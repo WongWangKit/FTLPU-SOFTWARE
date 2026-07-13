@@ -1,0 +1,4 @@
+Placeholder file for dry-run ONNX import tests.
+
+Replace this with a real ONNX protobuf when running `--mode=import-onnx`
+without `--dry-run`.

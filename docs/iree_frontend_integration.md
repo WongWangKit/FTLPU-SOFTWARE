@@ -67,9 +67,33 @@ third_party/iree_frontend/iree_frontend_manifest.json
 `tools/ftlpu-iree-import.py` is the first frontend adapter. It can:
 
 - accept already-imported StableHLO/TOSA/Linalg MLIR;
+- invoke IREE's `iree-import-onnx` tool for ONNX protobuf inputs;
 - copy it into the FTLPU common-IR staging format;
 - optionally invoke an installed `iree-compile` to lower to an IREE stage;
 - generate a command in dry-run mode for environments without IREE installed.
+
+For ONNX, install an IREE compiler package with ONNX support, then import:
+
+```powershell
+python tools/ftlpu-iree-import.py `
+  --input model.onnx `
+  --output build/model.mlir `
+  --input-format onnx `
+  --mode import-onnx `
+  --onnx-opset-version 17
+```
+
+To continue directly into an IREE stage:
+
+```powershell
+python tools/ftlpu-iree-import.py `
+  --input model.onnx `
+  --output build/model.flow.mlir `
+  --input-format onnx `
+  --mode iree-compile `
+  --iree-stage flow `
+  --onnx-opset-version 17
+```
 
 ## Milestones
 

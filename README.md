@@ -59,6 +59,17 @@ python tools/ftlpu-iree-import.py `
   --input-format stablehlo
 ```
 
+ONNX inputs go through IREE's ONNX importer first:
+
+```powershell
+python tools/ftlpu-iree-import.py `
+  --input model.onnx `
+  --output build/model.mlir `
+  --input-format onnx `
+  --mode import-onnx `
+  --onnx-opset-version 17
+```
+
 ## Build
 
 By default CMake expects `FTLPU-CMODEL` to sit next to this repository:

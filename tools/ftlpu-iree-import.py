@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stages frontend MLIR through an IREE-compatible import boundary.
+"""Stages frontend models through an IREE-compatible import boundary.
 
 This tool is intentionally thin. It lets FTLPU accept already-imported MLIR
 today, while leaving room to invoke a local IREE toolchain when available.
@@ -9,6 +9,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -17,6 +18,7 @@ SUPPORTED_INPUTS = {
     "tosa",
     "linalg",
     "mlir",
+    "onnx",
 }
 
 IREE_STAGES = {
@@ -41,7 +43,25 @@ def build_iree_command(args):
     return command
 
 
+def build_onnx_import_command(args, output):
+    command = [
+        args.iree_import_onnx,
+        str(args.input),
+        "-o",
+        str(output),
+    ]
+    if args.onnx_opset_version is not None:
+        command.extend(["--opset-version", str(args.onnx_opset_version)])
+    command.extend(args.extra_onnx_arg)
+    return command
+
+
 def stage_common_ir(args):
+    if args.input_format == "onnx":
+        raise ValueError(
+            "ONNX is a binary/protobuf graph. Use --mode=import-onnx first, "
+            "or --mode=iree-compile with a local IREE ONNX importer."
+        )
     text = args.input.read_text(encoding="utf-8")
     header = (
         "// FTLPU common IR staged from IREE-compatible frontend input.\n"
@@ -63,7 +83,7 @@ def main(argv):
     )
     parser.add_argument(
         "--mode",
-        choices=["stage-common-ir", "iree-compile"],
+        choices=["stage-common-ir", "import-onnx", "iree-compile"],
         default="stage-common-ir",
     )
     parser.add_argument(
@@ -73,7 +93,10 @@ def main(argv):
         help="IREE compiler stage used with --mode=iree-compile.",
     )
     parser.add_argument("--iree-compile", default="iree-compile")
+    parser.add_argument("--iree-import-onnx", default="iree-import-onnx")
+    parser.add_argument("--onnx-opset-version", type=int)
     parser.add_argument("--extra-iree-arg", action="append", default=[])
+    parser.add_argument("--extra-onnx-arg", action="append", default=[])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -82,8 +105,53 @@ def main(argv):
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     if args.mode == "stage-common-ir":
-        stage_common_ir(args)
+        try:
+            stage_common_ir(args)
+        except ValueError as exc:
+            parser.error(str(exc))
         return 0
+
+    if args.mode == "import-onnx":
+        if args.input_format != "onnx":
+            parser.error("--mode=import-onnx requires --input-format=onnx")
+        command = build_onnx_import_command(args, args.output)
+        if args.dry_run:
+            print(" ".join(command))
+            return 0
+        if shutil.which(args.iree_import_onnx) is None:
+            parser.error(
+                f"{args.iree_import_onnx!r} was not found. Install "
+                "iree-base-compiler[onnx] or use --dry-run."
+            )
+        return subprocess.call(command)
+
+    if args.mode == "iree-compile" and args.input_format == "onnx":
+        if args.dry_run:
+            imported = args.output.with_suffix(".imported.mlir")
+            print(" ".join(build_onnx_import_command(args, imported)))
+            compile_args = argparse.Namespace(**vars(args))
+            compile_args.input = imported
+            compile_args.input_format = "mlir"
+            print(" ".join(build_iree_command(compile_args)))
+            return 0
+        if shutil.which(args.iree_import_onnx) is None:
+            parser.error(
+                f"{args.iree_import_onnx!r} was not found. Install "
+                "iree-base-compiler[onnx] or use --dry-run."
+            )
+        if shutil.which(args.iree_compile) is None:
+            parser.error(
+                f"{args.iree_compile!r} was not found. Install IREE or use --dry-run."
+            )
+        with tempfile.TemporaryDirectory(prefix="ftlpu-onnx-import-") as temp_dir:
+            imported = Path(temp_dir) / (args.input.stem + ".mlir")
+            import_result = subprocess.call(build_onnx_import_command(args, imported))
+            if import_result != 0:
+                return import_result
+            compile_args = argparse.Namespace(**vars(args))
+            compile_args.input = imported
+            compile_args.input_format = "mlir"
+            return subprocess.call(build_iree_command(compile_args))
 
     command = build_iree_command(args)
     if args.dry_run:
