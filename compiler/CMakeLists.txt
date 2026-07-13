@@ -1,5 +1,18 @@
 find_package(Python3 COMPONENTS Interpreter)
 
+add_library(ftlpu_compiler
+    src/ir.cpp
+    src/passes.cpp)
+
+target_include_directories(ftlpu_compiler
+    PUBLIC
+        include)
+
+add_executable(ftlpu_opt
+    tools/ftlpu_opt.cpp)
+
+target_link_libraries(ftlpu_opt PRIVATE ftlpu_compiler)
+
 if(Python3_Interpreter_FOUND)
     set(FTLPU_COMPILER_PYTHON "${Python3_EXECUTABLE}")
     if(EXISTS "${CMAKE_SOURCE_DIR}/.venv/Scripts/python.exe")
@@ -37,11 +50,11 @@ if(Python3_Interpreter_FOUND)
             --dry-run)
 
     add_test(
-        NAME stablehlo_matmul_320_to_ftlpu_ir_layers_test
+        NAME stablehlo_matmul_320_to_ftlpu_schedule_cpp_test
         COMMAND
             ${FTLPU_COMPILER_PYTHON}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_matmul_lowering_test.py
-            --tool ${CMAKE_CURRENT_SOURCE_DIR}/tools/ftlpu-lower.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_matmul_cpp_pass_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
             --work-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/matmul_320)
 

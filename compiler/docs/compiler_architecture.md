@@ -91,4 +91,5 @@ StableHLO -> FTLPU common tensor IR -> FTLPU stream IR -> FTLPU schedule IR
 2. Add StableHLO fixture tests for matmul and elementwise ops.
 3. Define textual `ftlpu.tensor` or `ftlpu.common` examples.
 4. Lower StableHLO matmul to the first FTLPU stream form.
-5. Lower FTLPU stream matmul to schedule queues and `.ftlpu`.
+5. Lower StableHLO/FTLPU Tensor FFN SwiGLU to the CModel-aligned schedule shape.
+6. Lower FTLPU stream/schedule programs to `.ftlpu`.
