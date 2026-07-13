@@ -40,7 +40,7 @@ ONNX / PyTorch / TensorFlow
   -> StableHLO as the frontend common IR
   -> FTLPU common tensor IR
   -> FTLPU stream IR
-  -> FTLPU ICU IR
+  -> FTLPU schedule IR
   -> .ftlpu binary
 ```
 

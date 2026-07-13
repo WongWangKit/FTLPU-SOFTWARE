@@ -36,6 +36,15 @@ if(Python3_Interpreter_FOUND)
             --onnx-opset-version 17
             --dry-run)
 
+    add_test(
+        NAME stablehlo_matmul_320_to_ftlpu_ir_layers_test
+        COMMAND
+            ${FTLPU_COMPILER_PYTHON}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_matmul_lowering_test.py
+            --tool ${CMAKE_CURRENT_SOURCE_DIR}/tools/ftlpu-lower.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
+            --work-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/matmul_320)
+
     if(FTLPU_IREE_IMPORT_ONNX AND FTLPU_IREE_COMPILE)
         add_test(
             NAME iree_frontend_onnx_matmul_320_to_flow_ir_test

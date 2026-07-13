@@ -26,7 +26,7 @@ model / frontend graph
   -> StableHLO
   -> FTLPU common tensor IR
   -> FTLPU stream IR
-  -> FTLPU ICU timeline IR
+  -> FTLPU schedule IR
   -> .ftlpu binary
   -> CModel runtime
 ```
@@ -105,7 +105,7 @@ python compiler/tools/ftlpu-iree-import.py `
 2. Accept StableHLO MLIR as the primary frontend/common IR.
 3. Add shape/layout validation for LPU constraints.
 4. Lower StableHLO matmul/elementwise/post-op patterns to `ftlpu.stream`.
-5. Schedule `ftlpu.stream` to `ftlpu.icu`.
+5. Schedule `ftlpu.stream` to `ftlpu.schedule`.
 6. Emit `.ftlpu` binary and run through CModel runtime.
 
 ## IREE Source Areas To Study

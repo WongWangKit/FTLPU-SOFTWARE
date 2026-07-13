@@ -7,7 +7,7 @@ ONNX / PyTorch / TensorFlow
   -> StableHLO
   -> FTLPU common tensor IR
   -> FTLPU stream IR
-  -> FTLPU ICU IR
+  -> FTLPU schedule IR
   -> .ftlpu binary
   -> runtime / CModel / hardware
 ```
@@ -51,9 +51,9 @@ The stream IR maps tensor work onto LPU resources:
 This layer is conceptually similar to IREE Stream, but it is FTLPU-owned and
 should model the real LPU data movement directly.
 
-### FTLPU ICU IR
+### FTLPU Schedule IR
 
-The ICU IR is the low-level scheduled target:
+The schedule IR is the low-level scheduled target:
 
 - explicit cycle numbers;
 - explicit MEM/MXM/VXM queues;
@@ -82,7 +82,7 @@ ONNX -> IREE importer -> IREE Flow IR
 Those tests are comparison and sanity tests. The main backend path should be:
 
 ```text
-StableHLO -> FTLPU common tensor IR -> FTLPU stream IR -> FTLPU ICU IR
+StableHLO -> FTLPU common tensor IR -> FTLPU stream IR -> FTLPU schedule IR
 ```
 
 ## Immediate Milestones
@@ -91,4 +91,4 @@ StableHLO -> FTLPU common tensor IR -> FTLPU stream IR -> FTLPU ICU IR
 2. Add StableHLO fixture tests for matmul and elementwise ops.
 3. Define textual `ftlpu.tensor` or `ftlpu.common` examples.
 4. Lower StableHLO matmul to the first FTLPU stream form.
-5. Lower FTLPU stream matmul to ICU queues and `.ftlpu`.
+5. Lower FTLPU stream matmul to schedule queues and `.ftlpu`.
