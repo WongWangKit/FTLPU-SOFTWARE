@@ -1,8 +1,8 @@
 # IREE Frontend Integration Plan
 
-This repository should reuse IREE's frontend architecture without vendoring the
-entire IREE tree. IREE is a large MLIR-based compiler/runtime project, and the
-parts useful for FTLPU are the model import boundary and the common MLIR
+This repository tracks IREE as a git submodule instead of copying selected
+source files by hand. IREE is a large MLIR-based compiler/runtime project, and
+the parts useful for FTLPU are the model import boundary and the common MLIR
 abstractions before target-specific codegen.
 
 ## What To Reuse
@@ -39,19 +39,18 @@ standard MLIR plus ML model dialects:
 The LPU backend should not consume framework-specific graph files directly.
 Instead, it should consume this normalized MLIR boundary.
 
-## Why Not Vendor All IREE
+## Why A Submodule
 
-Do not copy the whole IREE source tree into `FTLPU-SOFTWARE`:
+Do not manually copy the whole IREE source tree into `FTLPU-SOFTWARE`:
 
 - IREE is a full compiler and runtime stack with many targets.
 - It carries a large LLVM/MLIR dependency surface.
 - Its import tools are intentionally separate from the core compiler tree.
 - FTLPU only needs the frontend-to-common-IR path now.
 
-The better short-term shape is an adapter that can call an installed IREE
-compiler toolchain or accept already-imported MLIR. Later, if we build a real
-MLIR C++ compiler binary, we can link against LLVM/MLIR/IREE as external
-projects.
+The submodule keeps upstream history and makes it easy to update or inspect the
+full compiler tree while still letting the default FTLPU build ignore IREE until
+LLVM/MLIR and other dependencies are wired into an optional compiler build.
 
 ## Repository Pieces
 
@@ -60,6 +59,7 @@ The current repository now includes:
 ```text
 tools/ftlpu-iree-import.py
 examples/iree_frontend/simple_stablehlo.mlir
+third_party/iree
 third_party/iree_frontend/README.md
 third_party/iree_frontend/iree_frontend_manifest.json
 ```

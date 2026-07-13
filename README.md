@@ -45,6 +45,11 @@ StableHLO / TOSA / Linalg MLIR
 See [docs/iree_frontend_integration.md](docs/iree_frontend_integration.md) and
 [examples/iree_frontend/simple_stablehlo.mlir](examples/iree_frontend/simple_stablehlo.mlir).
 
+The repository also tracks IREE as a git submodule under
+[third_party/iree](third_party/iree). We will use its input conversion, Flow,
+Stream, Util, and pipeline code as the frontend/compiler base while developing
+the FTLPU/LPU backend.
+
 Example:
 
 ```powershell
