@@ -66,6 +66,20 @@ std::string queue_name(QueueKind kind, std::size_t index)
     return os.str();
 }
 
+void validate_queue_index(QueueKind kind, std::size_t index)
+{
+    if (kind == QueueKind::Mem && index >= InstructionControlUnit::kMemQueues) {
+        throw std::out_of_range("binary MEM queue index is outside the CModel ICU range");
+    }
+    if ((kind == QueueKind::MxmLoad || kind == QueueKind::MxmCompute || kind == QueueKind::MxmOutput)
+        && index >= InstructionControlUnit::kMxmQueues) {
+        throw std::out_of_range("binary MXM queue index is outside the CModel ICU range");
+    }
+    if (kind == QueueKind::Vxm && index >= InstructionControlUnit::kVxmQueues) {
+        throw std::out_of_range("binary VXM queue index is outside the CModel ICU range");
+    }
+}
+
 } // namespace
 
 const char* queue_kind_name(QueueKind kind)
@@ -234,6 +248,89 @@ bool IcuProgram::empty() const
         }
     }
     return true;
+}
+
+void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, InstructionControlUnit& icu)
+{
+    for (const auto& queue : queues) {
+        validate_queue_index(queue.kind, queue.index);
+        for (const auto& command : queue.commands) {
+            const auto opcode = isa::decode_icu_command_opcode(command.command);
+            if (opcode == isa::IcuCommandOpcode::Nop) {
+                const auto cycles = isa::decode_icu_nop_cycles(command.command);
+                switch (queue.kind) {
+                case QueueKind::Mem:
+                    icu.enqueue_mem_nop(queue.index, cycles);
+                    break;
+                case QueueKind::MxmLoad:
+                    icu.enqueue_mxm_load_nop(queue.index, cycles);
+                    break;
+                case QueueKind::MxmCompute:
+                    icu.enqueue_mxm_compute_nop(queue.index, cycles);
+                    break;
+                case QueueKind::MxmOutput:
+                    icu.enqueue_mxm_output_nop(queue.index, cycles);
+                    break;
+                case QueueKind::Vxm:
+                    icu.enqueue_vxm_nop(queue.index, cycles);
+                    break;
+                }
+                continue;
+            }
+
+            if (opcode == isa::IcuCommandOpcode::Repeat) {
+                const auto repeat = isa::decode_icu_repeat(command.command);
+                switch (queue.kind) {
+                case QueueKind::Mem:
+                    icu.enqueue_mem_repeat(queue.index, repeat.count, repeat.interval, repeat.address_stride);
+                    break;
+                case QueueKind::MxmLoad:
+                    icu.enqueue_mxm_load_repeat(queue.index, repeat.count, repeat.interval);
+                    break;
+                case QueueKind::MxmCompute:
+                    icu.enqueue_mxm_compute_repeat(queue.index, repeat.count, repeat.interval);
+                    break;
+                case QueueKind::MxmOutput:
+                    icu.enqueue_mxm_output_repeat(queue.index, repeat.count, repeat.interval);
+                    break;
+                case QueueKind::Vxm:
+                    icu.enqueue_vxm_repeat(queue.index, repeat.count, repeat.interval);
+                    break;
+                }
+                continue;
+            }
+
+            if (opcode != isa::IcuCommandOpcode::Instruction) {
+                throw std::logic_error("unsupported ICU command opcode in binary queue");
+            }
+
+            switch (queue.kind) {
+            case QueueKind::Mem:
+                if (command.instruction_kind != InstructionKind::Mem || command.word_count != 1) {
+                    throw std::logic_error("MEM queue command does not carry one MEM instruction word");
+                }
+                icu.enqueue_mem(queue.index, isa::decode_mem_instruction(command.words[0]));
+                break;
+            case QueueKind::MxmLoad:
+            case QueueKind::MxmCompute:
+            case QueueKind::MxmOutput: {
+                if (command.instruction_kind != InstructionKind::Mxm || command.word_count != 1) {
+                    throw std::logic_error("MXM queue command does not carry one MXM instruction word");
+                }
+                const auto instruction = isa::decode_mxm_instruction(command.words[0]);
+                validate_mxm_queue_opcode(queue.kind, queue.index, instruction);
+                icu.enqueue_mxm(queue.index, instruction);
+                break;
+            }
+            case QueueKind::Vxm:
+                if (command.instruction_kind != InstructionKind::Vxm || command.word_count != 3) {
+                    throw std::logic_error("VXM queue command does not carry three VXM instruction words");
+                }
+                icu.enqueue_vxm(queue.index, isa::decode_vxm_instruction(isa::EncodedVxmInstruction {command.words}));
+                break;
+            }
+        }
+    }
 }
 
 void IcuProgram::check_mem_column(std::size_t column) const

@@ -90,5 +90,6 @@ private:
 };
 
 const char* queue_kind_name(QueueKind kind);
+void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, InstructionControlUnit& icu);
 
 } // namespace ftlpu::software::runtime

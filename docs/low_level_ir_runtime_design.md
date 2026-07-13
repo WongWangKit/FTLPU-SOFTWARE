@@ -145,6 +145,21 @@ The software repository now contains a first `IcuProgram` implementation under
 - lower scheduled events into NOP plus instruction commands;
 - load those commands into the CModel ICU.
 
+The current prototype also has the first full software path:
+
+```text
+examples/simple_dispatch.lpuir
+  -> parse_lpu_ir()
+  -> IcuProgram::encode_queues()
+  -> write_binary_program(.ftlpu)
+  -> CModelRuntime::load_file()
+  -> InstructionControlUnit queues
+  -> dispatch_icu_cycles()
+```
+
+This is intentionally narrow: it proves that handwritten LPU IR can be compiled
+to a binary queue file and loaded by runtime before the CModel clock starts.
+
 The runtime should not bypass the ICU to directly call MEM/MXM/VXM internals.
 That keeps the software contract aligned with the future hardware control path.
 

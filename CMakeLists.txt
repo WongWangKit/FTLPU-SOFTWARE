@@ -12,7 +12,10 @@ set(FTLPU_CMODEL_DIR
     "Path to the FTLPU-CMODEL repository")
 
 add_library(ftlpu_software
-    src/runtime/icu_program.cpp)
+    src/runtime/binary.cpp
+    src/runtime/cmodel_runtime.cpp
+    src/runtime/icu_program.cpp
+    src/runtime/lpu_ir.cpp)
 
 target_include_directories(ftlpu_software
     PUBLIC
@@ -24,11 +27,11 @@ add_executable(icu_program_smoke_test
 
 target_link_libraries(icu_program_smoke_test PRIVATE ftlpu_software)
 
-add_executable(mem_mxm_gemm_320_test
-    tests/runtime/mem_mxm_gemm_320_test.cpp)
+add_executable(lpu_ir_binary_runtime_test
+    tests/runtime/lpu_ir_binary_runtime_test.cpp)
 
-target_link_libraries(mem_mxm_gemm_320_test PRIVATE ftlpu_software)
+target_link_libraries(lpu_ir_binary_runtime_test PRIVATE ftlpu_software)
 
 enable_testing()
 add_test(NAME icu_program_smoke_test COMMAND icu_program_smoke_test)
-add_test(NAME mem_mxm_gemm_320_test COMMAND mem_mxm_gemm_320_test)
+add_test(NAME lpu_ir_binary_runtime_test COMMAND lpu_ir_binary_runtime_test)

@@ -14,12 +14,22 @@ network model -> MLIR-style lowering -> ftlpu.icu timeline
   -> .ftlpu binary -> runtime -> CModel InstructionControlUnit
 ```
 
-The initial code provides a reusable `IcuProgram` container that records
-scheduled MEM, MXM, and VXM events, converts idle cycle gaps into ICU NOPs, and
-loads the resulting queues into the CModel `InstructionControlUnit`.
+The initial code provides a reusable path for:
+
+```text
+hand-written LPU IR -> .ftlpu binary -> runtime parser
+  -> CModel InstructionControlUnit queues -> clock dispatch
+```
+
+`IcuProgram` records scheduled MEM, MXM, and VXM events, converts idle cycle
+gaps into ICU NOPs, and can be serialized into the first `.ftlpu` binary queue
+format.
 
 See [docs/low_level_ir_runtime_design.md](docs/low_level_ir_runtime_design.md)
 for the proposed low-level IR, binary format, and runtime design.
+
+See [examples/simple_dispatch.lpuir](examples/simple_dispatch.lpuir) for the
+current hand-written LPU IR syntax used by the runtime test.
 
 ## Build
 
