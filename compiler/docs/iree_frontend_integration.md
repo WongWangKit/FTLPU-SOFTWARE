@@ -57,14 +57,14 @@ LLVM/MLIR and other dependencies are wired into an optional compiler build.
 The current repository now includes:
 
 ```text
-tools/ftlpu-iree-import.py
-examples/iree_frontend/simple_stablehlo.mlir
+compiler/tools/ftlpu-iree-import.py
+compiler/examples/iree_frontend/simple_stablehlo.mlir
 third_party/iree
 third_party/iree_frontend/README.md
 third_party/iree_frontend/iree_frontend_manifest.json
 ```
 
-`tools/ftlpu-iree-import.py` is the first frontend adapter. It can:
+`compiler/tools/ftlpu-iree-import.py` is the first frontend adapter. It can:
 
 - accept already-imported StableHLO/TOSA/Linalg MLIR;
 - invoke IREE's `iree-import-onnx` tool for ONNX protobuf inputs;
@@ -75,7 +75,7 @@ third_party/iree_frontend/iree_frontend_manifest.json
 For ONNX, install an IREE compiler package with ONNX support, then import:
 
 ```powershell
-python tools/ftlpu-iree-import.py `
+python compiler/tools/ftlpu-iree-import.py `
   --input model.onnx `
   --output build/model.mlir `
   --input-format onnx `
@@ -86,7 +86,7 @@ python tools/ftlpu-iree-import.py `
 To continue directly into an IREE stage:
 
 ```powershell
-python tools/ftlpu-iree-import.py `
+python compiler/tools/ftlpu-iree-import.py `
   --input model.onnx `
   --output build/model.flow.mlir `
   --input-format onnx `

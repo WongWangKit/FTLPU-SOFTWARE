@@ -138,7 +138,7 @@ The first runtime path is intentionally narrow:
 ```
 
 The software repository now contains a first `IcuProgram` implementation under
-`include/ftlpu/software/runtime/icu_program.hpp`. It can:
+`runtime/include/ftlpu/software/runtime/icu_program.hpp`. It can:
 
 - record scheduled MEM/MXM/VXM events;
 - validate per-queue cycle conflicts;
@@ -148,7 +148,7 @@ The software repository now contains a first `IcuProgram` implementation under
 The current prototype also has the first full software path:
 
 ```text
-examples/simple_dispatch.lpuir
+runtime/examples/simple_dispatch.lpuir
   -> parse_lpu_ir()
   -> IcuProgram::encode_queues()
   -> write_binary_program(.ftlpu)

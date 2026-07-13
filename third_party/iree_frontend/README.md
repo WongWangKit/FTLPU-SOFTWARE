@@ -15,7 +15,7 @@ The FTLPU compiler should consume IREE-compatible common MLIR first:
 StableHLO / TOSA / Linalg MLIR -> FTLPU common IR -> FTLPU LPU backend
 ```
 
-Use `tools/ftlpu-iree-import.py` to stage MLIR files or to invoke an installed
+Use `compiler/tools/ftlpu-iree-import.py` to stage MLIR files or to invoke an installed
 `iree-compile` toolchain.
 
 When we later need in-process MLIR passes, add IREE/LLVM as external projects
