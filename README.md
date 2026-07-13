@@ -31,24 +31,30 @@ for the proposed low-level IR, binary format, and runtime design.
 See [runtime/examples/simple_dispatch.lpuir](runtime/examples/simple_dispatch.lpuir) for the
 current hand-written LPU IR syntax used by the runtime test.
 
-## IREE Frontend
+## Compiler Direction
 
-The first IREE-facing frontend adapter is intentionally lightweight:
+The compiler direction is:
 
 ```text
-StableHLO / TOSA / Linalg MLIR
-  -> compiler/tools/ftlpu-iree-import.py
-  -> FTLPU common IR staging file
-  -> future FTLPU stream / ICU lowering
+ONNX / PyTorch / TensorFlow
+  -> StableHLO as the frontend common IR
+  -> FTLPU common tensor IR
+  -> FTLPU stream IR
+  -> FTLPU ICU IR
+  -> .ftlpu binary
 ```
 
-See [compiler/docs/iree_frontend_integration.md](compiler/docs/iree_frontend_integration.md) and
+StableHLO is the primary frontend/common model IR boundary. IREE is kept as a
+reference compiler framework and comparison tool for Flow, Stream, pass
+pipelines, and backend plugin structure.
+
+See [compiler/docs/compiler_architecture.md](compiler/docs/compiler_architecture.md),
+[compiler/docs/iree_frontend_integration.md](compiler/docs/iree_frontend_integration.md), and
 [compiler/examples/iree_frontend/simple_stablehlo.mlir](compiler/examples/iree_frontend/simple_stablehlo.mlir).
 
 The repository also tracks IREE as a git submodule under
-[third_party/iree](third_party/iree). We will use its input conversion, Flow,
-Stream, Util, and pipeline code as the frontend/compiler base while developing
-the FTLPU/LPU backend.
+[third_party/iree](third_party/iree). We use it as an inspectable upstream
+reference while developing the FTLPU/LPU backend.
 
 Example:
 
@@ -59,7 +65,7 @@ python compiler/tools/ftlpu-iree-import.py `
   --input-format stablehlo
 ```
 
-ONNX inputs go through IREE's ONNX importer first:
+Current ONNX comparison tests go through IREE's ONNX importer first:
 
 ```powershell
 python compiler/tools/ftlpu-iree-import.py `

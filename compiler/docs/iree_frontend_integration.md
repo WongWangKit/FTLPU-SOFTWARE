@@ -1,9 +1,13 @@
-# IREE Frontend Integration Plan
+# IREE Reference Integration Plan
 
 This repository tracks IREE as a git submodule instead of copying selected
 source files by hand. IREE is a large MLIR-based compiler/runtime project, and
-the parts useful for FTLPU are the model import boundary and the common MLIR
-abstractions before target-specific codegen.
+the parts useful for FTLPU are its compiler architecture patterns and reference
+lowering path.
+
+StableHLO is the primary frontend/common model IR boundary for the FTLPU
+compiler. IREE is a reference framework and comparison tool, not the required
+long-term backend dependency.
 
 ## What To Reuse
 
@@ -15,12 +19,12 @@ The useful IREE-side concepts are:
 - Stream-style placement and scheduling ideas.
 - The plugin pattern for adding an out-of-tree target backend.
 
-The first FTLPU compiler path should therefore be:
+The primary FTLPU compiler path should be:
 
 ```text
-model / frontend MLIR
-  -> IREE-compatible common MLIR
-  -> FTLPU frontend-normalized IR
+model / frontend graph
+  -> StableHLO
+  -> FTLPU common tensor IR
   -> FTLPU stream IR
   -> FTLPU ICU timeline IR
   -> .ftlpu binary
@@ -37,7 +41,7 @@ standard MLIR plus ML model dialects:
 - `linalg` for structured compute after legalization
 
 The LPU backend should not consume framework-specific graph files directly.
-Instead, it should consume this normalized MLIR boundary.
+Instead, it should consume StableHLO or the first FTLPU-owned common tensor IR.
 
 ## Why A Submodule
 
@@ -64,11 +68,11 @@ third_party/iree_frontend/README.md
 third_party/iree_frontend/iree_frontend_manifest.json
 ```
 
-`compiler/tools/ftlpu-iree-import.py` is the first frontend adapter. It can:
+`compiler/tools/ftlpu-iree-import.py` is the first reference adapter. It can:
 
 - accept already-imported StableHLO/TOSA/Linalg MLIR;
 - invoke IREE's `iree-import-onnx` tool for ONNX protobuf inputs;
-- copy it into the FTLPU common-IR staging format;
+- copy StableHLO/TOSA/Linalg MLIR into the FTLPU common-IR staging format;
 - optionally invoke an installed `iree-compile` to lower to an IREE stage;
 - generate a command in dry-run mode for environments without IREE installed.
 
@@ -97,13 +101,12 @@ python compiler/tools/ftlpu-iree-import.py `
 
 ## Milestones
 
-1. Accept StableHLO/TOSA/Linalg MLIR as common IR.
-2. Add shape/layout validation for LPU constraints.
-3. Lower common IR matmul/elementwise/post-op patterns to `ftlpu.stream`.
-4. Schedule `ftlpu.stream` to `ftlpu.icu`.
-5. Emit `.ftlpu` binary and run through CModel runtime.
-6. Replace command-line adapter with linked MLIR/IREE passes when the backend
-   becomes mature enough.
+1. Keep ONNX-to-IREE Flow tests as reference coverage.
+2. Accept StableHLO MLIR as the primary frontend/common IR.
+3. Add shape/layout validation for LPU constraints.
+4. Lower StableHLO matmul/elementwise/post-op patterns to `ftlpu.stream`.
+5. Schedule `ftlpu.stream` to `ftlpu.icu`.
+6. Emit `.ftlpu` binary and run through CModel runtime.
 
 ## IREE Source Areas To Study
 
