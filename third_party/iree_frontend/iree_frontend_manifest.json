@@ -1,0 +1,35 @@
+{
+  "upstream": {
+    "name": "IREE",
+    "repository": "https://github.com/iree-org/iree",
+    "license": "Apache-2.0 WITH LLVM-exception"
+  },
+  "frontend_policy": {
+    "vendor_full_tree": false,
+    "use_as_external_toolchain": true,
+    "common_ir_boundary": [
+      "stablehlo",
+      "tosa",
+      "linalg",
+      "tensor",
+      "arith",
+      "func"
+    ]
+  },
+  "source_areas_to_study": [
+    "compiler/src/iree/compiler/InputConversion",
+    "compiler/src/iree/compiler/Dialect/Flow",
+    "compiler/src/iree/compiler/Dialect/Stream",
+    "compiler/src/iree/compiler/Pipelines",
+    "compiler/plugins/input",
+    "compiler/plugins/target"
+  ],
+  "ftlpu_flow": [
+    "frontend_mlir",
+    "ftlpu_common_ir",
+    "ftlpu_stream_ir",
+    "ftlpu_icu_ir",
+    "ftlpu_binary",
+    "cmodel_runtime"
+  ]
+}

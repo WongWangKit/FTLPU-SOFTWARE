@@ -31,6 +31,29 @@ for the proposed low-level IR, binary format, and runtime design.
 See [examples/simple_dispatch.lpuir](examples/simple_dispatch.lpuir) for the
 current hand-written LPU IR syntax used by the runtime test.
 
+## IREE Frontend
+
+The first IREE-facing frontend adapter is intentionally lightweight:
+
+```text
+StableHLO / TOSA / Linalg MLIR
+  -> tools/ftlpu-iree-import.py
+  -> FTLPU common IR staging file
+  -> future FTLPU stream / ICU lowering
+```
+
+See [docs/iree_frontend_integration.md](docs/iree_frontend_integration.md) and
+[examples/iree_frontend/simple_stablehlo.mlir](examples/iree_frontend/simple_stablehlo.mlir).
+
+Example:
+
+```powershell
+python tools/ftlpu-iree-import.py `
+  --input examples/iree_frontend/simple_stablehlo.mlir `
+  --output build/simple_stablehlo.common.mlir `
+  --input-format stablehlo
+```
+
 ## Build
 
 By default CMake expects `FTLPU-CMODEL` to sit next to this repository:

@@ -7,8 +7,8 @@
 # mxm_output <cycle> <mxm> output <stream_base>
 # vxm <cycle> <alu> cast <operand-kind> <operand-value> <fp32|i8> [out <stream>]
 
-mem 3 0 read 100 0
-mem 4 1 write 200 32
+mem 3 0 read 96 0
+mem 4 1 write 192 32
 mxm_load 5 0 iw 0 0
 mxm_compute 7 0 compute 0
 mxm_output 9 0 output 32

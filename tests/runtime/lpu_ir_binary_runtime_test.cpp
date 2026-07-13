@@ -34,8 +34,8 @@ int main()
 
         const auto ir = std::string {
             "# hand-written LPU IR: cycle queue instruction\n"
-            "mem 3 0 read 100 0\n"
-            "mem 4 1 write 200 32\n"
+            "mem 3 0 read 96 0\n"
+            "mem 4 1 write 192 32\n"
             "mxm_load 5 0 iw 0 0\n"
             "mxm_compute 7 0 compute 0\n"
             "mxm_output 9 0 output 32\n"
@@ -61,8 +61,8 @@ int main()
         runtime.dispatch_icu_cycles(loaded.max_cycle + 1, &icu_log);
         const auto log = icu_log.str();
 
-        require_contains(log, "ICU -> MEM q0 Read address=100 stream=0");
-        require_contains(log, "ICU -> MEM q1 Write address=200 stream=32");
+        require_contains(log, "ICU -> MEM q0 Read address=96 stream=0");
+        require_contains(log, "ICU -> MEM q1 Write address=192 stream=32");
         require_contains(log, "ICU -> MXM0.load IW b0 col=0");
         require_contains(log, "ICU -> MXM0.compute Compute b0");
         require_contains(log, "ICU -> MXM0.output Output stream_base=32");

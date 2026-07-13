@@ -32,6 +32,20 @@ add_executable(lpu_ir_binary_runtime_test
 
 target_link_libraries(lpu_ir_binary_runtime_test PRIVATE ftlpu_software)
 
+find_package(Python3 COMPONENTS Interpreter)
+
 enable_testing()
 add_test(NAME icu_program_smoke_test COMMAND icu_program_smoke_test)
 add_test(NAME lpu_ir_binary_runtime_test COMMAND lpu_ir_binary_runtime_test)
+
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME iree_frontend_stage_common_ir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/ftlpu-iree-import.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/iree_frontend/simple_stablehlo.common.mlir
+            --input-format stablehlo
+            --mode stage-common-ir)
+endif()
