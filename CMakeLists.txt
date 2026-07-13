@@ -24,5 +24,11 @@ add_executable(icu_program_smoke_test
 
 target_link_libraries(icu_program_smoke_test PRIVATE ftlpu_software)
 
+add_executable(mem_mxm_gemm_320_test
+    tests/runtime/mem_mxm_gemm_320_test.cpp)
+
+target_link_libraries(mem_mxm_gemm_320_test PRIVATE ftlpu_software)
+
 enable_testing()
 add_test(NAME icu_program_smoke_test COMMAND icu_program_smoke_test)
+add_test(NAME mem_mxm_gemm_320_test COMMAND mem_mxm_gemm_320_test)
