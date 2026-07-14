@@ -2,12 +2,23 @@ find_package(Python3 COMPONENTS Interpreter)
 
 add_library(ftlpu_compiler
     src/ir.cpp
-    src/passes.cpp
-    src/target_model.cpp)
+    src/Dialect/Common/LoweringUtils.cpp
+    src/Dialect/Kernel/Transforms/StableHloToKernel.cpp
+    src/Dialect/Schedule/Analysis/ResourceScheduler.cpp
+    src/Dialect/Schedule/Transforms/StreamToSchedule.cpp
+    src/Dialect/Stream/Analysis/StreamAllocator.cpp
+    src/Dialect/Stream/Transforms/TensorToStream.cpp
+    src/Dialect/Tensor/Analysis/MemoryLayout.cpp
+    src/Dialect/Tensor/Transforms/KernelToTensor.cpp
+    src/Pipelines/Phases.cpp
+    src/Pipelines/Pipelines.cpp
+    src/Target/FtlpuCModelTarget.cpp)
 
 target_include_directories(ftlpu_compiler
     PUBLIC
-        include)
+        include
+    PRIVATE
+        src)
 
 add_executable(ftlpu_opt
     tools/ftlpu_opt.cpp)

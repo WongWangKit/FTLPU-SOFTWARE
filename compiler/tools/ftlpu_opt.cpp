@@ -1,5 +1,6 @@
 #include "ftlpu/compiler/ir.hpp"
-#include "ftlpu/compiler/passes.hpp"
+#include "ftlpu/compiler/Pipelines/pipelines.hpp"
+#include "ftlpu/compiler/Target/ftlpu_cmodel_target.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -13,7 +14,8 @@ namespace {
 struct Args {
     std::filesystem::path input;
     std::filesystem::path output;
-    std::string pipeline;
+    std::string pipeline{"ftlpu-lpu-pipeline"};
+    ftlpu::compiler::pipeline::Options pipeline_options;
 };
 
 Args parse_args(int argc, char** argv)
@@ -33,14 +35,18 @@ Args parse_args(int argc, char** argv)
             args.output = next();
         } else if (arg == "--pipeline") {
             args.pipeline = next();
+        } else if (arg == "--compile-from") {
+            args.pipeline_options.compile_from = ftlpu::compiler::pipeline::parse_phase(next().c_str());
+        } else if (arg == "--compile-to") {
+            args.pipeline_options.compile_to = ftlpu::compiler::pipeline::parse_phase(next().c_str());
         } else {
             throw std::runtime_error("unknown argument: " + arg);
         }
     }
-    if (args.input.empty() || args.output.empty() || args.pipeline.empty()) {
+    if (args.input.empty() || args.output.empty()) {
         throw std::runtime_error(
             "usage: ftlpu_opt --input in.mlir --output out.mlir "
-            "--pipeline stablehlo-to-tensor,tensor-to-stream,stream-to-schedule");
+            "[--pipeline ftlpu-lpu-pipeline] [--compile-to schedule]");
     }
     return args;
 }
@@ -72,8 +78,9 @@ void write_file(const std::filesystem::path& path, const std::string& text)
 int main(int argc, char** argv)
 try {
     const auto args = parse_args(argc, argv);
+    const auto target = ftlpu::compiler::target::FtlpuCModelTarget {};
     auto module = ftlpu::compiler::parse_stablehlo_module(read_file(args.input));
-    module = ftlpu::compiler::run_pipeline(module, ftlpu::compiler::split_pipeline(args.pipeline));
+    module = ftlpu::compiler::pipeline::run_named_pipeline(module, target, args.pipeline, args.pipeline_options);
     write_file(args.output, ftlpu::compiler::print_module(module));
     return 0;
 } catch (const std::exception& ex) {

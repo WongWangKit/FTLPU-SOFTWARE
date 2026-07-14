@@ -124,8 +124,9 @@ compiler/lib/Dialect/Schedule/Analysis
 compiler/lib/Dialect/Schedule/Transforms
 ```
 
-The current `compiler/src/passes.cpp` should become glue around real passes,
-not the place where all IR construction lives.
+The former `compiler/src/passes.cpp` prototype has been removed; pipeline
+glue now lives under `Pipelines/` and IR construction lives in layer-specific
+transforms.
 
 ### Passes Are Registered, Named, And Testable
 
@@ -299,12 +300,12 @@ compiler/
     Tools/
 ```
 
-The existing `target_model.hpp/cpp` should be split:
+The old `target_model.hpp/cpp` prototype has been removed and split:
 
 - MEM address model -> `Dialect/Tensor/Analysis/MemoryLayout`.
 - stream lifetime allocation -> `Dialect/Stream/Analysis/StreamAllocator`.
 - resource/cycle scheduler -> `Dialect/Schedule/Analysis/ResourceScheduler`.
-- CModel queue constraints -> `Target/FtlpuCModel/`.
+- CModel queue constraints -> `Target/FtlpuCModel`.
 
 ## Migration Plan
 
@@ -398,12 +399,22 @@ The current compiler is useful as a spike, but structurally weak:
 The next serious milestone should be architectural, not adding more ops into
 the current file.
 
-## Recommended Next Commit
+## Current Refactor Status
 
-Refactor without changing behavior:
+The compiler has been split out of the original `passes.cpp` prototype:
 
-1. Move allocator/stream/scheduler classes into layer-specific analysis dirs.
-2. Add `Pipelines/phases.hpp` and `Pipelines/pipelines.cpp`.
-3. Add verifier functions for tensor/stream/schedule textual modules.
-4. Keep all existing tests green.
-5. Only then add more FFN/lower-to-binary behavior.
+```text
+Dialect/Kernel/Transforms/StableHloToKernel.cpp
+Dialect/Tensor/Analysis/MemoryLayout.cpp
+Dialect/Tensor/Transforms/KernelToTensor.cpp
+Dialect/Stream/Analysis/StreamAllocator.cpp
+Dialect/Stream/Transforms/TensorToStream.cpp
+Dialect/Schedule/Analysis/ResourceScheduler.cpp
+Dialect/Schedule/Transforms/StreamToSchedule.cpp
+Pipelines/Phases.cpp
+Pipelines/Pipelines.cpp
+Target/FtlpuCModelTarget.cpp
+```
+
+The next engineering milestone is to add verifiers and then replace the
+text-only module representation with real MLIR dialect definitions.
