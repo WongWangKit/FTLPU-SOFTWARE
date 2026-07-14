@@ -53,9 +53,6 @@ void validate_mxm_queue_opcode(
     if (kind == QueueKind::MxmCompute && instruction.opcode != MxmControlOpcode::Compute) {
         throw std::logic_error("MXM compute queue only accepts Compute instructions");
     }
-    if (kind == QueueKind::MxmOutput && instruction.opcode != MxmControlOpcode::Output) {
-        throw std::logic_error("MXM output queue only accepts Output instructions");
-    }
     (void)mxm;
 }
 
@@ -71,7 +68,7 @@ void validate_queue_index(QueueKind kind, std::size_t index)
     if (kind == QueueKind::Mem && index >= InstructionControlUnit::kMemQueues) {
         throw std::out_of_range("binary MEM queue index is outside the CModel ICU range");
     }
-    if ((kind == QueueKind::MxmLoad || kind == QueueKind::MxmCompute || kind == QueueKind::MxmOutput)
+    if ((kind == QueueKind::MxmLoad || kind == QueueKind::MxmCompute)
         && index >= InstructionControlUnit::kMxmQueues) {
         throw std::out_of_range("binary MXM queue index is outside the CModel ICU range");
     }
@@ -91,8 +88,6 @@ const char* queue_kind_name(QueueKind kind)
         return "mxm_load";
     case QueueKind::MxmCompute:
         return "mxm_compute";
-    case QueueKind::MxmOutput:
-        return "mxm_output";
     case QueueKind::Vxm:
         return "vxm";
     }
@@ -119,14 +114,6 @@ void IcuProgram::emit_mxm_compute(std::size_t cycle, std::size_t mxm, MxmControl
     check_mxm(mxm);
     validate_mxm_queue_opcode(QueueKind::MxmCompute, mxm, instruction);
     mxm_compute_[mxm].push_back(ScheduledInstruction<MxmControlInstruction> {cycle, instruction});
-    last_cycle_ = std::max(last_cycle_, cycle);
-}
-
-void IcuProgram::emit_mxm_output(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction)
-{
-    check_mxm(mxm);
-    validate_mxm_queue_opcode(QueueKind::MxmOutput, mxm, instruction);
-    mxm_output_[mxm].push_back(ScheduledInstruction<MxmControlInstruction> {cycle, instruction});
     last_cycle_ = std::max(last_cycle_, cycle);
 }
 
@@ -159,11 +146,6 @@ std::vector<QueueProgram> IcuProgram::encode_queues() const
             QueueKind::MxmCompute,
             mxm,
             encode_scheduled_queue(mxm_compute_[mxm], queue_name(QueueKind::MxmCompute, mxm), encode_mxm_command),
-        });
-        queues.push_back(QueueProgram {
-            QueueKind::MxmOutput,
-            mxm,
-            encode_scheduled_queue(mxm_output_[mxm], queue_name(QueueKind::MxmOutput, mxm), encode_mxm_command),
         });
     }
 
@@ -199,11 +181,6 @@ void IcuProgram::load_into(InstructionControlUnit& icu) const
             queue_name(QueueKind::MxmCompute, mxm),
             [&](std::size_t cycles) { icu.enqueue_mxm_compute_nop(mxm, cycles); },
             [&](const MxmControlInstruction& instruction) { icu.enqueue_mxm(mxm, instruction); });
-        load_scheduled_queue(
-            mxm_output_[mxm],
-            queue_name(QueueKind::MxmOutput, mxm),
-            [&](std::size_t cycles) { icu.enqueue_mxm_output_nop(mxm, cycles); },
-            [&](const MxmControlInstruction& instruction) { icu.enqueue_mxm(mxm, instruction); });
     }
 
     for (std::size_t alu = 0; alu < vxm_.size(); ++alu) {
@@ -237,11 +214,6 @@ bool IcuProgram::empty() const
             return false;
         }
     }
-    for (const auto& queue : mxm_output_) {
-        if (!queue.empty()) {
-            return false;
-        }
-    }
     for (const auto& queue : vxm_) {
         if (!queue.empty()) {
             return false;
@@ -268,9 +240,6 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                 case QueueKind::MxmCompute:
                     icu.enqueue_mxm_compute_nop(queue.index, cycles);
                     break;
-                case QueueKind::MxmOutput:
-                    icu.enqueue_mxm_output_nop(queue.index, cycles);
-                    break;
                 case QueueKind::Vxm:
                     icu.enqueue_vxm_nop(queue.index, cycles);
                     break;
@@ -289,9 +258,6 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                     break;
                 case QueueKind::MxmCompute:
                     icu.enqueue_mxm_compute_repeat(queue.index, repeat.count, repeat.interval);
-                    break;
-                case QueueKind::MxmOutput:
-                    icu.enqueue_mxm_output_repeat(queue.index, repeat.count, repeat.interval);
                     break;
                 case QueueKind::Vxm:
                     icu.enqueue_vxm_repeat(queue.index, repeat.count, repeat.interval);
@@ -312,8 +278,7 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                 icu.enqueue_mem(queue.index, isa::decode_mem_instruction(command.words[0]));
                 break;
             case QueueKind::MxmLoad:
-            case QueueKind::MxmCompute:
-            case QueueKind::MxmOutput: {
+            case QueueKind::MxmCompute: {
                 if (command.instruction_kind != InstructionKind::Mxm || command.word_count != 1) {
                     throw std::logic_error("MXM queue command does not carry one MXM instruction word");
                 }

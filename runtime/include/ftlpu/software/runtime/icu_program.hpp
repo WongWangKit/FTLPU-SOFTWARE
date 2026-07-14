@@ -15,7 +15,6 @@ enum class QueueKind : std::uint16_t {
     Mem = 0,
     MxmLoad = 1,
     MxmCompute = 2,
-    MxmOutput = 3,
     Vxm = 4,
 };
 
@@ -44,7 +43,6 @@ public:
     void emit_mem(std::size_t cycle, std::size_t column, MemInstruction instruction);
     void emit_mxm_load(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction);
     void emit_mxm_compute(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction);
-    void emit_mxm_output(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction);
     void emit_vxm(std::size_t cycle, std::size_t alu, VxmLaneAluInstruction instruction);
 
     std::vector<QueueProgram> encode_queues() const;
@@ -84,7 +82,6 @@ private:
     std::array<MemQueue, InstructionControlUnit::kMemQueues> mem_{};
     std::array<MxmQueue, InstructionControlUnit::kMxmQueues> mxm_load_{};
     std::array<MxmQueue, InstructionControlUnit::kMxmQueues> mxm_compute_{};
-    std::array<MxmQueue, InstructionControlUnit::kMxmQueues> mxm_output_{};
     std::array<VxmQueue, InstructionControlUnit::kVxmQueues> vxm_{};
     std::size_t last_cycle_{0};
 };

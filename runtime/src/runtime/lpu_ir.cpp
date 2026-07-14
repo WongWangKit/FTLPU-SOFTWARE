@@ -137,35 +137,28 @@ void parse_line(IcuProgram& program, const std::vector<std::string>& tokens)
     }
 
     if (kind == "mxm_load") {
-        if (tokens.size() != 6 || tokens[3] != "iw") {
-            throw std::runtime_error("mxm_load syntax: mxm_load <cycle> <mxm> iw <column_block> <buffer>");
+        if ((tokens.size() != 5 && tokens.size() != 6) || tokens[3] != "iw") {
+            throw std::runtime_error("mxm_load syntax: mxm_load <cycle> <mxm> iw <buffer>");
         }
+        const auto buffer_index = tokens.size() == 6 ? 5 : 4;
         program.emit_mxm_load(
             parse_size(tokens[1], "cycle"),
             parse_size(tokens[2], "mxm"),
-            MxmControlInstruction::IW(parse_size(tokens[4], "column_block"), parse_size(tokens[5], "buffer")));
+            MxmControlInstruction::IW(parse_size(tokens[buffer_index], "buffer")));
         return;
     }
 
     if (kind == "mxm_compute") {
-        if (tokens.size() != 5 || tokens[3] != "compute") {
-            throw std::runtime_error("mxm_compute syntax: mxm_compute <cycle> <mxm> compute <buffer>");
+        if ((tokens.size() != 5 && tokens.size() != 7) || tokens[3] != "compute") {
+            throw std::runtime_error(
+                "mxm_compute syntax: mxm_compute <cycle> <mxm> compute <buffer> [<activation_stream> <output_stream>]");
         }
+        const auto activation_stream = tokens.size() == 7 ? parse_size(tokens[5], "activation_stream") : 0;
+        const auto output_stream = tokens.size() == 7 ? parse_size(tokens[6], "output_stream") : 0;
         program.emit_mxm_compute(
             parse_size(tokens[1], "cycle"),
             parse_size(tokens[2], "mxm"),
-            MxmControlInstruction::Compute(parse_size(tokens[4], "buffer")));
-        return;
-    }
-
-    if (kind == "mxm_output") {
-        if (tokens.size() != 5 || tokens[3] != "output") {
-            throw std::runtime_error("mxm_output syntax: mxm_output <cycle> <mxm> output <stream_base>");
-        }
-        program.emit_mxm_output(
-            parse_size(tokens[1], "cycle"),
-            parse_size(tokens[2], "mxm"),
-            MxmControlInstruction::Output(parse_size(tokens[4], "stream_base")));
+            MxmControlInstruction::Compute(parse_size(tokens[4], "buffer"), activation_stream, output_stream));
         return;
     }
 

@@ -13,9 +13,8 @@ int main()
     assert(program.empty());
 
     program.emit_mem(3, 32, MemInstruction::Read(0, 0));
-    program.emit_mxm_load(5, 0, MxmControlInstruction::IW(0, 0));
-    program.emit_mxm_compute(7, 0, MxmControlInstruction::Compute(0));
-    program.emit_mxm_output(9, 0, MxmControlInstruction::Output(32));
+    program.emit_mxm_load(5, 0, MxmControlInstruction::IW(0));
+    program.emit_mxm_compute(7, 0, MxmControlInstruction::Compute(0, 0, 32));
     program.emit_vxm(11, 0, VxmLaneAluInstruction {
                             VxmAluOpcode::Cast,
                             VxmLaneOperand::StreamInt32(32),
@@ -28,7 +27,7 @@ int main()
     const auto queues = program.encode_queues();
     assert(!program.empty());
     assert(program.last_cycle() == 11);
-    assert(queues.size() == 66);
+    assert(queues.size() == 64);
 
     std::size_t non_empty_queues = 0;
     for (const auto& queue : queues) {
@@ -36,7 +35,7 @@ int main()
             ++non_empty_queues;
         }
     }
-    assert(non_empty_queues == 5);
+    assert(non_empty_queues == 4);
 
     auto icu = InstructionControlUnit {};
     program.load_into(icu);

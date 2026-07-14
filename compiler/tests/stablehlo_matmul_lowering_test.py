@@ -65,11 +65,10 @@ def main(argv):
         stream_ir,
         [
             "ftlpu.stream.matmul_grid",
-            "tile_m = 20",
-            "m_tiles = 16",
-            "n_tiles = 16",
-            "k_tiles = 16",
-            "ftlpu.stream.matmul_tile @m0_n0_k0",
+            "south_to_north_tiles = 20",
+            "ftlpu.stream.channel @matmul0_lhs",
+            "stream_ids = [0..15]",
+            "sink = \"MXM*:lhs\"",
         ],
     )
     assert_contains(
@@ -80,10 +79,12 @@ def main(argv):
             "ftlpu.schedule.mxm_load",
             "ftlpu.schedule.mxm_compute",
             "ftlpu.schedule.mem_write",
-            "accumulate false",
-            "accumulate true",
+            "accumulate = true",
+            "south_to_north_tiles = 20",
         ],
     )
+    if schedule_ir.count("ftlpu.schedule.") != 5:
+        raise AssertionError("schedule IR should contain exactly four stage ops plus the program op")
     print(f"generated tensor IR: {args.work_dir / 'matmul_320.tensor.mlir'}")
     print(f"generated stream IR: {args.work_dir / 'matmul_320.stream.mlir'}")
     print(f"generated schedule IR: {args.work_dir / 'matmul_320.schedule.mlir'}")

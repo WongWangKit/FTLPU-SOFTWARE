@@ -2,14 +2,12 @@
 # Format: one scheduled instruction per line.
 #
 # mem <cycle> <column> <read|write> <address> <stream>
-# mxm_load <cycle> <mxm> iw <column_block> <buffer>
-# mxm_compute <cycle> <mxm> compute <buffer>
-# mxm_output <cycle> <mxm> output <stream_base>
+# mxm_load <cycle> <mxm> iw <buffer>
+# mxm_compute <cycle> <mxm> compute <buffer> <activation_stream> <output_stream>
 # vxm <cycle> <alu> cast <operand-kind> <operand-value> <fp32|i8> [out <stream>]
 
 mem 3 0 read 96 0
 mem 4 1 write 192 32
-mxm_load 5 0 iw 0 0
-mxm_compute 7 0 compute 0
-mxm_output 9 0 output 32
+mxm_load 5 0 iw 0
+mxm_compute 7 0 compute 0 0 32
 vxm 11 0 cast stream_i32 32 fp32

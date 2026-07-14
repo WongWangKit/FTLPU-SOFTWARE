@@ -36,9 +36,8 @@ int main()
             "# hand-written LPU IR: cycle queue instruction\n"
             "mem 3 0 read 96 0\n"
             "mem 4 1 write 192 32\n"
-            "mxm_load 5 0 iw 0 0\n"
-            "mxm_compute 7 0 compute 0\n"
-            "mxm_output 9 0 output 32\n"
+            "mxm_load 5 0 iw 0\n"
+            "mxm_compute 7 0 compute 0 0 32\n"
             "vxm 11 0 cast stream_i32 32 fp32\n"
         };
 
@@ -63,9 +62,8 @@ int main()
 
         require_contains(log, "ICU -> MEM q0 Read address=96 stream=0");
         require_contains(log, "ICU -> MEM q1 Write address=192 stream=32");
-        require_contains(log, "ICU -> MXM0.load IW b0 col=0");
-        require_contains(log, "ICU -> MXM0.compute Compute b0");
-        require_contains(log, "ICU -> MXM0.output Output stream_base=32");
+        require_contains(log, "ICU -> MXM0.load IW b0");
+        require_contains(log, "ICU -> MXM0.compute Compute b0 stream=0 out=32");
         require_contains(log, "ICU -> VXM alu0 cast lhs=stream[32..35]");
 
         std::cout << "lpu_ir_binary_runtime_test passed\n";

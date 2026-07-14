@@ -42,7 +42,6 @@ The low-level IR should use the same queue shape as the CModel ICU:
 | `mem` | 44 | `enqueue_mem`, `enqueue_mem_nop`, `enqueue_mem_repeat` |
 | `mxm_load` | 2 | `enqueue_mxm_load_nop` plus `IW` |
 | `mxm_compute` | 2 | `enqueue_mxm_compute_nop` plus `Compute` |
-| `mxm_output` | 2 | `enqueue_mxm_output_nop` plus `Output` |
 | `vxm` | 16 | `enqueue_vxm`, `enqueue_vxm_nop`, `enqueue_vxm_repeat` |
 
 The textual shape can look like this:
@@ -56,9 +55,8 @@ ftlpu.icu.program @ffn attributes {
   streams = 64
 } {
   ftlpu.icu.mem_read     @mem32 cycle 27  addr 0  stream 0
-  ftlpu.icu.mxm_iw       @mxm0  cycle 38  col 0   buffer 0
-  ftlpu.icu.mxm_compute  @mxm0  cycle 78  buffer 0
-  ftlpu.icu.mxm_output   @mxm0  cycle 116 stream_base 32
+  ftlpu.icu.mxm_iw       @mxm0  cycle 38  buffer 0
+  ftlpu.icu.mxm_compute  @mxm0  cycle 78  buffer 0 activation_stream 0 output_stream 32
   ftlpu.icu.vxm_alu      @alu0  cycle 125 cast stream_i32 32 -> fp32
   ftlpu.icu.vxm_alu      @alu15 cycle 140 cast alu14 -> i8 out_stream 40
 }
@@ -74,7 +72,8 @@ test's current `OfflineIcuProgram`.
 The first version should reuse the CModel codec directly:
 
 - MEM: one 32-bit word for `Read`, `Write`, `Gather`, and `Scatter`.
-- MXM: one 32-bit word for `IW`, `Compute`, and `Output`.
+- MXM: one 32-bit word for `IW` and `Compute`; `Compute` carries both the
+  activation stream base and the output stream base.
 - VXM: three 32-bit words for ALU opcode, operands, immediates, cast target,
   and optional output stream.
 - ICU command: one 32-bit word for `Instruction`, `NOP`, and `Repeat`.
@@ -109,7 +108,6 @@ enum FtlpuQueueKind : uint16_t {
   FTLPU_Q_MEM = 0,
   FTLPU_Q_MXM_LOAD = 1,
   FTLPU_Q_MXM_COMPUTE = 2,
-  FTLPU_Q_MXM_OUTPUT = 3,
   FTLPU_Q_VXM = 4,
 };
 
@@ -166,9 +164,10 @@ That keeps the software contract aligned with the future hardware control path.
 ## Current CModel Boundary
 
 The current CModel still has one important integration boundary:
-`MxmGemmEngine` is not fully owned by `TspSliceSystem::tick()`. The ICU already
-dispatches MXM load, compute, and output control pulses, but the numeric GEMM
-engine is still bridged by the integration test.
+the numeric MXM GEMM datapath is advanced by `TspSliceSystem::tick()`, while
+larger FFN tests still provide explicit scheduling around MEM/MXM/VXM phases.
+The ICU already dispatches MXM load and compute control pulses, with compute
+carrying the output stream base.
 
 Recommended order:
 

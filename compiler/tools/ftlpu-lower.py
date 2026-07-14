@@ -6,7 +6,6 @@ files for the planned layers before we wire these passes into MLIR proper.
 """
 
 import argparse
-import math
 import re
 import sys
 from dataclasses import dataclass
@@ -78,73 +77,66 @@ module {{
 
 
 def emit_stream_ir(matmul, tile):
-    m_tiles = math.ceil(matmul.m / tile)
-    n_tiles = math.ceil(matmul.n / tile)
-    k_tiles = math.ceil(matmul.k / tile)
     lines = [
         "// FTLPU stream IR lowered from ftlpu.tensor.",
+        "// This layer binds each long logical stream to source, sink, and stream register ids.",
         "module {",
         "  ftlpu.stream.func @main {",
-        "    %a = ftlpu.stream.memref @A {addr = 0, layout = \"row_major\"}",
-        f"    %b = ftlpu.stream.memref @B {{addr = {matmul.m * matmul.k}, layout = \"row_major\"}}",
-        f"    %c = ftlpu.stream.memref @C {{addr = {matmul.m * matmul.k + matmul.k * matmul.n}, layout = \"row_major\"}}",
         (
-            f"    ftlpu.stream.matmul_grid %a, %b, %c {{m = {matmul.m}, n = {matmul.n}, "
-            f"k = {matmul.k}, tile_m = {tile}, tile_n = {tile}, tile_k = {tile}, "
-            f"m_tiles = {m_tiles}, n_tiles = {n_tiles}, k_tiles = {k_tiles}}}"
+            f"    ftlpu.stream.matmul_grid @matmul0 {{m = {matmul.m}, n = {matmul.n}, "
+            f"k = {matmul.k}, vector_lanes = 16, south_to_north_tiles = {tile}, mxm_count = 2}}"
+        ),
+        (
+            "    ftlpu.stream.channel @matmul0_lhs "
+            f"{{stream_ids = [0..15], sregs = [0..11], source = \"MEM:A0\", "
+            f"sink = \"MXM*:lhs\", start_addr = 0, bytes = {matmul.m * matmul.k}, "
+            "vector = \"south_to_north\"}"
+        ),
+        (
+            "    ftlpu.stream.channel @matmul0_rhs "
+            f"{{stream_ids = [32..47], sregs = [0..11], source = \"MEM:B0\", "
+            f"sink = \"MXM*:rhs\", start_addr = {matmul.m * matmul.k}, "
+            f"bytes = {matmul.k * matmul.n}, vector = \"south_to_north\"}}"
+        ),
+        (
+            "    ftlpu.stream.channel @matmul0_out "
+            f"{{stream_ids = [48..63], sregs = [0..11], source = \"MXM*:output\", "
+            f"sink = \"MEM:C0\", start_addr = {matmul.m * matmul.k + matmul.k * matmul.n}, "
+            f"bytes = {matmul.m * matmul.n * 4}, vector = \"south_to_north\"}}"
         ),
     ]
-    for mt in range(m_tiles):
-        for nt in range(n_tiles):
-            for kt in range(k_tiles):
-                lines.append(
-                    (
-                        "    ftlpu.stream.matmul_tile "
-                        f"@m{mt}_n{nt}_k{kt} {{m_tile = {mt}, n_tile = {nt}, k_tile = {kt}, "
-                        f"mxm = {((mt + nt) % 2)}, lhs_stream = {(mt * k_tiles + kt) % 64}, "
-                        f"rhs_stream = {(nt * k_tiles + kt + 32) % 64}, out_stream = {(mt * n_tiles + nt) % 64}}}"
-                    )
-                )
     lines.extend(["  }", "}", ""])
     return "\n".join(lines)
 
 
 def emit_schedule_ir(matmul, tile):
-    m_tiles = math.ceil(matmul.m / tile)
-    n_tiles = math.ceil(matmul.n / tile)
-    k_tiles = math.ceil(matmul.k / tile)
-    cycle = 0
     lines = [
         "// FTLPU schedule IR lowered from ftlpu.stream.",
-        "// This is the low-level queue/timeline layer before .ftlpu emission.",
+        "// This is a stage-level queue/timeline layer before .ftlpu emission.",
         "module {",
         "  ftlpu.schedule.program @main {",
+        (
+            "    ftlpu.schedule.mem_read @matmul0_read "
+            f"{{cycle = 0, sources = [@A0, @B0], streams = [0..15, 32..47], "
+            f"sregs = [0..11], bytes = [{matmul.m * matmul.k}, {matmul.k * matmul.n}], "
+            f"vector = \"south_to_north\", south_to_north_tiles = {tile}}}"
+        ),
+        (
+            "    ftlpu.schedule.mxm_load @matmul0_load "
+            "{cycle = 8, mxms = [0, 1], lhs_streams = [0..15], rhs_streams = [32..47]}"
+        ),
+        (
+            "    ftlpu.schedule.mxm_compute @matmul0_compute "
+            f"{{cycle = 16, mxms = [0, 1], m = {matmul.m}, n = {matmul.n}, k = {matmul.k}, "
+            f"vector_lanes = 16, south_to_north_tiles = {tile}, accumulate = true}}"
+        ),
+        (
+            "    ftlpu.schedule.mem_write @matmul0_write "
+            f"{{cycle = 32, dest = @C0, streams = [48..63], sregs = [0..11], "
+            f"bytes = {matmul.m * matmul.n * 4}, vector = \"south_to_north\", "
+            f"south_to_north_tiles = {tile}}}"
+        ),
     ]
-    for mt in range(m_tiles):
-        for nt in range(n_tiles):
-            for kt in range(k_tiles):
-                mxm = (mt + nt) % 2
-                lhs_addr = (mt * tile * matmul.k) + (kt * tile)
-                rhs_addr = (kt * tile * matmul.n) + (nt * tile)
-                out_addr = (matmul.m * matmul.k + matmul.k * matmul.n) + (
-                    mt * tile * matmul.n
-                ) + (nt * tile)
-                lines.extend(
-                    [
-                        f"    ftlpu.schedule.mem_read @mem0 cycle {cycle} addr {lhs_addr} bytes {tile * tile} stream 0",
-                        f"    ftlpu.schedule.mem_read @mem1 cycle {cycle + 1} addr {rhs_addr} bytes {tile * tile} stream 32",
-                        f"    ftlpu.schedule.mxm_load @mxm{mxm} cycle {cycle + 8} lhs_stream 0 rhs_stream 32",
-                        f"    ftlpu.schedule.mxm_compute @mxm{mxm} cycle {cycle + 16} m {tile} n {tile} k {tile} accumulate {str(kt != 0).lower()}",
-                    ]
-                )
-                if kt == k_tiles - 1:
-                    lines.append(
-                        f"    ftlpu.schedule.mxm_output @mxm{mxm} cycle {cycle + 28} stream 48"
-                    )
-                    lines.append(
-                        f"    ftlpu.schedule.mem_write @mem2 cycle {cycle + 36} addr {out_addr} bytes {tile * tile * 4} stream 48"
-                    )
-                cycle += 48
     lines.extend(["  }", "}", ""])
     return "\n".join(lines)
 
