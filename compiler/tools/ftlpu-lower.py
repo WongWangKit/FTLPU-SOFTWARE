@@ -116,19 +116,26 @@ def emit_schedule_ir(matmul, tile):
         "module {",
         "  ftlpu.schedule.program @main {",
         (
-            "    ftlpu.schedule.mem_read @matmul0_read "
-            f"{{cycle = 0, sources = [@A0, @B0], streams = [0..15, 32..47], "
-            f"sregs = [0..11], bytes = [{matmul.m * matmul.k}, {matmul.k * matmul.n}], "
+            "    ftlpu.schedule.mem_read_weight @matmul0_read_weight "
+            f"{{cycle = 0, source = @B0, streams = [0..15], "
+            f"sregs = [0..11], bytes = {matmul.k * matmul.n}, "
             f"vector = \"south_to_north\", south_to_north_tiles = {tile}}}"
         ),
         (
             "    ftlpu.schedule.mxm_load @matmul0_load "
-            "{cycle = 8, mxms = [0, 1], lhs_streams = [0..15], rhs_streams = [32..47]}"
+            "{cycle = 8, mxms = [0, 1], weight_streams = [0..15]}"
+        ),
+        (
+            "    ftlpu.schedule.mem_read_activation @matmul0_read_activation "
+            f"{{cycle = 12, source = @A0, streams = [16..31], "
+            f"sregs = [0..11], bytes = {matmul.m * matmul.k}, "
+            f"vector = \"south_to_north\", south_to_north_tiles = {tile}}}"
         ),
         (
             "    ftlpu.schedule.mxm_compute @matmul0_compute "
             f"{{cycle = 16, mxms = [0, 1], m = {matmul.m}, n = {matmul.n}, k = {matmul.k}, "
-            f"vector_lanes = 16, south_to_north_tiles = {tile}, accumulate = true}}"
+            f"activation_streams = [16..31], output_streams = [48..63], vector_lanes = 16, "
+            f"south_to_north_tiles = {tile}, accumulate = true}}"
         ),
         (
             "    ftlpu.schedule.mem_write @matmul0_write "

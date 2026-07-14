@@ -22,6 +22,16 @@ std::size_t ceil_div(std::size_t lhs, std::size_t rhs)
     return (lhs + rhs - 1) / rhs;
 }
 
+bool is_consumed_by_swiglu(const Module& module, std::size_t matmul_index)
+{
+    for (const auto& swiglu : module.swiglus) {
+        if (swiglu.gate_matmul == matmul_index || swiglu.up_matmul == matmul_index) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 Module lower_stablehlo_to_kernel(const Module& module)
@@ -202,17 +212,23 @@ Module lower_stream_to_schedule(const Module& module, std::size_t south_to_north
     os << "module {\n";
     os << "  ftlpu.schedule.program @main {\n";
     for (std::size_t i = 0; i < module.matmuls.size(); ++i) {
+        if (is_consumed_by_swiglu(module, i)) {
+            continue;
+        }
         const auto& op = module.matmuls[i];
-        os << "    ftlpu.schedule.mem_read @matmul" << i << "_read"
-           << " {cycle = 0, sources = [@A" << i << ", @B" << i
-           << "], streams = [0..15, 32..47], sregs = [0..11], bytes = ["
-           << (op.m * op.k) << ", " << (op.k * op.n)
-           << "], vector = \"south_to_north\", south_to_north_tiles = " << south_to_north_tiles << "}\n";
+        os << "    ftlpu.schedule.mem_read_weight @matmul" << i << "_read_weight"
+           << " {cycle = 0, source = @B" << i
+           << ", streams = [0..15], sregs = [0..11], bytes = " << (op.k * op.n)
+           << ", vector = \"south_to_north\", south_to_north_tiles = " << south_to_north_tiles << "}\n";
         os << "    ftlpu.schedule.mxm_load @matmul" << i << "_load"
-           << " {cycle = 8, mxms = [0, 1], lhs_streams = [0..15], rhs_streams = [32..47]}\n";
+           << " {cycle = 8, mxms = [0, 1], weight_streams = [0..15]}\n";
+        os << "    ftlpu.schedule.mem_read_activation @matmul" << i << "_read_activation"
+           << " {cycle = 12, source = @A" << i
+           << ", streams = [16..31], sregs = [0..11], bytes = " << (op.m * op.k)
+           << ", vector = \"south_to_north\", south_to_north_tiles = " << south_to_north_tiles << "}\n";
         os << "    ftlpu.schedule.mxm_compute @matmul" << i << "_compute"
            << " {cycle = 16, mxms = [0, 1], m = " << op.m << ", n = " << op.n
-           << ", k = " << op.k << ", vector_lanes = 16, south_to_north_tiles = "
+           << ", k = " << op.k << ", activation_streams = [16..31], output_streams = [48..63], vector_lanes = 16, south_to_north_tiles = "
            << south_to_north_tiles << ", accumulate = true}\n";
         os << "    ftlpu.schedule.mem_write @matmul" << i << "_write"
            << " {cycle = 32, dest = @C" << i
@@ -221,9 +237,20 @@ Module lower_stream_to_schedule(const Module& module, std::size_t south_to_north
     }
     for (std::size_t i = 0; i < module.swiglus.size(); ++i) {
         const auto& op = module.swiglus[i];
+        os << "    ftlpu.schedule.mem_read_weight_gate_up @swiglu" << i << "_read_weight"
+           << " {cycle = 0, sources = [@gate_w" << i << ", @up_w" << i
+           << "], mxms = [0, 1], streams = [0..15, 16..31], bytes = ["
+           << (op.columns * op.columns) << ", " << (op.columns * op.columns)
+           << "], vector = \"south_to_north\", south_to_north_tiles = " << south_to_north_tiles << "}\n";
+        os << "    ftlpu.schedule.mxm_load_gate_up @swiglu" << i << "_load"
+           << " {cycle = 8, mxms = [0, 1], gate_weight_streams = [0..15], up_weight_streams = [16..31]}\n";
+        os << "    ftlpu.schedule.mem_read_activation @swiglu" << i << "_read_activation"
+           << " {cycle = 12, source = @activation" << i
+           << ", streams = [16], bytes = " << (op.rows * op.columns)
+           << ", vector = \"south_to_north\", south_to_north_tiles = " << south_to_north_tiles << "}\n";
         os << "    ftlpu.schedule.mxm_compute_gate_up @swiglu" << i << "_gate_up"
            << " {cycle = 16, mxms = [0, 1], rows = " << op.rows
-           << ", columns = " << op.columns
+           << ", columns = " << op.columns << ", activation_stream = 16"
            << ", gate_output_streams = [32..35], up_output_streams = [36..39]}\n";
         os << "    ftlpu.schedule.vxm_swiglu @swiglu" << i << "_vxm"
            << " {cycle = 47, gate_streams = [32..35], up_streams = [36..39], output_stream = 31, "

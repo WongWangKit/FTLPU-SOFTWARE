@@ -74,9 +74,9 @@ The schedule IR is the low-level scheduled target:
 - explicit MEM/MXM/VXM queues;
 - explicit NOP and repeat opportunities;
 - direct serialization into `.ftlpu` queue sections.
-- stage-level operations first, such as `mem_read`, `mxm_load`, `mxm_compute`,
-  and `mem_write`; tile-by-tile expansion belongs in the later queue/binary
-  emission layer.
+- stage-level operations first, such as `mem_read_weight`,
+  `mem_read_activation`, `mxm_load`, `mxm_compute`, and `mem_write`;
+  tile-by-tile expansion belongs in the later queue/binary emission layer.
 
 The runtime consumes this layer through the binary format and loads the CModel
 ICU queues before clocks start.

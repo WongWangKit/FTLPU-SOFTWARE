@@ -75,7 +75,8 @@ def main(argv):
         schedule_ir,
         [
             "ftlpu.schedule.program",
-            "ftlpu.schedule.mem_read",
+            "ftlpu.schedule.mem_read_weight",
+            "ftlpu.schedule.mem_read_activation",
             "ftlpu.schedule.mxm_load",
             "ftlpu.schedule.mxm_compute",
             "ftlpu.schedule.mem_write",
@@ -83,8 +84,8 @@ def main(argv):
             "south_to_north_tiles = 20",
         ],
     )
-    if schedule_ir.count("ftlpu.schedule.") != 5:
-        raise AssertionError("schedule IR should contain exactly four stage ops plus the program op")
+    if schedule_ir.count("ftlpu.schedule.") != 6:
+        raise AssertionError("schedule IR should contain exactly five stage ops plus the program op")
     print(f"generated tensor IR: {args.work_dir / 'matmul_320.tensor.mlir'}")
     print(f"generated stream IR: {args.work_dir / 'matmul_320.stream.mlir'}")
     print(f"generated schedule IR: {args.work_dir / 'matmul_320.schedule.mlir'}")
