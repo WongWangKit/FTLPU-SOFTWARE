@@ -35,6 +35,12 @@ add_executable(cmodel_static_runtime_link_test
 
 target_link_libraries(cmodel_static_runtime_link_test PRIVATE ftlpu_software)
 
+add_executable(cmodel_gemm_320_runtime_test
+    tests/runtime/cmodel_gemm_320_runtime_test.cpp)
+
+target_link_libraries(cmodel_gemm_320_runtime_test PRIVATE ftlpu_software)
+
 add_test(NAME icu_program_smoke_test COMMAND icu_program_smoke_test)
 add_test(NAME lpu_ir_binary_runtime_test COMMAND lpu_ir_binary_runtime_test)
 add_test(NAME cmodel_static_runtime_link_test COMMAND cmodel_static_runtime_link_test)
+add_test(NAME cmodel_gemm_320_runtime_test COMMAND cmodel_gemm_320_runtime_test)
