@@ -38,7 +38,8 @@ The compiler direction is:
 ```text
 ONNX / PyTorch / TensorFlow
   -> StableHLO as the frontend common IR
-  -> FTLPU common tensor IR
+  -> FTLPU kernel IR
+  -> FTLPU tensor IR
   -> FTLPU stream IR
   -> FTLPU schedule IR
   -> .ftlpu binary

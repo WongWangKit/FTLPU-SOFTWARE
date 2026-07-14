@@ -5,7 +5,8 @@ This document fixes the compiler split for the first LPU backend work:
 ```text
 ONNX / PyTorch / TensorFlow
   -> StableHLO
-  -> FTLPU common tensor IR
+  -> FTLPU kernel IR
+  -> FTLPU tensor IR
   -> FTLPU stream IR
   -> FTLPU schedule IR
   -> .ftlpu binary
@@ -30,23 +31,34 @@ StableHLO should represent frontend model semantics after framework import:
 This boundary keeps the LPU compiler independent from ONNX, PyTorch, and
 TensorFlow graph quirks.
 
-### FTLPU Common Tensor IR
+### FTLPU Kernel IR
 
-The common tensor IR is the first FTLPU-owned compiler layer. It should:
+The kernel IR is the first FTLPU-owned compiler layer. It should:
 
-- normalize StableHLO ops into a small LPU-oriented operator set;
+- normalize StableHLO ops into a small LPU-oriented kernel set;
+- map each kernel to concrete LPU functional units such as MXM and VXM;
+- represent fused kernels such as SwiGLU as unit-level compositions, for
+  example `MXM + MXM + VXM + MXM`;
 - validate static shapes and element types supported by the LPU;
-- preserve quantization and layout metadata explicitly;
-- prepare matmul, elementwise, and post-op fusion candidates.
+- preserve quantization and layout metadata explicitly.
+
+### FTLPU Tensor IR
+
+The tensor IR owns MEM allocation and tensor placement:
+
+- assign activation, weight, intermediate, and output tensors to MEM ranges;
+- choose MEM columns/banks and base addresses;
+- describe tile plans that reference the selected kernels;
+- keep layouts and element sizes explicit.
 
 ### FTLPU Stream IR
 
-The stream IR maps tensor work onto LPU resources:
+The stream IR maps MEM-resident tensor tiles onto LPU streams:
 
-- MEM column reads and writes;
-- MXM input, weight, compute, and output streams;
-- VXM lanes and post-processing streams;
-- SRAM addresses, tile sizes, and scheduling constraints.
+- every stream has a source and sink, such as `MEM:A -> MXM0:lhs`;
+- every stream records stream id and stream register id;
+- every stream records start address, byte count, and endpoint functional unit;
+- MXM/VXM post-processing streams are explicit instead of implied by kernels.
 
 This layer is conceptually similar to IREE Stream, but it is FTLPU-owned and
 should model the real LPU data movement directly.
@@ -82,14 +94,14 @@ ONNX -> IREE importer -> IREE Flow IR
 Those tests are comparison and sanity tests. The main backend path should be:
 
 ```text
-StableHLO -> FTLPU common tensor IR -> FTLPU stream IR -> FTLPU schedule IR
+StableHLO -> FTLPU kernel IR -> FTLPU tensor IR -> FTLPU stream IR -> FTLPU schedule IR
 ```
 
 ## Immediate Milestones
 
 1. Keep ONNX-to-IREE Flow tests as reference coverage.
 2. Add StableHLO fixture tests for matmul and elementwise ops.
-3. Define textual `ftlpu.tensor` or `ftlpu.common` examples.
-4. Lower StableHLO matmul to the first FTLPU stream form.
-5. Lower StableHLO/FTLPU Tensor FFN SwiGLU to the CModel-aligned schedule shape.
+3. Define textual `ftlpu.kernel`, `ftlpu.tensor`, and `ftlpu.stream` examples.
+4. Lower StableHLO matmul to MXM kernel, MEM allocation, and explicit stream form.
+5. Lower StableHLO/FTLPU Kernel FFN SwiGLU to the CModel-aligned schedule shape.
 6. Lower FTLPU stream/schedule programs to `.ftlpu`.

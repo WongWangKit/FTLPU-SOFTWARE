@@ -36,32 +36,42 @@ def main():
     args = parser.parse_args()
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
+    kernel_ir = run_pipeline(
+        args.tool,
+        args.input,
+        args.work_dir / "matmul_320.kernel.mlir",
+        "stablehlo-to-kernel",
+    )
     tensor_ir = run_pipeline(
         args.tool,
         args.input,
         args.work_dir / "matmul_320.tensor.mlir",
-        "stablehlo-to-tensor",
+        "stablehlo-to-kernel,kernel-to-tensor",
     )
     stream_ir = run_pipeline(
         args.tool,
         args.input,
         args.work_dir / "matmul_320.stream.mlir",
-        "stablehlo-to-tensor,tensor-to-stream",
+        "stablehlo-to-kernel,kernel-to-tensor,tensor-to-stream",
     )
     schedule_ir = run_pipeline(
         args.tool,
         args.input,
         args.work_dir / "matmul_320.schedule.mlir",
-        "stablehlo-to-tensor,tensor-to-stream,stream-to-schedule",
+        "stablehlo-to-kernel,kernel-to-tensor,tensor-to-stream,stream-to-schedule",
     )
 
     assert_contains(
+        kernel_ir,
+        ["ftlpu.kernel.mxm_matmul", "unit = \"MXM\"", "mxm_count = 2", "tile_m = 20"],
+    )
+    assert_contains(
         tensor_ir,
-        ["ftlpu.tensor.matmul", "m = 320", "n = 320", "k = 320", "acc_dtype = \"i32\""],
+        ["ftlpu.tensor.mem_buffer @A0", "base = 0", "ftlpu.tensor.mem_buffer @B0", "ftlpu.tensor.tile_plan"],
     )
     assert_contains(
         stream_ir,
-        ["ftlpu.stream.matmul_grid", "m_tiles = 16", "n_tiles = 16", "k_tiles = 16"],
+        ["ftlpu.stream.matmul_grid", "ftlpu.stream.channel", "source = \"MEM:A0\"", "sink = \"MXM0:lhs\"", "sreg = "],
     )
     assert_contains(
         schedule_ir,
@@ -73,6 +83,7 @@ def main():
             "ftlpu.schedule.mem_write",
         ],
     )
+    print(f"generated kernel IR: {args.work_dir / 'matmul_320.kernel.mlir'}")
     print(f"generated tensor IR: {args.work_dir / 'matmul_320.tensor.mlir'}")
     print(f"generated stream IR: {args.work_dir / 'matmul_320.stream.mlir'}")
     print(f"generated schedule IR: {args.work_dir / 'matmul_320.schedule.mlir'}")

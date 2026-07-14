@@ -18,6 +18,8 @@ const char* dialect_name(Dialect dialect)
     switch (dialect) {
     case Dialect::StableHlo:
         return "stablehlo";
+    case Dialect::Kernel:
+        return "ftlpu.kernel";
     case Dialect::Tensor:
         return "ftlpu.tensor";
     case Dialect::Stream:

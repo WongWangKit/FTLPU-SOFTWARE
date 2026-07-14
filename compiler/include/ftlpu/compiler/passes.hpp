@@ -7,7 +7,8 @@
 
 namespace ftlpu::compiler {
 
-Module lower_stablehlo_to_tensor(const Module& module);
+Module lower_stablehlo_to_kernel(const Module& module);
+Module lower_kernel_to_tensor(const Module& module, std::size_t tile_size = 20);
 Module lower_tensor_to_stream(const Module& module, std::size_t tile_size = 20);
 Module lower_stream_to_schedule(const Module& module, std::size_t tile_size = 20);
 

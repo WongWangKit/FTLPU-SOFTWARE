@@ -8,6 +8,7 @@ namespace ftlpu::compiler {
 
 enum class Dialect {
     StableHlo,
+    Kernel,
     Tensor,
     Stream,
     Schedule,
