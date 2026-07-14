@@ -58,6 +58,15 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
             --work-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/matmul_320)
 
+    add_test(
+        NAME stablehlo_swiglu_to_ftlpu_schedule_cpp_test
+        COMMAND
+            ${FTLPU_COMPILER_PYTHON}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_swiglu_cpp_pass_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_swiglu_stablehlo.mlir
+            --work-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/swiglu)
+
     if(FTLPU_IREE_IMPORT_ONNX AND FTLPU_IREE_COMPILE)
         add_test(
             NAME iree_frontend_onnx_matmul_320_to_flow_ir_test

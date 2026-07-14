@@ -30,6 +30,7 @@ Module lower_stablehlo_to_kernel(const Module& module)
     Module out;
     out.dialect = Dialect::Kernel;
     out.matmuls = module.matmuls;
+    out.swiglus = module.swiglus;
 
     std::ostringstream os;
     os << "// FTLPU kernel IR lowered from StableHLO.\n";
@@ -57,6 +58,21 @@ Module lower_stablehlo_to_kernel(const Module& module)
            << op.k << "x" << op.n << "x" << op.rhs_type << ">) -> tensor<"
            << op.m << "x" << op.n << "x" << op.acc_type << ">\n";
     }
+    for (std::size_t i = 0; i < module.swiglus.size(); ++i) {
+        const auto& op = module.swiglus[i];
+        os << "    %swiglu" << i << " = ftlpu.kernel.swiglu %c" << op.gate_matmul
+           << ", %c" << op.up_matmul << " {\n";
+        os << "      units = [\"MXM0\", \"MXM1\", \"VXM\"],\n";
+        os << "      rows = " << op.rows << ",\n";
+        os << "      columns = " << op.columns << ",\n";
+        os << "      gate_scale = 0.00048828125,\n";
+        os << "      up_scale = 0.00048828125,\n";
+        os << "      output_scale = 0.0078125,\n";
+        os << "      output_dtype = \"" << op.output_type << "\"\n";
+        os << "    } : (tensor<" << op.rows << "x" << op.columns << "x" << op.input_type
+           << ">, tensor<" << op.rows << "x" << op.columns << "x" << op.input_type
+           << ">) -> tensor<" << op.rows << "x" << op.columns << "x" << op.output_type << ">\n";
+    }
     os << "  }\n";
     os << "}\n";
     out.text = os.str();
@@ -69,6 +85,7 @@ Module lower_kernel_to_tensor(const Module& module, std::size_t tile_size)
     Module out;
     out.dialect = Dialect::Tensor;
     out.matmuls = module.matmuls;
+    out.swiglus = module.swiglus;
 
     std::ostringstream os;
     os << "// FTLPU tensor IR lowered from ftlpu.kernel.\n";
@@ -104,6 +121,18 @@ Module lower_kernel_to_tensor(const Module& module, std::size_t tile_size)
            << ", m_tiles = " << m_tiles << ", n_tiles = " << n_tiles
            << ", k_tiles = " << k_tiles << "}\n";
     }
+    for (std::size_t i = 0; i < module.swiglus.size(); ++i) {
+        const auto& op = module.swiglus[i];
+        os << "    %s" << i << " = ftlpu.tensor.mem_buffer @S" << i
+           << " {mem_space = \"MEM\", base = " << (3 * op.rows * op.columns)
+           << ", bytes = " << (op.rows * op.columns)
+           << ", shape = [" << op.rows << ", " << op.columns
+           << "], dtype = \"" << op.output_type << "\", layout = \"row_major\"}\n";
+        os << "    ftlpu.tensor.post_op @swiglu" << i
+           << " {gate = @matmul" << op.gate_matmul
+           << ", up = @matmul" << op.up_matmul
+           << ", output = @S" << i << "}\n";
+    }
     os << "  }\n";
     os << "}\n";
     out.text = os.str();
@@ -116,6 +145,7 @@ Module lower_tensor_to_stream(const Module& module, std::size_t south_to_north_t
     Module out;
     out.dialect = Dialect::Stream;
     out.matmuls = module.matmuls;
+    out.swiglus = module.swiglus;
 
     std::ostringstream os;
     os << "// FTLPU stream IR lowered from ftlpu.tensor.\n";
@@ -141,6 +171,17 @@ Module lower_tensor_to_stream(const Module& module, std::size_t south_to_north_t
            << "\", start_addr = " << (op.m * op.k + op.k * op.n)
            << ", bytes = " << (op.m * op.n * 4) << ", vector = \"south_to_north\"}\n";
     }
+    for (std::size_t i = 0; i < module.swiglus.size(); ++i) {
+        const auto& op = module.swiglus[i];
+        os << "    ftlpu.stream.vxm_swiglu @swiglu" << i
+           << " {rows = " << op.rows << ", columns = " << op.columns
+           << ", gate_streams = [32..35], up_streams = [36..39], output_stream = 31, "
+           << "sregs = [0..11], source = \"MXM*:output\", sink = \"VXM:sigmoid_mul\"}\n";
+        os << "    ftlpu.stream.channel @swiglu" << i << "_out"
+           << " {stream_ids = [31], sregs = [0..11], source = \"VXM:sigmoid_mul\", sink = \"MEM:S"
+           << i << "\", bytes = " << (op.rows * op.columns)
+           << ", vector = \"south_to_north\"}\n";
+    }
     os << "  }\n";
     os << "}\n";
     out.text = os.str();
@@ -153,6 +194,7 @@ Module lower_stream_to_schedule(const Module& module, std::size_t south_to_north
     Module out;
     out.dialect = Dialect::Schedule;
     out.matmuls = module.matmuls;
+    out.swiglus = module.swiglus;
 
     std::ostringstream os;
     os << "// FTLPU schedule IR lowered from ftlpu.stream.\n";
@@ -175,6 +217,20 @@ Module lower_stream_to_schedule(const Module& module, std::size_t south_to_north
         os << "    ftlpu.schedule.mem_write @matmul" << i << "_write"
            << " {cycle = 32, dest = @C" << i
            << ", streams = [48..63], sregs = [0..11], bytes = " << (op.m * op.n * 4)
+           << ", vector = \"south_to_north\", south_to_north_tiles = " << south_to_north_tiles << "}\n";
+    }
+    for (std::size_t i = 0; i < module.swiglus.size(); ++i) {
+        const auto& op = module.swiglus[i];
+        os << "    ftlpu.schedule.mxm_compute_gate_up @swiglu" << i << "_gate_up"
+           << " {cycle = 16, mxms = [0, 1], rows = " << op.rows
+           << ", columns = " << op.columns
+           << ", gate_output_streams = [32..35], up_output_streams = [36..39]}\n";
+        os << "    ftlpu.schedule.vxm_swiglu @swiglu" << i << "_vxm"
+           << " {cycle = 47, gate_streams = [32..35], up_streams = [36..39], output_stream = 31, "
+           << "stages = 10, output_scale = 0.0078125}\n";
+        os << "    ftlpu.schedule.mem_write @swiglu" << i << "_write"
+           << " {cycle = 68, dest = @S" << i
+           << ", streams = [31], sregs = [0..11], bytes = " << (op.rows * op.columns)
            << ", vector = \"south_to_north\", south_to_north_tiles = " << south_to_north_tiles << "}\n";
     }
     os << "  }\n";

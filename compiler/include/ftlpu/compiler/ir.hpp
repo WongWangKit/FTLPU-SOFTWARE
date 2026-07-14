@@ -23,9 +23,19 @@ struct MatmulOp {
     std::string acc_type;
 };
 
+struct SwigluOp {
+    std::size_t gate_matmul{0};
+    std::size_t up_matmul{1};
+    std::size_t rows{0};
+    std::size_t columns{0};
+    std::string input_type;
+    std::string output_type{"i8"};
+};
+
 struct Module {
     Dialect dialect{Dialect::StableHlo};
     std::vector<MatmulOp> matmuls;
+    std::vector<SwigluOp> swiglus;
     std::string text;
 };
 

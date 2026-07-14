@@ -61,6 +61,15 @@ Module parse_stablehlo_module(const std::string& text)
     if (module.matmuls.empty()) {
         throw std::runtime_error("expected at least one stablehlo.dot_general matmul");
     }
+    if (text.find("stablehlo.logistic") != std::string::npos
+        && text.find("stablehlo.multiply") != std::string::npos
+        && module.matmuls.size() >= 2) {
+        const auto& gate = module.matmuls[0];
+        const auto& up = module.matmuls[1];
+        if (gate.m == up.m && gate.n == up.n && gate.k == up.k) {
+            module.swiglus.push_back(SwigluOp {0, 1, gate.m, gate.n, gate.acc_type, "i8"});
+        }
+    }
     return module;
 }
 
