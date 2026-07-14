@@ -59,6 +59,9 @@ The stream IR maps MEM-resident tensor tiles onto LPU streams:
 - every stream records stream id and stream register id;
 - every stream records start address, byte count, and endpoint functional unit;
 - MXM/VXM post-processing streams are explicit instead of implied by kernels.
+- streams are long logical vectors when the instruction naturally traverses the
+  south-to-north tile chain; the compiler should not expand those 20 physical
+  tiles into separate IR ops.
 
 This layer is conceptually similar to IREE Stream, but it is FTLPU-owned and
 should model the real LPU data movement directly.
@@ -71,6 +74,9 @@ The schedule IR is the low-level scheduled target:
 - explicit MEM/MXM/VXM queues;
 - explicit NOP and repeat opportunities;
 - direct serialization into `.ftlpu` queue sections.
+- stage-level operations first, such as `mem_read`, `mxm_load`, `mxm_compute`,
+  and `mem_write`; tile-by-tile expansion belongs in the later queue/binary
+  emission layer.
 
 The runtime consumes this layer through the binary format and loads the CModel
 ICU queues before clocks start.

@@ -71,18 +71,29 @@ def main():
     )
     assert_contains(
         stream_ir,
-        ["ftlpu.stream.matmul_grid", "ftlpu.stream.channel", "source = \"MEM:A0\"", "sink = \"MXM0:lhs\"", "sreg = "],
+        [
+            "ftlpu.stream.matmul_grid",
+            "south_to_north_tiles = 20",
+            "ftlpu.stream.channel @matmul0_lhs",
+            "stream_ids = [0..15]",
+            "source = \"MEM:A0\"",
+            "sink = \"MXM*:lhs\"",
+            "sregs = [0..11]",
+        ],
     )
     assert_contains(
         schedule_ir,
         [
             "ftlpu.schedule.program",
-            "ftlpu.schedule.mem_read",
-            "ftlpu.schedule.mxm_load",
-            "ftlpu.schedule.mxm_compute",
-            "ftlpu.schedule.mem_write",
+            "ftlpu.schedule.mem_read @matmul0_read",
+            "ftlpu.schedule.mxm_load @matmul0_load",
+            "ftlpu.schedule.mxm_compute @matmul0_compute",
+            "ftlpu.schedule.mem_write @matmul0_write",
+            "south_to_north_tiles = 20",
         ],
     )
+    if schedule_ir.count("ftlpu.schedule.") != 5:
+        raise AssertionError("schedule IR should contain exactly four stage ops plus the program op")
     print(f"generated kernel IR: {args.work_dir / 'matmul_320.kernel.mlir'}")
     print(f"generated tensor IR: {args.work_dir / 'matmul_320.tensor.mlir'}")
     print(f"generated stream IR: {args.work_dir / 'matmul_320.stream.mlir'}")

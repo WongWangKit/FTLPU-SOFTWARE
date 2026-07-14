@@ -110,7 +110,7 @@ Module lower_kernel_to_tensor(const Module& module, std::size_t tile_size)
     return out;
 }
 
-Module lower_tensor_to_stream(const Module& module, std::size_t tile_size)
+Module lower_tensor_to_stream(const Module& module, std::size_t south_to_north_tiles)
 {
     require_dialect(module, Dialect::Tensor, "tensor-to-stream");
     Module out;
@@ -119,46 +119,27 @@ Module lower_tensor_to_stream(const Module& module, std::size_t tile_size)
 
     std::ostringstream os;
     os << "// FTLPU stream IR lowered from ftlpu.tensor.\n";
-    os << "// This layer binds each logical stream to source, sink, and stream register id.\n";
+    os << "// This layer binds each long logical stream to source, sink, and stream register ids.\n";
     os << "module {\n";
     os << "  ftlpu.stream.func @main {\n";
     for (std::size_t i = 0; i < module.matmuls.size(); ++i) {
         const auto& op = module.matmuls[i];
-        const auto m_tiles = ceil_div(op.m, tile_size);
-        const auto n_tiles = ceil_div(op.n, tile_size);
-        const auto k_tiles = ceil_div(op.k, tile_size);
         os << "    ftlpu.stream.matmul_grid @matmul" << i
            << " {m = " << op.m << ", n = " << op.n << ", k = " << op.k
-           << ", tile_m = " << tile_size << ", tile_n = " << tile_size
-           << ", tile_k = " << tile_size << ", m_tiles = " << m_tiles
-           << ", n_tiles = " << n_tiles << ", k_tiles = " << k_tiles << "}\n";
-        for (std::size_t mt = 0; mt < m_tiles; ++mt) {
-            for (std::size_t nt = 0; nt < n_tiles; ++nt) {
-                for (std::size_t kt = 0; kt < k_tiles; ++kt) {
-                    const auto mxm = (mt + nt) % 2;
-                    const auto lhs_stream = (mt * k_tiles + kt) % 64;
-                    const auto rhs_stream = (nt * k_tiles + kt + 32) % 64;
-                    const auto out_stream = (mt * n_tiles + nt) % 64;
-                    os << "    ftlpu.stream.channel @op" << i << "_m" << mt << "_n" << nt << "_k" << kt << "_lhs"
-                       << " {stream_id = " << lhs_stream << ", sreg = " << (lhs_stream % 12)
-                       << ", source = \"MEM:A" << i << "\", sink = \"MXM" << mxm << ":lhs\", "
-                       << "start_addr = " << (mt * tile_size * op.k + kt * tile_size)
-                       << ", bytes = " << (tile_size * tile_size) << "}\n";
-                    os << "    ftlpu.stream.channel @op" << i << "_m" << mt << "_n" << nt << "_k" << kt << "_rhs"
-                       << " {stream_id = " << rhs_stream << ", sreg = " << (rhs_stream % 12)
-                       << ", source = \"MEM:B" << i << "\", sink = \"MXM" << mxm << ":rhs\", "
-                       << "start_addr = " << (op.m * op.k + kt * tile_size * op.n + nt * tile_size)
-                       << ", bytes = " << (tile_size * tile_size) << "}\n";
-                    if (kt + 1 == k_tiles) {
-                        os << "    ftlpu.stream.channel @op" << i << "_m" << mt << "_n" << nt << "_out"
-                           << " {stream_id = " << out_stream << ", sreg = " << (out_stream % 12)
-                           << ", source = \"MXM" << mxm << ":output\", sink = \"MEM:C" << i << "\", "
-                           << "start_addr = " << (op.m * op.k + op.k * op.n + mt * tile_size * op.n + nt * tile_size)
-                           << ", bytes = " << (tile_size * tile_size * 4) << "}\n";
-                    }
-                }
-            }
-        }
+           << ", vector_lanes = 16, south_to_north_tiles = " << south_to_north_tiles
+           << ", mxm_count = 2}\n";
+        os << "    ftlpu.stream.channel @matmul" << i << "_lhs"
+           << " {stream_ids = [0..15], sregs = [0..11], source = \"MEM:A" << i
+           << "\", sink = \"MXM*:lhs\", start_addr = 0, bytes = " << (op.m * op.k)
+           << ", vector = \"south_to_north\"}\n";
+        os << "    ftlpu.stream.channel @matmul" << i << "_rhs"
+           << " {stream_ids = [32..47], sregs = [0..11], source = \"MEM:B" << i
+           << "\", sink = \"MXM*:rhs\", start_addr = " << (op.m * op.k)
+           << ", bytes = " << (op.k * op.n) << ", vector = \"south_to_north\"}\n";
+        os << "    ftlpu.stream.channel @matmul" << i << "_out"
+           << " {stream_ids = [48..63], sregs = [0..11], source = \"MXM*:output\", sink = \"MEM:C" << i
+           << "\", start_addr = " << (op.m * op.k + op.k * op.n)
+           << ", bytes = " << (op.m * op.n * 4) << ", vector = \"south_to_north\"}\n";
     }
     os << "  }\n";
     os << "}\n";
@@ -166,7 +147,7 @@ Module lower_tensor_to_stream(const Module& module, std::size_t tile_size)
     return out;
 }
 
-Module lower_stream_to_schedule(const Module& module, std::size_t tile_size)
+Module lower_stream_to_schedule(const Module& module, std::size_t south_to_north_tiles)
 {
     require_dialect(module, Dialect::Stream, "stream-to-schedule");
     Module out;
@@ -175,41 +156,26 @@ Module lower_stream_to_schedule(const Module& module, std::size_t tile_size)
 
     std::ostringstream os;
     os << "// FTLPU schedule IR lowered from ftlpu.stream.\n";
-    os << "// This is the low-level queue/timeline layer before .ftlpu emission.\n";
+    os << "// This is a stage-level queue/timeline layer before .ftlpu emission.\n";
     os << "module {\n";
     os << "  ftlpu.schedule.program @main {\n";
-    std::size_t cycle = 0;
-    for (const auto& op : module.matmuls) {
-        const auto m_tiles = ceil_div(op.m, tile_size);
-        const auto n_tiles = ceil_div(op.n, tile_size);
-        const auto k_tiles = ceil_div(op.k, tile_size);
-        for (std::size_t mt = 0; mt < m_tiles; ++mt) {
-            for (std::size_t nt = 0; nt < n_tiles; ++nt) {
-                for (std::size_t kt = 0; kt < k_tiles; ++kt) {
-                    const auto mxm = (mt + nt) % 2;
-                    const auto lhs_addr = mt * tile_size * op.k + kt * tile_size;
-                    const auto rhs_addr = kt * tile_size * op.n + nt * tile_size;
-                    const auto out_addr = op.m * op.k + op.k * op.n + mt * tile_size * op.n + nt * tile_size;
-                    os << "    ftlpu.schedule.mem_read @mem0 cycle " << cycle
-                       << " addr " << lhs_addr << " bytes " << (tile_size * tile_size) << " stream 0\n";
-                    os << "    ftlpu.schedule.mem_read @mem1 cycle " << (cycle + 1)
-                       << " addr " << rhs_addr << " bytes " << (tile_size * tile_size) << " stream 32\n";
-                    os << "    ftlpu.schedule.mxm_load @mxm" << mxm << " cycle " << (cycle + 8)
-                       << " lhs_stream 0 rhs_stream 32\n";
-                    os << "    ftlpu.schedule.mxm_compute @mxm" << mxm << " cycle " << (cycle + 16)
-                       << " m " << tile_size << " n " << tile_size << " k " << tile_size
-                       << " accumulate " << (kt != 0 ? "true" : "false") << "\n";
-                    if (kt + 1 == k_tiles) {
-                        os << "    ftlpu.schedule.mxm_output @mxm" << mxm << " cycle " << (cycle + 28)
-                           << " stream 48\n";
-                        os << "    ftlpu.schedule.mem_write @mem2 cycle " << (cycle + 36)
-                           << " addr " << out_addr << " bytes " << (tile_size * tile_size * 4)
-                           << " stream 48\n";
-                    }
-                    cycle += 48;
-                }
-            }
-        }
+    for (std::size_t i = 0; i < module.matmuls.size(); ++i) {
+        const auto& op = module.matmuls[i];
+        os << "    ftlpu.schedule.mem_read @matmul" << i << "_read"
+           << " {cycle = 0, sources = [@A" << i << ", @B" << i
+           << "], streams = [0..15, 32..47], sregs = [0..11], bytes = ["
+           << (op.m * op.k) << ", " << (op.k * op.n)
+           << "], vector = \"south_to_north\", south_to_north_tiles = " << south_to_north_tiles << "}\n";
+        os << "    ftlpu.schedule.mxm_load @matmul" << i << "_load"
+           << " {cycle = 8, mxms = [0, 1], lhs_streams = [0..15], rhs_streams = [32..47]}\n";
+        os << "    ftlpu.schedule.mxm_compute @matmul" << i << "_compute"
+           << " {cycle = 16, mxms = [0, 1], m = " << op.m << ", n = " << op.n
+           << ", k = " << op.k << ", vector_lanes = 16, south_to_north_tiles = "
+           << south_to_north_tiles << ", accumulate = true}\n";
+        os << "    ftlpu.schedule.mem_write @matmul" << i << "_write"
+           << " {cycle = 32, dest = @C" << i
+           << ", streams = [48..63], sregs = [0..11], bytes = " << (op.m * op.n * 4)
+           << ", vector = \"south_to_north\", south_to_north_tiles = " << south_to_north_tiles << "}\n";
     }
     os << "  }\n";
     os << "}\n";
