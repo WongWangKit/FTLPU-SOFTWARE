@@ -2,7 +2,8 @@ find_package(Python3 COMPONENTS Interpreter)
 
 add_library(ftlpu_compiler
     src/ir.cpp
-    src/passes.cpp)
+    src/passes.cpp
+    src/target_model.cpp)
 
 target_include_directories(ftlpu_compiler
     PUBLIC

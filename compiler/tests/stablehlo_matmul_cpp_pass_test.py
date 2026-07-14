@@ -67,7 +67,12 @@ def main():
     )
     assert_contains(
         tensor_ir,
-        ["ftlpu.tensor.mem_buffer @A0", "base = 0", "ftlpu.tensor.mem_buffer @B0", "ftlpu.tensor.tile_plan"],
+        [
+            "ftlpu.tensor.mem_buffer @A0",
+            "allocation = {addr = [device = 0, hemi = \"east\", slice = 0, bank = 0, word = 0, byte = 0]",
+            "ftlpu.tensor.mem_buffer @B0",
+            "ftlpu.tensor.tile_plan",
+        ],
     )
     assert_contains(
         stream_ir,
@@ -75,10 +80,13 @@ def main():
             "ftlpu.stream.matmul_grid",
             "south_to_north_tiles = 20",
             "ftlpu.stream.channel @matmul0_lhs",
-            "stream_ids = [0..15]",
-            "source = \"MEM:A0\"",
-            "sink = \"MXM*:lhs\"",
-            "sregs = [0..11]",
+            "stream_id = 16",
+            "direction = \"E\"",
+            "producer = \"MEM:A0\"",
+            "consumer = \"MXM:*:activation\"",
+            "produce_cycle =",
+            "consume_cycle =",
+            "latency =",
         ],
     )
     assert_contains(

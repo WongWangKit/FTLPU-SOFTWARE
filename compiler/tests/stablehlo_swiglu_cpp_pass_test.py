@@ -69,9 +69,12 @@ def main():
         stream_ir,
         [
             "ftlpu.stream.vxm_swiglu @swiglu0",
-            "gate_streams = [32..35]",
-            "up_streams = [36..39]",
+            "gate_stream = 32",
+            "up_stream = 36",
             "output_stream = 31",
+            "input_consume_cycle =",
+            "producer = \"VXM:swiglu0:output\"",
+            "consumer = \"MEM:S0\"",
             "ftlpu.stream.channel @swiglu0_out",
         ],
     )
