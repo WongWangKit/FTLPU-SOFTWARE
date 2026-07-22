@@ -1,5 +1,7 @@
 # FTLPU-SOFTWARE
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Software stack for the FTLPU project.
 
 This repository is intended to host the compiler, low-level IR, binary format,

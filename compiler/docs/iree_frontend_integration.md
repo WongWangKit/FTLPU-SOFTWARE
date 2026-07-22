@@ -1,5 +1,7 @@
 # IREE Reference Integration Plan
 
+[English](iree_frontend_integration.md) | [简体中文](iree_frontend_integration.zh-CN.md)
+
 This repository tracks IREE as a git submodule instead of copying selected
 source files by hand. IREE is a large MLIR-based compiler/runtime project, and
 the parts useful for FTLPU are its compiler architecture patterns and reference

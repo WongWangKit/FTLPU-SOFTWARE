@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="860" viewBox="0 0 1600 860" role="img" aria-labelledby="title desc">
+  <title id="title">W8A16 FFN M-tile weight reuse schedule</title>
+  <desc id="desc">The first K equals 32, N equals 32 projection block for M equals 128. Each physical gate or up weight tile loads once and is reused by four M equals 32 activation tiles.</desc>
+  <style>
+    text { font-family: "Segoe UI", Arial, sans-serif; fill: #17212b; letter-spacing: 0; }
+    .title { font-size: 29px; font-weight: 700; }
+    .subtitle { font-size: 15px; fill: #536170; }
+    .row { font-size: 15px; font-weight: 600; }
+    .small { font-size: 12px; fill: #4e5965; }
+    .bar { font-size: 12px; font-weight: 600; }
+    .note { font-size: 14px; fill: #334150; }
+    .axis { stroke: #4a5560; stroke-width: 2; }
+    .grid { stroke: #dbe2e8; stroke-width: 1; }
+    .lane { fill: #fafbfc; stroke: #d8dee5; stroke-width: 1; }
+    .mem { fill: #90c9a8; stroke: #416b54; stroke-width: 1.2; }
+    .vxm { fill: #ed9c72; stroke: #8a4e31; stroke-width: 1.2; }
+    .load { fill: #91b8e8; stroke: #41678f; stroke-width: 1.2; }
+    .buffer { fill: #dce8f6; stroke: #41678f; stroke-width: 1.2; }
+    .compute { fill: #b1a7df; stroke: #5e568d; stroke-width: 1.2; }
+    .acc { fill: #dca2c2; stroke: #814f6b; stroke-width: 1.2; }
+    .phase { fill: #f4f7f9; stroke: #c9d1d9; stroke-width: 1.2; }
+  </style>
+
+  <rect width="1600" height="860" fill="#ffffff"/>
+  <text x="44" y="48" class="title">W8A16 FFN: M=128 Weight Reuse</text>
+  <text x="44" y="75" class="subtitle">Measured Schedule IR for the first K=32, N=32 gate/up projection block. East and west run in parallel; each M tile has 32 rows.</text>
+
+  <text x="44" y="119" class="note">One gate/up physical weight tile is loaded once into each MXM weight buffer, then reused for M0, M1, M2, and M3. Each M tile observes the target's 38-cycle MXM issue interval.</text>
+
+  <line x1="300" y1="155" x2="1520" y2="155" class="axis"/>
+  <text x="1530" y="160" class="row">cycle</text>
+  <g class="small" text-anchor="middle">
+    <text x="300" y="143">0</text><text x="444" y="143">20</text><text x="588" y="143">40</text><text x="732" y="143">60</text>
+    <text x="876" y="143">80</text><text x="1020" y="143">100</text><text x="1164" y="143">120</text><text x="1308" y="143">140</text><text x="1452" y="143">160</text>
+  </g>
+  <g class="grid">
+    <line x1="300" y1="165" x2="300" y2="650"/><line x1="444" y1="165" x2="444" y2="650"/>
+    <line x1="588" y1="165" x2="588" y2="650"/><line x1="732" y1="165" x2="732" y2="650"/>
+    <line x1="876" y1="165" x2="876" y2="650"/><line x1="1020" y1="165" x2="1020" y2="650"/>
+    <line x1="1164" y1="165" x2="1164" y2="650"/><line x1="1308" y1="165" x2="1308" y2="650"/><line x1="1452" y1="165" x2="1452" y2="650"/>
+  </g>
+
+  <g>
+    <rect x="250" y="175" width="1280" height="52" class="lane"/>
+    <rect x="250" y="239" width="1280" height="52" class="lane"/>
+    <rect x="250" y="303" width="1280" height="52" class="lane"/>
+    <rect x="250" y="367" width="1280" height="52" class="lane"/>
+    <rect x="250" y="431" width="1280" height="52" class="lane"/>
+    <rect x="250" y="495" width="1280" height="52" class="lane"/>
+    <rect x="250" y="559" width="1280" height="52" class="lane"/>
+    <rect x="250" y="623" width="1280" height="52" class="lane"/>
+    <text x="35" y="207" class="row">MEM weight read</text>
+    <text x="35" y="271" class="row">VXM dequant</text>
+    <text x="35" y="335" class="row">MXM load</text>
+    <text x="35" y="399" class="row">MXM buffer 0</text>
+    <text x="35" y="463" class="row">MEM activation</text>
+    <text x="35" y="527" class="row">MXM gate/up</text>
+    <text x="35" y="591" class="row">MEM accumulator</text>
+    <text x="35" y="655" class="row">M-tile identity</text>
+  </g>
+
+  <rect x="307" y="185" width="86" height="32" rx="3" class="mem"/>
+  <text x="350" y="206" text-anchor="middle" class="bar">16 streams</text>
+  <text x="405" y="206" class="small">c1..12, four physical tiles</text>
+  <rect x="372" y="249" width="58" height="32" rx="3" class="vxm"/>
+  <text x="401" y="270" text-anchor="middle" class="bar">4 cycles</text>
+  <text x="442" y="270" class="small">c10..13 per tile</text>
+
+  <g class="load">
+    <rect x="473" y="313" width="29" height="32" rx="3"/><rect x="502" y="313" width="29" height="32" rx="3"/>
+    <rect x="531" y="313" width="29" height="32" rx="3"/><rect x="560" y="313" width="29" height="32" rx="3"/>
+  </g>
+  <text x="531" y="335" text-anchor="middle" class="bar">c24 / 28 / 32 / 36</text>
+  <text x="608" y="335" class="small">one 16-stream load per physical gate/up MXM</text>
+
+  <rect x="473" y="377" width="1037" height="32" rx="3" class="buffer"/>
+  <text x="991" y="398" text-anchor="middle" class="bar">weight_buffer=0 stays resident while all four M tiles execute</text>
+
+  <g class="mem">
+    <rect x="566" y="441" width="230" height="32" rx="3"/><rect x="796" y="441" width="230" height="32" rx="3"/>
+    <rect x="1026" y="441" width="230" height="32" rx="3"/><rect x="1256" y="441" width="230" height="32" rx="3"/>
+  </g>
+  <g class="compute">
+    <rect x="602" y="505" width="230" height="32" rx="3"/><rect x="832" y="505" width="230" height="32" rx="3"/>
+    <rect x="1062" y="505" width="230" height="32" rx="3"/><rect x="1292" y="505" width="230" height="32" rx="3"/>
+  </g>
+  <g class="acc">
+    <rect x="624" y="569" width="252" height="32" rx="3"/><rect x="854" y="569" width="252" height="32" rx="3"/>
+    <rect x="1084" y="569" width="252" height="32" rx="3"/><rect x="1314" y="569" width="216" height="32" rx="3"/>
+  </g>
+  <g class="phase">
+    <rect x="602" y="633" width="230" height="32" rx="3"/><rect x="832" y="633" width="230" height="32" rx="3"/>
+    <rect x="1062" y="633" width="230" height="32" rx="3"/><rect x="1292" y="633" width="230" height="32" rx="3"/>
+  </g>
+  <g class="bar" text-anchor="middle">
+    <text x="717" y="462">M0: rows 0..31</text><text x="947" y="462">M1: rows 32..63</text>
+    <text x="1177" y="462">M2: rows 64..95</text><text x="1407" y="462">M3: rows 96..127</text>
+    <text x="717" y="526">compute c42..73</text><text x="947" y="526">compute c74..105</text>
+    <text x="1177" y="526">compute c118..149</text><text x="1407" y="526">compute c156..187</text>
+    <text x="717" y="590">partial tile M0</text><text x="947" y="590">partial tile M1</text>
+    <text x="1177" y="590">partial tile M2</text><text x="1407" y="590">partial tile M3</text>
+    <text x="717" y="654">distinct accumulator range</text><text x="947" y="654">distinct accumulator range</text>
+    <text x="1177" y="654">distinct accumulator range</text><text x="1407" y="654">distinct accumulator range</text>
+  </g>
+
+  <rect x="44" y="722" width="1480" height="86" rx="5" class="phase"/>
+  <text x="66" y="751" class="note">Reuse scope: one logical (K=32, N=32) weight tile. There are still new loads when K or N changes, because those are different weight tiles. M tiles retain the 38-cycle MXM issue interval.</text>
+  <text x="66" y="779" class="note">This exact M=128 test lowers to 24 MXM loads: 16 projection loads plus 8 down-projection loads. Reloading projection weights for every M tile would require 72 loads.</text>
+</svg>

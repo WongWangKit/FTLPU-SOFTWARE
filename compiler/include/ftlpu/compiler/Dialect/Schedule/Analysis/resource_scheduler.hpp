@@ -1,26 +1,33 @@
 #pragma once
 
-#include <cstddef>
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
+
+#include <cstdint>
 #include <string>
-#include <vector>
+#include <unordered_map>
 
 namespace ftlpu::compiler::schedule {
 
+struct ResourceWindow {
+    std::string resource;
+    int64_t offset;
+    int64_t duration;
+};
+
 class ResourceScheduler {
 public:
-    std::size_t reserve(std::string resource, std::size_t earliest_cycle, std::size_t duration = 1);
-    std::size_t available_after(const std::string& resource) const;
+    int64_t reserve(int64_t earliest_cycle, llvm::ArrayRef<ResourceWindow> windows);
+    void reserve_at(int64_t cycle, llvm::ArrayRef<ResourceWindow> windows);
 
 private:
     struct Reservation {
-        std::string resource;
-        std::size_t start{0};
-        std::size_t end{0};
+        int64_t start;
+        int64_t end;
     };
 
-    bool is_free(const std::string& resource, std::size_t start, std::size_t end) const;
-
-    std::vector<Reservation> reservations_{};
+    bool is_free(const ResourceWindow& window, int64_t anchor) const;
+    std::unordered_map<std::string, llvm::SmallVector<Reservation, 32>> reservations_;
 };
 
 } // namespace ftlpu::compiler::schedule

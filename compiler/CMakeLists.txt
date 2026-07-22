@@ -1,93 +1,263 @@
 find_package(Python3 COMPONENTS Interpreter)
 
+# The compiler owns its LLVM/MLIR and StableHLO revisions directly. IREE is a
+# reference compiler and is deliberately not part of this dependency chain.
+set(FTLPU_LLVM_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/llvm-project" CACHE PATH
+    "Pinned LLVM project source directory")
+set(FTLPU_STABLEHLO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/stablehlo" CACHE PATH
+    "Pinned StableHLO source directory")
+set(FTLPU_MLIR_DIR "${CMAKE_SOURCE_DIR}/build-mlir/lib/cmake/mlir" CACHE PATH
+    "Directory containing MLIRConfig.cmake")
+
+if(MSVC AND MSVC_VERSION LESS 1936)
+    message(FATAL_ERROR
+        "FTLPU's pinned LLVM/MLIR requires MSVC 19.36 or newer. "
+        "Use Visual Studio 2026, or a current Visual Studio 2022 toolset.")
+endif()
+
+find_package(MLIR REQUIRED CONFIG HINTS "${FTLPU_MLIR_DIR}")
+
+list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}" "${LLVM_CMAKE_DIR}")
+include(AddLLVM)
+include(AddMLIR)
+include(TableGen)
+include(HandleLLVMOptions)
+include_directories(${MLIR_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+set(STABLEHLO_BUILD_EMBEDDED ON CACHE BOOL "Build StableHLO in the FTLPU MLIR process" FORCE)
+add_subdirectory(
+    "${FTLPU_STABLEHLO_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/stablehlo"
+    EXCLUDE_FROM_ALL)
+
+set(LLVM_TARGET_DEFINITIONS include/ftlpu/compiler/Dialect/Kernel/IR/KernelOps.td)
+mlir_tablegen(ftlpu/compiler/Dialect/Kernel/IR/KernelOps.h.inc -gen-op-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Kernel/IR/KernelOps.cpp.inc -gen-op-defs)
+mlir_tablegen(ftlpu/compiler/Dialect/Kernel/IR/KernelOpsDialect.h.inc -gen-dialect-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Kernel/IR/KernelOpsDialect.cpp.inc -gen-dialect-defs)
+add_public_tablegen_target(FTLPUKernelOpsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS include/ftlpu/compiler/Dialect/Tensor/IR/TensorOps.td)
+mlir_tablegen(ftlpu/compiler/Dialect/Tensor/IR/TensorOps.h.inc -gen-op-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Tensor/IR/TensorOps.cpp.inc -gen-op-defs)
+mlir_tablegen(ftlpu/compiler/Dialect/Tensor/IR/TensorOpsDialect.h.inc -gen-dialect-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Tensor/IR/TensorOpsDialect.cpp.inc -gen-dialect-defs)
+add_public_tablegen_target(FTLPUTensorOpsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS include/ftlpu/compiler/Dialect/Stream/IR/StreamOps.td)
+mlir_tablegen(ftlpu/compiler/Dialect/Stream/IR/StreamOps.h.inc -gen-op-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Stream/IR/StreamOps.cpp.inc -gen-op-defs)
+mlir_tablegen(ftlpu/compiler/Dialect/Stream/IR/StreamOpsDialect.h.inc -gen-dialect-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Stream/IR/StreamOpsDialect.cpp.inc -gen-dialect-defs)
+add_public_tablegen_target(FTLPUStreamOpsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS include/ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.td)
+mlir_tablegen(ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.h.inc -gen-op-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.cpp.inc -gen-op-defs)
+mlir_tablegen(ftlpu/compiler/Dialect/Schedule/IR/ScheduleOpsDialect.h.inc -gen-dialect-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Schedule/IR/ScheduleOpsDialect.cpp.inc -gen-dialect-defs)
+add_public_tablegen_target(FTLPUScheduleOpsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS include/ftlpu/compiler/Dialect/Command/IR/CommandOps.td)
+mlir_tablegen(ftlpu/compiler/Dialect/Command/IR/CommandOps.h.inc -gen-op-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Command/IR/CommandOps.cpp.inc -gen-op-defs)
+mlir_tablegen(ftlpu/compiler/Dialect/Command/IR/CommandOpsDialect.h.inc -gen-dialect-decls)
+mlir_tablegen(ftlpu/compiler/Dialect/Command/IR/CommandOpsDialect.cpp.inc -gen-dialect-defs)
+add_public_tablegen_target(FTLPUCommandOpsIncGen)
+
 add_library(ftlpu_compiler
-    src/ir.cpp
-    src/Dialect/Common/LoweringUtils.cpp
+    src/Dialect/Kernel/IR/KernelDialect.cpp
     src/Dialect/Kernel/Transforms/StableHloToKernel.cpp
-    src/Dialect/Schedule/Analysis/ResourceScheduler.cpp
-    src/Dialect/Schedule/Transforms/StreamToSchedule.cpp
+    src/Dialect/Tensor/IR/TensorDialect.cpp
+    src/Dialect/Tensor/Transforms/KernelToTensor.cpp
+    src/Dialect/Stream/IR/StreamDialect.cpp
     src/Dialect/Stream/Analysis/StreamAllocator.cpp
     src/Dialect/Stream/Transforms/TensorToStream.cpp
-    src/Dialect/Tensor/Analysis/MemoryLayout.cpp
-    src/Dialect/Tensor/Transforms/KernelToTensor.cpp
-    src/Pipelines/Phases.cpp
-    src/Pipelines/Pipelines.cpp
-    src/Target/FtlpuCModelTarget.cpp)
+    src/Dialect/Schedule/IR/ScheduleDialect.cpp
+    src/Dialect/Schedule/Analysis/AttentionWorkPlanner.cpp
+    src/Dialect/Schedule/Analysis/AttentionProjectionPlanner.cpp
+    src/Dialect/Schedule/Analysis/ResourceScheduler.cpp
+    src/Dialect/Schedule/Transforms/AttentionMemoryLayout.cpp
+    src/Dialect/Schedule/Transforms/AttentionScheduleEmitter.cpp
+    src/Dialect/Schedule/Transforms/StreamToSchedule.cpp
+    src/Dialect/Command/IR/CommandDialect.cpp
+    src/Dialect/Command/Transforms/ScheduleToCommand.cpp
+    src/Target/LPUTargetModel.cpp
+    src/Target/CommandBinary.cpp)
+add_dependencies(ftlpu_compiler FTLPUKernelOpsIncGen FTLPUTensorOpsIncGen
+    FTLPUStreamOpsIncGen FTLPUScheduleOpsIncGen FTLPUCommandOpsIncGen)
 
 target_include_directories(ftlpu_compiler
     PUBLIC
         include
-    PRIVATE
-        src)
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${LLVM_INCLUDE_DIRS}
+        ${MLIR_INCLUDE_DIRS})
+target_compile_definitions(ftlpu_compiler PRIVATE ${LLVM_DEFINITIONS})
+target_link_libraries(ftlpu_compiler
+    PUBLIC
+        MLIRIR
+        MLIRParser
+        MLIRPass
+        MLIRFuncDialect
+        MLIRSupport
+        StablehloOps
+        ftlpu_software)
 
-add_executable(ftlpu_opt
-    tools/ftlpu_opt.cpp)
-
+add_executable(ftlpu_opt tools/ftlpu_opt.cpp)
 target_link_libraries(ftlpu_opt PRIVATE ftlpu_compiler)
+add_executable(ftlpu_translate tools/ftlpu_translate.cpp)
+set_target_properties(ftlpu_translate PROPERTIES OUTPUT_NAME "ftlpu-translate")
+target_link_libraries(ftlpu_translate PRIVATE ftlpu_compiler)
+
+add_executable(attention_work_planner_test tests/attention_work_planner_test.cpp)
+target_link_libraries(attention_work_planner_test PRIVATE ftlpu_compiler)
+add_test(NAME attention_work_planner_test COMMAND $<TARGET_FILE:attention_work_planner_test>)
+add_executable(attention_projection_planner_test tests/attention_projection_planner_test.cpp)
+target_link_libraries(attention_projection_planner_test PRIVATE ftlpu_compiler)
+add_test(NAME attention_projection_planner_test COMMAND $<TARGET_FILE:attention_projection_planner_test>)
+add_executable(attention_target_layout_test tests/attention_target_layout_test.cpp)
+target_link_libraries(attention_target_layout_test PRIVATE ftlpu_compiler)
+add_test(NAME attention_target_layout_test COMMAND $<TARGET_FILE:attention_target_layout_test>)
+if(MSVC)
+    target_compile_options(ftlpu_opt PRIVATE /EHsc)
+    target_compile_options(ftlpu_translate PRIVATE /EHsc)
+endif()
 
 if(Python3_Interpreter_FOUND)
-    set(FTLPU_COMPILER_PYTHON "${Python3_EXECUTABLE}")
-    if(EXISTS "${CMAKE_SOURCE_DIR}/.venv/Scripts/python.exe")
-        set(FTLPU_COMPILER_PYTHON "${CMAKE_SOURCE_DIR}/.venv/Scripts/python.exe")
-    endif()
-
-    find_program(FTLPU_IREE_IMPORT_ONNX
-        NAMES iree-import-onnx iree-import-onnx.exe
-        HINTS "${CMAKE_SOURCE_DIR}/.venv/Scripts")
-
-    find_program(FTLPU_IREE_COMPILE
-        NAMES iree-compile iree-compile.exe
-        HINTS "${CMAKE_SOURCE_DIR}/.venv/Scripts")
-
     add_test(
-        NAME iree_frontend_stage_common_ir_test
+        NAME smollm2_135m_ffn_stablehlo_to_stream_ir_test
         COMMAND
-            ${FTLPU_COMPILER_PYTHON}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/ftlpu-iree-import.py
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
-            --output ${CMAKE_CURRENT_BINARY_DIR}/iree_frontend/simple_stablehlo.common.mlir
-            --input-format stablehlo
-            --mode stage-common-ir)
-
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_ffn_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn)
     add_test(
-        NAME iree_frontend_onnx_import_dry_run_test
+        NAME generic_w8a16_ffn_lowering_test
         COMMAND
-            ${FTLPU_COMPILER_PYTHON}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/ftlpu-iree-import.py
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/model.onnx
-            --output ${CMAKE_CURRENT_BINARY_DIR}/iree_frontend/model.mlir
-            --input-format onnx
-            --mode import-onnx
-            --onnx-opset-version 17
-            --dry-run)
-
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/generic_w8a16_ffn_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/generic_w8a16_ffn_32x64x128x64)
     add_test(
-        NAME stablehlo_matmul_320_to_ftlpu_schedule_cpp_test
+        NAME w8a16_ffn_mtile_weight_reuse_test
         COMMAND
-            ${FTLPU_COMPILER_PYTHON}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_matmul_cpp_pass_test.py
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/w8a16_ffn_mtile_weight_reuse_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_128x64x128x64.stablehlo.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/w8a16_ffn_mtile_weight_reuse/ffn.schedule.mlir)
+    add_test(
+        NAME smollm2_135m_ffn_binary_cmodel_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_ffn_binary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_smollm2_135m_ffn_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_binary_runtime)
+    add_test(
+        NAME smollm2_135m_ffn_seq128_binary_cmodel_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_ffn_binary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_smollm2_135m_ffn_seq128_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn_seq128.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_seq128_binary_runtime)
+    add_test(
+        NAME smollm2_135m_attention_stablehlo_to_kernel_ir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_attention_kernel_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_attention/kernel/attention.kernel.mlir)
+    add_test(
+        NAME smollm2_135m_attention_stablehlo_to_tensor_ir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_attention_tensor_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_attention/tensor/attention.tensor.mlir)
+    add_test(
+        NAME smollm2_135m_attention_stablehlo_to_schedule_ir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_attention_schedule_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_attention/schedule/attention.schedule.mlir)
+    add_test(
+        NAME smollm2_attention_projection_binary_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_attention_projection_binary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_smollm2_attention_projection_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_attention_projection_binary_runtime)
+    add_test(
+        NAME stablehlo_matmul_320_to_ftlpu_kernel_mlir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_matmul_mlir_test.py
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
-            --work-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/matmul_320)
-
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/stablehlo_matmul_320_to_ftlpu_kernel/matmul_320.kernel.mlir)
     add_test(
-        NAME stablehlo_swiglu_to_ftlpu_schedule_cpp_test
+        NAME stablehlo_matmul_320_to_ftlpu_tensor_mlir_test
         COMMAND
-            ${FTLPU_COMPILER_PYTHON}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_swiglu_cpp_pass_test.py
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_matmul_tensor_mlir_test.py
             --tool $<TARGET_FILE:ftlpu_opt>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_swiglu_stablehlo.mlir
-            --work-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/swiglu)
-
-    if(FTLPU_IREE_IMPORT_ONNX AND FTLPU_IREE_COMPILE)
-        add_test(
-            NAME iree_frontend_onnx_matmul_320_to_flow_ir_test
-            COMMAND
-                ${FTLPU_COMPILER_PYTHON}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/onnx_matmul_320_to_iree_ir_test.py
-                --importer ${CMAKE_CURRENT_SOURCE_DIR}/tools/ftlpu-iree-import.py
-                --work-dir ${CMAKE_CURRENT_BINARY_DIR}/iree_frontend/matmul_320
-                --iree-import-onnx ${FTLPU_IREE_IMPORT_ONNX}
-                --iree-compile ${FTLPU_IREE_COMPILE})
-    endif()
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/stablehlo_matmul_320_to_ftlpu_tensor/matmul_320.tensor.mlir)
+    add_test(
+        NAME ftlpu_tensor_lifetime_reuse_mlir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/tensor_lifetime_reuse_mlir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/kernel_matmul_lifetime.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_tensor_lifetime_reuse/matmul_lifetime.tensor.mlir)
+    add_test(
+        NAME stablehlo_matmul_320_to_ftlpu_stream_mlir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_matmul_stream_mlir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/stablehlo_matmul_320_to_ftlpu_stream/matmul_320.stream.mlir)
+    add_test(
+        NAME ftlpu_stream_allocator_reuse_mlir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stream_allocator_reuse_mlir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/kernel_matmul_lifetime.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_stream_allocator_reuse/matmul_lifetime.stream.mlir)
+    add_test(
+        NAME ftlpu_schedule_resource_and_dependency_mlir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/schedule_resource_dependency_mlir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/kernel_matmul_lifetime.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_schedule_resource_and_dependency/matmul_lifetime.schedule.mlir)
+    add_test(
+        NAME ftlpu_command_vxm_binary_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/command_vxm_binary_runtime_test.py
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:command_vxm_binary_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/command_vxm.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_command_vxm_binary_runtime/command_vxm.ftlpu)
 endif()

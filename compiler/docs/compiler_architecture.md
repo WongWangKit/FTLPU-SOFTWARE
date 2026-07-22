@@ -1,5 +1,7 @@
 # FTLPU Compiler Architecture
 
+[English](compiler_architecture.md) | [简体中文](compiler_architecture.zh-CN.md)
+
 This document fixes the compiler split for the first LPU backend work:
 
 ```text
@@ -9,6 +11,7 @@ ONNX / PyTorch / TensorFlow
   -> FTLPU tensor IR
   -> FTLPU stream IR
   -> FTLPU schedule IR
+  -> FTLPU command IR
   -> .ftlpu binary
   -> runtime / CModel / hardware
 ```
@@ -51,12 +54,34 @@ The tensor IR owns MEM allocation and tensor placement:
 - describe tile plans that reference the selected kernels;
 - keep layouts and element sizes explicit.
 
+The implemented `ftlpu.tensor.matmul` and `ftlpu.tensor.swiglu` operations use
+the physical rank-5 MEM address tuple
+`[device, hemisphere, slice, bank, word, byte]`. One hemisphere contains 44
+slices, each slice contains 2 banks, each bank contains 4096 16-byte words.
+Allocation uses role-specific east-hemisphere SRAM row pools. Function inputs
+are live at entry, each SSA tensor is kept through its last use, and expired
+row ranges are merged and reused with a first-fit policy. Output storage is
+allocated before current operands expire,
+so a functional unit cannot overwrite an input that it is still consuming.
+
+Matmul placement also carries CModel-facing row geometry. MXM weights use
+`mxm_weight_striped` across MEM slices 0 through 15, activations use `vector`
+placement on slice 32, and int32 results use four `int32_byte_planar` slices
+40 through 43. Each placement records its slice list, base SRAM row,
+instruction count, and signed address stride. The current CModel convention
+uses a 16-row stride; weight Read commands walk the rows in reverse order.
+The complete `ftlpu.tensor.ffn` uses 320x640 gate/up weights and a 640x320 down
+weight. It keeps the shared activation on vector slice 32, stores the two
+320-column quantized hidden passes on slices 40 and 41, and places the final
+160x320 i8 result on slice 42. MXM int32 intermediates stay on streams.
+
 ### FTLPU Stream IR
 
 The stream IR maps MEM-resident tensor tiles onto LPU streams:
 
 - every stream has a source and sink, such as `MEM:A -> MXM0:lhs`;
-- every stream records stream id and stream register id;
+- every stream records a direction-local contiguous stream range and stream
+  register id;
 - every stream records start address, byte count, and endpoint functional unit;
 - MXM/VXM post-processing streams are explicit instead of implied by kernels.
 - streams are long logical vectors when the instruction naturally traverses the
@@ -66,6 +91,39 @@ The stream IR maps MEM-resident tensor tiles onto LPU streams:
 This layer is conceptually similar to IREE Stream, but it is FTLPU-owned and
 should model the real LPU data movement directly.
 
+The implemented `ftlpu.stream.route` operation records a direction-local
+contiguous `[stream_base, stream_base + stream_count)` range, a physical
+MEM-boundary `register_id`, source/destination
+endpoints, explicit source/destination functional-unit ids, MEM address, byte
+count, and fixed transport latency. MEM endpoints use unit id `-1`; MXM
+endpoints identify MXM0 or MXM1. `ftlpu.stream.matmul` also records the selected
+MXM unit and weight-buffer id. Each
+`ftlpu.tensor.matmul` becomes two eastbound MEM-to-MXM
+routes, one `ftlpu.stream.matmul`, and one westbound MXM-to-MEM route. The MXM
+weight route owns 16 streams during IW load, activation compute consumes one
+stream, and each int32 result owns four consecutive byte streams.
+
+SSA operation order is used internally by the stream allocator to permit safe
+stream-range reuse, but no logical lifetime stage is emitted in Stream IR.
+Exact issue and arrival cycles are assigned by Stream-to-Schedule.
+
+`ftlpu.stream.ffn` represents the full topology directly. Each hidden pass
+loads a 320-column gate/up pair into MXM0/MXM1, one shared activation route
+feeds both computes, west groups `W0..W3` and `W4..W7` feed the SwiGLU VXM
+pipeline, and `E31` writes the two hidden chunks to slices 40 and 41. The down
+phase loads the two 320-row K partitions, reads both hidden slices on separate
+activation streams, produces two int32 partials, and uses VXM AddQuant before
+writing the final `E31` result to slice 42.
+
+### LPU Target Model
+
+`LPUTargetModel` is the single compiler-side source for MEM geometry, 32
+streams per direction, the 64 packed selectors, 12 MEM-boundary register
+columns, the additional SXM-to-MXM column, MXM dimensions and throughput,
+supported endpoint routes, register mapping, and transport latency. A latency
+means producer issue to consumer visibility, including the CModel tick phase;
+lowering passes must query the model instead of embedding compensating cycles.
+
 ### FTLPU Schedule IR
 
 The schedule IR is the low-level scheduled target:
@@ -73,13 +131,76 @@ The schedule IR is the low-level scheduled target:
 - explicit cycle numbers;
 - explicit MEM/MXM/VXM queues;
 - explicit NOP and repeat opportunities;
-- direct serialization into `.ftlpu` queue sections.
 - stage-level operations first, such as `mem_read_weight`,
   `mem_read_activation`, `mxm_load`, `mxm_compute`, and `mem_write`;
-  tile-by-tile expansion belongs in the later queue/binary emission layer.
+  queue command expansion belongs in the Command lowering layer.
 
-The runtime consumes this layer through the binary format and loads the CModel
-ICU queues before clocks start.
+The implemented Schedule dialect uses `ftlpu.schedule.mem_read`,
+`ftlpu.schedule.mxm_load`, `ftlpu.schedule.mxm_compute`, and
+`ftlpu.schedule.mem_write`. Every operation carries an ICU issue `cycle` and
+`duration`. The scheduler reserves each MEM slice queue, each direction-local
+stream, the selected MXM unit's load/compute queues, and its selected weight
+buffer. `mxm_load` and `mxm_compute` preserve both ids explicitly. Fixed
+transport latency is included between producer and consumer windows, and SSA
+consumers cannot read a value before its producer's MEM write completes.
+
+For the current 320x320 int8 GEMM, the CModel-aligned baseline is: weight MEM
+reads begin at cycles 5 through 8 according to their MEM boundary, IW runs at
+`[18,38)`, activation MEM Read on `E16` runs at `[33,353)`, Compute issue runs
+at `[38,358)`, the first MXM result appears at cycle 57, and four int32
+byte-plane MEM writes run at `[59,379)`. The output stream remains occupied for
+the full 339-cycle MXM result window while the 20 physical tile rows drain.
+
+For the 160x320x640x320 FFN fixture, shared activation startup follows the
+CModel path in three segments (`E16`, `E30`, `E0`) for both hidden passes.
+The correctness-first schedule computes pass 0 at cycles 58/73/77 and pass 1
+at 318/333/337. Twelve stream-register transport cycles separate the first MXM
+result from VXM consumption. The two SwiGLU pipelines start at cycles 89 and
+349 and write 160 i8 rows to slices 40 and 41 at cycles 110 and 370. Down
+weights load into buffer 0 at cycles 538 and 558; both MXMs compute at cycle
+590 from activation streams `E0` and `E16`. The six-stage VXM AddQuant starts
+at cycle 621 and writes the final slice-42 result at cycle 638. This schedule is
+deliberately serial; buffer-1 ping-pong is a separate performance optimization.
+
+### FTLPU Command IR
+
+Command IR is the stable compiler/runtime boundary. The
+`ftlpu-schedule-to-command` pass removes the Schedule SSA graph and emits
+`ftlpu.command.binding`, `ftlpu.command.mem`, `ftlpu.command.mxm`, and
+`ftlpu.command.vxm`
+operations. Bindings describe input/output index, shape, element type, byte
+size, and physical placement. Results are represented by bindings plus their
+physical MEM write commands instead of an SSA tensor return value.
+
+A command maps one-to-one to an ICU queue's first instruction plus Repeat:
+absolute first cycle, queue index, opcode, stream selectors, repeat count and
+interval, and MEM address stride. A 320x320 GEMM produces 16 weight MEM
+commands, one activation MEM command, four result MEM commands, one IW command,
+and one Compute command. VXM commands carry ALU opcode, typed stream/ALU/immediate
+operands, cast target, output stream, and repeat metadata. Command operations
+are explicitly side-effecting so
+MLIR canonicalization cannot remove hardware work. Binary emission groups the
+flat command stream by queue and derives queue-local NOP counts from absolute
+cycles without reconstructing scheduling decisions.
+
+`ftlpu-translate` serializes this layer to `.ftlpu` binary version 2. The
+runtime stages bound inputs into SRAM, loads every ICU queue before clocks
+start, advances `TspSliceSystem::tick()`, and reconstructs bound outputs. The
+320x320 regression compares all 102,400 int32 results against a CPU GEMM.
+
+### Test Artifacts
+
+Compiler tests keep generated IR under a directory named after the test:
+
+```text
+build-ftlpu-vs2026/compiler/ftlpu_lower/<test-name>/
+```
+
+The complete FFN lowering test preserves every visible boundary as
+`ffn.stablehlo.mlir`, `ffn.kernel.mlir`, `ffn.tensor.mlir`,
+`ffn.stream.mlir`, `ffn.schedule.mlir`, and `ffn.commands.mlir`. Runtime tests
+use a different directory and additionally produce `ffn.ftlpu`, so parallel or
+repeated tests cannot overwrite another test's artifacts.
 
 ## Role Of IREE
 
@@ -100,7 +221,8 @@ ONNX -> IREE importer -> IREE Flow IR
 Those tests are comparison and sanity tests. The main backend path should be:
 
 ```text
-StableHLO -> FTLPU kernel IR -> FTLPU tensor IR -> FTLPU stream IR -> FTLPU schedule IR
+StableHLO -> FTLPU kernel IR -> FTLPU tensor IR -> FTLPU stream IR
+          -> FTLPU schedule IR -> FTLPU command IR
 ```
 
 ## Immediate Milestones

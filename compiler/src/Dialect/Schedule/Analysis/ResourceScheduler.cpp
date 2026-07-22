@@ -1,38 +1,50 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/resource_scheduler.hpp"
 
 #include <algorithm>
-#include <utility>
 
 namespace ftlpu::compiler::schedule {
 
-std::size_t ResourceScheduler::reserve(std::string resource, std::size_t earliest_cycle, std::size_t duration)
+int64_t ResourceScheduler::reserve(int64_t earliest_cycle,
+    llvm::ArrayRef<ResourceWindow> windows)
 {
-    auto start = earliest_cycle;
-    while (!is_free(resource, start, start + duration)) {
-        ++start;
+    int64_t anchor = earliest_cycle;
+    for (;;) {
+        int64_t next_anchor = anchor;
+        for (const auto& window : windows) {
+            const int64_t start = anchor + window.offset;
+            const int64_t end = start + window.duration;
+            const auto reservations = reservations_.find(window.resource);
+            if (reservations == reservations_.end()) continue;
+            for (const auto& reservation : reservations->second) {
+                if (start < reservation.end && end > reservation.start) {
+                    next_anchor = std::max(next_anchor, reservation.end - window.offset);
+                }
+            }
+        }
+        if (next_anchor == anchor) break;
+        anchor = next_anchor;
     }
-    reservations_.push_back(Reservation {std::move(resource), start, start + duration});
-    return start;
+    reserve_at(anchor, windows);
+    return anchor;
 }
 
-std::size_t ResourceScheduler::available_after(const std::string& resource) const
+void ResourceScheduler::reserve_at(int64_t cycle,
+    llvm::ArrayRef<ResourceWindow> windows)
 {
-    std::size_t cycle = 0;
-    for (const auto& reservation : reservations_) {
-        if (reservation.resource == resource) {
-            cycle = std::max(cycle, reservation.end);
-        }
+    for (const auto& window : windows) {
+        reservations_[window.resource].push_back(
+            {cycle + window.offset, cycle + window.offset + window.duration});
     }
-    return cycle;
 }
 
-bool ResourceScheduler::is_free(const std::string& resource, std::size_t start, std::size_t end) const
+bool ResourceScheduler::is_free(const ResourceWindow& window, int64_t anchor) const
 {
-    for (const auto& reservation : reservations_) {
-        if (reservation.resource == resource && start < reservation.end && end > reservation.start) {
-            return false;
-        }
-    }
+    const int64_t start = anchor + window.offset;
+    const int64_t end = start + window.duration;
+    const auto reservations = reservations_.find(window.resource);
+    if (reservations == reservations_.end()) return true;
+    for (const auto& reservation : reservations->second)
+        if (start < reservation.end && end > reservation.start) return false;
     return true;
 }
 

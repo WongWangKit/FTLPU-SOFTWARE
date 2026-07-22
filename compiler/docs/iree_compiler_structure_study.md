@@ -1,5 +1,7 @@
 # IREE Compiler Structure Study For FTLPU
 
+[English](iree_compiler_structure_study.md) | [简体中文](iree_compiler_structure_study.zh-CN.md)
+
 This note records the compiler structure we should learn from IREE and how it
 should reshape the FTLPU compiler. The main point is not to copy IREE's code
 volume, but to copy the engineering boundaries: dialects, passes, pipelines,
@@ -377,11 +379,13 @@ selected target for:
 - queue mapping;
 - binary serialization rules.
 
-### Step 5: Replace String IR With MLIR Dialects
+### Step 5: Implement MLIR Dialects
 
-Once the above boundaries settle, define real MLIR dialects with ODS/TableGen.
-Do this after the architecture is right; otherwise we will just encode bad
-structure in TableGen.
+The compiler now uses MLIR C++ APIs directly. The first production boundary is
+`stablehlo.dot_general -> ftlpu.kernel.matmul`, implemented with a registered
+`KernelDialect` and `OperationPass<func::FuncOp>`. Subsequent tensor, stream,
+schedule, and executable layers must follow this same model; they must not
+reintroduce a text-only intermediate representation.
 
 ## Immediate Critique Of Current Code
 
@@ -401,20 +405,15 @@ the current file.
 
 ## Current Refactor Status
 
-The compiler has been split out of the original `passes.cpp` prototype:
+The text `Module` representation, custom parser, printed-string passes, and
+their schedule prototype have been removed. The compiler now has this base:
 
 ```text
+Dialect/Kernel/IR/KernelDialect.cpp
 Dialect/Kernel/Transforms/StableHloToKernel.cpp
-Dialect/Tensor/Analysis/MemoryLayout.cpp
-Dialect/Tensor/Transforms/KernelToTensor.cpp
-Dialect/Stream/Analysis/StreamAllocator.cpp
-Dialect/Stream/Transforms/TensorToStream.cpp
-Dialect/Schedule/Analysis/ResourceScheduler.cpp
-Dialect/Schedule/Transforms/StreamToSchedule.cpp
-Pipelines/Phases.cpp
-Pipelines/Pipelines.cpp
-Target/FtlpuCModelTarget.cpp
+Transforms/passes.hpp
+tools/ftlpu_opt.cpp (MLIRContext + PassManager)
 ```
 
-The next engineering milestone is to add verifiers and then replace the
-text-only module representation with real MLIR dialect definitions.
+The immediate engineering milestone is to add the Tensor dialect and its
+allocation verifier, then Stream and Schedule dialects as MLIR passes.

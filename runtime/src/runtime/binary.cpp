@@ -1,3 +1,4 @@
+// Keep serialization rebuilt when BinaryProgram or BinaryBinding ABI evolves.
 #include "ftlpu/software/runtime/binary.hpp"
 
 #include <array>
@@ -10,6 +11,7 @@ namespace ftlpu::software::runtime {
 namespace {
 
 constexpr std::array<char, 8> kMagic {'F', 'T', 'L', 'P', 'U', 'B', '0', '1'};
+constexpr std::uint32_t kCurrentVersion = 4;
 
 template <typename T>
 void write_scalar(std::ostream& os, T value)
@@ -31,6 +33,47 @@ T read_scalar(std::istream& is)
     return value;
 }
 
+void write_binding(std::ostream& os, const BinaryBinding& binding)
+{
+    write_scalar<std::uint32_t>(os, binding.index);
+    write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(binding.access));
+    write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(binding.element_type));
+    write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(binding.layout));
+    write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(binding.shape.size()));
+    write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(binding.slices.size()));
+    write_scalar<std::uint16_t>(os, binding.hemisphere_mask);
+    write_scalar<std::uint64_t>(os, binding.byte_size);
+    write_scalar<std::int64_t>(os, binding.base_row);
+    write_scalar<std::int64_t>(os, binding.instruction_count);
+    write_scalar<std::int64_t>(os, binding.address_stride);
+    for (std::uint64_t dimension : binding.shape) write_scalar(os, dimension);
+    for (std::uint16_t slice : binding.slices) write_scalar(os, slice);
+}
+
+BinaryBinding read_binding(std::istream& is, std::uint32_t version)
+{
+    BinaryBinding binding;
+    binding.index = read_scalar<std::uint32_t>(is);
+    binding.access = static_cast<BindingAccess>(read_scalar<std::uint16_t>(is));
+    binding.element_type = static_cast<BindingElementType>(read_scalar<std::uint16_t>(is));
+    binding.layout = static_cast<BindingLayout>(read_scalar<std::uint16_t>(is));
+    const auto rank = read_scalar<std::uint16_t>(is);
+    const auto slice_count = read_scalar<std::uint16_t>(is);
+    const auto hemisphere_mask = read_scalar<std::uint16_t>(is);
+    binding.hemisphere_mask = version >= 3 ? hemisphere_mask : 1;
+    binding.byte_size = read_scalar<std::uint64_t>(is);
+    binding.base_row = read_scalar<std::int64_t>(is);
+    binding.instruction_count = read_scalar<std::int64_t>(is);
+    binding.address_stride = read_scalar<std::int64_t>(is);
+    binding.shape.reserve(rank);
+    binding.slices.reserve(slice_count);
+    for (std::uint16_t i = 0; i < rank; ++i)
+        binding.shape.push_back(read_scalar<std::uint64_t>(is));
+    for (std::uint16_t i = 0; i < slice_count; ++i)
+        binding.slices.push_back(read_scalar<std::uint16_t>(is));
+    return binding;
+}
+
 } // namespace
 
 void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path)
@@ -41,9 +84,12 @@ void write_binary_program(const BinaryProgram& program, const std::filesystem::p
     }
 
     os.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
-    write_scalar<std::uint32_t>(os, 1);
+    write_scalar<std::uint32_t>(os, kCurrentVersion);
     write_scalar<std::uint64_t>(os, static_cast<std::uint64_t>(program.max_cycle));
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.queues.size()));
+    write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.bindings.size()));
+
+    for (const auto& binding : program.bindings) write_binding(os, binding);
 
     for (const auto& queue : program.queues) {
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.kind));
@@ -56,6 +102,9 @@ void write_binary_program(const BinaryProgram& program, const std::filesystem::p
             for (const auto word : command.words) {
                 write_scalar<std::uint32_t>(os, word);
             }
+            write_scalar<std::uint16_t>(os,
+                static_cast<std::uint16_t>(command.extension_words.size()));
+            for (const auto word : command.extension_words) write_scalar<std::uint32_t>(os, word);
         }
     }
 }
@@ -74,13 +123,17 @@ BinaryProgram read_binary_program(const std::filesystem::path& path)
     }
 
     const auto version = read_scalar<std::uint32_t>(is);
-    if (version != 1) {
+    if (version < 1 || version > kCurrentVersion) {
         throw std::runtime_error("unsupported FTLPU binary version");
     }
 
     auto program = BinaryProgram {};
     program.max_cycle = static_cast<std::size_t>(read_scalar<std::uint64_t>(is));
     const auto queue_count = read_scalar<std::uint32_t>(is);
+    const auto binding_count = version >= 2 ? read_scalar<std::uint32_t>(is) : 0;
+    program.bindings.reserve(binding_count);
+    for (std::uint32_t binding_id = 0; binding_id < binding_count; ++binding_id)
+        program.bindings.push_back(read_binding(is, version));
     program.queues.reserve(queue_count);
 
     for (std::uint32_t queue_id = 0; queue_id < queue_count; ++queue_id) {
@@ -95,8 +148,14 @@ BinaryProgram read_binary_program(const std::filesystem::path& path)
             command.command = read_scalar<std::uint32_t>(is);
             command.instruction_kind = static_cast<InstructionKind>(read_scalar<std::uint16_t>(is));
             command.word_count = read_scalar<std::uint16_t>(is);
-            for (auto& word : command.words) {
-                word = read_scalar<std::uint32_t>(is);
+            const std::size_t serialized_words = version >= 3 ? command.words.size() : 3;
+            for (std::size_t word = 0; word < serialized_words; ++word)
+                command.words[word] = read_scalar<std::uint32_t>(is);
+            if (version >= 4) {
+                const auto extension_count = read_scalar<std::uint16_t>(is);
+                command.extension_words.reserve(extension_count);
+                for (std::uint16_t word = 0; word < extension_count; ++word)
+                    command.extension_words.push_back(read_scalar<std::uint32_t>(is));
             }
             queue.commands.push_back(command);
         }

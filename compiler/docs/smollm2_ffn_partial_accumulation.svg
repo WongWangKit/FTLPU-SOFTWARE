@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="890" viewBox="0 0 1800 890" role="img" aria-labelledby="title desc">
+  <title id="title">SmolLM2 FFN K partial accumulation timeline</title>
+  <desc id="desc">All 18 K equals 32 partial tiles for one M equals 32 N equals 32 gate and up projection tile accumulate into local SRAM.</desc>
+  <style>
+    text { font-family: "Segoe UI", Arial, sans-serif; fill: #17212b; letter-spacing: 0; }
+    .title { font-size: 29px; font-weight: 700; }
+    .subtitle { font-size: 15px; fill: #536170; }
+    .row { font-size: 15px; font-weight: 600; }
+    .small { font-size: 11px; fill: #4e5965; }
+    .bar { font-size: 11px; font-weight: 600; }
+    .note { font-size: 14px; fill: #334150; }
+    .axis { stroke: #4a5560; stroke-width: 2; }
+    .grid { stroke: #dbe2e8; stroke-width: 1; }
+    .lane { fill: #fafbfc; stroke: #d8dee5; stroke-width: 1; }
+    .gate { fill: #91b8e8; stroke: #41678f; stroke-width: 1.2; }
+    .up { fill: #b1a7df; stroke: #5e568d; stroke-width: 1.2; }
+    .gateacc { fill: #dca2c2; stroke: #814f6b; stroke-width: 1.2; }
+    .upacc { fill: #efb07c; stroke: #975f31; stroke-width: 1.2; }
+    .state { fill: #e8edf2; stroke: #7b8996; stroke-width: 1.1; }
+    .final { fill: #90c9a8; stroke: #416b54; stroke-width: 1.2; }
+    .phase { fill: #f4f7f9; stroke: #c9d1d9; stroke-width: 1.2; }
+  </style>
+
+  <rect width="1800" height="890" fill="#ffffff"/>
+  <text x="44" y="48" class="title">SmolLM2-135M FFN: All 18 K Partial Accumulations</text>
+  <text x="44" y="75" class="subtitle">One hemisphere, one logical M=32 and N=32 output tile. K=576 is reduced as 18 K=32 partial tiles P0..P17.</text>
+  <text x="44" y="107" class="note">The bars show the logical 32-row block windows. Some physical activation commands are segmented around weight prefetch, but every block still contributes exactly one P&lt;i&gt; to the same local accumulator tile.</text>
+
+  <line x1="260" y1="152" x2="1700" y2="152" class="axis"/>
+  <text x="1710" y="157" class="row">cycle</text>
+  <g class="small" text-anchor="middle">
+    <text x="260" y="141">0</text><text x="412" y="141">76</text><text x="564" y="141">152</text><text x="716" y="141">228</text>
+    <text x="868" y="141">304</text><text x="1020" y="141">380</text><text x="1172" y="141">456</text><text x="1324" y="141">532</text>
+    <text x="1476" y="141">608</text><text x="1628" y="141">684</text><text x="1700" y="141">720</text>
+  </g>
+  <g class="grid">
+    <line x1="260" y1="162" x2="260" y2="684"/><line x1="412" y1="162" x2="412" y2="684"/>
+    <line x1="564" y1="162" x2="564" y2="684"/><line x1="716" y1="162" x2="716" y2="684"/>
+    <line x1="868" y1="162" x2="868" y2="684"/><line x1="1020" y1="162" x2="1020" y2="684"/>
+    <line x1="1172" y1="162" x2="1172" y2="684"/><line x1="1324" y1="162" x2="1324" y2="684"/>
+    <line x1="1476" y1="162" x2="1476" y2="684"/><line x1="1628" y1="162" x2="1628" y2="684"/><line x1="1700" y1="162" x2="1700" y2="684"/>
+  </g>
+
+  <g>
+    <rect x="230" y="175" width="1490" height="48" class="lane"/><rect x="230" y="231" width="1490" height="48" class="lane"/>
+    <rect x="230" y="287" width="1490" height="48" class="lane"/><rect x="230" y="343" width="1490" height="48" class="lane"/>
+    <rect x="230" y="399" width="1490" height="48" class="lane"/><rect x="230" y="455" width="1490" height="48" class="lane"/>
+    <rect x="230" y="511" width="1490" height="48" class="lane"/><rect x="230" y="567" width="1490" height="48" class="lane"/>
+    <rect x="230" y="623" width="1490" height="48" class="lane"/>
+    <text x="34" y="205" class="row">MXM gate</text><text x="34" y="261" class="row">MXM up</text>
+    <text x="34" y="317" class="row">Gate ACC SRAM</text><text x="34" y="373" class="row">Up ACC SRAM</text>
+    <text x="34" y="429" class="row">Gate accumulated state</text><text x="34" y="485" class="row">Up accumulated state</text>
+    <text x="34" y="541" class="row">Final tile state</text><text x="34" y="597" class="row">Tail handoff</text><text x="34" y="653" class="row">Physical placement</text>
+  </g>
+
+  <defs>
+    <g id="partial-columns">
+      <rect x="344" y="183" width="64" height="32" rx="3" class="gate"/><rect x="344" y="239" width="64" height="32" rx="3" class="up"/>
+      <rect x="356" y="295" width="64" height="32" rx="3" class="gateacc"/><rect x="354" y="351" width="64" height="32" rx="3" class="upacc"/>
+    </g>
+  </defs>
+  <use href="#partial-columns"/><use href="#partial-columns" transform="translate(76,0)"/><use href="#partial-columns" transform="translate(152,0)"/>
+  <use href="#partial-columns" transform="translate(228,0)"/><use href="#partial-columns" transform="translate(304,0)"/><use href="#partial-columns" transform="translate(380,0)"/>
+  <use href="#partial-columns" transform="translate(456,0)"/><use href="#partial-columns" transform="translate(532,0)"/><use href="#partial-columns" transform="translate(608,0)"/>
+  <use href="#partial-columns" transform="translate(684,0)"/><use href="#partial-columns" transform="translate(760,0)"/><use href="#partial-columns" transform="translate(836,0)"/>
+  <use href="#partial-columns" transform="translate(912,0)"/><use href="#partial-columns" transform="translate(988,0)"/><use href="#partial-columns" transform="translate(1064,0)"/>
+  <use href="#partial-columns" transform="translate(1140,0)"/><use href="#partial-columns" transform="translate(1216,0)"/><use href="#partial-columns" transform="translate(1292,0)"/>
+
+  <g class="bar" text-anchor="middle">
+    <text x="376" y="204">P0</text><text x="452" y="204">P1</text><text x="528" y="204">P2</text><text x="604" y="204">P3</text><text x="680" y="204">P4</text><text x="756" y="204">P5</text><text x="832" y="204">P6</text><text x="908" y="204">P7</text><text x="984" y="204">P8</text><text x="1060" y="204">P9</text><text x="1136" y="204">P10</text><text x="1212" y="204">P11</text><text x="1288" y="204">P12</text><text x="1364" y="204">P13</text><text x="1440" y="204">P14</text><text x="1516" y="204">P15</text><text x="1592" y="204">P16</text><text x="1668" y="204">P17</text>
+    <text x="376" y="260">P0</text><text x="452" y="260">P1</text><text x="528" y="260">P2</text><text x="604" y="260">P3</text><text x="680" y="260">P4</text><text x="756" y="260">P5</text><text x="832" y="260">P6</text><text x="908" y="260">P7</text><text x="984" y="260">P8</text><text x="1060" y="260">P9</text><text x="1136" y="260">P10</text><text x="1212" y="260">P11</text><text x="1288" y="260">P12</text><text x="1364" y="260">P13</text><text x="1440" y="260">P14</text><text x="1516" y="260">P15</text><text x="1592" y="260">P16</text><text x="1668" y="260">P17</text>
+    <text x="388" y="316">+P0</text><text x="464" y="316">+P1</text><text x="540" y="316">+P2</text><text x="616" y="316">+P3</text><text x="692" y="316">+P4</text><text x="768" y="316">+P5</text><text x="844" y="316">+P6</text><text x="920" y="316">+P7</text><text x="996" y="316">+P8</text><text x="1072" y="316">+P9</text><text x="1148" y="316">+P10</text><text x="1224" y="316">+P11</text><text x="1300" y="316">+P12</text><text x="1376" y="316">+P13</text><text x="1452" y="316">+P14</text><text x="1528" y="316">+P15</text><text x="1604" y="316">+P16</text><text x="1680" y="316">+P17</text>
+    <text x="386" y="372">+P0</text><text x="462" y="372">+P1</text><text x="538" y="372">+P2</text><text x="614" y="372">+P3</text><text x="690" y="372">+P4</text><text x="766" y="372">+P5</text><text x="842" y="372">+P6</text><text x="918" y="372">+P7</text><text x="994" y="372">+P8</text><text x="1070" y="372">+P9</text><text x="1146" y="372">+P10</text><text x="1222" y="372">+P11</text><text x="1298" y="372">+P12</text><text x="1374" y="372">+P13</text><text x="1450" y="372">+P14</text><text x="1526" y="372">+P15</text><text x="1602" y="372">+P16</text><text x="1678" y="372">+P17</text>
+  </g>
+
+  <g class="state">
+    <rect x="356" y="407" width="64" height="32" rx="3"/><rect x="432" y="407" width="64" height="32" rx="3"/><rect x="508" y="407" width="64" height="32" rx="3"/><rect x="584" y="407" width="64" height="32" rx="3"/><rect x="660" y="407" width="64" height="32" rx="3"/><rect x="736" y="407" width="64" height="32" rx="3"/><rect x="812" y="407" width="64" height="32" rx="3"/><rect x="888" y="407" width="64" height="32" rx="3"/><rect x="964" y="407" width="64" height="32" rx="3"/><rect x="1040" y="407" width="64" height="32" rx="3"/><rect x="1116" y="407" width="64" height="32" rx="3"/><rect x="1192" y="407" width="64" height="32" rx="3"/><rect x="1268" y="407" width="64" height="32" rx="3"/><rect x="1344" y="407" width="64" height="32" rx="3"/><rect x="1420" y="407" width="64" height="32" rx="3"/><rect x="1496" y="407" width="64" height="32" rx="3"/><rect x="1572" y="407" width="64" height="32" rx="3"/><rect x="1648" y="407" width="64" height="32" rx="3"/>
+    <rect x="354" y="463" width="64" height="32" rx="3"/><rect x="430" y="463" width="64" height="32" rx="3"/><rect x="506" y="463" width="64" height="32" rx="3"/><rect x="582" y="463" width="64" height="32" rx="3"/><rect x="658" y="463" width="64" height="32" rx="3"/><rect x="734" y="463" width="64" height="32" rx="3"/><rect x="810" y="463" width="64" height="32" rx="3"/><rect x="886" y="463" width="64" height="32" rx="3"/><rect x="962" y="463" width="64" height="32" rx="3"/><rect x="1038" y="463" width="64" height="32" rx="3"/><rect x="1114" y="463" width="64" height="32" rx="3"/><rect x="1190" y="463" width="64" height="32" rx="3"/><rect x="1266" y="463" width="64" height="32" rx="3"/><rect x="1342" y="463" width="64" height="32" rx="3"/><rect x="1418" y="463" width="64" height="32" rx="3"/><rect x="1494" y="463" width="64" height="32" rx="3"/><rect x="1570" y="463" width="64" height="32" rx="3"/><rect x="1646" y="463" width="64" height="32" rx="3"/>
+  </g>
+  <g class="small" text-anchor="middle">
+    <text x="388" y="428">S0</text><text x="464" y="428">S1</text><text x="540" y="428">S2</text><text x="616" y="428">S3</text><text x="692" y="428">S4</text><text x="768" y="428">S5</text><text x="844" y="428">S6</text><text x="920" y="428">S7</text><text x="996" y="428">S8</text><text x="1072" y="428">S9</text><text x="1148" y="428">S10</text><text x="1224" y="428">S11</text><text x="1300" y="428">S12</text><text x="1376" y="428">S13</text><text x="1452" y="428">S14</text><text x="1528" y="428">S15</text><text x="1604" y="428">S16</text><text x="1680" y="428">S17</text>
+    <text x="386" y="484">S0</text><text x="462" y="484">S1</text><text x="538" y="484">S2</text><text x="614" y="484">S3</text><text x="690" y="484">S4</text><text x="766" y="484">S5</text><text x="842" y="484">S6</text><text x="918" y="484">S7</text><text x="994" y="484">S8</text><text x="1070" y="484">S9</text><text x="1146" y="484">S10</text><text x="1222" y="484">S11</text><text x="1298" y="484">S12</text><text x="1374" y="484">S13</text><text x="1450" y="484">S14</text><text x="1526" y="484">S15</text><text x="1602" y="484">S16</text><text x="1678" y="484">S17</text>
+  </g>
+
+  <rect x="1648" y="519" width="64" height="32" rx="3" class="final"/>
+  <text x="1680" y="540" text-anchor="middle" class="bar">S17</text>
+  <rect x="1450" y="575" width="262" height="32" rx="3" class="phase"/>
+  <text x="1581" y="596" text-anchor="middle" class="bar">SRAM complete; later read as W0..W7</text>
+  <rect x="260" y="631" width="1430" height="32" rx="3" class="phase"/>
+  <text x="975" y="652" text-anchor="middle" class="bar">Gate: local slices 36..39; Up: local slices 40..43. East and west use distinct physical MEM/SREG identities.</text>
+
+  <rect x="44" y="730" width="1668" height="104" rx="5" class="phase"/>
+  <text x="66" y="760" class="note">For block i, logical MXM issue begins at cycle 42 + 38*i. The gate accumulator begins at 48 + 38*i; the up accumulator begins at 47 + 38*i. Each has repeat_count=32 and accumulates one 32x32 FP32 P&lt;i&gt; tile.</text>
+  <text x="66" y="789" class="note">S0 means P0; S1 means P0+P1; ...; S17 means P0+...+P17. Only after S17 is complete does the current conservative lowering defer SwiGLU to the global projection tail.</text>
+  <text x="66" y="818" class="note">This figure is the complete K reduction for one output tile, not the 24 output pairs of the full 1536-wide gate/up projection.</text>
+</svg>

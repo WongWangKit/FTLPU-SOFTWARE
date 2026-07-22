@@ -1,54 +1,38 @@
 #pragma once
 
-#include <cstddef>
-#include <optional>
-#include <string>
-#include <vector>
+#include "ftlpu/compiler/Target/lpu_target_model.hpp"
+
+#include "llvm/ADT/SmallVector.h"
+#include "mlir/Support/LogicalResult.h"
+
+#include <cstdint>
 
 namespace ftlpu::compiler::stream {
 
-enum class Direction {
-    East,
-    West,
-};
-
-struct Endpoint {
-    std::string kind;
-    std::string name;
-    std::optional<std::string> port{};
-};
-
-struct Binding {
-    std::string symbol;
-    std::size_t stream_id{0};
-    Direction direction{Direction::East};
-    Endpoint producer{};
-    Endpoint consumer{};
-    std::size_t produce_cycle{0};
-    std::size_t consume_cycle{0};
-    std::size_t latency{0};
+struct StreamBinding {
+    int64_t stream_base;
+    int64_t stream_count;
+    int64_t register_id;
+    target::StreamDirection direction;
+    int64_t live_start;
+    int64_t live_end;
 };
 
 class StreamAllocator {
 public:
-    Binding allocate(
-        std::string symbol,
-        Direction direction,
-        Endpoint producer,
-        Endpoint consumer,
-        std::size_t produce_cycle,
-        std::size_t consume_cycle,
-        std::size_t preferred_stream);
+    explicit StreamAllocator(const target::LPUTargetModel& target) : target_(target) {}
 
-    const std::vector<Binding>& bindings() const;
+    mlir::FailureOr<StreamBinding> allocate(target::StreamEndpoint source,
+        target::StreamEndpoint destination, target::StreamDirection direction,
+        int64_t mem_slice, int64_t live_start, int64_t live_end);
 
 private:
-    bool conflicts(std::size_t stream_id, std::size_t produce_cycle, std::size_t consume_cycle) const;
+    bool conflicts(target::StreamDirection direction, int64_t stream_base,
+        int64_t stream_count,
+        int64_t live_start, int64_t live_end) const;
 
-    std::vector<Binding> bindings_{};
+    const target::LPUTargetModel& target_;
+    llvm::SmallVector<StreamBinding, 16> bindings_;
 };
-
-std::string direction_name(Direction direction);
-std::string format_endpoint(const Endpoint& endpoint);
 
 } // namespace ftlpu::compiler::stream

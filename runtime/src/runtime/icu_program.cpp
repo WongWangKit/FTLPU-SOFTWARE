@@ -37,9 +37,54 @@ QueueCommand encode_vxm_command(const VxmLaneAluInstruction& instruction)
     return QueueCommand {
         kInstructionCommand,
         InstructionKind::Vxm,
-        3,
+        4,
         encoded.words,
     };
+}
+
+QueueCommand encode_sxm_command(const SxmInstruction& instruction)
+{
+    QueueCommand command {kInstructionCommand, InstructionKind::Sxm, 4, {}};
+    command.words[0] = static_cast<std::uint32_t>(instruction.opcode);
+    command.words[1] = static_cast<std::uint32_t>(instruction.shift_source);
+    command.words[2] = static_cast<std::uint32_t>(instruction.shift_distance);
+    command.words[3] = static_cast<std::uint32_t>(instruction.weight_layout);
+    command.extension_words.push_back(static_cast<std::uint32_t>(instruction.src_streams.size()));
+    command.extension_words.push_back(static_cast<std::uint32_t>(instruction.dst_streams.size()));
+    for (const auto stream : instruction.src_streams)
+        command.extension_words.push_back(static_cast<std::uint32_t>(stream.stream));
+    for (const auto stream : instruction.dst_streams)
+        command.extension_words.push_back(static_cast<std::uint32_t>(stream.stream));
+    for (const auto lane : instruction.permute_map)
+        command.extension_words.push_back(lane == SxmInstruction::kZeroFill
+            ? UINT32_MAX : static_cast<std::uint32_t>(lane));
+    return command;
+}
+
+SxmInstruction decode_sxm_command(const QueueCommand& command)
+{
+    if (command.instruction_kind != InstructionKind::Sxm || command.word_count != 4
+        || command.extension_words.size() < 2 + SxmInstruction::kTotalLanes)
+        throw std::logic_error("SXM queue command has an invalid variable payload");
+    SxmInstruction instruction {};
+    instruction.opcode = static_cast<SxmOpcode>(command.words[0]);
+    instruction.shift_source = static_cast<SxmShiftSource>(command.words[1]);
+    instruction.shift_distance = command.words[2];
+    instruction.weight_layout = static_cast<SxmWeightLayout>(command.words[3]);
+    const auto src_count = command.extension_words[0];
+    const auto dst_count = command.extension_words[1];
+    const std::size_t map_begin = 2 + src_count + dst_count;
+    if (command.extension_words.size() != map_begin + SxmInstruction::kTotalLanes)
+        throw std::logic_error("SXM queue command has malformed stream lists");
+    for (std::size_t index = 0; index < src_count; ++index)
+        instruction.src_streams.push_back(SxmStreamId {command.extension_words[2 + index]});
+    for (std::size_t index = 0; index < dst_count; ++index)
+        instruction.dst_streams.push_back(SxmStreamId {command.extension_words[2 + src_count + index]});
+    for (std::size_t lane = 0; lane < SxmInstruction::kTotalLanes; ++lane) {
+        const auto value = command.extension_words[map_begin + lane];
+        instruction.permute_map[lane] = value == UINT32_MAX ? SxmInstruction::kZeroFill : value;
+    }
+    return instruction;
 }
 
 void validate_mxm_queue_opcode(
@@ -75,6 +120,9 @@ void validate_queue_index(QueueKind kind, std::size_t index)
     if (kind == QueueKind::Vxm && index >= InstructionControlUnit::kVxmQueues) {
         throw std::out_of_range("binary VXM queue index is outside the CModel ICU range");
     }
+    if ((kind == QueueKind::SxmTranspose || kind == QueueKind::SxmPermute)
+        && index >= hw::kHemispheres)
+        throw std::out_of_range("binary SXM hemisphere index is outside the CModel ICU range");
 }
 
 } // namespace
@@ -90,6 +138,10 @@ const char* queue_kind_name(QueueKind kind)
         return "mxm_compute";
     case QueueKind::Vxm:
         return "vxm";
+    case QueueKind::SxmTranspose:
+        return "sxm_transpose";
+    case QueueKind::SxmPermute:
+        return "sxm_permute";
     }
     return "unknown";
 }
@@ -121,6 +173,22 @@ void IcuProgram::emit_vxm(std::size_t cycle, std::size_t alu, VxmLaneAluInstruct
 {
     check_vxm_alu(alu);
     vxm_[alu].push_back(ScheduledInstruction<VxmLaneAluInstruction> {cycle, instruction});
+    last_cycle_ = std::max(last_cycle_, cycle);
+}
+
+void IcuProgram::emit_sxm_transpose(std::size_t cycle, Hemisphere hemisphere, SxmInstruction instruction)
+{
+    if (instruction.opcode != SxmOpcode::Transpose)
+        throw std::invalid_argument("SXM transpose queue only accepts Transpose instructions");
+    sxm_transpose_[hemisphere_index(hemisphere)].push_back({cycle, std::move(instruction)});
+    last_cycle_ = std::max(last_cycle_, cycle);
+}
+
+void IcuProgram::emit_sxm_permute(std::size_t cycle, Hemisphere hemisphere, SxmInstruction instruction)
+{
+    if (instruction.opcode != SxmOpcode::Permute)
+        throw std::invalid_argument("SXM permute queue only accepts Permute instructions");
+    sxm_permute_[hemisphere_index(hemisphere)].push_back({cycle, std::move(instruction)});
     last_cycle_ = std::max(last_cycle_, cycle);
 }
 
@@ -156,6 +224,14 @@ std::vector<QueueProgram> IcuProgram::encode_queues() const
             encode_scheduled_queue(vxm_[alu], queue_name(QueueKind::Vxm, alu), encode_vxm_command),
         });
     }
+    for (std::size_t hemisphere = 0; hemisphere < hw::kHemispheres; ++hemisphere) {
+        queues.push_back(QueueProgram {QueueKind::SxmTranspose, hemisphere,
+            encode_scheduled_queue(sxm_transpose_[hemisphere],
+                queue_name(QueueKind::SxmTranspose, hemisphere), encode_sxm_command)});
+        queues.push_back(QueueProgram {QueueKind::SxmPermute, hemisphere,
+            encode_scheduled_queue(sxm_permute_[hemisphere],
+                queue_name(QueueKind::SxmPermute, hemisphere), encode_sxm_command)});
+    }
 
     return queues;
 }
@@ -190,6 +266,17 @@ void IcuProgram::load_into(InstructionControlUnit& icu) const
             [&](std::size_t cycles) { icu.enqueue_vxm_nop(alu, cycles); },
             [&](const VxmLaneAluInstruction& instruction) { icu.enqueue_vxm(alu, instruction); });
     }
+    for (std::size_t hemisphere = 0; hemisphere < hw::kHemispheres; ++hemisphere) {
+        const auto side = static_cast<Hemisphere>(hemisphere);
+        load_scheduled_queue(sxm_transpose_[hemisphere],
+            queue_name(QueueKind::SxmTranspose, hemisphere),
+            [&](std::size_t cycles) { icu.enqueue_sxm_transpose_nop(side, cycles); },
+            [&](const SxmInstruction& instruction) { icu.enqueue_sxm_transpose(side, instruction); });
+        load_scheduled_queue(sxm_permute_[hemisphere],
+            queue_name(QueueKind::SxmPermute, hemisphere),
+            [&](std::size_t cycles) { icu.enqueue_sxm_permute_nop(side, cycles); },
+            [&](const SxmInstruction& instruction) { icu.enqueue_sxm_permute(side, instruction); });
+    }
 }
 
 std::size_t IcuProgram::last_cycle() const
@@ -214,6 +301,8 @@ bool IcuProgram::empty() const
             return false;
         }
     }
+    for (const auto& queue : sxm_transpose_) if (!queue.empty()) return false;
+    for (const auto& queue : sxm_permute_) if (!queue.empty()) return false;
     for (const auto& queue : vxm_) {
         if (!queue.empty()) {
             return false;
@@ -226,7 +315,8 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
 {
     for (const auto& queue : queues) {
         validate_queue_index(queue.kind, queue.index);
-        for (const auto& command : queue.commands) {
+        for (std::size_t command_index = 0; command_index < queue.commands.size(); ++command_index) {
+            const auto& command = queue.commands[command_index];
             const auto opcode = isa::decode_icu_command_opcode(command.command);
             if (opcode == isa::IcuCommandOpcode::Nop) {
                 const auto cycles = isa::decode_icu_nop_cycles(command.command);
@@ -242,6 +332,12 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                     break;
                 case QueueKind::Vxm:
                     icu.enqueue_vxm_nop(queue.index, cycles);
+                    break;
+                case QueueKind::SxmTranspose:
+                    icu.enqueue_sxm_transpose_nop(static_cast<Hemisphere>(queue.index), cycles);
+                    break;
+                case QueueKind::SxmPermute:
+                    icu.enqueue_sxm_permute_nop(static_cast<Hemisphere>(queue.index), cycles);
                     break;
                 }
                 continue;
@@ -262,6 +358,9 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                 case QueueKind::Vxm:
                     icu.enqueue_vxm_repeat(queue.index, repeat.count, repeat.interval);
                     break;
+                case QueueKind::SxmTranspose:
+                case QueueKind::SxmPermute:
+                    throw std::logic_error("SXM queues do not support repeat commands");
                 }
                 continue;
             }
@@ -288,11 +387,25 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                 break;
             }
             case QueueKind::Vxm:
-                if (command.instruction_kind != InstructionKind::Vxm || command.word_count != 3) {
-                    throw std::logic_error("VXM queue command does not carry three VXM instruction words");
+                if (command.instruction_kind != InstructionKind::Vxm || command.word_count != 4) {
+                    throw std::logic_error("VXM queue command does not carry four VXM instruction words");
                 }
                 icu.enqueue_vxm(queue.index, isa::decode_vxm_instruction(isa::EncodedVxmInstruction {command.words}));
                 break;
+            case QueueKind::SxmTranspose: {
+                const auto instruction = decode_sxm_command(command);
+                if (instruction.opcode != SxmOpcode::Transpose)
+                    throw std::logic_error("SXM transpose queue received a non-transpose instruction");
+                icu.enqueue_sxm_transpose(static_cast<Hemisphere>(queue.index), std::move(instruction));
+                break;
+            }
+            case QueueKind::SxmPermute: {
+                const auto instruction = decode_sxm_command(command);
+                if (instruction.opcode != SxmOpcode::Permute)
+                    throw std::logic_error("SXM permute queue received a non-permute instruction");
+                icu.enqueue_sxm_permute(static_cast<Hemisphere>(queue.index), std::move(instruction));
+                break;
+            }
             }
         }
     }

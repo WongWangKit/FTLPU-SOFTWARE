@@ -16,6 +16,8 @@ enum class QueueKind : std::uint16_t {
     MxmLoad = 1,
     MxmCompute = 2,
     Vxm = 4,
+    SxmTranspose = 5,
+    SxmPermute = 6,
 };
 
 enum class InstructionKind : std::uint16_t {
@@ -23,13 +25,17 @@ enum class InstructionKind : std::uint16_t {
     Mem = 1,
     Mxm = 2,
     Vxm = 3,
+    Sxm = 4,
 };
 
 struct QueueCommand {
     isa::EncodedIcuCommand command{0};
     InstructionKind instruction_kind{InstructionKind::None};
     std::uint16_t word_count{0};
-    std::array<std::uint32_t, 3> words{};
+    std::array<std::uint32_t, 4> words{};
+    // MEM/MXM/VXM fit in the fixed header. SXM carries variable stream lists
+    // and a 32-lane map in this trailing payload.
+    std::vector<std::uint32_t> extension_words{};
 };
 
 struct QueueProgram {
@@ -44,6 +50,8 @@ public:
     void emit_mxm_load(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction);
     void emit_mxm_compute(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction);
     void emit_vxm(std::size_t cycle, std::size_t alu, VxmLaneAluInstruction instruction);
+    void emit_sxm_transpose(std::size_t cycle, Hemisphere hemisphere, SxmInstruction instruction);
+    void emit_sxm_permute(std::size_t cycle, Hemisphere hemisphere, SxmInstruction instruction);
 
     std::vector<QueueProgram> encode_queues() const;
     void load_into(InstructionControlUnit& icu) const;
@@ -61,6 +69,7 @@ private:
     using MemQueue = std::vector<ScheduledInstruction<MemInstruction>>;
     using MxmQueue = std::vector<ScheduledInstruction<MxmControlInstruction>>;
     using VxmQueue = std::vector<ScheduledInstruction<VxmLaneAluInstruction>>;
+    using SxmQueue = std::vector<ScheduledInstruction<SxmInstruction>>;
 
     void check_mem_column(std::size_t column) const;
     void check_mxm(std::size_t mxm) const;
@@ -83,6 +92,8 @@ private:
     std::array<MxmQueue, InstructionControlUnit::kMxmQueues> mxm_load_{};
     std::array<MxmQueue, InstructionControlUnit::kMxmQueues> mxm_compute_{};
     std::array<VxmQueue, InstructionControlUnit::kVxmQueues> vxm_{};
+    std::array<SxmQueue, hw::kHemispheres> sxm_transpose_{};
+    std::array<SxmQueue, hw::kHemispheres> sxm_permute_{};
     std::size_t last_cycle_{0};
 };
 
