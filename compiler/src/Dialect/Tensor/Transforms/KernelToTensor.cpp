@@ -329,6 +329,10 @@ public:
             llvm::SmallVector<int64_t> weight_slices;
             for (int64_t index = 0; index < target.memory().w8a16_weight_slice_count; ++index)
                 weight_slices.push_back(index * target.memory().w8a16_weight_slice_stride);
+            llvm::SmallVector<int64_t> output_weight_slices = weight_slices;
+            // Slice 16 holds softmax probabilities until PV completes, so keep
+            // the concurrently live output projection weights on slice 2.
+            output_weight_slices[4] = 2;
             const llvm::SmallVector<int64_t> activation_slices {32, 33, 34, 35};
             const llvm::SmallVector<int64_t> output_slices {0, 1, 2, 3};
             const int64_t q_weight_rows = attention_weight_rows(query_width);
@@ -351,8 +355,8 @@ public:
                 rewriter.getNamedAttr("value_weight", make_attention_placement(rewriter,
                     "w8a16_attention_weight_striped", weight_slices, q_weight_rows + k_weight_rows, v_weight_rows, "both")),
                 rewriter.getNamedAttr("output_weight", make_attention_placement(rewriter,
-                    "w8a16_mxm_weight_striped", weight_slices, q_weight_rows + k_weight_rows + v_weight_rows,
-                    o_weight_rows, "east")),
+                    "w8a16_mxm_weight_striped", output_weight_slices, q_weight_rows + k_weight_rows + v_weight_rows,
+                    o_weight_rows, "both")),
                 rewriter.getNamedAttr("query", make_attention_placement(rewriter,
                     "fp16_query_iw", output_slices, 7600, query_rows, "both")),
                 rewriter.getNamedAttr("key", make_attention_placement(rewriter,
@@ -373,6 +377,10 @@ public:
                     "fp16_probability_x16", target.attention_query_iw_slices(1), 6000,
                     op.getQueryHeads() * blocks
                         * (op.getSeqLen() / target.throughput().lanes_per_tile), "both")),
+                rewriter.getNamedAttr("probability_diagonal", make_attention_placement(rewriter,
+                    "fp16_probability_diagonal", target.attention_query_iw_slices(0), 7000,
+                    op.getQueryHeads() * blocks * blocks
+                        * target.throughput().tile_rows, "both")),
                 rewriter.getNamedAttr("rope", make_attention_placement(rewriter,
                     "fp16_rope_table", llvm::ArrayRef<int64_t>({4, 5, 6, 7}), 7000,
                     op.getSeqLen(), "both")),

@@ -139,8 +139,8 @@ LogicalResult SxmOp::verify()
     if (getOpcode() != "transpose" && getOpcode() != "permute")
         return emitOpError("opcode must be transpose or permute");
     if (getSourceStreams().empty() || getDestinationStreams().empty()
-        || getPermuteMap().size() != 320)
-        return emitOpError("requires non-empty stream lists and a 320-lane map");
+        || getPermuteMap().size() != 32)
+        return emitOpError("requires non-empty stream lists and a 32-lane map");
     const auto valid_stream = [&](Attribute attribute) {
         const auto value = llvm::dyn_cast<IntegerAttr>(attribute);
         return value && value.getInt() >= 0
@@ -152,8 +152,8 @@ LogicalResult SxmOp::verify()
         if (!valid_stream(stream)) return emitOpError("destination stream is outside the encoded range");
     for (Attribute lane : getPermuteMap()) {
         const auto value = llvm::dyn_cast<IntegerAttr>(lane);
-        if (!value || value.getInt() < -1 || value.getInt() >= 320)
-            return emitOpError("permute map lanes must be -1 or [0, 319]");
+        if (!value || value.getInt() < -1 || value.getInt() >= 32)
+            return emitOpError("permute map lanes must be -1 or [0, 31]");
     }
     if (getWeightLayout() != "vector_columns" && getWeightLayout() != "matrix_columns")
         return emitOpError("weight_layout must be vector_columns or matrix_columns");

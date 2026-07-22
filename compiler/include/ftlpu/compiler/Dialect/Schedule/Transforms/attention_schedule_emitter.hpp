@@ -22,6 +22,9 @@ private:
         int64_t qkIwToComputeCycles);
     int64_t emitSoftmax(int64_t qkEnd);
     int64_t emitProbabilityPack(int64_t softmaxEnd);
+    int64_t emitProbabilityTranspose(int64_t packEnd);
+    int64_t emitPv(int64_t transposeEnd);
+    int64_t emitOutputProjection(int64_t pvEnd);
 
     mlir::IRRewriter& rewriter_;
     stream::AttentionOp op_;

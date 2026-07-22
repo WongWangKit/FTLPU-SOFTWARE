@@ -43,22 +43,31 @@ def main() -> None:
         'opcode = "divide"',
         'packed_stream = 48 : i64',
         'packed_stream = 49 : i64',
+        'ftlpu.schedule.sxm',
+        'opcode = "transpose"',
+        'opcode = "permute"',
+        'destination_streams = [32, 33, 34, 35',
+        'weight_layout = "matrix_columns"',
+        'opcode = "accumulate"',
+        'output_stream = 8 : i64',
     )
     missing = [item for item in required if item not in text]
     if missing:
         raise AssertionError(f"Attention Schedule IR is missing: {missing}")
-    if text.count("ftlpu.schedule.mem_queue") != 162864:
+    if text.count("ftlpu.schedule.mem_queue") != 251568:
         raise AssertionError("attention schedule did not emit the complete MEM queue program")
-    if text.count("ftlpu.schedule.mxm_queue") != 4896:
-        raise AssertionError("attention schedule did not emit projection and QK MXM commands")
-    if text.count("ftlpu.schedule.vxm") != 86016:
-        raise AssertionError("attention schedule did not emit projection, Softmax, and probability repack VXM commands")
+    if text.count("ftlpu.schedule.mxm_queue") != 8064:
+        raise AssertionError("attention schedule did not emit projection, QK, and PV MXM commands")
+    if text.count("ftlpu.schedule.vxm") != 118272:
+        raise AssertionError("attention schedule did not emit projection, softmax, and context VXM commands")
     if text.count('opcode = "max"') != 4572:
         raise AssertionError("attention schedule did not emit recurrent softmax max commands")
     if text.count('opcode = "exp"') != 4608 or text.count('opcode = "divide"') != 4608:
         raise AssertionError("attention schedule did not emit complete softmax exp/divide commands")
-    if text.count('opcode = "iw"') != 2448:
-        raise AssertionError("attention schedule did not emit all projection and QK IW commands")
+    if text.count('opcode = "iw"') != 4032:
+        raise AssertionError("attention schedule did not emit all projection, QK, and PV IW commands")
+    if text.count("ftlpu.schedule.sxm") != 2172:
+        raise AssertionError("attention schedule did not emit all probability and V transpose/permute waves")
     for column in range(4):
         if f"weight_column = {column} : i64" not in text:
             raise AssertionError(f"MXM IW weight column {column} is missing")

@@ -26,7 +26,7 @@ bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destin
     if (source == StreamEndpoint::Mem && mxm_input)
         return direction == StreamDirection::East;
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::VxmInput)
-        return direction == StreamDirection::East;
+        return direction == StreamDirection::East || direction == StreamDirection::West;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::MxmWeight)
         return direction == StreamDirection::East;
     if (source == StreamEndpoint::MxmResult && destination == StreamEndpoint::Mem)
@@ -138,10 +138,12 @@ std::optional<int64_t> LPUTargetModel::transport_latency(StreamEndpoint source,
     const int64_t group = mem_slice / streams_.mem_slices_per_register_group;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::MxmWeight)
         return 1;
+    if (source == StreamEndpoint::Mem && direction == StreamDirection::West)
+        return group + 2;
     if (source == StreamEndpoint::Mem)
         return streams_.system_register_columns - group;
     if (source == StreamEndpoint::VxmResult)
-        return group + 2;
+        return group + 1;
     return streams_.system_register_columns - 1 - group;
 }
 

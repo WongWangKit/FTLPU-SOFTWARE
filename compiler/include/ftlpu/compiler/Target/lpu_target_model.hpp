@@ -61,6 +61,8 @@ struct ThroughputModel {
     int64_t mxms_per_hemisphere = 2;
     int64_t mxm_weight_buffers = 2;
     int64_t vxm_weight_to_iw_latency = 14;
+    int64_t mem_to_sxm_latency = 12;
+    int64_t mem_to_mxm_latency = 13;
     int64_t mxm0_accumulator_latency = 6;
     int64_t mxm1_accumulator_latency = 5;
     int64_t accumulator_to_vxm_latency = 16;

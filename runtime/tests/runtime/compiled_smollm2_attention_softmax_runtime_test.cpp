@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -70,6 +71,21 @@ std::vector<std::uint8_t> make_weight(Projection projection)
             = static_cast<std::uint8_t>(value);
     }
     return weight;
+}
+
+std::vector<std::uint8_t> make_output_weight()
+{
+    std::vector<std::uint8_t> weight(kHidden * kHidden, 0);
+    for (std::size_t index = 0; index < kHidden; ++index)
+        weight[index * kHidden + index] = 1;
+    return weight;
+}
+
+float fp16_at(const std::vector<std::uint8_t>& bytes, std::size_t index)
+{
+    const std::size_t offset = index * 2;
+    return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(bytes[offset])
+        | (static_cast<std::uint16_t>(bytes[offset + 1]) << 8)).to_float();
 }
 
 void initialize_rope(ftlpu::TspSliceSystem& system)
@@ -195,6 +211,49 @@ float read_packed_probability(const ftlpu::TspSliceSystem& system,
     return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
         | (static_cast<std::uint16_t>(high) << 8)).to_float();
 }
+
+float read_diagonal_probability(const ftlpu::TspSliceSystem& system,
+    std::size_t query_head, std::size_t query, std::size_t key)
+{
+    const std::size_t query_block = query / kTile;
+    const std::size_t query_row = query % 8;
+    const std::size_t diagonal = (query % kTile) / 8;
+    const std::size_t key_block = key / kTile;
+    const std::size_t physical_key = key % kTile;
+    const std::size_t tile = physical_key / 8;
+    const std::size_t lane = physical_key % 8;
+    const std::size_t kv_head = query_head / (kQueryHeads / kKvHeads);
+    const auto hemisphere = static_cast<ftlpu::Hemisphere>(kv_head % 2);
+    const std::size_t stream = query_row * 2;
+    const std::size_t address = 7000
+        + ((query_head * (kSeqLen / kTile) + query_block) * (kSeqLen / kTile)
+              + key_block)
+            * 4
+        + diagonal;
+    const auto low = system.read_mem_sram_lane_byte(
+        hemisphere, kQueryIwSlices[0][stream], tile, address, lane);
+    const auto high = system.read_mem_sram_lane_byte(
+        hemisphere, kQueryIwSlices[0][stream + 1], tile, address, lane);
+    return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
+        | (static_cast<std::uint16_t>(high) << 8)).to_float();
+}
+
+float read_context(const ftlpu::TspSliceSystem& system, std::size_t query_head,
+    std::size_t token, std::size_t dimension)
+{
+    const std::size_t kv_head = query_head / (kQueryHeads / kKvHeads);
+    const auto hemisphere = static_cast<ftlpu::Hemisphere>(kv_head % 2);
+    const std::size_t physical = dimension % kTile;
+    const std::size_t tile = physical / 8;
+    const std::size_t lane = physical % 8;
+    const std::size_t low_slice = dimension < kTile ? 20 : 22;
+    const auto low = system.read_mem_sram_lane_byte(
+        hemisphere, low_slice, tile, 2000 + query_head * kSeqLen + token, lane);
+    const auto high = system.read_mem_sram_lane_byte(
+        hemisphere, low_slice + 1, tile, 2000 + query_head * kSeqLen + token, lane);
+    return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
+        | (static_cast<std::uint16_t>(high) << 8)).to_float();
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -214,7 +273,7 @@ try {
     const auto query_weight = make_weight(Projection::Query);
     const auto key_weight = make_weight(Projection::Key);
     const auto value_weight = make_weight(Projection::Value);
-    const auto output_weight = std::vector<std::uint8_t>(kHidden * kHidden, 0);
+    const auto output_weight = make_output_weight();
 
     auto system = std::make_unique<ftlpu::TspSliceSystem>();
     initialize_rope(*system);
@@ -258,10 +317,17 @@ try {
             for (std::size_t key = 0; key < kSeqLen; ++key) {
                 const float probability = read_probability(*system, head, query, key);
                 const float packed = read_packed_probability(*system, head, query, key);
+                const float diagonal = read_diagonal_probability(*system, head, query, key);
                 if (!std::isfinite(probability) || probability < 0.0f)
                     throw std::logic_error("attention softmax produced an invalid probability");
                 if (packed != probability)
                     throw std::logic_error("packed probability does not match softmax output");
+                if (diagonal != probability)
+                    throw std::logic_error("SXM diagonal probability mismatch: head="
+                        + std::to_string(head) + " query=" + std::to_string(query)
+                        + " key=" + std::to_string(key)
+                        + " actual=" + std::to_string(diagonal)
+                        + " expected=" + std::to_string(probability));
                 if (probability > 0.00001f) ++probability_nonzero;
                 sum += probability;
             }
@@ -274,11 +340,74 @@ try {
     }
     if (probability_nonzero == 0)
         throw std::logic_error("attention softmax produced only zero probabilities");
+    std::size_t context_checked = 0;
+    std::size_t context_nonzero = 0;
+    for (std::size_t head = 0; head < kQueryHeads; ++head) {
+        const std::size_t kv_head = head / (kQueryHeads / kKvHeads);
+        for (std::size_t query : sample_queries) {
+            for (std::size_t dimension = 0; dimension < kHeadDim; ++dimension) {
+                float reference = 0.0f;
+                for (std::size_t key = 0; key < kSeqLen; ++key) {
+                    reference += read_probability(*system, head, query, key)
+                        * expected(Projection::Value, key,
+                            kv_head * kHeadDim + dimension);
+                }
+                reference = ftlpu::Fp16::from_float(reference).to_float();
+                const float actual = read_context(*system, head, query, dimension);
+                if (std::fabs(actual) > 0.0005f) ++context_nonzero;
+                if (std::fabs(actual - reference) > 0.008f)
+                    throw std::logic_error("PV context mismatch: head="
+                        + std::to_string(head) + " query=" + std::to_string(query)
+                        + " dimension=" + std::to_string(dimension)
+                        + " actual=" + std::to_string(actual)
+                        + " expected=" + std::to_string(reference));
+                ++context_checked;
+            }
+        }
+    }
+    if (context_nonzero == 0)
+        throw std::logic_error("PV produced only zero context values");
+    const auto output = runtime.download_output(0);
+    std::size_t output_checked = 0;
+    std::size_t output_nonzero = 0;
+    for (std::size_t token : sample_queries) {
+        for (std::size_t column = 0; column < kHidden; ++column) {
+            const float actual = fp16_at(output, token * kHidden + column);
+            const float reference = read_context(*system, column / kHeadDim,
+                token, column % kHeadDim);
+            if (std::fabs(actual) > 0.0005f) ++output_nonzero;
+            if (std::fabs(actual - reference) > 0.008f) {
+                std::size_t closest = 0;
+                float closestError = std::numeric_limits<float>::infinity();
+                for (std::size_t candidate = 0; candidate < kHidden; ++candidate) {
+                    const float value = read_context(*system, candidate / kHeadDim,
+                        token, candidate % kHeadDim);
+                    if (std::fabs(actual - value) < closestError) {
+                        closest = candidate;
+                        closestError = std::fabs(actual - value);
+                    }
+                }
+                throw std::logic_error("O projection mismatch: token="
+                    + std::to_string(token) + " column=" + std::to_string(column)
+                    + " actual=" + std::to_string(actual)
+                    + " expected=" + std::to_string(reference)
+                    + " closest_context_column=" + std::to_string(closest)
+                    + " closest_error=" + std::to_string(closestError));
+            }
+            ++output_checked;
+        }
+    }
+    if (output_nonzero == 0)
+        throw std::logic_error("O projection produced only zero output values");
     std::cout << "Compiled attention Q/K/V projection + RoPE passed: " << checked
               << " sampled FP16 values, nonzero=" << nonzero
               << ", projection_end_cycle=" << kProjectionEndCycle
-              << "; softmax passed: rows=" << probability_rows
+              << "; softmax + SXM diagonal layout passed: rows=" << probability_rows
               << ", nonzero=" << probability_nonzero
+              << "; PV context passed: values=" << context_checked
+              << ", nonzero=" << context_nonzero
+              << "; O projection passed: values=" << output_checked
+              << ", nonzero=" << output_nonzero
               << ", max_cycle=" << program.max_cycle << '\n';
     return 0;
 } catch (const std::exception& ex) {

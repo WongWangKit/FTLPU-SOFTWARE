@@ -300,7 +300,7 @@ LogicalResult AttentionOp::verify()
         return emitOpError("tensor shapes do not match the attention configuration");
     for (StringRef name : {"input", "query_weight", "key_weight", "value_weight",
              "output_weight", "query", "key", "value", "score", "probability",
-             "probability_pack", "exp", "rope", "context", "result"}) {
+             "probability_pack", "probability_diagonal", "exp", "rope", "context", "result"}) {
         const auto placement = getMemoryPlan().getAs<DictionaryAttr>(name);
         const auto kind = placement ? placement.getAs<StringAttr>("kind") : StringAttr {};
         const auto slices = placement ? placement.getAs<ArrayAttr>("slices") : ArrayAttr {};
