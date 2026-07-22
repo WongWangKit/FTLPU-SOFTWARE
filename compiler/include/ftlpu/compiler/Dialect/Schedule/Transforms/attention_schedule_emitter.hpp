@@ -21,6 +21,7 @@ private:
     void emitQk(int64_t qkStart, int64_t qkWaveCycles,
         int64_t qkIwToComputeCycles);
     int64_t emitSoftmax(int64_t qkEnd);
+    int64_t emitProbabilityPack(int64_t softmaxEnd);
 
     mlir::IRRewriter& rewriter_;
     stream::AttentionOp op_;

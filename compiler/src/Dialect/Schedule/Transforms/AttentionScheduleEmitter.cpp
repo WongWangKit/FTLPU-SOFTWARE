@@ -247,11 +247,26 @@ int64_t AttentionScheduleEmitter::emitProjections()
                                             stream, 1, 1, 0);
                                     }
                                 }
-                            } else {
+                            } else if (kind == AttentionProjectionKind::Key) {
                                 for (int64_t byte = 0; byte < 4; ++byte)
                                     emitMem(rewriter_, op_.getLoc(), writeCycle,
                                         hemisphere * target_.memory().slices_per_hemisphere + byte,
                                         "write", outputAddress + offset, byte, 1, 1, 0);
+                            } else {
+                                const int64_t packedStream = (token % 8) * 2;
+                                const int64_t row = (token % tile) / 8;
+                                for (int64_t reduction = 0; reduction < 2; ++reduction) {
+                                    const auto slices = layout.valuePackSlices(reduction);
+                                    for (int64_t byte = 0; byte < 2; ++byte) {
+                                        const int64_t slice = slices[packedStream + byte];
+                                        emitMem(rewriter_, op_.getLoc(), writeCycle
+                                                + slice / target_.streams().mem_slices_per_register_group,
+                                            hemisphere * target_.memory().slices_per_hemisphere + slice,
+                                            "write", layout.valuePackAddress(head, reduction,
+                                                tokenBlock, row), reduction * 2 + byte,
+                                            1, 1, 0);
+                                    }
+                                }
                             }
                         }
                     }
@@ -455,6 +470,50 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
     return softmaxCycle;
 }
 
+int64_t AttentionScheduleEmitter::emitProbabilityPack(int64_t softmaxEnd)
+{
+    const AttentionMemoryLayout layout(op_, target_);
+    const AttentionWorkPlanner planner({static_cast<int64_t>(op_.getSeqLen()),
+        static_cast<int64_t>(op_.getQueryHeads()), static_cast<int64_t>(op_.getKvHeads()),
+        static_cast<int64_t>(op_.getHeadDim())}, target_);
+    const auto readLatency = [&](int64_t slice) {
+        return slice / target_.streams().mem_slices_per_register_group + 2;
+    };
+    int64_t cycle = softmaxEnd + 32;
+    for (const auto& wave : planner.qk_waves()) {
+        for (const auto& work : wave.slots) {
+            if (!work) continue;
+            const char* hemisphere = work->hemisphere == 0 ? "east" : "west";
+            for (int64_t key = 0; key < op_.getSeqLen(); ++key, ++cycle) {
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice = layout.probabilitySlices()[byte];
+                    emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
+                        work->hemisphere * target_.memory().slices_per_hemisphere + slice,
+                        "read", layout.probabilityAddress(work->query_head,
+                            work->query_block, key), 48 + byte, 1, 1, 0);
+                    emitVxm(rewriter_, op_, op_.getInput(), cycle, byte, "pass",
+                        "stream_i8", 48 + byte, 0.0f,
+                        "immediate", 0, 0.0f, "i8", byte,
+                        hemisphere, hemisphere);
+                }
+                const int64_t packedStream = (key % target_.throughput().lanes_per_tile) * 2;
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice = layout.probabilityPackSlices()[packedStream + byte];
+                    emitMem(rewriter_, op_.getLoc(), cycle + 1
+                            + slice / target_.streams().mem_slices_per_register_group,
+                        work->hemisphere * target_.memory().slices_per_hemisphere + slice,
+                        "write", layout.probabilityPackAddress(work->query_head,
+                            work->query_block,
+                            key / target_.throughput().lanes_per_tile),
+                        byte, 1, 1, 0);
+                }
+            }
+            cycle += 8;
+        }
+    }
+    return cycle + 16;
+}
+
 mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
 {
     const AttentionWorkPlanner attentionPlan({static_cast<int64_t>(op_.getSeqLen()),
@@ -488,8 +547,10 @@ mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
     emitQk(qkStart, qkWaveCycles, qkIwToComputeCycles);
     const int64_t softmaxEnd = emitSoftmax(qkEnd);
     const int64_t softmaxCycles = softmaxEnd - qkEnd;
-    const int64_t pvCycles = attentionPlan.pv_waves().size()
+    const int64_t probabilityPackEnd = emitProbabilityPack(softmaxEnd);
+    const int64_t pvComputeCycles = attentionPlan.pv_waves().size()
         * tokenBlocks * headBlocks * issue;
+    const int64_t pvCycles = probabilityPackEnd - softmaxEnd + pvComputeCycles;
     const int64_t outputProjectionCycles = (op_.getHidden() / tile)
         * hiddenBlocks * tokenBlocks * issue;
 
@@ -523,7 +584,7 @@ mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
     appendPhase("softmax", softmaxCycles);
     appendPhase("pv", pvCycles);
     appendPhase("o_proj", outputProjectionCycles);
-    const int64_t pvStart = softmaxEnd;
+    const int64_t pvStart = probabilityPackEnd;
     const auto appendWaves = [&](llvm::StringRef phaseName,
         const std::vector<AttentionWorkWave>& waves, int64_t start, int64_t interval) {
         for (std::size_t index = 0; index < waves.size(); ++index) {

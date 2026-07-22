@@ -25,6 +25,10 @@ constexpr std::array<std::array<std::size_t, 16>, 2> kQueryIwSlices {{
     {{0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33}},
     {{18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35}},
 }};
+constexpr std::array<std::array<std::size_t, 16>, 2> kValuePackSlices {{
+    {{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33}},
+    {{18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35}},
+}};
 
 enum class Projection : std::size_t { Query, Key, Value };
 
@@ -115,6 +119,16 @@ float read_projection(const ftlpu::TspSliceSystem& system, Projection projection
         high_slice = kQueryIwSlices[reduction][stream + 1];
         address = 7600 + (head * (kSeqLen / kTile) + token / kTile) * 4
             + local_token / 8;
+    } else if (projection == Projection::Value) {
+        const std::size_t reduction = dimension / kTile;
+        const std::size_t local_token = token % kTile;
+        const std::size_t stream = (local_token % 8) * 2;
+        low_slice = kValuePackSlices[reduction][stream];
+        high_slice = kValuePackSlices[reduction][stream + 1];
+        address = 7800 + ((head * 2 + reduction) * (kSeqLen / kTile)
+                            + token / kTile)
+                * 4
+            + local_token / 8;
     }
     const auto low = system.read_mem_sram_lane_byte(
         hemisphere, low_slice, tile, address, lane);
@@ -157,6 +171,27 @@ float read_probability(const ftlpu::TspSliceSystem& system, std::size_t query_he
         hemisphere, 16, tile, address, lane);
     const auto high = system.read_mem_sram_lane_byte(
         hemisphere, 17, tile, address, lane);
+    return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
+        | (static_cast<std::uint16_t>(high) << 8)).to_float();
+}
+
+float read_packed_probability(const ftlpu::TspSliceSystem& system,
+    std::size_t query_head, std::size_t query, std::size_t key)
+{
+    const std::size_t query_block = query / kTile;
+    const std::size_t physical = query % kTile;
+    const std::size_t tile = physical / 8;
+    const std::size_t lane = physical % 8;
+    const std::size_t kv_head = query_head / (kQueryHeads / kKvHeads);
+    const auto hemisphere = static_cast<ftlpu::Hemisphere>(kv_head % 2);
+    const std::size_t stream = (key % 8) * 2;
+    const std::size_t address = 6000
+        + (query_head * (kSeqLen / kTile) + query_block) * (kSeqLen / 8)
+        + key / 8;
+    const auto low = system.read_mem_sram_lane_byte(
+        hemisphere, kQueryIwSlices[1][stream], tile, address, lane);
+    const auto high = system.read_mem_sram_lane_byte(
+        hemisphere, kQueryIwSlices[1][stream + 1], tile, address, lane);
     return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
         | (static_cast<std::uint16_t>(high) << 8)).to_float();
 }
@@ -222,8 +257,11 @@ try {
             float sum = 0.0f;
             for (std::size_t key = 0; key < kSeqLen; ++key) {
                 const float probability = read_probability(*system, head, query, key);
+                const float packed = read_packed_probability(*system, head, query, key);
                 if (!std::isfinite(probability) || probability < 0.0f)
                     throw std::logic_error("attention softmax produced an invalid probability");
+                if (packed != probability)
+                    throw std::logic_error("packed probability does not match softmax output");
                 if (probability > 0.00001f) ++probability_nonzero;
                 sum += probability;
             }

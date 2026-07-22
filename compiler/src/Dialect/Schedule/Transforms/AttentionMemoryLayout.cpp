@@ -27,6 +27,9 @@ AttentionMemoryLayout::AttentionMemoryLayout(stream::AttentionOp op,
     readPlacement("score", scaledScoreSlices_, scaledScoreBase_);
     readPlacement("exp", expScoreSlices_, expScoreBase_);
     readPlacement("probability", probabilitySlices_, probabilityBase_);
+    readPlacement("probability_pack", probabilityPackSlices_, probabilityPackBase_);
+    if (const auto value = plan.getAs<mlir::DictionaryAttr>("value"))
+        valuePackBase_ = value.getAs<mlir::IntegerAttr>("base_row").getInt();
 }
 
 int64_t AttentionMemoryLayout::weightBase(AttentionProjectionKind projection) const
@@ -95,6 +98,31 @@ int64_t AttentionMemoryLayout::probabilityAddress(int64_t queryHead,
     const int64_t tokenBlocks = seqLen_ / target_.throughput().mxm_rows;
     return probabilityBase_
         + (queryHead * tokenBlocks + queryBlock) * seqLen_ + key;
+}
+
+int64_t AttentionMemoryLayout::probabilityPackAddress(int64_t queryHead,
+    int64_t queryBlock, int64_t keyBlock) const
+{
+    const int64_t tokenBlocks = seqLen_ / target_.throughput().mxm_rows;
+    return probabilityPackBase_
+        + (queryHead * tokenBlocks + queryBlock)
+            * (seqLen_ / target_.throughput().lanes_per_tile)
+        + keyBlock;
+}
+
+int64_t AttentionMemoryLayout::valuePackAddress(int64_t head,
+    int64_t reductionBlock, int64_t tokenBlock, int64_t row) const
+{
+    const int64_t tileRows = target_.throughput().tile_rows;
+    const int64_t tokenBlocks = seqLen_ / target_.throughput().mxm_rows;
+    return valuePackBase_
+        + ((head * 2 + reductionBlock) * tokenBlocks + tokenBlock) * tileRows + row;
+}
+
+llvm::ArrayRef<int64_t> AttentionMemoryLayout::valuePackSlices(
+    int64_t reductionBlock) const
+{
+    return valuePackSlices_.at(static_cast<std::size_t>(reductionBlock));
 }
 
 int64_t AttentionMemoryLayout::ropeAddress(int64_t token) const

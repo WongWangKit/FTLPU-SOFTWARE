@@ -41,16 +41,18 @@ def main() -> None:
         'opcode = "max"',
         'opcode = "exp"',
         'opcode = "divide"',
+        'packed_stream = 48 : i64',
+        'packed_stream = 49 : i64',
     )
     missing = [item for item in required if item not in text]
     if missing:
         raise AssertionError(f"Attention Schedule IR is missing: {missing}")
-    if text.count("ftlpu.schedule.mem_queue") != 144432:
+    if text.count("ftlpu.schedule.mem_queue") != 162864:
         raise AssertionError("attention schedule did not emit the complete MEM queue program")
     if text.count("ftlpu.schedule.mxm_queue") != 4896:
         raise AssertionError("attention schedule did not emit projection and QK MXM commands")
-    if text.count("ftlpu.schedule.vxm") != 76800:
-        raise AssertionError("attention schedule did not emit projection, RoPE, and softmax VXM commands")
+    if text.count("ftlpu.schedule.vxm") != 86016:
+        raise AssertionError("attention schedule did not emit projection, Softmax, and probability repack VXM commands")
     if text.count('opcode = "max"') != 4572:
         raise AssertionError("attention schedule did not emit recurrent softmax max commands")
     if text.count('opcode = "exp"') != 4608 or text.count('opcode = "divide"') != 4608:

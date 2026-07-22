@@ -36,6 +36,10 @@ public:
     int64_t expScoreAddress(int64_t key) const { return expScoreBase_ + key; }
     int64_t probabilityAddress(int64_t queryHead, int64_t queryBlock,
         int64_t key) const;
+    int64_t probabilityPackAddress(int64_t queryHead, int64_t queryBlock,
+        int64_t keyBlock) const;
+    int64_t valuePackAddress(int64_t head, int64_t reductionBlock,
+        int64_t tokenBlock, int64_t row) const;
     int64_t ropeAddress(int64_t token) const;
 
     llvm::ArrayRef<int64_t> weightSlices() const { return weightSlices_; }
@@ -44,6 +48,8 @@ public:
     llvm::ArrayRef<int64_t> scaledScoreSlices() const { return scaledScoreSlices_; }
     llvm::ArrayRef<int64_t> expScoreSlices() const { return expScoreSlices_; }
     llvm::ArrayRef<int64_t> probabilitySlices() const { return probabilitySlices_; }
+    llvm::ArrayRef<int64_t> probabilityPackSlices() const { return probabilityPackSlices_; }
+    llvm::ArrayRef<int64_t> valuePackSlices(int64_t reductionBlock) const;
 
 private:
     int64_t weightBase(AttentionProjectionKind projection) const;
@@ -59,10 +65,18 @@ private:
     std::array<int64_t, 4> scaledScoreSlices_ {8, 9, 10, 11};
     std::array<int64_t, 4> expScoreSlices_ {12, 13, 14, 15};
     std::array<int64_t, 2> probabilitySlices_ {16, 17};
+    std::array<int64_t, 16> probabilityPackSlices_ {
+        18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35};
+    std::array<std::array<int64_t, 16>, 2> valuePackSlices_ {{
+        {{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33}},
+        {{18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35}},
+    }};
     int64_t ropeBase_ = 7000;
     int64_t scaledScoreBase_ = 0;
     int64_t expScoreBase_ = 0;
     int64_t probabilityBase_ = 0;
+    int64_t probabilityPackBase_ = 6000;
+    int64_t valuePackBase_ = 7800;
 };
 
 } // namespace ftlpu::compiler::schedule

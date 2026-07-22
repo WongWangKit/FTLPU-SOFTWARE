@@ -255,8 +255,8 @@ LogicalResult SxmOp::verify()
     if (getOpcode() != "transpose" && getOpcode() != "permute")
         return emitOpError("opcode must be transpose or permute");
     if (getSourceStreams().empty() || getDestinationStreams().empty()
-        || getPermuteMap().size() != 32)
-        return emitOpError("requires stream lists and a 32-lane map");
+        || getPermuteMap().size() != 320)
+        return emitOpError("requires stream lists and a 320-lane map");
     return success();
 }
 
