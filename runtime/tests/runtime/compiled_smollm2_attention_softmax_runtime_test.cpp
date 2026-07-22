@@ -141,12 +141,31 @@ float expected(Projection projection, std::size_t token, std::size_t column)
     return ftlpu::Fp16::from_float(dimension < kTile
         ? lo * cosine - hi * sine : hi * cosine + lo * sine).to_float();
 }
+
+float read_probability(const ftlpu::TspSliceSystem& system, std::size_t query_head,
+    std::size_t query, std::size_t key)
+{
+    const std::size_t query_block = query / kTile;
+    const std::size_t physical = query % kTile;
+    const std::size_t tile = physical / 8;
+    const std::size_t lane = physical % 8;
+    const std::size_t kv_head = query_head / (kQueryHeads / kKvHeads);
+    const auto hemisphere = static_cast<ftlpu::Hemisphere>(kv_head % 2);
+    const std::size_t address = (query_head * (kSeqLen / kTile) + query_block)
+        * kSeqLen + key;
+    const auto low = system.read_mem_sram_lane_byte(
+        hemisphere, 16, tile, address, lane);
+    const auto high = system.read_mem_sram_lane_byte(
+        hemisphere, 17, tile, address, lane);
+    return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
+        | (static_cast<std::uint16_t>(high) << 8)).to_float();
+}
 } // namespace
 
 int main(int argc, char** argv)
 try {
     if (argc != 2)
-        throw std::runtime_error("usage: compiled_smollm2_attention_projection_runtime_test program.ftlpu");
+        throw std::runtime_error("usage: compiled_smollm2_attention_softmax_runtime_test program.ftlpu");
     const auto program = ftlpu::software::runtime::read_binary_program(
         std::filesystem::path(argv[1]));
     if (program.bindings.size() != 6 || program.max_cycle <= kProjectionEndCycle)
@@ -194,12 +213,38 @@ try {
         }
     }
     if (nonzero == 0) throw std::logic_error("attention projection produced only zero data");
+    runtime.run_cycles(program.max_cycle + 64 - kProjectionEndCycle);
+    constexpr std::size_t sample_queries[] = {0, 17, 31, 32, 79, 127};
+    std::size_t probability_nonzero = 0;
+    std::size_t probability_rows = 0;
+    for (std::size_t head = 0; head < kQueryHeads; ++head) {
+        for (std::size_t query : sample_queries) {
+            float sum = 0.0f;
+            for (std::size_t key = 0; key < kSeqLen; ++key) {
+                const float probability = read_probability(*system, head, query, key);
+                if (!std::isfinite(probability) || probability < 0.0f)
+                    throw std::logic_error("attention softmax produced an invalid probability");
+                if (probability > 0.00001f) ++probability_nonzero;
+                sum += probability;
+            }
+            if (std::fabs(sum - 1.0f) > 0.03f)
+                throw std::logic_error("attention softmax row is not normalized: head="
+                    + std::to_string(head) + " query=" + std::to_string(query)
+                    + " sum=" + std::to_string(sum));
+            ++probability_rows;
+        }
+    }
+    if (probability_nonzero == 0)
+        throw std::logic_error("attention softmax produced only zero probabilities");
     std::cout << "Compiled attention Q/K/V projection + RoPE passed: " << checked
               << " sampled FP16 values, nonzero=" << nonzero
-              << ", projection_end_cycle=" << kProjectionEndCycle << '\n';
+              << ", projection_end_cycle=" << kProjectionEndCycle
+              << "; softmax passed: rows=" << probability_rows
+              << ", nonzero=" << probability_nonzero
+              << ", max_cycle=" << program.max_cycle << '\n';
     return 0;
 } catch (const std::exception& ex) {
-    std::cerr << "compiled_smollm2_attention_projection_runtime_test failed: "
+    std::cerr << "compiled_smollm2_attention_softmax_runtime_test failed: "
               << ex.what() << '\n';
     return 1;
 }

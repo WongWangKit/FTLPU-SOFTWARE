@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compiles attention and validates compiler-generated Q/K/V + RoPE on CModel."""
+"""Validates compiler-generated Q/K/V, RoPE, QK, and softmax on CModel."""
 
 import argparse
 import subprocess

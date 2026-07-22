@@ -51,7 +51,7 @@ target_compile_definitions(compiled_smollm2_135m_ffn_seq128_runtime_test
     PRIVATE FTLPU_TEST_SEQUENCE_LENGTH=128)
 target_link_libraries(compiled_smollm2_135m_ffn_seq128_runtime_test PRIVATE ftlpu_software)
 
-add_executable(compiled_smollm2_attention_projection_runtime_test
-    tests/runtime/compiled_smollm2_attention_projection_runtime_test.cpp)
+add_executable(compiled_smollm2_attention_softmax_runtime_test
+    tests/runtime/compiled_smollm2_attention_softmax_runtime_test.cpp)
 
-target_link_libraries(compiled_smollm2_attention_projection_runtime_test PRIVATE ftlpu_software)
+target_link_libraries(compiled_smollm2_attention_softmax_runtime_test PRIVATE ftlpu_software)

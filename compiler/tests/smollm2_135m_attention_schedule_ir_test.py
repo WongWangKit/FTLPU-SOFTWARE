@@ -38,16 +38,23 @@ def main() -> None:
         "base_row = 7600 : i64",
         "query_weight_dequant",
         "output_weight_dequant",
+        'opcode = "max"',
+        'opcode = "exp"',
+        'opcode = "divide"',
     )
     missing = [item for item in required if item not in text]
     if missing:
         raise AssertionError(f"Attention Schedule IR is missing: {missing}")
-    if text.count("ftlpu.schedule.mem_queue") != 43056:
+    if text.count("ftlpu.schedule.mem_queue") != 144432:
         raise AssertionError("attention schedule did not emit the complete MEM queue program")
     if text.count("ftlpu.schedule.mxm_queue") != 4896:
         raise AssertionError("attention schedule did not emit projection and QK MXM commands")
-    if text.count("ftlpu.schedule.vxm") != 44544:
-        raise AssertionError("attention schedule did not emit dequant, RoPE, and cast VXM commands")
+    if text.count("ftlpu.schedule.vxm") != 76800:
+        raise AssertionError("attention schedule did not emit projection, RoPE, and softmax VXM commands")
+    if text.count('opcode = "max"') != 4572:
+        raise AssertionError("attention schedule did not emit recurrent softmax max commands")
+    if text.count('opcode = "exp"') != 4608 or text.count('opcode = "divide"') != 4608:
+        raise AssertionError("attention schedule did not emit complete softmax exp/divide commands")
     if text.count('opcode = "iw"') != 2448:
         raise AssertionError("attention schedule did not emit all projection and QK IW commands")
     for column in range(4):

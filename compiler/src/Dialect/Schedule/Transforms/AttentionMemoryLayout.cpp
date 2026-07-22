@@ -17,6 +17,16 @@ AttentionMemoryLayout::AttentionMemoryLayout(stream::AttentionOp op,
     }
     if (const auto rope = plan.getAs<mlir::DictionaryAttr>("rope"))
         ropeBase_ = rope.getAs<mlir::IntegerAttr>("base_row").getInt();
+    const auto readPlacement = [&](llvm::StringRef name, auto& slices, int64_t& base) {
+        const auto placement = plan.getAs<mlir::DictionaryAttr>(name);
+        base = placement.getAs<mlir::IntegerAttr>("base_row").getInt();
+        const auto values = placement.getAs<mlir::ArrayAttr>("slices");
+        for (std::size_t i = 0; i < slices.size(); ++i)
+            slices[i] = llvm::cast<mlir::IntegerAttr>(values[i]).getInt();
+    };
+    readPlacement("score", scaledScoreSlices_, scaledScoreBase_);
+    readPlacement("exp", expScoreSlices_, expScoreBase_);
+    readPlacement("probability", probabilitySlices_, probabilityBase_);
 }
 
 int64_t AttentionMemoryLayout::weightBase(AttentionProjectionKind projection) const
@@ -65,11 +75,26 @@ int64_t AttentionMemoryLayout::keyAddress(int64_t kvHead, int64_t keyBlock) cons
 int64_t AttentionMemoryLayout::scoreAddress(int64_t queryHead,
     int64_t queryBlock, int64_t keyBlock) const
 {
+    return scoreTokenAddress(queryHead, queryBlock,
+        keyBlock * target_.throughput().mxm_rows);
+}
+
+int64_t AttentionMemoryLayout::scoreTokenAddress(int64_t queryHead,
+    int64_t queryBlock, int64_t key) const
+{
     const int64_t tile = target_.throughput().mxm_rows;
     const int64_t tokenBlocks = seqLen_ / tile;
     return target_.attention_score_base_row()
         + (queryHead * tokenBlocks + queryBlock) * seqLen_
-        + keyBlock * tile;
+        + key;
+}
+
+int64_t AttentionMemoryLayout::probabilityAddress(int64_t queryHead,
+    int64_t queryBlock, int64_t key) const
+{
+    const int64_t tokenBlocks = seqLen_ / target_.throughput().mxm_rows;
+    return probabilityBase_
+        + (queryHead * tokenBlocks + queryBlock) * seqLen_ + key;
 }
 
 int64_t AttentionMemoryLayout::ropeAddress(int64_t token) const

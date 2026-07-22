@@ -194,15 +194,15 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_attention/schedule/attention.schedule.mlir)
     add_test(
-        NAME smollm2_attention_projection_binary_runtime_test
+        NAME smollm2_attention_softmax_binary_runtime_test
         COMMAND
             ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_attention_projection_binary_runtime_test.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_attention_softmax_binary_runtime_test.py
             --opt $<TARGET_FILE:ftlpu_opt>
             --translate $<TARGET_FILE:ftlpu_translate>
-            --runtime-test $<TARGET_FILE:compiled_smollm2_attention_projection_runtime_test>
+            --runtime-test $<TARGET_FILE:compiled_smollm2_attention_softmax_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_attention_projection_binary_runtime)
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_attention_softmax_binary_runtime)
     add_test(
         NAME stablehlo_matmul_320_to_ftlpu_kernel_mlir_test
         COMMAND
