@@ -2,6 +2,79 @@
 
 ![SmolLM2-135M FFN pipeline](smollm2_ffn_pipeline.svg)
 
+## Schedule Policies
+
+The compiler keeps two generic schedule policies:
+
+- `--ffn-schedule tail` is the default and preserves the established FFN
+  schedule. For `seq_len=128`, its first SwiGLU issue is cycle 55,355 and the
+  CModel program ends at cycle 92,573.
+- `--ffn-schedule fused` overlaps completed Gate/Up tiles with later
+  projection work. Its first SwiGLU issue is cycle 2,363 and the same CModel
+  program ends at cycle 86,685, saving 5,888 cycles (6.36%).
+
+![Fused seq_len=128 FFN pipeline](smollm2_ffn_fused_pipeline.svg)
+
+The fused policy does not use an unmodeled direct ACC-to-VXM bypass. On the
+final K partial, east MXMs use `W8..W15` and west MXMs use `W16..W23`.
+`accumulate -> stream + clear` sends the complete FP32 Gate/Up tile to
+dedicated ordinary-MEM byte planes: Gate uses local slices `1/5/9/13`, and Up
+uses `2/6/10/14`. The VXM allocator reads those planes only after the repeated
+MEM write queue is free, skips every four-cycle weight-dequant resource
+window, and writes FP16 hidden data through `E30/E31`. ACC-to-MEM transport
+includes the fabric's cycle-end commit latency.
+
+Both policies are produced by the same shape-driven lowering. The fused
+seq_len=128 binary was executed on the CModel and matched all 73,728 FP16
+values against the CPU reference, including 72,633 nonzero outputs.
+
+## Measured CModel Utilization
+
+The following values come from the CModel performance monitors while executing
+the compiled `seq_len=128` binaries. The monitor includes the runtime's 64
+drain cycles, so it samples 92,637 cycles for tail and 86,749 for fused.
+`array utilization` is active MXM cell-cycles divided by all sampled
+cell-cycles. `active density` removes completely idle cycles from the
+denominator.
+
+| MXM | Active cycles (tail/fused) | Tail array util. | Fused array util. | Tail active density | Fused active density |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MXM0 | 86,052 / 86,052 | 92.85% | 99.16% | 99.96% | 99.96% |
+| MXM1 | 86,052 / 86,052 | 92.85% | 99.16% | 99.96% | 99.96% |
+| MXM2 | 79,902 / 79,902 | 86.22% | 92.07% | 99.96% | 99.96% |
+| MXM3 | 79,902 / 79,902 | 86.22% | 92.07% | 99.96% | 99.96% |
+| Four-MXM mean | - | 89.54% | 95.62% | 99.96% | 99.96% |
+
+The fused policy performs the same MXM cell work in fewer total cycles. This
+raises mean full-program MXM utilization by 6.08 percentage points without
+changing the nearly saturated density while an MXM is active.
+
+| Resource | Policy | Full-program util. | Active density | Stall rate | Peak |
+| --- | --- | ---: | ---: | ---: | ---: |
+| VXM ALUs | tail | 15.91% | 74.19% | 0.00% | 512/512 |
+| VXM ALUs | fused | 16.99% | 72.67% | 0.00% | 512/512 |
+
+VXM utilization uses 512 lane-ALU execution slots per cycle as capacity.
+Fused scheduling leaves the executed work unchanged but spreads it over 414
+more non-idle VXM cycles, so full-program utilization rises while active
+density falls slightly.
+
+| SR fabric | Policy | Link BW | East BW | West BW | Staged-write util. | Active density | Peak link bytes/cycle |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| East hemisphere | tail | 4.94% | 5.57% | 4.31% | 5.90% | 4.94% | 4,928/24,576 |
+| East hemisphere | fused | 5.24% | 5.95% | 4.53% | 6.30% | 5.24% | 6,528/24,576 |
+| West hemisphere | tail | 4.57% | 5.11% | 4.03% | 5.47% | 4.91% | 4,928/24,576 |
+| West hemisphere | fused | 4.85% | 5.46% | 4.23% | 5.84% | 5.23% | 6,528/24,576 |
+
+SR bandwidth utilization is normalized by each hemisphere's modeled SR-fabric
+link capacity, not merely by cycles containing traffic. CModel does not yet expose
+capacity-normalized MEM or SXM utilization counters, so those values are not
+inferred from the schedule diagram.
+
+Accumulator banks remain on separate rows, while color describes the
+operation: purple means `accumulate -> SRAM`, and red means
+`accumulate -> stream + clear`.
+
 This is one instantiation of the generic W8A16 FFN lowering implemented by
 `ftlpu-stream-to-schedule`. The compiler derives loop counts, physical rows,
 slice placement, transport latency, and cycle intervals from the IR shape and
@@ -57,16 +130,17 @@ A single 32x32 MXM weight-tile dequantization takes four issue cycles: the VXM
 handles eight columns per cycle. Gate/up on east/west form four independent
 weight tiles. They are currently staggered into a 16-cycle aggregate issue
 window because all four use the same 16 VXM ALU ICU queues; this is four fast
-dequantizations, not one 16-cycle dequantization.
+dequantizations, not one 16-cycle dequantization. Down uses the same continuous
+four-cycle dequantization and 16-stream IW load, including weights prefetched
+under the previous reduction's final M tile. Activation switches between
+`E0/E1` and `E16/E17` only during the actual IW conflict windows.
 
-The second panel is deliberately a trace of the current lowering, rather than
-the desired direct-transport design. Its final K partial (`P17`) is still
-accumulated into local SRAM, then read through `W0..W7`. There is currently no
-fixed-size SwiGLU overlap batch: the compiler conservatively waits for all
-projection pairs to complete, then starts the first row/hemisphere Swish event
-at cycle 16,469 and issues the remaining events sequentially. A future
-accumulator-to-stream lowering must be shown as a separate schedule, once its
-dual-hemisphere VXM resource policy is defined.
+The second panel uses one continuous time axis for projection completion and
+the first SwiGLU work. In the tail figure, all Gate/Up projection pairs finish,
+the final partial remains in accumulator SRAM, and `W0..W7` then feed SwiGLU.
+In the fused figure, the same panel follows one completed accumulator tile
+through `stream + clear`, temporary MEM staging, and SwiGLU while later
+projection work remains in flight.
 
 The current tail uses `W0..W7` for accumulator input and local hidden slices
 21/22/23/29 for output. It deliberately does not claim projection/SwiGLU

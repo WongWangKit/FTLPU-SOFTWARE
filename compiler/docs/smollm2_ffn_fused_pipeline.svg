@@ -1,0 +1,1167 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="3934" viewBox="0 0 1800 3934">
+<style>
+.title{font:700 29px 'Segoe UI',Arial,sans-serif;fill:#17212b}
+.sub{font:14px 'Segoe UI',Arial,sans-serif;fill:#5d6874}
+.panel{font:700 18px 'Segoe UI',Arial,sans-serif;fill:#25313c}
+.row{font:600 12px 'Segoe UI',Arial,sans-serif;fill:#34404b}
+.tick{font:11px 'Segoe UI',Arial,sans-serif;fill:#66717d}
+.bar{font:600 10px 'Segoe UI',Arial,sans-serif;fill:#17212b}
+.grid{stroke:#dce2e8;stroke-width:1}
+.lane{fill:#fafbfc;stroke:#e1e6eb;stroke-width:1}
+</style>
+<rect width="100%" height="100%" fill="#fff"/>
+<text x="42" y="43" class="title">Dual-Hemisphere W8A16 FFN: Fused Runtime Schedule</text>
+<text x="42" y="69" class="sub">X[128,576] -> gate/up[128,1536] -> SwiGLU[128,1536] -> down[128,576]. Decoded from the runtime .ftlpu binary; hover bars for exact commands.</text>
+<rect x="42" y="82" width="18" height="12" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7"/>
+<text x="68" y="93" class="sub">Accumulator -> SRAM (keep partial sum)</text>
+<rect x="340" y="82" width="18" height="12" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7"/>
+<text x="366" y="93" class="sub">Accumulator -> stream + clear (final sum)</text>
+<text x="42" y="148" class="panel">Gate/Up projection: startup and first K-reduction waves</text>
+<text x="1755" y="148" text-anchor="end" class="sub">cycles 0..190 (190 cycles)</text>
+<line x1="245.00" y1="166" x2="245.00" y2="595" class="grid"/>
+<text x="245.00" y="159" text-anchor="middle" class="tick">0</text>
+<line x1="547.00" y1="166" x2="547.00" y2="595" class="grid"/>
+<text x="547.00" y="159" text-anchor="middle" class="tick">38</text>
+<line x1="849.00" y1="166" x2="849.00" y2="595" class="grid"/>
+<text x="849.00" y="159" text-anchor="middle" class="tick">76</text>
+<line x1="1151.00" y1="166" x2="1151.00" y2="595" class="grid"/>
+<text x="1151.00" y="159" text-anchor="middle" class="tick">114</text>
+<line x1="1453.00" y1="166" x2="1453.00" y2="595" class="grid"/>
+<text x="1453.00" y="159" text-anchor="middle" class="tick">152</text>
+<line x1="1755.00" y1="166" x2="1755.00" y2="595" class="grid"/>
+<text x="1755.00" y="159" text-anchor="middle" class="tick">190</text>
+<rect x="245" y="166" width="1510" height="24" class="lane"/>
+<text x="233" y="183" text-anchor="end" class="row">MEM.E.Read</text>
+<rect x="245" y="192" width="1510" height="24" class="lane"/>
+<text x="233" y="209" text-anchor="end" class="row">MEM.W.Read</text>
+<rect x="245" y="218" width="1510" height="24" class="lane"/>
+<text x="233" y="235" text-anchor="end" class="row">VXM.ALU0-7</text>
+<rect x="245" y="244" width="1510" height="24" class="lane"/>
+<text x="233" y="261" text-anchor="end" class="row">VXM.ALU8-15</text>
+<rect x="245" y="270" width="1510" height="24" class="lane"/>
+<text x="233" y="287" text-anchor="end" class="row">MXM.E0.Load</text>
+<rect x="245" y="296" width="1510" height="24" class="lane"/>
+<text x="233" y="313" text-anchor="end" class="row">MXM.E1.Load</text>
+<rect x="245" y="322" width="1510" height="24" class="lane"/>
+<text x="233" y="339" text-anchor="end" class="row">MXM.E0.Compute</text>
+<rect x="245" y="348" width="1510" height="24" class="lane"/>
+<text x="233" y="365" text-anchor="end" class="row">MXM.E1.Compute</text>
+<rect x="245" y="374" width="1510" height="24" class="lane"/>
+<text x="233" y="391" text-anchor="end" class="row">MXM.W0.Load</text>
+<rect x="245" y="400" width="1510" height="24" class="lane"/>
+<text x="233" y="417" text-anchor="end" class="row">MXM.W1.Load</text>
+<rect x="245" y="426" width="1510" height="24" class="lane"/>
+<text x="233" y="443" text-anchor="end" class="row">MXM.W0.Compute</text>
+<rect x="245" y="452" width="1510" height="24" class="lane"/>
+<text x="233" y="469" text-anchor="end" class="row">MXM.W1.Compute</text>
+<rect x="245" y="478" width="1510" height="24" class="lane"/>
+<text x="233" y="495" text-anchor="end" class="row">ACC.Gate/MXM0.E</text>
+<rect x="245" y="504" width="1510" height="24" class="lane"/>
+<text x="233" y="521" text-anchor="end" class="row">ACC.Up/MXM1.E</text>
+<rect x="245" y="530" width="1510" height="24" class="lane"/>
+<text x="233" y="547" text-anchor="end" class="row">ACC.Gate/MXM0.W</text>
+<rect x="245" y="556" width="1510" height="24" class="lane"/>
+<text x="233" y="573" text-anchor="end" class="row">ACC.Up/MXM1.W</text>
+<rect x="245.00" y="169" width="119.21" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 0..15; continuous reads; 16 coalesced events</title></rect>
+<text x="304.61" y="182" text-anchor="middle" class="bar" pointer-events="none">continuous read...</text>
+<rect x="308.58" y="195" width="119.21" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 8..23; continuous reads; 16 coalesced events</title></rect>
+<text x="368.18" y="208" text-anchor="middle" class="bar" pointer-events="none">continuous read...</text>
+<rect x="316.53" y="221" width="127.16" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 9..25; dequant int8 multiply; 4 coalesced events</title></rect>
+<text x="380.11" y="234" text-anchor="middle" class="bar" pointer-events="none">dequant int8 mul...</text>
+<rect x="324.47" y="247" width="127.16" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 10..26; dequant cast FP16; 4 coalesced events</title></rect>
+<text x="388.05" y="260" text-anchor="middle" class="bar" pointer-events="none">dequant cast FP1...</text>
+<rect x="427.79" y="273" width="31.79" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 23..27; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="459.58" y="299" width="31.79" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Load: cycles 27..31; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="491.37" y="377" width="31.79" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Load: cycles 31..35; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="523.16" y="403" width="31.79" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Load: cycles 35..39; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="531.11" y="169" width="1223.89" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 36..196; continuous reads; 30 coalesced events</title></rect>
+<text x="1143.05" y="182" text-anchor="middle" class="bar" pointer-events="none">continuous reads x30</text>
+<rect x="531.11" y="195" width="1223.89" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 36..196; continuous reads; 30 coalesced events</title></rect>
+<text x="1143.05" y="208" text-anchor="middle" class="bar" pointer-events="none">continuous reads x30</text>
+<rect x="570.84" y="325" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 41..73; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="698.00" y="338" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="570.84" y="351" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 41..73; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="698.00" y="364" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="570.84" y="429" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 41..73; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="698.00" y="442" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="570.84" y="455" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 41..73; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="698.00" y="468" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="610.58" y="507" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 46..78; accumulate -&gt; SRAM</title></rect>
+<text x="737.74" y="520" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="610.58" y="559" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 46..78; accumulate -&gt; SRAM</title></rect>
+<text x="737.74" y="572" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="618.53" y="481" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 47..79; accumulate -&gt; SRAM</title></rect>
+<text x="745.68" y="494" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="618.53" y="533" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 47..79; accumulate -&gt; SRAM</title></rect>
+<text x="745.68" y="546" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="825.16" y="325" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 73..105; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="952.32" y="338" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="825.16" y="351" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 73..105; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="952.32" y="364" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="825.16" y="429" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 73..105; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="952.32" y="442" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="825.16" y="455" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 73..105; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="952.32" y="468" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="864.89" y="507" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 78..110; accumulate -&gt; SRAM</title></rect>
+<text x="992.05" y="520" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="864.89" y="559" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 78..110; accumulate -&gt; SRAM</title></rect>
+<text x="992.05" y="572" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="872.84" y="481" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 79..111; accumulate -&gt; SRAM</title></rect>
+<text x="1000.00" y="494" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="872.84" y="533" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 79..111; accumulate -&gt; SRAM</title></rect>
+<text x="1000.00" y="546" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1079.47" y="325" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 105..137; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1206.63" y="338" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="1079.47" y="351" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 105..137; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1206.63" y="364" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="1079.47" y="429" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 105..137; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1206.63" y="442" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="1079.47" y="455" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 105..137; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1206.63" y="468" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="1119.21" y="507" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 110..142; accumulate -&gt; SRAM</title></rect>
+<text x="1246.37" y="520" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1119.21" y="559" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 110..142; accumulate -&gt; SRAM</title></rect>
+<text x="1246.37" y="572" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1127.16" y="481" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 111..143; accumulate -&gt; SRAM</title></rect>
+<text x="1254.32" y="494" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1127.16" y="533" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 111..143; accumulate -&gt; SRAM</title></rect>
+<text x="1254.32" y="546" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1333.79" y="221" width="127.16" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 137..153; dequant int8 multiply; 4 coalesced events</title></rect>
+<text x="1397.37" y="234" text-anchor="middle" class="bar" pointer-events="none">dequant int8 mul...</text>
+<rect x="1333.79" y="325" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 137..169; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="1460.95" y="338" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=14c E0/4c E...</text>
+<rect x="1333.79" y="351" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 137..169; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="1460.95" y="364" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=14c E0/4c E...</text>
+<rect x="1333.79" y="429" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 137..169; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="1460.95" y="442" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=22c E0/4c E...</text>
+<rect x="1333.79" y="455" width="254.32" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 137..169; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="1460.95" y="468" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=22c E0/4c E...</text>
+<rect x="1341.74" y="247" width="127.16" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 138..154; dequant cast FP16; 4 coalesced events</title></rect>
+<text x="1405.32" y="260" text-anchor="middle" class="bar" pointer-events="none">dequant cast FP1...</text>
+<rect x="1373.53" y="507" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 142..174; accumulate -&gt; SRAM</title></rect>
+<text x="1500.68" y="520" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1373.53" y="559" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 142..174; accumulate -&gt; SRAM</title></rect>
+<text x="1500.68" y="572" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1381.47" y="481" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 143..175; accumulate -&gt; SRAM</title></rect>
+<text x="1508.63" y="494" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1381.47" y="533" width="254.32" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 143..175; accumulate -&gt; SRAM</title></rect>
+<text x="1508.63" y="546" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1445.05" y="273" width="31.79" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 151..155; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="1476.84" y="299" width="31.79" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Load: cycles 155..159; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="1508.63" y="377" width="31.79" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Load: cycles 159..163; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="1540.42" y="403" width="31.79" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Load: cycles 163..167; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="1588.11" y="325" width="166.89" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 169..201; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1671.55" y="338" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E...</text>
+<rect x="1588.11" y="351" width="166.89" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 169..201; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1671.55" y="364" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E...</text>
+<rect x="1588.11" y="429" width="166.89" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 169..201; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1671.55" y="442" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E...</text>
+<rect x="1588.11" y="455" width="166.89" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 169..201; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1671.55" y="468" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E...</text>
+<rect x="1627.84" y="507" width="127.16" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 174..206; accumulate -&gt; SRAM</title></rect>
+<text x="1691.42" y="520" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SR...</text>
+<rect x="1627.84" y="559" width="127.16" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 174..206; accumulate -&gt; SRAM</title></rect>
+<text x="1691.42" y="572" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SR...</text>
+<rect x="1635.79" y="481" width="119.21" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 175..207; accumulate -&gt; SRAM</title></rect>
+<text x="1695.39" y="494" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; S...</text>
+<rect x="1635.79" y="533" width="119.21" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 175..207; accumulate -&gt; SRAM</title></rect>
+<text x="1695.39" y="546" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; S...</text>
+<text x="42" y="673" class="panel">Fused transition: ACC tile complete -&gt; SwiGLU</text>
+<text x="1755" y="673" text-anchor="end" class="sub">cycles 2084..2440 (356 cycles)</text>
+<line x1="245.00" y1="691" x2="245.00" y2="1458" class="grid"/>
+<text x="245.00" y="684" text-anchor="middle" class="tick">2084</text>
+<line x1="547.00" y1="691" x2="547.00" y2="1458" class="grid"/>
+<text x="547.00" y="684" text-anchor="middle" class="tick">2155</text>
+<line x1="849.00" y1="691" x2="849.00" y2="1458" class="grid"/>
+<text x="849.00" y="684" text-anchor="middle" class="tick">2226</text>
+<line x1="1151.00" y1="691" x2="1151.00" y2="1458" class="grid"/>
+<text x="1151.00" y="684" text-anchor="middle" class="tick">2298</text>
+<line x1="1453.00" y1="691" x2="1453.00" y2="1458" class="grid"/>
+<text x="1453.00" y="684" text-anchor="middle" class="tick">2369</text>
+<line x1="1755.00" y1="691" x2="1755.00" y2="1458" class="grid"/>
+<text x="1755.00" y="684" text-anchor="middle" class="tick">2440</text>
+<rect x="245" y="691" width="1510" height="24" class="lane"/>
+<text x="233" y="708" text-anchor="end" class="row">MEM.E.Read</text>
+<rect x="245" y="717" width="1510" height="24" class="lane"/>
+<text x="233" y="734" text-anchor="end" class="row">MEM.E.Write</text>
+<rect x="245" y="743" width="1510" height="24" class="lane"/>
+<text x="233" y="760" text-anchor="end" class="row">MEM.W.Read</text>
+<rect x="245" y="769" width="1510" height="24" class="lane"/>
+<text x="233" y="786" text-anchor="end" class="row">MEM.W.Write</text>
+<rect x="245" y="795" width="1510" height="24" class="lane"/>
+<text x="233" y="812" text-anchor="end" class="row">VXM.ALU0</text>
+<rect x="245" y="821" width="1510" height="24" class="lane"/>
+<text x="233" y="838" text-anchor="end" class="row">VXM.ALU0-7</text>
+<rect x="245" y="847" width="1510" height="24" class="lane"/>
+<text x="233" y="864" text-anchor="end" class="row">VXM.ALU1</text>
+<rect x="245" y="873" width="1510" height="24" class="lane"/>
+<text x="233" y="890" text-anchor="end" class="row">VXM.ALU2</text>
+<rect x="245" y="899" width="1510" height="24" class="lane"/>
+<text x="233" y="916" text-anchor="end" class="row">VXM.ALU3</text>
+<rect x="245" y="925" width="1510" height="24" class="lane"/>
+<text x="233" y="942" text-anchor="end" class="row">VXM.ALU4</text>
+<rect x="245" y="951" width="1510" height="24" class="lane"/>
+<text x="233" y="968" text-anchor="end" class="row">VXM.ALU5</text>
+<rect x="245" y="977" width="1510" height="24" class="lane"/>
+<text x="233" y="994" text-anchor="end" class="row">VXM.ALU6</text>
+<rect x="245" y="1003" width="1510" height="24" class="lane"/>
+<text x="233" y="1020" text-anchor="end" class="row">VXM.ALU7</text>
+<rect x="245" y="1029" width="1510" height="24" class="lane"/>
+<text x="233" y="1046" text-anchor="end" class="row">VXM.ALU8</text>
+<rect x="245" y="1055" width="1510" height="24" class="lane"/>
+<text x="233" y="1072" text-anchor="end" class="row">VXM.ALU8-15</text>
+<rect x="245" y="1081" width="1510" height="24" class="lane"/>
+<text x="233" y="1098" text-anchor="end" class="row">VXM.ALU9</text>
+<rect x="245" y="1107" width="1510" height="24" class="lane"/>
+<text x="233" y="1124" text-anchor="end" class="row">VXM.ALU11</text>
+<rect x="245" y="1133" width="1510" height="24" class="lane"/>
+<text x="233" y="1150" text-anchor="end" class="row">MXM.E0.Load</text>
+<rect x="245" y="1159" width="1510" height="24" class="lane"/>
+<text x="233" y="1176" text-anchor="end" class="row">MXM.E1.Load</text>
+<rect x="245" y="1185" width="1510" height="24" class="lane"/>
+<text x="233" y="1202" text-anchor="end" class="row">MXM.E0.Compute</text>
+<rect x="245" y="1211" width="1510" height="24" class="lane"/>
+<text x="233" y="1228" text-anchor="end" class="row">MXM.E1.Compute</text>
+<rect x="245" y="1237" width="1510" height="24" class="lane"/>
+<text x="233" y="1254" text-anchor="end" class="row">MXM.W0.Load</text>
+<rect x="245" y="1263" width="1510" height="24" class="lane"/>
+<text x="233" y="1280" text-anchor="end" class="row">MXM.W1.Load</text>
+<rect x="245" y="1289" width="1510" height="24" class="lane"/>
+<text x="233" y="1306" text-anchor="end" class="row">MXM.W0.Compute</text>
+<rect x="245" y="1315" width="1510" height="24" class="lane"/>
+<text x="233" y="1332" text-anchor="end" class="row">MXM.W1.Compute</text>
+<rect x="245" y="1341" width="1510" height="24" class="lane"/>
+<text x="233" y="1358" text-anchor="end" class="row">ACC.Gate/MXM0.E</text>
+<rect x="245" y="1367" width="1510" height="24" class="lane"/>
+<text x="233" y="1384" text-anchor="end" class="row">ACC.Up/MXM1.E</text>
+<rect x="245" y="1393" width="1510" height="24" class="lane"/>
+<text x="233" y="1410" text-anchor="end" class="row">ACC.Gate/MXM0.W</text>
+<rect x="245" y="1419" width="1510" height="24" class="lane"/>
+<text x="233" y="1436" text-anchor="end" class="row">ACC.Up/MXM1.W</text>
+<rect x="245.00" y="1188" width="21.21" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2057..2089; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<rect x="245.00" y="1214" width="21.21" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2057..2089; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<rect x="245.00" y="1292" width="21.21" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2057..2089; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<rect x="245.00" y="1318" width="21.21" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2057..2089; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<rect x="245.00" y="1370" width="42.42" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2062..2094; accumulate -&gt; SRAM</title></rect>
+<rect x="245.00" y="1422" width="42.42" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2062..2094; accumulate -&gt; SRAM</title></rect>
+<rect x="245.00" y="1344" width="46.66" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2063..2095; accumulate -&gt; SRAM</title></rect>
+<rect x="245.00" y="1396" width="46.66" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2063..2095; accumulate -&gt; SRAM</title></rect>
+<rect x="245.00" y="694" width="1510.00" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 2084..2450; continuous reads; 332 coalesced events</title></rect>
+<text x="1000.00" y="707" text-anchor="middle" class="bar" pointer-events="none">continuous reads x332</text>
+<rect x="245.00" y="746" width="1510.00" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 2084..2458; continuous reads; 320 coalesced events</title></rect>
+<text x="1000.00" y="759" text-anchor="middle" class="bar" pointer-events="none">continuous reads x320</text>
+<rect x="245.00" y="1266" width="12.72" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Load: cycles 2084..2087; IW buffer=0; 3 coalesced events</title></rect>
+<rect x="266.21" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2089..2121; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="334.07" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="266.21" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2089..2121; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="334.07" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="266.21" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2089..2121; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="334.07" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="266.21" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2089..2121; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="334.07" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="287.42" y="1370" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2094..2126; accumulate -&gt; SRAM</title></rect>
+<text x="355.28" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="287.42" y="1422" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2094..2126; accumulate -&gt; SRAM</title></rect>
+<text x="355.28" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="291.66" y="1344" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2095..2127; accumulate -&gt; SRAM</title></rect>
+<text x="359.52" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="291.66" y="1396" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2095..2127; accumulate -&gt; SRAM</title></rect>
+<text x="359.52" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="401.94" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2121..2153; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="469.80" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="401.94" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2121..2153; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="469.80" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="401.94" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2121..2153; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="469.80" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="401.94" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2121..2153; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="469.80" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="423.15" y="1370" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2126..2158; accumulate -&gt; SRAM</title></rect>
+<text x="491.01" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="423.15" y="1422" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2126..2158; accumulate -&gt; SRAM</title></rect>
+<text x="491.01" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="427.39" y="1344" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2127..2159; accumulate -&gt; SRAM</title></rect>
+<text x="495.25" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="427.39" y="1396" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2127..2159; accumulate -&gt; SRAM</title></rect>
+<text x="495.25" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="537.67" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2153..2185; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="605.53" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="537.67" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2153..2185; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="605.53" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="537.67" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2153..2185; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="605.53" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="537.67" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2153..2185; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="605.53" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="558.88" y="1370" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2158..2190; accumulate -&gt; SRAM</title></rect>
+<text x="626.74" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="558.88" y="1422" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2158..2190; accumulate -&gt; SRAM</title></rect>
+<text x="626.74" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="563.12" y="1344" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2159..2191; accumulate -&gt; SRAM</title></rect>
+<text x="630.98" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="563.12" y="1396" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2159..2191; accumulate -&gt; SRAM</title></rect>
+<text x="630.98" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="673.40" y="824" width="67.87" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 2185..2201; dequant int8 multiply; 4 coalesced events</title></rect>
+<text x="707.33" y="837" text-anchor="middle" class="bar" pointer-events="none">dequant ...</text>
+<rect x="673.40" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2185..2217; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="741.26" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute tile; seg...</text>
+<rect x="673.40" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2185..2217; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="741.26" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute tile; seg...</text>
+<rect x="673.40" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2185..2217; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="741.26" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute tile; seg...</text>
+<rect x="673.40" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2185..2217; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="741.26" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute tile; seg...</text>
+<rect x="677.64" y="1058" width="67.87" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 2186..2202; dequant cast FP16; 4 coalesced events</title></rect>
+<text x="711.57" y="1071" text-anchor="middle" class="bar" pointer-events="none">dequant ...</text>
+<rect x="694.61" y="1370" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2190..2222; accumulate -&gt; SRAM</title></rect>
+<text x="762.47" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="694.61" y="1422" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2190..2222; accumulate -&gt; SRAM</title></rect>
+<text x="762.47" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="698.85" y="1344" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2191..2223; accumulate -&gt; SRAM</title></rect>
+<text x="766.71" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="698.85" y="1396" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2191..2223; accumulate -&gt; SRAM</title></rect>
+<text x="766.71" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="732.78" y="1136" width="16.97" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 2199..2203; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="749.75" y="1162" width="16.97" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Load: cycles 2203..2207; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="766.71" y="1240" width="16.97" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Load: cycles 2207..2211; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="783.68" y="1266" width="16.97" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Load: cycles 2211..2215; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="809.13" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2217..2249; Compute buffer=1 act=E0 out=E8</title></rect>
+<text x="876.99" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="809.13" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2217..2249; Compute buffer=1 act=E0 out=E12</title></rect>
+<text x="876.99" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="809.13" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2217..2249; Compute buffer=1 act=E0 out=E16</title></rect>
+<text x="876.99" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="809.13" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2217..2249; Compute buffer=1 act=E0 out=E20</title></rect>
+<text x="876.99" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="830.34" y="1370" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2222..2254; accumulate -&gt; stream + clear</title></rect>
+<text x="898.20" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="830.34" y="1422" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2222..2254; accumulate -&gt; stream + clear</title></rect>
+<text x="898.20" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="834.58" y="1344" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2223..2255; accumulate -&gt; stream + clear</title></rect>
+<text x="902.44" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="834.58" y="1396" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2223..2255; accumulate -&gt; stream + clear</title></rect>
+<text x="902.44" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="860.03" y="720" width="555.65" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Write: cycles 2229..2360; continuous writes; 32 coalesced events</title></rect>
+<text x="1137.85" y="733" text-anchor="middle" class="bar" pointer-events="none">continuous writes x32</text>
+<rect x="860.03" y="772" width="555.65" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Write: cycles 2229..2360; continuous writes; 32 coalesced events</title></rect>
+<text x="1137.85" y="785" text-anchor="middle" class="bar" pointer-events="none">continuous writes x32</text>
+<rect x="944.86" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2249..2281; Compute buffer=1 act=E0 out=E8</title></rect>
+<text x="1012.72" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="944.86" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2249..2281; Compute buffer=1 act=E0 out=E12</title></rect>
+<text x="1012.72" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="944.86" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2249..2281; Compute buffer=1 act=E0 out=E16</title></rect>
+<text x="1012.72" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="944.86" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2249..2281; Compute buffer=1 act=E0 out=E20</title></rect>
+<text x="1012.72" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="966.07" y="1370" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2254..2286; accumulate -&gt; stream + clear</title></rect>
+<text x="1033.93" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="966.07" y="1422" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2254..2286; accumulate -&gt; stream + clear</title></rect>
+<text x="1033.93" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="970.31" y="1344" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2255..2287; accumulate -&gt; stream + clear</title></rect>
+<text x="1038.17" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="970.31" y="1396" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2255..2287; accumulate -&gt; stream + clear</title></rect>
+<text x="1038.17" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="1080.59" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2281..2313; Compute buffer=1 act=E0 out=E8</title></rect>
+<text x="1148.46" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="1080.59" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2281..2313; Compute buffer=1 act=E0 out=E12</title></rect>
+<text x="1148.46" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="1080.59" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2281..2313; Compute buffer=1 act=E0 out=E16</title></rect>
+<text x="1148.46" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="1080.59" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2281..2313; Compute buffer=1 act=E0 out=E20</title></rect>
+<text x="1148.46" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 ...</text>
+<rect x="1101.80" y="1370" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2286..2318; accumulate -&gt; stream + clear</title></rect>
+<text x="1169.66" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="1101.80" y="1422" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2286..2318; accumulate -&gt; stream + clear</title></rect>
+<text x="1169.66" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="1106.04" y="1344" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2287..2319; accumulate -&gt; stream + clear</title></rect>
+<text x="1173.90" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="1106.04" y="1396" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2287..2319; accumulate -&gt; stream + clear</title></rect>
+<text x="1173.90" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="1216.32" y="824" width="67.87" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 2313..2329; dequant int8 multiply; 4 coalesced events</title></rect>
+<text x="1250.25" y="837" text-anchor="middle" class="bar" pointer-events="none">dequant ...</text>
+<rect x="1216.32" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2313..2345; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="1284.19" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute tile; seg...</text>
+<rect x="1216.32" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2313..2345; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="1284.19" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute tile; seg...</text>
+<rect x="1216.32" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2313..2345; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="1284.19" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute tile; seg...</text>
+<rect x="1216.32" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2313..2345; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="1284.19" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute tile; seg...</text>
+<rect x="1220.56" y="1058" width="67.87" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 2314..2330; dequant cast FP16; 4 coalesced events</title></rect>
+<text x="1254.49" y="1071" text-anchor="middle" class="bar" pointer-events="none">dequant ...</text>
+<rect x="1237.53" y="1370" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2318..2350; accumulate -&gt; stream + clear</title></rect>
+<text x="1305.39" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="1237.53" y="1422" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2318..2350; accumulate -&gt; stream + clear</title></rect>
+<text x="1305.39" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="1241.77" y="1344" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2319..2351; accumulate -&gt; stream + clear</title></rect>
+<text x="1309.63" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="1241.77" y="1396" width="135.73" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2319..2351; accumulate -&gt; stream + clear</title></rect>
+<text x="1309.63" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; str...</text>
+<rect x="1275.70" y="1136" width="16.97" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 2327..2331; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="1292.67" y="1162" width="16.97" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Load: cycles 2331..2335; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="1309.63" y="1240" width="16.97" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Load: cycles 2335..2339; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="1326.60" y="1266" width="16.97" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Load: cycles 2339..2343; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="1352.05" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2345..2377; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1419.92" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1352.05" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2345..2377; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1419.92" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1352.05" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2345..2377; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1419.92" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1352.05" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2345..2377; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1419.92" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1373.26" y="1370" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2350..2382; accumulate -&gt; SRAM</title></rect>
+<text x="1441.12" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1373.26" y="1422" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2350..2382; accumulate -&gt; SRAM</title></rect>
+<text x="1441.12" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1377.50" y="1344" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2351..2383; accumulate -&gt; SRAM</title></rect>
+<text x="1445.37" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1377.50" y="1396" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2351..2383; accumulate -&gt; SRAM</title></rect>
+<text x="1445.37" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1424.16" y="798" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0: cycles 2362..2426; negate; 64 coalesced events</title></rect>
+<text x="1559.89" y="811" text-anchor="middle" class="bar" pointer-events="none">negate x64</text>
+<rect x="1424.16" y="850" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU1: cycles 2362..2426; multiply; 64 coalesced events</title></rect>
+<text x="1559.89" y="863" text-anchor="middle" class="bar" pointer-events="none">multiply x64</text>
+<rect x="1428.40" y="876" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU2: cycles 2363..2427; exp; 64 coalesced events</title></rect>
+<text x="1564.13" y="889" text-anchor="middle" class="bar" pointer-events="none">exp x64</text>
+<rect x="1428.40" y="954" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU5: cycles 2363..2427; pass; 64 coalesced events</title></rect>
+<text x="1564.13" y="967" text-anchor="middle" class="bar" pointer-events="none">pass x64</text>
+<rect x="1432.64" y="902" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU3: cycles 2364..2428; add; 64 coalesced events</title></rect>
+<text x="1568.37" y="915" text-anchor="middle" class="bar" pointer-events="none">add x64</text>
+<rect x="1432.64" y="980" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU6: cycles 2364..2428; pass; 64 coalesced events</title></rect>
+<text x="1568.37" y="993" text-anchor="middle" class="bar" pointer-events="none">pass x64</text>
+<rect x="1436.88" y="928" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU4: cycles 2365..2429; divide; 64 coalesced events</title></rect>
+<text x="1572.61" y="941" text-anchor="middle" class="bar" pointer-events="none">divide x64</text>
+<rect x="1436.88" y="1006" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU7: cycles 2365..2429; pass; 64 coalesced events</title></rect>
+<text x="1572.61" y="1019" text-anchor="middle" class="bar" pointer-events="none">pass x64</text>
+<rect x="1441.12" y="1032" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8: cycles 2366..2430; multiply; 64 coalesced events</title></rect>
+<text x="1576.85" y="1045" text-anchor="middle" class="bar" pointer-events="none">multiply x64</text>
+<rect x="1445.37" y="1084" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU9: cycles 2367..2431; cast -&gt; E30; 64 coalesced events</title></rect>
+<text x="1581.10" y="1097" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x64</text>
+<rect x="1445.37" y="1110" width="271.46" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU11: cycles 2367..2431; cast -&gt; E30; 64 coalesced events</title></rect>
+<text x="1581.10" y="1123" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x64</text>
+<rect x="1470.81" y="720" width="271.46" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Write: cycles 2373..2437; continuous writes; 128 coalesced events</title></rect>
+<text x="1606.54" y="733" text-anchor="middle" class="bar" pointer-events="none">continuous writes x128</text>
+<rect x="1470.81" y="772" width="271.46" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Write: cycles 2373..2437; continuous writes; 128 coalesced events</title></rect>
+<text x="1606.54" y="785" text-anchor="middle" class="bar" pointer-events="none">continuous writes x128</text>
+<rect x="1487.78" y="1188" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2377..2409; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1555.65" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1487.78" y="1214" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2377..2409; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1555.65" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1487.78" y="1292" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2377..2409; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1555.65" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1487.78" y="1318" width="135.73" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2377..2409; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1555.65" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1508.99" y="1370" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2382..2414; accumulate -&gt; SRAM</title></rect>
+<text x="1576.85" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1508.99" y="1422" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2382..2414; accumulate -&gt; SRAM</title></rect>
+<text x="1576.85" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1513.23" y="1344" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2383..2415; accumulate -&gt; SRAM</title></rect>
+<text x="1581.10" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1513.23" y="1396" width="135.73" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2383..2415; accumulate -&gt; SRAM</title></rect>
+<text x="1581.10" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1623.51" y="1188" width="131.49" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2409..2441; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1689.26" y="1201" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1623.51" y="1214" width="131.49" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2409..2441; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1689.26" y="1227" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1623.51" y="1292" width="131.49" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2409..2441; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1689.26" y="1305" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1623.51" y="1318" width="131.49" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2409..2441; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1689.26" y="1331" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 ...</text>
+<rect x="1644.72" y="1370" width="110.28" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2414..2446; accumulate -&gt; SRAM</title></rect>
+<text x="1699.86" y="1383" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; ...</text>
+<rect x="1644.72" y="1422" width="110.28" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2414..2446; accumulate -&gt; SRAM</title></rect>
+<text x="1699.86" y="1435" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; ...</text>
+<rect x="1648.96" y="1344" width="106.04" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2415..2447; accumulate -&gt; SRAM</title></rect>
+<text x="1701.98" y="1357" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt;...</text>
+<rect x="1648.96" y="1396" width="106.04" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2415..2447; accumulate -&gt; SRAM</title></rect>
+<text x="1701.98" y="1409" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt;...</text>
+<text x="42" y="1536" class="panel">SwiGLU: first scheduled tile across East/West</text>
+<text x="1755" y="1536" text-anchor="end" class="sub">cycles 2362..2638 (276 cycles)</text>
+<line x1="245.00" y1="1554" x2="245.00" y2="2321" class="grid"/>
+<text x="245.00" y="1547" text-anchor="middle" class="tick">2362</text>
+<line x1="547.00" y1="1554" x2="547.00" y2="2321" class="grid"/>
+<text x="547.00" y="1547" text-anchor="middle" class="tick">2417</text>
+<line x1="849.00" y1="1554" x2="849.00" y2="2321" class="grid"/>
+<text x="849.00" y="1547" text-anchor="middle" class="tick">2472</text>
+<line x1="1151.00" y1="1554" x2="1151.00" y2="2321" class="grid"/>
+<text x="1151.00" y="1547" text-anchor="middle" class="tick">2528</text>
+<line x1="1453.00" y1="1554" x2="1453.00" y2="2321" class="grid"/>
+<text x="1453.00" y="1547" text-anchor="middle" class="tick">2583</text>
+<line x1="1755.00" y1="1554" x2="1755.00" y2="2321" class="grid"/>
+<text x="1755.00" y="1547" text-anchor="middle" class="tick">2638</text>
+<rect x="245" y="1554" width="1510" height="24" class="lane"/>
+<text x="233" y="1571" text-anchor="end" class="row">MEM.E.Read</text>
+<rect x="245" y="1580" width="1510" height="24" class="lane"/>
+<text x="233" y="1597" text-anchor="end" class="row">MEM.E.Write</text>
+<rect x="245" y="1606" width="1510" height="24" class="lane"/>
+<text x="233" y="1623" text-anchor="end" class="row">MEM.W.Read</text>
+<rect x="245" y="1632" width="1510" height="24" class="lane"/>
+<text x="233" y="1649" text-anchor="end" class="row">MEM.W.Write</text>
+<rect x="245" y="1658" width="1510" height="24" class="lane"/>
+<text x="233" y="1675" text-anchor="end" class="row">VXM.ALU0</text>
+<rect x="245" y="1684" width="1510" height="24" class="lane"/>
+<text x="233" y="1701" text-anchor="end" class="row">VXM.ALU0-7</text>
+<rect x="245" y="1710" width="1510" height="24" class="lane"/>
+<text x="233" y="1727" text-anchor="end" class="row">VXM.ALU1</text>
+<rect x="245" y="1736" width="1510" height="24" class="lane"/>
+<text x="233" y="1753" text-anchor="end" class="row">VXM.ALU2</text>
+<rect x="245" y="1762" width="1510" height="24" class="lane"/>
+<text x="233" y="1779" text-anchor="end" class="row">VXM.ALU3</text>
+<rect x="245" y="1788" width="1510" height="24" class="lane"/>
+<text x="233" y="1805" text-anchor="end" class="row">VXM.ALU4</text>
+<rect x="245" y="1814" width="1510" height="24" class="lane"/>
+<text x="233" y="1831" text-anchor="end" class="row">VXM.ALU5</text>
+<rect x="245" y="1840" width="1510" height="24" class="lane"/>
+<text x="233" y="1857" text-anchor="end" class="row">VXM.ALU6</text>
+<rect x="245" y="1866" width="1510" height="24" class="lane"/>
+<text x="233" y="1883" text-anchor="end" class="row">VXM.ALU7</text>
+<rect x="245" y="1892" width="1510" height="24" class="lane"/>
+<text x="233" y="1909" text-anchor="end" class="row">VXM.ALU8</text>
+<rect x="245" y="1918" width="1510" height="24" class="lane"/>
+<text x="233" y="1935" text-anchor="end" class="row">VXM.ALU8-15</text>
+<rect x="245" y="1944" width="1510" height="24" class="lane"/>
+<text x="233" y="1961" text-anchor="end" class="row">VXM.ALU9</text>
+<rect x="245" y="1970" width="1510" height="24" class="lane"/>
+<text x="233" y="1987" text-anchor="end" class="row">VXM.ALU11</text>
+<rect x="245" y="1996" width="1510" height="24" class="lane"/>
+<text x="233" y="2013" text-anchor="end" class="row">MXM.E0.Load</text>
+<rect x="245" y="2022" width="1510" height="24" class="lane"/>
+<text x="233" y="2039" text-anchor="end" class="row">MXM.E1.Load</text>
+<rect x="245" y="2048" width="1510" height="24" class="lane"/>
+<text x="233" y="2065" text-anchor="end" class="row">MXM.E0.Compute</text>
+<rect x="245" y="2074" width="1510" height="24" class="lane"/>
+<text x="233" y="2091" text-anchor="end" class="row">MXM.E1.Compute</text>
+<rect x="245" y="2100" width="1510" height="24" class="lane"/>
+<text x="233" y="2117" text-anchor="end" class="row">MXM.W0.Load</text>
+<rect x="245" y="2126" width="1510" height="24" class="lane"/>
+<text x="233" y="2143" text-anchor="end" class="row">MXM.W1.Load</text>
+<rect x="245" y="2152" width="1510" height="24" class="lane"/>
+<text x="233" y="2169" text-anchor="end" class="row">MXM.W0.Compute</text>
+<rect x="245" y="2178" width="1510" height="24" class="lane"/>
+<text x="233" y="2195" text-anchor="end" class="row">MXM.W1.Compute</text>
+<rect x="245" y="2204" width="1510" height="24" class="lane"/>
+<text x="233" y="2221" text-anchor="end" class="row">ACC.Gate/MXM0.E</text>
+<rect x="245" y="2230" width="1510" height="24" class="lane"/>
+<text x="233" y="2247" text-anchor="end" class="row">ACC.Up/MXM1.E</text>
+<rect x="245" y="2256" width="1510" height="24" class="lane"/>
+<text x="233" y="2273" text-anchor="end" class="row">ACC.Gate/MXM0.W</text>
+<rect x="245" y="2282" width="1510" height="24" class="lane"/>
+<text x="233" y="2299" text-anchor="end" class="row">ACC.Up/MXM1.W</text>
+<rect x="245.00" y="1557" width="1510.00" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 2340..2660; continuous reads; 988 coalesced events</title></rect>
+<text x="1000.00" y="1570" text-anchor="middle" class="bar" pointer-events="none">continuous reads x988</text>
+<rect x="245.00" y="1609" width="1510.00" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 2340..2660; continuous reads; 828 coalesced events</title></rect>
+<text x="1000.00" y="1622" text-anchor="middle" class="bar" pointer-events="none">continuous reads x828</text>
+<rect x="245.00" y="2051" width="82.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2345..2377; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="286.03" y="2064" text-anchor="middle" class="bar" pointer-events="none">Compute bu...</text>
+<rect x="245.00" y="2077" width="82.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2345..2377; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="286.03" y="2090" text-anchor="middle" class="bar" pointer-events="none">Compute bu...</text>
+<rect x="245.00" y="2155" width="82.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2345..2377; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="286.03" y="2168" text-anchor="middle" class="bar" pointer-events="none">Compute bu...</text>
+<rect x="245.00" y="2181" width="82.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2345..2377; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="286.03" y="2194" text-anchor="middle" class="bar" pointer-events="none">Compute bu...</text>
+<rect x="245.00" y="2233" width="109.42" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2350..2382; accumulate -&gt; SRAM</title></rect>
+<text x="299.71" y="2246" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; ...</text>
+<rect x="245.00" y="2285" width="109.42" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2350..2382; accumulate -&gt; SRAM</title></rect>
+<text x="299.71" y="2298" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; ...</text>
+<rect x="245.00" y="2207" width="114.89" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2351..2383; accumulate -&gt; SRAM</title></rect>
+<text x="302.45" y="2220" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; ...</text>
+<rect x="245.00" y="2259" width="114.89" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2351..2383; accumulate -&gt; SRAM</title></rect>
+<text x="302.45" y="2272" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; ...</text>
+<rect x="245.00" y="1661" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0: cycles 2362..2426; negate; 64 coalesced events</title></rect>
+<text x="420.07" y="1674" text-anchor="middle" class="bar" pointer-events="none">negate x64</text>
+<rect x="245.00" y="1713" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU1: cycles 2362..2426; multiply; 64 coalesced events</title></rect>
+<text x="420.07" y="1726" text-anchor="middle" class="bar" pointer-events="none">multiply x64</text>
+<rect x="250.47" y="1739" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU2: cycles 2363..2427; exp; 64 coalesced events</title></rect>
+<text x="425.54" y="1752" text-anchor="middle" class="bar" pointer-events="none">exp x64</text>
+<rect x="250.47" y="1817" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU5: cycles 2363..2427; pass; 64 coalesced events</title></rect>
+<text x="425.54" y="1830" text-anchor="middle" class="bar" pointer-events="none">pass x64</text>
+<rect x="255.94" y="1765" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU3: cycles 2364..2428; add; 64 coalesced events</title></rect>
+<text x="431.01" y="1778" text-anchor="middle" class="bar" pointer-events="none">add x64</text>
+<rect x="255.94" y="1843" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU6: cycles 2364..2428; pass; 64 coalesced events</title></rect>
+<text x="431.01" y="1856" text-anchor="middle" class="bar" pointer-events="none">pass x64</text>
+<rect x="261.41" y="1791" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU4: cycles 2365..2429; divide; 64 coalesced events</title></rect>
+<text x="436.49" y="1804" text-anchor="middle" class="bar" pointer-events="none">divide x64</text>
+<rect x="261.41" y="1869" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU7: cycles 2365..2429; pass; 64 coalesced events</title></rect>
+<text x="436.49" y="1882" text-anchor="middle" class="bar" pointer-events="none">pass x64</text>
+<rect x="266.88" y="1895" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8: cycles 2366..2430; multiply; 64 coalesced events</title></rect>
+<text x="441.96" y="1908" text-anchor="middle" class="bar" pointer-events="none">multiply x64</text>
+<rect x="272.36" y="1947" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU9: cycles 2367..2431; cast -&gt; E30; 64 coalesced events</title></rect>
+<text x="447.43" y="1960" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x64</text>
+<rect x="272.36" y="1973" width="350.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU11: cycles 2367..2431; cast -&gt; E30; 64 coalesced events</title></rect>
+<text x="447.43" y="1986" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x64</text>
+<rect x="305.18" y="1583" width="350.14" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Write: cycles 2373..2437; continuous writes; 128 coalesced events</title></rect>
+<text x="480.25" y="1596" text-anchor="middle" class="bar" pointer-events="none">continuous writes x128</text>
+<rect x="305.18" y="1635" width="350.14" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Write: cycles 2373..2437; continuous writes; 128 coalesced events</title></rect>
+<text x="480.25" y="1648" text-anchor="middle" class="bar" pointer-events="none">continuous writes x128</text>
+<rect x="327.07" y="2051" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2377..2409; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="414.60" y="2064" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="327.07" y="2077" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2377..2409; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="414.60" y="2090" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="327.07" y="2155" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2377..2409; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="414.60" y="2168" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="327.07" y="2181" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2377..2409; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="414.60" y="2194" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="354.42" y="2233" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2382..2414; accumulate -&gt; SRAM</title></rect>
+<text x="441.96" y="2246" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="354.42" y="2285" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2382..2414; accumulate -&gt; SRAM</title></rect>
+<text x="441.96" y="2298" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="359.89" y="2207" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2383..2415; accumulate -&gt; SRAM</title></rect>
+<text x="447.43" y="2220" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="359.89" y="2259" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2383..2415; accumulate -&gt; SRAM</title></rect>
+<text x="447.43" y="2272" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="502.14" y="2051" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2409..2441; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="589.67" y="2064" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="502.14" y="2077" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2409..2441; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="589.67" y="2090" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="502.14" y="2155" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2409..2441; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="589.67" y="2168" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="502.14" y="2181" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2409..2441; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="589.67" y="2194" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="529.49" y="2233" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2414..2446; accumulate -&gt; SRAM</title></rect>
+<text x="617.03" y="2246" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="529.49" y="2285" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2414..2446; accumulate -&gt; SRAM</title></rect>
+<text x="617.03" y="2298" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="534.96" y="2207" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2415..2447; accumulate -&gt; SRAM</title></rect>
+<text x="622.50" y="2220" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="534.96" y="2259" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2415..2447; accumulate -&gt; SRAM</title></rect>
+<text x="622.50" y="2272" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="677.21" y="1687" width="87.54" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 2441..2457; dequant int8 multiply; 4 coalesced events</title></rect>
+<text x="720.98" y="1700" text-anchor="middle" class="bar" pointer-events="none">dequant int...</text>
+<rect x="677.21" y="2051" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2441..2473; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="764.75" y="2064" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=...</text>
+<rect x="677.21" y="2077" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2441..2473; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="764.75" y="2090" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=...</text>
+<rect x="677.21" y="2155" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2441..2473; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="764.75" y="2168" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=...</text>
+<rect x="677.21" y="2181" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2441..2473; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="764.75" y="2194" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=...</text>
+<rect x="682.68" y="1921" width="87.54" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 2442..2458; dequant cast FP16; 4 coalesced events</title></rect>
+<text x="726.45" y="1934" text-anchor="middle" class="bar" pointer-events="none">dequant cas...</text>
+<rect x="704.57" y="2233" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2446..2478; accumulate -&gt; SRAM</title></rect>
+<text x="792.10" y="2246" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="704.57" y="2285" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2446..2478; accumulate -&gt; SRAM</title></rect>
+<text x="792.10" y="2298" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="710.04" y="2207" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2447..2479; accumulate -&gt; SRAM</title></rect>
+<text x="797.57" y="2220" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="710.04" y="2259" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2447..2479; accumulate -&gt; SRAM</title></rect>
+<text x="797.57" y="2272" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="753.80" y="1999" width="21.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 2455..2459; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="770.22" y="1661" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0: cycles 2458..2554; negate; 96 coalesced events</title></rect>
+<text x="1032.83" y="1674" text-anchor="middle" class="bar" pointer-events="none">negate x96</text>
+<rect x="770.22" y="1713" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU1: cycles 2458..2554; multiply; 96 coalesced events</title></rect>
+<text x="1032.83" y="1726" text-anchor="middle" class="bar" pointer-events="none">multiply x96</text>
+<rect x="775.69" y="1739" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU2: cycles 2459..2555; exp; 96 coalesced events</title></rect>
+<text x="1038.30" y="1752" text-anchor="middle" class="bar" pointer-events="none">exp x96</text>
+<rect x="775.69" y="1817" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU5: cycles 2459..2555; pass; 96 coalesced events</title></rect>
+<text x="1038.30" y="1830" text-anchor="middle" class="bar" pointer-events="none">pass x96</text>
+<rect x="775.69" y="2025" width="21.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Load: cycles 2459..2463; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="781.16" y="1765" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU3: cycles 2460..2556; add; 96 coalesced events</title></rect>
+<text x="1043.77" y="1778" text-anchor="middle" class="bar" pointer-events="none">add x96</text>
+<rect x="781.16" y="1843" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU6: cycles 2460..2556; pass; 96 coalesced events</title></rect>
+<text x="1043.77" y="1856" text-anchor="middle" class="bar" pointer-events="none">pass x96</text>
+<rect x="786.63" y="1791" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU4: cycles 2461..2557; divide; 96 coalesced events</title></rect>
+<text x="1049.24" y="1804" text-anchor="middle" class="bar" pointer-events="none">divide x96</text>
+<rect x="786.63" y="1869" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU7: cycles 2461..2557; pass; 96 coalesced events</title></rect>
+<text x="1049.24" y="1882" text-anchor="middle" class="bar" pointer-events="none">pass x96</text>
+<rect x="792.10" y="1895" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8: cycles 2462..2558; multiply; 96 coalesced events</title></rect>
+<text x="1054.71" y="1908" text-anchor="middle" class="bar" pointer-events="none">multiply x96</text>
+<rect x="797.57" y="1947" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU9: cycles 2463..2559; cast -&gt; E30; 96 coalesced events</title></rect>
+<text x="1060.18" y="1960" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x96</text>
+<rect x="797.57" y="1973" width="525.22" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU11: cycles 2463..2559; cast -&gt; E30; 96 coalesced events</title></rect>
+<text x="1060.18" y="1986" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x96</text>
+<rect x="797.57" y="2103" width="21.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Load: cycles 2463..2467; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="819.46" y="2129" width="21.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Load: cycles 2467..2471; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="830.40" y="1583" width="525.22" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Write: cycles 2469..2565; continuous writes; 192 coalesced events</title></rect>
+<text x="1093.01" y="1596" text-anchor="middle" class="bar" pointer-events="none">continuous writes x192</text>
+<rect x="830.40" y="1635" width="525.22" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Write: cycles 2469..2565; continuous writes; 192 coalesced events</title></rect>
+<text x="1093.01" y="1648" text-anchor="middle" class="bar" pointer-events="none">continuous writes x192</text>
+<rect x="852.28" y="2051" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2473..2505; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="939.82" y="2064" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="852.28" y="2077" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2473..2505; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="939.82" y="2090" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="852.28" y="2155" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2473..2505; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="939.82" y="2168" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="852.28" y="2181" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2473..2505; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="939.82" y="2194" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="879.64" y="2233" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2478..2510; accumulate -&gt; SRAM</title></rect>
+<text x="967.17" y="2246" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="879.64" y="2285" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2478..2510; accumulate -&gt; SRAM</title></rect>
+<text x="967.17" y="2298" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="885.11" y="2207" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2479..2511; accumulate -&gt; SRAM</title></rect>
+<text x="972.64" y="2220" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="885.11" y="2259" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2479..2511; accumulate -&gt; SRAM</title></rect>
+<text x="972.64" y="2272" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1027.36" y="2051" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2505..2537; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1114.89" y="2064" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="1027.36" y="2077" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2505..2537; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1114.89" y="2090" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="1027.36" y="2155" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2505..2537; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1114.89" y="2168" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="1027.36" y="2181" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2505..2537; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1114.89" y="2194" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="1054.71" y="2233" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2510..2542; accumulate -&gt; SRAM</title></rect>
+<text x="1142.25" y="2246" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1054.71" y="2285" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2510..2542; accumulate -&gt; SRAM</title></rect>
+<text x="1142.25" y="2298" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1060.18" y="2207" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2511..2543; accumulate -&gt; SRAM</title></rect>
+<text x="1147.72" y="2220" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1060.18" y="2259" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2511..2543; accumulate -&gt; SRAM</title></rect>
+<text x="1147.72" y="2272" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1202.43" y="2051" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2537..2569; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1289.96" y="2064" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="1202.43" y="2077" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2537..2569; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1289.96" y="2090" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="1202.43" y="2155" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2537..2569; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1289.96" y="2168" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="1202.43" y="2181" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2537..2569; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1289.96" y="2194" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0...</text>
+<rect x="1229.78" y="2233" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2542..2574; accumulate -&gt; SRAM</title></rect>
+<text x="1317.32" y="2246" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1229.78" y="2285" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2542..2574; accumulate -&gt; SRAM</title></rect>
+<text x="1317.32" y="2298" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1235.25" y="2207" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2543..2575; accumulate -&gt; SRAM</title></rect>
+<text x="1322.79" y="2220" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1235.25" y="2259" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2543..2575; accumulate -&gt; SRAM</title></rect>
+<text x="1322.79" y="2272" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1377.50" y="1687" width="87.54" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 2569..2585; dequant int8 multiply; 4 coalesced events</title></rect>
+<text x="1421.27" y="1700" text-anchor="middle" class="bar" pointer-events="none">dequant int...</text>
+<rect x="1377.50" y="2051" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2569..2601; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="1465.04" y="2064" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=...</text>
+<rect x="1377.50" y="2077" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2569..2601; Compute tile; segments=14c E0/4c E16/14c E0</title></rect>
+<text x="1465.04" y="2090" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=...</text>
+<rect x="1377.50" y="2155" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2569..2601; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="1465.04" y="2168" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=...</text>
+<rect x="1377.50" y="2181" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2569..2601; Compute tile; segments=22c E0/4c E16/6c E0</title></rect>
+<text x="1465.04" y="2194" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=...</text>
+<rect x="1382.97" y="1921" width="87.54" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 2570..2586; dequant cast FP16; 4 coalesced events</title></rect>
+<text x="1426.74" y="1934" text-anchor="middle" class="bar" pointer-events="none">dequant cas...</text>
+<rect x="1404.86" y="2233" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2574..2606; accumulate -&gt; SRAM</title></rect>
+<text x="1492.39" y="2246" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1404.86" y="2285" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2574..2606; accumulate -&gt; SRAM</title></rect>
+<text x="1492.39" y="2298" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1410.33" y="2207" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2575..2607; accumulate -&gt; SRAM</title></rect>
+<text x="1497.86" y="2220" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1410.33" y="2259" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2575..2607; accumulate -&gt; SRAM</title></rect>
+<text x="1497.86" y="2272" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1454.09" y="1999" width="21.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 2583..2587; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="1470.51" y="1661" width="284.49" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0: cycles 2586..2638; negate; 52 coalesced events</title></rect>
+<text x="1612.75" y="1674" text-anchor="middle" class="bar" pointer-events="none">negate x52</text>
+<rect x="1470.51" y="1713" width="284.49" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU1: cycles 2586..2638; multiply; 52 coalesced events</title></rect>
+<text x="1612.75" y="1726" text-anchor="middle" class="bar" pointer-events="none">multiply x52</text>
+<rect x="1475.98" y="1739" width="279.02" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU2: cycles 2587..2638; exp; 51 coalesced events</title></rect>
+<text x="1615.49" y="1752" text-anchor="middle" class="bar" pointer-events="none">exp x51</text>
+<rect x="1475.98" y="1817" width="279.02" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU5: cycles 2587..2638; pass; 51 coalesced events</title></rect>
+<text x="1615.49" y="1830" text-anchor="middle" class="bar" pointer-events="none">pass x51</text>
+<rect x="1475.98" y="2025" width="21.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Load: cycles 2587..2591; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="1481.45" y="1765" width="273.55" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU3: cycles 2588..2638; add; 50 coalesced events</title></rect>
+<text x="1618.22" y="1778" text-anchor="middle" class="bar" pointer-events="none">add x50</text>
+<rect x="1481.45" y="1843" width="273.55" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU6: cycles 2588..2638; pass; 50 coalesced events</title></rect>
+<text x="1618.22" y="1856" text-anchor="middle" class="bar" pointer-events="none">pass x50</text>
+<rect x="1486.92" y="1791" width="268.08" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU4: cycles 2589..2638; divide; 49 coalesced events</title></rect>
+<text x="1620.96" y="1804" text-anchor="middle" class="bar" pointer-events="none">divide x49</text>
+<rect x="1486.92" y="1869" width="268.08" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU7: cycles 2589..2638; pass; 49 coalesced events</title></rect>
+<text x="1620.96" y="1882" text-anchor="middle" class="bar" pointer-events="none">pass x49</text>
+<rect x="1492.39" y="1895" width="262.61" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8: cycles 2590..2638; multiply; 48 coalesced events</title></rect>
+<text x="1623.70" y="1908" text-anchor="middle" class="bar" pointer-events="none">multiply x48</text>
+<rect x="1497.86" y="1947" width="257.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU9: cycles 2591..2638; cast -&gt; E30; 47 coalesced events</title></rect>
+<text x="1626.43" y="1960" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x47</text>
+<rect x="1497.86" y="1973" width="257.14" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU11: cycles 2591..2638; cast -&gt; E30; 47 coalesced events</title></rect>
+<text x="1626.43" y="1986" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x47</text>
+<rect x="1497.86" y="2103" width="21.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Load: cycles 2591..2595; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="1519.75" y="2129" width="21.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Load: cycles 2595..2599; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="1530.69" y="1583" width="224.31" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Write: cycles 2597..2638; continuous writes; 82 coalesced events</title></rect>
+<text x="1642.84" y="1596" text-anchor="middle" class="bar" pointer-events="none">continuous writes x82</text>
+<rect x="1530.69" y="1635" width="224.31" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Write: cycles 2597..2638; continuous writes; 82 coalesced events</title></rect>
+<text x="1642.84" y="1648" text-anchor="middle" class="bar" pointer-events="none">continuous writes x82</text>
+<rect x="1552.57" y="2051" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2601..2633; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1640.11" y="2064" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="1552.57" y="2077" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2601..2633; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1640.11" y="2090" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="1552.57" y="2155" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2601..2633; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="1640.11" y="2168" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="1552.57" y="2181" width="175.07" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2601..2633; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="1640.11" y="2194" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0...</text>
+<rect x="1579.93" y="2233" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 2606..2638; accumulate -&gt; SRAM</title></rect>
+<text x="1667.46" y="2246" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1579.93" y="2285" width="175.07" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 2606..2638; accumulate -&gt; SRAM</title></rect>
+<text x="1667.46" y="2298" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1585.40" y="2207" width="169.60" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 2607..2639; accumulate -&gt; SRAM</title></rect>
+<text x="1670.20" y="2220" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1585.40" y="2259" width="169.60" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 2607..2639; accumulate -&gt; SRAM</title></rect>
+<text x="1670.20" y="2272" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1727.64" y="2051" width="27.36" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 2633..2665; Compute buffer=0 act=E0 out=E0</title></rect>
+<rect x="1727.64" y="2077" width="27.36" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 2633..2665; Compute buffer=0 act=E0 out=E4</title></rect>
+<rect x="1727.64" y="2155" width="27.36" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 2633..2665; Compute buffer=0 act=E0 out=E0</title></rect>
+<rect x="1727.64" y="2181" width="27.36" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 2633..2665; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="42" y="2399" class="panel">SwiGLU: final staged tile and hidden writeback</text>
+<text x="1755" y="2399" text-anchor="end" class="sub">cycles 55396..55674 (278 cycles)</text>
+<line x1="245.00" y1="2417" x2="245.00" y2="2898" class="grid"/>
+<text x="245.00" y="2410" text-anchor="middle" class="tick">55396</text>
+<line x1="547.00" y1="2417" x2="547.00" y2="2898" class="grid"/>
+<text x="547.00" y="2410" text-anchor="middle" class="tick">55452</text>
+<line x1="849.00" y1="2417" x2="849.00" y2="2898" class="grid"/>
+<text x="849.00" y="2410" text-anchor="middle" class="tick">55507</text>
+<line x1="1151.00" y1="2417" x2="1151.00" y2="2898" class="grid"/>
+<text x="1151.00" y="2410" text-anchor="middle" class="tick">55563</text>
+<line x1="1453.00" y1="2417" x2="1453.00" y2="2898" class="grid"/>
+<text x="1453.00" y="2410" text-anchor="middle" class="tick">55618</text>
+<line x1="1755.00" y1="2417" x2="1755.00" y2="2898" class="grid"/>
+<text x="1755.00" y="2410" text-anchor="middle" class="tick">55674</text>
+<rect x="245" y="2417" width="1510" height="24" class="lane"/>
+<text x="233" y="2434" text-anchor="end" class="row">MEM.E.Read</text>
+<rect x="245" y="2443" width="1510" height="24" class="lane"/>
+<text x="233" y="2460" text-anchor="end" class="row">MEM.E.Write</text>
+<rect x="245" y="2469" width="1510" height="24" class="lane"/>
+<text x="233" y="2486" text-anchor="end" class="row">MEM.W.Read</text>
+<rect x="245" y="2495" width="1510" height="24" class="lane"/>
+<text x="233" y="2512" text-anchor="end" class="row">MEM.W.Write</text>
+<rect x="245" y="2521" width="1510" height="24" class="lane"/>
+<text x="233" y="2538" text-anchor="end" class="row">VXM.ALU0</text>
+<rect x="245" y="2547" width="1510" height="24" class="lane"/>
+<text x="233" y="2564" text-anchor="end" class="row">VXM.ALU0-7</text>
+<rect x="245" y="2573" width="1510" height="24" class="lane"/>
+<text x="233" y="2590" text-anchor="end" class="row">VXM.ALU1</text>
+<rect x="245" y="2599" width="1510" height="24" class="lane"/>
+<text x="233" y="2616" text-anchor="end" class="row">VXM.ALU2</text>
+<rect x="245" y="2625" width="1510" height="24" class="lane"/>
+<text x="233" y="2642" text-anchor="end" class="row">VXM.ALU3</text>
+<rect x="245" y="2651" width="1510" height="24" class="lane"/>
+<text x="233" y="2668" text-anchor="end" class="row">VXM.ALU4</text>
+<rect x="245" y="2677" width="1510" height="24" class="lane"/>
+<text x="233" y="2694" text-anchor="end" class="row">VXM.ALU5</text>
+<rect x="245" y="2703" width="1510" height="24" class="lane"/>
+<text x="233" y="2720" text-anchor="end" class="row">VXM.ALU6</text>
+<rect x="245" y="2729" width="1510" height="24" class="lane"/>
+<text x="233" y="2746" text-anchor="end" class="row">VXM.ALU7</text>
+<rect x="245" y="2755" width="1510" height="24" class="lane"/>
+<text x="233" y="2772" text-anchor="end" class="row">VXM.ALU8</text>
+<rect x="245" y="2781" width="1510" height="24" class="lane"/>
+<text x="233" y="2798" text-anchor="end" class="row">VXM.ALU8-15</text>
+<rect x="245" y="2807" width="1510" height="24" class="lane"/>
+<text x="233" y="2824" text-anchor="end" class="row">VXM.ALU9</text>
+<rect x="245" y="2833" width="1510" height="24" class="lane"/>
+<text x="233" y="2850" text-anchor="end" class="row">VXM.ALU11</text>
+<rect x="245" y="2859" width="1510" height="24" class="lane"/>
+<text x="233" y="2876" text-anchor="end" class="row">MXM.E0.Load</text>
+<rect x="245.00" y="2446" width="1222.12" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Write: cycles 55396..55621; continuous writes; 450 coalesced events</title></rect>
+<text x="856.06" y="2459" text-anchor="middle" class="bar" pointer-events="none">continuous writes x450</text>
+<rect x="245.00" y="2472" width="108.63" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 55396..55416; continuous reads; 148 coalesced events</title></rect>
+<text x="299.32" y="2485" text-anchor="middle" class="bar" pointer-events="none">continuous rea...</text>
+<rect x="245.00" y="2498" width="1222.12" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Write: cycles 55396..55621; continuous writes; 450 coalesced events</title></rect>
+<text x="856.06" y="2511" text-anchor="middle" class="bar" pointer-events="none">continuous writes x450</text>
+<rect x="245.00" y="2524" width="1162.37" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0: cycles 55396..55610; negate; 214 coalesced events</title></rect>
+<text x="826.19" y="2537" text-anchor="middle" class="bar" pointer-events="none">negate x214</text>
+<rect x="245.00" y="2576" width="1162.37" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU1: cycles 55396..55610; multiply; 214 coalesced events</title></rect>
+<text x="826.19" y="2589" text-anchor="middle" class="bar" pointer-events="none">multiply x214</text>
+<rect x="245.00" y="2602" width="1167.81" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU2: cycles 55396..55611; exp; 215 coalesced events</title></rect>
+<text x="828.90" y="2615" text-anchor="middle" class="bar" pointer-events="none">exp x215</text>
+<rect x="245.00" y="2628" width="1173.24" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU3: cycles 55396..55612; add; 216 coalesced events</title></rect>
+<text x="831.62" y="2641" text-anchor="middle" class="bar" pointer-events="none">add x216</text>
+<rect x="245.00" y="2654" width="1178.67" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU4: cycles 55396..55613; divide; 217 coalesced events</title></rect>
+<text x="834.33" y="2667" text-anchor="middle" class="bar" pointer-events="none">divide x217</text>
+<rect x="245.00" y="2680" width="1167.81" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU5: cycles 55396..55611; pass; 215 coalesced events</title></rect>
+<text x="828.90" y="2693" text-anchor="middle" class="bar" pointer-events="none">pass x215</text>
+<rect x="245.00" y="2706" width="1173.24" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU6: cycles 55396..55612; pass; 216 coalesced events</title></rect>
+<text x="831.62" y="2719" text-anchor="middle" class="bar" pointer-events="none">pass x216</text>
+<rect x="245.00" y="2732" width="1178.67" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU7: cycles 55396..55613; pass; 217 coalesced events</title></rect>
+<text x="834.33" y="2745" text-anchor="middle" class="bar" pointer-events="none">pass x217</text>
+<rect x="245.00" y="2758" width="1184.10" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8: cycles 55396..55614; multiply; 218 coalesced events</title></rect>
+<text x="837.05" y="2771" text-anchor="middle" class="bar" pointer-events="none">multiply x218</text>
+<rect x="245.00" y="2810" width="1189.53" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU9: cycles 55396..55615; cast -&gt; E30; 219 coalesced events</title></rect>
+<text x="839.77" y="2823" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x219</text>
+<rect x="245.00" y="2836" width="1189.53" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU11: cycles 55396..55615; cast -&gt; E30; 219 coalesced events</title></rect>
+<text x="839.77" y="2849" text-anchor="middle" class="bar" pointer-events="none">cast -&gt; E30 x219</text>
+<rect x="337.34" y="2420" width="190.11" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 55413..55448; continuous reads; 256 coalesced events</title></rect>
+<text x="432.39" y="2433" text-anchor="middle" class="bar" pointer-events="none">continuous reads x256</text>
+<rect x="511.15" y="2472" width="190.11" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 55445..55480; continuous reads; 256 coalesced events</title></rect>
+<text x="606.21" y="2485" text-anchor="middle" class="bar" pointer-events="none">continuous reads x256</text>
+<rect x="684.96" y="2420" width="190.11" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 55477..55512; continuous reads; 256 coalesced events</title></rect>
+<text x="780.02" y="2433" text-anchor="middle" class="bar" pointer-events="none">continuous reads x256</text>
+<rect x="858.78" y="2472" width="190.11" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 55509..55544; continuous reads; 256 coalesced events</title></rect>
+<text x="953.83" y="2485" text-anchor="middle" class="bar" pointer-events="none">continuous reads x256</text>
+<rect x="1032.59" y="2420" width="190.11" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 55541..55576; continuous reads; 256 coalesced events</title></rect>
+<text x="1127.64" y="2433" text-anchor="middle" class="bar" pointer-events="none">continuous reads x256</text>
+<rect x="1206.40" y="2472" width="190.11" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 55573..55608; continuous reads; 256 coalesced events</title></rect>
+<text x="1301.46" y="2485" text-anchor="middle" class="bar" pointer-events="none">continuous reads x256</text>
+<rect x="1624.64" y="2420" width="81.47" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 55650..55665; continuous reads; 16 coalesced events</title></rect>
+<text x="1665.38" y="2433" text-anchor="middle" class="bar" pointer-events="none">continuous...</text>
+<rect x="1668.09" y="2472" width="81.47" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 55658..55673; continuous reads; 16 coalesced events</title></rect>
+<text x="1708.83" y="2485" text-anchor="middle" class="bar" pointer-events="none">continuous...</text>
+<rect x="1673.53" y="2550" width="81.47" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 55659..55675; dequant int8 multiply; 4 coalesced events</title></rect>
+<text x="1714.26" y="2563" text-anchor="middle" class="bar" pointer-events="none">dequant in...</text>
+<rect x="1678.96" y="2784" width="76.04" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 55660..55676; dequant cast FP16; 4 coalesced events</title></rect>
+<text x="1716.98" y="2797" text-anchor="middle" class="bar" pointer-events="none">dequant c...</text>
+<rect x="1749.57" y="2862" width="5.43" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 55673..55674; IW buffer=0</title></rect>
+<text x="42" y="2976" class="panel">Down projection: startup and first output waves</text>
+<text x="1755" y="2976" text-anchor="end" class="sub">cycles 55673..55883 (210 cycles)</text>
+<line x1="245.00" y1="2994" x2="245.00" y2="3423" class="grid"/>
+<text x="245.00" y="2987" text-anchor="middle" class="tick">55673</text>
+<line x1="547.00" y1="2994" x2="547.00" y2="3423" class="grid"/>
+<text x="547.00" y="2987" text-anchor="middle" class="tick">55715</text>
+<line x1="849.00" y1="2994" x2="849.00" y2="3423" class="grid"/>
+<text x="849.00" y="2987" text-anchor="middle" class="tick">55757</text>
+<line x1="1151.00" y1="2994" x2="1151.00" y2="3423" class="grid"/>
+<text x="1151.00" y="2987" text-anchor="middle" class="tick">55799</text>
+<line x1="1453.00" y1="2994" x2="1453.00" y2="3423" class="grid"/>
+<text x="1453.00" y="2987" text-anchor="middle" class="tick">55841</text>
+<line x1="1755.00" y1="2994" x2="1755.00" y2="3423" class="grid"/>
+<text x="1755.00" y="2987" text-anchor="middle" class="tick">55883</text>
+<rect x="245" y="2994" width="1510" height="24" class="lane"/>
+<text x="233" y="3011" text-anchor="end" class="row">MEM.E.Read</text>
+<rect x="245" y="3020" width="1510" height="24" class="lane"/>
+<text x="233" y="3037" text-anchor="end" class="row">MEM.W.Read</text>
+<rect x="245" y="3046" width="1510" height="24" class="lane"/>
+<text x="233" y="3063" text-anchor="end" class="row">VXM.ALU0-7</text>
+<rect x="245" y="3072" width="1510" height="24" class="lane"/>
+<text x="233" y="3089" text-anchor="end" class="row">VXM.ALU8-15</text>
+<rect x="245" y="3098" width="1510" height="24" class="lane"/>
+<text x="233" y="3115" text-anchor="end" class="row">MXM.E0.Load</text>
+<rect x="245" y="3124" width="1510" height="24" class="lane"/>
+<text x="233" y="3141" text-anchor="end" class="row">MXM.E1.Load</text>
+<rect x="245" y="3150" width="1510" height="24" class="lane"/>
+<text x="233" y="3167" text-anchor="end" class="row">MXM.E0.Compute</text>
+<rect x="245" y="3176" width="1510" height="24" class="lane"/>
+<text x="233" y="3193" text-anchor="end" class="row">MXM.E1.Compute</text>
+<rect x="245" y="3202" width="1510" height="24" class="lane"/>
+<text x="233" y="3219" text-anchor="end" class="row">MXM.W0.Load</text>
+<rect x="245" y="3228" width="1510" height="24" class="lane"/>
+<text x="233" y="3245" text-anchor="end" class="row">MXM.W1.Load</text>
+<rect x="245" y="3254" width="1510" height="24" class="lane"/>
+<text x="233" y="3271" text-anchor="end" class="row">MXM.W0.Compute</text>
+<rect x="245" y="3280" width="1510" height="24" class="lane"/>
+<text x="233" y="3297" text-anchor="end" class="row">MXM.W1.Compute</text>
+<rect x="245" y="3306" width="1510" height="24" class="lane"/>
+<text x="233" y="3323" text-anchor="end" class="row">ACC.Gate/MXM0.E</text>
+<rect x="245" y="3332" width="1510" height="24" class="lane"/>
+<text x="233" y="3349" text-anchor="end" class="row">ACC.Up/MXM1.E</text>
+<rect x="245" y="3358" width="1510" height="24" class="lane"/>
+<text x="233" y="3375" text-anchor="end" class="row">ACC.Gate/MXM0.W</text>
+<rect x="245" y="3384" width="1510" height="24" class="lane"/>
+<text x="233" y="3401" text-anchor="end" class="row">ACC.Up/MXM1.W</text>
+<rect x="245.00" y="3049" width="14.38" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 55671..55675; dequant int8 multiply</title></rect>
+<rect x="245.00" y="3075" width="21.57" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 55672..55676; dequant cast FP16</title></rect>
+<rect x="245.00" y="3101" width="28.76" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 55673..55677; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="273.76" y="3127" width="28.76" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Load: cycles 55677..55681; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="302.52" y="3205" width="28.76" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Load: cycles 55681..55685; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="316.90" y="2997" width="1438.10" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 55683..55907; continuous reads; 42 coalesced events</title></rect>
+<text x="1035.95" y="3010" text-anchor="middle" class="bar" pointer-events="none">continuous reads x42</text>
+<rect x="316.90" y="3023" width="1438.10" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.W.Read: cycles 55683..55907; continuous reads; 42 coalesced events</title></rect>
+<text x="1035.95" y="3036" text-anchor="middle" class="bar" pointer-events="none">continuous reads x42</text>
+<rect x="331.29" y="3231" width="28.76" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Load: cycles 55685..55689; IW buffer=0; 4 coalesced events</title></rect>
+<rect x="374.43" y="3153" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 55691..55723; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="489.48" y="3166" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="374.43" y="3179" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 55691..55723; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="489.48" y="3192" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="374.43" y="3257" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 55691..55723; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="489.48" y="3270" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="374.43" y="3283" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 55691..55723; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="489.48" y="3296" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="410.38" y="3335" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 55696..55728; accumulate -&gt; SRAM</title></rect>
+<text x="525.43" y="3348" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="410.38" y="3387" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 55696..55728; accumulate -&gt; SRAM</title></rect>
+<text x="525.43" y="3400" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="417.57" y="3309" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 55697..55729; accumulate -&gt; SRAM</title></rect>
+<text x="532.62" y="3322" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="417.57" y="3361" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 55697..55729; accumulate -&gt; SRAM</title></rect>
+<text x="532.62" y="3374" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="604.52" y="3153" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 55723..55755; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="719.57" y="3166" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="604.52" y="3179" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 55723..55755; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="719.57" y="3192" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="604.52" y="3257" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 55723..55755; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="719.57" y="3270" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="604.52" y="3283" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 55723..55755; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="719.57" y="3296" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="640.48" y="3335" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 55728..55760; accumulate -&gt; SRAM</title></rect>
+<text x="755.52" y="3348" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="640.48" y="3387" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 55728..55760; accumulate -&gt; SRAM</title></rect>
+<text x="755.52" y="3400" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="647.67" y="3309" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 55729..55761; accumulate -&gt; SRAM</title></rect>
+<text x="762.71" y="3322" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="647.67" y="3361" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 55729..55761; accumulate -&gt; SRAM</title></rect>
+<text x="762.71" y="3374" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="834.62" y="3153" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 55755..55787; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="949.67" y="3166" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="834.62" y="3179" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 55755..55787; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="949.67" y="3192" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="834.62" y="3257" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 55755..55787; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="949.67" y="3270" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E0</text>
+<rect x="834.62" y="3283" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 55755..55787; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="949.67" y="3296" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 out=E4</text>
+<rect x="870.57" y="3335" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 55760..55792; accumulate -&gt; SRAM</title></rect>
+<text x="985.62" y="3348" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="870.57" y="3387" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 55760..55792; accumulate -&gt; SRAM</title></rect>
+<text x="985.62" y="3400" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="877.76" y="3309" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 55761..55793; accumulate -&gt; SRAM</title></rect>
+<text x="992.81" y="3322" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="877.76" y="3361" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 55761..55793; accumulate -&gt; SRAM</title></rect>
+<text x="992.81" y="3374" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1064.71" y="3049" width="115.05" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 55787..55803; dequant int8 multiply; 4 coalesced events</title></rect>
+<text x="1122.24" y="3062" text-anchor="middle" class="bar" pointer-events="none">dequant int8 m...</text>
+<rect x="1064.71" y="3153" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 55787..55819; Compute tile; segments=14c E0/4c E16/4c E0/4c E16/4c E0/1c E0/1c E0</title></rect>
+<text x="1179.76" y="3166" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=14c E0/...</text>
+<rect x="1064.71" y="3179" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 55787..55819; Compute tile; segments=14c E0/4c E16/4c E0/4c E16/4c E0/1c E0/1c E0</title></rect>
+<text x="1179.76" y="3192" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=14c E0/...</text>
+<rect x="1064.71" y="3257" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 55787..55819; Compute tile; segments=14c E0/4c E16/4c E0/4c E16/4c E0/1c E0/1c E0</title></rect>
+<text x="1179.76" y="3270" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=14c E0/...</text>
+<rect x="1064.71" y="3283" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 55787..55819; Compute tile; segments=14c E0/4c E16/4c E0/4c E16/4c E0/1c E0/1c E0</title></rect>
+<text x="1179.76" y="3296" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=14c E0/...</text>
+<rect x="1071.90" y="3075" width="115.05" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 55788..55804; dequant cast FP16; 4 coalesced events</title></rect>
+<text x="1129.43" y="3088" text-anchor="middle" class="bar" pointer-events="none">dequant cast F...</text>
+<rect x="1100.67" y="3335" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 55792..55824; accumulate -&gt; SRAM</title></rect>
+<text x="1215.71" y="3348" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1100.67" y="3387" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 55792..55824; accumulate -&gt; SRAM</title></rect>
+<text x="1215.71" y="3400" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1107.86" y="3309" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 55793..55825; accumulate -&gt; SRAM</title></rect>
+<text x="1222.90" y="3322" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1107.86" y="3361" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 55793..55825; accumulate -&gt; SRAM</title></rect>
+<text x="1222.90" y="3374" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1165.38" y="3101" width="28.76" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 55801..55805; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="1194.14" y="3127" width="28.76" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Load: cycles 55805..55809; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="1222.90" y="3205" width="28.76" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Load: cycles 55809..55813; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="1251.67" y="3231" width="28.76" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Load: cycles 55813..55817; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="1294.81" y="3153" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 55819..55851; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1409.86" y="3166" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 out=E0</text>
+<rect x="1294.81" y="3179" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 55819..55851; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1409.86" y="3192" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 out=E4</text>
+<rect x="1294.81" y="3257" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 55819..55851; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1409.86" y="3270" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 out=E0</text>
+<rect x="1294.81" y="3283" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 55819..55851; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1409.86" y="3296" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 out=E4</text>
+<rect x="1330.76" y="3335" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 55824..55856; accumulate -&gt; SRAM</title></rect>
+<text x="1445.81" y="3348" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1330.76" y="3387" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 55824..55856; accumulate -&gt; SRAM</title></rect>
+<text x="1445.81" y="3400" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1337.95" y="3309" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 55825..55857; accumulate -&gt; SRAM</title></rect>
+<text x="1453.00" y="3322" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1337.95" y="3361" width="230.10" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 55825..55857; accumulate -&gt; SRAM</title></rect>
+<text x="1453.00" y="3374" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1524.90" y="3153" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 55851..55883; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1639.95" y="3166" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 out=E0</text>
+<rect x="1524.90" y="3179" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 55851..55883; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1639.95" y="3192" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 out=E4</text>
+<rect x="1524.90" y="3257" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W0.Compute: cycles 55851..55883; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1639.95" y="3270" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 out=E0</text>
+<rect x="1524.90" y="3283" width="230.10" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.W1.Compute: cycles 55851..55883; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1639.95" y="3296" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 out=E4</text>
+<rect x="1560.86" y="3335" width="194.14" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 55856..55888; accumulate -&gt; SRAM</title></rect>
+<text x="1657.93" y="3348" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1560.86" y="3387" width="194.14" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.W: cycles 55856..55888; accumulate -&gt; SRAM</title></rect>
+<text x="1657.93" y="3400" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1568.05" y="3309" width="186.95" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 55857..55889; accumulate -&gt; SRAM</title></rect>
+<text x="1661.52" y="3322" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="1568.05" y="3361" width="186.95" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.W: cycles 55857..55889; accumulate -&gt; SRAM</title></rect>
+<text x="1661.52" y="3374" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<text x="42" y="3501" class="panel">Down projection: final accumulation, cast, and writeback</text>
+<text x="1755" y="3501" text-anchor="end" class="sub">cycles 86422..86686 (264 cycles)</text>
+<line x1="245.00" y1="3519" x2="245.00" y2="3844" class="grid"/>
+<text x="245.00" y="3512" text-anchor="middle" class="tick">86422</text>
+<line x1="547.00" y1="3519" x2="547.00" y2="3844" class="grid"/>
+<text x="547.00" y="3512" text-anchor="middle" class="tick">86475</text>
+<line x1="849.00" y1="3519" x2="849.00" y2="3844" class="grid"/>
+<text x="849.00" y="3512" text-anchor="middle" class="tick">86528</text>
+<line x1="1151.00" y1="3519" x2="1151.00" y2="3844" class="grid"/>
+<text x="1151.00" y="3512" text-anchor="middle" class="tick">86580</text>
+<line x1="1453.00" y1="3519" x2="1453.00" y2="3844" class="grid"/>
+<text x="1453.00" y="3512" text-anchor="middle" class="tick">86633</text>
+<line x1="1755.00" y1="3519" x2="1755.00" y2="3844" class="grid"/>
+<text x="1755.00" y="3512" text-anchor="middle" class="tick">86686</text>
+<rect x="245" y="3519" width="1510" height="24" class="lane"/>
+<text x="233" y="3536" text-anchor="end" class="row">MEM.E.Read</text>
+<rect x="245" y="3545" width="1510" height="24" class="lane"/>
+<text x="233" y="3562" text-anchor="end" class="row">MEM.E.Write</text>
+<rect x="245" y="3571" width="1510" height="24" class="lane"/>
+<text x="233" y="3588" text-anchor="end" class="row">VXM.ALU0</text>
+<rect x="245" y="3597" width="1510" height="24" class="lane"/>
+<text x="233" y="3614" text-anchor="end" class="row">VXM.ALU0-7</text>
+<rect x="245" y="3623" width="1510" height="24" class="lane"/>
+<text x="233" y="3640" text-anchor="end" class="row">VXM.ALU1</text>
+<rect x="245" y="3649" width="1510" height="24" class="lane"/>
+<text x="233" y="3666" text-anchor="end" class="row">VXM.ALU8-15</text>
+<rect x="245" y="3675" width="1510" height="24" class="lane"/>
+<text x="233" y="3692" text-anchor="end" class="row">MXM.E0.Load</text>
+<rect x="245" y="3701" width="1510" height="24" class="lane"/>
+<text x="233" y="3718" text-anchor="end" class="row">MXM.E1.Load</text>
+<rect x="245" y="3727" width="1510" height="24" class="lane"/>
+<text x="233" y="3744" text-anchor="end" class="row">MXM.E0.Compute</text>
+<rect x="245" y="3753" width="1510" height="24" class="lane"/>
+<text x="233" y="3770" text-anchor="end" class="row">MXM.E1.Compute</text>
+<rect x="245" y="3779" width="1510" height="24" class="lane"/>
+<text x="233" y="3796" text-anchor="end" class="row">ACC.Gate/MXM0.E</text>
+<rect x="245" y="3805" width="1510" height="24" class="lane"/>
+<text x="233" y="3822" text-anchor="end" class="row">ACC.Up/MXM1.E</text>
+<rect x="245.00" y="3522" width="1332.69" height="18" rx="2" fill="#8fc8a7" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Read: cycles 86399..86655; continuous reads; 38 coalesced events</title></rect>
+<text x="911.34" y="3535" text-anchor="middle" class="bar" pointer-events="none">continuous reads x38</text>
+<rect x="245.00" y="3730" width="97.23" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 86407..86439; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="293.62" y="3743" text-anchor="middle" class="bar" pointer-events="none">Compute buff...</text>
+<rect x="245.00" y="3756" width="97.23" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 86407..86439; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="293.62" y="3769" text-anchor="middle" class="bar" pointer-events="none">Compute buff...</text>
+<rect x="245.00" y="3808" width="125.83" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 86412..86444; accumulate -&gt; SRAM</title></rect>
+<text x="307.92" y="3821" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SR...</text>
+<rect x="245.00" y="3782" width="131.55" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 86413..86445; accumulate -&gt; SRAM</title></rect>
+<text x="310.78" y="3795" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="342.23" y="3730" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 86439..86471; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="433.75" y="3743" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 ...</text>
+<rect x="342.23" y="3756" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 86439..86471; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="433.75" y="3769" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 ...</text>
+<rect x="370.83" y="3808" width="183.03" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 86444..86476; accumulate -&gt; SRAM</title></rect>
+<text x="462.35" y="3821" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="376.55" y="3782" width="183.03" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 86445..86477; accumulate -&gt; SRAM</title></rect>
+<text x="468.07" y="3795" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="525.27" y="3730" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 86471..86503; Compute buffer=0 act=E0 out=E0</title></rect>
+<text x="616.78" y="3743" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 ...</text>
+<rect x="525.27" y="3756" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 86471..86503; Compute buffer=0 act=E0 out=E4</title></rect>
+<text x="616.78" y="3769" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=0 act=E0 ...</text>
+<rect x="553.86" y="3808" width="183.03" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 86476..86508; accumulate -&gt; SRAM</title></rect>
+<text x="645.38" y="3821" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="559.58" y="3782" width="183.03" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 86477..86509; accumulate -&gt; SRAM</title></rect>
+<text x="651.10" y="3795" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="708.30" y="3600" width="45.76" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0-7: cycles 86503..86511; dequant int8 multiply; 2 coalesced events</title></rect>
+<rect x="708.30" y="3730" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 86503..86535; Compute tile; segments=14c E0/4c E16/4c E0/10c E0</title></rect>
+<text x="799.81" y="3743" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=1...</text>
+<rect x="708.30" y="3756" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 86503..86535; Compute tile; segments=14c E0/4c E16/4c E0/10c E0</title></rect>
+<text x="799.81" y="3769" text-anchor="middle" class="bar" pointer-events="none">Compute tile; segments=1...</text>
+<rect x="714.02" y="3652" width="45.76" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU8-15: cycles 86504..86512; dequant cast FP16; 2 coalesced events</title></rect>
+<rect x="736.89" y="3808" width="183.03" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 86508..86540; accumulate -&gt; SRAM</title></rect>
+<text x="828.41" y="3821" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="742.61" y="3782" width="183.03" height="18" rx="2" fill="#c5a3d9" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 86509..86541; accumulate -&gt; SRAM</title></rect>
+<text x="834.13" y="3795" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; SRAM</text>
+<rect x="788.37" y="3678" width="22.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Load: cycles 86517..86521; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="811.25" y="3704" width="22.88" height="18" rx="2" fill="#91b7e5" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Load: cycles 86521..86525; IW buffer=1; 4 coalesced events</title></rect>
+<rect x="891.33" y="3730" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 86535..86567; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="982.84" y="3743" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 ...</text>
+<rect x="891.33" y="3756" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 86535..86567; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="982.84" y="3769" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 ...</text>
+<rect x="919.92" y="3808" width="183.03" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 86540..86572; accumulate -&gt; stream + clear</title></rect>
+<text x="1011.44" y="3821" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; stream + c...</text>
+<rect x="925.64" y="3782" width="183.03" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 86541..86573; accumulate -&gt; stream + clear</title></rect>
+<text x="1017.16" y="3795" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; stream + c...</text>
+<rect x="982.84" y="3574" width="732.12" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU0: cycles 86551..86679; FP32-&gt;FP16 output cast -&gt; E24; 128 coalesced events</title></rect>
+<text x="1348.90" y="3587" text-anchor="middle" class="bar" pointer-events="none">FP32-&gt;FP16 output cast -&gt; E24 x128</text>
+<rect x="982.84" y="3626" width="732.12" height="18" rx="2" fill="#ed996d" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>VXM.ALU1: cycles 86551..86679; FP32-&gt;FP16 output cast -&gt; E26; 128 coalesced events</title></rect>
+<text x="1348.90" y="3639" text-anchor="middle" class="bar" pointer-events="none">FP32-&gt;FP16 output cast -&gt; E26 x128</text>
+<rect x="1022.88" y="3548" width="732.12" height="18" rx="2" fill="#f0ca78" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MEM.E.Write: cycles 86558..86686; continuous writes; 512 coalesced events</title></rect>
+<text x="1388.94" y="3561" text-anchor="middle" class="bar" pointer-events="none">continuous writes x512</text>
+<rect x="1074.36" y="3730" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 86567..86599; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1165.87" y="3743" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 ...</text>
+<rect x="1074.36" y="3756" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 86567..86599; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1165.87" y="3769" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 ...</text>
+<rect x="1102.95" y="3808" width="183.03" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 86572..86604; accumulate -&gt; stream + clear</title></rect>
+<text x="1194.47" y="3821" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; stream + c...</text>
+<rect x="1108.67" y="3782" width="183.03" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 86573..86605; accumulate -&gt; stream + clear</title></rect>
+<text x="1200.19" y="3795" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; stream + c...</text>
+<rect x="1257.39" y="3730" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 86599..86631; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1348.90" y="3743" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 ...</text>
+<rect x="1257.39" y="3756" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 86599..86631; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1348.90" y="3769" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 ...</text>
+<rect x="1285.98" y="3808" width="183.03" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 86604..86636; accumulate -&gt; stream + clear</title></rect>
+<text x="1377.50" y="3821" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; stream + c...</text>
+<rect x="1291.70" y="3782" width="183.03" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 86605..86637; accumulate -&gt; stream + clear</title></rect>
+<text x="1383.22" y="3795" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; stream + c...</text>
+<rect x="1440.42" y="3730" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E0.Compute: cycles 86631..86663; Compute buffer=1 act=E0 out=E0</title></rect>
+<text x="1531.93" y="3743" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 ...</text>
+<rect x="1440.42" y="3756" width="183.03" height="18" rx="2" fill="#6f9fd8" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>MXM.E1.Compute: cycles 86631..86663; Compute buffer=1 act=E0 out=E4</title></rect>
+<text x="1531.93" y="3769" text-anchor="middle" class="bar" pointer-events="none">Compute buffer=1 act=E0 ...</text>
+<rect x="1469.02" y="3808" width="183.03" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Up/MXM1.E: cycles 86636..86668; accumulate -&gt; stream + clear</title></rect>
+<text x="1560.53" y="3821" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; stream + c...</text>
+<rect x="1474.73" y="3782" width="183.03" height="18" rx="2" fill="#e16b6f" stroke="#52606c" stroke-width="0.7" opacity="0.92"><title>ACC.Gate/MXM0.E: cycles 86637..86669; accumulate -&gt; stream + clear</title></rect>
+<text x="1566.25" y="3795" text-anchor="middle" class="bar" pointer-events="none">accumulate -&gt; stream + c...</text>
+</svg>

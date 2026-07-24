@@ -39,6 +39,11 @@ int64_t command_cycle(mlir::Operation* op)
     return llvm::cast<mlir::IntegerAttr>(op->getAttrDictionary().get("cycle")).getInt();
 }
 
+int64_t command_integer(mlir::Operation* op, llvm::StringRef name)
+{
+    return llvm::cast<mlir::IntegerAttr>(op->getAttrDictionary().get(name)).getInt();
+}
+
 using QueueKey = std::pair<QueueKind, int64_t>;
 using QueueMap = std::map<QueueKey, std::vector<CommandSequence>>;
 
@@ -49,6 +54,21 @@ QueueCommand instruction_command(InstructionKind kind, std::uint32_t word)
         kind,
         1,
         {word, 0, 0, 0},
+    };
+}
+
+QueueCommand mem_instruction_command(isa::EncodedMemInstruction encoded)
+{
+    return QueueCommand {
+        static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
+        InstructionKind::Mem,
+        static_cast<std::uint16_t>((encoded >> 32) == 0 ? 1 : 2),
+        {
+            static_cast<std::uint32_t>(encoded),
+            static_cast<std::uint32_t>(encoded >> 32),
+            0,
+            0,
+        },
     };
 }
 
@@ -97,9 +117,13 @@ BindingLayout parse_layout(llvm::StringRef value)
     if (value == "fp16_byte_planar") return BindingLayout::Fp16BytePlanar;
     if (value == "fp16_mxm_activation_planar") return BindingLayout::Fp16MxmActivationPlanar;
     if (value == "w8a16_mxm_weight_striped") return BindingLayout::W8A16MxmWeightStriped;
+    if (value == "w8a16_mxm_weight_wave_striped")
+        return BindingLayout::W8A16MxmWeightWaveStriped;
     if (value == "w8a16_attention_weight_striped")
         return BindingLayout::W8A16AttentionWeightStriped;
     if (value == "fp16_pair_planar") return BindingLayout::Fp16PairPlanar;
+    if (value == "fp32_causal_mask_tile")
+        return BindingLayout::Fp32CausalMaskTile;
     throw std::runtime_error("unsupported Command IR binding layout");
 }
 
@@ -107,9 +131,13 @@ BinaryBinding translate_binding(command::BindingOp op)
 {
     BinaryBinding binding;
     binding.index = static_cast<std::uint32_t>(op.getIndex());
-    binding.access = op.getAccess() == "input" ? BindingAccess::Input : BindingAccess::Output;
+    binding.access = op.getAccess() == "input" ? BindingAccess::Input
+        : op.getAccess() == "output" ? BindingAccess::Output
+        : BindingAccess::Internal;
     binding.element_type = op.getElementType() == "i8" ? BindingElementType::I8
-        : op.getElementType() == "f16" ? BindingElementType::F16 : BindingElementType::I32;
+        : op.getElementType() == "f16" ? BindingElementType::F16
+        : op.getElementType() == "f32" ? BindingElementType::F32
+        : BindingElementType::I32;
     binding.byte_size = static_cast<std::uint64_t>(op.getBytes());
     binding.layout = parse_layout(op.getPlacement().getAs<mlir::StringAttr>("kind").getValue());
     auto hemisphere = op.getPlacement().getAs<mlir::StringAttr>("hemisphere");
@@ -129,6 +157,8 @@ BinaryBinding translate_binding(command::BindingOp op)
 
 void collect_mem(command::MemOp op, QueueMap& queues)
 {
+    const int64_t queue = command_integer(op, "queue");
+    const int64_t cycle = command_cycle(op);
     const auto instruction = op.getOpcode() == "read"
         ? MemInstruction::Read(op.getAddress(), op.getPackedStream())
         : op.getOpcode() == "write"
@@ -136,12 +166,12 @@ void collect_mem(command::MemOp op, QueueMap& queues)
         : MemInstruction::Accumulate(op.getAddress(), op.getPackedStream(),
             op.getAccumulatorDestination() == "stream"
                 ? MemAccumulatorDestination::Stream : MemAccumulatorDestination::Sram);
-    queues[{QueueKind::Mem, static_cast<int64_t>(op.getQueue())}].push_back(CommandSequence {
-        command_cycle(op),
+    queues[{QueueKind::Mem, queue}].push_back(CommandSequence {
+        cycle,
         op->getAttrOfType<mlir::IntegerAttr>("repeat_count").getInt(),
         op->getAttrOfType<mlir::IntegerAttr>("repeat_interval").getInt(),
         op->getAttrOfType<mlir::IntegerAttr>("address_stride").getInt(),
-        instruction_command(InstructionKind::Mem, isa::encode_mem_instruction(instruction)),
+        mem_instruction_command(isa::encode_mem_instruction(instruction)),
     });
 }
 
@@ -263,13 +293,18 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
     });
     QueueProgram queue {key.first, static_cast<std::size_t>(key.second), {}};
     int64_t cursor = 0;
+    const CommandSequence* previous = nullptr;
     for (const CommandSequence& sequence : sequences) {
         if (sequence.cycle < cursor)
             throw std::runtime_error("overlapping Command IR sequences target ICU queue kind="
                 + std::to_string(static_cast<int>(key.first)) + " index="
                 + std::to_string(key.second) + " at cycle="
                 + std::to_string(sequence.cycle) + " (busy through "
-                + std::to_string(cursor - 1) + ")");
+                + std::to_string(cursor - 1) + "; previous start="
+                + std::to_string(previous ? previous->cycle : -1) + " count="
+                + std::to_string(previous ? previous->repeat_count : -1) + " interval="
+                + std::to_string(previous ? previous->repeat_interval : -1)
+                + ")");
         if (sequence.cycle > cursor)
             queue.commands.push_back(control_command(
                 isa::encode_icu_nop(static_cast<std::size_t>(sequence.cycle - cursor))));
@@ -286,6 +321,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
             + (sequence.repeat_count - 1) * sequence.repeat_interval;
         cursor = final_cycle + 1;
         max_cycle = std::max(max_cycle, static_cast<std::size_t>(final_cycle));
+        previous = &sequence;
     }
     return queue;
 }

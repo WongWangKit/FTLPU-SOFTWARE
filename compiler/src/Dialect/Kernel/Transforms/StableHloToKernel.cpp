@@ -5,6 +5,11 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
+
+#include <cmath>
+#include <optional>
+
 namespace ftlpu::compiler {
 namespace {
 
@@ -13,13 +18,66 @@ bool named(mlir::Operation* op, llvm::StringRef name)
     return op && op->getName().getStringRef() == name;
 }
 
-bool attention_custom_call(mlir::Operation* op)
+void collect_backward_slice(mlir::Value value,
+    llvm::SmallPtrSetImpl<mlir::Operation*>& operations)
 {
-    if (!named(op, "stablehlo.custom_call") || op->getNumOperands() != 5
-        || op->getNumResults() != 1)
-        return false;
-    const auto target = op->getAttrOfType<mlir::StringAttr>("call_target_name");
-    return target && target.getValue() == "ftlpu.attention";
+    mlir::Operation* operation = value.getDefiningOp();
+    if (!operation || !operations.insert(operation).second) return;
+    for (mlir::Value operand : operation->getOperands())
+        collect_backward_slice(operand, operations);
+}
+
+mlir::Operation* find_backward(mlir::Value value, llvm::StringRef name,
+    llvm::SmallPtrSetImpl<mlir::Operation*>& visited)
+{
+    mlir::Operation* operation = value.getDefiningOp();
+    if (!operation || !visited.insert(operation).second) return nullptr;
+    if (named(operation, name)) return operation;
+    for (mlir::Value operand : operation->getOperands())
+        if (mlir::Operation* found = find_backward(operand, name, visited))
+            return found;
+    return nullptr;
+}
+
+mlir::Operation* find_backward(mlir::Value value, llvm::StringRef name)
+{
+    llvm::SmallPtrSet<mlir::Operation*, 32> visited;
+    return find_backward(value, name, visited);
+}
+
+bool backward_slice_contains(mlir::Value value, llvm::StringRef name)
+{
+    return find_backward(value, name) != nullptr;
+}
+
+struct AttentionMatch {
+    mlir::Operation* output_dot;
+    mlir::Value input;
+    mlir::Value query_weight;
+    mlir::Value key_weight;
+    mlir::Value value_weight;
+    mlir::Value output_weight;
+    int64_t seq_len;
+    int64_t hidden;
+    int64_t query_heads;
+    int64_t kv_heads;
+    int64_t head_dim;
+    float rope_theta;
+    bool causal;
+    llvm::SmallPtrSet<mlir::Operation*, 32> operations;
+};
+
+std::optional<float> find_large_scalar_constant(
+    const llvm::SmallPtrSetImpl<mlir::Operation*>& operations)
+{
+    for (mlir::Operation* operation : operations) {
+        if (!named(operation, "stablehlo.constant")) continue;
+        const auto value = operation->getAttrOfType<mlir::DenseFPElementsAttr>("value");
+        if (!value || !value.isSplat() || value.getNumElements() != 1) continue;
+        const float scalar = value.getSplatValue<llvm::APFloat>().convertToFloat();
+        if (scalar > 1000.0f) return scalar;
+    }
+    return std::nullopt;
 }
 
 mlir::Operation* unary_input(mlir::Operation* op, llvm::StringRef name)
@@ -64,6 +122,95 @@ mlir::Value converted_source(mlir::Value value)
     auto* op = value.getDefiningOp();
     return named(op, "stablehlo.convert") && op->getNumOperands() == 1
         ? op->getOperand(0) : mlir::Value{};
+}
+
+std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_dot)
+{
+    if (!named(output_dot, "stablehlo.dot_general")
+        || output_dot->getNumOperands() != 2 || output_dot->getNumResults() != 1)
+        return std::nullopt;
+
+    const auto result_type =
+        llvm::dyn_cast<mlir::RankedTensorType>(output_dot->getResult(0).getType());
+    const auto output_weight_type =
+        llvm::dyn_cast<mlir::RankedTensorType>(output_dot->getOperand(1).getType());
+    if (!result_type || !output_weight_type || result_type.getRank() != 2
+        || output_weight_type.getRank() != 2)
+        return std::nullopt;
+
+    mlir::Operation* pv_dot =
+        find_backward(output_dot->getOperand(0), "stablehlo.dot_general");
+    if (!pv_dot || pv_dot->getNumOperands() != 2) return std::nullopt;
+    mlir::Operation* qk_dot =
+        find_backward(pv_dot->getOperand(0), "stablehlo.dot_general");
+    mlir::Operation* value_dot =
+        find_backward(pv_dot->getOperand(1), "stablehlo.dot_general");
+    if (!qk_dot || !value_dot || qk_dot->getNumOperands() != 2)
+        return std::nullopt;
+    mlir::Operation* query_dot =
+        find_backward(qk_dot->getOperand(0), "stablehlo.dot_general");
+    mlir::Operation* key_dot =
+        find_backward(qk_dot->getOperand(1), "stablehlo.dot_general");
+    if (!query_dot || !key_dot || query_dot->getNumOperands() != 2
+        || key_dot->getNumOperands() != 2 || value_dot->getNumOperands() != 2)
+        return std::nullopt;
+
+    mlir::Value input = query_dot->getOperand(0);
+    if (key_dot->getOperand(0) != input || value_dot->getOperand(0) != input)
+        return std::nullopt;
+    mlir::Value query_weight = converted_source(query_dot->getOperand(1));
+    mlir::Value key_weight = converted_source(key_dot->getOperand(1));
+    mlir::Value value_weight = converted_source(value_dot->getOperand(1));
+    mlir::Value output_weight = converted_source(output_dot->getOperand(1));
+    if (!query_weight || !key_weight || !value_weight || !output_weight)
+        return std::nullopt;
+
+    const auto input_type = llvm::dyn_cast<mlir::RankedTensorType>(input.getType());
+    const auto qk_lhs_type =
+        llvm::dyn_cast<mlir::RankedTensorType>(qk_dot->getOperand(0).getType());
+    const auto key_weight_storage =
+        llvm::dyn_cast<mlir::RankedTensorType>(key_weight.getType());
+    if (!input_type || !qk_lhs_type || !key_weight_storage
+        || input_type.getRank() != 2 || qk_lhs_type.getRank() != 3
+        || key_weight_storage.getRank() != 2)
+        return std::nullopt;
+
+    const int64_t query_heads = qk_lhs_type.getDimSize(0);
+    const int64_t head_dim = qk_lhs_type.getDimSize(2);
+    if (query_heads <= 0 || head_dim <= 0
+        || key_weight_storage.getDimSize(1) % head_dim != 0)
+        return std::nullopt;
+
+    const bool has_softmax =
+        backward_slice_contains(pv_dot->getOperand(0), "stablehlo.exponential")
+        && backward_slice_contains(pv_dot->getOperand(0), "stablehlo.reduce")
+        && backward_slice_contains(pv_dot->getOperand(0), "stablehlo.divide");
+    if (!has_softmax) return std::nullopt;
+    const bool causal =
+        backward_slice_contains(pv_dot->getOperand(0), "stablehlo.select")
+        && backward_slice_contains(pv_dot->getOperand(0), "stablehlo.compare")
+        && backward_slice_contains(pv_dot->getOperand(0), "stablehlo.iota");
+
+    AttentionMatch match {
+        output_dot,
+        input,
+        query_weight,
+        key_weight,
+        value_weight,
+        output_weight,
+        input_type.getDimSize(0),
+        input_type.getDimSize(1),
+        query_heads,
+        key_weight_storage.getDimSize(1) / head_dim,
+        head_dim,
+        100000.0f,
+        causal,
+        {},
+    };
+    collect_backward_slice(output_dot->getResult(0), match.operations);
+    if (const auto theta = find_large_scalar_constant(match.operations))
+        match.rope_theta = *theta;
+    return match;
 }
 
 std::optional<W8A16FfnMatch> match_w8a16_ffn(mlir::Operation* final_convert)
@@ -169,53 +316,180 @@ public:
 
     void runOnOperation() final
     {
-        llvm::SmallVector<mlir::Operation*> attention_calls;
+        llvm::SmallVector<mlir::Operation*> attention_roots;
         getOperation().walk([&](mlir::Operation* operation) {
-            if (attention_custom_call(operation)) attention_calls.push_back(operation);
+            if (named(operation, "stablehlo.dot_general"))
+                attention_roots.push_back(operation);
         });
         mlir::IRRewriter rewriter(&getContext());
-        for (mlir::Operation* call : attention_calls) {
-            const auto input = llvm::dyn_cast<mlir::RankedTensorType>(call->getOperand(0).getType());
-            const auto query = llvm::dyn_cast<mlir::RankedTensorType>(call->getOperand(1).getType());
-            const auto key = llvm::dyn_cast<mlir::RankedTensorType>(call->getOperand(2).getType());
-            const auto result = llvm::dyn_cast<mlir::RankedTensorType>(call->getResult(0).getType());
-            if (!input || !query || !key || !result || input.getRank() != 2 || query.getRank() != 2
-                || key.getRank() != 2 || result.getRank() != 2) {
-                call->emitError("ftlpu.attention custom call requires rank-2 tensors");
-                signalPassFailure();
-                return;
+        llvm::SmallPtrSet<mlir::Operation*, 32> erased_attention_operations;
+        for (mlir::Operation* root : llvm::reverse(attention_roots)) {
+            if (erased_attention_operations.contains(root)) continue;
+            if (!root->getBlock()) continue;
+            const auto match = match_standard_attention(root);
+            if (!match) continue;
+            erased_attention_operations.insert(
+                match->operations.begin(), match->operations.end());
+            rewriter.setInsertionPoint(root);
+            const auto result_type =
+                llvm::cast<mlir::RankedTensorType>(root->getResult(0).getType());
+            const mlir::Type element_type = result_type.getElementType();
+            const int64_t query_width = match->query_heads * match->head_dim;
+            const int64_t kv_width = match->kv_heads * match->head_dim;
+            const auto tensor_type = [&](llvm::ArrayRef<int64_t> shape) {
+                return mlir::RankedTensorType::get(shape, element_type);
+            };
+            const auto create_reshape = [&](mlir::Value input, mlir::Type type) {
+                mlir::OperationState state(root->getLoc(),
+                    kernel::ReshapeOp::getOperationName());
+                state.addOperands(input);
+                state.addTypes(type);
+                return llvm::cast<kernel::ReshapeOp>(rewriter.create(state));
+            };
+            const auto create_transpose = [&](mlir::Value input, mlir::Type type) {
+                mlir::OperationState state(root->getLoc(),
+                    kernel::TransposeOp::getOperationName());
+                state.addOperands(input);
+                state.addTypes(type);
+                state.addAttribute("permutation",
+                    rewriter.getDenseI64ArrayAttr({1, 0, 2}));
+                return llvm::cast<kernel::TransposeOp>(rewriter.create(state));
+            };
+            const auto create_rope = [&](mlir::Value input, int64_t heads) {
+                mlir::OperationState state(root->getLoc(),
+                    kernel::RopeOp::getOperationName());
+                state.addOperands(input);
+                state.addTypes(input.getType());
+                state.addAttribute("heads", rewriter.getI64IntegerAttr(heads));
+                state.addAttribute("head_dim",
+                    rewriter.getI64IntegerAttr(match->head_dim));
+                state.addAttribute("theta",
+                    rewriter.getF32FloatAttr(match->rope_theta));
+                return llvm::cast<kernel::RopeOp>(rewriter.create(state));
+            };
+            const auto create_gqa = [&](mlir::Value input) {
+                mlir::OperationState state(root->getLoc(),
+                    kernel::GqaBroadcastOp::getOperationName());
+                state.addOperands(input);
+                state.addTypes(tensor_type(
+                    {match->seq_len, match->query_heads, match->head_dim}));
+                state.addAttribute("query_heads",
+                    rewriter.getI64IntegerAttr(match->query_heads));
+                state.addAttribute("kv_heads",
+                    rewriter.getI64IntegerAttr(match->kv_heads));
+                return llvm::cast<kernel::GqaBroadcastOp>(rewriter.create(state));
+            };
+            const auto create_batch_matmul = [&](mlir::Value lhs, mlir::Value rhs,
+                                                  mlir::Type type,
+                                                  bool transpose_rhs,
+                                                  llvm::StringRef role) {
+                mlir::OperationState state(root->getLoc(),
+                    kernel::BatchMatmulOp::getOperationName());
+                state.addOperands({lhs, rhs});
+                state.addTypes(type);
+                state.addAttribute("transpose_rhs",
+                    rewriter.getBoolAttr(transpose_rhs));
+                state.addAttribute("role", rewriter.getStringAttr(role));
+                return llvm::cast<kernel::BatchMatmulOp>(rewriter.create(state));
+            };
+
+            auto query_2d = rewriter.create<kernel::MatmulOp>(root->getLoc(),
+                match->input, match->query_weight,
+                tensor_type({match->seq_len, query_width}),
+                match->seq_len, query_width, match->hidden);
+            auto key_2d = rewriter.create<kernel::MatmulOp>(root->getLoc(),
+                match->input, match->key_weight,
+                tensor_type({match->seq_len, kv_width}),
+                match->seq_len, kv_width, match->hidden);
+            auto value_2d = rewriter.create<kernel::MatmulOp>(root->getLoc(),
+                match->input, match->value_weight,
+                tensor_type({match->seq_len, kv_width}),
+                match->seq_len, kv_width, match->hidden);
+
+            auto query_heads = create_reshape(query_2d.getResult(),
+                tensor_type({match->seq_len, match->query_heads, match->head_dim}));
+            auto key_heads = create_reshape(key_2d.getResult(),
+                tensor_type({match->seq_len, match->kv_heads, match->head_dim}));
+            auto value_heads = create_reshape(value_2d.getResult(),
+                tensor_type({match->seq_len, match->kv_heads, match->head_dim}));
+            auto query_rope = create_rope(query_heads.getResult(), match->query_heads);
+            auto key_rope = create_rope(key_heads.getResult(), match->kv_heads);
+            auto key_gqa = create_gqa(key_rope.getResult());
+            auto value_gqa = create_gqa(value_heads.getResult());
+            const auto bhsd_type =
+                tensor_type({match->query_heads, match->seq_len, match->head_dim});
+            auto query_bhsd = create_transpose(query_rope.getResult(), bhsd_type);
+            auto key_bhsd = create_transpose(key_gqa.getResult(), bhsd_type);
+            auto value_bhsd = create_transpose(value_gqa.getResult(), bhsd_type);
+            const auto score_type =
+                tensor_type({match->query_heads, match->seq_len, match->seq_len});
+            auto scores = create_batch_matmul(query_bhsd.getResult(),
+                key_bhsd.getResult(), score_type, true, "qk");
+
+            mlir::OperationState softmax_state(root->getLoc(),
+                kernel::SoftmaxOp::getOperationName());
+            softmax_state.addOperands(scores.getResult());
+            softmax_state.addTypes(score_type);
+            softmax_state.addAttribute("axis", rewriter.getI64IntegerAttr(-1));
+            softmax_state.addAttribute("scale", rewriter.getF32FloatAttr(
+                1.0f / std::sqrt(static_cast<float>(match->head_dim))));
+            softmax_state.addAttribute("causal", rewriter.getBoolAttr(match->causal));
+            auto probability = llvm::cast<kernel::SoftmaxOp>(
+                rewriter.create(softmax_state));
+            auto context_bhsd = create_batch_matmul(probability.getResult(),
+                value_bhsd.getResult(), bhsd_type, false, "pv");
+            auto context_shd = create_transpose(context_bhsd.getResult(),
+                tensor_type({match->seq_len, match->query_heads, match->head_dim}));
+            auto context = create_reshape(context_shd.getResult(),
+                tensor_type({match->seq_len, query_width}));
+            auto output = rewriter.create<kernel::MatmulOp>(root->getLoc(),
+                context.getResult(), match->output_weight, result_type,
+                match->seq_len, match->hidden, query_width);
+            rewriter.replaceOp(root, output.getResult());
+
+            llvm::SmallVector<mlir::Operation*> block_operations;
+            for (mlir::Operation& operation : getOperation().getBody().front())
+                block_operations.push_back(&operation);
+            for (mlir::Operation* operation : llvm::reverse(block_operations)) {
+                if (match->operations.contains(operation) && operation->use_empty())
+                    rewriter.eraseOp(operation);
             }
-            const auto query_heads = call->getAttrOfType<mlir::IntegerAttr>("query_heads");
-            const auto kv_heads = call->getAttrOfType<mlir::IntegerAttr>("kv_heads");
-            const auto head_dim = call->getAttrOfType<mlir::IntegerAttr>("head_dim");
-            const auto rope_theta = call->getAttrOfType<mlir::FloatAttr>("rope_theta");
-            const auto causal = call->getAttrOfType<mlir::BoolAttr>("causal");
-            if (!query_heads || !kv_heads || !head_dim || !rope_theta || !causal) {
-                call->emitError("ftlpu.attention requires query_heads, kv_heads, head_dim, rope_theta, and causal attributes");
-                signalPassFailure();
-                return;
-            }
-            rewriter.setInsertionPoint(call);
-            mlir::OperationState state(call->getLoc(), kernel::AttentionOp::getOperationName());
-            state.addOperands(call->getOperands());
-            state.addTypes(result);
-            state.addAttributes({
-                rewriter.getNamedAttr("seq_len", rewriter.getI64IntegerAttr(input.getDimSize(0))),
-                rewriter.getNamedAttr("hidden", rewriter.getI64IntegerAttr(input.getDimSize(1))),
-                rewriter.getNamedAttr("query_heads", query_heads),
-                rewriter.getNamedAttr("kv_heads", kv_heads),
-                rewriter.getNamedAttr("head_dim", head_dim),
-                rewriter.getNamedAttr("rope_theta", rope_theta),
-                rewriter.getNamedAttr("causal", causal),
-            });
-            auto lowered = llvm::cast<kernel::AttentionOp>(rewriter.create(state));
-            rewriter.replaceOp(call, lowered.getResult());
         }
 
         llvm::SmallVector<mlir::Operation*> converts;
         getOperation().walk([&](mlir::Operation* operation) {
             if (named(operation, "stablehlo.convert")) converts.push_back(operation);
         });
+        const auto create_ffn_graph = [&](mlir::Location location,
+                                          mlir::Value input,
+                                          mlir::Value gate_weight,
+                                          mlir::Value up_weight,
+                                          mlir::Value down_weight,
+                                          mlir::Type hidden_type,
+                                          mlir::Type result_type,
+                                          int64_t m, int64_t k,
+                                          int64_t hidden, int64_t n) {
+            auto gate = rewriter.create<kernel::MatmulOp>(location,
+                input, gate_weight, hidden_type, m, hidden, k);
+            auto up = rewriter.create<kernel::MatmulOp>(location,
+                input, up_weight, hidden_type, m, hidden, k);
+            mlir::OperationState swish_state(location,
+                kernel::SwishOp::getOperationName());
+            swish_state.addOperands(gate.getResult());
+            swish_state.addTypes(hidden_type);
+            auto swish = llvm::cast<kernel::SwishOp>(
+                rewriter.create(swish_state));
+            mlir::OperationState multiply_state(location,
+                kernel::ElementwiseOp::getOperationName());
+            multiply_state.addOperands({swish.getResult(), up.getResult()});
+            multiply_state.addTypes(hidden_type);
+            multiply_state.addAttribute("kind",
+                rewriter.getStringAttr("multiply"));
+            auto gated = llvm::cast<kernel::ElementwiseOp>(
+                rewriter.create(multiply_state));
+            return rewriter.create<kernel::MatmulOp>(location,
+                gated.getResult(), down_weight, result_type, m, n, hidden);
+        };
         for (mlir::Operation* convert : llvm::reverse(converts)) {
             if (!convert->getBlock()) continue;
             if (auto match = match_w8a16_ffn(convert)) {
@@ -224,24 +498,11 @@ public:
                 auto down_type = llvm::cast<mlir::RankedTensorType>(match->down_weight.getType());
                 auto result_type = llvm::cast<mlir::RankedTensorType>(convert->getResult(0).getType());
                 rewriter.setInsertionPoint(convert);
-                mlir::OperationState state(convert->getLoc(), kernel::FfnOp::getOperationName());
-                state.addOperands({match->input, match->gate_weight, match->up_weight, match->down_weight});
-                state.addTypes(result_type);
-                state.addAttributes({
-                    rewriter.getNamedAttr("m", rewriter.getI64IntegerAttr(input_type.getDimSize(0))),
-                    rewriter.getNamedAttr("k", rewriter.getI64IntegerAttr(input_type.getDimSize(1))),
-                    rewriter.getNamedAttr("hidden", rewriter.getI64IntegerAttr(gate_type.getDimSize(1))),
-                    rewriter.getNamedAttr("n", rewriter.getI64IntegerAttr(down_type.getDimSize(1))),
-                    rewriter.getNamedAttr("gate_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("up_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("hidden_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("hidden_zero_point", rewriter.getI64IntegerAttr(0)),
-                    rewriter.getNamedAttr("down_lhs_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("down_rhs_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("output_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("output_zero_point", rewriter.getI64IntegerAttr(0)),
-                });
-                auto lowered = llvm::cast<kernel::FfnOp>(rewriter.create(state));
+                auto lowered = create_ffn_graph(convert->getLoc(),
+                    match->input, match->gate_weight, match->up_weight,
+                    match->down_weight, match->gate_dot->getResult(0).getType(),
+                    result_type, input_type.getDimSize(0), input_type.getDimSize(1),
+                    gate_type.getDimSize(1), down_type.getDimSize(1));
                 rewriter.replaceOp(convert, lowered.getResult());
                 for (mlir::Operation* op : {match->down_dot, match->swiglu_mul,
                          match->gated_mul, match->logistic, match->gate_dot, match->up_dot})
@@ -263,28 +524,14 @@ public:
                 auto result_type = llvm::cast<mlir::RankedTensorType>(
                     match->final_convert->getResult(0).getType());
                 rewriter.setInsertionPoint(match->final_convert);
-                mlir::OperationState state(match->final_convert->getLoc(),
-                    kernel::FfnOp::getOperationName());
-                state.addOperands({match->swiglu.gate_dot->getOperand(0),
+                auto lowered = create_ffn_graph(match->final_convert->getLoc(),
+                    match->swiglu.gate_dot->getOperand(0),
                     match->swiglu.gate_dot->getOperand(1),
                     match->swiglu.up_dot->getOperand(1),
-                    match->down_dot->getOperand(1)});
-                state.addTypes(result_type);
-                state.addAttributes({
-                    rewriter.getNamedAttr("m", rewriter.getI64IntegerAttr(input_type.getDimSize(0))),
-                    rewriter.getNamedAttr("k", rewriter.getI64IntegerAttr(input_type.getDimSize(1))),
-                    rewriter.getNamedAttr("hidden", rewriter.getI64IntegerAttr(gate_type.getDimSize(1))),
-                    rewriter.getNamedAttr("n", rewriter.getI64IntegerAttr(down_type.getDimSize(1))),
-                    rewriter.getNamedAttr("gate_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("up_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("hidden_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("hidden_zero_point", rewriter.getI64IntegerAttr(0)),
-                    rewriter.getNamedAttr("down_lhs_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("down_rhs_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("output_scale", rewriter.getF32FloatAttr(1.0f)),
-                    rewriter.getNamedAttr("output_zero_point", rewriter.getI64IntegerAttr(0)),
-                });
-                auto lowered = llvm::cast<kernel::FfnOp>(rewriter.create(state));
+                    match->down_dot->getOperand(1),
+                    match->swiglu.gate_dot->getResult(0).getType(), result_type,
+                    input_type.getDimSize(0), input_type.getDimSize(1),
+                    gate_type.getDimSize(1), down_type.getDimSize(1));
                 rewriter.replaceOp(match->final_convert, lowered.getResult());
                 rewriter.eraseOp(match->down_dot);
                 for (mlir::Operation* op : {match->swiglu.final_convert,

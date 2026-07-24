@@ -1,10 +1,13 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
+#include "ftlpu/software/runtime/performance.hpp"
+#include "ftlpu/software/runtime/schedule_trace.hpp"
 
 #include "ftlpu/core/fp16.hpp"
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -20,7 +23,7 @@ constexpr std::size_t kQueryHeads = 9;
 constexpr std::size_t kKvHeads = 3;
 constexpr std::size_t kHeadDim = 64;
 constexpr std::size_t kTile = 32;
-constexpr std::size_t kProjectionEndCycle = 32508;
+constexpr std::size_t kProjectionEndCycle = 22238;
 constexpr float kRopeTheta = 100000.0f;
 constexpr std::array<std::array<std::size_t, 16>, 2> kQueryIwSlices {{
     {{0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33}},
@@ -175,6 +178,8 @@ float expected(Projection projection, std::size_t token, std::size_t column)
 float read_probability(const ftlpu::TspSliceSystem& system, std::size_t query_head,
     std::size_t query, std::size_t key)
 {
+    constexpr std::array<std::size_t, kQueryHeads> kLocalMxm {
+        0, 1, 0, 0, 1, 0, 1, 0, 1};
     const std::size_t query_block = query / kTile;
     const std::size_t physical = query % kTile;
     const std::size_t tile = physical / 8;
@@ -183,10 +188,11 @@ float read_probability(const ftlpu::TspSliceSystem& system, std::size_t query_he
     const auto hemisphere = static_cast<ftlpu::Hemisphere>(kv_head % 2);
     const std::size_t address = (query_head * (kSeqLen / kTile) + query_block)
         * kSeqLen + key;
+    const std::size_t low_slice = kLocalMxm[query_head] * 2;
     const auto low = system.read_mem_sram_lane_byte(
-        hemisphere, 16, tile, address, lane);
+        hemisphere, low_slice, tile, address, lane);
     const auto high = system.read_mem_sram_lane_byte(
-        hemisphere, 17, tile, address, lane);
+        hemisphere, low_slice + 1, tile, address, lane);
     return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
         | (static_cast<std::uint16_t>(high) << 8)).to_float();
 }
@@ -262,8 +268,27 @@ try {
         throw std::runtime_error("usage: compiled_smollm2_attention_softmax_runtime_test program.ftlpu");
     const auto program = ftlpu::software::runtime::read_binary_program(
         std::filesystem::path(argv[1]));
-    if (program.bindings.size() != 6 || program.max_cycle <= kProjectionEndCycle)
+    if (program.bindings.size() != 8 || program.max_cycle <= kProjectionEndCycle)
         throw std::logic_error("attention binary is missing bindings or projection commands");
+    std::size_t causal_mask_bindings = 0;
+    for (const auto& binding : program.bindings) {
+        if (binding.access != ftlpu::software::runtime::BindingAccess::Internal)
+            continue;
+        const bool valid_mask_plane = binding.slices
+            == std::vector<std::uint16_t>({24, 25, 26, 27})
+            || binding.slices == std::vector<std::uint16_t>({20, 21, 22, 23});
+        if (binding.layout
+                != ftlpu::software::runtime::BindingLayout::Fp32CausalMaskTile
+            || binding.shape != std::vector<std::uint64_t>({kTile - 1, kTile})
+            || !valid_mask_plane || binding.base_row != 8128)
+            throw std::logic_error("attention binary has an invalid causal-mask binding");
+        ++causal_mask_bindings;
+    }
+    if (causal_mask_bindings != 2)
+        throw std::logic_error("attention binary is missing its internal causal mask");
+    if (const auto* trace_path = std::getenv("FTLPU_SCHEDULE_TRACE")) {
+        ftlpu::software::runtime::write_schedule_trace_csv(program, trace_path);
+    }
 
     std::vector<std::uint8_t> input;
     input.reserve(kSeqLen * kHidden * 2);
@@ -311,6 +336,7 @@ try {
     constexpr std::size_t sample_queries[] = {0, 17, 31, 32, 79, 127};
     std::size_t probability_nonzero = 0;
     std::size_t probability_rows = 0;
+    std::size_t causal_zero_checked = 0;
     for (std::size_t head = 0; head < kQueryHeads; ++head) {
         for (std::size_t query : sample_queries) {
             float sum = 0.0f;
@@ -320,8 +346,17 @@ try {
                 const float diagonal = read_diagonal_probability(*system, head, query, key);
                 if (!std::isfinite(probability) || probability < 0.0f)
                     throw std::logic_error("attention softmax produced an invalid probability");
+                if (key > query) {
+                    if (probability != 0.0f)
+                        throw std::logic_error("causal softmax produced a nonzero future probability");
+                    ++causal_zero_checked;
+                }
                 if (packed != probability)
-                    throw std::logic_error("packed probability does not match softmax output");
+                    throw std::logic_error("packed probability mismatch head="
+                        + std::to_string(head) + " query=" + std::to_string(query)
+                        + " key=" + std::to_string(key)
+                        + " probability=" + std::to_string(probability)
+                        + " packed=" + std::to_string(packed));
                 if (diagonal != probability)
                     throw std::logic_error("SXM diagonal probability mismatch: head="
                         + std::to_string(head) + " query=" + std::to_string(query)
@@ -340,6 +375,8 @@ try {
     }
     if (probability_nonzero == 0)
         throw std::logic_error("attention softmax produced only zero probabilities");
+    if (causal_zero_checked == 0)
+        throw std::logic_error("attention test did not check any causal-mask entries");
     std::size_t context_checked = 0;
     std::size_t context_nonzero = 0;
     for (std::size_t head = 0; head < kQueryHeads; ++head) {
@@ -399,11 +436,14 @@ try {
     }
     if (output_nonzero == 0)
         throw std::logic_error("O projection produced only zero output values");
+    ftlpu::software::runtime::print_runtime_performance(
+        program, program.max_cycle + 64, std::cout);
     std::cout << "Compiled attention Q/K/V projection + RoPE passed: " << checked
               << " sampled FP16 values, nonzero=" << nonzero
               << ", projection_end_cycle=" << kProjectionEndCycle
               << "; softmax + SXM diagonal layout passed: rows=" << probability_rows
               << ", nonzero=" << probability_nonzero
+              << ", causal_zero_checked=" << causal_zero_checked
               << "; PV context passed: values=" << context_checked
               << ", nonzero=" << context_nonzero
               << "; O projection passed: values=" << output_checked

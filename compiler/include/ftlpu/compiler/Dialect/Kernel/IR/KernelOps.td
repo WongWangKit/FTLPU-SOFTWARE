@@ -30,6 +30,75 @@ def MatmulOp : FTLPU_Kernel_Op<"matmul", [Pure]> {
   let hasVerifier = 1;
 }
 
+def ReshapeOp : FTLPU_Kernel_Op<"reshape", [Pure]> {
+  let summary = "Logical tensor reshape preserved in LPU Kernel IR";
+  let arguments = (ins AnyRankedTensor:$input);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def TransposeOp : FTLPU_Kernel_Op<"transpose", [Pure]> {
+  let summary = "Logical tensor permutation preserved for layout planning";
+  let arguments = (ins AnyRankedTensor:$input, DenseI64ArrayAttr:$permutation);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def RopeOp : FTLPU_Kernel_Op<"rope", [Pure]> {
+  let summary = "Rotary positional embedding over one Q or K tensor";
+  let arguments = (ins AnyRankedTensor:$input, I64Attr:$heads,
+      I64Attr:$head_dim, F32Attr:$theta);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def GqaBroadcastOp : FTLPU_Kernel_Op<"gqa_broadcast", [Pure]> {
+  let summary = "Broadcast KV heads to query heads for grouped-query attention";
+  let arguments = (ins AnyRankedTensor:$input, I64Attr:$query_heads,
+      I64Attr:$kv_heads);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def BatchMatmulOp : FTLPU_Kernel_Op<"batch_matmul", [Pure]> {
+  let summary = "Rank-3 batched matrix multiplication";
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+      BoolAttr:$transpose_rhs, StrAttr:$role);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def SoftmaxOp : FTLPU_Kernel_Op<"softmax", [Pure]> {
+  let summary = "Row softmax with optional causal masking";
+  let arguments = (ins AnyRankedTensor:$input, I64Attr:$axis,
+      F32Attr:$scale, BoolAttr:$causal);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def SwishOp : FTLPU_Kernel_Op<"swish", [Pure]> {
+  let summary = "Elementwise x times sigmoid(x) activation";
+  let arguments = (ins AnyRankedTensor:$input);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def ElementwiseOp : FTLPU_Kernel_Op<"elementwise", [Pure]> {
+  let summary = "Binary elementwise operation";
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+      StrAttr:$kind);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def SwigluOp : FTLPU_Kernel_Op<"swiglu", [Pure]> {
   let summary = "Two MXM projections followed by a quantized VXM SwiGLU";
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$gate_weight,

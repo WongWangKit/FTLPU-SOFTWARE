@@ -1,6 +1,9 @@
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 
+#include "ftlpu/system/tsp_slice_system.hpp"
+
 // Keep this translation unit rebuilt when BinaryProgram ABI evolves.
+#include <bit>
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
@@ -49,6 +52,36 @@ void CModelRuntime::load(const BinaryProgram& program)
     load_queue_programs_into_icu(program.queues, system_.icu());
     loaded_max_cycle_ = program.max_cycle;
     bindings_ = program.bindings;
+    for (const BinaryBinding& binding : bindings_) {
+        if (binding.access != BindingAccess::Internal
+            || binding.layout != BindingLayout::Fp32CausalMaskTile)
+            continue;
+        require_matrix_binding(binding);
+        if (binding.element_type != BindingElementType::F32
+            || binding.slices.size() != sizeof(float)
+            || binding.shape[0] + 1 != binding.shape[1])
+            throw std::logic_error("invalid internal causal-mask binding");
+        const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
+        const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
+        const std::size_t stride =
+            static_cast<std::size_t>(std::abs(binding.address_stride));
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t local_key = row + 1;
+            const std::size_t address =
+                static_cast<std::size_t>(binding.base_row) + row * stride;
+            for (std::size_t query_lane = 0; query_lane < columns; ++query_lane) {
+                const float mask = local_key <= query_lane ? 0.0f : -1.0e9f;
+                const std::uint32_t bits = std::bit_cast<std::uint32_t>(mask);
+                for (std::size_t byte = 0; byte < binding.slices.size(); ++byte) {
+                    for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
+                        write_sram_byte(system_, hemisphere, binding.slices[byte],
+                            address, query_lane,
+                            static_cast<std::uint8_t>(bits >> (8 * byte)));
+                    });
+                }
+            }
+        }
+    }
 }
 
 const BinaryBinding& CModelRuntime::find_binding(BindingAccess access, std::size_t index) const
@@ -123,10 +156,10 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
         }
         return;
     }
-    if (binding.layout == BindingLayout::W8A16MxmWeightStriped
+    if ((binding.layout == BindingLayout::W8A16MxmWeightStriped
+            || binding.layout == BindingLayout::W8A16MxmWeightWaveStriped)
         && binding.element_type == BindingElementType::I8
         && binding.slices.size() == 8) {
-        const bool down_projection = rows == 1536 && columns == 576;
         for (std::size_t k = 0; k < rows; ++k) {
             for (std::size_t n = 0; n < columns; ++n) {
                 const std::size_t local = n % 32;
@@ -134,8 +167,9 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
                 const std::size_t stream = local % 8;
                 std::size_t address = static_cast<std::size_t>(binding.base_row);
                 Hemisphere hemisphere = Hemisphere::East;
-                if (down_projection) {
-                    address += ((n / 64) * (rows / 32) + k / 32) * 8
+                if (binding.layout == BindingLayout::W8A16MxmWeightWaveStriped) {
+                    hemisphere = static_cast<Hemisphere>((n / 64) % 2);
+                    address += ((n / 128) * (rows / 32) + k / 32) * 8
                         + ((n % 64) / 32) * 4 + pulse;
                 } else {
                     hemisphere = ((n / 32) % 2) == 0
@@ -200,12 +234,16 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
         for (std::size_t row = 0; row < rows; ++row) {
             for (std::size_t column = 0; column < columns; ++column) {
                 const std::size_t local_mxm = (column % 64) / 32;
+                const bool dual_hemisphere = (binding.hemisphere_mask & 3) == 3;
+                const auto hemisphere = dual_hemisphere
+                    ? static_cast<Hemisphere>((column / 64) % 2)
+                    : Hemisphere::East;
                 const std::size_t address = static_cast<std::size_t>(binding.base_row)
-                    + (column / 64) * rows + row;
+                    + (dual_hemisphere ? column / 128 : column / 64) * rows + row;
                 const std::size_t offset = (row * columns + column) * 2;
-                result[offset] = read_sram_byte(system_, Hemisphere::East,
+                result[offset] = read_sram_byte(system_, hemisphere,
                     binding.slices[local_mxm * 2], address, column % 32);
-                result[offset + 1] = read_sram_byte(system_, Hemisphere::East,
+                result[offset + 1] = read_sram_byte(system_, hemisphere,
                     binding.slices[local_mxm * 2 + 1], address, column % 32);
             }
         }

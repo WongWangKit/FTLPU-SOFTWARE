@@ -9,9 +9,10 @@ def ScheduleDialect : Dialect {
 class FTLPU_Schedule_Op<string mnemonic, list<Trait> traits = []>
     : Op<ScheduleDialect, mnemonic, traits>;
 
-def MemQueueOp : FTLPU_Schedule_Op<"mem_queue", [MemoryEffects<[MemWrite]>]> {
-  let summary = "Exact MEM ICU queue issue";
-  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
+def MemTransferOp : FTLPU_Schedule_Op<"mem_transfer", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Cycle-accurate transfer through a physical MEM slice";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$hemisphere, I64Attr:$slice,
+      StrAttr:$opcode,
       I64Attr:$address, I64Attr:$packed_stream, I64Attr:$repeat_count,
       I64Attr:$repeat_interval, I64Attr:$address_stride,
       StrAttr:$accumulator_destination);
@@ -19,9 +20,9 @@ def MemQueueOp : FTLPU_Schedule_Op<"mem_queue", [MemoryEffects<[MemWrite]>]> {
   let hasVerifier = 1;
 }
 
-def MxmQueueOp : FTLPU_Schedule_Op<"mxm_queue", [MemoryEffects<[MemWrite]>]> {
-  let summary = "Exact MXM ICU queue issue";
-  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
+def MxmIssueOp : FTLPU_Schedule_Op<"mxm_issue", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Cycle-accurate issue to a physical MXM unit";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$unit_id, StrAttr:$opcode,
       I64Attr:$weight_buffer, I64Attr:$weight_column, I64Attr:$activation_stream_base,
       I64Attr:$output_stream_base, I64Attr:$repeat_count,
       I64Attr:$repeat_interval);

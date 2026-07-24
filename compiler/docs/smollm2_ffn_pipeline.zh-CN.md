@@ -2,6 +2,73 @@
 
 ![SmolLM2-135M FFN 流水线](smollm2_ffn_pipeline.svg)
 
+## 调度策略
+
+编译器保留两套通用调度策略：
+
+- `--ffn-schedule tail` 是默认策略，完整保留已有 FFN 调度。对于
+  `seq_len=128`，首个 SwiGLU 在 cycle 55,355 发射，CModel 程序结束于
+  cycle 92,573。
+- `--ffn-schedule fused` 将已经完成的 Gate/Up tile 与后续 projection
+  重叠。首个 SwiGLU 提前到 cycle 2,363，程序结束于 cycle 86,685，减少
+  5,888 cycles（6.36%）。
+
+![融合调度的 seq_len=128 FFN 流水线](smollm2_ffn_fused_pipeline.svg)
+
+fused 策略不使用尚未建模完整的 ACC 直连 VXM 旁路。最后一个 K partial
+中，东半球 MXM 使用 `W8..W15`，西半球 MXM 使用 `W16..W23`。
+`accumulate -> stream + clear` 将完整的 FP32 Gate/Up tile 写入普通 MEM
+临时 byte plane：Gate 使用 local slices `1/5/9/13`，Up 使用
+`2/6/10/14`。VXM allocator 只有在整条 repeat MEM write queue 释放后才会
+读这些临时区，同时避开每个 4-cycle weight-dequant 资源窗口，最后通过
+`E30/E31` 写回 FP16 hidden。ACC 到 MEM 的 transport 计算包含 fabric
+在周期末 commit 所需的额外一拍。
+
+两套策略由同一套 shape-driven lowering 生成。`seq_len=128` 的 fused
+binary 已在 CModel 上运行，并与 CPU reference 的 73,728 个 FP16 数值
+逐一一致，其中 72,633 个输出非零。
+
+## CModel 实测利用率
+
+下表来自 CModel performance monitor 对编译后 `seq_len=128` binary 的实际
+执行统计。统计包含 runtime 末尾的 64 个 drain cycles，因此 tail 共采样
+92,637 cycles，fused 共采样 86,749 cycles。`array utilization` 的分母是
+全部采样周期内的 MXM cell 容量；`active density` 会从分母中去掉完全空闲的周期。
+
+| MXM | Active cycles（tail/fused） | Tail array util. | Fused array util. | Tail active density | Fused active density |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MXM0 | 86,052 / 86,052 | 92.85% | 99.16% | 99.96% | 99.96% |
+| MXM1 | 86,052 / 86,052 | 92.85% | 99.16% | 99.96% | 99.96% |
+| MXM2 | 79,902 / 79,902 | 86.22% | 92.07% | 99.96% | 99.96% |
+| MXM3 | 79,902 / 79,902 | 86.22% | 92.07% | 99.96% | 99.96% |
+| 四个 MXM 平均 | - | 89.54% | 95.62% | 99.96% | 99.96% |
+
+fused 与 tail 完成相同的 MXM cell 工作，但总周期更少，因此全程序 MXM 平均
+利用率提高了 6.08 个百分点；MXM 一旦开始工作，内部阵列密度仍接近饱和。
+
+| 资源 | 策略 | 全程序利用率 | Active density | Stall rate | Peak |
+| --- | --- | ---: | ---: | ---: | ---: |
+| VXM ALU | tail | 15.91% | 74.19% | 0.00% | 512/512 |
+| VXM ALU | fused | 16.99% | 72.67% | 0.00% | 512/512 |
+
+VXM 利用率以每周期 512 个 lane-ALU execution slot 为总容量。fused 的实际
+执行工作量不变，但非空闲 VXM 周期增加了 414 个，因此全程序利用率提高，
+active density 略微下降。
+
+| SR fabric | 策略 | Link BW | East BW | West BW | Staged-write util. | Active density | Peak link bytes/cycle |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 东半球 | tail | 4.94% | 5.57% | 4.31% | 5.90% | 4.94% | 4,928/24,576 |
+| 东半球 | fused | 5.24% | 5.95% | 4.53% | 6.30% | 5.24% | 6,528/24,576 |
+| 西半球 | tail | 4.57% | 5.11% | 4.03% | 5.47% | 4.91% | 4,928/24,576 |
+| 西半球 | fused | 4.85% | 5.46% | 4.23% | 5.84% | 5.23% | 6,528/24,576 |
+
+SR bandwidth utilization 的分母是模型定义的各半球 SR-fabric 链路容量，而不是仅统计有
+流量的周期。CModel 目前还没有提供容量归一化的 MEM 和 SXM utilization
+counter，因此本文不根据流水图推测这两项百分比。
+
+Accumulator bank 仍拆成独立行，颜色表示具体操作：紫色表示
+`accumulate -> SRAM`，红色表示 `accumulate -> stream + clear`。
+
 该图是 `ftlpu-stream-to-schedule` 通用 W8A16 FFN lowering 的一个实例。编译器根据
 IR shape 和 `LPUTargetModel` 推导循环次数、物理行地址、slice 布局、传输延迟和
 cycle 间隔；编译器源码中没有 SmolLM2 尺寸专用分支。
@@ -42,9 +109,16 @@ local hidden slices 21/22/23/29。
 单个 32x32 MXM weight tile 的 dequantization 只占用 4 个发射周期：VXM 每周期处理
 8 列。Gate/Up 与 East/West 一共形成 4 个独立 weight tile。由于它们共享同一组 16 条
 VXM ALU ICU queue，当前排程将四组 dequant 错开发射，合计形成 16-cycle 的发射窗口；
-这是四次很快的 dequant，而不是一次 dequant 需要 16 cycles。
+这是四次很快的 dequant，而不是一次 dequant 需要 16 cycles。Down 也使用相同的
+连续 4-cycle dequant 和 16-stream IW load，包括与上一个 reduction 最后一个 M tile
+重叠的 weight prefetch。Activation 只在实际 IW 冲突窗口内于 `E0/E1` 和
+`E16/E17` 之间切换。
 
-图中的第二段刻意描述当前 lowering 实际生成的调度，而不是尚未实现的 accumulator 直连 stream 方案。最后一个 K partial（`P17`）仍先写入本半球的 accumulator SRAM，再通过 `W0..W7` 读出。当前没有固定大小的 SwiGLU overlap batch：编译器保守地等待所有 projection pair 完成，再在 cycle 16,469 发射首个“行 × 半球”Swish event，之后顺序发射其余 event。待明确双半球共享 VXM 的资源策略后，再将 accumulator-to-stream 作为一套独立的真实调度实现并绘制。
+第二张图使用一条连续时间轴展示 projection 完成到首个 SwiGLU 的过程。在 tail 图中，
+所有 Gate/Up projection pair 完成后，最后一个 partial 保留在 accumulator SRAM，
+随后通过 `W0..W7` 送入 SwiGLU。在 fused 图中，同一张图跟踪一个已经完成的
+accumulator tile，依次经过 `stream + clear`、临时 MEM staging 和 SwiGLU；与此同时，
+后续 projection 仍在执行。
 
 当前 tail 使用 `W0..W7` 读取 accumulator，并写入 local hidden slices 21/22/23/29。
 在 scheduler 能够对共享 VXM、MEM、stream 与 transport 资源做精确 cycle 预约前，

@@ -1,0 +1,14 @@
+{
+  "streams": {
+    "streams_per_direction": 40,
+    "encoded_streams": 80
+  },
+  "throughput": {
+    "mxm_pipeline_rows": 6,
+    "vxm_weight_to_iw_latency": 10,
+    "mxm0_accumulator_latency": 7,
+    "mxm1_accumulator_latency": 6,
+    "accumulator_to_vxm_latency": 14,
+    "swiglu_write_latency": 11
+  }
+}

@@ -13,11 +13,17 @@ constexpr isa::EncodedIcuCommand kInstructionCommand =
 
 QueueCommand encode_mem_command(const MemInstruction& instruction)
 {
+    const auto encoded = isa::encode_mem_instruction(instruction);
     return QueueCommand {
         kInstructionCommand,
         InstructionKind::Mem,
-        1,
-        {isa::encode_mem_instruction(instruction), 0, 0},
+        static_cast<std::uint16_t>((encoded >> 32) == 0 ? 1 : 2),
+        {
+            static_cast<std::uint32_t>(encoded),
+            static_cast<std::uint32_t>(encoded >> 32),
+            0,
+            0,
+        },
     };
 }
 
@@ -370,12 +376,16 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
             }
 
             switch (queue.kind) {
-            case QueueKind::Mem:
-                if (command.instruction_kind != InstructionKind::Mem || command.word_count != 1) {
-                    throw std::logic_error("MEM queue command does not carry one MEM instruction word");
+            case QueueKind::Mem: {
+                if (command.instruction_kind != InstructionKind::Mem
+                    || command.word_count < 1 || command.word_count > 2) {
+                    throw std::logic_error("MEM queue command must carry one or two MEM instruction words");
                 }
-                icu.enqueue_mem(queue.index, isa::decode_mem_instruction(command.words[0]));
+                const auto encoded = static_cast<isa::EncodedMemInstruction>(command.words[0])
+                    | (static_cast<isa::EncodedMemInstruction>(command.words[1]) << 32);
+                icu.enqueue_mem(queue.index, isa::decode_mem_instruction(encoded));
                 break;
+            }
             case QueueKind::MxmLoad:
             case QueueKind::MxmCompute: {
                 if (command.instruction_kind != InstructionKind::Mxm || command.word_count != 1) {

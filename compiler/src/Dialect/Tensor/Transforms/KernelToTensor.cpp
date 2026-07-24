@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
+#include "ftlpu/compiler/Dialect/Tensor/Analysis/physical_memory_allocator.hpp"
 #include "ftlpu/compiler/Dialect/Tensor/IR/tensor_dialect.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
@@ -209,6 +210,23 @@ mlir::DictionaryAttr make_profile_placement(mlir::OpBuilder& builder,
     });
 }
 
+mlir::DictionaryAttr make_task_allocation(mlir::OpBuilder& builder,
+    const Allocation& allocation, mlir::DictionaryAttr placement)
+{
+    return builder.getDictionaryAttr({
+        builder.getNamedAttr("address", make_address_attr(builder, allocation)),
+        builder.getNamedAttr("placement", placement),
+        builder.getNamedAttr("bytes", builder.getI64IntegerAttr(allocation.bytes)),
+    });
+}
+
+mlir::ArrayAttr make_task_allocations(mlir::OpBuilder& builder,
+    std::initializer_list<mlir::DictionaryAttr> allocations)
+{
+    llvm::SmallVector<mlir::Attribute> attributes(allocations.begin(), allocations.end());
+    return builder.getArrayAttr(attributes);
+}
+
 mlir::DictionaryAttr make_attention_placement(mlir::OpBuilder& builder,
     llvm::StringRef kind, llvm::ArrayRef<int64_t> slices, int64_t base_row,
     int64_t instruction_count, llvm::StringRef hemisphere)
@@ -246,7 +264,13 @@ public:
         }
 
         EastMemoryAllocator allocator;
-        const target::LPUTargetModel target;
+        auto target_model =
+            target::LPUTargetModel::from_operation(function);
+        if (mlir::failed(target_model)) {
+            signalPassFailure();
+            return;
+        }
+        const target::LPUTargetModel& target = *target_model;
         llvm::DenseMap<mlir::Value, Allocation> allocations;
         llvm::DenseMap<mlir::Value, int64_t> last_uses;
         llvm::DenseMap<mlir::Operation*, int64_t> ordinals;
@@ -330,9 +354,10 @@ public:
             for (int64_t index = 0; index < target.memory().w8a16_weight_slice_count; ++index)
                 weight_slices.push_back(index * target.memory().w8a16_weight_slice_stride);
             llvm::SmallVector<int64_t> output_weight_slices = weight_slices;
-            // Slice 16 holds softmax probabilities until PV completes, so keep
-            // the concurrently live output projection weights on slice 2.
+            // Keep the prefetching O-projection weight lane off the context
+            // planes without overlapping softmax's live probability range.
             output_weight_slices[4] = 2;
+            output_weight_slices[5] = 18;
             const llvm::SmallVector<int64_t> activation_slices {32, 33, 34, 35};
             const llvm::SmallVector<int64_t> output_slices {0, 1, 2, 3};
             const int64_t q_weight_rows = attention_weight_rows(query_width);
@@ -343,6 +368,60 @@ public:
             const int64_t query_rows = op.getQueryHeads() * blocks * target.throughput().tile_rows;
             const int64_t score_rows = op.getQueryHeads() * blocks * op.getSeqLen();
             const int64_t context_rows = op.getQueryHeads() * op.getSeqLen();
+            llvm::SmallVector<int64_t, 36> scratch_candidates;
+            for (int64_t slice = 0;
+                 slice < target.memory().accumulator_slice_base; ++slice)
+                scratch_candidates.push_back(slice);
+            tensor::PhysicalMemoryAllocator physical_allocator(target);
+            const auto probability_pack_slices = target.attention_query_iw_slices(1);
+            if (mlir::failed(physical_allocator.reserve({"probability_pack",
+                    llvm::SmallVector<int64_t, 16>(
+                    probability_pack_slices.begin(), probability_pack_slices.end()),
+                    6000,
+                    static_cast<int64_t>(op.getQueryHeads()) * blocks
+                        * (static_cast<int64_t>(op.getSeqLen())
+                            / target.throughput().lanes_per_tile),
+                    3, 5}))) {
+                op.emitError("failed to reserve the attention probability-pack layout");
+                signalPassFailure();
+                return;
+            }
+            const auto allocate_scratch = [&](llvm::StringRef name,
+                                              int64_t slice_count,
+                                              int64_t base_row,
+                                              int64_t rows,
+                                              int64_t live_start,
+                                              int64_t live_end)
+                -> mlir::FailureOr<tensor::PhysicalAllocation> {
+                return physical_allocator.allocate({name.str(), slice_count,
+                    base_row, rows, live_start, live_end, scratch_candidates});
+            };
+            // Probability remains live while probability-pack reads it. Allocate
+            // it first so the allocator keeps it off the pack destination planes.
+            auto probability0 = allocate_scratch(
+                "probability_mxm0", 2, 0, score_rows, 2, 5);
+            auto probability1 = allocate_scratch(
+                "probability_mxm1", 2, 0, score_rows, 2, 5);
+            auto score0 = allocate_scratch(
+                "score_mxm0", 4, 3000, score_rows, 2, 3);
+            auto score1 = allocate_scratch(
+                "score_mxm1", 4, 3000, score_rows, 2, 3);
+            auto exp0 = allocate_scratch(
+                "exp_mxm0", 4, 3000, score_rows, 2, 3);
+            auto exp1 = allocate_scratch(
+                "exp_mxm1", 4, 3000, score_rows, 2, 3);
+            auto mask0 = allocate_scratch(
+                "causal_mask_mxm0", 4, 8128, tile - 1, 2, 3);
+            auto mask1 = allocate_scratch(
+                "causal_mask_mxm1", 4, 8128, tile - 1, 2, 3);
+            if (mlir::failed(probability0) || mlir::failed(probability1)
+                || mlir::failed(score0) || mlir::failed(score1)
+                || mlir::failed(exp0) || mlir::failed(exp1)
+                || mlir::failed(mask0) || mlir::failed(mask1)) {
+                op.emitError("attention scratch memory allocation failed");
+                signalPassFailure();
+                return;
+            }
             rewriter.setInsertionPoint(op);
             const auto plan = rewriter.getDictionaryAttr({
                 rewriter.getNamedAttr("input", make_attention_placement(rewriter,
@@ -368,11 +447,23 @@ public:
                     op.getKvHeads() * (op.getHeadDim() / tile) * blocks
                         * target.throughput().tile_rows, "both")),
                 rewriter.getNamedAttr("score", make_attention_placement(rewriter,
-                    "fp16_score_block", llvm::ArrayRef<int64_t>({8, 9, 10, 11}), 3000, score_rows, "both")),
+                    "fp16_score_block", score0->slices, 3000, score_rows, "both")),
+                rewriter.getNamedAttr("score_mxm1", make_attention_placement(rewriter,
+                    "fp16_score_block", score1->slices, 3000, score_rows, "both")),
                 rewriter.getNamedAttr("exp", make_attention_placement(rewriter,
-                    "fp16_score_block", llvm::ArrayRef<int64_t>({12, 13, 14, 15}), 3000, score_rows, "both")),
+                    "fp16_score_block", exp0->slices, 3000, score_rows, "both")),
+                rewriter.getNamedAttr("exp_mxm1", make_attention_placement(rewriter,
+                    "fp16_score_block", exp1->slices, 3000, score_rows, "both")),
+                rewriter.getNamedAttr("causal_mask", make_attention_placement(rewriter,
+                    "fp32_causal_mask_tile", mask0->slices,
+                    8128, tile - 1, "both")),
+                rewriter.getNamedAttr("causal_mask_mxm1", make_attention_placement(rewriter,
+                    "fp32_causal_mask_tile", mask1->slices,
+                    8128, tile - 1, "both")),
                 rewriter.getNamedAttr("probability", make_attention_placement(rewriter,
-                    "fp16_score_block", llvm::ArrayRef<int64_t>({16, 17}), 0, score_rows, "both")),
+                    "fp16_score_block", probability0->slices, 0, score_rows, "both")),
+                rewriter.getNamedAttr("probability_mxm1", make_attention_placement(rewriter,
+                    "fp16_score_block", probability1->slices, 0, score_rows, "both")),
                 rewriter.getNamedAttr("probability_pack", make_attention_placement(rewriter,
                     "fp16_probability_x16", target.attention_query_iw_slices(1), 6000,
                     op.getQueryHeads() * blocks
@@ -484,59 +575,133 @@ public:
                 signalPassFailure(); return;
             }
             rewriter.setInsertionPoint(op);
-            mlir::OperationState state(op.getLoc(), tensor::FfnOp::getOperationName());
-            state.addOperands({op.getInput(), op.getGateWeight(), op.getUpWeight(), op.getDownWeight()});
-            state.addTypes(op.getResult().getType());
-            state.addAttributes({
-                rewriter.getNamedAttr("m", op.getMAttr()),
-                rewriter.getNamedAttr("k", op.getKAttr()),
-                rewriter.getNamedAttr("hidden", op.getHiddenAttr()),
-                rewriter.getNamedAttr("n", op.getNAttr()),
-                rewriter.getNamedAttr("gate_scale", op.getGateScaleAttr()),
-                rewriter.getNamedAttr("up_scale", op.getUpScaleAttr()),
-                rewriter.getNamedAttr("hidden_scale", op.getHiddenScaleAttr()),
-                rewriter.getNamedAttr("hidden_zero_point", op.getHiddenZeroPointAttr()),
-                rewriter.getNamedAttr("down_lhs_scale", op.getDownLhsScaleAttr()),
-                rewriter.getNamedAttr("down_rhs_scale", op.getDownRhsScaleAttr()),
-                rewriter.getNamedAttr("output_scale", op.getOutputScaleAttr()),
-                rewriter.getNamedAttr("output_zero_point", op.getOutputZeroPointAttr()),
-                rewriter.getNamedAttr("input_address", make_address_attr(rewriter, *input)),
-                rewriter.getNamedAttr("input_placement", w8a16
-                    ? make_profile_placement(rewriter, *input, "fp16_mxm_activation_planar", "both")
-                    : make_placement_attr(rewriter, *input)),
-                rewriter.getNamedAttr("gate_weight_address", make_address_attr(rewriter, *gate)),
-                rewriter.getNamedAttr("gate_weight_placement", w8a16
-                    ? make_profile_placement(rewriter, *gate, "w8a16_mxm_weight_striped", "both")
-                    : make_placement_attr(rewriter, *gate)),
-                rewriter.getNamedAttr("up_weight_address", make_address_attr(rewriter, *up)),
-                rewriter.getNamedAttr("up_weight_placement", w8a16
-                    ? make_profile_placement(rewriter, *up, "w8a16_mxm_weight_striped", "both")
-                    : make_placement_attr(rewriter, *up)),
-                rewriter.getNamedAttr("down_weight_address", make_address_attr(rewriter, *down)),
-                rewriter.getNamedAttr("down_weight_placement", w8a16
-                    ? make_profile_placement(rewriter, *down, "w8a16_mxm_weight_striped", "east")
-                    : make_placement_attr(rewriter, *down)),
-                rewriter.getNamedAttr("hidden0_address", make_address_attr(rewriter, *hidden0)),
-                rewriter.getNamedAttr("hidden0_placement", w8a16
-                    ? make_profile_placement(rewriter, *hidden0, "fp16_mxm_activation_planar", "west")
-                    : make_placement_attr(rewriter, *hidden0)),
-                rewriter.getNamedAttr("hidden1_address", make_address_attr(rewriter, *hidden1)),
-                rewriter.getNamedAttr("hidden1_placement", w8a16
-                    ? make_profile_placement(rewriter, *hidden1, "fp16_mxm_activation_planar", "east")
-                    : make_placement_attr(rewriter, *hidden1)),
-                rewriter.getNamedAttr("result_address", make_address_attr(rewriter, *result)),
-                rewriter.getNamedAttr("result_placement", w8a16
-                    ? make_profile_placement(rewriter, *result, "fp16_pair_planar", "east")
-                    : make_placement_attr(rewriter, *result)),
-                rewriter.getNamedAttr("input_bytes", rewriter.getI64IntegerAttr(input->bytes)),
-                rewriter.getNamedAttr("gate_weight_bytes", rewriter.getI64IntegerAttr(gate->bytes)),
-                rewriter.getNamedAttr("up_weight_bytes", rewriter.getI64IntegerAttr(up->bytes)),
-                rewriter.getNamedAttr("down_weight_bytes", rewriter.getI64IntegerAttr(down->bytes)),
-                rewriter.getNamedAttr("hidden_pass_bytes", rewriter.getI64IntegerAttr(hidden_pass_bytes)),
-                rewriter.getNamedAttr("result_bytes", rewriter.getI64IntegerAttr(result->bytes)),
+            const auto input_placement = w8a16
+                ? make_profile_placement(rewriter, *input, "fp16_mxm_activation_planar", "both")
+                : make_placement_attr(rewriter, *input);
+            const auto gate_placement = w8a16
+                ? make_profile_placement(rewriter, *gate, "w8a16_mxm_weight_striped", "both")
+                : make_placement_attr(rewriter, *gate);
+            const auto up_placement = w8a16
+                ? make_profile_placement(rewriter, *up, "w8a16_mxm_weight_striped", "both")
+                : make_placement_attr(rewriter, *up);
+            const auto down_placement = w8a16
+                ? make_profile_placement(rewriter, *down,
+                    "w8a16_mxm_weight_wave_striped", "both")
+                : make_placement_attr(rewriter, *down);
+            const auto hidden0_placement = w8a16
+                ? make_profile_placement(rewriter, *hidden0,
+                    "fp16_mxm_activation_planar", "west")
+                : make_placement_attr(rewriter, *hidden0);
+            const auto hidden1_placement = w8a16
+                ? make_profile_placement(rewriter, *hidden1,
+                    "fp16_mxm_activation_planar", "east")
+                : make_placement_attr(rewriter, *hidden1);
+            const auto result_placement = w8a16
+                ? make_profile_placement(rewriter, *result, "fp16_pair_planar", "both")
+                : make_placement_attr(rewriter, *result);
+
+            const auto input_allocations = make_task_allocations(rewriter,
+                {make_task_allocation(rewriter, *input, input_placement)});
+            const auto gate_allocations = make_task_allocations(rewriter,
+                {make_task_allocation(rewriter, *gate, gate_placement)});
+            const auto up_allocations = make_task_allocations(rewriter,
+                {make_task_allocation(rewriter, *up, up_placement)});
+            const auto down_allocations = make_task_allocations(rewriter,
+                {make_task_allocation(rewriter, *down, down_placement)});
+            const auto hidden_allocations = make_task_allocations(rewriter, {
+                make_task_allocation(rewriter, *hidden0, hidden0_placement),
+                make_task_allocation(rewriter, *hidden1, hidden1_placement),
             });
-            auto lowered = llvm::cast<tensor::FfnOp>(rewriter.create(state));
-            rewriter.replaceOp(op, lowered.getResult());
+            const auto result_allocations = make_task_allocations(rewriter,
+                {make_task_allocation(rewriter, *result, result_placement)});
+            const auto transient = rewriter.getArrayAttr({});
+            const auto empty_config = rewriter.getDictionaryAttr({});
+            const mlir::Type projection_element_type = w8a16
+                ? mlir::Type(rewriter.getF32Type())
+                : mlir::Type(rewriter.getI32Type());
+            const mlir::Type hidden_element_type = w8a16
+                ? mlir::Type(rewriter.getF16Type())
+                : mlir::Type(rewriter.getI8Type());
+            const auto projection_type = mlir::RankedTensorType::get(
+                {static_cast<int64_t>(op.getM()),
+                    static_cast<int64_t>(op.getHidden())},
+                projection_element_type);
+            const auto hidden_type = mlir::RankedTensorType::get(
+                {static_cast<int64_t>(op.getM()),
+                    static_cast<int64_t>(op.getHidden())},
+                hidden_element_type);
+
+            auto create_matmul_task = [&](mlir::Value lhs, mlir::Value rhs,
+                                          mlir::Type result_type, int64_t m,
+                                          int64_t n, int64_t k,
+                                          mlir::ArrayAttr lhs_plan,
+                                          mlir::ArrayAttr rhs_plan,
+                                          mlir::ArrayAttr result_plan,
+                                          mlir::DictionaryAttr config) {
+                mlir::OperationState task_state(op.getLoc(),
+                    tensor::MatmulTaskOp::getOperationName());
+                task_state.addOperands({lhs, rhs});
+                task_state.addTypes(result_type);
+                task_state.addAttributes({
+                    rewriter.getNamedAttr("m", rewriter.getI64IntegerAttr(m)),
+                    rewriter.getNamedAttr("n", rewriter.getI64IntegerAttr(n)),
+                    rewriter.getNamedAttr("k", rewriter.getI64IntegerAttr(k)),
+                    rewriter.getNamedAttr("lhs_allocations", lhs_plan),
+                    rewriter.getNamedAttr("rhs_allocations", rhs_plan),
+                    rewriter.getNamedAttr("result_allocations", result_plan),
+                    rewriter.getNamedAttr("config", config),
+                });
+                return llvm::cast<tensor::MatmulTaskOp>(rewriter.create(task_state));
+            };
+
+            auto gate_task = create_matmul_task(op.getInput(), op.getGateWeight(),
+                projection_type, op.getM(), op.getHidden(), op.getK(),
+                input_allocations, gate_allocations, transient,
+                rewriter.getDictionaryAttr({
+                    rewriter.getNamedAttr("rhs_scale", op.getGateScaleAttr()),
+                }));
+            auto up_task = create_matmul_task(op.getInput(), op.getUpWeight(),
+                projection_type, op.getM(), op.getHidden(), op.getK(),
+                input_allocations, up_allocations, transient,
+                rewriter.getDictionaryAttr({
+                    rewriter.getNamedAttr("rhs_scale", op.getUpScaleAttr()),
+                }));
+
+            mlir::OperationState swish_state(op.getLoc(),
+                tensor::SwishTaskOp::getOperationName());
+            swish_state.addOperands(gate_task.getResult());
+            swish_state.addTypes(projection_type);
+            swish_state.addAttributes({
+                rewriter.getNamedAttr("result_allocations", transient),
+                rewriter.getNamedAttr("config", empty_config),
+            });
+            auto swish = llvm::cast<tensor::SwishTaskOp>(rewriter.create(swish_state));
+
+            mlir::OperationState multiply_state(op.getLoc(),
+                tensor::ElementwiseTaskOp::getOperationName());
+            multiply_state.addOperands({swish.getResult(), up_task.getResult()});
+            multiply_state.addTypes(hidden_type);
+            multiply_state.addAttributes({
+                rewriter.getNamedAttr("kind", rewriter.getStringAttr("multiply")),
+                rewriter.getNamedAttr("result_allocations", hidden_allocations),
+                rewriter.getNamedAttr("config", rewriter.getDictionaryAttr({
+                    rewriter.getNamedAttr("output_scale", op.getHiddenScaleAttr()),
+                    rewriter.getNamedAttr("output_zero_point", op.getHiddenZeroPointAttr()),
+                })),
+            });
+            auto multiply =
+                llvm::cast<tensor::ElementwiseTaskOp>(rewriter.create(multiply_state));
+
+            auto down_task = create_matmul_task(multiply.getResult(),
+                op.getDownWeight(), op.getResult().getType(), op.getM(), op.getN(),
+                op.getHidden(), hidden_allocations, down_allocations,
+                result_allocations, rewriter.getDictionaryAttr({
+                    rewriter.getNamedAttr("lhs_scale", op.getDownLhsScaleAttr()),
+                    rewriter.getNamedAttr("rhs_scale", op.getDownRhsScaleAttr()),
+                    rewriter.getNamedAttr("output_scale", op.getOutputScaleAttr()),
+                    rewriter.getNamedAttr("output_zero_point", op.getOutputZeroPointAttr()),
+                }));
+            rewriter.replaceOp(op, down_task.getResult());
         }
 
         for (kernel::SwigluOp op : swiglus) {

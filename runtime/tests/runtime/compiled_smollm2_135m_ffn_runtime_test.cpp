@@ -1,10 +1,15 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
+#include "ftlpu/software/runtime/performance.hpp"
+#include "ftlpu/software/runtime/schedule_trace.hpp"
 
 #include "ftlpu/core/fp16.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -58,6 +63,9 @@ try {
         throw std::logic_error("SmolLM2 FFN binary must contain four inputs and one output");
     if (program.max_cycle == 0)
         throw std::logic_error("SmolLM2 FFN binary has no scheduled ICU commands");
+    if (const auto* trace_path = std::getenv("FTLPU_SCHEDULE_TRACE")) {
+        ftlpu::software::runtime::write_schedule_trace_csv(program, trace_path);
+    }
 
     std::vector<std::uint8_t> x;
     x.reserve(kM * kHidden * 2);
@@ -103,6 +111,16 @@ try {
     constexpr std::size_t kSampleRows[] = {0, kM / 2, kM - 1};
     constexpr std::size_t kSampleColumns[] = {0, 191, 575};
     for (std::size_t row = 0; row < kM; ++row) {
+        const auto read_hidden = [&](std::size_t h) {
+            const std::size_t address = (h / 32) * kM + row;
+            const std::size_t column = h % 32;
+            const auto low = system->read_mem_sram_lane_byte(ftlpu::Hemisphere::East,
+                21, column / 8, address, column % 8);
+            const auto high = system->read_mem_sram_lane_byte(ftlpu::Hemisphere::East,
+                22, column / 8, address, column % 8);
+            return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
+                | (static_cast<std::uint16_t>(high) << 8)).to_float();
+        };
         for (std::size_t h = 0; h < kIntermediate; ++h) {
             const float gate = activation(row, gate_k(h)) * gate_sign(h);
             const float up = activation(row, up_k(h)) * up_sign(h);
@@ -125,30 +143,49 @@ try {
                 }
             }
             if (std::fabs(observed - expected) > 0.004f) {
-                const auto read_hidden = [&](ftlpu::Hemisphere hemisphere, std::size_t h) {
-                    const std::size_t address = (h / 32) * kM + row;
-                    const std::size_t column = h % 32;
-                    const auto low = system->read_mem_sram_lane_byte(hemisphere,
-                        21, column / 8, address, column % 8);
-                    const auto high = system->read_mem_sram_lane_byte(hemisphere,
-                        22, column / 8, address, column % 8);
-                    return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
-                        | (static_cast<std::uint16_t>(high) << 8)).to_float();
-                };
+                const auto read_temp_fp32 =
+                    [&](const std::array<std::size_t, 4>& slices,
+                        std::size_t h) {
+                        std::uint32_t raw = 0;
+                        const std::size_t column = h % 32;
+                        for (std::size_t byte = 0; byte < slices.size();
+                             ++byte) {
+                            raw |= static_cast<std::uint32_t>(
+                                system->read_mem_sram_lane_byte(
+                                    ftlpu::Hemisphere::East, slices[byte],
+                                    column / 8, row, column % 8))
+                                << (byte * 8);
+                        }
+                        return std::bit_cast<float>(raw);
+                    };
+                float hidden_max_error = 0.0f;
+                for (std::size_t index = 0; index < kIntermediate; ++index)
+                    hidden_max_error = std::max(hidden_max_error,
+                        std::fabs(read_hidden(index) - hidden[index]));
+                const float device_hidden_expected = ftlpu::Fp16::from_float(
+                    read_hidden(h0) - read_hidden(h1)).to_float();
                 throw std::logic_error("SmolLM2 FFN mismatch row=" + std::to_string(row)
                     + " column=" + std::to_string(n) + " actual="
                     + std::to_string(observed) + " expected=" + std::to_string(expected)
-                    + " hidden0.actual=" + std::to_string(read_hidden(ftlpu::Hemisphere::East, h0))
+                    + " hidden0.actual=" + std::to_string(read_hidden(h0))
                     + " hidden0.cpu=" + std::to_string(hidden[h0])
-                    + " hidden1.east=" + std::to_string(read_hidden(ftlpu::Hemisphere::East, h1))
-                    + " hidden1.west=" + std::to_string(read_hidden(ftlpu::Hemisphere::West, h1))
-                    + " hidden1.cpu=" + std::to_string(hidden[h1]));
+                    + " hidden1.actual=" + std::to_string(read_hidden(h1))
+                    + " hidden1.cpu=" + std::to_string(hidden[h1])
+                    + " gate_temp=" + std::to_string(read_temp_fp32(
+                        {1, 5, 9, 13}, h0))
+                    + " up_temp=" + std::to_string(read_temp_fp32(
+                        {2, 6, 10, 14}, h0))
+                    + " hidden.max_error=" + std::to_string(hidden_max_error)
+                    + " down.from_device_hidden="
+                    + std::to_string(device_hidden_expected));
             }
             ++checked;
         }
     }
     if (actual_nonzero == 0 || expected_nonzero == 0)
         throw std::logic_error("SmolLM2 FFN numeric test unexpectedly produced only zero outputs");
+    ftlpu::software::runtime::print_runtime_performance(
+        program, program.max_cycle + 64, std::cout);
     std::cout << "SmolLM2-135M complete FFN passed: " << checked
               << " FP16 values, max_cycle=" << program.max_cycle
               << ", nonzero(actual/reference)=" << actual_nonzero << "/" << expected_nonzero

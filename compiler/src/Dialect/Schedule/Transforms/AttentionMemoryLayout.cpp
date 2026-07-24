@@ -15,6 +15,12 @@ AttentionMemoryLayout::AttentionMemoryLayout(stream::AttentionOp op,
         const auto placement = plan.getAs<mlir::DictionaryAttr>(names[i]);
         weightBases_[i] = placement.getAs<mlir::IntegerAttr>("base_row").getInt();
     }
+    if (const auto input = plan.getAs<mlir::DictionaryAttr>("input")) {
+        const auto slices = input.getAs<mlir::ArrayAttr>("slices");
+        for (std::size_t i = 0; i < activationSlices_.size(); ++i)
+            activationSlices_[i] =
+                llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
+    }
     if (const auto weight = plan.getAs<mlir::DictionaryAttr>("output_weight")) {
         outputWeightBase_ = weight.getAs<mlir::IntegerAttr>("base_row").getInt();
         const auto slices = weight.getAs<mlir::ArrayAttr>("slices");
@@ -30,9 +36,15 @@ AttentionMemoryLayout::AttentionMemoryLayout(stream::AttentionOp op,
         for (std::size_t i = 0; i < slices.size(); ++i)
             slices[i] = llvm::cast<mlir::IntegerAttr>(values[i]).getInt();
     };
-    readPlacement("score", scaledScoreSlices_, scaledScoreBase_);
-    readPlacement("exp", expScoreSlices_, expScoreBase_);
-    readPlacement("probability", probabilitySlices_, probabilityBase_);
+    readPlacement("score", scaledScoreSlices_[0], scaledScoreBase_);
+    int64_t ignoredBase = 0;
+    readPlacement("score_mxm1", scaledScoreSlices_[1], ignoredBase);
+    readPlacement("exp", expScoreSlices_[0], expScoreBase_);
+    readPlacement("exp_mxm1", expScoreSlices_[1], ignoredBase);
+    readPlacement("causal_mask", causalMaskSlices_[0], causalMaskBase_);
+    readPlacement("causal_mask_mxm1", causalMaskSlices_[1], ignoredBase);
+    readPlacement("probability", probabilitySlices_[0], probabilityBase_);
+    readPlacement("probability_mxm1", probabilitySlices_[1], ignoredBase);
     readPlacement("probability_pack", probabilityPackSlices_, probabilityPackBase_);
     readPlacement("probability_diagonal", probabilityDiagonalSlices_, probabilityDiagonalBase_);
     if (const auto value = plan.getAs<mlir::DictionaryAttr>("value"))

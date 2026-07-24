@@ -27,7 +27,26 @@ def main() -> None:
     if "tensor<128x64xf16>" not in schedule:
         raise AssertionError("M=128 FFN did not reach Schedule IR")
 
-    load_count = schedule.count("ftlpu.schedule.mxm_load")
+    aggregate_load_count = schedule.count("ftlpu.schedule.mxm_load")
+    explicit_iw_pulses = sum(
+        1 for line in schedule.splitlines()
+        if "ftlpu.schedule.mxm_issue" in line and 'opcode = "iw"' in line
+    )
+    if explicit_iw_pulses:
+        raise AssertionError(
+            "Down weight prefetch must use the same continuous four-cycle "
+            f"MXM load as Gate/Up, got {explicit_iw_pulses} explicit IW pulses")
+    malformed_loads = [
+        line for line in schedule.splitlines()
+        if "ftlpu.schedule.mxm_load" in line
+        and ("duration = 4 : i64" not in line
+             or "stream_count = 16 : i64" not in line)
+    ]
+    if malformed_loads:
+        raise AssertionError(
+            "Every FFN weight tile must use a continuous four-cycle, "
+            f"16-stream MXM load: {malformed_loads[:2]}")
+    load_count = aggregate_load_count
     # Projection: 2 N-pairs * 2 K-tiles * 2 hemispheres * (gate + up) = 16.
     # Down projection adds 2 units * 4 K-tiles = 8. The four M=32 tiles reuse
     # the same projection weights, so the total is 24 rather than 72.

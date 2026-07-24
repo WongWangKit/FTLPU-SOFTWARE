@@ -221,26 +221,38 @@ LogicalResult AttentionOp::verify()
     return success();
 }
 
-LogicalResult MemQueueOp::verify()
+LogicalResult MemTransferOp::verify()
 {
     const target::LPUTargetModel target;
-    if (failed(verify_queue_issue(*this, getCycle(), getQueue(), getRepeatCount(), getRepeatInterval()))
-        || getQueue() >= target.memory().hemispheres * target.memory().slices_per_hemisphere
+    if (failed(verify_queue_issue(*this, getCycle(), getSlice(), getRepeatCount(), getRepeatInterval()))
+        || getHemisphere() < 0 || getHemisphere() >= target.memory().hemispheres
+        || getSlice() >= target.memory().slices_per_hemisphere
         || getAddress() < 0 || getAddress() >= target.memory().words_per_bank * target.memory().banks_per_slice
         || getPackedStream() < 0 || getPackedStream() >= target.streams().encoded_streams)
-        return emitOpError("contains an invalid MEM queue issue");
+        return emitOpError("contains an invalid MEM transfer: cycle=")
+            << getCycle() << ", hemisphere=" << getHemisphere()
+            << ", slice=" << getSlice()
+            << ", address=" << getAddress()
+            << ", packed_stream=" << getPackedStream()
+            << ", repeat_count=" << getRepeatCount()
+            << ", repeat_interval=" << getRepeatInterval();
     if (getOpcode() != "read" && getOpcode() != "write" && getOpcode() != "accumulate")
         return emitOpError("opcode must be read, write, or accumulate");
     return success();
 }
 
-LogicalResult MxmQueueOp::verify()
+LogicalResult MxmIssueOp::verify()
 {
     const target::LPUTargetModel target;
-    if (failed(verify_queue_issue(*this, getCycle(), getQueue(), getRepeatCount(), getRepeatInterval()))
-        || !target.is_valid_mxm_unit(getQueue()) || !target.is_valid_weight_buffer(getWeightBuffer())
+    if (failed(verify_queue_issue(*this, getCycle(), getUnitId(), getRepeatCount(), getRepeatInterval()))
+        || !target.is_valid_mxm_unit(getUnitId()) || !target.is_valid_weight_buffer(getWeightBuffer())
         || getWeightColumn() < 0 || getWeightColumn() >= target.throughput().tile_rows)
-        return emitOpError("contains an invalid MXM queue issue");
+        return emitOpError("contains an invalid MXM issue: cycle=")
+            << getCycle() << ", unit_id=" << getUnitId()
+            << ", weight_buffer=" << getWeightBuffer()
+            << ", weight_column=" << getWeightColumn()
+            << ", activation_stream_base=" << getActivationStreamBase()
+            << ", output_stream_base=" << getOutputStreamBase();
     if (getOpcode() != "iw" && getOpcode() != "compute")
         return emitOpError("opcode must be iw or compute");
     return success();

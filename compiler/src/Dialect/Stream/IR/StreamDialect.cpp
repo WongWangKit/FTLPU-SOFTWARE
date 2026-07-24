@@ -6,6 +6,10 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OpImplementation.h"
 
+#include "llvm/ADT/STLExtras.h"
+
+#include <algorithm>
+
 using namespace mlir;
 
 #include "ftlpu/compiler/Dialect/Stream/IR/StreamOpsDialect.cpp.inc"
@@ -91,7 +95,9 @@ LogicalResult RouteOp::verify()
     if (!source || !destination || !direction || !slice)
         return emitOpError("has an invalid endpoint, direction, or MEM address");
 
-    const target::LPUTargetModel target;
+    auto target_model = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(target_model)) return failure();
+    const target::LPUTargetModel& target = *target_model;
     const auto valid_unit = [&](target::StreamEndpoint endpoint, int64_t unit_id) {
         if (endpoint == target::StreamEndpoint::Mem) return unit_id == -1;
         if (endpoint == target::StreamEndpoint::VxmResult
@@ -130,9 +136,18 @@ LogicalResult DequantizeOp::verify()
     if (!input.getElementType().isInteger(8) || !result.getElementType().isF16()
         || input.getShape() != result.getShape())
         return emitOpError("requires shape-preserving i8 to f16 conversion");
-    if (getInputStreamBase() < 0 || getInputStreamBase() + 8 > 32
-        || getOutputStreamBase() < 0 || getOutputStreamBase() + 16 > 32)
-        return emitOpError("requires an 8-stream input and 16-stream output range");
+    auto target_model = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(target_model)) return failure();
+    const auto& streams = target_model->streams();
+    const auto& throughput = target_model->throughput();
+    if (getInputStreamBase() < 0
+        || getInputStreamBase() + throughput.lanes_per_tile
+            > streams.streams_per_direction
+        || getOutputStreamBase() < 0
+        || getOutputStreamBase() + throughput.mxm_load_streams_per_cycle
+            > streams.streams_per_direction)
+        return emitOpError(
+            "dequant stream ranges do not fit the configured target");
     if ((getInputHemisphere() != "east" && getInputHemisphere() != "west")
         || (getOutputHemisphere() != "east" && getOutputHemisphere() != "west"))
         return emitOpError("hemisphere must be east or west");
@@ -150,7 +165,9 @@ LogicalResult MatmulOp::verify()
         || rhs.getDimSize(0) != getK() || rhs.getDimSize(1) != getN()
         || result.getDimSize(0) != getM() || result.getDimSize(1) != getN())
         return emitOpError("tensor shapes do not match m, n, and k");
-    const target::LPUTargetModel target;
+    auto target_model = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(target_model)) return failure();
+    const target::LPUTargetModel& target = *target_model;
     if (!target.is_valid_mxm_unit(getUnitId()))
         return emitOpError("unit_id must select MXM0 or MXM1");
     if (!target.is_valid_weight_buffer(getWeightBuffer()))
@@ -164,18 +181,128 @@ LogicalResult MatmulOp::verify()
     return success();
 }
 
+static LogicalResult verify_task_allocations(
+    Operation* op, ArrayAttr allocations)
+{
+    for (auto [index, attribute] : llvm::enumerate(allocations)) {
+        const auto allocation = llvm::dyn_cast<DictionaryAttr>(attribute);
+        if (!allocation || !allocation.getAs<DictionaryAttr>("address")
+            || !allocation.getAs<DictionaryAttr>("placement")
+            || !allocation.getAs<IntegerAttr>("bytes"))
+            return op->emitOpError()
+                << "result_allocations[" << index
+                << "] requires address, placement, and bytes";
+    }
+    return success();
+}
+
+LogicalResult MatmulTaskOp::verify()
+{
+    const size_t parallelism = std::max(getLhs().size(), getRhs().size());
+    if (parallelism == 0 || getLhs().empty() || getRhs().empty()
+        || (getLhs().size() != 1 && getLhs().size() != parallelism)
+        || (getRhs().size() != 1 && getRhs().size() != parallelism)
+        || getUnitIds().size() != parallelism
+        || getWeightBuffers().size() != parallelism
+        || getResultStreamBases().size() != parallelism
+        || getResultStreamCounts().size() != parallelism)
+        return emitOpError("parallel operand and stream arrays have inconsistent sizes");
+
+    auto target_model = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(target_model)) return failure();
+    const target::LPUTargetModel& target = *target_model;
+    for (size_t index = 0; index < parallelism; ++index) {
+        const auto unit = llvm::dyn_cast<IntegerAttr>(getUnitIds()[index]);
+        const auto buffer =
+            llvm::dyn_cast<IntegerAttr>(getWeightBuffers()[index]);
+        const auto stream =
+            llvm::dyn_cast<IntegerAttr>(getResultStreamBases()[index]);
+        const auto count =
+            llvm::dyn_cast<IntegerAttr>(getResultStreamCounts()[index]);
+        if (!unit || !buffer || !stream || !count
+            || !target.is_valid_mxm_unit(unit.getInt())
+            || !target.is_valid_weight_buffer(buffer.getInt())
+            || stream.getInt() < 0 || count.getInt() <= 0
+            || stream.getInt() + count.getInt()
+                > target.streams().streams_per_direction)
+            return emitOpError("contains an invalid MXM or result-stream binding");
+
+        const auto lhs = getLhs()[std::min(index, getLhs().size() - 1)];
+        const auto rhs = getRhs()[std::min(index, getRhs().size() - 1)];
+        const auto lhs_type = llvm::cast<RankedTensorType>(lhs.getType());
+        const auto rhs_type = llvm::cast<RankedTensorType>(rhs.getType());
+        if (lhs_type.getRank() != 2 || rhs_type.getRank() != 2
+            || lhs_type.getDimSize(0) != getM()
+            || lhs_type.getDimSize(1) != getK()
+            || rhs_type.getDimSize(0) != getK()
+            || rhs_type.getDimSize(1) != getN())
+            return emitOpError("operand shapes do not match m, n, and k");
+        auto lhs_route = lhs.getDefiningOp<RouteOp>();
+        auto rhs_route = rhs.getDefiningOp<RouteOp>();
+        if (!lhs_route || !rhs_route
+            || lhs_route.getDestination() != "MXM.activation"
+            || rhs_route.getDestination() != "MXM.weight"
+            || rhs_route.getDestinationUnitId() != unit.getInt())
+            return emitOpError("operands require canonical routes to the selected MXM");
+    }
+    const auto result_type = getResult().getType();
+    if (result_type.getRank() != 2
+        || result_type.getDimSize(0) != getM()
+        || result_type.getDimSize(1) != getN())
+        return emitOpError("result shape does not match m and n");
+    return verify_task_allocations(getOperation(), getResultAllocations());
+}
+
+LogicalResult SwishTaskOp::verify()
+{
+    if (getInput().getType().getShape() != getResult().getType().getShape())
+        return emitOpError("input and result shapes must match");
+    auto target_model = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(target_model)) return failure();
+    const int64_t streams =
+        target_model->streams().streams_per_direction;
+    if (getInputStreamBase() < 0 || getInputStreamBase() >= streams
+        || getOutputStreamBase() < 0 || getOutputStreamBase() >= streams)
+        return emitOpError("contains an invalid direction-local stream");
+    return success();
+}
+
+LogicalResult ElementwiseTaskOp::verify()
+{
+    if (getKind() != "multiply" && getKind() != "add_quant")
+        return emitOpError("supports multiply and add_quant");
+    if (getLhs().getType().getShape() != getRhs().getType().getShape()
+        || getLhs().getType().getShape() != getResult().getType().getShape())
+        return emitOpError("operand and result shapes must match");
+    auto target_model = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(target_model)) return failure();
+    const int64_t streams =
+        target_model->streams().streams_per_direction;
+    if (getInputStreamBases().size() != 2
+        || getOutputStreamBase() < 0 || getOutputStreamBase() >= streams)
+        return emitOpError("requires two input streams and one valid output stream");
+    return verify_task_allocations(getOperation(), getResultAllocations());
+}
+
 LogicalResult SwigluOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto target_model = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(target_model)) return failure();
+    const target::LPUTargetModel& target = *target_model;
     if (!target.is_valid_mxm_unit(getGateUnitId())
         || !target.is_valid_mxm_unit(getUpUnitId())
         || getGateUnitId() == getUpUnitId()
         || !target.is_valid_weight_buffer(getGateWeightBuffer())
         || !target.is_valid_weight_buffer(getUpWeightBuffer()))
         return emitOpError("requires distinct valid MXM units and valid weight buffers");
-    if (getGateOutputStreamBase() < 0 || getGateOutputStreamBase() + 4 > 32
-        || getUpOutputStreamBase() < 0 || getUpOutputStreamBase() + 4 > 32
-        || getVxmOutputStream() < 0 || getVxmOutputStream() >= 32)
+    const int64_t result_streams =
+        target.throughput().mxm_result_streams;
+    const int64_t streams = target.streams().streams_per_direction;
+    if (getGateOutputStreamBase() < 0
+        || getGateOutputStreamBase() + result_streams > streams
+        || getUpOutputStreamBase() < 0
+        || getUpOutputStreamBase() + result_streams > streams
+        || getVxmOutputStream() < 0 || getVxmOutputStream() >= streams)
         return emitOpError("contains an invalid direction-local stream range");
     auto activation = getActivation().getDefiningOp<RouteOp>();
     auto gate = getGateWeight().getDefiningOp<RouteOp>();
@@ -191,7 +318,9 @@ LogicalResult SwigluOp::verify()
 LogicalResult FfnOp::verify()
 {
     const bool legacy = getK() == 320 && getHidden() == 640 && getN() == 320;
-    const target::LPUTargetModel target;
+    auto target_model = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(target_model)) return failure();
+    const target::LPUTargetModel& target = *target_model;
     const bool w8a16 = getActivation().getType().getElementType().isF16()
         && getGateWeight().getType().getElementType().isF16()
         && getUpWeight().getType().getElementType().isF16()
@@ -218,8 +347,10 @@ LogicalResult FfnOp::verify()
         || (w8a16 && (gate.getSource() != "VXM.result" || up.getSource() != "VXM.result"
             || down0.getSource() != "VXM.result" || down1.getSource() != "VXM.result")))
         return emitOpError("requires canonical activation and three-stage dual-MXM routes");
-    if (getGateOutputStreamBase() != 0 || getUpOutputStreamBase() != 4
-        || (legacy && getVxmOutputStream() != 31)
+    if (getGateOutputStreamBase() != 0
+        || getUpOutputStreamBase() != target.throughput().mxm_result_streams
+        || (legacy && getVxmOutputStream()
+            != target.streams().streams_per_direction - 1)
         || (w8a16 && getVxmOutputStream() != 0))
         return emitOpError("contains non-canonical FFN stream bases for the selected target profile");
     return success();
@@ -230,6 +361,10 @@ LogicalResult AttentionOp::verify()
     if (getQueryHeads() <= 0 || getKvHeads() <= 0 || getHeadDim() <= 0
         || getQueryHeads() % getKvHeads() != 0 || getRoutes().empty())
         return emitOpError("requires grouped-query dimensions and at least one stream route");
+    auto target_model = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(target_model)) return failure();
+    const int64_t streams =
+        target_model->streams().streams_per_direction;
     for (Attribute attribute : getRoutes()) {
         const auto route = llvm::dyn_cast<DictionaryAttr>(attribute);
         if (!route) return emitOpError("routes must be dictionaries");
@@ -242,7 +377,8 @@ LogicalResult AttentionOp::verify()
         const auto begin = route.getAs<IntegerAttr>("producer_stage");
         const auto end = route.getAs<IntegerAttr>("consumer_stage");
         if (!base || !count || !begin || !end || base.getInt() < 0 || count.getInt() <= 0
-            || base.getInt() + count.getInt() > 32 || end.getInt() <= begin.getInt())
+            || base.getInt() + count.getInt() > streams
+            || end.getInt() <= begin.getInt())
             return emitOpError("route has an invalid stream range or lifetime window");
     }
     return success();

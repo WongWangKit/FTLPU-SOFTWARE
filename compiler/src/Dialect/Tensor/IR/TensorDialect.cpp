@@ -6,6 +6,8 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OpImplementation.h"
 
+#include "llvm/ADT/STLExtras.h"
+
 #include <cstdint>
 #include <limits>
 
@@ -172,6 +174,73 @@ LogicalResult MatmulOp::verify()
     return success();
 }
 
+static LogicalResult verify_task_allocations(
+    Operation* op, ArrayAttr allocations, StringRef name)
+{
+    for (auto [index, attribute] : llvm::enumerate(allocations)) {
+        const auto allocation = llvm::dyn_cast<DictionaryAttr>(attribute);
+        if (!allocation)
+            return op->emitOpError() << name << "[" << index
+                                     << "] must be a dictionary";
+        const auto address = allocation.getAs<DictionaryAttr>("address");
+        const auto placement = allocation.getAs<DictionaryAttr>("placement");
+        const auto bytes = allocation.getAs<IntegerAttr>("bytes");
+        if (!address || !placement || !bytes || bytes.getInt() <= 0)
+            return op->emitOpError()
+                << name << "[" << index
+                << "] requires address, placement, and positive bytes";
+        if (failed(verify_address(op, address, name)))
+            return failure();
+        for (StringRef field :
+            {"kind", "slices", "base_row", "instruction_count", "address_stride"})
+            if (!placement.get(field))
+                return op->emitOpError()
+                    << name << "[" << index
+                    << "] placement is missing field '" << field << "'";
+    }
+    return success();
+}
+
+LogicalResult MatmulTaskOp::verify()
+{
+    const auto lhs = getLhs().getType();
+    const auto rhs = getRhs().getType();
+    const auto result = getResult().getType();
+    if (lhs.getRank() != 2 || rhs.getRank() != 2 || result.getRank() != 2)
+        return emitOpError("requires rank-2 tensors");
+    if (lhs.getDimSize(0) != getM() || lhs.getDimSize(1) != getK()
+        || rhs.getDimSize(0) != getK() || rhs.getDimSize(1) != getN()
+        || result.getDimSize(0) != getM() || result.getDimSize(1) != getN())
+        return emitOpError("tensor shapes do not match m, n, and k");
+    if (failed(verify_task_allocations(
+            getOperation(), getLhsAllocations(), "lhs_allocations"))
+        || failed(verify_task_allocations(
+            getOperation(), getRhsAllocations(), "rhs_allocations"))
+        || failed(verify_task_allocations(
+            getOperation(), getResultAllocations(), "result_allocations")))
+        return failure();
+    return success();
+}
+
+LogicalResult SwishTaskOp::verify()
+{
+    if (getInput().getType().getShape() != getResult().getType().getShape())
+        return emitOpError("input and result shapes must match");
+    return verify_task_allocations(
+        getOperation(), getResultAllocations(), "result_allocations");
+}
+
+LogicalResult ElementwiseTaskOp::verify()
+{
+    if (getKind() != "multiply")
+        return emitOpError("currently supports kind = \"multiply\"");
+    if (getLhs().getType().getShape() != getRhs().getType().getShape()
+        || getLhs().getType().getShape() != getResult().getType().getShape())
+        return emitOpError("operand and result shapes must match");
+    return verify_task_allocations(
+        getOperation(), getResultAllocations(), "result_allocations");
+}
+
 LogicalResult SwigluOp::verify()
 {
     const auto input = getInput().getType();
@@ -261,7 +330,8 @@ LogicalResult FfnOp::verify()
         if (failed(verify_placement(getOperation(), getInputPlacement(), "input_placement", "fp16_mxm_activation_planar", 4))
             || failed(verify_placement(getOperation(), getGateWeightPlacement(), "gate_weight_placement", "w8a16_mxm_weight_striped", 8))
             || failed(verify_placement(getOperation(), getUpWeightPlacement(), "up_weight_placement", "w8a16_mxm_weight_striped", 8))
-            || failed(verify_placement(getOperation(), getDownWeightPlacement(), "down_weight_placement", "w8a16_mxm_weight_striped", 8))
+            || failed(verify_placement(getOperation(), getDownWeightPlacement(),
+                "down_weight_placement", "w8a16_mxm_weight_wave_striped", 8))
             || failed(verify_placement(getOperation(), getHidden0Placement(), "hidden0_placement", "fp16_mxm_activation_planar", 4))
             || failed(verify_placement(getOperation(), getHidden1Placement(), "hidden1_placement", "fp16_mxm_activation_planar", 4))
             || failed(verify_placement(getOperation(), getResultPlacement(), "result_placement", "fp16_pair_planar", 4)))
@@ -299,8 +369,10 @@ LogicalResult AttentionOp::verify()
         || result.getShape() != input.getShape())
         return emitOpError("tensor shapes do not match the attention configuration");
     for (StringRef name : {"input", "query_weight", "key_weight", "value_weight",
-             "output_weight", "query", "key", "value", "score", "probability",
-             "probability_pack", "probability_diagonal", "exp", "rope", "context", "result"}) {
+             "output_weight", "query", "key", "value", "score", "score_mxm1",
+             "probability", "probability_mxm1", "probability_pack", "probability_diagonal",
+             "exp", "exp_mxm1", "causal_mask", "causal_mask_mxm1",
+             "rope", "context", "result"}) {
         const auto placement = getMemoryPlan().getAs<DictionaryAttr>(name);
         const auto kind = placement ? placement.getAs<StringAttr>("kind") : StringAttr {};
         const auto slices = placement ? placement.getAs<ArrayAttr>("slices") : ArrayAttr {};

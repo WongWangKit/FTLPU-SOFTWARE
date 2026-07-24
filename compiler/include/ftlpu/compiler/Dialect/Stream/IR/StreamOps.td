@@ -91,6 +91,45 @@ def MatmulOp : FTLPU_Stream_Op<"matmul", [Pure]> {
   let hasVerifier = 1;
 }
 
+def MatmulTaskOp
+    : FTLPU_Stream_Op<"matmul_task", [Pure, AttrSizedOperandSegments]> {
+  let summary = "One or more MXM matmuls connected to allocated stream routes";
+  let description = [{
+    A logical matrix multiplication task may use one MXM or a set of parallel
+    MXMs. Each lhs/rhs operand is an explicitly routed stream value. Unit,
+    weight-buffer, and result-stream arrays have one entry per parallel MXM.
+  }];
+  let arguments = (ins Variadic<AnyRankedTensor>:$lhs,
+      Variadic<AnyRankedTensor>:$rhs, I64Attr:$m, I64Attr:$n, I64Attr:$k,
+      ArrayAttr:$unit_ids, ArrayAttr:$weight_buffers,
+      ArrayAttr:$result_stream_bases, ArrayAttr:$result_stream_counts,
+      ArrayAttr:$result_allocations, DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "`[` $lhs `]` `,` `[` $rhs `]` attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def SwishTaskOp : FTLPU_Stream_Op<"swish_task", [Pure]> {
+  let summary = "VXM swish over one MXM result stream";
+  let arguments = (ins AnyRankedTensor:$input,
+      I64Attr:$input_stream_base, I64Attr:$output_stream_base,
+      DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def ElementwiseTaskOp : FTLPU_Stream_Op<"elementwise_task", [Pure]> {
+  let summary = "VXM binary elementwise task over functional-unit streams";
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+      StrAttr:$kind, ArrayAttr:$input_stream_bases,
+      I64Attr:$output_stream_base, ArrayAttr:$result_allocations,
+      DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def SwigluOp : FTLPU_Stream_Op<"swiglu", [Pure]> {
   let summary = "Dual-MXM result streams consumed by the VXM SwiGLU pipeline";
   let arguments = (ins AnyRankedTensor:$activation, AnyRankedTensor:$gate_weight,

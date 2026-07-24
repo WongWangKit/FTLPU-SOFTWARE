@@ -18,11 +18,23 @@ def main() -> None:
         "--pipeline", "ftlpu-stablehlo-to-kernel",
     ], check=True)
     text = args.output.read_text(encoding="utf-8")
+    source = args.input.read_text(encoding="utf-8")
+    if "stablehlo.custom_call" in source:
+        raise AssertionError("attention fixture must use a standard StableHLO graph")
+    for operation in (
+        "stablehlo.dot_general", "stablehlo.iota", "stablehlo.compare",
+        "stablehlo.select", "stablehlo.reduce", "stablehlo.exponential",
+        "stablehlo.power", "stablehlo.slice", "stablehlo.concatenate",
+    ):
+        if operation not in source:
+            raise AssertionError(f"standard attention graph is missing {operation}")
     required = (
-        "ftlpu.kernel.attention",
-        "seq_len = 128 : i64",
-        "hidden = 576 : i64",
-        "query_heads = 9 : i64",
+        "ftlpu.kernel.matmul",
+        "ftlpu.kernel.rope",
+        "ftlpu.kernel.gqa_broadcast",
+        "ftlpu.kernel.transpose",
+        "ftlpu.kernel.batch_matmul",
+        "ftlpu.kernel.softmax",
         "kv_heads = 3 : i64",
         "head_dim = 64 : i64",
         "causal = true",
@@ -30,6 +42,16 @@ def main() -> None:
     missing = [item for item in required if item not in text]
     if missing:
         raise AssertionError(f"Kernel attention IR is missing: {missing}")
+    if "stablehlo." in text:
+        raise AssertionError("matched attention graph was not fully consumed")
+    if "ftlpu.kernel.attention" in text:
+        raise AssertionError("attention must be decomposed in public Kernel IR")
+    if text.count("ftlpu.kernel.matmul") != 4:
+        raise AssertionError("attention must contain Q/K/V/O matmul operations")
+    if text.count("ftlpu.kernel.rope") != 2:
+        raise AssertionError("attention must contain separate Q and K RoPE operations")
+    if text.count("ftlpu.kernel.batch_matmul") != 2:
+        raise AssertionError("attention must contain QK and PV batched matmuls")
 
 
 if __name__ == "__main__":

@@ -34,6 +34,9 @@ public:
         int64_t key) const;
     int64_t scaledScoreAddress(int64_t key) const { return scaledScoreBase_ + key; }
     int64_t expScoreAddress(int64_t key) const { return expScoreBase_ + key; }
+    int64_t causalMaskAddress(int64_t localKey) const {
+        return causalMaskBase_ + localKey - 1;
+    }
     int64_t probabilityAddress(int64_t queryHead, int64_t queryBlock,
         int64_t key) const;
     int64_t probabilityPackAddress(int64_t queryHead, int64_t queryBlock,
@@ -52,9 +55,18 @@ public:
     llvm::ArrayRef<int64_t> outputWeightSlices() const { return outputWeightSlices_; }
     llvm::ArrayRef<int64_t> activationSlices() const { return activationSlices_; }
     llvm::ArrayRef<int64_t> ropeSlices() const { return ropeSlices_; }
-    llvm::ArrayRef<int64_t> scaledScoreSlices() const { return scaledScoreSlices_; }
-    llvm::ArrayRef<int64_t> expScoreSlices() const { return expScoreSlices_; }
-    llvm::ArrayRef<int64_t> probabilitySlices() const { return probabilitySlices_; }
+    llvm::ArrayRef<int64_t> scaledScoreSlices(int64_t localMxm) const {
+        return scaledScoreSlices_.at(static_cast<std::size_t>(localMxm));
+    }
+    llvm::ArrayRef<int64_t> expScoreSlices(int64_t localMxm) const {
+        return expScoreSlices_.at(static_cast<std::size_t>(localMxm));
+    }
+    llvm::ArrayRef<int64_t> causalMaskSlices(int64_t localMxm) const {
+        return causalMaskSlices_.at(static_cast<std::size_t>(localMxm));
+    }
+    llvm::ArrayRef<int64_t> probabilitySlices(int64_t localMxm) const {
+        return probabilitySlices_.at(static_cast<std::size_t>(localMxm));
+    }
     llvm::ArrayRef<int64_t> probabilityPackSlices() const { return probabilityPackSlices_; }
     llvm::ArrayRef<int64_t> probabilityDiagonalSlices() const { return probabilityDiagonalSlices_; }
     llvm::ArrayRef<int64_t> valuePackSlices(int64_t reductionBlock) const;
@@ -70,12 +82,15 @@ private:
     std::array<int64_t, 3> weightBases_ {};
     int64_t outputWeightBase_ = 0;
     std::array<int64_t, 8> weightSlices_ {0, 4, 8, 12, 16, 20, 24, 28};
-    std::array<int64_t, 8> outputWeightSlices_ {0, 4, 8, 12, 2, 20, 24, 28};
+    std::array<int64_t, 8> outputWeightSlices_ {0, 4, 8, 12, 2, 18, 24, 28};
     std::array<int64_t, 4> activationSlices_ {32, 33, 34, 35};
     std::array<int64_t, 4> ropeSlices_ {4, 5, 6, 7};
-    std::array<int64_t, 4> scaledScoreSlices_ {8, 9, 10, 11};
-    std::array<int64_t, 4> expScoreSlices_ {12, 13, 14, 15};
-    std::array<int64_t, 2> probabilitySlices_ {16, 17};
+    // Each local MXM owns an independent softmax scratch plane. This permits
+    // the two work items in a hemisphere wave to use VXM concurrently.
+    std::array<std::array<int64_t, 4>, 2> scaledScoreSlices_ {{{{8, 9, 10, 11}}, {{0, 1, 2, 3}}}};
+    std::array<std::array<int64_t, 4>, 2> expScoreSlices_ {{{{12, 13, 14, 15}}, {{4, 5, 6, 7}}}};
+    std::array<std::array<int64_t, 4>, 2> causalMaskSlices_ {{{{24, 25, 26, 27}}, {{20, 21, 22, 23}}}};
+    std::array<std::array<int64_t, 2>, 2> probabilitySlices_ {{{{16, 17}}, {{32, 33}}}};
     std::array<int64_t, 16> probabilityPackSlices_ {
         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35};
     std::array<int64_t, 16> probabilityDiagonalSlices_ {
@@ -88,6 +103,7 @@ private:
     int64_t ropeBase_ = 7000;
     int64_t scaledScoreBase_ = 0;
     int64_t expScoreBase_ = 0;
+    int64_t causalMaskBase_ = 8128;
     int64_t probabilityBase_ = 0;
     int64_t probabilityPackBase_ = 6000;
     int64_t probabilityDiagonalBase_ = 7000;

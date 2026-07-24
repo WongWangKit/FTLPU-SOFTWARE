@@ -40,10 +40,17 @@ The kernel IR is the first FTLPU-owned compiler layer. It should:
 
 - normalize StableHLO ops into a small LPU-oriented kernel set;
 - map each kernel to concrete LPU functional units such as MXM and VXM;
-- represent fused kernels such as SwiGLU as unit-level compositions, for
-  example `MXM + MXM + VXM + MXM`;
+- represent reusable computation primitives including `matmul`, `batch_matmul`,
+  `rope`, `softmax`, `transpose`, `swish`, and elementwise operations;
 - validate static shapes and element types supported by the LPU;
 - preserve quantization and layout metadata explicitly.
+
+FFN and attention are graphs of these primitives in the public Kernel IR, not
+opaque operations. Fusion is a later optimization decision. The current
+Tensor backend still uses an internal `ftlpu-compose-kernel-plans`
+compatibility pass while its allocation code is migrated to consume primitive
+graphs directly; this compatibility operation is not emitted by the
+StableHLO-to-Kernel pipeline.
 
 ### FTLPU Tensor IR
 
@@ -70,10 +77,16 @@ placement on slice 32, and int32 results use four `int32_byte_planar` slices
 40 through 43. Each placement records its slice list, base SRAM row,
 instruction count, and signed address stride. The current CModel convention
 uses a 16-row stride; weight Read commands walk the rows in reverse order.
-The complete `ftlpu.tensor.ffn` uses 320x640 gate/up weights and a 640x320 down
-weight. It keeps the shared activation on vector slice 32, stores the two
-320-column quantized hidden passes on slices 40 and 41, and places the final
-160x320 i8 result on slice 42. MXM int32 intermediates stay on streams.
+FFN is represented as a primitive physical task graph:
+two `ftlpu.tensor.matmul_task` projections, `ftlpu.tensor.swish_task`,
+`ftlpu.tensor.elementwise_task`, and one down-projection matmul task. Each
+matmul carries allocation lists for its operands and result. An empty result
+list means that the value remains transient in an MXM accumulator or stream.
+The elementwise result owns two allocations so the hidden tensor can be
+materialized independently in the west and east hemispheres; the down
+projection consumes both allocations. Addresses, placements, byte sizes, and
+quantization parameters are therefore attached to the primitive operation
+that uses them instead of being hidden in a compound `ftlpu.tensor.ffn`.
 
 ### FTLPU Stream IR
 
@@ -107,13 +120,17 @@ SSA operation order is used internally by the stream allocator to permit safe
 stream-range reuse, but no logical lifetime stage is emitted in Stream IR.
 Exact issue and arrival cycles are assigned by Stream-to-Schedule.
 
-`ftlpu.stream.ffn` represents the full topology directly. Each hidden pass
-loads a 320-column gate/up pair into MXM0/MXM1, one shared activation route
-feeds both computes, west groups `W0..W3` and `W4..W7` feed the SwiGLU VXM
-pipeline, and `E31` writes the two hidden chunks to slices 40 and 41. The down
-phase loads the two 320-row K partitions, reads both hidden slices on separate
-activation streams, produces two int32 partials, and uses VXM AddQuant before
-writing the final `E31` result to slice 42.
+FFN is also primitive in public Stream IR. Gate and up are separate
+`ftlpu.stream.matmul_task` operations fed by one shared activation route and
+independent dequantized weight routes. `swish_task` and an
+`elementwise_task` with `kind = "multiply"` expose the VXM dataflow and the
+two west/east hidden allocations. Two hidden MEM-to-MXM routes then feed
+separate down matmul tasks. A final `elementwise_task` with
+`kind = "add_quant"` merges their partials and owns the result allocation.
+Each matmul task explicitly records its MXM unit, weight buffer, and result
+stream range. The current Stream-to-Schedule implementation composes this
+graph into its established scheduling descriptor internally; the compound
+operation is not emitted by the StableHLO-to-Stream pipeline.
 
 ### LPU Target Model
 
@@ -123,6 +140,28 @@ columns, the additional SXM-to-MXM column, MXM dimensions and throughput,
 supported endpoint routes, register mapping, and transport latency. A latency
 means producer issue to consumer visibility, including the CModel tick phase;
 lowering passes must query the model instead of embedding compensating cycles.
+
+The target is configurable during architecture exploration:
+
+```text
+ftlpu_opt --target-config compiler/examples/targets/exploration_40_streams.json ...
+```
+
+The JSON file may override fields in the `memory`, `streams`, and `throughput`
+sections. Unspecified fields retain the default CModel-compatible values. The
+resolved configuration is serialized into the module as the `ftlpu.target`
+dictionary, so every intermediate MLIR file carries the parameters needed to
+reproduce later lowering. Kernel-to-Tensor, Tensor-to-Stream, and
+Stream-to-Schedule recover the model from that attribute. Configuration
+validation rejects non-positive dimensions, stream widths that exceed the
+directional fabric, invalid MEM slice bases, and incompatible tile geometry.
+
+`exploration_40_streams.json` is a regression configuration with 40 streams
+per direction and non-default MXM/VXM latencies. It lowers the generic W8A16
+FFN through Schedule IR and must produce a schedule different from the
+default target. Non-default Command/Binary execution additionally requires a
+runtime and CModel built for the same target ABI; silently executing such a
+binary on the default target is not valid.
 
 ### FTLPU Schedule IR
 

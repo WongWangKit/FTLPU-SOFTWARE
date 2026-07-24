@@ -2,6 +2,8 @@
 
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_projection_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_work_planner.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/lpu_resource_model.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/schedule_graph.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_memory_layout.hpp"
 
 #include "llvm/ADT/SmallVector.h"
@@ -18,10 +20,14 @@ void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t packedStream, int64_t repeatCount, int64_t repeatInterval,
     int64_t addressStride, llvm::StringRef destination = "sram")
 {
-    mlir::OperationState state(location, MemQueueOp::getOperationName());
+    const target::LPUTargetModel target;
+    mlir::OperationState state(location, MemTransferOp::getOperationName());
     state.addAttributes({
         rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
-        rewriter.getNamedAttr("queue", rewriter.getI64IntegerAttr(queue)),
+        rewriter.getNamedAttr("hemisphere", rewriter.getI64IntegerAttr(
+            queue / target.memory().slices_per_hemisphere)),
+        rewriter.getNamedAttr("slice", rewriter.getI64IntegerAttr(
+            queue % target.memory().slices_per_hemisphere)),
         rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
         rewriter.getNamedAttr("address", rewriter.getI64IntegerAttr(address)),
         rewriter.getNamedAttr("packed_stream", rewriter.getI64IntegerAttr(packedStream)),
@@ -38,10 +44,10 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t weightColumn, int64_t activationStream, int64_t outputStream,
     int64_t repeatCount, int64_t repeatInterval)
 {
-    mlir::OperationState state(location, MxmQueueOp::getOperationName());
+    mlir::OperationState state(location, MxmIssueOp::getOperationName());
     state.addAttributes({
         rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
-        rewriter.getNamedAttr("queue", rewriter.getI64IntegerAttr(queue)),
+        rewriter.getNamedAttr("unit_id", rewriter.getI64IntegerAttr(queue)),
         rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
         rewriter.getNamedAttr("weight_buffer", rewriter.getI64IntegerAttr(weightBuffer)),
         rewriter.getNamedAttr("weight_column", rewriter.getI64IntegerAttr(weightColumn)),
@@ -155,7 +161,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
     const int64_t weightToIw = target_.throughput().vxm_weight_to_iw_latency;
     const int64_t activationLatency = *target_.transport_latency(
         target::StreamEndpoint::Mem, target::StreamEndpoint::MxmActivation,
-        target::StreamDirection::East, target_.memory().w8a16_activation_slice_base);
+        target::StreamDirection::East, layout.activationSlices().front());
     const int64_t projectionHeads[] = {
         op_.getQueryHeads(), op_.getKvHeads(), op_.getKvHeads()};
     const mlir::Value projectionValues[] = {
@@ -202,11 +208,20 @@ int64_t AttentionScheduleEmitter::emitProjections()
             0.0f, "alu", aluBase + 4, 0.0f, "fp16", 2, hemi, hemi);
     };
 
+    const int64_t weightLoadLead =
+        (target_.memory().hemispheres - 1) * 8 + 7 + weightToIw + 1;
+    int64_t projectionBlock = 0;
     for (int64_t projection = 0; projection < 3; ++projection) {
         const auto kind = projectionKind(projection);
         for (int64_t headBase = 0; headBase < projectionHeads[projection]; headBase += 2) {
             for (int64_t reductionBlock = 0; reductionBlock < hiddenBlocks; ++reductionBlock) {
-                const int64_t dequantStart = phaseStart + 10;
+                const int64_t firstCompute = reductionBlock == 0
+                    ? phaseStart + readLatency(layout.weightSlices().back())
+                        + weightLoadLead
+                    : phaseStart;
+                const int64_t dequantStart = firstCompute - weightLoadLead;
+                const int64_t weightBuffer =
+                    projectionBlock % target_.throughput().mxm_weight_buffers;
                 for (int64_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
                     const int64_t head = headBase + hemisphere;
                     if (head >= projectionHeads[projection]) continue;
@@ -225,15 +240,21 @@ int64_t AttentionScheduleEmitter::emitProjections()
                         emitDequant(cycle, hemisphere, localMxm,
                             projectionValues[projection]);
                         emitMxm(rewriter_, op_.getLoc(), cycle + weightToIw,
-                            hemisphere * 2 + localMxm, "iw", 0, column,
+                            hemisphere * 2 + localMxm, "iw", weightBuffer, column,
                             0, 0, 1, 1);
                     }
                 }
 
-                const int64_t firstCompute = dequantStart + 32;
                 const bool finalReduction = reductionBlock + 1 == hiddenBlocks;
-                const int64_t computeBlockCycles = finalReduction
-                    ? 2 * tile : target_.mxm_block_issue_interval();
+                // Final projection tiles feed MXM results directly through
+                // RoPE/cast into a 32-slice packed MEM layout. The following
+                // tile cannot read its activation planes while that packed
+                // writeback owns the same MEM queues.
+                const int64_t projectionWritebackDrain =
+                    finalReduction ? tile : 0;
+                const int64_t computeBlockCycles =
+                    target_.mxm_block_issue_interval()
+                    + projectionWritebackDrain;
                 for (int64_t tokenBlock = 0; tokenBlock < tokenBlocks; ++tokenBlock) {
                     for (int64_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
                         const int64_t head = headBase + hemisphere;
@@ -244,26 +265,87 @@ int64_t AttentionScheduleEmitter::emitProjections()
                             reductionBlock, tokenBlock);
                         const int64_t outputAddress = layout.projectionAddress(
                             kind, head, tokenBlock);
-                        for (int64_t byte = 0; byte < 4; ++byte)
-                            emitMem(rewriter_, op_.getLoc(), computeCycle - activationLatency,
-                                hemisphere * target_.memory().slices_per_hemisphere
-                                    + layout.activationSlices()[byte],
-                                "read", inputAddress, byte, tile, 1, 1);
+                        llvm::SmallVector<int64_t> segmentRows;
+                        llvm::SmallVector<int64_t> segmentStreams;
+                        const bool prefetchNextWeight = !finalReduction
+                            && tokenBlock + 1 == tokenBlocks;
+                        if (prefetchNextWeight) {
+                            const int64_t nextFirstCompute =
+                                firstCompute + tokenBlocks * computeBlockCycles;
+                            const int64_t nextDequantStart =
+                                nextFirstCompute - weightLoadLead;
+                            const int64_t switchRow = nextDequantStart
+                                + hemisphere * 8 + weightToIw - computeCycle;
+                            if (switchRow > 0) {
+                                segmentRows.push_back(switchRow);
+                                segmentStreams.push_back(0);
+                            }
+                            const int64_t switchedRows = std::min<int64_t>(
+                                4, tile - switchRow);
+                            segmentRows.push_back(switchedRows);
+                            segmentStreams.push_back(
+                                target_.throughput().mxm_load_streams_per_cycle);
+                            if (switchRow + switchedRows < tile) {
+                                segmentRows.push_back(
+                                    tile - switchRow - switchedRows);
+                                segmentStreams.push_back(0);
+                            }
+                        } else {
+                            segmentRows.push_back(tile);
+                            segmentStreams.push_back(0);
+                        }
+                        int64_t rowOffset = 0;
+                        for (std::size_t segment = 0;
+                             segment < segmentRows.size(); ++segment) {
+                            const int64_t rows = segmentRows[segment];
+                            const int64_t streamBase = segmentStreams[segment];
+                            const int64_t segmentCycle = computeCycle + rowOffset;
+                            for (int64_t byte = 0; byte < 4; ++byte) {
+                                emitMem(rewriter_, op_.getLoc(),
+                                    segmentCycle - activationLatency,
+                                    hemisphere * target_.memory().slices_per_hemisphere
+                                        + layout.activationSlices()[byte],
+                                    "read", inputAddress + rowOffset,
+                                    streamBase + byte, rows, 1, 1);
+                            }
+                            emitMxm(rewriter_, op_.getLoc(), segmentCycle,
+                                hemisphere * 2, "compute", weightBuffer, 0,
+                                streamBase, 0, rows, 1);
+                            emitMxm(rewriter_, op_.getLoc(), segmentCycle,
+                                hemisphere * 2 + 1, "compute", weightBuffer, 0,
+                                streamBase + 2, 4, rows, 1);
+                            rowOffset += rows;
+                        }
                         const char* destination = finalReduction ? "stream" : "sram";
-                        emitMem(rewriter_, op_.getLoc(), computeCycle
-                                + target_.throughput().mxm0_accumulator_latency,
-                            hemisphere * target_.memory().slices_per_hemisphere
-                                + target_.memory().accumulator_slice_base,
-                            "accumulate", outputAddress, 32, tile, 1, 1, destination);
-                        emitMem(rewriter_, op_.getLoc(), computeCycle
-                                + target_.throughput().mxm1_accumulator_latency,
-                            hemisphere * target_.memory().slices_per_hemisphere
-                                + target_.memory().accumulator_slice_base + 4,
-                            "accumulate", outputAddress, 36, tile, 1, 1, destination);
-                        emitMxm(rewriter_, op_.getLoc(), computeCycle, hemisphere * 2,
-                            "compute", 0, 0, 0, 0, tile, 1);
-                        emitMxm(rewriter_, op_.getLoc(), computeCycle, hemisphere * 2 + 1,
-                            "compute", 0, 0, 2, 4, tile, 1);
+                        if (reductionBlock == 0) {
+                            for (int64_t byte = 0; byte < 4; ++byte) {
+                                emitMem(rewriter_, op_.getLoc(), computeCycle
+                                        + target_.throughput().mxm0_accumulator_latency,
+                                    hemisphere * target_.memory().slices_per_hemisphere
+                                        + target_.memory().accumulator_slice_base + byte,
+                                    "write", outputAddress, 32 + byte,
+                                    tile, 1, 1, "sram");
+                                emitMem(rewriter_, op_.getLoc(), computeCycle
+                                        + target_.throughput().mxm1_accumulator_latency,
+                                    hemisphere * target_.memory().slices_per_hemisphere
+                                        + target_.memory().accumulator_slice_base + 4 + byte,
+                                    "write", outputAddress, 36 + byte,
+                                    tile, 1, 1, "sram");
+                            }
+                        } else {
+                            emitMem(rewriter_, op_.getLoc(), computeCycle
+                                    + target_.throughput().mxm0_accumulator_latency,
+                                hemisphere * target_.memory().slices_per_hemisphere
+                                    + target_.memory().accumulator_slice_base,
+                                "accumulate", outputAddress, 32,
+                                tile, 1, 1, destination);
+                            emitMem(rewriter_, op_.getLoc(), computeCycle
+                                    + target_.throughput().mxm1_accumulator_latency,
+                                hemisphere * target_.memory().slices_per_hemisphere
+                                    + target_.memory().accumulator_slice_base + 4,
+                                "accumulate", outputAddress, 36,
+                                tile, 1, 1, destination);
+                        }
                         if (!finalReduction) continue;
 
                         for (int64_t offset = 0; offset < tile; ++offset) {
@@ -321,8 +403,8 @@ int64_t AttentionScheduleEmitter::emitProjections()
                         }
                     }
                 }
-                phaseStart = firstCompute + tokenBlocks * computeBlockCycles
-                    + (finalReduction ? 16 : 0);
+                phaseStart = firstCompute + tokenBlocks * computeBlockCycles;
+                ++projectionBlock;
             }
         }
     }
@@ -417,8 +499,60 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
         static_cast<int64_t>(op_.getQueryHeads()), static_cast<int64_t>(op_.getKvHeads()),
         static_cast<int64_t>(op_.getHeadDim())}, target_);
     const float scale = 1.0f / std::sqrt(static_cast<float>(op_.getHeadDim()));
+    constexpr float causalMaskValue = -1.0e9f;
     constexpr int64_t outputStream = 8;
-    int64_t softmaxCycle = qkEnd + 16;
+    const int64_t softmaxDuration = 3 * op_.getSeqLen() + 20;
+    ScheduleGraph graph;
+    ResourceScheduler scheduler;
+    LPUResourceModel resources(target_);
+    std::vector<std::array<std::optional<ScheduleNodeId>, 2>> waveNodes(
+        plan.qk_waves().size());
+    std::array<std::optional<ScheduleNodeId>, 2> previousNode;
+    for (std::size_t waveIndex = 0; waveIndex < plan.qk_waves().size(); ++waveIndex) {
+        const AttentionWorkWave& wave = plan.qk_waves()[waveIndex];
+        for (int64_t hemisphere = 0; hemisphere < target_.memory().hemispheres;
+             ++hemisphere) {
+            llvm::SmallVector<ResourceWindow, 32> windows;
+            bool hasWork = false;
+            for (const auto& work : wave.slots) {
+                if (!work || work->hemisphere != hemisphere) continue;
+                hasWork = true;
+                const int64_t lane = work->local_mxm;
+                const int64_t aluBase = hemisphere * 6 + lane * 3;
+                for (int64_t alu = 0; alu < 3; ++alu)
+                    windows.push_back(
+                        {resources.vxm_alu(aluBase + alu), 0, softmaxDuration});
+                const auto addMemResources = [&](llvm::ArrayRef<int64_t> slices) {
+                    for (int64_t slice : slices)
+                        windows.push_back(
+                            {resources.mem_slice(hemisphere, slice), 0, softmaxDuration});
+                };
+                addMemResources(layout.scaledScoreSlices(lane));
+                addMemResources(layout.expScoreSlices(lane));
+                addMemResources(layout.causalMaskSlices(lane));
+                addMemResources(layout.probabilitySlices(lane));
+            }
+            if (!hasWork) continue;
+            const auto node = graph.add_node(
+                "softmax.wave" + std::to_string(waveIndex) + ".h"
+                    + std::to_string(hemisphere),
+                qkEnd + 16, softmaxDuration, windows);
+            if (previousNode[static_cast<std::size_t>(hemisphere)]
+                && mlir::failed(graph.add_dependency(
+                    *previousNode[static_cast<std::size_t>(hemisphere)], node))) {
+                op_.emitError("failed to construct the softmax schedule graph");
+                return qkEnd;
+            }
+            previousNode[static_cast<std::size_t>(hemisphere)] = node;
+            waveNodes[waveIndex][static_cast<std::size_t>(hemisphere)] = node;
+        }
+    }
+    auto scheduled = graph.schedule(scheduler);
+    if (mlir::failed(scheduled)) {
+        op_.emitError("softmax schedule graph contains a cycle or invalid duration");
+        return qkEnd;
+    }
+    std::array<int64_t, 2> softmaxReady {qkEnd + 16, qkEnd + 16};
     const auto readLatency = [&](int64_t slice) {
         return slice / target_.streams().mem_slices_per_register_group + 2;
     };
@@ -427,39 +561,89 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                          llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
                          llvm::StringRef castTarget, int64_t stream, int64_t hemisphere) {
         const char* hemi = hemisphere == 0 ? "east" : "west";
-        emitVxm(rewriter_, op_, op_.getInput(), cycle, queue, opcode,
+        emitVxm(rewriter_, op_, op_.getInput(), cycle,
+            queue, opcode,
             lhsKind, lhsIndex, lhsImmediate, rhsKind, rhsIndex, rhsImmediate,
             castTarget, stream, hemi, hemi);
     };
 
-    for (const AttentionWorkWave& wave : plan.qk_waves()) {
-        for (const auto& work : wave.slots) {
-            if (!work) continue;
-            const int64_t hemisphere = work->hemisphere;
+    for (std::size_t waveIndex = 0; waveIndex < plan.qk_waves().size(); ++waveIndex) {
+        const AttentionWorkWave& wave = plan.qk_waves()[waveIndex];
+        for (int64_t hemisphere = 0; hemisphere < target_.memory().hemispheres;
+             ++hemisphere) {
+            llvm::SmallVector<const AttentionWorkItem*> workLines;
+            for (const auto& work : wave.slots)
+                if (work && work->hemisphere == hemisphere) workLines.push_back(&*work);
+            if (workLines.empty()) continue;
+
+            const auto node = waveNodes[waveIndex][static_cast<std::size_t>(hemisphere)];
+            if (!node) continue;
+            const int64_t softmaxCycle = (*scheduled)[*node].cycle;
+            const int64_t pass3End = softmaxCycle + 3 * op_.getSeqLen() + 20;
+            for (const AttentionWorkItem* work : workLines) {
+            const int64_t lane = work->local_mxm;
+            const int64_t aluBase = hemisphere * 6 + lane * 3;
+            const int64_t inputStream = 32 + lane * 4;
+            const int64_t maskStream = 40 + lane * 4;
+            const int64_t outputStreamBase = outputStream + lane * 4;
             const int64_t accumulatorBase = target_.memory().accumulator_slice_base
-                + work->local_mxm * target_.memory().accumulator_slices_per_mxm;
+                + lane * target_.memory().accumulator_slices_per_mxm;
 
             for (int64_t key = 0; key < op_.getSeqLen(); ++key) {
                 const int64_t cycle = softmaxCycle + key;
+                const int64_t keyBlock =
+                    key / target_.throughput().mxm_rows;
+                const int64_t localKey =
+                    key % target_.throughput().mxm_rows;
+                const bool vectorMask = op_.getCausal()
+                    && keyBlock == work->query_block && localKey != 0;
                 for (int64_t byte = 0; byte < 4; ++byte) {
                     const int64_t slice = accumulatorBase + byte;
                     emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
                         "read", layout.scoreTokenAddress(work->query_head,
-                            work->query_block, key), 32 + byte, 1, 1, 0);
+                            work->query_block, key), inputStream + byte, 1, 1, 0);
                 }
-                vxm(cycle, 0, "multiply", "stream_f32", 32, 0.0f,
-                    "immediate", 0, scale, "fp32", outputStream, hemisphere);
-                vxm(cycle + 1, 1, key == 0 ? "pass" : "max",
-                    "alu", key == 0 ? 0 : 1, 0.0f,
-                    key == 0 ? "immediate" : "alu", key == 0 ? 0 : 0, 0.0f,
-                    "fp32", -1, hemisphere);
+                if (vectorMask) {
+                    for (int64_t byte = 0; byte < 4; ++byte) {
+                        const int64_t slice = layout.causalMaskSlices(lane)[byte];
+                        emitMem(rewriter_, op_.getLoc(),
+                            cycle + 1 - readLatency(slice),
+                            hemisphere * target_.memory().slices_per_hemisphere
+                                + slice,
+                            "read", layout.causalMaskAddress(localKey),
+                            maskStream + byte, 1, 1, 0);
+                    }
+                }
+                vxm(cycle, aluBase, "multiply", "stream_f32", inputStream, 0.0f,
+                    "immediate", 0, scale, "fp32",
+                    op_.getCausal() ? -1 : outputStreamBase, hemisphere);
+                if (op_.getCausal()) {
+                    const float immediateMask =
+                        keyBlock > work->query_block ? causalMaskValue : 0.0f;
+                    vxm(cycle + 1, aluBase + 1, "add", "alu", aluBase, 0.0f,
+                        vectorMask ? "stream_f32" : "immediate",
+                        vectorMask ? maskStream : 0, immediateMask,
+                        "fp32", outputStreamBase, hemisphere);
+                    vxm(cycle + 2, aluBase + 2, key == 0 ? "pass" : "max",
+                        "alu", key == 0 ? aluBase + 1 : aluBase + 2, 0.0f,
+                        key == 0 ? "immediate" : "alu",
+                        key == 0 ? 0 : aluBase + 1, 0.0f,
+                        "fp32", -1, hemisphere);
+                } else {
+                    vxm(cycle + 1, aluBase + 2, key == 0 ? "pass" : "max",
+                        "alu", key == 0 ? aluBase : aluBase + 2, 0.0f,
+                        key == 0 ? "immediate" : "alu",
+                        key == 0 ? 0 : aluBase, 0.0f,
+                        "fp32", -1, hemisphere);
+                }
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                    const int64_t slice = layout.scaledScoreSlices()[byte];
-                    emitMem(rewriter_, op_.getLoc(), cycle + 1
+                    const int64_t slice = layout.scaledScoreSlices(lane)[byte];
+                    emitMem(rewriter_, op_.getLoc(), cycle
+                            + (op_.getCausal() ? 2 : 1)
                             + slice / target_.streams().mem_slices_per_register_group,
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "write", layout.scaledScoreAddress(key), outputStream + byte,
+                        "write", layout.scaledScoreAddress(key), outputStreamBase + byte,
                         1, 1, 0);
                 }
             }
@@ -468,25 +652,25 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
             for (int64_t key = 0; key < op_.getSeqLen(); ++key) {
                 const int64_t cycle = pass2Start + key;
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                    const int64_t slice = layout.scaledScoreSlices()[byte];
+                    const int64_t slice = layout.scaledScoreSlices(lane)[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "read", layout.scaledScoreAddress(key), 32 + byte, 1, 1, 0);
+                        "read", layout.scaledScoreAddress(key), inputStream + byte, 1, 1, 0);
                 }
-                vxm(cycle, 2, "subtract", "stream_f32", 32, 0.0f,
-                    "alu", 1, 0.0f, "fp32", -1, hemisphere);
-                vxm(cycle + 1, 3, "exp", "alu", 2, 0.0f,
-                    "immediate", 0, 0.0f, "fp32", outputStream, hemisphere);
-                vxm(cycle + 2, 4, key == 0 ? "pass" : "add",
-                    "alu", key == 0 ? 3 : 4, 0.0f,
-                    key == 0 ? "immediate" : "alu", key == 0 ? 0 : 3, 0.0f,
+                vxm(cycle, aluBase, "subtract", "stream_f32", inputStream, 0.0f,
+                    "alu", aluBase + 2, 0.0f, "fp32", -1, hemisphere);
+                vxm(cycle + 1, aluBase + 1, "exp", "alu", aluBase, 0.0f,
+                    "immediate", 0, 0.0f, "fp32", outputStreamBase, hemisphere);
+                vxm(cycle + 2, aluBase + 2, key == 0 ? "pass" : "add",
+                    "alu", key == 0 ? aluBase + 1 : aluBase + 2, 0.0f,
+                    key == 0 ? "immediate" : "alu", key == 0 ? 0 : aluBase + 1, 0.0f,
                     "fp32", -1, hemisphere);
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                    const int64_t slice = layout.expScoreSlices()[byte];
+                    const int64_t slice = layout.expScoreSlices(lane)[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle + 2
                             + slice / target_.streams().mem_slices_per_register_group,
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "write", layout.expScoreAddress(key), outputStream + byte,
+                        "write", layout.expScoreAddress(key), outputStreamBase + byte,
                         1, 1, 0);
                 }
             }
@@ -495,29 +679,37 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
             for (int64_t key = 0; key < op_.getSeqLen(); ++key) {
                 const int64_t cycle = pass3Start + key;
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                    const int64_t slice = layout.expScoreSlices()[byte];
+                    const int64_t slice = layout.expScoreSlices(lane)[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "read", layout.expScoreAddress(key), 32 + byte, 1, 1, 0);
+                        "read", layout.expScoreAddress(key), inputStream + byte, 1, 1, 0);
                 }
-                vxm(cycle, 5, "divide", "stream_f32", 32, 0.0f,
-                    "alu", 4, 0.0f, "fp32", -1, hemisphere);
-                vxm(cycle + 1, 6, "cast", "alu", 5, 0.0f,
-                    "immediate", 0, 0.0f, "fp16", outputStream, hemisphere);
+                vxm(cycle, aluBase, "divide", "stream_f32", inputStream, 0.0f,
+                    "alu", aluBase + 2, 0.0f, "fp32", -1, hemisphere);
+                vxm(cycle + 1, aluBase + 1, "cast", "alu", aluBase, 0.0f,
+                    "immediate", 0, 0.0f, "fp16", outputStreamBase, hemisphere);
                 for (int64_t byte = 0; byte < 2; ++byte) {
-                    const int64_t slice = layout.probabilitySlices()[byte];
+                    const int64_t slice = layout.probabilitySlices(lane)[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle + 2
                             + slice / target_.streams().mem_slices_per_register_group,
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
                         "write", layout.probabilityAddress(work->query_head,
-                            work->query_block, key), outputStream + byte,
+                            work->query_block, key), outputStreamBase + byte,
                         1, 1, 0);
                 }
             }
-            softmaxCycle = pass3Start + op_.getSeqLen() + 8;
+            }
+            // Mask and probability use disjoint planes, so a new wave can
+            // start as soon as the preceding wave's final write is issued.
+            softmaxReady[static_cast<std::size_t>(hemisphere)] =
+                std::max(softmaxReady[static_cast<std::size_t>(hemisphere)],
+                    pass3End);
         }
     }
-    return softmaxCycle;
+    // Probability-pack reads begin with a six-cycle MEM lead. Preserve the
+    // final probability-write tail before that next phase turns the planes
+    // around.
+    return std::max(softmaxReady[0], softmaxReady[1]) + 16;
 }
 
 int64_t AttentionScheduleEmitter::emitProbabilityPack(int64_t softmaxEnd)
@@ -529,14 +721,16 @@ int64_t AttentionScheduleEmitter::emitProbabilityPack(int64_t softmaxEnd)
     const auto readLatency = [&](int64_t slice) {
         return slice / target_.streams().mem_slices_per_register_group + 2;
     };
-    int64_t cycle = softmaxEnd + 32;
+    // SoftmaxEnd already includes the final probability-write tail. Two
+    // cycles are sufficient to turn the same byte planes around for reading.
+    int64_t cycle = softmaxEnd + 2;
     for (const auto& wave : planner.qk_waves()) {
         for (const auto& work : wave.slots) {
             if (!work) continue;
             const char* hemisphere = work->hemisphere == 0 ? "east" : "west";
             for (int64_t key = 0; key < op_.getSeqLen(); ++key, ++cycle) {
                 for (int64_t byte = 0; byte < 2; ++byte) {
-                    const int64_t slice = layout.probabilitySlices()[byte];
+                    const int64_t slice = layout.probabilitySlices(work->local_mxm)[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
                         work->hemisphere * target_.memory().slices_per_hemisphere + slice,
                         "read", layout.probabilityAddress(work->query_head,
@@ -558,10 +752,13 @@ int64_t AttentionScheduleEmitter::emitProbabilityPack(int64_t softmaxEnd)
                         byte, 1, 1, 0);
                 }
             }
-            cycle += 8;
         }
     }
-    return cycle + 16;
+    const int64_t finalPackWriteTail =
+        layout.probabilityPackSlices().back()
+            / target_.streams().mem_slices_per_register_group
+        + 1;
+    return cycle + finalPackWriteTail;
 }
 
 int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
@@ -658,6 +855,13 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
         / target_.streams().mem_slices_per_register_group;
     const int64_t memToSxm = target_.throughput().mem_to_sxm_latency;
     const int64_t memToMxm = target_.throughput().mem_to_mxm_latency;
+    int64_t contextWriteTail = 0;
+    for (int64_t byte = 0; byte < 8; ++byte) {
+        const int64_t slice = layout.contextSlices()[byte];
+        contextWriteTail = std::max(contextWriteTail,
+            (byte < 4 ? 1 : 2)
+                + slice / target_.streams().mem_slices_per_register_group + 1);
+    }
     const auto identity = identityMap();
     std::array<int64_t, 16> inputStreams {};
     std::array<int64_t, 16> transposeStreams {};
@@ -865,15 +1069,16 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                                 * target_.memory().slices_per_hemisphere + slice,
                                         "write", layout.contextAddress(
                                             *head, queryBlock * tile + offset),
-                                        contextOutputStreamBase + byte, 1, 1, 0);
+                                    contextOutputStreamBase + byte, 1, 1, 0);
                                 }
                             }
                         }
+                        blockEnd = std::max(blockEnd,
+                            readStart + tile + contextWriteTail);
+                    } else {
+                        blockEnd = std::max(blockEnd,
+                            firstCompute + tile - memToMxm);
                     }
-                    blockEnd = std::max(blockEnd, firstCompute + 2 * tile
-                        + (keyBlock + 1 == tokenBlocks
-                                ? 40 + hemisphere * (tile + 16)
-                                : 16));
                 }
                 phaseStart = blockEnd;
             }
@@ -898,12 +1103,18 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
     const auto readLatency = [&](int64_t slice) {
         return slice / target_.streams().mem_slices_per_register_group + 2;
     };
+    const int64_t weightLoadLead =
+        (target_.memory().hemispheres - 1) * 8 + 3 + weightToIw + 1;
 
     int64_t phaseStart = pvEnd;
     for (int64_t outputGroup = 0; outputGroup < outputGroups; ++outputGroup) {
         for (int64_t reductionBlock = 0; reductionBlock < reductionBlocks;
              ++reductionBlock) {
-            const int64_t dequantStart = phaseStart + 10;
+            const int64_t firstCompute = reductionBlock == 0
+                ? phaseStart + readLatency(layout.outputWeightSlices().back())
+                    + weightLoadLead
+                : phaseStart;
+            const int64_t dequantStart = firstCompute - weightLoadLead;
             const int64_t weightBuffer =
                 (outputGroup * reductionBlocks + reductionBlock)
                 % target_.throughput().mxm_weight_buffers;
@@ -940,25 +1151,74 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
 
             const bool firstReduction = reductionBlock == 0;
             const bool finalReduction = reductionBlock + 1 == reductionBlocks;
-            const int64_t computeInterval = 2 * tile;
-            const int64_t firstCompute = dequantStart + 32;
+            const int64_t computeInterval = tile;
             const int64_t queryHead = reductionBlock / (op_.getHeadDim() / tile);
             const int64_t headBlock = reductionBlock % (op_.getHeadDim() / tile);
             for (int64_t tokenBlock = 0; tokenBlock < tokenBlocks; ++tokenBlock) {
                 const int64_t computeBase = firstCompute + tokenBlock * computeInterval;
                 for (int64_t hemisphere = 0;
                      hemisphere < target_.memory().hemispheres; ++hemisphere) {
-                    const int64_t computeCycle = computeBase + hemisphere * tile;
-                    for (int64_t byte = 0; byte < 2; ++byte) {
-                        const int64_t slice = layout.contextSlices()[headBlock * 2 + byte];
-                        const int64_t latency = *target_.transport_latency(
-                            target::StreamEndpoint::Mem,
-                            target::StreamEndpoint::MxmActivation,
-                            target::StreamDirection::East, slice);
-                        emitMem(rewriter_, op_.getLoc(), computeCycle - latency,
-                            hemisphere * target_.memory().slices_per_hemisphere + slice,
-                            "read", layout.contextAddress(queryHead, tokenBlock * tile),
-                            hemisphere * 2 + byte, tile, 1, 1);
+                    const int64_t computeCycle = computeBase;
+                    llvm::SmallVector<int64_t> segmentRows;
+                    llvm::SmallVector<int64_t> segmentStreams;
+                    const bool prefetchNextWeight = !finalReduction
+                        && tokenBlock + 1 == tokenBlocks;
+                    if (prefetchNextWeight) {
+                        const int64_t nextFirstCompute =
+                            firstCompute + tokenBlocks * computeInterval;
+                        const int64_t nextDequantStart =
+                            nextFirstCompute - weightLoadLead;
+                        const int64_t switchRow = nextDequantStart
+                            + hemisphere * 8 + weightToIw - computeCycle;
+                        if (switchRow > 0) {
+                            segmentRows.push_back(switchRow);
+                            segmentStreams.push_back(0);
+                        }
+                        const int64_t switchedRows =
+                            std::min<int64_t>(4, tile - switchRow);
+                        segmentRows.push_back(switchedRows);
+                        segmentStreams.push_back(
+                            target_.throughput().mxm_load_streams_per_cycle);
+                        if (switchRow + switchedRows < tile) {
+                            segmentRows.push_back(
+                                tile - switchRow - switchedRows);
+                            segmentStreams.push_back(0);
+                        }
+                    } else {
+                        segmentRows.push_back(tile);
+                        segmentStreams.push_back(0);
+                    }
+                    int64_t rowOffset = 0;
+                    for (std::size_t segment = 0;
+                         segment < segmentRows.size(); ++segment) {
+                        const int64_t rows = segmentRows[segment];
+                        const int64_t streamBase = segmentStreams[segment];
+                        const int64_t segmentCycle = computeCycle + rowOffset;
+                        for (int64_t byte = 0; byte < 2; ++byte) {
+                            const int64_t slice =
+                                layout.contextSlices()[headBlock * 2 + byte];
+                            const int64_t latency = *target_.transport_latency(
+                                target::StreamEndpoint::Mem,
+                                target::StreamEndpoint::MxmActivation,
+                                target::StreamDirection::East, slice);
+                            emitMem(rewriter_, op_.getLoc(),
+                                segmentCycle - latency,
+                                hemisphere * target_.memory().slices_per_hemisphere
+                                    + slice,
+                                "read",
+                                layout.contextAddress(queryHead,
+                                    tokenBlock * tile + rowOffset),
+                                streamBase + hemisphere * 2 + byte,
+                                rows, 1, 1);
+                        }
+                        emitMxm(rewriter_, op_.getLoc(), segmentCycle,
+                            hemisphere
+                                * target_.throughput().mxms_per_hemisphere
+                                + localMxm,
+                            "compute", weightBuffer, 0,
+                            streamBase + hemisphere * 2,
+                            8 + hemisphere * 4, rows, 1);
+                        rowOffset += rows;
                     }
                     const int64_t accumulatorCycle = computeCycle
                         + accumulatorLatency;
@@ -980,14 +1240,13 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                             40 + hemisphere * 4, tile, 1, 1,
                             "sram");
                     }
-                    emitMxm(rewriter_, op_.getLoc(), computeCycle,
-                        hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
-                        "compute", weightBuffer, 0, hemisphere * 2,
-                        8 + hemisphere * 4, tile, 1);
                 }
 
             }
-            phaseStart = firstCompute + tokenBlocks * computeInterval + 16;
+            phaseStart = firstCompute + tokenBlocks * computeInterval
+                + (finalReduction
+                        ? accumulatorLatency + readLatency(accumulatorSlice)
+                        : 0);
             if (finalReduction) {
                 const int64_t castStart = phaseStart;
                 for (int64_t hemisphere = 0;
@@ -996,8 +1255,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                     const int64_t inputStream = 32 + hemisphere * 4;
                     const int64_t outputStream = hemisphere * 2;
                     for (int64_t token = 0; token < op_.getSeqLen(); ++token) {
-                        const int64_t vxmCycle = castStart
-                            + hemisphere * op_.getSeqLen() + token;
+                        const int64_t vxmCycle = castStart + token;
                         for (int64_t byte = 0; byte < 4; ++byte) {
                             const int64_t slice = accumulatorSlice + byte;
                             const int64_t latency = *target_.transport_latency(
@@ -1025,8 +1283,12 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                         }
                     }
                 }
+                const int64_t finalWriteLatency = *target_.transport_latency(
+                    target::StreamEndpoint::VxmResult,
+                    target::StreamEndpoint::Mem,
+                    target::StreamDirection::East, 31);
                 phaseStart = castStart
-                    + target_.memory().hemispheres * op_.getSeqLen() + 16;
+                    + op_.getSeqLen() + finalWriteLatency;
             }
         }
     }
@@ -1055,14 +1317,21 @@ mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
     }
     const int64_t qkWaveComputeCycles = tokenBlocks * headBlocks * issue;
     const int64_t qkIwToComputeCycles = 24;
-    const int64_t qkWaveCycles = target_.throughput().mxm_earliest_iw_cycle
+    const int64_t qkFirstIwOffset = target_.throughput().mxm_earliest_iw_cycle
         + *target_.transport_latency(target::StreamEndpoint::Mem,
-            target::StreamEndpoint::MxmWeight, target::StreamDirection::East, 0)
-        + qkIwToComputeCycles + qkWaveComputeCycles + 16;
-    const int64_t qkCycles = attentionPlan.qk_waves().size() * qkWaveCycles;
+            target::StreamEndpoint::MxmWeight, target::StreamDirection::East, 0);
+    const int64_t qkFirstComputeOffset = qkFirstIwOffset + qkIwToComputeCycles;
+    const int64_t qkComputeEnd = qkFirstComputeOffset + qkWaveComputeCycles;
+    const int64_t qkWaveInterval = qkComputeEnd - qkFirstIwOffset;
+    const int64_t qkWaveDuration = qkComputeEnd
+        + std::max(target_.throughput().mxm0_accumulator_latency,
+            target_.throughput().mxm1_accumulator_latency);
     const int64_t qkStart = projectionEnd;
-    const int64_t qkEnd = qkStart + qkCycles;
-    emitQk(qkStart, qkWaveCycles, qkIwToComputeCycles);
+    const int64_t qkEnd = qkStart
+        + (attentionPlan.qk_waves().size() - 1) * qkWaveInterval
+        + qkWaveDuration;
+    const int64_t qkCycles = qkEnd - qkStart;
+    emitQk(qkStart, qkWaveInterval, qkIwToComputeCycles);
     const int64_t softmaxEnd = emitSoftmax(qkEnd);
     const int64_t softmaxCycles = softmaxEnd - qkEnd;
     const int64_t probabilityPackEnd = emitProbabilityPack(softmaxEnd);
@@ -1104,7 +1373,8 @@ mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
     appendPhase("o_proj", outputProjectionCycles);
     const int64_t pvStart = probabilityTransposeEnd;
     const auto appendWaves = [&](llvm::StringRef phaseName,
-        const std::vector<AttentionWorkWave>& waves, int64_t start, int64_t interval) {
+        const std::vector<AttentionWorkWave>& waves, int64_t start,
+        int64_t interval, int64_t duration) {
         for (std::size_t index = 0; index < waves.size(); ++index) {
             llvm::SmallVector<mlir::Attribute> slots;
             for (const auto& work : waves[index].slots) {
@@ -1122,13 +1392,15 @@ mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
                 rewriter_.getNamedAttr("phase", rewriter_.getStringAttr(phaseName)),
                 rewriter_.getNamedAttr("index", rewriter_.getI64IntegerAttr(index)),
                 rewriter_.getNamedAttr("start", rewriter_.getI64IntegerAttr(waveStart)),
-                rewriter_.getNamedAttr("end", rewriter_.getI64IntegerAttr(waveStart + interval)),
+                rewriter_.getNamedAttr("end", rewriter_.getI64IntegerAttr(waveStart + duration)),
                 rewriter_.getNamedAttr("slots", rewriter_.getArrayAttr(slots)),
             }));
         }
     };
-    appendWaves("qk", attentionPlan.qk_waves(), qkStart, qkWaveCycles);
-    appendWaves("pv", attentionPlan.pv_waves(), pvStart, qkWaveComputeCycles);
+    appendWaves("qk", attentionPlan.qk_waves(), qkStart,
+        qkWaveInterval, qkWaveDuration);
+    appendWaves("pv", attentionPlan.pv_waves(), pvStart,
+        qkWaveComputeCycles, qkWaveComputeCycles);
     mlir::OperationState state(op_.getLoc(), AttentionOp::getOperationName());
     state.addOperands(op_->getOperands());
     state.addTypes(op_.getResult().getType());

@@ -19,6 +19,133 @@ mlir::FailureOr<int64_t> get_mem_slice(mlir::DictionaryAttr address)
     return slice.getInt();
 }
 
+struct TaskAllocation {
+    mlir::DictionaryAttr address;
+    mlir::DictionaryAttr placement;
+    int64_t bytes;
+};
+
+mlir::FailureOr<TaskAllocation> get_task_allocation(
+    mlir::ArrayAttr allocations, size_t index)
+{
+    if (index >= allocations.size()) return mlir::failure();
+    const auto dictionary =
+        llvm::dyn_cast<mlir::DictionaryAttr>(allocations[index]);
+    if (!dictionary) return mlir::failure();
+    const auto address =
+        dictionary.getAs<mlir::DictionaryAttr>("address");
+    const auto placement =
+        dictionary.getAs<mlir::DictionaryAttr>("placement");
+    const auto bytes = dictionary.getAs<mlir::IntegerAttr>("bytes");
+    if (!address || !placement || !bytes) return mlir::failure();
+    return TaskAllocation{address, placement, bytes.getInt()};
+}
+
+struct TensorFfnPlan {
+    tensor::MatmulTaskOp gate;
+    tensor::MatmulTaskOp up;
+    tensor::SwishTaskOp swish;
+    tensor::ElementwiseTaskOp multiply;
+    tensor::MatmulTaskOp down;
+    TaskAllocation input;
+    TaskAllocation gate_weight;
+    TaskAllocation up_weight;
+    TaskAllocation down_weight;
+    TaskAllocation hidden0;
+    TaskAllocation hidden1;
+    TaskAllocation result;
+    mlir::FloatAttr gate_scale;
+    mlir::FloatAttr up_scale;
+    mlir::FloatAttr hidden_scale;
+    mlir::IntegerAttr hidden_zero_point;
+    mlir::FloatAttr down_lhs_scale;
+    mlir::FloatAttr down_rhs_scale;
+    mlir::FloatAttr output_scale;
+    mlir::IntegerAttr output_zero_point;
+
+    mlir::Value getInput() { return gate.getLhs(); }
+    mlir::Value getGateWeight() { return gate.getRhs(); }
+    mlir::Value getUpWeight() { return up.getRhs(); }
+    mlir::Value getDownWeight() { return down.getRhs(); }
+    mlir::Value getResult() { return down.getResult(); }
+    mlir::Location getLoc() { return down.getLoc(); }
+    uint64_t getM() { return down.getM(); }
+    uint64_t getK() { return gate.getK(); }
+    uint64_t getHidden() { return gate.getN(); }
+    uint64_t getN() { return down.getN(); }
+    mlir::DictionaryAttr getInputAddress() { return input.address; }
+    mlir::DictionaryAttr getInputPlacement() { return input.placement; }
+    int64_t getInputBytes() { return input.bytes; }
+    mlir::DictionaryAttr getGateWeightAddress()
+    {
+        return gate_weight.address;
+    }
+    mlir::DictionaryAttr getGateWeightPlacement()
+    {
+        return gate_weight.placement;
+    }
+    int64_t getGateWeightBytes() { return gate_weight.bytes; }
+    mlir::DictionaryAttr getUpWeightAddress()
+    {
+        return up_weight.address;
+    }
+    mlir::DictionaryAttr getUpWeightPlacement()
+    {
+        return up_weight.placement;
+    }
+    int64_t getUpWeightBytes() { return up_weight.bytes; }
+    mlir::DictionaryAttr getDownWeightAddress()
+    {
+        return down_weight.address;
+    }
+    mlir::DictionaryAttr getDownWeightPlacement()
+    {
+        return down_weight.placement;
+    }
+    int64_t getDownWeightBytes() { return down_weight.bytes; }
+    mlir::DictionaryAttr getHidden0Address() { return hidden0.address; }
+    mlir::DictionaryAttr getHidden0Placement()
+    {
+        return hidden0.placement;
+    }
+    mlir::DictionaryAttr getHidden1Address() { return hidden1.address; }
+    mlir::DictionaryAttr getHidden1Placement()
+    {
+        return hidden1.placement;
+    }
+    int64_t getHiddenPassBytes() { return hidden0.bytes; }
+    mlir::DictionaryAttr getResultAddress() { return result.address; }
+    mlir::DictionaryAttr getResultPlacement()
+    {
+        return result.placement;
+    }
+    int64_t getResultBytes() { return result.bytes; }
+    llvm::APFloat getGateScale() { return gate_scale.getValue(); }
+    llvm::APFloat getUpScale() { return up_scale.getValue(); }
+    llvm::APFloat getDownRhsScale()
+    {
+        return down_rhs_scale.getValue();
+    }
+    mlir::FloatAttr getGateScaleAttr() { return gate_scale; }
+    mlir::FloatAttr getUpScaleAttr() { return up_scale; }
+    mlir::FloatAttr getHiddenScaleAttr() { return hidden_scale; }
+    mlir::IntegerAttr getHiddenZeroPointAttr()
+    {
+        return hidden_zero_point;
+    }
+    mlir::FloatAttr getDownLhsScaleAttr() { return down_lhs_scale; }
+    mlir::FloatAttr getDownRhsScaleAttr() { return down_rhs_scale; }
+    mlir::FloatAttr getOutputScaleAttr() { return output_scale; }
+    mlir::IntegerAttr getOutputZeroPointAttr()
+    {
+        return output_zero_point;
+    }
+    mlir::InFlightDiagnostic emitError(llvm::StringRef message)
+    {
+        return down.emitError(message);
+    }
+};
+
 class LowerTensorToStreamPass final
     : public mlir::PassWrapper<LowerTensorToStreamPass, mlir::OperationPass<mlir::func::FuncOp>> {
 public:
@@ -39,18 +166,93 @@ public:
             return;
         }
 
-        const target::LPUTargetModel target;
+        auto target_model =
+            target::LPUTargetModel::from_operation(function);
+        if (mlir::failed(target_model)) {
+            signalPassFailure();
+            return;
+        }
+        const target::LPUTargetModel& target = *target_model;
         stream::StreamAllocator allocator(target);
+        mlir::IRRewriter rewriter(&getContext());
+
+        llvm::SmallVector<TensorFfnPlan, 2> ffns;
+        llvm::SmallVector<tensor::MatmulTaskOp> task_matmuls;
+        function.walk(
+            [&](tensor::MatmulTaskOp op) { task_matmuls.push_back(op); });
+        for (tensor::MatmulTaskOp down : task_matmuls) {
+            auto multiply =
+                down.getLhs().getDefiningOp<tensor::ElementwiseTaskOp>();
+            if (!multiply || multiply.getKind() != "multiply") continue;
+            auto swish =
+                multiply.getLhs().getDefiningOp<tensor::SwishTaskOp>();
+            auto gate = swish
+                ? swish.getInput().getDefiningOp<tensor::MatmulTaskOp>()
+                : tensor::MatmulTaskOp{};
+            auto up =
+                multiply.getRhs().getDefiningOp<tensor::MatmulTaskOp>();
+            if (!swish || !gate || !up || gate.getLhs() != up.getLhs())
+                continue;
+
+            const auto input =
+                get_task_allocation(gate.getLhsAllocations(), 0);
+            const auto gate_weight =
+                get_task_allocation(gate.getRhsAllocations(), 0);
+            const auto up_weight =
+                get_task_allocation(up.getRhsAllocations(), 0);
+            const auto down_weight =
+                get_task_allocation(down.getRhsAllocations(), 0);
+            const auto hidden0 =
+                get_task_allocation(multiply.getResultAllocations(), 0);
+            const auto hidden1 =
+                get_task_allocation(multiply.getResultAllocations(), 1);
+            const auto result =
+                get_task_allocation(down.getResultAllocations(), 0);
+            const auto gate_scale =
+                gate.getConfig().getAs<mlir::FloatAttr>("rhs_scale");
+            const auto up_scale =
+                up.getConfig().getAs<mlir::FloatAttr>("rhs_scale");
+            const auto hidden_scale =
+                multiply.getConfig().getAs<mlir::FloatAttr>("output_scale");
+            const auto hidden_zero_point =
+                multiply.getConfig().getAs<mlir::IntegerAttr>(
+                    "output_zero_point");
+            const auto down_lhs_scale =
+                down.getConfig().getAs<mlir::FloatAttr>("lhs_scale");
+            const auto down_rhs_scale =
+                down.getConfig().getAs<mlir::FloatAttr>("rhs_scale");
+            const auto output_scale =
+                down.getConfig().getAs<mlir::FloatAttr>("output_scale");
+            const auto output_zero_point =
+                down.getConfig().getAs<mlir::IntegerAttr>(
+                    "output_zero_point");
+            if (mlir::failed(input) || mlir::failed(gate_weight)
+                || mlir::failed(up_weight) || mlir::failed(down_weight)
+                || mlir::failed(hidden0) || mlir::failed(hidden1)
+                || mlir::failed(result) || !gate_scale || !up_scale
+                || !hidden_scale || !hidden_zero_point || !down_lhs_scale
+                || !down_rhs_scale || !output_scale || !output_zero_point) {
+                down.emitError("incomplete physical FFN task plan");
+                signalPassFailure();
+                return;
+            }
+
+            ffns.push_back(TensorFfnPlan{
+                gate, up, swish, multiply, down, *input, *gate_weight,
+                *up_weight, *down_weight, *hidden0, *hidden1, *result,
+                gate_scale, up_scale, hidden_scale, hidden_zero_point,
+                down_lhs_scale, down_rhs_scale, output_scale,
+                output_zero_point,
+            });
+        }
+
         llvm::SmallVector<tensor::MatmulOp> matmuls;
         llvm::SmallVector<tensor::SwigluOp> swiglus;
-        llvm::SmallVector<tensor::FfnOp> ffns;
         llvm::SmallVector<tensor::AttentionOp> attentions;
         function.walk([&](tensor::MatmulOp op) { matmuls.push_back(op); });
         function.walk([&](tensor::SwigluOp op) { swiglus.push_back(op); });
-        function.walk([&](tensor::FfnOp op) { ffns.push_back(op); });
         function.walk([&](tensor::AttentionOp op) { attentions.push_back(op); });
 
-        mlir::IRRewriter rewriter(&getContext());
         int64_t stage = 0;
         for (tensor::AttentionOp op : attentions) {
             llvm::SmallVector<mlir::Attribute> routes;
@@ -125,21 +327,28 @@ public:
             rewriter.replaceOp(op, lowered.getResult());
             stage += 54;
         }
-        for (tensor::FfnOp op : ffns) {
-            const bool w8a16 = op.getInput().getType().getElementType().isF16()
-                && op.getGateWeight().getType().getElementType().isInteger(8)
-                && op.getUpWeight().getType().getElementType().isInteger(8)
-                && op.getDownWeight().getType().getElementType().isInteger(8)
-                && op.getResult().getType().getElementType().isF16()
+        for (TensorFfnPlan& op : ffns) {
+            const auto element_type = [](mlir::Value value) {
+                return llvm::cast<mlir::RankedTensorType>(value.getType())
+                    .getElementType();
+            };
+            const bool w8a16 = element_type(op.getInput()).isF16()
+                && element_type(op.getGateWeight()).isInteger(8)
+                && element_type(op.getUpWeight()).isInteger(8)
+                && element_type(op.getDownWeight()).isInteger(8)
+                && element_type(op.getResult()).isF16()
                 && target.supports_w8a16_ffn_shape(
                     op.getM(), op.getK(), op.getHidden(), op.getN());
             const auto input_slice = get_mem_slice(op.getInputAddress());
             const auto gate_slice = get_mem_slice(op.getGateWeightAddress());
             const auto up_slice = get_mem_slice(op.getUpWeightAddress());
             const auto down_slice = get_mem_slice(op.getDownWeightAddress());
+            const auto hidden0_slice = get_mem_slice(op.getHidden0Address());
+            const auto hidden1_slice = get_mem_slice(op.getHidden1Address());
             const auto result_slice = get_mem_slice(op.getResultAddress());
             if (mlir::failed(input_slice) || mlir::failed(gate_slice)
                 || mlir::failed(up_slice) || mlir::failed(down_slice)
+                || mlir::failed(hidden0_slice) || mlir::failed(hidden1_slice)
                 || mlir::failed(result_slice)) {
                 op.emitError("requires valid complete-FFN MEM addresses");
                 signalPassFailure(); return;
@@ -161,10 +370,25 @@ public:
                 *down_slice, stage + 7, stage + 9);
             const auto down1_binding = allocate(weight_endpoint,
                 *down_slice, stage + 7, stage + 9);
+            const auto hidden0_binding = allocate(
+                target::StreamEndpoint::MxmActivation,
+                *hidden0_slice, stage + 11, stage + 13);
+            const auto hidden1_binding = allocate(
+                target::StreamEndpoint::MxmActivation,
+                *hidden1_slice, stage + 11, stage + 13);
             if (mlir::failed(gate_binding) || mlir::failed(up_binding)
                 || mlir::failed(activation_binding) || mlir::failed(down0_binding)
-                || mlir::failed(down1_binding)) {
-                op.emitError("cannot allocate complete-FFN stream ranges");
+                || mlir::failed(down1_binding)
+                || mlir::failed(hidden0_binding)
+                || mlir::failed(hidden1_binding)) {
+                auto diagnostic = op.emitError("cannot allocate complete-FFN stream ranges:");
+                if (mlir::failed(gate_binding)) diagnostic << " gate";
+                if (mlir::failed(up_binding)) diagnostic << " up";
+                if (mlir::failed(activation_binding)) diagnostic << " activation";
+                if (mlir::failed(down0_binding)) diagnostic << " down0";
+                if (mlir::failed(down1_binding)) diagnostic << " down1";
+                if (mlir::failed(hidden0_binding)) diagnostic << " hidden0";
+                if (mlir::failed(hidden1_binding)) diagnostic << " hidden1";
                 signalPassFailure(); return;
             }
             auto latency = [&](target::StreamEndpoint endpoint, int64_t slice) {
@@ -175,11 +399,16 @@ public:
             const auto up_latency = latency(weight_endpoint, *up_slice);
             const auto input_latency = latency(target::StreamEndpoint::MxmActivation, *input_slice);
             const auto down_latency = latency(weight_endpoint, *down_slice);
-            if (!gate_latency || !up_latency || !input_latency || !down_latency) {
+            const auto hidden0_latency = latency(
+                target::StreamEndpoint::MxmActivation, *hidden0_slice);
+            const auto hidden1_latency = latency(
+                target::StreamEndpoint::MxmActivation, *hidden1_slice);
+            if (!gate_latency || !up_latency || !input_latency || !down_latency
+                || !hidden0_latency || !hidden1_latency) {
                 op.emitError("complete-FFN route is unsupported by the target");
                 signalPassFailure(); return;
             }
-            rewriter.setInsertionPoint(op);
+            rewriter.setInsertionPoint(op.down);
             auto route = [&](mlir::Value value, const stream::StreamBinding& binding,
                              target::StreamEndpoint destination, int64_t unit,
                              mlir::DictionaryAttr address, mlir::DictionaryAttr placement,
@@ -248,37 +477,216 @@ public:
                     signalPassFailure(); return;
                 }
             }
-            mlir::OperationState state(op.getLoc(), stream::FfnOp::getOperationName());
-            state.addOperands({activation_route.getOutput(), gate_route.getOutput(),
-                up_route.getOutput(), down0_route.getOutput(), down1_route.getOutput()});
-            state.addTypes(op.getResult().getType());
-            state.addAttributes({
-                rewriter.getNamedAttr("m", op.getMAttr()), rewriter.getNamedAttr("k", op.getKAttr()),
-                rewriter.getNamedAttr("hidden", op.getHiddenAttr()), rewriter.getNamedAttr("n", op.getNAttr()),
-                rewriter.getNamedAttr("gate_output_stream_base", rewriter.getI64IntegerAttr(0)),
-                rewriter.getNamedAttr("up_output_stream_base", rewriter.getI64IntegerAttr(4)),
-                rewriter.getNamedAttr("vxm_output_stream", rewriter.getI64IntegerAttr(
-                    w8a16 ? 0 : 31)),
-                rewriter.getNamedAttr("gate_scale", op.getGateScaleAttr()),
-                rewriter.getNamedAttr("up_scale", op.getUpScaleAttr()),
-                rewriter.getNamedAttr("hidden_scale", op.getHiddenScaleAttr()),
-                rewriter.getNamedAttr("hidden_zero_point", op.getHiddenZeroPointAttr()),
-                rewriter.getNamedAttr("down_lhs_scale", op.getDownLhsScaleAttr()),
-                rewriter.getNamedAttr("down_rhs_scale", op.getDownRhsScaleAttr()),
-                rewriter.getNamedAttr("output_scale", op.getOutputScaleAttr()),
-                rewriter.getNamedAttr("output_zero_point", op.getOutputZeroPointAttr()),
-                rewriter.getNamedAttr("hidden0_address", op.getHidden0AddressAttr()),
-                rewriter.getNamedAttr("hidden0_placement", op.getHidden0PlacementAttr()),
-                rewriter.getNamedAttr("hidden1_address", op.getHidden1AddressAttr()),
-                rewriter.getNamedAttr("hidden1_placement", op.getHidden1PlacementAttr()),
-                rewriter.getNamedAttr("result_address", op.getResultAddressAttr()),
-                rewriter.getNamedAttr("result_placement", op.getResultPlacementAttr()),
-                rewriter.getNamedAttr("hidden_pass_bytes", op.getHiddenPassBytesAttr()),
-                rewriter.getNamedAttr("result_bytes", op.getResultBytesAttr()),
+            const auto empty_allocations = rewriter.getArrayAttr({});
+            const auto i64_array = [&](std::initializer_list<int64_t> values) {
+                llvm::SmallVector<mlir::Attribute> attributes;
+                for (int64_t value : values)
+                    attributes.push_back(rewriter.getI64IntegerAttr(value));
+                return rewriter.getArrayAttr(attributes);
+            };
+            const auto allocation = [&](mlir::DictionaryAttr address,
+                                        mlir::DictionaryAttr placement,
+                                        int64_t bytes) {
+                return rewriter.getDictionaryAttr({
+                    rewriter.getNamedAttr("address", address),
+                    rewriter.getNamedAttr("placement", placement),
+                    rewriter.getNamedAttr(
+                        "bytes", rewriter.getI64IntegerAttr(bytes)),
+                });
+            };
+            const auto hidden_allocations = rewriter.getArrayAttr({
+                allocation(op.getHidden0Address(), op.getHidden0Placement(),
+                    op.getHiddenPassBytes()),
+                allocation(op.getHidden1Address(), op.getHidden1Placement(),
+                    op.getHiddenPassBytes()),
             });
-            auto lowered = llvm::cast<stream::FfnOp>(rewriter.create(state));
-            rewriter.replaceOp(op, lowered.getResult());
-            stage += 10;
+            const auto result_allocations = rewriter.getArrayAttr({
+                allocation(op.getResultAddress(), op.getResultPlacement(),
+                    op.getResultBytes()),
+            });
+            const auto projection_type = mlir::RankedTensorType::get(
+                {static_cast<int64_t>(op.getM()),
+                    static_cast<int64_t>(op.getHidden())},
+                rewriter.getF32Type());
+            const auto hidden_type = mlir::RankedTensorType::get(
+                {static_cast<int64_t>(op.getM()),
+                    static_cast<int64_t>(op.getHidden())},
+                w8a16 ? mlir::Type(rewriter.getF16Type())
+                      : mlir::Type(rewriter.getI8Type()));
+            const auto down_partial_type = mlir::RankedTensorType::get(
+                {static_cast<int64_t>(op.getM()),
+                    static_cast<int64_t>(op.getN())},
+                rewriter.getF32Type());
+            const int64_t result_stream_count =
+                target.throughput().mxm_result_streams;
+            const int64_t second_result_stream = result_stream_count;
+
+            auto create_matmul_task =
+                [&](mlir::ValueRange lhs, mlir::ValueRange rhs,
+                    mlir::Type result_type, int64_t m, int64_t n, int64_t k,
+                    mlir::ArrayAttr unit_ids, mlir::ArrayAttr buffers,
+                    mlir::ArrayAttr stream_bases,
+                    mlir::ArrayAttr stream_counts,
+                    mlir::ArrayAttr result_plan,
+                    mlir::DictionaryAttr config) {
+                    mlir::OperationState task_state(
+                        op.getLoc(), stream::MatmulTaskOp::getOperationName());
+                    task_state.addOperands(lhs);
+                    task_state.addOperands(rhs);
+                    task_state.addTypes(result_type);
+                    task_state.addAttributes({
+                        rewriter.getNamedAttr("m",
+                            rewriter.getI64IntegerAttr(m)),
+                        rewriter.getNamedAttr("n",
+                            rewriter.getI64IntegerAttr(n)),
+                        rewriter.getNamedAttr("k",
+                            rewriter.getI64IntegerAttr(k)),
+                        rewriter.getNamedAttr("unit_ids", unit_ids),
+                        rewriter.getNamedAttr("weight_buffers", buffers),
+                        rewriter.getNamedAttr(
+                            "result_stream_bases", stream_bases),
+                        rewriter.getNamedAttr(
+                            "result_stream_counts", stream_counts),
+                        rewriter.getNamedAttr(
+                            "result_allocations", result_plan),
+                        rewriter.getNamedAttr("config", config),
+                        rewriter.getNamedAttr("operandSegmentSizes",
+                            rewriter.getDenseI32ArrayAttr(
+                                {static_cast<int32_t>(lhs.size()),
+                                    static_cast<int32_t>(rhs.size())})),
+                    });
+                    return llvm::cast<stream::MatmulTaskOp>(
+                        rewriter.create(task_state));
+                };
+
+            auto gate_task = create_matmul_task(
+                mlir::ValueRange{activation_route.getOutput()},
+                mlir::ValueRange{gate_route.getOutput()}, projection_type,
+                op.getM(), op.getHidden(), op.getK(), i64_array({0}),
+                i64_array({0}), i64_array({0}),
+                i64_array({result_stream_count}),
+                empty_allocations, rewriter.getDictionaryAttr({
+                    rewriter.getNamedAttr(
+                        "rhs_scale", op.getGateScaleAttr()),
+                }));
+            auto up_task = create_matmul_task(
+                mlir::ValueRange{activation_route.getOutput()},
+                mlir::ValueRange{up_route.getOutput()}, projection_type,
+                op.getM(), op.getHidden(), op.getK(), i64_array({1}),
+                i64_array({0}), i64_array({second_result_stream}),
+                i64_array({result_stream_count}),
+                empty_allocations, rewriter.getDictionaryAttr({
+                    rewriter.getNamedAttr(
+                        "rhs_scale", op.getUpScaleAttr()),
+                }));
+
+            mlir::OperationState swish_state(
+                op.getLoc(), stream::SwishTaskOp::getOperationName());
+            swish_state.addOperands(gate_task.getResult());
+            swish_state.addTypes(projection_type);
+            swish_state.addAttributes({
+                rewriter.getNamedAttr(
+                    "input_stream_base", rewriter.getI64IntegerAttr(0)),
+                rewriter.getNamedAttr(
+                    "output_stream_base", rewriter.getI64IntegerAttr(0)),
+                rewriter.getNamedAttr(
+                    "config", rewriter.getDictionaryAttr({})),
+            });
+            auto swish =
+                llvm::cast<stream::SwishTaskOp>(rewriter.create(swish_state));
+
+            mlir::OperationState multiply_state(
+                op.getLoc(), stream::ElementwiseTaskOp::getOperationName());
+            multiply_state.addOperands(
+                {swish.getResult(), up_task.getResult()});
+            multiply_state.addTypes(hidden_type);
+            multiply_state.addAttributes({
+                rewriter.getNamedAttr(
+                    "kind", rewriter.getStringAttr("multiply")),
+                rewriter.getNamedAttr(
+                    "input_stream_bases",
+                    i64_array({0, second_result_stream})),
+                rewriter.getNamedAttr(
+                    "output_stream_base", rewriter.getI64IntegerAttr(
+                        w8a16 ? 0
+                              : target.streams().streams_per_direction - 1)),
+                rewriter.getNamedAttr(
+                    "result_allocations", hidden_allocations),
+                rewriter.getNamedAttr("config",
+                    rewriter.getDictionaryAttr({
+                        rewriter.getNamedAttr(
+                            "output_scale", op.getHiddenScaleAttr()),
+                        rewriter.getNamedAttr("output_zero_point",
+                            op.getHiddenZeroPointAttr()),
+                    })),
+            });
+            auto multiply = llvm::cast<stream::ElementwiseTaskOp>(
+                rewriter.create(multiply_state));
+
+            auto hidden0_route = route(multiply.getResult(), *hidden0_binding,
+                target::StreamEndpoint::MxmActivation, 0,
+                op.getHidden0Address(), op.getHidden0Placement(),
+                op.getHiddenPassBytes(), *hidden0_latency);
+            auto hidden1_route = route(multiply.getResult(), *hidden1_binding,
+                target::StreamEndpoint::MxmActivation, 1,
+                op.getHidden1Address(), op.getHidden1Placement(),
+                op.getHiddenPassBytes(), *hidden1_latency);
+            auto down0_task = create_matmul_task(
+                mlir::ValueRange{hidden0_route.getOutput()},
+                mlir::ValueRange{down0_route.getOutput()}, down_partial_type,
+                op.getM(), op.getN(), op.getHidden(), i64_array({0}),
+                i64_array({0}), i64_array({0}),
+                i64_array({result_stream_count}),
+                empty_allocations, rewriter.getDictionaryAttr({
+                    rewriter.getNamedAttr(
+                        "lhs_scale", op.getDownLhsScaleAttr()),
+                    rewriter.getNamedAttr(
+                        "rhs_scale", op.getDownRhsScaleAttr()),
+                }));
+            auto down1_task = create_matmul_task(
+                mlir::ValueRange{hidden1_route.getOutput()},
+                mlir::ValueRange{down1_route.getOutput()}, down_partial_type,
+                op.getM(), op.getN(), op.getHidden(), i64_array({1}),
+                i64_array({0}), i64_array({second_result_stream}),
+                i64_array({result_stream_count}),
+                empty_allocations, rewriter.getDictionaryAttr({
+                    rewriter.getNamedAttr(
+                        "lhs_scale", op.getDownLhsScaleAttr()),
+                    rewriter.getNamedAttr(
+                        "rhs_scale", op.getDownRhsScaleAttr()),
+                }));
+
+            mlir::OperationState add_state(
+                op.getLoc(), stream::ElementwiseTaskOp::getOperationName());
+            add_state.addOperands(
+                {down0_task.getResult(), down1_task.getResult()});
+            add_state.addTypes(op.getResult().getType());
+            add_state.addAttributes({
+                rewriter.getNamedAttr(
+                    "kind", rewriter.getStringAttr("add_quant")),
+                rewriter.getNamedAttr(
+                    "input_stream_bases",
+                    i64_array({0, second_result_stream})),
+                rewriter.getNamedAttr(
+                    "output_stream_base", rewriter.getI64IntegerAttr(0)),
+                rewriter.getNamedAttr(
+                    "result_allocations", result_allocations),
+                rewriter.getNamedAttr("config",
+                    rewriter.getDictionaryAttr({
+                        rewriter.getNamedAttr(
+                            "output_scale", op.getOutputScaleAttr()),
+                        rewriter.getNamedAttr("output_zero_point",
+                            op.getOutputZeroPointAttr()),
+                    })),
+            });
+            auto add = llvm::cast<stream::ElementwiseTaskOp>(
+                rewriter.create(add_state));
+            rewriter.replaceOp(op.down, add.getResult());
+            rewriter.eraseOp(op.multiply);
+            rewriter.eraseOp(op.swish);
+            rewriter.eraseOp(op.up);
+            rewriter.eraseOp(op.gate);
+            stage += 14;
         }
 
         for (tensor::SwigluOp op : swiglus) {
@@ -429,6 +837,20 @@ public:
                 op.getResultAddress(), op.getResultPlacement(), op.getResultBytes(), *result_latency);
             rewriter.replaceOp(op, result_route.getOutput());
             stage += 6;
+        }
+
+        mlir::Operation* unlowered_task = nullptr;
+        function.walk([&](mlir::Operation* operation) {
+            if (!unlowered_task
+                && (llvm::isa<tensor::MatmulTaskOp>(operation)
+                    || llvm::isa<tensor::SwishTaskOp>(operation)
+                    || llvm::isa<tensor::ElementwiseTaskOp>(operation)))
+                unlowered_task = operation;
+        });
+        if (unlowered_task) {
+            unlowered_task->emitError(
+                "tensor task graph is not supported by stream lowering");
+            signalPassFailure();
         }
     }
 };

@@ -40,6 +40,123 @@ LogicalResult MatmulOp::verify()
     return success();
 }
 
+LogicalResult ReshapeOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto result = getResult().getType();
+    if (!input.hasStaticShape() || !result.hasStaticShape())
+        return emitOpError("requires static tensor shapes");
+    if (input.getNumElements() != result.getNumElements()
+        || input.getElementType() != result.getElementType())
+        return emitOpError("must preserve element count and element type");
+    return success();
+}
+
+LogicalResult TransposeOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto result = getResult().getType();
+    const auto permutation = getPermutation();
+    if (!input.hasStaticShape() || !result.hasStaticShape()
+        || input.getRank() != result.getRank()
+        || static_cast<int64_t>(permutation.size()) != input.getRank())
+        return emitOpError("requires static equal-rank tensors and a full permutation");
+    llvm::SmallVector<bool> seen(permutation.size(), false);
+    for (std::size_t index = 0; index < permutation.size(); ++index) {
+        const int64_t source = permutation[index];
+        if (source < 0 || source >= input.getRank() || seen[source]
+            || result.getDimSize(index) != input.getDimSize(source))
+            return emitOpError("has an invalid permutation or result shape");
+        seen[source] = true;
+    }
+    return success();
+}
+
+LogicalResult RopeOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto result = getResult().getType();
+    if (!input.hasStaticShape() || input.getRank() != 3
+        || result != input || input.getDimSize(1) != getHeads()
+        || input.getDimSize(2) != getHeadDim() || getHeadDim() % 2 != 0)
+        return emitOpError("requires [sequence, heads, even head_dim] input and matching result");
+    if (!std::isfinite(getTheta().convertToFloat())
+        || getTheta().convertToFloat() <= 1.0f)
+        return emitOpError("requires a finite theta greater than one");
+    return success();
+}
+
+LogicalResult GqaBroadcastOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto result = getResult().getType();
+    if (!input.hasStaticShape() || !result.hasStaticShape()
+        || input.getRank() != 3 || result.getRank() != 3
+        || getQueryHeads() <= 0 || getKvHeads() <= 0
+        || getQueryHeads() % getKvHeads() != 0
+        || input.getDimSize(1) != getKvHeads()
+        || result.getDimSize(1) != getQueryHeads()
+        || input.getDimSize(0) != result.getDimSize(0)
+        || input.getDimSize(2) != result.getDimSize(2)
+        || input.getElementType() != result.getElementType())
+        return emitOpError("requires a valid grouped-query head expansion");
+    return success();
+}
+
+LogicalResult BatchMatmulOp::verify()
+{
+    const auto lhs = getLhs().getType();
+    const auto rhs = getRhs().getType();
+    const auto result = getResult().getType();
+    if (!lhs.hasStaticShape() || !rhs.hasStaticShape() || !result.hasStaticShape()
+        || lhs.getRank() != 3 || rhs.getRank() != 3 || result.getRank() != 3)
+        return emitOpError("requires static rank-3 tensors");
+    const int64_t rhs_k = getTransposeRhs() ? rhs.getDimSize(2) : rhs.getDimSize(1);
+    const int64_t rhs_n = getTransposeRhs() ? rhs.getDimSize(1) : rhs.getDimSize(2);
+    if (lhs.getDimSize(0) != rhs.getDimSize(0)
+        || lhs.getDimSize(0) != result.getDimSize(0)
+        || lhs.getDimSize(2) != rhs_k
+        || lhs.getDimSize(1) != result.getDimSize(1)
+        || rhs_n != result.getDimSize(2))
+        return emitOpError("tensor shapes do not satisfy batched matmul");
+    if (getRole() != "qk" && getRole() != "pv")
+        return emitOpError("role must be qk or pv");
+    return success();
+}
+
+LogicalResult SoftmaxOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto result = getResult().getType();
+    if (!input.hasStaticShape() || result != input)
+        return emitOpError("requires matching static input and result tensors");
+    const int64_t axis = getAxisAttr().getInt();
+    const int64_t rank = input.getRank();
+    if (axis < -rank || axis >= rank)
+        return emitOpError("axis is outside the tensor rank");
+    if (!std::isfinite(getScale().convertToFloat())
+        || getScale().convertToFloat() <= 0.0f)
+        return emitOpError("requires a finite positive scale");
+    return success();
+}
+
+LogicalResult SwishOp::verify()
+{
+    if (getInput().getType() != getResult().getType())
+        return emitOpError("requires matching input and result types");
+    return success();
+}
+
+LogicalResult ElementwiseOp::verify()
+{
+    if (getLhs().getType() != getRhs().getType()
+        || getLhs().getType() != getResult().getType())
+        return emitOpError("requires matching operand and result types");
+    if (getKind() != "multiply")
+        return emitOpError("currently supports only multiply");
+    return success();
+}
+
 LogicalResult SwigluOp::verify()
 {
     const auto input = getInput().getType();

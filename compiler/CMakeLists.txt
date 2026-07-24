@@ -68,7 +68,9 @@ add_public_tablegen_target(FTLPUCommandOpsIncGen)
 add_library(ftlpu_compiler
     src/Dialect/Kernel/IR/KernelDialect.cpp
     src/Dialect/Kernel/Transforms/StableHloToKernel.cpp
+    src/Dialect/Kernel/Transforms/ComposeKernelPlans.cpp
     src/Dialect/Tensor/IR/TensorDialect.cpp
+    src/Dialect/Tensor/Analysis/PhysicalMemoryAllocator.cpp
     src/Dialect/Tensor/Transforms/KernelToTensor.cpp
     src/Dialect/Stream/IR/StreamDialect.cpp
     src/Dialect/Stream/Analysis/StreamAllocator.cpp
@@ -76,10 +78,13 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/IR/ScheduleDialect.cpp
     src/Dialect/Schedule/Analysis/AttentionWorkPlanner.cpp
     src/Dialect/Schedule/Analysis/AttentionProjectionPlanner.cpp
+    src/Dialect/Schedule/Analysis/LPUResourceModel.cpp
     src/Dialect/Schedule/Analysis/ResourceScheduler.cpp
+    src/Dialect/Schedule/Analysis/ScheduleGraph.cpp
     src/Dialect/Schedule/Transforms/AttentionMemoryLayout.cpp
     src/Dialect/Schedule/Transforms/AttentionScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/StreamToSchedule.cpp
+    src/Dialect/Schedule/Transforms/VerifySchedule.cpp
     src/Dialect/Command/IR/CommandDialect.cpp
     src/Dialect/Command/Transforms/ScheduleToCommand.cpp
     src/Target/LPUTargetModel.cpp
@@ -119,12 +124,26 @@ add_test(NAME attention_projection_planner_test COMMAND $<TARGET_FILE:attention_
 add_executable(attention_target_layout_test tests/attention_target_layout_test.cpp)
 target_link_libraries(attention_target_layout_test PRIVATE ftlpu_compiler)
 add_test(NAME attention_target_layout_test COMMAND $<TARGET_FILE:attention_target_layout_test>)
+add_executable(schedule_graph_test tests/schedule_graph_test.cpp)
+target_link_libraries(schedule_graph_test PRIVATE ftlpu_compiler)
+add_test(NAME schedule_graph_test COMMAND $<TARGET_FILE:schedule_graph_test>)
+add_executable(physical_memory_allocator_test tests/physical_memory_allocator_test.cpp)
+target_link_libraries(physical_memory_allocator_test PRIVATE ftlpu_compiler)
+add_test(NAME physical_memory_allocator_test COMMAND $<TARGET_FILE:physical_memory_allocator_test>)
 if(MSVC)
     target_compile_options(ftlpu_opt PRIVATE /EHsc)
     target_compile_options(ftlpu_translate PRIVATE /EHsc)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME schedule_verifier_overlap_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/schedule_verifier_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/schedule_resource_overlap.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/schedule_verifier/invalid.mlir)
     add_test(
         NAME smollm2_135m_ffn_stablehlo_to_stream_ir_test
         COMMAND
@@ -134,6 +153,15 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn)
     add_test(
+        NAME smollm2_135m_ffn_fused_schedule_ir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_ffn_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_fused
+            --ffn-schedule fused)
+    add_test(
         NAME generic_w8a16_ffn_lowering_test
         COMMAND
             ${Python3_EXECUTABLE}
@@ -141,6 +169,15 @@ if(Python3_Interpreter_FOUND)
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/generic_w8a16_ffn_32x64x128x64)
+    add_test(
+        NAME lpu_target_configuration_lowering_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/target_configuration_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64.stablehlo.mlir
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/exploration_40_streams.json
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/lpu_target_configuration)
     add_test(
         NAME w8a16_ffn_mtile_weight_reuse_test
         COMMAND
@@ -169,6 +206,17 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:compiled_smollm2_135m_ffn_seq128_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn_seq128.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_seq128_binary_runtime)
+    add_test(
+        NAME smollm2_135m_ffn_seq128_fused_binary_cmodel_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_ffn_binary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_smollm2_135m_ffn_seq128_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn_seq128.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_seq128_fused_binary_runtime
+            --ffn-schedule fused)
     add_test(
         NAME smollm2_135m_attention_stablehlo_to_kernel_ir_test
         COMMAND

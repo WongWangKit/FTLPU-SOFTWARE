@@ -12,12 +12,14 @@ namespace ftlpu::software::runtime {
 enum class BindingAccess : std::uint16_t {
     Input = 0,
     Output = 1,
+    Internal = 2,
 };
 
 enum class BindingElementType : std::uint16_t {
     I8 = 1,
     I32 = 2,
     F16 = 3,
+    F32 = 4,
 };
 
 enum class BindingLayout : std::uint16_t {
@@ -29,6 +31,8 @@ enum class BindingLayout : std::uint16_t {
     W8A16MxmWeightStriped = 6,
     Fp16PairPlanar = 7,
     W8A16AttentionWeightStriped = 8,
+    W8A16MxmWeightWaveStriped = 9,
+    Fp32CausalMaskTile = 10,
 };
 
 struct BinaryBinding {

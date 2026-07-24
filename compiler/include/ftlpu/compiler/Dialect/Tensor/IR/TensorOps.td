@@ -58,6 +58,40 @@ def MatmulOp : FTLPU_Tensor_Op<"matmul", [Pure]> {
   let hasCustomAssemblyFormat = 1;
 }
 
+def MatmulTaskOp : FTLPU_Tensor_Op<"matmul_task", [Pure]> {
+  let summary = "Matrix multiplication with explicit physical buffer plans";
+  let description = [{
+    Represents a hardware-mapped matrix multiplication after tensor memory
+    planning. An empty result allocation list means that the result remains
+    transient in a functional-unit accumulator or stream.
+  }];
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+      I64Attr:$m, I64Attr:$n, I64Attr:$k,
+      ArrayAttr:$lhs_allocations, ArrayAttr:$rhs_allocations,
+      ArrayAttr:$result_allocations, DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def SwishTaskOp : FTLPU_Tensor_Op<"swish_task", [Pure]> {
+  let summary = "Swish with an explicit physical result plan";
+  let arguments = (ins AnyRankedTensor:$input,
+      ArrayAttr:$result_allocations, DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def ElementwiseTaskOp : FTLPU_Tensor_Op<"elementwise_task", [Pure]> {
+  let summary = "Binary elementwise computation with a physical result plan";
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+      StrAttr:$kind, ArrayAttr:$result_allocations, DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def SwigluOp : FTLPU_Tensor_Op<"swiglu", [Pure]> {
   let summary = "Dual-MXM SwiGLU with assigned input, weight, and output storage";
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$gate_weight,

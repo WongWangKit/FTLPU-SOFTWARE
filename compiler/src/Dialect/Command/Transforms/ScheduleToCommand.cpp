@@ -40,6 +40,7 @@ llvm::StringRef element_type_name(mlir::Type type)
     if (integer && integer.getWidth() == 8) return "i8";
     if (integer && integer.getWidth() == 32) return "i32";
     if (type.isF16()) return "f16";
+    if (type.isF32()) return "f32";
     return "unsupported";
 }
 
@@ -48,6 +49,7 @@ int64_t element_type_bytes(mlir::Type type)
     if (auto integer = llvm::dyn_cast<mlir::IntegerType>(type))
         return (integer.getWidth() + 7) / 8;
     if (type.isF16()) return 2;
+    if (type.isF32()) return 4;
     return 0;
 }
 
@@ -131,21 +133,26 @@ void create_sxm_command(mlir::OpBuilder& builder, schedule::SxmOp op)
     builder.create(state);
 }
 
-void create_mem_queue_command(mlir::OpBuilder& builder, schedule::MemQueueOp op)
+void create_mem_transfer_command(mlir::OpBuilder& builder,
+    schedule::MemTransferOp op, const target::LPUTargetModel& target)
 {
     mlir::OperationState state(op.getLoc(), command::MemOp::getOperationName());
-    for (llvm::StringRef name : {"cycle", "queue", "opcode", "address", "packed_stream",
+    for (llvm::StringRef name : {"cycle", "opcode", "address", "packed_stream",
              "repeat_count", "repeat_interval", "address_stride", "accumulator_destination"})
         state.addAttribute(name, op->getAttr(name));
+    state.addAttribute("queue", builder.getI64IntegerAttr(
+        op.getHemisphere() * target.memory().slices_per_hemisphere
+        + op.getSlice()));
     builder.create(state);
 }
 
-void create_mxm_queue_command(mlir::OpBuilder& builder, schedule::MxmQueueOp op)
+void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
 {
     mlir::OperationState state(op.getLoc(), command::MxmOp::getOperationName());
-    for (llvm::StringRef name : {"cycle", "queue", "opcode", "weight_buffer",
+    for (llvm::StringRef name : {"cycle", "opcode", "weight_buffer",
              "weight_column", "activation_stream_base", "output_stream_base", "repeat_count", "repeat_interval"})
         state.addAttribute(name, op->getAttr(name));
+    state.addAttribute("queue", builder.getI64IntegerAttr(op.getUnitId()));
     builder.create(state);
 }
 
@@ -180,8 +187,8 @@ public:
         llvm::SmallVector<schedule::MxmComputeOp> computes;
         llvm::SmallVector<schedule::VxmOp> vxms;
         llvm::SmallVector<schedule::SxmOp> sxms;
-        llvm::SmallVector<schedule::MemQueueOp> mem_queue_issues;
-        llvm::SmallVector<schedule::MxmQueueOp> mxm_queue_issues;
+        llvm::SmallVector<schedule::MemTransferOp> mem_transfers;
+        llvm::SmallVector<schedule::MxmIssueOp> mxm_issues;
         llvm::SmallVector<schedule::AttentionOp> attention_schedules;
         llvm::SmallVector<schedule::MemWriteOp> writes;
         llvm::SmallVector<schedule::MemAccumulateOp> accumulates;
@@ -206,12 +213,12 @@ public:
             sxms.push_back(op);
             schedule_operations.push_back(op);
         });
-        function.walk([&](schedule::MemQueueOp op) {
-            mem_queue_issues.push_back(op);
+        function.walk([&](schedule::MemTransferOp op) {
+            mem_transfers.push_back(op);
             schedule_operations.push_back(op);
         });
-        function.walk([&](schedule::MxmQueueOp op) {
-            mxm_queue_issues.push_back(op);
+        function.walk([&](schedule::MxmIssueOp op) {
+            mxm_issues.push_back(op);
             schedule_operations.push_back(op);
         });
         function.walk([&](schedule::AttentionOp op) { attention_schedules.push_back(op); });
@@ -233,6 +240,7 @@ public:
         mlir::OpBuilder builder(&getContext());
         builder.setInsertionPointToStart(&function.getBody().front());
         llvm::SmallDenseSet<unsigned> bound_inputs;
+        bool causal_mask_bound = false;
         for (schedule::AttentionOp attention : attention_schedules) {
             const mlir::Value inputs[] = {attention.getInput(), attention.getQueryWeight(),
                 attention.getKeyWeight(), attention.getValueWeight(), attention.getOutputWeight()};
@@ -251,6 +259,16 @@ public:
             create_binding(builder, attention.getLoc(), 0, "output", "result", result_type,
                 result_type.getNumElements() * element_type_bytes(result_type.getElementType()),
                 attention.getMemoryPlan().getAs<mlir::DictionaryAttr>("result"));
+            if (attention.getCausal() && !causal_mask_bound) {
+                const int64_t tile = target.throughput().mxm_rows;
+                auto mask_type = mlir::RankedTensorType::get(
+                    {tile - 1, tile}, builder.getF32Type());
+                for (const char* placement : {"causal_mask", "causal_mask_mxm1"})
+                    create_binding(builder, attention.getLoc(), 0, "internal", "constant",
+                        mask_type, mask_type.getNumElements() * 4,
+                        attention.getMemoryPlan().getAs<mlir::DictionaryAttr>(placement));
+                causal_mask_bound = true;
+            }
         }
         for (schedule::MemReadOp read : reads) {
             auto argument = llvm::dyn_cast<mlir::BlockArgument>(read.getInput());
@@ -273,7 +291,10 @@ public:
         for (schedule::MemWriteOp write : writes) {
             if (!returned_values.contains(write.getOutput())) continue;
             auto type = llvm::cast<mlir::RankedTensorType>(write.getOutput().getType());
-            mlir::NamedAttrList placement(write.getPlacement());
+            mlir::DictionaryAttr explicit_binding =
+                write.getPlacement().getAs<mlir::DictionaryAttr>("binding_placement");
+            mlir::NamedAttrList placement(
+                explicit_binding ? explicit_binding : write.getPlacement());
             if (auto slices = write.getPlacement().getAs<mlir::ArrayAttr>("binding_slices"))
                 placement.set("slices", slices);
             if (auto count = write.getPlacement().getAs<mlir::IntegerAttr>("binding_instruction_count"))
@@ -332,10 +353,15 @@ public:
             int64_t repeat_count = load.getDuration();
             if (auto read = load.getInput().getDefiningOp<schedule::MemReadOp>())
                 repeat_count = placement_integer(read.getPlacement(), "instruction_count");
-            for (int64_t column = 0; column < repeat_count; ++column)
+            for (int64_t column = 0; column < repeat_count; ++column) {
+                // The four west-to-east weight pulses reach the MXM column
+                // controls in reverse physical order.
+                const int64_t weight_column = target.throughput().tile_rows - 1
+                    - column % target.throughput().tile_rows;
                 create_mxm_command(builder, load.getLoc(), load.getCycle() + column, load.getUnitId(),
-                    "iw", load.getWeightBuffer(), column % target.throughput().tile_rows,
+                    "iw", load.getWeightBuffer(), weight_column,
                     0, 0, 1, 1);
+            }
         }
         for (schedule::MxmComputeOp compute : computes) {
             builder.setInsertionPointAfter(compute);
@@ -351,13 +377,13 @@ public:
             builder.setInsertionPointAfter(sxm);
             create_sxm_command(builder, sxm);
         }
-        for (schedule::MemQueueOp mem : mem_queue_issues) {
+        for (schedule::MemTransferOp mem : mem_transfers) {
             builder.setInsertionPointAfter(mem);
-            create_mem_queue_command(builder, mem);
+            create_mem_transfer_command(builder, mem, target);
         }
-        for (schedule::MxmQueueOp mxm : mxm_queue_issues) {
+        for (schedule::MxmIssueOp mxm : mxm_issues) {
             builder.setInsertionPointAfter(mxm);
-            create_mxm_queue_command(builder, mxm);
+            create_mxm_issue_command(builder, mxm);
         }
         for (schedule::MemAccumulateOp accumulate : accumulates) {
             const auto slices = placement_slices(accumulate.getPlacement());
@@ -411,7 +437,7 @@ public:
             if (llvm::isa<schedule::MemReadOp, schedule::MxmLoadOp,
                     schedule::MxmComputeOp, schedule::VxmOp,
                     schedule::SxmOp,
-                    schedule::MemQueueOp, schedule::MxmQueueOp,
+                    schedule::MemTransferOp, schedule::MxmIssueOp,
                     schedule::MemAccumulateOp, schedule::MemWriteOp>(op))
                 ordered_schedule_ops.push_back(op);
         });

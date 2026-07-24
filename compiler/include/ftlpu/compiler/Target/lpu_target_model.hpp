@@ -1,8 +1,14 @@
 #pragma once
 
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/StringRef.h"
+
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace ftlpu::compiler::target {
@@ -35,6 +41,8 @@ struct MemoryTopology {
     int64_t w8a16_hidden_slice_base = 21;
     int64_t w8a16_result_slice_base = 24;
     int64_t accumulator_scratch_base_row = 1600;
+    std::array<int64_t, 4> w8a16_fused_gate_temp_slices{{1, 5, 9, 13}};
+    std::array<int64_t, 4> w8a16_fused_up_temp_slices{{2, 6, 10, 14}};
 };
 
 struct StreamTopology {
@@ -60,6 +68,7 @@ struct ThroughputModel {
     int64_t mxm_earliest_iw_cycle = 2;
     int64_t mxms_per_hemisphere = 2;
     int64_t mxm_weight_buffers = 2;
+    int64_t vxm_alus = 16;
     int64_t vxm_weight_to_iw_latency = 14;
     int64_t mem_to_sxm_latency = 12;
     int64_t mem_to_mxm_latency = 13;
@@ -72,6 +81,16 @@ struct ThroughputModel {
 class LPUTargetModel {
 public:
     LPUTargetModel();
+    LPUTargetModel(MemoryTopology memory, StreamTopology streams,
+        ThroughputModel throughput);
+
+    static mlir::FailureOr<LPUTargetModel> from_json(
+        llvm::StringRef json, std::string& error);
+    static mlir::FailureOr<LPUTargetModel> from_operation(
+        mlir::Operation* operation);
+    mlir::DictionaryAttr to_attribute(mlir::MLIRContext* context) const;
+    mlir::LogicalResult validate(std::string* error = nullptr) const;
+
     const MemoryTopology& memory() const { return memory_; }
     const StreamTopology& streams() const { return streams_; }
     const ThroughputModel& throughput() const { return throughput_; }
@@ -108,7 +127,10 @@ public:
     {
         return buffer >= 0 && buffer < throughput_.mxm_weight_buffers;
     }
-    bool is_valid_vxm_alu(int64_t alu) const { return alu >= 0 && alu < 16; }
+    bool is_valid_vxm_alu(int64_t alu) const
+    {
+        return alu >= 0 && alu < throughput_.vxm_alus;
+    }
 
     static std::string_view direction_name(StreamDirection direction);
     static std::string_view endpoint_name(StreamEndpoint endpoint);

@@ -1,5 +1,7 @@
 // Keep this translation unit rebuilt with target topology ABI changes.
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/resource_scheduler.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/lpu_resource_model.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/schedule_graph.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
@@ -22,6 +24,78 @@ int64_t get_slice(mlir::DictionaryAttr address)
 {
     return address.getAs<mlir::IntegerAttr>("slice").getInt();
 }
+
+struct TaskAllocation {
+    mlir::DictionaryAttr address;
+    mlir::DictionaryAttr placement;
+    int64_t bytes;
+};
+
+mlir::FailureOr<TaskAllocation> get_task_allocation(
+    mlir::ArrayAttr allocations, size_t index)
+{
+    if (index >= allocations.size()) return mlir::failure();
+    const auto dictionary =
+        llvm::dyn_cast<mlir::DictionaryAttr>(allocations[index]);
+    if (!dictionary) return mlir::failure();
+    const auto address =
+        dictionary.getAs<mlir::DictionaryAttr>("address");
+    const auto placement =
+        dictionary.getAs<mlir::DictionaryAttr>("placement");
+    const auto bytes = dictionary.getAs<mlir::IntegerAttr>("bytes");
+    if (!address || !placement || !bytes) return mlir::failure();
+    return TaskAllocation{address, placement, bytes.getInt()};
+}
+
+struct PrimitiveFfnSchedulePlan {
+    stream::ElementwiseTaskOp add;
+    stream::MatmulTaskOp down0;
+    stream::MatmulTaskOp down1;
+    stream::RouteOp hidden0_route;
+    stream::RouteOp hidden1_route;
+    stream::ElementwiseTaskOp multiply;
+    stream::SwishTaskOp swish;
+    stream::MatmulTaskOp gate;
+    stream::MatmulTaskOp up;
+    stream::RouteOp activation_route;
+    stream::RouteOp gate_route;
+    stream::RouteOp up_route;
+    stream::RouteOp down0_route;
+    stream::RouteOp down1_route;
+    TaskAllocation hidden0;
+    TaskAllocation hidden1;
+    TaskAllocation result;
+    mlir::FloatAttr gate_scale;
+    mlir::FloatAttr up_scale;
+    mlir::FloatAttr down_rhs_scale;
+
+    mlir::Value getActivation() { return activation_route.getOutput(); }
+    mlir::Value getGateWeight() { return gate_route.getOutput(); }
+    mlir::Value getUpWeight() { return up_route.getOutput(); }
+    mlir::Value getDownWeight0() { return down0_route.getOutput(); }
+    mlir::Value getDownWeight1() { return down1_route.getOutput(); }
+    mlir::Value getResult() { return add.getResult(); }
+    mlir::Operation* getOperation() { return add.getOperation(); }
+    mlir::Location getLoc() { return add.getLoc(); }
+    uint64_t getM() { return down0.getM(); }
+    uint64_t getK() { return gate.getK(); }
+    uint64_t getHidden() { return gate.getN(); }
+    uint64_t getN() { return down0.getN(); }
+    llvm::APFloat getGateScale() { return gate_scale.getValue(); }
+    llvm::APFloat getUpScale() { return up_scale.getValue(); }
+    llvm::APFloat getDownRhsScale()
+    {
+        return down_rhs_scale.getValue();
+    }
+    mlir::DictionaryAttr getHidden0Address() { return hidden0.address; }
+    mlir::DictionaryAttr getHidden0AddressAttr() { return hidden0.address; }
+    mlir::DictionaryAttr getHidden0Placement() { return hidden0.placement; }
+    mlir::DictionaryAttr getHidden1Address() { return hidden1.address; }
+    mlir::DictionaryAttr getHidden1AddressAttr() { return hidden1.address; }
+    mlir::DictionaryAttr getResultAddress() { return result.address; }
+    mlir::DictionaryAttr getResultAddressAttr() { return result.address; }
+    mlir::DictionaryAttr getResultPlacement() { return result.placement; }
+};
 
 llvm::SmallVector<int64_t> get_slices(mlir::DictionaryAttr placement)
 {
@@ -90,46 +164,6 @@ mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
     });
 }
 
-void create_mem_queue_issue(mlir::IRRewriter& rewriter, mlir::Location location,
-    int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t address,
-    int64_t packed_stream, int64_t repeat_count, int64_t repeat_interval,
-    int64_t address_stride, llvm::StringRef accumulator_destination = "sram")
-{
-    mlir::OperationState state(location, schedule::MemQueueOp::getOperationName());
-    state.addAttributes({
-        rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
-        rewriter.getNamedAttr("queue", rewriter.getI64IntegerAttr(queue)),
-        rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
-        rewriter.getNamedAttr("address", rewriter.getI64IntegerAttr(address)),
-        rewriter.getNamedAttr("packed_stream", rewriter.getI64IntegerAttr(packed_stream)),
-        rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(repeat_count)),
-        rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(repeat_interval)),
-        rewriter.getNamedAttr("address_stride", rewriter.getI64IntegerAttr(address_stride)),
-        rewriter.getNamedAttr("accumulator_destination", rewriter.getStringAttr(accumulator_destination)),
-    });
-    rewriter.create(state);
-}
-
-void create_mxm_queue_issue(mlir::IRRewriter& rewriter, mlir::Location location,
-    int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t weight_buffer,
-    int64_t weight_column, int64_t activation_stream_base, int64_t output_stream_base,
-    int64_t repeat_count, int64_t repeat_interval)
-{
-    mlir::OperationState state(location, schedule::MxmQueueOp::getOperationName());
-    state.addAttributes({
-        rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
-        rewriter.getNamedAttr("queue", rewriter.getI64IntegerAttr(queue)),
-        rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
-        rewriter.getNamedAttr("weight_buffer", rewriter.getI64IntegerAttr(weight_buffer)),
-        rewriter.getNamedAttr("weight_column", rewriter.getI64IntegerAttr(weight_column)),
-        rewriter.getNamedAttr("activation_stream_base", rewriter.getI64IntegerAttr(activation_stream_base)),
-        rewriter.getNamedAttr("output_stream_base", rewriter.getI64IntegerAttr(output_stream_base)),
-        rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(repeat_count)),
-        rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(repeat_interval)),
-    });
-    rewriter.create(state);
-}
-
 schedule::VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Value lhs_value, mlir::Value rhs_value, mlir::Type result_type,
     int64_t cycle, int64_t queue, llvm::StringRef opcode,
@@ -162,23 +196,28 @@ schedule::VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
     return llvm::cast<schedule::VxmOp>(rewriter.create(state));
 }
 
+template <typename FfnPlan>
 mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
-    mlir::IRRewriter& rewriter, stream::FfnOp ffn)
+    mlir::IRRewriter& rewriter, FfnPlan& ffn,
+    FfnScheduleStrategy strategy, const target::LPUTargetModel& target)
 {
-    const target::LPUTargetModel target;
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
+    const int64_t stream_encoding_offset =
+        target.streams().streams_per_direction;
     const int64_t tile = throughput.mxm_rows;
     const int64_t m = ffn.getM();
     const int64_t k = ffn.getK();
     const int64_t intermediate = ffn.getHidden();
     const int64_t n = ffn.getN();
     const int64_t weight_to_iw = throughput.vxm_weight_to_iw_latency;
-    const int64_t compute_block_cycles = tile + 4 * throughput.mxm_pipeline_rows;
     const int64_t gate_acc_latency = throughput.mxm0_accumulator_latency;
     const int64_t up_acc_latency = throughput.mxm1_accumulator_latency;
     const int64_t swish_write_latency = throughput.swiglu_write_latency;
-    const int64_t down_accumulator_base = memory.accumulator_scratch_base_row;
+    const int64_t projection_accumulator_rows = m * (intermediate / tile);
+    const int64_t down_accumulator_base = std::max(
+        memory.accumulator_scratch_base_row,
+        ((projection_accumulator_rows + tile - 1) / tile) * tile);
 
     if (!target.supports_w8a16_ffn_shape(ffn.getM(), k, intermediate, n))
         return mlir::failure();
@@ -256,11 +295,28 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
     const int64_t projection_pair_count =
         intermediate / (memory.hemispheres * tile);
     const int64_t m_tile_count = m / tile;
+    struct CycleWindow {
+        int64_t start;
+        int64_t end;
+    };
+    struct CompletedProjectionTile {
+        int64_t pair;
+        int64_t m_tile;
+        int64_t hemisphere;
+        int64_t compute_cycle;
+        int64_t deferred_ready_cycle;
+        schedule::MemAccumulateOp gate;
+        schedule::MemAccumulateOp up;
+        mlir::Value gate_temp;
+        mlir::Value up_temp;
+    };
+    llvm::SmallVector<CompletedProjectionTile> completed_tiles;
+    std::array<llvm::SmallVector<CycleWindow>, 2> temp_mem_busy_windows;
     // A loaded KxN weight tile stays resident while every M=32 activation tile
-    // of the sequence consumes it. Consecutive blocks on the same MXM need the
-    // target's complete issue interval, including its pipeline reset cycles.
+    // of the sequence consumes it. Consecutive blocks follow the target's MXM
+    // issue interval.
     const int64_t weight_block_interval = m_tile_count * pipelined_block_interval;
-    rewriter.setInsertionPoint(ffn);
+    rewriter.setInsertionPoint(ffn.getOperation());
     int64_t projection_block = 0;
     for (int64_t pair = 0; pair < intermediate / (memory.hemispheres * tile); ++pair) {
         for (int64_t kb = 0; kb < k / tile; ++kb) {
@@ -291,7 +347,8 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                     for (int64_t stream = 0; stream < gate_raw.getStreamCount(); ++stream) {
                         vxm_value = create_vxm(rewriter, ffn.getLoc(), read_value, read_value,
                             cooked.getInput().getType(), start, stream, "multiply",
-                            "stream_i8", 32 + stream, 0.0f, "immediate", 0,
+                            "stream_i8", stream_encoding_offset + stream, 0.0f,
+                            "immediate", 0,
                             local_mxm == 0 ? ffn.getGateScale().convertToFloat()
                                            : ffn.getUpScale().convertToFloat(),
                             "fp32", -1, weight_load_cycles, 1,
@@ -331,6 +388,11 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                 const int64_t switch_row = next_weight_distance - next_dequant_lead
                     + weight_to_iw
                     + hemisphere * throughput.mxms_per_hemisphere * weight_load_cycles;
+                const bool final_k_block = kb + 1 == k / tile;
+                const int64_t projection_result_stream_base =
+                    strategy == FfnScheduleStrategy::Fused && final_k_block
+                    ? 8 + hemisphere * 8
+                    : 0;
                 if (!prefetch_next_weight || switch_row >= tile) {
                     segment_rows = {tile};
                     segment_streams = {0};
@@ -356,8 +418,7 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                     const int64_t stream_base = segment_streams[segment];
                     mlir::Value activation_value;
                     const int64_t segment_cycle = compute_cycle + row_offset;
-                    for (int64_t byte = 0;
-                         byte < throughput.mxm_activation_streams; ++byte) {
+                    for (int64_t byte = 0; byte < 2; ++byte) {
                         auto read = one_slice_read(activation_route.getInput(), activation_route,
                             segment_cycle - activation_latency, activation_slices[byte],
                             activation_base + row_offset, rows, 1, stream_base + byte,
@@ -367,13 +428,16 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                     gate_compute = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(),
                         activation_value, ffn.getGateWeight(), projection_type,
                         segment_cycle, rows, segment_cycle + 3, rows + 3,
-                        stream_base, 0, weight_buffer,
+                        stream_base, projection_result_stream_base,
+                        weight_buffer,
                         hemisphere * throughput.mxms_per_hemisphere,
                         rows, tile, tile);
                     up_compute = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(),
                         activation_value, ffn.getUpWeight(), projection_type,
                         segment_cycle, rows, segment_cycle + 3, rows + 3,
-                        stream_base + 2, throughput.mxm_result_streams,
+                        stream_base,
+                        projection_result_stream_base
+                            + throughput.mxm_result_streams,
                         weight_buffer,
                         hemisphere * throughput.mxms_per_hemisphere + 1,
                         rows, tile, tile);
@@ -389,32 +453,139 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                 gate_acc.addOperands(gate_compute.getResult()); gate_acc.addTypes(projection_type);
                 gate_acc.addAttributes({
                     rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(compute_cycle + gate_acc_latency)),
-                    rewriter.getNamedAttr("stream_base", rewriter.getI64IntegerAttr(0)),
+                    rewriter.getNamedAttr("stream_base",
+                        rewriter.getI64IntegerAttr(
+                            projection_result_stream_base)),
                     rewriter.getNamedAttr("stream_count", rewriter.getI64IntegerAttr(throughput.mxm_result_streams)),
                     rewriter.getNamedAttr("address", ffn.getHidden0AddressAttr()),
                     rewriter.getNamedAttr("placement", gate_acc_placement),
                     rewriter.getNamedAttr("hemisphere", rewriter.getStringAttr(hemi_name(hemisphere))),
-                    rewriter.getNamedAttr("destination", rewriter.getStringAttr("sram")),
+                    rewriter.getNamedAttr("destination",
+                        rewriter.getStringAttr(
+                            strategy == FfnScheduleStrategy::Fused
+                                    && final_k_block
+                                ? "stream"
+                                : "sram")),
                     rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(tile)),
                     rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(1)),
                     rewriter.getNamedAttr("address_stride", rewriter.getI64IntegerAttr(intermediate / tile)),
                 });
-                rewriter.create(gate_acc);
+                auto gate_acc_op =
+                    llvm::cast<schedule::MemAccumulateOp>(rewriter.create(gate_acc));
                 mlir::OperationState up_acc(ffn.getLoc(), schedule::MemAccumulateOp::getOperationName());
                 up_acc.addOperands(up_compute.getResult()); up_acc.addTypes(projection_type);
                 up_acc.addAttributes({
                     rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(compute_cycle + up_acc_latency)),
-                    rewriter.getNamedAttr("stream_base", rewriter.getI64IntegerAttr(throughput.mxm_result_streams)),
+                    rewriter.getNamedAttr("stream_base",
+                        rewriter.getI64IntegerAttr(
+                            projection_result_stream_base
+                                + throughput.mxm_result_streams)),
                     rewriter.getNamedAttr("stream_count", rewriter.getI64IntegerAttr(throughput.mxm_result_streams)),
                     rewriter.getNamedAttr("address", ffn.getHidden1AddressAttr()),
                     rewriter.getNamedAttr("placement", up_acc_placement),
                     rewriter.getNamedAttr("hemisphere", rewriter.getStringAttr(hemi_name(hemisphere))),
-                    rewriter.getNamedAttr("destination", rewriter.getStringAttr("sram")),
+                    rewriter.getNamedAttr("destination",
+                        rewriter.getStringAttr(
+                            strategy == FfnScheduleStrategy::Fused
+                                    && final_k_block
+                                ? "stream"
+                                : "sram")),
                     rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(tile)),
                     rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(1)),
                     rewriter.getNamedAttr("address_stride", rewriter.getI64IntegerAttr(intermediate / tile)),
                 });
-                rewriter.create(up_acc);
+                auto up_acc_op =
+                    llvm::cast<schedule::MemAccumulateOp>(rewriter.create(up_acc));
+                if (final_k_block) {
+                    mlir::Value gate_temp;
+                    mlir::Value up_temp;
+                    int64_t deferred_ready_cycle =
+                        compute_cycle
+                        + std::max(
+                            gate_acc_latency + tile
+                                + west_latency(gate_acc_slices.front()),
+                            up_acc_latency + tile
+                                + west_latency(up_acc_slices.front()));
+                    // A direct ACC-to-VXM bypass conflicts with later
+                    // projection traffic on the physical fabric. The fused
+                    // policy therefore clears ACC into isolated MEM planes.
+                    if (strategy == FfnScheduleStrategy::Fused) {
+                        const int64_t temp_base =
+                            (pair * m_tile_count + m_tile) * tile;
+                        const auto emit_temp_write =
+                            [&](schedule::MemAccumulateOp source,
+                                llvm::ArrayRef<int64_t> temp_slices,
+                                llvm::ArrayRef<int64_t> acc_slices,
+                                int64_t acc_cycle, int64_t stream_base,
+                                mlir::Value& last_write) {
+                                for (int64_t byte = 0;
+                                     byte < throughput.mxm_result_streams;
+                                     ++byte) {
+                                    const int64_t target_slice =
+                                        temp_slices[byte];
+                                    const int64_t source_boundary =
+                                        acc_slices.front()
+                                        / target.streams()
+                                              .mem_slices_per_register_group;
+                                    const int64_t target_input_boundary =
+                                        target_slice
+                                            / target.streams()
+                                                  .mem_slices_per_register_group
+                                        + 1;
+                                    const int64_t transport =
+                                        source_boundary
+                                        - target_input_boundary;
+                                    const int64_t write_cycle =
+                                        acc_cycle + transport + 1;
+                                    auto placement = schedule_placement(
+                                        rewriter, {target_slice}, temp_base,
+                                        tile, 1, hemi_name(hemisphere),
+                                        "fp32_swiglu_temp_byte");
+                                    auto write =
+                                        rewriter.create<schedule::MemWriteOp>(
+                                            ffn.getLoc(), source.getOutput(),
+                                            write_cycle, tile,
+                                            stream_base + byte, 1,
+                                            target_input_boundary,
+                                            rewriter.getStringAttr("west"),
+                                            ffn.getHidden1Address(), placement,
+                                            tile
+                                                * throughput.lanes_per_tile);
+                                    last_write = write.getOutput();
+                                    // A repeated MEM write owns its ICU queue
+                                    // until all 32 rows have issued. Express
+                                    // that interval in VXM-consume cycles so
+                                    // the deferred allocator cannot place a
+                                    // read from the same byte-plane queue over
+                                    // any projection tile's temporary write.
+                                    temp_mem_busy_windows[hemisphere].push_back({
+                                        write_cycle
+                                            + west_latency(target_slice),
+                                        write_cycle + tile
+                                            + west_latency(target_slice)});
+                                    deferred_ready_cycle = std::max(
+                                        deferred_ready_cycle,
+                                        write_cycle + tile
+                                            + west_latency(target_slice));
+                                }
+                            };
+                        emit_temp_write(gate_acc_op,
+                            memory.w8a16_fused_gate_temp_slices,
+                            gate_acc_slices,
+                            compute_cycle + gate_acc_latency,
+                            projection_result_stream_base, gate_temp);
+                        emit_temp_write(up_acc_op,
+                            memory.w8a16_fused_up_temp_slices, up_acc_slices,
+                            compute_cycle + up_acc_latency,
+                            projection_result_stream_base
+                                + throughput.mxm_result_streams,
+                            up_temp);
+                    }
+                    completed_tiles.push_back({
+                        pair, m_tile, hemisphere, compute_cycle,
+                        deferred_ready_cycle, gate_acc_op, up_acc_op,
+                        gate_temp, up_temp});
+                }
             }
             }
             ++projection_block;
@@ -427,126 +598,242 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
     const int64_t accumulator_queue_release = std::max(
         gate_acc_latency + tile + west_latency(gate_acc_slices.front()),
         up_acc_latency + tile + west_latency(up_acc_slices.front()));
-    // There is no fixed overlap batch. Until all projection resources are
-    // modeled by the exact scheduler, conservatively start SwiGLU at the tail.
-    int64_t tail_swish_cycle = final_projection_cycle + accumulator_queue_release;
     mlir::Value last_hidden;
     int64_t last_swish_cycle = 0;
-    for (int64_t m_tile = 0; m_tile < m_tile_count; ++m_tile) {
-        for (int64_t pair = 0; pair < projection_pair_count; ++pair) {
+    const auto emit_swiglu_row = [&](mlir::Value gate_value, mlir::Value up_value,
+                                     int64_t cycle, int64_t m_tile, int64_t pair,
+                                     int64_t row, int64_t hemisphere) {
+        const int64_t nblock = pair * memory.hemispheres + hemisphere;
+        const int64_t swish_input_stream =
+            strategy == FfnScheduleStrategy::Fused
+            ? 8 + hemisphere * 8
+            : 0;
+        // Keep the FP16 result off projection activation streams E0/E1 and
+        // their prefetch alternate E16/E17. Dequant windows are excluded by
+        // the fused allocator, leaving the top stream pair available here.
+        const int64_t swish_output_stream =
+            strategy == FfnScheduleStrategy::Fused
+            ? target.streams().streams_per_direction - 2
+            : 0;
+        last_swish_cycle = std::max(last_swish_cycle, cycle);
+        mlir::Value value;
+        value = create_vxm(rewriter, ffn.getLoc(), gate_value, up_value,
+            ffn.getResult().getType(), cycle, 0, "negate", "stream_f32",
+            stream_encoding_offset + swish_input_stream, 0,
+            "immediate", 0, 0, "fp32", -1, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
+        value = create_vxm(rewriter, ffn.getLoc(), gate_value, up_value,
+            ffn.getResult().getType(), cycle, 1, "multiply", "stream_f32",
+            stream_encoding_offset + swish_input_stream, 0, "stream_f32",
+            stream_encoding_offset + swish_input_stream
+                + throughput.mxm_result_streams,
+            0, "fp32", -1, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
+        value = create_vxm(rewriter, ffn.getLoc(), value, up_value,
+            ffn.getResult().getType(), cycle + 1, 2, "exp", "alu", 0, 0,
+            "immediate", 0, 0, "fp32", -1, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
+        value = create_vxm(rewriter, ffn.getLoc(), value, up_value,
+            ffn.getResult().getType(), cycle + 1, 5, "pass", "alu", 1, 0,
+            "immediate", 0, 0, "fp32", -1, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
+        value = create_vxm(rewriter, ffn.getLoc(), value, up_value,
+            ffn.getResult().getType(), cycle + 2, 3, "add", "alu", 2, 0,
+            "immediate", 0, 1, "fp32", -1, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
+        value = create_vxm(rewriter, ffn.getLoc(), value, up_value,
+            ffn.getResult().getType(), cycle + 2, 6, "pass", "alu", 5, 0,
+            "immediate", 0, 0, "fp32", -1, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
+        value = create_vxm(rewriter, ffn.getLoc(), value, up_value,
+            ffn.getResult().getType(), cycle + 3, 4, "divide", "immediate", 0,
+            1, "alu", 3, 0, "fp32", -1, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
+        value = create_vxm(rewriter, ffn.getLoc(), value, up_value,
+            ffn.getResult().getType(), cycle + 3, 7, "pass", "alu", 6, 0,
+            "immediate", 0, 0, "fp32", -1, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
+        value = create_vxm(rewriter, ffn.getLoc(), value, up_value,
+            ffn.getResult().getType(), cycle + 4, 8, "multiply", "alu", 7, 0,
+            "alu", 4, 0, "fp32", -1, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
+        auto cast0 = create_vxm(rewriter, ffn.getLoc(), value, up_value,
+            ffn.getResult().getType(), cycle + 5, 9, "cast", "alu", 8, 0,
+            "immediate", 0, 0, "fp16", swish_output_stream, 1, 1,
+            hemi_name(hemisphere), hemi_name(hemisphere));
+        const int64_t peer = 1 - hemisphere;
+        auto peer_cast0 = create_vxm(rewriter, ffn.getLoc(), value, up_value,
+            ffn.getResult().getType(), cycle + 5, 11, "cast", "alu", 8, 0,
+            "immediate", 0, 0, "fp16", swish_output_stream, 1, 1,
+            hemi_name(hemisphere), hemi_name(peer));
+        for (int64_t destination = 0; destination < memory.hemispheres;
+             ++destination) {
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                auto placement = schedule_placement(rewriter, {hidden_slices[byte]},
+                    nblock * m + m_tile * tile + row, 1, 1,
+                    hemi_name(destination), "fp16_mxm_activation_planar");
+                const bool local = destination == hemisphere;
+                mlir::Value output =
+                    local ? cast0.getResult() : peer_cast0.getResult();
+                auto write = rewriter.create<schedule::MemWriteOp>(ffn.getLoc(),
+                    output,
+                    cycle + 6 + hidden_slices[byte]
+                        / target.streams().mem_slices_per_register_group,
+                    1, swish_output_stream + byte, 1, 0,
+                    rewriter.getStringAttr("east"), ffn.getHidden0Address(),
+                    placement, tile);
+                last_hidden = write.getOutput();
+            }
+        }
+    };
+
+    if (strategy == FfnScheduleStrategy::Tail) {
+        // Preserve the original conservative schedule as the default policy.
+        int64_t tail_swish_cycle =
+            final_projection_cycle + accumulator_queue_release;
+        for (int64_t m_tile = 0; m_tile < m_tile_count; ++m_tile) {
+            for (int64_t pair = 0; pair < projection_pair_count; ++pair) {
+                for (int64_t row = 0; row < tile; ++row) {
+                    for (int64_t hemisphere = 0;
+                         hemisphere < memory.hemispheres; ++hemisphere) {
+                        const int64_t nblock =
+                            pair * memory.hemispheres + hemisphere;
+                        const int64_t address =
+                            m_tile * tile * (intermediate / tile)
+                            + row * (intermediate / tile) + nblock;
+                        const int64_t cycle = tail_swish_cycle++;
+                        mlir::Value gate_value, up_value;
+                        for (int64_t byte = 0;
+                             byte < throughput.mxm_result_streams; ++byte) {
+                            gate_value = one_slice_read(ffn.getActivation(),
+                                activation_route,
+                                cycle - west_latency(gate_acc_slices[byte]),
+                                gate_acc_slices[byte], address, 1, 1, byte,
+                                "west", "vxm_fp32",
+                                hemi_name(hemisphere)).getOutput();
+                            up_value = one_slice_read(ffn.getActivation(),
+                                activation_route,
+                                cycle - west_latency(up_acc_slices[byte]),
+                                up_acc_slices[byte], address, 1, 1,
+                                throughput.mxm_result_streams + byte,
+                                "west", "vxm_fp32",
+                                hemi_name(hemisphere)).getOutput();
+                        }
+                        emit_swiglu_row(gate_value, up_value, cycle, m_tile,
+                            pair, row, hemisphere);
+                    }
+                }
+            }
+        }
+    } else {
+        llvm::SmallVector<CycleWindow> dequant_windows;
+        const int64_t dequant_window_cycles =
+            memory.hemispheres * throughput.mxms_per_hemisphere
+                * weight_load_cycles
+            + 1;
+        for (int64_t block = 0; block < projection_block; ++block) {
+            const int64_t start =
+                initial_compute_cycle + block * weight_block_interval - tile;
+            dequant_windows.push_back({start, start + dequant_window_cycles});
+        }
+
+        llvm::SmallVector<const CompletedProjectionTile*> deferred;
+        for (const CompletedProjectionTile& completed : completed_tiles)
+            deferred.push_back(&completed);
+        llvm::sort(deferred,
+            [&](const CompletedProjectionTile* lhs,
+                const CompletedProjectionTile* rhs) {
+                return lhs->compute_cycle < rhs->compute_cycle;
+            });
+        schedule::ResourceScheduler ffn_resources;
+        schedule::LPUResourceModel resource_model(target);
+        llvm::SmallVector<schedule::ResourceWindow, 16> all_vxm_alus;
+        for (int64_t alu = 0; alu < 16; ++alu)
+            all_vxm_alus.push_back({resource_model.vxm_alu(alu), 0, 1});
+        for (CycleWindow dequant : dequant_windows) {
+            llvm::SmallVector<schedule::ResourceWindow, 16> windows;
+            for (const auto& resource : all_vxm_alus)
+                windows.push_back(
+                    {resource.resource, 0, dequant.end - dequant.start});
+            ffn_resources.reserve_at(dequant.start, windows);
+        }
+        for (int64_t hemisphere = 0; hemisphere < memory.hemispheres; ++hemisphere) {
+            llvm::SmallVector<int64_t, 8> temp_slices;
+            temp_slices.append(memory.w8a16_fused_gate_temp_slices.begin(),
+                memory.w8a16_fused_gate_temp_slices.end());
+            temp_slices.append(memory.w8a16_fused_up_temp_slices.begin(),
+                memory.w8a16_fused_up_temp_slices.end());
+            for (CycleWindow busy : temp_mem_busy_windows[hemisphere]) {
+                llvm::SmallVector<schedule::ResourceWindow, 8> windows;
+                for (int64_t slice : temp_slices)
+                    windows.push_back({resource_model.mem_slice(hemisphere, slice),
+                        0, busy.end - busy.start});
+                ffn_resources.reserve_at(busy.start, windows);
+            }
+        }
+
+        schedule::ScheduleGraph swish_graph;
+        llvm::SmallVector<schedule::ScheduleNodeId> swish_nodes;
+        for (const CompletedProjectionTile* completed : deferred) {
+            llvm::SmallVector<schedule::ResourceWindow, 24> windows;
+            for (const auto& resource : all_vxm_alus)
+                windows.push_back({resource.resource, 0, tile + 5});
+            for (int64_t slice : memory.w8a16_fused_gate_temp_slices)
+                windows.push_back({resource_model.mem_slice(
+                    completed->hemisphere, slice), 0, tile});
+            for (int64_t slice : memory.w8a16_fused_up_temp_slices)
+                windows.push_back({resource_model.mem_slice(
+                    completed->hemisphere, slice), 0, tile});
+            swish_nodes.push_back(swish_graph.add_node("ffn.swiglu",
+                completed->deferred_ready_cycle, tile, windows));
+        }
+        auto swish_schedule = swish_graph.schedule(ffn_resources);
+        if (mlir::failed(swish_schedule)) return mlir::failure();
+
+        for (std::size_t index = 0; index < deferred.size(); ++index) {
+            const CompletedProjectionTile* completed = deferred[index];
+            const int64_t start = (*swish_schedule)[swish_nodes[index]].cycle;
             for (int64_t row = 0; row < tile; ++row) {
-                for (int64_t hemisphere = 0; hemisphere < memory.hemispheres; ++hemisphere) {
-                const int64_t nblock = pair * memory.hemispheres + hemisphere;
-                const int64_t address = m_tile * tile * (intermediate / tile)
-                    + row * (intermediate / tile) + nblock;
-                const int64_t swish_input_stream = 0;
-                const int64_t swish_output_stream = 0;
-                const int64_t cycle = tail_swish_cycle++;
-                last_swish_cycle = std::max(last_swish_cycle, cycle);
+                const int64_t cycle = start + row;
+                const int64_t temp_base =
+                    (completed->pair * m_tile_count + completed->m_tile)
+                    * tile;
                 mlir::Value gate_value, up_value;
-                for (int64_t byte = 0; byte < throughput.mxm_result_streams; ++byte) {
-                    gate_value = one_slice_read(ffn.getActivation(), activation_route,
-                        cycle - west_latency(gate_acc_slices[byte]), gate_acc_slices[byte], address, 1, 1,
-                        swish_input_stream + byte,
-                        "west", "vxm_fp32", hemi_name(hemisphere)).getOutput();
-                    up_value = one_slice_read(ffn.getActivation(), activation_route,
-                        cycle - west_latency(up_acc_slices[byte]), up_acc_slices[byte], address, 1, 1,
-                        swish_input_stream + throughput.mxm_result_streams + byte,
-                        "west", "vxm_fp32", hemi_name(hemisphere)).getOutput();
+                const int64_t temp_stream_base =
+                    8 + completed->hemisphere * 8;
+                for (int64_t byte = 0;
+                     byte < throughput.mxm_result_streams; ++byte) {
+                    const int64_t gate_slice =
+                        memory.w8a16_fused_gate_temp_slices[byte];
+                    const int64_t up_slice =
+                        memory.w8a16_fused_up_temp_slices[byte];
+                    gate_value = one_slice_read(completed->gate_temp,
+                        activation_route,
+                        cycle - west_latency(gate_slice), gate_slice,
+                        temp_base + row, 1, 1,
+                        temp_stream_base + byte,
+                        "west", "vxm_fp32",
+                        hemi_name(completed->hemisphere)).getOutput();
+                    up_value = one_slice_read(completed->up_temp,
+                        activation_route,
+                        cycle - west_latency(up_slice), up_slice,
+                        temp_base + row, 1, 1,
+                        temp_stream_base
+                            + throughput.mxm_result_streams + byte,
+                        "west", "vxm_fp32",
+                        hemi_name(completed->hemisphere)).getOutput();
                 }
-                mlir::Value value;
-                value = create_vxm(rewriter, ffn.getLoc(), gate_value, up_value, ffn.getResult().getType(),
-                    cycle, 0, "negate", "stream_f32", 32 + swish_input_stream, 0,
-                    "immediate", 0, 0, "fp32", -1, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
-                value = create_vxm(rewriter, ffn.getLoc(), gate_value, up_value, ffn.getResult().getType(),
-                    cycle, 1, "multiply", "stream_f32", 32 + swish_input_stream, 0,
-                    "stream_f32", 32 + swish_input_stream + throughput.mxm_result_streams,
-                    0, "fp32", -1, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
-                value = create_vxm(rewriter, ffn.getLoc(), value, up_value, ffn.getResult().getType(),
-                    cycle + 1, 2, "exp", "alu", 0, 0, "immediate", 0, 0, "fp32", -1, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
-                value = create_vxm(rewriter, ffn.getLoc(), value, up_value, ffn.getResult().getType(),
-                    cycle + 1, 5, "pass", "alu", 1, 0, "immediate", 0, 0, "fp32", -1, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
-                value = create_vxm(rewriter, ffn.getLoc(), value, up_value, ffn.getResult().getType(),
-                    cycle + 2, 3, "add", "alu", 2, 0, "immediate", 0, 1, "fp32", -1, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
-                value = create_vxm(rewriter, ffn.getLoc(), value, up_value, ffn.getResult().getType(),
-                    cycle + 2, 6, "pass", "alu", 5, 0, "immediate", 0, 0, "fp32", -1, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
-                value = create_vxm(rewriter, ffn.getLoc(), value, up_value, ffn.getResult().getType(),
-                    cycle + 3, 4, "divide", "immediate", 0, 1, "alu", 3, 0, "fp32", -1, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
-                value = create_vxm(rewriter, ffn.getLoc(), value, up_value, ffn.getResult().getType(),
-                    cycle + 3, 7, "pass", "alu", 6, 0, "immediate", 0, 0, "fp32", -1, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
-                value = create_vxm(rewriter, ffn.getLoc(), value, up_value, ffn.getResult().getType(),
-                    cycle + 4, 8, "multiply", "alu", 7, 0, "alu", 4, 0, "fp32", -1, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
-                auto cast0 = create_vxm(rewriter, ffn.getLoc(), value, up_value, ffn.getResult().getType(),
-                    cycle + 5, 9, "cast", "alu", 8, 0, "immediate", 0, 0, "fp16",
-                    swish_output_stream, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere));
-                auto cast1 = create_vxm(rewriter, ffn.getLoc(), value, up_value, ffn.getResult().getType(),
-                    cycle + 5, 10, "cast", "alu", 8, 0, "immediate", 0, 0, "fp16",
-                    swish_output_stream + 2, 1, 1,
-                    hemi_name(hemisphere), hemi_name(hemisphere));
-                for (int64_t byte = 0; byte < throughput.mxm_activation_streams; ++byte) {
-                    auto placement = schedule_placement(rewriter, {hidden_slices[byte]},
-                        nblock * m + m_tile * tile + row, 1, 1, hemi_name(hemisphere),
-                        "fp16_mxm_activation_planar");
-                    auto write = rewriter.create<schedule::MemWriteOp>(ffn.getLoc(),
-                        byte < 2 ? cast0.getResult() : cast1.getResult(),
-                        cycle + 6 + hidden_slices[byte]
-                            / target.streams().mem_slices_per_register_group,
-                        1, swish_output_stream + byte, 1, 0,
-                        rewriter.getStringAttr("east"), ffn.getHidden0Address(),
-                        placement, tile);
-                    last_hidden = write.getOutput();
-                }
-                }
+                emit_swiglu_row(gate_value, up_value, cycle,
+                    completed->m_tile, completed->pair, row,
+                    completed->hemisphere);
             }
         }
     }
 
     const int64_t slowest_hidden_west_latency = west_latency(hidden_slices.back());
-    int64_t copy_cycle = last_swish_cycle + 1
-        + swish_write_latency + slowest_hidden_west_latency + 1;
-    for (int64_t m_tile = 0; m_tile < m_tile_count; ++m_tile) {
-        for (int64_t nblock = 1; nblock < intermediate / tile;
-             nblock += memory.hemispheres) {
-            for (int64_t row = 0; row < tile; ++row, ++copy_cycle) {
-            mlir::Value read_value;
-            for (int64_t byte = 0; byte < throughput.mxm_activation_streams; ++byte) {
-                read_value = one_slice_read(last_hidden, activation_route,
-                    copy_cycle - west_latency(hidden_slices[byte]), hidden_slices[byte],
-                    nblock * m + m_tile * tile + row, 1, 1, byte,
-                    "west", "vxm_fp16", "west").getOutput();
-            }
-            auto copy0 = create_vxm(rewriter, ffn.getLoc(), read_value, read_value,
-                ffn.getResult().getType(), copy_cycle, 0, "pass", "stream_f16", 32, 0,
-                "immediate", 0, 0, "fp16", 0, 1, 1, "west", "east");
-            auto copy1 = create_vxm(rewriter, ffn.getLoc(), read_value, read_value,
-                ffn.getResult().getType(), copy_cycle, 1, "pass", "stream_f16", 34, 0,
-                "immediate", 0, 0, "fp16", 2, 1, 1, "west", "east");
-            for (int64_t byte = 0; byte < throughput.mxm_activation_streams; ++byte) {
-                auto placement = schedule_placement(rewriter, {hidden_slices[byte]},
-                    nblock * m + m_tile * tile + row, 1, 1, "east",
-                    "fp16_mxm_activation_planar");
-                rewriter.create<schedule::MemWriteOp>(ffn.getLoc(),
-                    byte < 2 ? copy0.getResult() : copy1.getResult(),
-                    copy_cycle + 1 + hidden_slices[byte]
-                        / target.streams().mem_slices_per_register_group,
-                    1, byte, 1, 0,
-                    rewriter.getStringAttr("east"), ffn.getHidden1Address(), placement, tile);
-            }
-            }
-        }
-    }
-
-    int64_t phase_start = copy_cycle + throughput.accumulator_to_vxm_latency;
+    const int64_t phase_start = last_swish_cycle + 1
+        + swish_write_latency + slowest_hidden_west_latency + 1
+        + throughput.accumulator_to_vxm_latency;
     int64_t down_pair_transition_interval =
         2 * tile + throughput.accumulator_to_vxm_latency;
     for (int64_t result_slice : result_slices) {
@@ -560,18 +847,29 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
     }
     int64_t down_compute_cycle = phase_start + initial_compute_cycle;
     int64_t down_block = 0;
+    const int64_t down_reduction_blocks = intermediate / tile;
+    const int64_t down_columns_per_hemisphere =
+        throughput.mxms_per_hemisphere * tile;
+    const int64_t down_columns_per_wave =
+        memory.hemispheres * down_columns_per_hemisphere;
+    const int64_t down_wave_count =
+        (n + down_columns_per_wave - 1) / down_columns_per_wave;
     mlir::Value final_value;
-    for (int64_t output_pair = 0;
-         output_pair < n / (throughput.mxms_per_hemisphere * tile); ++output_pair) {
-        for (int64_t rb = 0; rb < intermediate / tile; ++rb) {
-            const int64_t compute_cycle = down_compute_cycle;
-            const int64_t dequant_start = compute_cycle - tile;
+    for (int64_t output_wave = 0; output_wave < down_wave_count; ++output_wave) {
+        const int64_t active_hemispheres = std::min<int64_t>(memory.hemispheres,
+            (n - output_wave * down_columns_per_wave
+                + down_columns_per_hemisphere - 1) / down_columns_per_hemisphere);
+        for (int64_t rb = 0; rb < down_reduction_blocks; ++rb) {
+            const int64_t weight_compute_cycle = down_compute_cycle;
+            const int64_t dequant_start = weight_compute_cycle - tile;
             const int64_t weight_buffer = down_block % 2;
+            for (int64_t hemisphere = 0; hemisphere < active_hemispheres; ++hemisphere) {
             for (int64_t local_mxm = 0;
                  local_mxm < throughput.mxms_per_hemisphere; ++local_mxm) {
-                const int64_t start = dequant_start + local_mxm * weight_load_cycles;
+                const int64_t unit = hemisphere * throughput.mxms_per_hemisphere + local_mxm;
+                const int64_t start = dequant_start + unit * weight_load_cycles;
                 const int64_t base = down_route.getPlacement().getAs<mlir::IntegerAttr>("base_row").getInt()
-                    + (output_pair * (intermediate / tile) + rb)
+                    + (output_wave * (intermediate / tile) + rb)
                         * throughput.mxms_per_hemisphere * weight_load_cycles
                     + local_mxm * weight_load_cycles;
                 mlir::Value read_value;
@@ -579,143 +877,187 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                     read_value = one_slice_read(down_raw.getInput(), down_raw,
                         start - west_latency(weight_slices[stream]), weight_slices[stream],
                         base, weight_load_cycles, 1, stream,
-                        "west", "weight_i8", "east").getOutput();
+                        "west", "weight_i8", hemi_name(hemisphere)).getOutput();
                 }
                 mlir::Value value = read_value;
                 for (int64_t stream = 0; stream < down_raw.getStreamCount(); ++stream) {
+                    const int64_t multiply_alu = stream;
+                    const int64_t cast_alu = 8 + stream;
                     value = create_vxm(rewriter, ffn.getLoc(), read_value, read_value,
-                        down_route.getInput().getType(), start, stream, "multiply",
-                        "stream_i8", 32 + stream, 0, "immediate", 0,
+                        down_route.getInput().getType(), start, multiply_alu, "multiply",
+                        "stream_i8", stream_encoding_offset + stream, 0,
+                        "immediate", 0,
                         ffn.getDownRhsScale().convertToFloat(), "fp32", -1,
                         weight_load_cycles, 1,
-                        "east", "east").getResult();
+                        hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
                     value = create_vxm(rewriter, ffn.getLoc(), value, read_value,
-                        down_route.getInput().getType(), start + 1, 8 + stream, "cast",
-                        "alu", stream, 0, "immediate", 0, 0, "fp16",
+                        down_route.getInput().getType(), start + 1, cast_alu, "cast",
+                        "alu", multiply_alu, 0, "immediate", 0, 0, "fp16",
                         local_mxm * throughput.mxm_load_streams_per_cycle + stream * 2,
-                        weight_load_cycles, 1, "east", "east").getResult();
+                        weight_load_cycles, 1,
+                        hemi_name(hemisphere), hemi_name(hemisphere)).getResult();
                 }
                 rewriter.create<schedule::MxmLoadOp>(ffn.getLoc(), value,
                     start + weight_to_iw, weight_load_cycles, 0,
                     throughput.mxm_load_streams_per_cycle,
-                    local_mxm, weight_buffer);
+                    unit, weight_buffer);
             }
-            const bool last = rb + 1 == intermediate / tile;
-            const int64_t switch_row = pipelined_block_interval - tile + weight_to_iw;
-            llvm::SmallVector<int64_t> segment_rows;
-            llvm::SmallVector<int64_t> segment_streams;
-            if (last || switch_row >= tile) {
-                segment_rows = {tile};
-                segment_streams = {0};
-            } else {
-                if (switch_row > 0) {
-                    segment_rows.push_back(switch_row);
+            }
+            const bool last = rb + 1 == down_reduction_blocks;
+            for (int64_t m_tile = 0; m_tile < m_tile_count; ++m_tile) {
+                const int64_t compute_cycle = weight_compute_cycle
+                    + m_tile * pipelined_block_interval;
+                const bool prefetch_next_weight = !last
+                    && m_tile_count > 1 && m_tile + 1 == m_tile_count;
+                llvm::SmallVector<int64_t> segment_rows;
+                llvm::SmallVector<int64_t> segment_streams;
+                if (!prefetch_next_weight) {
+                    segment_rows = {tile};
+                    segment_streams = {0};
+                } else {
+                    // The next reduction uses the same continuous four-cycle
+                    // dequant/IW load as Gate/Up. Route activation around each
+                    // target MXM's IW stream window while the weight is
+                    // prefetched under this final M tile.
+                    segment_rows.push_back(weight_to_iw);
                     segment_streams.push_back(0);
+                    for (int64_t unit = 0;
+                         unit < active_hemispheres * throughput.mxms_per_hemisphere;
+                         ++unit) {
+                        segment_rows.push_back(weight_load_cycles);
+                        segment_streams.push_back(
+                            unit % throughput.mxms_per_hemisphere == 0 ? 16 : 0);
+                    }
+                    const int64_t routed_rows = weight_to_iw
+                        + active_hemispheres * throughput.mxms_per_hemisphere
+                            * weight_load_cycles;
+                    if (routed_rows < tile) {
+                        segment_rows.push_back(tile - routed_rows);
+                        segment_streams.push_back(0);
+                    }
                 }
-                const int64_t switched_rows = std::min(weight_load_cycles, tile - switch_row);
-                segment_rows.push_back(switched_rows);
-                segment_streams.push_back(throughput.mxm_load_streams_per_cycle);
-                if (switch_row + switched_rows < tile) {
-                    segment_rows.push_back(tile - switch_row - switched_rows);
-                    segment_streams.push_back(0);
+                for (int64_t hemisphere = 0;
+                     hemisphere < active_hemispheres; ++hemisphere) {
+                schedule::MxmComputeOp down0;
+                schedule::MxmComputeOp down1;
+                int64_t row_offset = 0;
+                for (size_t segment = 0; segment < segment_rows.size(); ++segment) {
+                    const int64_t rows = segment_rows[segment];
+                    const int64_t stream_base = segment_streams[segment];
+                    const int64_t segment_cycle = compute_cycle + row_offset;
+                    mlir::Value hidden_value;
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        hidden_value = one_slice_read(last_hidden, activation_route,
+                            segment_cycle - east_mxm_latency(hidden_slices[byte]),
+                            hidden_slices[byte],
+                            rb * m + m_tile * tile + row_offset,
+                            rows, 1, stream_base + byte,
+                            "east", "activation", hemi_name(hemisphere)).getOutput();
+                    }
+                    const int64_t unit_base =
+                        hemisphere * throughput.mxms_per_hemisphere;
+                    down0 = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(), hidden_value,
+                        ffn.getDownWeight0(), projection_type, segment_cycle, rows,
+                        segment_cycle + 3, rows + 3, stream_base, 0,
+                        weight_buffer, unit_base, rows, tile, tile);
+                    down1 = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(), hidden_value,
+                        ffn.getDownWeight1(), projection_type, segment_cycle, rows,
+                        segment_cycle + 3, rows + 3, stream_base,
+                        throughput.mxm_result_streams,
+                        weight_buffer, unit_base + 1, rows, tile, tile);
+                    row_offset += rows;
                 }
-            }
-            schedule::MxmComputeOp down0;
-            schedule::MxmComputeOp down1;
-            int64_t row_offset = 0;
-            for (size_t segment = 0; segment < segment_rows.size(); ++segment) {
-                const int64_t rows = segment_rows[segment];
-                const int64_t stream_base = segment_streams[segment];
-                const int64_t segment_cycle = compute_cycle + row_offset;
-                mlir::Value hidden_value;
-                for (int64_t byte = 0; byte < throughput.mxm_activation_streams; ++byte) {
-                    hidden_value = one_slice_read(last_hidden, activation_route,
-                        segment_cycle - east_mxm_latency(hidden_slices[byte]),
-                        hidden_slices[byte], rb * tile + row_offset,
-                        rows, 1, stream_base + byte,
-                        "east", "activation", "east").getOutput();
-                }
-                down0 = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(), hidden_value,
-                    ffn.getDownWeight0(), projection_type, segment_cycle, rows,
-                    segment_cycle + 3, rows + 3, stream_base, 0,
-                    weight_buffer, 0, rows, tile, tile);
-                down1 = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(), hidden_value,
-                    ffn.getDownWeight1(), projection_type, segment_cycle, rows,
-                    segment_cycle + 3, rows + 3, stream_base + 2,
-                    throughput.mxm_result_streams,
-                    weight_buffer, 1, rows, tile, tile);
-                row_offset += rows;
-            }
-            auto acc0_place = schedule_placement(rewriter, gate_acc_slices,
-                down_accumulator_base,
-                tile, 1, "east", "fp32_accumulator");
-            auto acc1_place = schedule_placement(rewriter, up_acc_slices,
-                down_accumulator_base,
-                tile, 1, "east", "fp32_accumulator");
-            auto make_acc = [&](mlir::Value input, mlir::DictionaryAttr placement,
-                                int64_t cycle, int64_t stream_base) {
-                mlir::OperationState state(ffn.getLoc(), schedule::MemAccumulateOp::getOperationName());
-                state.addOperands(input); state.addTypes(projection_type);
-                state.addAttributes({
-                    rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
-                    rewriter.getNamedAttr("stream_base", rewriter.getI64IntegerAttr(stream_base)),
-                    rewriter.getNamedAttr("stream_count", rewriter.getI64IntegerAttr(
-                        throughput.mxm_result_streams)),
-                    rewriter.getNamedAttr("address", ffn.getResultAddressAttr()),
-                    rewriter.getNamedAttr("placement", placement),
-                    rewriter.getNamedAttr("hemisphere", rewriter.getStringAttr("east")),
-                    rewriter.getNamedAttr("destination", rewriter.getStringAttr(last ? "stream" : "sram")),
-                    rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(tile)),
-                    rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(1)),
-                    rewriter.getNamedAttr("address_stride", rewriter.getI64IntegerAttr(1)),
-                });
-                return llvm::cast<schedule::MemAccumulateOp>(rewriter.create(state));
-            };
-            auto acc0 = make_acc(down0.getResult(), acc0_place, compute_cycle + gate_acc_latency, 0);
-            auto acc1 = make_acc(down1.getResult(), acc1_place,
-                compute_cycle + up_acc_latency, throughput.mxm_result_streams);
-            if (last) {
-                const int64_t output_to_vxm_latency = throughput.accumulator_to_vxm_latency;
-                const int64_t result_stream_base = 2 * throughput.mxm_result_streams;
-                for (int64_t row = 0; row < tile; ++row) {
-                    const int64_t vxm_cycle = compute_cycle + output_to_vxm_latency + row;
-                    auto cast0 = create_vxm(rewriter, ffn.getLoc(), acc0.getOutput(), acc1.getOutput(),
-                        ffn.getResult().getType(), vxm_cycle, 0, "pass", "stream_f32", 32, 0,
-                        "immediate", 0, 0, "fp16", result_stream_base, 1, 1, "east", "east");
-                    auto cast1 = create_vxm(rewriter, ffn.getLoc(), acc0.getOutput(), acc1.getOutput(),
-                        ffn.getResult().getType(), vxm_cycle, 1, "pass", "stream_f32", 36, 0,
-                        "immediate", 0, 0, "fp16", result_stream_base + 2,
-                        1, 1, "east", "east");
-                    for (int64_t byte = 0; byte < throughput.mxm_result_streams; ++byte) {
-                        auto placement = schedule_placement(rewriter, {result_slices[byte]},
-                            output_pair * tile + row, 1, 1, "east", "fp16_pair_planar");
-                        mlir::NamedAttrList attrs(placement);
-                        llvm::SmallVector<mlir::Attribute> all_slices;
-                        for (int64_t slice : result_slices)
-                            all_slices.push_back(rewriter.getI64IntegerAttr(slice));
-                        attrs.set("binding_slices", rewriter.getArrayAttr(all_slices));
-                        attrs.set("binding_instruction_count", rewriter.getI64IntegerAttr(
-                            ffn.getM() * n
-                                / (tile * throughput.mxms_per_hemisphere)));
-                        auto write = rewriter.create<schedule::MemWriteOp>(ffn.getLoc(),
-                            byte < 2 ? cast0.getResult() : cast1.getResult(),
-                            vxm_cycle + 1 + result_slices[byte]
-                                / target.streams().mem_slices_per_register_group,
-                            1,
-                            result_stream_base + byte, 1, 0,
-                            rewriter.getStringAttr("east"), ffn.getResultAddress(),
-                            attrs.getDictionary(rewriter.getContext()), tile);
-                        final_value = write.getOutput();
+                const int64_t accumulator_base = down_accumulator_base + m_tile * tile;
+                auto acc0_place = schedule_placement(rewriter, gate_acc_slices,
+                    accumulator_base,
+                    tile, 1, hemi_name(hemisphere), "fp32_accumulator");
+                auto acc1_place = schedule_placement(rewriter, up_acc_slices,
+                    accumulator_base,
+                    tile, 1, hemi_name(hemisphere), "fp32_accumulator");
+                auto make_acc = [&](mlir::Value input, mlir::DictionaryAttr placement,
+                                    int64_t cycle, int64_t stream_base) {
+                    mlir::OperationState state(
+                        ffn.getLoc(), schedule::MemAccumulateOp::getOperationName());
+                    state.addOperands(input);
+                    state.addTypes(projection_type);
+                    state.addAttributes({
+                        rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
+                        rewriter.getNamedAttr("stream_base", rewriter.getI64IntegerAttr(stream_base)),
+                        rewriter.getNamedAttr("stream_count", rewriter.getI64IntegerAttr(
+                            throughput.mxm_result_streams)),
+                        rewriter.getNamedAttr("address", ffn.getResultAddressAttr()),
+                        rewriter.getNamedAttr("placement", placement),
+                        rewriter.getNamedAttr("hemisphere",
+                            rewriter.getStringAttr(hemi_name(hemisphere))),
+                        rewriter.getNamedAttr("destination", rewriter.getStringAttr(
+                            last ? "stream" : "sram")),
+                        rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(tile)),
+                        rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(1)),
+                        rewriter.getNamedAttr("address_stride", rewriter.getI64IntegerAttr(1)),
+                    });
+                    return llvm::cast<schedule::MemAccumulateOp>(rewriter.create(state));
+                };
+                auto acc0 = make_acc(down0.getResult(), acc0_place,
+                    compute_cycle + gate_acc_latency, 0);
+                auto acc1 = make_acc(down1.getResult(), acc1_place,
+                    compute_cycle + up_acc_latency, throughput.mxm_result_streams);
+                if (last) {
+                    const int64_t output_to_vxm_latency = throughput.accumulator_to_vxm_latency;
+                    // Keep the final VXM result off the down-activation pair.
+                    // The last activation rows can still be in flight through
+                    // MEM when the accumulator starts producing results.
+                    const int64_t result_stream_base = 24;
+                    const int64_t output_cast_alu_base = hemisphere == 0 ? 0 : 8;
+                    for (int64_t row = 0; row < tile; ++row) {
+                        const int64_t vxm_cycle = compute_cycle + output_to_vxm_latency + row;
+                        auto cast0 = create_vxm(rewriter, ffn.getLoc(), acc0.getOutput(), acc1.getOutput(),
+                            ffn.getResult().getType(), vxm_cycle, output_cast_alu_base, "pass",
+                            "stream_f32", stream_encoding_offset, 0,
+                            "immediate", 0, 0, "fp16",
+                            result_stream_base, 1, 1,
+                            hemi_name(hemisphere), hemi_name(hemisphere));
+                        auto cast1 = create_vxm(rewriter, ffn.getLoc(), acc0.getOutput(), acc1.getOutput(),
+                            ffn.getResult().getType(), vxm_cycle, output_cast_alu_base + 1,
+                            "pass", "stream_f32", 36, 0,
+                            "immediate", 0, 0, "fp16", result_stream_base + 2,
+                            1, 1, hemi_name(hemisphere), hemi_name(hemisphere));
+                        for (int64_t byte = 0; byte < throughput.mxm_result_streams; ++byte) {
+                            auto placement = schedule_placement(rewriter, {result_slices[byte]},
+                                output_wave * m + m_tile * tile + row,
+                                1, 1, hemi_name(hemisphere), "fp16_pair_planar");
+                            mlir::NamedAttrList attrs(placement);
+                            llvm::SmallVector<mlir::Attribute> all_slices;
+                            for (int64_t slice : result_slices)
+                                all_slices.push_back(rewriter.getI64IntegerAttr(slice));
+                            attrs.set("binding_slices", rewriter.getArrayAttr(all_slices));
+                            attrs.set("binding_instruction_count", rewriter.getI64IntegerAttr(
+                                ffn.getM() * down_wave_count));
+                            auto binding_placement = schedule_placement(rewriter,
+                                result_slices, 0, ffn.getM() * down_wave_count, 1,
+                                "both", "fp16_pair_planar");
+                            attrs.set("binding_placement", binding_placement);
+                            auto write = rewriter.create<schedule::MemWriteOp>(ffn.getLoc(),
+                                byte < 2 ? cast0.getResult() : cast1.getResult(),
+                                vxm_cycle + 1 + result_slices[byte]
+                                    / target.streams().mem_slices_per_register_group,
+                                1,
+                                result_stream_base + byte, 1, 0,
+                                rewriter.getStringAttr("east"), ffn.getResultAddress(),
+                                attrs.getDictionary(rewriter.getContext()), tile);
+                            final_value = write.getOutput();
+                        }
                     }
                 }
             }
+            }
             ++down_block;
             if (last) {
-                if (output_pair + 1
-                    < n / (throughput.mxms_per_hemisphere * tile))
-                    down_compute_cycle += down_pair_transition_interval;
+                if (output_wave + 1 < down_wave_count)
+                    down_compute_cycle += (m_tile_count - 1)
+                        * pipelined_block_interval + down_pair_transition_interval;
             } else {
-                down_compute_cycle += pipelined_block_interval;
+                down_compute_cycle += weight_block_interval
+                    + (m_tile_count > 1 ? 0 : tile);
             }
         }
     }
@@ -727,6 +1069,12 @@ class LowerStreamToSchedulePass final
           mlir::OperationPass<mlir::func::FuncOp>> {
 public:
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerStreamToSchedulePass)
+
+    LowerStreamToSchedulePass() = default;
+    explicit LowerStreamToSchedulePass(FfnScheduleStrategy strategy)
+        : ffn_strategy_(strategy)
+    {
+    }
 
     llvm::StringRef getArgument() const final { return "ftlpu-stream-to-schedule"; }
     llvm::StringRef getDescription() const final
@@ -743,6 +1091,127 @@ public:
             return;
         }
 
+        mlir::IRRewriter rewriter(&getContext());
+        auto target_model =
+            target::LPUTargetModel::from_operation(function);
+        if (mlir::failed(target_model)) {
+            signalPassFailure();
+            return;
+        }
+        const target::LPUTargetModel& target = *target_model;
+        llvm::SmallVector<PrimitiveFfnSchedulePlan, 2> primitive_ffns;
+        llvm::SmallVector<stream::ElementwiseTaskOp> stream_elements;
+        function.walk([&](stream::ElementwiseTaskOp op) {
+            if (op.getKind() == "add_quant") stream_elements.push_back(op);
+        });
+        for (stream::ElementwiseTaskOp add : stream_elements) {
+            auto down0 =
+                add.getLhs().getDefiningOp<stream::MatmulTaskOp>();
+            auto down1 =
+                add.getRhs().getDefiningOp<stream::MatmulTaskOp>();
+            if (!down0 || !down1 || down0.getLhs().size() != 1
+                || down1.getLhs().size() != 1
+                || down0.getRhs().size() != 1
+                || down1.getRhs().size() != 1)
+                continue;
+            auto hidden0_route =
+                down0.getLhs()[0].getDefiningOp<stream::RouteOp>();
+            auto hidden1_route =
+                down1.getLhs()[0].getDefiningOp<stream::RouteOp>();
+            auto multiply = hidden0_route
+                ? hidden0_route.getInput()
+                      .getDefiningOp<stream::ElementwiseTaskOp>()
+                : stream::ElementwiseTaskOp{};
+            if (!hidden0_route || !hidden1_route || !multiply
+                || multiply.getKind() != "multiply"
+                || hidden1_route.getInput() != multiply.getResult())
+                continue;
+            auto swish =
+                multiply.getLhs().getDefiningOp<stream::SwishTaskOp>();
+            auto gate = swish
+                ? swish.getInput().getDefiningOp<stream::MatmulTaskOp>()
+                : stream::MatmulTaskOp{};
+            auto up =
+                multiply.getRhs().getDefiningOp<stream::MatmulTaskOp>();
+            if (!swish || !gate || !up || gate.getLhs().size() != 1
+                || up.getLhs().size() != 1 || gate.getRhs().size() != 1
+                || up.getRhs().size() != 1
+                || gate.getLhs()[0] != up.getLhs()[0])
+                continue;
+
+            auto activation_route =
+                gate.getLhs()[0].getDefiningOp<stream::RouteOp>();
+            auto gate_route =
+                gate.getRhs()[0].getDefiningOp<stream::RouteOp>();
+            auto up_route =
+                up.getRhs()[0].getDefiningOp<stream::RouteOp>();
+            auto down0_route =
+                down0.getRhs()[0].getDefiningOp<stream::RouteOp>();
+            auto down1_route =
+                down1.getRhs()[0].getDefiningOp<stream::RouteOp>();
+            const auto hidden0 =
+                get_task_allocation(multiply.getResultAllocations(), 0);
+            const auto hidden1 =
+                get_task_allocation(multiply.getResultAllocations(), 1);
+            const auto result =
+                get_task_allocation(add.getResultAllocations(), 0);
+            const auto gate_scale =
+                gate.getConfig().getAs<mlir::FloatAttr>("rhs_scale");
+            const auto up_scale =
+                up.getConfig().getAs<mlir::FloatAttr>("rhs_scale");
+            const auto hidden_scale =
+                multiply.getConfig().getAs<mlir::FloatAttr>("output_scale");
+            const auto hidden_zero_point =
+                multiply.getConfig().getAs<mlir::IntegerAttr>(
+                    "output_zero_point");
+            const auto down_lhs_scale =
+                down0.getConfig().getAs<mlir::FloatAttr>("lhs_scale");
+            const auto down_rhs_scale =
+                down0.getConfig().getAs<mlir::FloatAttr>("rhs_scale");
+            const auto output_scale =
+                add.getConfig().getAs<mlir::FloatAttr>("output_scale");
+            const auto output_zero_point =
+                add.getConfig().getAs<mlir::IntegerAttr>(
+                    "output_zero_point");
+            if (!activation_route || !gate_route || !up_route
+                || !down0_route || !down1_route || mlir::failed(hidden0)
+                || mlir::failed(hidden1) || mlir::failed(result)
+                || !gate_scale || !up_scale || !hidden_scale
+                || !hidden_zero_point || !down_lhs_scale
+                || !down_rhs_scale || !output_scale || !output_zero_point) {
+                add.emitError("incomplete primitive FFN stream graph");
+                signalPassFailure();
+                return;
+            }
+
+            primitive_ffns.push_back(PrimitiveFfnSchedulePlan{
+                add, down0, down1, hidden0_route, hidden1_route, multiply,
+                swish, gate, up, activation_route, gate_route, up_route,
+                down0_route, down1_route, *hidden0, *hidden1, *result,
+                gate_scale, up_scale, down_rhs_scale,
+            });
+        }
+        for (PrimitiveFfnSchedulePlan& ffn : primitive_ffns) {
+            rewriter.setInsertionPoint(ffn.add);
+            auto result = lower_w8a16_ffn_schedule(
+                rewriter, ffn, ffn_strategy_, target);
+            if (mlir::failed(result)) {
+                ffn.add.emitError(
+                    "failed to schedule a primitive W8A16 FFN graph");
+                signalPassFailure();
+                return;
+            }
+            rewriter.replaceOp(ffn.add, *result);
+            rewriter.eraseOp(ffn.down1);
+            rewriter.eraseOp(ffn.down0);
+            rewriter.eraseOp(ffn.hidden1_route);
+            rewriter.eraseOp(ffn.hidden0_route);
+            rewriter.eraseOp(ffn.multiply);
+            rewriter.eraseOp(ffn.swish);
+            rewriter.eraseOp(ffn.up);
+            rewriter.eraseOp(ffn.gate);
+        }
+
         llvm::SmallVector<stream::MatmulOp> matmuls;
         llvm::SmallVector<stream::SwigluOp> swiglus;
         llvm::SmallVector<stream::FfnOp> ffns;
@@ -756,9 +1225,7 @@ public:
             if (operation.getName().getStringRef() == stream::AttentionOp::getOperationName())
                 attentions.emplace_back(&operation);
         }
-        const target::LPUTargetModel target;
         schedule::ResourceScheduler scheduler;
-        mlir::IRRewriter rewriter(&getContext());
 
         for (stream::AttentionOp op : attentions) {
             schedule::AttentionScheduleEmitter emitter(rewriter, op, target);
@@ -777,7 +1244,9 @@ public:
                 && target.supports_w8a16_ffn_shape(
                     ffn.getM(), ffn.getK(), ffn.getHidden(), ffn.getN());
             if (w8a16) {
-                auto result = lower_w8a16_ffn_schedule(rewriter, ffn);
+                auto result =
+                    lower_w8a16_ffn_schedule(
+                        rewriter, ffn, ffn_strategy_, target);
                 if (mlir::failed(result)) {
                     ffn.emitError("failed to schedule a tile-aligned W8A16 FFN");
                     signalPassFailure(); return;
@@ -1330,13 +1799,17 @@ public:
             if (weight_route->use_empty()) rewriter.eraseOp(weight_route);
         }
     }
+
+private:
+    FfnScheduleStrategy ffn_strategy_ = FfnScheduleStrategy::Tail;
 };
 
 } // namespace
 
-std::unique_ptr<mlir::Pass> create_lower_stream_to_schedule_pass()
+std::unique_ptr<mlir::Pass> create_lower_stream_to_schedule_pass(
+    FfnScheduleStrategy ffn_strategy)
 {
-    return std::make_unique<LowerStreamToSchedulePass>();
+    return std::make_unique<LowerStreamToSchedulePass>(ffn_strategy);
 }
 
 } // namespace ftlpu::compiler

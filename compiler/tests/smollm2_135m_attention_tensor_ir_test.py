@@ -21,12 +21,14 @@ def main() -> None:
     required = (
         "ftlpu.tensor.attention", "query_weight =", "key_weight =", "value_weight =",
         "output_weight =", "query =", "key =", "value =", "rope =", "score =",
-        "exp =", "probability =", "probability_pack =", "probability_diagonal =",
+        "exp =", "causal_mask =", "probability =", "probability_pack =",
+        "probability_diagonal =",
         "context =", "result =",
         "slices = [28, 29, 30, 31]",
         'kind = "fp16_value_x16"', "base_row = 7800 : i64",
         'kind = "fp16_probability_x16"', "base_row = 6000 : i64",
         'kind = "fp16_probability_diagonal"', "base_row = 7000 : i64",
+        'kind = "fp32_causal_mask_tile"', "base_row = 8128 : i64",
     )
     missing = [item for item in required if item not in text]
     if missing:

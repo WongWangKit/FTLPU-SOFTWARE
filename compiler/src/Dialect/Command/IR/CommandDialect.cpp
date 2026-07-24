@@ -21,12 +21,15 @@ LogicalResult BindingOp::verify()
 {
     if (getIndex() < 0 || getBytes() <= 0)
         return emitOpError("requires a non-negative index and positive byte size");
-    if (getAccess() != "input" && getAccess() != "output")
-        return emitOpError("access must be input or output");
-    if (getRole() != "activation" && getRole() != "weight" && getRole() != "result")
-        return emitOpError("role must be activation, weight, or result");
-    if (getElementType() != "i8" && getElementType() != "i32" && getElementType() != "f16")
-        return emitOpError("element_type must be i8, i32, or f16");
+    if (getAccess() != "input" && getAccess() != "output"
+        && getAccess() != "internal")
+        return emitOpError("access must be input, output, or internal");
+    if (getRole() != "activation" && getRole() != "weight"
+        && getRole() != "result" && getRole() != "constant")
+        return emitOpError("role must be activation, weight, result, or constant");
+    if (getElementType() != "i8" && getElementType() != "i32"
+        && getElementType() != "f16" && getElementType() != "f32")
+        return emitOpError("element_type must be i8, i32, f16, or f32");
     if (getShape().empty()) return emitOpError("requires a ranked shape");
     for (Attribute dimension : getShape()) {
         auto integer = llvm::dyn_cast<IntegerAttr>(dimension);
