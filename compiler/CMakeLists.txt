@@ -106,9 +106,13 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Transforms/AttentionRopeEmitter.cpp
     src/Dialect/Schedule/Transforms/AttentionScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/AttentionSoftmaxEmitter.cpp
+    src/Dialect/Schedule/Transforms/FfnDownProjectionEmitter.cpp
     src/Dialect/Schedule/Transforms/FfnScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/FfnEmitterUtils.cpp
+    src/Dialect/Schedule/Transforms/FfnProjectionEmitter.cpp
+    src/Dialect/Schedule/Transforms/FfnStageEmitter.cpp
     src/Dialect/Schedule/Transforms/FfnSwishEmitter.cpp
+    src/Dialect/Schedule/Transforms/FfnSwishStageEmitter.cpp
     src/Dialect/Schedule/Transforms/FfnWeightLoadEmitter.cpp
     src/Dialect/Schedule/Transforms/MatmulScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/ScheduleEmitterUtils.cpp
