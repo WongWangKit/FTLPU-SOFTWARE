@@ -1,18 +1,21 @@
 #pragma once
 
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_stage_plan.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LLVM.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 
 namespace ftlpu::compiler::schedule {
 
 class AttentionScheduleEmitter {
 public:
     AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
-        stream::AttentionOp op, const target::LPUTargetModel& target);
+        stream::AttentionOp op, const target::LPUTargetModel& target,
+        AttentionStagePlan stagePlan);
 
     mlir::FailureOr<schedule::AttentionOp> emit();
 
@@ -29,6 +32,10 @@ private:
     mlir::IRRewriter& rewriter_;
     stream::AttentionOp op_;
     const target::LPUTargetModel& target_;
+    AttentionStagePlan stage_plan_;
 };
+
+mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
+    mlir::func::FuncOp function, const target::LPUTargetModel& target);
 
 } // namespace ftlpu::compiler::schedule

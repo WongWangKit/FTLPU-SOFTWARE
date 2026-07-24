@@ -46,13 +46,16 @@ The implemented layouts are:
 declared SRAM placement. `download_output()` reconstructs the logical tensor
 from its physical byte planes.
 
-## Binary Version 2
+## Binary Version 5
 
 All scalar fields are little-endian. The file starts with:
 
 ```text
 magic[8] = "FTLPUB01"
-u32 version = 2
+u32 version = 5
+u64 target_abi
+u16 target_name_size
+char target_name[target_name_size]
 u64 max_cycle
 u32 queue_count
 u32 binding_count
@@ -63,9 +66,16 @@ QueueProgram[queue_count]
 A binding contains fixed metadata followed by `rank` 64-bit dimensions and
 `slice_count` 16-bit MEM slice identifiers. A queue record contains queue kind,
 queue index, command count, and encoded `QueueCommand` records. Each command
-stores the ICU command word, instruction kind, word count, and three 32-bit
-instruction words. The reader retains version 1 compatibility; version 1 has
-no binding count or binding records.
+stores the ICU command word, instruction kind, word count, four fixed 32-bit
+instruction words, and an optional variable payload.
+
+The compiler hashes every command-relevant topology, throughput, layout, and
+latency parameter into `target_abi`. The current CModel runtime accepts only
+`lpu_32stream_v1`. It rejects a mismatched or unidentified legacy binary before
+writing any ICU queue, so architecture-exploration schedules cannot
+accidentally execute against the default hardware model. Versions 1 through 4
+remain readable for inspection, but have no target identity and are therefore
+not executable by this runtime.
 
 The instruction words reuse the CModel codec directly. MEM and MXM use one
 word. VXM uses the full three-word container to encode its ALU opcode, two

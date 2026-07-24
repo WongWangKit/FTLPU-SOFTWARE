@@ -78,17 +78,63 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/IR/ScheduleDialect.cpp
     src/Dialect/Schedule/Analysis/AttentionWorkPlanner.cpp
     src/Dialect/Schedule/Analysis/AttentionProjectionPlanner.cpp
+    src/Dialect/Schedule/Analysis/AttentionSoftmaxPlanner.cpp
+    src/Dialect/Schedule/Analysis/AttentionProjectionStagePlanner.cpp
+    src/Dialect/Schedule/Analysis/AttentionRopeStagePlanner.cpp
+    src/Dialect/Schedule/Analysis/AttentionSoftmaxStagePlanner.cpp
+    src/Dialect/Schedule/Analysis/AttentionPvStagePlanner.cpp
+    src/Dialect/Schedule/Analysis/AttentionOutputProjectionStagePlanner.cpp
+    src/Dialect/Schedule/Analysis/AttentionStagePlan.cpp
+    src/Dialect/Schedule/Analysis/FfnSchedulePlanner.cpp
+    src/Dialect/Schedule/Analysis/FfnScheduleBuilders.cpp
+    src/Dialect/Schedule/Analysis/FfnWeightLoadScheduleBuilder.cpp
+    src/Dialect/Schedule/Analysis/FfnProjectionScheduleBuilder.cpp
+    src/Dialect/Schedule/Analysis/FfnSwishScheduleBuilder.cpp
+    src/Dialect/Schedule/Analysis/FfnSwishPlanner.cpp
+    src/Dialect/Schedule/Analysis/FfnDownProjectionScheduleBuilder.cpp
     src/Dialect/Schedule/Analysis/LPUResourceModel.cpp
     src/Dialect/Schedule/Analysis/ResourceScheduler.cpp
     src/Dialect/Schedule/Analysis/ScheduleGraph.cpp
-    src/Dialect/Schedule/Transforms/AttentionMemoryLayout.cpp
+    src/Dialect/Schedule/Analysis/SchedulePlan.cpp
+    src/Dialect/Schedule/Analysis/AttentionMemoryLayout.cpp
+    src/Dialect/Schedule/Transforms/AttentionEmitterUtils.cpp
+    src/Dialect/Schedule/Transforms/AttentionOutputProjectionEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionProjectionEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionPvEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionRopeEmitter.cpp
     src/Dialect/Schedule/Transforms/AttentionScheduleEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionSoftmaxEmitter.cpp
+    src/Dialect/Schedule/Transforms/FfnScheduleEmitter.cpp
+    src/Dialect/Schedule/Transforms/FfnEmitterUtils.cpp
+    src/Dialect/Schedule/Transforms/FfnSwishEmitter.cpp
+    src/Dialect/Schedule/Transforms/FfnWeightLoadEmitter.cpp
+    src/Dialect/Schedule/Transforms/MatmulScheduleEmitter.cpp
+    src/Dialect/Schedule/Transforms/ScheduleEmitterUtils.cpp
     src/Dialect/Schedule/Transforms/StreamToSchedule.cpp
+    src/Dialect/Schedule/Transforms/SwigluScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/VerifySchedule.cpp
     src/Dialect/Command/IR/CommandDialect.cpp
     src/Dialect/Command/Transforms/ScheduleToCommand.cpp
     src/Target/LPUTargetModel.cpp
     src/Target/CommandBinary.cpp)
+
+# Ninja cannot reliably parse localized MSVC /showIncludes output. Keep
+# explicit dependency edges for all compiler sources: LPUTargetModel is also
+# exposed transitively through allocator and planner headers, and has inline
+# accessors whose offsets change as architecture parameters evolve.
+get_target_property(FTLPU_COMPILER_LIBRARY_SOURCES ftlpu_compiler SOURCES)
+set(FTLPU_TARGET_MODEL_CONSUMER_SOURCES
+    ${FTLPU_COMPILER_LIBRARY_SOURCES}
+    tools/ftlpu_opt.cpp
+    tools/ftlpu_translate.cpp
+    tests/attention_projection_planner_test.cpp
+    tests/attention_target_layout_test.cpp
+    tests/attention_work_planner_test.cpp
+    tests/physical_memory_allocator_test.cpp)
+set_source_files_properties(${FTLPU_TARGET_MODEL_CONSUMER_SOURCES}
+    PROPERTIES OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${CMAKE_SOURCE_DIR}/runtime/include/ftlpu/software/runtime/target_abi.hpp")
+
 add_dependencies(ftlpu_compiler FTLPUKernelOpsIncGen FTLPUTensorOpsIncGen
     FTLPUStreamOpsIncGen FTLPUScheduleOpsIncGen FTLPUCommandOpsIncGen)
 
@@ -121,12 +167,31 @@ add_test(NAME attention_work_planner_test COMMAND $<TARGET_FILE:attention_work_p
 add_executable(attention_projection_planner_test tests/attention_projection_planner_test.cpp)
 target_link_libraries(attention_projection_planner_test PRIVATE ftlpu_compiler)
 add_test(NAME attention_projection_planner_test COMMAND $<TARGET_FILE:attention_projection_planner_test>)
+add_executable(attention_stage_plan_test tests/attention_stage_plan_test.cpp)
+target_link_libraries(attention_stage_plan_test PRIVATE ftlpu_compiler)
+add_test(NAME attention_stage_plan_test COMMAND $<TARGET_FILE:attention_stage_plan_test>)
+add_executable(attention_rope_emitter_test tests/attention_rope_emitter_test.cpp)
+target_include_directories(attention_rope_emitter_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms)
+target_link_libraries(attention_rope_emitter_test PRIVATE ftlpu_compiler)
+add_test(NAME attention_rope_emitter_test COMMAND $<TARGET_FILE:attention_rope_emitter_test>)
 add_executable(attention_target_layout_test tests/attention_target_layout_test.cpp)
 target_link_libraries(attention_target_layout_test PRIVATE ftlpu_compiler)
 add_test(NAME attention_target_layout_test COMMAND $<TARGET_FILE:attention_target_layout_test>)
 add_executable(schedule_graph_test tests/schedule_graph_test.cpp)
 target_link_libraries(schedule_graph_test PRIVATE ftlpu_compiler)
 add_test(NAME schedule_graph_test COMMAND $<TARGET_FILE:schedule_graph_test>)
+add_executable(schedule_plan_test tests/schedule_plan_test.cpp)
+target_link_libraries(schedule_plan_test PRIVATE ftlpu_compiler)
+add_test(NAME schedule_plan_test COMMAND $<TARGET_FILE:schedule_plan_test>)
+add_executable(ffn_schedule_builders_test tests/ffn_schedule_builders_test.cpp)
+target_link_libraries(ffn_schedule_builders_test PRIVATE ftlpu_compiler)
+add_test(NAME ffn_schedule_builders_test COMMAND $<TARGET_FILE:ffn_schedule_builders_test>)
+add_executable(ffn_swish_emitter_test tests/ffn_swish_emitter_test.cpp)
+target_include_directories(ffn_swish_emitter_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms)
+target_link_libraries(ffn_swish_emitter_test PRIVATE ftlpu_compiler)
+add_test(NAME ffn_swish_emitter_test COMMAND $<TARGET_FILE:ffn_swish_emitter_test>)
 add_executable(physical_memory_allocator_test tests/physical_memory_allocator_test.cpp)
 target_link_libraries(physical_memory_allocator_test PRIVATE ftlpu_compiler)
 add_test(NAME physical_memory_allocator_test COMMAND $<TARGET_FILE:physical_memory_allocator_test>)

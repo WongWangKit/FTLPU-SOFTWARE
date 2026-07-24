@@ -119,6 +119,30 @@ allocation。每个 matmul task 都显式记录 MXM unit、weight buffer 和 res
 stream range。当前 Stream-to-Schedule 会在内部把该图整理为已有 scheduler
 descriptor，但 StableHLO-to-Stream pipeline 不会输出 compound FFN op。
 
+### 调度计划与 IR 生成
+
+Stream-to-Schedule 已拆分为与 MLIR 无关的计划层和 MLIR 生成层。
+`SchedulePlan` 是统一的 task DAG。每个 task 都包含稳定 ID 和名称、功能类型、
+模型阶段、最早 cycle、持续时间、资源窗口，以及带固定 transport latency 的
+生产者依赖。计划会在 `ResourceScheduler` 分配精确 cycle 前检查重复名称、
+非法依赖和依赖环。
+
+Attention 分为 Projection、RoPE、Softmax、PV 和 OutputProjection 五组
+planner/emitter。Planner 在不持有 `IRRewriter` 的情况下生成 projection work、
+QK/PV work wave 和五阶段 DAG；各阶段 emitter 只读取不可变计划并生成
+Schedule IR。RoPE 虽然拥有独立 planner 和 emitter 模块，但仍在每个 Q/K
+projection 小块完成后立即融合执行，不会被强制串行化。Attention 物理内存布局
+属于 Analysis；Softmax planner 会预约 VXM/MEM 窗口并返回每个 work wave、
+每个半球的精确 cycle，Softmax emitter 不再持有资源调度器。
+
+FFN 使用可复用的 WeightLoad、Projection、Swish 和 DownProjection schedule
+builder。Gate/Up 和 Down 共用同一套 weight dequant 与 MXM load emitter；
+六 cycle Swish ALU 序列可以独立测试。`FfnSwishPlanner` 会避开 weight
+dequant 和临时 MEM 流量来安排 VXM/MEM 资源窗口，FFN MLIR emitter 只消费
+确定的 cycle，不再调用 `ResourceScheduler`。过时的
+compound `ftlpu.stream.ffn` 已删除；公开 Stream IR 只保留 primitive task 和
+route op。
+
 ### LPU Target Model
 
 `LPUTargetModel` 是编译器侧唯一的硬件参数来源，包含：MEM geometry、每个方向

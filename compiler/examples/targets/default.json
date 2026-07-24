@@ -1,1 +1,7 @@
-{}
+{
+  "name": "lpu_32stream_v1",
+  "streams": {
+    "streams_per_direction": 32,
+    "encoded_streams": 64
+  }
+}

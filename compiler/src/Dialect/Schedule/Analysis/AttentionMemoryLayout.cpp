@@ -1,4 +1,4 @@
-#include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_memory_layout.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 
 #include "mlir/IR/BuiltinAttributes.h"
 

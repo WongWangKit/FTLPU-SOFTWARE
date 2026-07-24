@@ -1,4 +1,5 @@
 {
+  "name": "lpu_exploration_40stream",
   "streams": {
     "streams_per_direction": 40,
     "encoded_streams": 80

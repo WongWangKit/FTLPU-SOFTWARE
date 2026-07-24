@@ -34,6 +34,10 @@ try {
     write_binary_program(program, path);
 
     const auto decoded = read_binary_program(path);
+    require(decoded.target_name == kLpu32StreamTargetName,
+        "target name was not preserved");
+    require(decoded.target_abi == kLpu32StreamTargetAbi,
+        "target ABI was not preserved");
     bool found = false;
     for (const auto& queue : decoded.queues) {
         if (queue.kind != QueueKind::SxmTranspose || queue.index != 0 || queue.commands.empty())
@@ -45,6 +49,19 @@ try {
         found = true;
     }
     require(found, "serialized SXM transpose queue is missing");
+
+    auto incompatible = decoded;
+    incompatible.target_name = "incompatible-test-target";
+    incompatible.target_abi ^= 1;
+    auto rejected_system = std::make_unique<TspSliceSystem>();
+    CModelRuntime rejected_runtime(*rejected_system);
+    bool rejected = false;
+    try {
+        rejected_runtime.load(incompatible);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "CModel runtime accepted an incompatible target ABI");
 
     auto system = std::make_unique<TspSliceSystem>();
     CModelRuntime runtime(*system);

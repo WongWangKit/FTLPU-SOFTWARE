@@ -5,6 +5,7 @@
 // Keep this translation unit rebuilt when BinaryProgram ABI evolves.
 #include <bit>
 #include <cstdlib>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 
@@ -49,6 +50,15 @@ CModelRuntime::CModelRuntime(TspSliceSystem& system)
 
 void CModelRuntime::load(const BinaryProgram& program)
 {
+    if (program.target_abi != kLpu32StreamTargetAbi) {
+        std::ostringstream message;
+        message << "CModel target ABI mismatch: binary target '"
+                << program.target_name << "' has 0x" << std::hex
+                << program.target_abi << ", runtime requires '"
+                << kLpu32StreamTargetName << "' ABI 0x"
+                << kLpu32StreamTargetAbi;
+        throw std::invalid_argument(message.str());
+    }
     load_queue_programs_into_icu(program.queues, system_.icu());
     loaded_max_cycle_ = program.max_cycle;
     bindings_ = program.bindings;

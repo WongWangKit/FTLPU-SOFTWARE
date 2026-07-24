@@ -91,6 +91,8 @@ public:
     mlir::DictionaryAttr to_attribute(mlir::MLIRContext* context) const;
     mlir::LogicalResult validate(std::string* error = nullptr) const;
 
+    const std::string& name() const { return name_; }
+    std::uint64_t abi_fingerprint() const;
     const MemoryTopology& memory() const { return memory_; }
     const StreamTopology& streams() const { return streams_; }
     const ThroughputModel& throughput() const { return throughput_; }
@@ -136,6 +138,7 @@ public:
     static std::string_view endpoint_name(StreamEndpoint endpoint);
 
 private:
+    std::string name_{"lpu_32stream_v1"};
     MemoryTopology memory_;
     StreamTopology streams_;
     ThroughputModel throughput_;

@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
+#include "ftlpu/software/runtime/target_abi.hpp"
 
 #include <array>
 #include <iostream>
@@ -8,6 +9,10 @@ int main()
 {
     using ftlpu::compiler::target::LPUTargetModel;
     const LPUTargetModel target;
+    if (target.name() != ftlpu::software::runtime::kLpu32StreamTargetName
+        || target.abi_fingerprint()
+            != ftlpu::software::runtime::kLpu32StreamTargetAbi)
+        throw std::logic_error("default compiler target ABI diverges from runtime");
     constexpr std::array<int64_t, 16> kFirstReduction {
         0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33};
     constexpr std::array<int64_t, 16> kSecondReduction {

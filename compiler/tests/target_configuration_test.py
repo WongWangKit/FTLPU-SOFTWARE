@@ -37,6 +37,8 @@ def main() -> None:
 
     required = [
         "ftlpu.target",
+        'name = "lpu_exploration_40stream"',
+        'abi = "0x',
         "streams_per_direction = 40 : i64",
         "encoded_streams = 80 : i64",
         "mxm_pipeline_rows = 6 : i64",
@@ -49,6 +51,8 @@ def main() -> None:
     if missing:
         raise AssertionError(
             f"configured Schedule IR is missing: {missing}")
+    if 'name = "lpu_32stream_v1"' not in baseline:
+        raise AssertionError("default Schedule IR has no explicit 32-stream target")
     if baseline == explored:
         raise AssertionError("non-default target did not change Schedule IR")
 

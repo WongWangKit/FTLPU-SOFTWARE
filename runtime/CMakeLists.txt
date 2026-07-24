@@ -3,6 +3,8 @@ add_library(ftlpu_cmodel_static STATIC
 
 file(GLOB_RECURSE FTLPU_CMODEL_PUBLIC_HEADERS CONFIGURE_DEPENDS
     "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
+file(GLOB_RECURSE FTLPU_RUNTIME_PUBLIC_HEADERS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/*.hpp")
 set_source_files_properties(${FTLPU_CMODEL_PUBLIC_HEADERS}
     PROPERTIES HEADER_FILE_ONLY TRUE)
 target_sources(ftlpu_cmodel_static PRIVATE ${FTLPU_CMODEL_PUBLIC_HEADERS})
@@ -23,7 +25,8 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
     tests/runtime/compiled_smollm2_attention_softmax_runtime_test.cpp)
 set_source_files_properties(${FTLPU_CMODEL_CONSUMER_SOURCES}
-    PROPERTIES OBJECT_DEPENDS "${FTLPU_CMODEL_PUBLIC_HEADERS}")
+    PROPERTIES OBJECT_DEPENDS
+        "${FTLPU_CMODEL_PUBLIC_HEADERS};${FTLPU_RUNTIME_PUBLIC_HEADERS}")
 
 target_include_directories(ftlpu_cmodel_static
     PUBLIC
@@ -54,6 +57,10 @@ add_executable(sxm_binary_roundtrip_test
     tests/runtime/sxm_binary_roundtrip_test.cpp)
 
 target_link_libraries(sxm_binary_roundtrip_test PRIVATE ftlpu_software)
+add_test(
+    NAME sxm_binary_roundtrip_test
+    COMMAND $<TARGET_FILE:sxm_binary_roundtrip_test>
+        ${CMAKE_CURRENT_BINARY_DIR}/test-output/sxm-v5.ftlpu)
 
 add_executable(compiled_sxm_command_runtime_test
     tests/runtime/compiled_sxm_command_runtime_test.cpp)

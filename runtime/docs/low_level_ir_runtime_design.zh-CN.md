@@ -43,13 +43,16 @@ runtime binding 和扁平 MEM/MXM/VXM 队列命令。`ftlpu-translate` 按队列
 `CModelRuntime::upload_input()` 验证 binding 并把字节放入声明的 SRAM 位置；
 `download_output()` 从物理 byte plane 还原逻辑 tensor。
 
-## 二进制版本 2
+## 二进制版本 5
 
 所有标量字段均为 little-endian。文件头为：
 
 ```text
 magic[8] = "FTLPUB01"
-u32 version = 2
+u32 version = 5
+u64 target_abi
+u16 target_name_size
+char target_name[target_name_size]
 u64 max_cycle
 u32 queue_count
 u32 binding_count
@@ -59,8 +62,14 @@ QueueProgram[queue_count]
 
 一个 binding 包含固定元数据，随后是 `rank` 个 64 位维度和 `slice_count` 个
 16 位 MEM slice 标识。队列记录包含队列类型、队列编号、命令数和编码后的
-`QueueCommand`。每个命令保存 ICU command word、指令类型、word 数量和三个
-32 位指令 word。reader 保持版本 1 兼容；版本 1 没有 binding count 和记录。
+`QueueCommand`。每个命令保存 ICU command word、指令类型、word 数量、四个固定
+32 位指令 word，以及可选的变长 payload。
+
+编译器会把所有影响命令兼容性的拓扑、吞吐、布局和 latency 参数散列到
+`target_abi`。当前 CModel runtime 只接受 `lpu_32stream_v1`；如果 binary 的
+target 不匹配或来自没有 target 身份的旧格式，runtime 会在写入任何 ICU queue
+之前拒绝执行，避免架构探索配置误跑到默认硬件模型。版本 1 到 4 仍可被 reader
+读取用于检查，但不能由当前 runtime 执行。
 
 指令 word 直接复用 CModel codec。MEM 和 MXM 使用一个 word；VXM 使用完整的
 三 word 容器编码 ALU opcode、两个带类型操作数、cast target、输出 stream、

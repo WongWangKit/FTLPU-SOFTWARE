@@ -2,6 +2,7 @@
 #include "ftlpu/compiler/Target/command_binary.hpp"
 
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
+#include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "ftlpu/core/instruction_codec.hpp"
 
@@ -330,6 +331,9 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
 
 software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
 {
+    const auto target = LPUTargetModel::from_operation(module);
+    if (mlir::failed(target))
+        throw std::runtime_error("Command IR module has an invalid target");
     QueueMap queues;
     std::vector<BinaryBinding> bindings;
     module.walk([&](command::BindingOp op) { bindings.push_back(translate_binding(op)); });
@@ -360,6 +364,8 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
         return std::tie(lhs.access, lhs.index) < std::tie(rhs.access, rhs.index);
     });
     software::runtime::BinaryProgram program;
+    program.target_name = target->name();
+    program.target_abi = target->abi_fingerprint();
     program.bindings = std::move(bindings);
     for (auto& [key, sequences] : queues)
         program.queues.push_back(encode_queue(key, std::move(sequences), program.max_cycle));

@@ -147,27 +147,6 @@ def SwigluOp : FTLPU_Stream_Op<"swiglu", [Pure]> {
   let hasVerifier = 1;
 }
 
-def FfnOp : FTLPU_Stream_Op<"ffn", [Pure]> {
-  let summary = "Complete two-pass SwiGLU FFN stream topology";
-  let arguments = (ins AnyRankedTensor:$activation,
-      AnyRankedTensor:$gate_weight, AnyRankedTensor:$up_weight,
-      AnyRankedTensor:$down_weight0, AnyRankedTensor:$down_weight1,
-      I64Attr:$m, I64Attr:$k, I64Attr:$hidden, I64Attr:$n,
-      I64Attr:$gate_output_stream_base, I64Attr:$up_output_stream_base,
-      I64Attr:$vxm_output_stream,
-      F32Attr:$gate_scale, F32Attr:$up_scale, F32Attr:$hidden_scale,
-      I64Attr:$hidden_zero_point, F32Attr:$down_lhs_scale,
-      F32Attr:$down_rhs_scale, F32Attr:$output_scale,
-      I64Attr:$output_zero_point,
-      DictionaryAttr:$hidden0_address, DictionaryAttr:$hidden0_placement,
-      DictionaryAttr:$hidden1_address, DictionaryAttr:$hidden1_placement,
-      DictionaryAttr:$result_address, DictionaryAttr:$result_placement,
-      I64Attr:$hidden_pass_bytes, I64Attr:$result_bytes);
-  let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$activation `,` $gate_weight `,` $up_weight `,` $down_weight0 `,` $down_weight1 attr-dict `:` functional-type(operands, results)";
-  let hasVerifier = 1;
-}
-
 def AttentionOp : FTLPU_Stream_Op<"attention", [Pure]> {
   let summary = "Grouped-query attention with allocated inter-unit stream routes";
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$query_weight,

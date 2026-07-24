@@ -1,10 +1,12 @@
 #pragma once
 
 #include "ftlpu/software/runtime/icu_program.hpp"
+#include "ftlpu/software/runtime/target_abi.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace ftlpu::software::runtime {
@@ -51,6 +53,8 @@ struct BinaryBinding {
 };
 
 struct BinaryProgram {
+    std::string target_name{std::string(kLpu32StreamTargetName)};
+    std::uint64_t target_abi{kLpu32StreamTargetAbi};
     std::size_t max_cycle{0};
     std::vector<QueueProgram> queues{};
     std::vector<BinaryBinding> bindings{};

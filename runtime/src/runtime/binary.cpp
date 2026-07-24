@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 namespace ftlpu::software::runtime {
@@ -11,7 +12,7 @@ namespace ftlpu::software::runtime {
 namespace {
 
 constexpr std::array<char, 8> kMagic {'F', 'T', 'L', 'P', 'U', 'B', '0', '1'};
-constexpr std::uint32_t kCurrentVersion = 4;
+constexpr std::uint32_t kCurrentVersion = 5;
 
 template <typename T>
 void write_scalar(std::ostream& os, T value)
@@ -85,6 +86,16 @@ void write_binary_program(const BinaryProgram& program, const std::filesystem::p
 
     os.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
     write_scalar<std::uint32_t>(os, kCurrentVersion);
+    if (program.target_name.empty()
+        || program.target_name.size() > std::numeric_limits<std::uint16_t>::max()
+        || program.target_abi == 0)
+        throw std::runtime_error("FTLPU binary requires a valid target identity");
+    write_scalar<std::uint64_t>(os, program.target_abi);
+    write_scalar<std::uint16_t>(
+        os, static_cast<std::uint16_t>(program.target_name.size()));
+    os.write(program.target_name.data(),
+        static_cast<std::streamsize>(program.target_name.size()));
+    if (!os) throw std::runtime_error("failed to write FTLPU target name");
     write_scalar<std::uint64_t>(os, static_cast<std::uint64_t>(program.max_cycle));
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.queues.size()));
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.bindings.size()));
@@ -128,6 +139,17 @@ BinaryProgram read_binary_program(const std::filesystem::path& path)
     }
 
     auto program = BinaryProgram {};
+    if (version >= 5) {
+        program.target_abi = read_scalar<std::uint64_t>(is);
+        const auto target_name_size = read_scalar<std::uint16_t>(is);
+        program.target_name.resize(target_name_size);
+        is.read(program.target_name.data(),
+            static_cast<std::streamsize>(program.target_name.size()));
+        if (!is) throw std::runtime_error("truncated FTLPU target name");
+    } else {
+        program.target_name = "legacy-unidentified";
+        program.target_abi = 0;
+    }
     program.max_cycle = static_cast<std::size_t>(read_scalar<std::uint64_t>(is));
     const auto queue_count = read_scalar<std::uint32_t>(is);
     const auto binding_count = version >= 2 ? read_scalar<std::uint32_t>(is) : 0;

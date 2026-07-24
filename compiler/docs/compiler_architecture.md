@@ -132,6 +132,34 @@ stream range. The current Stream-to-Schedule implementation composes this
 graph into its established scheduling descriptor internally; the compound
 operation is not emitted by the StableHLO-to-Stream pipeline.
 
+### Schedule planning and emission
+
+Stream-to-Schedule is split into a target-independent planning side and an
+MLIR emission side. `SchedulePlan` is the common task DAG. Each task has a
+stable id and name, functional kind, model stage, earliest cycle, duration,
+resource windows, and producer dependencies with fixed transport latency.
+The plan validates duplicate names, invalid edges, and dependency cycles
+before `ResourceScheduler` assigns exact cycles.
+
+Attention owns separate Projection, RoPE, Softmax, PV, and OutputProjection
+stage planners and emitters. The planner constructs projection work, QK/PV
+waves, and the five-stage DAG without an `IRRewriter`. The stage emitters
+consume that immutable plan and only create Schedule IR. RoPE remains fused
+with each completed Q/K projection block, even though its planner and emitter
+are separate modules. Attention physical memory layout is an Analysis object.
+The Softmax planner reserves its VXM and MEM windows and returns the exact
+cycle of every wave and hemisphere; the Softmax emitter no longer owns a
+resource scheduler.
+
+FFN uses reusable WeightLoad, Projection, Swish, and DownProjection schedule
+builders. Gate/Up and Down share one weight dequantization and MXM-load
+emitter. The six-cycle Swish ALU sequence is an independently testable
+emitter, while `FfnSwishPlanner` schedules its VXM/MEM windows around weight
+dequantization and temporary-memory traffic. The FFN MLIR emitter consumes
+those planned cycles and does not invoke `ResourceScheduler`.
+The obsolete compound `ftlpu.stream.ffn` operation has been removed; public
+Stream IR contains only primitive task and route operations.
+
 ### LPU Target Model
 
 `LPUTargetModel` is the single compiler-side source for MEM geometry, 32

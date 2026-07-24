@@ -1,9 +1,13 @@
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
+#include "ftlpu/software/runtime/target_abi.hpp"
 #include "llvm/Support/JSON.h"
 #include "mlir/IR/Builders.h"
 
 #include <algorithm>
+#include <charconv>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 namespace ftlpu::compiler::target {
@@ -96,6 +100,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     const auto* streams = root->getObject("streams");
     const auto* throughput = root->getObject("throughput");
     LPUTargetModel model;
+    if (const auto name = root->getString("name")) model.name_ = name->str();
 
 #define READ_MEMORY(field) \
     read_json_integer(memory, #field, &MemoryTopology::field, model.memory_)
@@ -169,6 +174,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     if (!target) return LPUTargetModel{};
 
     LPUTargetModel model;
+    if (const auto name = target.getAs<mlir::StringAttr>("name"))
+        model.name_ = name.str();
     const auto memory = target.getAs<mlir::DictionaryAttr>("memory");
     const auto streams = target.getAs<mlir::DictionaryAttr>("streams");
     const auto throughput = target.getAs<mlir::DictionaryAttr>("throughput");
@@ -230,6 +237,20 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
         operation->emitError("invalid ftlpu.target configuration: ") << error;
         return mlir::failure();
     }
+    if (const auto abi = target.getAs<mlir::StringAttr>("abi")) {
+        std::uint64_t serialized = 0;
+        const std::string value = abi.str();
+        const auto* begin = value.data();
+        const auto* end = begin + value.size();
+        if (value.starts_with("0x")) begin += 2;
+        const auto result = std::from_chars(begin, end, serialized, 16);
+        if (result.ec != std::errc{} || result.ptr != end
+            || serialized != model.abi_fingerprint()) {
+            operation->emitError(
+                "ftlpu.target ABI fingerprint does not match its parameters");
+            return mlir::failure();
+        }
+    }
     return model;
 }
 
@@ -237,6 +258,9 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
     mlir::MLIRContext* context) const
 {
     mlir::Builder builder(context);
+    std::ostringstream abi;
+    abi << "0x" << std::hex << std::setfill('0') << std::setw(16)
+        << abi_fingerprint();
 #define I64(object, field) \
     builder.getNamedAttr(#field, builder.getI64IntegerAttr(object.field))
     const auto memory = builder.getDictionaryAttr({
@@ -291,6 +315,8 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
     });
 #undef I64
     return builder.getDictionaryAttr({
+        builder.getNamedAttr("name", builder.getStringAttr(name_)),
+        builder.getNamedAttr("abi", builder.getStringAttr(abi.str())),
         builder.getNamedAttr("memory", memory),
         builder.getNamedAttr("streams", streams),
         builder.getNamedAttr("throughput", throughput),
@@ -306,6 +332,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
     const auto positive = [](std::initializer_list<int64_t> values) {
         return llvm::all_of(values, [](int64_t value) { return value > 0; });
     };
+    if (name_.empty()) return fail("target name must not be empty");
     if (!positive({memory_.hemispheres, memory_.slices_per_hemisphere,
             memory_.banks_per_slice, memory_.words_per_bank,
             memory_.bytes_per_word, streams_.streams_per_direction,
@@ -346,6 +373,61 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
     for (int64_t slice : memory_.w8a16_fused_up_temp_slices)
         if (!valid_slice(slice)) return fail("up temporary slice is invalid");
     return mlir::success();
+}
+
+std::uint64_t LPUTargetModel::abi_fingerprint() const
+{
+    software::runtime::TargetAbiHasher hash;
+    hash.add(1);
+#define HASH(field) hash.add(memory_.field)
+    HASH(hemispheres);
+    HASH(slices_per_hemisphere);
+    HASH(banks_per_slice);
+    HASH(words_per_bank);
+    HASH(bytes_per_word);
+    HASH(accumulator_slice_base);
+    HASH(accumulator_slices_per_mxm);
+    HASH(w8a16_weight_slice_count);
+    HASH(w8a16_weight_slice_stride);
+    HASH(w8a16_activation_slice_base);
+    HASH(w8a16_hidden_slice_base);
+    HASH(w8a16_result_slice_base);
+    HASH(accumulator_scratch_base_row);
+#undef HASH
+    for (const auto value : memory_.w8a16_fused_gate_temp_slices) hash.add(value);
+    for (const auto value : memory_.w8a16_fused_up_temp_slices) hash.add(value);
+#define HASH(field) hash.add(streams_.field)
+    HASH(streams_per_direction);
+    HASH(encoded_streams);
+    HASH(mem_boundary_register_columns);
+    HASH(system_register_columns);
+    HASH(mem_slices_per_register_group);
+#undef HASH
+#define HASH(field) hash.add(throughput_.field)
+    HASH(tile_rows);
+    HASH(lanes_per_tile);
+    HASH(mem_read_bytes_per_cycle);
+    HASH(mem_write_bytes_per_cycle);
+    HASH(mxm_rows);
+    HASH(mxm_columns);
+    HASH(mxm_load_streams_per_cycle);
+    HASH(mxm_load_bytes_per_cycle);
+    HASH(mxm_activation_streams);
+    HASH(mxm_result_streams);
+    HASH(mxm_pipeline_rows);
+    HASH(mxm_earliest_iw_cycle);
+    HASH(mxms_per_hemisphere);
+    HASH(mxm_weight_buffers);
+    HASH(vxm_alus);
+    HASH(vxm_weight_to_iw_latency);
+    HASH(mem_to_sxm_latency);
+    HASH(mem_to_mxm_latency);
+    HASH(mxm0_accumulator_latency);
+    HASH(mxm1_accumulator_latency);
+    HASH(accumulator_to_vxm_latency);
+    HASH(swiglu_write_latency);
+#undef HASH
+    return hash.value();
 }
 
 bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destination,

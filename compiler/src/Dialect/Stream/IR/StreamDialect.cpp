@@ -315,47 +315,6 @@ LogicalResult SwigluOp::verify()
     return success();
 }
 
-LogicalResult FfnOp::verify()
-{
-    const bool legacy = getK() == 320 && getHidden() == 640 && getN() == 320;
-    auto target_model = target::LPUTargetModel::from_operation(getOperation());
-    if (failed(target_model)) return failure();
-    const target::LPUTargetModel& target = *target_model;
-    const bool w8a16 = getActivation().getType().getElementType().isF16()
-        && getGateWeight().getType().getElementType().isF16()
-        && getUpWeight().getType().getElementType().isF16()
-        && getDownWeight0().getType().getElementType().isF16()
-        && getResult().getType().getElementType().isF16()
-        && target.supports_w8a16_ffn_shape(getM(), getK(), getHidden(), getN());
-    if (!legacy && !w8a16)
-        return emitOpError("requires a supported legacy or tile-aligned W8A16 FFN");
-    auto activation = getActivation().getDefiningOp<RouteOp>();
-    auto gate = getGateWeight().getDefiningOp<RouteOp>();
-    auto up = getUpWeight().getDefiningOp<RouteOp>();
-    auto down0 = getDownWeight0().getDefiningOp<RouteOp>();
-    auto down1 = getDownWeight1().getDefiningOp<RouteOp>();
-    if (!activation || !gate || !up || !down0 || !down1
-        || activation.getDestination() != "MXM.activation"
-        || gate.getDestinationUnitId() != 0
-        || up.getDestinationUnitId() != 1
-        || down0.getDestinationUnitId() != 0
-        || down1.getDestinationUnitId() != 1
-        || gate.getDestination() != "MXM.weight"
-        || up.getDestination() != "MXM.weight"
-        || down0.getDestination() != "MXM.weight"
-        || down1.getDestination() != "MXM.weight"
-        || (w8a16 && (gate.getSource() != "VXM.result" || up.getSource() != "VXM.result"
-            || down0.getSource() != "VXM.result" || down1.getSource() != "VXM.result")))
-        return emitOpError("requires canonical activation and three-stage dual-MXM routes");
-    if (getGateOutputStreamBase() != 0
-        || getUpOutputStreamBase() != target.throughput().mxm_result_streams
-        || (legacy && getVxmOutputStream()
-            != target.streams().streams_per_direction - 1)
-        || (w8a16 && getVxmOutputStream() != 0))
-        return emitOpError("contains non-canonical FFN stream bases for the selected target profile");
-    return success();
-}
-
 LogicalResult AttentionOp::verify()
 {
     if (getQueryHeads() <= 0 || getKvHeads() <= 0 || getHeadDim() <= 0
