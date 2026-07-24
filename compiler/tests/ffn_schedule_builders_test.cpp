@@ -77,6 +77,11 @@ int main()
     require(mlir::succeeded(down), "FFN down timeline failed");
     require(down->wave_count == 5 && down->blocks.size() == 5 * 48,
         "FFN down timeline has the wrong wave or block count");
+    require(down->output_stream_base == 24
+            && down->first_accumulator_stream == 32
+            && down->second_accumulator_stream == 36
+            && down->vxm_queues_per_hemisphere == 8,
+        "FFN down timeline changed the default stream layout");
     require(down->blocks.front().weight_compute_cycle
             == down->phase_start + projection->initial_compute_cycle,
         "FFN down timeline has the wrong phase offset");
@@ -89,4 +94,23 @@ int main()
                 "FFN down segments do not cover one MXM tile");
         }
     }
+
+    auto exploredStreams = target.streams();
+    exploredStreams.streams_per_direction = 40;
+    exploredStreams.encoded_streams = 80;
+    target::LPUTargetModel exploredTarget(
+        target.memory(), exploredStreams, target.throughput());
+    auto exploredProjection = schedule::planFfnProjectionTimeline(
+        {128, 576, 1536, 576}, weightSlices, exploredTarget);
+    require(mlir::succeeded(exploredProjection),
+        "40-stream FFN projection timeline failed");
+    auto exploredDown = schedule::planFfnDownProjectionTimeline(
+        {128, 576, 1536, 576}, *exploredProjection, 1000, weightSlices,
+        hiddenSlices, resultSlices, exploredTarget);
+    require(mlir::succeeded(exploredDown),
+        "40-stream FFN down timeline failed");
+    require(exploredDown->output_stream_base == 32
+            && exploredDown->first_accumulator_stream == 40
+            && exploredDown->second_accumulator_stream == 44,
+        "FFN down stream layout did not follow the 40-stream target");
 }

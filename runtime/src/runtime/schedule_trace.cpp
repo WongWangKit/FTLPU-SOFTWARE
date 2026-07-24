@@ -90,7 +90,11 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
     }
     case QueueKind::MxmLoad:
     case QueueKind::MxmCompute: {
-        const auto instruction = isa::decode_mxm_instruction(command.words[0]);
+        const auto encoded =
+            static_cast<isa::EncodedMxmInstruction>(command.words[0])
+            | (static_cast<isa::EncodedMxmInstruction>(command.words[1])
+                << 32);
+        const auto instruction = isa::decode_mxm_instruction(encoded);
         const auto per_hemisphere = InstructionControlUnit::kMxmQueues / 2;
         const auto side = queue.index < per_hemisphere ? "E" : "W";
         std::ostringstream detail;

@@ -23,8 +23,6 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
 {
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
-    const int64_t stream_encoding_offset =
-        target.streams().streams_per_direction;
     const int64_t tile = throughput.mxm_rows;
     const int64_t m = ffn.getM();
     const int64_t k = ffn.getK();
@@ -127,8 +125,6 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
          projectionTimeline->blocks) {
             const int64_t pair = block.pair;
             const int64_t kb = block.reduction_block;
-            const int64_t weight_compute_cycle =
-                block.weight_compute_cycle;
             const int64_t dequant_start = block.dequant_start;
             const int64_t weight_buffer = block.weight_buffer;
             for (int64_t hemisphere = 0; hemisphere < memory.hemispheres; ++hemisphere) {
@@ -190,14 +186,18 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                     }
                     gate_compute = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(),
                         activation_value, ffn.getGateWeight(), projection_type,
-                        segment_cycle, rows, segment_cycle + 3, rows + 3,
+                        segment_cycle, rows,
+                        segment_cycle + target.mxm_first_result_latency(),
+                        target.mxm_result_window_cycles(rows),
                         stream_base, projection_result_stream_base,
                         weight_buffer,
                         hemisphere * throughput.mxms_per_hemisphere,
                         rows, tile, tile);
                     up_compute = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(),
                         activation_value, ffn.getUpWeight(), projection_type,
-                        segment_cycle, rows, segment_cycle + 3, rows + 3,
+                        segment_cycle, rows,
+                        segment_cycle + target.mxm_first_result_latency(),
+                        target.mxm_result_window_cycles(rows),
                         stream_base,
                         projection_result_stream_base
                             + throughput.mxm_result_streams,
@@ -491,8 +491,6 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
             const int64_t output_wave = block.output_wave;
             const int64_t rb = block.reduction_block;
             const int64_t active_hemispheres = block.active_hemispheres;
-            const int64_t weight_compute_cycle =
-                block.weight_compute_cycle;
             const int64_t dequant_start = block.dequant_start;
             const int64_t weight_buffer = block.weight_buffer;
             for (int64_t hemisphere = 0; hemisphere < active_hemispheres; ++hemisphere) {
@@ -544,11 +542,13 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                         hemisphere * throughput.mxms_per_hemisphere;
                     down0 = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(), hidden_value,
                         ffn.getDownWeight0(), projection_type, segment_cycle, rows,
-                        segment_cycle + 3, rows + 3, stream_base, 0,
+                        segment_cycle + target.mxm_first_result_latency(),
+                        target.mxm_result_window_cycles(rows), stream_base, 0,
                         weight_buffer, unit_base, rows, tile, tile);
                     down1 = rewriter.create<schedule::MxmComputeOp>(ffn.getLoc(), hidden_value,
                         ffn.getDownWeight1(), projection_type, segment_cycle, rows,
-                        segment_cycle + 3, rows + 3, stream_base,
+                        segment_cycle + target.mxm_first_result_latency(),
+                        target.mxm_result_window_cycles(rows), stream_base,
                         throughput.mxm_result_streams,
                         weight_buffer, unit_base + 1, rows, tile, tile);
                     row_offset += rows;
@@ -592,19 +592,23 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                     // Keep the final VXM result off the down-activation pair.
                     // The last activation rows can still be in flight through
                     // MEM when the accumulator starts producing results.
-                    const int64_t result_stream_base = 24;
-                    const int64_t output_cast_alu_base = hemisphere == 0 ? 0 : 8;
+                    const int64_t result_stream_base =
+                        downTimeline->output_stream_base;
+                    const int64_t output_cast_alu_base =
+                        hemisphere * downTimeline->vxm_queues_per_hemisphere;
                     for (int64_t row = 0; row < tile; ++row) {
                         const int64_t vxm_cycle = compute_cycle + output_to_vxm_latency + row;
                         auto cast0 = create_vxm(rewriter, ffn.getLoc(), acc0.getOutput(), acc1.getOutput(),
                             ffn.getResult().getType(), vxm_cycle, output_cast_alu_base, "pass",
-                            "stream_f32", stream_encoding_offset, 0,
+                            "stream_f32",
+                            downTimeline->first_accumulator_stream, 0,
                             "immediate", 0, 0, "fp16",
                             result_stream_base, 1, 1,
                             hemi_name(hemisphere), hemi_name(hemisphere));
                         auto cast1 = create_vxm(rewriter, ffn.getLoc(), acc0.getOutput(), acc1.getOutput(),
                             ffn.getResult().getType(), vxm_cycle, output_cast_alu_base + 1,
-                            "pass", "stream_f32", 36, 0,
+                            "pass", "stream_f32",
+                            downTimeline->second_accumulator_stream, 0,
                             "immediate", 0, 0, "fp16", result_stream_base + 2,
                             1, 1, hemi_name(hemisphere), hemi_name(hemisphere));
                         for (int64_t byte = 0; byte < throughput.mxm_result_streams; ++byte) {

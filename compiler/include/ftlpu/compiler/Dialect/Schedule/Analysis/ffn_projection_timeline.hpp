@@ -71,6 +71,10 @@ struct FfnDownProjectionTimeline {
     int64_t reduction_block_count;
     int64_t columns_per_wave;
     int64_t wave_count;
+    int64_t output_stream_base;
+    int64_t first_accumulator_stream;
+    int64_t second_accumulator_stream;
+    int64_t vxm_queues_per_hemisphere;
     std::vector<FfnDownBlockSchedule> blocks;
 };
 

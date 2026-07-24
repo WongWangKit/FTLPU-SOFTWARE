@@ -49,6 +49,17 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
         memory.hemispheres * columnsPerHemisphere;
     result.wave_count =
         (shape.n + result.columns_per_wave - 1) / result.columns_per_wave;
+    result.output_stream_base = target.streams().streams_per_direction
+        - 2 * throughput.mxm_result_streams;
+    result.first_accumulator_stream =
+        target.streams().streams_per_direction;
+    result.second_accumulator_stream = result.first_accumulator_stream
+        + throughput.mxm_result_streams;
+    result.vxm_queues_per_hemisphere =
+        throughput.vxm_alus / memory.hemispheres;
+    if (result.output_stream_base < 0
+        || result.vxm_queues_per_hemisphere <= 0)
+        return mlir::failure();
     int64_t computeCycle =
         result.phase_start + projection.initial_compute_cycle;
 

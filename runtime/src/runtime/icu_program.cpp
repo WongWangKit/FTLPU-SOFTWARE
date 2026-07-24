@@ -29,11 +29,17 @@ QueueCommand encode_mem_command(const MemInstruction& instruction)
 
 QueueCommand encode_mxm_command(const MxmControlInstruction& instruction)
 {
+    const auto encoded = isa::encode_mxm_instruction(instruction);
     return QueueCommand {
         kInstructionCommand,
         InstructionKind::Mxm,
-        1,
-        {isa::encode_mxm_instruction(instruction), 0, 0},
+        static_cast<std::uint16_t>((encoded >> 32) == 0 ? 1 : 2),
+        {
+            static_cast<std::uint32_t>(encoded),
+            static_cast<std::uint32_t>(encoded >> 32),
+            0,
+            0,
+        },
     };
 }
 
@@ -388,10 +394,18 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
             }
             case QueueKind::MxmLoad:
             case QueueKind::MxmCompute: {
-                if (command.instruction_kind != InstructionKind::Mxm || command.word_count != 1) {
-                    throw std::logic_error("MXM queue command does not carry one MXM instruction word");
+                if (command.instruction_kind != InstructionKind::Mxm
+                    || command.word_count < 1 || command.word_count > 2) {
+                    throw std::logic_error(
+                        "MXM queue command must carry one or two MXM instruction words");
                 }
-                const auto instruction = isa::decode_mxm_instruction(command.words[0]);
+                const auto encoded =
+                    static_cast<isa::EncodedMxmInstruction>(command.words[0])
+                    | (static_cast<isa::EncodedMxmInstruction>(
+                           command.words[1])
+                        << 32);
+                const auto instruction =
+                    isa::decode_mxm_instruction(encoded);
                 validate_mxm_queue_opcode(queue.kind, queue.index, instruction);
                 icu.enqueue_mxm(queue.index, instruction);
                 break;

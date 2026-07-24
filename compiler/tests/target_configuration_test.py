@@ -55,6 +55,12 @@ def main() -> None:
         raise AssertionError("default Schedule IR has no explicit 32-stream target")
     if baseline == explored:
         raise AssertionError("non-default target did not change Schedule IR")
+    if 'lhs_index = 44 : i64, lhs_kind = "stream_f32"' not in explored:
+        raise AssertionError(
+            "40-stream target did not remap the second accumulator stream")
+    if 'output_stream = 32 : i64' not in explored:
+        raise AssertionError(
+            "40-stream target did not remap the FFN writeback stream group")
 
 
 if __name__ == "__main__":

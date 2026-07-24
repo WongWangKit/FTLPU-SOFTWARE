@@ -33,8 +33,11 @@ LogicalResult verify_queue_issue(Operation* op, int64_t cycle, int64_t queue,
 
 LogicalResult verify_stream_range(Operation* op, int64_t base, int64_t count)
 {
-    const target::LPUTargetModel target;
-    if (base < 0 || count <= 0 || base + count > target.streams().streams_per_direction)
+    auto targetModel = target::LPUTargetModel::from_operation(op);
+    if (failed(targetModel)) return failure();
+    if (base < 0 || count <= 0
+        || base + count
+            > targetModel->streams().streams_per_direction)
         return op->emitOpError("stream range is outside the target direction");
     return success();
 }
@@ -68,8 +71,9 @@ LogicalResult MemReadOp::verify()
     if (getRole() == "weight") endpoint = target::StreamEndpoint::MxmWeight;
     else if (getRole() == "activation") endpoint = target::StreamEndpoint::MxmActivation;
     else return emitOpError("role must be weight or activation");
-    const target::LPUTargetModel target;
-    const auto expected_count = target.route_stream_count(
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto expected_count = targetModel->route_stream_count(
         target::StreamEndpoint::Mem, endpoint, target::StreamDirection::East);
     auto instruction_count = placement.getAs<IntegerAttr>("instruction_count");
     if (!expected_count || !instruction_count || getStreamCount() != *expected_count
@@ -80,7 +84,9 @@ LogicalResult MemReadOp::verify()
 
 LogicalResult MxmLoadOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     if (failed(verify_timing(*this, getCycle(), getDuration()))
         || failed(verify_stream_range(*this, getStreamBase(), getStreamCount())))
         return failure();
@@ -95,7 +101,9 @@ LogicalResult MxmLoadOp::verify()
 
 LogicalResult MxmComputeOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     if (failed(verify_timing(*this, getCycle(), getDuration()))) return failure();
     if (getM() <= 0 || getN() <= 0 || getK() <= 0)
         return emitOpError("matrix dimensions must be positive");
@@ -114,7 +122,9 @@ LogicalResult MxmComputeOp::verify()
 
 LogicalResult VxmOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     if (getCycleAttr().getInt() < 0 || !target.is_valid_vxm_alu(getQueue())
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0)
         return emitOpError("contains invalid cycle, ALU queue, or repeat metadata");
@@ -161,7 +171,9 @@ LogicalResult MemAccumulateOp::verify()
 
 LogicalResult MemWriteOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     if (failed(verify_timing(*this, getCycle(), getDuration()))
         || failed(verify_stream_range(*this, getStreamBase(), getStreamCount())))
         return failure();
@@ -223,7 +235,9 @@ LogicalResult AttentionOp::verify()
 
 LogicalResult MemTransferOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     if (failed(verify_queue_issue(*this, getCycle(), getSlice(), getRepeatCount(), getRepeatInterval()))
         || getHemisphere() < 0 || getHemisphere() >= target.memory().hemispheres
         || getSlice() >= target.memory().slices_per_hemisphere
@@ -243,7 +257,9 @@ LogicalResult MemTransferOp::verify()
 
 LogicalResult MxmIssueOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     if (failed(verify_queue_issue(*this, getCycle(), getUnitId(), getRepeatCount(), getRepeatInterval()))
         || !target.is_valid_mxm_unit(getUnitId()) || !target.is_valid_weight_buffer(getWeightBuffer())
         || getWeightColumn() < 0 || getWeightColumn() >= target.throughput().tile_rows)
@@ -260,7 +276,9 @@ LogicalResult MxmIssueOp::verify()
 
 LogicalResult SxmOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     if (getCycle() < 0 || getHemisphere() < 0
         || getHemisphere() >= target.memory().hemispheres)
         return emitOpError("contains an invalid SXM queue selector");
