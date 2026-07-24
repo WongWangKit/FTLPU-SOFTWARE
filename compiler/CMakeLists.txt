@@ -89,9 +89,11 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Analysis/FfnScheduleBuilders.cpp
     src/Dialect/Schedule/Analysis/FfnWeightLoadScheduleBuilder.cpp
     src/Dialect/Schedule/Analysis/FfnProjectionScheduleBuilder.cpp
+    src/Dialect/Schedule/Analysis/FfnProjectionTimelinePlanner.cpp
     src/Dialect/Schedule/Analysis/FfnSwishScheduleBuilder.cpp
     src/Dialect/Schedule/Analysis/FfnSwishPlanner.cpp
     src/Dialect/Schedule/Analysis/FfnDownProjectionScheduleBuilder.cpp
+    src/Dialect/Schedule/Analysis/FfnDownProjectionTimelinePlanner.cpp
     src/Dialect/Schedule/Analysis/LPUResourceModel.cpp
     src/Dialect/Schedule/Analysis/ResourceScheduler.cpp
     src/Dialect/Schedule/Analysis/ScheduleGraph.cpp

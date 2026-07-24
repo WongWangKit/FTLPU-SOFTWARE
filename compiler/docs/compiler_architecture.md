@@ -157,6 +157,11 @@ emitter. The six-cycle Swish ALU sequence is an independently testable
 emitter, while `FfnSwishPlanner` schedules its VXM/MEM windows around weight
 dequantization and temporary-memory traffic. The FFN MLIR emitter consumes
 those planned cycles and does not invoke `ResourceScheduler`.
+`FfnProjectionTimeline` and `FfnDownProjectionTimeline` additionally describe
+every reduction block, ping-pong weight buffer, M-tile compute cycle, and
+activation-stream segment used while prefetching the next weight tile. These
+timelines are derived from `LPUTargetModel`; changing tile, lane, MXM,
+hemisphere, or stream counts does not require editing the emitter.
 The obsolete compound `ftlpu.stream.ffn` operation has been removed; public
 Stream IR contains only primitive task and route operations.
 

@@ -139,7 +139,12 @@ FFN 使用可复用的 WeightLoad、Projection、Swish 和 DownProjection schedu
 builder。Gate/Up 和 Down 共用同一套 weight dequant 与 MXM load emitter；
 六 cycle Swish ALU 序列可以独立测试。`FfnSwishPlanner` 会避开 weight
 dequant 和临时 MEM 流量来安排 VXM/MEM 资源窗口，FFN MLIR emitter 只消费
-确定的 cycle，不再调用 `ResourceScheduler`。过时的
+确定的 cycle，不再调用 `ResourceScheduler`。
+`FfnProjectionTimeline` 和 `FfnDownProjectionTimeline` 进一步描述每个
+reduction block、weight ping-pong buffer、M tile compute cycle，以及预取下一
+块权重时使用的 activation stream segment。这些 timeline 全部从
+`LPUTargetModel` 推导；修改 tile、lane、MXM、半球或 stream 数量不需要修改
+emitter。过时的
 compound `ftlpu.stream.ffn` 已删除；公开 Stream IR 只保留 primitive task 和
 route op。
 

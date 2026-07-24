@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/ffn_schedule_emitter.hpp"
 
 #include "FfnEmitterUtils.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_projection_timeline.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_swish_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 
@@ -30,10 +31,8 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
     const int64_t intermediate = ffn.getHidden();
     const int64_t n = ffn.getN();
     if (mlir::failed(ffn.task_plan.tasks.validate())) return mlir::failure();
-    const int64_t weight_to_iw = throughput.vxm_weight_to_iw_latency;
     const int64_t gate_acc_latency = throughput.mxm0_accumulator_latency;
     const int64_t up_acc_latency = throughput.mxm1_accumulator_latency;
-    const int64_t swish_write_latency = throughput.swiglu_write_latency;
     const int64_t projection_accumulator_rows = m * (intermediate / tile);
     const int64_t down_accumulator_base = std::max(
         memory.accumulator_scratch_base_row,
@@ -72,14 +71,16 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
         up_acc_slices.push_back(
             memory.accumulator_slice_base + memory.accumulator_slices_per_mxm + index);
     }
-    // One 32x32 weight tile is dequantized eight columns at a time, so each
-    // single MXM consumes four VXM issue cycles. Gate/up on east/west are four
-    // independent tiles and are staggered because they share the VXM ALU ICU
-    // queues; that aggregate window must not be confused with one dequant.
-    const int64_t weight_load_cycles = tile / throughput.lanes_per_tile;
     const int64_t activation_latency = *target.transport_latency(
         target::StreamEndpoint::Mem, target::StreamEndpoint::MxmActivation,
         target::StreamDirection::East, activation_slices.front());
+    auto projectionTimeline = schedule::planFfnProjectionTimeline(
+        {m, k, intermediate, n}, weight_slices, target);
+    if (mlir::failed(projectionTimeline)) return mlir::failure();
+    const int64_t weight_load_cycles =
+        projectionTimeline->weight_load_cycles;
+    const int64_t projection_pair_count = projectionTimeline->pair_count;
+    const int64_t m_tile_count = projectionTimeline->m_tile_count;
 
     const auto projection_type = mlir::RankedTensorType::get({tile, tile}, rewriter.getF32Type());
     const auto one_slice_read = [&](mlir::Value value, stream::RouteOp route,
@@ -107,14 +108,6 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
     const auto hemi_name = [](int64_t hemisphere) -> llvm::StringRef {
         return hemisphere == 0 ? "east" : "west";
     };
-    int64_t max_weight_west_latency = 0;
-    for (int64_t slice : weight_slices)
-        max_weight_west_latency = std::max(max_weight_west_latency, west_latency(slice));
-    const int64_t pipelined_block_interval = target.mxm_block_issue_interval();
-    const int64_t initial_compute_cycle = max_weight_west_latency + 1 + tile;
-    const int64_t projection_pair_count =
-        intermediate / (memory.hemispheres * tile);
-    const int64_t m_tile_count = m / tile;
     struct CompletedProjectionTile {
         int64_t pair;
         int64_t m_tile;
@@ -129,19 +122,15 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
     llvm::SmallVector<CompletedProjectionTile> completed_tiles;
     std::array<std::vector<schedule::FfnCycleWindow>, 2>
         temp_mem_busy_windows;
-    // A loaded KxN weight tile stays resident while every M=32 activation tile
-    // of the sequence consumes it. Consecutive blocks follow the target's MXM
-    // issue interval.
-    const int64_t weight_block_interval = m_tile_count * pipelined_block_interval;
     rewriter.setInsertionPoint(ffn.getOperation());
-    int64_t projection_block = 0;
-    for (int64_t pair = 0; pair < intermediate / (memory.hemispheres * tile); ++pair) {
-        for (int64_t kb = 0; kb < k / tile; ++kb) {
-            const int64_t weight_compute_cycle = initial_compute_cycle
-                + projection_block * weight_block_interval;
-            const int64_t dequant_lead = tile;
-            const int64_t dequant_start = weight_compute_cycle - dequant_lead;
-            const int64_t weight_buffer = projection_block % 2;
+    for (const schedule::FfnProjectionBlockSchedule& block :
+         projectionTimeline->blocks) {
+            const int64_t pair = block.pair;
+            const int64_t kb = block.reduction_block;
+            const int64_t weight_compute_cycle =
+                block.weight_compute_cycle;
+            const int64_t dequant_start = block.dequant_start;
+            const int64_t weight_buffer = block.weight_buffer;
             for (int64_t hemisphere = 0; hemisphere < memory.hemispheres; ++hemisphere) {
                 for (int64_t local_mxm = 0;
                      local_mxm < throughput.mxms_per_hemisphere; ++local_mxm) {
@@ -163,48 +152,27 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                 }
             }
 
-            const bool has_next_weight_block = projection_block + 1
-                < (intermediate / (memory.hemispheres * tile)) * (k / tile);
-            for (int64_t m_tile = 0; m_tile < m_tile_count; ++m_tile) {
-                const int64_t compute_cycle = weight_compute_cycle
-                    + m_tile * pipelined_block_interval;
-                const bool prefetch_next_weight = has_next_weight_block
-                    && m_tile + 1 == m_tile_count;
+            for (const schedule::FfnProjectionTileSchedule& tileSchedule :
+                block.tiles) {
+                const int64_t m_tile = tileSchedule.m_tile;
+                const int64_t compute_cycle = tileSchedule.compute_cycle;
                 for (int64_t hemisphere = 0; hemisphere < memory.hemispheres; ++hemisphere) {
                 // Activation is laid out as [K-tile][full M rows]. Select the
                 // current K block first, then the M=32 subrange within it.
                 const int64_t activation_base = kb * m + m_tile * tile;
                 llvm::SmallVector<int64_t> segment_rows;
                 llvm::SmallVector<int64_t> segment_streams;
-                const int64_t next_dequant_lead = tile;
-                const int64_t next_weight_distance = prefetch_next_weight
-                    ? weight_block_interval - m_tile * pipelined_block_interval
-                    : tile + next_dequant_lead;
-                const int64_t switch_row = next_weight_distance - next_dequant_lead
-                    + weight_to_iw
-                    + hemisphere * throughput.mxms_per_hemisphere * weight_load_cycles;
-                const bool final_k_block = kb + 1 == k / tile;
+                for (const schedule::FfnStreamSegment& segment :
+                     tileSchedule.hemisphere_segments[
+                         static_cast<std::size_t>(hemisphere)]) {
+                    segment_rows.push_back(segment.rows);
+                    segment_streams.push_back(segment.stream_base);
+                }
+                const bool final_k_block = block.final_reduction;
                 const int64_t projection_result_stream_base =
                     strategy == FfnScheduleStrategy::Fused && final_k_block
                     ? 8 + hemisphere * 8
                     : 0;
-                if (!prefetch_next_weight || switch_row >= tile) {
-                    segment_rows = {tile};
-                    segment_streams = {0};
-                } else {
-                    if (switch_row > 0) {
-                        segment_rows.push_back(switch_row);
-                        segment_streams.push_back(0);
-                    }
-                    const int64_t switched_rows = std::min(weight_load_cycles,
-                        tile - switch_row);
-                    segment_rows.push_back(switched_rows);
-                    segment_streams.push_back(throughput.mxm_load_streams_per_cycle);
-                    if (switch_row + switched_rows < tile) {
-                        segment_rows.push_back(tile - switch_row - switched_rows);
-                        segment_streams.push_back(0);
-                    }
-                }
                 schedule::MxmComputeOp gate_compute;
                 schedule::MxmComputeOp up_compute;
                 int64_t row_offset = 0;
@@ -383,16 +351,12 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                 }
             }
             }
-            ++projection_block;
-        }
     }
 
-    const int64_t final_projection_cycle = initial_compute_cycle
-        + (projection_block - 1) * weight_block_interval
-        + (m_tile_count - 1) * pipelined_block_interval;
-    const int64_t accumulator_queue_release = std::max(
-        gate_acc_latency + tile + west_latency(gate_acc_slices.front()),
-        up_acc_latency + tile + west_latency(up_acc_slices.front()));
+    const int64_t final_projection_cycle =
+        projectionTimeline->final_projection_cycle;
+    const int64_t accumulator_queue_release =
+        projectionTimeline->accumulator_queue_release;
     mlir::Value last_hidden;
     int64_t last_swish_cycle = 0;
     const auto emit_swiglu_row = [&](mlir::Value gate_value, mlir::Value up_value,
@@ -448,9 +412,9 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
             memory.hemispheres * throughput.mxms_per_hemisphere
                 * weight_load_cycles
             + 1;
-        for (int64_t block = 0; block < projection_block; ++block) {
-            const int64_t start =
-                initial_compute_cycle + block * weight_block_interval - tile;
+        for (const schedule::FfnProjectionBlockSchedule& block :
+             projectionTimeline->blocks) {
+            const int64_t start = block.dequant_start;
             dequant_windows.push_back({start, start + dequant_window_cycles});
         }
 
@@ -516,39 +480,21 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
         }
     }
 
-    const int64_t slowest_hidden_west_latency = west_latency(hidden_slices.back());
-    const int64_t phase_start = last_swish_cycle + 1
-        + swish_write_latency + slowest_hidden_west_latency + 1
-        + throughput.accumulator_to_vxm_latency;
-    int64_t down_pair_transition_interval =
-        2 * tile + throughput.accumulator_to_vxm_latency;
-    for (int64_t result_slice : result_slices) {
-        if (std::find(weight_slices.begin(), weight_slices.end(), result_slice)
-            == weight_slices.end())
-            continue;
-        const int64_t last_write_end = throughput.accumulator_to_vxm_latency
-            + tile + result_slice / target.streams().mem_slices_per_register_group + 1;
-        down_pair_transition_interval = std::max(down_pair_transition_interval,
-            last_write_end + tile + west_latency(result_slice));
-    }
-    int64_t down_compute_cycle = phase_start + initial_compute_cycle;
-    int64_t down_block = 0;
-    const int64_t down_reduction_blocks = intermediate / tile;
-    const int64_t down_columns_per_hemisphere =
-        throughput.mxms_per_hemisphere * tile;
-    const int64_t down_columns_per_wave =
-        memory.hemispheres * down_columns_per_hemisphere;
-    const int64_t down_wave_count =
-        (n + down_columns_per_wave - 1) / down_columns_per_wave;
+    auto downTimeline = schedule::planFfnDownProjectionTimeline(
+        {m, k, intermediate, n}, *projectionTimeline, last_swish_cycle,
+        weight_slices, hidden_slices, result_slices, target);
+    if (mlir::failed(downTimeline)) return mlir::failure();
+    const int64_t down_wave_count = downTimeline->wave_count;
     mlir::Value final_value;
-    for (int64_t output_wave = 0; output_wave < down_wave_count; ++output_wave) {
-        const int64_t active_hemispheres = std::min<int64_t>(memory.hemispheres,
-            (n - output_wave * down_columns_per_wave
-                + down_columns_per_hemisphere - 1) / down_columns_per_hemisphere);
-        for (int64_t rb = 0; rb < down_reduction_blocks; ++rb) {
-            const int64_t weight_compute_cycle = down_compute_cycle;
-            const int64_t dequant_start = weight_compute_cycle - tile;
-            const int64_t weight_buffer = down_block % 2;
+    for (const schedule::FfnDownBlockSchedule& block :
+         downTimeline->blocks) {
+            const int64_t output_wave = block.output_wave;
+            const int64_t rb = block.reduction_block;
+            const int64_t active_hemispheres = block.active_hemispheres;
+            const int64_t weight_compute_cycle =
+                block.weight_compute_cycle;
+            const int64_t dequant_start = block.dequant_start;
+            const int64_t weight_buffer = block.weight_buffer;
             for (int64_t hemisphere = 0; hemisphere < active_hemispheres; ++hemisphere) {
             for (int64_t local_mxm = 0;
                  local_mxm < throughput.mxms_per_hemisphere; ++local_mxm) {
@@ -564,38 +510,17 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                     hemisphere, local_mxm, unit, weight_buffer);
             }
             }
-            const bool last = rb + 1 == down_reduction_blocks;
-            for (int64_t m_tile = 0; m_tile < m_tile_count; ++m_tile) {
-                const int64_t compute_cycle = weight_compute_cycle
-                    + m_tile * pipelined_block_interval;
-                const bool prefetch_next_weight = !last
-                    && m_tile_count > 1 && m_tile + 1 == m_tile_count;
+            const bool last = block.final_reduction;
+            for (const schedule::FfnDownTileSchedule& tileSchedule :
+                 block.tiles) {
+                const int64_t m_tile = tileSchedule.m_tile;
+                const int64_t compute_cycle = tileSchedule.compute_cycle;
                 llvm::SmallVector<int64_t> segment_rows;
                 llvm::SmallVector<int64_t> segment_streams;
-                if (!prefetch_next_weight) {
-                    segment_rows = {tile};
-                    segment_streams = {0};
-                } else {
-                    // The next reduction uses the same continuous four-cycle
-                    // dequant/IW load as Gate/Up. Route activation around each
-                    // target MXM's IW stream window while the weight is
-                    // prefetched under this final M tile.
-                    segment_rows.push_back(weight_to_iw);
-                    segment_streams.push_back(0);
-                    for (int64_t unit = 0;
-                         unit < active_hemispheres * throughput.mxms_per_hemisphere;
-                         ++unit) {
-                        segment_rows.push_back(weight_load_cycles);
-                        segment_streams.push_back(
-                            unit % throughput.mxms_per_hemisphere == 0 ? 16 : 0);
-                    }
-                    const int64_t routed_rows = weight_to_iw
-                        + active_hemispheres * throughput.mxms_per_hemisphere
-                            * weight_load_cycles;
-                    if (routed_rows < tile) {
-                        segment_rows.push_back(tile - routed_rows);
-                        segment_streams.push_back(0);
-                    }
+                for (const schedule::FfnStreamSegment& segment :
+                     tileSchedule.segments) {
+                    segment_rows.push_back(segment.rows);
+                    segment_streams.push_back(segment.stream_base);
                 }
                 for (int64_t hemisphere = 0;
                      hemisphere < active_hemispheres; ++hemisphere) {
@@ -711,16 +636,6 @@ mlir::FailureOr<mlir::Value> lower_w8a16_ffn_schedule(
                 }
             }
             }
-            ++down_block;
-            if (last) {
-                if (output_wave + 1 < down_wave_count)
-                    down_compute_cycle += (m_tile_count - 1)
-                        * pipelined_block_interval + down_pair_transition_interval;
-            } else {
-                down_compute_cycle += weight_block_interval
-                    + (m_tile_count > 1 ? 0 : tile);
-            }
-        }
     }
     return final_value;
 }
