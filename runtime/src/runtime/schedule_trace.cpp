@@ -35,7 +35,6 @@ const char* mem_opcode_name(MemOpcode opcode)
     case MemOpcode::ReadWrite: return "ReadWrite";
     case MemOpcode::Gather: return "Gather";
     case MemOpcode::Scatter: return "Scatter";
-    case MemOpcode::Accumulate: return "Accumulate";
     }
     return "Unknown";
 }
@@ -81,10 +80,6 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
         std::ostringstream detail;
         detail << "slice=" << queue.index % InstructionControlUnit::kMemQueuesPerHemisphere
                << " addr=" << address << " stream=" << stream_name(instruction.stream);
-        if (instruction.opcode == MemOpcode::Accumulate) {
-            detail << (instruction.accumulator_destination == MemAccumulatorDestination::Stream
-                    ? " dst=stream+clear" : " dst=sram");
-        }
         return {std::string("MEM.") + (east ? "E." : "W.")
                 + mem_opcode_name(instruction.opcode), detail.str()};
     }
@@ -101,10 +96,20 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
         if (instruction.opcode == MxmControlOpcode::IW) {
             detail << "IW buffer=" << instruction.weight_buffer
                    << " column=" << instruction.weight_column;
-        } else {
+        } else if (instruction.opcode == MxmControlOpcode::Compute) {
             detail << "Compute buffer=" << instruction.weight_buffer
                    << " act=" << stream_name(instruction.activation_stream_base)
-                   << " out=" << stream_name(instruction.stream_base);
+                   << " out=" << stream_name(instruction.stream_base)
+                   << " acc=" << instruction.accumulator_address
+                   << " stride=" << instruction.accumulator_row_stride
+                   << (instruction.accumulator_destination
+                               == MxmAccumulatorDestination::Stream
+                           ? " dst=stream"
+                           : " dst=sram");
+        } else {
+            detail << "AccumulatorRead acc=" << instruction.accumulator_address
+                   << " out=" << stream_name(instruction.stream_base)
+                   << (instruction.accumulator_clear ? " clear" : " keep");
         }
         return {std::string("MXM.") + side + std::to_string(queue.index % per_hemisphere)
                 + (queue.kind == QueueKind::MxmLoad ? ".Load" : ".Compute"), detail.str()};
