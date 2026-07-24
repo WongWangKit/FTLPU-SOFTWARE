@@ -133,6 +133,8 @@ int64_t AttentionScheduleEmitter::emitProjections()
                             segmentRows.push_back(tile);
                             segmentStreams.push_back(0);
                         }
+                        const char* destination =
+                            finalReduction ? "stream" : "sram";
                         int64_t rowOffset = 0;
                         for (std::size_t segment = 0;
                              segment < segmentRows.size(); ++segment) {
@@ -149,41 +151,13 @@ int64_t AttentionScheduleEmitter::emitProjections()
                             }
                             emitMxm(rewriter_, op_.getLoc(), segmentCycle,
                                 hemisphere * 2, "compute", weightBuffer, 0,
-                                streamBase, 0, rows, 1);
+                                streamBase, 0, rows, 1, outputAddress, 1,
+                                destination);
                             emitMxm(rewriter_, op_.getLoc(), segmentCycle,
                                 hemisphere * 2 + 1, "compute", weightBuffer, 0,
-                                streamBase + 2, 4, rows, 1);
+                                streamBase + 2, 4, rows, 1,
+                                outputAddress, 1, destination);
                             rowOffset += rows;
-                        }
-                        const char* destination = finalReduction ? "stream" : "sram";
-                        if (reductionBlock == 0) {
-                            for (int64_t byte = 0; byte < 4; ++byte) {
-                                emitMem(rewriter_, op_.getLoc(), computeCycle
-                                        + target_.throughput().mxm0_accumulator_latency,
-                                    hemisphere * target_.memory().slices_per_hemisphere
-                                        + target_.memory().accumulator_slice_base + byte,
-                                    "write", outputAddress, 32 + byte,
-                                    tile, 1, 1, "sram");
-                                emitMem(rewriter_, op_.getLoc(), computeCycle
-                                        + target_.throughput().mxm1_accumulator_latency,
-                                    hemisphere * target_.memory().slices_per_hemisphere
-                                        + target_.memory().accumulator_slice_base + 4 + byte,
-                                    "write", outputAddress, 36 + byte,
-                                    tile, 1, 1, "sram");
-                            }
-                        } else {
-                            emitMem(rewriter_, op_.getLoc(), computeCycle
-                                    + target_.throughput().mxm0_accumulator_latency,
-                                hemisphere * target_.memory().slices_per_hemisphere
-                                    + target_.memory().accumulator_slice_base,
-                                "accumulate", outputAddress, 32,
-                                tile, 1, 1, destination);
-                            emitMem(rewriter_, op_.getLoc(), computeCycle
-                                    + target_.throughput().mxm1_accumulator_latency,
-                                hemisphere * target_.memory().slices_per_hemisphere
-                                    + target_.memory().accumulator_slice_base + 4,
-                                "accumulate", outputAddress, 36,
-                                tile, 1, 1, destination);
                         }
                         if (!finalReduction) continue;
 
@@ -272,11 +246,6 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                 + work->local_mxm;
             const int64_t activationStream = work->local_mxm * 2;
             const int64_t outputStream = work->local_mxm * 4;
-            const int64_t accumulatorSlice = target_.memory().accumulator_slice_base
-                + work->local_mxm * target_.memory().accumulator_slices_per_mxm;
-            const int64_t accumulatorLatency = work->local_mxm == 0
-                ? target_.throughput().mxm0_accumulator_latency
-                : target_.throughput().mxm1_accumulator_latency;
             const int64_t keySliceBase = work->local_mxm == 0 ? 0 : 4;
             for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
                 const auto& iwSlices = target_.attention_query_iw_slices(reduction);
@@ -317,12 +286,10 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                             activationStream + byte, tile, 1, 0);
                     }
                     emitMxm(rewriter_, op_.getLoc(), computeCycle, mxm, "compute",
-                        reduction, 0, activationStream, outputStream, tile, 1);
-                    emitMem(rewriter_, op_.getLoc(), computeCycle + accumulatorLatency,
-                        work->hemisphere * target_.memory().slices_per_hemisphere + accumulatorSlice,
-                        "accumulate", layout.scoreAddress(work->query_head,
+                        reduction, 0, activationStream, outputStream, tile, 1,
+                        layout.scoreAddress(work->query_head,
                             work->query_block, keyBlock),
-                        32 + outputStream, tile, 1, 0);
+                        1, "sram");
                 }
             }
         }

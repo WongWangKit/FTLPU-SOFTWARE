@@ -76,7 +76,7 @@ void create_binding(mlir::OpBuilder& builder, mlir::Location location,
 void create_mem_command(mlir::OpBuilder& builder, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t address,
     int64_t packed_stream, int64_t repeat_count, int64_t repeat_interval,
-    int64_t address_stride, llvm::StringRef accumulator_destination = "sram")
+    int64_t address_stride)
 {
     mlir::OperationState state(location, command::MemOp::getOperationName());
     state.addAttributes({
@@ -88,7 +88,6 @@ void create_mem_command(mlir::OpBuilder& builder, mlir::Location location,
         builder.getNamedAttr("repeat_count", builder.getI64IntegerAttr(repeat_count)),
         builder.getNamedAttr("repeat_interval", builder.getI64IntegerAttr(repeat_interval)),
         builder.getNamedAttr("address_stride", builder.getI64IntegerAttr(address_stride)),
-        builder.getNamedAttr("accumulator_destination", builder.getStringAttr(accumulator_destination)),
     });
     builder.create(state);
 }
@@ -96,7 +95,9 @@ void create_mem_command(mlir::OpBuilder& builder, mlir::Location location,
 void create_mxm_command(mlir::OpBuilder& builder, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t weight_buffer,
     int64_t weight_column, int64_t activation_stream_base, int64_t output_stream_base,
-    int64_t repeat_count, int64_t repeat_interval)
+    int64_t repeat_count, int64_t repeat_interval, int64_t accumulator_address,
+    int64_t accumulator_row_stride, llvm::StringRef accumulator_destination,
+    bool accumulator_clear = true)
 {
     mlir::OperationState state(location, command::MxmOp::getOperationName());
     state.addAttributes({
@@ -109,6 +110,10 @@ void create_mxm_command(mlir::OpBuilder& builder, mlir::Location location,
         builder.getNamedAttr("output_stream_base", builder.getI64IntegerAttr(output_stream_base)),
         builder.getNamedAttr("repeat_count", builder.getI64IntegerAttr(repeat_count)),
         builder.getNamedAttr("repeat_interval", builder.getI64IntegerAttr(repeat_interval)),
+        builder.getNamedAttr("accumulator_address", builder.getI64IntegerAttr(accumulator_address)),
+        builder.getNamedAttr("accumulator_row_stride", builder.getI64IntegerAttr(accumulator_row_stride)),
+        builder.getNamedAttr("accumulator_destination", builder.getStringAttr(accumulator_destination)),
+        builder.getNamedAttr("accumulator_clear", builder.getBoolAttr(accumulator_clear)),
     });
     builder.create(state);
 }
@@ -138,7 +143,7 @@ void create_mem_transfer_command(mlir::OpBuilder& builder,
 {
     mlir::OperationState state(op.getLoc(), command::MemOp::getOperationName());
     for (llvm::StringRef name : {"cycle", "opcode", "address", "packed_stream",
-             "repeat_count", "repeat_interval", "address_stride", "accumulator_destination"})
+             "repeat_count", "repeat_interval", "address_stride"})
         state.addAttribute(name, op->getAttr(name));
     state.addAttribute("queue", builder.getI64IntegerAttr(
         op.getHemisphere() * target.memory().slices_per_hemisphere
@@ -150,7 +155,10 @@ void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
 {
     mlir::OperationState state(op.getLoc(), command::MxmOp::getOperationName());
     for (llvm::StringRef name : {"cycle", "opcode", "weight_buffer",
-             "weight_column", "activation_stream_base", "output_stream_base", "repeat_count", "repeat_interval"})
+             "weight_column", "activation_stream_base", "output_stream_base",
+             "repeat_count", "repeat_interval", "accumulator_address",
+             "accumulator_row_stride", "accumulator_destination",
+             "accumulator_clear"})
         state.addAttribute(name, op->getAttr(name));
     state.addAttribute("queue", builder.getI64IntegerAttr(op.getUnitId()));
     builder.create(state);
@@ -185,6 +193,7 @@ public:
         llvm::SmallVector<schedule::MemReadOp> reads;
         llvm::SmallVector<schedule::MxmLoadOp> loads;
         llvm::SmallVector<schedule::MxmComputeOp> computes;
+        llvm::SmallVector<schedule::MxmAccumulatorReadOp> accumulator_reads;
         llvm::SmallVector<schedule::VxmOp> vxms;
         llvm::SmallVector<schedule::SxmOp> sxms;
         llvm::SmallVector<schedule::MemTransferOp> mem_transfers;
@@ -203,6 +212,10 @@ public:
         });
         function.walk([&](schedule::MxmComputeOp op) {
             computes.push_back(op);
+            schedule_operations.push_back(op);
+        });
+        function.walk([&](schedule::MxmAccumulatorReadOp op) {
+            accumulator_reads.push_back(op);
             schedule_operations.push_back(op);
         });
         function.walk([&](schedule::VxmOp op) {
@@ -360,14 +373,59 @@ public:
                     - column % target.throughput().tile_rows;
                 create_mxm_command(builder, load.getLoc(), load.getCycle() + column, load.getUnitId(),
                     "iw", load.getWeightBuffer(), weight_column,
-                    0, 0, 1, 1);
+                    0, 0, 1, 1, 0, 1, "sram");
             }
         }
         for (schedule::MxmComputeOp compute : computes) {
+            schedule::MemAccumulateOp accumulator;
+            for (mlir::Operation* user : compute.getResult().getUsers()) {
+                if (auto candidate = llvm::dyn_cast<schedule::MemAccumulateOp>(user)) {
+                    if (accumulator) {
+                        compute.emitError("must have exactly one accumulator consumer");
+                        signalPassFailure();
+                        return;
+                    }
+                    accumulator = candidate;
+                }
+            }
+            if (!accumulator) {
+                const int64_t hemisphere =
+                    compute.getUnitId()
+                    / target.throughput().mxms_per_hemisphere;
+                for (mlir::Operation* operation = compute->getNextNode();
+                     operation; operation = operation->getNextNode()) {
+                    auto candidate =
+                        llvm::dyn_cast<schedule::MemAccumulateOp>(
+                            operation);
+                    if (!candidate
+                        || candidate.getStreamBase()
+                            != compute.getOutputStreamBase()
+                        || candidate.getHemisphere()
+                            != (hemisphere == 0 ? "east" : "west"))
+                        continue;
+                    accumulator = candidate;
+                    break;
+                }
+            }
+            if (!accumulator) {
+                compute.emitError("requires an accumulator consumer");
+                signalPassFailure();
+                return;
+            }
             builder.setInsertionPointAfter(compute);
             create_mxm_command(builder, compute.getLoc(), compute.getCycle(), compute.getUnitId(),
                 "compute", compute.getWeightBuffer(), 0, compute.getActivationStreamBase(),
-                compute.getOutputStreamBase(), compute.getDuration(), 1);
+                compute.getOutputStreamBase(), compute.getDuration(), 1,
+                placement_integer(accumulator.getPlacement(), "base_row"),
+                accumulator.getAddressStride(), accumulator.getDestination());
+        }
+        for (schedule::MxmAccumulatorReadOp read : accumulator_reads) {
+            builder.setInsertionPointAfter(read);
+            create_mxm_command(builder, read.getLoc(), read.getCycle(),
+                read.getUnitId(), "accumulator_read", 0, 0, 0,
+                read.getOutputStreamBase(), 1, 1,
+                read.getAccumulatorAddress(), 1, "sram",
+                read.getClear());
         }
         for (schedule::VxmOp vxm : vxms) {
             builder.setInsertionPointAfter(vxm);
@@ -384,23 +442,6 @@ public:
         for (schedule::MxmIssueOp mxm : mxm_issues) {
             builder.setInsertionPointAfter(mxm);
             create_mxm_issue_command(builder, mxm);
-        }
-        for (schedule::MemAccumulateOp accumulate : accumulates) {
-            const auto slices = placement_slices(accumulate.getPlacement());
-            const int64_t base_row = placement_integer(accumulate.getPlacement(), "base_row");
-            const bool west = accumulate.getHemisphere() == "west";
-            if (slices.size() != 4 || slices[1] != slices[0] + 1
-                || slices[2] != slices[0] + 2 || slices[3] != slices[0] + 3) {
-                accumulate.emitError("MEM accumulator must occupy one contiguous four-slice group");
-                signalPassFailure();
-                return;
-            }
-            builder.setInsertionPointAfter(accumulate);
-            create_mem_command(builder, accumulate.getLoc(), accumulate.getCycle(),
-                (west ? target.memory().slices_per_hemisphere : 0) + slices.front(),
-                "accumulate", base_row, 32 + accumulate.getStreamBase(),
-                accumulate.getRepeatCount(), accumulate.getRepeatInterval(),
-                accumulate.getAddressStride(), accumulate.getDestination());
         }
         for (schedule::MemWriteOp write : writes) {
             const auto slices = placement_slices(write.getPlacement());
@@ -435,7 +476,8 @@ public:
         llvm::SmallVector<mlir::Operation*> ordered_schedule_ops;
         function.walk([&](mlir::Operation* op) {
             if (llvm::isa<schedule::MemReadOp, schedule::MxmLoadOp,
-                    schedule::MxmComputeOp, schedule::VxmOp,
+                    schedule::MxmComputeOp,
+                    schedule::MxmAccumulatorReadOp, schedule::VxmOp,
                     schedule::SxmOp,
                     schedule::MemTransferOp, schedule::MxmIssueOp,
                     schedule::MemAccumulateOp, schedule::MemWriteOp>(op))

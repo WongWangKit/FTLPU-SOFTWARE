@@ -54,21 +54,34 @@ def main() -> None:
         'opcode = "permute"',
         'destination_streams = [32, 33, 34, 35',
         'weight_layout = "matrix_columns"',
-        'opcode = "accumulate"',
+        'opcode = "accumulator_read"',
+        'accumulator_destination = "sram"',
+        'accumulator_address = 3000 : i64',
         'output_stream = 8 : i64',
     )
     missing = [item for item in required if item not in text]
     if missing:
         raise AssertionError(f"Attention Schedule IR is missing: {missing}")
-    if text.count("ftlpu.schedule.mem_transfer") != 259350:
+    if 'opcode = "accumulate"' in text:
+        raise AssertionError("attention schedule still uses legacy MEM accumulator commands")
+    if text.count("ftlpu.schedule.mem_transfer") != 217662:
         raise AssertionError("attention schedule did not emit the complete physical MEM transfer program")
-    if text.count("ftlpu.schedule.mxm_issue") != 9543:
-        raise AssertionError("attention schedule did not emit projection, QK, and PV MXM commands")
+    if text.count("ftlpu.schedule.mxm_issue") != 18759:
+        raise AssertionError("attention schedule did not emit all MXM compute and accumulator-read commands")
+    if text.count('opcode = "accumulator_read"') != 9216:
+        raise AssertionError("attention schedule did not read all MXM-resident accumulator rows")
     if text.count("ftlpu.schedule.vxm") != 122880:
         raise AssertionError("attention schedule did not emit projection, softmax, and context VXM commands")
     if text.count('rhs_immediate = -1.000000e+09 : f32') != 1728:
         raise AssertionError("attention schedule did not use immediate masks for all future blocks")
-    if text.count('address = 8128 : i64') != 144 or text.count('address = 8158 : i64') != 144:
+    mem_lines = [
+        line for line in text.splitlines()
+        if "ftlpu.schedule.mem_transfer" in line
+    ]
+    if (
+        sum('address = 8128 : i64' in line for line in mem_lines) != 144
+        or sum('address = 8158 : i64' in line for line in mem_lines) != 144
+    ):
         raise AssertionError("attention schedule did not reuse the 31 diagonal causal-mask vectors")
     if text.count('opcode = "max"') != 4572:
         raise AssertionError("attention schedule did not emit recurrent softmax max commands")

@@ -54,10 +54,8 @@ LogicalResult MemOp::verify()
         || getPackedStream() < 0 || getPackedStream() >= target.streams().encoded_streams
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0)
         return emitOpError("contains an invalid ICU MEM queue command field");
-    if (getOpcode() != "read" && getOpcode() != "write" && getOpcode() != "accumulate")
-        return emitOpError("opcode must be read, write, or accumulate");
-    if (getAccumulatorDestination() != "sram" && getAccumulatorDestination() != "stream")
-        return emitOpError("accumulator_destination must be sram or stream");
+    if (getOpcode() != "read" && getOpcode() != "write")
+        return emitOpError("opcode must be read or write");
     const int64_t final_address = getAddress()
         + (getRepeatCount() - 1) * getAddressStride();
     if (final_address < 0 || final_address >= 8192)
@@ -73,14 +71,21 @@ LogicalResult MxmOp::verify()
         || getWeightColumn() < 0 || getWeightColumn() >= target.throughput().tile_rows
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0)
         return emitOpError("contains an invalid ICU MXM queue command field");
-    if (getOpcode() != "iw" && getOpcode() != "compute")
-        return emitOpError("opcode must be iw or compute");
+    if (getOpcode() != "iw" && getOpcode() != "compute"
+        && getOpcode() != "accumulator_read")
+        return emitOpError("opcode must be iw, compute, or accumulator_read");
     if (getActivationStreamBase() < 0
         || getActivationStreamBase() >= target.streams().encoded_streams
         || getOutputStreamBase() < 0
         || getOutputStreamBase() + target.throughput().mxm_result_streams - 1
             >= target.streams().encoded_streams)
         return emitOpError("contains an invalid MXM stream selector");
+    if (getAccumulatorAddress() < 0 || getAccumulatorAddress() >= 8192
+        || getAccumulatorRowStride() <= 0)
+        return emitOpError("contains an invalid MXM accumulator address or stride");
+    if (getAccumulatorDestination() != "sram"
+        && getAccumulatorDestination() != "stream")
+        return emitOpError("accumulator_destination must be sram or stream");
     return success();
 }
 

@@ -138,29 +138,13 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                     }
 
                     for (int64_t localMxm = 0; localMxm < headBlocks; ++localMxm) {
-                        const int64_t accumulatorSlice = target_.memory().accumulator_slice_base
-                            + localMxm * target_.memory().accumulator_slices_per_mxm;
-                        const int64_t accumulatorLatency = localMxm == 0
-                            ? target_.throughput().mxm0_accumulator_latency
-                            : target_.throughput().mxm1_accumulator_latency;
                         const int64_t outputStream = localMxm * 4;
-                        if (keyBlock == 0) {
-                            for (int64_t byte = 0; byte < 4; ++byte)
-                                emitMem(rewriter_, op_.getLoc(), firstCompute + accumulatorLatency,
-                                    hemisphere * target_.memory().slices_per_hemisphere
-                                        + accumulatorSlice + byte,
-                                    "write", layout.contextAddress(*head, queryBlock * tile),
-                                    32 + outputStream + byte, tile, 1, 1);
-                        } else {
-                            emitMem(rewriter_, op_.getLoc(), firstCompute + accumulatorLatency,
-                                hemisphere * target_.memory().slices_per_hemisphere
-                                    + accumulatorSlice,
-                                "accumulate", layout.contextAddress(*head, queryBlock * tile),
-                                32 + outputStream, tile, 1, 1, "sram");
-                        }
                         emitMxm(rewriter_, op_.getLoc(), firstCompute,
                             hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
-                            "compute", 0, 0, 0, outputStream, tile, 1);
+                            "compute", 0, 0, 0, outputStream, tile, 1,
+                            layout.contextAddress(
+                                *head, queryBlock * tile),
+                            1, "sram");
                     }
 
                     if (keyBlock + 1 == tokenBlocks) {
@@ -172,19 +156,19 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                         for (int64_t offset = 0; offset < tile; ++offset) {
                             const int64_t cycle = readStart + offset;
                             for (int64_t localMxm = 0; localMxm < headBlocks; ++localMxm) {
-                                for (int64_t byte = 0; byte < 4; ++byte) {
-                                    const int64_t slice = target_.memory().accumulator_slice_base
-                                        + localMxm * target_.memory().accumulator_slices_per_mxm + byte;
-                                    const int64_t latency = *target_.transport_latency(
-                                        target::StreamEndpoint::Mem,
-                                        target::StreamEndpoint::VxmInput,
-                                        target::StreamDirection::West, slice);
-                                    emitMem(rewriter_, op_.getLoc(), cycle - latency,
-                                        hemisphere * target_.memory().slices_per_hemisphere + slice,
-                                        "read", layout.contextAddress(
-                                            *head, queryBlock * tile + offset),
-                                        32 + localMxm * 4 + byte, 1, 1, 0);
-                                }
+                                emitMxm(rewriter_, op_.getLoc(),
+                                    cycle
+                                        - target_.throughput()
+                                              .accumulator_read_to_vxm_latency,
+                                    hemisphere
+                                            * target_.throughput()
+                                                  .mxms_per_hemisphere
+                                        + localMxm,
+                                    "accumulator_read", 0, 0, 0,
+                                    localMxm * 4, 1, 1,
+                                    layout.contextAddress(*head,
+                                        queryBlock * tile + offset),
+                                    1, "sram", true);
                             }
                             emitVxm(rewriter_, op_, op_.getInput(), cycle, aluBase,
                                 "pass", "stream_f32", 32, 0.0f, "immediate", 0, 0.0f,

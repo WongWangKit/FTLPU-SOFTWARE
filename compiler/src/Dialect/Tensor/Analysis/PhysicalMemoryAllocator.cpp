@@ -22,10 +22,18 @@ bool PhysicalMemoryAllocator::valid(const PhysicalAllocation& allocation) const
 }
 
 bool PhysicalMemoryAllocator::conflicts(llvm::ArrayRef<int64_t> slices,
-    int64_t live_start, int64_t live_end) const
+    int64_t base_row, int64_t rows,
+    int64_t live_start, int64_t live_end,
+    bool reserve_slice_port) const
 {
     for (const PhysicalAllocation& allocation : allocations_) {
         if (live_start >= allocation.live_end || live_end <= allocation.live_start)
+            continue;
+        const bool rows_overlap =
+            base_row < allocation.base_row + allocation.rows
+            && base_row + rows > allocation.base_row;
+        if (!rows_overlap
+            && !(reserve_slice_port && allocation.reserve_slice_port))
             continue;
         for (int64_t slice : slices)
             if (llvm::is_contained(allocation.slices, slice)) return true;
@@ -36,7 +44,9 @@ bool PhysicalMemoryAllocator::conflicts(llvm::ArrayRef<int64_t> slices,
 mlir::LogicalResult PhysicalMemoryAllocator::reserve(PhysicalAllocation allocation)
 {
     if (!valid(allocation)
-        || conflicts(allocation.slices, allocation.live_start, allocation.live_end))
+        || conflicts(allocation.slices, allocation.base_row, allocation.rows,
+            allocation.live_start, allocation.live_end,
+            allocation.reserve_slice_port))
         return mlir::failure();
     allocations_.push_back(std::move(allocation));
     return mlir::success();
@@ -59,10 +69,13 @@ mlir::FailureOr<PhysicalAllocation> PhysicalMemoryAllocator::allocate(
         for (std::size_t index = 1; index < slices.size(); ++index)
             contiguous &= slices[index] == slices[index - 1] + 1;
         if (!contiguous
-            || conflicts(slices, request.live_start, request.live_end))
+            || conflicts(slices, request.base_row, request.rows,
+                request.live_start, request.live_end,
+                request.reserve_slice_port))
             continue;
         PhysicalAllocation allocation {request.name, std::move(slices),
-            request.base_row, request.rows, request.live_start, request.live_end};
+            request.base_row, request.rows, request.live_start, request.live_end,
+            request.reserve_slice_port};
         if (failed(reserve(allocation))) continue;
         return allocations_.back();
     }

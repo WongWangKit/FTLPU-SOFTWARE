@@ -169,6 +169,25 @@ LogicalResult MemAccumulateOp::verify()
     return success();
 }
 
+LogicalResult MxmAccumulatorReadOp::verify()
+{
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
+    if (getCycle() < 0 || !target.is_valid_mxm_unit(getUnitId())
+        || getAccumulatorAddress() < 0 || getAccumulatorAddress() >= 8192)
+        return emitOpError("contains an invalid MXM accumulator read field");
+    if (getOutputStreamBase() < 0
+        || getOutputStreamBase()
+                + target.throughput().mxm_result_streams
+                - 1
+            >= target.streams().streams_per_direction)
+        return emitOpError("contains an invalid accumulator output stream");
+    if (getInput().getType() != getOutput().getType())
+        return emitOpError("must preserve the logical accumulator value type");
+    return success();
+}
+
 LogicalResult MemWriteOp::verify()
 {
     auto targetModel = target::LPUTargetModel::from_operation(*this);
@@ -269,8 +288,15 @@ LogicalResult MxmIssueOp::verify()
             << ", weight_column=" << getWeightColumn()
             << ", activation_stream_base=" << getActivationStreamBase()
             << ", output_stream_base=" << getOutputStreamBase();
-    if (getOpcode() != "iw" && getOpcode() != "compute")
-        return emitOpError("opcode must be iw or compute");
+    if (getOpcode() != "iw" && getOpcode() != "compute"
+        && getOpcode() != "accumulator_read")
+        return emitOpError("opcode must be iw, compute, or accumulator_read");
+    if (getAccumulatorAddress() < 0 || getAccumulatorAddress() >= 8192
+        || getAccumulatorRowStride() <= 0)
+        return emitOpError("contains an invalid MXM accumulator address or stride");
+    if (getAccumulatorDestination() != "sram"
+        && getAccumulatorDestination() != "stream")
+        return emitOpError("accumulator_destination must be sram or stream");
     return success();
 }
 

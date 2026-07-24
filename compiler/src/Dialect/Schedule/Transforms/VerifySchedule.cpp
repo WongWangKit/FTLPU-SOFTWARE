@@ -44,7 +44,10 @@ private:
                 if (cycle < existing.end && end > existing.start) {
                     operation->emitError()
                         << "resource '" << resource << "' overlaps at cycle "
-                        << cycle << " with " << existing.owner->getName();
+                        << cycle << " with " << existing.owner->getName()
+                        << "; current attributes " << operation->getAttrDictionary()
+                        << "; existing attributes "
+                        << existing.owner->getAttrDictionary();
                     return mlir::WalkResult::interrupt();
                 }
             }

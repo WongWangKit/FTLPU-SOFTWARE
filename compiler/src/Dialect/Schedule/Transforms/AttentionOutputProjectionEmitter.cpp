@@ -19,13 +19,21 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
     const int64_t localMxm = 0;
     const int64_t accumulatorSlice = target_.memory().accumulator_slice_base
         + localMxm * target_.memory().accumulator_slices_per_mxm;
-    const int64_t accumulatorLatency = target_.throughput().mxm0_accumulator_latency;
+    const int64_t accumulatorLatency =
+        target_.throughput().mxm0_accumulator_latency;
     const int64_t weightToIw = target_.throughput().vxm_weight_to_iw_latency;
     const auto readLatency = [&](int64_t slice) {
         return slice / target_.streams().mem_slices_per_register_group + 2;
     };
     const int64_t weightLoadLead =
         (target_.memory().hemispheres - 1) * 8 + 3 + weightToIw + 1;
+    const int64_t accumulatorCapacity =
+        target_.memory().banks_per_slice * target_.memory().words_per_bank;
+    const int64_t outputAccumulatorBase =
+        accumulatorCapacity - op_.getSeqLen();
+    const auto accumulatorAddress = [&](int64_t token) {
+        return outputAccumulatorBase + token;
+    };
 
     int64_t phaseStart = pvEnd;
     for (int64_t outputGroup = 0; outputGroup < outputGroups; ++outputGroup) {
@@ -70,7 +78,6 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                 }
             }
 
-            const bool firstReduction = reductionBlock == 0;
             const bool finalReduction = reductionBlock + 1 == reductionBlocks;
             const int64_t computeInterval = tile;
             const int64_t queryHead = reductionBlock / (op_.getHeadDim() / tile);
@@ -138,31 +145,12 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                                 + localMxm,
                             "compute", weightBuffer, 0,
                             streamBase + hemisphere * 2,
-                            8 + hemisphere * 4, rows, 1);
+                            0, rows, 1,
+                            accumulatorAddress(tokenBlock * tile),
+                            1, "sram");
                         rowOffset += rows;
                     }
-                    const int64_t accumulatorCycle = computeCycle
-                        + accumulatorLatency;
-                    if (firstReduction) {
-                        for (int64_t byte = 0; byte < 4; ++byte) {
-                            emitMem(rewriter_, op_.getLoc(), accumulatorCycle,
-                                hemisphere * target_.memory().slices_per_hemisphere
-                                    + accumulatorSlice + byte,
-                                "write",
-                                layout.resultAddress(outputGroup, tokenBlock * tile),
-                                40 + hemisphere * 4 + byte, tile, 1, 1);
-                        }
-                    } else {
-                        emitMem(rewriter_, op_.getLoc(), accumulatorCycle,
-                            hemisphere * target_.memory().slices_per_hemisphere
-                                + accumulatorSlice,
-                            "accumulate",
-                            layout.resultAddress(outputGroup, tokenBlock * tile),
-                            40 + hemisphere * 4, tile, 1, 1,
-                            "sram");
-                    }
                 }
-
             }
             phaseStart = firstCompute + tokenBlocks * computeInterval
                 + (finalReduction
@@ -172,22 +160,27 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                 const int64_t castStart = phaseStart;
                 for (int64_t hemisphere = 0;
                      hemisphere < target_.memory().hemispheres; ++hemisphere) {
-                    const char* inputHemisphere = hemisphere == 0 ? "east" : "west";
-                    const int64_t inputStream = 32 + hemisphere * 4;
+                    const char* inputHemisphere =
+                        hemisphere == 0 ? "east" : "west";
+                    const int64_t mxmOutputStream = 0;
+                    const int64_t inputStream =
+                        target_.streams().streams_per_direction
+                        + mxmOutputStream;
                     const int64_t outputStream = hemisphere * 2;
                     for (int64_t token = 0; token < op_.getSeqLen(); ++token) {
                         const int64_t vxmCycle = castStart + token;
-                        for (int64_t byte = 0; byte < 4; ++byte) {
-                            const int64_t slice = accumulatorSlice + byte;
-                            const int64_t latency = *target_.transport_latency(
-                                target::StreamEndpoint::Mem,
-                                target::StreamEndpoint::VxmInput,
-                                target::StreamDirection::West, slice);
-                            emitMem(rewriter_, op_.getLoc(), vxmCycle - latency,
-                                hemisphere * target_.memory().slices_per_hemisphere + slice,
-                                "read", layout.resultAddress(outputGroup, token),
-                                inputStream + byte, 1, 1, 0);
-                        }
+                        emitMxm(rewriter_, op_.getLoc(),
+                            vxmCycle
+                                - target_.throughput()
+                                      .accumulator_read_to_vxm_latency,
+                            hemisphere
+                                    * target_.throughput()
+                                          .mxms_per_hemisphere
+                                + localMxm,
+                            "accumulator_read", 0, 0, 0,
+                            mxmOutputStream, 1, 1,
+                            accumulatorAddress(token),
+                            1, "sram", true);
                         emitVxm(rewriter_, op_, op_.getOutputWeight(), vxmCycle,
                             hemisphere, "pass", "stream_f32", inputStream, 0.0f,
                             "immediate", 0, 0.0f, "fp16", outputStream,
@@ -199,7 +192,8 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                                 target::StreamEndpoint::Mem,
                                 target::StreamDirection::East, slice);
                             emitMem(rewriter_, op_.getLoc(), vxmCycle + latency,
-                                slice, "write", layout.resultAddress(outputGroup, token),
+                                slice, "write",
+                                layout.resultAddress(outputGroup, token),
                                 outputStream + byte, 1, 1, 0);
                         }
                     }

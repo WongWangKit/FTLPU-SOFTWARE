@@ -184,11 +184,25 @@ def discover_windows(events: list[Event]) -> tuple[Window, ...]:
         lambda event: event.start > sxm_start
         and event.resource.endswith(".Compute"),
     )
-    o_compute_start = first_start(
-        events,
-        lambda event: event.start > pv_compute_start
-        and event.resource.endswith(".Compute")
-        and "out=E8" in event.detail,
+    post_pv_compute = []
+    for event in events:
+        if (
+            event.start > pv_compute_start
+            and event.resource.endswith(".Compute")
+            and event.detail.startswith("Compute ")
+        ):
+            accumulator = re.search(r"\bacc=(\d+)\b", event.detail)
+            if accumulator:
+                post_pv_compute.append((event, int(accumulator.group(1))))
+    if not post_pv_compute:
+        raise ValueError("runtime trace is missing post-PV MXM computes")
+    # O projection reuses one high accumulator block after each completed
+    # output group. PV uses lower context-addressed blocks.
+    o_accumulator_base = max(accumulator for _, accumulator in post_pv_compute)
+    o_compute_start = min(
+        event.start
+        for event, accumulator in post_pv_compute
+        if accumulator == o_accumulator_base
     )
 
     cast_events = [

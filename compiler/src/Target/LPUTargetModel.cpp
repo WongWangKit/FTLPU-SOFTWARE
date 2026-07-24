@@ -155,6 +155,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_THROUGHPUT(mxm0_accumulator_latency);
     READ_THROUGHPUT(mxm1_accumulator_latency);
     READ_THROUGHPUT(accumulator_to_vxm_latency);
+    READ_THROUGHPUT(accumulator_read_to_vxm_latency);
     READ_THROUGHPUT(swiglu_write_latency);
 #undef READ_THROUGHPUT
 
@@ -230,6 +231,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_THROUGHPUT(mxm0_accumulator_latency);
     READ_THROUGHPUT(mxm1_accumulator_latency);
     READ_THROUGHPUT(accumulator_to_vxm_latency);
+    READ_THROUGHPUT(accumulator_read_to_vxm_latency);
     READ_THROUGHPUT(swiglu_write_latency);
 #undef READ_THROUGHPUT
     std::string error;
@@ -311,6 +313,7 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(throughput_, mxm0_accumulator_latency),
         I64(throughput_, mxm1_accumulator_latency),
         I64(throughput_, accumulator_to_vxm_latency),
+        I64(throughput_, accumulator_read_to_vxm_latency),
         I64(throughput_, swiglu_write_latency),
     });
 #undef I64
@@ -425,6 +428,7 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
     HASH(mxm0_accumulator_latency);
     HASH(mxm1_accumulator_latency);
     HASH(accumulator_to_vxm_latency);
+    HASH(accumulator_read_to_vxm_latency);
     HASH(swiglu_write_latency);
 #undef HASH
     return hash.value();

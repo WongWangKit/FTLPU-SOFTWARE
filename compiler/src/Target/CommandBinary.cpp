@@ -48,21 +48,26 @@ int64_t command_integer(mlir::Operation* op, llvm::StringRef name)
 using QueueKey = std::pair<QueueKind, int64_t>;
 using QueueMap = std::map<QueueKey, std::vector<CommandSequence>>;
 
-QueueCommand instruction_command(InstructionKind kind, std::uint32_t word)
-{
-    return QueueCommand {
-        static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
-        kind,
-        1,
-        {word, 0, 0, 0},
-    };
-}
-
 QueueCommand mem_instruction_command(isa::EncodedMemInstruction encoded)
 {
     return QueueCommand {
         static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
         InstructionKind::Mem,
+        static_cast<std::uint16_t>((encoded >> 32) == 0 ? 1 : 2),
+        {
+            static_cast<std::uint32_t>(encoded),
+            static_cast<std::uint32_t>(encoded >> 32),
+            0,
+            0,
+        },
+    };
+}
+
+QueueCommand mxm_instruction_command(isa::EncodedMxmInstruction encoded)
+{
+    return QueueCommand {
+        static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
+        InstructionKind::Mxm,
         static_cast<std::uint16_t>((encoded >> 32) == 0 ? 1 : 2),
         {
             static_cast<std::uint32_t>(encoded),
@@ -162,11 +167,7 @@ void collect_mem(command::MemOp op, QueueMap& queues)
     const int64_t cycle = command_cycle(op);
     const auto instruction = op.getOpcode() == "read"
         ? MemInstruction::Read(op.getAddress(), op.getPackedStream())
-        : op.getOpcode() == "write"
-        ? MemInstruction::Write(op.getAddress(), op.getPackedStream())
-        : MemInstruction::Accumulate(op.getAddress(), op.getPackedStream(),
-            op.getAccumulatorDestination() == "stream"
-                ? MemAccumulatorDestination::Stream : MemAccumulatorDestination::Sram);
+        : MemInstruction::Write(op.getAddress(), op.getPackedStream());
     queues[{QueueKind::Mem, queue}].push_back(CommandSequence {
         cycle,
         op->getAttrOfType<mlir::IntegerAttr>("repeat_count").getInt(),
@@ -179,16 +180,23 @@ void collect_mem(command::MemOp op, QueueMap& queues)
 void collect_mxm(command::MxmOp op, QueueMap& queues)
 {
     const bool is_load = op.getOpcode() == "iw";
+    const bool is_accumulator_read = op.getOpcode() == "accumulator_read";
+    const auto destination = op.getAccumulatorDestination() == "stream"
+        ? MxmAccumulatorDestination::Stream : MxmAccumulatorDestination::Sram;
     const auto instruction = is_load
         ? MxmControlInstruction::IW(op.getWeightBuffer(), op.getWeightColumn())
+        : is_accumulator_read
+        ? MxmControlInstruction::AccumulatorRead(op.getAccumulatorAddress(),
+            op.getOutputStreamBase(), op.getAccumulatorClear())
         : MxmControlInstruction::Compute(op.getWeightBuffer(),
-            op.getActivationStreamBase(), op.getOutputStreamBase());
+            op.getActivationStreamBase(), op.getOutputStreamBase(),
+            op.getAccumulatorAddress(), op.getAccumulatorRowStride(), destination);
     const auto kind = is_load ? QueueKind::MxmLoad : QueueKind::MxmCompute;
     queues[{kind, static_cast<int64_t>(op.getQueue())}].push_back(CommandSequence {
         command_cycle(op),
         op->getAttrOfType<mlir::IntegerAttr>("repeat_count").getInt(),
         op->getAttrOfType<mlir::IntegerAttr>("repeat_interval").getInt(), 0,
-        instruction_command(InstructionKind::Mxm, isa::encode_mxm_instruction(instruction)),
+        mxm_instruction_command(isa::encode_mxm_instruction(instruction)),
     });
 }
 

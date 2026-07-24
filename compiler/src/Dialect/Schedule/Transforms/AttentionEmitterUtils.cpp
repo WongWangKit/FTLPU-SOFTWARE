@@ -32,7 +32,9 @@ void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
 void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t weightBuffer,
     int64_t weightColumn, int64_t activationStream, int64_t outputStream,
-    int64_t repeatCount, int64_t repeatInterval)
+    int64_t repeatCount, int64_t repeatInterval,
+    int64_t accumulatorAddress, int64_t accumulatorRowStride,
+    llvm::StringRef accumulatorDestination, bool accumulatorClear)
 {
     mlir::OperationState state(location, MxmIssueOp::getOperationName());
     state.addAttributes({
@@ -45,6 +47,10 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("output_stream_base", rewriter.getI64IntegerAttr(outputStream)),
         rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(repeatCount)),
         rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(repeatInterval)),
+        rewriter.getNamedAttr("accumulator_address", rewriter.getI64IntegerAttr(accumulatorAddress)),
+        rewriter.getNamedAttr("accumulator_row_stride", rewriter.getI64IntegerAttr(accumulatorRowStride)),
+        rewriter.getNamedAttr("accumulator_destination", rewriter.getStringAttr(accumulatorDestination)),
+        rewriter.getNamedAttr("accumulator_clear", rewriter.getBoolAttr(accumulatorClear)),
     });
     rewriter.create(state);
 }

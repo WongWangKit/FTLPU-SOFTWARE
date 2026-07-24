@@ -22,8 +22,7 @@ def MemOp : FTLPU_Command_Op<"mem", [MemoryEffects<[MemWrite]>]> {
   let summary = "Compressed command for one ICU MEM queue";
   let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
       I64Attr:$address, I64Attr:$packed_stream, I64Attr:$repeat_count,
-      I64Attr:$repeat_interval, I64Attr:$address_stride,
-      StrAttr:$accumulator_destination);
+      I64Attr:$repeat_interval, I64Attr:$address_stride);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -33,7 +32,9 @@ def MxmOp : FTLPU_Command_Op<"mxm", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
       I64Attr:$weight_buffer, I64Attr:$weight_column, I64Attr:$activation_stream_base,
       I64Attr:$output_stream_base, I64Attr:$repeat_count,
-      I64Attr:$repeat_interval);
+      I64Attr:$repeat_interval, I64Attr:$accumulator_address,
+      I64Attr:$accumulator_row_stride, StrAttr:$accumulator_destination,
+      BoolAttr:$accumulator_clear);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }

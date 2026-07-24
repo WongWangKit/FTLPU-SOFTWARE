@@ -107,8 +107,11 @@ void validate_mxm_queue_opcode(
     if (kind == QueueKind::MxmLoad && instruction.opcode != MxmControlOpcode::IW) {
         throw std::logic_error("MXM load queue only accepts IW instructions");
     }
-    if (kind == QueueKind::MxmCompute && instruction.opcode != MxmControlOpcode::Compute) {
-        throw std::logic_error("MXM compute queue only accepts Compute instructions");
+    if (kind == QueueKind::MxmCompute
+        && instruction.opcode != MxmControlOpcode::Compute
+        && instruction.opcode != MxmControlOpcode::AccumulatorRead) {
+        throw std::logic_error(
+            "MXM compute queue only accepts Compute or AccumulatorRead instructions");
     }
     (void)mxm;
 }

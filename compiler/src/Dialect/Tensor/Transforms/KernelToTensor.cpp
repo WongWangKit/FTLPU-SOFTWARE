@@ -373,6 +373,17 @@ public:
                  slice < target.memory().accumulator_slice_base; ++slice)
                 scratch_candidates.push_back(slice);
             tensor::PhysicalMemoryAllocator physical_allocator(target);
+            const int64_t output_weight_base =
+                q_weight_rows + k_weight_rows + v_weight_rows;
+            if (mlir::failed(physical_allocator.reserve({"output_weight",
+                    llvm::SmallVector<int64_t, 16>(
+                        output_weight_slices.begin(), output_weight_slices.end()),
+                    output_weight_base, o_weight_rows,
+                    0, 6, false}))) {
+                op.emitError("failed to reserve the live O-projection weights");
+                signalPassFailure();
+                return;
+            }
             const auto probability_pack_slices = target.attention_query_iw_slices(1);
             if (mlir::failed(physical_allocator.reserve({"probability_pack",
                     llvm::SmallVector<int64_t, 16>(
@@ -434,7 +445,7 @@ public:
                 rewriter.getNamedAttr("value_weight", make_attention_placement(rewriter,
                     "w8a16_attention_weight_striped", weight_slices, q_weight_rows + k_weight_rows, v_weight_rows, "both")),
                 rewriter.getNamedAttr("output_weight", make_attention_placement(rewriter,
-                    "w8a16_mxm_weight_striped", output_weight_slices, q_weight_rows + k_weight_rows + v_weight_rows,
+                    "w8a16_mxm_weight_striped", output_weight_slices, output_weight_base,
                     o_weight_rows, "both")),
                 rewriter.getNamedAttr("query", make_attention_placement(rewriter,
                     "fp16_query_iw", output_slices, 7600, query_rows, "both")),

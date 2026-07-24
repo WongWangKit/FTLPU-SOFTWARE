@@ -25,7 +25,9 @@ def MxmIssueOp : FTLPU_Schedule_Op<"mxm_issue", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins I64Attr:$cycle, I64Attr:$unit_id, StrAttr:$opcode,
       I64Attr:$weight_buffer, I64Attr:$weight_column, I64Attr:$activation_stream_base,
       I64Attr:$output_stream_base, I64Attr:$repeat_count,
-      I64Attr:$repeat_interval);
+      I64Attr:$repeat_interval, I64Attr:$accumulator_address,
+      I64Attr:$accumulator_row_stride, StrAttr:$accumulator_destination,
+      BoolAttr:$accumulator_clear);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -108,6 +110,16 @@ def MxmComputeOp : FTLPU_Schedule_Op<"mxm_compute"> {
     $_state.addAttribute("k", $_builder.getI64IntegerAttr(k));
   }] >];
   let assemblyFormat = "$activation `,` $weight attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def MxmAccumulatorReadOp : FTLPU_Schedule_Op<"mxm_accumulator_read"> {
+  let summary = "Read one row from an MXM-local accumulator to west streams";
+  let arguments = (ins AnyRankedTensor:$input, I64Attr:$cycle,
+      I64Attr:$unit_id, I64Attr:$accumulator_address,
+      I64Attr:$output_stream_base, BoolAttr:$clear);
+  let results = (outs AnyRankedTensor:$output);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 

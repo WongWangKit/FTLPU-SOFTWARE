@@ -180,6 +180,7 @@ float read_probability(const ftlpu::TspSliceSystem& system, std::size_t query_he
 {
     constexpr std::array<std::size_t, kQueryHeads> kLocalMxm {
         0, 1, 0, 0, 1, 0, 1, 0, 1};
+    constexpr std::array<std::size_t, 2> kProbabilityLowSlices {5, 9};
     const std::size_t query_block = query / kTile;
     const std::size_t physical = query % kTile;
     const std::size_t tile = physical / 8;
@@ -188,7 +189,8 @@ float read_probability(const ftlpu::TspSliceSystem& system, std::size_t query_he
     const auto hemisphere = static_cast<ftlpu::Hemisphere>(kv_head % 2);
     const std::size_t address = (query_head * (kSeqLen / kTile) + query_block)
         * kSeqLen + key;
-    const std::size_t low_slice = kLocalMxm[query_head] * 2;
+    const std::size_t low_slice =
+        kProbabilityLowSlices[kLocalMxm[query_head]];
     const auto low = system.read_mem_sram_lane_byte(
         hemisphere, low_slice, tile, address, lane);
     const auto high = system.read_mem_sram_lane_byte(
@@ -271,17 +273,30 @@ try {
     if (program.bindings.size() != 8 || program.max_cycle <= kProjectionEndCycle)
         throw std::logic_error("attention binary is missing bindings or projection commands");
     std::size_t causal_mask_bindings = 0;
+    std::vector<std::uint16_t> first_mask_plane;
     for (const auto& binding : program.bindings) {
         if (binding.access != ftlpu::software::runtime::BindingAccess::Internal)
             continue;
-        const bool valid_mask_plane = binding.slices
-            == std::vector<std::uint16_t>({24, 25, 26, 27})
-            || binding.slices == std::vector<std::uint16_t>({20, 21, 22, 23});
+        const bool valid_mask_plane = binding.slices.size() == sizeof(float)
+            && std::adjacent_find(binding.slices.begin(), binding.slices.end(),
+                   [](std::uint16_t lhs, std::uint16_t rhs) {
+                       return rhs != lhs + 1;
+                   })
+                == binding.slices.end();
         if (binding.layout
                 != ftlpu::software::runtime::BindingLayout::Fp32CausalMaskTile
             || binding.shape != std::vector<std::uint64_t>({kTile - 1, kTile})
             || !valid_mask_plane || binding.base_row != 8128)
             throw std::logic_error("attention binary has an invalid causal-mask binding");
+        if (first_mask_plane.empty())
+            first_mask_plane = binding.slices;
+        else if (std::any_of(binding.slices.begin(), binding.slices.end(),
+                     [&](std::uint16_t slice) {
+                         return std::find(first_mask_plane.begin(),
+                                    first_mask_plane.end(), slice)
+                             != first_mask_plane.end();
+                     }))
+            throw std::logic_error("attention causal masks overlap");
         ++causal_mask_bindings;
     }
     if (causal_mask_bindings != 2)

@@ -75,6 +75,7 @@ struct ThroughputModel {
     int64_t mxm0_accumulator_latency = 6;
     int64_t mxm1_accumulator_latency = 5;
     int64_t accumulator_to_vxm_latency = 16;
+    int64_t accumulator_read_to_vxm_latency = 13;
     int64_t swiglu_write_latency = 13;
 };
 

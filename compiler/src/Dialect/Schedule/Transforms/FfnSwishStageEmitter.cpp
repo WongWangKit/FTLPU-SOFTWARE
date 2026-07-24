@@ -45,49 +45,71 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                     for (int64_t hemisphere = 0;
                          hemisphere < memory.hemispheres;
                          ++hemisphere) {
+                        const auto completed = llvm::find_if(
+                            emission.completed_tiles,
+                            [&](const CompletedProjectionTile& tile) {
+                                return tile.m_tile == mTile
+                                    && tile.pair == pair
+                                    && tile.hemisphere == hemisphere;
+                            });
+                        if (completed
+                            == emission.completed_tiles.end())
+                            return mlir::failure();
                         const int64_t outputBlock =
                             pair * memory.hemispheres + hemisphere;
                         const int64_t address =
                             mTile * tile * (intermediate / tile)
                             + row * (intermediate / tile)
                             + outputBlock;
-                        mlir::Value gateValue;
-                        mlir::Value upValue;
-                        for (int64_t byte = 0;
-                             byte < throughput.mxm_result_streams;
-                             ++byte) {
-                            gateValue =
-                                context
-                                    .emitSliceRead(ffn.getActivation(),
-                                        context.activation_route,
-                                        cycle
-                                            - context.westLatency(
-                                                context
-                                                    .gate_acc_slices[byte]),
-                                        context.gate_acc_slices[byte],
-                                        address, 1, 1, byte, "west",
-                                        "vxm_fp32",
-                                        context.hemisphereName(
-                                            hemisphere))
-                                    .getOutput();
-                            upValue =
-                                context
-                                    .emitSliceRead(ffn.getActivation(),
-                                        context.activation_route,
-                                        cycle
-                                            - context.westLatency(
-                                                context
-                                                    .up_acc_slices[byte]),
-                                        context.up_acc_slices[byte],
-                                        address, 1, 1,
-                                        throughput.mxm_result_streams
-                                            + byte,
-                                        "west", "vxm_fp32",
-                                        context.hemisphereName(
-                                            hemisphere))
-                                    .getOutput();
-                        }
-                        emitRow(gateValue, upValue, cycle++, mTile,
+                        const auto emitAccumulatorRead =
+                            [&](MemAccumulateOp value, int64_t localMxm,
+                                int64_t streamBase) {
+                                mlir::OperationState state(ffn.getLoc(),
+                                    MxmAccumulatorReadOp::
+                                        getOperationName());
+                                state.addOperands(value.getOutput());
+                                state.addTypes(context.projection_type);
+                                state.addAttributes({
+                                    context.rewriter.getNamedAttr(
+                                        "cycle",
+                                        context.rewriter
+                                            .getI64IntegerAttr(
+                                                cycle
+                                                - throughput
+                                                      .accumulator_read_to_vxm_latency)),
+                                    context.rewriter.getNamedAttr(
+                                        "unit_id",
+                                        context.rewriter
+                                            .getI64IntegerAttr(
+                                                hemisphere
+                                                    * throughput
+                                                          .mxms_per_hemisphere
+                                                + localMxm)),
+                                    context.rewriter.getNamedAttr(
+                                        "accumulator_address",
+                                        context.rewriter
+                                            .getI64IntegerAttr(address)),
+                                    context.rewriter.getNamedAttr(
+                                        "output_stream_base",
+                                        context.rewriter
+                                            .getI64IntegerAttr(
+                                                streamBase)),
+                                    context.rewriter.getNamedAttr(
+                                        "clear",
+                                        context.rewriter
+                                            .getBoolAttr(false)),
+                                });
+                                return llvm::cast<
+                                    MxmAccumulatorReadOp>(
+                                    context.rewriter.create(state));
+                            };
+                        auto gateRead = emitAccumulatorRead(
+                            completed->gate, 0, 0);
+                        auto upRead = emitAccumulatorRead(
+                            completed->up, 1,
+                            throughput.mxm_result_streams);
+                        emitRow(gateRead.getOutput(),
+                            upRead.getOutput(), cycle++, mTile,
                             pair, row, hemisphere);
                     }
                 }

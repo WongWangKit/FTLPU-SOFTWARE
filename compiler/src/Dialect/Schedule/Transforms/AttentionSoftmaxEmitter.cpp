@@ -26,6 +26,10 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
     const auto readLatency = [&](int64_t slice) {
         return slice / target_.streams().mem_slices_per_register_group + 2;
     };
+    const auto maxRegisterGroup = [&](llvm::ArrayRef<int64_t> slices) {
+        return *std::max_element(slices.begin(), slices.end())
+            / target_.streams().mem_slices_per_register_group;
+    };
     const auto vxm = [&](int64_t cycle, int64_t queue, llvm::StringRef opcode,
                          llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
                          llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
@@ -57,9 +61,6 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
             const int64_t inputStream = 32 + lane * 4;
             const int64_t maskStream = 40 + lane * 4;
             const int64_t outputStreamBase = outputStream + lane * 4;
-            const int64_t accumulatorBase = target_.memory().accumulator_slice_base
-                + lane * target_.memory().accumulator_slices_per_mxm;
-
             for (int64_t key = 0; key < op_.getSeqLen(); ++key) {
                 const int64_t cycle = *softmaxCycle + key;
                 const int64_t keyBlock =
@@ -68,13 +69,17 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                     key % target_.throughput().mxm_rows;
                 const bool vectorMask = op_.getCausal()
                     && keyBlock == work->query_block && localKey != 0;
-                for (int64_t byte = 0; byte < 4; ++byte) {
-                    const int64_t slice = accumulatorBase + byte;
-                    emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
-                        hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "read", layout.scoreTokenAddress(work->query_head,
-                            work->query_block, key), inputStream + byte, 1, 1, 0);
-                }
+                emitMxm(rewriter_, op_.getLoc(),
+                    cycle
+                        - target_.throughput()
+                              .accumulator_read_to_vxm_latency,
+                    hemisphere
+                            * target_.throughput().mxms_per_hemisphere
+                        + lane,
+                    "accumulator_read", 0, 0, 0, lane * 4, 1, 1,
+                    layout.scoreTokenAddress(work->query_head,
+                        work->query_block, key),
+                    1, "sram", true);
                 if (vectorMask) {
                     for (int64_t byte = 0; byte < 4; ++byte) {
                         const int64_t slice = layout.causalMaskSlices(lane)[byte];
@@ -119,7 +124,10 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                 }
             }
 
-            const int64_t pass2Start = *softmaxCycle + op_.getSeqLen() + 8;
+            const int64_t scaledGroup =
+                maxRegisterGroup(layout.scaledScoreSlices(lane));
+            const int64_t pass2Start = *softmaxCycle + op_.getSeqLen()
+                + (op_.getCausal() ? 4 : 3) + 2 * scaledGroup;
             for (int64_t key = 0; key < op_.getSeqLen(); ++key) {
                 const int64_t cycle = pass2Start + key;
                 for (int64_t byte = 0; byte < 4; ++byte) {
@@ -146,7 +154,10 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                 }
             }
 
-            const int64_t pass3Start = pass2Start + op_.getSeqLen() + 12;
+            const int64_t expGroup =
+                maxRegisterGroup(layout.expScoreSlices(lane));
+            const int64_t pass3Start = pass2Start + op_.getSeqLen()
+                + 4 + 2 * expGroup;
             for (int64_t key = 0; key < op_.getSeqLen(); ++key) {
                 const int64_t cycle = pass3Start + key;
                 for (int64_t byte = 0; byte < 4; ++byte) {

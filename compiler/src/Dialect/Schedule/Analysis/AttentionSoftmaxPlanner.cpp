@@ -16,7 +16,28 @@ mlir::FailureOr<AttentionSoftmaxSchedule> planAttentionSoftmax(
     int64_t qkEnd, const target::LPUTargetModel& target)
 {
     const AttentionMemoryLayout layout(op, target);
-    const int64_t duration = 3 * op.getSeqLen() + 20;
+    const auto maxRegisterGroup = [&](llvm::ArrayRef<int64_t> slices) {
+        return *std::max_element(slices.begin(), slices.end())
+            / target.streams().mem_slices_per_register_group;
+    };
+    int64_t maxScaledGroup = 0;
+    int64_t maxExpGroup = 0;
+    int64_t maxProbabilityGroup = 0;
+    for (int64_t lane = 0;
+         lane < target.throughput().mxms_per_hemisphere; ++lane) {
+        maxScaledGroup = std::max(
+            maxScaledGroup, maxRegisterGroup(layout.scaledScoreSlices(lane)));
+        maxExpGroup = std::max(
+            maxExpGroup, maxRegisterGroup(layout.expScoreSlices(lane)));
+        maxProbabilityGroup = std::max(maxProbabilityGroup,
+            maxRegisterGroup(layout.probabilitySlices(lane)));
+    }
+    const int64_t pass2Offset = op.getSeqLen()
+        + (op.getCausal() ? 4 : 3) + 2 * maxScaledGroup;
+    const int64_t pass3Offset = pass2Offset + op.getSeqLen()
+        + 4 + 2 * maxExpGroup;
+    const int64_t duration = pass3Offset + op.getSeqLen()
+        + 2 + maxProbabilityGroup;
     const int64_t hemisphereCount = target.memory().hemispheres;
     if (hemisphereCount != 2) return mlir::failure();
 

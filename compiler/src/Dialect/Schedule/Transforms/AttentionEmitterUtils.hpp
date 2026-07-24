@@ -19,7 +19,10 @@ void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
 void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t weightBuffer,
     int64_t weightColumn, int64_t activationStream, int64_t outputStream,
-    int64_t repeatCount, int64_t repeatInterval);
+    int64_t repeatCount, int64_t repeatInterval,
+    int64_t accumulatorAddress = 0, int64_t accumulatorRowStride = 1,
+    llvm::StringRef accumulatorDestination = "stream",
+    bool accumulatorClear = true);
 
 void emitSxm(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t hemisphere, llvm::StringRef opcode,
