@@ -81,6 +81,11 @@ add_library(ftlpu_compiler
     src/Dialect/Tensor/Transforms/SwigluToTensor.cpp
     src/Dialect/Stream/IR/StreamDialect.cpp
     src/Dialect/Stream/Analysis/StreamAllocator.cpp
+    src/Dialect/Stream/Analysis/StreamRoutePlan.cpp
+    src/Dialect/Stream/Transforms/AttentionToStream.cpp
+    src/Dialect/Stream/Transforms/FfnToStream.cpp
+    src/Dialect/Stream/Transforms/MatmulToStream.cpp
+    src/Dialect/Stream/Transforms/SwigluToStream.cpp
     src/Dialect/Stream/Transforms/TensorToStream.cpp
     src/Dialect/Schedule/IR/ScheduleDialect.cpp
     src/Dialect/Schedule/Analysis/AttentionWorkPlanner.cpp
@@ -198,6 +203,9 @@ add_test(NAME schedule_graph_test COMMAND $<TARGET_FILE:schedule_graph_test>)
 add_executable(schedule_plan_test tests/schedule_plan_test.cpp)
 target_link_libraries(schedule_plan_test PRIVATE ftlpu_compiler)
 add_test(NAME schedule_plan_test COMMAND $<TARGET_FILE:schedule_plan_test>)
+add_executable(stream_route_plan_test tests/stream_route_plan_test.cpp)
+target_link_libraries(stream_route_plan_test PRIVATE ftlpu_compiler)
+add_test(NAME stream_route_plan_test COMMAND $<TARGET_FILE:stream_route_plan_test>)
 add_executable(ffn_schedule_builders_test tests/ffn_schedule_builders_test.cpp)
 target_link_libraries(ffn_schedule_builders_test PRIVATE ftlpu_compiler)
 add_test(NAME ffn_schedule_builders_test COMMAND $<TARGET_FILE:ffn_schedule_builders_test>)

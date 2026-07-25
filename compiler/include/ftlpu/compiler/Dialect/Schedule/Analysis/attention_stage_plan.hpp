@@ -28,6 +28,17 @@ struct AttentionStagePlan {
     std::vector<AttentionProjectionWork> projection_work;
     std::vector<AttentionWorkWave> qk_waves;
     std::vector<AttentionWorkWave> pv_waves;
+    int64_t qk_iw_to_compute_cycles = 0;
+    int64_t qk_wave_interval = 0;
+    int64_t qk_wave_duration = 0;
+
+    int64_t qkEnd(int64_t start) const
+    {
+        if (qk_waves.empty()) return start;
+        return start
+            + static_cast<int64_t>(qk_waves.size() - 1) * qk_wave_interval
+            + qk_wave_duration;
+    }
 };
 
 class AttentionProjectionStagePlanner {

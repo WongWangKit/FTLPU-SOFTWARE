@@ -3,6 +3,7 @@
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <array>
@@ -66,6 +67,7 @@ struct ThroughputModel {
     int64_t mxm_result_streams = 4;
     int64_t mxm_pipeline_rows = 4;
     int64_t mxm_earliest_iw_cycle = 2;
+    int64_t qk_iw_to_compute_latency = 24;
     int64_t mxms_per_hemisphere = 2;
     int64_t mxm_weight_buffers = 2;
     int64_t vxm_alus = 16;
@@ -116,8 +118,21 @@ public:
     // target-specific routing outside MemoryTopology so it cannot alter ABI.
     const std::array<int64_t, 16>& attention_query_iw_slices(
         int64_t reduction_block) const;
+    llvm::SmallVector<int64_t> attention_weight_slices() const;
+    llvm::SmallVector<int64_t> attention_output_weight_slices() const;
+    llvm::SmallVector<int64_t> attention_activation_slices() const;
+    llvm::SmallVector<int64_t> attention_projection_output_slices() const;
+    llvm::SmallVector<int64_t> attention_value_slices() const;
+    llvm::SmallVector<int64_t> attention_rope_slices() const;
+    llvm::SmallVector<int64_t> attention_context_slices() const;
+    llvm::SmallVector<int64_t> attention_result_slices() const;
     int64_t attention_query_iw_base_row() const;
     int64_t attention_score_base_row() const;
+    int64_t attention_probability_pack_base_row() const;
+    int64_t attention_probability_diagonal_base_row() const;
+    int64_t attention_value_base_row() const;
+    int64_t attention_mask_base_row() const;
+    int64_t attention_context_base_row() const;
     bool supports_w8a16_ffn_shape(int64_t m, int64_t k,
         int64_t hidden, int64_t n) const;
     int64_t mxm_earliest_iw_cycle() const { return throughput_.mxm_earliest_iw_cycle; }

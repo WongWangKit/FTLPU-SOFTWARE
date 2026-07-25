@@ -146,6 +146,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_THROUGHPUT(mxm_result_streams);
     READ_THROUGHPUT(mxm_pipeline_rows);
     READ_THROUGHPUT(mxm_earliest_iw_cycle);
+    READ_THROUGHPUT(qk_iw_to_compute_latency);
     READ_THROUGHPUT(mxms_per_hemisphere);
     READ_THROUGHPUT(mxm_weight_buffers);
     READ_THROUGHPUT(vxm_alus);
@@ -222,6 +223,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_THROUGHPUT(mxm_result_streams);
     READ_THROUGHPUT(mxm_pipeline_rows);
     READ_THROUGHPUT(mxm_earliest_iw_cycle);
+    READ_THROUGHPUT(qk_iw_to_compute_latency);
     READ_THROUGHPUT(mxms_per_hemisphere);
     READ_THROUGHPUT(mxm_weight_buffers);
     READ_THROUGHPUT(vxm_alus);
@@ -304,6 +306,7 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(throughput_, mxm_result_streams),
         I64(throughput_, mxm_pipeline_rows),
         I64(throughput_, mxm_earliest_iw_cycle),
+        I64(throughput_, qk_iw_to_compute_latency),
         I64(throughput_, mxms_per_hemisphere),
         I64(throughput_, mxm_weight_buffers),
         I64(throughput_, vxm_alus),
@@ -345,7 +348,8 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             throughput_.mxm_load_streams_per_cycle,
             throughput_.mxm_activation_streams,
             throughput_.mxm_result_streams, throughput_.mxms_per_hemisphere,
-            throughput_.mxm_weight_buffers, throughput_.vxm_alus}))
+            throughput_.mxm_weight_buffers, throughput_.vxm_alus,
+            throughput_.qk_iw_to_compute_latency}))
         return fail("topology dimensions and throughput values must be positive");
     if (streams_.encoded_streams
         < 2 * streams_.streams_per_direction)
@@ -419,6 +423,7 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
     HASH(mxm_result_streams);
     HASH(mxm_pipeline_rows);
     HASH(mxm_earliest_iw_cycle);
+    HASH(qk_iw_to_compute_latency);
     HASH(mxms_per_hemisphere);
     HASH(mxm_weight_buffers);
     HASH(vxm_alus);
@@ -526,6 +531,69 @@ const std::array<int64_t, 16>& LPUTargetModel::attention_query_iw_slices(
     return kSlices[static_cast<std::size_t>(reduction_block)];
 }
 
+llvm::SmallVector<int64_t> LPUTargetModel::attention_weight_slices() const
+{
+    llvm::SmallVector<int64_t> slices;
+    for (int64_t index = 0; index < memory_.w8a16_weight_slice_count; ++index)
+        slices.push_back(index * memory_.w8a16_weight_slice_stride);
+    return slices;
+}
+
+llvm::SmallVector<int64_t>
+LPUTargetModel::attention_output_weight_slices() const
+{
+    llvm::SmallVector<int64_t> slices = attention_weight_slices();
+    // O-projection prefetch avoids the live context and softmax planes.
+    if (slices.size() >= 6) {
+        slices[4] = 2;
+        slices[5] = 18;
+    }
+    return slices;
+}
+
+llvm::SmallVector<int64_t>
+LPUTargetModel::attention_activation_slices() const
+{
+    llvm::SmallVector<int64_t> slices;
+    for (int64_t index = 0; index < throughput_.mxm_activation_streams; ++index)
+        slices.push_back(memory_.w8a16_activation_slice_base + index);
+    return slices;
+}
+
+llvm::SmallVector<int64_t>
+LPUTargetModel::attention_projection_output_slices() const
+{
+    llvm::SmallVector<int64_t> slices;
+    for (int64_t index = 0; index < throughput_.mxm_result_streams; ++index)
+        slices.push_back(index);
+    return slices;
+}
+
+llvm::SmallVector<int64_t> LPUTargetModel::attention_value_slices() const
+{
+    llvm::SmallVector<int64_t> slices;
+    for (int64_t block = 0; block < 2; ++block) {
+        const auto& block_slices = attention_query_iw_slices(block);
+        slices.append(block_slices.begin(), block_slices.end());
+    }
+    return slices;
+}
+
+llvm::SmallVector<int64_t> LPUTargetModel::attention_rope_slices() const
+{
+    return {4, 5, 6, 7};
+}
+
+llvm::SmallVector<int64_t> LPUTargetModel::attention_context_slices() const
+{
+    return {20, 21, 22, 23, 24, 25, 26, 27};
+}
+
+llvm::SmallVector<int64_t> LPUTargetModel::attention_result_slices() const
+{
+    return {28, 29, 30, 31};
+}
+
 int64_t LPUTargetModel::attention_query_iw_base_row() const
 {
     return 7600;
@@ -534,6 +602,31 @@ int64_t LPUTargetModel::attention_query_iw_base_row() const
 int64_t LPUTargetModel::attention_score_base_row() const
 {
     return 3000;
+}
+
+int64_t LPUTargetModel::attention_probability_pack_base_row() const
+{
+    return 6000;
+}
+
+int64_t LPUTargetModel::attention_probability_diagonal_base_row() const
+{
+    return 7000;
+}
+
+int64_t LPUTargetModel::attention_value_base_row() const
+{
+    return 7800;
+}
+
+int64_t LPUTargetModel::attention_mask_base_row() const
+{
+    return 8128;
+}
+
+int64_t LPUTargetModel::attention_context_base_row() const
+{
+    return 2000;
 }
 
 bool LPUTargetModel::supports_w8a16_ffn_shape(

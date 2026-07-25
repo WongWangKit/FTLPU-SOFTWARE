@@ -22,18 +22,15 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const auto attention_weight_rows = [&](int64_t columns) {
         const int64_t head_groups = (columns + 2 * head_dim - 1)
             / (2 * head_dim);
-        return head_groups * (hidden / tile) * 8;
+        return head_groups * (hidden / tile)
+            * target.throughput().lanes_per_tile;
     };
-    llvm::SmallVector<int64_t> weight_slices;
-    for (int64_t index = 0; index < target.memory().w8a16_weight_slice_count; ++index)
-        weight_slices.push_back(index * target.memory().w8a16_weight_slice_stride);
-    llvm::SmallVector<int64_t> output_weight_slices = weight_slices;
-    // Keep the prefetching O-projection weight lane off the context
-    // planes without overlapping softmax's live probability range.
-    output_weight_slices[4] = 2;
-    output_weight_slices[5] = 18;
-    const llvm::SmallVector<int64_t> activation_slices {32, 33, 34, 35};
-    const llvm::SmallVector<int64_t> output_slices {0, 1, 2, 3};
+    const auto weight_slices = target.attention_weight_slices();
+    const auto output_weight_slices =
+        target.attention_output_weight_slices();
+    const auto activation_slices = target.attention_activation_slices();
+    const auto output_slices =
+        target.attention_projection_output_slices();
     const int64_t q_weight_rows = attention_weight_rows(query_width);
     const int64_t k_weight_rows = attention_weight_rows(kv_width);
     const int64_t v_weight_rows = attention_weight_rows(kv_width);
@@ -61,7 +58,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     if (mlir::failed(physical_allocator.reserve({"probability_pack",
             llvm::SmallVector<int64_t, 16>(
             probability_pack_slices.begin(), probability_pack_slices.end()),
-            6000,
+            target.attention_probability_pack_base_row(),
             query_heads * blocks
                 * (seq_len
                     / target.throughput().lanes_per_tile),
@@ -86,17 +83,23 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     auto probability1 = allocate_scratch(
         "probability_mxm1", 2, 0, score_rows, 2, 5);
     auto score0 = allocate_scratch(
-        "score_mxm0", 4, 3000, score_rows, 2, 3);
+        "score_mxm0", 4, target.attention_score_base_row(),
+        score_rows, 2, 3);
     auto score1 = allocate_scratch(
-        "score_mxm1", 4, 3000, score_rows, 2, 3);
+        "score_mxm1", 4, target.attention_score_base_row(),
+        score_rows, 2, 3);
     auto exp0 = allocate_scratch(
-        "exp_mxm0", 4, 3000, score_rows, 2, 3);
+        "exp_mxm0", 4, target.attention_score_base_row(),
+        score_rows, 2, 3);
     auto exp1 = allocate_scratch(
-        "exp_mxm1", 4, 3000, score_rows, 2, 3);
+        "exp_mxm1", 4, target.attention_score_base_row(),
+        score_rows, 2, 3);
     auto mask0 = allocate_scratch(
-        "causal_mask_mxm0", 4, 8128, tile - 1, 2, 3);
+        "causal_mask_mxm0", 4, target.attention_mask_base_row(),
+        tile - 1, 2, 3);
     auto mask1 = allocate_scratch(
-        "causal_mask_mxm1", 4, 8128, tile - 1, 2, 3);
+        "causal_mask_mxm1", 4, target.attention_mask_base_row(),
+        tile - 1, 2, 3);
     if (mlir::failed(probability0) || mlir::failed(probability1)
         || mlir::failed(score0) || mlir::failed(score1)
         || mlir::failed(exp0) || mlir::failed(exp1)
@@ -119,50 +122,57 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             "w8a16_mxm_weight_striped", output_weight_slices, output_weight_base,
             o_weight_rows, "both")),
         rewriter.getNamedAttr("query", make_attention_placement(rewriter,
-            "fp16_query_iw", output_slices, 7600, query_rows, "both")),
+            "fp16_query_iw", output_slices,
+            target.attention_query_iw_base_row(), query_rows, "both")),
         rewriter.getNamedAttr("key", make_attention_placement(rewriter,
             "fp16_head_planar", output_slices, 0,
             kv_heads * seq_len, "both")),
         rewriter.getNamedAttr("value", make_attention_placement(rewriter,
-            "fp16_value_x16", llvm::ArrayRef<int64_t>({4, 5, 6, 7, 8, 9, 10, 11,
-                12, 13, 14, 15, 16, 17, 32, 33, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 34, 35}), 7800,
+            "fp16_value_x16", target.attention_value_slices(),
+            target.attention_value_base_row(),
             kv_heads * (head_dim / tile) * blocks
                 * target.throughput().tile_rows, "both")),
         rewriter.getNamedAttr("score", make_attention_placement(rewriter,
-            "fp16_score_block", score0->slices, 3000, score_rows, "both")),
+            "fp16_score_block", score0->slices,
+            target.attention_score_base_row(), score_rows, "both")),
         rewriter.getNamedAttr("score_mxm1", make_attention_placement(rewriter,
-            "fp16_score_block", score1->slices, 3000, score_rows, "both")),
+            "fp16_score_block", score1->slices,
+            target.attention_score_base_row(), score_rows, "both")),
         rewriter.getNamedAttr("exp", make_attention_placement(rewriter,
-            "fp16_score_block", exp0->slices, 3000, score_rows, "both")),
+            "fp16_score_block", exp0->slices,
+            target.attention_score_base_row(), score_rows, "both")),
         rewriter.getNamedAttr("exp_mxm1", make_attention_placement(rewriter,
-            "fp16_score_block", exp1->slices, 3000, score_rows, "both")),
+            "fp16_score_block", exp1->slices,
+            target.attention_score_base_row(), score_rows, "both")),
         rewriter.getNamedAttr("causal_mask", make_attention_placement(rewriter,
             "fp32_causal_mask_tile", mask0->slices,
-            8128, tile - 1, "both")),
+            target.attention_mask_base_row(), tile - 1, "both")),
         rewriter.getNamedAttr("causal_mask_mxm1", make_attention_placement(rewriter,
             "fp32_causal_mask_tile", mask1->slices,
-            8128, tile - 1, "both")),
+            target.attention_mask_base_row(), tile - 1, "both")),
         rewriter.getNamedAttr("probability", make_attention_placement(rewriter,
             "fp16_score_block", probability0->slices, 0, score_rows, "both")),
         rewriter.getNamedAttr("probability_mxm1", make_attention_placement(rewriter,
             "fp16_score_block", probability1->slices, 0, score_rows, "both")),
         rewriter.getNamedAttr("probability_pack", make_attention_placement(rewriter,
-            "fp16_probability_x16", target.attention_query_iw_slices(1), 6000,
+            "fp16_probability_x16", target.attention_query_iw_slices(1),
+            target.attention_probability_pack_base_row(),
             query_heads * blocks
                 * (seq_len / target.throughput().lanes_per_tile), "both")),
         rewriter.getNamedAttr("probability_diagonal", make_attention_placement(rewriter,
-            "fp16_probability_diagonal", target.attention_query_iw_slices(0), 7000,
+            "fp16_probability_diagonal", target.attention_query_iw_slices(0),
+            target.attention_probability_diagonal_base_row(),
             query_heads * blocks * blocks
                 * target.throughput().tile_rows, "both")),
         rewriter.getNamedAttr("rope", make_attention_placement(rewriter,
-            "fp16_rope_table", llvm::ArrayRef<int64_t>({4, 5, 6, 7}), 7000,
+            "fp16_rope_table", target.attention_rope_slices(),
+            target.attention_probability_diagonal_base_row(),
             seq_len, "both")),
         rewriter.getNamedAttr("context", make_attention_placement(rewriter,
-            "fp16_head_planar", llvm::ArrayRef<int64_t>({20, 21, 22, 23, 24, 25, 26, 27}),
-            2000, context_rows, "both")),
+            "fp16_head_planar", target.attention_context_slices(),
+            target.attention_context_base_row(), context_rows, "both")),
         rewriter.getNamedAttr("result", make_attention_placement(rewriter,
-            "fp16_pair_planar", llvm::ArrayRef<int64_t>({28, 29, 30, 31}), 0,
+            "fp16_pair_planar", target.attention_result_slices(), 0,
             seq_len * hidden / (tile * 2), "east")),
     });
     const auto config = rewriter.getDictionaryAttr({

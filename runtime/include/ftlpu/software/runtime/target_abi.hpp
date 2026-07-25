@@ -65,6 +65,7 @@ constexpr std::uint64_t lpu_32stream_target_abi()
     hash.add(4);
     hash.add(4);
     hash.add(2);
+    hash.add(24);
     hash.add(2);
     hash.add(2);
     hash.add(16);

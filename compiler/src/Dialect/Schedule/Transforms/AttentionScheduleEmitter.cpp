@@ -73,9 +73,6 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         return mlir::failure();
     }
     const int64_t tile = target_.throughput().mxm_rows;
-    const int64_t tokenBlocks = op_.getSeqLen() / tile;
-    const int64_t headBlocks = op_.getHeadDim() / tile;
-    const int64_t issue = target_.mxm_block_issue_interval();
 
     rewriter_.setInsertionPoint(op_.output);
     const auto memoryPlan = op_.getMemoryPlan();
@@ -112,23 +109,11 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         op_.emitError("computed a non-positive QKV duration");
         return mlir::failure();
     }
-    const int64_t qkWaveComputeCycles = tokenBlocks * headBlocks * issue;
-    const int64_t qkIwToComputeCycles = 24;
-    const int64_t qkFirstIwOffset = target_.throughput().mxm_earliest_iw_cycle
-        + *target_.transport_latency(target::StreamEndpoint::Mem,
-            target::StreamEndpoint::MxmWeight, target::StreamDirection::East, 0);
-    const int64_t qkFirstComputeOffset = qkFirstIwOffset + qkIwToComputeCycles;
-    const int64_t qkComputeEnd = qkFirstComputeOffset + qkWaveComputeCycles;
-    const int64_t qkWaveInterval = qkComputeEnd - qkFirstIwOffset;
-    const int64_t qkWaveDuration = qkComputeEnd
-        + std::max(target_.throughput().mxm0_accumulator_latency,
-            target_.throughput().mxm1_accumulator_latency);
     const int64_t qkStart = projectionEnd;
-    const int64_t qkEnd = qkStart
-        + (stagePlan.qk_waves.size() - 1) * qkWaveInterval
-        + qkWaveDuration;
+    const int64_t qkEnd = stagePlan.qkEnd(qkStart);
     const int64_t qkCycles = qkEnd - qkStart;
-    emitQk(qkStart, qkWaveInterval, qkIwToComputeCycles);
+    emitQk(qkStart, stagePlan.qk_wave_interval,
+        stagePlan.qk_iw_to_compute_cycles);
     const int64_t softmaxEnd = emitSoftmax(qkEnd);
     const int64_t softmaxCycles = softmaxEnd - qkEnd;
     const int64_t probabilityPackEnd = emitProbabilityPack(softmaxEnd);

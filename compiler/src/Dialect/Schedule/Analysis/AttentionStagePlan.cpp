@@ -1,5 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_stage_plan.hpp"
 
+#include <algorithm>
+
 namespace ftlpu::compiler::schedule {
 
 AttentionStagePlan planAttentionStages(AttentionStageShape shape,
@@ -18,6 +20,24 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
         target);
     result.qk_waves = workPlanner.qk_waves();
     result.pv_waves = workPlanner.pv_waves();
+    const int64_t tile = target.throughput().mxm_rows;
+    const int64_t tokenBlocks = shape.sequence_length / tile;
+    const int64_t headBlocks = shape.head_dim / tile;
+    const int64_t qkWaveComputeCycles = tokenBlocks * headBlocks
+        * target.mxm_block_issue_interval();
+    result.qk_iw_to_compute_cycles =
+        target.throughput().qk_iw_to_compute_latency;
+    const int64_t firstIwOffset =
+        target.throughput().mxm_earliest_iw_cycle
+        + *target.transport_latency(target::StreamEndpoint::Mem,
+            target::StreamEndpoint::MxmWeight,
+            target::StreamDirection::East, 0);
+    const int64_t computeEnd = firstIwOffset
+        + result.qk_iw_to_compute_cycles + qkWaveComputeCycles;
+    result.qk_wave_interval = computeEnd - firstIwOffset;
+    result.qk_wave_duration = computeEnd
+        + std::max(target.throughput().mxm0_accumulator_latency,
+            target.throughput().mxm1_accumulator_latency);
 
     result.task_ids.projection =
         AttentionProjectionStagePlanner().append(result.tasks, shape, target);

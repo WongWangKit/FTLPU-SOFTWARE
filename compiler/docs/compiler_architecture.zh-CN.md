@@ -156,6 +156,22 @@ memory plan 由 output projection 唯一持有；Schedule analysis 会在分配�
 cycle 前收集并校验完整图。公开 Stream IR 不再包含过时的 compound
 `ftlpu.stream.attention`。
 
+#### Tensor-to-Stream 实现结构
+
+`TensorToStream.cpp` 现在只作为 pass driver：收集经过校验的 task graph、
+持有共享 stream allocator、分派 lowering，并拒绝任何未处理的 Tensor task。
+具体生成逻辑分别位于 `AttentionToStream.cpp`、`FfnToStream.cpp`、
+`MatmulToStream.cpp` 和 `SwigluToStream.cpp`。
+
+Tensor 与 Stream Attention 共用模板化 graph view 和拓扑 matcher。两层包装
+只分别聚合物理 memory plan 或 route。Attention route lifetime 由
+`StreamRoutePlan` 生成，materializer 只分配计划中的 route 并生成 MLIR，
+不再内嵌第二份 lifetime 表。
+
+Attention 的物理 slice 集合和 SRAM row 通过 `LPUTargetModel` 布局策略接口
+选择。Lowering 代码不再携带字面量 slice 列表和 row 地址；weight geometry
+使用 target 配置中的 lane 与 MXM 参数。
+
 ### 调度计划与 IR 生成
 
 Stream-to-Schedule 已拆分为与 MLIR 无关的计划层和 MLIR 生成层。

@@ -176,6 +176,25 @@ collects and validates the complete graph before assigning exact cycles. The
 obsolete compound `ftlpu.stream.attention` operation is not part of public
 Stream IR.
 
+#### Tensor-to-Stream implementation layout
+
+`TensorToStream.cpp` is now only a pass driver: it collects validated task
+graphs, owns the shared stream allocator, dispatches lowerers, and rejects any
+unhandled Tensor task. Operation-specific materialization lives in
+`AttentionToStream.cpp`, `FfnToStream.cpp`, `MatmulToStream.cpp`, and
+`SwigluToStream.cpp`.
+
+Tensor and Stream Attention use the same templated graph view and topology
+matcher. Their layer-specific wrappers only aggregate physical memory plans or
+routes. Attention route lifetimes are produced by `StreamRoutePlan`; the
+materializer allocates those planned routes and emits MLIR without embedding a
+second lifetime table.
+
+Physical Attention slice sets and SRAM rows are selected through
+`LPUTargetModel` layout-policy methods. Lowering code no longer carries literal
+slice lists or row addresses, and weight geometry uses the configured lane and
+MXM parameters.
+
 ### Schedule planning and emission
 
 Stream-to-Schedule is split into a target-independent planning side and an
