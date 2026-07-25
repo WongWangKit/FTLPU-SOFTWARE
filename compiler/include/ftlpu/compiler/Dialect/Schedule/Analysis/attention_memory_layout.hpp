@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_task_graph.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -18,7 +18,7 @@ enum class AttentionProjectionKind : std::uint8_t {
 
 class AttentionMemoryLayout {
 public:
-    AttentionMemoryLayout(stream::AttentionOp op,
+    AttentionMemoryLayout(const AttentionTaskGraph& graph,
         const target::LPUTargetModel& target);
 
     int64_t weightAddress(AttentionProjectionKind projection, int64_t head,

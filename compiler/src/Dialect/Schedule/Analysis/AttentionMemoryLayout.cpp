@@ -4,7 +4,7 @@
 
 namespace ftlpu::compiler::schedule {
 
-AttentionMemoryLayout::AttentionMemoryLayout(stream::AttentionOp op,
+AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     const target::LPUTargetModel& target)
     : target_(target), seqLen_(op.getSeqLen()), hidden_(op.getHidden()),
       kvHeads_(op.getKvHeads())

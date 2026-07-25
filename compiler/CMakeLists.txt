@@ -70,6 +70,7 @@ add_library(ftlpu_compiler
     src/Dialect/Kernel/Transforms/StableHloToKernel.cpp
     src/Dialect/Kernel/Transforms/ComposeKernelPlans.cpp
     src/Dialect/Tensor/IR/TensorDialect.cpp
+    src/Dialect/Tensor/Analysis/AttentionTaskGraph.cpp
     src/Dialect/Tensor/Analysis/PhysicalMemoryAllocator.cpp
     src/Dialect/Tensor/Transforms/KernelToTensor.cpp
     src/Dialect/Stream/IR/StreamDialect.cpp
@@ -98,6 +99,7 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Analysis/ResourceScheduler.cpp
     src/Dialect/Schedule/Analysis/ScheduleGraph.cpp
     src/Dialect/Schedule/Analysis/SchedulePlan.cpp
+    src/Dialect/Schedule/Analysis/AttentionTaskGraph.cpp
     src/Dialect/Schedule/Analysis/AttentionMemoryLayout.cpp
     src/Dialect/Schedule/Transforms/AttentionEmitterUtils.cpp
     src/Dialect/Schedule/Transforms/AttentionOutputProjectionEmitter.cpp
@@ -304,6 +306,22 @@ if(Python3_Interpreter_FOUND)
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_attention/tensor/attention.tensor.mlir)
+    add_test(
+        NAME tensor_attention_graph_verifier_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/tensor_attention_graph_verifier_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/tensor_attention_incomplete.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/tensor_attention_graph_verifier/invalid.mlir)
+    add_test(
+        NAME smollm2_135m_attention_stablehlo_to_stream_ir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_attention_stream_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_attention/stream/attention.stream.mlir)
     add_test(
         NAME smollm2_135m_attention_stablehlo_to_schedule_ir_test
         COMMAND

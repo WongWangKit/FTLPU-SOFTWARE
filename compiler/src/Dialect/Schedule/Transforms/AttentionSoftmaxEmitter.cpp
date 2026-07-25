@@ -35,7 +35,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                          llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
                          llvm::StringRef castTarget, int64_t stream, int64_t hemisphere) {
         const char* hemi = hemisphere == 0 ? "east" : "west";
-        emitVxm(rewriter_, op_, op_.getInput(), cycle,
+        emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle,
             queue, opcode,
             lhsKind, lhsIndex, lhsImmediate, rhsKind, rhsIndex, rhsImmediate,
             castTarget, stream, hemi, hemi);
@@ -209,7 +209,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityPack(int64_t softmaxEnd)
                         work->hemisphere * target_.memory().slices_per_hemisphere + slice,
                         "read", layout.probabilityAddress(work->query_head,
                             work->query_block, key), 48 + byte, 1, 1, 0);
-                    emitVxm(rewriter_, op_, op_.getInput(), cycle, byte, "pass",
+                    emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle, byte, "pass",
                         "stream_i8", 48 + byte, 0.0f,
                         "immediate", 0, 0.0f, "i8", byte,
                         hemisphere, hemisphere);

@@ -174,17 +174,20 @@ def MemWriteOp : FTLPU_Schedule_Op<"mem_write"> {
   let hasVerifier = 1;
 }
 
-def AttentionOp : FTLPU_Schedule_Op<"attention", [Pure]> {
-  let summary = "Cycle-bounded grouped-query attention schedule";
-  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$query_weight,
-      AnyRankedTensor:$key_weight, AnyRankedTensor:$value_weight,
-      AnyRankedTensor:$output_weight,
-      I64Attr:$seq_len, I64Attr:$hidden, I64Attr:$query_heads,
-      I64Attr:$kv_heads, I64Attr:$head_dim, F32Attr:$rope_theta,
-      BoolAttr:$causal, DictionaryAttr:$memory_plan, ArrayAttr:$routes,
-      ArrayAttr:$phases, ArrayAttr:$work_waves);
-  let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$input `,` $query_weight `,` $key_weight `,` $value_weight `,` $output_weight attr-dict `:` functional-type(operands, results)";
+def BindingOp : FTLPU_Schedule_Op<"binding"> {
+  let summary = "Runtime-visible tensor or internal constant binding";
+  let arguments = (ins Variadic<AnyRankedTensor>:$source,
+      I64Attr:$index, StrAttr:$access, StrAttr:$role,
+      I64Attr:$bytes, DictionaryAttr:$placement);
+  let results = (outs AnyRankedTensor:$value);
+  let assemblyFormat = "$source attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def TimelineOp : FTLPU_Schedule_Op<"timeline"> {
+  let summary = "Named cycle interval retained for schedule inspection";
+  let arguments = (ins StrAttr:$name, I64Attr:$start, I64Attr:$end);
+  let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
 

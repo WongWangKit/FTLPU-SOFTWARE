@@ -105,14 +105,14 @@ std::array<int64_t, 32> blockDiagonalMap(int64_t diagonal,
     return map;
 }
 
-VxmOp emitVxm(mlir::IRRewriter& rewriter, stream::AttentionOp op,
+VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Value value, int64_t cycle, int64_t queue, llvm::StringRef opcode,
     llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
     llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
     llvm::StringRef castTarget, int64_t outputStream,
     llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere)
 {
-    mlir::OperationState state(op.getLoc(), VxmOp::getOperationName());
+    mlir::OperationState state(location, VxmOp::getOperationName());
     state.addOperands({value, value});
     state.addTypes(value.getType());
     state.addAttributes({

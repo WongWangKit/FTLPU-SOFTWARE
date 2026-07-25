@@ -9,9 +9,53 @@
 #include <vector>
 
 namespace ftlpu::compiler::schedule {
+namespace {
+
+int64_t elementTypeBytes(mlir::Type type)
+{
+    if (type.isInteger(8)) return 1;
+    if (type.isF16()) return 2;
+    if (type.isF32()) return 4;
+    return 0;
+}
+
+BindingOp createBinding(mlir::IRRewriter& rewriter, mlir::Location location,
+    mlir::ValueRange source, int64_t index, llvm::StringRef access,
+    llvm::StringRef role, mlir::RankedTensorType type,
+    mlir::DictionaryAttr placement)
+{
+    mlir::OperationState state(location, BindingOp::getOperationName());
+    state.addOperands(source);
+    state.addTypes(type);
+    state.addAttributes({
+        rewriter.getNamedAttr(
+            "index", rewriter.getI64IntegerAttr(index)),
+        rewriter.getNamedAttr(
+            "access", rewriter.getStringAttr(access)),
+        rewriter.getNamedAttr("role", rewriter.getStringAttr(role)),
+        rewriter.getNamedAttr("bytes", rewriter.getI64IntegerAttr(
+            type.getNumElements() * elementTypeBytes(type.getElementType()))),
+        rewriter.getNamedAttr("placement", placement),
+    });
+    return llvm::cast<BindingOp>(rewriter.create(state));
+}
+
+void createTimeline(mlir::IRRewriter& rewriter, mlir::Location location,
+    llvm::StringRef name, int64_t start, int64_t end)
+{
+    mlir::OperationState state(location, TimelineOp::getOperationName());
+    state.addAttributes({
+        rewriter.getNamedAttr("name", rewriter.getStringAttr(name)),
+        rewriter.getNamedAttr("start", rewriter.getI64IntegerAttr(start)),
+        rewriter.getNamedAttr("end", rewriter.getI64IntegerAttr(end)),
+    });
+    rewriter.create(state);
+}
+
+} // namespace
 
 AttentionScheduleEmitter::AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
-    stream::AttentionOp op, const target::LPUTargetModel& target,
+    AttentionTaskGraph op, const target::LPUTargetModel& target,
     AttentionStagePlan stagePlan)
     : rewriter_(rewriter)
     , op_(op)
@@ -20,7 +64,8 @@ AttentionScheduleEmitter::AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
 {
 }
 
-mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
+mlir::FailureOr<mlir::Value>
+AttentionScheduleEmitter::emit(int64_t outputIndex)
 {
     const AttentionStagePlan& stagePlan = stage_plan_;
     if (mlir::failed(stagePlan.tasks.validate())) {
@@ -32,7 +77,35 @@ mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
     const int64_t headBlocks = op_.getHeadDim() / tile;
     const int64_t issue = target_.mxm_block_issue_interval();
 
-    rewriter_.setInsertionPoint(op_);
+    rewriter_.setInsertionPoint(op_.output);
+    const auto memoryPlan = op_.getMemoryPlan();
+    const mlir::Value inputs[] = {op_.getInput(), op_.getQueryWeight(),
+        op_.getKeyWeight(), op_.getValueWeight(), op_.getOutputWeight()};
+    const char* placements[] = {"input", "query_weight", "key_weight",
+        "value_weight", "output_weight"};
+    for (std::size_t index = 0; index < std::size(inputs); ++index) {
+        const auto argument =
+            llvm::dyn_cast<mlir::BlockArgument>(inputs[index]);
+        if (!argument) {
+            op_.emitError("attention runtime input is not a block argument");
+            return mlir::failure();
+        }
+        createBinding(rewriter_, op_.getLoc(), inputs[index],
+            argument.getArgNumber(), "input",
+            index == 0 ? "activation" : "weight",
+            llvm::cast<mlir::RankedTensorType>(argument.getType()),
+            memoryPlan.getAs<mlir::DictionaryAttr>(placements[index]));
+    }
+    if (op_.getCausal()) {
+        const auto maskType = mlir::RankedTensorType::get(
+            {tile - 1, tile}, rewriter_.getF32Type());
+        for (const char* placement :
+            {"causal_mask", "causal_mask_mxm1"})
+            createBinding(rewriter_, op_.getLoc(), {}, 0, "internal",
+                "constant", maskType,
+                memoryPlan.getAs<mlir::DictionaryAttr>(placement));
+    }
+
     const int64_t projectionEnd = emitProjections();
     const int64_t qkvCycles = projectionEnd - 1;
     if (qkvCycles <= 0) {
@@ -65,28 +138,10 @@ mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
     const int64_t outputProjectionEnd = emitOutputProjection(pvEnd);
     const int64_t outputProjectionCycles = outputProjectionEnd - pvEnd;
 
-    llvm::SmallVector<mlir::Attribute> phases;
-    llvm::SmallVector<mlir::Attribute> workWaves;
-    llvm::SmallVector<mlir::Attribute> projectionWork;
-    for (const auto& work : stagePlan.projection_work) {
-        const char* name = work.projection == AttentionProjection::Query ? "query"
-            : work.projection == AttentionProjection::Key ? "key" : "value";
-        projectionWork.push_back(rewriter_.getDictionaryAttr({
-            rewriter_.getNamedAttr("projection", rewriter_.getStringAttr(name)),
-            rewriter_.getNamedAttr("head_group", rewriter_.getI64IntegerAttr(work.head_group)),
-            rewriter_.getNamedAttr("reduction_block", rewriter_.getI64IntegerAttr(work.reduction_block)),
-            rewriter_.getNamedAttr("token_block", rewriter_.getI64IntegerAttr(work.token_block)),
-            rewriter_.getNamedAttr("hemisphere", rewriter_.getI64IntegerAttr(work.hemisphere)),
-            rewriter_.getNamedAttr("final_reduction", rewriter_.getBoolAttr(work.final_reduction)),
-        }));
-    }
     int64_t cycle = 0;
     const auto appendPhase = [&](llvm::StringRef name, int64_t duration) {
-        phases.push_back(rewriter_.getDictionaryAttr({
-            rewriter_.getNamedAttr("name", rewriter_.getStringAttr(name)),
-            rewriter_.getNamedAttr("start", rewriter_.getI64IntegerAttr(cycle)),
-            rewriter_.getNamedAttr("end", rewriter_.getI64IntegerAttr(cycle + duration)),
-        }));
+        createTimeline(
+            rewriter_, op_.getLoc(), name, cycle, cycle + duration);
         cycle += duration;
     };
     appendPhase("qkv", qkvCycles);
@@ -95,58 +150,20 @@ mlir::FailureOr<AttentionOp> AttentionScheduleEmitter::emit()
     appendPhase("softmax", softmaxCycles);
     appendPhase("pv", pvCycles);
     appendPhase("o_proj", outputProjectionCycles);
-    const int64_t pvStart = probabilityTransposeEnd;
-    const auto appendWaves = [&](llvm::StringRef phaseName,
-        const std::vector<AttentionWorkWave>& waves, int64_t start,
-        int64_t interval, int64_t duration) {
-        for (std::size_t index = 0; index < waves.size(); ++index) {
-            llvm::SmallVector<mlir::Attribute> slots;
-            for (const auto& work : waves[index].slots) {
-                if (!work) continue;
-                slots.push_back(rewriter_.getDictionaryAttr({
-                    rewriter_.getNamedAttr("query_head", rewriter_.getI64IntegerAttr(work->query_head)),
-                    rewriter_.getNamedAttr("kv_head", rewriter_.getI64IntegerAttr(work->kv_head)),
-                    rewriter_.getNamedAttr("query_block", rewriter_.getI64IntegerAttr(work->query_block)),
-                    rewriter_.getNamedAttr("hemisphere", rewriter_.getI64IntegerAttr(work->hemisphere)),
-                    rewriter_.getNamedAttr("local_mxm", rewriter_.getI64IntegerAttr(work->local_mxm)),
-                }));
-            }
-            const int64_t waveStart = start + static_cast<int64_t>(index) * interval;
-            workWaves.push_back(rewriter_.getDictionaryAttr({
-                rewriter_.getNamedAttr("phase", rewriter_.getStringAttr(phaseName)),
-                rewriter_.getNamedAttr("index", rewriter_.getI64IntegerAttr(index)),
-                rewriter_.getNamedAttr("start", rewriter_.getI64IntegerAttr(waveStart)),
-                rewriter_.getNamedAttr("end", rewriter_.getI64IntegerAttr(waveStart + duration)),
-                rewriter_.getNamedAttr("slots", rewriter_.getArrayAttr(slots)),
-            }));
-        }
-    };
-    appendWaves("qk", stagePlan.qk_waves, qkStart,
-        qkWaveInterval, qkWaveDuration);
-    appendWaves("pv", stagePlan.pv_waves, pvStart,
-        qkWaveComputeCycles, qkWaveComputeCycles);
-    mlir::OperationState state(op_.getLoc(), AttentionOp::getOperationName());
-    state.addOperands(op_->getOperands());
-    state.addTypes(op_.getResult().getType());
-    for (llvm::StringRef name : {"seq_len", "hidden", "query_heads", "kv_heads",
-             "head_dim", "rope_theta", "causal", "memory_plan", "routes"})
-        state.addAttribute(name, op_->getAttr(name));
-    state.addAttribute("phases", rewriter_.getArrayAttr(phases));
-    state.addAttribute("work_waves", rewriter_.getArrayAttr(workWaves));
-    state.addAttribute("projection_work", rewriter_.getArrayAttr(projectionWork));
-    return llvm::cast<AttentionOp>(rewriter_.create(state));
+    auto outputBinding = createBinding(rewriter_, op_.getLoc(), {},
+        outputIndex, "output", "result",
+        llvm::cast<mlir::RankedTensorType>(op_.getResult().getType()),
+        memoryPlan.getAs<mlir::DictionaryAttr>("result"));
+    return outputBinding.getValue();
 }
 
 mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target)
 {
-    llvm::SmallVector<stream::AttentionOp> operations;
-    for (mlir::Operation& operation : function.getBody().front()) {
-        if (operation.getName().getStringRef()
-            == stream::AttentionOp::getOperationName())
-            operations.emplace_back(&operation);
-    }
-    for (stream::AttentionOp operation : operations) {
+    auto graphs = collectAttentionTaskGraphs(function);
+    if (mlir::failed(graphs)) return mlir::failure();
+    int64_t outputIndex = 0;
+    for (AttentionTaskGraph operation : *graphs) {
         AttentionStagePlan stagePlan = planAttentionStages(
             {static_cast<int64_t>(operation.getSeqLen()),
                 static_cast<int64_t>(operation.getHidden()),
@@ -160,9 +177,19 @@ mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
         }
         AttentionScheduleEmitter emitter(
             rewriter, operation, target, std::move(stagePlan));
-        auto lowered = emitter.emit();
+        auto lowered = emitter.emit(outputIndex++);
         if (mlir::failed(lowered)) return mlir::failure();
-        rewriter.replaceOp(operation, lowered->getResult());
+        rewriter.replaceOp(operation.output, *lowered);
+        rewriter.eraseOp(operation.pv);
+        rewriter.eraseOp(operation.probability_transpose);
+        rewriter.eraseOp(operation.value_transpose);
+        rewriter.eraseOp(operation.softmax);
+        rewriter.eraseOp(operation.qk);
+        rewriter.eraseOp(operation.query_rope);
+        rewriter.eraseOp(operation.key_rope);
+        rewriter.eraseOp(operation.query);
+        rewriter.eraseOp(operation.key);
+        rewriter.eraseOp(operation.value);
     }
     return mlir::success();
 }

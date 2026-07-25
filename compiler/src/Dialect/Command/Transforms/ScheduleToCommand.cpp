@@ -198,7 +198,8 @@ public:
         llvm::SmallVector<schedule::SxmOp> sxms;
         llvm::SmallVector<schedule::MemTransferOp> mem_transfers;
         llvm::SmallVector<schedule::MxmIssueOp> mxm_issues;
-        llvm::SmallVector<schedule::AttentionOp> attention_schedules;
+        llvm::SmallVector<schedule::BindingOp> bindings;
+        llvm::SmallVector<schedule::TimelineOp> timelines;
         llvm::SmallVector<schedule::MemWriteOp> writes;
         llvm::SmallVector<schedule::MemAccumulateOp> accumulates;
         llvm::SmallVector<mlir::Operation*> schedule_operations;
@@ -234,7 +235,14 @@ public:
             mxm_issues.push_back(op);
             schedule_operations.push_back(op);
         });
-        function.walk([&](schedule::AttentionOp op) { attention_schedules.push_back(op); });
+        function.walk([&](schedule::BindingOp op) {
+            bindings.push_back(op);
+            schedule_operations.push_back(op);
+        });
+        function.walk([&](schedule::TimelineOp op) {
+            timelines.push_back(op);
+            schedule_operations.push_back(op);
+        });
         function.walk([&](schedule::MemWriteOp op) {
             writes.push_back(op);
             schedule_operations.push_back(op);
@@ -253,35 +261,15 @@ public:
         mlir::OpBuilder builder(&getContext());
         builder.setInsertionPointToStart(&function.getBody().front());
         llvm::SmallDenseSet<unsigned> bound_inputs;
-        bool causal_mask_bound = false;
-        for (schedule::AttentionOp attention : attention_schedules) {
-            const mlir::Value inputs[] = {attention.getInput(), attention.getQueryWeight(),
-                attention.getKeyWeight(), attention.getValueWeight(), attention.getOutputWeight()};
-            const char* placements[] = {"input", "query_weight", "key_weight",
-                "value_weight", "output_weight"};
-            for (unsigned index = 0; index < std::size(inputs); ++index) {
-                auto argument = llvm::dyn_cast<mlir::BlockArgument>(inputs[index]);
-                if (!argument || !bound_inputs.insert(argument.getArgNumber()).second) continue;
-                auto type = llvm::cast<mlir::RankedTensorType>(argument.getType());
-                create_binding(builder, attention.getLoc(), argument.getArgNumber(), "input",
-                    index == 0 ? "activation" : "weight", type,
-                    type.getNumElements() * element_type_bytes(type.getElementType()),
-                    attention.getMemoryPlan().getAs<mlir::DictionaryAttr>(placements[index]));
-            }
-            auto result_type = llvm::cast<mlir::RankedTensorType>(attention.getResult().getType());
-            create_binding(builder, attention.getLoc(), 0, "output", "result", result_type,
-                result_type.getNumElements() * element_type_bytes(result_type.getElementType()),
-                attention.getMemoryPlan().getAs<mlir::DictionaryAttr>("result"));
-            if (attention.getCausal() && !causal_mask_bound) {
-                const int64_t tile = target.throughput().mxm_rows;
-                auto mask_type = mlir::RankedTensorType::get(
-                    {tile - 1, tile}, builder.getF32Type());
-                for (const char* placement : {"causal_mask", "causal_mask_mxm1"})
-                    create_binding(builder, attention.getLoc(), 0, "internal", "constant",
-                        mask_type, mask_type.getNumElements() * 4,
-                        attention.getMemoryPlan().getAs<mlir::DictionaryAttr>(placement));
-                causal_mask_bound = true;
-            }
+        for (schedule::BindingOp binding : bindings) {
+            if (binding.getAccess() == "input"
+                && !bound_inputs.insert(binding.getIndex()).second)
+                continue;
+            auto type = llvm::cast<mlir::RankedTensorType>(
+                binding.getValue().getType());
+            create_binding(builder, binding.getLoc(), binding.getIndex(),
+                binding.getAccess(), binding.getRole(), type,
+                binding.getBytes(), binding.getPlacement());
         }
         for (schedule::MemReadOp read : reads) {
             auto argument = llvm::dyn_cast<mlir::BlockArgument>(read.getInput());
@@ -480,12 +468,11 @@ public:
                     schedule::MxmAccumulatorReadOp, schedule::VxmOp,
                     schedule::SxmOp,
                     schedule::MemTransferOp, schedule::MxmIssueOp,
-                    schedule::MemAccumulateOp, schedule::MemWriteOp>(op))
+                    schedule::MemAccumulateOp, schedule::MemWriteOp,
+                    schedule::BindingOp, schedule::TimelineOp>(op))
                 ordered_schedule_ops.push_back(op);
         });
         for (auto it = ordered_schedule_ops.rbegin(); it != ordered_schedule_ops.rend(); ++it)
-            (*it)->erase();
-        for (auto it = attention_schedules.rbegin(); it != attention_schedules.rend(); ++it)
             (*it)->erase();
         llvm::SmallVector<mlir::Operation*> dead_stream_ops;
         function.walk([&](mlir::Operation* op) {

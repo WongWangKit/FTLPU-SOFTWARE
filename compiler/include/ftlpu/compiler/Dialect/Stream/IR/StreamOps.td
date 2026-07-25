@@ -147,15 +147,48 @@ def SwigluOp : FTLPU_Stream_Op<"swiglu", [Pure]> {
   let hasVerifier = 1;
 }
 
-def AttentionOp : FTLPU_Stream_Op<"attention", [Pure]> {
-  let summary = "Grouped-query attention with allocated inter-unit stream routes";
-  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$query_weight,
-      AnyRankedTensor:$key_weight, AnyRankedTensor:$value_weight,
-      AnyRankedTensor:$output_weight,
-      I64Attr:$seq_len, I64Attr:$hidden, I64Attr:$query_heads,
-      I64Attr:$kv_heads, I64Attr:$head_dim, F32Attr:$rope_theta,
-      BoolAttr:$causal, DictionaryAttr:$memory_plan, ArrayAttr:$routes);
+def ProjectionTaskOp : FTLPU_Stream_Op<"projection_task", [Pure]> {
+  let summary = "Matrix projection task in a primitive stream graph";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      StrAttr:$kind, DictionaryAttr:$config,
+      OptionalAttr<DictionaryAttr>:$memory_plan, ArrayAttr:$routes);
   let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$input `,` $query_weight `,` $key_weight `,` $value_weight `,` $output_weight attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$input `,` $weight attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def RopeTaskOp : FTLPU_Stream_Op<"rope_task", [Pure]> {
+  let summary = "Rotary-position embedding task";
+  let arguments = (ins AnyRankedTensor:$input, StrAttr:$kind,
+      DictionaryAttr:$config, ArrayAttr:$routes);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def BatchMatmulTaskOp : FTLPU_Stream_Op<"batch_matmul_task", [Pure]> {
+  let summary = "Batched matrix multiplication task";
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+      StrAttr:$kind, DictionaryAttr:$config, ArrayAttr:$routes);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def SoftmaxTaskOp : FTLPU_Stream_Op<"softmax_task", [Pure]> {
+  let summary = "Numerically stable row-wise softmax task";
+  let arguments = (ins AnyRankedTensor:$input, DictionaryAttr:$config,
+      ArrayAttr:$routes);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def TransposeTaskOp : FTLPU_Stream_Op<"transpose_task", [Pure]> {
+  let summary = "SXM transpose and permutation task";
+  let arguments = (ins AnyRankedTensor:$input, StrAttr:$kind,
+      DictionaryAttr:$config, ArrayAttr:$routes);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }

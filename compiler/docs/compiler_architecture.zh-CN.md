@@ -81,6 +81,13 @@ elementwise 的结果带有东西半球两份 allocation，down projection 同�
 hidden 存储。地址、placement、字节数和量化参数由实际使用它们的 primitive op
 携带，不再隐藏在单个 `ftlpu.tensor.ffn` 中。
 
+Attention 在 Tensor 层同样表示为 primitive SSA 图。Query、key、value 和 output
+projection 使用 `projection_task`；RoPE、QK/PV batch matmul、softmax，以及
+probability/value transpose 都是独立 task。物理 memory plan 被拆成互不重叠的
+task-local dictionary，21 个具名 buffer 各自只有一个 owner。Tensor-to-Stream
+会校验完整 producer graph，并在分配 route 时重建只读的聚合视图。过时的
+compound `ftlpu.tensor.attention` 已删除。
+
 ### FTLPU Stream IR
 
 Stream IR 将 MEM 中的 tensor tile 映射到 LPU stream：
@@ -119,6 +126,15 @@ allocation。每个 matmul task 都显式记录 MXM unit、weight buffer 和 res
 stream range。当前 Stream-to-Schedule 会在内部把该图整理为已有 scheduler
 descriptor，但 StableHLO-to-Stream pipeline 不会输出 compound FFN op。
 
+Attention 同样表示为 SSA 连接的 primitive 图：query/key/value
+`projection_task` 连接两个 `rope_task`，随后依次连接 QK
+`batch_matmul_task`、`softmax_task`、probability/value `transpose_task`、PV
+`batch_matmul_task` 和 output `projection_task`。每条 route 只挂在实际拥有该
+传输的 task 上，不再把一份全局 route 数组复制到每个 projection。共享的物理
+memory plan 由 output projection 唯一持有；Schedule analysis 会在分配精确
+cycle 前收集并校验完整图。公开 Stream IR 不再包含过时的 compound
+`ftlpu.stream.attention`。
+
 ### 调度计划与 IR 生成
 
 Stream-to-Schedule 已拆分为与 MLIR 无关的计划层和 MLIR 生成层。
@@ -144,8 +160,8 @@ dequant 和临时 MEM 流量来安排 VXM/MEM 资源窗口，FFN MLIR emitter �
 reduction block、weight ping-pong buffer、M tile compute cycle，以及预取下一
 块权重时使用的 activation stream segment。这些 timeline 全部从
 `LPUTargetModel` 推导；修改 tile、lane、MXM、半球或 stream 数量不需要修改
-emitter。过时的
-compound `ftlpu.stream.ffn` 已删除；公开 Stream IR 只保留 primitive task 和
+emitter。过时的 compound `ftlpu.stream.ffn` 和
+`ftlpu.stream.attention` 已删除；公开 Stream IR 只保留 primitive task 和
 route op。
 
 ### LPU Target Model
@@ -191,6 +207,14 @@ stream、选定 MXM unit 的 load/compute queue 及选定 weight buffer。
 `mxm_load` 和 `mxm_compute` 显式保留两个 id。Producer 与 consumer window
 之间计入固定 transport latency，SSA consumer 不能在 producer MEM write
 完成之前读取数据。
+
+Attention 不再生成 compound `ftlpu.schedule.attention`。它的硬件程序只包含与
+其他 workload 共用的 MEM/MXM/VXM/SXM primitive schedule op。通用
+`ftlpu.schedule.binding` 保存 runtime 可见的输入、输出和内部常量；
+`ftlpu.schedule.timeline` 保存六个具名阶段区间，用于检查和可视化。
+Schedule-to-Command 统一翻译 binding，不再包含 Attention 特判。更细的
+projection 与 QK/PV work-wave plan 保留为 compiler analysis 对象，并由 planner
+单元测试覆盖，不再复制进可执行 IR。
 
 当前 320x320 int8 GEMM 的 CModel 对齐基线为：weight MEM read 根据 MEM 边界
 从 cycle 5..8 启动；IW 在 `[18,38)` 运行；`E16` activation MEM Read 在

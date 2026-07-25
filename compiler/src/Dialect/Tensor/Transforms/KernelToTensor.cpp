@@ -493,10 +493,7 @@ public:
                     "fp16_pair_planar", llvm::ArrayRef<int64_t>({28, 29, 30, 31}), 0,
                     op.getSeqLen() * op.getHidden() / (tile * 2), "east")),
             });
-            mlir::OperationState state(op.getLoc(), tensor::AttentionOp::getOperationName());
-            state.addOperands(op->getOperands());
-            state.addTypes(op.getResult().getType());
-            state.addAttributes({
+            const auto config = rewriter.getDictionaryAttr({
                 rewriter.getNamedAttr("seq_len", op.getSeqLenAttr()),
                 rewriter.getNamedAttr("hidden", op.getHiddenAttr()),
                 rewriter.getNamedAttr("query_heads", op.getQueryHeadsAttr()),
@@ -504,10 +501,118 @@ public:
                 rewriter.getNamedAttr("head_dim", op.getHeadDimAttr()),
                 rewriter.getNamedAttr("rope_theta", op.getRopeThetaAttr()),
                 rewriter.getNamedAttr("causal", op.getCausalAttr()),
-                rewriter.getNamedAttr("memory_plan", plan),
             });
-            auto lowered = llvm::cast<tensor::AttentionOp>(rewriter.create(state));
-            rewriter.replaceOp(op, lowered.getResult());
+            const auto subplan =
+                [&](std::initializer_list<llvm::StringRef> names) {
+                    llvm::SmallVector<mlir::NamedAttribute> entries;
+                    for (llvm::StringRef name : names)
+                        entries.push_back(rewriter.getNamedAttr(
+                            name, plan.get(name)));
+                    return rewriter.getDictionaryAttr(entries);
+                };
+            const auto emptyPlan = rewriter.getDictionaryAttr({});
+            const auto elementType =
+                llvm::cast<mlir::RankedTensorType>(op.getInput().getType())
+                    .getElementType();
+            const auto matrixType = [&](int64_t rows, int64_t columns) {
+                return mlir::RankedTensorType::get(
+                    {rows, columns}, elementType);
+            };
+            const auto scoreType = mlir::RankedTensorType::get(
+                {static_cast<int64_t>(op.getQueryHeads()),
+                    static_cast<int64_t>(op.getSeqLen()),
+                    static_cast<int64_t>(op.getSeqLen())},
+                elementType);
+            const auto createProjection =
+                [&](mlir::Value input, mlir::Value weight,
+                    llvm::StringRef kind, mlir::Type resultType,
+                    mlir::DictionaryAttr memoryPlan) {
+                    mlir::OperationState state(
+                        op.getLoc(),
+                        tensor::ProjectionTaskOp::getOperationName());
+                    state.addOperands({input, weight});
+                    state.addTypes(resultType);
+                    state.addAttributes({
+                        rewriter.getNamedAttr(
+                            "kind", rewriter.getStringAttr(kind)),
+                        rewriter.getNamedAttr("config", config),
+                        rewriter.getNamedAttr("memory_plan", memoryPlan),
+                    });
+                    return llvm::cast<tensor::ProjectionTaskOp>(
+                        rewriter.create(state));
+                };
+            const auto createUnary =
+                [&](llvm::StringRef operationName, mlir::Value input,
+                    llvm::StringRef kind, mlir::Type resultType,
+                    mlir::DictionaryAttr memoryPlan) {
+                    mlir::OperationState state(op.getLoc(), operationName);
+                    state.addOperands(input);
+                    state.addTypes(resultType);
+                    state.addAttribute("config", config);
+                    state.addAttribute("memory_plan", memoryPlan);
+                    if (!kind.empty())
+                        state.addAttribute(
+                            "kind", rewriter.getStringAttr(kind));
+                    return rewriter.create(state)->getResult(0);
+                };
+            const auto createBatchMatmul =
+                [&](mlir::Value lhs, mlir::Value rhs,
+                    llvm::StringRef kind, mlir::Type resultType,
+                    mlir::DictionaryAttr memoryPlan) {
+                    mlir::OperationState state(
+                        op.getLoc(),
+                        tensor::BatchMatmulTaskOp::getOperationName());
+                    state.addOperands({lhs, rhs});
+                    state.addTypes(resultType);
+                    state.addAttributes({
+                        rewriter.getNamedAttr(
+                            "kind", rewriter.getStringAttr(kind)),
+                        rewriter.getNamedAttr("config", config),
+                        rewriter.getNamedAttr("memory_plan", memoryPlan),
+                    });
+                    return llvm::cast<tensor::BatchMatmulTaskOp>(
+                        rewriter.create(state));
+                };
+
+            auto query = createProjection(op.getInput(), op.getQueryWeight(),
+                "query", matrixType(op.getSeqLen(), query_width),
+                subplan({"input", "query_weight", "query"}));
+            auto key = createProjection(op.getInput(), op.getKeyWeight(),
+                "key", matrixType(op.getSeqLen(), kv_width),
+                subplan({"key_weight", "key"}));
+            auto value = createProjection(op.getInput(), op.getValueWeight(),
+                "value", matrixType(op.getSeqLen(), kv_width),
+                subplan({"value_weight", "value"}));
+            const mlir::Value rotatedQuery = createUnary(
+                tensor::RopeTaskOp::getOperationName(), query.getResult(),
+                "query", query.getResult().getType(), subplan({"rope"}));
+            const mlir::Value rotatedKey = createUnary(
+                tensor::RopeTaskOp::getOperationName(), key.getResult(),
+                "key", key.getResult().getType(), emptyPlan);
+            auto qk = createBatchMatmul(
+                rotatedQuery, rotatedKey, "qk", scoreType,
+                subplan({"score", "score_mxm1"}));
+            const mlir::Value probability = createUnary(
+                tensor::SoftmaxTaskOp::getOperationName(), qk.getResult(),
+                "", scoreType,
+                subplan({"exp", "exp_mxm1", "causal_mask",
+                    "causal_mask_mxm1", "probability", "probability_mxm1",
+                    "probability_pack", "probability_diagonal"}));
+            const mlir::Value transposedProbability = createUnary(
+                tensor::TransposeTaskOp::getOperationName(), probability,
+                "probability", scoreType, emptyPlan);
+            const mlir::Value transposedValue = createUnary(
+                tensor::TransposeTaskOp::getOperationName(),
+                value.getResult(), "value", value.getResult().getType(),
+                emptyPlan);
+            auto pv = createBatchMatmul(
+                transposedProbability, transposedValue, "pv",
+                matrixType(op.getSeqLen(), query_width),
+                subplan({"context"}));
+            auto output = createProjection(pv.getResult(),
+                op.getOutputWeight(), "output", op.getResult().getType(),
+                subplan({"output_weight", "result"}));
+            rewriter.replaceOp(op, output.getResult());
         }
         for (kernel::FfnOp op : ffns) {
             const bool w8a16 = is_w8a16_ffn(op, target);

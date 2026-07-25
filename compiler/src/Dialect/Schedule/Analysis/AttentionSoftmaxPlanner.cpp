@@ -12,7 +12,8 @@
 namespace ftlpu::compiler::schedule {
 
 mlir::FailureOr<AttentionSoftmaxSchedule> planAttentionSoftmax(
-    stream::AttentionOp op, const std::vector<AttentionWorkWave>& waves,
+    const AttentionTaskGraph& op,
+    const std::vector<AttentionWorkWave>& waves,
     int64_t qkEnd, const target::LPUTargetModel& target)
 {
     const AttentionMemoryLayout layout(op, target);

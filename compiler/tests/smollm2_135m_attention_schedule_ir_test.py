@@ -20,25 +20,24 @@ def main() -> None:
     ], check=True)
     text = args.output.read_text(encoding="utf-8")
     required = (
-        "ftlpu.schedule.attention",
+        "ftlpu.schedule.binding",
+        "ftlpu.schedule.timeline",
         'name = "qkv"',
         'name = "rope"',
         'name = "qk"',
         'name = "softmax"',
         'name = "pv"',
         'name = "o_proj"',
-        "work_waves =",
-        "projection_work =",
-        'projection = "query"',
-        'projection = "key"',
-        'projection = "value"',
-        'phase = "qk"',
-        'phase = "pv"',
-        "query_head = 0 : i64",
-        "kv_head = 0 : i64",
-        "base_row = 7600 : i64",
-        "query_weight_dequant",
-        "output_weight_dequant",
+        'access = "input"',
+        'access = "output"',
+        'access = "internal"',
+        'role = "activation"',
+        'role = "weight"',
+        'role = "result"',
+        'role = "constant"',
+        "address = 7600 : i64",
+        "address = 7800 : i64",
+        "address = 1296 : i64",
         'opcode = "max"',
         'opcode = "exp"',
         'opcode = "divide"',
@@ -62,6 +61,12 @@ def main() -> None:
     missing = [item for item in required if item not in text]
     if missing:
         raise AssertionError(f"Attention Schedule IR is missing: {missing}")
+    if "ftlpu.schedule.attention" in text:
+        raise AssertionError("Attention Schedule IR still contains its compound op")
+    if text.count("ftlpu.schedule.binding") != 8:
+        raise AssertionError("Attention Schedule IR must expose eight generic bindings")
+    if text.count("ftlpu.schedule.timeline") != 6:
+        raise AssertionError("Attention Schedule IR must expose six phase timelines")
     if 'opcode = "accumulate"' in text:
         raise AssertionError("attention schedule still uses legacy MEM accumulator commands")
     if text.count("ftlpu.schedule.mem_transfer") != 217662:
@@ -94,7 +99,8 @@ def main() -> None:
     phase_matches = {
         name: (int(start), int(end))
         for end, name, start in re.findall(
-            r'\{end = (\d+) : i64, name = "([^"]+)", start = (\d+) : i64\}',
+            r'ftlpu\.schedule\.timeline \{end = (\d+) : i64, '
+            r'name = "([^"]+)", start = (\d+) : i64\}',
             text,
         )
     }

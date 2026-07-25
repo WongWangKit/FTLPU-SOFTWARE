@@ -33,10 +33,10 @@ int64_t AttentionScheduleEmitter::emitProjections()
                                  int64_t localMxm, mlir::Value weight) {
         const char* hemi = hemisphere == 0 ? "east" : "west";
         for (int64_t lane = 0; lane < target_.throughput().lanes_per_tile; ++lane) {
-            emitVxm(rewriter_, op_, weight, cycle, lane, "multiply",
+            emitVxm(rewriter_, op_.getLoc(), weight, cycle, lane, "multiply",
                 "stream_i8", 32 + lane, 0.0f, "immediate", 0, 1.0f,
                 "fp32", -1, hemi, hemi);
-            emitVxm(rewriter_, op_, weight, cycle + 1, 8 + lane, "cast",
+            emitVxm(rewriter_, op_.getLoc(), weight, cycle + 1, 8 + lane, "cast",
                 "alu", lane, 0.0f, "immediate", 0, 0.0f,
                 "fp16", localMxm * 16 + lane * 2, hemi, hemi);
         }
@@ -44,7 +44,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
     const auto emitRopeOrCast = [&](int64_t cycle, int64_t hemisphere,
                                     bool rope, mlir::Value value) {
         attention_detail::emitRopeOrCast(
-            rewriter_, op_, target_, cycle, hemisphere, rope, value);
+            rewriter_, op_.getLoc(), target_, cycle, hemisphere, rope, value);
     };
 
     const int64_t weightLoadLead =

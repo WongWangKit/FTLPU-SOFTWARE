@@ -170,22 +170,22 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                         queryBlock * tile + offset),
                                     1, "sram", true);
                             }
-                            emitVxm(rewriter_, op_, op_.getInput(), cycle, aluBase,
+                            emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle, aluBase,
                                 "pass", "stream_f32", 32, 0.0f, "immediate", 0, 0.0f,
                                 "fp16", contextOutputStreamBase,
                                 hemisphere == 0 ? "east" : "west",
                                 hemisphere == 0 ? "east" : "west");
-                            emitVxm(rewriter_, op_, op_.getInput(), cycle, aluBase + 1,
+                            emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle, aluBase + 1,
                                 "pass", "stream_f32", 36, 0.0f, "immediate", 0, 0.0f,
                                 "fp16", contextOutputStreamBase + 2,
                                 hemisphere == 0 ? "east" : "west",
                                 hemisphere == 0 ? "east" : "west");
-                            emitVxm(rewriter_, op_, op_.getInput(), cycle + 1, aluBase + 2,
+                            emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle + 1, aluBase + 2,
                                 "pass", "alu", aluBase, 0.0f, "immediate", 0, 0.0f,
                                 "fp16", contextOutputStreamBase + 4,
                                 hemisphere == 0 ? "east" : "west",
                                 hemisphere == 0 ? "east" : "west");
-                            emitVxm(rewriter_, op_, op_.getInput(), cycle + 1, aluBase + 3,
+                            emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle + 1, aluBase + 3,
                                 "pass", "alu", aluBase + 1, 0.0f, "immediate", 0, 0.0f,
                                 "fp16", contextOutputStreamBase + 6,
                                 hemisphere == 0 ? "east" : "west",
@@ -193,19 +193,19 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                             const int64_t mirrorAluBase = hemisphere == 0 ? 0 : 4;
                             const char* inputHemisphere = hemisphere == 0 ? "east" : "west";
                             const char* mirrorHemisphere = hemisphere == 0 ? "west" : "east";
-                            emitVxm(rewriter_, op_, op_.getInput(), cycle, mirrorAluBase,
+                            emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle, mirrorAluBase,
                                 "pass", "stream_f32", 32, 0.0f, "immediate", 0, 0.0f,
                                 "fp16", contextOutputStreamBase,
                                 inputHemisphere, mirrorHemisphere);
-                            emitVxm(rewriter_, op_, op_.getInput(), cycle, mirrorAluBase + 1,
+                            emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle, mirrorAluBase + 1,
                                 "pass", "stream_f32", 36, 0.0f, "immediate", 0, 0.0f,
                                 "fp16", contextOutputStreamBase + 2,
                                 inputHemisphere, mirrorHemisphere);
-                            emitVxm(rewriter_, op_, op_.getInput(), cycle + 1, mirrorAluBase + 2,
+                            emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle + 1, mirrorAluBase + 2,
                                 "pass", "alu", mirrorAluBase, 0.0f, "immediate", 0, 0.0f,
                                 "fp16", contextOutputStreamBase + 4,
                                 inputHemisphere, mirrorHemisphere);
-                            emitVxm(rewriter_, op_, op_.getInput(), cycle + 1, mirrorAluBase + 3,
+                            emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle + 1, mirrorAluBase + 3,
                                 "pass", "alu", mirrorAluBase + 1, 0.0f, "immediate", 0, 0.0f,
                                 "fp16", contextOutputStreamBase + 6,
                                 inputHemisphere, mirrorHemisphere);

@@ -1,5 +1,6 @@
 #include "ftlpu/compiler/Dialect/Stream/Analysis/stream_allocator.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
+#include "ftlpu/compiler/Dialect/Tensor/Analysis/attention_task_graph.hpp"
 #include "ftlpu/compiler/Dialect/Tensor/IR/tensor_dialect.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
@@ -248,13 +249,16 @@ public:
 
         llvm::SmallVector<tensor::MatmulOp> matmuls;
         llvm::SmallVector<tensor::SwigluOp> swiglus;
-        llvm::SmallVector<tensor::AttentionOp> attentions;
         function.walk([&](tensor::MatmulOp op) { matmuls.push_back(op); });
         function.walk([&](tensor::SwigluOp op) { swiglus.push_back(op); });
-        function.walk([&](tensor::AttentionOp op) { attentions.push_back(op); });
+        auto attentions = tensor::collectAttentionTaskGraphs(function);
+        if (mlir::failed(attentions)) {
+            signalPassFailure();
+            return;
+        }
 
         int64_t stage = 0;
-        for (tensor::AttentionOp op : attentions) {
+        for (tensor::AttentionTaskGraph op : *attentions) {
             llvm::SmallVector<mlir::Attribute> routes;
             auto placement = [&](llvm::StringRef name) {
                 return op.getMemoryPlan().getAs<mlir::DictionaryAttr>(name);
@@ -316,15 +320,159 @@ public:
                 op.emitError("cannot allocate generic attention stream topology");
                 signalPassFailure(); return;
             }
-            rewriter.setInsertionPoint(op);
-            mlir::OperationState state(op.getLoc(), stream::AttentionOp::getOperationName());
-            state.addOperands(op->getOperands());
-            state.addTypes(op.getResult().getType());
-            for (llvm::StringRef name : {"seq_len", "hidden", "query_heads", "kv_heads", "head_dim", "rope_theta", "causal", "memory_plan"})
-                state.addAttribute(name, op->getAttr(name));
-            state.addAttribute("routes", rewriter.getArrayAttr(routes));
-            auto lowered = llvm::cast<stream::AttentionOp>(rewriter.create(state));
-            rewriter.replaceOp(op, lowered.getResult());
+            rewriter.setInsertionPoint(op.output);
+            const auto config = op.config();
+            const auto routesForPhase = [&](llvm::StringRef phase) {
+                llvm::SmallVector<mlir::Attribute> selected;
+                for (mlir::Attribute attribute : routes) {
+                    auto route = llvm::cast<mlir::DictionaryAttr>(attribute);
+                    if (route.getAs<mlir::StringAttr>("phase").getValue()
+                        == phase)
+                        selected.push_back(route);
+                }
+                return rewriter.getArrayAttr(selected);
+            };
+            const auto routesForPhaseAndRoles =
+                [&](llvm::StringRef phase,
+                    std::initializer_list<llvm::StringRef> roles) {
+                    llvm::SmallVector<mlir::Attribute> selected;
+                    for (mlir::Attribute attribute : routes) {
+                        auto route =
+                            llvm::cast<mlir::DictionaryAttr>(attribute);
+                        if (route.getAs<mlir::StringAttr>("phase").getValue()
+                            != phase)
+                            continue;
+                        const llvm::StringRef role =
+                            route.getAs<mlir::StringAttr>("role").getValue();
+                        for (llvm::StringRef candidate : roles)
+                            if (candidate == role) {
+                                selected.push_back(route);
+                                break;
+                            }
+                    }
+                    return rewriter.getArrayAttr(selected);
+                };
+            const auto elementType =
+                llvm::cast<mlir::RankedTensorType>(op.getInput().getType())
+                    .getElementType();
+            const auto matrixType = [&](int64_t rows, int64_t columns) {
+                return mlir::RankedTensorType::get(
+                    {rows, columns}, elementType);
+            };
+            const auto scoreType = mlir::RankedTensorType::get(
+                {static_cast<int64_t>(op.getQueryHeads()),
+                    static_cast<int64_t>(op.getSeqLen()),
+                    static_cast<int64_t>(op.getSeqLen())},
+                elementType);
+            const auto createProjection =
+                [&](mlir::Value input, mlir::Value weight,
+                    llvm::StringRef kind, mlir::Type resultType,
+                    mlir::ArrayAttr taskRoutes, bool ownsMemoryPlan = false) {
+                    mlir::OperationState state(
+                        op.getLoc(),
+                        stream::ProjectionTaskOp::getOperationName());
+                    state.addOperands({input, weight});
+                    state.addTypes(resultType);
+                    state.addAttributes({
+                        rewriter.getNamedAttr(
+                            "kind", rewriter.getStringAttr(kind)),
+                        rewriter.getNamedAttr("config", config),
+                        rewriter.getNamedAttr("routes", taskRoutes),
+                    });
+                    if (ownsMemoryPlan)
+                        state.addAttribute("memory_plan", op.getMemoryPlan());
+                    return llvm::cast<stream::ProjectionTaskOp>(
+                        rewriter.create(state));
+                };
+            const auto createUnary =
+                [&](llvm::StringRef operationName, mlir::Value input,
+                    llvm::StringRef kind, mlir::Type resultType,
+                    mlir::ArrayAttr taskRoutes) {
+                    mlir::OperationState state(op.getLoc(), operationName);
+                    state.addOperands(input);
+                    state.addTypes(resultType);
+                    state.addAttribute("config", config);
+                    state.addAttribute("routes", taskRoutes);
+                    if (!kind.empty())
+                        state.addAttribute(
+                            "kind", rewriter.getStringAttr(kind));
+                    return rewriter.create(state)->getResult(0);
+                };
+            const auto createBatchMatmul =
+                [&](mlir::Value lhs, mlir::Value rhs,
+                    llvm::StringRef kind, mlir::Type resultType,
+                    mlir::ArrayAttr taskRoutes) {
+                    mlir::OperationState state(
+                        op.getLoc(),
+                        stream::BatchMatmulTaskOp::getOperationName());
+                    state.addOperands({lhs, rhs});
+                    state.addTypes(resultType);
+                    state.addAttributes({
+                        rewriter.getNamedAttr(
+                            "kind", rewriter.getStringAttr(kind)),
+                        rewriter.getNamedAttr("config", config),
+                        rewriter.getNamedAttr("routes", taskRoutes),
+                    });
+                    return llvm::cast<stream::BatchMatmulTaskOp>(
+                        rewriter.create(state));
+                };
+
+            auto query = createProjection(op.getInput(), op.getQueryWeight(),
+                "query", matrixType(op.getSeqLen(),
+                             op.getQueryHeads() * op.getHeadDim()),
+                routesForPhaseAndRoles("qkv", {"query_weight",
+                    "query_weight_dequant", "activation", "qkv_result"}));
+            auto key = createProjection(op.getInput(), op.getKeyWeight(),
+                "key", matrixType(op.getSeqLen(),
+                           op.getKvHeads() * op.getHeadDim()),
+                routesForPhaseAndRoles("qkv", {"key_weight",
+                    "key_weight_dequant", "key_activation", "key_result"}));
+            auto value = createProjection(op.getInput(), op.getValueWeight(),
+                "value", matrixType(op.getSeqLen(),
+                             op.getKvHeads() * op.getHeadDim()),
+                routesForPhaseAndRoles("qkv", {"value_weight",
+                    "value_weight_dequant", "value_activation",
+                    "value_result"}));
+            const mlir::Value rotatedQuery = createUnary(
+                stream::RopeTaskOp::getOperationName(), query.getResult(),
+                "query", query.getResult().getType(),
+                routesForPhase("rope"));
+            const mlir::Value rotatedKey = createUnary(
+                stream::RopeTaskOp::getOperationName(), key.getResult(),
+                "key", key.getResult().getType(),
+                rewriter.getArrayAttr({}));
+            auto qk = createBatchMatmul(
+                rotatedQuery, rotatedKey, "qk", scoreType,
+                routesForPhase("qk"));
+            const mlir::Value probability = createUnary(
+                stream::SoftmaxTaskOp::getOperationName(), qk.getResult(),
+                "", scoreType, routesForPhase("softmax"));
+            const mlir::Value transposedProbability = createUnary(
+                stream::TransposeTaskOp::getOperationName(), probability,
+                "probability", scoreType, rewriter.getArrayAttr({}));
+            const mlir::Value transposedValue = createUnary(
+                stream::TransposeTaskOp::getOperationName(), value.getResult(),
+                "value", value.getResult().getType(),
+                rewriter.getArrayAttr({}));
+            auto pv = createBatchMatmul(
+                transposedProbability, transposedValue, "pv",
+                matrixType(op.getSeqLen(),
+                    op.getQueryHeads() * op.getHeadDim()),
+                routesForPhase("pv"));
+            auto output = createProjection(pv.getResult(),
+                op.getOutputWeight(), "output", op.getResult().getType(),
+                routesForPhase("o_proj"), true);
+            rewriter.replaceOp(op.output, output.getResult());
+            rewriter.eraseOp(op.pv);
+            rewriter.eraseOp(op.value_transpose);
+            rewriter.eraseOp(op.probability_transpose);
+            rewriter.eraseOp(op.softmax);
+            rewriter.eraseOp(op.qk);
+            rewriter.eraseOp(op.key_rope);
+            rewriter.eraseOp(op.query_rope);
+            rewriter.eraseOp(op.value);
+            rewriter.eraseOp(op.key);
+            rewriter.eraseOp(op.query);
             stage += 54;
         }
         for (TensorFfnPlan& op : ffns) {
@@ -844,7 +992,12 @@ public:
             if (!unlowered_task
                 && (llvm::isa<tensor::MatmulTaskOp>(operation)
                     || llvm::isa<tensor::SwishTaskOp>(operation)
-                    || llvm::isa<tensor::ElementwiseTaskOp>(operation)))
+                    || llvm::isa<tensor::ElementwiseTaskOp>(operation)
+                    || llvm::isa<tensor::ProjectionTaskOp>(operation)
+                    || llvm::isa<tensor::RopeTaskOp>(operation)
+                    || llvm::isa<tensor::BatchMatmulTaskOp>(operation)
+                    || llvm::isa<tensor::SoftmaxTaskOp>(operation)
+                    || llvm::isa<tensor::TransposeTaskOp>(operation)))
                 unlowered_task = operation;
         });
         if (unlowered_task) {

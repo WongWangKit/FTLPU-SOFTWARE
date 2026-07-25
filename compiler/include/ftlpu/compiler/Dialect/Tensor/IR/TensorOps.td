@@ -133,15 +133,47 @@ def FfnOp : FTLPU_Tensor_Op<"ffn", [Pure]> {
   let hasVerifier = 1;
 }
 
-def AttentionOp : FTLPU_Tensor_Op<"attention", [Pure]> {
-  let summary = "Grouped-query causal attention with an assigned LPU MEM plan";
-  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$query_weight,
-      AnyRankedTensor:$key_weight, AnyRankedTensor:$value_weight,
-      AnyRankedTensor:$output_weight,
-      I64Attr:$seq_len, I64Attr:$hidden, I64Attr:$query_heads,
-      I64Attr:$kv_heads, I64Attr:$head_dim, F32Attr:$rope_theta,
-      BoolAttr:$causal, DictionaryAttr:$memory_plan);
+def ProjectionTaskOp : FTLPU_Tensor_Op<"projection_task", [Pure]> {
+  let summary = "Matrix projection with an assigned physical buffer sub-plan";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      StrAttr:$kind, DictionaryAttr:$config, DictionaryAttr:$memory_plan);
   let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$input `,` $query_weight `,` $key_weight `,` $value_weight `,` $output_weight attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$input `,` $weight attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def RopeTaskOp : FTLPU_Tensor_Op<"rope_task", [Pure]> {
+  let summary = "Rotary-position embedding with an assigned physical sub-plan";
+  let arguments = (ins AnyRankedTensor:$input, StrAttr:$kind,
+      DictionaryAttr:$config, DictionaryAttr:$memory_plan);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def BatchMatmulTaskOp : FTLPU_Tensor_Op<"batch_matmul_task", [Pure]> {
+  let summary = "Batched matrix multiplication with a physical buffer sub-plan";
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+      StrAttr:$kind, DictionaryAttr:$config, DictionaryAttr:$memory_plan);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def SoftmaxTaskOp : FTLPU_Tensor_Op<"softmax_task", [Pure]> {
+  let summary = "Numerically stable row-wise softmax with a physical sub-plan";
+  let arguments = (ins AnyRankedTensor:$input, DictionaryAttr:$config,
+      DictionaryAttr:$memory_plan);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def TransposeTaskOp : FTLPU_Tensor_Op<"transpose_task", [Pure]> {
+  let summary = "SXM transpose or permutation with a physical sub-plan";
+  let arguments = (ins AnyRankedTensor:$input, StrAttr:$kind,
+      DictionaryAttr:$config, DictionaryAttr:$memory_plan);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }

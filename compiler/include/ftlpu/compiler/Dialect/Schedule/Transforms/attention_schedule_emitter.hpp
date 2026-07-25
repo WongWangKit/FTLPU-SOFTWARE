@@ -1,8 +1,8 @@
 #pragma once
 
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_stage_plan.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_task_graph.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
-#include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "mlir/IR/PatternMatch.h"
@@ -14,10 +14,10 @@ namespace ftlpu::compiler::schedule {
 class AttentionScheduleEmitter {
 public:
     AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
-        stream::AttentionOp op, const target::LPUTargetModel& target,
+        AttentionTaskGraph graph, const target::LPUTargetModel& target,
         AttentionStagePlan stagePlan);
 
-    mlir::FailureOr<schedule::AttentionOp> emit();
+    mlir::FailureOr<mlir::Value> emit(int64_t outputIndex);
 
 private:
     int64_t emitProjections();
@@ -30,7 +30,7 @@ private:
     int64_t emitOutputProjection(int64_t pvEnd);
 
     mlir::IRRewriter& rewriter_;
-    stream::AttentionOp op_;
+    AttentionTaskGraph op_;
     const target::LPUTargetModel& target_;
     AttentionStagePlan stage_plan_;
 };

@@ -223,32 +223,35 @@ LogicalResult MemWriteOp::verify()
     return success();
 }
 
-LogicalResult AttentionOp::verify()
+LogicalResult BindingOp::verify()
 {
-    int64_t previous_end = 0;
-    for (Attribute attribute : getPhases()) {
-        const auto phase = llvm::dyn_cast<DictionaryAttr>(attribute);
-        const auto name = phase ? phase.getAs<StringAttr>("name") : StringAttr {};
-        const auto start = phase ? phase.getAs<IntegerAttr>("start") : IntegerAttr {};
-        const auto end = phase ? phase.getAs<IntegerAttr>("end") : IntegerAttr {};
-        if (!name || !start || !end || start.getInt() < previous_end || end.getInt() <= start.getInt())
-            return emitOpError() << "contains non-monotonic attention phase timing at '"
-                                 << (name ? name.getValue() : "<missing>") << "'";
-        previous_end = end.getInt();
+    if (getIndex() < 0 || getBytes() <= 0)
+        return emitOpError(
+            "requires a non-negative index and positive byte size");
+    if (getAccess() != "input" && getAccess() != "output"
+        && getAccess() != "internal")
+        return emitOpError("access must be input, output, or internal");
+    if (getAccess() == "input") {
+        if (getSource().size() != 1
+            || getSource().front().getType() != getValue().getType())
+            return emitOpError(
+                "input binding requires one type-matched source");
+    } else if (!getSource().empty()) {
+        return emitOpError(
+            "output and internal bindings must not have an SSA source");
     }
-    if (getPhases().size() != 6)
-        return emitOpError("requires qkv, rope, qk, softmax, pv, and o_proj phases");
-    if (getWorkWaves().empty()) return emitOpError("requires scheduled QK/PV work waves");
-    for (Attribute attribute : getWorkWaves()) {
-        const auto wave = llvm::dyn_cast<DictionaryAttr>(attribute);
-        const auto phase = wave ? wave.getAs<StringAttr>("phase") : StringAttr {};
-        const auto start = wave ? wave.getAs<IntegerAttr>("start") : IntegerAttr {};
-        const auto end = wave ? wave.getAs<IntegerAttr>("end") : IntegerAttr {};
-        const auto slots = wave ? wave.getAs<ArrayAttr>("slots") : ArrayAttr {};
-        if (!phase || (phase.getValue() != "qk" && phase.getValue() != "pv")
-            || !start || !end || end.getInt() <= start.getInt() || !slots || slots.empty())
-            return emitOpError("contains an invalid physical attention work wave");
-    }
+    if (!getPlacement().getAs<ArrayAttr>("slices")
+        || !getPlacement().getAs<IntegerAttr>("base_row")
+        || !getPlacement().getAs<IntegerAttr>("instruction_count"))
+        return emitOpError("requires a physical MEM placement");
+    return success();
+}
+
+LogicalResult TimelineOp::verify()
+{
+    if (getName().empty() || getStart() < 0 || getEnd() <= getStart())
+        return emitOpError(
+            "requires a name and a positive cycle interval");
     return success();
 }
 

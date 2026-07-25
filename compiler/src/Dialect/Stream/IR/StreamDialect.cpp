@@ -38,6 +38,64 @@ std::optional<target::StreamDirection> parse_direction(StringRef name)
     return std::nullopt;
 }
 
+LogicalResult verify_attention_config(
+    Operation* operation, DictionaryAttr config)
+{
+    const auto seqLen = config.getAs<IntegerAttr>("seq_len");
+    const auto hidden = config.getAs<IntegerAttr>("hidden");
+    const auto queryHeads = config.getAs<IntegerAttr>("query_heads");
+    const auto kvHeads = config.getAs<IntegerAttr>("kv_heads");
+    const auto headDim = config.getAs<IntegerAttr>("head_dim");
+    const auto ropeTheta = config.getAs<FloatAttr>("rope_theta");
+    const auto causal = config.getAs<BoolAttr>("causal");
+    if (!seqLen || !hidden || !queryHeads || !kvHeads || !headDim
+        || !ropeTheta || !causal || seqLen.getInt() <= 0
+        || hidden.getInt() <= 0 || queryHeads.getInt() <= 0
+        || kvHeads.getInt() <= 0 || headDim.getInt() <= 0
+        || queryHeads.getInt() % kvHeads.getInt() != 0)
+        return operation->emitOpError(
+            "requires a complete grouped-query attention config");
+    return success();
+}
+
+LogicalResult verify_attention_routes(
+    Operation* operation, ArrayAttr routes)
+{
+    if (routes.empty())
+        return operation->emitOpError("requires allocated stream routes");
+    auto targetModel = target::LPUTargetModel::from_operation(operation);
+    if (failed(targetModel)) return failure();
+    const int64_t streams = targetModel->streams().streams_per_direction;
+    for (Attribute attribute : routes) {
+        const auto route = llvm::dyn_cast<DictionaryAttr>(attribute);
+        if (!route)
+            return operation->emitOpError("routes must be dictionaries");
+        for (StringRef field : {"phase", "role", "source", "destination",
+                 "direction", "stream_base", "stream_count", "register_id",
+                 "producer_stage", "consumer_stage", "transport_latency"})
+            if (!route.get(field))
+                return operation->emitOpError()
+                    << "route is missing '" << field << "'";
+        const auto base = route.getAs<IntegerAttr>("stream_base");
+        const auto count = route.getAs<IntegerAttr>("stream_count");
+        const auto begin = route.getAs<IntegerAttr>("producer_stage");
+        const auto end = route.getAs<IntegerAttr>("consumer_stage");
+        if (!base || !count || !begin || !end || base.getInt() < 0
+            || count.getInt() <= 0 || base.getInt() + count.getInt() > streams
+            || end.getInt() <= begin.getInt())
+            return operation->emitOpError(
+                "route has an invalid stream range or lifetime window");
+    }
+    return success();
+}
+
+LogicalResult verify_optional_attention_routes(
+    Operation* operation, ArrayAttr routes)
+{
+    if (routes.empty()) return success();
+    return verify_attention_routes(operation, routes);
+}
+
 } // namespace
 
 ParseResult RouteOp::parse(OpAsmParser& parser, OperationState& result)
@@ -315,32 +373,57 @@ LogicalResult SwigluOp::verify()
     return success();
 }
 
-LogicalResult AttentionOp::verify()
+LogicalResult ProjectionTaskOp::verify()
 {
-    if (getQueryHeads() <= 0 || getKvHeads() <= 0 || getHeadDim() <= 0
-        || getQueryHeads() % getKvHeads() != 0 || getRoutes().empty())
-        return emitOpError("requires grouped-query dimensions and at least one stream route");
-    auto target_model = target::LPUTargetModel::from_operation(getOperation());
-    if (failed(target_model)) return failure();
-    const int64_t streams =
-        target_model->streams().streams_per_direction;
-    for (Attribute attribute : getRoutes()) {
-        const auto route = llvm::dyn_cast<DictionaryAttr>(attribute);
-        if (!route) return emitOpError("routes must be dictionaries");
-        for (StringRef field : {"phase", "role", "source", "destination", "direction",
-                 "stream_base", "stream_count", "register_id", "producer_stage",
-                 "consumer_stage", "transport_latency"})
-            if (!route.get(field)) return emitOpError() << "route is missing '" << field << "'";
-        const auto base = route.getAs<IntegerAttr>("stream_base");
-        const auto count = route.getAs<IntegerAttr>("stream_count");
-        const auto begin = route.getAs<IntegerAttr>("producer_stage");
-        const auto end = route.getAs<IntegerAttr>("consumer_stage");
-        if (!base || !count || !begin || !end || base.getInt() < 0 || count.getInt() <= 0
-            || base.getInt() + count.getInt() > streams
-            || end.getInt() <= begin.getInt())
-            return emitOpError("route has an invalid stream range or lifetime window");
+    if (getKind() != "query" && getKind() != "key"
+        && getKind() != "value" && getKind() != "output")
+        return emitOpError("kind must be query, key, value, or output");
+    if (failed(verify_attention_config(getOperation(), getConfig())))
+        return failure();
+    if (getKind() == "output") {
+        const auto memoryPlan = getMemoryPlan();
+        if (!memoryPlan || memoryPlan->empty())
+            return emitOpError("requires a physical attention memory plan");
     }
-    return success();
+    return verify_attention_routes(getOperation(), getRoutes());
+}
+
+LogicalResult RopeTaskOp::verify()
+{
+    if (getKind() != "query" && getKind() != "key")
+        return emitOpError("kind must be query or key");
+    if (getInput().getType() != getResult().getType())
+        return emitOpError("must preserve its tensor type");
+    if (failed(verify_attention_config(getOperation(), getConfig())))
+        return failure();
+    return verify_optional_attention_routes(getOperation(), getRoutes());
+}
+
+LogicalResult BatchMatmulTaskOp::verify()
+{
+    if (getKind() != "qk" && getKind() != "pv")
+        return emitOpError("kind must be qk or pv");
+    if (failed(verify_attention_config(getOperation(), getConfig())))
+        return failure();
+    return verify_optional_attention_routes(getOperation(), getRoutes());
+}
+
+LogicalResult SoftmaxTaskOp::verify()
+{
+    if (getInput().getType() != getResult().getType())
+        return emitOpError("must preserve its tensor type");
+    if (failed(verify_attention_config(getOperation(), getConfig())))
+        return failure();
+    return verify_optional_attention_routes(getOperation(), getRoutes());
+}
+
+LogicalResult TransposeTaskOp::verify()
+{
+    if (getKind() != "probability" && getKind() != "value")
+        return emitOpError("kind must be probability or value");
+    if (failed(verify_attention_config(getOperation(), getConfig())))
+        return failure();
+    return verify_optional_attention_routes(getOperation(), getRoutes());
 }
 
 void StreamDialect::initialize()

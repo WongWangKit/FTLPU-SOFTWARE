@@ -349,38 +349,99 @@ LogicalResult FfnOp::verify()
     return success();
 }
 
-LogicalResult AttentionOp::verify()
+static LogicalResult verify_attention_task_config(
+    Operation* operation, DictionaryAttr config)
 {
-    const auto input = getInput().getType();
-    const auto query = getQueryWeight().getType();
-    const auto key = getKeyWeight().getType();
-    const auto value = getValueWeight().getType();
-    const auto output = getOutputWeight().getType();
-    const auto result = getResult().getType();
-    const int64_t query_width = getQueryHeads() * getHeadDim();
-    const int64_t kv_width = getKvHeads() * getHeadDim();
-    if (input.getRank() != 2 || query.getRank() != 2 || key.getRank() != 2
-        || value.getRank() != 2 || output.getRank() != 2 || result.getRank() != 2
-        || input.getDimSize(0) != getSeqLen() || input.getDimSize(1) != getHidden()
-        || query.getDimSize(0) != getHidden() || query.getDimSize(1) != query_width
-        || key.getDimSize(0) != getHidden() || key.getDimSize(1) != kv_width
-        || value.getShape() != key.getShape()
-        || output.getDimSize(0) != query_width || output.getDimSize(1) != getHidden()
-        || result.getShape() != input.getShape())
-        return emitOpError("tensor shapes do not match the attention configuration");
-    for (StringRef name : {"input", "query_weight", "key_weight", "value_weight",
-             "output_weight", "query", "key", "value", "score", "score_mxm1",
-             "probability", "probability_mxm1", "probability_pack", "probability_diagonal",
-             "exp", "exp_mxm1", "causal_mask", "causal_mask_mxm1",
-             "rope", "context", "result"}) {
-        const auto placement = getMemoryPlan().getAs<DictionaryAttr>(name);
-        const auto kind = placement ? placement.getAs<StringAttr>("kind") : StringAttr {};
-        const auto slices = placement ? placement.getAs<ArrayAttr>("slices") : ArrayAttr {};
-        if (!kind || !slices || failed(verify_placement(getOperation(), placement, name,
-                kind.getValue(), static_cast<int64_t>(slices.size()))))
+    const auto seqLen = config.getAs<IntegerAttr>("seq_len");
+    const auto hidden = config.getAs<IntegerAttr>("hidden");
+    const auto queryHeads = config.getAs<IntegerAttr>("query_heads");
+    const auto kvHeads = config.getAs<IntegerAttr>("kv_heads");
+    const auto headDim = config.getAs<IntegerAttr>("head_dim");
+    const auto ropeTheta = config.getAs<FloatAttr>("rope_theta");
+    const auto causal = config.getAs<BoolAttr>("causal");
+    if (!seqLen || !hidden || !queryHeads || !kvHeads || !headDim
+        || !ropeTheta || !causal || seqLen.getInt() <= 0
+        || hidden.getInt() <= 0 || queryHeads.getInt() <= 0
+        || kvHeads.getInt() <= 0 || headDim.getInt() <= 0
+        || queryHeads.getInt() % kvHeads.getInt() != 0)
+        return operation->emitOpError(
+            "requires a complete grouped-query attention config");
+    return success();
+}
+
+static LogicalResult verify_attention_memory_subplan(
+    Operation* operation, DictionaryAttr memoryPlan)
+{
+    for (NamedAttribute entry : memoryPlan) {
+        const auto placement = llvm::dyn_cast<DictionaryAttr>(entry.getValue());
+        const auto kind =
+            placement ? placement.getAs<StringAttr>("kind") : StringAttr {};
+        const auto slices =
+            placement ? placement.getAs<ArrayAttr>("slices") : ArrayAttr {};
+        if (!kind || !slices
+            || failed(verify_placement(operation, placement,
+                entry.getName().strref(), kind.getValue(),
+                static_cast<int64_t>(slices.size()))))
             return failure();
     }
     return success();
+}
+
+LogicalResult ProjectionTaskOp::verify()
+{
+    if (getKind() != "query" && getKind() != "key"
+        && getKind() != "value" && getKind() != "output")
+        return emitOpError("kind must be query, key, value, or output");
+    if (getInput().getType().getRank() != 2
+        || getWeight().getType().getRank() != 2
+        || getResult().getType().getRank() != 2)
+        return emitOpError("requires rank-2 input, weight, and result tensors");
+    if (failed(verify_attention_task_config(getOperation(), getConfig())))
+        return failure();
+    return verify_attention_memory_subplan(
+        getOperation(), getMemoryPlan());
+}
+
+LogicalResult RopeTaskOp::verify()
+{
+    if (getKind() != "query" && getKind() != "key")
+        return emitOpError("kind must be query or key");
+    if (getInput().getType() != getResult().getType())
+        return emitOpError("must preserve its tensor type");
+    if (failed(verify_attention_task_config(getOperation(), getConfig())))
+        return failure();
+    return verify_attention_memory_subplan(
+        getOperation(), getMemoryPlan());
+}
+
+LogicalResult BatchMatmulTaskOp::verify()
+{
+    if (getKind() != "qk" && getKind() != "pv")
+        return emitOpError("kind must be qk or pv");
+    if (failed(verify_attention_task_config(getOperation(), getConfig())))
+        return failure();
+    return verify_attention_memory_subplan(
+        getOperation(), getMemoryPlan());
+}
+
+LogicalResult SoftmaxTaskOp::verify()
+{
+    if (getInput().getType() != getResult().getType())
+        return emitOpError("must preserve its tensor type");
+    if (failed(verify_attention_task_config(getOperation(), getConfig())))
+        return failure();
+    return verify_attention_memory_subplan(
+        getOperation(), getMemoryPlan());
+}
+
+LogicalResult TransposeTaskOp::verify()
+{
+    if (getKind() != "probability" && getKind() != "value")
+        return emitOpError("kind must be probability or value");
+    if (failed(verify_attention_task_config(getOperation(), getConfig())))
+        return failure();
+    return verify_attention_memory_subplan(
+        getOperation(), getMemoryPlan());
 }
 
 } // namespace ftlpu::compiler::tensor

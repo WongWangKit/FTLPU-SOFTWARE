@@ -36,7 +36,7 @@ std::array<int64_t, 32> identityMap();
 std::array<int64_t, 32> blockDiagonalMap(int64_t diagonal,
     const target::LPUTargetModel& target);
 
-VxmOp emitVxm(mlir::IRRewriter& rewriter, stream::AttentionOp op,
+VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Value value, int64_t cycle, int64_t queue, llvm::StringRef opcode,
     llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
     llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
@@ -45,7 +45,7 @@ VxmOp emitVxm(mlir::IRRewriter& rewriter, stream::AttentionOp op,
 
 AttentionProjectionKind projectionKind(int64_t index);
 
-void emitRopeOrCast(mlir::IRRewriter& rewriter, stream::AttentionOp op,
+void emitRopeOrCast(mlir::IRRewriter& rewriter, mlir::Location location,
     const target::LPUTargetModel& target, int64_t cycle, int64_t hemisphere,
     bool rope, mlir::Value value);
 

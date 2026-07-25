@@ -62,10 +62,10 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                     }
                     for (int64_t lane = 0;
                          lane < target_.throughput().lanes_per_tile; ++lane) {
-                        emitVxm(rewriter_, op_, op_.getOutputWeight(), cycle, lane,
+                        emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), cycle, lane,
                             "multiply", "stream_i8", 32 + lane, 0.0f,
                             "immediate", 0, 1.0f, "fp32", -1, hemi, hemi);
-                        emitVxm(rewriter_, op_, op_.getOutputWeight(), cycle + 1,
+                        emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), cycle + 1,
                             8 + lane, "cast", "alu", lane, 0.0f,
                             "immediate", 0, 0.0f, "fp16",
                             localMxm * target_.throughput().mxm_load_streams_per_cycle
@@ -181,7 +181,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                             mxmOutputStream, 1, 1,
                             accumulatorAddress(token),
                             1, "sram", true);
-                        emitVxm(rewriter_, op_, op_.getOutputWeight(), vxmCycle,
+                        emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), vxmCycle,
                             hemisphere, "pass", "stream_f32", inputStream, 0.0f,
                             "immediate", 0, 0.0f, "fp16", outputStream,
                             inputHemisphere, "east");

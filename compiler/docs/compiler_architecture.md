@@ -88,6 +88,15 @@ projection consumes both allocations. Addresses, placements, byte sizes, and
 quantization parameters are therefore attached to the primitive operation
 that uses them instead of being hidden in a compound `ftlpu.tensor.ffn`.
 
+Attention is also a primitive Tensor SSA graph. Query, key, value, and output
+projections are `projection_task` operations; RoPE, QK/PV batch matmul,
+softmax, and probability/value transpose are separate task operations. The
+physical memory plan is partitioned into disjoint task-local dictionaries, so
+each of its 21 named buffers has exactly one owner. Tensor-to-Stream validates
+the complete producer graph and reconstructs a read-only aggregate view when
+allocating routes. The obsolete compound `ftlpu.tensor.attention` operation
+has been removed.
+
 ### FTLPU Stream IR
 
 The stream IR maps MEM-resident tensor tiles onto LPU streams:
@@ -132,6 +141,17 @@ stream range. The current Stream-to-Schedule implementation composes this
 graph into its established scheduling descriptor internally; the compound
 operation is not emitted by the StableHLO-to-Stream pipeline.
 
+Attention is likewise an SSA-connected primitive graph:
+query/key/value `projection_task` operations feed two `rope_task` operations,
+then a QK `batch_matmul_task`, `softmax_task`, probability/value
+`transpose_task` operations, a PV `batch_matmul_task`, and the output
+`projection_task`. Routes are partitioned onto the task that owns each transfer
+instead of being copied as one global array onto every projection. The output
+projection owns the shared physical memory plan, and the Schedule analysis
+collects and validates the complete graph before assigning exact cycles. The
+obsolete compound `ftlpu.stream.attention` operation is not part of public
+Stream IR.
+
 ### Schedule planning and emission
 
 Stream-to-Schedule is split into a target-independent planning side and an
@@ -162,8 +182,9 @@ every reduction block, ping-pong weight buffer, M-tile compute cycle, and
 activation-stream segment used while prefetching the next weight tile. These
 timelines are derived from `LPUTargetModel`; changing tile, lane, MXM,
 hemisphere, or stream counts does not require editing the emitter.
-The obsolete compound `ftlpu.stream.ffn` operation has been removed; public
-Stream IR contains only primitive task and route operations.
+The obsolete compound `ftlpu.stream.ffn` and `ftlpu.stream.attention`
+operations have been removed; public Stream IR contains only primitive task
+and route operations.
 
 ### LPU Target Model
 
@@ -215,6 +236,16 @@ stream, the selected MXM unit's load/compute queues, and its selected weight
 buffer. `mxm_load` and `mxm_compute` preserve both ids explicitly. Fixed
 transport latency is included between producer and consumer windows, and SSA
 consumers cannot read a value before its producer's MEM write completes.
+
+Attention no longer emits a compound `ftlpu.schedule.attention` operation.
+Its hardware program consists only of the same MEM/MXM/VXM/SXM primitive
+schedule operations used by other workloads. Generic `ftlpu.schedule.binding`
+operations preserve runtime-visible inputs, outputs, and internal constants;
+generic `ftlpu.schedule.timeline` operations retain the six named phase
+intervals for inspection and visualization. Schedule-to-Command translates
+bindings without any Attention-specific branch. Detailed projection and QK/PV
+work-wave plans remain compiler analysis objects covered by planner tests
+instead of being duplicated into executable IR.
 
 For the current 320x320 int8 GEMM, the CModel-aligned baseline is: weight MEM
 reads begin at cycles 5 through 8 according to their MEM boundary, IW runs at
