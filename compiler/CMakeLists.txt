@@ -67,6 +67,7 @@ add_public_tablegen_target(FTLPUCommandOpsIncGen)
 
 add_library(ftlpu_compiler
     src/Dialect/Kernel/IR/KernelDialect.cpp
+    src/Dialect/Kernel/Analysis/AttentionGraph.cpp
     src/Dialect/Kernel/Transforms/StableHloToKernel.cpp
     src/Dialect/Kernel/Transforms/ComposeKernelPlans.cpp
     src/Dialect/Tensor/IR/TensorDialect.cpp

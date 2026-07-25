@@ -1,3 +1,4 @@
+#include "ftlpu/compiler/Dialect/Kernel/Analysis/attention_graph.hpp"
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Tensor/Analysis/physical_memory_allocator.hpp"
 #include "ftlpu/compiler/Dialect/Tensor/IR/tensor_dialect.hpp"
@@ -277,7 +278,8 @@ public:
         llvm::SmallVector<kernel::MatmulOp> matmuls;
         llvm::SmallVector<kernel::SwigluOp> swiglus;
         llvm::SmallVector<kernel::FfnOp> ffns;
-        llvm::SmallVector<kernel::AttentionOp> attentions;
+        llvm::SmallVector<kernel::AttentionGraph, 2> attentions;
+        llvm::SmallDenseSet<mlir::Operation*, 32> attention_operations;
         int64_t ordinal = 0;
         for (mlir::Operation& operation : function.getBody().front()) {
             ordinals[&operation] = ordinal;
@@ -285,9 +287,18 @@ public:
             if (auto matmul = llvm::dyn_cast<kernel::MatmulOp>(&operation)) matmuls.push_back(matmul);
             if (auto swiglu = llvm::dyn_cast<kernel::SwigluOp>(&operation)) swiglus.push_back(swiglu);
             if (auto ffn = llvm::dyn_cast<kernel::FfnOp>(&operation)) ffns.push_back(ffn);
-            if (auto attention = llvm::dyn_cast<kernel::AttentionOp>(&operation)) attentions.push_back(attention);
             ++ordinal;
         }
+        for (kernel::MatmulOp root : llvm::reverse(matmuls)) {
+            auto graph = kernel::match_attention_graph(root);
+            if (!graph) continue;
+            attention_operations.insert(
+                graph->operations.begin(), graph->operations.end());
+            attentions.push_back(std::move(*graph));
+        }
+        llvm::erase_if(matmuls, [&](kernel::MatmulOp op) {
+            return attention_operations.contains(op.getOperation());
+        });
 
         auto allocate_value = [&](mlir::Value value, PlacementKind kind) -> mlir::FailureOr<Allocation> {
             if (const auto found = allocations.find(value); found != allocations.end())
@@ -315,9 +326,6 @@ public:
                     if (use.getOperandNumber() >= 1 && use.getOperandNumber() <= 3)
                         return PlacementKind::Weight;
                 }
-                if (auto attention = llvm::dyn_cast<kernel::AttentionOp>(use.getOwner())) {
-                    if (use.getOperandNumber() >= 1) return PlacementKind::Weight;
-                }
             }
             return PlacementKind::Activation;
         };
@@ -329,7 +337,8 @@ public:
             for (mlir::OpOperand& use : argument.getUses()) {
                 if (auto ffn = llvm::dyn_cast<kernel::FfnOp>(use.getOwner()))
                     fixed_w8a16_operand |= is_w8a16_ffn(ffn, target);
-                if (llvm::isa<kernel::AttentionOp>(use.getOwner())) fixed_w8a16_operand = true;
+                fixed_w8a16_operand |=
+                    attention_operations.contains(use.getOwner());
             }
             if (fixed_w8a16_operand) continue;
             if (mlir::failed(allocate_value(argument, argument_kind(argument)))) {
@@ -340,15 +349,21 @@ public:
         }
 
         mlir::IRRewriter rewriter(&getContext());
-        for (kernel::AttentionOp op : attentions) {
+        for (kernel::AttentionGraph& graph : attentions) {
+            kernel::MatmulOp op = graph.output;
+            const int64_t seq_len = graph.query.getM();
+            const int64_t hidden = graph.query.getK();
+            const int64_t query_heads = graph.query_rope.getHeads();
+            const int64_t kv_heads = graph.key_rope.getHeads();
+            const int64_t head_dim = graph.query_rope.getHeadDim();
             const int64_t tile = target.throughput().mxm_rows;
-            const int64_t blocks = op.getSeqLen() / tile;
-            const int64_t query_width = op.getQueryHeads() * op.getHeadDim();
-            const int64_t kv_width = op.getKvHeads() * op.getHeadDim();
+            const int64_t blocks = seq_len / tile;
+            const int64_t query_width = query_heads * head_dim;
+            const int64_t kv_width = kv_heads * head_dim;
             const auto attention_weight_rows = [&](int64_t columns) {
-                const int64_t head_groups = (columns + 2 * op.getHeadDim() - 1)
-                    / (2 * op.getHeadDim());
-                return head_groups * (op.getHidden() / tile) * 8;
+                const int64_t head_groups = (columns + 2 * head_dim - 1)
+                    / (2 * head_dim);
+                return head_groups * (hidden / tile) * 8;
             };
             llvm::SmallVector<int64_t> weight_slices;
             for (int64_t index = 0; index < target.memory().w8a16_weight_slice_count; ++index)
@@ -363,11 +378,11 @@ public:
             const int64_t q_weight_rows = attention_weight_rows(query_width);
             const int64_t k_weight_rows = attention_weight_rows(kv_width);
             const int64_t v_weight_rows = attention_weight_rows(kv_width);
-            const int64_t o_weight_rows = op.getHidden() * query_width
+            const int64_t o_weight_rows = hidden * query_width
                 / (target.memory().hemispheres * target.memory().w8a16_weight_slice_count * tile);
-            const int64_t query_rows = op.getQueryHeads() * blocks * target.throughput().tile_rows;
-            const int64_t score_rows = op.getQueryHeads() * blocks * op.getSeqLen();
-            const int64_t context_rows = op.getQueryHeads() * op.getSeqLen();
+            const int64_t query_rows = query_heads * blocks * target.throughput().tile_rows;
+            const int64_t score_rows = query_heads * blocks * seq_len;
+            const int64_t context_rows = query_heads * seq_len;
             llvm::SmallVector<int64_t, 36> scratch_candidates;
             for (int64_t slice = 0;
                  slice < target.memory().accumulator_slice_base; ++slice)
@@ -389,8 +404,8 @@ public:
                     llvm::SmallVector<int64_t, 16>(
                     probability_pack_slices.begin(), probability_pack_slices.end()),
                     6000,
-                    static_cast<int64_t>(op.getQueryHeads()) * blocks
-                        * (static_cast<int64_t>(op.getSeqLen())
+                    query_heads * blocks
+                        * (seq_len
                             / target.throughput().lanes_per_tile),
                     3, 5}))) {
                 op.emitError("failed to reserve the attention probability-pack layout");
@@ -437,7 +452,7 @@ public:
             const auto plan = rewriter.getDictionaryAttr({
                 rewriter.getNamedAttr("input", make_attention_placement(rewriter,
                     "fp16_mxm_activation_planar", activation_slices, 0,
-                    op.getSeqLen() * op.getHidden() / tile, "both")),
+                    seq_len * hidden / tile, "both")),
                 rewriter.getNamedAttr("query_weight", make_attention_placement(rewriter,
                     "w8a16_attention_weight_striped", weight_slices, 0, q_weight_rows, "both")),
                 rewriter.getNamedAttr("key_weight", make_attention_placement(rewriter,
@@ -450,12 +465,13 @@ public:
                 rewriter.getNamedAttr("query", make_attention_placement(rewriter,
                     "fp16_query_iw", output_slices, 7600, query_rows, "both")),
                 rewriter.getNamedAttr("key", make_attention_placement(rewriter,
-                    "fp16_head_planar", output_slices, 0, op.getKvHeads() * op.getSeqLen(), "both")),
+                    "fp16_head_planar", output_slices, 0,
+                    kv_heads * seq_len, "both")),
                 rewriter.getNamedAttr("value", make_attention_placement(rewriter,
                     "fp16_value_x16", llvm::ArrayRef<int64_t>({4, 5, 6, 7, 8, 9, 10, 11,
                         12, 13, 14, 15, 16, 17, 32, 33, 18, 19, 20, 21, 22, 23,
                         24, 25, 26, 27, 28, 29, 30, 31, 34, 35}), 7800,
-                    op.getKvHeads() * (op.getHeadDim() / tile) * blocks
+                    kv_heads * (head_dim / tile) * blocks
                         * target.throughput().tile_rows, "both")),
                 rewriter.getNamedAttr("score", make_attention_placement(rewriter,
                     "fp16_score_block", score0->slices, 3000, score_rows, "both")),
@@ -477,30 +493,37 @@ public:
                     "fp16_score_block", probability1->slices, 0, score_rows, "both")),
                 rewriter.getNamedAttr("probability_pack", make_attention_placement(rewriter,
                     "fp16_probability_x16", target.attention_query_iw_slices(1), 6000,
-                    op.getQueryHeads() * blocks
-                        * (op.getSeqLen() / target.throughput().lanes_per_tile), "both")),
+                    query_heads * blocks
+                        * (seq_len / target.throughput().lanes_per_tile), "both")),
                 rewriter.getNamedAttr("probability_diagonal", make_attention_placement(rewriter,
                     "fp16_probability_diagonal", target.attention_query_iw_slices(0), 7000,
-                    op.getQueryHeads() * blocks * blocks
+                    query_heads * blocks * blocks
                         * target.throughput().tile_rows, "both")),
                 rewriter.getNamedAttr("rope", make_attention_placement(rewriter,
                     "fp16_rope_table", llvm::ArrayRef<int64_t>({4, 5, 6, 7}), 7000,
-                    op.getSeqLen(), "both")),
+                    seq_len, "both")),
                 rewriter.getNamedAttr("context", make_attention_placement(rewriter,
                     "fp16_head_planar", llvm::ArrayRef<int64_t>({20, 21, 22, 23, 24, 25, 26, 27}),
                     2000, context_rows, "both")),
                 rewriter.getNamedAttr("result", make_attention_placement(rewriter,
                     "fp16_pair_planar", llvm::ArrayRef<int64_t>({28, 29, 30, 31}), 0,
-                    op.getSeqLen() * op.getHidden() / (tile * 2), "east")),
+                    seq_len * hidden / (tile * 2), "east")),
             });
             const auto config = rewriter.getDictionaryAttr({
-                rewriter.getNamedAttr("seq_len", op.getSeqLenAttr()),
-                rewriter.getNamedAttr("hidden", op.getHiddenAttr()),
-                rewriter.getNamedAttr("query_heads", op.getQueryHeadsAttr()),
-                rewriter.getNamedAttr("kv_heads", op.getKvHeadsAttr()),
-                rewriter.getNamedAttr("head_dim", op.getHeadDimAttr()),
-                rewriter.getNamedAttr("rope_theta", op.getRopeThetaAttr()),
-                rewriter.getNamedAttr("causal", op.getCausalAttr()),
+                rewriter.getNamedAttr(
+                    "seq_len", rewriter.getI64IntegerAttr(seq_len)),
+                rewriter.getNamedAttr(
+                    "hidden", rewriter.getI64IntegerAttr(hidden)),
+                rewriter.getNamedAttr(
+                    "query_heads", graph.query_rope.getHeadsAttr()),
+                rewriter.getNamedAttr(
+                    "kv_heads", graph.key_rope.getHeadsAttr()),
+                rewriter.getNamedAttr(
+                    "head_dim", graph.query_rope.getHeadDimAttr()),
+                rewriter.getNamedAttr(
+                    "rope_theta", graph.query_rope.getThetaAttr()),
+                rewriter.getNamedAttr(
+                    "causal", graph.softmax.getCausalAttr()),
             });
             const auto subplan =
                 [&](std::initializer_list<llvm::StringRef> names) {
@@ -512,16 +535,15 @@ public:
                 };
             const auto emptyPlan = rewriter.getDictionaryAttr({});
             const auto elementType =
-                llvm::cast<mlir::RankedTensorType>(op.getInput().getType())
+                llvm::cast<mlir::RankedTensorType>(
+                    graph.query.getLhs().getType())
                     .getElementType();
             const auto matrixType = [&](int64_t rows, int64_t columns) {
                 return mlir::RankedTensorType::get(
                     {rows, columns}, elementType);
             };
             const auto scoreType = mlir::RankedTensorType::get(
-                {static_cast<int64_t>(op.getQueryHeads()),
-                    static_cast<int64_t>(op.getSeqLen()),
-                    static_cast<int64_t>(op.getSeqLen())},
+                {query_heads, seq_len, seq_len},
                 elementType);
             const auto createProjection =
                 [&](mlir::Value input, mlir::Value weight,
@@ -574,14 +596,17 @@ public:
                         rewriter.create(state));
                 };
 
-            auto query = createProjection(op.getInput(), op.getQueryWeight(),
-                "query", matrixType(op.getSeqLen(), query_width),
+            auto query = createProjection(
+                graph.query.getLhs(), graph.query.getRhs(),
+                "query", matrixType(seq_len, query_width),
                 subplan({"input", "query_weight", "query"}));
-            auto key = createProjection(op.getInput(), op.getKeyWeight(),
-                "key", matrixType(op.getSeqLen(), kv_width),
+            auto key = createProjection(
+                graph.key.getLhs(), graph.key.getRhs(),
+                "key", matrixType(seq_len, kv_width),
                 subplan({"key_weight", "key"}));
-            auto value = createProjection(op.getInput(), op.getValueWeight(),
-                "value", matrixType(op.getSeqLen(), kv_width),
+            auto value = createProjection(
+                graph.value.getLhs(), graph.value.getRhs(),
+                "value", matrixType(seq_len, kv_width),
                 subplan({"value_weight", "value"}));
             const mlir::Value rotatedQuery = createUnary(
                 tensor::RopeTaskOp::getOperationName(), query.getResult(),
@@ -607,12 +632,19 @@ public:
                 emptyPlan);
             auto pv = createBatchMatmul(
                 transposedProbability, transposedValue, "pv",
-                matrixType(op.getSeqLen(), query_width),
+                matrixType(seq_len, query_width),
                 subplan({"context"}));
             auto output = createProjection(pv.getResult(),
-                op.getOutputWeight(), "output", op.getResult().getType(),
+                graph.output.getRhs(), "output",
+                graph.output.getResult().getType(),
                 subplan({"output_weight", "result"}));
-            rewriter.replaceOp(op, output.getResult());
+            mlir::Operation* output_operation = graph.output.getOperation();
+            rewriter.replaceOp(graph.output, output.getResult());
+            for (mlir::Operation* operation :
+                 llvm::reverse(graph.operations)) {
+                if (operation != output_operation && operation->use_empty())
+                    rewriter.eraseOp(operation);
+            }
         }
         for (kernel::FfnOp op : ffns) {
             const bool w8a16 = is_w8a16_ffn(op, target);

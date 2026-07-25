@@ -44,9 +44,12 @@ Kernel IR 是第一层由 FTLPU 自有的编译器 IR，负责：
 - 显式保留 quantization 与 layout 元数据。
 
 公开的 Kernel IR 使用这些原语组成 FFN 和 Attention 图，不再把两者表示成
-不可拆分的大 op。融合由后续优化 pass 决定。当前 Tensor 后端迁移期间仍通过内部
-`ftlpu-compose-kernel-plans` 兼容 pass 接入原有分配代码；该兼容 op 不会出现在
-StableHLO-to-Kernel pipeline 的输出中。
+不可拆分的大 op。融合由后续优化 pass 决定。Attention 现在以 primitive graph
+直接跨过 Kernel-to-Tensor 边界：`kernel::AttentionGraph` 负责识别并校验
+Q/K/V projection、RoPE、QK、softmax、PV 和 output projection 组成的 SSA
+子图，Kernel-to-Tensor 直接为该图分配物理内存，不再生成
+`ftlpu.kernel.attention` 兼容 op。内部 `ftlpu-compose-kernel-plans` pass
+目前只服务于尚未完成同类迁移的 FFN 路径。
 
 ### FTLPU Tensor IR
 

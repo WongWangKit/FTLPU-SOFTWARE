@@ -46,11 +46,14 @@ The kernel IR is the first FTLPU-owned compiler layer. It should:
 - preserve quantization and layout metadata explicitly.
 
 FFN and attention are graphs of these primitives in the public Kernel IR, not
-opaque operations. Fusion is a later optimization decision. The current
-Tensor backend still uses an internal `ftlpu-compose-kernel-plans`
-compatibility pass while its allocation code is migrated to consume primitive
-graphs directly; this compatibility operation is not emitted by the
-StableHLO-to-Kernel pipeline.
+opaque operations. Fusion is a later optimization decision. Attention remains
+a primitive graph through the Kernel-to-Tensor boundary:
+`kernel::AttentionGraph` recognizes and validates the Q/K/V projection, RoPE,
+QK, softmax, PV, and output-projection SSA subgraph, and Kernel-to-Tensor
+assigns its physical memory plan directly. There is no
+`ftlpu.kernel.attention` compatibility operation. The internal
+`ftlpu-compose-kernel-plans` pass is now limited to the FFN path that has not
+yet completed this migration.
 
 ### FTLPU Tensor IR
 

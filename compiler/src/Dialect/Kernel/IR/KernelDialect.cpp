@@ -224,36 +224,4 @@ LogicalResult FfnOp::verify()
     return success();
 }
 
-LogicalResult AttentionOp::verify()
-{
-    const auto input = getInput().getType();
-    const auto query = getQueryWeight().getType();
-    const auto key = getKeyWeight().getType();
-    const auto value = getValueWeight().getType();
-    const auto output = getOutputWeight().getType();
-    const auto result = getResult().getType();
-    if (!input.hasStaticShape() || !query.hasStaticShape() || !key.hasStaticShape()
-        || !value.hasStaticShape() || !output.hasStaticShape() || !result.hasStaticShape()
-        || input.getRank() != 2 || query.getRank() != 2 || key.getRank() != 2
-        || value.getRank() != 2 || output.getRank() != 2 || result.getRank() != 2)
-        return emitOpError("requires static rank-2 tensors");
-    const int64_t query_width = getQueryHeads() * getHeadDim();
-    const int64_t kv_width = getKvHeads() * getHeadDim();
-    if (getSeqLen() <= 0 || getHidden() <= 0 || getQueryHeads() <= 0 || getKvHeads() <= 0
-        || getHeadDim() <= 0 || getQueryHeads() % getKvHeads() != 0)
-        return emitOpError("requires positive dimensions and an integral GQA group size");
-    if (input.getDimSize(0) != getSeqLen() || input.getDimSize(1) != getHidden()
-        || query.getDimSize(0) != getHidden() || query.getDimSize(1) != query_width
-        || key.getDimSize(0) != getHidden() || key.getDimSize(1) != kv_width
-        || value.getShape() != key.getShape()
-        || output.getDimSize(0) != query_width || output.getDimSize(1) != getHidden()
-        || result.getDimSize(0) != getSeqLen() || result.getDimSize(1) != getHidden())
-        return emitOpError("tensor shapes do not match the attention configuration");
-    if (getHeadDim() % 32 != 0 || getSeqLen() % 32 != 0 || getHidden() % 32 != 0)
-        return emitOpError("currently requires 32-element MXM tile alignment");
-    if (!std::isfinite(getRopeTheta().convertToFloat()) || getRopeTheta().convertToFloat() <= 1.0f)
-        return emitOpError("requires a finite RoPE theta greater than one");
-    return success();
-}
-
 } // namespace ftlpu::compiler::kernel

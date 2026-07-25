@@ -138,21 +138,3 @@ def FfnOp : FTLPU_Kernel_Op<"ffn", [Pure]> {
   let assemblyFormat = "$input `,` $gate_weight `,` $up_weight `,` $down_weight attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
-
-def AttentionOp : FTLPU_Kernel_Op<"attention", [Pure]> {
-  let summary = "Grouped-query causal attention mapped to LPU MXM, VXM, and SXM units";
-  let description = [{
-    Canonical decoder attention.  The op deliberately carries architectural
-    dimensions instead of a model name: query_heads may exceed kv_heads for
-    grouped-query attention, and head_dim is the per-head RoPE domain.
-  }];
-  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$query_weight,
-      AnyRankedTensor:$key_weight, AnyRankedTensor:$value_weight,
-      AnyRankedTensor:$output_weight,
-      I64Attr:$seq_len, I64Attr:$hidden, I64Attr:$query_heads,
-      I64Attr:$kv_heads, I64Attr:$head_dim, F32Attr:$rope_theta,
-      BoolAttr:$causal);
-  let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$input `,` $query_weight `,` $key_weight `,` $value_weight `,` $output_weight attr-dict `:` functional-type(operands, results)";
-  let hasVerifier = 1;
-}
