@@ -53,6 +53,22 @@ Q/K/V projection、RoPE、QK、softmax、PV 和 output projection 组成的 SSA
 Kernel-to-Tensor 直接 lower 该图。原有 `ftlpu-compose-kernel-plans`、
 `ftlpu.kernel.ffn` 和 `ftlpu.tensor.ffn` 兼容路径均已删除。
 
+#### Kernel-to-Tensor 实现结构
+
+Kernel-to-Tensor pass 由编排层和按计算类型拆分的 lowering 模块组成：
+
+- `KernelToTensor.cpp` 负责识别 primitive graph、计算 SSA last-use、
+  分配普通函数输入，并分派 lowering；
+- `AttentionToTensor.cpp` 负责 Attention 图的物理内存规划和 task 生成；
+- `FfnToTensor.cpp` 负责 FFN 图的物理内存规划和 task 生成；
+- `MatmulToTensor.cpp` 和 `SwigluToTensor.cpp` 负责独立 primitive；
+- `KernelToTensorLowering.{hpp,cpp}` 提供共享的 row allocator、
+  placement builder 和 lowering 接口。
+
+各 lowerer 返回 `LogicalResult`，并在根 op 上输出诊断，但不直接控制 pass
+失败状态。这样图相关策略不会重新堆积到 pass driver 中，各类 lowering
+也可以独立测试和演进。
+
 ### FTLPU Tensor IR
 
 Tensor IR 负责 MEM 分配和 tensor 放置：

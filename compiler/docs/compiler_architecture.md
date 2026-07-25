@@ -57,6 +57,25 @@ down projection, and Kernel-to-Tensor lowers that graph directly. The former
 `ftlpu-compose-kernel-plans`, `ftlpu.kernel.ffn`, and `ftlpu.tensor.ffn`
 compatibility path has been removed.
 
+#### Kernel-to-Tensor implementation layout
+
+The Kernel-to-Tensor pass is organized as an orchestration layer plus
+operation-specific lowerers:
+
+- `KernelToTensor.cpp` discovers primitive graphs, computes SSA last-use
+  information, allocates ordinary function inputs, and dispatches lowering;
+- `AttentionToTensor.cpp` owns Attention graph memory planning and task
+  emission;
+- `FfnToTensor.cpp` owns FFN graph memory planning and task emission;
+- `MatmulToTensor.cpp` and `SwigluToTensor.cpp` lower standalone primitives;
+- `KernelToTensorLowering.{hpp,cpp}` contains the shared row allocator,
+  placement builders, and lowering interfaces.
+
+The lowerers return `LogicalResult` and emit diagnostics on their root
+operation. They do not own pass failure state. This keeps graph-specific
+policy out of the pass driver and allows each lowering to be tested and
+evolved independently.
+
 ### FTLPU Tensor IR
 
 The tensor IR owns MEM allocation and tensor placement:

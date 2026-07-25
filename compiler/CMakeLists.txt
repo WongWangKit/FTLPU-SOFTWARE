@@ -73,7 +73,12 @@ add_library(ftlpu_compiler
     src/Dialect/Tensor/IR/TensorDialect.cpp
     src/Dialect/Tensor/Analysis/AttentionTaskGraph.cpp
     src/Dialect/Tensor/Analysis/PhysicalMemoryAllocator.cpp
+    src/Dialect/Tensor/Transforms/AttentionToTensor.cpp
+    src/Dialect/Tensor/Transforms/FfnToTensor.cpp
+    src/Dialect/Tensor/Transforms/KernelToTensorLowering.cpp
     src/Dialect/Tensor/Transforms/KernelToTensor.cpp
+    src/Dialect/Tensor/Transforms/MatmulToTensor.cpp
+    src/Dialect/Tensor/Transforms/SwigluToTensor.cpp
     src/Dialect/Stream/IR/StreamDialect.cpp
     src/Dialect/Stream/Analysis/StreamAllocator.cpp
     src/Dialect/Stream/Transforms/TensorToStream.cpp
