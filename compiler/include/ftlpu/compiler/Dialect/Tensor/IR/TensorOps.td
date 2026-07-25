@@ -109,30 +109,6 @@ def SwigluOp : FTLPU_Tensor_Op<"swiglu", [Pure]> {
   let hasVerifier = 1;
 }
 
-def FfnOp : FTLPU_Tensor_Op<"ffn", [Pure]> {
-  let summary = "Complete FFN with physical storage for two hidden passes";
-  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$gate_weight,
-      AnyRankedTensor:$up_weight, AnyRankedTensor:$down_weight,
-      I64Attr:$m, I64Attr:$k, I64Attr:$hidden, I64Attr:$n,
-      F32Attr:$gate_scale, F32Attr:$up_scale, F32Attr:$hidden_scale,
-      I64Attr:$hidden_zero_point, F32Attr:$down_lhs_scale,
-      F32Attr:$down_rhs_scale, F32Attr:$output_scale,
-      I64Attr:$output_zero_point,
-      DictionaryAttr:$input_address, DictionaryAttr:$input_placement,
-      DictionaryAttr:$gate_weight_address, DictionaryAttr:$gate_weight_placement,
-      DictionaryAttr:$up_weight_address, DictionaryAttr:$up_weight_placement,
-      DictionaryAttr:$down_weight_address, DictionaryAttr:$down_weight_placement,
-      DictionaryAttr:$hidden0_address, DictionaryAttr:$hidden0_placement,
-      DictionaryAttr:$hidden1_address, DictionaryAttr:$hidden1_placement,
-      DictionaryAttr:$result_address, DictionaryAttr:$result_placement,
-      I64Attr:$input_bytes, I64Attr:$gate_weight_bytes,
-      I64Attr:$up_weight_bytes, I64Attr:$down_weight_bytes,
-      I64Attr:$hidden_pass_bytes, I64Attr:$result_bytes);
-  let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$input `,` $gate_weight `,` $up_weight `,` $down_weight attr-dict `:` functional-type(operands, results)";
-  let hasVerifier = 1;
-}
-
 def ProjectionTaskOp : FTLPU_Tensor_Op<"projection_task", [Pure]> {
   let summary = "Matrix projection with an assigned physical buffer sub-plan";
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,

@@ -191,12 +191,13 @@ constraint。
 用途：把模型 op 映射到 LPU 功能单元。
 
 ```text
-ftlpu.kernel.mxm_matmul
-ftlpu.kernel.vxm_swiglu
-ftlpu.kernel.ffn
+ftlpu.kernel.matmul
+ftlpu.kernel.swish
+ftlpu.kernel.elementwise
 ```
 
-该层不分配地址或 cycle。
+该层不分配地址或 cycle。FFN 和 Attention 表示为 primitive SSA 图，而不是
+model-level compound op。
 
 ### Tensor IR
 

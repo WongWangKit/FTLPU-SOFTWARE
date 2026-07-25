@@ -48,8 +48,10 @@ Kernel IR 是第一层由 FTLPU 自有的编译器 IR，负责：
 直接跨过 Kernel-to-Tensor 边界：`kernel::AttentionGraph` 负责识别并校验
 Q/K/V projection、RoPE、QK、softmax、PV 和 output projection 组成的 SSA
 子图，Kernel-to-Tensor 直接为该图分配物理内存，不再生成
-`ftlpu.kernel.attention` 兼容 op。内部 `ftlpu-compose-kernel-plans` pass
-目前只服务于尚未完成同类迁移的 FFN 路径。
+`ftlpu.kernel.attention` 兼容 op。FFN 采用相同设计：`kernel::FfnGraph`
+识别 gate/up projection、Swish、multiply 和 down projection，
+Kernel-to-Tensor 直接 lower 该图。原有 `ftlpu-compose-kernel-plans`、
+`ftlpu.kernel.ffn` 和 `ftlpu.tensor.ffn` 兼容路径均已删除。
 
 ### FTLPU Tensor IR
 

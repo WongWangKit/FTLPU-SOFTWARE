@@ -183,45 +183,4 @@ LogicalResult SwigluOp::verify()
     return success();
 }
 
-LogicalResult FfnOp::verify()
-{
-    const auto input = getInput().getType();
-    const auto gate = getGateWeight().getType();
-    const auto up = getUpWeight().getType();
-    const auto down = getDownWeight().getType();
-    const auto result = getResult().getType();
-    if (!input.hasStaticShape() || !gate.hasStaticShape() || !up.hasStaticShape()
-        || !down.hasStaticShape() || !result.hasStaticShape()
-        || input.getRank() != 2 || gate.getRank() != 2 || up.getRank() != 2
-        || down.getRank() != 2 || result.getRank() != 2)
-        return emitOpError("requires static rank-2 tensors");
-    if (input.getDimSize(0) != static_cast<int64_t>(getM())
-        || input.getDimSize(1) != static_cast<int64_t>(getK())
-        || gate.getDimSize(0) != static_cast<int64_t>(getK())
-        || gate.getDimSize(1) != static_cast<int64_t>(getHidden())
-        || up.getShape() != gate.getShape()
-        || down.getDimSize(0) != static_cast<int64_t>(getHidden())
-        || down.getDimSize(1) != static_cast<int64_t>(getN())
-        || result.getDimSize(0) != static_cast<int64_t>(getM())
-        || result.getDimSize(1) != static_cast<int64_t>(getN()))
-        return emitOpError("tensor shapes do not match m, k, hidden, and n");
-    const bool legacy_w8a8 = getK() == 320 && getHidden() == 640 && getN() == 320
-        && input.getElementType().isInteger(8) && gate.getElementType().isInteger(8)
-        && up.getElementType().isInteger(8) && down.getElementType().isInteger(8)
-        && result.getElementType().isInteger(8);
-    const target::LPUTargetModel target;
-    const bool w8a16 = input.getElementType().isF16() && gate.getElementType().isInteger(8)
-        && up.getElementType().isInteger(8) && down.getElementType().isInteger(8)
-        && result.getElementType().isF16()
-        && target.supports_w8a16_ffn_shape(getM(), getK(), getHidden(), getN());
-    if (!legacy_w8a8 && !w8a16)
-        return emitOpError("requires the legacy W8A8 profile or a tile-aligned W8A16 FFN");
-    for (float scale : {getGateScale().convertToFloat(), getUpScale().convertToFloat(),
-             getHiddenScale().convertToFloat(), getDownLhsScale().convertToFloat(),
-             getDownRhsScale().convertToFloat(), getOutputScale().convertToFloat()})
-        if (!std::isfinite(scale) || scale <= 0.0f)
-            return emitOpError("requires finite positive quantization scales");
-    return success();
-}
-
 } // namespace ftlpu::compiler::kernel

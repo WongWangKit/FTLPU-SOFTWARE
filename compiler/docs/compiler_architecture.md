@@ -51,9 +51,11 @@ a primitive graph through the Kernel-to-Tensor boundary:
 `kernel::AttentionGraph` recognizes and validates the Q/K/V projection, RoPE,
 QK, softmax, PV, and output-projection SSA subgraph, and Kernel-to-Tensor
 assigns its physical memory plan directly. There is no
-`ftlpu.kernel.attention` compatibility operation. The internal
-`ftlpu-compose-kernel-plans` pass is now limited to the FFN path that has not
-yet completed this migration.
+`ftlpu.kernel.attention` compatibility operation. FFN uses the same design:
+`kernel::FfnGraph` recognizes the gate/up projections, Swish, multiply, and
+down projection, and Kernel-to-Tensor lowers that graph directly. The former
+`ftlpu-compose-kernel-plans`, `ftlpu.kernel.ffn`, and `ftlpu.tensor.ffn`
+compatibility path has been removed.
 
 ### FTLPU Tensor IR
 

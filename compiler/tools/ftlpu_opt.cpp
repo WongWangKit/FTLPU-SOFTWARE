@@ -127,11 +127,6 @@ try {
     if (args.pipeline == "ftlpu-stablehlo-to-tensor" || args.pipeline == "ftlpu-stablehlo-to-stream"
         || args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands")
-        pass_manager.addNestedPass<mlir::func::FuncOp>(
-            ftlpu::compiler::create_compose_kernel_plans_pass());
-    if (args.pipeline == "ftlpu-stablehlo-to-tensor" || args.pipeline == "ftlpu-stablehlo-to-stream"
-        || args.pipeline == "ftlpu-stablehlo-to-schedule"
-        || args.pipeline == "ftlpu-stablehlo-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_kernel_to_tensor_pass());
     if (args.pipeline == "ftlpu-stablehlo-to-stream" || args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands")

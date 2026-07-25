@@ -198,12 +198,13 @@ Purpose: map model ops to LPU functional units.
 Examples:
 
 ```text
-ftlpu.kernel.mxm_matmul
-ftlpu.kernel.vxm_swiglu
-ftlpu.kernel.ffn
+ftlpu.kernel.matmul
+ftlpu.kernel.swish
+ftlpu.kernel.elementwise
 ```
 
-This layer should not assign addresses or cycles.
+This layer should not assign addresses or cycles. FFN and attention are
+primitive SSA graphs, not compound model-level operations.
 
 ### Tensor IR
 

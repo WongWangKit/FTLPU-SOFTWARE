@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Kernel/Analysis/attention_graph.hpp"
+#include "ftlpu/compiler/Dialect/Kernel/Analysis/ffn_graph.hpp"
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Tensor/Analysis/physical_memory_allocator.hpp"
 #include "ftlpu/compiler/Dialect/Tensor/IR/tensor_dialect.hpp"
@@ -185,15 +186,17 @@ Allocation fixed_allocation(PlacementKind kind, llvm::ArrayRef<int64_t> slices,
         instruction_count, 1, instruction_count, bytes};
 }
 
-bool is_w8a16_ffn(kernel::FfnOp op, const target::LPUTargetModel& target)
+bool is_w8a16_ffn(kernel::FfnGraph& graph,
+    const target::LPUTargetModel& target)
 {
-    return op.getInput().getType().getElementType().isF16()
-        && op.getGateWeight().getType().getElementType().isInteger(8)
-        && op.getUpWeight().getType().getElementType().isInteger(8)
-        && op.getDownWeight().getType().getElementType().isInteger(8)
-        && op.getResult().getType().getElementType().isF16()
+    return graph.gate.getLhs().getType().getElementType().isF16()
+        && graph.gate.getRhs().getType().getElementType().isInteger(8)
+        && graph.up.getRhs().getType().getElementType().isInteger(8)
+        && graph.output.getRhs().getType().getElementType().isInteger(8)
+        && graph.output.getResult().getType().getElementType().isF16()
         && target.supports_w8a16_ffn_shape(
-            op.getM(), op.getK(), op.getHidden(), op.getN());
+            graph.gate.getM(), graph.gate.getK(), graph.gate.getN(),
+            graph.output.getN());
 }
 
 mlir::DictionaryAttr make_profile_placement(mlir::OpBuilder& builder,
@@ -277,7 +280,9 @@ public:
         llvm::DenseMap<mlir::Operation*, int64_t> ordinals;
         llvm::SmallVector<kernel::MatmulOp> matmuls;
         llvm::SmallVector<kernel::SwigluOp> swiglus;
-        llvm::SmallVector<kernel::FfnOp> ffns;
+        llvm::SmallVector<kernel::FfnGraph, 2> ffns;
+        llvm::SmallDenseSet<mlir::Operation*, 16> ffn_operations;
+        llvm::SmallDenseSet<mlir::Operation*, 16> fixed_ffn_operations;
         llvm::SmallVector<kernel::AttentionGraph, 2> attentions;
         llvm::SmallDenseSet<mlir::Operation*, 32> attention_operations;
         int64_t ordinal = 0;
@@ -286,7 +291,6 @@ public:
             for (mlir::Value operand : operation.getOperands()) last_uses[operand] = ordinal;
             if (auto matmul = llvm::dyn_cast<kernel::MatmulOp>(&operation)) matmuls.push_back(matmul);
             if (auto swiglu = llvm::dyn_cast<kernel::SwigluOp>(&operation)) swiglus.push_back(swiglu);
-            if (auto ffn = llvm::dyn_cast<kernel::FfnOp>(&operation)) ffns.push_back(ffn);
             ++ordinal;
         }
         for (kernel::MatmulOp root : llvm::reverse(matmuls)) {
@@ -298,6 +302,19 @@ public:
         }
         llvm::erase_if(matmuls, [&](kernel::MatmulOp op) {
             return attention_operations.contains(op.getOperation());
+        });
+        for (kernel::MatmulOp root : llvm::reverse(matmuls)) {
+            auto graph = kernel::match_ffn_graph(root);
+            if (!graph) continue;
+            ffn_operations.insert(
+                graph->operations.begin(), graph->operations.end());
+            if (is_w8a16_ffn(*graph, target))
+                fixed_ffn_operations.insert(
+                    graph->operations.begin(), graph->operations.end());
+            ffns.push_back(std::move(*graph));
+        }
+        llvm::erase_if(matmuls, [&](kernel::MatmulOp op) {
+            return ffn_operations.contains(op.getOperation());
         });
 
         auto allocate_value = [&](mlir::Value value, PlacementKind kind) -> mlir::FailureOr<Allocation> {
@@ -322,10 +339,6 @@ public:
                     if (use.getOperandNumber() == 1 || use.getOperandNumber() == 2)
                         return PlacementKind::Weight;
                 }
-                if (auto ffn = llvm::dyn_cast<kernel::FfnOp>(use.getOwner())) {
-                    if (use.getOperandNumber() >= 1 && use.getOperandNumber() <= 3)
-                        return PlacementKind::Weight;
-                }
             }
             return PlacementKind::Activation;
         };
@@ -335,8 +348,8 @@ public:
             if (!last_uses.contains(argument)) continue;
             bool fixed_w8a16_operand = false;
             for (mlir::OpOperand& use : argument.getUses()) {
-                if (auto ffn = llvm::dyn_cast<kernel::FfnOp>(use.getOwner()))
-                    fixed_w8a16_operand |= is_w8a16_ffn(ffn, target);
+                fixed_w8a16_operand |=
+                    fixed_ffn_operations.contains(use.getOwner());
                 fixed_w8a16_operand |=
                     attention_operations.contains(use.getOwner());
             }
@@ -646,8 +659,17 @@ public:
                     rewriter.eraseOp(operation);
             }
         }
-        for (kernel::FfnOp op : ffns) {
-            const bool w8a16 = is_w8a16_ffn(op, target);
+        for (kernel::FfnGraph& graph : ffns) {
+            kernel::MatmulOp op = graph.output;
+            const int64_t m = graph.gate.getM();
+            const int64_t k = graph.gate.getK();
+            const int64_t hidden = graph.gate.getN();
+            const int64_t n = graph.output.getN();
+            const mlir::Value input_value = graph.gate.getLhs();
+            const mlir::Value gate_weight = graph.gate.getRhs();
+            const mlir::Value up_weight = graph.up.getRhs();
+            const mlir::Value down_weight = graph.output.getRhs();
+            const bool w8a16 = is_w8a16_ffn(graph, target);
             const auto& memory = target.memory();
             const auto& throughput = target.throughput();
             llvm::SmallVector<int64_t> weight_slices;
@@ -663,54 +685,55 @@ public:
                 result_slices.push_back(memory.w8a16_result_slice_base + index);
             }
             const int64_t hidden_pass_bytes = w8a16
-                ? op.getM() * (op.getHidden() / target.memory().hemispheres) * 2
-                : op.getM() * 320;
+                ? m * (hidden / target.memory().hemispheres) * 2
+                : m * 320;
             const int64_t gate_rows = w8a16
-                ? op.getK() * op.getHidden()
+                ? k * hidden
                     / (memory.hemispheres * memory.w8a16_weight_slice_count
                         * throughput.tile_rows * throughput.lanes_per_tile)
                 : 0;
             const int64_t down_rows = w8a16
-                ? op.getHidden() * op.getN()
+                ? hidden * n
                     / (memory.w8a16_weight_slice_count
                         * throughput.tile_rows * throughput.lanes_per_tile)
                 : 0;
             auto input = w8a16
                 ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Activation,
-                    activation_slices, 0, op.getM() * op.getK() / throughput.mxm_rows,
-                    op.getM() * op.getK() * 2))
-                : allocate_value(op.getInput(), PlacementKind::Activation);
+                    activation_slices, 0, m * k / throughput.mxm_rows,
+                    m * k * 2))
+                : allocate_value(input_value, PlacementKind::Activation);
             auto gate = w8a16
                 ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
-                    weight_slices, 0, gate_rows, op.getK() * op.getHidden()))
-                : allocate_value(op.getGateWeight(), PlacementKind::Weight);
+                    weight_slices, 0, gate_rows, k * hidden))
+                : allocate_value(gate_weight, PlacementKind::Weight);
             auto up = w8a16
                 ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
-                    weight_slices, gate_rows, gate_rows, op.getK() * op.getHidden()))
-                : allocate_value(op.getUpWeight(), PlacementKind::Weight);
+                    weight_slices, gate_rows, gate_rows, k * hidden))
+                : allocate_value(up_weight, PlacementKind::Weight);
             auto down = w8a16
                 ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
-                    weight_slices, 2 * gate_rows, down_rows, op.getHidden() * op.getN()))
-                : allocate_value(op.getDownWeight(), PlacementKind::Weight);
+                    weight_slices, 2 * gate_rows, down_rows, hidden * n))
+                : allocate_value(down_weight, PlacementKind::Weight);
             auto hidden0 = w8a16
                 ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::VxmResult,
                     hidden_slices, 0,
-                    op.getM() * (op.getHidden() / memory.hemispheres)
+                    m * (hidden / memory.hemispheres)
                         / throughput.mxm_rows,
                     hidden_pass_bytes))
                 : allocator.allocate(PlacementKind::VxmResult, hidden_pass_bytes);
             auto hidden1 = w8a16
                 ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::VxmResult1,
                     hidden_slices, 0,
-                    op.getM() * (op.getHidden() / memory.hemispheres)
+                    m * (hidden / memory.hemispheres)
                         / throughput.mxm_rows,
                     hidden_pass_bytes))
                 : allocator.allocate(PlacementKind::VxmResult1, hidden_pass_bytes);
-            const auto result_bytes = get_static_tensor_bytes(op.getResult().getType());
+            const auto result_bytes =
+                get_static_tensor_bytes(graph.output.getResult().getType());
             const auto result = w8a16 && mlir::succeeded(result_bytes)
                 ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::FinalResult,
                     result_slices, 0,
-                    op.getM() * op.getN()
+                    m * n
                         / (throughput.mxm_rows * throughput.mxms_per_hemisphere),
                     *result_bytes))
                 : mlir::succeeded(result_bytes)
@@ -764,6 +787,8 @@ public:
                 {make_task_allocation(rewriter, *result, result_placement)});
             const auto transient = rewriter.getArrayAttr({});
             const auto empty_config = rewriter.getDictionaryAttr({});
+            const auto unit_scale = rewriter.getF32FloatAttr(1.0f);
+            const auto zero_point = rewriter.getI64IntegerAttr(0);
             const mlir::Type projection_element_type = w8a16
                 ? mlir::Type(rewriter.getF32Type())
                 : mlir::Type(rewriter.getI32Type());
@@ -771,12 +796,10 @@ public:
                 ? mlir::Type(rewriter.getF16Type())
                 : mlir::Type(rewriter.getI8Type());
             const auto projection_type = mlir::RankedTensorType::get(
-                {static_cast<int64_t>(op.getM()),
-                    static_cast<int64_t>(op.getHidden())},
+                {m, hidden},
                 projection_element_type);
             const auto hidden_type = mlir::RankedTensorType::get(
-                {static_cast<int64_t>(op.getM()),
-                    static_cast<int64_t>(op.getHidden())},
+                {m, hidden},
                 hidden_element_type);
 
             auto create_matmul_task = [&](mlir::Value lhs, mlir::Value rhs,
@@ -802,17 +825,17 @@ public:
                 return llvm::cast<tensor::MatmulTaskOp>(rewriter.create(task_state));
             };
 
-            auto gate_task = create_matmul_task(op.getInput(), op.getGateWeight(),
-                projection_type, op.getM(), op.getHidden(), op.getK(),
+            auto gate_task = create_matmul_task(input_value, gate_weight,
+                projection_type, m, hidden, k,
                 input_allocations, gate_allocations, transient,
                 rewriter.getDictionaryAttr({
-                    rewriter.getNamedAttr("rhs_scale", op.getGateScaleAttr()),
+                    rewriter.getNamedAttr("rhs_scale", unit_scale),
                 }));
-            auto up_task = create_matmul_task(op.getInput(), op.getUpWeight(),
-                projection_type, op.getM(), op.getHidden(), op.getK(),
+            auto up_task = create_matmul_task(input_value, up_weight,
+                projection_type, m, hidden, k,
                 input_allocations, up_allocations, transient,
                 rewriter.getDictionaryAttr({
-                    rewriter.getNamedAttr("rhs_scale", op.getUpScaleAttr()),
+                    rewriter.getNamedAttr("rhs_scale", unit_scale),
                 }));
 
             mlir::OperationState swish_state(op.getLoc(),
@@ -833,23 +856,28 @@ public:
                 rewriter.getNamedAttr("kind", rewriter.getStringAttr("multiply")),
                 rewriter.getNamedAttr("result_allocations", hidden_allocations),
                 rewriter.getNamedAttr("config", rewriter.getDictionaryAttr({
-                    rewriter.getNamedAttr("output_scale", op.getHiddenScaleAttr()),
-                    rewriter.getNamedAttr("output_zero_point", op.getHiddenZeroPointAttr()),
+                    rewriter.getNamedAttr("output_scale", unit_scale),
+                    rewriter.getNamedAttr("output_zero_point", zero_point),
                 })),
             });
             auto multiply =
                 llvm::cast<tensor::ElementwiseTaskOp>(rewriter.create(multiply_state));
 
             auto down_task = create_matmul_task(multiply.getResult(),
-                op.getDownWeight(), op.getResult().getType(), op.getM(), op.getN(),
-                op.getHidden(), hidden_allocations, down_allocations,
+                down_weight, graph.output.getResult().getType(), m, n,
+                hidden, hidden_allocations, down_allocations,
                 result_allocations, rewriter.getDictionaryAttr({
-                    rewriter.getNamedAttr("lhs_scale", op.getDownLhsScaleAttr()),
-                    rewriter.getNamedAttr("rhs_scale", op.getDownRhsScaleAttr()),
-                    rewriter.getNamedAttr("output_scale", op.getOutputScaleAttr()),
-                    rewriter.getNamedAttr("output_zero_point", op.getOutputZeroPointAttr()),
+                    rewriter.getNamedAttr("lhs_scale", unit_scale),
+                    rewriter.getNamedAttr("rhs_scale", unit_scale),
+                    rewriter.getNamedAttr("output_scale", unit_scale),
+                    rewriter.getNamedAttr("output_zero_point", zero_point),
                 }));
-            rewriter.replaceOp(op, down_task.getResult());
+            mlir::Operation* output_operation = graph.output.getOperation();
+            rewriter.replaceOp(graph.output, down_task.getResult());
+            for (mlir::Operation* operation : llvm::reverse(graph.operations)) {
+                if (operation != output_operation && operation->use_empty())
+                    rewriter.eraseOp(operation);
+            }
         }
 
         for (kernel::SwigluOp op : swiglus) {

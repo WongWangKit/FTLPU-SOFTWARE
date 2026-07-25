@@ -124,17 +124,3 @@ def SwigluOp : FTLPU_Kernel_Op<"swiglu", [Pure]> {
   let assemblyFormat = "$input `,` $gate_weight `,` $up_weight attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
-
-def FfnOp : FTLPU_Kernel_Op<"ffn", [Pure]> {
-  let summary = "Complete gate/up SwiGLU and down-projection FFN";
-  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$gate_weight,
-      AnyRankedTensor:$up_weight, AnyRankedTensor:$down_weight,
-      I64Attr:$m, I64Attr:$k, I64Attr:$hidden, I64Attr:$n,
-      F32Attr:$gate_scale, F32Attr:$up_scale, F32Attr:$hidden_scale,
-      I64Attr:$hidden_zero_point, F32Attr:$down_lhs_scale,
-      F32Attr:$down_rhs_scale, F32Attr:$output_scale,
-      I64Attr:$output_zero_point);
-  let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$input `,` $gate_weight `,` $up_weight `,` $down_weight attr-dict `:` functional-type(operands, results)";
-  let hasVerifier = 1;
-}
