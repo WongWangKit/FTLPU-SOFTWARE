@@ -27,6 +27,12 @@ std::string stream_name(std::size_t packed)
         + std::to_string(stream.index());
 }
 
+std::string vxm_output_stream_name(Hemisphere hemisphere, std::size_t stream)
+{
+    return std::string(hemisphere == Hemisphere::East ? "E" : "W")
+        + std::to_string(stream);
+}
+
 const char* mem_opcode_name(MemOpcode opcode)
 {
     switch (opcode) {
@@ -125,7 +131,9 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
         } else {
             detail << vxm_opcode_name(instruction.opcode);
         }
-        if (instruction.output_stream) detail << " -> " << stream_name(*instruction.output_stream);
+        if (instruction.output_stream)
+            detail << " -> " << vxm_output_stream_name(
+                instruction.output_hemisphere, *instruction.output_stream);
         return {"VXM.ALU" + std::to_string(queue.index), detail.str()};
     }
     case QueueKind::SxmTranspose:

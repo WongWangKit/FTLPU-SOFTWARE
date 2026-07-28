@@ -29,7 +29,6 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
             (byte < 4 ? 1 : 2)
                 + slice / target_.streams().mem_slices_per_register_group + 1);
     }
-    const auto identity = identityMap();
     std::array<int64_t, 16> inputStreams {};
     std::array<int64_t, 16> transposeStreams {};
     for (int64_t stream = 0; stream < 16; ++stream) {
@@ -59,6 +58,24 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     }
 
     int64_t phaseStart = transposeEnd;
+    const int64_t contextRows =
+        op_.getQueryHeads() * op_.getSeqLen();
+    for (int64_t unit = 0;
+         unit < target_.memory().hemispheres
+                * target_.throughput().mxms_per_hemisphere;
+         ++unit) {
+        for (int64_t offset = 0; offset < contextRows; ++offset) {
+            const int64_t outputStream =
+                (unit % target_.throughput().mxms_per_hemisphere)
+                * target_.throughput().mxm_result_streams;
+            emitMxm(rewriter_, op_.getLoc(), phaseStart + offset, unit,
+                "accumulator_read", 0, 0, 0, outputStream,
+                1, 1, layout.contextAddress(0, offset), 1,
+                "sram", true);
+        }
+    }
+    phaseStart += contextRows
+        + target_.throughput().accumulator_read_to_vxm_latency + 1;
     for (const auto& wave : waves) {
         for (int64_t keyBlock = 0; keyBlock < tokenBlocks; ++keyBlock) {
             int64_t loadReady = phaseStart;
@@ -88,11 +105,9 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                         mxmStreams[static_cast<std::size_t>(stream)] = localMxm * 16 + stream;
                     for (int64_t waveIndex = 0; waveIndex < tileRows; ++waveIndex) {
                         const int64_t cycle = capture + waveIndex;
-                        emitSxm(rewriter_, op_.getLoc(), cycle, hemisphere, "transpose",
-                            inputStreams, transposeStreams, identity);
-                        const auto map = blockDiagonalMap(waveIndex, target_);
-                        emitSxm(rewriter_, op_.getLoc(), cycle + 1, hemisphere, "permute",
-                            transposeStreams, mxmStreams, map, "matrix_columns");
+                        emitWavefrontBeat(rewriter_, op_.getLoc(), target_,
+                            cycle, hemisphere, waveIndex, inputStreams,
+                            transposeStreams, mxmStreams, "matrix_columns");
                         emitMxm(rewriter_, op_.getLoc(), cycle + 2,
                             hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
                             "iw", 0, waveIndex, 0, 0, 1, 1);
@@ -100,11 +115,9 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                     for (int64_t tail = 0; tail < tileRows - 1; ++tail) {
                         const int64_t waveIndex = tileRows + tail;
                         const int64_t cycle = capture + waveIndex;
-                        emitSxm(rewriter_, op_.getLoc(), cycle, hemisphere, "transpose",
-                            inputStreams, transposeStreams, identity);
-                        const auto map = blockDiagonalMap(waveIndex, target_);
-                        emitSxm(rewriter_, op_.getLoc(), cycle + 1, hemisphere, "permute",
-                            transposeStreams, mxmStreams, map, "matrix_columns");
+                        emitWavefrontTail(rewriter_, op_.getLoc(), target_,
+                            cycle, hemisphere, waveIndex, transposeStreams,
+                            mxmStreams, "matrix_columns");
                     }
                     loadReady = std::max(loadReady, capture + 2 * tileRows + 1);
                     routeStart += 2 * tileRows - 1;

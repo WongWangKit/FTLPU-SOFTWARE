@@ -17,6 +17,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
     const float scale = 1.0f / std::sqrt(static_cast<float>(op_.getHeadDim()));
     constexpr float causalMaskValue = -1.0e9f;
     constexpr int64_t outputStream = 8;
+    constexpr int64_t alusPerWork = 4;
     auto softmaxSchedule = planAttentionSoftmax(
         op_, stage_plan_.qk_waves, qkEnd, target_);
     if (mlir::failed(softmaxSchedule)) {
@@ -57,7 +58,9 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
             if (!softmaxCycle) continue;
             for (const AttentionWorkItem* work : workLines) {
             const int64_t lane = work->local_mxm;
-            const int64_t aluBase = hemisphere * 6 + lane * 3;
+            const int64_t aluBase =
+                (hemisphere * target_.throughput().mxms_per_hemisphere + lane)
+                * alusPerWork;
             const int64_t inputStream = 32 + lane * 4;
             const int64_t maskStream = 40 + lane * 4;
             const int64_t outputStreamBase = outputStream + lane * 4;
@@ -140,8 +143,8 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                     "alu", aluBase + 2, 0.0f, "fp32", -1, hemisphere);
                 vxm(cycle + 1, aluBase + 1, "exp", "alu", aluBase, 0.0f,
                     "immediate", 0, 0.0f, "fp32", outputStreamBase, hemisphere);
-                vxm(cycle + 2, aluBase + 2, key == 0 ? "pass" : "add",
-                    "alu", key == 0 ? aluBase + 1 : aluBase + 2, 0.0f,
+                vxm(cycle + 2, aluBase + 3, key == 0 ? "pass" : "add",
+                    "alu", key == 0 ? aluBase + 1 : aluBase + 3, 0.0f,
                     key == 0 ? "immediate" : "alu", key == 0 ? 0 : aluBase + 1, 0.0f,
                     "fp32", -1, hemisphere);
                 for (int64_t byte = 0; byte < 4; ++byte) {
@@ -167,7 +170,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                         "read", layout.expScoreAddress(key), inputStream + byte, 1, 1, 0);
                 }
                 vxm(cycle, aluBase, "divide", "stream_f32", inputStream, 0.0f,
-                    "alu", aluBase + 2, 0.0f, "fp32", -1, hemisphere);
+                    "alu", aluBase + 3, 0.0f, "fp32", -1, hemisphere);
                 vxm(cycle + 1, aluBase + 1, "cast", "alu", aluBase, 0.0f,
                     "immediate", 0, 0.0f, "fp16", outputStreamBase, hemisphere);
                 for (int64_t byte = 0; byte < 2; ++byte) {
@@ -251,8 +254,6 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
         transposeStreams[static_cast<std::size_t>(stream)] = 16 + stream;
         outputStreams[static_cast<std::size_t>(stream)] = 32 + stream;
     }
-    const auto identity = identityMap();
-
     for (const auto& wave : stage_plan_.qk_waves) {
         for (const auto& work : wave.slots) {
             if (!work) continue;
@@ -276,11 +277,9 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
                 for (int64_t sxmWave = 0;
                      sxmWave < target_.throughput().tile_rows; ++sxmWave) {
                     const int64_t cycle = capture + sxmWave;
-                    emitSxm(rewriter_, op_.getLoc(), cycle, hemisphere, "transpose",
-                        inputStreams, transposeStreams, identity);
-                    const auto map = blockDiagonalMap(sxmWave, target_);
-                    emitSxm(rewriter_, op_.getLoc(), cycle + 1, hemisphere, "permute",
-                        transposeStreams, outputStreams, map);
+                    emitWavefrontBeat(rewriter_, op_.getLoc(), target_,
+                        cycle, hemisphere, sxmWave, inputStreams,
+                        transposeStreams, outputStreams);
                     for (int64_t stream = 0; stream < 16; ++stream) {
                         const int64_t slice = layout.probabilityDiagonalSlices()[stream];
                         emitMem(rewriter_, op_.getLoc(), cycle + 1 + groups
@@ -301,11 +300,8 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
         for (int64_t tail = 0; tail < target_.throughput().tile_rows - 1; ++tail) {
             const int64_t cycle = ready[static_cast<std::size_t>(hemisphere)]
                 + memToSxm + tail;
-            emitSxm(rewriter_, op_.getLoc(), cycle, hemisphere, "transpose",
-                inputStreams, transposeStreams, identity);
-            const auto map = blockDiagonalMap(tail, target_);
-            emitSxm(rewriter_, op_.getLoc(), cycle + 1, hemisphere, "permute",
-                transposeStreams, outputStreams, map);
+            emitWavefrontTail(rewriter_, op_.getLoc(), target_,
+                cycle, hemisphere, tail, transposeStreams, outputStreams);
         }
         ready[static_cast<std::size_t>(hemisphere)] +=
             target_.throughput().tile_rows - 1;

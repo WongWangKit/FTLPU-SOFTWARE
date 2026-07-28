@@ -75,6 +75,10 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
 
     auto weightSlices = get_slices(gateRaw.getPlacement());
     auto activationSlices = get_slices(activationRoute.getPlacement());
+    const auto activationKind =
+        activationRoute.getPlacement().getAs<mlir::StringAttr>("kind");
+    const bool activationDistributed16 = activationKind
+        && activationKind.getValue() == "fp16_mxm_distributed_16";
     auto hiddenSlices = get_slices(ffn.getHidden0Placement());
     auto resultSlices = get_slices(ffn.getResultPlacement());
     const auto& memory = target.memory();
@@ -82,9 +86,12 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     if (weightSlices.size()
             != static_cast<std::size_t>(
                 memory.w8a16_weight_slice_count)
-        || activationSlices.size()
-            != static_cast<std::size_t>(
-                throughput.mxm_activation_streams)
+        || (!activationDistributed16
+            && activationSlices.size()
+                != static_cast<std::size_t>(
+                    throughput.mxm_activation_streams))
+        || (activationDistributed16
+            && activationSlices.size() != 16)
         || hiddenSlices.size()
             != static_cast<std::size_t>(
                 throughput.mxm_activation_streams)
@@ -148,6 +155,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         projectionType,
         *activationLatency,
         downAccumulatorBase,
+        activationDistributed16,
     });
 }
 

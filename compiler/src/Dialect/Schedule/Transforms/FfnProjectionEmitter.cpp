@@ -91,21 +91,68 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     mlir::Value activationValue;
                     const int64_t segmentCycle =
                         computeCycle + rowOffset;
-                    for (int64_t byte = 0; byte < 2; ++byte) {
-                        activationValue =
-                            context
-                                .emitSliceRead(
-                                    context.activation_route.getInput(),
-                                    context.activation_route,
-                                    segmentCycle
-                                        - context.activation_latency,
-                                    context.activation_slices[byte],
-                                    activationBase + rowOffset,
-                                    segment.rows, 1,
-                                    segment.stream_base + byte, "east",
-                                    "activation",
-                                    context.hemisphereName(hemisphere))
-                                .getOutput();
+                    if (context.activation_distributed16) {
+                        const int64_t base = context.activation_route
+                                                 .getPlacement()
+                                                 .getAs<mlir::IntegerAttr>(
+                                                     "base_row")
+                                                 .getInt();
+                        const int64_t reductionBlocks = k / tile;
+                        for (int64_t localRow = 0;
+                             localRow < segment.rows; ++localRow) {
+                            const int64_t token =
+                                mTile * tile + rowOffset + localRow;
+                            const int64_t tokenBlock = token / tile;
+                            const int64_t tokenWithinBlock = token % tile;
+                            const int64_t tokenWave =
+                                tokenWithinBlock / 8;
+                            const int64_t tokenLane =
+                                tokenWithinBlock % 8;
+                            const int64_t row = base
+                                + (tokenBlock * reductionBlocks
+                                      + reduction)
+                                    * 4
+                                + tokenWave;
+                            for (int64_t byte = 0; byte < 2; ++byte) {
+                                const int64_t slice =
+                                    context.activation_slices[
+                                        2 * tokenLane + byte];
+                                activationValue =
+                                    context
+                                        .emitSliceRead(
+                                            context.activation_route
+                                                .getInput(),
+                                            context.activation_route,
+                                            segmentCycle + localRow
+                                                - context.eastMxmLatency(
+                                                    slice),
+                                            slice, row, 1, 1,
+                                            segment.stream_base + byte,
+                                            "east", "activation",
+                                            context.hemisphereName(
+                                                hemisphere))
+                                        .getOutput();
+                            }
+                        }
+                    } else {
+                        for (int64_t byte = 0; byte < 2; ++byte) {
+                            activationValue =
+                                context
+                                    .emitSliceRead(
+                                        context.activation_route
+                                            .getInput(),
+                                        context.activation_route,
+                                        segmentCycle
+                                            - context.activation_latency,
+                                        context.activation_slices[byte],
+                                        activationBase + rowOffset,
+                                        segment.rows, 1,
+                                        segment.stream_base + byte,
+                                        "east", "activation",
+                                        context.hemisphereName(
+                                            hemisphere))
+                                    .getOutput();
+                        }
                     }
                     gateCompute =
                         rewriter.create<MxmComputeOp>(ffn.getLoc(),

@@ -1,6 +1,8 @@
 build/
 build-*/
 .venv/
+.cache/
+__pycache__/
 *.user
 *.suo
 *.vcxproj.user

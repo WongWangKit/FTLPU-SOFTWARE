@@ -1,9 +1,12 @@
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 
+#include "ftlpu/core/fp16.hpp"
 #include "ftlpu/system/tsp_slice_system.hpp"
 
 // Keep this translation unit rebuilt when BinaryProgram ABI evolves.
+#include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <sstream>
@@ -41,6 +44,91 @@ void require_matrix_binding(const BinaryBinding& binding)
         throw std::logic_error("runtime currently requires a valid rank-2 physical binding");
 }
 
+std::uint16_t read_fp16_element(const TspSliceSystem& system,
+    const BinaryBinding& binding, std::size_t row, std::size_t column)
+{
+    const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
+    const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
+    if (binding.layout == BindingLayout::Fp16PairPlanar
+        && binding.slices.size() == 4) {
+        const std::size_t local_mxm = (column % 64) / 32;
+        const bool dual_hemisphere = (binding.hemisphere_mask & 3) == 3;
+        const auto hemisphere = dual_hemisphere
+            ? static_cast<Hemisphere>((column / 64) % 2)
+            : Hemisphere::East;
+        const std::size_t address = static_cast<std::size_t>(binding.base_row)
+            + (dual_hemisphere ? column / 128 : column / 64) * rows + row;
+        return static_cast<std::uint16_t>(read_sram_byte(system, hemisphere,
+                   binding.slices[local_mxm * 2], address, column % 32))
+            | (static_cast<std::uint16_t>(read_sram_byte(system, hemisphere,
+                   binding.slices[local_mxm * 2 + 1], address, column % 32))
+                << 8);
+    }
+    if (binding.layout == BindingLayout::Fp16PairPlanar
+        && binding.slices.size() == 2) {
+        const std::size_t address = static_cast<std::size_t>(binding.base_row)
+            + (column / 32) * rows + row;
+        return static_cast<std::uint16_t>(read_sram_byte(system,
+                   Hemisphere::East, binding.slices[0], address, column % 32))
+            | (static_cast<std::uint16_t>(read_sram_byte(system,
+                   Hemisphere::East, binding.slices[1], address, column % 32))
+                << 8);
+    }
+    if (binding.layout == BindingLayout::Fp16MxmDistributed16
+        && binding.slices.size() == 16) {
+        const std::size_t hidden_blocks = columns / 32;
+        const std::size_t token_block = row / 32;
+        const std::size_t token_wave = (row % 32) / 8;
+        const std::size_t token_lane = row % 8;
+        const std::size_t hidden_block = column / 32;
+        const std::size_t feature_wave = (column % 32) / 8;
+        const std::size_t feature_lane = column % 8;
+        const std::size_t address = static_cast<std::size_t>(binding.base_row)
+            + (token_block * hidden_blocks + hidden_block) * 4 + token_wave;
+        return static_cast<std::uint16_t>(read_sram_byte(system,
+                   Hemisphere::East, binding.slices[2 * token_lane], address,
+                   feature_wave * 8 + feature_lane))
+            | (static_cast<std::uint16_t>(read_sram_byte(system,
+                   Hemisphere::East, binding.slices[2 * token_lane + 1],
+                   address, feature_wave * 8 + feature_lane))
+                << 8);
+    }
+    throw std::logic_error(
+        "device copy does not support the source FP16 layout");
+}
+
+void write_fp16_element(TspSliceSystem& system,
+    const BinaryBinding& binding, std::size_t row, std::size_t column,
+    std::uint16_t value)
+{
+    const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
+    if (binding.layout == BindingLayout::Fp16MxmDistributed16
+        && binding.slices.size() == 16) {
+        const std::size_t hidden_blocks = columns / 32;
+        const std::size_t token_block = row / 32;
+        const std::size_t token_wave = (row % 32) / 8;
+        const std::size_t token_lane = row % 8;
+        const std::size_t hidden_block = column / 32;
+        const std::size_t feature_wave = (column % 32) / 8;
+        const std::size_t feature_lane = column % 8;
+        const std::size_t address = static_cast<std::size_t>(binding.base_row)
+            + (token_block * hidden_blocks + hidden_block) * 4 + token_wave;
+        for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
+            write_sram_byte(system, hemisphere,
+                binding.slices[2 * token_lane], address,
+                feature_wave * 8 + feature_lane,
+                static_cast<std::uint8_t>(value));
+            write_sram_byte(system, hemisphere,
+                binding.slices[2 * token_lane + 1], address,
+                feature_wave * 8 + feature_lane,
+                static_cast<std::uint8_t>(value >> 8));
+        });
+        return;
+    }
+    throw std::logic_error(
+        "device copy does not support the destination FP16 layout");
+}
+
 } // namespace
 
 CModelRuntime::CModelRuntime(TspSliceSystem& system)
@@ -50,7 +138,10 @@ CModelRuntime::CModelRuntime(TspSliceSystem& system)
 
 void CModelRuntime::load(const BinaryProgram& program)
 {
-    if (program.target_abi != kLpu32StreamTargetAbi) {
+    const bool cmodelLargeSram =
+        program.target_name == "lpu32-cmodel-large-sram";
+    if (program.target_abi != kLpu32StreamTargetAbi
+        && !cmodelLargeSram) {
         std::ostringstream message;
         message << "CModel target ABI mismatch: binary target '"
                 << program.target_name << "' has 0x" << std::hex
@@ -59,38 +150,107 @@ void CModelRuntime::load(const BinaryProgram& program)
                 << kLpu32StreamTargetAbi;
         throw std::invalid_argument(message.str());
     }
+    system_.reset_execution_state();
     load_queue_programs_into_icu(program.queues, system_.icu());
     loaded_max_cycle_ = program.max_cycle;
     bindings_ = program.bindings;
     for (const BinaryBinding& binding : bindings_) {
-        if (binding.access != BindingAccess::Internal
-            || binding.layout != BindingLayout::Fp32CausalMaskTile)
+        if (binding.access != BindingAccess::Internal) continue;
+        if (binding.initializer == BindingInitializer::None) continue;
+        if (binding.initializer == BindingInitializer::Zero) {
+            if (binding.base_row < 0 || binding.instruction_count <= 0)
+                throw std::logic_error("invalid zero-initialized internal binding");
+            for (std::int64_t row = 0; row < binding.instruction_count; ++row)
+                for (std::uint16_t slice : binding.slices)
+                    for (std::size_t column = 0; column < 32; ++column)
+                        for_each_binding_hemisphere(binding,
+                            [&](Hemisphere hemisphere) {
+                                write_sram_byte(system_, hemisphere, slice,
+                                    static_cast<std::size_t>(binding.base_row + row),
+                                    column, 0);
+                            });
             continue;
-        require_matrix_binding(binding);
-        if (binding.element_type != BindingElementType::F32
-            || binding.slices.size() != sizeof(float)
-            || binding.shape[0] + 1 != binding.shape[1])
-            throw std::logic_error("invalid internal causal-mask binding");
-        const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
-        const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
-        const std::size_t stride =
-            static_cast<std::size_t>(std::abs(binding.address_stride));
-        for (std::size_t row = 0; row < rows; ++row) {
-            const std::size_t local_key = row + 1;
-            const std::size_t address =
-                static_cast<std::size_t>(binding.base_row) + row * stride;
-            for (std::size_t query_lane = 0; query_lane < columns; ++query_lane) {
-                const float mask = local_key <= query_lane ? 0.0f : -1.0e9f;
-                const std::uint32_t bits = std::bit_cast<std::uint32_t>(mask);
-                for (std::size_t byte = 0; byte < binding.slices.size(); ++byte) {
-                    for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
-                        write_sram_byte(system_, hemisphere, binding.slices[byte],
-                            address, query_lane,
-                            static_cast<std::uint8_t>(bits >> (8 * byte)));
-                    });
+        }
+        if (binding.initializer == BindingInitializer::CausalMask) {
+            require_matrix_binding(binding);
+            if (binding.layout != BindingLayout::Fp32CausalMaskTile
+                || binding.element_type != BindingElementType::F32
+                || binding.slices.size() != sizeof(float)
+                || binding.shape[0] + 1 != binding.shape[1])
+                throw std::logic_error("invalid internal causal-mask binding");
+            const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
+            const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
+            const std::size_t stride =
+                static_cast<std::size_t>(std::abs(binding.address_stride));
+            for (std::size_t row = 0; row < rows; ++row) {
+                const std::size_t local_key = row + 1;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row) + row * stride;
+                for (std::size_t query_lane = 0; query_lane < columns; ++query_lane) {
+                    const float mask = local_key <= query_lane ? 0.0f : -1.0e9f;
+                    const std::uint32_t bits = std::bit_cast<std::uint32_t>(mask);
+                    for (std::size_t byte = 0; byte < binding.slices.size(); ++byte)
+                        for_each_binding_hemisphere(binding,
+                            [&](Hemisphere hemisphere) {
+                                write_sram_byte(system_, hemisphere,
+                                    binding.slices[byte], address, query_lane,
+                                    static_cast<std::uint8_t>(bits >> (8 * byte)));
+                            });
                 }
             }
+            continue;
         }
+        if (binding.initializer == BindingInitializer::RopeTable) {
+            if (binding.layout != BindingLayout::Fp16RopeTable
+                || binding.element_type != BindingElementType::F16
+                || binding.shape.size() != 3 || binding.shape[2] != 2
+                || binding.slices.size() != 4 || binding.base_row < 0
+                || binding.address_stride == 0
+                || binding.rope_head_dim != 2 * binding.shape[1]
+                || !std::isfinite(binding.rope_theta)
+                || binding.rope_theta <= 1.0f)
+                throw std::logic_error("invalid internal RoPE-table binding");
+            const std::size_t sequence =
+                static_cast<std::size_t>(binding.shape[0]);
+            const std::size_t dimensions =
+                static_cast<std::size_t>(binding.shape[1]);
+            const std::size_t stride =
+                static_cast<std::size_t>(std::abs(binding.address_stride));
+            for (std::size_t token = 0; token < sequence; ++token) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + token * stride;
+                for (std::size_t dimension = 0;
+                     dimension < dimensions; ++dimension) {
+                    const float inverse = 1.0f / std::pow(
+                        binding.rope_theta,
+                        static_cast<float>(2 * dimension)
+                            / binding.rope_head_dim);
+                    const float angle = static_cast<float>(token) * inverse;
+                    const auto cosine =
+                        Fp16::from_float(std::cos(angle)).bits();
+                    const auto sine =
+                        Fp16::from_float(std::sin(angle)).bits();
+                    for_each_binding_hemisphere(binding,
+                        [&](Hemisphere hemisphere) {
+                            write_sram_byte(system_, hemisphere,
+                                binding.slices[0], address, dimension,
+                                static_cast<std::uint8_t>(cosine));
+                            write_sram_byte(system_, hemisphere,
+                                binding.slices[1], address, dimension,
+                                static_cast<std::uint8_t>(cosine >> 8));
+                            write_sram_byte(system_, hemisphere,
+                                binding.slices[2], address, dimension,
+                                static_cast<std::uint8_t>(sine));
+                            write_sram_byte(system_, hemisphere,
+                                binding.slices[3], address, dimension,
+                                static_cast<std::uint8_t>(sine >> 8));
+                        });
+                }
+            }
+            continue;
+        }
+        throw std::logic_error("unsupported internal binding initializer");
     }
 }
 
@@ -105,11 +265,18 @@ const BinaryBinding& CModelRuntime::find_binding(BindingAccess access, std::size
 void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t> data)
 {
     const auto& binding = find_binding(BindingAccess::Input, index);
-    require_matrix_binding(binding);
+    if ((binding.shape.size() != 1 && binding.shape.size() != 2)
+        || binding.base_row < 0 || binding.address_stride == 0
+        || binding.slices.empty())
+        throw std::logic_error(
+            "runtime requires a valid rank-1 or rank-2 physical input binding");
     if (data.size() != binding.byte_size)
         throw std::invalid_argument("input byte size or element type does not match binding");
-    const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
-    const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
+    const bool vector = binding.shape.size() == 1;
+    const std::size_t rows =
+        vector ? 1 : static_cast<std::size_t>(binding.shape[0]);
+    const std::size_t columns = static_cast<std::size_t>(
+        vector ? binding.shape[0] : binding.shape[1]);
     const std::size_t row_stride = static_cast<std::size_t>(std::abs(binding.address_stride));
 
     if (binding.layout == BindingLayout::Vector) {
@@ -162,6 +329,163 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
                     write_sram_byte(system_, hemisphere, binding.slices[3], address,
                         k % 32, data[offset + 1]);
                 });
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16PairPlanar
+        && binding.element_type == BindingElementType::F16
+        && binding.slices.size() == 2) {
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (column / 32) * rows + row;
+                const std::size_t offset = (row * columns + column) * 2;
+                for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
+                    write_sram_byte(system_, hemisphere, binding.slices[0],
+                        address, column % 32, data[offset]);
+                    write_sram_byte(system_, hemisphere, binding.slices[1],
+                        address, column % 32, data[offset + 1]);
+                });
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16SxmDistributed16
+        && binding.element_type == BindingElementType::F16
+        && binding.slices.size() == 16) {
+        if (vector) {
+            if (columns % 32 != 0)
+                throw std::logic_error(
+                    "distributed16 FP16 vector requires 32-aligned length");
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t hiddenBlock = column / 32;
+                const std::size_t featureWave = (column % 32) / 8;
+                const std::size_t featureLane = column % 8;
+                const std::size_t offset = column * 2;
+                for (std::size_t tokenWave = 0;
+                     tokenWave < 4; ++tokenWave) {
+                    const std::size_t destinationTile =
+                        (tokenWave + 4 - featureWave) % 4;
+                    const std::size_t address =
+                        static_cast<std::size_t>(binding.base_row)
+                        + hiddenBlock * 4 + tokenWave;
+                    for_each_binding_hemisphere(
+                        binding, [&](Hemisphere hemisphere) {
+                            for (std::size_t lane = 0; lane < 8; ++lane) {
+                                write_sram_byte(system_, hemisphere,
+                                    binding.slices[2 * featureLane],
+                                    address, destinationTile * 8 + lane,
+                                    data[offset]);
+                                write_sram_byte(system_, hemisphere,
+                                    binding.slices[2 * featureLane + 1],
+                                    address, destinationTile * 8 + lane,
+                                    data[offset + 1]);
+                            }
+                        });
+                }
+            }
+            return;
+        }
+        if (rows % 32 != 0 || columns % 32 != 0)
+            throw std::logic_error(
+                "distributed16 FP16 input requires 32-aligned dimensions");
+        const std::size_t hidden_blocks = columns / 32;
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t token_block = row / 32;
+            const std::size_t token_wave = (row % 32) / 8;
+            const std::size_t token_lane = row % 8;
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t hidden_block = column / 32;
+                const std::size_t feature_wave = (column % 32) / 8;
+                const std::size_t feature_lane = column % 8;
+                const std::size_t destination_tile =
+                    (token_wave + 4 - feature_wave) % 4;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (token_block * hidden_blocks + hidden_block) * 4
+                    + token_wave;
+                const std::size_t offset = (row * columns + column) * 2;
+                for_each_binding_hemisphere(
+                    binding, [&](Hemisphere hemisphere) {
+                        write_sram_byte(system_, hemisphere,
+                            binding.slices[2 * feature_lane], address,
+                            destination_tile * 8 + token_lane,
+                            data[offset]);
+                        write_sram_byte(system_, hemisphere,
+                            binding.slices[2 * feature_lane + 1], address,
+                            destination_tile * 8 + token_lane,
+                            data[offset + 1]);
+                    });
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16VxmDistributed16
+        && binding.element_type == BindingElementType::F16
+        && binding.slices.size() == 16) {
+        if (columns % 32 != 0 || (!vector && rows % 32 != 0))
+            throw std::logic_error(
+                "VXM distributed16 FP16 input requires 32-aligned dimensions");
+        const std::size_t hidden_blocks = columns / 32;
+        const std::size_t stored_rows = vector ? 32 : rows;
+        for (std::size_t row = 0; row < stored_rows; ++row) {
+            const std::size_t logical_row = vector ? 0 : row;
+            const std::size_t token_block = row / 32;
+            const std::size_t lane = row % 32;
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t hidden_block = column / 32;
+                const std::size_t feature_wave = (column % 32) / 8;
+                const std::size_t feature_lane = column % 8;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (token_block * hidden_blocks + hidden_block) * 4
+                    + feature_wave;
+                const std::size_t offset =
+                    (logical_row * columns + column) * 2;
+                for_each_binding_hemisphere(
+                    binding, [&](Hemisphere hemisphere) {
+                        write_sram_byte(system_, hemisphere,
+                            binding.slices[2 * feature_lane], address,
+                            lane, data[offset]);
+                        write_sram_byte(system_, hemisphere,
+                            binding.slices[2 * feature_lane + 1], address,
+                            lane, data[offset + 1]);
+                    });
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16MxmDistributed16
+        && binding.element_type == BindingElementType::F16
+        && binding.slices.size() == 16) {
+        if (rows % 32 != 0 || columns % 32 != 0)
+            throw std::logic_error(
+                "MXM distributed16 FP16 input requires 32-aligned dimensions");
+        const std::size_t hidden_blocks = columns / 32;
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t token_block = row / 32;
+            const std::size_t token_wave = (row % 32) / 8;
+            const std::size_t token_lane = row % 8;
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t hidden_block = column / 32;
+                const std::size_t feature_wave = (column % 32) / 8;
+                const std::size_t feature_lane = column % 8;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (token_block * hidden_blocks + hidden_block) * 4
+                    + token_wave;
+                const std::size_t offset = (row * columns + column) * 2;
+                for_each_binding_hemisphere(
+                    binding, [&](Hemisphere hemisphere) {
+                        write_sram_byte(system_, hemisphere,
+                            binding.slices[2 * token_lane], address,
+                            feature_wave * 8 + feature_lane, data[offset]);
+                        write_sram_byte(system_, hemisphere,
+                            binding.slices[2 * token_lane + 1], address,
+                            feature_wave * 8 + feature_lane, data[offset + 1]);
+                    });
             }
         }
         return;
@@ -225,6 +549,25 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
     const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
     const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
     const std::size_t row_stride = static_cast<std::size_t>(std::abs(binding.address_stride));
+    if (binding.layout == BindingLayout::Fp16MxmActivationPlanar
+        && binding.element_type == BindingElementType::F16
+        && binding.slices.size() == 4) {
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (column / 32) * rows + row;
+                const std::size_t offset = (row * columns + column) * 2;
+                result[offset] = read_sram_byte(system_, Hemisphere::East,
+                    binding.slices[0], address, column % 32);
+                result[offset + 1] = read_sram_byte(system_, Hemisphere::East,
+                    binding.slices[1], address, column % 32);
+            }
+        }
+        return result;
+    }
     if (binding.layout == BindingLayout::Vector
         && binding.element_type == BindingElementType::I8 && binding.slices.size() == 1) {
         std::vector<std::uint8_t> result(static_cast<std::size_t>(binding.byte_size));
@@ -259,6 +602,103 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
         }
         return result;
     }
+    if (binding.layout == BindingLayout::Fp16SxmDistributed16
+        && binding.element_type == BindingElementType::F16
+        && binding.slices.size() == 16) {
+        if (rows % 32 != 0 || columns % 32 != 0)
+            throw std::logic_error(
+                "distributed16 FP16 output requires 32-aligned dimensions");
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        const std::size_t hidden_blocks = columns / 32;
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t token_block = row / 32;
+            const std::size_t token_wave = (row % 32) / 8;
+            const std::size_t token_lane = row % 8;
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t hidden_block = column / 32;
+                const std::size_t feature_wave = (column % 32) / 8;
+                const std::size_t feature_lane = column % 8;
+                const std::size_t source_tile =
+                    (token_wave + 4 - feature_wave) % 4;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (token_block * hidden_blocks + hidden_block) * 4
+                    + token_wave;
+                const std::size_t offset = (row * columns + column) * 2;
+                result[offset] = read_sram_byte(system_,
+                    Hemisphere::East,
+                    binding.slices[2 * feature_lane], address,
+                    source_tile * 8 + token_lane);
+                result[offset + 1] = read_sram_byte(system_,
+                    Hemisphere::East,
+                    binding.slices[2 * feature_lane + 1], address,
+                    source_tile * 8 + token_lane);
+            }
+        }
+        return result;
+    }
+    if (binding.layout == BindingLayout::Fp16VxmDistributed16
+        && binding.element_type == BindingElementType::F16
+        && binding.slices.size() == 16) {
+        if (rows % 32 != 0 || columns % 32 != 0)
+            throw std::logic_error(
+                "VXM distributed16 FP16 output requires 32-aligned dimensions");
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        const std::size_t hidden_blocks = columns / 32;
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t token_block = row / 32;
+            const std::size_t lane = row % 32;
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t hidden_block = column / 32;
+                const std::size_t feature_wave = (column % 32) / 8;
+                const std::size_t feature_lane = column % 8;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (token_block * hidden_blocks + hidden_block) * 4
+                    + feature_wave;
+                const std::size_t offset = (row * columns + column) * 2;
+                result[offset] = read_sram_byte(system_, Hemisphere::East,
+                    binding.slices[2 * feature_lane], address, lane);
+                result[offset + 1] = read_sram_byte(system_, Hemisphere::East,
+                    binding.slices[2 * feature_lane + 1], address, lane);
+            }
+        }
+        return result;
+    }
+    if (binding.layout == BindingLayout::Fp16MxmDistributed16
+        && binding.element_type == BindingElementType::F16
+        && binding.slices.size() == 16) {
+        if (rows % 32 != 0 || columns % 32 != 0)
+            throw std::logic_error(
+                "MXM distributed16 FP16 output requires 32-aligned dimensions");
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        const std::size_t hidden_blocks = columns / 32;
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t token_block = row / 32;
+            const std::size_t token_wave = (row % 32) / 8;
+            const std::size_t token_lane = row % 8;
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t hidden_block = column / 32;
+                const std::size_t feature_wave = (column % 32) / 8;
+                const std::size_t feature_lane = column % 8;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (token_block * hidden_blocks + hidden_block) * 4
+                    + token_wave;
+                const std::size_t offset = (row * columns + column) * 2;
+                result[offset] = read_sram_byte(system_, Hemisphere::East,
+                    binding.slices[2 * token_lane], address,
+                    feature_wave * 8 + feature_lane);
+                result[offset + 1] = read_sram_byte(system_, Hemisphere::East,
+                    binding.slices[2 * token_lane + 1], address,
+                    feature_wave * 8 + feature_lane);
+            }
+        }
+        return result;
+    }
     if (binding.layout != BindingLayout::Int32BytePlanar
         || binding.element_type != BindingElementType::I32 || binding.slices.size() != 4)
         throw std::logic_error("unsupported output binding layout");
@@ -273,6 +713,40 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
         }
     }
     return result;
+}
+
+void CModelRuntime::copy_binding(
+    const BinaryBinding& source, const BinaryBinding& destination)
+{
+    require_matrix_binding(source);
+    require_matrix_binding(destination);
+    if (source.element_type != BindingElementType::F16
+        || destination.element_type != BindingElementType::F16
+        || source.shape != destination.shape
+        || source.byte_size != destination.byte_size)
+        throw std::invalid_argument(
+            "device binding copy requires matching FP16 tensors");
+    if (source.layout == destination.layout
+        && source.base_row == destination.base_row
+        && source.slices == destination.slices
+        && source.hemisphere_mask == destination.hemisphere_mask)
+        return;
+
+    if ((source.hemisphere_mask & destination.hemisphere_mask) != 0) {
+        for (const std::uint16_t source_slice : source.slices)
+            if (std::find(destination.slices.begin(),
+                    destination.slices.end(), source_slice)
+                != destination.slices.end())
+                throw std::logic_error(
+                    "device binding copy requires non-overlapping storage");
+    }
+
+    const std::size_t rows = static_cast<std::size_t>(source.shape[0]);
+    const std::size_t columns = static_cast<std::size_t>(source.shape[1]);
+    for (std::size_t row = 0; row < rows; ++row)
+        for (std::size_t column = 0; column < columns; ++column)
+            write_fp16_element(system_, destination, row, column,
+                read_fp16_element(system_, source, row, column));
 }
 
 void CModelRuntime::load_file(const std::filesystem::path& path)

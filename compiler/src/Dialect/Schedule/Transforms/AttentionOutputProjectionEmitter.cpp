@@ -27,10 +27,15 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
     };
     const int64_t weightLoadLead =
         (target_.memory().hemispheres - 1) * 8 + 3 + weightToIw + 1;
-    const int64_t accumulatorCapacity =
-        target_.memory().banks_per_slice * target_.memory().words_per_bank;
+    // MXM accumulator SRAM is a separate fixed-depth resource from MEM.
+    const int64_t accumulatorCapacity = 8192;
     const int64_t outputAccumulatorBase =
         accumulatorCapacity - op_.getSeqLen();
+    const auto outputWeightScaleAttr = op_.output.getConfig()
+        .getAs<mlir::FloatAttr>("output_weight_scale");
+    const float outputWeightScale = outputWeightScaleAttr
+        ? static_cast<float>(outputWeightScaleAttr.getValueAsDouble())
+        : 1.0f;
     const auto accumulatorAddress = [&](int64_t token) {
         return outputAccumulatorBase + token;
     };
@@ -64,7 +69,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                          lane < target_.throughput().lanes_per_tile; ++lane) {
                         emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), cycle, lane,
                             "multiply", "stream_i8", 32 + lane, 0.0f,
-                            "immediate", 0, 1.0f, "fp32", -1, hemi, hemi);
+                            "immediate", 0, outputWeightScale, "fp32", -1, hemi, hemi);
                         emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), cycle + 1,
                             8 + lane, "cast", "alu", lane, 0.0f,
                             "immediate", 0, 0.0f, "fp16",

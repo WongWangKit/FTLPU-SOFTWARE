@@ -15,6 +15,9 @@ def MemTransferOp : FTLPU_Schedule_Op<"mem_transfer", [MemoryEffects<[MemWrite]>
       StrAttr:$opcode,
       I64Attr:$address, I64Attr:$packed_stream, I64Attr:$repeat_count,
       I64Attr:$repeat_interval, I64Attr:$address_stride,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$wave_address_stride,
       StrAttr:$accumulator_destination);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
@@ -36,6 +39,7 @@ def MemReadOp : FTLPU_Schedule_Op<"mem_read"> {
   let summary = "Issue a cycle-accurate MEM read stream";
   let arguments = (ins AnyRankedTensor:$input, I64Attr:$cycle, I64Attr:$duration,
       I64Attr:$stream_base, I64Attr:$stream_count, I64Attr:$register_id,
+      OptionalAttr<ArrayAttr>:$register_ids,
       StrAttr:$direction, StrAttr:$role, DictionaryAttr:$address,
       DictionaryAttr:$placement, I64Attr:$bytes);
   let results = (outs AnyRankedTensor:$output);
@@ -178,6 +182,9 @@ def BindingOp : FTLPU_Schedule_Op<"binding"> {
   let summary = "Runtime-visible tensor or internal constant binding";
   let arguments = (ins Variadic<AnyRankedTensor>:$source,
       I64Attr:$index, StrAttr:$access, StrAttr:$role,
+      OptionalAttr<StrAttr>:$name, OptionalAttr<I64Attr>:$ready_cycle,
+      OptionalAttr<StrAttr>:$initializer,
+      OptionalAttr<DictionaryAttr>:$initializer_config,
       I64Attr:$bytes, DictionaryAttr:$placement);
   let results = (outs AnyRankedTensor:$value);
   let assemblyFormat = "$source attr-dict `:` functional-type(operands, results)";

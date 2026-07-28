@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validates compiler-generated Q/K/V, RoPE, QK, and softmax on CModel."""
+"""Validates complete compiler-generated Attention on the runtime and CModel."""
 
 import argparse
 import os
@@ -23,6 +23,21 @@ def main() -> None:
     pipeline = args.output_dir / "attention.pipeline.svg"
     subprocess.run([str(args.opt), "--input", str(args.input), "--output",
                     str(command_ir), "--pipeline", "ftlpu-stablehlo-to-commands"], check=True)
+    command_text = command_ir.read_text(encoding="utf-8")
+    required_ops = {
+        "binding": "ftlpu.command.binding",
+        "MEM": "ftlpu.command.mem",
+        "MXM": "ftlpu.command.mxm",
+        "VXM": "ftlpu.command.vxm",
+        "SXM": "ftlpu.command.sxm",
+    }
+    missing = [name for name, op in required_ops.items() if op not in command_text]
+    if missing:
+        raise RuntimeError(
+            "complete Attention Command IR is missing: " + ", ".join(missing))
+    if 'opcode = "iw"' not in command_text or 'weight_column = 3' not in command_text:
+        raise RuntimeError(
+            "Attention Command IR is missing reverse-column QK IW loads")
     subprocess.run([str(args.translate), "--input", str(command_ir),
                     "--output", str(binary)], check=True)
     environment = os.environ.copy()

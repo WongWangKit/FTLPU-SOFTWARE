@@ -12,6 +12,8 @@ class FTLPU_Command_Op<string mnemonic, list<Trait> traits = []>
 def BindingOp : FTLPU_Command_Op<"binding"> {
   let summary = "Runtime-visible tensor binding and physical MEM placement";
   let arguments = (ins I64Attr:$index, StrAttr:$access, StrAttr:$role,
+      StrAttr:$name, I64Attr:$ready_cycle,
+      StrAttr:$initializer, DictionaryAttr:$initializer_config,
       ArrayAttr:$shape, StrAttr:$element_type, I64Attr:$bytes,
       DictionaryAttr:$placement);
   let assemblyFormat = "attr-dict";
@@ -22,7 +24,10 @@ def MemOp : FTLPU_Command_Op<"mem", [MemoryEffects<[MemWrite]>]> {
   let summary = "Compressed command for one ICU MEM queue";
   let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
       I64Attr:$address, I64Attr:$packed_stream, I64Attr:$repeat_count,
-      I64Attr:$repeat_interval, I64Attr:$address_stride);
+      I64Attr:$repeat_interval, I64Attr:$address_stride,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$wave_address_stride);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }

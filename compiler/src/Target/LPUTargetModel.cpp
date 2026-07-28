@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "ftlpu/software/runtime/target_abi.hpp"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/JSON.h"
 #include "mlir/IR/Builders.h"
 
@@ -448,12 +449,19 @@ bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destin
         return direction == StreamDirection::East;
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::VxmInput)
         return direction == StreamDirection::East || direction == StreamDirection::West;
+    if (source == StreamEndpoint::Mem && destination == StreamEndpoint::SxmInput)
+        return direction == StreamDirection::East;
+    if (source == StreamEndpoint::MxmResult
+        && destination == StreamEndpoint::VxmInput)
+        return direction == StreamDirection::West;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::MxmWeight)
         return direction == StreamDirection::East;
     if (source == StreamEndpoint::MxmResult && destination == StreamEndpoint::Mem)
         return direction == StreamDirection::West;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::Mem)
         return direction == StreamDirection::East;
+    if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::Mem)
+        return direction == StreamDirection::West;
     return false;
 }
 
@@ -463,6 +471,14 @@ std::optional<int64_t> LPUTargetModel::route_stream_count(StreamEndpoint source,
     if (!supports_route(source, destination, direction)) return std::nullopt;
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::VxmInput)
         return throughput_.lanes_per_tile;
+    if ((source == StreamEndpoint::Mem
+            && destination == StreamEndpoint::SxmInput)
+        || (source == StreamEndpoint::SxmResult
+            && destination == StreamEndpoint::Mem))
+        return 2;
+    if (source == StreamEndpoint::MxmResult
+        && destination == StreamEndpoint::VxmInput)
+        return throughput_.mxm_result_streams;
     if (destination == StreamEndpoint::MxmWeight)
         return throughput_.mxm_load_streams_per_cycle;
     if (destination == StreamEndpoint::MxmActivation)
@@ -490,6 +506,10 @@ std::optional<int64_t> LPUTargetModel::route_issue_cycles(StreamEndpoint source,
         return divide_ceil(bytes, vector_bytes * throughput_.mxm_load_streams_per_cycle);
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::MxmActivation)
         return divide_ceil(bytes, vector_bytes);
+    if (source == StreamEndpoint::Mem && destination == StreamEndpoint::SxmInput)
+        return divide_ceil(bytes, 2 * vector_bytes);
+    if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::Mem)
+        return divide_ceil(bytes, 2 * vector_bytes);
     if (source == StreamEndpoint::MxmResult && destination == StreamEndpoint::Mem)
         return divide_ceil(bytes, vector_bytes * throughput_.mxm_result_streams);
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::Mem)
@@ -557,6 +577,31 @@ LPUTargetModel::attention_activation_slices() const
     llvm::SmallVector<int64_t> slices;
     for (int64_t index = 0; index < throughput_.mxm_activation_streams; ++index)
         slices.push_back(memory_.w8a16_activation_slice_base + index);
+    return slices;
+}
+
+llvm::SmallVector<int64_t>
+LPUTargetModel::mxm_distributed_activation_slices() const
+{
+    llvm::SmallDenseSet<int64_t, 16> reserved;
+    for (int64_t slice : attention_weight_slices())
+        reserved.insert(slice);
+    for (int64_t slice : attention_output_weight_slices())
+        reserved.insert(slice);
+    for (int64_t slice : attention_result_slices())
+        reserved.insert(slice);
+    for (int64_t slice : attention_activation_slices())
+        reserved.insert(slice);
+    for (int64_t index = 0;
+         index < throughput_.mxm_result_streams; ++index)
+        reserved.insert(memory_.w8a16_result_slice_base + index);
+
+    llvm::SmallVector<int64_t> slices;
+    for (int64_t slice = memory_.slices_per_hemisphere - 1;
+         slice >= 0 && slices.size() < 16; --slice) {
+        if (!reserved.contains(slice)) slices.push_back(slice);
+    }
+    llvm::reverse(slices);
     return slices;
 }
 
@@ -647,8 +692,17 @@ std::optional<int64_t> LPUTargetModel::transport_latency(StreamEndpoint source,
         || mem_slice < 0 || mem_slice >= memory_.slices_per_hemisphere)
         return std::nullopt;
     const int64_t group = mem_slice / streams_.mem_slices_per_register_group;
+    if (source == StreamEndpoint::MxmResult
+        && destination == StreamEndpoint::VxmInput)
+        return throughput_.accumulator_to_vxm_latency;
+    if (source == StreamEndpoint::Mem
+        && destination == StreamEndpoint::SxmInput)
+        return throughput_.mem_to_sxm_latency - group;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::MxmWeight)
         return 1;
+    if (source == StreamEndpoint::SxmResult
+        && destination == StreamEndpoint::Mem)
+        return streams_.system_register_columns - 2 - group;
     if (source == StreamEndpoint::Mem && direction == StreamDirection::West)
         return group + 2;
     if (source == StreamEndpoint::Mem)
@@ -672,6 +726,8 @@ std::string_view LPUTargetModel::endpoint_name(StreamEndpoint endpoint)
     case StreamEndpoint::MxmResult: return "MXM.result";
     case StreamEndpoint::VxmInput: return "VXM.input";
     case StreamEndpoint::VxmResult: return "VXM.result";
+    case StreamEndpoint::SxmInput: return "SXM.input";
+    case StreamEndpoint::SxmResult: return "SXM.result";
     }
     return "unknown";
 }

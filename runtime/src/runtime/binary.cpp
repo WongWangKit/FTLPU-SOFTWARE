@@ -12,7 +12,6 @@ namespace ftlpu::software::runtime {
 namespace {
 
 constexpr std::array<char, 8> kMagic {'F', 'T', 'L', 'P', 'U', 'B', '0', '1'};
-constexpr std::uint32_t kCurrentVersion = 5;
 
 template <typename T>
 void write_scalar(std::ostream& os, T value)
@@ -49,6 +48,24 @@ void write_binding(std::ostream& os, const BinaryBinding& binding)
     write_scalar<std::int64_t>(os, binding.address_stride);
     for (std::uint64_t dimension : binding.shape) write_scalar(os, dimension);
     for (std::uint16_t slice : binding.slices) write_scalar(os, slice);
+    if (binding.role.size() > std::numeric_limits<std::uint16_t>::max()
+        || binding.name.size() > std::numeric_limits<std::uint16_t>::max())
+        throw std::runtime_error("FTLPU binding metadata string is too long");
+    write_scalar<std::uint16_t>(
+        os, static_cast<std::uint16_t>(binding.role.size()));
+    write_scalar<std::uint16_t>(
+        os, static_cast<std::uint16_t>(binding.name.size()));
+    write_scalar<std::uint64_t>(os, binding.ready_cycle);
+    write_scalar<std::uint16_t>(
+        os, static_cast<std::uint16_t>(binding.initializer));
+    write_scalar<std::uint16_t>(os, 0);
+    write_scalar<float>(os, binding.rope_theta);
+    write_scalar<std::uint32_t>(os, binding.rope_head_dim);
+    os.write(binding.role.data(),
+        static_cast<std::streamsize>(binding.role.size()));
+    os.write(binding.name.data(),
+        static_cast<std::streamsize>(binding.name.size()));
+    if (!os) throw std::runtime_error("failed to write binding metadata");
 }
 
 BinaryBinding read_binding(std::istream& is, std::uint32_t version)
@@ -72,20 +89,36 @@ BinaryBinding read_binding(std::istream& is, std::uint32_t version)
         binding.shape.push_back(read_scalar<std::uint64_t>(is));
     for (std::uint16_t i = 0; i < slice_count; ++i)
         binding.slices.push_back(read_scalar<std::uint16_t>(is));
+    if (version >= 6) {
+        const auto role_size = read_scalar<std::uint16_t>(is);
+        const auto name_size = read_scalar<std::uint16_t>(is);
+        binding.ready_cycle = read_scalar<std::uint64_t>(is);
+        if (version >= 7) {
+            binding.initializer = static_cast<BindingInitializer>(
+                read_scalar<std::uint16_t>(is));
+            (void)read_scalar<std::uint16_t>(is);
+            binding.rope_theta = read_scalar<float>(is);
+            binding.rope_head_dim = read_scalar<std::uint32_t>(is);
+        } else if (binding.layout == BindingLayout::Fp32CausalMaskTile) {
+            binding.initializer = BindingInitializer::CausalMask;
+        }
+        binding.role.resize(role_size);
+        binding.name.resize(name_size);
+        is.read(binding.role.data(),
+            static_cast<std::streamsize>(binding.role.size()));
+        is.read(binding.name.data(),
+            static_cast<std::streamsize>(binding.name.size()));
+        if (!is) throw std::runtime_error("truncated binding metadata");
+    }
     return binding;
 }
 
 } // namespace
 
-void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path)
+void write_binary_program(const BinaryProgram& program, std::ostream& os)
 {
-    std::ofstream os(path, std::ios::binary);
-    if (!os) {
-        throw std::runtime_error("failed to open FTLPU binary for writing");
-    }
-
     os.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
-    write_scalar<std::uint32_t>(os, kCurrentVersion);
+    write_scalar<std::uint32_t>(os, kBinaryFormatVersion);
     if (program.target_name.empty()
         || program.target_name.size() > std::numeric_limits<std::uint16_t>::max()
         || program.target_abi == 0)
@@ -120,13 +153,8 @@ void write_binary_program(const BinaryProgram& program, const std::filesystem::p
     }
 }
 
-BinaryProgram read_binary_program(const std::filesystem::path& path)
+BinaryProgram read_binary_program(std::istream& is)
 {
-    std::ifstream is(path, std::ios::binary);
-    if (!is) {
-        throw std::runtime_error("failed to open FTLPU binary for reading");
-    }
-
     std::array<char, 8> magic {};
     is.read(magic.data(), static_cast<std::streamsize>(magic.size()));
     if (!is || magic != kMagic) {
@@ -134,7 +162,7 @@ BinaryProgram read_binary_program(const std::filesystem::path& path)
     }
 
     const auto version = read_scalar<std::uint32_t>(is);
-    if (version < 1 || version > kCurrentVersion) {
+    if (version < 1 || version > kBinaryFormatVersion) {
         throw std::runtime_error("unsupported FTLPU binary version");
     }
 
@@ -185,6 +213,23 @@ BinaryProgram read_binary_program(const std::filesystem::path& path)
     }
 
     return program;
+}
+
+void write_binary_program(
+    const BinaryProgram& program, const std::filesystem::path& path)
+{
+    std::ofstream os(path, std::ios::binary);
+    if (!os)
+        throw std::runtime_error("failed to open FTLPU binary for writing");
+    write_binary_program(program, os);
+}
+
+BinaryProgram read_binary_program(const std::filesystem::path& path)
+{
+    std::ifstream is(path, std::ios::binary);
+    if (!is)
+        throw std::runtime_error("failed to open FTLPU binary for reading");
+    return read_binary_program(is);
 }
 
 } // namespace ftlpu::software::runtime

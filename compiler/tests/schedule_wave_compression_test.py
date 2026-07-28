@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Checks nested MEM repeat/wave compression in Schedule-to-Command lowering."""
+
+import argparse
+import subprocess
+from pathlib import Path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--opt", type=Path, required=True)
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--target-config", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(
+        [
+            str(args.opt),
+            "--input",
+            str(args.input),
+            "--output",
+            str(args.output),
+            "--pipeline",
+            "ftlpu-schedule-to-commands",
+            "--target-config",
+            str(args.target_config),
+        ],
+        check=True,
+    )
+    text = args.output.read_text(encoding="utf-8")
+    if text.count("ftlpu.command.mem") != 1:
+        raise RuntimeError("expected one compressed MEM command")
+    for attribute in (
+        "repeat_count = 4",
+        "repeat_interval = 1",
+        "wave_count = 3",
+        "wave_interval = 128",
+        "wave_address_stride = 4",
+    ):
+        if attribute not in text:
+            raise RuntimeError(f"missing compressed attribute: {attribute}")
+
+
+if __name__ == "__main__":
+    main()

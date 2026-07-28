@@ -26,6 +26,8 @@ enum class StreamEndpoint {
     MxmResult,
     VxmInput,
     VxmResult,
+    SxmInput,
+    SxmResult,
 };
 
 struct MemoryTopology {
@@ -121,6 +123,7 @@ public:
     llvm::SmallVector<int64_t> attention_weight_slices() const;
     llvm::SmallVector<int64_t> attention_output_weight_slices() const;
     llvm::SmallVector<int64_t> attention_activation_slices() const;
+    llvm::SmallVector<int64_t> mxm_distributed_activation_slices() const;
     llvm::SmallVector<int64_t> attention_projection_output_slices() const;
     llvm::SmallVector<int64_t> attention_value_slices() const;
     llvm::SmallVector<int64_t> attention_rope_slices() const;

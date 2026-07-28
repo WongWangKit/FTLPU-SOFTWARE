@@ -8,6 +8,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -52,6 +53,7 @@ void MatmulOp::print(OpAsmPrinter& printer)
     print_attribute("n", getNAttr(), true);
     print_attribute("k", getKAttr(), true);
     print_attribute("unit", getUnitAttr(), true);
+    print_attribute("rhs_scale", getRhsScaleAttr(), true);
     print_attribute("lhs_address", getLhsAddressAttr(), true);
     print_attribute("lhs_placement", getLhsPlacementAttr(), true);
     print_attribute("lhs_bytes", getLhsBytesAttr(), true);
@@ -88,8 +90,9 @@ static LogicalResult verify_address(Operation* op, DictionaryAttr address, Strin
         const int64_t value = address.getAs<IntegerAttr>(field).getInt();
         return value >= minimum && value <= maximum;
     };
-    const target::LPUTargetModel target;
-    const auto& memory = target.memory();
+    auto targetModel = target::LPUTargetModel::from_operation(op);
+    if (mlir::failed(targetModel)) return failure();
+    const auto& memory = targetModel->memory();
     if (!in_range("device", 0, 0)
         || !in_range("slice", 0, memory.slices_per_hemisphere - 1)
         || !in_range("bank", 0, memory.banks_per_slice - 1)
@@ -130,11 +133,13 @@ static LogicalResult verify_placement(Operation* op, DictionaryAttr placement,
         || static_cast<int64_t>(slices.size()) != expected_slices
         || !base_row || !instruction_count || !address_stride)
         return op->emitOpError() << name << " is not a valid " << expected_kind << " placement";
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(op);
+    if (mlir::failed(targetModel)) return failure();
     for (Attribute attribute : slices) {
         const auto slice = llvm::dyn_cast<IntegerAttr>(attribute);
         if (!slice || slice.getInt() < 0
-            || slice.getInt() >= target.memory().slices_per_hemisphere)
+            || slice.getInt()
+                >= targetModel->memory().slices_per_hemisphere)
             return op->emitOpError() << name << " contains an invalid MEM slice";
     }
     if (base_row.getInt() < 0 || instruction_count.getInt() <= 0
@@ -232,13 +237,61 @@ LogicalResult SwishTaskOp::verify()
 
 LogicalResult ElementwiseTaskOp::verify()
 {
-    if (getKind() != "multiply")
-        return emitOpError("currently supports kind = \"multiply\"");
+    if (getKind() != "multiply" && getKind() != "add"
+        && getKind() != "add_quant")
+        return emitOpError(
+            "kind must be multiply, add, or add_quant");
     if (getLhs().getType().getShape() != getRhs().getType().getShape()
         || getLhs().getType().getShape() != getResult().getType().getShape())
         return emitOpError("operand and result shapes must match");
+    if (!getLhsAllocations().empty()
+        && failed(verify_task_allocations(
+            getOperation(), getLhsAllocations(), "lhs_allocations")))
+        return failure();
+    if (!getRhsAllocations().empty()
+        && failed(verify_task_allocations(
+            getOperation(), getRhsAllocations(), "rhs_allocations")))
+        return failure();
     return verify_task_allocations(
         getOperation(), getResultAllocations(), "result_allocations");
+}
+
+LogicalResult RmsNormTaskOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto weight = getWeight().getType();
+    const auto result = getResult().getType();
+    const int64_t rawAxis = getAxisAttr().getInt();
+    const int64_t axis =
+        rawAxis < 0 ? rawAxis + input.getRank() : rawAxis;
+    if (!input.hasStaticShape() || !weight.hasStaticShape()
+        || input.getRank() != 2 || weight.getRank() != 1
+        || result != input || axis != input.getRank() - 1
+        || weight.getDimSize(0) != input.getDimSize(axis)
+        || weight.getElementType() != input.getElementType())
+        return emitOpError("has incompatible RMSNorm tensor types");
+    if (!std::isfinite(getEpsilon().convertToFloat())
+        || getEpsilon().convertToFloat() <= 0.0f)
+        return emitOpError("requires a finite positive epsilon");
+    const auto strategy = getConfig().getAs<mlir::StringAttr>("strategy");
+    if (!strategy
+        || (strategy.getValue() != "vxm_square_mxm_reduce"
+            && strategy.getValue() != "vxm_feedback"))
+        return emitOpError("requires a supported RMSNorm strategy");
+    const std::size_t expectedScratch =
+        strategy.getValue() == "vxm_feedback" ? 3 : 2;
+    if (getScratchAllocations().size() != expectedScratch)
+        return emitOpError("scratch allocation count does not match strategy");
+    if (failed(verify_task_allocations(
+            getOperation(), getInputAllocations(), "input_allocations"))
+        || failed(verify_task_allocations(
+            getOperation(), getWeightAllocations(), "weight_allocations"))
+        || failed(verify_task_allocations(
+            getOperation(), getScratchAllocations(), "scratch_allocations"))
+        || failed(verify_task_allocations(
+            getOperation(), getResultAllocations(), "result_allocations")))
+        return failure();
+    return success();
 }
 
 LogicalResult SwigluOp::verify()

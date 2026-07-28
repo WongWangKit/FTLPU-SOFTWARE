@@ -4,12 +4,16 @@
 #include "ftlpu/compiler/Dialect/Kernel/Analysis/ffn_graph.hpp"
 #include "ftlpu/compiler/Dialect/Tensor/IR/tensor_dialect.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
+#include "ftlpu/compiler/Transforms/passes.hpp"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
 
 #include <initializer_list>
+#include <string>
 
 namespace ftlpu::compiler::tensor_lowering {
 
@@ -30,6 +34,8 @@ struct Allocation {
     int64_t address_stride;
     int64_t row_span;
     int64_t bytes;
+    std::string layout;
+    std::string hemisphere;
 };
 
 class RowAllocator {
@@ -62,6 +68,27 @@ private:
     RowAllocator final_result_;
 };
 
+class FunctionMemoryPlanner {
+public:
+    FunctionMemoryPlanner(
+        mlir::func::FuncOp function, EastMemoryAllocator& allocator);
+
+    mlir::FailureOr<Allocation> allocate(
+        mlir::Value value, PlacementKind kind);
+    mlir::LogicalResult bind(
+        mlir::Value value, const Allocation& allocation);
+    void release_before(mlir::Operation* operation);
+    void replace_value(mlir::Value old_value, mlir::Value new_value);
+    int64_t ordinal(mlir::Operation* operation) const;
+
+private:
+    EastMemoryAllocator& allocator_;
+    llvm::DenseMap<mlir::Value, Allocation> allocations_;
+    llvm::DenseSet<mlir::Value> externally_managed_;
+    llvm::DenseMap<mlir::Value, int64_t> last_uses_;
+    llvm::DenseMap<mlir::Operation*, int64_t> ordinals_;
+};
+
 using AllocateValueFn =
     llvm::function_ref<mlir::FailureOr<Allocation>(
         mlir::Value, PlacementKind)>;
@@ -75,6 +102,10 @@ mlir::DictionaryAttr make_placement_attr(
 Allocation fixed_allocation(PlacementKind kind,
     llvm::ArrayRef<int64_t> slices, int64_t base_row,
     int64_t instruction_count, int64_t bytes);
+Allocation fixed_allocation(PlacementKind kind,
+    llvm::ArrayRef<int64_t> slices, int64_t base_row,
+    int64_t instruction_count, int64_t bytes,
+    llvm::StringRef layout, llvm::StringRef hemisphere);
 bool is_w8a16_ffn(kernel::FfnGraph& graph,
     const target::LPUTargetModel& target);
 mlir::DictionaryAttr make_profile_placement(
@@ -85,6 +116,10 @@ mlir::DictionaryAttr make_task_allocation(
     mlir::DictionaryAttr placement);
 mlir::ArrayAttr make_task_allocations(mlir::OpBuilder& builder,
     std::initializer_list<mlir::DictionaryAttr> allocations);
+mlir::FailureOr<mlir::ArrayAttr> get_value_task_allocations(
+    mlir::Value value);
+mlir::FailureOr<mlir::DictionaryAttr> get_value_placement(
+    mlir::Value value);
 mlir::DictionaryAttr make_attention_placement(
     mlir::OpBuilder& builder, llvm::StringRef kind,
     llvm::ArrayRef<int64_t> slices, int64_t base_row,
@@ -98,11 +133,17 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
 mlir::LogicalResult lower_swiglu(kernel::SwigluOp op,
     EastMemoryAllocator& allocator, AllocateValueFn allocate_value,
     mlir::IRRewriter& rewriter);
+mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
+    const target::LPUTargetModel& target,
+    RmsNormLoweringStrategy strategy, AllocateValueFn allocate_value,
+    mlir::IRRewriter& rewriter);
+mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
+    const target::LPUTargetModel& target,
+    EastMemoryAllocator& allocator, AllocateValueFn allocate_value,
+    RmsNormLoweringStrategy rmsnorm_strategy,
+    mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
-    EastMemoryAllocator& allocator,
-    llvm::DenseMap<mlir::Value, Allocation>& allocations,
-    llvm::DenseMap<mlir::Value, int64_t>& last_uses,
-    const llvm::DenseMap<mlir::Operation*, int64_t>& ordinals,
+    FunctionMemoryPlanner& planner,
     AllocateValueFn allocate_value, mlir::IRRewriter& rewriter);
 
 } // namespace ftlpu::compiler::tensor_lowering

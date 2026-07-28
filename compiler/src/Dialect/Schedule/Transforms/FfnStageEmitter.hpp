@@ -42,6 +42,7 @@ struct FfnEmissionContext {
     mlir::RankedTensorType projection_type;
     int64_t activation_latency;
     int64_t down_accumulator_base;
+    bool activation_distributed16;
 
     int64_t m() const { return static_cast<int64_t>(ffn.getM()); }
     int64_t k() const { return static_cast<int64_t>(ffn.getK()); }

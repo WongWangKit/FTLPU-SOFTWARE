@@ -9,6 +9,7 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
+#include <cmath>
 
 using namespace mlir;
 
@@ -327,8 +328,9 @@ LogicalResult SwishTaskOp::verify()
 
 LogicalResult ElementwiseTaskOp::verify()
 {
-    if (getKind() != "multiply" && getKind() != "add_quant")
-        return emitOpError("supports multiply and add_quant");
+    if (getKind() != "multiply" && getKind() != "add"
+        && getKind() != "add_quant")
+        return emitOpError("supports multiply, add, and add_quant");
     if (getLhs().getType().getShape() != getRhs().getType().getShape()
         || getLhs().getType().getShape() != getResult().getType().getShape())
         return emitOpError("operand and result shapes must match");
@@ -339,7 +341,55 @@ LogicalResult ElementwiseTaskOp::verify()
     if (getInputStreamBases().size() != 2
         || getOutputStreamBase() < 0 || getOutputStreamBase() >= streams)
         return emitOpError("requires two input streams and one valid output stream");
+    if (!getLhsAllocations().empty()
+        && failed(verify_task_allocations(
+            getOperation(), getLhsAllocations())))
+        return failure();
+    if (!getRhsAllocations().empty()
+        && failed(verify_task_allocations(
+            getOperation(), getRhsAllocations())))
+        return failure();
     return verify_task_allocations(getOperation(), getResultAllocations());
+}
+
+LogicalResult RmsNormTaskOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto weight = getWeight().getType();
+    const auto result = getResult().getType();
+    const int64_t rawAxis = getAxisAttr().getInt();
+    const int64_t axis =
+        rawAxis < 0 ? rawAxis + input.getRank() : rawAxis;
+    if (!input.hasStaticShape() || !weight.hasStaticShape()
+        || input.getRank() != 2 || weight.getRank() != 1
+        || result != input || axis != input.getRank() - 1
+        || weight.getDimSize(0) != input.getDimSize(axis)
+        || weight.getElementType() != input.getElementType())
+        return emitOpError("has incompatible RMSNorm tensor types");
+    if (!std::isfinite(getEpsilon().convertToFloat())
+        || getEpsilon().convertToFloat() <= 0.0f)
+        return emitOpError("requires a finite positive epsilon");
+    const auto strategy = getConfig().getAs<mlir::StringAttr>("strategy");
+    if (!strategy
+        || (strategy.getValue() != "vxm_square_mxm_reduce"
+            && strategy.getValue() != "vxm_feedback"))
+        return emitOpError("requires a supported RMSNorm strategy");
+    const std::size_t expectedScratch =
+        strategy.getValue() == "vxm_feedback" ? 3 : 2;
+    if (getScratchAllocations().size() != expectedScratch)
+        return emitOpError("scratch allocation count does not match strategy");
+    if (getRoutes().size() < 2)
+        return emitOpError("requires input and scale stream routes");
+    if (failed(verify_task_allocations(
+            getOperation(), getInputAllocations()))
+        || failed(verify_task_allocations(
+            getOperation(), getWeightAllocations()))
+        || failed(verify_task_allocations(
+            getOperation(), getScratchAllocations()))
+        || failed(verify_task_allocations(
+            getOperation(), getResultAllocations())))
+        return failure();
+    return success();
 }
 
 LogicalResult SwigluOp::verify()

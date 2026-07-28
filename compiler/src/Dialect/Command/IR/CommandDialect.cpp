@@ -1,4 +1,4 @@
-// Keep generated property accessors rebuilt after Command ODS changes.
+// Keep generated wave/repeat accessors rebuilt after Command ODS changes.
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
 
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
@@ -10,6 +10,7 @@
 
 using namespace mlir;
 
+// Keep generated binding metadata accessors synchronized with CommandOps.td.
 #include "ftlpu/compiler/Dialect/Command/IR/CommandOpsDialect.cpp.inc"
 
 #define GET_OP_CLASSES
@@ -31,6 +32,19 @@ LogicalResult BindingOp::verify()
         && getElementType() != "f16" && getElementType() != "f32")
         return emitOpError("element_type must be i8, i32, f16, or f32");
     if (getShape().empty()) return emitOpError("requires a ranked shape");
+    if (getInitializer() != "none" && getInitializer() != "zero"
+        && getInitializer() != "causal_mask"
+        && getInitializer() != "rope_table")
+        return emitOpError(
+            "initializer must be none, zero, causal_mask, or rope_table");
+    if (getAccess() != "internal" && getInitializer() != "none")
+        return emitOpError(
+            "only internal bindings may have an initializer");
+    if (getInitializer() == "rope_table"
+        && (!getInitializerConfig().getAs<FloatAttr>("theta")
+            || !getInitializerConfig().getAs<IntegerAttr>("head_dim")))
+        return emitOpError(
+            "rope_table initializer requires theta and head_dim");
     for (Attribute dimension : getShape()) {
         auto integer = llvm::dyn_cast<IntegerAttr>(dimension);
         if (!integer || integer.getInt() <= 0)
@@ -47,25 +61,45 @@ LogicalResult BindingOp::verify()
 
 LogicalResult MemOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
+    const int64_t memoryRows =
+        target.memory().banks_per_slice
+        * target.memory().words_per_bank;
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
+    const int64_t waveAddressStride =
+        getWaveAddressStride().value_or(0);
     if (getCycle() < 0 || getQueue() < 0
         || getQueue() >= target.memory().hemispheres * target.memory().slices_per_hemisphere
-        || getAddress() < 0 || getAddress() >= 8192
+        || getAddress() < 0 || getAddress() >= memoryRows
         || getPackedStream() < 0 || getPackedStream() >= target.streams().encoded_streams
-        || getRepeatCount() <= 0 || getRepeatInterval() <= 0)
+        || getRepeatCount() <= 0 || getRepeatInterval() <= 0
+        || waveCount <= 0 || waveInterval <= 0)
         return emitOpError("contains an invalid ICU MEM queue command field");
     if (getOpcode() != "read" && getOpcode() != "write")
         return emitOpError("opcode must be read or write");
-    const int64_t final_address = getAddress()
-        + (getRepeatCount() - 1) * getAddressStride();
-    if (final_address < 0 || final_address >= 8192)
-        return emitOpError("repeated address range is outside SRAM");
+    const int64_t corners[] = {
+        getAddress(),
+        getAddress() + (getRepeatCount() - 1) * getAddressStride(),
+        getAddress() + (waveCount - 1) * waveAddressStride,
+        getAddress() + (waveCount - 1) * waveAddressStride
+            + (getRepeatCount() - 1) * getAddressStride(),
+    };
+    if (llvm::any_of(corners,
+            [&](int64_t address) {
+                return address < 0 || address >= memoryRows;
+            }))
+        return emitOpError("wave/repeat address range is outside SRAM");
     return success();
 }
 
 LogicalResult MxmOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     if (getCycle() < 0 || !target.is_valid_mxm_unit(getQueue())
         || !target.is_valid_weight_buffer(getWeightBuffer())
         || getWeightColumn() < 0 || getWeightColumn() >= target.throughput().tile_rows
@@ -91,7 +125,9 @@ LogicalResult MxmOp::verify()
 
 LogicalResult VxmOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     const int64_t cycle = getCycleAttr().getInt();
     const int64_t queue = getQueueAttr().getInt();
     const int64_t lhs_index = getLhsIndexAttr().getInt();
@@ -140,15 +176,22 @@ LogicalResult VxmOp::verify()
 
 LogicalResult SxmOp::verify()
 {
-    const target::LPUTargetModel target;
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
     if (getCycle() < 0 || getHemisphere() < 0
         || getHemisphere() >= target.memory().hemispheres)
         return emitOpError("contains an invalid ICU SXM queue selector");
     if (getOpcode() != "transpose" && getOpcode() != "permute")
         return emitOpError("opcode must be transpose or permute");
-    if (getSourceStreams().empty() || getDestinationStreams().empty()
+    const int64_t physicalWidth =
+        2 * target.throughput().lanes_per_tile;
+    if (getSourceStreams().size() != physicalWidth
+        || getDestinationStreams().size() != physicalWidth
         || getPermuteMap().size() != 32)
-        return emitOpError("requires non-empty stream lists and a 32-lane map");
+        return emitOpError()
+            << "requires " << physicalWidth
+            << " source and destination byte streams and a 32-lane map";
     const auto valid_stream = [&](Attribute attribute) {
         const auto value = llvm::dyn_cast<IntegerAttr>(attribute);
         return value && value.getInt() >= 0

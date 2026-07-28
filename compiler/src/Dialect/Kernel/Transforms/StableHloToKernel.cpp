@@ -57,6 +57,10 @@ struct AttentionMatch {
     mlir::Value key_weight;
     mlir::Value value_weight;
     mlir::Value output_weight;
+    float query_scale;
+    float key_scale;
+    float value_scale;
+    float output_scale;
     int64_t seq_len;
     int64_t hidden;
     int64_t query_heads;
@@ -115,6 +119,17 @@ struct W8A16FfnMatch {
     mlir::Value gate_weight;
     mlir::Value up_weight;
     mlir::Value down_weight;
+    float gate_scale;
+    float up_scale;
+    float down_scale;
+};
+
+struct RmsNormMatch {
+    mlir::Operation* final_convert;
+    mlir::Value input;
+    mlir::Value weight;
+    float epsilon;
+    llvm::SmallPtrSet<mlir::Operation*, 16> operations;
 };
 
 mlir::Value converted_source(mlir::Value value)
@@ -122,6 +137,157 @@ mlir::Value converted_source(mlir::Value value)
     auto* op = value.getDefiningOp();
     return named(op, "stablehlo.convert") && op->getNumOperands() == 1
         ? op->getOperand(0) : mlir::Value{};
+}
+
+mlir::Operation* defining(mlir::Value value, llvm::StringRef name)
+{
+    mlir::Operation* operation = value.getDefiningOp();
+    return named(operation, name) ? operation : nullptr;
+}
+
+mlir::Value strip_broadcast(mlir::Value value)
+{
+    mlir::Operation* operation = value.getDefiningOp();
+    return named(operation, "stablehlo.broadcast_in_dim")
+            && operation->getNumOperands() == 1
+        ? operation->getOperand(0)
+        : value;
+}
+
+std::optional<float> scalar_constant(mlir::Value value)
+{
+    value = strip_broadcast(value);
+    mlir::Operation* operation = value.getDefiningOp();
+    if (named(operation, "stablehlo.convert")
+        && operation->getNumOperands() == 1)
+        operation = operation->getOperand(0).getDefiningOp();
+    if (!named(operation, "stablehlo.constant")) return std::nullopt;
+    const auto elements =
+        operation->getAttrOfType<mlir::DenseFPElementsAttr>("value");
+    if (!elements || !elements.isSplat()) return std::nullopt;
+    return elements.getSplatValue<llvm::APFloat>().convertToFloat();
+}
+
+struct ScaledWeight {
+    mlir::Value storage;
+    float scale;
+};
+
+std::optional<ScaledWeight> match_scaled_weight(mlir::Value value)
+{
+    if (mlir::Value storage = converted_source(value))
+        return ScaledWeight {storage, 1.0f};
+    auto* multiply = defining(value, "stablehlo.multiply");
+    if (!multiply || multiply->getNumOperands() != 2) return std::nullopt;
+    for (unsigned order = 0; order < 2; ++order) {
+        mlir::Value storage =
+            converted_source(multiply->getOperand(order));
+        const auto scale =
+            scalar_constant(multiply->getOperand(1 - order));
+        if (storage && scale && std::isfinite(*scale) && *scale > 0.0f)
+            return ScaledWeight {storage, *scale};
+    }
+    return std::nullopt;
+}
+
+std::optional<RmsNormMatch> match_rms_norm(
+    mlir::Operation* final_convert)
+{
+    if (!named(final_convert, "stablehlo.convert")
+        || final_convert->getNumOperands() != 1
+        || final_convert->getNumResults() != 1)
+        return std::nullopt;
+    auto resultType = llvm::dyn_cast<mlir::RankedTensorType>(
+        final_convert->getResult(0).getType());
+    if (!resultType || resultType.getRank() != 2) return std::nullopt;
+
+    auto* outputMultiply =
+        defining(final_convert->getOperand(0), "stablehlo.multiply");
+    if (!outputMultiply || outputMultiply->getNumOperands() != 2)
+        return std::nullopt;
+
+    for (unsigned scaleOrder = 0; scaleOrder < 2; ++scaleOrder) {
+        mlir::Value scaledValue = outputMultiply->getOperand(scaleOrder);
+        mlir::Value weightValue =
+            strip_broadcast(outputMultiply->getOperand(1 - scaleOrder));
+        mlir::Value weight = converted_source(weightValue);
+        if (!weight) weight = weightValue;
+        auto weightType =
+            llvm::dyn_cast<mlir::RankedTensorType>(weight.getType());
+        auto* scaled = defining(scaledValue, "stablehlo.multiply");
+        if (!scaled || !weightType || weightType.getRank() != 1)
+            continue;
+
+        for (unsigned inputOrder = 0; inputOrder < 2; ++inputOrder) {
+            mlir::Value inputValue = scaled->getOperand(inputOrder);
+            mlir::Value input = converted_source(inputValue);
+            if (!input) continue;
+            mlir::Value invBroadcast =
+                scaled->getOperand(1 - inputOrder);
+            mlir::Value invValue = strip_broadcast(invBroadcast);
+            auto* rsqrt = defining(invValue, "stablehlo.rsqrt");
+            if (!rsqrt || rsqrt->getNumOperands() != 1) continue;
+            auto* epsilonAdd =
+                defining(rsqrt->getOperand(0), "stablehlo.add");
+            if (!epsilonAdd || epsilonAdd->getNumOperands() != 2)
+                continue;
+
+            mlir::Operation* mean = nullptr;
+            std::optional<float> epsilon;
+            for (unsigned meanOrder = 0; meanOrder < 2; ++meanOrder) {
+                mean = defining(
+                    epsilonAdd->getOperand(meanOrder), "stablehlo.divide");
+                epsilon = scalar_constant(
+                    epsilonAdd->getOperand(1 - meanOrder));
+                if (mean && epsilon) break;
+            }
+            if (!mean || !epsilon || *epsilon <= 0.0f
+                || mean->getNumOperands() != 2)
+                continue;
+
+            mlir::Operation* reduce = nullptr;
+            for (mlir::Value operand : mean->getOperands()) {
+                mlir::Value source = strip_broadcast(operand);
+                reduce = defining(source, "stablehlo.reduce");
+                if (reduce) break;
+            }
+            if (!reduce || reduce->getNumOperands() < 1) continue;
+            auto* square =
+                defining(reduce->getOperand(0), "stablehlo.multiply");
+            if (!square || square->getNumOperands() != 2
+                || square->getOperand(0) != inputValue
+                || square->getOperand(1) != inputValue)
+                continue;
+
+            RmsNormMatch match {
+                final_convert, input, weight, *epsilon, {}};
+            const auto remember = [&](mlir::Operation* operation) {
+                if (operation) match.operations.insert(operation);
+            };
+            remember(final_convert);
+            remember(outputMultiply);
+            remember(scaled);
+            remember(inputValue.getDefiningOp());
+            remember(outputMultiply->getOperand(1 - scaleOrder)
+                         .getDefiningOp());
+            remember(weightValue.getDefiningOp());
+            remember(invBroadcast.getDefiningOp());
+            remember(invValue.getDefiningOp());
+            remember(rsqrt);
+            remember(epsilonAdd);
+            remember(mean);
+            remember(reduce);
+            remember(square);
+            for (mlir::Value operand : reduce->getOperands())
+                remember(operand.getDefiningOp());
+            for (mlir::Value operand : epsilonAdd->getOperands())
+                remember(operand.getDefiningOp());
+            for (mlir::Value operand : mean->getOperands())
+                remember(operand.getDefiningOp());
+            return match;
+        }
+    }
+    return std::nullopt;
 }
 
 std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_dot)
@@ -158,10 +324,10 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
     mlir::Value input = query_dot->getOperand(0);
     if (key_dot->getOperand(0) != input || value_dot->getOperand(0) != input)
         return std::nullopt;
-    mlir::Value query_weight = converted_source(query_dot->getOperand(1));
-    mlir::Value key_weight = converted_source(key_dot->getOperand(1));
-    mlir::Value value_weight = converted_source(value_dot->getOperand(1));
-    mlir::Value output_weight = converted_source(output_dot->getOperand(1));
+    const auto query_weight = match_scaled_weight(query_dot->getOperand(1));
+    const auto key_weight = match_scaled_weight(key_dot->getOperand(1));
+    const auto value_weight = match_scaled_weight(value_dot->getOperand(1));
+    const auto output_weight = match_scaled_weight(output_dot->getOperand(1));
     if (!query_weight || !key_weight || !value_weight || !output_weight)
         return std::nullopt;
 
@@ -169,7 +335,7 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
     const auto qk_lhs_type =
         llvm::dyn_cast<mlir::RankedTensorType>(qk_dot->getOperand(0).getType());
     const auto key_weight_storage =
-        llvm::dyn_cast<mlir::RankedTensorType>(key_weight.getType());
+        llvm::dyn_cast<mlir::RankedTensorType>(key_weight->storage.getType());
     if (!input_type || !qk_lhs_type || !key_weight_storage
         || input_type.getRank() != 2 || qk_lhs_type.getRank() != 3
         || key_weight_storage.getRank() != 2)
@@ -194,10 +360,14 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
     AttentionMatch match {
         output_dot,
         input,
-        query_weight,
-        key_weight,
-        value_weight,
-        output_weight,
+        query_weight->storage,
+        key_weight->storage,
+        value_weight->storage,
+        output_weight->storage,
+        query_weight->scale,
+        key_weight->scale,
+        value_weight->scale,
+        output_weight->scale,
         input_type.getDimSize(0),
         input_type.getDimSize(1),
         query_heads,
@@ -237,13 +407,19 @@ std::optional<W8A16FfnMatch> match_w8a16_ffn(mlir::Operation* final_convert)
                 continue;
             mlir::Value input = converted_source(gate_dot->getOperand(0));
             mlir::Value up_input = converted_source(up_dot->getOperand(0));
-            mlir::Value gate_weight = converted_source(gate_dot->getOperand(1));
-            mlir::Value up_weight = converted_source(up_dot->getOperand(1));
-            mlir::Value down_weight = converted_source(down_dot->getOperand(1));
-            if (!input || input != up_input || !gate_weight || !up_weight || !down_weight)
+            const auto gate_weight =
+                match_scaled_weight(gate_dot->getOperand(1));
+            const auto up_weight =
+                match_scaled_weight(up_dot->getOperand(1));
+            const auto down_weight =
+                match_scaled_weight(down_dot->getOperand(1));
+            if (!input || input != up_input || !gate_weight || !up_weight
+                || !down_weight)
                 continue;
             return W8A16FfnMatch {final_convert, down_dot, swiglu_mul, gated_mul,
-                logistic, gate_dot, up_dot, input, gate_weight, up_weight, down_weight};
+                logistic, gate_dot, up_dot, input, gate_weight->storage,
+                up_weight->storage, down_weight->storage, gate_weight->scale,
+                up_weight->scale, down_weight->scale};
         }
     }
     return std::nullopt;
@@ -397,14 +573,20 @@ public:
                 match->input, match->query_weight,
                 tensor_type({match->seq_len, query_width}),
                 match->seq_len, query_width, match->hidden);
+            query_2d.setRhsScaleAttr(
+                rewriter.getF32FloatAttr(match->query_scale));
             auto key_2d = rewriter.create<kernel::MatmulOp>(root->getLoc(),
                 match->input, match->key_weight,
                 tensor_type({match->seq_len, kv_width}),
                 match->seq_len, kv_width, match->hidden);
+            key_2d.setRhsScaleAttr(
+                rewriter.getF32FloatAttr(match->key_scale));
             auto value_2d = rewriter.create<kernel::MatmulOp>(root->getLoc(),
                 match->input, match->value_weight,
                 tensor_type({match->seq_len, kv_width}),
                 match->seq_len, kv_width, match->hidden);
+            value_2d.setRhsScaleAttr(
+                rewriter.getF32FloatAttr(match->value_scale));
 
             auto query_heads = create_reshape(query_2d.getResult(),
                 tensor_type({match->seq_len, match->query_heads, match->head_dim}));
@@ -445,6 +627,8 @@ public:
             auto output = rewriter.create<kernel::MatmulOp>(root->getLoc(),
                 context.getResult(), match->output_weight, result_type,
                 match->seq_len, match->hidden, query_width);
+            output.setRhsScaleAttr(
+                rewriter.getF32FloatAttr(match->output_scale));
             rewriter.replaceOp(root, output.getResult());
 
             llvm::SmallVector<mlir::Operation*> block_operations;
@@ -460,6 +644,45 @@ public:
         getOperation().walk([&](mlir::Operation* operation) {
             if (named(operation, "stablehlo.convert")) converts.push_back(operation);
         });
+        for (mlir::Operation* convert : llvm::reverse(converts)) {
+            if (!convert->getBlock()) continue;
+            auto match = match_rms_norm(convert);
+            if (!match) continue;
+            rewriter.setInsertionPoint(convert);
+            mlir::OperationState state(
+                convert->getLoc(), kernel::RmsNormOp::getOperationName());
+            state.addOperands({match->input, match->weight});
+            state.addTypes(convert->getResult(0).getType());
+            state.addAttribute("axis", rewriter.getI64IntegerAttr(-1));
+            state.addAttribute(
+                "epsilon", rewriter.getF32FloatAttr(match->epsilon));
+            auto lowered =
+                llvm::cast<kernel::RmsNormOp>(rewriter.create(state));
+            rewriter.replaceOp(convert, lowered.getResult());
+            llvm::SmallVector<mlir::Operation*> blockOperations;
+            for (mlir::Operation& operation :
+                getOperation().getBody().front())
+                blockOperations.push_back(&operation);
+            bool erased = true;
+            while (erased) {
+                erased = false;
+                for (mlir::Operation*& operation :
+                    llvm::reverse(blockOperations)) {
+                    if (operation && match->operations.contains(operation)
+                        && operation->getBlock()
+                        && operation->use_empty()) {
+                        rewriter.eraseOp(operation);
+                        operation = nullptr;
+                        erased = true;
+                    }
+                }
+            }
+        }
+        converts.clear();
+        getOperation().walk([&](mlir::Operation* operation) {
+            if (named(operation, "stablehlo.convert"))
+                converts.push_back(operation);
+        });
         const auto create_ffn_graph = [&](mlir::Location location,
                                           mlir::Value input,
                                           mlir::Value gate_weight,
@@ -468,11 +691,18 @@ public:
                                           mlir::Type hidden_type,
                                           mlir::Type result_type,
                                           int64_t m, int64_t k,
-                                          int64_t hidden, int64_t n) {
+                                          int64_t hidden, int64_t n,
+                                          float gate_scale,
+                                          float up_scale,
+                                          float down_scale) {
             auto gate = rewriter.create<kernel::MatmulOp>(location,
                 input, gate_weight, hidden_type, m, hidden, k);
+            gate.setRhsScaleAttr(
+                rewriter.getF32FloatAttr(gate_scale));
             auto up = rewriter.create<kernel::MatmulOp>(location,
                 input, up_weight, hidden_type, m, hidden, k);
+            up.setRhsScaleAttr(
+                rewriter.getF32FloatAttr(up_scale));
             mlir::OperationState swish_state(location,
                 kernel::SwishOp::getOperationName());
             swish_state.addOperands(gate.getResult());
@@ -487,8 +717,11 @@ public:
                 rewriter.getStringAttr("multiply"));
             auto gated = llvm::cast<kernel::ElementwiseOp>(
                 rewriter.create(multiply_state));
-            return rewriter.create<kernel::MatmulOp>(location,
+            auto down = rewriter.create<kernel::MatmulOp>(location,
                 gated.getResult(), down_weight, result_type, m, n, hidden);
+            down.setRhsScaleAttr(
+                rewriter.getF32FloatAttr(down_scale));
+            return down;
         };
         for (mlir::Operation* convert : llvm::reverse(converts)) {
             if (!convert->getBlock()) continue;
@@ -502,7 +735,8 @@ public:
                     match->input, match->gate_weight, match->up_weight,
                     match->down_weight, match->gate_dot->getResult(0).getType(),
                     result_type, input_type.getDimSize(0), input_type.getDimSize(1),
-                    gate_type.getDimSize(1), down_type.getDimSize(1));
+                    gate_type.getDimSize(1), down_type.getDimSize(1),
+                    match->gate_scale, match->up_scale, match->down_scale);
                 rewriter.replaceOp(convert, lowered.getResult());
                 for (mlir::Operation* op : {match->down_dot, match->swiglu_mul,
                          match->gated_mul, match->logistic, match->gate_dot, match->up_dot})
@@ -531,7 +765,8 @@ public:
                     match->down_dot->getOperand(1),
                     match->swiglu.gate_dot->getResult(0).getType(), result_type,
                     input_type.getDimSize(0), input_type.getDimSize(1),
-                    gate_type.getDimSize(1), down_type.getDimSize(1));
+                    gate_type.getDimSize(1), down_type.getDimSize(1),
+                    1.0f, 1.0f, 1.0f);
                 rewriter.replaceOp(match->final_convert, lowered.getResult());
                 rewriter.eraseOp(match->down_dot);
                 for (mlir::Operation* op : {match->swiglu.final_convert,
@@ -564,6 +799,29 @@ public:
                 rewriter.eraseOp(op);
         }
 
+        // Quantized StableHLO represents runtime weights as convert followed
+        // by a scalar multiply. Composite attention/FFN lowering replaces the
+        // dots with scaled Kernel IR, so remove the now-dead scale subgraphs
+        // before generic elementwise lowering sees them.
+        bool erased_dead_stablehlo = true;
+        while (erased_dead_stablehlo) {
+            erased_dead_stablehlo = false;
+            llvm::SmallVector<mlir::Operation*> operations;
+            for (mlir::Operation& operation :
+                 getOperation().getBody().front())
+                operations.push_back(&operation);
+            for (mlir::Operation* operation : llvm::reverse(operations)) {
+                if (operation->getName().getDialectNamespace()
+                        != "stablehlo"
+                    || !operation->use_empty()
+                    || operation->hasTrait<
+                        mlir::OpTrait::IsTerminator>())
+                    continue;
+                rewriter.eraseOp(operation);
+                erased_dead_stablehlo = true;
+            }
+        }
+
         llvm::SmallVector<mlir::Operation*> dot_generals;
         getOperation().walk([&](mlir::Operation* operation) {
             if (operation->getName().getStringRef() == "stablehlo.dot_general") {
@@ -594,6 +852,46 @@ public:
                 lhs.getShape()[0], rhs.getShape()[1], lhs.getShape()[1]);
             rewriter.replaceOp(dot_general, lowered->getResult(0));
         }
+
+        llvm::SmallVector<mlir::Operation*> elementwiseOperations;
+        getOperation().walk([&](mlir::Operation* operation) {
+            if (named(operation, "stablehlo.add")
+                || named(operation, "stablehlo.multiply"))
+                elementwiseOperations.push_back(operation);
+        });
+        for (mlir::Operation* operation :
+            llvm::reverse(elementwiseOperations)) {
+            if (!operation->getBlock() || operation->getNumOperands() != 2
+                || operation->getNumResults() != 1)
+                continue;
+            const auto lhs = llvm::dyn_cast<mlir::RankedTensorType>(
+                operation->getOperand(0).getType());
+            const auto rhs = llvm::dyn_cast<mlir::RankedTensorType>(
+                operation->getOperand(1).getType());
+            const auto result = llvm::dyn_cast<mlir::RankedTensorType>(
+                operation->getResult(0).getType());
+            if (!lhs || lhs != rhs || lhs != result || lhs.getRank() != 2)
+                continue;
+            rewriter.setInsertionPoint(operation);
+            mlir::OperationState state(operation->getLoc(),
+                kernel::ElementwiseOp::getOperationName());
+            state.addOperands(operation->getOperands());
+            state.addTypes(result);
+            state.addAttribute("kind", rewriter.getStringAttr(
+                named(operation, "stablehlo.add") ? "add" : "multiply"));
+            auto lowered =
+                llvm::cast<kernel::ElementwiseOp>(rewriter.create(state));
+            rewriter.replaceOp(operation, lowered.getResult());
+        }
+
+        llvm::SmallVector<mlir::Operation*> deadConstants;
+        getOperation().walk([&](mlir::Operation* operation) {
+            if (named(operation, "stablehlo.constant")
+                && operation->use_empty())
+                deadConstants.push_back(operation);
+        });
+        for (mlir::Operation* operation : llvm::reverse(deadConstants))
+            rewriter.eraseOp(operation);
     }
 };
 

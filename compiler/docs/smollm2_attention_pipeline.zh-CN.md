@@ -2,7 +2,7 @@
 
 ![SmolLM2-135M Attention 流水线](smollm2_attention_pipeline.svg)
 
-该图由 `compiled_smollm2_attention_softmax_runtime_test` 实际执行的序列化
+该图由 `compiled_smollm2_attention_runtime_test` 实际执行的序列化
 ICU queue 生成，不是手工维护的时序草图。Runtime 将 `NOP` 和 `Repeat`
 command 展开为与 FTLPU-CMODEL 相同的四列 trace：
 
@@ -20,9 +20,11 @@ start,end,resource,detail
 - P x V context 计算；
 - 四个 MXM 执行的 output projection。
 
-Runtime test 会将抽样的 Q/K/V 数值、softmax 归一化结果、SXM layout、
-P x V context 和最终 O-projection 输出与 CPU reference 对比，并检查所有
-抽样的未来 token 概率严格为零。
+Runtime test 首先检查 Command IR 中包含 MEM、MXM、VXM 和 SXM queue
+command，再将 binary 交给 runtime 和 CModel 执行。抽样的 Q/K/V 数值、
+causal softmax 概率、P x V context 和最终 O-projection 输出都会与独立
+CPU Attention reference 对比。CPU reference 只使用上传的输入和权重计算，
+不会读取 CModel 中间结果；所有抽样的未来 token 概率还必须严格为零。
 
 Causal mask 只保存一个 32x32 tile 中 31 条非零对角线对应的 FP32 vector，
 并在所有 query head 和 query block 间复用。完整的过去 block 使用立即数
@@ -34,7 +36,7 @@ vector。Softmax 第一遍执行 `scale -> mask add -> recurrent max`，后两�
 
 绘图器采用与 FTLPU-CMODEL
 `smollm2_attention_schedule_detail.svg` 相同的功能单元分行方式和配色，
-从完整的 69,304-cycle trace 中显示八个便于阅读的窗口：
+从完整的 64,952-cycle trace 中显示八个便于阅读的窗口：
 
 1. Q projection 的第一个 reduction block；
 2. Q RoPE 和写回；
@@ -72,8 +74,8 @@ accumulator 占用 slices 36..43，packed query layout 和 RoPE table 则使用
 ## CModel 实测利用率
 
 下列数据来自完整编译后 Attention binary 的实际执行，并包含 64 个
-runtime drain cycles。Monitor 共采样 69,368 cycles，`program.max_cycle`
-为 69,304。
+runtime drain cycles。Monitor 共采样 65,016 cycles，`program.max_cycle`
+为 64,952。
 
 | MXM | Active cycles | Array utilization | Active density | Peak active cells |
 | --- | ---: | ---: | ---: | ---: |
@@ -105,13 +107,13 @@ CModel 目前还没有提供容量归一化的 MEM 或 SXM utilization counter�
 ## 重新生成
 
 构建 `ftlpu_opt`、`ftlpu_translate` 和
-`compiled_smollm2_attention_softmax_runtime_test`，然后运行：
+`compiled_smollm2_attention_runtime_test`，然后运行：
 
 ```powershell
-python compiler/tests/smollm2_attention_softmax_binary_runtime_test.py `
+python compiler/tests/smollm2_attention_binary_runtime_test.py `
   --opt build-ftlpu-vs2026/compiler/ftlpu_opt.exe `
   --translate build-ftlpu-vs2026/compiler/ftlpu-translate.exe `
-  --runtime-test build-ftlpu-vs2026/runtime/compiled_smollm2_attention_softmax_runtime_test.exe `
+  --runtime-test build-ftlpu-vs2026/runtime/compiled_smollm2_attention_runtime_test.exe `
   --input compiler/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir `
   --output-dir build-ftlpu-vs2026/compiler/ftlpu_lower/smollm2_attention_pipeline
 ```

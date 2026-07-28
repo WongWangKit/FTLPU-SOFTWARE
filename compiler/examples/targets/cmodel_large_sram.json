@@ -1,0 +1,11 @@
+{
+  "name": "lpu32-cmodel-large-sram",
+  "memory": {
+    "banks_per_slice": 16,
+    "words_per_bank": 4096
+  },
+  "streams": {
+    "streams_per_direction": 32,
+    "encoded_streams": 64
+  }
+}

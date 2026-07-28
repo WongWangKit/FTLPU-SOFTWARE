@@ -22,11 +22,24 @@ try {
     using namespace ftlpu;
     using namespace ftlpu::software::runtime;
     IcuProgram icu_program;
+    auto source_streams = SxmInstruction::StreamList {};
+    auto destination_streams = SxmInstruction::StreamList {};
+    for (std::size_t stream = 0; stream < 16; ++stream) {
+        source_streams.push_back(SxmStreamId {stream});
+        destination_streams.push_back(SxmStreamId {16 + stream});
+    }
     auto transpose = SxmInstruction::Transpose(
-        {SxmStreamId {0}, SxmStreamId {1}}, {SxmStreamId {16}, SxmStreamId {17}});
+        std::move(source_streams), std::move(destination_streams));
     icu_program.emit_sxm_transpose(7, Hemisphere::East, transpose);
 
     BinaryProgram program;
+    BinaryBinding binding;
+    binding.index = 3;
+    binding.access = BindingAccess::Internal;
+    binding.role = "attention_input";
+    binding.name = "rms1_result";
+    binding.ready_cycle = 1234;
+    program.bindings.push_back(binding);
     program.max_cycle = icu_program.last_cycle();
     program.queues = icu_program.encode_queues();
     const auto path = std::filesystem::path(argv[1]);
@@ -34,6 +47,11 @@ try {
     write_binary_program(program, path);
 
     const auto decoded = read_binary_program(path);
+    if (decoded.bindings.size() != 1
+        || decoded.bindings[0].role != "attention_input"
+        || decoded.bindings[0].name != "rms1_result"
+        || decoded.bindings[0].ready_cycle != 1234)
+        return 1;
     require(decoded.target_name == kLpu32StreamTargetName,
         "target name was not preserved");
     require(decoded.target_abi == kLpu32StreamTargetAbi,
@@ -44,7 +62,7 @@ try {
             continue;
         const auto& command = queue.commands.back();
         require(command.instruction_kind == InstructionKind::Sxm, "SXM instruction kind was not preserved");
-        require(command.extension_words.size() == 2 + 2 + 2 + SxmInstruction::kTotalLanes,
+        require(command.extension_words.size() == 2 + 16 + 16 + SxmInstruction::kTotalLanes,
             "SXM variable payload size was not preserved");
         found = true;
     }

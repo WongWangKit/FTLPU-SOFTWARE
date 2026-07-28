@@ -65,6 +65,16 @@ mlir_tablegen(ftlpu/compiler/Dialect/Command/IR/CommandOpsDialect.h.inc -gen-dia
 mlir_tablegen(ftlpu/compiler/Dialect/Command/IR/CommandOpsDialect.cpp.inc -gen-dialect-defs)
 add_public_tablegen_target(FTLPUCommandOpsIncGen)
 
+# Ninja cannot recover this cross-subdirectory ABI dependency from localized
+# MSVC /showIncludes output. Binding and queue layout changes must always
+# rebuild the binary translator and its CLI entry point.
+file(GLOB_RECURSE FTLPU_RUNTIME_ABI_HEADERS CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/runtime/include/ftlpu/*.hpp")
+set_source_files_properties(
+    src/Target/CommandBinary.cpp
+    tools/ftlpu_translate.cpp
+    PROPERTIES OBJECT_DEPENDS "${FTLPU_RUNTIME_ABI_HEADERS}")
+
 add_library(ftlpu_compiler
     src/Dialect/Kernel/IR/KernelDialect.cpp
     src/Dialect/Kernel/Analysis/AttentionGraph.cpp
@@ -78,13 +88,16 @@ add_library(ftlpu_compiler
     src/Dialect/Tensor/Transforms/KernelToTensorLowering.cpp
     src/Dialect/Tensor/Transforms/KernelToTensor.cpp
     src/Dialect/Tensor/Transforms/MatmulToTensor.cpp
+    src/Dialect/Tensor/Transforms/RmsNormToTensor.cpp
     src/Dialect/Tensor/Transforms/SwigluToTensor.cpp
     src/Dialect/Stream/IR/StreamDialect.cpp
     src/Dialect/Stream/Analysis/StreamAllocator.cpp
     src/Dialect/Stream/Analysis/StreamRoutePlan.cpp
     src/Dialect/Stream/Transforms/AttentionToStream.cpp
     src/Dialect/Stream/Transforms/FfnToStream.cpp
+    src/Dialect/Stream/Transforms/ElementwiseToStream.cpp
     src/Dialect/Stream/Transforms/MatmulToStream.cpp
+    src/Dialect/Stream/Transforms/RmsNormToStream.cpp
     src/Dialect/Stream/Transforms/SwigluToStream.cpp
     src/Dialect/Stream/Transforms/TensorToStream.cpp
     src/Dialect/Schedule/IR/ScheduleDialect.cpp
@@ -113,6 +126,7 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Analysis/AttentionTaskGraph.cpp
     src/Dialect/Schedule/Analysis/AttentionMemoryLayout.cpp
     src/Dialect/Schedule/Transforms/AttentionEmitterUtils.cpp
+    src/Dialect/Schedule/Transforms/SxmWavefrontEmitterUtils.cpp
     src/Dialect/Schedule/Transforms/AttentionOutputProjectionEmitter.cpp
     src/Dialect/Schedule/Transforms/AttentionProjectionEmitter.cpp
     src/Dialect/Schedule/Transforms/AttentionPvEmitter.cpp
@@ -127,8 +141,11 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Transforms/FfnSwishEmitter.cpp
     src/Dialect/Schedule/Transforms/FfnSwishStageEmitter.cpp
     src/Dialect/Schedule/Transforms/FfnWeightLoadEmitter.cpp
+    src/Dialect/Schedule/Transforms/ElementwiseScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/MatmulScheduleEmitter.cpp
-    src/Dialect/Schedule/Transforms/ScheduleEmitterUtils.cpp
+      src/Dialect/Schedule/Transforms/RmsNormScheduleEmitter.cpp
+      src/Dialect/Schedule/Transforms/ScheduleCompression.cpp
+      src/Dialect/Schedule/Transforms/ScheduleEmitterUtils.cpp
     src/Dialect/Schedule/Transforms/StreamToSchedule.cpp
     src/Dialect/Schedule/Transforms/SwigluScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/VerifySchedule.cpp
@@ -136,6 +153,14 @@ add_library(ftlpu_compiler
     src/Dialect/Command/Transforms/ScheduleToCommand.cpp
     src/Target/LPUTargetModel.cpp
     src/Target/CommandBinary.cpp)
+
+if(FTLPU_ENABLE_ADDRESS_SANITIZER AND MSVC)
+    target_compile_options(ftlpu_compiler PRIVATE /fsanitize=address)
+    target_compile_definitions(ftlpu_compiler PRIVATE
+        _DISABLE_VECTOR_ANNOTATION
+        _DISABLE_STRING_ANNOTATION
+        _DISABLE_OPTIONAL_ANNOTATION)
+endif()
 
 # Ninja cannot reliably parse localized MSVC /showIncludes output. Keep
 # explicit dependency edges for all compiler sources: LPUTargetModel is also
@@ -179,6 +204,14 @@ target_link_libraries(ftlpu_opt PRIVATE ftlpu_compiler)
 add_executable(ftlpu_translate tools/ftlpu_translate.cpp)
 set_target_properties(ftlpu_translate PROPERTIES OUTPUT_NAME "ftlpu-translate")
 target_link_libraries(ftlpu_translate PRIVATE ftlpu_compiler)
+if(FTLPU_ENABLE_ADDRESS_SANITIZER AND MSVC)
+    target_compile_options(ftlpu_translate PRIVATE /fsanitize=address)
+    target_compile_definitions(ftlpu_translate PRIVATE
+        _DISABLE_VECTOR_ANNOTATION
+        _DISABLE_STRING_ANNOTATION
+        _DISABLE_OPTIONAL_ANNOTATION)
+    target_link_options(ftlpu_translate PRIVATE /INCREMENTAL:NO)
+endif()
 
 add_executable(attention_work_planner_test tests/attention_work_planner_test.cpp)
 target_link_libraries(attention_work_planner_test PRIVATE ftlpu_compiler)
@@ -345,15 +378,56 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_attention/schedule/attention.schedule.mlir)
     add_test(
-        NAME smollm2_attention_softmax_binary_runtime_test
+        NAME smollm2_attention_binary_cmodel_runtime_test
         COMMAND
             ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_attention_softmax_binary_runtime_test.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_attention_binary_runtime_test.py
             --opt $<TARGET_FILE:ftlpu_opt>
             --translate $<TARGET_FILE:ftlpu_translate>
-            --runtime-test $<TARGET_FILE:compiled_smollm2_attention_softmax_runtime_test>
+            --runtime-test $<TARGET_FILE:compiled_smollm2_attention_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_attention_softmax_binary_runtime)
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_attention_binary_runtime)
+    add_test(
+        NAME rmsnorm_binary_cmodel_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/rmsnorm_binary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_rmsnorm_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/rmsnorm/rmsnorm_128x576.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/rmsnorm_binary_runtime)
+    add_test(
+        NAME rmsnorm_feedback_binary_cmodel_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/rmsnorm_binary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_rmsnorm_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/rmsnorm/rmsnorm_128x576.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/rmsnorm_feedback_binary_runtime
+            --strategy vxm-feedback)
+    add_test(
+        NAME smollm2_decoder_layer_binary_cmodel_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_decoder_layer_binary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_smollm2_decoder_layer_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_decoder_layer/decoder_layer_seq128.stablehlo.mlir
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_decoder_layer_binary_runtime)
+    add_test(
+        NAME schedule_wave_compression_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/schedule_wave_compression_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/schedule_wave_compression.mlir
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/schedule_wave_compression/command.mlir)
     add_test(
         NAME stablehlo_matmul_320_to_ftlpu_kernel_mlir_test
         COMMAND

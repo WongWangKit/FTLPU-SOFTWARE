@@ -20,9 +20,13 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const bool w8a16 = is_w8a16_ffn(graph, target);
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
-    llvm::SmallVector<int64_t> weight_slices;
-    for (int64_t index = 0; index < memory.w8a16_weight_slice_count; ++index)
-        weight_slices.push_back(index * memory.w8a16_weight_slice_stride);
+    llvm::SmallVector<int64_t> projection_weight_slices;
+    for (int64_t index = 0;
+         index < memory.w8a16_weight_slice_count; ++index)
+        projection_weight_slices.push_back(
+            index * memory.w8a16_weight_slice_stride);
+    const llvm::SmallVector<int64_t> down_weight_slices =
+        projection_weight_slices;
     llvm::SmallVector<int64_t> activation_slices;
     llvm::SmallVector<int64_t> hidden_slices;
     llvm::SmallVector<int64_t> result_slices;
@@ -45,6 +49,9 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             / (memory.w8a16_weight_slice_count
                 * throughput.tile_rows * throughput.lanes_per_tile)
         : 0;
+    const bool largeSramProfile =
+        memory.banks_per_slice * memory.words_per_bank >= 17000;
+    const int64_t ffnWeightBase = largeSramProfile ? 10000 : 0;
     auto input = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Activation,
             activation_slices, 0, m * k / throughput.mxm_rows,
@@ -52,15 +59,18 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         : allocate_value(input_value, PlacementKind::Activation);
     auto gate = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
-            weight_slices, 0, gate_rows, k * hidden))
+            projection_weight_slices, ffnWeightBase,
+            gate_rows, k * hidden))
         : allocate_value(gate_weight, PlacementKind::Weight);
     auto up = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
-            weight_slices, gate_rows, gate_rows, k * hidden))
+            projection_weight_slices, ffnWeightBase + gate_rows,
+            gate_rows, k * hidden))
         : allocate_value(up_weight, PlacementKind::Weight);
     auto down = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
-            weight_slices, 2 * gate_rows, down_rows, hidden * n))
+            down_weight_slices, ffnWeightBase + 2 * gate_rows,
+            down_rows, hidden * n))
         : allocate_value(down_weight, PlacementKind::Weight);
     auto hidden0 = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::VxmResult,
@@ -119,8 +129,13 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         ? make_profile_placement(rewriter, *result, "fp16_pair_planar", "both")
         : make_placement_attr(rewriter, *result);
 
-    const auto input_allocations = make_task_allocations(rewriter,
-        {make_task_allocation(rewriter, *input, input_placement)});
+    auto inheritedInputAllocations =
+        get_value_task_allocations(input_value);
+    const auto input_allocations =
+        mlir::succeeded(inheritedInputAllocations)
+        ? *inheritedInputAllocations
+        : make_task_allocations(rewriter,
+            {make_task_allocation(rewriter, *input, input_placement)});
     const auto gate_allocations = make_task_allocations(rewriter,
         {make_task_allocation(rewriter, *gate, gate_placement)});
     const auto up_allocations = make_task_allocations(rewriter,
@@ -136,6 +151,9 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const auto transient = rewriter.getArrayAttr({});
     const auto empty_config = rewriter.getDictionaryAttr({});
     const auto unit_scale = rewriter.getF32FloatAttr(1.0f);
+    const auto gate_scale = graph.gate.getRhsScaleAttr();
+    const auto up_scale = graph.up.getRhsScaleAttr();
+    const auto down_scale = graph.output.getRhsScaleAttr();
     const auto zero_point = rewriter.getI64IntegerAttr(0);
     const mlir::Type projection_element_type = w8a16
         ? mlir::Type(rewriter.getF32Type())
@@ -177,13 +195,13 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         projection_type, m, hidden, k,
         input_allocations, gate_allocations, transient,
         rewriter.getDictionaryAttr({
-            rewriter.getNamedAttr("rhs_scale", unit_scale),
+            rewriter.getNamedAttr("rhs_scale", gate_scale),
         }));
     auto up_task = create_matmul_task(input_value, up_weight,
         projection_type, m, hidden, k,
         input_allocations, up_allocations, transient,
         rewriter.getDictionaryAttr({
-            rewriter.getNamedAttr("rhs_scale", unit_scale),
+            rewriter.getNamedAttr("rhs_scale", up_scale),
         }));
 
     mlir::OperationState swish_state(op.getLoc(),
@@ -202,6 +220,8 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     multiply_state.addTypes(hidden_type);
     multiply_state.addAttributes({
         rewriter.getNamedAttr("kind", rewriter.getStringAttr("multiply")),
+        rewriter.getNamedAttr("lhs_allocations", transient),
+        rewriter.getNamedAttr("rhs_allocations", transient),
         rewriter.getNamedAttr("result_allocations", hidden_allocations),
         rewriter.getNamedAttr("config", rewriter.getDictionaryAttr({
             rewriter.getNamedAttr("output_scale", unit_scale),
@@ -216,7 +236,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         hidden, hidden_allocations, down_allocations,
         result_allocations, rewriter.getDictionaryAttr({
             rewriter.getNamedAttr("lhs_scale", unit_scale),
-            rewriter.getNamedAttr("rhs_scale", unit_scale),
+            rewriter.getNamedAttr("rhs_scale", down_scale),
             rewriter.getNamedAttr("output_scale", unit_scale),
             rewriter.getNamedAttr("output_zero_point", zero_point),
         }));

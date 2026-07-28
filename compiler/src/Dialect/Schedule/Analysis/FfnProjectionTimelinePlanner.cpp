@@ -43,7 +43,8 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
             block.pair = pair;
             block.reduction_block = reduction;
             block.weight_compute_cycle = result.initial_compute_cycle
-                + block.index * result.weight_block_interval;
+                + block.index * result.weight_block_interval
+                + pair * tile;
             block.dequant_start = block.weight_compute_cycle - tile;
             block.weight_buffer = block.index % 2;
             block.final_reduction = reduction + 1 == reductionBlocks;
@@ -55,6 +56,7 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
                 tileSchedule.compute_cycle = block.weight_compute_cycle
                     + mTile * result.pipelined_block_interval;
                 tileSchedule.prefetch_next_weight = hasNextWeight
+                    && !block.final_reduction
                     && mTile + 1 == result.m_tile_count;
                 tileSchedule.hemisphere_segments.resize(
                     static_cast<std::size_t>(memory.hemispheres));
@@ -97,6 +99,7 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     if (result.blocks.empty()) return mlir::failure();
     result.final_projection_cycle = result.initial_compute_cycle
         + (totalBlocks - 1) * result.weight_block_interval
+        + (result.pair_count - 1) * tile
         + (result.m_tile_count - 1) * result.pipelined_block_interval;
     const int64_t gateAccumulatorSlice = memory.accumulator_slice_base;
     const int64_t upAccumulatorSlice = memory.accumulator_slice_base

@@ -37,6 +37,9 @@ LogicalResult MatmulOp::verify()
         || result_type.getDimSize(0) != getM() || result_type.getDimSize(1) != getN())
         return emitOpError("tensor shapes do not match m, n, and k");
     if (getUnit() != "MXM") return emitOpError("unit must be MXM");
+    if (!std::isfinite(getRhsScale().convertToDouble())
+        || getRhsScale().convertToDouble() <= 0.0)
+        return emitOpError("requires a finite positive rhs_scale");
     return success();
 }
 
@@ -140,6 +143,28 @@ LogicalResult SoftmaxOp::verify()
     return success();
 }
 
+LogicalResult RmsNormOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto weight = getWeight().getType();
+    const auto result = getResult().getType();
+    if (!input.hasStaticShape() || !weight.hasStaticShape()
+        || input.getRank() != 2 || weight.getRank() != 1 || result != input)
+        return emitOpError(
+            "requires a static rank-2 input/result and rank-1 scale");
+    const int64_t axis = getAxisAttr().getInt();
+    const int64_t normalizedAxis = axis < 0 ? axis + input.getRank() : axis;
+    if (normalizedAxis != input.getRank() - 1
+        || weight.getDimSize(0) != input.getDimSize(normalizedAxis)
+        || weight.getElementType() != input.getElementType())
+        return emitOpError(
+            "requires a scale matching the final input dimension");
+    if (!std::isfinite(getEpsilon().convertToFloat())
+        || getEpsilon().convertToFloat() <= 0.0f)
+        return emitOpError("requires a finite positive epsilon");
+    return success();
+}
+
 LogicalResult SwishOp::verify()
 {
     if (getInput().getType() != getResult().getType())
@@ -152,8 +177,8 @@ LogicalResult ElementwiseOp::verify()
     if (getLhs().getType() != getRhs().getType()
         || getLhs().getType() != getResult().getType())
         return emitOpError("requires matching operand and result types");
-    if (getKind() != "multiply")
-        return emitOpError("currently supports only multiply");
+    if (getKind() != "multiply" && getKind() != "add")
+        return emitOpError("kind must be multiply or add");
     return success();
 }
 

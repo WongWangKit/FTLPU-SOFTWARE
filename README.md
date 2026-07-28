@@ -79,6 +79,16 @@ python compiler/tools/ftlpu-iree-import.py `
   --onnx-opset-version 17
 ```
 
+## Pipeline Waveform Viewer
+
+Open runtime `*.runtime.csv` traces in the interactive Canvas viewer:
+
+[tools/pipeline_viewer/index.html](tools/pipeline_viewer/index.html)
+
+It supports timeline zoom and pan, functional-unit filters, event inspection,
+overview navigation, and A/B cycle measurement cursors. See
+[tools/pipeline_viewer/README.md](tools/pipeline_viewer/README.md) for usage.
+
 ## Build
 
 By default CMake expects `FTLPU-CMODEL` to sit next to this repository:

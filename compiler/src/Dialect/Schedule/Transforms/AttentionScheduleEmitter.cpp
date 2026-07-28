@@ -22,7 +22,9 @@ int64_t elementTypeBytes(mlir::Type type)
 BindingOp createBinding(mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::ValueRange source, int64_t index, llvm::StringRef access,
     llvm::StringRef role, mlir::RankedTensorType type,
-    mlir::DictionaryAttr placement)
+    mlir::DictionaryAttr placement, llvm::StringRef name = {},
+    llvm::StringRef initializer = {},
+    mlir::DictionaryAttr initializerConfig = {})
 {
     mlir::OperationState state(location, BindingOp::getOperationName());
     state.addOperands(source);
@@ -37,6 +39,13 @@ BindingOp createBinding(mlir::IRRewriter& rewriter, mlir::Location location,
             type.getNumElements() * elementTypeBytes(type.getElementType()))),
         rewriter.getNamedAttr("placement", placement),
     });
+    if (!name.empty())
+        state.addAttribute("name", rewriter.getStringAttr(name));
+    if (!initializer.empty())
+        state.addAttribute(
+            "initializer", rewriter.getStringAttr(initializer));
+    if (initializerConfig)
+        state.addAttribute("initializer_config", initializerConfig);
     return llvm::cast<BindingOp>(rewriter.create(state));
 }
 
@@ -84,6 +93,7 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         const auto argument =
             llvm::dyn_cast<mlir::BlockArgument>(inputs[index]);
         if (!argument) {
+            if (index == 0) continue;
             op_.emitError("attention runtime input is not a block argument");
             return mlir::failure();
         }
@@ -96,12 +106,30 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     if (op_.getCausal()) {
         const auto maskType = mlir::RankedTensorType::get(
             {tile - 1, tile}, rewriter_.getF32Type());
+        int64_t maskIndex = 0;
         for (const char* placement :
-            {"causal_mask", "causal_mask_mxm1"})
-            createBinding(rewriter_, op_.getLoc(), {}, 0, "internal",
-                "constant", maskType,
-                memoryPlan.getAs<mlir::DictionaryAttr>(placement));
+            {"causal_mask", "causal_mask_mxm1"}) {
+            createBinding(rewriter_, op_.getLoc(), {}, maskIndex,
+                "internal", "constant", maskType,
+                memoryPlan.getAs<mlir::DictionaryAttr>(placement),
+                "causal_mask." + std::to_string(maskIndex),
+                "causal_mask", rewriter_.getDictionaryAttr({}));
+            ++maskIndex;
+        }
     }
+    const auto ropeType = mlir::RankedTensorType::get(
+        {op_.getSeqLen(), op_.getHeadDim() / 2, 2},
+        rewriter_.getF16Type());
+    createBinding(rewriter_, op_.getLoc(), {}, 2, "internal",
+        "constant", ropeType,
+        memoryPlan.getAs<mlir::DictionaryAttr>("rope"),
+        "rope.cos_sin", "rope_table",
+        rewriter_.getDictionaryAttr({
+            rewriter_.getNamedAttr(
+                "theta", op_.config().getAs<mlir::FloatAttr>("rope_theta")),
+            rewriter_.getNamedAttr("head_dim",
+                rewriter_.getI64IntegerAttr(op_.getHeadDim())),
+        }));
 
     const int64_t projectionEnd = emitProjections();
     const int64_t qkvCycles = projectionEnd - 1;

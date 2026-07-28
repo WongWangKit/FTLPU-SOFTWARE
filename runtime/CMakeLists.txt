@@ -1,5 +1,7 @@
 add_library(ftlpu_cmodel_static STATIC
-    src/cmodel/cmodel_static.cpp)
+    src/cmodel/cmodel_static.cpp
+    "${FTLPU_CMODEL_DIR}/src/mem/sram.cpp"
+    "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp")
 
 file(GLOB_RECURSE FTLPU_CMODEL_PUBLIC_HEADERS CONFIGURE_DEPENDS
     "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
@@ -16,14 +18,19 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/binary.cpp
     src/runtime/cmodel_runtime.cpp
     src/runtime/icu_program.cpp
+    src/runtime/model_package.cpp
+    src/runtime/model_session.cpp
     src/runtime/performance.cpp
     src/runtime/schedule_trace.cpp
     tests/runtime/command_vxm_binary_runtime_test.cpp
     tests/runtime/sxm_binary_roundtrip_test.cpp
     tests/runtime/compiled_sxm_command_runtime_test.cpp
     tests/runtime/compiled_queue_program_runtime_test.cpp
+    tests/runtime/compiled_rmsnorm_runtime_test.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
-    tests/runtime/compiled_smollm2_attention_softmax_runtime_test.cpp)
+    tests/runtime/compiled_smollm2_attention_runtime_test.cpp
+    tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp
+    tests/runtime/hf_decoder_layer_model_session_test.cpp)
 set_source_files_properties(${FTLPU_CMODEL_CONSUMER_SOURCES}
     PROPERTIES OBJECT_DEPENDS
         "${FTLPU_CMODEL_PUBLIC_HEADERS};${FTLPU_RUNTIME_PUBLIC_HEADERS}")
@@ -37,8 +44,19 @@ add_library(ftlpu_software
     src/runtime/binary.cpp
     src/runtime/cmodel_runtime.cpp
     src/runtime/icu_program.cpp
+    src/runtime/model_package.cpp
+    src/runtime/model_session.cpp
     src/runtime/performance.cpp
-    src/runtime/schedule_trace.cpp)
+    src/runtime/schedule_trace.cpp
+    src/runtime/session_memory_planner.cpp)
+
+if(FTLPU_ENABLE_ADDRESS_SANITIZER AND MSVC)
+    target_compile_options(ftlpu_software PRIVATE /fsanitize=address)
+    target_compile_definitions(ftlpu_software PRIVATE
+        _DISABLE_VECTOR_ANNOTATION
+        _DISABLE_STRING_ANNOTATION
+        _DISABLE_OPTIONAL_ANNOTATION)
+endif()
 
 target_include_directories(ftlpu_software
     PUBLIC
@@ -62,6 +80,15 @@ add_test(
     COMMAND $<TARGET_FILE:sxm_binary_roundtrip_test>
         ${CMAKE_CURRENT_BINARY_DIR}/test-output/sxm-v5.ftlpu)
 
+add_executable(model_package_roundtrip_test
+    tests/runtime/model_package_roundtrip_test.cpp)
+
+target_link_libraries(model_package_roundtrip_test PRIVATE ftlpu_software)
+add_test(
+    NAME model_package_roundtrip_test
+    COMMAND $<TARGET_FILE:model_package_roundtrip_test>
+        ${CMAKE_CURRENT_BINARY_DIR}/test-output/roundtrip.ftlpum)
+
 add_executable(compiled_sxm_command_runtime_test
     tests/runtime/compiled_sxm_command_runtime_test.cpp)
 
@@ -71,6 +98,11 @@ add_executable(compiled_queue_program_runtime_test
     tests/runtime/compiled_queue_program_runtime_test.cpp)
 
 target_link_libraries(compiled_queue_program_runtime_test PRIVATE ftlpu_software)
+
+add_executable(compiled_rmsnorm_runtime_test
+    tests/runtime/compiled_rmsnorm_runtime_test.cpp)
+
+target_link_libraries(compiled_rmsnorm_runtime_test PRIVATE ftlpu_software)
 
 add_executable(compiled_smollm2_135m_ffn_runtime_test
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
@@ -84,7 +116,25 @@ target_compile_definitions(compiled_smollm2_135m_ffn_seq128_runtime_test
     PRIVATE FTLPU_TEST_SEQUENCE_LENGTH=128)
 target_link_libraries(compiled_smollm2_135m_ffn_seq128_runtime_test PRIVATE ftlpu_software)
 
-add_executable(compiled_smollm2_attention_softmax_runtime_test
-    tests/runtime/compiled_smollm2_attention_softmax_runtime_test.cpp)
+add_executable(compiled_smollm2_attention_runtime_test
+    tests/runtime/compiled_smollm2_attention_runtime_test.cpp)
 
-target_link_libraries(compiled_smollm2_attention_softmax_runtime_test PRIVATE ftlpu_software)
+target_link_libraries(compiled_smollm2_attention_runtime_test PRIVATE ftlpu_software)
+
+add_executable(compiled_smollm2_decoder_layer_runtime_test
+    tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
+
+target_link_libraries(compiled_smollm2_decoder_layer_runtime_test
+    PRIVATE ftlpu_software)
+
+add_executable(hf_decoder_layer_model_session_test
+    tests/runtime/hf_decoder_layer_model_session_test.cpp)
+
+target_link_libraries(hf_decoder_layer_model_session_test
+    PRIVATE ftlpu_software)
+
+add_executable(hf_two_decoder_layers_model_session_test
+    tests/runtime/hf_two_decoder_layers_model_session_test.cpp)
+
+target_link_libraries(hf_two_decoder_layers_model_session_test
+    PRIVATE ftlpu_software)

@@ -33,6 +33,8 @@ struct Args {
     std::string pipeline{"ftlpu-stablehlo-to-kernel"};
     ftlpu::compiler::FfnScheduleStrategy ffn_schedule{
         ftlpu::compiler::FfnScheduleStrategy::Tail};
+    ftlpu::compiler::RmsNormLoweringStrategy rmsnorm_strategy{
+        ftlpu::compiler::RmsNormLoweringStrategy::VxmSquareMxmReduce};
 };
 
 Args parse_args(int argc, char** argv)
@@ -58,14 +60,30 @@ Args parse_args(int argc, char** argv)
                 throw std::runtime_error(
                     "unknown FFN schedule strategy: " + strategy);
         }
+        else if (arg == "--rmsnorm-strategy") {
+            const std::string strategy = next();
+            if (strategy == "vxm-square-mxm-reduce")
+                args.rmsnorm_strategy =
+                    ftlpu::compiler::RmsNormLoweringStrategy::
+                        VxmSquareMxmReduce;
+            else if (strategy == "vxm-feedback")
+                args.rmsnorm_strategy =
+                    ftlpu::compiler::RmsNormLoweringStrategy::VxmFeedback;
+            else
+                throw std::runtime_error(
+                    "unknown RMSNorm lowering strategy: " + strategy);
+        }
         else throw std::runtime_error("unknown argument: " + arg);
     }
     if (args.input.empty() || args.output.empty()) {
         throw std::runtime_error("usage: ftlpu-opt --input in.mlir --output out.mlir "
                                  "[--pipeline ftlpu-stablehlo-to-kernel|ftlpu-stablehlo-to-tensor|"
                                  "ftlpu-stablehlo-to-stream|ftlpu-stablehlo-to-schedule|"
-                                 "ftlpu-stablehlo-to-commands|ftlpu-verify-schedule] "
+                                 "ftlpu-stablehlo-to-commands|ftlpu-schedule-to-commands|"
+                                 "ftlpu-compress-schedule|ftlpu-verify-schedule] "
                                  "[--ffn-schedule tail|fused] "
+                                 "[--rmsnorm-strategy "
+                                 "vxm-square-mxm-reduce|vxm-feedback] "
                                  "[--target-config target.json]");
     }
     return args;
@@ -118,16 +136,22 @@ try {
         && args.pipeline != "ftlpu-stablehlo-to-stream"
         && args.pipeline != "ftlpu-stablehlo-to-schedule"
         && args.pipeline != "ftlpu-stablehlo-to-commands"
+        && args.pipeline != "ftlpu-schedule-to-commands"
+        && args.pipeline != "ftlpu-compress-schedule"
         && args.pipeline != "ftlpu-verify-schedule") {
         throw std::runtime_error("unknown MLIR pipeline: " + args.pipeline);
     }
-    if (args.pipeline != "ftlpu-verify-schedule")
+    if (args.pipeline != "ftlpu-verify-schedule"
+        && args.pipeline != "ftlpu-schedule-to-commands"
+        && args.pipeline != "ftlpu-compress-schedule")
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stablehlo_to_kernel_pass());
     if (args.pipeline == "ftlpu-stablehlo-to-tensor" || args.pipeline == "ftlpu-stablehlo-to-stream"
         || args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands")
-        pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_kernel_to_tensor_pass());
+        pass_manager.addNestedPass<mlir::func::FuncOp>(
+            ftlpu::compiler::create_lower_kernel_to_tensor_pass(
+                args.rmsnorm_strategy));
     if (args.pipeline == "ftlpu-stablehlo-to-stream" || args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_tensor_to_stream_pass());
@@ -135,13 +159,22 @@ try {
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stream_to_schedule_pass(args.ffn_schedule));
     if (args.pipeline == "ftlpu-stablehlo-to-schedule"
-        || args.pipeline == "ftlpu-stablehlo-to-commands")
+        || args.pipeline == "ftlpu-stablehlo-to-commands"
+        || args.pipeline == "ftlpu-schedule-to-commands"
+        || args.pipeline == "ftlpu-compress-schedule")
+        pass_manager.addNestedPass<mlir::func::FuncOp>(
+            ftlpu::compiler::create_compress_schedule_pass());
+    if (args.pipeline == "ftlpu-stablehlo-to-schedule"
+        || args.pipeline == "ftlpu-stablehlo-to-commands"
+        || args.pipeline == "ftlpu-schedule-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_verify_schedule_pass());
     if (args.pipeline == "ftlpu-verify-schedule")
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_verify_schedule_pass());
     if (args.pipeline == "ftlpu-stablehlo-to-commands")
+        pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_schedule_to_command_pass());
+    if (args.pipeline == "ftlpu-schedule-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_schedule_to_command_pass());
     if (mlir::failed(pass_manager.run(*module))) return 1;
 

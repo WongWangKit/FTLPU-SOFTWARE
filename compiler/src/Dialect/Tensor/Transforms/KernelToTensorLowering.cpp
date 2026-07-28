@@ -6,6 +6,92 @@
 
 namespace ftlpu::compiler::tensor_lowering {
 
+FunctionMemoryPlanner::FunctionMemoryPlanner(
+    mlir::func::FuncOp function, EastMemoryAllocator& allocator)
+    : allocator_(allocator)
+{
+    int64_t ordinal = 0;
+    for (mlir::Operation& operation : function.getBody().front()) {
+        ordinals_[&operation] = ordinal;
+        for (mlir::Value operand : operation.getOperands())
+            last_uses_[operand] = ordinal;
+        ++ordinal;
+    }
+}
+
+mlir::FailureOr<Allocation> FunctionMemoryPlanner::allocate(
+    mlir::Value value, PlacementKind kind)
+{
+    if (const auto found = allocations_.find(value);
+        found != allocations_.end())
+        return found->second.kind == kind
+            ? mlir::FailureOr<Allocation>(found->second)
+            : mlir::FailureOr<Allocation>(mlir::failure());
+    const auto type =
+        llvm::dyn_cast<mlir::RankedTensorType>(value.getType());
+    const auto bytes = get_static_tensor_bytes(type);
+    if (mlir::failed(bytes)) return mlir::failure();
+    auto allocation = allocator_.allocate(kind, *bytes);
+    if (mlir::failed(allocation)) return mlir::failure();
+    allocations_.try_emplace(value, *allocation);
+    return *allocation;
+}
+
+mlir::LogicalResult FunctionMemoryPlanner::bind(
+    mlir::Value value, const Allocation& allocation)
+{
+    if (const auto found = allocations_.find(value);
+        found != allocations_.end())
+        return found->second.slices == allocation.slices
+                && found->second.base_row == allocation.base_row
+            ? mlir::success()
+            : mlir::failure();
+    allocations_.try_emplace(value, allocation);
+    externally_managed_.insert(value);
+    return mlir::success();
+}
+
+void FunctionMemoryPlanner::release_before(mlir::Operation* operation)
+{
+    const int64_t current = ordinal(operation);
+    llvm::SmallVector<mlir::Value> expired;
+    for (const auto& [value, allocation] : allocations_) {
+        const auto use = last_uses_.find(value);
+        if (use == last_uses_.end() || use->second < current)
+            expired.push_back(value);
+    }
+    for (mlir::Value value : expired) {
+        if (!externally_managed_.contains(value))
+            allocator_.release(allocations_.lookup(value));
+        externally_managed_.erase(value);
+        allocations_.erase(value);
+    }
+}
+
+void FunctionMemoryPlanner::replace_value(
+    mlir::Value old_value, mlir::Value new_value)
+{
+    if (auto allocation = allocations_.find(old_value);
+        allocation != allocations_.end()) {
+        allocations_.try_emplace(new_value, allocation->second);
+        if (externally_managed_.erase(old_value))
+            externally_managed_.insert(new_value);
+        allocations_.erase(allocation);
+    }
+    if (auto use = last_uses_.find(old_value);
+        use != last_uses_.end()) {
+        last_uses_[new_value] = use->second;
+        last_uses_.erase(use);
+    }
+}
+
+int64_t FunctionMemoryPlanner::ordinal(
+    mlir::Operation* operation) const
+{
+    const auto found = ordinals_.find(operation);
+    return found == ordinals_.end() ? 0 : found->second;
+}
+
 mlir::FailureOr<int64_t> RowAllocator::allocate(int64_t rows)
 {
     for (size_t index = 0; index < free_blocks_.size(); ++index) {
@@ -74,7 +160,7 @@ mlir::FailureOr<Allocation> EastMemoryAllocator::allocate(
         slices.push_back(first_slice + index);
     return Allocation {kind, std::move(slices), *base_row,
         instruction_count, kind == PlacementKind::Weight ? -16 : 16,
-        row_span, bytes};
+        row_span, bytes, "", "east"};
 }
 
 void EastMemoryAllocator::release(const Allocation& allocation)
@@ -140,12 +226,14 @@ mlir::DictionaryAttr make_placement_attr(
     llvm::SmallVector<mlir::Attribute> slices;
     for (int64_t slice : allocation.slices)
         slices.push_back(builder.getI64IntegerAttr(slice));
-    const char* kind = allocation.kind == PlacementKind::Weight
+    const std::string kind = !allocation.layout.empty()
+        ? allocation.layout
+        : allocation.kind == PlacementKind::Weight
         ? "mxm_weight_striped"
         : allocation.kind == PlacementKind::Result
         ? "int32_byte_planar"
         : "vector";
-    return builder.getDictionaryAttr({
+    llvm::SmallVector<mlir::NamedAttribute> attributes {
         builder.getNamedAttr("kind", builder.getStringAttr(kind)),
         builder.getNamedAttr("slices", builder.getArrayAttr(slices)),
         builder.getNamedAttr(
@@ -154,15 +242,29 @@ mlir::DictionaryAttr make_placement_attr(
             builder.getI64IntegerAttr(allocation.instruction_count)),
         builder.getNamedAttr("address_stride",
             builder.getI64IntegerAttr(allocation.address_stride)),
-    });
+    };
+    if (!allocation.hemisphere.empty())
+        attributes.push_back(builder.getNamedAttr(
+            "hemisphere", builder.getStringAttr(allocation.hemisphere)));
+    return builder.getDictionaryAttr(attributes);
 }
 
 Allocation fixed_allocation(PlacementKind kind,
     llvm::ArrayRef<int64_t> slices, int64_t base_row,
     int64_t instruction_count, int64_t bytes)
 {
+    return fixed_allocation(kind, slices, base_row,
+        instruction_count, bytes, {}, "east");
+}
+
+Allocation fixed_allocation(PlacementKind kind,
+    llvm::ArrayRef<int64_t> slices, int64_t base_row,
+    int64_t instruction_count, int64_t bytes,
+    llvm::StringRef layout, llvm::StringRef hemisphere)
+{
     return Allocation {kind, llvm::SmallVector<int64_t, 16>(slices),
-        base_row, instruction_count, 1, instruction_count, bytes};
+        base_row, instruction_count, 1, instruction_count, bytes,
+        layout.str(), hemisphere.str()};
 }
 
 bool is_w8a16_ffn(kernel::FfnGraph& graph,
@@ -217,6 +319,62 @@ mlir::ArrayAttr make_task_allocations(mlir::OpBuilder& builder,
     llvm::SmallVector<mlir::Attribute> attributes(
         allocations.begin(), allocations.end());
     return builder.getArrayAttr(attributes);
+}
+
+mlir::FailureOr<mlir::ArrayAttr> get_value_task_allocations(
+    mlir::Value value)
+{
+    if (auto op = value.getDefiningOp<tensor::MatmulTaskOp>())
+        return op.getResultAllocations();
+    if (auto op = value.getDefiningOp<tensor::RmsNormTaskOp>())
+        return op.getResultAllocations();
+    if (auto op = value.getDefiningOp<tensor::ElementwiseTaskOp>())
+        return op.getResultAllocations();
+    if (auto op = value.getDefiningOp<tensor::ProjectionTaskOp>()) {
+        auto placement =
+            op.getMemoryPlan().getAs<mlir::DictionaryAttr>("result");
+        const auto type =
+            llvm::dyn_cast<mlir::RankedTensorType>(value.getType());
+        if (!placement || !type) return mlir::failure();
+        auto bytes = get_static_tensor_bytes(type);
+        if (mlir::failed(bytes)) return mlir::failure();
+        llvm::SmallVector<int64_t> slices;
+        for (mlir::Attribute slice :
+            placement.getAs<mlir::ArrayAttr>("slices"))
+            slices.push_back(
+                llvm::cast<mlir::IntegerAttr>(slice).getInt());
+        const int64_t baseRow =
+            placement.getAs<mlir::IntegerAttr>("base_row").getInt();
+        const int64_t instructionCount =
+            placement.getAs<mlir::IntegerAttr>(
+                "instruction_count").getInt();
+        const auto kind =
+            placement.getAs<mlir::StringAttr>("kind").getValue();
+        const auto hemisphere =
+            placement.getAs<mlir::StringAttr>("hemisphere").getValue();
+        const Allocation allocation = fixed_allocation(
+            PlacementKind::FinalResult, slices, baseRow,
+            instructionCount, *bytes, kind, hemisphere);
+        mlir::OpBuilder builder(value.getContext());
+        return make_task_allocations(builder,
+            {make_task_allocation(builder, allocation, placement)});
+    }
+    return mlir::failure();
+}
+
+mlir::FailureOr<mlir::DictionaryAttr> get_value_placement(
+    mlir::Value value)
+{
+    auto allocations = get_value_task_allocations(value);
+    if (mlir::failed(allocations) || allocations->empty())
+        return mlir::failure();
+    auto allocation =
+        llvm::dyn_cast<mlir::DictionaryAttr>((*allocations)[0]);
+    if (!allocation) return mlir::failure();
+    auto placement =
+        allocation.getAs<mlir::DictionaryAttr>("placement");
+    if (!placement) return mlir::failure();
+    return placement;
 }
 
 mlir::DictionaryAttr make_attention_placement(

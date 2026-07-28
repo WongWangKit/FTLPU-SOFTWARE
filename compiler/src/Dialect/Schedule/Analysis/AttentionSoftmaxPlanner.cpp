@@ -41,6 +41,11 @@ mlir::FailureOr<AttentionSoftmaxSchedule> planAttentionSoftmax(
         + 2 + maxProbabilityGroup;
     const int64_t hemisphereCount = target.memory().hemispheres;
     if (hemisphereCount != 2) return mlir::failure();
+    constexpr int64_t alusPerWork = 4;
+    if (hemisphereCount * target.throughput().mxms_per_hemisphere
+            * alusPerWork
+        > target.throughput().vxm_alus)
+        return mlir::failure();
 
     SchedulePlan tasks;
     LPUResourceModel resources(target);
@@ -56,8 +61,11 @@ mlir::FailureOr<AttentionSoftmaxSchedule> planAttentionSoftmax(
             for (const auto& work : waves[waveIndex].slots) {
                 if (!work || work->hemisphere != hemisphere) continue;
                 hasWork = true;
-                const int64_t aluBase = hemisphere * 6 + work->local_mxm * 3;
-                for (int64_t alu = 0; alu < 3; ++alu)
+                const int64_t aluBase =
+                    (hemisphere * target.throughput().mxms_per_hemisphere
+                        + work->local_mxm)
+                    * alusPerWork;
+                for (int64_t alu = 0; alu < alusPerWork; ++alu)
                     windows.push_back(
                         {resources.vxm_alu(aluBase + alu), 0, duration});
                 const auto reserveSlices = [&](llvm::ArrayRef<int64_t> slices) {

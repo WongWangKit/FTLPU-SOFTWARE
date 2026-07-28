@@ -3,7 +3,7 @@
 ![SmolLM2-135M attention pipeline](smollm2_attention_pipeline.svg)
 
 The diagram is generated from the serialized ICU queues executed by
-`compiled_smollm2_attention_softmax_runtime_test`. It is not a manually
+`compiled_smollm2_attention_runtime_test`. It is not a manually
 maintained timing sketch. The runtime expands `NOP` and `Repeat` commands into
 the same four-column trace format used by FTLPU-CMODEL:
 
@@ -21,10 +21,13 @@ workload covers:
 - P x V context calculation;
 - four-MXM output projection.
 
-The runtime test checks sampled Q/K/V values, softmax normalization and SXM
-layout, P x V context values, and the final O-projection output against CPU
-references. It also checks every sampled future-token probability is exactly
-zero.
+The runtime test checks that Command IR contains MEM, MXM, VXM, and SXM queue
+commands. It then executes the binary on CModel and compares sampled Q/K/V
+values, causal softmax probabilities, P x V context values, and final
+O-projection output against an independent CPU Attention reference. The CPU
+reference is computed only from the uploaded input and weights; it does not
+reuse CModel intermediate values. Every sampled future-token probability must
+also be exactly zero.
 
 The causal mask uses only 31 reusable FP32 vectors for the nonzero diagonals of
 one 32x32 tile. Fully visible past blocks use an immediate `0`; fully hidden
@@ -36,7 +39,7 @@ passes 2 and 3 consume already-masked scores without another mask read.
 
 The renderer uses the same functional-unit lane layout and color convention as
 FTLPU-CMODEL's `smollm2_attention_schedule_detail.svg`. It selects eight
-readable windows from the full 69,304-cycle trace:
+readable windows from the full 64,952-cycle trace:
 
 1. Q projection first reduction block;
 2. Q RoPE and writeback;
@@ -79,8 +82,8 @@ layout or another intermediate buffer, not only a cycle-number change.
 ## Measured CModel Utilization
 
 These values are measured while executing the compiled full Attention binary,
-including 64 runtime drain cycles. The monitor sampled 69,368 cycles;
-`program.max_cycle` is 69,304.
+including 64 runtime drain cycles. The monitor sampled 65,016 cycles;
+`program.max_cycle` is 64,952.
 
 | MXM | Active cycles | Array utilization | Active density | Peak active cells |
 | --- | ---: | ---: | ---: | ---: |
@@ -113,13 +116,13 @@ MEM or SXM utilization counters, so no percentages are estimated for them.
 ## Regenerate
 
 Build `ftlpu_opt`, `ftlpu_translate`, and
-`compiled_smollm2_attention_softmax_runtime_test`, then run:
+`compiled_smollm2_attention_runtime_test`, then run:
 
 ```powershell
-python compiler/tests/smollm2_attention_softmax_binary_runtime_test.py `
+python compiler/tests/smollm2_attention_binary_runtime_test.py `
   --opt build-ftlpu-vs2026/compiler/ftlpu_opt.exe `
   --translate build-ftlpu-vs2026/compiler/ftlpu-translate.exe `
-  --runtime-test build-ftlpu-vs2026/runtime/compiled_smollm2_attention_softmax_runtime_test.exe `
+  --runtime-test build-ftlpu-vs2026/runtime/compiled_smollm2_attention_runtime_test.exe `
   --input compiler/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir `
   --output-dir build-ftlpu-vs2026/compiler/ftlpu_lower/smollm2_attention_pipeline
 ```

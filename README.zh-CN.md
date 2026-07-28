@@ -78,6 +78,16 @@ python compiler/tools/ftlpu-iree-import.py `
   --onnx-opset-version 17
 ```
 
+## Pipeline 波形查看器
+
+runtime 生成的 `*.runtime.csv` 可以在交互式 Canvas 查看器中打开：
+
+[tools/pipeline_viewer/index.html](tools/pipeline_viewer/index.html)
+
+查看器支持时间轴缩放、拖动、功能单元筛选、事件详情、Overview 快速跳转和
+A/B cycle 测量游标。使用说明见
+[tools/pipeline_viewer/README.zh-CN.md](tools/pipeline_viewer/README.zh-CN.md)。
+
 ## 构建
 
 CMake 默认假设 `FTLPU-CMODEL` 与本仓库位于同一父目录：

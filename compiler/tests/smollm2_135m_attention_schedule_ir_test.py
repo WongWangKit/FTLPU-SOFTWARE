@@ -69,13 +69,13 @@ def main() -> None:
         raise AssertionError("Attention Schedule IR must expose six phase timelines")
     if 'opcode = "accumulate"' in text:
         raise AssertionError("attention schedule still uses legacy MEM accumulator commands")
-    if text.count("ftlpu.schedule.mem_transfer") != 217662:
+    if text.count("ftlpu.schedule.mem_transfer") != 223806:
         raise AssertionError("attention schedule did not emit the complete physical MEM transfer program")
     if text.count("ftlpu.schedule.mxm_issue") != 18759:
         raise AssertionError("attention schedule did not emit all MXM compute and accumulator-read commands")
     if text.count('opcode = "accumulator_read"') != 9216:
         raise AssertionError("attention schedule did not read all MXM-resident accumulator rows")
-    if text.count("ftlpu.schedule.vxm") != 122880:
+    if text.count("ftlpu.schedule.vxm") != 125184:
         raise AssertionError("attention schedule did not emit projection, softmax, and context VXM commands")
     if text.count('rhs_immediate = -1.000000e+09 : f32') != 1728:
         raise AssertionError("attention schedule did not use immediate masks for all future blocks")
@@ -104,8 +104,8 @@ def main() -> None:
             text,
         )
     }
-    if phase_matches["qkv"][1] - phase_matches["qkv"][0] > 22238:
-        raise AssertionError("Q/K/V projection lost its weight-prefetch pipeline")
+    if phase_matches["qkv"][1] - phase_matches["qkv"][0] > 22862:
+        raise AssertionError("Q/K/V projection and GQA preparation lost their pipeline")
     if phase_matches["o_proj"][1] - phase_matches["o_proj"][0] > 22428:
         raise AssertionError("O projection lost its weight-prefetch pipeline")
     for column in range(4):

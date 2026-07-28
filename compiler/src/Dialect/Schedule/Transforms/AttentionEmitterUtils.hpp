@@ -1,5 +1,6 @@
 #pragma once
 
+#include "SxmWavefrontEmitterUtils.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
@@ -24,17 +25,11 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef accumulatorDestination = "stream",
     bool accumulatorClear = true);
 
-void emitSxm(mlir::IRRewriter& rewriter, mlir::Location location,
-    int64_t cycle, int64_t hemisphere, llvm::StringRef opcode,
-    llvm::ArrayRef<int64_t> sourceStreams,
-    llvm::ArrayRef<int64_t> destinationStreams,
-    llvm::ArrayRef<int64_t> permuteMap,
-    llvm::StringRef weightLayout = "vector_columns");
-
-std::array<int64_t, 32> identityMap();
-
-std::array<int64_t, 32> blockDiagonalMap(int64_t diagonal,
-    const target::LPUTargetModel& target);
+using sxm_detail::blockDiagonalMap;
+using sxm_detail::emitSxm;
+using sxm_detail::emitWavefrontBeat;
+using sxm_detail::emitWavefrontTail;
+using sxm_detail::identityMap;
 
 VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Value value, int64_t cycle, int64_t queue, llvm::StringRef opcode,

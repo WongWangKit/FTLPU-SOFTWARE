@@ -29,6 +29,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const auto output_weight_slices =
         target.attention_output_weight_slices();
     const auto activation_slices = target.attention_activation_slices();
+    if (activation_slices.size() < 2) {
+        op.emitError(
+            "target does not provide an FP16 attention staging pair");
+        return mlir::failure();
+    }
     const auto output_slices =
         target.attention_projection_output_slices();
     const int64_t q_weight_rows = attention_weight_rows(query_width);
@@ -39,11 +44,24 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t query_rows = query_heads * blocks * target.throughput().tile_rows;
     const int64_t score_rows = query_heads * blocks * seq_len;
     const int64_t context_rows = query_heads * seq_len;
+    const int64_t input_staging_rows = seq_len * hidden / tile;
+    const int64_t input_staging_base =
+        target.memory().banks_per_slice
+            * target.memory().words_per_bank
+        - input_staging_rows;
     llvm::SmallVector<int64_t, 36> scratch_candidates;
     for (int64_t slice = 0;
          slice < target.memory().accumulator_slice_base; ++slice)
         scratch_candidates.push_back(slice);
     tensor::PhysicalMemoryAllocator physical_allocator(target);
+    const llvm::SmallVector<int64_t, 16> input_staging_slices(
+        activation_slices.begin(), activation_slices.begin() + 2);
+    if (mlir::failed(physical_allocator.reserve({"input_staging",
+            input_staging_slices, input_staging_base,
+            input_staging_rows, 0, 2, true}))) {
+        op.emitError("failed to reserve the attention input staging buffer");
+        return mlir::failure();
+    }
     const int64_t output_weight_base =
         q_weight_rows + k_weight_rows + v_weight_rows;
     if (mlir::failed(physical_allocator.reserve({"output_weight",
@@ -108,10 +126,19 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         return mlir::failure();
     }
     rewriter.setInsertionPoint(op);
-    const auto plan = rewriter.getDictionaryAttr({
-        rewriter.getNamedAttr("input", make_attention_placement(rewriter,
+    auto inheritedInputPlacement =
+        get_value_placement(graph.query.getLhs());
+    const auto inputPlacement = mlir::succeeded(inheritedInputPlacement)
+        ? *inheritedInputPlacement
+        : make_attention_placement(rewriter,
             "fp16_mxm_activation_planar", activation_slices, 0,
-            seq_len * hidden / tile, "both")),
+            seq_len * hidden / tile, "both");
+    const auto plan = rewriter.getDictionaryAttr({
+        rewriter.getNamedAttr("input", inputPlacement),
+        rewriter.getNamedAttr("input_staging",
+            make_attention_placement(rewriter,
+                "fp16_pair_planar", input_staging_slices,
+                input_staging_base, input_staging_rows, "both")),
         rewriter.getNamedAttr("query_weight", make_attention_placement(rewriter,
             "w8a16_attention_weight_striped", weight_slices, 0, q_weight_rows, "both")),
         rewriter.getNamedAttr("key_weight", make_attention_placement(rewriter,
@@ -190,6 +217,14 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             "rope_theta", graph.query_rope.getThetaAttr()),
         rewriter.getNamedAttr(
             "causal", graph.softmax.getCausalAttr()),
+        rewriter.getNamedAttr(
+            "query_weight_scale", graph.query.getRhsScaleAttr()),
+        rewriter.getNamedAttr(
+            "key_weight_scale", graph.key.getRhsScaleAttr()),
+        rewriter.getNamedAttr(
+            "value_weight_scale", graph.value.getRhsScaleAttr()),
+        rewriter.getNamedAttr(
+            "output_weight_scale", graph.output.getRhsScaleAttr()),
     });
     const auto subplan =
         [&](std::initializer_list<llvm::StringRef> names) {
@@ -265,7 +300,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     auto query = createProjection(
         graph.query.getLhs(), graph.query.getRhs(),
         "query", matrixType(seq_len, query_width),
-        subplan({"input", "query_weight", "query"}));
+        subplan({"input", "input_staging",
+            "query_weight", "query"}));
     auto key = createProjection(
         graph.key.getLhs(), graph.key.getRhs(),
         "key", matrixType(seq_len, kv_width),

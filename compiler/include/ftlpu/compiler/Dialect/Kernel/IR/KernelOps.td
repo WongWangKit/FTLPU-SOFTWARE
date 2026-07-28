@@ -13,7 +13,7 @@ def MatmulOp : FTLPU_Kernel_Op<"matmul", [Pure]> {
   let summary = "Matrix multiplication mapped to the LPU MXM unit";
   let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
                        I64Attr:$m, I64Attr:$n, I64Attr:$k,
-                       StrAttr:$unit);
+                       StrAttr:$unit, F32Attr:$rhs_scale);
   let results = (outs AnyRankedTensor:$result);
   let builders = [
     OpBuilder<(ins "::mlir::Value":$lhs, "::mlir::Value":$rhs,
@@ -25,6 +25,7 @@ def MatmulOp : FTLPU_Kernel_Op<"matmul", [Pure]> {
       $_state.addAttribute("n", $_builder.getI64IntegerAttr(n));
       $_state.addAttribute("k", $_builder.getI64IntegerAttr(k));
       $_state.addAttribute("unit", $_builder.getStringAttr("MXM"));
+      $_state.addAttribute("rhs_scale", $_builder.getF32FloatAttr(1.0f));
     }]>
   ];
   let hasVerifier = 1;
@@ -79,6 +80,15 @@ def SoftmaxOp : FTLPU_Kernel_Op<"softmax", [Pure]> {
       F32Attr:$scale, BoolAttr:$causal);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def RmsNormOp : FTLPU_Kernel_Op<"rms_norm", [Pure]> {
+  let summary = "Root-mean-square normalization over one tensor axis";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      I64Attr:$axis, F32Attr:$epsilon);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $weight attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 

@@ -157,6 +157,10 @@ mlir::LogicalResult lower_ffn(
     FfnTaskGraph& graph, LoweringContext& context);
 mlir::LogicalResult lower_swiglu(
     tensor::SwigluOp op, LoweringContext& context);
+mlir::LogicalResult lower_rms_norm(
+    tensor::RmsNormTaskOp op, LoweringContext& context);
+mlir::LogicalResult lower_elementwise(
+    tensor::ElementwiseTaskOp op, LoweringContext& context);
 mlir::LogicalResult lower_matmul(
     tensor::MatmulOp op, LoweringContext& context);
 

@@ -293,6 +293,10 @@ mlir::LogicalResult lower_ffn(
                 w8a16 ? 0
                       : target.streams().streams_per_direction - 1)),
         rewriter.getNamedAttr(
+            "lhs_allocations", empty_allocations),
+        rewriter.getNamedAttr(
+            "rhs_allocations", empty_allocations),
+        rewriter.getNamedAttr(
             "result_allocations", hidden_allocations),
         rewriter.getNamedAttr("config",
             rewriter.getDictionaryAttr({
@@ -351,6 +355,10 @@ mlir::LogicalResult lower_ffn(
             i64_array({0, second_result_stream})),
         rewriter.getNamedAttr(
             "output_stream_base", rewriter.getI64IntegerAttr(0)),
+        rewriter.getNamedAttr(
+            "lhs_allocations", empty_allocations),
+        rewriter.getNamedAttr(
+            "rhs_allocations", empty_allocations),
         rewriter.getNamedAttr(
             "result_allocations", result_allocations),
         rewriter.getNamedAttr("config",

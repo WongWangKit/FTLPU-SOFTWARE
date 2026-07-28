@@ -20,6 +20,8 @@ public:
     void load_file(const std::filesystem::path& path);
     void upload_input(std::size_t index, std::span<const std::uint8_t> data);
     std::vector<std::uint8_t> download_output(std::size_t index) const;
+    void copy_binding(
+        const BinaryBinding& source, const BinaryBinding& destination);
     void dispatch_icu_cycles(std::size_t cycles, std::ostream* log = nullptr);
     void run_cycles(std::size_t cycles, std::ostream* log = nullptr);
 

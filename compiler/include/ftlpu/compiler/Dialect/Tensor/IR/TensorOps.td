@@ -13,7 +13,7 @@ def MatmulOp : FTLPU_Tensor_Op<"matmul", [Pure]> {
   let summary = "Matrix multiplication with assigned LPU MEM storage";
   let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
                        I64Attr:$m, I64Attr:$n, I64Attr:$k,
-                       StrAttr:$unit,
+                       StrAttr:$unit, F32Attr:$rhs_scale,
                        DictionaryAttr:$lhs_address,
                        DictionaryAttr:$lhs_placement,
                        DictionaryAttr:$rhs_address,
@@ -28,7 +28,7 @@ def MatmulOp : FTLPU_Tensor_Op<"matmul", [Pure]> {
     OpBuilder<(ins "::mlir::Value":$lhs, "::mlir::Value":$rhs,
                    "::mlir::Type":$result_type, "int64_t":$m,
                    "int64_t":$n, "int64_t":$k,
-                   "::mlir::StringAttr":$unit,
+                   "::mlir::StringAttr":$unit, "::mlir::FloatAttr":$rhs_scale,
                    "::mlir::DictionaryAttr":$lhs_address,
                    "::mlir::DictionaryAttr":$lhs_placement,
                    "::mlir::DictionaryAttr":$rhs_address,
@@ -43,6 +43,7 @@ def MatmulOp : FTLPU_Tensor_Op<"matmul", [Pure]> {
       $_state.addAttribute("n", $_builder.getI64IntegerAttr(n));
       $_state.addAttribute("k", $_builder.getI64IntegerAttr(k));
       $_state.addAttribute("unit", unit);
+      $_state.addAttribute("rhs_scale", rhs_scale);
       $_state.addAttribute("lhs_address", lhs_address);
       $_state.addAttribute("lhs_placement", lhs_placement);
       $_state.addAttribute("rhs_address", rhs_address);
@@ -86,7 +87,8 @@ def SwishTaskOp : FTLPU_Tensor_Op<"swish_task", [Pure]> {
 def ElementwiseTaskOp : FTLPU_Tensor_Op<"elementwise_task", [Pure]> {
   let summary = "Binary elementwise computation with a physical result plan";
   let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
-      StrAttr:$kind, ArrayAttr:$result_allocations, DictionaryAttr:$config);
+      StrAttr:$kind, ArrayAttr:$lhs_allocations, ArrayAttr:$rhs_allocations,
+      ArrayAttr:$result_allocations, DictionaryAttr:$config);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
@@ -142,6 +144,17 @@ def SoftmaxTaskOp : FTLPU_Tensor_Op<"softmax_task", [Pure]> {
       DictionaryAttr:$memory_plan);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def RmsNormTaskOp : FTLPU_Tensor_Op<"rms_norm_task", [Pure]> {
+  let summary = "RMS normalization with assigned input, scale, scratch, and result storage";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      I64Attr:$axis, F32Attr:$epsilon, ArrayAttr:$input_allocations,
+      ArrayAttr:$weight_allocations, ArrayAttr:$scratch_allocations,
+      ArrayAttr:$result_allocations, DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $weight attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 

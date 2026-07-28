@@ -6,10 +6,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <iosfwd>
 #include <string>
 #include <vector>
 
 namespace ftlpu::software::runtime {
+
+inline constexpr std::uint32_t kBinaryFormatVersion = 7;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -35,6 +38,17 @@ enum class BindingLayout : std::uint16_t {
     W8A16AttentionWeightStriped = 8,
     W8A16MxmWeightWaveStriped = 9,
     Fp32CausalMaskTile = 10,
+    Fp16SxmDistributed16 = 11,
+    Fp16VxmDistributed16 = 12,
+    Fp16MxmDistributed16 = 13,
+    Fp16RopeTable = 14,
+};
+
+enum class BindingInitializer : std::uint16_t {
+    None = 0,
+    Zero = 1,
+    CausalMask = 2,
+    RopeTable = 3,
 };
 
 struct BinaryBinding {
@@ -48,8 +62,16 @@ struct BinaryBinding {
     std::int64_t address_stride{0};
     std::vector<std::uint64_t> shape{};
     std::vector<std::uint16_t> slices{};
+    // Stable semantic identity and the first cycle at which consumers may
+    // observe the complete binding contents.
+    std::string role{};
+    std::string name{};
+    std::uint64_t ready_cycle{0};
     // Bit 0 selects east and bit 1 selects west. Inputs may be replicated to both.
     std::uint16_t hemisphere_mask{1};
+    BindingInitializer initializer{BindingInitializer::None};
+    float rope_theta{0.0f};
+    std::uint32_t rope_head_dim{0};
 };
 
 struct BinaryProgram {
@@ -62,5 +84,7 @@ struct BinaryProgram {
 
 void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path);
 BinaryProgram read_binary_program(const std::filesystem::path& path);
+void write_binary_program(const BinaryProgram& program, std::ostream& stream);
+BinaryProgram read_binary_program(std::istream& stream);
 
 } // namespace ftlpu::software::runtime

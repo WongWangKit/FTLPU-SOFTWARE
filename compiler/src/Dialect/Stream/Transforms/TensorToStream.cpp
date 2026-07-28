@@ -127,10 +127,13 @@ public:
 
         llvm::SmallVector<tensor::MatmulOp> matmuls;
         llvm::SmallVector<tensor::SwigluOp> swiglus;
+        llvm::SmallVector<tensor::RmsNormTaskOp> rmsNorms;
         function.walk(
             [&](tensor::MatmulOp op) { matmuls.push_back(op); });
         function.walk(
             [&](tensor::SwigluOp op) { swiglus.push_back(op); });
+        function.walk(
+            [&](tensor::RmsNormTaskOp op) { rmsNorms.push_back(op); });
 
         int64_t stage = 0;
         LoweringContext context{target, allocator, rewriter, stage};
@@ -142,6 +145,22 @@ public:
         }
         for (FfnTaskGraph& graph : *ffns) {
             if (mlir::failed(lower_ffn(graph, context))) {
+                signalPassFailure();
+                return;
+            }
+        }
+        for (tensor::RmsNormTaskOp op : rmsNorms) {
+            if (mlir::failed(lower_rms_norm(op, context))) {
+                signalPassFailure();
+                return;
+            }
+        }
+        llvm::SmallVector<tensor::ElementwiseTaskOp> elementwiseOps;
+        function.walk([&](tensor::ElementwiseTaskOp op) {
+            elementwiseOps.push_back(op);
+        });
+        for (tensor::ElementwiseTaskOp op : elementwiseOps) {
+            if (mlir::failed(lower_elementwise(op, context))) {
                 signalPassFailure();
                 return;
             }
@@ -169,6 +188,7 @@ public:
                     || llvm::isa<tensor::RopeTaskOp>(operation)
                     || llvm::isa<tensor::BatchMatmulTaskOp>(operation)
                     || llvm::isa<tensor::SoftmaxTaskOp>(operation)
+                    || llvm::isa<tensor::RmsNormTaskOp>(operation)
                     || llvm::isa<tensor::TransposeTaskOp>(operation)))
                 unlowered_task = operation;
         });

@@ -60,7 +60,7 @@ QueueCommand encode_sxm_command(const SxmInstruction& instruction)
     command.words[0] = static_cast<std::uint32_t>(instruction.opcode);
     command.words[1] = static_cast<std::uint32_t>(instruction.shift_source);
     command.words[2] = static_cast<std::uint32_t>(instruction.shift_distance);
-    command.words[3] = static_cast<std::uint32_t>(instruction.weight_layout);
+    command.words[3] = 0;
     command.extension_words.push_back(static_cast<std::uint32_t>(instruction.src_streams.size()));
     command.extension_words.push_back(static_cast<std::uint32_t>(instruction.dst_streams.size()));
     for (const auto stream : instruction.src_streams)
@@ -82,7 +82,6 @@ SxmInstruction decode_sxm_command(const QueueCommand& command)
     instruction.opcode = static_cast<SxmOpcode>(command.words[0]);
     instruction.shift_source = static_cast<SxmShiftSource>(command.words[1]);
     instruction.shift_distance = command.words[2];
-    instruction.weight_layout = static_cast<SxmWeightLayout>(command.words[3]);
     const auto src_count = command.extension_words[0];
     const auto dst_count = command.extension_words[1];
     const std::size_t map_begin = 2 + src_count + dst_count;

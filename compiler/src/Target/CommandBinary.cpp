@@ -97,7 +97,7 @@ QueueCommand sxm_instruction_command(const SxmInstruction& instruction)
     command.words[0] = static_cast<std::uint32_t>(instruction.opcode);
     command.words[1] = static_cast<std::uint32_t>(instruction.shift_source);
     command.words[2] = static_cast<std::uint32_t>(instruction.shift_distance);
-    command.words[3] = static_cast<std::uint32_t>(instruction.weight_layout);
+    command.words[3] = 0;
     command.extension_words.push_back(static_cast<std::uint32_t>(instruction.src_streams.size()));
     command.extension_words.push_back(static_cast<std::uint32_t>(instruction.dst_streams.size()));
     for (const auto stream : instruction.src_streams)
@@ -130,6 +130,14 @@ BindingLayout parse_layout(llvm::StringRef value)
     if (value == "fp16_pair_planar") return BindingLayout::Fp16PairPlanar;
     if (value == "fp32_causal_mask_tile")
         return BindingLayout::Fp32CausalMaskTile;
+    if (value == "fp16_sxm_distributed_16")
+        return BindingLayout::Fp16SxmDistributed16;
+    if (value == "fp16_vxm_distributed_16")
+        return BindingLayout::Fp16VxmDistributed16;
+    if (value == "fp16_mxm_distributed_16")
+        return BindingLayout::Fp16MxmDistributed16;
+    if (value == "fp16_rope_table")
+        return BindingLayout::Fp16RopeTable;
     throw std::runtime_error("unsupported Command IR binding layout");
 }
 
@@ -137,6 +145,11 @@ BinaryBinding translate_binding(command::BindingOp op)
 {
     BinaryBinding binding;
     binding.index = static_cast<std::uint32_t>(op.getIndex());
+    binding.role = op.getRole().str();
+    binding.name =
+        op->getAttrOfType<mlir::StringAttr>("name").getValue().str();
+    binding.ready_cycle = static_cast<std::uint64_t>(
+        op->getAttrOfType<mlir::IntegerAttr>("ready_cycle").getInt());
     binding.access = op.getAccess() == "input" ? BindingAccess::Input
         : op.getAccess() == "output" ? BindingAccess::Output
         : BindingAccess::Internal;
@@ -152,6 +165,22 @@ BinaryBinding translate_binding(command::BindingOp op)
     binding.base_row = op.getPlacement().getAs<mlir::IntegerAttr>("base_row").getInt();
     binding.instruction_count = op.getPlacement().getAs<mlir::IntegerAttr>("instruction_count").getInt();
     binding.address_stride = op.getPlacement().getAs<mlir::IntegerAttr>("address_stride").getInt();
+    const llvm::StringRef initializer = op.getInitializer();
+    binding.initializer = initializer == "zero"
+        ? software::runtime::BindingInitializer::Zero
+        : initializer == "causal_mask"
+        ? software::runtime::BindingInitializer::CausalMask
+        : initializer == "rope_table"
+        ? software::runtime::BindingInitializer::RopeTable
+        : software::runtime::BindingInitializer::None;
+    if (binding.initializer
+        == software::runtime::BindingInitializer::RopeTable) {
+        const auto config = op.getInitializerConfig();
+        binding.rope_theta = static_cast<float>(
+            config.getAs<mlir::FloatAttr>("theta").getValueAsDouble());
+        binding.rope_head_dim = static_cast<std::uint32_t>(
+            config.getAs<mlir::IntegerAttr>("head_dim").getInt());
+    }
     for (mlir::Attribute dimension : op.getShape())
         binding.shape.push_back(static_cast<std::uint64_t>(
             llvm::cast<mlir::IntegerAttr>(dimension).getInt()));
@@ -164,17 +193,28 @@ BinaryBinding translate_binding(command::BindingOp op)
 void collect_mem(command::MemOp op, QueueMap& queues)
 {
     const int64_t queue = command_integer(op, "queue");
-    const int64_t cycle = command_cycle(op);
-    const auto instruction = op.getOpcode() == "read"
-        ? MemInstruction::Read(op.getAddress(), op.getPackedStream())
-        : MemInstruction::Write(op.getAddress(), op.getPackedStream());
-    queues[{QueueKind::Mem, queue}].push_back(CommandSequence {
-        cycle,
-        op->getAttrOfType<mlir::IntegerAttr>("repeat_count").getInt(),
-        op->getAttrOfType<mlir::IntegerAttr>("repeat_interval").getInt(),
-        op->getAttrOfType<mlir::IntegerAttr>("address_stride").getInt(),
-        mem_instruction_command(isa::encode_mem_instruction(instruction)),
-    });
+    const int64_t waveCount =
+        static_cast<int64_t>(op.getWaveCount().value_or(1));
+    const int64_t waveInterval =
+        static_cast<int64_t>(op.getWaveInterval().value_or(1));
+    const int64_t waveAddressStride =
+        static_cast<int64_t>(op.getWaveAddressStride().value_or(0));
+    for (int64_t wave = 0; wave < waveCount; ++wave) {
+        const int64_t address =
+            static_cast<int64_t>(op.getAddress())
+            + wave * waveAddressStride;
+        const auto instruction = op.getOpcode() == "read"
+            ? MemInstruction::Read(address, op.getPackedStream())
+            : MemInstruction::Write(address, op.getPackedStream());
+        queues[{QueueKind::Mem, queue}].push_back(CommandSequence {
+            command_cycle(op) + wave * waveInterval,
+            op->getAttrOfType<mlir::IntegerAttr>("repeat_count").getInt(),
+            op->getAttrOfType<mlir::IntegerAttr>("repeat_interval").getInt(),
+            op->getAttrOfType<mlir::IntegerAttr>("address_stride").getInt(),
+            mem_instruction_command(
+                isa::encode_mem_instruction(instruction)),
+        });
+    }
 }
 
 void collect_mxm(command::MxmOp op, QueueMap& queues)
@@ -273,8 +313,6 @@ void collect_sxm(command::SxmOp op, QueueMap& queues)
     SxmInstruction instruction {};
     instruction.opcode = op.getOpcode() == "transpose"
         ? SxmOpcode::Transpose : SxmOpcode::Permute;
-    instruction.weight_layout = op.getWeightLayout() == "matrix_columns"
-        ? SxmWeightLayout::MatrixColumns : SxmWeightLayout::VectorColumns;
     for (mlir::Attribute stream : op.getSourceStreams())
         instruction.src_streams.push_back(SxmStreamId {static_cast<std::size_t>(
             llvm::cast<mlir::IntegerAttr>(stream).getInt())});

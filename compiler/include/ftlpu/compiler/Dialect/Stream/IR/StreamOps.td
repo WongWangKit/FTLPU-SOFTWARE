@@ -123,7 +123,8 @@ def ElementwiseTaskOp : FTLPU_Stream_Op<"elementwise_task", [Pure]> {
   let summary = "VXM binary elementwise task over functional-unit streams";
   let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
       StrAttr:$kind, ArrayAttr:$input_stream_bases,
-      I64Attr:$output_stream_base, ArrayAttr:$result_allocations,
+      I64Attr:$output_stream_base, ArrayAttr:$lhs_allocations,
+      ArrayAttr:$rhs_allocations, ArrayAttr:$result_allocations,
       DictionaryAttr:$config);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
@@ -181,6 +182,18 @@ def SoftmaxTaskOp : FTLPU_Stream_Op<"softmax_task", [Pure]> {
       ArrayAttr:$routes);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def RmsNormTaskOp : FTLPU_Stream_Op<"rms_norm_task", [Pure]> {
+  let summary = "RMS normalization routed through VXM and MXM reduction resources";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      I64Attr:$axis, F32Attr:$epsilon, ArrayAttr:$routes,
+      ArrayAttr:$input_allocations, ArrayAttr:$weight_allocations,
+      ArrayAttr:$scratch_allocations, ArrayAttr:$result_allocations,
+      DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $weight attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 
