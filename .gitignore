@@ -2,6 +2,7 @@ build/
 build-*/
 .venv/
 .cache/
+models/
 __pycache__/
 *.user
 *.suo
