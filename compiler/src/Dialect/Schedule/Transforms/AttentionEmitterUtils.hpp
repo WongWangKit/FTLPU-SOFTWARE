@@ -36,7 +36,8 @@ VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
     llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
     llvm::StringRef castTarget, int64_t outputStream,
-    llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere);
+    llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
+    int64_t scaleBinding = -1);
 
 AttentionProjectionKind projectionKind(int64_t index);
 

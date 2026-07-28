@@ -89,3 +89,23 @@ one final host download, one device alias, zero device copies, and no host
 transfer for `hidden.1`. All 73,728 final FP16 values pass against the NumPy
 two-layer golden with maximum absolute error `0.0625` and mean absolute error
 `0.00147592`.
+
+## Reusable quantized executables
+
+Binary format version 8 carries typed VXM immediate relocations. A relocation
+identifies an input binding, quantization scale index, queue, command, and
+operand. `ModelSession` resolves the invocation's bound `ModelTensor`, copies
+the executable template, and patches only the declared immediates before
+loading ICU queues.
+
+Q/K/V/O and gate/up/down weight dequantization therefore share one decoder
+executable across layers with different per-tensor scales. The real two-layer
+package shrinks from 50,593,779 bytes with two specialized executables to
+29,445,522 bytes with one reusable executable. The shared-executable CModel
+golden passes with maximum absolute error `0.0625`, mean absolute error
+`0.00138637`, one device alias, and zero device copies.
+
+`build_hf_decoder_stack.py` extends the same flow to any contiguous HF decoder
+layer range. It chains each layer's NumPy golden into the next layer input,
+imports all real layer tensors, and packages the stack with one reusable
+executable. By default it reads `num_hidden_layers` from `config.json`.

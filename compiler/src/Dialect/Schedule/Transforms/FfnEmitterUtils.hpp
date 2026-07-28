@@ -26,7 +26,8 @@ VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
     llvm::StringRef castTarget, int64_t outputStream,
     int64_t repeatCount, int64_t repeatInterval,
-    llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere);
+    llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
+    int64_t scaleBinding = -1);
 
 llvm::StringRef hemisphere_name(int64_t hemisphere);
 

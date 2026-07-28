@@ -79,3 +79,21 @@ Session 共执行 19 次 host upload，用于模型入口和两层常量；只�
 host download，并执行一次 device alias、零次 device copy；`hidden.1` 不经过
 host。最终 73,728 个 FP16 值全部与 NumPy 双层 golden 对比通过，最大绝对误差为
 `0.0625`，平均绝对误差为 `0.00147592`。
+
+## 可复用量化 executable
+
+二进制格式 v8 增加 typed VXM immediate relocation。每条 relocation 明确记录
+输入 binding、量化 scale 下标、queue、command 和 operand。`ModelSession`
+根据当前 invocation 绑定的 `ModelTensor` 解析 scale，复制 executable 模板，
+只修补声明过的 immediate，然后再装载 ICU 队列。
+
+因此 Q/K/V/O 和 gate/up/down 权重反量化可以让不同层共享同一份 decoder
+executable，即使每层的 per-tensor scale 不同。真实双层模型包从两份专用
+executable 的 50,593,779 bytes 降到一份可复用 executable 的 29,445,522 bytes。
+共享 executable 的 CModel golden 最大绝对误差为 `0.0625`，平均绝对误差为
+`0.00138637`，执行一次 device alias、零次 device copy。
+
+`build_hf_decoder_stack.py` 将同一流程扩展到任意连续的 HF decoder 层范围。
+它把每层 NumPy golden 串成下一层输入，导入所有真实层参数，并用一份可复用
+executable 打包整个层栈。默认层数直接读取 `config.json` 中的
+`num_hidden_layers`。

@@ -30,6 +30,11 @@ try {
     auto system = std::make_unique<ftlpu::TspSliceSystem>();
     ModelSession session(*system);
     session.load_file(std::filesystem::path(argv[1]));
+    if (session.package().executables.size() != 1
+        || session.package().executables[0]
+               .program.scale_relocations.empty())
+        throw std::logic_error(
+            "two-layer package did not reuse a parameterized executable");
 
     const SessionMemoryPlan& plan = session.memory_plan();
     if (plan.invocations.size() != 2 || plan.lifetimes.size() != 1

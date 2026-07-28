@@ -7,6 +7,16 @@
 
 namespace ftlpu::compiler::schedule {
 using namespace attention_detail;
+namespace {
+
+int64_t functionArgumentIndex(mlir::Value value)
+{
+    if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(value))
+        return argument.getArgNumber();
+    return -1;
+}
+
+} // namespace
 
 int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
 {
@@ -69,7 +79,8 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
                          lane < target_.throughput().lanes_per_tile; ++lane) {
                         emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), cycle, lane,
                             "multiply", "stream_i8", 32 + lane, 0.0f,
-                            "immediate", 0, outputWeightScale, "fp32", -1, hemi, hemi);
+                            "immediate", 0, outputWeightScale, "fp32", -1, hemi, hemi,
+                            functionArgumentIndex(op_.getOutputWeight()));
                         emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), cycle + 1,
                             8 + lane, "cast", "alu", lane, 0.0f,
                             "immediate", 0, 0.0f, "fp16",

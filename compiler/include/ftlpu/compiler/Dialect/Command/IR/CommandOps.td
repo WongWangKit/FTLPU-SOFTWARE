@@ -51,7 +51,8 @@ def VxmOp : FTLPU_Command_Op<"vxm", [MemoryEffects<[MemWrite]>]> {
       StrAttr:$rhs_kind, I64Attr:$rhs_index, F32Attr:$rhs_immediate,
       StrAttr:$cast_target, I64Attr:$output_stream,
       I64Attr:$repeat_count, I64Attr:$repeat_interval,
-      StrAttr:$input_hemisphere, StrAttr:$output_hemisphere);
+      StrAttr:$input_hemisphere, StrAttr:$output_hemisphere,
+      OptionalAttr<I64Attr>:$scale_binding);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }

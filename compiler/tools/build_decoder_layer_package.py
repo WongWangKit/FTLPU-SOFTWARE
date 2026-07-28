@@ -71,9 +71,9 @@ def main() -> None:
 
     golden_dirs = args.golden_dir
     executables = args.executable
-    if len(executables) != len(golden_dirs):
+    if len(executables) not in (1, len(golden_dirs)):
         raise ValueError(
-            "one layer-specialized executable is required per golden directory"
+            "provide one reusable executable or one specialized executable per layer"
         )
     metadata_list = [
         json.loads((path / "metadata.json").read_text(encoding="utf-8"))
@@ -160,12 +160,15 @@ def main() -> None:
             vector(stream, "Q", [seq_len, hidden])
 
         scalar(stream, "I", len(executables))
-        for executable_path, layer_metadata in zip(
-            executables, metadata_list
-        ):
+        for executable_index, executable_path in enumerate(executables):
+            layer_metadata = metadata_list[
+                executable_index if len(executables) > 1 else 0
+            ]
             string(
                 stream,
-                f"decoder_layer_{int(layer_metadata['layer'])}_seq128",
+                "decoder_layer_seq128"
+                if len(executables) == 1
+                else f"decoder_layer_{int(layer_metadata['layer'])}_seq128",
             )
             executable = executable_path.read_bytes()
             scalar(stream, "Q", len(executable))
@@ -175,7 +178,10 @@ def main() -> None:
         for invocation_index, layer_metadata in enumerate(metadata_list):
             layer = int(layer_metadata["layer"])
             string(stream, f"layers.{layer}")
-            scalar(stream, "I", invocation_index)
+            scalar(
+                stream, "I",
+                invocation_index if len(executables) > 1 else 0,
+            )
             binding_refs(stream, [
                 (0, f"hidden.{invocation_index}"),
                 (1, f"layers.{layer}.input_layernorm.weight"),

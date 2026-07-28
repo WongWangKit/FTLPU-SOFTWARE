@@ -50,6 +50,8 @@ try {
     rope.rope_theta = 100000.0f;
     rope.rope_head_dim = 64;
     program.bindings.push_back(rope);
+    program.scale_relocations.push_back(BinaryScaleRelocation {
+        0, 1, QueueKind::Vxm, 7, 11, VxmImmediateOperand::Rhs});
 
     ModelPackage package;
     package.model_name = "roundtrip";
@@ -81,7 +83,10 @@ try {
         "quantized tensor was not preserved");
     require(decoded.executables.size() == 1
             && decoded.executables[0].program.max_cycle == 17
-            && decoded.executables[0].program.bindings.size() == 3,
+            && decoded.executables[0].program.bindings.size() == 3
+            && decoded.executables[0].program.scale_relocations.size() == 1
+            && decoded.executables[0]
+                   .program.scale_relocations[0].scale_index == 1,
         "embedded executable was not preserved");
     const BinaryBinding& decoded_rope =
         decoded.executables[0].program.bindings[2];

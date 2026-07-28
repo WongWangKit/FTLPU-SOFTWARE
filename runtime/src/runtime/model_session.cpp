@@ -1,5 +1,6 @@
 #include "ftlpu/software/runtime/model_session.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -14,6 +15,68 @@ const BinaryBinding& find_binding(const BinaryProgram& program,
             return binding;
     throw std::logic_error(
         "session plan references a missing executable binding");
+}
+
+const ModelTensor& find_tensor(
+    const ModelPackage& package, const std::string& name)
+{
+    for (const ModelTensor& tensor : package.tensors)
+        if (tensor.name == name) return tensor;
+    throw std::logic_error(
+        "executable scale relocation requires a model tensor input");
+}
+
+const ModelBindingRef& find_input_ref(
+    const ModelInvocation& invocation, std::uint32_t binding_index)
+{
+    for (const ModelBindingRef& input : invocation.inputs)
+        if (input.binding_index == binding_index) return input;
+    throw std::logic_error(
+        "executable scale relocation references an unbound input");
+}
+
+BinaryProgram parameterize_program(const ModelPackage& package,
+    const ModelInvocation& invocation, const BinaryProgram& executable)
+{
+    BinaryProgram program = executable;
+    for (const BinaryScaleRelocation& relocation :
+         program.scale_relocations) {
+        const ModelBindingRef& input =
+            find_input_ref(invocation, relocation.binding_index);
+        const ModelTensor& tensor = find_tensor(package, input.value);
+        if (tensor.encoding == ModelTensorEncoding::Raw
+            || relocation.scale_index >= tensor.scales.size())
+            throw std::logic_error(
+                "executable scale relocation requires quantized tensor metadata");
+        auto queue = std::find_if(program.queues.begin(),
+            program.queues.end(), [&](const QueueProgram& candidate) {
+                return candidate.kind == relocation.queue_kind
+                    && candidate.index == relocation.queue_index;
+            });
+        if (queue == program.queues.end()
+            || relocation.command_index >= queue->commands.size())
+            throw std::logic_error(
+                "executable scale relocation references a missing command");
+        QueueCommand& command =
+            queue->commands[relocation.command_index];
+        if (command.instruction_kind != InstructionKind::Vxm
+            || command.word_count != 4)
+            throw std::logic_error(
+                "scale relocation target is not a VXM instruction");
+        isa::EncodedVxmInstruction encoded {command.words};
+        VxmLaneAluInstruction instruction =
+            isa::decode_vxm_instruction(encoded);
+        VxmLaneOperand& operand =
+            relocation.operand == VxmImmediateOperand::Lhs
+            ? instruction.lhs : instruction.rhs;
+        if (operand.kind != VxmLaneOperandKind::Immediate)
+            throw std::logic_error(
+                "scale relocation target is not an immediate operand");
+        operand = VxmLaneOperand::Imm(
+            tensor.scales[relocation.scale_index]);
+        command.words = isa::encode_vxm_instruction(instruction).words;
+    }
+    return program;
 }
 
 } // namespace
@@ -78,10 +141,12 @@ void ModelSession::run_invocation(
     const auto& invocation = package_.invocations[index];
     const auto& executable = package_.executables.at(
         invocation.executable_index);
+    const BinaryProgram program = parameterize_program(
+        package_, invocation, executable.program);
     const SessionInvocationPlan& invocation_plan =
         memory_plan_.invocations.at(index);
 
-    runtime_.load(executable.program);
+    runtime_.load(program);
     for (const SessionInputPlan& input : invocation_plan.inputs) {
         if (input.transfer == SessionTransferKind::HostUpload) {
             runtime_.upload_input(
@@ -93,10 +158,10 @@ void ModelSession::run_invocation(
         if (source == device_values_.end())
             throw std::logic_error(
                 "device-resident model value is not available");
-        if (source->second.target_abi != executable.program.target_abi)
+        if (source->second.target_abi != program.target_abi)
             throw std::logic_error(
                 "device-resident value cannot cross target ABIs");
-        const BinaryBinding& destination = find_binding(executable.program,
+        const BinaryBinding& destination = find_binding(program,
             BindingAccess::Input, input.binding_index);
         if (input.transfer == SessionTransferKind::DeviceAlias) {
             if (!bindings_physically_alias(
@@ -113,13 +178,13 @@ void ModelSession::run_invocation(
         if (input.release_after_transfer)
             device_values_.erase(source);
     }
-    runtime_.run_cycles(executable.program.max_cycle + drain_cycles);
+    runtime_.run_cycles(program.max_cycle + drain_cycles);
     for (const SessionOutputPlan& output : invocation_plan.outputs) {
         if (output.retain_on_device) {
             device_values_[output.value] = DeviceValue {
-                find_binding(executable.program, BindingAccess::Output,
+                find_binding(program, BindingAccess::Output,
                     output.binding_index),
-                executable.program.target_abi,
+                program.target_abi,
             };
         }
         if (output.download_to_host) {

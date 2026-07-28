@@ -60,7 +60,8 @@ VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
     llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
     llvm::StringRef castTarget, int64_t outputStream,
-    llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere)
+    llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
+    int64_t scaleBinding)
 {
     mlir::OperationState state(location, VxmOp::getOperationName());
     state.addOperands({value, value});
@@ -82,6 +83,9 @@ VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("input_hemisphere", rewriter.getStringAttr(inputHemisphere)),
         rewriter.getNamedAttr("output_hemisphere", rewriter.getStringAttr(outputHemisphere)),
     });
+    if (scaleBinding >= 0)
+        state.addAttribute(
+            "scale_binding", rewriter.getI64IntegerAttr(scaleBinding));
     return llvm::cast<VxmOp>(rewriter.create(state));
 }
 

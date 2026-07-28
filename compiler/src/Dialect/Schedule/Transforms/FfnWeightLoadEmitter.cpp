@@ -1,6 +1,16 @@
 #include "FfnEmitterUtils.hpp"
 
 namespace ftlpu::compiler::schedule::ffn_detail {
+namespace {
+
+int64_t functionArgumentIndex(mlir::Value value)
+{
+    if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(value))
+        return argument.getArgNumber();
+    return -1;
+}
+
+} // namespace
 
 MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Location location, stream::RouteOp rawRoute,
@@ -41,7 +51,8 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
             dequantizedType, startCycle, stream, "multiply",
             "stream_i8", encodedStreamBase + stream, 0.0f,
             "immediate", 0, scale, "fp32", -1, duration, 1,
-            hemi, hemi).getResult();
+            hemi, hemi,
+            functionArgumentIndex(rawRoute.getInput())).getResult();
         value = create_vxm(rewriter, location, value, readValue,
             dequantizedType, startCycle + 1, 8 + stream, "cast",
             "alu", stream, 0.0f, "immediate", 0, 0.0f, "fp16",

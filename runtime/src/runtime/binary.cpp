@@ -132,6 +132,8 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
     write_scalar<std::uint64_t>(os, static_cast<std::uint64_t>(program.max_cycle));
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.queues.size()));
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.bindings.size()));
+    write_scalar<std::uint32_t>(
+        os, static_cast<std::uint32_t>(program.scale_relocations.size()));
 
     for (const auto& binding : program.bindings) write_binding(os, binding);
 
@@ -150,6 +152,16 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
                 static_cast<std::uint16_t>(command.extension_words.size()));
             for (const auto word : command.extension_words) write_scalar<std::uint32_t>(os, word);
         }
+    }
+    for (const auto& relocation : program.scale_relocations) {
+        write_scalar<std::uint32_t>(os, relocation.binding_index);
+        write_scalar<std::uint32_t>(os, relocation.scale_index);
+        write_scalar<std::uint16_t>(
+            os, static_cast<std::uint16_t>(relocation.queue_kind));
+        write_scalar<std::uint16_t>(os, relocation.queue_index);
+        write_scalar<std::uint32_t>(os, relocation.command_index);
+        write_scalar<std::uint16_t>(
+            os, static_cast<std::uint16_t>(relocation.operand));
     }
 }
 
@@ -181,6 +193,8 @@ BinaryProgram read_binary_program(std::istream& is)
     program.max_cycle = static_cast<std::size_t>(read_scalar<std::uint64_t>(is));
     const auto queue_count = read_scalar<std::uint32_t>(is);
     const auto binding_count = version >= 2 ? read_scalar<std::uint32_t>(is) : 0;
+    const auto relocation_count =
+        version >= 8 ? read_scalar<std::uint32_t>(is) : 0;
     program.bindings.reserve(binding_count);
     for (std::uint32_t binding_id = 0; binding_id < binding_count; ++binding_id)
         program.bindings.push_back(read_binding(is, version));
@@ -210,6 +224,19 @@ BinaryProgram read_binary_program(std::istream& is)
             queue.commands.push_back(command);
         }
         program.queues.push_back(queue);
+    }
+    program.scale_relocations.reserve(relocation_count);
+    for (std::uint32_t index = 0; index < relocation_count; ++index) {
+        BinaryScaleRelocation relocation;
+        relocation.binding_index = read_scalar<std::uint32_t>(is);
+        relocation.scale_index = read_scalar<std::uint32_t>(is);
+        relocation.queue_kind =
+            static_cast<QueueKind>(read_scalar<std::uint16_t>(is));
+        relocation.queue_index = read_scalar<std::uint16_t>(is);
+        relocation.command_index = read_scalar<std::uint32_t>(is);
+        relocation.operand = static_cast<VxmImmediateOperand>(
+            read_scalar<std::uint16_t>(is));
+        program.scale_relocations.push_back(relocation);
     }
 
     return program;

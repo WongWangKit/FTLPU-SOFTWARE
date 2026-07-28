@@ -76,7 +76,7 @@ bool same_vxm_body(schedule::VxmOp lhs, schedule::VxmOp rhs)
     for (llvm::StringRef name : {"queue", "opcode", "lhs_kind",
              "lhs_index", "lhs_immediate", "rhs_kind", "rhs_index",
              "rhs_immediate", "cast_target", "output_stream",
-             "input_hemisphere", "output_hemisphere"})
+             "input_hemisphere", "output_hemisphere", "scale_binding"})
         if (lhs->getAttr(name) != rhs->getAttr(name))
             return false;
     return lhs.getRepeatCount() == 1 && rhs.getRepeatCount() == 1

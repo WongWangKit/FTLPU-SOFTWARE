@@ -12,7 +12,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 7;
+inline constexpr std::uint32_t kBinaryFormatVersion = 8;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -74,12 +74,27 @@ struct BinaryBinding {
     std::uint32_t rope_head_dim{0};
 };
 
+enum class VxmImmediateOperand : std::uint16_t {
+    Lhs = 0,
+    Rhs = 1,
+};
+
+struct BinaryScaleRelocation {
+    std::uint32_t binding_index{0};
+    std::uint32_t scale_index{0};
+    QueueKind queue_kind{QueueKind::Vxm};
+    std::uint16_t queue_index{0};
+    std::uint32_t command_index{0};
+    VxmImmediateOperand operand{VxmImmediateOperand::Rhs};
+};
+
 struct BinaryProgram {
     std::string target_name{std::string(kLpu32StreamTargetName)};
     std::uint64_t target_abi{kLpu32StreamTargetAbi};
     std::size_t max_cycle{0};
     std::vector<QueueProgram> queues{};
     std::vector<BinaryBinding> bindings{};
+    std::vector<BinaryScaleRelocation> scale_relocations{};
 };
 
 void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path);

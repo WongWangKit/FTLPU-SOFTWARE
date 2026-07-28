@@ -22,10 +22,12 @@ using software::runtime::BinaryBinding;
 using software::runtime::BindingAccess;
 using software::runtime::BindingElementType;
 using software::runtime::BindingLayout;
+using software::runtime::BinaryScaleRelocation;
 using software::runtime::InstructionKind;
 using software::runtime::QueueCommand;
 using software::runtime::QueueKind;
 using software::runtime::QueueProgram;
+using software::runtime::VxmImmediateOperand;
 
 struct CommandSequence {
     int64_t cycle{0};
@@ -33,6 +35,7 @@ struct CommandSequence {
     int64_t repeat_interval{0};
     int64_t address_stride{0};
     QueueCommand instruction;
+    int64_t scale_binding{-1};
 };
 
 int64_t command_cycle(mlir::Operation* op)
@@ -305,6 +308,8 @@ void collect_vxm(command::VxmOp op, QueueMap& queues)
         op->getAttrOfType<mlir::IntegerAttr>("repeat_count").getInt(),
         op->getAttrOfType<mlir::IntegerAttr>("repeat_interval").getInt(), 0,
         vxm_instruction_command(isa::encode_vxm_instruction(instruction)),
+        op.getScaleBinding()
+            ? static_cast<int64_t>(*op.getScaleBinding()) : -1,
     });
 }
 
@@ -333,7 +338,8 @@ void collect_sxm(command::SxmOp op, QueueMap& queues)
 }
 
 QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequences,
-    std::size_t& max_cycle)
+    std::size_t& max_cycle,
+    std::vector<BinaryScaleRelocation>& relocations)
 {
     std::sort(sequences.begin(), sequences.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.cycle < rhs.cycle;
@@ -355,7 +361,18 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
         if (sequence.cycle > cursor)
             queue.commands.push_back(control_command(
                 isa::encode_icu_nop(static_cast<std::size_t>(sequence.cycle - cursor))));
+        const std::size_t instructionIndex = queue.commands.size();
         queue.commands.push_back(sequence.instruction);
+        if (sequence.scale_binding >= 0) {
+            relocations.push_back(BinaryScaleRelocation {
+                static_cast<std::uint32_t>(sequence.scale_binding),
+                0,
+                key.first,
+                static_cast<std::uint16_t>(key.second),
+                static_cast<std::uint32_t>(instructionIndex),
+                VxmImmediateOperand::Rhs,
+            });
+        }
         if (sequence.repeat_count > 1) {
             queue.commands.push_back(control_command(isa::encode_icu_repeat(
                 InstructionControlUnit::Repeat {
@@ -414,7 +431,8 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     program.target_abi = target->abi_fingerprint();
     program.bindings = std::move(bindings);
     for (auto& [key, sequences] : queues)
-        program.queues.push_back(encode_queue(key, std::move(sequences), program.max_cycle));
+        program.queues.push_back(encode_queue(key, std::move(sequences),
+            program.max_cycle, program.scale_relocations));
     return program;
 }
 
