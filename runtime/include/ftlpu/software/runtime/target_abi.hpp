@@ -1,11 +1,43 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace ftlpu::software::runtime {
 
 inline constexpr std::string_view kLpu32StreamTargetName = "lpu_32stream_v1";
+
+struct ExecutableTargetIdentity {
+    std::string name{};
+    std::uint64_t abi{0};
+
+    friend bool operator==(
+        const ExecutableTargetIdentity&,
+        const ExecutableTargetIdentity&) = default;
+};
+
+// Values shared by compiler scheduling and backend execution. This schema is
+// deliberately distinct from a backend implementation/version fingerprint.
+struct ExecutableTargetParameters {
+    std::int64_t hemisphere_count{0};
+    std::int64_t mem_slices_per_hemisphere{0};
+    std::int64_t sram_banks_per_tile{0};
+    std::int64_t sram_rows_per_bank{0};
+    std::int64_t sram_word_bytes{0};
+    std::int64_t tile_rows{0};
+    std::int64_t lanes_per_tile{0};
+    std::int64_t vector_bytes{0};
+    std::int64_t streams_per_direction{0};
+    std::int64_t mem_read_bytes_per_cycle{0};
+    std::int64_t mem_write_bytes_per_cycle{0};
+    std::int64_t mxm_count{0};
+    std::int64_t mxm_rows{0};
+    std::int64_t mxm_columns{0};
+    std::int64_t mxm_load_streams_per_cycle{0};
+    std::int64_t mxm_load_bytes_per_cycle{0};
+    std::int64_t vxm_alu_count{0};
+};
 
 class TargetAbiHasher {
 public:
@@ -24,8 +56,33 @@ private:
     std::uint64_t value_ = 14695981039346656037ULL;
 };
 
-// This list is the command ABI contract for the CModel-backed 32-stream LPU.
-// LPUTargetModel::abi_fingerprint() hashes fields in exactly this order.
+constexpr std::uint64_t executable_target_abi(
+    const ExecutableTargetParameters& target)
+{
+    TargetAbiHasher hash;
+    hash.add(2); // Executable ABI schema version.
+    hash.add(target.hemisphere_count);
+    hash.add(target.mem_slices_per_hemisphere);
+    hash.add(target.sram_banks_per_tile);
+    hash.add(target.sram_rows_per_bank);
+    hash.add(target.sram_word_bytes);
+    hash.add(target.tile_rows);
+    hash.add(target.lanes_per_tile);
+    hash.add(target.vector_bytes);
+    hash.add(target.streams_per_direction);
+    hash.add(target.mem_read_bytes_per_cycle);
+    hash.add(target.mem_write_bytes_per_cycle);
+    hash.add(target.mxm_count);
+    hash.add(target.mxm_rows);
+    hash.add(target.mxm_columns);
+    hash.add(target.mxm_load_streams_per_cycle);
+    hash.add(target.mxm_load_bytes_per_cycle);
+    hash.add(target.vxm_alu_count);
+    return hash.value();
+}
+
+// Frozen legacy identity retained only for reading/testing older binaries.
+// New compiler emissions use executable_target_abi() above.
 constexpr std::uint64_t lpu_32stream_target_abi()
 {
     TargetAbiHasher hash;

@@ -141,25 +141,6 @@ void validate_queue_index(QueueKind kind, std::size_t index)
 
 } // namespace
 
-const char* queue_kind_name(QueueKind kind)
-{
-    switch (kind) {
-    case QueueKind::Mem:
-        return "mem";
-    case QueueKind::MxmLoad:
-        return "mxm_load";
-    case QueueKind::MxmCompute:
-        return "mxm_compute";
-    case QueueKind::Vxm:
-        return "vxm";
-    case QueueKind::SxmTranspose:
-        return "sxm_transpose";
-    case QueueKind::SxmPermute:
-        return "sxm_permute";
-    }
-    return "unknown";
-}
-
 void IcuProgram::emit_mem(std::size_t cycle, std::size_t column, MemInstruction instruction)
 {
     check_mem_column(column);

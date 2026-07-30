@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ftlpu/software/runtime/target_abi.hpp"
+
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
@@ -98,6 +100,10 @@ public:
 
     const std::string& name() const { return name_; }
     std::uint64_t abi_fingerprint() const;
+    software::runtime::ExecutableTargetIdentity executable_target_identity() const
+    {
+        return {name_, abi_fingerprint()};
+    }
     const MemoryTopology& memory() const { return memory_; }
     const StreamTopology& streams() const { return streams_; }
     const ThroughputModel& throughput() const { return throughput_; }

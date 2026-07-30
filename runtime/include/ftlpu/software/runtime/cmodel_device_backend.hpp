@@ -10,6 +10,8 @@ class TspSliceSystem;
 
 namespace ftlpu::software::runtime {
 
+TargetDescription make_cmodel_target_description();
+
 class CModelDeviceBackend final : public DeviceBackend {
 public:
     CModelDeviceBackend();

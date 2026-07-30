@@ -8,6 +8,8 @@ option(FTLPU_BUILD_COMPILER
     "Build the MLIR-based FTLPU compiler" OFF)
 option(FTLPU_BUILD_LEGACY_CMODEL_RUNTIME
     "Build the direct-SRAM CModel runtime adapter and its tests" OFF)
+option(FTLPU_CMODEL_TRANSFORMER_EVAL
+    "Build against the TransformerEval CModel hardware configuration" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,9 +50,26 @@ add_subdirectory(
     "${CMAKE_CURRENT_BINARY_DIR}/_deps/ftlpu-cmodel"
     EXCLUDE_FROM_ALL)
 
+if(TARGET ftlpu_cmodel AND NOT TARGET ftlpu::cmodel)
+    add_library(ftlpu::cmodel ALIAS ftlpu_cmodel)
+endif()
+
 if(NOT TARGET ftlpu::cmodel)
     message(FATAL_ERROR
         "FTLPU-CMODEL did not define the ftlpu::cmodel target")
+endif()
+
+add_library(ftlpu_cmodel_selected_config INTERFACE)
+add_library(
+    ftlpu::cmodel_selected_config
+    ALIAS ftlpu_cmodel_selected_config)
+target_link_libraries(
+    ftlpu_cmodel_selected_config
+    INTERFACE ftlpu::cmodel)
+if(FTLPU_CMODEL_TRANSFORMER_EVAL)
+    target_compile_definitions(
+        ftlpu_cmodel_selected_config
+        INTERFACE FTLPU_TRANSFORMER_EVAL_CONFIG)
 endif()
 
 enable_testing()
@@ -58,11 +77,5 @@ enable_testing()
 add_subdirectory(runtime)
 
 if(FTLPU_BUILD_COMPILER)
-    if(NOT TARGET ftlpu_software)
-        message(FATAL_ERROR
-            "The compiler still depends on the legacy ftlpu_software target. "
-            "Keep FTLPU_BUILD_COMPILER=OFF until the new backend runtime "
-            "provides the binary support library.")
-    endif()
     add_subdirectory(compiler)
 endif()

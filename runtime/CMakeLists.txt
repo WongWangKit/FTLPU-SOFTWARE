@@ -3,11 +3,61 @@ add_executable(cmodel_dependency_smoke_test
 
 target_link_libraries(cmodel_dependency_smoke_test
     PRIVATE
-        ftlpu::cmodel)
+        ftlpu::cmodel_selected_config)
 
 add_test(
     NAME cmodel_dependency_smoke_test
     COMMAND cmodel_dependency_smoke_test)
+
+add_library(ftlpu_device_backend
+    src/runtime/cmodel_device_backend.cpp)
+
+add_library(ftlpu::device_backend ALIAS ftlpu_device_backend)
+
+target_include_directories(ftlpu_device_backend
+    PUBLIC
+        include)
+
+target_link_libraries(ftlpu_device_backend
+    PUBLIC
+        ftlpu::cmodel_selected_config)
+
+add_library(ftlpu_runtime_adapter
+    src/runtime/binary.cpp
+    src/runtime/binary_program_adapter.cpp
+    src/runtime/binding_transfer.cpp)
+
+add_library(ftlpu::runtime_adapter ALIAS ftlpu_runtime_adapter)
+
+target_include_directories(ftlpu_runtime_adapter
+    PUBLIC
+        include)
+
+target_link_libraries(ftlpu_runtime_adapter
+    PUBLIC
+        ftlpu::device_backend)
+
+add_executable(binary_program_adapter_test
+    tests/runtime/binary_program_adapter_test.cpp)
+
+target_link_libraries(binary_program_adapter_test
+    PRIVATE
+        ftlpu::runtime_adapter)
+
+add_test(
+    NAME binary_program_adapter_test
+    COMMAND binary_program_adapter_test)
+
+add_executable(compiled_binary_device_backend_test
+    tests/runtime/compiled_binary_device_backend_test.cpp)
+
+target_link_libraries(compiled_binary_device_backend_test
+    PRIVATE
+        ftlpu::runtime_adapter)
+
+add_test(
+    NAME compiled_binary_device_backend_test
+    COMMAND compiled_binary_device_backend_test)
 
 if(NOT FTLPU_BUILD_LEGACY_CMODEL_RUNTIME)
     return()

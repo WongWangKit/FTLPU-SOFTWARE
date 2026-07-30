@@ -385,59 +385,25 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
 
 std::uint64_t LPUTargetModel::abi_fingerprint() const
 {
-    software::runtime::TargetAbiHasher hash;
-    hash.add(1);
-#define HASH(field) hash.add(memory_.field)
-    HASH(hemispheres);
-    HASH(slices_per_hemisphere);
-    HASH(banks_per_slice);
-    HASH(words_per_bank);
-    HASH(bytes_per_word);
-    HASH(accumulator_slice_base);
-    HASH(accumulator_slices_per_mxm);
-    HASH(w8a16_weight_slice_count);
-    HASH(w8a16_weight_slice_stride);
-    HASH(w8a16_activation_slice_base);
-    HASH(w8a16_hidden_slice_base);
-    HASH(w8a16_result_slice_base);
-    HASH(accumulator_scratch_base_row);
-#undef HASH
-    for (const auto value : memory_.w8a16_fused_gate_temp_slices) hash.add(value);
-    for (const auto value : memory_.w8a16_fused_up_temp_slices) hash.add(value);
-#define HASH(field) hash.add(streams_.field)
-    HASH(streams_per_direction);
-    HASH(encoded_streams);
-    HASH(mem_boundary_register_columns);
-    HASH(system_register_columns);
-    HASH(mem_slices_per_register_group);
-#undef HASH
-#define HASH(field) hash.add(throughput_.field)
-    HASH(tile_rows);
-    HASH(lanes_per_tile);
-    HASH(mem_read_bytes_per_cycle);
-    HASH(mem_write_bytes_per_cycle);
-    HASH(mxm_rows);
-    HASH(mxm_columns);
-    HASH(mxm_load_streams_per_cycle);
-    HASH(mxm_load_bytes_per_cycle);
-    HASH(mxm_activation_streams);
-    HASH(mxm_result_streams);
-    HASH(mxm_pipeline_rows);
-    HASH(mxm_earliest_iw_cycle);
-    HASH(qk_iw_to_compute_latency);
-    HASH(mxms_per_hemisphere);
-    HASH(mxm_weight_buffers);
-    HASH(vxm_alus);
-    HASH(vxm_weight_to_iw_latency);
-    HASH(mem_to_sxm_latency);
-    HASH(mem_to_mxm_latency);
-    HASH(mxm0_accumulator_latency);
-    HASH(mxm1_accumulator_latency);
-    HASH(accumulator_to_vxm_latency);
-    HASH(accumulator_read_to_vxm_latency);
-    HASH(swiglu_write_latency);
-#undef HASH
-    return hash.value();
+    return software::runtime::executable_target_abi({
+        memory_.hemispheres,
+        memory_.slices_per_hemisphere,
+        memory_.banks_per_slice,
+        memory_.words_per_bank,
+        memory_.bytes_per_word,
+        throughput_.tile_rows,
+        throughput_.lanes_per_tile,
+        throughput_.tile_rows * throughput_.lanes_per_tile,
+        streams_.streams_per_direction,
+        throughput_.mem_read_bytes_per_cycle,
+        throughput_.mem_write_bytes_per_cycle,
+        memory_.hemispheres * throughput_.mxms_per_hemisphere,
+        throughput_.mxm_rows,
+        throughput_.mxm_columns,
+        throughput_.mxm_load_streams_per_cycle,
+        throughput_.mxm_load_bytes_per_cycle,
+        throughput_.vxm_alus,
+    });
 }
 
 bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destination,

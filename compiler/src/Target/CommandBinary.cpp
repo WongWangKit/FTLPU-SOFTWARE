@@ -83,12 +83,15 @@ QueueCommand mxm_instruction_command(isa::EncodedMxmInstruction encoded)
 
 QueueCommand vxm_instruction_command(const isa::EncodedVxmInstruction& encoded)
 {
-    return QueueCommand {
+    auto command = QueueCommand {
         static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
         InstructionKind::Vxm,
-        4,
-        encoded.words,
+        static_cast<std::uint16_t>(encoded.words.size()),
+        {},
     };
+    std::copy(
+        encoded.words.begin(), encoded.words.end(), command.words.begin());
+    return command;
 }
 
 QueueCommand sxm_instruction_command(const SxmInstruction& instruction)
@@ -427,8 +430,9 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
         return std::tie(lhs.access, lhs.index) < std::tie(rhs.access, rhs.index);
     });
     software::runtime::BinaryProgram program;
-    program.target_name = target->name();
-    program.target_abi = target->abi_fingerprint();
+    const auto identity = target->executable_target_identity();
+    program.target_name = identity.name;
+    program.target_abi = identity.abi;
     program.bindings = std::move(bindings);
     for (auto& [key, sequences] : queues)
         program.queues.push_back(encode_queue(key, std::move(sequences),

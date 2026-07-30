@@ -1,0 +1,26 @@
+{
+  "name": "lpu_cmodel_transformer_eval_v1",
+  "memory": {
+    "hemispheres": 2,
+    "slices_per_hemisphere": 44,
+    "banks_per_slice": 2,
+    "words_per_bank": 40960,
+    "bytes_per_word": 8
+  },
+  "streams": {
+    "streams_per_direction": 32,
+    "encoded_streams": 64
+  },
+  "throughput": {
+    "tile_rows": 4,
+    "lanes_per_tile": 8,
+    "mem_read_bytes_per_cycle": 8,
+    "mem_write_bytes_per_cycle": 8,
+    "mxm_rows": 32,
+    "mxm_columns": 32,
+    "mxm_load_streams_per_cycle": 16,
+    "mxm_load_bytes_per_cycle": 64,
+    "mxms_per_hemisphere": 2,
+    "vxm_alus": 8
+  }
+}

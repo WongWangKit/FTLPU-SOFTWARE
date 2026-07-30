@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ftlpu/software/runtime/target_abi.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -10,8 +12,9 @@ namespace ftlpu::software::runtime {
 // ModelSession and future BinaryProgram adapters must not duplicate CModel
 // compile-time constants.
 struct TargetDescription {
-    std::string name{};
-    std::uint64_t abi_fingerprint{0};
+    std::string backend_name{};
+    std::uint64_t backend_abi{0};
+    ExecutableTargetIdentity executable_target{};
 
     std::size_t tile_rows{0};
     std::size_t lanes_per_tile{0};
@@ -34,9 +37,14 @@ struct TargetDescription {
     std::size_t mxm_reduction{0};
     std::size_t mxm_weight_bytes_per_value{0};
     std::size_t mxm_activation_bytes_per_value{0};
+    std::size_t mxm_load_streams_per_cycle{0};
+    std::size_t mxm_load_bytes_per_cycle{0};
 
     std::size_t vxm_alu_count{0};
     std::size_t sxm_count{0};
+    std::size_t streams_per_direction{0};
+    std::size_t mem_read_bytes_per_cycle{0};
+    std::size_t mem_write_bytes_per_cycle{0};
 };
 
 } // namespace ftlpu::software::runtime

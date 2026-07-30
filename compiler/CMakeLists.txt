@@ -197,7 +197,7 @@ target_link_libraries(ftlpu_compiler
         MLIRFuncDialect
         MLIRSupport
         StablehloOps
-        ftlpu_software)
+        ftlpu::runtime_adapter)
 
 add_executable(ftlpu_opt tools/ftlpu_opt.cpp)
 target_link_libraries(ftlpu_opt PRIVATE ftlpu_compiler)
@@ -230,6 +230,9 @@ add_test(NAME attention_rope_emitter_test COMMAND $<TARGET_FILE:attention_rope_e
 add_executable(attention_target_layout_test tests/attention_target_layout_test.cpp)
 target_link_libraries(attention_target_layout_test PRIVATE ftlpu_compiler)
 add_test(NAME attention_target_layout_test COMMAND $<TARGET_FILE:attention_target_layout_test>)
+add_executable(executable_target_abi_test tests/executable_target_abi_test.cpp)
+target_link_libraries(executable_target_abi_test PRIVATE ftlpu_compiler)
+add_test(NAME executable_target_abi_test COMMAND $<TARGET_FILE:executable_target_abi_test>)
 add_executable(schedule_graph_test tests/schedule_graph_test.cpp)
 target_link_libraries(schedule_graph_test PRIVATE ftlpu_compiler)
 add_test(NAME schedule_graph_test COMMAND $<TARGET_FILE:schedule_graph_test>)

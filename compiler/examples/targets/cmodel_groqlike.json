@@ -1,0 +1,26 @@
+{
+  "name": "lpu_cmodel_groqlike_v1",
+  "memory": {
+    "hemispheres": 2,
+    "slices_per_hemisphere": 44,
+    "banks_per_slice": 2,
+    "words_per_bank": 4096,
+    "bytes_per_word": 16
+  },
+  "streams": {
+    "streams_per_direction": 32,
+    "encoded_streams": 64
+  },
+  "throughput": {
+    "tile_rows": 20,
+    "lanes_per_tile": 16,
+    "mem_read_bytes_per_cycle": 16,
+    "mem_write_bytes_per_cycle": 16,
+    "mxm_rows": 320,
+    "mxm_columns": 320,
+    "mxm_load_streams_per_cycle": 16,
+    "mxm_load_bytes_per_cycle": 256,
+    "mxms_per_hemisphere": 1,
+    "vxm_alus": 8
+  }
+}
