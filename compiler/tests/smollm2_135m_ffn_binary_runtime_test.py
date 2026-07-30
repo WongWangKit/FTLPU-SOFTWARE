@@ -36,15 +36,16 @@ def main() -> None:
     environment = os.environ.copy()
     environment["FTLPU_SCHEDULE_TRACE"] = str(trace)
     runtime_result = subprocess.run([str(args.runtime_test), str(binary)], env=environment)
-    renderer = Path(__file__).resolve().parents[1] / "tools" / "render_ffn_pipeline.py"
-    source = args.input.read_text(encoding="utf-8")
-    sequence_match = re.search(r"tensor<(\d+)x576xf16>", source)
-    if not sequence_match:
-        raise RuntimeError("cannot determine FFN sequence length from StableHLO input")
-    subprocess.run([
-        sys.executable, str(renderer), str(trace), str(pipeline),
-        "--sequence-length", sequence_match.group(1),
-    ], check=True)
+    if trace.exists():
+        renderer = Path(__file__).resolve().parents[1] / "tools" / "render_ffn_pipeline.py"
+        source = args.input.read_text(encoding="utf-8")
+        sequence_match = re.search(r"tensor<(\d+)x576xf16>", source)
+        if not sequence_match:
+            raise RuntimeError("cannot determine FFN sequence length from StableHLO input")
+        subprocess.run([
+            sys.executable, str(renderer), str(trace), str(pipeline),
+            "--sequence-length", sequence_match.group(1),
+        ], check=True)
     runtime_result.check_returncode()
 
 

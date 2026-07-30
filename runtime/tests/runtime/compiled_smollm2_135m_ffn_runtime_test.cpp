@@ -1,15 +1,12 @@
 #include "ftlpu/software/runtime/binary.hpp"
-#include "ftlpu/software/runtime/cmodel_runtime.hpp"
-#include "ftlpu/software/runtime/performance.hpp"
-#include "ftlpu/software/runtime/schedule_trace.hpp"
+#include "ftlpu/software/runtime/binary_program_adapter.hpp"
+#include "ftlpu/software/runtime/binding_transfer.hpp"
+#include "ftlpu/software/runtime/cmodel_device_backend.hpp"
 
 #include "ftlpu/core/fp16.hpp"
-
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
-#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -51,6 +48,24 @@ float read_fp16(const std::vector<std::uint8_t>& bytes, std::size_t index)
         | (static_cast<std::uint16_t>(bytes[index * 2 + 1]) << 8);
     return ftlpu::Fp16::from_bits(bits).to_float();
 }
+
+const ftlpu::software::runtime::BinaryBinding& find_binding(
+    const std::vector<ftlpu::software::runtime::BinaryBinding>& bindings,
+    ftlpu::software::runtime::BindingAccess access,
+    std::uint32_t index)
+{
+    const auto found = std::find_if(
+        bindings.begin(), bindings.end(),
+        [&](const auto& binding) {
+            return binding.access == access
+                && binding.index == index;
+        });
+    if (found == bindings.end()) {
+        throw std::logic_error(
+            "SmolLM2 FFN binary is missing a required binding");
+    }
+    return *found;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -63,10 +78,6 @@ try {
         throw std::logic_error("SmolLM2 FFN binary must contain four inputs and one output");
     if (program.max_cycle == 0)
         throw std::logic_error("SmolLM2 FFN binary has no scheduled ICU commands");
-    if (const auto* trace_path = std::getenv("FTLPU_SCHEDULE_TRACE")) {
-        ftlpu::software::runtime::write_schedule_trace_csv(program, trace_path);
-    }
-
     std::vector<std::uint8_t> x;
     x.reserve(kM * kHidden * 2);
     for (std::size_t row = 0; row < kM; ++row)
@@ -90,15 +101,61 @@ try {
 
     // This full-chip model is intentionally process-lifetime in the test. On
     // Windows its very large nested queue graph is costly to tear down.
-    auto* system = new ftlpu::TspSliceSystem();
-    ftlpu::software::runtime::CModelRuntime runtime(*system);
-    runtime.load(program);
-    runtime.upload_input(0, x);
-    runtime.upload_input(1, gate_w);
-    runtime.upload_input(2, up_w);
-    runtime.upload_input(3, down_w);
-    runtime.run_cycles(program.max_cycle + 64);
-    const auto actual = runtime.download_output(0);
+    auto* backend =
+        new ftlpu::software::runtime::CModelDeviceBackend();
+    const auto adapted =
+        ftlpu::software::runtime::adapt_binary_program(
+            program, backend->target(), 63);
+    const std::array<std::vector<std::uint8_t>, 4> inputs {
+        std::move(x),
+        std::move(gate_w),
+        std::move(up_w),
+        std::move(down_w),
+    };
+    for (std::size_t index = 0; index < inputs.size(); ++index) {
+        const auto& input_binding = find_binding(
+            adapted.bindings,
+            ftlpu::software::runtime::BindingAccess::Input,
+            static_cast<std::uint32_t>(index));
+        const auto transfers =
+            ftlpu::software::runtime::pack_binding(
+                input_binding,
+                inputs[index],
+                backend->target());
+        for (const auto& transfer : transfers) {
+            backend->upload(
+                transfer.address,
+                transfer.bytes,
+                transfer.purpose);
+        }
+    }
+    backend->load(adapted.device_program);
+    backend->launch();
+    backend->wait();
+
+    std::vector<ftlpu::software::runtime::BindingTransfer>
+        output_transfers;
+    const auto& output_binding = find_binding(
+        adapted.bindings,
+        ftlpu::software::runtime::BindingAccess::Output,
+        0);
+    for (const auto& region :
+        ftlpu::software::runtime::plan_binding_regions(
+            output_binding, backend->target())) {
+        output_transfers.push_back({
+            region.address,
+            region.purpose,
+            backend->download(
+                region.address,
+                region.byte_size,
+                region.purpose),
+        });
+    }
+    const auto actual =
+        ftlpu::software::runtime::unpack_binding(
+            output_binding,
+            output_transfers,
+            backend->target());
 
     std::vector<float> hidden(kIntermediate);
     std::size_t checked = 0;
@@ -111,16 +168,6 @@ try {
     constexpr std::size_t kSampleRows[] = {0, kM / 2, kM - 1};
     constexpr std::size_t kSampleColumns[] = {0, 191, 575};
     for (std::size_t row = 0; row < kM; ++row) {
-        const auto read_hidden = [&](std::size_t h) {
-            const std::size_t address = (h / 32) * kM + row;
-            const std::size_t column = h % 32;
-            const auto low = system->read_mem_sram_lane_byte(ftlpu::Hemisphere::East,
-                21, column / 8, address, column % 8);
-            const auto high = system->read_mem_sram_lane_byte(ftlpu::Hemisphere::East,
-                22, column / 8, address, column % 8);
-            return ftlpu::Fp16::from_bits(static_cast<std::uint16_t>(low)
-                | (static_cast<std::uint16_t>(high) << 8)).to_float();
-        };
         for (std::size_t h = 0; h < kIntermediate; ++h) {
             const float gate = activation(row, gate_k(h)) * gate_sign(h);
             const float up = activation(row, up_k(h)) * up_sign(h);
@@ -143,49 +190,16 @@ try {
                 }
             }
             if (std::fabs(observed - expected) > 0.004f) {
-                const auto read_temp_fp32 =
-                    [&](const std::array<std::size_t, 4>& slices,
-                        std::size_t h) {
-                        std::uint32_t raw = 0;
-                        const std::size_t column = h % 32;
-                        for (std::size_t byte = 0; byte < slices.size();
-                             ++byte) {
-                            raw |= static_cast<std::uint32_t>(
-                                system->read_mem_sram_lane_byte(
-                                    ftlpu::Hemisphere::East, slices[byte],
-                                    column / 8, row, column % 8))
-                                << (byte * 8);
-                        }
-                        return std::bit_cast<float>(raw);
-                    };
-                float hidden_max_error = 0.0f;
-                for (std::size_t index = 0; index < kIntermediate; ++index)
-                    hidden_max_error = std::max(hidden_max_error,
-                        std::fabs(read_hidden(index) - hidden[index]));
-                const float device_hidden_expected = ftlpu::Fp16::from_float(
-                    read_hidden(h0) - read_hidden(h1)).to_float();
                 throw std::logic_error("SmolLM2 FFN mismatch row=" + std::to_string(row)
                     + " column=" + std::to_string(n) + " actual="
-                    + std::to_string(observed) + " expected=" + std::to_string(expected)
-                    + " hidden0.actual=" + std::to_string(read_hidden(h0))
-                    + " hidden0.cpu=" + std::to_string(hidden[h0])
-                    + " hidden1.actual=" + std::to_string(read_hidden(h1))
-                    + " hidden1.cpu=" + std::to_string(hidden[h1])
-                    + " gate_temp=" + std::to_string(read_temp_fp32(
-                        {1, 5, 9, 13}, h0))
-                    + " up_temp=" + std::to_string(read_temp_fp32(
-                        {2, 6, 10, 14}, h0))
-                    + " hidden.max_error=" + std::to_string(hidden_max_error)
-                    + " down.from_device_hidden="
-                    + std::to_string(device_hidden_expected));
+                    + std::to_string(observed) + " expected="
+                    + std::to_string(expected));
             }
             ++checked;
         }
     }
     if (actual_nonzero == 0 || expected_nonzero == 0)
         throw std::logic_error("SmolLM2 FFN numeric test unexpectedly produced only zero outputs");
-    ftlpu::software::runtime::print_runtime_performance(
-        program, program.max_cycle + 64, std::cout);
     std::cout << "SmolLM2-135M complete FFN passed: " << checked
               << " FP16 values, max_cycle=" << program.max_cycle
               << ", nonzero(actual/reference)=" << actual_nonzero << "/" << expected_nonzero

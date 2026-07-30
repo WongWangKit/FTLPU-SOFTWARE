@@ -59,6 +59,33 @@ add_test(
     NAME compiled_binary_device_backend_test
     COMMAND compiled_binary_device_backend_test)
 
+add_executable(ffn_binding_transfer_test
+    tests/runtime/ffn_binding_transfer_test.cpp)
+
+target_link_libraries(ffn_binding_transfer_test
+    PRIVATE
+        ftlpu::runtime_adapter)
+
+add_test(
+    NAME ffn_binding_transfer_test
+    COMMAND ffn_binding_transfer_test)
+
+add_executable(compiled_smollm2_135m_ffn_runtime_test
+    tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
+
+target_link_libraries(compiled_smollm2_135m_ffn_runtime_test
+    PRIVATE
+        ftlpu::runtime_adapter)
+
+add_executable(compiled_smollm2_135m_ffn_seq128_runtime_test
+    tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
+
+target_compile_definitions(compiled_smollm2_135m_ffn_seq128_runtime_test
+    PRIVATE FTLPU_TEST_SEQUENCE_LENGTH=128)
+target_link_libraries(compiled_smollm2_135m_ffn_seq128_runtime_test
+    PRIVATE
+        ftlpu::runtime_adapter)
+
 if(NOT FTLPU_BUILD_LEGACY_CMODEL_RUNTIME)
     return()
 endif()
@@ -128,18 +155,6 @@ add_executable(compiled_rmsnorm_runtime_test
     tests/runtime/compiled_rmsnorm_runtime_test.cpp)
 
 target_link_libraries(compiled_rmsnorm_runtime_test PRIVATE ftlpu_software)
-
-add_executable(compiled_smollm2_135m_ffn_runtime_test
-    tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
-
-target_link_libraries(compiled_smollm2_135m_ffn_runtime_test PRIVATE ftlpu_software)
-
-add_executable(compiled_smollm2_135m_ffn_seq128_runtime_test
-    tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
-
-target_compile_definitions(compiled_smollm2_135m_ffn_seq128_runtime_test
-    PRIVATE FTLPU_TEST_SEQUENCE_LENGTH=128)
-target_link_libraries(compiled_smollm2_135m_ffn_seq128_runtime_test PRIVATE ftlpu_software)
 
 add_executable(compiled_smollm2_attention_runtime_test
     tests/runtime/compiled_smollm2_attention_runtime_test.cpp)
