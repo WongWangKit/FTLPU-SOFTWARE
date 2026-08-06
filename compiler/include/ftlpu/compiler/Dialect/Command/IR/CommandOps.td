@@ -20,6 +20,13 @@ def BindingOp : FTLPU_Command_Op<"binding"> {
   let hasVerifier = 1;
 }
 
+def TimelineOp : FTLPU_Command_Op<"timeline"> {
+  let summary = "Named cycle interval retained in the executable";
+  let arguments = (ins StrAttr:$name, I64Attr:$start, I64Attr:$end);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
 def MemOp : FTLPU_Command_Op<"mem", [MemoryEffects<[MemWrite]>]> {
   let summary = "Compressed command for one ICU MEM queue";
   let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
@@ -27,7 +34,8 @@ def MemOp : FTLPU_Command_Op<"mem", [MemoryEffects<[MemWrite]>]> {
       I64Attr:$repeat_interval, I64Attr:$address_stride,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
-      OptionalAttr<I64Attr>:$wave_address_stride);
+      OptionalAttr<I64Attr>:$wave_address_stride,
+      OptionalAttr<I64Attr>:$address_binding);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -38,8 +46,23 @@ def MxmOp : FTLPU_Command_Op<"mxm", [MemoryEffects<[MemWrite]>]> {
       I64Attr:$weight_buffer, I64Attr:$weight_column, I64Attr:$activation_stream_base,
       I64Attr:$output_stream_base, I64Attr:$repeat_count,
       I64Attr:$repeat_interval, I64Attr:$accumulator_address,
-      I64Attr:$accumulator_row_stride, StrAttr:$accumulator_destination,
-      BoolAttr:$accumulator_clear);
+        I64Attr:$accumulator_row_stride, StrAttr:$accumulator_destination,
+        BoolAttr:$accumulator_clear,
+        OptionalAttr<StrAttr>:$data_format,
+        OptionalAttr<StrAttr>:$accumulator_output_format,
+        OptionalAttr<StrAttr>:$weight_load_mode,
+        OptionalAttr<I64Attr>:$weight_inner_column,
+        OptionalAttr<StrAttr>:$weight_input_mode,
+        OptionalAttr<StrAttr>:$compute_mode);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def MxmDequantOp : FTLPU_Command_Op<"mxm_dequant",
+    [MemoryEffects<[MemWrite]>]> {
+  let summary = "Compressed scale command for one ICU MXM dequant queue";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, F32Attr:$scale,
+      I64Attr:$repeat_count, I64Attr:$repeat_interval);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -61,7 +84,9 @@ def SxmOp : FTLPU_Command_Op<"sxm", [MemoryEffects<[MemWrite]>]> {
   let summary = "Variable-payload command for one ICU SXM queue";
   let arguments = (ins I64Attr:$cycle, I64Attr:$hemisphere, StrAttr:$opcode,
       ArrayAttr:$source_streams, ArrayAttr:$destination_streams,
-      ArrayAttr:$permute_map, StrAttr:$weight_layout);
+      ArrayAttr:$permute_map, StrAttr:$weight_layout,
+      OptionalAttr<I64Attr>:$repeat_count,
+      OptionalAttr<I64Attr>:$repeat_interval);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }

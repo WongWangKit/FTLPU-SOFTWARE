@@ -1,6 +1,6 @@
 #include "ftlpu/software/runtime/model_session.hpp"
 
-#include "ftlpu/core/fp16.hpp"
+#include "ftlpu/core/bf16.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -12,9 +12,9 @@
 
 namespace {
 
-float readFp16(const std::vector<std::uint8_t>& data, std::size_t index)
+float readBf16(const std::vector<std::uint8_t>& data, std::size_t index)
 {
-    return ftlpu::Fp16::from_bits(
+    return ftlpu::Bf16::from_bits(
         static_cast<std::uint16_t>(data[2 * index])
         | (static_cast<std::uint16_t>(data[2 * index + 1]) << 8))
         .to_float();
@@ -42,8 +42,16 @@ try {
     double meanError = 0.0;
     std::size_t maximumIndex = 0;
     for (std::size_t index = 0; index < actual.size() / 2; ++index) {
-        const float error = std::fabs(
-            readFp16(actual, index) - readFp16(expected, index));
+        const float actualValue = readBf16(actual, index);
+        const float expectedValue = readBf16(expected, index);
+        if (!std::isfinite(actualValue)
+            || !std::isfinite(expectedValue))
+            throw std::logic_error(
+                "HF decoder layer produced a non-finite value index="
+                + std::to_string(index)
+                + " actual=" + std::to_string(actualValue)
+                + " expected=" + std::to_string(expectedValue));
+        const float error = std::fabs(actualValue - expectedValue);
         meanError += error;
         if (error > maximumError) {
             maximumError = error;
@@ -51,7 +59,8 @@ try {
         }
     }
     meanError /= actual.size() / 2;
-    if (!std::isfinite(maximumError) || maximumError > 0.35f
+    if (!std::isfinite(maximumError) || !std::isfinite(meanError)
+        || maximumError > 0.35f
         || meanError > 0.035)
         throw std::logic_error(
             "HF decoder layer golden mismatch max_error="

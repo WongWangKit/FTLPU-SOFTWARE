@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -388,7 +389,9 @@ std::optional<W8A16FfnMatch> match_w8a16_ffn(mlir::Operation* final_convert)
     if (!named(final_convert, "stablehlo.convert") || final_convert->getNumOperands() != 1)
         return std::nullopt;
     auto result_type = llvm::dyn_cast<mlir::RankedTensorType>(final_convert->getResult(0).getType());
-    if (!result_type || !result_type.getElementType().isF16()) return std::nullopt;
+    if (!result_type
+        || !is_lpu_16bit_float(result_type.getElementType()))
+        return std::nullopt;
     auto* down_dot = final_convert->getOperand(0).getDefiningOp();
     if (!named(down_dot, "stablehlo.dot_general")) return std::nullopt;
     auto* swiglu_mul = down_dot->getOperand(0).getDefiningOp();
@@ -846,11 +849,48 @@ public:
                 return;
             }
 
+            mlir::Value loweredRhs = dot_general->getOperand(1);
+            float rhsScale = 1.0f;
+            if (const auto scaledWeight =
+                    match_scaled_weight(dot_general->getOperand(1))) {
+                const auto storageType =
+                    llvm::dyn_cast<mlir::RankedTensorType>(
+                        scaledWeight->storage.getType());
+                if (storageType
+                    && storageType.getElementType().isInteger(8)
+                    && is_lpu_16bit_float(lhs.getElementType())
+                    && is_lpu_16bit_float(result.getElementType())) {
+                    loweredRhs = scaledWeight->storage;
+                    rhsScale = scaledWeight->scale;
+                }
+            }
             rewriter.setInsertionPoint(dot_general);
             const auto lowered = rewriter.create<kernel::MatmulOp>(dot_general->getLoc(),
-                dot_general->getOperand(0), dot_general->getOperand(1), result,
+                dot_general->getOperand(0), loweredRhs, result,
                 lhs.getShape()[0], rhs.getShape()[1], lhs.getShape()[1]);
+            lowered->setAttr(
+                "rhs_scale", rewriter.getF32FloatAttr(rhsScale));
             rewriter.replaceOp(dot_general, lowered->getResult(0));
+        }
+
+        bool erasedDeadStablehlo = true;
+        while (erasedDeadStablehlo) {
+            erasedDeadStablehlo = false;
+            llvm::SmallVector<mlir::Operation*> operations;
+            for (mlir::Operation& operation :
+                 getOperation().getBody().front())
+                operations.push_back(&operation);
+            for (mlir::Operation* operation :
+                 llvm::reverse(operations)) {
+                if (operation->getName().getDialectNamespace()
+                        != "stablehlo"
+                    || !operation->use_empty()
+                    || operation->hasTrait<
+                        mlir::OpTrait::IsTerminator>())
+                    continue;
+                rewriter.eraseOp(operation);
+                erasedDeadStablehlo = true;
+            }
         }
 
         llvm::SmallVector<mlir::Operation*> elementwiseOperations;

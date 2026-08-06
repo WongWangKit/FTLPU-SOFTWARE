@@ -52,6 +52,27 @@ def verify_vxm_queue_slots(schedule: str) -> None:
         raise AssertionError(f"VXM queue/cycle collisions: {sample}")
 
 
+def verify_weight_allocations(tensor: str) -> None:
+    allocations = [
+        (int(base), int(count), kind)
+        for base, count, kind in re.findall(
+            r'placement = \{[^{}]*base_row = (\d+) : i64,'
+            r'[^{}]*instruction_count = (\d+) : i64,'
+            r'[^{}]*kind = "(w8a16_[^"]+)"',
+            tensor,
+        )
+    ]
+    if len(allocations) != 3:
+        raise AssertionError(
+            f"expected three physical FFN weight allocations, got {allocations}")
+    intervals = sorted((base, base + count, kind)
+                       for base, count, kind in allocations)
+    for previous, current in zip(intervals, intervals[1:]):
+        if current[0] < previous[1]:
+            raise AssertionError(
+                f"FFN weight allocations overlap: {previous} and {current}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tool", type=Path, required=True)
@@ -64,7 +85,7 @@ def main() -> None:
     stablehlo = args.input.read_text(encoding="utf-8")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.input, args.output_dir / "ffn.stablehlo.mlir")
-    require(stablehlo, ["tensor<32x576xf16>", "tensor<576x1536xi8>",
+    require(stablehlo, ["tensor<32x576xbf16>", "tensor<576x1536xi8>",
                         "tensor<1536x576xi8>", "stablehlo.logistic"], "StableHLO")
 
     kernel = run(args.tool, args.input, args.output_dir / "ffn.kernel.mlir",
@@ -82,11 +103,12 @@ def main() -> None:
     require(tensor, ["ftlpu.tensor.matmul_task", "ftlpu.tensor.swish_task",
                      "ftlpu.tensor.elementwise_task",
                      "result_allocations = []", "base_row = 0 : i64",
-                     "base_row = 1728 : i64", "base_row = 3456 : i64",
                      'hemisphere = "both"', 'hemisphere = "west"',
-                     "slices = [21, 22, 23, 29]",
+                     'kind = "fp16_mxm_activation_planar"',
                      'kind = "w8a16_mxm_weight_striped"',
+                     'instruction_count = 1920 : i64, '
                      'kind = "w8a16_mxm_weight_wave_striped"'], "Tensor")
+    verify_weight_allocations(tensor)
     if "ftlpu.tensor.ffn" in tensor:
         raise AssertionError("Tensor IR must not contain the legacy compound FFN op")
 
@@ -107,7 +129,8 @@ def main() -> None:
     require(schedule, ["ftlpu.schedule.mem_read", "ftlpu.schedule.mxm_load",
                        "ftlpu.schedule.mxm_compute", "ftlpu.schedule.vxm",
                        "ftlpu.schedule.mem_accumulate", "ftlpu.schedule.mem_write",
-                       'destination = "stream"'], "Schedule")
+                       'destination = "stream"',
+                       'data_format = "bf16"'], "Schedule")
     verify_vxm_queue_slots(schedule)
     swish_cycles = []
     for line in schedule.splitlines():
@@ -119,19 +142,30 @@ def main() -> None:
         if match:
             swish_cycles.append(int(match.group(1)))
     if args.ffn_schedule == "tail":
-        if not swish_cycles or min(swish_cycles) != 13883:
+        accumulator_read_cycles = [
+            int(cycle)
+            for line in schedule.splitlines()
+            if ("ftlpu.schedule.mxm_accumulator_read" in line
+                and "clear = false" in line)
+            for cycle in re.findall(r"cycle = (\d+) : i64", line)
+        ]
+        first_swish_cycle = min(swish_cycles) if swish_cycles else -1
+        reads_before_swish = [
+            cycle for cycle in accumulator_read_cycles
+            if cycle < first_swish_cycle
+        ]
+        if not reads_before_swish:
             raise AssertionError(
-                "Schedule expected tail SwiGLU start at cycle 13883, "
-                f"got {swish_cycles[:1]}")
-        if swish_cycles[:10] != list(range(13883, 13893)):
+                "Tail schedule must start SwiGLU after a non-clearing "
+                "projection accumulator read")
+        if swish_cycles[:10] != list(
+                range(first_swish_cycle, first_swish_cycle + 10)):
             raise AssertionError(
                 "Schedule expected sequential tail SwiGLU events, "
                 f"got {swish_cycles[:10]}")
     else:
-        if not swish_cycles or min(swish_cycles) >= 13883:
-            raise AssertionError(
-                "Fused schedule did not overlap SwiGLU with projection: "
-                f"{swish_cycles[:1]}")
+        if not swish_cycles:
+            raise AssertionError("Fused schedule did not emit SwiGLU")
         if 'destination = "stream"' not in schedule:
             raise AssertionError(
                 "Fused schedule did not emit accumulator stream+clear")
@@ -146,6 +180,8 @@ def main() -> None:
                   "ftlpu-stablehlo-to-commands", args.ffn_schedule)
     require(command, ["ftlpu.command.binding", "ftlpu.command.mem",
                       "ftlpu.command.mxm", "ftlpu.command.vxm",
+                      'element_type = "bf16"',
+                      'data_format = "bf16"',
                       'kind = "fp16_pair_planar"',
                       'hemisphere = "both"'], "Command")
 

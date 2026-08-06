@@ -1,19 +1,19 @@
 module {
   func.func @smollm2_135m_decoder_layer_seq128(
-      %x: tensor<128x576xf16>,
-      %input_norm_weight: tensor<576xf16>,
+      %x: tensor<128x576xbf16>,
+      %input_norm_weight: tensor<576xbf16>,
       %query_weight: tensor<576x576xi8>,
       %key_weight: tensor<576x192xi8>,
       %value_weight: tensor<576x192xi8>,
       %output_weight: tensor<576x576xi8>,
-      %post_attention_norm_weight: tensor<576xf16>,
+      %post_attention_norm_weight: tensor<576xbf16>,
       %gate_weight: tensor<576x1536xi8>,
       %up_weight: tensor<576x1536xi8>,
-      %down_weight: tensor<1536x576xi8>) -> tensor<128x576xf16> {
+      %down_weight: tensor<1536x576xi8>) -> tensor<128x576xbf16> {
     %rms1_x_f32 = stablehlo.convert %x :
-        (tensor<128x576xf16>) -> tensor<128x576xf32>
+        (tensor<128x576xbf16>) -> tensor<128x576xf32>
     %rms1_weight_f32 = stablehlo.convert %input_norm_weight :
-        (tensor<576xf16>) -> tensor<576xf32>
+        (tensor<576xbf16>) -> tensor<576xf32>
     %rms1_square = stablehlo.multiply %rms1_x_f32, %rms1_x_f32 :
         tensor<128x576xf32>
     %rms1_zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
@@ -41,33 +41,33 @@ module {
     %rms1_scaled = stablehlo.multiply %rms1_normalized, %rms1_weight_broadcast :
         tensor<128x576xf32>
     %rms1_result = stablehlo.convert %rms1_scaled :
-        (tensor<128x576xf32>) -> tensor<128x576xf16>
+        (tensor<128x576xf32>) -> tensor<128x576xbf16>
 
-    %attention_query_weight_f16 = stablehlo.convert %query_weight :
-        (tensor<576x576xi8>) -> tensor<576x576xf16>
-    %attention_key_weight_f16 = stablehlo.convert %key_weight :
-        (tensor<576x192xi8>) -> tensor<576x192xf16>
-    %attention_value_weight_f16 = stablehlo.convert %value_weight :
-        (tensor<576x192xi8>) -> tensor<576x192xf16>
-    %attention_output_weight_f16 = stablehlo.convert %output_weight :
-        (tensor<576x576xi8>) -> tensor<576x576xf16>
+    %attention_query_weight_bf16 = stablehlo.convert %query_weight :
+        (tensor<576x576xi8>) -> tensor<576x576xbf16>
+    %attention_key_weight_bf16 = stablehlo.convert %key_weight :
+        (tensor<576x192xi8>) -> tensor<576x192xbf16>
+    %attention_value_weight_bf16 = stablehlo.convert %value_weight :
+        (tensor<576x192xi8>) -> tensor<576x192xbf16>
+    %attention_output_weight_bf16 = stablehlo.convert %output_weight :
+        (tensor<576x576xi8>) -> tensor<576x576xbf16>
 
-    %attention_query_2d = stablehlo.dot_general %rms1_result, %attention_query_weight_f16,
+    %attention_query_2d = stablehlo.dot_general %rms1_result, %attention_query_weight_bf16,
         contracting_dims = [1] x [0], precision = [] :
-        (tensor<128x576xf16>, tensor<576x576xf16>) -> tensor<128x576xf16>
-    %attention_key_2d = stablehlo.dot_general %rms1_result, %attention_key_weight_f16,
+        (tensor<128x576xbf16>, tensor<576x576xbf16>) -> tensor<128x576xbf16>
+    %attention_key_2d = stablehlo.dot_general %rms1_result, %attention_key_weight_bf16,
         contracting_dims = [1] x [0], precision = [] :
-        (tensor<128x576xf16>, tensor<576x192xf16>) -> tensor<128x192xf16>
-    %attention_value_2d = stablehlo.dot_general %rms1_result, %attention_value_weight_f16,
+        (tensor<128x576xbf16>, tensor<576x192xbf16>) -> tensor<128x192xbf16>
+    %attention_value_2d = stablehlo.dot_general %rms1_result, %attention_value_weight_bf16,
         contracting_dims = [1] x [0], precision = [] :
-        (tensor<128x576xf16>, tensor<576x192xf16>) -> tensor<128x192xf16>
+        (tensor<128x576xbf16>, tensor<576x192xbf16>) -> tensor<128x192xbf16>
 
     %attention_query_heads = stablehlo.reshape %attention_query_2d :
-        (tensor<128x576xf16>) -> tensor<128x9x64xf16>
+        (tensor<128x576xbf16>) -> tensor<128x9x64xbf16>
     %attention_key_heads = stablehlo.reshape %attention_key_2d :
-        (tensor<128x192xf16>) -> tensor<128x3x64xf16>
+        (tensor<128x192xbf16>) -> tensor<128x3x64xbf16>
     %attention_value_heads = stablehlo.reshape %attention_value_2d :
-        (tensor<128x192xf16>) -> tensor<128x3x64xf16>
+        (tensor<128x192xbf16>) -> tensor<128x3x64xbf16>
 
     %attention_theta_f32 = stablehlo.constant dense<1.000000e+05> : tensor<f32>
     %attention_frequency_index = stablehlo.iota dim = 0 : tensor<32xf32>
@@ -107,9 +107,9 @@ module {
         (tensor<128x1x32xf32>) -> tensor<128x3x32xf32>
 
     %attention_query_f32 = stablehlo.convert %attention_query_heads :
-        (tensor<128x9x64xf16>) -> tensor<128x9x64xf32>
+        (tensor<128x9x64xbf16>) -> tensor<128x9x64xf32>
     %attention_key_f32 = stablehlo.convert %attention_key_heads :
-        (tensor<128x3x64xf16>) -> tensor<128x3x64xf32>
+        (tensor<128x3x64xbf16>) -> tensor<128x3x64xf32>
     %attention_query_pairs = stablehlo.reshape %attention_query_f32 :
         (tensor<128x9x64xf32>) -> tensor<128x9x32x2xf32>
     %attention_key_pairs = stablehlo.reshape %attention_key_f32 :
@@ -161,7 +161,7 @@ module {
     %attention_query_rope_f32 = stablehlo.reshape %attention_query_rope_pairs :
         (tensor<128x9x32x2xf32>) -> tensor<128x9x64xf32>
     %attention_query_rope = stablehlo.convert %attention_query_rope_f32 :
-        (tensor<128x9x64xf32>) -> tensor<128x9x64xf16>
+        (tensor<128x9x64xf32>) -> tensor<128x9x64xbf16>
 
     %attention_key_even_cos = stablehlo.multiply %attention_key_even, %attention_cos_k : tensor<128x3x32xf32>
     %attention_key_odd_sin = stablehlo.multiply %attention_key_odd, %attention_sin_k : tensor<128x3x32xf32>
@@ -181,86 +181,86 @@ module {
     %attention_key_rope_f32 = stablehlo.reshape %attention_key_rope_pairs :
         (tensor<128x3x32x2xf32>) -> tensor<128x3x64xf32>
     %attention_key_rope_kv = stablehlo.convert %attention_key_rope_f32 :
-        (tensor<128x3x64xf32>) -> tensor<128x3x64xf16>
+        (tensor<128x3x64xf32>) -> tensor<128x3x64xbf16>
 
     %attention_key_grouped = stablehlo.broadcast_in_dim %attention_key_rope_kv, dims = [0, 1, 3] :
-        (tensor<128x3x64xf16>) -> tensor<128x3x3x64xf16>
+        (tensor<128x3x64xbf16>) -> tensor<128x3x3x64xbf16>
     %attention_value_grouped = stablehlo.broadcast_in_dim %attention_value_heads, dims = [0, 1, 3] :
-        (tensor<128x3x64xf16>) -> tensor<128x3x3x64xf16>
+        (tensor<128x3x64xbf16>) -> tensor<128x3x3x64xbf16>
     %attention_key_rope = stablehlo.reshape %attention_key_grouped :
-        (tensor<128x3x3x64xf16>) -> tensor<128x9x64xf16>
+        (tensor<128x3x3x64xbf16>) -> tensor<128x9x64xbf16>
     %attention_value_gqa = stablehlo.reshape %attention_value_grouped :
-        (tensor<128x3x3x64xf16>) -> tensor<128x9x64xf16>
+        (tensor<128x3x3x64xbf16>) -> tensor<128x9x64xbf16>
 
     %attention_query_bhsd = stablehlo.transpose %attention_query_rope, dims = [1, 0, 2] :
-        (tensor<128x9x64xf16>) -> tensor<9x128x64xf16>
+        (tensor<128x9x64xbf16>) -> tensor<9x128x64xbf16>
     %attention_key_bhsd = stablehlo.transpose %attention_key_rope, dims = [1, 0, 2] :
-        (tensor<128x9x64xf16>) -> tensor<9x128x64xf16>
+        (tensor<128x9x64xbf16>) -> tensor<9x128x64xbf16>
     %attention_value_bhsd = stablehlo.transpose %attention_value_gqa, dims = [1, 0, 2] :
-        (tensor<128x9x64xf16>) -> tensor<9x128x64xf16>
+        (tensor<128x9x64xbf16>) -> tensor<9x128x64xbf16>
 
     %attention_scores = stablehlo.dot_general %attention_query_bhsd, %attention_key_bhsd,
         batching_dims = [0] x [0], contracting_dims = [2] x [2],
         precision = [] :
-        (tensor<9x128x64xf16>, tensor<9x128x64xf16>) -> tensor<9x128x128xf16>
-    %attention_scale = stablehlo.constant dense<1.250000e-01> : tensor<f16>
+        (tensor<9x128x64xbf16>, tensor<9x128x64xbf16>) -> tensor<9x128x128xbf16>
+    %attention_scale = stablehlo.constant dense<1.250000e-01> : tensor<bf16>
     %attention_scale_broadcast = stablehlo.broadcast_in_dim %attention_scale, dims = [] :
-        (tensor<f16>) -> tensor<9x128x128xf16>
+        (tensor<bf16>) -> tensor<9x128x128xbf16>
     %attention_scaled_scores = stablehlo.multiply %attention_scores, %attention_scale_broadcast :
-        tensor<9x128x128xf16>
+        tensor<9x128x128xbf16>
 
     %attention_query_index = stablehlo.iota dim = 1 : tensor<9x128x128xi32>
     %attention_key_index = stablehlo.iota dim = 2 : tensor<9x128x128xi32>
     %attention_causal = stablehlo.compare GE, %attention_query_index, %attention_key_index, SIGNED :
         (tensor<9x128x128xi32>, tensor<9x128x128xi32>) -> tensor<9x128x128xi1>
-    %attention_negative = stablehlo.constant dense<0xFC00> : tensor<f16>
+    %attention_negative = stablehlo.constant dense<0xFF80> : tensor<bf16>
     %attention_negative_broadcast = stablehlo.broadcast_in_dim %attention_negative, dims = [] :
-        (tensor<f16>) -> tensor<9x128x128xf16>
+        (tensor<bf16>) -> tensor<9x128x128xbf16>
     %attention_masked_scores = stablehlo.select %attention_causal, %attention_scaled_scores, %attention_negative_broadcast :
-        tensor<9x128x128xi1>, tensor<9x128x128xf16>
+        tensor<9x128x128xi1>, tensor<9x128x128xbf16>
 
-    %attention_negative_init = stablehlo.constant dense<0xFC00> : tensor<f16>
+    %attention_negative_init = stablehlo.constant dense<0xFF80> : tensor<bf16>
     %attention_row_max = "stablehlo.reduce"(%attention_masked_scores, %attention_negative_init) ({
-      ^bb0(%attention_lhs: tensor<f16>, %attention_rhs: tensor<f16>):
-        %attention_max = stablehlo.maximum %attention_lhs, %attention_rhs : tensor<f16>
-        stablehlo.return %attention_max : tensor<f16>
+      ^bb0(%attention_lhs: tensor<bf16>, %attention_rhs: tensor<bf16>):
+        %attention_max = stablehlo.maximum %attention_lhs, %attention_rhs : tensor<bf16>
+        stablehlo.return %attention_max : tensor<bf16>
     }) {dimensions = array<i64: 2>} :
-        (tensor<9x128x128xf16>, tensor<f16>) -> tensor<9x128xf16>
+        (tensor<9x128x128xbf16>, tensor<bf16>) -> tensor<9x128xbf16>
     %attention_row_max_broadcast = stablehlo.broadcast_in_dim %attention_row_max, dims = [0, 1] :
-        (tensor<9x128xf16>) -> tensor<9x128x128xf16>
+        (tensor<9x128xbf16>) -> tensor<9x128x128xbf16>
     %attention_centered = stablehlo.subtract %attention_masked_scores, %attention_row_max_broadcast :
-        tensor<9x128x128xf16>
-    %attention_exp = stablehlo.exponential %attention_centered : tensor<9x128x128xf16>
-    %attention_zero = stablehlo.constant dense<0.000000e+00> : tensor<f16>
+        tensor<9x128x128xbf16>
+    %attention_exp = stablehlo.exponential %attention_centered : tensor<9x128x128xbf16>
+    %attention_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
     %attention_row_sum = "stablehlo.reduce"(%attention_exp, %attention_zero) ({
-      ^bb0(%attention_lhs: tensor<f16>, %attention_rhs: tensor<f16>):
-        %attention_sum = stablehlo.add %attention_lhs, %attention_rhs : tensor<f16>
-        stablehlo.return %attention_sum : tensor<f16>
+      ^bb0(%attention_lhs: tensor<bf16>, %attention_rhs: tensor<bf16>):
+        %attention_sum = stablehlo.add %attention_lhs, %attention_rhs : tensor<bf16>
+        stablehlo.return %attention_sum : tensor<bf16>
     }) {dimensions = array<i64: 2>} :
-        (tensor<9x128x128xf16>, tensor<f16>) -> tensor<9x128xf16>
+        (tensor<9x128x128xbf16>, tensor<bf16>) -> tensor<9x128xbf16>
     %attention_row_sum_broadcast = stablehlo.broadcast_in_dim %attention_row_sum, dims = [0, 1] :
-        (tensor<9x128xf16>) -> tensor<9x128x128xf16>
+        (tensor<9x128xbf16>) -> tensor<9x128x128xbf16>
     %attention_probability = stablehlo.divide %attention_exp, %attention_row_sum_broadcast :
-        tensor<9x128x128xf16>
+        tensor<9x128x128xbf16>
 
     %attention_context_bhsd = stablehlo.dot_general %attention_probability, %attention_value_bhsd,
         batching_dims = [0] x [0], contracting_dims = [2] x [1],
         precision = [] :
-        (tensor<9x128x128xf16>, tensor<9x128x64xf16>) -> tensor<9x128x64xf16>
+        (tensor<9x128x128xbf16>, tensor<9x128x64xbf16>) -> tensor<9x128x64xbf16>
     %attention_context_shd = stablehlo.transpose %attention_context_bhsd, dims = [1, 0, 2] :
-        (tensor<9x128x64xf16>) -> tensor<128x9x64xf16>
+        (tensor<9x128x64xbf16>) -> tensor<128x9x64xbf16>
     %attention_context = stablehlo.reshape %attention_context_shd :
-        (tensor<128x9x64xf16>) -> tensor<128x576xf16>
-    %attention_result = stablehlo.dot_general %attention_context, %attention_output_weight_f16,
+        (tensor<128x9x64xbf16>) -> tensor<128x576xbf16>
+    %attention_result = stablehlo.dot_general %attention_context, %attention_output_weight_bf16,
         contracting_dims = [1] x [0], precision = [] :
-        (tensor<128x576xf16>, tensor<576x576xf16>) -> tensor<128x576xf16>
+        (tensor<128x576xbf16>, tensor<576x576xbf16>) -> tensor<128x576xbf16>
     %residual1 = stablehlo.add %x, %attention_result :
-        tensor<128x576xf16>
+        tensor<128x576xbf16>
 
     %rms2_x_f32 = stablehlo.convert %residual1 :
-        (tensor<128x576xf16>) -> tensor<128x576xf32>
+        (tensor<128x576xbf16>) -> tensor<128x576xf32>
     %rms2_weight_f32 = stablehlo.convert %post_attention_norm_weight :
-        (tensor<576xf16>) -> tensor<576xf32>
+        (tensor<576xbf16>) -> tensor<576xf32>
     %rms2_square = stablehlo.multiply %rms2_x_f32, %rms2_x_f32 :
         tensor<128x576xf32>
     %rms2_zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
@@ -288,9 +288,9 @@ module {
     %rms2_scaled = stablehlo.multiply %rms2_normalized, %rms2_weight_broadcast :
         tensor<128x576xf32>
     %rms2_result = stablehlo.convert %rms2_scaled :
-        (tensor<128x576xf32>) -> tensor<128x576xf16>
+        (tensor<128x576xf32>) -> tensor<128x576xbf16>
 
-    %ffn_x_f = stablehlo.convert %rms2_result : (tensor<128x576xf16>) -> tensor<128x576xf32>
+    %ffn_x_f = stablehlo.convert %rms2_result : (tensor<128x576xbf16>) -> tensor<128x576xf32>
     %ffn_gate_w_f = stablehlo.convert %gate_weight : (tensor<576x1536xi8>) -> tensor<576x1536xf32>
     %ffn_up_w_f = stablehlo.convert %up_weight : (tensor<576x1536xi8>) -> tensor<576x1536xf32>
     %ffn_down_w_f = stablehlo.convert %down_weight : (tensor<1536x576xi8>) -> tensor<1536x576xf32>
@@ -306,9 +306,9 @@ module {
     %ffn_down = stablehlo.dot_general %ffn_hidden, %ffn_down_w_f,
       contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT]
       : (tensor<128x1536xf32>, tensor<1536x576xf32>) -> tensor<128x576xf32>
-    %ffn_result = stablehlo.convert %ffn_down : (tensor<128x576xf32>) -> tensor<128x576xf16>
+    %ffn_result = stablehlo.convert %ffn_down : (tensor<128x576xf32>) -> tensor<128x576xbf16>
     %result = stablehlo.add %residual1, %ffn_result :
-        tensor<128x576xf16>
-    return %result : tensor<128x576xf16>
+        tensor<128x576xbf16>
+    return %result : tensor<128x576xbf16>
   }
 }

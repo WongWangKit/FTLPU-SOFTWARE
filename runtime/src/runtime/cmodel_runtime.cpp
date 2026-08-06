@@ -1,5 +1,6 @@
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 
+#include "ftlpu/core/bf16.hpp"
 #include "ftlpu/core/fp16.hpp"
 #include "ftlpu/system/tsp_slice_system.hpp"
 
@@ -44,8 +45,24 @@ void require_matrix_binding(const BinaryBinding& binding)
         throw std::logic_error("runtime currently requires a valid rank-2 physical binding");
 }
 
-std::uint16_t read_fp16_element(const TspSliceSystem& system,
-    const BinaryBinding& binding, std::size_t row, std::size_t column)
+bool is_16bit_float(BindingElementType type)
+{
+    return type == BindingElementType::F16
+        || type == BindingElementType::BF16;
+}
+
+std::uint16_t encode_16bit_float(float value, BindingElementType type)
+{
+    if (type == BindingElementType::BF16)
+        return Bf16::from_float(value).bits();
+    if (type == BindingElementType::F16)
+        return Fp16::from_float(value).bits();
+    throw std::logic_error("binding is not a supported 16-bit float");
+}
+
+std::uint16_t read_16bit_element(const TspSliceSystem& system,
+    const BinaryBinding& binding, std::size_t row, std::size_t column,
+    std::size_t mxms_per_hemisphere)
 {
     const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
     const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
@@ -74,7 +91,9 @@ std::uint16_t read_fp16_element(const TspSliceSystem& system,
                    Hemisphere::East, binding.slices[1], address, column % 32))
                 << 8);
     }
-    if (binding.layout == BindingLayout::Fp16MxmDistributed16
+    if ((binding.layout == BindingLayout::Fp16MxmDistributed16
+            || binding.layout
+                == BindingLayout::Fp16MxmBlock8Distributed16)
         && binding.slices.size() == 16) {
         const std::size_t hidden_blocks = columns / 32;
         const std::size_t token_block = row / 32;
@@ -85,19 +104,26 @@ std::uint16_t read_fp16_element(const TspSliceSystem& system,
         const std::size_t feature_lane = column % 8;
         const std::size_t address = static_cast<std::size_t>(binding.base_row)
             + (token_block * hidden_blocks + hidden_block) * 4 + token_wave;
+        const auto hemisphere = binding.layout
+                == BindingLayout::Fp16MxmBlock8Distributed16
+            ? static_cast<Hemisphere>(
+                (hidden_block
+                    % (hw::kHemispheres * mxms_per_hemisphere))
+                / mxms_per_hemisphere)
+            : Hemisphere::East;
         return static_cast<std::uint16_t>(read_sram_byte(system,
-                   Hemisphere::East, binding.slices[2 * token_lane], address,
+                   hemisphere, binding.slices[2 * token_lane], address,
                    feature_wave * 8 + feature_lane))
             | (static_cast<std::uint16_t>(read_sram_byte(system,
-                   Hemisphere::East, binding.slices[2 * token_lane + 1],
+                   hemisphere, binding.slices[2 * token_lane + 1],
                    address, feature_wave * 8 + feature_lane))
                 << 8);
     }
     throw std::logic_error(
-        "device copy does not support the source FP16 layout");
+        "device copy does not support the source 16-bit float layout");
 }
 
-void write_fp16_element(TspSliceSystem& system,
+void write_16bit_element(TspSliceSystem& system,
     const BinaryBinding& binding, std::size_t row, std::size_t column,
     std::uint16_t value)
 {
@@ -126,7 +152,7 @@ void write_fp16_element(TspSliceSystem& system,
         return;
     }
     throw std::logic_error(
-        "device copy does not support the destination FP16 layout");
+        "device copy does not support the destination 16-bit float layout");
 }
 
 } // namespace
@@ -140,19 +166,23 @@ void CModelRuntime::load(const BinaryProgram& program)
 {
     const bool cmodelLargeSram =
         program.target_name == "lpu32-cmodel-large-sram";
-    if (program.target_abi != kLpu32StreamTargetAbi
+    const std::uint64_t compatibleAbi =
+        lpu_32stream_target_abi(program.mxms_per_hemisphere);
+    if (program.target_abi != compatibleAbi
         && !cmodelLargeSram) {
         std::ostringstream message;
         message << "CModel target ABI mismatch: binary target '"
                 << program.target_name << "' has 0x" << std::hex
                 << program.target_abi << ", runtime requires '"
                 << kLpu32StreamTargetName << "' ABI 0x"
-                << kLpu32StreamTargetAbi;
+                << compatibleAbi;
         throw std::invalid_argument(message.str());
     }
     system_.reset_execution_state();
-    load_queue_programs_into_icu(program.queues, system_.icu());
+    load_queue_programs_into_icu(program.queues, system_.icu(),
+        program.mxms_per_hemisphere);
     loaded_max_cycle_ = program.max_cycle;
+    loaded_mxms_per_hemisphere_ = program.mxms_per_hemisphere;
     bindings_ = program.bindings;
     for (const BinaryBinding& binding : bindings_) {
         if (binding.access != BindingAccess::Internal) continue;
@@ -202,7 +232,7 @@ void CModelRuntime::load(const BinaryProgram& program)
         }
         if (binding.initializer == BindingInitializer::RopeTable) {
             if (binding.layout != BindingLayout::Fp16RopeTable
-                || binding.element_type != BindingElementType::F16
+                || !is_16bit_float(binding.element_type)
                 || binding.shape.size() != 3 || binding.shape[2] != 2
                 || binding.slices.size() != 4 || binding.base_row < 0
                 || binding.address_stride == 0
@@ -227,10 +257,10 @@ void CModelRuntime::load(const BinaryProgram& program)
                         static_cast<float>(2 * dimension)
                             / binding.rope_head_dim);
                     const float angle = static_cast<float>(token) * inverse;
-                    const auto cosine =
-                        Fp16::from_float(std::cos(angle)).bits();
-                    const auto sine =
-                        Fp16::from_float(std::sin(angle)).bits();
+                    const auto cosine = encode_16bit_float(
+                        std::cos(angle), binding.element_type);
+                    const auto sine = encode_16bit_float(
+                        std::sin(angle), binding.element_type);
                     for_each_binding_hemisphere(binding,
                         [&](Hemisphere hemisphere) {
                             write_sram_byte(system_, hemisphere,
@@ -264,19 +294,26 @@ const BinaryBinding& CModelRuntime::find_binding(BindingAccess access, std::size
 
 void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t> data)
 {
-    const auto& binding = find_binding(BindingAccess::Input, index);
-    if ((binding.shape.size() != 1 && binding.shape.size() != 2)
+    upload_binding(find_binding(BindingAccess::Input, index), data);
+}
+
+void CModelRuntime::upload_binding(
+    const BinaryBinding& binding, std::span<const std::uint8_t> data)
+{
+    if ((binding.shape.empty() || binding.shape.size() > 3)
         || binding.base_row < 0 || binding.address_stride == 0
         || binding.slices.empty())
         throw std::logic_error(
-            "runtime requires a valid rank-1 or rank-2 physical input binding");
+            "runtime requires a valid rank-1 through rank-3 physical binding");
     if (data.size() != binding.byte_size)
         throw std::invalid_argument("input byte size or element type does not match binding");
     const bool vector = binding.shape.size() == 1;
     const std::size_t rows =
         vector ? 1 : static_cast<std::size_t>(binding.shape[0]);
-    const std::size_t columns = static_cast<std::size_t>(
+    std::size_t columns = static_cast<std::size_t>(
         vector ? binding.shape[0] : binding.shape[1]);
+    if (binding.shape.size() == 3)
+        columns *= static_cast<std::size_t>(binding.shape[2]);
     const std::size_t row_stride = static_cast<std::size_t>(std::abs(binding.address_stride));
 
     if (binding.layout == BindingLayout::Vector) {
@@ -312,7 +349,7 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
         return;
     }
     if (binding.layout == BindingLayout::Fp16MxmActivationPlanar
-        && binding.element_type == BindingElementType::F16
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 4) {
         for (std::size_t row = 0; row < rows; ++row) {
             for (std::size_t k = 0; k < columns; ++k) {
@@ -334,7 +371,7 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
         return;
     }
     if (binding.layout == BindingLayout::Fp16PairPlanar
-        && binding.element_type == BindingElementType::F16
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 2) {
         for (std::size_t row = 0; row < rows; ++row) {
             for (std::size_t column = 0; column < columns; ++column) {
@@ -353,12 +390,13 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
         return;
     }
     if (binding.layout == BindingLayout::Fp16SxmDistributed16
-        && binding.element_type == BindingElementType::F16
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 16) {
         if (vector) {
             if (columns % 32 != 0)
                 throw std::logic_error(
-                    "distributed16 FP16 vector requires 32-aligned length");
+                    "distributed16 16-bit float vector requires "
+                    "32-aligned length");
             for (std::size_t column = 0; column < columns; ++column) {
                 const std::size_t hiddenBlock = column / 32;
                 const std::size_t featureWave = (column % 32) / 8;
@@ -390,7 +428,8 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
         }
         if (rows % 32 != 0 || columns % 32 != 0)
             throw std::logic_error(
-                "distributed16 FP16 input requires 32-aligned dimensions");
+                "distributed16 16-bit float input requires "
+                "32-aligned dimensions");
         const std::size_t hidden_blocks = columns / 32;
         for (std::size_t row = 0; row < rows; ++row) {
             const std::size_t token_block = row / 32;
@@ -423,11 +462,12 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
         return;
     }
     if (binding.layout == BindingLayout::Fp16VxmDistributed16
-        && binding.element_type == BindingElementType::F16
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 16) {
         if (columns % 32 != 0 || (!vector && rows % 32 != 0))
             throw std::logic_error(
-                "VXM distributed16 FP16 input requires 32-aligned dimensions");
+                "VXM distributed16 16-bit float input requires "
+                "32-aligned dimensions");
         const std::size_t hidden_blocks = columns / 32;
         const std::size_t stored_rows = vector ? 32 : rows;
         for (std::size_t row = 0; row < stored_rows; ++row) {
@@ -457,12 +497,15 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
         }
         return;
     }
-    if (binding.layout == BindingLayout::Fp16MxmDistributed16
-        && binding.element_type == BindingElementType::F16
+    if ((binding.layout == BindingLayout::Fp16MxmDistributed16
+            || binding.layout
+                == BindingLayout::Fp16MxmBlock8Distributed16)
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 16) {
         if (rows % 32 != 0 || columns % 32 != 0)
             throw std::logic_error(
-                "MXM distributed16 FP16 input requires 32-aligned dimensions");
+                "MXM distributed16 16-bit float input requires "
+                "32-aligned dimensions");
         const std::size_t hidden_blocks = columns / 32;
         for (std::size_t row = 0; row < rows; ++row) {
             const std::size_t token_block = row / 32;
@@ -516,6 +559,41 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
         }
         return;
     }
+    if (binding.layout
+            == BindingLayout::W8A16Block8WeightWaveStriped
+        && binding.element_type == BindingElementType::I8
+        && binding.slices.size()
+            == hw::kMxmsPerHemisphere * 8) {
+        const std::size_t columnsPerHemisphere =
+            hw::kMxmsPerHemisphere * 32;
+        const std::size_t columnsPerWave =
+            hw::kHemispheres * columnsPerHemisphere;
+        if (rows % 32 != 0 || columns % columnsPerWave != 0)
+            throw std::logic_error(
+                "Block8 weight binding must align to the physical MXM wave");
+        const std::size_t reductionBlocks = rows / 32;
+        for (std::size_t k = 0; k < rows; ++k) {
+            for (std::size_t n = 0; n < columns; ++n) {
+                const std::size_t localColumn = n % 32;
+                const std::size_t pulse = 3 - localColumn / 8;
+                const std::size_t localMxm =
+                    (n % columnsPerHemisphere) / 32;
+                const std::size_t stream = localColumn % 8;
+                const auto hemisphere =
+                    static_cast<Hemisphere>(
+                        (n / columnsPerHemisphere) % hw::kHemispheres);
+                const std::size_t wave = n / columnsPerWave;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (wave * reductionBlocks + k / 32) * 4
+                    + pulse;
+                write_sram_byte(system_, hemisphere,
+                    binding.slices[localMxm * 8 + stream],
+                    address, k % 32, data[k * columns + n]);
+            }
+        }
+        return;
+    }
     if (binding.layout == BindingLayout::W8A16AttentionWeightStriped
         && binding.element_type == BindingElementType::I8
         && binding.slices.size() == 8) {
@@ -550,7 +628,7 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
     const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
     const std::size_t row_stride = static_cast<std::size_t>(std::abs(binding.address_stride));
     if (binding.layout == BindingLayout::Fp16MxmActivationPlanar
-        && binding.element_type == BindingElementType::F16
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 4) {
         std::vector<std::uint8_t> result(
             static_cast<std::size_t>(binding.byte_size));
@@ -581,7 +659,7 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
         return result;
     }
     if (binding.layout == BindingLayout::Fp16PairPlanar
-        && binding.element_type == BindingElementType::F16
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 4) {
         std::vector<std::uint8_t> result(static_cast<std::size_t>(binding.byte_size));
         for (std::size_t row = 0; row < rows; ++row) {
@@ -603,11 +681,12 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
         return result;
     }
     if (binding.layout == BindingLayout::Fp16SxmDistributed16
-        && binding.element_type == BindingElementType::F16
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 16) {
         if (rows % 32 != 0 || columns % 32 != 0)
             throw std::logic_error(
-                "distributed16 FP16 output requires 32-aligned dimensions");
+                "distributed16 16-bit float output requires "
+                "32-aligned dimensions");
         std::vector<std::uint8_t> result(
             static_cast<std::size_t>(binding.byte_size));
         const std::size_t hidden_blocks = columns / 32;
@@ -639,11 +718,12 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
         return result;
     }
     if (binding.layout == BindingLayout::Fp16VxmDistributed16
-        && binding.element_type == BindingElementType::F16
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 16) {
         if (rows % 32 != 0 || columns % 32 != 0)
             throw std::logic_error(
-                "VXM distributed16 FP16 output requires 32-aligned dimensions");
+                "VXM distributed16 16-bit float output requires "
+                "32-aligned dimensions");
         std::vector<std::uint8_t> result(
             static_cast<std::size_t>(binding.byte_size));
         const std::size_t hidden_blocks = columns / 32;
@@ -667,12 +747,15 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
         }
         return result;
     }
-    if (binding.layout == BindingLayout::Fp16MxmDistributed16
-        && binding.element_type == BindingElementType::F16
+    if ((binding.layout == BindingLayout::Fp16MxmDistributed16
+            || binding.layout
+                == BindingLayout::Fp16MxmBlock8Distributed16)
+        && is_16bit_float(binding.element_type)
         && binding.slices.size() == 16) {
         if (rows % 32 != 0 || columns % 32 != 0)
             throw std::logic_error(
-                "MXM distributed16 FP16 output requires 32-aligned dimensions");
+                "MXM distributed16 16-bit float output requires "
+                "32-aligned dimensions");
         std::vector<std::uint8_t> result(
             static_cast<std::size_t>(binding.byte_size));
         const std::size_t hidden_blocks = columns / 32;
@@ -689,10 +772,18 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
                     + (token_block * hidden_blocks + hidden_block) * 4
                     + token_wave;
                 const std::size_t offset = (row * columns + column) * 2;
-                result[offset] = read_sram_byte(system_, Hemisphere::East,
+                const auto hemisphere = binding.layout
+                        == BindingLayout::Fp16MxmBlock8Distributed16
+                    ? static_cast<Hemisphere>(
+                        (hidden_block
+                            % (hw::kHemispheres
+                                * loaded_mxms_per_hemisphere_))
+                        / loaded_mxms_per_hemisphere_)
+                    : Hemisphere::East;
+                result[offset] = read_sram_byte(system_, hemisphere,
                     binding.slices[2 * token_lane], address,
                     feature_wave * 8 + feature_lane);
-                result[offset + 1] = read_sram_byte(system_, Hemisphere::East,
+                result[offset + 1] = read_sram_byte(system_, hemisphere,
                     binding.slices[2 * token_lane + 1], address,
                     feature_wave * 8 + feature_lane);
             }
@@ -720,33 +811,30 @@ void CModelRuntime::copy_binding(
 {
     require_matrix_binding(source);
     require_matrix_binding(destination);
-    if (source.element_type != BindingElementType::F16
-        || destination.element_type != BindingElementType::F16
+    if (!is_16bit_float(source.element_type)
+        || source.element_type != destination.element_type
         || source.shape != destination.shape
         || source.byte_size != destination.byte_size)
         throw std::invalid_argument(
-            "device binding copy requires matching FP16 tensors");
+            "device binding copy requires matching 16-bit float tensors");
     if (source.layout == destination.layout
         && source.base_row == destination.base_row
         && source.slices == destination.slices
         && source.hemisphere_mask == destination.hemisphere_mask)
         return;
 
-    if ((source.hemisphere_mask & destination.hemisphere_mask) != 0) {
-        for (const std::uint16_t source_slice : source.slices)
-            if (std::find(destination.slices.begin(),
-                    destination.slices.end(), source_slice)
-                != destination.slices.end())
-                throw std::logic_error(
-                    "device binding copy requires non-overlapping storage");
-    }
-
     const std::size_t rows = static_cast<std::size_t>(source.shape[0]);
     const std::size_t columns = static_cast<std::size_t>(source.shape[1]);
+    std::vector<std::uint16_t> staging(rows * columns);
     for (std::size_t row = 0; row < rows; ++row)
         for (std::size_t column = 0; column < columns; ++column)
-            write_fp16_element(system_, destination, row, column,
-                read_fp16_element(system_, source, row, column));
+            staging[row * columns + column] =
+                read_16bit_element(system_, source, row, column,
+                    loaded_mxms_per_hemisphere_);
+    for (std::size_t row = 0; row < rows; ++row)
+        for (std::size_t column = 0; column < columns; ++column)
+            write_16bit_element(system_, destination, row, column,
+                staging[row * columns + column]);
 }
 
 void CModelRuntime::load_file(const std::filesystem::path& path)

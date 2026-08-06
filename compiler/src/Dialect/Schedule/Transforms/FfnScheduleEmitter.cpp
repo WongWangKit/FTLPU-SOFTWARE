@@ -3,6 +3,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/ffn_schedule_emitter.hpp"
 
 #include "FfnStageEmitter.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 
 namespace {
 
@@ -30,6 +31,10 @@ void emitAccumulatorClearPrelude(
     const int64_t unitCount =
         context.target.memory().hemispheres
         * throughput.mxms_per_hemisphere;
+    const auto inputType = llvm::cast<mlir::RankedTensorType>(
+        context.ffn.getActivation().getType());
+    const llvm::StringRef dataFormat =
+        ftlpu::compiler::lpu_16bit_data_format(inputType.getElementType());
     for (int64_t unit = 0; unit < unitCount; ++unit) {
         const int64_t outputStream =
             (unit % throughput.mxms_per_hemisphere)
@@ -66,6 +71,8 @@ void emitAccumulatorClearPrelude(
                     rewriter.getStringAttr("sram")),
                 rewriter.getNamedAttr("accumulator_clear",
                     rewriter.getBoolAttr(true)),
+                rewriter.getNamedAttr("data_format",
+                    rewriter.getStringAttr(dataFormat)),
             });
             rewriter.create(state);
         }
@@ -84,6 +91,15 @@ mlir::FailureOr<mlir::Value> schedule::lowerFfnSchedule(
     auto context = schedule::ffn_detail::createFfnEmissionContext(
         rewriter, plan, strategy, target);
     if (mlir::failed(context)) return mlir::failure();
+
+    if ((*context)->block8_projection) {
+        auto swish =
+            schedule::ffn_detail::emitFfnBlock8ProjectionAndSwish(
+                **context);
+        if (mlir::failed(swish)) return mlir::failure();
+        return schedule::ffn_detail::emitFfnDownProjection(
+            **context, *swish);
+    }
 
     const int64_t accumulatorRows =
         (*context)->down_accumulator_base + (*context)->m();

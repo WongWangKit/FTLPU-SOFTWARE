@@ -1,23 +1,25 @@
 #include "FfnEmitterUtils.hpp"
 
+#include "ftlpu/compiler/Support/float_format.hpp"
+
 namespace ftlpu::compiler::schedule::ffn_detail {
 
 std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
     mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Type resultType, mlir::Value gateValue, mlir::Value upValue,
     const target::LPUTargetModel& target, FfnScheduleStrategy strategy,
-    int64_t cycle, int64_t hemisphere)
+    int64_t cycle, int64_t hemisphere, int64_t outputStream)
 {
     const auto& throughput = target.throughput();
     const int64_t inputStream = strategy == FfnScheduleStrategy::Fused
         ? 8 + hemisphere * 8
         : 0;
-    const int64_t outputStream = strategy == FfnScheduleStrategy::Fused
-        ? target.streams().streams_per_direction - 2
-        : 0;
     const int64_t encodedInput =
         target.streams().streams_per_direction + inputStream;
     const auto hemi = hemisphere_name(hemisphere);
+    const auto dataFormat = lpu_16bit_data_format(
+        llvm::cast<mlir::RankedTensorType>(
+            resultType).getElementType());
     mlir::Value value;
 
     value = create_vxm(rewriter, location, gateValue, upValue,
@@ -52,11 +54,11 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
         "alu", 4, 0, "fp32", -1, 1, 1, hemi, hemi).getResult();
     auto localCast = create_vxm(rewriter, location, value, upValue,
         resultType, cycle + 5, 9, "cast", "alu", 8, 0,
-        "immediate", 0, 0, "fp16", outputStream, 1, 1, hemi, hemi);
+        "immediate", 0, 0, dataFormat, outputStream, 1, 1, hemi, hemi);
     const int64_t peer = 1 - hemisphere;
     auto peerCast = create_vxm(rewriter, location, value, upValue,
-        resultType, cycle + 5, 11, "cast", "alu", 8, 0,
-        "immediate", 0, 0, "fp16", outputStream, 1, 1, hemi,
+        resultType, cycle + 5, 10, "cast", "alu", 8, 0,
+        "immediate", 0, 0, dataFormat, outputStream, 1, 1, hemi,
         hemisphere_name(peer));
     return {localCast, peerCast};
 }
@@ -65,24 +67,67 @@ mlir::Value emitFfnSwishRow(mlir::IRRewriter& rewriter,
     PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,
     FfnScheduleStrategy strategy, llvm::ArrayRef<int64_t> hiddenSlices,
     mlir::Value gateValue, mlir::Value upValue, int64_t cycle,
-    int64_t mTile, int64_t pair, int64_t row, int64_t hemisphere)
+    int64_t mTile, int64_t pair, int64_t row, int64_t hemisphere,
+    int64_t outputStream)
 {
     const auto& memory = target.memory();
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t nblock = pair * memory.hemispheres + hemisphere;
-    const int64_t outputStream = strategy == FfnScheduleStrategy::Fused
-        ? target.streams().streams_per_direction - 2
-        : 0;
+    const int64_t hiddenBaseRow =
+        get_base_row(plan.getHidden0Placement());
+    const auto hiddenKind =
+        plan.getHidden0Placement().getAs<mlir::StringAttr>("kind");
+    const bool distributed16 = hiddenKind
+        && hiddenKind.getValue() == "fp16_mxm_distributed_16";
     auto [localCast, peerCast] = emitFfnSwishAlu(rewriter, plan.getLoc(),
         plan.getResult().getType(), gateValue, upValue, target, strategy,
-        cycle, hemisphere);
+        cycle, hemisphere, outputStream);
 
     mlir::Value lastHidden;
     for (int64_t destination = 0; destination < memory.hemispheres;
          ++destination) {
+        if (distributed16) {
+            const int64_t token = mTile * tile + row;
+            const int64_t tokenBlock = token / tile;
+            const int64_t tokenWithinBlock = token % tile;
+            const int64_t tokenWave =
+                tokenWithinBlock / target.throughput().mxm_block_rows;
+            const int64_t tokenLane =
+                tokenWithinBlock % target.throughput().mxm_block_rows;
+            const int64_t reductionBlocks = plan.getHidden() / tile;
+            const int64_t address = hiddenBaseRow
+                + (tokenBlock * reductionBlocks + nblock)
+                    * target.throughput().tile_rows
+                + tokenWave;
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const int64_t slice =
+                    hiddenSlices[2 * tokenLane + byte];
+                auto placement = schedule_placement(rewriter,
+                    {slice}, address, 1, 1,
+                    hemisphere_name(destination),
+                    "fp16_mxm_distributed_16");
+                mlir::Value output =
+                    destination == hemisphere
+                    ? localCast.getResult()
+                    : peerCast.getResult();
+                auto write = rewriter.create<MemWriteOp>(
+                    plan.getLoc(), output,
+                    cycle + 6
+                        + slice
+                            / target.streams()
+                                  .mem_slices_per_register_group,
+                    1, outputStream + byte, 1, 0,
+                    rewriter.getStringAttr("east"),
+                    plan.getHidden0Address(), placement, tile);
+                lastHidden = write.getOutput();
+            }
+            continue;
+        }
         for (int64_t byte = 0; byte < 2; ++byte) {
             auto placement = schedule_placement(rewriter,
-                {hiddenSlices[byte]}, nblock * plan.getM() + mTile * tile + row,
+                {hiddenSlices[byte]},
+                hiddenBaseRow
+                    + nblock * plan.getM() + mTile * tile + row,
                 1, 1, hemisphere_name(destination),
                 "fp16_mxm_activation_planar");
             mlir::Value output =

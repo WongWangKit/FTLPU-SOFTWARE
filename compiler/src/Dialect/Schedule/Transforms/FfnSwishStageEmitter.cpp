@@ -1,6 +1,7 @@
 #include "FfnStageEmitter.hpp"
 
 #include "FfnEmitterUtils.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
 
@@ -21,9 +22,16 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
         context.projection_timeline.pair_count;
     const int64_t weightLoadCycles =
         context.projection_timeline.weight_load_cycles;
+    const auto inputType = llvm::cast<mlir::RankedTensorType>(
+        ffn.getActivation().getType());
+    const llvm::StringRef dataFormat =
+        lpu_16bit_data_format(inputType.getElementType());
 
     FfnSwishEmission result;
     result.last_cycle = 0;
+    const int64_t outputStream = context.strategy == FfnScheduleStrategy::Fused
+        && context.fused_output
+        ? context.fused_output->stream_base : 0;
     const auto emitRow =
         [&](mlir::Value gateValue, mlir::Value upValue, int64_t cycle,
             int64_t mTile, int64_t pair, int64_t row,
@@ -32,7 +40,7 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
             result.hidden = emitFfnSwishRow(context.rewriter, ffn,
                 target, context.strategy, context.hidden_slices,
                 gateValue, upValue, cycle, mTile, pair, row,
-                hemisphere);
+                hemisphere, outputStream);
         };
 
     if (context.strategy == FfnScheduleStrategy::Tail) {
@@ -53,8 +61,9 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                                     && tile.hemisphere == hemisphere;
                             });
                         if (completed
-                            == emission.completed_tiles.end())
+                            == emission.completed_tiles.end()) {
                             return mlir::failure();
+                        }
                         const int64_t outputBlock =
                             pair * memory.hemispheres + hemisphere;
                         const int64_t address =
@@ -98,6 +107,10 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                                         "clear",
                                         context.rewriter
                                             .getBoolAttr(false)),
+                                    context.rewriter.getNamedAttr(
+                                        "data_format",
+                                        context.rewriter.getStringAttr(
+                                            dataFormat)),
                                 });
                                 return llvm::cast<
                                     MxmAccumulatorReadOp>(

@@ -1,6 +1,6 @@
 #include "ftlpu/software/runtime/model_session.hpp"
 
-#include "ftlpu/core/fp16.hpp"
+#include "ftlpu/core/bf16.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -11,9 +11,9 @@
 
 namespace {
 
-float readFp16(const std::vector<std::uint8_t>& data, std::size_t index)
+float readBf16(const std::vector<std::uint8_t>& data, std::size_t index)
 {
-    return ftlpu::Fp16::from_bits(
+    return ftlpu::Bf16::from_bits(
         static_cast<std::uint16_t>(data[2 * index])
         | (static_cast<std::uint16_t>(data[2 * index + 1]) << 8))
         .to_float();
@@ -32,7 +32,8 @@ try {
     session.load_file(std::filesystem::path(argv[1]));
     if (session.package().executables.size() != 1
         || session.package().executables[0]
-               .program.scale_relocations.empty())
+               .serialized_program.empty()
+        || session.package().executables[0].program.bindings.empty())
         throw std::logic_error(
             "two-layer package did not reuse a parameterized executable");
 
@@ -49,7 +50,8 @@ try {
     session.run();
 
     const ModelSessionStats& stats = session.stats();
-    if (stats.host_uploads != 19 || stats.host_downloads != 1
+    if (stats.resident_uploads != 18
+        || stats.host_uploads != 1 || stats.host_downloads != 1
         || stats.device_aliases != 1 || stats.device_copies != 0
         || stats.device_copy_bytes != 0)
         throw std::logic_error(
@@ -63,8 +65,16 @@ try {
     double meanError = 0.0;
     std::size_t maximumIndex = 0;
     for (std::size_t index = 0; index < actual.size() / 2; ++index) {
-        const float error = std::fabs(
-            readFp16(actual, index) - readFp16(expected, index));
+        const float actualValue = readBf16(actual, index);
+        const float expectedValue = readBf16(expected, index);
+        if (!std::isfinite(actualValue)
+            || !std::isfinite(expectedValue))
+            throw std::logic_error(
+                "HF two-layer output contains a non-finite value index="
+                + std::to_string(index)
+                + " actual=" + std::to_string(actualValue)
+                + " expected=" + std::to_string(expectedValue));
+        const float error = std::fabs(actualValue - expectedValue);
         meanError += error;
         if (error > maximumError) {
             maximumError = error;
@@ -72,7 +82,8 @@ try {
         }
     }
     meanError /= actual.size() / 2;
-    if (!std::isfinite(maximumError) || maximumError > 0.5f
+    if (!std::isfinite(maximumError) || !std::isfinite(meanError)
+        || maximumError > 0.5f
         || meanError > 0.05)
         throw std::logic_error(
             "HF two-layer golden mismatch max_error="
@@ -83,6 +94,7 @@ try {
     std::cout
         << "hf_two_decoder_layers_model_session_test passed max_error="
         << maximumError << " mean_error=" << meanError
+        << " resident_uploads=" << stats.resident_uploads
         << " host_uploads=" << stats.host_uploads
         << " host_downloads=" << stats.host_downloads
         << " device_aliases=" << stats.device_aliases

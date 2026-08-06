@@ -10,6 +10,7 @@ namespace ftlpu::software::runtime {
 
 enum class SessionTransferKind {
     HostUpload,
+    Resident,
     DeviceAlias,
     DeviceCopy,
 };
@@ -26,6 +27,7 @@ struct SessionInputPlan {
     SessionTransferKind transfer{SessionTransferKind::HostUpload};
     std::size_t producer{0};
     bool release_after_transfer{false};
+    BinaryBinding resolved_binding{};
 };
 
 struct SessionOutputPlan {
@@ -35,14 +37,31 @@ struct SessionOutputPlan {
     bool download_to_host{false};
 };
 
+struct SessionStatePlan {
+    std::uint32_t binding_index{0};
+    std::string state{};
+    BinaryBinding resolved_binding{};
+};
+
 struct SessionInvocationPlan {
     std::vector<SessionInputPlan> inputs{};
     std::vector<SessionOutputPlan> outputs{};
+    std::vector<SessionStatePlan> states{};
 };
 
 struct SessionMemoryPlan {
     std::vector<SessionValueLifetime> lifetimes{};
     std::vector<SessionInvocationPlan> invocations{};
+    struct ResidentTensor {
+        std::string value{};
+        BinaryBinding binding{};
+    };
+    std::vector<ResidentTensor> resident_tensors{};
+    struct PersistentState {
+        std::string state{};
+        BinaryBinding binding{};
+    };
+    std::vector<PersistentState> persistent_states{};
 };
 
 class SessionMemoryPlanner {

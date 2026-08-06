@@ -52,6 +52,7 @@ reference compiler framework and comparison tool for Flow, Stream, pass
 pipelines, and backend plugin structure.
 
 See [compiler/docs/compiler_architecture.md](compiler/docs/compiler_architecture.md),
+[runtime/docs/model_package.md](runtime/docs/model_package.md),
 [compiler/docs/iree_frontend_integration.md](compiler/docs/iree_frontend_integration.md), and
 [compiler/examples/iree_frontend/simple_stablehlo.mlir](compiler/examples/iree_frontend/simple_stablehlo.mlir).
 

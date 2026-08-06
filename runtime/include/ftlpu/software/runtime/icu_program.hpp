@@ -15,6 +15,7 @@ enum class QueueKind : std::uint16_t {
     Mem = 0,
     MxmLoad = 1,
     MxmCompute = 2,
+    MxmDequant = 3,
     Vxm = 4,
     SxmTranspose = 5,
     SxmPermute = 6,
@@ -26,6 +27,7 @@ enum class InstructionKind : std::uint16_t {
     Mxm = 2,
     Vxm = 3,
     Sxm = 4,
+    MxmDequant = 5,
 };
 
 struct QueueCommand {
@@ -48,6 +50,7 @@ class IcuProgram {
 public:
     void emit_mem(std::size_t cycle, std::size_t column, MemInstruction instruction);
     void emit_mxm_load(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction);
+    void emit_mxm_dequant(std::size_t cycle, std::size_t mxm, MxmDequantInstruction instruction);
     void emit_mxm_compute(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction);
     void emit_vxm(std::size_t cycle, std::size_t alu, VxmLaneAluInstruction instruction);
     void emit_sxm_transpose(std::size_t cycle, Hemisphere hemisphere, SxmInstruction instruction);
@@ -68,6 +71,8 @@ private:
 
     using MemQueue = std::vector<ScheduledInstruction<MemInstruction>>;
     using MxmQueue = std::vector<ScheduledInstruction<MxmControlInstruction>>;
+    using MxmDequantQueue =
+        std::vector<ScheduledInstruction<MxmDequantInstruction>>;
     using VxmQueue = std::vector<ScheduledInstruction<VxmLaneAluInstruction>>;
     using SxmQueue = std::vector<ScheduledInstruction<SxmInstruction>>;
 
@@ -90,6 +95,8 @@ private:
 
     std::array<MemQueue, InstructionControlUnit::kMemQueues> mem_{};
     std::array<MxmQueue, InstructionControlUnit::kMxmQueues> mxm_load_{};
+    std::array<MxmDequantQueue, InstructionControlUnit::kMxmQueues>
+        mxm_dequant_{};
     std::array<MxmQueue, InstructionControlUnit::kMxmQueues> mxm_compute_{};
     std::array<VxmQueue, InstructionControlUnit::kVxmQueues> vxm_{};
     std::array<SxmQueue, hw::kHemispheres> sxm_transpose_{};
@@ -98,6 +105,8 @@ private:
 };
 
 const char* queue_kind_name(QueueKind kind);
-void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, InstructionControlUnit& icu);
+void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
+    InstructionControlUnit& icu,
+    std::size_t logical_mxms_per_hemisphere = hw::kMxmsPerHemisphere);
 
 } // namespace ftlpu::software::runtime

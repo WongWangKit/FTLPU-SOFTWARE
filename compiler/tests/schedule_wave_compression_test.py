@@ -41,6 +41,17 @@ def main() -> None:
     ):
         if attribute not in text:
             raise RuntimeError(f"missing compressed attribute: {attribute}")
+    sxm_commands = [
+        line for line in text.splitlines()
+        if "ftlpu.command.sxm" in line
+    ]
+    if len(sxm_commands) != 1:
+        raise RuntimeError("expected one compressed SXM command")
+    if (
+        "repeat_count = 3" not in sxm_commands[0]
+        or "repeat_interval = 2" not in sxm_commands[0]
+    ):
+        raise RuntimeError("SXM command is missing repeat metadata")
 
 
 if __name__ == "__main__":

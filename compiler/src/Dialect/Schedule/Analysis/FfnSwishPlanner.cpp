@@ -44,9 +44,12 @@ mlir::FailureOr<std::vector<int64_t>> planFfnSwishCycles(
              request.temp_mem_windows[static_cast<std::size_t>(hemisphere)]) {
             if (busy.end <= busy.start) return mlir::failure();
             llvm::SmallVector<ResourceWindow, 8> windows;
-            for (int64_t slice : tempSlices)
-                windows.push_back({resourceModel.mem_slice(hemisphere, slice),
+            for (int64_t slice : tempSlices) {
+                windows.push_back({resourceModel.mem_read_port(hemisphere, slice),
                     0, busy.end - busy.start});
+                windows.push_back({resourceModel.mem_write_port(hemisphere, slice),
+                    0, busy.end - busy.start});
+            }
             resources.reserve_at(busy.start, windows);
         }
     }
@@ -64,13 +67,19 @@ mlir::FailureOr<std::vector<int64_t>> planFfnSwishCycles(
             windows.push_back(
                 {resource.resource, 0, request.tile_rows + 5});
         for (int64_t slice :
-             target.memory().w8a16_fused_gate_temp_slices)
-            windows.push_back({resourceModel.mem_slice(task.hemisphere, slice),
+             target.memory().w8a16_fused_gate_temp_slices) {
+            windows.push_back({resourceModel.mem_read_port(task.hemisphere, slice),
                 0, request.tile_rows});
+            windows.push_back({resourceModel.mem_write_port(task.hemisphere, slice),
+                0, request.tile_rows});
+        }
         for (int64_t slice :
-             target.memory().w8a16_fused_up_temp_slices)
-            windows.push_back({resourceModel.mem_slice(task.hemisphere, slice),
+             target.memory().w8a16_fused_up_temp_slices) {
+            windows.push_back({resourceModel.mem_read_port(task.hemisphere, slice),
                 0, request.tile_rows});
+            windows.push_back({resourceModel.mem_write_port(task.hemisphere, slice),
+                0, request.tile_rows});
+        }
         taskIds.push_back(plan.addTask(
             llvm::formatv("ffn.swish.{0}", index).str(),
             ScheduleTaskKind::VxmCompute, ScheduleStage::FfnSwish,

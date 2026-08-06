@@ -74,7 +74,7 @@ mlir::LogicalResult lowerMatmulSchedules(mlir::IRRewriter& rewriter,
                 const int64_t latency = *target.transport_latency(target::StreamEndpoint::Mem,
                     target::StreamEndpoint::MxmWeight, target::StreamDirection::East, slice);
                 weight_windows.push_back(
-                    {mem_resource(slice), weight_latency - latency, *weight_read_duration});
+                    {mem_read_resource(slice), weight_latency - latency, *weight_read_duration});
             }
             weight_windows.push_back({llvm::formatv("MXM.{0}.load", matmul.getUnitId()).str(),
                 load_offset, *weight_read_duration});
@@ -92,7 +92,7 @@ mlir::LogicalResult lowerMatmulSchedules(mlir::IRRewriter& rewriter,
 
             llvm::SmallVector<schedule::ResourceWindow> compute_windows;
             for (int64_t slice : activation_slices)
-                compute_windows.push_back({mem_resource(slice), 0, *activation_read_duration});
+                compute_windows.push_back({mem_read_resource(slice), 0, *activation_read_duration});
             compute_windows.push_back({llvm::formatv("MXM.{0}.compute", matmul.getUnitId()).str(),
                 activation_latency, compute_duration});
             compute_windows.push_back({llvm::formatv("MXM.{0}.weight_buffer.{1}",
@@ -102,7 +102,7 @@ mlir::LogicalResult lowerMatmulSchedules(mlir::IRRewriter& rewriter,
                 const int64_t latency = *target.transport_latency(target::StreamEndpoint::MxmResult,
                     target::StreamEndpoint::Mem, target::StreamDirection::West, slice);
                 compute_windows.push_back(
-                    {mem_resource(slice), result_offset + latency, *write_duration});
+                    {mem_write_resource(slice), result_offset + latency, *write_duration});
             }
             add_stream_windows(compute_windows, "east", activation_route.getStreamBase(),
                 activation_route.getStreamCount(), 0, activation_latency + compute_duration);

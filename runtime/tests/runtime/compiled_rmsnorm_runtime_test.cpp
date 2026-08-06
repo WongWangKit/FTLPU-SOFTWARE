@@ -1,7 +1,7 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 
-#include "ftlpu/core/fp16.hpp"
+#include "ftlpu/core/bf16.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,41 +19,41 @@ constexpr std::size_t kRows = 128;
 constexpr std::size_t kHidden = 576;
 constexpr float kEpsilon = 1.0e-5f;
 
-float toFp16(float value)
+float toBf16(float value)
 {
-    return ftlpu::Fp16::from_float(value).to_float();
+    return ftlpu::Bf16::from_float(value).to_float();
 }
 
 float inputValue(std::size_t row, std::size_t column)
 {
     const int value =
         static_cast<int>((row * 13 + column * 7) % 31) - 15;
-    return toFp16(static_cast<float>(value) / 32.0f);
+    return toBf16(static_cast<float>(value) / 32.0f);
 }
 
 float gammaValue(std::size_t column)
 {
-    return toFp16(0.75f
+    return toBf16(0.75f
         + static_cast<float>(column % 9) / 32.0f);
 }
 
-void appendFp16(std::vector<std::uint8_t>& bytes, float value)
+void appendBf16(std::vector<std::uint8_t>& bytes, float value)
 {
-    const std::uint16_t bits = ftlpu::Fp16::from_float(value).bits();
+    const std::uint16_t bits = ftlpu::Bf16::from_float(value).bits();
     bytes.push_back(static_cast<std::uint8_t>(bits));
     bytes.push_back(static_cast<std::uint8_t>(bits >> 8));
 }
 
-float readFp16(const std::vector<std::uint8_t>& bytes, std::size_t index)
+float readBf16(const std::vector<std::uint8_t>& bytes, std::size_t index)
 {
     const std::size_t offset = index * 2;
-    return ftlpu::Fp16::from_bits(
+    return ftlpu::Bf16::from_bits(
         static_cast<std::uint16_t>(bytes[offset])
         | (static_cast<std::uint16_t>(bytes[offset + 1]) << 8))
         .to_float();
 }
 
-float readMemFp16(const ftlpu::TspSliceSystem& system,
+float readMemBf16(const ftlpu::TspSliceSystem& system,
     ftlpu::Hemisphere hemisphere, std::size_t lowSlice,
     std::size_t highSlice, std::size_t address, std::size_t lane)
 {
@@ -63,7 +63,7 @@ float readMemFp16(const ftlpu::TspSliceSystem& system,
         hemisphere, lowSlice, tile, address, localLane);
     const auto high = system.read_mem_sram_lane_byte(
         hemisphere, highSlice, tile, address, localLane);
-    return ftlpu::Fp16::from_bits(
+    return ftlpu::Bf16::from_bits(
         static_cast<std::uint16_t>(low)
         | (static_cast<std::uint16_t>(high) << 8))
         .to_float();
@@ -89,12 +89,12 @@ try {
     input.reserve(kRows * kHidden * 2);
     for (std::size_t row = 0; row < kRows; ++row)
         for (std::size_t column = 0; column < kHidden; ++column)
-            appendFp16(input, inputValue(row, column));
+            appendBf16(input, inputValue(row, column));
 
     std::vector<std::uint8_t> gamma;
     gamma.reserve(kHidden * 2);
     for (std::size_t column = 0; column < kHidden; ++column)
-        appendFp16(gamma, gammaValue(column));
+        appendBf16(gamma, gammaValue(column));
 
     auto system = std::make_unique<ftlpu::TspSliceSystem>();
     ftlpu::software::runtime::CModelRuntime runtime(*system);
@@ -113,21 +113,21 @@ try {
             const float value = inputValue(row, column);
             meanSquare += feedback
                 ? value * value / static_cast<float>(kHidden)
-                : toFp16(value * value)
-                    * toFp16(1.0f / kHidden);
+                : toBf16(value * value)
+                    * toBf16(1.0f / kHidden);
         }
         const float factor = feedback
             ? 1.0f / std::sqrt(meanSquare + kEpsilon)
-            : toFp16(1.0f / std::sqrt(meanSquare + kEpsilon));
+            : toBf16(1.0f / std::sqrt(meanSquare + kEpsilon));
         const float physicalFactor = feedback
             ? 0.0f
-            : readMemFp16(*system, ftlpu::Hemisphere::East,
+            : readMemBf16(*system, ftlpu::Hemisphere::East,
                 22, 23, row, 0);
         for (std::size_t column = 0; column < kHidden; ++column) {
-            const float expected = toFp16(
+            const float expected = toBf16(
                 inputValue(row, column) * factor * gammaValue(column));
             const float actual =
-                readFp16(output, row * kHidden + column);
+                readBf16(output, row * kHidden + column);
             const float error = std::fabs(actual - expected);
             maxError = std::max(maxError, error);
             if (std::fabs(actual) > 1.0e-5f) ++nonzero;
@@ -143,13 +143,13 @@ try {
                 std::string feedbackInputFirstMismatch;
                 std::string reverseMatches;
                 for (std::size_t index = 0; index < kHidden; ++index) {
-                    const float feedbackInput = readMemFp16(*system,
+                    const float feedbackInput = readMemBf16(*system,
                         ftlpu::Hemisphere::East, 36, 37,
                         (row / 32) * kHidden + index, row % 32);
-                    const float feedbackWeight = readMemFp16(*system,
+                    const float feedbackWeight = readMemBf16(*system,
                         ftlpu::Hemisphere::East, 10, 11,
                         index, row % 32);
-                    const float feedbackOutput = readMemFp16(*system,
+                    const float feedbackOutput = readMemBf16(*system,
                         ftlpu::Hemisphere::East, 22, 23,
                         (row / 32) * kHidden + index, row % 32);
                     feedbackMean += inputValue(row, index)
@@ -167,7 +167,7 @@ try {
                     } else if (feedbackZeroIndices.size() < 80) {
                         feedbackZeroIndices += std::to_string(index) + ",";
                     }
-                    const float feedbackExpected = toFp16(
+                    const float feedbackExpected = toBf16(
                         inputValue(row, index) * factor
                         * gammaValue(index));
                     feedbackMaxError = std::max(feedbackMaxError,
@@ -192,7 +192,7 @@ try {
                     for (std::size_t index = 0;
                          index < kHidden && reverseMatches.size() < 120;
                          ++index) {
-                        const float candidate = readMemFp16(*system,
+                        const float candidate = readMemBf16(*system,
                             ftlpu::Hemisphere::East, 22, 23,
                             index, feedbackLane);
                         if (std::fabs(candidate - actual) < 1.0e-4f)

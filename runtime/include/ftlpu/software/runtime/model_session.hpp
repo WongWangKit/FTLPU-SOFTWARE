@@ -14,11 +14,16 @@
 namespace ftlpu::software::runtime {
 
 struct ModelSessionStats {
+    std::size_t resident_uploads{0};
+    std::size_t resident_upload_bytes{0};
+    std::size_t state_initializations{0};
+    std::size_t state_initialization_bytes{0};
     std::size_t host_uploads{0};
     std::size_t host_downloads{0};
     std::size_t device_aliases{0};
     std::size_t device_copies{0};
     std::size_t device_copy_bytes{0};
+    std::size_t host_operations{0};
 };
 
 class ModelSession {
@@ -44,6 +49,8 @@ private:
 
     const std::vector<std::uint8_t>& resolve_value(const std::string& name) const;
     const ModelValue* find_value_metadata(const std::string& name) const;
+    void run_embedding_lookups();
+    void run_host_lm_heads();
 
     CModelRuntime runtime_;
     ModelPackage package_{};

@@ -1,8 +1,11 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_schedule_builders.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_block8_projection_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_projection_timeline.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_swish_planner.hpp"
 
+#include <algorithm>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -17,6 +20,43 @@ int main()
 {
     using namespace ftlpu::compiler;
     target::LPUTargetModel target;
+    const auto distributedActivationSlices =
+        target.mxm_distributed_activation_slices();
+    for (int64_t tempSlice :
+        target.memory().w8a16_fused_gate_temp_slices) {
+        require(std::find(distributedActivationSlices.begin(),
+                    distributedActivationSlices.end(), tempSlice)
+                == distributedActivationSlices.end(),
+            "gate temporary slice overlaps distributed activation");
+    }
+    for (int64_t tempSlice :
+        target.memory().w8a16_fused_up_temp_slices) {
+        require(std::find(distributedActivationSlices.begin(),
+                    distributedActivationSlices.end(), tempSlice)
+                == distributedActivationSlices.end(),
+            "up temporary slice overlaps distributed activation");
+    }
+    const auto derivedHiddenSlices = target.ffn_hidden_slices();
+    require(derivedHiddenSlices.size()
+            == static_cast<std::size_t>(
+                target.throughput().mxm_activation_streams),
+        "target did not allocate the complete fused hidden layout");
+    for (int64_t hiddenSlice : derivedHiddenSlices) {
+        require(std::find(distributedActivationSlices.begin(),
+                    distributedActivationSlices.end(), hiddenSlice)
+                == distributedActivationSlices.end(),
+            "fused hidden slice overlaps distributed activation");
+    }
+    auto conflictingMemory = target.memory();
+    conflictingMemory.w8a16_fused_gate_temp_slices[0] =
+        distributedActivationSlices.front();
+    target::LPUTargetModel conflictingTarget(
+        conflictingMemory, target.streams(), target.throughput());
+    std::string validationError;
+    require(mlir::failed(conflictingTarget.validate(&validationError))
+            && validationError.find("overlap") != std::string::npos,
+        "target validation accepted a fused temporary activation hazard");
+
     auto plan = schedule::buildFfnTaskPlan({128, 576, 1536, 576}, target);
     require(plan.tasks.size() == 4, "FFN plan must contain four stages");
     require(mlir::succeeded(plan.tasks.validate()), "FFN task DAG is invalid");
@@ -30,6 +70,62 @@ int main()
     require(mlir::succeeded(plan.tasks.schedule(resources)),
         "FFN task DAG failed to schedule");
 
+    auto block8Projection = schedule::planFfnBlock8ProjectionSchedule(
+        4, 4, 0,
+        target.ffn_projection_weight_slices(
+            target::FfnProjectionKind::Gate),
+        target.ffn_projection_weight_slices(
+            target::FfnProjectionKind::Up),
+        target.ffn_block8_input_slices(), target);
+    require(mlir::succeeded(block8Projection),
+        "Block8 projection planner failed");
+    require(block8Projection->reductions.size() == 4
+            && block8Projection->end_cycle == 68,
+        "Block8 projection planner has the wrong extent");
+    const int64_t expectedLoadCycles[] = {0, 4, 32, 36};
+    const int64_t expectedComputeCycles[][4] = {
+        {4, 12, 20, 28},
+        {8, 16, 24, 32},
+        {36, 44, 52, 60},
+        {40, 48, 56, 64},
+    };
+    for (int64_t reduction = 0; reduction < 4; ++reduction) {
+        const auto& scheduled = block8Projection->reductions[reduction];
+        require(scheduled.reduction == reduction
+                && scheduled.weight_buffer == reduction % 2
+                && scheduled.load_cycle == expectedLoadCycles[reduction],
+            "Block8 projection load/buffer plan is incorrect");
+        require(std::equal(scheduled.compute_cycles.begin(),
+                    scheduled.compute_cycles.end(),
+                    expectedComputeCycles[reduction]),
+            "Block8 projection compute interleave is incorrect");
+    }
+    const auto gateWeightSlices = target.ffn_projection_weight_slices(
+        target::FfnProjectionKind::Gate);
+    const auto upWeightSlices = target.ffn_projection_weight_slices(
+        target::FfnProjectionKind::Up);
+    const auto block8InputSlices = target.ffn_block8_input_slices();
+    for (int64_t slice : gateWeightSlices) {
+        require(std::find(upWeightSlices.begin(), upWeightSlices.end(), slice)
+                    == upWeightSlices.end()
+                && std::find(block8InputSlices.begin(),
+                       block8InputSlices.end(), slice)
+                    == block8InputSlices.end(),
+            "Gate weight slice is not independent");
+    }
+    for (int64_t slice : upWeightSlices)
+        require(std::find(block8InputSlices.begin(),
+                    block8InputSlices.end(), slice)
+                == block8InputSlices.end(),
+            "Up weight slice overlaps Block8 activation");
+
+    require(block8Projection->reductions[0].activation_stream_bases[0] == 16
+            && block8Projection->reductions[1]
+                    .activation_stream_bases[3] == 16
+            && block8Projection->reductions[2]
+                    .activation_stream_bases[0] == 16,
+        "Block8 projection did not move overlapping activation traffic");
+
     schedule::FfnSwishScheduleRequest swish;
     swish.tasks = {{10, 0}, {10, 1}};
     swish.dequant_windows = {{0, 8}};
@@ -42,7 +138,8 @@ int main()
     const auto& memory = target.memory();
     llvm::SmallVector<int64_t> weightSlices;
     for (int64_t index = 0; index < memory.w8a16_weight_slice_count; ++index)
-        weightSlices.push_back(index * memory.w8a16_weight_slice_stride);
+        weightSlices.push_back(memory.w8a16_weight_slice_base
+            + index * memory.w8a16_weight_slice_stride);
     auto projection = schedule::planFfnProjectionTimeline(
         {128, 576, 1536, 576}, weightSlices, target);
     require(mlir::succeeded(projection), "FFN projection timeline failed");

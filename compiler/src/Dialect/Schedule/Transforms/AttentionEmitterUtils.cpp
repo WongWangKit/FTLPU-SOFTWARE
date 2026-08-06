@@ -8,7 +8,8 @@ namespace ftlpu::compiler::schedule::attention_detail {
 void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t address,
     int64_t packedStream, int64_t repeatCount, int64_t repeatInterval,
-    int64_t addressStride, llvm::StringRef destination)
+    int64_t addressStride, llvm::StringRef destination,
+    int64_t addressBinding)
 {
     const target::LPUTargetModel target;
     mlir::OperationState state(location, MemTransferOp::getOperationName());
@@ -26,6 +27,9 @@ void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("address_stride", rewriter.getI64IntegerAttr(addressStride)),
         rewriter.getNamedAttr("accumulator_destination", rewriter.getStringAttr(destination)),
     });
+    if (addressBinding >= 0)
+        state.addAttribute("address_binding",
+            rewriter.getI64IntegerAttr(addressBinding));
     rewriter.create(state);
 }
 
@@ -34,7 +38,10 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t weightColumn, int64_t activationStream, int64_t outputStream,
     int64_t repeatCount, int64_t repeatInterval,
     int64_t accumulatorAddress, int64_t accumulatorRowStride,
-    llvm::StringRef accumulatorDestination, bool accumulatorClear)
+    llvm::StringRef accumulatorDestination, bool accumulatorClear,
+    llvm::StringRef weightLoadMode, int64_t weightInnerColumn,
+    llvm::StringRef dataFormat, llvm::StringRef weightInputMode,
+    llvm::StringRef computeMode, llvm::StringRef accumulatorOutputFormat)
 {
     mlir::OperationState state(location, MxmIssueOp::getOperationName());
     state.addAttributes({
@@ -51,6 +58,39 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("accumulator_row_stride", rewriter.getI64IntegerAttr(accumulatorRowStride)),
         rewriter.getNamedAttr("accumulator_destination", rewriter.getStringAttr(accumulatorDestination)),
         rewriter.getNamedAttr("accumulator_clear", rewriter.getBoolAttr(accumulatorClear)),
+        rewriter.getNamedAttr("data_format", rewriter.getStringAttr(dataFormat)),
+        rewriter.getNamedAttr("weight_load_mode", rewriter.getStringAttr(weightLoadMode)),
+        rewriter.getNamedAttr("weight_inner_column", rewriter.getI64IntegerAttr(weightInnerColumn)),
+    });
+    if (!weightInputMode.empty())
+        state.addAttribute("weight_input_mode",
+            rewriter.getStringAttr(weightInputMode));
+    if (!computeMode.empty())
+        state.addAttribute("compute_mode",
+            rewriter.getStringAttr(computeMode));
+    if (!accumulatorOutputFormat.empty())
+        state.addAttribute("accumulator_output_format",
+            rewriter.getStringAttr(accumulatorOutputFormat));
+    rewriter.create(state);
+}
+
+void emitMxmDequant(mlir::IRRewriter& rewriter,
+    mlir::Location location, int64_t cycle, int64_t unitId,
+    float scale, int64_t repeatCount, int64_t repeatInterval)
+{
+    mlir::OperationState state(
+        location, MxmDequantOp::getOperationName());
+    state.addAttributes({
+        rewriter.getNamedAttr(
+            "cycle", rewriter.getI64IntegerAttr(cycle)),
+        rewriter.getNamedAttr(
+            "unit_id", rewriter.getI64IntegerAttr(unitId)),
+        rewriter.getNamedAttr(
+            "scale", rewriter.getF32FloatAttr(scale)),
+        rewriter.getNamedAttr("repeat_count",
+            rewriter.getI64IntegerAttr(repeatCount)),
+        rewriter.getNamedAttr("repeat_interval",
+            rewriter.getI64IntegerAttr(repeatInterval)),
     });
     rewriter.create(state);
 }

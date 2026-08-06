@@ -19,6 +19,8 @@ public:
     void load(const BinaryProgram& program);
     void load_file(const std::filesystem::path& path);
     void upload_input(std::size_t index, std::span<const std::uint8_t> data);
+    void upload_binding(
+        const BinaryBinding& binding, std::span<const std::uint8_t> data);
     std::vector<std::uint8_t> download_output(std::size_t index) const;
     void copy_binding(
         const BinaryBinding& source, const BinaryBinding& destination);
@@ -30,6 +32,7 @@ private:
 
     TspSliceSystem& system_;
     std::size_t loaded_max_cycle_{0};
+    std::size_t loaded_mxms_per_hemisphere_{hw::kMxmsPerHemisphere};
     std::vector<BinaryBinding> bindings_;
 };
 

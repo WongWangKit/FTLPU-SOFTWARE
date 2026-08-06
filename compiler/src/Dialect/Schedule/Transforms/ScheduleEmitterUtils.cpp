@@ -43,9 +43,14 @@ mlir::DictionaryAttr weight_pass_placement(mlir::OpBuilder& builder,
     return attributes.getDictionary(builder.getContext());
 }
 
-std::string mem_resource(int64_t slice)
+std::string mem_read_resource(int64_t slice)
 {
-    return llvm::formatv("MEM.slice.{0}", slice).str();
+    return llvm::formatv("MEM.slice.{0}.read", slice).str();
+}
+
+std::string mem_write_resource(int64_t slice)
+{
+    return llvm::formatv("MEM.slice.{0}.write", slice).str();
 }
 
 int64_t value_ready_cycle(mlir::Value value)

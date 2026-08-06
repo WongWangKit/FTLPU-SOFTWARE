@@ -1,11 +1,11 @@
 module {
   func.func @rmsnorm_128x576(
-      %x: tensor<128x576xf16>,
-      %weight: tensor<576xf16>) -> tensor<128x576xf16> {
+      %x: tensor<128x576xbf16>,
+      %weight: tensor<576xbf16>) -> tensor<128x576xbf16> {
     %x_f32 = stablehlo.convert %x :
-        (tensor<128x576xf16>) -> tensor<128x576xf32>
+        (tensor<128x576xbf16>) -> tensor<128x576xf32>
     %weight_f32 = stablehlo.convert %weight :
-        (tensor<576xf16>) -> tensor<576xf32>
+        (tensor<576xbf16>) -> tensor<576xf32>
     %square = stablehlo.multiply %x_f32, %x_f32 :
         tensor<128x576xf32>
     %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
@@ -33,7 +33,7 @@ module {
     %scaled = stablehlo.multiply %normalized, %weight_broadcast :
         tensor<128x576xf32>
     %result = stablehlo.convert %scaled :
-        (tensor<128x576xf32>) -> tensor<128x576xf16>
-    return %result : tensor<128x576xf16>
+        (tensor<128x576xf32>) -> tensor<128x576xbf16>
+    return %result : tensor<128x576xbf16>
   }
 }

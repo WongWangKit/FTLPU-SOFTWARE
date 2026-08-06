@@ -30,29 +30,41 @@ enum class StreamEndpoint {
     SxmResult,
 };
 
+enum class FfnProjectionKind {
+    Gate,
+    Up,
+};
+
 struct MemoryTopology {
     int64_t hemispheres = 2;
-    int64_t slices_per_hemisphere = 44;
-    int64_t banks_per_slice = 2;
+    int64_t slices_per_hemisphere = 52;
+    int64_t banks_per_slice = 16;
     int64_t words_per_bank = 4096;
     int64_t bytes_per_word = 16;
+    int64_t sram_depth_rows = 65536;
+    int64_t sram_read_ports_per_slice = 1;
+    int64_t sram_write_ports_per_slice = 1;
     int64_t accumulator_slice_base = 36;
     int64_t accumulator_slices_per_mxm = 4;
     int64_t w8a16_weight_slice_count = 8;
+    int64_t w8a16_weight_slice_base = 0;
     int64_t w8a16_weight_slice_stride = 4;
+    std::array<int64_t, 2> w8a16_output_weight_spare_slices{{2, 18}};
     int64_t w8a16_activation_slice_base = 32;
     int64_t w8a16_hidden_slice_base = 21;
+    int64_t w8a16_hidden_base_row = 0;
+    int64_t attention_mask_base_row = 8128;
     int64_t w8a16_result_slice_base = 24;
     int64_t accumulator_scratch_base_row = 1600;
-    std::array<int64_t, 4> w8a16_fused_gate_temp_slices{{1, 5, 9, 13}};
-    std::array<int64_t, 4> w8a16_fused_up_temp_slices{{2, 6, 10, 14}};
+    std::array<int64_t, 4> w8a16_fused_gate_temp_slices{{1, 5, 9, 29}};
+    std::array<int64_t, 4> w8a16_fused_up_temp_slices{{2, 6, 10, 30}};
 };
 
 struct StreamTopology {
     int64_t streams_per_direction = 32;
     int64_t encoded_streams = 64;
-    int64_t mem_boundary_register_columns = 12;
-    int64_t system_register_columns = 13;
+    int64_t mem_boundary_register_columns = 14;
+    int64_t system_register_columns = 15;
     int64_t mem_slices_per_register_group = 4;
 };
 
@@ -64,22 +76,29 @@ struct ThroughputModel {
     int64_t mxm_rows = 32;
     int64_t mxm_columns = 32;
     int64_t mxm_load_streams_per_cycle = 16;
+    int64_t mxm_int8_load_streams_per_cycle = 8;
     int64_t mxm_load_bytes_per_cycle = 128;
     int64_t mxm_activation_streams = 4;
     int64_t mxm_result_streams = 4;
     int64_t mxm_pipeline_rows = 4;
+    int64_t mxm_block_rows = 8;
+    int64_t mxm_local_dequant_enabled = 1;
+    int64_t mxm_block_compute_enabled = 1;
+    int64_t mxm_weight_activation_overlap_enabled = 1;
+    int64_t mxm_local_load_to_compute_latency = 4;
+    int64_t mxm_block_group_interval = 8;
     int64_t mxm_earliest_iw_cycle = 2;
     int64_t qk_iw_to_compute_latency = 24;
-    int64_t mxms_per_hemisphere = 2;
+    int64_t mxms_per_hemisphere = 1;
     int64_t mxm_weight_buffers = 2;
     int64_t vxm_alus = 16;
-    int64_t vxm_weight_to_iw_latency = 14;
-    int64_t mem_to_sxm_latency = 12;
-    int64_t mem_to_mxm_latency = 13;
+    int64_t vxm_weight_to_iw_latency = 16;
+    int64_t mem_to_sxm_latency = 14;
+    int64_t mem_to_mxm_latency = 15;
     int64_t mxm0_accumulator_latency = 6;
     int64_t mxm1_accumulator_latency = 5;
-    int64_t accumulator_to_vxm_latency = 16;
-    int64_t accumulator_read_to_vxm_latency = 13;
+    int64_t accumulator_to_vxm_latency = 18;
+    int64_t accumulator_read_to_vxm_latency = 15;
     int64_t swiglu_write_latency = 13;
 };
 
@@ -116,6 +135,18 @@ public:
     int64_t mxm_first_result_latency() const;
     int64_t mxm_result_window_cycles(int64_t rows) const;
     int64_t mxm_block_issue_interval() const;
+    bool supports_mxm_local_dequant() const
+    {
+        return throughput_.mxm_local_dequant_enabled != 0;
+    }
+    bool supports_mxm_block8_compute() const
+    {
+        return throughput_.mxm_block_compute_enabled != 0;
+    }
+    bool supports_mxm_weight_activation_overlap() const
+    {
+        return throughput_.mxm_weight_activation_overlap_enabled != 0;
+    }
     // Attention QK uses two physical 16-stream IW source layouts. Keep this
     // target-specific routing outside MemoryTopology so it cannot alter ABI.
     const std::array<int64_t, 16>& attention_query_iw_slices(
@@ -124,10 +155,17 @@ public:
     llvm::SmallVector<int64_t> attention_output_weight_slices() const;
     llvm::SmallVector<int64_t> attention_activation_slices() const;
     llvm::SmallVector<int64_t> mxm_distributed_activation_slices() const;
+    llvm::SmallVector<int64_t> ffn_projection_weight_slices(
+        FfnProjectionKind kind) const;
+    llvm::SmallVector<int64_t> ffn_block8_input_slices() const;
+    llvm::SmallVector<int64_t> ffn_hidden_slices() const;
     llvm::SmallVector<int64_t> attention_projection_output_slices() const;
+    llvm::SmallVector<int64_t> attention_qk_key_slices() const;
     llvm::SmallVector<int64_t> attention_value_slices() const;
     llvm::SmallVector<int64_t> attention_rope_slices() const;
+    llvm::SmallVector<int64_t> attention_rope_staging_slices() const;
     llvm::SmallVector<int64_t> attention_context_slices() const;
+    llvm::SmallVector<int64_t> attention_output_activation_slices() const;
     llvm::SmallVector<int64_t> attention_result_slices() const;
     int64_t attention_query_iw_base_row() const;
     int64_t attention_score_base_row() const;

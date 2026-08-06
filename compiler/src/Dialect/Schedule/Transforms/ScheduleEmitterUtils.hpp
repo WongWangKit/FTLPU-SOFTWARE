@@ -17,7 +17,8 @@ mlir::DictionaryAttr subrange_placement(mlir::OpBuilder& builder,
 mlir::DictionaryAttr weight_pass_placement(mlir::OpBuilder& builder,
     mlir::DictionaryAttr placement, int64_t pass);
 
-std::string mem_resource(int64_t slice);
+std::string mem_read_resource(int64_t slice);
+std::string mem_write_resource(int64_t slice);
 
 int64_t value_ready_cycle(mlir::Value value);
 

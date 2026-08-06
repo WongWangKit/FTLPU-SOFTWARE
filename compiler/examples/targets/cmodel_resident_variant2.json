@@ -1,0 +1,22 @@
+{
+  "name": "lpu32-cmodel-resident-variant2",
+  "memory": {
+    "slices_per_hemisphere": 52,
+    "banks_per_slice": 16,
+    "words_per_bank": 4096,
+    "w8a16_weight_slice_base": 2,
+    "w8a16_weight_slice_stride": 4,
+    "w8a16_output_weight_spare_slices": [18, 22],
+    "w8a16_fused_gate_temp_slices": [1, 5, 9, 29],
+    "w8a16_fused_up_temp_slices": [3, 7, 11, 31],
+    "w8a16_activation_slice_base": 48,
+    "w8a16_hidden_base_row": 8128,
+    "attention_mask_base_row": 7936
+  },
+  "streams": {
+    "streams_per_direction": 32,
+    "encoded_streams": 64,
+    "mem_boundary_register_columns": 14,
+    "system_register_columns": 15
+  }
+}

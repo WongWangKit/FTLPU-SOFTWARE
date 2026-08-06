@@ -43,6 +43,23 @@ QueueCommand encode_mxm_command(const MxmControlInstruction& instruction)
     };
 }
 
+QueueCommand encode_mxm_dequant_command(
+    const MxmDequantInstruction& instruction)
+{
+    return QueueCommand {
+        kInstructionCommand,
+        InstructionKind::MxmDequant,
+        1,
+        {
+            static_cast<std::uint32_t>(
+                isa::encode_mxm_dequant_instruction(instruction)),
+            0,
+            0,
+            0,
+        },
+    };
+}
+
 QueueCommand encode_vxm_command(const VxmLaneAluInstruction& instruction)
 {
     const auto encoded = isa::encode_vxm_instruction(instruction);
@@ -127,7 +144,8 @@ void validate_queue_index(QueueKind kind, std::size_t index)
     if (kind == QueueKind::Mem && index >= InstructionControlUnit::kMemQueues) {
         throw std::out_of_range("binary MEM queue index is outside the CModel ICU range");
     }
-    if ((kind == QueueKind::MxmLoad || kind == QueueKind::MxmCompute)
+    if ((kind == QueueKind::MxmLoad || kind == QueueKind::MxmCompute
+            || kind == QueueKind::MxmDequant)
         && index >= InstructionControlUnit::kMxmQueues) {
         throw std::out_of_range("binary MXM queue index is outside the CModel ICU range");
     }
@@ -137,6 +155,33 @@ void validate_queue_index(QueueKind kind, std::size_t index)
     if ((kind == QueueKind::SxmTranspose || kind == QueueKind::SxmPermute)
         && index >= hw::kHemispheres)
         throw std::out_of_range("binary SXM hemisphere index is outside the CModel ICU range");
+}
+
+bool is_mxm_queue(QueueKind kind)
+{
+    return kind == QueueKind::MxmLoad
+        || kind == QueueKind::MxmCompute
+        || kind == QueueKind::MxmDequant;
+}
+
+std::size_t physical_queue_index(QueueKind kind, std::size_t logical_index,
+    std::size_t logical_mxms_per_hemisphere)
+{
+    if (!is_mxm_queue(kind)) return logical_index;
+    if (logical_mxms_per_hemisphere == 0
+        || logical_mxms_per_hemisphere > hw::kMxmsPerHemisphere)
+        throw std::out_of_range(
+            "binary MXM topology cannot be mapped onto the CModel");
+    const std::size_t logical_mxm_count =
+        hw::kHemispheres * logical_mxms_per_hemisphere;
+    if (logical_index >= logical_mxm_count)
+        throw std::out_of_range(
+            "binary MXM queue index is outside its logical topology");
+    const std::size_t hemisphere =
+        logical_index / logical_mxms_per_hemisphere;
+    const std::size_t local_mxm =
+        logical_index % logical_mxms_per_hemisphere;
+    return hemisphere * hw::kMxmsPerHemisphere + local_mxm;
 }
 
 } // namespace
@@ -150,6 +195,8 @@ const char* queue_kind_name(QueueKind kind)
         return "mxm_load";
     case QueueKind::MxmCompute:
         return "mxm_compute";
+    case QueueKind::MxmDequant:
+        return "mxm_dequant";
     case QueueKind::Vxm:
         return "vxm";
     case QueueKind::SxmTranspose:
@@ -180,6 +227,17 @@ void IcuProgram::emit_mxm_compute(std::size_t cycle, std::size_t mxm, MxmControl
     check_mxm(mxm);
     validate_mxm_queue_opcode(QueueKind::MxmCompute, mxm, instruction);
     mxm_compute_[mxm].push_back(ScheduledInstruction<MxmControlInstruction> {cycle, instruction});
+    last_cycle_ = std::max(last_cycle_, cycle);
+}
+
+void IcuProgram::emit_mxm_dequant(
+    std::size_t cycle,
+    std::size_t mxm,
+    MxmDequantInstruction instruction)
+{
+    check_mxm(mxm);
+    mxm_dequant_[mxm].push_back(
+        ScheduledInstruction<MxmDequantInstruction> {cycle, instruction});
     last_cycle_ = std::max(last_cycle_, cycle);
 }
 
@@ -229,6 +287,14 @@ std::vector<QueueProgram> IcuProgram::encode_queues() const
             mxm,
             encode_scheduled_queue(mxm_compute_[mxm], queue_name(QueueKind::MxmCompute, mxm), encode_mxm_command),
         });
+        queues.push_back(QueueProgram {
+            QueueKind::MxmDequant,
+            mxm,
+            encode_scheduled_queue(
+                mxm_dequant_[mxm],
+                queue_name(QueueKind::MxmDequant, mxm),
+                encode_mxm_dequant_command),
+        });
     }
 
     for (std::size_t alu = 0; alu < vxm_.size(); ++alu) {
@@ -271,6 +337,15 @@ void IcuProgram::load_into(InstructionControlUnit& icu) const
             queue_name(QueueKind::MxmCompute, mxm),
             [&](std::size_t cycles) { icu.enqueue_mxm_compute_nop(mxm, cycles); },
             [&](const MxmControlInstruction& instruction) { icu.enqueue_mxm(mxm, instruction); });
+        load_scheduled_queue(
+            mxm_dequant_[mxm],
+            queue_name(QueueKind::MxmDequant, mxm),
+            [&](std::size_t cycles) {
+                icu.enqueue_mxm_dequant_nop(mxm, cycles);
+            },
+            [&](const MxmDequantInstruction& instruction) {
+                icu.enqueue_mxm_dequant(mxm, instruction);
+            });
     }
 
     for (std::size_t alu = 0; alu < vxm_.size(); ++alu) {
@@ -315,6 +390,9 @@ bool IcuProgram::empty() const
             return false;
         }
     }
+    for (const auto& queue : mxm_dequant_) {
+        if (!queue.empty()) return false;
+    }
     for (const auto& queue : sxm_transpose_) if (!queue.empty()) return false;
     for (const auto& queue : sxm_permute_) if (!queue.empty()) return false;
     for (const auto& queue : vxm_) {
@@ -325,10 +403,15 @@ bool IcuProgram::empty() const
     return true;
 }
 
-void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, InstructionControlUnit& icu)
+void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
+    InstructionControlUnit& icu,
+    std::size_t logical_mxms_per_hemisphere)
 {
     for (const auto& queue : queues) {
-        validate_queue_index(queue.kind, queue.index);
+        if (queue.commands.empty()) continue;
+        const std::size_t queue_index = physical_queue_index(
+            queue.kind, queue.index, logical_mxms_per_hemisphere);
+        validate_queue_index(queue.kind, queue_index);
         for (std::size_t command_index = 0; command_index < queue.commands.size(); ++command_index) {
             const auto& command = queue.commands[command_index];
             const auto opcode = isa::decode_icu_command_opcode(command.command);
@@ -336,22 +419,25 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                 const auto cycles = isa::decode_icu_nop_cycles(command.command);
                 switch (queue.kind) {
                 case QueueKind::Mem:
-                    icu.enqueue_mem_nop(queue.index, cycles);
+                    icu.enqueue_mem_nop(queue_index, cycles);
                     break;
                 case QueueKind::MxmLoad:
-                    icu.enqueue_mxm_load_nop(queue.index, cycles);
+                    icu.enqueue_mxm_load_nop(queue_index, cycles);
                     break;
                 case QueueKind::MxmCompute:
-                    icu.enqueue_mxm_compute_nop(queue.index, cycles);
+                    icu.enqueue_mxm_compute_nop(queue_index, cycles);
+                    break;
+                case QueueKind::MxmDequant:
+                    icu.enqueue_mxm_dequant_nop(queue_index, cycles);
                     break;
                 case QueueKind::Vxm:
-                    icu.enqueue_vxm_nop(queue.index, cycles);
+                    icu.enqueue_vxm_nop(queue_index, cycles);
                     break;
                 case QueueKind::SxmTranspose:
-                    icu.enqueue_sxm_transpose_nop(static_cast<Hemisphere>(queue.index), cycles);
+                    icu.enqueue_sxm_transpose_nop(static_cast<Hemisphere>(queue_index), cycles);
                     break;
                 case QueueKind::SxmPermute:
-                    icu.enqueue_sxm_permute_nop(static_cast<Hemisphere>(queue.index), cycles);
+                    icu.enqueue_sxm_permute_nop(static_cast<Hemisphere>(queue_index), cycles);
                     break;
                 }
                 continue;
@@ -361,20 +447,31 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                 const auto repeat = isa::decode_icu_repeat(command.command);
                 switch (queue.kind) {
                 case QueueKind::Mem:
-                    icu.enqueue_mem_repeat(queue.index, repeat.count, repeat.interval, repeat.address_stride);
+                    icu.enqueue_mem_repeat(queue_index, repeat.count, repeat.interval, repeat.address_stride);
                     break;
                 case QueueKind::MxmLoad:
-                    icu.enqueue_mxm_load_repeat(queue.index, repeat.count, repeat.interval);
+                    icu.enqueue_mxm_load_repeat(queue_index, repeat.count, repeat.interval);
                     break;
                 case QueueKind::MxmCompute:
-                    icu.enqueue_mxm_compute_repeat(queue.index, repeat.count, repeat.interval);
+                    icu.enqueue_mxm_compute_repeat(queue_index, repeat.count, repeat.interval);
+                    break;
+                case QueueKind::MxmDequant:
+                    icu.enqueue_mxm_dequant_repeat(
+                        queue_index, repeat.count, repeat.interval);
                     break;
                 case QueueKind::Vxm:
-                    icu.enqueue_vxm_repeat(queue.index, repeat.count, repeat.interval);
+                    icu.enqueue_vxm_repeat(queue_index, repeat.count, repeat.interval);
                     break;
                 case QueueKind::SxmTranspose:
+                    icu.enqueue_sxm_transpose_repeat(
+                        static_cast<Hemisphere>(queue_index),
+                        repeat.count, repeat.interval);
+                    break;
                 case QueueKind::SxmPermute:
-                    throw std::logic_error("SXM queues do not support repeat commands");
+                    icu.enqueue_sxm_permute_repeat(
+                        static_cast<Hemisphere>(queue_index),
+                        repeat.count, repeat.interval);
+                    break;
                 }
                 continue;
             }
@@ -391,7 +488,7 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                 }
                 const auto encoded = static_cast<isa::EncodedMemInstruction>(command.words[0])
                     | (static_cast<isa::EncodedMemInstruction>(command.words[1]) << 32);
-                icu.enqueue_mem(queue.index, isa::decode_mem_instruction(encoded));
+                icu.enqueue_mem(queue_index, isa::decode_mem_instruction(encoded));
                 break;
             }
             case QueueKind::MxmLoad:
@@ -406,30 +503,52 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues, Instr
                     | (static_cast<isa::EncodedMxmInstruction>(
                            command.words[1])
                         << 32);
-                const auto instruction =
-                    isa::decode_mxm_instruction(encoded);
-                validate_mxm_queue_opcode(queue.kind, queue.index, instruction);
-                icu.enqueue_mxm(queue.index, instruction);
+                MxmControlInstruction instruction;
+                try {
+                    instruction = isa::decode_mxm_instruction(encoded);
+                } catch (const std::exception& error) {
+                    std::ostringstream message;
+                    message << error.what() << "; queue_kind="
+                            << static_cast<int>(queue.kind)
+                            << ", queue_index=" << queue.index
+                            << ", command_index=" << command_index
+                            << ", encoded=0x" << std::hex << encoded;
+                    throw std::logic_error(message.str());
+                }
+                validate_mxm_queue_opcode(queue.kind, queue_index, instruction);
+                icu.enqueue_mxm(queue_index, instruction);
                 break;
             }
+            case QueueKind::MxmDequant:
+                if (command.instruction_kind
+                        != InstructionKind::MxmDequant
+                    || command.word_count != 1)
+                    throw std::logic_error(
+                        "MXM dequant queue command must carry one scale word");
+                icu.enqueue_mxm_dequant(
+                    queue_index,
+                    isa::decode_mxm_dequant_instruction(
+                        static_cast<isa::EncodedMxmDequantInstruction>(
+                            command.words[0])));
+                break;
             case QueueKind::Vxm:
                 if (command.instruction_kind != InstructionKind::Vxm || command.word_count != 4) {
                     throw std::logic_error("VXM queue command does not carry four VXM instruction words");
                 }
-                icu.enqueue_vxm(queue.index, isa::decode_vxm_instruction(isa::EncodedVxmInstruction {command.words}));
+                icu.enqueue_vxm(queue_index, isa::decode_vxm_instruction(isa::EncodedVxmInstruction {command.words}));
                 break;
             case QueueKind::SxmTranspose: {
                 const auto instruction = decode_sxm_command(command);
                 if (instruction.opcode != SxmOpcode::Transpose)
                     throw std::logic_error("SXM transpose queue received a non-transpose instruction");
-                icu.enqueue_sxm_transpose(static_cast<Hemisphere>(queue.index), std::move(instruction));
+                icu.enqueue_sxm_transpose(static_cast<Hemisphere>(queue_index), std::move(instruction));
                 break;
             }
             case QueueKind::SxmPermute: {
                 const auto instruction = decode_sxm_command(command);
                 if (instruction.opcode != SxmOpcode::Permute)
                     throw std::logic_error("SXM permute queue received a non-permute instruction");
-                icu.enqueue_sxm_permute(static_cast<Hemisphere>(queue.index), std::move(instruction));
+                icu.enqueue_sxm_permute(static_cast<Hemisphere>(queue_index), std::move(instruction));
                 break;
             }
             }

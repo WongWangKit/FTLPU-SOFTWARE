@@ -1,6 +1,7 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -33,6 +34,10 @@ try {
     icu_program.emit_sxm_transpose(7, Hemisphere::East, transpose);
 
     BinaryProgram program;
+    program.mxms_per_hemisphere = 1;
+    program.target_abi = lpu_32stream_target_abi(
+        program.mxms_per_hemisphere);
+    program.memory_floors.push_back({1, 7, 8192});
     BinaryBinding binding;
     binding.index = 3;
     binding.access = BindingAccess::Internal;
@@ -40,8 +45,18 @@ try {
     binding.name = "rms1_result";
     binding.ready_cycle = 1234;
     program.bindings.push_back(binding);
+    program.timelines.push_back({"rmsnorm.transpose", 7, 13});
     program.max_cycle = icu_program.last_cycle();
     program.queues = icu_program.encode_queues();
+    for (auto& queue : program.queues) {
+        if (queue.kind != QueueKind::SxmTranspose || queue.index != 0)
+            continue;
+        QueueCommand repeat;
+        repeat.command = isa::encode_icu_repeat(
+            InstructionControlUnit::Repeat {3, 2, 0});
+        queue.commands.push_back(repeat);
+        program.max_cycle += 6;
+    }
     const auto path = std::filesystem::path(argv[1]);
     std::filesystem::create_directories(path.parent_path());
     write_binary_program(program, path);
@@ -52,16 +67,44 @@ try {
         || decoded.bindings[0].name != "rms1_result"
         || decoded.bindings[0].ready_cycle != 1234)
         return 1;
+    require(decoded.timelines.size() == 1
+            && decoded.timelines[0].name == "rmsnorm.transpose"
+            && decoded.timelines[0].start_cycle == 7
+            && decoded.timelines[0].end_cycle == 13,
+        "timeline metadata was not preserved");
     require(decoded.target_name == kLpu32StreamTargetName,
         "target name was not preserved");
-    require(decoded.target_abi == kLpu32StreamTargetAbi,
+    require(decoded.target_abi == lpu_32stream_target_abi(1),
         "target ABI was not preserved");
+    require(decoded.mxms_per_hemisphere == 1,
+        "logical MXM topology was not preserved");
+    require(decoded.memory_floors.size() == 1
+            && decoded.memory_floors[0].hemisphere == 1
+            && decoded.memory_floors[0].slice == 7
+            && decoded.memory_floors[0].first_free_row == 8192,
+        "per-slice MEM floor was not preserved");
     bool found = false;
     for (const auto& queue : decoded.queues) {
         if (queue.kind != QueueKind::SxmTranspose || queue.index != 0 || queue.commands.empty())
             continue;
-        const auto& command = queue.commands.back();
+        const auto instruction = std::find_if(
+            queue.commands.begin(), queue.commands.end(),
+            [](const QueueCommand& command) {
+                return command.instruction_kind
+                    == InstructionKind::Sxm;
+            });
+        require(instruction != queue.commands.end(),
+            "SXM instruction kind was not preserved");
+        const auto& command = *instruction;
         require(command.instruction_kind == InstructionKind::Sxm, "SXM instruction kind was not preserved");
+        require(std::any_of(queue.commands.begin(),
+                    queue.commands.end(),
+                    [](const QueueCommand& candidate) {
+                        return isa::decode_icu_command_opcode(
+                                   candidate.command)
+                            == isa::IcuCommandOpcode::Repeat;
+                    }),
+            "SXM repeat command was not preserved");
         require(command.extension_words.size() == 2 + 16 + 16 + SxmInstruction::kTotalLanes,
             "SXM variable payload size was not preserved");
         found = true;

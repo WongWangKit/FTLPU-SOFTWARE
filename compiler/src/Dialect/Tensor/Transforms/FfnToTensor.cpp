@@ -1,5 +1,8 @@
 #include "KernelToTensorLowering.hpp"
 
+#include "ftlpu/compiler/Support/float_format.hpp"
+#include "ftlpu/compiler/Target/mxm_execution_strategy.hpp"
+
 #include "llvm/ADT/STLExtras.h"
 
 namespace ftlpu::compiler::tensor_lowering {
@@ -18,23 +21,63 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const mlir::Value up_weight = graph.up.getRhs();
     const mlir::Value down_weight = graph.output.getRhs();
     const bool w8a16 = is_w8a16_ffn(graph, target);
+    auto executionPolicy =
+        target::mxm_execution_policy_from_operation(op);
+    if (mlir::failed(executionPolicy)) {
+        op.emitError("invalid MXM execution policy");
+        return mlir::failure();
+    }
+    bool block8Ffn = false;
+    if (w8a16) {
+        auto strategy = target::plan_mxm_execution_strategy(
+            {m, n, hidden,
+                llvm::cast<mlir::RankedTensorType>(
+                    input_value.getType())
+                    .getElementType()
+                    .isBF16(),
+                true, true, true},
+            target, *executionPolicy);
+        if (mlir::failed(strategy)) {
+            op.emitError(
+                "cannot select an MXM execution strategy for FFN");
+            return mlir::failure();
+        }
+        block8Ffn = strategy->uses_block8();
+    }
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
-    llvm::SmallVector<int64_t> projection_weight_slices;
-    for (int64_t index = 0;
-         index < memory.w8a16_weight_slice_count; ++index)
-        projection_weight_slices.push_back(
-            index * memory.w8a16_weight_slice_stride);
-    const llvm::SmallVector<int64_t> down_weight_slices =
-        projection_weight_slices;
+    const auto gate_weight_slices = target.ffn_projection_weight_slices(
+        target::FfnProjectionKind::Gate);
+    const auto up_weight_slices = target.ffn_projection_weight_slices(
+        target::FfnProjectionKind::Up);
+    llvm::SmallVector<int64_t> down_weight_slices;
+    if (block8Ffn) {
+        for (int64_t slice = 0;
+             slice < throughput.mxms_per_hemisphere
+                     * memory.w8a16_weight_slice_count;
+             ++slice)
+            down_weight_slices.push_back(slice);
+    } else {
+        down_weight_slices = gate_weight_slices;
+    }
     llvm::SmallVector<int64_t> activation_slices;
-    llvm::SmallVector<int64_t> hidden_slices;
+    if (block8Ffn)
+        activation_slices = target.ffn_block8_input_slices();
+    const llvm::SmallVector<int64_t> hidden_slices = block8Ffn
+        ? target.mxm_distributed_activation_slices()
+        : target.ffn_hidden_slices();
     llvm::SmallVector<int64_t> result_slices;
-    for (int64_t index = 0; index < throughput.mxm_activation_streams; ++index) {
-        activation_slices.push_back(memory.w8a16_activation_slice_base + index);
-        hidden_slices.push_back(memory.w8a16_hidden_slice_base
-            + index + (index == 3 ? 5 : 0));
-        result_slices.push_back(memory.w8a16_result_slice_base + index);
+    if (block8Ffn)
+        result_slices =
+            target.mxm_distributed_activation_slices();
+    for (int64_t index = 0;
+         index < throughput.mxm_activation_streams; ++index) {
+        if (!block8Ffn)
+            activation_slices.push_back(
+                memory.w8a16_activation_slice_base + index);
+        if (!block8Ffn)
+            result_slices.push_back(
+                memory.w8a16_result_slice_base + index);
     }
     const int64_t hidden_pass_bytes = w8a16
         ? m * (hidden / target.memory().hemispheres) * 2
@@ -44,27 +87,47 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             / (memory.hemispheres * memory.w8a16_weight_slice_count
                 * throughput.tile_rows * throughput.lanes_per_tile)
         : 0;
-    const int64_t down_rows = w8a16
-        ? hidden * n
-            / (memory.w8a16_weight_slice_count
-                * throughput.tile_rows * throughput.lanes_per_tile)
+    const int64_t down_wave_columns = memory.hemispheres
+        * throughput.mxms_per_hemisphere
+        * throughput.tile_rows * throughput.lanes_per_tile;
+    const int64_t down_rows = w8a16 && block8Ffn
+        ? ((n + down_wave_columns - 1) / down_wave_columns)
+            * (hidden / throughput.mxm_rows)
+            * throughput.tile_rows
+        : w8a16
+        ? ((n + down_wave_columns - 1) / down_wave_columns)
+            * (hidden / throughput.mxm_rows)
+            * memory.w8a16_weight_slice_count
         : 0;
     const bool largeSramProfile =
         memory.banks_per_slice * memory.words_per_bank >= 17000;
     const int64_t ffnWeightBase = largeSramProfile ? 10000 : 0;
+    const int64_t distributedElementsPerRow =
+        throughput.mxm_rows * throughput.mxm_block_rows;
+    const int64_t block8HiddenRows = block8Ffn
+        ? m * hidden / distributedElementsPerRow
+        : 0;
+    const int64_t block8ResultBaseRow =
+        memory.w8a16_hidden_base_row + block8HiddenRows;
     auto input = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Activation,
-            activation_slices, 0, m * k / throughput.mxm_rows,
-            m * k * 2))
+            activation_slices, 0,
+            block8Ffn
+                ? m * k / distributedElementsPerRow
+                : m * k / throughput.mxm_rows,
+            m * k * 2,
+            block8Ffn ? "fp16_mxm_distributed_16"
+                      : "fp16_mxm_activation_planar",
+            "both"))
         : allocate_value(input_value, PlacementKind::Activation);
     auto gate = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
-            projection_weight_slices, ffnWeightBase,
+            gate_weight_slices, ffnWeightBase,
             gate_rows, k * hidden))
         : allocate_value(gate_weight, PlacementKind::Weight);
     auto up = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
-            projection_weight_slices, ffnWeightBase + gate_rows,
+            up_weight_slices, ffnWeightBase + gate_rows,
             gate_rows, k * hidden))
         : allocate_value(up_weight, PlacementKind::Weight);
     auto down = w8a16
@@ -74,26 +137,38 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         : allocate_value(down_weight, PlacementKind::Weight);
     auto hidden0 = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::VxmResult,
-            hidden_slices, 0,
-            m * (hidden / memory.hemispheres)
-                / throughput.mxm_rows,
-            hidden_pass_bytes))
+            hidden_slices, memory.w8a16_hidden_base_row,
+            block8Ffn
+                ? block8HiddenRows
+                : m * (hidden / memory.hemispheres)
+                    / throughput.mxm_rows,
+            hidden_pass_bytes,
+            block8Ffn ? "fp16_mxm_distributed_16" : "", "both"))
         : allocator.allocate(PlacementKind::VxmResult, hidden_pass_bytes);
     auto hidden1 = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::VxmResult1,
-            hidden_slices, 0,
-            m * (hidden / memory.hemispheres)
-                / throughput.mxm_rows,
-            hidden_pass_bytes))
+            hidden_slices, memory.w8a16_hidden_base_row,
+            block8Ffn
+                ? block8HiddenRows
+                : m * (hidden / memory.hemispheres)
+                    / throughput.mxm_rows,
+            hidden_pass_bytes,
+            block8Ffn ? "fp16_mxm_distributed_16" : "", "both"))
         : allocator.allocate(PlacementKind::VxmResult1, hidden_pass_bytes);
     const auto result_bytes =
         get_static_tensor_bytes(graph.output.getResult().getType());
     const auto result = w8a16 && mlir::succeeded(result_bytes)
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::FinalResult,
-            result_slices, 0,
-            m * n
-                / (throughput.mxm_rows * throughput.mxms_per_hemisphere),
-            *result_bytes))
+            result_slices, block8Ffn ? block8ResultBaseRow : 0,
+            block8Ffn
+                ? m * n / distributedElementsPerRow
+                : m * n
+                    / (throughput.mxm_rows
+                        * throughput.mxms_per_hemisphere),
+            *result_bytes,
+            block8Ffn ? "fp16_mxm_block8_distributed_16"
+                       : "",
+            "both"))
         : mlir::succeeded(result_bytes)
         ? allocator.allocate(PlacementKind::FinalResult, *result_bytes)
         : mlir::FailureOr<Allocation>(mlir::failure());
@@ -105,7 +180,10 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     }
     rewriter.setInsertionPoint(op);
     const auto input_placement = w8a16
-        ? make_profile_placement(rewriter, *input, "fp16_mxm_activation_planar", "both")
+        ? make_profile_placement(rewriter, *input,
+            block8Ffn ? "fp16_mxm_distributed_16"
+                      : "fp16_mxm_activation_planar",
+            "both")
         : make_placement_attr(rewriter, *input);
     const auto gate_placement = w8a16
         ? make_profile_placement(rewriter, *gate, "w8a16_mxm_weight_striped", "both")
@@ -115,18 +193,27 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         : make_placement_attr(rewriter, *up);
     const auto down_placement = w8a16
         ? make_profile_placement(rewriter, *down,
-            "w8a16_mxm_weight_wave_striped", "both")
+            block8Ffn ? "w8a16_block8_weight_wave_striped"
+                       : "w8a16_mxm_weight_wave_striped",
+            "both")
         : make_placement_attr(rewriter, *down);
     const auto hidden0_placement = w8a16
         ? make_profile_placement(rewriter, *hidden0,
-            "fp16_mxm_activation_planar", "west")
+            block8Ffn ? "fp16_mxm_distributed_16"
+                       : "fp16_mxm_activation_planar",
+            block8Ffn ? "both" : "west")
         : make_placement_attr(rewriter, *hidden0);
     const auto hidden1_placement = w8a16
         ? make_profile_placement(rewriter, *hidden1,
-            "fp16_mxm_activation_planar", "east")
+            block8Ffn ? "fp16_mxm_distributed_16"
+                       : "fp16_mxm_activation_planar",
+            block8Ffn ? "both" : "east")
         : make_placement_attr(rewriter, *hidden1);
     const auto result_placement = w8a16
-        ? make_profile_placement(rewriter, *result, "fp16_pair_planar", "both")
+        ? make_profile_placement(rewriter, *result,
+            block8Ffn ? "fp16_mxm_block8_distributed_16"
+                       : "fp16_pair_planar",
+            "both")
         : make_placement_attr(rewriter, *result);
 
     auto inheritedInputAllocations =
@@ -159,7 +246,8 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         ? mlir::Type(rewriter.getF32Type())
         : mlir::Type(rewriter.getI32Type());
     const mlir::Type hidden_element_type = w8a16
-        ? mlir::Type(rewriter.getF16Type())
+        ? llvm::cast<mlir::RankedTensorType>(
+              input_value.getType()).getElementType()
         : mlir::Type(rewriter.getI8Type());
     const auto projection_type = mlir::RankedTensorType::get(
         {m, hidden},

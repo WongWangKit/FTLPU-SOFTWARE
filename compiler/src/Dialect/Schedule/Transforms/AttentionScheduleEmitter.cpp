@@ -1,6 +1,8 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_stage_plan.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_softmax_planner.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 
 #include "llvm/ADT/SmallVector.h"
 
@@ -14,7 +16,7 @@ namespace {
 int64_t elementTypeBytes(mlir::Type type)
 {
     if (type.isInteger(8)) return 1;
-    if (type.isF16()) return 2;
+    if (is_lpu_16bit_float(type)) return 2;
     if (type.isF32()) return 4;
     return 0;
 }
@@ -65,11 +67,12 @@ void createTimeline(mlir::IRRewriter& rewriter, mlir::Location location,
 
 AttentionScheduleEmitter::AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
     AttentionTaskGraph op, const target::LPUTargetModel& target,
-    AttentionStagePlan stagePlan)
+    AttentionStagePlan stagePlan, AttentionScheduleStrategy strategy)
     : rewriter_(rewriter)
     , op_(op)
     , target_(target)
     , stage_plan_(std::move(stagePlan))
+    , strategy_(strategy)
 {
 }
 
@@ -106,20 +109,24 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     if (op_.getCausal()) {
         const auto maskType = mlir::RankedTensorType::get(
             {tile - 1, tile}, rewriter_.getF32Type());
-        int64_t maskIndex = 0;
-        for (const char* placement :
-            {"causal_mask", "causal_mask_mxm1"}) {
+        const char* maskPlacements[] = {"causal_mask",
+            "causal_mask_mxm1", "fused_causal_mask",
+            "fused_causal_mask_bank1"};
+        const int64_t maskCount = strategy_ == AttentionScheduleStrategy::Fused
+            ? 4 : 2;
+        for (int64_t maskIndex = 0; maskIndex < maskCount; ++maskIndex) {
+            const char* placement = maskPlacements[maskIndex];
             createBinding(rewriter_, op_.getLoc(), {}, maskIndex,
                 "internal", "constant", maskType,
                 memoryPlan.getAs<mlir::DictionaryAttr>(placement),
                 "causal_mask." + std::to_string(maskIndex),
                 "causal_mask", rewriter_.getDictionaryAttr({}));
-            ++maskIndex;
         }
     }
     const auto ropeType = mlir::RankedTensorType::get(
         {op_.getSeqLen(), op_.getHeadDim() / 2, 2},
-        rewriter_.getF16Type());
+        llvm::cast<mlir::RankedTensorType>(
+            op_.getInput().getType()).getElementType());
     createBinding(rewriter_, op_.getLoc(), {}, 2, "internal",
         "constant", ropeType,
         memoryPlan.getAs<mlir::DictionaryAttr>("rope"),
@@ -139,30 +146,43 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     }
     const int64_t qkStart = projectionEnd;
     const int64_t qkEnd = stagePlan.qkEnd(qkStart);
-    const int64_t qkCycles = qkEnd - qkStart;
+    bool fusedSoftmax = strategy_ == AttentionScheduleStrategy::Fused;
+    if (fusedSoftmax
+        && mlir::failed(planAttentionSoftmax(op_, stagePlan.qk_waves,
+            qkStart, qkEnd, stagePlan.qk_wave_interval,
+            stagePlan.qk_iw_to_compute_cycles, true, target_)))
+        fusedSoftmax = false;
     emitQk(qkStart, stagePlan.qk_wave_interval,
-        stagePlan.qk_iw_to_compute_cycles);
-    const int64_t softmaxEnd = emitSoftmax(qkEnd);
-    const int64_t softmaxCycles = softmaxEnd - qkEnd;
-    const int64_t probabilityPackEnd = emitProbabilityPack(softmaxEnd);
-    const int64_t probabilityTransposeEnd = emitProbabilityTranspose(probabilityPackEnd);
+        stagePlan.qk_iw_to_compute_cycles, fusedSoftmax);
+    const int64_t softmaxEnd = emitSoftmax(qkStart, qkEnd, fusedSoftmax);
+    const int64_t softmaxStart = fusedSoftmax
+        ? qkStart + target_.throughput().mxm_earliest_iw_cycle
+            + *target_.transport_latency(target::StreamEndpoint::Mem,
+                target::StreamEndpoint::MxmWeight,
+                target::StreamDirection::East, 0)
+            + stagePlan.qk_iw_to_compute_cycles
+            + (op_.getHeadDim() / tile - 1)
+                * (op_.getSeqLen() / tile)
+                * target_.mxm_block_issue_interval()
+            + target_.mxm_first_result_latency()
+        : qkEnd;
+    const int64_t probabilityTransposeStart =
+        std::max(softmaxEnd, qkEnd);
+    const int64_t probabilityTransposeEnd =
+        emitProbabilityTranspose(probabilityTransposeStart);
     const int64_t pvEnd = emitPv(probabilityTransposeEnd);
-    const int64_t pvCycles = pvEnd - softmaxEnd;
     const int64_t outputProjectionEnd = emitOutputProjection(pvEnd);
-    const int64_t outputProjectionCycles = outputProjectionEnd - pvEnd;
 
-    int64_t cycle = 0;
-    const auto appendPhase = [&](llvm::StringRef name, int64_t duration) {
-        createTimeline(
-            rewriter_, op_.getLoc(), name, cycle, cycle + duration);
-        cycle += duration;
-    };
-    appendPhase("qkv", qkvCycles);
-    appendPhase("rope", 1);
-    appendPhase("qk", qkCycles);
-    appendPhase("softmax", softmaxCycles);
-    appendPhase("pv", pvCycles);
-    appendPhase("o_proj", outputProjectionCycles);
+    createTimeline(rewriter_, op_.getLoc(), "qkv", 0, qkvCycles);
+    createTimeline(rewriter_, op_.getLoc(), "rope", qkvCycles, qkStart);
+    createTimeline(rewriter_, op_.getLoc(), "qk", qkStart, qkEnd);
+    createTimeline(rewriter_, op_.getLoc(),
+        fusedSoftmax ? "softmax_fused" : "softmax",
+        softmaxStart, softmaxEnd);
+    createTimeline(rewriter_, op_.getLoc(), "pv",
+        probabilityTransposeEnd, pvEnd);
+    createTimeline(rewriter_, op_.getLoc(), "o_proj",
+        pvEnd, outputProjectionEnd);
     auto outputBinding = createBinding(rewriter_, op_.getLoc(), {},
         outputIndex, "output", "result",
         llvm::cast<mlir::RankedTensorType>(op_.getResult().getType()),
@@ -171,7 +191,8 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
 }
 
 mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
-    mlir::func::FuncOp function, const target::LPUTargetModel& target)
+    mlir::func::FuncOp function, const target::LPUTargetModel& target,
+    AttentionScheduleStrategy strategy)
 {
     auto graphs = collectAttentionTaskGraphs(function);
     if (mlir::failed(graphs)) return mlir::failure();
@@ -189,7 +210,7 @@ mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
             return mlir::failure();
         }
         AttentionScheduleEmitter emitter(
-            rewriter, operation, target, std::move(stagePlan));
+            rewriter, operation, target, std::move(stagePlan), strategy);
         auto lowered = emitter.emit(outputIndex++);
         if (mlir::failed(lowered)) return mlir::failure();
         rewriter.replaceOp(operation.output, *lowered);

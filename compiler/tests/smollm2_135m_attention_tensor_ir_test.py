@@ -7,19 +7,25 @@ import subprocess
 from pathlib import Path
 
 
-def run(tool: Path, input_path: Path, output_path: Path, pipeline: str) -> None:
-    subprocess.run(
-        [
-            str(tool),
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-            "--pipeline",
-            pipeline,
-        ],
-        check=True,
-    )
+def run(
+    tool: Path,
+    input_path: Path,
+    output_path: Path,
+    pipeline: str,
+    target_config: Path | None = None,
+) -> None:
+    command = [
+        str(tool),
+        "--input",
+        str(input_path),
+        "--output",
+        str(output_path),
+        "--pipeline",
+        pipeline,
+    ]
+    if target_config is not None:
+        command.extend(["--target-config", str(target_config)])
+    subprocess.run(command, check=True)
 
 
 def main() -> None:
@@ -27,6 +33,7 @@ def main() -> None:
     parser.add_argument("--tool", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--legacy-target-config", type=Path)
     args = parser.parse_args()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -88,16 +95,22 @@ def main() -> None:
         "exp_mxm1",
         "causal_mask",
         "causal_mask_mxm1",
-        "probability",
-        "probability_mxm1",
         "probability_pack",
         "probability_diagonal",
+        "fused_score",
+        "fused_score_bank1",
+        "fused_causal_mask",
+        "fused_causal_mask_bank1",
         "rope",
+        "rope_staging",
         "context",
+        "output_activation",
         "result",
     )
     for entry in plan_entries:
-        count = text.count(f"{entry} =")
+        count = len(re.findall(
+            rf"(?<![A-Za-z0-9_]){re.escape(entry)} =", text
+        ))
         if count != 1:
             raise AssertionError(
                 f"physical plan entry {entry} must have one task owner, got {count}"
@@ -106,13 +119,14 @@ def main() -> None:
         raise AssertionError("every Tensor attention task must expose its local sub-plan")
 
     required_layouts = (
-        "slices = [28, 29, 30, 31]",
+        'kind = "fp16_mxm_block8_distributed_16"',
         'kind = "fp16_value_x16"',
         "base_row = 7800 : i64",
         'kind = "fp16_probability_x16"',
         "base_row = 6000 : i64",
         'kind = "fp16_probability_diagonal"',
         "base_row = 7000 : i64",
+        'kind = "fp16_rope_fifo_x16"',
         'kind = "fp32_causal_mask_tile"',
         "base_row = 8128 : i64",
     )
@@ -126,6 +140,21 @@ def main() -> None:
     for operation, expected in expected_counts.items():
         if roundtrip_text.count(operation) != expected:
             raise AssertionError(f"{operation} did not survive parse/print roundtrip")
+
+    if args.legacy_target_config is not None:
+        legacy_output = args.output.with_name("attention.legacy.tensor.mlir")
+        run(
+            args.tool,
+            args.input,
+            legacy_output,
+            "ftlpu-stablehlo-to-tensor",
+            args.legacy_target_config,
+        )
+        legacy_text = legacy_output.read_text(encoding="utf-8")
+        if 'kind = "fp16_mxm_block8_distributed_16"' in legacy_text:
+            raise AssertionError("legacy target unexpectedly selected Block8 attention")
+        if 'kind = "fp16_pair_planar"' not in legacy_text:
+            raise AssertionError("legacy target did not fall back to planar Vector attention")
 
 
 if __name__ == "__main__":

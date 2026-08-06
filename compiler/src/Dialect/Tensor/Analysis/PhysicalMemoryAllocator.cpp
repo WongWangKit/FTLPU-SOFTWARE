@@ -13,7 +13,7 @@ bool PhysicalMemoryAllocator::valid(const PhysicalAllocation& allocation) const
         return false;
     llvm::SmallDenseSet<int64_t, 16> unique;
     for (int64_t slice : allocation.slices) {
-        if (slice < 0 || slice >= target_.memory().accumulator_slice_base
+        if (slice < 0 || slice >= target_.memory().slices_per_hemisphere
             || !unique.insert(slice).second)
             return false;
     }

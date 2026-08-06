@@ -71,7 +71,7 @@ StreamRoutePlan plan_attention_routes()
     add("softmax", "score_to_vxm", E::Mem, E::VxmInput, D::East,
         "score", 38, 41);
     add("pv", "probability_activation", E::Mem, E::MxmActivation,
-        D::East, "probability", 41, 45);
+        D::East, "probability_diagonal", 41, 45);
     add("pv", "value_weight", E::Mem, E::MxmWeight, D::East,
         "value", 41, 45);
     add("pv", "context_result", E::MxmResult, E::Mem, D::West,

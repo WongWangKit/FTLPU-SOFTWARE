@@ -4,34 +4,41 @@
 
 ## 调度策略
 
-编译器保留两套通用调度策略：
+默认的 `--mxm-execution auto` 会为当前 BF16 activation、INT8 weight FFN
+选择 16-stream Block8 路径。目前有两套经过验证的 Block8 策略：
 
-- `--ffn-schedule tail` 是默认策略，完整保留已有 FFN 调度。对于
-  `seq_len=128`，首个 SwiGLU 在 cycle 55,355 发射，CModel 程序结束于
-  cycle 92,573。
-- `--ffn-schedule fused` 将已经完成的 Gate/Up tile 与后续 projection
-  重叠。首个 SwiGLU 提前到 cycle 2,363，程序结束于 cycle 86,685，减少
-  5,888 cycles（6.36%）。
+- `--ffn-schedule tail` 是正确性基线。它先完成全部 Gate/Up projection，
+  将每个 pair 写入独立 scratch，再于 cycle 16,574 发射第一条 SwiGLU；
+  程序结束于 cycle 33,681。
+- `--ffn-schedule fused` 将已完成 Gate/Up pair 的 SwiGLU 与后续 projection
+  重叠。stream allocator 根据目标参数预留 projection 实际占用区间，再分配
+  不冲突的 VXM-to-MEM route，emitter 中没有固定高位 stream helper。程序结束
+  于 cycle 27,425，相对 tail 减少 6,256 cycles（18.57%）。
+
+runtime 包含末尾 64 个 drain cycles，tail 与 fused 分别采样 33,745 和
+27,489 cycles。两者的 MEM issue utilization 为 16.89% / 20.74%，MXM
+compute issue utilization 为 32.08% / 39.38%，VXM issue utilization 为
+23.33% / 28.64%。两套 binary 均与 CPU reference 的 73,728 个 BF16 数值
+逐一一致，其中 72,625 个输出非零，最大绝对值为 0.216797。
+
+Tensor lowering 现在为 Gate weight、Up weight 和 Block8 activation 分配三组
+互不重叠的物理 slices。因此 planner 可以让 MXM0 Gate load 与 MXM1 Up load
+以 4-cycle initiation interval 流水发射，不再让每个 reduction 串行占用 8 cycles。
+scratch 只在不同 row address 上复用 weight slices，并显式预约其 queue lifetime。
+当前 CModel 的 MXM0 weight 与 activation 仍共用 E0..E15 transport，所以
+`mxm_weight_activation_overlap_enabled=0` 会让下一组 load 避开 activation 窗口。
+独立 placement 让 tail 和 fused 又各减少 864 cycles；若后续硬件提供独立 transport，
+只需在 target 中打开该能力，不需要修改 planner。
+
+legacy MXM 路径仍然保留，但目前对 fused 的请求会回退到 tail，因为被动
+stream-fabric transport lifetime 尚未精确建模，编译器还不能证明其分配无冲突。
 
 ![融合调度的 seq_len=128 FFN 流水线](smollm2_ffn_fused_pipeline.svg)
 
-fused 策略不使用尚未建模完整的 ACC 直连 VXM 旁路。最后一个 K partial
-中，东半球 MXM 使用 `W8..W15`，西半球 MXM 使用 `W16..W23`。
-`accumulate -> stream + clear` 将完整的 FP32 Gate/Up tile 写入普通 MEM
-临时 byte plane：Gate 使用 local slices `1/5/9/13`，Up 使用
-`2/6/10/14`。VXM allocator 只有在整条 repeat MEM write queue 释放后才会
-读这些临时区，同时避开每个 4-cycle weight-dequant 资源窗口，最后通过
-`E30/E31` 写回 FP16 hidden。ACC 到 MEM 的 transport 计算包含 fabric
-在周期末 commit 所需的额外一拍。
+## 历史 legacy 测量
 
-两套策略由同一套 shape-driven lowering 生成。`seq_len=128` 的 fused
-binary 已在 CModel 上运行，并与 CPU reference 的 73,728 个 FP16 数值
-逐一一致，其中 72,633 个输出非零。
-
-## CModel 实测利用率
-
-下表来自 CModel performance monitor 对编译后 `seq_len=128` binary 的实际
-执行统计。统计包含 runtime 末尾的 64 个 drain cycles，因此 tail 共采样
+下表是早期 legacy fused 实验的归档数据，不代表上面的当前 Block8 策略。
+统计包含 runtime 末尾的 64 个 drain cycles，因此 tail 共采样
 92,637 cycles，fused 共采样 86,749 cycles。`array utilization` 的分母是
 全部采样周期内的 MXM cell 容量；`active density` 会从分母中去掉完全空闲的周期。
 
@@ -85,13 +92,20 @@ buffer 0/1。每个 block 连续发射 32 行 MXM compute，行发射占用率�
 在 CModel 扁平化的 88 条 MEM queue 视图中，东半球 queue 为 `local_slice`，西半球
 queue 为 `44 + local_slice`。
 
-MXM load 使用 16 条 stream。单个 MXM compute 使用两条 FP16 activation stream；并行的
-gate/up 两个 MXM 因而共用 E0..E3。一个 32x32 K block 连续流入 32 行 activation，
-每个输出行在四个物理 K=8 段内累加，生成一个 32x32 partial tile。K=576 的 18 个
-partial tile 先在 MEM 中累加，完整的 gate/up tile 才能进入 SwiGLU。当 B+1 的 load
-与 B 的 compute 重叠时，activation 临时从 E0..E3 切换到 E16..E19。对于本例的物理
-布局，down 相邻 output pair 的间隔为 95 cycle，因为结果写回和下一组权重读取都会
-占用各自半球内的 local MEM slice 24；该间隔由冲突 slice 和 transport latency 动态计算得出。
+编译器现在为 Gate/Up 保留两条完整执行路径。`legacy` 使用下图所示的双 byte-stream
+vector compute；当 BF16 activation、INT8 weight 和目标能力满足约束时，`auto` 会选择
+Block8：16 条分布式 activation stream 每次携带 8 行数据，同一组 `E0..E15` 会同时
+广播给东西半球的 Gate 和 Up MXM，连续 4 次 Block8 issue 覆盖一个 32 行 token tile。
+原始权重通过 8 条 stream 输入，并在各 MXM 内部完成反量化和 IW。
+
+Gate 和 Up 的 `8x32` FP32 block accumulator 不能同时 drain，因为任一路结果都会占满
+全部 32 条 west stream。当前保守调度依次 drain 两路结果，转成两组互不重叠的短生命周期
+BF16 scratch，再逐行执行 SwiGLU。输入和 hidden 使用两组独立的 16-slice 物理布局，
+避免较早完成的 hidden 写回覆盖后续 output wave 仍需读取的输入。SmolLM2-135M 在
+`seq_len=128` 下，完整 FFN 从 legacy 的 105,898 cycles 降到 38,968 cycles，且 CModel
+数值基线保持一致。相邻 K block 现在通过两个 MXM weight buffer 交替预取：下一块权重
+占用当前块最后一个 token tile 前的空闲 issue 窗口，因此两组 repeated Block8 compute
+可以首尾相接。
 
 ![完整的 18 个 K partial 累加](smollm2_ffn_partial_accumulation.svg)
 

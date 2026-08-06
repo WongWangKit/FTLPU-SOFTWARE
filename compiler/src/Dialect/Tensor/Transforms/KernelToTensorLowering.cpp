@@ -1,5 +1,7 @@
 #include "KernelToTensorLowering.hpp"
 
+#include "ftlpu/compiler/Support/float_format.hpp"
+
 #include "llvm/ADT/STLExtras.h"
 
 #include <limits>
@@ -35,6 +37,14 @@ mlir::FailureOr<Allocation> FunctionMemoryPlanner::allocate(
     if (mlir::failed(allocation)) return mlir::failure();
     allocations_.try_emplace(value, *allocation);
     return *allocation;
+}
+
+mlir::FailureOr<Allocation> FunctionMemoryPlanner::lookup(
+    mlir::Value value) const
+{
+    const auto found = allocations_.find(value);
+    if (found == allocations_.end()) return mlir::failure();
+    return found->second;
 }
 
 mlir::LogicalResult FunctionMemoryPlanner::bind(
@@ -104,7 +114,7 @@ mlir::FailureOr<int64_t> RowAllocator::allocate(int64_t rows)
             free_blocks_.erase(free_blocks_.begin() + index);
         return offset;
     }
-    if (rows > 8192 - next_row_) return mlir::failure();
+    if (rows > capacity_rows_ - next_row_) return mlir::failure();
     const int64_t offset = next_row_;
     next_row_ += rows;
     return offset;
@@ -161,6 +171,23 @@ mlir::FailureOr<Allocation> EastMemoryAllocator::allocate(
     return Allocation {kind, std::move(slices), *base_row,
         instruction_count, kind == PlacementKind::Weight ? -16 : 16,
         row_span, bytes, "", "east"};
+}
+
+EastMemoryAllocator::EastMemoryAllocator(
+    const target::LPUTargetModel& target)
+    : activation_(target.memory().banks_per_slice
+          * target.memory().words_per_bank),
+      weight_(target.memory().banks_per_slice
+          * target.memory().words_per_bank),
+      result_(target.memory().banks_per_slice
+          * target.memory().words_per_bank),
+      vxm_result_(target.memory().banks_per_slice
+          * target.memory().words_per_bank),
+      vxm_result1_(target.memory().banks_per_slice
+          * target.memory().words_per_bank),
+      final_result_(target.memory().banks_per_slice
+          * target.memory().words_per_bank)
+{
 }
 
 void EastMemoryAllocator::release(const Allocation& allocation)
@@ -270,11 +297,13 @@ Allocation fixed_allocation(PlacementKind kind,
 bool is_w8a16_ffn(kernel::FfnGraph& graph,
     const target::LPUTargetModel& target)
 {
-    return graph.gate.getLhs().getType().getElementType().isF16()
+    return is_lpu_16bit_float(
+               graph.gate.getLhs().getType().getElementType())
         && graph.gate.getRhs().getType().getElementType().isInteger(8)
         && graph.up.getRhs().getType().getElementType().isInteger(8)
         && graph.output.getRhs().getType().getElementType().isInteger(8)
-        && graph.output.getResult().getType().getElementType().isF16()
+        && is_lpu_16bit_float(
+            graph.output.getResult().getType().getElementType())
         && target.supports_w8a16_ffn_shape(graph.gate.getM(),
             graph.gate.getK(), graph.gate.getN(), graph.output.getN());
 }

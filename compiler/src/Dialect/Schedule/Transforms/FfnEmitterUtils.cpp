@@ -10,6 +10,11 @@ llvm::SmallVector<int64_t> get_slices(mlir::DictionaryAttr placement)
     return result;
 }
 
+int64_t get_base_row(mlir::DictionaryAttr placement)
+{
+    return placement.getAs<mlir::IntegerAttr>("base_row").getInt();
+}
+
 mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
     llvm::ArrayRef<int64_t> slices, int64_t baseRow, int64_t count,
     int64_t stride, llvm::StringRef hemisphere, llvm::StringRef kind)

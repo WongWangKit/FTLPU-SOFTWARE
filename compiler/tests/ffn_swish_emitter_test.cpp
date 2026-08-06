@@ -39,7 +39,7 @@ int main()
     auto [local, peer] = schedule::ffn_detail::emitFfnSwishAlu(
         rewriter, rewriter.getUnknownLoc(), tensor,
         entry->getArgument(0), entry->getArgument(1), target,
-        FfnScheduleStrategy::Fused, 10, 0);
+        FfnScheduleStrategy::Fused, 10, 0, 24);
 
     int instructions = 0;
     int expInstructions = 0;
@@ -63,4 +63,14 @@ int main()
         "local Swish output must remain in the source hemisphere");
     require(peer.getOutputHemisphere() == "west",
         "peer Swish output must cross to the other hemisphere");
+    require(local.getQueue() == 9,
+        "local Swish cast must use the east VXM output queue");
+    require(peer.getQueue() == 10,
+        "peer Swish cast must use the west VXM output queue");
+
+    auto placement = schedule::ffn_detail::schedule_placement(rewriter,
+        {31}, 8192 + 3 * 128 + 64, 1, 1, "east",
+        "fp16_mxm_activation_planar");
+    require(schedule::ffn_detail::get_base_row(placement) == 8640,
+        "FFN schedule placement must preserve the physical base row");
 }

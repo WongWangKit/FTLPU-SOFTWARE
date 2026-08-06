@@ -1,4 +1,4 @@
-// Keep the tool rebuilt with the BinaryProgram and binding-metadata ABI.
+// Keep the tool rebuilt with the BinaryProgram timeline and binding ABI.
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
 #include "ftlpu/compiler/Target/command_binary.hpp"
 #include "ftlpu/software/runtime/binary.hpp"

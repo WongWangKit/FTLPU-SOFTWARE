@@ -12,7 +12,7 @@ namespace ftlpu::software::runtime {
 namespace {
 
 constexpr std::array<char, 8> kMagic {'F', 'T', 'L', 'P', 'U', 'M', '0', '1'};
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 4;
 
 template <typename T>
 void write_scalar(std::ostream& stream, T value)
@@ -109,6 +109,28 @@ std::vector<ModelBindingRef> read_binding_refs(std::istream& stream)
     return refs;
 }
 
+void write_state_binding_refs(
+    std::ostream& stream, const std::vector<ModelStateBindingRef>& refs)
+{
+    write_scalar(stream, static_cast<std::uint32_t>(refs.size()));
+    for (const auto& ref : refs) {
+        write_scalar(stream, ref.binding_index);
+        write_string(stream, ref.state);
+    }
+}
+
+std::vector<ModelStateBindingRef> read_state_binding_refs(
+    std::istream& stream)
+{
+    const auto count = read_scalar<std::uint32_t>(stream);
+    std::vector<ModelStateBindingRef> refs;
+    refs.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index)
+        refs.push_back(
+            {read_scalar<std::uint32_t>(stream), read_string(stream)});
+    return refs;
+}
+
 } // namespace
 
 void validate_model_package(const ModelPackage& package)
@@ -135,6 +157,33 @@ void validate_model_package(const ModelPackage& package)
             throw std::invalid_argument(
                 "FTLPU model package value names must be unique");
     }
+    for (const auto& lookup : package.embedding_lookups) {
+        if (lookup.name.empty() || lookup.token_ids.empty()
+            || lookup.table.empty() || lookup.output.empty()
+            || !names.contains(lookup.token_ids)
+            || !names.contains(lookup.table)
+            || !names.contains(lookup.output))
+            throw std::invalid_argument(
+                "FTLPU embedding lookup references an invalid model value");
+    }
+    for (const auto& lm_head : package.host_lm_heads) {
+        if (lm_head.name.empty() || lm_head.hidden.empty()
+            || lm_head.weight.empty() || lm_head.output.empty()
+            || !names.contains(lm_head.hidden)
+            || !names.contains(lm_head.weight)
+            || !names.contains(lm_head.output))
+            throw std::invalid_argument(
+                "FTLPU host LM head references an invalid model value");
+    }
+    std::unordered_set<std::string> state_names;
+    for (const auto& state : package.states) {
+        if (state.name.empty() || !names.insert(state.name).second
+            || !state_names.insert(state.name).second
+            || state.shape.empty() || state.max_tokens == 0
+            || state.shape.front() != state.max_tokens)
+            throw std::invalid_argument(
+                "FTLPU model state metadata is invalid");
+    }
 
     for (const auto& executable : package.executables)
         if (executable.name.empty())
@@ -159,6 +208,13 @@ void validate_model_package(const ModelPackage& package)
                 || !output_indices.insert(ref.binding_index).second)
                 throw std::invalid_argument(
                     "FTLPU model invocation has an invalid output binding");
+        }
+        std::unordered_set<std::uint32_t> state_indices;
+        for (const auto& ref : invocation.states) {
+            if (!state_names.contains(ref.state)
+                || !state_indices.insert(ref.binding_index).second)
+                throw std::invalid_argument(
+                    "FTLPU model invocation has an invalid state binding");
         }
     }
 }
@@ -200,6 +256,18 @@ void write_model_package(
     write_scalar(stream, static_cast<std::uint32_t>(package.executables.size()));
     for (const auto& executable : package.executables) {
         write_string(stream, executable.name);
+        if (!executable.serialized_program.empty()) {
+            write_scalar(stream, static_cast<std::uint64_t>(
+                executable.serialized_program.size()));
+            stream.write(reinterpret_cast<const char*>(
+                    executable.serialized_program.data()),
+                static_cast<std::streamsize>(
+                    executable.serialized_program.size()));
+            if (!stream)
+                throw std::runtime_error(
+                    "failed to write embedded FTLPU executable");
+            continue;
+        }
         std::ostringstream binary(std::ios::out | std::ios::binary);
         write_binary_program(executable.program, binary);
         const std::string data = binary.str();
@@ -210,16 +278,49 @@ void write_model_package(
                 "failed to write embedded FTLPU executable");
     }
 
+    write_scalar(stream,
+        static_cast<std::uint32_t>(package.embedding_lookups.size()));
+    for (const auto& lookup : package.embedding_lookups) {
+        write_string(stream, lookup.name);
+        write_string(stream, lookup.token_ids);
+        write_string(stream, lookup.table);
+        write_string(stream, lookup.output);
+    }
+
+    write_scalar(stream,
+        static_cast<std::uint32_t>(package.host_lm_heads.size()));
+    for (const auto& lm_head : package.host_lm_heads) {
+        write_string(stream, lm_head.name);
+        write_string(stream, lm_head.hidden);
+        write_string(stream, lm_head.weight);
+        write_string(stream, lm_head.output);
+        write_scalar(stream,
+            static_cast<std::uint8_t>(lm_head.last_token_only));
+    }
+
+    write_scalar(stream, static_cast<std::uint32_t>(package.states.size()));
+    for (const auto& state : package.states) {
+        write_string(stream, state.name);
+        write_scalar(stream, static_cast<std::uint16_t>(state.kind));
+        write_scalar(stream,
+            static_cast<std::uint16_t>(state.element_type));
+        write_scalar(stream, state.layer);
+        write_scalar(stream, state.max_tokens);
+        write_vector(stream, state.shape);
+    }
+
     write_scalar(stream, static_cast<std::uint32_t>(package.invocations.size()));
     for (const auto& invocation : package.invocations) {
         write_string(stream, invocation.name);
         write_scalar(stream, invocation.executable_index);
         write_binding_refs(stream, invocation.inputs);
         write_binding_refs(stream, invocation.outputs);
+        write_state_binding_refs(stream, invocation.states);
     }
 }
 
-ModelPackage read_model_package(const std::filesystem::path& path)
+ModelPackage read_model_package(
+    const std::filesystem::path& path, ModelPackageLoadMode mode)
 {
     std::ifstream stream(path, std::ios::binary);
     if (!stream)
@@ -228,7 +329,8 @@ ModelPackage read_model_package(const std::filesystem::path& path)
     stream.read(magic.data(), static_cast<std::streamsize>(magic.size()));
     if (!stream || magic != kMagic)
         throw std::runtime_error("invalid FTLPU model package magic");
-    if (read_scalar<std::uint32_t>(stream) != kVersion)
+    const std::uint32_t version = read_scalar<std::uint32_t>(stream);
+    if (version < 1 || version > kVersion)
         throw std::runtime_error("unsupported FTLPU model package version");
 
     ModelPackage package;
@@ -272,13 +374,74 @@ ModelPackage read_model_package(const std::filesystem::path& path)
         ModelExecutable executable;
         executable.name = read_string(stream);
         const auto size = read_scalar<std::uint64_t>(stream);
-        std::string data(static_cast<std::size_t>(size), '\0');
-        stream.read(data.data(), static_cast<std::streamsize>(data.size()));
-        if (!stream)
-            throw std::runtime_error("truncated embedded FTLPU executable");
-        std::istringstream binary(data, std::ios::in | std::ios::binary);
-        executable.program = read_binary_program(binary);
+        if (size > static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max()))
+            throw std::runtime_error(
+                "embedded FTLPU executable is too large");
+        if (mode == ModelPackageLoadMode::LazyExecutables) {
+            executable.serialized_program.resize(
+                static_cast<std::size_t>(size));
+            stream.read(reinterpret_cast<char*>(
+                    executable.serialized_program.data()),
+                static_cast<std::streamsize>(
+                    executable.serialized_program.size()));
+            if (!stream)
+                throw std::runtime_error(
+                    "truncated embedded FTLPU executable");
+            executable.program = read_binary_program_metadata(
+                executable.serialized_program);
+            package.executables.push_back(std::move(executable));
+            continue;
+        }
+        const std::streampos begin = stream.tellg();
+        if (begin == std::streampos(-1))
+            throw std::runtime_error(
+                "failed to locate embedded FTLPU executable");
+        executable.program = read_binary_program(stream);
+        const std::streampos end = stream.tellg();
+        if (end == std::streampos(-1)
+            || static_cast<std::uint64_t>(end - begin) != size)
+            throw std::runtime_error(
+                "embedded FTLPU executable size mismatch");
         package.executables.push_back(std::move(executable));
+    }
+
+    if (version >= 2) {
+        const auto lookup_count = read_scalar<std::uint32_t>(stream);
+        package.embedding_lookups.reserve(lookup_count);
+        for (std::uint32_t index = 0; index < lookup_count; ++index) {
+            package.embedding_lookups.push_back(ModelEmbeddingLookup {
+                read_string(stream), read_string(stream),
+                read_string(stream), read_string(stream)});
+        }
+    }
+    if (version >= 3) {
+        const auto lm_head_count = read_scalar<std::uint32_t>(stream);
+        package.host_lm_heads.reserve(lm_head_count);
+        for (std::uint32_t index = 0; index < lm_head_count; ++index) {
+            package.host_lm_heads.push_back(ModelHostLmHead {
+                read_string(stream), read_string(stream),
+                read_string(stream), read_string(stream),
+                read_scalar<std::uint8_t>(stream) != 0});
+        }
+    }
+    if (version >= 4) {
+        const auto state_count = read_scalar<std::uint32_t>(stream);
+        package.states.reserve(state_count);
+        for (std::uint32_t index = 0; index < state_count; ++index) {
+            ModelState state;
+            state.name = read_string(stream);
+            state.kind =
+                static_cast<ModelStateKind>(
+                    read_scalar<std::uint16_t>(stream));
+            state.element_type =
+                static_cast<BindingElementType>(
+                    read_scalar<std::uint16_t>(stream));
+            state.layer = read_scalar<std::uint32_t>(stream);
+            state.max_tokens = read_scalar<std::uint32_t>(stream);
+            state.shape = read_vector<std::uint64_t>(stream);
+            package.states.push_back(std::move(state));
+        }
     }
 
     const auto invocation_count = read_scalar<std::uint32_t>(stream);
@@ -289,10 +452,25 @@ ModelPackage read_model_package(const std::filesystem::path& path)
         invocation.executable_index = read_scalar<std::uint32_t>(stream);
         invocation.inputs = read_binding_refs(stream);
         invocation.outputs = read_binding_refs(stream);
+        if (version >= 4)
+            invocation.states = read_state_binding_refs(stream);
         package.invocations.push_back(std::move(invocation));
     }
     validate_model_package(package);
     return package;
+}
+
+ModelPackage read_model_package(const std::filesystem::path& path)
+{
+    return read_model_package(path, ModelPackageLoadMode::Eager);
+}
+
+BinaryProgram materialize_model_executable(
+    const ModelExecutable& executable)
+{
+    if (executable.serialized_program.empty())
+        return executable.program;
+    return read_binary_program(executable.serialized_program);
 }
 
 } // namespace ftlpu::software::runtime

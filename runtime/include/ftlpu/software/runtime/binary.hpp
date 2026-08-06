@@ -7,12 +7,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 8;
+inline constexpr std::uint32_t kBinaryFormatVersion = 15;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -25,6 +26,7 @@ enum class BindingElementType : std::uint16_t {
     I32 = 2,
     F16 = 3,
     F32 = 4,
+    BF16 = 5,
 };
 
 enum class BindingLayout : std::uint16_t {
@@ -42,6 +44,8 @@ enum class BindingLayout : std::uint16_t {
     Fp16VxmDistributed16 = 12,
     Fp16MxmDistributed16 = 13,
     Fp16RopeTable = 14,
+    W8A16Block8WeightWaveStriped = 15,
+    Fp16MxmBlock8Distributed16 = 16,
 };
 
 enum class BindingInitializer : std::uint16_t {
@@ -88,18 +92,53 @@ struct BinaryScaleRelocation {
     VxmImmediateOperand operand{VxmImmediateOperand::Rhs};
 };
 
+struct BinaryAddressRelocation {
+    std::uint32_t binding_index{0};
+    BindingAccess binding_access{BindingAccess::Input};
+    QueueKind queue_kind{QueueKind::Mem};
+    std::uint16_t queue_index{0};
+    std::uint32_t command_index{0};
+    // ReadWrite has a second independently relocatable SRAM address.
+    bool write_port{false};
+};
+
+struct BinaryTimeline {
+    std::string name{};
+    std::uint64_t start_cycle{0};
+    std::uint64_t end_cycle{0};
+};
+
+struct BinaryMemoryFloor {
+    std::uint16_t hemisphere{0};
+    std::uint16_t slice{0};
+    std::uint32_t first_free_row{0};
+};
+
 struct BinaryProgram {
     std::string target_name{std::string(kLpu32StreamTargetName)};
     std::uint64_t target_abi{kLpu32StreamTargetAbi};
+    std::uint32_t memory_rows_per_slice{65536};
+    // Logical topology used to number MXM queues in this executable. The
+    // runtime maps these queues onto the CModel's physical MXM topology.
+    std::uint32_t mxms_per_hemisphere{hw::kMxmsPerHemisphere};
     std::size_t max_cycle{0};
     std::vector<QueueProgram> queues{};
     std::vector<BinaryBinding> bindings{};
+    std::vector<BinaryTimeline> timelines{};
+    // Per-physical-slice upper bounds for statically addressed command
+    // scratch. Resident allocations start at or above these rows.
+    std::vector<BinaryMemoryFloor> memory_floors{};
     std::vector<BinaryScaleRelocation> scale_relocations{};
+    std::vector<BinaryAddressRelocation> address_relocations{};
 };
 
 void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path);
 BinaryProgram read_binary_program(const std::filesystem::path& path);
 void write_binary_program(const BinaryProgram& program, std::ostream& stream);
 BinaryProgram read_binary_program(std::istream& stream);
+BinaryProgram read_binary_program(std::span<const std::uint8_t> data);
+BinaryProgram read_binary_program_metadata(std::istream& stream);
+BinaryProgram read_binary_program_metadata(
+    std::span<const std::uint8_t> data);
 
 } // namespace ftlpu::software::runtime

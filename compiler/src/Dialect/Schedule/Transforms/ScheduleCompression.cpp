@@ -83,6 +83,17 @@ bool same_vxm_body(schedule::VxmOp lhs, schedule::VxmOp rhs)
         && lhs.getResult().getType() == rhs.getResult().getType();
 }
 
+bool same_sxm_body(schedule::SxmOp lhs, schedule::SxmOp rhs)
+{
+    for (llvm::StringRef name : {"hemisphere", "opcode",
+             "source_streams", "destination_streams", "permute_map",
+             "weight_layout"})
+        if (lhs->getAttr(name) != rhs->getAttr(name))
+            return false;
+    return lhs.getRepeatCount().value_or(1) == 1
+        && rhs.getRepeatCount().value_or(1) == 1;
+}
+
 class CompressSchedulePass final
     : public mlir::PassWrapper<CompressSchedulePass,
           mlir::OperationPass<mlir::func::FuncOp>> {
@@ -200,6 +211,7 @@ public:
 
         compressMemReads(function, *target, builder);
         compressVxm(function, builder);
+        compressSxm(function, builder);
         function->setAttr(
             "ftlpu.schedule.compressed", builder.getUnitAttr());
     }
@@ -364,6 +376,60 @@ private:
             index = end;
         }
         for (schedule::VxmOp operation : toErase)
+            operation.erase();
+    }
+
+    void compressSxm(
+        mlir::func::FuncOp function, mlir::Builder& builder)
+    {
+        llvm::SmallVector<schedule::SxmOp> operations;
+        function.walk(
+            [&](schedule::SxmOp op) { operations.push_back(op); });
+        llvm::sort(operations,
+            [](schedule::SxmOp lhs, schedule::SxmOp rhs) {
+                if (lhs.getHemisphere() != rhs.getHemisphere())
+                    return lhs.getHemisphere() < rhs.getHemisphere();
+                if (lhs.getOpcode() != rhs.getOpcode())
+                    return lhs.getOpcode() < rhs.getOpcode();
+                return lhs.getCycle() < rhs.getCycle();
+            });
+
+        llvm::SmallVector<schedule::SxmOp> toErase;
+        for (std::size_t index = 0; index < operations.size();) {
+            schedule::SxmOp first = operations[index];
+            std::size_t end = index + 1;
+            if (end >= operations.size()
+                || !same_sxm_body(first, operations[end])) {
+                ++index;
+                continue;
+            }
+            const int64_t interval =
+                operations[end].getCycle() - first.getCycle();
+            if (interval <= 0 || interval > kMaxRepeatInterval) {
+                ++index;
+                continue;
+            }
+            ++end;
+            while (end < operations.size()
+                && static_cast<int64_t>(end - index)
+                    < kMaxRepeatCount) {
+                const int64_t repeat =
+                    static_cast<int64_t>(end - index);
+                if (!same_sxm_body(first, operations[end])
+                    || operations[end].getCycle()
+                        != first.getCycle() + repeat * interval)
+                    break;
+                ++end;
+            }
+            first->setAttr("repeat_count",
+                builder.getI64IntegerAttr(end - index));
+            first->setAttr(
+                "repeat_interval", builder.getI64IntegerAttr(interval));
+            for (std::size_t erase = index + 1; erase < end; ++erase)
+                toErase.push_back(operations[erase]);
+            index = end;
+        }
+        for (schedule::SxmOp operation : toErase)
             operation.erase();
     }
 };

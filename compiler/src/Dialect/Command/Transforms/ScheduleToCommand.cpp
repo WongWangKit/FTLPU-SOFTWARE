@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
@@ -47,6 +48,7 @@ llvm::StringRef element_type_name(mlir::Type type)
     if (integer && integer.getWidth() == 8) return "i8";
     if (integer && integer.getWidth() == 32) return "i32";
     if (type.isF16()) return "f16";
+    if (type.isBF16()) return "bf16";
     if (type.isF32()) return "f32";
     return "unsupported";
 }
@@ -55,9 +57,38 @@ int64_t element_type_bytes(mlir::Type type)
 {
     if (auto integer = llvm::dyn_cast<mlir::IntegerType>(type))
         return (integer.getWidth() + 7) / 8;
-    if (type.isF16()) return 2;
+    if (is_lpu_16bit_float(type)) return 2;
     if (type.isF32()) return 4;
     return 0;
+}
+
+std::optional<int64_t> source_binding_index(mlir::Value value)
+{
+    llvm::SmallVector<mlir::Value> pending {value};
+    llvm::SmallDenseSet<mlir::Value, 16> visited;
+    std::optional<int64_t> result;
+    while (!pending.empty()) {
+        mlir::Value current = pending.pop_back_val();
+        if (!visited.insert(current).second) continue;
+        if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(current)) {
+            const int64_t index = argument.getArgNumber();
+            if (result && *result != index) return std::nullopt;
+            result = index;
+            continue;
+        }
+        mlir::Operation* defining = current.getDefiningOp();
+        if (!defining) continue;
+        if (auto binding = llvm::dyn_cast<schedule::BindingOp>(defining)) {
+            if (binding.getAccess() != "input") continue;
+            const int64_t index = binding.getIndex();
+            if (result && *result != index) return std::nullopt;
+            result = index;
+            continue;
+        }
+        for (mlir::Value operand : defining->getOperands())
+            pending.push_back(operand);
+    }
+    return result;
 }
 
 void create_binding(mlir::OpBuilder& builder, mlir::Location location,
@@ -96,7 +127,8 @@ void create_mem_command(mlir::OpBuilder& builder, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t address,
     int64_t packed_stream, int64_t repeat_count, int64_t repeat_interval,
     int64_t address_stride, int64_t wave_count = 1,
-    int64_t wave_interval = 1, int64_t wave_address_stride = 0)
+    int64_t wave_interval = 1, int64_t wave_address_stride = 0,
+    int64_t address_binding = -1)
 {
     mlir::OperationState state(location, command::MemOp::getOperationName());
     state.addAttributes({
@@ -117,15 +149,19 @@ void create_mem_command(mlir::OpBuilder& builder, mlir::Location location,
         state.addAttribute("wave_address_stride",
             builder.getI64IntegerAttr(wave_address_stride));
     }
+    if (address_binding >= 0)
+        state.addAttribute("address_binding",
+            builder.getI64IntegerAttr(address_binding));
     builder.create(state);
 }
 
-void create_mxm_command(mlir::OpBuilder& builder, mlir::Location location,
+command::MxmOp create_mxm_command(
+    mlir::OpBuilder& builder, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t weight_buffer,
     int64_t weight_column, int64_t activation_stream_base, int64_t output_stream_base,
     int64_t repeat_count, int64_t repeat_interval, int64_t accumulator_address,
     int64_t accumulator_row_stride, llvm::StringRef accumulator_destination,
-    bool accumulator_clear = true)
+    bool accumulator_clear = true, llvm::StringRef data_format = "fp16")
 {
     mlir::OperationState state(location, command::MxmOp::getOperationName());
     state.addAttributes({
@@ -142,8 +178,9 @@ void create_mxm_command(mlir::OpBuilder& builder, mlir::Location location,
         builder.getNamedAttr("accumulator_row_stride", builder.getI64IntegerAttr(accumulator_row_stride)),
         builder.getNamedAttr("accumulator_destination", builder.getStringAttr(accumulator_destination)),
         builder.getNamedAttr("accumulator_clear", builder.getBoolAttr(accumulator_clear)),
+        builder.getNamedAttr("data_format", builder.getStringAttr(data_format)),
     });
-    builder.create(state);
+    return llvm::cast<command::MxmOp>(builder.create(state));
 }
 
 void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op,
@@ -183,6 +220,10 @@ void create_sxm_command(mlir::OpBuilder& builder, schedule::SxmOp op)
     for (llvm::StringRef name : {"cycle", "hemisphere", "opcode", "source_streams",
              "destination_streams", "permute_map", "weight_layout"})
         state.addAttribute(name, op->getAttr(name));
+    state.addAttribute("repeat_count", builder.getI64IntegerAttr(
+        op.getRepeatCount().value_or(1)));
+    state.addAttribute("repeat_interval", builder.getI64IntegerAttr(
+        op.getRepeatInterval().value_or(1)));
     builder.create(state);
 }
 
@@ -197,7 +238,8 @@ void create_mem_transfer_command(mlir::OpBuilder& builder,
         op.getHemisphere() * target.memory().slices_per_hemisphere
         + op.getSlice()));
     for (llvm::StringRef name :
-        {"wave_count", "wave_interval", "wave_address_stride"})
+        {"wave_count", "wave_interval", "wave_address_stride",
+            "address_binding"})
         if (mlir::Attribute attribute = op->getAttr(name))
             state.addAttribute(name, attribute);
     builder.create(state);
@@ -212,7 +254,37 @@ void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
              "accumulator_row_stride", "accumulator_destination",
              "accumulator_clear"})
         state.addAttribute(name, op->getAttr(name));
+    state.addAttribute("data_format", op.getDataFormatAttr()
+            ? op.getDataFormatAttr()
+            : builder.getStringAttr("fp16"));
+    state.addAttribute("accumulator_output_format",
+        op.getAccumulatorOutputFormatAttr()
+            ? op.getAccumulatorOutputFormatAttr()
+            : builder.getStringAttr("fp32"));
     state.addAttribute("queue", builder.getI64IntegerAttr(op.getUnitId()));
+    for (llvm::StringRef name :
+        {"weight_load_mode", "weight_inner_column",
+            "weight_input_mode", "compute_mode"})
+        if (mlir::Attribute attribute = op->getAttr(name))
+            state.addAttribute(name, attribute);
+    builder.create(state);
+}
+
+void create_mxm_dequant_command(
+    mlir::OpBuilder& builder, schedule::MxmDequantOp op)
+{
+    mlir::OperationState state(
+        op.getLoc(), command::MxmDequantOp::getOperationName());
+    state.addAttributes({
+        builder.getNamedAttr("cycle", op.getCycleAttr()),
+        builder.getNamedAttr(
+            "queue", builder.getI64IntegerAttr(op.getUnitId())),
+        builder.getNamedAttr("scale", op.getScaleAttr()),
+        builder.getNamedAttr(
+            "repeat_count", op.getRepeatCountAttr()),
+        builder.getNamedAttr(
+            "repeat_interval", op.getRepeatIntervalAttr()),
+    });
     builder.create(state);
 }
 
@@ -234,6 +306,9 @@ public:
         bool has_commands = false;
         function.walk([&](command::MemOp) { has_commands = true; });
         function.walk([&](command::MxmOp) { has_commands = true; });
+        function.walk([&](command::MxmDequantOp) {
+            has_commands = true;
+        });
         function.walk([&](command::VxmOp) { has_commands = true; });
         function.walk([&](command::SxmOp) { has_commands = true; });
         if (has_commands) {
@@ -250,6 +325,7 @@ public:
         llvm::SmallVector<schedule::SxmOp> sxms;
         llvm::SmallVector<schedule::MemTransferOp> mem_transfers;
         llvm::SmallVector<schedule::MxmIssueOp> mxm_issues;
+        llvm::SmallVector<schedule::MxmDequantOp> mxm_dequants;
         llvm::SmallVector<schedule::BindingOp> bindings;
         llvm::SmallVector<schedule::TimelineOp> timelines;
         llvm::SmallVector<schedule::MemWriteOp> writes;
@@ -278,6 +354,9 @@ public:
         function.walk([&](schedule::MxmIssueOp op) {
             mxm_issues.push_back(op);
         });
+        function.walk([&](schedule::MxmDequantOp op) {
+            mxm_dequants.push_back(op);
+        });
         function.walk([&](schedule::BindingOp op) {
             bindings.push_back(op);
         });
@@ -293,6 +372,7 @@ public:
         if (reads.empty() && loads.empty() && computes.empty()
             && accumulator_reads.empty() && vxms.empty() && sxms.empty()
             && mem_transfers.empty() && mxm_issues.empty()
+            && mxm_dequants.empty()
             && bindings.empty() && timelines.empty() && writes.empty()
             && accumulates.empty()) {
             function.emitError("requires Schedule IR operations");
@@ -300,7 +380,13 @@ public:
             return;
         }
 
-        const target::LPUTargetModel target;
+        auto target_model =
+            target::LPUTargetModel::from_operation(function);
+        if (mlir::failed(target_model)) {
+            signalPassFailure();
+            return;
+        }
+        const target::LPUTargetModel& target = *target_model;
         mlir::OpBuilder builder(&getContext());
         builder.setInsertionPointToStart(&function.getBody().front());
         llvm::SmallDenseSet<unsigned> bound_inputs;
@@ -327,6 +413,16 @@ public:
                 binding.getInitializer().value_or("none"),
                 binding.getInitializerConfig().value_or(
                     builder.getDictionaryAttr({})));
+        }
+        for (schedule::TimelineOp timeline : timelines) {
+            mlir::OperationState state(
+                timeline.getLoc(), command::TimelineOp::getOperationName());
+            state.addAttributes({
+                builder.getNamedAttr("name", timeline.getNameAttr()),
+                builder.getNamedAttr("start", timeline.getStartAttr()),
+                builder.getNamedAttr("end", timeline.getEndAttr()),
+            });
+            builder.create(state);
         }
         for (schedule::MemReadOp read : reads) {
             auto argument =
@@ -435,7 +531,9 @@ public:
                     && !second->getAttr("wave_count")
                     && second.getOpcode() == first.getOpcode()
                     && second.getPackedStream()
-                        == first.getPackedStream();
+                        == first.getPackedStream()
+                    && second.getAddressBinding()
+                        == first.getAddressBinding();
                 if (compatible) {
                     interval = second.getCycle() - first.getCycle();
                     stride = second.getAddress() - first.getAddress();
@@ -463,6 +561,8 @@ public:
                                     != first.getOpcode()
                                 || next.getPackedStream()
                                     != first.getPackedStream()
+                                || next.getAddressBinding()
+                                    != first.getAddressBinding()
                                 || next.getCycle()
                                     != first.getCycle()
                                         + repeat * interval
@@ -486,7 +586,8 @@ public:
                 create_mem_command(builder, first.getLoc(),
                     first.getCycle(), queue, first.getOpcode(),
                     first.getAddress(), first.getPackedStream(),
-                    runLength, interval, stride);
+                    runLength, interval, stride, 1, 1, 0,
+                    first.getAddressBinding().value_or(-1));
             } else {
                 create_mem_transfer_command(
                     builder, first, target);
@@ -499,6 +600,11 @@ public:
             builder.setInsertionPointAfter(mxm);
             create_mxm_issue_command(builder, mxm);
             mxm.erase();
+        }
+        for (schedule::MxmDequantOp dequant : mxm_dequants) {
+            builder.setInsertionPointAfter(dequant);
+            create_mxm_dequant_command(builder, dequant);
+            dequant.erase();
         }
         llvm::sort(vxms, [](schedule::VxmOp lhs, schedule::VxmOp rhs) {
             return lhs.getQueue() != rhs.getQueue()
@@ -554,6 +660,7 @@ public:
             int64_t repeat_count;
             int64_t repeat_interval;
             int64_t address_stride;
+            int64_t address_binding;
         };
         llvm::SmallVector<PendingReadCommand> pendingReads;
         for (schedule::MemReadOp read : reads) {
@@ -595,6 +702,14 @@ public:
             }
             const int64_t command_base = stride < 0
                 ? base_row - (count - 1) * stride : base_row;
+            const int64_t addressBinding =
+                source_binding_index(read.getInput()).value_or(-1);
+            if (read.getRole() == "weight" && addressBinding < 0) {
+                read.emitError(
+                    "weight MEM read must resolve to one input binding");
+                signalPassFailure();
+                return;
+            }
             for (size_t index = 0; index < slices.size(); ++index) {
                 const int64_t latency = *target.transport_latency(
                     target::StreamEndpoint::Mem, destination,
@@ -612,6 +727,7 @@ public:
                     count,
                     1,
                     stride,
+                    addressBinding,
                 });
             }
         }
@@ -637,7 +753,9 @@ public:
                 if (second.queue == first.queue
                     && second.packed_stream
                         == first.packed_stream
-                    && second.repeat_count == 1) {
+                    && second.repeat_count == 1
+                    && second.address_binding
+                        == first.address_binding) {
                     interval = second.cycle - first.cycle;
                     stride = second.address - first.address;
                     if (interval > 0
@@ -656,6 +774,8 @@ public:
                                 || next.packed_stream
                                     != first.packed_stream
                                 || next.repeat_count != 1
+                                || next.address_binding
+                                    != first.address_binding
                                 || next.cycle
                                     != first.cycle
                                         + repeat * interval
@@ -682,7 +802,8 @@ public:
                 runLength > 1 ? interval
                               : first.repeat_interval,
                 runLength > 1 ? stride
-                              : first.address_stride);
+                              : first.address_stride,
+                1, 1, 0, first.address_binding);
             index = end;
         }
 
@@ -697,9 +818,12 @@ public:
                 // controls in reverse physical order.
                 const int64_t weight_column = target.throughput().tile_rows - 1
                     - column % target.throughput().tile_rows;
-                create_mxm_command(builder, load.getLoc(), load.getCycle() + column, load.getUnitId(),
+                auto command = create_mxm_command(builder, load.getLoc(), load.getCycle() + column, load.getUnitId(),
                     "iw", load.getWeightBuffer(), weight_column,
-                    0, 0, 1, 1, 0, 1, "sram");
+                    0, 0, 1, 1, 0, 1, "sram", true,
+                    load.getDataFormat().value_or("fp16"));
+                if (auto mode = load.getWeightInputModeAttr())
+                    command->setAttr("weight_input_mode", mode);
             }
         }
         for (schedule::MxmComputeOp compute : computes) {
@@ -739,19 +863,24 @@ public:
                 return;
             }
             builder.setInsertionPointAfter(compute);
-            create_mxm_command(builder, compute.getLoc(), compute.getCycle(), compute.getUnitId(),
+            auto command = create_mxm_command(builder, compute.getLoc(), compute.getCycle(), compute.getUnitId(),
                 "compute", compute.getWeightBuffer(), 0, compute.getActivationStreamBase(),
                 compute.getOutputStreamBase(), compute.getDuration(), 1,
                 placement_integer(accumulator.getPlacement(), "base_row"),
-                accumulator.getAddressStride(), accumulator.getDestination());
+                accumulator.getAddressStride(), accumulator.getDestination(),
+                true, compute.getDataFormat().value_or("fp16"));
+            if (auto mode = compute.getComputeModeAttr())
+                command->setAttr("compute_mode", mode);
         }
         for (schedule::MxmAccumulatorReadOp read : accumulator_reads) {
             builder.setInsertionPointAfter(read);
-            create_mxm_command(builder, read.getLoc(), read.getCycle(),
+            auto command = create_mxm_command(builder, read.getLoc(), read.getCycle(),
                 read.getUnitId(), "accumulator_read", 0, 0, 0,
                 read.getOutputStreamBase(), 1, 1,
                 read.getAccumulatorAddress(), 1, "sram",
-                read.getClear());
+                read.getClear(), read.getDataFormat().value_or("fp16"));
+            if (auto mode = read.getComputeModeAttr())
+                command->setAttr("compute_mode", mode);
         }
         for (schedule::MemWriteOp write : writes) {
             const auto slices = placement_slices(write.getPlacement());
@@ -790,6 +919,7 @@ public:
                     schedule::MxmAccumulatorReadOp, schedule::VxmOp,
                     schedule::SxmOp,
                     schedule::MemTransferOp, schedule::MxmIssueOp,
+                    schedule::MxmDequantOp,
                     schedule::MemAccumulateOp, schedule::MemWriteOp,
                     schedule::BindingOp, schedule::TimelineOp>(op))
                 ordered_schedule_ops.push_back(op);

@@ -29,8 +29,10 @@ LogicalResult BindingOp::verify()
         && getRole() != "result" && getRole() != "constant")
         return emitOpError("role must be activation, weight, result, or constant");
     if (getElementType() != "i8" && getElementType() != "i32"
-        && getElementType() != "f16" && getElementType() != "f32")
-        return emitOpError("element_type must be i8, i32, f16, or f32");
+        && getElementType() != "f16" && getElementType() != "bf16"
+        && getElementType() != "f32")
+        return emitOpError(
+            "element_type must be i8, i32, f16, bf16, or f32");
     if (getShape().empty()) return emitOpError("requires a ranked shape");
     if (getInitializer() != "none" && getInitializer() != "zero"
         && getInitializer() != "causal_mask"
@@ -59,6 +61,15 @@ LogicalResult BindingOp::verify()
     return success();
 }
 
+LogicalResult TimelineOp::verify()
+{
+    if (getName().empty())
+        return emitOpError("requires a non-empty name");
+    if (getStart() < 0 || getEnd() < getStart())
+        return emitOpError("requires 0 <= start <= end");
+    return success();
+}
+
 LogicalResult MemOp::verify()
 {
     auto targetModel = target::LPUTargetModel::from_operation(*this);
@@ -78,8 +89,9 @@ LogicalResult MemOp::verify()
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0
         || waveCount <= 0 || waveInterval <= 0)
         return emitOpError("contains an invalid ICU MEM queue command field");
-    if (getOpcode() != "read" && getOpcode() != "write")
-        return emitOpError("opcode must be read or write");
+    if (getOpcode() != "read" && getOpcode() != "write"
+        && getOpcode() != "write_tap")
+        return emitOpError("opcode must be read, write, or write_tap");
     const int64_t corners[] = {
         getAddress(),
         getAddress() + (getRepeatCount() - 1) * getAddressStride(),
@@ -108,6 +120,30 @@ LogicalResult MxmOp::verify()
     if (getOpcode() != "iw" && getOpcode() != "compute"
         && getOpcode() != "accumulator_read")
         return emitOpError("opcode must be iw, compute, or accumulator_read");
+    const llvm::StringRef dataFormat =
+        getDataFormat().value_or("fp16");
+    if (dataFormat != "fp16" && dataFormat != "bf16")
+        return emitOpError("data_format must be fp16 or bf16");
+    const llvm::StringRef accumulatorOutputFormat =
+        getAccumulatorOutputFormat().value_or("fp32");
+    if (accumulatorOutputFormat != "fp32"
+        && accumulatorOutputFormat != "bf16")
+        return emitOpError(
+            "accumulator_output_format must be fp32 or bf16");
+    const llvm::StringRef loadMode =
+        getWeightLoadMode().value_or("supercell");
+    const int64_t innerColumn = getWeightInnerColumn().value_or(0);
+    if (loadMode != "supercell" && loadMode != "column")
+        return emitOpError(
+            "weight_load_mode must be supercell or column");
+    if (getOpcode() != "iw" && loadMode != "supercell")
+        return emitOpError(
+            "only iw may use column weight loading");
+    if ((loadMode == "supercell" && innerColumn != 0)
+        || (loadMode == "column"
+            && (innerColumn < 0
+                || innerColumn >= target.throughput().lanes_per_tile)))
+        return emitOpError("contains an invalid MXM inner weight column");
     if (getActivationStreamBase() < 0
         || getActivationStreamBase() >= target.streams().encoded_streams
         || getOutputStreamBase() < 0
@@ -120,6 +156,30 @@ LogicalResult MxmOp::verify()
     if (getAccumulatorDestination() != "sram"
         && getAccumulatorDestination() != "stream")
         return emitOpError("accumulator_destination must be sram or stream");
+    const llvm::StringRef inputMode =
+        getWeightInputMode().value_or("direct16");
+    if (inputMode != "direct16"
+        && inputMode != "int8_dequant_bf16")
+        return emitOpError(
+            "weight_input_mode must be direct16 or int8_dequant_bf16");
+    const llvm::StringRef computeMode =
+        getComputeMode().value_or("vector");
+    if (computeMode != "vector" && computeMode != "block8")
+        return emitOpError(
+            "compute_mode must be vector or block8");
+    return success();
+}
+
+LogicalResult MxmDequantOp::verify()
+{
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    if (getCycle() < 0
+        || !targetModel->is_valid_mxm_unit(getQueue())
+        || getRepeatCount() <= 0 || getRepeatInterval() <= 0
+        || !std::isfinite(getScaleAttr().getValueAsDouble()))
+        return emitOpError(
+            "contains an invalid MXM dequant queue command field");
     return success();
 }
 
@@ -154,7 +214,9 @@ LogicalResult VxmOp::verify()
         if (kind == "stream_i32" || kind == "stream_f32")
             return index >= 0 && index + 3 < target.streams().encoded_streams;
         if (kind == "stream_i8") return index >= 0 && index < target.streams().encoded_streams;
-        if (kind == "stream_f16") return index >= 0 && index + 1 < target.streams().encoded_streams;
+        if (kind == "stream_f16" || kind == "stream_bf16")
+            return index >= 0
+                && index + 1 < target.streams().encoded_streams;
         return false;
     };
     if (!verify_operand(getLhsKind(), lhs_index)
@@ -164,8 +226,9 @@ LogicalResult VxmOp::verify()
         || !std::isfinite(getRhsImmediateAttr().getValueAsDouble()))
         return emitOpError("VXM immediate operands must be finite");
     if (getCastTarget() != "fp32" && getCastTarget() != "fp16"
-        && getCastTarget() != "i8")
-        return emitOpError("cast_target must be fp32, fp16, or i8");
+        && getCastTarget() != "bf16" && getCastTarget() != "i8")
+        return emitOpError(
+            "cast_target must be fp32, fp16, bf16, or i8");
     if (output_stream < -1 || output_stream >= target.streams().encoded_streams)
         return emitOpError("output_stream must be -1 or a packed stream selector");
     if ((getInputHemisphere() != "east" && getInputHemisphere() != "west")
@@ -182,6 +245,9 @@ LogicalResult SxmOp::verify()
     if (getCycle() < 0 || getHemisphere() < 0
         || getHemisphere() >= target.memory().hemispheres)
         return emitOpError("contains an invalid ICU SXM queue selector");
+    if (getRepeatCount().value_or(1) <= 0
+        || getRepeatInterval().value_or(1) <= 0)
+        return emitOpError("repeat count and interval must be positive");
     if (getOpcode() != "transpose" && getOpcode() != "permute")
         return emitOpError("opcode must be transpose or permute");
     const int64_t physicalWidth =

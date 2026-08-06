@@ -1,5 +1,6 @@
 #include "ftlpu/compiler/Dialect/Tensor/IR/tensor_dialect.hpp"
 
+#include "ftlpu/compiler/Support/float_format.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "mlir/IR/Builders.h"
@@ -368,6 +369,35 @@ static LogicalResult verify_attention_memory_subplan(
 
 LogicalResult ProjectionTaskOp::verify()
 {
+    if (getKind() == "linear") {
+        const auto input = getInput().getType();
+        const auto weight = getWeight().getType();
+        const auto result = getResult().getType();
+        const auto m = getConfig().getAs<IntegerAttr>("m");
+        const auto n = getConfig().getAs<IntegerAttr>("n");
+        const auto k = getConfig().getAs<IntegerAttr>("k");
+        const auto rhsScale =
+            getConfig().getAs<FloatAttr>("rhs_scale");
+        if (!m || !n || !k || !rhsScale || m.getInt() <= 0
+            || n.getInt() <= 0 || k.getInt() <= 0
+            || !std::isfinite(rhsScale.getValueAsDouble())
+            || rhsScale.getValueAsDouble() <= 0.0
+            || input.getRank() != 2 || weight.getRank() != 2
+            || result.getRank() != 2
+            || input.getShape()
+                != llvm::ArrayRef<int64_t>({m.getInt(), k.getInt()})
+            || weight.getShape()
+                != llvm::ArrayRef<int64_t>({k.getInt(), n.getInt()})
+            || result.getShape()
+                != llvm::ArrayRef<int64_t>({m.getInt(), n.getInt()})
+            || !is_lpu_16bit_float(input.getElementType())
+            || !weight.getElementType().isInteger(8)
+            || result.getElementType() != input.getElementType())
+            return emitOpError(
+                "requires a valid rank-2 W8A16 linear projection config");
+        return verify_attention_memory_subplan(
+            getOperation(), getMemoryPlan());
+    }
     if (getKind() != "query" && getKind() != "key"
         && getKind() != "value" && getKind() != "output")
         return emitOpError("kind must be query, key, value, or output");

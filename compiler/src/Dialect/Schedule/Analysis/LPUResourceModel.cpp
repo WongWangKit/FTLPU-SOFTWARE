@@ -4,12 +4,31 @@
 
 namespace ftlpu::compiler::schedule {
 
-std::string LPUResourceModel::mem_slice(int64_t hemisphere, int64_t slice) const
+namespace {
+std::string mem_port_resource(
+    const target::LPUTargetModel& target,
+    int64_t hemisphere,
+    int64_t slice,
+    const char* port)
 {
-    if (hemisphere < 0 || hemisphere >= target_.memory().hemispheres
-        || slice < 0 || slice >= target_.memory().slices_per_hemisphere)
+    if (hemisphere < 0 || hemisphere >= target.memory().hemispheres
+        || slice < 0 || slice >= target.memory().slices_per_hemisphere)
         throw std::out_of_range("invalid MEM resource");
-    return "mem.h" + std::to_string(hemisphere) + ".s" + std::to_string(slice);
+    return "mem.h" + std::to_string(hemisphere) + ".s"
+        + std::to_string(slice) + "." + port;
+}
+} // namespace
+
+std::string LPUResourceModel::mem_read_port(
+    int64_t hemisphere, int64_t slice) const
+{
+    return mem_port_resource(target_, hemisphere, slice, "read");
+}
+
+std::string LPUResourceModel::mem_write_port(
+    int64_t hemisphere, int64_t slice) const
+{
+    return mem_port_resource(target_, hemisphere, slice, "write");
 }
 
 std::string LPUResourceModel::mxm(int64_t unit) const

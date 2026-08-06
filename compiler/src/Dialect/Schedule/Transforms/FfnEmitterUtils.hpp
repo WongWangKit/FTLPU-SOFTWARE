@@ -15,6 +15,8 @@ namespace ftlpu::compiler::schedule::ffn_detail {
 
 llvm::SmallVector<int64_t> get_slices(mlir::DictionaryAttr placement);
 
+int64_t get_base_row(mlir::DictionaryAttr placement);
+
 mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
     llvm::ArrayRef<int64_t> slices, int64_t baseRow, int64_t count,
     int64_t stride, llvm::StringRef hemisphere, llvm::StringRef kind);
@@ -35,7 +37,7 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
     mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Type resultType, mlir::Value gateValue, mlir::Value upValue,
     const target::LPUTargetModel& target, FfnScheduleStrategy strategy,
-    int64_t cycle, int64_t hemisphere);
+    int64_t cycle, int64_t hemisphere, int64_t outputStream);
 
 MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Location location, stream::RouteOp rawRoute,
@@ -48,6 +50,7 @@ mlir::Value emitFfnSwishRow(mlir::IRRewriter& rewriter,
     PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,
     FfnScheduleStrategy strategy, llvm::ArrayRef<int64_t> hiddenSlices,
     mlir::Value gateValue, mlir::Value upValue, int64_t cycle,
-    int64_t mTile, int64_t pair, int64_t row, int64_t hemisphere);
+    int64_t mTile, int64_t pair, int64_t row, int64_t hemisphere,
+    int64_t outputStream);
 
 } // namespace ftlpu::compiler::schedule::ffn_detail

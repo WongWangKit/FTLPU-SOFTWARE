@@ -77,17 +77,33 @@ def quantize_linear(weight: np.ndarray) -> tuple[np.ndarray, float]:
     return np.ascontiguousarray(quantized.T), scale
 
 
-def fp16(value: np.ndarray) -> np.ndarray:
-    return value.astype(np.float16).astype(np.float32)
+def bf16_bits(value: np.ndarray) -> np.ndarray:
+    words = np.asarray(value, dtype=np.float32).view(np.uint32)
+    rounding_bias = np.uint32(0x7FFF) + ((words >> 16) & 1)
+    return ((words + rounding_bias) >> 16).astype("<u2")
+
+
+def bf16(value: np.ndarray) -> np.ndarray:
+    words = bf16_bits(value).astype(np.uint32) << 16
+    return words.view(np.float32)
+
+
+def write_bf16(path: Path, value: np.ndarray) -> None:
+    bf16_bits(value).tofile(path)
+
+
+def read_bf16(path: Path, shape: tuple[int, ...]) -> np.ndarray:
+    words = np.fromfile(path, dtype="<u2").astype(np.uint32) << 16
+    return words.view(np.float32).reshape(shape)
 
 
 def rms_norm(value: np.ndarray, weight: np.ndarray, epsilon: float) -> np.ndarray:
     mean_square = np.mean(value * value, axis=-1, keepdims=True)
-    return fp16(value / np.sqrt(mean_square + epsilon) * weight)
+    return bf16(value / np.sqrt(mean_square + epsilon) * weight)
 
 
 def linear(value: np.ndarray, weight: np.ndarray, scale: float) -> np.ndarray:
-    return fp16(value @ (weight.astype(np.float32) * scale))
+    return bf16(value @ (weight.astype(np.float32) * scale))
 
 
 def rope(value: np.ndarray, theta: float) -> np.ndarray:
@@ -95,11 +111,11 @@ def rope(value: np.ndarray, theta: float) -> np.ndarray:
     half = head_dim // 2
     inverse = theta ** (-np.arange(half, dtype=np.float32) * 2.0 / head_dim)
     angle = np.arange(seq_len, dtype=np.float32)[:, None] * inverse[None, :]
-    cosine = fp16(np.cos(angle))[:, None, :]
-    sine = fp16(np.sin(angle))[:, None, :]
+    cosine = bf16(np.cos(angle))[:, None, :]
+    sine = bf16(np.sin(angle))[:, None, :]
     low = value[:, :, :half]
     high = value[:, :, half:]
-    return fp16(np.concatenate(
+    return bf16(np.concatenate(
         (low * cosine - high * sine, high * cosine + low * sine), axis=-1
     ))
 
@@ -146,17 +162,19 @@ def decoder_layer_reference(
         np.full((seq_len, seq_len), -1.0e9, dtype=np.float32), 1
     )
     scores -= np.max(scores, axis=-1, keepdims=True)
-    probability = fp16(np.exp(scores) / np.sum(np.exp(scores), axis=-1, keepdims=True))
+    probability = bf16(
+        np.exp(scores) / np.sum(np.exp(scores), axis=-1, keepdims=True)
+    )
     context = np.transpose(probability @ value, (1, 0, 2)).reshape(seq_len, hidden)
     attention = linear(context, weights["output"], scales["output"])
-    residual = fp16(activation + attention)
+    residual = bf16(activation + attention)
 
     normalized = rms_norm(residual, norm1, epsilon)
     gate = linear(normalized, weights["gate"], scales["gate"])
     up = linear(normalized, weights["up"], scales["up"])
-    swiglu = fp16((gate / (1.0 + np.exp(-gate))) * up)
+    swiglu = bf16((gate / (1.0 + np.exp(-gate))) * up)
     down = linear(swiglu, weights["down"], scales["down"])
-    return fp16(residual + down)
+    return bf16(residual + down)
 
 
 def main() -> None:
@@ -166,9 +184,9 @@ def main() -> None:
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument(
-        "--input-f16",
+        "--input-bf16",
         type=Path,
-        help="optional FP16 activation produced by the preceding layer",
+        help="optional BF16 activation produced by the preceding layer",
     )
     args = parser.parse_args()
 
@@ -200,23 +218,26 @@ def main() -> None:
     norm1 = store.read(f"{prefix}.post_attention_layernorm.weight")
     embedding = store.read("model.embed_tokens.weight")
     token_ids = np.arange(args.seq_len, dtype=np.int64) % embedding.shape[0]
-    if args.input_f16:
-        activation = np.fromfile(args.input_f16, dtype="<f2").astype(
-            np.float32
-        ).reshape(args.seq_len, int(config["hidden_size"]))
+    if args.input_bf16:
+        activation = read_bf16(
+            args.input_bf16,
+            (args.seq_len, int(config["hidden_size"])),
+        )
     else:
-        activation = fp16(embedding[token_ids])
+        activation = bf16(embedding[token_ids])
     golden = decoder_layer_reference(
         activation, norm0, norm1, quantized, scales, config
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    activation.astype("<f2").tofile(args.output_dir / "input.f16.bin")
-    norm0.astype("<f2").tofile(args.output_dir / "input_layernorm.f16.bin")
-    norm1.astype("<f2").tofile(
-        args.output_dir / "post_attention_layernorm.f16.bin"
+    write_bf16(args.output_dir / "input.bf16.bin", activation)
+    write_bf16(
+        args.output_dir / "input_layernorm.bf16.bin", norm0
     )
-    golden.astype("<f2").tofile(args.output_dir / "golden.f16.bin")
+    write_bf16(
+        args.output_dir / "post_attention_layernorm.bf16.bin", norm1
+    )
+    write_bf16(args.output_dir / "golden.bf16.bin", golden)
     token_ids.astype("<i8").tofile(args.output_dir / "token_ids.i64.bin")
     for role, value in quantized.items():
         value.tofile(args.output_dir / f"{role}.i8.bin")
@@ -235,7 +256,10 @@ def main() -> None:
         "rms_norm_eps": float(config["rms_norm_eps"]),
         "scales": scales,
         "source_tensors": names,
-        "input_source": str(args.input_f16) if args.input_f16 else "embedding",
+        "activation_element_type": "bf16",
+        "input_source": (
+            str(args.input_bf16) if args.input_bf16 else "embedding"
+        ),
     }
     (args.output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"

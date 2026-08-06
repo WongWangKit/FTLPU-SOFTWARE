@@ -30,6 +30,8 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    source = args.input.read_text(encoding="utf-8")
+    bf16 = "xbf16>" in source
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.input, args.output_dir / "ffn.stablehlo.mlir")
@@ -46,10 +48,14 @@ def main() -> None:
 
     tensor = lower(args.tool, args.input, args.output_dir / "ffn.tensor.mlir",
                    "ftlpu-stablehlo-to-tensor")
+    down_weight_kind = (
+        'kind = "w8a16_block8_weight_wave_striped"'
+        if bf16 else 'kind = "w8a16_mxm_weight_wave_striped"'
+    )
     require(tensor, ["ftlpu.tensor.matmul_task", "ftlpu.tensor.swish_task",
                      "ftlpu.tensor.elementwise_task",
                      'kind = "w8a16_mxm_weight_striped"',
-                     'kind = "w8a16_mxm_weight_wave_striped"',
+                     down_weight_kind,
                      'hemisphere = "both"'], "Tensor")
     if "ftlpu.tensor.ffn" in tensor:
         raise AssertionError("Tensor IR must not contain the legacy compound FFN op")
@@ -59,23 +65,39 @@ def main() -> None:
     require(stream, ["ftlpu.stream.matmul_task", "ftlpu.stream.swish_task",
                      "ftlpu.stream.elementwise_task",
                      'kind = "multiply"', 'kind = "add_quant"',
-                     "ftlpu.stream.dequantize",
-                     'destination = "MXM.weight"', "stream_count = 16 : i64",
-                     "stream_count = 4 : i64"], "Stream")
+                     'destination = "MXM.weight"',
+                     "stream_count = 16 : i64",
+                     "result_stream_counts = [4]"], "Stream")
+    if not bf16:
+        require(stream, ["ftlpu.stream.dequantize",
+                         "stream_count = 4 : i64"], "Stream")
     if "ftlpu.stream.ffn" in stream:
         raise AssertionError("Stream IR must not contain the legacy compound FFN op")
 
     schedule = lower(args.tool, args.input, args.output_dir / "ffn.schedule.mlir",
                      "ftlpu-stablehlo-to-schedule")
-    require(schedule, ["ftlpu.schedule.mem_read", "ftlpu.schedule.mxm_load",
-                       "ftlpu.schedule.mxm_compute", "ftlpu.schedule.vxm",
-                       "ftlpu.schedule.mem_write", "weight_buffer = 1 : i64"],
+    schedule_ops = (
+        ["ftlpu.schedule.mem_transfer", "ftlpu.schedule.mxm_issue",
+         "ftlpu.schedule.mxm_dequant", "ftlpu.schedule.vxm"]
+        if bf16 else
+        ["ftlpu.schedule.mem_read", "ftlpu.schedule.mxm_load",
+         "ftlpu.schedule.mxm_compute", "ftlpu.schedule.vxm",
+         "ftlpu.schedule.mem_write"]
+    )
+    require(schedule, schedule_ops + ["weight_buffer = 1 : i64"],
             "Schedule")
+    if bf16:
+        require(schedule, ['data_format = "bf16"',
+                           'cast_target = "bf16"'], "BF16 Schedule")
 
     command = lower(args.tool, args.input, args.output_dir / "ffn.command.mlir",
                     "ftlpu-stablehlo-to-commands")
     require(command, ["ftlpu.command.binding", "ftlpu.command.mem",
                       "ftlpu.command.mxm", "ftlpu.command.vxm"], "Command")
+    if bf16:
+        require(command, ['element_type = "bf16"',
+                          'data_format = "bf16"',
+                          'cast_target = "bf16"'], "BF16 Command")
     iw_columns = [
         int(match.group(1))
         for line in command.splitlines()
@@ -83,9 +105,11 @@ def main() -> None:
         for match in [re.search(r"weight_column = (\d+) : i64", line)]
         if match
     ]
-    if iw_columns[:4] != [3, 2, 1, 0]:
+    expected_columns = [0, 1, 2, 3] if bf16 else [3, 2, 1, 0]
+    if iw_columns[:4] != expected_columns:
         raise AssertionError(
-            f"MXM IW pulses must follow physical column order 3,2,1,0; got {iw_columns[:4]}")
+            "MXM IW pulses do not follow the selected load mode's physical "
+            f"column order {expected_columns}; got {iw_columns[:4]}")
 
 
 if __name__ == "__main__":

@@ -16,12 +16,15 @@ namespace ftlpu::compiler::schedule {
 
 struct AttentionSoftmaxSchedule {
     std::vector<std::array<std::optional<int64_t>, 2>> wave_cycles;
+    int64_t work_interval = 0;
     int64_t end_cycle = 0;
 };
 
 mlir::FailureOr<AttentionSoftmaxSchedule> planAttentionSoftmax(
     const AttentionTaskGraph& graph,
     const std::vector<AttentionWorkWave>& waves,
-    int64_t qkEnd, const target::LPUTargetModel& target);
+    int64_t qkStart, int64_t qkEnd, int64_t qkWaveInterval,
+    int64_t qkIwToComputeCycles, bool fused,
+    const target::LPUTargetModel& target);
 
 } // namespace ftlpu::compiler::schedule

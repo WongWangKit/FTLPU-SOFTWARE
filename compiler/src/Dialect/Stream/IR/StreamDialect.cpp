@@ -1,5 +1,6 @@
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
 
+#include "ftlpu/compiler/Support/float_format.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "mlir/IR/Builders.h"
@@ -176,7 +177,27 @@ LogicalResult RouteOp::verify()
         return emitOpError("route is not supported by the LPU topology");
     const int64_t stream_base = getStreamBaseAttr().getInt();
     const int64_t stream_count = getStreamCountAttr().getInt();
-    if (stream_base < 0 || stream_count != *expected_stream_count
+    const auto placementKind =
+        getPlacement().getAs<StringAttr>("kind");
+    const bool distributedBlock8Activation =
+        *source == target::StreamEndpoint::Mem
+        && *destination == target::StreamEndpoint::MxmActivation
+        && placementKind
+        && placementKind.getValue() == "fp16_mxm_distributed_16"
+        && stream_count
+            == 2 * target.throughput().mxm_block_rows;
+    const bool block8Weight =
+        *source == target::StreamEndpoint::Mem
+        && *destination == target::StreamEndpoint::MxmWeight
+        && placementKind
+        && placementKind.getValue()
+            == "w8a16_block8_weight_wave_striped"
+        && stream_count
+            == target.throughput().mxm_int8_load_streams_per_cycle;
+    const bool validStreamCount =
+        stream_count == *expected_stream_count
+        || distributedBlock8Activation || block8Weight;
+    if (stream_base < 0 || !validStreamCount
         || stream_base + stream_count > target.streams().streams_per_direction
         || getRegisterId() != static_cast<uint64_t>(*expected_register)
         || latency != *expected_latency)
@@ -192,9 +213,11 @@ LogicalResult DequantizeOp::verify()
 {
     auto input = getInput().getType();
     auto result = getResult().getType();
-    if (!input.getElementType().isInteger(8) || !result.getElementType().isF16()
+    if (!input.getElementType().isInteger(8)
+        || !is_lpu_16bit_float(result.getElementType())
         || input.getShape() != result.getShape())
-        return emitOpError("requires shape-preserving i8 to f16 conversion");
+        return emitOpError(
+            "requires shape-preserving i8 to 16-bit float conversion");
     auto target_model = target::LPUTargetModel::from_operation(getOperation());
     if (failed(target_model)) return failure();
     const auto& streams = target_model->streams();
@@ -425,6 +448,34 @@ LogicalResult SwigluOp::verify()
 
 LogicalResult ProjectionTaskOp::verify()
 {
+    if (getKind() == "linear") {
+        const auto m = getConfig().getAs<IntegerAttr>("m");
+        const auto n = getConfig().getAs<IntegerAttr>("n");
+        const auto k = getConfig().getAs<IntegerAttr>("k");
+        const auto rhsScale =
+            getConfig().getAs<FloatAttr>("rhs_scale");
+        const auto input = getInput().getType();
+        const auto weight = getWeight().getType();
+        const auto result = getResult().getType();
+        if (!m || !n || !k || !rhsScale || !getMemoryPlan()
+            || m.getInt() <= 0 || n.getInt() <= 0 || k.getInt() <= 0
+            || !std::isfinite(rhsScale.getValueAsDouble())
+            || rhsScale.getValueAsDouble() <= 0.0
+            || input.getRank() != 2 || weight.getRank() != 2
+            || result.getRank() != 2
+            || input.getShape()
+                != llvm::ArrayRef<int64_t>({m.getInt(), k.getInt()})
+            || weight.getShape()
+                != llvm::ArrayRef<int64_t>({k.getInt(), n.getInt()})
+            || result.getShape()
+                != llvm::ArrayRef<int64_t>({m.getInt(), n.getInt()})
+            || !is_lpu_16bit_float(input.getElementType())
+            || !weight.getElementType().isInteger(8)
+            || result.getElementType() != input.getElementType())
+            return emitOpError(
+                "requires a valid rank-2 W8A16 linear projection config");
+        return success();
+    }
     if (getKind() != "query" && getKind() != "key"
         && getKind() != "value" && getKind() != "output")
         return emitOpError("kind must be query, key, value, or output");

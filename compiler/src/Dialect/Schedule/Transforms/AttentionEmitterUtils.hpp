@@ -15,7 +15,8 @@ namespace ftlpu::compiler::schedule::attention_detail {
 void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t address,
     int64_t packedStream, int64_t repeatCount, int64_t repeatInterval,
-    int64_t addressStride, llvm::StringRef destination = "sram");
+    int64_t addressStride, llvm::StringRef destination = "sram",
+    int64_t addressBinding = -1);
 
 void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t weightBuffer,
@@ -23,7 +24,18 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t repeatCount, int64_t repeatInterval,
     int64_t accumulatorAddress = 0, int64_t accumulatorRowStride = 1,
     llvm::StringRef accumulatorDestination = "stream",
-    bool accumulatorClear = true);
+    bool accumulatorClear = true,
+    llvm::StringRef weightLoadMode = "supercell",
+    int64_t weightInnerColumn = 0,
+    llvm::StringRef dataFormat = "fp16",
+    llvm::StringRef weightInputMode = {},
+    llvm::StringRef computeMode = {},
+    llvm::StringRef accumulatorOutputFormat = {});
+
+void emitMxmDequant(mlir::IRRewriter& rewriter,
+    mlir::Location location, int64_t cycle, int64_t unitId,
+    float scale, int64_t repeatCount = 1,
+    int64_t repeatInterval = 1);
 
 using sxm_detail::blockDiagonalMap;
 using sxm_detail::emitSxm;
@@ -43,6 +55,6 @@ AttentionProjectionKind projectionKind(int64_t index);
 
 void emitRopeOrCast(mlir::IRRewriter& rewriter, mlir::Location location,
     const target::LPUTargetModel& target, int64_t cycle, int64_t hemisphere,
-    bool rope, mlir::Value value);
+    bool rope, mlir::Value value, mlir::Type elementType);
 
 } // namespace ftlpu::compiler::schedule::attention_detail

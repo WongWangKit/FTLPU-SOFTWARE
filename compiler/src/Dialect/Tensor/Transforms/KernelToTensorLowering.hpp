@@ -40,6 +40,11 @@ struct Allocation {
 
 class RowAllocator {
 public:
+    explicit RowAllocator(int64_t capacity_rows = 8192)
+        : capacity_rows_(capacity_rows)
+    {
+    }
+
     mlir::FailureOr<int64_t> allocate(int64_t rows);
     void release(int64_t offset, int64_t rows);
 
@@ -48,12 +53,15 @@ private:
         int64_t offset;
         int64_t rows;
     };
+    int64_t capacity_rows_;
     int64_t next_row_ = 0;
     llvm::SmallVector<FreeBlock> free_blocks_;
 };
 
 class EastMemoryAllocator {
 public:
+    explicit EastMemoryAllocator(const target::LPUTargetModel& target);
+
     mlir::FailureOr<Allocation> allocate(PlacementKind kind, int64_t bytes);
     void release(const Allocation& allocation);
 
@@ -75,6 +83,7 @@ public:
 
     mlir::FailureOr<Allocation> allocate(
         mlir::Value value, PlacementKind kind);
+    mlir::FailureOr<Allocation> lookup(mlir::Value value) const;
     mlir::LogicalResult bind(
         mlir::Value value, const Allocation& allocation);
     void release_before(mlir::Operation* operation);
@@ -135,7 +144,8 @@ mlir::LogicalResult lower_swiglu(kernel::SwigluOp op,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const target::LPUTargetModel& target,
-    RmsNormLoweringStrategy strategy, AllocateValueFn allocate_value,
+    RmsNormLoweringStrategy strategy, int64_t feedback_weight_base_row,
+    FunctionMemoryPlanner& planner,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
     const target::LPUTargetModel& target,
@@ -143,6 +153,7 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
     RmsNormLoweringStrategy rmsnorm_strategy,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
+    const target::LPUTargetModel& target,
     FunctionMemoryPlanner& planner,
     AllocateValueFn allocate_value, mlir::IRRewriter& rewriter);
 

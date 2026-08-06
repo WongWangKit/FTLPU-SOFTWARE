@@ -1,6 +1,6 @@
 #include "KernelToTensorLowering.hpp"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
 
@@ -8,7 +8,8 @@ namespace ftlpu::compiler::tensor_lowering {
 
 mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const target::LPUTargetModel& target,
-    RmsNormLoweringStrategy strategy, AllocateValueFn allocateValue,
+    RmsNormLoweringStrategy strategy, int64_t feedbackWeightBaseRow,
+    FunctionMemoryPlanner& planner,
     mlir::IRRewriter& rewriter)
 {
     const auto inputType = op.getInput().getType();
@@ -16,11 +17,15 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const int64_t rows = inputType.getDimSize(0);
     const int64_t hidden = inputType.getDimSize(1);
     const int64_t tile = target.throughput().mxm_rows;
-    if (!inputType.getElementType().isF16()
-        || !weightType.getElementType().isF16()
+    if (!is_lpu_16bit_float(inputType.getElementType())
+        || weightType.getElementType()
+            != inputType.getElementType()
+        || op.getResult().getType().getElementType()
+            != inputType.getElementType()
         || rows % tile != 0 || hidden % tile != 0) {
         op.emitError(
-            "current RMSNorm strategy requires tile-aligned FP16 tensors");
+            "current RMSNorm strategy requires tile-aligned matching "
+            "16-bit float tensors");
         return mlir::failure();
     }
 
@@ -47,8 +52,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const int64_t matrixRows = rows * hidden / tile;
     const int64_t matrixBytes = rows * hidden * 2;
     const int64_t factorBytes = rows * tile * 2;
-    auto existingInput = allocateValue(
-        op.getInput(), PlacementKind::Activation);
+    auto existingInput = planner.lookup(op.getInput());
     const auto distributedInputSlices =
         target.mxm_distributed_activation_slices();
     if (distributedInputSlices.size() != 16) {
@@ -59,6 +63,12 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const bool existingInputIsDistributed =
         mlir::succeeded(existingInput)
         && existingInput->layout == "fp16_mxm_distributed_16";
+    const bool existingInputIsMxmPlanar =
+        mlir::succeeded(existingInput)
+        && existingInput->layout == "fp16_mxm_activation_planar"
+        && existingInput->slices.size()
+            >= static_cast<std::size_t>(
+                throughput.mxm_activation_streams);
     const Allocation input =
         strategy == RmsNormLoweringStrategy::VxmFeedback
         ? existingInputIsDistributed
@@ -67,7 +77,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
                   distributedInputSlices, 4096,
                   rows * hidden / 256, matrixBytes,
                   "fp16_mxm_distributed_16", "both")
-        : mlir::succeeded(existingInput)
+        : existingInputIsMxmPlanar
             ? *existingInput
             : fixed_allocation(PlacementKind::Activation,
                   inputSlices, 0, matrixRows, matrixBytes,
@@ -86,15 +96,15 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             effectiveInputSlices.push_back(
                 llvm::cast<mlir::IntegerAttr>(slice).getInt());
     }
-    const auto plannedWeight =
-        allocateValue(op.getWeight(), PlacementKind::Activation);
+    const auto plannedWeight = planner.lookup(op.getWeight());
     const auto distributedWeightBindingSlices =
         effectiveInputSlices;
     const Allocation weight =
         strategy == RmsNormLoweringStrategy::VxmFeedback
         ? fixed_allocation(PlacementKind::Activation,
-              distributedWeightBindingSlices, 5120,
-              hidden / 8, hidden * 2,
+              distributedWeightBindingSlices,
+              feedbackWeightBaseRow,
+              hidden / throughput.lanes_per_tile, hidden * 2,
               "fp16_vxm_distributed_16", "both")
         : mlir::succeeded(plannedWeight)
             && plannedWeight->layout == "fp16_pair_planar"
@@ -145,7 +155,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             distributedSlices, 4608, packedRows, matrixBytes,
             "fp16_vxm_distributed_16", "both"));
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
-            distributedWeightSlices, 5120, packedWeightRows,
+            distributedWeightSlices, weight.base_row, packedWeightRows,
             hidden * tile * 2,
             "fp16_vxm_distributed_16", "both"));
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
@@ -170,6 +180,12 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         : fixed_allocation(PlacementKind::FinalResult,
               resultSlices, 0, matrixRows, matrixBytes,
               "fp16_mxm_activation_planar", "both");
+    if (mlir::failed(planner.bind(op.getInput(), input))
+        || mlir::failed(planner.bind(op.getWeight(), weight))
+        || mlir::failed(planner.bind(op.getResult(), result))) {
+        op.emitError("RMSNorm physical layout conflicts with the global memory plan");
+        return mlir::failure();
+    }
 
     const auto inputPlacement = make_profile_placement(rewriter, input,
         input.layout, input.hemisphere);
@@ -216,8 +232,10 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
                 rewriter.getI64IntegerAttr(tile)),
         })),
     });
+    const mlir::Value oldResult = op.getResult();
     auto lowered =
         llvm::cast<tensor::RmsNormTaskOp>(rewriter.create(state));
+    planner.replace_value(oldResult, lowered.getResult());
     rewriter.replaceOp(op, lowered.getResult());
     return mlir::success();
 }
@@ -249,7 +267,8 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
     mlir::ArrayAttr resultPlan;
     const auto resultType =
         llvm::cast<mlir::RankedTensorType>(op.getResult().getType());
-    if (op.getKind() == "add" && resultType.getElementType().isF16()
+    if (op.getKind() == "add"
+        && is_lpu_16bit_float(resultType.getElementType())
         && resultType.getRank() == 2
         && resultType.getDimSize(1) % 64 == 0) {
         const int64_t rows = resultType.getDimSize(0);
@@ -279,6 +298,12 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
             };
         collectSlices(*lhsPlan);
         collectSlices(*rhsPlan);
+        for (int64_t index = 0;
+             index < target.throughput().mxm_result_streams; ++index)
+            occupiedSlices.push_back(
+                target.memory().w8a16_result_slice_base + index);
+        for (int64_t slice : target.attention_result_slices())
+            occupiedSlices.push_back(slice);
         llvm::SmallVector<int64_t, 16> distributedSlices;
         for (int64_t slice = 0;
              slice < target.memory().slices_per_hemisphere
@@ -289,7 +314,7 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
                 == occupiedSlices.end())
                 distributedSlices.push_back(slice);
         }
-        if (distributedSlices.size() != 16)
+        if (feedsFeedbackRmsNorm && distributedSlices.size() != 16)
             return op.emitError(
                 "target does not provide 16 ping-pong residual slices");
         const bool feedsRmsNorm = llvm::any_of(

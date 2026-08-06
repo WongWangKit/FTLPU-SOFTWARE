@@ -37,8 +37,6 @@ public:
     int64_t causalMaskAddress(int64_t localKey) const {
         return causalMaskBase_ + localKey - 1;
     }
-    int64_t probabilityAddress(int64_t queryHead, int64_t queryBlock,
-        int64_t key) const;
     int64_t probabilityPackAddress(int64_t queryHead, int64_t queryBlock,
         int64_t keyBlock) const;
     int64_t probabilityDiagonalAddress(int64_t queryHead, int64_t queryBlock,
@@ -50,11 +48,18 @@ public:
         int64_t reductionBlock, int64_t column) const;
     int64_t resultAddress(int64_t outputGroup, int64_t token) const;
     int64_t ropeAddress(int64_t token) const;
+    int64_t ropeStagingAddress(AttentionProjectionKind projection,
+        int64_t head, int64_t half, int64_t tokenBlock,
+        int64_t row) const;
 
     llvm::ArrayRef<int64_t> weightSlices() const { return weightSlices_; }
     llvm::ArrayRef<int64_t> outputWeightSlices() const { return outputWeightSlices_; }
     llvm::ArrayRef<int64_t> activationSlices() const { return activationSlices_; }
+    llvm::ArrayRef<int64_t> keySlices() const { return keySlices_; }
     llvm::ArrayRef<int64_t> ropeSlices() const { return ropeSlices_; }
+    llvm::ArrayRef<int64_t> ropeStagingSlices() const {
+        return ropeStagingSlices_;
+    }
     llvm::ArrayRef<int64_t> scaledScoreSlices(int64_t localMxm) const {
         return scaledScoreSlices_.at(static_cast<std::size_t>(localMxm));
     }
@@ -64,8 +69,17 @@ public:
     llvm::ArrayRef<int64_t> causalMaskSlices(int64_t localMxm) const {
         return causalMaskSlices_.at(static_cast<std::size_t>(localMxm));
     }
-    llvm::ArrayRef<int64_t> probabilitySlices(int64_t localMxm) const {
-        return probabilitySlices_.at(static_cast<std::size_t>(localMxm));
+    // Optional overlays are computed from target topology and never perturb
+    // the allocator-selected Tail planes.
+    std::array<int64_t, 4> fusedScoreSlices(int64_t bank) const {
+        const int64_t begin = target_.memory().slices_per_hemisphere
+            - 16 + bank * 4;
+        return {begin, begin + 1, begin + 2, begin + 3};
+    }
+    std::array<int64_t, 4> fusedCausalMaskSlices(int64_t bank) const {
+        const int64_t begin = target_.memory().slices_per_hemisphere
+            - 8 + bank * 4;
+        return {begin, begin + 1, begin + 2, begin + 3};
     }
     llvm::ArrayRef<int64_t> probabilityPackSlices() const { return probabilityPackSlices_; }
     llvm::ArrayRef<int64_t> probabilityDiagonalSlices() const { return probabilityDiagonalSlices_; }
@@ -84,13 +98,14 @@ private:
     std::array<int64_t, 8> weightSlices_ {0, 4, 8, 12, 16, 20, 24, 28};
     std::array<int64_t, 8> outputWeightSlices_ {0, 4, 8, 12, 2, 18, 24, 28};
     std::array<int64_t, 4> activationSlices_ {32, 33, 34, 35};
-    std::array<int64_t, 4> ropeSlices_ {4, 5, 6, 7};
+    std::array<int64_t, 4> keySlices_ {0, 1, 2, 3};
+    std::array<int64_t, 4> ropeSlices_ {};
+    std::array<int64_t, 16> ropeStagingSlices_ {};
     // Each local MXM owns an independent softmax scratch plane. This permits
     // the two work items in a hemisphere wave to use VXM concurrently.
     std::array<std::array<int64_t, 4>, 2> scaledScoreSlices_ {{{{8, 9, 10, 11}}, {{0, 1, 2, 3}}}};
     std::array<std::array<int64_t, 4>, 2> expScoreSlices_ {{{{12, 13, 14, 15}}, {{4, 5, 6, 7}}}};
     std::array<std::array<int64_t, 4>, 2> causalMaskSlices_ {{{{24, 25, 26, 27}}, {{20, 21, 22, 23}}}};
-    std::array<std::array<int64_t, 2>, 2> probabilitySlices_ {{{{16, 17}}, {{32, 33}}}};
     std::array<int64_t, 16> probabilityPackSlices_ {
         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35};
     std::array<int64_t, 16> probabilityDiagonalSlices_ {
@@ -99,12 +114,12 @@ private:
         {{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33}},
         {{18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35}},
     }};
-    std::array<int64_t, 8> contextSlices_ {20, 21, 22, 23, 24, 25, 26, 27};
+    std::array<int64_t, 8> contextSlices_ {44, 45, 46, 47, 48, 49, 50, 51};
     int64_t ropeBase_ = 7000;
+    int64_t ropeStagingBase_ = 0;
     int64_t scaledScoreBase_ = 0;
     int64_t expScoreBase_ = 0;
     int64_t causalMaskBase_ = 8128;
-    int64_t probabilityBase_ = 0;
     int64_t probabilityPackBase_ = 6000;
     int64_t probabilityDiagonalBase_ = 7000;
     int64_t valuePackBase_ = 7800;

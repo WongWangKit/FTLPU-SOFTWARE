@@ -4,6 +4,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/ffn_schedule_emitter.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/stream_schedule_emitters.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
@@ -38,6 +39,18 @@ void shiftIntegerAttribute(mlir::Operation& operation,
     if (!value) return;
     operation.setAttr(name, mlir::IntegerAttr::get(
         value.getType(), value.getInt() + offset));
+}
+
+void assignMxmDataFormats(mlir::func::FuncOp function)
+{
+    function.walk([&](schedule::MxmComputeOp op) {
+        const auto activationType =
+            llvm::cast<mlir::RankedTensorType>(
+                op.getActivation().getType());
+        op.setDataFormat(
+            lpu_16bit_data_format(
+                activationType.getElementType()));
+    });
 }
 
 void sequentializeScheduleStages(mlir::func::FuncOp function)
@@ -130,8 +143,10 @@ public:
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerStreamToSchedulePass)
 
     LowerStreamToSchedulePass() = default;
-    explicit LowerStreamToSchedulePass(FfnScheduleStrategy strategy)
-        : ffn_strategy_(strategy)
+    explicit LowerStreamToSchedulePass(FfnScheduleStrategy ffnStrategy,
+        AttentionScheduleStrategy attentionStrategy)
+        : ffn_strategy_(ffnStrategy)
+        , attention_strategy_(attentionStrategy)
     {
     }
 
@@ -186,13 +201,20 @@ public:
         }
 
         if (mlir::failed(
-                schedule::lowerAttentionSchedules(rewriter, function, target))) {
+                schedule::lowerAttentionSchedules(
+                    rewriter, function, target, attention_strategy_))) {
             signalPassFailure();
             return;
         }
 
         if (mlir::failed(
                 schedule::lowerRmsNormSchedules(rewriter, function, target))) {
+            signalPassFailure();
+            return;
+        }
+
+        if (mlir::failed(schedule::lowerLinearProjectionSchedules(
+                rewriter, function, target))) {
             signalPassFailure();
             return;
         }
@@ -212,19 +234,24 @@ public:
             return;
         }
 
+        assignMxmDataFormats(function);
         sequentializeScheduleStages(function);
     }
 
 private:
     FfnScheduleStrategy ffn_strategy_ = FfnScheduleStrategy::Tail;
+    AttentionScheduleStrategy attention_strategy_ =
+        AttentionScheduleStrategy::Tail;
 };
 
 } // namespace
 
 std::unique_ptr<mlir::Pass> create_lower_stream_to_schedule_pass(
-    FfnScheduleStrategy ffn_strategy)
+    FfnScheduleStrategy ffn_strategy,
+    AttentionScheduleStrategy attention_strategy)
 {
-    return std::make_unique<LowerStreamToSchedulePass>(ffn_strategy);
+    return std::make_unique<LowerStreamToSchedulePass>(
+        ffn_strategy, attention_strategy);
 }
 
 } // namespace ftlpu::compiler

@@ -2,10 +2,15 @@
   "name": "lpu32-cmodel-large-sram",
   "memory": {
     "banks_per_slice": 16,
-    "words_per_bank": 4096
+    "words_per_bank": 4096,
+    "w8a16_hidden_base_row": 8192
   },
   "streams": {
     "streams_per_direction": 32,
     "encoded_streams": 64
+  },
+  "throughput": {
+    "mxm_local_dequant_enabled": 1,
+    "mxm_block_compute_enabled": 1
   }
 }

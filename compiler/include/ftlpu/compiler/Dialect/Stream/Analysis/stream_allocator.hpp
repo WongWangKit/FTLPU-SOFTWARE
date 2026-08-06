@@ -6,6 +6,7 @@
 #include "mlir/Support/LogicalResult.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace ftlpu::compiler::stream {
 
@@ -25,6 +26,13 @@ public:
     mlir::FailureOr<StreamBinding> allocate(target::StreamEndpoint source,
         target::StreamEndpoint destination, target::StreamDirection direction,
         int64_t mem_slice, int64_t live_start, int64_t live_end);
+    mlir::FailureOr<StreamBinding> allocate(target::StreamEndpoint source,
+        target::StreamEndpoint destination, target::StreamDirection direction,
+        int64_t mem_slice, int64_t live_start, int64_t live_end,
+        std::optional<int64_t> stream_count_override);
+    mlir::LogicalResult reserve(target::StreamDirection direction,
+        int64_t stream_base, int64_t stream_count,
+        int64_t live_start, int64_t live_end);
 
 private:
     bool conflicts(target::StreamDirection direction, int64_t stream_base,

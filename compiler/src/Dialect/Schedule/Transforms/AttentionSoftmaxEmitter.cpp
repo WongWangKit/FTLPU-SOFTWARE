@@ -3,6 +3,7 @@
 #include "AttentionEmitterUtils.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_softmax_planner.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -11,15 +12,24 @@
 namespace ftlpu::compiler::schedule {
 using namespace attention_detail;
 
-int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
+int64_t AttentionScheduleEmitter::emitSoftmax(
+    int64_t qkStart, int64_t qkEnd, bool fusedSoftmax)
 {
     const AttentionMemoryLayout layout(op_, target_);
+    const auto elementType =
+        llvm::cast<mlir::RankedTensorType>(op_.getInput().getType())
+            .getElementType();
+    const llvm::StringRef dataFormat =
+        lpu_16bit_data_format(elementType);
     const float scale = 1.0f / std::sqrt(static_cast<float>(op_.getHeadDim()));
     constexpr float causalMaskValue = -1.0e9f;
     constexpr int64_t outputStream = 8;
     constexpr int64_t alusPerWork = 4;
+    const int64_t hemisphereCount = target_.memory().hemispheres;
     auto softmaxSchedule = planAttentionSoftmax(
-        op_, stage_plan_.qk_waves, qkEnd, target_);
+        op_, stage_plan_.qk_waves, qkStart, qkEnd,
+        stage_plan_.qk_wave_interval,
+        stage_plan_.qk_iw_to_compute_cycles, fusedSoftmax, target_);
     if (mlir::failed(softmaxSchedule)) {
         op_.emitError("failed to plan the softmax schedule");
         return qkEnd;
@@ -56,36 +66,59 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                 softmaxSchedule->wave_cycles[waveIndex]
                     [static_cast<std::size_t>(hemisphere)];
             if (!softmaxCycle) continue;
-            for (const AttentionWorkItem* work : workLines) {
-            const int64_t lane = work->local_mxm;
-            const int64_t aluBase =
-                (hemisphere * target_.throughput().mxms_per_hemisphere + lane)
-                * alusPerWork;
-            const int64_t inputStream = 32 + lane * 4;
+            for (std::size_t workIndex = 0; workIndex < workLines.size();
+                 ++workIndex) {
+            const AttentionWorkItem* work = workLines[workIndex];
+            const int64_t mxmLane = work->local_mxm;
+            const int64_t lane = fusedSoftmax
+                ? static_cast<int64_t>(waveIndex % 2) : mxmLane;
+            const int64_t aluBase = fusedSoftmax
+                ? lane * hemisphereCount * alusPerWork
+                    + hemisphere * alusPerWork
+                : (hemisphere * target_.throughput().mxms_per_hemisphere
+                      + lane)
+                    * alusPerWork;
+            const int64_t scoreInputStream = 32 + mxmLane * 4;
+            const int64_t scratchInputStream = 32 + lane * 4;
             const int64_t maskStream = 40 + lane * 4;
             const int64_t outputStreamBase = outputStream + lane * 4;
+            // Keep optional fused banks target-derived and isolated from the
+            // physical planes selected for the Tail schedule.
+            const auto scaledScoreSlices = fusedSoftmax
+                ? layout.fusedScoreSlices(lane)
+                : layout.scaledScoreSlices(lane);
+            const auto expScoreSlices = fusedSoftmax
+                ? layout.fusedScoreSlices(lane)
+                : layout.expScoreSlices(lane);
             for (int64_t key = 0; key < op_.getSeqLen(); ++key) {
-                const int64_t cycle = *softmaxCycle + key;
+                const int64_t cycle = *softmaxCycle
+                    + static_cast<int64_t>(workIndex)
+                        * softmaxSchedule->work_interval
+                    + key;
                 const int64_t keyBlock =
                     key / target_.throughput().mxm_rows;
                 const int64_t localKey =
                     key % target_.throughput().mxm_rows;
                 const bool vectorMask = op_.getCausal()
                     && keyBlock == work->query_block && localKey != 0;
-                emitMxm(rewriter_, op_.getLoc(),
-                    cycle
-                        - target_.throughput()
-                              .accumulator_read_to_vxm_latency,
-                    hemisphere
-                            * target_.throughput().mxms_per_hemisphere
-                        + lane,
-                    "accumulator_read", 0, 0, 0, lane * 4, 1, 1,
-                    layout.scoreTokenAddress(work->query_head,
-                        work->query_block, key),
-                    1, "sram", true);
+                if (!fusedSoftmax) {
+                    emitMxm(rewriter_, op_.getLoc(),
+                        cycle
+                            - target_.throughput()
+                                  .accumulator_read_to_vxm_latency,
+                        hemisphere
+                                * target_.throughput().mxms_per_hemisphere
+                            + mxmLane,
+                        "accumulator_read", 0, 0, 0, mxmLane * 4, 1, 1,
+                        layout.scoreTokenAddress(work->query_head,
+                            work->query_block, key),
+                        1, "sram", true, "supercell", 0, dataFormat);
+                }
                 if (vectorMask) {
                     for (int64_t byte = 0; byte < 4; ++byte) {
-                        const int64_t slice = layout.causalMaskSlices(lane)[byte];
+                        const int64_t slice = fusedSoftmax
+                            ? layout.fusedCausalMaskSlices(lane)[byte]
+                            : layout.causalMaskSlices(lane)[byte];
                         emitMem(rewriter_, op_.getLoc(),
                             cycle + 1 - readLatency(slice),
                             hemisphere * target_.memory().slices_per_hemisphere
@@ -94,7 +127,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                             maskStream + byte, 1, 1, 0);
                     }
                 }
-                vxm(cycle, aluBase, "multiply", "stream_f32", inputStream, 0.0f,
+                vxm(cycle, aluBase, "multiply", "stream_f32", scoreInputStream, 0.0f,
                     "immediate", 0, scale, "fp32",
                     op_.getCausal() ? -1 : outputStreamBase, hemisphere);
                 if (op_.getCausal()) {
@@ -117,7 +150,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                         "fp32", -1, hemisphere);
                 }
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                    const int64_t slice = layout.scaledScoreSlices(lane)[byte];
+                    const int64_t slice = scaledScoreSlices[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle
                             + (op_.getCausal() ? 2 : 1)
                             + slice / target_.streams().mem_slices_per_register_group,
@@ -128,18 +161,23 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
             }
 
             const int64_t scaledGroup =
-                maxRegisterGroup(layout.scaledScoreSlices(lane));
-            const int64_t pass2Start = *softmaxCycle + op_.getSeqLen()
+                maxRegisterGroup(scaledScoreSlices);
+            const int64_t workStart = *softmaxCycle
+                + static_cast<int64_t>(workIndex)
+                    * softmaxSchedule->work_interval;
+            const int64_t pass2Start = workStart + op_.getSeqLen()
                 + (op_.getCausal() ? 4 : 3) + 2 * scaledGroup;
             for (int64_t key = 0; key < op_.getSeqLen(); ++key) {
                 const int64_t cycle = pass2Start + key;
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                    const int64_t slice = layout.scaledScoreSlices(lane)[byte];
+                    const int64_t slice = scaledScoreSlices[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "read", layout.scaledScoreAddress(key), inputStream + byte, 1, 1, 0);
+                        "read", layout.scaledScoreAddress(key),
+                        scratchInputStream + byte, 1, 1, 0);
                 }
-                vxm(cycle, aluBase, "subtract", "stream_f32", inputStream, 0.0f,
+                vxm(cycle, aluBase, "subtract", "stream_f32",
+                    scratchInputStream, 0.0f,
                     "alu", aluBase + 2, 0.0f, "fp32", -1, hemisphere);
                 vxm(cycle + 1, aluBase + 1, "exp", "alu", aluBase, 0.0f,
                     "immediate", 0, 0.0f, "fp32", outputStreamBase, hemisphere);
@@ -148,7 +186,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
                     key == 0 ? "immediate" : "alu", key == 0 ? 0 : aluBase + 1, 0.0f,
                     "fp32", -1, hemisphere);
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                    const int64_t slice = layout.expScoreSlices(lane)[byte];
+                    const int64_t slice = expScoreSlices[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle + 2
                             + slice / target_.streams().mem_slices_per_register_group,
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
@@ -158,84 +196,47 @@ int64_t AttentionScheduleEmitter::emitSoftmax(int64_t qkEnd)
             }
 
             const int64_t expGroup =
-                maxRegisterGroup(layout.expScoreSlices(lane));
+                maxRegisterGroup(expScoreSlices);
             const int64_t pass3Start = pass2Start + op_.getSeqLen()
                 + 4 + 2 * expGroup;
             for (int64_t key = 0; key < op_.getSeqLen(); ++key) {
                 const int64_t cycle = pass3Start + key;
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                    const int64_t slice = layout.expScoreSlices(lane)[byte];
+                    const int64_t slice = expScoreSlices[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "read", layout.expScoreAddress(key), inputStream + byte, 1, 1, 0);
+                        "read", layout.expScoreAddress(key),
+                        scratchInputStream + byte, 1, 1, 0);
                 }
-                vxm(cycle, aluBase, "divide", "stream_f32", inputStream, 0.0f,
+                vxm(cycle, aluBase, "divide", "stream_f32",
+                    scratchInputStream, 0.0f,
                     "alu", aluBase + 3, 0.0f, "fp32", -1, hemisphere);
+                const int64_t packedStream =
+                    (key % target_.throughput().lanes_per_tile) * 2;
                 vxm(cycle + 1, aluBase + 1, "cast", "alu", aluBase, 0.0f,
-                    "immediate", 0, 0.0f, "fp16", outputStreamBase, hemisphere);
+                    "immediate", 0, 0.0f, dataFormat,
+                    packedStream, hemisphere);
                 for (int64_t byte = 0; byte < 2; ++byte) {
-                    const int64_t slice = layout.probabilitySlices(lane)[byte];
+                    const int64_t packSlice =
+                        layout.probabilityPackSlices()[packedStream + byte];
                     emitMem(rewriter_, op_.getLoc(), cycle + 2
-                            + slice / target_.streams().mem_slices_per_register_group,
-                        hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "write", layout.probabilityAddress(work->query_head,
-                            work->query_block, key), outputStreamBase + byte,
+                            + packSlice
+                                / target_.streams().mem_slices_per_register_group,
+                        hemisphere * target_.memory().slices_per_hemisphere
+                            + packSlice,
+                        "write", layout.probabilityPackAddress(
+                            work->query_head, work->query_block,
+                            key / target_.throughput().lanes_per_tile),
+                        packedStream + byte,
                         1, 1, 0);
                 }
             }
             }
         }
     }
-    // Probability-pack reads begin with a six-cycle MEM lead. Preserve the
-    // final probability-write tail before that next phase turns the planes
-    // around.
+    // Softmax materializes its sole physical result in the packed layout
+    // consumed by SXM. No planar probability copy or repack phase is needed.
     return softmaxSchedule->end_cycle;
-}
-
-int64_t AttentionScheduleEmitter::emitProbabilityPack(int64_t softmaxEnd)
-{
-    const AttentionMemoryLayout layout(op_, target_);
-    const auto readLatency = [&](int64_t slice) {
-        return slice / target_.streams().mem_slices_per_register_group + 2;
-    };
-    // SoftmaxEnd already includes the final probability-write tail. Two
-    // cycles are sufficient to turn the same byte planes around for reading.
-    int64_t cycle = softmaxEnd + 2;
-    for (const auto& wave : stage_plan_.qk_waves) {
-        for (const auto& work : wave.slots) {
-            if (!work) continue;
-            const char* hemisphere = work->hemisphere == 0 ? "east" : "west";
-            for (int64_t key = 0; key < op_.getSeqLen(); ++key, ++cycle) {
-                for (int64_t byte = 0; byte < 2; ++byte) {
-                    const int64_t slice = layout.probabilitySlices(work->local_mxm)[byte];
-                    emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
-                        work->hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "read", layout.probabilityAddress(work->query_head,
-                            work->query_block, key), 48 + byte, 1, 1, 0);
-                    emitVxm(rewriter_, op_.getLoc(), op_.getInput(), cycle, byte, "pass",
-                        "stream_i8", 48 + byte, 0.0f,
-                        "immediate", 0, 0.0f, "i8", byte,
-                        hemisphere, hemisphere);
-                }
-                const int64_t packedStream = (key % target_.throughput().lanes_per_tile) * 2;
-                for (int64_t byte = 0; byte < 2; ++byte) {
-                    const int64_t slice = layout.probabilityPackSlices()[packedStream + byte];
-                    emitMem(rewriter_, op_.getLoc(), cycle + 1
-                            + slice / target_.streams().mem_slices_per_register_group,
-                        work->hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "write", layout.probabilityPackAddress(work->query_head,
-                            work->query_block,
-                            key / target_.throughput().lanes_per_tile),
-                        byte, 1, 1, 0);
-                }
-            }
-        }
-    }
-    const int64_t finalPackWriteTail =
-        layout.probabilityPackSlices().back()
-            / target_.streams().mem_slices_per_register_group
-        + 1;
-    return cycle + finalPackWriteTail;
 }
 
 int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)

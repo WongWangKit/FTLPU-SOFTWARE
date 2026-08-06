@@ -2,6 +2,8 @@
 
 #include "FfnEmitterUtils.hpp"
 
+#include "llvm/ADT/STLExtras.h"
+
 #include <algorithm>
 
 namespace ftlpu::compiler::schedule::ffn_detail {
@@ -58,7 +60,9 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     auto upRoute = ffn.getUpWeight().getDefiningOp<stream::RouteOp>();
     auto downRoute =
         ffn.getDownWeight0().getDefiningOp<stream::RouteOp>();
-    if (!activationRoute || !gateRoute || !upRoute || !downRoute)
+    auto hiddenRoute = ffn.hidden0_route;
+    if (!activationRoute || !gateRoute || !upRoute || !downRoute
+        || !hiddenRoute)
         return mlir::failure();
 
     const auto rawRoute = [](stream::RouteOp route) {
@@ -66,7 +70,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
             route.getInput().getDefiningOp<stream::DequantizeOp>();
         return dequant
             ? dequant.getInput().getDefiningOp<stream::RouteOp>()
-            : stream::RouteOp {};
+            : route;
     };
     auto gateRaw = rawRoute(gateRoute);
     auto upRaw = rawRoute(upRoute);
@@ -74,6 +78,8 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     if (!gateRaw || !upRaw || !downRaw) return mlir::failure();
 
     auto weightSlices = get_slices(gateRaw.getPlacement());
+    auto upWeightSlices = get_slices(upRaw.getPlacement());
+    auto downWeightSlices = get_slices(downRaw.getPlacement());
     auto activationSlices = get_slices(activationRoute.getPlacement());
     const auto activationKind =
         activationRoute.getPlacement().getAs<mlir::StringAttr>("kind");
@@ -81,23 +87,54 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         && activationKind.getValue() == "fp16_mxm_distributed_16";
     auto hiddenSlices = get_slices(ffn.getHidden0Placement());
     auto resultSlices = get_slices(ffn.getResultPlacement());
+    auto executionPolicy =
+        target::mxm_execution_policy_from_operation(
+            ffn.getOperation());
+    if (mlir::failed(executionPolicy)) return mlir::failure();
+    const auto activationType = llvm::cast<mlir::RankedTensorType>(
+        ffn.getActivation().getType());
+    auto execution = target::plan_mxm_execution_strategy(
+        {static_cast<int64_t>(ffn.getM()),
+            static_cast<int64_t>(ffn.getN()),
+            static_cast<int64_t>(ffn.getHidden()),
+            activationType.getElementType().isBF16(), true, true, true},
+        target, *executionPolicy);
+    if (mlir::failed(execution)) return mlir::failure();
+    const bool block8Ffn = execution->uses_block8();
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
+    // The legacy path does not model passive stream-fabric transport
+    // lifetimes precisely enough to prove a fused route. Keep its requested
+    // fused mode on the validated tail baseline.
+    if (!block8Ffn && strategy == FfnScheduleStrategy::Fused)
+        strategy = FfnScheduleStrategy::Tail;
     if (weightSlices.size()
             != static_cast<std::size_t>(
                 memory.w8a16_weight_slice_count)
+        || upWeightSlices.size()
+            != static_cast<std::size_t>(
+                memory.w8a16_weight_slice_count)
+        || (block8Ffn && !activationDistributed16)
         || (!activationDistributed16
             && activationSlices.size()
                 != static_cast<std::size_t>(
                     throughput.mxm_activation_streams))
         || (activationDistributed16
             && activationSlices.size() != 16)
+        || downWeightSlices.size()
+            != static_cast<std::size_t>(
+                block8Ffn
+                    ? throughput.mxms_per_hemisphere
+                        * memory.w8a16_weight_slice_count
+                    : memory.w8a16_weight_slice_count)
         || hiddenSlices.size()
             != static_cast<std::size_t>(
-                throughput.mxm_activation_streams)
+                block8Ffn ? 16
+                           : throughput.mxm_activation_streams)
         || resultSlices.size()
             != static_cast<std::size_t>(
-                throughput.mxm_result_streams))
+                block8Ffn ? 16
+                           : throughput.mxm_result_streams))
         return mlir::failure();
 
     llvm::SmallVector<int64_t> gateAccumulatorSlices;
@@ -133,6 +170,27 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     auto projectionType = mlir::RankedTensorType::get(
         {tile, tile}, rewriter.getF32Type());
 
+    std::optional<stream::StreamBinding> fusedOutput;
+    if (block8Ffn && strategy == FfnScheduleStrategy::Fused) {
+        stream::StreamAllocator allocator(target);
+        const int64_t projectionStreamBase = 0;
+        const int64_t projectionStreamCount =
+            throughput.mxms_per_hemisphere == 1
+            ? throughput.mxm_int8_load_streams_per_cycle
+            : 24;
+        if (mlir::succeeded(allocator.reserve(
+                target::StreamDirection::East, projectionStreamBase,
+                projectionStreamCount, 0, 1))) {
+            auto output = allocator.allocate(
+                target::StreamEndpoint::VxmResult,
+                target::StreamEndpoint::Mem,
+                target::StreamDirection::East,
+                hiddenSlices.front(), 0, 1, 2);
+            if (mlir::succeeded(output)) fusedOutput = *output;
+        }
+        if (!fusedOutput) strategy = FfnScheduleStrategy::Tail;
+    }
+
     return std::make_unique<FfnEmissionContext>(FfnEmissionContext {
         rewriter,
         ffn,
@@ -142,10 +200,13 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         gateRoute,
         upRoute,
         downRoute,
+        hiddenRoute,
         gateRaw,
         upRaw,
         downRaw,
         std::move(weightSlices),
+        std::move(upWeightSlices),
+        std::move(downWeightSlices),
         std::move(activationSlices),
         std::move(hiddenSlices),
         std::move(resultSlices),
@@ -156,6 +217,9 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         *activationLatency,
         downAccumulatorBase,
         activationDistributed16,
+        block8Ffn,
+        block8Ffn,
+        fusedOutput,
     });
 }
 

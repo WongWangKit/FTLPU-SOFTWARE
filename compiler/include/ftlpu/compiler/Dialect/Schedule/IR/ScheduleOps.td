@@ -18,6 +18,7 @@ def MemTransferOp : FTLPU_Schedule_Op<"mem_transfer", [MemoryEffects<[MemWrite]>
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
       OptionalAttr<I64Attr>:$wave_address_stride,
+      OptionalAttr<I64Attr>:$address_binding,
       StrAttr:$accumulator_destination);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
@@ -30,7 +31,22 @@ def MxmIssueOp : FTLPU_Schedule_Op<"mxm_issue", [MemoryEffects<[MemWrite]>]> {
       I64Attr:$output_stream_base, I64Attr:$repeat_count,
       I64Attr:$repeat_interval, I64Attr:$accumulator_address,
       I64Attr:$accumulator_row_stride, StrAttr:$accumulator_destination,
-      BoolAttr:$accumulator_clear);
+      BoolAttr:$accumulator_clear,
+      OptionalAttr<StrAttr>:$data_format,
+      OptionalAttr<StrAttr>:$accumulator_output_format,
+      OptionalAttr<StrAttr>:$weight_load_mode,
+      OptionalAttr<I64Attr>:$weight_inner_column,
+      OptionalAttr<StrAttr>:$weight_input_mode,
+      OptionalAttr<StrAttr>:$compute_mode);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def MxmDequantOp : FTLPU_Schedule_Op<"mxm_dequant",
+    [MemoryEffects<[MemWrite]>]> {
+  let summary = "Cycle-accurate issue to an MXM-local weight dequantizer";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$unit_id, F32Attr:$scale,
+      I64Attr:$repeat_count, I64Attr:$repeat_interval);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -67,8 +83,12 @@ def MemReadOp : FTLPU_Schedule_Op<"mem_read"> {
 def MxmLoadOp : FTLPU_Schedule_Op<"mxm_load"> {
   let summary = "Issue MXM IW instructions";
   let arguments = (ins AnyRankedTensor:$input, I64Attr:$cycle, I64Attr:$duration,
-      I64Attr:$stream_base, I64Attr:$stream_count, I64Attr:$unit_id,
-      I64Attr:$weight_buffer);
+        I64Attr:$stream_base, I64Attr:$stream_count, I64Attr:$unit_id,
+        I64Attr:$weight_buffer,
+        OptionalAttr<StrAttr>:$data_format,
+        OptionalAttr<StrAttr>:$weight_load_mode,
+        OptionalAttr<I64Attr>:$weight_inner_column,
+        OptionalAttr<StrAttr>:$weight_input_mode);
   let results = (outs AnyRankedTensor:$output);
   let builders = [OpBuilder<(ins "::mlir::Value":$input, "int64_t":$cycle,
       "int64_t":$duration, "int64_t":$stream_base, "int64_t":$stream_count,
@@ -80,6 +100,12 @@ def MxmLoadOp : FTLPU_Schedule_Op<"mxm_load"> {
     $_state.addAttribute("stream_count", $_builder.getI64IntegerAttr(stream_count));
     $_state.addAttribute("unit_id", $_builder.getI64IntegerAttr(unit_id));
     $_state.addAttribute("weight_buffer", $_builder.getI64IntegerAttr(weight_buffer));
+    auto &properties = $_state.getOrAddProperties<Properties>();
+    properties.data_format = $_builder.getStringAttr(
+        ::llvm::cast<::mlir::ShapedType>(input.getType())
+                .getElementType().isBF16()
+            ? "bf16"
+            : "fp16");
   }] >];
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
@@ -91,7 +117,8 @@ def MxmComputeOp : FTLPU_Schedule_Op<"mxm_compute"> {
       I64Attr:$cycle, I64Attr:$duration, I64Attr:$result_cycle,
       I64Attr:$result_duration, I64Attr:$activation_stream_base,
       I64Attr:$output_stream_base, I64Attr:$weight_buffer,
-      I64Attr:$unit_id,
+      I64Attr:$unit_id, OptionalAttr<StrAttr>:$data_format,
+      OptionalAttr<StrAttr>:$compute_mode,
       I64Attr:$m, I64Attr:$n, I64Attr:$k);
   let results = (outs AnyRankedTensor:$result);
   let builders = [OpBuilder<(ins "::mlir::Value":$activation, "::mlir::Value":$weight,
@@ -109,6 +136,12 @@ def MxmComputeOp : FTLPU_Schedule_Op<"mxm_compute"> {
     $_state.addAttribute("output_stream_base", $_builder.getI64IntegerAttr(output_stream_base));
     $_state.addAttribute("weight_buffer", $_builder.getI64IntegerAttr(weight_buffer));
     $_state.addAttribute("unit_id", $_builder.getI64IntegerAttr(unit_id));
+    auto &properties = $_state.getOrAddProperties<Properties>();
+    properties.data_format = $_builder.getStringAttr(
+        ::llvm::cast<::mlir::ShapedType>(activation.getType())
+                .getElementType().isBF16()
+            ? "bf16"
+            : "fp16");
     $_state.addAttribute("m", $_builder.getI64IntegerAttr(m));
     $_state.addAttribute("n", $_builder.getI64IntegerAttr(n));
     $_state.addAttribute("k", $_builder.getI64IntegerAttr(k));
@@ -121,7 +154,9 @@ def MxmAccumulatorReadOp : FTLPU_Schedule_Op<"mxm_accumulator_read"> {
   let summary = "Read one row from an MXM-local accumulator to west streams";
   let arguments = (ins AnyRankedTensor:$input, I64Attr:$cycle,
       I64Attr:$unit_id, I64Attr:$accumulator_address,
-      I64Attr:$output_stream_base, BoolAttr:$clear);
+      I64Attr:$output_stream_base, BoolAttr:$clear,
+      OptionalAttr<StrAttr>:$data_format,
+      OptionalAttr<StrAttr>:$compute_mode);
   let results = (outs AnyRankedTensor:$output);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
@@ -203,7 +238,9 @@ def SxmOp : FTLPU_Schedule_Op<"sxm"> {
   let summary = "Cycle-accurate SXM transpose or permute instruction";
   let arguments = (ins I64Attr:$cycle, I64Attr:$hemisphere, StrAttr:$opcode,
       ArrayAttr:$source_streams, ArrayAttr:$destination_streams,
-      ArrayAttr:$permute_map, StrAttr:$weight_layout);
+      ArrayAttr:$permute_map, StrAttr:$weight_layout,
+      OptionalAttr<I64Attr>:$repeat_count,
+      OptionalAttr<I64Attr>:$repeat_interval);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }

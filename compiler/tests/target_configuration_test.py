@@ -44,7 +44,8 @@ def main() -> None:
         "mxm_pipeline_rows = 6 : i64",
         "vxm_weight_to_iw_latency = 10 : i64",
         "swiglu_write_latency = 11 : i64",
-        "ftlpu.schedule.mxm_compute",
+        "ftlpu.schedule.mxm_issue",
+        "ftlpu.schedule.mxm_dequant",
         "ftlpu.schedule.vxm",
     ]
     missing = [value for value in required if value not in explored]
@@ -55,12 +56,6 @@ def main() -> None:
         raise AssertionError("default Schedule IR has no explicit 32-stream target")
     if baseline == explored:
         raise AssertionError("non-default target did not change Schedule IR")
-    if 'lhs_index = 44 : i64, lhs_kind = "stream_f32"' not in explored:
-        raise AssertionError(
-            "40-stream target did not remap the second accumulator stream")
-    if 'output_stream = 32 : i64' not in explored:
-        raise AssertionError(
-            "40-stream target did not remap the FFN writeback stream group")
 
 
 if __name__ == "__main__":

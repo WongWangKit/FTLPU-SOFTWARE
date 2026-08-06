@@ -5,6 +5,7 @@
 
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
@@ -42,7 +43,10 @@ struct TileAddress {
 bool isDistributed16(mlir::DictionaryAttr placement)
 {
     const auto kind = placement.getAs<mlir::StringAttr>("kind");
-    return kind && kind.getValue() == "fp16_mxm_distributed_16";
+    return kind
+        && (kind.getValue() == "fp16_mxm_distributed_16"
+            || kind.getValue()
+                == "fp16_mxm_block8_distributed_16");
 }
 
 mlir::FailureOr<TileAddress> distributedAddress(
@@ -67,7 +71,8 @@ mlir::FailureOr<TileAddress> distributedAddress(
 
 mlir::FailureOr<TileAddress> tileAddress(
     mlir::DictionaryAttr placement, int64_t block, int64_t rows,
-    int64_t preferredHemisphere)
+    int64_t preferredHemisphere,
+    const target::LPUTargetModel& target)
 {
     const auto kind = placement.getAs<mlir::StringAttr>("kind");
     const auto slices = placementSlices(placement);
@@ -89,9 +94,15 @@ mlir::FailureOr<TileAddress> tileAddress(
             base + (dual ? block / 4 : block / 2) * rows,
             dual ? (block / 2) % 2 : 0};
     }
-    if (kind.getValue() == "fp16_mxm_distributed_16")
+    if (isDistributed16(placement)) {
+        if (kind.getValue()
+            == "fp16_mxm_block8_distributed_16")
+            preferredHemisphere =
+                (block / target.throughput().mxms_per_hemisphere)
+                % target.memory().hemispheres;
         return distributedAddress(
             placement, block, 0, 1, preferredHemisphere);
+    }
     return mlir::failure();
 }
 
@@ -139,11 +150,17 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
     const int64_t rows = type.getDimSize(0);
     const int64_t columns = type.getDimSize(1);
     const int64_t tile = target.throughput().mxm_rows;
+    const auto streamKind =
+        lpu_16bit_stream_kind(type.getElementType());
+    const auto dataFormat =
+        lpu_16bit_data_format(type.getElementType());
     if (op.getKind() != "add" || type.getRank() != 2
-        || !type.getElementType().isF16() || rows % tile != 0
+        || !is_lpu_16bit_float(type.getElementType())
+        || rows % tile != 0
         || columns % tile != 0) {
         return op.emitError(
-            "elementwise schedule currently supports tile-aligned FP16 add");
+            "elementwise schedule currently supports tile-aligned "
+            "16-bit float add");
     }
 
     const auto lhsPlacement =
@@ -156,11 +173,17 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
         resultPlacement.getAs<mlir::StringAttr>("kind").getValue();
     const auto resultSlices = placementSlices(resultPlacement);
     const bool resultDistributed = isDistributed16(resultPlacement);
+    const auto layoutKind = [](mlir::DictionaryAttr placement) {
+        const auto kind = placement.getAs<mlir::StringAttr>("kind");
+        return kind ? kind.getValue() : llvm::StringRef("<missing>");
+    };
     if ((!resultDistributed && resultSlices.size() < 4)
         || (resultDistributed && resultSlices.size() != 16)
         || (resultKind != "fp16_pair_planar"
             && resultKind != "fp16_mxm_activation_planar"
-            && resultKind != "fp16_mxm_distributed_16"))
+            && resultKind != "fp16_mxm_distributed_16"
+            && resultKind
+                != "fp16_mxm_block8_distributed_16"))
         return op.emitError("unsupported elementwise result layout");
 
     const auto westLatency = [&](int64_t slice) {
@@ -180,21 +203,31 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
     mlir::Value finalValue = op.getLhs();
     const int64_t columnBlocks = columns / tile;
     for (int64_t block = 0; block < columnBlocks; ++block) {
-        auto probeLhs = tileAddress(lhsPlacement, block, rows, 0);
-        auto probeRhs = tileAddress(rhsPlacement, block, rows, 0);
+        auto probeLhs = tileAddress(
+            lhsPlacement, block, rows, 0, target);
+        auto probeRhs = tileAddress(
+            rhsPlacement, block, rows, 0, target);
         if (mlir::failed(probeLhs) || mlir::failed(probeRhs))
-            return op.emitError("unsupported elementwise operand layout");
+            return op.emitError("unsupported elementwise operand layout")
+                << " during hemisphere probe: lhs="
+                << layoutKind(lhsPlacement) << ", rhs="
+                << layoutKind(rhsPlacement);
         const int64_t hemisphere = std::max(
             probeLhs->hemisphere, probeRhs->hemisphere);
         auto lhs = tileAddress(
-            lhsPlacement, block, rows, hemisphere);
+            lhsPlacement, block, rows, hemisphere, target);
         auto rhs = tileAddress(
-            rhsPlacement, block, rows, hemisphere);
+            rhsPlacement, block, rows, hemisphere, target);
         auto result = tileAddress(
-            resultPlacement, block, rows, hemisphere);
+            resultPlacement, block, rows, hemisphere, target);
         if (mlir::failed(lhs) || mlir::failed(rhs)
             || mlir::failed(result))
-            return op.emitError("unsupported elementwise operand layout");
+            return op.emitError("unsupported elementwise operand layout")
+                << " during tile addressing: lhs="
+                << layoutKind(lhsPlacement) << ", rhs="
+                << layoutKind(rhsPlacement) << ", result="
+                << layoutKind(resultPlacement) << ", block=" << block
+                << ", hemisphere=" << hemisphere;
 
         const int64_t vxmCycle = cycle;
         const auto emitOperand = [&](mlir::DictionaryAttr placement,
@@ -236,14 +269,14 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             return op.emitError("invalid distributed elementwise address");
         auto sum = create_vxm(rewriter, op.getLoc(),
             op.getLhs(), op.getRhs(), type, vxmCycle, 0, "add",
-            "stream_f16", 32, 0.0f, "stream_f16", 34, 0.0f,
+            streamKind, 32, 0.0f, streamKind, 34, 0.0f,
             "fp32", -1, rows, 1,
             hemisphere == 0 ? "east" : "west",
             hemisphere == 0 ? "east" : "west");
         auto cast = create_vxm(rewriter, op.getLoc(),
             sum.getResult(), sum.getResult(), type, vxmCycle + 1, 1,
             "cast", "alu", 0, 0.0f, "immediate", 0, 0.0f,
-            "fp16", 0, rows, 1,
+            dataFormat, 0, rows, 1,
             hemisphere == 0 ? "east" : "west",
             hemisphere == 0 ? "east" : "west");
         finalValue = cast.getResult();
@@ -253,21 +286,21 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             create_vxm(rewriter, op.getLoc(),
                 sum.getResult(), sum.getResult(), type,
                 vxmCycle + 1, 2, "cast", "alu", 0, 0.0f,
-                "immediate", 0, 0.0f, "fp16", 2,
+                "immediate", 0, 0.0f, dataFormat, 2,
                 rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "east" : "west");
             create_vxm(rewriter, op.getLoc(),
                 sum.getResult(), sum.getResult(), type,
                 vxmCycle + 1, 3, "cast", "alu", 0, 0.0f,
-                "immediate", 0, 0.0f, "fp16", 0,
+                "immediate", 0, 0.0f, dataFormat, 0,
                 rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "west" : "east");
             create_vxm(rewriter, op.getLoc(),
                 sum.getResult(), sum.getResult(), type,
                 vxmCycle + 1, 4, "cast", "alu", 0, 0.0f,
-                "immediate", 0, 0.0f, "fp16", 2,
+                "immediate", 0, 0.0f, dataFormat, 2,
                 rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "west" : "east");
@@ -276,7 +309,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             create_vxm(rewriter, op.getLoc(),
                 sum.getResult(), sum.getResult(), type,
                 vxmCycle + 1, 2, "cast", "alu", 0, 0.0f,
-                "immediate", 0, 0.0f, "fp16", 0,
+                "immediate", 0, 0.0f, dataFormat, 0,
                 rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "west" : "east");

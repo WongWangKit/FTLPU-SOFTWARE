@@ -29,8 +29,10 @@ bool has_complete_disjoint_memory_plan(const AttentionTaskGraph& graph)
         {"input", "query_weight", "key_weight", "value_weight",
             "output_weight", "query", "key", "value", "score",
             "score_mxm1", "exp", "exp_mxm1", "causal_mask",
-            "causal_mask_mxm1", "probability", "probability_mxm1",
-            "probability_pack", "probability_diagonal", "rope", "context",
+            "causal_mask_mxm1", "probability_pack",
+            "probability_diagonal", "fused_score",
+            "fused_score_bank1", "fused_causal_mask",
+            "fused_causal_mask_bank1", "rope", "context",
             "result"})
         if (!names.contains(required)) return false;
     return true;

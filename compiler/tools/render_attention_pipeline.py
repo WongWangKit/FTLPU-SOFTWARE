@@ -30,6 +30,9 @@ class Window:
 COLORS = {
     "MEM.Read": "#8fc8a7",
     "MEM.Write": "#f0ca78",
+    "MEM.WriteTap": "#e9a35f",
+    "MEM.ReadWrite": "#b7b879",
+    "MEM.ReadWriteTap": "#c18f67",
     "MEM.Accumulate.Sram": "#c5a3d9",
     "MEM.Accumulate.Stream": "#e16b6f",
     "SXM.Transpose": "#71c3bc",
@@ -113,7 +116,7 @@ def group_dequant_lanes(events: list[Event]) -> list[Event]:
             candidates[(event.start, event.end, "multiply", 0)].append(
                 (alu, event)
             )
-        elif event.detail.startswith("cast ->") and alu >= 8:
+        elif event.detail.startswith("cast") and alu >= 8:
             candidates[(event.start, event.end, "cast", 8)].append((alu, event))
         else:
             untouched.append(event)
@@ -121,11 +124,15 @@ def group_dequant_lanes(events: list[Event]) -> list[Event]:
     grouped = list(untouched)
     for (start, end, operation, base), group in candidates.items():
         if {alu for alu, _ in group} == set(range(base, base + 8)):
-            detail = (
-                "dequant int8 multiply"
-                if operation == "multiply"
-                else "dequant cast FP16"
-            )
+            if operation == "multiply":
+                detail = "dequant int8 multiply"
+            else:
+                float_format = (
+                    "BF16"
+                    if any("BF16" in event.detail for _, event in group)
+                    else "FP16"
+                )
+                detail = f"dequant cast {float_format}"
             grouped.append(
                 Event(start, end, f"VXM.ALU{base}-{base + 7}", detail)
             )
@@ -168,13 +175,14 @@ def discover_windows(events: list[Event]) -> tuple[Window, ...]:
     rope_start = first_start(
         events,
         lambda event: event.resource.startswith("VXM.")
-        and event.detail == "subtract -> E0",
+        and event.detail == "subtract -> E20",
     )
     packed_p_start = first_start(
         events,
         lambda event: event.start > softmax_start
-        and event.resource.startswith("VXM.")
-        and event.detail == "pass -> E0",
+        and event.resource.startswith("MEM.")
+        and event.resource.endswith("Write")
+        and "addr=6000 " in event.detail,
     )
     sxm_start = first_start(
         events, lambda event: event.resource.startswith("SXM.")
@@ -184,25 +192,22 @@ def discover_windows(events: list[Event]) -> tuple[Window, ...]:
         lambda event: event.start > sxm_start
         and event.resource.endswith(".Compute"),
     )
-    post_pv_compute = []
-    for event in events:
-        if (
-            event.start > pv_compute_start
-            and event.resource.endswith(".Compute")
-            and event.detail.startswith("Compute ")
-        ):
-            accumulator = re.search(r"\bacc=(\d+)\b", event.detail)
-            if accumulator:
-                post_pv_compute.append((event, int(accumulator.group(1))))
-    if not post_pv_compute:
-        raise ValueError("runtime trace is missing post-PV MXM computes")
-    # O projection reuses one high accumulator block after each completed
-    # output group. PV uses lower context-addressed blocks.
-    o_accumulator_base = max(accumulator for _, accumulator in post_pv_compute)
-    o_compute_start = min(
-        event.start
-        for event, accumulator in post_pv_compute
-        if accumulator == o_accumulator_base
+    o_staging_events = [
+        event
+        for event in events
+        if event.start > pv_compute_start
+        and event.resource.startswith("MEM.")
+        and event.resource.endswith("WriteTap")
+    ]
+    if not o_staging_events:
+        raise ValueError("runtime trace is missing O-projection staging taps")
+    o_staging_start = min(event.start for event in o_staging_events)
+    o_staging_end = max(event.end for event in o_staging_events)
+    o_compute_start = first_start(
+        events,
+        lambda event: event.start > o_staging_end
+        and event.resource.endswith(".Compute")
+        and event.detail.startswith("Compute "),
     )
 
     cast_events = [
@@ -210,29 +215,53 @@ def discover_windows(events: list[Event]) -> tuple[Window, ...]:
         for event in events
         if event.start < qk_start
         and event.resource.startswith("VXM.")
-        and event.detail.startswith("FP32->FP16 output cast")
+        and (
+            re.match(r"FP32->(?:FP16|BF16) output cast", event.detail)
+            or re.match(r"cast (?:FP16|BF16) -> [EW]\d+", event.detail)
+        )
     ]
     cast_clusters = merge_intervals(cast_events, max_gap=64)
-    if not cast_clusters:
-        raise ValueError("runtime trace is missing projection output casts")
-    final_projection_cast = cast_clusters[-1][0]
+    direct_output_events = [
+        event
+        for event in projection_compute
+        if event.start < qk_start and "dst=stream" in event.detail
+    ]
+    direct_output_clusters = merge_intervals(direct_output_events, max_gap=64)
+    if direct_output_clusters:
+        final_projection_output = direct_output_clusters[-1][0]
+        projection_format = (
+            "BF16"
+            if any("format=bf16" in event.detail for event in direct_output_events)
+            else "FP16"
+        )
+        projection_output_detail = f"ACC -> {projection_format} stream + clear"
+    elif cast_clusters:
+        final_projection_output = cast_clusters[-1][0]
+        projection_format = (
+            "BF16"
+            if any("BF16" in event.detail for event in cast_events)
+            else "FP16"
+        )
+        projection_output_detail = f"{projection_format} cast"
+    else:
+        raise ValueError("runtime trace is missing projection outputs")
 
     return (
         Window(0, 204, "Q projection: first reduction block"),
         Window(
             max(0, rope_start - 8),
             rope_start + 76,
-            "Q RoPE: FP32 rotate, FP16 cast, and MEM writeback",
+            f"Q RoPE: drain MEM FIFO while the next MXM projection runs",
         ),
         Window(
-            final_projection_cast,
-            min(qk_start, final_projection_cast + 170),
-            "V projection: FP16 cast -> packed 16-stream MEM layout",
+            final_projection_output,
+            min(qk_start, final_projection_output + 170),
+            f"V projection: {projection_output_detail} -> direct 16-stream MEM write",
         ),
         Window(
             qk_start + 450,
             min(softmax_start, qk_start + 1094),
-            "QK: four MXMs, independent query blocks",
+            "QK: independent query blocks",
         ),
         Window(
             softmax_start + 609,
@@ -240,19 +269,24 @@ def discover_windows(events: list[Event]) -> tuple[Window, ...]:
             "Softmax: P1 scale/mask/max, P2 exp/sum, P3 normalize/cast",
         ),
         Window(
-            packed_p_start + 593,
-            packed_p_start + 997,
-            "Post-softmax P layout: packed x16 blocks at II=4",
+            packed_p_start - 12,
+            packed_p_start + 212,
+            "Softmax P3: normalize/cast -> direct packed x16 MEM write",
         ),
         Window(
             max(sxm_start, pv_compute_start - 36),
             pv_compute_start + 288,
-            "P x V: passive cross-hemisphere streams, V IW, and direct P replay",
+            "P x V: V prefetch/IW overlapped with dense P replay",
+        ),
+        Window(
+            max(0, o_staging_start - 4),
+            o_staging_start + 84,
+            "O input staging: local MEM tap + passive bridge remote write",
         ),
         Window(
             max(0, o_compute_start - 36),
             o_compute_start + 276,
-            "O projection: first four-MXM reduction wave",
+            "O projection: continuous dual-MXM Block8 issues",
         ),
     )
 
@@ -319,6 +353,12 @@ def detail_class(event: Event) -> str:
             return "continuous reads"
         if event.resource.endswith(".Write"):
             return "continuous writes"
+        if event.resource.endswith(".WriteTap"):
+            return "continuous writes + passive forwarding"
+        if event.resource.endswith(".ReadWrite"):
+            return "dual-port reads/writes"
+        if event.resource.endswith(".ReadWriteTap"):
+            return "dual-port reads/writes + passive forwarding"
         destination = (
             "stream + clear"
             if accumulator_stream_destination(event.detail)

@@ -1,12 +1,16 @@
 #include "FfnStageEmitter.hpp"
 
 #include "FfnEmitterUtils.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 
 namespace ftlpu::compiler::schedule::ffn_detail {
 
 mlir::FailureOr<mlir::Value> emitFfnDownProjection(
     FfnEmissionContext& context, const FfnSwishEmission& swish)
 {
+    if (context.block8_down)
+        return emitFfnBlock8DownProjection(context, swish);
+
     auto& rewriter = context.rewriter;
     auto& ffn = context.ffn;
     const auto& target = context.target;
@@ -21,6 +25,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         throughput.mxm0_accumulator_latency;
     const int64_t upAccLatency =
         throughput.mxm1_accumulator_latency;
+    const int64_t hiddenBaseRow =
+        get_base_row(ffn.getHidden0Placement());
 
     auto timeline = planFfnDownProjectionTimeline(
         {context.m(), context.k(), intermediate, context.n()},
@@ -85,7 +91,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                                         - context.eastMxmLatency(
                                             context.hidden_slices[byte]),
                                     context.hidden_slices[byte],
-                                    reduction * m + mTile * tile
+                                    hiddenBaseRow
+                                        + reduction * m + mTile * tile
                                         + rowOffset,
                                     segment.rows, 1,
                                     segment.stream_base + byte, "east",
@@ -177,6 +184,10 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     timeline->output_stream_base;
                 const int64_t outputAluBase = hemisphere
                     * timeline->vxm_queues_per_hemisphere;
+                const auto dataFormat = lpu_16bit_data_format(
+                    llvm::cast<mlir::RankedTensorType>(
+                        ffn.getResult().getType())
+                        .getElementType());
                 for (int64_t row = 0; row < tile; ++row) {
                     const int64_t vxmCycle = computeCycle
                         + throughput.accumulator_to_vxm_latency + row;
@@ -185,7 +196,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         ffn.getResult().getType(), vxmCycle,
                         outputAluBase, "pass", "stream_f32",
                         timeline->first_accumulator_stream, 0,
-                        "immediate", 0, 0, "fp16", resultStreamBase, 1,
+                        "immediate", 0, 0, dataFormat, resultStreamBase, 1,
                         1, context.hemisphereName(hemisphere),
                         context.hemisphereName(hemisphere));
                     auto cast1 = create_vxm(rewriter, ffn.getLoc(),
@@ -193,7 +204,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         ffn.getResult().getType(), vxmCycle,
                         outputAluBase + 1, "pass", "stream_f32",
                         timeline->second_accumulator_stream, 0,
-                        "immediate", 0, 0, "fp16",
+                        "immediate", 0, 0, dataFormat,
                         resultStreamBase + 2, 1, 1,
                         context.hemisphereName(hemisphere),
                         context.hemisphereName(hemisphere));

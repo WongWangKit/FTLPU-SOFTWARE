@@ -85,11 +85,11 @@ def main() -> None:
             ("output", "output_weight"),
         ):
             attention_scale_ops.append(
-                f"""%attention_{stem}_scale = stablehlo.constant dense<{scales[role]:.9e}> : tensor<f16>
+                f"""%attention_{stem}_scale = stablehlo.constant dense<{scales[role]:.9e}> : tensor<bf16>
     %attention_{stem}_scale_broadcast = stablehlo.broadcast_in_dim %attention_{stem}_scale, dims = [] :
-        (tensor<f16>) -> tensor<{576 if role != "output" else 576}x{576 if role in ("query", "output") else 192}xf16>
+        (tensor<bf16>) -> tensor<{576 if role != "output" else 576}x{576 if role in ("query", "output") else 192}xbf16>
     %attention_{stem}_scaled = stablehlo.multiply %attention_{stem}_f16, %attention_{stem}_scale_broadcast :
-        tensor<{576 if role != "output" else 576}x{576 if role in ("query", "output") else 192}xf16>"""
+        tensor<{576 if role != "output" else 576}x{576 if role in ("query", "output") else 192}xbf16>"""
             )
             attention = attention.replace(
                 f"%attention_{stem}_f16,\n        contracting",
@@ -124,28 +124,28 @@ def main() -> None:
 
     output = f"""module {{
   func.func @smollm2_135m_decoder_layer_seq128(
-      %x: tensor<128x576xf16>,
-      %input_norm_weight: tensor<576xf16>,
+      %x: tensor<128x576xbf16>,
+      %input_norm_weight: tensor<576xbf16>,
       %query_weight: tensor<576x576xi8>,
       %key_weight: tensor<576x192xi8>,
       %value_weight: tensor<576x192xi8>,
       %output_weight: tensor<576x576xi8>,
-      %post_attention_norm_weight: tensor<576xf16>,
+      %post_attention_norm_weight: tensor<576xbf16>,
       %gate_weight: tensor<576x1536xi8>,
       %up_weight: tensor<576x1536xi8>,
-      %down_weight: tensor<1536x576xi8>) -> tensor<128x576xf16> {{
+      %down_weight: tensor<1536x576xi8>) -> tensor<128x576xbf16> {{
     {rms1}
 
     {attention}
     %residual1 = stablehlo.add %x, {attention_result} :
-        tensor<128x576xf16>
+        tensor<128x576xbf16>
 
     {rms2}
 
     {ffn}
     %result = stablehlo.add %residual1, {ffn_result} :
-        tensor<128x576xf16>
-    return %result : tensor<128x576xf16>
+        tensor<128x576xbf16>
+    return %result : tensor<128x576xbf16>
   }}
 }}
 """

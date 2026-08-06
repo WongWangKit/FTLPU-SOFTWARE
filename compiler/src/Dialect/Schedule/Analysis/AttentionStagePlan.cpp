@@ -23,8 +23,9 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t tokenBlocks = shape.sequence_length / tile;
     const int64_t headBlocks = shape.head_dim / tile;
-    const int64_t qkWaveComputeCycles = tokenBlocks * headBlocks
-        * target.mxm_block_issue_interval();
+    const int64_t qkIssueCount = tokenBlocks * headBlocks;
+    const int64_t qkWaveComputeCycles =
+        (qkIssueCount - 1) * target.mxm_block_issue_interval() + tile;
     result.qk_iw_to_compute_cycles =
         target.throughput().qk_iw_to_compute_latency;
     const int64_t firstIwOffset =
@@ -34,7 +35,11 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
             target::StreamDirection::East, 0);
     const int64_t computeEnd = firstIwOffset
         + result.qk_iw_to_compute_cycles + qkWaveComputeCycles;
-    result.qk_wave_interval = computeEnd - firstIwOffset;
+    result.qk_wave_interval =
+        target.supports_mxm_weight_activation_overlap()
+            && target.throughput().mxm_weight_buffers >= 2
+        ? qkWaveComputeCycles
+        : computeEnd - firstIwOffset;
     result.qk_wave_duration = computeEnd
         + std::max(target.throughput().mxm0_accumulator_latency,
             target.throughput().mxm1_accumulator_latency);

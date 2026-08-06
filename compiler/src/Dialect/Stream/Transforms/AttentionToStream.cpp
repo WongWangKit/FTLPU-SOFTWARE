@@ -23,8 +23,10 @@ mlir::LogicalResult lower_attention(
                          target::StreamDirection direction, llvm::StringRef buffer,
                          int64_t begin, int64_t end) -> bool {
         const auto buffer_placement = placement(buffer);
-        const auto slices = buffer_placement.getAs<mlir::ArrayAttr>("slices");
-        if (!buffer_placement || !slices || slices.empty()) return false;
+        if (!buffer_placement) return false;
+        const auto slices =
+            buffer_placement.getAs<mlir::ArrayAttr>("slices");
+        if (!slices || slices.empty()) return false;
         const auto slice = llvm::cast<mlir::IntegerAttr>(slices[0]).getInt();
         const auto binding = allocator.allocate(source, destination, direction, slice, begin, end);
         const auto latency = target.transport_latency(source, destination, direction, slice);

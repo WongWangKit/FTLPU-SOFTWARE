@@ -5,6 +5,7 @@
 
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
@@ -41,9 +42,20 @@ llvm::SmallVector<int64_t> slices(mlir::DictionaryAttr placement)
 
 int64_t elementBytes(mlir::RankedTensorType type)
 {
-    if (type.getElementType().isF16()) return 2;
+    if (is_lpu_16bit_float(type.getElementType())) return 2;
     if (type.getElementType().isF32()) return 4;
     return 0;
+}
+
+int64_t inputBindingIndex(mlir::Value value)
+{
+    if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(value))
+        return argument.getArgNumber();
+    if (auto binding =
+            value.getDefiningOp<schedule::BindingOp>())
+        return binding.getAccess() == "input"
+            ? binding.getIndex() : -1;
+    return -1;
 }
 
 struct TileAddress {
@@ -732,6 +744,10 @@ int64_t emitSerialVxmFeedback(mlir::IRRewriter& rewriter,
     const auto outputSlices = slices(outputPlacement);
     const auto inputType =
         llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
+    const llvm::StringRef streamKind =
+        lpu_16bit_stream_kind(inputType.getElementType());
+    const llvm::StringRef dataFormat =
+        lpu_16bit_data_format(inputType.getElementType());
     const int64_t rows = inputType.getDimSize(0);
     const int64_t hidden = inputType.getDimSize(1);
     const int64_t tile = target.throughput().mxm_rows;
@@ -761,7 +777,7 @@ int64_t emitSerialVxmFeedback(mlir::IRRewriter& rewriter,
                 32 + byte, hidden, 1, 1);
         create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
             inputType, square, 0, "square",
-            "stream_f16", 32, 0.0f, "immediate", 0, 0.0f,
+            streamKind, 32, 0.0f, "immediate", 0, 0.0f,
             "fp32", -1, hidden, 1, "east", "east");
         create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
             inputType, square, 1, "pass",
@@ -805,24 +821,26 @@ int64_t emitSerialVxmFeedback(mlir::IRRewriter& rewriter,
                 normalize - westReadLatency(weightSlices[byte]),
                 weightSlices[byte], "read",
                 baseRow(weightPlacement), 34 + byte,
-                1, 1, 0);
+                1, 1, 0, "sram",
+                inputBindingIndex(op.getWeight()));
             emitMem(rewriter, op.getLoc(),
                 normalize - westReadLatency(weightSlices[byte]) + 2,
                 weightSlices[byte], "read",
                 baseRow(weightPlacement), 34 + byte,
-                hidden, 1, 1);
+                hidden, 1, 1, "sram",
+                inputBindingIndex(op.getWeight()));
         }
         for (int64_t queue = 6; queue <= 9; ++queue)
             create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
                 inputType, normalize + queue - 6, queue, "pass",
-                queue == 6 ? "stream_f16" : "alu",
+                queue == 6 ? streamKind : llvm::StringRef("alu"),
                 queue == 6 ? 32 : queue - 1, 0.0f,
                 "immediate", 0, 0.0f, "fp32", -1,
                 hidden, 1, "east", "east");
         for (int64_t queue = 10; queue <= 13; ++queue)
             create_vxm(rewriter, op.getLoc(), op.getWeight(), op.getWeight(),
                 inputType, normalize + queue - 10, queue, "pass",
-                queue == 10 ? "stream_f16" : "alu",
+                queue == 10 ? streamKind : llvm::StringRef("alu"),
                 queue == 10 ? 34 : queue - 1, 0.0f,
                 "immediate", 0, 0.0f, "fp32", -1,
                 hidden, 1, "east", "east");
@@ -833,11 +851,11 @@ int64_t emitSerialVxmFeedback(mlir::IRRewriter& rewriter,
         create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
             inputType, normalize + 6, 15, "multiply",
             "alu", 14, 0.0f, "alu", 13, 0.0f,
-            "fp16", 0, hidden, 1, "east", "east");
+            dataFormat, 0, hidden, 1, "east", "east");
         create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
             inputType, normalize + 7, 0, "pass",
             "alu", 15, 0.0f, "immediate", 0, 0.0f,
-            "fp16", 16, hidden, 1, "east", "west");
+            dataFormat, 16, hidden, 1, "east", "west");
 
         for (int64_t byte = 0; byte < 2; ++byte) {
             emitMem(rewriter, op.getLoc(),
@@ -868,20 +886,21 @@ int64_t emitSerialVxmFeedback(mlir::IRRewriter& rewriter,
                     gammaCycle - westReadLatency(weightSlices[byte]),
                     weightSlices[byte], "read",
                     baseRow(weightPlacement) + column,
-                    34 + byte, 1, 1, 0);
+                    34 + byte, 1, 1, 0, "sram",
+                    inputBindingIndex(op.getWeight()));
             }
             create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
                 inputType, xCycle, 6, "multiply",
-                "stream_f16", 32, 0.0f, "alu", 5, 0.0f,
+                streamKind, 32, 0.0f, "alu", 5, 0.0f,
                 "fp32", -1, 1, 1, "east", "east");
             create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
                 inputType, gammaCycle, 7, "multiply",
-                "alu", 6, 0.0f, "stream_f16", 34, 0.0f,
-                "fp16", 0, 1, 1, "east", "east");
+                "alu", 6, 0.0f, streamKind, 34, 0.0f,
+                dataFormat, 0, 1, 1, "east", "east");
             create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
                 inputType, gammaCycle + 1, 8, "pass",
                 "alu", 7, 0.0f, "immediate", 0, 0.0f,
-                "fp16", 16, 1, 1, "east", "west");
+                dataFormat, 16, 1, 1, "east", "west");
             for (int64_t byte = 0; byte < 2; ++byte) {
                 emitMem(rewriter, op.getLoc(),
                     gammaCycle + eastWriteLatency(outputSlices[byte]),
@@ -918,6 +937,10 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
     const auto outputSlices = slices(outputPlacement);
     const auto inputType =
         llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
+    const llvm::StringRef streamKind =
+        lpu_16bit_stream_kind(inputType.getElementType());
+    const llvm::StringRef dataFormat =
+        lpu_16bit_data_format(inputType.getElementType());
     const int64_t rows = inputType.getDimSize(0);
     const int64_t hidden = inputType.getDimSize(1);
     const int64_t tile = target.throughput().mxm_rows;
@@ -962,7 +985,7 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
                     create_vxm(rewriter, op.getLoc(),
                         op.getInput(), op.getInput(), inputType,
                         square, feature, "square",
-                        "stream_f16", 32 + 2 * feature, 0.0f,
+                        streamKind, 32 + 2 * feature, 0.0f,
                         "immediate", 0, 0.0f, "fp32", -1,
                         1, 1, "east", "east");
                 for (int64_t pair = 0; pair < 4; ++pair)
@@ -1037,7 +1060,8 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
                     emitMem(rewriter, op.getLoc(),
                         normalize - westReadLatency(weightSlices[stream]),
                         weightSlices[stream], "read", weightAddress,
-                        48 + stream, 1, 1, 0);
+                        48 + stream, 1, 1, 0, "sram",
+                        inputBindingIndex(op.getWeight()));
                 }
                 for (int64_t feature = 0;
                      feature < featuresPerBeat; ++feature) {
@@ -1045,22 +1069,22 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
                     create_vxm(rewriter, op.getLoc(),
                         op.getInput(), op.getInput(), inputType,
                         featureCycle, feature, "multiply",
-                        "stream_f16", 32 + 2 * feature, 0.0f,
+                        streamKind, 32 + 2 * feature, 0.0f,
                         "alu", 15, 0.0f, "fp32", -1,
                         1, 1, "east", "east");
                     create_vxm(rewriter, op.getLoc(),
                         op.getInput(), op.getWeight(), inputType,
                         featureCycle + 1, feature, "multiply",
                         "alu", feature, 0.0f,
-                        "stream_f16", 48 + 2 * feature, 0.0f,
-                        "fp16", 2 * feature, 1, 1,
+                        streamKind, 48 + 2 * feature, 0.0f,
+                        dataFormat, 2 * feature, 1, 1,
                         "east", "east");
                     create_vxm(rewriter, op.getLoc(),
                         op.getInput(), op.getWeight(), inputType,
                         featureCycle + 2, feature, "pass",
                         "alu", feature, 0.0f,
                         "immediate", 0, 0.0f,
-                        "fp16", 16 + 2 * feature, 1, 1,
+                        dataFormat, 16 + 2 * feature, 1, 1,
                         "east", "west");
                     for (int64_t byte = 0; byte < 2; ++byte) {
                         const int64_t slice =
@@ -1186,6 +1210,10 @@ mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
         llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
     const auto weightType =
         llvm::cast<mlir::RankedTensorType>(op.getWeight().getType());
+    const llvm::StringRef streamKind =
+        lpu_16bit_stream_kind(inputType.getElementType());
+    const llvm::StringRef dataFormat =
+        lpu_16bit_data_format(inputType.getElementType());
     const int64_t rows = inputType.getDimSize(0);
     const int64_t hidden = inputType.getDimSize(1);
     const int64_t tile = target.throughput().mxm_rows;
@@ -1213,7 +1241,8 @@ mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
     if (inputSlices.size() < 2 || weightSlices.size() < 2
         || squareSlices.size() < 2 || factorSlices.size() < 2
         || resultSlices.size() < 4) {
-        return op.emitError("RMSNorm schedule requires FP16 byte-pair slices");
+        return op.emitError(
+            "RMSNorm schedule requires 16-bit float byte-pair slices");
     }
 
     rewriter.setInsertionPoint(op);
@@ -1259,7 +1288,7 @@ mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
                 constant.getResult(), inputType,
                 weightCastStart + pulse + 1, 8 + lane, "cast",
                 "alu", lane, 0.0f, "immediate", 0, 0.0f,
-                "fp16", lane * 2, 1, 1, "east", "east");
+                dataFormat, lane * 2, 1, 1, "east", "east");
         }
         emitMxm(rewriter, op.getLoc(), weightCastStart + pulse + weightToIw,
             0, "iw", 0, 3 - pulse, 0, 0, 1, 1);
@@ -1286,18 +1315,18 @@ mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
                 rows, 1, 1);
         auto squared = create_vxm(rewriter, op.getLoc(),
             op.getInput(), op.getInput(), inputType, vxmCycle, 8,
-            "square", "stream_f16", 32, 0.0f,
+            "square", streamKind, 32, 0.0f,
             "immediate", 0, 0.0f, "fp32", -1,
             rows, 1, "east", "east");
         create_vxm(rewriter, op.getLoc(),
             op.getInput(), op.getInput(), inputType, vxmCycle, 10,
-            "pass", "stream_f16", 32, 0.0f,
-            "immediate", 0, 0.0f, "fp16", 2,
+            "pass", streamKind, 32, 0.0f,
+            "immediate", 0, 0.0f, dataFormat, 2,
             rows, 1, "east", "east");
         create_vxm(rewriter, op.getLoc(), squared.getResult(),
             squared.getResult(), inputType, vxmCycle + 1, 9, "cast",
             "alu", 8, 0.0f, "immediate", 0, 0.0f,
-            "fp16", 0, rows, 1, "east", "east");
+            dataFormat, 0, rows, 1, "east", "east");
         for (int64_t byte = 0; byte < 2; ++byte)
             emitMem(rewriter, op.getLoc(),
                 vxmCycle + 1 + eastWriteLatency(squareTile->slices[byte]),
@@ -1323,7 +1352,7 @@ mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
     for (int64_t row = 0; row < rows; ++row)
         emitMxm(rewriter, op.getLoc(), clearStart + row,
             0, "accumulator_read", 0, 0, 0, 0, 1, 1,
-            row, 1, "sram", true);
+            row, 1, "sram", true, "supercell", 0, dataFormat);
     const int64_t reduceStart = std::max(
         clearStart + rows
             + target.throughput().accumulator_read_to_vxm_latency + 1,
@@ -1349,7 +1378,8 @@ mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
                     squareTile->row + tokenBase, byte, tile, 1, 1);
             emitMxm(rewriter, op.getLoc(), computeCycle, 0, "compute",
                 0, 0, 0, 0, tile, 1, tokenBase, 1,
-                final ? "stream" : "sram", final);
+                final ? "stream" : "sram", final, "supercell", 0,
+                dataFormat);
             if (final && wave == 0) finalCompute = computeCycle;
         }
     }
@@ -1372,7 +1402,7 @@ mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
     create_vxm(rewriter, op.getLoc(), inverse.getResult(),
         inverse.getResult(), inputType, factorVxm + 3, 3, "cast",
         "alu", 2, 0.0f, "immediate", 0, 0.0f,
-        "fp16", 0, rows, 1, "east", "east");
+        dataFormat, 0, rows, 1, "east", "east");
     for (int64_t byte = 0; byte < 2; ++byte)
         emitMem(rewriter, op.getLoc(),
             factorVxm + 3 + eastWriteLatency(factorSlices[byte]),
@@ -1407,37 +1437,38 @@ mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
                 vxmCycle - westReadLatency(weightSlices[byte]),
                 weightSlices[byte], "read",
                 baseRow(weightPlacement) + block,
-                36 + byte, rows, 1, 0);
+                36 + byte, rows, 1, 0, "sram",
+                inputBindingIndex(op.getWeight()));
         }
         auto normalized = create_vxm(rewriter, op.getLoc(),
             op.getInput(), op.getInput(), inputType, vxmCycle, 4,
-            "multiply", "stream_f16", 32, 0.0f,
-            "stream_f16", 34, 0.0f, "fp32", -1,
+            "multiply", streamKind, 32, 0.0f,
+            streamKind, 34, 0.0f, "fp32", -1,
             rows, 1, "east", "east");
         auto scaled = create_vxm(rewriter, op.getLoc(),
             normalized.getResult(), op.getWeight(), inputType,
             vxmCycle + 1, 5, "multiply", "alu", 4, 0.0f,
-            "stream_f16", 36, 0.0f, "fp32", -1,
+            streamKind, 36, 0.0f, "fp32", -1,
             rows, 1, "east", "east");
         auto cast = create_vxm(rewriter, op.getLoc(),
             scaled.getResult(), scaled.getResult(), inputType,
             vxmCycle + 2, 6, "cast", "alu", 5, 0.0f,
-            "immediate", 0, 0.0f, "fp16", 0,
+            "immediate", 0, 0.0f, dataFormat, 0,
             rows, 1, "east", "east");
         create_vxm(rewriter, op.getLoc(),
             scaled.getResult(), scaled.getResult(), inputType,
             vxmCycle + 2, 7, "cast", "alu", 5, 0.0f,
-            "immediate", 0, 0.0f, "fp16", 2,
+            "immediate", 0, 0.0f, dataFormat, 2,
             rows, 1, "east", "east");
         create_vxm(rewriter, op.getLoc(),
             scaled.getResult(), scaled.getResult(), inputType,
             vxmCycle + 2, 8, "cast", "alu", 5, 0.0f,
-            "immediate", 0, 0.0f, "fp16", 0,
+            "immediate", 0, 0.0f, dataFormat, 0,
             rows, 1, "east", "west");
         create_vxm(rewriter, op.getLoc(),
             scaled.getResult(), scaled.getResult(), inputType,
             vxmCycle + 2, 9, "cast", "alu", 5, 0.0f,
-            "immediate", 0, 0.0f, "fp16", 2,
+            "immediate", 0, 0.0f, dataFormat, 2,
             rows, 1, "east", "west");
         finalValue = cast.getResult();
         for (int64_t hemisphere = 0; hemisphere < 2; ++hemisphere) {

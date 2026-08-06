@@ -4,34 +4,45 @@
 
 ## Schedule Policies
 
-The compiler keeps two generic schedule policies:
+The default `--mxm-execution auto` mode selects the 16-stream Block8 path for
+this BF16-activation/INT8-weight FFN. Two Block8 policies are validated:
 
-- `--ffn-schedule tail` is the default and preserves the established FFN
-  schedule. For `seq_len=128`, its first SwiGLU issue is cycle 55,355 and the
-  CModel program ends at cycle 92,573.
-- `--ffn-schedule fused` overlaps completed Gate/Up tiles with later
-  projection work. Its first SwiGLU issue is cycle 2,363 and the same CModel
-  program ends at cycle 86,685, saving 5,888 cycles (6.36%).
+- `--ffn-schedule tail` is the correctness baseline. It completes every
+  Gate/Up projection and drains pair-indexed scratch storage before issuing
+  the first SwiGLU at cycle 16,574. The program ends at cycle 33,681.
+- `--ffn-schedule fused` overlaps each completed Gate/Up pair's SwiGLU with
+  later projection work. The stream allocator reserves the target-derived
+  projection footprint and allocates a non-overlapping VXM-to-MEM route; the
+  emitter contains no fixed high-stream helper. The program ends at cycle
+  27,425, saving 6,256 cycles (18.57%) relative to tail.
+
+The runtime samples 33,745 cycles for tail and 27,489 for fused, including 64
+drain cycles. MEM issue utilization is 16.89% / 20.74%, MXM compute issue
+utilization is 32.08% / 39.38%, and VXM issue utilization is 23.33% / 28.64%
+for tail / fused. Both binaries match all 73,728 BF16 reference values, with
+72,625 nonzero outputs and maximum absolute magnitude 0.216797.
+
+Tensor lowering now assigns independent physical slices to Gate weights, Up
+weights, and the Block8 activation. The planner can therefore pipeline Gate on
+MXM0 and Up on MXM1 with a four-cycle weight-load initiation interval instead
+of serializing each reduction for eight cycles. Scratch storage reuses weight
+slices only at non-overlapping row addresses and its queue lifetime is reserved
+explicitly. The current CModel still shares E0..E15 between MXM0 weight traffic
+and activation traffic, so `mxm_weight_activation_overlap_enabled=0` keeps the
+next load group outside the activation window. Independent placement removes a
+further 864 cycles from both policies; a target with independent transport can
+enable the capability without changing the planner.
+
+The legacy MXM path remains available, but a fused request currently falls
+back to tail because its passive stream-fabric transport lifetimes are not yet
+modeled precisely enough to prove a collision-free allocation.
 
 ![Fused seq_len=128 FFN pipeline](smollm2_ffn_fused_pipeline.svg)
 
-The fused policy does not use an unmodeled direct ACC-to-VXM bypass. On the
-final K partial, east MXMs use `W8..W15` and west MXMs use `W16..W23`.
-`accumulate -> stream + clear` sends the complete FP32 Gate/Up tile to
-dedicated ordinary-MEM byte planes: Gate uses local slices `1/5/9/13`, and Up
-uses `2/6/10/14`. The VXM allocator reads those planes only after the repeated
-MEM write queue is free, skips every four-cycle weight-dequant resource
-window, and writes FP16 hidden data through `E30/E31`. ACC-to-MEM transport
-includes the fabric's cycle-end commit latency.
+## Historical Legacy Measurements
 
-Both policies are produced by the same shape-driven lowering. The fused
-seq_len=128 binary was executed on the CModel and matched all 73,728 FP16
-values against the CPU reference, including 72,633 nonzero outputs.
-
-## Measured CModel Utilization
-
-The following values come from the CModel performance monitors while executing
-the compiled `seq_len=128` binaries. The monitor includes the runtime's 64
+The following archived values describe the earlier legacy fused experiment,
+not the active Block8 policies above. The monitor includes the runtime's 64
 drain cycles, so it samples 92,637 cycles for tail and 86,749 for fused.
 `array utilization` is active MXM cell-cycles divided by all sampled
 cell-cycles. `active density` removes completely idle cycles from the
@@ -100,16 +111,25 @@ accumulators use local slices 36..39 and up accumulators use local slices
 40..43 in both hemispheres. In the CModel's flattened 88-queue view, east
 uses queue `local_slice`, while west uses queue `44 + local_slice`.
 
-An MXM weight load uses 16 streams. One MXM compute consumes two FP16
-activation streams; the concurrent gate/up MXM pair therefore consumes E0..E3.
-A 32x32 K block streams 32 activation rows, with four spatial K=8 contributions
-accumulated per output row, and produces one 32x32 partial tile. The 18 partial
-tiles for K=576 accumulate in MEM before the completed gate/up tile enters
-SwiGLU. When loading block B+1 overlaps block B compute, the activation route
-temporarily moves from E0..E3 to E16..E19. Down output-pair transitions are 95
-cycles for this placement because result writes and the next weight read both
-use local MEM slice 24 in each hemisphere; that interval is calculated from the conflicting slice and
-transport latency.
+The compiler now has two complete Gate/Up execution paths. `legacy` keeps the
+two-byte-stream vector compute used by the diagrams below. `auto` selects the
+Block8 path for a legal BF16-activation/INT8-weight FFN: sixteen distributed
+activation streams carry eight rows per issue, and the same E0..E15 values are
+multicast to the Gate and Up MXMs in both hemispheres. Four repeated Block8
+issues cover one 32-row token tile. Raw weights use eight streams and are
+dequantized locally in each MXM before IW.
+
+Gate and Up cannot drain their 8x32 FP32 block accumulators simultaneously
+because either result occupies all 32 west streams. The conservative schedule
+drains them in turn, casts them into two disjoint short-lived BF16 scratch
+layouts, and then runs SwiGLU row by row. Input and hidden tensors use disjoint
+sixteen-slice physical layouts so an early hidden write cannot overwrite an
+activation that a later output wave still needs. For SmolLM2-135M at
+`seq_len=128`, this path reduces the complete FFN from 105,898 legacy cycles to
+38,968 cycles while preserving the CModel numerical baseline. The two MXM
+weight buffers now ping-pong between adjacent K blocks: the next weight load
+uses the idle issue window before the current block's final token tile, so the
+next repeated Block8 compute starts immediately after the current one ends.
 
 ![All 18 K partial accumulations](smollm2_ffn_partial_accumulation.svg)
 

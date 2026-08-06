@@ -4,7 +4,9 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_schedule_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_swish_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
+#include "ftlpu/compiler/Dialect/Stream/Analysis/stream_allocator.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
+#include "ftlpu/compiler/Target/mxm_execution_strategy.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
 #include "llvm/ADT/SmallVector.h"
@@ -13,6 +15,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace ftlpu::compiler::schedule::ffn_detail {
@@ -27,11 +30,14 @@ struct FfnEmissionContext {
     stream::RouteOp gate_route;
     stream::RouteOp up_route;
     stream::RouteOp down_route;
+    stream::RouteOp hidden_route;
     stream::RouteOp gate_raw;
     stream::RouteOp up_raw;
     stream::RouteOp down_raw;
 
     llvm::SmallVector<int64_t> weight_slices;
+    llvm::SmallVector<int64_t> up_weight_slices;
+    llvm::SmallVector<int64_t> down_weight_slices;
     llvm::SmallVector<int64_t> activation_slices;
     llvm::SmallVector<int64_t> hidden_slices;
     llvm::SmallVector<int64_t> result_slices;
@@ -43,6 +49,9 @@ struct FfnEmissionContext {
     int64_t activation_latency;
     int64_t down_accumulator_base;
     bool activation_distributed16;
+    bool block8_projection;
+    bool block8_down;
+    std::optional<stream::StreamBinding> fused_output;
 
     int64_t m() const { return static_cast<int64_t>(ffn.getM()); }
     int64_t k() const { return static_cast<int64_t>(ffn.getK()); }
@@ -91,10 +100,16 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
 mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
     FfnEmissionContext& context);
 
+mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
+    FfnEmissionContext& context);
+
 mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
     FfnEmissionContext& context, FfnProjectionEmission emission);
 
 mlir::FailureOr<mlir::Value> emitFfnDownProjection(
+    FfnEmissionContext& context, const FfnSwishEmission& swish);
+
+mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
     FfnEmissionContext& context, const FfnSwishEmission& swish);
 
 } // namespace ftlpu::compiler::schedule::ffn_detail

@@ -58,22 +58,40 @@ private:
 
     mlir::WalkResult verify(mlir::Operation* operation)
     {
-        if (auto op = llvm::dyn_cast<schedule::MemTransferOp>(operation))
-            return reserve(operation, "mem."
-                    + std::to_string(op.getHemisphere()) + "."
-                    + std::to_string(op.getSlice()),
-                op.getCycle(), op.getRepeatCount(), op.getRepeatInterval());
+        if (auto op = llvm::dyn_cast<schedule::MemTransferOp>(operation)) {
+            const std::string base = "mem."
+                + std::to_string(op.getHemisphere()) + "."
+                + std::to_string(op.getSlice()) + ".";
+            if (op.getOpcode() == "read" || op.getOpcode() == "read_write") {
+                auto result = reserve(operation, base + "read",
+                    op.getCycle(), op.getRepeatCount(),
+                    op.getRepeatInterval());
+                if (result.wasInterrupted()) return result;
+            }
+            if (op.getOpcode() == "write" || op.getOpcode() == "write_tap"
+                || op.getOpcode() == "read_write")
+                return reserve(operation, base + "write",
+                    op.getCycle(), op.getRepeatCount(),
+                    op.getRepeatInterval());
+            return mlir::WalkResult::advance();
+        }
         if (auto op = llvm::dyn_cast<schedule::MxmIssueOp>(operation))
             return reserve(operation, "mxm." + op.getOpcode().str() + "."
                     + std::to_string(op.getUnitId()),
                 op.getCycle(), op.getRepeatCount(), op.getRepeatInterval());
+        if (auto op = llvm::dyn_cast<schedule::MxmDequantOp>(operation))
+            return reserve(operation,
+                "mxm.dequant." + std::to_string(op.getUnitId()),
+                op.getCycle(), op.getRepeatCount(),
+                op.getRepeatInterval());
         if (auto op = llvm::dyn_cast<schedule::VxmOp>(operation))
             return reserve(operation, "vxm." + std::to_string(op.getQueue()),
                 op.getCycle(), op.getRepeatCount(), op.getRepeatInterval());
         if (auto op = llvm::dyn_cast<schedule::SxmOp>(operation))
             return reserve(operation, "sxm." + op.getOpcode().str() + "."
                     + std::to_string(op.getHemisphere()),
-                op.getCycle());
+                op.getCycle(), op.getRepeatCount().value_or(1),
+                op.getRepeatInterval().value_or(1));
         if (auto op = llvm::dyn_cast<schedule::MxmLoadOp>(operation))
             return reserve(operation, "mxm.iw." + std::to_string(op.getUnitId()),
                 op.getCycle(), op.getDuration(), 1);

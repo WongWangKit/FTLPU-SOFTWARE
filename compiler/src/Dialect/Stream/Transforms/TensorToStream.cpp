@@ -9,6 +9,79 @@ namespace ftlpu::compiler {
 namespace {
 using namespace stream_lowering;
 
+mlir::LogicalResult lower_linear_projection(
+    tensor::ProjectionTaskOp op, LoweringContext& context)
+{
+    if (op.getKind() != "linear") return mlir::success();
+    mlir::IRRewriter& rewriter = context.rewriter;
+    const auto plan = op.getMemoryPlan();
+    const auto input =
+        plan.getAs<mlir::DictionaryAttr>("input");
+    const auto weight =
+        plan.getAs<mlir::DictionaryAttr>("weight");
+    const auto result =
+        plan.getAs<mlir::DictionaryAttr>("result");
+    if (!input || !weight || !result) {
+        op.emitError("linear projection requires input/weight/result memory plans");
+        return mlir::failure();
+    }
+    const auto route = [&](llvm::StringRef role,
+                           llvm::StringRef source,
+                           llvm::StringRef destination,
+                           llvm::StringRef direction,
+                           int64_t streamBase, int64_t streamCount,
+                           mlir::DictionaryAttr placement) {
+        return rewriter.getDictionaryAttr({
+            rewriter.getNamedAttr(
+                "role", rewriter.getStringAttr(role)),
+            rewriter.getNamedAttr(
+                "source", rewriter.getStringAttr(source)),
+            rewriter.getNamedAttr(
+                "destination", rewriter.getStringAttr(destination)),
+            rewriter.getNamedAttr(
+                "direction", rewriter.getStringAttr(direction)),
+            rewriter.getNamedAttr("stream_base",
+                rewriter.getI64IntegerAttr(streamBase)),
+            rewriter.getNamedAttr("stream_count",
+                rewriter.getI64IntegerAttr(streamCount)),
+            rewriter.getNamedAttr(
+                "register_id", rewriter.getI64IntegerAttr(0)),
+            rewriter.getNamedAttr("placement", placement),
+        });
+    };
+    llvm::SmallVector<mlir::Attribute> routes {
+        route("activation", "MEM", "MXM.activation", "east",
+            0, 2, input),
+        route("weight_i8", "MEM", "VXM", "west",
+            0, context.target.throughput().lanes_per_tile, weight),
+        route("weight_bf16", "VXM", "MXM.weight", "east",
+            0, context.target.throughput().mxm_load_streams_per_cycle,
+            weight),
+        route("result", "MXM.accumulator", "MEM", "east",
+            0, context.target.throughput().mxm_result_streams * 2,
+            result),
+    };
+
+    rewriter.setInsertionPoint(op);
+    mlir::OperationState state(
+        op.getLoc(), stream::ProjectionTaskOp::getOperationName());
+    state.addOperands({op.getInput(), op.getWeight()});
+    state.addTypes(op.getResult().getType());
+    state.addAttributes({
+        rewriter.getNamedAttr(
+            "kind", rewriter.getStringAttr("linear")),
+        rewriter.getNamedAttr("config", op.getConfig()),
+        rewriter.getNamedAttr("memory_plan", plan),
+        rewriter.getNamedAttr(
+            "routes", rewriter.getArrayAttr(routes)),
+    });
+    auto lowered = llvm::cast<stream::ProjectionTaskOp>(
+        rewriter.create(state));
+    rewriter.replaceOp(op, lowered.getResult());
+    context.stage += 4;
+    return mlir::success();
+}
+
 mlir::FailureOr<llvm::SmallVector<FfnTaskGraph, 2>>
 collect_ffn_task_graphs(mlir::func::FuncOp function)
 {
@@ -128,12 +201,17 @@ public:
         llvm::SmallVector<tensor::MatmulOp> matmuls;
         llvm::SmallVector<tensor::SwigluOp> swiglus;
         llvm::SmallVector<tensor::RmsNormTaskOp> rmsNorms;
+        llvm::SmallVector<tensor::ProjectionTaskOp> linearProjections;
         function.walk(
             [&](tensor::MatmulOp op) { matmuls.push_back(op); });
         function.walk(
             [&](tensor::SwigluOp op) { swiglus.push_back(op); });
         function.walk(
             [&](tensor::RmsNormTaskOp op) { rmsNorms.push_back(op); });
+        function.walk([&](tensor::ProjectionTaskOp op) {
+            if (op.getKind() == "linear")
+                linearProjections.push_back(op);
+        });
 
         int64_t stage = 0;
         LoweringContext context{target, allocator, rewriter, stage};
@@ -151,6 +229,12 @@ public:
         }
         for (tensor::RmsNormTaskOp op : rmsNorms) {
             if (mlir::failed(lower_rms_norm(op, context))) {
+                signalPassFailure();
+                return;
+            }
+        }
+        for (tensor::ProjectionTaskOp op : linearProjections) {
+            if (mlir::failed(lower_linear_projection(op, context))) {
                 signalPassFailure();
                 return;
             }

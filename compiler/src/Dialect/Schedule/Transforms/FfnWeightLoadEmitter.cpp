@@ -1,5 +1,7 @@
 #include "FfnEmitterUtils.hpp"
 
+#include "ftlpu/compiler/Support/float_format.hpp"
+
 namespace ftlpu::compiler::schedule::ffn_detail {
 namespace {
 
@@ -25,6 +27,9 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     const int64_t encodedStreamBase =
         target.streams().streams_per_direction;
     const auto hemi = hemisphere_name(hemisphere);
+    const auto dataFormat = lpu_16bit_data_format(
+        llvm::cast<mlir::RankedTensorType>(
+            dequantizedType).getElementType());
     mlir::Value readValue;
 
     for (int64_t stream = 0; stream < rawRoute.getStreamCount(); ++stream) {
@@ -55,7 +60,7 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
             functionArgumentIndex(rawRoute.getInput())).getResult();
         value = create_vxm(rewriter, location, value, readValue,
             dequantizedType, startCycle + 1, 8 + stream, "cast",
-            "alu", stream, 0.0f, "immediate", 0, 0.0f, "fp16",
+            "alu", stream, 0.0f, "immediate", 0, 0.0f, dataFormat,
             localMxm * throughput.mxm_load_streams_per_cycle + stream * 2,
             duration, 1, hemi, hemi).getResult();
     }

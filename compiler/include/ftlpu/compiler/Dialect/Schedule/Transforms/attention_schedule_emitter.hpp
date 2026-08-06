@@ -4,6 +4,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_task_graph.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
+#include "ftlpu/compiler/Transforms/passes.hpp"
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LLVM.h"
@@ -15,27 +16,31 @@ class AttentionScheduleEmitter {
 public:
     AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
         AttentionTaskGraph graph, const target::LPUTargetModel& target,
-        AttentionStagePlan stagePlan);
+        AttentionStagePlan stagePlan, AttentionScheduleStrategy strategy);
 
     mlir::FailureOr<mlir::Value> emit(int64_t outputIndex);
 
 private:
     int64_t emitProjections();
+    int64_t emitBlock8Projections();
     void emitQk(int64_t qkStart, int64_t qkWaveCycles,
-        int64_t qkIwToComputeCycles);
-    int64_t emitSoftmax(int64_t qkEnd);
-    int64_t emitProbabilityPack(int64_t softmaxEnd);
+        int64_t qkIwToComputeCycles, bool fusedSoftmax);
+    int64_t emitSoftmax(int64_t qkStart, int64_t qkEnd,
+        bool fusedSoftmax);
     int64_t emitProbabilityTranspose(int64_t packEnd);
     int64_t emitPv(int64_t transposeEnd);
     int64_t emitOutputProjection(int64_t pvEnd);
+    int64_t emitBlock8OutputProjection(int64_t pvEnd);
 
     mlir::IRRewriter& rewriter_;
     AttentionTaskGraph op_;
     const target::LPUTargetModel& target_;
     AttentionStagePlan stage_plan_;
+    AttentionScheduleStrategy strategy_;
 };
 
 mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
-    mlir::func::FuncOp function, const target::LPUTargetModel& target);
+    mlir::func::FuncOp function, const target::LPUTargetModel& target,
+    AttentionScheduleStrategy strategy = AttentionScheduleStrategy::Tail);
 
 } // namespace ftlpu::compiler::schedule

@@ -1,6 +1,7 @@
 #include "KernelToTensorLowering.hpp"
 
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
+#include "ftlpu/compiler/Support/float_format.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
 #include "llvm/ADT/DenseMap.h"
@@ -41,7 +42,6 @@ public:
             return;
         }
 
-        EastMemoryAllocator allocator;
         auto target_model =
             target::LPUTargetModel::from_operation(function);
         if (mlir::failed(target_model)) {
@@ -49,6 +49,7 @@ public:
             return;
         }
         const target::LPUTargetModel& target = *target_model;
+        EastMemoryAllocator allocator(target);
         llvm::SmallVector<kernel::MatmulOp> matmuls;
         llvm::SmallVector<kernel::SwigluOp> swiglus;
         llvm::SmallVector<kernel::RmsNormOp> rmsNorms;
@@ -118,12 +119,13 @@ public:
 
         // Function arguments are model inputs and coexist in MEM at entry.
         int64_t rmsWeightBase = 0;
+        llvm::DenseMap<mlir::Value, int64_t> feedbackRmsWeightBaseRows;
         for (mlir::BlockArgument argument : function.getArguments()) {
             if (argument.use_empty()) continue;
             const auto type =
                 llvm::dyn_cast<mlir::RankedTensorType>(argument.getType());
             if (type && type.getRank() == 2
-                && type.getElementType().isF16()
+                && is_lpu_16bit_float(type.getElementType())
                 && type.getDimSize(1) % target.throughput().mxm_rows == 0) {
                 bool feedsFeedbackRmsNorm = false;
                 if (rmsnorm_strategy_
@@ -162,17 +164,36 @@ public:
                 const auto type =
                     llvm::cast<mlir::RankedTensorType>(
                         argument.getType());
-                const int64_t instructions =
-                    type.getNumElements()
-                    / target.throughput().mxm_rows;
+                const bool distributed =
+                    rmsnorm_strategy_
+                    == RmsNormLoweringStrategy::VxmFeedback;
+                // Feedback RMSNorm chooses weight slices from the actual
+                // input placement when the op is lowered. Binding every
+                // RMSNorm weight to one target-wide slice set here can
+                // collide with the second norm's transpose scratch.
+                const int64_t instructions = type.getNumElements()
+                    / (distributed ? 8
+                                   : target.throughput().mxm_rows);
+                const int64_t baseRow =
+                    (distributed ? 5120 : 0) + rmsWeightBase;
+                if (distributed) {
+                    feedbackRmsWeightBaseRows[argument] = baseRow;
+                    rmsWeightBase += instructions;
+                    continue;
+                }
                 const auto allocation = fixed_allocation(
-                    PlacementKind::Activation, {20, 21},
-                    rmsWeightBase, instructions,
-                    type.getNumElements() * 2,
-                    "fp16_pair_planar", "both");
-                rmsWeightBase +=
-                    std::max<int64_t>(1,
-                        (instructions - 1) * 16 + 1);
+                    PlacementKind::Activation,
+                    distributed
+                        ? target.mxm_distributed_activation_slices()
+                        : llvm::ArrayRef<int64_t>({20, 21}),
+                    baseRow, instructions, type.getNumElements() * 2,
+                    distributed ? "fp16_vxm_distributed_16"
+                                : "fp16_pair_planar",
+                    "both");
+                rmsWeightBase += distributed
+                    ? instructions
+                    : std::max<int64_t>(1,
+                          (instructions - 1) * 16 + 1);
                 if (mlir::failed(planner.bind(argument, allocation))) {
                     function.emitError(
                         "conflicting RMSNorm weight placement");
@@ -228,9 +249,23 @@ public:
                 || ffn_operations.contains(operation))
                 continue;
             if (auto op = llvm::dyn_cast<kernel::RmsNormOp>(operation)) {
+                int64_t feedbackWeightBaseRow = 0;
+                if (rmsnorm_strategy_
+                    == RmsNormLoweringStrategy::VxmFeedback) {
+                    auto found =
+                        feedbackRmsWeightBaseRows.find(op.getWeight());
+                    if (found == feedbackRmsWeightBaseRows.end()) {
+                        op.emitError(
+                            "feedback RMSNorm weight is not a "
+                            "function argument");
+                        signalPassFailure();
+                        return;
+                    }
+                    feedbackWeightBaseRow = found->second;
+                }
                 if (mlir::failed(lower_rms_norm(
-                        op, target, rmsnorm_strategy_, allocate_value,
-                        rewriter))) {
+                        op, target, rmsnorm_strategy_,
+                        feedbackWeightBaseRow, planner, rewriter))) {
                     signalPassFailure();
                     return;
                 }
@@ -255,7 +290,7 @@ public:
             }
             if (auto op = llvm::dyn_cast<kernel::MatmulOp>(operation)) {
                 if (mlir::failed(lower_matmul(
-                        op, planner, allocate_value, rewriter))) {
+                        op, target, planner, allocate_value, rewriter))) {
                     signalPassFailure();
                     return;
                 }

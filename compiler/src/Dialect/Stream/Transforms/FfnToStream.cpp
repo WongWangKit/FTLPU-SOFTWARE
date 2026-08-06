@@ -1,5 +1,10 @@
 #include "TensorToStreamLowering.hpp"
 
+#include "ftlpu/compiler/Support/float_format.hpp"
+#include "ftlpu/compiler/Target/mxm_execution_strategy.hpp"
+
+#include <optional>
+
 namespace ftlpu::compiler::stream_lowering {
 
 mlir::LogicalResult lower_ffn(
@@ -14,13 +19,35 @@ mlir::LogicalResult lower_ffn(
         return llvm::cast<mlir::RankedTensorType>(value.getType())
             .getElementType();
     };
-    const bool w8a16 = element_type(op.getInput()).isF16()
+    const bool w8a16 = is_lpu_16bit_float(
+                           element_type(op.getInput()))
         && element_type(op.getGateWeight()).isInteger(8)
         && element_type(op.getUpWeight()).isInteger(8)
         && element_type(op.getDownWeight()).isInteger(8)
-        && element_type(op.getResult()).isF16()
+        && is_lpu_16bit_float(element_type(op.getResult()))
         && target.supports_w8a16_ffn_shape(
             op.getM(), op.getK(), op.getHidden(), op.getN());
+    auto executionPolicy =
+        target::mxm_execution_policy_from_operation(
+            op.down.getOperation());
+    if (mlir::failed(executionPolicy)) {
+        op.emitError("invalid MXM execution policy");
+        return mlir::failure();
+    }
+    bool block8Ffn = false;
+    if (w8a16) {
+        auto strategy = target::plan_mxm_execution_strategy(
+            {static_cast<int64_t>(op.getM()),
+                static_cast<int64_t>(op.getN()),
+                static_cast<int64_t>(op.getHidden()),
+                element_type(op.getInput()).isBF16(), true, true, true},
+            target, *executionPolicy);
+        if (mlir::failed(strategy)) {
+            op.emitError("cannot select an MXM execution strategy for FFN");
+            return mlir::failure();
+        }
+        block8Ffn = strategy->uses_block8();
+    }
     const auto input_slice = get_mem_slice(op.getInputAddress());
     const auto gate_slice = get_mem_slice(op.getGateWeightAddress());
     const auto up_slice = get_mem_slice(op.getUpWeightAddress());
@@ -36,28 +63,41 @@ mlir::LogicalResult lower_ffn(
         return mlir::failure();
     }
     auto allocate = [&](target::StreamEndpoint destination, int64_t slice,
-                        int64_t begin, int64_t end) {
+                        int64_t begin, int64_t end,
+                        std::optional<int64_t> streamCount = std::nullopt) {
         return allocator.allocate(target::StreamEndpoint::Mem, destination,
-            target::StreamDirection::East, slice, begin, end);
+            target::StreamDirection::East, slice, begin, end,
+            streamCount);
     };
-    const auto weight_endpoint = w8a16 ? target::StreamEndpoint::VxmInput
-                                          : target::StreamEndpoint::MxmWeight;
-    const auto gate_binding = allocate(weight_endpoint,
+    const auto projectionWeightEndpoint =
+        w8a16 && !block8Ffn ? target::StreamEndpoint::VxmInput
+              : target::StreamEndpoint::MxmWeight;
+    const auto downWeightEndpoint = block8Ffn
+        ? target::StreamEndpoint::MxmWeight
+        : projectionWeightEndpoint;
+    const auto gate_binding = allocate(projectionWeightEndpoint,
         *gate_slice, stage, stage + 2);
-    const auto up_binding = allocate(weight_endpoint,
+    const auto up_binding = allocate(projectionWeightEndpoint,
         *up_slice, stage, stage + 2);
     const auto activation_binding = allocate(target::StreamEndpoint::MxmActivation,
-        *input_slice, stage + (w8a16 ? 4 : 2), stage + (w8a16 ? 8 : 6));
-    const auto down0_binding = allocate(weight_endpoint,
-        *down_slice, stage + 7, stage + 9);
-    const auto down1_binding = allocate(weight_endpoint,
-        *down_slice, stage + 7, stage + 9);
+        *input_slice, stage + (w8a16 ? 4 : 2), stage + (w8a16 ? 8 : 6),
+        block8Ffn ? std::optional<int64_t>(16) : std::nullopt);
+    const auto down0_binding = allocate(downWeightEndpoint,
+        *down_slice, stage + 7, stage + 9,
+        block8Ffn ? std::optional<int64_t>(16) : std::nullopt);
+    auto down1_binding = down0_binding;
+    if (!block8Ffn)
+        down1_binding = allocate(downWeightEndpoint,
+            *down_slice, stage + 7, stage + 9);
     const auto hidden0_binding = allocate(
         target::StreamEndpoint::MxmActivation,
-        *hidden0_slice, stage + 11, stage + 13);
-    const auto hidden1_binding = allocate(
-        target::StreamEndpoint::MxmActivation,
-        *hidden1_slice, stage + 11, stage + 13);
+        *hidden0_slice, stage + 11, stage + 13,
+        block8Ffn ? std::optional<int64_t>(16) : std::nullopt);
+    auto hidden1_binding = hidden0_binding;
+    if (!block8Ffn)
+        hidden1_binding = allocate(
+            target::StreamEndpoint::MxmActivation,
+            *hidden1_slice, stage + 11, stage + 13);
     if (mlir::failed(gate_binding) || mlir::failed(up_binding)
         || mlir::failed(activation_binding) || mlir::failed(down0_binding)
         || mlir::failed(down1_binding)
@@ -77,10 +117,12 @@ mlir::LogicalResult lower_ffn(
         return target.transport_latency(target::StreamEndpoint::Mem, endpoint,
             target::StreamDirection::East, slice);
     };
-    const auto gate_latency = latency(weight_endpoint, *gate_slice);
-    const auto up_latency = latency(weight_endpoint, *up_slice);
+    const auto gate_latency =
+        latency(projectionWeightEndpoint, *gate_slice);
+    const auto up_latency =
+        latency(projectionWeightEndpoint, *up_slice);
     const auto input_latency = latency(target::StreamEndpoint::MxmActivation, *input_slice);
-    const auto down_latency = latency(weight_endpoint, *down_slice);
+    const auto down_latency = latency(downWeightEndpoint, *down_slice);
     const auto hidden0_latency = latency(
         target::StreamEndpoint::MxmActivation, *hidden0_slice);
     const auto hidden1_latency = latency(
@@ -102,30 +144,32 @@ mlir::LogicalResult lower_ffn(
             -1, unit, address, placement, bytes, route_latency);
     };
     auto gate_route = route(op.getGateWeight(), *gate_binding,
-        weight_endpoint, 0, op.getGateWeightAddress(),
+        projectionWeightEndpoint, 0, op.getGateWeightAddress(),
         op.getGateWeightPlacement(), op.getGateWeightBytes(), *gate_latency);
     auto up_route = route(op.getUpWeight(), *up_binding,
-        weight_endpoint, w8a16 ? 0 : 1, op.getUpWeightAddress(),
+        projectionWeightEndpoint, block8Ffn || !w8a16 ? 1 : 0,
+        op.getUpWeightAddress(),
         op.getUpWeightPlacement(), op.getUpWeightBytes(), *up_latency);
     auto activation_route = route(op.getInput(), *activation_binding,
         target::StreamEndpoint::MxmActivation, 0, op.getInputAddress(),
         op.getInputPlacement(), op.getInputBytes(), *input_latency);
     auto down0_route = route(op.getDownWeight(), *down0_binding,
-        weight_endpoint, 0, op.getDownWeightAddress(),
+        downWeightEndpoint, 0, op.getDownWeightAddress(),
         op.getDownWeightPlacement(), op.getDownWeightBytes(), *down_latency);
     auto down1_route = route(op.getDownWeight(), *down1_binding,
-        weight_endpoint, w8a16 ? 0 : 1, op.getDownWeightAddress(),
+        downWeightEndpoint, block8Ffn || !w8a16 ? 1 : 0,
+        op.getDownWeightAddress(),
         op.getDownWeightPlacement(), op.getDownWeightBytes(), *down_latency);
-    if (w8a16) {
+    if (w8a16 && !block8Ffn) {
         auto connect_dequant = [&](stream::RouteOp raw, int64_t slice,
                                    int64_t unit, int64_t begin, float scale) {
             auto input_type = llvm::cast<mlir::RankedTensorType>(raw.getOutput().getType());
-            auto fp16_type = mlir::RankedTensorType::get(input_type.getShape(),
-                rewriter.getF16Type());
+            auto float16_type = mlir::RankedTensorType::get(
+                input_type.getShape(), element_type(op.getInput()));
             mlir::OperationState dequant_state(op.getLoc(),
                 stream::DequantizeOp::getOperationName());
             dequant_state.addOperands(raw.getOutput());
-            dequant_state.addTypes(fp16_type);
+            dequant_state.addTypes(float16_type);
             dequant_state.addAttributes({
                 rewriter.getNamedAttr("scale", rewriter.getF32FloatAttr(scale)),
                 rewriter.getNamedAttr("input_stream_base", rewriter.getI64IntegerAttr(raw.getStreamBase())),
@@ -150,9 +194,11 @@ mlir::LogicalResult lower_ffn(
             op.getGateScale().convertToFloat());
         up_route = connect_dequant(up_route, *up_slice, 1, stage + 2,
             op.getUpScale().convertToFloat());
-        down0_route = connect_dequant(down0_route, *down_slice, 0, stage + 9,
+        down0_route = connect_dequant(down0_route,
+            *down_slice, 0, stage + 9,
             op.getDownRhsScale().convertToFloat());
-        down1_route = connect_dequant(down1_route, *down_slice, 1, stage + 9,
+        down1_route = connect_dequant(down1_route,
+            *down_slice, 1, stage + 9,
             op.getDownRhsScale().convertToFloat());
         if (!gate_route || !up_route || !down0_route || !down1_route) {
             op.emitError("cannot allocate W8A16 VXM-to-MXM streams");
@@ -193,7 +239,7 @@ mlir::LogicalResult lower_ffn(
     const auto hidden_type = mlir::RankedTensorType::get(
         {static_cast<int64_t>(op.getM()),
             static_cast<int64_t>(op.getHidden())},
-        w8a16 ? mlir::Type(rewriter.getF16Type())
+        w8a16 ? element_type(op.getInput())
               : mlir::Type(rewriter.getI8Type()));
     const auto down_partial_type = mlir::RankedTensorType::get(
         {static_cast<int64_t>(op.getM()),

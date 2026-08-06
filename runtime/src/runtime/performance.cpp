@@ -23,9 +23,10 @@ std::size_t group_index(QueueKind kind)
     case QueueKind::Mem: return 0;
     case QueueKind::MxmLoad: return 1;
     case QueueKind::MxmCompute: return 2;
-    case QueueKind::Vxm: return 3;
-    case QueueKind::SxmTranspose: return 4;
-    case QueueKind::SxmPermute: return 5;
+    case QueueKind::MxmDequant: return 3;
+    case QueueKind::Vxm: return 4;
+    case QueueKind::SxmTranspose: return 5;
+    case QueueKind::SxmPermute: return 6;
     }
     throw std::logic_error("unknown ICU queue kind in runtime performance report");
 }
@@ -56,10 +57,11 @@ void print_runtime_performance(
 {
     const std::size_t cycles = executed_cycles == 0
         ? program.max_cycle + 1 : executed_cycles;
-    std::array<QueueGroupStats, 6> groups {{
+    std::array<QueueGroupStats, 7> groups {{
         {"MEM", InstructionControlUnit::kMemQueues},
         {"MXM.load", InstructionControlUnit::kMxmQueues},
         {"MXM.compute", InstructionControlUnit::kMxmQueues},
+        {"MXM.dequant", InstructionControlUnit::kMxmQueues},
         {"VXM", InstructionControlUnit::kVxmQueues},
         {"SXM.transpose", hw::kHemispheres},
         {"SXM.permute", hw::kHemispheres},

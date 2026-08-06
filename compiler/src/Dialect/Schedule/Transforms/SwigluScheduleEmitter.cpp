@@ -43,7 +43,7 @@ mlir::LogicalResult lowerSwigluSchedules(mlir::IRRewriter& rewriter,
                     const int64_t slice_latency = *target.transport_latency(
                         target::StreamEndpoint::Mem, target::StreamEndpoint::MxmWeight,
                         target::StreamDirection::East, slice);
-                    windows.push_back({mem_resource(slice), latency - slice_latency, *duration});
+                    windows.push_back({mem_read_resource(slice), latency - slice_latency, *duration});
                 }
                 windows.push_back({llvm::formatv("MXM.{0}.load", unit).str(), latency, *duration});
                 windows.push_back({llvm::formatv("MXM.{0}.weight_buffer.{1}", unit, buffer).str(),
@@ -77,7 +77,7 @@ mlir::LogicalResult lowerSwigluSchedules(mlir::IRRewriter& rewriter,
                 + swiglu.getOutputTransportLatency();
             llvm::SmallVector<schedule::ResourceWindow> windows;
             for (int64_t slice : get_slices(activation_route.getPlacement()))
-                windows.push_back({mem_resource(slice), 0, *activation_duration});
+                windows.push_back({mem_read_resource(slice), 0, *activation_duration});
             for (int64_t unit : {static_cast<int64_t>(swiglu.getGateUnitId()),
                      static_cast<int64_t>(swiglu.getUpUnitId())})
                 windows.push_back({llvm::formatv("MXM.{0}.compute", unit).str(),
@@ -101,7 +101,7 @@ mlir::LogicalResult lowerSwigluSchedules(mlir::IRRewriter& rewriter,
                 result_offset + vxm_latency,
                 compute_duration + swiglu.getOutputTransportLatency());
             const int64_t result_slice = get_slice(swiglu.getResultAddress());
-            windows.push_back({mem_resource(result_slice), write_offset, *output_duration});
+            windows.push_back({mem_write_resource(result_slice), write_offset, *output_duration});
             const int64_t loads_done = std::max(
                 gate_schedule->load_cycle + gate_schedule->duration,
                 up_schedule->load_cycle + up_schedule->duration);

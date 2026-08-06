@@ -4,6 +4,7 @@
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Tensor/IR/tensor_dialect.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
+#include "ftlpu/compiler/Target/mxm_execution_strategy.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -33,8 +34,12 @@ struct Args {
     std::string pipeline{"ftlpu-stablehlo-to-kernel"};
     ftlpu::compiler::FfnScheduleStrategy ffn_schedule{
         ftlpu::compiler::FfnScheduleStrategy::Tail};
+    ftlpu::compiler::AttentionScheduleStrategy attention_schedule{
+        ftlpu::compiler::AttentionScheduleStrategy::Tail};
     ftlpu::compiler::RmsNormLoweringStrategy rmsnorm_strategy{
         ftlpu::compiler::RmsNormLoweringStrategy::VxmSquareMxmReduce};
+    ftlpu::compiler::target::MxmExecutionPolicy mxm_execution_policy{
+        ftlpu::compiler::target::MxmExecutionPolicy::Auto};
 };
 
 Args parse_args(int argc, char** argv)
@@ -60,6 +65,18 @@ Args parse_args(int argc, char** argv)
                 throw std::runtime_error(
                     "unknown FFN schedule strategy: " + strategy);
         }
+        else if (arg == "--attention-schedule") {
+            const std::string strategy = next();
+            if (strategy == "tail")
+                args.attention_schedule =
+                    ftlpu::compiler::AttentionScheduleStrategy::Tail;
+            else if (strategy == "fused")
+                args.attention_schedule =
+                    ftlpu::compiler::AttentionScheduleStrategy::Fused;
+            else
+                throw std::runtime_error(
+                    "unknown Attention schedule strategy: " + strategy);
+        }
         else if (arg == "--rmsnorm-strategy") {
             const std::string strategy = next();
             if (strategy == "vxm-square-mxm-reduce")
@@ -73,17 +90,30 @@ Args parse_args(int argc, char** argv)
                 throw std::runtime_error(
                     "unknown RMSNorm lowering strategy: " + strategy);
         }
+        else if (arg == "--mxm-execution") {
+            const std::string policy = next();
+            auto parsed =
+                ftlpu::compiler::target::parse_mxm_execution_policy(
+                    policy);
+            if (mlir::failed(parsed))
+                throw std::runtime_error(
+                    "unknown MXM execution policy: " + policy);
+            args.mxm_execution_policy = *parsed;
+        }
         else throw std::runtime_error("unknown argument: " + arg);
     }
     if (args.input.empty() || args.output.empty()) {
         throw std::runtime_error("usage: ftlpu-opt --input in.mlir --output out.mlir "
                                  "[--pipeline ftlpu-stablehlo-to-kernel|ftlpu-stablehlo-to-tensor|"
                                  "ftlpu-stablehlo-to-stream|ftlpu-stablehlo-to-schedule|"
+                                 "ftlpu-stream-to-schedule|"
                                  "ftlpu-stablehlo-to-commands|ftlpu-schedule-to-commands|"
                                  "ftlpu-compress-schedule|ftlpu-verify-schedule] "
                                  "[--ffn-schedule tail|fused] "
+                                 "[--attention-schedule tail|fused] "
                                  "[--rmsnorm-strategy "
                                  "vxm-square-mxm-reduce|vxm-feedback] "
+                                 "[--mxm-execution auto|legacy|block8] "
                                  "[--target-config target.json]");
     }
     return args;
@@ -129,12 +159,17 @@ try {
         target = *parsed_target;
     }
     (*module)->setAttr("ftlpu.target", target.to_attribute(&context));
+    (*module)->setAttr("ftlpu.mxm_execution_policy",
+        mlir::StringAttr::get(&context,
+            ftlpu::compiler::target::mxm_execution_policy_name(
+                args.mxm_execution_policy)));
 
     mlir::PassManager pass_manager(&context);
     if (args.pipeline != "ftlpu-stablehlo-to-kernel"
         && args.pipeline != "ftlpu-stablehlo-to-tensor"
         && args.pipeline != "ftlpu-stablehlo-to-stream"
         && args.pipeline != "ftlpu-stablehlo-to-schedule"
+        && args.pipeline != "ftlpu-stream-to-schedule"
         && args.pipeline != "ftlpu-stablehlo-to-commands"
         && args.pipeline != "ftlpu-schedule-to-commands"
         && args.pipeline != "ftlpu-compress-schedule"
@@ -155,9 +190,12 @@ try {
     if (args.pipeline == "ftlpu-stablehlo-to-stream" || args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_tensor_to_stream_pass());
-    if (args.pipeline == "ftlpu-stablehlo-to-schedule" || args.pipeline == "ftlpu-stablehlo-to-commands")
+    if (args.pipeline == "ftlpu-stablehlo-to-schedule"
+        || args.pipeline == "ftlpu-stream-to-schedule"
+        || args.pipeline == "ftlpu-stablehlo-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(
-            ftlpu::compiler::create_lower_stream_to_schedule_pass(args.ffn_schedule));
+            ftlpu::compiler::create_lower_stream_to_schedule_pass(
+                args.ffn_schedule, args.attention_schedule));
     if (args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands"
         || args.pipeline == "ftlpu-schedule-to-commands"
