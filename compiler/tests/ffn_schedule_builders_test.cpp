@@ -4,6 +4,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_swish_planner.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -16,7 +17,7 @@ void require(bool condition, const char* message)
 
 } // namespace
 
-int main()
+int main() try
 {
     using namespace ftlpu::compiler;
     target::LPUTargetModel target;
@@ -152,6 +153,19 @@ int main()
             + target.throughput().mxm_rows
             == projection->blocks.front().weight_compute_cycle,
         "FFN projection dequant lead is incorrect");
+    auto localDequantProjection = schedule::planFfnProjectionTimeline(
+        {32, 576, 1536, 576}, weightSlices, target, true);
+    require(mlir::succeeded(localDequantProjection),
+        "local-dequant FFN projection timeline failed");
+    const auto& firstLocalBlock = localDequantProjection->blocks.front();
+    const auto& reusedLocalBlock =
+        localDequantProjection->blocks[
+            target.throughput().mxm_weight_buffers];
+    require(reusedLocalBlock.dequant_start
+            >= firstLocalBlock.tiles.back().compute_cycle
+                + target.throughput().mxm_rows
+                + target.mxm_first_result_latency(),
+        "local-dequant FFN reused a live MXM weight buffer");
     for (const auto& block : projection->blocks) {
         for (const auto& tile : block.tiles) {
             for (const auto& hemisphere : tile.hemisphere_segments) {
@@ -172,7 +186,17 @@ int main()
         {128, 576, 1536, 576}, *projection, 1000, weightSlices,
         hiddenSlices, resultSlices, target);
     require(mlir::succeeded(down), "FFN down timeline failed");
-    require(down->wave_count == 5 && down->blocks.size() == 5 * 48,
+    const int64_t expectedDownWaves =
+        (576 + target.memory().hemispheres
+                    * target.throughput().mxms_per_hemisphere
+                    * target.throughput().mxm_rows
+                - 1)
+        / (target.memory().hemispheres
+            * target.throughput().mxms_per_hemisphere
+            * target.throughput().mxm_rows);
+    require(down->wave_count == expectedDownWaves
+            && down->blocks.size()
+                == static_cast<std::size_t>(expectedDownWaves * 48),
         "FFN down timeline has the wrong wave or block count");
     require(down->output_stream_base == 24
             && down->first_accumulator_stream == 32
@@ -182,6 +206,7 @@ int main()
     require(down->blocks.front().weight_compute_cycle
             == down->phase_start + projection->initial_compute_cycle,
         "FFN down timeline has the wrong phase offset");
+    bool sawLocalDequantPrefetch = false;
     for (const auto& block : down->blocks) {
         for (const auto& tile : block.tiles) {
             int64_t rows = 0;
@@ -189,8 +214,19 @@ int main()
                 rows += segment.rows;
             require(rows == target.throughput().mxm_rows,
                 "FFN down segments do not cover one MXM tile");
+            if (!tile.prefetch_next_weight) continue;
+            sawLocalDequantPrefetch = true;
+            require(tile.segments.size() == 1
+                    && tile.segments.front().rows
+                        == target.throughput().mxm_rows
+                    && tile.segments.front().stream_base
+                        == target.throughput()
+                               .mxm_load_streams_per_cycle,
+                "local-dequant FFN down activation overlaps weight streams");
         }
     }
+    require(sawLocalDequantPrefetch,
+        "FFN down timeline did not exercise weight prefetch");
 
     auto exploredStreams = target.streams();
     exploredStreams.streams_per_direction = 40;
@@ -210,4 +246,9 @@ int main()
             && exploredDown->first_accumulator_stream == 40
             && exploredDown->second_accumulator_stream == 44,
         "FFN down stream layout did not follow the 40-stream target");
+    return 0;
+} catch (const std::exception& ex) {
+    std::cerr << "ffn_schedule_builders_test failed: " << ex.what()
+              << '\n';
+    return 1;
 }

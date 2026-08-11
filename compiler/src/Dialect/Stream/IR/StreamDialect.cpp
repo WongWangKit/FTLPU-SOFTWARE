@@ -194,9 +194,17 @@ LogicalResult RouteOp::verify()
             == "w8a16_block8_weight_wave_striped"
         && stream_count
             == target.throughput().mxm_int8_load_streams_per_cycle;
+    const bool localInt8Weight =
+        *source == target::StreamEndpoint::Mem
+        && *destination == target::StreamEndpoint::MxmWeight
+        && getInput().getType().getElementType().isInteger(8)
+        && target.supports_mxm_local_dequant()
+        && stream_count
+            == target.throughput().mxm_int8_load_streams_per_cycle;
     const bool validStreamCount =
         stream_count == *expected_stream_count
-        || distributedBlock8Activation || block8Weight;
+        || distributedBlock8Activation || block8Weight
+        || localInt8Weight;
     if (stream_base < 0 || !validStreamCount
         || stream_base + stream_count > target.streams().streams_per_direction
         || getRegisterId() != static_cast<uint64_t>(*expected_register)

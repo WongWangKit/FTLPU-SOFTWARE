@@ -668,13 +668,22 @@ int64_t LPUTargetModel::mxm_block_issue_interval() const
 const std::array<int64_t, 16>& LPUTargetModel::attention_query_iw_slices(
     int64_t reduction_block) const
 {
-    static constexpr std::array<std::array<int64_t, 16>, 2> kSlices {{
+    static constexpr std::array<std::array<int64_t, 16>, 2> kSingleMxmSlices {{
         {{0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33}},
         {{18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35}},
     }};
-    if (reduction_block < 0 || reduction_block >= static_cast<int64_t>(kSlices.size()))
+    static constexpr std::array<std::array<int64_t, 16>, 2> kDualMxmSlices {{
+        {{44, 45, 46, 47, 8, 9, 10, 11,
+            12, 13, 14, 15, 16, 17, 32, 33}},
+        {{18, 19, 20, 21, 22, 23, 24, 25,
+            26, 27, 28, 29, 30, 31, 34, 35}},
+    }};
+    const auto& slices = throughput_.mxms_per_hemisphere == 1
+        ? kSingleMxmSlices : kDualMxmSlices;
+    if (reduction_block < 0
+        || reduction_block >= static_cast<int64_t>(slices.size()))
         throw std::out_of_range("attention query IW reduction block");
-    return kSlices[static_cast<std::size_t>(reduction_block)];
+    return slices[static_cast<std::size_t>(reduction_block)];
 }
 
 llvm::SmallVector<int64_t> LPUTargetModel::attention_weight_slices() const
@@ -855,10 +864,15 @@ llvm::SmallVector<int64_t> LPUTargetModel::attention_value_slices() const
         slices.append(shared.begin(), shared.end());
         return slices;
     }
-    for (int64_t block = 0; block < 2; ++block) {
-        const auto& block_slices = attention_query_iw_slices(block);
-        slices.append(block_slices.begin(), block_slices.end());
-    }
+    static constexpr std::array<std::array<int64_t, 16>, 2>
+        kDualMxmValueSlices {{
+            {{0, 1, 2, 3, 8, 9, 10, 11,
+                12, 13, 14, 15, 16, 17, 32, 33}},
+            {{18, 19, 20, 21, 22, 23, 24, 25,
+                26, 27, 28, 29, 30, 31, 34, 35}},
+        }};
+    for (const auto& blockSlices : kDualMxmValueSlices)
+        slices.append(blockSlices.begin(), blockSlices.end());
     return slices;
 }
 

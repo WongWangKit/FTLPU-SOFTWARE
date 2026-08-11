@@ -40,9 +40,9 @@ try {
     auto streamResult = plan_mxm_execution_strategy(
         {32, 64, 64, true, true, true, false}, target);
     require(mlir::succeeded(streamResult)
-            && !streamResult->uses_local_dequant()
+            && streamResult->uses_local_dequant()
             && !streamResult->uses_block8(),
-        "stream-result request must use the complete compatibility strategy");
+        "stream-result request must retain local-dequant Vector compute");
 
     auto throughput = target.throughput();
     throughput.mxm_block_compute_enabled = 0;
@@ -51,9 +51,9 @@ try {
     auto fallback = plan_mxm_execution_strategy(
         {32, 64, 64, true, true, true, true}, noBlock8);
     require(mlir::succeeded(fallback)
-            && !fallback->uses_local_dequant()
+            && fallback->uses_local_dequant()
             && !fallback->uses_block8(),
-        "target without Block8 must use the complete compatibility strategy");
+        "target without Block8 must retain MXM-local dequant for Vector compute");
     auto unavailableForcedBlock8 = plan_mxm_execution_strategy(
         {32, 64, 64, true, true, true, true}, noBlock8,
         MxmExecutionPolicy::Block8);
@@ -64,8 +64,9 @@ try {
         {32, 64, 64, true, true, true, true}, target,
         MxmExecutionPolicy::Legacy);
     require(mlir::succeeded(forcedLegacy)
+            && forcedLegacy->uses_local_dequant()
             && !forcedLegacy->uses_block8(),
-        "legacy policy did not suppress Block8");
+        "legacy policy must select local-dequant Vector compute");
 
     auto forcedBlock8 = plan_mxm_execution_strategy(
         {32, 64, 64, true, true, true, true}, target,

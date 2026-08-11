@@ -160,7 +160,7 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
             package.executables.at(invocation.executable_index).program;
         for (const BinaryMemoryFloor& floor : program.memory_floors) {
             if (floor.hemisphere >= 2
-                || floor.first_free_row > program.memory_rows_per_slice)
+                || floor.first_free_row > program.hardware.sram_depth_rows)
                 throw std::invalid_argument(
                     "binary MEM floor exceeds physical MEM");
             const PhysicalSlice slice {
@@ -185,7 +185,7 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
             const auto [begin, end] = binding_row_range(binding);
             if (begin < 0
                 || end > static_cast<std::int64_t>(
-                    program.memory_rows_per_slice))
+                    program.hardware.sram_depth_rows))
                 throw std::invalid_argument(
                     "compiler-assigned binding exceeds physical MEM");
             for_each_physical_slice(program, binding,
@@ -198,10 +198,10 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
             for_each_physical_slice(program, binding,
                 [&](const PhysicalSlice& slice) {
                     auto [it, inserted] = memory_capacity.emplace(
-                        slice, program.memory_rows_per_slice);
+                        slice, program.hardware.sram_depth_rows);
                     if (!inserted && it->second
                             != static_cast<std::int64_t>(
-                                program.memory_rows_per_slice))
+                                program.hardware.sram_depth_rows))
                         throw std::invalid_argument(
                             "executables with one target ABI disagree "
                             "on MEM capacity");
@@ -363,7 +363,7 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
                 + " usable_capacity="
                 + std::to_string(
                     static_cast<std::int64_t>(
-                        request.program->memory_rows_per_slice)
+                        request.program->hardware.sram_depth_rows)
                     - reserved_floor[physical_slices.front()])
                 + " free_intervals=" + interval_details.str());
         }

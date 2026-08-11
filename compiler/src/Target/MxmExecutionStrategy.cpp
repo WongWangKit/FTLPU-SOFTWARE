@@ -96,12 +96,14 @@ mlir::FailureOr<MxmExecutionStrategy> plan_mxm_execution_strategy(
             <= target.streams().streams_per_direction;
     if (policy == MxmExecutionPolicy::Block8 && !block8Legal)
         return mlir::failure();
-    if (policy != MxmExecutionPolicy::Legacy && block8Legal) {
+    if (localDequantLegal) {
         strategy.weight_preparation =
             MxmWeightPreparation::LocalInt8DequantBf16;
-        strategy.compute = MxmComputeStrategy::Block8;
         strategy.weight_stream_count =
             throughput.mxm_int8_load_streams_per_cycle;
+    }
+    if (policy != MxmExecutionPolicy::Legacy && block8Legal) {
+        strategy.compute = MxmComputeStrategy::Block8;
         strategy.activation_stream_count =
             2 * throughput.mxm_block_rows;
         strategy.rows_per_compute_issue =

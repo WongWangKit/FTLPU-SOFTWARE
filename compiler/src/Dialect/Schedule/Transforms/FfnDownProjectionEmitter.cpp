@@ -60,12 +60,22 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         * throughput.mxms_per_hemisphere
                         * weightLoadCycles
                     + localMxm * weightLoadCycles;
+                const auto rawType =
+                    llvm::cast<mlir::RankedTensorType>(
+                        context.down_raw.getInput().getType());
+                const auto activationType =
+                    llvm::cast<mlir::RankedTensorType>(
+                        ffn.getActivation().getType());
+                const auto dequantizedType =
+                    mlir::RankedTensorType::get(rawType.getShape(),
+                        activationType.getElementType());
                 emitFfnWeightTile(rewriter, ffn.getLoc(),
                     context.down_raw,
-                    context.down_route.getInput().getType(),
-                    context.weight_slices, target,
+                    dequantizedType,
+                    context.down_weight_slices, target,
                     ffn.getDownRhsScale().convertToFloat(), start,
-                    base, hemisphere, localMxm, unit, weightBuffer);
+                    base, hemisphere, localMxm, unit, weightBuffer,
+                    context.local_weight_dequant);
             }
         }
 

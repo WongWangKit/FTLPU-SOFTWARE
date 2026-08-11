@@ -4,10 +4,111 @@
 
 #include <cstdint>
 #include <string_view>
+#include <utility>
 
 namespace ftlpu::software::runtime {
 
 inline constexpr std::string_view kLpu32StreamTargetName = "lpu_32stream_v1";
+
+// Self-contained hardware contract embedded in every executable. Structural
+// fields describe the instruction and transport geometry; capacity fields may
+// select a logical subset of a larger CModel instance.
+struct ExecutableHardwareConfig {
+    std::uint32_t hemispheres{2};
+    std::uint32_t slices_per_hemisphere{52};
+    std::uint32_t banks_per_slice{16};
+    std::uint32_t words_per_bank{4096};
+    std::uint32_t bytes_per_word{16};
+    std::uint32_t sram_depth_rows{65536};
+    std::uint32_t sram_read_ports_per_slice{1};
+    std::uint32_t sram_write_ports_per_slice{1};
+    std::uint32_t streams_per_direction{32};
+    std::uint32_t encoded_streams{64};
+    std::uint32_t mem_boundary_register_columns{14};
+    std::uint32_t system_register_columns{15};
+    std::uint32_t mem_slices_per_register_group{4};
+    std::uint32_t tile_rows{4};
+    std::uint32_t lanes_per_tile{8};
+    std::uint32_t mem_read_bytes_per_cycle{8};
+    std::uint32_t mem_write_bytes_per_cycle{8};
+    std::uint32_t mxm_rows{32};
+    std::uint32_t mxm_columns{32};
+    std::uint32_t mxm_load_streams_per_cycle{16};
+    std::uint32_t mxm_int8_load_streams_per_cycle{8};
+    std::uint32_t mxm_load_bytes_per_cycle{128};
+    std::uint32_t mxm_activation_streams{4};
+    std::uint32_t mxm_result_streams{4};
+    std::uint32_t mxm_pipeline_rows{4};
+    std::uint32_t mxm_block_rows{8};
+    std::uint32_t mxm_local_dequant_enabled{1};
+    std::uint32_t mxm_block_compute_enabled{1};
+    std::uint32_t mxm_weight_activation_overlap_enabled{1};
+    std::uint32_t mxm_local_load_to_compute_latency{4};
+    std::uint32_t mxm_block_group_interval{8};
+    std::uint32_t mxm_earliest_iw_cycle{2};
+    std::uint32_t qk_iw_to_compute_latency{24};
+    std::uint32_t mxms_per_hemisphere{hw::kMxmsPerHemisphere};
+    std::uint32_t mxm_weight_buffers{2};
+    std::uint32_t vxm_alus{16};
+    std::uint32_t vxm_weight_to_iw_latency{16};
+    std::uint32_t mem_to_sxm_latency{14};
+    std::uint32_t mem_to_mxm_latency{15};
+    std::uint32_t mxm0_accumulator_latency{6};
+    std::uint32_t mxm1_accumulator_latency{5};
+    std::uint32_t accumulator_to_vxm_latency{18};
+    std::uint32_t accumulator_read_to_vxm_latency{15};
+    std::uint32_t swiglu_write_latency{13};
+
+    template <typename Visitor>
+    constexpr void visit(Visitor&& visitor)
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor));
+    }
+
+    template <typename Visitor>
+    constexpr void visit(Visitor&& visitor) const
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor));
+    }
+
+private:
+    template <typename Self, typename Visitor>
+    static constexpr void visit_impl(Self& self, Visitor&& visitor)
+    {
+        visitor(self.hemispheres); visitor(self.slices_per_hemisphere);
+        visitor(self.banks_per_slice); visitor(self.words_per_bank);
+        visitor(self.bytes_per_word); visitor(self.sram_depth_rows);
+        visitor(self.sram_read_ports_per_slice);
+        visitor(self.sram_write_ports_per_slice);
+        visitor(self.streams_per_direction); visitor(self.encoded_streams);
+        visitor(self.mem_boundary_register_columns);
+        visitor(self.system_register_columns);
+        visitor(self.mem_slices_per_register_group); visitor(self.tile_rows);
+        visitor(self.lanes_per_tile); visitor(self.mem_read_bytes_per_cycle);
+        visitor(self.mem_write_bytes_per_cycle); visitor(self.mxm_rows);
+        visitor(self.mxm_columns); visitor(self.mxm_load_streams_per_cycle);
+        visitor(self.mxm_int8_load_streams_per_cycle);
+        visitor(self.mxm_load_bytes_per_cycle);
+        visitor(self.mxm_activation_streams);
+        visitor(self.mxm_result_streams); visitor(self.mxm_pipeline_rows);
+        visitor(self.mxm_block_rows); visitor(self.mxm_local_dequant_enabled);
+        visitor(self.mxm_block_compute_enabled);
+        visitor(self.mxm_weight_activation_overlap_enabled);
+        visitor(self.mxm_local_load_to_compute_latency);
+        visitor(self.mxm_block_group_interval);
+        visitor(self.mxm_earliest_iw_cycle);
+        visitor(self.qk_iw_to_compute_latency);
+        visitor(self.mxms_per_hemisphere);
+        visitor(self.mxm_weight_buffers); visitor(self.vxm_alus);
+        visitor(self.vxm_weight_to_iw_latency);
+        visitor(self.mem_to_sxm_latency); visitor(self.mem_to_mxm_latency);
+        visitor(self.mxm0_accumulator_latency);
+        visitor(self.mxm1_accumulator_latency);
+        visitor(self.accumulator_to_vxm_latency);
+        visitor(self.accumulator_read_to_vxm_latency);
+        visitor(self.swiglu_write_latency);
+    }
+};
 
 class TargetAbiHasher {
 public:
@@ -31,55 +132,21 @@ private:
 constexpr std::uint64_t lpu_32stream_target_abi(
     std::int64_t mxms_per_hemisphere = hw::kMxmsPerHemisphere)
 {
+    ExecutableHardwareConfig config;
+    config.mxms_per_hemisphere =
+        static_cast<std::uint32_t>(mxms_per_hemisphere);
     TargetAbiHasher hash;
     hash.add(7); // Hardware ABI schema version.
+    config.visit([&](std::uint32_t value) { hash.add(value); });
+    return hash.value();
+}
 
-    hash.add(hw::kHemispheres);
-    hash.add(hw::kMemSliceColumns);
-    hash.add(16);
-    hash.add(4096);
-    hash.add(16);
-    hash.add(hw::kSramDepthRows);
-    hash.add(1); // One SRAM read port per slice.
-    hash.add(1); // One SRAM write port per slice.
-
-    hash.add(hw::kStreamsPerDirection);
-    hash.add(hw::kStreams);
-    hash.add(hw::kMemBoundaryStreamRegisterColumns);
-    hash.add(hw::kSystemStreamRegisterColumns);
-    hash.add(hw::kMemSlicesPerGroup);
-
-    hash.add(hw::kTileRows);
-    hash.add(hw::kLanesPerTile);
-    hash.add(hw::kMemReadBytesPerCycle);
-    hash.add(hw::kMemWriteBytesPerCycle);
-    hash.add(hw::kMxmRows);
-    hash.add(hw::kMxmColumns);
-    hash.add(hw::kMxmLoadStreamsPerCycle);
-    hash.add(hw::kMxmInt8LoadStreamsPerCycle);
-    hash.add(hw::kMxmLoadBytesPerCycle);
-    hash.add(4);
-    hash.add(4);
-    hash.add(4);
-    hash.add(hw::kMxmBlockRows);
-    hash.add(1); // MXM-local INT8 dequant is enabled.
-    hash.add(1); // Block8 compute is enabled.
-    hash.add(1); // Weight/activation transport overlap is enabled.
-    hash.add(4); // Wavefront weight-load to compute latency.
-    hash.add(8); // Interval between 32-row Block8 groups.
-    hash.add(2);
-    hash.add(24);
-    hash.add(mxms_per_hemisphere);
-    hash.add(2);
-    hash.add(16);
-    hash.add(hw::kMxmBoundaryStreamRegisterColumn + 2);
-    hash.add(hw::kMemGroups + 1);
-    hash.add(hw::kMemGroups + 2);
-    hash.add(6);
-    hash.add(5);
-    hash.add(hw::kMxmBoundaryStreamRegisterColumn + 4);
-    hash.add(hw::kMxmBoundaryStreamRegisterColumn + 1);
-    hash.add(13);
+constexpr std::uint64_t executable_target_abi(
+    const ExecutableHardwareConfig& config)
+{
+    TargetAbiHasher hash;
+    hash.add(7); // Hardware ABI schema version.
+    config.visit([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }
 

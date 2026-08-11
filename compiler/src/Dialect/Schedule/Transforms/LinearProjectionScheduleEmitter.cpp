@@ -114,6 +114,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
         return mlir::failure();
     }
     const bool block8 = execution->uses_block8();
+    const bool localDequant = execution->uses_local_dequant();
     const std::size_t expectedActivationSlices = block8 ? 16 : 2;
     const std::size_t expectedResultSlices = block8 ? 16 : 4;
     if (inputSlices.size() != expectedActivationSlices
@@ -163,7 +164,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
             + 2;
     };
     const auto weightReadLatency = [&](int64_t slice) {
-        if (!block8) return readLatency(slice);
+        if (!localDequant) return readLatency(slice);
         const auto latency = target.transport_latency(
             target::StreamEndpoint::Mem,
             target::StreamEndpoint::MxmWeight,
@@ -202,7 +203,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
              reduction < reductionBlocks; ++reduction) {
             const int64_t dequantStart =
                 phaseStart + maxWeightLatency;
-            const int64_t firstCompute = block8
+            const int64_t firstCompute = localDequant
                 ? dequantStart
                     + target.throughput()
                           .mxm_local_load_to_compute_latency
@@ -217,7 +218,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                     hemisphere == 0 ? "east" : "west";
                 for (int64_t pulse = 0; pulse < 4; ++pulse) {
                     const int64_t cycle = dequantStart
-                        + (block8
+                        + (localDequant
                                 ? 0
                                 : hemisphere
                                     * target.throughput()
@@ -236,8 +237,11 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                                           .slices_per_hemisphere
                                 + slice,
                             "read", address,
-                            block8
-                                ? stream
+                            localDequant
+                                ? localMxm
+                                        * target.throughput()
+                                              .mxm_int8_load_streams_per_cycle
+                                    + stream
                                 : target.streams()
                                       .streams_per_direction
                                     + stream,
@@ -247,7 +251,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                             * target.throughput()
                                   .mxms_per_hemisphere
                         + localMxm;
-                    if (block8) {
+                    if (localDequant) {
                         emitMxmDequant(rewriter, op.getLoc(),
                             cycle, unit, scale);
                         emitMxm(rewriter, op.getLoc(), cycle, unit,

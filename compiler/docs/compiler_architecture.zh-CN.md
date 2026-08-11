@@ -237,7 +237,7 @@ FFN 使用可复用的 WeightLoad、Projection、Swish 和 DownProjection schedu
 
 `MxmExecutionStrategyPlanner` 根据 tensor 类型、矩阵尺寸、结果放置要求和 `LPUTargetModel` 能力选择执行策略。对于满足约束的 BF16 activation、INT8 weight projection，planner 会原子地选择 `Int8DequantBF16` 权重输入和 `Block8` compute：Schedule 使用 8 条原始 INT8 weight stream、MXM 本地反量化、16 条分布式 BF16 activation stream，并对每个 32 行输出块发射 4 次 8 行 compute。如果硬件能力、数据类型、对齐、stream 宽度或 accumulator 结果放置的任一条件不满足，planner 会完整回退到 VXM dequant、Direct16 load 和 Vector compute，不会产生硬件不支持的混合策略。
 
-相关 target 参数包括 `mxm_int8_load_streams_per_cycle`、`mxm_block_rows`、`mxm_local_dequant_enabled`、`mxm_block_compute_enabled`、`mxm_local_load_to_compute_latency` 和 `mxm_block_group_interval`。这些参数属于 target ABI schema 4，并参与 compiler/runtime 兼容性哈希。
+相关 target 参数包括 `mxm_int8_load_streams_per_cycle`、`mxm_block_rows`、`mxm_local_dequant_enabled`、`mxm_block_compute_enabled`、`mxm_local_load_to_compute_latency` 和 `mxm_block_group_interval`。这些参数属于 target ABI schema 7，并参与 compiler/runtime 兼容性哈希。
 
 `mxm_block_compute_enabled` 是硬件能力位。`--mxm-execution auto|legacy|block8` 只表达编译策略：`auto` 仅在 target 和算子都合法时选择 Block8，`legacy` 禁用该优化，`block8` 要求目标支持该能力，但不能在不支持的硬件上凭空开启 Block8。
 
@@ -250,6 +250,10 @@ Feedback RMSNorm 有独立的 Tensor/Stream/Schedule lowering。它的 Schedule 
 ```text
 ftlpu_opt --target-config compiler/examples/targets/exploration_40_streams.json ...
 ```
+
+Binary v16 不再只保存 target 名称和 ABI hash，而是携带解析完成的完整硬件配置。每个 CModel 端到端测试都必须显式传入 `--target-config`；runtime 在装载 ICU queue 前，会先验证 binary 中的字段能够重新计算出相同 ABI。CModel 静态库表示物理容量上限，每个 `TspSliceSystem` 在 load 时选择自己的逻辑配置。目前可动态选择 SRAM 有效深度、每半球 1 或 2 个 MXM、MXM weight buffer 数、VXM ALU 数，以及 Block8、本地反量化和传输重叠能力；runtime 会把 executable 的逻辑 MXM queue 映射到物理 queue。
+
+stream 数、tile geometry、矩阵阵列尺寸、传输宽度和固定 latency 等结构/时序参数仍必须与 CModel 精确一致，容量参数必须非零且不超过物理上限。因此 `exploration_40_streams.json` 仍是 compiler 调度回归配置：它可以生成不同的 Schedule IR，但默认 32-stream CModel 会以明确字段错误拒绝其 binary。要执行这类结构探索配置，仍需先实现对应的物理 CModel。
 
 JSON 可以覆盖 `memory`、`streams` 和 `throughput` 三组字段；未指定字段继续使用与默认 CModel 兼容的值。解析后的完整配置会序列化为 module 上的 `ftlpu.target` dictionary，因此每个中间 MLIR 文件都携带可复现后续 lowering 所需的硬件参数。Kernel-to-Tensor、Tensor-to-Stream 和 Stream-to-Schedule 都会从该属性恢复同一份 target model。配置校验会拒绝非正维度、超过方向 stream 容量的功能单元宽度、越界 MEM slice base 和不兼容的 tile geometry。
 

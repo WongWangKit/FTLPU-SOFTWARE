@@ -58,7 +58,7 @@ def main() -> None:
     ])
     run_phase("schedule-to-command", [
         str(args.opt), "--input", str(schedule_ir), "--output",
-        str(command_ir), "--pipeline", "ftlpu-schedule-to-commands",
+        str(command_ir), "--pipeline", "ftlpu-verified-schedule-to-commands",
         "--target-config", str(args.target_config),
     ])
     text = command_ir.read_text(encoding="utf-8")
@@ -81,6 +81,17 @@ def main() -> None:
                 raise RuntimeError(
                     f"Block8 decoder is missing Command IR marker: {marker}"
                 )
+    else:
+        for marker in (
+            'weight_input_mode = "int8_dequant_bf16"',
+            "ftlpu.command.mxm_dequant",
+        ):
+            if marker not in text:
+                raise RuntimeError(
+                    f"vector decoder is missing Command IR marker: {marker}"
+                )
+        if 'compute_mode = "block8"' in text:
+            raise RuntimeError("vector decoder unexpectedly uses Block8 compute")
     output_bindings = [
         line for line in text.splitlines()
         if "ftlpu.command.binding" in line

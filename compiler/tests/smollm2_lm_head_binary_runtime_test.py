@@ -58,6 +58,7 @@ def main() -> None:
     parser.add_argument("--runtime-test", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument("--shard-count", type=int, default=12)
     args = parser.parse_args()
 
@@ -148,6 +149,8 @@ def main() -> None:
                 str(output),
                 "--pipeline",
                 pipeline,
+                "--target-config",
+                str(args.target_config),
             ],
             check=True,
         )

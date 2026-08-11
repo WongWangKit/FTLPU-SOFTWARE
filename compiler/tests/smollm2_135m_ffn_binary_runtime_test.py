@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("--runtime-test", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument("--ffn-schedule", choices=("tail", "fused"),
                         default="tail")
     parser.add_argument("--mxm-execution", choices=("auto", "legacy", "block8"),
@@ -27,14 +28,29 @@ def main() -> None:
     binary = args.output_dir / "ffn.ftlpu"
     trace = args.output_dir / "ffn.runtime.csv"
     pipeline = args.output_dir / "ffn.pipeline.svg"
-    subprocess.run([
+    compile_command = [
         str(args.opt), "--input", str(args.input), "--output", str(commands),
         "--pipeline", "ftlpu-stablehlo-to-commands",
         "--ffn-schedule", args.ffn_schedule,
         "--mxm-execution", args.mxm_execution,
-    ], check=True)
+    ]
+    compile_command.extend(["--target-config", str(args.target_config)])
+    subprocess.run(compile_command, check=True)
     command_text = commands.read_text(encoding="utf-8")
     block8_selected = args.mxm_execution in ("auto", "block8")
+    if not block8_selected:
+        for marker in (
+            'weight_input_mode = "int8_dequant_bf16"',
+            "ftlpu.command.mxm_dequant",
+        ):
+            if marker not in command_text:
+                raise RuntimeError(
+                    f"Vector FFN is missing MXM-local dequant marker: {marker}"
+                )
+        if 'lhs_kind = "stream_i8"' in command_text:
+            raise RuntimeError(
+                "Vector FFN must not use VXM for weight dequantization"
+            )
     if block8_selected:
         for marker in (
             'weight_input_mode = "int8_dequant_bf16"',

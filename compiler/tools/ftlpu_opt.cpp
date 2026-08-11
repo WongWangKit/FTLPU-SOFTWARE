@@ -108,6 +108,7 @@ Args parse_args(int argc, char** argv)
                                  "ftlpu-stablehlo-to-stream|ftlpu-stablehlo-to-schedule|"
                                  "ftlpu-stream-to-schedule|"
                                  "ftlpu-stablehlo-to-commands|ftlpu-schedule-to-commands|"
+                                 "ftlpu-verified-schedule-to-commands|"
                                  "ftlpu-compress-schedule|ftlpu-verify-schedule] "
                                  "[--ffn-schedule tail|fused] "
                                  "[--attention-schedule tail|fused] "
@@ -172,12 +173,14 @@ try {
         && args.pipeline != "ftlpu-stream-to-schedule"
         && args.pipeline != "ftlpu-stablehlo-to-commands"
         && args.pipeline != "ftlpu-schedule-to-commands"
+        && args.pipeline != "ftlpu-verified-schedule-to-commands"
         && args.pipeline != "ftlpu-compress-schedule"
         && args.pipeline != "ftlpu-verify-schedule") {
         throw std::runtime_error("unknown MLIR pipeline: " + args.pipeline);
     }
     if (args.pipeline != "ftlpu-verify-schedule"
         && args.pipeline != "ftlpu-schedule-to-commands"
+        && args.pipeline != "ftlpu-verified-schedule-to-commands"
         && args.pipeline != "ftlpu-compress-schedule")
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stablehlo_to_kernel_pass());
@@ -214,6 +217,9 @@ try {
         pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_schedule_to_command_pass());
     if (args.pipeline == "ftlpu-schedule-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_schedule_to_command_pass());
+    if (args.pipeline == "ftlpu-verified-schedule-to-commands")
+        pass_manager.addNestedPass<mlir::func::FuncOp>(
+            ftlpu::compiler::create_lower_schedule_to_command_pass());
     if (mlir::failed(pass_manager.run(*module))) return 1;
 
     std::error_code error;

@@ -26,6 +26,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/model_session.cpp
     src/runtime/performance.cpp
     src/runtime/schedule_trace.cpp
+    examples/binary_inspect.cpp
     tests/runtime/command_mxm_column_binary_test.cpp
     tests/runtime/command_vxm_binary_runtime_test.cpp
     tests/runtime/sxm_binary_roundtrip_test.cpp
@@ -80,6 +81,9 @@ target_link_libraries(ftlpu_software
     PUBLIC
         ftlpu_cmodel_static)
 
+add_executable(ftlpu_binary_inspect examples/binary_inspect.cpp)
+target_link_libraries(ftlpu_binary_inspect PRIVATE ftlpu_software)
+
 add_executable(command_vxm_binary_runtime_test
     tests/runtime/command_vxm_binary_runtime_test.cpp)
 
@@ -111,7 +115,7 @@ target_link_libraries(sxm_binary_roundtrip_test PRIVATE ftlpu_software)
 add_test(
     NAME sxm_binary_roundtrip_test
     COMMAND $<TARGET_FILE:sxm_binary_roundtrip_test>
-        ${CMAKE_CURRENT_BINARY_DIR}/test-output/sxm-v5.ftlpu)
+        ${CMAKE_CURRENT_BINARY_DIR}/test-output/sxm-v16.ftlpu)
 
 add_executable(model_package_roundtrip_test
     tests/runtime/model_package_roundtrip_test.cpp)

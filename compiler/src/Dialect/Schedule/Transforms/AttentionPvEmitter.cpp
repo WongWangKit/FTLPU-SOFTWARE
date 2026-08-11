@@ -7,6 +7,7 @@
 
 
 #include <algorithm>
+#include <limits>
 
 namespace ftlpu::compiler::schedule {
 using namespace attention_detail;
@@ -40,6 +41,29 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
         && resultKind.getValue()
             == "fp16_mxm_block8_distributed_16";
     const int64_t accumulatorHalfStride = 4096;
+    const int64_t mxmResultToVxmLatency =
+        target_.throughput().accumulator_to_vxm_latency
+        - target_.mxm_first_result_latency();
+    int64_t finalOutputHemisphereStagger = 0;
+    if (!sourceLocalContext) {
+        int64_t earliestLocalWrite = std::numeric_limits<int64_t>::max();
+        int64_t latestRemoteWrite = 0;
+        for (const int64_t slice : layout.contextSlices()) {
+            const auto localLatency = target_.transport_latency(
+                target::StreamEndpoint::MxmResult,
+                target::StreamEndpoint::Mem,
+                target::StreamDirection::West, slice);
+            if (!localLatency) return -1;
+            earliestLocalWrite = std::min(
+                earliestLocalWrite, *localLatency);
+            const int64_t destinationGroup = slice
+                / target_.streams().mem_slices_per_register_group;
+            latestRemoteWrite = std::max(latestRemoteWrite,
+                mxmResultToVxmLatency + destinationGroup + 1);
+        }
+        finalOutputHemisphereStagger = latestRemoteWrite + tile
+            - earliestLocalWrite;
+    }
     int64_t lastContextWriteCycle = transposeEnd - 1;
     std::array<int64_t, 16> inputStreams {};
     std::array<int64_t, 16> transposeStreams {};
@@ -184,34 +208,37 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                     // the same context MEM write slices.
                     const int64_t finalComputeStart = firstCompute
                         + (finalReduction && !sourceLocalContext
-                                ? hemisphere * (tile + 16)
+                                ? hemisphere
+                                    * finalOutputHemisphereStagger
                                 : 0);
                     for (int64_t localMxm = 0; localMxm < headBlocks; ++localMxm) {
                         const int64_t computeCycle = finalComputeStart
                             + (singleMxm ? localMxm * tile : 0);
-                        for (int64_t query = 0; query < tile; ++query) {
-                            const int64_t row = query % lanes;
-                            const int64_t diagonal = query / lanes;
-                            for (int64_t byte = 0; byte < 2; ++byte) {
-                                const int64_t slice =
-                                    layout.probabilityDiagonalSlices()
-                                        [row * 2 + byte];
-                                const int64_t latency =
-                                    *target_.transport_latency(
-                                        target::StreamEndpoint::Mem,
-                                        target::StreamEndpoint::MxmActivation,
-                                        target::StreamDirection::East,
-                                        slice);
-                                emitMem(rewriter_, op_.getLoc(),
-                                    computeCycle + query - latency,
-                                    hemisphere
-                                            * target_.memory()
-                                                  .slices_per_hemisphere
-                                        + slice,
-                                    "read",
-                                    layout.probabilityDiagonalAddress(*head,
-                                        queryBlock, keyBlock, diagonal),
-                                    16 + byte, 1, 1, 0);
+                        if (singleMxm || localMxm == 0) {
+                            for (int64_t query = 0; query < tile; ++query) {
+                                const int64_t row = query % lanes;
+                                const int64_t diagonal = query / lanes;
+                                for (int64_t byte = 0; byte < 2; ++byte) {
+                                    const int64_t slice =
+                                        layout.probabilityDiagonalSlices()
+                                            [row * 2 + byte];
+                                    const int64_t latency =
+                                        *target_.transport_latency(
+                                            target::StreamEndpoint::Mem,
+                                            target::StreamEndpoint::MxmActivation,
+                                            target::StreamDirection::East,
+                                            slice);
+                                    emitMem(rewriter_, op_.getLoc(),
+                                        computeCycle + query - latency,
+                                        hemisphere
+                                                * target_.memory()
+                                                      .slices_per_hemisphere
+                                            + slice,
+                                        "read",
+                                        layout.probabilityDiagonalAddress(*head,
+                                            queryBlock, keyBlock, diagonal),
+                                        16 + byte, 1, 1, 0);
+                                }
                             }
                         }
                         const int64_t outputStream =
@@ -257,25 +284,53 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                         const int64_t slice =
                                             layout.contextSlices()[
                                                 copy * 4 + half * 2 + byte];
-                                        const auto latency =
-                                            target_.transport_latency(
-                                                target::StreamEndpoint::MxmResult,
-                                                target::StreamEndpoint::Mem,
-                                                target::StreamDirection::West,
-                                                slice);
-                                        if (!latency) return -1;
-                                        const int64_t writeCycle =
-                                            resultStart + *latency;
+                                        const bool local =
+                                            destinationHemisphere
+                                            == hemisphere;
+                                        const int64_t destinationGroup =
+                                            slice
+                                            / target_.streams()
+                                                  .mem_slices_per_register_group;
+                                        int64_t writeCycle = 0;
+                                        int64_t packedStream = 0;
+                                        if (local) {
+                                            const auto latency =
+                                                target_.transport_latency(
+                                                    target::StreamEndpoint::MxmResult,
+                                                    target::StreamEndpoint::Mem,
+                                                    target::StreamDirection::West,
+                                                    slice);
+                                            if (!latency) return -1;
+                                            writeCycle = resultStart + *latency;
+                                            packedStream = resultStream + byte;
+                                        } else {
+                                            writeCycle = resultStart
+                                                + mxmResultToVxmLatency
+                                                + destinationGroup + 1;
+                                            packedStream = resultStream + byte
+                                                - target_.streams()
+                                                      .streams_per_direction;
+                                        }
+                                        // Local writes must preserve the W
+                                        // stream for the passive VXM bridge.
+                                        // On the remote E path, only the last
+                                        // physical copy consumes the stream.
+                                        const bool preserveStream =
+                                            !sourceLocalContext
+                                            && (local
+                                                || copy + 1 < copyCount);
                                         emitMem(rewriter_, op_.getLoc(),
                                             writeCycle,
                                             destinationHemisphere
                                                     * target_.memory()
                                                           .slices_per_hemisphere
                                                 + slice,
-                                            "write",
+                                            preserveStream
+                                                ? "write_tap"
+                                                : "write",
                                             layout.contextAddress(*head,
                                                 queryBlock * tile),
-                                            resultStream + byte, tile, 1, 1);
+                                            packedStream, tile, 1, 1);
                                         lastContextWriteCycle = std::max(
                                             lastContextWriteCycle,
                                             writeCycle + tile - 1);

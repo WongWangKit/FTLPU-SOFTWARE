@@ -35,11 +35,25 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
             target::StreamDirection::East, 0);
     const int64_t computeEnd = firstIwOffset
         + result.qk_iw_to_compute_cycles + qkWaveComputeCycles;
-    result.qk_wave_interval =
+    const bool supportsWavefront =
         target.supports_mxm_weight_activation_overlap()
-            && target.throughput().mxm_weight_buffers >= 2
-        ? qkWaveComputeCycles
-        : computeEnd - firstIwOffset;
+        && target.throughput().mxm_weight_buffers >= 2;
+    if (!supportsWavefront) {
+        result.qk_wave_interval = computeEnd - firstIwOffset;
+    } else if (target.throughput().mxms_per_hemisphere == 1) {
+        result.qk_wave_interval = qkWaveComputeCycles;
+    } else {
+        // A dual-MXM QK wave uses E16..E31 both for MXM1 weights and for
+        // activation traffic. The next wave can start loading only after the
+        // previous activation packet diagonal has cleared those SR links.
+        const int64_t iwPhasesPerReduction = tile / 8;
+        const int64_t localMxmPreloadOffset =
+            (target.throughput().mxms_per_hemisphere - 1)
+            * headBlocks * iwPhasesPerReduction;
+        const int64_t streamReuseGap = std::max<int64_t>(0,
+            result.qk_iw_to_compute_cycles - localMxmPreloadOffset);
+        result.qk_wave_interval = qkWaveComputeCycles + streamReuseGap;
+    }
     result.qk_wave_duration = computeEnd
         + std::max(target.throughput().mxm0_accumulator_latency,
             target.throughput().mxm1_accumulator_latency);

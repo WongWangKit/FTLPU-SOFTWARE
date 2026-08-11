@@ -962,13 +962,16 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
             const int64_t outputStream = work->local_mxm * 4;
             const bool wavefront =
                 target_.supports_mxm_weight_activation_overlap()
-                && target_.throughput().mxm_weight_buffers >= 2;
+                && target_.throughput().mxm_weight_buffers >= 2
+                && target_.throughput().mxms_per_hemisphere == 1;
             for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
                 const auto& iwSlices = target_.attention_query_iw_slices(reduction);
                 const int64_t reductionComputeCycle = firstComputeCycle
                     + reduction * tokenBlocks * issue;
                 const int64_t reductionIwCycle = wavefront
                     ? reductionComputeCycle - qkIwToComputeCycles
+                        - work->local_mxm
+                            * target_.throughput().tile_rows
                     : firstIwCycle + work->local_mxm * 8
                         + reduction * tile / 8;
                 for (int64_t phase = 0; phase < tile / 8; ++phase) {

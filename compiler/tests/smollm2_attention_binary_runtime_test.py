@@ -15,6 +15,7 @@ def main() -> None:
     parser.add_argument("--runtime-test", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument(
         "--attention-schedule", choices=("tail", "fused"), default="tail")
     args = parser.parse_args()
@@ -27,6 +28,7 @@ def main() -> None:
         str(args.opt), "--input", str(args.input), "--output",
         str(command_ir), "--pipeline", "ftlpu-stablehlo-to-commands",
         "--attention-schedule", args.attention_schedule,
+        "--target-config", str(args.target_config),
     ], check=True)
     command_text = command_ir.read_text(encoding="utf-8")
     required_ops = {

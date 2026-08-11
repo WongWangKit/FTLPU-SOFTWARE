@@ -203,7 +203,7 @@ BinaryProgram parameterize_program(const ModelPackage& package,
         const std::int64_t relocated =
             static_cast<std::int64_t>(sourceAddress) + delta;
         if (relocated < 0
-            || relocated >= program.memory_rows_per_slice)
+            || relocated >= program.hardware.sram_depth_rows)
             throw std::logic_error(
                 "resident address relocation exceeds physical MEM: binding="
                 + std::to_string(relocation.binding_index)

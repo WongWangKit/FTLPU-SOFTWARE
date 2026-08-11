@@ -51,6 +51,104 @@ bool is_16bit_float(BindingElementType type)
         || type == BindingElementType::BF16;
 }
 
+void validate_cmodel_hardware_config(const BinaryProgram& program)
+{
+    const auto& requested = program.hardware;
+    const auto physical = ExecutableHardwareConfig {};
+    if (program.target_abi != executable_target_abi(requested)) {
+        std::ostringstream message;
+        message << "binary target '" << program.target_name
+                << "' ABI does not match its embedded hardware configuration";
+        throw std::invalid_argument(message.str());
+    }
+
+    const auto require_exact = [&](const char* field, std::uint32_t value,
+                                   std::uint32_t available) {
+        if (value == available) return;
+        std::ostringstream message;
+        message << "CModel hardware mismatch for " << field
+                << ": executable requires " << value
+                << ", CModel implements " << available;
+        throw std::invalid_argument(message.str());
+    };
+    const auto require_capacity = [&](const char* field, std::uint32_t value,
+                                      std::uint32_t available) {
+        if (value != 0 && value <= available) return;
+        std::ostringstream message;
+        message << "CModel capacity mismatch for " << field
+                << ": executable requires " << value
+                << ", CModel provides " << available;
+        throw std::invalid_argument(message.str());
+    };
+    const auto require_capability = [&](const char* field, std::uint32_t value,
+                                        std::uint32_t available) {
+        if (value <= available) return;
+        std::ostringstream message;
+        message << "CModel capability mismatch for " << field
+                << ": executable requires " << value
+                << ", CModel provides " << available;
+        throw std::invalid_argument(message.str());
+    };
+
+#define REQUIRE_EXACT(field) \
+    require_exact(#field, requested.field, physical.field)
+    REQUIRE_EXACT(hemispheres);
+    REQUIRE_EXACT(slices_per_hemisphere);
+    REQUIRE_EXACT(banks_per_slice);
+    REQUIRE_EXACT(words_per_bank);
+    REQUIRE_EXACT(bytes_per_word);
+    REQUIRE_EXACT(sram_read_ports_per_slice);
+    REQUIRE_EXACT(sram_write_ports_per_slice);
+    REQUIRE_EXACT(streams_per_direction);
+    REQUIRE_EXACT(encoded_streams);
+    REQUIRE_EXACT(mem_boundary_register_columns);
+    REQUIRE_EXACT(system_register_columns);
+    REQUIRE_EXACT(mem_slices_per_register_group);
+    REQUIRE_EXACT(tile_rows);
+    REQUIRE_EXACT(lanes_per_tile);
+    REQUIRE_EXACT(mem_read_bytes_per_cycle);
+    REQUIRE_EXACT(mem_write_bytes_per_cycle);
+    REQUIRE_EXACT(mxm_rows);
+    REQUIRE_EXACT(mxm_columns);
+    REQUIRE_EXACT(mxm_load_streams_per_cycle);
+    REQUIRE_EXACT(mxm_int8_load_streams_per_cycle);
+    REQUIRE_EXACT(mxm_load_bytes_per_cycle);
+    REQUIRE_EXACT(mxm_activation_streams);
+    REQUIRE_EXACT(mxm_result_streams);
+    REQUIRE_EXACT(mxm_pipeline_rows);
+    REQUIRE_EXACT(mxm_block_rows);
+    REQUIRE_EXACT(mxm_local_load_to_compute_latency);
+    REQUIRE_EXACT(mxm_block_group_interval);
+    REQUIRE_EXACT(mxm_earliest_iw_cycle);
+    REQUIRE_EXACT(qk_iw_to_compute_latency);
+    REQUIRE_EXACT(vxm_weight_to_iw_latency);
+    REQUIRE_EXACT(mem_to_sxm_latency);
+    REQUIRE_EXACT(mem_to_mxm_latency);
+    REQUIRE_EXACT(mxm0_accumulator_latency);
+    REQUIRE_EXACT(mxm1_accumulator_latency);
+    REQUIRE_EXACT(accumulator_to_vxm_latency);
+    REQUIRE_EXACT(accumulator_read_to_vxm_latency);
+    REQUIRE_EXACT(swiglu_write_latency);
+#undef REQUIRE_EXACT
+
+    require_capacity("sram_depth_rows", requested.sram_depth_rows,
+        physical.sram_depth_rows);
+    require_capacity("mxms_per_hemisphere", requested.mxms_per_hemisphere,
+        physical.mxms_per_hemisphere);
+    require_capacity("mxm_weight_buffers", requested.mxm_weight_buffers,
+        physical.mxm_weight_buffers);
+    require_capacity("vxm_alus", requested.vxm_alus, physical.vxm_alus);
+    require_capability("mxm_local_dequant_enabled",
+        requested.mxm_local_dequant_enabled,
+        physical.mxm_local_dequant_enabled);
+    require_capability("mxm_block_compute_enabled",
+        requested.mxm_block_compute_enabled,
+        physical.mxm_block_compute_enabled);
+    require_capability("mxm_weight_activation_overlap_enabled",
+        requested.mxm_weight_activation_overlap_enabled,
+        physical.mxm_weight_activation_overlap_enabled);
+}
+
 std::uint16_t encode_16bit_float(float value, BindingElementType type)
 {
     if (type == BindingElementType::BF16)
@@ -164,25 +262,23 @@ CModelRuntime::CModelRuntime(TspSliceSystem& system)
 
 void CModelRuntime::load(const BinaryProgram& program)
 {
-    const bool cmodelLargeSram =
-        program.target_name == "lpu32-cmodel-large-sram";
-    const std::uint64_t compatibleAbi =
-        lpu_32stream_target_abi(program.mxms_per_hemisphere);
-    if (program.target_abi != compatibleAbi
-        && !cmodelLargeSram) {
-        std::ostringstream message;
-        message << "CModel target ABI mismatch: binary target '"
-                << program.target_name << "' has 0x" << std::hex
-                << program.target_abi << ", runtime requires '"
-                << kLpu32StreamTargetName << "' ABI 0x"
-                << compatibleAbi;
-        throw std::invalid_argument(message.str());
-    }
+    validate_cmodel_hardware_config(program);
+    system_.configure_hardware(SystemHardwareConfiguration {
+        program.hardware.sram_depth_rows,
+        program.hardware.mxms_per_hemisphere,
+        program.hardware.mxm_weight_buffers,
+        program.hardware.vxm_alus,
+        program.hardware.mxm_local_dequant_enabled != 0,
+        program.hardware.mxm_block_compute_enabled != 0,
+        program.hardware.mxm_weight_activation_overlap_enabled != 0,
+    });
     system_.reset_execution_state();
     load_queue_programs_into_icu(program.queues, system_.icu(),
-        program.mxms_per_hemisphere);
+        program.hardware.mxms_per_hemisphere);
     loaded_max_cycle_ = program.max_cycle;
-    loaded_mxms_per_hemisphere_ = program.mxms_per_hemisphere;
+    loaded_mxms_per_hemisphere_ = program.hardware.mxms_per_hemisphere;
+    loaded_vxm_alus_ = program.hardware.vxm_alus;
+    datapath_performance_.reset();
     bindings_ = program.bindings;
     for (const BinaryBinding& binding : bindings_) {
         if (binding.access != BindingAccess::Internal) continue;
@@ -563,9 +659,9 @@ void CModelRuntime::upload_binding(
             == BindingLayout::W8A16Block8WeightWaveStriped
         && binding.element_type == BindingElementType::I8
         && binding.slices.size()
-            == hw::kMxmsPerHemisphere * 8) {
+            == loaded_mxms_per_hemisphere_ * 8) {
         const std::size_t columnsPerHemisphere =
-            hw::kMxmsPerHemisphere * 32;
+            loaded_mxms_per_hemisphere_ * 32;
         const std::size_t columnsPerWave =
             hw::kHemispheres * columnsPerHemisphere;
         if (rows % 32 != 0 || columns % columnsPerWave != 0)
@@ -848,6 +944,8 @@ void CModelRuntime::dispatch_icu_cycles(std::size_t cycles, std::ostream* log)
     for (std::size_t cycle = 0; cycle < count; ++cycle) {
         if (log != nullptr) system_.tick(*log);
         else system_.tick({});
+        datapath_performance_.sample(
+            system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
     }
 }
 
@@ -859,12 +957,21 @@ void CModelRuntime::run_cycles(std::size_t cycles, std::ostream* log)
     for (std::size_t cycle = 0; cycle < count; ++cycle) {
         try {
             system_.tick(sinks);
+            datapath_performance_.sample(
+                system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
         } catch (const std::exception& ex) {
             std::ostringstream message;
-            message << "CModel cycle " << cycle << ": " << ex.what();
+            message << "CModel global_cycle=" << system_.cycle()
+                    << " segment_cycle=" << cycle << ": " << ex.what();
             throw std::logic_error(message.str());
         }
     }
+}
+
+void CModelRuntime::print_datapath_performance(std::ostream& os) const
+{
+    datapath_performance_.print(
+        system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_, os);
 }
 
 } // namespace ftlpu::software::runtime

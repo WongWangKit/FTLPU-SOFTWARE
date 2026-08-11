@@ -8,17 +8,17 @@
 选择 16-stream Block8 路径。目前有两套经过验证的 Block8 策略：
 
 - `--ffn-schedule tail` 是正确性基线。它先完成全部 Gate/Up projection，
-  将每个 pair 写入独立 scratch，再于 cycle 16,574 发射第一条 SwiGLU；
-  程序结束于 cycle 33,681。
+  将每个 pair 写入独立 scratch，再执行 SwiGLU；最后一条 command 位于
+  cycle 27,348。
 - `--ffn-schedule fused` 将已完成 Gate/Up pair 的 SwiGLU 与后续 projection
   重叠。stream allocator 根据目标参数预留 projection 实际占用区间，再分配
-  不冲突的 VXM-to-MEM route，emitter 中没有固定高位 stream helper。程序结束
-  于 cycle 27,425，相对 tail 减少 6,256 cycles（18.57%）。
+  不冲突的 VXM-to-MEM route，emitter 中没有固定高位 stream helper。最后一条
+  command 位于 cycle 21,092，相对 tail 减少 6,256 个调度周期。
 
-runtime 包含末尾 64 个 drain cycles，tail 与 fused 分别采样 33,745 和
-27,489 cycles。两者的 MEM issue utilization 为 16.89% / 20.74%，MXM
-compute issue utilization 为 32.08% / 39.38%，VXM issue utilization 为
-23.33% / 28.64%。两套 binary 均与 CPU reference 的 73,728 个 BF16 数值
+runtime 包含末尾 64 个 drain cycles，tail 与 fused 分别采样 27,412 和
+21,156 cycles。两者的 MEM issue utilization 为 28.74% / 37.23%，MXM
+compute issue utilization 为 75.65% / 98.01%，VXM issue utilization 为
+15.41% / 19.97%。两套 binary 均与 CPU reference 的 73,728 个 BF16 数值
 逐一一致，其中 72,625 个输出非零，最大绝对值为 0.216797。
 
 Tensor lowering 现在为 Gate weight、Up weight 和 Block8 activation 分配三组
@@ -35,11 +35,63 @@ stream-fabric transport lifetime 尚未精确建模，编译器还不能证明�
 
 ![融合调度的 seq_len=128 FFN 流水线](smollm2_ffn_fused_pipeline.svg)
 
+## 当前 Block8 测量
+
+本次测量使用 `cmodel_block8_1mxm.json`：每个半球一个支持 Block8 的 MXM、
+16 条 activation stream、16 个 VXM ALU，以及每半球 52 个 MEM slice。
+历史 Vector 数据不再重跑，原样保留。它使用每半球两个 MXM 和较早的
+stream-fabric 拓扑，因此跨模式加速比可作为端到端参考，不能解释为只改变
+Block8 微架构得到的孤立收益。
+
+| 模式 | 每半球 MXM 数 | Tail 采样周期 | Fused 采样周期 | Fused 降幅 |
+| --- | ---: | ---: | ---: | ---: |
+| Vector，历史归档 | 2 | 92,637 | 86,749 | 6.36% |
+| Block8，当前 | 1 | 27,412 | 21,156 | 22.82% |
+
+与相同调度策略的历史 Vector 结果相比，当前 Block8 的 tail 周期减少 70.41%
+（加速 3.379 倍），fused 周期减少 75.61%（加速 4.100 倍）。
+
+| ICU queue 组 | Block8 tail issue util. | Block8 fused issue util. |
+| --- | ---: | ---: |
+| MEM | 28.74% | 37.23% |
+| MXM load | 18.91% | 24.50% |
+| MXM compute | 75.65% | 98.01% |
+| MXM dequant | 18.91% | 24.50% |
+| VXM | 15.41% | 19.97% |
+
+| MXM datapath | 策略 | Active cycles | Array util. | Active density | Peak cells |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 东半球 MXM0 | tail | 20,748 | 75.65% | 99.94% | 16/16 |
+| 西半球 MXM0 | tail | 20,748 | 75.65% | 99.94% | 16/16 |
+| 东半球 MXM0 | fused | 20,748 | 98.01% | 99.94% | 16/16 |
+| 西半球 MXM0 | fused | 20,748 | 98.01% | 99.94% | 16/16 |
+
+| VXM datapath | 全程序利用率 | 有效运算利用率 | Active density | Peak slots |
+| --- | ---: | ---: | ---: | ---: |
+| tail | 15.41% | 11.21% | 64.65% | 352/512 |
+| fused | 19.97% | 14.52% | 59.04% | 352/512 |
+
+“全程序利用率”包含 VXM `Pass` 传输指令；“有效运算利用率”排除这些直通
+slot，只统计实际算术 ALU 工作。
+
+| SR fabric | 策略 | 全程序利用率 | Active density | Peak staged bytes/cycle |
+| --- | --- | ---: | ---: | ---: |
+| 东半球 | tail | 14.87% | 14.90% | 11,272/28,672 |
+| 西半球 | tail | 14.87% | 14.90% | 11,272/28,672 |
+| 东半球 | fused | 19.26% | 19.32% | 11,272/28,672 |
+| 西半球 | fused | 19.26% | 19.32% | 11,272/28,672 |
+
+容量归一化和汇总由 runtime 完成。CModel 只暴露每周期 MXM、VXM 和
+stream-fabric 原始活动，因此开启统计不会改变 queue 调度或 datapath 行为。
+
 ## 历史 legacy 测量
 
 下表是早期 legacy fused 实验的归档数据，不代表上面的当前 Block8 策略。
 统计包含 runtime 末尾的 64 个 drain cycles，因此 tail 共采样
-92,637 cycles，fused 共采样 86,749 cycles。`array utilization` 的分母是
+92,637 cycles，fused 共采样 86,749 cycles。这些数值在本次更新中原样保留，
+没有重新运行 Vector 性能测试。它们描述的也是旧版 Vector 实现：INT8 权重先在 VXM
+中执行 multiply/cast 反量化，再通过 16 条 stream 执行 IW；当前 MXM 本地反量化路径
+不会覆盖这些历史数据。`array utilization` 的分母是
 全部采样周期内的 MXM cell 容量；`active density` 会从分母中去掉完全空闲的周期。
 
 | MXM | Active cycles（tail/fused） | Tail array util. | Fused array util. | Tail active density | Fused active density |
@@ -92,8 +144,13 @@ buffer 0/1。每个 block 连续发射 32 行 MXM compute，行发射占用率�
 在 CModel 扁平化的 88 条 MEM queue 视图中，东半球 queue 为 `local_slice`，西半球
 queue 为 `44 + local_slice`。
 
-编译器现在为 Gate/Up 保留两条完整执行路径。`legacy` 使用下图所示的双 byte-stream
-vector compute；当 BF16 activation、INT8 weight 和目标能力满足约束时，`auto` 会选择
+编译器现在将 compute mode 与权重反量化位置作为两个独立选择。`legacy` 保留下图所示的
+双 byte-stream Vector compute；但当目标启用 `mxm_local_dequant_enabled` 时，原始 INT8
+权重通过 8 条 stream 从 MEM 直接进入 MXM，在 4 个 IW pulse 中由 MXM 本地反量化，
+不再生成 VXM weight multiply/cast。权重占用 `E0..E15`，Vector activation 使用互不
+重叠的 `E16+`。同一个 MXM weight buffer 只有在前一次 32-row compute issue 窗口及其
+pipeline drain 都完成后才能复用；不支持该能力的目标仍回退到 VXM。当 BF16 activation、
+INT8 weight 和目标能力满足约束时，`auto` 会选择
 Block8：16 条分布式 activation stream 每次携带 8 行数据，同一组 `E0..E15` 会同时
 广播给东西半球的 Gate 和 Up MXM，连续 4 次 Block8 issue 覆盖一个 32 行 token tile。
 原始权重通过 8 条 stream 输入，并在各 MXM 内部完成反量化和 IW。
@@ -120,13 +177,16 @@ accumulator tile 的 `P0..P17`，以及累加状态 `S0..S17`；西半球采用�
 `SiLU(gate) * up`。结果在 `t+5` 转成 FP16，并在计入传输和 MEM 布局延迟后写入
 local hidden slices 21/22/23/29。
 
-单个 32x32 MXM weight tile 的 dequantization 只占用 4 个发射周期：VXM 每周期处理
-8 列。Gate/Up 与 East/West 一共形成 4 个独立 weight tile。由于它们共享同一组 16 条
-VXM ALU ICU queue，当前排程将四组 dequant 错开发射，合计形成 16-cycle 的发射窗口；
-这是四次很快的 dequant，而不是一次 dequant 需要 16 cycles。Down 也使用相同的
-连续 4-cycle dequant 和 16-stream IW load，包括与上一个 reduction 最后一个 M tile
-重叠的 weight prefetch。Activation 只在实际 IW 冲突窗口内于 `E0/E1` 和
-`E16/E17` 之间切换。
+在当前本地反量化目标上，一个 32x32 INT8 weight tile 使用 4 个 MXM dequant/IW 发射
+周期，8 条 INT8 stream 每周期提供一个 8-column pulse。Gate 和 Up 使用独立的物理
+slice placement，Up binding 不会再通过 Gate 的 slice 列表读取。两个 weight buffer
+交替工作；同 buffer 的 IW 会等待上一轮 Vector compute pipeline 排空，但仍会在下一轮
+compute 之前完成。旧流水图和历史 Vector 利用率表展示的是早期 VXM 反量化路径，该路径
+目前只作为无本地反量化能力时的回退。
+
+当前 `seq_len=32` Vector-tail binary 已通过 CModel 数值验证：18,432 个 BF16 输出全部
+匹配，设备与 reference 两侧均有 18,158 个非零值，`max_cycle=35,030`。该验证不用于
+替换上面的 `seq_len=128` 历史性能数据。
 
 第二张图使用一条连续时间轴展示 projection 完成到首个 SwiGLU 的过程。在 tail 图中，
 所有 Gate/Up projection pair 完成后，最后一个 partial 保留在 accumulator SRAM，

@@ -152,6 +152,7 @@ python compiler/tests/smollm2_attention_binary_runtime_test.py `
   --translate build-ftlpu-vs2026/compiler/ftlpu-translate.exe `
   --runtime-test build-ftlpu-vs2026/runtime/compiled_smollm2_attention_runtime_test.exe `
   --input compiler/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir `
+  --target-config compiler/tests/Inputs/cmodel_block8_1mxm.json `
   --output-dir build-ftlpu-vs2026/compiler/ftlpu_lower/smollm2_attention_pipeline
 ```
 

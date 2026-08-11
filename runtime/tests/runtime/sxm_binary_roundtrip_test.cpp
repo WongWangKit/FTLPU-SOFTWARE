@@ -34,9 +34,9 @@ try {
     icu_program.emit_sxm_transpose(7, Hemisphere::East, transpose);
 
     BinaryProgram program;
-    program.mxms_per_hemisphere = 1;
+    program.hardware.mxms_per_hemisphere = 1;
     program.target_abi = lpu_32stream_target_abi(
-        program.mxms_per_hemisphere);
+        program.hardware.mxms_per_hemisphere);
     program.memory_floors.push_back({1, 7, 8192});
     BinaryBinding binding;
     binding.index = 3;
@@ -76,7 +76,7 @@ try {
         "target name was not preserved");
     require(decoded.target_abi == lpu_32stream_target_abi(1),
         "target ABI was not preserved");
-    require(decoded.mxms_per_hemisphere == 1,
+    require(decoded.hardware.mxms_per_hemisphere == 1,
         "logical MXM topology was not preserved");
     require(decoded.memory_floors.size() == 1
             && decoded.memory_floors[0].hemisphere == 1
@@ -127,6 +127,46 @@ try {
     auto system = std::make_unique<TspSliceSystem>();
     CModelRuntime runtime(*system);
     runtime.load(decoded);
+    require(system->hardware_configuration().mxms_per_hemisphere == 1,
+        "CModel instance did not select the executable MXM topology");
+
+    auto legacy = decoded;
+    legacy.target_name = "test-owned-legacy-hardware";
+    legacy.hardware.mxms_per_hemisphere = 2;
+    legacy.hardware.mxm_local_dequant_enabled = 0;
+    legacy.hardware.mxm_block_compute_enabled = 0;
+    legacy.target_abi = executable_target_abi(legacy.hardware);
+    runtime.load(legacy);
+    require(system->hardware_configuration().mxms_per_hemisphere == 2
+            && !system->hardware_configuration().mxm_block_compute_enabled,
+        "CModel instance did not select the legacy test configuration");
+
+    auto oversized = decoded;
+    oversized.hardware.mxms_per_hemisphere =
+        static_cast<std::uint32_t>(hw::kMxmsPerHemisphere + 1);
+    oversized.target_abi = executable_target_abi(oversized.hardware);
+    bool oversized_rejected = false;
+    try {
+        runtime.load(oversized);
+    } catch (const std::invalid_argument&) {
+        oversized_rejected = true;
+    }
+    require(oversized_rejected,
+        "CModel runtime accepted a topology beyond physical capacity");
+
+    auto shallow_sram = decoded;
+    shallow_sram.hardware.sram_depth_rows = 1024;
+    shallow_sram.target_abi = executable_target_abi(shallow_sram.hardware);
+    runtime.load(shallow_sram);
+    bool row_rejected = false;
+    try {
+        system->initialize_mem_sram_lane_byte(
+            Hemisphere::East, 0, 0, 1024, 0, 1);
+    } catch (const std::out_of_range&) {
+        row_rejected = true;
+    }
+    require(row_rejected,
+        "CModel SRAM did not enforce the test-selected logical depth");
     std::cout << "sxm_binary_roundtrip_test passed\n";
     return 0;
 } catch (const std::exception& ex) {

@@ -51,8 +51,11 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
 {
     if (mlir::failed(ffn.task_plan.tasks.validate())
         || !target.supports_w8a16_ffn_shape(
-            ffn.getM(), ffn.getK(), ffn.getHidden(), ffn.getN()))
+            ffn.getM(), ffn.getK(), ffn.getHidden(), ffn.getN())) {
+        ffn.getOperation()->emitError(
+            "FFN task DAG or target shape is invalid");
         return mlir::failure();
+    }
 
     auto activationRoute =
         ffn.getActivation().getDefiningOp<stream::RouteOp>();
@@ -62,8 +65,11 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         ffn.getDownWeight0().getDefiningOp<stream::RouteOp>();
     auto hiddenRoute = ffn.hidden0_route;
     if (!activationRoute || !gateRoute || !upRoute || !downRoute
-        || !hiddenRoute)
+        || !hiddenRoute) {
+        ffn.getOperation()->emitError(
+            "FFN schedule is missing a required stream route");
         return mlir::failure();
+    }
 
     const auto rawRoute = [](stream::RouteOp route) {
         auto dequant =
@@ -75,7 +81,11 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     auto gateRaw = rawRoute(gateRoute);
     auto upRaw = rawRoute(upRoute);
     auto downRaw = rawRoute(downRoute);
-    if (!gateRaw || !upRaw || !downRaw) return mlir::failure();
+    if (!gateRaw || !upRaw || !downRaw) {
+        ffn.getOperation()->emitError(
+            "FFN schedule cannot resolve raw weight routes");
+        return mlir::failure();
+    }
 
     auto weightSlices = get_slices(gateRaw.getPlacement());
     auto upWeightSlices = get_slices(upRaw.getPlacement());
@@ -90,7 +100,10 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     auto executionPolicy =
         target::mxm_execution_policy_from_operation(
             ffn.getOperation());
-    if (mlir::failed(executionPolicy)) return mlir::failure();
+    if (mlir::failed(executionPolicy)) {
+        ffn.getOperation()->emitError("invalid FFN MXM execution policy");
+        return mlir::failure();
+    }
     const auto activationType = llvm::cast<mlir::RankedTensorType>(
         ffn.getActivation().getType());
     auto execution = target::plan_mxm_execution_strategy(
@@ -99,7 +112,11 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
             static_cast<int64_t>(ffn.getHidden()),
             activationType.getElementType().isBF16(), true, true, true},
         target, *executionPolicy);
-    if (mlir::failed(execution)) return mlir::failure();
+    if (mlir::failed(execution)) {
+        ffn.getOperation()->emitError(
+            "cannot plan the FFN MXM execution strategy");
+        return mlir::failure();
+    }
     const bool block8Ffn = execution->uses_block8();
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
@@ -135,7 +152,11 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
             != static_cast<std::size_t>(
                 block8Ffn ? 16
                            : throughput.mxm_result_streams))
+    {
+        ffn.getOperation()->emitError(
+            "FFN physical slices do not match the selected MXM strategy");
         return mlir::failure();
+    }
 
     llvm::SmallVector<int64_t> gateAccumulatorSlices;
     llvm::SmallVector<int64_t> upAccumulatorSlices;
@@ -156,9 +177,12 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
             static_cast<int64_t>(ffn.getK()),
             static_cast<int64_t>(ffn.getHidden()),
             static_cast<int64_t>(ffn.getN())},
-        weightSlices, target);
-    if (!activationLatency || mlir::failed(projectionTimeline))
+        weightSlices, target, execution->uses_local_dequant());
+    if (!activationLatency || mlir::failed(projectionTimeline)) {
+        ffn.getOperation()->emitError(
+            "cannot plan FFN activation transport or projection timeline");
         return mlir::failure();
+    }
 
     const int64_t tile = throughput.mxm_rows;
     const int64_t projectionAccumulatorRows =
@@ -217,6 +241,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         *activationLatency,
         downAccumulatorBase,
         activationDistributed16,
+        execution->uses_local_dequant(),
         block8Ffn,
         block8Ffn,
         fusedOutput,

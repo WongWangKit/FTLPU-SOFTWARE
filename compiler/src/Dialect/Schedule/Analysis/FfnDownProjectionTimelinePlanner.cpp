@@ -93,6 +93,12 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
                     && mTile + 1 == projection.m_tile_count;
                 if (!tileSchedule.prefetch_next_weight) {
                     tileSchedule.segments.push_back({tile, 0});
+                } else if (target.supports_mxm_local_dequant()) {
+                    // Local INT8 weight input owns E0..E15 while the next
+                    // weight wave propagates to the MXMs. Keep the complete
+                    // activation wave on the disjoint upper stream bank.
+                    tileSchedule.segments.push_back(
+                        {tile, throughput.mxm_load_streams_per_cycle});
                 } else {
                     tileSchedule.segments.push_back(
                         {throughput.vxm_weight_to_iw_latency, 0});

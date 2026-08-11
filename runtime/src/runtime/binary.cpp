@@ -313,11 +313,18 @@ BinaryHeader read_header(ByteReader& reader)
         program.target_name.resize(target_name_size);
         reader.read_bytes(
             program.target_name.data(), program.target_name.size());
-        if (version >= 9)
-            program.memory_rows_per_slice =
-                reader.read<std::uint32_t>();
-        if (version >= 15)
-            program.mxms_per_hemisphere = reader.read<std::uint32_t>();
+        if (version >= 16) {
+            program.hardware.visit([&](std::uint32_t& value) {
+                value = reader.read<std::uint32_t>();
+            });
+        } else {
+            if (version >= 9)
+                program.hardware.sram_depth_rows =
+                    reader.read<std::uint32_t>();
+            if (version >= 15)
+                program.hardware.mxms_per_hemisphere =
+                    reader.read<std::uint32_t>();
+        }
     } else {
         program.target_name = "legacy-unidentified";
         program.target_abi = 0;
@@ -379,11 +386,15 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
     os.write(program.target_name.data(),
         static_cast<std::streamsize>(program.target_name.size()));
     if (!os) throw std::runtime_error("failed to write FTLPU target name");
-    write_scalar<std::uint32_t>(os, program.memory_rows_per_slice);
-    if (program.mxms_per_hemisphere == 0)
+    if (program.target_abi != executable_target_abi(program.hardware))
+        throw std::runtime_error(
+            "FTLPU target ABI does not match its hardware configuration");
+    if (program.hardware.mxms_per_hemisphere == 0)
         throw std::runtime_error(
             "FTLPU binary requires a nonzero MXM topology");
-    write_scalar<std::uint32_t>(os, program.mxms_per_hemisphere);
+    program.hardware.visit([&](std::uint32_t value) {
+        write_scalar<std::uint32_t>(os, value);
+    });
     write_scalar<std::uint64_t>(os, static_cast<std::uint64_t>(program.max_cycle));
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.queues.size()));
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.bindings.size()));
@@ -465,12 +476,18 @@ BinaryProgram read_binary_program(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 9)
-            program.memory_rows_per_slice =
-                read_scalar<std::uint32_t>(is);
-        if (version >= 15)
-            program.mxms_per_hemisphere =
-                read_scalar<std::uint32_t>(is);
+        if (version >= 16) {
+            program.hardware.visit([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+        } else {
+            if (version >= 9)
+                program.hardware.sram_depth_rows =
+                    read_scalar<std::uint32_t>(is);
+            if (version >= 15)
+                program.hardware.mxms_per_hemisphere =
+                    read_scalar<std::uint32_t>(is);
+        }
     } else {
         program.target_name = "legacy-unidentified";
         program.target_abi = 0;
@@ -582,12 +599,18 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 9)
-            program.memory_rows_per_slice =
-                read_scalar<std::uint32_t>(is);
-        if (version >= 15)
-            program.mxms_per_hemisphere =
-                read_scalar<std::uint32_t>(is);
+        if (version >= 16) {
+            program.hardware.visit([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+        } else {
+            if (version >= 9)
+                program.hardware.sram_depth_rows =
+                    read_scalar<std::uint32_t>(is);
+            if (version >= 15)
+                program.hardware.mxms_per_hemisphere =
+                    read_scalar<std::uint32_t>(is);
+        }
     } else {
         program.target_name = "legacy-unidentified";
         program.target_abi = 0;

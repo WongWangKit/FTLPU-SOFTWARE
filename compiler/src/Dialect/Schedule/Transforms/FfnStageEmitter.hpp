@@ -49,6 +49,7 @@ struct FfnEmissionContext {
     int64_t activation_latency;
     int64_t down_accumulator_base;
     bool activation_distributed16;
+    bool local_weight_dequant;
     bool block8_projection;
     bool block8_down;
     std::optional<stream::StreamBinding> fused_output;

@@ -316,7 +316,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 ? "fp16_mxm_block8_distributed_16"
                 : "fp16_pair_planar",
             block8_attention
-                ? target.mxm_distributed_activation_slices()
+                ? target.attention_output_activation_slices()
                 : target.attention_result_slices(),
             block8_attention
                 ? distributed_result_base

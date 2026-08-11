@@ -81,7 +81,8 @@ try {
     require(sawBlock8, "MXM Block8 compute mode was not preserved");
 
     InstructionControlUnit icu;
-    load_queue_programs_into_icu(program.queues, icu);
+    load_queue_programs_into_icu(program.queues, icu,
+        program.hardware.mxms_per_hemisphere);
     std::cout << "command_cmodel_compat_binary_test passed\n";
     return 0;
 } catch (const std::exception& ex) {

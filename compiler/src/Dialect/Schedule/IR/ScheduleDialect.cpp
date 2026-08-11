@@ -108,9 +108,14 @@ LogicalResult MxmLoadOp::verify()
         return failure();
     const llvm::StringRef loadMode =
         getWeightLoadMode().value_or("supercell");
+    const llvm::StringRef inputMode =
+        getWeightInputMode().value_or("direct16");
     const int64_t innerColumn = getWeightInnerColumn().value_or(0);
     const int64_t expectedStreams = loadMode == "column"
-        ? 2 : target.throughput().mxm_load_streams_per_cycle;
+        ? 2
+        : inputMode == "int8_dequant_bf16"
+            ? target.throughput().mxm_int8_load_streams_per_cycle
+            : target.throughput().mxm_load_streams_per_cycle;
     if ((loadMode != "supercell" && loadMode != "column")
         || getStreamCount() != expectedStreams)
         return emitOpError(
@@ -124,8 +129,6 @@ LogicalResult MxmLoadOp::verify()
         return emitOpError("unit_id must select MXM0 or MXM1");
     if (!target.is_valid_weight_buffer(getWeightBuffer()))
         return emitOpError("weight_buffer must select buffer 0 or 1");
-    const llvm::StringRef inputMode =
-        getWeightInputMode().value_or("direct16");
     if (inputMode != "direct16"
         && inputMode != "int8_dequant_bf16")
         return emitOpError(

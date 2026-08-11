@@ -96,9 +96,39 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             effectiveInputSlices.push_back(
                 llvm::cast<mlir::IntegerAttr>(slice).getInt());
     }
+    llvm::SmallVector<int64_t, 16> feedbackInputSlices;
+    if (strategy == RmsNormLoweringStrategy::VxmFeedback) {
+        for (int64_t slice = 0;
+             slice < memory.slices_per_hemisphere
+             && feedbackInputSlices.size() < 16;
+             ++slice) {
+            if (!llvm::is_contained(effectiveInputSlices, slice))
+                feedbackInputSlices.push_back(slice);
+        }
+        if (feedbackInputSlices.size() != 16) {
+            op.emitError(
+                "target does not provide 16 VXM feedback slices disjoint "
+                "from the RMSNorm input");
+            return mlir::failure();
+        }
+    }
     const auto plannedWeight = planner.lookup(op.getWeight());
-    const auto distributedWeightBindingSlices =
-        effectiveInputSlices;
+    llvm::SmallVector<int64_t, 16> distributedWeightBindingSlices;
+    for (int64_t slice = 0;
+         slice < memory.slices_per_hemisphere
+         && distributedWeightBindingSlices.size() < 16;
+         ++slice) {
+        if (!llvm::is_contained(effectiveInputSlices, slice)
+            && !llvm::is_contained(feedbackInputSlices, slice))
+            distributedWeightBindingSlices.push_back(slice);
+    }
+    if (strategy == RmsNormLoweringStrategy::VxmFeedback
+        && distributedWeightBindingSlices.size() != 16) {
+        op.emitError(
+            "target does not provide 16 gamma slices disjoint from the "
+            "RMSNorm input");
+        return mlir::failure();
+    }
     const Allocation weight =
         strategy == RmsNormLoweringStrategy::VxmFeedback
         ? fixed_allocation(PlacementKind::Activation,
@@ -114,23 +144,8 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
               "fp16_pair_planar", "both");
     llvm::SmallVector<Allocation> scratch;
     if (strategy == RmsNormLoweringStrategy::VxmFeedback) {
-        llvm::SmallVector<int64_t, 16> distributedSlices;
-        for (int64_t slice = 0;
-             slice < memory.slices_per_hemisphere
-             && distributedSlices.size() < 16;
-             ++slice) {
-            if (std::find(effectiveInputSlices.begin(),
-                    effectiveInputSlices.end(), slice)
-                == effectiveInputSlices.end())
-                distributedSlices.push_back(slice);
-        }
-        if (distributedSlices.size() != 16) {
-            op.emitError(
-                "target does not provide 16 VXM scratch slices disjoint "
-                "from MXM distributed activation");
-            return mlir::failure();
-        }
-        const auto distributedWeightSlices = effectiveInputSlices;
+        const auto distributedWeightSlices =
+            distributedWeightBindingSlices;
         const auto canonicalResultSlices =
             target.mxm_distributed_activation_slices();
         llvm::SmallVector<int64_t, 16> normalizedSlices;
@@ -152,7 +167,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         const int64_t packedRows = rows * hidden / 256;
         const int64_t packedWeightRows = hidden / 8;
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
-            distributedSlices, 4608, packedRows, matrixBytes,
+            feedbackInputSlices, 4608, packedRows, matrixBytes,
             "fp16_vxm_distributed_16", "both"));
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
             distributedWeightSlices, weight.base_row, packedWeightRows,
@@ -313,6 +328,27 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
                     occupiedSlices.end(), slice)
                 == occupiedSlices.end())
                 distributedSlices.push_back(slice);
+        }
+        if (feedsFeedbackRmsNorm && distributedSlices.size() != 16
+            && op.getRhs().hasOneUse()) {
+            const auto rhsPlacement =
+                llvm::cast<mlir::DictionaryAttr>((*rhsPlan)[0])
+                    .getAs<mlir::DictionaryAttr>("placement");
+            const auto rhsKind =
+                rhsPlacement.getAs<mlir::StringAttr>("kind");
+            const auto rhsSlices =
+                rhsPlacement.getAs<mlir::ArrayAttr>("slices");
+            if (rhsKind && rhsSlices && rhsSlices.size() == 16
+                && (rhsKind.getValue()
+                        == "fp16_mxm_distributed_16"
+                    || rhsKind.getValue()
+                        == "fp16_mxm_block8_distributed_16")) {
+                distributedSlices.clear();
+                for (mlir::Attribute slice : rhsSlices)
+                    distributedSlices.push_back(
+                        llvm::cast<mlir::IntegerAttr>(slice)
+                            .getInt());
+            }
         }
         if (feedsFeedbackRmsNorm && distributedSlices.size() != 16)
             return op.emitError(

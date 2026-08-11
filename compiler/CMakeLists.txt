@@ -288,6 +288,7 @@ if(Python3_Interpreter_FOUND)
                 --translate $<TARGET_FILE:ftlpu_translate>
                 --runtime-test $<TARGET_FILE:compiled_smollm2_lm_head_runtime_test>
                 --model-dir ${CMAKE_SOURCE_DIR}/.cache/hf/SmolLM2-135M
+                --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
                 --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_lm_head)
         set_tests_properties(
             smollm2_135m_real_int8_lm_head_cmodel_test
@@ -301,6 +302,7 @@ if(Python3_Interpreter_FOUND)
                 --translate $<TARGET_FILE:ftlpu_translate>
                 --runtime-test $<TARGET_FILE:compiled_smollm2_lm_head_runtime_test>
                 --model-dir ${CMAKE_SOURCE_DIR}/.cache/hf/SmolLM2-135M
+                --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
                 --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_lm_head
             DEPENDS
                 ftlpu_opt
@@ -358,7 +360,8 @@ if(Python3_Interpreter_FOUND)
             --translate $<TARGET_FILE:ftlpu_translate>
             --runtime-test $<TARGET_FILE:compiled_smollm2_135m_ffn_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn.stablehlo.mlir
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_binary_runtime)
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_binary_runtime
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json)
     add_test(
         NAME smollm2_135m_ffn_seq128_binary_cmodel_runtime_test
         COMMAND
@@ -368,7 +371,8 @@ if(Python3_Interpreter_FOUND)
             --translate $<TARGET_FILE:ftlpu_translate>
             --runtime-test $<TARGET_FILE:compiled_smollm2_135m_ffn_seq128_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn_seq128.stablehlo.mlir
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_seq128_binary_runtime)
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_seq128_binary_runtime
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json)
     add_test(
         NAME smollm2_135m_ffn_seq128_block8_binary_cmodel_runtime_test
         COMMAND
@@ -379,6 +383,7 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:compiled_smollm2_135m_ffn_seq128_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn_seq128.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_seq128_block8_binary_runtime
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
             --mxm-execution block8)
     add_test(
         NAME smollm2_135m_ffn_seq128_block8_fused_binary_cmodel_runtime_test
@@ -390,6 +395,7 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:compiled_smollm2_135m_ffn_seq128_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn_seq128.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_seq128_block8_fused_binary_runtime
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
             --mxm-execution block8
             --ffn-schedule fused)
     add_test(
@@ -443,6 +449,7 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:compiled_smollm2_attention_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_attention_binary_runtime
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
             --attention-schedule fused)
     add_test(
         NAME rmsnorm_binary_cmodel_runtime_test
@@ -453,7 +460,8 @@ if(Python3_Interpreter_FOUND)
             --translate $<TARGET_FILE:ftlpu_translate>
             --runtime-test $<TARGET_FILE:compiled_rmsnorm_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/rmsnorm/rmsnorm_128x576.stablehlo.mlir
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/rmsnorm_binary_runtime)
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/rmsnorm_binary_runtime
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json)
     add_test(
         NAME rmsnorm_feedback_binary_cmodel_runtime_test
         COMMAND
@@ -464,6 +472,7 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:compiled_rmsnorm_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/rmsnorm/rmsnorm_128x576.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/rmsnorm_feedback_binary_runtime
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
             --strategy vxm-feedback)
     add_test(
         NAME smollm2_decoder_layer_binary_cmodel_runtime_test
@@ -485,7 +494,7 @@ if(Python3_Interpreter_FOUND)
             --translate $<TARGET_FILE:ftlpu_translate>
             --runtime-test $<TARGET_FILE:compiled_smollm2_decoder_layer_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_decoder_layer/decoder_layer_seq128.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_decoder_layer_block8_binary_runtime
             --mxm-execution block8)
     add_custom_target(
@@ -608,6 +617,7 @@ if(Python3_Interpreter_FOUND)
             --translate $<TARGET_FILE:ftlpu_translate>
             --runtime-test $<TARGET_FILE:block8_linear_projection_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/block8_linear_projection.stablehlo.mlir
+            --block8-target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
             --legacy-target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/block8_linear_projection_e2e)
 endif()

@@ -41,7 +41,7 @@ BinaryProgram program(std::vector<std::uint16_t> weight_slices,
     std::vector<std::uint16_t> gamma_slices)
 {
     BinaryProgram result;
-    result.memory_rows_per_slice = 65536;
+    result.hardware.sram_depth_rows = 65536;
     result.bindings.push_back(binding(0, 0, 2304, gamma_slices,
         BindingElementType::F16, BindingLayout::Fp16MxmDistributed16,
         128 * 576 * 2, "activation"));

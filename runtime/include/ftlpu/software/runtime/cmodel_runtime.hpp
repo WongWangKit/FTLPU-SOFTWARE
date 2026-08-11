@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/performance.hpp"
 #include "ftlpu/system/tsp_slice_system.hpp"
 
 #include <cstddef>
@@ -26,6 +27,7 @@ public:
         const BinaryBinding& source, const BinaryBinding& destination);
     void dispatch_icu_cycles(std::size_t cycles, std::ostream* log = nullptr);
     void run_cycles(std::size_t cycles, std::ostream* log = nullptr);
+    void print_datapath_performance(std::ostream& os) const;
 
 private:
     const BinaryBinding& find_binding(BindingAccess access, std::size_t index) const;
@@ -33,7 +35,9 @@ private:
     TspSliceSystem& system_;
     std::size_t loaded_max_cycle_{0};
     std::size_t loaded_mxms_per_hemisphere_{hw::kMxmsPerHemisphere};
+    std::size_t loaded_vxm_alus_{16};
     std::vector<BinaryBinding> bindings_;
+    DatapathPerformanceMonitor datapath_performance_{};
 };
 
 } // namespace ftlpu::software::runtime

@@ -1,7 +1,8 @@
 {
   "name": "lpu32-cmodel-legacy-mxm",
   "throughput": {
-    "mxm_local_dequant_enabled": 0,
+    "mxms_per_hemisphere": 2,
+    "mxm_local_dequant_enabled": 1,
     "mxm_block_compute_enabled": 0
   }
 }

@@ -6,7 +6,7 @@ namespace ftlpu::compiler::schedule {
 
 mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     FfnScheduleShape shape, llvm::ArrayRef<int64_t> weightSlices,
-    const target::LPUTargetModel& target)
+    const target::LPUTargetModel& target, bool localWeightDequant)
 {
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
@@ -17,12 +17,19 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
         || throughput.lanes_per_tile <= 0)
         return mlir::failure();
 
-    const auto westLatency = [&](int64_t slice) {
+    const auto legacyWeightLatency = [&](int64_t slice) {
         return slice / target.streams().mem_slices_per_register_group + 2;
+    };
+    const auto weightLatency = [&](int64_t slice) {
+        if (!localWeightDequant) return legacyWeightLatency(slice);
+        return target.transport_latency(target::StreamEndpoint::Mem,
+                   target::StreamEndpoint::MxmWeight,
+                   target::StreamDirection::East, slice)
+            .value_or(legacyWeightLatency(slice));
     };
     int64_t maxWeightLatency = 0;
     for (int64_t slice : weightSlices)
-        maxWeightLatency = std::max(maxWeightLatency, westLatency(slice));
+        maxWeightLatency = std::max(maxWeightLatency, weightLatency(slice));
 
     FfnProjectionTimeline result;
     result.weight_load_cycles = tile / throughput.lanes_per_tile;
@@ -46,7 +53,19 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
                 + block.index * result.weight_block_interval
                 + pair * tile;
             block.dequant_start = block.weight_compute_cycle - tile;
-            block.weight_buffer = block.index % 2;
+            block.weight_buffer = block.index
+                % throughput.mxm_weight_buffers;
+            if (localWeightDequant
+                && block.index >= throughput.mxm_weight_buffers) {
+                const auto& previous = result.blocks[
+                    static_cast<std::size_t>(block.index
+                        - throughput.mxm_weight_buffers)];
+                const int64_t previousLastCompute =
+                    previous.tiles.back().compute_cycle;
+                block.dequant_start = std::max(block.dequant_start,
+                    previousLastCompute + tile
+                        + target.mxm_first_result_latency());
+            }
             block.final_reduction = reduction + 1 == reductionBlocks;
             const bool hasNextWeight = block.index + 1 < totalBlocks;
 
@@ -65,6 +84,11 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
                      hemisphere < memory.hemispheres; ++hemisphere) {
                     auto& segments = tileSchedule.hemisphere_segments[
                         static_cast<std::size_t>(hemisphere)];
+                    if (localWeightDequant) {
+                        segments.push_back(
+                            {tile, throughput.mxm_load_streams_per_cycle});
+                        continue;
+                    }
                     const int64_t nextWeightDistance =
                         tileSchedule.prefetch_next_weight
                         ? result.weight_block_interval
@@ -106,9 +130,9 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
         + memory.accumulator_slices_per_mxm;
     result.accumulator_queue_release = std::max(
         throughput.mxm0_accumulator_latency + tile
-            + westLatency(gateAccumulatorSlice),
+            + legacyWeightLatency(gateAccumulatorSlice),
         throughput.mxm1_accumulator_latency + tile
-            + westLatency(upAccumulatorSlice));
+            + legacyWeightLatency(upAccumulatorSlice));
     return result;
 }
 

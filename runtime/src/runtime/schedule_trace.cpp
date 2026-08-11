@@ -240,7 +240,7 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
                     if (repeat.interval == 1) {
                         write_event(output, first, last + 1,
                             describe(queue, *previous, repeat.address_stride,
-                                program.mxms_per_hemisphere), repeat.count,
+                                program.hardware.mxms_per_hemisphere), repeat.count,
                             repeat.interval, repeat.address_stride);
                     } else {
                         for (std::size_t index = 1; index <= repeat.count; ++index) {
@@ -249,7 +249,7 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
                                 describe(queue, *previous,
                                     static_cast<std::int64_t>(index)
                                         * repeat.address_stride,
-                                    program.mxms_per_hemisphere));
+                                    program.hardware.mxms_per_hemisphere));
                         }
                     }
                     cursor = last + 1;
@@ -259,7 +259,7 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
             if (opcode != isa::IcuCommandOpcode::Instruction)
                 throw std::logic_error("runtime trace found unsupported ICU command");
             const auto event = describe(
-                queue, command, 0, program.mxms_per_hemisphere);
+                queue, command, 0, program.hardware.mxms_per_hemisphere);
             write_event(output, cursor, cursor + 1, event);
             previous = &command;
             previous_cycle = cursor;

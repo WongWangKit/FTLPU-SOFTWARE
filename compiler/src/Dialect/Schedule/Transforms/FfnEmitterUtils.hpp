@@ -44,7 +44,7 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Type dequantizedType, llvm::ArrayRef<int64_t> weightSlices,
     const target::LPUTargetModel& target, float scale, int64_t startCycle,
     int64_t baseRow, int64_t hemisphere, int64_t localMxm,
-    int64_t unit, int64_t weightBuffer);
+    int64_t unit, int64_t weightBuffer, bool localDequant);
 
 mlir::Value emitFfnSwishRow(mlir::IRRewriter& rewriter,
     PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,

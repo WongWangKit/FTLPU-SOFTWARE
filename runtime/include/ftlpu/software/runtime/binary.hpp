@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 15;
+inline constexpr std::uint32_t kBinaryFormatVersion = 16;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -117,10 +117,7 @@ struct BinaryMemoryFloor {
 struct BinaryProgram {
     std::string target_name{std::string(kLpu32StreamTargetName)};
     std::uint64_t target_abi{kLpu32StreamTargetAbi};
-    std::uint32_t memory_rows_per_slice{65536};
-    // Logical topology used to number MXM queues in this executable. The
-    // runtime maps these queues onto the CModel's physical MXM topology.
-    std::uint32_t mxms_per_hemisphere{hw::kMxmsPerHemisphere};
+    ExecutableHardwareConfig hardware{};
     std::size_t max_cycle{0};
     std::vector<QueueProgram> queues{};
     std::vector<BinaryBinding> bindings{};

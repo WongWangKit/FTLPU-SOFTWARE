@@ -96,6 +96,9 @@ try {
     runtime.upload_input(2, up_w);
     runtime.upload_input(3, down_w);
     runtime.run_cycles(program.max_cycle + 64);
+    ftlpu::software::runtime::print_runtime_performance(
+        program, program.max_cycle + 64, std::cout);
+    runtime.print_datapath_performance(std::cout);
     const auto actual = runtime.download_output(0);
 
     std::vector<float> hidden(kIntermediate);
@@ -140,8 +143,6 @@ try {
     }
     if (actual_nonzero == 0 || expected_nonzero == 0)
         throw std::logic_error("SmolLM2 FFN numeric test unexpectedly produced only zero outputs");
-    ftlpu::software::runtime::print_runtime_performance(
-        program, program.max_cycle + 64, std::cout);
     std::cout << "SmolLM2-135M complete FFN passed: " << checked
               << " BF16 values, max_cycle=" << program.max_cycle
               << ", nonzero(actual/reference)=" << actual_nonzero << "/" << expected_nonzero

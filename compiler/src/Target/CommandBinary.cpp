@@ -773,10 +773,63 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     software::runtime::BinaryProgram program;
     program.target_name = target->name();
     program.target_abi = target->abi_fingerprint();
-    program.memory_rows_per_slice = static_cast<std::uint32_t>(
-        target->memory().sram_depth_rows);
-    program.mxms_per_hemisphere = static_cast<std::uint32_t>(
-        target->throughput().mxms_per_hemisphere);
+    auto& hardware = program.hardware;
+    const auto& memory = target->memory();
+    const auto& streams = target->streams();
+    const auto& throughput = target->throughput();
+#define COPY_MEMORY(field) \
+    hardware.field = static_cast<std::uint32_t>(memory.field)
+    COPY_MEMORY(hemispheres);
+    COPY_MEMORY(slices_per_hemisphere);
+    COPY_MEMORY(banks_per_slice);
+    COPY_MEMORY(words_per_bank);
+    COPY_MEMORY(bytes_per_word);
+    COPY_MEMORY(sram_depth_rows);
+    COPY_MEMORY(sram_read_ports_per_slice);
+    COPY_MEMORY(sram_write_ports_per_slice);
+#undef COPY_MEMORY
+#define COPY_STREAM(field) \
+    hardware.field = static_cast<std::uint32_t>(streams.field)
+    COPY_STREAM(streams_per_direction);
+    COPY_STREAM(encoded_streams);
+    COPY_STREAM(mem_boundary_register_columns);
+    COPY_STREAM(system_register_columns);
+    COPY_STREAM(mem_slices_per_register_group);
+#undef COPY_STREAM
+#define COPY_THROUGHPUT(field) \
+    hardware.field = static_cast<std::uint32_t>(throughput.field)
+    COPY_THROUGHPUT(tile_rows);
+    COPY_THROUGHPUT(lanes_per_tile);
+    COPY_THROUGHPUT(mem_read_bytes_per_cycle);
+    COPY_THROUGHPUT(mem_write_bytes_per_cycle);
+    COPY_THROUGHPUT(mxm_rows);
+    COPY_THROUGHPUT(mxm_columns);
+    COPY_THROUGHPUT(mxm_load_streams_per_cycle);
+    COPY_THROUGHPUT(mxm_int8_load_streams_per_cycle);
+    COPY_THROUGHPUT(mxm_load_bytes_per_cycle);
+    COPY_THROUGHPUT(mxm_activation_streams);
+    COPY_THROUGHPUT(mxm_result_streams);
+    COPY_THROUGHPUT(mxm_pipeline_rows);
+    COPY_THROUGHPUT(mxm_block_rows);
+    COPY_THROUGHPUT(mxm_local_dequant_enabled);
+    COPY_THROUGHPUT(mxm_block_compute_enabled);
+    COPY_THROUGHPUT(mxm_weight_activation_overlap_enabled);
+    COPY_THROUGHPUT(mxm_local_load_to_compute_latency);
+    COPY_THROUGHPUT(mxm_block_group_interval);
+    COPY_THROUGHPUT(mxm_earliest_iw_cycle);
+    COPY_THROUGHPUT(qk_iw_to_compute_latency);
+    COPY_THROUGHPUT(mxms_per_hemisphere);
+    COPY_THROUGHPUT(mxm_weight_buffers);
+    COPY_THROUGHPUT(vxm_alus);
+    COPY_THROUGHPUT(vxm_weight_to_iw_latency);
+    COPY_THROUGHPUT(mem_to_sxm_latency);
+    COPY_THROUGHPUT(mem_to_mxm_latency);
+    COPY_THROUGHPUT(mxm0_accumulator_latency);
+    COPY_THROUGHPUT(mxm1_accumulator_latency);
+    COPY_THROUGHPUT(accumulator_to_vxm_latency);
+    COPY_THROUGHPUT(accumulator_read_to_vxm_latency);
+    COPY_THROUGHPUT(swiglu_write_latency);
+#undef COPY_THROUGHPUT
     program.memory_floors = static_memory_floors(module,
         target->memory().slices_per_hemisphere,
         target->memory().sram_depth_rows);

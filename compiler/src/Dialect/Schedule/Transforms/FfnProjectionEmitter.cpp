@@ -54,8 +54,19 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         .getInt()
                     + (pair * (k / tile) + reduction)
                         * weightLoadCycles;
+                const auto rawType =
+                    llvm::cast<mlir::RankedTensorType>(
+                        raw.getInput().getType());
+                const auto activationType =
+                    llvm::cast<mlir::RankedTensorType>(
+                        ffn.getActivation().getType());
+                const auto dequantizedType =
+                    mlir::RankedTensorType::get(rawType.getShape(),
+                        activationType.getElementType());
                 emitFfnWeightTile(rewriter, ffn.getLoc(), raw,
-                    cooked.getInput().getType(), context.weight_slices,
+                    dequantizedType,
+                    localMxm == 0 ? context.weight_slices
+                                  : context.up_weight_slices,
                     target,
                     localMxm == 0
                         ? ffn.getGateScale().convertToFloat()
@@ -63,7 +74,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     start, base, hemisphere, localMxm,
                     hemisphere * throughput.mxms_per_hemisphere
                         + localMxm,
-                    weightBuffer);
+                    weightBuffer, context.local_weight_dequant);
             }
         }
 

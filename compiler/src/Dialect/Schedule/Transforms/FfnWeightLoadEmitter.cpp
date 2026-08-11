@@ -19,7 +19,7 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Type dequantizedType, llvm::ArrayRef<int64_t> weightSlices,
     const target::LPUTargetModel& target, float scale, int64_t startCycle,
     int64_t baseRow, int64_t hemisphere, int64_t localMxm,
-    int64_t unit, int64_t weightBuffer)
+    int64_t unit, int64_t weightBuffer, bool localDequant)
 {
     const auto& throughput = target.throughput();
     const int64_t duration =
@@ -31,6 +31,64 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
         llvm::cast<mlir::RankedTensorType>(
             dequantizedType).getElementType());
     mlir::Value readValue;
+
+    if (localDequant) {
+        const int64_t streamBase = localMxm
+            * throughput.mxm_int8_load_streams_per_cycle;
+        for (int64_t stream = 0;
+             stream < rawRoute.getStreamCount(); ++stream) {
+            const int64_t slice = weightSlices[stream];
+            const int64_t latency = target.transport_latency(
+                target::StreamEndpoint::Mem,
+                target::StreamEndpoint::MxmWeight,
+                target::StreamDirection::East, slice)
+                                        .value_or(
+                                            slice
+                                                    / target.streams()
+                                                          .mem_slices_per_register_group
+                                                + 2);
+            auto placement = schedule_placement(rewriter, {slice}, baseRow,
+                duration, 1, hemi, "schedule_slice");
+            mlir::NamedAttrList attributes(placement);
+            attributes.set("binding_placement", rawRoute.getPlacement());
+            auto read = rewriter.create<MemReadOp>(location,
+                rawRoute.getInput(), startCycle - latency, duration,
+                streamBase + stream, 1,
+                slice / target.streams().mem_slices_per_register_group + 1,
+                rewriter.getStringAttr("east"),
+                rewriter.getStringAttr("weight_i8"), rawRoute.getAddress(),
+                attributes.getDictionary(rewriter.getContext()),
+                duration * throughput.lanes_per_tile);
+            readValue = read.getOutput();
+        }
+
+        mlir::OperationState dequantState(
+            location, MxmDequantOp::getOperationName());
+        dequantState.addAttributes({
+            rewriter.getNamedAttr(
+                "cycle", rewriter.getI64IntegerAttr(startCycle)),
+            rewriter.getNamedAttr(
+                "unit_id", rewriter.getI64IntegerAttr(unit)),
+            rewriter.getNamedAttr(
+                "scale", rewriter.getF32FloatAttr(scale)),
+            rewriter.getNamedAttr(
+                "repeat_count", rewriter.getI64IntegerAttr(duration)),
+            rewriter.getNamedAttr(
+                "repeat_interval", rewriter.getI64IntegerAttr(1)),
+        });
+        rewriter.create(dequantState);
+
+        auto load = rewriter.create<MxmLoadOp>(location, readValue,
+            startCycle, duration, streamBase,
+            throughput.mxm_int8_load_streams_per_cycle, unit,
+            weightBuffer);
+        load->setAttr("data_format", rewriter.getStringAttr(dataFormat));
+        load->setAttr(
+            "weight_load_mode", rewriter.getStringAttr("supercell"));
+        load->setAttr("weight_input_mode",
+            rewriter.getStringAttr("int8_dequant_bf16"));
+        return load;
+    }
 
     for (int64_t stream = 0; stream < rawRoute.getStreamCount(); ++stream) {
         const int64_t slice = weightSlices[stream];

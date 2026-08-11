@@ -111,14 +111,26 @@ mlir::FailureOr<mlir::Value> schedule::lowerFfnSchedule(
 
     auto projection =
         schedule::ffn_detail::emitFfnProjection(**context);
-    if (mlir::failed(projection)) return mlir::failure();
+    if (mlir::failed(projection)) {
+        plan.getOperation()->emitError(
+            "failed to emit the FFN projection schedule");
+        return mlir::failure();
+    }
 
     auto swish = schedule::ffn_detail::emitFfnSwish(
         **context, std::move(*projection));
-    if (mlir::failed(swish)) return mlir::failure();
+    if (mlir::failed(swish)) {
+        plan.getOperation()->emitError(
+            "failed to emit the FFN Swish schedule");
+        return mlir::failure();
+    }
 
-    return schedule::ffn_detail::emitFfnDownProjection(
+    auto result = schedule::ffn_detail::emitFfnDownProjection(
         **context, *swish);
+    if (mlir::failed(result))
+        plan.getOperation()->emitError(
+            "failed to emit the FFN down-projection schedule");
+    return result;
 }
 
 } // namespace ftlpu::compiler
