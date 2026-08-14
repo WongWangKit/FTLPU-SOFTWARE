@@ -14,12 +14,6 @@
 namespace ftlpu::compiler {
 namespace {
 
-struct Reservation {
-    int64_t start;
-    int64_t end;
-    mlir::Operation* owner;
-};
-
 class ScheduleVerifier {
 public:
     explicit ScheduleVerifier(mlir::func::FuncOp function) : function_(function) {}
@@ -39,19 +33,18 @@ private:
         auto& reservations = resources_[resource];
         for (int64_t repeat = 0; repeat < repeatCount; ++repeat) {
             const int64_t cycle = start + repeat * repeatInterval;
-            const int64_t end = cycle + 1;
-            for (const Reservation& existing : reservations) {
-                if (cycle < existing.end && end > existing.start) {
-                    operation->emitError()
-                        << "resource '" << resource << "' overlaps at cycle "
-                        << cycle << " with " << existing.owner->getName()
-                        << "; current attributes " << operation->getAttrDictionary()
-                        << "; existing attributes "
-                        << existing.owner->getAttrDictionary();
-                    return mlir::WalkResult::interrupt();
-                }
+            auto [position, inserted] =
+                reservations.try_emplace(cycle, operation);
+            if (!inserted) {
+                operation->emitError()
+                    << "resource '" << resource << "' overlaps at cycle "
+                    << cycle << " with " << position->second->getName()
+                    << "; current attributes "
+                    << operation->getAttrDictionary()
+                    << "; existing attributes "
+                    << position->second->getAttrDictionary();
+                return mlir::WalkResult::interrupt();
             }
-            reservations.push_back({cycle, end, operation});
         }
         return mlir::WalkResult::advance();
     }
@@ -62,31 +55,61 @@ private:
             const std::string base = "mem."
                 + std::to_string(op.getHemisphere()) + "."
                 + std::to_string(op.getSlice()) + ".";
-            if (op.getOpcode() == "read" || op.getOpcode() == "read_write") {
-                auto result = reserve(operation, base + "read",
-                    op.getCycle(), op.getRepeatCount(),
-                    op.getRepeatInterval());
-                if (result.wasInterrupted()) return result;
+            for (int64_t wave = 0;
+                 wave < op.getWaveCount().value_or(1); ++wave) {
+                const int64_t cycle = op.getCycle()
+                    + wave * op.getWaveInterval().value_or(1);
+                if (op.getOpcode() == "read"
+                    || op.getOpcode() == "read_write") {
+                    auto result = reserve(operation, base + "read",
+                        cycle, op.getRepeatCount(),
+                        op.getRepeatInterval());
+                    if (result.wasInterrupted()) return result;
+                }
+                if (op.getOpcode() == "write"
+                    || op.getOpcode() == "write_tap"
+                    || op.getOpcode() == "read_write") {
+                    auto result = reserve(operation, base + "write",
+                        cycle, op.getRepeatCount(),
+                        op.getRepeatInterval());
+                    if (result.wasInterrupted()) return result;
+                }
             }
-            if (op.getOpcode() == "write" || op.getOpcode() == "write_tap"
-                || op.getOpcode() == "read_write")
-                return reserve(operation, base + "write",
-                    op.getCycle(), op.getRepeatCount(),
-                    op.getRepeatInterval());
             return mlir::WalkResult::advance();
         }
-        if (auto op = llvm::dyn_cast<schedule::MxmIssueOp>(operation))
-            return reserve(operation, "mxm." + op.getOpcode().str() + "."
-                    + std::to_string(op.getUnitId()),
-                op.getCycle(), op.getRepeatCount(), op.getRepeatInterval());
-        if (auto op = llvm::dyn_cast<schedule::MxmDequantOp>(operation))
-            return reserve(operation,
-                "mxm.dequant." + std::to_string(op.getUnitId()),
-                op.getCycle(), op.getRepeatCount(),
-                op.getRepeatInterval());
+        if (auto op = llvm::dyn_cast<schedule::MxmIssueOp>(operation)) {
+            const int64_t waveCount = op.getWaveCount().value_or(1);
+            const int64_t waveInterval = op.getWaveInterval().value_or(1);
+            const int64_t groupCount = op.getGroupCount().value_or(1);
+            const int64_t groupInterval = op.getGroupInterval().value_or(1);
+            for (int64_t group = 0; group < groupCount; ++group) {
+                for (int64_t wave = 0; wave < waveCount; ++wave) {
+                    auto result = reserve(operation,
+                        "mxm." + op.getOpcode().str() + "."
+                            + std::to_string(op.getUnitId()),
+                        op.getCycle() + group * groupInterval
+                            + wave * waveInterval,
+                        op.getRepeatCount(), op.getRepeatInterval());
+                    if (result.wasInterrupted()) return result;
+                }
+            }
+            return mlir::WalkResult::advance();
+        }
+        if (auto op = llvm::dyn_cast<schedule::MxmDequantOp>(operation)) {
+            for (int64_t wave = 0;
+                 wave < op.getWaveCount().value_or(1); ++wave) {
+                auto result = reserve(operation,
+                    "mxm.dequant." + std::to_string(op.getUnitId()),
+                    op.getCycle()
+                        + wave * op.getWaveInterval().value_or(1),
+                    op.getRepeatCount(), op.getRepeatInterval());
+                if (result.wasInterrupted()) return result;
+            }
+            return mlir::WalkResult::advance();
+        }
         if (auto op = llvm::dyn_cast<schedule::VxmOp>(operation))
             return reserve(operation, "vxm." + std::to_string(op.getQueue()),
-                op.getCycle(), op.getRepeatCount(), op.getRepeatInterval());
+                op.getCycle(), 1, 1);
         if (auto op = llvm::dyn_cast<schedule::SxmOp>(operation))
             return reserve(operation, "sxm." + op.getOpcode().str() + "."
                     + std::to_string(op.getHemisphere()),
@@ -102,7 +125,8 @@ private:
     }
 
     mlir::func::FuncOp function_;
-    std::unordered_map<std::string, std::vector<Reservation>> resources_;
+    std::unordered_map<std::string,
+        std::unordered_map<int64_t, mlir::Operation*>> resources_;
 };
 
 class VerifySchedulePass final

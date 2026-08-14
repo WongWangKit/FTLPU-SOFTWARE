@@ -57,7 +57,7 @@ bool is_state_binding(const ModelInvocation& invocation,
 }
 
 using PhysicalSlice =
-    std::tuple<std::uint64_t, std::uint16_t, std::uint16_t>;
+    std::tuple<std::uint64_t, std::uint16_t, std::uint16_t, std::uint16_t>;
 
 template <typename Callback>
 void for_each_physical_slice(const BinaryProgram& program,
@@ -67,7 +67,7 @@ void for_each_physical_slice(const BinaryProgram& program,
         if ((binding.hemisphere_mask & (1u << hemisphere)) == 0) continue;
         for (std::uint16_t slice : binding.slices)
             callback(PhysicalSlice {
-                program.target_abi, hemisphere, slice});
+                program.target_abi, hemisphere, slice, binding.bank});
     }
 }
 
@@ -106,7 +106,8 @@ bool bindings_physically_alias(
         && source.address_stride == destination.address_stride
         && source.shape == destination.shape
         && source.slices == destination.slices
-        && source.hemisphere_mask == destination.hemisphere_mask;
+        && source.hemisphere_mask == destination.hemisphere_mask
+        && source.bank == destination.bank;
 }
 
 SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
@@ -114,6 +115,22 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
     // Host LM heads execute after this device-only invocation plan.
     SessionMemoryPlan result;
     result.invocations.resize(package.invocations.size());
+    std::vector<std::unordered_set<std::string>> pagedInputs(
+        package.invocations.size());
+    for (std::size_t invocation = 0;
+         invocation < package.invocations.size(); ++invocation) {
+        const auto page = package.invocations[invocation].weight_page;
+        if (page == 0xffffffffu) continue;
+        pagedInputs[invocation].insert(
+            package.weight_pages.at(page).tensors.begin(),
+            package.weight_pages.at(page).tensors.end());
+    }
+    for (std::size_t page = 0; page < package.weight_pages.size(); ++page) {
+        const auto& source = package.weight_pages[page];
+        result.weight_pages.push_back(SessionMemoryPlan::WeightPage {
+            static_cast<std::uint32_t>(page), source.layer, source.bank,
+            source.tensors});
+    }
 
     struct Producer {
         std::size_t invocation{0};
@@ -164,7 +181,8 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
                 throw std::invalid_argument(
                     "binary MEM floor exceeds physical MEM");
             const PhysicalSlice slice {
-                program.target_abi, floor.hemisphere, floor.slice};
+                program.target_abi, floor.hemisphere, floor.slice,
+                floor.bank};
             reserved_floor[slice] = std::max<std::int64_t>(
                 reserved_floor[slice], floor.first_free_row);
         }
@@ -235,7 +253,9 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
         const BinaryProgram& program =
             package.executables.at(invocation.executable_index).program;
         for (const ModelBindingRef& input : invocation.inputs) {
-            if (!is_tensor(package, input.value)) continue;
+            if (!is_tensor(package, input.value)
+                || pagedInputs[invocation_index].contains(input.value))
+                continue;
             BinaryBinding resident = find_binding(
                 program, BindingAccess::Input, input.binding_index);
             const auto [begin, end] = binding_row_range(resident);
@@ -340,14 +360,15 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
             }
         }
         if (!allocated_begin) {
-            const auto [target, hemisphere, physical_slice] =
+            const auto [target, hemisphere, physical_slice, bank] =
                 physical_slices.front();
             std::ostringstream interval_details;
             for (const PhysicalSlice& slice : physical_slices) {
                 const auto [slice_target, slice_hemisphere,
-                    slice_index] = slice;
+                    slice_index, slice_bank] = slice;
                 if (slice_hemisphere != hemisphere) continue;
-                interval_details << " s" << slice_index << '=';
+                interval_details << " s" << slice_index
+                                 << "b" << slice_bank << '=';
                 for (const auto& [begin, end] : free_intervals.at(slice))
                     interval_details << '[' << begin << ',' << end << ')';
             }
@@ -357,6 +378,7 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
                 + " target_abi=" + std::to_string(target)
                 + " hemisphere=" + std::to_string(hemisphere)
                 + " slice=" + std::to_string(physical_slice)
+                + " bank=" + std::to_string(bank)
                 + " extent=" + std::to_string(request.extent)
                 + " requested_total="
                 + std::to_string(requested_rows[physical_slices.front()])
@@ -429,10 +451,21 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage& package)
                     throw std::invalid_argument(
                         "model invocation input has no available producer");
                 if (is_tensor(package, input.value)) {
-                    input_plan.transfer = SessionTransferKind::Resident;
-                    input_plan.resolved_binding =
-                        resolved_residents.at(
-                            {invocation_index, input.binding_index});
+                    if (pagedInputs[invocation_index].contains(input.value)) {
+                        input_plan.transfer = SessionTransferKind::WeightPage;
+                        input_plan.resolved_binding = destination;
+                        const auto& page = package.weight_pages.at(
+                            invocation.weight_page);
+                        if (destination.bank != page.bank)
+                            throw std::invalid_argument(
+                                "weight-page binding bank does not match "
+                                "the invocation page bank");
+                    } else {
+                        input_plan.transfer = SessionTransferKind::Resident;
+                        input_plan.resolved_binding =
+                            resolved_residents.at(
+                                {invocation_index, input.binding_index});
+                    }
                 } else {
                     input_plan.transfer = SessionTransferKind::HostUpload;
                 }

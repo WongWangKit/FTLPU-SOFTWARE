@@ -11,8 +11,11 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/Support/Format.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <optional>
 
@@ -144,9 +147,10 @@ public:
 
     LowerStreamToSchedulePass() = default;
     explicit LowerStreamToSchedulePass(FfnScheduleStrategy ffnStrategy,
-        AttentionScheduleStrategy attentionStrategy)
+        AttentionScheduleStrategy attentionStrategy, bool stageTiming)
         : ffn_strategy_(ffnStrategy)
         , attention_strategy_(attentionStrategy)
+        , stage_timing_(stageTiming)
     {
     }
 
@@ -173,12 +177,29 @@ public:
             return;
         }
         const target::LPUTargetModel& target = *target_model;
+        const auto passStart = std::chrono::steady_clock::now();
+        auto lastStage = passStart;
+        const auto reportStage = [&](llvm::StringRef name) {
+            if (!stage_timing_) return;
+            const auto now = std::chrono::steady_clock::now();
+            const double stageSeconds =
+                std::chrono::duration<double>(now - lastStage).count();
+            const double totalSeconds =
+                std::chrono::duration<double>(now - passStart).count();
+            llvm::errs() << "[ftlpu-stage-timing] " << name << ": "
+                         << llvm::format("%.3f", stageSeconds)
+                         << " s (total "
+                         << llvm::format("%.3f", totalSeconds) << " s)\n";
+            lastStage = now;
+        };
         auto primitive_ffns =
             schedule::collectPrimitiveFfnSchedulePlans(function);
         if (mlir::failed(primitive_ffns)) {
             signalPassFailure();
             return;
         }
+        reportStage("primitive-ffn-plan");
+        int64_t ffnIndex = 0;
         for (schedule::PrimitiveFfnSchedulePlan& ffn : *primitive_ffns) {
             rewriter.setInsertionPoint(ffn.add);
             auto result = schedule::lowerFfnSchedule(
@@ -198,60 +219,69 @@ public:
             rewriter.eraseOp(ffn.swish);
             rewriter.eraseOp(ffn.up);
             rewriter.eraseOp(ffn.gate);
+            if (stage_timing_)
+                reportStage("primitive-ffn-lower-"
+                    + std::to_string(ffnIndex));
+            ++ffnIndex;
         }
-
         if (mlir::failed(
                 schedule::lowerAttentionSchedules(
                     rewriter, function, target, attention_strategy_))) {
             signalPassFailure();
             return;
         }
-
+        reportStage("attention");
         if (mlir::failed(
                 schedule::lowerRmsNormSchedules(rewriter, function, target))) {
             signalPassFailure();
             return;
         }
-
+        reportStage("rmsnorm");
         if (mlir::failed(schedule::lowerLinearProjectionSchedules(
                 rewriter, function, target))) {
             signalPassFailure();
             return;
         }
-
+        reportStage("linear-projection");
         if (mlir::failed(schedule::lowerElementwiseSchedules(
                 rewriter, function, target))) {
             signalPassFailure();
             return;
         }
-
+        reportStage("elementwise");
         schedule::ResourceScheduler scheduler;
+        schedule::StreamFabricScheduler streamScheduler(
+            target.streams().system_register_columns,
+            target.streams().streams_per_direction);
         if (mlir::failed(schedule::lowerSwigluSchedules(
-                rewriter, function, target, scheduler))
+                rewriter, function, target, scheduler, streamScheduler))
             || mlir::failed(schedule::lowerMatmulSchedules(
-                rewriter, function, target, scheduler))) {
+                rewriter, function, target, scheduler, streamScheduler))) {
             signalPassFailure();
             return;
         }
+        reportStage("generic-kernels");
 
         assignMxmDataFormats(function);
         sequentializeScheduleStages(function);
+        reportStage("finalize");
     }
 
 private:
     FfnScheduleStrategy ffn_strategy_ = FfnScheduleStrategy::Tail;
     AttentionScheduleStrategy attention_strategy_ =
         AttentionScheduleStrategy::Tail;
+    bool stage_timing_ = false;
 };
 
 } // namespace
 
 std::unique_ptr<mlir::Pass> create_lower_stream_to_schedule_pass(
     FfnScheduleStrategy ffn_strategy,
-    AttentionScheduleStrategy attention_strategy)
+    AttentionScheduleStrategy attention_strategy, bool stage_timing)
 {
     return std::make_unique<LowerStreamToSchedulePass>(
-        ffn_strategy, attention_strategy);
+        ffn_strategy, attention_strategy, stage_timing);
 }
 
 } // namespace ftlpu::compiler

@@ -36,6 +36,7 @@ struct Allocation {
     int64_t bytes;
     std::string layout;
     std::string hemisphere;
+    int64_t bank = 0;
 };
 
 class RowAllocator {
@@ -114,7 +115,8 @@ Allocation fixed_allocation(PlacementKind kind,
 Allocation fixed_allocation(PlacementKind kind,
     llvm::ArrayRef<int64_t> slices, int64_t base_row,
     int64_t instruction_count, int64_t bytes,
-    llvm::StringRef layout, llvm::StringRef hemisphere);
+    llvm::StringRef layout, llvm::StringRef hemisphere,
+    int64_t bank = 0);
 bool is_w8a16_ffn(kernel::FfnGraph& graph,
     const target::LPUTargetModel& target);
 mlir::DictionaryAttr make_profile_placement(
@@ -132,20 +134,23 @@ mlir::FailureOr<mlir::DictionaryAttr> get_value_placement(
 mlir::DictionaryAttr make_attention_placement(
     mlir::OpBuilder& builder, llvm::StringRef kind,
     llvm::ArrayRef<int64_t> slices, int64_t base_row,
-    int64_t instruction_count, llvm::StringRef hemisphere);
+    int64_t instruction_count, llvm::StringRef hemisphere,
+    int64_t bank = 0);
 
 mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
-    const target::LPUTargetModel& target, mlir::IRRewriter& rewriter);
+    const target::LPUTargetModel& target, int64_t weight_bank,
+    mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const target::LPUTargetModel& target, EastMemoryAllocator& allocator,
-    AllocateValueFn allocate_value, mlir::IRRewriter& rewriter);
+    AllocateValueFn allocate_value, int64_t weight_bank,
+    mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_swiglu(kernel::SwigluOp op,
     EastMemoryAllocator& allocator, AllocateValueFn allocate_value,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const target::LPUTargetModel& target,
     RmsNormLoweringStrategy strategy, int64_t feedback_weight_base_row,
-    FunctionMemoryPlanner& planner,
+    int64_t weight_bank, FunctionMemoryPlanner& planner,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
     const target::LPUTargetModel& target,

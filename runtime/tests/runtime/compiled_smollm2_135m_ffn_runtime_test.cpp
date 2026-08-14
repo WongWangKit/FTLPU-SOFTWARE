@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -95,7 +96,34 @@ try {
     runtime.upload_input(1, gate_w);
     runtime.upload_input(2, up_w);
     runtime.upload_input(3, down_w);
-    runtime.run_cycles(program.max_cycle + 64);
+    std::ofstream cmodel_log;
+    std::ostream* cmodel_log_sink = nullptr;
+    if (const auto* path = std::getenv("FTLPU_CMODEL_LOG")) {
+        cmodel_log.open(path, std::ios::trunc);
+        if (!cmodel_log)
+            throw std::runtime_error("cannot open FTLPU_CMODEL_LOG path");
+        cmodel_log_sink = &cmodel_log;
+    }
+    const auto total_cycles = program.max_cycle + 64;
+    if (cmodel_log_sink != nullptr
+        && std::getenv("FTLPU_CMODEL_LOG_START") != nullptr) {
+        const auto log_start = std::min<std::uint64_t>(
+            std::strtoull(std::getenv("FTLPU_CMODEL_LOG_START"), nullptr, 10),
+            total_cycles);
+        const auto requested = std::getenv("FTLPU_CMODEL_LOG_CYCLES") != nullptr
+            ? std::strtoull(std::getenv("FTLPU_CMODEL_LOG_CYCLES"), nullptr, 10)
+            : 192;
+        const auto log_cycles = std::min<std::uint64_t>(
+            requested, total_cycles - log_start);
+        runtime.run_cycles(log_start);
+        runtime.run_cycles(log_cycles, cmodel_log_sink);
+        runtime.run_cycles(total_cycles - log_start - log_cycles);
+    } else if (cmodel_log_sink != nullptr && program.max_cycle > 128) {
+        runtime.run_cycles(program.max_cycle - 128);
+        runtime.run_cycles(192, cmodel_log_sink);
+    } else {
+        runtime.run_cycles(total_cycles, cmodel_log_sink);
+    }
     ftlpu::software::runtime::print_runtime_performance(
         program, program.max_cycle + 64, std::cout);
     runtime.print_datapath_performance(std::cout);
@@ -105,6 +133,7 @@ try {
     std::size_t checked = 0;
     std::size_t actual_nonzero = 0;
     std::size_t expected_nonzero = 0;
+    std::size_t mismatch_count = 0;
     float actual_max_abs = 0.0f;
     float expected_max_abs = 0.0f;
     float sample_actual[3] {};
@@ -133,14 +162,20 @@ try {
                     sample_expected[sample] = expected;
                 }
             }
-            if (std::fabs(observed - expected) > 0.004f)
-                throw std::logic_error("SmolLM2 FFN mismatch row=" + std::to_string(row)
-                    + " column=" + std::to_string(n) + " actual="
-                    + std::to_string(observed) + " expected="
-                    + std::to_string(expected));
+            if (std::fabs(observed - expected) > 0.004f) {
+                if (mismatch_count < 16)
+                    std::cerr << "mismatch row=" << row
+                              << " column=" << n
+                              << " actual=" << observed
+                              << " expected=" << expected << '\n';
+                ++mismatch_count;
+            }
             ++checked;
         }
     }
+    if (mismatch_count != 0)
+        throw std::logic_error("SmolLM2 FFN mismatch count="
+            + std::to_string(mismatch_count));
     if (actual_nonzero == 0 || expected_nonzero == 0)
         throw std::logic_error("SmolLM2 FFN numeric test unexpectedly produced only zero outputs");
     std::cout << "SmolLM2-135M complete FFN passed: " << checked

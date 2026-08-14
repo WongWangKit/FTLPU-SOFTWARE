@@ -16,7 +16,23 @@ void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t address,
     int64_t packedStream, int64_t repeatCount, int64_t repeatInterval,
     int64_t addressStride, llvm::StringRef destination = "sram",
-    int64_t addressBinding = -1);
+    int64_t addressBinding = -1, int64_t bank = -1);
+
+void emitMemWave(mlir::IRRewriter& rewriter, mlir::Location location,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    int64_t address, int64_t packedStream, int64_t repeatCount,
+    int64_t repeatInterval, int64_t addressStride,
+    llvm::StringRef destination, int64_t addressBinding,
+    int64_t waveCount, int64_t waveInterval,
+    int64_t waveAddressStride);
+
+void emitMemWave(mlir::IRRewriter& rewriter, mlir::Location location,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    int64_t address, int64_t packedStream, int64_t repeatCount,
+    int64_t repeatInterval, int64_t addressStride,
+    llvm::StringRef destination, int64_t addressBinding,
+    int64_t waveCount, int64_t waveInterval,
+    int64_t waveAddressStride, int64_t bank);
 
 void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t weightBuffer,
@@ -32,10 +48,30 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef computeMode = {},
     llvm::StringRef accumulatorOutputFormat = {});
 
+void emitMxmWave(mlir::IRRewriter& rewriter, mlir::Location location,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    int64_t weightBuffer, int64_t weightColumn,
+    int64_t activationStream, int64_t outputStream,
+    int64_t repeatCount, int64_t repeatInterval,
+    int64_t accumulatorAddress, int64_t accumulatorRowStride,
+    llvm::StringRef accumulatorDestination, bool accumulatorClear,
+    llvm::StringRef weightLoadMode, int64_t weightInnerColumn,
+    llvm::StringRef dataFormat, llvm::StringRef weightInputMode,
+    llvm::StringRef computeMode, llvm::StringRef accumulatorOutputFormat,
+    int64_t waveCount, int64_t waveInterval,
+    int64_t waveWeightColumnStride, int64_t groupCount = 1,
+    int64_t groupInterval = 1,
+    int64_t waveAccumulatorAddressStride = 0);
+
 void emitMxmDequant(mlir::IRRewriter& rewriter,
     mlir::Location location, int64_t cycle, int64_t unitId,
     float scale, int64_t repeatCount = 1,
     int64_t repeatInterval = 1);
+
+void emitMxmDequantWave(mlir::IRRewriter& rewriter,
+    mlir::Location location, int64_t cycle, int64_t unitId,
+    float scale, int64_t repeatCount, int64_t repeatInterval,
+    int64_t waveCount, int64_t waveInterval);
 
 using sxm_detail::blockDiagonalMap;
 using sxm_detail::emitSxm;

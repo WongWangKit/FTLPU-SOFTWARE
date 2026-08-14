@@ -62,20 +62,34 @@ def main() -> None:
                 raise RuntimeError(
                     f"Block8 FFN is missing Command IR marker: {marker}"
                 )
-        output_binding = re.search(
-            r'ftlpu\.command\.binding \{[^\n]*access = "output"[^\n]*'
-            r'base_row = 768 : i64[^\n]*'
-            r'kind = "fp16_mxm_block8_distributed_16"',
-            command_text,
-        )
-        if not output_binding:
-            raise RuntimeError(
-                "Block8 FFN output must start after the 768-row hidden region"
-            )
         binding_lines = [
             line for line in command_text.splitlines()
             if "ftlpu.command.binding" in line
         ]
+        output_binding = next(
+            (line for line in binding_lines
+             if 'access = "output"' in line
+             and 'kind = "fp16_mxm_block8_distributed_16"' in line),
+            None,
+        )
+        if not output_binding:
+            raise RuntimeError(
+                "Block8 FFN output must use distributed16 placement"
+            )
+        shape_match = re.search(
+            r'shape = \[(\d+), (\d+)\]', output_binding
+        )
+        if not shape_match:
+            raise RuntimeError("Block8 FFN output binding has no shape")
+        base_match = re.search(r'base_row = (\d+) : i64', output_binding)
+        if not base_match:
+            raise RuntimeError("Block8 FFN output binding has no base row")
+        sequence_length = int(shape_match.group(1))
+        expected_hidden_rows = (sequence_length // 32) * (1536 // 8)
+        if int(base_match.group(1)) < expected_hidden_rows:
+            raise RuntimeError(
+                "Block8 FFN output overlaps the shape-dependent hidden region"
+            )
         activation_binding = next(
             (line for line in binding_lines if 'name = "activation"' in line),
             None,
@@ -221,17 +235,23 @@ def main() -> None:
                 and int(re.search(r"cycle = (\d+) : i64", line).group(1))
                     < first_swiglu_cycle
             ]
-            # Each output pair emits Gate and Up for every token block on all
-            # physical MXMs. A command repeats over four 8-row result blocks.
+            # Count ICU compute commands across the compressed outer pair
+            # wave. The inner repeat is the four-block execution width of one
+            # command and is already represented in the expected formula.
             expected_stream_computes = (
                 24 * 4 * mxm_queue_count * 2
                 // mxms_per_hemisphere
             )
-            if len(final_stream_computes) != expected_stream_computes:
+            dynamic_stream_computes = 0
+            for line in final_stream_computes:
+                group = re.search(r"group_count = (\d+) : i64", line)
+                dynamic_stream_computes += (
+                    int(group.group(1)) if group else 1)
+            if dynamic_stream_computes != expected_stream_computes:
                 raise RuntimeError(
                     "Block8 tail must stream+clear every final Gate/Up "
                     f"partial: expected {expected_stream_computes}, got "
-                    f"{len(final_stream_computes)}"
+                    f"{dynamic_stream_computes}"
                 )
             output_bases = {
                 int(re.search(r"output_stream_base = (\d+) : i64", line)
@@ -296,11 +316,16 @@ def main() -> None:
         # 18 output blocks x 4 token blocks. Each command repeats over
         # the four 8-row token blocks produced by one Block8 issue.
         expected_down_stream_computes = 18 * 4
-        if len(down_stream_computes) != expected_down_stream_computes:
+        logical_down_stream_computes = sum(
+            int(match.group(1)) if (match := re.search(
+                r"group_count = (\d+) : i64", line)) else 1
+            for line in down_stream_computes
+        )
+        if logical_down_stream_computes != expected_down_stream_computes:
             raise RuntimeError(
                 "Block8 down must stream+clear every final partial: "
                 f"expected {expected_down_stream_computes}, got "
-                f"{len(down_stream_computes)}"
+                f"{logical_down_stream_computes}"
             )
         down_output_bases = {
             int(re.search(r"output_stream_base = (\d+) : i64", line)

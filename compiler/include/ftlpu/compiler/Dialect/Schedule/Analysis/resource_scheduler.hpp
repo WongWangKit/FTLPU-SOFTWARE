@@ -4,6 +4,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <unordered_map>
 
@@ -17,17 +18,17 @@ struct ResourceWindow {
 
 class ResourceScheduler {
 public:
+    int64_t find_earliest(int64_t earliest_cycle,
+        llvm::ArrayRef<ResourceWindow> windows) const;
+    bool is_free_at(int64_t cycle,
+        llvm::ArrayRef<ResourceWindow> windows) const;
     int64_t reserve(int64_t earliest_cycle, llvm::ArrayRef<ResourceWindow> windows);
     void reserve_at(int64_t cycle, llvm::ArrayRef<ResourceWindow> windows);
+    int64_t minimum_non_overlapping_shift(int64_t minimum_shift) const;
 
 private:
-    struct Reservation {
-        int64_t start;
-        int64_t end;
-    };
-
     bool is_free(const ResourceWindow& window, int64_t anchor) const;
-    std::unordered_map<std::string, llvm::SmallVector<Reservation, 32>> reservations_;
+    std::unordered_map<std::string, std::map<int64_t, int64_t>> reservations_;
 };
 
 } // namespace ftlpu::compiler::schedule

@@ -47,7 +47,7 @@ try {
         read_binary_program(std::filesystem::path(argv[1]));
     bool sawLocalDequant = false;
     bool sawBlock8Compute = false;
-    bool sawBlock8Read = false;
+    bool sawDirectBlock8Result = false;
     for (const QueueProgram& queue : program.queues) {
         for (const QueueCommand& command : queue.commands) {
             if (command.instruction_kind
@@ -67,14 +67,19 @@ try {
                 instruction.opcode == MxmControlOpcode::Compute
                 && instruction.compute_mode
                     == MxmComputeMode::Block8;
-            sawBlock8Read |=
-                instruction.opcode
-                    == MxmControlOpcode::AccumulatorRead
+            sawDirectBlock8Result |=
+                instruction.opcode == MxmControlOpcode::Compute
                 && instruction.compute_mode
-                    == MxmComputeMode::Block8;
+                    == MxmComputeMode::Block8
+                && instruction.accumulator_destination
+                    == MxmAccumulatorDestination::Stream
+                && instruction.accumulator_clear
+                && instruction.accumulator_output_format
+                    == MxmAccumulatorOutputFormat::BFloat16;
         }
     }
-    if (!sawLocalDequant || !sawBlock8Compute || !sawBlock8Read)
+    if (!sawLocalDequant || !sawBlock8Compute
+        || !sawDirectBlock8Result)
         throw std::logic_error(
             "binary did not preserve the selected MXM strategy");
 

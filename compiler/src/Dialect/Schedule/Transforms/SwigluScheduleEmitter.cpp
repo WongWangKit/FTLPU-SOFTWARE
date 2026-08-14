@@ -12,7 +12,7 @@ namespace ftlpu::compiler::schedule {
 
 mlir::LogicalResult lowerSwigluSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target,
-    ResourceScheduler& scheduler)
+    ResourceScheduler& scheduler, StreamFabricScheduler& streamScheduler)
 {
     llvm::SmallVector<stream::SwigluOp> swiglus;
     function.walk([&](stream::SwigluOp op) { swiglus.push_back(op); });
@@ -48,10 +48,33 @@ mlir::LogicalResult lowerSwigluSchedules(mlir::IRRewriter& rewriter,
                 windows.push_back({llvm::formatv("MXM.{0}.load", unit).str(), latency, *duration});
                 windows.push_back({llvm::formatv("MXM.{0}.weight_buffer.{1}", unit, buffer).str(),
                     latency, *duration});
-                add_stream_windows(windows, "east", route.getStreamBase(), route.getStreamCount(),
-                    0, latency + *duration);
-                const int64_t read_cycle = scheduler.reserve(
-                    std::max<int64_t>(0, target.mxm_earliest_iw_cycle() - latency), windows);
+                llvm::SmallVector<TimedStreamRoute> streamRoutes;
+                const auto token = streamScheduler.allocate_token_range(*duration);
+                for (int64_t index = 0;
+                     index < static_cast<int64_t>(slices.size()); ++index) {
+                    const int64_t slice = slices[index];
+                    const int64_t sliceLatency = *target.transport_latency(
+                        target::StreamEndpoint::Mem,
+                        target::StreamEndpoint::MxmWeight,
+                        target::StreamDirection::East, slice);
+                    StreamRouteWindow path;
+                    path.direction = target::StreamDirection::East;
+                    path.source_column = *target.stream_source_column(
+                        target::StreamEndpoint::Mem, path.direction, slice);
+                    path.destination_column = *target.stream_destination_column(
+                        target::StreamEndpoint::MxmWeight,
+                        path.direction, slice);
+                    path.stream_base = route.getStreamBase() + index;
+                    path.beat_count = *duration;
+                    path.token_id = token;
+                    streamRoutes.emplace_back(
+                        latency - sliceLatency, std::move(path));
+                }
+                const int64_t read_cycle = reserve_resources_and_streams(
+                    scheduler, streamScheduler,
+                    std::max<int64_t>(0,
+                        target.mxm_earliest_iw_cycle() - latency),
+                    windows, streamRoutes);
                 return WeightSchedule {read_cycle, read_cycle + latency, *duration};
             };
             const auto gate_schedule = schedule_weight(gate_route,
@@ -88,25 +111,79 @@ mlir::LogicalResult lowerSwigluSchedules(mlir::IRRewriter& rewriter,
             windows.push_back({llvm::formatv("MXM.{0}.weight_buffer.{1}",
                 swiglu.getUpUnitId(), swiglu.getUpWeightBuffer()).str(),
                 activation_latency, compute_duration});
-            add_stream_windows(windows, "east", activation_route.getStreamBase(), 1,
-                0, activation_latency + compute_duration);
-            add_stream_windows(windows, "west", swiglu.getGateOutputStreamBase(), 4,
-                result_offset, target.mxm_result_window_cycles(swiglu.getM()));
-            add_stream_windows(windows, "west", swiglu.getUpOutputStreamBase(), 4,
-                result_offset, target.mxm_result_window_cycles(swiglu.getM()));
             for (int64_t alu = 0; alu < 16; ++alu)
                 windows.push_back({llvm::formatv("VXM.alu.{0}", alu).str(),
                     result_offset, compute_duration + vxm_latency});
-            add_stream_windows(windows, "east", swiglu.getVxmOutputStream(), 1,
-                result_offset + vxm_latency,
-                compute_duration + swiglu.getOutputTransportLatency());
             const int64_t result_slice = get_slice(swiglu.getResultAddress());
             windows.push_back({mem_write_resource(result_slice), write_offset, *output_duration});
+            llvm::SmallVector<TimedStreamRoute> routes;
+            const auto activationToken =
+                streamScheduler.allocate_token_range(*activation_duration);
+            const auto activationSlices =
+                get_slices(activation_route.getPlacement());
+            const int64_t segmentRows[] = {
+                15, 4, swiglu.getMAttr().getInt() - 19};
+            const int64_t segmentStreams[] = {16, 30, 0};
+            int64_t activationOffset = 0;
+            for (int segment = 0; segment < 3; ++segment) {
+                if (segmentRows[segment] <= 0) continue;
+                for (int64_t slice : activationSlices) {
+                    StreamRouteWindow path;
+                    path.direction = target::StreamDirection::East;
+                    path.source_column = *target.stream_source_column(
+                        target::StreamEndpoint::Mem, path.direction, slice);
+                    path.destination_column = *target.stream_destination_column(
+                        target::StreamEndpoint::MxmActivation,
+                        path.direction, slice);
+                    path.stream_base = segmentStreams[segment];
+                    path.beat_count = segmentRows[segment];
+                    path.token_id = activationToken + activationOffset;
+                    routes.emplace_back(activationOffset, std::move(path));
+                }
+                activationOffset += segmentRows[segment];
+            }
+            for (const auto [streamBase, token] : {
+                     std::pair<int64_t, std::uint64_t> {
+                         swiglu.getGateOutputStreamBase(),
+                         streamScheduler.allocate_token_range(compute_duration)},
+                     std::pair<int64_t, std::uint64_t> {
+                         swiglu.getUpOutputStreamBase(),
+                         streamScheduler.allocate_token_range(compute_duration)}}) {
+                StreamRouteWindow path;
+                path.direction = target::StreamDirection::West;
+                path.source_column = *target.stream_source_column(
+                    target::StreamEndpoint::MxmResult,
+                    path.direction, result_slice);
+                path.destination_column = *target.stream_destination_column(
+                    target::StreamEndpoint::VxmInput,
+                    path.direction, result_slice);
+                path.stream_base = streamBase;
+                path.stream_count = 4;
+                path.beat_count = compute_duration;
+                path.token_id = token;
+                routes.emplace_back(result_offset, std::move(path));
+            }
+            StreamRouteWindow outputPath;
+            outputPath.direction = target::StreamDirection::East;
+            outputPath.source_column = *target.stream_source_column(
+                target::StreamEndpoint::VxmResult,
+                outputPath.direction, result_slice);
+            outputPath.destination_column = *target.stream_destination_column(
+                target::StreamEndpoint::Mem,
+                outputPath.direction, result_slice);
+            outputPath.stream_base = swiglu.getVxmOutputStream();
+            outputPath.beat_count = *output_duration;
+            outputPath.token_id =
+                streamScheduler.allocate_token_range(*output_duration);
+            routes.emplace_back(
+                result_offset + vxm_latency, std::move(outputPath));
             const int64_t loads_done = std::max(
                 gate_schedule->load_cycle + gate_schedule->duration,
                 up_schedule->load_cycle + up_schedule->duration);
-            const int64_t activation_read_cycle = scheduler.reserve(
-                std::max<int64_t>(0, loads_done - activation_latency), windows);
+            const int64_t activation_read_cycle = reserve_resources_and_streams(
+                scheduler, streamScheduler,
+                std::max<int64_t>(0, loads_done - activation_latency),
+                windows, routes);
             const int64_t compute_cycle = activation_read_cycle + activation_latency;
             const int64_t result_cycle = activation_read_cycle + result_offset;
 
@@ -171,6 +248,7 @@ mlir::LogicalResult lowerSwigluSchedules(mlir::IRRewriter& rewriter,
                     rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(result_cycle + stage)),
                     rewriter.getNamedAttr("queue", rewriter.getI64IntegerAttr(alu)),
                     rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
+                    rewriter.getNamedAttr("chain_depth", rewriter.getI64IntegerAttr(8)),
                     rewriter.getNamedAttr("lhs_kind", rewriter.getStringAttr(lhs_kind)),
                     rewriter.getNamedAttr("lhs_index", rewriter.getI64IntegerAttr(lhs_index)),
                     rewriter.getNamedAttr("lhs_immediate", rewriter.getF32FloatAttr(lhs_imm)),

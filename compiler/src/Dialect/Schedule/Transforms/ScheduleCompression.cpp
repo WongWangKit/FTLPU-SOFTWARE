@@ -76,7 +76,10 @@ bool same_vxm_body(schedule::VxmOp lhs, schedule::VxmOp rhs)
     for (llvm::StringRef name : {"queue", "opcode", "lhs_kind",
              "lhs_index", "lhs_immediate", "rhs_kind", "rhs_index",
              "rhs_immediate", "cast_target", "output_stream",
-             "input_hemisphere", "output_hemisphere", "scale_binding"})
+               "input_hemisphere", "output_hemisphere", "scale_binding",
+               "chain_depth",
+               "accumulator_reset", "accumulator_write", "accumulator_emit",
+             "local_scalar_write"})
         if (lhs->getAttr(name) != rhs->getAttr(name))
             return false;
     return lhs.getRepeatCount() == 1 && rhs.getRepeatCount() == 1
@@ -86,12 +89,40 @@ bool same_vxm_body(schedule::VxmOp lhs, schedule::VxmOp rhs)
 bool same_sxm_body(schedule::SxmOp lhs, schedule::SxmOp rhs)
 {
     for (llvm::StringRef name : {"hemisphere", "opcode",
-             "source_streams", "destination_streams", "permute_map",
-             "weight_layout"})
+               "source_streams", "destination_streams", "permute_map",
+               "weight_layout", "output_row", "input_row", "output_tile"})
         if (lhs->getAttr(name) != rhs->getAttr(name))
             return false;
     return lhs.getRepeatCount().value_or(1) == 1
         && rhs.getRepeatCount().value_or(1) == 1;
+}
+
+bool same_mxm_attributes(schedule::MxmIssueOp lhs,
+    schedule::MxmIssueOp rhs, bool ignoreWeightColumn,
+    bool ignoreGroup)
+{
+    for (mlir::NamedAttribute attribute : lhs->getAttrs()) {
+        const llvm::StringRef name = attribute.getName().strref();
+        if (name == "cycle"
+            || (ignoreWeightColumn && name == "weight_column")
+            || (ignoreGroup
+                && (name == "group_count"
+                    || name == "group_interval")))
+            continue;
+        if (rhs->getAttr(attribute.getName()) != attribute.getValue())
+            return false;
+    }
+    for (mlir::NamedAttribute attribute : rhs->getAttrs()) {
+        const llvm::StringRef name = attribute.getName().strref();
+        if (name == "cycle"
+            || (ignoreWeightColumn && name == "weight_column")
+            || (ignoreGroup
+                && (name == "group_count"
+                    || name == "group_interval")))
+            continue;
+        if (!lhs->hasAttr(attribute.getName())) return false;
+    }
+    return true;
 }
 
 class CompressSchedulePass final
@@ -210,6 +241,7 @@ public:
         }
 
         compressMemReads(function, *target, builder);
+        compressMxmIssues(function, *target, builder);
         compressVxm(function, builder);
         compressSxm(function, builder);
         function->setAttr(
@@ -217,6 +249,135 @@ public:
     }
 
 private:
+    void compressMxmIssues(mlir::func::FuncOp function,
+        const target::LPUTargetModel& target, mlir::Builder& builder)
+    {
+        llvm::SmallVector<schedule::MxmIssueOp> operations;
+        function.walk(
+            [&](schedule::MxmIssueOp op) { operations.push_back(op); });
+        llvm::sort(operations,
+            [](schedule::MxmIssueOp lhs, schedule::MxmIssueOp rhs) {
+                if (lhs.getUnitId() != rhs.getUnitId())
+                    return lhs.getUnitId() < rhs.getUnitId();
+                if (lhs.getOpcode() != rhs.getOpcode())
+                    return lhs.getOpcode() < rhs.getOpcode();
+                return lhs.getCycle() < rhs.getCycle();
+            });
+
+        // Form an IW column wave. Other MXM fields stay invariant and the
+        // hardware induction variable changes only the weight column.
+        llvm::SmallVector<schedule::MxmIssueOp> erased;
+        for (std::size_t index = 0; index < operations.size();) {
+            schedule::MxmIssueOp first = operations[index];
+            if (first.getOpcode() != "iw"
+                || first.getWaveCount().value_or(1) != 1
+                || first.getGroupCount().value_or(1) != 1
+                || index + 1 >= operations.size()) {
+                ++index;
+                continue;
+            }
+            schedule::MxmIssueOp second = operations[index + 1];
+            if (!same_mxm_attributes(first, second, true, false)) {
+                ++index;
+                continue;
+            }
+            const int64_t interval = second.getCycle() - first.getCycle();
+            const int64_t stride =
+                second.getWeightColumn() - first.getWeightColumn();
+            if (interval <= 0 || interval > kMaxRepeatInterval
+                || stride == 0) {
+                ++index;
+                continue;
+            }
+            std::size_t end = index + 2;
+            while (end < operations.size()
+                && static_cast<int64_t>(end - index) < kMaxRepeatCount) {
+                const int64_t wave = static_cast<int64_t>(end - index);
+                schedule::MxmIssueOp next = operations[end];
+                if (!same_mxm_attributes(first, next, true, false)
+                    || next.getCycle() != first.getCycle() + wave * interval
+                    || next.getWeightColumn()
+                        != first.getWeightColumn() + wave * stride)
+                    break;
+                ++end;
+            }
+            const int64_t count = static_cast<int64_t>(end - index);
+            const int64_t finalColumn = first.getWeightColumn()
+                + (count - 1) * stride;
+            if (finalColumn < 0
+                || finalColumn >= target.throughput().tile_rows) {
+                ++index;
+                continue;
+            }
+            first->setAttr(
+                "wave_count", builder.getI64IntegerAttr(count));
+            first->setAttr(
+                "wave_interval", builder.getI64IntegerAttr(interval));
+            first->setAttr("wave_weight_column_stride",
+                builder.getI64IntegerAttr(stride));
+            for (std::size_t erase = index + 1; erase < end; ++erase)
+                erased.push_back(operations[erase]);
+            index = end;
+        }
+        for (schedule::MxmIssueOp operation : erased)
+            operation.erase();
+
+        // Group equal issue bodies at a regular interval. A wave plus an
+        // existing inner repeat would require three hardware loop dimensions.
+        operations.clear();
+        function.walk(
+            [&](schedule::MxmIssueOp op) { operations.push_back(op); });
+        llvm::sort(operations,
+            [](schedule::MxmIssueOp lhs, schedule::MxmIssueOp rhs) {
+                if (lhs.getUnitId() != rhs.getUnitId())
+                    return lhs.getUnitId() < rhs.getUnitId();
+                if (lhs.getOpcode() != rhs.getOpcode())
+                    return lhs.getOpcode() < rhs.getOpcode();
+                return lhs.getCycle() < rhs.getCycle();
+            });
+        erased.clear();
+        for (std::size_t index = 0; index < operations.size();) {
+            schedule::MxmIssueOp first = operations[index];
+            if (first.getGroupCount().value_or(1) != 1
+                || (first.getWaveCount().value_or(1) > 1
+                    && first.getRepeatCount() > 1)
+                || index + 1 >= operations.size()) {
+                ++index;
+                continue;
+            }
+            schedule::MxmIssueOp second = operations[index + 1];
+            if (!same_mxm_attributes(first, second, false, true)) {
+                ++index;
+                continue;
+            }
+            const int64_t interval = second.getCycle() - first.getCycle();
+            if (interval <= 0) {
+                ++index;
+                continue;
+            }
+            std::size_t end = index + 2;
+            while (end < operations.size()
+                && static_cast<int64_t>(end - index) < kMaxRepeatCount) {
+                const int64_t group = static_cast<int64_t>(end - index);
+                schedule::MxmIssueOp next = operations[end];
+                if (!same_mxm_attributes(first, next, false, true)
+                    || next.getCycle()
+                        != first.getCycle() + group * interval)
+                    break;
+                ++end;
+            }
+            first->setAttr("group_count",
+                builder.getI64IntegerAttr(end - index));
+            first->setAttr(
+                "group_interval", builder.getI64IntegerAttr(interval));
+            for (std::size_t erase = index + 1; erase < end; ++erase)
+                erased.push_back(operations[erase]);
+            index = end;
+        }
+        for (schedule::MxmIssueOp operation : erased)
+            operation.erase();
+    }
+
     void compressMemReads(mlir::func::FuncOp function,
         const target::LPUTargetModel& target, mlir::Builder& builder)
     {
@@ -335,9 +496,11 @@ private:
                 ++index;
                 continue;
             }
-            const int64_t interval =
-                operations[end].getCycle() - first.getCycle();
-            if (interval <= 0 || interval > kMaxRepeatInterval) {
+              const int64_t interval =
+                  operations[end].getCycle() - first.getCycle();
+              // VXM repeat_count is a datapath hold count, not an ICU
+              // issue-loop with a programmable interval.
+              if (interval != 1) {
                 ++index;
                 continue;
             }

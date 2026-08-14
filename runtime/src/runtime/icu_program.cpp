@@ -60,14 +60,20 @@ QueueCommand encode_mxm_dequant_command(
     };
 }
 
-QueueCommand encode_vxm_command(const VxmLaneAluInstruction& instruction)
+QueueCommand encode_vxm_command(std::size_t queue,
+    VxmChainDepth depth, const VxmLaneAluInstruction& instruction)
 {
-    const auto encoded = isa::encode_vxm_instruction(instruction);
+    const auto encoded = isa::encode_vxm_instruction(queue, depth, instruction);
     return QueueCommand {
         kInstructionCommand,
         InstructionKind::Vxm,
-        4,
-        encoded.words,
+        3,
+        {
+            static_cast<std::uint32_t>(encoded.control),
+            static_cast<std::uint32_t>(encoded.control >> 32),
+            encoded.immediate_bits,
+            0,
+        },
     };
 }
 
@@ -77,7 +83,13 @@ QueueCommand encode_sxm_command(const SxmInstruction& instruction)
     command.words[0] = static_cast<std::uint32_t>(instruction.opcode);
     command.words[1] = static_cast<std::uint32_t>(instruction.shift_source);
     command.words[2] = static_cast<std::uint32_t>(instruction.shift_distance);
-    command.words[3] = 0;
+    command.words[3] =
+        (instruction.output_row == SxmInstruction::kAllOutputRows ? 0xffu
+            : static_cast<std::uint32_t>(instruction.output_row))
+        | ((instruction.input_row == SxmInstruction::kAllInputRows ? 0xffu
+            : static_cast<std::uint32_t>(instruction.input_row)) << 8)
+        | ((instruction.output_tile == SxmInstruction::kAllOutputTiles ? 0xffu
+            : static_cast<std::uint32_t>(instruction.output_tile)) << 16);
     command.extension_words.push_back(static_cast<std::uint32_t>(instruction.src_streams.size()));
     command.extension_words.push_back(static_cast<std::uint32_t>(instruction.dst_streams.size()));
     for (const auto stream : instruction.src_streams)
@@ -99,6 +111,15 @@ SxmInstruction decode_sxm_command(const QueueCommand& command)
     instruction.opcode = static_cast<SxmOpcode>(command.words[0]);
     instruction.shift_source = static_cast<SxmShiftSource>(command.words[1]);
     instruction.shift_distance = command.words[2];
+    const auto output_row = command.words[3] & 0xffu;
+    const auto input_row = (command.words[3] >> 8) & 0xffu;
+    const auto output_tile = (command.words[3] >> 16) & 0xffu;
+    instruction.output_row = output_row == 0xffu
+        ? SxmInstruction::kAllOutputRows : output_row;
+    instruction.input_row = input_row == 0xffu
+        ? SxmInstruction::kAllInputRows : input_row;
+    instruction.output_tile = output_tile == 0xffu
+        ? SxmInstruction::kAllOutputTiles : output_tile;
     const auto src_count = command.extension_words[0];
     const auto dst_count = command.extension_words[1];
     const std::size_t map_begin = 2 + src_count + dst_count;
@@ -241,11 +262,19 @@ void IcuProgram::emit_mxm_dequant(
     last_cycle_ = std::max(last_cycle_, cycle);
 }
 
-void IcuProgram::emit_vxm(std::size_t cycle, std::size_t alu, VxmLaneAluInstruction instruction)
+void IcuProgram::emit_vxm(std::size_t cycle, std::size_t alu,
+    VxmChainDepth depth, VxmLaneAluInstruction instruction)
 {
     check_vxm_alu(alu);
-    vxm_[alu].push_back(ScheduledInstruction<VxmLaneAluInstruction> {cycle, instruction});
+    vxm_[alu].push_back(ScheduledInstruction<VxmInstruction> {
+        cycle, VxmInstruction {depth, std::move(instruction)}});
     last_cycle_ = std::max(last_cycle_, cycle);
+}
+
+void IcuProgram::emit_vxm(std::size_t cycle, std::size_t alu,
+    VxmLaneAluInstruction instruction)
+{
+    emit_vxm(cycle, alu, VxmChainDepth::Eight, std::move(instruction));
 }
 
 void IcuProgram::emit_sxm_transpose(std::size_t cycle, Hemisphere hemisphere, SxmInstruction instruction)
@@ -301,7 +330,11 @@ std::vector<QueueProgram> IcuProgram::encode_queues() const
         queues.push_back(QueueProgram {
             QueueKind::Vxm,
             alu,
-            encode_scheduled_queue(vxm_[alu], queue_name(QueueKind::Vxm, alu), encode_vxm_command),
+            encode_scheduled_queue(vxm_[alu], queue_name(QueueKind::Vxm, alu),
+                [alu](const VxmInstruction& item) {
+                    return encode_vxm_command(
+                        alu, item.depth, item.instruction);
+                }),
         });
     }
     for (std::size_t hemisphere = 0; hemisphere < hw::kHemispheres; ++hemisphere) {
@@ -353,7 +386,9 @@ void IcuProgram::load_into(InstructionControlUnit& icu) const
             vxm_[alu],
             queue_name(QueueKind::Vxm, alu),
             [&](std::size_t cycles) { icu.enqueue_vxm_nop(alu, cycles); },
-            [&](const VxmLaneAluInstruction& instruction) { icu.enqueue_vxm(alu, instruction); });
+            [&](const VxmInstruction& item) {
+                icu.enqueue_vxm(alu, item.depth, item.instruction);
+            });
     }
     for (std::size_t hemisphere = 0; hemisphere < hw::kHemispheres; ++hemisphere) {
         const auto side = static_cast<Hemisphere>(hemisphere);
@@ -414,6 +449,43 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
         validate_queue_index(queue.kind, queue_index);
         for (std::size_t command_index = 0; command_index < queue.commands.size(); ++command_index) {
             const auto& command = queue.commands[command_index];
+            if (is_repeat_2d_command(command)) {
+                IcuLocation location;
+                switch (queue.kind) {
+                case QueueKind::Mem:
+                    location = IcuLocation::Mem(
+                        static_cast<Hemisphere>(queue_index
+                            / InstructionControlUnit::kMemQueuesPerHemisphere),
+                        (queue_index
+                            % InstructionControlUnit::kMemQueuesPerHemisphere)
+                            / hw::kMemBanksPerSlice,
+                        queue_index % hw::kMemBanksPerSlice);
+                    break;
+                case QueueKind::MxmLoad:
+                    location = IcuLocation::MxmLoad(queue_index);
+                    break;
+                case QueueKind::MxmCompute:
+                    location = IcuLocation::MxmCompute(queue_index);
+                    break;
+                case QueueKind::MxmDequant:
+                    location = IcuLocation::MxmDequant(queue_index);
+                    break;
+                case QueueKind::Vxm:
+                    location = IcuLocation::Vxm(queue_index);
+                    break;
+                case QueueKind::SxmTranspose:
+                    location = IcuLocation::Sxm(
+                        static_cast<Hemisphere>(queue_index), 0);
+                    break;
+                case QueueKind::SxmPermute:
+                    location = IcuLocation::Sxm(
+                        static_cast<Hemisphere>(queue_index), 1);
+                    break;
+                }
+                icu.enqueue_control(location, IcuControlInstruction::Repeat2D(
+                    decode_repeat_2d_command(command)));
+                continue;
+            }
             const auto opcode = isa::decode_icu_command_opcode(command.command);
             if (opcode == isa::IcuCommandOpcode::Nop) {
                 const auto cycles = isa::decode_icu_nop_cycles(command.command);
@@ -476,6 +548,46 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                 continue;
             }
 
+            if (opcode == isa::IcuCommandOpcode::Loop) {
+                const auto loop = isa::decode_icu_loop(command.command);
+                IcuLocation location;
+                switch (queue.kind) {
+                case QueueKind::Mem:
+                    location = IcuLocation::Mem(
+                        static_cast<Hemisphere>(queue_index
+                            / InstructionControlUnit::kMemQueuesPerHemisphere),
+                        (queue_index
+                            % InstructionControlUnit::kMemQueuesPerHemisphere)
+                            / hw::kMemBanksPerSlice,
+                        queue_index % hw::kMemBanksPerSlice);
+                    break;
+                case QueueKind::MxmLoad:
+                    location = IcuLocation::MxmLoad(queue_index);
+                    break;
+                case QueueKind::MxmCompute:
+                    location = IcuLocation::MxmCompute(queue_index);
+                    break;
+                case QueueKind::MxmDequant:
+                    location = IcuLocation::MxmDequant(queue_index);
+                    break;
+                case QueueKind::Vxm:
+                    location = IcuLocation::Vxm(queue_index);
+                    break;
+                case QueueKind::SxmTranspose:
+                    location = IcuLocation::Sxm(
+                        static_cast<Hemisphere>(queue_index), 0);
+                    break;
+                case QueueKind::SxmPermute:
+                    location = IcuLocation::Sxm(
+                        static_cast<Hemisphere>(queue_index), 1);
+                    break;
+                }
+                icu.enqueue_control(location, IcuControlInstruction::Loop(
+                    loop.window_size, loop.count, loop.interval,
+                    loop.address_stride));
+                continue;
+            }
+
             if (opcode != isa::IcuCommandOpcode::Instruction) {
                 throw std::logic_error("unsupported ICU command opcode in binary queue");
             }
@@ -532,10 +644,15 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                             command.words[0])));
                 break;
             case QueueKind::Vxm:
-                if (command.instruction_kind != InstructionKind::Vxm || command.word_count != 4) {
-                    throw std::logic_error("VXM queue command does not carry four VXM instruction words");
+                if (command.instruction_kind != InstructionKind::Vxm
+                    || command.word_count != 3) {
+                    throw std::logic_error(
+                        "VXM queue command must carry one 96-bit compact packet");
                 }
-                icu.enqueue_vxm(queue_index, isa::decode_vxm_instruction(isa::EncodedVxmInstruction {command.words}));
+                icu.enqueue_vxm(queue_index, VxmCompactInstruction {
+                    static_cast<std::uint64_t>(command.words[0])
+                        | (static_cast<std::uint64_t>(command.words[1]) << 32),
+                    command.words[2]});
                 break;
             case QueueKind::SxmTranspose: {
                 const auto instruction = decode_sxm_command(command);

@@ -53,7 +53,8 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
     const int64_t weightLoadLead =
         (target_.memory().hemispheres - 1) * 8 + 3 + weightToIw + 1;
     // MXM accumulator SRAM is a separate fixed-depth resource from MEM.
-    const int64_t accumulatorCapacity = 8192;
+    const int64_t accumulatorCapacity =
+        32 * target_.throughput().mxm_rows;
     const int64_t outputAccumulatorBase =
         accumulatorCapacity - op_.getSeqLen();
     const auto outputWeightScaleAttr = op_.output.getConfig()

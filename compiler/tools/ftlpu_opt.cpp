@@ -40,6 +40,8 @@ struct Args {
         ftlpu::compiler::RmsNormLoweringStrategy::VxmSquareMxmReduce};
     ftlpu::compiler::target::MxmExecutionPolicy mxm_execution_policy{
         ftlpu::compiler::target::MxmExecutionPolicy::Auto};
+    std::int64_t weight_bank{-1};
+    bool pass_timing{false};
 };
 
 Args parse_args(int argc, char** argv)
@@ -100,12 +102,18 @@ Args parse_args(int argc, char** argv)
                     "unknown MXM execution policy: " + policy);
             args.mxm_execution_policy = *parsed;
         }
+        else if (arg == "--weight-bank")
+            args.weight_bank = std::stoll(next());
+        else if (arg == "--pass-timing")
+            args.pass_timing = true;
         else throw std::runtime_error("unknown argument: " + arg);
     }
     if (args.input.empty() || args.output.empty()) {
         throw std::runtime_error("usage: ftlpu-opt --input in.mlir --output out.mlir "
                                  "[--pipeline ftlpu-stablehlo-to-kernel|ftlpu-stablehlo-to-tensor|"
                                  "ftlpu-stablehlo-to-stream|ftlpu-stablehlo-to-schedule|"
+                                 "ftlpu-stream-to-uncompressed-schedule|"
+                                 "ftlpu-stream-to-compressed-schedule|"
                                  "ftlpu-stream-to-schedule|"
                                  "ftlpu-stablehlo-to-commands|ftlpu-schedule-to-commands|"
                                  "ftlpu-verified-schedule-to-commands|"
@@ -115,6 +123,7 @@ Args parse_args(int argc, char** argv)
                                  "[--rmsnorm-strategy "
                                  "vxm-square-mxm-reduce|vxm-feedback] "
                                  "[--mxm-execution auto|legacy|block8] "
+                                 "[--weight-bank 0|1] "
                                  "[--target-config target.json]");
     }
     return args;
@@ -159,6 +168,9 @@ try {
                 "invalid target configuration: " + target_error);
         target = *parsed_target;
     }
+    if (args.weight_bank >= target.memory().banks_per_slice)
+        throw std::runtime_error(
+            "weight bank is outside the target memory");
     (*module)->setAttr("ftlpu.target", target.to_attribute(&context));
     (*module)->setAttr("ftlpu.mxm_execution_policy",
         mlir::StringAttr::get(&context,
@@ -166,10 +178,13 @@ try {
                 args.mxm_execution_policy)));
 
     mlir::PassManager pass_manager(&context);
+    if (args.pass_timing) pass_manager.enableTiming();
     if (args.pipeline != "ftlpu-stablehlo-to-kernel"
         && args.pipeline != "ftlpu-stablehlo-to-tensor"
         && args.pipeline != "ftlpu-stablehlo-to-stream"
         && args.pipeline != "ftlpu-stablehlo-to-schedule"
+        && args.pipeline != "ftlpu-stream-to-uncompressed-schedule"
+        && args.pipeline != "ftlpu-stream-to-compressed-schedule"
         && args.pipeline != "ftlpu-stream-to-schedule"
         && args.pipeline != "ftlpu-stablehlo-to-commands"
         && args.pipeline != "ftlpu-schedule-to-commands"
@@ -179,6 +194,9 @@ try {
         throw std::runtime_error("unknown MLIR pipeline: " + args.pipeline);
     }
     if (args.pipeline != "ftlpu-verify-schedule"
+        && args.pipeline != "ftlpu-stream-to-uncompressed-schedule"
+        && args.pipeline != "ftlpu-stream-to-compressed-schedule"
+        && args.pipeline != "ftlpu-stream-to-schedule"
         && args.pipeline != "ftlpu-schedule-to-commands"
         && args.pipeline != "ftlpu-verified-schedule-to-commands"
         && args.pipeline != "ftlpu-compress-schedule")
@@ -189,18 +207,33 @@ try {
         || args.pipeline == "ftlpu-stablehlo-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_kernel_to_tensor_pass(
-                args.rmsnorm_strategy));
+                args.rmsnorm_strategy, args.weight_bank));
     if (args.pipeline == "ftlpu-stablehlo-to-stream" || args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_tensor_to_stream_pass());
     if (args.pipeline == "ftlpu-stablehlo-to-schedule"
+        || args.pipeline == "ftlpu-stream-to-uncompressed-schedule"
+        || args.pipeline == "ftlpu-stream-to-compressed-schedule"
         || args.pipeline == "ftlpu-stream-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stream_to_schedule_pass(
-                args.ffn_schedule, args.attention_schedule));
+                args.ffn_schedule, args.attention_schedule,
+                args.pass_timing));
+    if (args.weight_bank >= 0
+        && (args.pipeline == "ftlpu-stablehlo-to-schedule"
+            || args.pipeline == "ftlpu-stablehlo-to-commands"
+            || args.pipeline == "ftlpu-stream-to-uncompressed-schedule"
+            || args.pipeline == "ftlpu-stream-to-compressed-schedule"
+            || args.pipeline == "ftlpu-stream-to-schedule"
+            || args.pipeline == "ftlpu-schedule-to-commands"
+            || args.pipeline == "ftlpu-verified-schedule-to-commands"))
+        pass_manager.addNestedPass<mlir::func::FuncOp>(
+            ftlpu::compiler::create_assign_weight_bank_pass(
+                args.weight_bank));
     if (args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands"
+        || args.pipeline == "ftlpu-stream-to-compressed-schedule"
         || args.pipeline == "ftlpu-schedule-to-commands"
         || args.pipeline == "ftlpu-compress-schedule")
         pass_manager.addNestedPass<mlir::func::FuncOp>(

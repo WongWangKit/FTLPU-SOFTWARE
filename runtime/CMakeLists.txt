@@ -4,6 +4,16 @@ add_library(ftlpu_cmodel_static STATIC
     "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp"
     "${FTLPU_CMODEL_DIR}/src/mxm/block_accumulator.cpp")
 
+set(FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT 256 CACHE STRING
+    "Number of complete 32x32 FP32 partial-sum blocks per MXM accumulator")
+if(NOT FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT MATCHES "^[1-9][0-9]*$" OR
+   FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT GREATER 256)
+    message(FATAL_ERROR
+        "FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT must be an integer in [1, 256]")
+endif()
+target_compile_definitions(ftlpu_cmodel_static PUBLIC
+    FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT=${FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT})
+
 file(GLOB_RECURSE FTLPU_CMODEL_PUBLIC_HEADERS CONFIGURE_DEPENDS
     "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
 file(GLOB_RECURSE FTLPU_RUNTIME_PUBLIC_HEADERS CONFIGURE_DEPENDS
@@ -26,7 +36,10 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/model_session.cpp
     src/runtime/performance.cpp
     src/runtime/schedule_trace.cpp
+    src/runtime/session_memory_planner.cpp
+    src/runtime/weight_page_builder.cpp
     examples/binary_inspect.cpp
+    examples/pack_model_weights.cpp
     tests/runtime/command_mxm_column_binary_test.cpp
     tests/runtime/command_vxm_binary_runtime_test.cpp
     tests/runtime/sxm_binary_roundtrip_test.cpp
@@ -45,7 +58,12 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/host_lm_head_test.cpp
     tests/runtime/model_package_roundtrip_test.cpp
     tests/runtime/model_session_embedding_test.cpp
-    tests/runtime/resident_weight_planner_test.cpp)
+    tests/runtime/resident_weight_planner_test.cpp
+    tests/runtime/c2c_weight_ping_pong_test.cpp
+    tests/runtime/weight_page_planner_test.cpp
+    tests/runtime/model_session_c2c_weight_pages_test.cpp
+    tests/runtime/weight_page_builder_test.cpp
+    tests/runtime/qwen_weight_page_builder_test.cpp)
 set_source_files_properties(${FTLPU_CMODEL_CONSUMER_SOURCES}
     PROPERTIES OBJECT_DEPENDS
         "${FTLPU_CMODEL_PUBLIC_HEADERS};${FTLPU_RUNTIME_PUBLIC_HEADERS}")
@@ -57,13 +75,15 @@ target_include_directories(ftlpu_cmodel_static
 
 add_library(ftlpu_software
     src/runtime/binary.cpp
+    src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
     src/runtime/icu_program.cpp
     src/runtime/model_package.cpp
     src/runtime/model_session.cpp
     src/runtime/performance.cpp
     src/runtime/schedule_trace.cpp
-    src/runtime/session_memory_planner.cpp)
+    src/runtime/session_memory_planner.cpp
+    src/runtime/weight_page_builder.cpp)
 
 if(FTLPU_ENABLE_ADDRESS_SANITIZER AND MSVC)
     target_compile_options(ftlpu_software PRIVATE /fsanitize=address)
@@ -83,6 +103,12 @@ target_link_libraries(ftlpu_software
 
 add_executable(ftlpu_binary_inspect examples/binary_inspect.cpp)
 target_link_libraries(ftlpu_binary_inspect PRIVATE ftlpu_software)
+
+add_executable(ftlpu_pack_model_weights
+    examples/pack_model_weights.cpp)
+set_target_properties(ftlpu_pack_model_weights PROPERTIES
+    OUTPUT_NAME "ftlpu-pack-model-weights")
+target_link_libraries(ftlpu_pack_model_weights PRIVATE ftlpu_software)
 
 add_executable(command_vxm_binary_runtime_test
     tests/runtime/command_vxm_binary_runtime_test.cpp)
@@ -146,6 +172,42 @@ target_link_libraries(resident_weight_planner_test PRIVATE ftlpu_software)
 add_test(
     NAME resident_weight_planner_test
     COMMAND $<TARGET_FILE:resident_weight_planner_test>)
+
+add_executable(c2c_weight_ping_pong_test
+    tests/runtime/c2c_weight_ping_pong_test.cpp)
+target_link_libraries(c2c_weight_ping_pong_test PRIVATE ftlpu_software)
+add_test(
+    NAME c2c_weight_ping_pong_test
+    COMMAND $<TARGET_FILE:c2c_weight_ping_pong_test>)
+
+add_executable(weight_page_planner_test
+    tests/runtime/weight_page_planner_test.cpp)
+target_link_libraries(weight_page_planner_test PRIVATE ftlpu_software)
+add_test(
+    NAME weight_page_planner_test
+    COMMAND $<TARGET_FILE:weight_page_planner_test>)
+
+add_executable(model_session_c2c_weight_pages_test
+    tests/runtime/model_session_c2c_weight_pages_test.cpp)
+target_link_libraries(model_session_c2c_weight_pages_test
+    PRIVATE ftlpu_software)
+add_test(
+    NAME model_session_c2c_weight_pages_test
+    COMMAND $<TARGET_FILE:model_session_c2c_weight_pages_test>)
+
+add_executable(weight_page_builder_test
+    tests/runtime/weight_page_builder_test.cpp)
+target_link_libraries(weight_page_builder_test PRIVATE ftlpu_software)
+add_test(
+    NAME weight_page_builder_test
+    COMMAND $<TARGET_FILE:weight_page_builder_test>)
+
+add_executable(qwen_weight_page_builder_test
+    tests/runtime/qwen_weight_page_builder_test.cpp)
+target_link_libraries(qwen_weight_page_builder_test PRIVATE ftlpu_software)
+add_test(
+    NAME qwen_weight_page_builder_test
+    COMMAND $<TARGET_FILE:qwen_weight_page_builder_test>)
 
 add_executable(hf_model_boundaries_package_test
     tests/runtime/hf_model_boundaries_package_test.cpp)

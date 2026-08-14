@@ -177,7 +177,8 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
             static_cast<int64_t>(ffn.getK()),
             static_cast<int64_t>(ffn.getHidden()),
             static_cast<int64_t>(ffn.getN())},
-        weightSlices, target, execution->uses_local_dequant());
+        weightSlices, target, execution->uses_local_dequant(),
+        !block8Ffn);
     if (!activationLatency || mlir::failed(projectionTimeline)) {
         ffn.getOperation()->emitError(
             "cannot plan FFN activation transport or projection timeline");
@@ -185,12 +186,9 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     }
 
     const int64_t tile = throughput.mxm_rows;
-    const int64_t projectionAccumulatorRows =
-        static_cast<int64_t>(ffn.getM())
-        * (static_cast<int64_t>(ffn.getHidden()) / tile);
-    const int64_t downAccumulatorBase = std::max(
-        memory.accumulator_scratch_base_row,
-        ((projectionAccumulatorRows + tile - 1) / tile) * tile);
+    // Projection final partials are drained to MEM and clear their rows.
+    // Down projection starts afterwards and can reuse the same token window.
+    const int64_t downAccumulatorBase = 0;
     auto projectionType = mlir::RankedTensorType::get(
         {tile, tile}, rewriter.getF32Type());
 

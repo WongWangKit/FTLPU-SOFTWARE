@@ -44,6 +44,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
     const int64_t tile = target_.throughput().mxm_rows;
     const int64_t tokenBlocks = op_.getSeqLen() / tile;
     const int64_t hiddenBlocks = op_.getHidden() / tile;
+    const int64_t projectionHeadBlocks = op_.getHeadDim() / tile;
     const int64_t weightToIw = target_.throughput().vxm_weight_to_iw_latency;
     const auto inputPlacement =
         op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("input");
@@ -256,7 +257,8 @@ int64_t AttentionScheduleEmitter::emitProjections()
                                 const int64_t cycle = dequantStart
                                     + hemisphere * 8 + pulse;
                                 const int64_t address = layout.weightAddress(
-                                    kind, head, reductionBlock, half,
+                                    kind, head * projectionHeadBlocks + half,
+                                    reductionBlock, half,
                                     pulse);
                                 for (int64_t stream = 0; stream < 8;
                                      ++stream) {
@@ -482,7 +484,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
                                             + slice,
                                         "write",
                                         layout.queryIwAddress(head,
-                                            tokenBlock,
+                                            half, tokenBlock,
                                             (token % tile) / 8),
                                         half * 2 + byte, 1, 1, 0);
                                     rawWriteEnd = std::max(
@@ -548,7 +550,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
                                     + slice,
                                 "read",
                                 layout.queryIwAddress(queryHead,
-                                    queryBlock, phase),
+                                    reduction, queryBlock, phase),
                                 32 + stream, 1, 1, 0);
                             emitVxm(rewriter_, op_.getLoc(),
                                 op_.getInput(), copyCycle, stream,
@@ -565,7 +567,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
                                     + slice,
                                 "write",
                                 layout.queryIwAddress(queryHead,
-                                    queryBlock, phase),
+                                    reduction, queryBlock, phase),
                                 stream, 1, 1, 0);
                         }
                     }
@@ -597,7 +599,8 @@ int64_t AttentionScheduleEmitter::emitProjections()
                         const int64_t localMxm = pulse / 4;
                         const int64_t column = 3 - pulse % 4;
                         const int64_t cycle = dequantStart + hemisphere * 8 + pulse;
-                        const int64_t address = layout.weightAddress(kind, head,
+                        const int64_t address = layout.weightAddress(kind,
+                            head * projectionHeadBlocks + localMxm,
                             reductionBlock, localMxm, pulse % 4);
                         for (int64_t stream = 0; stream < 8; ++stream) {
                             const int64_t slice = layout.weightSlices()[stream];
@@ -778,7 +781,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
                                         const int64_t slice = slices[localColumn * 2 + byte];
                                         emitMem(rewriter_, op_.getLoc(), writeCycle + slice / 4,
                                             hemisphere * target_.memory().slices_per_hemisphere + slice,
-                                            "write", layout.queryIwAddress(head, tokenBlock, phase),
+                                            "write", layout.queryIwAddress(head, reduction, tokenBlock, phase),
                                             stream, 1, 1, 0);
                                         finalWriteEnd = std::max(
                                             finalWriteEnd,
@@ -848,9 +851,9 @@ int64_t AttentionScheduleEmitter::emitProjections()
             kvHead % target_.memory().hemispheres;
         if (source == destination) continue;
         for (int64_t queryBlock = 0; queryBlock < tokenBlocks; ++queryBlock) {
-            for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
-                const auto& slices =
-                    target_.attention_query_iw_slices(reduction);
+                for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
+                    const auto& slices =
+                    layout.queryIwSlices(reduction);
                 for (int64_t phase = 0;
                      phase < target_.throughput().tile_rows;
                      ++phase, ++copyCycle) {
@@ -863,7 +866,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
                                 + slice,
                             "read",
                             layout.queryIwAddress(
-                                queryHead, queryBlock, phase),
+                                queryHead, reduction, queryBlock, phase),
                             32 + stream, 1, 1, 0);
                         emitVxm(rewriter_, op_.getLoc(), op_.getInput(),
                             copyCycle, stream, "pass",
@@ -878,7 +881,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
                                 + slice,
                             "write",
                             layout.queryIwAddress(
-                                queryHead, queryBlock, phase),
+                                queryHead, reduction, queryBlock, phase),
                             stream, 1, 1, 0);
                     }
                 }
@@ -901,7 +904,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
                     keyCopyCycle - readLatency(byte),
                     hemisphere * target_.memory().slices_per_hemisphere
                         + byte,
-                    "read", layout.keyAddress(keyHead, token / tile)
+                    "read", layout.keyAddress(keyHead, 0, token / tile)
                             + token % tile,
                     32 + byte, 1, 1, 0);
             }
@@ -919,7 +922,7 @@ int64_t AttentionScheduleEmitter::emitProjections()
                     keyCopyCycle + 1 + slice / groups,
                     hemisphere * target_.memory().slices_per_hemisphere
                         + slice,
-                    "write", layout.keyAddress(keyHead, token / tile)
+                    "write", layout.keyAddress(keyHead, 0, token / tile)
                             + token % tile,
                     byte, 1, 1, 0);
             }
@@ -965,7 +968,7 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                 && target_.throughput().mxm_weight_buffers >= 2
                 && target_.throughput().mxms_per_hemisphere == 1;
             for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
-                const auto& iwSlices = target_.attention_query_iw_slices(reduction);
+                const auto iwSlices = layout.queryIwSlices(reduction);
                 const int64_t reductionComputeCycle = firstComputeCycle
                     + reduction * tokenBlocks * issue;
                 const int64_t reductionIwCycle = wavefront
@@ -978,7 +981,8 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                     const int64_t iwCycle = reductionIwCycle + phase;
                     const int64_t sourcePhase = tile / 8 - 1 - phase;
                     const int64_t queryAddress = layout.queryIwAddress(
-                        work->query_head, work->query_block, sourcePhase);
+                        work->query_head, reduction, work->query_block,
+                        sourcePhase);
                     for (int64_t stream = 0; stream < static_cast<int64_t>(iwSlices.size()); ++stream) {
                         const int64_t slice = iwSlices[stream];
                         const int64_t latency = *target_.transport_latency(
@@ -991,7 +995,9 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                             1, 1, 0);
                     }
                     emitMxm(rewriter_, op_.getLoc(), iwCycle, mxm, "iw",
-                        reduction, tile / 8 - 1 - phase, 0, 0, 1, 1,
+                        reduction
+                            % target_.throughput().mxm_weight_buffers,
+                        tile / 8 - 1 - phase, 0, 0, 1, 1,
                         0, 1, "stream", true, "supercell", 0,
                         dataFormat);
                 }
@@ -1004,24 +1010,54 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                     for (int64_t byte = 0; byte < 2; ++byte) {
                         const int64_t slice =
                             target_.throughput().mxms_per_hemisphere == 1
-                            ? layout.keySlices()[reduction * 2 + byte]
-                            : work->local_mxm * 4 + reduction * 2 + byte;
+                            ? layout.keySlices(reduction)[byte]
+                            : work->local_mxm * 4
+                                + (reduction % 2) * 2 + byte;
                         const int64_t latency = *target_.transport_latency(
                             target::StreamEndpoint::Mem, target::StreamEndpoint::MxmActivation,
                             target::StreamDirection::East, slice);
                         emitMem(rewriter_, op_.getLoc(), computeCycle - latency,
                             work->hemisphere * target_.memory().slices_per_hemisphere + slice,
-                            "read", layout.keyAddress(work->kv_head, keyBlock),
+                            "read", layout.keyAddress(work->kv_head,
+                                reduction, keyBlock),
                             activationStream + byte, tile, 1, 1);
                     }
                     emitMxm(rewriter_, op_.getLoc(), computeCycle, mxm, "compute",
-                        reduction, 0, activationStream, outputStream, tile, 1,
-                        layout.scoreAddress(work->query_head,
+                        reduction
+                            % target_.throughput().mxm_weight_buffers,
+                        0, activationStream, outputStream, tile, 1,
+                        layout.scoreAccumulatorAddress(work->query_head,
                             work->query_block, keyBlock),
                         1,
-                        fusedSoftmax && finalReduction ? "stream" : "sram",
-                        fusedSoftmax && finalReduction,
+                        finalReduction ? "stream" : "sram",
+                        finalReduction,
                         "supercell", 0, dataFormat);
+                    if (!fusedSoftmax && finalReduction) {
+                        // Tail softmax runs after all QK waves, so completed
+                        // FP32 scores must leave the finite MXM accumulator.
+                        // Write the four result byte streams directly to the
+                        // score plane and clear the reusable accumulator rows.
+                        for (int64_t byte = 0; byte < 4; ++byte) {
+                            const int64_t slice =
+                                layout.scaledScoreSlices(work->local_mxm)[byte];
+                            const auto latency = target_.transport_latency(
+                                target::StreamEndpoint::MxmResult,
+                                target::StreamEndpoint::Mem,
+                                target::StreamDirection::West, slice);
+                            if (!latency) continue;
+                            emitMem(rewriter_, op_.getLoc(),
+                                computeCycle
+                                    + target_.mxm_first_result_latency()
+                                    + *latency,
+                                work->hemisphere
+                                        * target_.memory().slices_per_hemisphere
+                                    + slice,
+                                "write", layout.scoreAddress(
+                                    work->query_head, work->query_block,
+                                    keyBlock * tile),
+                                32 + outputStream + byte, tile, 1, 1);
+                        }
+                    }
                 }
             }
         }

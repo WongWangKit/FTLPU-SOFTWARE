@@ -110,12 +110,15 @@ BinaryProgram parameterize_program(const ModelPackage& package,
         QueueCommand& command =
             queue->commands[relocation.command_index];
         if (command.instruction_kind != InstructionKind::Vxm
-            || command.word_count != 4)
+            || command.word_count != 3)
             throw std::logic_error(
                 "scale relocation target is not a VXM instruction");
-        isa::EncodedVxmInstruction encoded {command.words};
-        VxmLaneAluInstruction instruction =
-            isa::decode_vxm_instruction(encoded);
+        isa::EncodedVxmInstruction encoded {
+            static_cast<std::uint64_t>(command.words[0])
+                | (static_cast<std::uint64_t>(command.words[1]) << 32),
+            command.words[2]};
+        auto decoded = isa::decode_vxm_instruction(queue->index, encoded);
+        VxmLaneAluInstruction& instruction = decoded.instruction;
         VxmLaneOperand& operand =
             relocation.operand == VxmImmediateOperand::Lhs
             ? instruction.lhs : instruction.rhs;
@@ -124,7 +127,13 @@ BinaryProgram parameterize_program(const ModelPackage& package,
                 "scale relocation target is not an immediate operand");
         operand = VxmLaneOperand::Imm(
             tensor.scales[relocation.scale_index]);
-        command.words = isa::encode_vxm_instruction(instruction).words;
+        encoded = isa::encode_vxm_instruction(
+            queue->index, decoded.chain_depth, instruction);
+        command.words = {
+            static_cast<std::uint32_t>(encoded.control),
+            static_cast<std::uint32_t>(encoded.control >> 32),
+            encoded.immediate_bits,
+            0};
     }
     std::unordered_set<std::uint64_t> relocated_bindings;
     std::unordered_map<std::uint64_t, std::size_t> relocation_counts;
@@ -186,8 +195,11 @@ BinaryProgram parameterize_program(const ModelPackage& package,
             | (static_cast<isa::EncodedMemInstruction>(command.words[1])
                 << 32);
         MemInstruction instruction = isa::decode_mem_instruction(encoded);
-        const std::size_t sourceAddress = relocation.write_port
-            ? instruction.write_address : instruction.address;
+        if (relocation.write_port)
+            throw std::logic_error(
+                "legacy MEM ReadWrite relocation is not supported by "
+                "the banked MEM ISA");
+        const std::size_t sourceAddress = instruction.address;
         auto [range, inserted] =
             relocation_address_ranges.try_emplace(key,
                 static_cast<std::int64_t>(sourceAddress),
@@ -214,11 +226,7 @@ BinaryProgram parameterize_program(const ModelPackage& package,
                 + " command_address="
                 + std::to_string(sourceAddress)
                 + " relocated=" + std::to_string(relocated));
-        if (relocation.write_port)
-            instruction.write_address =
-                static_cast<std::size_t>(relocated);
-        else
-            instruction.address = static_cast<std::size_t>(relocated);
+        instruction.address = static_cast<std::size_t>(relocated);
         const isa::EncodedMemInstruction patched =
             isa::encode_mem_instruction(instruction);
         command.words[0] = static_cast<std::uint32_t>(patched);
@@ -294,11 +302,94 @@ ModelSession::ModelSession(TspSliceSystem& system)
 {
 }
 
+ModelSession::ModelSession(C2cDmaSystem& system)
+    : runtime_(system.chip(), [this, &system](TspSliceSystem::LogSinks sinks) {
+        system.tick(sinks);
+        if (weight_pager_) weight_pager_->observe_tick();
+    })
+    , c2c_system_(&system)
+    , weight_pager_(std::make_unique<C2cWeightPager>(system))
+{
+}
+
+void ModelSession::prepare_weight_pages()
+{
+    c2c_pages_.clear();
+    ready_weight_page_.reset();
+    inflight_weight_page_.reset();
+    if (package_.weight_pages.empty()) return;
+    if (c2c_system_ == nullptr)
+        throw std::logic_error(
+            "paged model weights require ModelSession(C2cDmaSystem&)");
+
+    std::uint64_t nextDdrAddress = 0;
+    for (const ModelWeightPage& source : package_.weight_pages) {
+        C2cWeightPage page;
+        page.layer = source.layer;
+        page.bank = source.bank;
+        for (const ModelWeightPage::Segment& segment : source.segments) {
+            const ModelTensor& tensor = find_tensor(package_, segment.tensor);
+            const std::uint64_t bytes = static_cast<std::uint64_t>(
+                segment.vector_count) * hw::kPhysicalVectorBytes;
+            const std::uint64_t ddrAddress = nextDdrAddress;
+            for (std::uint32_t vector = 0; vector < segment.vector_count;
+                 ++vector) {
+                C2cVector payload;
+                const std::size_t sourceOffset = static_cast<std::size_t>(
+                    segment.byte_offset
+                    + static_cast<std::uint64_t>(vector)
+                        * hw::kPhysicalVectorBytes);
+                for (std::size_t tile = 0; tile < hw::kTileRows; ++tile)
+                    for (std::size_t lane = 0;
+                         lane < hw::kLanesPerTile; ++lane)
+                        payload.payload[tile][lane] = tensor.data[
+                            sourceOffset + tile * hw::kLanesPerTile + lane];
+                c2c_system_->ddr4().initialize_vector(
+                    ddrAddress
+                        + static_cast<std::uint64_t>(vector)
+                            * hw::kPhysicalVectorBytes,
+                    payload);
+            }
+            page.segments.push_back(C2cWeightSegment {
+                static_cast<Hemisphere>(segment.hemisphere),
+                segment.slice, source.bank, segment.base_row,
+                segment.stream, ddrAddress, segment.vector_count});
+            nextDdrAddress += bytes;
+        }
+        c2c_pages_.push_back(std::move(page));
+    }
+}
+
+void ModelSession::start_weight_page(std::uint32_t page_index)
+{
+    if (!weight_pager_ || page_index >= c2c_pages_.size())
+        throw std::logic_error("model weight page is unavailable");
+    weight_pager_->enqueue(c2c_pages_[page_index]);
+    ++stats_.weight_page_prefetches;
+    stats_.weight_page_prefetch_bytes += weight_pager_->stats().bytes;
+    inflight_weight_page_ = page_index;
+    ready_weight_page_.reset();
+}
+
+void ModelSession::ensure_weight_page(std::uint32_t page_index)
+{
+    if (ready_weight_page_ == page_index) return;
+    if (inflight_weight_page_ != page_index)
+        start_weight_page(page_index);
+    const std::size_t beginCycle = c2c_system_->cycle();
+    weight_pager_->wait(std::max<std::size_t>(
+        1024, weight_pager_->stats().vectors * 64));
+    stats_.weight_page_wait_cycles += c2c_system_->cycle() - beginCycle;
+    ready_weight_page_ = page_index;
+    inflight_weight_page_.reset();
+}
+
 void ModelSession::load(ModelPackage package)
 {
     validate_model_package(package);
     memory_plan_ = SessionMemoryPlanner::plan(package);
     package_ = std::move(package);
+    prepare_weight_pages();
     values_.clear();
     device_values_.clear();
     stats_ = {};
@@ -382,13 +473,21 @@ void ModelSession::run_invocation(
         invocation.executable_index);
     const SessionInvocationPlan& invocation_plan =
         memory_plan_.invocations.at(index);
+    if (invocation.weight_page != 0xffffffffu)
+        ensure_weight_page(invocation.weight_page);
     const BinaryProgram program = parameterize_program(
         package_, invocation, invocation_plan,
         materialize_model_executable(executable));
 
     runtime_.load(program);
+    if (index + 1 < package_.invocations.size()) {
+        const auto nextPage = package_.invocations[index + 1].weight_page;
+        if (nextPage != 0xffffffffu && nextPage != invocation.weight_page)
+            start_weight_page(nextPage);
+    }
     for (const SessionInputPlan& input : invocation_plan.inputs) {
-        if (input.transfer == SessionTransferKind::Resident)
+        if (input.transfer == SessionTransferKind::Resident
+            || input.transfer == SessionTransferKind::WeightPage)
             continue;
         if (input.transfer == SessionTransferKind::HostUpload) {
             runtime_.upload_input(

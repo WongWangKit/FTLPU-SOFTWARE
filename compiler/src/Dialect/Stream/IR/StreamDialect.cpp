@@ -183,7 +183,9 @@ LogicalResult RouteOp::verify()
         *source == target::StreamEndpoint::Mem
         && *destination == target::StreamEndpoint::MxmActivation
         && placementKind
-        && placementKind.getValue() == "fp16_mxm_distributed_16"
+        && (placementKind.getValue() == "fp16_mxm_distributed_16"
+            || placementKind.getValue()
+                == "fp16_mxm_block8_distributed_16")
         && stream_count
             == 2 * target.throughput().mxm_block_rows;
     const bool block8Weight =
@@ -212,6 +214,8 @@ LogicalResult RouteOp::verify()
         return emitOpError("stream binding does not match the LPU target model")
             << " (base=" << stream_base << ", count=" << stream_count
             << ", expected_count=" << *expected_stream_count
+            << ", placement="
+            << (placementKind ? placementKind.getValue() : "<none>")
             << ", register=" << getRegisterId() << ", expected_register="
             << *expected_register << ")";
     return success();

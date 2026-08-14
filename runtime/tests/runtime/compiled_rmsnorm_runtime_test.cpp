@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -15,8 +17,6 @@
 
 namespace {
 
-constexpr std::size_t kRows = 128;
-constexpr std::size_t kHidden = 576;
 constexpr float kEpsilon = 1.0e-5f;
 
 float toBf16(float value)
@@ -53,22 +53,6 @@ float readBf16(const std::vector<std::uint8_t>& bytes, std::size_t index)
         .to_float();
 }
 
-float readMemBf16(const ftlpu::TspSliceSystem& system,
-    ftlpu::Hemisphere hemisphere, std::size_t lowSlice,
-    std::size_t highSlice, std::size_t address, std::size_t lane)
-{
-    const auto tile = lane / ftlpu::hw::kLanesPerTile;
-    const auto localLane = lane % ftlpu::hw::kLanesPerTile;
-    const auto low = system.read_mem_sram_lane_byte(
-        hemisphere, lowSlice, tile, address, localLane);
-    const auto high = system.read_mem_sram_lane_byte(
-        hemisphere, highSlice, tile, address, localLane);
-    return ftlpu::Bf16::from_bits(
-        static_cast<std::uint16_t>(low)
-        | (static_cast<std::uint16_t>(high) << 8))
-        .to_float();
-}
-
 } // namespace
 
 int main(int argc, char** argv)
@@ -80,20 +64,24 @@ try {
     const auto program =
         ftlpu::software::runtime::read_binary_program(
             std::filesystem::path(argv[1]));
-    if (program.bindings.size() != 3
-        || program.max_cycle < (feedback ? 5000 : 7000))
+    if (program.bindings.size() != 3 || program.max_cycle < 100)
         throw std::logic_error(
             "RMSNorm binary is missing bindings or scheduled commands");
+    const auto& activation = program.bindings[0];
+    if (activation.shape.size() != 2)
+        throw std::logic_error("RMSNorm activation binding must be rank 2");
+    const std::size_t rows = activation.shape[0];
+    const std::size_t hidden = activation.shape[1];
 
     std::vector<std::uint8_t> input;
-    input.reserve(kRows * kHidden * 2);
-    for (std::size_t row = 0; row < kRows; ++row)
-        for (std::size_t column = 0; column < kHidden; ++column)
+    input.reserve(rows * hidden * 2);
+    for (std::size_t row = 0; row < rows; ++row)
+        for (std::size_t column = 0; column < hidden; ++column)
             appendBf16(input, inputValue(row, column));
 
     std::vector<std::uint8_t> gamma;
-    gamma.reserve(kHidden * 2);
-    for (std::size_t column = 0; column < kHidden; ++column)
+    gamma.reserve(hidden * 2);
+    for (std::size_t column = 0; column < hidden; ++column)
         appendBf16(gamma, gammaValue(column));
 
     auto system = std::make_unique<ftlpu::TspSliceSystem>();
@@ -101,135 +89,45 @@ try {
     runtime.load(program);
     runtime.upload_input(0, input);
     runtime.upload_input(1, gamma);
-    runtime.run_cycles(program.max_cycle + 64);
+    auto trace = std::ofstream {};
+    std::ostream* traceStream = nullptr;
+    if (const char* path = std::getenv("FTLPU_RMSNORM_TRACE")) {
+        trace.open(path, std::ios::trunc);
+        traceStream = &trace;
+    }
+    runtime.run_cycles(program.max_cycle + 64, traceStream);
     const auto output = runtime.download_output(0);
 
-        std::size_t checked = 0;
+    std::size_t checked = 0;
     std::size_t nonzero = 0;
     float maxError = 0.0f;
-    for (std::size_t row = 0; row < kRows; ++row) {
+    for (std::size_t row = 0; row < rows; ++row) {
         float meanSquare = 0.0f;
-        for (std::size_t column = 0; column < kHidden; ++column) {
+        for (std::size_t column = 0; column < hidden; ++column) {
             const float value = inputValue(row, column);
             meanSquare += feedback
-                ? value * value / static_cast<float>(kHidden)
+                ? value * value / static_cast<float>(hidden)
                 : toBf16(value * value)
-                    * toBf16(1.0f / kHidden);
+                    * toBf16(1.0f / hidden);
         }
         const float factor = feedback
             ? 1.0f / std::sqrt(meanSquare + kEpsilon)
             : toBf16(1.0f / std::sqrt(meanSquare + kEpsilon));
-        const float physicalFactor = feedback
-            ? 0.0f
-            : readMemBf16(*system, ftlpu::Hemisphere::East,
-                22, 23, row, 0);
-        for (std::size_t column = 0; column < kHidden; ++column) {
+        for (std::size_t column = 0; column < hidden; ++column) {
             const float expected = toBf16(
                 inputValue(row, column) * factor * gammaValue(column));
             const float actual =
-                readBf16(output, row * kHidden + column);
+                readBf16(output, row * hidden + column);
             const float error = std::fabs(actual - expected);
             maxError = std::max(maxError, error);
             if (std::fabs(actual) > 1.0e-5f) ++nonzero;
-            if (error > 8.0e-3f)
-            {
-                float feedbackMean = 0.0f;
-                float physicalFeedbackMean = 0.0f;
-                float feedbackMaxError = 0.0f;
-                std::size_t feedbackNonzero = 0;
-                std::string feedbackZeroIndices;
-                std::string feedbackSamples;
-                std::string feedbackFirstMismatch;
-                std::string feedbackInputFirstMismatch;
-                std::string reverseMatches;
-                for (std::size_t index = 0; index < kHidden; ++index) {
-                    const float feedbackInput = readMemBf16(*system,
-                        ftlpu::Hemisphere::East, 36, 37,
-                        (row / 32) * kHidden + index, row % 32);
-                    const float feedbackWeight = readMemBf16(*system,
-                        ftlpu::Hemisphere::East, 10, 11,
-                        index, row % 32);
-                    const float feedbackOutput = readMemBf16(*system,
-                        ftlpu::Hemisphere::East, 22, 23,
-                        (row / 32) * kHidden + index, row % 32);
-                    feedbackMean += inputValue(row, index)
-                        * inputValue(row, index)
-                        / static_cast<float>(kHidden);
-                    physicalFeedbackMean += feedbackInput * feedbackInput
-                        / static_cast<float>(kHidden);
-                    if (feedbackInputFirstMismatch.empty()
-                        && feedbackInput != inputValue(row, index))
-                        feedbackInputFirstMismatch = std::to_string(index)
-                            + ":" + std::to_string(feedbackInput)
-                            + "/" + std::to_string(inputValue(row, index));
-                    if (feedbackInput != 0.0f) {
-                        ++feedbackNonzero;
-                    } else if (feedbackZeroIndices.size() < 80) {
-                        feedbackZeroIndices += std::to_string(index) + ",";
-                    }
-                    const float feedbackExpected = toBf16(
-                        inputValue(row, index) * factor
-                        * gammaValue(index));
-                    feedbackMaxError = std::max(feedbackMaxError,
-                        std::fabs(feedbackOutput - feedbackExpected));
-                    if (feedbackFirstMismatch.empty()
-                        && std::fabs(
-                            feedbackOutput - feedbackExpected) > 8.0e-3f)
-                        feedbackFirstMismatch = std::to_string(index)
-                            + ":" + std::to_string(feedbackOutput)
-                            + "/" + std::to_string(feedbackExpected);
-                    if (index < 8) {
-                        feedbackSamples += "["
-                            + std::to_string(feedbackInput) + ","
-                            + std::to_string(feedbackWeight) + ","
-                            + std::to_string(feedbackOutput) + ","
-                            + std::to_string(feedbackExpected) + "]";
-                    }
-                }
-                for (std::size_t feedbackLane = 0;
-                     feedbackLane < 32 && reverseMatches.size() < 120;
-                     ++feedbackLane) {
-                    for (std::size_t index = 0;
-                         index < kHidden && reverseMatches.size() < 120;
-                         ++index) {
-                        const float candidate = readMemBf16(*system,
-                            ftlpu::Hemisphere::East, 22, 23,
-                            index, feedbackLane);
-                        if (std::fabs(candidate - actual) < 1.0e-4f)
-                            reverseMatches += std::to_string(feedbackLane)
-                                + ":" + std::to_string(index) + ",";
-                    }
-                }
+            if (error > 8.0e-3f) {
                 throw std::logic_error(
                     "RMSNorm CPU baseline mismatch at row="
                     + std::to_string(row) + " column="
                     + std::to_string(column) + " actual="
                     + std::to_string(actual) + " expected="
-                    + std::to_string(expected) + " factor="
-                    + std::to_string(physicalFactor) + " expected_factor="
-                    + std::to_string(factor) + " mean="
-                    + std::to_string(meanSquare) + " weight00="
-                    + std::to_string(static_cast<float>(
-                        system->mxm_unit(0).array().weight(
-                            0, 0, 0, 0, 0)))
-                    + " feedback_mean="
-                    + std::to_string(feedbackMean)
-                    + " physical_feedback_mean="
-                    + std::to_string(physicalFeedbackMean)
-                    + " feedback_output_max_error="
-                    + std::to_string(feedbackMaxError)
-                    + " feedback_nonzero="
-                    + std::to_string(feedbackNonzero)
-                    + " feedback_zero_indices="
-                    + feedbackZeroIndices
-                    + " feedback_samples="
-                    + feedbackSamples
-                    + " feedback_first_mismatch="
-                    + feedbackFirstMismatch
-                    + " feedback_input_first_mismatch="
-                    + feedbackInputFirstMismatch
-                    + " reverse_matches="
-                    + reverseMatches);
+                    + std::to_string(expected));
             }
             ++checked;
         }

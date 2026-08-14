@@ -72,16 +72,25 @@ struct AttentionMatch {
     llvm::SmallPtrSet<mlir::Operation*, 32> operations;
 };
 
-std::optional<float> find_large_scalar_constant(
-    const llvm::SmallPtrSetImpl<mlir::Operation*>& operations)
+std::optional<float> scalar_constant_value(mlir::Operation* operation)
 {
-    for (mlir::Operation* operation : operations) {
-        if (!named(operation, "stablehlo.constant")) continue;
-        const auto value = operation->getAttrOfType<mlir::DenseFPElementsAttr>("value");
-        if (!value || !value.isSplat() || value.getNumElements() != 1) continue;
-        const float scalar = value.getSplatValue<llvm::APFloat>().convertToFloat();
-        if (scalar > 1000.0f) return scalar;
-    }
+    if (!named(operation, "stablehlo.constant")) return std::nullopt;
+    const auto value =
+        operation->getAttrOfType<mlir::DenseFPElementsAttr>("value");
+    if (!value || !value.isSplat() || value.getNumElements() != 1)
+        return std::nullopt;
+    return value.getSplatValue<llvm::APFloat>().convertToFloat();
+}
+
+std::optional<float> match_rope_theta(mlir::Operation* qk_dot)
+{
+    mlir::Operation* power =
+        find_backward(qk_dot->getOperand(0), "stablehlo.power");
+    if (!power || power->getNumOperands() != 2) return std::nullopt;
+    mlir::Operation* constant =
+        find_backward(power->getOperand(0), "stablehlo.constant");
+    const auto theta = scalar_constant_value(constant);
+    if (theta && *theta > 1.0f) return theta;
     return std::nullopt;
 }
 
@@ -379,7 +388,7 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
         {},
     };
     collect_backward_slice(output_dot->getResult(0), match.operations);
-    if (const auto theta = find_large_scalar_constant(match.operations))
+    if (const auto theta = match_rope_theta(qk_dot))
         match.rope_theta = *theta;
     return match;
 }

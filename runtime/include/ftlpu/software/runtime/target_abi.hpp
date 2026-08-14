@@ -16,16 +16,16 @@ inline constexpr std::string_view kLpu32StreamTargetName = "lpu_32stream_v1";
 struct ExecutableHardwareConfig {
     std::uint32_t hemispheres{2};
     std::uint32_t slices_per_hemisphere{52};
-    std::uint32_t banks_per_slice{16};
-    std::uint32_t words_per_bank{4096};
-    std::uint32_t bytes_per_word{16};
-    std::uint32_t sram_depth_rows{65536};
+    std::uint32_t banks_per_slice{2};
+    std::uint32_t words_per_bank{32768};
+    std::uint32_t bytes_per_word{32};
+    std::uint32_t sram_depth_rows{32768};
     std::uint32_t sram_read_ports_per_slice{1};
     std::uint32_t sram_write_ports_per_slice{1};
     std::uint32_t streams_per_direction{32};
     std::uint32_t encoded_streams{64};
     std::uint32_t mem_boundary_register_columns{14};
-    std::uint32_t system_register_columns{15};
+    std::uint32_t system_register_columns{16};
     std::uint32_t mem_slices_per_register_group{4};
     std::uint32_t tile_rows{4};
     std::uint32_t lanes_per_tile{8};
@@ -51,13 +51,14 @@ struct ExecutableHardwareConfig {
     std::uint32_t mxm_weight_buffers{2};
     std::uint32_t vxm_alus{16};
     std::uint32_t vxm_weight_to_iw_latency{16};
-    std::uint32_t mem_to_sxm_latency{14};
-    std::uint32_t mem_to_mxm_latency{15};
+    std::uint32_t mem_to_sxm_latency{15};
+    std::uint32_t mem_to_mxm_latency{16};
     std::uint32_t mxm0_accumulator_latency{6};
     std::uint32_t mxm1_accumulator_latency{5};
-    std::uint32_t accumulator_to_vxm_latency{18};
-    std::uint32_t accumulator_read_to_vxm_latency{15};
+    std::uint32_t accumulator_to_vxm_latency{19};
+    std::uint32_t accumulator_read_to_vxm_latency{16};
     std::uint32_t swiglu_write_latency{13};
+    std::uint32_t mxm_accumulator_blocks{hw::kMxmAccumulatorBlockCount};
 
     template <typename Visitor>
     constexpr void visit(Visitor&& visitor)
@@ -71,9 +72,28 @@ struct ExecutableHardwareConfig {
         visit_impl(*this, std::forward<Visitor>(visitor));
     }
 
+    template <typename Visitor>
+    constexpr void visit_pre_v19(Visitor&& visitor)
+    {
+        visit_pre_v19_impl(*this, std::forward<Visitor>(visitor));
+    }
+
 private:
     template <typename Self, typename Visitor>
+    static constexpr void visit_pre_v19_impl(Self& self, Visitor&& visitor)
+    {
+        visit_impl(self, std::forward<Visitor>(visitor), false);
+    }
+
+    template <typename Self, typename Visitor>
     static constexpr void visit_impl(Self& self, Visitor&& visitor)
+    {
+        visit_impl(self, std::forward<Visitor>(visitor), true);
+    }
+
+    template <typename Self, typename Visitor>
+    static constexpr void visit_impl(Self& self, Visitor&& visitor,
+                                     bool include_accumulator_capacity)
     {
         visitor(self.hemispheres); visitor(self.slices_per_hemisphere);
         visitor(self.banks_per_slice); visitor(self.words_per_bank);
@@ -107,6 +127,8 @@ private:
         visitor(self.accumulator_to_vxm_latency);
         visitor(self.accumulator_read_to_vxm_latency);
         visitor(self.swiglu_write_latency);
+        if (include_accumulator_capacity)
+            visitor(self.mxm_accumulator_blocks);
     }
 };
 
@@ -136,7 +158,7 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     config.mxms_per_hemisphere =
         static_cast<std::uint32_t>(mxms_per_hemisphere);
     TargetAbiHasher hash;
-    hash.add(7); // Hardware ABI schema version.
+    hash.add(13); // Hardware ABI schema version (MXM accumulator capacity).
     config.visit([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }
@@ -145,7 +167,7 @@ constexpr std::uint64_t executable_target_abi(
     const ExecutableHardwareConfig& config)
 {
     TargetAbiHasher hash;
-    hash.add(7); // Hardware ABI schema version.
+    hash.add(13); // Hardware ABI schema version (MXM accumulator capacity).
     config.visit([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }

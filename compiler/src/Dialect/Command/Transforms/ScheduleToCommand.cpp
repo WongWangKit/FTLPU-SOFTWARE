@@ -34,6 +34,22 @@ int64_t placement_integer(mlir::DictionaryAttr placement, llvm::StringRef name)
     return placement.getAs<mlir::IntegerAttr>(name).getInt();
 }
 
+int64_t placement_integer_or(mlir::DictionaryAttr placement,
+    llvm::StringRef name, int64_t fallback)
+{
+    if (auto value = placement.getAs<mlir::IntegerAttr>(name))
+        return value.getInt();
+    return fallback;
+}
+
+int64_t mem_queue(const target::LPUTargetModel& target,
+    int64_t hemisphere, int64_t slice, int64_t bank)
+{
+    return hemisphere * target.memory().slices_per_hemisphere
+            * target.memory().banks_per_slice
+        + slice * target.memory().banks_per_slice + bank;
+}
+
 mlir::StringAttr placement_hemisphere(mlir::DictionaryAttr placement,
     mlir::DictionaryAttr address)
 {
@@ -161,7 +177,8 @@ command::MxmOp create_mxm_command(
     int64_t weight_column, int64_t activation_stream_base, int64_t output_stream_base,
     int64_t repeat_count, int64_t repeat_interval, int64_t accumulator_address,
     int64_t accumulator_row_stride, llvm::StringRef accumulator_destination,
-    bool accumulator_clear = true, llvm::StringRef data_format = "fp16")
+    bool accumulator_clear = true, llvm::StringRef data_format = "fp16",
+    llvm::StringRef accumulator_output_format = "fp32")
 {
     mlir::OperationState state(location, command::MxmOp::getOperationName());
     state.addAttributes({
@@ -179,6 +196,8 @@ command::MxmOp create_mxm_command(
         builder.getNamedAttr("accumulator_destination", builder.getStringAttr(accumulator_destination)),
         builder.getNamedAttr("accumulator_clear", builder.getBoolAttr(accumulator_clear)),
         builder.getNamedAttr("data_format", builder.getStringAttr(data_format)),
+        builder.getNamedAttr("accumulator_output_format",
+            builder.getStringAttr(accumulator_output_format)),
     });
     return llvm::cast<command::MxmOp>(builder.create(state));
 }
@@ -187,11 +206,18 @@ void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op,
     int64_t repeatCount = -1, int64_t repeatInterval = -1)
 {
     mlir::OperationState state(op.getLoc(), command::VxmOp::getOperationName());
-    for (llvm::StringRef name : {"cycle", "queue", "opcode", "lhs_kind",
-             "lhs_index", "lhs_immediate", "rhs_kind", "rhs_index",
-             "rhs_immediate", "cast_target", "output_stream", "repeat_count",
-             "repeat_interval", "input_hemisphere", "output_hemisphere"})
-        state.addAttribute(name, op->getAttr(name));
+      for (llvm::StringRef name : {"cycle", "queue", "opcode", "lhs_kind",
+               "lhs_index", "lhs_immediate", "rhs_kind", "rhs_index",
+               "rhs_immediate", "cast_target", "output_stream", "repeat_count",
+               "repeat_interval", "input_hemisphere", "output_hemisphere",
+               "accumulator_reset", "accumulator_write", "accumulator_emit",
+               "local_scalar_write"})
+          if (mlir::Attribute attribute = op->getAttr(name))
+              state.addAttribute(name, attribute);
+    state.addAttribute("chain_depth",
+        op->getAttr("chain_depth")
+            ? op->getAttr("chain_depth")
+            : builder.getI64IntegerAttr(8));
     if (auto scaleBinding = op.getScaleBindingAttr())
         state.addAttribute("scale_binding", scaleBinding);
     if (repeatCount >= 0)
@@ -205,10 +231,12 @@ void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op,
 
 bool same_vxm_command(schedule::VxmOp lhs, schedule::VxmOp rhs)
 {
-    for (llvm::StringRef name : {"queue", "opcode", "lhs_kind",
+    for (llvm::StringRef name : {"queue", "opcode", "chain_depth", "lhs_kind",
              "lhs_index", "lhs_immediate", "rhs_kind", "rhs_index",
              "rhs_immediate", "cast_target", "output_stream",
-             "input_hemisphere", "output_hemisphere", "scale_binding"}) {
+             "input_hemisphere", "output_hemisphere", "scale_binding",
+             "accumulator_reset", "accumulator_write", "accumulator_emit",
+             "local_scalar_write"}) {
         if (lhs->getAttr(name) != rhs->getAttr(name)) return false;
     }
     return lhs.getRepeatCount() == 1 && rhs.getRepeatCount() == 1;
@@ -218,7 +246,9 @@ void create_sxm_command(mlir::OpBuilder& builder, schedule::SxmOp op)
 {
     mlir::OperationState state(op.getLoc(), command::SxmOp::getOperationName());
     for (llvm::StringRef name : {"cycle", "hemisphere", "opcode", "source_streams",
-             "destination_streams", "permute_map", "weight_layout"})
+               "destination_streams", "permute_map", "weight_layout",
+               "output_row", "input_row", "output_tile"})
+        if (op->getAttr(name))
         state.addAttribute(name, op->getAttr(name));
     state.addAttribute("repeat_count", builder.getI64IntegerAttr(
         op.getRepeatCount().value_or(1)));
@@ -235,8 +265,8 @@ void create_mem_transfer_command(mlir::OpBuilder& builder,
              "repeat_count", "repeat_interval", "address_stride"})
         state.addAttribute(name, op->getAttr(name));
     state.addAttribute("queue", builder.getI64IntegerAttr(
-        op.getHemisphere() * target.memory().slices_per_hemisphere
-        + op.getSlice()));
+        mem_queue(target, op.getHemisphere(), op.getSlice(),
+            op.getBank().value_or(0))));
     for (llvm::StringRef name :
         {"wave_count", "wave_interval", "wave_address_stride",
             "address_binding"})
@@ -264,7 +294,10 @@ void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
     state.addAttribute("queue", builder.getI64IntegerAttr(op.getUnitId()));
     for (llvm::StringRef name :
         {"weight_load_mode", "weight_inner_column",
-            "weight_input_mode", "compute_mode"})
+            "weight_input_mode", "compute_mode", "wave_count",
+            "wave_interval", "wave_weight_column_stride",
+            "wave_accumulator_address_stride",
+            "group_count", "group_interval"})
         if (mlir::Attribute attribute = op->getAttr(name))
             state.addAttribute(name, attribute);
     builder.create(state);
@@ -285,6 +318,9 @@ void create_mxm_dequant_command(
         builder.getNamedAttr(
             "repeat_interval", op.getRepeatIntervalAttr()),
     });
+    for (llvm::StringRef name : {"wave_count", "wave_interval"})
+        if (mlir::Attribute attribute = op->getAttr(name))
+            state.addAttribute(name, attribute);
     builder.create(state);
 }
 
@@ -498,10 +534,14 @@ public:
                 schedule::MemTransferOp rhs) {
                 const int64_t lhsQueue = lhs.getHemisphere()
                         * target.memory().slices_per_hemisphere
-                    + lhs.getSlice();
+                        * target.memory().banks_per_slice
+                    + lhs.getSlice() * target.memory().banks_per_slice
+                    + lhs.getBank().value_or(0);
                 const int64_t rhsQueue = rhs.getHemisphere()
                         * target.memory().slices_per_hemisphere
-                    + rhs.getSlice();
+                        * target.memory().banks_per_slice
+                    + rhs.getSlice() * target.memory().banks_per_slice
+                    + rhs.getBank().value_or(0);
                 return lhsQueue != rhsQueue
                     ? lhsQueue < rhsQueue
                     : lhs.getCycle() < rhs.getCycle();
@@ -509,9 +549,9 @@ public:
         for (std::size_t index = 0;
              index < mem_transfers.size();) {
             schedule::MemTransferOp first = mem_transfers[index];
-            const int64_t queue = first.getHemisphere()
-                    * target.memory().slices_per_hemisphere
-                + first.getSlice();
+            const int64_t queue = mem_queue(target, first.getHemisphere(),
+                first.getSlice(),
+                first.getBank().value_or(0));
             std::size_t end = index + 1;
             int64_t interval = 1;
             int64_t stride = first.getAddressStride();
@@ -524,7 +564,9 @@ public:
                 schedule::MemTransferOp second = mem_transfers[end];
                 const int64_t secondQueue = second.getHemisphere()
                         * target.memory().slices_per_hemisphere
-                    + second.getSlice();
+                        * target.memory().banks_per_slice
+                    + second.getSlice() * target.memory().banks_per_slice
+                    + second.getBank().value_or(0);
                 const bool compatible =
                     secondQueue == queue
                     && second.getRepeatCount() == 1
@@ -548,10 +590,9 @@ public:
                             schedule::MemTransferOp next =
                                 mem_transfers[end];
                             const int64_t nextQueue =
-                                next.getHemisphere()
-                                        * target.memory()
-                                              .slices_per_hemisphere
-                                    + next.getSlice();
+                                mem_queue(target, next.getHemisphere(),
+                                    next.getSlice(),
+                                    next.getBank().value_or(0));
                             const int64_t repeat =
                                 static_cast<int64_t>(end - index);
                             if (nextQueue != queue
@@ -617,10 +658,9 @@ public:
             int64_t interval = first.getRepeatInterval();
             if (end < vxms.size()
                 && same_vxm_command(first, vxms[end])) {
-                interval =
-                    vxms[end].getCycle() - first.getCycle();
-                if (interval > 0
-                    && interval <= kMaxRepeatInterval) {
+                  interval =
+                      vxms[end].getCycle() - first.getCycle();
+                  if (interval == 1) {
                     ++end;
                     while (end < vxms.size()
                         && static_cast<int64_t>(end - index)
@@ -668,6 +708,8 @@ public:
             const int64_t base_row = placement_integer(read.getPlacement(), "base_row");
             const int64_t count = placement_integer(read.getPlacement(), "instruction_count");
             const int64_t stride = placement_integer(read.getPlacement(), "address_stride");
+            const int64_t bank = placement_integer_or(
+                read.getPlacement(), "bank", 0);
             auto hemisphere = placement_hemisphere(read.getPlacement(), read.getAddress());
             if (!hemisphere || slices.empty()
                 || (slices.size() != 1
@@ -718,8 +760,8 @@ public:
                     read.getLoc(),
                     static_cast<int64_t>(read.getCycle())
                         + max_latency - latency,
-                    (west_hemisphere ? target.memory().slices_per_hemisphere : 0)
-                        + slices[index],
+                    mem_queue(target, west_hemisphere ? 1 : 0,
+                        slices[index], bank),
                     command_base,
                     (west_stream ? 32 : 0)
                         + static_cast<int64_t>(read.getStreamBase())
@@ -868,7 +910,8 @@ public:
                 compute.getOutputStreamBase(), compute.getDuration(), 1,
                 placement_integer(accumulator.getPlacement(), "base_row"),
                 accumulator.getAddressStride(), accumulator.getDestination(),
-                true, compute.getDataFormat().value_or("fp16"));
+                true, compute.getDataFormat().value_or("fp16"),
+                accumulator.getAccumulatorOutputFormat().value_or("fp32"));
             if (auto mode = compute.getComputeModeAttr())
                 command->setAttr("compute_mode", mode);
         }
@@ -887,6 +930,8 @@ public:
             const int64_t base_row = placement_integer(write.getPlacement(), "base_row");
             const int64_t count = placement_integer(write.getPlacement(), "instruction_count");
             const int64_t stride = placement_integer(write.getPlacement(), "address_stride");
+            const int64_t bank = placement_integer_or(
+                write.getPlacement(), "bank", 0);
             auto hemisphere = placement_hemisphere(write.getPlacement(), write.getAddress());
             if (!hemisphere
                 || static_cast<int64_t>(slices.size()) != write.getStreamCount()) {
@@ -900,7 +945,8 @@ public:
             for (size_t index = 0; index < slices.size(); ++index) {
                 create_mem_command(builder, write.getLoc(),
                     write.getCycle(),
-                    (west_hemisphere ? target.memory().slices_per_hemisphere : 0) + slices[index],
+                    mem_queue(target, west_hemisphere ? 1 : 0,
+                        slices[index], bank),
                     "write", base_row,
                     (west_stream ? 32 : 0) + write.getStreamBase() + static_cast<int64_t>(index),
                     count, 1, stride);
@@ -912,7 +958,10 @@ public:
         });
         function.setType(mlir::FunctionType::get(
             &getContext(), function.getArgumentTypes(), mlir::TypeRange {}));
-        llvm::SmallVector<mlir::Operation*> ordered_schedule_ops;
+        // Preserve block order while collecting the complete lowered SSA
+        // graph. Reverse deletion then removes Schedule consumers before the
+        // Stream route aliases they consume, and aliases before bindings.
+        llvm::SmallVector<mlir::Operation*> lowered_ops;
         function.walk([&](mlir::Operation* op) {
             if (llvm::isa<schedule::MemReadOp, schedule::MxmLoadOp,
                     schedule::MxmComputeOp,
@@ -921,18 +970,19 @@ public:
                     schedule::MemTransferOp, schedule::MxmIssueOp,
                     schedule::MxmDequantOp,
                     schedule::MemAccumulateOp, schedule::MemWriteOp,
-                    schedule::BindingOp, schedule::TimelineOp>(op))
-                ordered_schedule_ops.push_back(op);
+                    schedule::BindingOp, schedule::TimelineOp,
+                    stream::RouteOp, stream::DequantizeOp>(op))
+                lowered_ops.push_back(op);
         });
-        for (auto it = ordered_schedule_ops.rbegin(); it != ordered_schedule_ops.rend(); ++it)
+        for (auto it = lowered_ops.rbegin(); it != lowered_ops.rend(); ++it) {
+            if (!(*it)->use_empty()) {
+                (*it)->emitError(
+                    "lowered operation still has live users after Command lowering");
+                signalPassFailure();
+                return;
+            }
             (*it)->erase();
-        llvm::SmallVector<mlir::Operation*> dead_stream_ops;
-        function.walk([&](mlir::Operation* op) {
-            if (llvm::isa<stream::RouteOp, stream::DequantizeOp>(op))
-                dead_stream_ops.push_back(op);
-        });
-        for (auto it = dead_stream_ops.rbegin(); it != dead_stream_ops.rend(); ++it)
-            if ((*it)->use_empty()) (*it)->erase();
+        }
     }
 };
 

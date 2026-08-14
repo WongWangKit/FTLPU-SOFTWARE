@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Imports one Llama-compatible Hugging Face decoder layer without PyTorch."""
+"""Imports one Llama/Qwen2 Hugging Face decoder layer without PyTorch."""
 
 from __future__ import annotations
 
@@ -106,6 +106,18 @@ def linear(value: np.ndarray, weight: np.ndarray, scale: float) -> np.ndarray:
     return bf16(value @ (weight.astype(np.float32) * scale))
 
 
+def biased_linear(
+    value: np.ndarray,
+    weight: np.ndarray,
+    scale: float,
+    bias: np.ndarray | None,
+) -> np.ndarray:
+    result = value @ (weight.astype(np.float32) * scale)
+    if bias is not None:
+        result += bias
+    return bf16(result)
+
+
 def rope(value: np.ndarray, theta: float) -> np.ndarray:
     seq_len, _, head_dim = value.shape
     half = head_dim // 2
@@ -127,6 +139,7 @@ def decoder_layer_reference(
     weights: dict[str, np.ndarray],
     scales: dict[str, float],
     config: dict[str, object],
+    biases: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     seq_len, hidden = activation.shape
     query_heads = int(config["num_attention_heads"])
@@ -135,19 +148,23 @@ def decoder_layer_reference(
     epsilon = float(config["rms_norm_eps"])
 
     normalized = rms_norm(activation, norm0, epsilon)
+    biases = biases or {}
     query = rope(
-        linear(normalized, weights["query"], scales["query"]).reshape(
+        biased_linear(normalized, weights["query"], scales["query"],
+                      biases.get("query")).reshape(
             seq_len, query_heads, head_dim
         ),
         float(config["rope_theta"]),
     )
     key = rope(
-        linear(normalized, weights["key"], scales["key"]).reshape(
+        biased_linear(normalized, weights["key"], scales["key"],
+                      biases.get("key")).reshape(
             seq_len, kv_heads, head_dim
         ),
         float(config["rope_theta"]),
     )
-    value = linear(normalized, weights["value"], scales["value"]).reshape(
+    value = biased_linear(normalized, weights["value"], scales["value"],
+                          biases.get("value")).reshape(
         seq_len, kv_heads, head_dim
     )
     repeats = query_heads // kv_heads
@@ -193,8 +210,8 @@ def main() -> None:
     config = json.loads(
         (args.model_dir / "config.json").read_text(encoding="utf-8")
     )
-    if config.get("model_type") != "llama":
-        raise ValueError("only standard Llama-compatible checkpoints are supported")
+    if config.get("model_type") not in ("llama", "qwen2"):
+        raise ValueError("only standard Llama and Qwen2 checkpoints are supported")
     if args.seq_len % 32:
         raise ValueError("current LPU decoder executable requires seq_len divisible by 32")
 
@@ -214,6 +231,12 @@ def main() -> None:
     for role, name in names.items():
         quantized[role], scales[role] = quantize_linear(store.read(name))
 
+    biases: dict[str, np.ndarray] = {}
+    if config.get("attention_bias", config.get("model_type") == "qwen2"):
+        for role, stem in (("query", "q_proj"), ("key", "k_proj"),
+                           ("value", "v_proj")):
+            biases[role] = store.read(f"{prefix}.self_attn.{stem}.bias")
+
     norm0 = store.read(f"{prefix}.input_layernorm.weight")
     norm1 = store.read(f"{prefix}.post_attention_layernorm.weight")
     embedding = store.read("model.embed_tokens.weight")
@@ -226,7 +249,7 @@ def main() -> None:
     else:
         activation = bf16(embedding[token_ids])
     golden = decoder_layer_reference(
-        activation, norm0, norm1, quantized, scales, config
+        activation, norm0, norm1, quantized, scales, config, biases
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -241,6 +264,8 @@ def main() -> None:
     token_ids.astype("<i8").tofile(args.output_dir / "token_ids.i64.bin")
     for role, value in quantized.items():
         value.tofile(args.output_dir / f"{role}.i8.bin")
+    for role, value in biases.items():
+        write_bf16(args.output_dir / f"{role}_bias.bf16.bin", value)
 
     metadata = {
         "model": args.model_dir.name,
@@ -256,6 +281,14 @@ def main() -> None:
         "rms_norm_eps": float(config["rms_norm_eps"]),
         "scales": scales,
         "source_tensors": names,
+        "attention_bias": bool(biases),
+        "bias_roles": sorted(biases),
+        "bias_tensors": {
+            role: f"{prefix}.self_attn.{stem}.bias"
+            for role, stem in (("query", "q_proj"), ("key", "k_proj"),
+                               ("value", "v_proj"))
+            if role in biases
+        },
         "activation_element_type": "bf16",
         "input_source": (
             str(args.input_bf16) if args.input_bf16 else "embedding"

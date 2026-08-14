@@ -3,6 +3,7 @@
 #include "AttentionEmitterUtils.hpp"
 #include "FfnEmitterUtils.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_block8_projection_planner.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/stream_fabric_scheduler.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/resource_scheduler.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 
@@ -68,64 +69,59 @@ llvm::SmallVector<int64_t> chooseScratchSlices(
 }
 
 std::pair<VxmOp, VxmOp> emitScratchSwish(
-    FfnEmissionContext& context, int64_t cycle, int64_t hemisphere,
-    int64_t outputStreamBase)
+    FfnEmissionContext& context, int64_t cycle, int64_t repeatCount = 1,
+    int64_t repeatInterval = 1)
 {
     using attention_detail::emitVxm;
     auto& rewriter = context.rewriter;
     auto& ffn = context.ffn;
-    const auto& target = context.target;
-    const auto hemi = context.hemisphereName(hemisphere);
+    constexpr llvm::StringLiteral east = "east";
+    constexpr llvm::StringLiteral west = "west";
     const auto dataFormat = lpu_16bit_data_format(
         llvm::cast<mlir::RankedTensorType>(
             ffn.getActivation().getType()).getElementType());
-    const int64_t west = target.streams().streams_per_direction;
     mlir::Value value = ffn.getActivation();
+    const auto repeated = [&](VxmOp op) {
+        op.setRepeatCountAttr(rewriter.getI64IntegerAttr(repeatCount));
+        op.setRepeatIntervalAttr(
+            rewriter.getI64IntegerAttr(repeatInterval));
+        return op;
+    };
+    const int64_t configCycle = cycle - 1;
 
-    value = emitVxm(rewriter, ffn.getLoc(), value, cycle, 0,
+    value = repeated(emitVxm(rewriter, ffn.getLoc(), value, configCycle, 0,
         "negate", lpu_16bit_stream_kind(
             llvm::cast<mlir::RankedTensorType>(
                 ffn.getActivation().getType()).getElementType()),
-        west, 0.0f, "immediate", 0, 0.0f, "fp32", -1,
-        hemi, hemi).getResult();
-    value = emitVxm(rewriter, ffn.getLoc(), value, cycle, 1,
-        "multiply", lpu_16bit_stream_kind(
+        0, 0.0f, lpu_16bit_stream_kind(
             llvm::cast<mlir::RankedTensorType>(
                 ffn.getActivation().getType()).getElementType()),
-        west, 0.0f, lpu_16bit_stream_kind(
-            llvm::cast<mlir::RankedTensorType>(
-                ffn.getActivation().getType()).getElementType()),
-        west + 2, 0.0f, "fp32", -1, hemi, hemi).getResult();
-    value = emitVxm(rewriter, ffn.getLoc(), value, cycle + 1, 2,
-        "exp", "alu", 0, 0.0f, "immediate", 0, 0.0f,
-        "fp32", -1, hemi, hemi).getResult();
-    value = emitVxm(rewriter, ffn.getLoc(), value, cycle + 1, 5,
-        "pass", "alu", 1, 0.0f, "immediate", 0, 0.0f,
-        "fp32", -1, hemi, hemi).getResult();
-    value = emitVxm(rewriter, ffn.getLoc(), value, cycle + 2, 3,
-        "add", "alu", 2, 0.0f, "immediate", 0, 1.0f,
-        "fp32", -1, hemi, hemi).getResult();
-    value = emitVxm(rewriter, ffn.getLoc(), value, cycle + 2, 6,
-        "pass", "alu", 5, 0.0f, "immediate", 0, 0.0f,
-        "fp32", -1, hemi, hemi).getResult();
-    value = emitVxm(rewriter, ffn.getLoc(), value, cycle + 3, 4,
-        "divide", "immediate", 0, 1.0f, "alu", 3, 0.0f,
-        "fp32", -1, hemi, hemi).getResult();
-    value = emitVxm(rewriter, ffn.getLoc(), value, cycle + 3, 7,
-        "pass", "alu", 6, 0.0f, "immediate", 0, 0.0f,
-        "fp32", -1, hemi, hemi).getResult();
-    value = emitVxm(rewriter, ffn.getLoc(), value, cycle + 4, 8,
-        "multiply", "alu", 7, 0.0f, "alu", 4, 0.0f,
-        "fp32", -1, hemi, hemi).getResult();
-    auto local = emitVxm(rewriter, ffn.getLoc(), value, cycle + 5, 9,
-        "cast", "alu", 8, 0.0f, "immediate", 0, 0.0f,
-        dataFormat, outputStreamBase, hemi, hemi);
-    auto peer = emitVxm(rewriter, ffn.getLoc(), value, cycle + 5, 10,
-        "cast", "alu", 8, 0.0f, "immediate", 0, 0.0f,
-        dataFormat, outputStreamBase, hemi,
-        context.hemisphereName(1 - hemisphere));
-    return {local, peer};
+        2, 0.0f, "fp32", -1, east, east)).getResult();
+    value = repeated(emitVxm(rewriter, ffn.getLoc(), value, configCycle, 1,
+        "exp", "previous", 0, 0.0f, "immediate", 0, 0.0f,
+        "fp32", -1, east, east)).getResult();
+    value = repeated(emitVxm(rewriter, ffn.getLoc(), value, configCycle, 2,
+        "add", "previous", 0, 0.0f, "immediate", 0, 1.0f,
+        "fp32", -1, east, east)).getResult();
+    value = repeated(emitVxm(rewriter, ffn.getLoc(), value, configCycle, 3,
+        "reciprocal", "previous", 0, 0.0f, "immediate", 0, 0.0f,
+        "fp32", -1, east, east)).getResult();
+    value = repeated(emitVxm(rewriter, ffn.getLoc(), value, configCycle, 4,
+        "multiply", "previous", 0, 0.0f, "original", 0, 0.0f,
+        "fp32", -1, east, east)).getResult();
+    value = repeated(emitVxm(rewriter, ffn.getLoc(), value, configCycle, 5,
+        "multiply", "previous", 0, 0.0f, "auxiliary", 0, 0.0f,
+        "fp32", -1, east, east)).getResult();
+    value = repeated(emitVxm(rewriter, ffn.getLoc(), value, configCycle, 6,
+        "bypass", "previous", 0, 0.0f, "immediate", 0, 0.0f,
+        "fp32", -1, east, east)).getResult();
+    auto tail = repeated(emitVxm(rewriter, ffn.getLoc(), value, configCycle, 7,
+        "bypass", "previous", 0, 0.0f, "immediate", 0, 0.0f,
+        dataFormat, 6, east, west));
+    return {tail, tail};
 }
+
+constexpr int64_t kVxmSwishLatency = 17;
 
 } // namespace
 
@@ -133,8 +129,11 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
     FfnEmissionContext& context)
 {
     using attention_detail::emitMem;
+    using attention_detail::emitMemWave;
     using attention_detail::emitMxm;
+    using attention_detail::emitMxmWave;
     using attention_detail::emitMxmDequant;
+    using attention_detail::emitMxmDequantWave;
     using attention_detail::emitVxm;
 
     auto& rewriter = context.rewriter;
@@ -216,10 +215,15 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
             + placement.getAs<mlir::IntegerAttr>(
                   "instruction_count").getInt();
     };
+    const auto scratchVisibleEnd = [&](mlir::DictionaryAttr placement) {
+        const auto bank = placement.getAs<mlir::IntegerAttr>("bank");
+        return bank && bank.getInt() != 0
+            ? int64_t {0} : placementEnd(placement);
+    };
     const int64_t scratchBase = std::max({hiddenBase + hiddenRows,
-        placementEnd(context.gate_raw.getPlacement()),
-        placementEnd(context.up_raw.getPlacement()),
-        placementEnd(context.down_raw.getPlacement())});
+        scratchVisibleEnd(context.gate_raw.getPlacement()),
+        scratchVisibleEnd(context.up_raw.getPlacement()),
+        scratchVisibleEnd(context.down_raw.getPlacement())});
     const int64_t scratchRowsPerPair = tokenBlocks * blockIssues;
     if (scratchBase + pairCount * scratchRowsPerPair
         > memory.sram_depth_rows)
@@ -254,10 +258,6 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
         && target.streams().streams_per_direction >= 32;
     const bool fused = context.strategy == FfnScheduleStrategy::Fused
         && context.fused_output.has_value();
-    const int64_t swishOutputStreamBase = fused
-        ? context.fused_output->stream_base
-        : 0;
-
     int64_t phaseStart = maxWeightLatency + 1;
     mlir::Value lastHidden = activation;
     int64_t lastSwishCycle = 0;
@@ -271,7 +271,20 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
             + "." + std::to_string(slice);
     };
     ResourceScheduler memScheduler;
-    for (int64_t pair = 0; pair < pairCount; ++pair) {
+    // Pair-level compaction must repeat the complete reduction window. A
+    // per-command outer repeat changes the accumulator order from
+    // pair-major to reduction-major and corrupts sparse projections.
+    const bool compactPairWaves = false;
+    const int64_t pairGroupCount = compactPairWaves ? pairCount : 1;
+    int64_t pairGroupInterval = reductionBlocks * tokenBlocks
+        * throughput.mxm_block_group_interval;
+    const int64_t emittedPairCount = compactPairWaves ? 1 : pairCount;
+    llvm::SmallVector<mlir::Operation*> compactWaveOps;
+    const auto rememberCompactWave = [&]() {
+        if (compactPairWaves)
+            compactWaveOps.push_back(ffn.getOperation()->getPrevNode());
+    };
+    for (int64_t pair = 0; pair < emittedPairCount; ++pair) {
         int64_t pairDrainEnd = phaseStart;
         if (throughput.mxms_per_hemisphere == 1) {
             const int64_t rowBlocks = context.m() / blockRows;
@@ -292,39 +305,44 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
                 for (int64_t hemisphere = 0;
                      hemisphere < memory.hemispheres; ++hemisphere) {
                     const int64_t unit = hemisphere;
-                    for (int64_t pulse = 0;
-                         pulse < throughput.tile_rows; ++pulse) {
-                        const int64_t cycle = loadStart + pulse;
-                        const int64_t address = weightBase
-                            + (pair * reductionBlocks + reduction)
-                                * throughput.tile_rows
-                            + throughput.tile_rows - 1 - pulse;
-                        for (int64_t stream = 0; stream < 8; ++stream) {
-                            const int64_t slice = weightSlices[stream];
-                            const auto latency = target.transport_latency(
-                                target::StreamEndpoint::Mem,
-                                target::StreamEndpoint::MxmWeight,
-                                target::StreamDirection::East, slice);
-                            if (!latency) return mlir::failure();
-                            emitMem(rewriter, ffn.getLoc(),
-                                cycle - *latency,
-                                hemisphere
-                                        * memory.slices_per_hemisphere
-                                    + slice,
-                                "read", address, stream,
-                                1, 1, 0, "sram", binding);
-                            memScheduler.reserve_at(cycle - *latency,
-                                {{memResource("read", hemisphere, slice),
-                                    0, 1}});
-                        }
-                        emitMxmDequant(rewriter, ffn.getLoc(),
-                            cycle, unit, scale);
-                        emitMxm(rewriter, ffn.getLoc(), cycle, unit,
-                            "iw", weightBuffer, pulse,
-                            0, 0, 1, 1, 0, 1, "sram", true,
-                            "supercell", 0, dataFormat,
-                            "int8_dequant_bf16");
+                    const int64_t firstAddress = weightBase
+                        + (pair * reductionBlocks + reduction)
+                            * throughput.tile_rows
+                        + throughput.tile_rows - 1;
+                    for (int64_t stream = 0; stream < 8; ++stream) {
+                        const int64_t slice = weightSlices[stream];
+                        const auto latency = target.transport_latency(
+                            target::StreamEndpoint::Mem,
+                            target::StreamEndpoint::MxmWeight,
+                            target::StreamDirection::East, slice);
+                        if (!latency) return mlir::failure();
+                        emitMemWave(rewriter, ffn.getLoc(),
+                            loadStart - *latency,
+                            hemisphere * memory.slices_per_hemisphere
+                                + slice,
+                            "read", firstAddress, stream,
+                            throughput.tile_rows, 1, -1,
+                            "sram", binding, pairGroupCount,
+                            pairGroupInterval,
+                            reductionBlocks * throughput.tile_rows);
+                        rememberCompactWave();
+                        memScheduler.reserve_at(loadStart - *latency,
+                            {{memResource("read", hemisphere, slice),
+                                0, throughput.tile_rows}});
                     }
+                    emitMxmDequantWave(rewriter, ffn.getLoc(),
+                        loadStart, unit, scale,
+                        throughput.tile_rows, 1,
+                        pairGroupCount, pairGroupInterval);
+                    rememberCompactWave();
+                    emitMxmWave(rewriter, ffn.getLoc(), loadStart, unit,
+                        "iw", weightBuffer, 0,
+                        0, 0, 1, 1, 0, 1, "sram", true,
+                        "supercell", 0, dataFormat,
+                        "int8_dequant_bf16", {}, {},
+                        throughput.tile_rows, 1, 1,
+                        pairGroupCount, pairGroupInterval);
+                    rememberCompactWave();
                 }
                 return mlir::success();
             };
@@ -362,7 +380,7 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
                                 target::StreamEndpoint::MxmActivation,
                                 target::StreamDirection::East, slice);
                             if (!latency) return mlir::failure();
-                            emitMem(rewriter, ffn.getLoc(),
+                            emitMemWave(rewriter, ffn.getLoc(),
                                 computeCycle - *latency,
                                 hemisphere
                                         * memory.slices_per_hemisphere
@@ -370,7 +388,9 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
                                 "read", activationAddress,
                                 activationStreamBase + stream,
                                 blockIssues, 1, 1,
-                                "sram", activationBinding);
+                                "sram", activationBinding,
+                                pairGroupCount, pairGroupInterval, 0);
+                            rememberCompactWave();
                             memScheduler.reserve_at(computeCycle - *latency,
                                 {{memResource("read", hemisphere, slice),
                                     0, blockIssues}});
@@ -378,12 +398,18 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
                         const int64_t accumulatorBase =
                             projection * rowBlocks
                             + tokenBlock * blockIssues;
-                        emitMxm(rewriter, ffn.getLoc(), computeCycle,
+                        emitMxmWave(rewriter, ffn.getLoc(), computeCycle,
                             hemisphere, "compute", weightBuffer, 0,
                             activationStreamBase, 0,
                             blockIssues, 1, accumulatorBase, 1,
-                            finalReduction ? "stream" : "sram", true,
-                            "supercell", 0, dataFormat, {}, "block8");
+                            finalReduction ? "stream" : "sram",
+                            finalReduction,
+                            "supercell", 0, dataFormat, {}, "block8",
+                            finalReduction ? dataFormat
+                                           : llvm::StringRef {},
+                            1, 1, 0,
+                            pairGroupCount, pairGroupInterval);
+                        rememberCompactWave();
                         if (!finalReduction) continue;
 
                         const auto& slices = projection == 0
@@ -401,14 +427,17 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
                             const int64_t writeCycle = computeCycle
                                 + target.mxm_first_result_latency()
                                 + *latency;
-                            emitMem(rewriter, ffn.getLoc(), writeCycle,
+                            emitMemWave(rewriter, ffn.getLoc(), writeCycle,
                                 hemisphere
                                         * memory.slices_per_hemisphere
                                     + slice,
                                 "write", scratchAddress,
                                 target.streams().streams_per_direction
                                     + stream,
-                                blockIssues, 1, 1);
+                                blockIssues, 1, 1, "sram", -1,
+                                pairGroupCount, pairGroupInterval,
+                                scratchRowsPerPair);
+                            rememberCompactWave();
                             memScheduler.reserve_at(writeCycle,
                                 {{memResource("write", hemisphere, slice),
                                     0, blockIssues}});
@@ -444,11 +473,34 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
                         1, reduction, upCompute, 1)))
                     return mlir::failure();
             }
+            if (compactPairWaves) {
+                const int64_t nominalInterval = pairGroupInterval;
+                pairGroupInterval =
+                    memScheduler.minimum_non_overlapping_shift(
+                        nominalInterval);
+                if (pairGroupInterval != nominalInterval) {
+                    for (mlir::Operation* operation : compactWaveOps) {
+                        if (operation->hasAttr("group_interval"))
+                            operation->setAttr("group_interval",
+                                rewriter.getI64IntegerAttr(
+                                    pairGroupInterval));
+                        else if (operation->hasAttr("wave_interval"))
+                            operation->setAttr("wave_interval",
+                                rewriter.getI64IntegerAttr(
+                                    pairGroupInterval));
+                    }
+                }
+            }
             const int64_t pairComputeEnd = firstGateCompute
                 + reductionBlocks * tokenBlocks
                     * throughput.mxm_block_group_interval;
-            phaseStart = pairComputeEnd
-                - throughput.mxm_local_load_to_compute_latency;
+            phaseStart = std::max(
+                pairComputeEnd
+                    - throughput.mxm_local_load_to_compute_latency
+                    + (pairGroupCount - 1) * pairGroupInterval,
+                pairDrainEnd + maxWeightLatency);
+            pairDrainEnd +=
+                (pairGroupCount - 1) * pairGroupInterval;
             projectionDrainEnd = std::max(
                 projectionDrainEnd, pairDrainEnd);
             pairDrainEnds.push_back(pairDrainEnd);
@@ -586,8 +638,10 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
                             blockIssues, 1,
                             tokenBlock * blockIssues,
                             1, finalReduction ? "stream" : "sram",
-                            true, "supercell", 0,
-                            dataFormat, {}, "block8");
+                            finalReduction, "supercell", 0,
+                            dataFormat, {}, "block8",
+                            finalReduction ? dataFormat
+                                           : llvm::StringRef {});
                         if (!finalReduction) continue;
 
                         const auto& slices = localMxm == 0
@@ -661,13 +715,58 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
     int64_t swishCycle = (fused ? pairDrainEnds.front()
                                 : projectionDrainEnd)
         + maxScratchReadLatency + 1;
+    // A token-block boundary may need one issue slot per hemisphere while
+    // the MEM read/write ports switch to the next distributed address wave.
+    // Include those slots in the outer pair repeat so repeated VXM programs
+    // cannot overlap the tail of the representative pair.
+    mlir::Value localSwish = activation;
+    mlir::Value peerSwish = activation;
     for (int64_t pair = 0; pair < pairCount; ++pair) {
         if (fused)
             swishCycle = std::max(swishCycle,
                 pairDrainEnds[pair] + maxScratchReadLatency + 1);
         for (int64_t tokenBlock = 0;
              tokenBlock < tokenBlocks; ++tokenBlock) {
+            llvm::SmallVector<ResourceWindow> blockMemWindows;
             for (int64_t row = 0; row < tile; ++row) {
+                const int64_t tokenLane = row % blockRows;
+                for (int64_t hemisphere = 0;
+                     hemisphere < memory.hemispheres; ++hemisphere) {
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t gateSlice =
+                            gateScratchSlices[2 * tokenLane + byte];
+                        const int64_t upSlice =
+                            upScratchSlices[2 * tokenLane + byte];
+                        blockMemWindows.push_back({
+                            memResource("read", hemisphere, gateSlice),
+                            row - context.westLatency(gateSlice), 1});
+                        blockMemWindows.push_back({
+                            memResource("read", hemisphere, upSlice),
+                            row - context.westLatency(upSlice), 1});
+                        const int64_t destination = 1 - hemisphere;
+                        const int64_t outputSlice = context.hidden_slices[
+                            2 * tokenLane + byte];
+                        const int64_t outputTransport =
+                            *target.transport_latency(
+                                target::StreamEndpoint::VxmResult,
+                                target::StreamEndpoint::Mem,
+                                target::StreamDirection::East,
+                                outputSlice);
+                        blockMemWindows.push_back({
+                            memResource("write", destination, outputSlice),
+                            row + kVxmSwishLatency + outputTransport,
+                            1});
+                    }
+                }
+            }
+            const int64_t blockSwishCycle =
+                memScheduler.reserve(swishCycle, blockMemWindows);
+            auto outputs = emitScratchSwish(
+                context, blockSwishCycle, tile, 1);
+            localSwish = outputs.first.getResult();
+            peerSwish = outputs.second.getResult();
+            for (int64_t row = 0; row < tile; ++row) {
+                const int64_t rowSwishCycle = blockSwishCycle + row;
                 const int64_t rowBlock = row / blockRows;
                 const int64_t tokenLane = row % blockRows;
                 const int64_t scratchAddress = scratchBase
@@ -675,59 +774,34 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
                     + tokenBlock * blockIssues + rowBlock;
                 for (int64_t hemisphere = 0;
                      hemisphere < memory.hemispheres; ++hemisphere) {
-                    llvm::SmallVector<ResourceWindow> memWindows;
-                    for (int64_t byte = 0; byte < 2; ++byte) {
-                        const int64_t gateSlice =
-                            gateScratchSlices[2 * tokenLane + byte];
-                        const int64_t upSlice =
-                            upScratchSlices[2 * tokenLane + byte];
-                        memWindows.push_back({
-                            memResource("read", hemisphere, gateSlice),
-                            -context.westLatency(gateSlice), 1});
-                        memWindows.push_back({
-                            memResource("read", hemisphere, upSlice),
-                            -context.westLatency(upSlice), 1});
-                        for (int64_t destination = 0;
-                             destination < memory.hemispheres;
-                             ++destination) {
-                            const int64_t outputSlice =
-                                context.hidden_slices[
-                                    2 * tokenLane + byte];
-                            memWindows.push_back({
-                                memResource("write", destination,
-                                    outputSlice),
-                                6 + outputSlice
-                                    / target.streams()
-                                          .mem_slices_per_register_group,
-                                1});
-                        }
-                    }
-                    swishCycle = memScheduler.reserve(
-                        swishCycle, memWindows);
+                    const int64_t inputStreamBase = hemisphere * 16;
                     for (int64_t byte = 0; byte < 2; ++byte) {
                         const int64_t gateSlice =
                             gateScratchSlices[2 * tokenLane + byte];
                         const int64_t upSlice =
                             upScratchSlices[2 * tokenLane + byte];
                         emitMem(rewriter, ffn.getLoc(),
-                            swishCycle - context.westLatency(gateSlice),
+                            rowSwishCycle
+                                - context.westLatency(gateSlice),
                             hemisphere * memory.slices_per_hemisphere
                                 + gateSlice,
                             "read", scratchAddress,
-                            target.streams().streams_per_direction + byte,
+                            target.streams().streams_per_direction
+                                + inputStreamBase + byte,
                             1, 1, 0);
                         emitMem(rewriter, ffn.getLoc(),
-                            swishCycle - context.westLatency(upSlice),
+                            rowSwishCycle
+                                - context.westLatency(upSlice),
                             hemisphere * memory.slices_per_hemisphere
                                 + upSlice,
                             "read", scratchAddress,
                             target.streams().streams_per_direction
-                                + 2 + byte,
+                                + inputStreamBase + 2 + byte,
                             1, 1, 0);
                     }
-                    auto [local, peer] =
-                        emitScratchSwish(context, swishCycle, hemisphere,
-                            swishOutputStreamBase);
+                }
+                for (int64_t hemisphere = 0;
+                     hemisphere < memory.hemispheres; ++hemisphere) {
                     const int64_t outputBlock =
                         pair * memory.hemispheres + hemisphere;
                     const int64_t tokenWave = row / blockRows;
@@ -735,36 +809,136 @@ mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
                         + (tokenBlock * hiddenBlocks + outputBlock)
                             * throughput.tile_rows
                         + tokenWave;
-                    for (int64_t destination = 0;
-                         destination < memory.hemispheres;
-                         ++destination) {
-                        for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t destination = 1 - hemisphere;
+                    for (int64_t byte = 0; byte < 2; ++byte) {
                             const int64_t slice =
                                 context.hidden_slices[
                                     2 * tokenLane + byte];
+                            const int64_t physicalOutputStream =
+                                hemisphere == 0 ? 6 : 14;
+                            const int64_t outputTransport =
+                                *target.transport_latency(
+                                    target::StreamEndpoint::VxmResult,
+                                    target::StreamEndpoint::Mem,
+                                    target::StreamDirection::East, slice);
                             emitMem(rewriter, ffn.getLoc(),
-                                swishCycle + 6
-                                    + slice
-                                        / target.streams()
-                                              .mem_slices_per_register_group,
+                                rowSwishCycle + kVxmSwishLatency
+                                    + outputTransport,
                                 destination
                                         * memory.slices_per_hemisphere
                                     + slice,
                                 "write", outputAddress,
-                                swishOutputStreamBase + byte,
+                                physicalOutputStream + byte,
                                 1, 1, 0);
-                        }
-                        lastHidden = destination == hemisphere
-                            ? local.getResult() : peer.getResult();
+                            lastSwishCycle = std::max(lastSwishCycle,
+                                rowSwishCycle + kVxmSwishLatency
+                                    + outputTransport);
                     }
-                    lastSwishCycle = swishCycle;
-                    ++swishCycle;
+                    lastHidden = hemisphere == 0
+                        ? localSwish : peerSwish;
                 }
+            }
+            swishCycle = blockSwishCycle + tile;
+        }
+    }
+
+    // A Down reduction is consumed by both hemisphere-local MXMs. The VXM
+    // output router has one destination per output block, so first retain one
+    // owner copy above, then multicast through SRAM: owner MEM emits west,
+    // the passive VXM bridge forwards it to the peer east fabric, and peer
+    // MEM captures it. This avoids a VXM ALU pass and keeps one canonical
+    // result until the value actually needs two consumers.
+    StreamFabricScheduler copyFabric(
+        target.streams().system_register_columns,
+        target.streams().streams_per_direction);
+    int64_t copyIssueCycle = lastSwishCycle + 1;
+    int64_t lastCopyCycle = lastSwishCycle;
+    for (int64_t pair = 0; pair < pairCount; ++pair) {
+        for (int64_t tokenBlock = 0;
+             tokenBlock < tokenBlocks; ++tokenBlock) {
+            for (int64_t row = 0; row < tile; ++row) {
+                int64_t nextCopyIssueCycle = copyIssueCycle + 1;
+                const int64_t tokenLane = row % blockRows;
+                const int64_t tokenWave = row / blockRows;
+                for (int64_t sourceHemisphere = 0;
+                     sourceHemisphere < memory.hemispheres;
+                     ++sourceHemisphere) {
+                    const int64_t outputBlock =
+                        pair * memory.hemispheres + sourceHemisphere;
+                    const int64_t address = hiddenBase
+                        + (tokenBlock * hiddenBlocks + outputBlock)
+                            * throughput.tile_rows
+                        + tokenWave;
+                    const int64_t owner = 1 - sourceHemisphere;
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t slice =
+                            context.hidden_slices[2 * tokenLane + byte];
+                        const int64_t group = slice
+                            / target.streams()
+                                  .mem_slices_per_register_group;
+                        const int64_t westSource = group;
+                        const int64_t westEdge = 0;
+                        StreamRouteWindow westRoute {
+                            target::StreamDirection::West,
+                            westSource,
+                            westEdge,
+                            byte,
+                            1,
+                            1,
+                            1,
+                            copyFabric.allocate_token_range(1),
+                            StreamConsumerMode::Tap,
+                        };
+                        const int64_t readCycle =
+                            copyFabric.reserve(copyIssueCycle, westRoute);
+                        nextCopyIssueCycle = std::max(
+                            nextCopyIssueCycle, readCycle + 1);
+                        const auto westLatency = target.transport_latency(
+                            target::StreamEndpoint::Mem,
+                            target::StreamEndpoint::VxmInput,
+                            target::StreamDirection::West, slice);
+                        const auto eastLatency = target.transport_latency(
+                            target::StreamEndpoint::VxmResult,
+                            target::StreamEndpoint::Mem,
+                            target::StreamDirection::East, slice);
+                        if (!westLatency || !eastLatency)
+                            return mlir::failure();
+                        const int64_t bridgeCycle =
+                            readCycle + *westLatency;
+                        StreamRouteWindow eastRoute {
+                            target::StreamDirection::East,
+                            0,
+                            group,
+                            byte,
+                            1,
+                            1,
+                            1,
+                            westRoute.token_id,
+                            StreamConsumerMode::Consume,
+                        };
+                        const int64_t eastStart =
+                            copyFabric.reserve(bridgeCycle, eastRoute);
+                        emitMem(rewriter, ffn.getLoc(), readCycle,
+                            owner * memory.slices_per_hemisphere + slice,
+                            "read", address,
+                            target.streams().streams_per_direction + byte,
+                            1, 1, 0);
+                        const int64_t writeCycle = eastStart + *eastLatency;
+                        emitMem(rewriter, ffn.getLoc(), writeCycle,
+                            sourceHemisphere
+                                    * memory.slices_per_hemisphere
+                                + slice,
+                            "write", address, byte, 1, 1, 0);
+                        lastCopyCycle =
+                            std::max(lastCopyCycle, writeCycle);
+                    }
+                }
+                copyIssueCycle = nextCopyIssueCycle;
             }
         }
     }
 
-    return FfnSwishEmission {lastHidden, lastSwishCycle};
+    return FfnSwishEmission {lastHidden, lastCopyCycle};
 }
 
 } // namespace ftlpu::compiler::schedule::ffn_detail

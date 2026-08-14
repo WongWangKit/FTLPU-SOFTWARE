@@ -7,11 +7,13 @@
 
 int main()
 {
+    try {
     using ftlpu::compiler::target::LPUTargetModel;
     const LPUTargetModel target;
     if (target.name() != ftlpu::software::runtime::kLpu32StreamTargetName
         || target.abi_fingerprint()
-            != ftlpu::software::runtime::kLpu32StreamTargetAbi)
+            != ftlpu::software::runtime::lpu_32stream_target_abi(
+                target.throughput().mxms_per_hemisphere))
         throw std::logic_error("default compiler target ABI diverges from runtime");
     constexpr std::array<int64_t, 16> kFirstReduction {
         0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33};
@@ -20,14 +22,23 @@ int main()
     if (target.attention_query_iw_slices(0) != kFirstReduction
         || target.attention_query_iw_slices(1) != kSecondReduction)
         throw std::logic_error("query IW physical slice map diverges from CModel");
+    if (target.attention_query_iw_slices(2) != kFirstReduction
+        || target.attention_query_iw_slices(3) != kSecondReduction)
+        throw std::logic_error(
+            "query IW bank reuse does not support a 128-wide head");
     if (target.attention_query_iw_base_row() != 7600
         || target.attention_score_base_row() != 3000)
         throw std::logic_error("attention scratch-row map diverges from CModel");
     try {
-        static_cast<void>(target.attention_query_iw_slices(2));
+        static_cast<void>(target.attention_query_iw_slices(-1));
         throw std::logic_error("invalid reduction block was accepted");
     } catch (const std::out_of_range&) {
     }
     std::cout << "attention_target_layout_test passed\n";
     return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "attention_target_layout_test failed: "
+                  << error.what() << '\n';
+        return 1;
+    }
 }

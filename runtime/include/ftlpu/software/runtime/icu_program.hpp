@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,23 @@ struct QueueCommand {
     std::vector<std::uint32_t> extension_words{};
 };
 
+inline bool is_repeat_2d_command(const QueueCommand& command)
+{
+    return command.instruction_kind == InstructionKind::None
+        && command.word_count == 3
+        && isa::decode_icu_command_opcode(command.command)
+            == isa::IcuCommandOpcode::Loop;
+}
+
+inline IcuRepeat2D decode_repeat_2d_command(const QueueCommand& command)
+{
+    if (!is_repeat_2d_command(command))
+        throw std::logic_error("queue command is not ICU Repeat2D");
+    return isa::decode_icu_repeat_2d(
+        isa::EncodedIcuRepeat2D {{
+            command.words[0], command.words[1], command.words[2]}});
+}
+
 struct QueueProgram {
     QueueKind kind{QueueKind::Mem};
     std::size_t index{0};
@@ -52,6 +70,8 @@ public:
     void emit_mxm_load(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction);
     void emit_mxm_dequant(std::size_t cycle, std::size_t mxm, MxmDequantInstruction instruction);
     void emit_mxm_compute(std::size_t cycle, std::size_t mxm, MxmControlInstruction instruction);
+    void emit_vxm(std::size_t cycle, std::size_t alu,
+        VxmChainDepth depth, VxmLaneAluInstruction instruction);
     void emit_vxm(std::size_t cycle, std::size_t alu, VxmLaneAluInstruction instruction);
     void emit_sxm_transpose(std::size_t cycle, Hemisphere hemisphere, SxmInstruction instruction);
     void emit_sxm_permute(std::size_t cycle, Hemisphere hemisphere, SxmInstruction instruction);
@@ -73,7 +93,11 @@ private:
     using MxmQueue = std::vector<ScheduledInstruction<MxmControlInstruction>>;
     using MxmDequantQueue =
         std::vector<ScheduledInstruction<MxmDequantInstruction>>;
-    using VxmQueue = std::vector<ScheduledInstruction<VxmLaneAluInstruction>>;
+    struct VxmInstruction {
+        VxmChainDepth depth{VxmChainDepth::Eight};
+        VxmLaneAluInstruction instruction{};
+    };
+    using VxmQueue = std::vector<ScheduledInstruction<VxmInstruction>>;
     using SxmQueue = std::vector<ScheduledInstruction<SxmInstruction>>;
 
     void check_mem_column(std::size_t column) const;

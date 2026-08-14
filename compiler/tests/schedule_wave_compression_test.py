@@ -52,6 +52,27 @@ def main() -> None:
         or "repeat_interval = 2" not in sxm_commands[0]
     ):
         raise RuntimeError("SXM command is missing repeat metadata")
+    mxm_commands = [
+        line for line in text.splitlines()
+        if "ftlpu.command.mxm" in line
+    ]
+    if len(mxm_commands) != 2:
+        raise RuntimeError(
+            f"expected two compressed MXM commands, got {len(mxm_commands)}")
+    iw = next(line for line in mxm_commands if 'opcode = "iw"' in line)
+    if (
+        "wave_count = 4" not in iw
+        or "wave_interval = 1" not in iw
+        or "wave_weight_column_stride = 1" not in iw
+    ):
+        raise RuntimeError("MXM IW command is missing column-wave metadata")
+    compute = next(
+        line for line in mxm_commands if 'opcode = "compute"' in line)
+    if (
+        "group_count = 3" not in compute
+        or "group_interval = 16" not in compute
+    ):
+        raise RuntimeError("MXM compute command is missing group metadata")
 
 
 if __name__ == "__main__":

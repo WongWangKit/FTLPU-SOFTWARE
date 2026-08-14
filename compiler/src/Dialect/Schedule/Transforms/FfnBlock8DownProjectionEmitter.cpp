@@ -64,8 +64,11 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
     FfnEmissionContext& context, const FfnSwishEmission& swish)
 {
     using attention_detail::emitMem;
+    using attention_detail::emitMemWave;
     using attention_detail::emitMxm;
+    using attention_detail::emitMxmWave;
     using attention_detail::emitMxmDequant;
+    using attention_detail::emitMxmDequantWave;
 
     auto& rewriter = context.rewriter;
     auto& ffn = context.ffn;
@@ -74,7 +77,6 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
     const auto& throughput = target.throughput();
     const int64_t tile = context.tile();
     const int64_t blockRows = throughput.mxm_block_rows;
-    const int64_t rowBlocks = context.m() / blockRows;
     const int64_t tokenBlocks = context.m() / tile;
     const int64_t reductionBlocks = context.hidden() / tile;
     const int64_t outputBlocks =
@@ -110,6 +112,9 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
         get_base_row(ffn.getHidden0Placement());
     const int64_t resultBase =
         get_base_row(ffn.getResultPlacement());
+    const int64_t resultBank =
+        ffn.getResultPlacement().getAs<mlir::IntegerAttr>("bank")
+            .getInt();
     const int64_t weightBase =
         get_base_row(context.down_raw.getPlacement());
     const auto resultType =
@@ -119,12 +124,33 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
         lpu_16bit_data_format(resultType.getElementType());
     const float scale =
         ffn.getDownRhsScale().convertToFloat();
+    // The projection planner expresses phaseStart at the MXM weight port and
+    // back-schedules MEM injection by the route latency. Keep that injection
+    // behind the final SwiGLU beat, otherwise E6/E7 weight traffic can collide
+    // with a VXM result that is still crossing the fabric.
+    int64_t maxDownWeightLatency = 0;
+    for (int64_t slice : context.down_weight_slices) {
+        const auto latency = target.transport_latency(
+            target::StreamEndpoint::Mem,
+            target::StreamEndpoint::MxmWeight,
+            target::StreamDirection::East, slice);
+        if (!latency) return mlir::failure();
+        maxDownWeightLatency = std::max(maxDownWeightLatency, *latency);
+    }
     const int64_t startCycle =
-        swish.last_cycle + throughput.swiglu_write_latency + 16;
+        swish.last_cycle + 1 + maxDownWeightLatency;
     int64_t phaseStart = startCycle;
     int64_t lastResultWriteEnd = startCycle;
 
-    for (int64_t wave = 0; wave < waveCount; ++wave) {
+    // Keep the Schedule pair-major. Repeating each command independently
+    // makes all output waves execute one reduction before advancing to the
+    // next reduction, which aliases the shared accumulator state.
+    const bool compactOutputWaves = false;
+    const int64_t emittedWaveCount =
+        compactOutputWaves ? 1 : waveCount;
+    const int64_t commandWaveCount =
+        compactOutputWaves ? waveCount : 1;
+    for (int64_t wave = 0; wave < emittedWaveCount; ++wave) {
         auto reductionSchedule = planFfnBlock8ProjectionSchedule(
             reductionBlocks, tokenBlocks, phaseStart,
             llvm::ArrayRef(context.down_weight_slices).take_front(8),
@@ -177,6 +203,9 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
             }
         }
         const int64_t finalComputeEnd = finalCandidate;
+        const int64_t waveGroupInterval = finalComputeEnd
+            - throughput.mxm_local_load_to_compute_latency
+            - phaseStart;
 
         for (int64_t reduction = 0;
              reduction < reductionBlocks; ++reduction) {
@@ -218,7 +247,7 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
                                 target::StreamDirection::East,
                                 slice);
                         if (!latency) return mlir::failure();
-                        emitMem(rewriter, ffn.getLoc(),
+                        emitMemWave(rewriter, ffn.getLoc(),
                             loadStart - *latency,
                             hemisphere
                                     * memory.slices_per_hemisphere
@@ -230,20 +259,21 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
                                           .mxm_int8_load_streams_per_cycle
                                 + stream,
                             throughput.tile_rows, 1, -1,
-                            "sram", downBinding);
+                            "sram", downBinding, commandWaveCount,
+                            waveGroupInterval,
+                            reductionBlocks * throughput.tile_rows);
                     }
-                    emitMxmDequant(rewriter, ffn.getLoc(),
+                    emitMxmDequantWave(rewriter, ffn.getLoc(),
                         loadStart, unit, scale,
-                        throughput.tile_rows, 1);
-                    for (int64_t pulse = 0;
-                         pulse < throughput.tile_rows; ++pulse) {
-                        emitMxm(rewriter, ffn.getLoc(),
-                            loadStart + pulse, unit, "iw", weightBuffer,
-                            pulse,
-                            0, 0, 1, 1, 0, 1, "sram", true,
-                            "supercell", 0, dataFormat,
-                            "int8_dequant_bf16");
-                    }
+                        throughput.tile_rows, 1,
+                        commandWaveCount, waveGroupInterval);
+                    emitMxmWave(rewriter, ffn.getLoc(),
+                        loadStart, unit, "iw", weightBuffer, 0,
+                        0, 0, 1, 1, 0, 1, "sram", true,
+                        "supercell", 0, dataFormat,
+                        "int8_dequant_bf16", {}, {},
+                        throughput.tile_rows, 1, 1,
+                        commandWaveCount, waveGroupInterval);
                 }
             }
 
@@ -258,11 +288,12 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
                                              tokenBlock];
                 const int64_t hiddenAddress = hiddenBase
                     + (tokenBlock * reductionBlocks + reduction)
-                        * throughput.tile_rows;
-                for (int64_t hemisphere = 0;
-                     hemisphere < memory.hemispheres; ++hemisphere) {
-                    const auto emitActivationAt =
+                        * blockIssues;
+                const auto emitActivationAt =
                         [&](int64_t issueCycle) -> mlir::LogicalResult {
+                    for (int64_t hiddenOwner = 0;
+                         hiddenOwner < memory.hemispheres;
+                         ++hiddenOwner) {
                         for (int64_t stream = 0; stream < 16;
                              ++stream) {
                             const int64_t slice =
@@ -274,21 +305,33 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
                                     target::StreamDirection::East,
                                     slice);
                             if (!latency) return mlir::failure();
-                            emitMem(rewriter, ffn.getLoc(),
+                            emitMemWave(rewriter, ffn.getLoc(),
                                 issueCycle - *latency,
-                                hemisphere
+                                hiddenOwner
                                         * memory.slices_per_hemisphere
                                     + slice,
                                 "read", hiddenAddress,
                                 activationStreamBase + stream,
-                                blockIssues, 1, 1);
+                                blockIssues, 1, 1, "sram", -1,
+                                commandWaveCount, waveGroupInterval, 0);
                         }
+                    }
                         return mlir::success();
                     };
-                    if (!finalReduction
-                        && mlir::failed(
-                            emitActivationAt(computeCycle)))
-                        return mlir::failure();
+                if (!finalReduction
+                    && mlir::failed(emitActivationAt(computeCycle)))
+                    return mlir::failure();
+                if (finalReduction) {
+                    for (int64_t localMxm = 0;
+                         localMxm < throughput.mxms_per_hemisphere;
+                         ++localMxm) {
+                        if (mlir::failed(emitActivationAt(
+                                finalComputeCycles[tokenBlock][localMxm])))
+                            return mlir::failure();
+                    }
+                }
+                for (int64_t hemisphere = 0;
+                     hemisphere < memory.hemispheres; ++hemisphere) {
                     for (int64_t localMxm = 0;
                          localMxm < throughput.mxms_per_hemisphere;
                          ++localMxm) {
@@ -297,10 +340,6 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
                                 finalComputeCycles[tokenBlock][localMxm]
                                     - computeCycle
                                 : 0);
-                        if (finalReduction
-                            && mlir::failed(
-                                emitActivationAt(localComputeCycle)))
-                            return mlir::failure();
                         const int64_t outputBlock = wave
                                 * memory.hemispheres
                                 * throughput.mxms_per_hemisphere
@@ -312,19 +351,20 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
                                 * throughput.mxms_per_hemisphere
                             + localMxm;
                         const int64_t accumulatorBase =
-                            wave * rowBlocks
-                            + tokenBlock * blockIssues;
+                            tokenBlock * blockIssues;
                         const int64_t outputStreamBase =
                             localMxm * blockRows * 2;
-                        emitMxm(rewriter, ffn.getLoc(),
+                        emitMxmWave(rewriter, ffn.getLoc(),
                             localComputeCycle, unit, "compute",
                             weightBuffer, 0, activationStreamBase,
                             outputStreamBase,
                             blockIssues, 1,
                             accumulatorBase, 1,
-                            finalReduction ? "stream" : "sram", true,
+                            finalReduction ? "stream" : "sram",
+                            finalReduction,
                             "supercell", 0, dataFormat, {},
-                            "block8");
+                            "block8", dataFormat, 1, 1, 0,
+                            commandWaveCount, waveGroupInterval);
                         if (!finalReduction) continue;
 
                         // The final partial converts the completed FP32
@@ -347,17 +387,24 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
                             const int64_t writeCycle = localComputeCycle
                                 + target.mxm_first_result_latency()
                                 + *latency;
-                            emitMem(rewriter, ffn.getLoc(), writeCycle,
+                            emitMemWave(rewriter, ffn.getLoc(), writeCycle,
                                 hemisphere
                                         * memory.slices_per_hemisphere
                                     + slice,
                                 "write", resultAddress,
                                 target.streams().streams_per_direction
                                     + outputStreamBase + stream,
-                                blockIssues, 1, 1);
+                                blockIssues, 1, 1, "sram", -1,
+                                commandWaveCount, waveGroupInterval,
+                                memory.hemispheres
+                                    * throughput.mxms_per_hemisphere
+                                    * throughput.tile_rows,
+                                resultBank);
                             lastResultWriteEnd = std::max(
                                 lastResultWriteEnd,
-                                writeCycle + blockIssues);
+                                writeCycle + blockIssues
+                                    + (commandWaveCount - 1)
+                                        * waveGroupInterval);
                         }
                     }
                 }
@@ -366,8 +413,7 @@ mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
         // Preload the next wave's buffer while the current wave emits its
         // final result beat. It uses E0..15 while final activation uses
         // E16..31 and result traffic travels west.
-        phaseStart = finalComputeEnd
-            - throughput.mxm_local_load_to_compute_latency;
+        phaseStart += commandWaveCount * waveGroupInterval;
     }
 
     phaseStart = std::max(phaseStart, lastResultWriteEnd);

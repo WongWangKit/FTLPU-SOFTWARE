@@ -9,7 +9,7 @@ namespace ftlpu::compiler::tensor_lowering {
 mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const target::LPUTargetModel& target,
     RmsNormLoweringStrategy strategy, int64_t feedbackWeightBaseRow,
-    FunctionMemoryPlanner& planner,
+    int64_t weightBank, FunctionMemoryPlanner& planner,
     mlir::IRRewriter& rewriter)
 {
     const auto inputType = op.getInput().getType();
@@ -134,15 +134,17 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         ? fixed_allocation(PlacementKind::Activation,
               distributedWeightBindingSlices,
               feedbackWeightBaseRow,
-              hidden / throughput.lanes_per_tile, hidden * 2,
-              "fp16_vxm_distributed_16", "both")
+              hidden, hidden * 2,
+              "fp16_vxm_row_parallel_8", "both",
+              std::max<int64_t>(0, weightBank))
         : mlir::succeeded(plannedWeight)
             && plannedWeight->layout == "fp16_pair_planar"
         ? *plannedWeight
         : fixed_allocation(PlacementKind::Activation,
               {20, 21}, 0, hidden / tile, hidden * 2,
-              "fp16_pair_planar", "both");
-    llvm::SmallVector<Allocation> scratch;
+              "fp16_pair_planar", "both",
+              std::max<int64_t>(0, weightBank));
+    llvm::SmallVector<Allocation, 4> scratch;
     if (strategy == RmsNormLoweringStrategy::VxmFeedback) {
         const auto distributedWeightSlices =
             distributedWeightBindingSlices;
@@ -164,18 +166,20 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
                 "disjoint from canonical MXM output");
             return mlir::failure();
         }
-        const int64_t packedRows = rows * hidden / 256;
-        const int64_t packedWeightRows = hidden / 8;
+        const int64_t tokenBlocks = rows / tile;
+        const int64_t rowParallelRows =
+            ((tokenBlocks + 7) / 8) * hidden;
+        const int64_t scalarRows = 2 * ((tokenBlocks + 7) / 8);
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
-            feedbackInputSlices, 4608, packedRows, matrixBytes,
-            "fp16_vxm_distributed_16", "both"));
+            feedbackInputSlices, 4608, rowParallelRows, matrixBytes,
+            "fp16_vxm_row_parallel_8", "both"));
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
-            distributedWeightSlices, weight.base_row, packedWeightRows,
-            hidden * tile * 2,
-            "fp16_vxm_distributed_16", "both"));
+            distributedWeightSlices, 4608, rowParallelRows, matrixBytes,
+            "fp16_vxm_row_parallel_8", "both"));
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
-            normalizedSlices, 5632, packedRows, matrixBytes,
-            "fp16_vxm_distributed_16", "both"));
+            normalizedSlices, 5632, rowParallelRows + scalarRows,
+            matrixBytes + rows * 4,
+            "fp16_vxm_row_parallel_8", "both", 1));
     } else {
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
             squareSlices, 0, matrixRows, matrixBytes,

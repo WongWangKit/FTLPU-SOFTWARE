@@ -6,11 +6,14 @@ import subprocess
 from pathlib import Path
 
 
-def lower(tool: Path, source: Path, output: Path) -> str:
+def lower(tool: Path, source: Path, output: Path,
+          target_config: Path) -> str:
     output.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [str(tool), "--input", str(source), "--output", str(output),
-         "--pipeline", "ftlpu-stablehlo-to-schedule"],
+         "--pipeline", "ftlpu-stablehlo-to-schedule",
+         "--mxm-execution", "legacy",
+         "--target-config", str(target_config)],
         check=True,
     )
     return output.read_text(encoding="utf-8")
@@ -21,10 +24,12 @@ def main() -> None:
     parser.add_argument("--tool", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--target-config", type=Path, required=True)
     args = parser.parse_args()
 
-    schedule = lower(args.tool, args.input, args.output)
-    if "tensor<128x64xf16>" not in schedule:
+    schedule = lower(args.tool, args.input, args.output,
+                     args.target_config)
+    if "tensor<128x64xbf16>" not in schedule:
         raise AssertionError("M=128 FFN did not reach Schedule IR")
 
     aggregate_load_count = schedule.count("ftlpu.schedule.mxm_load")
@@ -40,19 +45,20 @@ def main() -> None:
         line for line in schedule.splitlines()
         if "ftlpu.schedule.mxm_load" in line
         and ("duration = 4 : i64" not in line
-             or "stream_count = 16 : i64" not in line)
+             or "stream_count = 8 : i64" not in line
+             or 'weight_input_mode = "int8_dequant_bf16"' not in line)
     ]
     if malformed_loads:
         raise AssertionError(
             "Every FFN weight tile must use a continuous four-cycle, "
-            f"16-stream MXM load: {malformed_loads[:2]}")
+            f"8-stream MXM-local-dequant load: {malformed_loads[:2]}")
     load_count = aggregate_load_count
-    # Projection: 2 N-pairs * 2 K-tiles * 2 hemispheres * (gate + up) = 16.
-    # Down projection adds 2 units * 4 K-tiles = 8. The four M=32 tiles reuse
-    # the same projection weights, so the total is 24 rather than 72.
-    if load_count != 24:
+    # Projection: 4 N-blocks * 2 K-tiles * 2 hemispheres *
+    # (gate + up) = 32. Down adds 2 units * 4 K-tiles = 8. The four M=32
+    # tiles reuse each loaded weight, so the total is 40 rather than 160.
+    if load_count != 40:
         raise AssertionError(
-            f"Expected 24 MXM loads with four-way M-tile reuse, got {load_count}")
+            f"Expected 40 MXM loads with four-way M-tile reuse, got {load_count}")
 
     compute_count = schedule.count("ftlpu.schedule.mxm_compute")
     if compute_count < 64:

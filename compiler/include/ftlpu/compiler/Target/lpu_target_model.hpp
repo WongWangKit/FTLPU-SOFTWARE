@@ -38,10 +38,10 @@ enum class FfnProjectionKind {
 struct MemoryTopology {
     int64_t hemispheres = 2;
     int64_t slices_per_hemisphere = 52;
-    int64_t banks_per_slice = 16;
-    int64_t words_per_bank = 4096;
-    int64_t bytes_per_word = 16;
-    int64_t sram_depth_rows = 65536;
+    int64_t banks_per_slice = 2;
+    int64_t words_per_bank = 32768;
+    int64_t bytes_per_word = 32;
+    int64_t sram_depth_rows = 32768;
     int64_t sram_read_ports_per_slice = 1;
     int64_t sram_write_ports_per_slice = 1;
     int64_t accumulator_slice_base = 36;
@@ -64,11 +64,12 @@ struct StreamTopology {
     int64_t streams_per_direction = 32;
     int64_t encoded_streams = 64;
     int64_t mem_boundary_register_columns = 14;
-    int64_t system_register_columns = 15;
+    int64_t system_register_columns = 16;
     int64_t mem_slices_per_register_group = 4;
 };
 
 struct ThroughputModel {
+    int64_t icu_repeat_2d_enabled = 1;
     int64_t tile_rows = 4;
     int64_t lanes_per_tile = 8;
     int64_t mem_read_bytes_per_cycle = 8;
@@ -91,14 +92,15 @@ struct ThroughputModel {
     int64_t qk_iw_to_compute_latency = 24;
     int64_t mxms_per_hemisphere = 1;
     int64_t mxm_weight_buffers = 2;
+    int64_t mxm_accumulator_blocks = 256;
     int64_t vxm_alus = 16;
     int64_t vxm_weight_to_iw_latency = 16;
-    int64_t mem_to_sxm_latency = 14;
-    int64_t mem_to_mxm_latency = 15;
+    int64_t mem_to_sxm_latency = 15;
+    int64_t mem_to_mxm_latency = 16;
     int64_t mxm0_accumulator_latency = 6;
     int64_t mxm1_accumulator_latency = 5;
-    int64_t accumulator_to_vxm_latency = 18;
-    int64_t accumulator_read_to_vxm_latency = 15;
+    int64_t accumulator_to_vxm_latency = 19;
+    int64_t accumulator_read_to_vxm_latency = 16;
     int64_t swiglu_write_latency = 13;
 };
 
@@ -125,6 +127,10 @@ public:
         StreamDirection direction) const;
     std::optional<int64_t> stream_register_id(StreamEndpoint source,
         StreamEndpoint destination, StreamDirection direction, int64_t mem_slice) const;
+    std::optional<int64_t> stream_source_column(StreamEndpoint source,
+        StreamDirection direction, int64_t mem_slice) const;
+    std::optional<int64_t> stream_destination_column(StreamEndpoint destination,
+        StreamDirection direction, int64_t mem_slice) const;
     std::optional<int64_t> transport_latency(StreamEndpoint source,
         StreamEndpoint destination, StreamDirection direction, int64_t mem_slice) const;
     std::optional<int64_t> route_stream_count(StreamEndpoint source,
@@ -152,11 +158,15 @@ public:
     const std::array<int64_t, 16>& attention_query_iw_slices(
         int64_t reduction_block) const;
     llvm::SmallVector<int64_t> attention_weight_slices() const;
+    llvm::SmallVector<int64_t> page_resident_attention_weight_slices(
+        bool block8) const;
     llvm::SmallVector<int64_t> attention_output_weight_slices() const;
     llvm::SmallVector<int64_t> attention_activation_slices() const;
     llvm::SmallVector<int64_t> mxm_distributed_activation_slices() const;
     llvm::SmallVector<int64_t> ffn_projection_weight_slices(
         FfnProjectionKind kind) const;
+    llvm::SmallVector<int64_t> ffn_down_projection_weight_slices(
+        bool block8) const;
     llvm::SmallVector<int64_t> ffn_block8_input_slices() const;
     llvm::SmallVector<int64_t> ffn_hidden_slices() const;
     llvm::SmallVector<int64_t> attention_projection_output_slices() const;

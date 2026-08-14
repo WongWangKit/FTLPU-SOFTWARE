@@ -89,7 +89,8 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
                   target.memory().accumulator_scratch_base_row,
                   op.getM() * op.getN()
                       / distributedElementsPerRow,
-                  resultBytes, "fp16_mxm_distributed_16", "east")
+                  resultBytes, "fp16_mxm_block8_distributed_16",
+                  "both")
             : fixed_allocation(PlacementKind::FinalResult,
                   resultSlices, 0,
                   op.getM() * op.getN() / (2 * tile),

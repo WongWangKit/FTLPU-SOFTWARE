@@ -98,13 +98,22 @@ def main() -> None:
         require(command, ['element_type = "bf16"',
                           'data_format = "bf16"',
                           'cast_target = "bf16"'], "BF16 Command")
-    iw_columns = [
-        int(match.group(1))
-        for line in command.splitlines()
-        if 'opcode = "iw"' in line
-        for match in [re.search(r"weight_column = (\d+) : i64", line)]
-        if match
-    ]
+    iw_columns = []
+    for line in command.splitlines():
+        if 'opcode = "iw"' not in line:
+            continue
+        column = re.search(r"weight_column = (\d+) : i64", line)
+        wave_count = re.search(r"wave_count = (\d+) : i64", line)
+        wave_stride = re.search(
+            r"wave_weight_column_stride = (-?\d+) : i64", line)
+        if not column:
+            continue
+        count = int(wave_count.group(1)) if wave_count else 1
+        stride = int(wave_stride.group(1)) if wave_stride else 0
+        iw_columns.extend(
+            int(column.group(1)) + wave * stride for wave in range(count))
+        if len(iw_columns) >= 4:
+            break
     expected_columns = [0, 1, 2, 3] if bf16 else [3, 2, 1, 0]
     if iw_columns[:4] != expected_columns:
         raise AssertionError(

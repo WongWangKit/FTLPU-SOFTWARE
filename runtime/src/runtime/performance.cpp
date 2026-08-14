@@ -36,16 +36,32 @@ std::size_t group_index(QueueKind kind)
 std::size_t issued_commands(const QueueProgram& queue)
 {
     std::size_t issued = 0;
-    bool has_previous_instruction = false;
+    std::size_t prior_instructions = 0;
     for (const auto& command : queue.commands) {
+        if (is_repeat_2d_command(command)) {
+            if (prior_instructions == 0)
+                throw std::logic_error(
+                    "runtime performance found Repeat2D without instruction");
+            const auto repeat = decode_repeat_2d_command(command);
+            issued += repeat.inner_count * repeat.outer_count - 1;
+            continue;
+        }
         const auto opcode = isa::decode_icu_command_opcode(command.command);
         if (opcode == isa::IcuCommandOpcode::Instruction) {
             ++issued;
-            has_previous_instruction = true;
+            ++prior_instructions;
             continue;
         }
         if (opcode == isa::IcuCommandOpcode::Nop) continue;
-        if (!has_previous_instruction)
+        if (opcode == isa::IcuCommandOpcode::Loop) {
+            const auto loop = isa::decode_icu_loop(command.command);
+            if (loop.window_size > prior_instructions)
+                throw std::logic_error(
+                    "runtime performance found Loop with an invalid window");
+            issued += loop.window_size * loop.count;
+            continue;
+        }
+        if (prior_instructions == 0)
             throw std::logic_error("runtime performance found Repeat without instruction");
         issued += isa::decode_icu_repeat(command.command).count;
     }
@@ -144,13 +160,19 @@ void DatapathPerformanceMonitor::sample(const TspSliceSystem& system,
     }
 
     const auto& vxm = system.vxm_unit();
-    const auto& activity = vxm.last_cycle_activity();
-    const std::size_t vxm_active =
-        activity.executed_instruction_rows * hw::kLanesPerTile;
-    const std::size_t vxm_useful =
-        activity.useful_instruction_rows * hw::kLanesPerTile;
+    std::size_t active_rows = 0;
+    std::size_t useful_rows = 0;
+    for (std::size_t tile = 0; tile < VxmSlice::kTileCount; ++tile) {
+        const auto& timeline =
+            vxm.superlane(tile).lane(0).statistics().timeline;
+        if (timeline.empty()) continue;
+        active_rows += timeline.back().active_slots();
+        useful_rows += timeline.back().useful_slots();
+    }
+    const std::size_t vxm_active = active_rows * hw::kLanesPerTile;
+    const std::size_t vxm_useful = useful_rows * hw::kLanesPerTile;
     const auto vxm_capacity =
-        hw::kTileRows * hw::kLanesPerTile * vxm_alus;
+        hw::kTileRows * hw::kLanesPerTile * VxmLane::kAluCount;
     if (vxm_active > vxm_capacity)
         throw std::logic_error(
             "VXM activity exceeds the executable hardware capacity");

@@ -18,7 +18,7 @@ bool PhysicalMemoryAllocator::valid(const PhysicalAllocation& allocation) const
             return false;
     }
     return allocation.base_row + allocation.rows
-        <= target_.memory().words_per_bank * target_.memory().banks_per_slice;
+        <= target_.memory().words_per_bank;
 }
 
 bool PhysicalMemoryAllocator::conflicts(llvm::ArrayRef<int64_t> slices,

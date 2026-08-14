@@ -61,7 +61,7 @@ void write_binding(std::ostream& os, const BinaryBinding& binding)
     write_scalar<std::uint64_t>(os, binding.ready_cycle);
     write_scalar<std::uint16_t>(
         os, static_cast<std::uint16_t>(binding.initializer));
-    write_scalar<std::uint16_t>(os, 0);
+    write_scalar<std::uint16_t>(os, binding.bank);
     write_scalar<float>(os, binding.rope_theta);
     write_scalar<std::uint32_t>(os, binding.rope_head_dim);
     os.write(binding.role.data(),
@@ -99,7 +99,8 @@ BinaryBinding read_binding(std::istream& is, std::uint32_t version)
         if (version >= 7) {
             binding.initializer = static_cast<BindingInitializer>(
                 read_scalar<std::uint16_t>(is));
-            (void)read_scalar<std::uint16_t>(is);
+            const auto bank_or_reserved = read_scalar<std::uint16_t>(is);
+            binding.bank = version >= 17 ? bank_or_reserved : 0;
             binding.rope_theta = read_scalar<float>(is);
             binding.rope_head_dim = read_scalar<std::uint32_t>(is);
         } else if (binding.layout == BindingLayout::Fp32CausalMaskTile) {
@@ -227,7 +228,8 @@ BinaryBinding read_binding(ByteReader& reader, std::uint32_t version)
         if (version >= 7) {
             binding.initializer = static_cast<BindingInitializer>(
                 reader.read<std::uint16_t>());
-            (void)reader.read<std::uint16_t>();
+            const auto bank_or_reserved = reader.read<std::uint16_t>();
+            binding.bank = version >= 17 ? bank_or_reserved : 0;
             binding.rope_theta = reader.read<float>();
             binding.rope_head_dim = reader.read<std::uint32_t>();
         } else if (binding.layout == BindingLayout::Fp32CausalMaskTile) {
@@ -313,10 +315,15 @@ BinaryHeader read_header(ByteReader& reader)
         program.target_name.resize(target_name_size);
         reader.read_bytes(
             program.target_name.data(), program.target_name.size());
-        if (version >= 16) {
+        if (version >= 19) {
             program.hardware.visit([&](std::uint32_t& value) {
                 value = reader.read<std::uint32_t>();
             });
+        } else if (version >= 16) {
+            program.hardware.visit_pre_v19([&](std::uint32_t& value) {
+                value = reader.read<std::uint32_t>();
+            });
+            program.target_abi = executable_target_abi(program.hardware);
         } else {
             if (version >= 9)
                 program.hardware.sram_depth_rows =
@@ -351,10 +358,13 @@ BinaryHeader read_header(ByteReader& reader)
     program.memory_floors.reserve(memory_floor_count);
     for (std::uint32_t index = 0;
          index < memory_floor_count; ++index) {
+        const auto hemisphere = reader.read<std::uint16_t>();
+        const auto slice = reader.read<std::uint16_t>();
+        const auto bank = version >= 17
+            ? reader.read<std::uint16_t>() : std::uint16_t {0};
+        const auto firstFreeRow = reader.read<std::uint32_t>();
         program.memory_floors.push_back(BinaryMemoryFloor {
-            reader.read<std::uint16_t>(),
-            reader.read<std::uint16_t>(),
-            reader.read<std::uint32_t>(),
+            hemisphere, slice, firstFreeRow, bank,
         });
     }
     return {std::move(program), version, queue_count, relocation_count,
@@ -413,6 +423,7 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
     for (const BinaryMemoryFloor& floor : program.memory_floors) {
         write_scalar<std::uint16_t>(os, floor.hemisphere);
         write_scalar<std::uint16_t>(os, floor.slice);
+        write_scalar<std::uint16_t>(os, floor.bank);
         write_scalar<std::uint32_t>(os, floor.first_free_row);
     }
 
@@ -476,10 +487,15 @@ BinaryProgram read_binary_program(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 16) {
+        if (version >= 19) {
             program.hardware.visit([&](std::uint32_t& value) {
                 value = read_scalar<std::uint32_t>(is);
             });
+        } else if (version >= 16) {
+            program.hardware.visit_pre_v19([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+            program.target_abi = executable_target_abi(program.hardware);
         } else {
             if (version >= 9)
                 program.hardware.sram_depth_rows =
@@ -513,10 +529,13 @@ BinaryProgram read_binary_program(std::istream& is)
     program.memory_floors.reserve(memory_floor_count);
     for (std::uint32_t index = 0;
          index < memory_floor_count; ++index) {
+        const auto hemisphere = read_scalar<std::uint16_t>(is);
+        const auto slice = read_scalar<std::uint16_t>(is);
+        const auto bank = version >= 17
+            ? read_scalar<std::uint16_t>(is) : std::uint16_t {0};
+        const auto firstFreeRow = read_scalar<std::uint32_t>(is);
         program.memory_floors.push_back(BinaryMemoryFloor {
-            read_scalar<std::uint16_t>(is),
-            read_scalar<std::uint16_t>(is),
-            read_scalar<std::uint32_t>(is),
+            hemisphere, slice, firstFreeRow, bank,
         });
     }
     program.queues.reserve(queue_count);
@@ -599,10 +618,15 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 16) {
+        if (version >= 19) {
             program.hardware.visit([&](std::uint32_t& value) {
                 value = read_scalar<std::uint32_t>(is);
             });
+        } else if (version >= 16) {
+            program.hardware.visit_pre_v19([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+            program.target_abi = executable_target_abi(program.hardware);
         } else {
             if (version >= 9)
                 program.hardware.sram_depth_rows =
@@ -638,10 +662,13 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
     program.memory_floors.reserve(memory_floor_count);
     for (std::uint32_t index = 0;
          index < memory_floor_count; ++index) {
+        const auto hemisphere = read_scalar<std::uint16_t>(is);
+        const auto slice = read_scalar<std::uint16_t>(is);
+        const auto bank = version >= 17
+            ? read_scalar<std::uint16_t>(is) : std::uint16_t {0};
+        const auto firstFreeRow = read_scalar<std::uint32_t>(is);
         program.memory_floors.push_back(BinaryMemoryFloor {
-            read_scalar<std::uint16_t>(is),
-            read_scalar<std::uint16_t>(is),
-            read_scalar<std::uint32_t>(is),
+            hemisphere, slice, firstFreeRow, bank,
         });
     }
 

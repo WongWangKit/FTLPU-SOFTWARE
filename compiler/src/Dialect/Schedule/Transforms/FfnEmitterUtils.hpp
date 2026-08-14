@@ -29,7 +29,9 @@ VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef castTarget, int64_t outputStream,
     int64_t repeatCount, int64_t repeatInterval,
     llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
-    int64_t scaleBinding = -1);
+    int64_t scaleBinding = -1, bool accumulatorReset = false,
+    bool accumulatorWrite = false, bool accumulatorEmit = true,
+    bool localScalarWrite = false, int64_t chainDepth = 8);
 
 llvm::StringRef hemisphere_name(int64_t hemisphere);
 
@@ -37,7 +39,14 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
     mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Type resultType, mlir::Value gateValue, mlir::Value upValue,
     const target::LPUTargetModel& target, FfnScheduleStrategy strategy,
-    int64_t cycle, int64_t hemisphere, int64_t outputStream);
+    int64_t cycle, int64_t hemisphere, int64_t outputStream,
+    int64_t repeatCount = 1, int64_t repeatInterval = 1);
+
+mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
+    PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,
+    llvm::ArrayRef<int64_t> hiddenSlices, mlir::Value output,
+    int64_t inputCycle, int64_t mTile, int64_t pair, int64_t row,
+    int64_t sourceHemisphere);
 
 MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Location location, stream::RouteOp rawRoute,

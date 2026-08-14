@@ -14,6 +14,7 @@ enum class ModelTensorEncoding : std::uint16_t {
     SymmetricPerTensorI8 = 1,
     SymmetricPerAxisI8 = 2,
     SymmetricPerBlockI8 = 3,
+    TargetPackedSramVectors = 4,
 };
 
 struct ModelTensor {
@@ -87,12 +88,33 @@ struct ModelStateBindingRef {
     std::string state{};
 };
 
+// A page groups the already target-packed weight tensors required by one
+// invocation. Runtime alternates page banks and may prefetch page i+1 while
+// invocation i executes from the other bank.
+struct ModelWeightPage {
+    struct Segment {
+        std::string tensor{};
+        std::uint64_t byte_offset{0};
+        std::uint16_t hemisphere{0};
+        std::uint16_t slice{0};
+        std::uint32_t base_row{0};
+        std::uint32_t vector_count{0};
+        std::uint16_t stream{0};
+    };
+    std::uint32_t layer{0};
+    std::uint16_t bank{0};
+    std::vector<std::string> tensors{};
+    std::vector<Segment> segments{};
+};
+
 struct ModelInvocation {
     std::string name{};
     std::uint32_t executable_index{0};
     std::vector<ModelBindingRef> inputs{};
     std::vector<ModelBindingRef> outputs{};
     std::vector<ModelStateBindingRef> states{};
+    // UINT32_MAX means this invocation uses ordinary resident tensors.
+    std::uint32_t weight_page{0xffffffffu};
 };
 
 struct ModelPackage {
@@ -105,6 +127,7 @@ struct ModelPackage {
     std::vector<ModelState> states{};
     std::vector<ModelExecutable> executables{};
     std::vector<ModelInvocation> invocations{};
+    std::vector<ModelWeightPage> weight_pages{};
 };
 
 void validate_model_package(const ModelPackage& package);

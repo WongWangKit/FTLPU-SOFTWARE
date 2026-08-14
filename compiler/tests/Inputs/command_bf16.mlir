@@ -38,6 +38,7 @@ module {
     }
     ftlpu.command.vxm {
       cast_target = "bf16",
+      chain_depth = 2 : i64,
       cycle = 0 : i64,
       input_hemisphere = "east",
       lhs_immediate = 0.0 : f32,
@@ -45,7 +46,7 @@ module {
       lhs_kind = "stream_bf16",
       opcode = "cast",
       output_hemisphere = "east",
-      output_stream = 40 : i64,
+      output_stream = -1 : i64,
       queue = 0 : i64,
       repeat_count = 1 : i64,
       repeat_interval = 1 : i64,

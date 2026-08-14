@@ -64,7 +64,8 @@ LogicalResult MemReadOp::verify()
                             && hemisphere.getValue() != "west"))
             return emitOpError("scheduled MEM read requires a physical hemisphere");
         if (getRole() != "activation" && getRole() != "weight_i8"
-            && getRole() != "vxm_fp16" && getRole() != "vxm_fp32")
+            && getRole() != "vxm_fp16" && getRole() != "vxm_bf16"
+            && getRole() != "vxm_fp32")
             return emitOpError("contains an unsupported scheduled MEM role");
         auto slices = placement.getAs<ArrayAttr>("slices");
         if (!slices
@@ -170,28 +171,57 @@ LogicalResult VxmOp::verify()
     auto targetModel = target::LPUTargetModel::from_operation(*this);
     if (failed(targetModel)) return failure();
     const auto& target = *targetModel;
-    if (getCycleAttr().getInt() < 0 || !target.is_valid_vxm_alu(getQueue())
+    const int64_t chainDepth = getChainDepth().value_or(8);
+    if (getCycleAttr().getInt() < 0
+        || !target.is_valid_vxm_alu(getQueue()) || getQueue() >= 8
+        || (chainDepth != 2 && chainDepth != 4 && chainDepth != 8)
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0)
-        return emitOpError("contains invalid cycle, ALU queue, or repeat metadata");
+        return emitOpError("contains invalid cycle, ALU queue, or repeat metadata: cycle=")
+            << getCycle() << ", queue=" << getQueue()
+            << ", chain_depth=" << chainDepth
+            << ", repeat_count=" << getRepeatCount()
+            << ", repeat_interval=" << getRepeatInterval();
+    if (getAccumulatorReset().value_or(false)
+        && !getAccumulatorWrite().value_or(false))
+        return emitOpError(
+            "accumulator_reset requires accumulator_write");
+    if (!getAccumulatorWrite().value_or(false)
+        && !getAccumulatorEmit().value_or(true))
+        return emitOpError(
+            "accumulator_emit=false requires accumulator_write");
+    if (getLocalScalarWrite().value_or(false)
+        && getAccumulatorWrite().value_or(false))
+        return emitOpError(
+            "local_scalar_write cannot be combined with accumulator_write");
+    const auto opcode = getOpcode();
+    if (opcode != "pass" && opcode != "bypass" && opcode != "cast"
+        && opcode != "add" && opcode != "subtract"
+        && opcode != "multiply" && opcode != "negate"
+        && opcode != "max" && opcode != "exp"
+        && opcode != "reciprocal" && opcode != "rsqrt")
+        return emitOpError("contains an unsupported hardware VXM opcode");
     const auto valid_kind = [](StringRef kind) {
-        return kind == "alu" || kind == "stream_i32" || kind == "stream_f32"
-            || kind == "stream_i8" || kind == "stream_f16"
-            || kind == "stream_bf16"
-            || kind == "immediate";
+        return kind == "alu" || kind == "stream_i8"
+            || kind == "stream_f16" || kind == "stream_bf16"
+            || kind == "stream_f32"
+            || kind == "immediate" || kind == "previous"
+            || kind == "original" || kind == "auxiliary"
+            || kind == "accumulator" || kind == "feedback";
     };
     if (!valid_kind(getLhsKind()) || !valid_kind(getRhsKind()))
         return emitOpError("contains an invalid operand kind");
     const auto valid_operand = [&](StringRef kind, int64_t index) {
         if (kind == "immediate") return index == 0;
-        if (kind == "alu") return target.is_valid_vxm_alu(index);
-        if (kind == "stream_i8")
-            return index >= 0
-                && index < target.streams().encoded_streams;
-        if (kind == "stream_f16" || kind == "stream_bf16")
+        if (kind == "previous" || kind == "original"
+            || kind == "auxiliary" || kind == "accumulator"
+            || kind == "feedback")
+            return index == 0;
+        if (kind == "alu") return index == getQueue() - 1;
+        if (kind == "stream_i8" || kind == "stream_f16"
+            || kind == "stream_bf16" || kind == "stream_f32")
             return index >= 0
                 && index + 1 < target.streams().encoded_streams;
-        return index >= 0
-            && index + 3 < target.streams().encoded_streams;
+        return false;
     };
     if (!valid_operand(getLhsKind(), getLhsIndex())
         || !valid_operand(getRhsKind(), getRhsIndex()))
@@ -217,6 +247,14 @@ LogicalResult MemAccumulateOp::verify()
         return emitOpError("hemisphere must be east or west");
     if (getDestination() != "sram" && getDestination() != "stream")
         return emitOpError("destination must be sram or stream");
+    const llvm::StringRef outputFormat =
+        getAccumulatorOutputFormat().value_or("fp32");
+    if (outputFormat != "fp32" && outputFormat != "bf16")
+        return emitOpError(
+            "accumulator_output_format must be fp32 or bf16");
+    if (getDestination() == "sram" && outputFormat != "fp32")
+        return emitOpError(
+            "a retained accumulator value must keep FP32 format");
     if (failed(verify_stream_range(*this, getStreamBase(), getStreamCount())))
         return failure();
     return success();
@@ -350,8 +388,12 @@ LogicalResult MemTransferOp::verify()
         return emitOpError("slice is outside the target hemisphere: ")
             << getSlice() << " not in [0, "
             << target.memory().slices_per_hemisphere << ")";
-    const int64_t memoryRows =
-        target.memory().words_per_bank * target.memory().banks_per_slice;
+    const int64_t bank = getBank().value_or(0);
+    if (bank < 0 || bank >= target.memory().banks_per_slice)
+        return emitOpError("bank is outside the target: ")
+            << bank << " not in [0, "
+            << target.memory().banks_per_slice << ")";
+    const int64_t memoryRows = target.memory().sram_depth_rows;
     if (getAddress() < 0 || getAddress() >= memoryRows)
         return emitOpError("address is outside the target SRAM: ")
             << getAddress() << " not in [0, " << memoryRows << ")";
@@ -398,6 +440,30 @@ LogicalResult MxmIssueOp::verify()
     if (getOpcode() != "iw" && getOpcode() != "compute"
         && getOpcode() != "accumulator_read")
         return emitOpError("opcode must be iw, compute, or accumulator_read");
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
+    const int64_t waveColumnStride =
+        getWaveWeightColumnStride().value_or(0);
+    const int64_t waveAccumulatorStride =
+        getWaveAccumulatorAddressStride().value_or(0);
+    const int64_t groupCount = getGroupCount().value_or(1);
+    const int64_t groupInterval = getGroupInterval().value_or(1);
+    const int64_t finalWeightColumn = getWeightColumn()
+        + (waveCount - 1) * waveColumnStride;
+    if (waveCount <= 0 || waveInterval <= 0
+        || groupCount <= 0 || groupInterval <= 0
+        || finalWeightColumn < 0
+        || finalWeightColumn >= target.throughput().tile_rows)
+        return emitOpError("contains an invalid MXM issue wave");
+    if (waveColumnStride != 0 && waveAccumulatorStride != 0)
+        return emitOpError(
+            "an MXM issue wave may induct only one hardware field");
+    if (getOpcode() == "iw" && waveAccumulatorStride != 0)
+        return emitOpError(
+            "an iw wave cannot induct the MXM accumulator address");
+    if (getOpcode() != "iw" && waveColumnStride != 0)
+        return emitOpError(
+            "only an iw wave may induct the MXM weight column");
     const llvm::StringRef dataFormat =
         getDataFormat().value_or("fp16");
     if (dataFormat != "fp16" && dataFormat != "bf16")
@@ -422,9 +488,27 @@ LogicalResult MxmIssueOp::verify()
             && (innerColumn < 0
                 || innerColumn >= target.throughput().lanes_per_tile)))
         return emitOpError("contains an invalid MXM inner weight column");
-    if (getAccumulatorAddress() < 0 || getAccumulatorAddress() >= 8192
+    const llvm::StringRef computeMode =
+        getComputeMode().value_or("vector");
+    if (computeMode != "vector" && computeMode != "block8")
+        return emitOpError("compute_mode must be vector or block8");
+    const int64_t accumulatorRows = computeMode == "block8"
+        ? target.throughput().mxm_accumulator_blocks
+            * target.throughput().mxm_rows
+            / target.throughput().mxm_block_rows
+        : target.throughput().mxm_accumulator_blocks
+            * target.throughput().mxm_rows;
+    const int64_t finalAccumulatorAddress = getAccumulatorAddress()
+        + (waveCount - 1) * waveAccumulatorStride;
+    if (getAccumulatorAddress() < 0
+        || getAccumulatorAddress() >= accumulatorRows
+        || finalAccumulatorAddress < 0
+        || finalAccumulatorAddress >= accumulatorRows
         || getAccumulatorRowStride() <= 0)
-        return emitOpError("contains an invalid MXM accumulator address or stride");
+        return emitOpError(
+            "contains an invalid MXM accumulator address or stride: address=")
+            << getAccumulatorAddress()
+            << ", stride=" << getAccumulatorRowStride();
     if (getAccumulatorDestination() != "sram"
         && getAccumulatorDestination() != "stream")
         return emitOpError("accumulator_destination must be sram or stream");
@@ -434,10 +518,6 @@ LogicalResult MxmIssueOp::verify()
         && inputMode != "int8_dequant_bf16")
         return emitOpError(
             "weight_input_mode must be direct16 or int8_dequant_bf16");
-    const llvm::StringRef computeMode =
-        getComputeMode().value_or("vector");
-    if (computeMode != "vector" && computeMode != "block8")
-        return emitOpError("compute_mode must be vector or block8");
     return success();
 }
 
@@ -448,6 +528,8 @@ LogicalResult MxmDequantOp::verify()
     if (getCycle() < 0
         || !targetModel->is_valid_mxm_unit(getUnitId())
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0
+        || getWaveCount().value_or(1) <= 0
+        || getWaveInterval().value_or(1) <= 0
         || !std::isfinite(getScaleAttr().getValueAsDouble()))
         return emitOpError(
             "contains an invalid MXM dequant schedule field");
@@ -467,14 +549,28 @@ LogicalResult SxmOp::verify()
         return emitOpError("repeat count and interval must be positive");
     if (getOpcode() != "transpose" && getOpcode() != "permute")
         return emitOpError("opcode must be transpose or permute");
+    if (getOutputRow()
+        && (*getOutputRow() < 0
+            || *getOutputRow() >= target.throughput().lanes_per_tile))
+        return emitOpError("output_row must be in the physical lane range");
+      if (getInputRow()
+          && (*getInputRow() < 0
+              || *getInputRow() >= target.throughput().lanes_per_tile))
+          return emitOpError("input_row must be in the physical lane range");
+      if (getOutputTile()
+          && (*getOutputTile() < 0
+              || *getOutputTile() >= target.throughput().tile_rows))
+          return emitOpError("output_tile must be in the physical tile range");
     const int64_t physicalWidth =
         2 * target.throughput().lanes_per_tile;
-    if (getSourceStreams().size() != physicalWidth
+    const int64_t sourceWidth = getInputRow() ? 2 : physicalWidth;
+    if (getSourceStreams().size() != sourceWidth
         || getDestinationStreams().size() != physicalWidth
         || getPermuteMap().size() != 32)
         return emitOpError()
-            << "requires " << physicalWidth
-            << " source and destination byte streams and a 32-lane map";
+            << "requires " << sourceWidth << " source and "
+            << physicalWidth
+            << " destination byte streams and a 32-lane map";
     return success();
 }
 

@@ -3,6 +3,7 @@
 #include "ftlpu/core/instruction_codec.hpp"
 
 #include <fstream>
+#include <deque>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -27,45 +28,15 @@ std::string stream_name(std::size_t packed)
         + std::to_string(stream.index());
 }
 
-std::string vxm_output_stream_name(Hemisphere hemisphere, std::size_t stream)
-{
-    return std::string(hemisphere == Hemisphere::East ? "E" : "W")
-        + std::to_string(stream);
-}
-
 const char* mem_opcode_name(MemOpcode opcode)
 {
     switch (opcode) {
     case MemOpcode::Read: return "Read";
     case MemOpcode::Write: return "Write";
-    case MemOpcode::ReadWrite: return "ReadWrite";
     case MemOpcode::Gather: return "Gather";
     case MemOpcode::Scatter: return "Scatter";
     }
     return "Unknown";
-}
-
-const char* vxm_opcode_name(VxmAluOpcode opcode)
-{
-    switch (opcode) {
-    case VxmAluOpcode::Pass: return "pass";
-    case VxmAluOpcode::Add: return "add";
-    case VxmAluOpcode::Subtract: return "subtract";
-    case VxmAluOpcode::Multiply: return "multiply";
-    case VxmAluOpcode::Divide: return "divide";
-    case VxmAluOpcode::Negate: return "negate";
-    case VxmAluOpcode::Abs: return "abs";
-    case VxmAluOpcode::Min: return "min";
-    case VxmAluOpcode::Max: return "max";
-    case VxmAluOpcode::Clamp: return "clamp";
-    case VxmAluOpcode::Square: return "square";
-    case VxmAluOpcode::Sqrt: return "sqrt";
-    case VxmAluOpcode::Exp: return "exp";
-    case VxmAluOpcode::Log: return "log";
-    case VxmAluOpcode::Relu: return "relu";
-    case VxmAluOpcode::Cast: return "cast";
-    }
-    return "unknown";
 }
 
 struct EventDescription {
@@ -79,23 +50,19 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
     const auto east = queue.index < InstructionControlUnit::kMemQueuesPerHemisphere;
     switch (queue.kind) {
     case QueueKind::Mem: {
+        const std::size_t localQueue =
+            queue.index % InstructionControlUnit::kMemQueuesPerHemisphere;
+        const std::size_t slice = localQueue / hw::kMemBanksPerSlice;
+        const std::size_t bank = localQueue % hw::kMemBanksPerSlice;
         const auto encoded = static_cast<isa::EncodedMemInstruction>(command.words[0])
             | (static_cast<isa::EncodedMemInstruction>(command.words[1]) << 32);
         auto instruction = isa::decode_mem_instruction(encoded);
         const auto address = static_cast<std::int64_t>(instruction.address) + address_delta;
         std::ostringstream detail;
-        detail << "slice=" << queue.index % InstructionControlUnit::kMemQueuesPerHemisphere
+        detail << "slice=" << slice << " bank=" << bank
                << " addr=" << address << " stream=" << stream_name(instruction.stream);
-        if (instruction.opcode == MemOpcode::ReadWrite)
-            detail << " write_addr="
-                   << static_cast<std::int64_t>(
-                          instruction.write_address)
-                        + address_delta
-                   << " write_stream="
-                   << stream_name(instruction.write_stream);
         const char* opcodeName = instruction.preserve_stream
-            ? instruction.opcode == MemOpcode::ReadWrite
-                ? "ReadWriteTap" : "WriteTap"
+            ? "WriteTap"
             : mem_opcode_name(instruction.opcode);
         return {std::string("MEM.") + (east ? "E." : "W.")
                 + opcodeName, detail.str()};
@@ -156,38 +123,19 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
             detail.str()};
     }
     case QueueKind::Vxm: {
-        const auto instruction = isa::decode_vxm_instruction(
-            isa::EncodedVxmInstruction {command.words});
+        const auto decoded = isa::decode_vxm_instruction(queue.index,
+            isa::EncodedVxmInstruction {
+                static_cast<std::uint64_t>(command.words[0])
+                    | (static_cast<std::uint64_t>(command.words[1]) << 32),
+                command.words[2]});
+        const auto& instruction = decoded.instruction;
         std::ostringstream detail;
-        if (instruction.opcode == VxmAluOpcode::Pass
-            && instruction.output_stream
-            && instruction.lhs.kind
-                == VxmLaneOperandKind::StreamFloat32
-            && (instruction.cast_target == VxmCastTarget::Float16
-                || instruction.cast_target
-                    == VxmCastTarget::BFloat16)) {
-            detail << "FP32->"
-                   << (instruction.cast_target
-                               == VxmCastTarget::BFloat16
-                           ? "BF16"
-                           : "FP16")
-                   << " output cast";
-        } else if (instruction.opcode == VxmAluOpcode::Cast
-            && (instruction.cast_target == VxmCastTarget::Float16
-                || instruction.cast_target
-                    == VxmCastTarget::BFloat16)) {
-            detail << "cast "
-                   << (instruction.cast_target
-                               == VxmCastTarget::BFloat16
-                           ? "BF16"
-                           : "FP16");
-        } else {
-            detail << vxm_opcode_name(instruction.opcode);
-        }
+        detail << VxmLane::operation_name(instruction.operation)
+               << " depth=" << static_cast<std::size_t>(decoded.chain_depth)
+               << " repeat=" << instruction.repeat_count;
         if (instruction.output_stream)
-            detail << " -> " << vxm_output_stream_name(
-                instruction.output_hemisphere, *instruction.output_stream);
-        return {"VXM.ALU" + std::to_string(queue.index), detail.str()};
+            detail << " -> S" << *instruction.output_stream;
+        return {"VXM.C" + std::to_string(queue.index), detail.str()};
     }
     case QueueKind::SxmTranspose:
         return {std::string("SXM.") + (queue.index == 0 ? "E.Transpose" : "W.Transpose"),
@@ -225,7 +173,36 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
         std::size_t cursor = 0;
         std::size_t previous_cycle = 0;
         const QueueCommand* previous = nullptr;
+        std::deque<std::pair<const QueueCommand*, std::size_t>> history;
         for (const auto& command : queue.commands) {
+            if (is_repeat_2d_command(command)) {
+                if (!previous)
+                    throw std::logic_error(
+                        "runtime trace found Repeat2D without instruction");
+                const auto repeat = decode_repeat_2d_command(command);
+                for (std::size_t outer = 0;
+                     outer < repeat.outer_count; ++outer) {
+                    for (std::size_t inner = 0;
+                         inner < repeat.inner_count; ++inner) {
+                        if (outer == 0 && inner == 0) continue;
+                        const auto cycle = previous_cycle
+                            + outer * repeat.outer_interval
+                            + inner * repeat.inner_interval;
+                        const auto delta =
+                            static_cast<std::int64_t>(outer)
+                                * repeat.outer_stride
+                            + static_cast<std::int64_t>(inner)
+                                * repeat.inner_stride;
+                        write_event(output, cycle, cycle + 1,
+                            describe(queue, *previous, delta,
+                                program.hardware.mxms_per_hemisphere));
+                    }
+                }
+                cursor = previous_cycle
+                    + (repeat.outer_count - 1) * repeat.outer_interval
+                    + (repeat.inner_count - 1) * repeat.inner_interval + 1;
+                continue;
+            }
             const auto opcode = isa::decode_icu_command_opcode(command.command);
             if (opcode == isa::IcuCommandOpcode::Nop) {
                 cursor += isa::decode_icu_nop_cycles(command.command);
@@ -256,6 +233,29 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
                 }
                 continue;
             }
+            if (opcode == isa::IcuCommandOpcode::Loop) {
+                const auto loop = isa::decode_icu_loop(command.command);
+                if (loop.window_size > history.size())
+                    throw std::logic_error(
+                        "runtime trace found Loop with an invalid window");
+                const auto first = history.end() - loop.window_size;
+                for (std::size_t round = 1; round <= loop.count; ++round) {
+                    std::size_t offset = 0;
+                    for (auto item = first; item != history.end();
+                         ++item, ++offset) {
+                        const auto cycle = cursor
+                            + (round - 1) * loop.interval + offset;
+                        write_event(output, cycle, cycle + 1,
+                            describe(queue, *item->first,
+                                static_cast<std::int64_t>(round)
+                                    * loop.address_stride,
+                                program.hardware.mxms_per_hemisphere));
+                    }
+                }
+                cursor += (loop.count - 1) * loop.interval
+                    + loop.window_size;
+                continue;
+            }
             if (opcode != isa::IcuCommandOpcode::Instruction)
                 throw std::logic_error("runtime trace found unsupported ICU command");
             const auto event = describe(
@@ -263,6 +263,8 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
             write_event(output, cursor, cursor + 1, event);
             previous = &command;
             previous_cycle = cursor;
+            history.emplace_back(&command, cursor);
+            if (history.size() > 63) history.pop_front();
             ++cursor;
         }
     }

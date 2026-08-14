@@ -25,7 +25,8 @@ void emitSxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::ArrayRef<int64_t> sourceStreams,
     llvm::ArrayRef<int64_t> destinationStreams,
     llvm::ArrayRef<int64_t> permuteMap,
-    llvm::StringRef weightLayout)
+    llvm::StringRef weightLayout, int64_t outputRow, int64_t inputRow,
+    int64_t outputTile)
 {
     const auto integers = [&](llvm::ArrayRef<int64_t> values) {
         llvm::SmallVector<mlir::Attribute> attributes;
@@ -44,6 +45,15 @@ void emitSxm(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("permute_map", integers(permuteMap)),
         rewriter.getNamedAttr("weight_layout", rewriter.getStringAttr(weightLayout)),
     });
+    if (outputRow >= 0)
+        state.addAttribute("output_row",
+            rewriter.getI64IntegerAttr(outputRow));
+    if (inputRow >= 0)
+        state.addAttribute("input_row",
+            rewriter.getI64IntegerAttr(inputRow));
+    if (outputTile >= 0)
+        state.addAttribute("output_tile",
+            rewriter.getI64IntegerAttr(outputTile));
     rewriter.create(state);
 }
 

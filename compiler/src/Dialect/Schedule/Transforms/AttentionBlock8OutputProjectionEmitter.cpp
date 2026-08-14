@@ -255,57 +255,63 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                          hemisphere < memory.hemispheres; ++hemisphere) {
                         // Replace weights behind the compute wavefront as it
                         // advances across MXM columns.
-                        for (int64_t pulse = 0;
-                             pulse < throughput.tile_rows; ++pulse) {
-                            const int64_t firstUnitCompute = reductionCompute
-                                + loadSlot * blockIssues;
-                            const int64_t cycle = firstUnitCompute
-                                - throughput.mxm_local_load_to_compute_latency
-                                + pulse;
-                            for (int64_t stream = 0; stream < 8; ++stream) {
-                                const int64_t slice =
-                                    layout.outputWeightSlices()[stream];
-                                const auto latency = target_.transport_latency(
-                                    target::StreamEndpoint::Mem,
-                                    target::StreamEndpoint::MxmWeight,
-                                    target::StreamDirection::East, slice);
-                                if (!latency) return -1;
-                                emitMem(rewriter_, op_.getLoc(),
-                                    cycle - *latency,
-                                    hemisphere
-                                            * memory.slices_per_hemisphere
-                                        + slice,
-                                    "read", layout.outputWeightAddress(
-                                        outputGroup, reduction,
-                                        throughput.tile_rows - 1 - pulse),
-                                    stream, 1, 1, 0, "sram",
-                                    functionArgumentIndex(
-                                        op_.getOutputWeight()));
-                            }
-                            emitMxmDequant(rewriter_, op_.getLoc(), cycle,
-                                hemisphere, outputWeightScale);
-                            emitMxm(rewriter_, op_.getLoc(), cycle,
-                                hemisphere, "iw", weightBuffer,
-                                pulse, 0, 0, 1, 1, 0, 1, "sram",
-                                true, "supercell", 0, dataFormat,
-                                "int8_dequant_bf16");
+                        const int64_t firstUnitCompute = reductionCompute
+                            + loadSlot * blockIssues;
+                        const int64_t loadStart = firstUnitCompute
+                            - throughput.mxm_local_load_to_compute_latency;
+                        const int64_t address = layout.outputWeightAddress(
+                            outputGroup, reduction,
+                            throughput.tile_rows - 1);
+                        for (int64_t stream = 0; stream < 8; ++stream) {
+                            const int64_t slice =
+                                layout.outputWeightSlices()[stream];
+                            const auto latency = target_.transport_latency(
+                                target::StreamEndpoint::Mem,
+                                target::StreamEndpoint::MxmWeight,
+                                target::StreamDirection::East, slice);
+                            if (!latency) return -1;
+                            emitMemWave(rewriter_, op_.getLoc(),
+                                loadStart - *latency,
+                                hemisphere * memory.slices_per_hemisphere
+                                    + slice,
+                                "read", address, stream, 1, 1, 0,
+                                "sram", functionArgumentIndex(
+                                    op_.getOutputWeight()),
+                                throughput.tile_rows, 1, -1);
                         }
+                        emitMxmDequantWave(rewriter_, op_.getLoc(),
+                            loadStart, hemisphere, outputWeightScale,
+                            1, 1, throughput.tile_rows, 1);
+                        emitMxmWave(rewriter_, op_.getLoc(), loadStart,
+                            hemisphere, "iw", weightBuffer, 0,
+                            0, 0, 1, 1, 0, 1, "sram", true,
+                            "supercell", 0, dataFormat,
+                            "int8_dequant_bf16", {}, {},
+                            throughput.tile_rows, 1, 1);
                     }
                 }
 
-                for (int64_t tokenBlock = 0;
-                     tokenBlock < tokenBlocks; ++tokenBlock) {
+                const int64_t tokenStride = duplicateSingleton ? 2 : 1;
+                const int64_t tokenPatterns = std::min<int64_t>(
+                    tokenStride, tokenBlocks);
+                for (int64_t firstToken = 0;
+                     firstToken < tokenPatterns; ++firstToken) {
+                    const int64_t waveCount =
+                        (tokenBlocks - firstToken + tokenStride - 1)
+                        / tokenStride;
+                    const int64_t waveInterval =
+                        tokenIssueInterval * tokenStride;
                     const int64_t weightBuffer = duplicateSingleton
-                        ? tokenBlock % 2
+                        ? firstToken % 2
                         : groupSlot;
                     const int64_t activationAddress = activationBase
-                        + (reduction * tokenBlocks + tokenBlock)
+                        + (reduction * tokenBlocks + firstToken)
                             * blockIssues;
                     for (int64_t hemisphere = 0;
                          hemisphere < memory.hemispheres; ++hemisphere) {
                         const int64_t computeSlot = groupSlot;
                         const int64_t computeCycle = reductionCompute
-                            + tokenBlock * tokenIssueInterval
+                            + firstToken * tokenIssueInterval
                             + computeSlot * blockIssues;
                         for (int64_t stream = 0; stream < 16;
                              ++stream) {
@@ -316,32 +322,38 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                                 target::StreamEndpoint::MxmActivation,
                                 target::StreamDirection::East, slice);
                             if (!latency) return -1;
-                            emitMem(rewriter_, op_.getLoc(),
+                            emitMemWave(rewriter_, op_.getLoc(),
                                 computeCycle - *latency,
                                 hemisphere
                                         * memory.slices_per_hemisphere
                                     + slice,
                                 "read", activationAddress,
                                 2 * blockRows + stream,
-                                blockIssues, 1, 1);
+                                blockIssues, 1, 1, "sram", -1,
+                                waveCount, waveInterval,
+                                tokenStride * blockIssues);
                         }
                         const int64_t accumulatorBase =
-                            (groupSlot * tokenBlocks + tokenBlock)
+                            (groupSlot * tokenBlocks + firstToken)
                             * blockIssues;
-                        emitMxm(rewriter_, op_.getLoc(), computeCycle,
+                        emitMxmWave(rewriter_, op_.getLoc(), computeCycle,
                             hemisphere, "compute", weightBuffer, 0,
                             2 * blockRows, 0, blockIssues, 1,
                             accumulatorBase, 1,
                             finalReduction ? "stream" : "sram", true,
-                            "supercell", 0, dataFormat, {}, "block8");
+                            "supercell", 0, dataFormat, {}, "block8", {},
+                            waveCount, waveInterval, 0, 1, 1,
+                            tokenStride * blockIssues);
                         lastComputeEnd = std::max(lastComputeEnd,
-                            computeCycle + blockIssues);
+                            computeCycle
+                                + (waveCount - 1) * waveInterval
+                                + blockIssues);
                         if (!finalReduction) continue;
 
                         const int64_t resultCycle = computeCycle
                             + throughput.accumulator_to_vxm_latency;
                         const int64_t resultAddress = resultBase
-                            + (tokenBlock * hiddenBlocks
+                            + (firstToken * hiddenBlocks
                                   + outputGroup * memory.hemispheres
                                   + hemisphere)
                                 * blockIssues;
@@ -353,16 +365,20 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                                       .mem_slices_per_register_group;
                             const int64_t writeCycle =
                                 resultCycle - group - 1;
-                            emitMem(rewriter_, op_.getLoc(), writeCycle,
+                            emitMemWave(rewriter_, op_.getLoc(), writeCycle,
                                 hemisphere
                                         * memory.slices_per_hemisphere
                                     + slice,
                                 "write", resultAddress,
                                 target_.streams().streams_per_direction
                                     + stream,
-                                blockIssues, 1, 1);
+                                blockIssues, 1, 1, "sram", -1,
+                                waveCount, waveInterval,
+                                tokenStride * hiddenBlocks * blockIssues);
                             pairEnd = std::max(pairEnd,
-                                writeCycle + blockIssues);
+                                writeCycle
+                                    + (waveCount - 1) * waveInterval
+                                    + blockIssues);
                         }
                     }
                 }

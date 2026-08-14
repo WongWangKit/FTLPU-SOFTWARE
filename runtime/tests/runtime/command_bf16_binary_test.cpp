@@ -48,16 +48,24 @@ try {
                 sawMxm = true;
             }
             if (queue.kind == QueueKind::Vxm) {
-                const auto instruction =
-                    isa::decode_vxm_instruction(
-                        isa::EncodedVxmInstruction {
-                            command.words});
+                require(command.word_count == 3,
+                    "VXM compact packet is not 96 bits");
+                const auto decoded = isa::decode_vxm_instruction(
+                    queue.index, isa::EncodedVxmInstruction {
+                        static_cast<std::uint64_t>(command.words[0])
+                            | (static_cast<std::uint64_t>(
+                                   command.words[1])
+                                << 32),
+                        command.words[2]});
+                const auto& instruction = decoded.instruction;
                 require(instruction.lhs.kind
                         == VxmLaneOperandKind::StreamBFloat16,
                     "VXM BF16 stream operand was lost");
-                require(instruction.cast_target
+                require(instruction.output_type
                         == VxmCastTarget::BFloat16,
                     "VXM BF16 cast target was lost");
+                require(decoded.chain_depth == VxmChainDepth::Two,
+                    "VXM chain depth was lost");
                 sawVxm = true;
             }
         }

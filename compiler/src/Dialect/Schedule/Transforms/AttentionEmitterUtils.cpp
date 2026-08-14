@@ -9,7 +9,7 @@ void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t address,
     int64_t packedStream, int64_t repeatCount, int64_t repeatInterval,
     int64_t addressStride, llvm::StringRef destination,
-    int64_t addressBinding)
+    int64_t addressBinding, int64_t bank)
 {
     const target::LPUTargetModel target;
     mlir::OperationState state(location, MemTransferOp::getOperationName());
@@ -30,10 +30,62 @@ void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
     if (addressBinding >= 0)
         state.addAttribute("address_binding",
             rewriter.getI64IntegerAttr(addressBinding));
+    if (bank >= 0)
+        state.addAttribute("bank", rewriter.getI64IntegerAttr(bank));
     rewriter.create(state);
 }
 
-void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
+void emitMemWave(mlir::IRRewriter& rewriter, mlir::Location location,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    int64_t address, int64_t packedStream, int64_t repeatCount,
+    int64_t repeatInterval, int64_t addressStride,
+    llvm::StringRef destination, int64_t addressBinding,
+    int64_t waveCount, int64_t waveInterval,
+    int64_t waveAddressStride)
+{
+    emitMemWave(rewriter, location, cycle, queue, opcode, address,
+        packedStream, repeatCount, repeatInterval, addressStride,
+        destination, addressBinding, waveCount, waveInterval,
+        waveAddressStride, -1);
+}
+
+void emitMemWave(mlir::IRRewriter& rewriter, mlir::Location location,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    int64_t address, int64_t packedStream, int64_t repeatCount,
+    int64_t repeatInterval, int64_t addressStride,
+    llvm::StringRef destination, int64_t addressBinding,
+    int64_t waveCount, int64_t waveInterval,
+    int64_t waveAddressStride, int64_t bank)
+{
+    const target::LPUTargetModel target;
+    mlir::OperationState state(location, MemTransferOp::getOperationName());
+    state.addAttributes({
+        rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
+        rewriter.getNamedAttr("hemisphere", rewriter.getI64IntegerAttr(
+            queue / target.memory().slices_per_hemisphere)),
+        rewriter.getNamedAttr("slice", rewriter.getI64IntegerAttr(
+            queue % target.memory().slices_per_hemisphere)),
+        rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
+        rewriter.getNamedAttr("address", rewriter.getI64IntegerAttr(address)),
+        rewriter.getNamedAttr("packed_stream", rewriter.getI64IntegerAttr(packedStream)),
+        rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(repeatCount)),
+        rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(repeatInterval)),
+        rewriter.getNamedAttr("address_stride", rewriter.getI64IntegerAttr(addressStride)),
+        rewriter.getNamedAttr("wave_count", rewriter.getI64IntegerAttr(waveCount)),
+        rewriter.getNamedAttr("wave_interval", rewriter.getI64IntegerAttr(waveInterval)),
+        rewriter.getNamedAttr("wave_address_stride", rewriter.getI64IntegerAttr(waveAddressStride)),
+        rewriter.getNamedAttr("accumulator_destination", rewriter.getStringAttr(destination)),
+    });
+    if (addressBinding >= 0)
+        state.addAttribute("address_binding",
+            rewriter.getI64IntegerAttr(addressBinding));
+    if (bank >= 0)
+        state.addAttribute("bank",
+            rewriter.getI64IntegerAttr(bank));
+    rewriter.create(state);
+}
+
+void emitMxmWave(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t weightBuffer,
     int64_t weightColumn, int64_t activationStream, int64_t outputStream,
     int64_t repeatCount, int64_t repeatInterval,
@@ -41,7 +93,10 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef accumulatorDestination, bool accumulatorClear,
     llvm::StringRef weightLoadMode, int64_t weightInnerColumn,
     llvm::StringRef dataFormat, llvm::StringRef weightInputMode,
-    llvm::StringRef computeMode, llvm::StringRef accumulatorOutputFormat)
+    llvm::StringRef computeMode, llvm::StringRef accumulatorOutputFormat,
+    int64_t waveCount, int64_t waveInterval,
+    int64_t waveWeightColumnStride, int64_t groupCount,
+    int64_t groupInterval, int64_t waveAccumulatorAddressStride)
 {
     mlir::OperationState state(location, MxmIssueOp::getOperationName());
     state.addAttributes({
@@ -71,7 +126,67 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
     if (!accumulatorOutputFormat.empty())
         state.addAttribute("accumulator_output_format",
             rewriter.getStringAttr(accumulatorOutputFormat));
+    if (waveCount != 1 || waveInterval != 1
+        || waveWeightColumnStride != 0
+        || waveAccumulatorAddressStride != 0) {
+        state.addAttribute("wave_count",
+            rewriter.getI64IntegerAttr(waveCount));
+        state.addAttribute("wave_interval",
+            rewriter.getI64IntegerAttr(waveInterval));
+        state.addAttribute("wave_weight_column_stride",
+            rewriter.getI64IntegerAttr(waveWeightColumnStride));
+        state.addAttribute("wave_accumulator_address_stride",
+            rewriter.getI64IntegerAttr(waveAccumulatorAddressStride));
+    }
+    if (groupCount != 1 || groupInterval != 1) {
+        state.addAttribute("group_count",
+            rewriter.getI64IntegerAttr(groupCount));
+        state.addAttribute("group_interval",
+            rewriter.getI64IntegerAttr(groupInterval));
+    }
     rewriter.create(state);
+}
+
+// Preserve the helper ABI for incremental builds and out-of-tree emitters.
+void emitMxmWave(mlir::IRRewriter& rewriter, mlir::Location location,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    int64_t weightBuffer, int64_t weightColumn,
+    int64_t activationStream, int64_t outputStream,
+    int64_t repeatCount, int64_t repeatInterval,
+    int64_t accumulatorAddress, int64_t accumulatorRowStride,
+    llvm::StringRef accumulatorDestination, bool accumulatorClear,
+    llvm::StringRef weightLoadMode, int64_t weightInnerColumn,
+    llvm::StringRef dataFormat, llvm::StringRef weightInputMode,
+    llvm::StringRef computeMode, llvm::StringRef accumulatorOutputFormat,
+    int64_t waveCount, int64_t waveInterval,
+    int64_t waveWeightColumnStride)
+{
+    emitMxmWave(rewriter, location, cycle, queue, opcode,
+        weightBuffer, weightColumn, activationStream, outputStream,
+        repeatCount, repeatInterval, accumulatorAddress,
+        accumulatorRowStride, accumulatorDestination, accumulatorClear,
+        weightLoadMode, weightInnerColumn, dataFormat, weightInputMode,
+        computeMode, accumulatorOutputFormat, waveCount, waveInterval,
+        waveWeightColumnStride, 1, 1, 0);
+}
+
+void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    int64_t weightBuffer, int64_t weightColumn,
+    int64_t activationStream, int64_t outputStream,
+    int64_t repeatCount, int64_t repeatInterval,
+    int64_t accumulatorAddress, int64_t accumulatorRowStride,
+    llvm::StringRef accumulatorDestination, bool accumulatorClear,
+    llvm::StringRef weightLoadMode, int64_t weightInnerColumn,
+    llvm::StringRef dataFormat, llvm::StringRef weightInputMode,
+    llvm::StringRef computeMode, llvm::StringRef accumulatorOutputFormat)
+{
+    emitMxmWave(rewriter, location, cycle, queue, opcode,
+        weightBuffer, weightColumn, activationStream, outputStream,
+        repeatCount, repeatInterval, accumulatorAddress,
+        accumulatorRowStride, accumulatorDestination, accumulatorClear,
+        weightLoadMode, weightInnerColumn, dataFormat, weightInputMode,
+        computeMode, accumulatorOutputFormat, 1, 1, 0, 1, 1, 0);
 }
 
 void emitMxmDequant(mlir::IRRewriter& rewriter,
@@ -95,6 +210,25 @@ void emitMxmDequant(mlir::IRRewriter& rewriter,
     rewriter.create(state);
 }
 
+void emitMxmDequantWave(mlir::IRRewriter& rewriter,
+    mlir::Location location, int64_t cycle, int64_t unitId,
+    float scale, int64_t repeatCount, int64_t repeatInterval,
+    int64_t waveCount, int64_t waveInterval)
+{
+    mlir::OperationState state(
+        location, MxmDequantOp::getOperationName());
+    state.addAttributes({
+        rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
+        rewriter.getNamedAttr("unit_id", rewriter.getI64IntegerAttr(unitId)),
+        rewriter.getNamedAttr("scale", rewriter.getF32FloatAttr(scale)),
+        rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(repeatCount)),
+        rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(repeatInterval)),
+        rewriter.getNamedAttr("wave_count", rewriter.getI64IntegerAttr(waveCount)),
+        rewriter.getNamedAttr("wave_interval", rewriter.getI64IntegerAttr(waveInterval)),
+    });
+    rewriter.create(state);
+}
+
 VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Value value, int64_t cycle, int64_t queue, llvm::StringRef opcode,
     llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
@@ -110,6 +244,7 @@ VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
         rewriter.getNamedAttr("queue", rewriter.getI64IntegerAttr(queue)),
         rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
+        rewriter.getNamedAttr("chain_depth", rewriter.getI64IntegerAttr(8)),
         rewriter.getNamedAttr("lhs_kind", rewriter.getStringAttr(lhsKind)),
         rewriter.getNamedAttr("lhs_index", rewriter.getI64IntegerAttr(lhsIndex)),
         rewriter.getNamedAttr("lhs_immediate", rewriter.getF32FloatAttr(lhsImmediate)),

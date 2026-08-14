@@ -71,6 +71,12 @@ int main() try
     require(mlir::succeeded(plan.tasks.schedule(resources)),
         "FFN task DAG failed to schedule");
 
+    schedule::ResourceScheduler repeatedWave;
+    repeatedWave.reserve_at(32, {{"mem.0", 0, 4}});
+    repeatedWave.reserve_at(606, {{"mem.0", 0, 4}});
+    require(repeatedWave.minimum_non_overlapping_shift(576) == 578,
+        "repeat wave interval did not account for a trailing MEM write");
+
     auto block8Projection = schedule::planFfnBlock8ProjectionSchedule(
         4, 4, 0,
         target.ffn_projection_weight_slices(
@@ -146,6 +152,12 @@ int main() try
     require(mlir::succeeded(projection), "FFN projection timeline failed");
     require(projection->blocks.size() == 24 * 18,
         "FFN projection timeline has the wrong block count");
+    auto replicatedProjection = schedule::planFfnProjectionTimeline(
+        {128, 576, 1536, 576}, weightSlices, target, false, true);
+    require(mlir::succeeded(replicatedProjection),
+        "replicated FFN projection timeline failed");
+    require(replicatedProjection->blocks.size() == 48 * 18,
+        "replicated FFN projection must schedule every output block");
     require(projection->blocks.front().weight_buffer == 0
             && projection->blocks[1].weight_buffer == 1,
         "FFN projection weight buffers must ping-pong");

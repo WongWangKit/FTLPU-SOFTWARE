@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <ostream>
 #include <span>
 #include <vector>
@@ -16,6 +17,8 @@ namespace ftlpu::software::runtime {
 class CModelRuntime {
 public:
     explicit CModelRuntime(TspSliceSystem& system);
+    CModelRuntime(TspSliceSystem& system,
+        std::function<void(TspSliceSystem::LogSinks)> tick);
 
     void load(const BinaryProgram& program);
     void load_file(const std::filesystem::path& path);
@@ -38,6 +41,7 @@ private:
     std::size_t loaded_vxm_alus_{16};
     std::vector<BinaryBinding> bindings_;
     DatapathPerformanceMonitor datapath_performance_{};
+    std::function<void(TspSliceSystem::LogSinks)> tick_{};
 };
 
 } // namespace ftlpu::software::runtime

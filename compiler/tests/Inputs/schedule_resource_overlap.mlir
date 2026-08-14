@@ -18,7 +18,7 @@ module {
       address_stride = 0 : i64,
       cycle = 5 : i64,
       hemisphere = 0 : i64,
-      opcode = "write",
+      opcode = "read",
       packed_stream = 1 : i64,
       repeat_count = 1 : i64,
       repeat_interval = 1 : i64,

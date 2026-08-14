@@ -14,6 +14,15 @@ void require(bool condition, const char* message)
     if (!condition) throw std::logic_error(message);
 }
 
+ftlpu::SxmInstruction::StreamList streamRange(
+    std::size_t first, std::size_t count)
+{
+    auto streams = ftlpu::SxmInstruction::StreamList {};
+    for (std::size_t index = 0; index < count; ++index)
+        streams.push_back(ftlpu::SxmStreamId {first + index});
+    return streams;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -33,23 +42,31 @@ try {
         std::move(source_streams), std::move(destination_streams));
     icu_program.emit_sxm_transpose(7, Hemisphere::East, transpose);
 
+    auto permute = SxmInstruction::Permute(
+        streamRange(16, 16), streamRange(32, 16),
+        Permute320::identity_map());
+    permute.output_row = 5;
+    permute.output_tile = 2;
+    icu_program.emit_sxm_permute(12, Hemisphere::East, permute);
+
     BinaryProgram program;
     program.hardware.mxms_per_hemisphere = 1;
     program.target_abi = lpu_32stream_target_abi(
         program.hardware.mxms_per_hemisphere);
-    program.memory_floors.push_back({1, 7, 8192});
+    program.memory_floors.push_back({1, 7, 8192, 1});
     BinaryBinding binding;
     binding.index = 3;
     binding.access = BindingAccess::Internal;
     binding.role = "attention_input";
     binding.name = "rms1_result";
     binding.ready_cycle = 1234;
+    binding.bank = 1;
     program.bindings.push_back(binding);
     program.timelines.push_back({"rmsnorm.transpose", 7, 13});
     program.max_cycle = icu_program.last_cycle();
     program.queues = icu_program.encode_queues();
     for (auto& queue : program.queues) {
-        if (queue.kind != QueueKind::SxmTranspose || queue.index != 0)
+        if (queue.kind != QueueKind::SxmPermute || queue.index != 0)
             continue;
         QueueCommand repeat;
         repeat.command = isa::encode_icu_repeat(
@@ -65,7 +82,8 @@ try {
     if (decoded.bindings.size() != 1
         || decoded.bindings[0].role != "attention_input"
         || decoded.bindings[0].name != "rms1_result"
-        || decoded.bindings[0].ready_cycle != 1234)
+        || decoded.bindings[0].ready_cycle != 1234
+        || decoded.bindings[0].bank != 1)
         return 1;
     require(decoded.timelines.size() == 1
             && decoded.timelines[0].name == "rmsnorm.transpose"
@@ -81,11 +99,12 @@ try {
     require(decoded.memory_floors.size() == 1
             && decoded.memory_floors[0].hemisphere == 1
             && decoded.memory_floors[0].slice == 7
-            && decoded.memory_floors[0].first_free_row == 8192,
+            && decoded.memory_floors[0].first_free_row == 8192
+            && decoded.memory_floors[0].bank == 1,
         "per-slice MEM floor was not preserved");
     bool found = false;
     for (const auto& queue : decoded.queues) {
-        if (queue.kind != QueueKind::SxmTranspose || queue.index != 0 || queue.commands.empty())
+        if (queue.kind != QueueKind::SxmPermute || queue.index != 0 || queue.commands.empty())
             continue;
         const auto instruction = std::find_if(
             queue.commands.begin(), queue.commands.end(),
@@ -97,6 +116,10 @@ try {
             "SXM instruction kind was not preserved");
         const auto& command = *instruction;
         require(command.instruction_kind == InstructionKind::Sxm, "SXM instruction kind was not preserved");
+        require((command.words[3] & 0xffu) == 5
+                && ((command.words[3] >> 8) & 0xffu) == 0xffu
+                && ((command.words[3] >> 16) & 0xffu) == 2,
+            "SXM row/tile selectors were not preserved");
         require(std::any_of(queue.commands.begin(),
                     queue.commands.end(),
                     [](const QueueCommand& candidate) {
@@ -109,7 +132,7 @@ try {
             "SXM variable payload size was not preserved");
         found = true;
     }
-    require(found, "serialized SXM transpose queue is missing");
+    require(found, "serialized SXM permute queue is missing");
 
     auto incompatible = decoded;
     incompatible.target_name = "incompatible-test-target";

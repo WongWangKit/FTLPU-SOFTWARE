@@ -6,7 +6,8 @@ namespace ftlpu::compiler::schedule {
 
 mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     FfnScheduleShape shape, llvm::ArrayRef<int64_t> weightSlices,
-    const target::LPUTargetModel& target, bool localWeightDequant)
+    const target::LPUTargetModel& target, bool localWeightDequant,
+    bool replicateOutputBlocksAcrossHemispheres)
 {
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
@@ -35,7 +36,10 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     result.weight_load_cycles = tile / throughput.lanes_per_tile;
     result.pipelined_block_interval = target.mxm_block_issue_interval();
     result.initial_compute_cycle = maxWeightLatency + 1 + tile;
-    result.pair_count = shape.hidden / (memory.hemispheres * tile);
+    result.pair_count = shape.hidden
+        / ((replicateOutputBlocksAcrossHemispheres
+                ? 1 : memory.hemispheres)
+            * tile);
     result.m_tile_count = shape.m / tile;
     result.weight_block_interval =
         result.m_tile_count * result.pipelined_block_interval;

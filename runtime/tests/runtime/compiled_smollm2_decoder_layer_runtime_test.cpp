@@ -105,6 +105,16 @@ std::size_t firstBindingReadCycle(
         for (std::size_t commandIndex = 0;
              commandIndex <= relocation.command_index; ++commandIndex) {
             const auto& command = queue->commands[commandIndex];
+            if (ftlpu::software::runtime::is_repeat_2d_command(command)) {
+                const auto repeat =
+                    ftlpu::software::runtime::decode_repeat_2d_command(
+                        command);
+                cycle += (repeat.outer_count - 1)
+                        * repeat.outer_interval
+                    + (repeat.inner_count - 1)
+                        * repeat.inner_interval;
+                continue;
+            }
             const auto opcode =
                 ftlpu::isa::decode_icu_command_opcode(command.command);
             if (opcode == ftlpu::isa::IcuCommandOpcode::Nop) {
@@ -116,6 +126,13 @@ std::size_t firstBindingReadCycle(
                 const auto repeat =
                     ftlpu::isa::decode_icu_repeat(command.command);
                 cycle += repeat.count * repeat.interval;
+                continue;
+            }
+            if (opcode == ftlpu::isa::IcuCommandOpcode::Loop) {
+                const auto loop =
+                    ftlpu::isa::decode_icu_loop(command.command);
+                cycle += (loop.count - 1) * loop.interval
+                    + loop.window_size;
                 continue;
             }
             if (opcode != ftlpu::isa::IcuCommandOpcode::Instruction

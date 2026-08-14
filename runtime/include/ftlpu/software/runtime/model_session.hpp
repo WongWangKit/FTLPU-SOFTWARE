@@ -1,12 +1,15 @@
 #pragma once
 
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
+#include "ftlpu/software/runtime/c2c_weight_pager.hpp"
 #include "ftlpu/software/runtime/model_package.hpp"
 #include "ftlpu/software/runtime/session_memory_planner.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,11 +27,15 @@ struct ModelSessionStats {
     std::size_t device_copies{0};
     std::size_t device_copy_bytes{0};
     std::size_t host_operations{0};
+    std::size_t weight_page_prefetches{0};
+    std::size_t weight_page_prefetch_bytes{0};
+    std::size_t weight_page_wait_cycles{0};
 };
 
 class ModelSession {
 public:
     explicit ModelSession(TspSliceSystem& system);
+    explicit ModelSession(C2cDmaSystem& system);
 
     void load(ModelPackage package);
     void load_file(const std::filesystem::path& path);
@@ -51,8 +58,16 @@ private:
     const ModelValue* find_value_metadata(const std::string& name) const;
     void run_embedding_lookups();
     void run_host_lm_heads();
+    void prepare_weight_pages();
+    void ensure_weight_page(std::uint32_t page_index);
+    void start_weight_page(std::uint32_t page_index);
 
     CModelRuntime runtime_;
+    C2cDmaSystem* c2c_system_{nullptr};
+    std::unique_ptr<C2cWeightPager> weight_pager_{};
+    std::vector<C2cWeightPage> c2c_pages_{};
+    std::optional<std::uint32_t> ready_weight_page_{};
+    std::optional<std::uint32_t> inflight_weight_page_{};
     ModelPackage package_{};
     SessionMemoryPlan memory_plan_{};
     ModelSessionStats stats_{};

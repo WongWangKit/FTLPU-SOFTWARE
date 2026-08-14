@@ -7,7 +7,8 @@ namespace ftlpu::compiler::schedule {
 AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     const target::LPUTargetModel& target)
     : target_(target), seqLen_(op.getSeqLen()), hidden_(op.getHidden()),
-      kvHeads_(op.getKvHeads())
+      kvHeads_(op.getKvHeads()),
+      headBlocks_(op.getHeadDim() / target.throughput().mxm_rows)
 {
     const auto plan = op.getMemoryPlan();
     const char* names[] = {"query_weight", "key_weight", "value_weight"};
@@ -93,11 +94,12 @@ int64_t AttentionMemoryLayout::weightBase(AttentionProjectionKind projection) co
 }
 
 int64_t AttentionMemoryLayout::weightAddress(AttentionProjectionKind projection,
-    int64_t head, int64_t reductionBlock, int64_t localMxm, int64_t column) const
+    int64_t outputBlock, int64_t reductionBlock, int64_t localMxm,
+    int64_t column) const
 {
     const int64_t hiddenBlocks = hidden_ / target_.throughput().mxm_rows;
     return weightBase(projection)
-        + ((head / 2) * hiddenBlocks + reductionBlock) * 8
+        + ((outputBlock / 4) * hiddenBlocks + reductionBlock) * 8
         + localMxm * 4 + column;
 }
 
@@ -117,34 +119,72 @@ int64_t AttentionMemoryLayout::projectionAddress(AttentionProjectionKind project
 }
 
 int64_t AttentionMemoryLayout::queryIwAddress(
-    int64_t head, int64_t tokenBlock, int64_t phase) const
+    int64_t head, int64_t reductionBlock, int64_t tokenBlock,
+    int64_t phase) const
 {
     const int64_t tile = target_.throughput().mxm_rows;
     const int64_t tokenBlocks = seqLen_ / tile;
+    const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
     return target_.attention_query_iw_base_row()
-        + (head * tokenBlocks + tokenBlock) * (tile / 8) + phase;
+        + ((head * blocksPerRotaryHalf
+               + reductionBlock % blocksPerRotaryHalf)
+              * tokenBlocks
+              + tokenBlock)
+            * (tile / 8)
+        + phase;
 }
 
-int64_t AttentionMemoryLayout::keyAddress(int64_t kvHead, int64_t keyBlock) const
+llvm::ArrayRef<int64_t> AttentionMemoryLayout::queryIwSlices(
+    int64_t reductionBlock) const
 {
-    return kvHead * seqLen_ + keyBlock * target_.throughput().mxm_rows;
+    const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
+    return target_.attention_query_iw_slices(
+        reductionBlock / blocksPerRotaryHalf);
 }
 
-int64_t AttentionMemoryLayout::scoreAddress(int64_t queryHead,
+int64_t AttentionMemoryLayout::keyAddress(int64_t kvHead,
+    int64_t reductionBlock, int64_t keyBlock) const
+{
+    const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
+    return (kvHead * blocksPerRotaryHalf
+               + reductionBlock % blocksPerRotaryHalf)
+            * seqLen_
+        + keyBlock * target_.throughput().mxm_rows;
+}
+
+llvm::ArrayRef<int64_t> AttentionMemoryLayout::keySlices(
+    int64_t reductionBlock) const
+{
+    const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
+    const int64_t bank = reductionBlock / blocksPerRotaryHalf;
+    return llvm::ArrayRef<int64_t>(keySlices_).slice(bank * 2, 2);
+}
+
+int64_t AttentionMemoryLayout::scoreAccumulatorAddress(int64_t queryHead,
     int64_t queryBlock, int64_t keyBlock) const
 {
-    return scoreTokenAddress(queryHead, queryBlock,
+    return scoreAccumulatorTokenAddress(queryHead, queryBlock,
         keyBlock * target_.throughput().mxm_rows);
 }
 
-int64_t AttentionMemoryLayout::scoreTokenAddress(int64_t queryHead,
+int64_t AttentionMemoryLayout::scoreAccumulatorTokenAddress(int64_t queryHead,
     int64_t queryBlock, int64_t key) const
 {
-    const int64_t tile = target_.throughput().mxm_rows;
-    const int64_t tokenBlocks = seqLen_ / tile;
-    return target_.attention_score_base_row()
-        + (queryHead * tokenBlocks + queryBlock) * seqLen_
-        + key;
+    (void)queryHead;
+    (void)queryBlock;
+    // QK waves sharing a physical MXM do not overlap. Keep only one
+    // query-tile window in its finite accumulator SRAM and drain every final
+    // partial to MEM before the next wave reuses the same rows.
+    return key;
+}
+
+int64_t AttentionMemoryLayout::scoreAddress(int64_t queryHead,
+    int64_t queryBlock, int64_t key) const
+{
+    const int64_t tokenBlocks =
+        seqLen_ / target_.throughput().mxm_rows;
+    return scaledScoreBase_
+        + (queryHead * tokenBlocks + queryBlock) * seqLen_ + key;
 }
 
 int64_t AttentionMemoryLayout::probabilityPackAddress(int64_t queryHead,
@@ -173,13 +213,17 @@ int64_t AttentionMemoryLayout::valuePackAddress(int64_t head,
     const int64_t tileRows = target_.throughput().tile_rows;
     const int64_t tokenBlocks = seqLen_ / target_.throughput().mxm_rows;
     return valuePackBase_
-        + ((head * 2 + reductionBlock) * tokenBlocks + tokenBlock) * tileRows + row;
+        + ((head * headBlocks_ + reductionBlock) * tokenBlocks
+              + tokenBlock)
+            * tileRows
+        + row;
 }
 
 llvm::ArrayRef<int64_t> AttentionMemoryLayout::valuePackSlices(
     int64_t reductionBlock) const
 {
-    return valuePackSlices_.at(static_cast<std::size_t>(reductionBlock));
+    return valuePackSlices_.at(
+        static_cast<std::size_t>(reductionBlock % valuePackSlices_.size()));
 }
 
 int64_t AttentionMemoryLayout::contextAddress(int64_t queryHead, int64_t token) const
@@ -203,7 +247,13 @@ int64_t AttentionMemoryLayout::resultAddress(
 
 int64_t AttentionMemoryLayout::ropeAddress(int64_t token) const
 {
-    return ropeBase_ + token;
+    return ropeAddress(token, 0);
+}
+
+int64_t AttentionMemoryLayout::ropeAddress(
+    int64_t token, int64_t frequencyBlock) const
+{
+    return ropeBase_ + frequencyBlock * seqLen_ + token;
 }
 
 int64_t AttentionMemoryLayout::ropeStagingAddress(
@@ -219,7 +269,7 @@ int64_t AttentionMemoryLayout::ropeStagingAddress(
     return ropeStagingBase_
         + ((((projectionIndex * target_.memory().slices_per_hemisphere
                   + head)
-                 * 2
+                 * headBlocks_
                 + half)
                * tokenBlocks
               + tokenBlock)

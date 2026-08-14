@@ -15,6 +15,7 @@ def MemTransferOp : FTLPU_Schedule_Op<"mem_transfer", [MemoryEffects<[MemWrite]>
       StrAttr:$opcode,
       I64Attr:$address, I64Attr:$packed_stream, I64Attr:$repeat_count,
       I64Attr:$repeat_interval, I64Attr:$address_stride,
+      OptionalAttr<I64Attr>:$bank,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
       OptionalAttr<I64Attr>:$wave_address_stride,
@@ -37,7 +38,13 @@ def MxmIssueOp : FTLPU_Schedule_Op<"mxm_issue", [MemoryEffects<[MemWrite]>]> {
       OptionalAttr<StrAttr>:$weight_load_mode,
       OptionalAttr<I64Attr>:$weight_inner_column,
       OptionalAttr<StrAttr>:$weight_input_mode,
-      OptionalAttr<StrAttr>:$compute_mode);
+      OptionalAttr<StrAttr>:$compute_mode,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$wave_weight_column_stride,
+      OptionalAttr<I64Attr>:$wave_accumulator_address_stride,
+      OptionalAttr<I64Attr>:$group_count,
+      OptionalAttr<I64Attr>:$group_interval);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -46,7 +53,9 @@ def MxmDequantOp : FTLPU_Schedule_Op<"mxm_dequant",
     [MemoryEffects<[MemWrite]>]> {
   let summary = "Cycle-accurate issue to an MXM-local weight dequantizer";
   let arguments = (ins I64Attr:$cycle, I64Attr:$unit_id, F32Attr:$scale,
-      I64Attr:$repeat_count, I64Attr:$repeat_interval);
+      I64Attr:$repeat_count, I64Attr:$repeat_interval,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -163,15 +172,20 @@ def MxmAccumulatorReadOp : FTLPU_Schedule_Op<"mxm_accumulator_read"> {
 }
 
 def VxmOp : FTLPU_Schedule_Op<"vxm", [MemoryEffects<[MemWrite]>]> {
-  let summary = "Cycle-accurate instruction for one VXM ALU queue";
-  let arguments = (ins AnyRankedTensor:$gate, AnyRankedTensor:$up,
-      I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
-      StrAttr:$lhs_kind, I64Attr:$lhs_index, F32Attr:$lhs_immediate,
+    let summary = "Cycle-accurate instruction for one VXM ALU queue";
+    let arguments = (ins AnyRankedTensor:$gate, AnyRankedTensor:$up,
+        I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
+        OptionalAttr<I64Attr>:$chain_depth,
+        StrAttr:$lhs_kind, I64Attr:$lhs_index, F32Attr:$lhs_immediate,
       StrAttr:$rhs_kind, I64Attr:$rhs_index, F32Attr:$rhs_immediate,
       StrAttr:$cast_target, I64Attr:$output_stream,
       I64Attr:$repeat_count, I64Attr:$repeat_interval,
       StrAttr:$input_hemisphere, StrAttr:$output_hemisphere,
-      OptionalAttr<I64Attr>:$scale_binding);
+      OptionalAttr<I64Attr>:$scale_binding,
+      OptionalAttr<BoolAttr>:$accumulator_reset,
+      OptionalAttr<BoolAttr>:$accumulator_write,
+      OptionalAttr<BoolAttr>:$accumulator_emit,
+      OptionalAttr<BoolAttr>:$local_scalar_write);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$gate `,` $up attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
@@ -182,7 +196,8 @@ def MemAccumulateOp : FTLPU_Schedule_Op<"mem_accumulate"> {
   let arguments = (ins AnyRankedTensor:$input, I64Attr:$cycle,
       I64Attr:$stream_base, I64Attr:$stream_count, DictionaryAttr:$address,
       DictionaryAttr:$placement, StrAttr:$hemisphere, StrAttr:$destination,
-      I64Attr:$repeat_count, I64Attr:$repeat_interval, I64Attr:$address_stride);
+      I64Attr:$repeat_count, I64Attr:$repeat_interval, I64Attr:$address_stride,
+      OptionalAttr<StrAttr>:$accumulator_output_format);
   let results = (outs AnyRankedTensor:$output);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
@@ -239,6 +254,9 @@ def SxmOp : FTLPU_Schedule_Op<"sxm"> {
   let arguments = (ins I64Attr:$cycle, I64Attr:$hemisphere, StrAttr:$opcode,
       ArrayAttr:$source_streams, ArrayAttr:$destination_streams,
       ArrayAttr:$permute_map, StrAttr:$weight_layout,
+      OptionalAttr<I64Attr>:$output_row,
+      OptionalAttr<I64Attr>:$input_row,
+      OptionalAttr<I64Attr>:$output_tile,
       OptionalAttr<I64Attr>:$repeat_count,
       OptionalAttr<I64Attr>:$repeat_interval);
   let assemblyFormat = "attr-dict";

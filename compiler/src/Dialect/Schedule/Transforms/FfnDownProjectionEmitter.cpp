@@ -14,7 +14,6 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
     auto& rewriter = context.rewriter;
     auto& ffn = context.ffn;
     const auto& target = context.target;
-    const auto& memory = target.memory();
     const auto& throughput = target.throughput();
     const int64_t tile = context.tile();
     const int64_t m = context.m();
@@ -35,7 +34,6 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         context.result_slices, target);
     if (mlir::failed(timeline)) return mlir::failure();
 
-    mlir::Value finalValue;
     for (const FfnDownBlockSchedule& block : timeline->blocks) {
         const int64_t outputWave = block.output_wave;
         const int64_t reduction = block.reduction_block;
@@ -160,7 +158,9 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                                 rewriter.getI64IntegerAttr(streamBase)),
                             rewriter.getNamedAttr("stream_count",
                                 rewriter.getI64IntegerAttr(
-                                    throughput.mxm_result_streams)),
+                                    block.final_reduction ? 2
+                                                          : throughput
+                                                                .mxm_result_streams)),
                             rewriter.getNamedAttr(
                                 "address", ffn.getResultAddressAttr()),
                             rewriter.getNamedAttr(
@@ -179,6 +179,11 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                                 rewriter.getI64IntegerAttr(1)),
                             rewriter.getNamedAttr("address_stride",
                                 rewriter.getI64IntegerAttr(1)),
+                            rewriter.getNamedAttr(
+                                "accumulator_output_format",
+                                rewriter.getStringAttr(
+                                    block.final_reduction ? "bf16"
+                                                          : "fp32")),
                         });
                         return llvm::cast<MemAccumulateOp>(
                             rewriter.create(state));
@@ -190,38 +195,19 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     throughput.mxm_result_streams);
                 if (!block.final_reduction) continue;
 
-                const int64_t resultStreamBase =
-                    timeline->output_stream_base;
-                const int64_t outputAluBase = hemisphere
-                    * timeline->vxm_queues_per_hemisphere;
-                const auto dataFormat = lpu_16bit_data_format(
-                    llvm::cast<mlir::RankedTensorType>(
-                        ffn.getResult().getType())
-                        .getElementType());
                 for (int64_t row = 0; row < tile; ++row) {
-                    const int64_t vxmCycle = computeCycle
-                        + throughput.accumulator_to_vxm_latency + row;
-                    auto cast0 = create_vxm(rewriter, ffn.getLoc(),
-                        acc0.getOutput(), acc1.getOutput(),
-                        ffn.getResult().getType(), vxmCycle,
-                        outputAluBase, "pass", "stream_f32",
-                        timeline->first_accumulator_stream, 0,
-                        "immediate", 0, 0, dataFormat, resultStreamBase, 1,
-                        1, context.hemisphereName(hemisphere),
-                        context.hemisphereName(hemisphere));
-                    auto cast1 = create_vxm(rewriter, ffn.getLoc(),
-                        acc0.getOutput(), acc1.getOutput(),
-                        ffn.getResult().getType(), vxmCycle,
-                        outputAluBase + 1, "pass", "stream_f32",
-                        timeline->second_accumulator_stream, 0,
-                        "immediate", 0, 0, dataFormat,
-                        resultStreamBase + 2, 1, 1,
-                        context.hemisphereName(hemisphere),
-                        context.hemisphereName(hemisphere));
                     for (int64_t byte = 0;
                          byte < throughput.mxm_result_streams; ++byte) {
+                        const int64_t streamBase = byte < 2
+                            ? 0 : throughput.mxm_result_streams;
+                        const int64_t slice = context.result_slices[byte];
+                        const auto latency = target.transport_latency(
+                            target::StreamEndpoint::MxmResult,
+                            target::StreamEndpoint::Mem,
+                            target::StreamDirection::West, slice);
+                        if (!latency) return mlir::failure();
                         auto placement = schedule_placement(rewriter,
-                            {context.result_slices[byte]},
+                            {slice},
                             outputWave * m + mTile * tile + row, 1, 1,
                             context.hemisphereName(hemisphere),
                             "fp16_pair_planar");
@@ -242,25 +228,44 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                                 "both", "fp16_pair_planar"));
                         auto write = rewriter.create<MemWriteOp>(
                             ffn.getLoc(),
-                            byte < 2 ? cast0.getResult()
-                                     : cast1.getResult(),
-                            vxmCycle + 1
-                                + context.result_slices[byte]
-                                    / target.streams()
-                                          .mem_slices_per_register_group,
-                            1, resultStreamBase + byte, 1, 0,
-                            rewriter.getStringAttr("east"),
+                            byte < 2 ? acc0.getOutput()
+                                     : acc1.getOutput(),
+                            computeCycle
+                                + target.mxm_first_result_latency()
+                                + row + *latency,
+                            1, streamBase + byte % 2, 1, 0,
+                            rewriter.getStringAttr("west"),
                             ffn.getResultAddress(),
                             attributes.getDictionary(
                                 rewriter.getContext()),
                             tile);
-                        finalValue = write.getOutput();
+                        (void)write;
                     }
                 }
             }
         }
     }
-    return finalValue;
+    auto resultType = llvm::cast<mlir::RankedTensorType>(
+        ffn.getResult().getType());
+    mlir::OperationState bindingState(
+        ffn.getLoc(), BindingOp::getOperationName());
+    bindingState.addTypes(resultType);
+    bindingState.addAttributes({
+        context.rewriter.getNamedAttr("index",
+            context.rewriter.getI64IntegerAttr(0)),
+        context.rewriter.getNamedAttr("access",
+            context.rewriter.getStringAttr("output")),
+        context.rewriter.getNamedAttr("role",
+            context.rewriter.getStringAttr("result")),
+        context.rewriter.getNamedAttr("bytes",
+            context.rewriter.getI64IntegerAttr(
+                resultType.getNumElements() * 2)),
+        context.rewriter.getNamedAttr(
+            "placement", ffn.getResultPlacement()),
+    });
+    auto output = llvm::cast<BindingOp>(
+        context.rewriter.create(bindingState));
+    return output.getValue();
 }
 
 } // namespace ftlpu::compiler::schedule::ffn_detail

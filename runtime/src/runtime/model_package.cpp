@@ -12,7 +12,7 @@ namespace ftlpu::software::runtime {
 namespace {
 
 constexpr std::array<char, 8> kMagic {'F', 'T', 'L', 'P', 'U', 'M', '0', '1'};
-constexpr std::uint32_t kVersion = 4;
+constexpr std::uint32_t kVersion = 5;
 
 template <typename T>
 void write_scalar(std::ostream& stream, T value)
@@ -147,7 +147,11 @@ void validate_model_package(const ModelPackage& package)
         if (tensor.name.empty() || !names.insert(tensor.name).second)
             throw std::invalid_argument(
                 "FTLPU model package tensor names must be unique");
-        if (tensor.encoding != ModelTensorEncoding::Raw
+        if ((tensor.encoding == ModelTensorEncoding::SymmetricPerTensorI8
+                || tensor.encoding
+                    == ModelTensorEncoding::SymmetricPerAxisI8
+                || tensor.encoding
+                    == ModelTensorEncoding::SymmetricPerBlockI8)
             && tensor.scales.empty())
             throw std::invalid_argument(
                 "quantized FTLPU model tensor requires scales");
@@ -190,11 +194,50 @@ void validate_model_package(const ModelPackage& package)
             throw std::invalid_argument(
                 "FTLPU model package executable requires a name");
 
+    std::unordered_set<std::uint32_t> weight_layers;
+    for (std::size_t index = 0; index < package.weight_pages.size(); ++index) {
+        const auto& page = package.weight_pages[index];
+        if (page.bank >= hw::kMemBanksPerSlice || page.tensors.empty()
+            || !weight_layers.insert(page.layer).second)
+            throw std::invalid_argument(
+                "FTLPU model weight page metadata is invalid");
+        for (const std::string& tensor : page.tensors)
+            if (!names.contains(tensor))
+                throw std::invalid_argument(
+                    "FTLPU weight page references an unknown tensor");
+        for (const auto& segment : page.segments) {
+            const auto tensor = std::find_if(package.tensors.begin(),
+                package.tensors.end(), [&](const ModelTensor& candidate) {
+                    return candidate.name == segment.tensor;
+                });
+            const std::uint64_t bytes = static_cast<std::uint64_t>(
+                segment.vector_count) * hw::kPhysicalVectorBytes;
+            if (tensor == package.tensors.end()
+                || tensor->encoding
+                    != ModelTensorEncoding::TargetPackedSramVectors
+                || segment.hemisphere >= hw::kHemispheres
+                || segment.slice >= hw::kMemSliceColumns
+                || segment.stream >= hw::kStreamsPerDirection
+                || segment.vector_count == 0
+                || segment.byte_offset + bytes > tensor->data.size())
+                throw std::invalid_argument(
+                    "FTLPU weight page has an invalid packed segment");
+        }
+        if (index != 0
+            && page.bank == package.weight_pages[index - 1].bank)
+            throw std::invalid_argument(
+                "adjacent FTLPU weight pages must use different banks");
+    }
+
     for (const auto& invocation : package.invocations) {
         if (invocation.name.empty()
             || invocation.executable_index >= package.executables.size())
             throw std::invalid_argument(
                 "FTLPU model invocation has an invalid executable");
+        if (invocation.weight_page != 0xffffffffu
+            && invocation.weight_page >= package.weight_pages.size())
+            throw std::invalid_argument(
+                "FTLPU model invocation has an invalid weight page");
         std::unordered_set<std::uint32_t> input_indices;
         for (const auto& ref : invocation.inputs) {
             if (!names.contains(ref.value)
@@ -309,6 +352,27 @@ void write_model_package(
         write_vector(stream, state.shape);
     }
 
+    write_scalar(stream,
+        static_cast<std::uint32_t>(package.weight_pages.size()));
+    for (const auto& page : package.weight_pages) {
+        write_scalar(stream, page.layer);
+        write_scalar(stream, page.bank);
+        write_scalar(stream,
+            static_cast<std::uint32_t>(page.tensors.size()));
+        for (const auto& tensor : page.tensors) write_string(stream, tensor);
+        write_scalar(stream,
+            static_cast<std::uint32_t>(page.segments.size()));
+        for (const auto& segment : page.segments) {
+            write_string(stream, segment.tensor);
+            write_scalar(stream, segment.byte_offset);
+            write_scalar(stream, segment.hemisphere);
+            write_scalar(stream, segment.slice);
+            write_scalar(stream, segment.base_row);
+            write_scalar(stream, segment.vector_count);
+            write_scalar(stream, segment.stream);
+        }
+    }
+
     write_scalar(stream, static_cast<std::uint32_t>(package.invocations.size()));
     for (const auto& invocation : package.invocations) {
         write_string(stream, invocation.name);
@@ -316,6 +380,7 @@ void write_model_package(
         write_binding_refs(stream, invocation.inputs);
         write_binding_refs(stream, invocation.outputs);
         write_state_binding_refs(stream, invocation.states);
+        write_scalar(stream, invocation.weight_page);
     }
 }
 
@@ -443,6 +508,34 @@ ModelPackage read_model_package(
             package.states.push_back(std::move(state));
         }
     }
+    if (version >= 5) {
+        const auto page_count = read_scalar<std::uint32_t>(stream);
+        package.weight_pages.reserve(page_count);
+        for (std::uint32_t index = 0; index < page_count; ++index) {
+            ModelWeightPage page;
+            page.layer = read_scalar<std::uint32_t>(stream);
+            page.bank = read_scalar<std::uint16_t>(stream);
+            const auto tensor_count = read_scalar<std::uint32_t>(stream);
+            page.tensors.reserve(tensor_count);
+            for (std::uint32_t tensor = 0; tensor < tensor_count; ++tensor)
+                page.tensors.push_back(read_string(stream));
+            const auto segment_count = read_scalar<std::uint32_t>(stream);
+            page.segments.reserve(segment_count);
+            for (std::uint32_t segment = 0; segment < segment_count;
+                 ++segment) {
+                ModelWeightPage::Segment value;
+                value.tensor = read_string(stream);
+                value.byte_offset = read_scalar<std::uint64_t>(stream);
+                value.hemisphere = read_scalar<std::uint16_t>(stream);
+                value.slice = read_scalar<std::uint16_t>(stream);
+                value.base_row = read_scalar<std::uint32_t>(stream);
+                value.vector_count = read_scalar<std::uint32_t>(stream);
+                value.stream = read_scalar<std::uint16_t>(stream);
+                page.segments.push_back(std::move(value));
+            }
+            package.weight_pages.push_back(std::move(page));
+        }
+    }
 
     const auto invocation_count = read_scalar<std::uint32_t>(stream);
     package.invocations.reserve(invocation_count);
@@ -454,6 +547,8 @@ ModelPackage read_model_package(
         invocation.outputs = read_binding_refs(stream);
         if (version >= 4)
             invocation.states = read_state_binding_refs(stream);
+        if (version >= 5)
+            invocation.weight_page = read_scalar<std::uint32_t>(stream);
         package.invocations.push_back(std::move(invocation));
     }
     validate_model_package(package);

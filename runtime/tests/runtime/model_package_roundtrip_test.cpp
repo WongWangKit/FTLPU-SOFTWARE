@@ -84,6 +84,10 @@ try {
     package.tensors.push_back(ModelTensor {
         "model.embed_tokens.weight", BindingElementType::F16, {2, 2},
         {0, 0, 0, 0, 0, 0, 0, 0}});
+    package.tensors.push_back(ModelTensor {
+        "layers.0.page.packed", BindingElementType::I8, {32},
+        std::vector<std::uint8_t>(32, 0x5a),
+        ModelTensorEncoding::TargetPackedSramVectors});
     package.values = {
         ModelValue {"token_ids", BindingElementType::I32, {2}, true, false},
         ModelValue {"hidden.0", BindingElementType::F16, {2, 2}, true, false},
@@ -97,6 +101,10 @@ try {
     package.states.push_back(ModelState {
         "layers.0.key_cache", ModelStateKind::KvKey,
         BindingElementType::F16, {2048, 3, 64}, 0, 2048});
+    package.weight_pages.push_back(ModelWeightPage {
+        0, 1, {"layers.0.page.packed"},
+        {ModelWeightPage::Segment {
+            "layers.0.page.packed", 0, 1, 16, 42, 1, 5}}});
     package.executables.push_back({"decoder_layer", program, {}});
     package.invocations.push_back(ModelInvocation {
         "layers.0", 0, {{0, "hidden.0"}}, {{0, "hidden.1"}},
@@ -117,9 +125,12 @@ try {
         "model name was not preserved");
     require(decoded.architecture == package.architecture,
         "architecture was not preserved");
-    require(decoded.tensors.size() == 2
+    require(decoded.tensors.size() == 3
             && decoded.tensors[0].scales == package.tensors[0].scales
-            && decoded.tensors[0].data == package.tensors[0].data,
+            && decoded.tensors[0].data == package.tensors[0].data
+            && decoded.tensors[2].encoding
+                == ModelTensorEncoding::TargetPackedSramVectors
+            && decoded.tensors[2].data == package.tensors[2].data,
         "quantized tensor was not preserved");
     require(decoded.executables.size() == 1
             && decoded.executables[0].program.max_cycle == 17
@@ -162,6 +173,14 @@ try {
             && decoded.invocations[0].states.size() == 1
             && decoded.invocations[0].states[0].binding_index == 10,
         "persistent KV state metadata was not preserved");
+    require(decoded.weight_pages.size() == 1
+            && decoded.weight_pages[0].bank == 1
+            && decoded.weight_pages[0].segments.size() == 1
+            && decoded.weight_pages[0].segments[0].hemisphere == 1
+            && decoded.weight_pages[0].segments[0].slice == 16
+            && decoded.weight_pages[0].segments[0].base_row == 42
+            && decoded.weight_pages[0].segments[0].stream == 5,
+        "C2C weight-page metadata was not preserved");
     const BinaryBinding& decoded_rope =
         decoded.executables[0].program.bindings[2];
     require(decoded_rope.initializer == BindingInitializer::RopeTable

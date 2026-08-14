@@ -51,9 +51,9 @@ def main() -> None:
         'opcode = "permute"',
         'destination_streams = [32, 33, 34, 35',
         'weight_layout = "matrix_columns"',
-        'opcode = "accumulator_read"',
         'accumulator_destination = "sram"',
-        'accumulator_address = 3000 : i64',
+        'accumulator_destination = "stream"',
+        'accumulator_clear = true',
         'output_stream = 8 : i64',
         'output_stream = 20 : i64',
         'output_stream = 22 : i64',
@@ -75,10 +75,21 @@ def main() -> None:
         raise AssertionError(
             "attention schedule still uses the post-softmax VXM repack pass"
         )
+    accumulator_addresses = [
+        int(value) for value in re.findall(
+            r"ftlpu\.schedule\.mxm_issue \{[^\n]*"
+            r"accumulator_address = (\d+) : i64",
+            text,
+        )
+    ]
+    if not accumulator_addresses or max(accumulator_addresses) >= 1024:
+        raise AssertionError(
+            "attention schedule exceeded the physical Vector MXM "
+            "accumulator SRAM"
+        )
     minimum_counts = {
         "ftlpu.schedule.mem_transfer": 8000,
         "ftlpu.schedule.mxm_issue": 12000,
-        'opcode = "accumulator_read"': 4000,
         "ftlpu.schedule.vxm": 1400,
         'rhs_immediate = -1.000000e+09 : f32': 1,
     }

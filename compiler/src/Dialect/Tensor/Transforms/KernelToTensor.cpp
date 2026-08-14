@@ -22,8 +22,10 @@ public:
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerKernelToTensorPass)
 
     LowerKernelToTensorPass() = default;
-    explicit LowerKernelToTensorPass(RmsNormLoweringStrategy strategy)
+    LowerKernelToTensorPass(
+        RmsNormLoweringStrategy strategy, int64_t weightBank)
         : rmsnorm_strategy_(strategy)
+        , weight_bank_(weightBank)
     {
     }
 
@@ -119,6 +121,20 @@ public:
 
         // Function arguments are model inputs and coexist in MEM at entry.
         int64_t rmsWeightBase = 0;
+        if (weight_bank_ >= 0
+            && rmsnorm_strategy_
+                == RmsNormLoweringStrategy::VxmFeedback) {
+            int64_t totalRows = 0;
+            for (kernel::RmsNormOp rmsNorm : rmsNorms)
+                totalRows += rmsNorm.getWeight().getType().getNumElements();
+            if (totalRows > target.memory().words_per_bank) {
+                function.emitError(
+                    "paged RMSNorm weights exceed one SRAM bank");
+                signalPassFailure();
+                return;
+            }
+            rmsWeightBase = target.memory().words_per_bank - totalRows;
+        }
         llvm::DenseMap<mlir::Value, int64_t> feedbackRmsWeightBaseRows;
         for (mlir::BlockArgument argument : function.getArguments()) {
             if (argument.use_empty()) continue;
@@ -171,11 +187,12 @@ public:
                 // input placement when the op is lowered. Binding every
                 // RMSNorm weight to one target-wide slice set here can
                 // collide with the second norm's transpose scratch.
-                const int64_t instructions = type.getNumElements()
-                    / (distributed ? 8
-                                   : target.throughput().mxm_rows);
-                const int64_t baseRow =
-                    (distributed ? 5120 : 0) + rmsWeightBase;
+                const int64_t instructions = distributed
+                    ? type.getNumElements()
+                    : type.getNumElements()
+                        / target.throughput().mxm_rows;
+                const int64_t baseRow = distributed && weight_bank_ < 0
+                    ? 7168 + rmsWeightBase : rmsWeightBase;
                 if (distributed) {
                     feedbackRmsWeightBaseRows[argument] = baseRow;
                     rmsWeightBase += instructions;
@@ -187,9 +204,9 @@ public:
                         ? target.mxm_distributed_activation_slices()
                         : llvm::ArrayRef<int64_t>({20, 21}),
                     baseRow, instructions, type.getNumElements() * 2,
-                    distributed ? "fp16_vxm_distributed_16"
+                    distributed ? "fp16_vxm_row_parallel_8"
                                 : "fp16_pair_planar",
-                    "both");
+                    "both", std::max<int64_t>(0, weight_bank_));
                 rmsWeightBase += distributed
                     ? instructions
                     : std::max<int64_t>(1,
@@ -230,7 +247,8 @@ public:
             if (auto found = attention_roots.find(operation);
                 found != attention_roots.end()) {
                 if (mlir::failed(lower_attention(
-                        attentions[found->second], target, rewriter))) {
+                        attentions[found->second], target,
+                        weight_bank_, rewriter))) {
                     signalPassFailure();
                     return;
                 }
@@ -239,7 +257,7 @@ public:
             if (auto found = ffn_roots.find(operation);
                 found != ffn_roots.end()) {
                 if (mlir::failed(lower_ffn(ffns[found->second], target,
-                        allocator, allocate_value, rewriter))) {
+                        allocator, allocate_value, weight_bank_, rewriter))) {
                     signalPassFailure();
                     return;
                 }
@@ -265,7 +283,8 @@ public:
                 }
                 if (mlir::failed(lower_rms_norm(
                         op, target, rmsnorm_strategy_,
-                        feedbackWeightBaseRow, planner, rewriter))) {
+                        feedbackWeightBaseRow, weight_bank_, planner,
+                        rewriter))) {
                     signalPassFailure();
                     return;
                 }
@@ -301,14 +320,16 @@ public:
 private:
     RmsNormLoweringStrategy rmsnorm_strategy_ =
         RmsNormLoweringStrategy::VxmSquareMxmReduce;
+    int64_t weight_bank_ = -1;
 };
 
 } // namespace
 
 std::unique_ptr<mlir::Pass> create_lower_kernel_to_tensor_pass(
-    RmsNormLoweringStrategy rmsnorm_strategy)
+    RmsNormLoweringStrategy rmsnorm_strategy, std::int64_t weight_bank)
 {
-    return std::make_unique<LowerKernelToTensorPass>(rmsnorm_strategy);
+    return std::make_unique<LowerKernelToTensorPass>(
+        rmsnorm_strategy, weight_bank);
 }
 
 } // namespace ftlpu::compiler

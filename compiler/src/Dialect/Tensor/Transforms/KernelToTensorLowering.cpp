@@ -170,23 +170,17 @@ mlir::FailureOr<Allocation> EastMemoryAllocator::allocate(
         slices.push_back(first_slice + index);
     return Allocation {kind, std::move(slices), *base_row,
         instruction_count, kind == PlacementKind::Weight ? -16 : 16,
-        row_span, bytes, "", "east"};
+        row_span, bytes, "", "east", 0};
 }
 
 EastMemoryAllocator::EastMemoryAllocator(
     const target::LPUTargetModel& target)
-    : activation_(target.memory().banks_per_slice
-          * target.memory().words_per_bank),
-      weight_(target.memory().banks_per_slice
-          * target.memory().words_per_bank),
-      result_(target.memory().banks_per_slice
-          * target.memory().words_per_bank),
-      vxm_result_(target.memory().banks_per_slice
-          * target.memory().words_per_bank),
-      vxm_result1_(target.memory().banks_per_slice
-          * target.memory().words_per_bank),
-      final_result_(target.memory().banks_per_slice
-          * target.memory().words_per_bank)
+    : activation_(target.memory().words_per_bank),
+      weight_(target.memory().words_per_bank),
+      result_(target.memory().words_per_bank),
+      vxm_result_(target.memory().words_per_bank),
+      vxm_result1_(target.memory().words_per_bank),
+      final_result_(target.memory().words_per_bank)
 {
 }
 
@@ -240,9 +234,9 @@ mlir::DictionaryAttr make_address_attr(
         builder.getNamedAttr(
             "slice", builder.getI64IntegerAttr(allocation.slices.front())),
         builder.getNamedAttr(
-            "bank", builder.getI64IntegerAttr(allocation.base_row / 4096)),
+            "bank", builder.getI64IntegerAttr(allocation.bank)),
         builder.getNamedAttr(
-            "word", builder.getI64IntegerAttr(allocation.base_row % 4096)),
+            "word", builder.getI64IntegerAttr(allocation.base_row)),
         builder.getNamedAttr("byte", builder.getI64IntegerAttr(0)),
     });
 }
@@ -269,6 +263,8 @@ mlir::DictionaryAttr make_placement_attr(
             builder.getI64IntegerAttr(allocation.instruction_count)),
         builder.getNamedAttr("address_stride",
             builder.getI64IntegerAttr(allocation.address_stride)),
+        builder.getNamedAttr(
+            "bank", builder.getI64IntegerAttr(allocation.bank)),
     };
     if (!allocation.hemisphere.empty())
         attributes.push_back(builder.getNamedAttr(
@@ -287,11 +283,11 @@ Allocation fixed_allocation(PlacementKind kind,
 Allocation fixed_allocation(PlacementKind kind,
     llvm::ArrayRef<int64_t> slices, int64_t base_row,
     int64_t instruction_count, int64_t bytes,
-    llvm::StringRef layout, llvm::StringRef hemisphere)
+    llvm::StringRef layout, llvm::StringRef hemisphere, int64_t bank)
 {
     return Allocation {kind, llvm::SmallVector<int64_t, 16>(slices),
         base_row, instruction_count, 1, instruction_count, bytes,
-        layout.str(), hemisphere.str()};
+        layout.str(), hemisphere.str(), bank};
 }
 
 bool is_w8a16_ffn(kernel::FfnGraph& graph,
@@ -326,6 +322,8 @@ mlir::DictionaryAttr make_profile_placement(
             builder.getI64IntegerAttr(allocation.instruction_count)),
         builder.getNamedAttr("address_stride",
             builder.getI64IntegerAttr(allocation.address_stride)),
+        builder.getNamedAttr(
+            "bank", builder.getI64IntegerAttr(allocation.bank)),
     });
 }
 
@@ -409,7 +407,7 @@ mlir::FailureOr<mlir::DictionaryAttr> get_value_placement(
 mlir::DictionaryAttr make_attention_placement(
     mlir::OpBuilder& builder, llvm::StringRef kind,
     llvm::ArrayRef<int64_t> slices, int64_t base_row,
-    int64_t instruction_count, llvm::StringRef hemisphere)
+    int64_t instruction_count, llvm::StringRef hemisphere, int64_t bank)
 {
     llvm::SmallVector<mlir::Attribute> attrs;
     for (int64_t slice : slices)
@@ -425,6 +423,7 @@ mlir::DictionaryAttr make_attention_placement(
             builder.getI64IntegerAttr(instruction_count)),
         builder.getNamedAttr(
             "address_stride", builder.getI64IntegerAttr(1)),
+        builder.getNamedAttr("bank", builder.getI64IntegerAttr(bank)),
     });
 }
 

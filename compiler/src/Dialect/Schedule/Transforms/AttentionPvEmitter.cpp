@@ -40,7 +40,16 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     const bool sourceLocalContext = singleMxm && resultKind
         && resultKind.getValue()
             == "fp16_mxm_block8_distributed_16";
-    const int64_t accumulatorHalfStride = 4096;
+    // Accumulator addresses are local to each physical MXM and are not MEM
+    // context addresses. A single-MXM target keeps one query-tile window per
+    // resident head block; dual-MXM targets get an independent address space
+    // per unit.
+    const int64_t accumulatorHalfStride = tokenBlocks * tile;
+    const auto accumulatorAddress = [&](int64_t queryBlock,
+                                        int64_t localMxm) {
+        return queryBlock * tile
+            + (singleMxm ? localMxm * accumulatorHalfStride : 0);
+    };
     const int64_t mxmResultToVxmLatency =
         target_.throughput().accumulator_to_vxm_latency
         - target_.mxm_first_result_latency();
@@ -128,7 +137,12 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
             emitMxm(rewriter_, op_.getLoc(), cycle + 2,
                 hemisphere * target_.throughput().mxms_per_hemisphere
                     + (singleMxm ? 0 : localMxm),
-                "iw", singleMxm ? localMxm : 0, wavefront,
+                "iw",
+                singleMxm
+                    ? localMxm
+                        % target_.throughput().mxm_weight_buffers
+                    : 0,
+                wavefront,
                 0, 0, 1, 1, 0, 1, "stream", true,
                 "supercell", 0, dataFormat);
         }
@@ -142,6 +156,124 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     };
 
     int64_t phaseStart = transposeEnd;
+    if (singleMxm
+        && headBlocks > target_.throughput().mxm_weight_buffers) {
+        if (!sourceLocalContext) {
+            op_.emitError(
+                "paged PV head blocks require local Block8 context output");
+            return -1;
+        }
+        // A head may contain more 32-column blocks than the physical MXM has
+        // weight buffers. Page one block at a time, retain each block's ACC
+        // rows across key blocks, and emit it before reusing the buffer.
+        for (const auto& wave : waves) {
+            for (int64_t headBlock = 0;
+                 headBlock < headBlocks; ++headBlock) {
+                const int64_t weightBuffer = headBlock
+                    % target_.throughput().mxm_weight_buffers;
+                for (int64_t keyBlock = 0;
+                     keyBlock < tokenBlocks; ++keyBlock) {
+                    int64_t loadReady = phaseStart;
+                    for (int64_t hemisphere = 0;
+                         hemisphere < target_.memory().hemispheres;
+                         ++hemisphere) {
+                        const auto head =
+                            wave[static_cast<std::size_t>(hemisphere)];
+                        if (!head) continue;
+                        loadReady = std::max(loadReady,
+                            emitValueLoad(hemisphere, *head, keyBlock,
+                                headBlock, phaseStart));
+                    }
+                    phaseStart = loadReady + 8;
+                    for (int64_t queryBlock = 0;
+                         queryBlock < tokenBlocks; ++queryBlock) {
+                        const int64_t firstCompute =
+                            phaseStart + memToMxm;
+                        const bool finalReduction =
+                            keyBlock + 1 == tokenBlocks;
+                        int64_t blockEnd = firstCompute + tile;
+                        for (int64_t hemisphere = 0;
+                             hemisphere
+                                 < target_.memory().hemispheres;
+                             ++hemisphere) {
+                            const auto head =
+                                wave[static_cast<std::size_t>(hemisphere)];
+                            if (!head) continue;
+                            for (int64_t query = 0; query < tile;
+                                 ++query) {
+                                const int64_t row = query % lanes;
+                                const int64_t diagonal = query / lanes;
+                                for (int64_t byte = 0; byte < 2;
+                                     ++byte) {
+                                    const int64_t slice =
+                                        layout.probabilityDiagonalSlices()
+                                            [row * 2 + byte];
+                                    const auto latency =
+                                        target_.transport_latency(
+                                            target::StreamEndpoint::Mem,
+                                            target::StreamEndpoint::MxmActivation,
+                                            target::StreamDirection::East,
+                                            slice);
+                                    if (!latency) return -1;
+                                    emitMem(rewriter_, op_.getLoc(),
+                                        firstCompute + query - *latency,
+                                        hemisphere
+                                                * target_.memory()
+                                                      .slices_per_hemisphere
+                                            + slice,
+                                        "read",
+                                        layout.probabilityDiagonalAddress(
+                                            *head, queryBlock, keyBlock,
+                                            diagonal),
+                                        16 + byte, 1, 1, 0);
+                                }
+                            }
+                            emitMxm(rewriter_, op_.getLoc(),
+                                firstCompute, hemisphere, "compute",
+                                weightBuffer, 0, 16, 0, tile, 1,
+                                accumulatorAddress(queryBlock, 0),
+                                1,
+                                finalReduction ? "stream" : "sram",
+                                finalReduction, "supercell", 0,
+                                dataFormat, {}, {},
+                                finalReduction ? "bf16" : "");
+                            if (!finalReduction) continue;
+                            const int64_t resultStart = firstCompute
+                                + target_.mxm_first_result_latency();
+                            for (int64_t byte = 0; byte < 2;
+                                 ++byte) {
+                                const int64_t slice =
+                                    layout.contextSlices()[
+                                        headBlock * 2 + byte];
+                                const auto latency =
+                                    target_.transport_latency(
+                                        target::StreamEndpoint::MxmResult,
+                                        target::StreamEndpoint::Mem,
+                                        target::StreamDirection::West,
+                                        slice);
+                                if (!latency) return -1;
+                                emitMem(rewriter_, op_.getLoc(),
+                                    resultStart + *latency,
+                                    hemisphere
+                                            * target_.memory()
+                                                  .slices_per_hemisphere
+                                        + slice,
+                                    "write",
+                                    layout.contextAddress(
+                                        *head, queryBlock * tile),
+                                    32 + byte, tile, 1, 1);
+                                blockEnd = std::max(blockEnd,
+                                    resultStart + *latency + tile);
+                            }
+                        }
+                        phaseStart = blockEnd + 1;
+                    }
+                }
+            }
+        }
+        return phaseStart + groups;
+    }
+
     for (std::size_t waveIndex = 0; waveIndex < waves.size(); ++waveIndex) {
         const auto& wave = waves[waveIndex];
         for (int64_t keyBlock = 0; keyBlock < tokenBlocks; ++keyBlock) {
@@ -249,12 +381,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                 + (singleMxm ? 0 : localMxm),
                             "compute", singleMxm ? localMxm : 0,
                             0, 16, outputStream, tile, 1,
-                            layout.contextAddress(
-                                *head, queryBlock * tile)
-                                + (singleMxm
-                                        ? localMxm
-                                            * accumulatorHalfStride
-                                        : 0),
+                            accumulatorAddress(queryBlock, localMxm),
                             1, finalReduction ? "stream" : "sram",
                             finalReduction, "supercell", 0, dataFormat,
                             {}, {}, finalReduction ? "bf16" : "");

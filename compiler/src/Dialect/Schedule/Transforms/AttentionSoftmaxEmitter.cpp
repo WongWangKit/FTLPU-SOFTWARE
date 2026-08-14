@@ -102,17 +102,17 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                 const bool vectorMask = op_.getCausal()
                     && keyBlock == work->query_block && localKey != 0;
                 if (!fusedSoftmax) {
-                    emitMxm(rewriter_, op_.getLoc(),
-                        cycle
-                            - target_.throughput()
-                                  .accumulator_read_to_vxm_latency,
-                        hemisphere
-                                * target_.throughput().mxms_per_hemisphere
-                            + mxmLane,
-                        "accumulator_read", 0, 0, 0, mxmLane * 4, 1, 1,
-                        layout.scoreTokenAddress(work->query_head,
-                            work->query_block, key),
-                        1, "sram", true, "supercell", 0, dataFormat);
+                    for (int64_t byte = 0; byte < 4; ++byte) {
+                        const int64_t slice = scaledScoreSlices[byte];
+                        emitMem(rewriter_, op_.getLoc(),
+                            cycle - readLatency(slice),
+                            hemisphere
+                                    * target_.memory().slices_per_hemisphere
+                                + slice,
+                            "read", layout.scoreAddress(work->query_head,
+                                work->query_block, key),
+                            scoreInputStream + byte, 1, 1, 0);
+                    }
                 }
                 if (vectorMask) {
                     for (int64_t byte = 0; byte < 4; ++byte) {
@@ -155,7 +155,8 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                             + (op_.getCausal() ? 2 : 1)
                             + slice / target_.streams().mem_slices_per_register_group,
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "write", layout.scaledScoreAddress(key), outputStreamBase + byte,
+                        "write", layout.scoreAddress(work->query_head,
+                            work->query_block, key), outputStreamBase + byte,
                         1, 1, 0);
                 }
             }
@@ -173,7 +174,8 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                     const int64_t slice = scaledScoreSlices[byte];
                     emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
                         hemisphere * target_.memory().slices_per_hemisphere + slice,
-                        "read", layout.scaledScoreAddress(key),
+                        "read", layout.scoreAddress(work->query_head,
+                            work->query_block, key),
                         scratchInputStream + byte, 1, 1, 0);
                 }
                 vxm(cycle, aluBase, "subtract", "stream_f32",

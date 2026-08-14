@@ -11,6 +11,7 @@ namespace ftlpu::software::runtime {
 enum class SessionTransferKind {
     HostUpload,
     Resident,
+    WeightPage,
     DeviceAlias,
     DeviceCopy,
 };
@@ -62,6 +63,13 @@ struct SessionMemoryPlan {
         BinaryBinding binding{};
     };
     std::vector<PersistentState> persistent_states{};
+    struct WeightPage {
+        std::uint32_t page_index{0};
+        std::uint32_t layer{0};
+        std::uint16_t bank{0};
+        std::vector<std::string> tensors{};
+    };
+    std::vector<WeightPage> weight_pages{};
 };
 
 class SessionMemoryPlanner {

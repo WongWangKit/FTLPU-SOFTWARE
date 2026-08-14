@@ -16,19 +16,22 @@
 namespace ftlpu::software::runtime {
 namespace {
 
-void write_sram_byte(TspSliceSystem& system, Hemisphere hemisphere, std::size_t slice,
+void write_binding_sram_byte(TspSliceSystem& system,
+    const BinaryBinding& binding, Hemisphere hemisphere, std::size_t slice,
     std::size_t address, std::size_t column, std::uint8_t value)
 {
-    system.initialize_mem_sram_lane_byte(hemisphere, slice,
-        column / hw::kLanesPerTile, address, column % hw::kLanesPerTile, value);
+    system.initialize_mem_sram_lane_byte(hemisphere, slice, binding.bank,
+        column / hw::kLanesPerTile, address,
+        column % hw::kLanesPerTile, value);
 }
 
-std::uint8_t read_sram_byte(const TspSliceSystem& system, Hemisphere hemisphere,
-    std::size_t slice,
+std::uint8_t read_binding_sram_byte(const TspSliceSystem& system,
+    const BinaryBinding& binding, Hemisphere hemisphere, std::size_t slice,
     std::size_t address, std::size_t column)
 {
-    return system.read_mem_sram_lane_byte(hemisphere, slice,
-        column / hw::kLanesPerTile, address, column % hw::kLanesPerTile);
+    return system.read_mem_sram_lane_byte(hemisphere, slice, binding.bank,
+        column / hw::kLanesPerTile, address,
+        column % hw::kLanesPerTile);
 }
 
 template <typename Fn>
@@ -49,6 +52,45 @@ bool is_16bit_float(BindingElementType type)
 {
     return type == BindingElementType::F16
         || type == BindingElementType::BF16;
+}
+
+template <typename Fn>
+std::vector<VxmLutEntry> make_vxm_lut(
+    float input_min, float segment_width, std::size_t count, Fn fn)
+{
+    std::vector<VxmLutEntry> entries;
+    entries.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const float x0 = input_min
+            + static_cast<float>(index) * segment_width;
+        const float y0 = fn(x0);
+        entries.push_back(VxmLutEntry::from_float(
+            (fn(x0 + segment_width) - y0) / segment_width, y0));
+    }
+    return entries;
+}
+
+void initialize_vxm_luts(TspSliceSystem& system)
+{
+    constexpr std::size_t entries = 256;
+    constexpr float ln2 = 0.6931471805599453f;
+    const float expWidth = ln2 / static_cast<float>(entries);
+    system.initialize_vxm_lut(VxmSpecialAluOpcode::Exp,
+        {-ln2 / 2.0f, expWidth},
+        make_vxm_lut(-ln2 / 2.0f, expWidth, entries,
+            [](float x) { return std::exp(x); }));
+
+    const float reciprocalWidth = 1.0f / static_cast<float>(entries);
+    system.initialize_vxm_lut(VxmSpecialAluOpcode::Reciprocal,
+        {1.0f, reciprocalWidth},
+        make_vxm_lut(1.0f, reciprocalWidth, entries,
+            [](float x) { return 1.0f / x; }));
+
+    const float rsqrtWidth = 3.0f / static_cast<float>(entries);
+    system.initialize_vxm_lut(VxmSpecialAluOpcode::Rsqrt,
+        {1.0f, rsqrtWidth},
+        make_vxm_lut(1.0f, rsqrtWidth, entries,
+            [](float x) { return 1.0f / std::sqrt(x); }));
 }
 
 void validate_cmodel_hardware_config(const BinaryProgram& program)
@@ -137,6 +179,9 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
         physical.mxms_per_hemisphere);
     require_capacity("mxm_weight_buffers", requested.mxm_weight_buffers,
         physical.mxm_weight_buffers);
+    require_capacity("mxm_accumulator_blocks",
+        requested.mxm_accumulator_blocks,
+        physical.mxm_accumulator_blocks);
     require_capacity("vxm_alus", requested.vxm_alus, physical.vxm_alus);
     require_capability("mxm_local_dequant_enabled",
         requested.mxm_local_dequant_enabled,
@@ -173,9 +218,9 @@ std::uint16_t read_16bit_element(const TspSliceSystem& system,
             : Hemisphere::East;
         const std::size_t address = static_cast<std::size_t>(binding.base_row)
             + (dual_hemisphere ? column / 128 : column / 64) * rows + row;
-        return static_cast<std::uint16_t>(read_sram_byte(system, hemisphere,
+        return static_cast<std::uint16_t>(read_binding_sram_byte(system, binding, hemisphere,
                    binding.slices[local_mxm * 2], address, column % 32))
-            | (static_cast<std::uint16_t>(read_sram_byte(system, hemisphere,
+            | (static_cast<std::uint16_t>(read_binding_sram_byte(system, binding, hemisphere,
                    binding.slices[local_mxm * 2 + 1], address, column % 32))
                 << 8);
     }
@@ -183,9 +228,9 @@ std::uint16_t read_16bit_element(const TspSliceSystem& system,
         && binding.slices.size() == 2) {
         const std::size_t address = static_cast<std::size_t>(binding.base_row)
             + (column / 32) * rows + row;
-        return static_cast<std::uint16_t>(read_sram_byte(system,
+        return static_cast<std::uint16_t>(read_binding_sram_byte(system, binding,
                    Hemisphere::East, binding.slices[0], address, column % 32))
-            | (static_cast<std::uint16_t>(read_sram_byte(system,
+            | (static_cast<std::uint16_t>(read_binding_sram_byte(system, binding,
                    Hemisphere::East, binding.slices[1], address, column % 32))
                 << 8);
     }
@@ -209,10 +254,10 @@ std::uint16_t read_16bit_element(const TspSliceSystem& system,
                     % (hw::kHemispheres * mxms_per_hemisphere))
                 / mxms_per_hemisphere)
             : Hemisphere::East;
-        return static_cast<std::uint16_t>(read_sram_byte(system,
+        return static_cast<std::uint16_t>(read_binding_sram_byte(system, binding,
                    hemisphere, binding.slices[2 * token_lane], address,
                    feature_wave * 8 + feature_lane))
-            | (static_cast<std::uint16_t>(read_sram_byte(system,
+            | (static_cast<std::uint16_t>(read_binding_sram_byte(system, binding,
                    hemisphere, binding.slices[2 * token_lane + 1],
                    address, feature_wave * 8 + feature_lane))
                 << 8);
@@ -238,11 +283,11 @@ void write_16bit_element(TspSliceSystem& system,
         const std::size_t address = static_cast<std::size_t>(binding.base_row)
             + (token_block * hidden_blocks + hidden_block) * 4 + token_wave;
         for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
-            write_sram_byte(system, hemisphere,
+            write_binding_sram_byte(system, binding, hemisphere,
                 binding.slices[2 * token_lane], address,
                 feature_wave * 8 + feature_lane,
                 static_cast<std::uint8_t>(value));
-            write_sram_byte(system, hemisphere,
+            write_binding_sram_byte(system, binding, hemisphere,
                 binding.slices[2 * token_lane + 1], address,
                 feature_wave * 8 + feature_lane,
                 static_cast<std::uint8_t>(value >> 8));
@@ -257,6 +302,16 @@ void write_16bit_element(TspSliceSystem& system,
 
 CModelRuntime::CModelRuntime(TspSliceSystem& system)
     : system_(system)
+    , tick_([&system](TspSliceSystem::LogSinks sinks) {
+        system.tick(sinks);
+    })
+{
+}
+
+CModelRuntime::CModelRuntime(TspSliceSystem& system,
+    std::function<void(TspSliceSystem::LogSinks)> tick)
+    : system_(system)
+    , tick_(std::move(tick))
 {
 }
 
@@ -273,6 +328,13 @@ void CModelRuntime::load(const BinaryProgram& program)
         program.hardware.mxm_weight_activation_overlap_enabled != 0,
     });
     system_.reset_execution_state();
+    initialize_vxm_luts(system_);
+    for (std::size_t group = 0; group < 16; ++group)
+        system_.configure_vxm_input_group_source(group,
+            group < 8 ? Hemisphere::East : Hemisphere::West);
+    for (std::size_t block = 0; block < 8; ++block)
+        system_.configure_vxm_output_block_destination(block,
+            block < 4 ? Hemisphere::West : Hemisphere::East);
     load_queue_programs_into_icu(program.queues, system_.icu(),
         program.hardware.mxms_per_hemisphere);
     loaded_max_cycle_ = program.max_cycle;
@@ -291,7 +353,7 @@ void CModelRuntime::load(const BinaryProgram& program)
                     for (std::size_t column = 0; column < 32; ++column)
                         for_each_binding_hemisphere(binding,
                             [&](Hemisphere hemisphere) {
-                                write_sram_byte(system_, hemisphere, slice,
+                                write_binding_sram_byte(system_, binding, hemisphere, slice,
                                     static_cast<std::size_t>(binding.base_row + row),
                                     column, 0);
                             });
@@ -318,7 +380,7 @@ void CModelRuntime::load(const BinaryProgram& program)
                     for (std::size_t byte = 0; byte < binding.slices.size(); ++byte)
                         for_each_binding_hemisphere(binding,
                             [&](Hemisphere hemisphere) {
-                                write_sram_byte(system_, hemisphere,
+                                write_binding_sram_byte(system_, binding, hemisphere,
                                     binding.slices[byte], address, query_lane,
                                     static_cast<std::uint8_t>(bits >> (8 * byte)));
                             });
@@ -342,12 +404,19 @@ void CModelRuntime::load(const BinaryProgram& program)
                 static_cast<std::size_t>(binding.shape[1]);
             const std::size_t stride =
                 static_cast<std::size_t>(std::abs(binding.address_stride));
+            const std::size_t lanes =
+                static_cast<std::size_t>(program.hardware.mxm_rows);
+            if (lanes == 0 || dimensions % lanes != 0)
+                throw std::logic_error(
+                    "RoPE-table dimensions must be a multiple of MXM rows");
             for (std::size_t token = 0; token < sequence; ++token) {
-                const std::size_t address =
-                    static_cast<std::size_t>(binding.base_row)
-                    + token * stride;
                 for (std::size_t dimension = 0;
                      dimension < dimensions; ++dimension) {
+                    const std::size_t frequencyBlock = dimension / lanes;
+                    const std::size_t localDimension = dimension % lanes;
+                    const std::size_t address =
+                        static_cast<std::size_t>(binding.base_row)
+                        + (frequencyBlock * sequence + token) * stride;
                     const float inverse = 1.0f / std::pow(
                         binding.rope_theta,
                         static_cast<float>(2 * dimension)
@@ -359,17 +428,17 @@ void CModelRuntime::load(const BinaryProgram& program)
                         std::sin(angle), binding.element_type);
                     for_each_binding_hemisphere(binding,
                         [&](Hemisphere hemisphere) {
-                            write_sram_byte(system_, hemisphere,
-                                binding.slices[0], address, dimension,
+                            write_binding_sram_byte(system_, binding, hemisphere,
+                                binding.slices[0], address, localDimension,
                                 static_cast<std::uint8_t>(cosine));
-                            write_sram_byte(system_, hemisphere,
-                                binding.slices[1], address, dimension,
+                            write_binding_sram_byte(system_, binding, hemisphere,
+                                binding.slices[1], address, localDimension,
                                 static_cast<std::uint8_t>(cosine >> 8));
-                            write_sram_byte(system_, hemisphere,
-                                binding.slices[2], address, dimension,
+                            write_binding_sram_byte(system_, binding, hemisphere,
+                                binding.slices[2], address, localDimension,
                                 static_cast<std::uint8_t>(sine));
-                            write_sram_byte(system_, hemisphere,
-                                binding.slices[3], address, dimension,
+                            write_binding_sram_byte(system_, binding, hemisphere,
+                                binding.slices[3], address, localDimension,
                                 static_cast<std::uint8_t>(sine >> 8));
                         });
                 }
@@ -419,7 +488,7 @@ void CModelRuntime::upload_binding(
             const auto address = static_cast<std::size_t>(binding.base_row) + row * row_stride;
             for (std::size_t column = 0; column < columns; ++column)
                 for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
-                    write_sram_byte(system_, hemisphere, binding.slices[0], address,
+                    write_binding_sram_byte(system_, binding, hemisphere, binding.slices[0], address,
                         column, data[row * columns + column]);
                 });
         }
@@ -437,7 +506,7 @@ void CModelRuntime::upload_binding(
                     + ((k / mxm_k) * column_blocks
                         + column / binding.slices.size()) * row_stride;
                 for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
-                    write_sram_byte(system_, hemisphere, slice, address, k % mxm_k,
+                    write_binding_sram_byte(system_, binding, hemisphere, slice, address, k % mxm_k,
                         data[k * columns + column]);
                 });
             }
@@ -453,13 +522,13 @@ void CModelRuntime::upload_binding(
                     + (k / 32) * rows + row;
                 const std::size_t offset = (row * columns + k) * 2;
                 for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
-                    write_sram_byte(system_, hemisphere, binding.slices[0], address,
+                    write_binding_sram_byte(system_, binding, hemisphere, binding.slices[0], address,
                         k % 32, data[offset]);
-                    write_sram_byte(system_, hemisphere, binding.slices[1], address,
+                    write_binding_sram_byte(system_, binding, hemisphere, binding.slices[1], address,
                         k % 32, data[offset + 1]);
-                    write_sram_byte(system_, hemisphere, binding.slices[2], address,
+                    write_binding_sram_byte(system_, binding, hemisphere, binding.slices[2], address,
                         k % 32, data[offset]);
-                    write_sram_byte(system_, hemisphere, binding.slices[3], address,
+                    write_binding_sram_byte(system_, binding, hemisphere, binding.slices[3], address,
                         k % 32, data[offset + 1]);
                 });
             }
@@ -476,9 +545,9 @@ void CModelRuntime::upload_binding(
                     + (column / 32) * rows + row;
                 const std::size_t offset = (row * columns + column) * 2;
                 for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
-                    write_sram_byte(system_, hemisphere, binding.slices[0],
+                    write_binding_sram_byte(system_, binding, hemisphere, binding.slices[0],
                         address, column % 32, data[offset]);
-                    write_sram_byte(system_, hemisphere, binding.slices[1],
+                    write_binding_sram_byte(system_, binding, hemisphere, binding.slices[1],
                         address, column % 32, data[offset + 1]);
                 });
             }
@@ -508,11 +577,11 @@ void CModelRuntime::upload_binding(
                     for_each_binding_hemisphere(
                         binding, [&](Hemisphere hemisphere) {
                             for (std::size_t lane = 0; lane < 8; ++lane) {
-                                write_sram_byte(system_, hemisphere,
+                                write_binding_sram_byte(system_, binding, hemisphere,
                                     binding.slices[2 * featureLane],
                                     address, destinationTile * 8 + lane,
                                     data[offset]);
-                                write_sram_byte(system_, hemisphere,
+                                write_binding_sram_byte(system_, binding, hemisphere,
                                     binding.slices[2 * featureLane + 1],
                                     address, destinationTile * 8 + lane,
                                     data[offset + 1]);
@@ -544,11 +613,11 @@ void CModelRuntime::upload_binding(
                 const std::size_t offset = (row * columns + column) * 2;
                 for_each_binding_hemisphere(
                     binding, [&](Hemisphere hemisphere) {
-                        write_sram_byte(system_, hemisphere,
+                        write_binding_sram_byte(system_, binding, hemisphere,
                             binding.slices[2 * feature_lane], address,
                             destination_tile * 8 + token_lane,
                             data[offset]);
-                        write_sram_byte(system_, hemisphere,
+                        write_binding_sram_byte(system_, binding, hemisphere,
                             binding.slices[2 * feature_lane + 1], address,
                             destination_tile * 8 + token_lane,
                             data[offset + 1]);
@@ -582,12 +651,51 @@ void CModelRuntime::upload_binding(
                     (logical_row * columns + column) * 2;
                 for_each_binding_hemisphere(
                     binding, [&](Hemisphere hemisphere) {
-                        write_sram_byte(system_, hemisphere,
+                        write_binding_sram_byte(system_, binding, hemisphere,
                             binding.slices[2 * feature_lane], address,
                             lane, data[offset]);
-                        write_sram_byte(system_, hemisphere,
+                        write_binding_sram_byte(system_, binding, hemisphere,
                             binding.slices[2 * feature_lane + 1], address,
                             lane, data[offset + 1]);
+                    });
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16VxmRowParallel8
+        && is_16bit_float(binding.element_type)
+        && binding.slices.size() == 16) {
+        if (columns == 0 || (!vector && rows % 32 != 0))
+            throw std::logic_error(
+                "VXM row-parallel input requires 32-aligned rows");
+        const std::size_t storedRows = vector ? 32 : rows;
+        for (std::size_t row = 0; row < storedRows; ++row) {
+            const std::size_t logicalRow = vector ? 0 : row;
+            const std::size_t tokenBlock = row / 32;
+            const std::size_t pair = vector ? 0 : tokenBlock % 8;
+            const std::size_t batch = vector ? 0 : tokenBlock / 8;
+            const std::size_t lane = row % 32;
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + batch * columns + column;
+                const std::size_t offset =
+                    (logicalRow * columns + column) * 2;
+                for_each_binding_hemisphere(binding,
+                    [&](Hemisphere hemisphere) {
+                        const std::size_t firstPair = vector ? 0 : pair;
+                        const std::size_t lastPair = vector ? 8 : pair + 1;
+                        for (std::size_t targetPair = firstPair;
+                             targetPair < lastPair; ++targetPair) {
+                            write_binding_sram_byte(system_, binding,
+                                hemisphere,
+                                binding.slices[2 * targetPair], address,
+                                lane, data[offset]);
+                            write_binding_sram_byte(system_, binding,
+                                hemisphere,
+                                binding.slices[2 * targetPair + 1], address,
+                                lane, data[offset + 1]);
+                        }
                     });
             }
         }
@@ -618,10 +726,10 @@ void CModelRuntime::upload_binding(
                 const std::size_t offset = (row * columns + column) * 2;
                 for_each_binding_hemisphere(
                     binding, [&](Hemisphere hemisphere) {
-                        write_sram_byte(system_, hemisphere,
+                        write_binding_sram_byte(system_, binding, hemisphere,
                             binding.slices[2 * token_lane], address,
                             feature_wave * 8 + feature_lane, data[offset]);
-                        write_sram_byte(system_, hemisphere,
+                        write_binding_sram_byte(system_, binding, hemisphere,
                             binding.slices[2 * token_lane + 1], address,
                             feature_wave * 8 + feature_lane, data[offset + 1]);
                     });
@@ -649,8 +757,34 @@ void CModelRuntime::upload_binding(
                         ? Hemisphere::East : Hemisphere::West;
                     address += ((n / 64) * (rows / 32) + k / 32) * 4 + pulse;
                 }
-                write_sram_byte(system_, hemisphere, binding.slices[stream], address,
+                write_binding_sram_byte(system_, binding, hemisphere, binding.slices[stream], address,
                     k % 32, data[k * columns + n]);
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::W8A16MxmWeightReplicated
+        && binding.element_type == BindingElementType::I8
+        && binding.slices.size() == 8) {
+        if (rows % 32 != 0 || columns % 32 != 0)
+            throw std::logic_error(
+                "replicated W8A16 weight must be K32/N32 aligned");
+        const std::size_t reductionBlocks = rows / 32;
+        for (std::size_t k = 0; k < rows; ++k) {
+            for (std::size_t n = 0; n < columns; ++n) {
+                const std::size_t local = n % 32;
+                const std::size_t pulse = 3 - local / 8;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + ((n / 32) * reductionBlocks + k / 32) * 4
+                    + pulse;
+                for_each_binding_hemisphere(binding,
+                    [&](Hemisphere hemisphere) {
+                        write_binding_sram_byte(system_, binding,
+                            hemisphere, binding.slices[local % 8],
+                            address, k % 32,
+                            data[k * columns + n]);
+                    });
             }
         }
         return;
@@ -683,7 +817,7 @@ void CModelRuntime::upload_binding(
                     static_cast<std::size_t>(binding.base_row)
                     + (wave * reductionBlocks + k / 32) * 4
                     + pulse;
-                write_sram_byte(system_, hemisphere,
+                write_binding_sram_byte(system_, binding, hemisphere,
                     binding.slices[localMxm * 8 + stream],
                     address, k % 32, data[k * columns + n]);
             }
@@ -707,7 +841,7 @@ void CModelRuntime::upload_binding(
                 const std::size_t address = static_cast<std::size_t>(binding.base_row)
                     + (head_group * reduction_blocks + k / 32) * 8
                     + local_mxm * 4 + pulse;
-                write_sram_byte(system_, hemisphere, binding.slices[stream], address,
+                write_binding_sram_byte(system_, binding, hemisphere, binding.slices[stream], address,
                     k % 32, data[k * columns + n]);
             }
         }
@@ -734,9 +868,9 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
                     static_cast<std::size_t>(binding.base_row)
                     + (column / 32) * rows + row;
                 const std::size_t offset = (row * columns + column) * 2;
-                result[offset] = read_sram_byte(system_, Hemisphere::East,
+                result[offset] = read_binding_sram_byte(system_, binding, Hemisphere::East,
                     binding.slices[0], address, column % 32);
-                result[offset + 1] = read_sram_byte(system_, Hemisphere::East,
+                result[offset + 1] = read_binding_sram_byte(system_, binding, Hemisphere::East,
                     binding.slices[1], address, column % 32);
             }
         }
@@ -749,7 +883,7 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
             const auto address = static_cast<std::size_t>(binding.base_row) + row * row_stride;
             for (std::size_t column = 0; column < columns; ++column)
                 result[row * columns + column] =
-                    read_sram_byte(system_, Hemisphere::East,
+                    read_binding_sram_byte(system_, binding, Hemisphere::East,
                         binding.slices[0], address, column);
         }
         return result;
@@ -768,9 +902,9 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
                 const std::size_t address = static_cast<std::size_t>(binding.base_row)
                     + (dual_hemisphere ? column / 128 : column / 64) * rows + row;
                 const std::size_t offset = (row * columns + column) * 2;
-                result[offset] = read_sram_byte(system_, hemisphere,
+                result[offset] = read_binding_sram_byte(system_, binding, hemisphere,
                     binding.slices[local_mxm * 2], address, column % 32);
-                result[offset + 1] = read_sram_byte(system_, hemisphere,
+                result[offset + 1] = read_binding_sram_byte(system_, binding, hemisphere,
                     binding.slices[local_mxm * 2 + 1], address, column % 32);
             }
         }
@@ -801,11 +935,11 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
                     + (token_block * hidden_blocks + hidden_block) * 4
                     + token_wave;
                 const std::size_t offset = (row * columns + column) * 2;
-                result[offset] = read_sram_byte(system_,
+                result[offset] = read_binding_sram_byte(system_, binding,
                     Hemisphere::East,
                     binding.slices[2 * feature_lane], address,
                     source_tile * 8 + token_lane);
-                result[offset + 1] = read_sram_byte(system_,
+                result[offset + 1] = read_binding_sram_byte(system_, binding,
                     Hemisphere::East,
                     binding.slices[2 * feature_lane + 1], address,
                     source_tile * 8 + token_lane);
@@ -835,10 +969,38 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
                     + (token_block * hidden_blocks + hidden_block) * 4
                     + feature_wave;
                 const std::size_t offset = (row * columns + column) * 2;
-                result[offset] = read_sram_byte(system_, Hemisphere::East,
+                result[offset] = read_binding_sram_byte(system_, binding, Hemisphere::East,
                     binding.slices[2 * feature_lane], address, lane);
-                result[offset + 1] = read_sram_byte(system_, Hemisphere::East,
+                result[offset + 1] = read_binding_sram_byte(system_, binding, Hemisphere::East,
                     binding.slices[2 * feature_lane + 1], address, lane);
+            }
+        }
+        return result;
+    }
+    if (binding.layout == BindingLayout::Fp16VxmRowParallel8
+        && is_16bit_float(binding.element_type)
+        && binding.slices.size() == 16) {
+        if (rows % 32 != 0 || columns == 0)
+            throw std::logic_error(
+                "VXM row-parallel output requires 32-aligned rows");
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t tokenBlock = row / 32;
+            const std::size_t pair = tokenBlock % 8;
+            const std::size_t batch = tokenBlock / 8;
+            const std::size_t lane = row % 32;
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + batch * columns + column;
+                const std::size_t offset = (row * columns + column) * 2;
+                result[offset] = read_binding_sram_byte(system_, binding,
+                    Hemisphere::East, binding.slices[2 * pair], address,
+                    lane);
+                result[offset + 1] = read_binding_sram_byte(system_, binding,
+                    Hemisphere::East, binding.slices[2 * pair + 1], address,
+                    lane);
             }
         }
         return result;
@@ -876,10 +1038,10 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
                                 * loaded_mxms_per_hemisphere_))
                         / loaded_mxms_per_hemisphere_)
                     : Hemisphere::East;
-                result[offset] = read_sram_byte(system_, hemisphere,
+                result[offset] = read_binding_sram_byte(system_, binding, hemisphere,
                     binding.slices[2 * token_lane], address,
                     feature_wave * 8 + feature_lane);
-                result[offset + 1] = read_sram_byte(system_, hemisphere,
+                result[offset + 1] = read_binding_sram_byte(system_, binding, hemisphere,
                     binding.slices[2 * token_lane + 1], address,
                     feature_wave * 8 + feature_lane);
             }
@@ -895,8 +1057,8 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
         for (std::size_t column = 0; column < columns; ++column) {
             const auto offset = (row * columns + column) * 4;
             for (std::size_t byte = 0; byte < 4; ++byte)
-                result[offset + byte] = read_sram_byte(
-                    system_, Hemisphere::East, binding.slices[byte], address, column);
+                result[offset + byte] = read_binding_sram_byte(
+                    system_, binding, Hemisphere::East, binding.slices[byte], address, column);
         }
     }
     return result;
@@ -914,6 +1076,7 @@ void CModelRuntime::copy_binding(
         throw std::invalid_argument(
             "device binding copy requires matching 16-bit float tensors");
     if (source.layout == destination.layout
+        && source.bank == destination.bank
         && source.base_row == destination.base_row
         && source.slices == destination.slices
         && source.hemisphere_mask == destination.hemisphere_mask)
@@ -942,8 +1105,8 @@ void CModelRuntime::dispatch_icu_cycles(std::size_t cycles, std::ostream* log)
 {
     const auto count = cycles == 0 ? loaded_max_cycle_ + 1 : cycles;
     for (std::size_t cycle = 0; cycle < count; ++cycle) {
-        if (log != nullptr) system_.tick(*log);
-        else system_.tick({});
+        if (log != nullptr) tick_({log, log, log, log, log});
+        else tick_({});
         datapath_performance_.sample(
             system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
     }
@@ -953,10 +1116,13 @@ void CModelRuntime::run_cycles(std::size_t cycles, std::ostream* log)
 {
     const auto count = cycles == 0 ? loaded_max_cycle_ + 1 : cycles;
     auto sinks = TspSliceSystem::LogSinks {};
-    if (log != nullptr) sinks = TspSliceSystem::LogSinks {log, log, log, log, log};
+    if (log != nullptr) {
+        sinks = TspSliceSystem::LogSinks {log, log, log, log, log};
+        sinks.sxm = log;
+    }
     for (std::size_t cycle = 0; cycle < count; ++cycle) {
         try {
-            system_.tick(sinks);
+            tick_(sinks);
             datapath_performance_.sample(
                 system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
         } catch (const std::exception& ex) {

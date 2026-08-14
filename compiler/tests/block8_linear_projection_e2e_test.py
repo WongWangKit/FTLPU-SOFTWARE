@@ -41,7 +41,7 @@ def main() -> None:
         'weight_input_mode = "int8_dequant_bf16"',
         'compute_mode = "block8"',
         "ftlpu.command.mxm_dequant",
-        'kind = "fp16_mxm_distributed_16"',
+        'kind = "fp16_mxm_block8_distributed_16"',
     )
     missing = [token for token in required if token not in text]
     if missing:

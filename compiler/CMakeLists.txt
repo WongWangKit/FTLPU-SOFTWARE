@@ -118,6 +118,7 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Analysis/FfnDownProjectionTimelinePlanner.cpp
     src/Dialect/Schedule/Analysis/LPUResourceModel.cpp
     src/Dialect/Schedule/Analysis/ResourceScheduler.cpp
+    src/Dialect/Schedule/Analysis/StreamFabricScheduler.cpp
     src/Dialect/Schedule/Analysis/ScheduleGraph.cpp
     src/Dialect/Schedule/Analysis/SchedulePlan.cpp
     src/Dialect/Schedule/Analysis/AttentionTaskGraph.cpp
@@ -132,6 +133,7 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Transforms/AttentionRopeEmitter.cpp
     src/Dialect/Schedule/Transforms/AttentionScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/AttentionSoftmaxEmitter.cpp
+    src/Dialect/Schedule/Transforms/AssignWeightBank.cpp
     src/Dialect/Schedule/Transforms/FfnDownProjectionEmitter.cpp
     src/Dialect/Schedule/Transforms/FfnBlock8ProjectionEmitter.cpp
     src/Dialect/Schedule/Transforms/FfnBlock8DownProjectionEmitter.cpp
@@ -174,6 +176,7 @@ set(FTLPU_TARGET_MODEL_CONSUMER_SOURCES
     ${FTLPU_COMPILER_LIBRARY_SOURCES}
     tools/ftlpu_opt.cpp
     tools/ftlpu_translate.cpp
+    tools/ftlpu_compile.cpp
     tests/attention_projection_planner_test.cpp
     tests/attention_target_layout_test.cpp
     tests/attention_work_planner_test.cpp
@@ -212,6 +215,9 @@ target_link_libraries(ftlpu_opt PRIVATE ftlpu_compiler)
 add_executable(ftlpu_translate tools/ftlpu_translate.cpp)
 set_target_properties(ftlpu_translate PROPERTIES OUTPUT_NAME "ftlpu-translate")
 target_link_libraries(ftlpu_translate PRIVATE ftlpu_compiler)
+add_executable(ftlpu_compile tools/ftlpu_compile.cpp)
+set_target_properties(ftlpu_compile PROPERTIES OUTPUT_NAME "ftlpu-compile")
+target_link_libraries(ftlpu_compile PRIVATE ftlpu_compiler)
 if(FTLPU_ENABLE_ADDRESS_SANITIZER AND MSVC)
     target_compile_options(ftlpu_translate PRIVATE /fsanitize=address)
     target_compile_definitions(ftlpu_translate PRIVATE
@@ -244,6 +250,11 @@ add_test(NAME schedule_graph_test COMMAND $<TARGET_FILE:schedule_graph_test>)
 add_executable(schedule_plan_test tests/schedule_plan_test.cpp)
 target_link_libraries(schedule_plan_test PRIVATE ftlpu_compiler)
 add_test(NAME schedule_plan_test COMMAND $<TARGET_FILE:schedule_plan_test>)
+add_executable(stream_fabric_scheduler_test
+    tests/stream_fabric_scheduler_test.cpp)
+target_link_libraries(stream_fabric_scheduler_test PRIVATE ftlpu_compiler)
+add_test(NAME stream_fabric_scheduler_test
+    COMMAND $<TARGET_FILE:stream_fabric_scheduler_test>)
 add_executable(stream_route_plan_test tests/stream_route_plan_test.cpp)
 target_link_libraries(stream_route_plan_test PRIVATE ftlpu_compiler)
 add_test(NAME stream_route_plan_test COMMAND $<TARGET_FILE:stream_route_plan_test>)
@@ -269,6 +280,37 @@ if(MSVC)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME qwen2_5_1_5b_decoder_layer_stablehlo_to_stream_ir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer)
+    add_test(
+        NAME qwen2_5_1_5b_paged_weight_layout_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --weight-bank 1
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_paged)
+    add_custom_target(
+        qwen2_5_1_5b_decoder_layer_pipeline
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_pipeline_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer
+        DEPENDS ftlpu_opt ftlpu_translate
+        USES_TERMINAL)
     add_test(
         NAME lm_head_target_aware_tensor_ir_test
         COMMAND
@@ -350,7 +392,8 @@ if(Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/w8a16_ffn_mtile_weight_reuse_test.py
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_128x64x128x64.stablehlo.mlir
-            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/w8a16_ffn_mtile_weight_reuse/ffn.schedule.mlir)
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/w8a16_ffn_mtile_weight_reuse/ffn.schedule.mlir
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json)
     add_test(
         NAME smollm2_135m_ffn_binary_cmodel_runtime_test
         COMMAND
@@ -620,4 +663,15 @@ if(Python3_Interpreter_FOUND)
             --block8-target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
             --legacy-target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/block8_linear_projection_e2e)
+    add_test(
+        NAME direct_binary_compile_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/direct_binary_compile_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64_bf16.stablehlo.mlir
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/direct_binary_compile)
 endif()

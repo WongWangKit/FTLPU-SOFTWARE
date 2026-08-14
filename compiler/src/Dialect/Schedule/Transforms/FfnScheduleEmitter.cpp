@@ -90,15 +90,27 @@ mlir::FailureOr<mlir::Value> schedule::lowerFfnSchedule(
 {
     auto context = schedule::ffn_detail::createFfnEmissionContext(
         rewriter, plan, strategy, target);
-    if (mlir::failed(context)) return mlir::failure();
+    if (mlir::failed(context)) {
+        plan.getOperation()->emitError(
+            "failed to create the FFN emission context");
+        return mlir::failure();
+    }
 
     if ((*context)->block8_projection) {
         auto swish =
             schedule::ffn_detail::emitFfnBlock8ProjectionAndSwish(
                 **context);
-        if (mlir::failed(swish)) return mlir::failure();
-        return schedule::ffn_detail::emitFfnDownProjection(
+        if (mlir::failed(swish)) {
+            plan.getOperation()->emitError(
+                "failed to emit the Block8 FFN projection and Swish");
+            return mlir::failure();
+        }
+        auto result = schedule::ffn_detail::emitFfnDownProjection(
             **context, *swish);
+        if (mlir::failed(result))
+            plan.getOperation()->emitError(
+                "failed to emit the Block8 FFN down projection");
+        return result;
     }
 
     const int64_t accumulatorRows =

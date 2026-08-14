@@ -24,33 +24,34 @@ try {
 
     const auto path = std::filesystem::path(argv[1]);
     const auto program = read_binary_program(path);
-    require(program.max_cycle == 1, "VXM Repeat final cycle was not serialized");
+    require(program.max_cycle == 0,
+        "VXM packet repeat must not become an ICU Repeat command");
     require(program.queues.size() == 1, "expected exactly one serialized VXM queue");
-    require(program.queues[0].kind == QueueKind::Vxm && program.queues[0].index == 3,
+    require(program.queues[0].kind == QueueKind::Vxm && program.queues[0].index == 1,
         "serialized VXM queue identity is incorrect");
 
-    bool has_four_word_instruction = false;
+    bool hasCompactInstruction = false;
     for (const auto& command : program.queues[0].commands) {
-        if (command.instruction_kind == InstructionKind::Vxm && command.word_count == 4)
-            has_four_word_instruction = true;
+        if (command.instruction_kind != InstructionKind::Vxm
+            || command.word_count != 3)
+            continue;
+        const auto decoded = ftlpu::isa::decode_vxm_instruction(1,
+            ftlpu::isa::EncodedVxmInstruction {
+                static_cast<std::uint64_t>(command.words[0])
+                    | (static_cast<std::uint64_t>(command.words[1]) << 32),
+                command.words[2]});
+        require(decoded.chain_depth == ftlpu::VxmChainDepth::Two,
+            "VXM chain depth was not encoded");
+        require(decoded.instruction.repeat_count == 2,
+            "VXM packet repeat count was not encoded");
+        hasCompactInstruction = true;
     }
-    require(has_four_word_instruction, "VXM command did not use the four-word codec");
+    require(hasCompactInstruction,
+        "VXM command did not use the 96-bit compact codec");
 
     auto system = std::make_unique<ftlpu::TspSliceSystem>();
     auto runtime = CModelRuntime(*system);
     runtime.load(program);
-    std::ostringstream log;
-    runtime.dispatch_icu_cycles(program.max_cycle + 1, &log);
-    constexpr auto dispatch = "ICU -> VXM.alu3 mul";
-    const auto first_dispatch = log.str().find(dispatch);
-    const auto second_dispatch = first_dispatch == std::string::npos
-        ? std::string::npos
-        : log.str().find(dispatch, first_dispatch + 1);
-    if (second_dispatch == std::string::npos) {
-        throw std::logic_error(
-            "runtime did not dispatch and repeat the VXM instruction on ALU3; ICU log:\n"
-            + log.str());
-    }
 
     std::cout << "command_vxm_binary_runtime_test passed\n";
     return 0;

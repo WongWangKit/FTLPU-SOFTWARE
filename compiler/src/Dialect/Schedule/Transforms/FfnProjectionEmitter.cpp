@@ -17,7 +17,6 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
     const int64_t tile = context.tile();
     const int64_t m = context.m();
     const int64_t k = context.k();
-    const int64_t intermediate = context.hidden();
     const int64_t weightLoadCycles =
         context.projection_timeline.weight_load_cycles;
     const int64_t mTileCount =
@@ -88,9 +87,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     reduction * m + mTile * tile;
                 const bool finalReduction = block.final_reduction;
                 const int64_t resultStreamBase =
-                    context.strategy == FfnScheduleStrategy::Fused
-                        && finalReduction
-                    ? 8 + hemisphere * 8
+                    finalReduction
+                    ? (context.strategy == FfnScheduleStrategy::Fused
+                            ? 8 + hemisphere * 8
+                            : 0)
                     : 0;
 
                 MxmComputeOp gateCompute;
@@ -199,18 +199,19 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     rowOffset += segment.rows;
                 }
 
-                const int64_t outputBlock =
-                    pair * memory.hemispheres + hemisphere;
+                // Each physical MXM owns its accumulator. A pair is fully
+                // reduced and drained before the next pair starts, so all
+                // projection pairs can reuse the same token-row window.
                 const int64_t accumulatorBase =
-                    mTile * tile * (intermediate / tile) + outputBlock;
+                    mTile * tile;
                 auto gatePlacement = schedule_placement(rewriter,
                     context.gate_acc_slices, accumulatorBase, tile,
-                    intermediate / tile,
+                    1,
                     context.hemisphereName(hemisphere),
                     "fp32_accumulator");
                 auto upPlacement = schedule_placement(rewriter,
                     context.up_acc_slices, accumulatorBase, tile,
-                    intermediate / tile,
+                    1,
                     context.hemisphereName(hemisphere),
                     "fp32_accumulator");
 
@@ -230,7 +231,9 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                 rewriter.getI64IntegerAttr(streamBase)),
                             rewriter.getNamedAttr("stream_count",
                                 rewriter.getI64IntegerAttr(
-                                    throughput.mxm_result_streams)),
+                                    finalReduction ? 2
+                                                   : throughput
+                                                         .mxm_result_streams)),
                             rewriter.getNamedAttr("address", address),
                             rewriter.getNamedAttr(
                                 "placement", placement),
@@ -240,18 +243,17 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                         hemisphere))),
                             rewriter.getNamedAttr("destination",
                                 rewriter.getStringAttr(
-                                    context.strategy
-                                            == FfnScheduleStrategy::Fused
-                                            && finalReduction
-                                        ? "stream"
-                                        : "sram")),
+                                    finalReduction ? "stream" : "sram")),
                             rewriter.getNamedAttr("repeat_count",
                                 rewriter.getI64IntegerAttr(tile)),
                             rewriter.getNamedAttr("repeat_interval",
                                 rewriter.getI64IntegerAttr(1)),
                             rewriter.getNamedAttr("address_stride",
-                                rewriter.getI64IntegerAttr(
-                                    intermediate / tile)),
+                                rewriter.getI64IntegerAttr(1)),
+                            rewriter.getNamedAttr(
+                                "accumulator_output_format",
+                                rewriter.getStringAttr(
+                                    finalReduction ? "bf16" : "fp32")),
                         });
                         return llvm::cast<MemAccumulateOp>(
                             rewriter.create(state));
@@ -277,36 +279,38 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         upAccLatency + tile
                             + context.westLatency(
                                 context.up_acc_slices.front()));
-                if (context.strategy == FfnScheduleStrategy::Fused) {
+                {
                     const int64_t tempBase =
                         (pair * mTileCount + mTile) * tile;
                     const auto emitTempWrite =
                         [&](MemAccumulateOp source,
                             llvm::ArrayRef<int64_t> tempSlices,
-                            llvm::ArrayRef<int64_t> accSlices,
-                            int64_t accCycle, int64_t streamBase,
+                            int64_t streamBase,
                             mlir::Value& lastWrite) {
-                            for (int64_t byte = 0;
-                                 byte < throughput.mxm_result_streams;
-                                 ++byte) {
+                            for (int64_t byte = 0; byte < 2; ++byte) {
                                 const int64_t targetSlice =
                                     tempSlices[byte];
-                                const int64_t sourceBoundary =
-                                    accSlices.front()
-                                    / target.streams()
-                                          .mem_slices_per_register_group;
                                 const int64_t targetBoundary =
                                     targetSlice
                                         / target.streams()
                                               .mem_slices_per_register_group
                                     + 1;
-                                const int64_t writeCycle = accCycle
-                                    + sourceBoundary - targetBoundary + 1;
+                                const auto transportLatency =
+                                    target.transport_latency(
+                                        target::StreamEndpoint::MxmResult,
+                                        target::StreamEndpoint::Mem,
+                                        target::StreamDirection::West,
+                                        targetSlice);
+                                if (!transportLatency)
+                                    return;
+                                const int64_t writeCycle = computeCycle
+                                    + target.mxm_first_result_latency()
+                                    + *transportLatency;
                                 auto placement = schedule_placement(
                                     rewriter, {targetSlice}, tempBase,
                                     tile, 1,
                                     context.hemisphereName(hemisphere),
-                                    "fp32_swiglu_temp_byte");
+                                    "bf16_swiglu_temp_byte");
                                 auto write =
                                     rewriter.create<MemWriteOp>(
                                         ffn.getLoc(), source.getOutput(),
@@ -322,12 +326,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                 emission
                                     .temp_mem_busy_windows[hemisphere]
                                     .push_back({
-                                        writeCycle
-                                            + context.westLatency(
-                                                targetSlice),
-                                        writeCycle + tile
-                                            + context.westLatency(
-                                                targetSlice)});
+                                        writeCycle,
+                                        writeCycle + tile});
                                 deferredReadyCycle =
                                     std::max(deferredReadyCycle,
                                         writeCycle + tile
@@ -337,13 +337,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         };
                     emitTempWrite(gateAccumulator,
                         memory.w8a16_fused_gate_temp_slices,
-                        context.gate_acc_slices,
-                        computeCycle + gateAccLatency, resultStreamBase,
+                        resultStreamBase,
                         gateTemp);
                     emitTempWrite(upAccumulator,
                         memory.w8a16_fused_up_temp_slices,
-                        context.up_acc_slices,
-                        computeCycle + upAccLatency,
                         resultStreamBase
                             + throughput.mxm_result_streams,
                         upTemp);

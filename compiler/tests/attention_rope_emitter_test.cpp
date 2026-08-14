@@ -37,10 +37,10 @@ int main()
     target::LPUTargetModel target;
     schedule::attention_detail::emitRopeOrCast(
         rewriter, rewriter.getUnknownLoc(), target, 10, 0, true,
-        entry->getArgument(0));
+        entry->getArgument(0), rewriter.getBF16Type());
     schedule::attention_detail::emitRopeOrCast(
         rewriter, rewriter.getUnknownLoc(), target, 20, 1, false,
-        entry->getArgument(0));
+        entry->getArgument(0), rewriter.getBF16Type());
 
     int ropeInstructions = 0;
     int castInstructions = 0;

@@ -2,6 +2,7 @@
 """Lowers generic StableHLO RMSNorm and checks the binary on CModel."""
 
 import argparse
+import re
 import subprocess
 from pathlib import Path
 
@@ -38,12 +39,32 @@ def main() -> None:
     ):
         if operation not in text:
             raise RuntimeError(f"RMSNorm Command IR is missing {operation}")
-    for opcode in ("square", "sqrt", "divide", "multiply"):
-        if f'opcode = "{opcode}"' not in text:
-            raise RuntimeError(f"RMSNorm Command IR is missing {opcode}")
     if args.strategy == "vxm-feedback":
-        if "source_streams = [0]" in text:
-            raise RuntimeError("feedback RMSNorm emitted a legacy narrow SXM command")
+        for marker in (
+            'kind = "fp16_vxm_row_parallel_8"',
+            'opcode = "multiply"',
+            'opcode = "rsqrt"',
+            "accumulator_reset = true",
+            "accumulator_write = true",
+            "accumulator_emit = false",
+            "local_scalar_write = true",
+            "chain_depth = 2",
+            "chain_depth = 4",
+        ):
+            if marker not in text:
+                raise RuntimeError(
+                    f"feedback RMSNorm Command IR is missing {marker}")
+        if 'opcode = "square"' in text or 'opcode = "sqrt"' in text:
+            raise RuntimeError("feedback RMSNorm emitted a non-hardware VXM opcode")
+        mem_queues = [
+            int(value)
+            for value in re.findall(
+                r'ftlpu\.command\.mem \{[^\n]*?queue = (\d+) : i64', text
+            )
+        ]
+        if not any(queue % 2 == 1 for queue in mem_queues):
+            raise RuntimeError(
+                "feedback RMSNorm Command IR does not use SRAM bank 1")
     elif "ftlpu.command.mxm" not in text:
         raise RuntimeError("MXM-reduce RMSNorm Command IR is missing MXM")
 

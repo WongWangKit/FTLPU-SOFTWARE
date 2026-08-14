@@ -43,7 +43,9 @@ VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef castTarget, int64_t outputStream,
     int64_t repeatCount, int64_t repeatInterval,
     llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
-    int64_t scaleBinding)
+    int64_t scaleBinding, bool accumulatorReset,
+    bool accumulatorWrite, bool accumulatorEmit,
+    bool localScalarWrite, int64_t chainDepth)
 {
     mlir::OperationState state(location, VxmOp::getOperationName());
     state.addOperands({lhsValue, rhsValue});
@@ -52,6 +54,8 @@ VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
         rewriter.getNamedAttr("queue", rewriter.getI64IntegerAttr(queue)),
         rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
+        rewriter.getNamedAttr("chain_depth",
+            rewriter.getI64IntegerAttr(chainDepth)),
         rewriter.getNamedAttr("lhs_kind", rewriter.getStringAttr(lhsKind)),
         rewriter.getNamedAttr(
             "lhs_index", rewriter.getI64IntegerAttr(lhsIndex)),
@@ -78,6 +82,14 @@ VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
     if (scaleBinding >= 0)
         state.addAttribute(
             "scale_binding", rewriter.getI64IntegerAttr(scaleBinding));
+    if (accumulatorReset)
+        state.addAttribute("accumulator_reset", rewriter.getBoolAttr(true));
+    if (accumulatorWrite)
+        state.addAttribute("accumulator_write", rewriter.getBoolAttr(true));
+    if (!accumulatorEmit)
+        state.addAttribute("accumulator_emit", rewriter.getBoolAttr(false));
+    if (localScalarWrite)
+        state.addAttribute("local_scalar_write", rewriter.getBoolAttr(true));
     return llvm::cast<VxmOp>(rewriter.create(state));
 }
 

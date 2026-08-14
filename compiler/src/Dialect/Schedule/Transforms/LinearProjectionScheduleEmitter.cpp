@@ -292,6 +292,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
 
             const bool finalReduction =
                 reduction + 1 == reductionBlocks;
+            int64_t block8FinalWriteCycle = 0;
             for (int64_t tokenBlock = 0;
                  tokenBlock < tokenBlocks; ++tokenBlock) {
                 const int64_t computeCycle =
@@ -353,9 +354,44 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                                 1, 1,
                                 accumulatorAddress
                                     + tokenBlock * blockIssues,
-                                1, "sram", true, "supercell", 0,
+                                1, finalReduction ? "stream" : "sram",
+                                finalReduction, "supercell", 0,
                                 dataFormat, {},
-                                execution->compute_mode());
+                                execution->compute_mode(),
+                                finalReduction ? dataFormat
+                                               : llvm::StringRef {});
+                            if (!finalReduction) continue;
+
+                            const int64_t resultStart = issueCycle
+                                + target.throughput().tile_rows - 1;
+                            const int64_t hiddenBlocks = n / tile;
+                            const int64_t resultAddress = resultBase
+                                + (tokenBlock * hiddenBlocks
+                                      + outputGroup * 2 + hemisphere)
+                                    * blockIssues
+                                + rowBlock;
+                            for (int64_t stream = 0;
+                                 stream
+                                 < execution->activation_stream_count;
+                                 ++stream) {
+                                const int64_t slice = resultSlices[stream];
+                                const auto latency = target.transport_latency(
+                                    target::StreamEndpoint::MxmResult,
+                                    target::StreamEndpoint::Mem,
+                                    target::StreamDirection::West, slice);
+                                if (!latency) return mlir::failure();
+                                const int64_t writeCycle =
+                                    resultStart + *latency;
+                                emitMem(rewriter, op.getLoc(), writeCycle,
+                                    hemisphere
+                                            * target.memory()
+                                                  .slices_per_hemisphere
+                                        + slice,
+                                    "write", resultAddress, 32 + stream,
+                                    1, 1, 0, "sram");
+                                block8FinalWriteCycle = std::max(
+                                    block8FinalWriteCycle, writeCycle + 1);
+                            }
                         }
                         continue;
                     }
@@ -401,101 +437,8 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                           .mxm_local_load_to_compute_latency
                 : firstCompute + tokenBlocks * tile;
             if (!finalReduction) continue;
-
             if (block8) {
-                const int64_t blockRows =
-                    target.throughput().mxm_block_rows;
-                const int64_t blockIssues = tile / blockRows;
-                const int64_t columnSegments =
-                    target.throughput().tile_rows;
-                const int64_t hiddenBlocks = n / tile;
-                const int64_t readsPerHemisphere =
-                    tokenBlocks * blockIssues;
-                const int64_t drainStart =
-                    phaseStart + accumulatorLatency;
-                int64_t finalWriteCycle = drainStart;
-                for (int64_t hemisphere = 0;
-                     hemisphere < target.memory().hemispheres;
-                     ++hemisphere) {
-                    const char* inputHemisphere =
-                        hemisphere == 0 ? "east" : "west";
-                    for (int64_t tokenBlock = 0;
-                         tokenBlock < tokenBlocks; ++tokenBlock) {
-                        for (int64_t rowBlock = 0;
-                             rowBlock < blockIssues; ++rowBlock) {
-                            const int64_t ordinal =
-                                hemisphere * readsPerHemisphere
-                                + tokenBlock * blockIssues
-                                + rowBlock;
-                            const int64_t readCycle = drainStart
-                                + ordinal * columnSegments;
-                            emitMxm(rewriter, op.getLoc(), readCycle,
-                                hemisphere
-                                        * target.throughput()
-                                              .mxms_per_hemisphere
-                                    + localMxm,
-                                "accumulator_read", 0, 0, 0, 0,
-                                1, 1,
-                                accumulatorAddress
-                                    + tokenBlock * blockIssues
-                                    + rowBlock,
-                                1, "sram", true, "supercell", 0,
-                                dataFormat, {},
-                                execution->compute_mode());
-                            const int64_t vxmStart = readCycle
-                                + target.throughput()
-                                      .accumulator_read_to_vxm_latency;
-                            for (int64_t segment = 0;
-                                 segment < columnSegments; ++segment) {
-                                for (int64_t row = 0;
-                                     row < blockRows; ++row) {
-                                    emitVxm(rewriter, op.getLoc(),
-                                        op.getWeight(),
-                                        vxmStart + segment, row,
-                                        "cast", "stream_f32",
-                                        target.streams()
-                                                .streams_per_direction
-                                            + row * 4,
-                                        0.0f, "immediate", 0, 0.0f,
-                                        dataFormat, row * 2,
-                                        inputHemisphere, "east");
-                                }
-                            }
-                            const int64_t resultAddress = resultBase
-                                + (tokenBlock * hiddenBlocks
-                                      + outputGroup * 2
-                                      + hemisphere)
-                                    * blockIssues
-                                + rowBlock;
-                            for (int64_t stream = 0;
-                                 stream
-                                 < execution
-                                       ->activation_stream_count;
-                                 ++stream) {
-                                const int64_t slice =
-                                    resultSlices[stream];
-                                const auto latency =
-                                    target.transport_latency(
-                                        target::StreamEndpoint::
-                                            VxmResult,
-                                        target::StreamEndpoint::Mem,
-                                        target::StreamDirection::East,
-                                        slice);
-                                if (!latency)
-                                    return mlir::failure();
-                                emitMem(rewriter, op.getLoc(),
-                                    vxmStart + *latency,
-                                    slice, "write", resultAddress,
-                                    stream, columnSegments, 1, 0);
-                                finalWriteCycle = std::max(
-                                    finalWriteCycle,
-                                    vxmStart + *latency
-                                        + columnSegments);
-                            }
-                        }
-                    }
-                }
-                phaseStart = finalWriteCycle;
+                phaseStart = std::max(phaseStart, block8FinalWriteCycle);
                 continue;
             }
 

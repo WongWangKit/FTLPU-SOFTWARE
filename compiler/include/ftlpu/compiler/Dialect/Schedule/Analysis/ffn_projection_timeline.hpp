@@ -81,7 +81,8 @@ struct FfnDownProjectionTimeline {
 mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     FfnScheduleShape shape, llvm::ArrayRef<int64_t> weightSlices,
     const target::LPUTargetModel& target,
-    bool localWeightDequant = false);
+    bool localWeightDequant = false,
+    bool replicateOutputBlocksAcrossHemispheres = false);
 
 mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
     FfnScheduleShape shape, const FfnProjectionTimeline& projection,

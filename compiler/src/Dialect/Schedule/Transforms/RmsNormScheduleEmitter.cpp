@@ -68,6 +68,13 @@ int64_t baseRow(mlir::DictionaryAttr placement)
     return placement.getAs<mlir::IntegerAttr>("base_row").getInt();
 }
 
+int64_t bank(mlir::DictionaryAttr placement)
+{
+    if (auto value = placement.getAs<mlir::IntegerAttr>("bank"))
+        return value.getInt();
+    return 0;
+}
+
 mlir::FailureOr<TileAddress> tileAddress(
     mlir::DictionaryAttr placement, int64_t block, int64_t rows)
 {
@@ -133,6 +140,14 @@ int64_t serialFeedbackAddress(mlir::DictionaryAttr placement,
             + hiddenBlock * 32 + wave * 8 + row;
     return baseRow(placement) + hiddenBlock * rows
         + tokenBlock * 32 + wave * 8 + row;
+}
+
+int64_t rowParallelAddress(mlir::DictionaryAttr placement,
+    int64_t tokenBlock, int64_t hiddenBlock, int64_t wave,
+    int64_t row, int64_t hidden)
+{
+    return baseRow(placement) + (tokenBlock / 8) * hidden
+        + hiddenBlock * 32 + wave * 8 + row;
 }
 
 int64_t emitSerialFeedbackTranspose(mlir::IRRewriter& rewriter,
@@ -532,87 +547,114 @@ int64_t emitPairToPackedTranspose(mlir::IRRewriter& rewriter,
     const int64_t packedStreams = 2 * lanes;
     const int64_t hiddenBlocks = hidden / tile;
     const int64_t tokenBlocks = broadcastInput ? 1 : rows / tile;
+    const auto inputKind = inputPlacement.getAs<mlir::StringAttr>("kind");
+    const bool rowParallel = inputKind
+        && inputKind.getValue() == "fp16_vxm_row_parallel_8";
     int64_t cycle = start;
 
     for (int64_t tokenBlock = 0;
          tokenBlock < tokenBlocks; ++tokenBlock) {
-        for (int64_t hiddenBlock = 0;
-             hiddenBlock < hiddenBlocks; ++hiddenBlock) {
-            for (int64_t wave = 0; wave < tileRows; ++wave) {
-                const int64_t capture = cycle
+        for (int64_t featureWave = 0;
+             featureWave < tileRows; ++featureWave) {
+            for (int64_t hiddenBlock = 0;
+                 hiddenBlock < hiddenBlocks; ++hiddenBlock) {
+                const int64_t fill = cycle
                     + target.throughput().mem_to_sxm_latency;
-                for (int64_t row = 0; row < lanes; ++row) {
-                    for (int64_t hemisphere = 0;
-                         hemisphere < target.memory().hemispheres;
-                         ++hemisphere) {
-                        const std::array<int64_t, 2> sourceStreams {
-                            hemisphere == 0 ? 0 : 32,
-                            hemisphere == 0 ? 1 : 33,
-                        };
-                        const auto transposeStreams = streamRange(
-                            hemisphere == 0 ? 16 : 48, packedStreams);
-                        for (int64_t byte = 0; byte < 2; ++byte) {
-                            const int64_t slice = inputSlices[byte];
-                            const int64_t latency =
-                                *target.transport_latency(
-                                    target::StreamEndpoint::Mem,
-                                    target::StreamEndpoint::SxmInput,
-                                    target::StreamDirection::East, slice);
-                            const int64_t address = broadcastInput
-                                ? baseRow(inputPlacement) + hiddenBlock
-                                : planarAddress(inputPlacement,
-                                    tokenBlock, hiddenBlock, wave, row,
-                                    rows);
-                            emitMem(rewriter, location,
-                                capture + row - latency,
-                                hemisphere
-                                        * target.memory().
-                                            slices_per_hemisphere
-                                    + slice,
-                                "read", address,
-                                hemisphere == 0 ? byte : 32 + byte,
-                                1, 1, 0);
-                        }
-                        emitSxm(rewriter, location, capture + row,
-                            hemisphere, "transpose", sourceStreams,
-                            transposeStreams,
-                            attention_detail::identityMap());
-                    }
-                }
-
-                const int64_t permute = capture + lanes
-                    + target.throughput().tile_rows;
-                const auto map = blockDiagonalMap(wave, target);
                 for (int64_t hemisphere = 0;
                      hemisphere < target.memory().hemispheres;
                      ++hemisphere) {
                     const auto transposeStreams = streamRange(
                         hemisphere == 0 ? 16 : 48, packedStreams);
-                    const auto outputStreams = streamRange(
-                        hemisphere == 0 ? 32 : 0, packedStreams);
-                    emitSxm(rewriter, location, permute, hemisphere,
-                        "permute", transposeStreams, outputStreams, map);
-                    for (int64_t stream = 0;
-                         stream < packedStreams; ++stream) {
-                        const int64_t slice = outputSlices[stream];
-                        const auto direction = hemisphere == 0
-                            ? target::StreamDirection::West
-                            : target::StreamDirection::East;
-                        const int64_t latency = *target.transport_latency(
-                            target::StreamEndpoint::SxmResult,
-                            target::StreamEndpoint::Mem, direction, slice);
-                        emitMem(rewriter, location, permute + latency,
-                            hemisphere
-                                    * target.memory().slices_per_hemisphere
-                                + slice,
-                            "write", packedAddress(outputPlacement,
-                                tokenBlock, hiddenBlock, wave,
-                                hiddenBlocks),
-                            hemisphere == 0 ? 32 + stream : stream,
-                            1, 1, 0);
+                    for (int64_t row = 0; row < lanes; ++row) {
+                        for (int64_t byte = 0; byte < 2; ++byte) {
+                            const int64_t pair = rowParallel
+                                ? tokenBlock % 8 : 0;
+                            const int64_t slice =
+                                inputSlices[2 * pair + byte];
+                            const auto direction = hemisphere == 0
+                                ? target::StreamDirection::East
+                                : target::StreamDirection::West;
+                            const int64_t latency =
+                                *target.transport_latency(
+                                    target::StreamEndpoint::Mem,
+                                    target::StreamEndpoint::SxmInput,
+                                    direction, slice);
+                            const int64_t address = broadcastInput
+                                ? baseRow(inputPlacement) + hiddenBlock
+                                : rowParallel
+                                ? rowParallelAddress(inputPlacement,
+                                    tokenBlock, hiddenBlock, featureWave, row,
+                                    hidden)
+                                : planarAddress(inputPlacement,
+                                    tokenBlock, hiddenBlock, featureWave, row,
+                                    rows);
+                            emitMem(rewriter, location,
+                                fill + row - latency,
+                                hemisphere
+                                        * target.memory().
+                                            slices_per_hemisphere
+                                    + slice,
+                                "read", address,
+                                (hemisphere == 0 ? 0 : 32)
+                                    + 2 * row + byte,
+                                1, 1, 0, "sram", -1,
+                                bank(inputPlacement));
+                        }
+                        const std::array<int64_t, 2> sourceStreams {
+                            (hemisphere == 0 ? 0 : 32) + 2 * row,
+                            (hemisphere == 0 ? 0 : 32) + 2 * row + 1,
+                        };
+                        emitSxm(rewriter, location, fill + row,
+                            hemisphere, "transpose", sourceStreams,
+                            transposeStreams,
+                            attention_detail::identityMap(),
+                            "vector_columns", -1, row);
                     }
                 }
-                cycle = permute + target.streams().system_register_columns;
+
+                const int64_t permuteBegin =
+                    fill + lanes + tileRows - 1;
+                for (int64_t tokenWave = 0;
+                     tokenWave < tileRows; ++tokenWave) {
+                    const int64_t permute = permuteBegin + tokenWave;
+                    const auto map = blockDiagonalMap(
+                        (tokenWave + featureWave) % tileRows, target);
+                    for (int64_t hemisphere = 0;
+                         hemisphere < target.memory().hemispheres;
+                         ++hemisphere) {
+                        const auto transposeStreams = streamRange(
+                            hemisphere == 0 ? 16 : 48, packedStreams);
+                        const auto outputStreams = streamRange(
+                            hemisphere == 0 ? 32 : 0, packedStreams);
+                        emitSxm(rewriter, location, permute, hemisphere,
+                            "permute", transposeStreams, outputStreams, map,
+                            "vector_columns", -1, -1, featureWave);
+                        for (int64_t stream = 0;
+                             stream < packedStreams; ++stream) {
+                            const int64_t slice = outputSlices[stream];
+                            const auto direction = hemisphere == 0
+                                ? target::StreamDirection::West
+                                : target::StreamDirection::East;
+                            const int64_t latency = *target.transport_latency(
+                                target::StreamEndpoint::SxmResult,
+                                target::StreamEndpoint::Mem, direction,
+                                slice);
+                            emitMem(rewriter, location,
+                                permute + latency - featureWave,
+                                hemisphere
+                                        * target.memory().
+                                            slices_per_hemisphere
+                                    + slice,
+                                "write_tap", packedAddress(outputPlacement,
+                                    tokenBlock, hiddenBlock, tokenWave,
+                                    hiddenBlocks),
+                                hemisphere == 0 ? 32 + stream : stream,
+                                1, 1, 0);
+                        }
+                    }
+                }
+                cycle = permuteBegin + tileRows
+                    + target.streams().system_register_columns;
             }
         }
     }
@@ -624,10 +666,14 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
     mlir::DictionaryAttr inputPlacement,
     mlir::DictionaryAttr outputPlacement,
     int64_t rows, int64_t hidden, int64_t start,
-    bool outputFeedback)
+    bool outputFeedback,
+    mlir::DictionaryAttr duplicateOutputPlacement = {})
 {
     const auto inputSlices = slices(inputPlacement);
     const auto outputSlices = slices(outputPlacement);
+    const auto duplicateOutputSlices = duplicateOutputPlacement
+        ? slices(duplicateOutputPlacement)
+        : llvm::SmallVector<int64_t>{};
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t lanes = target.throughput().lanes_per_tile;
     const int64_t tileRows = target.throughput().tile_rows;
@@ -636,9 +682,10 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
     int64_t cycle = start;
 
     for (int64_t tokenBlock = 0; tokenBlock < rows / tile; ++tokenBlock) {
-        for (int64_t hiddenBlock = 0;
-             hiddenBlock < hiddenBlocks; ++hiddenBlock) {
-            for (int64_t wave = 0; wave < tileRows; ++wave) {
+        for (int64_t tokenWave = 0;
+             tokenWave < tileRows; ++tokenWave) {
+            for (int64_t hiddenBlock = 0;
+                 hiddenBlock < hiddenBlocks; ++hiddenBlock) {
                 const int64_t capture = cycle
                     + target.throughput().mem_to_sxm_latency;
                 for (int64_t hemisphere = 0;
@@ -663,7 +710,7 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
                                     * target.memory().slices_per_hemisphere
                                 + slice,
                             "read", packedAddress(inputPlacement,
-                                tokenBlock, hiddenBlock, wave,
+                                tokenBlock, hiddenBlock, tokenWave,
                                 hiddenBlocks),
                             hemisphere == 0 ? stream : 32 + stream,
                             1, 1, 0);
@@ -673,255 +720,98 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
                         attention_detail::identityMap());
                 }
 
-                const int64_t permute = capture
+                const int64_t permuteBegin = capture
                     + target.throughput().tile_rows + 1;
-                const auto map = blockDiagonalMap(wave, target);
-                for (int64_t row = 0; row < lanes; ++row) {
-                    for (int64_t hemisphere = 0;
-                         hemisphere < target.memory().hemispheres;
-                         ++hemisphere) {
-                        const auto transposeStreams = streamRange(
-                            hemisphere == 0 ? 16 : 48, packedStreams);
-                        const std::array<int64_t, 2> outputStreams {
-                            hemisphere == 0 ? 32 : 0,
-                            hemisphere == 0 ? 33 : 1,
-                        };
-                        emitSxm(rewriter, location, permute + row,
-                            hemisphere, "permute", transposeStreams,
-                            outputStreams, map);
-                        for (int64_t byte = 0; byte < 2; ++byte) {
-                            for (int64_t duplicate = byte;
-                                 duplicate
-                                     < static_cast<int64_t>(
+                for (int64_t featureWave = 0;
+                     featureWave < tileRows; ++featureWave) {
+                    const auto map = blockDiagonalMap(
+                        (tokenWave + featureWave) % tileRows, target);
+                    for (int64_t row = 0; row < lanes; ++row) {
+                        const int64_t permute = permuteBegin
+                            + featureWave * lanes + row;
+                        for (int64_t hemisphere = 0;
+                             hemisphere < target.memory().hemispheres;
+                             ++hemisphere) {
+                            const auto transposeStreams = streamRange(
+                                hemisphere == 0 ? 16 : 48, packedStreams);
+                            const auto outputStreams = streamRange(
+                                hemisphere == 0 ? 32 : 0, packedStreams);
+                            emitSxm(rewriter, location, permute,
+                                hemisphere, "permute", transposeStreams,
+                                outputStreams, map, "vector_columns", row,
+                                -1, tokenWave);
+                            for (int64_t byte = 0; byte < 2; ++byte) {
+                            llvm::SmallVector<int64_t, 8> sliceIndices;
+                            if (outputFeedback) {
+                                const int64_t tokenBlocks = rows / tile;
+                                const int64_t batch = tokenBlock / 8;
+                                const int64_t active =
+                                    std::min<int64_t>(8,
+                                        tokenBlocks - batch * 8);
+                                for (int64_t pair = tokenBlock % 8;
+                                     pair < 8; pair += active)
+                                    sliceIndices.push_back(2 * pair + byte);
+                            } else {
+                                for (int64_t index = byte;
+                                     index < static_cast<int64_t>(
                                          outputSlices.size());
-                                 duplicate += 2) {
-                                const int64_t slice =
-                                    outputSlices[duplicate];
-                                const auto direction = hemisphere == 0
-                                    ? target::StreamDirection::West
-                                    : target::StreamDirection::East;
-                                const int64_t latency =
-                                    *target.transport_latency(
-                                        target::StreamEndpoint::SxmResult,
-                                        target::StreamEndpoint::Mem,
-                                        direction, slice);
-                                emitMem(rewriter, location,
-                                    permute + row + latency,
-                                    hemisphere
-                                            * target.memory().
-                                                slices_per_hemisphere
-                                        + slice,
-                                    "write", outputFeedback
-                                        ? serialFeedbackAddress(
-                                              outputPlacement, tokenBlock,
-                                              hiddenBlock, wave, row,
-                                              rows, hidden, true)
-                                        : planarAddress(
-                                              outputPlacement, tokenBlock,
-                                              hiddenBlock, wave, row, rows),
-                                    hemisphere == 0 ? 32 + byte : byte,
-                                    1, 1, 0);
+                                     index += 2)
+                                    sliceIndices.push_back(index);
+                            }
+                            llvm::SmallVector<mlir::DictionaryAttr, 2>
+                                destinations {outputPlacement};
+                            if (duplicateOutputPlacement)
+                                destinations.push_back(
+                                    duplicateOutputPlacement);
+                            for (mlir::DictionaryAttr destination :
+                                 destinations) {
+                                const auto destinationSlices =
+                                    destination == outputPlacement
+                                    ? llvm::ArrayRef<int64_t>(outputSlices)
+                                    : llvm::ArrayRef<int64_t>(
+                                          duplicateOutputSlices);
+                                for (int64_t duplicate : sliceIndices) {
+                                    const int64_t slice =
+                                        destinationSlices[duplicate];
+                                    const auto direction = hemisphere == 0
+                                        ? target::StreamDirection::West
+                                        : target::StreamDirection::East;
+                                    const int64_t latency =
+                                        *target.transport_latency(
+                                            target::StreamEndpoint::SxmResult,
+                                            target::StreamEndpoint::Mem,
+                                            direction, slice);
+                                    emitMem(rewriter, location,
+                                        permute + latency - tokenWave,
+                                        hemisphere
+                                                * target.memory().
+                                                    slices_per_hemisphere
+                                            + slice,
+                                        "write_tap", outputFeedback
+                                            ? rowParallelAddress(
+                                                  destination, tokenBlock,
+                                                  hiddenBlock, featureWave,
+                                                  row,
+                                                  hidden)
+                                            : planarAddress(
+                                                  destination, tokenBlock,
+                                                  hiddenBlock, featureWave,
+                                                  row,
+                                                  rows),
+                                        (hemisphere == 0 ? 32 : 0)
+                                            + 2 * row + byte,
+                                        1, 1, 0, "sram", -1,
+                                        bank(destination));
+                                }
+                            }
                             }
                         }
                     }
                 }
-                cycle = permute + lanes
+                cycle = permuteBegin + tileRows * lanes
                     + target.streams().system_register_columns;
             }
         }
-    }
-    return cycle;
-}
-
-int64_t emitSerialVxmFeedback(mlir::IRRewriter& rewriter,
-    stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
-    mlir::DictionaryAttr inputPlacement,
-    mlir::DictionaryAttr weightPlacement,
-    mlir::DictionaryAttr outputPlacement, int64_t start)
-{
-    const auto inputSlices = slices(inputPlacement);
-    const auto weightSlices = slices(weightPlacement);
-    const auto outputSlices = slices(outputPlacement);
-    const auto inputType =
-        llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
-    const llvm::StringRef streamKind =
-        lpu_16bit_stream_kind(inputType.getElementType());
-    const llvm::StringRef dataFormat =
-        lpu_16bit_data_format(inputType.getElementType());
-    const int64_t rows = inputType.getDimSize(0);
-    const int64_t hidden = inputType.getDimSize(1);
-    const int64_t tile = target.throughput().mxm_rows;
-    const auto westReadLatency = [&](int64_t slice) {
-        return target.transport_latency(target::StreamEndpoint::Mem,
-            target::StreamEndpoint::VxmInput,
-            target::StreamDirection::West, slice).value();
-    };
-    const auto eastWriteLatency = [&](int64_t slice) {
-        return target.transport_latency(target::StreamEndpoint::VxmResult,
-            target::StreamEndpoint::Mem,
-            target::StreamDirection::East, slice).value();
-    };
-
-    int64_t cycle = start;
-    for (int64_t tokenBlock = 0;
-         tokenBlock < rows / tile; ++tokenBlock) {
-        const int64_t square = cycle
-            + std::max(westReadLatency(inputSlices[0]),
-                westReadLatency(inputSlices[1]));
-        const int64_t inputAddress =
-            baseRow(inputPlacement) + tokenBlock * hidden;
-        for (int64_t byte = 0; byte < 2; ++byte)
-            emitMem(rewriter, op.getLoc(),
-                square - westReadLatency(inputSlices[byte]),
-                inputSlices[byte], "read", inputAddress,
-                32 + byte, hidden, 1, 1);
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-            inputType, square, 0, "square",
-            streamKind, 32, 0.0f, "immediate", 0, 0.0f,
-            "fp32", -1, hidden, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-            inputType, square, 1, "pass",
-            "immediate", 0, 0.0f, "immediate", 0, 0.0f,
-            "fp32", -1, 1, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-            inputType, square + 1, 1, "add",
-            "alu", 0, 0.0f, "alu", 1, 0.0f,
-            "fp32", -1, hidden, 1, "east", "east");
-
-        const int64_t normalize = square + hidden + 1;
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-            inputType, normalize, 2, "divide",
-            "alu", 1, 0.0f, "immediate", 0,
-            static_cast<float>(hidden), "fp32", -1, 1, 1,
-            "east", "east");
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-            inputType, normalize + 1, 3, "add",
-            "alu", 2, 0.0f, "immediate", 0,
-            static_cast<float>(op.getEpsilon().convertToDouble()),
-            "fp32", -1, 1, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-            inputType, normalize + 2, 4, "sqrt",
-            "alu", 3, 0.0f, "immediate", 0, 0.0f,
-            "fp32", -1, 1, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-            inputType, normalize + 3, 5, "divide",
-            "immediate", 0, 1.0f, "alu", 4, 0.0f,
-            "fp32", -1, 1, 1, "east", "east");
-
-        for (int64_t byte = 0; byte < 2; ++byte) {
-            emitMem(rewriter, op.getLoc(),
-                normalize - westReadLatency(inputSlices[byte]),
-                inputSlices[byte], "read", inputAddress,
-                32 + byte, 1, 1, 0);
-            emitMem(rewriter, op.getLoc(),
-                normalize - westReadLatency(inputSlices[byte]) + 1,
-                inputSlices[byte], "read", inputAddress,
-                32 + byte, hidden, 1, 1);
-            emitMem(rewriter, op.getLoc(),
-                normalize - westReadLatency(weightSlices[byte]),
-                weightSlices[byte], "read",
-                baseRow(weightPlacement), 34 + byte,
-                1, 1, 0, "sram",
-                inputBindingIndex(op.getWeight()));
-            emitMem(rewriter, op.getLoc(),
-                normalize - westReadLatency(weightSlices[byte]) + 2,
-                weightSlices[byte], "read",
-                baseRow(weightPlacement), 34 + byte,
-                hidden, 1, 1, "sram",
-                inputBindingIndex(op.getWeight()));
-        }
-        for (int64_t queue = 6; queue <= 9; ++queue)
-            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-                inputType, normalize + queue - 6, queue, "pass",
-                queue == 6 ? streamKind : llvm::StringRef("alu"),
-                queue == 6 ? 32 : queue - 1, 0.0f,
-                "immediate", 0, 0.0f, "fp32", -1,
-                hidden, 1, "east", "east");
-        for (int64_t queue = 10; queue <= 13; ++queue)
-            create_vxm(rewriter, op.getLoc(), op.getWeight(), op.getWeight(),
-                inputType, normalize + queue - 10, queue, "pass",
-                queue == 10 ? streamKind : llvm::StringRef("alu"),
-                queue == 10 ? 34 : queue - 1, 0.0f,
-                "immediate", 0, 0.0f, "fp32", -1,
-                hidden, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-            inputType, normalize + 5, 14, "multiply",
-            "alu", 9, 0.0f, "alu", 5, 0.0f,
-            "fp32", -1, hidden, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
-            inputType, normalize + 6, 15, "multiply",
-            "alu", 14, 0.0f, "alu", 13, 0.0f,
-            dataFormat, 0, hidden, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
-            inputType, normalize + 7, 0, "pass",
-            "alu", 15, 0.0f, "immediate", 0, 0.0f,
-            dataFormat, 16, hidden, 1, "east", "west");
-
-        for (int64_t byte = 0; byte < 2; ++byte) {
-            emitMem(rewriter, op.getLoc(),
-                normalize + 6 + eastWriteLatency(outputSlices[byte]),
-                outputSlices[byte], "write",
-                baseRow(outputPlacement) + tokenBlock * hidden,
-                byte, hidden, 1, 1);
-            emitMem(rewriter, op.getLoc(),
-                normalize + 7 + eastWriteLatency(outputSlices[byte]),
-                target.memory().slices_per_hemisphere
-                    + outputSlices[byte],
-                "write",
-                baseRow(outputPlacement) + tokenBlock * hidden,
-                16 + byte, hidden, 1, 1);
-        }
-
-        const int64_t tailStart = normalize + hidden + 12;
-        for (int64_t tail = 0; tail < 2; ++tail) {
-            const int64_t column = hidden - 2 + tail;
-            const int64_t xCycle = tailStart + tail;
-            const int64_t gammaCycle = xCycle + 1;
-            for (int64_t byte = 0; byte < 2; ++byte) {
-                emitMem(rewriter, op.getLoc(),
-                    xCycle - westReadLatency(inputSlices[byte]),
-                    inputSlices[byte], "read",
-                    inputAddress + column, 32 + byte, 1, 1, 0);
-                emitMem(rewriter, op.getLoc(),
-                    gammaCycle - westReadLatency(weightSlices[byte]),
-                    weightSlices[byte], "read",
-                    baseRow(weightPlacement) + column,
-                    34 + byte, 1, 1, 0, "sram",
-                    inputBindingIndex(op.getWeight()));
-            }
-            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
-                inputType, xCycle, 6, "multiply",
-                streamKind, 32, 0.0f, "alu", 5, 0.0f,
-                "fp32", -1, 1, 1, "east", "east");
-            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
-                inputType, gammaCycle, 7, "multiply",
-                "alu", 6, 0.0f, streamKind, 34, 0.0f,
-                dataFormat, 0, 1, 1, "east", "east");
-            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
-                inputType, gammaCycle + 1, 8, "pass",
-                "alu", 7, 0.0f, "immediate", 0, 0.0f,
-                dataFormat, 16, 1, 1, "east", "west");
-            for (int64_t byte = 0; byte < 2; ++byte) {
-                emitMem(rewriter, op.getLoc(),
-                    gammaCycle + eastWriteLatency(outputSlices[byte]),
-                    outputSlices[byte], "write",
-                    baseRow(outputPlacement)
-                        + tokenBlock * hidden + column,
-                    byte, 1, 1, 0);
-                emitMem(rewriter, op.getLoc(),
-                    gammaCycle + 1
-                        + eastWriteLatency(outputSlices[byte]),
-                    target.memory().slices_per_hemisphere
-                        + outputSlices[byte],
-                    "write",
-                    baseRow(outputPlacement)
-                        + tokenBlock * hidden + column,
-                    16 + byte, 1, 1, 0);
-            }
-        }
-        cycle = tailStart + 4
-            + std::max(eastWriteLatency(outputSlices[0]),
-                eastWriteLatency(outputSlices[1]));
     }
     return cycle;
 }
@@ -1112,6 +1002,292 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
     return cycle;
 }
 
+int64_t emitRowParallelVxmFeedback(mlir::IRRewriter& rewriter,
+    stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
+    mlir::DictionaryAttr inputPlacement,
+    mlir::DictionaryAttr inputCopyPlacement,
+    mlir::DictionaryAttr weightPlacement,
+    mlir::DictionaryAttr outputPlacement, int64_t start)
+{
+    const auto inputSlices = slices(inputPlacement);
+    const auto inputCopySlices = slices(inputCopyPlacement);
+    const auto weightSlices = slices(weightPlacement);
+    const auto outputSlices = slices(outputPlacement);
+    const auto inputType =
+        llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
+    const llvm::StringRef streamKind =
+        lpu_16bit_stream_kind(inputType.getElementType());
+    const llvm::StringRef dataFormat =
+        lpu_16bit_data_format(inputType.getElementType());
+    const int64_t rows = inputType.getDimSize(0);
+    const int64_t hidden = inputType.getDimSize(1);
+    const int64_t rowWidth = target.throughput().mxm_rows;
+    const int64_t tokenBlocks = rows / rowWidth;
+    const int64_t batchCount = (tokenBlocks + 7) / 8;
+    const int64_t scalarBase = baseRow(outputPlacement)
+        + batchCount * hidden;
+    const auto readLatency = [&](int64_t slice) {
+        return *target.transport_latency(target::StreamEndpoint::Mem,
+            target::StreamEndpoint::VxmInput,
+            target::StreamDirection::West, slice);
+    };
+    const auto writeLatency = [&](int64_t slice) {
+        return *target.transport_latency(target::StreamEndpoint::VxmResult,
+            target::StreamEndpoint::Mem,
+            target::StreamDirection::East, slice);
+    };
+    const auto address = [&](mlir::DictionaryAttr placement,
+                             int64_t batch, int64_t column) {
+        return baseRow(placement) + batch * hidden + column;
+    };
+    // One shared control queue drives an east physical chain and its west
+    // mirror. Fixed VXM groups 0..7 consume East while groups 8..15 consume
+    // West, matching the executable-wide fabric mux used by FFN/attention.
+    const auto inputHemisphere = [](int64_t pair) {
+        return pair < 4 ? int64_t {0} : int64_t {1};
+    };
+    const auto outputHemisphere = [&](int64_t pair) {
+        return 1 - inputHemisphere(pair);
+    };
+    const auto emitReadPair = [&](llvm::ArrayRef<int64_t> memorySlices,
+                                  int64_t pair, int64_t memoryAddress,
+                                  int64_t stream, int64_t inputCycle,
+                                  int64_t count, int64_t stride,
+                                  int64_t memoryBank,
+                                  int64_t addressBinding = -1,
+                                  int64_t sourceHemisphere = -1) {
+        if (sourceHemisphere < 0)
+            sourceHemisphere = inputHemisphere(pair);
+        for (int64_t byte = 0; byte < 2; ++byte) {
+            const int64_t slice = memorySlices[2 * pair + byte];
+            emitMem(rewriter, op.getLoc(),
+                inputCycle - readLatency(slice),
+                sourceHemisphere
+                        * target.memory().slices_per_hemisphere
+                    + slice,
+                "read",
+                memoryAddress, 32 + stream + byte, count, 1, stride,
+                "sram", addressBinding, memoryBank);
+        }
+    };
+    const auto emitWritePair = [&](int64_t pair, int64_t memoryAddress,
+                                   int64_t stream, int64_t outputCycle,
+                                   int64_t count, int64_t stride,
+                                   int64_t destinationHemisphere = -1) {
+        if (destinationHemisphere < 0)
+            destinationHemisphere = outputHemisphere(pair);
+        for (int64_t byte = 0; byte < 2; ++byte) {
+            const int64_t slice = outputSlices[2 * pair + byte];
+            emitMem(rewriter, op.getLoc(),
+                outputCycle + writeLatency(slice),
+                destinationHemisphere
+                        * target.memory().slices_per_hemisphere
+                    + slice,
+                "write",
+                memoryAddress, stream + byte, count, 1, stride,
+                "sram", -1, bank(outputPlacement));
+        }
+    };
+
+    int64_t cycle = start;
+    for (int64_t batch = 0; batch < batchCount; ++batch) {
+        const int64_t squareConfig = cycle + 8;
+        const int64_t squareInput = squareConfig + 1;
+        for (int64_t head = 0; head < 8; head += 2) {
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                inputType, squareConfig, head, "multiply",
+                streamKind, 32 + head * 2, 0.0f,
+                streamKind, 34 + head * 2, 0.0f,
+                "fp32", -1, hidden, 1, "east", "east",
+                -1, false, false, true, false, 2);
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                inputType, squareConfig, head + 1, "add",
+                "previous", 0, 0.0f, "accumulator", 0, 0.0f,
+                "fp32", -1, 1, 1, "east", "east",
+                -1, true, true, false, false, 2);
+            if (hidden > 2)
+                create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                    inputType, squareConfig + 1, head + 1, "add",
+                    "previous", 0, 0.0f, "accumulator", 0, 0.0f,
+                    "fp32", -1, hidden - 2, 1, "east", "east",
+                    -1, false, true, false, false, 2);
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                inputType, squareConfig + 2, head + 1, "add",
+                "previous", 0, 0.0f, "accumulator", 0, 0.0f,
+                dataFormat, head, 1, 1, "east", "east",
+                -1, false, true, true, false, 2);
+        }
+        for (int64_t pair = 0; pair < 8; ++pair) {
+            emitReadPair(inputSlices, pair,
+                address(inputPlacement, batch, 0), pair * 4,
+                squareInput, hidden, 1, bank(inputPlacement));
+            emitReadPair(inputCopySlices, pair,
+                address(inputCopyPlacement, batch, 0), pair * 4 + 2,
+                squareInput, hidden, 1, bank(inputCopyPlacement));
+        }
+        const int64_t squareOutput = squareInput + hidden + 1;
+        for (int64_t pair = 0; pair < 8; ++pair)
+            emitWritePair(pair, scalarBase + batch * 2,
+                pair * 2, squareOutput, 1, 0);
+
+        int64_t maxScalarWrite = squareOutput;
+        for (int64_t pair = 0; pair < 8; ++pair)
+            maxScalarWrite = std::max(maxScalarWrite,
+                squareOutput + writeLatency(outputSlices[2 * pair + 1]));
+        const int64_t rsqrtConfig = maxScalarWrite + 8;
+        const int64_t rsqrtInput = rsqrtConfig + 1;
+        for (int64_t head : {int64_t{0}, int64_t{4}}) {
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                inputType, rsqrtConfig, head, "multiply",
+                streamKind, 32 + head * 2, 0.0f,
+                "immediate", 0, 1.0f / static_cast<float>(hidden),
+                "fp32", -1, 2, 1, "east", "east",
+                -1, false, false, true, false, 4);
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                inputType, rsqrtConfig, head + 1, "add",
+                "previous", 0, 0.0f, "immediate", 0,
+                static_cast<float>(op.getEpsilon().convertToDouble()),
+                "fp32", -1, 2, 1, "east", "east",
+                -1, false, false, true, false, 4);
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                inputType, rsqrtConfig, head + 2, "pass",
+                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                "fp32", -1, 2, 1, "east", "east",
+                -1, false, false, true, false, 4);
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                inputType, rsqrtConfig, head + 3, "rsqrt",
+                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                dataFormat, head + 2, 2, 1, "east", "east",
+                -1, false, false, true, false, 4);
+        }
+        constexpr std::array<int64_t, 4> rsqrtInputs {0, 8, 16, 24};
+        constexpr std::array<int64_t, 4> rsqrtOutputs {2, 6, 10, 14};
+        // Square results cross the VXM: pairs 4/5 are now on East and pairs
+        // 0/1 are on West. Feed those to C0/C4/C8/C12 respectively; wave 1
+        // repeats the same permutation for pairs 6/7/2/3.
+        constexpr std::array<int64_t, 8> rsqrtPairs {
+            4, 5, 0, 1, 6, 7, 2, 3,
+        };
+        for (int64_t wave = 0; wave < 2; ++wave) {
+            for (int64_t chain = 0; chain < 4; ++chain) {
+                const int64_t pair = rsqrtPairs[wave * 4 + chain];
+                emitReadPair(outputSlices, pair,
+                    scalarBase + batch * 2, rsqrtInputs[chain],
+                    rsqrtInput + wave, 1, 0, bank(outputPlacement), -1,
+                    outputHemisphere(pair));
+            }
+        }
+        const int64_t rsqrtOutput = rsqrtInput + 8;
+        for (int64_t wave = 0; wave < 2; ++wave) {
+            for (int64_t chain = 0; chain < 4; ++chain) {
+                const int64_t pair = rsqrtPairs[wave * 4 + chain];
+                emitWritePair(pair, scalarBase + batch * 2 + 1,
+                    rsqrtOutputs[chain], rsqrtOutput + wave, 1, 0,
+                    inputHemisphere(pair));
+            }
+        }
+
+        int64_t maxRsqrtWrite = rsqrtOutput + 1;
+        for (int64_t pair = 0; pair < 8; ++pair)
+            maxRsqrtWrite = std::max(maxRsqrtWrite,
+                rsqrtOutput + (pair / 4)
+                    + writeLatency(outputSlices[2 * pair + 1]));
+        const int64_t scalarConfig = maxRsqrtWrite + 8;
+        const int64_t scalarInput = scalarConfig + 1;
+        for (int64_t head = 0; head < 8; head += 2) {
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                inputType, scalarConfig, head, "pass",
+                streamKind, 32 + head * 2, 0.0f,
+                "immediate", 0, 0.0f, "fp32", -1,
+                1, 1, "east", "east",
+                -1, false, false, true, false, 2);
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
+                inputType, scalarConfig, head + 1, "pass",
+                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                "fp32", -1, 1, 1, "east", "east",
+                -1, false, false, true, true, 2);
+        }
+        for (int64_t pair = 0; pair < 8; ++pair)
+            emitReadPair(outputSlices, pair,
+                scalarBase + batch * 2 + 1, pair * 4,
+                scalarInput, 1, 0, bank(outputPlacement));
+
+        const int64_t normalizeConfig = scalarInput + 20;
+        const int64_t normalizeInput = normalizeConfig + 1;
+        for (int64_t head = 0; head < 8; head += 2) {
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
+                inputType, normalizeConfig, head, "multiply",
+                streamKind, 32 + head * 2, 0.0f,
+                streamKind, 34 + head * 2, 0.0f,
+                "fp32", -1, hidden, 1, "east", "east",
+                -1, false, false, true, false, 2);
+            create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
+                inputType, normalizeConfig, head + 1, "multiply",
+                "previous", 0, 0.0f, "accumulator", 0, 0.0f,
+                dataFormat, head, hidden, 1, "east", "east",
+                -1, false, false, true, false, 2);
+        }
+        for (int64_t pair = 0; pair < 8; ++pair) {
+            emitReadPair(inputSlices, pair,
+                address(inputPlacement, batch, 0), pair * 4,
+                normalizeInput, hidden, 1, bank(inputPlacement));
+            emitReadPair(weightSlices, pair,
+                baseRow(weightPlacement), pair * 4 + 2,
+                normalizeInput, hidden, 1, bank(weightPlacement),
+                inputBindingIndex(op.getWeight()));
+        }
+        const int64_t normalizeOutput = normalizeInput + 3;
+        for (int64_t pair = 0; pair < 8; ++pair)
+            emitWritePair(pair, address(outputPlacement, batch, 0),
+                pair * 2, normalizeOutput, hidden, 1);
+
+        // Each normalized physical chain writes to the hemisphere opposite
+        // its input. Restore-layout SXMs run in both hemispheres, so multicast
+        // the owner copy through the passive VXM bridge after normalization.
+        int64_t maxNormalizeWrite = normalizeOutput + hidden;
+        int64_t maxReadLatency = 0;
+        for (int64_t pair = 0; pair < 8; ++pair) {
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const int64_t slice = outputSlices[2 * pair + byte];
+                maxNormalizeWrite = std::max(maxNormalizeWrite,
+                    normalizeOutput + hidden - 1
+                        + writeLatency(slice));
+                maxReadLatency = std::max(
+                    maxReadLatency, readLatency(slice));
+            }
+        }
+        const int64_t bridgeInput = maxNormalizeWrite
+            + maxReadLatency + 2;
+        int64_t bridgeEnd = bridgeInput + hidden;
+        for (int64_t pair = 0; pair < 8; ++pair) {
+            const int64_t owner = outputHemisphere(pair);
+            const int64_t peer = 1 - owner;
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const int64_t slice = outputSlices[2 * pair + byte];
+                emitMem(rewriter, op.getLoc(),
+                    bridgeInput - readLatency(slice),
+                    owner * target.memory().slices_per_hemisphere
+                        + slice,
+                    "read", address(outputPlacement, batch, 0),
+                    32 + pair * 2 + byte, hidden, 1, 1,
+                    "sram", -1, bank(outputPlacement));
+                const int64_t writeCycle = bridgeInput
+                    + writeLatency(slice);
+                emitMem(rewriter, op.getLoc(), writeCycle,
+                    peer * target.memory().slices_per_hemisphere
+                        + slice,
+                    "write", address(outputPlacement, batch, 0),
+                    pair * 2 + byte, hidden, 1, 1,
+                    "sram", -1, bank(outputPlacement));
+                bridgeEnd = std::max(bridgeEnd,
+                    writeCycle + hidden);
+            }
+        }
+        cycle = bridgeEnd + 8;
+    }
+    return cycle;
+}
+
 mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
     stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
     int64_t outputIndex)
@@ -1126,6 +1302,8 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
         allocationPlacement(op.getWeightAllocations(), 0);
     const auto feedbackInputPlacement =
         allocationPlacement(op.getScratchAllocations(), 0);
+    const auto feedbackInputCopyPlacement =
+        allocationPlacement(op.getScratchAllocations(), 1);
     const auto feedbackOutputPlacement =
         allocationPlacement(op.getScratchAllocations(), 2);
     const auto resultPlacement =
@@ -1145,35 +1323,39 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
     const auto inputKind =
         inputPlacement.getAs<mlir::StringAttr>("kind");
     const bool vxmInput = inputKind
-        && inputKind.getValue() == "fp16_vxm_distributed_16";
+        && inputKind.getValue() == "fp16_vxm_row_parallel_8";
     const bool mxmInput = inputKind
-        && inputKind.getValue() == "fp16_mxm_distributed_16";
+        && (inputKind.getValue() == "fp16_mxm_distributed_16"
+            || inputKind.getValue()
+                == "fp16_mxm_block8_distributed_16");
     if (!vxmInput && !mxmInput)
         return op.emitError(
             "feedback RMSNorm requires MXM- or VXM-oriented distributed16 input");
     const int64_t inputTransposeEnd = vxmInput
         ? 0
-        : emitDistributedMatrixTranspose(
+        : emitPackedToPairTranspose(
               rewriter, op.getLoc(), target, inputPlacement,
-              feedbackInputPlacement, rows, hidden, 0);
+              feedbackInputPlacement, rows, hidden, 0, true,
+              feedbackInputCopyPlacement);
     const auto feedbackInput = vxmInput
         ? inputPlacement : feedbackInputPlacement;
     const auto weightKind =
         weightPlacement.getAs<mlir::StringAttr>("kind");
     const bool distributedWeight = weightKind
-        && weightKind.getValue() == "fp16_vxm_distributed_16";
+        && weightKind.getValue() == "fp16_vxm_row_parallel_8";
     if (!distributedWeight)
         return op.emitError(
             "feedback RMSNorm requires VXM-oriented distributed16 gamma");
     const int64_t weightTransposeEnd = inputTransposeEnd;
-    const int64_t feedbackEnd = emitVxmFeedback(
+    const int64_t feedbackEnd = emitRowParallelVxmFeedback(
         rewriter, op, target, feedbackInput,
+        feedbackInputCopyPlacement,
         weightPlacement, feedbackOutputPlacement,
         weightTransposeEnd);
     const auto resultKind =
         resultPlacement.getAs<mlir::StringAttr>("kind");
     const bool vxmResult = resultKind
-        && resultKind.getValue() == "fp16_vxm_distributed_16";
+        && resultKind.getValue() == "fp16_vxm_row_parallel_8";
     const bool mxmResult = resultKind
         && resultKind.getValue() == "fp16_mxm_distributed_16";
     if (!vxmResult && !mxmResult)
@@ -1181,10 +1363,10 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
             "feedback RMSNorm requires MXM- or VXM-oriented distributed16 result");
     const int64_t restoreEnd = vxmResult
         ? feedbackEnd
-        : emitDistributedMatrixTranspose(
+        : emitPairToPackedTranspose(
               rewriter, op.getLoc(), target,
               feedbackOutputPlacement, resultPlacement,
-              rows, hidden, feedbackEnd);
+              rows, hidden, feedbackEnd, false);
 
     if (!vxmInput)
         createTimeline(rewriter, op.getLoc(), "rmsnorm.transpose_input",

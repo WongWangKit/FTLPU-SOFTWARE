@@ -278,9 +278,9 @@ Attention 不再生成 compound `ftlpu.schedule.attention`。它的硬件程序�
 
 ### FTLPU Command IR
 
-Command IR 是稳定的编译器/runtime 边界。`ftlpu-schedule-to-command` pass 移除 Schedule SSA graph，生成 `ftlpu.command.binding`、`ftlpu.command.mem`、`ftlpu.command.mxm`、`ftlpu.command.vxm` 和 `ftlpu.command.sxm`。Binding 描述输入/输出 index、shape、元素类型、字节数和物理 placement。Result 由 binding 及其物理 MEM write command 表示，不再作为 SSA tensor 返回。
+Command IR 是稳定的编译器/runtime 边界。`ftlpu-schedule-to-command` pass 移除 Schedule SSA graph，生成 `ftlpu.command.binding`、`ftlpu.command.mem`、`ftlpu.command.mxm`、`ftlpu.command.vxm`、`ftlpu.command.sxm` 和 `ftlpu.command.loop`。Binding 描述输入/输出 index、shape、元素类型、字节数和物理 placement。Result 由 binding 及其物理 MEM write command 表示，不再作为 SSA tensor 返回。
 
-每条 command 一一对应某个 ICU queue 的首条指令加 Repeat：包括绝对首 cycle、queue index、opcode、stream selector、repeat count/interval 和 MEM address stride。320x320 GEMM 生成 16 条 weight MEM command、1 条 activation MEM command、4 条 result MEM command、1 条 IW command 和 1 条 Compute command。VXM command 携带 ALU opcode、带类型的 stream/ALU/immediate operand、cast target、output stream 和 repeat 元数据。Command op 被显式标记为有 side effect，因此 MLIR canonicalization 不会删除硬件工作。
+普通 command 对应 ICU queue 的一条功能指令和可选的单指令 Repeat。`ftlpu.command.loop` 是多指令循环形式：最多回看前面连续 63 条功能指令，额外执行最多 255 轮，并携带轮次起点 interval 和可选的 MEM address stride。Runtime 不在 host 侧展开，而是原样装载 32-bit Loop 控制字，由 queue-local ICU 前端重放窗口。320x320 GEMM 生成 16 条 weight MEM command、1 条 activation MEM command、4 条 result MEM command、1 条 IW command 和 1 条 Compute command。VXM command 携带 ALU opcode、带类型的 stream/ALU/immediate operand、cast target、output stream 和 repeat 元数据。Command op 被显式标记为有 side effect，因此 MLIR canonicalization 不会删除硬件工作。
 
 Binary emission 按 queue 对扁平 command stream 分组，并根据绝对 cycle 推导 queue-local NOP，无需重建调度决策。`ftlpu-translate` 将该层序列化为 `.ftlpu` 二进制版本 2。Runtime 在时钟启动前把绑定输入放入 SRAM 并加载全部 ICU queue，随后推进 `TspSliceSystem::tick()` 并还原绑定输出。320x320 回归将全部 102,400 个 int32 result 与 CPU GEMM 比较。
 

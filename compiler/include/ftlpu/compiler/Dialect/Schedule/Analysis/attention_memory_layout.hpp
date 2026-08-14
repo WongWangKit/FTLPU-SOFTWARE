@@ -21,18 +21,24 @@ public:
     AttentionMemoryLayout(const AttentionTaskGraph& graph,
         const target::LPUTargetModel& target);
 
-    int64_t weightAddress(AttentionProjectionKind projection, int64_t head,
+    int64_t weightAddress(AttentionProjectionKind projection,
+        int64_t outputBlock,
         int64_t reductionBlock, int64_t localMxm, int64_t column) const;
     int64_t activationAddress(int64_t reductionBlock, int64_t tokenBlock) const;
     int64_t projectionAddress(AttentionProjectionKind projection, int64_t head,
         int64_t tokenBlock) const;
-    int64_t queryIwAddress(int64_t head, int64_t tokenBlock, int64_t phase) const;
-    int64_t keyAddress(int64_t kvHead, int64_t keyBlock) const;
-    int64_t scoreAddress(int64_t queryHead, int64_t queryBlock,
+    int64_t queryIwAddress(int64_t head, int64_t reductionBlock,
+        int64_t tokenBlock, int64_t phase) const;
+    llvm::ArrayRef<int64_t> queryIwSlices(int64_t reductionBlock) const;
+    int64_t keyAddress(int64_t kvHead, int64_t reductionBlock,
         int64_t keyBlock) const;
-    int64_t scoreTokenAddress(int64_t queryHead, int64_t queryBlock,
+    llvm::ArrayRef<int64_t> keySlices(int64_t reductionBlock) const;
+    int64_t scoreAccumulatorAddress(int64_t queryHead, int64_t queryBlock,
+        int64_t keyBlock) const;
+    int64_t scoreAccumulatorTokenAddress(int64_t queryHead, int64_t queryBlock,
         int64_t key) const;
-    int64_t scaledScoreAddress(int64_t key) const { return scaledScoreBase_ + key; }
+    int64_t scoreAddress(int64_t queryHead, int64_t queryBlock,
+        int64_t key) const;
     int64_t expScoreAddress(int64_t key) const { return expScoreBase_ + key; }
     int64_t causalMaskAddress(int64_t localKey) const {
         return causalMaskBase_ + localKey - 1;
@@ -48,6 +54,7 @@ public:
         int64_t reductionBlock, int64_t column) const;
     int64_t resultAddress(int64_t outputGroup, int64_t token) const;
     int64_t ropeAddress(int64_t token) const;
+    int64_t ropeAddress(int64_t token, int64_t frequencyBlock) const;
     int64_t ropeStagingAddress(AttentionProjectionKind projection,
         int64_t head, int64_t half, int64_t tokenBlock,
         int64_t row) const;
@@ -55,7 +62,6 @@ public:
     llvm::ArrayRef<int64_t> weightSlices() const { return weightSlices_; }
     llvm::ArrayRef<int64_t> outputWeightSlices() const { return outputWeightSlices_; }
     llvm::ArrayRef<int64_t> activationSlices() const { return activationSlices_; }
-    llvm::ArrayRef<int64_t> keySlices() const { return keySlices_; }
     llvm::ArrayRef<int64_t> ropeSlices() const { return ropeSlices_; }
     llvm::ArrayRef<int64_t> ropeStagingSlices() const {
         return ropeStagingSlices_;
@@ -93,6 +99,7 @@ private:
     int64_t seqLen_ = 0;
     int64_t hidden_ = 0;
     int64_t kvHeads_ = 0;
+    int64_t headBlocks_ = 0;
     std::array<int64_t, 3> weightBases_ {};
     int64_t outputWeightBase_ = 0;
     std::array<int64_t, 8> weightSlices_ {0, 4, 8, 12, 16, 20, 24, 28};

@@ -58,6 +58,13 @@ LogicalResult BindingOp::verify()
         || !getPlacement().getAs<IntegerAttr>("instruction_count")
         || !getPlacement().getAs<IntegerAttr>("address_stride"))
         return emitOpError("placement is missing physical layout fields");
+    if (auto bank = getPlacement().getAs<IntegerAttr>("bank")) {
+        auto targetModel = target::LPUTargetModel::from_operation(*this);
+        if (failed(targetModel)) return failure();
+        if (bank.getInt() < 0
+            || bank.getInt() >= targetModel->memory().banks_per_slice)
+            return emitOpError("placement bank is outside the target");
+    }
     return success();
 }
 
@@ -75,15 +82,15 @@ LogicalResult MemOp::verify()
     auto targetModel = target::LPUTargetModel::from_operation(*this);
     if (failed(targetModel)) return failure();
     const auto& target = *targetModel;
-    const int64_t memoryRows =
-        target.memory().banks_per_slice
-        * target.memory().words_per_bank;
+    const int64_t memoryRows = target.memory().sram_depth_rows;
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
     const int64_t waveAddressStride =
         getWaveAddressStride().value_or(0);
     if (getCycle() < 0 || getQueue() < 0
-        || getQueue() >= target.memory().hemispheres * target.memory().slices_per_hemisphere
+        || getQueue() >= target.memory().hemispheres
+                * target.memory().slices_per_hemisphere
+                * target.memory().banks_per_slice
         || getAddress() < 0 || getAddress() >= memoryRows
         || getPackedStream() < 0 || getPackedStream() >= target.streams().encoded_streams
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0
@@ -120,6 +127,30 @@ LogicalResult MxmOp::verify()
     if (getOpcode() != "iw" && getOpcode() != "compute"
         && getOpcode() != "accumulator_read")
         return emitOpError("opcode must be iw, compute, or accumulator_read");
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
+    const int64_t waveColumnStride =
+        getWaveWeightColumnStride().value_or(0);
+    const int64_t waveAccumulatorStride =
+        getWaveAccumulatorAddressStride().value_or(0);
+    const int64_t groupCount = getGroupCount().value_or(1);
+    const int64_t groupInterval = getGroupInterval().value_or(1);
+    const int64_t finalWeightColumn = getWeightColumn()
+        + (waveCount - 1) * waveColumnStride;
+    if (waveCount <= 0 || waveInterval <= 0
+        || groupCount <= 0 || groupInterval <= 0
+        || finalWeightColumn < 0
+        || finalWeightColumn >= target.throughput().tile_rows)
+        return emitOpError("contains an invalid ICU MXM command wave");
+    if (waveColumnStride != 0 && waveAccumulatorStride != 0)
+        return emitOpError(
+            "an ICU MXM command wave may induct only one hardware field");
+    if (getOpcode() == "iw" && waveAccumulatorStride != 0)
+        return emitOpError(
+            "an iw wave cannot induct the MXM accumulator address");
+    if (getOpcode() != "iw" && waveColumnStride != 0)
+        return emitOpError(
+            "only an iw wave may induct the MXM weight column");
     const llvm::StringRef dataFormat =
         getDataFormat().value_or("fp16");
     if (dataFormat != "fp16" && dataFormat != "bf16")
@@ -150,9 +181,27 @@ LogicalResult MxmOp::verify()
         || getOutputStreamBase() + target.throughput().mxm_result_streams - 1
             >= target.streams().encoded_streams)
         return emitOpError("contains an invalid MXM stream selector");
-    if (getAccumulatorAddress() < 0 || getAccumulatorAddress() >= 8192
+    const llvm::StringRef computeMode =
+        getComputeMode().value_or("vector");
+    if (computeMode != "vector" && computeMode != "block8")
+        return emitOpError("compute_mode must be vector or block8");
+    const int64_t accumulatorRows = computeMode == "block8"
+        ? target.throughput().mxm_accumulator_blocks
+            * target.throughput().mxm_rows
+            / target.throughput().mxm_block_rows
+        : target.throughput().mxm_accumulator_blocks
+            * target.throughput().mxm_rows;
+    const int64_t finalAccumulatorAddress = getAccumulatorAddress()
+        + (waveCount - 1) * waveAccumulatorStride;
+    if (getAccumulatorAddress() < 0
+        || getAccumulatorAddress() >= accumulatorRows
+        || finalAccumulatorAddress < 0
+        || finalAccumulatorAddress >= accumulatorRows
         || getAccumulatorRowStride() <= 0)
-        return emitOpError("contains an invalid MXM accumulator address or stride");
+        return emitOpError(
+            "contains an invalid MXM accumulator address or stride: address=")
+            << getAccumulatorAddress()
+            << ", stride=" << getAccumulatorRowStride();
     if (getAccumulatorDestination() != "sram"
         && getAccumulatorDestination() != "stream")
         return emitOpError("accumulator_destination must be sram or stream");
@@ -162,11 +211,42 @@ LogicalResult MxmOp::verify()
         && inputMode != "int8_dequant_bf16")
         return emitOpError(
             "weight_input_mode must be direct16 or int8_dequant_bf16");
-    const llvm::StringRef computeMode =
-        getComputeMode().value_or("vector");
-    if (computeMode != "vector" && computeMode != "block8")
+    return success();
+}
+
+LogicalResult LoopOp::verify()
+{
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
+    const int64_t cycle = getCycleAttr().getInt();
+    const int64_t queue = getQueueAttr().getInt();
+    const int64_t windowSize = getWindowSizeAttr().getInt();
+    const int64_t count = getCountAttr().getInt();
+    const int64_t interval = getIntervalAttr().getInt();
+    const int64_t addressStride = getAddressStrideAttr().getInt();
+    if (cycle < 0 || queue < 0
+        || windowSize <= 0 || windowSize > 63
+        || count <= 0 || count > 255
+        || interval < windowSize || interval > 255
+        || addressStride < -128 || addressStride > 127)
+        return emitOpError("contains an invalid ICU Loop field");
+    const auto kind = getQueueKind();
+    const bool validQueue =
+        (kind == "mem"
+            && queue < target.memory().hemispheres
+                    * target.memory().slices_per_hemisphere)
+        || ((kind == "mxm_load" || kind == "mxm_compute"
+                || kind == "mxm_dequant")
+            && target.is_valid_mxm_unit(queue))
+        || (kind == "vxm" && target.is_valid_vxm_alu(queue))
+        || ((kind == "sxm_transpose" || kind == "sxm_permute")
+            && queue < target.memory().hemispheres);
+    if (!validQueue)
+        return emitOpError("contains an invalid ICU Loop queue");
+    if (kind != "mem" && addressStride != 0)
         return emitOpError(
-            "compute_mode must be vector or block8");
+            "only a MEM ICU Loop may use address_stride");
     return success();
 }
 
@@ -177,6 +257,8 @@ LogicalResult MxmDequantOp::verify()
     if (getCycle() < 0
         || !targetModel->is_valid_mxm_unit(getQueue())
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0
+        || getWaveCount().value_or(1) <= 0
+        || getWaveInterval().value_or(1) <= 0
         || !std::isfinite(getScaleAttr().getValueAsDouble()))
         return emitOpError(
             "contains an invalid MXM dequant queue command field");
@@ -195,26 +277,45 @@ LogicalResult VxmOp::verify()
     const int64_t output_stream = getOutputStreamAttr().getInt();
     const int64_t repeat_count = getRepeatCountAttr().getInt();
     const int64_t repeat_interval = getRepeatIntervalAttr().getInt();
-    if (cycle < 0 || !target.is_valid_vxm_alu(queue)
+    const int64_t chainDepth = getChainDepth().value_or(8);
+    if (cycle < 0 || !target.is_valid_vxm_alu(queue) || queue >= 8
+        || (chainDepth != 2 && chainDepth != 4 && chainDepth != 8)
         || repeat_count <= 0 || repeat_interval <= 0)
-        return emitOpError("contains an invalid ICU VXM queue command field");
+        return emitOpError("contains an invalid ICU VXM queue command field: cycle=")
+            << cycle << ", queue=" << queue
+            << ", chain_depth=" << chainDepth
+            << ", repeat_count=" << repeat_count
+            << ", repeat_interval=" << repeat_interval;
+    if (getAccumulatorReset().value_or(false)
+        && !getAccumulatorWrite().value_or(false))
+        return emitOpError(
+            "accumulator_reset requires accumulator_write");
+    if (!getAccumulatorWrite().value_or(false)
+        && !getAccumulatorEmit().value_or(true))
+        return emitOpError(
+            "accumulator_emit=false requires accumulator_write");
+    if (getLocalScalarWrite().value_or(false)
+        && getAccumulatorWrite().value_or(false))
+        return emitOpError(
+            "local_scalar_write cannot be combined with accumulator_write");
 
     const auto opcode = getOpcode();
-    if (opcode != "pass" && opcode != "add" && opcode != "subtract"
-        && opcode != "multiply" && opcode != "divide" && opcode != "negate"
-        && opcode != "abs" && opcode != "min" && opcode != "max"
-        && opcode != "clamp" && opcode != "square" && opcode != "sqrt"
-        && opcode != "exp" && opcode != "log" && opcode != "relu"
-        && opcode != "cast")
+    if (opcode != "pass" && opcode != "bypass" && opcode != "cast"
+        && opcode != "add" && opcode != "subtract"
+        && opcode != "multiply" && opcode != "negate"
+        && opcode != "max" && opcode != "exp"
+        && opcode != "reciprocal" && opcode != "rsqrt")
         return emitOpError("contains an unsupported VXM opcode");
 
     const auto verify_operand = [&](StringRef kind, int64_t index) {
         if (kind == "immediate") return index == 0;
-        if (kind == "alu") return target.is_valid_vxm_alu(index);
-        if (kind == "stream_i32" || kind == "stream_f32")
-            return index >= 0 && index + 3 < target.streams().encoded_streams;
-        if (kind == "stream_i8") return index >= 0 && index < target.streams().encoded_streams;
-        if (kind == "stream_f16" || kind == "stream_bf16")
+        if (kind == "previous" || kind == "original"
+            || kind == "auxiliary" || kind == "accumulator"
+            || kind == "feedback")
+            return index == 0;
+        if (kind == "alu") return index == queue - 1;
+        if (kind == "stream_i8" || kind == "stream_f16"
+            || kind == "stream_bf16" || kind == "stream_f32")
             return index >= 0
                 && index + 1 < target.streams().encoded_streams;
         return false;
@@ -250,14 +351,28 @@ LogicalResult SxmOp::verify()
         return emitOpError("repeat count and interval must be positive");
     if (getOpcode() != "transpose" && getOpcode() != "permute")
         return emitOpError("opcode must be transpose or permute");
+    if (getOutputRow()
+        && (*getOutputRow() < 0
+            || *getOutputRow() >= target.throughput().lanes_per_tile))
+        return emitOpError("output_row must be in the physical lane range");
+      if (getInputRow()
+          && (*getInputRow() < 0
+              || *getInputRow() >= target.throughput().lanes_per_tile))
+          return emitOpError("input_row must be in the physical lane range");
+      if (getOutputTile()
+          && (*getOutputTile() < 0
+              || *getOutputTile() >= target.throughput().tile_rows))
+          return emitOpError("output_tile must be in the physical tile range");
     const int64_t physicalWidth =
         2 * target.throughput().lanes_per_tile;
-    if (getSourceStreams().size() != physicalWidth
+    const int64_t sourceWidth = getInputRow() ? 2 : physicalWidth;
+    if (getSourceStreams().size() != sourceWidth
         || getDestinationStreams().size() != physicalWidth
         || getPermuteMap().size() != 32)
         return emitOpError()
-            << "requires " << physicalWidth
-            << " source and destination byte streams and a 32-lane map";
+            << "requires " << sourceWidth << " source and "
+            << physicalWidth
+            << " destination byte streams and a 32-lane map";
     const auto valid_stream = [&](Attribute attribute) {
         const auto value = llvm::dyn_cast<IntegerAttr>(attribute);
         return value && value.getInt() >= 0

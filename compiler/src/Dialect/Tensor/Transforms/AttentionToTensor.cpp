@@ -11,7 +11,8 @@
 namespace ftlpu::compiler::tensor_lowering {
 
 mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
-    const target::LPUTargetModel& target, mlir::IRRewriter& rewriter)
+    const target::LPUTargetModel& target, int64_t weight_bank,
+    mlir::IRRewriter& rewriter)
 {
     kernel::MatmulOp op = graph.output;
     const int64_t seq_len = graph.query.getM();
@@ -47,14 +48,20 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     const bool block8_attention = projection_strategy->uses_block8();
     const auto attention_weight_rows = [&](int64_t columns) {
-        const int64_t head_groups = (columns + 2 * head_dim - 1)
-            / (2 * head_dim);
-        return head_groups * (hidden / tile)
+        // W8A16AttentionWeightStriped stores 128 output columns per
+        // physical wave: two 32-column groups in each hemisphere.
+        const int64_t columns_per_wave = 4 * tile;
+        const int64_t waves = (columns + columns_per_wave - 1)
+            / columns_per_wave;
+        return waves * (hidden / tile)
             * target.throughput().lanes_per_tile;
     };
-    const auto weight_slices = target.attention_weight_slices();
-    const auto output_weight_slices =
-        target.attention_output_weight_slices();
+    const bool paged_weights = weight_bank >= 0;
+    const auto weight_slices = paged_weights
+        ? target.page_resident_attention_weight_slices(block8_attention)
+        : target.attention_weight_slices();
+    const auto output_weight_slices = paged_weights
+        ? weight_slices : target.attention_output_weight_slices();
     const auto planar_activation_slices =
         target.attention_activation_slices();
     const auto activation_slices = block8_attention
@@ -76,11 +83,18 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t v_weight_rows = attention_weight_rows(kv_width);
     const int64_t o_weight_rows = hidden * query_width
         / (target.memory().hemispheres * target.memory().w8a16_weight_slice_count * tile);
-    const int64_t query_rows = query_heads * blocks * target.throughput().tile_rows;
+    const int64_t head_blocks = head_dim / tile;
+    const int64_t logical_head_banks = (head_blocks + 1) / 2;
+    const int64_t query_rows = query_heads * logical_head_banks * blocks
+        * target.throughput().tile_rows;
+    const int64_t rope_frequency_blocks = head_dim / (2 * tile);
+    const int64_t rope_rows = seq_len * rope_frequency_blocks;
     const int64_t rope_staging_rows =
-        2 * target.memory().slices_per_hemisphere * 2 * blocks
+        2 * target.memory().slices_per_hemisphere * head_blocks * blocks
         * (tile / block_rows);
     const int64_t score_rows = query_heads * blocks * seq_len;
+    const int64_t probability_pack_rows = query_heads * blocks
+        * (seq_len / target.throughput().lanes_per_tile);
     const int64_t context_rows = query_heads * seq_len;
     const int64_t output_activation_rows =
         query_width / tile * blocks * (tile / block_rows);
@@ -92,9 +106,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         distributed_input_rows + output_activation_rows);
     const int64_t input_staging_rows = seq_len * hidden / tile;
     const int64_t input_staging_base =
-        target.memory().banks_per_slice
-            * target.memory().words_per_bank
-        - input_staging_rows;
+        target.memory().words_per_bank - input_staging_rows;
     llvm::SmallVector<int64_t, 36> scratch_candidates;
     for (int64_t slice = 0;
          slice < target.memory().accumulator_slice_base; ++slice)
@@ -109,9 +121,18 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         op.emitError("failed to reserve the attention input staging buffer");
         return mlir::failure();
     }
-    const int64_t output_weight_base =
-        q_weight_rows + k_weight_rows + v_weight_rows;
-    if (mlir::failed(physical_allocator.reserve({"output_weight",
+    // Keep the long-lived O-projection weights out of the fixed probability
+    // staging window. Larger models can make O weights cross that window even
+    // though the compact SmolLM2 shape does not.
+    const int64_t output_weight_base = paged_weights
+        ? q_weight_rows + k_weight_rows + v_weight_rows
+        : std::max({q_weight_rows + k_weight_rows + v_weight_rows,
+              target.attention_score_base_row() + score_rows,
+              target.attention_probability_pack_base_row()
+                  + probability_pack_rows,
+              target.attention_mask_base_row() + tile});
+    if (!paged_weights
+        && mlir::failed(physical_allocator.reserve({"output_weight",
             llvm::SmallVector<int64_t, 16>(
                 output_weight_slices.begin(), output_weight_slices.end()),
             output_weight_base, o_weight_rows,
@@ -133,9 +154,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             llvm::SmallVector<int64_t, 16>(
             probability_pack_slices.begin(), probability_pack_slices.end()),
             target.attention_probability_pack_base_row(),
-            query_heads * blocks
-                * (seq_len
-                    / target.throughput().lanes_per_tile),
+            probability_pack_rows,
             3, 5}))) {
         op.emitError("failed to reserve the attention probability-pack layout");
         return mlir::failure();
@@ -230,20 +249,23 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 "fp16_pair_planar", input_staging_slices,
                 input_staging_base, input_staging_rows, "both")),
         rewriter.getNamedAttr("query_weight", make_attention_placement(rewriter,
-            "w8a16_attention_weight_striped", weight_slices, 0, q_weight_rows, "both")),
+            "w8a16_attention_weight_striped", weight_slices, 0, q_weight_rows, "both",
+            std::max<int64_t>(0, weight_bank))),
         rewriter.getNamedAttr("key_weight", make_attention_placement(rewriter,
-            "w8a16_attention_weight_striped", weight_slices, q_weight_rows, k_weight_rows, "both")),
+            "w8a16_attention_weight_striped", weight_slices, q_weight_rows, k_weight_rows, "both",
+            std::max<int64_t>(0, weight_bank))),
         rewriter.getNamedAttr("value_weight", make_attention_placement(rewriter,
-            "w8a16_attention_weight_striped", weight_slices, q_weight_rows + k_weight_rows, v_weight_rows, "both")),
+            "w8a16_attention_weight_striped", weight_slices, q_weight_rows + k_weight_rows, v_weight_rows, "both",
+            std::max<int64_t>(0, weight_bank))),
         rewriter.getNamedAttr("output_weight", make_attention_placement(rewriter,
             "w8a16_mxm_weight_striped", output_weight_slices, output_weight_base,
-            o_weight_rows, "both")),
+            o_weight_rows, "both", std::max<int64_t>(0, weight_bank))),
         rewriter.getNamedAttr("query", make_attention_placement(rewriter,
             "fp16_query_iw", output_slices,
             target.attention_query_iw_base_row(), query_rows, "both")),
         rewriter.getNamedAttr("key", make_attention_placement(rewriter,
             "fp16_head_planar", key_slices, 0,
-            kv_heads * seq_len, "both")),
+            kv_heads * logical_head_banks * seq_len, "both")),
         rewriter.getNamedAttr("value", make_attention_placement(rewriter,
             "fp16_value_x16", target.attention_value_slices(),
             target.attention_value_base_row(),
@@ -292,7 +314,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr("rope", make_attention_placement(rewriter,
             "fp16_rope_table", target.attention_rope_slices(),
             target.attention_probability_diagonal_base_row(),
-            seq_len, "both")),
+            rope_rows, "both")),
         rewriter.getNamedAttr("rope_staging",
             make_attention_placement(rewriter,
                 "fp16_rope_fifo_x16", rope_staging_slices,

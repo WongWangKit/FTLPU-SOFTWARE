@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 16;
+inline constexpr std::uint32_t kBinaryFormatVersion = 19;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -46,6 +46,8 @@ enum class BindingLayout : std::uint16_t {
     Fp16RopeTable = 14,
     W8A16Block8WeightWaveStriped = 15,
     Fp16MxmBlock8Distributed16 = 16,
+    Fp16VxmRowParallel8 = 17,
+    W8A16MxmWeightReplicated = 18,
 };
 
 enum class BindingInitializer : std::uint16_t {
@@ -73,6 +75,9 @@ struct BinaryBinding {
     std::uint64_t ready_cycle{0};
     // Bit 0 selects east and bit 1 selects west. Inputs may be replicated to both.
     std::uint16_t hemisphere_mask{1};
+    // Physical SRAM bank shared by every (hemisphere, slice) placement in
+    // this binding. Bank-local addresses remain in base_row.
+    std::uint16_t bank{0};
     BindingInitializer initializer{BindingInitializer::None};
     float rope_theta{0.0f};
     std::uint32_t rope_head_dim{0};
@@ -112,6 +117,7 @@ struct BinaryMemoryFloor {
     std::uint16_t hemisphere{0};
     std::uint16_t slice{0};
     std::uint32_t first_free_row{0};
+    std::uint16_t bank{0};
 };
 
 struct BinaryProgram {

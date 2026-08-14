@@ -13,7 +13,7 @@ namespace ftlpu::compiler::schedule {
 
 mlir::LogicalResult lowerMatmulSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target,
-    ResourceScheduler& scheduler)
+    ResourceScheduler& scheduler, StreamFabricScheduler& streamScheduler)
 {
     llvm::SmallVector<stream::MatmulOp> matmuls;
     function.walk([&](stream::MatmulOp op) { matmuls.push_back(op); });
@@ -70,27 +70,75 @@ mlir::LogicalResult lowerMatmulSchedules(mlir::IRRewriter& rewriter,
             const int64_t write_offset = result_offset + result_latency;
 
             llvm::SmallVector<schedule::ResourceWindow> weight_windows;
+            llvm::SmallVector<TimedStreamRoute> weight_routes;
+            const auto weightToken = streamScheduler.allocate_token_range(
+                *weight_read_duration);
             for (int64_t slice : weight_slices) {
                 const int64_t latency = *target.transport_latency(target::StreamEndpoint::Mem,
                     target::StreamEndpoint::MxmWeight, target::StreamDirection::East, slice);
                 weight_windows.push_back(
                     {mem_read_resource(slice), weight_latency - latency, *weight_read_duration});
             }
+            for (int64_t index = 0;
+                 index < static_cast<int64_t>(weight_slices.size()); ++index) {
+                const int64_t slice = weight_slices[index];
+                const int64_t latency = *target.transport_latency(
+                    target::StreamEndpoint::Mem,
+                    target::StreamEndpoint::MxmWeight,
+                    target::StreamDirection::East, slice);
+                StreamRouteWindow route;
+                route.direction = target::StreamDirection::East;
+                route.source_column = *target.stream_source_column(
+                    target::StreamEndpoint::Mem,
+                    target::StreamDirection::East, slice);
+                route.destination_column = *target.stream_destination_column(
+                    target::StreamEndpoint::MxmWeight,
+                    target::StreamDirection::East, slice);
+                route.stream_base = weight_route.getStreamBase() + index;
+                route.stream_count = 1;
+                route.beat_count = *weight_read_duration;
+                route.beat_interval = 1;
+                route.token_id = weightToken;
+                route.consumer_mode = StreamConsumerMode::Consume;
+                weight_routes.emplace_back(
+                    weight_latency - latency, std::move(route));
+            }
             weight_windows.push_back({llvm::formatv("MXM.{0}.load", matmul.getUnitId()).str(),
                 load_offset, *weight_read_duration});
             weight_windows.push_back({llvm::formatv("MXM.{0}.weight_buffer.{1}",
                 matmul.getUnitId(), matmul.getWeightBuffer()).str(),
                 load_offset, *weight_read_duration});
-            add_stream_windows(weight_windows, "east", weight_route.getStreamBase(),
-                weight_route.getStreamCount(), 0, load_offset + *weight_read_duration);
             const int64_t earliest_weight_start = std::max(
                 value_ready_cycle(weight_route.getInput()),
                 target.mxm_earliest_iw_cycle() - load_offset);
-            const int64_t weight_read_cycle = scheduler.reserve(
-                earliest_weight_start, weight_windows);
+            const int64_t weight_read_cycle = reserve_resources_and_streams(
+                scheduler, streamScheduler, earliest_weight_start,
+                weight_windows, weight_routes);
             const int64_t load_cycle = weight_read_cycle + load_offset;
 
             llvm::SmallVector<schedule::ResourceWindow> compute_windows;
+            llvm::SmallVector<TimedStreamRoute> compute_routes;
+            const auto activationToken = streamScheduler.allocate_token_range(
+                *activation_read_duration);
+            for (int64_t index = 0;
+                 index < static_cast<int64_t>(activation_slices.size()); ++index) {
+                const int64_t slice = activation_slices[index];
+                StreamRouteWindow route;
+                route.direction = target::StreamDirection::East;
+                route.source_column = *target.stream_source_column(
+                    target::StreamEndpoint::Mem,
+                    target::StreamDirection::East, slice);
+                route.destination_column = *target.stream_destination_column(
+                    target::StreamEndpoint::MxmActivation,
+                    target::StreamDirection::East, slice);
+                route.stream_base = activation_route.getStreamBase() + index;
+                route.stream_count = 1;
+                route.beat_count = *activation_read_duration;
+                route.beat_interval = 1;
+                route.token_id = activationToken;
+                route.consumer_mode = StreamConsumerMode::Consume;
+                compute_routes.emplace_back(0, std::move(route));
+            }
             for (int64_t slice : activation_slices)
                 compute_windows.push_back({mem_read_resource(slice), 0, *activation_read_duration});
             compute_windows.push_back({llvm::formatv("MXM.{0}.compute", matmul.getUnitId()).str(),
@@ -104,13 +152,32 @@ mlir::LogicalResult lowerMatmulSchedules(mlir::IRRewriter& rewriter,
                 compute_windows.push_back(
                     {mem_write_resource(slice), result_offset + latency, *write_duration});
             }
-            add_stream_windows(compute_windows, "east", activation_route.getStreamBase(),
-                activation_route.getStreamCount(), 0, activation_latency + compute_duration);
-            add_stream_windows(compute_windows, "west", result_route.getStreamBase(),
-                result_route.getStreamCount(), result_offset,
-                std::max(result_duration, result_latency + *write_duration));
-            const int64_t activation_read_cycle = scheduler.reserve(
-                value_ready_cycle(activation_route.getInput()), compute_windows);
+            const auto resultToken = streamScheduler.allocate_token_range(
+                *write_duration);
+            for (int64_t index = 0;
+                 index < static_cast<int64_t>(result_slices.size()); ++index) {
+                const int64_t slice = result_slices[index];
+                StreamRouteWindow route;
+                route.direction = target::StreamDirection::West;
+                route.source_column = *target.stream_source_column(
+                    target::StreamEndpoint::MxmResult,
+                    target::StreamDirection::West, slice);
+                route.destination_column = *target.stream_destination_column(
+                    target::StreamEndpoint::Mem,
+                    target::StreamDirection::West, slice);
+                route.stream_base = result_route.getStreamBase() + index;
+                route.stream_count = 1;
+                route.beat_count = *write_duration;
+                route.beat_interval = 1;
+                route.token_id = resultToken;
+                route.consumer_mode = StreamConsumerMode::Consume;
+                compute_routes.emplace_back(
+                    result_offset, std::move(route));
+            }
+            const int64_t activation_read_cycle = reserve_resources_and_streams(
+                scheduler, streamScheduler,
+                value_ready_cycle(activation_route.getInput()),
+                compute_windows, compute_routes);
             const int64_t compute_cycle = activation_read_cycle + activation_latency;
             const int64_t result_cycle = activation_read_cycle + result_offset;
             const int64_t write_cycle = activation_read_cycle + write_offset;
