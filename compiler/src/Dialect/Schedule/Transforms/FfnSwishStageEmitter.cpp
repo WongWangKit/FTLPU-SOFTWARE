@@ -21,6 +21,10 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
         context.projection_timeline.pair_count;
     const int64_t weightLoadCycles =
         context.projection_timeline.weight_load_cycles;
+    const auto gateTempSlices = target.ffn_gate_temp_slices();
+    const auto upTempSlices = target.ffn_up_temp_slices();
+    const int64_t pairsPerTempGroup =
+        memory.sram_depth_rows / (mTileCount * tile);
 
     FfnSwishEmission result;
     result.last_cycle = 0;
@@ -64,14 +68,16 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                             == emission.completed_tiles.end()) {
                             return mlir::failure();
                         }
+                        const int64_t tempGroup = pair / pairsPerTempGroup;
                         const int64_t tempBase =
-                            (pair * mTileCount + mTile) * tile;
+                            ((pair % pairsPerTempGroup) * mTileCount + mTile)
+                            * tile;
                         const int64_t streamBase = hemisphere * 16;
                         for (int64_t byte = 0; byte < 2; ++byte) {
                             const int64_t gateSlice =
-                                memory.w8a16_fused_gate_temp_slices[byte];
+                                gateTempSlices[2 * tempGroup + byte];
                             const int64_t upSlice =
-                                memory.w8a16_fused_up_temp_slices[byte];
+                                upTempSlices[2 * tempGroup + byte];
                             gateValue =
                                 context
                                     .emitSliceRead(completed->gate_temp,
@@ -80,10 +86,10 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                                             - context.westLatency(
                                                 gateSlice),
                                         gateSlice, tempBase + row, 1, 1,
-                                        streamBase + byte, "west",
-                                        "vxm_bf16",
-                                        context.hemisphereName(
-                                            hemisphere))
+                                            streamBase + byte, "west",
+                                            "vxm_bf16",
+                                            context.hemisphereName(
+                                                hemisphere))
                                     .getOutput();
                             upValue =
                                 context
@@ -120,7 +126,92 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                 pending.input_cycle, pending.m_tile, pending.pair,
                 pending.row, pending.source_hemisphere);
         }
-        result.last_cycle = inputCycle - 1;
+
+        // The shared compact VXM instruction drives two physical chains.
+        // Their fixed outputs retain each 32-feature block in one owner
+        // hemisphere. Down projection needs every reduction block at both
+        // MXMs, so multicast the owner copy through the passive bridge.
+        const int64_t hiddenBase = get_base_row(ffn.getHidden0Placement());
+        const int64_t hiddenBlocks = ffn.getHidden() / tile;
+        const int64_t hiddenBank = ffn.getHidden0Placement()
+            .getAs<mlir::IntegerAttr>("bank").getInt();
+        int64_t maxOutputLatency = 0;
+        int64_t maxReadLatency = 0;
+        for (int64_t slice : context.hidden_slices) {
+            const auto outputLatency = target.transport_latency(
+                target::StreamEndpoint::VxmResult,
+                target::StreamEndpoint::Mem,
+                target::StreamDirection::East, slice);
+            const auto readLatency = target.transport_latency(
+                target::StreamEndpoint::Mem,
+                target::StreamEndpoint::VxmInput,
+                target::StreamDirection::West, slice);
+            if (!outputLatency || !readLatency) return mlir::failure();
+            maxOutputLatency = std::max(maxOutputLatency, *outputLatency);
+            maxReadLatency = std::max(maxReadLatency, *readLatency);
+        }
+        int64_t bridgeInputCycle = inputCycle - 1 + 17
+            + maxOutputLatency + maxReadLatency + 2;
+        int64_t lastCopyCycle = bridgeInputCycle;
+        const mlir::Value bridgeSource = result.hidden;
+        mlir::Value lastBridgeWrite = result.hidden;
+        for (int64_t sourceHemisphere = 0;
+             sourceHemisphere < memory.hemispheres; ++sourceHemisphere) {
+            if (sourceHemisphere != 0)
+                bridgeInputCycle += maxReadLatency + maxOutputLatency + 1;
+            for (const PendingOutput& pending : pendingOutputs) {
+                if (pending.source_hemisphere != sourceHemisphere) continue;
+                const int64_t token = pending.m_tile * tile + pending.row;
+                const int64_t tokenWithinBlock = token % tile;
+                const int64_t tokenWave = tokenWithinBlock
+                    / throughput.mxm_block_rows;
+                const int64_t tokenLane = tokenWithinBlock
+                    % throughput.mxm_block_rows;
+                const int64_t nblock = (pending.pair / 2) * 4
+                    + pending.source_hemisphere * 2 + pending.pair % 2;
+                const int64_t address = hiddenBase
+                    + ((token / tile) * hiddenBlocks + nblock)
+                        * throughput.tile_rows
+                    + tokenWave;
+                const int64_t owner = 1 - pending.source_hemisphere;
+                const int64_t peer = pending.source_hemisphere;
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice =
+                        context.hidden_slices[2 * tokenLane + byte];
+                    const auto readLatency = target.transport_latency(
+                        target::StreamEndpoint::Mem,
+                        target::StreamEndpoint::VxmInput,
+                        target::StreamDirection::West, slice);
+                    const auto writeLatency = target.transport_latency(
+                        target::StreamEndpoint::VxmResult,
+                        target::StreamEndpoint::Mem,
+                        target::StreamDirection::East, slice);
+                    if (!readLatency || !writeLatency)
+                        return mlir::failure();
+                    auto read = context.emitSliceRead(bridgeSource,
+                        context.hidden_route,
+                        bridgeInputCycle - *readLatency,
+                        slice, address, 1, 1, byte, "west", "vxm_bypass",
+                        context.hemisphereName(owner));
+                    auto placement = schedule_placement(context.rewriter,
+                        {slice}, address, 1, 1,
+                        context.hemisphereName(peer),
+                        "fp16_mxm_distributed_16", hiddenBank);
+                    auto write = context.rewriter.create<MemWriteOp>(
+                        ffn.getLoc(), read.getOutput(),
+                        bridgeInputCycle + *writeLatency,
+                        1, byte, 1, 0,
+                        context.rewriter.getStringAttr("east"),
+                        ffn.getHidden0Address(), placement, tile);
+                    lastBridgeWrite = write.getOutput();
+                    lastCopyCycle = std::max(lastCopyCycle,
+                        bridgeInputCycle + *writeLatency);
+                }
+                ++bridgeInputCycle;
+            }
+        }
+        result.hidden = lastBridgeWrite;
+        result.last_cycle = lastCopyCycle;
         return result;
     }
 
@@ -170,11 +261,9 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
             mlir::Value gateValue;
             mlir::Value upValue;
             for (int64_t byte = 0;
-                 byte < throughput.mxm_result_streams; ++byte) {
-                const int64_t gateSlice =
-                    memory.w8a16_fused_gate_temp_slices[byte];
-                const int64_t upSlice =
-                    memory.w8a16_fused_up_temp_slices[byte];
+                byte < throughput.mxm_result_streams; ++byte) {
+                const int64_t gateSlice = gateTempSlices[byte];
+                const int64_t upSlice = upTempSlices[byte];
                 gateValue =
                     context
                         .emitSliceRead(completed.gate_temp,

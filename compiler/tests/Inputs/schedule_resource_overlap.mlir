@@ -1,7 +1,6 @@
 module {
   func.func @overlap() {
     ftlpu.schedule.mem_transfer {
-      accumulator_destination = "sram",
       address = 0 : i64,
       address_stride = 0 : i64,
       cycle = 4 : i64,
@@ -13,7 +12,6 @@ module {
       slice = 0 : i64
     }
     ftlpu.schedule.mem_transfer {
-      accumulator_destination = "sram",
       address = 32 : i64,
       address_stride = 0 : i64,
       cycle = 5 : i64,

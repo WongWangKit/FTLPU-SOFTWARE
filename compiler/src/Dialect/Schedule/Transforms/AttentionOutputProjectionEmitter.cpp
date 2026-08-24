@@ -42,8 +42,6 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
     const int64_t outputGroups = op_.getHidden()
         / (tile * target_.memory().hemispheres);
     const int64_t localMxm = 0;
-    const int64_t accumulatorSlice = target_.memory().accumulator_slice_base
-        + localMxm * target_.memory().accumulator_slices_per_mxm;
     const int64_t accumulatorLatency =
         target_.throughput().mxm0_accumulator_latency;
     const int64_t weightToIw = target_.throughput().vxm_weight_to_iw_latency;
@@ -148,7 +146,9 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd)
             }
             phaseStart = firstCompute + tokenBlocks * computeInterval
                 + (finalReduction
-                        ? accumulatorLatency + readLatency(accumulatorSlice)
+                        ? accumulatorLatency
+                            + target_.throughput()
+                                  .accumulator_read_to_vxm_latency
                         : 0);
             if (finalReduction) {
                 const int64_t castStart = phaseStart;

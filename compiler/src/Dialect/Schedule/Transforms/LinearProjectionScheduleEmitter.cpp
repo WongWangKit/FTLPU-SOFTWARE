@@ -191,8 +191,6 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     const int64_t accumulatorAddress = block8 ? 0 : 8192 - m;
     const int64_t accumulatorLatency =
         target.throughput().mxm0_accumulator_latency;
-    const int64_t accumulatorSlice =
-        target.memory().accumulator_slice_base;
     const float scale =
         static_cast<float>(scaleAttr.getValueAsDouble());
 
@@ -253,7 +251,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                         + localMxm;
                     if (localDequant) {
                         emitMxmDequant(rewriter, op.getLoc(),
-                            cycle, unit, scale);
+                            cycle, unit, scale, 1, 1, weightBinding);
                         emitMxm(rewriter, op.getLoc(), cycle, unit,
                             "iw", weightBuffer, 3 - pulse, 0, 0,
                             1, 1, 0, 1, "sram", true,
@@ -444,7 +442,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
 
             const int64_t castStart = phaseStart
                 + accumulatorLatency
-                + readLatency(accumulatorSlice);
+                + target.throughput().accumulator_read_to_vxm_latency;
             for (int64_t hemisphere = 0;
                  hemisphere < target.memory().hemispheres;
                  ++hemisphere) {

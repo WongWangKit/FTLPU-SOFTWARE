@@ -58,6 +58,9 @@ public:
     int64_t ropeStagingAddress(AttentionProjectionKind projection,
         int64_t head, int64_t half, int64_t tokenBlock,
         int64_t row) const;
+    int64_t ropeProductAddress(AttentionProjectionKind projection,
+        int64_t head, int64_t pairBlock, int64_t product,
+        int64_t token) const;
 
     llvm::ArrayRef<int64_t> weightSlices() const { return weightSlices_; }
     llvm::ArrayRef<int64_t> outputWeightSlices() const { return outputWeightSlices_; }
@@ -82,10 +85,10 @@ public:
             - 16 + bank * 4;
         return {begin, begin + 1, begin + 2, begin + 3};
     }
-    std::array<int64_t, 4> fusedCausalMaskSlices(int64_t bank) const {
+    std::array<int64_t, 2> fusedCausalMaskSlices(int64_t bank) const {
         const int64_t begin = target_.memory().slices_per_hemisphere
-            - 8 + bank * 4;
-        return {begin, begin + 1, begin + 2, begin + 3};
+            - 4 + bank * 2;
+        return {begin, begin + 1};
     }
     llvm::ArrayRef<int64_t> probabilityPackSlices() const { return probabilityPackSlices_; }
     llvm::ArrayRef<int64_t> probabilityDiagonalSlices() const { return probabilityDiagonalSlices_; }
@@ -112,7 +115,7 @@ private:
     // the two work items in a hemisphere wave to use VXM concurrently.
     std::array<std::array<int64_t, 4>, 2> scaledScoreSlices_ {{{{8, 9, 10, 11}}, {{0, 1, 2, 3}}}};
     std::array<std::array<int64_t, 4>, 2> expScoreSlices_ {{{{12, 13, 14, 15}}, {{4, 5, 6, 7}}}};
-    std::array<std::array<int64_t, 4>, 2> causalMaskSlices_ {{{{24, 25, 26, 27}}, {{20, 21, 22, 23}}}};
+    std::array<std::array<int64_t, 2>, 2> causalMaskSlices_ {{{{24, 25}}, {{20, 21}}}};
     std::array<int64_t, 16> probabilityPackSlices_ {
         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35};
     std::array<int64_t, 16> probabilityDiagonalSlices_ {

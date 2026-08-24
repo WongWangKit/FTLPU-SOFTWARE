@@ -18,6 +18,7 @@ namespace ftlpu::compiler::schedule {
 using ScheduleTaskId = std::size_t;
 
 enum class ScheduleTaskKind : std::uint8_t {
+    C2cPrefetch,
     MemRead,
     MxmLoad,
     MxmCompute,

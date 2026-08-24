@@ -19,6 +19,7 @@ struct PhysicalAllocation {
     int64_t live_start;
     int64_t live_end;
     bool reserve_slice_port = true;
+    int64_t bank = 0;
 };
 
 struct PhysicalAllocationRequest {
@@ -30,6 +31,7 @@ struct PhysicalAllocationRequest {
     int64_t live_end;
     llvm::ArrayRef<int64_t> candidate_slices;
     bool reserve_slice_port = true;
+    llvm::ArrayRef<int64_t> candidate_banks;
 };
 
 // Allocates byte planes with interval reuse. Lifetimes are half-open and are
@@ -50,7 +52,7 @@ public:
 
 private:
     bool valid(const PhysicalAllocation& allocation) const;
-    bool conflicts(llvm::ArrayRef<int64_t> slices,
+    bool conflicts(int64_t bank, llvm::ArrayRef<int64_t> slices,
         int64_t base_row, int64_t rows,
         int64_t live_start, int64_t live_end,
         bool reserve_slice_port) const;

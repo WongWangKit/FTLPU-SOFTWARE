@@ -43,15 +43,31 @@ std::vector<std::uint8_t> page_bytes(std::uint8_t base)
     return bytes;
 }
 
-} // namespace
+void run_overlap_hazard_test()
+{
+    BinaryProgram layer0 = make_program(0);
+    BinaryBinding scratch;
+    scratch.index = 0;
+    scratch.access = BindingAccess::Internal;
+    scratch.element_type = BindingElementType::I8;
+    scratch.layout = BindingLayout::Vector;
+    scratch.byte_size = hw::kPhysicalVectorBytes;
+    scratch.base_row = 10;
+    scratch.instruction_count = 1;
+    scratch.address_stride = 1;
+    scratch.shape = {hw::kPhysicalVectorBytes};
+    scratch.slices = {16};
+    scratch.role = "workspace";
+    scratch.name = "next-bank-overlap";
+    scratch.hemisphere_mask = 2;
+    scratch.bank = 1;
+    layer0.bindings.push_back(std::move(scratch));
 
-int main()
-try {
     ModelPackage package;
-    package.model_name = "two-layer-c2c-page-session";
+    package.model_name = "two-layer-c2c-page-hazard";
     package.architecture = "Qwen2ForCausalLM";
     package.executables = {
-        {"layer.bank0", make_program(0), {}},
+        {"layer.bank0.hazard", std::move(layer0), {}},
         {"layer.bank1", make_program(1), {}},
     };
     for (std::uint32_t layer = 0; layer < 2; ++layer) {
@@ -59,7 +75,7 @@ try {
             + ".weights.packed";
         package.tensors.push_back(ModelTensor {
             name, BindingElementType::I8, {hw::kPhysicalVectorBytes},
-            page_bytes(static_cast<std::uint8_t>(0x20 + layer * 0x40)),
+            page_bytes(static_cast<std::uint8_t>(0x20 + layer * 0x30)),
             ModelTensorEncoding::TargetPackedSramVectors});
         ModelWeightPage page;
         page.layer = layer;
@@ -73,9 +89,62 @@ try {
             layer});
     }
 
-    C2cDmaSystem system(Ddr4Config {8, 2, 2, 4});
+    C2cDmaSystem system(Ddr4Config {32, 2, 2, 256, 8});
     ModelSession session(system);
     session.load(std::move(package));
+    session.run_invocation(0, 0);
+    session.run_invocation(1, 0);
+    const ModelSessionStats& stats = session.stats();
+    if (stats.weight_page_prefetches != 2
+        || stats.weight_page_deferred_prefetches != 1
+        || stats.weight_page_hidden_prefetches != 0
+        || stats.weight_page_boundary_wait_cycles == 0)
+        throw std::runtime_error(
+            "session did not defer an overlapping next-bank weight page");
+}
+
+} // namespace
+
+int main()
+try {
+    ModelPackage package;
+    package.model_name = "three-layer-c2c-page-session";
+    package.architecture = "Qwen2ForCausalLM";
+    package.executables = {
+        {"layer.bank0", make_program(0), {}},
+        {"layer.bank1", make_program(1), {}},
+        {"layer.bank0.reuse", make_program(0), {}},
+    };
+    for (std::uint32_t layer = 0; layer < 3; ++layer) {
+        const std::string name = "layers." + std::to_string(layer)
+            + ".weights.packed";
+        package.tensors.push_back(ModelTensor {
+            name, BindingElementType::I8, {hw::kPhysicalVectorBytes},
+            page_bytes(static_cast<std::uint8_t>(0x20 + layer * 0x30)),
+            ModelTensorEncoding::TargetPackedSramVectors});
+        ModelWeightPage page;
+        page.layer = layer;
+        page.bank = static_cast<std::uint16_t>(layer % 2);
+        page.tensors = {name};
+        page.segments.push_back(ModelWeightPage::Segment {
+            name, 0, 1, 16, 10, 1, 5});
+        package.weight_pages.push_back(std::move(page));
+        package.invocations.push_back(ModelInvocation {
+            "layers." + std::to_string(layer), layer, {{0, name}}, {}, {},
+            layer});
+    }
+
+    C2cDmaSystem system(Ddr4Config {32, 2, 2, 256, 8});
+    const auto require_c2c = [&](const char* stage) {
+        if (!system.chip().has_c2c(Hemisphere::East)
+            || !system.chip().has_c2c(Hemisphere::West))
+            throw std::runtime_error(
+                std::string("C2C endpoints detached at ") + stage);
+    };
+    require_c2c("system construction");
+    ModelSession session(system);
+    session.load(std::move(package));
+    require_c2c("session load");
     if (session.memory_plan().invocations[0].inputs[0].transfer
             != SessionTransferKind::WeightPage
         || session.memory_plan().invocations[1].inputs[0].transfer
@@ -95,10 +164,11 @@ try {
             + session.package().weight_pages[0].tensors[0]
             + "," + session.package().weight_pages[1].tensors[0]);
     session.run_invocation(0, 0);
+    require_c2c("first invocation");
 
     for (std::size_t bank = 0; bank < 2; ++bank) {
         const auto expected = page_bytes(
-            static_cast<std::uint8_t>(0x20 + bank * 0x40));
+            static_cast<std::uint8_t>(0x20 + bank * 0x30));
         for (std::size_t byte = 0; byte < expected.size(); ++byte) {
             const auto actual = system.chip().read_mem_sram_lane_byte(
                 Hemisphere::West, 16, bank,
@@ -110,16 +180,44 @@ try {
         }
     }
     session.run_invocation(1, 0);
-    if (session.stats().weight_page_prefetches != 2
+    require_c2c("second invocation");
+    const auto expectedLayer2 = page_bytes(0x80);
+    for (std::size_t byte = 0; byte < expectedLayer2.size(); ++byte) {
+        const auto actual = system.chip().read_mem_sram_lane_byte(
+            Hemisphere::West, 16, 0,
+            byte / hw::kLanesPerTile, 10,
+            byte % hw::kLanesPerTile);
+        if (actual != expectedLayer2[byte])
+            throw std::runtime_error(
+                "layer 2 did not overwrite bank 0 during layer 1");
+    }
+    session.run_invocation(2, 0);
+    require_c2c("third invocation");
+    if (session.stats().weight_page_prefetches != 3
         || session.stats().weight_page_prefetch_bytes
-            != 2 * hw::kPhysicalVectorBytes
-        || session.stats().weight_page_wait_cycles == 0)
+            != 3 * hw::kPhysicalVectorBytes
+        || session.stats().weight_page_initial_wait_cycles == 0
+        || session.stats().weight_page_boundary_wait_cycles != 0
+        || session.stats().weight_page_hidden_prefetches != 2
+        || session.stats().weight_page_wait_cycles
+            != session.stats().weight_page_initial_wait_cycles)
         throw std::runtime_error(
-            "session did not report C2C page prefetch statistics");
+            "session did not fully hide layer-to-layer C2C prefetch");
     if (!session.memory_plan().resident_tensors.empty())
         throw std::runtime_error(
             "C2C pages were also allocated as resident weights");
-    std::cout << "model_session_c2c_weight_pages_test passed\n";
+    run_overlap_hazard_test();
+    std::cout << "model_session_c2c_weight_pages_test passed"
+              << " prefetches="
+              << session.stats().weight_page_prefetches
+              << " initial_wait_cycles="
+              << session.stats().weight_page_initial_wait_cycles
+              << " boundary_wait_cycles="
+              << session.stats().weight_page_boundary_wait_cycles
+              << " hidden_prefetches="
+              << session.stats().weight_page_hidden_prefetches
+              << " deferred_prefetches="
+              << session.stats().weight_page_deferred_prefetches << '\n';
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "model_session_c2c_weight_pages_test failed: "

@@ -449,6 +449,65 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
         validate_queue_index(queue.kind, queue_index);
         for (std::size_t command_index = 0; command_index < queue.commands.size(); ++command_index) {
             const auto& command = queue.commands[command_index];
+            if (is_macro_schedule_command(command)) {
+                const auto schedule = decode_macro_schedule_command(command);
+                switch (queue.kind) {
+                case QueueKind::Mem: {
+                    if (command.instruction_kind != InstructionKind::Mem
+                        || command.word_count < 1 || command.word_count > 2)
+                        throw std::logic_error(
+                            "MEM macro must carry one or two MEM instruction words");
+                    const auto encoded =
+                        static_cast<isa::EncodedMemInstruction>(command.words[0])
+                        | (static_cast<isa::EncodedMemInstruction>(
+                               command.words[1])
+                            << 32);
+                    icu.enqueue_mem_macro(queue_index, schedule,
+                        isa::decode_mem_instruction(encoded));
+                    break;
+                }
+                case QueueKind::MxmLoad:
+                case QueueKind::MxmCompute: {
+                    if (command.instruction_kind != InstructionKind::Mxm
+                        || command.word_count < 1 || command.word_count > 2)
+                        throw std::logic_error(
+                            "MXM macro must carry one or two MXM instruction words");
+                    const auto encoded =
+                        static_cast<isa::EncodedMxmInstruction>(command.words[0])
+                        | (static_cast<isa::EncodedMxmInstruction>(
+                               command.words[1])
+                            << 32);
+                    const auto instruction =
+                        isa::decode_mxm_instruction(encoded);
+                    validate_mxm_queue_opcode(
+                        queue.kind, queue_index, instruction);
+                    if (queue.kind == QueueKind::MxmLoad)
+                        icu.enqueue_mxm_load_macro(
+                            queue_index, schedule, instruction);
+                    else
+                        icu.enqueue_mxm_compute_macro(
+                            queue_index, schedule, instruction);
+                    break;
+                }
+                case QueueKind::MxmDequant:
+                    if (command.instruction_kind
+                            != InstructionKind::MxmDequant
+                        || command.word_count != 1)
+                        throw std::logic_error(
+                            "MXM dequant macro must carry one scale word");
+                    icu.enqueue_mxm_dequant_macro(queue_index, schedule,
+                        isa::decode_mxm_dequant_instruction(
+                            static_cast<isa::EncodedMxmDequantInstruction>(
+                                command.words[0])));
+                    break;
+                case QueueKind::Vxm:
+                case QueueKind::SxmTranspose:
+                case QueueKind::SxmPermute:
+                    throw std::logic_error(
+                        "ICU macro v1 supports MEM and MXM queues only");
+                }
+                continue;
+            }
             if (is_repeat_2d_command(command)) {
                 IcuLocation location;
                 switch (queue.kind) {

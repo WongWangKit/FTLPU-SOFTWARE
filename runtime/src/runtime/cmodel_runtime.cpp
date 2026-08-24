@@ -1,4 +1,5 @@
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
+#include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include "ftlpu/core/bf16.hpp"
 #include "ftlpu/core/fp16.hpp"
@@ -137,12 +138,12 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     REQUIRE_EXACT(hemispheres);
     REQUIRE_EXACT(slices_per_hemisphere);
     REQUIRE_EXACT(banks_per_slice);
-    REQUIRE_EXACT(words_per_bank);
     REQUIRE_EXACT(bytes_per_word);
     REQUIRE_EXACT(sram_read_ports_per_slice);
     REQUIRE_EXACT(sram_write_ports_per_slice);
     REQUIRE_EXACT(streams_per_direction);
     REQUIRE_EXACT(encoded_streams);
+    REQUIRE_EXACT(c2c_bytes_per_stream_per_cycle);
     REQUIRE_EXACT(mem_boundary_register_columns);
     REQUIRE_EXACT(system_register_columns);
     REQUIRE_EXACT(mem_slices_per_register_group);
@@ -175,6 +176,8 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
 
     require_capacity("sram_depth_rows", requested.sram_depth_rows,
         physical.sram_depth_rows);
+    require_capacity("words_per_bank", requested.words_per_bank,
+        physical.words_per_bank);
     require_capacity("mxms_per_hemisphere", requested.mxms_per_hemisphere,
         physical.mxms_per_hemisphere);
     require_capacity("mxm_weight_buffers", requested.mxm_weight_buffers,
@@ -183,6 +186,9 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
         requested.mxm_accumulator_blocks,
         physical.mxm_accumulator_blocks);
     require_capacity("vxm_alus", requested.vxm_alus, physical.vxm_alus);
+    require_capacity("c2c_streams_per_direction",
+        requested.c2c_streams_per_direction,
+        physical.c2c_streams_per_direction);
     require_capability("mxm_local_dequant_enabled",
         requested.mxm_local_dequant_enabled,
         physical.mxm_local_dequant_enabled);
@@ -318,15 +324,21 @@ CModelRuntime::CModelRuntime(TspSliceSystem& system,
 void CModelRuntime::load(const BinaryProgram& program)
 {
     validate_cmodel_hardware_config(program);
-    system_.configure_hardware(SystemHardwareConfiguration {
-        program.hardware.sram_depth_rows,
-        program.hardware.mxms_per_hemisphere,
-        program.hardware.mxm_weight_buffers,
-        program.hardware.vxm_alus,
-        program.hardware.mxm_local_dequant_enabled != 0,
-        program.hardware.mxm_block_compute_enabled != 0,
-        program.hardware.mxm_weight_activation_overlap_enabled != 0,
-    });
+    SystemHardwareConfiguration hardware;
+    hardware.sram_depth_rows = program.hardware.sram_depth_rows;
+    hardware.mxms_per_hemisphere = program.hardware.mxms_per_hemisphere;
+    hardware.mxm_weight_buffers = program.hardware.mxm_weight_buffers;
+    hardware.vxm_alus = program.hardware.vxm_alus;
+    hardware.c2c_streams_per_direction =
+        program.hardware.c2c_streams_per_direction;
+    hardware.c2c_dedicated_streams = false;
+    hardware.mxm_local_dequant_enabled =
+        program.hardware.mxm_local_dequant_enabled != 0;
+    hardware.mxm_block_compute_enabled =
+        program.hardware.mxm_block_compute_enabled != 0;
+    hardware.mxm_weight_activation_overlap_enabled =
+        program.hardware.mxm_weight_activation_overlap_enabled != 0;
+    system_.configure_hardware(hardware);
     system_.reset_execution_state();
     initialize_vxm_luts(system_);
     for (std::size_t group = 0; group < 16; ++group)
@@ -342,6 +354,19 @@ void CModelRuntime::load(const BinaryProgram& program)
     loaded_vxm_alus_ = program.hardware.vxm_alus;
     datapath_performance_.reset();
     bindings_ = program.bindings;
+    hardware_ = program.hardware;
+    weight_page_uses_ = program.weight_page_uses;
+    std::sort(weight_page_uses_.begin(), weight_page_uses_.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return lhs.ready_cycle != rhs.ready_cycle
+                ? lhs.ready_cycle < rhs.ready_cycle
+                : lhs.binding_index != rhs.binding_index
+                ? lhs.binding_index < rhs.binding_index
+                : lhs.page_index < rhs.page_index;
+        });
+    paged_weight_data_.clear();
+    next_weight_page_use_ = 0;
+    executed_cycles_ = 0;
     for (const BinaryBinding& binding : bindings_) {
         if (binding.access != BindingAccess::Internal) continue;
         if (binding.initializer == BindingInitializer::None) continue;
@@ -361,9 +386,15 @@ void CModelRuntime::load(const BinaryProgram& program)
         }
         if (binding.initializer == BindingInitializer::CausalMask) {
             require_matrix_binding(binding);
-            if (binding.layout != BindingLayout::Fp32CausalMaskTile
-                || binding.element_type != BindingElementType::F32
-                || binding.slices.size() != sizeof(float)
+            const bool fp32Mask =
+                binding.layout == BindingLayout::Fp32CausalMaskTile
+                && binding.element_type == BindingElementType::F32
+                && binding.slices.size() == sizeof(float);
+            const bool fp16Mask =
+                binding.layout == BindingLayout::Fp16CausalMaskTile
+                && is_16bit_float(binding.element_type)
+                && binding.slices.size() == sizeof(std::uint16_t);
+            if ((!fp32Mask && !fp16Mask)
                 || binding.shape[0] + 1 != binding.shape[1])
                 throw std::logic_error("invalid internal causal-mask binding");
             const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
@@ -376,7 +407,9 @@ void CModelRuntime::load(const BinaryProgram& program)
                     static_cast<std::size_t>(binding.base_row) + row * stride;
                 for (std::size_t query_lane = 0; query_lane < columns; ++query_lane) {
                     const float mask = local_key <= query_lane ? 0.0f : -1.0e9f;
-                    const std::uint32_t bits = std::bit_cast<std::uint32_t>(mask);
+                    const std::uint32_t bits = fp16Mask
+                        ? encode_16bit_float(mask, binding.element_type)
+                        : std::bit_cast<std::uint32_t>(mask);
                     for (std::size_t byte = 0; byte < binding.slices.size(); ++byte)
                         for_each_binding_hemisphere(binding,
                             [&](Hemisphere hemisphere) {
@@ -459,7 +492,56 @@ const BinaryBinding& CModelRuntime::find_binding(BindingAccess access, std::size
 
 void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t> data)
 {
-    upload_binding(find_binding(BindingAccess::Input, index), data);
+    const auto& binding = find_binding(BindingAccess::Input, index);
+    if (binding.paged_weight) {
+        if (data.size() != binding.byte_size)
+            throw std::invalid_argument(
+                "paged input byte size does not match binding");
+        paged_weight_data_[binding.index] =
+            std::vector<std::uint8_t>(data.begin(), data.end());
+        return;
+    }
+    upload_binding(binding, data);
+}
+
+void CModelRuntime::load_ready_weight_pages()
+{
+    while (next_weight_page_use_ < weight_page_uses_.size()
+        && weight_page_uses_[next_weight_page_use_].ready_cycle
+            <= executed_cycles_) {
+        const auto& use = weight_page_uses_[next_weight_page_use_++];
+        const auto& binding = find_binding(
+            BindingAccess::Input, use.binding_index);
+        const auto logical = paged_weight_data_.find(use.binding_index);
+        if (logical == paged_weight_data_.end())
+            throw std::logic_error(
+                "paged weight was not uploaded before its ready cycle");
+        if (use.bank >= hardware_.banks_per_slice
+            || use.bank != use.page_index % binding.page_bank_count)
+            throw std::logic_error(
+                "binary weight-page bank does not match ping-pong policy");
+        const auto image = pack_weight_binding_page(binding,
+            use.page_index, logical->second, hardware_);
+        for (const auto& segment : image.segments) {
+            const auto hemisphere = static_cast<Hemisphere>(
+                segment.hemisphere);
+            for (std::uint32_t row = 0;
+                 row < segment.vector_count; ++row) {
+                const std::size_t offset =
+                    static_cast<std::size_t>(segment.byte_offset)
+                    + static_cast<std::size_t>(row)
+                        * hw::kPhysicalVectorBytes;
+                for (std::size_t column = 0;
+                     column < hw::kPhysicalVectorBytes; ++column)
+                    system_.initialize_mem_sram_lane_byte(hemisphere,
+                        segment.slice, use.bank,
+                        column / hw::kLanesPerTile,
+                        segment.base_row + row,
+                        column % hw::kLanesPerTile,
+                        image.data[offset + column]);
+            }
+        }
+    }
 }
 
 void CModelRuntime::upload_binding(
@@ -701,6 +783,29 @@ void CModelRuntime::upload_binding(
         }
         return;
     }
+    if (binding.layout == BindingLayout::Fp16VxmGammaBroadcast
+        && is_16bit_float(binding.element_type)
+        && binding.slices.size() == 2) {
+        if (!vector)
+            throw std::logic_error(
+                "VXM gamma broadcast input requires a rank-1 tensor");
+        for (std::size_t column = 0; column < columns; ++column) {
+            const std::size_t offset = column * 2;
+            const std::size_t address =
+                static_cast<std::size_t>(binding.base_row) + column;
+            for_each_binding_hemisphere(binding,
+                [&](Hemisphere hemisphere) {
+                    for (std::size_t lane = 0; lane < 32; ++lane) {
+                        write_binding_sram_byte(system_, binding, hemisphere,
+                            binding.slices[0], address, lane, data[offset]);
+                        write_binding_sram_byte(system_, binding, hemisphere,
+                            binding.slices[1], address, lane,
+                            data[offset + 1]);
+                    }
+                });
+        }
+        return;
+    }
     if ((binding.layout == BindingLayout::Fp16MxmDistributed16
             || binding.layout
                 == BindingLayout::Fp16MxmBlock8Distributed16)
@@ -852,7 +957,12 @@ void CModelRuntime::upload_binding(
 
 std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) const
 {
-    const auto& binding = find_binding(BindingAccess::Output, index);
+    return download_binding(find_binding(BindingAccess::Output, index));
+}
+
+std::vector<std::uint8_t> CModelRuntime::download_binding(
+    const BinaryBinding& binding) const
+{
     require_matrix_binding(binding);
     const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
     const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
@@ -1105,10 +1215,12 @@ void CModelRuntime::dispatch_icu_cycles(std::size_t cycles, std::ostream* log)
 {
     const auto count = cycles == 0 ? loaded_max_cycle_ + 1 : cycles;
     for (std::size_t cycle = 0; cycle < count; ++cycle) {
+        load_ready_weight_pages();
         if (log != nullptr) tick_({log, log, log, log, log});
         else tick_({});
         datapath_performance_.sample(
             system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
+        ++executed_cycles_;
     }
 }
 
@@ -1122,9 +1234,11 @@ void CModelRuntime::run_cycles(std::size_t cycles, std::ostream* log)
     }
     for (std::size_t cycle = 0; cycle < count; ++cycle) {
         try {
+            load_ready_weight_pages();
             tick_(sinks);
             datapath_performance_.sample(
                 system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
+            ++executed_cycles_;
         } catch (const std::exception& ex) {
             std::ostringstream message;
             message << "CModel global_cycle=" << system_.cycle()

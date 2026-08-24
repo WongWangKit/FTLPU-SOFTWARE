@@ -437,6 +437,7 @@ select {
   border-radius: 2px;
 }
 
+.c2c-prefetch { background: #d58a35; }
 .mem-read { background: #62a982; }
 .mem-write { background: #e0ae4f; }
 .sxm { background: #2e9e96; }

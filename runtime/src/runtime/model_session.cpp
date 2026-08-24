@@ -109,6 +109,14 @@ BinaryProgram parameterize_program(const ModelPackage& package,
                 "executable scale relocation references a missing command");
         QueueCommand& command =
             queue->commands[relocation.command_index];
+        if (command.instruction_kind == InstructionKind::MxmDequant
+            && command.word_count == 1) {
+            command.words[0] = static_cast<std::uint32_t>(
+                isa::encode_mxm_dequant_instruction(
+                    MxmDequantInstruction::Scale(
+                        tensor.scales[relocation.scale_index])));
+            continue;
+        }
         if (command.instruction_kind != InstructionKind::Vxm
             || command.word_count != 3)
             throw std::logic_error(
@@ -295,6 +303,32 @@ BinaryProgram parameterize_program(const ModelPackage& package,
     return program;
 }
 
+bool weight_page_overlaps_program(
+    const C2cWeightPage& page,
+    const BinaryProgram& program)
+{
+    for (const C2cWeightSegment& segment : page.segments) {
+        const std::uint64_t segmentBegin = segment.base_row;
+        const std::uint64_t segmentEnd = segmentBegin + segment.vector_count;
+        const std::uint16_t hemisphereBit = static_cast<std::uint16_t>(
+            1u << hemisphere_index(segment.hemisphere));
+        for (const BinaryBinding& binding : program.bindings) {
+            if (binding.bank != segment.bank
+                || (binding.hemisphere_mask & hemisphereBit) == 0
+                || std::find(binding.slices.begin(), binding.slices.end(),
+                       static_cast<std::uint16_t>(segment.slice))
+                    == binding.slices.end())
+                continue;
+            const std::uint64_t bindingBegin = binding.base_row;
+            const std::uint64_t bindingEnd = bindingBegin
+                + binding.instruction_count;
+            if (segmentBegin < bindingEnd && bindingBegin < segmentEnd)
+                return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 ModelSession::ModelSession(TspSliceSystem& system)
@@ -305,7 +339,7 @@ ModelSession::ModelSession(TspSliceSystem& system)
 ModelSession::ModelSession(C2cDmaSystem& system)
     : runtime_(system.chip(), [this, &system](TspSliceSystem::LogSinks sinks) {
         system.tick(sinks);
-        if (weight_pager_) weight_pager_->observe_tick();
+        observe_weight_page_tick();
     })
     , c2c_system_(&system)
     , weight_pager_(std::make_unique<C2cWeightPager>(system))
@@ -364,6 +398,12 @@ void ModelSession::start_weight_page(std::uint32_t page_index)
 {
     if (!weight_pager_ || page_index >= c2c_pages_.size())
         throw std::logic_error("model weight page is unavailable");
+    if (ready_weight_page_ == page_index
+        || inflight_weight_page_ == page_index)
+        return;
+    if (inflight_weight_page_)
+        throw std::logic_error(
+            "cannot start a weight page while another page is in flight");
     weight_pager_->enqueue(c2c_pages_[page_index]);
     ++stats_.weight_page_prefetches;
     stats_.weight_page_prefetch_bytes += weight_pager_->stats().bytes;
@@ -371,15 +411,39 @@ void ModelSession::start_weight_page(std::uint32_t page_index)
     ready_weight_page_.reset();
 }
 
+void ModelSession::observe_weight_page_tick()
+{
+    if (!weight_pager_) return;
+    weight_pager_->observe_tick();
+    if (!inflight_weight_page_ || !weight_pager_->ready()) return;
+    ready_weight_page_ = *inflight_weight_page_;
+    inflight_weight_page_.reset();
+}
+
 void ModelSession::ensure_weight_page(std::uint32_t page_index)
 {
-    if (ready_weight_page_ == page_index) return;
-    if (inflight_weight_page_ != page_index)
+    if (ready_weight_page_ == page_index) {
+        ++stats_.weight_page_hidden_prefetches;
+        return;
+    }
+    if (inflight_weight_page_ != page_index) {
+        // A deferred page is loaded at an invocation boundary. The previous
+        // executable has already launched its ICU queues, so clear execution
+        // state before enqueueing C2C commands. SRAM and DDR contents remain
+        // intact across this reset.
+        if (completed_invocation_)
+            c2c_system_->reset_execution_state();
         start_weight_page(page_index);
+    }
     const std::size_t beginCycle = c2c_system_->cycle();
     weight_pager_->wait(std::max<std::size_t>(
         1024, weight_pager_->stats().vectors * 64));
-    stats_.weight_page_wait_cycles += c2c_system_->cycle() - beginCycle;
+    const std::size_t waitCycles = c2c_system_->cycle() - beginCycle;
+    stats_.weight_page_wait_cycles += waitCycles;
+    if (completed_invocation_)
+        stats_.weight_page_boundary_wait_cycles += waitCycles;
+    else
+        stats_.weight_page_initial_wait_cycles += waitCycles;
     ready_weight_page_ = page_index;
     inflight_weight_page_.reset();
 }
@@ -393,6 +457,7 @@ void ModelSession::load(ModelPackage package)
     values_.clear();
     device_values_.clear();
     stats_ = {};
+    completed_invocation_ = false;
     const bool report_progress =
         std::getenv("FTLPU_SESSION_PROGRESS") != nullptr;
     if (report_progress)
@@ -482,8 +547,15 @@ void ModelSession::run_invocation(
     runtime_.load(program);
     if (index + 1 < package_.invocations.size()) {
         const auto nextPage = package_.invocations[index + 1].weight_page;
-        if (nextPage != 0xffffffffu && nextPage != invocation.weight_page)
-            start_weight_page(nextPage);
+        if (nextPage != 0xffffffffu && nextPage != invocation.weight_page) {
+            if (nextPage >= c2c_pages_.size())
+                throw std::logic_error(
+                    "next model weight page is unavailable");
+            if (weight_page_overlaps_program(c2c_pages_[nextPage], program))
+                ++stats_.weight_page_deferred_prefetches;
+            else
+                start_weight_page(nextPage);
+        }
     }
     for (const SessionInputPlan& input : invocation_plan.inputs) {
         if (input.transfer == SessionTransferKind::Resident
@@ -519,7 +591,65 @@ void ModelSession::run_invocation(
         if (input.release_after_transfer)
             device_values_.erase(source);
     }
-    runtime_.run_cycles(program.max_cycle + drain_cycles);
+    std::size_t executionCycles = program.max_cycle + drain_cycles;
+    if (const char* stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
+        executionCycles = std::min(executionCycles,
+            static_cast<std::size_t>(std::stoull(stop)));
+    runtime_.run_cycles(executionCycles);
+    completed_invocation_ = true;
+    if (std::getenv("FTLPU_SESSION_TRACE_BINDINGS") != nullptr) {
+        for (const BinaryBinding& binding : program.bindings) {
+            if (binding.shape.size() != 2
+                || !is_16bit_float(binding.element_type)
+                || binding.role == "weight")
+                continue;
+            std::vector<std::uint8_t> data;
+            try {
+                data = runtime_.download_binding(binding);
+            } catch (const std::logic_error& error) {
+                std::clog << "FTLPU binding trace: cycle="
+                          << executionCycles << " access="
+                          << static_cast<int>(binding.access)
+                          << " index=" << binding.index
+                          << " role=" << binding.role
+                          << " name=" << binding.name
+                          << " bank=" << binding.bank
+                          << " base=" << binding.base_row
+                          << " layout=" << static_cast<int>(binding.layout)
+                          << " unavailable=" << error.what() << std::endl;
+                continue;
+            }
+            std::size_t nonFinite = 0;
+            float minimum = std::numeric_limits<float>::infinity();
+            float maximum = -std::numeric_limits<float>::infinity();
+            for (std::size_t element = 0;
+                 element < data.size() / sizeof(std::uint16_t); ++element) {
+                std::uint16_t bits = 0;
+                std::memcpy(&bits,
+                    data.data() + element * sizeof(std::uint16_t),
+                    sizeof(bits));
+                const float value = decode_16bit_float(
+                    bits, binding.element_type);
+                if (!std::isfinite(value)) {
+                    ++nonFinite;
+                    continue;
+                }
+                minimum = std::min(minimum, value);
+                maximum = std::max(maximum, value);
+            }
+            std::clog << "FTLPU binding trace: cycle=" << executionCycles
+                      << " access=" << static_cast<int>(binding.access)
+                      << " index=" << binding.index
+                      << " role=" << binding.role
+                      << " name=" << binding.name
+                      << " bank=" << binding.bank
+                      << " base=" << binding.base_row
+                      << " layout=" << static_cast<int>(binding.layout)
+                      << " non_finite=" << nonFinite
+                      << " min=" << minimum
+                      << " max=" << maximum << std::endl;
+        }
+    }
     const bool validate_fp16 =
         std::getenv("FTLPU_SESSION_VALIDATE_FP16") != nullptr;
     for (const SessionOutputPlan& output : invocation_plan.outputs) {

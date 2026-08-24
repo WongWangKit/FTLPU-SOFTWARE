@@ -54,11 +54,7 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
     auto output = create_vxm(rewriter, location, value, upValue,
         resultType, cycle, 7, "bypass", "previous", 0, 0,
         "immediate", 0, 0, dataFormat, outputStream,
-        repeatCount, repeatInterval, hemi,
-        hemisphere_name(peer));
-    // VXM has one physical output destination per chain. Down consumes the
-    // hidden tile in both hemispheres, so emit the same SSA value for the two
-    // MEM-write descriptions; only the selected peer route is physically live.
+        repeatCount, repeatInterval, hemi, hemisphere_name(peer));
     return {output, output};
 }
 
@@ -71,12 +67,16 @@ mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
     constexpr int64_t kVxmSwishLatency = 17;
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t destination = 1 - sourceHemisphere;
-    const int64_t outputStream = 6 + sourceHemisphere * 8;
-    const int64_t nblock = pair;
-    const int64_t hiddenBaseRow =
-        get_base_row(plan.getHidden0Placement());
+    const int64_t outputStream = sourceHemisphere == 0 ? 6 : 14;
     const auto hiddenKind =
         plan.getHidden0Placement().getAs<mlir::StringAttr>("kind");
+    const bool singleMxmVector =
+        target.throughput().mxms_per_hemisphere == 1;
+    const int64_t nblock = singleMxmVector
+        ? (pair / 2) * 4 + sourceHemisphere * 2 + pair % 2
+        : pair;
+    const int64_t hiddenBaseRow =
+        get_base_row(plan.getHidden0Placement());
     const bool distributed16 = hiddenKind
         && hiddenKind.getValue() == "fp16_mxm_distributed_16";
 
@@ -106,14 +106,17 @@ mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
             target::StreamEndpoint::Mem,
             target::StreamDirection::East, slice);
         if (!latency) return {};
-        auto placement = schedule_placement(rewriter, {slice}, address,
-            1, 1, hemisphere_name(destination), kind);
-        auto write = rewriter.create<MemWriteOp>(plan.getLoc(), output,
-            inputCycle + kVxmSwishLatency + *latency,
-            1, outputStream + byte, 1, 0,
-            rewriter.getStringAttr("east"), plan.getHidden0Address(),
-            placement, tile);
-        lastHidden = write.getOutput();
+        const auto emitWrite = [&](int64_t hemisphere) {
+            auto placement = schedule_placement(rewriter, {slice}, address,
+                1, 1, hemisphere_name(hemisphere), kind);
+            auto write = rewriter.create<MemWriteOp>(plan.getLoc(), output,
+                inputCycle + kVxmSwishLatency + *latency,
+                1, outputStream + byte, 1, 0,
+                rewriter.getStringAttr("east"), plan.getHidden0Address(),
+                placement, tile);
+            lastHidden = write.getOutput();
+        };
+        emitWrite(destination);
     }
     return lastHidden;
 }

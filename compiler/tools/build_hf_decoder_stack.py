@@ -27,7 +27,9 @@ def compile_executables(
     output_dir: Path,
     ffn_schedule: str,
     rmsnorm_strategy: str,
+    mxm_execution: str,
     reuse_executables: bool,
+    weight_banks: list[int | None],
 ) -> list[Path]:
     executables: list[Path] = []
     for index, target_config in enumerate(target_configs):
@@ -43,6 +45,10 @@ def compile_executables(
             )
             executables.append(binary)
             continue
+        weight_bank_args = (
+            ["--weight-bank", str(weight_banks[index])]
+            if weight_banks[index] is not None else []
+        )
         run_phase(
             f"lower executable variant {index} to Schedule IR",
             [
@@ -52,8 +58,9 @@ def compile_executables(
                 "--pipeline", "ftlpu-stablehlo-to-schedule",
                 "--ffn-schedule", ffn_schedule,
                 "--rmsnorm-strategy", rmsnorm_strategy,
+                "--mxm-execution", mxm_execution,
                 "--target-config", str(target_config),
-            ],
+            ] + weight_bank_args,
         )
         run_phase(
             f"lower executable variant {index} to Command IR",
@@ -110,8 +117,25 @@ def main() -> None:
         default="vxm-feedback",
     )
     parser.add_argument(
+        "--mxm-execution",
+        choices=("auto", "vector", "legacy", "block8"),
+        default="auto",
+        help="MXM projection execution policy for every decoder variant",
+    )
+    parser.add_argument(
         "--layers-per-executable", type=int, default=6,
         help="contiguous layers assigned to each resident-weight variant",
+    )
+    parser.add_argument(
+        "--c2c-weight-paging", action="store_true",
+        help=(
+            "compile alternating bank0/bank1 decoder executables and pack "
+            "each layer as a C2C weight page"
+        ),
+    )
+    parser.add_argument(
+        "--pack-model-weights", type=Path,
+        help="ftlpu-pack-model-weights used by --c2c-weight-paging",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -129,6 +153,11 @@ def main() -> None:
         "--checkpoint-outputs",
         action="store_true",
         help="embed and download every decoder layer golden output",
+    )
+    parser.add_argument(
+        "--ignore-attention-bias",
+        action="store_true",
+        help="omit checkpoint Q/K/V biases from import and golden generation",
     )
     parser.add_argument(
         "--final-rmsnorm-executable",
@@ -157,9 +186,13 @@ def main() -> None:
         raise ValueError("decoder layer range exceeds the HF model")
     if args.layers_per_executable <= 0:
         raise ValueError("layers per executable must be positive")
-    required_executables = (
+    required_executables = min(2, layer_count) if args.c2c_weight_paging else (
         layer_count + args.layers_per_executable - 1
     ) // args.layers_per_executable
+    if args.c2c_weight_paging and args.pack_model_weights is None:
+        raise ValueError(
+            "--pack-model-weights is required by --c2c-weight-paging"
+        )
     compile_options = (
         args.opt, args.translate, args.stablehlo, args.target_config
     )
@@ -194,7 +227,12 @@ def main() -> None:
             output_dir=args.output_dir,
             ffn_schedule=args.ffn_schedule,
             rmsnorm_strategy=args.rmsnorm_strategy,
+            mxm_execution=args.mxm_execution,
             reuse_executables=args.reuse_executables,
+            weight_banks=(
+                list(range(required_executables)) if args.c2c_weight_paging
+                else [None] * required_executables
+            ),
         )
     else:
         executables = args.executable or []
@@ -235,6 +273,8 @@ def main() -> None:
         ]
         if preceding_output is not None:
             command.extend(["--input-bf16", str(preceding_output)])
+        if args.ignore_attention_bias:
+            command.append("--ignore-attention-bias")
         run_phase(f"import HF layer {layer}", command)
         golden_dirs.append(layer_dir)
         preceding_output = layer_dir / "golden.bf16.bin"
@@ -243,18 +283,24 @@ def main() -> None:
     for golden_dir in golden_dirs:
         package_command.extend(["--golden-dir", str(golden_dir)])
     if len(executables) == 1:
-        package_command.extend([
-            "--executable", str(executables[0])
-        ])
+        layer_executables = executables
+    elif args.c2c_weight_paging:
+        layer_executables = [
+            executables[layer_offset % 2]
+            for layer_offset in range(layer_count)
+        ]
     else:
-        for layer_offset in range(layer_count):
-            executable = executables[
-                layer_offset // args.layers_per_executable
-            ]
-            package_command.extend([
-                "--executable", str(executable)
-            ])
-    package_command.extend(["--output", str(args.output)])
+        layer_executables = [
+            executables[layer_offset // args.layers_per_executable]
+            for layer_offset in range(layer_count)
+        ]
+    for executable in layer_executables:
+        package_command.extend(["--executable", str(executable)])
+    logical_output = (
+        args.output_dir / "model.logical.ftlpum"
+        if args.c2c_weight_paging else args.output
+    )
+    package_command.extend(["--output", str(logical_output)])
     if args.checkpoint_outputs:
         package_command.append("--checkpoint-outputs")
     if args.final_rmsnorm_executable:
@@ -278,6 +324,17 @@ def main() -> None:
             str(args.final_rmsnorm_executable),
         ])
     run_phase("build model package", package_command)
+    if args.c2c_weight_paging:
+        run_phase(
+            "pack alternating C2C weight pages",
+            [
+                str(args.pack_model_weights),
+                "--input", str(logical_output),
+                "--output", str(args.output),
+                "--first-bank", "0",
+            ],
+        )
+        logical_output.unlink()
 
 
 if __name__ == "__main__":

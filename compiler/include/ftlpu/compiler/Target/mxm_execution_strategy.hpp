@@ -12,6 +12,7 @@ namespace ftlpu::compiler::target {
 
 enum class MxmExecutionPolicy {
     Auto,
+    Vector,
     Legacy,
     Block8,
 };

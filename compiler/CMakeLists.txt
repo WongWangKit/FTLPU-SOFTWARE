@@ -79,6 +79,7 @@ add_library(ftlpu_compiler
     src/Dialect/Tensor/IR/TensorDialect.cpp
     src/Dialect/Tensor/Analysis/AttentionTaskGraph.cpp
     src/Dialect/Tensor/Analysis/PhysicalMemoryAllocator.cpp
+    src/Dialect/Tensor/Analysis/FfnWeightTilePlan.cpp
     src/Dialect/Tensor/Transforms/AttentionToTensor.cpp
     src/Dialect/Tensor/Transforms/FfnToTensor.cpp
     src/Dialect/Tensor/Transforms/KernelToTensorLowering.cpp
@@ -111,6 +112,7 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Analysis/FfnWeightLoadScheduleBuilder.cpp
     src/Dialect/Schedule/Analysis/FfnProjectionScheduleBuilder.cpp
     src/Dialect/Schedule/Analysis/FfnProjectionTimelinePlanner.cpp
+    src/Dialect/Schedule/Analysis/FfnWeightTilePlanner.cpp
     src/Dialect/Schedule/Analysis/FfnBlock8ProjectionPlanner.cpp
     src/Dialect/Schedule/Analysis/FfnSwishScheduleBuilder.cpp
     src/Dialect/Schedule/Analysis/FfnSwishPlanner.cpp
@@ -261,6 +263,11 @@ add_test(NAME stream_route_plan_test COMMAND $<TARGET_FILE:stream_route_plan_tes
 add_executable(ffn_schedule_builders_test tests/ffn_schedule_builders_test.cpp)
 target_link_libraries(ffn_schedule_builders_test PRIVATE ftlpu_compiler)
 add_test(NAME ffn_schedule_builders_test COMMAND $<TARGET_FILE:ffn_schedule_builders_test>)
+add_executable(ffn_weight_tile_planner_test
+    tests/ffn_weight_tile_planner_test.cpp)
+target_link_libraries(ffn_weight_tile_planner_test PRIVATE ftlpu_compiler)
+add_test(NAME ffn_weight_tile_planner_test
+    COMMAND $<TARGET_FILE:ffn_weight_tile_planner_test>)
 add_executable(mxm_execution_strategy_test
     tests/mxm_execution_strategy_test.cpp)
 target_link_libraries(mxm_execution_strategy_test PRIVATE ftlpu_compiler)
@@ -280,6 +287,11 @@ if(MSVC)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME build_hf_decoder_stack_paging_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/build_hf_decoder_stack_paging_test.py)
     add_test(
         NAME qwen2_5_1_5b_decoder_layer_stablehlo_to_stream_ir_test
         COMMAND
@@ -305,11 +317,12 @@ if(Python3_Interpreter_FOUND)
             ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_pipeline_test.py
             --opt $<TARGET_FILE:ftlpu_opt>
-            --translate $<TARGET_FILE:ftlpu_translate>
+            --compile $<TARGET_FILE:ftlpu_compile>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --weight-bank 1
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer
-        DEPENDS ftlpu_opt ftlpu_translate
+        DEPENDS ftlpu_opt ftlpu_compile
         USES_TERMINAL)
     add_test(
         NAME lm_head_target_aware_tensor_ir_test
@@ -405,6 +418,30 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_binary_runtime
             --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json)
+    add_test(
+        NAME smollm2_135m_ffn_vector_macro_binary_cmodel_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_ffn_binary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_smollm2_135m_ffn_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_vector_macro_binary_runtime
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json
+            --icu-macro-schedule)
+    add_test(
+        NAME block8_ffn_wave_boundary_binary_cmodel_runtime_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/block8_ffn_wave_boundary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_block8_ffn_wave_boundary_fast_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/block8_ffn_wave_boundary_fast.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/block8_ffn_wave_boundary_regression
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --weight-bank 1)
     add_test(
         NAME smollm2_135m_ffn_seq128_binary_cmodel_runtime_test
         COMMAND
@@ -515,7 +552,7 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:compiled_rmsnorm_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/rmsnorm/rmsnorm_128x576.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/rmsnorm_feedback_binary_runtime
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_128kb_superlane_vector.json
             --strategy vxm-feedback)
     add_test(
         NAME smollm2_decoder_layer_binary_cmodel_runtime_test

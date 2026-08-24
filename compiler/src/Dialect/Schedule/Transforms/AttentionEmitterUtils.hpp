@@ -66,14 +66,16 @@ void emitMxmWave(mlir::IRRewriter& rewriter, mlir::Location location,
 void emitMxmDequant(mlir::IRRewriter& rewriter,
     mlir::Location location, int64_t cycle, int64_t unitId,
     float scale, int64_t repeatCount = 1,
-    int64_t repeatInterval = 1);
+    int64_t repeatInterval = 1, int64_t scaleBinding = -1);
 
 void emitMxmDequantWave(mlir::IRRewriter& rewriter,
     mlir::Location location, int64_t cycle, int64_t unitId,
     float scale, int64_t repeatCount, int64_t repeatInterval,
-    int64_t waveCount, int64_t waveInterval);
+    int64_t waveCount, int64_t waveInterval,
+    int64_t scaleBinding = -1);
 
 using sxm_detail::blockDiagonalMap;
+using sxm_detail::emitBufferedWavefrontBeat;
 using sxm_detail::emitSxm;
 using sxm_detail::emitWavefrontBeat;
 using sxm_detail::emitWavefrontTail;
@@ -86,6 +88,16 @@ VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef castTarget, int64_t outputStream,
     llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
     int64_t scaleBinding = -1);
+
+VxmOp emitVxmConfigured(mlir::IRRewriter& rewriter,
+    mlir::Location location, mlir::Value value, int64_t cycle,
+    int64_t queue, llvm::StringRef opcode,
+    llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
+    llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
+    llvm::StringRef castTarget, int64_t outputStream,
+    llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
+    int64_t scaleBinding, int64_t chainDepth,
+    int64_t repeatCount, int64_t repeatInterval);
 
 AttentionProjectionKind projectionKind(int64_t index);
 

@@ -8,6 +8,7 @@ llvm::StringRef mxm_execution_policy_name(MxmExecutionPolicy policy)
 {
     switch (policy) {
     case MxmExecutionPolicy::Auto: return "auto";
+    case MxmExecutionPolicy::Vector: return "vector";
     case MxmExecutionPolicy::Legacy: return "legacy";
     case MxmExecutionPolicy::Block8: return "block8";
     }
@@ -18,6 +19,7 @@ mlir::FailureOr<MxmExecutionPolicy> parse_mxm_execution_policy(
     llvm::StringRef value)
 {
     if (value == "auto") return MxmExecutionPolicy::Auto;
+    if (value == "vector") return MxmExecutionPolicy::Vector;
     if (value == "legacy") return MxmExecutionPolicy::Legacy;
     if (value == "block8") return MxmExecutionPolicy::Block8;
     return mlir::failure();
@@ -102,7 +104,8 @@ mlir::FailureOr<MxmExecutionStrategy> plan_mxm_execution_strategy(
         strategy.weight_stream_count =
             throughput.mxm_int8_load_streams_per_cycle;
     }
-    if (policy != MxmExecutionPolicy::Legacy && block8Legal) {
+    if (policy != MxmExecutionPolicy::Vector
+        && policy != MxmExecutionPolicy::Legacy && block8Legal) {
         strategy.compute = MxmComputeStrategy::Block8;
         strategy.activation_stream_count =
             2 * throughput.mxm_block_rows;

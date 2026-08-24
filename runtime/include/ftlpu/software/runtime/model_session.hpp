@@ -30,6 +30,10 @@ struct ModelSessionStats {
     std::size_t weight_page_prefetches{0};
     std::size_t weight_page_prefetch_bytes{0};
     std::size_t weight_page_wait_cycles{0};
+    std::size_t weight_page_initial_wait_cycles{0};
+    std::size_t weight_page_boundary_wait_cycles{0};
+    std::size_t weight_page_hidden_prefetches{0};
+    std::size_t weight_page_deferred_prefetches{0};
 };
 
 class ModelSession {
@@ -61,6 +65,7 @@ private:
     void prepare_weight_pages();
     void ensure_weight_page(std::uint32_t page_index);
     void start_weight_page(std::uint32_t page_index);
+    void observe_weight_page_tick();
 
     CModelRuntime runtime_;
     C2cDmaSystem* c2c_system_{nullptr};
@@ -72,6 +77,7 @@ private:
     SessionMemoryPlan memory_plan_{};
     ModelSessionStats stats_{};
     bool loaded_{false};
+    bool completed_invocation_{false};
     std::unordered_map<std::string, std::vector<std::uint8_t>> values_{};
     std::unordered_map<std::string, DeviceValue> device_values_{};
 };

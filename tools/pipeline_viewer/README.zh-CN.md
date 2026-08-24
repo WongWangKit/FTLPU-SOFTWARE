@@ -12,6 +12,10 @@ start,end,resource,detail
 32,64,"MXM.E0.Compute","Compute buffer=0 act=E0 out=W0"
 ```
 
+分页 binary 还会生成 `C2C.E.Prefetch` 和 `C2C.W.Prefetch` 行。事件区间由
+binary 的页面 readiness 和目标专用 C2C 带宽计算，`detail` 中保留 page、bank、
+binding、bytes、lane 数以及来源标记 `planned=true`。
+
 操作：
 
 - 鼠标滚轮：以指针所在 cycle 为中心缩放。
@@ -20,7 +24,7 @@ start,end,resource,detail
 - Ctrl/Alt + 滚轮：垂直滚动功能单元。
 - 选择 A/B 后单击：放置测量游标。
 - 单击 Overview：快速跳转到对应时间区域。
-- 搜索框和功能单元菜单：筛选资源与指令详情。
+- 搜索框和功能单元菜单：筛选 C2C/MEM/MXM/VXM/SXM 资源与指令详情。
 
 远景下查看器会自动启用 LOD，把每个可见资源行的绘制数量限制在合理范围；
 放大后自动恢复逐 event 绘制。状态栏中的 `LOD` 数字表示当前实际绘制的 event

@@ -26,6 +26,25 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
     const int64_t qkIssueCount = tokenBlocks * headBlocks;
     const int64_t qkWaveComputeCycles =
         (qkIssueCount - 1) * target.mxm_block_issue_interval() + tile;
+    int64_t scoreDrainCycles = target.mxm_first_result_latency();
+    int64_t queryIwReadLead = 0;
+    for (int64_t slice = 0;
+         slice < target.memory().slices_per_hemisphere; ++slice) {
+        const auto latency = target.transport_latency(
+            target::StreamEndpoint::MxmResult,
+            target::StreamEndpoint::Mem,
+            target::StreamDirection::West, slice);
+        if (latency)
+            scoreDrainCycles = std::max(
+                scoreDrainCycles,
+                target.mxm_first_result_latency() + *latency);
+        const auto iwLatency = target.transport_latency(
+            target::StreamEndpoint::Mem,
+            target::StreamEndpoint::MxmWeight,
+            target::StreamDirection::East, slice);
+        if (iwLatency)
+            queryIwReadLead = std::max(queryIwReadLead, *iwLatency);
+    }
     result.qk_iw_to_compute_cycles =
         target.throughput().qk_iw_to_compute_latency;
     const int64_t firstIwOffset =
@@ -41,7 +60,11 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
     if (!supportsWavefront) {
         result.qk_wave_interval = computeEnd - firstIwOffset;
     } else if (target.throughput().mxms_per_hemisphere == 1) {
-        result.qk_wave_interval = qkWaveComputeCycles;
+        // The SRAM is dual-port, but each (slice, bank) still has one ICU
+        // command queue. Drain the final score write before the next wave's
+        // query-IW read can target the same queue.
+        result.qk_wave_interval = qkWaveComputeCycles
+            + tile + scoreDrainCycles + queryIwReadLead;
     } else {
         // A dual-MXM QK wave uses E16..E31 both for MXM1 weights and for
         // activation traffic. The next wave can start loading only after the
@@ -52,11 +75,14 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
             * headBlocks * iwPhasesPerReduction;
         const int64_t streamReuseGap = std::max<int64_t>(0,
             result.qk_iw_to_compute_cycles - localMxmPreloadOffset);
-        result.qk_wave_interval = qkWaveComputeCycles + streamReuseGap;
+        result.qk_wave_interval = qkWaveComputeCycles
+            + std::max(streamReuseGap,
+                tile + scoreDrainCycles + queryIwReadLead);
     }
     result.qk_wave_duration = computeEnd
         + std::max(target.throughput().mxm0_accumulator_latency,
-            target.throughput().mxm1_accumulator_latency);
+            target.throughput().mxm1_accumulator_latency)
+        + tile + scoreDrainCycles;
 
     result.task_ids.projection =
         AttentionProjectionStagePlanner().append(result.tasks, shape, target);

@@ -47,6 +47,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/compiled_queue_program_runtime_test.cpp
     tests/runtime/compiled_rmsnorm_runtime_test.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
+    tests/runtime/compiled_qwen_real_ffn_runtime_test.cpp
     tests/runtime/compiled_smollm2_lm_head_runtime_test.cpp
     tests/runtime/compiled_smollm2_attention_runtime_test.cpp
     tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp
@@ -103,6 +104,13 @@ target_link_libraries(ftlpu_software
 
 add_executable(ftlpu_binary_inspect examples/binary_inspect.cpp)
 target_link_libraries(ftlpu_binary_inspect PRIVATE ftlpu_software)
+
+add_executable(schedule_trace_weight_page_test
+    tests/runtime/schedule_trace_weight_page_test.cpp)
+target_link_libraries(schedule_trace_weight_page_test PRIVATE ftlpu_software)
+add_test(
+    NAME schedule_trace_weight_page_test
+    COMMAND $<TARGET_FILE:schedule_trace_weight_page_test>)
 
 add_executable(ftlpu_pack_model_weights
     examples/pack_model_weights.cpp)
@@ -180,6 +188,11 @@ add_test(
     NAME c2c_weight_ping_pong_test
     COMMAND $<TARGET_FILE:c2c_weight_ping_pong_test>)
 
+add_executable(c2c_weight_page_package_roundtrip_test
+    tests/runtime/c2c_weight_page_package_roundtrip_test.cpp)
+target_link_libraries(c2c_weight_page_package_roundtrip_test
+    PRIVATE ftlpu_software)
+
 add_executable(weight_page_planner_test
     tests/runtime/weight_page_planner_test.cpp)
 target_link_libraries(weight_page_planner_test PRIVATE ftlpu_software)
@@ -241,6 +254,34 @@ add_executable(compiled_smollm2_135m_ffn_runtime_test
 
 target_link_libraries(compiled_smollm2_135m_ffn_runtime_test PRIVATE ftlpu_software)
 
+add_executable(compiled_qwen2_5_1_5b_ffn_seq32_runtime_test
+    tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
+target_compile_definitions(compiled_qwen2_5_1_5b_ffn_seq32_runtime_test
+    PRIVATE
+    FTLPU_TEST_SEQUENCE_LENGTH=32
+    FTLPU_TEST_HIDDEN_SIZE=1536
+    FTLPU_TEST_INTERMEDIATE_SIZE=8960
+    FTLPU_TEST_MODEL_NAME="Qwen2.5-1.5B-seq32")
+target_link_libraries(compiled_qwen2_5_1_5b_ffn_seq32_runtime_test
+    PRIVATE ftlpu_software)
+
+add_executable(compiled_qwen_real_ffn_runtime_test
+    tests/runtime/compiled_qwen_real_ffn_runtime_test.cpp)
+target_link_libraries(compiled_qwen_real_ffn_runtime_test
+    PRIVATE ftlpu_software)
+
+add_executable(compiled_block8_ffn_wave_boundary_fast_runtime_test
+    tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
+target_compile_definitions(compiled_block8_ffn_wave_boundary_fast_runtime_test
+    PRIVATE
+    FTLPU_TEST_SEQUENCE_LENGTH=32
+    FTLPU_TEST_HIDDEN_SIZE=1536
+    FTLPU_TEST_INTERMEDIATE_SIZE=3200
+    FTLPU_TEST_OUTPUT_SIZE=640
+    FTLPU_TEST_MODEL_NAME="Block8-wave-boundary-fast")
+target_link_libraries(compiled_block8_ffn_wave_boundary_fast_runtime_test
+    PRIVATE ftlpu_software)
+
 add_executable(compiled_smollm2_lm_head_runtime_test
     tests/runtime/compiled_smollm2_lm_head_runtime_test.cpp)
 
@@ -263,6 +304,39 @@ add_executable(compiled_smollm2_decoder_layer_runtime_test
     tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
 
 target_link_libraries(compiled_smollm2_decoder_layer_runtime_test
+    PRIVATE ftlpu_software)
+
+add_executable(compiled_qwen2_5_1_5b_decoder_layer_runtime_test
+    tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
+target_compile_definitions(
+    compiled_qwen2_5_1_5b_decoder_layer_runtime_test PRIVATE
+    FTLPU_TEST_SEQUENCE_LENGTH=128
+    FTLPU_TEST_HIDDEN_SIZE=1536
+    FTLPU_TEST_INTERMEDIATE_SIZE=8960
+    FTLPU_TEST_QUERY_HEADS=12
+    FTLPU_TEST_KV_HEADS=2
+    FTLPU_TEST_HEAD_DIM=128
+    FTLPU_TEST_RMS_EPSILON=1.0e-6f
+    FTLPU_TEST_ROPE_THETA=1000000.0f
+    FTLPU_TEST_MODEL_NAME=\"Qwen2.5-1.5B\")
+target_link_libraries(compiled_qwen2_5_1_5b_decoder_layer_runtime_test
+    PRIVATE ftlpu_software)
+
+add_executable(compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test
+    tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
+target_compile_definitions(
+    compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test PRIVATE
+    FTLPU_TEST_SEQUENCE_LENGTH=32
+    FTLPU_TEST_HIDDEN_SIZE=1536
+    FTLPU_TEST_INTERMEDIATE_SIZE=8960
+    FTLPU_TEST_QUERY_HEADS=12
+    FTLPU_TEST_KV_HEADS=2
+    FTLPU_TEST_HEAD_DIM=128
+    FTLPU_TEST_RMS_EPSILON=1.0e-6f
+    FTLPU_TEST_ROPE_THETA=1000000.0f
+    FTLPU_TEST_MODEL_NAME="Qwen2.5-1.5B-seq32")
+target_link_libraries(
+    compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test
     PRIVATE ftlpu_software)
 
 add_executable(hf_decoder_layer_model_session_test

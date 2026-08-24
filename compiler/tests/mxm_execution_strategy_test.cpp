@@ -25,6 +25,16 @@ try {
         "BF16 W8A16 should select MXM-local dequant");
     require(block8->uses_block8(),
         "aligned BF16 W8A16 should select Block8");
+    if (block8->weight_stream_count != 8
+        || block8->activation_stream_count != 16
+        || block8->rows_per_compute_issue != 8) {
+        std::cerr << "Block8 geometry: weight_streams="
+                  << block8->weight_stream_count
+                  << ", activation_streams="
+                  << block8->activation_stream_count
+                  << ", rows_per_issue="
+                  << block8->rows_per_compute_issue << '\n';
+    }
     require(block8->weight_stream_count == 8
             && block8->activation_stream_count == 16
             && block8->rows_per_compute_issue == 8,
@@ -67,6 +77,15 @@ try {
             && forcedLegacy->uses_local_dequant()
             && !forcedLegacy->uses_block8(),
         "legacy policy must select local-dequant Vector compute");
+
+    auto forcedVector = plan_mxm_execution_strategy(
+        {32, 64, 64, true, true, true, true}, target,
+        MxmExecutionPolicy::Vector);
+    require(mlir::succeeded(forcedVector)
+            && forcedVector->uses_local_dequant()
+            && !forcedVector->uses_block8()
+            && forcedVector->compute_mode() == "vector",
+        "vector policy must select local-dequant Vector compute");
 
     auto forcedBlock8 = plan_mxm_execution_strategy(
         {32, 64, 64, true, true, true, true}, target,

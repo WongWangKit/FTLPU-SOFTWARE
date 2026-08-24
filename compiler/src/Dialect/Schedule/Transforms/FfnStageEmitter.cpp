@@ -5,18 +5,28 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
+#include <cassert>
 
 namespace ftlpu::compiler::schedule::ffn_detail {
 
 int64_t FfnEmissionContext::westLatency(int64_t slice) const
 {
-    return slice / target.streams().mem_slices_per_register_group + 2;
+    const auto latency = target.transport_latency(
+        target::StreamEndpoint::Mem,
+        target::StreamEndpoint::VxmInput,
+        target::StreamDirection::West, slice);
+    assert(latency && "validated FFN slice must have a MEM-to-VXM route");
+    return *latency;
 }
 
 int64_t FfnEmissionContext::eastMxmLatency(int64_t slice) const
 {
-    return target.streams().system_register_columns
-        - slice / target.streams().mem_slices_per_register_group;
+    const auto latency = target.transport_latency(
+        target::StreamEndpoint::Mem,
+        target::StreamEndpoint::MxmWeight,
+        target::StreamDirection::East, slice);
+    assert(latency && "validated FFN slice must have a MEM-to-MXM route");
+    return *latency;
 }
 
 llvm::StringRef FfnEmissionContext::hemisphereName(
@@ -31,8 +41,13 @@ schedule::MemReadOp FfnEmissionContext::emitSliceRead(
     int64_t stream, llvm::StringRef direction, llvm::StringRef role,
     llvm::StringRef hemisphere)
 {
+    int64_t bank = route.getPlacement()
+        .getAs<mlir::IntegerAttr>("bank").getInt();
+    if (auto write = value.getDefiningOp<schedule::MemWriteOp>())
+        bank = write.getPlacement()
+            .getAs<mlir::IntegerAttr>("bank").getInt();
     auto placement = schedule_placement(rewriter, {slice}, base, count,
-        stride, hemisphere, "schedule_slice");
+        stride, hemisphere, "schedule_slice", bank);
     mlir::NamedAttrList placementAttrs(placement);
     placementAttrs.set("binding_placement", route.getPlacement());
     return rewriter.create<schedule::MemReadOp>(ffn.getLoc(), value,
@@ -96,6 +111,18 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     const bool activationDistributed16 = activationKind
         && activationKind.getValue() == "fp16_mxm_distributed_16";
     auto hiddenSlices = get_slices(ffn.getHidden0Placement());
+    const auto hiddenKind =
+        ffn.getHidden0Placement().getAs<mlir::StringAttr>("kind");
+    const bool hiddenDistributed16 = hiddenKind
+        && hiddenKind.getValue() == "fp16_mxm_distributed_16";
+    const auto pagedWeightsAttr = gateRaw.getPlacement()
+        .getAs<mlir::BoolAttr>("paged_weight");
+    const bool pagedWeights = pagedWeightsAttr && pagedWeightsAttr.getValue();
+    const auto& memory = target.memory();
+    const int64_t hiddenBank = ffn.getHidden0Placement()
+        .getAs<mlir::IntegerAttr>("bank").getInt();
+    const int64_t tempBank = pagedWeights && memory.banks_per_slice > 1
+        ? (hiddenBank + 1) % memory.banks_per_slice : hiddenBank;
     auto resultSlices = get_slices(ffn.getResultPlacement());
     auto executionPolicy =
         target::mxm_execution_policy_from_operation(
@@ -118,7 +145,6 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         return mlir::failure();
     }
     const bool block8Ffn = execution->uses_block8();
-    const auto& memory = target.memory();
     const auto& throughput = target.throughput();
     // The legacy path does not model passive stream-fabric transport
     // lifetimes precisely enough to prove a fused route. Keep its requested
@@ -146,7 +172,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
                     : memory.w8a16_weight_slice_count)
         || hiddenSlices.size()
             != static_cast<std::size_t>(
-                block8Ffn ? 16
+                (block8Ffn || hiddenDistributed16) ? 16
                            : throughput.mxm_activation_streams)
         || resultSlices.size()
             != static_cast<std::size_t>(
@@ -156,16 +182,6 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         ffn.getOperation()->emitError(
             "FFN physical slices do not match the selected MXM strategy");
         return mlir::failure();
-    }
-
-    llvm::SmallVector<int64_t> gateAccumulatorSlices;
-    llvm::SmallVector<int64_t> upAccumulatorSlices;
-    for (int64_t index = 0;
-         index < memory.accumulator_slices_per_mxm; ++index) {
-        gateAccumulatorSlices.push_back(
-            memory.accumulator_slice_base + index);
-        upAccumulatorSlices.push_back(memory.accumulator_slice_base
-            + memory.accumulator_slices_per_mxm + index);
     }
 
     auto activationLatency = target.transport_latency(
@@ -178,7 +194,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
             static_cast<int64_t>(ffn.getHidden()),
             static_cast<int64_t>(ffn.getN())},
         weightSlices, target, execution->uses_local_dequant(),
-        !block8Ffn);
+        !block8Ffn && throughput.mxms_per_hemisphere != 1);
     if (!activationLatency || mlir::failed(projectionTimeline)) {
         ffn.getOperation()->emitError(
             "cannot plan FFN activation transport or projection timeline");
@@ -232,8 +248,6 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         std::move(activationSlices),
         std::move(hiddenSlices),
         std::move(resultSlices),
-        std::move(gateAccumulatorSlices),
-        std::move(upAccumulatorSlices),
         std::move(*projectionTimeline),
         projectionType,
         *activationLatency,
@@ -242,6 +256,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         execution->uses_local_dequant(),
         block8Ffn,
         block8Ffn,
+        tempBank,
         fusedOutput,
     });
 }

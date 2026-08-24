@@ -1,6 +1,8 @@
 "use strict";
 
 const SAMPLE_CSV = `start,end,resource,detail
+-16,0,"C2C.E.Prefetch","page=0 bank=0 bindings=gate+up bytes=4096 lanes=8 bandwidth=256B/cycle planned=true"
+-16,0,"C2C.W.Prefetch","page=0 bank=0 bindings=gate+up bytes=4096 lanes=8 bandwidth=256B/cycle planned=true"
 0,24,"MEM.E.Read","slice=0 addr=0 stream=E0 count=24 interval=1 stride=1"
 8,12,"VXM.ALU0","multiply"
 12,16,"VXM.ALU8","cast -> E8"
@@ -23,6 +25,7 @@ const SAMPLE_CSV = `start,end,resource,detail
 296,320,"MEM.W.Write","slice=41 addr=96 stream=W1 count=24 interval=1 stride=1"`;
 
 const palette = {
+  "C2C.Prefetch": "#d58a35",
   "MEM.Read": "#62a982",
   "MEM.Write": "#e0ae4f",
   "MEM.ReadWrite": "#b78c48",
@@ -176,7 +179,7 @@ function resourceFamily(resource) {
 
 function resourceOrder(resource) {
   const family = resourceFamily(resource);
-  const familyRank = { MEM: 0, MXM: 1, VXM: 2, SXM: 3 };
+  const familyRank = { C2C: 0, MEM: 1, MXM: 2, VXM: 3, SXM: 4 };
   const side = resource.includes(".E") ? 0 : resource.includes(".W") ? 1 : 2;
   const number = Number((resource.match(/(?:ALU|MXM)?(\d+)/) || [0, 0])[1]);
   const operation = resource.endsWith("Read") || resource.endsWith("Load")
@@ -197,6 +200,7 @@ function compareTuple(a, b) {
 
 function eventColor(event) {
   const family = resourceFamily(event.resource);
+  if (family === "C2C") return palette["C2C.Prefetch"];
   if (family === "MEM") {
     const operation = event.resource.split(".").at(-1);
     return palette[`MEM.${operation}`] || palette.other;
@@ -236,7 +240,9 @@ function setTrace(events, fileName) {
   applyFilters();
   fitAll();
   dom.fileName.textContent = fileName;
-  dom.traceSummary.textContent = `${events.length.toLocaleString()} events · ${state.fullEnd.toLocaleString()} cycles`;
+  const fullSpan = Math.ceil(state.fullEnd - state.fullStart);
+  dom.traceSummary.textContent =
+    `${events.length.toLocaleString()} events · ${fullSpan.toLocaleString()} cycles`;
   dom.interactionState.textContent = "Loaded";
 }
 

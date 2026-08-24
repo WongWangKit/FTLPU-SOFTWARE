@@ -115,8 +115,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_MEMORY(sram_depth_rows);
     READ_MEMORY(sram_read_ports_per_slice);
     READ_MEMORY(sram_write_ports_per_slice);
-    READ_MEMORY(accumulator_slice_base);
-    READ_MEMORY(accumulator_slices_per_mxm);
+    READ_MEMORY(dedicated_slice_roles);
     READ_MEMORY(w8a16_weight_slice_count);
     READ_MEMORY(w8a16_weight_slice_base);
     READ_MEMORY(w8a16_weight_slice_stride);
@@ -125,7 +124,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_MEMORY(w8a16_hidden_base_row);
     READ_MEMORY(attention_mask_base_row);
     READ_MEMORY(w8a16_result_slice_base);
-    READ_MEMORY(accumulator_scratch_base_row);
+    READ_MEMORY(matmul_result_base_row);
 #undef READ_MEMORY
     read_json_array(memory, "w8a16_fused_gate_temp_slices",
         model.memory_.w8a16_fused_gate_temp_slices);
@@ -138,6 +137,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     read_json_integer(streams, #field, &StreamTopology::field, model.streams_)
     READ_STREAM(streams_per_direction);
     READ_STREAM(encoded_streams);
+    READ_STREAM(c2c_streams_per_direction);
+    READ_STREAM(c2c_bytes_per_stream_per_cycle);
     READ_STREAM(mem_boundary_register_columns);
     READ_STREAM(system_register_columns);
     READ_STREAM(mem_slices_per_register_group);
@@ -226,8 +227,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_MEMORY(sram_depth_rows);
     READ_MEMORY(sram_read_ports_per_slice);
     READ_MEMORY(sram_write_ports_per_slice);
-    READ_MEMORY(accumulator_slice_base);
-    READ_MEMORY(accumulator_slices_per_mxm);
+    READ_MEMORY(dedicated_slice_roles);
     READ_MEMORY(w8a16_weight_slice_count);
     READ_MEMORY(w8a16_weight_slice_base);
     READ_MEMORY(w8a16_weight_slice_stride);
@@ -236,7 +236,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_MEMORY(w8a16_hidden_base_row);
     READ_MEMORY(attention_mask_base_row);
     READ_MEMORY(w8a16_result_slice_base);
-    READ_MEMORY(accumulator_scratch_base_row);
+    READ_MEMORY(matmul_result_base_row);
 #undef READ_MEMORY
     read_attr_array(memory, "w8a16_fused_gate_temp_slices",
         model.memory_.w8a16_fused_gate_temp_slices);
@@ -248,6 +248,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     read_attr_integer(streams, #field, &StreamTopology::field, model.streams_)
     READ_STREAM(streams_per_direction);
     READ_STREAM(encoded_streams);
+    READ_STREAM(c2c_streams_per_direction);
+    READ_STREAM(c2c_bytes_per_stream_per_cycle);
     READ_STREAM(mem_boundary_register_columns);
     READ_STREAM(system_register_columns);
     READ_STREAM(mem_slices_per_register_group);
@@ -330,8 +332,7 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(memory_, sram_depth_rows),
         I64(memory_, sram_read_ports_per_slice),
         I64(memory_, sram_write_ports_per_slice),
-        I64(memory_, accumulator_slice_base),
-        I64(memory_, accumulator_slices_per_mxm),
+        I64(memory_, dedicated_slice_roles),
         I64(memory_, w8a16_weight_slice_count),
         I64(memory_, w8a16_weight_slice_base),
         I64(memory_, w8a16_weight_slice_stride),
@@ -340,7 +341,7 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(memory_, w8a16_hidden_base_row),
         I64(memory_, attention_mask_base_row),
         I64(memory_, w8a16_result_slice_base),
-        I64(memory_, accumulator_scratch_base_row),
+        I64(memory_, matmul_result_base_row),
         builder.getNamedAttr("w8a16_fused_gate_temp_slices",
             make_i64_array(builder, memory_.w8a16_fused_gate_temp_slices)),
         builder.getNamedAttr("w8a16_fused_up_temp_slices",
@@ -352,6 +353,8 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
     const auto streams = builder.getDictionaryAttr({
         I64(streams_, streams_per_direction),
         I64(streams_, encoded_streams),
+        I64(streams_, c2c_streams_per_direction),
+        I64(streams_, c2c_bytes_per_stream_per_cycle),
         I64(streams_, mem_boundary_register_columns),
         I64(streams_, system_register_columns),
         I64(streams_, mem_slices_per_register_group),
@@ -417,7 +420,9 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             memory_.sram_read_ports_per_slice,
             memory_.sram_write_ports_per_slice,
             streams_.streams_per_direction,
-            streams_.encoded_streams, streams_.mem_slices_per_register_group,
+            streams_.encoded_streams, streams_.c2c_streams_per_direction,
+            streams_.c2c_bytes_per_stream_per_cycle,
+            streams_.mem_slices_per_register_group,
             throughput_.tile_rows, throughput_.lanes_per_tile,
             throughput_.mxm_rows, throughput_.mxm_columns,
             throughput_.mxm_load_streams_per_cycle,
@@ -446,11 +451,14 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
     if (streams_.encoded_streams
         < 2 * streams_.streams_per_direction)
         return fail("encoded_streams must cover east and west stream ranges");
+    if (streams_.c2c_bytes_per_stream_per_cycle != memory_.bytes_per_word)
+        return fail(
+            "a dedicated C2C lane must carry one complete SRAM row per cycle");
     if (streams_.system_register_columns
         < streams_.mem_boundary_register_columns)
         return fail("system register columns must cover MEM boundary columns");
     if (throughput_.mem_to_sxm_latency
-            != streams_.system_register_columns - 1
+            != streams_.system_register_columns - 2
         || throughput_.mem_to_mxm_latency
             != streams_.system_register_columns)
         return fail("MEM transport latencies must match the stream-register topology");
@@ -470,8 +478,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
     const auto valid_slice = [&](int64_t slice) {
         return slice >= 0 && slice < memory_.slices_per_hemisphere;
     };
-    if (!valid_slice(memory_.accumulator_slice_base)
-        || !valid_slice(memory_.w8a16_activation_slice_base)
+    if (!valid_slice(memory_.w8a16_activation_slice_base)
         || !valid_slice(memory_.w8a16_hidden_slice_base)
         || !valid_slice(memory_.w8a16_result_slice_base))
         return fail("configured MEM slice base is outside a hemisphere");
@@ -486,6 +493,10 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             + (memory_.w8a16_weight_slice_count - 1)
                 * memory_.w8a16_weight_slice_stride))
         return fail("configured W8A16 weight slices are outside a hemisphere");
+    if (uses_dedicated_slice_roles()
+        && activation_storage_slices().size() < 16)
+        return fail(
+            "dedicated activation storage requires at least 16 MEM slices for the SXM plane");
     for (int64_t slice : memory_.w8a16_fused_gate_temp_slices)
         if (!valid_slice(slice)) return fail("gate temporary slice is invalid");
     for (int64_t slice : memory_.w8a16_fused_up_temp_slices)
@@ -500,16 +511,18 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
     for (int64_t slice : memory_.w8a16_fused_up_temp_slices)
         if (!fusedTempSlices.insert(slice).second)
             return fail("fused temporary slices must be unique");
-    const auto distributedActivationSlices =
-        mxm_distributed_activation_slices();
-    for (int64_t slice : distributedActivationSlices)
-        if (fusedTempSlices.contains(slice))
-            return fail(
-                "fused temporary slices overlap distributed MXM activation");
-    for (int64_t slice : attention_activation_slices())
-        if (fusedTempSlices.contains(slice))
-            return fail(
-                "fused temporary slices overlap planar MXM activation");
+    if (supports_mxm_block8_compute()) {
+        const auto distributedActivationSlices =
+            mxm_distributed_activation_slices();
+        for (int64_t slice : distributedActivationSlices)
+            if (fusedTempSlices.contains(slice))
+                return fail(
+                    "fused temporary slices overlap distributed MXM activation");
+        for (int64_t slice : attention_activation_slices())
+            if (fusedTempSlices.contains(slice))
+                return fail(
+                    "fused temporary slices overlap planar MXM activation");
+    }
     if (ffn_hidden_slices().size()
         != static_cast<std::size_t>(throughput_.mxm_activation_streams))
         return fail("not enough independent MEM slices for fused hidden data");
@@ -543,7 +556,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
 std::uint64_t LPUTargetModel::abi_fingerprint() const
 {
     software::runtime::TargetAbiHasher hash;
-    hash.add(13);
+    hash.add(14);
 #define HASH(field) hash.add(memory_.field)
     HASH(hemispheres);
     HASH(slices_per_hemisphere);
@@ -557,6 +570,8 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
 #define HASH(field) hash.add(streams_.field)
     HASH(streams_per_direction);
     HASH(encoded_streams);
+    HASH(c2c_streams_per_direction);
+    HASH(c2c_bytes_per_stream_per_cycle);
     HASH(mem_boundary_register_columns);
     HASH(system_register_columns);
     HASH(mem_slices_per_register_group);
@@ -601,8 +616,6 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
 bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destination,
     StreamDirection direction) const
 {
-    const bool mxm_input = destination == StreamEndpoint::MxmActivation
-        || destination == StreamEndpoint::MxmWeight;
     if (source == StreamEndpoint::Mem
         && destination == StreamEndpoint::MxmActivation)
         return direction == StreamDirection::East;
@@ -757,9 +770,52 @@ int64_t LPUTargetModel::mxm_block_issue_interval() const
     return throughput_.mxm_rows;
 }
 
+llvm::SmallVector<int64_t> LPUTargetModel::weight_storage_slices() const
+{
+    llvm::SmallVector<int64_t> slices;
+    if (!uses_dedicated_slice_roles()) {
+        for (int64_t slice = 0;
+             slice < memory_.slices_per_hemisphere; ++slice)
+            slices.push_back(slice);
+        return slices;
+    }
+    for (int64_t slice = memory_.w8a16_weight_slice_base;
+         slice < memory_.slices_per_hemisphere; ++slice)
+        slices.push_back(slice);
+    return slices;
+}
+
+llvm::SmallVector<int64_t> LPUTargetModel::activation_storage_slices() const
+{
+    llvm::SmallVector<int64_t> slices;
+    if (!uses_dedicated_slice_roles()) {
+        for (int64_t slice = 0;
+             slice < memory_.slices_per_hemisphere; ++slice)
+            slices.push_back(slice);
+        return slices;
+    }
+    for (int64_t slice = 0;
+         slice < memory_.w8a16_weight_slice_base; ++slice)
+        slices.push_back(slice);
+    return slices;
+}
+
+bool LPUTargetModel::is_weight_storage_slice(int64_t slice) const
+{
+    return llvm::is_contained(weight_storage_slices(), slice);
+}
+
+bool LPUTargetModel::is_activation_storage_slice(int64_t slice) const
+{
+    return llvm::is_contained(activation_storage_slices(), slice);
+}
+
 const std::array<int64_t, 16>& LPUTargetModel::attention_query_iw_slices(
     int64_t reduction_block) const
 {
+    static constexpr std::array<int64_t, 16> kDedicatedSlices {{
+        0, 1, 2, 3, 4, 5, 6, 7,
+        8, 9, 10, 11, 12, 13, 14, 15}};
     static constexpr std::array<std::array<int64_t, 16>, 2> kSingleMxmSlices {{
         {{0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33}},
         {{18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35}},
@@ -770,6 +826,11 @@ const std::array<int64_t, 16>& LPUTargetModel::attention_query_iw_slices(
         {{18, 19, 20, 21, 22, 23, 24, 25,
             26, 27, 28, 29, 30, 31, 34, 35}},
     }};
+    if (uses_dedicated_slice_roles()) {
+        if (reduction_block < 0)
+            throw std::out_of_range("attention query IW reduction block");
+        return kDedicatedSlices;
+    }
     const auto& slices = throughput_.mxms_per_hemisphere == 1
         ? kSingleMxmSlices : kDualMxmSlices;
     if (reduction_block < 0)
@@ -806,6 +867,11 @@ LPUTargetModel::attention_output_weight_slices() const
 llvm::SmallVector<int64_t>
 LPUTargetModel::attention_activation_slices() const
 {
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        return llvm::SmallVector<int64_t>(storage.begin(),
+            storage.begin() + throughput_.mxm_activation_streams);
+    }
     llvm::SmallVector<int64_t> slices;
     for (int64_t index = 0; index < throughput_.mxm_activation_streams; ++index)
         slices.push_back(memory_.w8a16_activation_slice_base + index);
@@ -815,6 +881,11 @@ LPUTargetModel::attention_activation_slices() const
 llvm::SmallVector<int64_t>
 LPUTargetModel::mxm_distributed_activation_slices() const
 {
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        return llvm::SmallVector<int64_t>(
+            storage.begin(), storage.begin() + 16);
+    }
     llvm::SmallDenseSet<int64_t, 16> reserved;
     for (int64_t slice : attention_weight_slices())
         reserved.insert(slice);
@@ -840,6 +911,8 @@ LPUTargetModel::mxm_distributed_activation_slices() const
 llvm::SmallVector<int64_t>
 LPUTargetModel::ffn_block8_input_slices() const
 {
+    if (uses_dedicated_slice_roles())
+        return mxm_distributed_activation_slices();
     const auto hiddenSlices = mxm_distributed_activation_slices();
     llvm::SmallDenseSet<int64_t, 32> reserved(
         hiddenSlices.begin(), hiddenSlices.end());
@@ -873,12 +946,12 @@ LPUTargetModel::ffn_projection_weight_slices(
     for (int64_t slice : memory_.w8a16_fused_up_temp_slices)
         reserved.insert(slice);
     llvm::SmallVector<int64_t> slices;
-    for (int64_t slice = 0;
-         slice < memory_.slices_per_hemisphere
-         && slices.size()
-             < static_cast<std::size_t>(
-                 memory_.w8a16_weight_slice_count);
-         ++slice) {
+    const auto candidates = weight_storage_slices();
+    for (int64_t slice : candidates) {
+        if (slices.size()
+            >= static_cast<std::size_t>(
+                memory_.w8a16_weight_slice_count))
+            break;
         if (!reserved.contains(slice)) slices.push_back(slice);
     }
     return slices;
@@ -886,6 +959,11 @@ LPUTargetModel::ffn_projection_weight_slices(
 
 llvm::SmallVector<int64_t> LPUTargetModel::ffn_hidden_slices() const
 {
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        return llvm::SmallVector<int64_t>(storage.begin(),
+            storage.begin() + throughput_.mxm_activation_streams);
+    }
     llvm::SmallDenseSet<int64_t, 32> reserved;
     for (int64_t slice : attention_weight_slices())
         reserved.insert(slice);
@@ -920,14 +998,75 @@ llvm::SmallVector<int64_t> LPUTargetModel::ffn_hidden_slices() const
 llvm::SmallVector<int64_t>
 LPUTargetModel::attention_projection_output_slices() const
 {
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        return llvm::SmallVector<int64_t>(storage.begin(),
+            storage.begin() + throughput_.mxm_result_streams);
+    }
     llvm::SmallVector<int64_t> slices;
     for (int64_t index = 0; index < throughput_.mxm_result_streams; ++index)
         slices.push_back(index);
     return slices;
 }
 
+llvm::SmallVector<int64_t> LPUTargetModel::ffn_gate_temp_slices() const
+{
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        return llvm::SmallVector<int64_t>(storage.begin(),
+            storage.begin() + std::min<std::size_t>(8, storage.size()));
+    }
+    return llvm::SmallVector<int64_t>(
+        memory_.w8a16_fused_gate_temp_slices.begin(),
+        memory_.w8a16_fused_gate_temp_slices.end());
+}
+
+llvm::SmallVector<int64_t> LPUTargetModel::ffn_up_temp_slices() const
+{
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        const std::size_t begin = std::min<std::size_t>(8, storage.size());
+        const std::size_t end = std::min<std::size_t>(16, storage.size());
+        return llvm::SmallVector<int64_t>(
+            storage.begin() + begin, storage.begin() + end);
+    }
+    return llvm::SmallVector<int64_t>(
+        memory_.w8a16_fused_up_temp_slices.begin(),
+        memory_.w8a16_fused_up_temp_slices.end());
+}
+
+llvm::SmallVector<int64_t>
+LPUTargetModel::attention_block8_result_slices(
+    bool page_resident_weights) const
+{
+    if (uses_dedicated_slice_roles())
+        return mxm_distributed_activation_slices();
+    const auto activation = attention_output_activation_slices(
+        page_resident_weights);
+    llvm::SmallDenseSet<int64_t, 32> reserved(
+        activation.begin(), activation.end());
+    if (page_resident_weights)
+        for (int64_t slice : page_resident_attention_weight_slices(true))
+            reserved.insert(slice);
+    llvm::SmallVector<int64_t> slices;
+    for (int64_t slice = 0;
+         slice < memory_.slices_per_hemisphere
+         && slices.size() < 16; ++slice)
+        if (!reserved.contains(slice)) slices.push_back(slice);
+    if (slices.size() != 16)
+        throw std::logic_error(
+            "target cannot allocate an O-projection result plane disjoint from its activation plane");
+    return slices;
+}
+
 llvm::SmallVector<int64_t> LPUTargetModel::attention_qk_key_slices() const
 {
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        const auto begin = storage.begin() + throughput_.mxm_result_streams;
+        return llvm::SmallVector<int64_t>(
+            begin, begin + throughput_.mxm_result_streams);
+    }
     llvm::SmallDenseSet<int64_t, 32> queryIwSlices;
     for (int64_t reduction = 0; reduction < 2; ++reduction) {
         const auto& slices = attention_query_iw_slices(reduction);
@@ -954,6 +1093,12 @@ llvm::SmallVector<int64_t> LPUTargetModel::attention_qk_key_slices() const
 llvm::SmallVector<int64_t> LPUTargetModel::attention_value_slices() const
 {
     llvm::SmallVector<int64_t> slices;
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        slices.append(storage.begin(), storage.begin() + 16);
+        slices.append(storage.begin(), storage.begin() + 16);
+        return slices;
+    }
     if (throughput_.mxms_per_hemisphere == 1) {
         const auto& shared = attention_query_iw_slices(1);
         slices.append(shared.begin(), shared.end());
@@ -966,7 +1111,7 @@ llvm::SmallVector<int64_t> LPUTargetModel::attention_value_slices() const
                 12, 13, 14, 15, 16, 17, 32, 33}},
             {{18, 19, 20, 21, 22, 23, 24, 25,
                 26, 27, 28, 29, 30, 31, 34, 35}},
-        }};
+    }};
     for (const auto& blockSlices : kDualMxmValueSlices)
         slices.append(blockSlices.begin(), blockSlices.end());
     return slices;
@@ -984,13 +1129,14 @@ LPUTargetModel::page_resident_attention_weight_slices(bool block8) const
         reserved.insert(slice);
 
     llvm::SmallVector<int64_t> slices;
-    for (int64_t slice = 0;
-         slice < memory_.slices_per_hemisphere
-         && slices.size()
-             < static_cast<std::size_t>(
-                 memory_.w8a16_weight_slice_count);
-         ++slice)
+    const auto candidates = weight_storage_slices();
+    for (int64_t slice : candidates) {
+        if (slices.size()
+            >= static_cast<std::size_t>(
+                memory_.w8a16_weight_slice_count))
+            break;
         if (!reserved.contains(slice)) slices.push_back(slice);
+    }
     if (slices.size()
         != static_cast<std::size_t>(memory_.w8a16_weight_slice_count))
         throw std::logic_error(
@@ -1010,9 +1156,9 @@ LPUTargetModel::ffn_down_projection_weight_slices(bool block8) const
     const int64_t count = memory_.w8a16_weight_slice_count
         * (block8 ? throughput_.mxms_per_hemisphere : 1);
     llvm::SmallVector<int64_t> slices;
-    for (int64_t slice = 0;
-         slice < memory_.slices_per_hemisphere
-         && static_cast<int64_t>(slices.size()) < count; ++slice) {
+    const auto candidates = weight_storage_slices();
+    for (int64_t slice : candidates) {
+        if (static_cast<int64_t>(slices.size()) >= count) break;
         if (!reserved.contains(slice)) slices.push_back(slice);
     }
     if (static_cast<int64_t>(slices.size()) != count)
@@ -1021,8 +1167,35 @@ LPUTargetModel::ffn_down_projection_weight_slices(bool block8) const
     return slices;
 }
 
+llvm::SmallVector<int64_t>
+LPUTargetModel::ffn_block8_result_slices() const
+{
+    if (uses_dedicated_slice_roles())
+        return mxm_distributed_activation_slices();
+    llvm::SmallDenseSet<int64_t, 64> reserved;
+    const auto reserve = [&](llvm::ArrayRef<int64_t> slices) {
+        reserved.insert(slices.begin(), slices.end());
+    };
+    reserve(mxm_distributed_activation_slices());
+    reserve(attention_output_activation_slices(true));
+
+    llvm::SmallVector<int64_t> slices;
+    for (int64_t slice = 0;
+         slice < memory_.slices_per_hemisphere
+         && slices.size() < 16; ++slice)
+        if (!reserved.contains(slice)) slices.push_back(slice);
+    if (slices.size() != 16)
+        throw std::logic_error(
+            "target cannot allocate an FFN result plane disjoint from hidden and residual planes");
+    return slices;
+}
+
 llvm::SmallVector<int64_t> LPUTargetModel::attention_rope_slices() const
 {
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        return llvm::SmallVector<int64_t>(storage.end() - 4, storage.end());
+    }
     const auto result = attention_result_slices();
     return {memory_.w8a16_output_weight_spare_slices[0],
         memory_.w8a16_output_weight_spare_slices[1],
@@ -1032,6 +1205,8 @@ llvm::SmallVector<int64_t> LPUTargetModel::attention_rope_slices() const
 llvm::SmallVector<int64_t>
 LPUTargetModel::attention_rope_staging_slices() const
 {
+    if (uses_dedicated_slice_roles())
+        return mxm_distributed_activation_slices();
     llvm::SmallDenseSet<int64_t, 64> reserved;
     const auto reserve = [&](llvm::ArrayRef<int64_t> slices) {
         reserved.insert(slices.begin(), slices.end());
@@ -1061,6 +1236,10 @@ LPUTargetModel::attention_rope_staging_slices() const
 
 llvm::SmallVector<int64_t> LPUTargetModel::attention_context_slices() const
 {
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        return llvm::SmallVector<int64_t>(storage.end() - 8, storage.end());
+    }
     if (memory_.slices_per_hemisphere < 8)
         throw std::logic_error(
             "target cannot allocate the attention context layout");
@@ -1072,16 +1251,37 @@ llvm::SmallVector<int64_t> LPUTargetModel::attention_context_slices() const
 }
 
 llvm::SmallVector<int64_t>
-LPUTargetModel::attention_output_activation_slices() const
+LPUTargetModel::attention_output_activation_slices(
+    bool page_resident_weights) const
 {
+    if (uses_dedicated_slice_roles())
+        return mxm_distributed_activation_slices();
     // RoPE staging is dead before O projection. Reusing its low slices lets
     // westbound context streams tap local MEM and continue to the passive
     // inter-hemisphere bridge without a VXM pass.
-    return attention_rope_staging_slices();
+    if (!page_resident_weights) return attention_rope_staging_slices();
+
+    llvm::SmallDenseSet<int64_t, 16> reserved;
+    for (int64_t slice : page_resident_attention_weight_slices(true))
+        reserved.insert(slice);
+    llvm::SmallVector<int64_t> slices;
+    const int64_t contextBegin = memory_.slices_per_hemisphere - 8;
+    for (int64_t slice = 0;
+         slice < contextBegin && slices.size() < 16; ++slice)
+        if (!reserved.contains(slice)) slices.push_back(slice);
+    if (slices.size() != 16)
+        throw std::logic_error(
+            "target cannot allocate paged O-projection activation slices disjoint from weights");
+    return slices;
 }
 
 llvm::SmallVector<int64_t> LPUTargetModel::attention_result_slices() const
 {
+    if (uses_dedicated_slice_roles()) {
+        const auto storage = activation_storage_slices();
+        return llvm::SmallVector<int64_t>(storage.begin(),
+            storage.begin() + throughput_.mxm_result_streams);
+    }
     return {28, 29, 30, 31};
 }
 
@@ -1150,7 +1350,18 @@ std::optional<int64_t> LPUTargetModel::transport_latency(StreamEndpoint source,
         && destination == StreamEndpoint::Mem)
         return streams_.system_register_columns - 2 - group;
     if (source == StreamEndpoint::Mem && direction == StreamDirection::West)
-        return group + 2;
+        return group + 1;
+    if (source == StreamEndpoint::Mem
+        && (destination == StreamEndpoint::MxmActivation
+            || destination == StreamEndpoint::MxmWeight)) {
+        const auto sourceColumn =
+            stream_source_column(source, direction, mem_slice);
+        const auto destinationColumn =
+            stream_destination_column(destination, direction, mem_slice);
+        if (!sourceColumn || !destinationColumn) return std::nullopt;
+        return std::max(*destinationColumn, *sourceColumn)
+            - std::min(*destinationColumn, *sourceColumn) + 1;
+    }
     if (source == StreamEndpoint::Mem)
         return streams_.system_register_columns - group;
     if (source == StreamEndpoint::VxmResult)

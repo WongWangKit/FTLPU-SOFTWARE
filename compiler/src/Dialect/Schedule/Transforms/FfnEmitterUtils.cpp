@@ -19,6 +19,15 @@ mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
     llvm::ArrayRef<int64_t> slices, int64_t baseRow, int64_t count,
     int64_t stride, llvm::StringRef hemisphere, llvm::StringRef kind)
 {
+    return schedule_placement(builder, slices, baseRow, count, stride,
+        hemisphere, kind, 0);
+}
+
+mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
+    llvm::ArrayRef<int64_t> slices, int64_t baseRow, int64_t count,
+    int64_t stride, llvm::StringRef hemisphere, llvm::StringRef kind,
+    int64_t bank)
+{
     llvm::SmallVector<mlir::Attribute> sliceAttrs;
     for (int64_t slice : slices)
         sliceAttrs.push_back(builder.getI64IntegerAttr(slice));
@@ -28,6 +37,7 @@ mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
             "hemisphere", builder.getStringAttr(hemisphere)),
         builder.getNamedAttr("slices", builder.getArrayAttr(sliceAttrs)),
         builder.getNamedAttr("base_row", builder.getI64IntegerAttr(baseRow)),
+        builder.getNamedAttr("bank", builder.getI64IntegerAttr(bank)),
         builder.getNamedAttr(
             "instruction_count", builder.getI64IntegerAttr(count)),
         builder.getNamedAttr(

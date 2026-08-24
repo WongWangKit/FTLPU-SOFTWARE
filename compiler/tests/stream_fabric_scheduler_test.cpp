@@ -85,6 +85,20 @@ int main()
                 target::StreamEndpoint::MxmActivation,
                 target::StreamDirection::East, 0) == 15,
         "MEM-to-MXM endpoint columns do not match CModel topology");
+    require(target.transport_latency(target::StreamEndpoint::Mem,
+                target::StreamEndpoint::MxmWeight,
+                target::StreamDirection::East, 20) == 10
+            && target.transport_latency(target::StreamEndpoint::Mem,
+                target::StreamEndpoint::MxmWeight,
+                target::StreamDirection::East, 24) == 9,
+        "MEM-to-MXM latency must be physical hop distance plus consume cycle");
+    require(target.transport_latency(target::StreamEndpoint::Mem,
+                target::StreamEndpoint::VxmInput,
+                target::StreamDirection::West, 0) == 1
+            && target.transport_latency(target::StreamEndpoint::Mem,
+                target::StreamEndpoint::VxmInput,
+                target::StreamDirection::West, 8) == 3,
+        "MEM-to-VXM latency must be physical hop distance plus consume cycle");
     require(target.stream_source_column(target::StreamEndpoint::MxmResult,
                 target::StreamDirection::West, 0) == 15
             && target.stream_destination_column(

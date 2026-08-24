@@ -59,6 +59,14 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
             "output_activation");
     const auto resultPlacement =
         op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("result");
+    const auto placementBank = [&](llvm::StringRef name) {
+        return op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(name)
+            .getAs<mlir::IntegerAttr>("bank").getInt();
+    };
+    const int64_t contextBank = placementBank("context");
+    const int64_t activationBank = placementBank("output_activation");
+    const int64_t resultBank = placementBank("result");
+    const int64_t outputWeightBank = placementBank("output_weight");
     const auto activationSlices =
         placementSlices(activationPlacement);
     const auto resultSlices = placementSlices(resultPlacement);
@@ -74,6 +82,39 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
         .getAs<mlir::IntegerAttr>("base_row").getInt();
     const int64_t resultBase = resultPlacement
         .getAs<mlir::IntegerAttr>("base_row").getInt();
+    int64_t maxResultGroup = 0;
+    for (int64_t slice : resultSlices)
+        maxResultGroup = std::max(maxResultGroup,
+            slice / target_.streams().mem_slices_per_register_group);
+    int64_t maxOutputWaveSpan = 0;
+    // O-projection results cross the passive VXM bridge on E0..E15. INT8
+    // weights enter the MXM on the fixed E0..E7 range, so a second output
+    // group cannot prefetch while the first group's remote result wave is
+    // still in flight. Both weight buffers remain useful for alternating
+    // token waves within one output group.
+    constexpr int64_t outputGroupBatch = 1;
+    const int64_t maxParallelOutputGroups = std::min<int64_t>(
+        outputGroupBatch, outputGroups);
+    for (int64_t groupCount = 1;
+         groupCount <= maxParallelOutputGroups; ++groupCount) {
+        const bool duplicateSingleton = tokenBlocks > 1
+            && groupCount == 1
+            && throughput.mxm_weight_buffers >= 2
+            && 2 * blockIssues
+                >= throughput.mxm_block_group_interval;
+        const int64_t tokenIssueInterval = duplicateSingleton
+            ? blockIssues
+            : std::max<int64_t>(groupCount * blockIssues,
+                  throughput.mxm_block_group_interval);
+        maxOutputWaveSpan = std::max(maxOutputWaveSpan,
+            groupCount * blockIssues
+                + (tokenBlocks - 1) * tokenIssueInterval);
+    }
+    // Each MXM result is written locally with a tap and forwarded to the
+    // opposite hemisphere. Serialize the two producers for a destination MEM
+    // queue across the complete compressed token/output-group wave.
+    const int64_t hemisphereOutputSkew =
+        maxOutputWaveSpan + 2 * maxResultGroup + 2;
     const auto outputWeightScaleAttr = op_.output.getConfig()
         .getAs<mlir::FloatAttr>("output_weight_scale");
     const float outputWeightScale = outputWeightScaleAttr
@@ -154,9 +195,10 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                         emitMem(rewriter_, op_.getLoc(),
                             stagingCycle - *readLatency,
                             sourceHemisphere * memory.slices_per_hemisphere
-                                + sourceSlice,
+                            + sourceSlice,
                             "read", layout.contextAddress(queryHead, token),
-                            contextStreamBase + byte, 1, 1, 0);
+                            contextStreamBase + byte, 1, 1, 0,
+                            "sram", -1, contextBank);
                     }
                     for (int64_t hemisphere = 0;
                          hemisphere < memory.hemispheres;
@@ -190,7 +232,8 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                                 hemisphere * memory.slices_per_hemisphere
                                         + destinationSlice,
                                 local ? "write_tap" : "write",
-                                destinationAddress, packedStream, 1, 1, 0);
+                                destinationAddress, packedStream, 1, 1, 0,
+                                "sram", -1, activationBank);
                             occupiedWritePorts.insert({
                                 hemisphere * memory.slices_per_hemisphere
                                     + destinationSlice,
@@ -216,10 +259,11 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
     int64_t phaseStart = stagingEnd + 1;
     int64_t phaseEnd = phaseStart;
     for (int64_t groupBase = 0; groupBase < outputGroups;
-         groupBase += throughput.mxm_weight_buffers) {
+         groupBase += outputGroupBatch) {
         const int64_t groupCount = std::min<int64_t>(
-            throughput.mxm_weight_buffers, outputGroups - groupBase);
-        const bool duplicateSingleton = groupCount == 1
+            outputGroupBatch, outputGroups - groupBase);
+        const bool duplicateSingleton = tokenBlocks > 1
+            && groupCount == 1
             && throughput.mxm_weight_buffers >= 2
             && 2 * blockIssues
                 >= throughput.mxm_block_group_interval;
@@ -258,7 +302,8 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                         const int64_t firstUnitCompute = reductionCompute
                             + loadSlot * blockIssues;
                         const int64_t loadStart = firstUnitCompute
-                            - throughput.mxm_local_load_to_compute_latency;
+                            - throughput.mxm_local_load_to_compute_latency
+                            + hemisphere * hemisphereOutputSkew;
                         const int64_t address = layout.outputWeightAddress(
                             outputGroup, reduction,
                             throughput.tile_rows - 1);
@@ -277,11 +322,13 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                                 "read", address, stream, 1, 1, 0,
                                 "sram", functionArgumentIndex(
                                     op_.getOutputWeight()),
-                                throughput.tile_rows, 1, -1);
+                                throughput.tile_rows, 1, -1,
+                                outputWeightBank);
                         }
                         emitMxmDequantWave(rewriter_, op_.getLoc(),
                             loadStart, hemisphere, outputWeightScale,
-                            1, 1, throughput.tile_rows, 1);
+                            1, 1, throughput.tile_rows, 1,
+                            functionArgumentIndex(op_.getOutputWeight()));
                         emitMxmWave(rewriter_, op_.getLoc(), loadStart,
                             hemisphere, "iw", weightBuffer, 0,
                             0, 0, 1, 1, 0, 1, "sram", true,
@@ -312,7 +359,8 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                         const int64_t computeSlot = groupSlot;
                         const int64_t computeCycle = reductionCompute
                             + firstToken * tokenIssueInterval
-                            + computeSlot * blockIssues;
+                            + computeSlot * blockIssues
+                            + hemisphere * hemisphereOutputSkew;
                         for (int64_t stream = 0; stream < 16;
                              ++stream) {
                             const int64_t slice =
@@ -331,7 +379,8 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                                 2 * blockRows + stream,
                                 blockIssues, 1, 1, "sram", -1,
                                 waveCount, waveInterval,
-                                tokenStride * blockIssues);
+                                tokenStride * blockIssues,
+                                activationBank);
                         }
                         const int64_t accumulatorBase =
                             (groupSlot * tokenBlocks + firstToken)
@@ -363,30 +412,52 @@ int64_t AttentionScheduleEmitter::emitBlock8OutputProjection(
                             const int64_t group = slice
                                 / target_.streams()
                                       .mem_slices_per_register_group;
-                            const int64_t writeCycle =
-                                resultCycle - group - 1;
-                            emitMemWave(rewriter_, op_.getLoc(), writeCycle,
-                                hemisphere
-                                        * memory.slices_per_hemisphere
-                                    + slice,
-                                "write", resultAddress,
-                                target_.streams().streams_per_direction
-                                    + stream,
-                                blockIssues, 1, 1, "sram", -1,
-                                waveCount, waveInterval,
-                                tokenStride * hiddenBlocks * blockIssues);
-                            pairEnd = std::max(pairEnd,
-                                writeCycle
-                                    + (waveCount - 1) * waveInterval
-                                    + blockIssues);
+                            for (int64_t destinationHemisphere = 0;
+                                 destinationHemisphere
+                                     < memory.hemispheres;
+                                 ++destinationHemisphere) {
+                                const bool local = destinationHemisphere
+                                    == hemisphere;
+                                const int64_t writeCycle = local
+                                    ? resultCycle - group - 1
+                                    : resultCycle + group + 1;
+                                emitMemWave(rewriter_, op_.getLoc(),
+                                    writeCycle,
+                                    destinationHemisphere
+                                            * memory.slices_per_hemisphere
+                                        + slice,
+                                    local ? "write_tap" : "write",
+                                    resultAddress,
+                                    local
+                                        ? target_.streams()
+                                                .streams_per_direction
+                                            + stream
+                                        : stream,
+                                    blockIssues, 1, 1, "sram", -1,
+                                    waveCount, waveInterval,
+                                    tokenStride * hiddenBlocks
+                                        * blockIssues,
+                                    resultBank);
+                                pairEnd = std::max(pairEnd,
+                                    writeCycle
+                                        + (waveCount - 1) * waveInterval
+                                        + blockIssues);
+                            }
                         }
                     }
                 }
             }
         }
         phaseEnd = std::max(phaseEnd, pairEnd + 1);
-        phaseStart = lastComputeEnd - maxWeightLatency
-            - throughput.mxm_local_load_to_compute_latency;
+        // Final Block8 results use W0..W15 and write_tap across the passive
+        // VXM bridge. The remote half arrives on E0..E15, while the next
+        // INT8 weight wave is fixed to E0..E7. Do not inject that weight wave
+        // until every remote result write in this output-group wave has
+        // consumed the shared stream-register path.
+        phaseStart = std::max(
+            pairEnd,
+            lastComputeEnd - maxWeightLatency
+                - throughput.mxm_local_load_to_compute_latency);
     }
     return phaseEnd;
 }

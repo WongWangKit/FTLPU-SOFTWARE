@@ -9,26 +9,41 @@ std::string mem_port_resource(
     const target::LPUTargetModel& target,
     int64_t hemisphere,
     int64_t slice,
+    int64_t bank,
     const char* port)
 {
     if (hemisphere < 0 || hemisphere >= target.memory().hemispheres
-        || slice < 0 || slice >= target.memory().slices_per_hemisphere)
+        || slice < 0 || slice >= target.memory().slices_per_hemisphere
+        || bank < 0 || bank >= target.memory().banks_per_slice)
         throw std::out_of_range("invalid MEM resource");
     return "mem.h" + std::to_string(hemisphere) + ".s"
-        + std::to_string(slice) + "." + port;
+        + std::to_string(slice) + ".b" + std::to_string(bank)
+        + "." + port;
 }
 } // namespace
 
 std::string LPUResourceModel::mem_read_port(
     int64_t hemisphere, int64_t slice) const
 {
-    return mem_port_resource(target_, hemisphere, slice, "read");
+    return mem_read_port(hemisphere, slice, 0);
+}
+
+std::string LPUResourceModel::mem_read_port(
+    int64_t hemisphere, int64_t slice, int64_t bank) const
+{
+    return mem_port_resource(target_, hemisphere, slice, bank, "read");
 }
 
 std::string LPUResourceModel::mem_write_port(
     int64_t hemisphere, int64_t slice) const
 {
-    return mem_port_resource(target_, hemisphere, slice, "write");
+    return mem_write_port(hemisphere, slice, 0);
+}
+
+std::string LPUResourceModel::mem_write_port(
+    int64_t hemisphere, int64_t slice, int64_t bank) const
+{
+    return mem_port_resource(target_, hemisphere, slice, bank, "write");
 }
 
 std::string LPUResourceModel::mxm(int64_t unit) const

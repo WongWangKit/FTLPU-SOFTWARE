@@ -40,8 +40,16 @@ def main() -> None:
         if operation not in text:
             raise RuntimeError(f"RMSNorm Command IR is missing {operation}")
     if args.strategy == "vxm-feedback":
-        for marker in (
+        uses_dedicated_slice_roles = (
+            "dedicated_slice_roles = 1 : i64" in text
+        )
+        placement_markers = (
+            'kind = "fp16_vxm_gamma_broadcast"',
+            'slices = [16, 17]',
+        ) if uses_dedicated_slice_roles else (
             'kind = "fp16_vxm_row_parallel_8"',
+        )
+        for marker in placement_markers + (
             'opcode = "multiply"',
             'opcode = "rsqrt"',
             "accumulator_reset = true",
@@ -56,15 +64,16 @@ def main() -> None:
                     f"feedback RMSNorm Command IR is missing {marker}")
         if 'opcode = "square"' in text or 'opcode = "sqrt"' in text:
             raise RuntimeError("feedback RMSNorm emitted a non-hardware VXM opcode")
-        mem_queues = [
-            int(value)
-            for value in re.findall(
-                r'ftlpu\.command\.mem \{[^\n]*?queue = (\d+) : i64', text
-            )
-        ]
-        if not any(queue % 2 == 1 for queue in mem_queues):
-            raise RuntimeError(
-                "feedback RMSNorm Command IR does not use SRAM bank 1")
+        if uses_dedicated_slice_roles:
+            mem_queues = [
+                int(value)
+                for value in re.findall(
+                    r'ftlpu\.command\.mem \{[^\n]*?queue = (\d+) : i64', text
+                )
+            ]
+            if not any(queue % 2 == 1 for queue in mem_queues):
+                raise RuntimeError(
+                    "feedback RMSNorm Command IR does not use SRAM bank 1")
     elif "ftlpu.command.mxm" not in text:
         raise RuntimeError("MXM-reduce RMSNorm Command IR is missing MXM")
 

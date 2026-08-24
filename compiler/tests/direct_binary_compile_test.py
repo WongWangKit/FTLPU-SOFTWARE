@@ -24,8 +24,10 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     command_ir = args.output_dir / "reference.command.mlir"
+    schedule_ir = args.output_dir / "reference.schedule.mlir"
     reference = args.output_dir / "reference.ftlpu"
     direct = args.output_dir / "direct.ftlpu"
+    schedule_direct = args.output_dir / "schedule-direct.ftlpu"
     common = [
         "--mxm-execution", "block8",
         "--target-config", str(args.target_config),
@@ -36,6 +38,11 @@ def main() -> None:
         "--pipeline", "ftlpu-stablehlo-to-commands", *common,
     ])
     run([
+        str(args.opt), "--input", str(args.input),
+        "--output", str(schedule_ir),
+        "--pipeline", "ftlpu-stablehlo-to-schedule", *common,
+    ])
+    run([
         str(args.translate), "--input", str(command_ir),
         "--output", str(reference),
     ])
@@ -43,15 +50,21 @@ def main() -> None:
         str(args.compile), "--input", str(args.input),
         "--output", str(direct), "--input-stage", "stablehlo", *common,
     ])
+    run([
+        str(args.compile), "--input", str(schedule_ir),
+        "--output", str(schedule_direct), "--input-stage", "schedule",
+        *common,
+    ])
     expected = reference.read_bytes()
-    actual = direct.read_bytes()
-    if actual != expected:
-        mismatch = next((index for index, pair in enumerate(zip(actual, expected))
-                         if pair[0] != pair[1]), min(len(actual), len(expected)))
-        raise AssertionError(
-            f"direct binary differs at byte {mismatch}: "
-            f"direct={len(actual)} reference={len(expected)}")
-    print(f"direct binary parity passed: {len(actual)} bytes")
+    for name, path in (("stablehlo", direct), ("schedule", schedule_direct)):
+        actual = path.read_bytes()
+        if actual != expected:
+            mismatch = next((index for index, pair in enumerate(zip(actual, expected))
+                             if pair[0] != pair[1]), min(len(actual), len(expected)))
+            raise AssertionError(
+                f"{name} direct binary differs at byte {mismatch}: "
+                f"direct={len(actual)} reference={len(expected)}")
+    print(f"direct binary parity passed: {len(expected)} bytes")
 
 
 if __name__ == "__main__":

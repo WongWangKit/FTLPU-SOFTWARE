@@ -38,6 +38,11 @@ std::size_t issued_commands(const QueueProgram& queue)
     std::size_t issued = 0;
     std::size_t prior_instructions = 0;
     for (const auto& command : queue.commands) {
+        if (is_macro_schedule_command(command)) {
+            const auto macro = decode_macro_schedule_command(command);
+            issued += macro.inner_count * macro.outer_count;
+            continue;
+        }
         if (is_repeat_2d_command(command)) {
             if (prior_instructions == 0)
                 throw std::logic_error(

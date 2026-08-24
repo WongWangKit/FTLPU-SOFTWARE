@@ -9,7 +9,9 @@ bool PhysicalMemoryAllocator::valid(const PhysicalAllocation& allocation) const
 {
     if (allocation.name.empty() || allocation.slices.empty()
         || allocation.base_row < 0 || allocation.rows <= 0
-        || allocation.live_start < 0 || allocation.live_end <= allocation.live_start)
+        || allocation.live_start < 0 || allocation.live_end <= allocation.live_start
+        || allocation.bank < 0
+        || allocation.bank >= target_.memory().banks_per_slice)
         return false;
     llvm::SmallDenseSet<int64_t, 16> unique;
     for (int64_t slice : allocation.slices) {
@@ -21,12 +23,14 @@ bool PhysicalMemoryAllocator::valid(const PhysicalAllocation& allocation) const
         <= target_.memory().words_per_bank;
 }
 
-bool PhysicalMemoryAllocator::conflicts(llvm::ArrayRef<int64_t> slices,
+bool PhysicalMemoryAllocator::conflicts(int64_t bank,
+    llvm::ArrayRef<int64_t> slices,
     int64_t base_row, int64_t rows,
     int64_t live_start, int64_t live_end,
     bool reserve_slice_port) const
 {
     for (const PhysicalAllocation& allocation : allocations_) {
+        if (bank != allocation.bank) continue;
         if (live_start >= allocation.live_end || live_end <= allocation.live_start)
             continue;
         const bool rows_overlap =
@@ -44,7 +48,8 @@ bool PhysicalMemoryAllocator::conflicts(llvm::ArrayRef<int64_t> slices,
 mlir::LogicalResult PhysicalMemoryAllocator::reserve(PhysicalAllocation allocation)
 {
     if (!valid(allocation)
-        || conflicts(allocation.slices, allocation.base_row, allocation.rows,
+        || conflicts(allocation.bank, allocation.slices,
+            allocation.base_row, allocation.rows,
             allocation.live_start, allocation.live_end,
             allocation.reserve_slice_port))
         return mlir::failure();
@@ -58,26 +63,34 @@ mlir::FailureOr<PhysicalAllocation> PhysicalMemoryAllocator::allocate(
     if (request.slice_count <= 0
         || static_cast<int64_t>(request.candidate_slices.size()) < request.slice_count)
         return mlir::failure();
-    for (std::size_t begin = 0;
-         begin + static_cast<std::size_t>(request.slice_count)
-            <= request.candidate_slices.size();
-         ++begin) {
-        llvm::SmallVector<int64_t, 16> slices(
-            request.candidate_slices.slice(begin,
-                static_cast<std::size_t>(request.slice_count)));
-        bool contiguous = true;
-        for (std::size_t index = 1; index < slices.size(); ++index)
-            contiguous &= slices[index] == slices[index - 1] + 1;
-        if (!contiguous
-            || conflicts(slices, request.base_row, request.rows,
-                request.live_start, request.live_end,
-                request.reserve_slice_port))
-            continue;
-        PhysicalAllocation allocation {request.name, std::move(slices),
-            request.base_row, request.rows, request.live_start, request.live_end,
-            request.reserve_slice_port};
-        if (failed(reserve(allocation))) continue;
-        return allocations_.back();
+    const int64_t defaultBank = 0;
+    const llvm::ArrayRef<int64_t> candidateBanks =
+        request.candidate_banks.empty()
+        ? llvm::ArrayRef<int64_t>(defaultBank)
+        : request.candidate_banks;
+    for (int64_t bank : candidateBanks) {
+        if (bank < 0 || bank >= target_.memory().banks_per_slice) continue;
+        for (std::size_t begin = 0;
+             begin + static_cast<std::size_t>(request.slice_count)
+                <= request.candidate_slices.size();
+             ++begin) {
+            llvm::SmallVector<int64_t, 16> slices(
+                request.candidate_slices.slice(begin,
+                    static_cast<std::size_t>(request.slice_count)));
+            bool contiguous = true;
+            for (std::size_t index = 1; index < slices.size(); ++index)
+                contiguous &= slices[index] == slices[index - 1] + 1;
+            if (!contiguous
+                || conflicts(bank, slices, request.base_row, request.rows,
+                    request.live_start, request.live_end,
+                    request.reserve_slice_port))
+                continue;
+            PhysicalAllocation allocation {request.name, std::move(slices),
+                request.base_row, request.rows, request.live_start,
+                request.live_end, request.reserve_slice_port, bank};
+            if (failed(reserve(allocation))) continue;
+            return allocations_.back();
+        }
     }
     return mlir::failure();
 }

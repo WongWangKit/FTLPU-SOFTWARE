@@ -18,6 +18,7 @@ int main()
     const target::LPUTargetModel target;
     tensor::PhysicalMemoryAllocator allocator(target);
     const std::array<int64_t, 8> candidates {0, 1, 2, 3, 4, 5, 6, 7};
+    const std::array<int64_t, 1> bank1 {1};
     auto first = allocator.allocate(
         {"first", 2, 0, 32, 0, 2, candidates, false});
     auto disjoint_rows = allocator.allocate(
@@ -26,6 +27,8 @@ int main()
         {"overlap", 2, 16, 32, 1, 3, candidates});
     auto reused = allocator.allocate(
         {"reused", 2, 0, 32, 3, 4, candidates});
+    auto other_bank = allocator.allocate(
+        {"other_bank", 2, 0, 32, 0, 2, candidates, false, bank1});
     require(mlir::succeeded(first) && first->slices[0] == 0,
         "first-fit allocation failed");
     require(mlir::succeeded(disjoint_rows) && disjoint_rows->slices[0] == 0,
@@ -34,4 +37,7 @@ int main()
         "overlapping row range and lifetime reused live slices");
     require(mlir::succeeded(reused) && reused->slices[0] == 0,
         "expired slices were not reused");
+    require(mlir::succeeded(other_bank) && other_bank->bank == 1
+            && other_bank->slices[0] == 0,
+        "an independent SRAM bank did not reuse the same live interval");
 }

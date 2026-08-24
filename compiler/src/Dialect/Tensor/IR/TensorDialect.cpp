@@ -279,8 +279,7 @@ LogicalResult RmsNormTaskOp::verify()
         || (strategy.getValue() != "vxm_square_mxm_reduce"
             && strategy.getValue() != "vxm_feedback"))
         return emitOpError("requires a supported RMSNorm strategy");
-    const std::size_t expectedScratch =
-        strategy.getValue() == "vxm_feedback" ? 3 : 2;
+    const std::size_t expectedScratch = 2;
     if (getScratchAllocations().size() != expectedScratch)
         return emitOpError("scratch allocation count does not match strategy");
     if (failed(verify_task_allocations(

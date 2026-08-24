@@ -13,6 +13,7 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -130,7 +131,7 @@ Args parse_args(int argc, char** argv)
             "usage: ftlpu-compile --input in.mlir --output program.ftlpu "
             "[--input-stage stablehlo|stream|schedule|verified-schedule|command] "
             "[--target-config target.json] [--weight-bank 0|1] "
-            "[--mxm-execution auto|legacy|block8] "
+            "[--mxm-execution auto|vector|legacy|block8] "
             "[--ffn-schedule tail|fused] "
             "[--attention-schedule tail|fused] "
             "[--rmsnorm-strategy vxm-square-mxm-reduce|vxm-feedback]");
@@ -190,6 +191,10 @@ try {
                 args.mxm_execution_policy)));
 
     mlir::PassManager passes(&context);
+    // Model-scale schedules contain hundreds of thousands of primitive ops.
+    // Verify once after schedule compression and once after command lowering
+    // instead of rescanning the uncompressed IR after every pass.
+    passes.enableVerifier(false);
     if (args.pass_timing) passes.enableTiming();
     if (args.input_stage == InputStage::StableHlo) {
         passes.addNestedPass<mlir::func::FuncOp>(
@@ -215,13 +220,15 @@ try {
         && args.input_stage != InputStage::Command)
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_compress_schedule_pass());
-    if (args.input_stage != InputStage::Command)
+    if (args.input_stage != InputStage::VerifiedSchedule
+        && args.input_stage != InputStage::Command)
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_verify_schedule_pass());
     if (args.input_stage != InputStage::Command)
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_schedule_to_command_pass());
     if (mlir::failed(passes.run(*module))) return 1;
+    if (mlir::failed(mlir::verify(*module))) return 1;
 
     std::error_code error;
     std::filesystem::create_directories(args.output.parent_path(), error);

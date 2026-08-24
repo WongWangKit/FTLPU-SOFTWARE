@@ -12,6 +12,7 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
@@ -42,6 +43,7 @@ struct Args {
         ftlpu::compiler::target::MxmExecutionPolicy::Auto};
     std::int64_t weight_bank{-1};
     bool pass_timing{false};
+    bool icu_macro_schedule{false};
 };
 
 Args parse_args(int argc, char** argv)
@@ -106,6 +108,8 @@ Args parse_args(int argc, char** argv)
             args.weight_bank = std::stoll(next());
         else if (arg == "--pass-timing")
             args.pass_timing = true;
+        else if (arg == "--icu-macro-schedule")
+            args.icu_macro_schedule = true;
         else throw std::runtime_error("unknown argument: " + arg);
     }
     if (args.input.empty() || args.output.empty()) {
@@ -122,7 +126,8 @@ Args parse_args(int argc, char** argv)
                                  "[--attention-schedule tail|fused] "
                                  "[--rmsnorm-strategy "
                                  "vxm-square-mxm-reduce|vxm-feedback] "
-                                 "[--mxm-execution auto|legacy|block8] "
+                                 "[--mxm-execution auto|vector|legacy|block8] "
+                                 "[--icu-macro-schedule] "
                                  "[--weight-bank 0|1] "
                                  "[--target-config target.json]");
     }
@@ -176,8 +181,14 @@ try {
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::mxm_execution_policy_name(
                 args.mxm_execution_policy)));
+    (*module)->setAttr("ftlpu.icu_macro_schedule",
+        mlir::BoolAttr::get(&context, args.icu_macro_schedule));
 
     mlir::PassManager pass_manager(&context);
+    const bool deferVerificationUntilCompressed =
+        args.pipeline == "ftlpu-stream-to-compressed-schedule";
+    if (deferVerificationUntilCompressed)
+        pass_manager.enableVerifier(false);
     if (args.pass_timing) pass_manager.enableTiming();
     if (args.pipeline != "ftlpu-stablehlo-to-kernel"
         && args.pipeline != "ftlpu-stablehlo-to-tensor"
@@ -254,6 +265,9 @@ try {
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_schedule_to_command_pass());
     if (mlir::failed(pass_manager.run(*module))) return 1;
+    if (deferVerificationUntilCompressed
+        && mlir::failed(mlir::verify(*module)))
+        return 1;
 
     std::error_code error;
     std::filesystem::create_directories(args.output.parent_path(), error);

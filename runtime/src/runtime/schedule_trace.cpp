@@ -2,11 +2,16 @@
 
 #include "ftlpu/core/instruction_codec.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <fstream>
 #include <deque>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ftlpu::software::runtime {
 namespace {
@@ -147,7 +152,7 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
     throw std::logic_error("unknown ICU queue kind in schedule trace");
 }
 
-void write_event(std::ostream& output, std::size_t start, std::size_t end,
+void write_event(std::ostream& output, std::int64_t start, std::int64_t end,
     const EventDescription& event, std::size_t count = 1, std::size_t interval = 1,
     std::int64_t stride = 0)
 {
@@ -161,6 +166,128 @@ void write_event(std::ostream& output, std::size_t start, std::size_t end,
            << csv_field(detail) << '\n';
 }
 
+struct WeightPrefetch {
+    std::uint32_t page{0};
+    std::uint16_t bank{0};
+    std::uint64_t ready{std::numeric_limits<std::uint64_t>::max()};
+    std::uint64_t release{0};
+    std::array<std::uint64_t, 2> bytes{};
+    std::vector<std::string> bindings{};
+};
+
+const BinaryBinding& find_paged_weight(
+    const BinaryProgram& program, std::uint32_t index)
+{
+    const auto found = std::ranges::find_if(program.bindings,
+        [index](const BinaryBinding& binding) {
+            return binding.access == BindingAccess::Input
+                && binding.index == index && binding.paged_weight;
+        });
+    if (found == program.bindings.end())
+        throw std::logic_error(
+            "weight-page trace references a missing paged binding");
+    return *found;
+}
+
+std::uint64_t page_byte_size(
+    const BinaryBinding& binding, std::uint32_t page)
+{
+    if (binding.page_count == 0 || page >= binding.page_count)
+        throw std::logic_error("weight-page trace index is out of range");
+    const auto quotient = binding.byte_size / binding.page_count;
+    const auto remainder = binding.byte_size % binding.page_count;
+    return quotient + (page < remainder ? 1 : 0);
+}
+
+void add_binding_bytes(WeightPrefetch& prefetch,
+    const BinaryBinding& binding, std::uint64_t bytes)
+{
+    const bool east = (binding.hemisphere_mask & 1u) != 0;
+    const bool west = (binding.hemisphere_mask & 2u) != 0;
+    const std::uint64_t sideCount = static_cast<std::uint64_t>(east)
+        + static_cast<std::uint64_t>(west);
+    if (sideCount == 0)
+        throw std::logic_error(
+            "paged weight binding has an empty hemisphere mask");
+    const auto quotient = bytes / sideCount;
+    const auto remainder = bytes % sideCount;
+    if (east) prefetch.bytes[0] += quotient + (remainder != 0 ? 1 : 0);
+    if (west) prefetch.bytes[1] += quotient;
+    prefetch.bindings.push_back(binding.name.empty()
+        ? std::to_string(binding.index) : binding.name);
+}
+
+void write_weight_prefetches(
+    std::ostream& output, const BinaryProgram& program)
+{
+    if (program.weight_page_uses.empty()) return;
+    const std::uint64_t lanes =
+        program.hardware.c2c_streams_per_direction;
+    const std::uint64_t bytesPerLane =
+        program.hardware.c2c_bytes_per_stream_per_cycle;
+    if (lanes == 0 || bytesPerLane == 0)
+        throw std::logic_error(
+            "paged weight trace requires non-zero C2C bandwidth");
+
+    std::vector<const BinaryWeightPageUse*> ordered;
+    ordered.reserve(program.weight_page_uses.size());
+    for (const auto& use : program.weight_page_uses)
+        ordered.push_back(&use);
+    std::ranges::sort(ordered, [](const auto* lhs, const auto* rhs) {
+        return lhs->ready_cycle < rhs->ready_cycle;
+    });
+
+    std::vector<WeightPrefetch> prefetches;
+    for (const auto* use : ordered) {
+        const auto& binding = find_paged_weight(program, use->binding_index);
+        auto found = std::ranges::find_if(prefetches,
+            [use](const WeightPrefetch& candidate) {
+                return candidate.page == use->page_index
+                    && candidate.bank == use->bank
+                    && use->ready_cycle <= candidate.release
+                    && candidate.ready <= use->release_cycle;
+            });
+        if (found == prefetches.end()) {
+            prefetches.push_back(WeightPrefetch {
+                use->page_index, use->bank, use->ready_cycle,
+                use->release_cycle, {}, {}});
+            found = std::prev(prefetches.end());
+        } else {
+            found->ready = std::min(found->ready, use->ready_cycle);
+            found->release = std::max(found->release, use->release_cycle);
+        }
+        add_binding_bytes(
+            *found, binding, page_byte_size(binding, use->page_index));
+    }
+
+    const std::uint64_t bandwidth = lanes * bytesPerLane;
+    for (const auto& prefetch : prefetches) {
+        for (std::size_t side = 0; side < prefetch.bytes.size(); ++side) {
+            if (prefetch.bytes[side] == 0) continue;
+            const std::uint64_t duration =
+                (prefetch.bytes[side] + bandwidth - 1) / bandwidth;
+            const auto ready = static_cast<std::int64_t>(prefetch.ready);
+            std::ostringstream detail;
+            detail << "page=" << prefetch.page
+                   << " bank=" << prefetch.bank << " bindings=";
+            for (std::size_t index = 0;
+                 index < prefetch.bindings.size(); ++index) {
+                if (index != 0) detail << '+';
+                detail << prefetch.bindings[index];
+            }
+            detail << " bytes=" << prefetch.bytes[side]
+                   << " lanes=" << lanes
+                   << " bandwidth=" << bandwidth
+                   << "B/cycle planned=true";
+            write_event(output,
+                ready - static_cast<std::int64_t>(duration), ready,
+                {std::string("C2C.") + (side == 0 ? "E" : "W")
+                        + ".Prefetch",
+                    detail.str()});
+        }
+    }
+}
+
 } // namespace
 
 void write_schedule_trace_csv(const BinaryProgram& program, const std::filesystem::path& path)
@@ -168,6 +295,7 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
     std::ofstream output(path, std::ios::trunc);
     if (!output) throw std::runtime_error("cannot open runtime schedule trace: " + path.string());
     output << "start,end,resource,detail\n";
+    write_weight_prefetches(output, program);
 
     for (const auto& queue : program.queues) {
         std::size_t cursor = 0;
@@ -175,6 +303,30 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
         const QueueCommand* previous = nullptr;
         std::deque<std::pair<const QueueCommand*, std::size_t>> history;
         for (const auto& command : queue.commands) {
+            if (is_macro_schedule_command(command)) {
+                const auto macro = decode_macro_schedule_command(command);
+                for (std::size_t outer = 0;
+                     outer < macro.outer_count; ++outer) {
+                    for (std::size_t inner = 0;
+                         inner < macro.inner_count; ++inner) {
+                        const auto cycle = macro.start_cycle
+                            + outer * macro.outer_interval
+                            + inner * macro.inner_interval;
+                        const auto delta =
+                            static_cast<std::int64_t>(outer)
+                                * macro.outer_stride
+                            + static_cast<std::int64_t>(inner)
+                                * macro.inner_stride;
+                        write_event(output, cycle, cycle + 1,
+                            describe(queue, command, delta,
+                                program.hardware.mxms_per_hemisphere));
+                    }
+                }
+                cursor = std::max(cursor, macro.start_cycle
+                    + (macro.outer_count - 1) * macro.outer_interval
+                    + (macro.inner_count - 1) * macro.inner_interval + 1);
+                continue;
+            }
             if (is_repeat_2d_command(command)) {
                 if (!previous)
                     throw std::logic_error(

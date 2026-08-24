@@ -21,6 +21,7 @@ def main() -> None:
                         default="tail")
     parser.add_argument("--mxm-execution", choices=("auto", "legacy", "block8"),
                         default="legacy")
+    parser.add_argument("--icu-macro-schedule", action="store_true")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -35,6 +36,8 @@ def main() -> None:
         "--mxm-execution", args.mxm_execution,
     ]
     compile_command.extend(["--target-config", str(args.target_config)])
+    if args.icu_macro_schedule:
+        compile_command.append("--icu-macro-schedule")
     subprocess.run(compile_command, check=True)
     command_text = commands.read_text(encoding="utf-8")
     block8_selected = args.mxm_execution in ("auto", "block8")
@@ -398,7 +401,10 @@ def main() -> None:
     ], check=True)
     environment = os.environ.copy()
     environment["FTLPU_SCHEDULE_TRACE"] = str(trace)
-    runtime_result = subprocess.run([str(args.runtime_test), str(binary)], env=environment)
+    runtime_command = [str(args.runtime_test), str(binary)]
+    if args.icu_macro_schedule:
+        runtime_command.append("--require-icu-macro")
+    runtime_result = subprocess.run(runtime_command, env=environment)
     runtime_result.check_returncode()
     if block8_selected:
         return

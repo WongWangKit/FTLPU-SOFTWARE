@@ -47,6 +47,46 @@ LogicalResult verify_stream_range(Operation* op, int64_t base, int64_t count)
     return success();
 }
 
+LogicalResult verify_mem_placement(Operation* op, DictionaryAttr placement,
+    const target::LPUTargetModel& targetModel)
+{
+    const auto slices = placement.getAs<ArrayAttr>("slices");
+    const auto base = placement.getAs<IntegerAttr>("base_row");
+    const auto count = placement.getAs<IntegerAttr>("instruction_count");
+    const auto stride = placement.getAs<IntegerAttr>("address_stride");
+    const auto bank = placement.getAs<IntegerAttr>("bank");
+    if (!slices || !base || !count || !stride)
+        return op->emitOpError(
+            "physical MEM placement requires slices, base_row, "
+            "instruction_count, and address_stride");
+
+    const auto& memory = targetModel.memory();
+    const int64_t bankIndex = bank ? bank.getInt() : 0;
+    if (bankIndex < 0 || bankIndex >= memory.banks_per_slice)
+        return op->emitOpError("MEM placement bank is outside the target");
+    for (Attribute attribute : slices) {
+        const auto slice = dyn_cast<IntegerAttr>(attribute);
+        if (!slice || slice.getInt() < 0
+            || slice.getInt() >= memory.slices_per_hemisphere)
+            return op->emitOpError(
+                "MEM placement slice is outside the target hemisphere");
+    }
+
+    if (count.getInt() <= 0)
+        return op->emitOpError(
+            "MEM placement instruction_count must be positive");
+    const int64_t firstRow = base.getInt();
+    const int64_t lastRow = firstRow
+        + (count.getInt() - 1) * stride.getInt();
+    if (std::min(firstRow, lastRow) < 0
+        || std::max(firstRow, lastRow) >= memory.sram_depth_rows)
+        return op->emitOpError("MEM placement row range is outside SRAM: [")
+            << std::min(firstRow, lastRow) << ", "
+            << std::max(firstRow, lastRow) << "] not in [0, "
+            << memory.sram_depth_rows << "); placement " << placement;
+    return success();
+}
+
 } // namespace
 
 LogicalResult MemReadOp::verify()
@@ -54,7 +94,25 @@ LogicalResult MemReadOp::verify()
     if (failed(verify_timing(*this, getCycle(), getDuration()))
         || failed(verify_stream_range(*this, getStreamBase(), getStreamCount())))
         return failure();
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)
+        || failed(verify_mem_placement(*this, getPlacement(), *targetModel)))
+        return failure();
     auto placement = getPlacement();
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
+    const int64_t waveAddressStride =
+        getWaveAddressStride().value_or(0);
+    if (waveCount <= 0 || waveInterval <= 0)
+        return emitOpError(
+            "requires positive wave_count and wave_interval");
+    if (auto base = placement.getAs<IntegerAttr>("base_row")) {
+        const int64_t finalBase = base.getInt()
+            + (waveCount - 1) * waveAddressStride;
+        if (finalBase < 0
+            || finalBase >= targetModel->memory().sram_depth_rows)
+            return emitOpError("MEM read wave leaves physical SRAM");
+    }
     auto kind = placement.getAs<StringAttr>("kind");
     if (kind && kind.getValue() == "schedule_slice") {
         if (getDirection() != "east" && getDirection() != "west")
@@ -65,7 +123,7 @@ LogicalResult MemReadOp::verify()
             return emitOpError("scheduled MEM read requires a physical hemisphere");
         if (getRole() != "activation" && getRole() != "weight_i8"
             && getRole() != "vxm_fp16" && getRole() != "vxm_bf16"
-            && getRole() != "vxm_fp32")
+            && getRole() != "vxm_fp32" && getRole() != "vxm_bypass")
             return emitOpError("contains an unsupported scheduled MEM role");
         auto slices = placement.getAs<ArrayAttr>("slices");
         if (!slices
@@ -88,8 +146,6 @@ LogicalResult MemReadOp::verify()
     if (getRole() == "weight") endpoint = target::StreamEndpoint::MxmWeight;
     else if (getRole() == "activation") endpoint = target::StreamEndpoint::MxmActivation;
     else return emitOpError("role must be weight or activation");
-    auto targetModel = target::LPUTargetModel::from_operation(*this);
-    if (failed(targetModel)) return failure();
     const auto expected_count = targetModel->route_stream_count(
         target::StreamEndpoint::Mem, endpoint, target::StreamDirection::East);
     auto instruction_count = placement.getAs<IntegerAttr>("instruction_count");
@@ -112,6 +168,10 @@ LogicalResult MxmLoadOp::verify()
     const llvm::StringRef inputMode =
         getWeightInputMode().value_or("direct16");
     const int64_t innerColumn = getWeightInnerColumn().value_or(0);
+    if (getGroupCount().value_or(1) <= 0
+        || getGroupInterval().value_or(1) <= 0)
+        return emitOpError(
+            "requires positive group_count and group_interval");
     const int64_t expectedStreams = loadMode == "column"
         ? 2
         : inputMode == "int8_dequant_bf16"
@@ -156,6 +216,11 @@ LogicalResult MxmComputeOp::verify()
         getComputeMode().value_or("vector");
     if (computeMode != "vector" && computeMode != "block8")
         return emitOpError("compute_mode must be vector or block8");
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
+    if (waveCount <= 0 || waveInterval <= 0)
+        return emitOpError(
+            "requires positive wave_count and wave_interval");
     if (getDuration() != target.mxm_compute_issue_cycles(getM())
         || getResultCycle() != getCycle() + target.mxm_first_result_latency()
         || getResultDuration() != target.mxm_result_window_cycles(getM()))
@@ -225,7 +290,10 @@ LogicalResult VxmOp::verify()
     };
     if (!valid_operand(getLhsKind(), getLhsIndex())
         || !valid_operand(getRhsKind(), getRhsIndex()))
-        return emitOpError("contains an invalid operand index");
+        return emitOpError("contains an invalid operand index: queue=")
+            << getQueue() << ", opcode=" << getOpcode()
+            << ", lhs=" << getLhsKind() << "(" << getLhsIndex() << ")"
+            << ", rhs=" << getRhsKind() << "(" << getRhsIndex() << ")";
     const int64_t output = getOutputStreamAttr().getInt();
     if (output < -1 || output >= target.streams().encoded_streams)
         return emitOpError("contains an invalid output stream");
@@ -235,26 +303,38 @@ LogicalResult VxmOp::verify()
     return success();
 }
 
-LogicalResult MemAccumulateOp::verify()
+LogicalResult MxmAccumulateOp::verify()
 {
     if (getRepeatCount() <= 0 || getRepeatInterval() <= 0
-        || getAddressStride() > 4095)
+        || getAccumulatorAddress() < 0 || getAccumulatorAddress() >= 8192
+        || getAccumulatorStride() <= 0 || getAccumulatorStride() > 4095)
         return emitOpError("contains invalid accumulation timing or stride: cycle=")
             << getCycle() << ", repeat_count=" << getRepeatCount()
             << ", repeat_interval=" << getRepeatInterval()
-            << ", address_stride=" << getAddressStride();
-    if (getHemisphere() != "east" && getHemisphere() != "west")
-        return emitOpError("hemisphere must be east or west");
-    if (getDestination() != "sram" && getDestination() != "stream")
-        return emitOpError("destination must be sram or stream");
+            << ", accumulator_address=" << getAccumulatorAddress()
+            << ", accumulator_stride=" << getAccumulatorStride();
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    if (!targetModel->is_valid_mxm_unit(getUnitId()))
+        return emitOpError("contains invalid MXM unit_id");
+    if (getDestination() != "local" && getDestination() != "stream")
+        return emitOpError("destination must be local or stream");
     const llvm::StringRef outputFormat =
         getAccumulatorOutputFormat().value_or("fp32");
     if (outputFormat != "fp32" && outputFormat != "bf16")
         return emitOpError(
             "accumulator_output_format must be fp32 or bf16");
-    if (getDestination() == "sram" && outputFormat != "fp32")
+    if (getDestination() == "local" && outputFormat != "fp32")
         return emitOpError(
             "a retained accumulator value must keep FP32 format");
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
+    const int64_t finalAddress = getAccumulatorAddress()
+        + (waveCount - 1)
+            * getWaveAccumulatorAddressStride().value_or(0);
+    if (waveCount <= 0 || waveInterval <= 0
+        || finalAddress < 0 || finalAddress >= 8192)
+        return emitOpError("contains an invalid accumulator wave");
     if (failed(verify_stream_range(*this, getStreamBase(), getStreamCount())))
         return failure();
     return success();
@@ -292,6 +372,21 @@ LogicalResult MemWriteOp::verify()
         || failed(verify_stream_range(*this, getStreamBase(), getStreamCount())))
         return failure();
     auto placement = getPlacement();
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
+    const int64_t waveAddressStride =
+        getWaveAddressStride().value_or(0);
+    if (waveCount <= 0 || waveInterval <= 0)
+        return emitOpError(
+            "requires positive wave_count and wave_interval");
+    if (auto base = placement.getAs<IntegerAttr>("base_row")) {
+        const int64_t finalBase = base.getInt()
+            + (waveCount - 1) * waveAddressStride;
+        if (finalBase < 0 || finalBase >= target.memory().sram_depth_rows)
+            return emitOpError("MEM write wave leaves physical SRAM");
+    }
+    if (failed(verify_mem_placement(*this, placement, target)))
+        return failure();
     auto kind = placement.getAs<StringAttr>("kind");
     auto hemisphere = placement.getAs<StringAttr>("hemisphere");
     if (!hemisphere) hemisphere = getAddress().getAs<StringAttr>("hemisphere");
@@ -518,6 +613,16 @@ LogicalResult MxmIssueOp::verify()
         && inputMode != "int8_dequant_bf16")
         return emitOpError(
             "weight_input_mode must be direct16 or int8_dequant_bf16");
+    const int64_t weightStreams = loadMode == "column"
+        ? inputMode == "int8_dequant_bf16" ? 1 : 2
+        : inputMode == "int8_dequant_bf16"
+        ? target.throughput().mxm_int8_load_streams_per_cycle
+        : target.throughput().mxm_load_streams_per_cycle;
+    const int64_t weightStreamBase = getWeightStreamBase().value_or(0);
+    if (weightStreamBase < 0
+        || weightStreamBase + weightStreams
+            > target.streams().streams_per_direction)
+        return emitOpError("contains an invalid MXM weight stream range");
     return success();
 }
 
@@ -530,6 +635,7 @@ LogicalResult MxmDequantOp::verify()
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0
         || getWaveCount().value_or(1) <= 0
         || getWaveInterval().value_or(1) <= 0
+        || (getScaleBinding() && *getScaleBinding() < 0)
         || !std::isfinite(getScaleAttr().getValueAsDouble()))
         return emitOpError(
             "contains an invalid MXM dequant schedule field");
