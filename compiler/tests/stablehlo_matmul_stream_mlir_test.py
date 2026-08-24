@@ -46,9 +46,9 @@ def main():
         "stream_count = 4 : i64",
         "stream_count = 4 : i64",
         "register_id = 1 : i64",
-        "transport_latency = 13 : i64",
+        "transport_latency = 16 : i64",
         "transport_latency = 5 : i64",
-        "transport_latency = 2 : i64",
+        "transport_latency = 8 : i64",
         "bytes = 102400 : i64",
         "bytes = 409600 : i64",
     ]

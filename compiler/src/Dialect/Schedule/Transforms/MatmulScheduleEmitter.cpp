@@ -205,8 +205,68 @@ mlir::LogicalResult lowerMatmulSchedules(mlir::IRRewriter& rewriter,
                 activation_route.getStreamBase(), result_route.getStreamBase(),
                 matmul.getWeightBuffer(),
                 matmul.getUnitId(), matmul.getM(), matmul.getN(), matmul.getK());
+
+            // A compute command always writes through its local MXM accumulator.
+            // Keep that hardware contract explicit in Schedule IR so Command
+            // lowering can populate the accumulator fields of the MXM command.
+            const int64_t hemisphere = matmul.getUnitId()
+                / target.throughput().mxms_per_hemisphere;
+            const int64_t local_mxm = matmul.getUnitId()
+                % target.throughput().mxms_per_hemisphere;
+            const llvm::StringRef hemisphere_name =
+                hemisphere == 0 ? "east" : "west";
+            llvm::SmallVector<mlir::Attribute> accumulator_slices;
+            const int64_t first_accumulator_slice =
+                target.memory().accumulator_slice_base
+                + local_mxm * target.memory().accumulator_slices_per_mxm;
+            for (int64_t index = 0;
+                 index < target.memory().accumulator_slices_per_mxm; ++index)
+                accumulator_slices.push_back(
+                    rewriter.getI64IntegerAttr(first_accumulator_slice + index));
+            auto accumulator_placement = rewriter.getDictionaryAttr({
+                rewriter.getNamedAttr(
+                    "kind", rewriter.getStringAttr("fp32_accumulator")),
+                rewriter.getNamedAttr(
+                    "hemisphere", rewriter.getStringAttr(hemisphere_name)),
+                rewriter.getNamedAttr(
+                    "slices", rewriter.getArrayAttr(accumulator_slices)),
+                rewriter.getNamedAttr(
+                    "base_row", rewriter.getI64IntegerAttr(0)),
+                rewriter.getNamedAttr("instruction_count",
+                    rewriter.getI64IntegerAttr(matmul.getM())),
+                rewriter.getNamedAttr(
+                    "address_stride", rewriter.getI64IntegerAttr(1)),
+            });
+            mlir::OperationState accumulator_state(
+                matmul.getLoc(), schedule::MemAccumulateOp::getOperationName());
+            accumulator_state.addOperands(compute.getResult());
+            accumulator_state.addTypes(matmul.getResult().getType());
+            accumulator_state.addAttributes({
+                rewriter.getNamedAttr(
+                    "cycle", rewriter.getI64IntegerAttr(result_cycle)),
+                rewriter.getNamedAttr("stream_base",
+                    rewriter.getI64IntegerAttr(result_route.getStreamBase())),
+                rewriter.getNamedAttr("stream_count",
+                    rewriter.getI64IntegerAttr(result_route.getStreamCount())),
+                rewriter.getNamedAttr("address", result_route.getAddress()),
+                rewriter.getNamedAttr("placement", accumulator_placement),
+                rewriter.getNamedAttr(
+                    "hemisphere", rewriter.getStringAttr(hemisphere_name)),
+                rewriter.getNamedAttr(
+                    "destination", rewriter.getStringAttr("stream")),
+                rewriter.getNamedAttr("repeat_count",
+                    rewriter.getI64IntegerAttr(matmul.getM())),
+                rewriter.getNamedAttr(
+                    "repeat_interval", rewriter.getI64IntegerAttr(1)),
+                rewriter.getNamedAttr(
+                    "address_stride", rewriter.getI64IntegerAttr(1)),
+                rewriter.getNamedAttr("accumulator_output_format",
+                    rewriter.getStringAttr("fp32")),
+            });
+            auto accumulator = llvm::cast<schedule::MemAccumulateOp>(
+                rewriter.create(accumulator_state));
             auto write = rewriter.create<schedule::MemWriteOp>(matmul.getLoc(),
-                compute.getResult(), write_cycle, *write_duration,
+                accumulator.getOutput(), write_cycle, *write_duration,
                 result_route.getStreamBase(), result_route.getStreamCount(),
                 result_route.getRegisterId(), result_route.getDirectionAttr(),
                 result_route.getAddress(), result_route.getPlacement(), result_route.getBytes());
