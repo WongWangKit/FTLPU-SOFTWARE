@@ -155,7 +155,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
 mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
     const target::LPUTargetModel& target,
     EastMemoryAllocator& allocator, AllocateValueFn allocate_value,
-    RmsNormLoweringStrategy rmsnorm_strategy,
+    RmsNormLoweringStrategy rmsnorm_strategy, int64_t weight_bank,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
     const target::LPUTargetModel& target,

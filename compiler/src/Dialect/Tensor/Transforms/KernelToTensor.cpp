@@ -293,7 +293,7 @@ public:
             if (auto op = llvm::dyn_cast<kernel::ElementwiseOp>(operation)) {
                 if (mlir::failed(lower_elementwise(
                         op, target, allocator, allocate_value,
-                        rmsnorm_strategy_, rewriter))) {
+                        rmsnorm_strategy_, weight_bank_, rewriter))) {
                     signalPassFailure();
                     return;
                 }

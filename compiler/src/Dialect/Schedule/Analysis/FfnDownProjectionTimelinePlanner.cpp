@@ -43,8 +43,11 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
     }
 
     result.reduction_block_count = shape.hidden / tile;
+    // Vector FFN keeps two logical 32-column output slots per hemisphere.
+    // A dual-MXM target executes them in parallel; a single-MXM target
+    // time-multiplexes both slots through its two weight buffers.
     const int64_t columnsPerHemisphere =
-        throughput.mxms_per_hemisphere * tile;
+        std::max<int64_t>(2, throughput.mxms_per_hemisphere) * tile;
     result.columns_per_wave =
         memory.hemispheres * columnsPerHemisphere;
     result.wave_count =

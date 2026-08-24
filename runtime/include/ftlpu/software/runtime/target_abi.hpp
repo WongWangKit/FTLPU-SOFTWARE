@@ -24,6 +24,8 @@ struct ExecutableHardwareConfig {
     std::uint32_t sram_write_ports_per_slice{1};
     std::uint32_t streams_per_direction{32};
     std::uint32_t encoded_streams{64};
+    std::uint32_t c2c_streams_per_direction{hw::kC2cStreamsPerDirection};
+    std::uint32_t c2c_bytes_per_stream_per_cycle{hw::kPhysicalVectorBytes};
     std::uint32_t mem_boundary_register_columns{14};
     std::uint32_t system_register_columns{16};
     std::uint32_t mem_slices_per_register_group{4};
@@ -78,22 +80,29 @@ struct ExecutableHardwareConfig {
         visit_pre_v19_impl(*this, std::forward<Visitor>(visitor));
     }
 
+    template <typename Visitor>
+    constexpr void visit_pre_v20(Visitor&& visitor)
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor), true, false);
+    }
+
 private:
     template <typename Self, typename Visitor>
     static constexpr void visit_pre_v19_impl(Self& self, Visitor&& visitor)
     {
-        visit_impl(self, std::forward<Visitor>(visitor), false);
+        visit_impl(self, std::forward<Visitor>(visitor), false, false);
     }
 
     template <typename Self, typename Visitor>
     static constexpr void visit_impl(Self& self, Visitor&& visitor)
     {
-        visit_impl(self, std::forward<Visitor>(visitor), true);
+        visit_impl(self, std::forward<Visitor>(visitor), true, true);
     }
 
     template <typename Self, typename Visitor>
     static constexpr void visit_impl(Self& self, Visitor&& visitor,
-                                     bool include_accumulator_capacity)
+                                     bool include_accumulator_capacity,
+                                     bool include_c2c_fabric)
     {
         visitor(self.hemispheres); visitor(self.slices_per_hemisphere);
         visitor(self.banks_per_slice); visitor(self.words_per_bank);
@@ -101,6 +110,10 @@ private:
         visitor(self.sram_read_ports_per_slice);
         visitor(self.sram_write_ports_per_slice);
         visitor(self.streams_per_direction); visitor(self.encoded_streams);
+        if (include_c2c_fabric) {
+            visitor(self.c2c_streams_per_direction);
+            visitor(self.c2c_bytes_per_stream_per_cycle);
+        }
         visitor(self.mem_boundary_register_columns);
         visitor(self.system_register_columns);
         visitor(self.mem_slices_per_register_group); visitor(self.tile_rows);
@@ -158,7 +171,7 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     config.mxms_per_hemisphere =
         static_cast<std::uint32_t>(mxms_per_hemisphere);
     TargetAbiHasher hash;
-    hash.add(13); // Hardware ABI schema version (MXM accumulator capacity).
+    hash.add(14); // Hardware ABI schema version (dedicated C2C stream fabric).
     config.visit([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }
@@ -167,7 +180,7 @@ constexpr std::uint64_t executable_target_abi(
     const ExecutableHardwareConfig& config)
 {
     TargetAbiHasher hash;
-    hash.add(13); // Hardware ABI schema version (MXM accumulator capacity).
+    hash.add(14); // Hardware ABI schema version (dedicated C2C stream fabric).
     config.visit([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }

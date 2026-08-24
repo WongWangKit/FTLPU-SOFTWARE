@@ -3,6 +3,7 @@
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 
 #include <algorithm>
@@ -27,6 +28,43 @@ public:
     }
 
 private:
+    mlir::WalkResult reserveMemPlacement(mlir::Operation* operation,
+        mlir::DictionaryAttr placement, int64_t cycle, int64_t duration,
+        llvm::StringRef port)
+    {
+        const auto hemisphereAttr =
+            placement.getAs<mlir::StringAttr>("hemisphere");
+        const auto slicesAttr = placement.getAs<mlir::ArrayAttr>("slices");
+        if (!hemisphereAttr || !slicesAttr)
+            return mlir::WalkResult::advance();
+        const int64_t bank = placement.getAs<mlir::IntegerAttr>("bank")
+            ? placement.getAs<mlir::IntegerAttr>("bank").getInt()
+            : 0;
+        llvm::SmallVector<int64_t, 2> hemispheres;
+        if (hemisphereAttr.getValue() == "both")
+            hemispheres = {0, 1};
+        else
+            hemispheres.push_back(
+                hemisphereAttr.getValue() == "west" ? 1 : 0);
+        for (int64_t hemisphere : hemispheres) {
+            for (mlir::Attribute sliceAttr : slicesAttr) {
+                const int64_t slice =
+                    llvm::cast<mlir::IntegerAttr>(sliceAttr).getInt();
+                const std::string base = "mem."
+                    + std::to_string(hemisphere) + "."
+                    + std::to_string(slice) + ".bank"
+                    + std::to_string(bank) + ".";
+                auto queueResult = reserve(operation, base + "icu",
+                    cycle, duration, 1);
+                if (queueResult.wasInterrupted()) return queueResult;
+                auto portResult = reserve(operation, base + port.str(),
+                    cycle, duration, 1);
+                if (portResult.wasInterrupted()) return portResult;
+            }
+        }
+        return mlir::WalkResult::advance();
+    }
+
     mlir::WalkResult reserve(mlir::Operation* operation, std::string resource,
         int64_t start, int64_t repeatCount = 1, int64_t repeatInterval = 1)
     {
@@ -51,14 +89,43 @@ private:
 
     mlir::WalkResult verify(mlir::Operation* operation)
     {
+        if (auto op = llvm::dyn_cast<schedule::MemReadOp>(operation)) {
+            for (int64_t wave = 0;
+                 wave < op.getWaveCount().value_or(1); ++wave) {
+                auto result = reserveMemPlacement(operation,
+                    op.getPlacement(),
+                    op.getCycle()
+                        + wave * op.getWaveInterval().value_or(1),
+                    op.getDuration(), "read");
+                if (result.wasInterrupted()) return result;
+            }
+            return mlir::WalkResult::advance();
+        }
+        if (auto op = llvm::dyn_cast<schedule::MemWriteOp>(operation)) {
+            for (int64_t wave = 0;
+                 wave < op.getWaveCount().value_or(1); ++wave) {
+                auto result = reserveMemPlacement(operation,
+                    op.getPlacement(),
+                    op.getCycle()
+                        + wave * op.getWaveInterval().value_or(1),
+                    op.getDuration(), "write");
+                if (result.wasInterrupted()) return result;
+            }
+            return mlir::WalkResult::advance();
+        }
         if (auto op = llvm::dyn_cast<schedule::MemTransferOp>(operation)) {
+            const int64_t bank = op.getBank().value_or(0);
             const std::string base = "mem."
                 + std::to_string(op.getHemisphere()) + "."
-                + std::to_string(op.getSlice()) + ".";
+                + std::to_string(op.getSlice()) + ".bank"
+                + std::to_string(bank) + ".";
             for (int64_t wave = 0;
                  wave < op.getWaveCount().value_or(1); ++wave) {
                 const int64_t cycle = op.getCycle()
                     + wave * op.getWaveInterval().value_or(1);
+                auto queueResult = reserve(operation, base + "icu",
+                    cycle, op.getRepeatCount(), op.getRepeatInterval());
+                if (queueResult.wasInterrupted()) return queueResult;
                 if (op.getOpcode() == "read"
                     || op.getOpcode() == "read_write") {
                     auto result = reserve(operation, base + "read",
@@ -115,12 +182,30 @@ private:
                     + std::to_string(op.getHemisphere()),
                 op.getCycle(), op.getRepeatCount().value_or(1),
                 op.getRepeatInterval().value_or(1));
-        if (auto op = llvm::dyn_cast<schedule::MxmLoadOp>(operation))
-            return reserve(operation, "mxm.iw." + std::to_string(op.getUnitId()),
-                op.getCycle(), op.getDuration(), 1);
-        if (auto op = llvm::dyn_cast<schedule::MxmComputeOp>(operation))
-            return reserve(operation, "mxm.compute." + std::to_string(op.getUnitId()),
-                op.getCycle(), op.getDuration(), 1);
+        if (auto op = llvm::dyn_cast<schedule::MxmLoadOp>(operation)) {
+            for (int64_t group = 0;
+                 group < op.getGroupCount().value_or(1); ++group) {
+                auto result = reserve(operation,
+                    "mxm.iw." + std::to_string(op.getUnitId()),
+                    op.getCycle()
+                        + group * op.getGroupInterval().value_or(1),
+                    op.getDuration(), 1);
+                if (result.wasInterrupted()) return result;
+            }
+            return mlir::WalkResult::advance();
+        }
+        if (auto op = llvm::dyn_cast<schedule::MxmComputeOp>(operation)) {
+            for (int64_t wave = 0;
+                 wave < op.getWaveCount().value_or(1); ++wave) {
+                auto result = reserve(operation,
+                    "mxm.compute." + std::to_string(op.getUnitId()),
+                    op.getCycle()
+                        + wave * op.getWaveInterval().value_or(1),
+                    op.getDuration(), 1);
+                if (result.wasInterrupted()) return result;
+            }
+            return mlir::WalkResult::advance();
+        }
         return mlir::WalkResult::advance();
     }
 
@@ -143,6 +228,10 @@ public:
 
     void runOnOperation() final
     {
+        if (mlir::failed(mlir::verify(getOperation()))) {
+            signalPassFailure();
+            return;
+        }
         ScheduleVerifier verifier(getOperation());
         if (mlir::failed(verifier.run())) signalPassFailure();
     }

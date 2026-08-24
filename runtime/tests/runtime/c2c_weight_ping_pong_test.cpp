@@ -40,7 +40,7 @@ void run_test()
     constexpr std::size_t vectors = 3;
     constexpr std::uint64_t ddr4_address = 0x1000;
 
-    C2cDmaSystem system(Ddr4Config {8, 2, 2, 4});
+    C2cDmaSystem system(Ddr4Config {32, 2, 2, 256, 8});
     const auto current = make_vector(0x10);
     for (std::size_t tile = 0; tile < hw::kTileRows; ++tile)
         for (std::size_t lane = 0; lane < hw::kLanesPerTile; ++lane)
@@ -67,21 +67,18 @@ void run_test()
             ddr4_address, vectors}},
     });
 
-    const std::size_t next_queue = InstructionControlUnit::mem_queue(
-        hemisphere, slice, next_bank);
     bool overlapped_bank_issue = false;
     for (std::size_t cycle = 0; cycle < 512 && !pager.ready(); ++cycle) {
         pager.tick();
         overlapped_bank_issue = overlapped_bank_issue
             || (system.chip().icu().mem_iq(current_queue).last_trace().action
                     == IcuQueueAction::FunctionalIssue
-                && system.chip().icu().mem_iq(next_queue).last_trace().action
-                    == IcuQueueAction::FunctionalIssue);
+                && system.dma(hemisphere).last_beat().has_value());
     }
 
     require(pager.ready(), "next-layer C2C weight page did not become ready");
     require(overlapped_bank_issue,
-        "current-bank reads did not overlap next-bank C2C writes");
+        "current-bank reads did not overlap the dedicated C2C data path");
     require(pager.stats().layer == 1 && pager.stats().bank == next_bank,
         "weight pager lost layer or bank identity");
     require(pager.stats().vectors == vectors

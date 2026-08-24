@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -82,7 +83,7 @@ try {
         throw std::runtime_error(
             "usage: hf_decoder_stack_checkpoint_test model.ftlpum");
     using namespace ftlpu::software::runtime;
-    auto system = std::make_unique<ftlpu::TspSliceSystem>();
+    auto system = std::make_unique<ftlpu::C2cDmaSystem>();
     ModelSession session(*system);
     session.load_file(std::filesystem::path(argv[1]));
     session.set_input("hidden.0", session.value("golden.input"));
@@ -107,9 +108,13 @@ try {
                   << " max_tolerance_ratio="
                   << error.maximumToleranceRatio
                   << " tolerance_violations="
-                  << error.toleranceViolations << '\n';
-        passed &= error.toleranceViolations == 0
+                  << error.toleranceViolations << std::endl;
+        const bool checkpointPassed = error.toleranceViolations == 0
             && error.mean <= 0.04;
+        passed &= checkpointPassed;
+        if (!checkpointPassed
+            && std::getenv("FTLPU_CHECKPOINT_FAIL_FAST") != nullptr)
+            break;
     }
     if (!passed)
         throw std::logic_error(

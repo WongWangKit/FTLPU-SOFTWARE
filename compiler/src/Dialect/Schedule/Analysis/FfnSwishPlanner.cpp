@@ -34,12 +34,10 @@ mlir::FailureOr<std::vector<int64_t>> planFfnSwishCycles(
     for (int64_t hemisphere = 0;
          hemisphere < target.memory().hemispheres; ++hemisphere) {
         llvm::SmallVector<int64_t, 8> tempSlices;
-        tempSlices.append(
-            target.memory().w8a16_fused_gate_temp_slices.begin(),
-            target.memory().w8a16_fused_gate_temp_slices.end());
-        tempSlices.append(
-            target.memory().w8a16_fused_up_temp_slices.begin(),
-            target.memory().w8a16_fused_up_temp_slices.end());
+        const auto gateTempSlices = target.ffn_gate_temp_slices();
+        const auto upTempSlices = target.ffn_up_temp_slices();
+        tempSlices.append(gateTempSlices.begin(), gateTempSlices.end());
+        tempSlices.append(upTempSlices.begin(), upTempSlices.end());
         for (FfnCycleWindow busy :
              request.temp_mem_windows[static_cast<std::size_t>(hemisphere)]) {
             if (busy.end <= busy.start) return mlir::failure();
@@ -66,15 +64,13 @@ mlir::FailureOr<std::vector<int64_t>> planFfnSwishCycles(
         for (const auto& resource : allVxmAlus)
             windows.push_back(
                 {resource.resource, 0, request.tile_rows + 5});
-        for (int64_t slice :
-             target.memory().w8a16_fused_gate_temp_slices) {
+        for (int64_t slice : target.ffn_gate_temp_slices()) {
             windows.push_back({resourceModel.mem_read_port(task.hemisphere, slice),
                 0, request.tile_rows});
             windows.push_back({resourceModel.mem_write_port(task.hemisphere, slice),
                 0, request.tile_rows});
         }
-        for (int64_t slice :
-             target.memory().w8a16_fused_up_temp_slices) {
+        for (int64_t slice : target.ffn_up_temp_slices()) {
             windows.push_back({resourceModel.mem_read_port(task.hemisphere, slice),
                 0, request.tile_rows});
             windows.push_back({resourceModel.mem_write_port(task.hemisphere, slice),

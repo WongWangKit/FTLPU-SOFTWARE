@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 19;
+inline constexpr std::uint32_t kBinaryFormatVersion = 22;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -48,6 +48,9 @@ enum class BindingLayout : std::uint16_t {
     Fp16MxmBlock8Distributed16 = 16,
     Fp16VxmRowParallel8 = 17,
     W8A16MxmWeightReplicated = 18,
+    Fp16CausalMaskTile = 19,
+    Fp16ProbabilityX16 = 20,
+    Fp16ProbabilityDiagonal = 21,
 };
 
 enum class BindingInitializer : std::uint16_t {
@@ -81,6 +84,25 @@ struct BinaryBinding {
     BindingInitializer initializer{BindingInitializer::None};
     float rope_theta{0.0f};
     std::uint32_t rope_head_dim{0};
+    // Intra-executable ping-pong paging metadata. A paged binding contains
+    // the logical tensor; only one page is resident in each physical bank.
+    bool paged_weight{false};
+    std::uint32_t page_count{0};
+    std::uint32_t page_rows{0};
+    std::uint32_t page_granularity{0};
+    std::uint32_t page_role_group_base{0};
+    std::uint32_t page_role_group_count{0};
+    std::uint32_t page_items_per_slice_group{0};
+    std::uint32_t page_bank_count{0};
+    std::vector<std::uint16_t> page_storage_slices{};
+};
+
+struct BinaryWeightPageUse {
+    std::uint32_t binding_index{0};
+    std::uint32_t page_index{0};
+    std::uint16_t bank{0};
+    std::uint64_t ready_cycle{0};
+    std::uint64_t release_cycle{0};
 };
 
 enum class VxmImmediateOperand : std::uint16_t {
@@ -133,6 +155,7 @@ struct BinaryProgram {
     std::vector<BinaryMemoryFloor> memory_floors{};
     std::vector<BinaryScaleRelocation> scale_relocations{};
     std::vector<BinaryAddressRelocation> address_relocations{};
+    std::vector<BinaryWeightPageUse> weight_page_uses{};
 };
 
 void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path);

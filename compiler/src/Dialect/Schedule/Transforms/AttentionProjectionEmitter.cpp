@@ -937,6 +937,16 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
     bool fusedSoftmax)
 {
     const AttentionMemoryLayout layout(op_, target_);
+    const auto placementBank = [&](llvm::StringRef name) {
+        const auto placement =
+            op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(name);
+        const auto bank = placement
+            ? placement.getAs<mlir::IntegerAttr>("bank")
+            : mlir::IntegerAttr {};
+        return bank ? bank.getInt() : 0;
+    };
+    const int64_t queryBank = placementBank("query");
+    const int64_t keyBank = placementBank("key");
     const auto elementType =
         llvm::cast<mlir::RankedTensorType>(op_.getInput().getType())
             .getElementType();
@@ -992,7 +1002,7 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                             work->hemisphere * target_.memory().slices_per_hemisphere + slice,
                             "read", queryAddress,
                             work->local_mxm * static_cast<int64_t>(iwSlices.size()) + stream,
-                            1, 1, 0);
+                            1, 1, 0, "sram", -1, queryBank);
                     }
                     emitMxm(rewriter_, op_.getLoc(), iwCycle, mxm, "iw",
                         reduction
@@ -1020,7 +1030,8 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                             work->hemisphere * target_.memory().slices_per_hemisphere + slice,
                             "read", layout.keyAddress(work->kv_head,
                                 reduction, keyBlock),
-                            activationStream + byte, tile, 1, 1);
+                            activationStream + byte, tile, 1, 1,
+                            "sram", -1, keyBank);
                     }
                     emitMxm(rewriter_, op_.getLoc(), computeCycle, mxm, "compute",
                         reduction
@@ -1031,13 +1042,14 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                         1,
                         finalReduction ? "stream" : "sram",
                         finalReduction,
-                        "supercell", 0, dataFormat);
+                        "supercell", 0, dataFormat, {}, {},
+                        finalReduction ? dataFormat : llvm::StringRef {});
                     if (!fusedSoftmax && finalReduction) {
-                        // Tail softmax runs after all QK waves, so completed
-                        // FP32 scores must leave the finite MXM accumulator.
-                        // Write the four result byte streams directly to the
-                        // score plane and clear the reusable accumulator rows.
-                        for (int64_t byte = 0; byte < 4; ++byte) {
+                        // Tail softmax consumes compact 16-bit scores. The
+                        // final partial converts in the accumulator and clears
+                        // the row while streaming, avoiding a separate FP32
+                        // accumulator-read/cast pass.
+                        for (int64_t byte = 0; byte < 2; ++byte) {
                             const int64_t slice =
                                 layout.scaledScoreSlices(work->local_mxm)[byte];
                             const auto latency = target_.transport_latency(
@@ -1055,7 +1067,11 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart,
                                 "write", layout.scoreAddress(
                                     work->query_head, work->query_block,
                                     keyBlock * tile),
-                                32 + outputStream + byte, tile, 1, 1);
+                                32 + outputStream + byte, tile, 1, 1,
+                                "sram", -1,
+                                placementBank(work->local_mxm == 0
+                                        ? "score"
+                                        : "score_mxm1"));
                         }
                     }
                 }

@@ -86,7 +86,7 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
         const auto result = strategy->uses_block8()
             ? fixed_allocation(PlacementKind::FinalResult,
                   resultSlices,
-                  target.memory().accumulator_scratch_base_row,
+                  target.memory().matmul_result_base_row,
                   op.getM() * op.getN()
                       / distributedElementsPerRow,
                   resultBytes, "fp16_mxm_block8_distributed_16",

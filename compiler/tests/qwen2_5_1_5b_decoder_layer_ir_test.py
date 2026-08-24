@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import shutil
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 
@@ -27,6 +30,125 @@ def require(text: str, markers: tuple[str, ...], layer: str) -> None:
     missing = [marker for marker in markers if marker not in text]
     if missing:
         raise AssertionError(f"{layer} IR is missing {missing}")
+
+
+def parse_placement(body: str) -> dict[str, object]:
+    def integer(name: str) -> int:
+        match = re.search(rf"\b{name} = (-?\d+) : i64", body)
+        if not match:
+            raise AssertionError(f"placement is missing {name}: {body}")
+        return int(match.group(1))
+
+    kind = re.search(r'\bkind = "([^"]+)"', body)
+    slices = re.search(r"\bslices = \[([^\]]*)\]", body)
+    if not kind or not slices:
+        raise AssertionError(f"malformed placement: {body}")
+    return {
+        "bank": integer("bank"),
+        "base": integer("base_row"),
+        "count": integer("instruction_count"),
+        "kind": kind.group(1),
+        "slices": tuple(int(value) for value in re.findall(r"\d+", slices.group(1))),
+    }
+
+
+def validate_paged_weights(tensor: str, target_config: Path,
+                           weight_bank: int) -> None:
+    placements = [parse_placement(match.group(1)) for match in
+                  re.finditer(r"placement = \{([^{}]+)\}", tensor)]
+    weights = [placement for placement in placements
+               if str(placement["kind"]).startswith("w8a16_")]
+    for name in ("query_weight", "key_weight", "value_weight", "output_weight"):
+        match = re.search(rf"\b{name} = \{{([^{{}}]+)\}}", tensor)
+        if not match:
+            raise AssertionError(f"attention memory plan has no {name}")
+        weights.append(parse_placement(match.group(1)))
+    for line in tensor.splitlines():
+        if "ftlpu.tensor.rms_norm_task" not in line:
+            continue
+        section = line.split("weight_allocations = [", 1)
+        if len(section) != 2:
+            raise AssertionError("RMSNorm task has no weight allocation")
+        match = re.search(r"placement = \{([^{}]+)\}", section[1])
+        if not match:
+            raise AssertionError("RMSNorm weight has no placement")
+        weights.append(parse_placement(match.group(1)))
+
+    expected = Counter({
+        ("w8a16_attention_weight_striped", 4608): 1,
+        ("w8a16_attention_weight_striped", 768): 2,
+        ("w8a16_mxm_weight_striped", 4608): 1,
+        ("w8a16_block8_weight_wave_striped", 26880): 3,
+        ("fp16_vxm_row_parallel_8", 1536): 2,
+    })
+    observed = Counter((str(weight["kind"]), int(weight["count"]))
+                       for weight in weights)
+    if observed != expected:
+        raise AssertionError(
+            f"paged weight layouts differ: observed={observed}, expected={expected}")
+
+    target = json.loads(target_config.read_text(encoding="utf-8"))
+    bank_rows = int(target.get("memory", {}).get("words_per_bank", 8192))
+    for weight in weights:
+        if weight["bank"] != weight_bank:
+            raise AssertionError(
+                f"weight is in bank {weight['bank']}, expected {weight_bank}")
+        if weight["base"] < 0 or weight["base"] + weight["count"] > bank_rows:
+            raise AssertionError(
+                f"weight placement exceeds {bank_rows} rows: {weight}")
+
+    for index, lhs in enumerate(weights):
+        lhs_slices = set(lhs["slices"])
+        lhs_end = int(lhs["base"]) + int(lhs["count"])
+        for rhs in weights[index + 1:]:
+            if lhs["bank"] != rhs["bank"] or not lhs_slices.intersection(rhs["slices"]):
+                continue
+            rhs_end = int(rhs["base"]) + int(rhs["count"])
+            if int(lhs["base"]) < rhs_end and int(rhs["base"]) < lhs_end:
+                raise AssertionError(
+                    f"paged weights overlap on a shared slice: {lhs} vs {rhs}")
+
+    working_bank = (weight_bank + 1) % int(
+        target.get("memory", {}).get("banks_per_slice", 1)
+    )
+    if working_bank == weight_bank:
+        raise AssertionError("paged lowering requires a separate working bank")
+
+    attention_workspaces = (
+        "input_staging", "query", "key", "value", "score",
+        "score_mxm1", "exp", "exp_mxm1", "causal_mask",
+        "causal_mask_mxm1", "fused_score", "fused_score_bank1",
+        "fused_causal_mask", "fused_causal_mask_bank1",
+        "probability_pack", "probability_diagonal", "rope",
+        "rope_staging", "rope_product", "context",
+        "output_activation", "result",
+    )
+    for name in attention_workspaces:
+        matches = re.findall(rf"\b{name} = \{{([^{{}}]+)\}}", tensor)
+        for body in matches:
+            placement = parse_placement(body)
+            if placement["bank"] != working_bank:
+                raise AssertionError(
+                    f"attention workspace {name} is in weight bank: "
+                    f"{placement}"
+                )
+
+    for line in tensor.splitlines():
+        if "ftlpu.tensor.rms_norm_task" not in line:
+            continue
+        for section_name, end_marker in (
+            ("result_allocations", "scratch_allocations"),
+            ("scratch_allocations", "weight_allocations"),
+        ):
+            section = line.split(f"{section_name} = [", 1)[1]
+            section = section.split(f"], {end_marker}", 1)[0]
+            for body in re.findall(r"placement = \{([^{}]+)\}", section):
+                placement = parse_placement(body)
+                if placement["bank"] != working_bank:
+                    raise AssertionError(
+                        f"RMSNorm {section_name} is in weight bank: "
+                        f"{placement}"
+                    )
 
 
 def main() -> None:
@@ -69,16 +191,7 @@ def main() -> None:
         'kind = "fp16_mxm_distributed_16"',
     ), "Tensor")
     if args.weight_bank is not None:
-        require(tensor, (
-            f"bank = {args.weight_bank} : i64, base_row = 0 : i64",
-            "instruction_count = 4608 : i64, kind = \"w8a16_attention_weight_striped\"",
-            "base_row = 4608 : i64, hemisphere = \"both\", instruction_count = 768 : i64",
-            "base_row = 5376 : i64, hemisphere = \"both\", instruction_count = 768 : i64",
-            "base_row = 6144 : i64, hemisphere = \"both\", instruction_count = 4608 : i64",
-            "instruction_count = 26880 : i64, kind = \"w8a16_mxm_weight_striped\"",
-            "instruction_count = 13440 : i64, kind = \"w8a16_block8_weight_wave_striped\"",
-            "word = 32384 : i64", "word = 32576 : i64",
-        ), "Paged Tensor")
+        validate_paged_weights(tensor, args.target_config, args.weight_bank)
 
     stream = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.stream.mlir",

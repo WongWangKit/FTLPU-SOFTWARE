@@ -5,6 +5,7 @@
 #include "ftlpu/compiler/Target/mxm_execution_strategy.hpp"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <algorithm>
 
@@ -57,6 +58,10 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             * target.throughput().lanes_per_tile;
     };
     const bool paged_weights = weight_bank >= 0;
+    const int64_t scratch_bank = paged_weights
+        ? (weight_bank + 1) % target.memory().banks_per_slice : 0;
+    const int64_t secondary_scratch_bank = paged_weights
+        ? weight_bank : scratch_bank;
     const auto weight_slices = paged_weights
         ? target.page_resident_attention_weight_slices(block8_attention)
         : target.attention_weight_slices();
@@ -92,6 +97,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t rope_staging_rows =
         2 * target.memory().slices_per_hemisphere * head_blocks * blocks
         * (tile / block_rows);
+    const int64_t rope_product_rows =
+        (query_heads + kv_heads) * (head_blocks / 2) * 4
+        * ((seq_len + 1) / 2);
+    const int64_t rope_workspace_rows =
+        rope_staging_rows + rope_product_rows;
     const int64_t score_rows = query_heads * blocks * seq_len;
     const int64_t probability_pack_rows = query_heads * blocks
         * (seq_len / target.throughput().lanes_per_tile);
@@ -108,16 +118,16 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t input_staging_base =
         target.memory().words_per_bank - input_staging_rows;
     llvm::SmallVector<int64_t, 36> scratch_candidates;
-    for (int64_t slice = 0;
-         slice < target.memory().accumulator_slice_base; ++slice)
-        scratch_candidates.push_back(slice);
+    scratch_candidates = target.activation_storage_slices();
+    const llvm::SmallVector<int64_t, 2> scratch_banks {
+        scratch_bank, secondary_scratch_bank};
     tensor::PhysicalMemoryAllocator physical_allocator(target);
     const llvm::SmallVector<int64_t, 16> input_staging_slices(
         planar_activation_slices.begin(),
         planar_activation_slices.begin() + 2);
     if (mlir::failed(physical_allocator.reserve({"input_staging",
             input_staging_slices, input_staging_base,
-            input_staging_rows, 0, 2, true}))) {
+            input_staging_rows, 0, 2, true, scratch_bank}))) {
         op.emitError("failed to reserve the attention input staging buffer");
         return mlir::failure();
     }
@@ -136,7 +146,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             llvm::SmallVector<int64_t, 16>(
                 output_weight_slices.begin(), output_weight_slices.end()),
             output_weight_base, o_weight_rows,
-            0, 6, false}))) {
+            0, 6, false, std::max<int64_t>(0, weight_bank)}))) {
         op.emitError("failed to reserve the live O-projection weights");
         return mlir::failure();
     }
@@ -145,8 +155,45 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         target.attention_rope_staging_slices();
     const llvm::SmallVector<int64_t, 16> rope_staging_slices(
         staging_slice_values.begin(), staging_slice_values.end());
+    const int64_t rope_staging_bank = target.uses_dedicated_slice_roles()
+        ? secondary_scratch_bank : scratch_bank;
+    const auto rope_product_slice_values =
+        target.mxm_distributed_activation_slices();
+    const llvm::SmallVector<int64_t, 16> rope_product_slices(
+        rope_product_slice_values.begin(),
+        rope_product_slice_values.end());
+    llvm::SmallVector<int64_t, 4> rope_table_slices;
+    int64_t rope_table_bank = scratch_bank;
+    if (block8_attention && target.memory().banks_per_slice > 1) {
+        llvm::SmallDenseSet<int64_t, 64> reserved;
+        const auto reserve = [&](llvm::ArrayRef<int64_t> slices) {
+            for (int64_t slice : slices) reserved.insert(slice);
+        };
+        reserve(weight_slices);
+        reserve(output_weight_slices);
+        reserve(target.ffn_projection_weight_slices(
+            target::FfnProjectionKind::Gate));
+        reserve(target.ffn_projection_weight_slices(
+            target::FfnProjectionKind::Up));
+        reserve(target.ffn_down_projection_weight_slices(true));
+        reserve(rope_product_slices);
+        for (int64_t slice = 0;
+             slice < target.memory().slices_per_hemisphere
+             && rope_table_slices.size() < 4; ++slice)
+            if (!reserved.contains(slice))
+                rope_table_slices.push_back(slice);
+        if (rope_table_slices.size() != 4) {
+            op.emitError(
+                "target cannot place a four-slice RoPE table away from resident weights");
+            return mlir::failure();
+        }
+    } else {
+        const auto slices = target.attention_rope_slices();
+        rope_table_slices.assign(slices.begin(), slices.end());
+    }
     if (mlir::failed(physical_allocator.reserve({"rope_staging",
-            rope_staging_slices, 0, rope_staging_rows, 0, 2}))) {
+            rope_staging_slices, 0, rope_workspace_rows, 0, 2, true,
+            rope_staging_bank}))) {
         op.emitError("failed to reserve the attention RoPE staging FIFO");
         return mlir::failure();
     }
@@ -155,16 +202,40 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             probability_pack_slices.begin(), probability_pack_slices.end()),
             target.attention_probability_pack_base_row(),
             probability_pack_rows,
-            3, 5}))) {
+            3, 4, true, scratch_bank}))) {
         op.emitError("failed to reserve the attention probability-pack layout");
+        return mlir::failure();
+    }
+    if (mlir::failed(physical_allocator.reserve({"probability_diagonal",
+            rope_product_slices,
+            target.attention_probability_diagonal_base_row(),
+            query_heads * blocks * blocks
+                * target.throughput().tile_rows,
+            4, 5, true, scratch_bank}))) {
+        op.emitError(
+            "failed to reserve the attention probability-diagonal ports");
+        return mlir::failure();
+    }
+    const auto output_activation_slice_values =
+        target.attention_output_activation_slices(paged_weights);
+    const llvm::SmallVector<int64_t, 16> output_activation_slices(
+        output_activation_slice_values.begin(),
+        output_activation_slice_values.end());
+    if (mlir::failed(physical_allocator.reserve({"output_activation",
+            output_activation_slices, output_activation_base,
+            output_activation_rows, 5, 6, true, scratch_bank}))) {
+        op.emitError(
+            "failed to reserve the attention output-activation ports");
         return mlir::failure();
     }
     if (target.memory().slices_per_hemisphere < 16) {
         op.emitError("target cannot reserve fused attention scratch banks");
         return mlir::failure();
     }
-    const int64_t fused_slice_base =
-        target.memory().slices_per_hemisphere - 16;
+    const auto activation_storage = target.activation_storage_slices();
+    const int64_t fused_slice_base = target.uses_dedicated_slice_roles()
+        ? activation_storage.front()
+        : target.memory().slices_per_hemisphere - 16;
     const llvm::SmallVector<int64_t, 16> fused_score0 {
         fused_slice_base, fused_slice_base + 1,
         fused_slice_base + 2, fused_slice_base + 3};
@@ -172,24 +243,22 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         fused_slice_base + 4, fused_slice_base + 5,
         fused_slice_base + 6, fused_slice_base + 7};
     const llvm::SmallVector<int64_t, 16> fused_mask0 {
-        fused_slice_base + 8, fused_slice_base + 9,
-        fused_slice_base + 10, fused_slice_base + 11};
+        fused_slice_base + 8, fused_slice_base + 9};
     const llvm::SmallVector<int64_t, 16> fused_mask1 {
-        fused_slice_base + 12, fused_slice_base + 13,
-        fused_slice_base + 14, fused_slice_base + 15};
+        fused_slice_base + 10, fused_slice_base + 11};
     for (const auto& reservation : {
              tensor::PhysicalAllocation {"fused_score",
-                 fused_score0, target.attention_score_base_row(),
-                 score_rows, 2, 3},
+                  fused_score0, target.attention_score_base_row(),
+                  score_rows, 2, 3, true, secondary_scratch_bank},
              tensor::PhysicalAllocation {"fused_score_bank1",
-                 fused_score1, target.attention_score_base_row(),
-                 score_rows, 2, 3},
+                  fused_score1, target.attention_score_base_row(),
+                  score_rows, 2, 3, true, secondary_scratch_bank},
              tensor::PhysicalAllocation {"fused_causal_mask",
-                 fused_mask0, target.attention_mask_base_row(),
-                 tile - 1, 2, 3},
+                  fused_mask0, target.attention_mask_base_row(),
+                  tile - 1, 2, 3, true, secondary_scratch_bank},
              tensor::PhysicalAllocation {"fused_causal_mask_bank1",
-                 fused_mask1, target.attention_mask_base_row(),
-                 tile - 1, 2, 3}}) {
+                  fused_mask1, target.attention_mask_base_row(),
+                  tile - 1, 2, 3, true, secondary_scratch_bank}}) {
         if (mlir::failed(physical_allocator.reserve(reservation))) {
             op.emitError("failed to reserve fused attention scratch");
             return mlir::failure();
@@ -203,7 +272,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                                       int64_t live_end)
         -> mlir::FailureOr<tensor::PhysicalAllocation> {
         return physical_allocator.allocate({name.str(), slice_count,
-            base_row, rows, live_start, live_end, scratch_candidates});
+            base_row, rows, live_start, live_end, scratch_candidates,
+            true, scratch_banks});
     };
     auto score0 = allocate_scratch(
         "score_mxm0", 4, target.attention_score_base_row(),
@@ -218,14 +288,19 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         "exp_mxm1", 4, target.attention_score_base_row(),
         score_rows, 2, 3);
     auto mask0 = allocate_scratch(
-        "causal_mask_mxm0", 4, target.attention_mask_base_row(),
+        "causal_mask_mxm0", 2, target.attention_mask_base_row(),
         tile - 1, 2, 3);
     auto mask1 = allocate_scratch(
-        "causal_mask_mxm1", 4, target.attention_mask_base_row(),
+        "causal_mask_mxm1", 2, target.attention_mask_base_row(),
         tile - 1, 2, 3);
+    auto context = allocate_scratch(
+        "context",
+        static_cast<int64_t>(target.attention_context_slices().size()),
+        target.attention_context_base_row(), context_rows, 4, 6);
     if (mlir::failed(score0) || mlir::failed(score1)
         || mlir::failed(exp0) || mlir::failed(exp1)
-        || mlir::failed(mask0) || mlir::failed(mask1)) {
+        || mlir::failed(mask0) || mlir::failed(mask1)
+        || mlir::failed(context)) {
         op.emitError("attention scratch memory allocation failed");
         return mlir::failure();
     }
@@ -247,7 +322,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr("input_staging",
             make_attention_placement(rewriter,
                 "fp16_pair_planar", input_staging_slices,
-                input_staging_base, input_staging_rows, "both")),
+                input_staging_base, input_staging_rows, "both",
+                scratch_bank)),
         rewriter.getNamedAttr("query_weight", make_attention_placement(rewriter,
             "w8a16_attention_weight_striped", weight_slices, 0, q_weight_rows, "both",
             std::max<int64_t>(0, weight_bank))),
@@ -262,83 +338,107 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             o_weight_rows, "both", std::max<int64_t>(0, weight_bank))),
         rewriter.getNamedAttr("query", make_attention_placement(rewriter,
             "fp16_query_iw", output_slices,
-            target.attention_query_iw_base_row(), query_rows, "both")),
+            target.attention_query_iw_base_row(), query_rows, "both",
+            scratch_bank)),
         rewriter.getNamedAttr("key", make_attention_placement(rewriter,
             "fp16_head_planar", key_slices, 0,
-            kv_heads * logical_head_banks * seq_len, "both")),
+            kv_heads * logical_head_banks * seq_len, "both",
+            scratch_bank)),
         rewriter.getNamedAttr("value", make_attention_placement(rewriter,
             "fp16_value_x16", target.attention_value_slices(),
             target.attention_value_base_row(),
             kv_heads * (head_dim / tile) * blocks
-                * target.throughput().tile_rows, "both")),
+                * target.throughput().tile_rows, "both", scratch_bank)),
         rewriter.getNamedAttr("score", make_attention_placement(rewriter,
             "fp16_score_block", score0->slices,
-            target.attention_score_base_row(), score_rows, "both")),
+            target.attention_score_base_row(), score_rows, "both",
+            score0->bank)),
         rewriter.getNamedAttr("score_mxm1", make_attention_placement(rewriter,
             "fp16_score_block", score1->slices,
-            target.attention_score_base_row(), score_rows, "both")),
+            target.attention_score_base_row(), score_rows, "both",
+            score1->bank)),
         rewriter.getNamedAttr("exp", make_attention_placement(rewriter,
             "fp16_score_block", exp0->slices,
-            target.attention_score_base_row(), score_rows, "both")),
+            target.attention_score_base_row(), score_rows, "both",
+            exp0->bank)),
         rewriter.getNamedAttr("exp_mxm1", make_attention_placement(rewriter,
             "fp16_score_block", exp1->slices,
-            target.attention_score_base_row(), score_rows, "both")),
+            target.attention_score_base_row(), score_rows, "both",
+            exp1->bank)),
         rewriter.getNamedAttr("causal_mask", make_attention_placement(rewriter,
-            "fp32_causal_mask_tile", mask0->slices,
-            target.attention_mask_base_row(), tile - 1, "both")),
+            "fp16_causal_mask_tile", mask0->slices,
+            target.attention_mask_base_row(), tile - 1, "both",
+            mask0->bank)),
         rewriter.getNamedAttr("causal_mask_mxm1", make_attention_placement(rewriter,
-            "fp32_causal_mask_tile", mask1->slices,
-            target.attention_mask_base_row(), tile - 1, "both")),
+            "fp16_causal_mask_tile", mask1->slices,
+            target.attention_mask_base_row(), tile - 1, "both",
+            mask1->bank)),
         rewriter.getNamedAttr("fused_score", make_attention_placement(rewriter,
             "fp32_score_block", fused_score0,
-            target.attention_score_base_row(), score_rows, "both")),
+            target.attention_score_base_row(), score_rows, "both",
+            secondary_scratch_bank)),
         rewriter.getNamedAttr("fused_score_bank1", make_attention_placement(rewriter,
             "fp32_score_block", fused_score1,
-            target.attention_score_base_row(), score_rows, "both")),
+            target.attention_score_base_row(), score_rows, "both",
+            secondary_scratch_bank)),
         rewriter.getNamedAttr("fused_causal_mask", make_attention_placement(rewriter,
-            "fp32_causal_mask_tile", fused_mask0,
-            target.attention_mask_base_row(), tile - 1, "both")),
+            "fp16_causal_mask_tile", fused_mask0,
+            target.attention_mask_base_row(), tile - 1, "both",
+            secondary_scratch_bank)),
         rewriter.getNamedAttr("fused_causal_mask_bank1", make_attention_placement(rewriter,
-            "fp32_causal_mask_tile", fused_mask1,
-            target.attention_mask_base_row(), tile - 1, "both")),
+            "fp16_causal_mask_tile", fused_mask1,
+            target.attention_mask_base_row(), tile - 1, "both",
+            secondary_scratch_bank)),
         rewriter.getNamedAttr("probability_pack", make_attention_placement(rewriter,
             "fp16_probability_x16", target.attention_query_iw_slices(1),
             target.attention_probability_pack_base_row(),
             query_heads * blocks
-                * (seq_len / target.throughput().lanes_per_tile), "both")),
+                * (seq_len / target.throughput().lanes_per_tile), "both",
+            scratch_bank)),
         rewriter.getNamedAttr("probability_diagonal", make_attention_placement(rewriter,
-            "fp16_probability_diagonal", target.attention_query_iw_slices(0),
+            "fp16_probability_diagonal",
+            block8_attention ? rope_product_slices
+                             : llvm::ArrayRef<int64_t>(
+                                   target.attention_query_iw_slices(0)),
             target.attention_probability_diagonal_base_row(),
             query_heads * blocks * blocks
-                * target.throughput().tile_rows, "both")),
+                * target.throughput().tile_rows, "both",
+            scratch_bank)),
         rewriter.getNamedAttr("rope", make_attention_placement(rewriter,
-            "fp16_rope_table", target.attention_rope_slices(),
+            "fp16_rope_table", rope_table_slices,
             target.attention_probability_diagonal_base_row(),
-            rope_rows, "both")),
+            rope_rows, "both", rope_table_bank)),
         rewriter.getNamedAttr("rope_staging",
             make_attention_placement(rewriter,
                 "fp16_rope_fifo_x16", rope_staging_slices,
-                0, rope_staging_rows, "both")),
+                0, rope_workspace_rows, "both", rope_staging_bank)),
+        rewriter.getNamedAttr("rope_product",
+            make_attention_placement(rewriter,
+                "fp16_rope_product_x16", rope_product_slices,
+                rope_staging_rows, rope_product_rows, "both",
+                scratch_bank)),
         rewriter.getNamedAttr("context", make_attention_placement(rewriter,
-            "fp16_head_planar", target.attention_context_slices(),
-            target.attention_context_base_row(), context_rows, "both")),
+            "fp16_head_planar", context->slices,
+            target.attention_context_base_row(), context_rows, "both",
+            context->bank)),
         rewriter.getNamedAttr("output_activation",
             block8_attention
                 ? make_attention_placement(rewriter,
                       "fp16_mxm_distributed_16",
-                      target.attention_output_activation_slices(),
+                      target.attention_output_activation_slices(
+                          paged_weights),
                       output_activation_base,
-                      output_activation_rows, "both")
+                      output_activation_rows, "both", scratch_bank)
                 : make_attention_placement(rewriter,
                       "fp16_pair_planar", input_staging_slices,
                       input_staging_base, input_staging_rows,
-                      "both")),
+                      "both", scratch_bank)),
         rewriter.getNamedAttr("result", make_attention_placement(rewriter,
             block8_attention
                 ? "fp16_mxm_block8_distributed_16"
                 : "fp16_pair_planar",
             block8_attention
-                ? target.attention_output_activation_slices()
+                ? target.attention_block8_result_slices(paged_weights)
                 : target.attention_result_slices(),
             block8_attention
                 ? distributed_result_base
@@ -346,7 +446,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             block8_attention
                 ? seq_len * hidden / (tile * block_rows)
                 : seq_len * hidden / (tile * 2),
-            block8_attention ? "both" : "east")),
+            block8_attention ? "both" : "east",
+            secondary_scratch_bank)),
     });
     const auto config = rewriter.getDictionaryAttr({
         rewriter.getNamedAttr(
@@ -447,7 +548,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         graph.query.getLhs(), graph.query.getRhs(),
         "query", matrixType(seq_len, query_width),
         subplan({"input", "input_staging",
-            "query_weight", "query", "rope_staging"}));
+            "query_weight", "query", "rope_staging", "rope_product"}));
     auto key = createProjection(
         graph.key.getLhs(), graph.key.getRhs(),
         "key", matrixType(seq_len, kv_width),

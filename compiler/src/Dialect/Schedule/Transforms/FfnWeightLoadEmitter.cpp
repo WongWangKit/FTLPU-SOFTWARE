@@ -2,6 +2,9 @@
 
 #include "ftlpu/compiler/Support/float_format.hpp"
 
+#include <algorithm>
+#include <cassert>
+
 namespace ftlpu::compiler::schedule::ffn_detail {
 namespace {
 
@@ -19,7 +22,8 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Type dequantizedType, llvm::ArrayRef<int64_t> weightSlices,
     const target::LPUTargetModel& target, float scale, int64_t startCycle,
     int64_t baseRow, int64_t hemisphere, int64_t localMxm,
-    int64_t unit, int64_t weightBuffer, bool localDequant)
+    int64_t unit, int64_t weightBuffer, bool localDequant,
+    int64_t bank, int64_t pageIndex, int64_t logicalBaseRow)
 {
     const auto& throughput = target.throughput();
     const int64_t duration =
@@ -27,35 +31,57 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     const int64_t encodedStreamBase =
         target.streams().streams_per_direction;
     const auto hemi = hemisphere_name(hemisphere);
+    constexpr auto direction = target::StreamDirection::East;
+    constexpr auto directionName = "east";
     const auto dataFormat = lpu_16bit_data_format(
         llvm::cast<mlir::RankedTensorType>(
             dequantizedType).getElementType());
     mlir::Value readValue;
 
     if (localDequant) {
-        const int64_t streamBase = localMxm
-            * throughput.mxm_int8_load_streams_per_cycle;
+        const int64_t packedLoadsPerDirectLoad =
+            (throughput.mxm_load_streams_per_cycle
+                + throughput.mxm_int8_load_streams_per_cycle - 1)
+            / throughput.mxm_int8_load_streams_per_cycle;
+        const int64_t streamPartitions = std::max(
+            throughput.mxms_per_hemisphere, packedLoadsPerDirectLoad);
+        const int64_t partitionWidth =
+            target.streams().streams_per_direction / streamPartitions;
+        const int64_t streamBase = localMxm * partitionWidth
+            + partitionWidth
+            - throughput.mxm_int8_load_streams_per_cycle;
+        assert(streamBase >= 0
+            && streamBase
+                    + throughput.mxm_int8_load_streams_per_cycle
+                <= target.streams().streams_per_direction
+            && "validated target must provide a disjoint INT8 weight window");
         for (int64_t stream = 0;
              stream < rawRoute.getStreamCount(); ++stream) {
             const int64_t slice = weightSlices[stream];
             const int64_t latency = target.transport_latency(
                 target::StreamEndpoint::Mem,
                 target::StreamEndpoint::MxmWeight,
-                target::StreamDirection::East, slice)
+                direction, slice)
                                         .value_or(
                                             slice
                                                     / target.streams()
                                                           .mem_slices_per_register_group
                                                 + 2);
             auto placement = schedule_placement(rewriter, {slice}, baseRow,
-                duration, 1, hemi, "schedule_slice");
+                duration, 1, hemi, "schedule_slice", bank);
             mlir::NamedAttrList attributes(placement);
             attributes.set("binding_placement", rawRoute.getPlacement());
+            if (pageIndex >= 0) {
+                attributes.set("weight_page",
+                    rewriter.getI64IntegerAttr(pageIndex));
+                attributes.set("logical_base_row",
+                    rewriter.getI64IntegerAttr(logicalBaseRow));
+            }
             auto read = rewriter.create<MemReadOp>(location,
                 rawRoute.getInput(), startCycle - latency, duration,
                 streamBase + stream, 1,
                 slice / target.streams().mem_slices_per_register_group + 1,
-                rewriter.getStringAttr("east"),
+                rewriter.getStringAttr(directionName),
                 rewriter.getStringAttr("weight_i8"), rawRoute.getAddress(),
                 attributes.getDictionary(rewriter.getContext()),
                 duration * throughput.lanes_per_tile);
@@ -92,16 +118,28 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
 
     for (int64_t stream = 0; stream < rawRoute.getStreamCount(); ++stream) {
         const int64_t slice = weightSlices[stream];
-        const int64_t latency =
-            slice / target.streams().mem_slices_per_register_group + 2;
+        const int64_t latency = target.transport_latency(
+            target::StreamEndpoint::Mem,
+            target::StreamEndpoint::MxmWeight, direction, slice)
+                                    .value_or(
+                                        slice
+                                                / target.streams()
+                                                      .mem_slices_per_register_group
+                                            + 2);
         auto placement = schedule_placement(rewriter, {slice}, baseRow,
-            duration, 1, hemi, "schedule_slice");
+            duration, 1, hemi, "schedule_slice", bank);
         mlir::NamedAttrList attributes(placement);
         attributes.set("binding_placement", rawRoute.getPlacement());
+        if (pageIndex >= 0) {
+            attributes.set("weight_page",
+                rewriter.getI64IntegerAttr(pageIndex));
+            attributes.set("logical_base_row",
+                rewriter.getI64IntegerAttr(logicalBaseRow));
+        }
         auto read = rewriter.create<MemReadOp>(location, rawRoute.getInput(),
             startCycle - latency, duration, stream, 1,
             slice / target.streams().mem_slices_per_register_group + 1,
-            rewriter.getStringAttr("west"),
+            rewriter.getStringAttr(directionName),
             rewriter.getStringAttr("weight_i8"), rawRoute.getAddress(),
             attributes.getDictionary(rewriter.getContext()),
             duration * throughput.mxm_rows);

@@ -44,8 +44,10 @@ struct MemoryTopology {
     int64_t sram_depth_rows = 32768;
     int64_t sram_read_ports_per_slice = 1;
     int64_t sram_write_ports_per_slice = 1;
-    int64_t accumulator_slice_base = 36;
-    int64_t accumulator_slices_per_mxm = 4;
+    // When enabled, slices below w8a16_weight_slice_base are activation-only
+    // and slices at or above that base are weight-only. MXM accumulators are
+    // functional-unit-local storage and are not MEM slices.
+    int64_t dedicated_slice_roles = 0;
     int64_t w8a16_weight_slice_count = 8;
     int64_t w8a16_weight_slice_base = 0;
     int64_t w8a16_weight_slice_stride = 4;
@@ -55,7 +57,7 @@ struct MemoryTopology {
     int64_t w8a16_hidden_base_row = 0;
     int64_t attention_mask_base_row = 8128;
     int64_t w8a16_result_slice_base = 24;
-    int64_t accumulator_scratch_base_row = 1600;
+    int64_t matmul_result_base_row = 1600;
     std::array<int64_t, 4> w8a16_fused_gate_temp_slices{{1, 5, 9, 29}};
     std::array<int64_t, 4> w8a16_fused_up_temp_slices{{2, 6, 10, 30}};
 };
@@ -63,6 +65,8 @@ struct MemoryTopology {
 struct StreamTopology {
     int64_t streams_per_direction = 32;
     int64_t encoded_streams = 64;
+    int64_t c2c_streams_per_direction = 8;
+    int64_t c2c_bytes_per_stream_per_cycle = 32;
     int64_t mem_boundary_register_columns = 14;
     int64_t system_register_columns = 16;
     int64_t mem_slices_per_register_group = 4;
@@ -153,6 +157,14 @@ public:
     {
         return throughput_.mxm_weight_activation_overlap_enabled != 0;
     }
+    bool uses_dedicated_slice_roles() const
+    {
+        return memory_.dedicated_slice_roles != 0;
+    }
+    llvm::SmallVector<int64_t> weight_storage_slices() const;
+    llvm::SmallVector<int64_t> activation_storage_slices() const;
+    bool is_weight_storage_slice(int64_t slice) const;
+    bool is_activation_storage_slice(int64_t slice) const;
     // Attention QK uses two physical 16-stream IW source layouts. Keep this
     // target-specific routing outside MemoryTopology so it cannot alter ABI.
     const std::array<int64_t, 16>& attention_query_iw_slices(
@@ -167,15 +179,21 @@ public:
         FfnProjectionKind kind) const;
     llvm::SmallVector<int64_t> ffn_down_projection_weight_slices(
         bool block8) const;
+    llvm::SmallVector<int64_t> ffn_block8_result_slices() const;
     llvm::SmallVector<int64_t> ffn_block8_input_slices() const;
     llvm::SmallVector<int64_t> ffn_hidden_slices() const;
+    llvm::SmallVector<int64_t> ffn_gate_temp_slices() const;
+    llvm::SmallVector<int64_t> ffn_up_temp_slices() const;
     llvm::SmallVector<int64_t> attention_projection_output_slices() const;
     llvm::SmallVector<int64_t> attention_qk_key_slices() const;
     llvm::SmallVector<int64_t> attention_value_slices() const;
     llvm::SmallVector<int64_t> attention_rope_slices() const;
     llvm::SmallVector<int64_t> attention_rope_staging_slices() const;
     llvm::SmallVector<int64_t> attention_context_slices() const;
-    llvm::SmallVector<int64_t> attention_output_activation_slices() const;
+    llvm::SmallVector<int64_t> attention_output_activation_slices(
+        bool page_resident_weights = false) const;
+    llvm::SmallVector<int64_t> attention_block8_result_slices(
+        bool page_resident_weights = false) const;
     llvm::SmallVector<int64_t> attention_result_slices() const;
     int64_t attention_query_iw_base_row() const;
     int64_t attention_score_base_row() const;

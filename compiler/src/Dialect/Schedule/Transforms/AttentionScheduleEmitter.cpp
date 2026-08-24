@@ -108,7 +108,9 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     }
     if (op_.getCausal()) {
         const auto maskType = mlir::RankedTensorType::get(
-            {tile - 1, tile}, rewriter_.getF32Type());
+            {tile - 1, tile},
+            llvm::cast<mlir::RankedTensorType>(
+                op_.getInput().getType()).getElementType());
         const char* maskPlacements[] = {"causal_mask",
             "causal_mask_mxm1", "fused_causal_mask",
             "fused_causal_mask_bank1"};
@@ -137,6 +139,22 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             rewriter_.getNamedAttr("head_dim",
                 rewriter_.getI64IntegerAttr(op_.getHeadDim())),
         }));
+    const auto probabilityType = mlir::RankedTensorType::get(
+        {op_.getQueryHeads(), op_.getSeqLen(), op_.getSeqLen()},
+        llvm::cast<mlir::RankedTensorType>(
+            op_.getInput().getType()).getElementType());
+    const int64_t workspaceBindingBase =
+        (strategy_ == AttentionScheduleStrategy::Fused ? 4 : 2) + 1;
+    auto probabilityPackBinding = createBinding(
+        rewriter_, op_.getLoc(), {}, workspaceBindingBase,
+        "internal", "workspace", probabilityType,
+        memoryPlan.getAs<mlir::DictionaryAttr>("probability_pack"),
+        "attention.probability_pack");
+    auto probabilityDiagonalBinding = createBinding(
+        rewriter_, op_.getLoc(), {}, workspaceBindingBase + 1,
+        "internal", "workspace", probabilityType,
+        memoryPlan.getAs<mlir::DictionaryAttr>("probability_diagonal"),
+        "attention.probability_diagonal");
 
     const int64_t projectionEnd = emitProjections();
     const int64_t qkvCycles = projectionEnd - 1;
@@ -146,12 +164,10 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     }
     const int64_t qkStart = projectionEnd;
     const int64_t qkEnd = stagePlan.qkEnd(qkStart);
-    bool fusedSoftmax = strategy_ == AttentionScheduleStrategy::Fused;
-    if (fusedSoftmax
-        && mlir::failed(planAttentionSoftmax(op_, stagePlan.qk_waves,
-            qkStart, qkEnd, stagePlan.qk_wave_interval,
-            stagePlan.qk_iw_to_compute_cycles, true, target_)))
-        fusedSoftmax = false;
+    // The compact 8-queue CModel path currently uses the correctness-first
+    // tail schedule. Fused planning remains an optional optimization, but it
+    // must not suppress the BF16 score materialization consumed below.
+    const bool fusedSoftmax = false;
     emitQk(qkStart, stagePlan.qk_wave_interval,
         stagePlan.qk_iw_to_compute_cycles, fusedSoftmax);
     const int64_t softmaxEnd = emitSoftmax(qkStart, qkEnd, fusedSoftmax);
@@ -170,6 +186,10 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         std::max(softmaxEnd, qkEnd);
     const int64_t probabilityTransposeEnd =
         emitProbabilityTranspose(probabilityTransposeStart);
+    probabilityPackBinding->setAttr("ready_cycle",
+        rewriter_.getI64IntegerAttr(probabilityTransposeStart));
+    probabilityDiagonalBinding->setAttr("ready_cycle",
+        rewriter_.getI64IntegerAttr(probabilityTransposeEnd));
     const int64_t pvEnd = emitPv(probabilityTransposeEnd);
     const int64_t outputProjectionEnd = emitOutputProjection(pvEnd);
 
@@ -179,6 +199,8 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     createTimeline(rewriter_, op_.getLoc(),
         fusedSoftmax ? "softmax_fused" : "softmax",
         softmaxStart, softmaxEnd);
+    createTimeline(rewriter_, op_.getLoc(), "probability_transpose",
+        probabilityTransposeStart, probabilityTransposeEnd);
     createTimeline(rewriter_, op_.getLoc(), "pv",
         probabilityTransposeEnd, pvEnd);
     createTimeline(rewriter_, op_.getLoc(), "o_proj",

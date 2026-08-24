@@ -41,9 +41,6 @@ struct FfnEmissionContext {
     llvm::SmallVector<int64_t> activation_slices;
     llvm::SmallVector<int64_t> hidden_slices;
     llvm::SmallVector<int64_t> result_slices;
-    llvm::SmallVector<int64_t> gate_acc_slices;
-    llvm::SmallVector<int64_t> up_acc_slices;
-
     FfnProjectionTimeline projection_timeline;
     mlir::RankedTensorType projection_type;
     int64_t activation_latency;
@@ -52,6 +49,7 @@ struct FfnEmissionContext {
     bool local_weight_dequant;
     bool block8_projection;
     bool block8_down;
+    int64_t temp_bank;
     std::optional<stream::StreamBinding> fused_output;
 
     int64_t m() const { return static_cast<int64_t>(ffn.getM()); }
@@ -77,8 +75,8 @@ struct CompletedProjectionTile {
     int64_t hemisphere;
     int64_t compute_cycle;
     int64_t deferred_ready_cycle;
-    schedule::MemAccumulateOp gate;
-    schedule::MemAccumulateOp up;
+    schedule::MxmAccumulateOp gate;
+    schedule::MxmAccumulateOp up;
     mlir::Value gate_temp;
     mlir::Value up_temp;
 };

@@ -21,6 +21,11 @@ mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
     llvm::ArrayRef<int64_t> slices, int64_t baseRow, int64_t count,
     int64_t stride, llvm::StringRef hemisphere, llvm::StringRef kind);
 
+mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
+    llvm::ArrayRef<int64_t> slices, int64_t baseRow, int64_t count,
+    int64_t stride, llvm::StringRef hemisphere, llvm::StringRef kind,
+    int64_t bank);
+
 VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Value lhsValue, mlir::Value rhsValue, mlir::Type resultType,
     int64_t cycle, int64_t queue, llvm::StringRef opcode,
@@ -53,7 +58,9 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Type dequantizedType, llvm::ArrayRef<int64_t> weightSlices,
     const target::LPUTargetModel& target, float scale, int64_t startCycle,
     int64_t baseRow, int64_t hemisphere, int64_t localMxm,
-    int64_t unit, int64_t weightBuffer, bool localDequant);
+    int64_t unit, int64_t weightBuffer, bool localDequant,
+    int64_t bank = 0, int64_t pageIndex = -1,
+    int64_t logicalBaseRow = -1);
 
 mlir::Value emitFfnSwishRow(mlir::IRRewriter& rewriter,
     PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,

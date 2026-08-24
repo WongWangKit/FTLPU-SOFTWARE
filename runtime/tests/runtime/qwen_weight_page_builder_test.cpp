@@ -54,14 +54,13 @@ void require(bool condition, const std::string& message)
 int main()
 try {
     const std::vector<std::uint16_t> attentionSlices {
-        32, 33, 34, 35, 36, 37, 38, 39};
+        22, 23, 25, 26, 27, 29, 30, 31};
     const std::vector<std::uint16_t> gateSlices {
         0, 4, 8, 12, 16, 20, 24, 28};
     const std::vector<std::uint16_t> upSlices {
-        1, 2, 3, 5, 6, 7, 9, 10};
+        3, 7, 11, 13, 14, 15, 17, 18};
     const std::vector<std::uint16_t> downSlices {
-        11, 13, 14, 15, 17, 18, 19, 21,
-        22, 23, 25, 26, 27, 29, 30, 31};
+        1, 2, 5, 6, 9, 10, 19, 21};
     std::vector<std::uint16_t> norm0Slices;
     std::vector<std::uint16_t> norm1Slices;
     for (std::uint16_t slice = 16; slice < 32; ++slice)
@@ -70,10 +69,10 @@ try {
         norm1Slices.push_back(slice);
 
     BinaryProgram program;
-    program.hardware.mxms_per_hemisphere = 2;
+    program.hardware.mxms_per_hemisphere = 1;
     program.bindings = {
         make_binding(0, "input_layernorm.weight", BindingElementType::BF16,
-            BindingLayout::Fp16VxmDistributed16, {1536}, 32384, 192,
+            BindingLayout::Fp16VxmRowParallel8, {1536}, 29696, 1536,
             norm0Slices),
         make_binding(1, "query.weight", BindingElementType::I8,
             BindingLayout::W8A16AttentionWeightStriped, {1536, 1536},
@@ -89,17 +88,17 @@ try {
             6144, 4608, attentionSlices),
         make_binding(5, "post_attention_layernorm.weight",
             BindingElementType::BF16,
-            BindingLayout::Fp16VxmDistributed16, {1536}, 32576, 192,
+            BindingLayout::Fp16VxmRowParallel8, {1536}, 31232, 1536,
             norm1Slices),
         make_binding(6, "gate.weight", BindingElementType::I8,
-            BindingLayout::W8A16MxmWeightStriped, {1536, 8960},
+            BindingLayout::W8A16Block8WeightWaveStriped, {1536, 8960},
             0, 26880, gateSlices),
         make_binding(7, "up.weight", BindingElementType::I8,
-            BindingLayout::W8A16MxmWeightStriped, {1536, 8960},
+            BindingLayout::W8A16Block8WeightWaveStriped, {1536, 8960},
             0, 26880, upSlices),
         make_binding(8, "down.weight", BindingElementType::I8,
             BindingLayout::W8A16Block8WeightWaveStriped, {8960, 1536},
-            0, 13440, downSlices),
+            0, 26880, downSlices),
     };
 
     const auto replicated = make_binding(9, "replicated.weight",
@@ -166,7 +165,11 @@ try {
             "Qwen logical weight was not replaced by target-packed data");
         packedBytes += tensor.data.size();
     }
-    require(packedBytes == 45ull * 1024 * 1024,
+    constexpr std::uint64_t expectedPackedBytes =
+        1536ull * 1536 + 2ull * 1536 * 256 + 1536ull * 1536
+        + 3ull * 1536 * 8960
+        + 2ull * 1536 * 2 * 16 * 32;
+    require(packedBytes == expectedPackedBytes,
         "Qwen layer page has an unexpected physical byte count");
     for (const auto& segment : package.weight_pages[0].segments)
         require(static_cast<std::uint64_t>(segment.base_row)

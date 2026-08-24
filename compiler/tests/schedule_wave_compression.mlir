@@ -1,14 +1,31 @@
 module {
   func.func @nested_mem_repeat() {
-    ftlpu.schedule.mem_transfer {accumulator_destination = "sram", address = 100 : i64, address_stride = 1 : i64, cycle = 10 : i64, hemisphere = 0 : i64, opcode = "read", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
-    ftlpu.schedule.mem_transfer {accumulator_destination = "sram", address = 104 : i64, address_stride = 1 : i64, cycle = 138 : i64, hemisphere = 0 : i64, opcode = "read", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
-    ftlpu.schedule.mem_transfer {accumulator_destination = "sram", address = 108 : i64, address_stride = 1 : i64, cycle = 266 : i64, hemisphere = 0 : i64, opcode = "read", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
+    ftlpu.schedule.mem_transfer {address = 100 : i64, address_stride = 1 : i64, cycle = 10 : i64, hemisphere = 0 : i64, opcode = "read", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
+    ftlpu.schedule.mem_transfer {address = 104 : i64, address_stride = 1 : i64, cycle = 138 : i64, hemisphere = 0 : i64, opcode = "read", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
+    ftlpu.schedule.mem_transfer {address = 108 : i64, address_stride = 1 : i64, cycle = 266 : i64, hemisphere = 0 : i64, opcode = "read", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
+    return
+  }
+  func.func @hierarchical_mxm_wave(%activation: tensor<32x32xbf16>,
+      %weight: tensor<32x32xbf16>) {
+    %0 = ftlpu.schedule.mxm_compute %activation, %weight {activation_stream_base = 16 : i64, cycle = 400 : i64, data_format = "bf16", duration = 32 : i64, k = 32 : i64, m = 32 : i64, n = 32 : i64, output_stream_base = 0 : i64, result_cycle = 403 : i64, result_duration = 35 : i64, unit_id = 0 : i64, weight_buffer = 0 : i64} : (tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xf32>
+    %1 = ftlpu.schedule.mxm_accumulate %0 {accumulator_address = 0 : i64, accumulator_output_format = "fp32", accumulator_stride = 1 : i64, cycle = 406 : i64, destination = "local", repeat_count = 32 : i64, repeat_interval = 1 : i64, stream_base = 0 : i64, stream_count = 4 : i64, unit_id = 0 : i64} : (tensor<32x32xf32>) -> tensor<32x32xf32>
+    %2 = ftlpu.schedule.mxm_compute %activation, %weight {activation_stream_base = 16 : i64, cycle = 500 : i64, data_format = "bf16", duration = 32 : i64, k = 32 : i64, m = 32 : i64, n = 32 : i64, output_stream_base = 0 : i64, result_cycle = 503 : i64, result_duration = 35 : i64, unit_id = 0 : i64, weight_buffer = 0 : i64} : (tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xf32>
+    %3 = ftlpu.schedule.mxm_accumulate %2 {accumulator_address = 32 : i64, accumulator_output_format = "fp32", accumulator_stride = 1 : i64, cycle = 506 : i64, destination = "local", repeat_count = 32 : i64, repeat_interval = 1 : i64, stream_base = 0 : i64, stream_count = 4 : i64, unit_id = 0 : i64} : (tensor<32x32xf32>) -> tensor<32x32xf32>
+    %4 = ftlpu.schedule.mxm_compute %activation, %weight {activation_stream_base = 16 : i64, cycle = 600 : i64, data_format = "bf16", duration = 32 : i64, k = 32 : i64, m = 32 : i64, n = 32 : i64, output_stream_base = 0 : i64, result_cycle = 603 : i64, result_duration = 35 : i64, unit_id = 0 : i64, weight_buffer = 0 : i64} : (tensor<32x32xbf16>, tensor<32x32xbf16>) -> tensor<32x32xf32>
+    %5 = ftlpu.schedule.mxm_accumulate %4 {accumulator_address = 64 : i64, accumulator_output_format = "fp32", accumulator_stride = 1 : i64, cycle = 606 : i64, destination = "local", repeat_count = 32 : i64, repeat_interval = 1 : i64, stream_base = 0 : i64, stream_count = 4 : i64, unit_id = 0 : i64} : (tensor<32x32xf32>) -> tensor<32x32xf32>
     return
   }
   func.func @sxm_repeat() {
     ftlpu.schedule.sxm {cycle = 20 : i64, destination_streams = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], hemisphere = 0 : i64, opcode = "transpose", permute_map = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], source_streams = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], weight_layout = "vector_columns"}
     ftlpu.schedule.sxm {cycle = 22 : i64, destination_streams = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], hemisphere = 0 : i64, opcode = "transpose", permute_map = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], source_streams = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], weight_layout = "vector_columns"}
     ftlpu.schedule.sxm {cycle = 24 : i64, destination_streams = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], hemisphere = 0 : i64, opcode = "transpose", permute_map = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], source_streams = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], weight_layout = "vector_columns"}
+    return
+  }
+  func.func @banked_mem_repeat() {
+    ftlpu.schedule.mem_transfer {address = 200 : i64, address_stride = 1 : i64, bank = 0 : i64, cycle = 500 : i64, hemisphere = 0 : i64, opcode = "write", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
+    ftlpu.schedule.mem_transfer {address = 204 : i64, address_stride = 1 : i64, bank = 0 : i64, cycle = 628 : i64, hemisphere = 0 : i64, opcode = "write", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
+    ftlpu.schedule.mem_transfer {address = 300 : i64, address_stride = 1 : i64, bank = 1 : i64, cycle = 500 : i64, hemisphere = 0 : i64, opcode = "write", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
+    ftlpu.schedule.mem_transfer {address = 304 : i64, address_stride = 1 : i64, bank = 1 : i64, cycle = 628 : i64, hemisphere = 0 : i64, opcode = "write", packed_stream = 0 : i64, repeat_count = 4 : i64, repeat_interval = 1 : i64, slice = 0 : i64}
     return
   }
   func.func @mxm_repeat() {

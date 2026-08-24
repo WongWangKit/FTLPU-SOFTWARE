@@ -198,13 +198,16 @@ int main() try
         {128, 576, 1536, 576}, *projection, 1000, weightSlices,
         hiddenSlices, resultSlices, target);
     require(mlir::succeeded(down), "FFN down timeline failed");
+    const int64_t logicalOutputSlotsPerHemisphere =
+        std::max<int64_t>(2,
+            target.throughput().mxms_per_hemisphere);
     const int64_t expectedDownWaves =
         (576 + target.memory().hemispheres
-                    * target.throughput().mxms_per_hemisphere
+                    * logicalOutputSlotsPerHemisphere
                     * target.throughput().mxm_rows
                 - 1)
         / (target.memory().hemispheres
-            * target.throughput().mxms_per_hemisphere
+            * logicalOutputSlotsPerHemisphere
             * target.throughput().mxm_rows);
     require(down->wave_count == expectedDownWaves
             && down->blocks.size()

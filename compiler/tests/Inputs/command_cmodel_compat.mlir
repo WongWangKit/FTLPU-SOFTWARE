@@ -14,7 +14,8 @@ module {
     }
     ftlpu.command.mxm_dequant {
       cycle = 0 : i64, queue = 0 : i64, scale = 0.125 : f32,
-      repeat_count = 1 : i64, repeat_interval = 1 : i64
+      repeat_count = 1 : i64, repeat_interval = 1 : i64,
+      scale_binding = 7 : i64
     }
     ftlpu.command.mxm {
       cycle = 0 : i64, queue = 0 : i64, opcode = "iw",

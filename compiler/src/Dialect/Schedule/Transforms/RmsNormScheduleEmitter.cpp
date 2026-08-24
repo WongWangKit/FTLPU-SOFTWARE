@@ -24,6 +24,14 @@ using attention_detail::blockDiagonalMap;
 using ffn_detail::create_vxm;
 using ffn_detail::schedule_placement;
 
+// Hemispheres own independently numbered stream fabrics. Directions are local
+// to each fabric, so SXM ingress is eastbound and egress is westbound on both.
+constexpr auto kMemToSxmDirection = target::StreamDirection::East;
+constexpr auto kSxmToMemDirection = target::StreamDirection::West;
+constexpr int64_t kSxmInputStream = 0;
+constexpr int64_t kSxmTransposeStream = 16;
+constexpr int64_t kSxmOutputStream = 32;
+
 mlir::DictionaryAttr allocationPlacement(mlir::ArrayAttr allocations,
     int64_t index)
 {
@@ -177,23 +185,20 @@ int64_t emitSerialFeedbackTranspose(mlir::IRRewriter& rewriter,
                          hemisphere < target.memory().hemispheres;
                          ++hemisphere) {
                         const std::array<int64_t, 2> sourceStreams {
-                            hemisphere == 0 ? 0 : 32,
-                            hemisphere == 0 ? 1 : 33,
+                            kSxmInputStream,
+                            kSxmInputStream + 1,
                         };
                         const std::array<int64_t, 2> transposeStreams {
-                            hemisphere == 0 ? 16 : 48,
-                            hemisphere == 0 ? 17 : 49,
+                            kSxmTransposeStream,
+                            kSxmTransposeStream + 1,
                         };
                         for (int64_t byte = 0; byte < 2; ++byte) {
                             const int64_t slice = inputSlices[byte];
-                            const auto direction = hemisphere == 0
-                                ? target::StreamDirection::East
-                                : target::StreamDirection::West;
                             const int64_t latency =
                                 *target.transport_latency(
                                     target::StreamEndpoint::Mem,
                                     target::StreamEndpoint::SxmInput,
-                                    direction, slice);
+                                    kMemToSxmDirection, slice);
                             const int64_t address = broadcastInput
                                 ? baseRow(inputPlacement) + hiddenBlock
                                 : serialFeedbackAddress(inputPlacement,
@@ -206,7 +211,7 @@ int64_t emitSerialFeedbackTranspose(mlir::IRRewriter& rewriter,
                                             slices_per_hemisphere
                                     + slice,
                                 "read", address,
-                                hemisphere == 0 ? byte : 32 + byte,
+                                kSxmInputStream + byte,
                                 1, 1, 0);
                         }
                         emitSxm(rewriter, location, capture + row,
@@ -227,12 +232,12 @@ int64_t emitSerialFeedbackTranspose(mlir::IRRewriter& rewriter,
                          hemisphere < target.memory().hemispheres;
                          ++hemisphere) {
                         const std::array<int64_t, 2> transposeStreams {
-                            hemisphere == 0 ? 16 : 48,
-                            hemisphere == 0 ? 17 : 49,
+                            kSxmTransposeStream,
+                            kSxmTransposeStream + 1,
                         };
                         const std::array<int64_t, 2> outputStreams {
-                            hemisphere == 0 ? 32 : 0,
-                            hemisphere == 0 ? 33 : 1,
+                            kSxmOutputStream,
+                            kSxmOutputStream + 1,
                         };
                         emitSxm(rewriter, location, permute + row,
                             hemisphere, "permute", transposeStreams,
@@ -249,14 +254,11 @@ int64_t emitSerialFeedbackTranspose(mlir::IRRewriter& rewriter,
                                  duplicate += 2) {
                                 const int64_t slice =
                                     outputSlices[duplicate];
-                                const auto direction = hemisphere == 0
-                                    ? target::StreamDirection::West
-                                    : target::StreamDirection::East;
                                 const int64_t latency =
                                     *target.transport_latency(
                                         target::StreamEndpoint::SxmResult,
                                         target::StreamEndpoint::Mem,
-                                        direction, slice);
+                                        kSxmToMemDirection, slice);
                                 emitMem(rewriter, location,
                                     permute + row + latency,
                                     hemisphere
@@ -264,7 +266,7 @@ int64_t emitSerialFeedbackTranspose(mlir::IRRewriter& rewriter,
                                                 slices_per_hemisphere
                                         + slice,
                                     "write", address,
-                                    hemisphere == 0 ? 32 + byte : byte,
+                                    kSxmOutputStream + byte,
                                     1, 1, 0);
                             }
                         }
@@ -301,23 +303,20 @@ int64_t emitMatrixTranspose(mlir::IRRewriter& rewriter,
                     + target.throughput().mem_to_sxm_latency;
                 for (int64_t row = 0; row < tile; ++row) {
                     const std::array<int64_t, 2> sourceStreams {
-                        hemisphere == 0 ? 0 : 32,
-                        hemisphere == 0 ? 1 : 33,
+                        kSxmInputStream,
+                        kSxmInputStream + 1,
                     };
                     const std::array<int64_t, 2> transposeStreams {
-                        hemisphere == 0 ? 16 : 48,
-                        hemisphere == 0 ? 17 : 49,
+                        kSxmTransposeStream,
+                        kSxmTransposeStream + 1,
                     };
                     for (int64_t byte = 0; byte < 2; ++byte) {
                         const int64_t slice = inputSlices[byte];
-                        const auto direction = hemisphere == 0
-                            ? target::StreamDirection::East
-                            : target::StreamDirection::West;
                         const int64_t latency =
                             *target.transport_latency(
                                 target::StreamEndpoint::Mem,
                                 target::StreamEndpoint::SxmInput,
-                                direction, slice);
+                                kMemToSxmDirection, slice);
                         const int64_t address = broadcastInput
                             ? baseRow(inputPlacement) + hiddenBlock
                             : inputFeedback
@@ -333,7 +332,7 @@ int64_t emitMatrixTranspose(mlir::IRRewriter& rewriter,
                                     * target.memory().slices_per_hemisphere
                                 + slice,
                             "read", address,
-                            hemisphere == 0 ? byte : 32 + byte,
+                            kSxmInputStream + byte,
                             1, 1, 0);
                     }
                     emitSxm(rewriter, location, capture + row,
@@ -346,12 +345,12 @@ int64_t emitMatrixTranspose(mlir::IRRewriter& rewriter,
                     + target.throughput().tile_rows + 1;
                 for (int64_t row = 0; row < tile; ++row) {
                     const std::array<int64_t, 2> transposeStreams {
-                        hemisphere == 0 ? 16 : 48,
-                        hemisphere == 0 ? 17 : 49,
+                        kSxmTransposeStream,
+                        kSxmTransposeStream + 1,
                     };
                     const std::array<int64_t, 2> outputStreams {
-                        hemisphere == 0 ? 32 : 0,
-                        hemisphere == 0 ? 33 : 1,
+                        kSxmOutputStream,
+                        kSxmOutputStream + 1,
                     };
                     emitSxm(rewriter, location, emit + row,
                         hemisphere, "permute", transposeStreams,
@@ -364,14 +363,11 @@ int64_t emitMatrixTranspose(mlir::IRRewriter& rewriter,
                                      outputSlices.size());
                              duplicate += 2) {
                             const int64_t slice = outputSlices[duplicate];
-                            const auto direction = hemisphere == 0
-                                ? target::StreamDirection::West
-                                : target::StreamDirection::East;
                             const int64_t latency =
                                 *target.transport_latency(
                                     target::StreamEndpoint::SxmResult,
                                     target::StreamEndpoint::Mem,
-                                    direction, slice);
+                                    kSxmToMemDirection, slice);
                             const int64_t address = outputFeedback
                                 ? baseRow(outputPlacement)
                                     + tokenBlock * hidden
@@ -386,7 +382,7 @@ int64_t emitMatrixTranspose(mlir::IRRewriter& rewriter,
                                             slices_per_hemisphere
                                     + slice,
                                 "write", address,
-                                hemisphere == 0 ? 32 + byte : byte,
+                                kSxmOutputStream + byte,
                                 1, 1, 0);
                         }
                     }
@@ -492,25 +488,27 @@ int64_t emitDistributedMatrixTranspose(mlir::IRRewriter& rewriter,
             const int64_t capture =
                 captureReady[static_cast<std::size_t>(hemisphere)];
             for (int64_t beat = 0; beat < tileRows; ++beat) {
+                const int64_t beatCycle = capture
+                    + beat * (tileRows + 1);
                 for (int64_t stream = 0; stream < width; ++stream) {
                     const int64_t slice =
                         inputSlices[static_cast<std::size_t>(stream)];
                     emitMem(rewriter, location,
-                        capture + beat - readLatency(slice),
+                        beatCycle - readLatency(slice),
                         hemisphere * target.memory().slices_per_hemisphere
                             + slice,
                         "read", baseRow(inputPlacement)
                             + block * tileRows + beat,
                         stream, 1, 1, 0);
                 }
-                emitWavefrontBeat(rewriter, location, target,
-                    capture + beat, hemisphere, beat,
+                sxm_detail::emitBufferedWavefrontBeat(rewriter, location,
+                    target, beatCycle, hemisphere, beat,
                     sourceStreams, transposeStreams, outputStreams);
                 for (int64_t stream = 0; stream < width; ++stream) {
                     const int64_t slice =
                         outputSlices[static_cast<std::size_t>(stream)];
                     emitMem(rewriter, location,
-                        capture + beat + 1 + writeLatency(slice),
+                        beatCycle + 1 + writeLatency(slice),
                         hemisphere * target.memory().slices_per_hemisphere
                             + slice,
                         "write", baseRow(outputPlacement)
@@ -518,18 +516,12 @@ int64_t emitDistributedMatrixTranspose(mlir::IRRewriter& rewriter,
                         32 + stream, 1, 1, 0);
                 }
             }
-            captureReady[static_cast<std::size_t>(hemisphere)] += tileRows;
+            captureReady[static_cast<std::size_t>(hemisphere)] +=
+                tileRows * (tileRows + 1);
         }
     }
-    for (int64_t hemisphere = 0;
-         hemisphere < target.memory().hemispheres; ++hemisphere) {
-        for (int64_t tail = 0; tail < tileRows - 1; ++tail)
-            emitWavefrontTail(rewriter, location, target,
-                captureReady[static_cast<std::size_t>(hemisphere)] + tail,
-                hemisphere, tail, transposeStreams, outputStreams);
-    }
     return std::max(captureReady[0], captureReady[1])
-        + tileRows - 1 + maxWriteLatency + 2;
+        + maxWriteLatency + tileRows + 2;
 }
 
 int64_t emitPairToPackedTranspose(mlir::IRRewriter& rewriter,
@@ -564,21 +556,18 @@ int64_t emitPairToPackedTranspose(mlir::IRRewriter& rewriter,
                      hemisphere < target.memory().hemispheres;
                      ++hemisphere) {
                     const auto transposeStreams = streamRange(
-                        hemisphere == 0 ? 16 : 48, packedStreams);
+                        kSxmTransposeStream, packedStreams);
                     for (int64_t row = 0; row < lanes; ++row) {
                         for (int64_t byte = 0; byte < 2; ++byte) {
                             const int64_t pair = rowParallel
                                 ? tokenBlock % 8 : 0;
                             const int64_t slice =
                                 inputSlices[2 * pair + byte];
-                            const auto direction = hemisphere == 0
-                                ? target::StreamDirection::East
-                                : target::StreamDirection::West;
                             const int64_t latency =
                                 *target.transport_latency(
                                     target::StreamEndpoint::Mem,
                                     target::StreamEndpoint::SxmInput,
-                                    direction, slice);
+                                    kMemToSxmDirection, slice);
                             const int64_t address = broadcastInput
                                 ? baseRow(inputPlacement) + hiddenBlock
                                 : rowParallel
@@ -595,14 +584,13 @@ int64_t emitPairToPackedTranspose(mlir::IRRewriter& rewriter,
                                             slices_per_hemisphere
                                     + slice,
                                 "read", address,
-                                (hemisphere == 0 ? 0 : 32)
-                                    + 2 * row + byte,
+                                kSxmInputStream + 2 * row + byte,
                                 1, 1, 0, "sram", -1,
                                 bank(inputPlacement));
                         }
                         const std::array<int64_t, 2> sourceStreams {
-                            (hemisphere == 0 ? 0 : 32) + 2 * row,
-                            (hemisphere == 0 ? 0 : 32) + 2 * row + 1,
+                            kSxmInputStream + 2 * row,
+                            kSxmInputStream + 2 * row + 1,
                         };
                         emitSxm(rewriter, location, fill + row,
                             hemisphere, "transpose", sourceStreams,
@@ -623,21 +611,19 @@ int64_t emitPairToPackedTranspose(mlir::IRRewriter& rewriter,
                          hemisphere < target.memory().hemispheres;
                          ++hemisphere) {
                         const auto transposeStreams = streamRange(
-                            hemisphere == 0 ? 16 : 48, packedStreams);
+                            kSxmTransposeStream, packedStreams);
                         const auto outputStreams = streamRange(
-                            hemisphere == 0 ? 32 : 0, packedStreams);
+                            kSxmOutputStream, packedStreams);
                         emitSxm(rewriter, location, permute, hemisphere,
                             "permute", transposeStreams, outputStreams, map,
                             "vector_columns", -1, -1, featureWave);
                         for (int64_t stream = 0;
                              stream < packedStreams; ++stream) {
                             const int64_t slice = outputSlices[stream];
-                            const auto direction = hemisphere == 0
-                                ? target::StreamDirection::West
-                                : target::StreamDirection::East;
                             const int64_t latency = *target.transport_latency(
                                 target::StreamEndpoint::SxmResult,
-                                target::StreamEndpoint::Mem, direction,
+                                target::StreamEndpoint::Mem,
+                                kSxmToMemDirection,
                                 slice);
                             emitMem(rewriter, location,
                                 permute + latency - featureWave,
@@ -648,8 +634,9 @@ int64_t emitPairToPackedTranspose(mlir::IRRewriter& rewriter,
                                 "write_tap", packedAddress(outputPlacement,
                                     tokenBlock, hiddenBlock, tokenWave,
                                     hiddenBlocks),
-                                hemisphere == 0 ? 32 + stream : stream,
-                                1, 1, 0);
+                                kSxmOutputStream + stream,
+                                1, 1, 0, "sram", -1,
+                                bank(outputPlacement));
                         }
                     }
                 }
@@ -692,19 +679,16 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
                      hemisphere < target.memory().hemispheres;
                      ++hemisphere) {
                     const auto sourceStreams = streamRange(
-                        hemisphere == 0 ? 0 : 32, packedStreams);
+                        kSxmInputStream, packedStreams);
                     const auto transposeStreams = streamRange(
-                        hemisphere == 0 ? 16 : 48, packedStreams);
+                        kSxmTransposeStream, packedStreams);
                     for (int64_t stream = 0;
                          stream < packedStreams; ++stream) {
                         const int64_t slice = inputSlices[stream];
-                        const auto direction = hemisphere == 0
-                            ? target::StreamDirection::East
-                            : target::StreamDirection::West;
                         const int64_t latency = *target.transport_latency(
                             target::StreamEndpoint::Mem,
                             target::StreamEndpoint::SxmInput,
-                            direction, slice);
+                            kMemToSxmDirection, slice);
                         emitMem(rewriter, location, capture - latency,
                             hemisphere
                                     * target.memory().slices_per_hemisphere
@@ -712,8 +696,9 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
                             "read", packedAddress(inputPlacement,
                                 tokenBlock, hiddenBlock, tokenWave,
                                 hiddenBlocks),
-                            hemisphere == 0 ? stream : 32 + stream,
-                            1, 1, 0);
+                            kSxmInputStream + stream,
+                            1, 1, 0, "sram", -1,
+                            bank(inputPlacement));
                     }
                     emitSxm(rewriter, location, capture, hemisphere,
                         "transpose", sourceStreams, transposeStreams,
@@ -733,9 +718,9 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
                              hemisphere < target.memory().hemispheres;
                              ++hemisphere) {
                             const auto transposeStreams = streamRange(
-                                hemisphere == 0 ? 16 : 48, packedStreams);
+                                kSxmTransposeStream, packedStreams);
                             const auto outputStreams = streamRange(
-                                hemisphere == 0 ? 32 : 0, packedStreams);
+                                kSxmOutputStream, packedStreams);
                             emitSxm(rewriter, location, permute,
                                 hemisphere, "permute", transposeStreams,
                                 outputStreams, map, "vector_columns", row,
@@ -773,14 +758,11 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
                                 for (int64_t duplicate : sliceIndices) {
                                     const int64_t slice =
                                         destinationSlices[duplicate];
-                                    const auto direction = hemisphere == 0
-                                        ? target::StreamDirection::West
-                                        : target::StreamDirection::East;
                                     const int64_t latency =
                                         *target.transport_latency(
                                             target::StreamEndpoint::SxmResult,
                                             target::StreamEndpoint::Mem,
-                                            direction, slice);
+                                            kSxmToMemDirection, slice);
                                     emitMem(rewriter, location,
                                         permute + latency - tokenWave,
                                         hemisphere
@@ -798,8 +780,7 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
                                                   hiddenBlock, featureWave,
                                                   row,
                                                   rows),
-                                        (hemisphere == 0 ? 32 : 0)
-                                            + 2 * row + byte,
+                                        kSxmOutputStream + 2 * row + byte,
                                         1, 1, 0, "sram", -1,
                                         bank(destination));
                                 }

@@ -27,6 +27,14 @@ def TimelineOp : FTLPU_Command_Op<"timeline"> {
   let hasVerifier = 1;
 }
 
+def WeightPageOp : FTLPU_Command_Op<"weight_page"> {
+  let summary = "Runtime-visible residency interval for one logical weight page";
+  let arguments = (ins I64Attr:$binding_index, I64Attr:$page_index,
+      I64Attr:$bank, I64Attr:$ready_cycle, I64Attr:$release_cycle);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
 def LoopOp : FTLPU_Command_Op<"loop"> {
   let summary = "ICU control command replaying a prior instruction window";
   let arguments = (ins I64Attr:$cycle, StrAttr:$queue_kind,
@@ -49,6 +57,20 @@ def MemOp : FTLPU_Command_Op<"mem", [MemoryEffects<[MemWrite]>]> {
   let hasVerifier = 1;
 }
 
+def MemBundleOp : FTLPU_Command_Op<"mem_bundle", [MemoryEffects<[MemWrite]>]> {
+  let summary = "One logical MEM transfer issued to several physical queues";
+  let arguments = (ins ArrayAttr:$cycles, ArrayAttr:$queues,
+      StrAttr:$opcode, ArrayAttr:$addresses, ArrayAttr:$packed_streams,
+      I64Attr:$repeat_count, I64Attr:$repeat_interval,
+      I64Attr:$address_stride,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$wave_address_stride,
+      OptionalAttr<I64Attr>:$address_binding);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
 def MxmOp : FTLPU_Command_Op<"mxm", [MemoryEffects<[MemWrite]>]> {
   let summary = "Compressed command for one ICU MXM queue";
   let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
@@ -59,10 +81,11 @@ def MxmOp : FTLPU_Command_Op<"mxm", [MemoryEffects<[MemWrite]>]> {
         BoolAttr:$accumulator_clear,
         OptionalAttr<StrAttr>:$data_format,
         OptionalAttr<StrAttr>:$accumulator_output_format,
-        OptionalAttr<StrAttr>:$weight_load_mode,
-        OptionalAttr<I64Attr>:$weight_inner_column,
-        OptionalAttr<StrAttr>:$weight_input_mode,
-        OptionalAttr<StrAttr>:$compute_mode,
+      OptionalAttr<StrAttr>:$weight_load_mode,
+      OptionalAttr<I64Attr>:$weight_inner_column,
+      OptionalAttr<StrAttr>:$weight_input_mode,
+      OptionalAttr<I64Attr>:$weight_stream_base,
+      OptionalAttr<StrAttr>:$compute_mode,
         OptionalAttr<I64Attr>:$wave_count,
         OptionalAttr<I64Attr>:$wave_interval,
         OptionalAttr<I64Attr>:$wave_weight_column_stride,
@@ -78,6 +101,7 @@ def MxmDequantOp : FTLPU_Command_Op<"mxm_dequant",
   let summary = "Compressed scale command for one ICU MXM dequant queue";
   let arguments = (ins I64Attr:$cycle, I64Attr:$queue, F32Attr:$scale,
       I64Attr:$repeat_count, I64Attr:$repeat_interval,
+      OptionalAttr<I64Attr>:$scale_binding,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval);
   let assemblyFormat = "attr-dict";

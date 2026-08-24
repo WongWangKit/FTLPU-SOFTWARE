@@ -229,6 +229,7 @@ void validate_model_package(const ModelPackage& package)
                 "adjacent FTLPU weight pages must use different banks");
     }
 
+    std::optional<std::uint32_t> previous_invocation_page;
     for (const auto& invocation : package.invocations) {
         if (invocation.name.empty()
             || invocation.executable_index >= package.executables.size())
@@ -238,6 +239,17 @@ void validate_model_package(const ModelPackage& package)
             && invocation.weight_page >= package.weight_pages.size())
             throw std::invalid_argument(
                 "FTLPU model invocation has an invalid weight page");
+        if (invocation.weight_page != 0xffffffffu) {
+            if (previous_invocation_page
+                && *previous_invocation_page != invocation.weight_page
+                && package.weight_pages[*previous_invocation_page].bank
+                    == package.weight_pages[invocation.weight_page].bank)
+                throw std::invalid_argument(
+                    "adjacent paged invocations must alternate MEM banks");
+            previous_invocation_page = invocation.weight_page;
+        } else {
+            previous_invocation_page.reset();
+        }
         std::unordered_set<std::uint32_t> input_indices;
         for (const auto& ref : invocation.inputs) {
             if (!names.contains(ref.value)

@@ -27,15 +27,23 @@ try {
         throw std::runtime_error(
             "usage: hf_two_decoder_layers_model_session_test model.ftlpum");
     using namespace ftlpu::software::runtime;
-    auto system = std::make_unique<ftlpu::TspSliceSystem>();
+    auto system = std::make_unique<ftlpu::C2cDmaSystem>();
     ModelSession session(*system);
     session.load_file(std::filesystem::path(argv[1]));
-    if (session.package().executables.size() != 1
-        || session.package().executables[0]
-               .serialized_program.empty()
+    const bool paged = !session.package().weight_pages.empty();
+    if (session.package().executables.size() != (paged ? 2 : 1)
+        || session.package().executables[0].serialized_program.empty()
         || session.package().executables[0].program.bindings.empty())
         throw std::logic_error(
-            "two-layer package did not reuse a parameterized executable");
+            "two-layer package has an unexpected executable layout");
+    if (paged
+        && (session.package().weight_pages.size() != 2
+            || session.package().weight_pages[0].bank != 0
+            || session.package().weight_pages[1].bank != 1
+            || session.package().invocations[0].weight_page != 0
+            || session.package().invocations[1].weight_page != 1))
+        throw std::logic_error(
+            "two-layer package does not alternate C2C weight banks");
 
     const SessionMemoryPlan& plan = session.memory_plan();
     if (plan.invocations.size() != 2 || plan.lifetimes.size() != 1
@@ -50,12 +58,19 @@ try {
     session.run();
 
     const ModelSessionStats& stats = session.stats();
-    if (stats.resident_uploads != 18
+    if (stats.resident_uploads != (paged ? 0 : 18)
         || stats.host_uploads != 1 || stats.host_downloads != 1
         || stats.device_aliases != 1 || stats.device_copies != 0
         || stats.device_copy_bytes != 0)
         throw std::logic_error(
             "two-layer session used an unexpected host/device transfer plan");
+    if (paged
+        && (stats.weight_page_prefetches != 2
+            || stats.weight_page_initial_wait_cycles == 0
+            || stats.weight_page_hidden_prefetches
+                    + (stats.weight_page_boundary_wait_cycles != 0) != 1))
+        throw std::logic_error(
+            "two-layer session did not execute C2C page ping-pong");
 
     const auto& actual = session.value("hidden.2");
     const auto& expected = session.value("golden.output");
@@ -99,7 +114,14 @@ try {
         << " host_downloads=" << stats.host_downloads
         << " device_aliases=" << stats.device_aliases
         << " device_copies=" << stats.device_copies
-        << " device_copy_bytes=" << stats.device_copy_bytes << '\n';
+        << " device_copy_bytes=" << stats.device_copy_bytes
+        << " paged=" << paged
+        << " initial_page_wait_cycles="
+        << stats.weight_page_initial_wait_cycles
+        << " boundary_page_wait_cycles="
+        << stats.weight_page_boundary_wait_cycles
+        << " deferred_page_prefetches="
+        << stats.weight_page_deferred_prefetches << '\n';
     return 0;
 } catch (const std::exception& exception) {
     std::cerr << "hf_two_decoder_layers_model_session_test failed: "

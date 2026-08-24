@@ -24,8 +24,15 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         throughput.mxm0_accumulator_latency;
     const int64_t upAccLatency =
         throughput.mxm1_accumulator_latency;
+    const bool singleMxm = throughput.mxms_per_hemisphere == 1;
+    const int64_t logicalSlotsPerHemisphere =
+        singleMxm ? 2 : throughput.mxms_per_hemisphere;
     const int64_t hiddenBaseRow =
         get_base_row(ffn.getHidden0Placement());
+    const auto hiddenKind =
+        ffn.getHidden0Placement().getAs<mlir::StringAttr>("kind");
+    const bool hiddenDistributed16 = hiddenKind
+        && hiddenKind.getValue() == "fp16_mxm_distributed_16";
 
     auto timeline = planFfnDownProjectionTimeline(
         {context.m(), context.k(), intermediate, context.n()},
@@ -42,22 +49,75 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
 
         for (int64_t hemisphere = 0;
              hemisphere < activeHemispheres; ++hemisphere) {
-            for (int64_t localMxm = 0;
-                 localMxm < throughput.mxms_per_hemisphere;
-                 ++localMxm) {
+            for (int64_t logicalSlot = 0;
+                 logicalSlot < logicalSlotsPerHemisphere;
+                 ++logicalSlot) {
+                const int64_t localMxm = singleMxm ? 0 : logicalSlot;
                 const int64_t unit =
                     hemisphere * throughput.mxms_per_hemisphere
                     + localMxm;
                 const int64_t start =
-                    block.dequant_start + unit * weightLoadCycles;
-                const int64_t base =
-                    context.down_route.getPlacement()
+                    block.dequant_start
+                    + (hemisphere * logicalSlotsPerHemisphere
+                          + logicalSlot)
+                        * weightLoadCycles;
+                const auto placement = context.down_route.getPlacement();
+                const int64_t bindingBase = placement
                         .getAs<mlir::IntegerAttr>("base_row")
-                        .getInt()
+                        .getInt();
+                const int64_t logicalBase = bindingBase
                     + (outputWave * (intermediate / tile) + reduction)
-                        * throughput.mxms_per_hemisphere
+                        * logicalSlotsPerHemisphere
                         * weightLoadCycles
-                    + localMxm * weightLoadCycles;
+                    + logicalSlot * weightLoadCycles;
+                int64_t base = logicalBase;
+                int64_t page = -1;
+                int64_t bank = placement
+                    .getAs<mlir::IntegerAttr>("bank").getInt();
+                llvm::SmallVector<int64_t> selectedWeightSlices(
+                    context.down_weight_slices.begin(),
+                    context.down_weight_slices.end());
+                if (auto paged = placement.getAs<mlir::BoolAttr>(
+                        "paged_weight"); paged && paged.getValue()) {
+                    const int64_t reductionsPerPage = placement
+                        .getAs<mlir::IntegerAttr>("page_granularity")
+                        .getInt();
+                    const int64_t roleGroupBase = placement
+                        .getAs<mlir::IntegerAttr>("page_role_group_base")
+                        .getInt();
+                    const int64_t reductionsPerGroup = placement
+                        .getAs<mlir::IntegerAttr>(
+                            "page_items_per_slice_group")
+                        .getInt();
+                    const int64_t bankCount = placement
+                        .getAs<mlir::IntegerAttr>("page_bank_count")
+                        .getInt();
+                    const int64_t pagesPerWave =
+                        (intermediate / tile + reductionsPerPage - 1)
+                        / reductionsPerPage;
+                    page = outputWave * pagesPerWave
+                        + reduction / reductionsPerPage;
+                    bank = page % bankCount;
+                    const int64_t reductionInPage =
+                        reduction % reductionsPerPage;
+                    const int64_t sliceGroup = roleGroupBase
+                        + reductionInPage / reductionsPerGroup;
+                    const int64_t localReduction =
+                        reductionInPage % reductionsPerGroup;
+                    const auto storage = placement
+                        .getAs<mlir::ArrayAttr>("page_storage_slices");
+                    const int64_t loadSliceCount =
+                        static_cast<int64_t>(selectedWeightSlices.size());
+                    selectedWeightSlices.clear();
+                    for (int64_t index = 0; index < loadSliceCount; ++index)
+                        selectedWeightSlices.push_back(
+                            llvm::cast<mlir::IntegerAttr>(
+                                storage[sliceGroup * loadSliceCount + index])
+                                .getInt());
+                    base = localReduction * logicalSlotsPerHemisphere
+                            * weightLoadCycles
+                        + logicalSlot * weightLoadCycles;
+                }
                 const auto rawType =
                     llvm::cast<mlir::RankedTensorType>(
                         context.down_raw.getInput().getType());
@@ -70,10 +130,12 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                 emitFfnWeightTile(rewriter, ffn.getLoc(),
                     context.down_raw,
                     dequantizedType,
-                    context.down_weight_slices, target,
+                    selectedWeightSlices, target,
                     ffn.getDownRhsScale().convertToFloat(), start,
-                    base, hemisphere, localMxm, unit, weightBuffer,
-                    context.local_weight_dequant);
+                    base, hemisphere, logicalSlot, unit,
+                    singleMxm ? logicalSlot : weightBuffer,
+                    context.local_weight_dequant, bank, page,
+                    logicalBase);
             }
         }
 
@@ -89,13 +151,46 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     tileSchedule.segments) {
                     const int64_t segmentCycle =
                         computeCycle + rowOffset;
-                    mlir::Value hiddenValue;
-                    for (int64_t byte = 0; byte < 2; ++byte) {
-                        hiddenValue =
-                            context
+                    const auto emitHidden = [&](int64_t consumerCycle) {
+                        mlir::Value hiddenValue;
+                        if (hiddenDistributed16) {
+                            const int64_t hiddenBlocks = intermediate / tile;
+                            for (int64_t localRow = 0;
+                                 localRow < segment.rows; ++localRow) {
+                                const int64_t token =
+                                    mTile * tile + rowOffset + localRow;
+                                const int64_t tokenWithinBlock = token % tile;
+                                const int64_t tokenWave = tokenWithinBlock
+                                    / throughput.mxm_block_rows;
+                                const int64_t tokenLane = tokenWithinBlock
+                                    % throughput.mxm_block_rows;
+                                const int64_t address = hiddenBaseRow
+                                    + ((token / tile) * hiddenBlocks
+                                          + reduction)
+                                        * throughput.tile_rows
+                                    + tokenWave;
+                                for (int64_t byte = 0; byte < 2; ++byte) {
+                                    const int64_t slice = context.hidden_slices[
+                                        2 * tokenLane + byte];
+                                    hiddenValue = context.emitSliceRead(
+                                        swish.hidden,
+                                        context.activation_route,
+                                        consumerCycle + localRow
+                                            - context.eastMxmLatency(slice),
+                                        slice, address, 1, 1,
+                                        segment.stream_base + byte, "east",
+                                        "activation",
+                                        context.hemisphereName(hemisphere))
+                                        .getOutput();
+                                }
+                            }
+                            return hiddenValue;
+                        }
+                        for (int64_t byte = 0; byte < 2; ++byte) {
+                            hiddenValue = context
                                 .emitSliceRead(swish.hidden,
                                     context.activation_route,
-                                    segmentCycle
+                                    consumerCycle
                                         - context.eastMxmLatency(
                                             context.hidden_slices[byte]),
                                     context.hidden_slices[byte],
@@ -107,53 +202,58 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                                     "activation",
                                     context.hemisphereName(hemisphere))
                                 .getOutput();
-                    }
+                        }
+                        return hiddenValue;
+                    };
+                    const int64_t down0Cycle = segmentCycle;
+                    const int64_t down1Cycle =
+                        segmentCycle + (singleMxm ? tile : 0);
+                    mlir::Value hidden0 = emitHidden(down0Cycle);
+                    mlir::Value hidden1 = singleMxm
+                        ? emitHidden(down1Cycle) : hidden0;
                     const int64_t unitBase =
                         hemisphere * throughput.mxms_per_hemisphere;
                     down0 = rewriter.create<MxmComputeOp>(ffn.getLoc(),
-                        hiddenValue, ffn.getDownWeight0(),
-                        context.projection_type, segmentCycle,
+                        hidden0, ffn.getDownWeight0(),
+                        context.projection_type, down0Cycle,
                         segment.rows,
-                        segmentCycle
+                        down0Cycle
                             + target.mxm_first_result_latency(),
                         target.mxm_result_window_cycles(segment.rows),
-                        segment.stream_base, 0, weightBuffer, unitBase,
+                        segment.stream_base, 0,
+                        singleMxm ? 0 : weightBuffer, unitBase,
                         segment.rows, tile, tile);
                     down1 = rewriter.create<MxmComputeOp>(ffn.getLoc(),
-                        hiddenValue, ffn.getDownWeight1(),
-                        context.projection_type, segmentCycle,
+                        hidden1, ffn.getDownWeight1(),
+                        context.projection_type, down1Cycle,
                         segment.rows,
-                        segmentCycle
+                        down1Cycle
                             + target.mxm_first_result_latency(),
                         target.mxm_result_window_cycles(segment.rows),
                         segment.stream_base,
-                        throughput.mxm_result_streams, weightBuffer,
-                        unitBase + 1, segment.rows, tile, tile);
+                        throughput.mxm_result_streams,
+                        singleMxm ? 1 : weightBuffer,
+                        unitBase + (singleMxm ? 0 : 1),
+                        segment.rows, tile, tile);
                     rowOffset += segment.rows;
                 }
 
                 const int64_t accumulatorBase =
                     context.down_accumulator_base + mTile * tile;
-                auto acc0Placement = schedule_placement(rewriter,
-                    context.gate_acc_slices, accumulatorBase, tile, 1,
-                    context.hemisphereName(hemisphere),
-                    "fp32_accumulator");
-                auto acc1Placement = schedule_placement(rewriter,
-                    context.up_acc_slices, accumulatorBase, tile, 1,
-                    context.hemisphereName(hemisphere),
-                    "fp32_accumulator");
                 const auto emitAccumulator =
-                    [&](mlir::Value input,
-                        mlir::DictionaryAttr placement, int64_t cycle,
+                    [&](mlir::Value input, int64_t unitId,
+                        int64_t accumulatorAddress, int64_t cycle,
                         int64_t streamBase) {
                         mlir::OperationState state(
                             ffn.getLoc(),
-                            MemAccumulateOp::getOperationName());
+                            MxmAccumulateOp::getOperationName());
                         state.addOperands(input);
                         state.addTypes(context.projection_type);
                         state.addAttributes({
                             rewriter.getNamedAttr("cycle",
                                 rewriter.getI64IntegerAttr(cycle)),
+                            rewriter.getNamedAttr("unit_id",
+                                rewriter.getI64IntegerAttr(unitId)),
                             rewriter.getNamedAttr("stream_base",
                                 rewriter.getI64IntegerAttr(streamBase)),
                             rewriter.getNamedAttr("stream_count",
@@ -161,23 +261,18 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                                     block.final_reduction ? 2
                                                           : throughput
                                                                 .mxm_result_streams)),
-                            rewriter.getNamedAttr(
-                                "address", ffn.getResultAddressAttr()),
-                            rewriter.getNamedAttr(
-                                "placement", placement),
-                            rewriter.getNamedAttr("hemisphere",
-                                rewriter.getStringAttr(
-                                    context.hemisphereName(
-                                        hemisphere))),
+                            rewriter.getNamedAttr("accumulator_address",
+                                rewriter.getI64IntegerAttr(
+                                    accumulatorAddress)),
+                            rewriter.getNamedAttr("accumulator_stride",
+                                rewriter.getI64IntegerAttr(1)),
                             rewriter.getNamedAttr("destination",
                                 rewriter.getStringAttr(
                                     block.final_reduction ? "stream"
-                                                          : "sram")),
+                                                          : "local")),
                             rewriter.getNamedAttr("repeat_count",
                                 rewriter.getI64IntegerAttr(tile)),
                             rewriter.getNamedAttr("repeat_interval",
-                                rewriter.getI64IntegerAttr(1)),
-                            rewriter.getNamedAttr("address_stride",
                                 rewriter.getI64IntegerAttr(1)),
                             rewriter.getNamedAttr(
                                 "accumulator_output_format",
@@ -185,13 +280,19 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                                     block.final_reduction ? "bf16"
                                                           : "fp32")),
                         });
-                        return llvm::cast<MemAccumulateOp>(
+                        return llvm::cast<MxmAccumulateOp>(
                             rewriter.create(state));
                     };
                 auto acc0 = emitAccumulator(down0.getResult(),
-                    acc0Placement, computeCycle + gateAccLatency, 0);
+                    down0.getUnitId(), accumulatorBase,
+                    computeCycle + gateAccLatency, 0);
+                const int64_t down1ComputeCycle =
+                    computeCycle + (singleMxm ? tile : 0);
                 auto acc1 = emitAccumulator(down1.getResult(),
-                    acc1Placement, computeCycle + upAccLatency,
+                    down1.getUnitId(),
+                    accumulatorBase + (singleMxm ? m : 0),
+                    down1ComputeCycle
+                        + (singleMxm ? gateAccLatency : upAccLatency),
                     throughput.mxm_result_streams);
                 if (!block.final_reduction) continue;
 
@@ -230,7 +331,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             ffn.getLoc(),
                             byte < 2 ? acc0.getOutput()
                                      : acc1.getOutput(),
-                            computeCycle
+                            (byte < 2 ? computeCycle
+                                      : down1ComputeCycle)
                                 + target.mxm_first_result_latency()
                                 + row + *latency,
                             1, streamBase + byte % 2, 1, 0,

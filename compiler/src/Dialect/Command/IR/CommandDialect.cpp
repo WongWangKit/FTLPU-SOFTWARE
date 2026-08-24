@@ -3,6 +3,7 @@
 
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
+#include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
 
@@ -26,8 +27,10 @@ LogicalResult BindingOp::verify()
         && getAccess() != "internal")
         return emitOpError("access must be input, output, or internal");
     if (getRole() != "activation" && getRole() != "weight"
-        && getRole() != "result" && getRole() != "constant")
-        return emitOpError("role must be activation, weight, result, or constant");
+        && getRole() != "result" && getRole() != "constant"
+        && getRole() != "workspace")
+        return emitOpError(
+            "role must be activation, weight, result, constant, or workspace");
     if (getElementType() != "i8" && getElementType() != "i32"
         && getElementType() != "f16" && getElementType() != "bf16"
         && getElementType() != "f32")
@@ -77,6 +80,18 @@ LogicalResult TimelineOp::verify()
     return success();
 }
 
+LogicalResult WeightPageOp::verify()
+{
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    if (getBindingIndex() < 0 || getPageIndex() < 0 || getBank() < 0
+        || getBank() >= targetModel->memory().banks_per_slice
+        || getReadyCycle() < 0 || getReleaseCycle() <= getReadyCycle())
+        return emitOpError(
+            "requires a valid binding/page/bank and non-empty residency interval");
+    return success();
+}
+
 LogicalResult MemOp::verify()
 {
     auto targetModel = target::LPUTargetModel::from_operation(*this);
@@ -111,6 +126,57 @@ LogicalResult MemOp::verify()
                 return address < 0 || address >= memoryRows;
             }))
         return emitOpError("wave/repeat address range is outside SRAM");
+    return success();
+}
+
+LogicalResult MemBundleOp::verify()
+{
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
+    const int64_t queueCount = target.memory().hemispheres
+        * target.memory().slices_per_hemisphere
+        * target.memory().banks_per_slice;
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
+    const int64_t waveStride = getWaveAddressStride().value_or(0);
+    if (getCycles().empty()
+        || getCycles().size() != getQueues().size()
+        || getCycles().size() != getAddresses().size()
+        || getCycles().size() != getPackedStreams().size()
+        || getRepeatCount() <= 0 || getRepeatInterval() <= 0
+        || waveCount <= 0 || waveInterval <= 0)
+        return emitOpError(
+            "requires equal non-empty lane arrays and positive repeat fields");
+    if (getOpcode() != "read" && getOpcode() != "write"
+        && getOpcode() != "write_tap")
+        return emitOpError("opcode must be read, write, or write_tap");
+    for (auto [cycleAttr, queueAttr, addressAttr, streamAttr] :
+        llvm::zip(getCycles(), getQueues(), getAddresses(),
+            getPackedStreams())) {
+        const int64_t cycle =
+            llvm::cast<IntegerAttr>(cycleAttr).getInt();
+        const int64_t queue =
+            llvm::cast<IntegerAttr>(queueAttr).getInt();
+        const int64_t address =
+            llvm::cast<IntegerAttr>(addressAttr).getInt();
+        const int64_t stream =
+            llvm::cast<IntegerAttr>(streamAttr).getInt();
+        const int64_t corners[] = {
+            address,
+            address + (getRepeatCount() - 1) * getAddressStride(),
+            address + (waveCount - 1) * waveStride,
+            address + (waveCount - 1) * waveStride
+                + (getRepeatCount() - 1) * getAddressStride(),
+        };
+        if (cycle < 0 || queue < 0 || queue >= queueCount
+            || stream < 0 || stream >= target.streams().encoded_streams
+            || llvm::any_of(corners, [&](int64_t corner) {
+                   return corner < 0
+                       || corner >= target.memory().sram_depth_rows;
+               }))
+            return emitOpError("contains an invalid bundled MEM lane");
+    }
     return success();
 }
 
@@ -211,6 +277,16 @@ LogicalResult MxmOp::verify()
         && inputMode != "int8_dequant_bf16")
         return emitOpError(
             "weight_input_mode must be direct16 or int8_dequant_bf16");
+    const int64_t weightStreams = loadMode == "column"
+        ? inputMode == "int8_dequant_bf16" ? 1 : 2
+        : inputMode == "int8_dequant_bf16"
+        ? target.throughput().mxm_int8_load_streams_per_cycle
+        : target.throughput().mxm_load_streams_per_cycle;
+    const int64_t weightStreamBase = getWeightStreamBase().value_or(0);
+    if (weightStreamBase < 0
+        || weightStreamBase + weightStreams
+            > target.streams().streams_per_direction)
+        return emitOpError("contains an invalid MXM weight stream range");
     return success();
 }
 
@@ -259,6 +335,7 @@ LogicalResult MxmDequantOp::verify()
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0
         || getWaveCount().value_or(1) <= 0
         || getWaveInterval().value_or(1) <= 0
+        || (getScaleBinding() && *getScaleBinding() < 0)
         || !std::isfinite(getScaleAttr().getValueAsDouble()))
         return emitOpError(
             "contains an invalid MXM dequant queue command field");
@@ -323,6 +400,31 @@ LogicalResult VxmOp::verify()
     if (!verify_operand(getLhsKind(), lhs_index)
         || !verify_operand(getRhsKind(), rhs_index))
         return emitOpError("contains an invalid VXM operand kind or index");
+    const bool chainHead = queue % chainDepth == 0;
+    const auto isStreamOperand = [](StringRef kind) {
+        return kind == "stream_i8" || kind == "stream_f16"
+            || kind == "stream_bf16" || kind == "stream_f32";
+    };
+    if (chainHead) {
+        const bool validLhs = isStreamOperand(getLhsKind())
+            || getLhsKind() == "immediate" || getLhsKind() == "feedback";
+        const bool validRhs = isStreamOperand(getRhsKind())
+            || getRhsKind() == "immediate";
+        if (!validLhs || !validRhs)
+            return emitOpError(
+                "VXM chain head operands must use stream/immediate, "
+                "except lhs may use feedback");
+    } else {
+        const bool validRhs = getRhsKind() == "original"
+            || getRhsKind() == "auxiliary" || getRhsKind() == "immediate"
+            || (getRhsKind() == "accumulator"
+                && (queue % 4 == 1 || queue % 4 == 3));
+        const bool validLhs = getLhsKind() == "previous"
+            || (getLhsKind() == "alu" && lhs_index == queue - 1);
+        if (!validLhs || !validRhs)
+            return emitOpError(
+                "VXM internal stage operands are outside the fixed local mux");
+    }
     if (!std::isfinite(getLhsImmediateAttr().getValueAsDouble())
         || !std::isfinite(getRhsImmediateAttr().getValueAsDouble()))
         return emitOpError("VXM immediate operands must be finite");
@@ -332,6 +434,15 @@ LogicalResult VxmOp::verify()
             "cast_target must be fp32, fp16, bf16, or i8");
     if (output_stream < -1 || output_stream >= target.streams().encoded_streams)
         return emitOpError("output_stream must be -1 or a packed stream selector");
+    if (output_stream >= 0 && queue % chainDepth != chainDepth - 1)
+        return emitOpError("output_stream requires a configured VXM chain tail: queue=")
+            << queue << ", chain_depth=" << chainDepth
+            << ", output_stream=" << output_stream
+            << ", cycle=" << cycle;
+    if (output_stream >= 0 && output_stream != (queue / 2) * 2)
+        return emitOpError("output_stream does not match the fixed VXM output block: queue=")
+            << queue << ", output_stream=" << output_stream
+            << ", expected=" << (queue / 2) * 2;
     if ((getInputHemisphere() != "east" && getInputHemisphere() != "west")
         || (getOutputHemisphere() != "east" && getOutputHemisphere() != "west"))
         return emitOpError("hemisphere must be east or west");

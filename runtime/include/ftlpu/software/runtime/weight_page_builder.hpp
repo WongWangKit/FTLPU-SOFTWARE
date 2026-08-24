@@ -28,6 +28,13 @@ PackedWeightImage pack_weight_binding(
     const BinaryBinding& binding, std::span<const std::uint8_t> logical_data,
     const ExecutableHardwareConfig& hardware);
 
+// Packs one intra-executable FFN page into its compiler-selected bank-local
+// slice groups. The returned segments contain only the requested page.
+PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
+    std::uint32_t page_index,
+    std::span<const std::uint8_t> logical_data,
+    const ExecutableHardwareConfig& hardware);
+
 struct WeightPageBuildOptions {
     std::uint16_t first_bank{0};
     bool remove_logical_weights{true};

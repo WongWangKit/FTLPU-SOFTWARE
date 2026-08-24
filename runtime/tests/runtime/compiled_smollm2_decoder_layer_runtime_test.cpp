@@ -19,17 +19,78 @@
 
 namespace {
 
-constexpr std::size_t kSeqLen = 128;
-constexpr std::size_t kHidden = 576;
-constexpr std::size_t kIntermediate = 1536;
-constexpr std::size_t kQueryHeads = 9;
-constexpr std::size_t kKvHeads = 3;
-constexpr std::size_t kHeadDim = 64;
-constexpr float kEpsilon = 1.0e-5f;
+#ifndef FTLPU_TEST_SEQUENCE_LENGTH
+#define FTLPU_TEST_SEQUENCE_LENGTH 128
+#endif
+#ifndef FTLPU_TEST_HIDDEN_SIZE
+#define FTLPU_TEST_HIDDEN_SIZE 576
+#endif
+#ifndef FTLPU_TEST_INTERMEDIATE_SIZE
+#define FTLPU_TEST_INTERMEDIATE_SIZE 1536
+#endif
+#ifndef FTLPU_TEST_QUERY_HEADS
+#define FTLPU_TEST_QUERY_HEADS 9
+#endif
+#ifndef FTLPU_TEST_KV_HEADS
+#define FTLPU_TEST_KV_HEADS 3
+#endif
+#ifndef FTLPU_TEST_HEAD_DIM
+#define FTLPU_TEST_HEAD_DIM 64
+#endif
+#ifndef FTLPU_TEST_RMS_EPSILON
+#define FTLPU_TEST_RMS_EPSILON 1.0e-5f
+#endif
+#ifndef FTLPU_TEST_ROPE_THETA
+#define FTLPU_TEST_ROPE_THETA 100000.0f
+#endif
+#ifndef FTLPU_TEST_MODEL_NAME
+#define FTLPU_TEST_MODEL_NAME "SmolLM2"
+#endif
+
+constexpr std::size_t kSeqLen = FTLPU_TEST_SEQUENCE_LENGTH;
+constexpr std::size_t kHidden = FTLPU_TEST_HIDDEN_SIZE;
+constexpr std::size_t kIntermediate = FTLPU_TEST_INTERMEDIATE_SIZE;
+constexpr std::size_t kQueryHeads = FTLPU_TEST_QUERY_HEADS;
+constexpr std::size_t kKvHeads = FTLPU_TEST_KV_HEADS;
+constexpr std::size_t kHeadDim = FTLPU_TEST_HEAD_DIM;
+constexpr std::size_t kHeadBlocks = kHeadDim / 32;
+constexpr std::size_t kTokenBlocks = kSeqLen / 32;
+constexpr std::size_t kTileRows = 4;
+constexpr float kEpsilon = FTLPU_TEST_RMS_EPSILON;
+constexpr float kRopeTheta = FTLPU_TEST_ROPE_THETA;
+
+static_assert(kQueryHeads % kKvHeads == 0);
+static_assert(kHeadDim % 32 == 0);
+
+template <typename T, std::size_t N>
+std::string arrayValues(const std::array<T, N>& values)
+{
+    std::string result = "[";
+    for (std::size_t index = 0; index < N; ++index) {
+        if (index != 0) result += ",";
+        result += std::to_string(values[index]);
+    }
+    return result + "]";
+}
 
 float bf16(float value)
 {
     return ftlpu::Bf16::from_float(value).to_float();
+}
+
+std::size_t bf16UlpDistance(float lhs, float rhs)
+{
+    const auto ordered = [](float value) {
+        const std::uint16_t bits =
+            ftlpu::Bf16::from_float(value).bits();
+        return bits & 0x8000u
+            ? static_cast<std::uint32_t>(0x8000u - (bits & 0x7fffu))
+            : static_cast<std::uint32_t>(0x8000u + bits);
+    };
+    const std::uint32_t lhsOrdered = ordered(lhs);
+    const std::uint32_t rhsOrdered = ordered(rhs);
+    return lhsOrdered > rhsOrdered
+        ? lhsOrdered - rhsOrdered : rhsOrdered - lhsOrdered;
 }
 
 float inputValue(std::size_t row, std::size_t column)
@@ -48,17 +109,17 @@ float gammaValue(std::size_t column, std::size_t stage)
 float ropeValue(const std::vector<float>& projection,
     std::size_t token, std::size_t head, std::size_t dimension)
 {
-    const std::size_t pair = dimension % 32;
+    const std::size_t halfHead = kHeadDim / 2;
+    const std::size_t pair = dimension % halfHead;
     const std::size_t base = token * kHidden + head * kHeadDim;
     const float low = projection[base + pair];
-    const float high = projection[base + pair + 32];
-    constexpr float theta = 100000.0f;
+    const float high = projection[base + pair + halfHead];
     const float inverse = 1.0f / std::pow(
-        theta, static_cast<float>(2 * pair) / kHeadDim);
+        kRopeTheta, static_cast<float>(2 * pair) / kHeadDim);
     const float angle = static_cast<float>(token) * inverse;
     const float cosine = bf16(std::cos(angle));
     const float sine = bf16(std::sin(angle));
-    return bf16(dimension < 32
+    return bf16(dimension < halfHead
         ? low * cosine - high * sine
         : high * cosine + low * sine);
 }
@@ -148,9 +209,7 @@ std::size_t firstBindingReadCycle(
             const auto instruction =
                 ftlpu::isa::decode_mem_instruction(encoded);
             if (commandIndex == relocation.command_index) {
-                if (instruction.opcode != ftlpu::MemOpcode::Read
-                    && instruction.opcode
-                        != ftlpu::MemOpcode::ReadWrite)
+                if (instruction.opcode != ftlpu::MemOpcode::Read)
                     throw std::logic_error(
                         "binding relocation does not reference a MEM read");
                 firstCycle = std::min(firstCycle, cycle);
@@ -209,7 +268,7 @@ int main(int argc, char** argv)
 try {
     if (argc != 2)
         throw std::runtime_error(
-            "usage: compiled_smollm2_decoder_layer_runtime_test program.ftlpu");
+            "usage: compiled_decoder_layer_runtime_test program.ftlpu");
     const auto program =
         ftlpu::software::runtime::read_binary_program(
             std::filesystem::path(argv[1]));
@@ -238,6 +297,7 @@ try {
     if (const auto* tracePath = std::getenv("FTLPU_SCHEDULE_TRACE"))
         ftlpu::software::runtime::write_schedule_trace_csv(
             program, tracePath);
+    if (std::getenv("FTLPU_TRACE_ONLY")) return 0;
 
     std::vector<float> inputValues(kSeqLen * kHidden);
     std::vector<std::uint8_t> input;
@@ -277,6 +337,14 @@ try {
     std::array<std::vector<std::size_t>, kKvHeads>
         valueMismatchColumns;
     std::array<std::uint64_t, kKvHeads> valueMismatchMasks {};
+    std::array<std::size_t, kKvHeads> valueNonzeroCounts {};
+    std::array<float, 8> valueObservedSamples {};
+    std::array<float, 8> valueExpectedSamples {};
+    std::array<std::size_t, kKvHeads * kHeadBlocks>
+        valueSourceNonzeroCounts {};
+    std::array<std::size_t, kKvHeads * kHeadBlocks>
+        valueDestinationNonzeroCounts {};
+    std::array<float, kKvHeads * kHeadBlocks> valueSourceMaxErrors {};
     for (std::size_t column = 0;
          column < kKvHeads * kHeadDim; ++column) {
         keyWeight[sourceHidden(1, column)
@@ -327,18 +395,16 @@ try {
     runtime.upload_input(4, valueWeight);
     runtime.upload_input(5, outputWeight);
     runtime.upload_input(6, gamma1);
-    runtime.upload_input(7, gateWeight);
-    runtime.upload_input(8, upWeight);
-    runtime.upload_input(9, downWeight);
     const auto physicalBf16 = [&](ftlpu::Hemisphere hemisphere,
                                   std::size_t lowSlice,
                                   std::size_t highSlice,
                                   std::size_t address,
-                                  std::size_t column) {
+                                  std::size_t column,
+                                  std::size_t bank = 0) {
         const auto low = system->read_mem_sram_lane_byte(
-            hemisphere, lowSlice, column / 8, address, column % 8);
+            hemisphere, lowSlice, bank, column / 8, address, column % 8);
         const auto high = system->read_mem_sram_lane_byte(
-            hemisphere, highSlice, column / 8, address, column % 8);
+            hemisphere, highSlice, bank, column / 8, address, column % 8);
         return ftlpu::Bf16::from_bits(
             static_cast<std::uint16_t>(low)
             | (static_cast<std::uint16_t>(high) << 8))
@@ -383,10 +449,28 @@ try {
                         Fp16MxmBlock8Distributed16
                 && binding.byte_size == inputBinding->byte_size;
         });
+    const auto probabilityDiagonalBinding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "attention.probability_diagonal";
+        });
+    if (probabilityDiagonalBinding == program.bindings.end()
+        || probabilityDiagonalBinding->role != "workspace"
+        || probabilityDiagonalBinding->layout
+            != ftlpu::software::runtime::BindingLayout::
+                Fp16ProbabilityDiagonal
+        || probabilityDiagonalBinding->slices.size() != 16)
+        throw std::logic_error(
+            "decoder binary is missing diagonal probability metadata");
     const auto readMxmDistributed = [&](const std::vector<std::uint16_t>& slices,
                                         std::size_t baseRow,
                                         std::size_t row,
-                                        std::size_t column) {
+                                        std::size_t column,
+                                        ftlpu::Hemisphere hemisphere =
+                                            ftlpu::Hemisphere::East,
+                                        std::size_t bank = 0) {
         const std::size_t hiddenBlocks = kHidden / 32;
         const std::size_t tokenBlock = row / 32;
         const std::size_t tokenWave = (row % 32) / 8;
@@ -396,9 +480,9 @@ try {
         const std::size_t featureLane = column % 8;
         const std::size_t address = baseRow
             + (tokenBlock * hiddenBlocks + hiddenBlock) * 4 + tokenWave;
-        return physicalBf16(ftlpu::Hemisphere::East,
+        return physicalBf16(hemisphere,
             slices[2 * tokenLane], slices[2 * tokenLane + 1],
-            address, featureWave * 8 + featureLane);
+            address, featureWave * 8 + featureLane, bank);
     };
     const auto normalized0 = rmsNorm(inputValues, 0);
     const std::size_t attentionPrepackEndCycle =
@@ -424,14 +508,26 @@ try {
     std::size_t prepackFirstZeroColumn = 0;
     std::size_t prepackLastZeroRow = 0;
     std::size_t prepackLastZeroColumn = 0;
+    std::array<std::size_t, 2> prepackHemisphereMismatchCounts {};
+    std::array<float, 2> prepackHemisphereMaxErrors {};
     const std::size_t rms1BaseRow =
-        static_cast<std::size_t>(inputBinding->base_row) + 1536;
+        static_cast<std::size_t>(inputBinding->base_row) + kHidden;
     for (std::size_t row = 0; row < kSeqLen; ++row) {
         for (std::size_t column = 0; column < kHidden; ++column) {
             const float observed = readMxmDistributed(
                 inputBinding->slices, rms1BaseRow, row, column);
             const float expected = normalized0[row * kHidden + column];
             const float error = std::fabs(observed - expected);
+            for (std::size_t side = 0; side < 2; ++side) {
+                const float sideObserved = readMxmDistributed(
+                    inputBinding->slices, rms1BaseRow, row, column,
+                    static_cast<ftlpu::Hemisphere>(side));
+                const float sideError = std::fabs(sideObserved - expected);
+                prepackHemisphereMaxErrors[side] = std::max(
+                    prepackHemisphereMaxErrors[side], sideError);
+                if (sideError > 0.04f)
+                    ++prepackHemisphereMismatchCounts[side];
+            }
             if (error > 0.0f) {
                 ++prepackMismatchCount;
                 if (error > 0.04f)
@@ -474,8 +570,18 @@ try {
                 + "," + std::to_string(prepackLastZeroColumn) + ")"
             + " source=" + std::to_string(readMxmDistributed(
                 inputBinding->slices,
-                static_cast<std::size_t>(inputBinding->base_row) + 1536,
-                prepackMaxRow, prepackMaxColumn)));
+                static_cast<std::size_t>(inputBinding->base_row) + kHidden,
+                prepackMaxRow, prepackMaxColumn))
+            + " hemisphere_mismatches="
+                + arrayValues(prepackHemisphereMismatchCounts)
+            + " hemisphere_max_errors="
+                + arrayValues(prepackHemisphereMaxErrors));
+    if (std::ranges::any_of(prepackHemisphereMismatchCounts,
+            [](std::size_t count) { return count != 0; }))
+        throw std::logic_error(
+            "RMS1 hemisphere replication mismatch counts="
+            + arrayValues(prepackHemisphereMismatchCounts)
+            + " max_errors=" + arrayValues(prepackHemisphereMaxErrors));
     const std::size_t qkvEndCycle =
         static_cast<std::size_t>(timeline(program, "qk").start_cycle);
     runtime.run_cycles(qkvEndCycle - attentionPrepackEndCycle);
@@ -503,45 +609,100 @@ try {
         const std::size_t reduction = dimension / 32;
         const std::size_t stream = 0;
         const std::size_t address =
-            7800 + (head * 2 + reduction) * 16;
+            7800 + (head * kHeadBlocks + reduction)
+                * kTokenBlocks * kTileRows;
+        const auto& reductionSlices =
+            valuePackSlices[reduction % valuePackSlices.size()];
         const float observed = physicalBf16(
             static_cast<ftlpu::Hemisphere>(head % 2),
-            valuePackSlices[reduction][stream],
-            valuePackSlices[reduction][stream + 1],
+            reductionSlices[stream],
+            reductionSlices[stream + 1],
             address, dimension % 32);
         const float expected = bf16(
             normalized0[sourceHidden(2, column)]
             * projectionSign(2, column));
+        const auto block = head * kHeadBlocks + reduction;
+        const float sourceObserved = physicalBf16(
+            static_cast<ftlpu::Hemisphere>((block % 4) / 2),
+            reductionSlices[stream], reductionSlices[stream + 1],
+            address, dimension % 32);
+        if (sourceObserved != 0.0f) ++valueSourceNonzeroCounts[block];
+        if (observed != 0.0f) ++valueDestinationNonzeroCounts[block];
+        valueSourceMaxErrors[block] = std::max(
+            valueSourceMaxErrors[block],
+            std::fabs(sourceObserved - expected));
+        if (observed != 0.0f) ++valueNonzeroCounts[head];
+        if (column < valueObservedSamples.size()) {
+            valueObservedSamples[column] = observed;
+            valueExpectedSamples[column] = expected;
+        }
         const float error = std::fabs(observed - expected);
         valueMaxErrors[head] = std::max(valueMaxErrors[head], error);
         if (error > 0.04f) {
             ++valueMismatchCounts[head];
             valueMismatchColumns[head].push_back(column % kHeadDim);
             valueMismatchMasks[head] |=
-                std::uint64_t {1} << (column % kHeadDim);
+                std::uint64_t {1} << (column % 64);
         }
     }
+    std::array<std::size_t, 8> vxmRemaining {};
+    for (std::size_t stage = 0; stage < vxmRemaining.size(); ++stage)
+        vxmRemaining[stage] = system->vxm_unit()
+                                   .superlane(0)
+                                   .remaining_executions(stage);
+    const auto& copiedBlockSlices = valuePackSlices[0];
+    const float copiedToken4 = physicalBf16(
+        ftlpu::Hemisphere::East,
+        copiedBlockSlices[8], copiedBlockSlices[9],
+        7800 + 2 * kTokenBlocks * kTileRows, 0);
+    const float copiedToken4Expected = bf16(
+        normalized0[4 * kHidden + sourceHidden(2, 64)]
+        * projectionSign(2, 64));
+    const std::array<float, 2> remoteSourceSamples {{
+        physicalBf16(ftlpu::Hemisphere::West,
+            valuePackSlices[0][0], valuePackSlices[0][1],
+            7800 + 2 * kTokenBlocks * kTileRows, 0),
+        physicalBf16(ftlpu::Hemisphere::East,
+            valuePackSlices[0][0], valuePackSlices[0][1],
+            7800 + 4 * kTokenBlocks * kTileRows, 0),
+    }};
+    const std::array<std::size_t, 2> passiveBridgeCounts {{
+        system->passive_bridge_transfer_count(
+            ftlpu::Hemisphere::East, 0),
+        system->passive_bridge_transfer_count(
+            ftlpu::Hemisphere::West, 0),
+    }};
+    const auto bridgeCycleValue = [&](ftlpu::Hemisphere source) {
+        const auto cycle = system->last_passive_bridge_cycle(source, 0);
+        return cycle.has_value() ? *cycle : std::size_t {0};
+    };
+    const std::array<std::size_t, 2> passiveBridgeLastCycles {{
+        bridgeCycleValue(ftlpu::Hemisphere::East),
+        bridgeCycleValue(ftlpu::Hemisphere::West),
+    }};
     if (std::ranges::any_of(
             valueMismatchCounts, [](std::size_t count) {
                 return count != 0;
             }))
         throw std::logic_error(
             "RMS1-to-value projection mismatch counts=["
-            + std::to_string(valueMismatchCounts[0]) + ","
-            + std::to_string(valueMismatchCounts[1]) + ","
-            + std::to_string(valueMismatchCounts[2]) + "] max_errors=["
-            + std::to_string(valueMaxErrors[0]) + ","
-            + std::to_string(valueMaxErrors[1]) + ","
-            + std::to_string(valueMaxErrors[2]) + "] first_dimensions=["
-            + std::to_string(valueMismatchColumns[1].empty()
-                    ? 999 : valueMismatchColumns[1].front())
-            + ","
-            + std::to_string(valueMismatchColumns[2].empty()
-                    ? 999 : valueMismatchColumns[2].front())
-            + "] masks=["
-            + std::to_string(valueMismatchMasks[0]) + ","
-            + std::to_string(valueMismatchMasks[1]) + ","
-            + std::to_string(valueMismatchMasks[2]) + "]");
+            + arrayValues(valueMismatchCounts)
+            + " max_errors=" + arrayValues(valueMaxErrors)
+            + " masks=" + arrayValues(valueMismatchMasks)
+            + " nonzero=" + arrayValues(valueNonzeroCounts)
+            + " observed0=" + arrayValues(valueObservedSamples)
+            + " expected0=" + arrayValues(valueExpectedSamples)
+            + " vxm_remaining=" + arrayValues(vxmRemaining)
+            + " copied_token4=" + std::to_string(copiedToken4)
+            + "/" + std::to_string(copiedToken4Expected)
+            + " remote_sources=" + arrayValues(remoteSourceSamples)
+            + " bridge_counts=" + arrayValues(passiveBridgeCounts)
+            + " bridge_last_cycles="
+                + arrayValues(passiveBridgeLastCycles)
+            + " source_nonzero=" + arrayValues(valueSourceNonzeroCounts)
+            + " destination_nonzero="
+                + arrayValues(valueDestinationNonzeroCounts)
+            + " source_max_errors=" + arrayValues(valueSourceMaxErrors));
 
     std::vector<float> checkpointQuery(inputValues.size(), 0.0f);
     std::vector<float> checkpointKey(inputValues.size(), 0.0f);
@@ -608,38 +769,28 @@ try {
     const std::size_t pvStartCycle =
         static_cast<std::size_t>(timeline(program, "pv").start_cycle);
     runtime.run_cycles(pvStartCycle - qkvEndCycle);
-    const std::size_t probabilityLowSlice =
-        program.hardware.mxms_per_hemisphere == 1 ? 0 : 44;
-    const std::size_t probabilityHighSlice = probabilityLowSlice + 1;
     for (std::size_t head = 0; head < kQueryHeads; ++head) {
         const std::size_t kvHead =
             head / (kQueryHeads / kKvHeads);
         const float probability = physicalBf16(
             static_cast<ftlpu::Hemisphere>(kvHead % 2),
-            probabilityLowSlice, probabilityHighSlice,
-            7000 + head * 64, 0);
+            probabilityDiagonalBinding->slices[0],
+            probabilityDiagonalBinding->slices[1],
+            static_cast<std::size_t>(
+                probabilityDiagonalBinding->base_row)
+                + head * kTokenBlocks * kTokenBlocks * kTileRows,
+            0, probabilityDiagonalBinding->bank);
         if (std::fabs(probability - 1.0f) > 0.01f)
             throw std::logic_error(
                 "softmax probability checkpoint mismatch head="
                 + std::to_string(head) + " actual="
                 + std::to_string(probability) + " expected=1.0");
     }
-    constexpr std::array<std::size_t, 16>
-        kSingleMxmProbabilitySlices {{
-            0, 1, 2, 3, 8, 9, 10, 11,
-            12, 13, 14, 15, 16, 17, 32, 33,
-        }};
-    constexpr std::array<std::size_t, 16>
-        kDualMxmProbabilitySlices {{
-            44, 45, 46, 47, 8, 9, 10, 11,
-            12, 13, 14, 15, 16, 17, 32, 33,
-        }};
     const auto& probabilitySlices =
-        program.hardware.mxms_per_hemisphere == 1
-        ? kSingleMxmProbabilitySlices : kDualMxmProbabilitySlices;
-    constexpr std::size_t kProbabilityBaseRow = 7000;
-    constexpr std::size_t kTokenBlocks = kSeqLen / 32;
-    constexpr std::size_t kTileRows = 4;
+        probabilityDiagonalBinding->slices;
+    const std::size_t probabilityBaseRow =
+        static_cast<std::size_t>(
+            probabilityDiagonalBinding->base_row);
     for (std::size_t query = 0; query < kSeqLen; ++query) {
         const std::size_t queryBlock = query / 32;
         const std::size_t queryRow = query % 8;
@@ -652,7 +803,7 @@ try {
                 float context = 0.0f;
                 for (std::size_t key = 0; key <= query; ++key) {
                     const std::size_t keyBlock = key / 32;
-                    const std::size_t address = kProbabilityBaseRow
+                    const std::size_t address = probabilityBaseRow
                         + ((head * kTokenBlocks + queryBlock)
                                 * kTokenBlocks
                             + keyBlock)
@@ -662,7 +813,8 @@ try {
                         static_cast<ftlpu::Hemisphere>(kvHead % 2),
                         probabilitySlices[queryRow * 2],
                         probabilitySlices[queryRow * 2 + 1],
-                        address, key % 32);
+                        address, key % 32,
+                        probabilityDiagonalBinding->bank);
                     context += probability
                         * checkpointValue[key * kHidden
                             + kvHead * kHeadDim + dimension];
@@ -726,35 +878,29 @@ try {
             + " column=" + std::to_string(contextMaxColumn)
             + " actual=" + std::to_string(contextMaxActual)
             + " expected=" + std::to_string(contextMaxExpected)
-            + " mismatch_counts=["
-            + std::to_string(contextMismatchCounts[0]) + ","
-            + std::to_string(contextMismatchCounts[1]) + ","
-            + std::to_string(contextMismatchCounts[2]) + ","
-            + std::to_string(contextMismatchCounts[3]) + ","
-            + std::to_string(contextMismatchCounts[4]) + ","
-            + std::to_string(contextMismatchCounts[5]) + ","
-            + std::to_string(contextMismatchCounts[6]) + ","
-            + std::to_string(contextMismatchCounts[7]) + ","
-            + std::to_string(contextMismatchCounts[8]) + "] zero_counts=["
-            + std::to_string(contextUnexpectedZeroCounts[0]) + ","
-            + std::to_string(contextUnexpectedZeroCounts[1]) + ","
-            + std::to_string(contextUnexpectedZeroCounts[2]) + ","
-            + std::to_string(contextUnexpectedZeroCounts[3]) + ","
-            + std::to_string(contextUnexpectedZeroCounts[4]) + ","
-            + std::to_string(contextUnexpectedZeroCounts[5]) + ","
-            + std::to_string(contextUnexpectedZeroCounts[6]) + ","
-            + std::to_string(contextUnexpectedZeroCounts[7]) + ","
-            + std::to_string(contextUnexpectedZeroCounts[8]) + "]");
+            + " mismatch_counts=" + arrayValues(contextMismatchCounts)
+            + " zero_counts="
+                + arrayValues(contextUnexpectedZeroCounts));
 
     const std::size_t outputProjectionEndCycle =
         static_cast<std::size_t>(
             timeline(program, "elementwise.add").start_cycle);
-    runtime.run_cycles(outputProjectionEndCycle - pvEndCycle);
+    if (outputProjectionEndCycle
+        < pvEndCycle + kCheckpointDrainCycles)
+        throw std::logic_error(
+            "PV checkpoint drain overlaps the O projection checkpoint");
+    runtime.run_cycles(outputProjectionEndCycle - pvEndCycle
+        - kCheckpointDrainCycles);
     float outputProjectionMaxError = 0.0f;
     std::size_t outputProjectionMaxRow = 0;
     std::size_t outputProjectionMaxColumn = 0;
     float outputProjectionMaxActual = 0.0f;
     float outputProjectionMaxExpected = 0.0f;
+    float outputProjectionReplicaMaxError = 0.0f;
+    std::size_t outputProjectionReplicaMaxHemisphere = 0;
+    std::size_t outputProjectionReplicaMaxRow = 0;
+    std::size_t outputProjectionReplicaMaxColumn = 0;
+    float outputProjectionReplicaMaxActual = 0.0f;
     for (std::size_t row = 0; row < kSeqLen; ++row) {
         for (std::size_t column = 0; column < kHidden; ++column) {
             float expected = 0.0f;
@@ -788,6 +934,22 @@ try {
                     block8AttentionBinding->slices[2 * tokenLane],
                     block8AttentionBinding->slices[2 * tokenLane + 1],
                     address, featureWave * 8 + featureLane);
+                for (std::size_t side = 0; side < 2; ++side) {
+                    const float replica = physicalBf16(
+                        static_cast<ftlpu::Hemisphere>(side),
+                        block8AttentionBinding->slices[2 * tokenLane],
+                        block8AttentionBinding->slices[2 * tokenLane + 1],
+                        address, featureWave * 8 + featureLane);
+                    const float replicaError =
+                        std::fabs(replica - expected);
+                    if (replicaError > outputProjectionReplicaMaxError) {
+                        outputProjectionReplicaMaxError = replicaError;
+                        outputProjectionReplicaMaxHemisphere = side;
+                        outputProjectionReplicaMaxRow = row;
+                        outputProjectionReplicaMaxColumn = column;
+                        outputProjectionReplicaMaxActual = replica;
+                    }
+                }
             } else {
                 const std::size_t pair = (column % 64) / 32;
                 observed = physicalBf16(
@@ -813,6 +975,17 @@ try {
             + " column=" + std::to_string(outputProjectionMaxColumn)
             + " actual=" + std::to_string(outputProjectionMaxActual)
             + " expected=" + std::to_string(outputProjectionMaxExpected));
+    if (outputProjectionReplicaMaxError > 0.04f)
+        throw std::logic_error(
+            "O projection hemisphere replication mismatch max_error="
+            + std::to_string(outputProjectionReplicaMaxError)
+            + " hemisphere="
+            + std::to_string(outputProjectionReplicaMaxHemisphere)
+            + " row=" + std::to_string(outputProjectionReplicaMaxRow)
+            + " column="
+            + std::to_string(outputProjectionReplicaMaxColumn)
+            + " actual="
+            + std::to_string(outputProjectionReplicaMaxActual));
 
     const std::size_t attentionResidualEndCycle =
         static_cast<std::size_t>(
@@ -866,8 +1039,14 @@ try {
     const std::size_t ffnStartCycle =
         firstBindingReadCycle(program, 7);
     runtime.run_cycles(ffnStartCycle - attentionResidualEndCycle);
+    // Paged executables reuse the resident weight bank as scratch between
+    // stages. Model the C2C handoff by making the FFN page resident immediately
+    // before its first binding read instead of uploading every page at cycle 0.
+    runtime.upload_input(7, gateWeight);
+    runtime.upload_input(8, upWeight);
+    runtime.upload_input(9, downWeight);
     const std::size_t rms2BaseRow =
-        static_cast<std::size_t>(inputBinding->base_row) + 1536;
+        static_cast<std::size_t>(inputBinding->base_row) + kHidden;
     const float rms2Value = readMxmDistributed(
         inputBinding->slices, rms2BaseRow, 0, 0);
     if (!std::isfinite(rms2Value) || rms2Value == 0.0f)
@@ -878,16 +1057,109 @@ try {
                 residualSlices,
                 static_cast<std::size_t>(residualBinding->base_row), 0, 0)));
     std::vector<float> rms2Output(kSeqLen * kHidden);
+    const auto expectedRms2Output = rmsNorm(residual1, 1);
+    float rms2CheckpointMaxError = 0.0f;
+    std::size_t rms2CheckpointMaxIndex = 0;
     for (std::size_t row = 0; row < kSeqLen; ++row) {
         for (std::size_t column = 0; column < kHidden; ++column) {
-            rms2Output[row * kHidden + column] = readMxmDistributed(
+            const std::size_t index = row * kHidden + column;
+            rms2Output[index] = readMxmDistributed(
                 inputBinding->slices, rms2BaseRow, row, column);
+            const float error = std::fabs(
+                rms2Output[index] - expectedRms2Output[index]);
+            if (error > rms2CheckpointMaxError) {
+                rms2CheckpointMaxError = error;
+                rms2CheckpointMaxIndex = index;
+            }
         }
     }
+    if (rms2CheckpointMaxError > 0.04f)
+        throw std::logic_error(
+            "second RMSNorm checkpoint mismatch max_error="
+            + std::to_string(rms2CheckpointMaxError)
+            + " row="
+            + std::to_string(rms2CheckpointMaxIndex / kHidden)
+            + " column="
+            + std::to_string(rms2CheckpointMaxIndex % kHidden)
+            + " actual="
+            + std::to_string(rms2Output[rms2CheckpointMaxIndex])
+            + " expected="
+            + std::to_string(expectedRms2Output[rms2CheckpointMaxIndex]));
+    std::cout << FTLPU_TEST_MODEL_NAME
+              << " decoder checkpoint passed: attention + RMS2; "
+              << "starting paged FFN" << std::endl;
     const std::size_t finalResidualStartCycle =
         static_cast<std::size_t>(
             timeline(program, "elementwise.add", 1).start_cycle);
     runtime.run_cycles(finalResidualStartCycle - ffnStartCycle);
+    const auto block8FfnBinding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [&](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.layout
+                    == ftlpu::software::runtime::BindingLayout::
+                        Fp16MxmBlock8Distributed16
+                && binding.byte_size == inputBinding->byte_size
+                && binding.bank == 1;
+        });
+    if (block8FfnBinding == program.bindings.end()
+        || block8FfnBinding->slices.size() != 16)
+        throw std::logic_error(
+            "cannot locate FFN down-projection physical binding");
+    const auto hiddenValue = [&](std::size_t row, std::size_t h) {
+        const float gate =
+            rms2Output[row * kHidden + gateK(h)] * gateSign(h);
+        const float up =
+            rms2Output[row * kHidden + upK(h)] * upSign(h);
+        return bf16(gate * (1.0f / (1.0f + std::exp(-gate))) * up);
+    };
+    std::vector<float> ffnOutput(kSeqLen * kHidden);
+    float ffnCheckpointMaxError = 0.0f;
+    for (std::size_t row = 0; row < kSeqLen; ++row) {
+        for (std::size_t column = 0; column < kHidden; ++column) {
+            const std::size_t h0 =
+                (column * 5 + 17) % kIntermediate;
+            const std::size_t h1 = (h0 + 37) % kIntermediate;
+            const float expected =
+                bf16(hiddenValue(row, h0) - hiddenValue(row, h1));
+            const std::size_t outputBlock = column / 32;
+            const auto owner = static_cast<ftlpu::Hemisphere>(
+                outputBlock % 2);
+            const auto replica = static_cast<ftlpu::Hemisphere>(
+                1 - outputBlock % 2);
+            const float ownerValue = readMxmDistributed(
+                block8FfnBinding->slices,
+                static_cast<std::size_t>(block8FfnBinding->base_row),
+                row, column, owner, block8FfnBinding->bank);
+            const float replicaValue = readMxmDistributed(
+                block8FfnBinding->slices,
+                static_cast<std::size_t>(block8FfnBinding->base_row),
+                row, column, replica, block8FfnBinding->bank);
+            ffnOutput[row * kHidden + column] = ownerValue;
+            const float ownerError = std::fabs(ownerValue - expected);
+            const float replicaError = std::fabs(replicaValue - expected);
+            ffnCheckpointMaxError = std::max(
+                ffnCheckpointMaxError, std::max(ownerError, replicaError));
+            if (ownerError > 0.04f || replicaError > 0.04f)
+                throw std::logic_error(
+                    "FFN down checkpoint mismatch row="
+                    + std::to_string(row)
+                    + " column=" + std::to_string(column)
+                    + " output_block=" + std::to_string(outputBlock)
+                    + " owner="
+                    + std::to_string(static_cast<std::size_t>(owner))
+                    + " owner_actual=" + std::to_string(ownerValue)
+                    + " replica_actual=" + std::to_string(replicaValue)
+                    + " expected=" + std::to_string(expected)
+                    + " h0=" + std::to_string(h0)
+                    + " h1=" + std::to_string(h1)
+                    + " bank="
+                    + std::to_string(block8FfnBinding->bank)
+                    + " base_row="
+                    + std::to_string(block8FfnBinding->base_row));
+        }
+    }
     const float preFinalResidualSample = readMxmDistributed(
         residualSlices,
         static_cast<std::size_t>(residualBinding->base_row),
@@ -899,7 +1171,8 @@ try {
             " actual=" + std::to_string(preFinalResidualSample)
             + " expected=" + std::to_string(expectedResidualSample));
     runtime.run_cycles(
-        program.max_cycle - finalResidualStartCycle);
+        program.max_cycle + kCheckpointDrainCycles
+        - finalResidualStartCycle);
     const auto actual = runtime.download_output(0);
 
     std::vector<float> queryProjection(inputValues.size(), 0.0f);
@@ -1094,6 +1367,7 @@ try {
     std::vector<float> hidden(kIntermediate);
     std::size_t nonzero = 0;
     float maxError = 0.0f;
+    std::size_t maxUlpDistance = 0;
     for (std::size_t row = 0; row < kSeqLen; ++row) {
         for (std::size_t h = 0; h < kIntermediate; ++h) {
             const float gate =
@@ -1107,19 +1381,26 @@ try {
             const std::size_t h0 = (column * 5 + 17) % kIntermediate;
             const std::size_t h1 = (h0 + 37) % kIntermediate;
             const float ffn = bf16(hidden[h0] - hidden[h1]);
-            const float expected = bf16(
+            const std::size_t index = row * kHidden + column;
+            const float cpuExpected = bf16(
                 residual1[row * kHidden + column] + ffn);
-            const float observed =
-                readBf16(actual, row * kHidden + column);
-            const float error = std::fabs(observed - expected);
-            maxError = std::max(maxError, error);
+            const float stageExpected = bf16(
+                residual1[index] + ffnOutput[index]);
+            const float observed = readBf16(actual, index);
+            const float stageError = std::fabs(observed - stageExpected);
+            const float cpuError = std::fabs(observed - cpuExpected);
+            maxError = std::max(maxError, cpuError);
+            maxUlpDistance = std::max(
+                maxUlpDistance,
+                bf16UlpDistance(observed, cpuExpected));
             if (std::fabs(observed) > 1.0e-4f) ++nonzero;
-            if (error > 0.04f) {
+            if (stageError != 0.0f) {
                 throw std::logic_error(
-                    "decoder layer mismatch row=" + std::to_string(row)
+                    "final residual mismatch row=" + std::to_string(row)
                     + " column=" + std::to_string(column)
                     + " actual=" + std::to_string(observed)
-                    + " expected=" + std::to_string(expected)
+                    + " expected=" + std::to_string(stageExpected)
+                    + " down.actual=" + std::to_string(ffnOutput[index])
                     + " cpu_ffn=" + std::to_string(ffn)
                     + " hidden0.cpu=" + std::to_string(hidden[h0])
                     + " hidden1.cpu=" + std::to_string(hidden[h1])
@@ -1143,9 +1424,13 @@ try {
             + " final.west=" + std::to_string(physicalBf16(
                 ftlpu::Hemisphere::West, 32, 33, 0, 0)));
     }
-    std::cout << "Complete SmolLM2 decoder layer passed: "
+    std::cout << "Complete " FTLPU_TEST_MODEL_NAME
+                 " decoder layer passed: "
               << kSeqLen * kHidden << " BF16 values, nonzero="
               << nonzero << ", max_error=" << maxError
+              << ", max_ulp_distance=" << maxUlpDistance
+              << ", ffn_checkpoint_max_error="
+              << ffnCheckpointMaxError
               << ", host_attention_context_max_error="
               << hostAttentionContextMaxError
               << ", attention_residual_max_error="
@@ -1154,7 +1439,7 @@ try {
               << ", max_cycle=" << program.max_cycle << '\n';
     return 0;
 } catch (const std::exception& ex) {
-    std::cerr << "compiled_smollm2_decoder_layer_runtime_test failed: "
+    std::cerr << "compiled_decoder_layer_runtime_test failed: "
               << ex.what() << '\n';
     return 1;
 }

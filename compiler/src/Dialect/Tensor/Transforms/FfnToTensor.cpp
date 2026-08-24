@@ -1,5 +1,6 @@
 #include "KernelToTensorLowering.hpp"
 
+#include "ftlpu/compiler/Dialect/Tensor/Analysis/ffn_weight_tile_plan.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 #include "ftlpu/compiler/Target/mxm_execution_strategy.hpp"
 
@@ -56,13 +57,12 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     llvm::SmallVector<int64_t> activation_slices;
     if (block8Ffn)
         activation_slices = target.ffn_block8_input_slices();
-    const llvm::SmallVector<int64_t> hidden_slices = block8Ffn
+    llvm::SmallVector<int64_t> hidden_slices = block8Ffn
         ? target.mxm_distributed_activation_slices()
         : target.ffn_hidden_slices();
     llvm::SmallVector<int64_t> result_slices;
     if (block8Ffn)
-        result_slices =
-            target.mxm_distributed_activation_slices();
+        result_slices = target.ffn_block8_result_slices();
     for (int64_t index = 0;
          index < throughput.mxm_activation_streams; ++index) {
         if (!block8Ffn)
@@ -75,14 +75,18 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const int64_t hidden_pass_bytes = w8a16
         ? m * (block8Ffn ? hidden / memory.hemispheres : hidden) * 2
         : m * 320;
+    const bool singleMxmVector = w8a16 && !block8Ffn
+        && throughput.mxms_per_hemisphere == 1;
     const int64_t gate_rows = w8a16
         ? k * hidden
-            / ((block8Ffn ? memory.hemispheres : 1)
+            / (((block8Ffn || singleMxmVector)
+                    ? memory.hemispheres : 1)
                 * memory.w8a16_weight_slice_count
                 * throughput.tile_rows * throughput.lanes_per_tile)
         : 0;
     const int64_t down_wave_columns = memory.hemispheres
-        * throughput.mxms_per_hemisphere
+        * (singleMxmVector
+                ? 2 : throughput.mxms_per_hemisphere)
         * throughput.tile_rows * throughput.lanes_per_tile;
     const int64_t down_rows = w8a16 && block8Ffn
         ? ((n + down_wave_columns - 1) / down_wave_columns)
@@ -93,7 +97,40 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             * (hidden / throughput.mxm_rows)
             * memory.w8a16_weight_slice_count
         : 0;
-    const bool pagedWeights = weight_bank >= 0;
+    const bool requiresWeightPaging = singleMxmVector
+        && std::max(gate_rows, down_rows) > memory.sram_depth_rows;
+    const bool pagedWeights = weight_bank >= 0 || requiresWeightPaging;
+    const int64_t initialWeightBank = std::max<int64_t>(0, weight_bank);
+    std::optional<tensor::FfnWeightTilePlan> weightTilePlan;
+    if (requiresWeightPaging) {
+        auto planned = tensor::planFfnWeightTiles(
+            {m, k, hidden, n}, target);
+        if (mlir::failed(planned)) {
+            op.emitError("cannot tile FFN weights into the configured SRAM banks");
+            return mlir::failure();
+        }
+        weightTilePlan = std::move(*planned);
+        if (weightTilePlan->minimum_hidden_slices
+            > static_cast<int64_t>(hidden_slices.size()))
+            hidden_slices = target.mxm_distributed_activation_slices();
+    }
+    const bool tiledWeights = weightTilePlan.has_value();
+    const bool hiddenDistributed16 = block8Ffn || (tiledWeights
+        && hidden_slices.size() == 16);
+    const auto inheritedInputPlacement = get_value_placement(input_value);
+    const auto inheritedInputBank = mlir::succeeded(inheritedInputPlacement)
+        ? inheritedInputPlacement->getAs<mlir::IntegerAttr>("bank")
+        : mlir::IntegerAttr{};
+    const int64_t inputBank = inheritedInputBank
+        ? inheritedInputBank.getInt() : 0;
+    const int64_t workingBank = target.uses_dedicated_slice_roles()
+        && memory.banks_per_slice > 1
+        ? (inputBank + 1) % memory.banks_per_slice
+        : pagedWeights
+            ? (initialWeightBank + 1) % memory.banks_per_slice : 0;
+    const int64_t hiddenBank = tiledWeights ? inputBank : workingBank;
+    const int64_t resultBank = target.uses_dedicated_slice_roles()
+        ? inputBank : workingBank;
     const bool largeSramProfile =
         memory.banks_per_slice * memory.words_per_bank >= 17000;
     const int64_t ffnWeightBase = pagedWeights
@@ -103,6 +140,8 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const int64_t block8HiddenRows = block8Ffn
         ? m * hidden / distributedElementsPerRow
         : 0;
+    const int64_t distributedHiddenRows =
+        m * hidden / distributedElementsPerRow;
     const int64_t block8ResultBaseRow =
         memory.w8a16_hidden_base_row + block8HiddenRows;
     const int64_t block8ResultBank =
@@ -116,43 +155,48 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             m * k * 2,
             block8Ffn ? "fp16_mxm_distributed_16"
                       : "fp16_mxm_activation_planar",
-            "both"))
+            "both", inputBank))
         : allocate_value(input_value, PlacementKind::Activation);
     auto gate = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
             gate_weight_slices, ffnWeightBase,
-            gate_rows, k * hidden, {}, "east",
-            std::max<int64_t>(0, weight_bank)))
+            tiledWeights ? memory.sram_depth_rows : gate_rows,
+            k * hidden, {}, "east",
+            initialWeightBank))
         : allocate_value(gate_weight, PlacementKind::Weight);
     auto up = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
             up_weight_slices, ffnWeightBase,
-            gate_rows, k * hidden, {}, "east",
-            std::max<int64_t>(0, weight_bank)))
+            tiledWeights ? memory.sram_depth_rows : gate_rows,
+            k * hidden, {}, "east",
+            initialWeightBank))
         : allocate_value(up_weight, PlacementKind::Weight);
     auto down = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
             down_weight_slices, ffnWeightBase,
-            down_rows, hidden * n, {}, "east",
-            std::max<int64_t>(0, weight_bank)))
+            tiledWeights ? memory.sram_depth_rows : down_rows,
+            hidden * n, {}, "east",
+            initialWeightBank))
         : allocate_value(down_weight, PlacementKind::Weight);
     auto hidden0 = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::VxmResult,
             hidden_slices, memory.w8a16_hidden_base_row,
-            block8Ffn
-                ? block8HiddenRows
+            hiddenDistributed16
+                ? distributedHiddenRows
                 : m * hidden / throughput.mxm_rows,
             hidden_pass_bytes,
-            block8Ffn ? "fp16_mxm_distributed_16" : "", "both"))
+            hiddenDistributed16 ? "fp16_mxm_distributed_16" : "", "both",
+            hiddenBank))
         : allocator.allocate(PlacementKind::VxmResult, hidden_pass_bytes);
     auto hidden1 = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::VxmResult1,
             hidden_slices, memory.w8a16_hidden_base_row,
-            block8Ffn
-                ? block8HiddenRows
+            hiddenDistributed16
+                ? distributedHiddenRows
                 : m * hidden / throughput.mxm_rows,
             hidden_pass_bytes,
-            block8Ffn ? "fp16_mxm_distributed_16" : "", "both"))
+            hiddenDistributed16 ? "fp16_mxm_distributed_16" : "", "both",
+            hiddenBank))
         : allocator.allocate(PlacementKind::VxmResult1, hidden_pass_bytes);
     const auto result_bytes =
         get_static_tensor_bytes(graph.output.getResult().getType());
@@ -167,7 +211,9 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             *result_bytes,
             block8Ffn ? "fp16_mxm_block8_distributed_16"
                        : "",
-            "both", block8ResultBank))
+            "both", target.uses_dedicated_slice_roles()
+                ? resultBank
+                : pagedWeights ? workingBank : block8ResultBank))
         : mlir::succeeded(result_bytes)
         ? allocator.allocate(PlacementKind::FinalResult, *result_bytes)
         : mlir::FailureOr<Allocation>(mlir::failure());
@@ -184,35 +230,91 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
                       : "fp16_mxm_activation_planar",
             "both")
         : make_placement_attr(rewriter, *input);
-    const auto gate_placement = w8a16
+    const int64_t projectionPageCount = tiledWeights
+        ? (weightTilePlan->projection_wave_count
+              + weightTilePlan->projection_waves_per_page - 1)
+            / weightTilePlan->projection_waves_per_page
+        : 0;
+    const int64_t downPageCount = tiledWeights
+        ? static_cast<int64_t>(weightTilePlan->pages.size())
+            - projectionPageCount
+        : 0;
+    llvm::SmallVector<mlir::Attribute> weightStorageSliceAttrs;
+    if (tiledWeights)
+        for (int64_t slice : target.weight_storage_slices())
+            weightStorageSliceAttrs.push_back(
+                rewriter.getI64IntegerAttr(slice));
+    const auto withWeightPaging = [&](mlir::DictionaryAttr placement,
+                                      int64_t pageCount,
+                                      int64_t pageGranularity,
+                                      int64_t pageRoleGroupBase,
+                                      int64_t pageRoleGroupCount,
+                                      int64_t itemsPerSliceGroup) {
+        if (!tiledWeights) return placement;
+        mlir::NamedAttrList attrs(placement);
+        attrs.set("paged_weight", rewriter.getBoolAttr(true));
+        attrs.set("page_count", rewriter.getI64IntegerAttr(pageCount));
+        attrs.set("page_rows",
+            rewriter.getI64IntegerAttr(memory.sram_depth_rows));
+        attrs.set("page_granularity",
+            rewriter.getI64IntegerAttr(pageGranularity));
+        attrs.set("page_role_group_base",
+            rewriter.getI64IntegerAttr(pageRoleGroupBase));
+        attrs.set("page_role_group_count",
+            rewriter.getI64IntegerAttr(pageRoleGroupCount));
+        attrs.set("page_items_per_slice_group",
+            rewriter.getI64IntegerAttr(itemsPerSliceGroup));
+        attrs.set("page_storage_slices",
+            rewriter.getArrayAttr(weightStorageSliceAttrs));
+        attrs.set("page_bank_count",
+            rewriter.getI64IntegerAttr(memory.banks_per_slice));
+        return attrs.getDictionary(rewriter.getContext());
+    };
+    const auto gate_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *gate,
             block8Ffn ? "w8a16_block8_weight_wave_striped"
-                      : "w8a16_mxm_weight_replicated",
+                : singleMxmVector
+                    ? "w8a16_mxm_weight_wave_striped"
+                    : "w8a16_mxm_weight_replicated",
             "both")
-        : make_placement_attr(rewriter, *gate);
-    const auto up_placement = w8a16
+        : make_placement_attr(rewriter, *gate), projectionPageCount,
+        tiledWeights ? weightTilePlan->projection_waves_per_page : 0,
+        0,
+        tiledWeights ? weightTilePlan->projection_slice_groups_per_role : 0,
+        tiledWeights ? weightTilePlan->projection_waves_per_slice_group : 0);
+    const auto up_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *up,
             block8Ffn ? "w8a16_block8_weight_wave_striped"
-                      : "w8a16_mxm_weight_replicated",
+                : singleMxmVector
+                    ? "w8a16_mxm_weight_wave_striped"
+                    : "w8a16_mxm_weight_replicated",
             "both")
-        : make_placement_attr(rewriter, *up);
-    const auto down_placement = w8a16
+        : make_placement_attr(rewriter, *up), projectionPageCount,
+        tiledWeights ? weightTilePlan->projection_waves_per_page : 0,
+        tiledWeights ? weightTilePlan->projection_slice_groups_per_role : 0,
+        tiledWeights ? weightTilePlan->projection_slice_groups_per_role : 0,
+        tiledWeights ? weightTilePlan->projection_waves_per_slice_group : 0);
+    const auto down_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *down,
             block8Ffn ? "w8a16_block8_weight_wave_striped"
                        : "w8a16_mxm_weight_wave_striped",
             "both")
-        : make_placement_attr(rewriter, *down);
+        : make_placement_attr(rewriter, *down), downPageCount,
+        tiledWeights ? weightTilePlan->down_reduction_blocks_per_page : 0,
+        0, tiledWeights ? weightTilePlan->slice_group_count : 0,
+        tiledWeights
+            ? weightTilePlan->down_reduction_blocks_per_slice_group : 0);
     const auto hidden0_placement = w8a16
         ? make_profile_placement(rewriter, *hidden0,
-            block8Ffn ? "fp16_mxm_distributed_16"
+            hiddenDistributed16 ? "fp16_mxm_distributed_16"
                        : "fp16_mxm_activation_planar",
-            block8Ffn ? "both" : "west")
+            hiddenDistributed16 ? "both" : "west")
         : make_placement_attr(rewriter, *hidden0);
     const auto hidden1_placement = w8a16
         ? make_profile_placement(rewriter, *hidden1,
-            block8Ffn ? "fp16_mxm_distributed_16"
+            hiddenDistributed16 ? "fp16_mxm_distributed_16"
                        : "fp16_mxm_activation_planar",
-            block8Ffn ? "both" : "east")
+            hiddenDistributed16 ? "both" : "east")
         : make_placement_attr(rewriter, *hidden1);
     const auto result_placement = w8a16
         ? make_profile_placement(rewriter, *result,
@@ -247,6 +349,36 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const auto up_scale = graph.up.getRhsScaleAttr();
     const auto down_scale = graph.output.getRhsScaleAttr();
     const auto zero_point = rewriter.getI64IntegerAttr(0);
+    const auto projectionConfig = [&](mlir::FloatAttr scale) {
+        mlir::NamedAttrList attrs;
+        attrs.set("rhs_scale", scale);
+        if (tiledWeights) {
+            attrs.set("weight_page_count",
+                rewriter.getI64IntegerAttr(projectionPageCount));
+            attrs.set("weight_page_rows",
+                rewriter.getI64IntegerAttr(memory.sram_depth_rows));
+            attrs.set("output_waves_per_page", rewriter.getI64IntegerAttr(
+                weightTilePlan->projection_waves_per_page));
+        }
+        return attrs.getDictionary(rewriter.getContext());
+    };
+    const auto downConfig = [&] {
+        mlir::NamedAttrList attrs;
+        attrs.set("lhs_scale", unit_scale);
+        attrs.set("rhs_scale", down_scale);
+        attrs.set("output_scale", unit_scale);
+        attrs.set("output_zero_point", zero_point);
+        if (tiledWeights) {
+            attrs.set("weight_page_count",
+                rewriter.getI64IntegerAttr(downPageCount));
+            attrs.set("weight_page_rows",
+                rewriter.getI64IntegerAttr(memory.sram_depth_rows));
+            attrs.set("reduction_blocks_per_page",
+                rewriter.getI64IntegerAttr(
+                    weightTilePlan->down_reduction_blocks_per_page));
+        }
+        return attrs.getDictionary(rewriter.getContext());
+    };
     const mlir::Type projection_element_type = w8a16
         ? mlir::Type(rewriter.getF32Type())
         : mlir::Type(rewriter.getI32Type());
@@ -287,15 +419,11 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     auto gate_task = create_matmul_task(input_value, gate_weight,
         projection_type, m, hidden, k,
         input_allocations, gate_allocations, transient,
-        rewriter.getDictionaryAttr({
-            rewriter.getNamedAttr("rhs_scale", gate_scale),
-        }));
+        projectionConfig(gate_scale));
     auto up_task = create_matmul_task(input_value, up_weight,
         projection_type, m, hidden, k,
         input_allocations, up_allocations, transient,
-        rewriter.getDictionaryAttr({
-            rewriter.getNamedAttr("rhs_scale", up_scale),
-        }));
+        projectionConfig(up_scale));
 
     mlir::OperationState swish_state(op.getLoc(),
         tensor::SwishTaskOp::getOperationName());
@@ -327,12 +455,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     auto down_task = create_matmul_task(multiply.getResult(),
         down_weight, graph.output.getResult().getType(), m, n,
         hidden, hidden_allocations, down_allocations,
-        result_allocations, rewriter.getDictionaryAttr({
-            rewriter.getNamedAttr("lhs_scale", unit_scale),
-            rewriter.getNamedAttr("rhs_scale", down_scale),
-            rewriter.getNamedAttr("output_scale", unit_scale),
-            rewriter.getNamedAttr("output_zero_point", zero_point),
-        }));
+        result_allocations, downConfig());
     mlir::Operation* output_operation = graph.output.getOperation();
     rewriter.replaceOp(graph.output, down_task.getResult());
     for (mlir::Operation* operation : llvm::reverse(graph.operations)) {

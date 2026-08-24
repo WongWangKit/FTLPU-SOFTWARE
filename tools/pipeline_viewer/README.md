@@ -12,6 +12,11 @@ start,end,resource,detail
 32,64,"MXM.E0.Compute","Compute buffer=0 act=E0 out=W0"
 ```
 
+Paged binaries also include `C2C.E.Prefetch` and `C2C.W.Prefetch` rows. Their
+intervals are derived from binary page readiness and the target's dedicated
+C2C bandwidth; `detail` records the page, bank, bindings, bytes, lane count,
+and `planned=true` provenance.
+
 Controls:
 
 - Mouse wheel: zoom around the pointer.
@@ -22,7 +27,7 @@ Controls:
 - Overview click: recenter the visible window.
 - Overview drag or wheel: pan horizontally; hold Shift for fine control.
 - Focus the overview and use Left/Right; hold Shift for smaller steps.
-- Search and unit selector: filter resources and instruction details.
+- Search and unit selector: filter C2C/MEM/MXM/VXM/SXM resources and details.
 
 The viewer automatically enables level-of-detail sampling in wide views and
 returns to exact per-event drawing as you zoom in. The status strip reports the

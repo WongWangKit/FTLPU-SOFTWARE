@@ -13,7 +13,11 @@ public:
         : target_(target) {}
 
     std::string mem_read_port(int64_t hemisphere, int64_t slice) const;
+    std::string mem_read_port(
+        int64_t hemisphere, int64_t slice, int64_t bank) const;
     std::string mem_write_port(int64_t hemisphere, int64_t slice) const;
+    std::string mem_write_port(
+        int64_t hemisphere, int64_t slice, int64_t bank) const;
     std::string mxm(int64_t unit) const;
     std::string mxm_weight_buffer(int64_t unit, int64_t buffer) const;
     std::string vxm_alu(int64_t alu) const;

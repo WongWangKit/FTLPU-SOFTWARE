@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -40,6 +41,82 @@ struct QueueCommand {
     // and a 32-lane map in this trailing payload.
     std::vector<std::uint32_t> extension_words{};
 };
+
+inline constexpr std::uint32_t kIcuMacroScheduleMagic = 0x4d414352u;
+
+inline bool is_macro_schedule_command(const QueueCommand& command)
+{
+    return command.instruction_kind != InstructionKind::None
+        && isa::decode_icu_command_opcode(command.command)
+            == isa::IcuCommandOpcode::Loop
+        && command.extension_words.size() == 9
+        && command.extension_words[0] == kIcuMacroScheduleMagic;
+}
+
+inline IcuMacroSchedule decode_macro_schedule_command(
+    const QueueCommand& command)
+{
+    if (!is_macro_schedule_command(command))
+        throw std::logic_error("queue command is not an ICU macro schedule");
+    return IcuMacroSchedule {
+        command.extension_words[1],
+        command.extension_words[2],
+        command.extension_words[3],
+        static_cast<std::int32_t>(command.extension_words[4]),
+        command.extension_words[5],
+        command.extension_words[6],
+        static_cast<std::int32_t>(command.extension_words[7]),
+        static_cast<IcuInductionTarget>(command.extension_words[8]),
+    };
+}
+
+inline QueueCommand encode_macro_schedule_command(
+    QueueCommand instruction, const IcuMacroSchedule& schedule)
+{
+    const auto fits_u32 = [](std::size_t value) {
+        return value <= std::numeric_limits<std::uint32_t>::max();
+    };
+    const auto fits_i32 = [](std::int64_t value) {
+        return value >= std::numeric_limits<std::int32_t>::min()
+            && value <= std::numeric_limits<std::int32_t>::max();
+    };
+    if (instruction.instruction_kind == InstructionKind::None
+        || isa::decode_icu_command_opcode(instruction.command)
+            != isa::IcuCommandOpcode::Instruction
+        || !instruction.extension_words.empty())
+        throw std::invalid_argument(
+            "ICU macro requires one native functional instruction");
+    if (schedule.inner_count == 0 || schedule.outer_count == 0
+        || schedule.inner_interval == 0 || schedule.outer_interval == 0
+        || !fits_u32(schedule.start_cycle)
+        || !fits_u32(schedule.inner_count)
+        || !fits_u32(schedule.inner_interval)
+        || !fits_u32(schedule.outer_count)
+        || !fits_u32(schedule.outer_interval)
+        || !fits_i32(schedule.inner_stride)
+        || !fits_i32(schedule.outer_stride))
+        throw std::invalid_argument(
+            "ICU macro schedule does not fit the binary descriptor");
+    if (static_cast<std::uint8_t>(schedule.induction_target)
+        > static_cast<std::uint8_t>(
+            IcuInductionTarget::MxmAccumulatorAddress))
+        throw std::invalid_argument("ICU macro has an invalid induction target");
+
+    instruction.command = static_cast<isa::EncodedIcuCommand>(
+        isa::IcuCommandOpcode::Loop);
+    instruction.extension_words = {
+        kIcuMacroScheduleMagic,
+        static_cast<std::uint32_t>(schedule.start_cycle),
+        static_cast<std::uint32_t>(schedule.inner_count),
+        static_cast<std::uint32_t>(schedule.inner_interval),
+        static_cast<std::uint32_t>(schedule.inner_stride),
+        static_cast<std::uint32_t>(schedule.outer_count),
+        static_cast<std::uint32_t>(schedule.outer_interval),
+        static_cast<std::uint32_t>(schedule.outer_stride),
+        static_cast<std::uint32_t>(schedule.induction_target),
+    };
+    return instruction;
+}
 
 inline bool is_repeat_2d_command(const QueueCommand& command)
 {

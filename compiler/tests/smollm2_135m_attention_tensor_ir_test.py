@@ -127,7 +127,7 @@ def main() -> None:
         'kind = "fp16_probability_diagonal"',
         "base_row = 7000 : i64",
         'kind = "fp16_rope_fifo_x16"',
-        'kind = "fp32_causal_mask_tile"',
+        'kind = "fp16_causal_mask_tile"',
         "base_row = 8128 : i64",
     )
     missing = [item for item in required_layouts if item not in text]

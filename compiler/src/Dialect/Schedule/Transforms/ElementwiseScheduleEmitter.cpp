@@ -9,6 +9,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
+#include <algorithm>
 #include <array>
 
 namespace ftlpu::compiler::schedule {
@@ -38,7 +39,15 @@ struct TileAddress {
     std::array<int64_t, 2> slices;
     int64_t row;
     int64_t hemisphere;
+    int64_t bank;
 };
+
+int64_t placementBank(mlir::DictionaryAttr placement)
+{
+    if (const auto bank = placement.getAs<mlir::IntegerAttr>("bank"))
+        return bank.getInt();
+    return 0;
+}
 
 bool isDistributed16(mlir::DictionaryAttr placement)
 {
@@ -66,7 +75,7 @@ mlir::FailureOr<TileAddress> distributedAddress(
     return TileAddress {
         {slices[2 * tokenLane], slices[2 * tokenLane + 1]},
         base + (tokenBlock * columnBlocks + block) * 4 + tokenWave,
-        hemisphere};
+        hemisphere, placementBank(placement)};
 }
 
 mlir::FailureOr<TileAddress> tileAddress(
@@ -81,7 +90,8 @@ mlir::FailureOr<TileAddress> tileAddress(
     if (!kind || slices.size() < 2) return mlir::failure();
     if (kind.getValue() == "fp16_mxm_activation_planar")
         return TileAddress {{slices[0], slices[1]},
-            base + block * rows, preferredHemisphere};
+            base + block * rows, preferredHemisphere,
+            placementBank(placement)};
     if (kind.getValue() == "fp16_pair_planar") {
         const int64_t pair = block % 2;
         if (slices.size() < static_cast<std::size_t>(2 * pair + 2))
@@ -92,7 +102,7 @@ mlir::FailureOr<TileAddress> tileAddress(
             && hemisphereAttr.getValue() == "both";
         return TileAddress {{slices[2 * pair], slices[2 * pair + 1]},
             base + (dual ? block / 4 : block / 2) * rows,
-            dual ? (block / 2) % 2 : 0};
+            dual ? (block / 2) % 2 : 0, placementBank(placement)};
     }
     if (isDistributed16(placement)) {
         if (kind.getValue()
@@ -232,15 +242,17 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
         const int64_t vxmCycle = cycle;
         const auto emitOperand = [&](mlir::DictionaryAttr placement,
                                      const TileAddress& address,
-                                     int64_t streamBase) {
+                                     int64_t inputCycle,
+                                     int64_t streamBase,
+                                     int64_t sourceHemisphere) {
             if (isDistributed16(placement)) {
                 for (int64_t row = 0; row < rows; ++row) {
                     auto distributed = distributedAddress(placement,
-                        block, row, columnBlocks, hemisphere);
+                        block, row, columnBlocks, sourceHemisphere);
                     if (mlir::failed(distributed)) return false;
                     for (int64_t byte = 0; byte < 2; ++byte) {
                         emitMem(rewriter, op.getLoc(),
-                            vxmCycle + row
+                            inputCycle + row
                                 - westLatency(
                                     distributed->slices[byte]),
                             distributed->hemisphere
@@ -248,78 +260,91 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                                           .slices_per_hemisphere
                                 + distributed->slices[byte],
                             "read", distributed->row,
-                            streamBase + byte, 1, 1, 1);
+                            streamBase + byte, 1, 1, 1,
+                            "sram", -1, distributed->bank);
                     }
                 }
                 return true;
             }
             for (int64_t byte = 0; byte < 2; ++byte) {
                 emitMem(rewriter, op.getLoc(),
-                    vxmCycle - westLatency(address.slices[byte]),
-                    address.hemisphere
+                    inputCycle - westLatency(address.slices[byte]),
+                    sourceHemisphere
                             * target.memory().slices_per_hemisphere
                         + address.slices[byte],
                     "read", address.row, streamBase + byte,
-                    rows, 1, 1);
+                    rows, 1, 1, "sram", -1, address.bank);
             }
             return true;
         };
-        if (!emitOperand(lhsPlacement, *lhs, 32)
-            || !emitOperand(rhsPlacement, *rhs, 34))
-            return op.emitError("invalid distributed elementwise address");
+        for (int64_t sourceHemisphere = 0;
+             sourceHemisphere < target.memory().hemispheres;
+             ++sourceHemisphere) {
+            const int64_t mirroredStreamOffset =
+                sourceHemisphere * 16;
+            if (!emitOperand(lhsPlacement, *lhs, vxmCycle,
+                    32 + mirroredStreamOffset, sourceHemisphere)
+                || !emitOperand(rhsPlacement, *rhs, vxmCycle,
+                    34 + mirroredStreamOffset, sourceHemisphere))
+                return op.emitError(
+                    "invalid distributed elementwise address");
+        }
         auto sum = create_vxm(rewriter, op.getLoc(),
-            op.getLhs(), op.getRhs(), type, vxmCycle, 0, "add",
+            op.getLhs(), op.getRhs(), type, vxmCycle - 1, 0, "add",
             streamKind, 32, 0.0f, streamKind, 34, 0.0f,
             "fp32", -1, rows, 1,
             hemisphere == 0 ? "east" : "west",
-            hemisphere == 0 ? "east" : "west");
+            hemisphere == 0 ? "east" : "west",
+            -1, false, false, true, false, 2);
         auto cast = create_vxm(rewriter, op.getLoc(),
-            sum.getResult(), sum.getResult(), type, vxmCycle + 1, 1,
+            sum.getResult(), sum.getResult(), type, vxmCycle - 1, 1,
             "cast", "alu", 0, 0.0f, "immediate", 0, 0.0f,
             dataFormat, 0, rows, 1,
             hemisphere == 0 ? "east" : "west",
-            hemisphere == 0 ? "east" : "west");
+            hemisphere == 0 ? "east" : "west",
+            -1, false, false, true, false, 2);
         finalValue = cast.getResult();
 
         int64_t outputSliceCount = 2;
+        int64_t secondOutputCycle = -1;
         if (resultKind == "fp16_mxm_activation_planar") {
-            create_vxm(rewriter, op.getLoc(),
-                sum.getResult(), sum.getResult(), type,
-                vxmCycle + 1, 2, "cast", "alu", 0, 0.0f,
-                "immediate", 0, 0.0f, dataFormat, 2,
-                rows, 1,
+            const int64_t secondVxmCycle = vxmCycle + rows + 2;
+            for (int64_t sourceHemisphere = 0;
+                 sourceHemisphere < target.memory().hemispheres;
+                 ++sourceHemisphere) {
+                const int64_t mirroredStreamOffset =
+                    sourceHemisphere * 16;
+                if (!emitOperand(lhsPlacement, *lhs, secondVxmCycle,
+                        36 + mirroredStreamOffset, sourceHemisphere)
+                    || !emitOperand(rhsPlacement, *rhs, secondVxmCycle,
+                        38 + mirroredStreamOffset, sourceHemisphere))
+                    return op.emitError(
+                        "invalid second planar elementwise input pass");
+            }
+            auto secondSum = create_vxm(rewriter, op.getLoc(),
+                op.getLhs(), op.getRhs(), type,
+                secondVxmCycle - 1, 2, "add",
+                streamKind, 36, 0.0f, streamKind, 38, 0.0f,
+                "fp32", -1, rows, 1,
                 hemisphere == 0 ? "east" : "west",
-                hemisphere == 0 ? "east" : "west");
-            create_vxm(rewriter, op.getLoc(),
-                sum.getResult(), sum.getResult(), type,
-                vxmCycle + 1, 3, "cast", "alu", 0, 0.0f,
-                "immediate", 0, 0.0f, dataFormat, 0,
-                rows, 1,
                 hemisphere == 0 ? "east" : "west",
-                hemisphere == 0 ? "west" : "east");
+                -1, false, false, true, false, 2);
             create_vxm(rewriter, op.getLoc(),
-                sum.getResult(), sum.getResult(), type,
-                vxmCycle + 1, 4, "cast", "alu", 0, 0.0f,
-                "immediate", 0, 0.0f, dataFormat, 2,
-                rows, 1,
+                secondSum.getResult(), secondSum.getResult(), type,
+                secondVxmCycle - 1, 3, "cast", "previous", 0, 0.0f,
+                "immediate", 0, 0.0f, dataFormat, 2, rows, 1,
                 hemisphere == 0 ? "east" : "west",
-                hemisphere == 0 ? "west" : "east");
+                hemisphere == 0 ? "east" : "west",
+                -1, false, false, true, false, 2);
             outputSliceCount = 4;
-        } else if (resultDistributed) {
-            create_vxm(rewriter, op.getLoc(),
-                sum.getResult(), sum.getResult(), type,
-                vxmCycle + 1, 2, "cast", "alu", 0, 0.0f,
-                "immediate", 0, 0.0f, dataFormat, 0,
-                rows, 1,
-                hemisphere == 0 ? "east" : "west",
-                hemisphere == 0 ? "west" : "east");
+            secondOutputCycle = secondVxmCycle + 1;
         }
         if (resultDistributed) {
             for (int64_t outputHemisphere = 0;
                  outputHemisphere < target.memory().hemispheres;
                  ++outputHemisphere) {
                 const int64_t streamBase =
-                    outputHemisphere == hemisphere ? 0 : 0;
+                    outputHemisphere == 0 ? 8 : 0;
                 for (int64_t row = 0; row < rows; ++row) {
                     auto output = distributedAddress(resultPlacement,
                         block, row, columnBlocks, outputHemisphere);
@@ -335,7 +360,8 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                                           .slices_per_hemisphere
                                 + output->slices[byte],
                             "write", output->row,
-                            streamBase + byte, 1, 1, 1);
+                            streamBase + byte, 1, 1, 1,
+                            "sram", -1, output->bank);
                     }
                 }
             }
@@ -355,16 +381,25 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 const int64_t slice =
                     resultKind == "fp16_pair_planar"
                     ? result->slices[byte] : resultSlices[byte];
+                const int64_t pairCycle = byte < 2
+                    ? vxmCycle + 1 : secondOutputCycle;
+                const int64_t physicalStreamBase =
+                    outputHemisphere == 0 ? 8 : 0;
                 emitMem(rewriter, op.getLoc(),
-                    vxmCycle + 1 + eastLatency(slice),
+                    pairCycle + eastLatency(slice),
                     outputHemisphere
                             * target.memory().slices_per_hemisphere
                         + slice,
-                    "write", result->row, byte, rows, 1, 1);
+                    "write", result->row,
+                    physicalStreamBase + byte, rows, 1, 1,
+                    "sram", -1, result->bank);
             }
         }
-        cycle += rows + 2
-            + eastLatency(resultSlices[outputSliceCount - 1]);
+        cycle = std::max(cycle,
+            (secondOutputCycle >= 0
+                 ? secondOutputCycle + rows + 1
+                 : vxmCycle + rows + 2)
+            + eastLatency(resultSlices[outputSliceCount - 1]));
     }
     createTimeline(rewriter, op, start, cycle);
     auto output =

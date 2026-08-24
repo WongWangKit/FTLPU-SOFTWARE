@@ -227,7 +227,7 @@ FFN uses reusable WeightLoad, Projection, Swish, and DownProjection schedule bui
 
 ### LPU Target Model
 
-`LPUTargetModel` is the single compiler-side source for MEM geometry, 32 streams per direction, the 64 packed selectors, 12 MEM-boundary register columns, the additional SXM-to-MXM column, MXM dimensions and throughput, supported endpoint routes, register mapping, and transport latency. A latency means producer issue to consumer visibility, including the CModel tick phase; lowering passes must query the model instead of embedding compensating cycles.
+`LPUTargetModel` is the single compiler-side source for MEM geometry, 32 compute streams per direction, the 64 packed selectors, the separate C2C lane count and bytes-per-lane throughput, MEM-boundary register columns, the additional SXM-to-MXM column, MXM dimensions and throughput, supported endpoint routes, register mapping, and transport latency. A latency means producer issue to consumer visibility, including the CModel tick phase; lowering passes must query the model instead of embedding compensating cycles.
 
 #### Automatic MXM execution strategy
 

@@ -190,6 +190,12 @@ CModel 端到端 golden 结果为：
 
 完整模型 executable 当前采用 FFN tail 调度。其静态 decoder-layer schedule 结束于约 197,978 cycle，fused 调度约为 192,125 cycle，因此当前 tail 约慢 3.0%。这里保留 tail 作为更保守的完整 prefill 基线，并不把它描述成性能优化。
 
+## 整层权重页乒乓
+
+当完整 decoder stack 无法全部常驻 MEM 时，一个 `ModelWeightPage` 保存一个完整 decoder layer 的全部 target-packed 权重，包括 Attention、两次 RMSNorm 和 FFN。连续 layer invocation 在 bank 0 和 bank 1 之间交替。layer `i` 从当前 bank 计算时，共用的 C2C/chip cycle driver 把 layer `i+1` 写入另一个 bank；只有下一页在层边界仍未 SRAM-ready 时 runtime 才会等待。
+
+`weight_page_initial_wait_cycles` 统计 page 0 冷启动，`weight_page_boundary_wait_cycles` 统计稳态层间停顿，`weight_page_hidden_prefetches` 统计被前一层计算完全隐藏的页面。Package 校验会拒绝连续 paged invocation 使用同一个 bank。三层 runtime 测试覆盖完整的 `bank0 -> bank1 -> bank0` 复用过程。
+
 ## 持久 KV cache
 
 `SessionMemoryPlanner` 会把模型状态与常驻权重一起做全局分配。由状态支持的 internal binding 不再计入 executable 的普通 scratch 保留区；它在整个 session 中只分配一个物理区间。每个引用该状态的 invocation 都必须具有相同的元素类型、layout、shape、slice 集合和 hemisphere placement。

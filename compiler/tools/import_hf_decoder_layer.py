@@ -205,6 +205,14 @@ def main() -> None:
         type=Path,
         help="optional BF16 activation produced by the preceding layer",
     )
+    parser.add_argument(
+        "--ignore-attention-bias",
+        action="store_true",
+        help=(
+            "omit checkpoint Q/K/V biases until the LPU attention lowering "
+            "supports projection bias adds"
+        ),
+    )
     args = parser.parse_args()
 
     config = json.loads(
@@ -231,8 +239,11 @@ def main() -> None:
     for role, name in names.items():
         quantized[role], scales[role] = quantize_linear(store.read(name))
 
+    source_has_attention_bias = config.get(
+        "attention_bias", config.get("model_type") == "qwen2"
+    )
     biases: dict[str, np.ndarray] = {}
-    if config.get("attention_bias", config.get("model_type") == "qwen2"):
+    if source_has_attention_bias and not args.ignore_attention_bias:
         for role, stem in (("query", "q_proj"), ("key", "k_proj"),
                            ("value", "v_proj")):
             biases[role] = store.read(f"{prefix}.self_attn.{stem}.bias")
@@ -282,6 +293,10 @@ def main() -> None:
         "scales": scales,
         "source_tensors": names,
         "attention_bias": bool(biases),
+        "source_attention_bias": bool(source_has_attention_bias),
+        "ignored_attention_bias": bool(
+            source_has_attention_bias and args.ignore_attention_bias
+        ),
         "bias_roles": sorted(biases),
         "bias_tensors": {
             role: f"{prefix}.self_attn.{stem}.bias"

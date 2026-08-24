@@ -190,6 +190,23 @@ The validation combines scale-aware BF16 error, relative L2, cosine similarity, 
 
 The full-model executable currently uses FFN tail scheduling. Its static decoder-layer schedule ends at approximately 197,978 cycles versus 192,125 for the fused schedule, so tail is about 3.0% slower in the current scheduler. It is retained here as the conservative full-prefill baseline, not as a performance improvement.
 
+## Layer-paged weight ping-pong
+
+For models whose complete decoder stack cannot remain in MEM, one
+`ModelWeightPage` contains all target-packed weights for one complete decoder
+layer, including Attention, both RMSNorms, and FFN. Consecutive layer
+invocations alternate bank 0 and bank 1. While layer `i` executes from its
+bank, the shared C2C/chip cycle driver writes layer `i+1` into the other bank.
+Runtime waits only at the next layer boundary when that page is not yet
+SRAM-ready.
+
+`weight_page_initial_wait_cycles` reports page-0 bootstrap,
+`weight_page_boundary_wait_cycles` reports steady-state stalls, and
+`weight_page_hidden_prefetches` reports pages fully hidden by the preceding
+layer. Package validation rejects consecutive paged invocations that target
+the same bank. The three-layer runtime test covers the full
+`bank0 -> bank1 -> bank0` reuse sequence.
+
 ## Persistent KV cache
 
 `SessionMemoryPlanner` allocates package states globally together with resident weights. State-backed internal bindings are excluded from executable scratch reservation, receive one physical interval for the whole session, and are validated for identical element type, layout, shape, slices, and hemisphere placement at every invocation that uses them.

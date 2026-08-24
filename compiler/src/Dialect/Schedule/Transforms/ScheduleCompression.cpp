@@ -3,10 +3,14 @@
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 
 #include <algorithm>
+#include <map>
+#include <tuple>
 
 namespace ftlpu::compiler {
 namespace {
@@ -29,13 +33,13 @@ bool same_mem_body(
 {
     return lhs.getHemisphere() == rhs.getHemisphere()
         && lhs.getSlice() == rhs.getSlice()
+        && lhs.getBank().value_or(0) == rhs.getBank().value_or(0)
+        && lhs.getAddressBinding() == rhs.getAddressBinding()
         && lhs.getOpcode() == rhs.getOpcode()
         && lhs.getPackedStream() == rhs.getPackedStream()
         && lhs.getRepeatCount() == rhs.getRepeatCount()
         && lhs.getRepeatInterval() == rhs.getRepeatInterval()
         && lhs.getAddressStride() == rhs.getAddressStride()
-        && lhs.getAccumulatorDestination()
-            == rhs.getAccumulatorDestination()
         && optional_integer(lhs, "wave_count", 1) == 1
         && optional_integer(rhs, "wave_count", 1) == 1;
 }
@@ -95,6 +99,102 @@ bool same_sxm_body(schedule::SxmOp lhs, schedule::SxmOp rhs)
             return false;
     return lhs.getRepeatCount().value_or(1) == 1
         && rhs.getRepeatCount().value_or(1) == 1;
+}
+
+const void* attribute_pointer(mlir::Attribute attribute)
+{
+    return attribute ? attribute.getAsOpaquePointer() : nullptr;
+}
+
+mlir::DictionaryAttr operation_pattern_attributes(
+    mlir::Operation* operation, mlir::MLIRContext* context,
+    llvm::ArrayRef<llvm::StringRef> excluded)
+{
+    llvm::SmallVector<mlir::NamedAttribute> attributes;
+    for (mlir::NamedAttribute attribute : operation->getAttrs())
+        if (!llvm::is_contained(
+                excluded, attribute.getName().strref()))
+            attributes.push_back(attribute);
+    return mlir::DictionaryAttr::get(context, attributes);
+}
+
+mlir::DictionaryAttr placement_without_wave_base(
+    mlir::DictionaryAttr placement, mlir::MLIRContext* context)
+{
+    llvm::SmallVector<mlir::NamedAttribute> attributes;
+    for (mlir::NamedAttribute attribute : placement) {
+        const llvm::StringRef name = attribute.getName().strref();
+        if (name != "base_row" && name != "logical_base_row")
+            attributes.push_back(attribute);
+    }
+    return mlir::DictionaryAttr::get(context, attributes);
+}
+
+int64_t placement_base_row(mlir::DictionaryAttr placement)
+{
+    if (auto value = placement.getAs<mlir::IntegerAttr>("base_row"))
+        return value.getInt();
+    return 0;
+}
+
+bool same_temporal_read_body(schedule::MemReadOp lhs,
+    schedule::MemReadOp rhs, mlir::MLIRContext* context)
+{
+    return lhs.getInput() == rhs.getInput()
+        && lhs.getDuration() == rhs.getDuration()
+        && lhs.getStreamBase() == rhs.getStreamBase()
+        && lhs.getStreamCount() == rhs.getStreamCount()
+        && lhs.getRegisterId() == rhs.getRegisterId()
+        && lhs.getRegisterIds() == rhs.getRegisterIds()
+        && lhs.getDirection() == rhs.getDirection()
+        && lhs.getRole() == rhs.getRole()
+        && lhs.getAddress() == rhs.getAddress()
+        && lhs.getBytes() == rhs.getBytes()
+        && lhs.getOutput().getType() == rhs.getOutput().getType()
+        && placement_without_wave_base(lhs.getPlacement(), context)
+            == placement_without_wave_base(rhs.getPlacement(), context);
+}
+
+std::size_t temporal_read_hash(
+    schedule::MemReadOp op, mlir::MLIRContext* context)
+{
+    return static_cast<std::size_t>(llvm::hash_combine(
+        op.getInput().getAsOpaquePointer(), op.getDuration(),
+        op.getStreamBase(), op.getStreamCount(), op.getRegisterId(),
+        attribute_pointer(op->getAttr("register_ids")),
+        attribute_pointer(op.getDirectionAttr()),
+        attribute_pointer(op.getRoleAttr()),
+        op.getAddress().getAsOpaquePointer(), op.getBytes(),
+        op.getOutput().getType().getAsOpaquePointer(),
+        placement_without_wave_base(op.getPlacement(), context)
+            .getAsOpaquePointer()));
+}
+
+bool same_temporal_write_body(schedule::MemWriteOp lhs,
+    schedule::MemWriteOp rhs, mlir::MLIRContext* context)
+{
+    return lhs.getDuration() == rhs.getDuration()
+        && lhs.getStreamBase() == rhs.getStreamBase()
+        && lhs.getStreamCount() == rhs.getStreamCount()
+        && lhs.getRegisterId() == rhs.getRegisterId()
+        && lhs.getDirection() == rhs.getDirection()
+        && lhs.getAddress() == rhs.getAddress()
+        && lhs.getBytes() == rhs.getBytes()
+        && lhs.getOutput().getType() == rhs.getOutput().getType()
+        && placement_without_wave_base(lhs.getPlacement(), context)
+            == placement_without_wave_base(rhs.getPlacement(), context);
+}
+
+std::size_t temporal_write_hash(
+    schedule::MemWriteOp op, mlir::MLIRContext* context)
+{
+    return static_cast<std::size_t>(llvm::hash_combine(
+        op.getDuration(), op.getStreamBase(), op.getStreamCount(),
+        op.getRegisterId(), attribute_pointer(op.getDirectionAttr()),
+        op.getAddress().getAsOpaquePointer(), op.getBytes(),
+        op.getOutput().getType().getAsOpaquePointer(),
+        placement_without_wave_base(op.getPlacement(), context)
+            .getAsOpaquePointer()));
 }
 
 bool same_mxm_attributes(schedule::MxmIssueOp lhs,
@@ -168,8 +268,16 @@ public:
                 const int64_t rhsQueue = rhs.getHemisphere()
                         * target->memory().slices_per_hemisphere
                     + rhs.getSlice();
-                return lhsQueue != rhsQueue
-                    ? lhsQueue < rhsQueue
+                if (lhsQueue != rhsQueue) return lhsQueue < rhsQueue;
+                const int64_t lhsBank = lhs.getBank().value_or(0);
+                const int64_t rhsBank = rhs.getBank().value_or(0);
+                if (lhsBank != rhsBank) return lhsBank < rhsBank;
+                const int64_t lhsBinding =
+                    lhs.getAddressBinding().value_or(-1);
+                const int64_t rhsBinding =
+                    rhs.getAddressBinding().value_or(-1);
+                return lhsBinding != rhsBinding
+                    ? lhsBinding < rhsBinding
                     : lhs.getCycle() < rhs.getCycle();
                 });
 
@@ -241,6 +349,11 @@ public:
         }
 
         compressMemReads(function, *target, builder);
+        compressMemReadWaves(function, builder);
+        compressMemWriteWaves(function, builder);
+        compressMxmLoadGroups(function, builder);
+        compressMxmDequantWaves(function, builder);
+        compressMxmComputeWaves(function, builder);
         compressMxmIssues(function, *target, builder);
         compressVxm(function, builder);
         compressSxm(function, builder);
@@ -249,6 +362,549 @@ public:
     }
 
 private:
+    void compressMemReadWaves(
+        mlir::func::FuncOp function, mlir::Builder& builder)
+    {
+        struct ReadGroup {
+            schedule::MemReadOp exemplar;
+            llvm::SmallVector<schedule::MemReadOp> operations;
+        };
+        std::map<std::size_t, llvm::SmallVector<ReadGroup>> buckets;
+        function.walk([&](schedule::MemReadOp op) {
+            if (op.getWaveCount().value_or(1) != 1) return;
+            auto& groups = buckets[temporal_read_hash(op, &getContext())];
+            auto position = llvm::find_if(groups, [&](const ReadGroup& group) {
+                return same_temporal_read_body(
+                    group.exemplar, op, &getContext());
+            });
+            if (position == groups.end()) {
+                groups.push_back(ReadGroup {op, {op}});
+            } else {
+                position->operations.push_back(op);
+            }
+        });
+
+        llvm::SmallVector<schedule::MemReadOp> toErase;
+        for (auto& [hash, groups] : buckets) {
+            (void)hash;
+            for (ReadGroup& group : groups) {
+                llvm::sort(group.operations,
+                    [](schedule::MemReadOp lhs,
+                        schedule::MemReadOp rhs) {
+                        if (lhs.getCycle() != rhs.getCycle())
+                            return lhs.getCycle() < rhs.getCycle();
+                        return placement_base_row(lhs.getPlacement())
+                            < placement_base_row(rhs.getPlacement());
+                    });
+
+                llvm::SmallVector<schedule::MemReadOp> unique;
+                for (schedule::MemReadOp op : group.operations) {
+                    if (!unique.empty()
+                        && unique.back().getCycle() == op.getCycle()
+                        && placement_base_row(unique.back().getPlacement())
+                            == placement_base_row(op.getPlacement())) {
+                        op.getOutput().replaceAllUsesWith(
+                            unique.back().getOutput());
+                        toErase.push_back(op);
+                        continue;
+                    }
+                    unique.push_back(op);
+                }
+                if (unique.size() < 2) continue;
+
+                std::map<std::pair<int64_t, int64_t>, std::size_t> lookup;
+                for (std::size_t index = 0; index < unique.size(); ++index)
+                    lookup.emplace(
+                        std::pair {static_cast<int64_t>(unique[index].getCycle()),
+                            placement_base_row(unique[index].getPlacement())},
+                        index);
+                llvm::SmallVector<bool> used(unique.size(), false);
+                for (std::size_t seed = 0; seed < unique.size(); ++seed) {
+                    if (used[seed]) continue;
+                    llvm::SmallVector<std::size_t> best {seed};
+                    const int64_t seedCycle = unique[seed].getCycle();
+                    const int64_t seedAddress =
+                        placement_base_row(unique[seed].getPlacement());
+                    const std::size_t candidateEnd = std::min(
+                        unique.size(), seed + std::size_t {17});
+                    for (std::size_t candidate = seed + 1;
+                         candidate < candidateEnd; ++candidate) {
+                        if (used[candidate]) continue;
+                        const int64_t interval =
+                            unique[candidate].getCycle() - seedCycle;
+                        const int64_t stride =
+                            placement_base_row(unique[candidate].getPlacement())
+                            - seedAddress;
+                        if (interval <= 0 || interval > 65535
+                            || stride < -32768 || stride > 32767)
+                            continue;
+                        llvm::SmallVector<std::size_t> sequence {seed};
+                        for (int64_t wave = 1; wave < 1023; ++wave) {
+                            auto found = lookup.find(
+                                {seedCycle + wave * interval,
+                                    seedAddress + wave * stride});
+                            if (found == lookup.end() || used[found->second])
+                                break;
+                            sequence.push_back(found->second);
+                        }
+                        if (sequence.size() > best.size())
+                            best = std::move(sequence);
+                    }
+                    if (best.size() < 2) {
+                        used[seed] = true;
+                        continue;
+                    }
+
+                    schedule::MemReadOp representative = unique[best.front()];
+                    for (std::size_t index : best)
+                        if (unique[index]->isBeforeInBlock(representative))
+                            representative = unique[index];
+                    mlir::NamedAttrList placement(
+                        unique[best.front()].getPlacement());
+                    representative->setAttr("cycle",
+                        builder.getI64IntegerAttr(seedCycle));
+                    representative->setAttr("placement",
+                        placement.getDictionary(&getContext()));
+                    representative->setAttr("wave_count",
+                        builder.getI64IntegerAttr(best.size()));
+                    representative->setAttr("wave_interval",
+                        builder.getI64IntegerAttr(
+                            unique[best[1]].getCycle() - seedCycle));
+                    representative->setAttr("wave_address_stride",
+                        builder.getI64IntegerAttr(
+                            placement_base_row(unique[best[1]].getPlacement())
+                            - seedAddress));
+                    for (std::size_t index : best) {
+                        used[index] = true;
+                        if (unique[index] == representative) continue;
+                        unique[index].getOutput().replaceAllUsesWith(
+                            representative.getOutput());
+                        toErase.push_back(unique[index]);
+                    }
+                }
+            }
+        }
+        for (schedule::MemReadOp operation : toErase)
+            operation.erase();
+    }
+
+    void compressMemWriteWaves(
+        mlir::func::FuncOp function, mlir::Builder& builder)
+    {
+        struct WriteGroup {
+            schedule::MemWriteOp exemplar;
+            llvm::SmallVector<schedule::MemWriteOp> operations;
+        };
+        std::map<std::size_t, llvm::SmallVector<WriteGroup>> buckets;
+        function.walk([&](schedule::MemWriteOp op) {
+            if (op.getWaveCount().value_or(1) != 1) return;
+            auto& groups = buckets[temporal_write_hash(op, &getContext())];
+            auto position = llvm::find_if(groups,
+                [&](const WriteGroup& group) {
+                    return same_temporal_write_body(
+                        group.exemplar, op, &getContext());
+                });
+            if (position == groups.end())
+                groups.push_back(WriteGroup {op, {op}});
+            else
+                position->operations.push_back(op);
+        });
+
+        llvm::SmallVector<schedule::MemWriteOp> toErase;
+        for (auto& [hash, groups] : buckets) {
+            (void)hash;
+            for (WriteGroup& group : groups) {
+                llvm::sort(group.operations,
+                    [](schedule::MemWriteOp lhs,
+                        schedule::MemWriteOp rhs) {
+                        if (lhs.getCycle() != rhs.getCycle())
+                            return lhs.getCycle() < rhs.getCycle();
+                        return placement_base_row(lhs.getPlacement())
+                            < placement_base_row(rhs.getPlacement());
+                    });
+                llvm::SmallVector<schedule::MemWriteOp> unique;
+                for (schedule::MemWriteOp op : group.operations) {
+                    if (!unique.empty()
+                        && unique.back().getCycle() == op.getCycle()
+                        && placement_base_row(unique.back().getPlacement())
+                            == placement_base_row(op.getPlacement())) {
+                        op.getOutput().replaceAllUsesWith(
+                            unique.back().getOutput());
+                        toErase.push_back(op);
+                        continue;
+                    }
+                    unique.push_back(op);
+                }
+                if (unique.size() < 2) continue;
+
+                std::map<std::pair<int64_t, int64_t>, std::size_t> lookup;
+                for (std::size_t index = 0; index < unique.size(); ++index)
+                    lookup.emplace(
+                        std::pair {static_cast<int64_t>(unique[index].getCycle()),
+                            placement_base_row(unique[index].getPlacement())},
+                        index);
+                llvm::SmallVector<bool> used(unique.size(), false);
+                for (std::size_t seed = 0; seed < unique.size(); ++seed) {
+                    if (used[seed]) continue;
+                    llvm::SmallVector<std::size_t> best {seed};
+                    const int64_t seedCycle = unique[seed].getCycle();
+                    const int64_t seedAddress =
+                        placement_base_row(unique[seed].getPlacement());
+                    const std::size_t candidateEnd = std::min(
+                        unique.size(), seed + std::size_t {17});
+                    for (std::size_t candidate = seed + 1;
+                         candidate < candidateEnd; ++candidate) {
+                        if (used[candidate]) continue;
+                        const int64_t interval =
+                            unique[candidate].getCycle() - seedCycle;
+                        const int64_t stride = placement_base_row(
+                            unique[candidate].getPlacement()) - seedAddress;
+                        if (interval <= 0 || interval > 65535
+                            || stride < -32768 || stride > 32767)
+                            continue;
+                        llvm::SmallVector<std::size_t> sequence {seed};
+                        for (int64_t wave = 1; wave < 1023; ++wave) {
+                            auto found = lookup.find(
+                                {seedCycle + wave * interval,
+                                    seedAddress + wave * stride});
+                            if (found == lookup.end() || used[found->second])
+                                break;
+                            sequence.push_back(found->second);
+                        }
+                        if (sequence.size() > best.size())
+                            best = std::move(sequence);
+                    }
+                    if (best.size() < 2) {
+                        used[seed] = true;
+                        continue;
+                    }
+                    schedule::MemWriteOp representative = unique[best.front()];
+                    for (std::size_t index : best)
+                        if (unique[index]->isBeforeInBlock(representative))
+                            representative = unique[index];
+                    representative->setAttr("cycle",
+                        builder.getI64IntegerAttr(seedCycle));
+                    representative->setAttr("placement",
+                        unique[best.front()].getPlacement());
+                    representative->setAttr("wave_count",
+                        builder.getI64IntegerAttr(best.size()));
+                    representative->setAttr("wave_interval",
+                        builder.getI64IntegerAttr(
+                            unique[best[1]].getCycle() - seedCycle));
+                    representative->setAttr("wave_address_stride",
+                        builder.getI64IntegerAttr(placement_base_row(
+                            unique[best[1]].getPlacement()) - seedAddress));
+                    for (std::size_t index : best) {
+                        used[index] = true;
+                        if (unique[index] == representative) continue;
+                        unique[index].getOutput().replaceAllUsesWith(
+                            representative.getOutput());
+                        toErase.push_back(unique[index]);
+                    }
+                }
+            }
+        }
+        for (schedule::MemWriteOp operation : toErase)
+            operation.erase();
+    }
+
+    void compressMxmLoadGroups(
+        mlir::func::FuncOp function, mlir::Builder& builder)
+    {
+        struct Group {
+            llvm::SmallVector<schedule::MxmLoadOp> operations;
+        };
+        std::map<std::pair<const void*, const void*>, Group> groups;
+        function.walk([&](schedule::MxmLoadOp op) {
+            if (op.getGroupCount().value_or(1) != 1) return;
+            auto attributes = operation_pattern_attributes(op,
+                &getContext(), {"cycle", "group_count", "group_interval"});
+            groups[{op.getInput().getAsOpaquePointer(),
+                attributes.getAsOpaquePointer()}]
+                .operations.push_back(op);
+        });
+        llvm::SmallVector<schedule::MxmLoadOp> toErase;
+        for (auto& [key, group] : groups) {
+            (void)key;
+            auto& operations = group.operations;
+            llvm::sort(operations,
+                [](schedule::MxmLoadOp lhs, schedule::MxmLoadOp rhs) {
+                    return lhs.getCycle() < rhs.getCycle();
+                });
+            std::map<int64_t, std::size_t> lookup;
+            for (std::size_t index = 0; index < operations.size(); ++index)
+                lookup.emplace(operations[index].getCycle(), index);
+            llvm::SmallVector<bool> used(operations.size(), false);
+            for (std::size_t seed = 0; seed < operations.size(); ++seed) {
+                if (used[seed]) continue;
+                llvm::SmallVector<std::size_t> best {seed};
+                const int64_t seedCycle = operations[seed].getCycle();
+                const std::size_t candidateEnd = std::min(
+                    operations.size(), seed + std::size_t {17});
+                for (std::size_t candidate = seed + 1;
+                     candidate < candidateEnd; ++candidate) {
+                    if (used[candidate]) continue;
+                    const int64_t interval =
+                        operations[candidate].getCycle() - seedCycle;
+                    if (interval <= 0 || interval > 65535) continue;
+                    llvm::SmallVector<std::size_t> sequence {seed};
+                    for (int64_t groupIndex = 1;
+                         groupIndex < 1023; ++groupIndex) {
+                        auto found = lookup.find(
+                            seedCycle + groupIndex * interval);
+                        if (found == lookup.end() || used[found->second])
+                            break;
+                        sequence.push_back(found->second);
+                    }
+                    if (sequence.size() > best.size())
+                        best = std::move(sequence);
+                }
+                if (best.size() < 2) {
+                    used[seed] = true;
+                    continue;
+                }
+                schedule::MxmLoadOp representative = operations[best.front()];
+                for (std::size_t index : best)
+                    if (operations[index]->isBeforeInBlock(representative))
+                        representative = operations[index];
+                representative->setAttr("cycle",
+                    builder.getI64IntegerAttr(seedCycle));
+                representative->setAttr("group_count",
+                    builder.getI64IntegerAttr(best.size()));
+                representative->setAttr("group_interval",
+                    builder.getI64IntegerAttr(
+                        operations[best[1]].getCycle() - seedCycle));
+                for (std::size_t index : best) {
+                    used[index] = true;
+                    if (operations[index] == representative) continue;
+                    operations[index].getOutput().replaceAllUsesWith(
+                        representative.getOutput());
+                    toErase.push_back(operations[index]);
+                }
+            }
+        }
+        for (schedule::MxmLoadOp operation : toErase)
+            operation.erase();
+    }
+
+    void compressMxmDequantWaves(
+        mlir::func::FuncOp function, mlir::Builder& builder)
+    {
+        struct Group {
+            llvm::SmallVector<schedule::MxmDequantOp> operations;
+        };
+        std::map<const void*, Group> groups;
+        function.walk([&](schedule::MxmDequantOp op) {
+            if (op.getWaveCount().value_or(1) != 1) return;
+            auto attributes = operation_pattern_attributes(op,
+                &getContext(), {"cycle", "wave_count", "wave_interval"});
+            groups[attributes.getAsOpaquePointer()].operations.push_back(op);
+        });
+        llvm::SmallVector<schedule::MxmDequantOp> toErase;
+        for (auto& [key, group] : groups) {
+            (void)key;
+            auto& operations = group.operations;
+            llvm::sort(operations,
+                [](schedule::MxmDequantOp lhs,
+                    schedule::MxmDequantOp rhs) {
+                    return lhs.getCycle() < rhs.getCycle();
+                });
+            std::map<int64_t, std::size_t> lookup;
+            for (std::size_t index = 0; index < operations.size(); ++index)
+                lookup.emplace(operations[index].getCycle(), index);
+            llvm::SmallVector<bool> used(operations.size(), false);
+            for (std::size_t seed = 0; seed < operations.size(); ++seed) {
+                if (used[seed]) continue;
+                llvm::SmallVector<std::size_t> best {seed};
+                const int64_t seedCycle = operations[seed].getCycle();
+                const std::size_t candidateEnd = std::min(
+                    operations.size(), seed + std::size_t {17});
+                for (std::size_t candidate = seed + 1;
+                     candidate < candidateEnd; ++candidate) {
+                    if (used[candidate]) continue;
+                    const int64_t interval =
+                        operations[candidate].getCycle() - seedCycle;
+                    if (interval <= 0 || interval > 65535) continue;
+                    llvm::SmallVector<std::size_t> sequence {seed};
+                    for (int64_t wave = 1; wave < 1023; ++wave) {
+                        auto found = lookup.find(seedCycle + wave * interval);
+                        if (found == lookup.end() || used[found->second])
+                            break;
+                        sequence.push_back(found->second);
+                    }
+                    if (sequence.size() > best.size())
+                        best = std::move(sequence);
+                }
+                if (best.size() < 2) {
+                    used[seed] = true;
+                    continue;
+                }
+                schedule::MxmDequantOp representative =
+                    operations[best.front()];
+                representative->setAttr("wave_count",
+                    builder.getI64IntegerAttr(best.size()));
+                representative->setAttr("wave_interval",
+                    builder.getI64IntegerAttr(
+                        operations[best[1]].getCycle() - seedCycle));
+                for (std::size_t index : best) {
+                    used[index] = true;
+                    if (index != best.front())
+                        toErase.push_back(operations[index]);
+                }
+            }
+        }
+        for (schedule::MxmDequantOp operation : toErase)
+            operation.erase();
+    }
+
+    void compressMxmComputeWaves(
+        mlir::func::FuncOp function, mlir::Builder& builder)
+    {
+        struct ComputePair {
+            schedule::MxmComputeOp compute;
+            schedule::MxmAccumulateOp accumulator;
+        };
+        using GroupKey = std::tuple<const void*, const void*, const void*,
+            const void*, int64_t, int64_t>;
+        std::map<GroupKey, llvm::SmallVector<ComputePair>> groups;
+        function.walk([&](schedule::MxmComputeOp compute) {
+            if (compute.getWaveCount().value_or(1) != 1) return;
+            schedule::MxmAccumulateOp accumulator;
+            for (mlir::Operation* user : compute.getResult().getUsers()) {
+                auto candidate =
+                    llvm::dyn_cast<schedule::MxmAccumulateOp>(user);
+                if (!candidate || accumulator) return;
+                accumulator = candidate;
+            }
+            if (!accumulator
+                || accumulator.getWaveCount().value_or(1) != 1)
+                return;
+            auto computeAttributes = operation_pattern_attributes(compute,
+                &getContext(), {"cycle", "result_cycle", "wave_count",
+                    "wave_interval", "wave_accumulator_address_stride"});
+            auto accumulatorAttributes = operation_pattern_attributes(
+                accumulator, &getContext(), {"cycle", "accumulator_address",
+                    "wave_count", "wave_interval",
+                    "wave_accumulator_address_stride"});
+            groups[{compute.getActivation().getAsOpaquePointer(),
+                compute.getWeight().getAsOpaquePointer(),
+                computeAttributes.getAsOpaquePointer(),
+                accumulatorAttributes.getAsOpaquePointer(),
+                compute.getResultCycle() - compute.getCycle(),
+                accumulator.getCycle() - compute.getCycle()}]
+                .push_back({compute, accumulator});
+        });
+
+        llvm::SmallVector<schedule::MxmAccumulateOp> accumulatorsToErase;
+        llvm::SmallVector<schedule::MxmComputeOp> computesToErase;
+        for (auto& [key, pairs] : groups) {
+            (void)key;
+            llvm::sort(pairs, [](ComputePair lhs, ComputePair rhs) {
+                if (lhs.compute.getCycle() != rhs.compute.getCycle())
+                    return lhs.compute.getCycle() < rhs.compute.getCycle();
+                return lhs.accumulator.getAccumulatorAddress()
+                    < rhs.accumulator.getAccumulatorAddress();
+            });
+            std::map<std::pair<int64_t, int64_t>, std::size_t> lookup;
+            for (std::size_t index = 0; index < pairs.size(); ++index)
+                lookup.emplace(
+                    std::pair {
+                        static_cast<int64_t>(pairs[index].compute.getCycle()),
+                        static_cast<int64_t>(pairs[index].accumulator
+                                .getAccumulatorAddress())},
+                    index);
+            llvm::SmallVector<bool> used(pairs.size(), false);
+            for (std::size_t seed = 0; seed < pairs.size(); ++seed) {
+                if (used[seed]) continue;
+                llvm::SmallVector<std::size_t> best {seed};
+                const int64_t seedCycle = pairs[seed].compute.getCycle();
+                const int64_t seedAddress =
+                    pairs[seed].accumulator.getAccumulatorAddress();
+                const std::size_t candidateEnd =
+                    std::min(pairs.size(), seed + std::size_t {17});
+                for (std::size_t candidate = seed + 1;
+                     candidate < candidateEnd; ++candidate) {
+                    if (used[candidate]) continue;
+                    const int64_t interval =
+                        pairs[candidate].compute.getCycle() - seedCycle;
+                    const int64_t stride = pairs[candidate].accumulator
+                            .getAccumulatorAddress()
+                        - seedAddress;
+                    if (interval <= 0 || interval > 65535) continue;
+                    llvm::SmallVector<std::size_t> sequence {seed};
+                    for (int64_t wave = 1; wave < 1023; ++wave) {
+                        auto found = lookup.find(
+                            {seedCycle + wave * interval,
+                                seedAddress + wave * stride});
+                        if (found == lookup.end() || used[found->second])
+                            break;
+                        sequence.push_back(found->second);
+                    }
+                    if (sequence.size() > best.size())
+                        best = std::move(sequence);
+                }
+                if (best.size() < 2) {
+                    used[seed] = true;
+                    continue;
+                }
+
+                std::size_t representativeIndex = best.front();
+                for (std::size_t index : best)
+                    if (pairs[index].compute->isBeforeInBlock(
+                            pairs[representativeIndex].compute))
+                        representativeIndex = index;
+                auto representative = pairs[representativeIndex];
+                const int64_t interval =
+                    pairs[best[1]].compute.getCycle() - seedCycle;
+                const int64_t stride = pairs[best[1]].accumulator
+                        .getAccumulatorAddress()
+                    - seedAddress;
+                const int64_t resultOffset =
+                    representative.compute.getResultCycle()
+                    - representative.compute.getCycle();
+                const int64_t accumulatorOffset =
+                    representative.accumulator.getCycle()
+                    - representative.compute.getCycle();
+                representative.compute->setAttr(
+                    "cycle", builder.getI64IntegerAttr(seedCycle));
+                representative.compute->setAttr("result_cycle",
+                    builder.getI64IntegerAttr(seedCycle + resultOffset));
+                representative.compute->setAttr("wave_count",
+                    builder.getI64IntegerAttr(best.size()));
+                representative.compute->setAttr("wave_interval",
+                    builder.getI64IntegerAttr(interval));
+                representative.compute->setAttr(
+                    "wave_accumulator_address_stride",
+                    builder.getI64IntegerAttr(stride));
+                representative.accumulator->setAttr(
+                    "cycle", builder.getI64IntegerAttr(
+                        seedCycle + accumulatorOffset));
+                representative.accumulator->setAttr("accumulator_address",
+                    builder.getI64IntegerAttr(seedAddress));
+                representative.accumulator->setAttr("wave_count",
+                    builder.getI64IntegerAttr(best.size()));
+                representative.accumulator->setAttr("wave_interval",
+                    builder.getI64IntegerAttr(interval));
+                representative.accumulator->setAttr(
+                    "wave_accumulator_address_stride",
+                    builder.getI64IntegerAttr(stride));
+
+                for (std::size_t index : best) {
+                    used[index] = true;
+                    if (index == representativeIndex) continue;
+                    pairs[index].accumulator.getOutput().replaceAllUsesWith(
+                        representative.accumulator.getOutput());
+                    accumulatorsToErase.push_back(pairs[index].accumulator);
+                    computesToErase.push_back(pairs[index].compute);
+                }
+            }
+        }
+        for (schedule::MxmAccumulateOp operation : accumulatorsToErase)
+            operation.erase();
+        for (schedule::MxmComputeOp operation : computesToErase)
+            operation.erase();
+    }
+
     void compressMxmIssues(mlir::func::FuncOp function,
         const target::LPUTargetModel& target, mlir::Builder& builder)
     {

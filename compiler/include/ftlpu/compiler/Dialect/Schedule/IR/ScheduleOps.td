@@ -19,8 +19,7 @@ def MemTransferOp : FTLPU_Schedule_Op<"mem_transfer", [MemoryEffects<[MemWrite]>
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
       OptionalAttr<I64Attr>:$wave_address_stride,
-      OptionalAttr<I64Attr>:$address_binding,
-      StrAttr:$accumulator_destination);
+      OptionalAttr<I64Attr>:$address_binding);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -38,6 +37,7 @@ def MxmIssueOp : FTLPU_Schedule_Op<"mxm_issue", [MemoryEffects<[MemWrite]>]> {
       OptionalAttr<StrAttr>:$weight_load_mode,
       OptionalAttr<I64Attr>:$weight_inner_column,
       OptionalAttr<StrAttr>:$weight_input_mode,
+      OptionalAttr<I64Attr>:$weight_stream_base,
       OptionalAttr<StrAttr>:$compute_mode,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
@@ -54,6 +54,7 @@ def MxmDequantOp : FTLPU_Schedule_Op<"mxm_dequant",
   let summary = "Cycle-accurate issue to an MXM-local weight dequantizer";
   let arguments = (ins I64Attr:$cycle, I64Attr:$unit_id, F32Attr:$scale,
       I64Attr:$repeat_count, I64Attr:$repeat_interval,
+      OptionalAttr<I64Attr>:$scale_binding,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval);
   let assemblyFormat = "attr-dict";
@@ -66,7 +67,10 @@ def MemReadOp : FTLPU_Schedule_Op<"mem_read"> {
       I64Attr:$stream_base, I64Attr:$stream_count, I64Attr:$register_id,
       OptionalAttr<ArrayAttr>:$register_ids,
       StrAttr:$direction, StrAttr:$role, DictionaryAttr:$address,
-      DictionaryAttr:$placement, I64Attr:$bytes);
+      DictionaryAttr:$placement, I64Attr:$bytes,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$wave_address_stride);
   let results = (outs AnyRankedTensor:$output);
   let builders = [OpBuilder<(ins "::mlir::Value":$input, "int64_t":$cycle,
       "int64_t":$duration, "int64_t":$stream_base, "int64_t":$stream_count,
@@ -97,7 +101,9 @@ def MxmLoadOp : FTLPU_Schedule_Op<"mxm_load"> {
         OptionalAttr<StrAttr>:$data_format,
         OptionalAttr<StrAttr>:$weight_load_mode,
         OptionalAttr<I64Attr>:$weight_inner_column,
-        OptionalAttr<StrAttr>:$weight_input_mode);
+        OptionalAttr<StrAttr>:$weight_input_mode,
+        OptionalAttr<I64Attr>:$group_count,
+        OptionalAttr<I64Attr>:$group_interval);
   let results = (outs AnyRankedTensor:$output);
   let builders = [OpBuilder<(ins "::mlir::Value":$input, "int64_t":$cycle,
       "int64_t":$duration, "int64_t":$stream_base, "int64_t":$stream_count,
@@ -128,7 +134,10 @@ def MxmComputeOp : FTLPU_Schedule_Op<"mxm_compute"> {
       I64Attr:$output_stream_base, I64Attr:$weight_buffer,
       I64Attr:$unit_id, OptionalAttr<StrAttr>:$data_format,
       OptionalAttr<StrAttr>:$compute_mode,
-      I64Attr:$m, I64Attr:$n, I64Attr:$k);
+      I64Attr:$m, I64Attr:$n, I64Attr:$k,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$wave_accumulator_address_stride);
   let results = (outs AnyRankedTensor:$result);
   let builders = [OpBuilder<(ins "::mlir::Value":$activation, "::mlir::Value":$weight,
       "::mlir::Type":$result_type, "int64_t":$cycle, "int64_t":$duration,
@@ -191,13 +200,16 @@ def VxmOp : FTLPU_Schedule_Op<"vxm", [MemoryEffects<[MemWrite]>]> {
   let hasVerifier = 1;
 }
 
-def MemAccumulateOp : FTLPU_Schedule_Op<"mem_accumulate"> {
-  let summary = "Accumulate an MXM result stream in MEM or forward the final sum";
+def MxmAccumulateOp : FTLPU_Schedule_Op<"mxm_accumulate"> {
+  let summary = "Commit an MXM result into its local accumulator or output stream";
   let arguments = (ins AnyRankedTensor:$input, I64Attr:$cycle,
-      I64Attr:$stream_base, I64Attr:$stream_count, DictionaryAttr:$address,
-      DictionaryAttr:$placement, StrAttr:$hemisphere, StrAttr:$destination,
-      I64Attr:$repeat_count, I64Attr:$repeat_interval, I64Attr:$address_stride,
-      OptionalAttr<StrAttr>:$accumulator_output_format);
+      I64Attr:$unit_id, I64Attr:$stream_base, I64Attr:$stream_count,
+      I64Attr:$accumulator_address, I64Attr:$accumulator_stride,
+      StrAttr:$destination, I64Attr:$repeat_count, I64Attr:$repeat_interval,
+      OptionalAttr<StrAttr>:$accumulator_output_format,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$wave_accumulator_address_stride);
   let results = (outs AnyRankedTensor:$output);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
@@ -208,7 +220,10 @@ def MemWriteOp : FTLPU_Schedule_Op<"mem_write"> {
   let arguments = (ins AnyRankedTensor:$input, I64Attr:$cycle, I64Attr:$duration,
       I64Attr:$stream_base, I64Attr:$stream_count, I64Attr:$register_id,
       StrAttr:$direction, DictionaryAttr:$address, DictionaryAttr:$placement,
-      I64Attr:$bytes);
+      I64Attr:$bytes,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$wave_address_stride);
   let results = (outs AnyRankedTensor:$output);
   let builders = [OpBuilder<(ins "::mlir::Value":$input, "int64_t":$cycle,
       "int64_t":$duration, "int64_t":$stream_base, "int64_t":$stream_count,

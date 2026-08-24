@@ -25,7 +25,6 @@ void emitMem(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(repeatCount)),
         rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(repeatInterval)),
         rewriter.getNamedAttr("address_stride", rewriter.getI64IntegerAttr(addressStride)),
-        rewriter.getNamedAttr("accumulator_destination", rewriter.getStringAttr(destination)),
     });
     if (addressBinding >= 0)
         state.addAttribute("address_binding",
@@ -74,7 +73,6 @@ void emitMemWave(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("wave_count", rewriter.getI64IntegerAttr(waveCount)),
         rewriter.getNamedAttr("wave_interval", rewriter.getI64IntegerAttr(waveInterval)),
         rewriter.getNamedAttr("wave_address_stride", rewriter.getI64IntegerAttr(waveAddressStride)),
-        rewriter.getNamedAttr("accumulator_destination", rewriter.getStringAttr(destination)),
     });
     if (addressBinding >= 0)
         state.addAttribute("address_binding",
@@ -191,7 +189,8 @@ void emitMxm(mlir::IRRewriter& rewriter, mlir::Location location,
 
 void emitMxmDequant(mlir::IRRewriter& rewriter,
     mlir::Location location, int64_t cycle, int64_t unitId,
-    float scale, int64_t repeatCount, int64_t repeatInterval)
+    float scale, int64_t repeatCount, int64_t repeatInterval,
+    int64_t scaleBinding)
 {
     mlir::OperationState state(
         location, MxmDequantOp::getOperationName());
@@ -207,13 +206,16 @@ void emitMxmDequant(mlir::IRRewriter& rewriter,
         rewriter.getNamedAttr("repeat_interval",
             rewriter.getI64IntegerAttr(repeatInterval)),
     });
+    if (scaleBinding >= 0)
+        state.addAttribute("scale_binding",
+            rewriter.getI64IntegerAttr(scaleBinding));
     rewriter.create(state);
 }
 
 void emitMxmDequantWave(mlir::IRRewriter& rewriter,
     mlir::Location location, int64_t cycle, int64_t unitId,
     float scale, int64_t repeatCount, int64_t repeatInterval,
-    int64_t waveCount, int64_t waveInterval)
+    int64_t waveCount, int64_t waveInterval, int64_t scaleBinding)
 {
     mlir::OperationState state(
         location, MxmDequantOp::getOperationName());
@@ -226,16 +228,20 @@ void emitMxmDequantWave(mlir::IRRewriter& rewriter,
         rewriter.getNamedAttr("wave_count", rewriter.getI64IntegerAttr(waveCount)),
         rewriter.getNamedAttr("wave_interval", rewriter.getI64IntegerAttr(waveInterval)),
     });
+    if (scaleBinding >= 0)
+        state.addAttribute("scale_binding",
+            rewriter.getI64IntegerAttr(scaleBinding));
     rewriter.create(state);
 }
 
-VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
+VxmOp emitVxmConfigured(mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Value value, int64_t cycle, int64_t queue, llvm::StringRef opcode,
     llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
     llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
     llvm::StringRef castTarget, int64_t outputStream,
     llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
-    int64_t scaleBinding)
+    int64_t scaleBinding, int64_t chainDepth,
+    int64_t repeatCount, int64_t repeatInterval)
 {
     mlir::OperationState state(location, VxmOp::getOperationName());
     state.addOperands({value, value});
@@ -244,7 +250,7 @@ VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
         rewriter.getNamedAttr("queue", rewriter.getI64IntegerAttr(queue)),
         rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
-        rewriter.getNamedAttr("chain_depth", rewriter.getI64IntegerAttr(8)),
+        rewriter.getNamedAttr("chain_depth", rewriter.getI64IntegerAttr(chainDepth)),
         rewriter.getNamedAttr("lhs_kind", rewriter.getStringAttr(lhsKind)),
         rewriter.getNamedAttr("lhs_index", rewriter.getI64IntegerAttr(lhsIndex)),
         rewriter.getNamedAttr("lhs_immediate", rewriter.getF32FloatAttr(lhsImmediate)),
@@ -253,8 +259,8 @@ VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
         rewriter.getNamedAttr("rhs_immediate", rewriter.getF32FloatAttr(rhsImmediate)),
         rewriter.getNamedAttr("cast_target", rewriter.getStringAttr(castTarget)),
         rewriter.getNamedAttr("output_stream", rewriter.getI64IntegerAttr(outputStream)),
-        rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(1)),
-        rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(1)),
+        rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(repeatCount)),
+        rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(repeatInterval)),
         rewriter.getNamedAttr("input_hemisphere", rewriter.getStringAttr(inputHemisphere)),
         rewriter.getNamedAttr("output_hemisphere", rewriter.getStringAttr(outputHemisphere)),
     });
@@ -262,6 +268,20 @@ VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
         state.addAttribute(
             "scale_binding", rewriter.getI64IntegerAttr(scaleBinding));
     return llvm::cast<VxmOp>(rewriter.create(state));
+}
+
+VxmOp emitVxm(mlir::IRRewriter& rewriter, mlir::Location location,
+    mlir::Value value, int64_t cycle, int64_t queue,
+    llvm::StringRef opcode, llvm::StringRef lhsKind,
+    int64_t lhsIndex, float lhsImmediate, llvm::StringRef rhsKind,
+    int64_t rhsIndex, float rhsImmediate, llvm::StringRef castTarget,
+    int64_t outputStream, llvm::StringRef inputHemisphere,
+    llvm::StringRef outputHemisphere, int64_t scaleBinding)
+{
+    return emitVxmConfigured(rewriter, location, value, cycle, queue,
+        opcode, lhsKind, lhsIndex, lhsImmediate, rhsKind, rhsIndex,
+        rhsImmediate, castTarget, outputStream, inputHemisphere,
+        outputHemisphere, scaleBinding, 8, 1, 1);
 }
 
 AttentionProjectionKind projectionKind(int64_t index)

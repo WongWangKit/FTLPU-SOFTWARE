@@ -277,4 +277,26 @@ int64_t AttentionMemoryLayout::ropeStagingAddress(
         + row;
 }
 
+int64_t AttentionMemoryLayout::ropeProductAddress(
+    AttentionProjectionKind projection, int64_t head, int64_t pairBlock,
+    int64_t product, int64_t token) const
+{
+    const int64_t tokenBlocks =
+        seqLen_ / target_.throughput().mxm_rows;
+    const int64_t rowsPerBlock = target_.throughput().mxm_rows
+        / target_.throughput().mxm_block_rows;
+    const int64_t stagingRows =
+        2 * target_.memory().slices_per_hemisphere * headBlocks_
+        * tokenBlocks * rowsPerBlock;
+    const int64_t queryHeads = hidden_
+        / (headBlocks_ * target_.throughput().mxm_rows);
+    const int64_t globalHead = projection == AttentionProjectionKind::Query
+        ? head : queryHeads + head;
+    const int64_t productRowsPerVector = (seqLen_ + 1) / 2;
+    return ropeStagingBase_ + stagingRows
+        + ((globalHead * (headBlocks_ / 2) + pairBlock) * 4 + product)
+            * productRowsPerVector
+        + token / 2;
+}
+
 } // namespace ftlpu::compiler::schedule

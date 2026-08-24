@@ -6,6 +6,7 @@
 #include "mlir/IR/BuiltinOps.h"
 
 #include <algorithm>
+#include <iostream>
 #include <stdexcept>
 
 namespace {
@@ -17,8 +18,7 @@ void require(bool condition, const char* message)
 
 } // namespace
 
-int main()
-{
+int main() try {
     using namespace ftlpu::compiler;
     mlir::MLIRContext context;
     context.getOrLoadDialect<mlir::func::FuncDialect>();
@@ -39,38 +39,43 @@ int main()
     auto [local, peer] = schedule::ffn_detail::emitFfnSwishAlu(
         rewriter, rewriter.getUnknownLoc(), tensor,
         entry->getArgument(0), entry->getArgument(1), target,
-        FfnScheduleStrategy::Fused, 10, 0, 24);
+        FfnScheduleStrategy::Fused, 10, 0, 6);
 
     int instructions = 0;
     int expInstructions = 0;
-    int divideInstructions = 0;
+    int reciprocalInstructions = 0;
     int castInstructions = 0;
     int64_t lastCycle = 0;
     function.walk([&](schedule::VxmOp op) {
         ++instructions;
         lastCycle = std::max(lastCycle, static_cast<int64_t>(op.getCycle()));
         if (op.getOpcode() == "exp") ++expInstructions;
-        if (op.getOpcode() == "divide") ++divideInstructions;
+        if (op.getOpcode() == "reciprocal") ++reciprocalInstructions;
         if (op.getOpcode() == "cast") ++castInstructions;
     });
 
-    require(instructions == 11, "Swish emitter must issue eleven VXM ops");
+    require(instructions == 8, "Swish emitter must issue one 8-stage VXM chain");
     require(expInstructions == 1, "Swish emitter must issue one exp");
-    require(divideInstructions == 1, "Swish emitter must issue one divide");
-    require(castInstructions == 2, "Swish emitter must fan out two casts");
-    require(lastCycle == 15, "Swish VXM pipeline must occupy six cycles");
-    require(local.getOutputHemisphere() == "east",
-        "local Swish output must remain in the source hemisphere");
+    require(reciprocalInstructions == 1,
+        "Swish emitter must issue one reciprocal");
+    require(castInstructions == 0,
+        "Swish BF16 conversion is a chain-tail cast target");
+    require(lastCycle == 10, "Swish chain is issued in one cycle");
+    require(local == peer,
+        "one compact VXM packet represents both physical chain outputs");
     require(peer.getOutputHemisphere() == "west",
         "peer Swish output must cross to the other hemisphere");
-    require(local.getQueue() == 9,
-        "local Swish cast must use the east VXM output queue");
-    require(peer.getQueue() == 10,
-        "peer Swish cast must use the west VXM output queue");
+    require(peer.getQueue() == 7 && peer.getOutputStream() == 6,
+        "Swish output must use the fixed 8-stage chain tail");
 
     auto placement = schedule::ffn_detail::schedule_placement(rewriter,
         {31}, 8192 + 3 * 128 + 64, 1, 1, "east",
         "fp16_mxm_activation_planar");
     require(schedule::ffn_detail::get_base_row(placement) == 8640,
         "FFN schedule placement must preserve the physical base row");
+    std::cout << "ffn_swish_emitter_test passed\n";
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << "ffn_swish_emitter_test failed: " << error.what() << '\n';
+    return 1;
 }

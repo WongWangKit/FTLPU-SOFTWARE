@@ -49,7 +49,6 @@ public:
 private:
     C2cDmaSystem& system_;
     C2cWeightPageStats stats_{};
-    std::vector<std::size_t> mem_queues_{};
     std::uint32_t drain_cycles_{0};
     bool active_{false};
 };

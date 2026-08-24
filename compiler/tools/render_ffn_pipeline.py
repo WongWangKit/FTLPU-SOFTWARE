@@ -176,7 +176,8 @@ def discover_windows(events: list[Event], policy: str) -> tuple[Window, ...]:
     end_cycle = max(event.end for event in events)
     swiglu = min(
         event.start for event in events
-        if event.resource.startswith("VXM") and "negate" in event.detail
+        if event.resource.startswith("VXM")
+        and re.match(r"(?:neg|negate)\b", event.detail)
     )
     hidden_write_end = max(
         event.end for event in events

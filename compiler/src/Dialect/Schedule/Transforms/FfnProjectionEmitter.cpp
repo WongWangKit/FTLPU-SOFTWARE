@@ -25,6 +25,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
         throughput.mxm0_accumulator_latency;
     const int64_t upAccLatency =
         throughput.mxm1_accumulator_latency;
+    const bool singleMxm = throughput.mxms_per_hemisphere == 1;
 
     FfnProjectionEmission emission;
     rewriter.setInsertionPoint(ffn.getOperation());
@@ -37,22 +38,82 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
 
         for (int64_t hemisphere = 0;
              hemisphere < memory.hemispheres; ++hemisphere) {
-            for (int64_t localMxm = 0;
-                 localMxm < throughput.mxms_per_hemisphere; ++localMxm) {
+            const int64_t projectionCount = singleMxm
+                ? 2 : throughput.mxms_per_hemisphere;
+            for (int64_t projection = 0;
+                 projection < projectionCount; ++projection) {
+                const int64_t localMxm = singleMxm ? 0 : projection;
                 stream::RouteOp raw =
-                    localMxm == 0 ? context.gate_raw : context.up_raw;
+                    projection == 0 ? context.gate_raw : context.up_raw;
                 stream::RouteOp cooked =
-                    localMxm == 0 ? context.gate_route : context.up_route;
+                    projection == 0 ? context.gate_route : context.up_route;
                 const int64_t start = dequantStart
-                    + (hemisphere * throughput.mxms_per_hemisphere
-                          + localMxm)
+                    + (singleMxm
+                            ? projection * tile
+                            : (hemisphere
+                                      * throughput.mxms_per_hemisphere
+                                  + localMxm)
+                                * weightLoadCycles);
+                const auto placement = cooked.getPlacement();
+                const int64_t bindingBase = placement
+                                                .getAs<mlir::IntegerAttr>(
+                                                    "base_row")
+                                                .getInt();
+                int64_t base = bindingBase;
+                if (singleMxm) {
+                    const int64_t logicalSlots = 2;
+                    base += ((pair / logicalSlots) * (k / tile)
+                                + reduction)
+                            * logicalSlots * weightLoadCycles
+                        + (pair % logicalSlots) * weightLoadCycles;
+                } else {
+                    base += (pair * (k / tile) + reduction)
                         * weightLoadCycles;
-                const int64_t base =
-                    cooked.getPlacement()
-                        .getAs<mlir::IntegerAttr>("base_row")
-                        .getInt()
-                    + (pair * (k / tile) + reduction)
-                        * weightLoadCycles;
+                }
+                const int64_t logicalBase = base;
+                int64_t page = -1;
+                int64_t bank = placement
+                    .getAs<mlir::IntegerAttr>("bank").getInt();
+                llvm::SmallVector<int64_t> selectedWeightSlices =
+                    projection == 0 ? context.weight_slices
+                                    : context.up_weight_slices;
+                if (auto paged = placement.getAs<mlir::BoolAttr>(
+                        "paged_weight"); paged && paged.getValue()) {
+                    const int64_t wavesPerPage = placement
+                        .getAs<mlir::IntegerAttr>("page_granularity")
+                        .getInt();
+                    const int64_t roleGroupBase = placement
+                        .getAs<mlir::IntegerAttr>("page_role_group_base")
+                        .getInt();
+                    const int64_t itemsPerGroup = placement
+                        .getAs<mlir::IntegerAttr>(
+                            "page_items_per_slice_group")
+                        .getInt();
+                    const int64_t bankCount = placement
+                        .getAs<mlir::IntegerAttr>("page_bank_count")
+                        .getInt();
+                    page = pair / wavesPerPage;
+                    bank = page % bankCount;
+                    const int64_t pairInPage = pair % wavesPerPage;
+                    const int64_t sliceGroup = roleGroupBase
+                        + pairInPage / itemsPerGroup;
+                    const int64_t localPair = pairInPage % itemsPerGroup;
+                    const auto storage = placement
+                        .getAs<mlir::ArrayAttr>("page_storage_slices");
+                    const int64_t loadSliceCount =
+                        static_cast<int64_t>(selectedWeightSlices.size());
+                    selectedWeightSlices.clear();
+                    for (int64_t index = 0; index < loadSliceCount; ++index)
+                        selectedWeightSlices.push_back(
+                            llvm::cast<mlir::IntegerAttr>(
+                                storage[sliceGroup * loadSliceCount + index])
+                                .getInt());
+                    const int64_t logicalSlots = singleMxm ? 2 : 1;
+                    base = ((localPair / logicalSlots) * (k / tile)
+                              + reduction)
+                            * logicalSlots * weightLoadCycles
+                        + (localPair % logicalSlots) * weightLoadCycles;
+                }
                 const auto rawType =
                     llvm::cast<mlir::RankedTensorType>(
                         raw.getInput().getType());
@@ -64,16 +125,17 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         activationType.getElementType());
                 emitFfnWeightTile(rewriter, ffn.getLoc(), raw,
                     dequantizedType,
-                    localMxm == 0 ? context.weight_slices
-                                  : context.up_weight_slices,
+                    selectedWeightSlices,
                     target,
-                    localMxm == 0
+                    projection == 0
                         ? ffn.getGateScale().convertToFloat()
                         : ffn.getUpScale().convertToFloat(),
                     start, base, hemisphere, localMxm,
                     hemisphere * throughput.mxms_per_hemisphere
                         + localMxm,
-                    weightBuffer, context.local_weight_dequant);
+                    singleMxm ? projection : weightBuffer,
+                    context.local_weight_dequant, bank, page,
+                    logicalBase);
             }
         }
 
@@ -99,102 +161,108 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 for (const FfnStreamSegment& segment :
                     tileSchedule.hemisphere_segments[
                         static_cast<std::size_t>(hemisphere)]) {
-                    mlir::Value activationValue;
                     const int64_t segmentCycle =
                         computeCycle + rowOffset;
-                    if (context.activation_distributed16) {
-                        const int64_t base = context.activation_route
-                                                 .getPlacement()
-                                                 .getAs<mlir::IntegerAttr>(
-                                                     "base_row")
-                                                 .getInt();
-                        const int64_t reductionBlocks = k / tile;
-                        for (int64_t localRow = 0;
-                             localRow < segment.rows; ++localRow) {
-                            const int64_t token =
-                                mTile * tile + rowOffset + localRow;
-                            const int64_t tokenBlock = token / tile;
-                            const int64_t tokenWithinBlock = token % tile;
-                            const int64_t tokenWave =
-                                tokenWithinBlock / 8;
-                            const int64_t tokenLane =
-                                tokenWithinBlock % 8;
-                            const int64_t row = base
-                                + (tokenBlock * reductionBlocks
-                                      + reduction)
-                                    * 4
-                                + tokenWave;
-                            for (int64_t byte = 0; byte < 2; ++byte) {
-                                const int64_t slice =
-                                    context.activation_slices[
-                                        2 * tokenLane + byte];
-                                activationValue =
-                                    context
-                                        .emitSliceRead(
-                                            context.activation_route
-                                                .getInput(),
-                                            context.activation_route,
-                                            segmentCycle + localRow
-                                                - context.eastMxmLatency(
-                                                    slice),
-                                            slice, row, 1, 1,
-                                            segment.stream_base + byte,
-                                            "east", "activation",
-                                            context.hemisphereName(
-                                                hemisphere))
-                                        .getOutput();
-                            }
-                        }
-                    } else {
-                        for (int64_t byte = 0; byte < 2; ++byte) {
-                            activationValue =
-                                context
-                                    .emitSliceRead(
-                                        context.activation_route
-                                            .getInput(),
+                    const auto emitActivation =
+                        [&](int64_t consumerCycle) {
+                            mlir::Value activationValue;
+                            if (context.activation_distributed16) {
+                                const int64_t base =
+                                    context.activation_route.getPlacement()
+                                        .getAs<mlir::IntegerAttr>("base_row")
+                                        .getInt();
+                                const int64_t reductionBlocks = k / tile;
+                                for (int64_t localRow = 0;
+                                     localRow < segment.rows; ++localRow) {
+                                    const int64_t token =
+                                        mTile * tile + rowOffset + localRow;
+                                    const int64_t tokenBlock = token / tile;
+                                    const int64_t tokenWithinBlock =
+                                        token % tile;
+                                    const int64_t tokenWave =
+                                        tokenWithinBlock / 8;
+                                    const int64_t tokenLane =
+                                        tokenWithinBlock % 8;
+                                    const int64_t row = base
+                                        + (tokenBlock * reductionBlocks
+                                              + reduction)
+                                            * 4
+                                        + tokenWave;
+                                    for (int64_t byte = 0; byte < 2;
+                                         ++byte) {
+                                        const int64_t slice =
+                                            context.activation_slices[
+                                                2 * tokenLane + byte];
+                                        activationValue = context
+                                            .emitSliceRead(
+                                                context.activation_route
+                                                    .getInput(),
+                                                context.activation_route,
+                                                consumerCycle + localRow
+                                                    - context.eastMxmLatency(
+                                                        slice),
+                                                slice, row, 1, 1,
+                                                segment.stream_base + byte,
+                                                "east", "activation",
+                                                context.hemisphereName(
+                                                    hemisphere))
+                                            .getOutput();
+                                    }
+                                }
+                            } else {
+                                for (int64_t byte = 0; byte < 2; ++byte) {
+                                    activationValue = context.emitSliceRead(
+                                        context.activation_route.getInput(),
                                         context.activation_route,
-                                        segmentCycle
+                                        consumerCycle
                                             - context.activation_latency,
                                         context.activation_slices[byte],
                                         activationBase + rowOffset,
                                         segment.rows, 1,
                                         segment.stream_base + byte,
                                         "east", "activation",
-                                        context.hemisphereName(
-                                            hemisphere))
-                                    .getOutput();
-                        }
-                    }
+                                        context.hemisphereName(hemisphere))
+                                        .getOutput();
+                                }
+                            }
+                            return activationValue;
+                        };
+                    const int64_t gateCycle = segmentCycle;
+                    const int64_t upCycle =
+                        segmentCycle + (singleMxm ? tile : 0);
+                    mlir::Value gateActivation = emitActivation(gateCycle);
+                    mlir::Value upActivation = singleMxm
+                        ? emitActivation(upCycle) : gateActivation;
                     gateCompute =
                         rewriter.create<MxmComputeOp>(ffn.getLoc(),
-                            activationValue, ffn.getGateWeight(),
-                            context.projection_type, segmentCycle,
+                            gateActivation, ffn.getGateWeight(),
+                            context.projection_type, gateCycle,
                             segment.rows,
-                            segmentCycle
+                            gateCycle
                                 + target.mxm_first_result_latency(),
                             target.mxm_result_window_cycles(
                                 segment.rows),
                             segment.stream_base, resultStreamBase,
-                            weightBuffer,
+                            singleMxm ? 0 : weightBuffer,
                             hemisphere
                                 * throughput.mxms_per_hemisphere,
                             segment.rows, tile, tile);
                     upCompute =
                         rewriter.create<MxmComputeOp>(ffn.getLoc(),
-                            activationValue, ffn.getUpWeight(),
-                            context.projection_type, segmentCycle,
+                            upActivation, ffn.getUpWeight(),
+                            context.projection_type, upCycle,
                             segment.rows,
-                            segmentCycle
+                            upCycle
                                 + target.mxm_first_result_latency(),
                             target.mxm_result_window_cycles(
                                 segment.rows),
                             segment.stream_base,
                             resultStreamBase
                                 + throughput.mxm_result_streams,
-                            weightBuffer,
+                            singleMxm ? 1 : weightBuffer,
                             hemisphere
                                     * throughput.mxms_per_hemisphere
-                                + 1,
+                                + (singleMxm ? 0 : 1),
                             segment.rows, tile, tile);
                     rowOffset += segment.rows;
                 }
@@ -202,31 +270,22 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 // Each physical MXM owns its accumulator. A pair is fully
                 // reduced and drained before the next pair starts, so all
                 // projection pairs can reuse the same token-row window.
-                const int64_t accumulatorBase =
-                    mTile * tile;
-                auto gatePlacement = schedule_placement(rewriter,
-                    context.gate_acc_slices, accumulatorBase, tile,
-                    1,
-                    context.hemisphereName(hemisphere),
-                    "fp32_accumulator");
-                auto upPlacement = schedule_placement(rewriter,
-                    context.up_acc_slices, accumulatorBase, tile,
-                    1,
-                    context.hemisphereName(hemisphere),
-                    "fp32_accumulator");
+                const int64_t accumulatorBase = mTile * tile;
 
                 const auto emitAccumulator =
-                    [&](mlir::Value input, mlir::DictionaryAttr address,
-                        mlir::DictionaryAttr placement, int64_t cycle,
+                    [&](mlir::Value input, int64_t unitId,
+                        int64_t accumulatorAddress, int64_t cycle,
                         int64_t streamBase) {
                         mlir::OperationState state(
                             ffn.getLoc(),
-                            MemAccumulateOp::getOperationName());
+                            MxmAccumulateOp::getOperationName());
                         state.addOperands(input);
                         state.addTypes(context.projection_type);
                         state.addAttributes({
                             rewriter.getNamedAttr("cycle",
                                 rewriter.getI64IntegerAttr(cycle)),
+                            rewriter.getNamedAttr("unit_id",
+                                rewriter.getI64IntegerAttr(unitId)),
                             rewriter.getNamedAttr("stream_base",
                                 rewriter.getI64IntegerAttr(streamBase)),
                             rewriter.getNamedAttr("stream_count",
@@ -234,58 +293,69 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                     finalReduction ? 2
                                                    : throughput
                                                          .mxm_result_streams)),
-                            rewriter.getNamedAttr("address", address),
-                            rewriter.getNamedAttr(
-                                "placement", placement),
-                            rewriter.getNamedAttr("hemisphere",
-                                rewriter.getStringAttr(
-                                    context.hemisphereName(
-                                        hemisphere))),
+                            rewriter.getNamedAttr("accumulator_address",
+                                rewriter.getI64IntegerAttr(
+                                    accumulatorAddress)),
+                            rewriter.getNamedAttr("accumulator_stride",
+                                rewriter.getI64IntegerAttr(1)),
                             rewriter.getNamedAttr("destination",
                                 rewriter.getStringAttr(
-                                    finalReduction ? "stream" : "sram")),
+                                    finalReduction ? "stream" : "local")),
                             rewriter.getNamedAttr("repeat_count",
                                 rewriter.getI64IntegerAttr(tile)),
                             rewriter.getNamedAttr("repeat_interval",
-                                rewriter.getI64IntegerAttr(1)),
-                            rewriter.getNamedAttr("address_stride",
                                 rewriter.getI64IntegerAttr(1)),
                             rewriter.getNamedAttr(
                                 "accumulator_output_format",
                                 rewriter.getStringAttr(
                                     finalReduction ? "bf16" : "fp32")),
                         });
-                        return llvm::cast<MemAccumulateOp>(
+                        return llvm::cast<MxmAccumulateOp>(
                             rewriter.create(state));
                     };
                 auto gateAccumulator = emitAccumulator(
-                    gateCompute.getResult(), ffn.getHidden0AddressAttr(),
-                    gatePlacement, computeCycle + gateAccLatency,
+                    gateCompute.getResult(), gateCompute.getUnitId(),
+                    accumulatorBase, computeCycle + gateAccLatency,
                     resultStreamBase);
+                const int64_t upComputeCycle =
+                    computeCycle + (singleMxm ? tile : 0);
+                const int64_t effectiveUpAccLatency =
+                    singleMxm ? gateAccLatency : upAccLatency;
                 auto upAccumulator = emitAccumulator(
-                    upCompute.getResult(), ffn.getHidden1AddressAttr(),
-                    upPlacement, computeCycle + upAccLatency,
+                    upCompute.getResult(), upCompute.getUnitId(),
+                    accumulatorBase + (singleMxm ? m : 0),
+                    upComputeCycle + effectiveUpAccLatency,
                     resultStreamBase + throughput.mxm_result_streams);
 
                 if (!finalReduction) continue;
 
+                const auto gateTempSlices = target.ffn_gate_temp_slices();
+                const auto upTempSlices = target.ffn_up_temp_slices();
+                const int64_t pairsPerTempGroup =
+                    memory.sram_depth_rows / (mTileCount * tile);
+                const int64_t tempGroup = pair / pairsPerTempGroup;
+                if (2 * tempGroup + 1
+                        >= static_cast<int64_t>(gateTempSlices.size())
+                    || 2 * tempGroup + 1
+                        >= static_cast<int64_t>(upTempSlices.size()))
+                    return mlir::failure();
                 mlir::Value gateTemp;
                 mlir::Value upTemp;
-                int64_t deferredReadyCycle = computeCycle
-                    + std::max(
-                        gateAccLatency + tile
-                            + context.westLatency(
-                                context.gate_acc_slices.front()),
-                        upAccLatency + tile
-                            + context.westLatency(
-                                context.up_acc_slices.front()));
+                int64_t deferredReadyCycle = std::max(
+                    computeCycle + gateAccLatency + tile
+                        + context.westLatency(
+                            gateTempSlices[2 * tempGroup]),
+                    upComputeCycle + effectiveUpAccLatency + tile
+                        + context.westLatency(
+                            upTempSlices[2 * tempGroup]));
                 {
                     const int64_t tempBase =
-                        (pair * mTileCount + mTile) * tile;
+                        ((pair % pairsPerTempGroup) * mTileCount + mTile)
+                        * tile;
                     const auto emitTempWrite =
-                        [&](MemAccumulateOp source,
+                        [&](MxmAccumulateOp source,
                             llvm::ArrayRef<int64_t> tempSlices,
-                            int64_t streamBase,
+                            int64_t streamBase, int64_t sourceComputeCycle,
                             mlir::Value& lastWrite) {
                             for (int64_t byte = 0; byte < 2; ++byte) {
                                 const int64_t targetSlice =
@@ -303,14 +373,15 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                         targetSlice);
                                 if (!transportLatency)
                                     return;
-                                const int64_t writeCycle = computeCycle
+                                const int64_t writeCycle = sourceComputeCycle
                                     + target.mxm_first_result_latency()
                                     + *transportLatency;
                                 auto placement = schedule_placement(
                                     rewriter, {targetSlice}, tempBase,
                                     tile, 1,
                                     context.hemisphereName(hemisphere),
-                                    "bf16_swiglu_temp_byte");
+                                    "bf16_swiglu_temp_byte",
+                                    context.temp_bank);
                                 auto write =
                                     rewriter.create<MemWriteOp>(
                                         ffn.getLoc(), source.getOutput(),
@@ -336,13 +407,16 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             }
                         };
                     emitTempWrite(gateAccumulator,
-                        memory.w8a16_fused_gate_temp_slices,
-                        resultStreamBase,
+                        llvm::ArrayRef<int64_t>(gateTempSlices)
+                            .slice(2 * tempGroup, 2),
+                        resultStreamBase, computeCycle,
                         gateTemp);
                     emitTempWrite(upAccumulator,
-                        memory.w8a16_fused_up_temp_slices,
+                        llvm::ArrayRef<int64_t>(upTempSlices)
+                            .slice(2 * tempGroup, 2),
                         resultStreamBase
                             + throughput.mxm_result_streams,
+                        upComputeCycle,
                         upTemp);
                 }
                 emission.completed_tiles.push_back({

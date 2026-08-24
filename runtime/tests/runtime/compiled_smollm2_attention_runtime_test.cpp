@@ -166,8 +166,12 @@ float expected(Projection projection, std::size_t token, std::size_t column)
     const float angle = static_cast<float>(token) * inverse_frequency;
     const float cosine = ftlpu::Bf16::from_float(std::cos(angle)).to_float();
     const float sine = ftlpu::Bf16::from_float(std::sin(angle)).to_float();
-    return ftlpu::Bf16::from_float(dimension < kTile
-        ? lo * cosine - hi * sine : hi * cosine + lo * sine).to_float();
+    const float cosine_product = ftlpu::Bf16::from_float(
+        (dimension < kTile ? lo : hi) * cosine).to_float();
+    const float sine_product = ftlpu::Bf16::from_float(
+        (dimension < kTile ? -hi : lo) * sine).to_float();
+    return ftlpu::Bf16::from_float(
+        cosine_product + sine_product).to_float();
 }
 
 std::vector<float> reference_probability(
@@ -218,6 +222,7 @@ float reference_context(const std::vector<float>& probability,
 }
 
 float read_packed_probability(const ftlpu::TspSliceSystem& system,
+    const ftlpu::software::runtime::BinaryBinding& binding,
     std::size_t query_head, std::size_t query, std::size_t key)
 {
     const std::size_t query_block = query / kTile;
@@ -227,18 +232,21 @@ float read_packed_probability(const ftlpu::TspSliceSystem& system,
     const std::size_t kv_head = query_head / (kQueryHeads / kKvHeads);
     const auto hemisphere = static_cast<ftlpu::Hemisphere>(kv_head % 2);
     const std::size_t stream = (key % 8) * 2;
-    const std::size_t address = 6000
+    const std::size_t address = static_cast<std::size_t>(binding.base_row)
         + (query_head * (kSeqLen / kTile) + query_block) * (kSeqLen / 8)
         + key / 8;
     const auto low = system.read_mem_sram_lane_byte(
-        hemisphere, kQueryIwSlices[1][stream], tile, address, lane);
+        hemisphere, binding.slices[stream], binding.bank,
+        tile, address, lane);
     const auto high = system.read_mem_sram_lane_byte(
-        hemisphere, kQueryIwSlices[1][stream + 1], tile, address, lane);
+        hemisphere, binding.slices[stream + 1], binding.bank,
+        tile, address, lane);
     return ftlpu::Bf16::from_bits(static_cast<std::uint16_t>(low)
         | (static_cast<std::uint16_t>(high) << 8)).to_float();
 }
 
 float read_diagonal_probability(const ftlpu::TspSliceSystem& system,
+    const ftlpu::software::runtime::BinaryBinding& binding,
     std::size_t query_head, std::size_t query, std::size_t key)
 {
     const std::size_t query_block = query / kTile;
@@ -251,15 +259,17 @@ float read_diagonal_probability(const ftlpu::TspSliceSystem& system,
     const std::size_t kv_head = query_head / (kQueryHeads / kKvHeads);
     const auto hemisphere = static_cast<ftlpu::Hemisphere>(kv_head % 2);
     const std::size_t stream = query_row * 2;
-    const std::size_t address = 7000
+    const std::size_t address = static_cast<std::size_t>(binding.base_row)
         + ((query_head * (kSeqLen / kTile) + query_block) * (kSeqLen / kTile)
               + key_block)
             * 4
         + diagonal;
     const auto low = system.read_mem_sram_lane_byte(
-        hemisphere, kQueryIwSlices[0][stream], tile, address, lane);
+        hemisphere, binding.slices[stream], binding.bank,
+        tile, address, lane);
     const auto high = system.read_mem_sram_lane_byte(
-        hemisphere, kQueryIwSlices[0][stream + 1], tile, address, lane);
+        hemisphere, binding.slices[stream + 1], binding.bank,
+        tile, address, lane);
     return ftlpu::Bf16::from_bits(static_cast<std::uint16_t>(low)
         | (static_cast<std::uint16_t>(high) << 8)).to_float();
 }
@@ -294,26 +304,55 @@ try {
     if (projectionTimeline == program.timelines.end())
         throw std::logic_error(
             "attention binary is missing the qkv timeline");
+    const auto probabilityTransposeTimeline = std::find_if(
+        program.timelines.begin(), program.timelines.end(),
+        [](const auto& timeline) {
+            return timeline.name == "probability_transpose";
+        });
+    if (probabilityTransposeTimeline == program.timelines.end())
+        throw std::logic_error(
+            "attention binary is missing the probability-transpose timeline");
     const std::size_t projectionEndCycle =
         static_cast<std::size_t>(projectionTimeline->end_cycle);
-    if ((program.bindings.size() != 9 && program.bindings.size() != 11)
+    const std::size_t probabilityTransposeEndCycle =
+        static_cast<std::size_t>(probabilityTransposeTimeline->end_cycle);
+    if ((program.bindings.size() != 11 && program.bindings.size() != 13)
         || program.max_cycle <= projectionEndCycle)
         throw std::logic_error("attention binary is missing bindings or projection commands");
     std::size_t causal_mask_bindings = 0;
     std::size_t rope_bindings = 0;
+    const ftlpu::software::runtime::BinaryBinding* probabilityPackBinding = nullptr;
+    const ftlpu::software::runtime::BinaryBinding* probabilityDiagonalBinding = nullptr;
     std::vector<std::uint16_t> first_mask_plane;
     for (const auto& binding : program.bindings) {
         if (binding.access != ftlpu::software::runtime::BindingAccess::Internal)
             continue;
         if (binding.initializer
+            == ftlpu::software::runtime::BindingInitializer::None) {
+            if (binding.name == "attention.probability_pack")
+                probabilityPackBinding = &binding;
+            else if (binding.name == "attention.probability_diagonal")
+                probabilityDiagonalBinding = &binding;
+            else
+                throw std::logic_error(
+                    "attention binary has an unknown internal workspace");
+            continue;
+        }
+        if (binding.initializer
             == ftlpu::software::runtime::BindingInitializer::RopeTable) {
+            const bool valid_rope_plane = binding.slices.size() == 4
+                && std::adjacent_find(binding.slices.begin(), binding.slices.end(),
+                       [](std::uint16_t lhs, std::uint16_t rhs) {
+                           return rhs != lhs + 1;
+                       })
+                    == binding.slices.end();
             if (binding.layout
                     != ftlpu::software::runtime::BindingLayout::Fp16RopeTable
                 || binding.element_type
                     != ftlpu::software::runtime::BindingElementType::BF16
                 || binding.shape
                     != std::vector<std::uint64_t>({kSeqLen, kHeadDim / 2, 2})
-                || binding.slices != std::vector<std::uint16_t>({2, 18, 30, 31})
+                || !valid_rope_plane || binding.bank != 1
                 || binding.base_row != 7000
                 || binding.rope_head_dim != kHeadDim
                 || std::fabs(binding.rope_theta - 100000.0f) > 0.5f)
@@ -326,14 +365,14 @@ try {
             != ftlpu::software::runtime::BindingInitializer::CausalMask)
             throw std::logic_error(
                 "attention binary has an unknown internal initializer");
-        const bool valid_mask_plane = binding.slices.size() == sizeof(float)
+        const bool valid_mask_plane = binding.slices.size() == sizeof(std::uint16_t)
             && std::adjacent_find(binding.slices.begin(), binding.slices.end(),
                    [](std::uint16_t lhs, std::uint16_t rhs) {
                        return rhs != lhs + 1;
                    })
                 == binding.slices.end();
         if (binding.layout
-                != ftlpu::software::runtime::BindingLayout::Fp32CausalMaskTile
+                != ftlpu::software::runtime::BindingLayout::Fp16CausalMaskTile
             || binding.shape != std::vector<std::uint64_t>({kTile - 1, kTile})
             || !valid_mask_plane || binding.base_row != 8128)
             throw std::logic_error("attention binary has an invalid causal-mask binding");
@@ -352,6 +391,21 @@ try {
         throw std::logic_error("attention binary is missing its internal causal mask");
     if (rope_bindings != 1)
         throw std::logic_error("attention binary is missing its internal RoPE table");
+    const auto probabilityShape =
+        std::vector<std::uint64_t>({kQueryHeads, kSeqLen, kSeqLen});
+    if (!probabilityPackBinding || !probabilityDiagonalBinding
+        || probabilityPackBinding->role != "workspace"
+        || probabilityDiagonalBinding->role != "workspace"
+        || probabilityPackBinding->layout
+            != ftlpu::software::runtime::BindingLayout::Fp16ProbabilityX16
+        || probabilityDiagonalBinding->layout
+            != ftlpu::software::runtime::BindingLayout::Fp16ProbabilityDiagonal
+        || probabilityPackBinding->shape != probabilityShape
+        || probabilityDiagonalBinding->shape != probabilityShape
+        || probabilityPackBinding->slices.size() != 16
+        || probabilityDiagonalBinding->slices.size() != 16)
+        throw std::logic_error(
+            "attention binary has invalid probability workspace metadata");
     if (const auto* trace_path = std::getenv("FTLPU_SCHEDULE_TRACE")) {
         ftlpu::software::runtime::write_schedule_trace_csv(program, trace_path);
     }
@@ -399,7 +453,8 @@ try {
         }
     }
     if (nonzero == 0) throw std::logic_error("attention projection produced only zero data");
-    runtime.run_cycles(program.max_cycle + 64 - projectionEndCycle);
+    runtime.run_cycles(
+        probabilityTransposeEndCycle - projectionEndCycle);
     std::array<std::array<std::vector<float>, kSampleQueries.size()>,
         kQueryHeads>
         reference_probabilities;
@@ -416,8 +471,10 @@ try {
             float sum = 0.0f;
             for (std::size_t key = 0; key < kSeqLen; ++key) {
                 const float probability =
-                    read_packed_probability(*system, head, query, key);
-                const float diagonal = read_diagonal_probability(*system, head, query, key);
+                    read_packed_probability(*system,
+                        *probabilityPackBinding, head, query, key);
+                const float diagonal = read_diagonal_probability(*system,
+                    *probabilityDiagonalBinding, head, query, key);
                 const float reference = reference_row[key];
                 if (!std::isfinite(probability) || probability < 0.0f)
                     throw std::logic_error("attention softmax produced an invalid probability");
@@ -452,6 +509,8 @@ try {
         throw std::logic_error("attention softmax produced only zero probabilities");
     if (causal_zero_checked == 0)
         throw std::logic_error("attention test did not check any causal-mask entries");
+    runtime.run_cycles(
+        program.max_cycle + 64 - probabilityTransposeEndCycle);
     std::array<std::array<std::array<float, kHeadDim>,
                    kSampleQueries.size()>,
         kQueryHeads>

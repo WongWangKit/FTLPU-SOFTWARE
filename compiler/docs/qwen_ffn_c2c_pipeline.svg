@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="590" viewBox="0 0 1920 590">
+<defs>
+<pattern id="c2c" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+<rect width="8" height="8" fill="#e9a24b"/><line x1="0" y1="0" x2="0" y2="8" stroke="#fff" stroke-width="2" opacity="0.45"/>
+</pattern>
+</defs>
+<style>
+.title{font:700 28px 'Segoe UI',Arial,sans-serif;fill:#17212b}
+.sub{font:14px 'Segoe UI',Arial,sans-serif;fill:#56636f}
+.laneLabel{font:600 13px 'Segoe UI',Arial,sans-serif;fill:#2d3944}
+.tick{font:11px 'Segoe UI',Arial,sans-serif;fill:#64717d}
+.bar{font:600 10px 'Segoe UI',Arial,sans-serif;fill:#17212b}
+.grid{stroke:#dce3e8;stroke-width:1}
+.lane{fill:#f9fafb;stroke:#e0e5e9;stroke-width:1}
+</style>
+<rect width="100%" height="100%" fill="#fff"/>
+<text x="42" y="43" class="title">Qwen2.5-1.5B Vector FFN: C2C Weight-Page Pipeline</text>
+<text x="42" y="69" class="sub">seq_len=32; dedicated C2C bandwidth per direction: 8 lanes x 32 B/cycle = 256 B/cycle.</text>
+<rect x="42" y="88" width="18" height="12" rx="2" fill="url(#c2c)" stroke="#805d29"/>
+<text x="68" y="99" class="sub">planned C2C prefetch</text>
+<rect x="242" y="88" width="18" height="12" rx="2" fill="#66b59a" stroke="#52606c"/>
+<text x="268" y="99" class="sub">bank 0 resident / compute</text>
+<rect x="490" y="88" width="18" height="12" rx="2" fill="#6f9fd8" stroke="#52606c"/>
+<text x="516" y="99" class="sub">bank 1 resident / compute</text>
+<rect x="742" y="88" width="18" height="12" rx="2" fill="#df8167" stroke="#52606c"/>
+<text x="768" y="99" class="sub">SwiGLU tail</text>
+<text x="1870" y="99" text-anchor="end" class="sub">19 rounds: 7 Gate/Up + 12 Down</text>
+<line x1="250.00" y1="142" x2="250.00" y2="508" class="grid"/>
+<text x="250.00" y="132" text-anchor="middle" class="tick">-7,680</text>
+<line x1="412.00" y1="142" x2="412.00" y2="508" class="grid"/>
+<text x="412.00" y="132" text-anchor="middle" class="tick">70,142</text>
+<line x1="574.00" y1="142" x2="574.00" y2="508" class="grid"/>
+<text x="574.00" y="132" text-anchor="middle" class="tick">147,965</text>
+<line x1="736.00" y1="142" x2="736.00" y2="508" class="grid"/>
+<text x="736.00" y="132" text-anchor="middle" class="tick">225,788</text>
+<line x1="898.00" y1="142" x2="898.00" y2="508" class="grid"/>
+<text x="898.00" y="132" text-anchor="middle" class="tick">303,610</text>
+<line x1="1060.00" y1="142" x2="1060.00" y2="508" class="grid"/>
+<text x="1060.00" y="132" text-anchor="middle" class="tick">381,432</text>
+<line x1="1222.00" y1="142" x2="1222.00" y2="508" class="grid"/>
+<text x="1222.00" y="132" text-anchor="middle" class="tick">459,255</text>
+<line x1="1384.00" y1="142" x2="1384.00" y2="508" class="grid"/>
+<text x="1384.00" y="132" text-anchor="middle" class="tick">537,078</text>
+<line x1="1546.00" y1="142" x2="1546.00" y2="508" class="grid"/>
+<text x="1546.00" y="132" text-anchor="middle" class="tick">614,900</text>
+<line x1="1708.00" y1="142" x2="1708.00" y2="508" class="grid"/>
+<text x="1708.00" y="132" text-anchor="middle" class="tick">692,722</text>
+<line x1="1870.00" y1="142" x2="1870.00" y2="508" class="grid"/>
+<text x="1870.00" y="132" text-anchor="middle" class="tick">770,545</text>
+<line x1="265.99" y1="138" x2="265.99" y2="508" stroke="#263746" stroke-width="1.6"/>
+<text x="270.99" y="151" class="tick">ICU cycle 0</text>
+<rect x="250" y="176" width="1620" height="28" class="lane"/>
+<text x="236" y="195" text-anchor="end" class="laneLabel">C2C East (8 lanes)</text>
+<rect x="250" y="216" width="1620" height="28" class="lane"/>
+<text x="236" y="235" text-anchor="end" class="laneLabel">C2C West (8 lanes)</text>
+<rect x="250" y="282" width="1620" height="28" class="lane"/>
+<text x="236" y="301" text-anchor="end" class="laneLabel">MEM weight bank 0</text>
+<rect x="250" y="322" width="1620" height="28" class="lane"/>
+<text x="236" y="341" text-anchor="end" class="laneLabel">MEM weight bank 1</text>
+<rect x="250" y="388" width="1620" height="28" class="lane"/>
+<text x="236" y="407" text-anchor="end" class="laneLabel">MXM Gate + Up</text>
+<rect x="250" y="428" width="1620" height="28" class="lane"/>
+<text x="236" y="447" text-anchor="end" class="laneLabel">VXM SwiGLU tail</text>
+<rect x="250" y="468" width="1620" height="28" class="lane"/>
+<text x="236" y="487" text-anchor="end" class="laneLabel">MXM Down</text>
+<rect x="250.10" y="180" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 0: C2C -7630..50; 1.88 MiB per direction; bank 0</title></rect>
+<rect x="250.10" y="220" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 0: C2C -7630..50; 1.88 MiB per direction; bank 0</title></rect>
+<rect x="266.09" y="286" width="129.12" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 0: ready 50, release 62076; 3.75 MiB; bank 0</title></rect>
+<text x="330.65" y="300" text-anchor="middle" class="bar">Gate/Up p0</text>
+<rect x="266.09" y="392" width="129.12" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 0: ready 50, release 62076; 3.75 MiB; bank 0</title></rect>
+<text x="330.65" y="406" text-anchor="middle" class="bar">Gate/Up p0</text>
+<rect x="379.33" y="180" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 1: C2C 54450..62130; 1.88 MiB per direction; bank 1</title></rect>
+<rect x="379.33" y="220" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 1: C2C 54450..62130; 1.88 MiB per direction; bank 1</title></rect>
+<rect x="395.32" y="326" width="129.12" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 1: ready 62130, release 124156; 3.75 MiB; bank 1</title></rect>
+<text x="459.88" y="340" text-anchor="middle" class="bar">Gate/Up p1</text>
+<rect x="395.32" y="392" width="129.12" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 1: ready 62130, release 124156; 3.75 MiB; bank 1</title></rect>
+<text x="459.88" y="406" text-anchor="middle" class="bar">Gate/Up p1</text>
+<rect x="508.56" y="180" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 2: C2C 116530..124210; 1.88 MiB per direction; bank 0</title></rect>
+<rect x="508.56" y="220" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 2: C2C 116530..124210; 1.88 MiB per direction; bank 0</title></rect>
+<rect x="524.55" y="286" width="129.12" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 2: ready 124210, release 186236; 3.75 MiB; bank 0</title></rect>
+<text x="589.11" y="300" text-anchor="middle" class="bar">Gate/Up p2</text>
+<rect x="524.55" y="392" width="129.12" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 2: ready 124210, release 186236; 3.75 MiB; bank 0</title></rect>
+<text x="589.11" y="406" text-anchor="middle" class="bar">Gate/Up p2</text>
+<rect x="637.79" y="180" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 3: C2C 178610..186290; 1.88 MiB per direction; bank 1</title></rect>
+<rect x="637.79" y="220" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 3: C2C 178610..186290; 1.88 MiB per direction; bank 1</title></rect>
+<rect x="653.78" y="326" width="129.12" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 3: ready 186290, release 248316; 3.75 MiB; bank 1</title></rect>
+<text x="718.34" y="340" text-anchor="middle" class="bar">Gate/Up p3</text>
+<rect x="653.78" y="392" width="129.12" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 3: ready 186290, release 248316; 3.75 MiB; bank 1</title></rect>
+<text x="718.34" y="406" text-anchor="middle" class="bar">Gate/Up p3</text>
+<rect x="767.02" y="180" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 4: C2C 240690..248370; 1.88 MiB per direction; bank 0</title></rect>
+<rect x="767.02" y="220" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 4: C2C 240690..248370; 1.88 MiB per direction; bank 0</title></rect>
+<rect x="783.01" y="286" width="129.12" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 4: ready 248370, release 310396; 3.75 MiB; bank 0</title></rect>
+<text x="847.57" y="300" text-anchor="middle" class="bar">Gate/Up p4</text>
+<rect x="783.01" y="392" width="129.12" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 4: ready 248370, release 310396; 3.75 MiB; bank 0</title></rect>
+<text x="847.57" y="406" text-anchor="middle" class="bar">Gate/Up p4</text>
+<rect x="896.25" y="180" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 5: C2C 302770..310450; 1.88 MiB per direction; bank 1</title></rect>
+<rect x="896.25" y="220" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 5: C2C 302770..310450; 1.88 MiB per direction; bank 1</title></rect>
+<rect x="912.24" y="326" width="129.12" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 5: ready 310450, release 372476; 3.75 MiB; bank 1</title></rect>
+<text x="976.80" y="340" text-anchor="middle" class="bar">Gate/Up p5</text>
+<rect x="912.24" y="392" width="129.12" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 5: ready 310450, release 372476; 3.75 MiB; bank 1</title></rect>
+<text x="976.80" y="406" text-anchor="middle" class="bar">Gate/Up p5</text>
+<rect x="1025.48" y="180" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 6: C2C 364850..372530; 1.88 MiB per direction; bank 0</title></rect>
+<rect x="1025.48" y="220" width="15.99" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Gate + Up page 6: C2C 364850..372530; 1.88 MiB per direction; bank 0</title></rect>
+<rect x="1041.47" y="286" width="129.12" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 6: ready 372530, release 434556; 3.75 MiB; bank 0</title></rect>
+<text x="1106.03" y="300" text-anchor="middle" class="bar">Gate/Up p6</text>
+<rect x="1041.47" y="392" width="129.12" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Gate + Up page 6: ready 372530, release 434556; 3.75 MiB; bank 0</title></rect>
+<text x="1106.03" y="406" text-anchor="middle" class="bar">Gate/Up p6</text>
+<rect x="1194.34" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 0: C2C 445966..448206; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1194.34" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 0: C2C 445966..448206; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1199.00" y="286" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 0: ready 448206, release 475008; 1.09 MiB; bank 0</title></rect>
+<text x="1226.90" y="300" text-anchor="middle" class="bar">Down p0</text>
+<rect x="1199.00" y="472" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 0: ready 448206, release 475008; 1.09 MiB; bank 0</title></rect>
+<text x="1226.90" y="486" text-anchor="middle" class="bar">Down p0</text>
+<rect x="1250.26" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 1: C2C 472833..475073; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1250.26" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 1: C2C 472833..475073; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1254.93" y="326" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 1: ready 475073, release 501875; 1.09 MiB; bank 1</title></rect>
+<text x="1282.82" y="340" text-anchor="middle" class="bar">Down p1</text>
+<rect x="1254.93" y="472" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 1: ready 475073, release 501875; 1.09 MiB; bank 1</title></rect>
+<text x="1282.82" y="486" text-anchor="middle" class="bar">Down p1</text>
+<rect x="1306.19" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 2: C2C 499700..501940; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1306.19" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 2: C2C 499700..501940; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1310.86" y="286" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 2: ready 501940, release 528742; 1.09 MiB; bank 0</title></rect>
+<text x="1338.75" y="300" text-anchor="middle" class="bar">Down p2</text>
+<rect x="1310.86" y="472" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 2: ready 501940, release 528742; 1.09 MiB; bank 0</title></rect>
+<text x="1338.75" y="486" text-anchor="middle" class="bar">Down p2</text>
+<rect x="1362.12" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 3: C2C 526567..528807; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1362.12" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 3: C2C 526567..528807; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1366.78" y="326" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 3: ready 528807, release 555609; 1.09 MiB; bank 1</title></rect>
+<text x="1394.68" y="340" text-anchor="middle" class="bar">Down p3</text>
+<rect x="1366.78" y="472" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 3: ready 528807, release 555609; 1.09 MiB; bank 1</title></rect>
+<text x="1394.68" y="486" text-anchor="middle" class="bar">Down p3</text>
+<rect x="1418.05" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 4: C2C 553434..555674; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1418.05" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 4: C2C 553434..555674; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1422.71" y="286" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 4: ready 555674, release 582476; 1.09 MiB; bank 0</title></rect>
+<text x="1450.61" y="300" text-anchor="middle" class="bar">Down p4</text>
+<rect x="1422.71" y="472" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 4: ready 555674, release 582476; 1.09 MiB; bank 0</title></rect>
+<text x="1450.61" y="486" text-anchor="middle" class="bar">Down p4</text>
+<rect x="1473.98" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 5: C2C 580301..582541; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1473.98" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 5: C2C 580301..582541; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1478.64" y="326" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 5: ready 582541, release 609343; 1.09 MiB; bank 1</title></rect>
+<text x="1506.54" y="340" text-anchor="middle" class="bar">Down p5</text>
+<rect x="1478.64" y="472" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 5: ready 582541, release 609343; 1.09 MiB; bank 1</title></rect>
+<text x="1506.54" y="486" text-anchor="middle" class="bar">Down p5</text>
+<rect x="1529.90" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 6: C2C 607168..609408; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1529.90" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 6: C2C 607168..609408; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1534.57" y="286" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 6: ready 609408, release 636210; 1.09 MiB; bank 0</title></rect>
+<text x="1562.46" y="300" text-anchor="middle" class="bar">Down p6</text>
+<rect x="1534.57" y="472" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 6: ready 609408, release 636210; 1.09 MiB; bank 0</title></rect>
+<text x="1562.46" y="486" text-anchor="middle" class="bar">Down p6</text>
+<rect x="1585.83" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 7: C2C 634035..636275; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1585.83" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 7: C2C 634035..636275; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1590.50" y="326" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 7: ready 636275, release 663077; 1.09 MiB; bank 1</title></rect>
+<text x="1618.39" y="340" text-anchor="middle" class="bar">Down p7</text>
+<rect x="1590.50" y="472" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 7: ready 636275, release 663077; 1.09 MiB; bank 1</title></rect>
+<text x="1618.39" y="486" text-anchor="middle" class="bar">Down p7</text>
+<rect x="1641.76" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 8: C2C 660902..663142; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1641.76" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 8: C2C 660902..663142; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1646.42" y="286" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 8: ready 663142, release 689944; 1.09 MiB; bank 0</title></rect>
+<text x="1674.32" y="300" text-anchor="middle" class="bar">Down p8</text>
+<rect x="1646.42" y="472" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 8: ready 663142, release 689944; 1.09 MiB; bank 0</title></rect>
+<text x="1674.32" y="486" text-anchor="middle" class="bar">Down p8</text>
+<rect x="1697.69" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 9: C2C 687769..690009; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1697.69" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 9: C2C 687769..690009; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1702.35" y="326" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 9: ready 690009, release 716811; 1.09 MiB; bank 1</title></rect>
+<text x="1730.25" y="340" text-anchor="middle" class="bar">Down p9</text>
+<rect x="1702.35" y="472" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 9: ready 690009, release 716811; 1.09 MiB; bank 1</title></rect>
+<text x="1730.25" y="486" text-anchor="middle" class="bar">Down p9</text>
+<rect x="1753.62" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 10: C2C 714636..716876; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1753.62" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 10: C2C 714636..716876; 0.547 MiB per direction; bank 0</title></rect>
+<rect x="1758.28" y="286" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 10: ready 716876, release 743678; 1.09 MiB; bank 0</title></rect>
+<text x="1786.18" y="300" text-anchor="middle" class="bar">Down p10</text>
+<rect x="1758.28" y="472" width="55.79" height="20" rx="2" fill="#66b59a" stroke="#46545f" stroke-width="0.7"><title>Down page 10: ready 716876, release 743678; 1.09 MiB; bank 0</title></rect>
+<text x="1786.18" y="486" text-anchor="middle" class="bar">Down p10</text>
+<rect x="1809.54" y="180" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 11: C2C 741503..743743; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1809.54" y="220" width="4.66" height="20" rx="2" fill="url(#c2c)" stroke="#805d29" stroke-width="0.7"><title>Down page 11: C2C 741503..743743; 0.547 MiB per direction; bank 1</title></rect>
+<rect x="1814.21" y="326" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 11: ready 743743, release 770545; 1.09 MiB; bank 1</title></rect>
+<text x="1842.10" y="340" text-anchor="middle" class="bar">Down p11</text>
+<rect x="1814.21" y="472" width="55.79" height="20" rx="2" fill="#6f9fd8" stroke="#46545f" stroke-width="0.7"><title>Down page 11: ready 743743, release 770545; 1.09 MiB; bank 1</title></rect>
+<text x="1842.10" y="486" text-anchor="middle" class="bar">Down p11</text>
+<rect x="1170.59" y="432" width="28.41" height="20" rx="2" fill="#df8167" stroke="#6d493f" stroke-width="0.7"><title>SwiGLU tail: cycles 434556..448206</title></rect>
+<text x="42" y="542" class="sub">Cold start: GU0 is prefetched before ICU cycle 0. During each compute round, the next page is loaded into the other SRAM bank.</text>
+<text x="42" y="566" class="sub">C2C windows are derived from Command IR readiness and target bandwidth (Gate + Up: 7,680 cycles/page, Down: 2,240 cycles/page); compute windows are executable residency intervals. Total weights: 39.4 MiB.</text>
+</svg>

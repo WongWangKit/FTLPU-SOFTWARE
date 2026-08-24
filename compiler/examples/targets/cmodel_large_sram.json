@@ -9,7 +9,9 @@
   },
   "streams": {
     "streams_per_direction": 32,
-    "encoded_streams": 64
+    "encoded_streams": 64,
+    "c2c_streams_per_direction": 8,
+    "c2c_bytes_per_stream_per_cycle": 32
   },
   "throughput": {
     "mxms_per_hemisphere": 1,
