@@ -324,16 +324,21 @@ CModelRuntime::CModelRuntime(TspSliceSystem& system,
 void CModelRuntime::load(const BinaryProgram& program)
 {
     validate_cmodel_hardware_config(program);
-    system_.configure_hardware(SystemHardwareConfiguration {
-        program.hardware.sram_depth_rows,
-        program.hardware.mxms_per_hemisphere,
-        program.hardware.mxm_weight_buffers,
-        program.hardware.vxm_alus,
-        program.hardware.c2c_streams_per_direction,
-        program.hardware.mxm_local_dequant_enabled != 0,
-        program.hardware.mxm_block_compute_enabled != 0,
-        program.hardware.mxm_weight_activation_overlap_enabled != 0,
-    });
+    SystemHardwareConfiguration hardware;
+    hardware.sram_depth_rows = program.hardware.sram_depth_rows;
+    hardware.mxms_per_hemisphere = program.hardware.mxms_per_hemisphere;
+    hardware.mxm_weight_buffers = program.hardware.mxm_weight_buffers;
+    hardware.vxm_alus = program.hardware.vxm_alus;
+    hardware.c2c_streams_per_direction =
+        program.hardware.c2c_streams_per_direction;
+    hardware.c2c_dedicated_streams = false;
+    hardware.mxm_local_dequant_enabled =
+        program.hardware.mxm_local_dequant_enabled != 0;
+    hardware.mxm_block_compute_enabled =
+        program.hardware.mxm_block_compute_enabled != 0;
+    hardware.mxm_weight_activation_overlap_enabled =
+        program.hardware.mxm_weight_activation_overlap_enabled != 0;
+    system_.configure_hardware(hardware);
     system_.reset_execution_state();
     initialize_vxm_luts(system_);
     for (std::size_t group = 0; group < 16; ++group)
@@ -775,6 +780,29 @@ void CModelRuntime::upload_binding(
                         }
                     });
             }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16VxmGammaBroadcast
+        && is_16bit_float(binding.element_type)
+        && binding.slices.size() == 2) {
+        if (!vector)
+            throw std::logic_error(
+                "VXM gamma broadcast input requires a rank-1 tensor");
+        for (std::size_t column = 0; column < columns; ++column) {
+            const std::size_t offset = column * 2;
+            const std::size_t address =
+                static_cast<std::size_t>(binding.base_row) + column;
+            for_each_binding_hemisphere(binding,
+                [&](Hemisphere hemisphere) {
+                    for (std::size_t lane = 0; lane < 32; ++lane) {
+                        write_binding_sram_byte(system_, binding, hemisphere,
+                            binding.slices[0], address, lane, data[offset]);
+                        write_binding_sram_byte(system_, binding, hemisphere,
+                            binding.slices[1], address, lane,
+                            data[offset + 1]);
+                    }
+                });
         }
         return;
     }

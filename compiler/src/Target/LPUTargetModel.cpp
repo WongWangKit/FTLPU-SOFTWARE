@@ -458,7 +458,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         < streams_.mem_boundary_register_columns)
         return fail("system register columns must cover MEM boundary columns");
     if (throughput_.mem_to_sxm_latency
-            != streams_.system_register_columns - 1
+            != streams_.system_register_columns - 2
         || throughput_.mem_to_mxm_latency
             != streams_.system_register_columns)
         return fail("MEM transport latencies must match the stream-register topology");

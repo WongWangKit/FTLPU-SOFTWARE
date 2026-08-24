@@ -552,7 +552,7 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:compiled_rmsnorm_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/rmsnorm/rmsnorm_128x576.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/rmsnorm_feedback_binary_runtime
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_128kb_superlane_vector.json
             --strategy vxm-feedback)
     add_test(
         NAME smollm2_decoder_layer_binary_cmodel_runtime_test

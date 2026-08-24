@@ -2,7 +2,9 @@
 
 #include "ftlpu/icu/instruction.hpp"
 #include "ftlpu/icu/location.hpp"
+#include "ftlpu/mem/slice.hpp"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <string>
@@ -26,9 +28,14 @@ void C2cWeightPager::enqueue(const C2cWeightPage& page)
     stats_.layer = page.layer;
     stats_.bank = page.bank;
     stats_.enqueue_cycle = system_.cycle();
+    target_mem_queues_.clear();
     drain_cycles_ = 0;
 
     auto& chip = system_.chip();
+    const auto& hardware = chip.hardware_configuration();
+    const bool sharedFabric = !hardware.c2c_dedicated_streams;
+    const std::size_t sharedStreamBase =
+        hw::kWestStreams - hardware.c2c_streams_per_direction;
     auto usedHemisphere = std::array<bool, hw::kHemispheres> {};
     for (const C2cWeightSegment& segment : page.segments) {
         if (segment.bank != page.bank)
@@ -44,16 +51,41 @@ void C2cWeightPager::enqueue(const C2cWeightPage& page)
 
         const auto side = hemisphere_index(segment.hemisphere);
         usedHemisphere[side] = true;
-        const auto stream = segment.slice
-            % chip.hardware_configuration().c2c_streams_per_direction;
+        const auto lane = segment.stream
+            % hardware.c2c_streams_per_direction;
+        const auto fabricStream = sharedStreamBase + lane;
 
         chip.icu().enqueue_c2c_dma(segment.hemisphere,
             C2cDmaInstruction::Load(segment.ddr4_address,
-                segment.vector_count, hw::kPhysicalVectorBytes, 0, stream));
+                segment.vector_count, hw::kPhysicalVectorBytes, 0, lane));
         chip.icu().enqueue_c2c_receive(segment.hemisphere,
-            stream, segment.hemisphere, segment.slice,
-            segment.bank, false, segment.base_row,
-            segment.vector_count, 1);
+            lane, segment.hemisphere, segment.slice,
+            segment.bank, sharedFabric, segment.base_row,
+            segment.vector_count, 1, fabricStream);
+        if (sharedFabric) {
+            const auto queue = InstructionControlUnit::mem_queue(
+                segment.hemisphere, segment.slice, segment.bank);
+            if (std::find(target_mem_queues_.begin(),
+                    target_mem_queues_.end(), queue)
+                == target_mem_queues_.end())
+                target_mem_queues_.push_back(queue);
+            chip.icu().enqueue_control(
+                IcuLocation::Mem(segment.hemisphere,
+                    segment.slice, segment.bank),
+                IcuControlInstruction::Sync());
+            const auto group =
+                segment.slice / hw::kMemSlicesPerGroup;
+            const auto transportNops =
+                hw::kMemEastBoundaryStreamRegisterColumn - (group + 1);
+            chip.icu().enqueue_mem_nop(queue, transportNops);
+            chip.icu().enqueue_mem(queue,
+                MemInstruction::Write(segment.base_row,
+                    StreamId::West(fabricStream)));
+            if (segment.vector_count > 1) {
+                chip.icu().enqueue_mem_repeat(queue,
+                    segment.vector_count - 1, 1, 1);
+            }
+        }
         stats_.vectors += segment.vector_count;
     }
     for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
@@ -88,7 +120,9 @@ bool C2cWeightPager::ready() const
             || !chip.c2c_endpoint(hemisphere).rx().idle())
             return false;
     }
-    return drain_cycles_ >= 1;
+    for (const auto queue : target_mem_queues_)
+        if (!chip.icu().mem_iq(queue).done()) return false;
+    return drain_cycles_ >= hw::kTileRows;
 }
 
 void C2cWeightPager::tick()
@@ -106,6 +140,9 @@ void C2cWeightPager::observe_tick()
         queues_done = queues_done
             && system_.chip().icu().c2c_rx_iq(hemisphere).done();
     }
+    for (const auto queue : target_mem_queues_)
+        queues_done = queues_done
+            && system_.chip().icu().mem_iq(queue).done();
     if (queues_done) ++drain_cycles_;
     else drain_cycles_ = 0;
     if (ready() && stats_.ready_cycle == 0)

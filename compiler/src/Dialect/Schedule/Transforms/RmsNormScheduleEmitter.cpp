@@ -986,12 +986,10 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
 int64_t emitRowParallelVxmFeedback(mlir::IRRewriter& rewriter,
     stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
     mlir::DictionaryAttr inputPlacement,
-    mlir::DictionaryAttr inputCopyPlacement,
     mlir::DictionaryAttr weightPlacement,
     mlir::DictionaryAttr outputPlacement, int64_t start)
 {
     const auto inputSlices = slices(inputPlacement);
-    const auto inputCopySlices = slices(inputCopyPlacement);
     const auto weightSlices = slices(weightPlacement);
     const auto outputSlices = slices(outputPlacement);
     const auto inputType =
@@ -1078,7 +1076,7 @@ int64_t emitRowParallelVxmFeedback(mlir::IRRewriter& rewriter,
             create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
                 inputType, squareConfig, head, "multiply",
                 streamKind, 32 + head * 2, 0.0f,
-                streamKind, 34 + head * 2, 0.0f,
+                streamKind, 32 + head * 2, 0.0f,
                 "fp32", -1, hidden, 1, "east", "east",
                 -1, false, false, true, false, 2);
             create_vxm(rewriter, op.getLoc(), op.getInput(), op.getInput(),
@@ -1102,9 +1100,6 @@ int64_t emitRowParallelVxmFeedback(mlir::IRRewriter& rewriter,
             emitReadPair(inputSlices, pair,
                 address(inputPlacement, batch, 0), pair * 4,
                 squareInput, hidden, 1, bank(inputPlacement));
-            emitReadPair(inputCopySlices, pair,
-                address(inputCopyPlacement, batch, 0), pair * 4 + 2,
-                squareInput, hidden, 1, bank(inputCopyPlacement));
         }
         const int64_t squareOutput = squareInput + hidden + 1;
         for (int64_t pair = 0; pair < 8; ++pair)
@@ -1199,7 +1194,7 @@ int64_t emitRowParallelVxmFeedback(mlir::IRRewriter& rewriter,
             create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
                 inputType, normalizeConfig, head, "multiply",
                 streamKind, 32 + head * 2, 0.0f,
-                streamKind, 34 + head * 2, 0.0f,
+                streamKind, 34, 0.0f,
                 "fp32", -1, hidden, 1, "east", "east",
                 -1, false, false, true, false, 2);
             create_vxm(rewriter, op.getLoc(), op.getInput(), op.getWeight(),
@@ -1212,11 +1207,20 @@ int64_t emitRowParallelVxmFeedback(mlir::IRRewriter& rewriter,
             emitReadPair(inputSlices, pair,
                 address(inputPlacement, batch, 0), pair * 4,
                 normalizeInput, hidden, 1, bank(inputPlacement));
-            emitReadPair(weightSlices, pair,
-                baseRow(weightPlacement), pair * 4 + 2,
-                normalizeInput, hidden, 1, bank(weightPlacement),
-                inputBindingIndex(op.getWeight()));
         }
+        for (int64_t hemisphere = 0; hemisphere < 2; ++hemisphere)
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const int64_t slice = weightSlices[byte];
+                emitMem(rewriter, op.getLoc(),
+                    normalizeInput - readLatency(slice),
+                    hemisphere * target.memory().slices_per_hemisphere
+                        + slice,
+                    "read", baseRow(weightPlacement),
+                    34 + hemisphere * 16 + byte,
+                    hidden, 1, 1, "sram",
+                    inputBindingIndex(op.getWeight()),
+                    bank(weightPlacement));
+            }
         const int64_t normalizeOutput = normalizeInput + 3;
         for (int64_t pair = 0; pair < 8; ++pair)
             emitWritePair(pair, address(outputPlacement, batch, 0),
@@ -1283,10 +1287,8 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
         allocationPlacement(op.getWeightAllocations(), 0);
     const auto feedbackInputPlacement =
         allocationPlacement(op.getScratchAllocations(), 0);
-    const auto feedbackInputCopyPlacement =
-        allocationPlacement(op.getScratchAllocations(), 1);
     const auto feedbackOutputPlacement =
-        allocationPlacement(op.getScratchAllocations(), 2);
+        allocationPlacement(op.getScratchAllocations(), 1);
     const auto resultPlacement =
         allocationPlacement(op.getResultAllocations(), 0);
 
@@ -1316,21 +1318,21 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
         ? 0
         : emitPackedToPairTranspose(
               rewriter, op.getLoc(), target, inputPlacement,
-              feedbackInputPlacement, rows, hidden, 0, true,
-              feedbackInputCopyPlacement);
+              feedbackInputPlacement, rows, hidden, 0, true);
     const auto feedbackInput = vxmInput
         ? inputPlacement : feedbackInputPlacement;
     const auto weightKind =
         weightPlacement.getAs<mlir::StringAttr>("kind");
     const bool distributedWeight = weightKind
-        && weightKind.getValue() == "fp16_vxm_row_parallel_8";
+        && (weightKind.getValue() == "fp16_vxm_row_parallel_8"
+            || weightKind.getValue()
+                == "fp16_vxm_gamma_broadcast");
     if (!distributedWeight)
         return op.emitError(
             "feedback RMSNorm requires VXM-oriented distributed16 gamma");
     const int64_t weightTransposeEnd = inputTransposeEnd;
     const int64_t feedbackEnd = emitRowParallelVxmFeedback(
         rewriter, op, target, feedbackInput,
-        feedbackInputCopyPlacement,
         weightPlacement, feedbackOutputPlacement,
         weightTransposeEnd);
     const auto resultKind =

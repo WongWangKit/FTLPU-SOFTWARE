@@ -4,7 +4,7 @@
 
 上图将计算 Command IR 中的权重页 `ready/release/bank` 区间与目标配置的 C2C
 带宽放在同一时间轴。实色块是当前可执行文件的 MEM 驻留和 MXM/VXM 计算窗口；
-斜纹块是按每方向 8 条专用 lane、每 lane 32 bytes/cycle 推导的 C2C 预取窗口。
+斜纹块是按每方向 8 条外部 lane、每 lane 32 bytes/cycle 推导的 C2C 预取窗口。
 第 0 页在 ICU cycle 0 前冷启动加载，后续页面在当前 bank 计算时写入另一 bank。
 
 ## 目标
@@ -17,11 +17,12 @@ Qwen decoder 层不再要求全部权重同时常驻片上 MEM。runtime 首先�
 - MEM ICU queue 唯一标识 `(hemisphere, slice, bank)`。
 - SRAM 地址是 bank-local row，每 row 为 32 bytes。每 superlane 128 KiB 的配置包含两个 64 KiB bank，因此每个 bank 的地址范围是 `0..2047`。
 - bank 0 read 与 bank 1 write 可以同 cycle 发射；同一 bank 内仍服从单端口约束。
-- 计算保持原有 32 条 eastward 和 32 条 westward stream。C2C 使用独立、可配置
-  的物理 lane，默认每个方向 8 条，每条每 cycle 搬运一个 32-byte vector，峰值为
+- 计算保持原有 32 条 eastward 和 32 条 westward stream。C2C 对外提供可配置
+  的 lane，默认每个方向 8 条，每条每 cycle 搬运一个 32-byte vector，峰值为
   `8 x 32 = 256 bytes/cycle`/方向。
-- C2C RX 通过专用数据路径直接写目标 SRAM，不占用 `E0..E31/W0..W31`，因此可以
-  与占满 32 条计算 stream 的 RMSNorm feedback 重叠。
+- C2C RX 将外部 lane 映射到普通 west stream，当前使用 `W24..W31`。数据从
+  C2C/MEM 边界沿共享 SR 传播，最终由目标 slice 的 MEM `Write` 消费，不绕过
+  stream fabric 和 MEM write port。
 - C2C page ready 表示最后一个 MEM write 已经完成，不等同于 DMA 把最后一个 vector 放入 RX FIFO。
 
 ## 软件表示
@@ -38,10 +39,10 @@ Binary v20 在 `BinaryBinding` 和 `BinaryMemoryFloor` 中保存 bank。ModelPac
 激活/工作区 slices `0..19`，以及靠近 MXM 的权重 slices `20..51`。
 其中 `0..15` 构成 SXM 所需的 distributed-16 激活平面，`16..19` 是辅助激活工作区。
 MXM accumulator 位于功能单元内部，其容量由 `mxm_accumulator_blocks` 描述；任何 MEM slice 都不配置成 accumulator。
-两个 SRAM bank 使用相同的 slice 角色。因此 RMSNorm
-即使占满原有 32 条 westward 计算 stream，C2C 仍可通过专用 lane 将下一层
-权重写入高编号权重池；两者既不共用 stream register，也不访问同一个 SRAM
-slice 端口。
+两个 SRAM bank 使用相同的 slice 角色。feedback RMSNorm 将每层 gamma 放在激活区
+两个 slice，每个半球只用两条低编号 west stream，其他数据流也保持在 `W16`
+以下；pager 则保留 `W24..W31`，并写入高编号权重 slice。该显式资源隔离允许两者
+重叠，不依赖 C2C 直写 SRAM 旁路。
 
 该分区消除的是传输和端口冲突，并不会增加容量。对于 seq_len=32 的
 Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gate 与 Up

@@ -5,7 +5,7 @@
 The diagram aligns Command IR weight-page `ready/release/bank` intervals with
 the target C2C bandwidth. Solid bars are executable MEM residency and MXM/VXM
 compute windows. Hatched bars are C2C prefetch windows derived from eight
-dedicated lanes per direction at 32 bytes/cycle per lane. Page 0 is cold-loaded
+external lanes per direction at 32 bytes/cycle per lane. Page 0 is cold-loaded
 before ICU cycle 0; later pages are written to the alternate bank while the
 current bank is being consumed.
 
@@ -20,14 +20,14 @@ Qwen decoder weights no longer need to be resident in on-chip MEM all at once. R
 - SRAM addresses are bank-local rows; each row is 32 bytes. The 128 KiB-per-
   superlane profile has two 64 KiB banks, so each bank exposes rows `0..2047`.
 - A bank-0 read may issue in the same cycle as a bank-1 write. Operations in one bank still obey its single-port constraint.
-- Compute keeps the original 32 eastward and 32 westward streams. C2C owns a
-  separate, target-configurable pool, defaulting to 8 eastward and 8 westward
-  lanes. A C2C lane transfers one complete 32-byte vector per cycle, for a
-  default external bandwidth of `8 x 32 = 256 bytes/cycle` per direction.
-- DMA ingress writes target SRAM rows directly through the dedicated C2C data
-  path. It does not allocate `E0..E31/W0..W31`, so a full-width RMSNorm VXM
-  feedback wave can overlap next-bank weight loading.
-- Page readiness means that the final dedicated C2C write committed to SRAM,
+- Compute keeps the original 32 eastward and 32 westward streams. C2C exposes
+  a target-configurable external pool, defaulting to 8 lanes per direction. A
+  lane transfers one complete 32-byte vector per cycle, for a default external
+  bandwidth of `8 x 32 = 256 bytes/cycle` per direction.
+- DMA ingress maps those lanes to ordinary west streams, currently `W24..W31`.
+  Data propagates from the C2C/MEM edge to the target slice and is consumed by
+  MEM `Write`; it never bypasses the shared SR fabric or the MEM write port.
+- Page readiness means that the final target-MEM write committed to SRAM,
   not merely that DMA placed the final vector in an RX FIFO.
 
 ## Software Representation
@@ -49,10 +49,12 @@ activation/workspace slices `0..19` and MXM-local weight slices `20..51`.
 Slices `0..15` provide the distributed-16 activation plane required by SXM;
 `16..19` are auxiliary activation workspace. MXM accumulators are local to the
 functional unit and are sized by `mxm_accumulator_blocks`; no MEM slice is
-configured as an accumulator. Both SRAM banks keep the same slice role. RMSNorm
-may therefore use all 32 legacy westward compute streams while C2C writes the
-next layer through its dedicated lanes into the high-slice weight pool. The
-two operations share neither stream registers nor SRAM slice ports.
+configured as an accumulator. Both SRAM banks keep the same slice role.
+Feedback RMSNorm stores layer gamma in two activation-side slices and reads it
+through two low-numbered west streams per hemisphere. Its data path remains
+below `W16`, while the pager reserves `W24..W31` and writes high-slice weight
+SRAM ports. This planned separation permits overlap without a direct-SRAM C2C
+bypass.
 
 This partition removes transport and port conflicts; it does not increase
 capacity. For Qwen2.5-1.5B FFN at sequence length 32, the generic Vector planner

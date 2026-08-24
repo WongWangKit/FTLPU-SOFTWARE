@@ -293,6 +293,8 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::Fp16VxmDistributed16;
     if (value == "fp16_vxm_row_parallel_8")
         return BindingLayout::Fp16VxmRowParallel8;
+    if (value == "fp16_vxm_gamma_broadcast")
+        return BindingLayout::Fp16VxmGammaBroadcast;
     if (value == "fp16_mxm_distributed_16")
         return BindingLayout::Fp16MxmDistributed16;
     if (value == "fp16_mxm_block8_distributed_16")
@@ -595,8 +597,16 @@ VxmLaneOperand parse_vxm_operand(llvm::StringRef kind, int64_t index,
         throw std::runtime_error(
             "arbitrary VXM alu(N) references require chain legalization");
     }
-    if (kind == "stream_f16") return VxmLaneOperand::StreamFloat16();
-    if (kind == "stream_bf16") return VxmLaneOperand::StreamBFloat16();
+    const auto streamGroup = [&]() -> std::int32_t {
+        if (index < 0 || index >= 64 || index % 2 != 0)
+            throw std::runtime_error(
+                "VXM 16-bit stream operand requires an even packed stream index");
+        return static_cast<std::int32_t>(((index % 32) / 2) % 8);
+    };
+    if (kind == "stream_f16")
+        return VxmLaneOperand::StreamFloat16(1.0f, streamGroup());
+    if (kind == "stream_bf16")
+        return VxmLaneOperand::StreamBFloat16(1.0f, streamGroup());
     if (kind == "immediate") return VxmLaneOperand::Imm(immediate);
     throw std::runtime_error(
         "legacy integer/FP32 VXM stream operands require BF16 legalization");

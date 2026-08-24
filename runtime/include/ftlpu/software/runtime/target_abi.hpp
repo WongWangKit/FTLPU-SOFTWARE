@@ -53,7 +53,7 @@ struct ExecutableHardwareConfig {
     std::uint32_t mxm_weight_buffers{2};
     std::uint32_t vxm_alus{16};
     std::uint32_t vxm_weight_to_iw_latency{16};
-    std::uint32_t mem_to_sxm_latency{15};
+    std::uint32_t mem_to_sxm_latency{14};
     std::uint32_t mem_to_mxm_latency{16};
     std::uint32_t mxm0_accumulator_latency{6};
     std::uint32_t mxm1_accumulator_latency{5};

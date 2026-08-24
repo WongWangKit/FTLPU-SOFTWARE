@@ -253,6 +253,30 @@ PackedWeightImage pack_weight_binding(const BinaryBinding& binding,
         }
         return image.finish();
     }
+    if (binding.layout == BindingLayout::Fp16VxmGammaBroadcast
+        && (binding.element_type == BindingElementType::F16
+            || binding.element_type == BindingElementType::BF16)
+        && binding.slices.size() == 2) {
+        if (binding.shape.size() != 1)
+            throw std::invalid_argument(
+                "VXM gamma broadcast weight must be a vector");
+        for (std::size_t column = 0; column < columns; ++column) {
+            const std::size_t offset = column * 2;
+            const std::uint32_t address = base
+                + static_cast<std::uint32_t>(column) * stride;
+            for_each_hemisphere(binding,
+                [&](std::uint16_t hemisphere) {
+                    for (std::size_t lane = 0; lane < 32; ++lane) {
+                        image.write(hemisphere, binding.slices[0], address,
+                            static_cast<std::uint32_t>(lane), data[offset]);
+                        image.write(hemisphere, binding.slices[1], address,
+                            static_cast<std::uint32_t>(lane),
+                            data[offset + 1]);
+                    }
+                });
+        }
+        return image.finish();
+    }
 
     const auto write_i8 = [&](std::size_t k, std::size_t n,
                               std::uint16_t hemisphere,

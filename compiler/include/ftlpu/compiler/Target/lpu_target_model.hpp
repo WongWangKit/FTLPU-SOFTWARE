@@ -99,7 +99,7 @@ struct ThroughputModel {
     int64_t mxm_accumulator_blocks = 256;
     int64_t vxm_alus = 16;
     int64_t vxm_weight_to_iw_latency = 16;
-    int64_t mem_to_sxm_latency = 15;
+    int64_t mem_to_sxm_latency = 14;
     int64_t mem_to_mxm_latency = 16;
     int64_t mxm0_accumulator_latency = 6;
     int64_t mxm1_accumulator_latency = 5;

@@ -150,6 +150,7 @@ mlir::LogicalResult lower_swiglu(kernel::SwigluOp op,
 mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const target::LPUTargetModel& target,
     RmsNormLoweringStrategy strategy, int64_t feedback_weight_base_row,
+    int64_t feedback_weight_slice_base,
     int64_t weight_bank, FunctionMemoryPlanner& planner,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
