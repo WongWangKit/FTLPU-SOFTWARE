@@ -60,6 +60,7 @@ struct FfnWeightTilePlan {
 };
 
 mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
-    FfnWeightShape shape, const target::LPUTargetModel& target);
+    FfnWeightShape shape, const target::LPUTargetModel& target,
+    int64_t initialBank = 0);
 
 } // namespace ftlpu::compiler::tensor

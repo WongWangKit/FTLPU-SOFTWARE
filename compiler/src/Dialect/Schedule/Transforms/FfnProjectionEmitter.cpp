@@ -21,6 +21,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
         context.projection_timeline.weight_load_cycles;
     const int64_t mTileCount =
         context.projection_timeline.m_tile_count;
+    const int64_t projectionSlotInterval =
+        context.projection_timeline.projection_slot_interval;
     const int64_t gateAccLatency =
         throughput.mxm0_accumulator_latency;
     const int64_t upAccLatency =
@@ -93,7 +95,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         .getAs<mlir::IntegerAttr>("page_bank_count")
                         .getInt();
                     page = pair / wavesPerPage;
-                    bank = page % bankCount;
+                    bank = (bank + page) % bankCount;
                     const int64_t pairInPage = pair % wavesPerPage;
                     const int64_t sliceGroup = roleGroupBase
                         + pairInPage / itemsPerGroup;
@@ -229,7 +231,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         };
                     const int64_t gateCycle = segmentCycle;
                     const int64_t upCycle =
-                        segmentCycle + (singleMxm ? tile : 0);
+                        segmentCycle
+                        + (singleMxm ? projectionSlotInterval : 0);
                     mlir::Value gateActivation = emitActivation(gateCycle);
                     mlir::Value upActivation = singleMxm
                         ? emitActivation(upCycle) : gateActivation;
@@ -318,7 +321,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     accumulatorBase, computeCycle + gateAccLatency,
                     resultStreamBase);
                 const int64_t upComputeCycle =
-                    computeCycle + (singleMxm ? tile : 0);
+                    computeCycle
+                    + (singleMxm ? projectionSlotInterval : 0);
                 const int64_t effectiveUpAccLatency =
                     singleMxm ? gateAccLatency : upAccLatency;
                 auto upAccumulator = emitAccumulator(

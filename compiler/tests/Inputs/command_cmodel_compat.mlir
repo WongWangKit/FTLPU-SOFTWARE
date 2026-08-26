@@ -33,7 +33,7 @@ module {
       repeat_count = 1 : i64, repeat_interval = 1 : i64,
       accumulator_address = 0 : i64, accumulator_row_stride = 1 : i64,
       accumulator_destination = "sram", accumulator_clear = false,
-      data_format = "bf16", compute_mode = "block8"
+      data_format = "bf16", compute_mode = "vector"
     }
     ftlpu.command.mxm {
       cycle = 16 : i64, queue = 1 : i64, opcode = "compute",
@@ -42,7 +42,7 @@ module {
       repeat_count = 4 : i64, repeat_interval = 1 : i64,
       accumulator_address = 4 : i64, accumulator_row_stride = 1 : i64,
       accumulator_destination = "sram", accumulator_clear = false,
-      data_format = "bf16", compute_mode = "block8",
+      data_format = "bf16", compute_mode = "vector",
       wave_count = 3 : i64, wave_interval = 8 : i64,
       wave_accumulator_address_stride = 4 : i64
     }

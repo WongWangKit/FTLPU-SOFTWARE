@@ -25,6 +25,17 @@
     "c2c_streams_per_direction": 8,
     "c2c_bytes_per_stream_per_cycle": 32
   },
+  "external_memory": {
+    "lpu_clock_mhz": 500,
+    "ddr_peak_bandwidth_mbytes_per_second": 51200,
+    "ddr_scheduling_efficiency_percent": 90,
+    "ddr_read_latency_cycles": 35,
+    "ddr_write_latency_cycles": 25,
+    "ddr_read_latency_jitter_cycles": 15,
+    "ddr_write_latency_jitter_cycles": 10,
+    "ddr_request_queue_depth": 256,
+    "ddr_latency_random_seed": 1179929680
+  },
   "throughput": {
     "mxms_per_hemisphere": 1,
     "mxm_weight_buffers": 2,

@@ -104,7 +104,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     std::optional<tensor::FfnWeightTilePlan> weightTilePlan;
     if (requiresWeightPaging) {
         auto planned = tensor::planFfnWeightTiles(
-            {m, k, hidden, n}, target);
+            {m, k, hidden, n}, target, initialWeightBank);
         if (mlir::failed(planned)) {
             op.emitError("cannot tile FFN weights into the configured SRAM banks");
             return mlir::failure();

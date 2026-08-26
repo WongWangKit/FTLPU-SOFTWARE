@@ -802,6 +802,36 @@ public:
                         * read.getWaveInterval().value_or(1)
                     + read.getDuration());
         }
+        for (schedule::MemTransferOp transfer : mem_transfers) {
+            const auto page = transfer.getWeightPage();
+            if (!page) continue;
+            const auto binding = transfer.getAddressBinding();
+            if (!binding) {
+                transfer.emitError(
+                    "paged weight transfer must resolve to one input binding");
+                signalPassFailure();
+                return;
+            }
+            const int64_t bindingIndex = static_cast<int64_t>(*binding);
+            const int64_t pageIndex = static_cast<int64_t>(*page);
+            const int64_t bank = transfer.getBank().value_or(0);
+            auto [position, inserted] = weightPages.try_emplace(
+                std::tuple {bindingIndex, pageIndex, bank},
+                WeightPageInterval {bindingIndex, pageIndex, bank,
+                    std::numeric_limits<int64_t>::max(), 0,
+                    transfer.getLoc()});
+            auto& interval = position->second;
+            const int64_t endCycle = transfer.getCycle()
+                + (transfer.getWaveCount().value_or(1) - 1)
+                    * transfer.getWaveInterval().value_or(1)
+                + (transfer.getRepeatCount() - 1)
+                    * transfer.getRepeatInterval()
+                + 1;
+            interval.ready = std::min<int64_t>(
+                interval.ready, transfer.getCycle());
+            interval.release = std::max<int64_t>(
+                interval.release, endCycle);
+        }
         builder.setInsertionPointToStart(&function.getBody().front());
         for (const auto& [key, interval] : weightPages) {
             (void)key;

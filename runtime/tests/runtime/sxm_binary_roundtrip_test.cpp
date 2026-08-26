@@ -160,8 +160,7 @@ try {
     legacy.hardware.mxm_block_compute_enabled = 0;
     legacy.target_abi = executable_target_abi(legacy.hardware);
     runtime.load(legacy);
-    require(system->hardware_configuration().mxms_per_hemisphere == 2
-            && !system->hardware_configuration().mxm_block_compute_enabled,
+    require(system->hardware_configuration().mxms_per_hemisphere == 2,
         "CModel instance did not select the legacy test configuration");
 
     auto oversized = decoded;

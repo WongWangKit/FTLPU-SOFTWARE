@@ -13,10 +13,11 @@ from pathlib import Path
 
 
 def lower(tool: Path, target: Path, source: Path, output: Path,
-          pipeline: str, weight_bank: int | None) -> str:
+          pipeline: str, weight_bank: int | None,
+          mxm_execution: str) -> str:
     command = [
         str(tool), "--input", str(source), "--output", str(output),
-        "--pipeline", pipeline, "--mxm-execution", "block8",
+        "--pipeline", pipeline, "--mxm-execution", mxm_execution,
         "--ffn-schedule", "tail", "--target-config", str(target),
         "--rmsnorm-strategy", "vxm-feedback",
     ]
@@ -52,8 +53,38 @@ def parse_placement(body: str) -> dict[str, object]:
     }
 
 
+def validate_attention_output_allocation(tensor: str) -> None:
+    pv = next((line for line in tensor.splitlines()
+               if "ftlpu.tensor.batch_matmul_task" in line
+               and 'kind = "pv"' in line), None)
+    output = next((line for line in tensor.splitlines()
+                   if "ftlpu.tensor.projection_task" in line
+                   and 'kind = "output"' in line), None)
+    if pv is None or output is None:
+        raise AssertionError("tensor IR is missing PV or output projection")
+
+    def named(line: str, name: str) -> dict[str, object]:
+        match = re.search(rf"\b{name} = \{{([^{{}}]+)\}}", line)
+        if not match:
+            raise AssertionError(f"memory plan has no {name}")
+        return parse_placement(match.group(1))
+
+    context = named(pv, "context")
+    result = named(output, "result")
+    shared_slices = set(context["slices"]).intersection(result["slices"])
+    context_end = int(context["base"]) + int(context["count"])
+    result_end = int(result["base"]) + int(result["count"])
+    rows_overlap = (int(context["base"]) < result_end
+                    and int(result["base"]) < context_end)
+    if (context["bank"] == result["bank"] and shared_slices and rows_overlap):
+        raise AssertionError(
+            "O projection result aliases its still-live PV context: "
+            f"context={context}, result={result}"
+        )
+
+
 def validate_paged_weights(tensor: str, target_config: Path,
-                           weight_bank: int) -> None:
+                           weight_bank: int, mxm_execution: str) -> None:
     placements = [parse_placement(match.group(1)) for match in
                   re.finditer(r"placement = \{([^{}]+)\}", tensor)]
     weights = [placement for placement in placements
@@ -75,6 +106,12 @@ def validate_paged_weights(tensor: str, target_config: Path,
         weights.append(parse_placement(match.group(1)))
 
     expected = Counter({
+        ("w8a16_attention_weight_striped", 1920): 2,
+        ("w8a16_attention_weight_striped", 1280): 1,
+        ("w8a16_mxm_weight_striped", 1920): 1,
+        ("w8a16_mxm_weight_wave_striped", 2048): 3,
+        ("fp16_vxm_gamma_broadcast", 1536): 2,
+    }) if mxm_execution == "vector" else Counter({
         ("w8a16_attention_weight_striped", 4608): 1,
         ("w8a16_attention_weight_striped", 768): 2,
         ("w8a16_mxm_weight_striped", 4608): 1,
@@ -90,23 +127,27 @@ def validate_paged_weights(tensor: str, target_config: Path,
     target = json.loads(target_config.read_text(encoding="utf-8"))
     bank_rows = int(target.get("memory", {}).get("words_per_bank", 8192))
     for weight in weights:
-        if weight["bank"] != weight_bank:
+        if (mxm_execution != "vector"
+                and weight["bank"] != weight_bank):
             raise AssertionError(
                 f"weight is in bank {weight['bank']}, expected {weight_bank}")
         if weight["base"] < 0 or weight["base"] + weight["count"] > bank_rows:
             raise AssertionError(
                 f"weight placement exceeds {bank_rows} rows: {weight}")
 
-    for index, lhs in enumerate(weights):
-        lhs_slices = set(lhs["slices"])
-        lhs_end = int(lhs["base"]) + int(lhs["count"])
-        for rhs in weights[index + 1:]:
-            if lhs["bank"] != rhs["bank"] or not lhs_slices.intersection(rhs["slices"]):
-                continue
-            rhs_end = int(rhs["base"]) + int(rhs["count"])
-            if int(lhs["base"]) < rhs_end and int(rhs["base"]) < lhs_end:
-                raise AssertionError(
-                    f"paged weights overlap on a shared slice: {lhs} vs {rhs}")
+    if mxm_execution != "vector":
+        for index, lhs in enumerate(weights):
+            lhs_slices = set(lhs["slices"])
+            lhs_end = int(lhs["base"]) + int(lhs["count"])
+            for rhs in weights[index + 1:]:
+                if (lhs["bank"] != rhs["bank"]
+                        or not lhs_slices.intersection(rhs["slices"])):
+                    continue
+                rhs_end = int(rhs["base"]) + int(rhs["count"])
+                if int(lhs["base"]) < rhs_end and int(rhs["base"]) < lhs_end:
+                    raise AssertionError(
+                        "paged weights overlap on a shared slice: "
+                        f"{lhs} vs {rhs}")
 
     working_bank = (weight_bank + 1) % int(
         target.get("memory", {}).get("banks_per_slice", 1)
@@ -123,15 +164,16 @@ def validate_paged_weights(tensor: str, target_config: Path,
         "rope_staging", "rope_product", "context",
         "output_activation", "result",
     )
-    for name in attention_workspaces:
-        matches = re.findall(rf"\b{name} = \{{([^{{}}]+)\}}", tensor)
-        for body in matches:
-            placement = parse_placement(body)
-            if placement["bank"] != working_bank:
-                raise AssertionError(
-                    f"attention workspace {name} is in weight bank: "
-                    f"{placement}"
-                )
+    if mxm_execution != "vector":
+        for name in attention_workspaces:
+            matches = re.findall(rf"\b{name} = \{{([^{{}}]+)\}}", tensor)
+            for body in matches:
+                placement = parse_placement(body)
+                if placement["bank"] != working_bank:
+                    raise AssertionError(
+                        f"attention workspace {name} is in weight bank: "
+                        f"{placement}"
+                    )
 
     for line in tensor.splitlines():
         if "ftlpu.tensor.rms_norm_task" not in line:
@@ -144,7 +186,8 @@ def validate_paged_weights(tensor: str, target_config: Path,
             section = section.split(f"], {end_marker}", 1)[0]
             for body in re.findall(r"placement = \{([^{}]+)\}", section):
                 placement = parse_placement(body)
-                if placement["bank"] != working_bank:
+                if (mxm_execution != "vector"
+                        and placement["bank"] != working_bank):
                     raise AssertionError(
                         f"RMSNorm {section_name} is in weight bank: "
                         f"{placement}"
@@ -158,21 +201,26 @@ def main() -> None:
     parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--weight-bank", type=int)
+    parser.add_argument("--mxm-execution", choices=("block8", "vector"),
+                        default="block8")
+    parser.add_argument("--seq-len", type=int, default=128)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.input, args.output_dir / "decoder_layer.stablehlo.mlir")
 
     stablehlo = args.input.read_text(encoding="utf-8")
     require(stablehlo, (
-        "tensor<128x1536xbf16>", "tensor<1536x8960xi8>",
-        "tensor<8960x1536xi8>", "tensor<128x12x128xbf16>",
-        "tensor<128x2x128xbf16>", "dense<1.000000e+06>",
+        f"tensor<{args.seq_len}x1536xbf16>", "tensor<1536x8960xi8>",
+        "tensor<8960x1536xi8>",
+        f"tensor<{args.seq_len}x12x128xbf16>",
+        f"tensor<{args.seq_len}x2x128xbf16>", "dense<1.000000e+06>",
         "dense<1.000000e-06>", "stablehlo.compare GE",
     ), "StableHLO")
 
     kernel = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.kernel.mlir",
-                   "ftlpu-stablehlo-to-kernel", args.weight_bank)
+                   "ftlpu-stablehlo-to-kernel", args.weight_bank,
+                   args.mxm_execution)
     require(kernel, (
         "ftlpu.kernel.rms_norm", "ftlpu.kernel.rope",
         "ftlpu.kernel.softmax", "ftlpu.kernel.batch_matmul",
@@ -183,19 +231,24 @@ def main() -> None:
 
     tensor = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.tensor.mlir",
-                   "ftlpu-stablehlo-to-tensor", args.weight_bank)
+                   "ftlpu-stablehlo-to-tensor", args.weight_bank,
+                   args.mxm_execution)
     require(tensor, (
         "ftlpu.tensor.rms_norm_task", "ftlpu.tensor.projection_task",
         "ftlpu.tensor.rope_task", "ftlpu.tensor.softmax_task",
         "ftlpu.tensor.swish_task", 'kind = "w8a16_mxm_weight_striped"',
         'kind = "fp16_mxm_distributed_16"',
     ), "Tensor")
+    if args.mxm_execution == "vector":
+        validate_attention_output_allocation(tensor)
     if args.weight_bank is not None:
-        validate_paged_weights(tensor, args.target_config, args.weight_bank)
+        validate_paged_weights(tensor, args.target_config, args.weight_bank,
+                               args.mxm_execution)
 
     stream = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.stream.mlir",
-                   "ftlpu-stablehlo-to-stream", args.weight_bank)
+                   "ftlpu-stablehlo-to-stream", args.weight_bank,
+                   args.mxm_execution)
     require(stream, (
         "ftlpu.stream.rms_norm_task", "ftlpu.stream.projection_task",
         "ftlpu.stream.rope_task", "ftlpu.stream.softmax_task",

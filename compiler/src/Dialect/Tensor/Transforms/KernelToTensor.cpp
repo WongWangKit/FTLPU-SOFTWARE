@@ -19,6 +19,7 @@ using namespace tensor_lowering;
 struct FeedbackGammaPlacement {
     int64_t base_row = 0;
     int64_t slice_base = -1;
+    int64_t bank = 0;
 };
 
 class LowerKernelToTensorPass final
@@ -144,16 +145,20 @@ public:
                 return;
             }
             const std::size_t pairCount = constantSlices.size() / 2;
-            llvm::SmallVector<int64_t> nextRows(pairCount, 0);
-            for (kernel::RmsNormOp rmsNorm : rmsNorms) {
+            llvm::SmallVector<int64_t> nextRows(
+                pairCount, target.memory().words_per_bank);
+            const int64_t constantBank = target.memory().banks_per_slice > 1
+                ? (std::max<int64_t>(0, weight_bank_) + 1)
+                    % target.memory().banks_per_slice
+                : 0;
+            for (kernel::RmsNormOp rmsNorm : llvm::reverse(rmsNorms)) {
                 if (feedbackRmsWeightPlacements.contains(rmsNorm.getWeight()))
                     continue;
                 const int64_t rows =
                     rmsNorm.getWeight().getType().getNumElements();
                 std::optional<std::size_t> selected;
                 for (std::size_t pair = 0; pair < pairCount; ++pair) {
-                    if (nextRows[pair] + rows
-                        <= target.memory().words_per_bank) {
+                    if (nextRows[pair] >= rows) {
                         selected = pair;
                         break;
                     }
@@ -165,9 +170,10 @@ public:
                     return;
                 }
                 const auto pair = *selected;
+                nextRows[pair] -= rows;
                 feedbackRmsWeightPlacements[rmsNorm.getWeight()] = {
-                    nextRows[pair], constantSlices[2 * pair]};
-                nextRows[pair] += rows;
+                    nextRows[pair], constantSlices[2 * pair],
+                    constantBank};
             }
         } else if (weight_bank_ >= 0
             && rmsnorm_strategy_
@@ -331,6 +337,8 @@ public:
             if (auto op = llvm::dyn_cast<kernel::RmsNormOp>(operation)) {
                 int64_t feedbackWeightBaseRow = 0;
                 int64_t feedbackWeightSliceBase = -1;
+                int64_t feedbackWeightBank =
+                    std::max<int64_t>(0, weight_bank_);
                 if (rmsnorm_strategy_
                     == RmsNormLoweringStrategy::VxmFeedback) {
                     auto found =
@@ -344,11 +352,12 @@ public:
                     }
                     feedbackWeightBaseRow = found->second.base_row;
                     feedbackWeightSliceBase = found->second.slice_base;
+                    feedbackWeightBank = found->second.bank;
                 }
                 if (mlir::failed(lower_rms_norm(
                         op, target, rmsnorm_strategy_,
                         feedbackWeightBaseRow, feedbackWeightSliceBase,
-                        weight_bank_, planner,
+                        feedbackWeightBank, weight_bank_, planner,
                         rewriter))) {
                     signalPassFailure();
                     return;

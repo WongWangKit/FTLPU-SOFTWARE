@@ -10,7 +10,7 @@
 
 namespace {
 
-void require(bool condition, const char* message)
+void require(bool condition, const std::string& message)
 {
     if (!condition) throw std::logic_error(message);
 }
@@ -20,7 +20,10 @@ void require(bool condition, const char* message)
 int main() try
 {
     using namespace ftlpu::compiler;
-    target::LPUTargetModel target;
+    target::ThroughputModel block8Throughput;
+    block8Throughput.mxm_block_compute_enabled = 1;
+    target::LPUTargetModel target(
+        target::MemoryTopology {}, target::StreamTopology {}, block8Throughput);
     const auto distributedActivationSlices =
         target.mxm_distributed_activation_slices();
     for (int64_t tempSlice :
@@ -54,9 +57,10 @@ int main() try
     target::LPUTargetModel conflictingTarget(
         conflictingMemory, target.streams(), target.throughput());
     std::string validationError;
-    require(mlir::failed(conflictingTarget.validate(&validationError))
-            && validationError.find("overlap") != std::string::npos,
+    require(mlir::failed(conflictingTarget.validate(&validationError)),
         "target validation accepted a fused temporary activation hazard");
+    require(validationError.find("overlap") != std::string::npos,
+        "unexpected target validation error: " + validationError);
 
     auto plan = schedule::buildFfnTaskPlan({128, 576, 1536, 576}, target);
     require(plan.tasks.size() == 4, "FFN plan must contain four stages");
@@ -165,6 +169,15 @@ int main() try
             + target.throughput().mxm_rows
             == projection->blocks.front().weight_compute_cycle,
         "FFN projection dequant lead is incorrect");
+    const int64_t expectedProjectionSlot =
+        (projection->m_tile_count - 1)
+            * projection->pipelined_block_interval
+        + target.mxm_first_result_latency()
+        + target.mxm_result_window_cycles(
+            target.throughput().mxm_rows);
+    require(projection->projection_slot_interval
+            == expectedProjectionSlot,
+        "FFN projection slot does not include the MXM result drain");
     auto localDequantProjection = schedule::planFfnProjectionTimeline(
         {32, 576, 1536, 576}, weightSlices, target, true);
     require(mlir::succeeded(localDequantProjection),
@@ -221,6 +234,18 @@ int main() try
     require(down->blocks.front().weight_compute_cycle
             == down->phase_start + projection->initial_compute_cycle,
         "FFN down timeline has the wrong phase offset");
+    const int64_t expectedDownReductionInterval =
+        target.throughput().mxms_per_hemisphere == 1
+        ? std::max(projection->weight_block_interval,
+              projection->projection_slot_interval
+                  + 2 * target.throughput().mxm_rows
+                  - projection->weight_load_cycles
+                  + target.mxm_first_result_latency())
+        : projection->weight_block_interval;
+    require(down->reduction_interval == expectedDownReductionInterval
+            && down->pair_transition_interval
+                >= down->reduction_interval,
+        "FFN down timeline reuses a live MXM weight buffer");
     bool sawLocalDequantPrefetch = false;
     for (const auto& block : down->blocks) {
         for (const auto& tile : block.tiles) {

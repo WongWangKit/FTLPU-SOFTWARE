@@ -331,7 +331,8 @@ void CModelRuntime::load(const BinaryProgram& program)
     hardware.vxm_alus = program.hardware.vxm_alus;
     hardware.c2c_streams_per_direction =
         program.hardware.c2c_streams_per_direction;
-    hardware.c2c_dedicated_streams = false;
+    hardware.c2c_dedicated_streams =
+        program.hardware.c2c_streams_per_direction != 0;
     hardware.mxm_local_dequant_enabled =
         program.hardware.mxm_local_dequant_enabled != 0;
     hardware.mxm_weight_activation_overlap_enabled =
@@ -510,14 +511,24 @@ void CModelRuntime::load_ready_weight_pages()
         const auto& use = weight_page_uses_[next_weight_page_use_++];
         const auto& binding = find_binding(
             BindingAccess::Input, use.binding_index);
+        if (weight_page_residency_checker_) {
+            if (!weight_page_residency_checker_(use))
+                throw std::logic_error(
+                    "C2C weight page missed its first-consumer deadline: "
+                    "binding=" + std::to_string(use.binding_index)
+                    + " page=" + std::to_string(use.page_index)
+                    + " bank=" + std::to_string(use.bank)
+                    + " ready_cycle=" + std::to_string(use.ready_cycle));
+            continue;
+        }
         const auto logical = paged_weight_data_.find(use.binding_index);
         if (logical == paged_weight_data_.end())
             throw std::logic_error(
                 "paged weight was not uploaded before its ready cycle");
         if (use.bank >= hardware_.banks_per_slice
-            || use.bank != use.page_index % binding.page_bank_count)
+            || use.bank >= binding.page_bank_count)
             throw std::logic_error(
-                "binary weight-page bank does not match ping-pong policy");
+                "binary weight-page bank is outside the binding policy");
         const auto image = pack_weight_binding_page(binding,
             use.page_index, logical->second, hardware_);
         for (const auto& segment : image.segments) {
@@ -540,6 +551,12 @@ void CModelRuntime::load_ready_weight_pages()
             }
         }
     }
+}
+
+void CModelRuntime::set_weight_page_residency_checker(
+    std::function<bool(const BinaryWeightPageUse&)> checker)
+{
+    weight_page_residency_checker_ = std::move(checker);
 }
 
 void CModelRuntime::upload_binding(

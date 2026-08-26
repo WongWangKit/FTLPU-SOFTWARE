@@ -4,6 +4,7 @@
 #include "ftlpu/software/runtime/c2c_weight_pager.hpp"
 #include "ftlpu/software/runtime/model_package.hpp"
 #include "ftlpu/software/runtime/session_memory_planner.hpp"
+#include "ftlpu/software/runtime/weight_prefetch_plan.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,10 @@ struct ModelSessionStats {
     std::size_t state_initialization_bytes{0};
     std::size_t host_uploads{0};
     std::size_t host_downloads{0};
+    std::size_t c2c_ingress_bytes{0};
+    std::size_t c2c_ingress_cycles{0};
+    std::size_t c2c_egress_bytes{0};
+    std::size_t c2c_egress_cycles{0};
     std::size_t device_aliases{0};
     std::size_t device_copies{0};
     std::size_t device_copy_bytes{0};
@@ -58,6 +63,13 @@ private:
         std::uint64_t target_abi{0};
     };
 
+    struct ExecutableWeightTransfer {
+        WeightPrefetchPlan plan{};
+        C2cWeightPage page{};
+        C2cWeightPageFence fence{};
+        std::vector<BinaryWeightPageUse> uses{};
+    };
+
     const std::vector<std::uint8_t>& resolve_value(const std::string& name) const;
     const ModelValue* find_value_metadata(const std::string& name) const;
     void run_embedding_lookups();
@@ -66,6 +78,18 @@ private:
     void ensure_weight_page(std::uint32_t page_index);
     void start_weight_page(std::uint32_t page_index);
     void observe_weight_page_tick();
+    void prepare_executable_weight_pages(
+        const BinaryProgram& program, const ModelInvocation& invocation);
+    bool executable_weight_page_ready(
+        const BinaryWeightPageUse& use) const;
+    void configure_external_transport(
+        const ExecutableHardwareConfig& hardware);
+    void upload_binding_through_c2c(
+        const BinaryBinding& binding, std::span<const std::uint8_t> data,
+        const ExecutableHardwareConfig& hardware);
+    std::vector<std::uint8_t> download_binding_through_c2c(
+        const BinaryBinding& binding,
+        const ExecutableHardwareConfig& hardware);
 
     CModelRuntime runtime_;
     C2cDmaSystem* c2c_system_{nullptr};
@@ -73,9 +97,14 @@ private:
     std::vector<C2cWeightPage> c2c_pages_{};
     std::optional<std::uint32_t> ready_weight_page_{};
     std::optional<std::uint32_t> inflight_weight_page_{};
+    std::vector<ExecutableWeightTransfer> executable_weight_transfers_{};
+    std::uint64_t executable_cycle_{0};
+    std::uint64_t executable_ddr4_address_{0};
+    bool executable_clock_active_{false};
     ModelPackage package_{};
     SessionMemoryPlan memory_plan_{};
     ModelSessionStats stats_{};
+    ModelSessionStats load_stats_{};
     bool loaded_{false};
     bool completed_invocation_{false};
     std::unordered_map<std::string, std::vector<std::uint8_t>> values_{};

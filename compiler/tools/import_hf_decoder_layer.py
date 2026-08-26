@@ -102,8 +102,16 @@ def rms_norm(value: np.ndarray, weight: np.ndarray, epsilon: float) -> np.ndarra
     return bf16(value / np.sqrt(mean_square + epsilon) * weight)
 
 
-def linear(value: np.ndarray, weight: np.ndarray, scale: float) -> np.ndarray:
-    return bf16(value @ (weight.astype(np.float32) * scale))
+def linear(
+    value: np.ndarray,
+    weight: np.ndarray,
+    scale: float,
+    bf16_scale: bool = False,
+) -> np.ndarray:
+    if bf16_scale:
+        scale = float(bf16(np.asarray([scale], dtype=np.float32))[0])
+    dequantized = bf16(weight.astype(np.float32) * scale)
+    return bf16(value @ dequantized)
 
 
 def biased_linear(
@@ -112,7 +120,8 @@ def biased_linear(
     scale: float,
     bias: np.ndarray | None,
 ) -> np.ndarray:
-    result = value @ (weight.astype(np.float32) * scale)
+    dequantized = bf16(weight.astype(np.float32) * scale)
+    result = value @ dequantized
     if bias is not None:
         result += bias
     return bf16(result)
@@ -140,6 +149,7 @@ def decoder_layer_reference(
     scales: dict[str, float],
     config: dict[str, object],
     biases: dict[str, np.ndarray] | None = None,
+    stage_outputs: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     seq_len, hidden = activation.shape
     query_heads = int(config["num_attention_heads"])
@@ -148,6 +158,8 @@ def decoder_layer_reference(
     epsilon = float(config["rms_norm_eps"])
 
     normalized = rms_norm(activation, norm0, epsilon)
+    if stage_outputs is not None:
+        stage_outputs["norm0"] = normalized
     biases = biases or {}
     query = rope(
         biased_linear(normalized, weights["query"], scales["query"],
@@ -167,6 +179,10 @@ def decoder_layer_reference(
                           biases.get("value")).reshape(
         seq_len, kv_heads, head_dim
     )
+    if stage_outputs is not None:
+        stage_outputs["query"] = query.reshape(seq_len, hidden)
+        stage_outputs["key"] = key.reshape(seq_len, kv_heads * head_dim)
+        stage_outputs["value"] = value.reshape(seq_len, kv_heads * head_dim)
     repeats = query_heads // kv_heads
     key = np.repeat(key, repeats, axis=1)
     value = np.repeat(value, repeats, axis=1)
@@ -185,12 +201,24 @@ def decoder_layer_reference(
     context = np.transpose(probability @ value, (1, 0, 2)).reshape(seq_len, hidden)
     attention = linear(context, weights["output"], scales["output"])
     residual = bf16(activation + attention)
+    if stage_outputs is not None:
+        stage_outputs["context"] = bf16(context)
+        stage_outputs["attention"] = attention
+        stage_outputs["residual0"] = residual
 
     normalized = rms_norm(residual, norm1, epsilon)
-    gate = linear(normalized, weights["gate"], scales["gate"])
-    up = linear(normalized, weights["up"], scales["up"])
+    if stage_outputs is not None:
+        stage_outputs["norm1"] = normalized
+    # Vector FFN uses the MXM local INT8 dequant instruction, whose immediate
+    # scale is encoded as BF16. Attention retains its existing projection
+    # reference semantics until that lowering uses the same local path.
+    gate = linear(normalized, weights["gate"], scales["gate"], True)
+    up = linear(normalized, weights["up"], scales["up"], True)
     swiglu = bf16((gate / (1.0 + np.exp(-gate))) * up)
-    down = linear(swiglu, weights["down"], scales["down"])
+    down = linear(swiglu, weights["down"], scales["down"], True)
+    if stage_outputs is not None:
+        stage_outputs["swiglu"] = swiglu
+        stage_outputs["down"] = down
     return bf16(residual + down)
 
 
@@ -259,8 +287,10 @@ def main() -> None:
         )
     else:
         activation = bf16(embedding[token_ids])
+    stage_outputs: dict[str, np.ndarray] = {}
     golden = decoder_layer_reference(
-        activation, norm0, norm1, quantized, scales, config, biases
+        activation, norm0, norm1, quantized, scales, config, biases,
+        stage_outputs,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -272,9 +302,14 @@ def main() -> None:
         args.output_dir / "post_attention_layernorm.bf16.bin", norm1
     )
     write_bf16(args.output_dir / "golden.bf16.bin", golden)
+    for stage, value in stage_outputs.items():
+        write_bf16(args.output_dir / f"golden.{stage}.bf16.bin", value)
     token_ids.astype("<i8").tofile(args.output_dir / "token_ids.i64.bin")
     for role, value in quantized.items():
         value.tofile(args.output_dir / f"{role}.i8.bin")
+    np.asarray(
+        [scales[role] for role in names], dtype="<f4"
+    ).tofile(args.output_dir / "quant_scales.f32.bin")
     for role, value in biases.items():
         write_bf16(args.output_dir / f"{role}_bias.bf16.bin", value)
 

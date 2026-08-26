@@ -37,6 +37,10 @@ struct FfnProjectionBlockSchedule {
 struct FfnProjectionTimeline {
     int64_t weight_load_cycles;
     int64_t pipelined_block_interval;
+    // Cycles from the first row of one logical projection to the first row
+    // of the next projection sharing the same physical MXM. This includes
+    // the systolic result drain after the final input row.
+    int64_t projection_slot_interval;
     int64_t weight_block_interval;
     int64_t initial_compute_cycle;
     int64_t final_projection_cycle;
@@ -67,6 +71,7 @@ struct FfnDownBlockSchedule {
 
 struct FfnDownProjectionTimeline {
     int64_t phase_start;
+    int64_t reduction_interval;
     int64_t pair_transition_interval;
     int64_t reduction_block_count;
     int64_t columns_per_wave;

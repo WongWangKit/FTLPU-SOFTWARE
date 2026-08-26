@@ -243,6 +243,10 @@ LogicalResult VxmOp::verify()
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0)
         return emitOpError("contains invalid cycle, ALU queue, or repeat metadata: cycle=")
             << getCycle() << ", queue=" << getQueue()
+            << ", opcode=" << getOpcode()
+            << ", lhs=" << getLhsKind() << "(" << getLhsIndex() << ")"
+            << ", rhs=" << getRhsKind() << "(" << getRhsIndex() << ")"
+            << ", output_stream=" << getOutputStream()
             << ", chain_depth=" << chainDepth
             << ", repeat_count=" << getRepeatCount()
             << ", repeat_interval=" << getRepeatInterval();

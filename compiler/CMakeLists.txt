@@ -78,6 +78,7 @@ add_library(ftlpu_compiler
     src/Dialect/Kernel/Transforms/StableHloToKernel.cpp
     src/Dialect/Tensor/IR/TensorDialect.cpp
     src/Dialect/Tensor/Analysis/AttentionTaskGraph.cpp
+    src/Dialect/Tensor/Analysis/AttentionWeightTilePlan.cpp
     src/Dialect/Tensor/Analysis/PhysicalMemoryAllocator.cpp
     src/Dialect/Tensor/Analysis/FfnWeightTilePlan.cpp
     src/Dialect/Tensor/Transforms/AttentionToTensor.cpp
@@ -186,6 +187,25 @@ set(FTLPU_TARGET_MODEL_CONSUMER_SOURCES
 set_source_files_properties(${FTLPU_TARGET_MODEL_CONSUMER_SOURCES}
     PROPERTIES OBJECT_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${CMAKE_SOURCE_DIR}/runtime/include/ftlpu/software/runtime/target_abi.hpp")
+set(FTLPU_ATTENTION_EMITTER_CONSUMER_SOURCES
+    src/Dialect/Schedule/Transforms/AttentionEmitterUtils.cpp
+    src/Dialect/Schedule/Transforms/AttentionProjectionEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionOutputProjectionEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionBlock8ProjectionEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionBlock8OutputProjectionEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionPvEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionRopeEmitter.cpp
+    src/Dialect/Schedule/Transforms/AttentionSoftmaxEmitter.cpp
+    src/Dialect/Schedule/Transforms/ElementwiseScheduleEmitter.cpp
+    src/Dialect/Schedule/Transforms/FfnBlock8ProjectionEmitter.cpp
+    src/Dialect/Schedule/Transforms/LinearProjectionScheduleEmitter.cpp
+    src/Dialect/Schedule/Transforms/RmsNormScheduleEmitter.cpp)
+set_property(SOURCE ${FTLPU_ATTENTION_EMITTER_CONSUMER_SOURCES}
+    APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/AttentionEmitterUtils.hpp")
+set_property(SOURCE src/Dialect/Schedule/IR/ScheduleDialect.cpp
+    APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_BINARY_DIR}/ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.cpp.inc")
 set_source_files_properties(
     src/Target/CommandBinary.cpp
     tools/ftlpu_translate.cpp
@@ -294,6 +314,11 @@ endif()
 
 if(Python3_Interpreter_FOUND)
     add_test(
+        NAME import_hf_decoder_layer_math_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/import_hf_decoder_layer_math_test.py)
+    add_test(
         NAME build_hf_decoder_stack_paging_test
         COMMAND
             ${Python3_EXECUTABLE}
@@ -317,6 +342,18 @@ if(Python3_Interpreter_FOUND)
             --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
             --weight-bank 1
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_paged)
+    add_test(
+        NAME qwen2_5_1_5b_vector_128kb_memory_layout_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_128kb_superlane_vector.json
+            --weight-bank 0
+            --mxm-execution vector
+            --seq-len 32
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_vector_128kb)
     add_custom_target(
         qwen2_5_1_5b_decoder_layer_pipeline
         COMMAND
@@ -702,18 +739,6 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:command_cmodel_compat_binary_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/command_cmodel_compat.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_command_cmodel_compat/command_cmodel_compat.ftlpu)
-    add_test(
-        NAME block8_linear_projection_e2e_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/block8_linear_projection_e2e_test.py
-            --opt $<TARGET_FILE:ftlpu_opt>
-            --translate $<TARGET_FILE:ftlpu_translate>
-            --runtime-test $<TARGET_FILE:block8_linear_projection_runtime_test>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/block8_linear_projection.stablehlo.mlir
-            --block8-target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
-            --legacy-target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/block8_linear_projection_e2e)
     add_test(
         NAME direct_binary_compile_test
         COMMAND

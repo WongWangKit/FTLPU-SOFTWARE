@@ -18,6 +18,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     "${FTLPU_CMODEL_DIR}/src/mem/sram.cpp"
     "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp"
     src/runtime/binary.cpp
+    src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
     src/runtime/icu_program.cpp
     src/runtime/model_package.cpp
@@ -26,6 +27,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/schedule_trace.cpp
     src/runtime/session_memory_planner.cpp
     src/runtime/weight_page_builder.cpp
+    src/runtime/weight_prefetch_plan.cpp
     examples/binary_inspect.cpp
     examples/pack_model_weights.cpp
     tests/runtime/command_mxm_column_binary_test.cpp
@@ -36,6 +38,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/compiled_rmsnorm_runtime_test.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
     tests/runtime/compiled_qwen_real_ffn_runtime_test.cpp
+    tests/runtime/compiled_qwen_real_decoder_layer_runtime_test.cpp
     tests/runtime/compiled_smollm2_lm_head_runtime_test.cpp
     tests/runtime/compiled_smollm2_attention_runtime_test.cpp
     tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp
@@ -51,6 +54,8 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/c2c_weight_ping_pong_test.cpp
     tests/runtime/weight_page_planner_test.cpp
     tests/runtime/model_session_c2c_weight_pages_test.cpp
+    tests/runtime/model_session_c2c_io_test.cpp
+    tests/runtime/model_session_executable_c2c_weight_test.cpp
     tests/runtime/weight_page_builder_test.cpp
     tests/runtime/qwen_weight_page_builder_test.cpp)
 set_source_files_properties(${FTLPU_CMODEL_CONSUMER_SOURCES}
@@ -73,7 +78,8 @@ add_library(ftlpu_software
     src/runtime/performance.cpp
     src/runtime/schedule_trace.cpp
     src/runtime/session_memory_planner.cpp
-    src/runtime/weight_page_builder.cpp)
+    src/runtime/weight_page_builder.cpp
+    src/runtime/weight_prefetch_plan.cpp)
 
 if(FTLPU_ENABLE_ADDRESS_SANITIZER AND MSVC)
     target_compile_options(ftlpu_software PRIVATE /fsanitize=address)
@@ -100,6 +106,14 @@ target_link_libraries(schedule_trace_weight_page_test PRIVATE ftlpu_software)
 add_test(
     NAME schedule_trace_weight_page_test
     COMMAND $<TARGET_FILE:schedule_trace_weight_page_test>)
+
+add_executable(model_session_executable_c2c_weight_test
+    tests/runtime/model_session_executable_c2c_weight_test.cpp)
+target_link_libraries(model_session_executable_c2c_weight_test
+    PRIVATE ftlpu_software)
+add_test(
+    NAME model_session_executable_c2c_weight_test
+    COMMAND $<TARGET_FILE:model_session_executable_c2c_weight_test>)
 
 add_executable(ftlpu_pack_model_weights
     examples/pack_model_weights.cpp)
@@ -197,6 +211,13 @@ add_test(
     NAME model_session_c2c_weight_pages_test
     COMMAND $<TARGET_FILE:model_session_c2c_weight_pages_test>)
 
+add_executable(model_session_c2c_io_test
+    tests/runtime/model_session_c2c_io_test.cpp)
+target_link_libraries(model_session_c2c_io_test PRIVATE ftlpu_software)
+add_test(
+    NAME model_session_c2c_io_test
+    COMMAND $<TARGET_FILE:model_session_c2c_io_test>)
+
 add_executable(weight_page_builder_test
     tests/runtime/weight_page_builder_test.cpp)
 target_link_libraries(weight_page_builder_test PRIVATE ftlpu_software)
@@ -257,6 +278,11 @@ target_link_libraries(compiled_qwen2_5_1_5b_ffn_seq32_runtime_test
 add_executable(compiled_qwen_real_ffn_runtime_test
     tests/runtime/compiled_qwen_real_ffn_runtime_test.cpp)
 target_link_libraries(compiled_qwen_real_ffn_runtime_test
+    PRIVATE ftlpu_software)
+
+add_executable(compiled_qwen_real_decoder_layer_runtime_test
+    tests/runtime/compiled_qwen_real_decoder_layer_runtime_test.cpp)
+target_link_libraries(compiled_qwen_real_decoder_layer_runtime_test
     PRIVATE ftlpu_software)
 
 add_executable(compiled_block8_ffn_wave_boundary_fast_runtime_test

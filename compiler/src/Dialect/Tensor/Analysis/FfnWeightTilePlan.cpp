@@ -11,7 +11,8 @@ int64_t divideCeil(int64_t value, int64_t divisor)
 } // namespace
 
 mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
-    FfnWeightShape shape, const target::LPUTargetModel& target)
+    FfnWeightShape shape, const target::LPUTargetModel& target,
+    int64_t initialBank)
 {
     const auto& memory = target.memory();
     const auto& streams = target.streams();
@@ -23,7 +24,9 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
         static_cast<int64_t>(target.weight_storage_slices().size());
     if (!target.supports_w8a16_ffn_shape(
             shape.m, shape.k, shape.hidden, shape.n)
-        || memory.banks_per_slice < 2 || memory.sram_depth_rows <= 0
+        || memory.banks_per_slice < 2 || initialBank < 0
+        || initialBank >= memory.banks_per_slice
+        || memory.sram_depth_rows <= 0
         || memory.bytes_per_word <= 0 || memory.hemispheres <= 0
         || tile <= 0 || rowsPerWeightTile <= 0 || weightSlices <= 0
         || storageSlices < 2 * weightSlices
@@ -57,12 +60,13 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
     result.projection_waves_per_page = projectionWavesPerPage;
     result.projection_slice_groups_per_role = projectionGroupsPerRole;
     result.projection_waves_per_slice_group = projectionWavesPerGroup;
-    const int64_t c2cLanes = memory.hemispheres
-        * streams.c2c_streams_per_direction;
-    const auto appendPage = [&](FfnWeightTilePage page) {
+    const auto appendPage = [&](FfnWeightTilePage page,
+                                int64_t bindingPageIndex) {
         page.index = static_cast<int64_t>(result.pages.size());
-        page.bank = page.index % memory.banks_per_slice;
-        page.transfer_cycles = divideCeil(page.transfer_vectors, c2cLanes);
+        page.bank =
+            (initialBank + bindingPageIndex) % memory.banks_per_slice;
+        page.transfer_cycles = target.external_read_transfer_cycles(
+            page.transfer_vectors * memory.bytes_per_word);
         result.pages.push_back(std::move(page));
     };
 
@@ -83,7 +87,7 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
             projectionGroupsPerRole, projectionGroupsPerRole,
             projectionWavesPerGroup, wave, count, 0, reductionBlocks,
             1, rows});
-        appendPage(std::move(page));
+        appendPage(std::move(page), wave / projectionWavesPerPage);
     }
 
     constexpr int64_t downOutputBlocksPerHemisphere = 2;
@@ -100,6 +104,7 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
     result.down_reduction_blocks_per_page = downReductionsPerPage;
     result.down_reduction_blocks_per_slice_group =
         downReductionsPerGroup;
+    int64_t downPageIndex = 0;
     for (int64_t wave = 0; wave < downWaves; ++wave) {
         for (int64_t reduction = 0; reduction < downReductionBlocks;
              reduction += downReductionsPerPage) {
@@ -112,7 +117,7 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
             page.spans.push_back({FfnWeightTileKind::Down, 0, 0,
                 sliceGroupCount, downReductionsPerGroup, wave, 1,
                 reduction, count, downOutputBlocksPerHemisphere, rows});
-            appendPage(std::move(page));
+            appendPage(std::move(page), downPageIndex++);
         }
     }
     result.minimum_hidden_slices = divideCeil(

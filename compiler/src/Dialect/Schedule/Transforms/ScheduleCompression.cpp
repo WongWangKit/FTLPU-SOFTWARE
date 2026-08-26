@@ -35,6 +35,8 @@ bool same_mem_body(
         && lhs.getSlice() == rhs.getSlice()
         && lhs.getBank().value_or(0) == rhs.getBank().value_or(0)
         && lhs.getAddressBinding() == rhs.getAddressBinding()
+        && lhs.getWeightPage() == rhs.getWeightPage()
+        && lhs.getLogicalBaseRow() == rhs.getLogicalBaseRow()
         && lhs.getOpcode() == rhs.getOpcode()
         && lhs.getPackedStream() == rhs.getPackedStream()
         && lhs.getRepeatCount() == rhs.getRepeatCount()

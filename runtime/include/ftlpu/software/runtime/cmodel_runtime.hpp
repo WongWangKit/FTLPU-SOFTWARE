@@ -31,6 +31,8 @@ public:
     std::vector<std::uint8_t> download_output(std::size_t index) const;
     void copy_binding(
         const BinaryBinding& source, const BinaryBinding& destination);
+    void set_weight_page_residency_checker(
+        std::function<bool(const BinaryWeightPageUse&)> checker);
     void dispatch_icu_cycles(std::size_t cycles, std::ostream* log = nullptr);
     void run_cycles(std::size_t cycles, std::ostream* log = nullptr);
     void print_datapath_performance(std::ostream& os) const;
@@ -52,6 +54,8 @@ private:
     std::size_t executed_cycles_{0};
     DatapathPerformanceMonitor datapath_performance_{};
     std::function<void(TspSliceSystem::LogSinks)> tick_{};
+    std::function<bool(const BinaryWeightPageUse&)>
+        weight_page_residency_checker_{};
 };
 
 } // namespace ftlpu::software::runtime

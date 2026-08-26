@@ -5,13 +5,19 @@
 The diagram aligns Command IR weight-page `ready/release/bank` intervals with
 the target C2C bandwidth. Solid bars are executable MEM residency and MXM/VXM
 compute windows. Hatched bars are C2C prefetch windows derived from eight
-external lanes per direction at 32 bytes/cycle per lane. Page 0 is cold-loaded
-before ICU cycle 0; later pages are written to the alternate bank while the
-current bank is being consumed.
+external lanes per direction at 32 bytes/cycle per lane, then capped by the
+configured DDR source bandwidth. Page 0 is cold-loaded before ICU cycle 0;
+later pages are written to the alternate bank while the current bank is being
+consumed.
 
 ## Goal
 
 Qwen decoder weights no longer need to be resident in on-chip MEM all at once. Runtime first loads the target-packed layer-0 page through C2C into bank 0. While layer `i` reads its current bank, C2C writes layer `i+1` into the other bank. Runtime swaps banks at the layer boundary after the next page reaches SRAM-ready state.
+
+This is also the model-wide external-I/O rule: host data may initialize or read
+the external DDR backing store, but it cannot directly mutate LPU MEM. Inputs,
+outputs, resident constants, state initialization, and every weight page cross
+the C2C path. Device-resident aliases between decoder layers remain internal.
 
 ## Physical Contract
 
@@ -24,15 +30,19 @@ Qwen decoder weights no longer need to be resident in on-chip MEM all at once. R
   a target-configurable external pool, defaulting to 8 lanes per direction. A
   lane transfers one complete 32-byte vector per cycle, for a default external
   bandwidth of `8 x 32 = 256 bytes/cycle` per direction.
-- DMA ingress maps those lanes to ordinary west streams, currently `W24..W31`.
-  Data propagates from the C2C/MEM edge to the target slice and is consumed by
-  MEM `Write`; it never bypasses the shared SR fabric or the MEM write port.
-- Page readiness means that the final target-MEM write committed to SRAM,
+- The current `ModelSession` uses dedicated C2C lanes in addition to the 32
+  ordinary compute streams. An RX command carries the destination hemisphere,
+  slice, bank, and row, and the target MEM receiver commits SRAM. Every byte
+  must still arrive through DDR DMA and C2C; the host cannot write LPU MEM
+  directly. An optional shared-SR mode maps lanes to `W24..W31` and consumes
+  them with ordinary MEM `Write`, but it is not used for current fine-grained
+  overlapped paging.
+- Page readiness means that the final target-SRAM write committed,
   not merely that DMA placed the final vector in an RX FIFO.
 
 ## Software Representation
 
-Binary v20 stores the bank in `BinaryBinding` and `BinaryMemoryFloor`. ModelPackage v5 uses `ModelWeightPage` to record the layer, destination bank, target-packed tensors, and physical segments with DDR offset, hemisphere, slice, row, vector count, and stream.
+Binary v24 stores the bank and external-memory target parameters in the target ABI. ModelPackage v5 uses `ModelWeightPage` to record the layer, destination bank, target-packed tensors, and physical segments with DDR offset, hemisphere, slice, row, vector count, and stream.
 
 Only `TargetPackedSramVectors` tensors may be used as C2C page images. `ftlpu-pack-model-weights` offline-reorders quantized row-major weights into target SRAM rows from executable bindings. Runtime only transfers page images.
 
@@ -52,9 +62,9 @@ functional unit and are sized by `mxm_accumulator_blocks`; no MEM slice is
 configured as an accumulator. Both SRAM banks keep the same slice role.
 Feedback RMSNorm stores layer gamma in two activation-side slices and reads it
 through two low-numbered west streams per hemisphere. Its data path remains
-below `W16`, while the pager reserves `W24..W31` and writes high-slice weight
-SRAM ports. This planned separation permits overlap without a direct-SRAM C2C
-bypass.
+below `W16`, while the pager uses independent dedicated C2C lanes and writes
+high-slice weight SRAM ports. Separating both stream and slice/port resources
+permits overlap; neither path may bypass the external C2C boundary.
 
 This partition removes transport and port conflicts; it does not increase
 capacity. For Qwen2.5-1.5B FFN at sequence length 32, the generic Vector planner
@@ -96,6 +106,11 @@ scales with segments rather than 32-byte vectors.
 - `build_hf_decoder_stack_paging_test` checks that the generic stack builder
   compiles bank-0/bank-1 variants, assigns consecutive layers to alternating
   variants, and invokes offline C2C page packing.
+- `model_session_c2c_io_test` round-trips a 32x1536 BF16 tensor through DDR,
+  C2C, and MEM and rejects a host/MEM bypass.
+- The real two-layer Qwen seq-len-32 package passes with 6/49,152 tolerance
+  outliers, P99 0.25, and MAE 0.06079. It performs one external upload, one
+  external download, one device alias, and zero device copies.
 
 Convert a logical package with:
 
@@ -136,10 +151,9 @@ giant textual Command MLIR.
 
 Prefill has a long enough compute window to hide much of the next-layer transfer. `M=1` decode has a short compute window and will generally be DDR/C2C-bandwidth bound when tens of MiB are loaded per layer. Double buffering enables overlap but cannot remove that bandwidth lower bound; decode will need higher link bandwidth, projection/wave-granular prefetch, or more resident capacity.
 
-For the current sequence-length-32 Qwen layer window of about 192,382 cycles,
-a 47.625 MiB page requires at least about 260 bytes/cycle of sustained source
-bandwidth to be completely hidden. The default 8-lane C2C model provides a
-peak 256 bytes/cycle, very close to that lower bound. Protocol setup, DDR
-latency, segment imbalance, and SRAM-bank conflicts can still reduce sustained
-bandwidth, so the planner may still need projection-granular paging when the
-measured layer window is shorter than the page transfer.
+The default eight-lane C2C peak is 256 bytes/cycle per direction, but it is not
+the sustained source rate. The default dual-channel DDR4-3200 model peaks at
+51.2 GB/s = 102.4 bytes per 500 MHz LPU cycle, and the planner reserves only
+90% of it: 92.16 bytes/cycle. Request-level read latency varies from 35 to 50
+cycles. The current real two-layer seq-len-32 run therefore records a 4,750
+cycle layer-boundary page wait; the overlap is real but not yet complete.

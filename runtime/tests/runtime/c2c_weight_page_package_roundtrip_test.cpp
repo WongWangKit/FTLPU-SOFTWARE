@@ -22,6 +22,44 @@ const ModelTensor& findTensor(
     throw std::out_of_range("weight-page tensor is unavailable: " + name);
 }
 
+void configureSystem(
+    C2cDmaSystem& system, const ExecutableHardwareConfig& hardware)
+{
+    SystemHardwareConfiguration cmodelHardware;
+    cmodelHardware.sram_depth_rows = hardware.sram_depth_rows;
+    cmodelHardware.mxms_per_hemisphere = hardware.mxms_per_hemisphere;
+    cmodelHardware.mxm_weight_buffers = hardware.mxm_weight_buffers;
+    cmodelHardware.vxm_alus = hardware.vxm_alus;
+    cmodelHardware.c2c_streams_per_direction =
+        hardware.c2c_streams_per_direction;
+    cmodelHardware.c2c_dedicated_streams = true;
+    cmodelHardware.mxm_local_dequant_enabled =
+        hardware.mxm_local_dequant_enabled != 0;
+    cmodelHardware.mxm_weight_activation_overlap_enabled =
+        hardware.mxm_weight_activation_overlap_enabled != 0;
+    system.chip().configure_hardware(cmodelHardware);
+
+    Ddr4Config ddr;
+    ddr.beat_bytes = hardware.c2c_bytes_per_stream_per_cycle;
+    ddr.read_latency_cycles = hardware.ddr_read_latency_cycles;
+    ddr.write_latency_cycles = hardware.ddr_write_latency_cycles;
+    ddr.read_latency_jitter_cycles =
+        hardware.ddr_read_latency_jitter_cycles;
+    ddr.write_latency_jitter_cycles =
+        hardware.ddr_write_latency_jitter_cycles;
+    ddr.request_queue_depth = hardware.ddr_request_queue_depth;
+    ddr.transfer_channels = static_cast<std::size_t>(hardware.hemispheres)
+        * hardware.c2c_streams_per_direction;
+    ddr.lpu_clock_hz =
+        static_cast<std::uint64_t>(hardware.lpu_clock_mhz) * 1'000'000;
+    ddr.peak_bandwidth_bytes_per_second =
+        static_cast<std::uint64_t>(
+            hardware.ddr_peak_bandwidth_mbytes_per_second)
+        * 1'000'000;
+    ddr.latency_random_seed = hardware.ddr_latency_random_seed;
+    system.ddr4().configure(ddr);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -37,7 +75,10 @@ try {
     if (selected >= package.weight_pages.size())
         throw std::out_of_range("weight-page index is out of range");
 
+    if (package.executables.empty())
+        throw std::runtime_error("weight-page package has no executable target");
     C2cDmaSystem system;
+    configureSystem(system, package.executables.front().program.hardware);
     std::vector<C2cWeightPage> pages;
     std::uint64_t nextDdrAddress = 0;
     for (const ModelWeightPage& source : package.weight_pages) {

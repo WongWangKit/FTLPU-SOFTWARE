@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <vector>
 
 namespace ftlpu::software::runtime {
@@ -33,13 +34,24 @@ struct C2cWeightPageStats {
     std::size_t bytes{0};
 };
 
+struct C2cWeightPageFence {
+    std::array<std::array<std::size_t, hw::kC2cStreamsPerDirection>,
+               hw::kHemispheres>
+        completed_segments{};
+};
+
 class C2cWeightPager {
 public:
     explicit C2cWeightPager(C2cDmaSystem& system);
 
     void enqueue(const C2cWeightPage& page);
+    void begin_schedule();
+    C2cWeightPageFence schedule(
+        const C2cWeightPage& page, std::size_t start_cycle);
+    bool ready(const C2cWeightPageFence& fence) const;
     bool busy() const noexcept;
     bool ready() const;
+    void retire();
     void tick();
     void observe_tick();
     void wait(std::size_t max_cycles);
@@ -50,6 +62,11 @@ private:
     C2cDmaSystem& system_;
     C2cWeightPageStats stats_{};
     std::vector<std::size_t> target_mem_queues_{};
+    std::array<std::size_t, hw::kHemispheres> schedule_dma_cursor_{};
+    std::array<std::size_t, hw::kHemispheres> schedule_rx_cursor_{};
+    std::array<std::array<std::size_t, hw::kC2cStreamsPerDirection>,
+               hw::kHemispheres>
+        scheduled_rx_segments_{};
     std::uint32_t drain_cycles_{0};
     bool active_{false};
 };

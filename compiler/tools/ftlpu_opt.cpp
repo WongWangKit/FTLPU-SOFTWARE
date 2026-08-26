@@ -17,6 +17,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
 #include "stablehlo/dialect/StablehloOps.h"
+#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/ToolOutputFile.h"
 
 #include <filesystem>
@@ -138,6 +139,7 @@ Args parse_args(int argc, char** argv)
 
 int main(int argc, char** argv)
 try {
+    llvm::InitLLVM initLLVM(argc, argv);
     const auto args = parse_args(argc, argv);
     mlir::DialectRegistry registry;
     registry.insert<mlir::func::FuncDialect, mlir::stablehlo::StablehloDialect,

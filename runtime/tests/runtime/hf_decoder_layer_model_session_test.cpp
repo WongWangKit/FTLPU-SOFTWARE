@@ -28,7 +28,7 @@ try {
         throw std::runtime_error(
             "usage: hf_decoder_layer_model_session_test model.ftlpum");
     using namespace ftlpu::software::runtime;
-    auto system = std::make_unique<ftlpu::TspSliceSystem>();
+    auto system = std::make_unique<ftlpu::C2cDmaSystem>();
     ModelSession session(*system);
     session.load_file(std::filesystem::path(argv[1]));
     session.set_input("hidden.0", session.value("golden.input"));

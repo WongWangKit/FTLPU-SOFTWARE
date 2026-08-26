@@ -79,6 +79,24 @@ host embedding -> LPU decoder stack -> LPU final RMSNorm -> host LM head
 
 `load_file(path)` reads the package with lazy executable materialization and then follows the same path. Resident weights therefore move during `load()`, not once per layer. Persistent state, including KV cache, is not automatically cleared by `run()`; loading a package initializes it again.
 
+### External-transfer contract
+
+LPU MEM has no host-visible initialization backdoor. Every resident constant,
+persistent-state initialization, dynamic input, paged weight, and external
+output crosses the modeled boundary as
+`host backing store -> DDR -> C2C DMA -> C2C -> MEM` or the reverse path.
+`Ddr4Model::initialize_vector` and `read_vector` are host accesses to the
+external DDR backing store; they never read or write LPU SRAM. A `DeviceAlias`
+is still legal between invocations because it preserves an already resident
+LPU value and does not cross the external boundary.
+
+The default target models a 500 MHz LPU with dual-channel DDR4-3200: 51.2 GB/s
+peak, or 102.4 bytes per LPU cycle. Scheduling uses 90% of peak (46.08 GB/s,
+92.16 bytes/cycle). Read latency is 35 cycles plus deterministic 0..15-cycle
+jitter; write latency is 25 cycles plus deterministic 0..10-cycle jitter.
+Jitter is derived from request ID, address, operation, and a target seed, so
+tests are repeatable while requests still complete at different cycles.
+
 ### Run phase
 
 `set_input(name, bytes)` accepts only values declared as external inputs. `run()` clears the transient device-value map, executes host embedding lookups, runs invocations in package order, and finally executes host LM-head operations. For each invocation it:

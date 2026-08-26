@@ -102,6 +102,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     const auto* memory = root->getObject("memory");
     const auto* streams = root->getObject("streams");
     const auto* throughput = root->getObject("throughput");
+    const auto* externalMemory = root->getObject("external_memory");
     LPUTargetModel model;
 
     // Schema v1 is the shared physical-target format consumed by both the
@@ -365,6 +366,20 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_THROUGHPUT(swiglu_write_latency);
 #undef READ_THROUGHPUT
 
+#define READ_EXTERNAL(field) \
+    read_json_integer(externalMemory, #field, &ExternalMemoryModel::field, \
+        model.external_memory_)
+    READ_EXTERNAL(lpu_clock_mhz);
+    READ_EXTERNAL(ddr_peak_bandwidth_mbytes_per_second);
+    READ_EXTERNAL(ddr_scheduling_efficiency_percent);
+    READ_EXTERNAL(ddr_read_latency_cycles);
+    READ_EXTERNAL(ddr_write_latency_cycles);
+    READ_EXTERNAL(ddr_read_latency_jitter_cycles);
+    READ_EXTERNAL(ddr_write_latency_jitter_cycles);
+    READ_EXTERNAL(ddr_request_queue_depth);
+    READ_EXTERNAL(ddr_latency_random_seed);
+#undef READ_EXTERNAL
+
     if (mlir::failed(model.validate(&error))) return mlir::failure();
     return model;
 }
@@ -401,6 +416,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     const auto memory = target.getAs<mlir::DictionaryAttr>("memory");
     const auto streams = target.getAs<mlir::DictionaryAttr>("streams");
     const auto throughput = target.getAs<mlir::DictionaryAttr>("throughput");
+    const auto externalMemory =
+        target.getAs<mlir::DictionaryAttr>("external_memory");
 #define READ_MEMORY(field) \
     read_attr_integer(memory, #field, &MemoryTopology::field, model.memory_)
     READ_MEMORY(hemispheres);
@@ -474,6 +491,19 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_THROUGHPUT(accumulator_read_to_vxm_latency);
     READ_THROUGHPUT(swiglu_write_latency);
 #undef READ_THROUGHPUT
+#define READ_EXTERNAL(field) \
+    read_attr_integer(externalMemory, #field, &ExternalMemoryModel::field, \
+        model.external_memory_)
+    READ_EXTERNAL(lpu_clock_mhz);
+    READ_EXTERNAL(ddr_peak_bandwidth_mbytes_per_second);
+    READ_EXTERNAL(ddr_scheduling_efficiency_percent);
+    READ_EXTERNAL(ddr_read_latency_cycles);
+    READ_EXTERNAL(ddr_write_latency_cycles);
+    READ_EXTERNAL(ddr_read_latency_jitter_cycles);
+    READ_EXTERNAL(ddr_write_latency_jitter_cycles);
+    READ_EXTERNAL(ddr_request_queue_depth);
+    READ_EXTERNAL(ddr_latency_random_seed);
+#undef READ_EXTERNAL
     std::string error;
     if (mlir::failed(model.validate(&error))) {
         operation->emitError("invalid ftlpu.target configuration: ") << error;
@@ -578,6 +608,17 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(throughput_, accumulator_read_to_vxm_latency),
         I64(throughput_, swiglu_write_latency),
     });
+    const auto externalMemory = builder.getDictionaryAttr({
+        I64(external_memory_, lpu_clock_mhz),
+        I64(external_memory_, ddr_peak_bandwidth_mbytes_per_second),
+        I64(external_memory_, ddr_scheduling_efficiency_percent),
+        I64(external_memory_, ddr_read_latency_cycles),
+        I64(external_memory_, ddr_write_latency_cycles),
+        I64(external_memory_, ddr_read_latency_jitter_cycles),
+        I64(external_memory_, ddr_write_latency_jitter_cycles),
+        I64(external_memory_, ddr_request_queue_depth),
+        I64(external_memory_, ddr_latency_random_seed),
+    });
 #undef I64
     return builder.getDictionaryAttr({
         builder.getNamedAttr("name", builder.getStringAttr(name_)),
@@ -585,6 +626,7 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         builder.getNamedAttr("memory", memory),
         builder.getNamedAttr("streams", streams),
         builder.getNamedAttr("throughput", throughput),
+        builder.getNamedAttr("external_memory", externalMemory),
     });
 }
 
@@ -618,8 +660,20 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             throughput_.qk_iw_to_compute_latency,
             throughput_.mxm_block_rows,
             throughput_.mxm_local_load_to_compute_latency,
-            throughput_.mxm_block_group_interval}))
+            throughput_.mxm_block_group_interval,
+            external_memory_.lpu_clock_mhz,
+            external_memory_.ddr_peak_bandwidth_mbytes_per_second,
+            external_memory_.ddr_scheduling_efficiency_percent,
+            external_memory_.ddr_read_latency_cycles,
+            external_memory_.ddr_write_latency_cycles,
+            external_memory_.ddr_request_queue_depth}))
         return fail("topology dimensions and throughput values must be positive");
+    if (external_memory_.ddr_read_latency_jitter_cycles < 0
+        || external_memory_.ddr_write_latency_jitter_cycles < 0
+        || external_memory_.ddr_latency_random_seed < 0)
+        return fail("external-memory jitter and seed must be non-negative");
+    if (external_memory_.ddr_scheduling_efficiency_percent > 100)
+        return fail("DDR scheduling efficiency must be in [1, 100]");
     if ((throughput_.mxm_local_dequant_enabled != 0
             && throughput_.mxm_local_dequant_enabled != 1)
         || (throughput_.mxm_block_compute_enabled != 0
@@ -740,7 +794,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
 std::uint64_t LPUTargetModel::abi_fingerprint() const
 {
     software::runtime::TargetAbiHasher hash;
-    hash.add(14);
+    hash.add(16);
 #define HASH(field) hash.add(memory_.field)
     HASH(hemispheres);
     HASH(slices_per_hemisphere);
@@ -794,7 +848,34 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
     HASH(swiglu_write_latency);
     HASH(mxm_accumulator_blocks);
 #undef HASH
+#define HASH(field) hash.add(external_memory_.field)
+    HASH(lpu_clock_mhz);
+    HASH(ddr_peak_bandwidth_mbytes_per_second);
+    HASH(ddr_scheduling_efficiency_percent);
+    HASH(ddr_read_latency_cycles);
+    HASH(ddr_write_latency_cycles);
+    HASH(ddr_read_latency_jitter_cycles);
+    HASH(ddr_write_latency_jitter_cycles);
+    HASH(ddr_request_queue_depth);
+    HASH(ddr_latency_random_seed);
+#undef HASH
     return hash.value();
+}
+
+int64_t LPUTargetModel::external_read_transfer_cycles(int64_t bytes) const
+{
+    if (bytes <= 0) return 0;
+    const int64_t c2cBytesPerCycle = memory_.hemispheres
+        * streams_.c2c_streams_per_direction
+        * streams_.c2c_bytes_per_stream_per_cycle;
+    const int64_t c2cCycles = divide_ceil(bytes, c2cBytesPerCycle);
+    const int64_t ddrCycles = divide_ceil(
+        bytes * external_memory_.lpu_clock_mhz * 100,
+        external_memory_.ddr_peak_bandwidth_mbytes_per_second
+            * external_memory_.ddr_scheduling_efficiency_percent);
+    return std::max(c2cCycles, ddrCycles)
+        + external_memory_.ddr_read_latency_cycles
+        + external_memory_.ddr_read_latency_jitter_cycles;
 }
 
 bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destination,
@@ -817,7 +898,9 @@ bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destin
         return direction == StreamDirection::East;
     if (source == StreamEndpoint::MxmResult && destination == StreamEndpoint::Mem)
         return direction == StreamDirection::West;
-    if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::Mem)
+    if ((source == StreamEndpoint::VxmResult
+            || source == StreamEndpoint::VxmBridgeResult)
+        && destination == StreamEndpoint::Mem)
         return direction == StreamDirection::East;
     if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::Mem)
         return direction == StreamDirection::West;
@@ -868,6 +951,7 @@ std::optional<int64_t> LPUTargetModel::stream_source_column(
     case StreamEndpoint::MxmResult:
         return streams_.system_register_columns - 1;
     case StreamEndpoint::VxmResult:
+    case StreamEndpoint::VxmBridgeResult:
         return 0;
     case StreamEndpoint::SxmResult:
         return direction == StreamDirection::East
@@ -904,6 +988,7 @@ std::optional<int64_t> LPUTargetModel::stream_destination_column(
             : streams_.system_register_columns - 1;
     case StreamEndpoint::MxmResult:
     case StreamEndpoint::VxmResult:
+    case StreamEndpoint::VxmBridgeResult:
     case StreamEndpoint::SxmResult:
         return std::nullopt;
     }
@@ -927,7 +1012,9 @@ std::optional<int64_t> LPUTargetModel::route_issue_cycles(StreamEndpoint source,
         return divide_ceil(bytes, 2 * vector_bytes);
     if (source == StreamEndpoint::MxmResult && destination == StreamEndpoint::Mem)
         return divide_ceil(bytes, vector_bytes * throughput_.mxm_result_streams);
-    if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::Mem)
+    if ((source == StreamEndpoint::VxmResult
+            || source == StreamEndpoint::VxmBridgeResult)
+        && destination == StreamEndpoint::Mem)
         return divide_ceil(bytes, vector_bytes);
     return std::nullopt;
 }
@@ -1530,6 +1617,9 @@ std::optional<int64_t> LPUTargetModel::transport_latency(StreamEndpoint source,
         return throughput_.mem_to_sxm_latency - group;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::MxmWeight)
         return 1;
+    if (source == StreamEndpoint::VxmBridgeResult
+        && destination == StreamEndpoint::Mem)
+        return group;
     if (source == StreamEndpoint::SxmResult
         && destination == StreamEndpoint::Mem)
         return streams_.system_register_columns - 2 - group;
@@ -1567,6 +1657,7 @@ std::string_view LPUTargetModel::endpoint_name(StreamEndpoint endpoint)
     case StreamEndpoint::MxmResult: return "MXM.result";
     case StreamEndpoint::VxmInput: return "VXM.input";
     case StreamEndpoint::VxmResult: return "VXM.result";
+    case StreamEndpoint::VxmBridgeResult: return "VXM.bridge_result";
     case StreamEndpoint::SxmInput: return "SXM.input";
     case StreamEndpoint::SxmResult: return "SXM.result";
     }

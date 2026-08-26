@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include "llvm/Support/raw_ostream.h"
 
 namespace ftlpu::compiler::schedule {
 using namespace attention_detail;

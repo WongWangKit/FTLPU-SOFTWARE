@@ -4,12 +4,17 @@
 
 上图将计算 Command IR 中的权重页 `ready/release/bank` 区间与目标配置的 C2C
 带宽放在同一时间轴。实色块是当前可执行文件的 MEM 驻留和 MXM/VXM 计算窗口；
-斜纹块是按每方向 8 条外部 lane、每 lane 32 bytes/cycle 推导的 C2C 预取窗口。
+斜纹块先按每方向 8 条外部 lane、每 lane 32 bytes/cycle 推导 C2C 预取窗口，
+再受 target 中 DDR 源端带宽的限制。
 第 0 页在 ICU cycle 0 前冷启动加载，后续页面在当前 bank 计算时写入另一 bank。
 
 ## 目标
 
 Qwen decoder 层不再要求全部权重同时常驻片上 MEM。runtime 首先通过 C2C 将第 0 层已经量化、并按目标 SRAM 布局打包的权重写入 bank 0。计算第 `i` 层时，MXM 从当前 bank 读取权重；C2C 同时把第 `i+1` 层写入另一 bank。层结束后仅在下一页尚未 ready 时等待，然后交换 bank。
+
+这也是整个模型的外部 I/O 规则：host 只能初始化或读取外部 DDR backing store，
+不能直接修改 LPU MEM。输入、输出、resident 常量、state 初始化和所有权重页都要
+经过 C2C；decoder 层之间的 device-resident alias 属于 LPU 内部数据，不跨外部边界。
 
 ## 物理语义
 
@@ -20,14 +25,15 @@ Qwen decoder 层不再要求全部权重同时常驻片上 MEM。runtime 首先�
 - 计算保持原有 32 条 eastward 和 32 条 westward stream。C2C 对外提供可配置
   的 lane，默认每个方向 8 条，每条每 cycle 搬运一个 32-byte vector，峰值为
   `8 x 32 = 256 bytes/cycle`/方向。
-- C2C RX 将外部 lane 映射到普通 west stream，当前使用 `W24..W31`。数据从
-  C2C/MEM 边界沿共享 SR 传播，最终由目标 slice 的 MEM `Write` 消费，不绕过
-  stream fabric 和 MEM write port。
-- C2C page ready 表示最后一个 MEM write 已经完成，不等同于 DMA 把最后一个 vector 放入 RX FIFO。
+- 当前 `ModelSession` 使用 32 条普通计算 stream 之外的专用 C2C lane。RX 指令携带
+  目标 hemisphere/slice/bank/row，由目标 MEM 接收端提交 SRAM；所有字节仍必须来自
+  DDR DMA 和 C2C 链路，host 不能直接写 LPU MEM。共享-SR 模式仍可选择，此时 lane
+  映射到 `W24..W31`，并由普通 MEM `Write` 消费，但不用于当前细粒度重叠分页。
+- C2C page ready 表示最后一个目标 SRAM 写入已经提交，不等同于 DMA 把最后一个 vector 放入 RX FIFO。
 
 ## 软件表示
 
-Binary v20 在 `BinaryBinding` 和 `BinaryMemoryFloor` 中保存 bank。ModelPackage v5 用 `ModelWeightPage` 描述层号、目标 bank、target-packed tensor，以及每个物理 segment 的 DDR offset、半球、slice、row、vector 数和 stream。
+Binary v24 在 target ABI 中保存 bank 和外部存储参数。ModelPackage v5 用 `ModelWeightPage` 描述层号、目标 bank、target-packed tensor，以及每个物理 segment 的 DDR offset、半球、slice、row、vector 数和 stream。
 
 只有 `TargetPackedSramVectors` tensor 可以作为 C2C page image。`ftlpu-pack-model-weights` 根据 executable binding 把已经量化的 row-major 权重离线重排成目标 SRAM row image；runtime 只负责搬运，不在部署时重新排列大权重。
 
@@ -41,8 +47,8 @@ Binary v20 在 `BinaryBinding` 和 `BinaryMemoryFloor` 中保存 bank。ModelPac
 MXM accumulator 位于功能单元内部，其容量由 `mxm_accumulator_blocks` 描述；任何 MEM slice 都不配置成 accumulator。
 两个 SRAM bank 使用相同的 slice 角色。feedback RMSNorm 将每层 gamma 放在激活区
 两个 slice，每个半球只用两条低编号 west stream，其他数据流也保持在 `W16`
-以下；pager 则保留 `W24..W31`，并写入高编号权重 slice。该显式资源隔离允许两者
-重叠，不依赖 C2C 直写 SRAM 旁路。
+以下；pager 使用独立的专用 C2C lane，并写入高编号权重 slice。stream 和 slice/port
+的双重资源隔离允许权重预取与 RMSNorm 重叠；两条路径都不能绕过 C2C 外部边界。
 
 该分区消除的是传输和端口冲突，并不会增加容量。对于 seq_len=32 的
 Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gate 与 Up
@@ -74,6 +80,11 @@ C2C receive 指令描述一段连续 SRAM row burst。runtime 按目标 slice �
 - `qwen2_5_1_5b_paged_weight_layout_test`：从标准 StableHLO lower 到 Tensor/Stream IR，检查 bank、slice、row 范围和 head-dim 128 的 attention weight row 公式。
 - `build_hf_decoder_stack_paging_test`：检查通用 stack builder 是否编译 bank0/bank1
   两个 variant、将连续层交替绑定到两个 variant，并调用离线 C2C page packing。
+- `model_session_c2c_io_test`：把 32x1536 BF16 tensor 经 DDR、C2C 和 MEM 做
+  往返，并检查不存在 host/MEM 旁路。
+- 真实 Qwen seq_len=32 双层 package 数值通过：49,152 个输出中 6 个容差超限点，
+  P99=0.25、MAE=0.06079；外部 upload/download 各 1 次，device alias 1 次，
+  device copy 0 次。
 
 部署包转换命令：
 
@@ -112,8 +123,8 @@ Schedule/repeat 表示，避免物化巨型 Command MLIR 文本。
 
 prefill 的单层计算窗口较长，具备隐藏下一层权重搬运的机会。decode 的 `M=1` 计算窗口很短，若每层都搬入约几十 MiB 权重，通常会受 DDR/C2C 带宽限制。decode 后续需要更高链路带宽、按 projection/weight wave 更细粒度预取，或增加可常驻权重容量；双 bank 只能实现重叠，不能消除带宽下界。
 
-当前 `seq_len=32` Qwen 整层窗口约为 192,382 cycle，要完全隐藏 47.625 MiB
-权重页，源端持续带宽至少约为 260 bytes/cycle。默认 8-lane C2C 的理论峰值为
-256 bytes/cycle，已经非常接近下界，但协议启动、DDR latency、segment 分布不均和
-bank 冲突会降低持续带宽，因此层边界仍可能有少量等待。`seq_len=128` 的计算窗口
-更长，更适合隐藏整页搬运；短窗口或 decode 仍需要 projection/weight-wave 级分页。
+默认 8-lane C2C 每方向峰值为 256 bytes/cycle，但这不是持续源端速率。默认
+双通道 DDR4-3200 峰值为 51.2 GB/s，在 500 MHz LPU 下等于 102.4 bytes/cycle；
+planner 只按 90% 峰值规划，即 92.16 bytes/cycle。每个读请求的延迟还会在
+35..50 cycle 之间变化。当前真实 seq_len=32 双层运行测得 layer boundary page
+wait 为 4,750 cycle，因此搬运与计算确实发生了重叠，但还没有被完全隐藏。

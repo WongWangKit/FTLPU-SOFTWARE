@@ -461,9 +461,9 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
             == "int8_dequant_bf16"
         ? MxmWeightInputMode::Int8DequantBf16
         : MxmWeightInputMode::Direct16;
-    if (op.getComputeMode().value_or("vector") != "vector")
+    if (op.getComputeMode().value_or("vector") == "block8")
         throw std::runtime_error(
-            "Block8 MXM commands are not supported by this target");
+            "Command IR Block8 compute is not supported by the current CModel");
     const auto kind = is_load ? QueueKind::MxmLoad : QueueKind::MxmCompute;
     const int64_t waveCount = op.getWaveCount().value_or(1);
     const int64_t waveInterval = op.getWaveInterval().value_or(1);
@@ -936,6 +936,47 @@ IcuInductionTarget macro_induction_target(QueueKind kind)
     if (kind == QueueKind::MxmCompute)
         return IcuInductionTarget::MxmAccumulatorAddress;
     return IcuInductionTarget::None;
+}
+
+bool fold_loop_windows_into_macro(
+    std::vector<CommandSequence>& sequences, QueueKind kind)
+{
+    auto candidate = sequences;
+    std::sort(candidate.begin(), candidate.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return lhs.cycle < rhs.cycle;
+        });
+    for (std::size_t index = 0; index < candidate.size();) {
+        if (!candidate[index].is_loop) {
+            ++index;
+            continue;
+        }
+        const CommandSequence loop = candidate[index];
+        if (loop.loop_window_size <= 0 || loop.repeat_count <= 0
+            || loop.repeat_interval < loop.loop_window_size
+            || index < static_cast<std::size_t>(loop.loop_window_size))
+            return false;
+
+        const std::size_t window =
+            static_cast<std::size_t>(loop.loop_window_size);
+        const std::size_t begin = index - window;
+        const int64_t firstCycle = loop.cycle - loop.repeat_interval;
+        for (std::size_t offset = 0; offset < window; ++offset) {
+            auto& sequence = candidate[begin + offset];
+            if (sequence.is_loop || sequence.repeat_count != 1
+                || sequence.outer_count != 1
+                || sequence.cycle
+                    != firstCycle + static_cast<int64_t>(offset))
+                return false;
+            sequence.outer_count = loop.repeat_count + 1;
+            sequence.outer_interval = loop.repeat_interval;
+            sequence.outer_stride = loop.address_stride;
+            sequence.induction_target = macro_induction_target(kind);
+        }
+        candidate.erase(candidate.begin() + index);
+    }
+    sequences = std::move(candidate);
+    return true;
 }
 
 int64_t macro_instruction_stride(const CommandSequence& first,
@@ -1412,18 +1453,20 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
             });
         }
     }
-    if (macroScheduleEnabled) {
+    const bool macroKind = key.first == QueueKind::Mem
+        || key.first == QueueKind::MxmLoad
+        || key.first == QueueKind::MxmCompute
+        || key.first == QueueKind::MxmDequant;
+    const bool macroLoopsFolded = macroScheduleEnabled && macroKind
+        && fold_loop_windows_into_macro(sequences, key.first);
+    if (macroLoopsFolded) {
         compress_interleaved_macro_windows(sequences, key.first);
         std::sort(sequences.begin(), sequences.end(),
             [](const auto& lhs, const auto& rhs) {
                 return lhs.cycle < rhs.cycle;
             });
     }
-    const bool macroQueue = macroScheduleEnabled
-        && (key.first == QueueKind::Mem
-            || key.first == QueueKind::MxmLoad
-            || key.first == QueueKind::MxmCompute
-            || key.first == QueueKind::MxmDequant)
+    const bool macroQueue = macroLoopsFolded
         && std::none_of(sequences.begin(), sequences.end(),
             [](const CommandSequence& sequence) {
                 return sequence.is_loop;
@@ -1728,6 +1771,7 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     const auto& memory = target->memory();
     const auto& streams = target->streams();
     const auto& throughput = target->throughput();
+    const auto& externalMemory = target->external_memory();
 #define COPY_MEMORY(field) \
     hardware.field = static_cast<std::uint32_t>(memory.field)
     COPY_MEMORY(hemispheres);
@@ -1784,6 +1828,18 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     COPY_THROUGHPUT(accumulator_read_to_vxm_latency);
     COPY_THROUGHPUT(swiglu_write_latency);
 #undef COPY_THROUGHPUT
+#define COPY_EXTERNAL(field) \
+    hardware.field = static_cast<std::uint32_t>(externalMemory.field)
+    COPY_EXTERNAL(lpu_clock_mhz);
+    COPY_EXTERNAL(ddr_peak_bandwidth_mbytes_per_second);
+    COPY_EXTERNAL(ddr_scheduling_efficiency_percent);
+    COPY_EXTERNAL(ddr_read_latency_cycles);
+    COPY_EXTERNAL(ddr_write_latency_cycles);
+    COPY_EXTERNAL(ddr_read_latency_jitter_cycles);
+    COPY_EXTERNAL(ddr_write_latency_jitter_cycles);
+    COPY_EXTERNAL(ddr_request_queue_depth);
+    COPY_EXTERNAL(ddr_latency_random_seed);
+#undef COPY_EXTERNAL
     program.memory_floors = static_memory_floors(module,
         target->memory().slices_per_hemisphere,
         target->memory().banks_per_slice,

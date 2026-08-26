@@ -30,6 +30,7 @@ public:
     int64_t queryIwAddress(int64_t head, int64_t reductionBlock,
         int64_t tokenBlock, int64_t phase) const;
     llvm::ArrayRef<int64_t> queryIwSlices(int64_t reductionBlock) const;
+    int64_t rotaryBank(int64_t baseBank, int64_t reductionBlock) const;
     int64_t keyAddress(int64_t kvHead, int64_t reductionBlock,
         int64_t keyBlock) const;
     llvm::ArrayRef<int64_t> keySlices(int64_t reductionBlock) const;
@@ -64,10 +65,20 @@ public:
 
     llvm::ArrayRef<int64_t> weightSlices() const { return weightSlices_; }
     llvm::ArrayRef<int64_t> outputWeightSlices() const { return outputWeightSlices_; }
+    llvm::ArrayRef<int64_t> weightSlices(
+        AttentionProjectionKind projection, int64_t outputBlock) const;
+    llvm::ArrayRef<int64_t> outputWeightSlices(int64_t outputGroup) const;
+    int64_t weightPage(AttentionProjectionKind projection) const;
+    int64_t weightBank(AttentionProjectionKind projection) const;
+    int64_t outputWeightPage() const;
+    int64_t outputWeightBank() const;
     llvm::ArrayRef<int64_t> activationSlices() const { return activationSlices_; }
     llvm::ArrayRef<int64_t> ropeSlices() const { return ropeSlices_; }
     llvm::ArrayRef<int64_t> ropeStagingSlices() const {
         return ropeStagingSlices_;
+    }
+    llvm::ArrayRef<int64_t> ropeProductSlices() const {
+        return ropeProductSlices_;
     }
     llvm::ArrayRef<int64_t> scaledScoreSlices(int64_t localMxm) const {
         return scaledScoreSlices_.at(static_cast<std::size_t>(localMxm));
@@ -96,21 +107,38 @@ public:
     llvm::ArrayRef<int64_t> contextSlices() const { return contextSlices_; }
 
 private:
+    struct WeightPagingLayout {
+        bool enabled = false;
+        int64_t page = -1;
+        int64_t bank = 0;
+        int64_t groupBase = 0;
+        int64_t groupCount = 0;
+        int64_t itemsPerGroup = 0;
+        llvm::SmallVector<int64_t, 32> storageSlices;
+    };
+
     int64_t weightBase(AttentionProjectionKind projection) const;
+    llvm::ArrayRef<int64_t> pagingSlices(
+        const WeightPagingLayout& paging, int64_t item,
+        llvm::ArrayRef<int64_t> fallback) const;
 
     const target::LPUTargetModel& target_;
     int64_t seqLen_ = 0;
     int64_t hidden_ = 0;
+    int64_t queryHeads_ = 0;
     int64_t kvHeads_ = 0;
     int64_t headBlocks_ = 0;
     std::array<int64_t, 3> weightBases_ {};
+    std::array<WeightPagingLayout, 3> weightPaging_ {};
     int64_t outputWeightBase_ = 0;
+    WeightPagingLayout outputWeightPaging_ {};
     std::array<int64_t, 8> weightSlices_ {0, 4, 8, 12, 16, 20, 24, 28};
     std::array<int64_t, 8> outputWeightSlices_ {0, 4, 8, 12, 2, 18, 24, 28};
     std::array<int64_t, 4> activationSlices_ {32, 33, 34, 35};
     std::array<int64_t, 4> keySlices_ {0, 1, 2, 3};
     std::array<int64_t, 4> ropeSlices_ {};
     std::array<int64_t, 16> ropeStagingSlices_ {};
+    std::array<int64_t, 16> ropeProductSlices_ {};
     // Each local MXM owns an independent softmax scratch plane. This permits
     // the two work items in a hemisphere wave to use VXM concurrently.
     std::array<std::array<int64_t, 4>, 2> scaledScoreSlices_ {{{{8, 9, 10, 11}}, {{0, 1, 2, 3}}}};
@@ -127,6 +155,8 @@ private:
     std::array<int64_t, 8> contextSlices_ {44, 45, 46, 47, 48, 49, 50, 51};
     int64_t ropeBase_ = 7000;
     int64_t ropeStagingBase_ = 0;
+    int64_t ropeProductBase_ = 0;
+    int64_t queryIwBase_ = 7600;
     int64_t scaledScoreBase_ = 0;
     int64_t expScoreBase_ = 0;
     int64_t causalMaskBase_ = 8128;

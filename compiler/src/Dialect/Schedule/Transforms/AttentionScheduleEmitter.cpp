@@ -5,6 +5,7 @@
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <utility>

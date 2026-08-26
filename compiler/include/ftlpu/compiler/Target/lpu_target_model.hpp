@@ -28,6 +28,7 @@ enum class StreamEndpoint {
     MxmResult,
     VxmInput,
     VxmResult,
+    VxmBridgeResult,
     SxmInput,
     SxmResult,
 };
@@ -110,6 +111,18 @@ struct ThroughputModel {
     int64_t swiglu_write_latency = 13;
 };
 
+struct ExternalMemoryModel {
+    int64_t lpu_clock_mhz = 500;
+    int64_t ddr_peak_bandwidth_mbytes_per_second = 51200;
+    int64_t ddr_scheduling_efficiency_percent = 90;
+    int64_t ddr_read_latency_cycles = 35;
+    int64_t ddr_write_latency_cycles = 25;
+    int64_t ddr_read_latency_jitter_cycles = 15;
+    int64_t ddr_write_latency_jitter_cycles = 10;
+    int64_t ddr_request_queue_depth = 256;
+    int64_t ddr_latency_random_seed = 0x46544c50;
+};
+
 class LPUTargetModel {
 public:
     LPUTargetModel();
@@ -128,6 +141,11 @@ public:
     const MemoryTopology& memory() const { return memory_; }
     const StreamTopology& streams() const { return streams_; }
     const ThroughputModel& throughput() const { return throughput_; }
+    const ExternalMemoryModel& external_memory() const
+    {
+        return external_memory_;
+    }
+    int64_t external_read_transfer_cycles(int64_t bytes) const;
 
     bool supports_route(StreamEndpoint source, StreamEndpoint destination,
         StreamDirection direction) const;
@@ -229,6 +247,7 @@ private:
     MemoryTopology memory_;
     StreamTopology streams_;
     ThroughputModel throughput_;
+    ExternalMemoryModel external_memory_;
 };
 
 } // namespace ftlpu::compiler::target

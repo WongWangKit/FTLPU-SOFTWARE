@@ -95,7 +95,6 @@ mlir::FailureOr<mlir::Value> schedule::lowerFfnSchedule(
             "failed to create the FFN emission context");
         return mlir::failure();
     }
-
     if ((*context)->block8_projection) {
         auto swish =
             schedule::ffn_detail::emitFfnBlock8ProjectionAndSwish(
@@ -128,7 +127,6 @@ mlir::FailureOr<mlir::Value> schedule::lowerFfnSchedule(
             "failed to emit the FFN projection schedule");
         return mlir::failure();
     }
-
     auto swish = schedule::ffn_detail::emitFfnSwish(
         **context, std::move(*projection));
     if (mlir::failed(swish)) {
@@ -136,7 +134,6 @@ mlir::FailureOr<mlir::Value> schedule::lowerFfnSchedule(
             "failed to emit the FFN Swish schedule");
         return mlir::failure();
     }
-
     auto result = schedule::ffn_detail::emitFfnDownProjection(
         **context, *swish);
     if (mlir::failed(result))

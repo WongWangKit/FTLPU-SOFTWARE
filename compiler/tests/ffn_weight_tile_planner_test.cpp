@@ -44,7 +44,9 @@ try {
         throw std::logic_error("unexpected Qwen FFN page count");
     for (std::size_t index = 0; index < plan->pages.size(); ++index) {
         const auto& page = plan->pages[index];
-        if (page.bank != static_cast<int64_t>(index % 2)
+        const auto bindingPage = index < projectionPages
+            ? index : index - projectionPages;
+        if (page.bank != static_cast<int64_t>(bindingPage % 2)
             || page.rows_per_slice <= 0
             || page.rows_per_slice > plan->bank_rows
             || page.transfer_cycles <= 0)
@@ -57,6 +59,13 @@ try {
         || plan->pages[7].rows_per_slice != 2048
         || plan->pages[7].spans[0].reduction_block_count != 280)
         throw std::logic_error("Down K split does not honor 64 KiB bank");
+    auto bankOnePlan = tensor::planFfnWeightTiles(
+        {32, 1536, 8960, 1536}, target, 1);
+    if (mlir::failed(bankOnePlan)
+        || bankOnePlan->pages[0].bank != 1
+        || bankOnePlan->pages[1].bank != 0
+        || bankOnePlan->pages[projectionPages].bank != 1)
+        throw std::logic_error("FFN page banks ignore the initial bank");
     auto tasks = schedule::buildFfnWeightTileTaskPlan(
         *plan, {32, 1536, 8960, 1536}, target);
     schedule::ResourceScheduler resources;
@@ -73,11 +82,14 @@ try {
             tasks.page_tasks[index].compute];
         if (compute.cycle < previous.end_cycle)
             throw std::logic_error("FFN compute pages overlap one MXM");
-        if (index >= 2) {
+        for (std::size_t previous = index; previous-- > 0;) {
+            if (plan->pages[previous].bank != plan->pages[index].bank)
+                continue;
             const auto& sameBank = (*assignment)[
-                tasks.page_tasks[index - 2].compute];
+                tasks.page_tasks[previous].compute];
             if (prefetch.cycle < sameBank.end_cycle)
                 throw std::logic_error("C2C overwrites a live weight bank");
+            break;
         }
     }
 

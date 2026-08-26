@@ -35,20 +35,23 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     FfnProjectionTimeline result;
     result.weight_load_cycles = tile / throughput.lanes_per_tile;
     result.pipelined_block_interval = target.mxm_block_issue_interval();
+    result.m_tile_count = shape.m / tile;
+    result.projection_slot_interval =
+        (result.m_tile_count - 1) * result.pipelined_block_interval
+        + target.mxm_first_result_latency()
+        + target.mxm_result_window_cycles(tile);
     result.initial_compute_cycle = maxWeightLatency + 1 + tile;
     result.pair_count = shape.hidden
         / ((replicateOutputBlocksAcrossHemispheres
                 ? 1 : memory.hemispheres)
             * tile);
-    result.m_tile_count = shape.m / tile;
     // Gate and Up share the same physical MXM in a one-MXM hemisphere, so
     // their load/compute issue windows are two serial slots regardless of
     // whether output blocks are replicated across hemispheres.
     const int64_t projectionIssueSlots =
         throughput.mxms_per_hemisphere == 1 ? 2 : 1;
     result.weight_block_interval =
-        result.m_tile_count * result.pipelined_block_interval
-        * projectionIssueSlots;
+        result.projection_slot_interval * projectionIssueSlots;
     const int64_t reductionBlocks = shape.k / tile;
     const int64_t totalBlocks = result.pair_count * reductionBlocks;
 
@@ -135,7 +138,7 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
         + (totalBlocks - 1) * result.weight_block_interval
         + (result.pair_count - 1) * tile
         + (result.m_tile_count - 1) * result.pipelined_block_interval
-        + (projectionIssueSlots - 1) * tile;
+        + (projectionIssueSlots - 1) * result.projection_slot_interval;
     result.accumulator_queue_release = std::max(
         throughput.mxm0_accumulator_latency + tile,
         throughput.mxm1_accumulator_latency + tile);

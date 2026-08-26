@@ -551,7 +551,7 @@ int64_t AttentionScheduleEmitter::emitBlock8Projections()
                         lowOutputBlock, highOutputBlock};
                     const auto sourceSlices = layout.ropeStagingSlices();
                     const auto productSlices =
-                        target_.mxm_distributed_activation_slices();
+                        layout.ropeProductSlices();
                     if (productSlices.size() != 16
                         || memory.banks_per_slice < 2) {
                         op_.emitError(
@@ -792,7 +792,9 @@ int64_t AttentionScheduleEmitter::emitBlock8Projections()
                                         source * 8 + half * 2 + byte,
                                         1, 1, 0, "sram", -1,
                                         kind == AttentionProjectionKind::Query
-                                            ? queryBank : keyBank);
+                                            ? layout.rotaryBank(
+                                                  queryBank, reductionBlock)
+                                            : keyBank);
                                     headEnd = std::max(headEnd,
                                         outputCycle + *latency + 1);
                                 }

@@ -81,6 +81,21 @@ host embedding -> LPU decoder stack -> LPU final RMSNorm -> host LM head
 
 `load_file(path)` 使用 lazy executable materialization 读取 package，随后进入同一流程。因此常驻权重在 `load()` 阶段传输，而不是每层传一次。包括 KV cache 在内的 persistent state 不会被 `run()` 自动清零；重新加载 package 才会再次初始化。
 
+### 外部传输约束
+
+LPU MEM 不提供 host 可见的初始化旁路。所有 resident 常量、persistent state
+初始化、动态输入、分页权重和 external output，都必须沿
+`host backing store -> DDR -> C2C DMA -> C2C -> MEM` 或反向路径跨越设备边界。
+`Ddr4Model::initialize_vector/read_vector` 只是 host 访问外部 DDR backing store
+的接口，不会直接读写 LPU SRAM。invocation 之间仍允许 `DeviceAlias`，因为它只是
+延长已经驻留在 LPU 内部的数据生命周期，并未跨越外部边界。
+
+默认 target 建模 500 MHz LPU 和双通道 DDR4-3200：峰值 51.2 GB/s，即每个
+LPU cycle 102.4 bytes；调度按 90% 峰值规划，即 46.08 GB/s、92.16 bytes/cycle。
+读延迟为 35 cycle 加确定性的 0..15 cycle 抖动，写延迟为 25 cycle 加确定性的
+0..10 cycle 抖动。抖动由 request ID、地址、读写方向和 target seed 共同决定，
+因此不同请求的完成 cycle 不同，同时测试可以稳定复现。
+
 ### Run 阶段
 
 `set_input(name, bytes)` 只接受声明为 external input 的 value。`run()` 会清空临时 device-value map，执行 host embedding lookup，按 package 顺序运行 invocation，最后执行 host LM head。每次 invocation 会：

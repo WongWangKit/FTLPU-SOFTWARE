@@ -28,6 +28,18 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
         + throughput.accumulator_to_vxm_latency;
     result.pair_transition_interval =
         2 * tile + throughput.accumulator_to_vxm_latency;
+    result.reduction_interval = projection.weight_block_interval;
+    if (throughput.mxms_per_hemisphere == 1) {
+        // Down0 and Down1 permanently occupy the two physical weight
+        // buffers. The next reduction may start loading Down1 only after the
+        // current Down1 has consumed all activation rows and the last row has
+        // crossed the MXM column pipeline.
+        result.reduction_interval = std::max(
+            result.reduction_interval,
+            projection.projection_slot_interval + 2 * tile
+                - projection.weight_load_cycles
+                + target.mxm_first_result_latency());
+    }
     for (int64_t resultSlice : resultSlices) {
         if (std::find(weightSlices.begin(), weightSlices.end(), resultSlice)
             == weightSlices.end())
@@ -41,6 +53,8 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
             std::max(result.pair_transition_interval,
                 lastWriteEnd + tile + westLatency(resultSlice));
     }
+    result.pair_transition_interval = std::max(
+        result.pair_transition_interval, result.reduction_interval);
 
     result.reduction_block_count = shape.hidden / tile;
     // Vector FFN keeps two logical 32-column output slots per hemisphere.
@@ -136,8 +150,7 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
                             * projection.pipelined_block_interval
                         + result.pair_transition_interval;
             } else {
-                computeCycle += projection.weight_block_interval
-                    + (projection.m_tile_count > 1 ? 0 : tile);
+                computeCycle += result.reduction_interval;
             }
         }
     }

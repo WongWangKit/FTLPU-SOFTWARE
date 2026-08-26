@@ -174,11 +174,19 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
     }
 
     const auto lhsPlacement =
-        allocationPlacement(op.getLhsAllocations(), 0);
+        allocationPlacement(op.getLhsAllocations(),
+            op.getLhsAllocations().size() > 1
+                ? op.getLhsAllocations().size() - 1 : 0);
     const auto rhsPlacement =
-        allocationPlacement(op.getRhsAllocations(), 0);
+        allocationPlacement(op.getRhsAllocations(),
+            op.getRhsAllocations().size() > 1
+                ? op.getRhsAllocations().size() - 1 : 0);
     const auto resultPlacement =
         allocationPlacement(op.getResultAllocations(), 0);
+    const auto persistentResultPlacement =
+        op.getResultAllocations().size() > 1
+        ? allocationPlacement(op.getResultAllocations(), 1)
+        : mlir::DictionaryAttr {};
     const auto resultKind =
         resultPlacement.getAs<mlir::StringAttr>("kind").getValue();
     const auto resultSlices = placementSlices(resultPlacement);
@@ -205,6 +213,15 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
         return target.transport_latency(target::StreamEndpoint::VxmResult,
             target::StreamEndpoint::Mem,
             target::StreamDirection::East, slice).value();
+    };
+    const auto bridgeWriteLatency = [&](int64_t slice) {
+        return target.transport_latency(
+            target::StreamEndpoint::VxmBridgeResult,
+            target::StreamEndpoint::Mem,
+            target::StreamDirection::East, slice).value();
+    };
+    const auto passiveReadLatency = [&](int64_t slice) {
+        return westLatency(slice) + 1;
     };
 
     rewriter.setInsertionPoint(op);
@@ -340,11 +357,36 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             secondOutputCycle = secondVxmCycle + 1;
         }
         if (resultDistributed) {
+            const int64_t validOutputHemisphere = 1 - hemisphere;
+            const int64_t mirrorOutputHemisphere = hemisphere;
+            auto persistent = persistentResultPlacement
+                ? tileAddress(persistentResultPlacement, block, rows,
+                      validOutputHemisphere, target)
+                : mlir::FailureOr<TileAddress>(mlir::failure());
+            if (persistentResultPlacement && mlir::failed(persistent))
+                return op.emitError(
+                    "invalid persistent elementwise result layout");
+            const bool persistentOnValidOutput =
+                persistentResultPlacement
+                && persistent->hemisphere == validOutputHemisphere;
+            const bool persistentOnMirrorOutput =
+                persistentResultPlacement
+                && persistent->hemisphere == mirrorOutputHemisphere;
+            if (persistentResultPlacement
+                && !persistentOnValidOutput
+                && !persistentOnMirrorOutput)
+                return op.emitError(
+                    "persistent elementwise result hemisphere is not "
+                    "reachable from either VXM output");
+            int64_t activeWriteEnd = vxmCycle;
             for (int64_t outputHemisphere = 0;
                  outputHemisphere < target.memory().hemispheres;
                  ++outputHemisphere) {
                 const int64_t streamBase =
                     outputHemisphere == 0 ? 8 : 0;
+                const bool preserveValidOutput =
+                    persistentOnValidOutput
+                    && outputHemisphere == validOutputHemisphere;
                 for (int64_t row = 0; row < rows; ++row) {
                     auto output = distributedAddress(resultPlacement,
                         block, row, columnBlocks, outputHemisphere);
@@ -352,20 +394,115 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                         return op.emitError(
                             "invalid distributed elementwise result");
                     for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t writeCycle = vxmCycle + 1 + row
+                            + eastLatency(output->slices[byte]);
                         emitMem(rewriter, op.getLoc(),
-                            vxmCycle + 1 + row
-                                + eastLatency(output->slices[byte]),
+                            writeCycle,
                             outputHemisphere
                                     * target.memory()
                                           .slices_per_hemisphere
                                 + output->slices[byte],
-                            "write", output->row,
+                            preserveValidOutput ? "write_tap" : "write",
+                            output->row,
                             streamBase + byte, 1, 1, 1,
                             "sram", -1, output->bank);
+                        activeWriteEnd =
+                            std::max(activeWriteEnd, writeCycle + 1);
+                        if (preserveValidOutput) {
+                            const int64_t persistentWriteCycle =
+                                vxmCycle + 1 + row
+                                + eastLatency(
+                                    persistent->slices[byte]);
+                            emitMem(rewriter, op.getLoc(),
+                                persistentWriteCycle,
+                                validOutputHemisphere
+                                        * target.memory()
+                                              .slices_per_hemisphere
+                                    + persistent->slices[byte],
+                                "write", persistent->row + row,
+                                streamBase + byte, 1, 1, 1,
+                                "sram", -1, persistent->bank);
+                            activeWriteEnd = std::max(activeWriteEnd,
+                                persistentWriteCycle + 1);
+                        }
                     }
                 }
             }
-            cycle += rows + 2 + eastLatency(resultSlices.back());
+
+            const bool operandsMirrored = isDistributed16(lhsPlacement)
+                && isDistributed16(rhsPlacement);
+            if (!operandsMirrored) {
+                // A logical VXM instruction drives both physical chains. If
+                // one operand is hemisphere-local, only that hemisphere's
+                // chain produces a valid result. Bridge it to the other side
+                // so distributed16 remains physically mirrored.
+                constexpr int64_t bridgeStream = 20;
+                int64_t maximumReadLatency = 0;
+                for (int64_t slice : resultSlices)
+                    maximumReadLatency = std::max(
+                        maximumReadLatency, passiveReadLatency(slice));
+                const int64_t bridgeCycle =
+                    activeWriteEnd + maximumReadLatency;
+                int64_t bridgeEnd = bridgeCycle;
+                for (int64_t row = 0; row < rows; ++row) {
+                    auto source = distributedAddress(resultPlacement,
+                        block, row, columnBlocks,
+                        validOutputHemisphere);
+                    auto mirror = distributedAddress(resultPlacement,
+                        block, row, columnBlocks,
+                        mirrorOutputHemisphere);
+                    if (mlir::failed(source) || mlir::failed(mirror))
+                        return op.emitError(
+                            "invalid distributed elementwise mirror");
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        emitMem(rewriter, op.getLoc(),
+                            bridgeCycle + row
+                                - passiveReadLatency(
+                                    source->slices[byte]),
+                            validOutputHemisphere
+                                    * target.memory()
+                                          .slices_per_hemisphere
+                                + source->slices[byte],
+                            "read", source->row,
+                            32 + bridgeStream + byte, 1, 1, 1,
+                            "sram", -1, source->bank);
+                        const int64_t mirrorWriteCycle = bridgeCycle + row
+                            + bridgeWriteLatency(mirror->slices[byte]);
+                        emitMem(rewriter, op.getLoc(), mirrorWriteCycle,
+                            mirrorOutputHemisphere
+                                    * target.memory()
+                                          .slices_per_hemisphere
+                                + mirror->slices[byte],
+                            persistentOnMirrorOutput
+                                ? "write_tap" : "write",
+                            mirror->row,
+                            bridgeStream + byte, 1, 1, 1,
+                            "sram", -1, mirror->bank);
+                        bridgeEnd = std::max(
+                            bridgeEnd, mirrorWriteCycle + 1);
+                        if (persistentOnMirrorOutput) {
+                            const int64_t persistentWriteCycle =
+                                bridgeCycle + row
+                                + bridgeWriteLatency(
+                                    persistent->slices[byte]);
+                            emitMem(rewriter, op.getLoc(),
+                                persistentWriteCycle,
+                                mirrorOutputHemisphere
+                                        * target.memory()
+                                              .slices_per_hemisphere
+                                    + persistent->slices[byte],
+                                "write", persistent->row + row,
+                                bridgeStream + byte, 1, 1, 1,
+                                "sram", -1, persistent->bank);
+                            bridgeEnd = std::max(
+                                bridgeEnd, persistentWriteCycle + 1);
+                        }
+                    }
+                }
+                cycle = bridgeEnd + 1;
+            } else {
+                cycle = activeWriteEnd + 1;
+            }
             continue;
         }
         const int64_t firstOutputHemisphere =

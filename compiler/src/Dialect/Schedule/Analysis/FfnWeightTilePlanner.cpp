@@ -49,11 +49,12 @@ FfnWeightTileTaskPlan buildFfnWeightTileTaskPlan(
             (void)result.tasks.addDependency(previous.prefetch, prefetch);
             (void)result.tasks.addDependency(previous.compute, compute);
         }
-        if (result.page_tasks.size() >= 2) {
-            const auto previousSameBank =
-                result.page_tasks[result.page_tasks.size() - 2];
+        for (std::size_t previous = result.page_tasks.size();
+             previous-- > 0;) {
+            if (tiles.pages[previous].bank != page.bank) continue;
             (void)result.tasks.addDependency(
-                previousSameBank.compute, prefetch);
+                result.page_tasks[previous].compute, prefetch);
+            break;
         }
         result.page_tasks.push_back({prefetch, compute});
     }

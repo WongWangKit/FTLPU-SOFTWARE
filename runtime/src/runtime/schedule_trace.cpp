@@ -1,5 +1,7 @@
 #include "ftlpu/software/runtime/schedule_trace.hpp"
 
+#include "ftlpu/software/runtime/weight_prefetch_plan.hpp"
+
 #include "ftlpu/core/instruction_codec.hpp"
 
 #include <algorithm>
@@ -50,11 +52,16 @@ struct EventDescription {
 };
 
 EventDescription describe(const QueueProgram& queue, const QueueCommand& command,
-    std::int64_t address_delta, std::size_t mxms_per_hemisphere)
+    std::int64_t address_delta, std::size_t mxms_per_hemisphere,
+    IcuInductionTarget induction_target = IcuInductionTarget::None)
 {
     const auto east = queue.index < InstructionControlUnit::kMemQueuesPerHemisphere;
     switch (queue.kind) {
     case QueueKind::Mem: {
+        if (induction_target != IcuInductionTarget::None
+            && induction_target != IcuInductionTarget::MemAddress)
+            throw std::logic_error(
+                "runtime trace has a non-MEM induction target on a MEM queue");
         const std::size_t localQueue =
             queue.index % InstructionControlUnit::kMemQueuesPerHemisphere;
         const std::size_t slice = localQueue / hw::kMemBanksPerSlice;
@@ -62,7 +69,11 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
         const auto encoded = static_cast<isa::EncodedMemInstruction>(command.words[0])
             | (static_cast<isa::EncodedMemInstruction>(command.words[1]) << 32);
         auto instruction = isa::decode_mem_instruction(encoded);
-        const auto address = static_cast<std::int64_t>(instruction.address) + address_delta;
+        const auto address =
+            static_cast<std::int64_t>(instruction.address) + address_delta;
+        if (address < 0)
+            throw std::logic_error(
+                "runtime trace MEM induction underflows the address");
         std::ostringstream detail;
         detail << "slice=" << slice << " bank=" << bank
                << " addr=" << address << " stream=" << stream_name(instruction.stream);
@@ -78,7 +89,45 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
             static_cast<isa::EncodedMxmInstruction>(command.words[0])
             | (static_cast<isa::EncodedMxmInstruction>(command.words[1])
                 << 32);
-        const auto instruction = isa::decode_mxm_instruction(encoded);
+        auto instruction = isa::decode_mxm_instruction(encoded);
+        auto target = induction_target;
+        // Repeat and Loop predate explicit induction targets. Preserve their
+        // opcode-selected MXM stride semantics while honoring the typed target
+        // carried by Repeat2D and macro schedule commands.
+        if (target == IcuInductionTarget::None && address_delta != 0) {
+            target = instruction.opcode == MxmControlOpcode::IW
+                ? IcuInductionTarget::MxmWeightColumn
+                : IcuInductionTarget::MxmAccumulatorAddress;
+        }
+        if (target == IcuInductionTarget::MxmWeightColumn) {
+            if (instruction.opcode != MxmControlOpcode::IW)
+                throw std::logic_error(
+                    "runtime trace MXM column induction requires IW");
+            const auto column =
+                static_cast<std::int64_t>(instruction.weight_column)
+                + address_delta;
+            if (column < 0
+                || column >= static_cast<std::int64_t>(hw::kMxmColumns))
+                throw std::logic_error(
+                    "runtime trace MXM column induction is out of range");
+            instruction.weight_column = static_cast<std::size_t>(column);
+        } else if (target == IcuInductionTarget::MxmAccumulatorAddress) {
+            if (instruction.opcode != MxmControlOpcode::Compute
+                && instruction.opcode != MxmControlOpcode::AccumulatorRead)
+                throw std::logic_error(
+                    "runtime trace MXM accumulator induction requires compute or accumulator-read");
+            const auto address =
+                static_cast<std::int64_t>(instruction.accumulator_address)
+                + address_delta;
+            if (address < 0)
+                throw std::logic_error(
+                    "runtime trace MXM accumulator induction underflows the address");
+            instruction.accumulator_address =
+                static_cast<std::size_t>(address);
+        } else if (target != IcuInductionTarget::None) {
+            throw std::logic_error(
+                "runtime trace has a non-MXM induction target on an MXM queue");
+        }
         const auto per_hemisphere = mxms_per_hemisphere;
         const auto side = queue.index < per_hemisphere ? "E" : "W";
         std::ostringstream detail;
@@ -113,6 +162,10 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
                 + (queue.kind == QueueKind::MxmLoad ? ".Load" : ".Compute"), detail.str()};
     }
     case QueueKind::MxmDequant: {
+        if (induction_target != IcuInductionTarget::None
+            || address_delta != 0)
+            throw std::logic_error(
+                "runtime trace cannot induct an MXM dequant instruction");
         const auto instruction =
             isa::decode_mxm_dequant_instruction(
                 static_cast<isa::EncodedMxmDequantInstruction>(
@@ -128,6 +181,10 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
             detail.str()};
     }
     case QueueKind::Vxm: {
+        if (induction_target != IcuInductionTarget::None
+            || address_delta != 0)
+            throw std::logic_error(
+                "runtime trace cannot induct a VXM instruction");
         const auto decoded = isa::decode_vxm_instruction(queue.index,
             isa::EncodedVxmInstruction {
                 static_cast<std::uint64_t>(command.words[0])
@@ -143,9 +200,17 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
         return {"VXM.C" + std::to_string(queue.index), detail.str()};
     }
     case QueueKind::SxmTranspose:
+        if (induction_target != IcuInductionTarget::None
+            || address_delta != 0)
+            throw std::logic_error(
+                "runtime trace cannot induct an SXM transpose instruction");
         return {std::string("SXM.") + (queue.index == 0 ? "E.Transpose" : "W.Transpose"),
             "transpose"};
     case QueueKind::SxmPermute:
+        if (induction_target != IcuInductionTarget::None
+            || address_delta != 0)
+            throw std::logic_error(
+                "runtime trace cannot induct an SXM permute instruction");
         return {std::string("SXM.") + (queue.index == 0 ? "E.Permute" : "W.Permute"),
             "permute"};
     }
@@ -166,15 +231,6 @@ void write_event(std::ostream& output, std::int64_t start, std::int64_t end,
            << csv_field(detail) << '\n';
 }
 
-struct WeightPrefetch {
-    std::uint32_t page{0};
-    std::uint16_t bank{0};
-    std::uint64_t ready{std::numeric_limits<std::uint64_t>::max()};
-    std::uint64_t release{0};
-    std::array<std::uint64_t, 2> bytes{};
-    std::vector<std::string> bindings{};
-};
-
 const BinaryBinding& find_paged_weight(
     const BinaryProgram& program, std::uint32_t index)
 {
@@ -189,34 +245,6 @@ const BinaryBinding& find_paged_weight(
     return *found;
 }
 
-std::uint64_t page_byte_size(
-    const BinaryBinding& binding, std::uint32_t page)
-{
-    if (binding.page_count == 0 || page >= binding.page_count)
-        throw std::logic_error("weight-page trace index is out of range");
-    const auto quotient = binding.byte_size / binding.page_count;
-    const auto remainder = binding.byte_size % binding.page_count;
-    return quotient + (page < remainder ? 1 : 0);
-}
-
-void add_binding_bytes(WeightPrefetch& prefetch,
-    const BinaryBinding& binding, std::uint64_t bytes)
-{
-    const bool east = (binding.hemisphere_mask & 1u) != 0;
-    const bool west = (binding.hemisphere_mask & 2u) != 0;
-    const std::uint64_t sideCount = static_cast<std::uint64_t>(east)
-        + static_cast<std::uint64_t>(west);
-    if (sideCount == 0)
-        throw std::logic_error(
-            "paged weight binding has an empty hemisphere mask");
-    const auto quotient = bytes / sideCount;
-    const auto remainder = bytes % sideCount;
-    if (east) prefetch.bytes[0] += quotient + (remainder != 0 ? 1 : 0);
-    if (west) prefetch.bytes[1] += quotient;
-    prefetch.bindings.push_back(binding.name.empty()
-        ? std::to_string(binding.index) : binding.name);
-}
-
 void write_weight_prefetches(
     std::ostream& output, const BinaryProgram& program)
 {
@@ -229,58 +257,33 @@ void write_weight_prefetches(
         throw std::logic_error(
             "paged weight trace requires non-zero C2C bandwidth");
 
-    std::vector<const BinaryWeightPageUse*> ordered;
-    ordered.reserve(program.weight_page_uses.size());
-    for (const auto& use : program.weight_page_uses)
-        ordered.push_back(&use);
-    std::ranges::sort(ordered, [](const auto* lhs, const auto* rhs) {
-        return lhs->ready_cycle < rhs->ready_cycle;
-    });
-
-    std::vector<WeightPrefetch> prefetches;
-    for (const auto* use : ordered) {
-        const auto& binding = find_paged_weight(program, use->binding_index);
-        auto found = std::ranges::find_if(prefetches,
-            [use](const WeightPrefetch& candidate) {
-                return candidate.page == use->page_index
-                    && candidate.bank == use->bank
-                    && use->ready_cycle <= candidate.release
-                    && candidate.ready <= use->release_cycle;
-            });
-        if (found == prefetches.end()) {
-            prefetches.push_back(WeightPrefetch {
-                use->page_index, use->bank, use->ready_cycle,
-                use->release_cycle, {}, {}});
-            found = std::prev(prefetches.end());
-        } else {
-            found->ready = std::min(found->ready, use->ready_cycle);
-            found->release = std::max(found->release, use->release_cycle);
-        }
-        add_binding_bytes(
-            *found, binding, page_byte_size(binding, use->page_index));
-    }
-
     const std::uint64_t bandwidth = lanes * bytesPerLane;
-    for (const auto& prefetch : prefetches) {
+    for (const auto& prefetch : plan_weight_prefetches(program)) {
+        std::vector<std::string> bindings;
+        for (const std::size_t useIndex : prefetch.use_indices) {
+            const auto& use = program.weight_page_uses[useIndex];
+            const auto& binding =
+                find_paged_weight(program, use.binding_index);
+            bindings.push_back(binding.name.empty()
+                ? std::to_string(binding.index) : binding.name);
+        }
         for (std::size_t side = 0; side < prefetch.bytes.size(); ++side) {
             if (prefetch.bytes[side] == 0) continue;
-            const std::uint64_t duration =
-                (prefetch.bytes[side] + bandwidth - 1) / bandwidth;
-            const auto ready = static_cast<std::int64_t>(prefetch.ready);
             std::ostringstream detail;
-            detail << "page=" << prefetch.page
+            detail << "page=" << prefetch.page_index
                    << " bank=" << prefetch.bank << " bindings=";
-            for (std::size_t index = 0;
-                 index < prefetch.bindings.size(); ++index) {
+            for (std::size_t index = 0; index < bindings.size(); ++index) {
                 if (index != 0) detail << '+';
-                detail << prefetch.bindings[index];
+                detail << bindings[index];
             }
             detail << " bytes=" << prefetch.bytes[side]
                    << " lanes=" << lanes
                    << " bandwidth=" << bandwidth
-                   << "B/cycle planned=true";
+                   << "B/cycle deadline=" << prefetch.ready_cycle
+                   << " scheduled=true";
             write_event(output,
-                ready - static_cast<std::int64_t>(duration), ready,
+                static_cast<std::int64_t>(prefetch.start_cycle),
+                static_cast<std::int64_t>(prefetch.transfer_end_cycle),
                 {std::string("C2C.") + (side == 0 ? "E" : "W")
                         + ".Prefetch",
                     detail.str()});
@@ -319,7 +322,8 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
                                 * macro.inner_stride;
                         write_event(output, cycle, cycle + 1,
                             describe(queue, command, delta,
-                                program.hardware.mxms_per_hemisphere));
+                                program.hardware.mxms_per_hemisphere,
+                                macro.induction_target));
                     }
                 }
                 cursor = std::max(cursor, macro.start_cycle
@@ -347,7 +351,8 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
                                 * repeat.inner_stride;
                         write_event(output, cycle, cycle + 1,
                             describe(queue, *previous, delta,
-                                program.hardware.mxms_per_hemisphere));
+                                program.hardware.mxms_per_hemisphere,
+                                repeat.induction_target));
                     }
                 }
                 cursor = previous_cycle

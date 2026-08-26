@@ -15,6 +15,91 @@ C2cWeightPager::C2cWeightPager(C2cDmaSystem& system)
 {
 }
 
+void C2cWeightPager::begin_schedule()
+{
+    if (active_ && !ready())
+        throw std::logic_error(
+            "cannot schedule executable pages while a page is in flight");
+    if (active_) retire();
+    schedule_dma_cursor_ = {};
+    schedule_rx_cursor_ = {};
+    scheduled_rx_segments_ = {};
+}
+
+C2cWeightPageFence C2cWeightPager::schedule(
+    const C2cWeightPage& page, std::size_t start_cycle)
+{
+    auto& chip = system_.chip();
+    const auto& hardware = chip.hardware_configuration();
+    if (!hardware.c2c_dedicated_streams)
+        throw std::logic_error(
+            "executable C2C pages require the dedicated stream fabric");
+    if (page.bank >= hw::kMemBanksPerSlice || page.segments.empty())
+        throw std::invalid_argument("invalid executable C2C weight page");
+
+    C2cWeightPageFence fence;
+    fence.completed_segments = scheduled_rx_segments_;
+    for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
+        const auto hemisphere = static_cast<Hemisphere>(side);
+        const auto segmentCount = static_cast<std::size_t>(std::count_if(
+            page.segments.begin(), page.segments.end(),
+            [&](const C2cWeightSegment& segment) {
+                return hemisphere_index(segment.hemisphere) == side;
+            }));
+        if (segmentCount == 0) continue;
+        if (start_cycle < schedule_dma_cursor_[side]
+            || start_cycle < schedule_rx_cursor_[side])
+            throw std::logic_error(
+                "executable C2C page schedule overlaps an ICU queue");
+        chip.icu().enqueue_c2c_dma_nop(
+            hemisphere, start_cycle - schedule_dma_cursor_[side]);
+        chip.icu().enqueue_c2c_rx_nop(
+            hemisphere, start_cycle - schedule_rx_cursor_[side]);
+        schedule_dma_cursor_[side] = start_cycle;
+        schedule_rx_cursor_[side] = start_cycle;
+
+        for (const C2cWeightSegment& segment : page.segments) {
+            if (hemisphere_index(segment.hemisphere) != side) continue;
+            if (segment.bank != page.bank
+                || segment.slice >= hw::kMemSliceColumns
+                || segment.vector_count == 0
+                || static_cast<std::uint64_t>(segment.base_row)
+                        + segment.vector_count
+                    > hardware.sram_depth_rows)
+                throw std::invalid_argument(
+                    "invalid executable C2C weight-page segment");
+            const auto lane = segment.stream
+                % hardware.c2c_streams_per_direction;
+            chip.icu().enqueue_c2c_dma(hemisphere,
+                C2cDmaInstruction::Load(segment.ddr4_address,
+                    segment.vector_count, hw::kPhysicalVectorBytes, 0,
+                    lane));
+            chip.icu().enqueue_c2c_receive(hemisphere, lane,
+                segment.hemisphere, segment.slice, segment.bank, false,
+                segment.base_row, segment.vector_count, 1, lane);
+            ++scheduled_rx_segments_[side][lane];
+            fence.completed_segments[side][lane] =
+                scheduled_rx_segments_[side][lane];
+        }
+        schedule_dma_cursor_[side] += segmentCount;
+        schedule_rx_cursor_[side] += segmentCount;
+    }
+    return fence;
+}
+
+bool C2cWeightPager::ready(const C2cWeightPageFence& fence) const
+{
+    const auto& chip = system_.chip();
+    for (std::size_t side = 0; side < hw::kHemispheres; ++side)
+        for (std::size_t stream = 0;
+             stream < hw::kC2cStreamsPerDirection; ++stream)
+            if (chip.c2c_endpoint(static_cast<Hemisphere>(side))
+                    .rx().completed_instruction_count(stream)
+                < fence.completed_segments[side][stream])
+                return false;
+    return true;
+}
+
 void C2cWeightPager::enqueue(const C2cWeightPage& page)
 {
     if (active_ && !ready())
@@ -47,7 +132,12 @@ void C2cWeightPager::enqueue(const C2cWeightPage& page)
         if (static_cast<std::uint64_t>(segment.base_row)
                 + segment.vector_count
             > chip.hardware_configuration().sram_depth_rows)
-            throw std::out_of_range("C2C weight segment exceeds its SRAM bank");
+            throw std::out_of_range(
+                "C2C weight segment exceeds its SRAM bank: base="
+                + std::to_string(segment.base_row)
+                + " vectors=" + std::to_string(segment.vector_count)
+                + " depth=" + std::to_string(
+                    chip.hardware_configuration().sram_depth_rows));
 
         const auto side = hemisphere_index(segment.hemisphere);
         usedHemisphere[side] = true;
@@ -123,6 +213,16 @@ bool C2cWeightPager::ready() const
     for (const auto queue : target_mem_queues_)
         if (!chip.icu().mem_iq(queue).done()) return false;
     return drain_cycles_ >= hw::kTileRows;
+}
+
+void C2cWeightPager::retire()
+{
+    if (!active_ || !ready())
+        throw std::logic_error(
+            "cannot retire an incomplete C2C weight page");
+    active_ = false;
+    target_mem_queues_.clear();
+    drain_cycles_ = 0;
 }
 
 void C2cWeightPager::tick()

@@ -7,14 +7,34 @@ namespace ftlpu::compiler::schedule {
 AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     const target::LPUTargetModel& target)
     : target_(target), seqLen_(op.getSeqLen()), hidden_(op.getHidden()),
-      kvHeads_(op.getKvHeads()),
+      queryHeads_(op.getQueryHeads()), kvHeads_(op.getKvHeads()),
       headBlocks_(op.getHeadDim() / target.throughput().mxm_rows)
 {
     const auto plan = op.getMemoryPlan();
+    const auto readPaging = [&](mlir::DictionaryAttr placement,
+                                WeightPagingLayout& paging) {
+        const auto paged = placement.getAs<mlir::BoolAttr>("paged_weight");
+        if (!paged || !paged.getValue()) return;
+        paging.enabled = true;
+        paging.page = 0;
+        paging.bank = placement.getAs<mlir::IntegerAttr>("bank").getInt();
+        paging.groupBase = placement
+            .getAs<mlir::IntegerAttr>("page_role_group_base").getInt();
+        paging.groupCount = placement
+            .getAs<mlir::IntegerAttr>("page_role_group_count").getInt();
+        paging.itemsPerGroup = placement
+            .getAs<mlir::IntegerAttr>(
+                "page_items_per_slice_group").getInt();
+        for (mlir::Attribute slice :
+             placement.getAs<mlir::ArrayAttr>("page_storage_slices"))
+            paging.storageSlices.push_back(
+                llvm::cast<mlir::IntegerAttr>(slice).getInt());
+    };
     const char* names[] = {"query_weight", "key_weight", "value_weight"};
     for (std::size_t i = 0; i < weightBases_.size(); ++i) {
         const auto placement = plan.getAs<mlir::DictionaryAttr>(names[i]);
         weightBases_[i] = placement.getAs<mlir::IntegerAttr>("base_row").getInt();
+        readPaging(placement, weightPaging_[i]);
         if (i == 0) {
             const auto slices = placement.getAs<mlir::ArrayAttr>("slices");
             for (std::size_t lane = 0; lane < weightSlices_.size(); ++lane)
@@ -36,6 +56,7 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     }
     if (const auto weight = plan.getAs<mlir::DictionaryAttr>("output_weight")) {
         outputWeightBase_ = weight.getAs<mlir::IntegerAttr>("base_row").getInt();
+        readPaging(weight, outputWeightPaging_);
         const auto slices = weight.getAs<mlir::ArrayAttr>("slices");
         for (std::size_t i = 0; i < outputWeightSlices_.size(); ++i)
             outputWeightSlices_[i] = llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
@@ -56,6 +77,15 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
             ropeStagingSlices_[i] =
                 llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
     }
+    if (const auto product =
+            plan.getAs<mlir::DictionaryAttr>("rope_product")) {
+        ropeProductBase_ =
+            product.getAs<mlir::IntegerAttr>("base_row").getInt();
+        const auto slices = product.getAs<mlir::ArrayAttr>("slices");
+        for (std::size_t i = 0; i < ropeProductSlices_.size(); ++i)
+            ropeProductSlices_[i] =
+                llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
+    }
     const auto readPlacement = [&](llvm::StringRef name, auto& slices, int64_t& base) {
         const auto placement = plan.getAs<mlir::DictionaryAttr>(name);
         base = placement.getAs<mlir::IntegerAttr>("base_row").getInt();
@@ -72,6 +102,8 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     readPlacement("causal_mask_mxm1", causalMaskSlices_[1], ignoredBase);
     readPlacement("probability_pack", probabilityPackSlices_, probabilityPackBase_);
     readPlacement("probability_diagonal", probabilityDiagonalSlices_, probabilityDiagonalBase_);
+    if (const auto query = plan.getAs<mlir::DictionaryAttr>("query"))
+        queryIwBase_ = query.getAs<mlir::IntegerAttr>("base_row").getInt();
     if (const auto value = plan.getAs<mlir::DictionaryAttr>("value")) {
         valuePackBase_ = value.getAs<mlir::IntegerAttr>("base_row").getInt();
         const auto slices = value.getAs<mlir::ArrayAttr>("slices");
@@ -98,9 +130,50 @@ int64_t AttentionMemoryLayout::weightAddress(AttentionProjectionKind projection,
     int64_t column) const
 {
     const int64_t hiddenBlocks = hidden_ / target_.throughput().mxm_rows;
+    const auto& paging = weightPaging_[static_cast<std::size_t>(projection)];
+    const int64_t item = outputBlock / 4;
+    const int64_t localItem = paging.enabled
+        ? item % paging.itemsPerGroup : item;
     return weightBase(projection)
-        + ((outputBlock / 4) * hiddenBlocks + reductionBlock) * 8
+        + (localItem * hiddenBlocks + reductionBlock) * 8
         + localMxm * 4 + column;
+}
+
+llvm::ArrayRef<int64_t> AttentionMemoryLayout::pagingSlices(
+    const WeightPagingLayout& paging, int64_t item,
+    llvm::ArrayRef<int64_t> fallback) const
+{
+    if (!paging.enabled) return fallback;
+    const int64_t group = paging.groupBase
+        + item / paging.itemsPerGroup;
+    const int64_t groupSize = static_cast<int64_t>(fallback.size());
+    if (group < paging.groupBase
+        || group >= paging.groupBase + paging.groupCount
+        || (group + 1) * groupSize
+            > static_cast<int64_t>(paging.storageSlices.size()))
+        return {};
+    return llvm::ArrayRef<int64_t>(paging.storageSlices)
+        .slice(group * groupSize, groupSize);
+}
+
+llvm::ArrayRef<int64_t> AttentionMemoryLayout::weightSlices(
+    AttentionProjectionKind projection, int64_t outputBlock) const
+{
+    return pagingSlices(
+        weightPaging_[static_cast<std::size_t>(projection)],
+        outputBlock / 4, weightSlices_);
+}
+
+int64_t AttentionMemoryLayout::weightPage(
+    AttentionProjectionKind projection) const
+{
+    return weightPaging_[static_cast<std::size_t>(projection)].page;
+}
+
+int64_t AttentionMemoryLayout::weightBank(
+    AttentionProjectionKind projection) const
+{
+    return weightPaging_[static_cast<std::size_t>(projection)].bank;
 }
 
 int64_t AttentionMemoryLayout::activationAddress(
@@ -125,7 +198,7 @@ int64_t AttentionMemoryLayout::queryIwAddress(
     const int64_t tile = target_.throughput().mxm_rows;
     const int64_t tokenBlocks = seqLen_ / tile;
     const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
-    return target_.attention_query_iw_base_row()
+    return queryIwBase_
         + ((head * blocksPerRotaryHalf
                + reductionBlock % blocksPerRotaryHalf)
               * tokenBlocks
@@ -140,6 +213,18 @@ llvm::ArrayRef<int64_t> AttentionMemoryLayout::queryIwSlices(
     const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
     return target_.attention_query_iw_slices(
         reductionBlock / blocksPerRotaryHalf);
+}
+
+int64_t AttentionMemoryLayout::rotaryBank(
+    int64_t baseBank, int64_t reductionBlock) const
+{
+    if (!target_.uses_dedicated_slice_roles()
+        || target_.memory().banks_per_slice < 2)
+        return baseBank;
+    const int64_t blocksPerRotaryHalf =
+        std::max<int64_t>(1, headBlocks_ / 2);
+    return (baseBank + reductionBlock / blocksPerRotaryHalf)
+        % target_.memory().banks_per_slice;
 }
 
 int64_t AttentionMemoryLayout::keyAddress(int64_t kvHead,
@@ -235,8 +320,27 @@ int64_t AttentionMemoryLayout::outputWeightAddress(int64_t outputGroup,
     int64_t reductionBlock, int64_t column) const
 {
     const int64_t reductionBlocks = hidden_ / target_.throughput().mxm_rows;
+    const int64_t localGroup = outputWeightPaging_.enabled
+        ? outputGroup % outputWeightPaging_.itemsPerGroup : outputGroup;
     return outputWeightBase_
-        + (outputGroup * reductionBlocks + reductionBlock) * 4 + column;
+        + (localGroup * reductionBlocks + reductionBlock) * 4 + column;
+}
+
+llvm::ArrayRef<int64_t> AttentionMemoryLayout::outputWeightSlices(
+    int64_t outputGroup) const
+{
+    return pagingSlices(outputWeightPaging_, outputGroup,
+        outputWeightSlices_);
+}
+
+int64_t AttentionMemoryLayout::outputWeightPage() const
+{
+    return outputWeightPaging_.page;
+}
+
+int64_t AttentionMemoryLayout::outputWeightBank() const
+{
+    return outputWeightPaging_.bank;
 }
 
 int64_t AttentionMemoryLayout::resultAddress(
@@ -260,40 +364,19 @@ int64_t AttentionMemoryLayout::ropeStagingAddress(
     AttentionProjectionKind projection, int64_t head, int64_t half,
     int64_t tokenBlock, int64_t row) const
 {
-    const int64_t tokenBlocks =
-        seqLen_ / target_.throughput().mxm_rows;
-    const int64_t rowsPerBlock = target_.throughput().mxm_rows
-        / target_.throughput().mxm_block_rows;
-    const int64_t projectionIndex =
-        projection == AttentionProjectionKind::Query ? 0 : 1;
     return ropeStagingBase_
-        + ((((projectionIndex * target_.memory().slices_per_hemisphere
-                  + head)
-                 * headBlocks_
-                + half)
-               * tokenBlocks
-              + tokenBlock)
-                 * rowsPerBlock)
-        + row;
+        + ((head * headBlocks_ + half) % 4) * seqLen_
+        + tokenBlock * target_.throughput().mxm_rows + row;
 }
 
 int64_t AttentionMemoryLayout::ropeProductAddress(
     AttentionProjectionKind projection, int64_t head, int64_t pairBlock,
     int64_t product, int64_t token) const
 {
-    const int64_t tokenBlocks =
-        seqLen_ / target_.throughput().mxm_rows;
-    const int64_t rowsPerBlock = target_.throughput().mxm_rows
-        / target_.throughput().mxm_block_rows;
-    const int64_t stagingRows =
-        2 * target_.memory().slices_per_hemisphere * headBlocks_
-        * tokenBlocks * rowsPerBlock;
-    const int64_t queryHeads = hidden_
-        / (headBlocks_ * target_.throughput().mxm_rows);
     const int64_t globalHead = projection == AttentionProjectionKind::Query
-        ? head : queryHeads + head;
+        ? head : queryHeads_ + head;
     const int64_t productRowsPerVector = (seqLen_ + 1) / 2;
-    return ropeStagingBase_ + stagingRows
+    return ropeProductBase_
         + ((globalHead * (headBlocks_ / 2) + pairBlock) * 4 + product)
             * productRowsPerVector
         + token / 2;

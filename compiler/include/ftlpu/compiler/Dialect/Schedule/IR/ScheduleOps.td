@@ -19,7 +19,9 @@ def MemTransferOp : FTLPU_Schedule_Op<"mem_transfer", [MemoryEffects<[MemWrite]>
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
       OptionalAttr<I64Attr>:$wave_address_stride,
-      OptionalAttr<I64Attr>:$address_binding);
+      OptionalAttr<I64Attr>:$address_binding,
+      OptionalAttr<I64Attr>:$weight_page,
+      OptionalAttr<I64Attr>:$logical_base_row);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }

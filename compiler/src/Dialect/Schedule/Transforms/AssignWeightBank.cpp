@@ -9,6 +9,16 @@
 namespace ftlpu::compiler {
 namespace {
 
+bool is_paged_weight(mlir::DictionaryAttr placement)
+{
+    if (const auto paged = placement.getAs<mlir::BoolAttr>("paged_weight"))
+        return paged.getValue();
+    if (const auto binding = placement.getAs<mlir::DictionaryAttr>(
+            "binding_placement"))
+        return is_paged_weight(binding);
+    return false;
+}
+
 mlir::DictionaryAttr with_bank(mlir::MLIRContext* context,
     mlir::DictionaryAttr placement, std::int64_t bank)
 {
@@ -49,17 +59,20 @@ public:
                 || binding.getRole() != "weight")
                 return;
             weight_bindings.insert(binding.getIndex());
+            if (is_paged_weight(binding.getPlacement())) return;
             binding->setAttr("placement", with_bank(&getContext(),
                 binding.getPlacement(), bank_));
         });
         function.walk([&](schedule::MemReadOp read) {
             if (read.getRole() != "weight") return;
+            if (is_paged_weight(read.getPlacement())) return;
             read->setAttr("placement", with_bank(&getContext(),
                 read.getPlacement(), bank_));
         });
         function.walk([&](schedule::MemTransferOp transfer) {
             const auto binding = transfer.getAddressBinding();
             if (!binding || !weight_bindings.contains(*binding)) return;
+            if (transfer.getWeightPage() && transfer.getBank()) return;
             transfer->setAttr("bank",
                 mlir::IntegerAttr::get(
                     mlir::IntegerType::get(&getContext(), 64), bank_));

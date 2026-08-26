@@ -61,6 +61,15 @@ struct ExecutableHardwareConfig {
     std::uint32_t accumulator_read_to_vxm_latency{16};
     std::uint32_t swiglu_write_latency{13};
     std::uint32_t mxm_accumulator_blocks{hw::kMxmAccumulatorBlockCount};
+    std::uint32_t lpu_clock_mhz{500};
+    std::uint32_t ddr_peak_bandwidth_mbytes_per_second{51200};
+    std::uint32_t ddr_scheduling_efficiency_percent{90};
+    std::uint32_t ddr_read_latency_cycles{35};
+    std::uint32_t ddr_write_latency_cycles{25};
+    std::uint32_t ddr_read_latency_jitter_cycles{15};
+    std::uint32_t ddr_write_latency_jitter_cycles{10};
+    std::uint32_t ddr_request_queue_depth{256};
+    std::uint32_t ddr_latency_random_seed{0x46544c50};
 
     template <typename Visitor>
     constexpr void visit(Visitor&& visitor)
@@ -83,26 +92,45 @@ struct ExecutableHardwareConfig {
     template <typename Visitor>
     constexpr void visit_pre_v20(Visitor&& visitor)
     {
-        visit_impl(*this, std::forward<Visitor>(visitor), true, false);
+        visit_impl(*this, std::forward<Visitor>(visitor), true, false, false,
+                   false);
+    }
+
+    template <typename Visitor>
+    constexpr void visit_pre_v23(Visitor&& visitor)
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor), true, true, false,
+                   false);
+    }
+
+    template <typename Visitor>
+    constexpr void visit_pre_v24(Visitor&& visitor)
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
+                   false);
     }
 
 private:
     template <typename Self, typename Visitor>
     static constexpr void visit_pre_v19_impl(Self& self, Visitor&& visitor)
     {
-        visit_impl(self, std::forward<Visitor>(visitor), false, false);
+        visit_impl(self, std::forward<Visitor>(visitor), false, false, false,
+                   false);
     }
 
     template <typename Self, typename Visitor>
     static constexpr void visit_impl(Self& self, Visitor&& visitor)
     {
-        visit_impl(self, std::forward<Visitor>(visitor), true, true);
+        visit_impl(self, std::forward<Visitor>(visitor), true, true, true,
+                   true);
     }
 
     template <typename Self, typename Visitor>
     static constexpr void visit_impl(Self& self, Visitor&& visitor,
                                      bool include_accumulator_capacity,
-                                     bool include_c2c_fabric)
+                                     bool include_c2c_fabric,
+                                     bool include_external_memory,
+                                     bool include_ddr_scheduling_efficiency)
     {
         visitor(self.hemispheres); visitor(self.slices_per_hemisphere);
         visitor(self.banks_per_slice); visitor(self.words_per_bank);
@@ -142,6 +170,18 @@ private:
         visitor(self.swiglu_write_latency);
         if (include_accumulator_capacity)
             visitor(self.mxm_accumulator_blocks);
+        if (include_external_memory) {
+            visitor(self.lpu_clock_mhz);
+            visitor(self.ddr_peak_bandwidth_mbytes_per_second);
+            if (include_ddr_scheduling_efficiency)
+                visitor(self.ddr_scheduling_efficiency_percent);
+            visitor(self.ddr_read_latency_cycles);
+            visitor(self.ddr_write_latency_cycles);
+            visitor(self.ddr_read_latency_jitter_cycles);
+            visitor(self.ddr_write_latency_jitter_cycles);
+            visitor(self.ddr_request_queue_depth);
+            visitor(self.ddr_latency_random_seed);
+        }
     }
 };
 
@@ -171,7 +211,7 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     config.mxms_per_hemisphere =
         static_cast<std::uint32_t>(mxms_per_hemisphere);
     TargetAbiHasher hash;
-    hash.add(14); // Hardware ABI schema version (dedicated C2C stream fabric).
+    hash.add(16); // Hardware ABI schema version (DDR scheduling margin).
     config.visit([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }
@@ -180,7 +220,7 @@ constexpr std::uint64_t executable_target_abi(
     const ExecutableHardwareConfig& config)
 {
     TargetAbiHasher hash;
-    hash.add(14); // Hardware ABI schema version (dedicated C2C stream fabric).
+    hash.add(16); // Hardware ABI schema version (DDR scheduling margin).
     config.visit([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }

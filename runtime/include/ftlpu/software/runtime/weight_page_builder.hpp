@@ -21,6 +21,18 @@ struct PackedWeightImage {
     std::vector<PackedWeightSegment> segments{};
 };
 
+// Converts a logical runtime tensor to/from its exact bank-local SRAM image.
+// The image is transport-neutral: ModelSession moves it only through the C2C
+// DMA path, while offline weight-page construction stores the same image in a
+// model package.
+PackedWeightImage pack_binding_image(
+    const BinaryBinding& binding, std::span<const std::uint8_t> logical_data,
+    const ExecutableHardwareConfig& hardware);
+
+std::vector<std::uint8_t> unpack_binding_image(
+    const BinaryBinding& binding, const PackedWeightImage& image,
+    const ExecutableHardwareConfig& hardware);
+
 // Converts one logical runtime tensor into the exact 32-byte SRAM vectors
 // consumed by its executable binding. This is the offline counterpart of a
 // host upload and is the only representation accepted by C2C weight pages.

@@ -77,6 +77,8 @@ mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
         : pair;
     const int64_t hiddenBaseRow =
         get_base_row(plan.getHidden0Placement());
+    const int64_t hiddenBank = plan.getHidden0Placement()
+        .getAs<mlir::IntegerAttr>("bank").getInt();
     const bool distributed16 = hiddenKind
         && hiddenKind.getValue() == "fp16_mxm_distributed_16";
 
@@ -108,7 +110,7 @@ mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
         if (!latency) return {};
         const auto emitWrite = [&](int64_t hemisphere) {
             auto placement = schedule_placement(rewriter, {slice}, address,
-                1, 1, hemisphere_name(hemisphere), kind);
+                1, 1, hemisphere_name(hemisphere), kind, hiddenBank);
             auto write = rewriter.create<MemWriteOp>(plan.getLoc(), output,
                 inputCycle + kVxmSwishLatency + *latency,
                 1, outputStream + byte, 1, 0,

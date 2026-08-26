@@ -23,8 +23,25 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
         context.projection_timeline.weight_load_cycles;
     const auto gateTempSlices = target.ffn_gate_temp_slices();
     const auto upTempSlices = target.ffn_up_temp_slices();
+    if (tile <= 0 || mTileCount <= 0 || pairCount <= 0
+        || throughput.mxm_block_rows <= 0 || memory.hemispheres <= 0
+        || memory.hemispheres > 2
+        || memory.sram_depth_rows < mTileCount * tile) {
+        ffn.getOperation()->emitError(
+            "invalid target geometry for FFN Swish scheduling");
+        return mlir::failure();
+    }
     const int64_t pairsPerTempGroup =
         memory.sram_depth_rows / (mTileCount * tile);
+    const int64_t requiredTempSlices =
+        2 * ((pairCount + pairsPerTempGroup - 1) / pairsPerTempGroup);
+    if (pairsPerTempGroup <= 0
+        || static_cast<int64_t>(gateTempSlices.size()) < requiredTempSlices
+        || static_cast<int64_t>(upTempSlices.size()) < requiredTempSlices) {
+        ffn.getOperation()->emitError(
+            "FFN Swish temporary storage does not cover every projection pair");
+        return mlir::failure();
+    }
 
     FfnSwishEmission result;
     result.last_cycle = 0;

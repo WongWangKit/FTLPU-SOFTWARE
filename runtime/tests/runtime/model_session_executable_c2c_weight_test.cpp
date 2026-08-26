@@ -1,0 +1,108 @@
+#include "ftlpu/software/runtime/model_session.hpp"
+#include "ftlpu/software/runtime/weight_page_builder.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+using namespace ftlpu;
+using namespace ftlpu::software::runtime;
+
+BinaryBinding make_weight_binding()
+{
+    BinaryBinding binding;
+    binding.index = 0;
+    binding.access = BindingAccess::Input;
+    binding.element_type = BindingElementType::I8;
+    binding.layout = BindingLayout::W8A16AttentionWeightStriped;
+    binding.byte_size = 32 * 128;
+    binding.base_row = 0;
+    binding.instruction_count = 8;
+    binding.address_stride = 1;
+    binding.shape = {32, 128};
+    binding.slices = {20, 21, 22, 23, 24, 25, 26, 27};
+    binding.role = "weight";
+    binding.name = "q_proj.weight";
+    binding.hemisphere_mask = 3;
+    binding.bank = 0;
+    binding.paged_weight = true;
+    binding.page_count = 1;
+    binding.page_rows = 8;
+    binding.page_granularity = 1;
+    binding.page_role_group_base = 0;
+    binding.page_role_group_count = 1;
+    binding.page_items_per_slice_group = 1;
+    binding.page_bank_count = 2;
+    binding.page_storage_slices = binding.slices;
+    return binding;
+}
+
+} // namespace
+
+int main()
+try {
+    BinaryProgram program;
+    program.bindings.push_back(make_weight_binding());
+    program.weight_page_uses.push_back({0, 0, 0, 200, 220});
+    program.max_cycle = 228;
+
+    std::vector<std::uint8_t> logical(program.bindings[0].byte_size);
+    for (std::size_t index = 0; index < logical.size(); ++index)
+        logical[index] = static_cast<std::uint8_t>(index * 17 + 3);
+    const PackedWeightImage expected = pack_weight_binding_page(
+        program.bindings[0], 0, logical, program.hardware);
+
+    ModelPackage package;
+    package.model_name = "executable-c2c-weight";
+    package.architecture = "test";
+    package.tensors.push_back(ModelTensor {
+        "q_proj.weight", BindingElementType::I8, {32, 128}, logical});
+    package.executables.push_back({"projection", program, {}});
+    package.invocations.push_back(ModelInvocation {
+        "projection", 0, {{0, "q_proj.weight"}}, {}, {}});
+
+    C2cDmaSystem system;
+    ModelSession session(system);
+    session.load(std::move(package));
+    session.run_invocation(0, 0);
+
+    if (!system.chip().hardware_configuration().c2c_dedicated_streams)
+        throw std::runtime_error(
+            "executable did not select the dedicated C2C stream fabric");
+    if (session.stats().weight_page_prefetches != 1
+        || session.stats().weight_page_prefetch_bytes != expected.data.size())
+        throw std::runtime_error(
+            "executable-local page did not run through the C2C pager");
+    if (system.dma(Hemisphere::East).completions().empty())
+        throw std::runtime_error("C2C DMA did not complete a DDR load");
+
+    for (const PackedWeightSegment& segment : expected.segments) {
+        for (std::uint32_t row = 0; row < segment.vector_count; ++row) {
+            const std::size_t offset =
+                static_cast<std::size_t>(segment.byte_offset)
+                + static_cast<std::size_t>(row) * hw::kPhysicalVectorBytes;
+            for (std::size_t column = 0;
+                 column < hw::kPhysicalVectorBytes; ++column) {
+                const auto actual = system.chip().read_mem_sram_lane_byte(
+                    static_cast<Hemisphere>(segment.hemisphere),
+                    segment.slice, 0, column / hw::kLanesPerTile,
+                    segment.base_row + row, column % hw::kLanesPerTile);
+                if (actual != expected.data[offset + column])
+                    throw std::runtime_error(
+                        "C2C page payload does not match packed weight SRAM");
+            }
+        }
+    }
+
+    std::cout << "model_session_executable_c2c_weight_test passed\n";
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << "model_session_executable_c2c_weight_test failed: "
+              << error.what() << '\n';
+    return 1;
+}

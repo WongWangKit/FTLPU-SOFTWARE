@@ -17,6 +17,7 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "stablehlo/dialect/StablehloOps.h"
+#include "llvm/Support/InitLLVM.h"
 
 #include <filesystem>
 #include <fstream>
@@ -50,6 +51,7 @@ struct Args {
         ftlpu::compiler::target::MxmExecutionPolicy::Auto};
     std::int64_t weight_bank{-1};
     bool pass_timing{false};
+    bool icu_macro_schedule{false};
 };
 
 InputStage parse_input_stage(const std::string& value)
@@ -81,6 +83,8 @@ Args parse_args(int argc, char** argv)
             args.weight_bank = std::stoll(next());
         else if (argument == "--pass-timing")
             args.pass_timing = true;
+        else if (argument == "--icu-macro-schedule")
+            args.icu_macro_schedule = true;
         else if (argument == "--ffn-schedule") {
             const std::string value = next();
             if (value == "tail")
@@ -132,6 +136,7 @@ Args parse_args(int argc, char** argv)
             "[--input-stage stablehlo|stream|schedule|verified-schedule|command] "
             "[--target-config target.json] [--weight-bank 0|1] "
             "[--mxm-execution auto|vector|legacy|block8] "
+            "[--icu-macro-schedule] "
             "[--ffn-schedule tail|fused] "
             "[--attention-schedule tail|fused] "
             "[--rmsnorm-strategy vxm-square-mxm-reduce|vxm-feedback]");
@@ -161,6 +166,7 @@ ftlpu::compiler::target::LPUTargetModel load_target(
 
 int main(int argc, char** argv)
 try {
+    llvm::InitLLVM initLLVM(argc, argv);
     const Args args = parse_args(argc, argv);
     mlir::DialectRegistry registry;
     registry.insert<mlir::func::FuncDialect,
@@ -189,6 +195,8 @@ try {
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::mxm_execution_policy_name(
                 args.mxm_execution_policy)));
+    (*module)->setAttr("ftlpu.icu_macro_schedule",
+        mlir::BoolAttr::get(&context, args.icu_macro_schedule));
 
     mlir::PassManager passes(&context);
     // Model-scale schedules contain hundreds of thousands of primitive ops.

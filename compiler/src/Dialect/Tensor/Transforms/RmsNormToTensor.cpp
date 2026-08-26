@@ -10,7 +10,8 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const target::LPUTargetModel& target,
     RmsNormLoweringStrategy strategy, int64_t feedbackWeightBaseRow,
     int64_t feedbackWeightSliceBase,
-    int64_t weightBank, FunctionMemoryPlanner& planner,
+    int64_t feedbackWeightBank, int64_t weightBank,
+    FunctionMemoryPlanner& planner,
     mlir::IRRewriter& rewriter)
 {
     const auto inputType = op.getInput().getType();
@@ -172,7 +173,9 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
                   ? "fp16_vxm_gamma_broadcast"
                   : "fp16_vxm_row_parallel_8",
               "both",
-              std::max<int64_t>(0, weightBank))
+              target.uses_dedicated_slice_roles()
+                  ? feedbackWeightBank
+                  : std::max<int64_t>(0, weightBank))
         : mlir::succeeded(plannedWeight)
             && plannedWeight->layout == "fp16_pair_planar"
         ? *plannedWeight
@@ -212,7 +215,15 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         const int64_t firstScratchBase =
             target.uses_dedicated_slice_roles() ? 0 : 4608;
         const int64_t normalizedScratchBase =
-            target.uses_dedicated_slice_roles() ? 0 : 5632;
+            target.uses_dedicated_slice_roles()
+            ? preservesInput ? input.base_row + input.row_span : 0
+            : 5632;
+        if (normalizedScratchBase + rowParallelRows + scalarRows
+            > memory.words_per_bank) {
+            op.emitError(
+                "RMSNorm normalized scratch does not fit after the live input");
+            return mlir::failure();
+        }
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
             feedbackInputSlices, firstScratchBase, rowParallelRows,
             matrixBytes, "fp16_vxm_row_parallel_8", "both",
@@ -368,12 +379,19 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
         for (int64_t slice : target.attention_result_slices())
             occupiedSlices.push_back(slice);
         llvm::SmallVector<int64_t, 16> distributedSlices;
-        if (target.uses_dedicated_slice_roles())
-            distributedSlices = target.mxm_distributed_activation_slices();
-        for (int64_t slice = 0;
-             slice < target.memory().slices_per_hemisphere
-             && distributedSlices.size() < 16;
-             ++slice) {
+        llvm::SmallVector<int64_t, 64> placementCandidates;
+        bool reusesLhsStorage = false;
+        if (target.uses_dedicated_slice_roles()) {
+            const auto activation = target.activation_storage_slices();
+            placementCandidates.append(
+                activation.begin(), activation.end());
+        } else {
+            for (int64_t slice = 0;
+                 slice < target.memory().slices_per_hemisphere; ++slice)
+                placementCandidates.push_back(slice);
+        }
+        for (int64_t slice : placementCandidates) {
+            if (distributedSlices.size() == 16) break;
             if (std::find(occupiedSlices.begin(),
                     occupiedSlices.end(), slice)
                 == occupiedSlices.end())
@@ -400,6 +418,27 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
                             .getInt());
             }
         }
+        if (feedsFeedbackRmsNorm && distributedSlices.size() != 16
+            && target.uses_dedicated_slice_roles()
+            && target.memory().banks_per_slice > 1) {
+            const auto lhsPlacement =
+                llvm::cast<mlir::DictionaryAttr>((*lhsPlan)[0])
+                    .getAs<mlir::DictionaryAttr>("placement");
+            const auto lhsKind =
+                lhsPlacement.getAs<mlir::StringAttr>("kind");
+            const auto lhsSlices =
+                lhsPlacement.getAs<mlir::ArrayAttr>("slices");
+            if (lhsKind && lhsSlices && lhsSlices.size() == 16
+                && (lhsKind.getValue() == "fp16_mxm_distributed_16"
+                    || lhsKind.getValue()
+                        == "fp16_mxm_block8_distributed_16")) {
+                distributedSlices.clear();
+                for (mlir::Attribute slice : lhsSlices)
+                    distributedSlices.push_back(
+                        llvm::cast<mlir::IntegerAttr>(slice).getInt());
+                reusesLhsStorage = true;
+            }
+        }
         if (feedsFeedbackRmsNorm && distributedSlices.size() != 16)
             return op.emitError(
                 "target does not provide 16 ping-pong residual slices");
@@ -408,6 +447,11 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
                 return llvm::isa<kernel::RmsNormOp>(use.getOwner())
                     && use.getOperandNumber() == 0;
             });
+        const bool survivesFeedbackRmsNorm = feedsFeedbackRmsNorm
+            && llvm::any_of(op.getResult().getUses(),
+                [](mlir::OpOperand& use) {
+                    return !llvm::isa<kernel::RmsNormOp>(use.getOwner());
+                });
         const bool isFunctionResult = llvm::any_of(
             op.getResult().getUses(), [](mlir::OpOperand& use) {
                 return llvm::isa<mlir::func::ReturnOp>(use.getOwner());
@@ -423,7 +467,9 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
             ? lhsPlacement.getAs<mlir::IntegerAttr>("bank")
             : mlir::IntegerAttr{};
         const int64_t lhsBank = lhsBankAttr ? lhsBankAttr.getInt() : 0;
-        const int64_t resultBank = target.memory().banks_per_slice > 1
+        const int64_t resultBank = reusesLhsStorage
+            ? lhsBank
+            : target.memory().banks_per_slice > 1
             ? (lhsBank + 1) % target.memory().banks_per_slice : lhsBank;
         const int64_t plannedResultBank = target.uses_dedicated_slice_roles()
             ? resultBank : workingBank;
@@ -436,16 +482,19 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
             target.uses_dedicated_slice_roles()
             ? planarResultSlices
             : llvm::SmallVector<int64_t, 4>({32, 33, 34, 35});
+        const int64_t feedbackResultBase =
+            target.uses_dedicated_slice_roles() ? 0 : 4096;
         const Allocation result = usesPersistentActivationAbi
             ? fixed_allocation(PlacementKind::FinalResult,
                 target.mxm_distributed_activation_slices(),
-                4096, rows * columns / 128,
+                feedbackResultBase, rows * columns / 128,
                 rows * columns * 2,
                 "fp16_mxm_distributed_16", "both",
                 target.uses_dedicated_slice_roles() ? resultBank : 0)
             : feedsFeedbackRmsNorm
             ? fixed_allocation(PlacementKind::FinalResult,
-                distributedSlices, 4096, rows * columns / 256,
+                distributedSlices, feedbackResultBase,
+                rows * columns / 256,
                 rows * columns * 2,
                 "fp16_mxm_distributed_16", "both", plannedResultBank)
             : feedsRmsNorm
@@ -457,9 +506,29 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
                 pairResultSlices, 0, rows * columns / 64,
                 rows * columns * 2,
                 "fp16_pair_planar", "both", plannedResultBank);
-        resultPlan = make_task_allocations(rewriter,
-            {make_task_allocation(rewriter, result,
-                make_placement_attr(rewriter, result))});
+        llvm::SmallVector<mlir::Attribute, 2> resultAllocations;
+        resultAllocations.push_back(make_task_allocation(rewriter, result,
+            make_placement_attr(rewriter, result)));
+        if (survivesFeedbackRmsNorm) {
+            llvm::SmallVector<int64_t, 4> persistentSlices;
+            for (int64_t slice : target.activation_storage_slices()) {
+                if (!llvm::is_contained(distributedSlices, slice))
+                    persistentSlices.push_back(slice);
+                if (persistentSlices.size() == 4) break;
+            }
+            if (persistentSlices.size() != 4)
+                return op.emitError(
+                    "feedback RMSNorm residual requires four persistent "
+                    "activation slices");
+            const Allocation persistent = fixed_allocation(
+                PlacementKind::FinalResult, persistentSlices, 0,
+                rows * columns / 64, rows * columns * 2,
+                "fp16_pair_planar", "both", plannedResultBank);
+            resultAllocations.push_back(make_task_allocation(
+                rewriter, persistent, make_placement_attr(rewriter,
+                    persistent)));
+        }
+        resultPlan = rewriter.getArrayAttr(resultAllocations);
     } else {
         auto resultBytes =
             get_static_tensor_bytes(op.getResult().getType());

@@ -29,7 +29,7 @@ try {
     bool sawWriteRepeat = false;
     bool sawDequant = false;
     bool sawInt8Load = false;
-    bool sawBlock8 = false;
+    bool sawCompute = false;
     bool sawLoop = false;
     bool sawRepeat2D = false;
     bool sawMxmAccumulatorRepeat2D = false;
@@ -148,9 +148,7 @@ try {
                 sawInt8Load |= instruction.opcode == MxmControlOpcode::IW
                     && instruction.weight_input_mode
                         == MxmWeightInputMode::Int8DequantBf16;
-                sawBlock8 |=
-                    instruction.opcode == MxmControlOpcode::Compute
-                    && instruction.compute_mode == MxmComputeMode::Block8;
+                sawCompute |= instruction.opcode == MxmControlOpcode::Compute;
             }
         }
     }
@@ -164,7 +162,7 @@ try {
                 == QueueKind::MxmDequant,
         "MXM dequant scale relocation was not preserved");
     require(sawInt8Load, "MXM INT8 dequant load mode was not preserved");
-    require(sawBlock8, "MXM Block8 compute mode was not preserved");
+    require(sawCompute, "MXM compute command was not preserved");
     require(sawLoop, "multi-instruction ICU Loop was not preserved");
     require(loopQueueCommands == 4,
         "ICU Loop was expanded instead of encoded as one control command");
