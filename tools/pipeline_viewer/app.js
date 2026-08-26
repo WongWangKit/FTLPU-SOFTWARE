@@ -69,6 +69,7 @@ const state = {
   drawPending: false,
   drawFullPending: false,
   filterTimer: null,
+  loadWorker: null,
 };
 
 const dom = {
@@ -169,7 +170,204 @@ function parseCsv(text) {
     row.push(field.replace(/\r$/, ""));
     consumeRow();
   }
-  return events.sort((a, b) => a.start - b.start || a.end - b.end);
+  return events.map((event) => ({
+    ...event,
+    pattern: "single",
+    patternEnd: event.end,
+    innerCount: 1,
+    innerInterval: 0,
+    innerStride: 0,
+    outerCount: 1,
+    outerInterval: 0,
+    outerStride: 0,
+    skipFirst: false,
+    induction: "none",
+    baseDelta: 0,
+    logicalCount: 1,
+  }));
+}
+
+function csvWorkerMain() {
+  const optionalColumns = [
+    "pattern", "inner_count", "inner_interval", "inner_stride",
+    "outer_count", "outer_interval", "outer_stride", "skip_first",
+    "induction", "base_delta",
+  ];
+  let headers = null;
+  let positions = null;
+  let row = [];
+  let field = "";
+  let quoted = false;
+  let pendingQuote = false;
+  let lineNumber = 0;
+  let nextId = 0;
+  let batch = [];
+
+  function emitBatch() {
+    if (!batch.length) return;
+    self.postMessage({type: "batch", patterns: batch});
+    batch = [];
+  }
+
+  function consumeRow() {
+    lineNumber += 1;
+    if (!row.some(Boolean)) {
+      row = [];
+      return;
+    }
+    if (!headers) {
+      headers = row.map((item) => item.trim().toLowerCase());
+      const required = ["start", "end", "resource", "detail"];
+      if (required.some((key) => !headers.includes(key)))
+        throw new Error("CSV must contain start,end,resource,detail");
+      positions = Object.fromEntries([...required, ...optionalColumns]
+        .map((key) => [key, headers.indexOf(key)]));
+      row = [];
+      return;
+    }
+    const value = (key, fallback = "") => positions[key] >= 0
+      ? (row[positions[key]] ?? fallback) : fallback;
+    const number = (key, fallback) => {
+      const result = Number(value(key, String(fallback)));
+      if (!Number.isFinite(result))
+        throw new Error(`line ${lineNumber}: invalid ${key}`);
+      return result;
+    };
+    const start = number("start", 0);
+    const end = number("end", 0);
+    if (end <= start)
+      throw new Error(`line ${lineNumber}: invalid cycle range`);
+    const pattern = value("pattern", "single").trim().toLowerCase() || "single";
+    if (!["single", "repeat", "repeat2d"].includes(pattern))
+      throw new Error(`line ${lineNumber}: invalid pattern ${pattern}`);
+    const innerCount = number("inner_count", 1);
+    const innerInterval = number("inner_interval", 0);
+    const innerStride = number("inner_stride", 0);
+    const outerCount = number("outer_count", 1);
+    const outerInterval = number("outer_interval", 0);
+    const outerStride = number("outer_stride", 0);
+    const baseDelta = number("base_delta", 0);
+    const skipFirst = number("skip_first", 0) !== 0;
+    if (!Number.isInteger(innerCount) || innerCount < 1
+        || !Number.isInteger(outerCount) || outerCount < 1
+        || innerInterval < 0 || outerInterval < 0
+        || (innerCount > 1 && innerInterval <= 0)
+        || (outerCount > 1 && outerInterval <= 0))
+      throw new Error(`line ${lineNumber}: invalid repeat parameters`);
+    const logicalCount = innerCount * outerCount - (skipFirst ? 1 : 0);
+    if (logicalCount > 0) {
+      batch.push({
+        id: nextId,
+        start,
+        end,
+        patternEnd: start + (end - start)
+          + (innerCount - 1) * innerInterval
+          + (outerCount - 1) * outerInterval,
+        resource: value("resource") || "Unknown",
+        detail: value("detail"),
+        pattern,
+        innerCount,
+        innerInterval,
+        innerStride,
+        outerCount,
+        outerInterval,
+        outerStride,
+        skipFirst,
+        induction: value("induction", "none") || "none",
+        baseDelta,
+        logicalCount,
+      });
+      nextId += 1;
+    }
+    row = [];
+    if (batch.length >= 50_000) emitBatch();
+  }
+
+  function parseChunk(text) {
+    let index = 0;
+    if (pendingQuote) {
+      pendingQuote = false;
+      if (text[0] === '"') {
+        field += '"';
+        index = 1;
+      } else {
+        quoted = false;
+      }
+    }
+    for (; index < text.length; index += 1) {
+      const char = text[index];
+      if (quoted) {
+        if (char === '"' && text[index + 1] === '"') {
+          field += '"';
+          index += 1;
+        } else if (char === '"' && index + 1 === text.length) {
+          pendingQuote = true;
+        } else if (char === '"') {
+          quoted = false;
+        } else {
+          field += char;
+        }
+      } else if (char === '"') {
+        quoted = true;
+      } else if (char === ",") {
+        row.push(field);
+        field = "";
+      } else if (char === "\n") {
+        row.push(field.replace(/\r$/, ""));
+        field = "";
+        consumeRow();
+      } else {
+        field += char;
+      }
+    }
+  }
+
+  self.onmessage = async ({data}) => {
+    try {
+      const reader = data.file.stream().getReader();
+      const decoder = new TextDecoder();
+      let loaded = 0;
+      let reported = 0;
+      while (true) {
+        const {done, value: bytes} = await reader.read();
+        if (done) break;
+        loaded += bytes.byteLength;
+        parseChunk(decoder.decode(bytes, {stream: true}));
+        if (loaded - reported >= 4 * 1024 * 1024) {
+          self.postMessage({type: "progress", loaded, size: data.file.size});
+          reported = loaded;
+        }
+      }
+      parseChunk(decoder.decode());
+      if (pendingQuote) {
+        pendingQuote = false;
+        quoted = false;
+      }
+      if (quoted) throw new Error("unterminated quoted CSV field");
+      if (field || row.length) {
+        row.push(field.replace(/\r$/, ""));
+        consumeRow();
+      }
+      emitBatch();
+      self.postMessage({type: "done", patternCount: nextId});
+    } catch (error) {
+      self.postMessage({type: "error", message: error.message});
+    }
+  };
+}
+
+function createCsvWorker() {
+  const source = `(${csvWorkerMain.toString()})()`;
+  const url = URL.createObjectURL(new Blob([source], {type: "text/javascript"}));
+  const worker = new Worker(url);
+  worker.sourceUrl = url;
+  return worker;
+}
+
+function disposeCsvWorker(worker) {
+  if (!worker) return;
+  worker.terminate();
+  URL.revokeObjectURL(worker.sourceUrl);
 }
 
 function resourceFamily(resource) {
@@ -230,7 +428,7 @@ function setTrace(events, fileName) {
   state.fullEnd = -Infinity;
   for (const event of events) {
     state.fullStart = Math.min(state.fullStart, event.start);
-    state.fullEnd = Math.max(state.fullEnd, event.end);
+    state.fullEnd = Math.max(state.fullEnd, event.patternEnd);
   }
   state.fileName = fileName;
   state.cursorA = state.fullStart + (state.fullEnd - state.fullStart) * 0.25;
@@ -243,6 +441,11 @@ function setTrace(events, fileName) {
   const fullSpan = Math.ceil(state.fullEnd - state.fullStart);
   dom.traceSummary.textContent =
     `${events.length.toLocaleString()} events · ${fullSpan.toLocaleString()} cycles`;
+  const logicalCount = events.reduce(
+    (total, event) => total + event.logicalCount, 0);
+  dom.traceSummary.textContent = `${events.length.toLocaleString()} patterns / `
+    + `${logicalCount.toLocaleString()} events / `
+    + `${fullSpan.toLocaleString()} cycles`;
   dom.interactionState.textContent = "Loaded";
 }
 
@@ -269,9 +472,10 @@ function applyFilters() {
   ]));
   for (const event of state.events) state.groups.get(event.resource).events.push(event);
   for (const group of state.groups.values()) {
+    group.events.sort((a, b) => a.start - b.start || a.patternEnd - b.patternEnd);
     let maxEnd = -Infinity;
     group.prefixMaxEnd = group.events.map((event) => {
-      maxEnd = Math.max(maxEnd, event.end);
+      maxEnd = Math.max(maxEnd, event.patternEnd);
       return maxEnd;
     });
   }
@@ -398,6 +602,62 @@ function formatCycle(value) {
   return rounded.toLocaleString();
 }
 
+function patternVisibleSegments(pattern, viewStart, viewEnd) {
+  const duration = pattern.end - pattern.start;
+  const segments = [];
+  let total = 0;
+  for (let outer = 0; outer < pattern.outerCount; outer += 1) {
+    const outerStart = pattern.start + outer * pattern.outerInterval;
+    let first = pattern.innerCount === 1 ? 0
+      : Math.ceil((viewStart - duration - outerStart) / pattern.innerInterval);
+    let last = pattern.innerCount === 1 ? 0
+      : Math.floor((viewEnd - outerStart) / pattern.innerInterval);
+    first = Math.max(0, first);
+    last = Math.min(pattern.innerCount - 1, last);
+    if (pattern.skipFirst && outer === 0 && first === 0) first = 1;
+    if (last < first) continue;
+    const count = last - first + 1;
+    segments.push({outer, first, count, offset: total});
+    total += count;
+  }
+  return {pattern, segments, total};
+}
+
+function adjustInducedDetail(detail, induction, delta) {
+  if (!delta) return detail;
+  const update = (expression) => detail.replace(expression,
+    (match, prefix, value) => `${prefix}${Number(value) + delta}`);
+  if (induction === "mem_address") return update(/(\baddr=)(-?\d+)/);
+  if (induction === "mxm_weight_column") return update(/(\bcolumn=)(-?\d+)/);
+  if (induction === "mxm_accumulator_address") return update(/(\bacc=)(-?\d+)/);
+  return detail;
+}
+
+function materializePatternInstance(info, rank) {
+  let segment = info.segments[0];
+  for (const candidate of info.segments) {
+    if (rank < candidate.offset + candidate.count) {
+      segment = candidate;
+      break;
+    }
+  }
+  const inner = segment.first + rank - segment.offset;
+  const {pattern} = info;
+  const start = pattern.start
+    + segment.outer * pattern.outerInterval
+    + inner * pattern.innerInterval;
+  const delta = pattern.baseDelta
+    + segment.outer * pattern.outerStride
+    + inner * pattern.innerStride;
+  return {
+    id: `${pattern.id}:${segment.outer}:${inner}`,
+    start,
+    end: start + pattern.end - pattern.start,
+    resource: pattern.resource,
+    detail: adjustInducedDetail(pattern.detail, pattern.induction, delta),
+  };
+}
+
 function visibleEvents() {
   const topRow = Math.max(0, Math.floor(state.scrollY / 30));
   const bottomRow = Math.min(
@@ -413,16 +673,31 @@ function visibleEvents() {
     if (!group) continue;
     const first = lowerBound(group.prefixMaxEnd, state.viewStart);
     const last = upperBoundEvents(group.events, state.viewEnd);
-    const count = Math.max(0, last - first);
-    total += count;
-    const stride = Math.max(1, Math.ceil(count / perRowBudget));
+    const infos = [];
+    let rowTotal = 0;
+    for (let index = first; index < last; index += 1) {
+      const pattern = group.events[index];
+      if (pattern.patternEnd < state.viewStart) continue;
+      const info = patternVisibleSegments(
+        pattern, state.viewStart, state.viewEnd);
+      if (!info.total) continue;
+      info.offset = rowTotal;
+      rowTotal += info.total;
+      infos.push(info);
+    }
+    total += rowTotal;
+    const stride = Math.max(1, Math.ceil(rowTotal / perRowBudget));
     if (stride > 1) sampled = true;
-    for (let index = first; index < last; index += stride) {
-      const event = group.events[index];
-      if (event.end >= state.viewStart) visible.push(event);
+    let nextRank = 0;
+    for (const info of infos) {
+      while (nextRank < info.offset + info.total) {
+        if (nextRank >= info.offset)
+          visible.push(materializePatternInstance(info, nextRank - info.offset));
+        nextRank += stride;
+      }
     }
   }
-  return { events: visible, total, sampled };
+  return {events: visible, total, sampled};
 }
 
 function lowerBound(values, target) {
@@ -601,7 +876,8 @@ function rebuildOverviewCache() {
     for (let index = 0; index < group.events.length; index += stride) {
       const event = group.events[index];
       const x = ((event.start - state.fullStart) / fullSpan) * width;
-      const eventWidth = Math.max(1, ((event.end - event.start) / fullSpan) * width);
+      const eventWidth = Math.max(1,
+        ((event.patternEnd - event.start) / fullSpan) * width);
       const y = 4 + (row / resourceCount) * (height - 8);
       context.fillStyle = eventColor(event);
       context.globalAlpha = 0.72;
@@ -684,9 +960,12 @@ function hitTest(clientX, clientY) {
   const candidates = [];
   const first = lowerBound(group.prefixMaxEnd, cycle);
   for (let index = first; index < group.events.length; index += 1) {
-    const event = group.events[index];
-    if (event.start > cycle) break;
-    if (event.end >= cycle) candidates.push(event);
+    const pattern = group.events[index];
+    if (pattern.start > cycle) break;
+    if (pattern.patternEnd < cycle) continue;
+    const info = patternVisibleSegments(pattern, cycle, cycle);
+    for (let rank = 0; rank < info.total; rank += 1)
+      candidates.push(materializePatternInstance(info, rank));
   }
   return candidates.sort((a, b) => (a.end - a.start) - (b.end - b.start))[0] || null;
 }
@@ -699,11 +978,38 @@ function setActiveCursor(name) {
 
 async function loadFile(file) {
   if (!file) return;
+  disposeCsvWorker(state.loadWorker);
+  state.loadWorker = null;
+  const patterns = [];
   try {
-    dom.interactionState.textContent = "Parsing";
-    const events = parseCsv(await file.text());
-    setTrace(events, file.name);
+    dom.interactionState.textContent = "Streaming 0%";
+    const worker = createCsvWorker();
+    state.loadWorker = worker;
+    await new Promise((resolve, reject) => {
+      worker.onmessage = ({data}) => {
+        if (data.type === "batch") {
+          patterns.push(...data.patterns);
+        } else if (data.type === "progress") {
+          const percent = Math.min(100,
+            Math.floor(data.loaded / Math.max(1, data.size) * 100));
+          dom.interactionState.textContent = `Streaming ${percent}%`;
+        } else if (data.type === "done") {
+          resolve();
+        } else if (data.type === "error") {
+          reject(new Error(data.message));
+        }
+      };
+      worker.onerror = (event) => reject(
+        new Error(event.message || "CSV worker failed"));
+      worker.postMessage({file});
+    });
+    disposeCsvWorker(worker);
+    state.loadWorker = null;
+    dom.interactionState.textContent = "Indexing";
+    setTrace(patterns, file.name);
   } catch (error) {
+    disposeCsvWorker(state.loadWorker);
+    state.loadWorker = null;
     dom.interactionState.textContent = error.message;
   } finally {
     dom.fileInput.value = "";

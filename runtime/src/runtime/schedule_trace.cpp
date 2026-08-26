@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ftlpu::software::runtime {
@@ -51,8 +52,41 @@ struct EventDescription {
     std::string detail;
 };
 
+MemInstruction decode_mem_instruction_for_target(
+    isa::EncodedMemInstruction word, std::size_t sram_depth_rows)
+{
+    if (sram_depth_rows == 0 || sram_depth_rows > (1u << 16)
+        || (sram_depth_rows & (sram_depth_rows - 1)) != 0)
+        throw std::logic_error(
+            "runtime trace requires a power-of-two target SRAM depth");
+    const auto opcode = static_cast<MemOpcode>(word & 0x7);
+    const auto stream = static_cast<std::size_t>((word >> 3) & 0x3f);
+    const auto map_stream = static_cast<std::size_t>((word >> 9) & 0x3f);
+    const auto address_mask = static_cast<std::uint64_t>(sram_depth_rows - 1);
+    const auto address = static_cast<std::size_t>((word >> 15) & address_mask);
+    const bool preserve_stream = ((word >> 31) & 0x1) != 0;
+    const auto used_mask = 0x80007fffull | (address_mask << 15);
+    if ((word & ~used_mask) != 0)
+        throw std::logic_error(
+            "encoded MEM instruction exceeds target SRAM address width");
+    if (preserve_stream && opcode != MemOpcode::Write)
+        throw std::logic_error(
+            "only encoded MEM Write can preserve its input stream");
+    switch (opcode) {
+    case MemOpcode::Read: return MemInstruction::Read(address, stream);
+    case MemOpcode::Write:
+        return preserve_stream
+            ? MemInstruction::WriteTap(address, stream)
+            : MemInstruction::Write(address, stream);
+    case MemOpcode::Gather: return MemInstruction::Gather(stream, map_stream);
+    case MemOpcode::Scatter: return MemInstruction::Scatter(stream, map_stream);
+    }
+    throw std::logic_error("unknown encoded MEM opcode");
+}
+
 EventDescription describe(const QueueProgram& queue, const QueueCommand& command,
     std::int64_t address_delta, std::size_t mxms_per_hemisphere,
+    std::size_t sram_depth_rows,
     IcuInductionTarget induction_target = IcuInductionTarget::None)
 {
     const auto east = queue.index < InstructionControlUnit::kMemQueuesPerHemisphere;
@@ -68,7 +102,8 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
         const std::size_t bank = localQueue % hw::kMemBanksPerSlice;
         const auto encoded = static_cast<isa::EncodedMemInstruction>(command.words[0])
             | (static_cast<isa::EncodedMemInstruction>(command.words[1]) << 32);
-        auto instruction = isa::decode_mem_instruction(encoded);
+        auto instruction = decode_mem_instruction_for_target(
+            encoded, sram_depth_rows);
         const auto address =
             static_cast<std::int64_t>(instruction.address) + address_delta;
         if (address < 0)
@@ -217,18 +252,77 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
     throw std::logic_error("unknown ICU queue kind in schedule trace");
 }
 
-void write_event(std::ostream& output, std::int64_t start, std::int64_t end,
-    const EventDescription& event, std::size_t count = 1, std::size_t interval = 1,
-    std::int64_t stride = 0)
+struct EventPattern {
+    std::string_view kind{"single"};
+    std::size_t inner_count{1};
+    std::size_t inner_interval{0};
+    std::int64_t inner_stride{0};
+    std::size_t outer_count{1};
+    std::size_t outer_interval{0};
+    std::int64_t outer_stride{0};
+    bool skip_first{false};
+    IcuInductionTarget induction_target{IcuInductionTarget::None};
+    std::int64_t base_delta{0};
+};
+
+IcuInductionTarget resolve_induction_target(const QueueProgram& queue,
+    const QueueCommand& command, IcuInductionTarget requested,
+    const EventPattern& pattern)
 {
-    auto detail = event.detail;
-    if (count > 1) {
-        detail += " count=" + std::to_string(count)
-            + " interval=" + std::to_string(interval)
-            + " stride=" + std::to_string(stride);
+    if (requested != IcuInductionTarget::None) return requested;
+    if (pattern.base_delta == 0 && pattern.inner_stride == 0
+        && pattern.outer_stride == 0)
+        return IcuInductionTarget::None;
+    if (queue.kind == QueueKind::Mem)
+        return IcuInductionTarget::MemAddress;
+    if (queue.kind == QueueKind::MxmLoad
+        || queue.kind == QueueKind::MxmCompute) {
+        const auto encoded =
+            static_cast<isa::EncodedMxmInstruction>(command.words[0])
+            | (static_cast<isa::EncodedMxmInstruction>(command.words[1]) << 32);
+        const auto instruction = isa::decode_mxm_instruction(encoded);
+        return instruction.opcode == MxmControlOpcode::IW
+            ? IcuInductionTarget::MxmWeightColumn
+            : IcuInductionTarget::MxmAccumulatorAddress;
     }
+    return IcuInductionTarget::None;
+}
+
+std::string_view induction_name(IcuInductionTarget target)
+{
+    switch (target) {
+    case IcuInductionTarget::None: return "none";
+    case IcuInductionTarget::MemAddress: return "mem_address";
+    case IcuInductionTarget::MxmWeightColumn: return "mxm_weight_column";
+    case IcuInductionTarget::MxmAccumulatorAddress:
+        return "mxm_accumulator_address";
+    }
+    throw std::logic_error("unknown ICU induction target in schedule trace");
+}
+
+void write_event(std::ostream& output, std::int64_t start, std::int64_t end,
+    const EventDescription& event, const EventPattern& pattern = {})
+{
     output << start << ',' << end << ',' << csv_field(event.resource) << ','
-           << csv_field(detail) << '\n';
+           << csv_field(event.detail) << ',' << csv_field(std::string(pattern.kind))
+           << ',' << pattern.inner_count << ',' << pattern.inner_interval
+           << ',' << pattern.inner_stride << ',' << pattern.outer_count
+           << ',' << pattern.outer_interval << ',' << pattern.outer_stride
+           << ',' << (pattern.skip_first ? 1 : 0) << ','
+           << csv_field(std::string(induction_name(pattern.induction_target)))
+           << ',' << pattern.base_delta << '\n';
+}
+
+void write_pattern(std::ostream& output, const QueueProgram& queue,
+    const QueueCommand& command, std::int64_t start,
+    std::size_t mxms_per_hemisphere, std::size_t sram_depth_rows,
+    EventPattern pattern)
+{
+    pattern.induction_target = resolve_induction_target(
+        queue, command, pattern.induction_target, pattern);
+    const auto event = describe(queue, command, 0, mxms_per_hemisphere,
+        sram_depth_rows, pattern.induction_target);
+    write_event(output, start, start + 1, event, pattern);
 }
 
 const BinaryBinding& find_paged_weight(
@@ -297,7 +391,9 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
 {
     std::ofstream output(path, std::ios::trunc);
     if (!output) throw std::runtime_error("cannot open runtime schedule trace: " + path.string());
-    output << "start,end,resource,detail\n";
+    output << "start,end,resource,detail,pattern,inner_count,inner_interval,"
+              "inner_stride,outer_count,outer_interval,outer_stride,skip_first,"
+              "induction,base_delta\n";
     write_weight_prefetches(output, program);
 
     for (const auto& queue : program.queues) {
@@ -308,24 +404,15 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
         for (const auto& command : queue.commands) {
             if (is_macro_schedule_command(command)) {
                 const auto macro = decode_macro_schedule_command(command);
-                for (std::size_t outer = 0;
-                     outer < macro.outer_count; ++outer) {
-                    for (std::size_t inner = 0;
-                         inner < macro.inner_count; ++inner) {
-                        const auto cycle = macro.start_cycle
-                            + outer * macro.outer_interval
-                            + inner * macro.inner_interval;
-                        const auto delta =
-                            static_cast<std::int64_t>(outer)
-                                * macro.outer_stride
-                            + static_cast<std::int64_t>(inner)
-                                * macro.inner_stride;
-                        write_event(output, cycle, cycle + 1,
-                            describe(queue, command, delta,
-                                program.hardware.mxms_per_hemisphere,
-                                macro.induction_target));
-                    }
-                }
+                write_pattern(output, queue, command, macro.start_cycle,
+                    program.hardware.mxms_per_hemisphere,
+                    program.hardware.sram_depth_rows,
+                    {macro.outer_count > 1 ? "repeat2d"
+                            : macro.inner_count > 1 ? "repeat" : "single",
+                        macro.inner_count, macro.inner_interval,
+                        macro.inner_stride, macro.outer_count,
+                        macro.outer_interval, macro.outer_stride, false,
+                        macro.induction_target, 0});
                 cursor = std::max(cursor, macro.start_cycle
                     + (macro.outer_count - 1) * macro.outer_interval
                     + (macro.inner_count - 1) * macro.inner_interval + 1);
@@ -336,25 +423,15 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
                     throw std::logic_error(
                         "runtime trace found Repeat2D without instruction");
                 const auto repeat = decode_repeat_2d_command(command);
-                for (std::size_t outer = 0;
-                     outer < repeat.outer_count; ++outer) {
-                    for (std::size_t inner = 0;
-                         inner < repeat.inner_count; ++inner) {
-                        if (outer == 0 && inner == 0) continue;
-                        const auto cycle = previous_cycle
-                            + outer * repeat.outer_interval
-                            + inner * repeat.inner_interval;
-                        const auto delta =
-                            static_cast<std::int64_t>(outer)
-                                * repeat.outer_stride
-                            + static_cast<std::int64_t>(inner)
-                                * repeat.inner_stride;
-                        write_event(output, cycle, cycle + 1,
-                            describe(queue, *previous, delta,
-                                program.hardware.mxms_per_hemisphere,
-                                repeat.induction_target));
-                    }
-                }
+                if (repeat.outer_count * repeat.inner_count > 1)
+                    write_pattern(output, queue, *previous, previous_cycle,
+                        program.hardware.mxms_per_hemisphere,
+                        program.hardware.sram_depth_rows,
+                        {"repeat2d", repeat.inner_count,
+                            repeat.inner_interval, repeat.inner_stride,
+                            repeat.outer_count, repeat.outer_interval,
+                            repeat.outer_stride, true,
+                            repeat.induction_target, 0});
                 cursor = previous_cycle
                     + (repeat.outer_count - 1) * repeat.outer_interval
                     + (repeat.inner_count - 1) * repeat.inner_interval + 1;
@@ -371,21 +448,13 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
                 if (repeat.count != 0) {
                     const auto first = previous_cycle + repeat.interval;
                     const auto last = previous_cycle + repeat.count * repeat.interval;
-                    if (repeat.interval == 1) {
-                        write_event(output, first, last + 1,
-                            describe(queue, *previous, repeat.address_stride,
-                                program.hardware.mxms_per_hemisphere), repeat.count,
-                            repeat.interval, repeat.address_stride);
-                    } else {
-                        for (std::size_t index = 1; index <= repeat.count; ++index) {
-                            write_event(output, previous_cycle + index * repeat.interval,
-                                previous_cycle + index * repeat.interval + 1,
-                                describe(queue, *previous,
-                                    static_cast<std::int64_t>(index)
-                                        * repeat.address_stride,
-                                    program.hardware.mxms_per_hemisphere));
-                        }
-                    }
+                    write_pattern(output, queue, *previous, first,
+                        program.hardware.mxms_per_hemisphere,
+                        program.hardware.sram_depth_rows,
+                        {"repeat", repeat.count, repeat.interval,
+                            repeat.address_stride, 1, 0, 0, false,
+                            IcuInductionTarget::None,
+                            repeat.address_stride});
                     cursor = last + 1;
                 }
                 continue;
@@ -396,19 +465,16 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
                     throw std::logic_error(
                         "runtime trace found Loop with an invalid window");
                 const auto first = history.end() - loop.window_size;
-                for (std::size_t round = 1; round <= loop.count; ++round) {
-                    std::size_t offset = 0;
-                    for (auto item = first; item != history.end();
-                         ++item, ++offset) {
-                        const auto cycle = cursor
-                            + (round - 1) * loop.interval + offset;
-                        write_event(output, cycle, cycle + 1,
-                            describe(queue, *item->first,
-                                static_cast<std::int64_t>(round)
-                                    * loop.address_stride,
-                                program.hardware.mxms_per_hemisphere));
-                    }
-                }
+                std::size_t offset = 0;
+                for (auto item = first; item != history.end();
+                     ++item, ++offset)
+                    write_pattern(output, queue, *item->first,
+                        cursor + offset, program.hardware.mxms_per_hemisphere,
+                        program.hardware.sram_depth_rows,
+                        {"repeat", loop.count, loop.interval,
+                            loop.address_stride, 1, 0, 0, false,
+                            IcuInductionTarget::None,
+                            loop.address_stride});
                 cursor += (loop.count - 1) * loop.interval
                     + loop.window_size;
                 continue;
@@ -416,7 +482,8 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
             if (opcode != isa::IcuCommandOpcode::Instruction)
                 throw std::logic_error("runtime trace found unsupported ICU command");
             const auto event = describe(
-                queue, command, 0, program.hardware.mxms_per_hemisphere);
+                queue, command, 0, program.hardware.mxms_per_hemisphere,
+                program.hardware.sram_depth_rows);
             write_event(output, cursor, cursor + 1, event);
             previous = &command;
             previous_cycle = cursor;

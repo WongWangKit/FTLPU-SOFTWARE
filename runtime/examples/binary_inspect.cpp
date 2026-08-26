@@ -57,6 +57,7 @@ try {
     std::size_t repeat2DReplayed = 0;
     std::size_t loopReplayed = 0;
     std::size_t macroExpanded = 0;
+    std::size_t tracePatternRows = 0;
     std::size_t serializedQueueBytes = program.queues.size() * 8;
     for (const auto& queue : program.queues) {
         for (const auto& command : queue.commands) {
@@ -69,6 +70,7 @@ try {
                         command);
                 macroExpanded += macro.inner_count * macro.outer_count;
                 expandedInstructions += macro.inner_count * macro.outer_count;
+                ++tracePatternRows;
                 continue;
             }
             if (ftlpu::software::runtime::is_repeat_2d_command(command)) {
@@ -80,22 +82,28 @@ try {
                     repeat.inner_count * repeat.outer_count - 1;
                 expandedInstructions +=
                     repeat.inner_count * repeat.outer_count - 1;
+                if (repeat.inner_count * repeat.outer_count > 1)
+                    ++tracePatternRows;
                 continue;
             }
             switch (ftlpu::isa::decode_icu_command_opcode(command.command)) {
             case ftlpu::isa::IcuCommandOpcode::Instruction:
                 ++totalInstructions;
                 ++expandedInstructions;
+                ++tracePatternRows;
                 break;
             case ftlpu::isa::IcuCommandOpcode::Nop:
                 ++totalNops;
                 break;
             case ftlpu::isa::IcuCommandOpcode::Repeat:
                 ++totalRepeats;
-                repeatReplayed +=
-                    ftlpu::isa::decode_icu_repeat(command.command).count;
-                expandedInstructions +=
-                    ftlpu::isa::decode_icu_repeat(command.command).count;
+                {
+                    const auto repeat =
+                        ftlpu::isa::decode_icu_repeat(command.command);
+                    repeatReplayed += repeat.count;
+                    expandedInstructions += repeat.count;
+                    if (repeat.count != 0) ++tracePatternRows;
+                }
                 break;
             case ftlpu::isa::IcuCommandOpcode::Loop: {
                 ++totalLoops;
@@ -103,6 +111,7 @@ try {
                     ftlpu::isa::decode_icu_loop(command.command);
                 loopReplayed += loop.window_size * loop.count;
                 expandedInstructions += loop.window_size * loop.count;
+                if (loop.count != 0) tracePatternRows += loop.window_size;
                 break;
             }
             default:
@@ -127,6 +136,7 @@ try {
               << " expanded_instruction=" << expandedInstructions
               << " encoded_work_entries=" << encodedWorkEntries
               << " saved_work_entries=" << savedWorkEntries
+              << " trace_queue_pattern_rows=" << tracePatternRows
               << " serialized_queue_bytes=" << serializedQueueBytes
               << '\n';
     std::map<std::pair<std::uint32_t,

@@ -4,13 +4,23 @@ Pipeline Viewer 是一个无外部依赖的 Canvas 波形工作台，用于查�
 schedule trace。浏览器直接打开 `index.html`，然后载入
 `write_schedule_trace_csv()` 生成的 CSV。
 
-输入格式：
+旧版四列输入格式继续兼容：
 
 ```csv
 start,end,resource,detail
 0,32,"MEM.E.Read","slice=0 addr=0 stream=E0"
 32,64,"MXM.E0.Compute","Compute buffer=0 act=E0 out=W0"
 ```
+
+新版 trace 增加结构化压缩字段：
+
+```csv
+start,end,resource,detail,pattern,inner_count,inner_interval,inner_stride,outer_count,outer_interval,outer_stride,skip_first,induction,base_delta
+0,1,"MEM.E.Read","slice=0 addr=0 stream=E0","repeat",128,1,1,1,0,0,0,"mem_address",0
+```
+
+`repeat` 和 `repeat2d` 行描述迭代空间，不再提前展开所有 event。Viewer 只展开
+与当前可见 cycle 窗口相交的实例；`induction` 指明 stride 修改的数值字段。
 
 分页 binary 还会生成 `C2C.E.Prefetch` 和 `C2C.W.Prefetch` 行。事件区间由
 binary 的页面 readiness 和目标专用 C2C 带宽计算，`detail` 中保留 page、bank、
@@ -26,9 +36,10 @@ binding、bytes、lane 数以及来源标记 `planned=true`。
 - 单击 Overview：快速跳转到对应时间区域。
 - 搜索框和功能单元菜单：筛选 C2C/MEM/MXM/VXM/SXM 资源与指令详情。
 
+CSV 由 Web Worker 流式解码，浏览器不会再创建包含整个文件的单个字符串。
 远景下查看器会自动启用 LOD，把每个可见资源行的绘制数量限制在合理范围；
 放大后自动恢复逐 event 绘制。状态栏中的 `LOD` 数字表示当前实际绘制的 event
-数量，点击命中和详情查询始终使用完整原始 trace。
+数量，点击命中和详情查询按需展开压缩 pattern。
 
 现有 runtime 测试会生成可直接载入的 trace，例如：
 
