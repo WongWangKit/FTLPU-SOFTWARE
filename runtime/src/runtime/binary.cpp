@@ -15,6 +15,11 @@ namespace ftlpu::software::runtime {
 namespace {
 
 constexpr std::array<char, 8> kMagic {'F', 'T', 'L', 'P', 'U', 'B', '0', '1'};
+constexpr std::uint8_t kCompactInstructionKindMask = 0x07;
+constexpr std::uint8_t kCompactWordCountMask = 0x38;
+constexpr std::uint8_t kCompactWordCountShift = 3;
+constexpr std::uint8_t kCompactHasExtension = 0x40;
+constexpr std::uint8_t kCompactMacro = 0x80;
 
 template <typename T>
 void write_scalar(std::ostream& os, T value)
@@ -34,6 +39,120 @@ T read_scalar(std::istream& is)
         throw std::runtime_error("truncated FTLPU binary");
     }
     return value;
+}
+
+struct CompactQueueRecordHeader {
+    InstructionKind instruction_kind;
+    std::uint16_t word_count;
+    bool has_extension;
+    bool macro;
+};
+
+CompactQueueRecordHeader decode_compact_queue_record_header(
+    std::uint8_t flags)
+{
+    const auto instruction_kind = static_cast<InstructionKind>(
+        flags & kCompactInstructionKindMask);
+    const auto word_count = static_cast<std::uint16_t>(
+        (flags & kCompactWordCountMask) >> kCompactWordCountShift);
+    const bool has_extension = (flags & kCompactHasExtension) != 0;
+    const bool macro = (flags & kCompactMacro) != 0;
+    if (static_cast<std::uint16_t>(instruction_kind)
+            > static_cast<std::uint16_t>(InstructionKind::MxmDequant)
+        || word_count > QueueCommand {}.words.size()
+        || (macro && (instruction_kind == InstructionKind::None
+                         || has_extension)))
+        throw std::runtime_error("invalid compact FTLPU queue record");
+    return {instruction_kind, word_count, has_extension, macro};
+}
+
+std::uint8_t compact_queue_record_flags(const QueueCommand& command,
+    bool macro)
+{
+    if (static_cast<std::uint16_t>(command.instruction_kind)
+            > static_cast<std::uint16_t>(InstructionKind::MxmDequant)
+        || command.word_count > command.words.size()
+        || command.extension_words.size()
+            > std::numeric_limits<std::uint16_t>::max())
+        throw std::runtime_error(
+            "FTLPU queue command does not fit compact encoding");
+    return static_cast<std::uint8_t>(command.instruction_kind)
+        | static_cast<std::uint8_t>(command.word_count
+            << kCompactWordCountShift)
+        | static_cast<std::uint8_t>(
+            !macro && !command.extension_words.empty()
+                ? kCompactHasExtension : 0)
+        | static_cast<std::uint8_t>(macro ? kCompactMacro : 0);
+}
+
+void write_compact_queue_command(
+    std::ostream& os, const QueueCommand& command)
+{
+    const bool macro = is_macro_schedule_command(command);
+    write_scalar<std::uint8_t>(
+        os, compact_queue_record_flags(command, macro));
+    if (!macro) write_scalar<std::uint32_t>(os, command.command);
+    for (std::uint16_t word = 0; word < command.word_count; ++word)
+        write_scalar<std::uint32_t>(os, command.words[word]);
+    if (macro) {
+        const auto schedule = decode_macro_schedule_command(command);
+        write_scalar<std::uint32_t>(os,
+            static_cast<std::uint32_t>(schedule.start_cycle));
+        write_scalar<std::uint32_t>(os,
+            static_cast<std::uint32_t>(schedule.inner_count));
+        write_scalar<std::uint32_t>(os,
+            static_cast<std::uint32_t>(schedule.inner_interval));
+        write_scalar<std::int32_t>(os,
+            static_cast<std::int32_t>(schedule.inner_stride));
+        write_scalar<std::uint32_t>(os,
+            static_cast<std::uint32_t>(schedule.outer_count));
+        write_scalar<std::uint32_t>(os,
+            static_cast<std::uint32_t>(schedule.outer_interval));
+        write_scalar<std::int32_t>(os,
+            static_cast<std::int32_t>(schedule.outer_stride));
+        write_scalar<std::uint8_t>(os,
+            static_cast<std::uint8_t>(schedule.induction_target));
+    } else if (!command.extension_words.empty()) {
+        write_scalar<std::uint16_t>(os,
+            static_cast<std::uint16_t>(command.extension_words.size()));
+        for (const auto word : command.extension_words)
+            write_scalar<std::uint32_t>(os, word);
+    }
+}
+
+QueueCommand read_compact_queue_command(std::istream& is)
+{
+    const auto header = decode_compact_queue_record_header(
+        read_scalar<std::uint8_t>(is));
+    QueueCommand command;
+    command.instruction_kind = header.instruction_kind;
+    command.word_count = header.word_count;
+    command.command = header.macro
+        ? static_cast<isa::EncodedIcuCommand>(
+            isa::IcuCommandOpcode::Instruction)
+        : read_scalar<std::uint32_t>(is);
+    for (std::uint16_t word = 0; word < command.word_count; ++word)
+        command.words[word] = read_scalar<std::uint32_t>(is);
+    if (header.macro) {
+        const IcuMacroSchedule schedule {
+            read_scalar<std::uint32_t>(is),
+            read_scalar<std::uint32_t>(is),
+            read_scalar<std::uint32_t>(is),
+            read_scalar<std::int32_t>(is),
+            read_scalar<std::uint32_t>(is),
+            read_scalar<std::uint32_t>(is),
+            read_scalar<std::int32_t>(is),
+            static_cast<IcuInductionTarget>(read_scalar<std::uint8_t>(is)),
+        };
+        return encode_macro_schedule_command(std::move(command), schedule);
+    }
+    if (header.has_extension) {
+        const auto extension_count = read_scalar<std::uint16_t>(is);
+        command.extension_words.reserve(extension_count);
+        for (std::uint16_t word = 0; word < extension_count; ++word)
+            command.extension_words.push_back(read_scalar<std::uint32_t>(is));
+    }
+    return command;
 }
 
 void write_binding(std::ostream& os, const BinaryBinding& binding)
@@ -230,6 +349,41 @@ private:
     std::span<const std::uint8_t> data_;
     std::size_t offset_{0};
 };
+
+QueueCommand read_compact_queue_command(ByteReader& reader)
+{
+    const auto header = decode_compact_queue_record_header(
+        reader.read<std::uint8_t>());
+    QueueCommand command;
+    command.instruction_kind = header.instruction_kind;
+    command.word_count = header.word_count;
+    command.command = header.macro
+        ? static_cast<isa::EncodedIcuCommand>(
+            isa::IcuCommandOpcode::Instruction)
+        : reader.read<std::uint32_t>();
+    for (std::uint16_t word = 0; word < command.word_count; ++word)
+        command.words[word] = reader.read<std::uint32_t>();
+    if (header.macro) {
+        const IcuMacroSchedule schedule {
+            reader.read<std::uint32_t>(),
+            reader.read<std::uint32_t>(),
+            reader.read<std::uint32_t>(),
+            reader.read<std::int32_t>(),
+            reader.read<std::uint32_t>(),
+            reader.read<std::uint32_t>(),
+            reader.read<std::int32_t>(),
+            static_cast<IcuInductionTarget>(reader.read<std::uint8_t>()),
+        };
+        return encode_macro_schedule_command(std::move(command), schedule);
+    }
+    if (header.has_extension) {
+        const auto extension_count = reader.read<std::uint16_t>();
+        command.extension_words.reserve(extension_count);
+        for (std::uint16_t word = 0; word < extension_count; ++word)
+            command.extension_words.push_back(reader.read<std::uint32_t>());
+    }
+    return command;
+}
 
 BinaryBinding read_binding(ByteReader& reader, std::uint32_t version)
 {
@@ -466,6 +620,34 @@ void skip_bytes(std::istream& is, std::uint64_t bytes)
     if (!is) throw std::runtime_error("truncated FTLPU binary");
 }
 
+void skip_compact_queue_command(std::istream& is)
+{
+    const auto header = decode_compact_queue_record_header(
+        read_scalar<std::uint8_t>(is));
+    skip_bytes(is, static_cast<std::uint64_t>(header.word_count)
+            * sizeof(std::uint32_t)
+        + (header.macro ? 29 : sizeof(std::uint32_t)));
+    if (header.has_extension) {
+        const auto extension_count = read_scalar<std::uint16_t>(is);
+        skip_bytes(is, static_cast<std::uint64_t>(extension_count)
+            * sizeof(std::uint32_t));
+    }
+}
+
+void skip_compact_queue_command(ByteReader& reader)
+{
+    const auto header = decode_compact_queue_record_header(
+        reader.read<std::uint8_t>());
+    reader.skip(static_cast<std::uint64_t>(header.word_count)
+            * sizeof(std::uint32_t)
+        + (header.macro ? 29 : sizeof(std::uint32_t)));
+    if (header.has_extension) {
+        const auto extension_count = reader.read<std::uint16_t>();
+        reader.skip(static_cast<std::uint64_t>(extension_count)
+            * sizeof(std::uint32_t));
+    }
+}
+
 } // namespace
 
 void write_binary_program(const BinaryProgram& program, std::ostream& os)
@@ -527,17 +709,8 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.kind));
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.index));
         write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(queue.commands.size()));
-        for (const auto& command : queue.commands) {
-            write_scalar<std::uint32_t>(os, command.command);
-            write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(command.instruction_kind));
-            write_scalar<std::uint16_t>(os, command.word_count);
-            for (const auto word : command.words) {
-                write_scalar<std::uint32_t>(os, word);
-            }
-            write_scalar<std::uint16_t>(os,
-                static_cast<std::uint16_t>(command.extension_words.size()));
-            for (const auto word : command.extension_words) write_scalar<std::uint32_t>(os, word);
-        }
+        for (const auto& command : queue.commands)
+            write_compact_queue_command(os, command);
     }
     for (const auto& relocation : program.scale_relocations) {
         write_scalar<std::uint32_t>(os, relocation.binding_index);
@@ -673,6 +846,10 @@ BinaryProgram read_binary_program(std::istream& is)
         queue.commands.reserve(command_count);
 
         for (std::uint32_t command_id = 0; command_id < command_count; ++command_id) {
+            if (version >= 25) {
+                queue.commands.push_back(read_compact_queue_command(is));
+                continue;
+            }
             auto command = QueueCommand {};
             command.command = read_scalar<std::uint32_t>(is);
             command.instruction_kind = static_cast<InstructionKind>(read_scalar<std::uint16_t>(is));
@@ -829,6 +1006,10 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         const auto command_count = read_scalar<std::uint32_t>(is);
         for (std::uint32_t command = 0;
              command < command_count; ++command) {
+            if (version >= 25) {
+                skip_compact_queue_command(is);
+                continue;
+            }
             (void)read_scalar<std::uint32_t>(is);
             (void)read_scalar<std::uint16_t>(is);
             (void)read_scalar<std::uint16_t>(is);
@@ -847,7 +1028,8 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
             * (sizeof(std::uint32_t) * 3 + sizeof(std::uint16_t) * 3));
     const std::uint64_t address_relocation_size =
         sizeof(std::uint32_t) * 2 + sizeof(std::uint16_t) * 2
-        + (version >= 10 ? sizeof(std::uint16_t) : 0);
+        + (version >= 10 ? sizeof(std::uint16_t) : 0)
+        + (version >= 14 ? sizeof(std::uint16_t) : 0);
     skip_bytes(is,
         static_cast<std::uint64_t>(address_relocation_count)
             * address_relocation_size);
@@ -870,6 +1052,10 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
         queue.commands.reserve(command_count);
         for (std::uint32_t command_id = 0;
              command_id < command_count; ++command_id) {
+            if (header.version >= 25) {
+                queue.commands.push_back(read_compact_queue_command(reader));
+                continue;
+            }
             QueueCommand command;
             command.command = reader.read<std::uint32_t>();
             command.instruction_kind =
@@ -943,6 +1129,10 @@ BinaryProgram read_binary_program_metadata(
         const auto command_count = reader.read<std::uint32_t>();
         for (std::uint32_t command = 0;
              command < command_count; ++command) {
+            if (header.version >= 25) {
+                skip_compact_queue_command(reader);
+                continue;
+            }
             (void)reader.read<std::uint32_t>();
             (void)reader.read<std::uint16_t>();
             (void)reader.read<std::uint16_t>();

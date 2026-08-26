@@ -1,3 +1,4 @@
+#include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/schedule_trace.hpp"
 
 #include <filesystem>
@@ -114,6 +115,39 @@ try {
             mxm_command(ftlpu::MxmControlInstruction::IW(0, 3)),
             ftlpu::IcuMacroSchedule {10, 3, 2, 1, 1, 1, 0,
                 ftlpu::IcuInductionTarget::MxmWeightColumn})}});
+    program.address_relocations.push_back(BinaryAddressRelocation {
+        1, BindingAccess::Input, QueueKind::MxmLoad, 0, 0, false,
+    });
+
+    program.target_abi = executable_target_abi(program.hardware);
+    std::ostringstream binary(std::ios::out | std::ios::binary);
+    write_binary_program(program, binary);
+    const auto bytes = binary.str();
+    const auto decoded = read_binary_program(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+    std::istringstream metadataStream(bytes,
+        std::ios::in | std::ios::binary);
+    const auto streamMetadata = read_binary_program_metadata(metadataStream);
+    const auto spanMetadata = read_binary_program_metadata(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(bytes.data()),
+            bytes.size()));
+    if (decoded.queues.size() != 1 || decoded.queues[0].commands.size() != 1
+        || !is_macro_schedule_command(decoded.queues[0].commands[0]))
+        throw std::runtime_error("compact macro binary did not round-trip");
+    if (streamMetadata.target_abi != program.target_abi
+        || spanMetadata.target_abi != program.target_abi
+        || metadataStream.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error(
+            "compact macro metadata-only read did not round-trip");
+    const auto decodedMacro =
+        decode_macro_schedule_command(decoded.queues[0].commands[0]);
+    if (decodedMacro.start_cycle != 10 || decodedMacro.inner_count != 3
+        || decodedMacro.inner_interval != 2
+        || decodedMacro.inner_stride != 1
+        || decodedMacro.induction_target
+            != ftlpu::IcuInductionTarget::MxmWeightColumn)
+        throw std::runtime_error("compact macro descriptor changed on disk");
 
     const auto path = std::filesystem::temp_directory_path()
         / "ftlpu_schedule_trace_weight_page_test.csv";

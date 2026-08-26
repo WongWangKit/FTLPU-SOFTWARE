@@ -61,9 +61,17 @@ try {
     std::size_t serializedQueueBytes = program.queues.size() * 8;
     for (const auto& queue : program.queues) {
         for (const auto& command : queue.commands) {
-            serializedQueueBytes += 26
-                + command.extension_words.size() * sizeof(std::uint32_t);
-            if (ftlpu::software::runtime::is_macro_schedule_command(command)) {
+            const bool macro =
+                ftlpu::software::runtime::is_macro_schedule_command(command);
+            serializedQueueBytes += 1
+                + command.word_count * sizeof(std::uint32_t)
+                + (macro ? 29 : sizeof(std::uint32_t))
+                + (!macro && !command.extension_words.empty()
+                        ? sizeof(std::uint16_t)
+                            + command.extension_words.size()
+                                * sizeof(std::uint32_t)
+                        : 0);
+            if (macro) {
                 ++totalMacros;
                 const auto macro =
                     ftlpu::software::runtime::decode_macro_schedule_command(
