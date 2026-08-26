@@ -56,7 +56,8 @@ void assignMxmDataFormats(mlir::func::FuncOp function)
     });
 }
 
-void sequentializeScheduleStages(mlir::func::FuncOp function)
+void sequentializeScheduleStages(mlir::func::FuncOp function,
+    const target::LPUTargetModel& target)
 {
     llvm::SmallVector<llvm::SmallVector<mlir::Operation*>> stages;
     llvm::SmallVector<mlir::Operation*> current;
@@ -80,6 +81,8 @@ void sequentializeScheduleStages(mlir::func::FuncOp function)
     if (!current.empty()) stages.push_back(std::move(current));
 
     int64_t cursor = 0;
+    const int64_t streamDrainCycles =
+        target.streams().system_register_columns;
     for (auto& stage : stages) {
         int64_t first = std::numeric_limits<int64_t>::max();
         int64_t end = 0;
@@ -116,7 +119,11 @@ void sequentializeScheduleStages(mlir::func::FuncOp function)
             shiftIntegerAttribute(*operation, "start", offset);
             shiftIntegerAttribute(*operation, "end", offset);
         }
-        cursor += std::max<int64_t>(1, end - first);
+        // A stage can finish issuing while its final vector beat is still
+        // moving through passive stream-register links. Keep the next stage
+        // from injecting a different producer onto those links until the
+        // longest possible on-chip route has drained.
+        cursor += std::max<int64_t>(1, end - first) + streamDrainCycles;
     }
 
     llvm::SmallDenseSet<mlir::Value> returnedValues;
@@ -263,7 +270,7 @@ public:
         reportStage("generic-kernels");
 
         assignMxmDataFormats(function);
-        sequentializeScheduleStages(function);
+        sequentializeScheduleStages(function, target);
         reportStage("finalize");
     }
 

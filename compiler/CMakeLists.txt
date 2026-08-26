@@ -220,6 +220,12 @@ target_link_libraries(ftlpu_translate PRIVATE ftlpu_compiler)
 add_executable(ftlpu_compile tools/ftlpu_compile.cpp)
 set_target_properties(ftlpu_compile PROPERTIES OUTPUT_NAME "ftlpu-compile")
 target_link_libraries(ftlpu_compile PRIVATE ftlpu_compiler)
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+    # Large command streams such as Qwen seq128 exceed the default 2 GiB
+    # user-mode address-space ceiling of a 32-bit Windows executable.
+    target_link_options(ftlpu_compile PRIVATE /LARGEADDRESSAWARE)
+    target_link_options(ftlpu_opt PRIVATE /LARGEADDRESSAWARE)
+endif()
 if(FTLPU_ENABLE_ADDRESS_SANITIZER AND MSVC)
     target_compile_options(ftlpu_translate PRIVATE /fsanitize=address)
     target_compile_definitions(ftlpu_translate PRIVATE

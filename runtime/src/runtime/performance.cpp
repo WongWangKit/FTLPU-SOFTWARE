@@ -85,7 +85,8 @@ void print_runtime_performance(
         * program.hardware.mxms_per_hemisphere;
     std::array<QueueGroupStats, 7> groups {{
         {"MEM", program.hardware.hemispheres
-                * program.hardware.slices_per_hemisphere},
+                * program.hardware.slices_per_hemisphere
+                * program.hardware.banks_per_slice},
         {"MXM.load", logical_mxm_queues},
         {"MXM.compute", logical_mxm_queues},
         {"MXM.dequant", logical_mxm_queues},

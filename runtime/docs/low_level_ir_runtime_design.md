@@ -72,7 +72,7 @@ instruction words, and an optional variable payload.
 The compiler hashes every command-relevant topology, throughput, layout, and
 latency parameter, including `qk_iw_to_compute_latency`, into `target_abi`.
 The current CModel runtime accepts only
-`lpu_32stream_v1`. It rejects a mismatched or unidentified legacy binary before
+`ftlpu-lpu32`. It rejects a mismatched or unidentified legacy binary before
 writing any ICU queue, so architecture-exploration schedules cannot
 accidentally execute against the default hardware model. Versions 1 through 4
 remain readable for inspection, but have no target identity and are therefore

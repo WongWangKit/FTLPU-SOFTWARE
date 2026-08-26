@@ -67,7 +67,7 @@ QueueProgram[queue_count]
 
 编译器会把所有影响命令兼容性的拓扑、吞吐、布局和 latency 参数散列到
 `target_abi`，其中包括 `qk_iw_to_compute_latency`。当前 CModel runtime 只接受
-`lpu_32stream_v1`；如果 binary 的
+`ftlpu-lpu32`；如果 binary 的
 target 不匹配或来自没有 target 身份的旧格式，runtime 会在写入任何 ICU queue
 之前拒绝执行，避免架构探索配置误跑到默认硬件模型。版本 1 到 4 仍可被 reader
 读取用于检查，但不能由当前 runtime 执行。

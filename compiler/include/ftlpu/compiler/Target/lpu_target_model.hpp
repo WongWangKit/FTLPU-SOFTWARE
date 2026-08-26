@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ftlpu/core/hardware_params.hpp"
+
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
@@ -36,12 +38,12 @@ enum class FfnProjectionKind {
 };
 
 struct MemoryTopology {
-    int64_t hemispheres = 2;
-    int64_t slices_per_hemisphere = 52;
-    int64_t banks_per_slice = 2;
-    int64_t words_per_bank = 32768;
-    int64_t bytes_per_word = 32;
-    int64_t sram_depth_rows = 32768;
+    int64_t hemispheres = hw::kHemispheres;
+    int64_t slices_per_hemisphere = hw::kMemSliceColumns;
+    int64_t banks_per_slice = hw::kMemBanksPerSlice;
+    int64_t words_per_bank = hw::kSramDepthRows;
+    int64_t bytes_per_word = hw::kSramRowBytes;
+    int64_t sram_depth_rows = hw::kSramDepthRows;
     int64_t sram_read_ports_per_slice = 1;
     int64_t sram_write_ports_per_slice = 1;
     // When enabled, slices below w8a16_weight_slice_base are activation-only
@@ -55,7 +57,7 @@ struct MemoryTopology {
     int64_t w8a16_activation_slice_base = 32;
     int64_t w8a16_hidden_slice_base = 21;
     int64_t w8a16_hidden_base_row = 0;
-    int64_t attention_mask_base_row = 8128;
+    int64_t attention_mask_base_row = hw::kSramDepthRows - 64;
     int64_t w8a16_result_slice_base = 24;
     int64_t matmul_result_base_row = 1600;
     std::array<int64_t, 4> w8a16_fused_gate_temp_slices{{1, 5, 9, 29}};
@@ -63,41 +65,41 @@ struct MemoryTopology {
 };
 
 struct StreamTopology {
-    int64_t streams_per_direction = 32;
-    int64_t encoded_streams = 64;
+    int64_t streams_per_direction = hw::kStreamsPerDirection;
+    int64_t encoded_streams = hw::kStreams;
     int64_t c2c_streams_per_direction = 8;
     int64_t c2c_bytes_per_stream_per_cycle = 32;
-    int64_t mem_boundary_register_columns = 14;
-    int64_t system_register_columns = 16;
-    int64_t mem_slices_per_register_group = 4;
+    int64_t mem_boundary_register_columns = hw::kMemBoundaryStreamRegisterColumns;
+    int64_t system_register_columns = hw::kSystemStreamRegisterColumns;
+    int64_t mem_slices_per_register_group = hw::kMemSlicesPerGroup;
 };
 
 struct ThroughputModel {
     int64_t icu_repeat_2d_enabled = 1;
-    int64_t tile_rows = 4;
-    int64_t lanes_per_tile = 8;
-    int64_t mem_read_bytes_per_cycle = 8;
-    int64_t mem_write_bytes_per_cycle = 8;
-    int64_t mxm_rows = 32;
-    int64_t mxm_columns = 32;
-    int64_t mxm_load_streams_per_cycle = 16;
-    int64_t mxm_int8_load_streams_per_cycle = 8;
-    int64_t mxm_load_bytes_per_cycle = 128;
+    int64_t tile_rows = hw::kTileRows;
+    int64_t lanes_per_tile = hw::kLanesPerTile;
+    int64_t mem_read_bytes_per_cycle = hw::kMemReadBytesPerCycle;
+    int64_t mem_write_bytes_per_cycle = hw::kMemWriteBytesPerCycle;
+    int64_t mxm_rows = hw::kMxmRows;
+    int64_t mxm_columns = hw::kMxmColumns;
+    int64_t mxm_load_streams_per_cycle = hw::kMxmLoadStreamsPerCycle;
+    int64_t mxm_int8_load_streams_per_cycle = hw::kMxmInt8LoadStreamsPerCycle;
+    int64_t mxm_load_bytes_per_cycle = hw::kMxmLoadBytesPerCycle;
     int64_t mxm_activation_streams = 4;
     int64_t mxm_result_streams = 4;
     int64_t mxm_pipeline_rows = 4;
     int64_t mxm_block_rows = 8;
     int64_t mxm_local_dequant_enabled = 1;
-    int64_t mxm_block_compute_enabled = 1;
+    int64_t mxm_block_compute_enabled = 0;
     int64_t mxm_weight_activation_overlap_enabled = 1;
     int64_t mxm_local_load_to_compute_latency = 4;
     int64_t mxm_block_group_interval = 8;
     int64_t mxm_earliest_iw_cycle = 2;
     int64_t qk_iw_to_compute_latency = 24;
-    int64_t mxms_per_hemisphere = 1;
+    int64_t mxms_per_hemisphere = hw::kMxmsPerHemisphere;
     int64_t mxm_weight_buffers = 2;
-    int64_t mxm_accumulator_blocks = 256;
-    int64_t vxm_alus = 16;
+    int64_t mxm_accumulator_blocks = hw::kMxmAccumulatorBlockCount;
+    int64_t vxm_alus = hw::kVxmAluCount;
     int64_t vxm_weight_to_iw_latency = 16;
     int64_t mem_to_sxm_latency = 14;
     int64_t mem_to_mxm_latency = 16;
@@ -223,7 +225,7 @@ public:
     static std::string_view endpoint_name(StreamEndpoint endpoint);
 
 private:
-    std::string name_{"lpu_32stream_v1"};
+    std::string name_{hw::kTargetName};
     MemoryTopology memory_;
     StreamTopology streams_;
     ThroughputModel throughput_;

@@ -103,6 +103,190 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     const auto* streams = root->getObject("streams");
     const auto* throughput = root->getObject("throughput");
     LPUTargetModel model;
+
+    // Schema v1 is the shared physical-target format consumed by both the
+    // CModel CMake build and FTLPU-SOFTWARE. Legacy compiler exploration
+    // files keep using the memory/streams/throughput overlay below.
+    if (const auto schema = root->getInteger("schema_version")) {
+        if (*schema != 1) {
+            error = "unsupported hardware configuration schema_version";
+            return mlir::failure();
+        }
+        const auto require_object = [&](llvm::StringRef name) {
+            const auto* object = root->getObject(name);
+            if (!object && error.empty())
+                error = ("missing hardware configuration object: " + name).str();
+            return object;
+        };
+        const auto* target = require_object("target");
+        const auto* topology = require_object("topology");
+        const auto* mem = require_object("mem");
+        const auto* sr = require_object("sr");
+        const auto* mxm = require_object("mxm");
+        const auto* vxm = require_object("vxm");
+        if (!error.empty()) return mlir::failure();
+
+        const auto read_required = [&](const llvm::json::Object* object,
+                                       llvm::StringRef section,
+                                       llvm::StringRef field,
+                                       int64_t& value) {
+            const auto integer = object->getInteger(field);
+            if (!integer) {
+                error = ("missing integer hardware configuration field: "
+                    + section + "." + field).str();
+                return false;
+            }
+            value = *integer;
+            return true;
+        };
+
+        const auto target_name = target->getString("name");
+        if (!target_name || target_name->empty()) {
+            error = "target.name must be a non-empty string";
+            return mlir::failure();
+        }
+        model.name_ = target_name->str();
+
+        int64_t bytes_per_lane = 0;
+        int64_t registers_per_lane = 0;
+        int64_t bytes_per_stream_per_lane = 0;
+        int64_t vxm_alus_per_direction = 0;
+        if (!read_required(topology, "topology", "hemispheres",
+                model.memory_.hemispheres)
+            || !read_required(topology, "topology", "tiles_per_slice",
+                model.throughput_.tile_rows)
+            || !read_required(topology, "topology", "lanes_per_tile",
+                model.throughput_.lanes_per_tile)
+            || !read_required(mem, "mem", "slices_per_hemisphere",
+                model.memory_.slices_per_hemisphere)
+            || !read_required(mem, "mem", "banks_per_slice",
+                model.memory_.banks_per_slice)
+            || !read_required(mem, "mem", "rows_per_bank",
+                model.memory_.sram_depth_rows)
+            || !read_required(mem, "mem", "bytes_per_lane",
+                bytes_per_lane)
+            || !read_required(sr, "sr", "registers_per_lane",
+                registers_per_lane)
+            || !read_required(sr, "sr", "bytes_per_stream_per_lane",
+                bytes_per_stream_per_lane)
+            || !read_required(mxm, "mxm", "accum_contexts",
+                model.throughput_.mxm_accumulator_blocks)
+            || !read_required(vxm, "vxm", "alus",
+                vxm_alus_per_direction))
+            return mlir::failure();
+
+        if (model.memory_.hemispheres <= 0
+            || model.throughput_.tile_rows <= 0
+            || model.throughput_.lanes_per_tile <= 0
+            || model.memory_.slices_per_hemisphere <= 0
+            || model.memory_.banks_per_slice <= 0
+            || model.memory_.sram_depth_rows <= 0
+            || bytes_per_lane <= 0
+            || registers_per_lane <= 0
+            || bytes_per_stream_per_lane <= 0
+            || model.throughput_.mxm_accumulator_blocks <= 0
+            || vxm_alus_per_direction <= 0) {
+            error = "hardware configuration integer fields must be positive";
+            return mlir::failure();
+        }
+        if (registers_per_lane != 64) {
+            error = "sr.registers_per_lane must be 64 for the current 6-bit stream ISA";
+            return mlir::failure();
+        }
+        if (bytes_per_lane != 1 || bytes_per_stream_per_lane != 1) {
+            error = "the current byte-stream datapath requires both byte-width fields to be 1";
+            return mlir::failure();
+        }
+        if (model.throughput_.mxm_accumulator_blocks > 256) {
+            error = "mxm.accum_contexts exceeds the 13-bit accumulator address capacity";
+            return mlir::failure();
+        }
+        const auto rows_per_bank = model.memory_.sram_depth_rows;
+        if (rows_per_bank < 64 || rows_per_bank > 32768
+            || (rows_per_bank & (rows_per_bank - 1)) != 0) {
+            error = "mem.rows_per_bank must be a power of two in [64, 32768]";
+            return mlir::failure();
+        }
+
+        model.memory_.words_per_bank = model.memory_.sram_depth_rows;
+        model.memory_.bytes_per_word = model.throughput_.tile_rows
+            * model.throughput_.lanes_per_tile * bytes_per_lane;
+        model.memory_.attention_mask_base_row =
+            model.memory_.sram_depth_rows - 64;
+        model.streams_.encoded_streams = registers_per_lane;
+        model.streams_.streams_per_direction = registers_per_lane / 2;
+        model.streams_.c2c_streams_per_direction =
+            model.throughput_.lanes_per_tile;
+        model.streams_.c2c_bytes_per_stream_per_cycle =
+            model.memory_.bytes_per_word;
+        model.streams_.mem_slices_per_register_group =
+            model.throughput_.tile_rows;
+        model.streams_.mem_boundary_register_columns =
+            model.memory_.slices_per_hemisphere
+                / model.streams_.mem_slices_per_register_group
+            + 1;
+        model.streams_.system_register_columns =
+            model.streams_.mem_boundary_register_columns + 2;
+        model.throughput_.mem_read_bytes_per_cycle =
+            model.throughput_.lanes_per_tile * bytes_per_lane;
+        model.throughput_.mem_write_bytes_per_cycle =
+            model.throughput_.mem_read_bytes_per_cycle;
+        model.throughput_.mxm_rows = model.memory_.bytes_per_word;
+        model.throughput_.mxm_columns = model.memory_.bytes_per_word;
+        model.throughput_.mxm_load_streams_per_cycle =
+            2 * model.throughput_.lanes_per_tile;
+        model.throughput_.mxm_int8_load_streams_per_cycle =
+            model.throughput_.lanes_per_tile;
+        model.throughput_.mxm_load_bytes_per_cycle =
+            model.throughput_.lanes_per_tile
+            * model.throughput_.mxm_load_streams_per_cycle
+            * bytes_per_stream_per_lane;
+        model.throughput_.mxm_pipeline_rows =
+            model.throughput_.tile_rows;
+        model.throughput_.vxm_alus = 2 * vxm_alus_per_direction;
+        model.throughput_.mxm_block_compute_enabled = 0;
+        model.throughput_.mem_to_sxm_latency =
+            model.streams_.system_register_columns - 2;
+        model.throughput_.mem_to_mxm_latency =
+            model.streams_.system_register_columns;
+
+        const auto* supported_modes = mxm->getArray("supported_modes");
+        if (!supported_modes || supported_modes->empty()) {
+            error = "mxm.supported_modes must be a non-empty array";
+            return mlir::failure();
+        }
+        bool native4x4 = false;
+        bool linear1x16 = false;
+        for (const auto& value : *supported_modes) {
+            const auto mode = value.getAsString();
+            if (!mode) {
+                error = "mxm.supported_modes entries must be strings";
+                return mlir::failure();
+            }
+            if (*mode == "native4x4") {
+                if (native4x4) {
+                    error = "mxm.supported_modes contains native4x4 twice";
+                    return mlir::failure();
+                }
+                native4x4 = true;
+            } else if (*mode == "linear1x16") {
+                if (linear1x16) {
+                    error = "mxm.supported_modes contains linear1x16 twice";
+                    return mlir::failure();
+                }
+                linear1x16 = true;
+            }
+            else {
+                error = ("unsupported MXM mode: " + *mode).str();
+                return mlir::failure();
+            }
+        }
+        if (native4x4 != hw::kMxmSupportsNative4x4
+            || linear1x16 != hw::kMxmSupportsLinear1x16) {
+            error = "mxm.supported_modes differs from the software build configuration";
+            return mlir::failure();
+        }
+    }
     if (const auto name = root->getString("name")) model.name_ = name->str();
 
 #define READ_MEMORY(field) \

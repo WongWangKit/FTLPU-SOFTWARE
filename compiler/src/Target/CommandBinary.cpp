@@ -461,9 +461,9 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
             == "int8_dequant_bf16"
         ? MxmWeightInputMode::Int8DequantBf16
         : MxmWeightInputMode::Direct16;
-    const auto computeMode =
-        op.getComputeMode().value_or("vector") == "block8"
-        ? MxmComputeMode::Block8 : MxmComputeMode::Vector;
+    if (op.getComputeMode().value_or("vector") != "vector")
+        throw std::runtime_error(
+            "Block8 MXM commands are not supported by this target");
     const auto kind = is_load ? QueueKind::MxmLoad : QueueKind::MxmCompute;
     const int64_t waveCount = op.getWaveCount().value_or(1);
     const int64_t waveInterval = op.getWaveInterval().value_or(1);
@@ -519,7 +519,7 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
             : is_accumulator_read
             ? MxmControlInstruction::AccumulatorRead(
                 op.getAccumulatorAddress(), op.getOutputStreamBase(),
-                op.getAccumulatorClear(), computeMode,
+                op.getAccumulatorClear(),
                 op.getAccumulatorOutputFormat().value_or("fp32") == "bf16"
                     ? MxmAccumulatorOutputFormat::BFloat16
                     : MxmAccumulatorOutputFormat::Float32,
@@ -531,7 +531,7 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
                 op.getDataFormat().value_or("fp16") == "bf16"
                     ? MxmDataFormat::BFloat16
                     : MxmDataFormat::Float16,
-                computeMode, op.getAccumulatorClear(),
+                op.getAccumulatorClear(),
                 op.getAccumulatorOutputFormat().value_or("fp32") == "bf16"
                     ? MxmAccumulatorOutputFormat::BFloat16
                     : MxmAccumulatorOutputFormat::Float32);

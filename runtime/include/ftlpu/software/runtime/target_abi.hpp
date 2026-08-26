@@ -8,42 +8,42 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::string_view kLpu32StreamTargetName = "lpu_32stream_v1";
+inline constexpr std::string_view kLpu32StreamTargetName = hw::kTargetName;
 
 // Self-contained hardware contract embedded in every executable. Structural
 // fields describe the instruction and transport geometry; capacity fields may
 // select a logical subset of a larger CModel instance.
 struct ExecutableHardwareConfig {
-    std::uint32_t hemispheres{2};
-    std::uint32_t slices_per_hemisphere{52};
-    std::uint32_t banks_per_slice{2};
-    std::uint32_t words_per_bank{32768};
-    std::uint32_t bytes_per_word{32};
-    std::uint32_t sram_depth_rows{32768};
+    std::uint32_t hemispheres{hw::kHemispheres};
+    std::uint32_t slices_per_hemisphere{hw::kMemSliceColumns};
+    std::uint32_t banks_per_slice{hw::kMemBanksPerSlice};
+    std::uint32_t words_per_bank{hw::kSramDepthRows};
+    std::uint32_t bytes_per_word{hw::kSramRowBytes};
+    std::uint32_t sram_depth_rows{hw::kSramDepthRows};
     std::uint32_t sram_read_ports_per_slice{1};
     std::uint32_t sram_write_ports_per_slice{1};
-    std::uint32_t streams_per_direction{32};
-    std::uint32_t encoded_streams{64};
+    std::uint32_t streams_per_direction{hw::kStreamsPerDirection};
+    std::uint32_t encoded_streams{hw::kStreams};
     std::uint32_t c2c_streams_per_direction{hw::kC2cStreamsPerDirection};
     std::uint32_t c2c_bytes_per_stream_per_cycle{hw::kPhysicalVectorBytes};
-    std::uint32_t mem_boundary_register_columns{14};
-    std::uint32_t system_register_columns{16};
-    std::uint32_t mem_slices_per_register_group{4};
-    std::uint32_t tile_rows{4};
-    std::uint32_t lanes_per_tile{8};
-    std::uint32_t mem_read_bytes_per_cycle{8};
-    std::uint32_t mem_write_bytes_per_cycle{8};
-    std::uint32_t mxm_rows{32};
-    std::uint32_t mxm_columns{32};
-    std::uint32_t mxm_load_streams_per_cycle{16};
-    std::uint32_t mxm_int8_load_streams_per_cycle{8};
-    std::uint32_t mxm_load_bytes_per_cycle{128};
+    std::uint32_t mem_boundary_register_columns{hw::kMemBoundaryStreamRegisterColumns};
+    std::uint32_t system_register_columns{hw::kSystemStreamRegisterColumns};
+    std::uint32_t mem_slices_per_register_group{hw::kMemSlicesPerGroup};
+    std::uint32_t tile_rows{hw::kTileRows};
+    std::uint32_t lanes_per_tile{hw::kLanesPerTile};
+    std::uint32_t mem_read_bytes_per_cycle{hw::kMemReadBytesPerCycle};
+    std::uint32_t mem_write_bytes_per_cycle{hw::kMemWriteBytesPerCycle};
+    std::uint32_t mxm_rows{hw::kMxmRows};
+    std::uint32_t mxm_columns{hw::kMxmColumns};
+    std::uint32_t mxm_load_streams_per_cycle{hw::kMxmLoadStreamsPerCycle};
+    std::uint32_t mxm_int8_load_streams_per_cycle{hw::kMxmInt8LoadStreamsPerCycle};
+    std::uint32_t mxm_load_bytes_per_cycle{hw::kMxmLoadBytesPerCycle};
     std::uint32_t mxm_activation_streams{4};
     std::uint32_t mxm_result_streams{4};
     std::uint32_t mxm_pipeline_rows{4};
     std::uint32_t mxm_block_rows{8};
     std::uint32_t mxm_local_dequant_enabled{1};
-    std::uint32_t mxm_block_compute_enabled{1};
+    std::uint32_t mxm_block_compute_enabled{0};
     std::uint32_t mxm_weight_activation_overlap_enabled{1};
     std::uint32_t mxm_local_load_to_compute_latency{4};
     std::uint32_t mxm_block_group_interval{8};
@@ -51,7 +51,7 @@ struct ExecutableHardwareConfig {
     std::uint32_t qk_iw_to_compute_latency{24};
     std::uint32_t mxms_per_hemisphere{hw::kMxmsPerHemisphere};
     std::uint32_t mxm_weight_buffers{2};
-    std::uint32_t vxm_alus{16};
+    std::uint32_t vxm_alus{hw::kVxmAluCount};
     std::uint32_t vxm_weight_to_iw_latency{16};
     std::uint32_t mem_to_sxm_latency{14};
     std::uint32_t mem_to_mxm_latency{16};

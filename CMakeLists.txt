@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 
 project(FTLPU_SOFTWARE LANGUAGES CXX)
 
@@ -22,6 +22,17 @@ set(FTLPU_CMODEL_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../FTLPU-CMODEL"
     CACHE PATH
     "Path to the FTLPU-CMODEL repository")
+
+set(FTLPU_HARDWARE_CONFIG
+    "${FTLPU_CMODEL_DIR}/config/ftlpu-lpu32.json"
+    CACHE FILEPATH
+    "Shared hardware target JSON used by FTLPU-SOFTWARE and FTLPU-CMODEL")
+set(FTLPU_GENERATED_INCLUDE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
+include("${FTLPU_CMODEL_DIR}/cmake/FTLPUHardwareConfig.cmake")
+ftlpu_generate_hardware_config(
+    "${FTLPU_HARDWARE_CONFIG}"
+    "${FTLPU_GENERATED_INCLUDE_DIR}/ftlpu/core/hardware_config.hpp")
 
 enable_testing()
 

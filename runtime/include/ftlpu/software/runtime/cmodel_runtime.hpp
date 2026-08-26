@@ -42,7 +42,7 @@ private:
     TspSliceSystem& system_;
     std::size_t loaded_max_cycle_{0};
     std::size_t loaded_mxms_per_hemisphere_{hw::kMxmsPerHemisphere};
-    std::size_t loaded_vxm_alus_{16};
+    std::size_t loaded_vxm_alus_{hw::kVxmAluCount};
     std::vector<BinaryBinding> bindings_;
     ExecutableHardwareConfig hardware_{};
     std::vector<BinaryWeightPageUse> weight_page_uses_{};

@@ -1,18 +1,7 @@
 add_library(ftlpu_cmodel_static STATIC
     src/cmodel/cmodel_static.cpp
     "${FTLPU_CMODEL_DIR}/src/mem/sram.cpp"
-    "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp"
-    "${FTLPU_CMODEL_DIR}/src/mxm/block_accumulator.cpp")
-
-set(FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT 256 CACHE STRING
-    "Number of complete 32x32 FP32 partial-sum blocks per MXM accumulator")
-if(NOT FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT MATCHES "^[1-9][0-9]*$" OR
-   FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT GREATER 256)
-    message(FATAL_ERROR
-        "FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT must be an integer in [1, 256]")
-endif()
-target_compile_definitions(ftlpu_cmodel_static PUBLIC
-    FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT=${FTLPU_MXM_ACCUMULATOR_BLOCK_COUNT})
+    "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp")
 
 file(GLOB_RECURSE FTLPU_CMODEL_PUBLIC_HEADERS CONFIGURE_DEPENDS
     "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
@@ -28,7 +17,6 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/cmodel/cmodel_static.cpp
     "${FTLPU_CMODEL_DIR}/src/mem/sram.cpp"
     "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp"
-    "${FTLPU_CMODEL_DIR}/src/mxm/block_accumulator.cpp"
     src/runtime/binary.cpp
     src/runtime/cmodel_runtime.cpp
     src/runtime/icu_program.cpp
@@ -72,6 +60,7 @@ set_source_files_properties(${FTLPU_CMODEL_CONSUMER_SOURCES}
 target_include_directories(ftlpu_cmodel_static
     PUBLIC
         include
+        "${FTLPU_GENERATED_INCLUDE_DIR}"
         "${FTLPU_CMODEL_DIR}/include")
 
 add_library(ftlpu_software

@@ -334,8 +334,6 @@ void CModelRuntime::load(const BinaryProgram& program)
     hardware.c2c_dedicated_streams = false;
     hardware.mxm_local_dequant_enabled =
         program.hardware.mxm_local_dequant_enabled != 0;
-    hardware.mxm_block_compute_enabled =
-        program.hardware.mxm_block_compute_enabled != 0;
     hardware.mxm_weight_activation_overlap_enabled =
         program.hardware.mxm_weight_activation_overlap_enabled != 0;
     system_.configure_hardware(hardware);

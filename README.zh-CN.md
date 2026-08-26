@@ -104,3 +104,11 @@ ctest --test-dir build --output-on-failure
 ```powershell
 cmake -S . -B build -DFTLPU_CMODEL_DIR=E:/path/to/FTLPU-CMODEL
 ```
+
+两个工程默认读取同一个物理 target 文件：
+`../FTLPU-CMODEL/config/ftlpu-lpu32.json`。CMake 会校验它并生成 CModel/runtime
+ABI 所需的编译期常量；compiler 工具也可以通过 `--target-config` 直接读取同一
+文件。若选择其他兼容 target，需要为两个工程传入相同的
+`-DFTLPU_HARDWARE_CONFIG=E:/path/to/target.json` 后重新配置和构建。
+JSON 格式、字段推导、修改方法和校验限制见
+[JSON 硬件配置指南](../FTLPU-CMODEL/docs/hardware_configuration.zh-CN.md)。

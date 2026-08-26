@@ -13,7 +13,7 @@ def lower(tool: Path, source: Path, output: Path,
         str(tool),
         "--input", str(source),
         "--output", str(output),
-        "--pipeline", "ftlpu-stablehlo-to-schedule",
+        "--pipeline", "ftlpu-stablehlo-to-kernel",
     ]
     if target_config is not None:
         command.extend(["--target-config", str(target_config)])
@@ -30,9 +30,9 @@ def main() -> None:
     args = parser.parse_args()
 
     baseline = lower(
-        args.tool, args.input, args.output_dir / "default.schedule.mlir")
+        args.tool, args.input, args.output_dir / "default.kernel.mlir")
     explored = lower(
-        args.tool, args.input, args.output_dir / "explored.schedule.mlir",
+        args.tool, args.input, args.output_dir / "explored.kernel.mlir",
         args.target_config)
 
     required = [
@@ -44,16 +44,16 @@ def main() -> None:
         "mxm_pipeline_rows = 6 : i64",
         "vxm_weight_to_iw_latency = 10 : i64",
         "swiglu_write_latency = 11 : i64",
-        "ftlpu.schedule.mxm_issue",
-        "ftlpu.schedule.mxm_dequant",
-        "ftlpu.schedule.vxm",
+        "ftlpu.kernel.matmul",
+        "ftlpu.kernel.swish",
+        "ftlpu.kernel.elementwise",
     ]
     missing = [value for value in required if value not in explored]
     if missing:
         raise AssertionError(
-            f"configured Schedule IR is missing: {missing}")
-    if 'name = "lpu_32stream_v1"' not in baseline:
-        raise AssertionError("default Schedule IR has no explicit 32-stream target")
+            f"configured Kernel IR is missing: {missing}")
+    if 'name = "ftlpu-lpu32"' not in baseline:
+        raise AssertionError("default Kernel IR has no explicit 32-stream target")
     if baseline == explored:
         raise AssertionError("non-default target did not change Schedule IR")
 

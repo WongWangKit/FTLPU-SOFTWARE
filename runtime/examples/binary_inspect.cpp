@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string_view>
@@ -12,10 +13,14 @@
 
 int main(int argc, char** argv)
 try {
-    if (argc != 2 && argc != 4)
+    if (argc != 2 && argc != 3 && argc != 4)
         throw std::runtime_error(
             "usage: ftlpu_binary_inspect program.ftlpu "
-            "[--trace schedule.csv]");
+            "[--all-queues] [--trace schedule.csv]");
+    const bool reportAllQueues = argc == 3
+        && std::string_view(argv[2]) == "--all-queues";
+    if (argc == 3 && !reportAllQueues)
+        throw std::runtime_error("expected --all-queues");
     if (argc == 4 && std::string_view(argv[2]) != "--trace")
         throw std::runtime_error("expected --trace before the CSV path");
 
@@ -38,7 +43,92 @@ try {
     for (const auto& queue : program.queues)
         total_commands += queue.commands.size();
     std::cout << "binary queues=" << program.queues.size()
-              << " commands=" << total_commands << '\n';
+              << " commands=" << total_commands
+              << " file_bytes=" << std::filesystem::file_size(argv[1])
+              << '\n';
+    std::size_t totalInstructions = 0;
+    std::size_t totalNops = 0;
+    std::size_t totalRepeats = 0;
+    std::size_t totalRepeat2D = 0;
+    std::size_t totalLoops = 0;
+    std::size_t totalMacros = 0;
+    std::size_t expandedInstructions = 0;
+    std::size_t repeatReplayed = 0;
+    std::size_t repeat2DReplayed = 0;
+    std::size_t loopReplayed = 0;
+    std::size_t macroExpanded = 0;
+    std::size_t serializedQueueBytes = program.queues.size() * 8;
+    for (const auto& queue : program.queues) {
+        for (const auto& command : queue.commands) {
+            serializedQueueBytes += 26
+                + command.extension_words.size() * sizeof(std::uint32_t);
+            if (ftlpu::software::runtime::is_macro_schedule_command(command)) {
+                ++totalMacros;
+                const auto macro =
+                    ftlpu::software::runtime::decode_macro_schedule_command(
+                        command);
+                macroExpanded += macro.inner_count * macro.outer_count;
+                expandedInstructions += macro.inner_count * macro.outer_count;
+                continue;
+            }
+            if (ftlpu::software::runtime::is_repeat_2d_command(command)) {
+                ++totalRepeat2D;
+                const auto repeat =
+                    ftlpu::software::runtime::decode_repeat_2d_command(
+                        command);
+                repeat2DReplayed +=
+                    repeat.inner_count * repeat.outer_count - 1;
+                expandedInstructions +=
+                    repeat.inner_count * repeat.outer_count - 1;
+                continue;
+            }
+            switch (ftlpu::isa::decode_icu_command_opcode(command.command)) {
+            case ftlpu::isa::IcuCommandOpcode::Instruction:
+                ++totalInstructions;
+                ++expandedInstructions;
+                break;
+            case ftlpu::isa::IcuCommandOpcode::Nop:
+                ++totalNops;
+                break;
+            case ftlpu::isa::IcuCommandOpcode::Repeat:
+                ++totalRepeats;
+                repeatReplayed +=
+                    ftlpu::isa::decode_icu_repeat(command.command).count;
+                expandedInstructions +=
+                    ftlpu::isa::decode_icu_repeat(command.command).count;
+                break;
+            case ftlpu::isa::IcuCommandOpcode::Loop: {
+                ++totalLoops;
+                const auto loop =
+                    ftlpu::isa::decode_icu_loop(command.command);
+                loopReplayed += loop.window_size * loop.count;
+                expandedInstructions += loop.window_size * loop.count;
+                break;
+            }
+            default:
+                break;
+            }
+        }
+    }
+    const std::size_t encodedWorkEntries = totalInstructions + totalRepeats
+        + totalRepeat2D + totalLoops + totalMacros;
+    const std::size_t savedWorkEntries = expandedInstructions
+        > encodedWorkEntries ? expandedInstructions - encodedWorkEntries : 0;
+    std::cout << "binary aggregate instruction=" << totalInstructions
+              << " nop=" << totalNops
+              << " repeat=" << totalRepeats
+              << " repeat2d=" << totalRepeat2D
+              << " loop=" << totalLoops
+              << " macro=" << totalMacros
+              << " repeat_replayed=" << repeatReplayed
+              << " repeat2d_replayed=" << repeat2DReplayed
+              << " loop_replayed=" << loopReplayed
+              << " macro_expanded=" << macroExpanded
+              << " expanded_instruction=" << expandedInstructions
+              << " encoded_work_entries=" << encodedWorkEntries
+              << " saved_work_entries=" << savedWorkEntries
+              << " serialized_queue_bytes=" << serializedQueueBytes
+              << '\n';
     std::map<std::pair<std::uint32_t,
         ftlpu::software::runtime::QueueKind>, std::size_t>
         scaleRelocations;
@@ -52,7 +142,8 @@ try {
                   << " resource="
                   << ftlpu::software::runtime::queue_kind_name(key.second)
                   << " count=" << count << '\n';
-    const std::size_t reported = std::min<std::size_t>(queues.size(), 20);
+    const std::size_t reported = reportAllQueues
+        ? queues.size() : std::min<std::size_t>(queues.size(), 20);
     for (std::size_t i = 0; i < reported; ++i) {
         const auto& queue = *queues[i];
         std::size_t instructions = 0;
@@ -107,6 +198,27 @@ try {
              ftlpu::software::runtime::QueueKind::Vxm,
              ftlpu::software::runtime::QueueKind::SxmTranspose,
              ftlpu::software::runtime::QueueKind::SxmPermute}) {
+        std::size_t kindQueues = 0;
+        std::size_t kindCommands = 0;
+        std::size_t kindMin = std::numeric_limits<std::size_t>::max();
+        std::size_t kindMax = 0;
+        for (const auto* queue : queues) {
+            if (queue->kind != kind) continue;
+            ++kindQueues;
+            kindCommands += queue->commands.size();
+            kindMin = std::min(kindMin, queue->commands.size());
+            kindMax = std::max(kindMax, queue->commands.size());
+        }
+        if (kindQueues != 0)
+            std::cout << "binary resource_summary resource="
+                      << ftlpu::software::runtime::queue_kind_name(kind)
+                      << " queues=" << kindQueues
+                      << " commands=" << kindCommands
+                      << " min=" << kindMin
+                      << " max=" << kindMax
+                      << " average="
+                      << static_cast<double>(kindCommands) / kindQueues
+                      << '\n';
         const auto found = std::ranges::find_if(queues,
             [kind](const auto* queue) { return queue->kind == kind; });
         if (found == queues.end()) continue;

@@ -105,3 +105,11 @@ If the CModel is elsewhere:
 ```powershell
 cmake -S . -B build -DFTLPU_CMODEL_DIR=E:/path/to/FTLPU-CMODEL
 ```
+
+Both projects read the same physical target file, defaulting to
+`../FTLPU-CMODEL/config/ftlpu-lpu32.json`. CMake validates it and generates the
+compile-time CModel/runtime ABI constants; compiler tools also accept that exact
+file through `--target-config`. To select another compatible target, configure
+both repositories with the same `-DFTLPU_HARDWARE_CONFIG=E:/path/to/target.json`.
+See the [JSON hardware configuration guide](../FTLPU-CMODEL/docs/hardware_configuration.zh-CN.md)
+for the schema, field derivations, commands, and validation constraints.
