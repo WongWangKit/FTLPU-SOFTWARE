@@ -29,6 +29,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/weight_page_builder.cpp
     src/runtime/weight_prefetch_plan.cpp
     examples/binary_inspect.cpp
+    examples/binary_repack.cpp
     examples/pack_model_weights.cpp
     tests/runtime/command_mxm_column_binary_test.cpp
     tests/runtime/command_vxm_binary_runtime_test.cpp
@@ -98,6 +99,9 @@ target_link_libraries(ftlpu_software
 
 add_executable(ftlpu_binary_inspect examples/binary_inspect.cpp)
 target_link_libraries(ftlpu_binary_inspect PRIVATE ftlpu_software)
+
+add_executable(ftlpu_binary_repack examples/binary_repack.cpp)
+target_link_libraries(ftlpu_binary_repack PRIVATE ftlpu_software)
 
 add_executable(schedule_trace_weight_page_test
     tests/runtime/schedule_trace_weight_page_test.cpp)
