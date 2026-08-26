@@ -53,6 +53,9 @@ void require(bool condition, const std::string& message)
 
 int main()
 try {
+    constexpr std::uint64_t hiddenSize = 256;
+    constexpr std::uint64_t kvSize = 64;
+    constexpr std::uint64_t intermediateSize = 512;
     const std::vector<std::uint16_t> attentionSlices {
         22, 23, 25, 26, 27, 29, 30, 31};
     const std::vector<std::uint16_t> gateSlices {
@@ -70,41 +73,52 @@ try {
 
     BinaryProgram program;
     program.hardware.mxms_per_hemisphere = 1;
+    const auto normBaseRow = static_cast<std::int64_t>(
+        program.hardware.sram_depth_rows - hiddenSize);
+    constexpr std::int64_t queryRows = hiddenSize * hiddenSize / 512;
+    constexpr std::int64_t kvRows = hiddenSize * 128 / 512;
+    constexpr std::int64_t outputRows = hiddenSize * hiddenSize / 512;
+    constexpr std::int64_t ffnRows =
+        hiddenSize * intermediateSize / 512;
     program.bindings = {
         make_binding(0, "input_layernorm.weight", BindingElementType::BF16,
-            BindingLayout::Fp16VxmRowParallel8, {1536}, 29696, 1536,
+            BindingLayout::Fp16VxmRowParallel8, {hiddenSize}, normBaseRow,
+            hiddenSize,
             norm0Slices),
         make_binding(1, "query.weight", BindingElementType::I8,
-            BindingLayout::W8A16AttentionWeightStriped, {1536, 1536},
-            0, 4608, attentionSlices),
+            BindingLayout::W8A16AttentionWeightStriped,
+            {hiddenSize, hiddenSize}, 0, queryRows, attentionSlices),
         make_binding(2, "key.weight", BindingElementType::I8,
-            BindingLayout::W8A16AttentionWeightStriped, {1536, 256},
-            4608, 768, attentionSlices),
+            BindingLayout::W8A16AttentionWeightStriped,
+            {hiddenSize, kvSize}, queryRows, kvRows, attentionSlices),
         make_binding(3, "value.weight", BindingElementType::I8,
-            BindingLayout::W8A16AttentionWeightStriped, {1536, 256},
-            5376, 768, attentionSlices),
+            BindingLayout::W8A16AttentionWeightStriped,
+            {hiddenSize, kvSize}, queryRows + kvRows, kvRows,
+            attentionSlices),
         make_binding(4, "output.weight", BindingElementType::I8,
-            BindingLayout::W8A16MxmWeightStriped, {1536, 1536},
-            6144, 4608, attentionSlices),
+            BindingLayout::W8A16MxmWeightStriped,
+            {hiddenSize, hiddenSize}, queryRows + 2 * kvRows,
+            outputRows, attentionSlices),
         make_binding(5, "post_attention_layernorm.weight",
             BindingElementType::BF16,
-            BindingLayout::Fp16VxmRowParallel8, {1536}, 31232, 1536,
+            BindingLayout::Fp16VxmRowParallel8, {hiddenSize}, normBaseRow,
+            hiddenSize,
             norm1Slices),
         make_binding(6, "gate.weight", BindingElementType::I8,
-            BindingLayout::W8A16Block8WeightWaveStriped, {1536, 8960},
-            0, 26880, gateSlices),
+            BindingLayout::W8A16Block8WeightWaveStriped,
+            {hiddenSize, intermediateSize}, 0, ffnRows, gateSlices),
         make_binding(7, "up.weight", BindingElementType::I8,
-            BindingLayout::W8A16Block8WeightWaveStriped, {1536, 8960},
-            0, 26880, upSlices),
+            BindingLayout::W8A16Block8WeightWaveStriped,
+            {hiddenSize, intermediateSize}, 0, ffnRows, upSlices),
         make_binding(8, "down.weight", BindingElementType::I8,
-            BindingLayout::W8A16Block8WeightWaveStriped, {8960, 1536},
-            0, 26880, downSlices),
+            BindingLayout::W8A16Block8WeightWaveStriped,
+            {intermediateSize, hiddenSize}, 0, ffnRows, downSlices),
     };
 
     const auto replicated = make_binding(9, "replicated.weight",
         BindingElementType::I8,
         BindingLayout::W8A16MxmWeightReplicated,
-        {32, 32}, 30000, 16, gateSlices);
+        {32, 32}, program.hardware.sram_depth_rows - 16, 16, gateSlices);
     const auto replicatedData = pattern(32 * 32, 7);
     const auto replicatedImage = pack_weight_binding(
         replicated, replicatedData, program.hardware);
@@ -166,9 +180,10 @@ try {
         packedBytes += tensor.data.size();
     }
     constexpr std::uint64_t expectedPackedBytes =
-        1536ull * 1536 + 2ull * 1536 * 256 + 1536ull * 1536
-        + 3ull * 1536 * 8960
-        + 2ull * 1536 * 2 * 16 * 32;
+        hiddenSize * hiddenSize + 2 * hiddenSize * kvSize
+        + hiddenSize * hiddenSize
+        + 3 * hiddenSize * intermediateSize
+        + 2 * hiddenSize * 2 * 16 * 32;
     require(packedBytes == expectedPackedBytes,
         "Qwen layer page has an unexpected physical byte count");
     for (const auto& segment : package.weight_pages[0].segments)

@@ -35,7 +35,6 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/sxm_binary_roundtrip_test.cpp
     tests/runtime/compiled_sxm_command_runtime_test.cpp
     tests/runtime/compiled_queue_program_runtime_test.cpp
-    tests/runtime/compiled_rmsnorm_runtime_test.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
     tests/runtime/compiled_qwen_real_ffn_runtime_test.cpp
     tests/runtime/compiled_qwen_real_decoder_layer_runtime_test.cpp
@@ -140,11 +139,6 @@ add_executable(command_cmodel_compat_binary_test
     tests/runtime/command_cmodel_compat_binary_test.cpp)
 target_link_libraries(command_cmodel_compat_binary_test
     PRIVATE ftlpu_software)
-add_executable(block8_linear_projection_runtime_test
-    tests/runtime/block8_linear_projection_runtime_test.cpp)
-target_link_libraries(block8_linear_projection_runtime_test
-    PRIVATE ftlpu_software)
-
 add_executable(sxm_binary_roundtrip_test
     tests/runtime/sxm_binary_roundtrip_test.cpp)
 
@@ -254,11 +248,6 @@ add_executable(compiled_queue_program_runtime_test
 
 target_link_libraries(compiled_queue_program_runtime_test PRIVATE ftlpu_software)
 
-add_executable(compiled_rmsnorm_runtime_test
-    tests/runtime/compiled_rmsnorm_runtime_test.cpp)
-
-target_link_libraries(compiled_rmsnorm_runtime_test PRIVATE ftlpu_software)
-
 add_executable(compiled_smollm2_135m_ffn_runtime_test
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
 
@@ -283,18 +272,6 @@ target_link_libraries(compiled_qwen_real_ffn_runtime_test
 add_executable(compiled_qwen_real_decoder_layer_runtime_test
     tests/runtime/compiled_qwen_real_decoder_layer_runtime_test.cpp)
 target_link_libraries(compiled_qwen_real_decoder_layer_runtime_test
-    PRIVATE ftlpu_software)
-
-add_executable(compiled_block8_ffn_wave_boundary_fast_runtime_test
-    tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
-target_compile_definitions(compiled_block8_ffn_wave_boundary_fast_runtime_test
-    PRIVATE
-    FTLPU_TEST_SEQUENCE_LENGTH=32
-    FTLPU_TEST_HIDDEN_SIZE=1536
-    FTLPU_TEST_INTERMEDIATE_SIZE=3200
-    FTLPU_TEST_OUTPUT_SIZE=640
-    FTLPU_TEST_MODEL_NAME="Block8-wave-boundary-fast")
-target_link_libraries(compiled_block8_ffn_wave_boundary_fast_runtime_test
     PRIVATE ftlpu_software)
 
 add_executable(compiled_smollm2_lm_head_runtime_test

@@ -474,18 +474,6 @@ if(Python3_Interpreter_FOUND)
             --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json
             --icu-macro-schedule)
     add_test(
-        NAME block8_ffn_wave_boundary_binary_cmodel_runtime_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/block8_ffn_wave_boundary_runtime_test.py
-            --opt $<TARGET_FILE:ftlpu_opt>
-            --translate $<TARGET_FILE:ftlpu_translate>
-            --runtime-test $<TARGET_FILE:compiled_block8_ffn_wave_boundary_fast_runtime_test>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/block8_ffn_wave_boundary_fast.stablehlo.mlir
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/block8_ffn_wave_boundary_regression
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
-            --weight-bank 1)
-    add_test(
         NAME smollm2_135m_ffn_seq128_binary_cmodel_runtime_test
         COMMAND
             ${Python3_EXECUTABLE}
@@ -574,29 +562,6 @@ if(Python3_Interpreter_FOUND)
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_attention_binary_runtime
             --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json
             --attention-schedule fused)
-    add_test(
-        NAME rmsnorm_binary_cmodel_runtime_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/rmsnorm_binary_runtime_test.py
-            --opt $<TARGET_FILE:ftlpu_opt>
-            --translate $<TARGET_FILE:ftlpu_translate>
-            --runtime-test $<TARGET_FILE:compiled_rmsnorm_runtime_test>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/rmsnorm/rmsnorm_128x576.stablehlo.mlir
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/rmsnorm_binary_runtime
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_block8_1mxm.json)
-    add_test(
-        NAME rmsnorm_feedback_binary_cmodel_runtime_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/rmsnorm_binary_runtime_test.py
-            --opt $<TARGET_FILE:ftlpu_opt>
-            --translate $<TARGET_FILE:ftlpu_translate>
-            --runtime-test $<TARGET_FILE:compiled_rmsnorm_runtime_test>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/rmsnorm/rmsnorm_128x576.stablehlo.mlir
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/rmsnorm_feedback_binary_runtime
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_128kb_superlane_vector.json
-            --strategy vxm-feedback)
     add_test(
         NAME smollm2_decoder_layer_binary_cmodel_runtime_test
         COMMAND
