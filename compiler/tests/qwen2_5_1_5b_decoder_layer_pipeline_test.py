@@ -35,7 +35,7 @@ def main() -> None:
     shutil.copyfile(args.input, stablehlo)
 
     common = [
-        "--mxm-execution", "block8", "--ffn-schedule", "tail",
+        "--mxm-execution", "vector", "--ffn-schedule", "tail",
         "--target-config", str(args.target_config),
         "--weight-bank", str(args.weight_bank),
         "--rmsnorm-strategy", "vxm-feedback",
@@ -52,7 +52,7 @@ def main() -> None:
     schedule_markers = {
         "ftlpu.schedule.compressed", 'name = "qkv"',
         'name = "softmax"', 'name = "o_proj"',
-        'name = "rmsnorm.feedback"', 'name = "ffn.down.block8"',
+        'name = "rmsnorm.feedback"',
         'accumulator_destination = "stream"',
         'accumulator_clear = true',
     }
@@ -74,7 +74,7 @@ def main() -> None:
             if not match:
                 continue
             address = int(match.group(1))
-            limit = 128 if 'compute_mode = "block8"' in line else 1024
+            limit = 1024
             if address >= limit:
                 raise AssertionError(
                     f"MXM accumulator address {address} exceeds {limit} rows"
@@ -88,7 +88,7 @@ def main() -> None:
         str(args.compile), "--input", str(schedule),
         "--output", str(binary), "--input-stage", "schedule",
         "--target-config", str(args.target_config),
-        "--mxm-execution", "block8",
+        "--mxm-execution", "vector",
         "--weight-bank", str(args.weight_bank),
     ], "compressed-schedule-to-binary")
     if binary.stat().st_size < 64:

@@ -10,7 +10,6 @@ llvm::StringRef mxm_execution_policy_name(MxmExecutionPolicy policy)
     case MxmExecutionPolicy::Auto: return "auto";
     case MxmExecutionPolicy::Vector: return "vector";
     case MxmExecutionPolicy::Legacy: return "legacy";
-    case MxmExecutionPolicy::Block8: return "block8";
     }
     return "auto";
 }
@@ -21,7 +20,6 @@ mlir::FailureOr<MxmExecutionPolicy> parse_mxm_execution_policy(
     if (value == "auto") return MxmExecutionPolicy::Auto;
     if (value == "vector") return MxmExecutionPolicy::Vector;
     if (value == "legacy") return MxmExecutionPolicy::Legacy;
-    if (value == "block8") return MxmExecutionPolicy::Block8;
     return mlir::failure();
 }
 
@@ -45,11 +43,6 @@ llvm::StringRef MxmExecutionStrategy::weight_input_mode() const
     return uses_local_dequant()
         ? "int8_dequant_bf16"
         : "direct16";
-}
-
-llvm::StringRef MxmExecutionStrategy::compute_mode() const
-{
-    return uses_block8() ? "block8" : "vector";
 }
 
 mlir::FailureOr<MxmExecutionStrategy> plan_mxm_execution_strategy(
@@ -86,31 +79,12 @@ mlir::FailureOr<MxmExecutionStrategy> plan_mxm_execution_strategy(
         && throughput.mxm_int8_load_streams_per_cycle > 0
         && throughput.mxm_int8_load_streams_per_cycle
             <= target.streams().streams_per_direction;
-    const bool block8Legal =
-        localDequantLegal
-        && target.supports_mxm_block8_compute()
-        && request.accumulator_result_allowed
-        && request.result_is_16bit_float
-        && throughput.mxm_block_rows > 0
-        && request.m % throughput.mxm_rows == 0
-        && throughput.mxm_rows % throughput.mxm_block_rows == 0
-        && 2 * throughput.mxm_block_rows
-            <= target.streams().streams_per_direction;
-    if (policy == MxmExecutionPolicy::Block8 && !block8Legal)
-        return mlir::failure();
+    (void)policy;
     if (localDequantLegal) {
         strategy.weight_preparation =
             MxmWeightPreparation::LocalInt8DequantBf16;
         strategy.weight_stream_count =
             throughput.mxm_int8_load_streams_per_cycle;
-    }
-    if (policy != MxmExecutionPolicy::Vector
-        && policy != MxmExecutionPolicy::Legacy && block8Legal) {
-        strategy.compute = MxmComputeStrategy::Block8;
-        strategy.activation_stream_count =
-            2 * throughput.mxm_block_rows;
-        strategy.rows_per_compute_issue =
-            throughput.mxm_block_rows;
     }
     return strategy;
 }

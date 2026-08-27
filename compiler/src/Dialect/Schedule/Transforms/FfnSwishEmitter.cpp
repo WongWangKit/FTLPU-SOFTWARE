@@ -84,9 +84,9 @@ mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
 
     mlir::Value lastHidden;
     for (int64_t byte = 0; byte < 2; ++byte) {
-        int64_t slice = hiddenSlices[byte];
+        int64_t slice = hiddenSlices[2 * (nblock % 2) + byte];
         int64_t address = hiddenBaseRow
-            + nblock * plan.getM() + mTile * tile + row;
+            + (nblock / 2) * plan.getM() + mTile * tile + row;
         llvm::StringRef kind = "fp16_mxm_activation_planar";
         if (distributed16) {
             const int64_t token = mTile * tile + row;

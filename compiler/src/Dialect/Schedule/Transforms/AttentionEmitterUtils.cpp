@@ -107,7 +107,6 @@ void emitMxmWave(mlir::IRRewriter &rewriter, mlir::Location location,
                  llvm::StringRef accumulatorDestination, bool accumulatorClear,
                  llvm::StringRef weightLoadMode, int64_t weightInnerColumn,
                  llvm::StringRef dataFormat, llvm::StringRef weightInputMode,
-                 llvm::StringRef computeMode,
                  llvm::StringRef accumulatorOutputFormat, int64_t waveCount,
                  int64_t waveInterval, int64_t waveWeightColumnStride,
                  int64_t groupCount, int64_t groupInterval,
@@ -150,8 +149,6 @@ void emitMxmWave(mlir::IRRewriter &rewriter, mlir::Location location,
   if (weightStreamBase >= 0)
     state.addAttribute("weight_stream_base",
                        rewriter.getI64IntegerAttr(weightStreamBase));
-  if (!computeMode.empty())
-    state.addAttribute("compute_mode", rewriter.getStringAttr(computeMode));
   if (!accumulatorOutputFormat.empty())
     state.addAttribute("accumulator_output_format",
                        rewriter.getStringAttr(accumulatorOutputFormat));
@@ -184,14 +181,13 @@ void emitMxmWave(mlir::IRRewriter &rewriter, mlir::Location location,
                  llvm::StringRef accumulatorDestination, bool accumulatorClear,
                  llvm::StringRef weightLoadMode, int64_t weightInnerColumn,
                  llvm::StringRef dataFormat, llvm::StringRef weightInputMode,
-                 llvm::StringRef computeMode,
                  llvm::StringRef accumulatorOutputFormat, int64_t waveCount,
                  int64_t waveInterval, int64_t waveWeightColumnStride) {
   emitMxmWave(rewriter, location, cycle, queue, opcode, weightBuffer,
               weightColumn, activationStream, outputStream, repeatCount,
               repeatInterval, accumulatorAddress, accumulatorRowStride,
               accumulatorDestination, accumulatorClear, weightLoadMode,
-              weightInnerColumn, dataFormat, weightInputMode, computeMode,
+              weightInnerColumn, dataFormat, weightInputMode,
               accumulatorOutputFormat, waveCount, waveInterval,
               waveWeightColumnStride, 1, 1, 0, -1);
 }
@@ -204,14 +200,13 @@ void emitMxm(mlir::IRRewriter &rewriter, mlir::Location location, int64_t cycle,
              llvm::StringRef accumulatorDestination, bool accumulatorClear,
              llvm::StringRef weightLoadMode, int64_t weightInnerColumn,
              llvm::StringRef dataFormat, llvm::StringRef weightInputMode,
-             llvm::StringRef computeMode,
              llvm::StringRef accumulatorOutputFormat,
              int64_t weightStreamBase) {
   emitMxmWave(rewriter, location, cycle, queue, opcode, weightBuffer,
               weightColumn, activationStream, outputStream, repeatCount,
               repeatInterval, accumulatorAddress, accumulatorRowStride,
               accumulatorDestination, accumulatorClear, weightLoadMode,
-              weightInnerColumn, dataFormat, weightInputMode, computeMode,
+              weightInnerColumn, dataFormat, weightInputMode,
               accumulatorOutputFormat, 1, 1, 0, 1, 1, 0, weightStreamBase);
 }
 

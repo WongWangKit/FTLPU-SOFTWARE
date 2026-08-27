@@ -407,10 +407,7 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
             const auto rhsSlices =
                 rhsPlacement.getAs<mlir::ArrayAttr>("slices");
             if (rhsKind && rhsSlices && rhsSlices.size() == 16
-                && (rhsKind.getValue()
-                        == "fp16_mxm_distributed_16"
-                    || rhsKind.getValue()
-                        == "fp16_mxm_block8_distributed_16")) {
+                && rhsKind.getValue() == "fp16_mxm_distributed_16") {
                 distributedSlices.clear();
                 for (mlir::Attribute slice : rhsSlices)
                     distributedSlices.push_back(
@@ -429,9 +426,7 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
             const auto lhsSlices =
                 lhsPlacement.getAs<mlir::ArrayAttr>("slices");
             if (lhsKind && lhsSlices && lhsSlices.size() == 16
-                && (lhsKind.getValue() == "fp16_mxm_distributed_16"
-                    || lhsKind.getValue()
-                        == "fp16_mxm_block8_distributed_16")) {
+                && lhsKind.getValue() == "fp16_mxm_distributed_16") {
                 distributedSlices.clear();
                 for (mlir::Attribute slice : lhsSlices)
                     distributedSlices.push_back(

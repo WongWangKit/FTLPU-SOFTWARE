@@ -3,6 +3,7 @@ build-*/
 .venv/
 .cache/
 models/
+/out/
 __pycache__/
 *.user
 *.suo

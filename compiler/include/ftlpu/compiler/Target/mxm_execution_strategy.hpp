@@ -14,17 +14,11 @@ enum class MxmExecutionPolicy {
     Auto,
     Vector,
     Legacy,
-    Block8,
 };
 
 enum class MxmWeightPreparation {
     VxmDequantDirect16,
     LocalInt8DequantBf16,
-};
-
-enum class MxmComputeStrategy {
-    Vector,
-    Block8,
 };
 
 struct MxmExecutionRequest {
@@ -40,7 +34,6 @@ struct MxmExecutionRequest {
 struct MxmExecutionStrategy {
     MxmWeightPreparation weight_preparation =
         MxmWeightPreparation::VxmDequantDirect16;
-    MxmComputeStrategy compute = MxmComputeStrategy::Vector;
     int64_t weight_stream_count = 16;
     int64_t activation_stream_count = 2;
     int64_t rows_per_compute_issue = 1;
@@ -50,12 +43,7 @@ struct MxmExecutionStrategy {
         return weight_preparation
             == MxmWeightPreparation::LocalInt8DequantBf16;
     }
-    bool uses_block8() const
-    {
-        return compute == MxmComputeStrategy::Block8;
-    }
     llvm::StringRef weight_input_mode() const;
-    llvm::StringRef compute_mode() const;
 };
 
 mlir::FailureOr<MxmExecutionStrategy> plan_mxm_execution_strategy(

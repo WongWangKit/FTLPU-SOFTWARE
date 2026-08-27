@@ -83,6 +83,9 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                             });
                         if (completed
                             == emission.completed_tiles.end()) {
+                            ffn.getOperation()->emitError(
+                                "missing completed FFN projection tile for "
+                                "vector Swish input");
                             return mlir::failure();
                         }
                         const int64_t tempGroup = pair / pairsPerTempGroup;
@@ -130,8 +133,11 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
             }
         }
         const int64_t repeatCount = inputCycle - firstInputCycle;
-        if (!gateValue || !upValue || repeatCount <= 0)
+        if (!gateValue || !upValue || repeatCount <= 0) {
+            ffn.getOperation()->emitError(
+                "vector FFN projection did not produce Swish temporaries");
             return mlir::failure();
+        }
         auto [output, mirroredOutput] = emitFfnSwishAlu(
             context.rewriter, ffn.getLoc(), ffn.getResult().getType(),
             gateValue, upValue, target, context.strategy,
@@ -152,6 +158,10 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
         const int64_t hiddenBlocks = ffn.getHidden() / tile;
         const int64_t hiddenBank = ffn.getHidden0Placement()
             .getAs<mlir::IntegerAttr>("bank").getInt();
+        const auto hiddenKind = ffn.getHidden0Placement()
+            .getAs<mlir::StringAttr>("kind");
+        const bool hiddenDistributed16 = hiddenKind
+            && hiddenKind.getValue() == "fp16_mxm_distributed_16";
         int64_t maxOutputLatency = 0;
         int64_t maxReadLatency = 0;
         for (int64_t slice : context.hidden_slices) {
@@ -163,7 +173,14 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                 target::StreamEndpoint::Mem,
                 target::StreamEndpoint::VxmInput,
                 target::StreamDirection::West, slice);
-            if (!outputLatency || !readLatency) return mlir::failure();
+            if (!outputLatency || !readLatency) {
+                ffn.getOperation()->emitError()
+                    << "vector FFN hidden slice " << slice
+                    << " is not routable through VXM (output="
+                    << static_cast<bool>(outputLatency)
+                    << ", read=" << static_cast<bool>(readLatency) << ")";
+                return mlir::failure();
+            }
             maxOutputLatency = std::max(maxOutputLatency, *outputLatency);
             maxReadLatency = std::max(maxReadLatency, *readLatency);
         }
@@ -186,15 +203,20 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                     % throughput.mxm_block_rows;
                 const int64_t nblock = (pending.pair / 2) * 4
                     + pending.source_hemisphere * 2 + pending.pair % 2;
-                const int64_t address = hiddenBase
-                    + ((token / tile) * hiddenBlocks + nblock)
-                        * throughput.tile_rows
-                    + tokenWave;
                 const int64_t owner = 1 - pending.source_hemisphere;
                 const int64_t peer = pending.source_hemisphere;
                 for (int64_t byte = 0; byte < 2; ++byte) {
-                    const int64_t slice =
-                        context.hidden_slices[2 * tokenLane + byte];
+                        const int64_t slice = hiddenDistributed16
+                            ? context.hidden_slices[2 * tokenLane + byte]
+                            : context.hidden_slices[
+                                2 * (nblock % 2) + byte];
+                        const int64_t address = hiddenDistributed16
+                            ? hiddenBase
+                                + ((token / tile) * hiddenBlocks + nblock)
+                                    * throughput.tile_rows
+                                + tokenWave
+                            : hiddenBase
+                                + (nblock / 2) * context.m() + token;
                     const auto readLatency = target.transport_latency(
                         target::StreamEndpoint::Mem,
                         target::StreamEndpoint::VxmInput,
@@ -203,8 +225,15 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                         target::StreamEndpoint::VxmResult,
                         target::StreamEndpoint::Mem,
                         target::StreamDirection::East, slice);
-                    if (!readLatency || !writeLatency)
+                    if (!readLatency || !writeLatency) {
+                        ffn.getOperation()->emitError()
+                            << "vector FFN hidden multicast route is unavailable "
+                            << "for slice " << slice << " (read="
+                            << static_cast<bool>(readLatency)
+                            << ", write=" << static_cast<bool>(writeLatency)
+                            << ")";
                         return mlir::failure();
+                    }
                     auto read = context.emitSliceRead(bridgeSource,
                         context.hidden_route,
                         bridgeInputCycle - *readLatency,

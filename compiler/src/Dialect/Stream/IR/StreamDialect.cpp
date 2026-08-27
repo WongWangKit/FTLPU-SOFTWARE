@@ -179,23 +179,6 @@ LogicalResult RouteOp::verify()
     const int64_t stream_count = getStreamCountAttr().getInt();
     const auto placementKind =
         getPlacement().getAs<StringAttr>("kind");
-    const bool distributedBlock8Activation =
-        *source == target::StreamEndpoint::Mem
-        && *destination == target::StreamEndpoint::MxmActivation
-        && placementKind
-        && (placementKind.getValue() == "fp16_mxm_distributed_16"
-            || placementKind.getValue()
-                == "fp16_mxm_block8_distributed_16")
-        && stream_count
-            == 2 * target.throughput().mxm_block_rows;
-    const bool block8Weight =
-        *source == target::StreamEndpoint::Mem
-        && *destination == target::StreamEndpoint::MxmWeight
-        && placementKind
-        && placementKind.getValue()
-            == "w8a16_block8_weight_wave_striped"
-        && stream_count
-            == target.throughput().mxm_int8_load_streams_per_cycle;
     const bool localInt8Weight =
         *source == target::StreamEndpoint::Mem
         && *destination == target::StreamEndpoint::MxmWeight
@@ -205,7 +188,6 @@ LogicalResult RouteOp::verify()
             == target.throughput().mxm_int8_load_streams_per_cycle;
     const bool validStreamCount =
         stream_count == *expected_stream_count
-        || distributedBlock8Activation || block8Weight
         || localInt8Weight;
     if (stream_base < 0 || !validStreamCount
         || stream_base + stream_count > target.streams().streams_per_direction

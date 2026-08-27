@@ -107,10 +107,10 @@ def main() -> None:
                      "ftlpu.tensor.elementwise_task",
                      "result_allocations = []", "base_row = 0 : i64",
                      'hemisphere = "both"',
-                     'kind = "fp16_mxm_distributed_16"',
+                     'kind = "fp16_mxm_activation_planar"',
                      'kind = "w8a16_mxm_weight_striped"',
                      'instruction_count = 1728 : i64, '
-                     'kind = "w8a16_block8_weight_wave_striped"'], "Tensor")
+                     'kind = "w8a16_mxm_weight_wave_striped"'], "Tensor")
     verify_weight_allocations(tensor)
     if "ftlpu.tensor.ffn" in tensor:
         raise AssertionError("Tensor IR must not contain the legacy compound FFN op")
@@ -124,7 +124,7 @@ def main() -> None:
                      'destination = "MXM.activation"',
                      "stream_count = 16 : i64",
                      "result_stream_counts = [4]",
-                     'kind = "fp16_mxm_distributed_16"'], "Stream")
+                     'kind = "fp16_mxm_activation_planar"'], "Stream")
     if "ftlpu.stream.ffn" in stream:
         raise AssertionError("Stream IR must not contain the legacy compound FFN op")
 
@@ -199,7 +199,7 @@ def main() -> None:
                       "ftlpu.command.mxm", "ftlpu.command.vxm",
                       'element_type = "bf16"',
                       'data_format = "bf16"',
-                      'kind = "fp16_mxm_block8_distributed_16"',
+                      'kind = "fp16_pair_planar"',
                       'hemisphere = "both"'], "Command")
 
 

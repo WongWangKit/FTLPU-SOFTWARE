@@ -22,7 +22,6 @@ public:
 
 private:
     int64_t emitProjections();
-    int64_t emitBlock8Projections();
     void emitQk(int64_t qkStart, int64_t qkWaveCycles,
         int64_t qkIwToComputeCycles, bool fusedSoftmax);
     int64_t emitSoftmax(int64_t qkStart, int64_t qkEnd,
@@ -30,7 +29,6 @@ private:
     int64_t emitProbabilityTranspose(int64_t packEnd);
     int64_t emitPv(int64_t transposeEnd);
     int64_t emitOutputProjection(int64_t pvEnd);
-    int64_t emitBlock8OutputProjection(int64_t pvEnd);
 
     mlir::IRRewriter& rewriter_;
     AttentionTaskGraph op_;

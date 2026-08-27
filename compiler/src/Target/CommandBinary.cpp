@@ -278,8 +278,6 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::W8A16MxmWeightReplicated;
     if (value == "w8a16_mxm_weight_wave_striped")
         return BindingLayout::W8A16MxmWeightWaveStriped;
-    if (value == "w8a16_block8_weight_wave_striped")
-        return BindingLayout::W8A16Block8WeightWaveStriped;
     if (value == "w8a16_attention_weight_striped")
         return BindingLayout::W8A16AttentionWeightStriped;
     if (value == "fp16_pair_planar") return BindingLayout::Fp16PairPlanar;
@@ -297,8 +295,6 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::Fp16VxmGammaBroadcast;
     if (value == "fp16_mxm_distributed_16")
         return BindingLayout::Fp16MxmDistributed16;
-    if (value == "fp16_mxm_block8_distributed_16")
-        return BindingLayout::Fp16MxmBlock8Distributed16;
     if (value == "fp16_rope_table")
         return BindingLayout::Fp16RopeTable;
     if (value == "fp16_probability_x16")
@@ -461,9 +457,6 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
             == "int8_dequant_bf16"
         ? MxmWeightInputMode::Int8DequantBf16
         : MxmWeightInputMode::Direct16;
-    if (op.getComputeMode().value_or("vector") == "block8")
-        throw std::runtime_error(
-            "Command IR Block8 compute is not supported by the current CModel");
     const auto kind = is_load ? QueueKind::MxmLoad : QueueKind::MxmCompute;
     const int64_t waveCount = op.getWaveCount().value_or(1);
     const int64_t waveInterval = op.getWaveInterval().value_or(1);

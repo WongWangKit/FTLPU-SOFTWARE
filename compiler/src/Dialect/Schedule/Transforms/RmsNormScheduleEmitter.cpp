@@ -1308,9 +1308,7 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
     const bool vxmInput = inputKind
         && inputKind.getValue() == "fp16_vxm_row_parallel_8";
     const bool mxmInput = inputKind
-        && (inputKind.getValue() == "fp16_mxm_distributed_16"
-            || inputKind.getValue()
-                == "fp16_mxm_block8_distributed_16");
+        && inputKind.getValue() == "fp16_mxm_distributed_16";
     if (!vxmInput && !mxmInput)
         return op.emitError(
             "feedback RMSNorm requires MXM- or VXM-oriented distributed16 input");

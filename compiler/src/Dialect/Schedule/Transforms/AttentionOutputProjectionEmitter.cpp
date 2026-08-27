@@ -23,13 +23,6 @@ int64_t functionArgumentIndex(mlir::Value value) {
 } // namespace
 
 int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd) {
-  const auto resultPlacement =
-      op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("result");
-  const auto resultKind = resultPlacement
-                              ? resultPlacement.getAs<mlir::StringAttr>("kind")
-                              : mlir::StringAttr{};
-  if (resultKind && resultKind.getValue() == "fp16_mxm_block8_distributed_16")
-    return emitBlock8OutputProjection(pvEnd);
   const AttentionMemoryLayout layout(op_, target_);
   const auto contextPlacement =
       op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("context");
@@ -167,7 +160,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd) {
                       localMxm,
                   "iw", weightBuffer, 3 - pulse, 0, 0, 1, 1, 0, 1, "stream",
                   true, "supercell", 0, dataFormat,
-                  localDequant ? "int8_dequant_bf16" : "", {}, {},
+                  localDequant ? "int8_dequant_bf16" : "", {},
                   localDequant ? weightStreamBase : -1);
         }
       }
@@ -218,7 +211,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(int64_t pvEnd) {
                         localMxm,
                     "accumulator_read", 0, 0, 0, mxmOutputStream, 1, 1,
                     accumulatorAddress(token), 1, "stream", true, "supercell",
-                    0, dataFormat, {}, {}, dataFormat);
+                    0, dataFormat, {}, dataFormat);
             for (int64_t byte = 0; byte < 2; ++byte) {
               const int64_t slice = resultSlices[hemisphere * 2 + byte];
               const int64_t latency = *target_.transport_latency(

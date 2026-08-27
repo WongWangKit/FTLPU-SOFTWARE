@@ -32,8 +32,7 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
         || storageSlices < 2 * weightSlices
         || storageSlices % weightSlices != 0
         || streams.c2c_streams_per_direction <= 0
-        || throughput.mxms_per_hemisphere != 1
-        || target.supports_mxm_block8_compute())
+        || throughput.mxms_per_hemisphere != 1)
         return mlir::failure();
 
     const int64_t reductionBlocks = shape.k / tile;

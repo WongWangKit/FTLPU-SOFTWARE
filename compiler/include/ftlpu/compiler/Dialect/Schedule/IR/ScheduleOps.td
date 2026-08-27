@@ -40,7 +40,6 @@ def MxmIssueOp : FTLPU_Schedule_Op<"mxm_issue", [MemoryEffects<[MemWrite]>]> {
       OptionalAttr<I64Attr>:$weight_inner_column,
       OptionalAttr<StrAttr>:$weight_input_mode,
       OptionalAttr<I64Attr>:$weight_stream_base,
-      OptionalAttr<StrAttr>:$compute_mode,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
       OptionalAttr<I64Attr>:$wave_weight_column_stride,
@@ -135,7 +134,6 @@ def MxmComputeOp : FTLPU_Schedule_Op<"mxm_compute"> {
       I64Attr:$result_duration, I64Attr:$activation_stream_base,
       I64Attr:$output_stream_base, I64Attr:$weight_buffer,
       I64Attr:$unit_id, OptionalAttr<StrAttr>:$data_format,
-      OptionalAttr<StrAttr>:$compute_mode,
       I64Attr:$m, I64Attr:$n, I64Attr:$k,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
@@ -175,8 +173,7 @@ def MxmAccumulatorReadOp : FTLPU_Schedule_Op<"mxm_accumulator_read"> {
   let arguments = (ins AnyRankedTensor:$input, I64Attr:$cycle,
       I64Attr:$unit_id, I64Attr:$accumulator_address,
       I64Attr:$output_stream_base, BoolAttr:$clear,
-      OptionalAttr<StrAttr>:$data_format,
-      OptionalAttr<StrAttr>:$compute_mode);
+      OptionalAttr<StrAttr>:$data_format);
   let results = (outs AnyRankedTensor:$output);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;

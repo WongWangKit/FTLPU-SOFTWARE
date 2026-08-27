@@ -49,7 +49,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             "cannot select an MXM execution strategy for attention");
         return mlir::failure();
     }
-    const bool block8_attention = projection_strategy->uses_block8();
     const auto attention_weight_rows = [&](int64_t columns) {
         // W8A16AttentionWeightStriped stores 128 output columns per
         // physical wave: two 32-column groups in each hemisphere.
@@ -65,17 +64,14 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t secondary_scratch_bank = paged_weights
         ? weight_bank : scratch_bank;
     const auto weight_slices = paged_weights
-        ? target.page_resident_attention_weight_slices(block8_attention)
+        ? target.page_resident_attention_weight_slices()
         : target.attention_weight_slices();
     const auto output_weight_slices = paged_weights
         ? weight_slices : target.attention_output_weight_slices();
     const auto planar_activation_slices =
         target.attention_activation_slices();
-    const auto activation_slices = block8_attention
-        ? target.mxm_distributed_activation_slices()
-        : planar_activation_slices;
-    if (planar_activation_slices.size() < 2
-        || (block8_attention && activation_slices.size() != 16)) {
+    const auto activation_slices = planar_activation_slices;
+    if (planar_activation_slices.size() < 2) {
         op.emitError(
             "target does not provide the attention activation layout");
         return mlir::failure();
@@ -89,7 +85,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t o_weight_rows = hidden * query_width
         / (target.memory().hemispheres * target.memory().w8a16_weight_slice_count * tile);
     const bool requires_weight_tiling = paged_weights
-        && !block8_attention
         && target.throughput().mxms_per_hemisphere == 1
         && std::max({q_weight_rows, k_weight_rows, v_weight_rows,
                o_weight_rows}) > target.memory().sram_depth_rows;
@@ -128,9 +123,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t distributed_input_rows =
         seq_len * hidden / (tile * block_rows);
     const int64_t output_activation_base = distributed_input_rows;
-    const int64_t distributed_result_base = std::max(
-        target.memory().w8a16_hidden_base_row,
-        distributed_input_rows + output_activation_rows);
     const int64_t input_staging_rows = seq_len * hidden / tile;
     const int64_t input_staging_base =
         target.memory().words_per_bank - input_staging_rows;
@@ -222,33 +214,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     llvm::SmallVector<int64_t, 4> rope_table_slices;
     int64_t rope_table_bank = scratch_bank;
-    if (block8_attention && target.memory().banks_per_slice > 1) {
-        llvm::SmallDenseSet<int64_t, 64> reserved;
-        const auto reserve = [&](llvm::ArrayRef<int64_t> slices) {
-            for (int64_t slice : slices) reserved.insert(slice);
-        };
-        reserve(weight_slices);
-        reserve(output_weight_slices);
-        reserve(target.ffn_projection_weight_slices(
-            target::FfnProjectionKind::Gate));
-        reserve(target.ffn_projection_weight_slices(
-            target::FfnProjectionKind::Up));
-        reserve(target.ffn_down_projection_weight_slices(true));
-        reserve(rope_product_slices);
-        for (int64_t slice = 0;
-             slice < target.memory().slices_per_hemisphere
-             && rope_table_slices.size() < 4; ++slice)
-            if (!reserved.contains(slice))
-                rope_table_slices.push_back(slice);
-        if (rope_table_slices.size() != 4) {
-            op.emitError(
-                "target cannot place a four-slice RoPE table away from resident weights");
-            return mlir::failure();
-        }
-    } else {
-        const auto slices = target.attention_rope_slices();
-        rope_table_slices.assign(slices.begin(), slices.end());
-    }
+    const auto rope_slices = target.attention_rope_slices();
+    rope_table_slices.assign(rope_slices.begin(), rope_slices.end());
     if (mlir::failed(physical_allocator.reserve({"rope_staging",
             rope_staging_slices, 0, rope_staging_rows, 0, 2, true,
             rope_staging_bank}))) {
@@ -371,21 +338,17 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         op.emitError("attention scratch memory allocation failed");
         return mlir::failure();
     }
-    std::optional<tensor::PhysicalAllocation> vector_result;
-    if (!block8_attention) {
-        const llvm::SmallVector<int64_t, 1> result_banks {
-            secondary_scratch_bank};
-        auto result = physical_allocator.allocate({"result",
-            target.throughput().mxm_result_streams,
-            0, seq_len * hidden / (tile * 2), 5, 7,
-            scratch_candidates, true, result_banks});
-        if (mlir::failed(result)) {
-            op.emitError(
-                "attention result cannot be placed without overlapping "
-                "live context or residual storage");
-            return mlir::failure();
-        }
-        vector_result = std::move(*result);
+    const llvm::SmallVector<int64_t, 1> result_banks {
+        secondary_scratch_bank};
+    auto vector_result = physical_allocator.allocate({"result",
+        target.throughput().mxm_result_streams,
+        0, seq_len * hidden / (tile * 2), 5, 7,
+        scratch_candidates, true, result_banks});
+    if (mlir::failed(vector_result)) {
+        op.emitError(
+            "attention result cannot be placed without overlapping "
+            "live context or residual storage");
+        return mlir::failure();
     }
     rewriter.setInsertionPoint(op);
     llvm::SmallVector<mlir::Attribute, 32> weight_storage_slice_attrs;
@@ -440,12 +403,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const auto inputPlacement = mlir::succeeded(inheritedInputPlacement)
         ? *inheritedInputPlacement
         : make_attention_placement(rewriter,
-            block8_attention ? "fp16_mxm_distributed_16"
-                             : "fp16_mxm_activation_planar",
-            activation_slices, 0,
-            block8_attention
-                ? seq_len * hidden / (tile * block_rows)
-                : seq_len * hidden / tile,
+            "fp16_mxm_activation_planar",
+            activation_slices, 0, seq_len * hidden / tile,
             "both");
     const auto plan = rewriter.getDictionaryAttr({
         rewriter.getNamedAttr("input", inputPlacement),
@@ -533,9 +492,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             scratch_bank)),
         rewriter.getNamedAttr("probability_diagonal", make_attention_placement(rewriter,
             "fp16_probability_diagonal",
-            block8_attention
-                    || (tiled_weights
-                        && target.uses_dedicated_slice_roles())
+            tiled_weights && target.uses_dedicated_slice_roles()
                 ? llvm::ArrayRef<int64_t>(rope_product_slices)
                 : llvm::ArrayRef<int64_t>(
                       target.attention_query_iw_slices(0)),
@@ -561,35 +518,15 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             target.attention_context_base_row(), context_rows, "both",
             context->bank)),
         rewriter.getNamedAttr("output_activation",
-            block8_attention
-                ? make_attention_placement(rewriter,
-                      "fp16_mxm_distributed_16",
-                      target.attention_output_activation_slices(
-                          paged_weights),
-                      output_activation_base,
-                      output_activation_rows, "both", scratch_bank)
-                : make_attention_placement(rewriter,
-                      "fp16_pair_planar", input_staging_slices,
-                      input_staging_base, input_staging_rows,
-                      "both", scratch_bank)),
+            make_attention_placement(rewriter,
+                "fp16_pair_planar", input_staging_slices,
+                input_staging_base, input_staging_rows,
+                "both", scratch_bank)),
         rewriter.getNamedAttr("result", make_attention_placement(rewriter,
-            block8_attention
-                ? "fp16_mxm_block8_distributed_16"
-                : "fp16_pair_planar",
-            block8_attention
-                ? target.attention_block8_result_slices(paged_weights)
-                : llvm::ArrayRef<int64_t>(vector_result->slices),
-            block8_attention
-                ? distributed_result_base
-                : vector_result->base_row,
-            block8_attention
-                ? seq_len * hidden / (tile * block_rows)
-                : seq_len * hidden / (tile * 2),
-            block8_attention ? "both" : "east",
-            block8_attention
-                ? (target.uses_dedicated_slice_roles()
-                    ? secondary_scratch_bank : scratch_bank)
-                : vector_result->bank)),
+            "fp16_pair_planar",
+            vector_result->slices, vector_result->base_row,
+            seq_len * hidden / (tile * 2), "east",
+            vector_result->bank)),
     });
     const auto config = rewriter.getDictionaryAttr({
         rewriter.getNamedAttr(

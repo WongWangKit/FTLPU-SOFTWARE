@@ -127,7 +127,7 @@ Args parse_args(int argc, char** argv)
                                  "[--attention-schedule tail|fused] "
                                  "[--rmsnorm-strategy "
                                  "vxm-square-mxm-reduce|vxm-feedback] "
-                                 "[--mxm-execution auto|vector|legacy|block8] "
+                                 "[--mxm-execution auto|vector|legacy] "
                                  "[--icu-macro-schedule] "
                                  "[--weight-bank 0|1] "
                                  "[--target-config target.json]");

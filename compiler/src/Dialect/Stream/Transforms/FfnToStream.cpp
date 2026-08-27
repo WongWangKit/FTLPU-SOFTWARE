@@ -34,7 +34,6 @@ mlir::LogicalResult lower_ffn(
         op.emitError("invalid MXM execution policy");
         return mlir::failure();
     }
-    bool block8Ffn = false;
     bool localDequantFfn = false;
     if (w8a16) {
         auto strategy = target::plan_mxm_execution_strategy(
@@ -47,7 +46,6 @@ mlir::LogicalResult lower_ffn(
             op.emitError("cannot select an MXM execution strategy for FFN");
             return mlir::failure();
         }
-        block8Ffn = strategy->uses_block8();
         localDequantFfn = strategy->uses_local_dequant();
     }
     const auto input_slice = get_mem_slice(op.getInputAddress());
@@ -78,7 +76,7 @@ mlir::LogicalResult lower_ffn(
         ? target::StreamEndpoint::MxmWeight
         : projectionWeightEndpoint;
     const std::optional<int64_t> localWeightStreamCount =
-        localDequantFfn && !block8Ffn
+        localDequantFfn
         ? std::optional<int64_t>(
               target.throughput().mxm_int8_load_streams_per_cycle)
         : std::nullopt;
@@ -87,26 +85,17 @@ mlir::LogicalResult lower_ffn(
     const auto up_binding = allocate(projectionWeightEndpoint,
         *up_slice, stage, stage + 2, localWeightStreamCount);
     const auto activation_binding = allocate(target::StreamEndpoint::MxmActivation,
-        *input_slice, stage + (w8a16 ? 4 : 2), stage + (w8a16 ? 8 : 6),
-        block8Ffn ? std::optional<int64_t>(16) : std::nullopt);
+        *input_slice, stage + (w8a16 ? 4 : 2), stage + (w8a16 ? 8 : 6));
     const auto down0_binding = allocate(downWeightEndpoint,
-        *down_slice, stage + 7, stage + 9,
-        block8Ffn ? std::optional<int64_t>(16)
-                  : localWeightStreamCount);
-    auto down1_binding = down0_binding;
-    if (!block8Ffn)
-        down1_binding = allocate(downWeightEndpoint,
-            *down_slice, stage + 7, stage + 9,
-            localWeightStreamCount);
+        *down_slice, stage + 7, stage + 9, localWeightStreamCount);
+    auto down1_binding = allocate(downWeightEndpoint,
+        *down_slice, stage + 7, stage + 9, localWeightStreamCount);
     const auto hidden0_binding = allocate(
         target::StreamEndpoint::MxmActivation,
-        *hidden0_slice, stage + 11, stage + 13,
-        block8Ffn ? std::optional<int64_t>(16) : std::nullopt);
-    auto hidden1_binding = hidden0_binding;
-    if (!block8Ffn)
-        hidden1_binding = allocate(
-            target::StreamEndpoint::MxmActivation,
-            *hidden1_slice, stage + 11, stage + 13);
+        *hidden0_slice, stage + 11, stage + 13);
+    auto hidden1_binding = allocate(
+        target::StreamEndpoint::MxmActivation,
+        *hidden1_slice, stage + 11, stage + 13);
     if (mlir::failed(gate_binding) || mlir::failed(up_binding)
         || mlir::failed(activation_binding) || mlir::failed(down0_binding)
         || mlir::failed(down1_binding)
@@ -157,7 +146,7 @@ mlir::LogicalResult lower_ffn(
         op.getGateWeightPlacement(), op.getGateWeightBytes(), *gate_latency);
     auto up_route = route(op.getUpWeight(), *up_binding,
         projectionWeightEndpoint,
-        block8Ffn || localDequantFfn || !w8a16 ? 1 : 0,
+        localDequantFfn || !w8a16 ? 1 : 0,
         op.getUpWeightAddress(),
         op.getUpWeightPlacement(), op.getUpWeightBytes(), *up_latency);
     auto activation_route = route(op.getInput(), *activation_binding,
@@ -168,7 +157,7 @@ mlir::LogicalResult lower_ffn(
         op.getDownWeightPlacement(), op.getDownWeightBytes(), *down_latency);
     auto down1_route = route(op.getDownWeight(), *down1_binding,
         downWeightEndpoint,
-        block8Ffn || localDequantFfn || !w8a16 ? 1 : 0,
+        localDequantFfn || !w8a16 ? 1 : 0,
         op.getDownWeightAddress(),
         op.getDownWeightPlacement(), op.getDownWeightBytes(), *down_latency);
     if (w8a16 && !localDequantFfn) {

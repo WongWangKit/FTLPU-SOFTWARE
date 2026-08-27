@@ -286,7 +286,7 @@ def discover_windows(events: list[Event]) -> tuple[Window, ...]:
         Window(
             max(0, o_compute_start - 36),
             o_compute_start + 276,
-            "O projection: continuous dual-MXM Block8 issues",
+            "O projection: continuous dual-MXM vector issues",
         ),
     )
 

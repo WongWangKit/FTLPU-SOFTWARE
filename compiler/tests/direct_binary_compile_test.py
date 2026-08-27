@@ -29,7 +29,7 @@ def main() -> None:
     direct = args.output_dir / "direct.ftlpu"
     schedule_direct = args.output_dir / "schedule-direct.ftlpu"
     common = [
-        "--mxm-execution", "block8",
+        "--mxm-execution", "vector",
         "--target-config", str(args.target_config),
     ]
     run([

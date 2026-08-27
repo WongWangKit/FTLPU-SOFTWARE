@@ -111,12 +111,6 @@ def validate_paged_weights(tensor: str, target_config: Path,
         ("w8a16_mxm_weight_striped", 1920): 1,
         ("w8a16_mxm_weight_wave_striped", 2048): 3,
         ("fp16_vxm_gamma_broadcast", 1536): 2,
-    }) if mxm_execution == "vector" else Counter({
-        ("w8a16_attention_weight_striped", 4608): 1,
-        ("w8a16_attention_weight_striped", 768): 2,
-        ("w8a16_mxm_weight_striped", 4608): 1,
-        ("w8a16_block8_weight_wave_striped", 26880): 3,
-        ("fp16_vxm_row_parallel_8", 1536): 2,
     })
     observed = Counter((str(weight["kind"]), int(weight["count"]))
                        for weight in weights)
@@ -201,8 +195,8 @@ def main() -> None:
     parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--weight-bank", type=int)
-    parser.add_argument("--mxm-execution", choices=("block8", "vector"),
-                        default="block8")
+    parser.add_argument("--mxm-execution", choices=("vector",),
+                        default="vector")
     parser.add_argument("--seq-len", type=int, default=128)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)

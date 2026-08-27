@@ -52,10 +52,7 @@ int64_t placementBank(mlir::DictionaryAttr placement)
 bool isDistributed16(mlir::DictionaryAttr placement)
 {
     const auto kind = placement.getAs<mlir::StringAttr>("kind");
-    return kind
-        && (kind.getValue() == "fp16_mxm_distributed_16"
-            || kind.getValue()
-                == "fp16_mxm_block8_distributed_16");
+    return kind && kind.getValue() == "fp16_mxm_distributed_16";
 }
 
 mlir::FailureOr<TileAddress> distributedAddress(
@@ -105,11 +102,6 @@ mlir::FailureOr<TileAddress> tileAddress(
             dual ? (block / 2) % 2 : 0, placementBank(placement)};
     }
     if (isDistributed16(placement)) {
-        if (kind.getValue()
-            == "fp16_mxm_block8_distributed_16")
-            preferredHemisphere =
-                (block / target.throughput().mxms_per_hemisphere)
-                % target.memory().hemispheres;
         return distributedAddress(
             placement, block, 0, 1, preferredHemisphere);
     }
@@ -199,9 +191,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
         || (resultDistributed && resultSlices.size() != 16)
         || (resultKind != "fp16_pair_planar"
             && resultKind != "fp16_mxm_activation_planar"
-            && resultKind != "fp16_mxm_distributed_16"
-            && resultKind
-                != "fp16_mxm_block8_distributed_16"))
+            && resultKind != "fp16_mxm_distributed_16"))
         return op.emitError("unsupported elementwise result layout");
 
     const auto westLatency = [&](int64_t slice) {

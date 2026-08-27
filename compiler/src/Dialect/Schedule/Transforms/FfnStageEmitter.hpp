@@ -47,10 +47,7 @@ struct FfnEmissionContext {
     int64_t down_accumulator_base;
     bool activation_distributed16;
     bool local_weight_dequant;
-    bool block8_projection;
-    bool block8_down;
     int64_t temp_bank;
-    std::optional<stream::StreamBinding> fused_output;
 
     int64_t m() const { return static_cast<int64_t>(ffn.getM()); }
     int64_t k() const { return static_cast<int64_t>(ffn.getK()); }
@@ -99,16 +96,10 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
 mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
     FfnEmissionContext& context);
 
-mlir::FailureOr<FfnSwishEmission> emitFfnBlock8ProjectionAndSwish(
-    FfnEmissionContext& context);
-
 mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
     FfnEmissionContext& context, FfnProjectionEmission emission);
 
 mlir::FailureOr<mlir::Value> emitFfnDownProjection(
-    FfnEmissionContext& context, const FfnSwishEmission& swish);
-
-mlir::FailureOr<mlir::Value> emitFfnBlock8DownProjection(
     FfnEmissionContext& context, const FfnSwishEmission& swish);
 
 } // namespace ftlpu::compiler::schedule::ffn_detail

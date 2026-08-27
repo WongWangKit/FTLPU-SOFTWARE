@@ -24,13 +24,6 @@ int64_t functionArgumentIndex(mlir::Value value) {
 
 int64_t AttentionScheduleEmitter::emitProjections() {
   const AttentionMemoryLayout layout(op_, target_);
-  const auto resultPlacement =
-      op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("result");
-  const auto resultKind = resultPlacement
-                              ? resultPlacement.getAs<mlir::StringAttr>("kind")
-                              : mlir::StringAttr{};
-  if (resultKind && resultKind.getValue() == "fp16_mxm_block8_distributed_16")
-    return emitBlock8Projections();
   const auto elementType =
       llvm::cast<mlir::RankedTensorType>(op_.getInput().getType())
           .getElementType();
@@ -237,7 +230,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   }
 
   if (target_.throughput().mxms_per_hemisphere == 1) {
-    const int64_t accumulatorHalfStride = 4096;
+    const int64_t accumulatorHalfStride =
+        target_.throughput().mxm_accumulator_blocks
+        * target_.throughput().mxm_rows / 2;
     const int64_t conservativeComputeSpacing = tile;
     int64_t projectionBlock = 0;
     int64_t previousProjectionWeightRelease = -1;
@@ -318,7 +313,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 emitMxm(rewriter_, op_.getLoc(), cycle + loadToIw, hemisphere,
                         "iw", weightBuffer, 3 - pulse, 0, 0, 1, 1, 0, 1,
                         "stream", true, "supercell", 0, dataFormat,
-                        localDequant ? "int8_dequant_bf16" : "", {}, {},
+                        localDequant ? "int8_dequant_bf16" : "", {},
                         localDequant ? weightStreamBase : -1);
               }
             }
@@ -359,13 +354,17 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           "read", inputAddress, byte, tile, 1, 1,
                           "sram", -1, projectionActivationBank);
                 }
-                const int64_t outputAddress =
-                    layout.projectionAddress(kind, head, tokenBlock);
+                // Projection waves are fully drained before another head or
+                // output group reuses this physical MXM. Keep accumulator
+                // addresses in one token window instead of aliasing the much
+                // larger MEM result address space.
+                const int64_t accumulatorAddress =
+                    tokenBlock * tile + half * accumulatorHalfStride;
                 emitMxm(rewriter_, op_.getLoc(), computeCycle, hemisphere,
                         "compute", weightBuffer, 0, 0, 0, tile, 1,
-                        outputAddress + half * accumulatorHalfStride, 1,
+                        accumulatorAddress, 1,
                         finalReduction ? "stream" : "sram", finalReduction,
-                        "supercell", 0, dataFormat, {}, {},
+                        "supercell", 0, dataFormat, {},
                         finalReduction ? dataFormat : "fp32");
                 if (!finalReduction)
                   continue;
@@ -1225,7 +1224,7 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart, int64_t qkWaveCycles,
                   layout.scoreAccumulatorAddress(work->query_head,
                                                  work->query_block, keyBlock),
                   1, finalReduction ? "stream" : "sram", finalReduction,
-                  "supercell", 0, dataFormat, {}, {},
+                  "supercell", 0, dataFormat, {},
                   finalReduction ? dataFormat : llvm::StringRef{});
           if (!fusedSoftmax && finalReduction) {
             // Tail softmax consumes compact 16-bit scores. The

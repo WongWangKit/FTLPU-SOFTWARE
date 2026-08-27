@@ -297,7 +297,7 @@ void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
     state.addAttribute("queue", builder.getI64IntegerAttr(op.getUnitId()));
     for (llvm::StringRef name :
         {"weight_load_mode", "weight_inner_column",
-            "weight_input_mode", "weight_stream_base", "compute_mode", "wave_count",
+            "weight_input_mode", "weight_stream_base", "wave_count",
             "wave_interval", "wave_weight_column_stride",
             "wave_accumulator_address_stride",
             "group_count", "group_interval"})
@@ -1247,8 +1247,6 @@ public:
                 accumulator.getDestination() == "local" ? "sram" : "stream",
                 true, compute.getDataFormat().value_or("fp16"),
                 accumulator.getAccumulatorOutputFormat().value_or("fp32"));
-            if (auto mode = compute.getComputeModeAttr())
-                command->setAttr("compute_mode", mode);
             if (compute.getWaveCount().value_or(1) > 1) {
                 command->setAttr("wave_count",
                     builder.getI64IntegerAttr(static_cast<int64_t>(
@@ -1268,8 +1266,6 @@ public:
                 read.getOutputStreamBase(), 1, 1,
                 read.getAccumulatorAddress(), 1, "sram",
                 read.getClear(), read.getDataFormat().value_or("fp16"));
-            if (auto mode = read.getComputeModeAttr())
-                command->setAttr("compute_mode", mode);
         }
         for (schedule::MemWriteOp write : writes) {
             const auto slices = placement_slices(write.getPlacement());

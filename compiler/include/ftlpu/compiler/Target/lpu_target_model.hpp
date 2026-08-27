@@ -169,10 +169,6 @@ public:
     {
         return throughput_.mxm_local_dequant_enabled != 0;
     }
-    bool supports_mxm_block8_compute() const
-    {
-        return throughput_.mxm_block_compute_enabled != 0;
-    }
     bool supports_mxm_weight_activation_overlap() const
     {
         return throughput_.mxm_weight_activation_overlap_enabled != 0;
@@ -190,17 +186,13 @@ public:
     const std::array<int64_t, 16>& attention_query_iw_slices(
         int64_t reduction_block) const;
     llvm::SmallVector<int64_t> attention_weight_slices() const;
-    llvm::SmallVector<int64_t> page_resident_attention_weight_slices(
-        bool block8) const;
+    llvm::SmallVector<int64_t> page_resident_attention_weight_slices() const;
     llvm::SmallVector<int64_t> attention_output_weight_slices() const;
     llvm::SmallVector<int64_t> attention_activation_slices() const;
     llvm::SmallVector<int64_t> mxm_distributed_activation_slices() const;
     llvm::SmallVector<int64_t> ffn_projection_weight_slices(
         FfnProjectionKind kind) const;
-    llvm::SmallVector<int64_t> ffn_down_projection_weight_slices(
-        bool block8) const;
-    llvm::SmallVector<int64_t> ffn_block8_result_slices() const;
-    llvm::SmallVector<int64_t> ffn_block8_input_slices() const;
+    llvm::SmallVector<int64_t> ffn_down_projection_weight_slices() const;
     llvm::SmallVector<int64_t> ffn_hidden_slices() const;
     llvm::SmallVector<int64_t> ffn_gate_temp_slices() const;
     llvm::SmallVector<int64_t> ffn_up_temp_slices() const;
@@ -211,8 +203,6 @@ public:
     llvm::SmallVector<int64_t> attention_rope_staging_slices() const;
     llvm::SmallVector<int64_t> attention_context_slices() const;
     llvm::SmallVector<int64_t> attention_output_activation_slices(
-        bool page_resident_weights = false) const;
-    llvm::SmallVector<int64_t> attention_block8_result_slices(
         bool page_resident_weights = false) const;
     llvm::SmallVector<int64_t> attention_result_slices() const;
     int64_t attention_query_iw_base_row() const;

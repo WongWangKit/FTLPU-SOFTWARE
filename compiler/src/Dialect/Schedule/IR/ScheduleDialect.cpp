@@ -212,10 +212,6 @@ LogicalResult MxmComputeOp::verify()
         getDataFormat().value_or("fp16");
     if (dataFormat != "fp16" && dataFormat != "bf16")
         return emitOpError("data_format must be fp16 or bf16");
-    const llvm::StringRef computeMode =
-        getComputeMode().value_or("vector");
-    if (computeMode != "vector" && computeMode != "block8")
-        return emitOpError("compute_mode must be vector or block8");
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
     if (waveCount <= 0 || waveInterval <= 0)
@@ -360,10 +356,6 @@ LogicalResult MxmAccumulatorReadOp::verify()
         return emitOpError("contains an invalid accumulator output stream");
     if (getInput().getType() != getOutput().getType())
         return emitOpError("must preserve the logical accumulator value type");
-    const llvm::StringRef computeMode =
-        getComputeMode().value_or("vector");
-    if (computeMode != "vector" && computeMode != "block8")
-        return emitOpError("compute_mode must be vector or block8");
     return success();
 }
 
@@ -387,7 +379,17 @@ LogicalResult MemWriteOp::verify()
         const int64_t finalBase = base.getInt()
             + (waveCount - 1) * waveAddressStride;
         if (finalBase < 0 || finalBase >= target.memory().sram_depth_rows)
-            return emitOpError("MEM write wave leaves physical SRAM");
+            return emitOpError()
+                << "MEM write wave leaves physical SRAM: base="
+                << base.getInt() << ", wave_count=" << waveCount
+                << ", wave_address_stride=" << waveAddressStride
+                << ", final_base=" << finalBase
+                << ", depth=" << target.memory().sram_depth_rows
+                << ", cycle=" << getCycle()
+                << ", duration=" << getDuration()
+                << ", stream_base=" << getStreamBase()
+                << ", stream_count=" << getStreamCount()
+                << ", placement=" << placement;
     }
     if (failed(verify_mem_placement(*this, placement, target)))
         return failure();
@@ -587,16 +589,9 @@ LogicalResult MxmIssueOp::verify()
             && (innerColumn < 0
                 || innerColumn >= target.throughput().lanes_per_tile)))
         return emitOpError("contains an invalid MXM inner weight column");
-    const llvm::StringRef computeMode =
-        getComputeMode().value_or("vector");
-    if (computeMode != "vector" && computeMode != "block8")
-        return emitOpError("compute_mode must be vector or block8");
-    const int64_t accumulatorRows = computeMode == "block8"
-        ? target.throughput().mxm_accumulator_blocks
-            * target.throughput().mxm_rows
-            / target.throughput().mxm_block_rows
-        : target.throughput().mxm_accumulator_blocks
-            * target.throughput().mxm_rows;
+    const int64_t accumulatorRows =
+        target.throughput().mxm_accumulator_blocks
+        * target.throughput().mxm_rows;
     const int64_t finalAccumulatorAddress = getAccumulatorAddress()
         + (waveCount - 1) * waveAccumulatorStride;
     if (getAccumulatorAddress() < 0

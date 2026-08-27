@@ -19,7 +19,7 @@ def main() -> None:
     parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument("--ffn-schedule", choices=("tail", "fused"),
                         default="tail")
-    parser.add_argument("--mxm-execution", choices=("auto", "legacy", "block8"),
+    parser.add_argument("--mxm-execution", choices=("auto", "vector", "legacy"),
                         default="legacy")
     parser.add_argument("--icu-macro-schedule", action="store_true")
     args = parser.parse_args()
@@ -40,7 +40,7 @@ def main() -> None:
         compile_command.append("--icu-macro-schedule")
     subprocess.run(compile_command, check=True)
     command_text = commands.read_text(encoding="utf-8")
-    block8_selected = args.mxm_execution in ("auto", "block8")
+    block8_selected = False
     if not block8_selected:
         for marker in (
             'weight_input_mode = "int8_dequant_bf16"',

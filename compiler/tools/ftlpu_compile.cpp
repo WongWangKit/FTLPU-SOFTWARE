@@ -135,7 +135,7 @@ Args parse_args(int argc, char** argv)
             "usage: ftlpu-compile --input in.mlir --output program.ftlpu "
             "[--input-stage stablehlo|stream|schedule|verified-schedule|command] "
             "[--target-config target.json] [--weight-bank 0|1] "
-            "[--mxm-execution auto|vector|legacy|block8] "
+            "[--mxm-execution auto|vector|legacy] "
             "[--icu-macro-schedule] "
             "[--ffn-schedule tail|fused] "
             "[--attention-schedule tail|fused] "

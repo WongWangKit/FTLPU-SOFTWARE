@@ -144,12 +144,11 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
             "cannot plan the FFN MXM execution strategy");
         return mlir::failure();
     }
-    const bool block8Ffn = execution->uses_block8();
     const auto& throughput = target.throughput();
     // The legacy path does not model passive stream-fabric transport
     // lifetimes precisely enough to prove a fused route. Keep its requested
     // fused mode on the validated tail baseline.
-    if (!block8Ffn && strategy == FfnScheduleStrategy::Fused)
+    if (strategy == FfnScheduleStrategy::Fused)
         strategy = FfnScheduleStrategy::Tail;
     if (weightSlices.size()
             != static_cast<std::size_t>(
@@ -157,7 +156,6 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         || upWeightSlices.size()
             != static_cast<std::size_t>(
                 memory.w8a16_weight_slice_count)
-        || (block8Ffn && !activationDistributed16)
         || (!activationDistributed16
             && activationSlices.size()
                 != static_cast<std::size_t>(
@@ -166,18 +164,14 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
             && activationSlices.size() != 16)
         || downWeightSlices.size()
             != static_cast<std::size_t>(
-                block8Ffn
-                    ? throughput.mxms_per_hemisphere
-                        * memory.w8a16_weight_slice_count
-                    : memory.w8a16_weight_slice_count)
+                memory.w8a16_weight_slice_count)
         || hiddenSlices.size()
             != static_cast<std::size_t>(
-                (block8Ffn || hiddenDistributed16) ? 16
+                hiddenDistributed16 ? 16
                            : throughput.mxm_activation_streams)
         || resultSlices.size()
             != static_cast<std::size_t>(
-                block8Ffn ? 16
-                           : throughput.mxm_result_streams))
+                throughput.mxm_result_streams))
     {
         ffn.getOperation()->emitError(
             "FFN physical slices do not match the selected MXM strategy");
@@ -194,7 +188,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
             static_cast<int64_t>(ffn.getHidden()),
             static_cast<int64_t>(ffn.getN())},
         weightSlices, target, execution->uses_local_dequant(),
-        !block8Ffn && throughput.mxms_per_hemisphere != 1);
+        throughput.mxms_per_hemisphere != 1);
     if (!activationLatency || mlir::failed(projectionTimeline)) {
         ffn.getOperation()->emitError(
             "cannot plan FFN activation transport or projection timeline");
@@ -207,27 +201,6 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     const int64_t downAccumulatorBase = 0;
     auto projectionType = mlir::RankedTensorType::get(
         {tile, tile}, rewriter.getF32Type());
-
-    std::optional<stream::StreamBinding> fusedOutput;
-    if (block8Ffn && strategy == FfnScheduleStrategy::Fused) {
-        stream::StreamAllocator allocator(target);
-        const int64_t projectionStreamBase = 0;
-        const int64_t projectionStreamCount =
-            throughput.mxms_per_hemisphere == 1
-            ? throughput.mxm_int8_load_streams_per_cycle
-            : 24;
-        if (mlir::succeeded(allocator.reserve(
-                target::StreamDirection::East, projectionStreamBase,
-                projectionStreamCount, 0, 1))) {
-            auto output = allocator.allocate(
-                target::StreamEndpoint::VxmResult,
-                target::StreamEndpoint::Mem,
-                target::StreamDirection::East,
-                hiddenSlices.front(), 0, 1, 2);
-            if (mlir::succeeded(output)) fusedOutput = *output;
-        }
-        if (!fusedOutput) strategy = FfnScheduleStrategy::Tail;
-    }
 
     return std::make_unique<FfnEmissionContext>(FfnEmissionContext {
         rewriter,
@@ -254,10 +227,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         downAccumulatorBase,
         activationDistributed16,
         execution->uses_local_dequant(),
-        block8Ffn,
-        block8Ffn,
         tempBank,
-        fusedOutput,
     });
 }
 

@@ -43,18 +43,12 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             op.emitError("cannot select an MXM execution strategy");
             return mlir::failure();
         }
-        const auto activationSlices = strategy->uses_block8()
-            ? target.mxm_distributed_activation_slices()
-            : target.attention_activation_slices();
+        const auto activationSlices = target.attention_activation_slices();
         const auto weightSlices =
             target.attention_output_weight_slices();
-        const auto resultSlices = strategy->uses_block8()
-            ? target.mxm_distributed_activation_slices()
-            : target.attention_result_slices();
-        const std::size_t expectedActivationSlices =
-            strategy->uses_block8() ? 16 : 2;
-        const std::size_t expectedResultSlices =
-            strategy->uses_block8() ? 16 : 4;
+        const auto resultSlices = target.attention_result_slices();
+        const std::size_t expectedActivationSlices = 2;
+        const std::size_t expectedResultSlices = 4;
         if (activationSlices.size() < expectedActivationSlices
             || weightSlices.size() != 8
             || resultSlices.size() != expectedResultSlices) {
@@ -66,35 +60,18 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
         const int64_t lhsBytes = lhsType.getNumElements() * 2;
         const int64_t rhsBytes = rhsType.getNumElements();
         const int64_t resultBytes = resultType.getNumElements() * 2;
-        const int64_t distributedElementsPerRow =
-            target.throughput().mxm_rows
-            * target.throughput().mxm_block_rows;
-        const auto input = strategy->uses_block8()
-            ? fixed_allocation(PlacementKind::Activation,
-                  activationSlices, 0,
-                  op.getM() * op.getK()
-                      / distributedElementsPerRow,
-                  lhsBytes, "fp16_mxm_distributed_16", "both")
-            : fixed_allocation(PlacementKind::Activation,
-                  llvm::ArrayRef<int64_t>(activationSlices).take_front(2),
-                  0, op.getM() * op.getK() / tile, lhsBytes,
-                  "fp16_pair_planar", "both");
+        const auto input = fixed_allocation(PlacementKind::Activation,
+            llvm::ArrayRef<int64_t>(activationSlices).take_front(2),
+            0, op.getM() * op.getK() / tile, lhsBytes,
+            "fp16_pair_planar", "both");
         const auto weight = fixed_allocation(PlacementKind::Weight,
             weightSlices, 0,
             (op.getN() / (2 * tile)) * (op.getK() / tile) * 4,
             rhsBytes, "w8a16_mxm_weight_striped", "both");
-        const auto result = strategy->uses_block8()
-            ? fixed_allocation(PlacementKind::FinalResult,
-                  resultSlices,
-                  target.memory().matmul_result_base_row,
-                  op.getM() * op.getN()
-                      / distributedElementsPerRow,
-                  resultBytes, "fp16_mxm_block8_distributed_16",
-                  "both")
-            : fixed_allocation(PlacementKind::FinalResult,
-                  resultSlices, 0,
-                  op.getM() * op.getN() / (2 * tile),
-                  resultBytes, "fp16_pair_planar", "east");
+        const auto result = fixed_allocation(PlacementKind::FinalResult,
+            resultSlices, 0,
+            op.getM() * op.getN() / (2 * tile),
+            resultBytes, "fp16_pair_planar", "east");
         const auto memoryPlan = rewriter.getDictionaryAttr({
             rewriter.getNamedAttr(
                 "input", make_placement_attr(rewriter, input)),

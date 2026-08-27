@@ -8,9 +8,6 @@ namespace ftlpu::compiler::schedule::ffn_detail {
 mlir::FailureOr<mlir::Value> emitFfnDownProjection(
     FfnEmissionContext& context, const FfnSwishEmission& swish)
 {
-    if (context.block8_down)
-        return emitFfnBlock8DownProjection(context, swish);
-
     auto& rewriter = context.rewriter;
     auto& ffn = context.ffn;
     const auto& target = context.target;
@@ -190,16 +187,20 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             }
                             return hiddenValue;
                         }
+                        const int64_t hiddenPair = reduction % 2;
                         for (int64_t byte = 0; byte < 2; ++byte) {
                             hiddenValue = context
                                 .emitSliceRead(swish.hidden,
                                     context.activation_route,
                                     consumerCycle
                                         - context.eastMxmLatency(
-                                            context.hidden_slices[byte]),
-                                    context.hidden_slices[byte],
+                                            context.hidden_slices[
+                                                2 * hiddenPair + byte]),
+                                    context.hidden_slices[
+                                        2 * hiddenPair + byte],
                                     hiddenBaseRow
-                                        + reduction * m + mTile * tile
+                                        + (reduction / 2) * m
+                                        + mTile * tile
                                         + rowOffset,
                                     segment.rows, 1,
                                     segment.stream_base + byte, "east",

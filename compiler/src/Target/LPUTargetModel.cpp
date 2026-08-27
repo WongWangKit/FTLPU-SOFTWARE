@@ -749,18 +749,6 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
     for (int64_t slice : memory_.w8a16_fused_up_temp_slices)
         if (!fusedTempSlices.insert(slice).second)
             return fail("fused temporary slices must be unique");
-    if (supports_mxm_block8_compute()) {
-        const auto distributedActivationSlices =
-            mxm_distributed_activation_slices();
-        for (int64_t slice : distributedActivationSlices)
-            if (fusedTempSlices.contains(slice))
-                return fail(
-                    "fused temporary slices overlap distributed MXM activation");
-        for (int64_t slice : attention_activation_slices())
-            if (fusedTempSlices.contains(slice))
-                return fail(
-                    "fused temporary slices overlap planar MXM activation");
-    }
     if (ffn_hidden_slices().size()
         != static_cast<std::size_t>(throughput_.mxm_activation_streams))
         return fail("not enough independent MEM slices for fused hidden data");
@@ -768,23 +756,14 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         ffn_projection_weight_slices(FfnProjectionKind::Gate);
     const auto upWeightSlices =
         ffn_projection_weight_slices(FfnProjectionKind::Up);
-    const auto block8InputSlices = ffn_block8_input_slices();
     if (gateWeightSlices.size()
             != static_cast<std::size_t>(memory_.w8a16_weight_slice_count)
         || upWeightSlices.size()
-            != static_cast<std::size_t>(memory_.w8a16_weight_slice_count)
-        || block8InputSlices.size() != 16)
-        return fail("not enough independent MEM slices for Block8 FFN");
-    llvm::SmallDenseSet<int64_t, 32> block8InputSet(
-        block8InputSlices.begin(), block8InputSlices.end());
+            != static_cast<std::size_t>(memory_.w8a16_weight_slice_count))
+        return fail("not enough independent MEM slices for W8A16 FFN");
     llvm::SmallDenseSet<int64_t, 16> gateWeightSet(
         gateWeightSlices.begin(), gateWeightSlices.end());
-    for (int64_t slice : gateWeightSlices)
-        if (block8InputSet.contains(slice))
-            return fail("Gate weights overlap Block8 FFN activation");
     for (int64_t slice : upWeightSlices) {
-        if (block8InputSet.contains(slice))
-            return fail("Up weights overlap Block8 FFN activation");
         if (gateWeightSet.contains(slice))
             return fail("Gate and Up weights must use independent slices");
     }
@@ -1180,27 +1159,6 @@ LPUTargetModel::mxm_distributed_activation_slices() const
 }
 
 llvm::SmallVector<int64_t>
-LPUTargetModel::ffn_block8_input_slices() const
-{
-    if (uses_dedicated_slice_roles())
-        return mxm_distributed_activation_slices();
-    const auto hiddenSlices = mxm_distributed_activation_slices();
-    llvm::SmallDenseSet<int64_t, 32> reserved(
-        hiddenSlices.begin(), hiddenSlices.end());
-    for (FfnProjectionKind kind : {
-             FfnProjectionKind::Gate, FfnProjectionKind::Up})
-        for (int64_t slice : ffn_projection_weight_slices(kind))
-            reserved.insert(slice);
-    llvm::SmallVector<int64_t> slices;
-    for (int64_t slice = 0;
-         slice < memory_.slices_per_hemisphere
-         && slices.size() < 16; ++slice) {
-        if (!reserved.contains(slice)) slices.push_back(slice);
-    }
-    return slices;
-}
-
-llvm::SmallVector<int64_t>
 LPUTargetModel::ffn_projection_weight_slices(
     FfnProjectionKind kind) const
 {
@@ -1306,30 +1264,6 @@ llvm::SmallVector<int64_t> LPUTargetModel::ffn_up_temp_slices() const
         memory_.w8a16_fused_up_temp_slices.end());
 }
 
-llvm::SmallVector<int64_t>
-LPUTargetModel::attention_block8_result_slices(
-    bool page_resident_weights) const
-{
-    if (uses_dedicated_slice_roles())
-        return mxm_distributed_activation_slices();
-    const auto activation = attention_output_activation_slices(
-        page_resident_weights);
-    llvm::SmallDenseSet<int64_t, 32> reserved(
-        activation.begin(), activation.end());
-    if (page_resident_weights)
-        for (int64_t slice : page_resident_attention_weight_slices(true))
-            reserved.insert(slice);
-    llvm::SmallVector<int64_t> slices;
-    for (int64_t slice = 0;
-         slice < memory_.slices_per_hemisphere
-         && slices.size() < 16; ++slice)
-        if (!reserved.contains(slice)) slices.push_back(slice);
-    if (slices.size() != 16)
-        throw std::logic_error(
-            "target cannot allocate an O-projection result plane disjoint from its activation plane");
-    return slices;
-}
-
 llvm::SmallVector<int64_t> LPUTargetModel::attention_qk_key_slices() const
 {
     if (uses_dedicated_slice_roles()) {
@@ -1389,14 +1323,14 @@ llvm::SmallVector<int64_t> LPUTargetModel::attention_value_slices() const
 }
 
 llvm::SmallVector<int64_t>
-LPUTargetModel::page_resident_attention_weight_slices(bool block8) const
+LPUTargetModel::page_resident_attention_weight_slices() const
 {
     llvm::SmallDenseSet<int64_t, 64> reserved;
     for (FfnProjectionKind kind : {
              FfnProjectionKind::Gate, FfnProjectionKind::Up})
         for (int64_t slice : ffn_projection_weight_slices(kind))
             reserved.insert(slice);
-    for (int64_t slice : ffn_down_projection_weight_slices(block8))
+    for (int64_t slice : ffn_down_projection_weight_slices())
         reserved.insert(slice);
 
     llvm::SmallVector<int64_t> slices;
@@ -1416,7 +1350,7 @@ LPUTargetModel::page_resident_attention_weight_slices(bool block8) const
 }
 
 llvm::SmallVector<int64_t>
-LPUTargetModel::ffn_down_projection_weight_slices(bool block8) const
+LPUTargetModel::ffn_down_projection_weight_slices() const
 {
     llvm::SmallDenseSet<int64_t, 32> reserved;
     for (FfnProjectionKind kind : {
@@ -1424,8 +1358,7 @@ LPUTargetModel::ffn_down_projection_weight_slices(bool block8) const
         for (int64_t slice : ffn_projection_weight_slices(kind))
             reserved.insert(slice);
 
-    const int64_t count = memory_.w8a16_weight_slice_count
-        * (block8 ? throughput_.mxms_per_hemisphere : 1);
+    const int64_t count = memory_.w8a16_weight_slice_count;
     llvm::SmallVector<int64_t> slices;
     const auto candidates = weight_storage_slices();
     for (int64_t slice : candidates) {
@@ -1435,29 +1368,6 @@ LPUTargetModel::ffn_down_projection_weight_slices(bool block8) const
     if (static_cast<int64_t>(slices.size()) != count)
         throw std::logic_error(
             "target cannot allocate an independent FFN down-weight plane");
-    return slices;
-}
-
-llvm::SmallVector<int64_t>
-LPUTargetModel::ffn_block8_result_slices() const
-{
-    if (uses_dedicated_slice_roles())
-        return mxm_distributed_activation_slices();
-    llvm::SmallDenseSet<int64_t, 64> reserved;
-    const auto reserve = [&](llvm::ArrayRef<int64_t> slices) {
-        reserved.insert(slices.begin(), slices.end());
-    };
-    reserve(mxm_distributed_activation_slices());
-    reserve(attention_output_activation_slices(true));
-
-    llvm::SmallVector<int64_t> slices;
-    for (int64_t slice = 0;
-         slice < memory_.slices_per_hemisphere
-         && slices.size() < 16; ++slice)
-        if (!reserved.contains(slice)) slices.push_back(slice);
-    if (slices.size() != 16)
-        throw std::logic_error(
-            "target cannot allocate an FFN result plane disjoint from hidden and residual planes");
     return slices;
 }
 
@@ -1533,7 +1443,7 @@ LPUTargetModel::attention_output_activation_slices(
     if (!page_resident_weights) return attention_rope_staging_slices();
 
     llvm::SmallDenseSet<int64_t, 16> reserved;
-    for (int64_t slice : page_resident_attention_weight_slices(true))
+    for (int64_t slice : page_resident_attention_weight_slices())
         reserved.insert(slice);
     llvm::SmallVector<int64_t> slices;
     const int64_t contextBegin = memory_.slices_per_hemisphere - 8;

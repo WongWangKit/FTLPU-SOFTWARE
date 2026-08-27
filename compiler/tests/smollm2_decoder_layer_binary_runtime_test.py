@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--mxm-execution",
-        choices=("legacy", "block8"),
+        choices=("legacy", "vector"),
         default="legacy",
         help="select the decoder MXM execution policy",
     )
@@ -71,27 +71,14 @@ def main() -> None:
     ):
         if operation not in text:
             raise RuntimeError(f"decoder layer is missing {operation}")
-    if args.mxm_execution == "block8":
-        for marker in (
-            'weight_input_mode = "int8_dequant_bf16"',
-            'compute_mode = "block8"',
-            "ftlpu.command.mxm_dequant",
-        ):
-            if marker not in text:
-                raise RuntimeError(
-                    f"Block8 decoder is missing Command IR marker: {marker}"
-                )
-    else:
-        for marker in (
-            'weight_input_mode = "int8_dequant_bf16"',
-            "ftlpu.command.mxm_dequant",
-        ):
-            if marker not in text:
-                raise RuntimeError(
-                    f"vector decoder is missing Command IR marker: {marker}"
-                )
-        if 'compute_mode = "block8"' in text:
-            raise RuntimeError("vector decoder unexpectedly uses Block8 compute")
+    for marker in (
+        'weight_input_mode = "int8_dequant_bf16"',
+        "ftlpu.command.mxm_dequant",
+    ):
+        if marker not in text:
+            raise RuntimeError(
+                f"vector decoder is missing Command IR marker: {marker}"
+            )
     output_bindings = [
         line for line in text.splitlines()
         if "ftlpu.command.binding" in line

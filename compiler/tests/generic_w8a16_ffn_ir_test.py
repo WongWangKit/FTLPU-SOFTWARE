@@ -48,10 +48,7 @@ def main() -> None:
 
     tensor = lower(args.tool, args.input, args.output_dir / "ffn.tensor.mlir",
                    "ftlpu-stablehlo-to-tensor")
-    down_weight_kind = (
-        'kind = "w8a16_block8_weight_wave_striped"'
-        if bf16 else 'kind = "w8a16_mxm_weight_wave_striped"'
-    )
+    down_weight_kind = 'kind = "w8a16_mxm_weight_wave_striped"'
     require(tensor, ["ftlpu.tensor.matmul_task", "ftlpu.tensor.swish_task",
                      "ftlpu.tensor.elementwise_task",
                      'kind = "w8a16_mxm_weight_striped"',

@@ -47,14 +47,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     const int64_t contextBank = placementBank("context");
     const bool singleMxm =
         target_.throughput().mxms_per_hemisphere == 1;
-    const auto resultPlacement =
-        op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("result");
-    const auto resultKind = resultPlacement
-        ? resultPlacement.getAs<mlir::StringAttr>("kind")
-        : mlir::StringAttr {};
-    const bool sourceLocalContext = singleMxm && resultKind
-        && resultKind.getValue()
-            == "fp16_mxm_block8_distributed_16";
+    const bool sourceLocalContext = false;
     // Accumulator addresses are local to each physical MXM and are not MEM
     // context addresses. A single-MXM target keeps one query-tile window per
     // resident head block; dual-MXM targets get an independent address space
@@ -178,9 +171,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
         // A head may contain more 32-column blocks than the physical MXM has
         // weight buffers. Page one block at a time, retain each block's ACC
         // rows across key blocks, and emit it before reusing the buffer. A
-        // Block8 consumer keeps the result source-local; a Vector consumer
-        // also forwards the same result through the passive VXM bridge so
-        // both hemispheres own a complete planar context.
+        // Forward the result through the passive VXM bridge so both
+        // hemispheres own a complete planar context.
         for (const auto& wave : waves) {
             for (int64_t headBlock = 0;
                  headBlock < headBlocks; ++headBlock) {
@@ -256,7 +248,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                 1,
                                 finalReduction ? "stream" : "sram",
                                 finalReduction, "supercell", 0,
-                                dataFormat, {}, {},
+                                dataFormat, {},
                                 finalReduction ? "bf16" : "");
                             if (!finalReduction) continue;
                             const int64_t resultStart = hemisphereCompute
@@ -431,7 +423,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                             accumulatorAddress(queryBlock, localMxm),
                             1, finalReduction ? "stream" : "sram",
                             finalReduction, "supercell", 0, dataFormat,
-                            {}, {}, finalReduction ? "bf16" : "");
+                            {}, finalReduction ? "bf16" : "");
                     }
 
                     if (keyBlock + 1 == tokenBlocks) {

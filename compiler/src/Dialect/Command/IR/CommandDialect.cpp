@@ -247,16 +247,9 @@ LogicalResult MxmOp::verify()
         || getOutputStreamBase() + target.throughput().mxm_result_streams - 1
             >= target.streams().encoded_streams)
         return emitOpError("contains an invalid MXM stream selector");
-    const llvm::StringRef computeMode =
-        getComputeMode().value_or("vector");
-    if (computeMode != "vector" && computeMode != "block8")
-        return emitOpError("compute_mode must be vector or block8");
-    const int64_t accumulatorRows = computeMode == "block8"
-        ? target.throughput().mxm_accumulator_blocks
-            * target.throughput().mxm_rows
-            / target.throughput().mxm_block_rows
-        : target.throughput().mxm_accumulator_blocks
-            * target.throughput().mxm_rows;
+    const int64_t accumulatorRows =
+        target.throughput().mxm_accumulator_blocks
+        * target.throughput().mxm_rows;
     const int64_t finalAccumulatorAddress = getAccumulatorAddress()
         + (waveCount - 1) * waveAccumulatorStride;
     if (getAccumulatorAddress() < 0

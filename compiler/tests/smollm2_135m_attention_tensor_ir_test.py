@@ -119,7 +119,7 @@ def main() -> None:
         raise AssertionError("every Tensor attention task must expose its local sub-plan")
 
     required_layouts = (
-        'kind = "fp16_mxm_block8_distributed_16"',
+        'kind = "fp16_pair_planar"',
         'kind = "fp16_value_x16"',
         "base_row = 7800 : i64",
         'kind = "fp16_probability_x16"',
@@ -151,10 +151,8 @@ def main() -> None:
             args.legacy_target_config,
         )
         legacy_text = legacy_output.read_text(encoding="utf-8")
-        if 'kind = "fp16_mxm_block8_distributed_16"' in legacy_text:
-            raise AssertionError("legacy target unexpectedly selected Block8 attention")
         if 'kind = "fp16_pair_planar"' not in legacy_text:
-            raise AssertionError("legacy target did not fall back to planar Vector attention")
+            raise AssertionError("legacy target did not select planar Vector attention")
 
 
 if __name__ == "__main__":

@@ -27,7 +27,6 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
         || headDim % tile != 0 || memory.banks_per_slice < 2
         || initialBank < 0 || initialBank >= memory.banks_per_slice
         || throughput.mxms_per_hemisphere != 1
-        || target.supports_mxm_block8_compute()
         || loadSlices <= 0 || storage.size() < 2 * loadSlices
         || storage.size() % loadSlices != 0
         || streams.c2c_streams_per_direction <= 0)
