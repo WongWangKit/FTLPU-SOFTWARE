@@ -1,11 +1,6 @@
 {
   "name": "lpu32-cmodel-resident-variant4",
   "memory": {
-    "slices_per_hemisphere": 52,
-    "banks_per_slice": 2,
-    "words_per_bank": 32768,
-    "bytes_per_word": 32,
-    "sram_depth_rows": 32768,
     "w8a16_weight_slice_base": 36,
     "w8a16_weight_slice_stride": 1,
     "w8a16_output_weight_spare_slices": [40, 41],

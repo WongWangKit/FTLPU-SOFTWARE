@@ -52,6 +52,8 @@ enum class BindingLayout : std::uint16_t {
     Fp16ProbabilityX16 = 20,
     Fp16ProbabilityDiagonal = 21,
     Fp16VxmGammaBroadcast = 22,
+    Fp16ValueX16 = 23,
+    Fp16HeadPlanar = 24,
 };
 
 enum class BindingInitializer : std::uint16_t {

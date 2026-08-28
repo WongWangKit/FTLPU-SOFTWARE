@@ -5,7 +5,6 @@
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <utility>
@@ -156,6 +155,24 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         "internal", "workspace", probabilityType,
         memoryPlan.getAs<mlir::DictionaryAttr>("probability_diagonal"),
         "attention.probability_diagonal");
+    const auto valueType = mlir::RankedTensorType::get(
+        {op_.getSeqLen(), op_.getKvHeads() * op_.getHeadDim()},
+        llvm::cast<mlir::RankedTensorType>(
+            op_.getInput().getType()).getElementType());
+    auto valueBinding = createBinding(
+        rewriter_, op_.getLoc(), {}, workspaceBindingBase + 2,
+        "internal", "workspace", valueType,
+        memoryPlan.getAs<mlir::DictionaryAttr>("value"),
+        "attention.value");
+    const auto contextType = mlir::RankedTensorType::get(
+        {op_.getSeqLen(), op_.getHidden()},
+        llvm::cast<mlir::RankedTensorType>(
+            op_.getInput().getType()).getElementType());
+    auto contextBinding = createBinding(
+        rewriter_, op_.getLoc(), {}, workspaceBindingBase + 3,
+        "internal", "workspace", contextType,
+        memoryPlan.getAs<mlir::DictionaryAttr>("context"),
+        "attention.context");
 
     const int64_t projectionEnd = emitProjections();
     const int64_t qkvCycles = projectionEnd - 1;
@@ -191,7 +208,11 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         rewriter_.getI64IntegerAttr(probabilityTransposeStart));
     probabilityDiagonalBinding->setAttr("ready_cycle",
         rewriter_.getI64IntegerAttr(probabilityTransposeEnd));
+    valueBinding->setAttr("ready_cycle",
+        rewriter_.getI64IntegerAttr(projectionEnd));
     const int64_t pvEnd = emitPv(probabilityTransposeEnd);
+    contextBinding->setAttr("ready_cycle",
+        rewriter_.getI64IntegerAttr(pvEnd));
     const int64_t outputProjectionEnd = emitOutputProjection(pvEnd);
 
     createTimeline(rewriter_, op_.getLoc(), "qkv", 0, qkvCycles);
@@ -209,7 +230,8 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     auto outputBinding = createBinding(rewriter_, op_.getLoc(), {},
         outputIndex, "output", "result",
         llvm::cast<mlir::RankedTensorType>(op_.getResult().getType()),
-        memoryPlan.getAs<mlir::DictionaryAttr>("result"));
+        memoryPlan.getAs<mlir::DictionaryAttr>("result"),
+        "attention.result");
     return outputBinding.getValue();
 }
 

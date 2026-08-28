@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <string>
 
 namespace ftlpu::compiler::schedule {
 namespace {
@@ -1361,6 +1362,8 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
         outputIndex, "output", "result",
         llvm::cast<mlir::RankedTensorType>(op.getResult().getType()),
         resultPlacement);
+    output->setAttr("name", rewriter.getStringAttr(
+        "rmsnorm.result." + std::to_string(outputIndex)));
     rewriter.replaceOp(op, output.getValue());
     return mlir::success();
 }
@@ -1658,6 +1661,8 @@ mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
         outputIndex, "output", "result",
         llvm::cast<mlir::RankedTensorType>(op.getResult().getType()),
         resultPlacement);
+    output->setAttr("name", rewriter.getStringAttr(
+        "rmsnorm.result." + std::to_string(outputIndex)));
     rewriter.replaceOp(op, output.getValue());
     return mlir::success();
 }

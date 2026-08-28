@@ -86,8 +86,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         / (target.memory().hemispheres * target.memory().w8a16_weight_slice_count * tile);
     const bool requires_weight_tiling = paged_weights
         && target.throughput().mxms_per_hemisphere == 1
-        && std::max({q_weight_rows, k_weight_rows, v_weight_rows,
-               o_weight_rows}) > target.memory().sram_depth_rows;
+        && (std::max({q_weight_rows, k_weight_rows, v_weight_rows,
+                o_weight_rows}) > target.memory().sram_depth_rows
+            || q_weight_rows + k_weight_rows + v_weight_rows
+                    + o_weight_rows
+                > target.memory().sram_depth_rows);
     std::optional<tensor::AttentionWeightTilePlan> weight_tile_plan;
     if (requires_weight_tiling) {
         auto planned = tensor::planAttentionWeightTiles(hidden,

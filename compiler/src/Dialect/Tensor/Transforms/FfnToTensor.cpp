@@ -100,6 +100,12 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             hidden_slices = target.mxm_distributed_activation_slices();
     }
     const bool tiledWeights = weightTilePlan.has_value();
+    const int64_t planarHiddenRows = m * hidden / throughput.mxm_rows;
+    const bool planarHiddenExceedsSram =
+        memory.w8a16_hidden_base_row + planarHiddenRows
+        > memory.sram_depth_rows;
+    if (planarHiddenExceedsSram)
+        hidden_slices = target.mxm_distributed_activation_slices();
     const bool hiddenDistributed16 = tiledWeights
         && hidden_slices.size() == 16;
     const auto inheritedInputPlacement = get_value_placement(input_value);
@@ -156,7 +162,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             hidden_slices, memory.w8a16_hidden_base_row,
             hiddenDistributed16
                 ? distributedHiddenRows
-                : m * hidden / throughput.mxm_rows,
+                : planarHiddenRows,
             hidden_pass_bytes,
             hiddenDistributed16 ? "fp16_mxm_distributed_16" : "", "both",
             hiddenBank))
@@ -166,7 +172,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             hidden_slices, memory.w8a16_hidden_base_row,
             hiddenDistributed16
                 ? distributedHiddenRows
-                : m * hidden / throughput.mxm_rows,
+                : planarHiddenRows,
             hidden_pass_bytes,
             hiddenDistributed16 ? "fp16_mxm_distributed_16" : "", "both",
             hiddenBank))

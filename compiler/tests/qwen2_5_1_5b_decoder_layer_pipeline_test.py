@@ -39,6 +39,7 @@ def main() -> None:
         "--target-config", str(args.target_config),
         "--weight-bank", str(args.weight_bank),
         "--rmsnorm-strategy", "vxm-feedback",
+        "--icu-macro-schedule",
     ]
     run([
         str(args.opt), "--input", str(stablehlo), "--output", str(stream),
@@ -52,7 +53,7 @@ def main() -> None:
     schedule_markers = {
         "ftlpu.schedule.compressed", 'name = "qkv"',
         'name = "softmax"', 'name = "o_proj"',
-        'name = "rmsnorm.feedback"',
+        'name = "rmsnorm.feedback"', 'name = "ffn.down.vector"',
         'accumulator_destination = "stream"',
         'accumulator_clear = true',
     }
@@ -74,7 +75,7 @@ def main() -> None:
             if not match:
                 continue
             address = int(match.group(1))
-            limit = 1024
+            limit = 8192
             if address >= limit:
                 raise AssertionError(
                     f"MXM accumulator address {address} exceeds {limit} rows"
@@ -90,6 +91,7 @@ def main() -> None:
         "--target-config", str(args.target_config),
         "--mxm-execution", "vector",
         "--weight-bank", str(args.weight_bank),
+        "--icu-macro-schedule",
     ], "compressed-schedule-to-binary")
     if binary.stat().st_size < 64:
         raise AssertionError("Qwen decoder-layer binary is unexpectedly small")

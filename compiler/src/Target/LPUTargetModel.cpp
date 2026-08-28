@@ -1266,12 +1266,6 @@ llvm::SmallVector<int64_t> LPUTargetModel::ffn_up_temp_slices() const
 
 llvm::SmallVector<int64_t> LPUTargetModel::attention_qk_key_slices() const
 {
-    if (uses_dedicated_slice_roles()) {
-        const auto storage = activation_storage_slices();
-        const auto begin = storage.begin() + throughput_.mxm_result_streams;
-        return llvm::SmallVector<int64_t>(
-            begin, begin + throughput_.mxm_result_streams);
-    }
     llvm::SmallDenseSet<int64_t, 32> queryIwSlices;
     for (int64_t reduction = 0; reduction < 2; ++reduction) {
         const auto& slices = attention_query_iw_slices(reduction);
@@ -1279,16 +1273,22 @@ llvm::SmallVector<int64_t> LPUTargetModel::attention_qk_key_slices() const
     }
 
     const int64_t count = throughput_.mxm_result_streams;
-    for (int64_t begin = 0;
-         begin + count <= memory_.slices_per_hemisphere; ++begin) {
+    const auto candidates = uses_dedicated_slice_roles()
+        ? activation_storage_slices()
+        : llvm::to_vector(llvm::seq<int64_t>(
+              0, memory_.slices_per_hemisphere));
+    for (auto begin = candidates.begin(); begin != candidates.end(); ++begin) {
+        if (std::distance(begin, candidates.end()) < count) break;
         bool available = true;
-        for (int64_t offset = 0; offset < count; ++offset)
-            available &= !queryIwSlices.contains(begin + offset);
+        for (int64_t offset = 0; offset < count; ++offset) {
+            available &= begin[offset] == begin[0] + offset;
+            available &= !queryIwSlices.contains(begin[offset]);
+        }
         if (!available) continue;
 
         llvm::SmallVector<int64_t> slices;
         for (int64_t offset = 0; offset < count; ++offset)
-            slices.push_back(begin + offset);
+            slices.push_back(begin[offset]);
         return slices;
     }
     throw std::logic_error(

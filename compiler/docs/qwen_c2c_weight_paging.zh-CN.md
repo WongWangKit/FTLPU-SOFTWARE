@@ -20,7 +20,7 @@ Qwen decoder 层不再要求全部权重同时常驻片上 MEM。runtime 首先�
 
 - 每个 MEM slice 有 2 个独立单端口 SRAM bank。
 - MEM ICU queue 唯一标识 `(hemisphere, slice, bank)`。
-- SRAM 地址是 bank-local row，每 row 为 32 bytes。每 superlane 128 KiB 的配置包含两个 64 KiB bank，因此每个 bank 的地址范围是 `0..2047`。
+- SRAM 地址是 bank-local row，每 row 为 32 bytes。共享配置包含两个 256 KiB bank，因此每个 bank 的地址范围是 `0..8191`。
 - bank 0 read 与 bank 1 write 可以同 cycle 发射；同一 bank 内仍服从单端口约束。
 - 计算保持原有 32 条 eastward 和 32 条 westward stream。C2C 对外提供可配置
   的 lane，默认每个方向 8 条，每条每 cycle 搬运一个 32-byte vector，峰值为
@@ -41,7 +41,7 @@ Binary v24 在 target ABI 中保存 bank 和外部存储参数。ModelPackage v5
 
 ### 专用 Slice 角色
 
-128 KiB Vector 部署目标 `cmodel_128kb_superlane_vector.json` 将每个 52-slice 半球划分为：
+共享硬件配置 `../FTLPU-CMODEL/config/ftlpu-lpu32.json` 将每个 52-slice 半球划分为：
 激活/工作区 slices `0..19`，以及靠近 MXM 的权重 slices `20..51`。
 其中 `0..15` 构成 SXM 所需的 distributed-16 激活平面，`16..19` 是辅助激活工作区。
 MXM accumulator 位于功能单元内部，其容量由 `mxm_accumulator_blocks` 描述；任何 MEM slice 都不配置成 accumulator。
@@ -52,7 +52,7 @@ MXM accumulator 位于功能单元内部，其容量由 `mxm_accumulator_blocks`
 
 该分区消除的是传输和端口冲突，并不会增加容量。对于 seq_len=32 的
 Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gate 与 Up
-共享 7 个乒乓页，Down 使用 12 个页，每页都不超过每 bank 2048 行。
+共享 7 个乒乓页，Down 使用 12 个页，每页都不超过每 bank 8192 行。
 现有 Block8 紧凑分页布局仍是另一条独立可用路径。
 
 ## 执行顺序
@@ -103,7 +103,7 @@ python compiler/tools/build_hf_decoder_stack.py `
   --opt build-ftlpu-vs2026/compiler/ftlpu_opt.exe `
   --translate build-ftlpu-vs2026/compiler/ftlpu-translate.exe `
   --stablehlo compiler/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir `
-  --target-config compiler/examples/targets/cmodel_large_sram.json `
+  --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
   --pack-model-weights build-ftlpu-vs2026/runtime/ftlpu-pack-model-weights.exe `
   --c2c-weight-paging --layer-count 2 --seq-len 128 `
   --output-dir build-ftlpu-vs2026/qwen_two_layer `
