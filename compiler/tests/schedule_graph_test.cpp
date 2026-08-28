@@ -38,4 +38,29 @@ int main()
     ResourceScheduler cycleResources;
     require(mlir::failed(cycle.schedule(cycleResources)),
         "dependency cycle was not rejected");
+
+    ResourceScheduler transactional;
+    const ResourceWindow conflictingBundle[] {
+        {"mem.h0.s3.b0.icu", 3, 1},
+        {"mem.h0.s3.b0.icu", 3, 1},
+    };
+    require(transactional.has_internal_conflict(conflictingBundle),
+        "bundle-internal ICU conflict was not detected");
+    require(!transactional.try_reserve_at(100, conflictingBundle),
+        "bundle-internal ICU conflict was committed");
+    const ResourceWindow nestedConflict[] {
+        {"mem.h0.s3.b0.icu", 0, 10},
+        {"mem.h0.s3.b0.icu", 1, 1},
+        {"mem.h0.s3.b0.icu", 3, 1},
+    };
+    require(transactional.has_internal_conflict(nestedConflict),
+        "nested bundle-internal conflict was not detected");
+    const ResourceWindow legalBundle[] {
+        {"mem.h0.s3.b0.icu", 3, 1},
+        {"mem.h0.s3.b0.read", 3, 1},
+    };
+    require(transactional.try_reserve_at(100, legalBundle),
+        "legal transactional bundle was rejected");
+    require(!transactional.try_reserve_at(100, legalBundle),
+        "existing ICU reservation was ignored");
 }

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -22,6 +23,12 @@ public:
         llvm::ArrayRef<ResourceWindow> windows) const;
     bool is_free_at(int64_t cycle,
         llvm::ArrayRef<ResourceWindow> windows) const;
+    bool has_internal_conflict(
+        llvm::ArrayRef<ResourceWindow> windows) const;
+    bool try_reserve_at(int64_t cycle,
+        llvm::ArrayRef<ResourceWindow> windows);
+    std::optional<int64_t> try_reserve(int64_t earliest_cycle,
+        llvm::ArrayRef<ResourceWindow> windows);
     int64_t reserve(int64_t earliest_cycle, llvm::ArrayRef<ResourceWindow> windows);
     void reserve_at(int64_t cycle, llvm::ArrayRef<ResourceWindow> windows);
     int64_t minimum_non_overlapping_shift(int64_t minimum_shift) const;

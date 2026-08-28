@@ -80,7 +80,10 @@ mlir::FailureOr<PhysicalAllocation> PhysicalMemoryAllocator::allocate(
             bool contiguous = true;
             for (std::size_t index = 1; index < slices.size(); ++index)
                 contiguous &= slices[index] == slices[index - 1] + 1;
-            if (!contiguous
+            const bool excluded = llvm::any_of(slices, [&](int64_t slice) {
+                return llvm::is_contained(request.excluded_slices, slice);
+            });
+            if (!contiguous || excluded
                 || conflicts(bank, slices, request.base_row, request.rows,
                     request.live_start, request.live_end,
                     request.reserve_slice_port))

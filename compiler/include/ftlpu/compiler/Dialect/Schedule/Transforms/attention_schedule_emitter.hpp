@@ -22,7 +22,7 @@ public:
 
 private:
     int64_t emitProjections();
-    void emitQk(int64_t qkStart, int64_t qkWaveCycles,
+    mlir::LogicalResult emitQk(int64_t qkStart, int64_t qkWaveCycles,
         int64_t qkIwToComputeCycles, bool fusedSoftmax);
     int64_t emitSoftmax(int64_t qkStart, int64_t qkEnd,
         bool fusedSoftmax);

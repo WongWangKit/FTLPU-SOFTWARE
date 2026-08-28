@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/resource_scheduler.hpp"
 
 #include <algorithm>
+#include <vector>
 
 namespace ftlpu::compiler::schedule {
 
@@ -34,8 +35,53 @@ int64_t ResourceScheduler::find_earliest(int64_t earliest_cycle,
 bool ResourceScheduler::is_free_at(int64_t cycle,
     llvm::ArrayRef<ResourceWindow> windows) const
 {
+    if (has_internal_conflict(windows)) return false;
     return std::all_of(windows.begin(), windows.end(),
         [&](const ResourceWindow& window) { return is_free(window, cycle); });
+}
+
+bool ResourceScheduler::has_internal_conflict(
+    llvm::ArrayRef<ResourceWindow> windows) const
+{
+    std::unordered_map<std::string, std::vector<std::pair<int64_t, int64_t>>>
+        intervalsByResource;
+    for (const ResourceWindow& window : windows) {
+        if (window.duration <= 0) return true;
+        intervalsByResource[window.resource].push_back(
+            {window.offset, window.offset + window.duration});
+    }
+    for (auto& [resource, intervals] : intervalsByResource) {
+        (void)resource;
+        std::sort(intervals.begin(), intervals.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.first != rhs.first
+                    ? lhs.first < rhs.first : lhs.second < rhs.second;
+            });
+        int64_t occupiedUntil = intervals.front().second;
+        for (std::size_t index = 1; index < intervals.size(); ++index) {
+            if (intervals[index].first < occupiedUntil)
+                return true;
+            occupiedUntil = std::max(occupiedUntil, intervals[index].second);
+        }
+    }
+    return false;
+}
+
+bool ResourceScheduler::try_reserve_at(int64_t cycle,
+    llvm::ArrayRef<ResourceWindow> windows)
+{
+    if (!is_free_at(cycle, windows)) return false;
+    reserve_at(cycle, windows);
+    return true;
+}
+
+std::optional<int64_t> ResourceScheduler::try_reserve(
+    int64_t earliest_cycle, llvm::ArrayRef<ResourceWindow> windows)
+{
+    if (has_internal_conflict(windows)) return std::nullopt;
+    const int64_t cycle = find_earliest(earliest_cycle, windows);
+    reserve_at(cycle, windows);
+    return cycle;
 }
 
 int64_t ResourceScheduler::reserve(int64_t earliest_cycle,

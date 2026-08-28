@@ -11,6 +11,9 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
       headBlocks_(op.getHeadDim() / target.throughput().mxm_rows)
 {
     const auto plan = op.getMemoryPlan();
+    for (std::size_t group = 0; group < queryIwSlices_.size(); ++group)
+        queryIwSlices_[group] = target_.attention_query_iw_slices(
+            static_cast<int64_t>(group));
     const auto readPaging = [&](mlir::DictionaryAttr placement,
                                 WeightPagingLayout& paging) {
         const auto paged = placement.getAs<mlir::BoolAttr>("paged_weight");
@@ -53,6 +56,8 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
         for (std::size_t i = 0; i < keySlices_.size(); ++i)
             keySlices_[i] =
                 llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
+        const int64_t bank = key.getAs<mlir::IntegerAttr>("bank").getInt();
+        keyBanks_.fill(bank);
     }
     if (const auto weight = plan.getAs<mlir::DictionaryAttr>("output_weight")) {
         outputWeightBase_ = weight.getAs<mlir::IntegerAttr>("base_row").getInt();
@@ -102,8 +107,53 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     readPlacement("causal_mask_mxm1", causalMaskSlices_[1], ignoredBase);
     readPlacement("probability_pack", probabilityPackSlices_, probabilityPackBase_);
     readPlacement("probability_diagonal", probabilityDiagonalSlices_, probabilityDiagonalBase_);
-    if (const auto query = plan.getAs<mlir::DictionaryAttr>("query"))
+    if (const auto query = plan.getAs<mlir::DictionaryAttr>("query")) {
         queryIwBase_ = query.getAs<mlir::IntegerAttr>("base_row").getInt();
+        const int64_t baseBank =
+            query.getAs<mlir::IntegerAttr>("bank").getInt();
+        queryIwBanks_.fill(baseBank);
+        if (target_.uses_dedicated_slice_roles()
+            && target_.memory().banks_per_slice >= 2)
+            queryIwBanks_[1] = (baseBank + 1)
+                % target_.memory().banks_per_slice;
+    }
+    const auto readSegments = [&](llvm::StringRef name, bool query) {
+        const auto placement = plan.getAs<mlir::DictionaryAttr>(name);
+        const auto segments = placement
+            ? placement.getAs<mlir::ArrayAttr>("segments") : mlir::ArrayAttr{};
+        if (!segments) return;
+        const int64_t blocksPerHalf = std::max<int64_t>(1, headBlocks_ / 2);
+        for (mlir::Attribute value : segments) {
+            const auto segment = llvm::dyn_cast<mlir::DictionaryAttr>(value);
+            const auto begin = segment
+                ? segment.getAs<mlir::IntegerAttr>("reduction_begin")
+                : mlir::IntegerAttr{};
+            const auto bank = segment
+                ? segment.getAs<mlir::IntegerAttr>("bank")
+                : mlir::IntegerAttr{};
+            const auto slices = segment
+                ? segment.getAs<mlir::ArrayAttr>("slices")
+                : mlir::ArrayAttr{};
+            if (!begin || !bank || !slices) continue;
+            const std::size_t group = static_cast<std::size_t>(
+                std::min<int64_t>(1, begin.getInt() / blocksPerHalf));
+            if (query) {
+                if (slices.size() != queryIwSlices_[group].size()) continue;
+                queryIwBanks_[group] = bank.getInt();
+                for (std::size_t index = 0; index < slices.size(); ++index)
+                    queryIwSlices_[group][index] =
+                        llvm::cast<mlir::IntegerAttr>(slices[index]).getInt();
+            } else {
+                if (slices.size() != 2) continue;
+                keyBanks_[group] = bank.getInt();
+                for (std::size_t index = 0; index < 2; ++index)
+                    keySlices_[group * 2 + index] =
+                        llvm::cast<mlir::IntegerAttr>(slices[index]).getInt();
+            }
+        }
+    };
+    readSegments("query", true);
+    readSegments("key", false);
     if (const auto value = plan.getAs<mlir::DictionaryAttr>("value")) {
         valuePackBase_ = value.getAs<mlir::IntegerAttr>("base_row").getInt();
         const auto slices = value.getAs<mlir::ArrayAttr>("slices");
@@ -211,20 +261,17 @@ llvm::ArrayRef<int64_t> AttentionMemoryLayout::queryIwSlices(
     int64_t reductionBlock) const
 {
     const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
-    return target_.attention_query_iw_slices(
-        reductionBlock / blocksPerRotaryHalf);
+    const std::size_t group = static_cast<std::size_t>(
+        std::min<int64_t>(1, reductionBlock / blocksPerRotaryHalf));
+    return queryIwSlices_[group];
 }
 
-int64_t AttentionMemoryLayout::rotaryBank(
-    int64_t baseBank, int64_t reductionBlock) const
+int64_t AttentionMemoryLayout::queryIwBank(int64_t reductionBlock) const
 {
-    if (!target_.uses_dedicated_slice_roles()
-        || target_.memory().banks_per_slice < 2)
-        return baseBank;
-    const int64_t blocksPerRotaryHalf =
-        std::max<int64_t>(1, headBlocks_ / 2);
-    return (baseBank + reductionBlock / blocksPerRotaryHalf)
-        % target_.memory().banks_per_slice;
+    const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
+    const std::size_t group = static_cast<std::size_t>(
+        std::min<int64_t>(1, reductionBlock / blocksPerRotaryHalf));
+    return queryIwBanks_[group];
 }
 
 int64_t AttentionMemoryLayout::keyAddress(int64_t kvHead,
@@ -243,6 +290,14 @@ llvm::ArrayRef<int64_t> AttentionMemoryLayout::keySlices(
     const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
     const int64_t bank = reductionBlock / blocksPerRotaryHalf;
     return llvm::ArrayRef<int64_t>(keySlices_).slice(bank * 2, 2);
+}
+
+int64_t AttentionMemoryLayout::keyBank(int64_t reductionBlock) const
+{
+    const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
+    const std::size_t group = static_cast<std::size_t>(
+        std::min<int64_t>(1, reductionBlock / blocksPerRotaryHalf));
+    return keyBanks_[group];
 }
 
 int64_t AttentionMemoryLayout::scoreAccumulatorAddress(int64_t queryHead,

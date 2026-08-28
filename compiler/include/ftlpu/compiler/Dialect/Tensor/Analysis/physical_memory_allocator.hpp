@@ -32,6 +32,9 @@ struct PhysicalAllocationRequest {
     llvm::ArrayRef<int64_t> candidate_slices;
     bool reserve_slice_port = true;
     llvm::ArrayRef<int64_t> candidate_banks;
+    // Slices which are storage-compatible but unavailable to this request
+    // because a concurrently accessed buffer already owns their MEM ICU.
+    llvm::ArrayRef<int64_t> excluded_slices;
 };
 
 // Allocates byte planes with interval reuse. Lifetimes are half-open and are

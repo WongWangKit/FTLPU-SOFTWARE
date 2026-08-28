@@ -169,8 +169,9 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     // tail schedule. Fused planning remains an optional optimization, but it
     // must not suppress the BF16 score materialization consumed below.
     const bool fusedSoftmax = false;
-    emitQk(qkStart, stagePlan.qk_wave_interval,
-        stagePlan.qk_iw_to_compute_cycles, fusedSoftmax);
+    if (mlir::failed(emitQk(qkStart, stagePlan.qk_wave_interval,
+            stagePlan.qk_iw_to_compute_cycles, fusedSoftmax)))
+        return mlir::failure();
     const int64_t softmaxEnd = emitSoftmax(qkStart, qkEnd, fusedSoftmax);
     const int64_t softmaxStart = fusedSoftmax
         ? qkStart + target_.throughput().mxm_earliest_iw_cycle

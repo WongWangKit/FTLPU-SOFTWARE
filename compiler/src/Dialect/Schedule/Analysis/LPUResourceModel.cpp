@@ -46,6 +46,12 @@ std::string LPUResourceModel::mem_write_port(
     return mem_port_resource(target_, hemisphere, slice, bank, "write");
 }
 
+std::string LPUResourceModel::mem_icu(
+    int64_t hemisphere, int64_t slice, int64_t bank) const
+{
+    return mem_port_resource(target_, hemisphere, slice, bank, "icu");
+}
+
 std::string LPUResourceModel::mxm(int64_t unit) const
 {
     if (!target_.is_valid_mxm_unit(unit)) throw std::out_of_range("invalid MXM resource");

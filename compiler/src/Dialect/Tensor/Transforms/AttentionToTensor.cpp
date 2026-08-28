@@ -78,7 +78,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     const auto output_slices =
         target.attention_projection_output_slices();
-    const auto key_slices = target.attention_qk_key_slices();
     const int64_t q_weight_rows = attention_weight_rows(query_width);
     const int64_t k_weight_rows = attention_weight_rows(kv_width);
     const int64_t v_weight_rows = attention_weight_rows(kv_width);
@@ -189,14 +188,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         return mlir::failure();
     }
     llvm::SmallVector<int64_t, 16> probability_pack_slices;
-    if (tiled_weights && target.uses_dedicated_slice_roles()) {
-        const auto storage = target.weight_storage_slices();
-        probability_pack_slices.assign(
-            storage.end() - 16, storage.end());
-    } else {
-        const auto values = target.attention_query_iw_slices(1);
-        probability_pack_slices.assign(values.begin(), values.end());
-    }
     const auto staging_slice_values =
         target.attention_rope_staging_slices();
     const llvm::SmallVector<int64_t, 16> rope_staging_slices(
@@ -211,6 +202,14 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     } else {
         const auto values = target.mxm_distributed_activation_slices();
         rope_product_slices.assign(values.begin(), values.end());
+    }
+    llvm::SmallVector<int64_t, 16> probability_diagonal_slices;
+    if (tiled_weights && target.uses_dedicated_slice_roles()) {
+        probability_diagonal_slices.assign(
+            rope_product_slices.begin(), rope_product_slices.end());
+    } else {
+        const auto values = target.attention_query_iw_slices(0);
+        probability_diagonal_slices.assign(values.begin(), values.end());
     }
     llvm::SmallVector<int64_t, 4> rope_table_slices;
     int64_t rope_table_bank = scratch_bank;
@@ -228,17 +227,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         op.emitError("failed to reserve the attention RoPE product FIFO");
         return mlir::failure();
     }
-    if (mlir::failed(physical_allocator.reserve({"probability_pack",
-            llvm::SmallVector<int64_t, 16>(
-            probability_pack_slices.begin(), probability_pack_slices.end()),
-            target.attention_probability_pack_base_row(),
-            probability_pack_rows,
-            3, 4, true, scratch_bank}))) {
-        op.emitError("failed to reserve the attention probability-pack layout");
-        return mlir::failure();
-    }
     if (mlir::failed(physical_allocator.reserve({"probability_diagonal",
-            rope_product_slices,
+            probability_diagonal_slices,
             target.attention_probability_diagonal_base_row(),
             query_heads * blocks * blocks
                 * target.throughput().tile_rows,
@@ -298,6 +288,37 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             return mlir::failure();
         }
     }
+    const int64_t key_bank = target.uses_dedicated_slice_roles()
+        ? secondary_scratch_bank : scratch_bank;
+    const llvm::SmallVector<int64_t, 1> key_candidate_banks {key_bank};
+    llvm::SmallVector<int64_t, 32> qk_excluded_slices;
+    const int64_t query_segment_banks[2] {
+        scratch_bank,
+        target.uses_dedicated_slice_roles()
+                && target.memory().banks_per_slice >= 2
+            ? (scratch_bank + 1) % target.memory().banks_per_slice
+            : scratch_bank,
+    };
+    for (int64_t group = 0; group < 2; ++group) {
+        if (query_segment_banks[group] != key_bank) continue;
+        for (int64_t slice : target.attention_query_iw_slices(group))
+            if (!llvm::is_contained(qk_excluded_slices, slice))
+                qk_excluded_slices.push_back(slice);
+    }
+    // Key and Query are consumed concurrently by QK. Allocate Key from the
+    // activation pool while excluding every Query slice on the same bank.
+    // The exact cycle-level MEM ICU check is performed by the QK planner.
+    auto key_allocation = physical_allocator.allocate({"key",
+        static_cast<int64_t>(target.throughput().mxm_result_streams),
+        0, kv_heads * logical_head_banks * seq_len,
+        2, 3, scratch_candidates, false, key_candidate_banks,
+        qk_excluded_slices});
+    if (mlir::failed(key_allocation)) {
+        op.emitError(
+            "cannot place QK Key storage outside concurrent Query MEM ICU "
+            "slices");
+        return mlir::failure();
+    }
     const auto allocate_scratch = [&](llvm::StringRef name,
                                       int64_t slice_count,
                                       int64_t base_row,
@@ -338,6 +359,48 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         op.emitError("attention scratch memory allocation failed");
         return mlir::failure();
     }
+    // Softmax broadcasts the score scalar and streams the exponentials while
+    // it writes the packed probability vectors.  These accesses overlap in
+    // time, so the probability-pack window must not reuse either input's MEM
+    // slices on the same bank.  Prefer activation slices, then use otherwise
+    // idle weight-role slices when weights live in a separate bank.
+    llvm::SmallVector<int64_t, 64> probability_pack_candidates(
+        activation_storage.begin(), activation_storage.end());
+    if (paged_weights && target.uses_dedicated_slice_roles()) {
+        const auto weight_storage = target.weight_storage_slices();
+        probability_pack_candidates.append(
+            weight_storage.begin(), weight_storage.end());
+    }
+    llvm::SmallVector<int64_t, 32> probability_pack_excluded;
+    const auto exclude_softmax_input = [&](const auto& allocation) {
+        if (allocation->bank != scratch_bank) return;
+        for (int64_t slice : allocation->slices)
+            if (!llvm::is_contained(probability_pack_excluded, slice))
+                probability_pack_excluded.push_back(slice);
+    };
+    exclude_softmax_input(score0);
+    exclude_softmax_input(score1);
+    exclude_softmax_input(exp0);
+    exclude_softmax_input(exp1);
+    // The pack-to-diagonal transpose pipelines reads and writes across its
+    // nominal phase boundary.  Keep those slice sets disjoint as well.
+    for (int64_t slice : probability_diagonal_slices)
+        if (!llvm::is_contained(probability_pack_excluded, slice))
+            probability_pack_excluded.push_back(slice);
+    const llvm::SmallVector<int64_t, 1> probability_pack_banks {
+        scratch_bank};
+    auto probability_pack = physical_allocator.allocate({"probability_pack",
+        16, target.attention_probability_pack_base_row(),
+        probability_pack_rows, 3, 4, probability_pack_candidates,
+        true, probability_pack_banks, probability_pack_excluded});
+    if (mlir::failed(probability_pack)) {
+        op.emitError(
+            "cannot place the attention probability pack outside concurrent "
+            "Softmax score/exp MEM slices");
+        return mlir::failure();
+    }
+    probability_pack_slices.assign(
+        probability_pack->slices.begin(), probability_pack->slices.end());
     const llvm::SmallVector<int64_t, 1> result_banks {
         secondary_scratch_bank};
     auto vector_result = physical_allocator.allocate({"result",
@@ -406,6 +469,56 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             "fp16_mxm_activation_planar",
             activation_slices, 0, seq_len * hidden / tile,
             "both");
+    const int64_t blocks_per_rotary_half =
+        std::max<int64_t>(1, head_blocks / 2);
+    const auto make_segment = [&](int64_t reduction_begin,
+                                  int64_t reduction_end, int64_t bank,
+                                  llvm::ArrayRef<int64_t> slices,
+                                  int64_t base_row) {
+        return rewriter.getDictionaryAttr({
+            rewriter.getNamedAttr("reduction_begin",
+                rewriter.getI64IntegerAttr(reduction_begin)),
+            rewriter.getNamedAttr("reduction_end",
+                rewriter.getI64IntegerAttr(reduction_end)),
+            rewriter.getNamedAttr(
+                "bank", rewriter.getI64IntegerAttr(bank)),
+            rewriter.getNamedAttr(
+                "base_row", rewriter.getI64IntegerAttr(base_row)),
+            rewriter.getNamedAttr("slices",
+                rewriter.getI64ArrayAttr(slices)),
+        });
+    };
+    const auto query_segments = rewriter.getArrayAttr({
+        make_segment(0, blocks_per_rotary_half, query_segment_banks[0],
+            target.attention_query_iw_slices(0), query_base),
+        make_segment(blocks_per_rotary_half, head_blocks,
+            query_segment_banks[1], target.attention_query_iw_slices(1),
+            query_base),
+    });
+    const auto key_segments = rewriter.getArrayAttr({
+        make_segment(0, blocks_per_rotary_half, key_allocation->bank,
+            llvm::ArrayRef<int64_t>(key_allocation->slices).take_front(2), 0),
+        make_segment(blocks_per_rotary_half, head_blocks,
+            key_allocation->bank,
+            llvm::ArrayRef<int64_t>(key_allocation->slices).take_back(2), 0),
+    });
+    const auto with_segments = [&](mlir::DictionaryAttr placement,
+                                   mlir::ArrayAttr segments) {
+        mlir::NamedAttrList attributes(placement);
+        attributes.set("segments", segments);
+        return attributes.getDictionary(rewriter.getContext());
+    };
+    const auto query_placement = with_segments(
+        make_attention_placement(rewriter, "fp16_query_iw",
+            target.attention_query_iw_slices(0), query_base, query_rows,
+            "both", scratch_bank),
+        query_segments);
+    const auto key_placement = with_segments(
+        make_attention_placement(rewriter, "fp16_head_planar",
+            key_allocation->slices, 0,
+            kv_heads * logical_head_banks * seq_len, "both",
+            key_allocation->bank),
+        key_segments);
     const auto plan = rewriter.getDictionaryAttr({
         rewriter.getNamedAttr("input", inputPlacement),
         rewriter.getNamedAttr("input_staging",
@@ -430,15 +543,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             "w8a16_mxm_weight_striped",
             tensor::AttentionWeightTileKind::Output, output_weight_base,
             o_weight_rows, output_weight_slices, 1)),
-        rewriter.getNamedAttr("query", make_attention_placement(rewriter,
-            "fp16_query_iw", target.attention_query_iw_slices(0),
-            query_base, query_rows, "both",
-            scratch_bank)),
-        rewriter.getNamedAttr("key", make_attention_placement(rewriter,
-            "fp16_head_planar", key_slices, 0,
-            kv_heads * logical_head_banks * seq_len, "both",
-            target.uses_dedicated_slice_roles()
-                ? secondary_scratch_bank : scratch_bank)),
+        rewriter.getNamedAttr("query", query_placement),
+        rewriter.getNamedAttr("key", key_placement),
         rewriter.getNamedAttr("value", make_attention_placement(rewriter,
             "fp16_value_x16", target.attention_value_slices(),
             value_base,
@@ -492,10 +598,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             scratch_bank)),
         rewriter.getNamedAttr("probability_diagonal", make_attention_placement(rewriter,
             "fp16_probability_diagonal",
-            tiled_weights && target.uses_dedicated_slice_roles()
-                ? llvm::ArrayRef<int64_t>(rope_product_slices)
-                : llvm::ArrayRef<int64_t>(
-                      target.attention_query_iw_slices(0)),
+            probability_diagonal_slices,
             target.attention_probability_diagonal_base_row(),
             query_heads * blocks * blocks
                 * target.throughput().tile_rows, "both",

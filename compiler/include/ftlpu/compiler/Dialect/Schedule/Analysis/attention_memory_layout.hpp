@@ -30,10 +30,11 @@ public:
     int64_t queryIwAddress(int64_t head, int64_t reductionBlock,
         int64_t tokenBlock, int64_t phase) const;
     llvm::ArrayRef<int64_t> queryIwSlices(int64_t reductionBlock) const;
-    int64_t rotaryBank(int64_t baseBank, int64_t reductionBlock) const;
+    int64_t queryIwBank(int64_t reductionBlock) const;
     int64_t keyAddress(int64_t kvHead, int64_t reductionBlock,
         int64_t keyBlock) const;
     llvm::ArrayRef<int64_t> keySlices(int64_t reductionBlock) const;
+    int64_t keyBank(int64_t reductionBlock) const;
     int64_t scoreAccumulatorAddress(int64_t queryHead, int64_t queryBlock,
         int64_t keyBlock) const;
     int64_t scoreAccumulatorTokenAddress(int64_t queryHead, int64_t queryBlock,
@@ -136,6 +137,9 @@ private:
     std::array<int64_t, 8> outputWeightSlices_ {0, 4, 8, 12, 2, 18, 24, 28};
     std::array<int64_t, 4> activationSlices_ {32, 33, 34, 35};
     std::array<int64_t, 4> keySlices_ {0, 1, 2, 3};
+    std::array<std::array<int64_t, 16>, 2> queryIwSlices_ {};
+    std::array<int64_t, 2> queryIwBanks_ {0, 0};
+    std::array<int64_t, 2> keyBanks_ {0, 0};
     std::array<int64_t, 4> ropeSlices_ {};
     std::array<int64_t, 16> ropeStagingSlices_ {};
     std::array<int64_t, 16> ropeProductSlices_ {};

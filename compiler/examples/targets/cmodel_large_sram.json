@@ -1,10 +1,39 @@
 {
+  "schema_version": 1,
+  "target": {
+    "name": "lpu32-cmodel-large-sram"
+  },
+  "topology": {
+    "hemispheres": 2,
+    "tiles_per_slice": 4,
+    "lanes_per_tile": 8
+  },
+  "mem": {
+    "slices_per_hemisphere": 52,
+    "banks_per_slice": 2,
+    "rows_per_bank": 32768,
+    "bytes_per_lane": 1
+  },
+  "sr": {
+    "registers_per_lane": 64,
+    "bytes_per_stream_per_lane": 1
+  },
+  "mxm": {
+    "accum_contexts": 32,
+    "supported_modes": [
+      "linear1x16"
+    ]
+  },
+  "vxm": {
+    "alus": 8
+  },
   "name": "lpu32-cmodel-large-sram",
   "memory": {
     "banks_per_slice": 2,
     "words_per_bank": 32768,
     "bytes_per_word": 32,
     "sram_depth_rows": 32768,
+    "attention_mask_base_row": 8128,
     "w8a16_hidden_base_row": 8192
   },
   "streams": {

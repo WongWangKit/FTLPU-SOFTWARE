@@ -40,4 +40,13 @@ int main()
     require(mlir::succeeded(other_bank) && other_bank->bank == 1
             && other_bank->slices[0] == 0,
         "an independent SRAM bank did not reuse the same live interval");
+
+    tensor::PhysicalMemoryAllocator constrained(target);
+    const std::array<int64_t, 4> excluded {0, 1, 2, 3};
+    auto qk_candidate = constrained.allocate(
+        {"qk_key", 2, 0, 32, 0, 1, candidates, false, bank1, excluded});
+    require(mlir::succeeded(qk_candidate)
+            && qk_candidate->slices[0] == 4
+            && qk_candidate->slices[1] == 5,
+        "excluded concurrent slices were selected");
 }

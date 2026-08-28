@@ -4,6 +4,8 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_projection_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_work_planner.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/lpu_resource_model.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/resource_scheduler.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
@@ -147,7 +149,6 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       inputDistributed16 ? inputStagingBank : inputBank;
   const int64_t stagingBank = placementBank("rope_staging");
   const int64_t ropeBank = placementBank("rope");
-  const int64_t queryBank = placementBank("query");
   const int64_t keyBank = placementBank("key");
   const int64_t valueBank = placementBank("value");
 
@@ -582,10 +583,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             std::max(replicateCycle, replicateEnd + maxStagingReadLatency + 1);
         const int64_t firstHead = firstOutputBlock / projectionHeadBlocks;
         const int64_t lastHead = (lastOutputBlock - 1) / projectionHeadBlocks;
-        const auto productSlices = layout.ropeProductSlices();
+        const auto baseProductSlices = layout.ropeProductSlices();
         int64_t maxProductWriteLatency = 0;
         int64_t maxProductReadLatency = 0;
-        for (int64_t slice : productSlices) {
+        for (int64_t slice : baseProductSlices) {
           maxProductWriteLatency = std::max(
               maxProductWriteLatency,
               target_
@@ -610,6 +611,162 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 kind == AttentionProjectionKind::Query
                     ? (head / queryHeadsPerKv) % memory.hemispheres
                     : head % memory.hemispheres;
+            const LPUResourceModel resourceModel(target_);
+            const auto appendMemResources = [&](auto &windows, int64_t cycle,
+                                                int64_t hemisphere,
+                                                int64_t slice, int64_t bank,
+                                                bool write) {
+              windows.push_back(
+                  {resourceModel.mem_icu(hemisphere, slice, bank), cycle, 1});
+              windows.push_back(
+                  {write ? resourceModel.mem_write_port(hemisphere, slice, bank)
+                         : resourceModel.mem_read_port(hemisphere, slice, bank),
+                   cycle, 1});
+            };
+            const auto ropeResourcesAreLegal =
+                [&](llvm::ArrayRef<int64_t> candidateSlices) {
+                  llvm::SmallVector<ResourceWindow, 0> windows;
+                  const int64_t productAInputOffset = 1;
+                  const int64_t productBConfigOffset =
+                      productAInputOffset + op_.getSeqLen() + 1 +
+                      maxProductWriteLatency + maxStagingReadLatency + 1;
+                  const int64_t productBInputOffset =
+                      productBConfigOffset + 1;
+                  const int64_t combineConfigOffset =
+                      productBInputOffset + op_.getSeqLen() + 1 +
+                      maxProductWriteLatency + maxProductReadLatency + 1;
+                  const int64_t combineInputOffset = combineConfigOffset + 1;
+
+                  const auto appendProductPhase =
+                      [&](int64_t inputOffset, int64_t firstProduct) {
+                        for (int64_t token = 0; token < op_.getSeqLen();
+                             ++token) {
+                          const int64_t tokenLane = token % blockRows;
+                          const int64_t inputCycle = inputOffset + token;
+                          for (int64_t half = 0; half < 2; ++half) {
+                            const int64_t sourceBlock = blocks[half];
+                            for (int64_t hemisphere = 0;
+                                 hemisphere < memory.hemispheres;
+                                 ++hemisphere) {
+                              for (int64_t byte = 0; byte < 2; ++byte) {
+                                const int64_t slice =
+                                    layout.ropeStagingSlices()
+                                        [(2 * tokenLane + byte +
+                                             2 * sourceBlock) %
+                                            16];
+                                appendMemResources(
+                                    windows,
+                                    inputCycle - vxmInputReadLatency(slice),
+                                    hemisphere, slice, stagingBank, false);
+                              }
+                            }
+                          }
+                          for (int64_t hemisphere = 0;
+                               hemisphere < memory.hemispheres; ++hemisphere) {
+                            for (int64_t byte = 0; byte < 4; ++byte) {
+                              const int64_t slice = layout.ropeSlices()[byte];
+                              appendMemResources(
+                                  windows,
+                                  inputCycle - vxmInputReadLatency(slice),
+                                  hemisphere, slice, ropeBank, false);
+                            }
+                          }
+                          const int64_t laneOffset = (token % 2) * 8;
+                          for (int64_t slot = 0; slot < 2; ++slot) {
+                            const int64_t product = firstProduct + slot;
+                            for (int64_t byte = 0; byte < 2; ++byte) {
+                              const int64_t slice = candidateSlices[
+                                  laneOffset + product * 2 + byte];
+                              const int64_t latency =
+                                  target_
+                                      .transport_latency(
+                                          target::StreamEndpoint::VxmResult,
+                                          target::StreamEndpoint::Mem,
+                                          target::StreamDirection::East,
+                                          slice)
+                                      .value_or(readLatency(slice));
+                              for (int64_t destination = 0;
+                                   destination < memory.hemispheres;
+                                   ++destination)
+                                appendMemResources(
+                                    windows, inputCycle + 2 + latency,
+                                    destination, slice, productBank, true);
+                            }
+                          }
+                        }
+                      };
+                  appendProductPhase(productAInputOffset, 0);
+                  appendProductPhase(productBInputOffset, 2);
+
+                  for (int64_t token = 0; token < op_.getSeqLen(); ++token) {
+                    const int64_t tokenLane = token % blockRows;
+                    const int64_t inputCycle = combineInputOffset + token;
+                    const int64_t laneOffset = (token % 2) * 8;
+                    for (int64_t product = 0; product < 4; ++product) {
+                      for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t slice = candidateSlices[
+                            laneOffset + product * 2 + byte];
+                        for (int64_t hemisphere = 0;
+                             hemisphere < memory.hemispheres; ++hemisphere)
+                          appendMemResources(
+                              windows,
+                              inputCycle - vxmInputReadLatency(slice),
+                              hemisphere, slice, productBank, false);
+                      }
+                    }
+                    const int64_t outputCycle = inputCycle + 1;
+                    for (int64_t half = 0; half < 2; ++half) {
+                      const int64_t reductionBlock = blocks[half];
+                      for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t slice =
+                            kind == AttentionProjectionKind::Query
+                                ? layout.queryIwSlices(reductionBlock)
+                                      [2 * tokenLane + byte]
+                                : layout.keySlices(reductionBlock)[byte];
+                        const int64_t latency =
+                            target_
+                                .transport_latency(
+                                    target::StreamEndpoint::VxmResult,
+                                    target::StreamEndpoint::Mem,
+                                    target::StreamDirection::East, slice)
+                                .value_or(readLatency(slice));
+                        const int64_t bank =
+                            kind == AttentionProjectionKind::Query
+                                ? layout.queryIwBank(reductionBlock)
+                                : layout.keyBank(reductionBlock);
+                        for (int64_t destination = 0;
+                             destination < memory.hemispheres; ++destination)
+                          appendMemResources(windows, outputCycle + latency,
+                                             destination, slice, bank, true);
+                      }
+                    }
+                  }
+                  ResourceScheduler resources;
+                  return resources.try_reserve_at(0, windows);
+                };
+
+            llvm::SmallVector<int64_t, 16> productSlices(
+                baseProductSlices.begin(), baseProductSlices.end());
+            if (!ropeResourcesAreLegal(productSlices)) {
+              llvm::SmallVector<int64_t, 16> interleaved;
+              interleaved.reserve(productSlices.size());
+              // Product storage uses two slices per BF16 pair. Group pairs
+              // by token-lane parity so an II=1 product read cannot meet the
+              // same Query-IW slice write from the opposite token parity.
+              for (int64_t parity = 0; parity < 2; ++parity)
+                for (std::size_t index = 0; index < productSlices.size();
+                     ++index)
+                  if (static_cast<int64_t>(index / 2) % 2 == parity)
+                    interleaved.push_back(productSlices[index]);
+              if (interleaved.empty() ||
+                  !ropeResourcesAreLegal(interleaved)) {
+                op_.emitError(
+                    "cannot find a conflict-free MEM ICU schedule for RoPE "
+                    "Product A/B/Combine");
+                return -1;
+              }
+              productSlices = std::move(interleaved);
+            }
             const auto emitSource = [&](int64_t token, int64_t half,
                                         int64_t stream, int64_t inputCycle) {
               const int64_t tokenBlock = token / tile;
@@ -750,8 +907,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                        destination < memory.hemispheres; ++destination) {
                     const int64_t source = 1 - destination;
                     const int64_t baseBank =
-                        kind == AttentionProjectionKind::Query ? queryBank
-                                                               : keyBank;
+                        kind == AttentionProjectionKind::Query
+                            ? layout.queryIwBank(reductionBlock)
+                            : layout.keyBank(reductionBlock);
                     emitMem(rewriter_, op_.getLoc(), outputCycle + latency,
                             destination * memory.slices_per_hemisphere + slice,
                             "write",
@@ -762,9 +920,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                                     tokenBlock) +
                                       token % tile,
                             source * 8 + half * 2 + byte, 1, 1, 0, "sram", -1,
-                            kind == AttentionProjectionKind::Query
-                                ? layout.rotaryBank(baseBank, reductionBlock)
-                                : baseBank);
+                            baseBank);
                     headEnd = std::max(headEnd, outputCycle + latency + 1);
                   }
                 }
@@ -979,7 +1135,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             layout.queryIwAddress(head, reduction, tokenBlock,
                                                   phase),
                             stream, 1, 1, 0, "sram", -1,
-                            layout.rotaryBank(queryBank, reduction));
+                            layout.queryIwBank(reduction));
                     finalWriteEnd =
                         std::max(finalWriteEnd, writeCycle + slice / 4 + 1);
                   }
@@ -1062,7 +1218,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 source * target_.memory().slices_per_hemisphere + slice, "read",
                 layout.queryIwAddress(queryHead, reduction, queryBlock, phase),
                 32 + stream, 1, 1, 0, "sram", -1,
-                layout.rotaryBank(queryBank, reduction));
+                layout.queryIwBank(reduction));
             emitVxm(rewriter_, op_.getLoc(), op_.getInput(), copyCycle, stream,
                     "pass", "stream_i8", 32 + stream, 0.0f, "immediate", 0,
                     0.0f, "i8", stream, hemisphereName(source),
@@ -1073,7 +1229,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 "write",
                 layout.queryIwAddress(queryHead, reduction, queryBlock, phase),
                 stream, 1, 1, 0, "sram", -1,
-                layout.rotaryBank(queryBank, reduction));
+                layout.queryIwBank(reduction));
           }
         }
       }
@@ -1102,12 +1258,13 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               "pass", streamKind, 34, 0.0f, "immediate", 0, 0.0f, dataFormat, 2,
               hemi, hemi);
       for (int64_t byte = 0; byte < 4; ++byte) {
-        const int64_t slice = 4 + byte;
+        const int64_t reduction = byte < 2 ? 0 : headBlocks / 2;
+        const int64_t slice = layout.keySlices(reduction)[byte % 2];
         emitMem(rewriter_, op_.getLoc(), keyCopyCycle + 1 + slice / groups,
                 hemisphere * target_.memory().slices_per_hemisphere + slice,
                 "write",
                 layout.keyAddress(keyHead, 0, token / tile) + token % tile,
-                byte, 1, 1, 0, "sram", -1, keyBank);
+                byte, 1, 1, 0, "sram", -1, layout.keyBank(reduction));
       }
     }
     keyCopyCycle += 12;
@@ -1115,9 +1272,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   return keyCopyCycle + 16;
 }
 
-void AttentionScheduleEmitter::emitQk(int64_t qkStart, int64_t qkWaveCycles,
-                                      int64_t qkIwToComputeCycles,
-                                      bool fusedSoftmax) {
+mlir::LogicalResult AttentionScheduleEmitter::emitQk(
+    int64_t qkStart, int64_t qkWaveCycles,
+    int64_t qkIwToComputeCycles, bool fusedSoftmax) {
   const AttentionMemoryLayout layout(op_, target_);
   const auto placementBank = [&](llvm::StringRef name) {
     const auto placement =
@@ -1126,8 +1283,6 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart, int64_t qkWaveCycles,
                                 : mlir::IntegerAttr{};
     return bank ? bank.getInt() : 0;
   };
-  const int64_t queryBank = placementBank("query");
-  const int64_t keyBank = placementBank("key");
   const auto elementType =
       llvm::cast<mlir::RankedTensorType>(op_.getInput().getType())
           .getElementType();
@@ -1136,6 +1291,85 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart, int64_t qkWaveCycles,
   const int64_t tokenBlocks = op_.getSeqLen() / tile;
   const int64_t headBlocks = op_.getHeadDim() / tile;
   const int64_t issue = target_.mxm_block_issue_interval();
+  const bool wavefront = target_.supports_mxm_weight_activation_overlap() &&
+                         target_.throughput().mxm_weight_buffers >= 2 &&
+                         target_.throughput().mxms_per_hemisphere == 1;
+  const auto reductionComputeCycle = [&](int64_t firstComputeCycle,
+                                         int64_t reduction) {
+    return firstComputeCycle + reduction * tokenBlocks * issue;
+  };
+  const auto reductionIwCycle = [&](int64_t firstIwCycle,
+                                    int64_t firstComputeCycle,
+                                    int64_t localMxm, int64_t reduction) {
+    const int64_t compute = reductionComputeCycle(firstComputeCycle, reduction);
+    return wavefront
+               ? compute - qkIwToComputeCycles -
+                     localMxm * target_.throughput().tile_rows
+               : firstIwCycle + localMxm * 8 + reduction * tile / 8;
+  };
+
+  // Plan the complete QK input bundle before emitting any IR. Query-IW and
+  // Key activation traffic use different MXM paths, but still share one MEM
+  // ICU for each (hemisphere, slice, bank).
+  ResourceScheduler qkResources;
+  const LPUResourceModel resourceModel(target_);
+  for (std::size_t waveIndex = 0; waveIndex < stage_plan_.qk_waves.size();
+       ++waveIndex) {
+    llvm::SmallVector<ResourceWindow, 256> windows;
+    const int64_t waveStart =
+        qkStart + static_cast<int64_t>(waveIndex) * qkWaveCycles;
+    const int64_t firstIwCycle =
+        waveStart + target_.throughput().mxm_earliest_iw_cycle +
+        *target_.transport_latency(target::StreamEndpoint::Mem,
+                                   target::StreamEndpoint::MxmWeight,
+                                   target::StreamDirection::East, 0);
+    const int64_t firstComputeCycle = firstIwCycle + qkIwToComputeCycles;
+    const auto appendRead = [&](int64_t cycle, int64_t duration,
+                                int64_t hemisphere, int64_t slice,
+                                int64_t bank) {
+      windows.push_back(
+          {resourceModel.mem_icu(hemisphere, slice, bank), cycle, duration});
+      windows.push_back({resourceModel.mem_read_port(
+                             hemisphere, slice, bank),
+                         cycle, duration});
+    };
+    for (const auto &work : stage_plan_.qk_waves[waveIndex].slots) {
+      if (!work)
+        continue;
+      for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
+        const int64_t iw = reductionIwCycle(
+            firstIwCycle, firstComputeCycle, work->local_mxm, reduction);
+        for (int64_t phase = 0; phase < tile / 8; ++phase) {
+          for (int64_t slice : layout.queryIwSlices(reduction)) {
+            const int64_t latency = *target_.transport_latency(
+                target::StreamEndpoint::Mem,
+                target::StreamEndpoint::MxmWeight,
+                target::StreamDirection::East, slice);
+            appendRead(iw + phase - latency, 1, work->hemisphere, slice,
+                       layout.queryIwBank(reduction));
+          }
+        }
+        for (int64_t keyBlock = 0; keyBlock < tokenBlocks; ++keyBlock) {
+          const int64_t compute =
+              reductionComputeCycle(firstComputeCycle, reduction) +
+              keyBlock * issue;
+          for (int64_t slice : layout.keySlices(reduction)) {
+            const int64_t latency = *target_.transport_latency(
+                target::StreamEndpoint::Mem,
+                target::StreamEndpoint::MxmActivation,
+                target::StreamDirection::East, slice);
+            appendRead(compute - latency, tile, work->hemisphere, slice,
+                       layout.keyBank(reduction));
+          }
+        }
+      }
+    }
+    if (!qkResources.try_reserve_at(0, windows)) {
+      op_.emitError(
+          "QK input placement has an overlapping MEM ICU/read-port bundle");
+      return mlir::failure();
+    }
+  }
 
   for (std::size_t waveIndex = 0; waveIndex < stage_plan_.qk_waves.size();
        ++waveIndex) {
@@ -1158,20 +1392,12 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart, int64_t qkWaveCycles,
       // current block computes.
       const int64_t activationStream = 16 + work->local_mxm * 2;
       const int64_t outputStream = work->local_mxm * 4;
-      const bool wavefront = target_.supports_mxm_weight_activation_overlap() &&
-                             target_.throughput().mxm_weight_buffers >= 2 &&
-                             target_.throughput().mxms_per_hemisphere == 1;
       for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
         const auto iwSlices = layout.queryIwSlices(reduction);
-        const int64_t reductionComputeCycle =
-            firstComputeCycle + reduction * tokenBlocks * issue;
-        const int64_t reductionIwCycle =
-            wavefront
-                ? reductionComputeCycle - qkIwToComputeCycles -
-                      work->local_mxm * target_.throughput().tile_rows
-                : firstIwCycle + work->local_mxm * 8 + reduction * tile / 8;
+        const int64_t reductionIw = reductionIwCycle(
+            firstIwCycle, firstComputeCycle, work->local_mxm, reduction);
         for (int64_t phase = 0; phase < tile / 8; ++phase) {
-          const int64_t iwCycle = reductionIwCycle + phase;
+          const int64_t iwCycle = reductionIw + phase;
           const int64_t sourcePhase = tile / 8 - 1 - phase;
           const int64_t queryAddress = layout.queryIwAddress(
               work->query_head, reduction, work->query_block, sourcePhase);
@@ -1188,7 +1414,7 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart, int64_t qkWaveCycles,
                     work->local_mxm * static_cast<int64_t>(iwSlices.size()) +
                         stream,
                     1, 1, 0, "sram", -1,
-                    layout.rotaryBank(queryBank, reduction));
+                    layout.queryIwBank(reduction));
           }
           emitMxm(rewriter_, op_.getLoc(), iwCycle, mxm, "iw",
                   reduction % target_.throughput().mxm_weight_buffers,
@@ -1200,7 +1426,8 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart, int64_t qkWaveCycles,
         const bool finalReduction = reduction + 1 == headBlocks;
         for (int64_t keyBlock = 0; keyBlock < tokenBlocks; ++keyBlock) {
           const int64_t computeCycle =
-              firstComputeCycle + (reduction * tokenBlocks + keyBlock) * issue;
+              reductionComputeCycle(firstComputeCycle, reduction) +
+              keyBlock * issue;
           for (int64_t byte = 0; byte < 2; ++byte) {
             const int64_t slice =
                 target_.throughput().mxms_per_hemisphere == 1
@@ -1216,7 +1443,7 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart, int64_t qkWaveCycles,
                     "read",
                     layout.keyAddress(work->kv_head, reduction, keyBlock),
                     activationStream + byte, tile, 1, 1, "sram", -1,
-                    keyBank);
+                    layout.keyBank(reduction));
           }
           emitMxm(rewriter_, op_.getLoc(), computeCycle, mxm, "compute",
                   reduction % target_.throughput().mxm_weight_buffers, 0,
@@ -1256,6 +1483,7 @@ void AttentionScheduleEmitter::emitQk(int64_t qkStart, int64_t qkWaveCycles,
       }
     }
   }
+  return mlir::success();
 }
 
 } // namespace ftlpu::compiler::schedule
