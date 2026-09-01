@@ -648,9 +648,16 @@ try {
                 && binding.name == "attention.context";
         });
     if (contextBinding == program.bindings.end()
-        || contextBinding->layout
-            != ftlpu::software::runtime::BindingLayout::Fp16HeadPlanar
-        || contextBinding->slices.size() < 2 * kHeadBlocks)
+        || (contextBinding->layout
+                != ftlpu::software::runtime::BindingLayout::Fp16HeadPlanar
+            && contextBinding->layout
+                != ftlpu::software::runtime::BindingLayout::
+                    Fp16HeadBlockPacked)
+        || (contextBinding->layout
+                == ftlpu::software::runtime::BindingLayout::
+                    Fp16HeadBlockPacked
+                ? contextBinding->slices.size() < 4
+                : contextBinding->slices.size() < 2 * kHeadBlocks))
         throw std::logic_error(
             "decoder binary is missing attention context metadata");
     for (std::size_t column = 0;
@@ -904,12 +911,23 @@ try {
                 const std::size_t kvHead =
                     head / (kQueryHeads / kKvHeads);
                 const std::size_t hemisphere = kvHead % 2;
+                const bool headBlockPacked =
+                    contextBinding->layout
+                    == ftlpu::software::runtime::BindingLayout::
+                        Fp16HeadBlockPacked;
+                const std::size_t sliceBase =
+                    headBlockPacked ? hemisphere * 2 : headBlock * 2;
+                const std::size_t contextAddress =
+                    static_cast<std::size_t>(contextBinding->base_row)
+                    + (headBlockPacked
+                        ? (head * kHeadBlocks + headBlock) * kSeqLen
+                        : head * kSeqLen)
+                    + row;
                 const float observed = physicalBf16(
                     static_cast<ftlpu::Hemisphere>(hemisphere),
-                    contextBinding->slices[headBlock * 2],
-                    contextBinding->slices[headBlock * 2 + 1],
-                    static_cast<std::size_t>(contextBinding->base_row)
-                        + head * kSeqLen + row,
+                    contextBinding->slices[sliceBase],
+                    contextBinding->slices[sliceBase + 1],
+                    contextAddress,
                     dimension % 32, contextBinding->bank);
                 const float expected =
                     checkpointContext[row * kHidden + column];

@@ -1,6 +1,7 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 #include "ftlpu/software/runtime/model_session.hpp"
+#include "ftlpu/software/runtime/schedule_trace.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include "ftlpu/core/bf16.hpp"
@@ -19,6 +20,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -131,6 +133,20 @@ const BinaryBinding &find_earliest_internal_binding(
   if (earliest == nullptr)
     throw std::logic_error("Qwen decoder is missing an internal stage binding");
   return *earliest;
+}
+
+const BinaryBinding &find_internal_binding_by_name(
+    const BinaryProgram &program, std::string_view name) {
+  const auto binding = std::find_if(
+      program.bindings.begin(), program.bindings.end(),
+      [&](const BinaryBinding &candidate) {
+        return candidate.access == BindingAccess::Internal &&
+               candidate.name == name;
+      });
+  if (binding == program.bindings.end())
+    throw std::logic_error("Qwen decoder is missing internal binding " +
+                           std::string(name));
+  return *binding;
 }
 
 std::vector<std::uint8_t> download_swiglu_stage(
@@ -368,33 +384,46 @@ std::vector<std::uint8_t> download_projection_staging(
 }
 
 std::vector<std::uint8_t> download_context_stage(
-    const ftlpu::TspSliceSystem &system, std::size_t bank,
+    const ftlpu::TspSliceSystem &system, const BinaryBinding &binding,
     int hemisphere_mode = 0) {
   constexpr std::size_t kSeqLen = 32;
   constexpr std::size_t kQueryHeads = 12;
   constexpr std::size_t kHeadDim = 128;
   constexpr std::size_t kHeadBlock = 32;
-  constexpr std::size_t kContextBaseRow = 0;
   constexpr std::size_t kHidden = kQueryHeads * kHeadDim;
+  const bool head_block_packed =
+      binding.layout == BindingLayout::Fp16HeadBlockPacked;
+  if ((head_block_packed && binding.slices.size() < 4)
+      || (!head_block_packed
+          && binding.slices.size() < 2 * (kHeadDim / kHeadBlock)))
+    throw std::logic_error("Qwen context binding has too few slices");
   std::vector<std::uint8_t> result(kSeqLen * kHidden * 2);
   for (std::size_t token = 0; token < kSeqLen; ++token) {
     for (std::size_t head = 0; head < kQueryHeads; ++head) {
-      const std::size_t address = kContextBaseRow + head * kSeqLen + token;
       const auto hemisphere = hemisphere_mode == 1
           ? static_cast<ftlpu::Hemisphere>((head / 6) % 2)
           : hemisphere_mode == 2 ? ftlpu::Hemisphere::West
                                  : ftlpu::Hemisphere::East;
       for (std::size_t feature = 0; feature < kHeadDim; ++feature) {
         const std::size_t head_block = feature / kHeadBlock;
+        const std::size_t address = binding.base_row
+            + (head_block_packed
+                ? (head * (kHeadDim / kHeadBlock) + head_block) * kSeqLen
+                : head * kSeqLen)
+            + token;
+        const std::size_t slice_base =
+            head_block_packed
+                ? ((head / (kQueryHeads / 2)) % 2) * 2
+                : 2 * head_block;
         const std::size_t column = feature % kHeadBlock;
         const std::size_t logical =
             (token * kHidden + head * kHeadDim + feature) * 2;
         result[logical] = system.read_mem_sram_lane_byte(
-            hemisphere, 2 * head_block, bank,
+            hemisphere, binding.slices[slice_base], binding.bank,
             column / ftlpu::hw::kLanesPerTile, address,
             column % ftlpu::hw::kLanesPerTile);
         result[logical + 1] = system.read_mem_sram_lane_byte(
-            hemisphere, 2 * head_block + 1, bank,
+            hemisphere, binding.slices[slice_base + 1], binding.bank,
             column / ftlpu::hw::kLanesPerTile, address,
             column % ftlpu::hw::kLanesPerTile);
       }
@@ -689,13 +718,33 @@ int main(int argc, char **argv) try {
   session.set_input("hidden.0", input_bytes);
   session.run();
 
-  if (std::getenv("FTLPU_TRACE_QWEN_WEIGHT_PAGE") != nullptr) {
+  if (const char *trace_path = std::getenv("FTLPU_QWEN_PIPELINE_CSV")) {
     const BinaryProgram &loaded_program =
         session.package().executables[0].program;
+    const auto physical_prefetches =
+        session.executable_weight_prefetch_plans();
+    write_schedule_trace_csv(
+        loaded_program, trace_path, physical_prefetches);
+  }
+
+  if (const char *binding_text =
+          std::getenv("FTLPU_TRACE_QWEN_WEIGHT_PAGE")) {
+    const BinaryProgram &loaded_program =
+        session.package().executables[0].program;
+    const std::uint32_t binding_index =
+        static_cast<std::uint32_t>(std::stoul(binding_text));
+    const std::array<const char *, 10> fixture_names = {
+        "input.bf16.bin", "input_layernorm.bf16.bin", "query.i8.bin",
+        "key.i8.bin", "value.i8.bin", "output.i8.bin",
+        "post_attention_layernorm.bf16.bin", "gate.i8.bin", "up.i8.bin",
+        "down.i8.bin"};
+    if (binding_index >= fixture_names.size())
+      throw std::logic_error("invalid Qwen weight-page binding index");
     print_weight_page_residency_error(
         system.chip(),
-        find_binding(loaded_program, BindingAccess::Input, 2),
-        read_bytes(fixture / "query.i8.bin"), loaded_program.hardware);
+        find_binding(loaded_program, BindingAccess::Input, binding_index),
+        read_bytes(fixture / fixture_names[binding_index]),
+        loaded_program.hardware);
   }
 
   if (const char *stage = std::getenv("FTLPU_TRACE_QWEN_STAGE")) {
@@ -732,6 +781,13 @@ int main(int argc, char **argv) try {
           std::cout << "Qwen stage capture: name=" << name
                     << " values=" << observed.size() / 2 << '\n';
       };
+      capture("query", download_query_stage(system.chip(), scratch_bank));
+      capture("key", download_key_stage(system.chip(), weight_bank));
+      capture("value", download_value_stage(system.chip(), scratch_bank));
+      capture("context", download_context_stage(
+                             system.chip(), find_internal_binding_by_name(
+                                                loaded_program,
+                                                "attention.context")));
       capture("attention",
               observer.download_binding(find_earliest_internal_binding(
                   loaded_program, BindingLayout::Fp16PairPlanar)));
@@ -772,6 +828,9 @@ int main(int argc, char **argv) try {
       };
       const auto observed = stage_name == "resnorm"
                               ? capture_resnorm()
+                          : stage_name == "input"
+                              ? observer.download_binding(find_binding(
+                                    loaded_program, BindingAccess::Input, 0))
                           : stage_name == "qkv"
                               ? capture_qkv()
                           : stage_name == "attention"
@@ -814,13 +873,21 @@ int main(int argc, char **argv) try {
                                     system.chip(), scratch_bank, true)
                           : stage_name == "context"
                               ? download_context_stage(
-                                    system.chip(), weight_bank)
+                                    system.chip(),
+                                    find_internal_binding_by_name(
+                                        loaded_program, "attention.context"))
                           : stage_name == "context_source"
                               ? download_context_stage(
-                                    system.chip(), weight_bank, 1)
+                                    system.chip(),
+                                    find_internal_binding_by_name(
+                                        loaded_program, "attention.context"),
+                                    1)
                           : stage_name == "context_west"
                               ? download_context_stage(
-                                    system.chip(), weight_bank, 2)
+                                    system.chip(),
+                                    find_internal_binding_by_name(
+                                        loaded_program, "attention.context"),
+                                    2)
                           : stage_name == "norm0"
                               ? download_distributed16_stage(
                                     system.chip(), weight_bank,
@@ -857,7 +924,8 @@ int main(int argc, char **argv) try {
                 << " values=" << observed.size() / 2 << '\n';
     } else {
       const auto expected = read_bytes(fixture /
-        (stage_name == "staging" || stage_name == "norm0"
+        (stage_name == "input" ? "input.bf16.bin"
+         : stage_name == "staging" || stage_name == "norm0"
              ? "golden.norm0.bf16.bin"
          : stage_name == "value_source" ? "golden.value.bf16.bin"
          : stage_name == "context_source" || stage_name == "context_west"

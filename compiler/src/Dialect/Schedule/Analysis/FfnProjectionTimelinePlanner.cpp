@@ -37,9 +37,7 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     result.pipelined_block_interval = target.mxm_block_issue_interval();
     result.m_tile_count = shape.m / tile;
     result.projection_slot_interval =
-        (result.m_tile_count - 1) * result.pipelined_block_interval
-        + target.mxm_first_result_latency()
-        + target.mxm_result_window_cycles(tile);
+        result.m_tile_count * result.pipelined_block_interval;
     result.initial_compute_cycle = maxWeightLatency + 1 + tile;
     result.pair_count = shape.hidden
         / ((replicateOutputBlocksAcrossHemispheres
@@ -68,16 +66,29 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
             block.dequant_start = block.weight_compute_cycle - tile;
             block.weight_buffer = block.index
                 % throughput.mxm_weight_buffers;
+            const bool singleMxm =
+                throughput.mxms_per_hemisphere == 1;
             if (localWeightDequant
-                && block.index >= throughput.mxm_weight_buffers) {
+                && ((singleMxm && !result.blocks.empty())
+                    || (!singleMxm
+                        && block.index
+                            >= throughput.mxm_weight_buffers))) {
+                // A one-MXM hemisphere permanently assigns Gate and Up to
+                // buffers 0 and 1, respectively. Therefore both buffers are
+                // reused by the immediately following reduction block even
+                // though the logical block weight_buffer field ping-pongs.
+                // Move the short local load later instead of delaying the
+                // next compute slot.
+                const int64_t previousIndex = singleMxm
+                    ? block.index - 1
+                    : block.index - throughput.mxm_weight_buffers;
                 const auto& previous = result.blocks[
-                    static_cast<std::size_t>(block.index
-                        - throughput.mxm_weight_buffers)];
+                    static_cast<std::size_t>(previousIndex)];
                 const int64_t previousLastCompute =
                     previous.tiles.back().compute_cycle;
                 block.dequant_start = std::max(block.dequant_start,
-                    previousLastCompute + tile
-                        + target.mxm_first_result_latency());
+                    previousLastCompute
+                        + target.mxm_result_window_cycles(tile));
             }
             block.final_reduction = reduction + 1 == reductionBlocks;
             const bool hasNextWeight = block.index + 1 < totalBlocks;

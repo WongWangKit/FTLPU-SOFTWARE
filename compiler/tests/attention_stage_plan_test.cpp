@@ -1,12 +1,16 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_stage_plan.hpp"
 
+#include <cstdio>
 #include <stdexcept>
 
 namespace {
 
 void require(bool condition, const char* message)
 {
-    if (!condition) throw std::logic_error(message);
+    if (condition) return;
+    std::fprintf(stderr, "attention_stage_plan_test: %s\n", message);
+    std::fflush(stderr);
+    throw std::logic_error(message);
 }
 
 } // namespace
@@ -14,7 +18,10 @@ void require(bool condition, const char* message)
 int main()
 {
     using namespace ftlpu::compiler;
-    target::LPUTargetModel target;
+    target::ThroughputModel singleMxmThroughput;
+    singleMxmThroughput.mxms_per_hemisphere = 1;
+    target::LPUTargetModel target(target::MemoryTopology {},
+        target::StreamTopology {}, singleMxmThroughput);
     auto plan = schedule::planAttentionStages({128, 576, 9, 3, 64}, target);
     require(plan.tasks.size() == 5, "attention plan must contain five stages");
     require(mlir::succeeded(plan.tasks.validate()), "attention task DAG is invalid");

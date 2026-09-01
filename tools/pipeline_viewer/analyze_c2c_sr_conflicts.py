@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Estimate legacy C2C conflicts with compute stream-register usage."""
+"""Estimate shared-SR C2C conflicts with compute stream-register usage."""
 
 from __future__ import annotations
 
@@ -56,7 +56,8 @@ def main() -> None:
 
     with args.trace.open(newline="", encoding="utf-8") as source:
         for row in csv.DictReader(source):
-            if row["resource"].startswith("C2C."):
+            if (row["resource"].startswith("C2C.")
+                    or ".C2C" in row["resource"]):
                 continue
             resource_parts = row["resource"].split(".")
             family = resource_parts[0]

@@ -60,11 +60,12 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                 const int64_t unit =
                     hemisphere * throughput.mxms_per_hemisphere
                     + localMxm;
-                const int64_t start =
-                    block.dequant_start
-                    + (hemisphere * logicalSlotsPerHemisphere
-                          + logicalSlot)
-                        * weightLoadCycles;
+                const int64_t start = singleMxm
+                    ? block.dequant_start + logicalSlot * tile
+                    : block.dequant_start
+                        + (hemisphere * logicalSlotsPerHemisphere
+                              + logicalSlot)
+                            * weightLoadCycles;
                 const auto placement = context.down_route.getPlacement();
                 const int64_t bindingBase = placement
                         .getAs<mlir::IntegerAttr>("base_row")

@@ -1,8 +1,10 @@
 #pragma once
 
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/weight_prefetch_plan.hpp"
 
 #include <filesystem>
+#include <span>
 
 namespace ftlpu::software::runtime {
 
@@ -11,5 +13,8 @@ namespace ftlpu::software::runtime {
 // expands only for its visible cycle window.
 void write_schedule_trace_csv(
     const BinaryProgram& program, const std::filesystem::path& path);
+void write_schedule_trace_csv(const BinaryProgram& program,
+    const std::filesystem::path& path,
+    std::span<const WeightPrefetchPlan> physical_prefetches);
 
 } // namespace ftlpu::software::runtime

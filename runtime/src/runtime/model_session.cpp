@@ -338,7 +338,6 @@ void ModelSession::configure_external_transport(
   cmodelHardware.vxm_alus = hardware.vxm_alus;
   cmodelHardware.c2c_streams_per_direction =
       hardware.c2c_streams_per_direction;
-  cmodelHardware.c2c_dedicated_streams = true;
   cmodelHardware.mxm_local_dequant_enabled =
       hardware.mxm_local_dequant_enabled != 0;
   cmodelHardware.mxm_weight_activation_overlap_enabled =
@@ -689,7 +688,7 @@ void ModelSession::prepare_executable_weight_pages(
         "executable-local paged weights require ModelSession(C2cDmaSystem&)");
 
   std::uint64_t nextDdrAddress = executable_ddr4_address_;
-  const auto plans = plan_weight_prefetches(program);
+  auto plans = plan_weight_prefetches(program);
   executable_weight_transfers_.reserve(plans.size());
   for (const WeightPrefetchPlan &plan : plans) {
     ExecutableWeightTransfer transfer;
@@ -699,6 +698,9 @@ void ModelSession::prepare_executable_weight_pages(
     std::array<std::array<std::uint64_t, hw::kC2cStreamsPerDirection>,
                hw::kHemispheres>
         streamLoads{};
+    std::array<std::array<std::array<std::optional<std::size_t>,
+        hw::kMemBanksPerSlice>, hw::kMemSliceColumns>,
+        hw::kHemispheres> targetLanes{};
     for (const std::size_t useIndex : plan.use_indices) {
       const BinaryWeightPageUse &use = program.weight_page_uses.at(useIndex);
       const BinaryBinding &binding =
@@ -726,10 +728,14 @@ void ModelSession::prepare_executable_weight_pages(
               "packed executable page has an invalid hemisphere");
         const auto laneCount = static_cast<std::size_t>(
             program.hardware.c2c_streams_per_direction);
-        const auto lane = static_cast<std::size_t>(std::distance(
-            streamLoads[side].begin(),
-            std::min_element(streamLoads[side].begin(),
-                             streamLoads[side].begin() + laneCount)));
+        auto &targetLane =
+            targetLanes[side][segment.slice][use.bank];
+        if (!targetLane.has_value()) {
+          const auto begin = streamLoads[side].begin();
+          targetLane = static_cast<std::size_t>(std::distance(
+              begin, std::min_element(begin, begin + laneCount)));
+        }
+        const auto lane = *targetLane;
         const std::uint64_t ddrAddress = nextDdrAddress;
         for (std::uint32_t vector = 0; vector < segment.vector_count;
              ++vector) {
@@ -757,11 +763,74 @@ void ModelSession::prepare_executable_weight_pages(
                           hw::kPhysicalVectorBytes;
       }
     }
+    transfer.plan.bytes = {};
+    for (const C2cWeightSegment &segment : transfer.page.segments)
+      transfer.plan.bytes[hemisphere_index(segment.hemisphere)] +=
+          static_cast<std::uint64_t>(segment.vector_count) *
+          hw::kPhysicalVectorBytes;
     executable_weight_transfers_.push_back(std::move(transfer));
   }
+  for (std::size_t index = 0; index < plans.size(); ++index)
+    plans[index] = executable_weight_transfers_[index].plan;
+  schedule_weight_prefetches(program, plans);
+  for (std::size_t index = 0; index < plans.size(); ++index) {
+    executable_weight_transfers_[index].plan = plans[index];
+    if (std::getenv("FTLPU_SESSION_PROGRESS") == nullptr) continue;
+    const auto &transfer = executable_weight_transfers_[index];
+    std::size_t vectors = 0;
+    for (const C2cWeightSegment &segment : transfer.page.segments)
+      vectors += segment.vector_count;
+    std::clog << "FTLPU executable page plan: binding="
+              << program.weight_page_uses[
+                     transfer.plan.use_indices.front()].binding_index
+              << " page=" << transfer.plan.page_index
+              << " bank=" << transfer.plan.bank
+              << " pre_execution=" << transfer.plan.pre_execution
+              << " segments=" << transfer.page.segments.size()
+              << " vectors=" << vectors
+              << " physical_bytes="
+              << vectors * hw::kPhysicalVectorBytes
+              << " start=" << transfer.plan.start_cycle
+              << " end=" << transfer.plan.transfer_end_cycle
+              << " ready=" << transfer.plan.ready_cycle << std::endl;
+  }
   executable_ddr4_address_ = nextDdrAddress;
+  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
+    if (!transfer.plan.pre_execution)
+      continue;
+    c2c_system_->reset_execution_state();
+    weight_pager_->enqueue(transfer.page);
+    ++stats_.weight_page_prefetches;
+    std::size_t vectors = 0;
+    for (const C2cWeightSegment &segment : transfer.page.segments)
+      vectors += segment.vector_count;
+    stats_.weight_page_prefetch_bytes +=
+        vectors * hw::kPhysicalVectorBytes;
+    const std::size_t beginCycle = c2c_system_->cycle();
+    weight_pager_->wait(std::max<std::size_t>(4096, vectors * 64));
+    const std::size_t waitCycles = c2c_system_->cycle() - beginCycle;
+    stats_.weight_page_wait_cycles += waitCycles;
+    stats_.weight_page_initial_wait_cycles += waitCycles;
+    weight_pager_->retire();
+    transfer.ready_before_execution = true;
+  }
+}
+
+void ModelSession::schedule_executable_weight_pages() {
+  if (executable_weight_transfers_.empty())
+    return;
+  std::optional<std::size_t> debugStopCycle;
+  if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
+    debugStopCycle = static_cast<std::size_t>(std::stoull(stop));
   weight_pager_->begin_schedule();
   for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
+    if (transfer.plan.pre_execution)
+      continue;
+    // A bounded diagnostic run must not inject traffic for a page whose first
+    // consumer is beyond the stop point. Besides saving time, this keeps
+    // stage captures isolated from future C2C/MEM traffic.
+    if (debugStopCycle && transfer.plan.ready_cycle > *debugStopCycle)
+      continue;
     transfer.fence = weight_pager_->schedule(
         transfer.page,
         static_cast<std::size_t>(transfer.plan.start_cycle));
@@ -782,6 +851,8 @@ bool ModelSession::executable_weight_page_ready(
       if (candidate.binding_index == use.binding_index &&
           candidate.page_index == use.page_index &&
           candidate.bank == use.bank) {
+        if (transfer.ready_before_execution)
+          return true;
         const bool ready = weight_pager_->ready(transfer.fence);
         if (!ready && std::getenv("FTLPU_SESSION_PROGRESS") != nullptr) {
           std::clog << "FTLPU executable page miss: binding="
@@ -1001,8 +1072,9 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     if (input.release_after_transfer)
       device_values_.erase(source);
   }
-  runtime_.load(program);
   prepare_executable_weight_pages(program, invocation);
+  runtime_.load(program);
+  schedule_executable_weight_pages();
   if (index + 1 < package_.invocations.size()) {
     const auto nextPage = package_.invocations[index + 1].weight_page;
     if (nextPage != 0xffffffffu && nextPage != invocation.weight_page) {
@@ -1273,6 +1345,15 @@ const ModelSessionStats &ModelSession::stats() const {
   if (!loaded_)
     throw std::logic_error("no FTLPU model package is loaded");
   return stats_;
+}
+
+std::vector<WeightPrefetchPlan>
+ModelSession::executable_weight_prefetch_plans() const {
+  std::vector<WeightPrefetchPlan> plans;
+  plans.reserve(executable_weight_transfers_.size());
+  for (const ExecutableWeightTransfer &transfer : executable_weight_transfers_)
+    plans.push_back(transfer.plan);
+  return plans;
 }
 
 } // namespace ftlpu::software::runtime

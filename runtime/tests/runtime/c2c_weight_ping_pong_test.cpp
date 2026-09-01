@@ -78,7 +78,7 @@ void run_test()
 
     require(pager.ready(), "next-layer C2C weight page did not become ready");
     require(overlapped_bank_issue,
-        "current-bank reads did not overlap the dedicated C2C data path");
+        "current-bank reads did not overlap shared-SR C2C writes");
     require(pager.stats().layer == 1 && pager.stats().bank == next_bank,
         "weight pager lost layer or bank identity");
     require(pager.stats().vectors == vectors

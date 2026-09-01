@@ -60,11 +60,11 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
     if (!supportsWavefront) {
         result.qk_wave_interval = computeEnd - firstIwOffset;
     } else if (target.throughput().mxms_per_hemisphere == 1) {
-        // The SRAM is dual-port, but each (slice, bank) still has one ICU
-        // command queue. Drain the final score write before the next wave's
-        // query-IW read can target the same queue.
-        result.qk_wave_interval = qkWaveComputeCycles
-            + tile + scoreDrainCycles + queryIwReadLead;
+        // Query IW uses the alternate physical buffer while the current wave
+        // computes. The final partial streams scores west, so neither the ACC
+        // rows nor the east-side weight path need a drain bubble before the
+        // next wave starts computing.
+        result.qk_wave_interval = qkWaveComputeCycles;
     } else {
         // A dual-MXM QK wave uses E16..E31 both for MXM1 weights and for
         // activation traffic. The next wave can start loading only after the
@@ -75,9 +75,7 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
             * headBlocks * iwPhasesPerReduction;
         const int64_t streamReuseGap = std::max<int64_t>(0,
             result.qk_iw_to_compute_cycles - localMxmPreloadOffset);
-        result.qk_wave_interval = qkWaveComputeCycles
-            + std::max(streamReuseGap,
-                tile + scoreDrainCycles + queryIwReadLead);
+        result.qk_wave_interval = qkWaveComputeCycles + streamReuseGap;
     }
     result.qk_wave_duration = computeEnd
         + std::max(target.throughput().mxm0_accumulator_latency,

@@ -38,8 +38,8 @@ struct FfnProjectionTimeline {
     int64_t weight_load_cycles;
     int64_t pipelined_block_interval;
     // Cycles from the first row of one logical projection to the first row
-    // of the next projection sharing the same physical MXM. This includes
-    // the systolic result drain after the final input row.
+    // of the next projection sharing the same physical MXM. Result draining
+    // is pipelined behind activation issue and does not extend this slot.
     int64_t projection_slot_interval;
     int64_t weight_block_interval;
     int64_t initial_compute_cycle;

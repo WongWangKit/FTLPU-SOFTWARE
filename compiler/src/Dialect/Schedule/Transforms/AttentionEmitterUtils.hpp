@@ -75,7 +75,6 @@ void emitMxmDequantWave(mlir::IRRewriter &rewriter, mlir::Location location,
                         int64_t scaleBinding = -1);
 
 using sxm_detail::blockDiagonalMap;
-using sxm_detail::emitBufferedWavefrontBeat;
 using sxm_detail::emitSxm;
 using sxm_detail::emitWavefrontBeat;
 using sxm_detail::emitWavefrontTail;

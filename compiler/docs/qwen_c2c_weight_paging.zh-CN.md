@@ -25,10 +25,9 @@ Qwen decoder 层不再要求全部权重同时常驻片上 MEM。runtime 首先�
 - 计算保持原有 32 条 eastward 和 32 条 westward stream。C2C 对外提供可配置
   的 lane，默认每个方向 8 条，每条每 cycle 搬运一个 32-byte vector，峰值为
   `8 x 32 = 256 bytes/cycle`/方向。
-- 当前 `ModelSession` 使用 32 条普通计算 stream 之外的专用 C2C lane。RX 指令携带
-  目标 hemisphere/slice/bank/row，由目标 MEM 接收端提交 SRAM；所有字节仍必须来自
-  DDR DMA 和 C2C 链路，host 不能直接写 LPU MEM。共享-SR 模式仍可选择，此时 lane
-  映射到 `W24..W31`，并由普通 MEM `Write` 消费，但不用于当前细粒度重叠分页。
+- `ModelSession` 把外部 lane 映射到普通 west stream（8 lane 时为 `W24..W31`）。
+  C2C RX 把每个 vector 注入共享 SR fabric，由点对点通知的目标 MEM ICU 发出普通
+  `Write` 提交 SRAM。系统不存在 C2C RX 直写 SRAM 的旁路，host 也不能直接写 LPU MEM。
 - C2C page ready 表示最后一个目标 SRAM 写入已经提交，不等同于 DMA 把最后一个 vector 放入 RX FIFO。
 
 ## 软件表示
@@ -47,8 +46,8 @@ Binary v24 在 target ABI 中保存 bank 和外部存储参数。ModelPackage v5
 MXM accumulator 位于功能单元内部，其容量由 `mxm_accumulator_blocks` 描述；任何 MEM slice 都不配置成 accumulator。
 两个 SRAM bank 使用相同的 slice 角色。feedback RMSNorm 将每层 gamma 放在激活区
 两个 slice，每个半球只用两条低编号 west stream，其他数据流也保持在 `W16`
-以下；pager 使用独立的专用 C2C lane，并写入高编号权重 slice。stream 和 slice/port
-的双重资源隔离允许权重预取与 RMSNorm 重叠；两条路径都不能绕过 C2C 外部边界。
+以下；pager 使用普通 `W24..W31`，并写入高编号权重 slice。stream ID 和 slice/port
+的资源隔离允许权重预取与 RMSNorm 重叠；两条路径都不能绕过 C2C 外部边界。
 
 该分区消除的是传输和端口冲突，并不会增加容量。对于 seq_len=32 的
 Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gate 与 Up

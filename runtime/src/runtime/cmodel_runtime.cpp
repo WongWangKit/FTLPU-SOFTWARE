@@ -331,8 +331,6 @@ void CModelRuntime::load(const BinaryProgram& program)
     hardware.vxm_alus = program.hardware.vxm_alus;
     hardware.c2c_streams_per_direction =
         program.hardware.c2c_streams_per_direction;
-    hardware.c2c_dedicated_streams =
-        program.hardware.c2c_streams_per_direction != 0;
     hardware.mxm_local_dequant_enabled =
         program.hardware.mxm_local_dequant_enabled != 0;
     hardware.mxm_weight_activation_overlap_enabled =

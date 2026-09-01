@@ -2,6 +2,7 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 
+#include <algorithm>
 namespace ftlpu::compiler::schedule {
 
 AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
@@ -73,6 +74,10 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
             ropeSlices_[i] =
                 llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
     }
+    if (const auto mirror =
+            plan.getAs<mlir::DictionaryAttr>("rope_mirror"))
+        ropeMirrorBase_ =
+            mirror.getAs<mlir::IntegerAttr>("base_row").getInt();
     if (const auto staging =
             plan.getAs<mlir::DictionaryAttr>("rope_staging")) {
         ropeStagingBase_ =
@@ -87,9 +92,21 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
         ropeProductBase_ =
             product.getAs<mlir::IntegerAttr>("base_row").getInt();
         const auto slices = product.getAs<mlir::ArrayAttr>("slices");
-        for (std::size_t i = 0; i < ropeProductSlices_.size(); ++i)
-            ropeProductSlices_[i] =
-                llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
+        for (mlir::Attribute slice : slices)
+            ropeProductSlices_.push_back(
+                llvm::cast<mlir::IntegerAttr>(slice).getInt());
+        if (const auto interleaved =
+                product.getAs<mlir::BoolAttr>("bank_interleaved"))
+            ropeProductBankInterleaved_ = interleaved.getValue();
+    }
+    if (const auto keyProduct =
+            plan.getAs<mlir::DictionaryAttr>("rope_product_key")) {
+        for (mlir::Attribute slice :
+             keyProduct.getAs<mlir::ArrayAttr>("slices"))
+            ropeProductKeySlices_.push_back(
+                llvm::cast<mlir::IntegerAttr>(slice).getInt());
+        ropeProductKeyBank_ =
+            keyProduct.getAs<mlir::IntegerAttr>("bank").getInt();
     }
     const auto readPlacement = [&](llvm::StringRef name, auto& slices, int64_t& base) {
         const auto placement = plan.getAs<mlir::DictionaryAttr>(name);
@@ -165,7 +182,21 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
                         slices[block * valuePackSlices_[block].size()
                             + stream]).getInt();
     }
-    readPlacement("context", contextSlices_, contextBase_);
+    if (const auto context =
+            plan.getAs<mlir::DictionaryAttr>("context")) {
+        contextBase_ =
+            context.getAs<mlir::IntegerAttr>("base_row").getInt();
+        const auto values = context.getAs<mlir::ArrayAttr>("slices");
+        for (std::size_t i = 0; i < contextSlices_.size(); ++i)
+            contextSlices_[i] = llvm::cast<mlir::IntegerAttr>(
+                values[i % values.size()]).getInt();
+        if (const auto packed =
+                context.getAs<mlir::BoolAttr>("head_block_packed"))
+            contextHeadBlockPacked_ = packed.getValue();
+        if (const auto paired =
+                context.getAs<mlir::BoolAttr>("hemisphere_paired"))
+            contextHemispherePaired_ = paired.getValue();
+    }
     if (const auto result = plan.getAs<mlir::DictionaryAttr>("result"))
         resultBase_ = result.getAs<mlir::IntegerAttr>("base_row").getInt();
 }
@@ -366,9 +397,30 @@ llvm::ArrayRef<int64_t> AttentionMemoryLayout::valuePackSlices(
         static_cast<std::size_t>(reductionBlock % valuePackSlices_.size()));
 }
 
-int64_t AttentionMemoryLayout::contextAddress(int64_t queryHead, int64_t token) const
+int64_t AttentionMemoryLayout::contextAddress(
+    int64_t queryHead, int64_t headBlock, int64_t token) const
 {
+    if (contextHeadBlockPacked_)
+        return contextBase_
+            + (queryHead * headBlocks_ + headBlock) * seqLen_ + token;
     return contextBase_ + queryHead * seqLen_ + token;
+}
+
+int64_t AttentionMemoryLayout::contextSlice(
+    int64_t queryHead, int64_t headBlock, int64_t byte) const
+{
+    int64_t index = headBlock * 2 + byte;
+    if (contextHeadBlockPacked_) {
+        index = byte;
+        if (contextHemispherePaired_) {
+            const int64_t queryHeadsPerKv = queryHeads_ / kvHeads_;
+            const int64_t sourceHemisphere =
+                (queryHead / queryHeadsPerKv)
+                % target_.memory().hemispheres;
+            index += sourceHemisphere * 2;
+        }
+    }
+    return contextSlices_.at(static_cast<std::size_t>(index));
 }
 
 int64_t AttentionMemoryLayout::outputWeightAddress(int64_t outputGroup,
@@ -415,6 +467,12 @@ int64_t AttentionMemoryLayout::ropeAddress(
     return ropeBase_ + frequencyBlock * seqLen_ + token;
 }
 
+int64_t AttentionMemoryLayout::ropeMirrorAddress(
+    int64_t token, int64_t frequencyBlock) const
+{
+    return ropeMirrorBase_ + frequencyBlock * seqLen_ + token;
+}
+
 int64_t AttentionMemoryLayout::ropeStagingAddress(
     AttentionProjectionKind projection, int64_t head, int64_t half,
     int64_t tokenBlock, int64_t row) const
@@ -430,11 +488,49 @@ int64_t AttentionMemoryLayout::ropeProductAddress(
 {
     const int64_t globalHead = projection == AttentionProjectionKind::Query
         ? head : queryHeads_ + head;
-    const int64_t productRowsPerVector = (seqLen_ + 1) / 2;
+    const int64_t productRowsPerVector = ropeProductBankInterleaved_
+        ? seqLen_ : (seqLen_ + 1) / 2;
     return ropeProductBase_
         + ((globalHead * (headBlocks_ / 2) + pairBlock) * 4 + product)
             * productRowsPerVector
-        + token / 2;
+        + (ropeProductBankInterleaved_ ? token : token / 2);
+}
+
+int64_t AttentionMemoryLayout::ropeProductSlice(
+    AttentionProjectionKind projection, int64_t product,
+    int64_t token, int64_t byte) const
+{
+    if (product < 0 || product >= 4 || token < 0
+        || byte < 0 || byte >= 2)
+        throw std::out_of_range("invalid RoPE product coordinate");
+    const bool keyLowProduct = ropeProductBankInterleaved_
+        && projection == AttentionProjectionKind::Key && product < 2
+        && ropeProductKeySlices_.size() >= 4;
+    const llvm::ArrayRef<int64_t> slices = keyLowProduct
+        ? llvm::ArrayRef<int64_t>(ropeProductKeySlices_)
+        : llvm::ArrayRef<int64_t>(ropeProductSlices_);
+    const int64_t index = keyLowProduct
+        ? product * 2 + byte
+        : ropeProductBankInterleaved_
+            ? (product % 2) * 2 + byte
+            : (token % 2) * 8 + product * 2 + byte;
+    if (index >= static_cast<int64_t>(slices.size()))
+        throw std::out_of_range("RoPE product slice layout is incomplete");
+    return slices[static_cast<std::size_t>(index)];
+}
+
+int64_t AttentionMemoryLayout::ropeProductBank(
+    AttentionProjectionKind projection, int64_t baseBank,
+    int64_t product) const
+{
+    if (!ropeProductBankInterleaved_) return baseBank;
+    if (product < 0 || product >= 4)
+        throw std::out_of_range("invalid RoPE product");
+    if (projection == AttentionProjectionKind::Key && product < 2
+        && ropeProductKeyBank_ >= 0)
+        return ropeProductKeyBank_;
+    return product < 2 ? baseBank
+                       : (baseBank + 1) % target_.memory().banks_per_slice;
 }
 
 } // namespace ftlpu::compiler::schedule

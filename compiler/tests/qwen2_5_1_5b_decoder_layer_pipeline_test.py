@@ -15,6 +15,29 @@ def run(command: list[str], phase: str) -> None:
     subprocess.run(command, check=True)
 
 
+def integer_attr(line: str, name: str, default: int | None = None) -> int:
+    match = re.search(rf"{name} = (\d+) : i64", line)
+    if match:
+        return int(match.group(1))
+    if default is not None:
+        return default
+    raise AssertionError(f"missing {name} in schedule operation: {line.strip()}")
+
+
+def repeated_intervals(line: str) -> list[tuple[int, int]]:
+    cycle = integer_attr(line, "cycle")
+    repeat_count = integer_attr(line, "repeat_count", 1)
+    repeat_interval = integer_attr(line, "repeat_interval", 1)
+    wave_count = integer_attr(line, "wave_count", 1)
+    wave_interval = integer_attr(line, "wave_interval", 0)
+    duration = (repeat_count - 1) * repeat_interval + 1
+    return [
+        (cycle + wave * wave_interval,
+         cycle + wave * wave_interval + duration)
+        for wave in range(wave_count)
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--opt", type=Path, required=True)
@@ -57,6 +80,9 @@ def main() -> None:
         'accumulator_destination = "stream"',
         'accumulator_clear = true',
     }
+    qkv_interval: tuple[int, int] | None = None
+    rope_product_intervals: list[tuple[int, int]] = []
+    mxm_compute_intervals: list[tuple[int, int]] = []
     with schedule.open(encoding="utf-8") as source:
         for line in source:
             schedule_markers = {
@@ -69,8 +95,36 @@ def main() -> None:
                         "Schedule IR addresses a physical VXM ALU instead of "
                         f"one of the 8 mirrored control queues: {line.strip()}"
                     )
+                if all(marker in line for marker in (
+                    'queue = 0 : i64', 'opcode = "multiply"',
+                    'lhs_index = 32 : i64', 'rhs_index = 34 : i64',
+                    'repeat_count = 32 : i64',
+                )):
+                    rope_product_intervals.extend(repeated_intervals(line))
+            if ('ftlpu.schedule.timeline' in line
+                    and 'name = "qkv"' in line):
+                qkv_interval = (
+                    integer_attr(line, "start"), integer_attr(line, "end")
+                )
+            if "ftlpu.schedule.sxm" in line:
+                partial = tuple(attribute for attribute in
+                                ("input_row", "output_row", "output_tile")
+                                if attribute in line)
+                if partial:
+                    raise AssertionError(
+                        "SXM must operate across every tile; partial attributes "
+                        f"{partial} are illegal: {line.strip()}"
+                    )
+                for field in ("source_streams", "destination_streams"):
+                    match = re.search(rf"{field} = \[([^\]]+)\]", line)
+                    if not match or len(re.findall(r"\d+", match.group(1))) != 16:
+                        raise AssertionError(
+                            f"SXM {field} is not full-width: {line.strip()}"
+                        )
             if "ftlpu.schedule.mxm_issue" not in line:
                 continue
+            if 'opcode = "compute"' in line:
+                mxm_compute_intervals.extend(repeated_intervals(line))
             match = re.search(r"accumulator_address = (\d+) : i64", line)
             if not match:
                 continue
@@ -84,6 +138,30 @@ def main() -> None:
         raise AssertionError(
             f"Schedule IR is missing {sorted(schedule_markers)}"
         )
+    if qkv_interval is None:
+        raise AssertionError("Schedule IR is missing the QKV timeline")
+    qkv_mxm_intervals = [
+        interval for interval in mxm_compute_intervals
+        if interval[0] < qkv_interval[1] and interval[1] > qkv_interval[0]
+    ]
+    overlaps = [
+        (rope, mxm)
+        for rope in rope_product_intervals
+        for mxm in qkv_mxm_intervals
+        if max(rope[0], mxm[0]) < min(rope[1], mxm[1])
+    ]
+    if not overlaps:
+        raise AssertionError(
+            "QKV schedule does not overlap any VXM RoPE product window with "
+            "an MXM projection compute window"
+        )
+    first_rope, first_mxm = overlaps[0]
+    print(
+        "QKV/RoPE overlap: "
+        f"{len({rope for rope, _ in overlaps})} RoPE windows; "
+        f"first RoPE {first_rope} with MXM {first_mxm}",
+        flush=True,
+    )
 
     run([
         str(args.compile), "--input", str(schedule),

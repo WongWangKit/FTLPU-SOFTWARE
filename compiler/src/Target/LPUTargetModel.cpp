@@ -691,7 +691,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         return fail("encoded_streams must cover east and west stream ranges");
     if (streams_.c2c_bytes_per_stream_per_cycle != memory_.bytes_per_word)
         return fail(
-            "a dedicated C2C lane must carry one complete SRAM row per cycle");
+            "a C2C lane must carry one complete SRAM row per cycle");
     if (streams_.system_register_columns
         < streams_.mem_boundary_register_columns)
         return fail("system register columns must cover MEM boundary columns");
@@ -896,7 +896,7 @@ std::optional<int64_t> LPUTargetModel::route_stream_count(StreamEndpoint source,
             && destination == StreamEndpoint::SxmInput)
         || (source == StreamEndpoint::SxmResult
             && destination == StreamEndpoint::Mem))
-        return 2;
+        return 2 * throughput_.lanes_per_tile;
     if (source == StreamEndpoint::MxmResult
         && destination == StreamEndpoint::VxmInput)
         return throughput_.mxm_result_streams;
@@ -986,9 +986,11 @@ std::optional<int64_t> LPUTargetModel::route_issue_cycles(StreamEndpoint source,
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::MxmActivation)
         return divide_ceil(bytes, vector_bytes);
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::SxmInput)
-        return divide_ceil(bytes, 2 * vector_bytes);
+        return divide_ceil(bytes,
+            2 * throughput_.lanes_per_tile * vector_bytes);
     if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::Mem)
-        return divide_ceil(bytes, 2 * vector_bytes);
+        return divide_ceil(bytes,
+            2 * throughput_.lanes_per_tile * vector_bytes);
     if (source == StreamEndpoint::MxmResult && destination == StreamEndpoint::Mem)
         return divide_ceil(bytes, vector_bytes * throughput_.mxm_result_streams);
     if ((source == StreamEndpoint::VxmResult

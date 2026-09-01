@@ -125,6 +125,7 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Analysis/SchedulePlan.cpp
     src/Dialect/Schedule/Analysis/AttentionTaskGraph.cpp
     src/Dialect/Schedule/Analysis/AttentionMemoryLayout.cpp
+    src/Dialect/Schedule/Analysis/PagedWeightResidency.cpp
     src/Dialect/Schedule/Transforms/AttentionEmitterUtils.cpp
     src/Dialect/Schedule/Transforms/SxmWavefrontEmitterUtils.cpp
     src/Dialect/Schedule/Transforms/AttentionOutputProjectionEmitter.cpp
@@ -266,6 +267,11 @@ add_test(NAME attention_rope_emitter_test COMMAND $<TARGET_FILE:attention_rope_e
 add_executable(attention_target_layout_test tests/attention_target_layout_test.cpp)
 target_link_libraries(attention_target_layout_test PRIVATE ftlpu_compiler)
 add_test(NAME attention_target_layout_test COMMAND $<TARGET_FILE:attention_target_layout_test>)
+add_executable(attention_weight_tile_planner_test
+    tests/attention_weight_tile_planner_test.cpp)
+target_link_libraries(attention_weight_tile_planner_test PRIVATE ftlpu_compiler)
+add_test(NAME attention_weight_tile_planner_test
+    COMMAND $<TARGET_FILE:attention_weight_tile_planner_test>)
 add_executable(schedule_graph_test tests/schedule_graph_test.cpp)
 target_link_libraries(schedule_graph_test PRIVATE ftlpu_compiler)
 add_test(NAME schedule_graph_test COMMAND $<TARGET_FILE:schedule_graph_test>)

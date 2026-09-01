@@ -56,6 +56,7 @@ public:
     const std::vector<std::uint8_t>& value(const std::string& name) const;
     const SessionMemoryPlan& memory_plan() const;
     const ModelSessionStats& stats() const;
+    std::vector<WeightPrefetchPlan> executable_weight_prefetch_plans() const;
 
 private:
     struct DeviceValue {
@@ -68,6 +69,7 @@ private:
         C2cWeightPage page{};
         C2cWeightPageFence fence{};
         std::vector<BinaryWeightPageUse> uses{};
+        bool ready_before_execution{false};
     };
 
     const std::vector<std::uint8_t>& resolve_value(const std::string& name) const;
@@ -80,6 +82,7 @@ private:
     void observe_weight_page_tick();
     void prepare_executable_weight_pages(
         const BinaryProgram& program, const ModelInvocation& invocation);
+    void schedule_executable_weight_pages();
     bool executable_weight_page_ready(
         const BinaryWeightPageUse& use) const;
     void configure_external_transport(

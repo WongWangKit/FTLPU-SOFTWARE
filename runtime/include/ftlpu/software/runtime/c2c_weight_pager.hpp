@@ -38,6 +38,8 @@ struct C2cWeightPageFence {
     std::array<std::array<std::size_t, hw::kC2cStreamsPerDirection>,
                hw::kHemispheres>
         completed_segments{};
+    std::array<std::size_t, InstructionControlUnit::kMemQueues>
+        completed_mem_writes{};
 };
 
 class C2cWeightPager {
@@ -67,6 +69,8 @@ private:
     std::array<std::array<std::size_t, hw::kC2cStreamsPerDirection>,
                hw::kHemispheres>
         scheduled_rx_segments_{};
+    std::array<std::size_t, InstructionControlUnit::kMemQueues>
+        scheduled_mem_writes_{};
     std::uint32_t drain_cycles_{0};
     bool active_{false};
 };

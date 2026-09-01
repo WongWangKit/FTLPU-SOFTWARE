@@ -46,6 +46,26 @@ BinaryBinding make_weight_binding()
 
 int main()
 try {
+    BinaryProgram preloadProgram;
+    auto firstPreload = make_weight_binding();
+    firstPreload.bank = 1;
+    auto alternateBankPreload = make_weight_binding();
+    alternateBankPreload.index = 1;
+    alternateBankPreload.bank = 0;
+    alternateBankPreload.slices = {28, 29, 30, 31, 32, 33, 34, 35};
+    alternateBankPreload.page_storage_slices =
+        alternateBankPreload.slices;
+    preloadProgram.bindings = {firstPreload, alternateBankPreload};
+    preloadProgram.weight_page_uses = {
+        {0, 0, 1, 200, 220},
+        {1, 0, 0, 400, 420},
+    };
+    const auto preloadPlans = plan_weight_prefetches(preloadProgram);
+    if (preloadPlans.size() != 2 || !preloadPlans[0].pre_execution
+        || !preloadPlans[1].pre_execution)
+        throw std::runtime_error(
+            "disjoint alternate-bank weight page was not preloaded");
+
     BinaryProgram program;
     program.bindings.push_back(make_weight_binding());
     program.weight_page_uses.push_back({0, 0, 0, 200, 220});
@@ -71,15 +91,11 @@ try {
     session.load(std::move(package));
     session.run_invocation(0, 0);
 
-    if (!system.chip().hardware_configuration().c2c_dedicated_streams)
-        throw std::runtime_error(
-            "executable did not select the dedicated C2C stream fabric");
     if (session.stats().weight_page_prefetches != 1
-        || session.stats().weight_page_prefetch_bytes != expected.data.size())
+        || session.stats().weight_page_prefetch_bytes != expected.data.size()
+        || session.stats().weight_page_initial_wait_cycles == 0)
         throw std::runtime_error(
             "executable-local page did not run through the C2C pager");
-    if (system.dma(Hemisphere::East).completions().empty())
-        throw std::runtime_error("C2C DMA did not complete a DDR load");
 
     for (const PackedWeightSegment& segment : expected.segments) {
         for (std::uint32_t row = 0; row < segment.vector_count; ++row) {

@@ -2,14 +2,12 @@
 
 #include <algorithm>
 #include <limits>
-#include <map>
 #include <ranges>
+#include <sstream>
 #include <stdexcept>
 
 namespace ftlpu::software::runtime {
 namespace {
-
-constexpr std::uint64_t kTransportGuardCycles = 64;
 
 const BinaryBinding& find_paged_weight(
     const BinaryProgram& program, std::uint32_t index)
@@ -46,6 +44,73 @@ void add_binding_bytes(WeightPrefetchPlan& plan,
     const auto remainder = bytes % sideCount;
     if (east) plan.bytes[0] += quotient + (remainder != 0 ? 1 : 0);
     if (west) plan.bytes[1] += quotient;
+}
+
+std::vector<WeightResidencyRegion> binding_regions(
+    const BinaryBinding& binding, std::uint16_t bank)
+{
+    std::vector<std::uint16_t> slices;
+    if (!binding.page_storage_slices.empty()) {
+        const std::size_t groupWidth = binding.slices.empty()
+            ? 8 : binding.slices.size();
+        const std::size_t begin = std::min<std::size_t>(
+            binding.page_storage_slices.size(),
+            static_cast<std::size_t>(binding.page_role_group_base)
+                * groupWidth);
+        const std::size_t end = std::min<std::size_t>(
+            binding.page_storage_slices.size(),
+            static_cast<std::size_t>(binding.page_role_group_base
+                + binding.page_role_group_count) * groupWidth);
+        slices.assign(binding.page_storage_slices.begin() + begin,
+            binding.page_storage_slices.begin() + end);
+    } else {
+        slices = binding.slices;
+    }
+
+    const std::uint32_t rowBegin = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(std::numeric_limits<std::uint32_t>::max(),
+            static_cast<std::uint64_t>(std::max<int64_t>(0,
+                binding.base_row))));
+    const std::uint64_t rowSpan = std::max<std::uint64_t>(1,
+        static_cast<std::uint64_t>(binding.instruction_count)
+            * std::max<std::uint32_t>(1, binding.address_stride));
+    const std::uint64_t rowEnd = std::min<std::uint64_t>(
+        std::numeric_limits<std::uint32_t>::max(),
+        static_cast<std::uint64_t>(rowBegin) + rowSpan);
+    std::vector<WeightResidencyRegion> regions;
+    if (slices.empty()) {
+        regions.push_back({bank, binding.hemisphere_mask, 0,
+            rowBegin, static_cast<std::uint32_t>(rowEnd), true});
+        return regions;
+    }
+    std::ranges::sort(slices);
+    const auto unique = std::ranges::unique(slices);
+    slices.erase(unique.begin(), unique.end());
+    regions.reserve(slices.size());
+    for (const std::uint16_t slice : slices)
+        regions.push_back({bank, binding.hemisphere_mask, slice,
+            rowBegin, static_cast<std::uint32_t>(rowEnd), false});
+    return regions;
+}
+
+bool regions_overlap(const WeightResidencyRegion& lhs,
+    const WeightResidencyRegion& rhs)
+{
+    return lhs.bank == rhs.bank
+        && (lhs.hemisphere_mask & rhs.hemisphere_mask) != 0
+        && (lhs.wildcard_slice || rhs.wildcard_slice
+            || lhs.slice == rhs.slice)
+        && lhs.row_begin < rhs.row_end && rhs.row_begin < lhs.row_end;
+}
+
+bool plans_overlap(
+    const WeightPrefetchPlan& lhs, const WeightPrefetchPlan& rhs)
+{
+    return std::ranges::any_of(lhs.regions, [&](const auto& left) {
+        return std::ranges::any_of(rhs.regions, [&](const auto& right) {
+            return regions_overlap(left, right);
+        });
+    });
 }
 
 } // namespace
@@ -92,15 +157,25 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
         const auto& use = program.weight_page_uses[useIndex];
         auto found = std::ranges::find_if(plans,
             [&](const WeightPrefetchPlan& candidate) {
-                return candidate.page_index == use.page_index
+                return !candidate.use_indices.empty()
+                    && program.weight_page_uses[
+                        candidate.use_indices.front()].binding_index
+                        == use.binding_index
+                    && candidate.page_index == use.page_index
                     && candidate.bank == use.bank
                     && use.ready_cycle <= candidate.release_cycle
                     && candidate.ready_cycle <= use.release_cycle;
             });
         if (found == plans.end()) {
-            plans.push_back(WeightPrefetchPlan {
-                use.page_index, use.bank, 0, 0, use.ready_cycle,
-                use.release_cycle, {}, {useIndex}});
+            WeightPrefetchPlan plan;
+            plan.page_index = use.page_index;
+            plan.bank = use.bank;
+            plan.ready_cycle = use.ready_cycle;
+            plan.release_cycle = use.release_cycle;
+            plan.use_indices.push_back(useIndex);
+            plan.regions = binding_regions(
+                find_paged_weight(program, use.binding_index), use.bank);
+            plans.push_back(std::move(plan));
             found = std::prev(plans.end());
         } else {
             found->ready_cycle =
@@ -114,11 +189,40 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
             *found, binding, page_byte_size(binding, use.page_index));
     }
 
+    schedule_weight_prefetches(program, plans);
+    return plans;
+}
+
+void schedule_weight_prefetches(const BinaryProgram& program,
+    std::vector<WeightPrefetchPlan>& plans)
+{
     std::ranges::sort(plans, [](const auto& lhs, const auto& rhs) {
         return lhs.ready_cycle < rhs.ready_cycle;
     });
-    std::uint64_t fabricCursor = 0;
-    std::map<std::uint16_t, std::uint64_t> bankReleaseCycles;
+    for (auto& plan : plans) {
+        plan.pre_execution = false;
+        plan.start_cycle = 0;
+        plan.transfer_end_cycle = 0;
+    }
+    const std::uint64_t lanes =
+        program.hardware.c2c_streams_per_direction;
+    const std::uint64_t bytesPerLane =
+        program.hardware.c2c_bytes_per_stream_per_cycle;
+    if (lanes == 0 || bytesPerLane == 0)
+        throw std::logic_error(
+            "paged weights require non-zero C2C bandwidth");
+    const std::uint64_t bandwidth = lanes * bytesPerLane;
+    const std::uint64_t clockMhz = program.hardware.lpu_clock_mhz;
+    const std::uint64_t ddrBandwidth =
+        program.hardware.ddr_peak_bandwidth_mbytes_per_second;
+    const std::uint64_t ddrEfficiency =
+        program.hardware.ddr_scheduling_efficiency_percent;
+
+    std::vector<std::uint64_t> durations(plans.size());
+    std::vector<std::uint64_t> reusableCycles(plans.size());
+    const auto dmaLeadCycles =
+        static_cast<std::uint64_t>(
+            program.hardware.ddr_read_latency_cycles) + 1;
     for (std::size_t index = 0; index < plans.size(); ++index) {
         auto& plan = plans[index];
         const auto sideBytes = std::max(plan.bytes[0], plan.bytes[1]);
@@ -132,31 +236,75 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
         const auto ddrCycles =
             (totalBytes * clockMhz * 100 + effectiveBandwidth - 1)
             / effectiveBandwidth;
-        const auto duration = std::max(c2cCycles, ddrCycles)
+        const auto queueDrain =
+            (static_cast<std::uint64_t>(
+                 program.hardware.ddr_request_queue_depth)
+                + lanes - 1)
+            / lanes;
+        const auto transportGuard = queueDrain
+            + hw::kMemEastBoundaryStreamRegisterColumn
+            + hw::kTileRows + lanes;
+        durations[index] = std::max(c2cCycles, ddrCycles)
             + program.hardware.ddr_read_latency_cycles
             + program.hardware.ddr_read_latency_jitter_cycles
-            + kTransportGuardCycles;
-        const auto lead = duration;
-        const auto deadlineStart =
-            plan.ready_cycle > lead ? plan.ready_cycle - lead : 0;
-        // Only the leading page is known to be safe before any paged weight
-        // consumer exists. Later pages retain the compiler's just-in-time
-        // lifetime order to avoid overwriting a still-live physical page.
-        const auto previousBankRelease = bankReleaseCycles.find(plan.bank);
-        const std::uint64_t reusableCycle =
-            previousBankRelease == bankReleaseCycles.end()
-            ? 0 : previousBankRelease->second;
-        plan.start_cycle = index == 0 ? 0
-            : std::max({fabricCursor, deadlineStart, reusableCycle});
-        plan.transfer_end_cycle = plan.start_cycle + duration;
-        if (plan.transfer_end_cycle > plan.ready_cycle)
-            throw std::logic_error(
-                "C2C weight page cannot meet its first-consumer deadline");
-        fabricCursor = plan.transfer_end_cycle;
-        bankReleaseCycles[plan.bank] = std::max(
-            bankReleaseCycles[plan.bank], plan.release_cycle);
+            + transportGuard;
+        // The compiler's dedicated-slice layout keeps activation scratch out
+        // of the weight residency regions represented here. Consequently,
+        // physically disjoint pages may be loaded before execution; pages that
+        // share a bank/slice/row range retain their release-ordered JIT load.
+        bool canPreload = true;
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (!plans_overlap(plan, plans[previous])) continue;
+            const auto safeDmaStart =
+                plans[previous].release_cycle > dmaLeadCycles
+                ? plans[previous].release_cycle - dmaLeadCycles
+                : 0;
+            reusableCycles[index] = std::max(
+                reusableCycles[index], safeDmaStart);
+            if (plans[previous].pre_execution) canPreload = false;
+        }
+        plan.pre_execution = canPreload;
+        if (plan.pre_execution)
+            plan.transfer_end_cycle = durations[index];
     }
-    return plans;
+
+    std::uint64_t nextFabricStart =
+        std::numeric_limits<std::uint64_t>::max();
+    for (std::size_t index = plans.size(); index-- > 0;) {
+        auto& plan = plans[index];
+        if (plan.pre_execution) continue;
+        const auto deadline = std::min(
+            plan.ready_cycle, nextFabricStart);
+        const bool durationFits = durations[index] <= deadline;
+        const auto latestStart = durationFits
+            ? deadline - durations[index] : 0;
+        const auto preferredStart = latestStart > dmaLeadCycles
+            ? latestStart - dmaLeadCycles : 0;
+        plan.start_cycle = std::max(
+            preferredStart, reusableCycles[index]);
+        plan.transfer_end_cycle = plan.start_cycle + durations[index];
+        if (!durationFits || plan.transfer_end_cycle > deadline) {
+            std::ostringstream detail;
+            const auto& firstUse =
+                program.weight_page_uses[plan.use_indices.front()];
+            detail << "C2C weight page cannot meet its first-consumer deadline:"
+                   << " binding=" << firstUse.binding_index
+                   << " uses=" << plan.use_indices.size()
+                   << " page=" << plan.page_index
+                   << " bank=" << plan.bank
+                   << " bytes_east=" << plan.bytes[0]
+                   << " bytes_west=" << plan.bytes[1]
+                   << " duration=" << durations[index]
+                   << " planned_start=" << plan.start_cycle
+                   << " planned_end=" << plan.transfer_end_cycle
+                   << " ready_cycle=" << plan.ready_cycle
+                   << " release_cycle=" << plan.release_cycle
+                   << " next_fabric_start=" << nextFabricStart
+                   << " reusable_cycle=" << reusableCycles[index];
+            throw std::logic_error(detail.str());
+        }
+        nextFabricStart = plan.start_cycle;
+    }
 }
 
 } // namespace ftlpu::software::runtime

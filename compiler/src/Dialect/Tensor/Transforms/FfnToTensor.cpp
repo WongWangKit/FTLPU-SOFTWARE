@@ -120,8 +120,18 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         : pagedWeights
             ? (initialWeightBank + 1) % memory.banks_per_slice : 0;
     const int64_t hiddenBank = tiledWeights ? inputBank : workingBank;
+    const bool resultOverlapsHidden = llvm::any_of(result_slices,
+        [&](int64_t resultSlice) {
+            return llvm::is_contained(hidden_slices, resultSlice);
+        });
+    // Prefer the input bank so the following residual add can read its two
+    // operands from independent bank ICU queues. Only switch banks when the
+    // target places final-result and hidden tiles on the same physical slices,
+    // where Down result streaming would otherwise collide with hidden reads.
     const int64_t resultBank = target.uses_dedicated_slice_roles()
-        ? inputBank : workingBank;
+        && memory.banks_per_slice > 1
+        && resultOverlapsHidden
+        ? workingBank : inputBank;
     const bool largeSramProfile =
         memory.banks_per_slice * memory.words_per_bank >= 17000;
     const int64_t ffnWeightBase = pagedWeights

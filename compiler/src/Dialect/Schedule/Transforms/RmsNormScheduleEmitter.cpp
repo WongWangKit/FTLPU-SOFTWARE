@@ -454,13 +454,19 @@ int64_t emitDistributedMatrixTranspose(mlir::IRRewriter& rewriter,
         || outputSlices.size() != static_cast<std::size_t>(width))
         return start;
 
-    std::array<int64_t, 16> sourceStreams {};
-    std::array<int64_t, 16> transposeStreams {};
-    std::array<int64_t, 16> outputStreams {};
+    llvm::SmallVector<int64_t> sourceStreams(
+        static_cast<std::size_t>(width));
+    llvm::SmallVector<int64_t> transposeStreams(
+        static_cast<std::size_t>(width));
+    llvm::SmallVector<int64_t> outputStreams(
+        static_cast<std::size_t>(width));
+    const int64_t sourceBase =
+        target.streams().streams_per_direction - width;
+    const int64_t outputBase = target.streams().streams_per_direction;
     for (int64_t stream = 0; stream < width; ++stream) {
-        sourceStreams[static_cast<std::size_t>(stream)] = stream;
-        transposeStreams[static_cast<std::size_t>(stream)] = 16 + stream;
-        outputStreams[static_cast<std::size_t>(stream)] = 32 + stream;
+        sourceStreams[static_cast<std::size_t>(stream)] = sourceBase + stream;
+        transposeStreams[static_cast<std::size_t>(stream)] = stream;
+        outputStreams[static_cast<std::size_t>(stream)] = outputBase + stream;
     }
     const auto readLatency = [&](int64_t slice) {
         return *target.transport_latency(target::StreamEndpoint::Mem,
@@ -481,48 +487,48 @@ int64_t emitDistributedMatrixTranspose(mlir::IRRewriter& rewriter,
 
     const int64_t hiddenBlocks = hidden / tile;
     const int64_t blockCount = (rows / tile) * hiddenBlocks;
-    std::array<int64_t, 2> captureReady {
-        start + maxReadLatency, start + maxReadLatency};
-    for (int64_t block = 0; block < blockCount; ++block) {
+    const int64_t inputBeats = blockCount * tileRows;
+    const int64_t captureStart = start + maxReadLatency;
+    for (int64_t wave = 0; wave < inputBeats; ++wave) {
         for (int64_t hemisphere = 0;
              hemisphere < target.memory().hemispheres; ++hemisphere) {
-            const int64_t capture =
-                captureReady[static_cast<std::size_t>(hemisphere)];
-            for (int64_t beat = 0; beat < tileRows; ++beat) {
-                const int64_t beatCycle = capture
-                    + beat * (tileRows + 1);
-                for (int64_t stream = 0; stream < width; ++stream) {
-                    const int64_t slice =
-                        inputSlices[static_cast<std::size_t>(stream)];
-                    emitMem(rewriter, location,
-                        beatCycle - readLatency(slice),
-                        hemisphere * target.memory().slices_per_hemisphere
-                            + slice,
-                        "read", baseRow(inputPlacement)
-                            + block * tileRows + beat,
-                        stream, 1, 1, 0);
-                }
-                sxm_detail::emitBufferedWavefrontBeat(rewriter, location,
-                    target, beatCycle, hemisphere, beat,
-                    sourceStreams, transposeStreams, outputStreams);
-                for (int64_t stream = 0; stream < width; ++stream) {
-                    const int64_t slice =
-                        outputSlices[static_cast<std::size_t>(stream)];
-                    emitMem(rewriter, location,
-                        beatCycle + 1 + writeLatency(slice),
-                        hemisphere * target.memory().slices_per_hemisphere
-                            + slice,
-                        "write", baseRow(outputPlacement)
-                            + block * tileRows + beat,
-                        32 + stream, 1, 1, 0);
-                }
+            const int64_t capture = captureStart + wave;
+            for (int64_t stream = 0; stream < width; ++stream) {
+                const int64_t slice =
+                    inputSlices[static_cast<std::size_t>(stream)];
+                emitMem(rewriter, location,
+                    capture - readLatency(slice),
+                    hemisphere * target.memory().slices_per_hemisphere
+                        + slice,
+                    "read", baseRow(inputPlacement) + wave,
+                    sourceBase + stream, 1, 1, 0, "sram", -1,
+                    bank(inputPlacement));
             }
-            captureReady[static_cast<std::size_t>(hemisphere)] +=
-                tileRows * (tileRows + 1);
+            emitWavefrontBeat(rewriter, location, target, capture,
+                hemisphere, wave, sourceStreams, transposeStreams,
+                outputStreams);
+            for (int64_t stream = 0; stream < width; ++stream) {
+                const int64_t slice =
+                    outputSlices[static_cast<std::size_t>(stream)];
+                emitMem(rewriter, location,
+                    capture + 1 + writeLatency(slice),
+                    hemisphere * target.memory().slices_per_hemisphere
+                        + slice,
+                    "write", baseRow(outputPlacement) + wave,
+                    outputBase + stream, 1, 1, 0, "sram", -1,
+                    bank(outputPlacement));
+            }
         }
     }
-    return std::max(captureReady[0], captureReady[1])
-        + maxWriteLatency + tileRows + 2;
+    for (int64_t hemisphere = 0;
+         hemisphere < target.memory().hemispheres; ++hemisphere) {
+        for (int64_t tail = 0; tail < tileRows - 1; ++tail)
+            emitWavefrontTail(rewriter, location, target,
+                captureStart + inputBeats + tail, hemisphere, tail,
+                transposeStreams, outputStreams);
+    }
+    return captureStart + inputBeats
+        + std::max(tileRows, maxWriteLatency + 1);
 }
 
 int64_t emitPairToPackedTranspose(mlir::IRRewriter& rewriter,
@@ -798,7 +804,7 @@ int64_t emitPackedToPairTranspose(mlir::IRRewriter& rewriter,
     return cycle;
 }
 
-int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
+int64_t emitLegacyVxmFeedback(mlir::IRRewriter& rewriter,
     stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
     mlir::DictionaryAttr inputPlacement,
     mlir::DictionaryAttr weightPlacement,
@@ -980,6 +986,222 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
             }
         }
         cycle = normalize;
+    }
+    return cycle;
+}
+
+int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
+    stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
+    mlir::DictionaryAttr inputPlacement,
+    mlir::DictionaryAttr weightPlacement,
+    mlir::DictionaryAttr outputPlacement, int64_t start)
+{
+    const auto inputSlices = slices(inputPlacement);
+    const auto weightSlices = slices(weightPlacement);
+    const auto outputSlices = slices(outputPlacement);
+    const auto inputType =
+        llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
+    const llvm::StringRef streamKind =
+        lpu_16bit_stream_kind(inputType.getElementType());
+    const llvm::StringRef dataFormat =
+        lpu_16bit_data_format(inputType.getElementType());
+    const int64_t rows = inputType.getDimSize(0);
+    const int64_t hidden = inputType.getDimSize(1);
+    const int64_t tile = target.throughput().mxm_rows;
+    const int64_t lanes = target.throughput().lanes_per_tile;
+    const int64_t waves = target.throughput().tile_rows;
+    const int64_t hiddenBlocks = hidden / tile;
+    const int64_t tokenBlocks = rows / tile;
+    const int64_t distributedRows =
+        rows * hidden / (tile * lanes);
+    if (inputSlices.size() != 16 || outputSlices.size() != 16
+        || (weightSlices.size() != 2 && weightSlices.size() != 16))
+        return start;
+
+    const auto readLatency = [&](int64_t slice) {
+        return target.transport_latency(target::StreamEndpoint::Mem,
+            target::StreamEndpoint::VxmInput,
+            target::StreamDirection::West, slice).value();
+    };
+    const auto writeLatency = [&](int64_t slice) {
+        return target.transport_latency(target::StreamEndpoint::VxmResult,
+            target::StreamEndpoint::Mem,
+            target::StreamDirection::East, slice).value();
+    };
+    const auto maxReadLatency = [&](llvm::ArrayRef<int64_t> memorySlices) {
+        int64_t latency = 0;
+        for (int64_t slice : memorySlices)
+            latency = std::max(latency, readLatency(slice));
+        return latency;
+    };
+    const auto maxWriteLatency = [&](llvm::ArrayRef<int64_t> memorySlices) {
+        int64_t latency = 0;
+        for (int64_t slice : memorySlices)
+            latency = std::max(latency, writeLatency(slice));
+        return latency;
+    };
+    const auto vxm = [&](int64_t cycle, int64_t queue,
+                         llvm::StringRef opcode,
+                         llvm::StringRef lhsKind, int64_t lhsIndex,
+                         float lhsImmediate,
+                         llvm::StringRef rhsKind, int64_t rhsIndex,
+                         float rhsImmediate,
+                         llvm::StringRef castTarget, int64_t outputStream,
+                         int64_t repeatCount, int64_t chainDepth,
+                         bool accumulatorReset = false,
+                         bool accumulatorWrite = false,
+                         bool accumulatorEmit = true,
+                         bool localScalarWrite = false) {
+        return create_vxm(rewriter, op.getLoc(), op.getInput(),
+            op.getWeight(), inputType, cycle, queue, opcode,
+            lhsKind, lhsIndex, lhsImmediate,
+            rhsKind, rhsIndex, rhsImmediate,
+            castTarget, outputStream, repeatCount, 1,
+            "east", "east", -1, accumulatorReset,
+            accumulatorWrite, accumulatorEmit, localScalarWrite,
+            chainDepth);
+    };
+    const auto emitMirroredPairRead =
+        [&](llvm::ArrayRef<int64_t> memorySlices, int64_t pair,
+            int64_t address, int64_t stream, int64_t inputCycle,
+            int64_t memoryBank, int64_t addressBinding = -1) {
+        for (int64_t hemisphere = 0;
+             hemisphere < target.memory().hemispheres; ++hemisphere) {
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const int64_t slice = memorySlices[2 * pair + byte];
+                emitMem(rewriter, op.getLoc(),
+                    inputCycle - readLatency(slice),
+                    hemisphere * target.memory().slices_per_hemisphere
+                        + slice,
+                    "read", address,
+                    32 + hemisphere * 16 + stream + byte,
+                    1, 1, 0, "sram", addressBinding, memoryBank);
+            }
+        }
+    };
+    const auto emitMirroredWrite =
+        [&](llvm::ArrayRef<int64_t> memorySlices, int64_t address,
+            int64_t originalOutputStream, int64_t outputCycle,
+            int64_t byteCount, int64_t memoryBank) {
+        for (int64_t destination = 0;
+             destination < target.memory().hemispheres; ++destination) {
+            const int64_t source = 1 - destination;
+            for (int64_t byte = 0; byte < byteCount; ++byte) {
+                const int64_t slice = memorySlices[byte];
+                emitMem(rewriter, op.getLoc(),
+                    outputCycle + writeLatency(slice),
+                    destination * target.memory().slices_per_hemisphere
+                        + slice,
+                    "write", address,
+                    source * 8 + originalOutputStream + byte,
+                    1, 1, 0, "sram", -1, memoryBank);
+            }
+        }
+    };
+
+    int64_t cycle = start;
+    for (int64_t tokenBlock = 0;
+         tokenBlock < tokenBlocks; ++tokenBlock) {
+        const int64_t reductionInput = cycle
+            + maxReadLatency(inputSlices) + 1;
+        const int64_t reductionConfig = reductionInput - 1;
+        vxm(reductionConfig, 0, "multiply",
+            streamKind, 32, 0.0f, streamKind, 32, 0.0f,
+            "fp32", -1, hidden, 2);
+        vxm(reductionConfig, 1, "add",
+            "previous", 0, 0.0f, "accumulator", 0, 0.0f,
+            "fp32", -1, 1, 2, true, true, false);
+        vxm(reductionConfig + 1, 1, "add",
+            "previous", 0, 0.0f, "accumulator", 0, 0.0f,
+            "fp32", -1, hidden - 2, 2, false, true, false);
+        vxm(reductionConfig + 2, 1, "add",
+            "previous", 0, 0.0f, "accumulator", 0, 0.0f,
+            dataFormat, 0, 1, 2, false, true, true);
+
+        for (int64_t feature = 0; feature < hidden; ++feature) {
+            const int64_t hiddenBlock = feature / tile;
+            const int64_t featureInBlock = feature % tile;
+            const int64_t wave = featureInBlock / lanes;
+            const int64_t pair = featureInBlock % lanes;
+            emitMirroredPairRead(inputSlices, pair,
+                packedAddress(inputPlacement, tokenBlock,
+                    hiddenBlock, wave, hiddenBlocks),
+                0, reductionInput + feature, bank(inputPlacement));
+        }
+
+        const int64_t scalarAddress = baseRow(inputPlacement)
+            + distributedRows + tokenBlock;
+        const int64_t sumOutput = reductionInput + hidden + 1;
+        emitMirroredWrite(llvm::ArrayRef<int64_t>(inputSlices).take_front(2),
+            scalarAddress, 0, sumOutput, 2, bank(inputPlacement));
+
+        const auto scalarSlices =
+            llvm::ArrayRef<int64_t>(inputSlices).take_front(2);
+        const int64_t scalarWriteEnd = sumOutput
+            + maxWriteLatency(scalarSlices) + 1;
+        const int64_t factorInput = scalarWriteEnd
+            + maxReadLatency(scalarSlices) + 1;
+        const int64_t factorConfig = factorInput - 1;
+        vxm(factorConfig, 0, "multiply",
+            streamKind, 32, 0.0f, "immediate", 0,
+            1.0f / static_cast<float>(hidden), "fp32", -1, 1, 4);
+        vxm(factorConfig, 1, "add",
+            "previous", 0, 0.0f, "immediate", 0,
+            static_cast<float>(op.getEpsilon().convertToDouble()),
+            "fp32", -1, 1, 4);
+        vxm(factorConfig, 2, "pass",
+            "previous", 0, 0.0f, "immediate", 0, 0.0f,
+            "fp32", -1, 1, 4);
+        vxm(factorConfig, 3, "rsqrt",
+            "previous", 0, 0.0f, "immediate", 0, 0.0f,
+            "fp32", -1, 1, 4, false, false, true, true);
+        emitMirroredPairRead(scalarSlices, 0, scalarAddress, 0,
+            factorInput, bank(inputPlacement));
+
+        const int64_t normalizeInput = factorInput + 10;
+        const int64_t normalizeConfig = normalizeInput - 1;
+        vxm(normalizeConfig, 0, "multiply",
+            streamKind, 32, 0.0f, streamKind, 34, 0.0f,
+            "fp32", -1, hidden, 4);
+        vxm(normalizeConfig, 1, "pass",
+            "previous", 0, 0.0f, "immediate", 0, 0.0f,
+            "fp32", -1, hidden, 4);
+        vxm(normalizeConfig, 2, "pass",
+            "previous", 0, 0.0f, "immediate", 0, 0.0f,
+            "fp32", -1, hidden, 4);
+        vxm(normalizeConfig, 3, "multiply",
+            "previous", 0, 0.0f, "accumulator", 0, 0.0f,
+            dataFormat, 2, hidden, 4);
+
+        int64_t normalizeWriteEnd = normalizeInput;
+        const bool broadcastWeight = weightSlices.size() == 2;
+        for (int64_t feature = 0; feature < hidden; ++feature) {
+            const int64_t hiddenBlock = feature / tile;
+            const int64_t featureInBlock = feature % tile;
+            const int64_t wave = featureInBlock / lanes;
+            const int64_t pair = featureInBlock % lanes;
+            const int64_t inputAddress = packedAddress(inputPlacement,
+                tokenBlock, hiddenBlock, wave, hiddenBlocks);
+            const int64_t weightAddress = broadcastWeight
+                ? baseRow(weightPlacement) + feature
+                : baseRow(weightPlacement) + hiddenBlock * waves + wave;
+            const int64_t outputAddress = packedAddress(outputPlacement,
+                tokenBlock, hiddenBlock, wave, hiddenBlocks);
+            emitMirroredPairRead(inputSlices, pair, inputAddress, 0,
+                normalizeInput + feature, bank(inputPlacement));
+            emitMirroredPairRead(weightSlices,
+                broadcastWeight ? 0 : pair, weightAddress, 2,
+                normalizeInput + feature, bank(weightPlacement),
+                inputBindingIndex(op.getWeight()));
+            const int64_t outputCycle = normalizeInput + feature + 5;
+            const auto outputPair =
+                llvm::ArrayRef<int64_t>(outputSlices).slice(2 * pair, 2);
+            emitMirroredWrite(outputPair, outputAddress, 2,
+                outputCycle, 2, bank(outputPlacement));
+            normalizeWriteEnd = std::max(normalizeWriteEnd,
+                outputCycle + maxWriteLatency(outputPair) + 1);
+        }
+        cycle = normalizeWriteEnd + 1;
     }
     return cycle;
 }
@@ -1307,7 +1529,7 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
     const auto inputKind =
         inputPlacement.getAs<mlir::StringAttr>("kind");
     const bool vxmInput = inputKind
-        && inputKind.getValue() == "fp16_vxm_row_parallel_8";
+        && inputKind.getValue() == "fp16_vxm_distributed_16";
     const bool mxmInput = inputKind
         && inputKind.getValue() == "fp16_mxm_distributed_16";
     if (!vxmInput && !mxmInput)
@@ -1315,29 +1537,28 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
             "feedback RMSNorm requires MXM- or VXM-oriented distributed16 input");
     const int64_t inputTransposeEnd = vxmInput
         ? 0
-        : emitPackedToPairTranspose(
+        : emitDistributedMatrixTranspose(
               rewriter, op.getLoc(), target, inputPlacement,
-              feedbackInputPlacement, rows, hidden, 0, true);
+              feedbackInputPlacement, rows, hidden, 0);
     const auto feedbackInput = vxmInput
         ? inputPlacement : feedbackInputPlacement;
     const auto weightKind =
         weightPlacement.getAs<mlir::StringAttr>("kind");
     const bool distributedWeight = weightKind
-        && (weightKind.getValue() == "fp16_vxm_row_parallel_8"
-            || weightKind.getValue()
-                == "fp16_vxm_gamma_broadcast");
+        && (weightKind.getValue() == "fp16_vxm_distributed_16"
+            || weightKind.getValue() == "fp16_vxm_gamma_broadcast");
     if (!distributedWeight)
         return op.emitError(
             "feedback RMSNorm requires VXM-oriented distributed16 gamma");
     const int64_t weightTransposeEnd = inputTransposeEnd;
-    const int64_t feedbackEnd = emitRowParallelVxmFeedback(
+    const int64_t feedbackEnd = emitVxmFeedback(
         rewriter, op, target, feedbackInput,
         weightPlacement, feedbackOutputPlacement,
         weightTransposeEnd);
     const auto resultKind =
         resultPlacement.getAs<mlir::StringAttr>("kind");
     const bool vxmResult = resultKind
-        && resultKind.getValue() == "fp16_vxm_row_parallel_8";
+        && resultKind.getValue() == "fp16_vxm_distributed_16";
     const bool mxmResult = resultKind
         && resultKind.getValue() == "fp16_mxm_distributed_16";
     if (!vxmResult && !mxmResult)
@@ -1345,10 +1566,10 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
             "feedback RMSNorm requires MXM- or VXM-oriented distributed16 result");
     const int64_t restoreEnd = vxmResult
         ? feedbackEnd
-        : emitPairToPackedTranspose(
+        : emitDistributedMatrixTranspose(
               rewriter, op.getLoc(), target,
               feedbackOutputPlacement, resultPlacement,
-              rows, hidden, feedbackEnd, false);
+              rows, hidden, feedbackEnd);
 
     if (!vxmInput)
         createTimeline(rewriter, op.getLoc(), "rmsnorm.transpose_input",

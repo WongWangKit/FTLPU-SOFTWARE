@@ -2,6 +2,7 @@
 
 #include "AttentionEmitterUtils.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/paged_weight_residency.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_projection_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_work_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/lpu_resource_model.hpp"
@@ -42,6 +43,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       localDequant ? target_.streams().streams_per_direction -
                          target_.throughput().mxm_int8_load_streams_per_cycle
                    : target_.streams().streams_per_direction;
+  const int64_t overlapActivationStreamBase =
+      target_.throughput().mxm_activation_streams;
   const auto inputPlacement =
       op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("input");
   const auto inputKind = inputPlacement.getAs<mlir::StringAttr>("kind");
@@ -102,21 +105,6 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                            target::StreamDirection::East, slice)
         .value_or(readLatency(slice));
   };
-  if (const auto queryWeight =
-          op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("query_weight")) {
-    if (const auto transferCycles =
-            queryWeight.getAs<mlir::IntegerAttr>("page_transfer_cycles")) {
-      const auto storage =
-          queryWeight.getAs<mlir::ArrayAttr>("page_storage_slices");
-      int64_t maxWeightReadLatency = 0;
-      for (mlir::Attribute slice : storage)
-        maxWeightReadLatency = std::max(
-            maxWeightReadLatency,
-            weightReadLatency(llvm::cast<mlir::IntegerAttr>(slice).getInt()));
-      phaseStart =
-          std::max(phaseStart, transferCycles.getInt() + maxWeightReadLatency);
-    }
-  }
   const auto emitDequant = [&](int64_t cycle, int64_t hemisphere,
                                int64_t localMxm, mlir::Value weight,
                                float scale) {
@@ -149,8 +137,46 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       inputDistributed16 ? inputStagingBank : inputBank;
   const int64_t stagingBank = placementBank("rope_staging");
   const int64_t ropeBank = placementBank("rope");
+  const auto ropeMirrorPlacement =
+      op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("rope_mirror");
+  const int64_t ropeMirrorBank = ropeMirrorPlacement
+                                     ? ropeMirrorPlacement
+                                           .getAs<mlir::IntegerAttr>("bank")
+                                           .getInt()
+                                     : ropeBank;
   const int64_t keyBank = placementBank("key");
   const int64_t valueBank = placementBank("value");
+  const int64_t productBank = placementBank("rope_product");
+  const auto keyProductPlacement =
+      op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("rope_product_key");
+  const int64_t keyProductBank = keyProductPlacement
+                                     ? keyProductPlacement
+                                           .getAs<mlir::IntegerAttr>("bank")
+                                           .getInt()
+                                     : productBank;
+  const auto slicesOverlap = [](llvm::ArrayRef<int64_t> lhs,
+                                 llvm::ArrayRef<int64_t> rhs) {
+    return llvm::any_of(lhs, [&](int64_t slice) {
+      return llvm::is_contained(rhs, slice);
+    });
+  };
+  const auto productConflictsWithInput =
+      [&](int64_t bank, llvm::ArrayRef<int64_t> slices) {
+        return inputStagingBank == bank &&
+               slicesOverlap(inputStagingSlices, slices);
+      };
+  const int64_t alternateProductBank =
+      (productBank + 1) % target_.memory().banks_per_slice;
+  const bool projectionRopeOverlap =
+      inputDistributed16 &&
+      overlapActivationStreamBase + 2 <=
+          target_.streams().streams_per_direction &&
+      !productConflictsWithInput(productBank,
+                                 layout.ropeProductSlices()) &&
+      !productConflictsWithInput(alternateProductBank,
+                                 layout.ropeProductSlices()) &&
+      !productConflictsWithInput(keyProductBank,
+                                 layout.ropeProductKeySlices());
 
   if (inputDistributed16) {
     const auto &stagingSlices = inputStagingSlices;
@@ -236,15 +262,28 @@ int64_t AttentionScheduleEmitter::emitProjections() {
         * target_.throughput().mxm_rows / 2;
     const int64_t conservativeComputeSpacing = tile;
     int64_t projectionBlock = 0;
-    int64_t previousProjectionWeightRelease = -1;
+    int64_t postprocessReady = phaseStart;
+    int64_t projectionOverlapDeadline = -1;
+    struct ResidentWeight {
+      mlir::DictionaryAttr placement;
+      int64_t releaseCycle;
+    };
+    llvm::SmallVector<ResidentWeight, 3> residentWeights;
 
-    for (int64_t projection = 0; projection < 3; ++projection) {
+    // Value is consumed only by PV, while Key gates the immediately following
+    // QK stage. Scheduling Q -> V -> K shortens Key's live range and releases
+    // Value's weight residency early enough to hide a conflicting next-stage
+    // page refill without adding an MXM bubble.
+    const int64_t projectionOrder[] = {0, 2, 1};
+    for (int64_t projectionPosition = 0; projectionPosition < 3;
+         ++projectionPosition) {
+      const int64_t projection = projectionOrder[projectionPosition];
       const auto kind = projectionKind(projection);
       const char *weightPlacementNames[] = {
           "query_weight", "key_weight", "value_weight"};
       const auto weightPlacement = op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(
           weightPlacementNames[projection]);
-      if (previousProjectionWeightRelease >= 0 && weightPlacement) {
+      if (weightPlacement) {
         if (const auto transferCycles =
                 weightPlacement.getAs<mlir::IntegerAttr>(
                     "page_transfer_cycles")) {
@@ -255,13 +294,15 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 maxWeightReadLatency,
                 weightReadLatency(
                     llvm::cast<mlir::IntegerAttr>(slice).getInt()));
-          // Paged projections reuse a physical weight bank. Keep the first
-          // read of the next page after the previous page's final read and a
-          // complete C2C transfer, including the modeled transport guard.
-          phaseStart = std::max(
-              phaseStart,
-              previousProjectionWeightRelease + transferCycles.getInt() +
-                  kC2cTransportGuardCycles + maxWeightReadLatency);
+          for (const ResidentWeight &resident : residentWeights) {
+            if (!pagedWeightResidencyOverlaps(
+                    resident.placement, weightPlacement))
+              continue;
+            phaseStart = std::max(
+                phaseStart,
+                resident.releaseCycle + transferCycles.getInt() +
+                    kC2cTransportGuardCycles + maxWeightReadLatency);
+          }
         }
       }
       int64_t currentProjectionWeightRelease = -1;
@@ -274,6 +315,23 @@ int64_t AttentionScheduleEmitter::emitProjections() {
         for (int64_t half = 0; half < 2; ++half) {
           for (int64_t reductionBlock = 0; reductionBlock < hiddenBlocks;
                ++reductionBlock) {
+            const bool finalReduction = reductionBlock + 1 == hiddenBlocks;
+            bool overlapsRopeProducts = false;
+            if (projectionRopeOverlap && phaseStart < postprocessReady) {
+              const int64_t computeEnd =
+                  phaseStart + 4 + loadToIw + tokenBlocks * tile;
+              if (projectionOverlapDeadline < 0 ||
+                  computeEnd > projectionOverlapDeadline)
+                phaseStart = postprocessReady;
+              else
+                overlapsRopeProducts = true;
+            }
+            if (projectionRopeOverlap && finalReduction) {
+              phaseStart = std::max(phaseStart, postprocessReady);
+              overlapsRopeProducts = false;
+            }
+            const int64_t activationStreamBase =
+                overlapsRopeProducts ? overlapActivationStreamBase : 0;
             const int64_t weightBuffer =
                 projectionBlock % target_.throughput().mxm_weight_buffers;
             const int64_t dequantStart = phaseStart;
@@ -320,7 +378,6 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             }
 
             const int64_t firstCompute = dequantStart + 4 + loadToIw;
-            const bool finalReduction = reductionBlock + 1 == hiddenBlocks;
             const int64_t computeSpacing =
                 finalReduction
                     ? tile + target_.throughput().accumulator_to_vxm_latency +
@@ -352,7 +409,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           computeCycle - activationLatency,
                           hemisphere * target_.memory().slices_per_hemisphere +
                               slice,
-                          "read", inputAddress, byte, tile, 1, 1,
+                          "read", inputAddress, activationStreamBase + byte,
+                          tile, 1, 1,
                           "sram", -1, projectionActivationBank);
                 }
                 // Projection waves are fully drained before another head or
@@ -362,7 +420,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 const int64_t accumulatorAddress =
                     tokenBlock * tile + half * accumulatorHalfStride;
                 emitMxm(rewriter_, op_.getLoc(), computeCycle, hemisphere,
-                        "compute", weightBuffer, 0, 0, 0, tile, 1,
+                        "compute", weightBuffer, 0, activationStreamBase, 0,
+                        tile, 1,
                         accumulatorAddress, 1,
                         finalReduction ? "stream" : "sram", finalReduction,
                         "supercell", 0, dataFormat, {},
@@ -425,14 +484,17 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 }
               }
             }
-            phaseStart = firstCompute + tokenBlocks * computeSpacing + tile;
-            if (finalReduction)
-              phaseStart = std::max(phaseStart, rawWriteEnd + 1);
+            // Double-buffer the next weight tile under the current 32-row
+            // compute window. The next compute starts exactly when the last
+            // issued row retires; result transport is tracked independently
+            // by rawWriteEnd and may overlap a different accumulator window.
+            const int64_t lastCompute = firstCompute
+                + (tokenBlocks - 1) * computeSpacing;
+            phaseStart = lastCompute + tile - (4 + loadToIw);
             ++projectionBlock;
           }
         }
 
-        const int64_t productBank = placementBank("rope_product");
         const auto &memory = target_.memory();
         const int64_t blockRows = target_.throughput().mxm_block_rows;
         const int64_t blockIssues = tile / blockRows;
@@ -446,7 +508,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
 
         if (kind == AttentionProjectionKind::Value) {
           int64_t copyCycle =
-              std::max(phaseStart, rawWriteEnd + maxStagingReadLatency + 1);
+              std::max({phaseStart, postprocessReady,
+                        rawWriteEnd + maxStagingReadLatency + 1});
           int64_t copyEnd = copyCycle;
           for (int64_t outputBlock = firstOutputBlock;
                outputBlock < lastOutputBlock; ++outputBlock) {
@@ -489,11 +552,14 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 std::max(copyCycle, copyEnd + maxStagingReadLatency + 1);
           }
           phaseStart = std::max(copyCycle + 1, copyEnd);
+          postprocessReady = phaseStart;
+          projectionOverlapDeadline = -1;
           continue;
         }
 
         int64_t replicateCycle =
-            std::max(phaseStart, rawWriteEnd + maxStagingReadLatency + 1);
+            std::max({phaseStart, postprocessReady,
+                      rawWriteEnd + maxStagingReadLatency + 1});
         int64_t replicateEnd = replicateCycle;
         for (int64_t outputBlock = firstOutputBlock;
              outputBlock < lastOutputBlock; ++outputBlock) {
@@ -581,8 +647,16 @@ int64_t AttentionScheduleEmitter::emitProjections() {
 
         int64_t ropeEnd =
             std::max(replicateCycle, replicateEnd + maxStagingReadLatency + 1);
+        // MXM activation reads are issued before compute. Keep that backward
+        // transport window beyond the full-width cross-hemisphere replication
+        // before switching to the disjoint overlap stream group.
+        const int64_t activationReadLead =
+            std::max<int64_t>(0, activationLatency - (4 + loadToIw));
+        const int64_t nextProjectionStart = ropeEnd + activationReadLead;
         const int64_t firstHead = firstOutputBlock / projectionHeadBlocks;
         const int64_t lastHead = (lastOutputBlock - 1) / projectionHeadBlocks;
+        const int64_t queryHeadsPerKv = op_.getQueryHeads() / op_.getKvHeads();
+        int64_t firstCombineConfig = -1;
         const auto baseProductSlices = layout.ropeProductSlices();
         int64_t maxProductWriteLatency = 0;
         int64_t maxProductReadLatency = 0;
@@ -597,7 +671,17 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           maxProductReadLatency =
               std::max(maxProductReadLatency, vxmInputReadLatency(slice));
         }
-        const int64_t queryHeadsPerKv = op_.getQueryHeads() / op_.getKvHeads();
+        for (int64_t slice : layout.ropeProductKeySlices()) {
+          maxProductWriteLatency = std::max(
+              maxProductWriteLatency,
+              target_
+                  .transport_latency(target::StreamEndpoint::VxmResult,
+                                     target::StreamEndpoint::Mem,
+                                     target::StreamDirection::East, slice)
+                  .value_or(readLatency(slice)));
+          maxProductReadLatency =
+              std::max(maxProductReadLatency, vxmInputReadLatency(slice));
+        }
         for (int64_t head = firstHead; head <= lastHead; ++head) {
           int64_t headEnd = ropeEnd;
           for (int64_t pairBlock = 0; pairBlock < projectionHeadBlocks / 2;
@@ -626,6 +710,22 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             const auto ropeResourcesAreLegal =
                 [&](llvm::ArrayRef<int64_t> candidateSlices) {
                   llvm::SmallVector<ResourceWindow, 0> windows;
+                  const bool compactProductLayout =
+                      candidateSlices.size() < 16;
+                  const auto candidateProductSlice =
+                      [&](int64_t product, int64_t token, int64_t byte) {
+                        if (compactProductLayout)
+                          return layout.ropeProductSlice(
+                              kind, product, token, byte);
+                        return candidateSlices[(token % 2) * 8 +
+                                               product * 2 + byte];
+                      };
+                  const auto candidateProductBank = [&](int64_t product) {
+                    return compactProductLayout
+                               ? layout.ropeProductBank(
+                                     kind, productBank, product)
+                               : productBank;
+                  };
                   const int64_t productAInputOffset = 1;
                   const int64_t productBConfigOffset =
                       productAInputOffset + op_.getSeqLen() + 1 +
@@ -638,7 +738,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   const int64_t combineInputOffset = combineConfigOffset + 1;
 
                   const auto appendProductPhase =
-                      [&](int64_t inputOffset, int64_t firstProduct) {
+                      [&](int64_t inputOffset, int64_t firstProduct,
+                          bool mirroredRopeTable) {
                         for (int64_t token = 0; token < op_.getSeqLen();
                              ++token) {
                           const int64_t tokenLane = token % blockRows;
@@ -668,15 +769,16 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               appendMemResources(
                                   windows,
                                   inputCycle - vxmInputReadLatency(slice),
-                                  hemisphere, slice, ropeBank, false);
+                                  hemisphere, slice,
+                                  mirroredRopeTable ? ropeMirrorBank : ropeBank,
+                                  false);
                             }
                           }
-                          const int64_t laneOffset = (token % 2) * 8;
                           for (int64_t slot = 0; slot < 2; ++slot) {
                             const int64_t product = firstProduct + slot;
                             for (int64_t byte = 0; byte < 2; ++byte) {
-                              const int64_t slice = candidateSlices[
-                                  laneOffset + product * 2 + byte];
+                              const int64_t slice = candidateProductSlice(
+                                  product, token, byte);
                               const int64_t latency =
                                   target_
                                       .transport_latency(
@@ -690,28 +792,29 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                    ++destination)
                                 appendMemResources(
                                     windows, inputCycle + 2 + latency,
-                                    destination, slice, productBank, true);
+                                    destination, slice,
+                                    candidateProductBank(product), true);
                             }
                           }
                         }
                       };
-                  appendProductPhase(productAInputOffset, 0);
-                  appendProductPhase(productBInputOffset, 2);
+                  appendProductPhase(productAInputOffset, 0, false);
+                  appendProductPhase(productBInputOffset, 2, true);
 
                   for (int64_t token = 0; token < op_.getSeqLen(); ++token) {
                     const int64_t tokenLane = token % blockRows;
                     const int64_t inputCycle = combineInputOffset + token;
-                    const int64_t laneOffset = (token % 2) * 8;
                     for (int64_t product = 0; product < 4; ++product) {
                       for (int64_t byte = 0; byte < 2; ++byte) {
-                        const int64_t slice = candidateSlices[
-                            laneOffset + product * 2 + byte];
+                        const int64_t slice = candidateProductSlice(
+                            product, token, byte);
                         for (int64_t hemisphere = 0;
                              hemisphere < memory.hemispheres; ++hemisphere)
                           appendMemResources(
                               windows,
                               inputCycle - vxmInputReadLatency(slice),
-                              hemisphere, slice, productBank, false);
+                              hemisphere, slice,
+                              candidateProductBank(product), false);
                       }
                     }
                     const int64_t outputCycle = inputCycle + 1;
@@ -748,6 +851,12 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             llvm::SmallVector<int64_t, 16> productSlices(
                 baseProductSlices.begin(), baseProductSlices.end());
             if (!ropeResourcesAreLegal(productSlices)) {
+              if (productSlices.size() < 16) {
+                op_.emitError(
+                    "compact RoPE product placement conflicts with a MEM "
+                    "ICU/read-write resource");
+                return -1;
+              }
               llvm::SmallVector<int64_t, 16> interleaved;
               interleaved.reserve(productSlices.size());
               // Product storage uses two slices per BF16 pair. Group pairs
@@ -790,7 +899,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 }
               }
             };
-            const auto emitRopeTable = [&](int64_t token, int64_t inputCycle) {
+            const auto emitRopeTable = [&](int64_t token, int64_t inputCycle,
+                                           bool mirror) {
               for (int64_t hemisphere = 0; hemisphere < memory.hemispheres;
                    ++hemisphere) {
                 for (int64_t byte = 0; byte < 4; ++byte) {
@@ -800,20 +910,23 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   emitMem(rewriter_, op_.getLoc(),
                           inputCycle - vxmInputReadLatency(slice),
                           hemisphere * memory.slices_per_hemisphere + slice,
-                          "read", layout.ropeAddress(token, pairBlock), stream,
-                          1, 1, 0, "sram", -1, ropeBank);
+                          "read",
+                          mirror
+                              ? layout.ropeMirrorAddress(token, pairBlock)
+                              : layout.ropeAddress(token, pairBlock),
+                          stream, 1, 1, 0, "sram", -1,
+                          mirror ? ropeMirrorBank : ropeBank);
                 }
               }
             };
             const auto emitProductWrites = [&](int64_t token,
                                                int64_t firstProduct,
                                                int64_t outputCycle) {
-              const int64_t laneOffset = (token % 2) * 8;
               for (int64_t slot = 0; slot < 2; ++slot) {
                 const int64_t product = firstProduct + slot;
                 for (int64_t byte = 0; byte < 2; ++byte) {
                   const int64_t slice =
-                      productSlices[laneOffset + product * 2 + byte];
+                      layout.ropeProductSlice(kind, product, token, byte);
                   const int64_t latency =
                       target_
                           .transport_latency(target::StreamEndpoint::VxmResult,
@@ -830,7 +943,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             layout.ropeProductAddress(kind, head, pairBlock,
                                                       product, token),
                             source * 8 + slot * 2 + byte, 1, 1, 0, "sram", -1,
-                            productBank);
+                            layout.ropeProductBank(kind, productBank,
+                                                   product));
                   }
                 }
               }
@@ -843,7 +957,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               const int64_t inputCycle = productAInput + token;
               emitSource(token, 0, 32, inputCycle);
               emitSource(token, 1, 36, inputCycle);
-              emitRopeTable(token, inputCycle);
+              emitRopeTable(token, inputCycle, false);
               emitProductWrites(token, 0, inputCycle + 2);
             }
 
@@ -856,13 +970,15 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               const int64_t inputCycle = productBInput + token;
               emitSource(token, 1, 32, inputCycle);
               emitSource(token, 0, 36, inputCycle);
-              emitRopeTable(token, inputCycle);
+              emitRopeTable(token, inputCycle, true);
               emitProductWrites(token, 2, inputCycle + 2);
             }
 
             const int64_t combineConfig = productBInput + op_.getSeqLen() + 1 +
-                                          maxProductWriteLatency +
-                                          maxProductReadLatency + 1;
+                                           maxProductWriteLatency +
+                                           maxProductReadLatency + 1;
+            if (firstCombineConfig < 0)
+              firstCombineConfig = combineConfig;
             const int64_t combineInput = combineConfig + 1;
             emitRopeCombine(combineConfig, inputHemisphere, outputHemisphere);
             for (int64_t token = 0; token < op_.getSeqLen(); ++token) {
@@ -870,11 +986,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               const int64_t rowBlock = (token % tile) / blockRows;
               const int64_t tokenLane = token % blockRows;
               const int64_t inputCycle = combineInput + token;
-              const int64_t laneOffset = (token % 2) * 8;
               for (int64_t product = 0; product < 4; ++product) {
                 for (int64_t byte = 0; byte < 2; ++byte) {
                   const int64_t slice =
-                      productSlices[laneOffset + product * 2 + byte];
+                      layout.ropeProductSlice(kind, product, token, byte);
                   for (int64_t hemisphere = 0; hemisphere < memory.hemispheres;
                        ++hemisphere)
                     emitMem(rewriter_, op_.getLoc(),
@@ -884,7 +999,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             layout.ropeProductAddress(kind, head, pairBlock,
                                                       product, token),
                             32 + hemisphere * 16 + product * 2 + byte, 1, 1, 0,
-                            "sram", -1, productBank);
+                            "sram", -1,
+                            layout.ropeProductBank(kind, productBank,
+                                                   product));
                 }
               }
               const int64_t outputCycle = inputCycle + 1;
@@ -931,12 +1048,20 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           }
           ropeEnd = std::max(ropeEnd, headEnd);
         }
-        phaseStart = std::max(
-            phaseStart, ropeEnd + target_.streams().system_register_columns);
+        postprocessReady =
+            ropeEnd + target_.streams().system_register_columns;
+        if (projectionRopeOverlap) {
+          phaseStart = std::max(phaseStart, nextProjectionStart);
+          projectionOverlapDeadline = firstCombineConfig;
+        } else {
+          phaseStart = std::max(phaseStart, postprocessReady);
+          projectionOverlapDeadline = -1;
+        }
       }
-      previousProjectionWeightRelease = currentProjectionWeightRelease;
+      residentWeights.push_back(
+          {weightPlacement, currentProjectionWeightRelease});
     }
-    return phaseStart + 16;
+    return std::max(phaseStart, postprocessReady) + 16;
   }
 
   const int64_t weightLoadLead =

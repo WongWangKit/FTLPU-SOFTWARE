@@ -237,6 +237,19 @@ def main() -> None:
         "ftlpu.tensor.swish_task", 'kind = "w8a16_mxm_weight_striped"',
         'kind = "fp16_mxm_distributed_16"',
     ), "Tensor")
+    for line in tensor.splitlines():
+        if "ftlpu.tensor.rms_norm_task" not in line:
+            continue
+        for legacy_layout in (
+                'kind = "fp16_vxm_row_parallel_8"',):
+            if legacy_layout in line:
+                raise AssertionError(
+                    f"RMSNorm retained an invalid partial-SXM layout: {line}"
+                )
+        if line.count('kind = "fp16_vxm_distributed_16"') < 2:
+            raise AssertionError(
+                f"RMSNorm scratch and gamma are not distributed16: {line}"
+            )
     if args.mxm_execution == "vector":
         validate_attention_output_allocation(tensor)
     if args.weight_bank is not None:

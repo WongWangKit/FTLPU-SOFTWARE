@@ -51,18 +51,26 @@ public:
         int64_t keyBlock, int64_t diagonal) const;
     int64_t valuePackAddress(int64_t head, int64_t reductionBlock,
         int64_t tokenBlock, int64_t row) const;
-    int64_t contextAddress(int64_t queryHead, int64_t token) const;
+    int64_t contextAddress(
+        int64_t queryHead, int64_t headBlock, int64_t token) const;
+    int64_t contextSlice(
+        int64_t queryHead, int64_t headBlock, int64_t byte) const;
     int64_t outputWeightAddress(int64_t outputGroup,
         int64_t reductionBlock, int64_t column) const;
     int64_t resultAddress(int64_t outputGroup, int64_t token) const;
     int64_t ropeAddress(int64_t token) const;
     int64_t ropeAddress(int64_t token, int64_t frequencyBlock) const;
+    int64_t ropeMirrorAddress(int64_t token, int64_t frequencyBlock) const;
     int64_t ropeStagingAddress(AttentionProjectionKind projection,
         int64_t head, int64_t half, int64_t tokenBlock,
         int64_t row) const;
     int64_t ropeProductAddress(AttentionProjectionKind projection,
         int64_t head, int64_t pairBlock, int64_t product,
         int64_t token) const;
+    int64_t ropeProductSlice(AttentionProjectionKind projection,
+        int64_t product, int64_t token, int64_t byte) const;
+    int64_t ropeProductBank(AttentionProjectionKind projection,
+        int64_t baseBank, int64_t product) const;
 
     llvm::ArrayRef<int64_t> weightSlices() const { return weightSlices_; }
     llvm::ArrayRef<int64_t> outputWeightSlices() const { return outputWeightSlices_; }
@@ -80,6 +88,9 @@ public:
     }
     llvm::ArrayRef<int64_t> ropeProductSlices() const {
         return ropeProductSlices_;
+    }
+    llvm::ArrayRef<int64_t> ropeProductKeySlices() const {
+        return ropeProductKeySlices_;
     }
     llvm::ArrayRef<int64_t> scaledScoreSlices(int64_t localMxm) const {
         return scaledScoreSlices_.at(static_cast<std::size_t>(localMxm));
@@ -106,6 +117,8 @@ public:
     llvm::ArrayRef<int64_t> probabilityDiagonalSlices() const { return probabilityDiagonalSlices_; }
     llvm::ArrayRef<int64_t> valuePackSlices(int64_t reductionBlock) const;
     llvm::ArrayRef<int64_t> contextSlices() const { return contextSlices_; }
+    bool contextHeadBlockPacked() const { return contextHeadBlockPacked_; }
+    bool contextHemispherePaired() const { return contextHemispherePaired_; }
 
 private:
     struct WeightPagingLayout {
@@ -142,7 +155,10 @@ private:
     std::array<int64_t, 2> keyBanks_ {0, 0};
     std::array<int64_t, 4> ropeSlices_ {};
     std::array<int64_t, 16> ropeStagingSlices_ {};
-    std::array<int64_t, 16> ropeProductSlices_ {};
+    llvm::SmallVector<int64_t, 16> ropeProductSlices_;
+    llvm::SmallVector<int64_t, 4> ropeProductKeySlices_;
+    int64_t ropeProductKeyBank_ = -1;
+    bool ropeProductBankInterleaved_ = false;
     // Each local MXM owns an independent softmax scratch plane. This permits
     // the two work items in a hemisphere wave to use VXM concurrently.
     std::array<std::array<int64_t, 4>, 2> scaledScoreSlices_ {{{{8, 9, 10, 11}}, {{0, 1, 2, 3}}}};
@@ -157,7 +173,10 @@ private:
         {{18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35}},
     }};
     std::array<int64_t, 8> contextSlices_ {44, 45, 46, 47, 48, 49, 50, 51};
+    bool contextHeadBlockPacked_ = false;
+    bool contextHemispherePaired_ = false;
     int64_t ropeBase_ = 7000;
+    int64_t ropeMirrorBase_ = 7000;
     int64_t ropeStagingBase_ = 0;
     int64_t ropeProductBase_ = 0;
     int64_t queryIwBase_ = 7600;

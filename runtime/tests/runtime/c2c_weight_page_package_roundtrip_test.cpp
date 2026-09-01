@@ -32,7 +32,6 @@ void configureSystem(
     cmodelHardware.vxm_alus = hardware.vxm_alus;
     cmodelHardware.c2c_streams_per_direction =
         hardware.c2c_streams_per_direction;
-    cmodelHardware.c2c_dedicated_streams = true;
     cmodelHardware.mxm_local_dequant_enabled =
         hardware.mxm_local_dequant_enabled != 0;
     cmodelHardware.mxm_weight_activation_overlap_enabled =

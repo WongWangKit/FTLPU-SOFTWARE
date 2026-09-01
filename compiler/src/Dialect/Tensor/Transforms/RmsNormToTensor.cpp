@@ -140,7 +140,8 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             || !target.is_activation_storage_slice(feedbackWeightSliceBase)
             || !target.is_activation_storage_slice(
                 feedbackWeightSliceBase + 1)) {
-            op.emitError("feedback RMSNorm gamma is not assigned to an activation slice pair");
+            op.emitError(
+                "feedback RMSNorm gamma is not assigned to an activation slice pair");
             return mlir::failure();
         }
         distributedWeightBindingSlices.push_back(feedbackWeightSliceBase);
@@ -168,10 +169,12 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         ? fixed_allocation(PlacementKind::Activation,
               distributedWeightBindingSlices,
               feedbackWeightBaseRow,
-              hidden, hidden * 2,
+              target.uses_dedicated_slice_roles()
+                  ? hidden : hidden / throughput.lanes_per_tile,
+              hidden * 2,
               target.uses_dedicated_slice_roles()
                   ? "fp16_vxm_gamma_broadcast"
-                  : "fp16_vxm_row_parallel_8",
+                  : "fp16_vxm_distributed_16",
               "both",
               target.uses_dedicated_slice_roles()
                   ? feedbackWeightBank
@@ -208,30 +211,30 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
                 "disjoint from canonical MXM output");
             return mlir::failure();
         }
+        const int64_t distributedRows =
+            rows * hidden / (tile * throughput.lanes_per_tile);
         const int64_t tokenBlocks = rows / tile;
-        const int64_t rowParallelRows =
-            ((tokenBlocks + 7) / 8) * hidden;
-        const int64_t scalarRows = 2 * ((tokenBlocks + 7) / 8);
         const int64_t firstScratchBase =
             target.uses_dedicated_slice_roles() ? 0 : 4608;
         const int64_t normalizedScratchBase =
             target.uses_dedicated_slice_roles()
             ? preservesInput ? input.base_row + input.row_span : 0
             : 5632;
-        if (normalizedScratchBase + rowParallelRows + scalarRows
+        if (normalizedScratchBase + distributedRows
             > memory.words_per_bank) {
             op.emitError(
                 "RMSNorm normalized scratch does not fit after the live input");
             return mlir::failure();
         }
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
-            feedbackInputSlices, firstScratchBase, rowParallelRows,
-            matrixBytes, "fp16_vxm_row_parallel_8", "both",
+            feedbackInputSlices, firstScratchBase,
+            distributedRows + tokenBlocks,
+            matrixBytes + rows * 2, "fp16_vxm_distributed_16", "both",
             target.uses_dedicated_slice_roles() ? resultBank : workingBank));
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
             normalizedSlices, normalizedScratchBase,
-            rowParallelRows + scalarRows, matrixBytes + rows * 4,
-            "fp16_vxm_row_parallel_8", "both",
+            distributedRows, matrixBytes,
+            "fp16_vxm_distributed_16", "both",
             target.uses_dedicated_slice_roles() ? inputBank : workingBank));
     } else {
         scratch.push_back(fixed_allocation(PlacementKind::VxmResult,

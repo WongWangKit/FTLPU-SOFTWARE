@@ -32,17 +32,6 @@ void emitWavefrontBeat(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::ArrayRef<int64_t> destinationStreams,
     llvm::StringRef weightLayout = "vector_columns");
 
-// Captures one block and drains it completely before the transpose bank is
-// reused. Use this for materialized MEM destinations that are not consumed as
-// one continuous functional-unit wavefront.
-void emitBufferedWavefrontBeat(mlir::IRRewriter& rewriter,
-    mlir::Location location, const target::LPUTargetModel& target,
-    int64_t cycle, int64_t hemisphere, int64_t diagonal,
-    llvm::ArrayRef<int64_t> sourceStreams,
-    llvm::ArrayRef<int64_t> transposeStreams,
-    llvm::ArrayRef<int64_t> destinationStreams,
-    llvm::StringRef weightLayout = "vector_columns");
-
 // Drains a northbound wave already resident in the transpose buffer.
 void emitWavefrontTail(mlir::IRRewriter& rewriter, mlir::Location location,
     const target::LPUTargetModel& target, int64_t cycle,

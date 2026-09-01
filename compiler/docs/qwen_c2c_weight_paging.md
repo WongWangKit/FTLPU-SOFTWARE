@@ -30,13 +30,11 @@ the C2C path. Device-resident aliases between decoder layers remain internal.
   a target-configurable external pool, defaulting to 8 lanes per direction. A
   lane transfers one complete 32-byte vector per cycle, for a default external
   bandwidth of `8 x 32 = 256 bytes/cycle` per direction.
-- The current `ModelSession` uses dedicated C2C lanes in addition to the 32
-  ordinary compute streams. An RX command carries the destination hemisphere,
-  slice, bank, and row, and the target MEM receiver commits SRAM. Every byte
-  must still arrive through DDR DMA and C2C; the host cannot write LPU MEM
-  directly. An optional shared-SR mode maps lanes to `W24..W31` and consumes
-  them with ordinary MEM `Write`, but it is not used for current fine-grained
-  overlapped paging.
+- `ModelSession` maps the external lanes onto ordinary west streams
+  (`W24..W31` for eight lanes). C2C RX injects each vector into that shared SR
+  fabric; a point-notified target MEM ICU issues the normal `Write` that commits
+  SRAM. There is no direct-to-SRAM C2C receive path, and the host cannot write
+  LPU MEM directly.
 - Page readiness means that the final target-SRAM write committed,
   not merely that DMA placed the final vector in an RX FIFO.
 
@@ -62,9 +60,9 @@ functional unit and are sized by `mxm_accumulator_blocks`; no MEM slice is
 configured as an accumulator. Both SRAM banks keep the same slice role.
 Feedback RMSNorm stores layer gamma in two activation-side slices and reads it
 through two low-numbered west streams per hemisphere. Its data path remains
-below `W16`, while the pager uses independent dedicated C2C lanes and writes
-high-slice weight SRAM ports. Separating both stream and slice/port resources
-permits overlap; neither path may bypass the external C2C boundary.
+below `W16`, while the pager uses ordinary `W24..W31` and writes high-slice
+weight SRAM ports. Separating stream IDs and slice/port resources permits
+overlap; neither path may bypass the external C2C boundary.
 
 This partition removes transport and port conflicts; it does not increase
 capacity. For Qwen2.5-1.5B FFN at sequence length 32, the generic Vector planner

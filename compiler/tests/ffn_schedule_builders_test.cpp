@@ -73,14 +73,11 @@ int main() try
             == projection->blocks.front().weight_compute_cycle,
         "FFN projection dequant lead is incorrect");
     const int64_t expectedProjectionSlot =
-        (projection->m_tile_count - 1)
-            * projection->pipelined_block_interval
-        + target.mxm_first_result_latency()
-        + target.mxm_result_window_cycles(
-            target.throughput().mxm_rows);
+        projection->m_tile_count
+        * projection->pipelined_block_interval;
     require(projection->projection_slot_interval
             == expectedProjectionSlot,
-        "FFN projection slot does not include the MXM result drain");
+        "FFN projection slot does not match back-to-back MXM issue");
     auto localDequantProjection = schedule::planFfnProjectionTimeline(
         {32, 576, 1536, 576}, weightSlices, target, true);
     require(mlir::succeeded(localDequantProjection),
@@ -94,6 +91,26 @@ int main() try
                 + target.throughput().mxm_rows
                 + target.mxm_first_result_latency(),
         "local-dequant FFN reused a live MXM weight buffer");
+    auto singleMxmThroughput = target.throughput();
+    singleMxmThroughput.mxms_per_hemisphere = 1;
+    singleMxmThroughput.mxm_weight_buffers = 2;
+    singleMxmThroughput.mxm_local_dequant_enabled = 1;
+    target::LPUTargetModel singleMxmTarget(
+        target.memory(), target.streams(), singleMxmThroughput);
+    auto singleMxmProjection = schedule::planFfnProjectionTimeline(
+        {32, 576, 1536, 576}, weightSlices, singleMxmTarget, true);
+    require(mlir::succeeded(singleMxmProjection)
+            && singleMxmProjection->blocks.size() > 1,
+        "single-MXM local-dequant FFN projection timeline failed");
+    require(singleMxmProjection->blocks[1].dequant_start
+            >= singleMxmProjection->blocks[0].tiles.back().compute_cycle
+                + singleMxmTarget.mxm_result_window_cycles(
+                    singleMxmThroughput.mxm_rows),
+        "single-MXM FFN overwrote a fixed projection weight buffer");
+    require(singleMxmProjection->blocks[1].weight_compute_cycle
+            - singleMxmProjection->blocks[0].weight_compute_cycle
+            == singleMxmProjection->weight_block_interval,
+        "single-MXM FFN delayed compute instead of retiming weight load");
     for (const auto& block : projection->blocks) {
         for (const auto& tile : block.tiles) {
             for (const auto& hemisphere : tile.hemisphere_segments) {
@@ -138,13 +155,7 @@ int main() try
             == down->phase_start + projection->initial_compute_cycle,
         "FFN down timeline has the wrong phase offset");
     const int64_t expectedDownReductionInterval =
-        target.throughput().mxms_per_hemisphere == 1
-        ? std::max(projection->weight_block_interval,
-              projection->projection_slot_interval
-                  + 2 * target.throughput().mxm_rows
-                  - projection->weight_load_cycles
-                  + target.mxm_first_result_latency())
-        : projection->weight_block_interval;
+        projection->weight_block_interval;
     require(down->reduction_interval == expectedDownReductionInterval
             && down->pair_transition_interval
                 >= down->reduction_interval,
@@ -170,6 +181,22 @@ int main() try
     }
     require(sawLocalDequantPrefetch,
         "FFN down timeline did not exercise weight prefetch");
+
+    auto singleMxmDown = schedule::planFfnDownProjectionTimeline(
+        {32, 576, 1536, 576}, *singleMxmProjection, 1000,
+        weightSlices, hiddenSlices, resultSlices, singleMxmTarget);
+    require(mlir::succeeded(singleMxmDown)
+            && singleMxmDown->blocks.size() > 1,
+        "single-MXM local-dequant FFN down timeline failed");
+    require(singleMxmDown->blocks[1].dequant_start
+            >= singleMxmDown->blocks[0].tiles.back().compute_cycle
+                + singleMxmTarget.mxm_result_window_cycles(
+                    singleMxmThroughput.mxm_rows),
+        "single-MXM FFN down overwrote a fixed weight buffer");
+    require(singleMxmDown->blocks[1].weight_compute_cycle
+            - singleMxmDown->blocks[0].weight_compute_cycle
+            == singleMxmDown->reduction_interval,
+        "single-MXM FFN down delayed compute instead of retiming weight load");
 
     auto exploredStreams = target.streams();
     exploredStreams.streams_per_direction = 40;

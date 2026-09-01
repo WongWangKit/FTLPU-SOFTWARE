@@ -160,6 +160,14 @@ try {
                   << " resource="
                   << ftlpu::software::runtime::queue_kind_name(key.second)
                   << " count=" << count << '\n';
+    std::cout << "binary weight_page_uses="
+              << program.weight_page_uses.size() << '\n';
+    for (const auto& use : program.weight_page_uses)
+        std::cout << "binary weight_page_use binding=" << use.binding_index
+                  << " page=" << use.page_index
+                  << " bank=" << use.bank
+                  << " ready_cycle=" << use.ready_cycle
+                  << " release_cycle=" << use.release_cycle << '\n';
     const std::size_t reported = reportAllQueues
         ? queues.size() : std::min<std::size_t>(queues.size(), 20);
     for (std::size_t i = 0; i < reported; ++i) {
@@ -289,6 +297,8 @@ try {
                   << " role=" << binding.role
                   << " name=" << binding.name
                   << " layout=" << static_cast<unsigned>(binding.layout)
+                  << " bytes=" << binding.byte_size
+                  << " page_count=" << binding.page_count
                   << " base_row=" << binding.base_row
                   << " rows=" << binding.instruction_count
                   << " bank=" << binding.bank

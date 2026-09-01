@@ -20,11 +20,25 @@ int main()
         0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33};
     constexpr std::array<int64_t, 16> kSecondReduction {
         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35};
-    if (target.attention_query_iw_slices(0) != kFirstReduction
-        || target.attention_query_iw_slices(1) != kSecondReduction)
+    constexpr std::array<int64_t, 16> kDedicatedReduction {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    constexpr std::array<int64_t, 16> kDualFirstReduction {
+        44, 45, 46, 47, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33};
+    constexpr std::array<int64_t, 16> kDualSecondReduction {
+        18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35};
+    const auto& expectedFirst = target.uses_dedicated_slice_roles()
+        ? kDedicatedReduction
+        : target.throughput().mxms_per_hemisphere == 1
+        ? kFirstReduction : kDualFirstReduction;
+    const auto& expectedSecond = target.uses_dedicated_slice_roles()
+        ? kDedicatedReduction
+        : target.throughput().mxms_per_hemisphere == 1
+        ? kSecondReduction : kDualSecondReduction;
+    if (target.attention_query_iw_slices(0) != expectedFirst
+        || target.attention_query_iw_slices(1) != expectedSecond)
         throw std::logic_error("query IW physical slice map diverges from CModel");
-    if (target.attention_query_iw_slices(2) != kFirstReduction
-        || target.attention_query_iw_slices(3) != kSecondReduction)
+    if (target.attention_query_iw_slices(2) != expectedFirst
+        || target.attention_query_iw_slices(3) != expectedSecond)
         throw std::logic_error(
             "query IW bank reuse does not support a 128-wide head");
     if (target.attention_query_iw_base_row() != 7600
@@ -86,9 +100,9 @@ int main()
             partitioned.ffn_projection_weight_slices(
                 ftlpu::compiler::target::FfnProjectionKind::Up))
         || !allWeightSlicesAreLocalToMxm(
-            partitioned.ffn_down_projection_weight_slices(false))
+            partitioned.ffn_down_projection_weight_slices())
         || !allWeightSlicesAreLocalToMxm(
-            partitioned.page_resident_attention_weight_slices(false)))
+            partitioned.page_resident_attention_weight_slices()))
         throw std::logic_error("weight plane escaped the MXM-local slice pool");
     for (int64_t slice : partitioned.attention_query_iw_slices(0))
         if (!partitioned.is_activation_storage_slice(slice))
