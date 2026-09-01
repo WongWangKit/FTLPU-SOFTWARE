@@ -81,8 +81,16 @@ def main() -> None:
         'accumulator_clear = true',
     }
     qkv_interval: tuple[int, int] | None = None
-    rope_product_intervals: list[tuple[int, int]] = []
+    direct_rope_intervals: list[tuple[int, int]] = []
+    direct_rope_fma = False
+    direct_rope_fms = False
     mxm_compute_intervals: list[tuple[int, int]] = []
+    host_preloaded_allocations: list[
+        tuple[str, int, int, int, frozenset[int]]
+    ] = []
+    initialized_allocations: list[
+        tuple[str, int, int, int, frozenset[int]]
+    ] = []
     with schedule.open(encoding="utf-8") as source:
         for line in source:
             schedule_markers = {
@@ -97,10 +105,54 @@ def main() -> None:
                     )
                 if all(marker in line for marker in (
                     'queue = 0 : i64', 'opcode = "multiply"',
-                    'lhs_index = 32 : i64', 'rhs_index = 34 : i64',
+                    'lhs_index = 32 : i64', 'rhs_index = 40 : i64',
+                    'lhs_stream_source = "east"',
+                    'rhs_stream_source = "east"',
                     'repeat_count = 32 : i64',
                 )):
-                    rope_product_intervals.extend(repeated_intervals(line))
+                    direct_rope_intervals.extend(repeated_intervals(line))
+                if all(marker in line for marker in (
+                    'queue = 1 : i64', 'opcode = "fms"',
+                    'lhs_stream_source = "west"',
+                    'rhs_stream_source = "east"',
+                    'output_stream = 0 : i64',
+                )):
+                    direct_rope_fms = True
+                if all(marker in line for marker in (
+                    'queue = 3 : i64', 'opcode = "fma"',
+                    'lhs_stream_source = "east"',
+                    'rhs_stream_source = "east"',
+                    'output_stream = 2 : i64',
+                )):
+                    direct_rope_fma = True
+                if all(marker in line for marker in (
+                    'opcode = "multiply"', 'lhs_index = 32 : i64',
+                    'rhs_index = 34 : i64',
+                    'repeat_count = 32 : i64',
+                )):
+                    raise AssertionError(
+                        "Schedule retained the legacy MEM-staged RoPE product path: "
+                        f"{line.strip()}"
+                    )
+            if "ftlpu.schedule.binding" in line:
+                slices_match = re.search(r"slices = \[([^\]]+)\]", line)
+                if slices_match:
+                    name_match = re.search(r'name = "([^"]+)"', line)
+                    allocation = (
+                        name_match.group(1) if name_match else line.split("=")[0].strip(),
+                        integer_attr(line, "bank"),
+                        integer_attr(line, "base_row"),
+                        integer_attr(line, "instruction_count"),
+                        frozenset(int(value) for value in
+                                  re.findall(r"\d+", slices_match.group(1))),
+                    )
+                    if ('access = "input"' in line
+                            and "paged_weight = true" not in line):
+                        host_preloaded_allocations.append(allocation)
+                    if ('access = "internal"' in line
+                            and 'initializer = "none"' not in line
+                            and "initializer =" in line):
+                        initialized_allocations.append(allocation)
             if ('ftlpu.schedule.timeline' in line
                     and 'name = "qkv"' in line):
                 qkv_interval = (
@@ -138,27 +190,46 @@ def main() -> None:
         raise AssertionError(
             f"Schedule IR is missing {sorted(schedule_markers)}"
         )
+    for host in host_preloaded_allocations:
+        for initialized in initialized_allocations:
+            host_name, host_bank, host_base, host_rows, host_slices = host
+            init_name, init_bank, init_base, init_rows, init_slices = initialized
+            rows_overlap = (host_base < init_base + init_rows
+                            and init_base < host_base + host_rows)
+            if (host_bank == init_bank and rows_overlap
+                    and not host_slices.isdisjoint(init_slices)):
+                raise AssertionError(
+                    "host-preloaded binding aliases an initialized constant: "
+                    f"{host_name} and {init_name} share bank {host_bank}, "
+                    f"slices {sorted(host_slices & init_slices)}, rows "
+                    f"[{max(host_base, init_base)}, "
+                    f"{min(host_base + host_rows, init_base + init_rows)})"
+                )
     if qkv_interval is None:
         raise AssertionError("Schedule IR is missing the QKV timeline")
+    if not direct_rope_fma or not direct_rope_fms:
+        raise AssertionError(
+            "Schedule IR is missing the direct MXM-to-VXM RoPE FMA/FMS chains"
+        )
     qkv_mxm_intervals = [
         interval for interval in mxm_compute_intervals
         if interval[0] < qkv_interval[1] and interval[1] > qkv_interval[0]
     ]
     overlaps = [
         (rope, mxm)
-        for rope in rope_product_intervals
+        for rope in direct_rope_intervals
         for mxm in qkv_mxm_intervals
         if max(rope[0], mxm[0]) < min(rope[1], mxm[1])
     ]
     if not overlaps:
         raise AssertionError(
-            "QKV schedule does not overlap any VXM RoPE product window with "
+            "QKV schedule does not overlap any direct VXM RoPE window with "
             "an MXM projection compute window"
         )
     first_rope, first_mxm = overlaps[0]
     print(
-        "QKV/RoPE overlap: "
-        f"{len({rope for rope, _ in overlaps})} RoPE windows; "
+        "QKV/direct-RoPE overlap: "
+        f"{len({rope for rope, _ in overlaps})} direct RoPE windows; "
         f"first RoPE {first_rope} with MXM {first_mxm}",
         flush=True,
     )

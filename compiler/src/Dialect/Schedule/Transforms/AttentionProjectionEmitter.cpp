@@ -167,8 +167,16 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       };
   const int64_t alternateProductBank =
       (productBank + 1) % target_.memory().banks_per_slice;
+  const bool directRopeCapable =
+      target_.uses_dedicated_slice_roles() &&
+      target_.memory().banks_per_slice > 1 &&
+      target_.activation_storage_slices().size() >= 20 &&
+      target_.throughput().vxm_cross_hemisphere_streams_enabled != 0 &&
+      target_.throughput().vxm_fma_enabled != 0 &&
+      target_.throughput().vxm_alus >= 4 &&
+      target_.memory().hemispheres == 2 && projectionHeadBlocks == 4;
   const bool projectionRopeOverlap =
-      inputDistributed16 &&
+      !directRopeCapable && inputDistributed16 &&
       overlapActivationStreamBase + 2 <=
           target_.streams().streams_per_direction &&
       !productConflictsWithInput(productBank,
@@ -419,8 +427,15 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 // larger MEM result address space.
                 const int64_t accumulatorAddress =
                     tokenBlock * tile + half * accumulatorHalfStride;
+                const int64_t resultStreamBase =
+                    directRopeCapable && finalReduction &&
+                            kind != AttentionProjectionKind::Value &&
+                            hemisphere == 1
+                        ? target_.streams().streams_per_direction / 2
+                        : 0;
                 emitMxm(rewriter_, op_.getLoc(), computeCycle, hemisphere,
-                        "compute", weightBuffer, 0, activationStreamBase, 0,
+                        "compute", weightBuffer, 0, activationStreamBase,
+                        resultStreamBase,
                         tile, 1,
                         accumulatorAddress, 1,
                         finalReduction ? "stream" : "sram", finalReduction,
@@ -435,6 +450,130 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       computeCycle + target_.mxm_first_result_latency() +
                       offset;
                   if (kind != AttentionProjectionKind::Value) {
+                    if (directRopeCapable) {
+                      if (hemisphere != 0)
+                        continue;
+
+                      const int64_t vxmInputCycle =
+                          computeCycle +
+                          target_.throughput().accumulator_to_vxm_latency +
+                          offset;
+                      if (offset == 0) {
+                        const int64_t configCycle = vxmInputCycle - 1;
+                        emitVxmConfigured(
+                            rewriter_, op_.getLoc(),
+                            projectionValues[projection], configCycle, 0,
+                            "multiply", streamKind, 32, 0.0f, streamKind, 40,
+                            0.0f, "fp32", -1, "east", "east", -1, 2, tile,
+                            1, "east", "east");
+                        emitVxmConfigured(
+                            rewriter_, op_.getLoc(),
+                            projectionValues[projection], configCycle, 1,
+                            "fms", streamKind, 32, 0.0f, streamKind, 42,
+                            0.0f, dataFormat, 0, "east", "east", -1, 2, tile,
+                            1, "west", "east");
+                        emitVxmConfigured(
+                            rewriter_, op_.getLoc(),
+                            projectionValues[projection], configCycle, 2,
+                            "multiply", streamKind, 32, 0.0f, streamKind, 40,
+                            0.0f, "fp32", -1, "east", "east", -1, 2, tile,
+                            1, "west", "east");
+                        emitVxmConfigured(
+                            rewriter_, op_.getLoc(),
+                            projectionValues[projection], configCycle, 3,
+                            "fma", streamKind, 32, 0.0f, streamKind, 42,
+                            0.0f, dataFormat, 2, "east", "east", -1, 2, tile,
+                            1, "east", "east");
+                      }
+
+                      const bool useMirrorTable =
+                          kind == AttentionProjectionKind::Key;
+                      const auto ropeSlices = useMirrorTable
+                                                  ? layout.ropeMirrorSlices()
+                                                  : layout.ropeSlices();
+                      const int64_t directRopeBank = useMirrorTable
+                                                         ? layout.ropeMirrorBank()
+                                                         : layout.ropeBank();
+                      for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t cosineSlice =
+                            ropeSlices[byte];
+                        emitMem(rewriter_, op_.getLoc(),
+                                vxmInputCycle -
+                                    vxmInputReadLatency(cosineSlice),
+                                cosineSlice, "read",
+                                useMirrorTable
+                                    ? layout.ropeMirrorAddress(token, half)
+                                    : layout.ropeAddress(token, half),
+                                40 + byte, 1, 1, 0, "sram", -1,
+                                directRopeBank);
+                        const int64_t sineSlice =
+                            ropeSlices[2 + byte];
+                        emitMem(rewriter_, op_.getLoc(),
+                                vxmInputCycle -
+                                    vxmInputReadLatency(sineSlice),
+                                sineSlice, "read",
+                                useMirrorTable
+                                    ? layout.ropeMirrorAddress(token, half)
+                                    : layout.ropeAddress(token, half),
+                                42 + byte, 1, 1, 0, "sram", -1,
+                                directRopeBank);
+                      }
+
+                      const int64_t tokenLane =
+                          token % target_.throughput().mxm_block_rows;
+                      const int64_t rowBlock =
+                          (token % tile) /
+                          target_.throughput().mxm_block_rows;
+                      const int64_t blocks[] = {half, half + 2};
+                      const int64_t outputCycle = vxmInputCycle + 3;
+                      for (int64_t outputHalf = 0; outputHalf < 2;
+                           ++outputHalf) {
+                        const int64_t reduction = blocks[outputHalf];
+                        for (int64_t byte = 0; byte < 2; ++byte) {
+                          const int64_t slice =
+                              kind == AttentionProjectionKind::Query
+                                  ? layout.queryIwSlices(reduction)
+                                        [2 * tokenLane + byte]
+                                  : layout.keySlices(reduction)[byte];
+                          const int64_t latency =
+                              target_
+                                  .transport_latency(
+                                      target::StreamEndpoint::VxmResult,
+                                      target::StreamEndpoint::Mem,
+                                      target::StreamDirection::East, slice)
+                                  .value_or(readLatency(slice));
+                          for (int64_t destination = 0;
+                               destination < target_.memory().hemispheres;
+                               ++destination) {
+                            const int64_t source = 1 - destination;
+                            const int64_t bank =
+                                kind == AttentionProjectionKind::Query
+                                    ? layout.queryIwBank(reduction)
+                                    : layout.keyBank(reduction);
+                            emitMem(
+                                rewriter_, op_.getLoc(),
+                                outputCycle + latency,
+                                destination *
+                                        target_.memory()
+                                            .slices_per_hemisphere +
+                                    slice,
+                                "write",
+                                kind == AttentionProjectionKind::Query
+                                    ? layout.queryIwAddress(
+                                          head, reduction, tokenBlock,
+                                          rowBlock)
+                                    : layout.keyAddress(head, reduction,
+                                                        tokenBlock) +
+                                          token % tile,
+                                source * 8 + outputHalf * 2 + byte, 1, 1, 0,
+                                "sram", -1, bank);
+                            rawWriteEnd = std::max(
+                                rawWriteEnd, outputCycle + latency + 1);
+                          }
+                        }
+                      }
+                      continue;
+                    }
                     const int64_t packedStream = (token % 8) * 2;
                     const int64_t row = (token % tile) / 8;
                     for (int64_t byte = 0; byte < 2; ++byte) {
@@ -552,6 +691,13 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 std::max(copyCycle, copyEnd + maxStagingReadLatency + 1);
           }
           phaseStart = std::max(copyCycle + 1, copyEnd);
+          postprocessReady = phaseStart;
+          projectionOverlapDeadline = -1;
+          continue;
+        }
+
+        if (directRopeCapable) {
+          phaseStart = std::max(phaseStart, rawWriteEnd);
           postprocessReady = phaseStart;
           projectionOverlapDeadline = -1;
           continue;

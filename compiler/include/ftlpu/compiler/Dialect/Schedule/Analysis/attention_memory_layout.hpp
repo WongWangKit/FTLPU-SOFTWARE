@@ -83,6 +83,11 @@ public:
     int64_t outputWeightBank() const;
     llvm::ArrayRef<int64_t> activationSlices() const { return activationSlices_; }
     llvm::ArrayRef<int64_t> ropeSlices() const { return ropeSlices_; }
+    int64_t ropeBank() const { return ropeBank_; }
+    llvm::ArrayRef<int64_t> ropeMirrorSlices() const {
+        return ropeMirrorSlices_;
+    }
+    int64_t ropeMirrorBank() const { return ropeMirrorBank_; }
     llvm::ArrayRef<int64_t> ropeStagingSlices() const {
         return ropeStagingSlices_;
     }
@@ -154,6 +159,9 @@ private:
     std::array<int64_t, 2> queryIwBanks_ {0, 0};
     std::array<int64_t, 2> keyBanks_ {0, 0};
     std::array<int64_t, 4> ropeSlices_ {};
+    int64_t ropeBank_ = 0;
+    std::array<int64_t, 4> ropeMirrorSlices_ {};
+    int64_t ropeMirrorBank_ = 0;
     std::array<int64_t, 16> ropeStagingSlices_ {};
     llvm::SmallVector<int64_t, 16> ropeProductSlices_;
     llvm::SmallVector<int64_t, 4> ropeProductKeySlices_;

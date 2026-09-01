@@ -261,7 +261,8 @@ LogicalResult VxmOp::verify()
     const auto opcode = getOpcode();
     if (opcode != "pass" && opcode != "bypass" && opcode != "cast"
         && opcode != "add" && opcode != "subtract"
-        && opcode != "multiply" && opcode != "negate"
+        && opcode != "multiply" && opcode != "fma" && opcode != "fms"
+        && opcode != "negate"
         && opcode != "max" && opcode != "exp"
         && opcode != "reciprocal" && opcode != "rsqrt")
         return emitOpError("contains an unsupported hardware VXM opcode");
@@ -275,6 +276,24 @@ LogicalResult VxmOp::verify()
     };
     if (!valid_kind(getLhsKind()) || !valid_kind(getRhsKind()))
         return emitOpError("contains an invalid operand kind");
+    const auto isStreamOperand = [](StringRef kind) {
+        return kind == "stream_i8" || kind == "stream_f16"
+            || kind == "stream_bf16" || kind == "stream_f32";
+    };
+    const auto validStreamSource = [&](StringRef kind,
+                                       llvm::StringRef attributeName) {
+        const auto source =
+            (*this)->getAttrOfType<mlir::StringAttr>(attributeName);
+        if (!source) return true;
+        return isStreamOperand(kind)
+            && (source.getValue() == "local"
+                || source.getValue() == "east"
+                || source.getValue() == "west");
+    };
+    if (!validStreamSource(getLhsKind(), "lhs_stream_source")
+        || !validStreamSource(getRhsKind(), "rhs_stream_source"))
+        return emitOpError(
+            "stream source must be local/east/west and requires a stream operand");
     const auto valid_operand = [&](StringRef kind, int64_t index) {
         if (kind == "immediate") return index == 0;
         if (kind == "previous" || kind == "original"
@@ -294,6 +313,14 @@ LogicalResult VxmOp::verify()
             << getQueue() << ", opcode=" << getOpcode()
             << ", lhs=" << getLhsKind() << "(" << getLhsIndex() << ")"
             << ", rhs=" << getRhsKind() << "(" << getRhsIndex() << ")";
+    const bool fused = opcode == "fma" || opcode == "fms";
+    const bool chainHead = getQueue() % chainDepth == 0;
+    if (fused
+        && (chainHead || (getQueue() - 1) % chainDepth != 0
+            || !isStreamOperand(getLhsKind())
+            || !isStreamOperand(getRhsKind())))
+        return emitOpError(
+            "fma/fms must immediately follow a VXM chain head and use two stream operands");
     const int64_t output = getOutputStreamAttr().getInt();
     if (output < -1 || output >= target.streams().encoded_streams)
         return emitOpError("contains an invalid output stream");

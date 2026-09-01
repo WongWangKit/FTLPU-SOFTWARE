@@ -532,7 +532,10 @@ try {
             throw std::runtime_error("cannot open FTLPU_CMODEL_LOG path");
         cmodelLogSink = &cmodelLog;
     }
-    runtime.run_cycles(attentionPrepackEndCycle, cmodelLogSink);
+    const bool scopedCmodelLog =
+        std::getenv("FTLPU_CMODEL_LOG_START") != nullptr;
+    runtime.run_cycles(attentionPrepackEndCycle,
+        scopedCmodelLog ? nullptr : cmodelLogSink);
     float prepackMaxError = 0.0f;
     std::size_t prepackMaxRow = 0;
     std::size_t prepackMaxColumn = 0;
@@ -623,7 +626,9 @@ try {
             + " max_errors=" + arrayValues(prepackHemisphereMaxErrors));
     const std::size_t qkvEndCycle =
         static_cast<std::size_t>(timeline(program, "qk").start_cycle);
-    runtime.run_cycles(qkvEndCycle - attentionPrepackEndCycle);
+    runtime.run_cycles(
+        qkvEndCycle - attentionPrepackEndCycle,
+        scopedCmodelLog ? nullptr : cmodelLogSink);
     const auto valueBinding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
         [](const auto& binding) {
@@ -640,6 +645,24 @@ try {
             "decoder binary is missing attention value metadata");
     const std::size_t valueSliceGroups =
         valueBinding->slices.size() / 16;
+    const auto readPackedValue = [&](std::size_t head,
+                                     std::size_t token,
+                                     std::size_t dimension,
+                                     ftlpu::Hemisphere hemisphere) {
+        const std::size_t headBlock = dimension / 32;
+        const std::size_t sliceGroup =
+            (headBlock % valueSliceGroups) * 16;
+        const std::size_t packedStream = (token % 8) * 2;
+        const std::size_t address =
+            static_cast<std::size_t>(valueBinding->base_row)
+            + (head * kHeadBlocks + headBlock)
+                * kTokenBlocks * kTileRows
+            + (token % 32) / 8;
+        return physicalBf16(hemisphere,
+            valueBinding->slices[sliceGroup + packedStream],
+            valueBinding->slices[sliceGroup + packedStream + 1],
+            address, dimension % 32, valueBinding->bank);
+    };
     const auto contextBinding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
         [](const auto& binding) {
@@ -660,6 +683,43 @@ try {
                 : contextBinding->slices.size() < 2 * kHeadBlocks))
         throw std::logic_error(
             "decoder binary is missing attention context metadata");
+    float valueTensorMaxError = 0.0f;
+    std::size_t valueTensorMaxHead = 0;
+    std::size_t valueTensorMaxToken = 0;
+    std::size_t valueTensorMaxDimension = 0;
+    float valueTensorMaxActual = 0.0f;
+    float valueTensorMaxExpected = 0.0f;
+    for (std::size_t head = 0; head < kKvHeads; ++head) {
+        for (std::size_t token = 0; token < kSeqLen; ++token) {
+            for (std::size_t dimension = 0;
+                 dimension < kHeadDim; ++dimension) {
+                const float actual = readPackedValue(head, token, dimension,
+                    static_cast<ftlpu::Hemisphere>(head % 2));
+                const std::size_t column = head * kHeadDim + dimension;
+                const float expected = bf16(
+                    normalized0[token * kHidden + sourceHidden(2, column)]
+                    * projectionSign(2, column));
+                const float error = std::fabs(actual - expected);
+                if (error > valueTensorMaxError) {
+                    valueTensorMaxError = error;
+                    valueTensorMaxHead = head;
+                    valueTensorMaxToken = token;
+                    valueTensorMaxDimension = dimension;
+                    valueTensorMaxActual = actual;
+                    valueTensorMaxExpected = expected;
+                }
+            }
+        }
+    }
+    if (valueTensorMaxError > 0.04f)
+        throw std::logic_error(
+            "full attention value checkpoint mismatch max_error="
+            + std::to_string(valueTensorMaxError)
+            + " head=" + std::to_string(valueTensorMaxHead)
+            + " token=" + std::to_string(valueTensorMaxToken)
+            + " dimension=" + std::to_string(valueTensorMaxDimension)
+            + " actual=" + std::to_string(valueTensorMaxActual)
+            + " expected=" + std::to_string(valueTensorMaxExpected));
     for (std::size_t column = 0;
          column < kKvHeads * kHeadDim; ++column) {
         const std::size_t head = column / kHeadDim;
@@ -788,6 +848,72 @@ try {
                 * projectionSign(2, column));
         }
     }
+    if constexpr (kSeqLen == 32 && kHeadDim == 128) {
+        float queryRopeMaxError = 0.0f;
+        float keyRopeMaxError = 0.0f;
+        std::array<std::size_t, 4> queryLocation {};
+        std::array<std::size_t, 4> keyLocation {};
+        std::array<float, 2> queryValues {};
+        std::array<float, 2> keyValues {};
+        for (std::size_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
+            for (std::size_t token = 0; token < kSeqLen; ++token) {
+                const std::size_t tokenLane = token % 8;
+                const std::size_t tokenWave = (token % 32) / 8;
+                for (std::size_t head = 0; head < kQueryHeads; ++head) {
+                    for (std::size_t dimension = 0;
+                         dimension < kHeadDim; ++dimension) {
+                        const std::size_t reduction = dimension / 32;
+                        const std::size_t address = 576
+                            + (head * 2 + reduction % 2) * 4
+                            + tokenWave;
+                        const float actual = physicalBf16(
+                            static_cast<ftlpu::Hemisphere>(hemisphere),
+                            2 * tokenLane, 2 * tokenLane + 1, address,
+                            dimension % 32, reduction / 2);
+                        const float expected = ropeValue(
+                            checkpointQuery, token, head, dimension);
+                        const float error = std::fabs(actual - expected);
+                        if (error > queryRopeMaxError) {
+                            queryRopeMaxError = error;
+                            queryLocation = {
+                                hemisphere, head, token, dimension};
+                            queryValues = {actual, expected};
+                        }
+                    }
+                }
+                for (std::size_t head = 0; head < kKvHeads; ++head) {
+                    for (std::size_t dimension = 0;
+                         dimension < kHeadDim; ++dimension) {
+                        const std::size_t reduction = dimension / 32;
+                        const std::size_t slice = 16 + 2 * (reduction / 2);
+                        const std::size_t address =
+                            (head * 2 + reduction % 2) * kSeqLen + token;
+                        const float actual = physicalBf16(
+                            static_cast<ftlpu::Hemisphere>(hemisphere),
+                            slice, slice + 1, address, dimension % 32, 1);
+                        const float expected = ropeValue(
+                            checkpointKey, token, head, dimension);
+                        const float error = std::fabs(actual - expected);
+                        if (error > keyRopeMaxError) {
+                            keyRopeMaxError = error;
+                            keyLocation = {
+                                hemisphere, head, token, dimension};
+                            keyValues = {actual, expected};
+                        }
+                    }
+                }
+            }
+        }
+        if (queryRopeMaxError > 0.02f || keyRopeMaxError > 0.02f)
+            throw std::logic_error(
+                "direct RoPE physical checkpoint mismatch query_error="
+                + std::to_string(queryRopeMaxError)
+                + " query_location=" + arrayValues(queryLocation)
+                + " query_values=" + arrayValues(queryValues)
+                + " key_error=" + std::to_string(keyRopeMaxError)
+                + " key_location=" + arrayValues(keyLocation)
+                + " key_values=" + arrayValues(keyValues));
+    }
     std::vector<float> checkpointContext(inputValues.size(), 0.0f);
     std::vector<float> checkpointScores(kSeqLen);
     std::vector<float> checkpointProbabilities(kSeqLen);
@@ -834,7 +960,8 @@ try {
     }
     const std::size_t pvStartCycle =
         static_cast<std::size_t>(timeline(program, "pv").start_cycle);
-    runtime.run_cycles(pvStartCycle - qkvEndCycle);
+    runtime.run_cycles(pvStartCycle - qkvEndCycle,
+        scopedCmodelLog ? nullptr : cmodelLogSink);
     for (std::size_t head = 0; head < kQueryHeads; ++head) {
         const std::size_t kvHead =
             head / (kQueryHeads / kKvHeads);
@@ -857,6 +984,35 @@ try {
     const std::size_t probabilityBaseRow =
         static_cast<std::size_t>(
             probabilityDiagonalBinding->base_row);
+    const std::size_t pvEndCycle =
+        static_cast<std::size_t>(timeline(program, "o_proj").start_cycle);
+    constexpr std::size_t kCheckpointDrainCycles = 64;
+    const std::size_t pvCheckpointCycles =
+        pvEndCycle - pvStartCycle + kCheckpointDrainCycles;
+    if (scopedCmodelLog) {
+        const std::size_t logStart = static_cast<std::size_t>(
+            std::strtoull(std::getenv("FTLPU_CMODEL_LOG_START"), nullptr, 10));
+        const auto* logCyclesText = std::getenv("FTLPU_CMODEL_LOG_CYCLES");
+        const std::size_t requestedLogCycles = logCyclesText
+            ? static_cast<std::size_t>(
+                  std::strtoull(logCyclesText, nullptr, 10))
+            : 64;
+        if (logStart < pvStartCycle
+            || logStart >= pvStartCycle + pvCheckpointCycles)
+            throw std::logic_error(
+                "FTLPU_CMODEL_LOG_START is outside the PV checkpoint");
+        const std::size_t prefixCycles = logStart - pvStartCycle;
+        const std::size_t logCycles = std::min(requestedLogCycles,
+            pvCheckpointCycles - prefixCycles);
+        runtime.run_cycles(prefixCycles);
+        runtime.run_cycles(logCycles, cmodelLogSink);
+        runtime.run_cycles(pvCheckpointCycles - prefixCycles - logCycles);
+    } else {
+        runtime.run_cycles(pvCheckpointCycles, cmodelLogSink);
+    }
+    // Softmax and PV intentionally overlap across head waves. Read the final
+    // probability tensor after PV has drained; a snapshot at pv.start would
+    // observe the tail heads before their last causal entries are written.
     for (std::size_t query = 0; query < kSeqLen; ++query) {
         const std::size_t queryBlock = query / 32;
         const std::size_t queryRow = query % 8;
@@ -878,9 +1034,8 @@ try {
                     const float probability = physicalBf16(
                         static_cast<ftlpu::Hemisphere>(kvHead % 2),
                         probabilitySlices[queryRow * 2],
-                        probabilitySlices[queryRow * 2 + 1],
-                        address, key % 32,
-                        probabilityDiagonalBinding->bank);
+                        probabilitySlices[queryRow * 2 + 1], address,
+                        key % 32, probabilityDiagonalBinding->bank);
                     context += probability
                         * checkpointValue[key * kHidden
                             + kvHead * kHeadDim + dimension];
@@ -890,11 +1045,6 @@ try {
             }
         }
     }
-    const std::size_t pvEndCycle =
-        static_cast<std::size_t>(timeline(program, "o_proj").start_cycle);
-    constexpr std::size_t kCheckpointDrainCycles = 64;
-    runtime.run_cycles(
-        pvEndCycle - pvStartCycle + kCheckpointDrainCycles);
     float contextMaxError = 0.0f;
     std::size_t contextMaxHemisphere = 0;
     std::size_t contextMaxRow = 0;
@@ -903,6 +1053,11 @@ try {
     float contextMaxExpected = 0.0f;
     std::array<std::size_t, kQueryHeads> contextMismatchCounts {};
     std::array<std::size_t, kQueryHeads> contextUnexpectedZeroCounts {};
+    std::array<std::size_t, kQueryHeads * kHeadBlocks>
+        contextBlockMismatchCounts {};
+    std::array<std::size_t, kQueryHeads> contextFirstMismatchRows {};
+    std::array<std::size_t, kQueryHeads> contextLastMismatchRows {};
+    contextFirstMismatchRows.fill(kSeqLen);
     for (std::size_t row = 0; row < kSeqLen; ++row) {
         for (std::size_t column = 0; column < kHidden; ++column) {
                 const std::size_t head = column / kHeadDim;
@@ -934,6 +1089,11 @@ try {
                 const float error = std::fabs(observed - expected);
                 if (error > 0.04f) {
                     ++contextMismatchCounts[head];
+                    ++contextBlockMismatchCounts[
+                        head * kHeadBlocks + headBlock];
+                    contextFirstMismatchRows[head] = std::min(
+                        contextFirstMismatchRows[head], row);
+                    contextLastMismatchRows[head] = row;
                     if (observed == 0.0f && expected != 0.0f)
                         ++contextUnexpectedZeroCounts[head];
                 }
@@ -947,7 +1107,85 @@ try {
                 }
         }
     }
-    if (contextMaxError > 0.04f)
+    std::size_t contextClosestHead = 0;
+    std::size_t contextClosestRow = 0;
+    float contextClosestMeanError =
+        std::numeric_limits<float>::infinity();
+    if (contextMaxError > 0.04f) {
+        const std::size_t failingHead = contextMaxColumn / kHeadDim;
+        const std::size_t failingKvHead =
+            failingHead / (kQueryHeads / kKvHeads);
+        std::array<float, kSeqLen> failingProbabilities {};
+        std::array<float, kSeqLen> failingValues {};
+        std::array<float, kSeqLen> failingExpectedValues {};
+        const std::size_t failingQueryBlock = contextMaxRow / 32;
+        const std::size_t failingQueryRow = contextMaxRow % 8;
+        const std::size_t failingDiagonal = (contextMaxRow % 32) / 8;
+        for (std::size_t key = 0; key <= contextMaxRow; ++key) {
+            const std::size_t keyBlock = key / 32;
+            const std::size_t address = probabilityBaseRow
+                + ((failingHead * kTokenBlocks + failingQueryBlock)
+                        * kTokenBlocks
+                    + keyBlock)
+                    * kTileRows
+                + failingDiagonal;
+            failingProbabilities[key] = physicalBf16(
+                static_cast<ftlpu::Hemisphere>(failingKvHead % 2),
+                probabilitySlices[failingQueryRow * 2],
+                probabilitySlices[failingQueryRow * 2 + 1], address,
+                key % 32, probabilityDiagonalBinding->bank);
+            failingValues[key] = readPackedValue(failingKvHead, key,
+                contextMaxColumn % kHeadDim,
+                static_cast<ftlpu::Hemisphere>(failingKvHead % 2));
+            failingExpectedValues[key] = checkpointValue[key * kHidden
+                + failingKvHead * kHeadDim
+                + contextMaxColumn % kHeadDim];
+        }
+        const bool headBlockPacked =
+            contextBinding->layout
+            == ftlpu::software::runtime::BindingLayout::
+                Fp16HeadBlockPacked;
+        std::array<float, kHeadDim> observedVector {};
+        for (std::size_t dimension = 0;
+             dimension < kHeadDim; ++dimension) {
+            const std::size_t headBlock = dimension / 32;
+            const std::size_t sliceBase = headBlockPacked
+                ? (failingKvHead % 2) * 2 : headBlock * 2;
+            const std::size_t address =
+                static_cast<std::size_t>(contextBinding->base_row)
+                + (headBlockPacked
+                    ? (failingHead * kHeadBlocks + headBlock) * kSeqLen
+                    : failingHead * kSeqLen)
+                + contextMaxRow;
+            observedVector[dimension] = physicalBf16(
+                static_cast<ftlpu::Hemisphere>(failingKvHead % 2),
+                contextBinding->slices[sliceBase],
+                contextBinding->slices[sliceBase + 1], address,
+                dimension % 32, contextBinding->bank);
+        }
+        const std::size_t firstHead =
+            failingKvHead * (kQueryHeads / kKvHeads);
+        const std::size_t lastHead =
+            firstHead + kQueryHeads / kKvHeads;
+        for (std::size_t candidateHead = firstHead;
+             candidateHead < lastHead; ++candidateHead) {
+            for (std::size_t candidateRow = 0;
+                 candidateRow < kSeqLen; ++candidateRow) {
+                float totalError = 0.0f;
+                for (std::size_t dimension = 0;
+                     dimension < kHeadDim; ++dimension)
+                    totalError += std::fabs(observedVector[dimension]
+                        - checkpointContext[candidateRow * kHidden
+                            + candidateHead * kHeadDim + dimension]);
+                const float meanError =
+                    totalError / static_cast<float>(kHeadDim);
+                if (meanError < contextClosestMeanError) {
+                    contextClosestMeanError = meanError;
+                    contextClosestHead = candidateHead;
+                    contextClosestRow = candidateRow;
+                }
+            }
+        }
         throw std::logic_error(
             "PV context mismatch max_error="
             + std::to_string(contextMaxError)
@@ -957,9 +1195,37 @@ try {
             + " column=" + std::to_string(contextMaxColumn)
             + " actual=" + std::to_string(contextMaxActual)
             + " expected=" + std::to_string(contextMaxExpected)
+            + " expected_prev_row=" + std::to_string(
+                checkpointContext[(contextMaxRow == 0
+                        ? contextMaxRow : contextMaxRow - 1) * kHidden
+                    + contextMaxColumn])
+            + " expected_next_row=" + std::to_string(
+                checkpointContext[(contextMaxRow + 1 < kSeqLen
+                        ? contextMaxRow + 1 : contextMaxRow) * kHidden
+                    + contextMaxColumn])
+            + " expected_prev_head=" + std::to_string(
+                checkpointContext[contextMaxRow * kHidden
+                    + (contextMaxColumn >= kHeadDim
+                        ? contextMaxColumn - kHeadDim
+                        : contextMaxColumn)])
+            + " closest_expected=(head="
+                + std::to_string(contextClosestHead)
+                + ",row=" + std::to_string(contextClosestRow)
+                + ",mean_error="
+                + std::to_string(contextClosestMeanError) + ")"
             + " mismatch_counts=" + arrayValues(contextMismatchCounts)
+            + " block_mismatch_counts="
+                + arrayValues(contextBlockMismatchCounts)
+            + " first_mismatch_rows="
+                + arrayValues(contextFirstMismatchRows)
+            + " last_mismatch_rows="
+                + arrayValues(contextLastMismatchRows)
             + " zero_counts="
-                + arrayValues(contextUnexpectedZeroCounts));
+                + arrayValues(contextUnexpectedZeroCounts)
+            + " probabilities=" + arrayValues(failingProbabilities)
+            + " values=" + arrayValues(failingValues)
+            + " expected_values=" + arrayValues(failingExpectedValues));
+    }
 
     const std::size_t outputProjectionEndCycle =
         static_cast<std::size_t>(
@@ -969,7 +1235,7 @@ try {
         throw std::logic_error(
             "PV checkpoint drain overlaps the O projection checkpoint");
     runtime.run_cycles(outputProjectionEndCycle - pvEndCycle
-        - kCheckpointDrainCycles);
+        - kCheckpointDrainCycles, cmodelLogSink);
     float outputProjectionMaxError = 0.0f;
     std::size_t outputProjectionMaxRow = 0;
     std::size_t outputProjectionMaxColumn = 0;
@@ -1094,7 +1360,8 @@ try {
         static_cast<std::size_t>(
             timeline(program, "rmsnorm.feedback", 1).start_cycle);
     runtime.run_cycles(
-        attentionResidualEndCycle - outputProjectionEndCycle);
+        attentionResidualEndCycle - outputProjectionEndCycle,
+        cmodelLogSink);
     float residualCheckpointMaxError = 0.0f;
     std::size_t residualCheckpointMaxRow = 0;
     std::size_t residualCheckpointMaxColumn = 0;
@@ -1141,7 +1408,8 @@ try {
 
     const std::size_t ffnStartCycle =
         firstBindingReadCycle(program, 7);
-    runtime.run_cycles(ffnStartCycle - attentionResidualEndCycle);
+    runtime.run_cycles(
+        ffnStartCycle - attentionResidualEndCycle, cmodelLogSink);
     // Paged executables reuse the resident weight bank as scratch between
     // stages. Model the C2C handoff by making the FFN page resident immediately
     // before its first binding read instead of uploading every page at cycle 0.
@@ -1210,7 +1478,8 @@ try {
     const std::size_t finalResidualStartCycle =
         static_cast<std::size_t>(
             timeline(program, "elementwise.add", 1).start_cycle);
-    runtime.run_cycles(finalResidualStartCycle - ffnStartCycle);
+    runtime.run_cycles(
+        finalResidualStartCycle - ffnStartCycle, cmodelLogSink);
     const auto ffnBinding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
         [](const auto& binding) {

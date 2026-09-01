@@ -108,6 +108,15 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         && target.memory().banks_per_slice > 1
         && target.activation_storage_slices().size() >= 20;
     const int64_t head_blocks = head_dim / tile;
+    const bool direct_rope_streaming =
+        target.uses_dedicated_slice_roles()
+        && target.memory().banks_per_slice > 1
+        && target.activation_storage_slices().size() >= 20
+        && target.throughput().vxm_cross_hemisphere_streams_enabled != 0
+        && target.throughput().vxm_fma_enabled != 0
+        && target.throughput().vxm_alus >= 4
+        && target.memory().hemispheres == 2
+        && head_blocks == 4;
     const int64_t logical_head_banks = (head_blocks + 1) / 2;
     const int64_t query_rows = query_heads * logical_head_banks * blocks
         * target.throughput().tile_rows;
@@ -180,7 +189,9 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t input_staging_bank = scratch_bank;
     const auto input_staging_values = target.uses_dedicated_slice_roles()
         ? target.activation_storage_slices() : planar_activation_slices;
-    const auto input_staging_begin = input_staging_values.begin();
+    const auto input_staging_begin = direct_rope_streaming
+        ? input_staging_values.end() - 2
+        : input_staging_values.begin();
     const auto input_staging_end = input_staging_begin + 2;
     const llvm::SmallVector<int64_t, 16> input_staging_slices(
         input_staging_begin, input_staging_end);
@@ -255,9 +266,19 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     const int64_t probability_diagonal_bank = scratch_bank;
     llvm::SmallVector<int64_t, 4> rope_table_slices;
-    int64_t rope_table_bank = scratch_bank;
+    llvm::SmallVector<int64_t, 4> rope_mirror_slices;
+    int64_t rope_table_bank = direct_rope_streaming
+        ? secondary_scratch_bank : scratch_bank;
+    int64_t rope_mirror_bank = direct_rope_streaming
+        ? scratch_bank : secondary_scratch_bank;
     const auto rope_slices = target.attention_rope_slices();
     rope_table_slices.assign(rope_slices.begin(), rope_slices.end());
+    if (direct_rope_streaming) {
+        const auto storage = target.activation_storage_slices();
+        rope_mirror_slices.assign(storage.begin(), storage.begin() + 4);
+    } else {
+        rope_mirror_slices = rope_table_slices;
+    }
     if (mlir::failed(physical_allocator.reserve({"rope_staging",
             rope_staging_slices, rope_staging_base,
             rope_staging_rows, 0, 2, true,
@@ -293,9 +314,9 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     if (compact_rope_products
         && mlir::failed(physical_allocator.reserve({"rope_mirror",
             llvm::SmallVector<int64_t, 16>(
-                rope_table_slices.begin(), rope_table_slices.end()),
+                rope_mirror_slices.begin(), rope_mirror_slices.end()),
             rope_mirror_base, rope_rows,
-            0, 2, false, secondary_scratch_bank}))) {
+            0, 2, false, rope_mirror_bank}))) {
         op.emitError("failed to reserve the mirrored attention RoPE table");
         return mlir::failure();
     }
@@ -763,12 +784,10 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             target.attention_probability_diagonal_base_row(),
             rope_rows, "both", rope_table_bank)),
         rewriter.getNamedAttr("rope_mirror", make_attention_placement(rewriter,
-            "fp16_rope_table", rope_table_slices,
+            "fp16_rope_table", rope_mirror_slices,
             compact_rope_products ? rope_mirror_base
                                   : target.attention_probability_diagonal_base_row(),
-            rope_rows, "both",
-            compact_rope_products ? secondary_scratch_bank
-                                  : rope_table_bank)),
+            rope_rows, "both", rope_mirror_bank)),
         rewriter.getNamedAttr("rope_staging",
             make_attention_placement(rewriter,
                 "fp16_rope_fifo_x16", rope_staging_slices,

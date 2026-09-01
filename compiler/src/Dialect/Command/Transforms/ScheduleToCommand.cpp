@@ -210,7 +210,8 @@ void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op,
 {
     mlir::OperationState state(op.getLoc(), command::VxmOp::getOperationName());
       for (llvm::StringRef name : {"cycle", "queue", "opcode", "lhs_kind",
-               "lhs_index", "lhs_immediate", "rhs_kind", "rhs_index",
+               "lhs_index", "lhs_immediate", "lhs_stream_source",
+               "rhs_kind", "rhs_index", "rhs_stream_source",
                "rhs_immediate", "cast_target", "output_stream", "repeat_count",
                "repeat_interval", "input_hemisphere", "output_hemisphere",
                "accumulator_reset", "accumulator_write", "accumulator_emit",
@@ -235,7 +236,8 @@ void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op,
 bool same_vxm_command(schedule::VxmOp lhs, schedule::VxmOp rhs)
 {
     for (llvm::StringRef name : {"queue", "opcode", "chain_depth", "lhs_kind",
-             "lhs_index", "lhs_immediate", "rhs_kind", "rhs_index",
+             "lhs_index", "lhs_immediate", "lhs_stream_source",
+             "rhs_kind", "rhs_index", "rhs_stream_source",
              "rhs_immediate", "cast_target", "output_stream",
              "input_hemisphere", "output_hemisphere", "scale_binding",
              "accumulator_reset", "accumulator_write", "accumulator_emit",

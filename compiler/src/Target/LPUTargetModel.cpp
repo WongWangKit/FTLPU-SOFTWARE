@@ -356,6 +356,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_THROUGHPUT(mxm_weight_buffers);
     READ_THROUGHPUT(mxm_accumulator_blocks);
     READ_THROUGHPUT(vxm_alus);
+    READ_THROUGHPUT(vxm_cross_hemisphere_streams_enabled);
+    READ_THROUGHPUT(vxm_fma_enabled);
     READ_THROUGHPUT(vxm_weight_to_iw_latency);
     READ_THROUGHPUT(mem_to_sxm_latency);
     READ_THROUGHPUT(mem_to_mxm_latency);
@@ -482,6 +484,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_THROUGHPUT(mxm_weight_buffers);
     READ_THROUGHPUT(mxm_accumulator_blocks);
     READ_THROUGHPUT(vxm_alus);
+    READ_THROUGHPUT(vxm_cross_hemisphere_streams_enabled);
+    READ_THROUGHPUT(vxm_fma_enabled);
     READ_THROUGHPUT(vxm_weight_to_iw_latency);
     READ_THROUGHPUT(mem_to_sxm_latency);
     READ_THROUGHPUT(mem_to_mxm_latency);
@@ -599,6 +603,8 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(throughput_, mxm_weight_buffers),
         I64(throughput_, mxm_accumulator_blocks),
         I64(throughput_, vxm_alus),
+        I64(throughput_, vxm_cross_hemisphere_streams_enabled),
+        I64(throughput_, vxm_fma_enabled),
         I64(throughput_, vxm_weight_to_iw_latency),
         I64(throughput_, mem_to_sxm_latency),
         I64(throughput_, mem_to_mxm_latency),
@@ -680,6 +686,10 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             && throughput_.mxm_block_compute_enabled != 1)
         || (throughput_.mxm_weight_activation_overlap_enabled != 0
             && throughput_.mxm_weight_activation_overlap_enabled != 1)
+        || (throughput_.vxm_cross_hemisphere_streams_enabled != 0
+            && throughput_.vxm_cross_hemisphere_streams_enabled != 1)
+        || (throughput_.vxm_fma_enabled != 0
+            && throughput_.vxm_fma_enabled != 1)
         || (throughput_.icu_repeat_2d_enabled != 0
             && throughput_.icu_repeat_2d_enabled != 1))
         return fail("target feature switches must be zero or one");
@@ -773,7 +783,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
 std::uint64_t LPUTargetModel::abi_fingerprint() const
 {
     software::runtime::TargetAbiHasher hash;
-    hash.add(16);
+    hash.add(17);
 #define HASH(field) hash.add(memory_.field)
     HASH(hemispheres);
     HASH(slices_per_hemisphere);
@@ -817,6 +827,8 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
     HASH(mxms_per_hemisphere);
     HASH(mxm_weight_buffers);
     HASH(vxm_alus);
+    HASH(vxm_cross_hemisphere_streams_enabled);
+    HASH(vxm_fma_enabled);
     HASH(vxm_weight_to_iw_latency);
     HASH(mem_to_sxm_latency);
     HASH(mem_to_mxm_latency);

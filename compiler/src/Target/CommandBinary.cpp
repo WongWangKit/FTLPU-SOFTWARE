@@ -573,6 +573,8 @@ VxmLaneOperation parse_vxm_operation(llvm::StringRef value)
     if (value == "add") return VxmAluOpcode::Add;
     if (value == "subtract") return VxmAluOpcode::Subtract;
     if (value == "multiply") return VxmAluOpcode::Multiply;
+    if (value == "fma") return VxmAluOpcode::FusedMultiplyAdd;
+    if (value == "fms") return VxmAluOpcode::FusedMultiplySubtract;
     if (value == "negate") return VxmAluOpcode::Negate;
     if (value == "max") return VxmAluOpcode::Max;
     if (value == "exp") return VxmSpecialAluOpcode::Exp;
@@ -583,8 +585,17 @@ VxmLaneOperation parse_vxm_operation(llvm::StringRef value)
         "Command IR VXM operation is not implemented by the current CModel");
 }
 
+VxmStreamSource parse_vxm_stream_source(llvm::StringRef value)
+{
+    if (value.empty() || value == "local") return VxmStreamSource::Local;
+    if (value == "east") return VxmStreamSource::East;
+    if (value == "west") return VxmStreamSource::West;
+    throw std::runtime_error(
+        "Command IR VXM stream source must be local, east, or west");
+}
+
 VxmLaneOperand parse_vxm_operand(llvm::StringRef kind, int64_t index,
-    float immediate, int64_t queue)
+    float immediate, int64_t queue, llvm::StringRef streamSource)
 {
     if (kind == "previous") return VxmLaneOperand::Previous();
     if (kind == "original") return VxmLaneOperand::Original();
@@ -603,9 +614,11 @@ VxmLaneOperand parse_vxm_operand(llvm::StringRef kind, int64_t index,
         return static_cast<std::int32_t>(((index % 32) / 2) % 8);
     };
     if (kind == "stream_f16")
-        return VxmLaneOperand::StreamFloat16(1.0f, streamGroup());
+        return VxmLaneOperand::StreamFloat16(
+            1.0f, streamGroup(), parse_vxm_stream_source(streamSource));
     if (kind == "stream_bf16")
-        return VxmLaneOperand::StreamBFloat16(1.0f, streamGroup());
+        return VxmLaneOperand::StreamBFloat16(
+            1.0f, streamGroup(), parse_vxm_stream_source(streamSource));
     if (kind == "immediate") return VxmLaneOperand::Imm(immediate);
     throw std::runtime_error(
         "legacy integer/FP32 VXM stream operands require BF16 legalization");
@@ -629,10 +642,16 @@ void collect_vxm(command::VxmOp op, QueueMap& queues)
     const int64_t output_stream = op.getOutputStreamAttr().getInt();
     auto instruction = VxmLaneAluInstruction {};
     instruction.operation = parse_vxm_operation(op.getOpcode());
+    const auto lhsSource =
+        op->getAttrOfType<mlir::StringAttr>("lhs_stream_source");
+    const auto rhsSource =
+        op->getAttrOfType<mlir::StringAttr>("rhs_stream_source");
     instruction.lhs = parse_vxm_operand(op.getLhsKind(), op.getLhsIndex(),
-        static_cast<float>(op.getLhsImmediateAttr().getValueAsDouble()), queue);
+        static_cast<float>(op.getLhsImmediateAttr().getValueAsDouble()), queue,
+        lhsSource ? lhsSource.getValue() : llvm::StringRef{});
     instruction.rhs = parse_vxm_operand(op.getRhsKind(), op.getRhsIndex(),
-        static_cast<float>(op.getRhsImmediateAttr().getValueAsDouble()), queue);
+        static_cast<float>(op.getRhsImmediateAttr().getValueAsDouble()), queue,
+        rhsSource ? rhsSource.getValue() : llvm::StringRef{});
     instruction.output_type = parse_vxm_cast_target(op.getCastTarget());
     instruction.precision = VxmAluPrecision::Float32;
     instruction.repeat_count = static_cast<std::size_t>(op.getRepeatCount());
@@ -1818,6 +1837,8 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     COPY_THROUGHPUT(mxm_weight_buffers);
     COPY_THROUGHPUT(mxm_accumulator_blocks);
     COPY_THROUGHPUT(vxm_alus);
+    COPY_THROUGHPUT(vxm_cross_hemisphere_streams_enabled);
+    COPY_THROUGHPUT(vxm_fma_enabled);
     COPY_THROUGHPUT(vxm_weight_to_iw_latency);
     COPY_THROUGHPUT(mem_to_sxm_latency);
     COPY_THROUGHPUT(mem_to_mxm_latency);

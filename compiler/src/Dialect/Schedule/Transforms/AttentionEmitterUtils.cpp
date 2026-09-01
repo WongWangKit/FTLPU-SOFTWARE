@@ -264,7 +264,9 @@ VxmOp emitVxmConfigured(mlir::IRRewriter &rewriter, mlir::Location location,
                         int64_t outputStream, llvm::StringRef inputHemisphere,
                         llvm::StringRef outputHemisphere, int64_t scaleBinding,
                         int64_t chainDepth, int64_t repeatCount,
-                        int64_t repeatInterval) {
+                        int64_t repeatInterval,
+                        llvm::StringRef lhsStreamSource,
+                        llvm::StringRef rhsStreamSource) {
   mlir::OperationState state(location, VxmOp::getOperationName());
   state.addOperands({value, value});
   state.addTypes(value.getType());
@@ -297,6 +299,12 @@ VxmOp emitVxmConfigured(mlir::IRRewriter &rewriter, mlir::Location location,
   if (scaleBinding >= 0)
     state.addAttribute("scale_binding",
                        rewriter.getI64IntegerAttr(scaleBinding));
+  if (!lhsStreamSource.empty())
+    state.addAttribute("lhs_stream_source",
+                       rewriter.getStringAttr(lhsStreamSource));
+  if (!rhsStreamSource.empty())
+    state.addAttribute("rhs_stream_source",
+                       rewriter.getStringAttr(rhsStreamSource));
   return llvm::cast<VxmOp>(rewriter.create(state));
 }
 

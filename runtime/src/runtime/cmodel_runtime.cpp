@@ -198,6 +198,12 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     require_capability("mxm_weight_activation_overlap_enabled",
         requested.mxm_weight_activation_overlap_enabled,
         physical.mxm_weight_activation_overlap_enabled);
+    require_capability("vxm_cross_hemisphere_streams_enabled",
+        requested.vxm_cross_hemisphere_streams_enabled,
+        physical.vxm_cross_hemisphere_streams_enabled);
+    require_capability("vxm_fma_enabled",
+        requested.vxm_fma_enabled,
+        physical.vxm_fma_enabled);
 }
 
 std::uint16_t encode_16bit_float(float value, BindingElementType type)

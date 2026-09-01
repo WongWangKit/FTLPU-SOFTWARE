@@ -526,10 +526,15 @@ BinaryHeader read_header(ByteReader& reader)
         program.target_name.resize(target_name_size);
         reader.read_bytes(
             program.target_name.data(), program.target_name.size());
-        if (version >= 24) {
+        if (version >= 26) {
             program.hardware.visit([&](std::uint32_t& value) {
                 value = reader.read<std::uint32_t>();
             });
+        } else if (version >= 24) {
+            program.hardware.visit_pre_v26([&](std::uint32_t& value) {
+                value = reader.read<std::uint32_t>();
+            });
+            program.target_abi = executable_target_abi(program.hardware);
         } else if (version >= 23) {
             program.hardware.visit_pre_v24([&](std::uint32_t& value) {
                 value = reader.read<std::uint32_t>();
@@ -756,10 +761,15 @@ BinaryProgram read_binary_program(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 24) {
+        if (version >= 26) {
             program.hardware.visit([&](std::uint32_t& value) {
                 value = read_scalar<std::uint32_t>(is);
             });
+        } else if (version >= 24) {
+            program.hardware.visit_pre_v26([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+            program.target_abi = executable_target_abi(program.hardware);
         } else if (version >= 23) {
             program.hardware.visit_pre_v24([&](std::uint32_t& value) {
                 value = read_scalar<std::uint32_t>(is);
@@ -920,10 +930,15 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 24) {
+        if (version >= 26) {
             program.hardware.visit([&](std::uint32_t& value) {
                 value = read_scalar<std::uint32_t>(is);
             });
+        } else if (version >= 24) {
+            program.hardware.visit_pre_v26([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+            program.target_abi = executable_target_abi(program.hardware);
         } else if (version >= 23) {
             program.hardware.visit_pre_v24([&](std::uint32_t& value) {
                 value = read_scalar<std::uint32_t>(is);

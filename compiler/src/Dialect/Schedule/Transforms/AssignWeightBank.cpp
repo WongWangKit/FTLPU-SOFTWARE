@@ -19,6 +19,16 @@ bool is_paged_weight(mlir::DictionaryAttr placement)
     return false;
 }
 
+bool is_bank_locked(mlir::DictionaryAttr placement)
+{
+    if (const auto locked = placement.getAs<mlir::BoolAttr>("bank_locked"))
+        return locked.getValue();
+    if (const auto binding = placement.getAs<mlir::DictionaryAttr>(
+            "binding_placement"))
+        return is_bank_locked(binding);
+    return false;
+}
+
 mlir::DictionaryAttr with_bank(mlir::MLIRContext* context,
     mlir::DictionaryAttr placement, std::int64_t bank)
 {
@@ -54,24 +64,33 @@ public:
         }
 
         llvm::SmallDenseSet<std::int64_t, 16> weight_bindings;
+        llvm::SmallDenseSet<std::int64_t, 4> bank_locked_bindings;
         function.walk([&](schedule::BindingOp binding) {
             if (binding.getAccess() != "input"
                 || binding.getRole() != "weight")
                 return;
             weight_bindings.insert(binding.getIndex());
-            if (is_paged_weight(binding.getPlacement())) return;
+            if (is_bank_locked(binding.getPlacement())) {
+                bank_locked_bindings.insert(binding.getIndex());
+                return;
+            }
+            if (is_paged_weight(binding.getPlacement()))
+                return;
             binding->setAttr("placement", with_bank(&getContext(),
                 binding.getPlacement(), bank_));
         });
         function.walk([&](schedule::MemReadOp read) {
             if (read.getRole() != "weight") return;
-            if (is_paged_weight(read.getPlacement())) return;
+            if (is_paged_weight(read.getPlacement())
+                || is_bank_locked(read.getPlacement()))
+                return;
             read->setAttr("placement", with_bank(&getContext(),
                 read.getPlacement(), bank_));
         });
         function.walk([&](schedule::MemTransferOp transfer) {
             const auto binding = transfer.getAddressBinding();
             if (!binding || !weight_bindings.contains(*binding)) return;
+            if (bank_locked_bindings.contains(*binding)) return;
             if (transfer.getWeightPage() && transfer.getBank()) return;
             transfer->setAttr("bank",
                 mlir::IntegerAttr::get(

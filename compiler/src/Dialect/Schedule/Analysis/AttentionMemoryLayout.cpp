@@ -69,15 +69,25 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     }
     if (const auto rope = plan.getAs<mlir::DictionaryAttr>("rope")) {
         ropeBase_ = rope.getAs<mlir::IntegerAttr>("base_row").getInt();
+        ropeBank_ = rope.getAs<mlir::IntegerAttr>("bank").getInt();
         const auto slices = rope.getAs<mlir::ArrayAttr>("slices");
         for (std::size_t i = 0; i < ropeSlices_.size(); ++i)
             ropeSlices_[i] =
                 llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
     }
+    ropeMirrorSlices_ = ropeSlices_;
+    ropeMirrorBank_ = ropeBank_;
     if (const auto mirror =
-            plan.getAs<mlir::DictionaryAttr>("rope_mirror"))
+            plan.getAs<mlir::DictionaryAttr>("rope_mirror")) {
         ropeMirrorBase_ =
             mirror.getAs<mlir::IntegerAttr>("base_row").getInt();
+        ropeMirrorBank_ =
+            mirror.getAs<mlir::IntegerAttr>("bank").getInt();
+        const auto slices = mirror.getAs<mlir::ArrayAttr>("slices");
+        for (std::size_t i = 0; i < ropeMirrorSlices_.size(); ++i)
+            ropeMirrorSlices_[i] =
+                llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
+    }
     if (const auto staging =
             plan.getAs<mlir::DictionaryAttr>("rope_staging")) {
         ropeStagingBase_ =

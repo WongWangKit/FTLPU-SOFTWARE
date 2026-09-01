@@ -97,7 +97,9 @@ VxmOp emitVxmConfigured(mlir::IRRewriter &rewriter, mlir::Location location,
                         int64_t outputStream, llvm::StringRef inputHemisphere,
                         llvm::StringRef outputHemisphere, int64_t scaleBinding,
                         int64_t chainDepth, int64_t repeatCount,
-                        int64_t repeatInterval);
+                        int64_t repeatInterval,
+                        llvm::StringRef lhsStreamSource = {},
+                        llvm::StringRef rhsStreamSource = {});
 
 AttentionProjectionKind projectionKind(int64_t index);
 

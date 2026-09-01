@@ -266,8 +266,14 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
 
     const auto inputPlacement = make_profile_placement(rewriter, input,
         input.layout, input.hemisphere);
-    const auto weightPlacement = make_profile_placement(rewriter, weight,
+    auto weightPlacement = make_profile_placement(rewriter, weight,
         weight.layout, "both");
+    if (strategy == RmsNormLoweringStrategy::VxmFeedback
+        && target.uses_dedicated_slice_roles()) {
+        mlir::NamedAttrList attributes(weightPlacement);
+        attributes.set("bank_locked", rewriter.getBoolAttr(true));
+        weightPlacement = attributes.getDictionary(rewriter.getContext());
+    }
     const auto resultPlacement = make_profile_placement(rewriter, result,
         result.layout, "both");
     const auto inputAllocations = mlir::succeeded(producerInput)
