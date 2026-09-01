@@ -83,7 +83,7 @@ Tensor IR 负责 MEM 分配和 tensor 放置：
 - 描述引用已选 kernel 的 tile plan；
 - 显式记录 layout 和元素大小。
 
-已实现的 `ftlpu.tensor.matmul` 和 `ftlpu.tensor.swiglu` 使用物理 rank-6 MEM 地址元组 `[device, hemisphere, slice, bank, word, byte]`。当前 `cmodel_large_sram` target 的每个 hemisphere 包含52个 slice。CModel 中每个 slice 拥有一块 vector-wide SRAM，共65536个32-byte物理 row：即每个 slice 2 MiB、每个 hemisphere 104 MiB、东西半球共208 MiB。Command address metadata 还保留 legacy logical view：16个 bank、每个 bank 4096个 word、每个 command word 16 byte。分配器按 tensor role 使用 east hemisphere 的 SRAM row pool。函数输入在入口处存活，每个 SSA tensor 保留到最后一次使用；失效的 row range 会合并并通过 first-fit 策略复用。当前 operand 失效之前先分配 output，避免功能单元覆盖仍在读取的输入。
+已实现的 `ftlpu.tensor.matmul` 和 `ftlpu.tensor.swiglu` 使用物理 rank-6 MEM 地址元组 `[device, hemisphere, slice, bank, word, byte]`。共享的 `FTLPU-CMODEL/config/ftlpu-lpu32.json` target 每个 hemisphere 包含52个 slice，每个 slice 有两个8192-row、32-byte 的 SRAM bank：每 slice 512 KiB、每 hemisphere 26 MiB、东西半球共52 MiB。compiler profile JSON 只保存调度或 placement 覆盖项，物理 SRAM 和 MXM accumulator 容量统一来自共享硬件 JSON。分配器按 tensor role 使用 east hemisphere 的 SRAM row pool。函数输入在入口处存活，每个 SSA tensor 保留到最后一次使用；失效的 row range 会合并并通过 first-fit 策略复用。当前 operand 失效之前先分配 output，避免功能单元覆盖仍在读取的输入。
 
 Matmul placement 同时记录 CModel 所需的 row geometry。通用独立 matmul 路径的 MXM weight 采用 `mxm_weight_striped`，分布在 MEM slice 0..15；activation 使用从 slice 32 开始的 `vector` placement；int32 result 使用 slice 40..43 上的四个 `int32_byte_planar` plane。这些数值描述通用 matmul allocator，不代表下文当前 W8A16 SmolLM2 decoder profile。每个 placement 记录 slice 列表、基础 SRAM row、指令数和有符号地址 stride。通用 CModel matmul 约定 stride 为 16 row；weight Read 命令反向遍历 row。
 
@@ -158,7 +158,7 @@ RoPE 在公开 primitive 图中是独立 task，但 Schedule planner 会在相�
 
 每个 Q/K/V projection 一次处理两个 logical head：east hemisphere 负责第一个，west hemisphere 负责第二个。每个 hemisphere 内的两个 local MXM 分别计算 64-element head 的两个32-column half，因此完整的 two-head group 会让四个物理 MXM 同时工作。随后循环18个 hidden-dimension reduction block（`576 / 32`）和 4个 token block（`128 / 32`）；最后一个落单的 Q 或 KV head 只使用 east MXM pair。进入下一个 weight tile 之前，同一 weight buffer 会服务全部4个 token block。
 
-当前 W8A16 decoder 是上述各作用域的具体实例：编译期选择 target-derived slice set 和算子专用固定 row 区域，runtime 再对 resident data relocation `base_row`。下表描述 `cmodel_large_sram` 的编译器模板；resident variant 可以使用不同的 target-selected slice set，但必须保持相同 layout contract。
+当前 W8A16 decoder 是上述各作用域的具体实例：编译期选择 target-derived slice set 和算子专用固定 row 区域，runtime 再对 resident data relocation `base_row`。下表描述共享的8192-row硬件 target；resident variant 可以使用不同的 target-selected slice set，但必须保持相同 layout contract。
 
 持久化的 distributed activation ABI 使用两个 16-slice 组。下表 slice 编号是 hemisphere 内的 local slice，顺序是当前物理 lane 顺序：
 

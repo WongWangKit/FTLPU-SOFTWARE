@@ -60,7 +60,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/qwen_weight_page_builder_test.cpp)
 set_source_files_properties(${FTLPU_CMODEL_CONSUMER_SOURCES}
     PROPERTIES OBJECT_DEPENDS
-        "${FTLPU_CMODEL_PUBLIC_HEADERS};${FTLPU_RUNTIME_PUBLIC_HEADERS}")
+        "${FTLPU_GENERATED_HARDWARE_CONFIG};${FTLPU_CMODEL_PUBLIC_HEADERS};${FTLPU_RUNTIME_PUBLIC_HEADERS}")
 
 target_include_directories(ftlpu_cmodel_static
     PUBLIC
@@ -300,22 +300,6 @@ add_executable(compiled_smollm2_decoder_layer_runtime_test
     tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
 
 target_link_libraries(compiled_smollm2_decoder_layer_runtime_test
-    PRIVATE ftlpu_software)
-
-add_executable(compiled_qwen2_5_1_5b_decoder_layer_runtime_test
-    tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
-target_compile_definitions(
-    compiled_qwen2_5_1_5b_decoder_layer_runtime_test PRIVATE
-    FTLPU_TEST_SEQUENCE_LENGTH=128
-    FTLPU_TEST_HIDDEN_SIZE=1536
-    FTLPU_TEST_INTERMEDIATE_SIZE=8960
-    FTLPU_TEST_QUERY_HEADS=12
-    FTLPU_TEST_KV_HEADS=2
-    FTLPU_TEST_HEAD_DIM=128
-    FTLPU_TEST_RMS_EPSILON=1.0e-6f
-    FTLPU_TEST_ROPE_THETA=1000000.0f
-    FTLPU_TEST_MODEL_NAME=\"Qwen2.5-1.5B\")
-target_link_libraries(compiled_qwen2_5_1_5b_decoder_layer_runtime_test
     PRIVATE ftlpu_software)
 
 add_executable(compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test

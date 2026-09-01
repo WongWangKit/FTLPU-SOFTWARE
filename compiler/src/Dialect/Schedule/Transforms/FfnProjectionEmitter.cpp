@@ -104,11 +104,28 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         .getAs<mlir::ArrayAttr>("page_storage_slices");
                     const int64_t loadSliceCount =
                         static_cast<int64_t>(selectedWeightSlices.size());
+                    const int64_t storageOffset =
+                        sliceGroup * loadSliceCount;
+                    if (wavesPerPage <= 0 || itemsPerGroup <= 0
+                        || bankCount <= 0 || storageOffset < 0
+                        || storageOffset + loadSliceCount
+                            > static_cast<int64_t>(storage.size())) {
+                        ffn.getOperation()->emitError(
+                            "paged FFN projection slice group is outside "
+                            "page_storage_slices")
+                            << ": projection=" << projection
+                            << ", pair=" << pair
+                            << ", page=" << page
+                            << ", slice_group=" << sliceGroup
+                            << ", load_slices=" << loadSliceCount
+                            << ", storage_slices=" << storage.size();
+                        return mlir::failure();
+                    }
                     selectedWeightSlices.clear();
                     for (int64_t index = 0; index < loadSliceCount; ++index)
                         selectedWeightSlices.push_back(
                             llvm::cast<mlir::IntegerAttr>(
-                                storage[sliceGroup * loadSliceCount + index])
+                                storage[storageOffset + index])
                                 .getInt());
                     const int64_t logicalSlots = singleMxm ? 2 : 1;
                     base = ((localPair / logicalSlots) * (k / tile)

@@ -29,10 +29,12 @@ set(FTLPU_HARDWARE_CONFIG
     "Shared hardware target JSON used by FTLPU-SOFTWARE and FTLPU-CMODEL")
 set(FTLPU_GENERATED_INCLUDE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
+set(FTLPU_GENERATED_HARDWARE_CONFIG
+    "${FTLPU_GENERATED_INCLUDE_DIR}/ftlpu/core/hardware_config.hpp")
 include("${FTLPU_CMODEL_DIR}/cmake/FTLPUHardwareConfig.cmake")
 ftlpu_generate_hardware_config(
     "${FTLPU_HARDWARE_CONFIG}"
-    "${FTLPU_GENERATED_INCLUDE_DIR}/ftlpu/core/hardware_config.hpp")
+    "${FTLPU_GENERATED_HARDWARE_CONFIG}")
 
 enable_testing()
 

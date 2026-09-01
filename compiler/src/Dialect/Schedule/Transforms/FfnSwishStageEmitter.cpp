@@ -2,7 +2,6 @@
 
 #include "FfnEmitterUtils.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
-
 #include <algorithm>
 
 namespace ftlpu::compiler::schedule::ffn_detail {
@@ -196,27 +195,28 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
             for (const PendingOutput& pending : pendingOutputs) {
                 if (pending.source_hemisphere != sourceHemisphere) continue;
                 const int64_t token = pending.m_tile * tile + pending.row;
-                const int64_t tokenWithinBlock = token % tile;
-                const int64_t tokenWave = tokenWithinBlock
-                    / throughput.mxm_block_rows;
-                const int64_t tokenLane = tokenWithinBlock
-                    % throughput.mxm_block_rows;
                 const int64_t nblock = (pending.pair / 2) * 4
                     + pending.source_hemisphere * 2 + pending.pair % 2;
                 const int64_t owner = 1 - pending.source_hemisphere;
                 const int64_t peer = pending.source_hemisphere;
                 for (int64_t byte = 0; byte < 2; ++byte) {
-                        const int64_t slice = hiddenDistributed16
-                            ? context.hidden_slices[2 * tokenLane + byte]
-                            : context.hidden_slices[
-                                2 * (nblock % 2) + byte];
-                        const int64_t address = hiddenDistributed16
-                            ? hiddenBase
-                                + ((token / tile) * hiddenBlocks + nblock)
-                                    * throughput.tile_rows
-                                + tokenWave
-                            : hiddenBase
-                                + (nblock / 2) * context.m() + token;
+                    int64_t slice = context.hidden_slices[
+                        2 * (nblock % 2) + byte];
+                    int64_t address = hiddenBase
+                        + (nblock / 2) * context.m() + token;
+                    if (hiddenDistributed16) {
+                        const int64_t tokenWithinBlock = token % tile;
+                        const int64_t tokenWave = tokenWithinBlock
+                            / throughput.mxm_block_rows;
+                        const int64_t tokenLane = tokenWithinBlock
+                            % throughput.mxm_block_rows;
+                        slice = context.hidden_slices[
+                            2 * tokenLane + byte];
+                        address = hiddenBase
+                            + ((token / tile) * hiddenBlocks + nblock)
+                                * throughput.tile_rows
+                            + tokenWave;
+                    }
                     const auto readLatency = target.transport_latency(
                         target::StreamEndpoint::Mem,
                         target::StreamEndpoint::VxmInput,
@@ -242,7 +242,10 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                     auto placement = schedule_placement(context.rewriter,
                         {slice}, address, 1, 1,
                         context.hemisphereName(peer),
-                        "fp16_mxm_distributed_16", hiddenBank);
+                        hiddenDistributed16
+                            ? "fp16_mxm_distributed_16"
+                            : "fp16_mxm_activation_planar",
+                        hiddenBank);
                     auto write = context.rewriter.create<MemWriteOp>(
                         ffn.getLoc(), read.getOutput(),
                         bridgeInputCycle + *writeLatency,

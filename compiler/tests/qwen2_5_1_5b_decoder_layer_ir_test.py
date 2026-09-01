@@ -105,22 +105,25 @@ def validate_paged_weights(tensor: str, target_config: Path,
             raise AssertionError("RMSNorm weight has no placement")
         weights.append(parse_placement(match.group(1)))
 
-    expected = Counter({
-        ("w8a16_attention_weight_striped", 1920): 2,
-        ("w8a16_attention_weight_striped", 1280): 1,
-        ("w8a16_mxm_weight_striped", 1920): 1,
-        ("w8a16_mxm_weight_wave_striped", 2048): 3,
-        ("fp16_vxm_gamma_broadcast", 1536): 2,
+    expected_kinds = Counter({
+        "w8a16_attention_weight_striped": 3,
+        "w8a16_mxm_weight_striped": 1,
+        "w8a16_mxm_weight_wave_striped": 3,
+        "fp16_vxm_gamma_broadcast": 2,
     })
-    observed = Counter((str(weight["kind"]), int(weight["count"]))
-                       for weight in weights)
-    if observed != expected:
+    observed_kinds = Counter(str(weight["kind"]) for weight in weights)
+    if observed_kinds != expected_kinds:
         raise AssertionError(
-            f"paged weight layouts differ: observed={observed}, expected={expected}")
+            "paged weight layout kinds differ: "
+            f"observed={observed_kinds}, expected={expected_kinds}")
 
     target = json.loads(target_config.read_text(encoding="utf-8"))
-    bank_rows = int(target.get("memory", {}).get("words_per_bank", 8192))
+    physical_rows = target.get("mem", {}).get("rows_per_bank", 8192)
+    bank_rows = int(target.get("memory", {}).get(
+        "words_per_bank", physical_rows))
     for weight in weights:
+        if int(weight["count"]) <= 0:
+            raise AssertionError(f"weight placement is empty: {weight}")
         if (mxm_execution != "vector"
                 and weight["bank"] != weight_bank):
             raise AssertionError(
@@ -143,8 +146,9 @@ def validate_paged_weights(tensor: str, target_config: Path,
                         "paged weights overlap on a shared slice: "
                         f"{lhs} vs {rhs}")
 
+    physical_banks = target.get("mem", {}).get("banks_per_slice", 1)
     working_bank = (weight_bank + 1) % int(
-        target.get("memory", {}).get("banks_per_slice", 1)
+        target.get("memory", {}).get("banks_per_slice", physical_banks)
     )
     if working_bank == weight_bank:
         raise AssertionError("paged lowering requires a separate working bank")

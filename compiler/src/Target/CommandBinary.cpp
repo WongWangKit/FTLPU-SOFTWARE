@@ -301,6 +301,10 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::Fp16ProbabilityX16;
     if (value == "fp16_probability_diagonal")
         return BindingLayout::Fp16ProbabilityDiagonal;
+    if (value == "fp16_value_x16")
+        return BindingLayout::Fp16ValueX16;
+    if (value == "fp16_head_planar")
+        return BindingLayout::Fp16HeadPlanar;
     throw std::runtime_error("unsupported Command IR binding layout");
 }
 

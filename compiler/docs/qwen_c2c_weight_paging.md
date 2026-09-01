@@ -23,8 +23,8 @@ the C2C path. Device-resident aliases between decoder layers remain internal.
 
 - Each MEM slice has two independent single-port SRAM banks.
 - A MEM ICU queue identifies `(hemisphere, slice, bank)`.
-- SRAM addresses are bank-local rows; each row is 32 bytes. The 128 KiB-per-
-  superlane profile has two 64 KiB banks, so each bank exposes rows `0..2047`.
+- SRAM addresses are bank-local rows; each row is 32 bytes. The shared target
+  has two 256 KiB banks, so each bank exposes rows `0..8191`.
 - A bank-0 read may issue in the same cycle as a bank-1 write. Operations in one bank still obey its single-port constraint.
 - Compute keeps the original 32 eastward and 32 westward streams. C2C exposes
   a target-configurable external pool, defaulting to 8 lanes per direction. A
@@ -53,8 +53,8 @@ in Tensor IR instead of being attached to Command IR afterward.
 
 ### Dedicated Slice Roles
 
-The 128 KiB vector deployment target
-`cmodel_128kb_superlane_vector.json` separates each 52-slice hemisphere into
+The shared hardware target `../FTLPU-CMODEL/config/ftlpu-lpu32.json` separates
+each 52-slice hemisphere into
 activation/workspace slices `0..19` and MXM-local weight slices `20..51`.
 Slices `0..15` provide the distributed-16 activation plane required by SXM;
 `16..19` are auxiliary activation workspace. MXM accumulators are local to the
@@ -69,7 +69,7 @@ permits overlap; neither path may bypass the external C2C boundary.
 This partition removes transport and port conflicts; it does not increase
 capacity. For Qwen2.5-1.5B FFN at sequence length 32, the generic Vector planner
 uses four 8-slice weight groups. Gate and Up share seven ping-pong pages, while
-Down uses twelve pages. Every page stays within 2048 rows per bank. Block8's
+Down uses twelve pages. Every page stays within 8192 rows per bank. Block8's
 packed page remains a separate valid layout.
 
 ## Execution
@@ -129,7 +129,7 @@ python compiler/tools/build_hf_decoder_stack.py `
   --opt build-ftlpu-vs2026/compiler/ftlpu_opt.exe `
   --translate build-ftlpu-vs2026/compiler/ftlpu-translate.exe `
   --stablehlo compiler/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir `
-  --target-config compiler/examples/targets/cmodel_large_sram.json `
+  --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
   --pack-model-weights build-ftlpu-vs2026/runtime/ftlpu-pack-model-weights.exe `
   --c2c-weight-paging --layer-count 2 --seq-len 128 `
   --output-dir build-ftlpu-vs2026/qwen_two_layer `

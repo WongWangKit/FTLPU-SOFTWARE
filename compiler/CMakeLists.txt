@@ -181,7 +181,7 @@ set(FTLPU_TARGET_MODEL_CONSUMER_SOURCES
     tests/physical_memory_allocator_test.cpp)
 set_source_files_properties(${FTLPU_TARGET_MODEL_CONSUMER_SOURCES}
     PROPERTIES OBJECT_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${CMAKE_SOURCE_DIR}/runtime/include/ftlpu/software/runtime/target_abi.hpp")
+        "${FTLPU_GENERATED_HARDWARE_CONFIG};${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${CMAKE_SOURCE_DIR}/runtime/include/ftlpu/software/runtime/target_abi.hpp")
 set(FTLPU_ATTENTION_EMITTER_CONSUMER_SOURCES
     src/Dialect/Schedule/Transforms/AttentionEmitterUtils.cpp
     src/Dialect/Schedule/Transforms/AttentionProjectionEmitter.cpp
@@ -198,11 +198,13 @@ set_property(SOURCE ${FTLPU_ATTENTION_EMITTER_CONSUMER_SOURCES}
 set_property(SOURCE src/Dialect/Schedule/IR/ScheduleDialect.cpp
     APPEND PROPERTY OBJECT_DEPENDS
         "${CMAKE_CURRENT_BINARY_DIR}/ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.cpp.inc")
+file(GLOB_RECURSE FTLPU_CMODEL_COMPILER_HEADERS CONFIGURE_DEPENDS
+    "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
 set_source_files_properties(
     src/Target/CommandBinary.cpp
     tools/ftlpu_translate.cpp
     PROPERTIES OBJECT_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${FTLPU_RUNTIME_ABI_HEADERS}")
+        "${FTLPU_GENERATED_HARDWARE_CONFIG};${FTLPU_CMODEL_COMPILER_HEADERS};${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${FTLPU_RUNTIME_ABI_HEADERS}")
 
 add_dependencies(ftlpu_compiler FTLPUKernelOpsIncGen FTLPUTensorOpsIncGen
     FTLPUStreamOpsIncGen FTLPUScheduleOpsIncGen FTLPUCommandOpsIncGen)
@@ -316,36 +318,29 @@ if(Python3_Interpreter_FOUND)
             ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/build_hf_decoder_stack_paging_test.py)
     add_test(
-        NAME qwen2_5_1_5b_decoder_layer_stablehlo_to_stream_ir_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_ir_test.py
-            --tool $<TARGET_FILE:ftlpu_opt>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer)
-    add_test(
-        NAME qwen2_5_1_5b_paged_weight_layout_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_ir_test.py
-            --tool $<TARGET_FILE:ftlpu_opt>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
-            --weight-bank 1
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_paged)
-    add_test(
-        NAME qwen2_5_1_5b_vector_128kb_memory_layout_test
+        NAME qwen2_5_1_5b_decoder_layer_seq32_vector_ir_test
         COMMAND
             ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_ir_test.py
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_128kb_superlane_vector.json
+            --target-config ${FTLPU_HARDWARE_CONFIG}
             --weight-bank 0
             --mxm-execution vector
             --seq-len 32
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_vector_128kb)
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer)
+    add_test(
+        NAME qwen2_5_1_5b_decoder_layer_seq32_vector_weight_bank1_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_ir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --weight-bank 1
+            --mxm-execution vector
+            --seq-len 32
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_paged)
     add_custom_target(
         qwen2_5_1_5b_decoder_layer_pipeline
         COMMAND
@@ -353,8 +348,8 @@ if(Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decoder_layer_pipeline_test.py
             --opt $<TARGET_FILE:ftlpu_opt>
             --compile $<TARGET_FILE:ftlpu_compile>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
+            --target-config ${FTLPU_HARDWARE_CONFIG}
             --weight-bank 1
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer
         DEPENDS ftlpu_opt ftlpu_compile
@@ -366,7 +361,7 @@ if(Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/lm_head_tensor_ir_test.py
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/lm_head/lm_head_128x576x4096.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --target-config ${FTLPU_HARDWARE_CONFIG}
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/lm_head/lm_head.tensor.mlir)
     if(EXISTS "${CMAKE_SOURCE_DIR}/.cache/hf/SmolLM2-135M/model.safetensors")
         add_test(
@@ -378,7 +373,7 @@ if(Python3_Interpreter_FOUND)
                 --translate $<TARGET_FILE:ftlpu_translate>
                 --runtime-test $<TARGET_FILE:compiled_smollm2_lm_head_runtime_test>
                 --model-dir ${CMAKE_SOURCE_DIR}/.cache/hf/SmolLM2-135M
-                --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+                --target-config ${FTLPU_HARDWARE_CONFIG}
                 --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_lm_head)
         set_tests_properties(
             smollm2_135m_real_int8_lm_head_cmodel_test
@@ -392,7 +387,7 @@ if(Python3_Interpreter_FOUND)
                 --translate $<TARGET_FILE:ftlpu_translate>
                 --runtime-test $<TARGET_FILE:compiled_smollm2_lm_head_runtime_test>
                 --model-dir ${CMAKE_SOURCE_DIR}/.cache/hf/SmolLM2-135M
-                --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+                --target-config ${FTLPU_HARDWARE_CONFIG}
                 --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_lm_head
             DEPENDS
                 ftlpu_opt
@@ -431,6 +426,7 @@ if(Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/target_configuration_test.py
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64_bf16.stablehlo.mlir
+            --hardware-config ${FTLPU_HARDWARE_CONFIG}
             --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/exploration_40_streams.json
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/lpu_target_configuration)
     add_test(
@@ -519,7 +515,7 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:compiled_smollm2_attention_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_attention/attention_seq128.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_attention_binary_runtime
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --target-config ${FTLPU_HARDWARE_CONFIG}
             --attention-schedule fused)
     add_test(
         NAME smollm2_decoder_layer_binary_cmodel_runtime_test
@@ -530,7 +526,7 @@ if(Python3_Interpreter_FOUND)
             --translate $<TARGET_FILE:ftlpu_translate>
             --runtime-test $<TARGET_FILE:compiled_smollm2_decoder_layer_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_decoder_layer/decoder_layer_seq128.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_decoder_layer_binary_runtime)
     add_custom_target(
         smollm2_decoder_layer_pipeline
@@ -541,7 +537,7 @@ if(Python3_Interpreter_FOUND)
             --translate $<TARGET_FILE:ftlpu_translate>
             --runtime-test $<TARGET_FILE:compiled_smollm2_decoder_layer_runtime_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_decoder_layer/decoder_layer_seq128.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_decoder_layer_pipeline
             --trace
             --render
@@ -557,7 +553,7 @@ if(Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/schedule_wave_compression_test.py
             --opt $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/schedule_wave_compression.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
+            --target-config ${FTLPU_HARDWARE_CONFIG}
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/schedule_wave_compression/command.mlir)
     add_test(
         NAME stablehlo_matmul_320_to_ftlpu_kernel_mlir_test
@@ -651,15 +647,4 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:command_cmodel_compat_binary_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/command_cmodel_compat.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_command_cmodel_compat/command_cmodel_compat.ftlpu)
-    add_test(
-        NAME direct_binary_compile_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/direct_binary_compile_test.py
-            --opt $<TARGET_FILE:ftlpu_opt>
-            --translate $<TARGET_FILE:ftlpu_translate>
-            --compile $<TARGET_FILE:ftlpu_compile>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64_bf16.stablehlo.mlir
-            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/cmodel_large_sram.json
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/direct_binary_compile)
 endif()

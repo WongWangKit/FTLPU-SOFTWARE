@@ -114,12 +114,18 @@ BindingOp createOutputBinding(mlir::IRRewriter& rewriter,
 {
     const auto type =
         llvm::cast<mlir::RankedTensorType>(op.getResult().getType());
+    std::string bindingName = "elementwise.";
+    bindingName.append(op.getKind());
+    bindingName.push_back('.');
+    bindingName.append(std::to_string(index));
     mlir::OperationState state(op.getLoc(), BindingOp::getOperationName());
     state.addTypes(type);
     state.addAttributes({
         rewriter.getNamedAttr("index", rewriter.getI64IntegerAttr(index)),
         rewriter.getNamedAttr("access", rewriter.getStringAttr("output")),
         rewriter.getNamedAttr("role", rewriter.getStringAttr("result")),
+        rewriter.getNamedAttr(
+            "name", rewriter.getStringAttr(bindingName)),
         rewriter.getNamedAttr("bytes", rewriter.getI64IntegerAttr(
             type.getNumElements() * 2)),
         rewriter.getNamedAttr("placement", placement),

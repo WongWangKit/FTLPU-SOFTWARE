@@ -16,7 +16,7 @@ python compiler/tests/qwen2_5_1_5b_decoder_layer_pipeline_test.py `
   --opt build-ftlpu-vs2026/compiler/ftlpu_opt.exe `
   --compile build-ftlpu-vs2026/compiler/ftlpu-compile.exe `
   --input compiler/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir `
-  --target-config compiler/examples/targets/cmodel_large_sram.json `
+  --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
   --weight-bank 1 `
   --output-dir build-ftlpu-vs2026/compiler/ftlpu_lower/qwen2_5_1_5b_seq32
 ```

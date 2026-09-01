@@ -166,6 +166,39 @@ std::size_t firstBindingReadCycle(
         for (std::size_t commandIndex = 0;
              commandIndex <= relocation.command_index; ++commandIndex) {
             const auto& command = queue->commands[commandIndex];
+            if (ftlpu::software::runtime::is_macro_schedule_command(
+                    command)) {
+                const auto schedule =
+                    ftlpu::software::runtime::decode_macro_schedule_command(
+                        command);
+                if (commandIndex == relocation.command_index) {
+                    if (command.instruction_kind
+                        != ftlpu::software::runtime::InstructionKind::Mem)
+                        throw std::logic_error(
+                            "binding relocation does not reference a MEM macro");
+                    const auto encoded =
+                        static_cast<ftlpu::isa::EncodedMemInstruction>(
+                            command.words[0])
+                        | (static_cast<ftlpu::isa::EncodedMemInstruction>(
+                               command.words[1])
+                            << 32);
+                    if (ftlpu::isa::decode_mem_instruction(encoded).opcode
+                        != ftlpu::MemOpcode::Read)
+                        throw std::logic_error(
+                            "binding relocation does not reference a MEM read");
+                    firstCycle =
+                        std::min(firstCycle, schedule.start_cycle);
+                    break;
+                }
+                cycle = std::max(cycle,
+                    schedule.start_cycle
+                        + (schedule.outer_count - 1)
+                            * schedule.outer_interval
+                        + (schedule.inner_count - 1)
+                            * schedule.inner_interval
+                        + 1);
+                continue;
+            }
             if (ftlpu::software::runtime::is_repeat_2d_command(command)) {
                 const auto repeat =
                     ftlpu::software::runtime::decode_repeat_2d_command(
@@ -427,28 +460,18 @@ try {
         [&](const auto& binding) {
             return binding.access
                     == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "elementwise.add.0"
                 && binding.layout
                     == ftlpu::software::runtime::BindingLayout::
                         Fp16MxmDistributed16
                 && binding.byte_size == inputBinding->byte_size
-                && binding.base_row == inputBinding->base_row
-                && binding.slices != inputBinding->slices;
+                && binding.base_row == inputBinding->base_row;
         });
     if (residualBinding == program.bindings.end()
         || residualBinding->slices.size() != 16)
         throw std::logic_error(
             "cannot locate attention residual physical binding");
     const auto& residualSlices = residualBinding->slices;
-    const auto block8AttentionBinding = std::find_if(
-        program.bindings.begin(), program.bindings.end(),
-        [&](const auto& binding) {
-            return binding.access
-                    == ftlpu::software::runtime::BindingAccess::Internal
-                && binding.layout
-                    == ftlpu::software::runtime::BindingLayout::
-                        Fp16MxmBlock8Distributed16
-                && binding.byte_size == inputBinding->byte_size;
-        });
     const auto probabilityDiagonalBinding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
         [](const auto& binding) {
@@ -485,6 +508,20 @@ try {
             address, featureWave * 8 + featureLane, bank);
     };
     const auto normalized0 = rmsNorm(inputValues, 0);
+    const auto rms1Binding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "rmsnorm.result.0";
+        });
+    if (rms1Binding == program.bindings.end()
+        || rms1Binding->layout
+            != ftlpu::software::runtime::BindingLayout::
+                Fp16MxmDistributed16
+        || rms1Binding->slices.size() != 16)
+        throw std::logic_error(
+            "cannot locate first RMSNorm physical binding");
     const std::size_t attentionPrepackEndCycle =
         firstBindingReadCycle(program, 2);
     std::ofstream cmodelLog;
@@ -511,17 +548,19 @@ try {
     std::array<std::size_t, 2> prepackHemisphereMismatchCounts {};
     std::array<float, 2> prepackHemisphereMaxErrors {};
     const std::size_t rms1BaseRow =
-        static_cast<std::size_t>(inputBinding->base_row) + kHidden;
+        static_cast<std::size_t>(rms1Binding->base_row);
     for (std::size_t row = 0; row < kSeqLen; ++row) {
         for (std::size_t column = 0; column < kHidden; ++column) {
             const float observed = readMxmDistributed(
-                inputBinding->slices, rms1BaseRow, row, column);
+                rms1Binding->slices, rms1BaseRow, row, column,
+                ftlpu::Hemisphere::East, rms1Binding->bank);
             const float expected = normalized0[row * kHidden + column];
             const float error = std::fabs(observed - expected);
             for (std::size_t side = 0; side < 2; ++side) {
                 const float sideObserved = readMxmDistributed(
-                    inputBinding->slices, rms1BaseRow, row, column,
-                    static_cast<ftlpu::Hemisphere>(side));
+                    rms1Binding->slices, rms1BaseRow, row, column,
+                    static_cast<ftlpu::Hemisphere>(side),
+                    rms1Binding->bank);
                 const float sideError = std::fabs(sideObserved - expected);
                 prepackHemisphereMaxErrors[side] = std::max(
                     prepackHemisphereMaxErrors[side], sideError);
@@ -569,9 +608,9 @@ try {
             + " last_zero=(" + std::to_string(prepackLastZeroRow)
                 + "," + std::to_string(prepackLastZeroColumn) + ")"
             + " source=" + std::to_string(readMxmDistributed(
-                inputBinding->slices,
-                static_cast<std::size_t>(inputBinding->base_row) + kHidden,
-                prepackMaxRow, prepackMaxColumn))
+                rms1Binding->slices, rms1BaseRow,
+                prepackMaxRow, prepackMaxColumn,
+                ftlpu::Hemisphere::East, rms1Binding->bank))
             + " hemisphere_mismatches="
                 + arrayValues(prepackHemisphereMismatchCounts)
             + " hemisphere_max_errors="
@@ -585,23 +624,35 @@ try {
     const std::size_t qkvEndCycle =
         static_cast<std::size_t>(timeline(program, "qk").start_cycle);
     runtime.run_cycles(qkvEndCycle - attentionPrepackEndCycle);
-    constexpr std::array<std::array<std::size_t, 16>, 2>
-        kSingleMxmValuePackSlices {{
-            {{18, 19, 20, 21, 22, 23, 24, 25,
-                26, 27, 28, 29, 30, 31, 34, 35}},
-            {{18, 19, 20, 21, 22, 23, 24, 25,
-                26, 27, 28, 29, 30, 31, 34, 35}},
-        }};
-    constexpr std::array<std::array<std::size_t, 16>, 2>
-        kDualMxmValuePackSlices {{
-            {{0, 1, 2, 3, 8, 9, 10, 11,
-                12, 13, 14, 15, 16, 17, 32, 33}},
-            {{18, 19, 20, 21, 22, 23, 24, 25,
-                26, 27, 28, 29, 30, 31, 34, 35}},
-        }};
-    const auto& valuePackSlices =
-        program.hardware.mxms_per_hemisphere == 1
-        ? kSingleMxmValuePackSlices : kDualMxmValuePackSlices;
+    const auto valueBinding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "attention.value";
+        });
+    if (valueBinding == program.bindings.end()
+        || valueBinding->layout
+            != ftlpu::software::runtime::BindingLayout::Fp16ValueX16
+        || valueBinding->slices.empty()
+        || valueBinding->slices.size() % 16 != 0)
+        throw std::logic_error(
+            "decoder binary is missing attention value metadata");
+    const std::size_t valueSliceGroups =
+        valueBinding->slices.size() / 16;
+    const auto contextBinding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "attention.context";
+        });
+    if (contextBinding == program.bindings.end()
+        || contextBinding->layout
+            != ftlpu::software::runtime::BindingLayout::Fp16HeadPlanar
+        || contextBinding->slices.size() < 2 * kHeadBlocks)
+        throw std::logic_error(
+            "decoder binary is missing attention context metadata");
     for (std::size_t column = 0;
          column < kKvHeads * kHeadDim; ++column) {
         const std::size_t head = column / kHeadDim;
@@ -609,23 +660,25 @@ try {
         const std::size_t reduction = dimension / 32;
         const std::size_t stream = 0;
         const std::size_t address =
-            7800 + (head * kHeadBlocks + reduction)
+            static_cast<std::size_t>(valueBinding->base_row)
+            + (head * kHeadBlocks + reduction)
                 * kTokenBlocks * kTileRows;
-        const auto& reductionSlices =
-            valuePackSlices[reduction % valuePackSlices.size()];
+        const std::size_t sliceGroup =
+            (reduction % valueSliceGroups) * 16;
         const float observed = physicalBf16(
             static_cast<ftlpu::Hemisphere>(head % 2),
-            reductionSlices[stream],
-            reductionSlices[stream + 1],
-            address, dimension % 32);
+            valueBinding->slices[sliceGroup + stream],
+            valueBinding->slices[sliceGroup + stream + 1],
+            address, dimension % 32, valueBinding->bank);
         const float expected = bf16(
             normalized0[sourceHidden(2, column)]
             * projectionSign(2, column));
         const auto block = head * kHeadBlocks + reduction;
         const float sourceObserved = physicalBf16(
             static_cast<ftlpu::Hemisphere>((block % 4) / 2),
-            reductionSlices[stream], reductionSlices[stream + 1],
-            address, dimension % 32);
+            valueBinding->slices[sliceGroup + stream],
+            valueBinding->slices[sliceGroup + stream + 1],
+            address, dimension % 32, valueBinding->bank);
         if (sourceObserved != 0.0f) ++valueSourceNonzeroCounts[block];
         if (observed != 0.0f) ++valueDestinationNonzeroCounts[block];
         valueSourceMaxErrors[block] = std::max(
@@ -650,21 +703,27 @@ try {
         vxmRemaining[stage] = system->vxm_unit()
                                    .superlane(0)
                                    .remaining_executions(stage);
-    const auto& copiedBlockSlices = valuePackSlices[0];
+    const auto copiedBlockSlices = valueBinding->slices.begin();
     const float copiedToken4 = physicalBf16(
         ftlpu::Hemisphere::East,
         copiedBlockSlices[8], copiedBlockSlices[9],
-        7800 + 2 * kTokenBlocks * kTileRows, 0);
+        static_cast<std::size_t>(valueBinding->base_row)
+            + 2 * kTokenBlocks * kTileRows,
+        0, valueBinding->bank);
     const float copiedToken4Expected = bf16(
         normalized0[4 * kHidden + sourceHidden(2, 64)]
         * projectionSign(2, 64));
     const std::array<float, 2> remoteSourceSamples {{
         physicalBf16(ftlpu::Hemisphere::West,
-            valuePackSlices[0][0], valuePackSlices[0][1],
-            7800 + 2 * kTokenBlocks * kTileRows, 0),
+            copiedBlockSlices[0], copiedBlockSlices[1],
+            static_cast<std::size_t>(valueBinding->base_row)
+                + 2 * kTokenBlocks * kTileRows,
+            0, valueBinding->bank),
         physicalBf16(ftlpu::Hemisphere::East,
-            valuePackSlices[0][0], valuePackSlices[0][1],
-            7800 + 4 * kTokenBlocks * kTileRows, 0),
+            copiedBlockSlices[0], copiedBlockSlices[1],
+            static_cast<std::size_t>(valueBinding->base_row)
+                + 4 * kTokenBlocks * kTileRows,
+            0, valueBinding->bank),
     }};
     const std::array<std::size_t, 2> passiveBridgeCounts {{
         system->passive_bridge_transfer_count(
@@ -847,9 +906,11 @@ try {
                 const std::size_t hemisphere = kvHead % 2;
                 const float observed = physicalBf16(
                     static_cast<ftlpu::Hemisphere>(hemisphere),
-                    44 + headBlock * 2, 45 + headBlock * 2,
-                    2000 + head * kSeqLen + row,
-                    dimension % 32);
+                    contextBinding->slices[headBlock * 2],
+                    contextBinding->slices[headBlock * 2 + 1],
+                    static_cast<std::size_t>(contextBinding->base_row)
+                        + head * kSeqLen + row,
+                    dimension % 32, contextBinding->bank);
                 const float expected =
                     checkpointContext[row * kHidden + column];
                 const float error = std::fabs(observed - expected);
@@ -901,6 +962,16 @@ try {
     std::size_t outputProjectionReplicaMaxRow = 0;
     std::size_t outputProjectionReplicaMaxColumn = 0;
     float outputProjectionReplicaMaxActual = 0.0f;
+    const auto attentionResultBinding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "attention.result";
+        });
+    if (attentionResultBinding == program.bindings.end())
+        throw std::logic_error(
+            "decoder binary is missing attention result metadata");
     for (std::size_t row = 0; row < kSeqLen; ++row) {
         for (std::size_t column = 0; column < kHidden; ++column) {
             float expected = 0.0f;
@@ -913,7 +984,9 @@ try {
             }
             expected = bf16(expected);
             float observed = 0.0f;
-            if (block8AttentionBinding != program.bindings.end()) {
+            if (attentionResultBinding->layout
+                == ftlpu::software::runtime::BindingLayout::
+                    Fp16MxmBlock8Distributed16) {
                 const std::size_t hiddenBlocks = kHidden / 32;
                 const std::size_t tokenBlock = row / 32;
                 const std::size_t tokenWave = (row % 32) / 8;
@@ -923,7 +996,7 @@ try {
                 const std::size_t featureLane = column % 8;
                 const std::size_t address =
                     static_cast<std::size_t>(
-                        block8AttentionBinding->base_row)
+                        attentionResultBinding->base_row)
                     + (tokenBlock * hiddenBlocks + hiddenBlock) * 4
                     + tokenWave;
                 const std::size_t mxmsPerHemisphere =
@@ -931,15 +1004,17 @@ try {
                 const auto hemisphere = static_cast<ftlpu::Hemisphere>(
                     (hiddenBlock / mxmsPerHemisphere) % 2);
                 observed = physicalBf16(hemisphere,
-                    block8AttentionBinding->slices[2 * tokenLane],
-                    block8AttentionBinding->slices[2 * tokenLane + 1],
-                    address, featureWave * 8 + featureLane);
+                    attentionResultBinding->slices[2 * tokenLane],
+                    attentionResultBinding->slices[2 * tokenLane + 1],
+                    address, featureWave * 8 + featureLane,
+                    attentionResultBinding->bank);
                 for (std::size_t side = 0; side < 2; ++side) {
                     const float replica = physicalBf16(
                         static_cast<ftlpu::Hemisphere>(side),
-                        block8AttentionBinding->slices[2 * tokenLane],
-                        block8AttentionBinding->slices[2 * tokenLane + 1],
-                        address, featureWave * 8 + featureLane);
+                        attentionResultBinding->slices[2 * tokenLane],
+                        attentionResultBinding->slices[2 * tokenLane + 1],
+                        address, featureWave * 8 + featureLane,
+                        attentionResultBinding->bank);
                     const float replicaError =
                         std::fabs(replica - expected);
                     if (replicaError > outputProjectionReplicaMaxError) {
@@ -951,11 +1026,21 @@ try {
                     }
                 }
             } else {
+                if (attentionResultBinding->layout
+                        != ftlpu::software::runtime::BindingLayout::
+                            Fp16PairPlanar
+                    || attentionResultBinding->slices.size() < 4)
+                    throw std::logic_error(
+                        "attention result has an unsupported vector layout");
                 const std::size_t pair = (column % 64) / 32;
                 observed = physicalBf16(
-                    ftlpu::Hemisphere::East, 28 + pair * 2,
-                    29 + pair * 2, (column / 64) * kSeqLen + row,
-                    column % 32);
+                    ftlpu::Hemisphere::East,
+                    attentionResultBinding->slices[pair * 2],
+                    attentionResultBinding->slices[pair * 2 + 1],
+                    static_cast<std::size_t>(
+                        attentionResultBinding->base_row)
+                        + (column / 64) * kSeqLen + row,
+                    column % 32, attentionResultBinding->bank);
             }
             const float error = std::fabs(observed - expected);
             if (error > outputProjectionMaxError) {
@@ -1045,10 +1130,25 @@ try {
     runtime.upload_input(7, gateWeight);
     runtime.upload_input(8, upWeight);
     runtime.upload_input(9, downWeight);
+    const auto rms2Binding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "rmsnorm.result.1";
+        });
+    if (rms2Binding == program.bindings.end()
+        || rms2Binding->layout
+            != ftlpu::software::runtime::BindingLayout::
+                Fp16MxmDistributed16
+        || rms2Binding->slices.size() != 16)
+        throw std::logic_error(
+            "cannot locate second RMSNorm physical binding");
     const std::size_t rms2BaseRow =
-        static_cast<std::size_t>(inputBinding->base_row) + kHidden;
+        static_cast<std::size_t>(rms2Binding->base_row);
     const float rms2Value = readMxmDistributed(
-        inputBinding->slices, rms2BaseRow, 0, 0);
+        rms2Binding->slices, rms2BaseRow, 0, 0,
+        ftlpu::Hemisphere::East, rms2Binding->bank);
     if (!std::isfinite(rms2Value) || rms2Value == 0.0f)
         throw std::logic_error(
             "RMS2 stage produced invalid data value="
@@ -1064,7 +1164,8 @@ try {
         for (std::size_t column = 0; column < kHidden; ++column) {
             const std::size_t index = row * kHidden + column;
             rms2Output[index] = readMxmDistributed(
-                inputBinding->slices, rms2BaseRow, row, column);
+                rms2Binding->slices, rms2BaseRow, row, column,
+                ftlpu::Hemisphere::East, rms2Binding->bank);
             const float error = std::fabs(
                 rms2Output[index] - expectedRms2Output[index]);
             if (error > rms2CheckpointMaxError) {
@@ -1092,19 +1193,14 @@ try {
         static_cast<std::size_t>(
             timeline(program, "elementwise.add", 1).start_cycle);
     runtime.run_cycles(finalResidualStartCycle - ffnStartCycle);
-    const auto block8FfnBinding = std::find_if(
+    const auto ffnBinding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
-        [&](const auto& binding) {
+        [](const auto& binding) {
             return binding.access
                     == ftlpu::software::runtime::BindingAccess::Internal
-                && binding.layout
-                    == ftlpu::software::runtime::BindingLayout::
-                        Fp16MxmBlock8Distributed16
-                && binding.byte_size == inputBinding->byte_size
-                && binding.bank == 1;
+                && binding.name == "ffn.result";
         });
-    if (block8FfnBinding == program.bindings.end()
-        || block8FfnBinding->slices.size() != 16)
+    if (ffnBinding == program.bindings.end())
         throw std::logic_error(
             "cannot locate FFN down-projection physical binding");
     const auto hiddenValue = [&](std::size_t row, std::size_t h) {
@@ -1124,18 +1220,51 @@ try {
             const float expected =
                 bf16(hiddenValue(row, h0) - hiddenValue(row, h1));
             const std::size_t outputBlock = column / 32;
-            const auto owner = static_cast<ftlpu::Hemisphere>(
-                outputBlock % 2);
-            const auto replica = static_cast<ftlpu::Hemisphere>(
-                1 - outputBlock % 2);
-            const float ownerValue = readMxmDistributed(
-                block8FfnBinding->slices,
-                static_cast<std::size_t>(block8FfnBinding->base_row),
-                row, column, owner, block8FfnBinding->bank);
-            const float replicaValue = readMxmDistributed(
-                block8FfnBinding->slices,
-                static_cast<std::size_t>(block8FfnBinding->base_row),
-                row, column, replica, block8FfnBinding->bank);
+            float ownerValue = 0.0f;
+            float replicaValue = 0.0f;
+            auto owner = ftlpu::Hemisphere::East;
+            auto replica = ftlpu::Hemisphere::West;
+            if (ffnBinding->layout
+                == ftlpu::software::runtime::BindingLayout::
+                    Fp16MxmBlock8Distributed16) {
+                if (ffnBinding->slices.size() != 16)
+                    throw std::logic_error(
+                        "FFN Block8 result requires 16 slices");
+                owner = static_cast<ftlpu::Hemisphere>(outputBlock % 2);
+                replica = static_cast<ftlpu::Hemisphere>(1 - outputBlock % 2);
+                ownerValue = readMxmDistributed(
+                    ffnBinding->slices,
+                    static_cast<std::size_t>(ffnBinding->base_row),
+                    row, column, owner, ffnBinding->bank);
+                replicaValue = readMxmDistributed(
+                    ffnBinding->slices,
+                    static_cast<std::size_t>(ffnBinding->base_row),
+                    row, column, replica, ffnBinding->bank);
+            } else if (ffnBinding->layout
+                == ftlpu::software::runtime::BindingLayout::Fp16PairPlanar) {
+                if (ffnBinding->slices.size() < 4)
+                    throw std::logic_error(
+                        "FFN vector result requires four planar slices");
+                owner = static_cast<ftlpu::Hemisphere>(
+                    (outputBlock % 4) / 2);
+                replica = static_cast<ftlpu::Hemisphere>(1
+                    - static_cast<std::size_t>(owner));
+                const std::size_t pair = outputBlock % 2;
+                const std::size_t address =
+                    static_cast<std::size_t>(ffnBinding->base_row)
+                    + (outputBlock / 4) * kSeqLen + row;
+                ownerValue = physicalBf16(owner,
+                    ffnBinding->slices[pair * 2],
+                    ffnBinding->slices[pair * 2 + 1], address,
+                    column % 32, ffnBinding->bank);
+                // Vector down partitions each four-block wave across the two
+                // hemispheres. The opposite side owns a different output
+                // block at the same local address; it is not a replica.
+                replicaValue = expected;
+            } else {
+                throw std::logic_error(
+                    "FFN result has an unsupported physical layout");
+            }
             ffnOutput[row * kHidden + column] = ownerValue;
             const float ownerError = std::fabs(ownerValue - expected);
             const float replicaError = std::fabs(replicaValue - expected);
@@ -1155,9 +1284,9 @@ try {
                     + " h0=" + std::to_string(h0)
                     + " h1=" + std::to_string(h1)
                     + " bank="
-                    + std::to_string(block8FfnBinding->bank)
+                    + std::to_string(ffnBinding->bank)
                     + " base_row="
-                    + std::to_string(block8FfnBinding->base_row));
+                    + std::to_string(ffnBinding->base_row));
         }
     }
     const float preFinalResidualSample = readMxmDistributed(

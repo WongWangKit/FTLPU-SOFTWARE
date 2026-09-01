@@ -3,6 +3,8 @@
 #include "FfnEmitterUtils.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 
+#include <algorithm>
+
 namespace ftlpu::compiler::schedule::ffn_detail {
 
 mlir::FailureOr<mlir::Value> emitFfnDownProjection(
@@ -41,6 +43,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         context.weight_slices, context.hidden_slices,
         context.result_slices, target);
     if (mlir::failed(timeline)) return mlir::failure();
+    int64_t downEnd = timeline->phase_start;
 
     for (const FfnDownBlockSchedule& block : timeline->blocks) {
         const int64_t outputWave = block.output_wave;
@@ -143,6 +146,10 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         for (const FfnDownTileSchedule& tileSchedule : block.tiles) {
             const int64_t mTile = tileSchedule.m_tile;
             const int64_t computeCycle = tileSchedule.compute_cycle;
+            downEnd = std::max(downEnd,
+                computeCycle
+                    + (singleMxm ? projectionSlotInterval : 0)
+                    + target.mxm_first_result_latency() + tile);
             for (int64_t hemisphere = 0;
                  hemisphere < activeHemispheres; ++hemisphere) {
                 MxmComputeOp down0;
@@ -354,6 +361,17 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
             }
         }
     }
+    mlir::OperationState timelineState(
+        ffn.getLoc(), TimelineOp::getOperationName());
+    timelineState.addAttributes({
+        rewriter.getNamedAttr(
+            "name", rewriter.getStringAttr("ffn.down.vector")),
+        rewriter.getNamedAttr(
+            "start", rewriter.getI64IntegerAttr(timeline->phase_start)),
+        rewriter.getNamedAttr(
+            "end", rewriter.getI64IntegerAttr(downEnd)),
+    });
+    rewriter.create(timelineState);
     auto resultType = llvm::cast<mlir::RankedTensorType>(
         ffn.getResult().getType());
     mlir::OperationState bindingState(
@@ -366,6 +384,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
             context.rewriter.getStringAttr("output")),
         context.rewriter.getNamedAttr("role",
             context.rewriter.getStringAttr("result")),
+        context.rewriter.getNamedAttr("name",
+            context.rewriter.getStringAttr("ffn.result")),
         context.rewriter.getNamedAttr("bytes",
             context.rewriter.getI64IntegerAttr(
                 resultType.getNumElements() * 2)),
