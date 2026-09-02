@@ -111,6 +111,25 @@ int main() try
             - singleMxmProjection->blocks[0].weight_compute_cycle
             == singleMxmProjection->weight_block_interval,
         "single-MXM FFN delayed compute instead of retiming weight load");
+    auto residencyFirstProjection = schedule::planFfnProjectionTimeline(
+        {32, 576, 1536, 576}, weightSlices, singleMxmTarget, true,
+        false, schedule::FfnProjectionOrder::UpThenGate);
+    require(mlir::succeeded(residencyFirstProjection),
+        "residency-first FFN projection timeline failed");
+    require(residencyFirstProjection->projection_order
+                == schedule::FfnProjectionOrder::UpThenGate
+            && residencyFirstProjection->second_projection_offset > 0,
+        "residency-first FFN did not serialize its projections");
+    require(residencyFirstProjection->blocks[1].weight_compute_cycle
+            - residencyFirstProjection->blocks[0].weight_compute_cycle
+            == residencyFirstProjection->projection_slot_interval,
+        "residency-first FFN left a bubble between projection blocks");
+    require(residencyFirstProjection->blocks[0].weight_buffer == 0
+            && residencyFirstProjection->blocks[1].weight_buffer == 1,
+        "residency-first FFN did not make both weight buffers available");
+    require(residencyFirstProjection->final_projection_cycle
+            > residencyFirstProjection->second_projection_offset,
+        "residency-first FFN final cycle does not include both phases");
     for (const auto& block : projection->blocks) {
         for (const auto& tile : block.tiles) {
             for (const auto& hemisphere : tile.hemisphere_segments) {
@@ -129,7 +148,7 @@ int main() try
         36, 37, 38, 39};
     auto down = schedule::planFfnDownProjectionTimeline(
         {128, 576, 1536, 576}, *projection, 1000, weightSlices,
-        hiddenSlices, resultSlices, target);
+        hiddenSlices, resultSlices, target, 0);
     require(mlir::succeeded(down), "FFN down timeline failed");
     const int64_t logicalOutputSlotsPerHemisphere =
         std::max<int64_t>(2,
@@ -153,7 +172,12 @@ int main() try
         "FFN down timeline changed the default stream layout");
     require(down->blocks.front().weight_compute_cycle
             == down->phase_start + projection->initial_compute_cycle,
-        "FFN down timeline has the wrong phase offset");
+        "FFN down timeline has the wrong phase offset: compute="
+            + std::to_string(
+                down->blocks.front().weight_compute_cycle)
+            + " phase=" + std::to_string(down->phase_start)
+            + " initial="
+            + std::to_string(projection->initial_compute_cycle));
     const int64_t expectedDownReductionInterval =
         projection->weight_block_interval;
     require(down->reduction_interval == expectedDownReductionInterval
@@ -184,7 +208,7 @@ int main() try
 
     auto singleMxmDown = schedule::planFfnDownProjectionTimeline(
         {32, 576, 1536, 576}, *singleMxmProjection, 1000,
-        weightSlices, hiddenSlices, resultSlices, singleMxmTarget);
+        weightSlices, hiddenSlices, resultSlices, singleMxmTarget, 0);
     require(mlir::succeeded(singleMxmDown)
             && singleMxmDown->blocks.size() > 1,
         "single-MXM local-dequant FFN down timeline failed");
@@ -198,6 +222,44 @@ int main() try
             == singleMxmDown->reduction_interval,
         "single-MXM FFN down delayed compute instead of retiming weight load");
 
+    auto pagedSingleMxmDown = schedule::planFfnDownProjectionTimeline(
+        {32, 576, 1536, 576}, *singleMxmProjection, 1000,
+        weightSlices, hiddenSlices, resultSlices, singleMxmTarget, 48);
+    require(mlir::succeeded(pagedSingleMxmDown)
+            && pagedSingleMxmDown->wave_count > 1,
+        "paged single-MXM FFN down timeline failed");
+    const auto& previousPageLast = pagedSingleMxmDown->blocks[47];
+    const auto& nextPageFirst = pagedSingleMxmDown->blocks[48];
+    int64_t maxWeightLatency = 0;
+    for (int64_t slice : weightSlices) {
+        maxWeightLatency = std::max(maxWeightLatency,
+            singleMxmTarget.transport_latency(
+                target::StreamEndpoint::Mem,
+                target::StreamEndpoint::MxmWeight,
+                target::StreamDirection::East, slice).value());
+    }
+    int64_t maxResultLatency = 0;
+    for (int64_t slice : resultSlices) {
+        maxResultLatency = std::max(maxResultLatency,
+            singleMxmTarget.transport_latency(
+                target::StreamEndpoint::MxmResult,
+                target::StreamEndpoint::Mem,
+                target::StreamDirection::West, slice).value());
+    }
+    const int64_t previousLastCompute =
+        previousPageLast.tiles.back().compute_cycle
+        + singleMxmProjection->projection_slot_interval;
+    const int64_t previousDrainEnd = previousLastCompute
+        + singleMxmTarget.mxm_first_result_latency()
+        + maxResultLatency + singleMxmThroughput.mxm_rows
+        + singleMxmTarget.streams().system_register_columns;
+    require(nextPageFirst.dequant_start - maxWeightLatency
+            >= previousDrainEnd,
+        "paged FFN down lacks a pipeline-safe runtime wait boundary: read="
+            + std::to_string(
+                nextPageFirst.dequant_start - maxWeightLatency)
+            + " drain=" + std::to_string(previousDrainEnd));
+
     auto exploredStreams = target.streams();
     exploredStreams.streams_per_direction = 40;
     exploredStreams.encoded_streams = 80;
@@ -209,7 +271,7 @@ int main() try
         "40-stream FFN projection timeline failed");
     auto exploredDown = schedule::planFfnDownProjectionTimeline(
         {128, 576, 1536, 576}, *exploredProjection, 1000, weightSlices,
-        hiddenSlices, resultSlices, exploredTarget);
+        hiddenSlices, resultSlices, exploredTarget, 0);
     require(mlir::succeeded(exploredDown),
         "40-stream FFN down timeline failed");
     require(exploredDown->output_stream_base == 32

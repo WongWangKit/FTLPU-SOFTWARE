@@ -2,14 +2,17 @@
 
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/performance.hpp"
+#include "ftlpu/software/runtime/runtime_execution_trace.hpp"
 #include "ftlpu/system/tsp_slice_system.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <ostream>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -33,13 +36,22 @@ public:
         const BinaryBinding& source, const BinaryBinding& destination);
     void set_weight_page_residency_checker(
         std::function<bool(const BinaryWeightPageUse&)> checker);
+    void enable_execution_trace(bool enabled = true) noexcept;
+    void record_execution_trace_interval(std::int64_t start_cycle,
+        std::int64_t end_cycle, std::string resource, std::string detail,
+        std::size_t issue_count = 1);
+    void write_execution_trace_csv(const std::filesystem::path& path) const;
+    std::size_t physical_cycles() const noexcept { return physical_cycles_; }
+    std::size_t logical_cycles() const noexcept { return executed_cycles_; }
     void dispatch_icu_cycles(std::size_t cycles, std::ostream* log = nullptr);
     void run_cycles(std::size_t cycles, std::ostream* log = nullptr);
     void print_datapath_performance(std::ostream& os) const;
 
 private:
     const BinaryBinding& find_binding(BindingAccess access, std::size_t index) const;
-    void load_ready_weight_pages();
+    bool load_ready_weight_pages();
+    void run_logical_cycles(std::size_t cycles,
+        TspSliceSystem::LogSinks sinks);
 
     TspSliceSystem& system_;
     std::size_t loaded_max_cycle_{0};
@@ -52,7 +64,11 @@ private:
         paged_weight_data_{};
     std::size_t next_weight_page_use_{0};
     std::size_t executed_cycles_{0};
+    std::size_t physical_cycles_{0};
+    std::optional<BinaryWeightPageUse> waiting_weight_page_use_{};
     DatapathPerformanceMonitor datapath_performance_{};
+    RuntimeExecutionTrace execution_trace_{};
+    bool execution_trace_enabled_{false};
     std::function<void(TspSliceSystem::LogSinks)> tick_{};
     std::function<bool(const BinaryWeightPageUse&)>
         weight_page_residency_checker_{};

@@ -81,11 +81,42 @@ packed page remains a separate valid layout.
 6. Load layer 1, start its complete Attention -> FFN execution, start page 2
    into bank 0, and continue alternating.
 
+### Page-ready synchronization
+
+The binary `ready_cycle` is now interpreted as the page's first logical
+consumer cycle and is reported as `consumer_cycle`. It is a prefetch-planning
+hint, not a hardware deadline, and it does not require DDR to respond at a
+fixed cycle. The actual synchronization chain is:
+
+```text
+logical launch point -> tagged WAIT_EVENT releases C2C DMA/RX
+DDR response -> C2C RX -> shared SR -> all target MEM writes commit
+page fence complete -> page-ready broadcast -> compute ICU issue resumes
+```
+
+Runtime tracks logical and physical cycles separately. While a page is not
+complete, normal MEM/MXM/VXM/SXM ICU issue remains at the consumer boundary,
+but DDR/C2C/RX/MEM C2C-write continues on physical clocks. Fence completion
+releases compute, so insufficient bandwidth and DDR latency jitter create
+dynamic backpressure rather than a missed deadline. The current implementation
+uses a global compute-side issue gate, which is appropriate at page/quiescent
+boundaries. If future schedules permit independent tasks to wait for different
+pages inside a live pipeline, event IDs should be carried by coarse task ISA
+and waited on by per-functional-unit ICU scoreboards.
+
 `ModelSessionStats` separates bootstrap and steady-state behavior.
 `weight_page_initial_wait_cycles` is the page-0 cold-start cost,
 `weight_page_boundary_wait_cycles` is an actual layer-boundary stall, and
+`weight_page_runtime_wait_cycles` counts physical cycles spent at an
+in-executable page-ready barrier, while
 `weight_page_hidden_prefetches` counts pages already SRAM-ready when their
 layer starts. The legacy `weight_page_wait_cycles` remains their total.
+
+`ModelSession::write_execution_trace_csv()` emits a trace sampled while CModel
+actually runs. C2C/SR/MEM rows marked `source=runtime` use observed start and
+completion cycles, and `ICU.PageReadyWait` records real synchronization stalls.
+`write_schedule_trace_csv()` remains an offline binary-plan inspection path;
+it does not run CModel and must not be treated as measured performance.
 
 A C2C receive command describes one contiguous SRAM-row burst. Runtime maps
 segments by target slice across the configured C2C lanes, so instruction count

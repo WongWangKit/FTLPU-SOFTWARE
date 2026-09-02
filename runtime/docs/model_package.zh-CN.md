@@ -96,6 +96,13 @@ LPU cycle 102.4 bytes；调度按 90% 峰值规划，即 46.08 GB/s、92.16 byte
 0..10 cycle 抖动。抖动由 request ID、地址、读写方向和 target seed 共同决定，
 因此不同请求的完成 cycle 不同，同时测试可以稳定复现。
 
+预取没有硬件 deadline。compiler/binary 提供的 page `ready_cycle` 是首个逻辑
+consumer cycle，也就是启动预取和放置同步点的提示。runtime 在该 consumer 到达时
+检查 page fence；只有 C2C RX 和全部目标 MEM write 都完成才算 SRAM-ready。未完成时
+计算侧 ICU 停止发射，DDR/C2C 路径继续推进 physical clock，完成后通过 page-ready
+事件恢复计算。这样 DDR 带宽和 latency jitter 直接表现为运行时等待，而不是依赖
+静态预测保证正确性。
+
 ### Run 阶段
 
 `set_input(name, bytes)` 只接受声明为 external input 的 value。`run()` 会清空临时 device-value map，执行 host embedding lookup，按 package 顺序运行 invocation，最后执行 host LM head。每次 invocation 会：
@@ -109,6 +116,12 @@ LPU cycle 102.4 bytes；调度按 90% 峰值规划，即 46.08 GB/s、92.16 byte
 `run_invocation(index)` 暴露单次设备 invocation，供定点测试和调试使用；它不能替代 `run()` 完成的 package 级前处理与后处理。物理 binding 兼容时直接 alias；16-bit float layout 不兼容时，在 CModel MEM 内完成 layout transfer，不在 host 中物化完整逻辑 tensor。该显式 backend operation 后续可替换为 ICU MEM/SXM adapter executable。
 
 生产路径中的 activation、RMSNorm 参数、RoPE 表、embedding 和 LM-head 边界使用 BF16。以 `Fp16` 开头的旧 layout 名称只描述双字节物理拓扑，`BindingElementType::BF16` 才是权威数值格式。切换 executable 时会清空 ICU、stream、MXM、VXM 和 SXM 状态，但 MEM 与 persistent state 保持存活。`stats()` 统计 resident upload、state initialization、host transfer、device alias/copy 和 host operation。
+
+`weight_page_runtime_wait_cycles` 统计 executable 内因 page-ready fence 产生的真实
+physical-cycle 等待。启用 execution trace 后，
+`ModelSession::write_execution_trace_csv()` 从每次 CModel tick 后的 ICU queue 状态
+记录实际发射事件、C2C 完成区间与 `ICU.PageReadyWait`；它不同于只读取 binary 的
+静态 `write_schedule_trace_csv()`。
 
 ## 地址规划与 relocation
 

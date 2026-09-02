@@ -400,7 +400,7 @@ void write_weight_prefetches(
             detail << " bytes=" << prefetch.bytes[side]
                    << " lanes=" << lanes
                    << " bandwidth=" << bandwidth
-                   << "B/cycle deadline=" << prefetch.ready_cycle
+                   << "B/cycle consumer_cycle=" << prefetch.ready_cycle
                    << " phase="
                    << (prefetch.pre_execution ? "pre_execution" : "overlap")
                    << " scheduled=true";

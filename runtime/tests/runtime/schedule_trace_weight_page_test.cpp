@@ -205,23 +205,23 @@ try {
     require_contains(trace,
         "\"C2C.E.Prefetch\",\"page=0 bank=0 "
         "bindings=gate bytes=512 lanes=8 bandwidth=256B/cycle "
-        "deadline=200 phase=pre_execution scheduled=true\"");
+        "consumer_cycle=200 phase=pre_execution scheduled=true\"");
     require_contains(trace,
         "\"C2C.W.Prefetch\",\"page=0 bank=0 "
         "bindings=gate bytes=512 lanes=8 bandwidth=256B/cycle "
-        "deadline=200 phase=pre_execution scheduled=true\"");
+        "consumer_cycle=200 phase=pre_execution scheduled=true\"");
     require_contains(trace,
         "\"C2C.E.Prefetch\",\"page=0 bank=0 "
         "bindings=up bytes=512 lanes=8 bandwidth=256B/cycle "
-        "deadline=202 phase=pre_execution scheduled=true\"");
+        "consumer_cycle=202 phase=pre_execution scheduled=true\"");
     require_contains(trace,
         "\"C2C.E.Prefetch\",\"page=0 bank=0 "
         "bindings=reuse bytes=256 lanes=8 bandwidth=256B/cycle "
-        "deadline=450 phase=overlap scheduled=true\"");
+        "consumer_cycle=450 phase=overlap scheduled=true\"");
     require_contains(trace,
         "\"C2C.E.Prefetch\",\"page=0 bank=0 "
         "bindings=down bytes=256 lanes=8 bandwidth=256B/cycle "
-        "deadline=700 phase=overlap scheduled=true\"");
+        "consumer_cycle=700 phase=overlap scheduled=true\"");
     require_contains(trace,
         "\"SR.E.C2C.Shared\",\"page=0 bank=0 streams=W24..W31 "
         "sync=target_mem+stream_tag timing=per_vector_notification\"");

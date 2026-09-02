@@ -406,12 +406,19 @@ function eventColor(event) {
   if (family === "MXM") {
     if (event.resource.endsWith("Load")) return palette["MXM.Load"];
     const detail = event.detail.toLowerCase();
-    if (detail.includes("clear")
-        || detail.includes("dst=stream")
+    const writesStream = /(?:^|\s)(?:destination|dst)=stream(?:\s|$)/
+      .test(detail);
+    const clearsAccumulator = /(?:^|\s)clear=(?:1|true)(?:\s|$)/
+      .test(detail);
+    const writesSram = /(?:^|\s)(?:destination|dst)=sram(?:\s|$)/
+      .test(detail);
+    const accumulatorRead = detail.startsWith("accumulatorread");
+    if (writesStream
+        || (accumulatorRead && clearsAccumulator)
         || detail.includes("final sum")) {
       return palette["MXM.Final"];
     }
-    if (detail.includes("dst=sram")
+    if (writesSram
         || detail.includes("partial sum")
         || event.resource.startsWith("ACC.")) {
       return palette["MXM.Partial"];

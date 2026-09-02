@@ -55,12 +55,14 @@ void C2cWeightPager::begin_schedule()
     if (active_) retire();
     schedule_dma_cursor_ = {};
     schedule_rx_cursor_ = {};
+    scheduled_dma_issues_ = {};
     scheduled_rx_segments_ = {};
     scheduled_mem_writes_ = {};
 }
 
 C2cWeightPageFence C2cWeightPager::schedule(
-    const C2cWeightPage& page, std::size_t start_cycle)
+    const C2cWeightPage& page, std::size_t start_cycle,
+    std::size_t launchEventTag)
 {
     auto& chip = system_.chip();
     const auto& hardware = chip.hardware_configuration();
@@ -72,6 +74,8 @@ C2cWeightPageFence C2cWeightPager::schedule(
         page, hardware.c2c_streams_per_direction);
 
     C2cWeightPageFence fence;
+    fence.dma_issues_begin = scheduled_dma_issues_;
+    fence.dma_issues_end = scheduled_dma_issues_;
     fence.completed_segments = scheduled_rx_segments_;
     for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
         const auto hemisphere = static_cast<Hemisphere>(side);
@@ -91,6 +95,12 @@ C2cWeightPageFence C2cWeightPager::schedule(
             hemisphere, start_cycle - schedule_rx_cursor_[side]);
         schedule_dma_cursor_[side] = start_cycle;
         schedule_rx_cursor_[side] = start_cycle;
+        chip.icu().enqueue_control(IcuLocation::C2cDma(hemisphere),
+            IcuControlInstruction::WaitEvent(launchEventTag));
+        chip.icu().enqueue_control(IcuLocation::C2cRx(hemisphere),
+            IcuControlInstruction::WaitEvent(launchEventTag));
+        ++schedule_dma_cursor_[side];
+        ++schedule_rx_cursor_[side];
 
         for (std::size_t segmentIndex = 0;
              segmentIndex < page.segments.size(); ++segmentIndex) {
@@ -112,6 +122,8 @@ C2cWeightPageFence C2cWeightPager::schedule(
                 C2cDmaInstruction::Load(segment.ddr4_address,
                     segment.vector_count, hw::kPhysicalVectorBytes, 0,
                     lane));
+            ++scheduled_dma_issues_[side];
+            fence.dma_issues_end[side] = scheduled_dma_issues_[side];
             chip.icu().enqueue_c2c_receive(hemisphere, lane,
                 segment.hemisphere, segment.slice, segment.bank, true,
                 segment.base_row, segment.vector_count, 1, fabricStream);
@@ -134,6 +146,19 @@ C2cWeightPageFence C2cWeightPager::schedule(
         schedule_rx_cursor_[side] += segmentCount;
     }
     return fence;
+}
+
+bool C2cWeightPager::started(const C2cWeightPageFence& fence) const
+{
+    auto& icu = system_.chip().icu();
+    for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
+        if (fence.dma_issues_end[side] == fence.dma_issues_begin[side])
+            continue;
+        if (icu.c2c_dma_iq(static_cast<Hemisphere>(side)).issued_count()
+            > fence.dma_issues_begin[side])
+            return true;
+    }
+    return false;
 }
 
 bool C2cWeightPager::ready(const C2cWeightPageFence& fence) const

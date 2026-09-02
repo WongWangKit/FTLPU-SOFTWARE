@@ -39,6 +39,7 @@ struct ModelSessionStats {
     std::size_t weight_page_boundary_wait_cycles{0};
     std::size_t weight_page_hidden_prefetches{0};
     std::size_t weight_page_deferred_prefetches{0};
+    std::size_t weight_page_runtime_wait_cycles{0};
 };
 
 class ModelSession {
@@ -51,6 +52,10 @@ public:
     void set_input(std::string name, std::span<const std::uint8_t> data);
     void run(std::size_t drain_cycles = 64);
     void run_invocation(std::size_t index, std::size_t drain_cycles = 64);
+    void enable_execution_trace(bool enabled = true) noexcept;
+    void write_execution_trace_csv(const std::filesystem::path& path) const;
+    void set_ddr_peak_bandwidth_mbytes_per_second(
+        std::uint32_t bandwidth);
 
     const ModelPackage& package() const;
     const std::vector<std::uint8_t>& value(const std::string& name) const;
@@ -69,6 +74,12 @@ private:
         C2cWeightPage page{};
         C2cWeightPageFence fence{};
         std::vector<BinaryWeightPageUse> uses{};
+        std::size_t launch_event_tag{0};
+        std::optional<std::int64_t> actual_start_cycle{};
+        std::optional<std::int64_t> actual_ready_cycle{};
+        std::size_t pre_execution_cycles{0};
+        bool launch_released{false};
+        bool trace_recorded{false};
         bool ready_before_execution{false};
     };
 
@@ -80,6 +91,9 @@ private:
     void ensure_weight_page(std::uint32_t page_index);
     void start_weight_page(std::uint32_t page_index);
     void observe_weight_page_tick();
+    void release_due_executable_weight_pages();
+    void observe_executable_weight_page_tick();
+    void record_weight_page_trace(ExecutableWeightTransfer& transfer);
     void prepare_executable_weight_pages(
         const BinaryProgram& program, const ModelInvocation& invocation);
     void schedule_executable_weight_pages();
@@ -87,6 +101,8 @@ private:
         const BinaryWeightPageUse& use) const;
     void configure_external_transport(
         const ExecutableHardwareConfig& hardware);
+    ExecutableHardwareConfig effective_external_transport(
+        const ExecutableHardwareConfig& hardware) const;
     void upload_binding_through_c2c(
         const BinaryBinding& binding, std::span<const std::uint8_t> data,
         const ExecutableHardwareConfig& hardware);
@@ -103,6 +119,9 @@ private:
     std::vector<ExecutableWeightTransfer> executable_weight_transfers_{};
     std::uint64_t executable_cycle_{0};
     std::uint64_t executable_ddr4_address_{0};
+    std::size_t c2c_bytes_per_stream_per_cycle_{0};
+    std::optional<std::uint32_t>
+        ddr_peak_bandwidth_mbytes_per_second_override_{};
     bool executable_clock_active_{false};
     ModelPackage package_{};
     SessionMemoryPlan memory_plan_{};

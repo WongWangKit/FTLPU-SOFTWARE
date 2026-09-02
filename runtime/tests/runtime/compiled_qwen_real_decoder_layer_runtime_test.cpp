@@ -1,7 +1,6 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 #include "ftlpu/software/runtime/model_session.hpp"
-#include "ftlpu/software/runtime/schedule_trace.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include "ftlpu/core/bf16.hpp"
@@ -647,6 +646,9 @@ int main(int argc, char **argv) try {
 
   const std::filesystem::path fixture(argv[2]);
   BinaryProgram program = read_binary_program(std::filesystem::path(argv[1]));
+  const std::uint32_t compiled_ddr_bandwidth =
+      program.hardware.ddr_peak_bandwidth_mbytes_per_second;
+  std::uint32_t runtime_ddr_bandwidth = compiled_ddr_bandwidth;
   if (program.weight_page_uses.empty())
     throw std::logic_error(
         "Qwen decoder binary has no intra-executable weight pages");
@@ -713,19 +715,24 @@ int main(int argc, char **argv) try {
 
   ftlpu::C2cDmaSystem system;
   ModelSession session(system);
+  if (const char *bandwidth = std::getenv("FTLPU_DDR_BANDWIDTH_MBPS")) {
+    const auto parsed = std::stoull(bandwidth);
+    if (parsed == 0 || parsed > std::numeric_limits<std::uint32_t>::max())
+      throw std::invalid_argument("invalid FTLPU_DDR_BANDWIDTH_MBPS");
+    runtime_ddr_bandwidth = static_cast<std::uint32_t>(parsed);
+    session.set_ddr_peak_bandwidth_mbytes_per_second(
+        runtime_ddr_bandwidth);
+  }
   session.load(std::move(package));
   const auto input_bytes = read_bytes(fixture / "input.bf16.bin");
   session.set_input("hidden.0", input_bytes);
+  const char *trace_path = std::getenv("FTLPU_QWEN_PIPELINE_CSV");
+  if (trace_path != nullptr)
+    session.enable_execution_trace();
   session.run();
 
-  if (const char *trace_path = std::getenv("FTLPU_QWEN_PIPELINE_CSV")) {
-    const BinaryProgram &loaded_program =
-        session.package().executables[0].program;
-    const auto physical_prefetches =
-        session.executable_weight_prefetch_plans();
-    write_schedule_trace_csv(
-        loaded_program, trace_path, physical_prefetches);
-  }
+  if (trace_path != nullptr)
+    session.write_execution_trace_csv(trace_path);
 
   if (const char *binding_text =
           std::getenv("FTLPU_TRACE_QWEN_WEIGHT_PAGE")) {
@@ -1057,6 +1064,10 @@ int main(int argc, char **argv) try {
             << " resident_uploads=" << stats.resident_uploads
             << " host_uploads=" << stats.host_uploads
             << " host_downloads=" << stats.host_downloads
+            << " compiled_ddr_mbytes=" << compiled_ddr_bandwidth
+            << " runtime_ddr_mbytes=" << runtime_ddr_bandwidth
+            << " runtime_page_wait_cycles="
+            << stats.weight_page_runtime_wait_cycles
             << " nonzero=" << nonzero << " max_error=" << maximum_error << '\n';
   return 0;
 } catch (const std::exception &error) {

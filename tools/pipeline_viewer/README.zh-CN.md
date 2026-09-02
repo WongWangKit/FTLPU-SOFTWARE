@@ -1,8 +1,14 @@
 # FTLPU Pipeline Viewer
 
-Pipeline Viewer 是一个无外部依赖的 Canvas 波形工作台，用于查看 runtime
-schedule trace。浏览器直接打开 `index.html`，然后载入
-`write_schedule_trace_csv()` 生成的 CSV。
+Pipeline Viewer 是一个无外部依赖的 Canvas 波形工作台，可以查看两类 CSV：
+
+- `ModelSession::write_execution_trace_csv()` / `RuntimeExecutionTrace` 在 CModel
+  逐 cycle 执行时采样 ICU 实际发射，记录真实 physical cycle、DDR 抖动和同步等待；
+- `write_schedule_trace_csv()` 不运行 CModel，只从 binary 生成离线计划视图，适合
+  检查编译结果，但不能作为实际执行时序的证据。
+
+浏览器直接打开 `index.html` 后载入任意一种 CSV。性能分析和流水验证应优先使用
+第一种实际运行 trace。
 
 旧版四列输入格式继续兼容：
 
@@ -22,9 +28,17 @@ start,end,resource,detail,pattern,inner_count,inner_interval,inner_stride,outer_
 `repeat` 和 `repeat2d` 行描述迭代空间，不再提前展开所有 event。Viewer 只展开
 与当前可见 cycle 窗口相交的实例；`induction` 指明 stride 修改的数值字段。
 
-分页 binary 还会生成 `C2C.E.Prefetch` 和 `C2C.W.Prefetch` 行。事件区间由
-binary 的页面 readiness 和目标专用 C2C 带宽计算，`detail` 中保留 page、bank、
-binding、bytes、lane 数以及来源标记 `planned=true`。
+实际运行 trace 中的 `C2C.E.Prefetch`、`C2C.W.Prefetch`、共享 SR 和
+`MEM.*.C2CWrite` 区间来自 CModel 已完成的 DMA/RX/MEM write；`detail` 使用
+`source=runtime`，并记录 `consumer_cycle` 与 `actual_ready`。当页面没有及时完成时，
+`ICU.PageReadyWait` 显示计算侧 ICU 被同步屏障阻塞的真实 physical-cycle 区间。
+离线计划 CSV 仍使用 `planned=true`，其区间只是目标带宽模型的预测。
+
+`C2C.E/W.DMA` 是东西半球各自的 DDR-to-C2C DMA 命令发射行；
+`C2C.E/W.RX` 是对应半球的 C2C 接收命令发射行，它把 lane 绑定到目标
+MEM slice/bank。它们合计四行，是“两半球 x DMA/RX 两级”的 ICU 命令轨迹；
+完整数据搬运持续时间看 `C2C.E/W.Prefetch`，最终 SRAM 写入看
+`MEM.E/W.C2CWrite`。
 
 操作：
 
@@ -48,6 +62,7 @@ build-ftlpu-vs2026/compiler/ftlpu_lower/
   smollm2_135m_ffn_seq128_pipeline/ffn.runtime.csv
   smollm2_attention_pipeline/attention.runtime.csv
   smollm2_decoder_layer_binary_runtime/decoder_layer.runtime.csv
+  qwen2_5_1_5b_decoder_layer/decoder_layer.actual.runtime.csv
 ```
 
 查看器只绘制当前可见的资源行和 cycle 区间，因此长调度不再需要生成超宽

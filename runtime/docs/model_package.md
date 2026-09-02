@@ -97,6 +97,15 @@ jitter; write latency is 25 cycles plus deterministic 0..10-cycle jitter.
 Jitter is derived from request ID, address, operation, and a target seed, so
 tests are repeatable while requests still complete at different cycles.
 
+Prefetch has no hardware deadline. A page `ready_cycle` in compiler/binary data
+is the first logical consumer cycle: a hint for launching prefetch and placing
+the synchronization point. Runtime checks the page fence when that consumer is
+reached. SRAM-ready requires both C2C RX completion and every target MEM write
+to commit. Until then, compute-side ICU issue is held while DDR/C2C continues
+to advance on physical clocks; the page-ready event releases compute. DDR
+bandwidth and latency jitter therefore become observed runtime stalls instead
+of correctness depending on a static prediction.
+
 ### Run phase
 
 `set_input(name, bytes)` accepts only values declared as external inputs. `run()` clears the transient device-value map, executes host embedding lookups, runs invocations in package order, and finally executes host LM-head operations. For each invocation it:
@@ -110,6 +119,13 @@ tests are repeatable while requests still complete at different cycles.
 `run_invocation(index)` exposes the device-invocation step for focused tests and debugging; it does not replace the package-level preprocessing and postprocessing performed by `run()`. Compatible physical bindings alias directly. Incompatible 16-bit float layouts use a CModel MEM-to-MEM layout transfer without materializing the logical tensor in a host buffer; this explicit backend operation can later become an ICU MEM/SXM adapter executable.
 
 Production activations, RMSNorm parameters, RoPE tables, embeddings, and LM-head boundaries use BF16. Legacy layout names beginning with `Fp16` describe two-byte physical topology only; `BindingElementType::BF16` is authoritative. At executable boundaries, ICU, stream, MXM, VXM, and SXM state is cleared, while MEM and persistent state remain live. `stats()` reports resident uploads, state initialization, host transfers, device aliases/copies, and host operations.
+
+`weight_page_runtime_wait_cycles` counts physical cycles spent at executable
+page-ready fences. With execution tracing enabled,
+`ModelSession::write_execution_trace_csv()` samples ICU queue state after each
+CModel tick and records actual issues, C2C completion intervals, and
+`ICU.PageReadyWait`. This is distinct from the static
+`write_schedule_trace_csv()` path, which only inspects a binary plan.
 
 ## Address planning and relocation
 

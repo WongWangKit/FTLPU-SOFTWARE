@@ -7,7 +7,8 @@ namespace ftlpu::compiler::schedule {
 mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     FfnScheduleShape shape, llvm::ArrayRef<int64_t> weightSlices,
     const target::LPUTargetModel& target, bool localWeightDequant,
-    bool replicateOutputBlocksAcrossHemispheres)
+    bool replicateOutputBlocksAcrossHemispheres,
+    FfnProjectionOrder projectionOrder)
 {
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
@@ -38,6 +39,11 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     result.m_tile_count = shape.m / tile;
     result.projection_slot_interval =
         result.m_tile_count * result.pipelined_block_interval;
+    const bool singleMxm = throughput.mxms_per_hemisphere == 1;
+    const bool serializedProjections = singleMxm
+        && projectionOrder != FfnProjectionOrder::Interleaved;
+    result.projection_order = serializedProjections
+        ? projectionOrder : FfnProjectionOrder::Interleaved;
     result.initial_compute_cycle = maxWeightLatency + 1 + tile;
     result.pair_count = shape.hidden
         / ((replicateOutputBlocksAcrossHemispheres
@@ -46,10 +52,13 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     // Gate and Up share the same physical MXM in a one-MXM hemisphere, so
     // their load/compute issue windows are two serial slots regardless of
     // whether output blocks are replicated across hemispheres.
-    const int64_t projectionIssueSlots =
-        throughput.mxms_per_hemisphere == 1 ? 2 : 1;
+    const int64_t projectionIssueSlots = singleMxm ? 2 : 1;
     result.weight_block_interval =
         result.projection_slot_interval * projectionIssueSlots;
+    result.projection_block_interval = serializedProjections
+        ? result.projection_slot_interval
+        : result.weight_block_interval;
+    result.second_projection_offset = 0;
     const int64_t reductionBlocks = shape.k / tile;
     const int64_t totalBlocks = result.pair_count * reductionBlocks;
 
@@ -61,13 +70,11 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
             block.pair = pair;
             block.reduction_block = reduction;
             block.weight_compute_cycle = result.initial_compute_cycle
-                + block.index * result.weight_block_interval
+                + block.index * result.projection_block_interval
                 + pair * tile;
             block.dequant_start = block.weight_compute_cycle - tile;
             block.weight_buffer = block.index
                 % throughput.mxm_weight_buffers;
-            const bool singleMxm =
-                throughput.mxms_per_hemisphere == 1;
             if (localWeightDequant
                 && ((singleMxm && !result.blocks.empty())
                     || (!singleMxm
@@ -80,15 +87,19 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
                 // Move the short local load later instead of delaying the
                 // next compute slot.
                 const int64_t previousIndex = singleMxm
-                    ? block.index - 1
+                    ? block.index
+                        - (serializedProjections
+                              ? throughput.mxm_weight_buffers : 1)
                     : block.index - throughput.mxm_weight_buffers;
-                const auto& previous = result.blocks[
-                    static_cast<std::size_t>(previousIndex)];
-                const int64_t previousLastCompute =
-                    previous.tiles.back().compute_cycle;
-                block.dequant_start = std::max(block.dequant_start,
-                    previousLastCompute
-                        + target.mxm_result_window_cycles(tile));
+                if (previousIndex >= 0) {
+                    const auto& previous = result.blocks[
+                        static_cast<std::size_t>(previousIndex)];
+                    const int64_t previousLastCompute =
+                        previous.tiles.back().compute_cycle;
+                    block.dequant_start = std::max(block.dequant_start,
+                        previousLastCompute
+                            + target.mxm_result_window_cycles(tile));
+                }
             }
             block.final_reduction = reduction + 1 == reductionBlocks;
             const bool hasNextWeight = block.index + 1 < totalBlocks;
@@ -115,7 +126,7 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
                     }
                     const int64_t nextWeightDistance =
                         tileSchedule.prefetch_next_weight
-                        ? result.weight_block_interval
+                        ? result.projection_block_interval
                             - mTile * result.pipelined_block_interval
                         : 2 * tile;
                     const int64_t switchRow = nextWeightDistance - tile
@@ -145,14 +156,26 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     }
 
     if (result.blocks.empty()) return mlir::failure();
-    result.final_projection_cycle = result.initial_compute_cycle
-        + (totalBlocks - 1) * result.weight_block_interval
-        + (result.pair_count - 1) * tile
-        + (result.m_tile_count - 1) * result.pipelined_block_interval
-        + (projectionIssueSlots - 1) * result.projection_slot_interval;
     result.accumulator_queue_release = std::max(
         throughput.mxm0_accumulator_latency + tile,
         throughput.mxm1_accumulator_latency + tile);
+    const int64_t lastFirstProjectionCycle =
+        result.blocks.back().tiles.back().compute_cycle;
+    if (serializedProjections) {
+        // Keep the second independent projection behind the final result
+        // drain of the first one. Both phases may ping-pong both weight
+        // buffers because they never execute concurrently.
+        result.second_projection_offset =
+            lastFirstProjectionCycle - result.initial_compute_cycle
+            + std::max<int64_t>(2 * tile,
+                result.accumulator_queue_release);
+        result.final_projection_cycle = lastFirstProjectionCycle
+            + result.second_projection_offset;
+    } else {
+        result.final_projection_cycle = lastFirstProjectionCycle
+            + (projectionIssueSlots - 1)
+                * result.projection_slot_interval;
+    }
     return result;
 }
 

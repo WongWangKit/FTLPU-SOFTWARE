@@ -51,8 +51,6 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
   const int64_t outputGroups =
       op_.getHidden() / (tile * target_.memory().hemispheres);
   const int64_t localMxm = 0;
-  const int64_t accumulatorLatency =
-      target_.throughput().mxm0_accumulator_latency;
   const int64_t weightToIw = target_.throughput().vxm_weight_to_iw_latency;
   const bool localDequant = target_.supports_mxm_local_dequant();
   const int64_t loadToIw = localDequant ? 0 : weightToIw;
@@ -189,6 +187,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
       const int64_t computeInterval = tile;
       const int64_t queryHead = reductionBlock / (op_.getHeadDim() / tile);
       const int64_t headBlock = reductionBlock % (op_.getHeadDim() / tile);
+      int64_t finalWriteEnd = firstCompute;
       for (int64_t tokenBlock = 0; tokenBlock < tokenBlocks; ++tokenBlock) {
         const int64_t computeBase = firstCompute + tokenBlock * computeInterval;
         for (int64_t hemisphere = 0; hemisphere < target_.memory().hemispheres;
@@ -212,31 +211,17 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
                   hemisphere * target_.throughput().mxms_per_hemisphere +
                       localMxm,
                   "compute", weightBuffer, 0, hemisphere * 2, 0, tile, 1,
-                  accumulatorAddress(tokenBlock * tile), 1, "sram", true,
-                  "supercell", 0, dataFormat);
-        }
-      }
-      const int64_t lastCompute =
-          firstCompute + (tokenBlocks - 1) * computeInterval;
-      weightBufferRelease[static_cast<std::size_t>(weightBuffer)] =
-          lastCompute + target_.mxm_result_window_cycles(tile);
-      nextReductionCompute = firstCompute + tokenBlocks * computeInterval;
-      if (finalReduction) {
-        phaseStart = nextReductionCompute + accumulatorLatency;
-        const int64_t writeStart = phaseStart;
-        int64_t finalWriteEnd = writeStart;
-        for (int64_t hemisphere = 0; hemisphere < target_.memory().hemispheres;
-             ++hemisphere) {
-          const int64_t mxmOutputStream = 0;
-          for (int64_t token = 0; token < op_.getSeqLen(); ++token) {
-            const int64_t writeCycle = writeStart + token;
-            emitMxm(rewriter_, op_.getLoc(),
-                    writeCycle,
-                    hemisphere * target_.throughput().mxms_per_hemisphere +
-                        localMxm,
-                    "accumulator_read", 0, 0, 0, mxmOutputStream, 1, 1,
-                    accumulatorAddress(token), 1, "stream", true, "supercell",
-                    0, dataFormat, {}, dataFormat);
+                  accumulatorAddress(tokenBlock * tile), 1,
+                  finalReduction ? "stream" : "sram", finalReduction,
+                  "supercell", 0, dataFormat, {},
+                  finalReduction ? dataFormat : llvm::StringRef{});
+          if (!finalReduction)
+            continue;
+
+          for (int64_t row = 0; row < tile; ++row) {
+            const int64_t token = tokenBlock * tile + row;
+            const int64_t resultCycle =
+                computeCycle + target_.mxm_first_result_latency() + row;
             for (int64_t byte = 0; byte < 2; ++byte) {
               const int64_t slice = resultSlices[hemisphere * 2 + byte];
               const int64_t latency = *target_.transport_latency(
@@ -244,9 +229,8 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
                   target::StreamEndpoint::Mem,
                   target::StreamDirection::West, slice);
               const int64_t packedStream =
-                  target_.streams().streams_per_direction + mxmOutputStream +
-                  byte;
-              const int64_t localWriteCycle = writeCycle + latency;
+                  target_.streams().streams_per_direction + byte;
+              const int64_t localWriteCycle = resultCycle + latency;
               const bool remoteResult = hemisphere != 0;
               emitMem(rewriter_, op_.getLoc(), localWriteCycle,
                       hemisphere * target_.memory().slices_per_hemisphere +
@@ -259,20 +243,25 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
                 const int64_t group =
                     slice / target_.streams().mem_slices_per_register_group;
                 const int64_t remoteWriteCycle =
-                    writeCycle + target_.streams().system_register_columns +
+                    resultCycle + target_.streams().system_register_columns +
                     group + 1;
                 emitMem(rewriter_, op_.getLoc(), remoteWriteCycle, slice,
                         "write", layout.resultAddress(outputGroup, token),
-                        mxmOutputStream + byte, 1, 1, 0, "sram", -1,
-                        resultBank);
+                        byte, 1, 1, 0, "sram", -1, resultBank);
                 finalWriteEnd =
                     std::max(finalWriteEnd, remoteWriteCycle + 1);
               }
             }
           }
         }
-        phaseStart = finalWriteEnd;
       }
+      const int64_t lastCompute =
+          firstCompute + (tokenBlocks - 1) * computeInterval;
+      weightBufferRelease[static_cast<std::size_t>(weightBuffer)] =
+          lastCompute + target_.mxm_result_window_cycles(tile);
+      nextReductionCompute = firstCompute + tokenBlocks * computeInterval;
+      if (finalReduction)
+        phaseStart = std::max(nextReductionCompute, finalWriteEnd);
     }
   }
   return phaseStart;

@@ -314,8 +314,14 @@ ModelSession::ModelSession(C2cDmaSystem &system)
                [this, &system](TspSliceSystem::LogSinks sinks) {
                  system.tick(sinks);
                  observe_weight_page_tick();
-                 if (executable_clock_active_)
-                   ++executable_cycle_;
+                 observe_executable_weight_page_tick();
+                 release_due_executable_weight_pages();
+                 if (executable_clock_active_) {
+                   if (system.chip().icu().program_issue_enabled())
+                     ++executable_cycle_;
+                   else
+                     ++stats_.weight_page_runtime_wait_cycles;
+                 }
                }),
       c2c_system_(&system),
       weight_pager_(std::make_unique<C2cWeightPager>(system)) {
@@ -325,11 +331,42 @@ ModelSession::ModelSession(C2cDmaSystem &system)
       });
 }
 
+void ModelSession::set_ddr_peak_bandwidth_mbytes_per_second(
+    std::uint32_t bandwidth) {
+  if (loaded_)
+    throw std::logic_error(
+        "DDR bandwidth must be configured before loading a model package");
+  if (bandwidth == 0)
+    throw std::invalid_argument("DDR bandwidth must be non-zero");
+  ddr_peak_bandwidth_mbytes_per_second_override_ = bandwidth;
+}
+
+ExecutableHardwareConfig ModelSession::effective_external_transport(
+    const ExecutableHardwareConfig &hardware) const {
+  ExecutableHardwareConfig effective = hardware;
+  if (ddr_peak_bandwidth_mbytes_per_second_override_)
+    effective.ddr_peak_bandwidth_mbytes_per_second =
+        *ddr_peak_bandwidth_mbytes_per_second_override_;
+  return effective;
+}
+
+void ModelSession::enable_execution_trace(bool enabled) noexcept {
+  runtime_.enable_execution_trace(enabled);
+}
+
+void ModelSession::write_execution_trace_csv(
+    const std::filesystem::path &path) const {
+  runtime_.write_execution_trace_csv(path);
+}
+
 void ModelSession::configure_external_transport(
     const ExecutableHardwareConfig &hardware) {
   if (c2c_system_ == nullptr)
     throw std::logic_error(
         "ModelSession external transfers require C2cDmaSystem");
+
+  c2c_bytes_per_stream_per_cycle_ =
+      hardware.c2c_bytes_per_stream_per_cycle;
 
   SystemHardwareConfiguration cmodelHardware;
   cmodelHardware.sram_depth_rows = hardware.sram_depth_rows;
@@ -445,6 +482,9 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
   if (image.segments.empty())
     throw std::logic_error("packed C2C output has no physical SRAM segments");
 
+  const ExecutableHardwareConfig runtimeHardware =
+      effective_external_transport(hardware);
+
   const std::size_t laneCount = hardware.c2c_streams_per_direction;
   std::array<std::vector<std::size_t>, hw::kHemispheres> byHemisphere;
   for (std::size_t index = 0; index < image.segments.size(); ++index) {
@@ -485,13 +525,13 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
 
     const std::uint64_t effectiveBandwidth =
         static_cast<std::uint64_t>(
-            hardware.ddr_peak_bandwidth_mbytes_per_second) *
-        hardware.ddr_scheduling_efficiency_percent;
+            runtimeHardware.ddr_peak_bandwidth_mbytes_per_second) *
+        runtimeHardware.ddr_scheduling_efficiency_percent;
     if (effectiveBandwidth == 0)
       throw std::logic_error("C2C output requires non-zero DDR bandwidth");
     const std::uint64_t producerDemand =
         static_cast<std::uint64_t>(batch.size()) *
-        hw::kPhysicalVectorBytes * hardware.lpu_clock_mhz * 100;
+        hw::kPhysicalVectorBytes * runtimeHardware.lpu_clock_mhz * 100;
     const std::size_t memReadInterval = static_cast<std::size_t>(
         std::max<std::uint64_t>(
             1, (producerDemand + effectiveBandwidth - 1) /
@@ -530,8 +570,8 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
 
     bool ready = false;
     const std::size_t maxCycles = std::max<std::size_t>(
-        4096, batchVectors * 64 + hardware.ddr_write_latency_cycles +
-                  hardware.ddr_write_latency_jitter_cycles);
+        4096, batchVectors * 64 + runtimeHardware.ddr_write_latency_cycles +
+                  runtimeHardware.ddr_write_latency_jitter_cycles);
     for (std::size_t cycle = 0; cycle < maxCycles; ++cycle) {
       c2c_system_->tick();
       ready = c2c_system_->ddr4().idle();
@@ -688,7 +728,9 @@ void ModelSession::prepare_executable_weight_pages(
         "executable-local paged weights require ModelSession(C2cDmaSystem&)");
 
   std::uint64_t nextDdrAddress = executable_ddr4_address_;
-  auto plans = plan_weight_prefetches(program);
+  const ExecutableHardwareConfig runtimeHardware =
+      effective_external_transport(program.hardware);
+  auto plans = plan_weight_prefetches(program, runtimeHardware);
   executable_weight_transfers_.reserve(plans.size());
   for (const WeightPrefetchPlan &plan : plans) {
     ExecutableWeightTransfer transfer;
@@ -772,7 +814,7 @@ void ModelSession::prepare_executable_weight_pages(
   }
   for (std::size_t index = 0; index < plans.size(); ++index)
     plans[index] = executable_weight_transfers_[index].plan;
-  schedule_weight_prefetches(program, plans);
+  schedule_weight_prefetches(program, plans, runtimeHardware);
   for (std::size_t index = 0; index < plans.size(); ++index) {
     executable_weight_transfers_[index].plan = plans[index];
     if (std::getenv("FTLPU_SESSION_PROGRESS") == nullptr) continue;
@@ -809,6 +851,7 @@ void ModelSession::prepare_executable_weight_pages(
     const std::size_t beginCycle = c2c_system_->cycle();
     weight_pager_->wait(std::max<std::size_t>(4096, vectors * 64));
     const std::size_t waitCycles = c2c_system_->cycle() - beginCycle;
+    transfer.pre_execution_cycles = waitCycles;
     stats_.weight_page_wait_cycles += waitCycles;
     stats_.weight_page_initial_wait_cycles += waitCycles;
     weight_pager_->retire();
@@ -819,11 +862,29 @@ void ModelSession::prepare_executable_weight_pages(
 void ModelSession::schedule_executable_weight_pages() {
   if (executable_weight_transfers_.empty())
     return;
+  std::int64_t preExecutionCursor = 0;
+  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_)
+    if (transfer.plan.pre_execution)
+      preExecutionCursor -= static_cast<std::int64_t>(
+          transfer.pre_execution_cycles);
+  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
+    if (!transfer.plan.pre_execution)
+      continue;
+    transfer.actual_start_cycle = preExecutionCursor;
+    transfer.actual_ready_cycle = preExecutionCursor
+        + static_cast<std::int64_t>(transfer.pre_execution_cycles);
+    record_weight_page_trace(transfer);
+    preExecutionCursor += static_cast<std::int64_t>(
+        transfer.pre_execution_cycles);
+  }
   std::optional<std::size_t> debugStopCycle;
   if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
     debugStopCycle = static_cast<std::size_t>(std::stoull(stop));
   weight_pager_->begin_schedule();
-  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
+  for (std::size_t transferIndex = 0;
+       transferIndex < executable_weight_transfers_.size(); ++transferIndex) {
+    ExecutableWeightTransfer &transfer =
+        executable_weight_transfers_[transferIndex];
     if (transfer.plan.pre_execution)
       continue;
     // A bounded diagnostic run must not inject traffic for a page whose first
@@ -831,9 +892,10 @@ void ModelSession::schedule_executable_weight_pages() {
     // stage captures isolated from future C2C/MEM traffic.
     if (debugStopCycle && transfer.plan.ready_cycle > *debugStopCycle)
       continue;
-    transfer.fence = weight_pager_->schedule(
-        transfer.page,
-        static_cast<std::size_t>(transfer.plan.start_cycle));
+    transfer.launch_event_tag = 0x10000u + transferIndex;
+    transfer.fence = weight_pager_->schedule(transfer.page,
+        static_cast<std::size_t>(transfer.plan.start_cycle),
+        transfer.launch_event_tag);
     ++stats_.weight_page_prefetches;
     for (const C2cWeightSegment &segment : transfer.page.segments)
       stats_.weight_page_prefetch_bytes +=
@@ -841,6 +903,95 @@ void ModelSession::schedule_executable_weight_pages() {
           hw::kPhysicalVectorBytes;
   }
   executable_clock_active_ = true;
+}
+
+void ModelSession::release_due_executable_weight_pages() {
+  if (!executable_clock_active_ || c2c_system_ == nullptr)
+    return;
+  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
+    if (transfer.plan.pre_execution || transfer.launch_released ||
+        transfer.plan.start_cycle > executable_cycle_)
+      continue;
+    for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
+      if (transfer.fence.dma_issues_end[side] ==
+          transfer.fence.dma_issues_begin[side])
+        continue;
+      const auto hemisphere = static_cast<Hemisphere>(side);
+      c2c_system_->chip().icu().notify_tagged(
+          IcuLocation::C2cDma(hemisphere), transfer.launch_event_tag);
+      c2c_system_->chip().icu().notify_tagged(
+          IcuLocation::C2cRx(hemisphere), transfer.launch_event_tag);
+    }
+    transfer.launch_released = true;
+  }
+}
+
+void ModelSession::observe_executable_weight_page_tick() {
+  if (!executable_clock_active_ || !weight_pager_)
+    return;
+  const auto physicalCycle =
+      static_cast<std::int64_t>(runtime_.physical_cycles());
+  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
+    if (transfer.plan.pre_execution || !transfer.launch_released ||
+        transfer.trace_recorded)
+      continue;
+    if (!transfer.actual_start_cycle &&
+        weight_pager_->started(transfer.fence))
+      transfer.actual_start_cycle = physicalCycle;
+    if (!weight_pager_->ready(transfer.fence))
+      continue;
+    if (!transfer.actual_start_cycle)
+      transfer.actual_start_cycle = physicalCycle;
+    transfer.actual_ready_cycle = physicalCycle + 1;
+    record_weight_page_trace(transfer);
+  }
+}
+
+void ModelSession::record_weight_page_trace(
+    ExecutableWeightTransfer &transfer) {
+  if (transfer.trace_recorded || !transfer.actual_start_cycle ||
+      !transfer.actual_ready_cycle)
+    return;
+  std::ostringstream bindings;
+  for (std::size_t index = 0; index < transfer.uses.size(); ++index) {
+    if (index != 0)
+      bindings << '+';
+    bindings << transfer.uses[index].binding_index;
+  }
+  const std::uint64_t bandwidth =
+      static_cast<std::uint64_t>(
+          c2c_system_->chip().hardware_configuration()
+              .c2c_streams_per_direction) *
+      c2c_bytes_per_stream_per_cycle_;
+  for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
+    if (transfer.plan.bytes[side] == 0)
+      continue;
+    const char *sideName = side == 0 ? "E" : "W";
+    std::ostringstream detail;
+    detail << "page=" << transfer.plan.page_index
+           << " bank=" << transfer.plan.bank
+           << " bindings=" << bindings.str()
+           << " bytes=" << transfer.plan.bytes[side]
+           << " bandwidth=" << bandwidth << "B/cycle"
+           << " consumer_cycle=" << transfer.plan.ready_cycle
+           << " actual_ready=" << *transfer.actual_ready_cycle
+           << " phase="
+           << (transfer.plan.pre_execution ? "pre_execution" : "overlap");
+    runtime_.record_execution_trace_interval(*transfer.actual_start_cycle,
+        *transfer.actual_ready_cycle,
+        std::string("C2C.") + sideName + ".Prefetch", detail.str());
+    runtime_.record_execution_trace_interval(*transfer.actual_start_cycle,
+        *transfer.actual_ready_cycle,
+        std::string("SR.") + sideName + ".C2C.Shared",
+        "page=" + std::to_string(transfer.plan.page_index) +
+            " bank=" + std::to_string(transfer.plan.bank));
+    runtime_.record_execution_trace_interval(*transfer.actual_start_cycle,
+        *transfer.actual_ready_cycle,
+        std::string("MEM.") + sideName + ".C2CWrite",
+        "page=" + std::to_string(transfer.plan.page_index) +
+            " bank=" + std::to_string(transfer.plan.bank));
+  }
+  transfer.trace_recorded = true;
 }
 
 bool ModelSession::executable_weight_page_ready(
@@ -855,7 +1006,7 @@ bool ModelSession::executable_weight_page_ready(
           return true;
         const bool ready = weight_pager_->ready(transfer.fence);
         if (!ready && std::getenv("FTLPU_SESSION_PROGRESS") != nullptr) {
-          std::clog << "FTLPU executable page miss: binding="
+          std::clog << "FTLPU executable page wait: binding="
                     << use.binding_index << " page=" << use.page_index
                     << " cycle=" << executable_cycle_
                     << " planned_start=" << transfer.plan.start_cycle
@@ -951,7 +1102,8 @@ void ModelSession::load(ModelPackage package) {
             "all executables in one session must share the external-memory "
             "target configuration");
     }
-    configure_external_transport(*sessionHardware);
+    configure_external_transport(
+        effective_external_transport(*sessionHardware));
   }
   prepare_weight_pages();
   const bool report_progress = std::getenv("FTLPU_SESSION_PROGRESS") != nullptr;

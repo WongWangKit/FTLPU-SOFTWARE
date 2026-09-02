@@ -81,10 +81,15 @@ def main() -> None:
         'accumulator_clear = true',
     }
     qkv_interval: tuple[int, int] | None = None
+    o_proj_interval: tuple[int, int] | None = None
+    rmsnorm_restore_ends: list[int] = []
+    ffn_weight_first_cycles: dict[int, int | None] = {7: None, 8: None}
     direct_rope_intervals: list[tuple[int, int]] = []
     direct_rope_fma = False
     direct_rope_fms = False
     mxm_compute_intervals: list[tuple[int, int]] = []
+    streaming_bf16_compute_intervals: list[tuple[int, int]] = []
+    accumulator_read_intervals: list[tuple[int, int]] = []
     host_preloaded_allocations: list[
         tuple[str, int, int, int, frozenset[int]]
     ] = []
@@ -158,6 +163,21 @@ def main() -> None:
                 qkv_interval = (
                     integer_attr(line, "start"), integer_attr(line, "end")
                 )
+            if ('ftlpu.schedule.timeline' in line
+                    and 'name = "o_proj"' in line):
+                o_proj_interval = (
+                    integer_attr(line, "start"), integer_attr(line, "end")
+                )
+            if ('ftlpu.schedule.timeline' in line
+                    and 'name = "rmsnorm.restore_layout"' in line):
+                rmsnorm_restore_ends.append(integer_attr(line, "end"))
+            for binding in ffn_weight_first_cycles:
+                if f"ftlpu.schedule.mem_read %arg{binding} " not in line:
+                    continue
+                cycle = integer_attr(line, "cycle")
+                first = ffn_weight_first_cycles[binding]
+                if first is None or cycle < first:
+                    ffn_weight_first_cycles[binding] = cycle
             if "ftlpu.schedule.sxm" in line:
                 partial = tuple(attribute for attribute in
                                 ("input_row", "output_row", "output_tile")
@@ -176,7 +196,16 @@ def main() -> None:
             if "ftlpu.schedule.mxm_issue" not in line:
                 continue
             if 'opcode = "compute"' in line:
-                mxm_compute_intervals.extend(repeated_intervals(line))
+                intervals = repeated_intervals(line)
+                mxm_compute_intervals.extend(intervals)
+                if all(marker in line for marker in (
+                    'accumulator_destination = "stream"',
+                    'accumulator_output_format = "bf16"',
+                    'accumulator_clear = true',
+                )):
+                    streaming_bf16_compute_intervals.extend(intervals)
+            if 'opcode = "accumulator_read"' in line:
+                accumulator_read_intervals.extend(repeated_intervals(line))
             match = re.search(r"accumulator_address = (\d+) : i64", line)
             if not match:
                 continue
@@ -207,6 +236,25 @@ def main() -> None:
                 )
     if qkv_interval is None:
         raise AssertionError("Schedule IR is missing the QKV timeline")
+    if o_proj_interval is None:
+        raise AssertionError("Schedule IR is missing the O projection timeline")
+    if len(rmsnorm_restore_ends) < 2:
+        raise AssertionError("Schedule IR is missing the second RMSNorm restore")
+    gate_first = ffn_weight_first_cycles[7]
+    up_first = ffn_weight_first_cycles[8]
+    if gate_first is None or up_first is None:
+        raise AssertionError("Schedule IR is missing Gate/Up paged weight reads")
+    if up_first >= gate_first:
+        raise AssertionError(
+            "FFN did not schedule the resident Up projection before the "
+            f"refilled Gate projection: up={up_first}, gate={gate_first}"
+        )
+    second_rms_end = rmsnorm_restore_ends[-1]
+    if up_first - second_rms_end > 256:
+        raise AssertionError(
+            "FFN retained a large idle window after the second RMSNorm: "
+            f"rms_end={second_rms_end}, first_up={up_first}"
+        )
     if not direct_rope_fma or not direct_rope_fms:
         raise AssertionError(
             "Schedule IR is missing the direct MXM-to-VXM RoPE FMA/FMS chains"
@@ -226,11 +274,37 @@ def main() -> None:
             "QKV schedule does not overlap any direct VXM RoPE window with "
             "an MXM projection compute window"
         )
+    o_proj_accumulator_reads = [
+        interval for interval in accumulator_read_intervals
+        if (interval[0] < o_proj_interval[1]
+            and interval[1] > o_proj_interval[0])
+    ]
+    if o_proj_accumulator_reads:
+        raise AssertionError(
+            "O projection retained standalone accumulator reads: "
+            f"{o_proj_accumulator_reads[:4]}"
+        )
+    o_proj_streaming_computes = [
+        interval for interval in streaming_bf16_compute_intervals
+        if (interval[0] < o_proj_interval[1]
+            and interval[1] > o_proj_interval[0])
+    ]
+    if not o_proj_streaming_computes:
+        raise AssertionError(
+            "O projection does not stream its final BF16 accumulations from "
+            "the final MXM partial"
+        )
     first_rope, first_mxm = overlaps[0]
     print(
         "QKV/direct-RoPE overlap: "
         f"{len({rope for rope, _ in overlaps})} direct RoPE windows; "
         f"first RoPE {first_rope} with MXM {first_mxm}",
+        flush=True,
+    )
+    print(
+        "FFN resident-first: "
+        f"second RMS end={second_rms_end}, first Up read={up_first}, "
+        f"first Gate read={gate_first}",
         flush=True,
     )
 

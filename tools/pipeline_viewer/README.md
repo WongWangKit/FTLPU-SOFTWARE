@@ -1,8 +1,17 @@
 # FTLPU Pipeline Viewer
 
-The pipeline viewer is a dependency-free Canvas waveform workspace for runtime
-schedule traces. Open `index.html` in a browser and load the CSV emitted by
-`write_schedule_trace_csv()`.
+The pipeline viewer is a dependency-free Canvas waveform workspace for two
+kinds of CSV trace:
+
+- `ModelSession::write_execution_trace_csv()` and `RuntimeExecutionTrace`
+  sample instructions actually issued by the ICUs while CModel advances cycle
+  by cycle. They include physical cycles, DDR jitter, and synchronization stalls.
+- `write_schedule_trace_csv()` produces an offline plan from a binary without
+  running CModel. It is useful for compiler inspection, but it is not evidence
+  of actual execution timing.
+
+Open `index.html` and load either format. Performance and pipeline validation
+should use the runtime execution trace.
 
 The original four-column CSV remains supported:
 
@@ -23,10 +32,18 @@ start,end,resource,detail,pattern,inner_count,inner_interval,inner_stride,outer_
 events. The viewer expands only the instances intersecting the visible cycle
 window. `induction` identifies the numeric field changed by the strides.
 
-Paged binaries also include `C2C.E.Prefetch` and `C2C.W.Prefetch` rows. Their
-intervals are derived from binary page readiness and the target's dedicated
-C2C bandwidth; `detail` records the page, bank, bindings, bytes, lane count,
-and `planned=true` provenance.
+In an execution trace, `C2C.E.Prefetch`, `C2C.W.Prefetch`, shared-SR, and
+`MEM.*.C2CWrite` intervals come from completed CModel DMA/RX/MEM-write work.
+Their details carry `source=runtime`, `consumer_cycle`, and `actual_ready`.
+When a page finishes late, `ICU.PageReadyWait` shows the physical-cycle interval
+for which compute-side ICU issue was held at the synchronization barrier.
+Offline-plan rows retain `planned=true` and are bandwidth-model predictions.
+
+`C2C.E/W.DMA` are the DDR-to-C2C DMA command-issue rows for the east and west
+hemispheres. `C2C.E/W.RX` are the matching receive command-issue rows that bind
+each lane to a destination MEM slice/bank. The four rows are therefore two
+hemispheres times two command stages. Use `C2C.E/W.Prefetch` for the completed
+transfer interval and `MEM.E/W.C2CWrite` for the final SRAM-write interval.
 
 Controls:
 
@@ -53,6 +70,7 @@ build-ftlpu-vs2026/compiler/ftlpu_lower/
   smollm2_135m_ffn_seq128_pipeline/ffn.runtime.csv
   smollm2_attention_pipeline/attention.runtime.csv
   smollm2_decoder_layer_binary_runtime/decoder_layer.runtime.csv
+  qwen2_5_1_5b_decoder_layer/decoder_layer.actual.runtime.csv
 ```
 
 The viewer renders only visible rows and cycle intervals, so long schedules do

@@ -65,6 +65,15 @@ try {
         || !preloadPlans[1].pre_execution)
         throw std::runtime_error(
             "disjoint alternate-bank weight page was not preloaded");
+    auto lowBandwidthHardware = preloadProgram.hardware;
+    lowBandwidthHardware.ddr_peak_bandwidth_mbytes_per_second = 12800;
+    const auto lowBandwidthPlans =
+        plan_weight_prefetches(preloadProgram, lowBandwidthHardware);
+    if (lowBandwidthPlans.size() != preloadPlans.size()
+        || lowBandwidthPlans[0].transfer_end_cycle
+            <= preloadPlans[0].transfer_end_cycle)
+        throw std::runtime_error(
+            "runtime DDR bandwidth did not retime weight prefetches");
 
     BinaryProgram program;
     program.bindings.push_back(make_weight_binding());
@@ -88,7 +97,12 @@ try {
 
     C2cDmaSystem system;
     ModelSession session(system);
+    session.set_ddr_peak_bandwidth_mbytes_per_second(12800);
     session.load(std::move(package));
+    if (system.ddr4().config().peak_bandwidth_bytes_per_second
+        != 12'800'000'000ULL)
+        throw std::runtime_error(
+            "ModelSession did not apply the runtime DDR bandwidth");
     session.run_invocation(0, 0);
 
     if (session.stats().weight_page_prefetches != 1

@@ -118,6 +118,13 @@ bool plans_overlap(
 std::vector<WeightPrefetchPlan> plan_weight_prefetches(
     const BinaryProgram& program)
 {
+    return plan_weight_prefetches(program, program.hardware);
+}
+
+std::vector<WeightPrefetchPlan> plan_weight_prefetches(
+    const BinaryProgram& program,
+    const ExecutableHardwareConfig& runtimeHardware)
+{
     if (program.weight_page_uses.empty()) return {};
     const std::uint64_t lanes =
         program.hardware.c2c_streams_per_direction;
@@ -129,11 +136,11 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
     if (lanes > std::numeric_limits<std::uint64_t>::max() / bytesPerLane)
         throw std::overflow_error("C2C bandwidth overflows uint64_t");
     const std::uint64_t bandwidth = lanes * bytesPerLane;
-    const std::uint64_t clockMhz = program.hardware.lpu_clock_mhz;
+    const std::uint64_t clockMhz = runtimeHardware.lpu_clock_mhz;
     const std::uint64_t ddrBandwidth =
-        program.hardware.ddr_peak_bandwidth_mbytes_per_second;
+        runtimeHardware.ddr_peak_bandwidth_mbytes_per_second;
     const std::uint64_t ddrEfficiency =
-        program.hardware.ddr_scheduling_efficiency_percent;
+        runtimeHardware.ddr_scheduling_efficiency_percent;
     if (clockMhz == 0 || ddrBandwidth == 0 || ddrEfficiency == 0
         || ddrEfficiency > 100)
         throw std::logic_error(
@@ -189,12 +196,19 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
             *found, binding, page_byte_size(binding, use.page_index));
     }
 
-    schedule_weight_prefetches(program, plans);
+    schedule_weight_prefetches(program, plans, runtimeHardware);
     return plans;
 }
 
 void schedule_weight_prefetches(const BinaryProgram& program,
     std::vector<WeightPrefetchPlan>& plans)
+{
+    schedule_weight_prefetches(program, plans, program.hardware);
+}
+
+void schedule_weight_prefetches(const BinaryProgram& program,
+    std::vector<WeightPrefetchPlan>& plans,
+    const ExecutableHardwareConfig& runtimeHardware)
 {
     std::ranges::sort(plans, [](const auto& lhs, const auto& rhs) {
         return lhs.ready_cycle < rhs.ready_cycle;
@@ -212,17 +226,20 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         throw std::logic_error(
             "paged weights require non-zero C2C bandwidth");
     const std::uint64_t bandwidth = lanes * bytesPerLane;
-    const std::uint64_t clockMhz = program.hardware.lpu_clock_mhz;
+    const std::uint64_t clockMhz = runtimeHardware.lpu_clock_mhz;
     const std::uint64_t ddrBandwidth =
-        program.hardware.ddr_peak_bandwidth_mbytes_per_second;
+        runtimeHardware.ddr_peak_bandwidth_mbytes_per_second;
     const std::uint64_t ddrEfficiency =
-        program.hardware.ddr_scheduling_efficiency_percent;
+        runtimeHardware.ddr_scheduling_efficiency_percent;
+    if (clockMhz == 0 || ddrBandwidth == 0 || ddrEfficiency == 0
+        || ddrEfficiency > 100)
+        throw std::logic_error(
+            "paged weights require a valid runtime external-memory model");
 
     std::vector<std::uint64_t> durations(plans.size());
     std::vector<std::uint64_t> reusableCycles(plans.size());
-    const auto dmaLeadCycles =
-        static_cast<std::uint64_t>(
-            program.hardware.ddr_read_latency_cycles) + 1;
+    const auto dmaLeadCycles = static_cast<std::uint64_t>(
+        runtimeHardware.ddr_read_latency_cycles) + 1;
     for (std::size_t index = 0; index < plans.size(); ++index) {
         auto& plan = plans[index];
         const auto sideBytes = std::max(plan.bytes[0], plan.bytes[1]);
@@ -238,15 +255,15 @@ void schedule_weight_prefetches(const BinaryProgram& program,
             / effectiveBandwidth;
         const auto queueDrain =
             (static_cast<std::uint64_t>(
-                 program.hardware.ddr_request_queue_depth)
+                 runtimeHardware.ddr_request_queue_depth)
                 + lanes - 1)
             / lanes;
         const auto transportGuard = queueDrain
             + hw::kMemEastBoundaryStreamRegisterColumn
             + hw::kTileRows + lanes;
         durations[index] = std::max(c2cCycles, ddrCycles)
-            + program.hardware.ddr_read_latency_cycles
-            + program.hardware.ddr_read_latency_jitter_cycles
+            + runtimeHardware.ddr_read_latency_cycles
+            + runtimeHardware.ddr_read_latency_jitter_cycles
             + transportGuard;
         // The compiler's dedicated-slice layout keeps activation scratch out
         // of the weight residency regions represented here. Consequently,
@@ -255,10 +272,12 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         bool canPreload = true;
         for (std::size_t previous = 0; previous < index; ++previous) {
             if (!plans_overlap(plan, plans[previous])) continue;
-            const auto safeDmaStart =
-                plans[previous].release_cycle > dmaLeadCycles
-                ? plans[previous].release_cycle - dmaLeadCycles
-                : 0;
+            // DDR latency is intentionally nondeterministic. With no staging
+            // buffer between DDR and the shared C2C/MEM path, launching before
+            // the old page's release could let an early response overwrite
+            // live SRAM. The event gate therefore opens no earlier than the
+            // compiler-provided physical release cycle.
+            const auto safeDmaStart = plans[previous].release_cycle;
             reusableCycles[index] = std::max(
                 reusableCycles[index], safeDmaStart);
             if (plans[previous].pre_execution) canPreload = false;
@@ -268,42 +287,26 @@ void schedule_weight_prefetches(const BinaryProgram& program,
             plan.transfer_end_cycle = durations[index];
     }
 
-    std::uint64_t nextFabricStart =
-        std::numeric_limits<std::uint64_t>::max();
-    for (std::size_t index = plans.size(); index-- > 0;) {
+    std::uint64_t nextQueueCursor = 0;
+    for (std::size_t index = 0; index < plans.size(); ++index) {
         auto& plan = plans[index];
         if (plan.pre_execution) continue;
-        const auto deadline = std::min(
-            plan.ready_cycle, nextFabricStart);
-        const bool durationFits = durations[index] <= deadline;
-        const auto latestStart = durationFits
-            ? deadline - durations[index] : 0;
+        const auto latestStart = durations[index] <= plan.ready_cycle
+            ? plan.ready_cycle - durations[index] : 0;
         const auto preferredStart = latestStart > dmaLeadCycles
             ? latestStart - dmaLeadCycles : 0;
         plan.start_cycle = std::max(
-            preferredStart, reusableCycles[index]);
+            {preferredStart, reusableCycles[index], nextQueueCursor});
         plan.transfer_end_cycle = plan.start_cycle + durations[index];
-        if (!durationFits || plan.transfer_end_cycle > deadline) {
-            std::ostringstream detail;
-            const auto& firstUse =
-                program.weight_page_uses[plan.use_indices.front()];
-            detail << "C2C weight page cannot meet its first-consumer deadline:"
-                   << " binding=" << firstUse.binding_index
-                   << " uses=" << plan.use_indices.size()
-                   << " page=" << plan.page_index
-                   << " bank=" << plan.bank
-                   << " bytes_east=" << plan.bytes[0]
-                   << " bytes_west=" << plan.bytes[1]
-                   << " duration=" << durations[index]
-                   << " planned_start=" << plan.start_cycle
-                   << " planned_end=" << plan.transfer_end_cycle
-                   << " ready_cycle=" << plan.ready_cycle
-                   << " release_cycle=" << plan.release_cycle
-                   << " next_fabric_start=" << nextFabricStart
-                   << " reusable_cycle=" << reusableCycles[index];
-            throw std::logic_error(detail.str());
-        }
-        nextFabricStart = plan.start_cycle;
+        std::array<std::uint64_t, hw::kHemispheres> segmentCounts{};
+        for (const auto& region : plan.regions)
+            for (std::size_t side = 0; side < hw::kHemispheres; ++side)
+                if ((region.hemisphere_mask & (1u << side)) != 0)
+                    ++segmentCounts[side];
+        // One queue cycle releases WAIT_EVENT, followed by one issue per
+        // segment on the busiest hemisphere.
+        nextQueueCursor = plan.start_cycle + 1
+            + *std::max_element(segmentCounts.begin(), segmentCounts.end());
     }
 }
 

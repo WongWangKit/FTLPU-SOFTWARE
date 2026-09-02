@@ -11,6 +11,12 @@
 
 namespace ftlpu::compiler::schedule {
 
+enum class FfnProjectionOrder {
+    Interleaved,
+    GateThenUp,
+    UpThenGate,
+};
+
 struct FfnStreamSegment {
     int64_t rows;
     int64_t stream_base;
@@ -41,12 +47,15 @@ struct FfnProjectionTimeline {
     // of the next projection sharing the same physical MXM. Result draining
     // is pipelined behind activation issue and does not extend this slot.
     int64_t projection_slot_interval;
+    int64_t projection_block_interval;
     int64_t weight_block_interval;
+    int64_t second_projection_offset;
     int64_t initial_compute_cycle;
     int64_t final_projection_cycle;
     int64_t accumulator_queue_release;
     int64_t pair_count;
     int64_t m_tile_count;
+    FfnProjectionOrder projection_order;
     std::vector<FfnProjectionBlockSchedule> blocks;
 };
 
@@ -87,13 +96,16 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     FfnScheduleShape shape, llvm::ArrayRef<int64_t> weightSlices,
     const target::LPUTargetModel& target,
     bool localWeightDequant = false,
-    bool replicateOutputBlocksAcrossHemispheres = false);
+    bool replicateOutputBlocksAcrossHemispheres = false,
+    FfnProjectionOrder projectionOrder =
+        FfnProjectionOrder::Interleaved);
 
 mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
     FfnScheduleShape shape, const FfnProjectionTimeline& projection,
     int64_t lastSwishCycle, llvm::ArrayRef<int64_t> weightSlices,
     llvm::ArrayRef<int64_t> hiddenSlices,
     llvm::ArrayRef<int64_t> resultSlices,
-    const target::LPUTargetModel& target);
+    const target::LPUTargetModel& target,
+    int64_t reductionsPerWeightPage = 0);
 
 } // namespace ftlpu::compiler::schedule

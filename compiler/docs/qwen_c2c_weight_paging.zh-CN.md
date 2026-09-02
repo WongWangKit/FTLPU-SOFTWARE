@@ -63,7 +63,31 @@ Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gat
 5. layer 0 完成后确认 page 1 ready；若未完成则只等待剩余搬运。
 6. 加载 layer 1 ICU 程序，执行完整 Attention -> FFN，同时启动 page 2 到 bank 0，依次交替。
 
-`ModelSessionStats` 将冷启动和稳态开销分开统计：`weight_page_initial_wait_cycles` 是 page 0 首装等待，`weight_page_boundary_wait_cycles` 是真正的层边界停顿，`weight_page_hidden_prefetches` 统计进入下一层时已经 SRAM-ready 的页面；原有 `weight_page_wait_cycles` 保留为总等待时间。
+### Page-ready 同步
+
+Binary 中的 `ready_cycle` 现在解释为该页的首个逻辑 consumer cycle，文档和 trace
+称其为 `consumer_cycle`。它用于让 planner 尽早启动预取，不是硬件 deadline，也不
+假设 DDR 必须在某个固定 cycle 返回。真正的同步链为：
+
+```text
+logical launch point -> tagged WAIT_EVENT releases C2C DMA/RX
+DDR response -> C2C RX -> shared SR -> all target MEM writes commit
+page fence complete -> page-ready broadcast -> compute ICU issue resumes
+```
+
+runtime 同时维护 logical cycle 和 physical cycle。页面未完成时，普通
+MEM/MXM/VXM/SXM ICU 停在 consumer 边界，DDR/C2C/RX/MEM C2C-write 继续走
+physical clock；页面 fence 完成后计算继续，因此带宽不足或 DDR latency jitter
+只会形成动态 backpressure，不会造成“错过 deadline”。当前实现采用计算侧全局
+issue gate，适合页边界/静止边界；若以后允许任意 task 在深流水中分别等待不同页，
+则应把 event ID 放入粗粒度 task ISA，由各功能单元 ICU 的 scoreboard 独立等待。
+
+`ModelSessionStats` 将冷启动和稳态开销分开统计：`weight_page_initial_wait_cycles` 是 page 0 首装等待，`weight_page_boundary_wait_cycles` 是真正的层边界停顿，`weight_page_runtime_wait_cycles` 是 executable 内 page-ready 屏障消耗的 physical cycle，`weight_page_hidden_prefetches` 统计进入下一层时已经 SRAM-ready 的页面；原有 `weight_page_wait_cycles` 保留为总等待时间。
+
+`ModelSession::write_execution_trace_csv()` 输出 CModel 运行过程中采样的实际 trace。
+其中 `source=runtime` 的 C2C/SR/MEM 行使用实际开始和完成 cycle，
+`ICU.PageReadyWait` 表示真实同步等待。`write_schedule_trace_csv()` 保留为不执行
+CModel 的离线 binary 计划检查，两者不能混作同一种性能数据。
 
 C2C receive 指令描述一段连续 SRAM row burst。runtime 按目标 slice 将 segment
 分配到已配置的 C2C lane，因此指令数量按 segment 数增长，而不是按 32-byte vector
