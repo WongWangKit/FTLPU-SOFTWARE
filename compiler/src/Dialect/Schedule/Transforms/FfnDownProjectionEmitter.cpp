@@ -37,11 +37,19 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
     const bool hiddenDistributed16 = hiddenKind
         && hiddenKind.getValue() == "fp16_mxm_distributed_16";
 
+    const auto downPlacement = context.down_route.getPlacement();
+    int64_t reductionsPerWeightPage = 0;
+    if (const auto paged = downPlacement.getAs<mlir::BoolAttr>(
+            "paged_weight"); paged && paged.getValue()) {
+        if (const auto granularity = downPlacement.getAs<mlir::IntegerAttr>(
+                "page_granularity"))
+            reductionsPerWeightPage = granularity.getInt();
+    }
     auto timeline = planFfnDownProjectionTimeline(
         {context.m(), context.k(), intermediate, context.n()},
         context.projection_timeline, swish.last_cycle,
-        context.weight_slices, context.hidden_slices,
-        context.result_slices, target);
+        context.down_weight_slices, context.hidden_slices,
+        context.result_slices, target, reductionsPerWeightPage);
     if (mlir::failed(timeline)) return mlir::failure();
     int64_t downEnd = timeline->phase_start;
 
@@ -60,11 +68,12 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                 const int64_t unit =
                     hemisphere * throughput.mxms_per_hemisphere
                     + localMxm;
-                const int64_t start =
-                    block.dequant_start
-                    + (hemisphere * logicalSlotsPerHemisphere
-                          + logicalSlot)
-                        * weightLoadCycles;
+                const int64_t start = singleMxm
+                    ? block.dequant_start + logicalSlot * tile
+                    : block.dequant_start
+                        + (hemisphere * logicalSlotsPerHemisphere
+                              + logicalSlot)
+                            * weightLoadCycles;
                 const auto placement = context.down_route.getPlacement();
                 const int64_t bindingBase = placement
                         .getAs<mlir::IntegerAttr>("base_row")

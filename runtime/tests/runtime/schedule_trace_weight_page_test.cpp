@@ -14,7 +14,8 @@ namespace {
 using namespace ftlpu::software::runtime;
 
 BinaryBinding weight(
-    std::uint32_t index, std::string name, std::uint64_t bytes)
+    std::uint32_t index, std::string name, std::uint64_t bytes,
+    std::uint16_t slice)
 {
     BinaryBinding binding;
     binding.index = index;
@@ -25,7 +26,14 @@ BinaryBinding weight(
     binding.hemisphere_mask = 3;
     binding.paged_weight = true;
     binding.page_count = 2;
+    binding.page_rows = 8;
+    binding.page_granularity = 1;
+    binding.page_role_group_count = 1;
+    binding.page_items_per_slice_group = 1;
     binding.page_bank_count = 2;
+    binding.instruction_count = 8;
+    binding.slices = {slice};
+    binding.page_storage_slices = binding.slices;
     return binding;
 }
 
@@ -33,6 +41,43 @@ void require_contains(const std::string& text, const std::string& expected)
 {
     if (text.find(expected) == std::string::npos)
         throw std::runtime_error("trace is missing: " + expected);
+}
+
+template <typename T>
+void write_fixture_scalar(std::ostream& os, T value)
+{
+    os.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+void verify_official_v26_header_compatibility()
+{
+    constexpr char magic[8] {'F', 'T', 'L', 'P', 'U', 'B', '0', '1'};
+    ExecutableHardwareConfig hardware;
+    hardware.vxm_cross_hemisphere_streams_enabled = 0;
+    hardware.vxm_fma_enabled = 1;
+    const std::string targetName = "official-v26-fixture";
+
+    std::ostringstream os(std::ios::out | std::ios::binary);
+    os.write(magic, sizeof(magic));
+    write_fixture_scalar<std::uint32_t>(os, 26);
+    write_fixture_scalar<std::uint64_t>(os, executable_target_abi(hardware));
+    write_fixture_scalar<std::uint16_t>(
+        os, static_cast<std::uint16_t>(targetName.size()));
+    os.write(targetName.data(), static_cast<std::streamsize>(targetName.size()));
+    hardware.visit_v26([&](std::uint32_t value) {
+        write_fixture_scalar(os, value);
+    });
+    write_fixture_scalar<std::uint64_t>(os, 0);
+    for (int count = 0; count < 7; ++count)
+        write_fixture_scalar<std::uint32_t>(os, 0);
+
+    const auto bytes = os.str();
+    const auto decoded = read_binary_program(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+    if (decoded.target_name != targetName || !decoded.queues.empty()
+        || decoded.hardware.vxm_cross_hemisphere_streams_enabled != 0
+        || decoded.hardware.vxm_fma_enabled != 1)
+        throw std::runtime_error("official v26 header did not round-trip");
 }
 
 QueueCommand mxm_command(const ftlpu::MxmControlInstruction& instruction)
@@ -61,6 +106,23 @@ QueueCommand mem_command(const ftlpu::MemInstruction& instruction)
     };
 }
 
+QueueCommand vxm_command(std::size_t queue,
+    ftlpu::VxmChainDepth depth,
+    const ftlpu::VxmLaneAluInstruction& instruction)
+{
+    const auto encoded =
+        ftlpu::isa::encode_vxm_instruction(queue, depth, instruction);
+    return QueueCommand {
+        static_cast<ftlpu::isa::EncodedIcuCommand>(
+            ftlpu::isa::IcuCommandOpcode::Instruction),
+        InstructionKind::Vxm,
+        3,
+        {static_cast<std::uint32_t>(encoded.control),
+            static_cast<std::uint32_t>(encoded.control >> 32),
+            encoded.immediate_bits, 0},
+    };
+}
+
 QueueCommand repeat_2d_command(const ftlpu::IcuRepeat2D& repeat)
 {
     const auto encoded = ftlpu::isa::encode_icu_repeat_2d(repeat);
@@ -74,6 +136,8 @@ QueueCommand repeat_2d_command(const ftlpu::IcuRepeat2D& repeat)
 
 int main()
 try {
+    verify_official_v26_header_compatibility();
+
     BinaryProgram program;
     program.hardware.c2c_streams_per_direction = 8;
     program.hardware.c2c_bytes_per_stream_per_cycle = 32;
@@ -84,10 +148,10 @@ try {
     program.hardware.ddr_read_latency_jitter_cycles = 15;
     program.hardware.icu_mem_imem_depth = 6;
     program.bindings = {
-        weight(1, "gate", 2048),
-        weight(2, "up", 2048),
-        weight(4, "reuse", 1024),
-        weight(3, "down", 1024),
+        weight(1, "gate", 2048, 20),
+        weight(2, "up", 2048, 21),
+        weight(4, "reuse", 1024, 20),
+        weight(3, "down", 1024, 20),
     };
     program.weight_page_uses = {
         {1, 0, 0, 200, 300},
@@ -117,6 +181,14 @@ try {
             mxm_command(ftlpu::MxmControlInstruction::IW(0, 3)),
             ftlpu::IcuMacroSchedule {10, 3, 2, 1, 1, 1, 0,
                 ftlpu::IcuInductionTarget::MxmWeightColumn})}});
+    auto vxm = ftlpu::VxmLaneAluInstruction {
+        ftlpu::VxmAluOpcode::Multiply,
+        ftlpu::VxmLaneOperand::StreamBFloat16(),
+        ftlpu::VxmLaneOperand::StreamBFloat16()};
+    vxm.repeat_count = 7;
+    program.queues.push_back(QueueProgram {
+        QueueKind::Vxm, 0,
+        {vxm_command(0, ftlpu::VxmChainDepth::Two, vxm)}});
     program.address_relocations.push_back(BinaryAddressRelocation {
         1, BindingAccess::Input, QueueKind::MxmLoad, 0, 0, false,
     });
@@ -134,8 +206,13 @@ try {
         std::span<const std::uint8_t>(
             reinterpret_cast<const std::uint8_t*>(bytes.data()),
             bytes.size()));
-    if (decoded.queues.size() != 2 || decoded.queues[1].commands.size() != 1
-        || !is_macro_schedule_command(decoded.queues[1].commands[0]))
+    const auto decodedMxm = std::find_if(decoded.queues.begin(),
+        decoded.queues.end(), [](const QueueProgram& queue) {
+            return queue.kind == QueueKind::MxmLoad && queue.index == 0;
+        });
+    if (decodedMxm == decoded.queues.end()
+        || decodedMxm->commands.size() != 1
+        || !is_macro_schedule_command(decodedMxm->commands[0]))
         throw std::runtime_error("compact macro binary did not round-trip");
     if (decoded.hardware.icu_mem_imem_depth != 6
         || decoded.hardware.icu_mxm_instruction_bits
@@ -143,8 +220,8 @@ try {
         throw std::runtime_error("i-MEM geometry did not round-trip");
     const auto imem = analyze_cmodel_abstract_imem(decoded);
     if (imem.fits() || imem.overflow_queues != 1
-        || imem.used_slots != 8 || imem.encoded_work_entries != 8
-        || imem.expanded_work != 21
+        || imem.used_slots != 9 || imem.encoded_work_entries != 9
+        || imem.expanded_work != 22
         || !imem.queues[0].overflow()
         || imem.queues[0].overflow_slots() != 1)
         throw std::runtime_error("cmodel-abstract i-MEM report is incorrect");
@@ -168,7 +245,7 @@ try {
         throw std::runtime_error(
             "compact macro metadata-only read did not round-trip");
     const auto decodedMacro =
-        decode_macro_schedule_command(decoded.queues[1].commands[0]);
+        decode_macro_schedule_command(decodedMxm->commands[0]);
     if (decodedMacro.start_cycle != 10 || decodedMacro.inner_count != 3
         || decodedMacro.inner_interval != 2
         || decodedMacro.inner_stride != 1
@@ -192,21 +269,31 @@ try {
         "inner_stride,outer_count,outer_interval,outer_stride,skip_first,"
         "induction,base_delta");
     require_contains(trace,
-        "0,137,\"C2C.E.Prefetch\",\"page=0 bank=0 "
-        "bindings=gate+up bytes=1024 lanes=8 bandwidth=256B/cycle "
-        "deadline=200 scheduled=true\"");
+        "\"C2C.E.Prefetch\",\"page=0 bank=0 "
+        "bindings=gate bytes=512 lanes=8 bandwidth=256B/cycle "
+        "consumer_cycle=200 phase=pre_execution scheduled=true\"");
     require_contains(trace,
-        "0,137,\"C2C.W.Prefetch\",\"page=0 bank=0 "
-        "bindings=gate+up bytes=1024 lanes=8 bandwidth=256B/cycle "
-        "deadline=200 scheduled=true\"");
+        "\"C2C.W.Prefetch\",\"page=0 bank=0 "
+        "bindings=gate bytes=512 lanes=8 bandwidth=256B/cycle "
+        "consumer_cycle=200 phase=pre_execution scheduled=true\"");
     require_contains(trace,
-        "330,450,\"C2C.E.Prefetch\",\"page=0 bank=0 "
+        "\"C2C.E.Prefetch\",\"page=0 bank=0 "
+        "bindings=up bytes=512 lanes=8 bandwidth=256B/cycle "
+        "consumer_cycle=202 phase=pre_execution scheduled=true\"");
+    require_contains(trace,
+        "\"C2C.E.Prefetch\",\"page=0 bank=0 "
         "bindings=reuse bytes=256 lanes=8 bandwidth=256B/cycle "
-        "deadline=450 scheduled=true\"");
+        "consumer_cycle=450 phase=overlap scheduled=true\"");
     require_contains(trace,
-        "580,700,\"C2C.E.Prefetch\",\"page=0 bank=0 "
+        "\"C2C.E.Prefetch\",\"page=0 bank=0 "
         "bindings=down bytes=256 lanes=8 bandwidth=256B/cycle "
-        "deadline=700 scheduled=true\"");
+        "consumer_cycle=700 phase=overlap scheduled=true\"");
+    require_contains(trace,
+        "\"SR.E.C2C.Shared\",\"page=0 bank=0 streams=W24..W31 "
+        "sync=target_mem+stream_tag timing=per_vector_notification\"");
+    require_contains(trace,
+        "\"MEM.E.C2CWrite\",\"page=0 bank=0 streams=W24..W31 "
+        "sync=target_mem+stream_tag timing=per_vector_notification\"");
     if (trace.find("bindings=gate+up+reuse") != std::string::npos)
         throw std::runtime_error(
             "non-overlapping reuse page was merged with Gate/Up");
@@ -227,6 +314,9 @@ try {
     require_contains(trace,
         "25,26,\"MEM.E.Read\",\"slice=0 bank=0 addr=301 stream=E3\","
         "\"repeat\",3,4,10,1,0,0,0,\"mem_address\",10");
+    require_contains(trace,
+        "0,7,\"VXM.C0\",\"mul depth=2 repeat=7\",\"single\","
+        "1,0,0,1,0,0,0,\"none\",0");
 
     std::cout << "schedule_trace_weight_page_test passed\n";
     return 0;

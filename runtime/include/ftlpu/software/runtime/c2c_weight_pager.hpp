@@ -35,9 +35,13 @@ struct C2cWeightPageStats {
 };
 
 struct C2cWeightPageFence {
+    std::array<std::size_t, hw::kHemispheres> dma_issues_begin{};
+    std::array<std::size_t, hw::kHemispheres> dma_issues_end{};
     std::array<std::array<std::size_t, hw::kC2cStreamsPerDirection>,
                hw::kHemispheres>
         completed_segments{};
+    std::array<std::size_t, InstructionControlUnit::kMemQueues>
+        completed_mem_writes{};
 };
 
 class C2cWeightPager {
@@ -47,7 +51,9 @@ public:
     void enqueue(const C2cWeightPage& page);
     void begin_schedule();
     C2cWeightPageFence schedule(
-        const C2cWeightPage& page, std::size_t start_cycle);
+        const C2cWeightPage& page, std::size_t start_cycle,
+        std::size_t launch_event_tag);
+    bool started(const C2cWeightPageFence& fence) const;
     bool ready(const C2cWeightPageFence& fence) const;
     bool busy() const noexcept;
     bool ready() const;
@@ -64,9 +70,12 @@ private:
     std::vector<std::size_t> target_mem_queues_{};
     std::array<std::size_t, hw::kHemispheres> schedule_dma_cursor_{};
     std::array<std::size_t, hw::kHemispheres> schedule_rx_cursor_{};
+    std::array<std::size_t, hw::kHemispheres> scheduled_dma_issues_{};
     std::array<std::array<std::size_t, hw::kC2cStreamsPerDirection>,
                hw::kHemispheres>
         scheduled_rx_segments_{};
+    std::array<std::size_t, InstructionControlUnit::kMemQueues>
+        scheduled_mem_writes_{};
     std::uint32_t drain_cycles_{0};
     bool active_{false};
 };

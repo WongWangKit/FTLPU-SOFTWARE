@@ -25,10 +25,9 @@ Qwen decoder 层不再要求全部权重同时常驻片上 MEM。runtime 首先�
 - 计算保持原有 32 条 eastward 和 32 条 westward stream。C2C 对外提供可配置
   的 lane，默认每个方向 8 条，每条每 cycle 搬运一个 32-byte vector，峰值为
   `8 x 32 = 256 bytes/cycle`/方向。
-- 当前 `ModelSession` 使用 32 条普通计算 stream 之外的专用 C2C lane。RX 指令携带
-  目标 hemisphere/slice/bank/row，由目标 MEM 接收端提交 SRAM；所有字节仍必须来自
-  DDR DMA 和 C2C 链路，host 不能直接写 LPU MEM。共享-SR 模式仍可选择，此时 lane
-  映射到 `W24..W31`，并由普通 MEM `Write` 消费，但不用于当前细粒度重叠分页。
+- `ModelSession` 把外部 lane 映射到普通 west stream（8 lane 时为 `W24..W31`）。
+  C2C RX 把每个 vector 注入共享 SR fabric，由点对点通知的目标 MEM ICU 发出普通
+  `Write` 提交 SRAM。系统不存在 C2C RX 直写 SRAM 的旁路，host 也不能直接写 LPU MEM。
 - C2C page ready 表示最后一个目标 SRAM 写入已经提交，不等同于 DMA 把最后一个 vector 放入 RX FIFO。
 
 ## 软件表示
@@ -47,8 +46,8 @@ Binary v24 在 target ABI 中保存 bank 和外部存储参数。ModelPackage v5
 MXM accumulator 位于功能单元内部，其容量由 `mxm_accumulator_blocks` 描述；任何 MEM slice 都不配置成 accumulator。
 两个 SRAM bank 使用相同的 slice 角色。feedback RMSNorm 将每层 gamma 放在激活区
 两个 slice，每个半球只用两条低编号 west stream，其他数据流也保持在 `W16`
-以下；pager 使用独立的专用 C2C lane，并写入高编号权重 slice。stream 和 slice/port
-的双重资源隔离允许权重预取与 RMSNorm 重叠；两条路径都不能绕过 C2C 外部边界。
+以下；pager 使用普通 `W24..W31`，并写入高编号权重 slice。stream ID 和 slice/port
+的资源隔离允许权重预取与 RMSNorm 重叠；两条路径都不能绕过 C2C 外部边界。
 
 该分区消除的是传输和端口冲突，并不会增加容量。对于 seq_len=32 的
 Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gate 与 Up
@@ -64,7 +63,31 @@ Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gat
 5. layer 0 完成后确认 page 1 ready；若未完成则只等待剩余搬运。
 6. 加载 layer 1 ICU 程序，执行完整 Attention -> FFN，同时启动 page 2 到 bank 0，依次交替。
 
-`ModelSessionStats` 将冷启动和稳态开销分开统计：`weight_page_initial_wait_cycles` 是 page 0 首装等待，`weight_page_boundary_wait_cycles` 是真正的层边界停顿，`weight_page_hidden_prefetches` 统计进入下一层时已经 SRAM-ready 的页面；原有 `weight_page_wait_cycles` 保留为总等待时间。
+### Page-ready 同步
+
+Binary 中的 `ready_cycle` 现在解释为该页的首个逻辑 consumer cycle，文档和 trace
+称其为 `consumer_cycle`。它用于让 planner 尽早启动预取，不是硬件 deadline，也不
+假设 DDR 必须在某个固定 cycle 返回。真正的同步链为：
+
+```text
+logical launch point -> tagged WAIT_EVENT releases C2C DMA/RX
+DDR response -> C2C RX -> shared SR -> all target MEM writes commit
+page fence complete -> page-ready broadcast -> compute ICU issue resumes
+```
+
+runtime 同时维护 logical cycle 和 physical cycle。页面未完成时，普通
+MEM/MXM/VXM/SXM ICU 停在 consumer 边界，DDR/C2C/RX/MEM C2C-write 继续走
+physical clock；页面 fence 完成后计算继续，因此带宽不足或 DDR latency jitter
+只会形成动态 backpressure，不会造成“错过 deadline”。当前实现采用计算侧全局
+issue gate，适合页边界/静止边界；若以后允许任意 task 在深流水中分别等待不同页，
+则应把 event ID 放入粗粒度 task ISA，由各功能单元 ICU 的 scoreboard 独立等待。
+
+`ModelSessionStats` 将冷启动和稳态开销分开统计：`weight_page_initial_wait_cycles` 是 page 0 首装等待，`weight_page_boundary_wait_cycles` 是真正的层边界停顿，`weight_page_runtime_wait_cycles` 是 executable 内 page-ready 屏障消耗的 physical cycle，`weight_page_hidden_prefetches` 统计进入下一层时已经 SRAM-ready 的页面；原有 `weight_page_wait_cycles` 保留为总等待时间。
+
+`ModelSession::write_execution_trace_csv()` 输出 CModel 运行过程中采样的实际 trace。
+其中 `source=runtime` 的 C2C/SR/MEM 行使用实际开始和完成 cycle，
+`ICU.PageReadyWait` 表示真实同步等待。`write_schedule_trace_csv()` 保留为不执行
+CModel 的离线 binary 计划检查，两者不能混作同一种性能数据。
 
 C2C receive 指令描述一段连续 SRAM row burst。runtime 按目标 slice 将 segment
 分配到已配置的 C2C lane，因此指令数量按 segment 数增长，而不是按 32-byte vector

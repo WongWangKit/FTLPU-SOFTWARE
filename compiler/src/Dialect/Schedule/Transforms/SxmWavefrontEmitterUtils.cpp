@@ -97,25 +97,6 @@ void emitWavefrontBeat(mlir::IRRewriter& rewriter, mlir::Location location,
         blockDiagonalMap(diagonal, target), weightLayout);
 }
 
-void emitBufferedWavefrontBeat(mlir::IRRewriter& rewriter,
-    mlir::Location location, const target::LPUTargetModel& target,
-    int64_t cycle, int64_t hemisphere, int64_t diagonal,
-    llvm::ArrayRef<int64_t> sourceStreams,
-    llvm::ArrayRef<int64_t> transposeStreams,
-    llvm::ArrayRef<int64_t> destinationStreams,
-    llvm::StringRef weightLayout)
-{
-    requirePhysicalWidth(target, sourceStreams, transposeStreams);
-    requirePhysicalWidth(target, transposeStreams, destinationStreams);
-    emitSxm(rewriter, location, cycle, hemisphere, "transpose",
-        sourceStreams, transposeStreams, identityMap());
-    const auto map = blockDiagonalMap(diagonal, target);
-    for (int64_t tile = 0; tile < target.throughput().tile_rows; ++tile)
-        emitSxm(rewriter, location, cycle + 1 + tile, hemisphere,
-            "permute", transposeStreams, destinationStreams,
-            map, weightLayout);
-}
-
 void emitWavefrontTail(mlir::IRRewriter& rewriter, mlir::Location location,
     const target::LPUTargetModel& target, int64_t cycle,
     int64_t hemisphere, int64_t diagonal,

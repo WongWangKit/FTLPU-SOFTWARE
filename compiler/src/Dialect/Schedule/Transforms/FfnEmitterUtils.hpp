@@ -51,7 +51,7 @@ mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
     PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,
     llvm::ArrayRef<int64_t> hiddenSlices, mlir::Value output,
     int64_t inputCycle, int64_t mTile, int64_t pair, int64_t row,
-    int64_t sourceHemisphere);
+    int64_t sourceHemisphere, bool mirroredBroadcast = false);
 
 MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Location location, stream::RouteOp rawRoute,
@@ -61,12 +61,5 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     int64_t unit, int64_t weightBuffer, bool localDequant,
     int64_t bank = 0, int64_t pageIndex = -1,
     int64_t logicalBaseRow = -1);
-
-mlir::Value emitFfnSwishRow(mlir::IRRewriter& rewriter,
-    PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,
-    FfnScheduleStrategy strategy, llvm::ArrayRef<int64_t> hiddenSlices,
-    mlir::Value gateValue, mlir::Value upValue, int64_t cycle,
-    int64_t mTile, int64_t pair, int64_t row, int64_t hemisphere,
-    int64_t outputStream);
 
 } // namespace ftlpu::compiler::schedule::ffn_detail

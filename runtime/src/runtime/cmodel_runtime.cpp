@@ -219,6 +219,12 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     require_capability("mxm_weight_activation_overlap_enabled",
         requested.mxm_weight_activation_overlap_enabled,
         physical.mxm_weight_activation_overlap_enabled);
+    require_capability("vxm_cross_hemisphere_streams_enabled",
+        requested.vxm_cross_hemisphere_streams_enabled,
+        physical.vxm_cross_hemisphere_streams_enabled);
+    require_capability("vxm_fma_enabled",
+        requested.vxm_fma_enabled,
+        physical.vxm_fma_enabled);
 }
 
 std::uint16_t encode_16bit_float(float value, BindingElementType type)
@@ -352,8 +358,6 @@ void CModelRuntime::load(const BinaryProgram& program)
     hardware.vxm_alus = program.hardware.vxm_alus;
     hardware.c2c_streams_per_direction =
         program.hardware.c2c_streams_per_direction;
-    hardware.c2c_dedicated_streams =
-        program.hardware.c2c_streams_per_direction != 0;
     hardware.mxm_local_dequant_enabled =
         program.hardware.mxm_local_dequant_enabled != 0;
     hardware.mxm_weight_activation_overlap_enabled =
@@ -387,6 +391,10 @@ void CModelRuntime::load(const BinaryProgram& program)
     paged_weight_data_.clear();
     next_weight_page_use_ = 0;
     executed_cycles_ = 0;
+    physical_cycles_ = 0;
+    waiting_weight_page_use_.reset();
+    system_.icu().set_program_issue_enabled(true);
+    if (execution_trace_enabled_) execution_trace_.reset(program);
     for (const BinaryBinding& binding : bindings_) {
         if (binding.access != BindingAccess::Internal) continue;
         if (binding.initializer == BindingInitializer::None) continue;
@@ -524,22 +532,20 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
     upload_binding(binding, data);
 }
 
-void CModelRuntime::load_ready_weight_pages()
+bool CModelRuntime::load_ready_weight_pages()
 {
     while (next_weight_page_use_ < weight_page_uses_.size()
         && weight_page_uses_[next_weight_page_use_].ready_cycle
             <= executed_cycles_) {
-        const auto& use = weight_page_uses_[next_weight_page_use_++];
+        const auto& use = weight_page_uses_[next_weight_page_use_];
         const auto& binding = find_binding(
             BindingAccess::Input, use.binding_index);
         if (weight_page_residency_checker_) {
-            if (!weight_page_residency_checker_(use))
-                throw std::logic_error(
-                    "C2C weight page missed its first-consumer deadline: "
-                    "binding=" + std::to_string(use.binding_index)
-                    + " page=" + std::to_string(use.page_index)
-                    + " bank=" + std::to_string(use.bank)
-                    + " ready_cycle=" + std::to_string(use.ready_cycle));
+            if (!weight_page_residency_checker_(use)) {
+                waiting_weight_page_use_ = use;
+                return false;
+            }
+            ++next_weight_page_use_;
             continue;
         }
         const auto logical = paged_weight_data_.find(use.binding_index);
@@ -571,13 +577,39 @@ void CModelRuntime::load_ready_weight_pages()
                         image.data[offset + column]);
             }
         }
+        ++next_weight_page_use_;
     }
+    waiting_weight_page_use_.reset();
+    return true;
 }
 
 void CModelRuntime::set_weight_page_residency_checker(
     std::function<bool(const BinaryWeightPageUse&)> checker)
 {
     weight_page_residency_checker_ = std::move(checker);
+}
+
+void CModelRuntime::enable_execution_trace(bool enabled) noexcept
+{
+    execution_trace_enabled_ = enabled;
+}
+
+void CModelRuntime::record_execution_trace_interval(
+    std::int64_t startCycle, std::int64_t endCycle,
+    std::string resource, std::string detail, std::size_t issueCount)
+{
+    if (!execution_trace_enabled_) return;
+    execution_trace_.record_interval(startCycle, endCycle,
+        std::move(resource), std::move(detail), issueCount);
+}
+
+void CModelRuntime::write_execution_trace_csv(
+    const std::filesystem::path& path) const
+{
+    if (!execution_trace_enabled_)
+        throw std::logic_error(
+            "runtime execution trace was not enabled before program load");
+    execution_trace_.write_csv(path);
 }
 
 void CModelRuntime::upload_binding(
@@ -1247,40 +1279,62 @@ void CModelRuntime::load_file(const std::filesystem::path& path)
     load(read_binary_program(path));
 }
 
-void CModelRuntime::dispatch_icu_cycles(std::size_t cycles, std::ostream* log)
+void CModelRuntime::run_logical_cycles(
+    std::size_t cycles, TspSliceSystem::LogSinks sinks)
 {
     const auto count = cycles == 0 ? loaded_max_cycle_ + 1 : cycles;
-    for (std::size_t cycle = 0; cycle < count; ++cycle) {
-        load_ready_weight_pages();
-        if (log != nullptr) tick_({log, log, log, log, log});
-        else tick_({});
+    std::size_t advanced = 0;
+    std::size_t consecutiveStalls = 0;
+    constexpr std::size_t kNoProgressWatchdogCycles = 10'000'000;
+    while (advanced < count) {
+        const bool pageReady = load_ready_weight_pages();
+        system_.icu().set_program_issue_enabled(pageReady);
+        tick_(sinks);
+        if (execution_trace_enabled_)
+            execution_trace_.sample(system_, physical_cycles_, pageReady,
+                waiting_weight_page_use_
+                    ? &*waiting_weight_page_use_ : nullptr);
         datapath_performance_.sample(
             system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
-        ++executed_cycles_;
+        ++physical_cycles_;
+        if (pageReady) {
+            ++executed_cycles_;
+            ++advanced;
+            consecutiveStalls = 0;
+            continue;
+        }
+        if (++consecutiveStalls > kNoProgressWatchdogCycles)
+            throw std::runtime_error(
+                "runtime page-ready wait made no progress for "
+                + std::to_string(kNoProgressWatchdogCycles)
+                + " physical cycles");
     }
+    system_.icu().set_program_issue_enabled(true);
+}
+
+void CModelRuntime::dispatch_icu_cycles(std::size_t cycles, std::ostream* log)
+{
+    run_logical_cycles(cycles, log != nullptr
+        ? TspSliceSystem::LogSinks {log, log, log, log, log}
+        : TspSliceSystem::LogSinks {});
 }
 
 void CModelRuntime::run_cycles(std::size_t cycles, std::ostream* log)
 {
-    const auto count = cycles == 0 ? loaded_max_cycle_ + 1 : cycles;
     auto sinks = TspSliceSystem::LogSinks {};
     if (log != nullptr) {
         sinks = TspSliceSystem::LogSinks {log, log, log, log, log};
         sinks.sxm = log;
     }
-    for (std::size_t cycle = 0; cycle < count; ++cycle) {
-        try {
-            load_ready_weight_pages();
-            tick_(sinks);
-            datapath_performance_.sample(
-                system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
-            ++executed_cycles_;
-        } catch (const std::exception& ex) {
-            std::ostringstream message;
-            message << "CModel global_cycle=" << system_.cycle()
-                    << " segment_cycle=" << cycle << ": " << ex.what();
-            throw std::logic_error(message.str());
-        }
+    try {
+        run_logical_cycles(cycles, sinks);
+    } catch (const std::exception& ex) {
+        std::ostringstream message;
+        message << "CModel global_cycle=" << system_.cycle()
+                << " logical_cycle=" << executed_cycles_
+                << " physical_cycle=" << physical_cycles_
+                << ": " << ex.what();
+        throw std::logic_error(message.str());
     }
 }
 

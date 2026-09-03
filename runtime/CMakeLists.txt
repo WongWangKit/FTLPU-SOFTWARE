@@ -26,6 +26,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/model_package.cpp
     src/runtime/model_session.cpp
     src/runtime/performance.cpp
+    src/runtime/runtime_execution_trace.cpp
     src/runtime/schedule_trace.cpp
     src/runtime/session_memory_planner.cpp
     src/runtime/weight_page_builder.cpp
@@ -80,6 +81,7 @@ add_library(ftlpu_software
     src/runtime/model_package.cpp
     src/runtime/model_session.cpp
     src/runtime/performance.cpp
+    src/runtime/runtime_execution_trace.cpp
     src/runtime/schedule_trace.cpp
     src/runtime/session_memory_planner.cpp
     src/runtime/weight_page_builder.cpp
@@ -126,6 +128,13 @@ target_link_libraries(model_session_executable_c2c_weight_test
 add_test(
     NAME model_session_executable_c2c_weight_test
     COMMAND $<TARGET_FILE:model_session_executable_c2c_weight_test>)
+
+add_executable(runtime_page_ready_sync_test
+    tests/runtime/runtime_page_ready_sync_test.cpp)
+target_link_libraries(runtime_page_ready_sync_test PRIVATE ftlpu_software)
+add_test(
+    NAME runtime_page_ready_sync_test
+    COMMAND $<TARGET_FILE:runtime_page_ready_sync_test>)
 
 add_executable(ftlpu_pack_model_weights
     examples/pack_model_weights.cpp)

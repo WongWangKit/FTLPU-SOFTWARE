@@ -101,6 +101,8 @@ struct ThroughputModel {
     int64_t mxm_weight_buffers = 2;
     int64_t mxm_accumulator_blocks = hw::kMxmAccumulatorBlockCount;
     int64_t vxm_alus = hw::kVxmAluCount;
+    int64_t vxm_cross_hemisphere_streams_enabled = 0;
+    int64_t vxm_fma_enabled = 0;
     int64_t vxm_weight_to_iw_latency = 16;
     int64_t mem_to_sxm_latency = 14;
     int64_t mem_to_mxm_latency = 16;

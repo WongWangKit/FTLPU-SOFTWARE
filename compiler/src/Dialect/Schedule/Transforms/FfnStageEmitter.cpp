@@ -2,12 +2,114 @@
 
 #include "FfnEmitterUtils.hpp"
 
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/paged_weight_residency.hpp"
+
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
 #include <cassert>
 
 namespace ftlpu::compiler::schedule::ffn_detail {
+namespace {
+
+bool isPagedWeight(mlir::DictionaryAttr placement)
+{
+    const auto paged = placement.getAs<mlir::BoolAttr>("paged_weight");
+    return paged && paged.getValue();
+}
+
+llvm::SmallVector<int64_t> occupiedBanks(mlir::DictionaryAttr placement)
+{
+    const auto integerOr = [&](llvm::StringRef name, int64_t fallback) {
+        const auto value = placement.getAs<mlir::IntegerAttr>(name);
+        return value ? value.getInt() : fallback;
+    };
+    const int64_t bankCount = std::max<int64_t>(
+        1, integerOr("page_bank_count", 1));
+    const int64_t pageCount = std::max<int64_t>(
+        1, integerOr("page_count", 1));
+    const int64_t baseBank = integerOr("bank", 0);
+    llvm::SmallVector<int64_t> banks;
+    for (int64_t page = 0; page < pageCount; ++page) {
+        const int64_t bank = (baseBank + page) % bankCount;
+        if (!llvm::is_contained(banks, bank)) banks.push_back(bank);
+    }
+    return banks;
+}
+
+bool residencyOverlaps(mlir::DictionaryAttr lhs,
+    mlir::DictionaryAttr rhs)
+{
+    for (int64_t lhsBank : occupiedBanks(lhs))
+        for (int64_t rhsBank : occupiedBanks(rhs))
+            if (pagedWeightResidencyOverlaps(
+                    lhs, lhsBank, rhs, rhsBank))
+                return true;
+    return false;
+}
+
+void collectPagedWeightPlacements(mlir::Attribute attribute,
+    llvm::SmallVectorImpl<mlir::DictionaryAttr>& placements)
+{
+    if (const auto dictionary =
+            llvm::dyn_cast<mlir::DictionaryAttr>(attribute)) {
+        if (isPagedWeight(dictionary)) placements.push_back(dictionary);
+        for (mlir::NamedAttribute entry : dictionary)
+            collectPagedWeightPlacements(entry.getValue(), placements);
+        return;
+    }
+    if (const auto array = llvm::dyn_cast<mlir::ArrayAttr>(attribute)) {
+        for (mlir::Attribute element : array)
+            collectPagedWeightPlacements(element, placements);
+    }
+}
+
+void collectProducerPagedWeightPlacements(mlir::Value value,
+    llvm::SmallPtrSetImpl<mlir::Operation*>& visited,
+    llvm::SmallVectorImpl<mlir::DictionaryAttr>& placements)
+{
+    mlir::Operation* operation = value.getDefiningOp();
+    if (!operation || !visited.insert(operation).second) return;
+    for (mlir::NamedAttribute attribute : operation->getAttrs())
+        collectPagedWeightPlacements(attribute.getValue(), placements);
+    for (mlir::Value operand : operation->getOperands())
+        collectProducerPagedWeightPlacements(operand, visited, placements);
+}
+
+bool overlapsPriorPagedWeight(mlir::DictionaryAttr candidate,
+    llvm::ArrayRef<mlir::DictionaryAttr> priorPlacements)
+{
+    for (mlir::DictionaryAttr prior : priorPlacements) {
+        if (residencyOverlaps(candidate, prior)) return true;
+    }
+    return false;
+}
+
+FfnProjectionOrder chooseProjectionOrder(PrimitiveFfnSchedulePlan& ffn,
+    stream::RouteOp gateRaw, stream::RouteOp upRaw,
+    const target::LPUTargetModel& target, bool localWeightDequant)
+{
+    if (target.throughput().mxms_per_hemisphere != 1
+        || !localWeightDequant
+        || !isPagedWeight(gateRaw.getPlacement())
+        || !isPagedWeight(upRaw.getPlacement()))
+        return FfnProjectionOrder::Interleaved;
+    llvm::SmallPtrSet<mlir::Operation*, 32> visited;
+    llvm::SmallVector<mlir::DictionaryAttr, 8> priorPlacements;
+    collectProducerPagedWeightPlacements(
+        ffn.activation_route.getInput(), visited, priorPlacements);
+    const bool gateRefill = overlapsPriorPagedWeight(
+        gateRaw.getPlacement(), priorPlacements);
+    const bool upRefill = overlapsPriorPagedWeight(
+        upRaw.getPlacement(), priorPlacements);
+    if (gateRefill == upRefill)
+        return FfnProjectionOrder::Interleaved;
+    return gateRefill ? FfnProjectionOrder::UpThenGate
+                      : FfnProjectionOrder::GateThenUp;
+}
+
+} // namespace
 
 int64_t FfnEmissionContext::westLatency(int64_t slice) const
 {
@@ -145,10 +247,26 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         return mlir::failure();
     }
     const auto& throughput = target.throughput();
-    // The legacy path does not model passive stream-fabric transport
-    // lifetimes precisely enough to prove a fused route. Keep its requested
-    // fused mode on the validated tail baseline.
-    if (strategy == FfnScheduleStrategy::Fused)
+    const auto gateTempSlices = target.ffn_gate_temp_slices();
+    const auto upTempSlices = target.ffn_up_temp_slices();
+    const bool tempOverlapsHiddenSlices = llvm::any_of(hiddenSlices,
+        [&](int64_t slice) {
+            return llvm::is_contained(gateTempSlices, slice)
+                || llvm::is_contained(upTempSlices, slice);
+        });
+    const bool supportsConcurrentTempAndHiddenWrites =
+        tempBank != hiddenBank || !tempOverlapsHiddenSlices;
+    // Fused Swish relies on the current vector path's local MXM dequant and
+    // one logical Gate/Up slot per physical MXM. Its hidden writes must also
+    // be physically independent from projection temporary writes. Keep Tail
+    // as the portable fallback when either condition cannot be proven.
+    const bool supportsFusedSwish = execution->uses_local_dequant()
+        && throughput.mxms_per_hemisphere == 1
+        && memory.hemispheres == 2
+        && throughput.mxm_result_streams == 4
+        && target.streams().streams_per_direction >= 24
+        && supportsConcurrentTempAndHiddenWrites;
+    if (strategy == FfnScheduleStrategy::Fused && !supportsFusedSwish)
         strategy = FfnScheduleStrategy::Tail;
     if (weightSlices.size()
             != static_cast<std::size_t>(
@@ -182,13 +300,15 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         target::StreamEndpoint::Mem,
         target::StreamEndpoint::MxmActivation,
         target::StreamDirection::East, activationSlices.front());
+    const FfnProjectionOrder projectionOrder = chooseProjectionOrder(
+        ffn, gateRaw, upRaw, target, execution->uses_local_dequant());
     auto projectionTimeline = planFfnProjectionTimeline(
         {static_cast<int64_t>(ffn.getM()),
             static_cast<int64_t>(ffn.getK()),
             static_cast<int64_t>(ffn.getHidden()),
             static_cast<int64_t>(ffn.getN())},
         weightSlices, target, execution->uses_local_dequant(),
-        throughput.mxms_per_hemisphere != 1);
+        throughput.mxms_per_hemisphere != 1, projectionOrder);
     if (!activationLatency || mlir::failed(projectionTimeline)) {
         ffn.getOperation()->emitError(
             "cannot plan FFN activation transport or projection timeline");

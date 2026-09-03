@@ -28,6 +28,21 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
     const int64_t upAccLatency =
         throughput.mxm1_accumulator_latency;
     const bool singleMxm = throughput.mxms_per_hemisphere == 1;
+    const FfnProjectionOrder projectionOrder =
+        context.projection_timeline.projection_order;
+    const bool serializedProjections = singleMxm
+        && projectionOrder != FfnProjectionOrder::Interleaved;
+    const auto computeProjectionOffset = [&](int64_t projection) {
+        if (!singleMxm) return int64_t{0};
+        if (!serializedProjections)
+            return projection * projectionSlotInterval;
+        const bool first =
+            (projectionOrder == FfnProjectionOrder::GateThenUp)
+            == (projection == 0);
+        return first ? int64_t{0}
+                     : context.projection_timeline
+                           .second_projection_offset;
+    };
 
     FfnProjectionEmission emission;
     rewriter.setInsertionPoint(ffn.getOperation());
@@ -51,7 +66,9 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     projection == 0 ? context.gate_route : context.up_route;
                 const int64_t start = dequantStart
                     + (singleMxm
-                            ? projection * tile
+                            ? (serializedProjections
+                                  ? computeProjectionOffset(projection)
+                                  : projection * tile)
                             : (hemisphere
                                       * throughput.mxms_per_hemisphere
                                   + localMxm)
@@ -152,7 +169,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     start, base, hemisphere, localMxm,
                     hemisphere * throughput.mxms_per_hemisphere
                         + localMxm,
-                    singleMxm ? projection : weightBuffer,
+                    singleMxm && !serializedProjections
+                        ? projection : weightBuffer,
                     context.local_weight_dequant, bank, page,
                     logicalBase);
             }
@@ -246,10 +264,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             }
                             return activationValue;
                         };
-                    const int64_t gateCycle = segmentCycle;
-                    const int64_t upCycle =
-                        segmentCycle
-                        + (singleMxm ? projectionSlotInterval : 0);
+                    const int64_t gateCycle = segmentCycle
+                        + computeProjectionOffset(0);
+                    const int64_t upCycle = segmentCycle
+                        + computeProjectionOffset(1);
                     mlir::Value gateActivation = emitActivation(gateCycle);
                     mlir::Value upActivation = singleMxm
                         ? emitActivation(upCycle) : gateActivation;
@@ -263,7 +281,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             target.mxm_result_window_cycles(
                                 segment.rows),
                             segment.stream_base, resultStreamBase,
-                            singleMxm ? 0 : weightBuffer,
+                            singleMxm && !serializedProjections
+                                ? 0 : weightBuffer,
                             hemisphere
                                 * throughput.mxms_per_hemisphere,
                             segment.rows, tile, tile);
@@ -279,7 +298,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             segment.stream_base,
                             resultStreamBase
                                 + throughput.mxm_result_streams,
-                            singleMxm ? 1 : weightBuffer,
+                            singleMxm && !serializedProjections
+                                ? 1 : weightBuffer,
                             hemisphere
                                     * throughput.mxms_per_hemisphere
                                 + (singleMxm ? 0 : 1),
@@ -291,6 +311,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 // reduced and drained before the next pair starts, so all
                 // projection pairs can reuse the same token-row window.
                 const int64_t accumulatorBase = mTile * tile;
+                const int64_t gateComputeCycle = computeCycle
+                    + computeProjectionOffset(0);
+                const int64_t upComputeCycle = computeCycle
+                    + computeProjectionOffset(1);
 
                 const auto emitAccumulator =
                     [&](mlir::Value input, int64_t unitId,
@@ -335,11 +359,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     };
                 auto gateAccumulator = emitAccumulator(
                     gateCompute.getResult(), gateCompute.getUnitId(),
-                    accumulatorBase, computeCycle + gateAccLatency,
+                    accumulatorBase, gateComputeCycle + gateAccLatency,
                     resultStreamBase);
-                const int64_t upComputeCycle =
-                    computeCycle
-                    + (singleMxm ? projectionSlotInterval : 0);
                 const int64_t effectiveUpAccLatency =
                     singleMxm ? gateAccLatency : upAccLatency;
                 auto upAccumulator = emitAccumulator(
@@ -363,7 +384,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 mlir::Value gateTemp;
                 mlir::Value upTemp;
                 int64_t deferredReadyCycle = std::max(
-                    computeCycle + gateAccLatency + tile
+                    gateComputeCycle + gateAccLatency + tile
                         + context.westLatency(
                             gateTempSlices[2 * tempGroup]),
                     upComputeCycle + effectiveUpAccLatency + tile
@@ -430,7 +451,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     emitTempWrite(gateAccumulator,
                         llvm::ArrayRef<int64_t>(gateTempSlices)
                             .slice(2 * tempGroup, 2),
-                        resultStreamBase, computeCycle,
+                        resultStreamBase, gateComputeCycle,
                         gateTemp);
                     emitTempWrite(upAccumulator,
                         llvm::ArrayRef<int64_t>(upTempSlices)
@@ -444,7 +465,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     pair,
                     mTile,
                     hemisphere,
-                    computeCycle,
+                    std::max(gateComputeCycle, upComputeCycle),
                     deferredReadyCycle,
                     gateAccumulator,
                     upAccumulator,

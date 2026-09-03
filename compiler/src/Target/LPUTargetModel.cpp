@@ -357,6 +357,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_THROUGHPUT(mxm_weight_buffers);
     READ_THROUGHPUT(mxm_accumulator_blocks);
     READ_THROUGHPUT(vxm_alus);
+    READ_THROUGHPUT(vxm_cross_hemisphere_streams_enabled);
+    READ_THROUGHPUT(vxm_fma_enabled);
     READ_THROUGHPUT(vxm_weight_to_iw_latency);
     READ_THROUGHPUT(mem_to_sxm_latency);
     READ_THROUGHPUT(mem_to_mxm_latency);
@@ -503,6 +505,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_THROUGHPUT(mxm_weight_buffers);
     READ_THROUGHPUT(mxm_accumulator_blocks);
     READ_THROUGHPUT(vxm_alus);
+    READ_THROUGHPUT(vxm_cross_hemisphere_streams_enabled);
+    READ_THROUGHPUT(vxm_fma_enabled);
     READ_THROUGHPUT(vxm_weight_to_iw_latency);
     READ_THROUGHPUT(mem_to_sxm_latency);
     READ_THROUGHPUT(mem_to_mxm_latency);
@@ -637,6 +641,8 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(throughput_, mxm_weight_buffers),
         I64(throughput_, mxm_accumulator_blocks),
         I64(throughput_, vxm_alus),
+        I64(throughput_, vxm_cross_hemisphere_streams_enabled),
+        I64(throughput_, vxm_fma_enabled),
         I64(throughput_, vxm_weight_to_iw_latency),
         I64(throughput_, mem_to_sxm_latency),
         I64(throughput_, mem_to_mxm_latency),
@@ -752,6 +758,10 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             && throughput_.mxm_block_compute_enabled != 1)
         || (throughput_.mxm_weight_activation_overlap_enabled != 0
             && throughput_.mxm_weight_activation_overlap_enabled != 1)
+        || (throughput_.vxm_cross_hemisphere_streams_enabled != 0
+            && throughput_.vxm_cross_hemisphere_streams_enabled != 1)
+        || (throughput_.vxm_fma_enabled != 0
+            && throughput_.vxm_fma_enabled != 1)
         || (throughput_.icu_repeat_2d_enabled != 0
             && throughput_.icu_repeat_2d_enabled != 1))
         return fail("target feature switches must be zero or one");
@@ -763,7 +773,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         return fail("encoded_streams must cover east and west stream ranges");
     if (streams_.c2c_bytes_per_stream_per_cycle != memory_.bytes_per_word)
         return fail(
-            "a dedicated C2C lane must carry one complete SRAM row per cycle");
+            "a C2C lane must carry one complete SRAM row per cycle");
     if (streams_.system_register_columns
         < streams_.mem_boundary_register_columns)
         return fail("system register columns must cover MEM boundary columns");
@@ -845,7 +855,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
 std::uint64_t LPUTargetModel::abi_fingerprint() const
 {
     software::runtime::TargetAbiHasher hash;
-    hash.add(16);
+    hash.add(17);
 #define HASH(field) hash.add(memory_.field)
     HASH(hemispheres);
     HASH(slices_per_hemisphere);
@@ -889,6 +899,8 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
     HASH(mxms_per_hemisphere);
     HASH(mxm_weight_buffers);
     HASH(vxm_alus);
+    HASH(vxm_cross_hemisphere_streams_enabled);
+    HASH(vxm_fma_enabled);
     HASH(vxm_weight_to_iw_latency);
     HASH(mem_to_sxm_latency);
     HASH(mem_to_mxm_latency);
@@ -968,7 +980,7 @@ std::optional<int64_t> LPUTargetModel::route_stream_count(StreamEndpoint source,
             && destination == StreamEndpoint::SxmInput)
         || (source == StreamEndpoint::SxmResult
             && destination == StreamEndpoint::Mem))
-        return 2;
+        return 2 * throughput_.lanes_per_tile;
     if (source == StreamEndpoint::MxmResult
         && destination == StreamEndpoint::VxmInput)
         return throughput_.mxm_result_streams;
@@ -1058,9 +1070,11 @@ std::optional<int64_t> LPUTargetModel::route_issue_cycles(StreamEndpoint source,
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::MxmActivation)
         return divide_ceil(bytes, vector_bytes);
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::SxmInput)
-        return divide_ceil(bytes, 2 * vector_bytes);
+        return divide_ceil(bytes,
+            2 * throughput_.lanes_per_tile * vector_bytes);
     if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::Mem)
-        return divide_ceil(bytes, 2 * vector_bytes);
+        return divide_ceil(bytes,
+            2 * throughput_.lanes_per_tile * vector_bytes);
     if (source == StreamEndpoint::MxmResult && destination == StreamEndpoint::Mem)
         return divide_ceil(bytes, vector_bytes * throughput_.mxm_result_streams);
     if ((source == StreamEndpoint::VxmResult

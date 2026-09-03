@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 28;
+inline constexpr std::uint32_t kBinaryFormatVersion = 29;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -54,6 +54,7 @@ enum class BindingLayout : std::uint16_t {
     Fp16VxmGammaBroadcast = 22,
     Fp16ValueX16 = 23,
     Fp16HeadPlanar = 24,
+    Fp16HeadBlockPacked = 25,
 };
 
 enum class BindingInitializer : std::uint16_t {

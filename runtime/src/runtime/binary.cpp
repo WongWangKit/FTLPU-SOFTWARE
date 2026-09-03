@@ -31,6 +31,19 @@ enum class QueueEncodingMode : std::uint8_t {
     MemMacroDeltaRle = 3,
 };
 
+constexpr bool has_queue_encoding_mode(std::uint32_t version)
+{
+    // Version 26 on origin/main added VXM capability fields but retained the
+    // v25 compact queue layout. Local experimental v27/v28 binaries introduced
+    // queue-level encoding modes; v29 is the first merged format.
+    return version == 27 || version == 28 || version >= 29;
+}
+
+constexpr bool has_mem_macro_delta_rle(std::uint32_t version)
+{
+    return version == 28 || version >= 29;
+}
+
 constexpr std::uint32_t kNativeWordCountShift = 2;
 constexpr std::uint32_t kNativeWordCountMask = 0x1cu;
 constexpr std::uint32_t kNativeSxmFixedWordCount = 7;
@@ -1029,6 +1042,46 @@ struct BinaryHeader {
     std::uint32_t weight_page_use_count;
 };
 
+template <typename ReadValue>
+void read_hardware_config(BinaryProgram& program, std::uint32_t version,
+    ReadValue&& read_value)
+{
+    auto read = [&](std::uint32_t& value) { value = read_value(); };
+    bool upgradeTargetAbi = false;
+    if (version >= 29) {
+        program.hardware.visit(read);
+    } else if (version == 28) {
+        // Local pre-merge format: i-MEM and Macro geometry, no VXM capability
+        // fields. Preserve existing Qwen v28 artifacts.
+        program.hardware.visit_legacy_v28(read);
+        upgradeTargetAbi = true;
+    } else if (version == 27) {
+        // Local pre-merge format: i-MEM geometry only.
+        program.hardware.visit_legacy_v27(read);
+        upgradeTargetAbi = true;
+    } else if (version >= 26) {
+        // Official origin/main v26 format: VXM capability fields, old queues.
+        program.hardware.visit_v26(read);
+    } else if (version >= 24) {
+        program.hardware.visit_pre_v26(read);
+        upgradeTargetAbi = true;
+    } else if (version >= 23) {
+        program.hardware.visit_pre_v24(read);
+        upgradeTargetAbi = true;
+    } else if (version >= 20) {
+        program.hardware.visit_pre_v23(read);
+        upgradeTargetAbi = true;
+    } else if (version >= 19) {
+        program.hardware.visit_pre_v20(read);
+        upgradeTargetAbi = true;
+    } else {
+        program.hardware.visit_pre_v19(read);
+        upgradeTargetAbi = true;
+    }
+    if (upgradeTargetAbi)
+        program.target_abi = executable_target_abi(program.hardware);
+}
+
 BinaryHeader read_header(ByteReader& reader)
 {
     std::array<char, 8> magic {};
@@ -1046,38 +1099,9 @@ BinaryHeader read_header(ByteReader& reader)
         program.target_name.resize(target_name_size);
         reader.read_bytes(
             program.target_name.data(), program.target_name.size());
-        if (version >= 28) {
-            program.hardware.visit([&](std::uint32_t& value) {
-                value = reader.read<std::uint32_t>();
-            });
-        } else if (version >= 27) {
-            program.hardware.visit_pre_v28([&](std::uint32_t& value) {
-                value = reader.read<std::uint32_t>();
-            });
-        } else if (version >= 24) {
-            program.hardware.visit_pre_v27([&](std::uint32_t& value) {
-                value = reader.read<std::uint32_t>();
-            });
-        } else if (version >= 23) {
-            program.hardware.visit_pre_v24([&](std::uint32_t& value) {
-                value = reader.read<std::uint32_t>();
-            });
-            program.target_abi = executable_target_abi(program.hardware);
-        } else if (version >= 20) {
-            program.hardware.visit_pre_v23([&](std::uint32_t& value) {
-                value = reader.read<std::uint32_t>();
-            });
-            program.target_abi = executable_target_abi(program.hardware);
-        } else if (version >= 19) {
-            program.hardware.visit_pre_v20([&](std::uint32_t& value) {
-                value = reader.read<std::uint32_t>();
-            });
-            program.target_abi = executable_target_abi(program.hardware);
-        } else if (version >= 16) {
-            program.hardware.visit_pre_v19([&](std::uint32_t& value) {
-                value = reader.read<std::uint32_t>();
-            });
-            program.target_abi = executable_target_abi(program.hardware);
+        if (version >= 16) {
+            read_hardware_config(program, version,
+                [&]() { return reader.read<std::uint32_t>(); });
         } else {
             if (version >= 9)
                 program.hardware.sram_depth_rows =
@@ -1295,38 +1319,9 @@ BinaryProgram read_binary_program(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 28) {
-            program.hardware.visit([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-        } else if (version >= 27) {
-            program.hardware.visit_pre_v28([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-        } else if (version >= 24) {
-            program.hardware.visit_pre_v27([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-        } else if (version >= 23) {
-            program.hardware.visit_pre_v24([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-            program.target_abi = executable_target_abi(program.hardware);
-        } else if (version >= 20) {
-            program.hardware.visit_pre_v23([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-            program.target_abi = executable_target_abi(program.hardware);
-        } else if (version >= 19) {
-            program.hardware.visit_pre_v20([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-            program.target_abi = executable_target_abi(program.hardware);
-        } else if (version >= 16) {
-            program.hardware.visit_pre_v19([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-            program.target_abi = executable_target_abi(program.hardware);
+        if (version >= 16) {
+            read_hardware_config(program, version,
+                [&]() { return read_scalar<std::uint32_t>(is); });
         } else {
             if (version >= 9)
                 program.hardware.sram_depth_rows =
@@ -1389,17 +1384,18 @@ BinaryProgram read_binary_program(std::istream& is)
         auto queue = QueueProgram {};
         queue.kind = static_cast<QueueKind>(read_scalar<std::uint16_t>(is));
         queue.index = read_scalar<std::uint16_t>(is);
-        const auto mode = version >= 26
+        const auto mode = has_queue_encoding_mode(version)
             ? decode_queue_encoding_mode(read_scalar<std::uint8_t>(is))
             : QueueEncodingMode::CompactTagged;
         const auto command_count = read_scalar<std::uint32_t>(is);
         queue.commands.reserve(command_count);
 
         std::vector<std::uint8_t> macroWidths;
-        if (version >= 26 && mode == QueueEncodingMode::MacroSchedule)
+        if (has_queue_encoding_mode(version)
+            && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(is, command_count);
 
-        if (version >= 28
+        if (has_mem_macro_delta_rle(version)
             && mode == QueueEncodingMode::MemMacroDeltaRle) {
             program.queues.push_back(read_mem_macro_bitstream(
                 is, command_count, queue.index));
@@ -1407,7 +1403,7 @@ BinaryProgram read_binary_program(std::istream& is)
         }
 
         for (std::uint32_t command_id = 0; command_id < command_count; ++command_id) {
-            if (version >= 26) {
+            if (has_queue_encoding_mode(version)) {
                 if (mode == QueueEncodingMode::Native)
                     queue.commands.push_back(
                         read_native_queue_command(is, queue.kind));
@@ -1494,38 +1490,9 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 28) {
-            program.hardware.visit([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-        } else if (version >= 27) {
-            program.hardware.visit_pre_v28([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-        } else if (version >= 24) {
-            program.hardware.visit_pre_v27([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-        } else if (version >= 23) {
-            program.hardware.visit_pre_v24([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-            program.target_abi = executable_target_abi(program.hardware);
-        } else if (version >= 20) {
-            program.hardware.visit_pre_v23([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-            program.target_abi = executable_target_abi(program.hardware);
-        } else if (version >= 19) {
-            program.hardware.visit_pre_v20([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-            program.target_abi = executable_target_abi(program.hardware);
-        } else if (version >= 16) {
-            program.hardware.visit_pre_v19([&](std::uint32_t& value) {
-                value = read_scalar<std::uint32_t>(is);
-            });
-            program.target_abi = executable_target_abi(program.hardware);
+        if (version >= 16) {
+            read_hardware_config(program, version,
+                [&]() { return read_scalar<std::uint32_t>(is); });
         } else {
             if (version >= 9)
                 program.hardware.sram_depth_rows =
@@ -1586,21 +1553,22 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         const auto queueKind = static_cast<QueueKind>(
             read_scalar<std::uint16_t>(is));
         (void)read_scalar<std::uint16_t>(is);
-        const auto mode = version >= 26
+        const auto mode = has_queue_encoding_mode(version)
             ? decode_queue_encoding_mode(read_scalar<std::uint8_t>(is))
             : QueueEncodingMode::CompactTagged;
         const auto command_count = read_scalar<std::uint32_t>(is);
         std::vector<std::uint8_t> macroWidths;
-        if (version >= 26 && mode == QueueEncodingMode::MacroSchedule)
+        if (has_queue_encoding_mode(version)
+            && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(is, command_count);
-        if (version >= 28
+        if (has_mem_macro_delta_rle(version)
             && mode == QueueEncodingMode::MemMacroDeltaRle) {
             skip_mem_macro_bitstream(is);
             continue;
         }
         for (std::uint32_t command = 0;
              command < command_count; ++command) {
-            if (version >= 26) {
+            if (has_queue_encoding_mode(version)) {
                 if (mode == QueueEncodingMode::Native)
                     skip_native_queue_command(is, queueKind);
                 else if (mode == QueueEncodingMode::MacroSchedule)
@@ -1653,16 +1621,16 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
         queue.kind =
             static_cast<QueueKind>(reader.read<std::uint16_t>());
         queue.index = reader.read<std::uint16_t>();
-        const auto mode = header.version >= 26
+        const auto mode = has_queue_encoding_mode(header.version)
             ? decode_queue_encoding_mode(reader.read<std::uint8_t>())
             : QueueEncodingMode::CompactTagged;
         const auto command_count = reader.read<std::uint32_t>();
         queue.commands.reserve(command_count);
         std::vector<std::uint8_t> macroWidths;
-        if (header.version >= 26
+        if (has_queue_encoding_mode(header.version)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(reader, command_count);
-        if (header.version >= 28
+        if (has_mem_macro_delta_rle(header.version)
             && mode == QueueEncodingMode::MemMacroDeltaRle) {
             program.queues.push_back(read_mem_macro_bitstream(
                 reader, command_count, queue.index));
@@ -1670,7 +1638,7 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
         }
         for (std::uint32_t command_id = 0;
              command_id < command_count; ++command_id) {
-            if (header.version >= 26) {
+            if (has_queue_encoding_mode(header.version)) {
                 if (mode == QueueEncodingMode::Native)
                     queue.commands.push_back(
                         read_native_queue_command(reader, queue.kind));
@@ -1759,22 +1727,22 @@ BinaryProgram read_binary_program_metadata(
         const auto queueKind =
             static_cast<QueueKind>(reader.read<std::uint16_t>());
         (void)reader.read<std::uint16_t>();
-        const auto mode = header.version >= 26
+        const auto mode = has_queue_encoding_mode(header.version)
             ? decode_queue_encoding_mode(reader.read<std::uint8_t>())
             : QueueEncodingMode::CompactTagged;
         const auto command_count = reader.read<std::uint32_t>();
         std::vector<std::uint8_t> macroWidths;
-        if (header.version >= 26
+        if (has_queue_encoding_mode(header.version)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(reader, command_count);
-        if (header.version >= 28
+        if (has_mem_macro_delta_rle(header.version)
             && mode == QueueEncodingMode::MemMacroDeltaRle) {
             skip_mem_macro_bitstream(reader);
             continue;
         }
         for (std::uint32_t command = 0;
              command < command_count; ++command) {
-            if (header.version >= 26) {
+            if (has_queue_encoding_mode(header.version)) {
                 if (mode == QueueEncodingMode::Native)
                     skip_native_queue_command(reader, queueKind);
                 else if (mode == QueueEncodingMode::MacroSchedule)

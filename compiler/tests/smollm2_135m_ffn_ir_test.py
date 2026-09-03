@@ -186,7 +186,7 @@ def main() -> None:
         if 'destination = "stream"' not in schedule:
             raise AssertionError(
                 "Fused schedule did not emit accumulator stream+clear")
-        require(schedule, ['kind = "fp32_swiglu_temp_byte"',
+        require(schedule, ['kind = "bf16_swiglu_temp_byte"',
                            "output_stream_base = 8 : i64",
                            "output_stream_base = 16 : i64",
                            "stream_base = 8 : i64",

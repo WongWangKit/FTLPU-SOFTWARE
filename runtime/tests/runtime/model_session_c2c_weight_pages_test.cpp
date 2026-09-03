@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -89,8 +90,9 @@ void run_overlap_hazard_test()
             layer});
     }
 
-    C2cDmaSystem system(Ddr4Config {32, 2, 2, 256, 8});
-    ModelSession session(system);
+    auto system = std::make_unique<C2cDmaSystem>(
+        Ddr4Config {32, 2, 2, 256, 8});
+    ModelSession session(*system);
     session.load(std::move(package));
     session.run_invocation(0, 0);
     session.run_invocation(1, 0);
@@ -134,15 +136,16 @@ try {
             layer});
     }
 
-    C2cDmaSystem system(Ddr4Config {32, 2, 2, 256, 8});
+    auto system = std::make_unique<C2cDmaSystem>(
+        Ddr4Config {32, 2, 2, 256, 8});
     const auto require_c2c = [&](const char* stage) {
-        if (!system.chip().has_c2c(Hemisphere::East)
-            || !system.chip().has_c2c(Hemisphere::West))
+        if (!system->chip().has_c2c(Hemisphere::East)
+            || !system->chip().has_c2c(Hemisphere::West))
             throw std::runtime_error(
                 std::string("C2C endpoints detached at ") + stage);
     };
     require_c2c("system construction");
-    ModelSession session(system);
+    ModelSession session(*system);
     session.load(std::move(package));
     require_c2c("session load");
     if (session.memory_plan().invocations[0].inputs[0].transfer
@@ -170,7 +173,7 @@ try {
         const auto expected = page_bytes(
             static_cast<std::uint8_t>(0x20 + bank * 0x30));
         for (std::size_t byte = 0; byte < expected.size(); ++byte) {
-            const auto actual = system.chip().read_mem_sram_lane_byte(
+            const auto actual = system->chip().read_mem_sram_lane_byte(
                 Hemisphere::West, 16, bank,
                 byte / hw::kLanesPerTile, 10,
                 byte % hw::kLanesPerTile);
@@ -183,7 +186,7 @@ try {
     require_c2c("second invocation");
     const auto expectedLayer2 = page_bytes(0x80);
     for (std::size_t byte = 0; byte < expectedLayer2.size(); ++byte) {
-        const auto actual = system.chip().read_mem_sram_lane_byte(
+        const auto actual = system->chip().read_mem_sram_lane_byte(
             Hemisphere::West, 16, 0,
             byte / hw::kLanesPerTile, 10,
             byte % hw::kLanesPerTile);

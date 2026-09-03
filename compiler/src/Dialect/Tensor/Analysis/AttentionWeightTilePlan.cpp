@@ -73,9 +73,11 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
                                int64_t groupBegin, int64_t groupCount,
                                int64_t itemsPerGroup, int64_t itemCount,
                                int64_t rowsPerItem, int64_t columns) {
+        const int64_t residentRows =
+            std::min(itemsPerGroup, itemCount) * rowsPerItem;
         return AttentionWeightTilePlacement {kind, bank, 0, baseRow,
             std::min(memory.sram_depth_rows - baseRow,
-                itemsPerGroup * rowsPerItem),
+                residentRows),
             groupBegin, groupCount, itemsPerGroup, itemCount,
             rowsPerItem, transferCycles(columns)};
     };

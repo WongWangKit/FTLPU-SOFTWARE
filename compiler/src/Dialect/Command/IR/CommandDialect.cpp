@@ -372,7 +372,8 @@ LogicalResult VxmOp::verify()
     const auto opcode = getOpcode();
     if (opcode != "pass" && opcode != "bypass" && opcode != "cast"
         && opcode != "add" && opcode != "subtract"
-        && opcode != "multiply" && opcode != "negate"
+        && opcode != "multiply" && opcode != "fma" && opcode != "fms"
+        && opcode != "negate"
         && opcode != "max" && opcode != "exp"
         && opcode != "reciprocal" && opcode != "rsqrt")
         return emitOpError("contains an unsupported VXM opcode");
@@ -398,7 +399,24 @@ LogicalResult VxmOp::verify()
         return kind == "stream_i8" || kind == "stream_f16"
             || kind == "stream_bf16" || kind == "stream_f32";
     };
+    const auto validStreamSource = [&](StringRef kind,
+                                       llvm::StringRef attributeName) {
+        const auto source =
+            (*this)->getAttrOfType<mlir::StringAttr>(attributeName);
+        if (!source) return true;
+        return isStreamOperand(kind)
+            && (source.getValue() == "local"
+                || source.getValue() == "east"
+                || source.getValue() == "west");
+    };
+    if (!validStreamSource(getLhsKind(), "lhs_stream_source")
+        || !validStreamSource(getRhsKind(), "rhs_stream_source"))
+        return emitOpError(
+            "stream source must be local/east/west and requires a stream operand");
+    const bool fused = opcode == "fma" || opcode == "fms";
     if (chainHead) {
+        if (fused)
+            return emitOpError("fma/fms cannot be a VXM chain head");
         const bool validLhs = isStreamOperand(getLhsKind())
             || getLhsKind() == "immediate" || getLhsKind() == "feedback";
         const bool validRhs = isStreamOperand(getRhsKind())
@@ -408,6 +426,13 @@ LogicalResult VxmOp::verify()
                 "VXM chain head operands must use stream/immediate, "
                 "except lhs may use feedback");
     } else {
+        if (fused) {
+            if ((queue - 1) % chainDepth != 0
+                || !isStreamOperand(getLhsKind())
+                || !isStreamOperand(getRhsKind()))
+                return emitOpError(
+                    "fma/fms must immediately follow a VXM chain head and use two stream operands");
+        } else {
         const bool validRhs = getRhsKind() == "original"
             || getRhsKind() == "auxiliary" || getRhsKind() == "immediate"
             || (getRhsKind() == "accumulator"
@@ -417,6 +442,7 @@ LogicalResult VxmOp::verify()
         if (!validLhs || !validRhs)
             return emitOpError(
                 "VXM internal stage operands are outside the fixed local mux");
+        }
     }
     if (!std::isfinite(getLhsImmediateAttr().getValueAsDouble())
         || !std::isfinite(getRhsImmediateAttr().getValueAsDouble()))

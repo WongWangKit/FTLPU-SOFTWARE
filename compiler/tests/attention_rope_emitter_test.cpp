@@ -5,16 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 
-#include <stdexcept>
-
-namespace {
-
-void require(bool condition, const char* message)
-{
-    if (!condition) throw std::logic_error(message);
-}
-
-} // namespace
+#include <iostream>
 
 int main()
 {
@@ -49,6 +40,10 @@ int main()
             ++ropeInstructions;
         if (op.getCycle() == 20) ++castInstructions;
     });
-    require(ropeInstructions == 6, "RoPE emitter must issue six VXM instructions");
-    require(castInstructions == 2, "cast emitter must issue two VXM instructions");
+    if (ropeInstructions != 6 || castInstructions != 2) {
+        std::cerr << "unexpected VXM instruction counts: rope="
+                  << ropeInstructions << ", cast=" << castInstructions << '\n';
+        return 1;
+    }
+    return 0;
 }

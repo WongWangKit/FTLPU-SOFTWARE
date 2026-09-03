@@ -129,7 +129,9 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         {op_.getSeqLen(), op_.getHeadDim() / 2, 2},
         llvm::cast<mlir::RankedTensorType>(
             op_.getInput().getType()).getElementType());
-    createBinding(rewriter_, op_.getLoc(), {}, 2, "internal",
+    const int64_t constantBindingBase =
+        strategy_ == AttentionScheduleStrategy::Fused ? 4 : 2;
+    createBinding(rewriter_, op_.getLoc(), {}, constantBindingBase, "internal",
         "constant", ropeType,
         memoryPlan.getAs<mlir::DictionaryAttr>("rope"),
         "rope.cos_sin", "rope_table",
@@ -139,12 +141,29 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             rewriter_.getNamedAttr("head_dim",
                 rewriter_.getI64IntegerAttr(op_.getHeadDim())),
         }));
+    const auto ropeProduct =
+        memoryPlan.getAs<mlir::DictionaryAttr>("rope_product");
+    const auto bankInterleaved =
+        ropeProduct.getAs<mlir::BoolAttr>("bank_interleaved");
+    const bool hasRopeMirror = bankInterleaved && bankInterleaved.getValue();
+    if (hasRopeMirror) {
+        createBinding(rewriter_, op_.getLoc(), {}, constantBindingBase + 1,
+            "internal", "constant", ropeType,
+            memoryPlan.getAs<mlir::DictionaryAttr>("rope_mirror"),
+            "rope.cos_sin.mirror", "rope_table",
+            rewriter_.getDictionaryAttr({
+                rewriter_.getNamedAttr("theta",
+                    op_.config().getAs<mlir::FloatAttr>("rope_theta")),
+                rewriter_.getNamedAttr("head_dim",
+                    rewriter_.getI64IntegerAttr(op_.getHeadDim())),
+            }));
+    }
     const auto probabilityType = mlir::RankedTensorType::get(
         {op_.getQueryHeads(), op_.getSeqLen(), op_.getSeqLen()},
         llvm::cast<mlir::RankedTensorType>(
             op_.getInput().getType()).getElementType());
     const int64_t workspaceBindingBase =
-        (strategy_ == AttentionScheduleStrategy::Fused ? 4 : 2) + 1;
+        constantBindingBase + 1 + (hasRopeMirror ? 1 : 0);
     auto probabilityPackBinding = createBinding(
         rewriter_, op_.getLoc(), {}, workspaceBindingBase,
         "internal", "workspace", probabilityType,
@@ -214,7 +233,8 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     const int64_t pvEnd = emitPv(probabilityTransposeEnd);
     contextBinding->setAttr("ready_cycle",
         rewriter_.getI64IntegerAttr(pvEnd));
-    const int64_t outputProjectionEnd = emitOutputProjection(pvEnd);
+    const int64_t outputProjectionEnd =
+        emitOutputProjection(pvEnd, projectionEnd);
 
     createTimeline(rewriter_, op_.getLoc(), "qkv", 0, qkvCycles);
     createTimeline(rewriter_, op_.getLoc(), "rope", qkvCycles, qkStart);

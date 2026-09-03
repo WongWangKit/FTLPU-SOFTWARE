@@ -9,7 +9,8 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
     int64_t lastSwishCycle, llvm::ArrayRef<int64_t> weightSlices,
     llvm::ArrayRef<int64_t> hiddenSlices,
     llvm::ArrayRef<int64_t> resultSlices,
-    const target::LPUTargetModel& target)
+    const target::LPUTargetModel& target,
+    int64_t reductionsPerWeightPage)
 {
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
@@ -21,25 +22,36 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
     const auto westLatency = [&](int64_t slice) {
         return slice / target.streams().mem_slices_per_register_group + 2;
     };
+    const auto weightLatency = [&](int64_t slice) {
+        return target.transport_latency(target::StreamEndpoint::Mem,
+                   target::StreamEndpoint::MxmWeight,
+                   target::StreamDirection::East, slice)
+            .value_or(slice
+                    / target.streams().mem_slices_per_register_group
+                + 2);
+    };
+    int64_t maxWeightLatency = 0;
+    for (int64_t slice : weightSlices)
+        maxWeightLatency = std::max(maxWeightLatency, weightLatency(slice));
+    int64_t maxResultLatency = 0;
+    for (int64_t slice : resultSlices) {
+        const auto latency = target.transport_latency(
+            target::StreamEndpoint::MxmResult,
+            target::StreamEndpoint::Mem,
+            target::StreamDirection::West, slice);
+        if (!latency) return mlir::failure();
+        maxResultLatency = std::max(maxResultLatency, *latency);
+    }
     FfnDownProjectionTimeline result;
     result.phase_start = lastSwishCycle + 1
         + throughput.swiglu_write_latency
         + westLatency(hiddenSlices.back()) + 1
         + throughput.accumulator_to_vxm_latency;
-    result.pair_transition_interval =
-        2 * tile + throughput.accumulator_to_vxm_latency;
     result.reduction_interval = projection.weight_block_interval;
-    if (throughput.mxms_per_hemisphere == 1) {
-        // Down0 and Down1 permanently occupy the two physical weight
-        // buffers. The next reduction may start loading Down1 only after the
-        // current Down1 has consumed all activation rows and the last row has
-        // crossed the MXM column pipeline.
-        result.reduction_interval = std::max(
-            result.reduction_interval,
-            projection.projection_slot_interval + 2 * tile
-                - projection.weight_load_cycles
-                + target.mxm_first_result_latency());
-    }
+    // Down0/Down1 alternate the two physical weight buffers. While one
+    // buffer computes, the other accepts the following reduction's weight,
+    // so a reduction occupies exactly the logical projection issue slots.
+    result.pair_transition_interval = result.reduction_interval;
     for (int64_t resultSlice : resultSlices) {
         if (std::find(weightSlices.begin(), weightSlices.end(), resultSlice)
             == weightSlices.end())
@@ -79,6 +91,12 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
         return mlir::failure();
     int64_t computeCycle =
         result.phase_start + projection.initial_compute_cycle;
+    const int64_t pagesPerWave = reductionsPerWeightPage > 0
+        ? (result.reduction_block_count + reductionsPerWeightPage - 1)
+            / reductionsPerWeightPage
+        : 0;
+    int64_t previousPage = -1;
+    int64_t previousPageDrainEnd = 0;
 
     for (int64_t wave = 0; wave < result.wave_count; ++wave) {
         const int64_t activeHemispheres = std::min<int64_t>(
@@ -88,6 +106,21 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
                 / columnsPerHemisphere);
         for (int64_t reduction = 0;
              reduction < result.reduction_block_count; ++reduction) {
+            const int64_t page = pagesPerWave > 0
+                ? wave * pagesPerWave
+                    + reduction / reductionsPerWeightPage
+                : -1;
+            if (page >= 0 && previousPage >= 0 && page != previousPage) {
+                // A runtime page miss may hold every compute-side ICU queue
+                // while C2C/MEM ingress continues. Move the next page's first
+                // weight read beyond the preceding page's final in-flight
+                // result so that this coarse wait point is pipeline-safe.
+                computeCycle = std::max(computeCycle,
+                    previousPageDrainEnd + maxWeightLatency + tile);
+                previousPageDrainEnd = 0;
+            }
+            previousPage = page;
+
             FfnDownBlockSchedule block;
             block.index = static_cast<int64_t>(result.blocks.size());
             block.output_wave = wave;
@@ -95,6 +128,15 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
             block.active_hemispheres = activeHemispheres;
             block.weight_compute_cycle = computeCycle;
             block.dequant_start = computeCycle - tile;
+            if (throughput.mxms_per_hemisphere == 1
+                && target.supports_mxm_local_dequant()
+                && !result.blocks.empty()) {
+                const int64_t previousLastCompute =
+                    result.blocks.back().tiles.back().compute_cycle;
+                block.dequant_start = std::max(block.dequant_start,
+                    previousLastCompute
+                        + target.mxm_result_window_cycles(tile));
+            }
             block.weight_buffer = block.index % 2;
             block.final_reduction =
                 reduction + 1 == result.reduction_block_count;
@@ -143,6 +185,24 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
                 block.tiles.push_back(std::move(tileSchedule));
             }
             result.blocks.push_back(std::move(block));
+
+            const auto& emittedBlock = result.blocks.back();
+            const int64_t lastTileCompute =
+                emittedBlock.tiles.back().compute_cycle;
+            const int64_t lastLogicalCompute = lastTileCompute
+                + (throughput.mxms_per_hemisphere == 1
+                        ? projection.projection_slot_interval : 0);
+            int64_t blockDrainEnd = lastLogicalCompute
+                + target.mxm_result_window_cycles(tile);
+            if (emittedBlock.final_reduction) {
+                blockDrainEnd = std::max(blockDrainEnd,
+                    lastLogicalCompute
+                        + target.mxm_first_result_latency()
+                        + maxResultLatency + tile);
+            }
+            blockDrainEnd += target.streams().system_register_columns;
+            previousPageDrainEnd = std::max(
+                previousPageDrainEnd, blockDrainEnd);
 
             if (result.blocks.back().final_reduction) {
                 if (wave + 1 < result.wave_count)

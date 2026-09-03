@@ -265,6 +265,18 @@ struct EventPattern {
     std::int64_t base_delta{0};
 };
 
+std::size_t event_duration(
+    const QueueProgram& queue, const QueueCommand& command)
+{
+    if (queue.kind != QueueKind::Vxm) return 1;
+    const auto decoded = isa::decode_vxm_instruction(queue.index,
+        isa::EncodedVxmInstruction {
+            static_cast<std::uint64_t>(command.words[0])
+                | (static_cast<std::uint64_t>(command.words[1]) << 32),
+            command.words[2]});
+    return decoded.instruction.repeat_count;
+}
+
 IcuInductionTarget resolve_induction_target(const QueueProgram& queue,
     const QueueCommand& command, IcuInductionTarget requested,
     const EventPattern& pattern)
@@ -322,7 +334,9 @@ void write_pattern(std::ostream& output, const QueueProgram& queue,
         queue, command, pattern.induction_target, pattern);
     const auto event = describe(queue, command, 0, mxms_per_hemisphere,
         sram_depth_rows, pattern.induction_target);
-    write_event(output, start, start + 1, event, pattern);
+    write_event(output, start,
+        start + static_cast<std::int64_t>(event_duration(queue, command)),
+        event, pattern);
 }
 
 const BinaryBinding& find_paged_weight(
@@ -340,7 +354,8 @@ const BinaryBinding& find_paged_weight(
 }
 
 void write_weight_prefetches(
-    std::ostream& output, const BinaryProgram& program)
+    std::ostream& output, const BinaryProgram& program,
+    std::span<const WeightPrefetchPlan> physicalPrefetches)
 {
     if (program.weight_page_uses.empty()) return;
     const std::uint64_t lanes =
@@ -352,7 +367,19 @@ void write_weight_prefetches(
             "paged weight trace requires non-zero C2C bandwidth");
 
     const std::uint64_t bandwidth = lanes * bytesPerLane;
-    for (const auto& prefetch : plan_weight_prefetches(program)) {
+    std::vector<WeightPrefetchPlan> computedPrefetches;
+    if (physicalPrefetches.empty())
+        computedPrefetches = plan_weight_prefetches(program);
+    const std::span<const WeightPrefetchPlan> prefetches =
+        physicalPrefetches.empty()
+        ? std::span<const WeightPrefetchPlan>(computedPrefetches)
+        : physicalPrefetches;
+    std::int64_t preExecutionCursor = 0;
+    for (const auto& prefetch : prefetches)
+        if (prefetch.pre_execution)
+            preExecutionCursor -= static_cast<std::int64_t>(
+                prefetch.transfer_end_cycle - prefetch.start_cycle);
+    for (const auto& prefetch : prefetches) {
         std::vector<std::string> bindings;
         for (const std::size_t useIndex : prefetch.use_indices) {
             const auto& use = program.weight_page_uses[useIndex];
@@ -373,28 +400,57 @@ void write_weight_prefetches(
             detail << " bytes=" << prefetch.bytes[side]
                    << " lanes=" << lanes
                    << " bandwidth=" << bandwidth
-                   << "B/cycle deadline=" << prefetch.ready_cycle
+                   << "B/cycle consumer_cycle=" << prefetch.ready_cycle
+                   << " phase="
+                   << (prefetch.pre_execution ? "pre_execution" : "overlap")
                    << " scheduled=true";
+            const auto duration = static_cast<std::int64_t>(
+                prefetch.transfer_end_cycle - prefetch.start_cycle);
+            const auto start = prefetch.pre_execution
+                ? preExecutionCursor
+                : static_cast<std::int64_t>(prefetch.start_cycle);
+            const auto end = prefetch.pre_execution
+                ? preExecutionCursor + duration
+                : static_cast<std::int64_t>(
+                    prefetch.transfer_end_cycle);
             write_event(output,
-                static_cast<std::int64_t>(prefetch.start_cycle),
-                static_cast<std::int64_t>(prefetch.transfer_end_cycle),
+                start, end,
                 {std::string("C2C.") + (side == 0 ? "E" : "W")
                         + ".Prefetch",
                     detail.str()});
+            const auto sideName = side == 0 ? "E" : "W";
+            std::ostringstream pathDetail;
+            pathDetail << "page=" << prefetch.page_index
+                       << " bank=" << prefetch.bank
+                       << " streams=W" << (hw::kWestStreams - lanes)
+                       << "..W" << (hw::kWestStreams - 1)
+                       << " sync=target_mem+stream_tag"
+                       << " timing=per_vector_notification";
+            write_event(output, start, end,
+                {std::string("SR.") + sideName + ".C2C.Shared",
+                    pathDetail.str()});
+            write_event(output, start, end,
+                {std::string("MEM.") + sideName + ".C2CWrite",
+                    pathDetail.str()});
         }
+        if (prefetch.pre_execution)
+            preExecutionCursor += static_cast<std::int64_t>(
+                prefetch.transfer_end_cycle - prefetch.start_cycle);
     }
 }
 
 } // namespace
 
-void write_schedule_trace_csv(const BinaryProgram& program, const std::filesystem::path& path)
+void write_schedule_trace_csv(const BinaryProgram& program,
+    const std::filesystem::path& path,
+    std::span<const WeightPrefetchPlan> physicalPrefetches)
 {
     std::ofstream output(path, std::ios::trunc);
     if (!output) throw std::runtime_error("cannot open runtime schedule trace: " + path.string());
     output << "start,end,resource,detail,pattern,inner_count,inner_interval,"
               "inner_stride,outer_count,outer_interval,outer_stride,skip_first,"
               "induction,base_delta\n";
-    write_weight_prefetches(output, program);
+    write_weight_prefetches(output, program, physicalPrefetches);
 
     for (const auto& queue : program.queues) {
         std::size_t cursor = 0;
@@ -484,7 +540,10 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
             const auto event = describe(
                 queue, command, 0, program.hardware.mxms_per_hemisphere,
                 program.hardware.sram_depth_rows);
-            write_event(output, cursor, cursor + 1, event);
+            write_event(output, cursor,
+                cursor + static_cast<std::int64_t>(
+                    event_duration(queue, command)),
+                event);
             previous = &command;
             previous_cycle = cursor;
             history.emplace_back(&command, cursor);
@@ -492,6 +551,12 @@ void write_schedule_trace_csv(const BinaryProgram& program, const std::filesyste
             ++cursor;
         }
     }
+}
+
+void write_schedule_trace_csv(
+    const BinaryProgram& program, const std::filesystem::path& path)
+{
+    write_schedule_trace_csv(program, path, {});
 }
 
 } // namespace ftlpu::software::runtime

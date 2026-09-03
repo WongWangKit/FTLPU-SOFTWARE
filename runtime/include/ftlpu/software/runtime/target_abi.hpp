@@ -52,6 +52,8 @@ struct ExecutableHardwareConfig {
     std::uint32_t mxms_per_hemisphere{hw::kMxmsPerHemisphere};
     std::uint32_t mxm_weight_buffers{2};
     std::uint32_t vxm_alus{hw::kVxmAluCount};
+    std::uint32_t vxm_cross_hemisphere_streams_enabled{1};
+    std::uint32_t vxm_fma_enabled{1};
     std::uint32_t vxm_weight_to_iw_latency{16};
     std::uint32_t mem_to_sxm_latency{14};
     std::uint32_t mem_to_mxm_latency{16};
@@ -109,49 +111,56 @@ struct ExecutableHardwareConfig {
     constexpr void visit_pre_v20(Visitor&& visitor)
     {
         visit_impl(*this, std::forward<Visitor>(visitor), true, false, false,
-                   false);
+                   false, false, false, false);
     }
 
     template <typename Visitor>
     constexpr void visit_pre_v23(Visitor&& visitor)
     {
         visit_impl(*this, std::forward<Visitor>(visitor), true, true, false,
-                   false);
+                   false, false, false, false);
     }
 
     template <typename Visitor>
     constexpr void visit_pre_v24(Visitor&& visitor)
     {
         visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
-                   false);
+                   false, false, false, false);
     }
 
     template <typename Visitor>
-    constexpr void visit_pre_v27(Visitor&& visitor)
+    constexpr void visit_pre_v26(Visitor&& visitor)
     {
         visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
-                   true, false);
+                   true, false, false, false);
     }
 
     template <typename Visitor>
-    constexpr void visit_pre_v27(Visitor&& visitor) const
+    constexpr void visit_v26(Visitor&& visitor)
     {
         visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
-                   true, false);
+                   true, true, false, false);
     }
 
     template <typename Visitor>
-    constexpr void visit_pre_v28(Visitor&& visitor)
+    constexpr void visit_legacy_v27(Visitor&& visitor)
     {
         visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
-                   true, true, false);
+                   true, false, true, false);
     }
 
     template <typename Visitor>
-    constexpr void visit_pre_v28(Visitor&& visitor) const
+    constexpr void visit_legacy_v28(Visitor&& visitor)
     {
         visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
-                   true, true, false);
+                   true, false, true, true);
+    }
+
+    template <typename Visitor>
+    constexpr void visit_command_abi(Visitor&& visitor) const
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
+                   true, true, false, false);
     }
 
 private:
@@ -159,14 +168,14 @@ private:
     static constexpr void visit_pre_v19_impl(Self& self, Visitor&& visitor)
     {
         visit_impl(self, std::forward<Visitor>(visitor), false, false, false,
-                   false, false, false);
+                   false, false, false, false);
     }
 
     template <typename Self, typename Visitor>
     static constexpr void visit_impl(Self& self, Visitor&& visitor)
     {
         visit_impl(self, std::forward<Visitor>(visitor), true, true, true,
-                   true, true, true);
+                   true, true, true, true);
     }
 
     template <typename Self, typename Visitor>
@@ -175,8 +184,9 @@ private:
                                      bool include_c2c_fabric,
                                      bool include_external_memory,
                                      bool include_ddr_scheduling_efficiency,
-                                     bool include_imem_geometry = false,
-                                     bool include_macro_geometry = false)
+                                     bool include_vxm_stream_fma,
+                                     bool include_imem_geometry,
+                                     bool include_macro_geometry)
     {
         visitor(self.hemispheres); visitor(self.slices_per_hemisphere);
         visitor(self.banks_per_slice); visitor(self.words_per_bank);
@@ -207,6 +217,10 @@ private:
         visitor(self.qk_iw_to_compute_latency);
         visitor(self.mxms_per_hemisphere);
         visitor(self.mxm_weight_buffers); visitor(self.vxm_alus);
+        if (include_vxm_stream_fma) {
+            visitor(self.vxm_cross_hemisphere_streams_enabled);
+            visitor(self.vxm_fma_enabled);
+        }
         visitor(self.vxm_weight_to_iw_latency);
         visitor(self.mem_to_sxm_latency); visitor(self.mem_to_mxm_latency);
         visitor(self.mxm0_accumulator_latency);
@@ -274,11 +288,11 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     config.mxms_per_hemisphere =
         static_cast<std::uint32_t>(mxms_per_hemisphere);
     TargetAbiHasher hash;
-    hash.add(16); // Hardware ABI schema version (DDR scheduling margin).
+    hash.add(17); // Hardware ABI schema version (VXM stream/FMA capability).
     // i-MEM capacity is a deployment constraint rather than a command-bit ABI
     // change. Keep legacy Schedule attributes valid and validate geometry
     // explicitly when loading an executable into a CModel.
-    config.visit_pre_v27([&](std::uint32_t value) { hash.add(value); });
+    config.visit_command_abi([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }
 
@@ -286,8 +300,8 @@ constexpr std::uint64_t executable_target_abi(
     const ExecutableHardwareConfig& config)
 {
     TargetAbiHasher hash;
-    hash.add(16); // Hardware ABI schema version (DDR scheduling margin).
-    config.visit_pre_v27([&](std::uint32_t value) { hash.add(value); });
+    hash.add(17); // Hardware ABI schema version (VXM stream/FMA capability).
+    config.visit_command_abi([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }
 

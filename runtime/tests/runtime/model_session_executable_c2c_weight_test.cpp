@@ -46,6 +46,53 @@ BinaryBinding make_weight_binding()
 
 int main()
 try {
+    BinaryProgram preloadProgram;
+    auto firstPreload = make_weight_binding();
+    firstPreload.bank = 1;
+    auto alternateBankPreload = make_weight_binding();
+    alternateBankPreload.index = 1;
+    alternateBankPreload.bank = 0;
+    alternateBankPreload.slices = {28, 29, 30, 31, 32, 33, 34, 35};
+    alternateBankPreload.page_storage_slices =
+        alternateBankPreload.slices;
+    preloadProgram.bindings = {firstPreload, alternateBankPreload};
+    preloadProgram.weight_page_uses = {
+        {0, 0, 1, 200, 220},
+        {1, 0, 0, 400, 420},
+    };
+    const auto preloadPlans = plan_weight_prefetches(preloadProgram);
+    if (preloadPlans.size() != 2 || !preloadPlans[0].pre_execution
+        || !preloadPlans[1].pre_execution)
+        throw std::runtime_error(
+            "disjoint alternate-bank weight page was not preloaded");
+    auto lowBandwidthHardware = preloadProgram.hardware;
+    lowBandwidthHardware.ddr_peak_bandwidth_mbytes_per_second = 12800;
+    const auto lowBandwidthPlans =
+        plan_weight_prefetches(preloadProgram, lowBandwidthHardware);
+    if (lowBandwidthPlans.size() != preloadPlans.size()
+        || lowBandwidthPlans[0].transfer_end_cycle
+            <= preloadPlans[0].transfer_end_cycle)
+        throw std::runtime_error(
+            "runtime DDR bandwidth did not retime weight prefetches");
+
+    BinaryProgram overlappingProgram;
+    auto resident = make_weight_binding();
+    auto replacement = make_weight_binding();
+    replacement.index = 1;
+    overlappingProgram.bindings = {resident, replacement};
+    overlappingProgram.weight_page_uses = {
+        {0, 0, 0, 100, 320},
+        {1, 0, 0, 1000, 1100},
+    };
+    const auto overlappingPlans =
+        plan_weight_prefetches(overlappingProgram);
+    if (overlappingPlans.size() != 2
+        || !overlappingPlans[0].pre_execution
+        || overlappingPlans[1].pre_execution
+        || overlappingPlans[1].start_cycle != 320)
+        throw std::runtime_error(
+            "overlapping weight replacement did not launch at release");
+
     BinaryProgram program;
     program.bindings.push_back(make_weight_binding());
     program.weight_page_uses.push_back({0, 0, 0, 200, 220});
@@ -68,18 +115,19 @@ try {
 
     C2cDmaSystem system;
     ModelSession session(system);
+    session.set_ddr_peak_bandwidth_mbytes_per_second(12800);
     session.load(std::move(package));
+    if (system.ddr4().config().peak_bandwidth_bytes_per_second
+        != 12'800'000'000ULL)
+        throw std::runtime_error(
+            "ModelSession did not apply the runtime DDR bandwidth");
     session.run_invocation(0, 0);
 
-    if (!system.chip().hardware_configuration().c2c_dedicated_streams)
-        throw std::runtime_error(
-            "executable did not select the dedicated C2C stream fabric");
     if (session.stats().weight_page_prefetches != 1
-        || session.stats().weight_page_prefetch_bytes != expected.data.size())
+        || session.stats().weight_page_prefetch_bytes != expected.data.size()
+        || session.stats().weight_page_initial_wait_cycles == 0)
         throw std::runtime_error(
             "executable-local page did not run through the C2C pager");
-    if (system.dma(Hemisphere::East).completions().empty())
-        throw std::runtime_error("C2C DMA did not complete a DDR load");
 
     for (const PackedWeightSegment& segment : expected.segments) {
         for (std::uint32_t row = 0; row < segment.vector_count; ++row) {

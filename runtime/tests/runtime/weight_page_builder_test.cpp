@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -65,9 +66,9 @@ try {
     require(packed.segments.size() == 16,
         "attention packing should produce eight slices per hemisphere");
 
-    ftlpu::TspSliceSystem host_system;
-    ftlpu::TspSliceSystem packed_system;
-    CModelRuntime host_runtime(host_system);
+    auto host_system = std::make_unique<ftlpu::TspSliceSystem>();
+    auto packed_system = std::make_unique<ftlpu::TspSliceSystem>();
+    CModelRuntime host_runtime(*host_system);
     host_runtime.load(make_program(1));
     host_runtime.upload_binding(binding, data);
     for (const PackedWeightSegment& segment : packed.segments)
@@ -76,22 +77,22 @@ try {
             for (std::uint32_t byte = 0; byte < 32; ++byte) {
                 const std::size_t offset = static_cast<std::size_t>(
                     segment.byte_offset) + vector * 32 + byte;
-                packed_system.initialize_mem_sram_lane_byte(
+                packed_system->initialize_mem_sram_lane_byte(
                     static_cast<ftlpu::Hemisphere>(segment.hemisphere),
                     segment.slice, 1, byte / 8,
                     segment.base_row + vector, byte % 8,
                     packed.data[offset]);
-                const auto expected = host_system.read_mem_sram_lane_byte(
+                const auto expected = host_system->read_mem_sram_lane_byte(
                     static_cast<ftlpu::Hemisphere>(segment.hemisphere),
                     segment.slice, 1, byte / 8,
                     segment.base_row + vector, byte % 8);
-                const auto actual = packed_system.read_mem_sram_lane_byte(
+                const auto actual = packed_system->read_mem_sram_lane_byte(
                     static_cast<ftlpu::Hemisphere>(segment.hemisphere),
                     segment.slice, 1, byte / 8,
                     segment.base_row + vector, byte % 8);
                 require(actual == expected,
                     "offline page image differs from CModel host upload");
-                require(host_system.read_mem_sram_lane_byte(
+                require(host_system->read_mem_sram_lane_byte(
                             static_cast<ftlpu::Hemisphere>(segment.hemisphere),
                             segment.slice, 0, byte / 8,
                             segment.base_row + vector, byte % 8)

@@ -56,6 +56,7 @@ std::vector<std::uint8_t> make_input()
 int main()
 try {
     BinaryProgram program;
+    program.hardware.ddr_peak_bandwidth_mbytes_per_second = 51200;
     program.bindings = {
         make_binding(BindingAccess::Input),
         make_binding(BindingAccess::Output),
@@ -74,7 +75,12 @@ try {
 
     C2cDmaSystem system;
     ModelSession session(system);
+    session.set_ddr_peak_bandwidth_mbytes_per_second(25600);
     session.load(std::move(package));
+    if (system.ddr4().config().peak_bandwidth_bytes_per_second
+        != 25'600'000'000ULL)
+        throw std::runtime_error(
+            "ModelSession did not apply the runtime DDR bandwidth");
     const auto input = make_input();
     session.set_input("input", input);
     session.run();
