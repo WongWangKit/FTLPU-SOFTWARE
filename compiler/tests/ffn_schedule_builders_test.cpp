@@ -124,6 +124,20 @@ int main() try
             - residencyFirstProjection->blocks[0].weight_compute_cycle
             == residencyFirstProjection->projection_slot_interval,
         "residency-first FFN left a bubble between projection blocks");
+    for (std::size_t index = 1;
+         index < residencyFirstProjection->blocks.size(); ++index)
+        require(residencyFirstProjection->blocks[index].weight_compute_cycle
+                - residencyFirstProjection->blocks[index - 1]
+                      .weight_compute_cycle
+                == residencyFirstProjection->projection_block_interval,
+            "residency-first FFN left an output-block boundary bubble");
+    const auto& finalFirstProjectionBlock =
+        residencyFirstProjection->blocks.back();
+    require(residencyFirstProjection->initial_compute_cycle
+                + residencyFirstProjection->second_projection_offset
+            == finalFirstProjectionBlock.tiles.back().compute_cycle
+                + residencyFirstProjection->projection_slot_interval,
+        "residency-first FFN left a bubble between projection phases");
     require(residencyFirstProjection->blocks[0].weight_buffer == 0
             && residencyFirstProjection->blocks[1].weight_buffer == 1,
         "residency-first FFN did not make both weight buffers available");

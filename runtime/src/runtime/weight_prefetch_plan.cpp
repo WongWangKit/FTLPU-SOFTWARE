@@ -238,8 +238,6 @@ void schedule_weight_prefetches(const BinaryProgram& program,
 
     std::vector<std::uint64_t> durations(plans.size());
     std::vector<std::uint64_t> reusableCycles(plans.size());
-    const auto dmaLeadCycles = static_cast<std::uint64_t>(
-        runtimeHardware.ddr_read_latency_cycles) + 1;
     for (std::size_t index = 0; index < plans.size(); ++index) {
         auto& plan = plans[index];
         const auto sideBytes = std::max(plan.bytes[0], plan.bytes[1]);
@@ -291,12 +289,13 @@ void schedule_weight_prefetches(const BinaryProgram& program,
     for (std::size_t index = 0; index < plans.size(); ++index) {
         auto& plan = plans[index];
         if (plan.pre_execution) continue;
-        const auto latestStart = durations[index] <= plan.ready_cycle
-            ? plan.ready_cycle - durations[index] : 0;
-        const auto preferredStart = latestStart > dmaLeadCycles
-            ? latestStart - dmaLeadCycles : 0;
+        // Once every overlapping SRAM region has been released, retaining
+        // the transfer until just before its consumer only reduces the time
+        // available to absorb DDR latency and jitter. Launch at the earliest
+        // physically safe cycle; page-ready synchronization still protects
+        // the consumer when runtime bandwidth is lower than planned.
         plan.start_cycle = std::max(
-            {preferredStart, reusableCycles[index], nextQueueCursor});
+            reusableCycles[index], nextQueueCursor);
         plan.transfer_end_cycle = plan.start_cycle + durations[index];
         std::array<std::uint64_t, hw::kHemispheres> segmentCounts{};
         for (const auto& region : plan.regions)

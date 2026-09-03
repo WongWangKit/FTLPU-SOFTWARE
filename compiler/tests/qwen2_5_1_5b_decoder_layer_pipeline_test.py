@@ -45,6 +45,8 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument("--weight-bank", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--ffn-schedule", choices=("tail", "fused"),
+                        default="fused")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -58,7 +60,7 @@ def main() -> None:
     shutil.copyfile(args.input, stablehlo)
 
     common = [
-        "--mxm-execution", "vector", "--ffn-schedule", "tail",
+        "--mxm-execution", "vector", "--ffn-schedule", args.ffn_schedule,
         "--target-config", str(args.target_config),
         "--weight-bank", str(args.weight_bank),
         "--rmsnorm-strategy", "vxm-feedback",
@@ -84,6 +86,10 @@ def main() -> None:
     o_proj_interval: tuple[int, int] | None = None
     rmsnorm_restore_ends: list[int] = []
     ffn_weight_first_cycles: dict[int, int | None] = {7: None, 8: None}
+    fused_swish_outputs: set[str] = set()
+    fused_swish_writes: dict[str, set[tuple[str, int]]] = {}
+    fused_hidden_locations: list[tuple[int, int, frozenset[int]]] = []
+    ffn_input_allocation: tuple[str, int, int, int, frozenset[int]] | None = None
     direct_rope_intervals: list[tuple[int, int]] = []
     direct_rope_fma = False
     direct_rope_fms = False
@@ -139,6 +145,36 @@ def main() -> None:
                         "Schedule retained the legacy MEM-staged RoPE product path: "
                         f"{line.strip()}"
                     )
+                if all(marker in line for marker in (
+                    'queue = 7 : i64', 'opcode = "bypass"',
+                    'cast_target = "bf16"', 'output_stream = 6 : i64',
+                    'repeat_count = 32 : i64',
+                )):
+                    result = re.match(r"\s*(%\d+)\s*=", line)
+                    if result:
+                        fused_swish_outputs.add(result.group(1))
+            if "ftlpu.schedule.mem_write" in line:
+                source = re.search(r"ftlpu\.schedule\.mem_write\s+(%\d+)", line)
+                if source and source.group(1) in fused_swish_outputs:
+                    hemisphere = re.search(
+                        r'placement = \{.*?hemisphere = "(east|west)"', line
+                    )
+                    if hemisphere:
+                        fused_swish_writes.setdefault(source.group(1), set()).add(
+                            (hemisphere.group(1), integer_attr(line, "stream_base"))
+                        )
+                    placement = re.search(r"placement = \{([^}]+)\}", line)
+                    if placement:
+                        fields = placement.group(1)
+                        bank = re.search(r"bank = (\d+) : i64", fields)
+                        base = re.search(r"base_row = (\d+) : i64", fields)
+                        slices = re.search(r"slices = \[([^]]+)\]", fields)
+                        if bank and base and slices:
+                            fused_hidden_locations.append((
+                                int(bank.group(1)), int(base.group(1)),
+                                frozenset(int(value) for value in
+                                          re.findall(r"\d+", slices.group(1))),
+                            ))
             if "ftlpu.schedule.binding" in line:
                 slices_match = re.search(r"slices = \[([^\]]+)\]", line)
                 if slices_match:
@@ -151,6 +187,8 @@ def main() -> None:
                         frozenset(int(value) for value in
                                   re.findall(r"\d+", slices_match.group(1))),
                     )
+                    if allocation[0] == "rmsnorm.result.1":
+                        ffn_input_allocation = allocation
                     if ('access = "input"' in line
                             and "paged_weight = true" not in line):
                         host_preloaded_allocations.append(allocation)
@@ -244,6 +282,35 @@ def main() -> None:
     up_first = ffn_weight_first_cycles[8]
     if gate_first is None or up_first is None:
         raise AssertionError("Schedule IR is missing Gate/Up paged weight reads")
+    mirrored_swish_outputs = [
+        output for output in fused_swish_outputs
+        if {("west", 6), ("east", 14)}.issubset(
+            fused_swish_writes.get(output, set())
+        )
+    ]
+    if args.ffn_schedule == "fused" and not mirrored_swish_outputs:
+        raise AssertionError(
+            "Fused Swish does not consume both fixed VXM chain outputs "
+            "through W6/W7 and E14/E15 hidden writes"
+        )
+    if args.ffn_schedule == "fused":
+        if ffn_input_allocation is None or not fused_hidden_locations:
+            raise AssertionError(
+                "cannot verify fused FFN input/hidden physical lifetimes"
+            )
+        _, input_bank, input_base, input_rows, input_slices = (
+            ffn_input_allocation
+        )
+        input_end = input_base + input_rows
+        for hidden_bank, hidden_base, hidden_slices in fused_hidden_locations:
+            if (hidden_bank == input_bank
+                    and not hidden_slices.isdisjoint(input_slices)
+                    and input_base <= hidden_base < input_end):
+                raise AssertionError(
+                    "Fused Swish overwrites a live Gate activation: "
+                    f"bank={hidden_bank}, row={hidden_base}, "
+                    f"slices={sorted(hidden_slices & input_slices)}"
+                )
     if up_first >= gate_first:
         raise AssertionError(
             "FFN did not schedule the resident Up projection before the "

@@ -153,7 +153,11 @@ std::vector<std::uint8_t> download_swiglu_stage(
   BinaryBinding binding = distributed_template;
   binding.shape = {32, 8960};
   binding.byte_size = 32 * 8960 * sizeof(std::uint16_t);
-  binding.base_row = 0;
+  // Fused FFN keeps the normalized activation live while Swish starts. The
+  // Tensor memory planner places hidden immediately after that distributed
+  // input allocation when both use the same bank and slices.
+  binding.base_row = distributed_template.base_row
+      + distributed_template.instruction_count;
   binding.instruction_count = 1120;
   binding.address_stride = 1;
   binding.bank = 0;

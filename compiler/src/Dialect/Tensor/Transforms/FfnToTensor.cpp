@@ -108,6 +108,10 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         hidden_slices = target.mxm_distributed_activation_slices();
     const bool hiddenDistributed16 = tiledWeights
         && hidden_slices.size() == 16;
+    const int64_t distributedElementsPerRow =
+        throughput.mxm_rows * throughput.mxm_block_rows;
+    const int64_t distributedHiddenRows =
+        m * hidden / distributedElementsPerRow;
     const auto inheritedInputPlacement = get_value_placement(input_value);
     const auto inheritedInputBank = mlir::succeeded(inheritedInputPlacement)
         ? inheritedInputPlacement->getAs<mlir::IntegerAttr>("bank")
@@ -120,6 +124,49 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         : pagedWeights
             ? (initialWeightBank + 1) % memory.banks_per_slice : 0;
     const int64_t hiddenBank = tiledWeights ? inputBank : workingBank;
+    int64_t hiddenBaseRow = memory.w8a16_hidden_base_row;
+    if (hiddenBank == inputBank) {
+        int64_t inputBaseRow = 0;
+        int64_t inputRowCount = m * k / throughput.mxm_rows;
+        bool hiddenOverlapsInputSlices = llvm::any_of(hidden_slices,
+            [&](int64_t hiddenSlice) {
+                return llvm::is_contained(
+                    activation_slices, hiddenSlice);
+            });
+        if (mlir::succeeded(inheritedInputPlacement)) {
+            if (const auto base = inheritedInputPlacement
+                    ->getAs<mlir::IntegerAttr>("base_row"))
+                inputBaseRow = base.getInt();
+            if (const auto count = inheritedInputPlacement
+                    ->getAs<mlir::IntegerAttr>("instruction_count"))
+                inputRowCount = count.getInt();
+            if (const auto slices = inheritedInputPlacement
+                    ->getAs<mlir::ArrayAttr>("slices")) {
+                hiddenOverlapsInputSlices = llvm::any_of(
+                    slices, [&](mlir::Attribute attribute) {
+                        const int64_t inputSlice =
+                            llvm::cast<mlir::IntegerAttr>(attribute)
+                                .getInt();
+                        return llvm::is_contained(
+                            hidden_slices, inputSlice);
+                    });
+            }
+        }
+        // Gate continues to consume the normalized activation while fused
+        // Swish starts producing hidden blocks. Keep both values resident in
+        // the same bank/slices without allowing the first hidden block to
+        // overwrite later Gate reduction inputs.
+        if (hiddenOverlapsInputSlices)
+            hiddenBaseRow = std::max(
+                hiddenBaseRow, inputBaseRow + inputRowCount);
+    }
+    const int64_t hiddenRowCount = hiddenDistributed16
+        ? distributedHiddenRows : planarHiddenRows;
+    if (hiddenBaseRow + hiddenRowCount > memory.sram_depth_rows) {
+        op.emitError(
+            "FFN hidden allocation cannot remain disjoint from its live input");
+        return mlir::failure();
+    }
     const bool resultOverlapsHidden = llvm::any_of(result_slices,
         [&](int64_t resultSlice) {
             return llvm::is_contained(hidden_slices, resultSlice);
@@ -136,10 +183,6 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         memory.banks_per_slice * memory.words_per_bank >= 17000;
     const int64_t ffnWeightBase = pagedWeights
         ? 0 : largeSramProfile ? 10000 : 0;
-    const int64_t distributedElementsPerRow =
-        throughput.mxm_rows * throughput.mxm_block_rows;
-    const int64_t distributedHiddenRows =
-        m * hidden / distributedElementsPerRow;
     auto input = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Activation,
             activation_slices, 0, m * k / throughput.mxm_rows,
@@ -169,20 +212,14 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         : allocate_value(down_weight, PlacementKind::Weight);
     auto hidden0 = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::VxmResult,
-            hidden_slices, memory.w8a16_hidden_base_row,
-            hiddenDistributed16
-                ? distributedHiddenRows
-                : planarHiddenRows,
+            hidden_slices, hiddenBaseRow, hiddenRowCount,
             hidden_pass_bytes,
             hiddenDistributed16 ? "fp16_mxm_distributed_16" : "", "both",
             hiddenBank))
         : allocator.allocate(PlacementKind::VxmResult, hidden_pass_bytes);
     auto hidden1 = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::VxmResult1,
-            hidden_slices, memory.w8a16_hidden_base_row,
-            hiddenDistributed16
-                ? distributedHiddenRows
-                : planarHiddenRows,
+            hidden_slices, hiddenBaseRow, hiddenRowCount,
             hidden_pass_bytes,
             hiddenDistributed16 ? "fp16_mxm_distributed_16" : "", "both",
             hiddenBank))

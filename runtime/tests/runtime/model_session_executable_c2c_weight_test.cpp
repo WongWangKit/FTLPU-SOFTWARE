@@ -75,6 +75,24 @@ try {
         throw std::runtime_error(
             "runtime DDR bandwidth did not retime weight prefetches");
 
+    BinaryProgram overlappingProgram;
+    auto resident = make_weight_binding();
+    auto replacement = make_weight_binding();
+    replacement.index = 1;
+    overlappingProgram.bindings = {resident, replacement};
+    overlappingProgram.weight_page_uses = {
+        {0, 0, 0, 100, 320},
+        {1, 0, 0, 1000, 1100},
+    };
+    const auto overlappingPlans =
+        plan_weight_prefetches(overlappingProgram);
+    if (overlappingPlans.size() != 2
+        || !overlappingPlans[0].pre_execution
+        || overlappingPlans[1].pre_execution
+        || overlappingPlans[1].start_cycle != 320)
+        throw std::runtime_error(
+            "overlapping weight replacement did not launch at release");
+
     BinaryProgram program;
     program.bindings.push_back(make_weight_binding());
     program.weight_page_uses.push_back({0, 0, 0, 200, 220});

@@ -42,6 +42,10 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     const bool singleMxm = throughput.mxms_per_hemisphere == 1;
     const bool serializedProjections = singleMxm
         && projectionOrder != FfnProjectionOrder::Interleaved;
+    const bool supportsDensePairHandoff = serializedProjections
+        && localWeightDequant
+        && throughput.mxm_weight_buffers >= 2
+        && throughput.mxm_weight_activation_overlap_enabled != 0;
     result.projection_order = serializedProjections
         ? projectionOrder : FfnProjectionOrder::Interleaved;
     result.initial_compute_cycle = maxWeightLatency + 1 + tile;
@@ -71,7 +75,7 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
             block.reduction_block = reduction;
             block.weight_compute_cycle = result.initial_compute_cycle
                 + block.index * result.projection_block_interval
-                + pair * tile;
+                + (supportsDensePairHandoff ? 0 : pair * tile);
             block.dequant_start = block.weight_compute_cycle - tile;
             block.weight_buffer = block.index
                 % throughput.mxm_weight_buffers;
@@ -162,13 +166,14 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     const int64_t lastFirstProjectionCycle =
         result.blocks.back().tiles.back().compute_cycle;
     if (serializedProjections) {
-        // Keep the second independent projection behind the final result
-        // drain of the first one. Both phases may ping-pong both weight
-        // buffers because they never execute concurrently.
+        // The accumulator drains row-by-row while the next compute consumes
+        // its activation rows. One complete projection slot is sufficient to
+        // hand the accumulator window to the second projection; an extra
+        // tile-sized guard would leave an avoidable bubble at every output
+        // block boundary.
         result.second_projection_offset =
             lastFirstProjectionCycle - result.initial_compute_cycle
-            + std::max<int64_t>(2 * tile,
-                result.accumulator_queue_release);
+            + result.projection_slot_interval;
         result.final_projection_cycle = lastFirstProjectionCycle
             + result.second_projection_offset;
     } else {

@@ -247,10 +247,26 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         return mlir::failure();
     }
     const auto& throughput = target.throughput();
-    // The legacy path does not model passive stream-fabric transport
-    // lifetimes precisely enough to prove a fused route. Keep its requested
-    // fused mode on the validated tail baseline.
-    if (strategy == FfnScheduleStrategy::Fused)
+    const auto gateTempSlices = target.ffn_gate_temp_slices();
+    const auto upTempSlices = target.ffn_up_temp_slices();
+    const bool tempOverlapsHiddenSlices = llvm::any_of(hiddenSlices,
+        [&](int64_t slice) {
+            return llvm::is_contained(gateTempSlices, slice)
+                || llvm::is_contained(upTempSlices, slice);
+        });
+    const bool supportsConcurrentTempAndHiddenWrites =
+        tempBank != hiddenBank || !tempOverlapsHiddenSlices;
+    // Fused Swish relies on the current vector path's local MXM dequant and
+    // one logical Gate/Up slot per physical MXM. Its hidden writes must also
+    // be physically independent from projection temporary writes. Keep Tail
+    // as the portable fallback when either condition cannot be proven.
+    const bool supportsFusedSwish = execution->uses_local_dequant()
+        && throughput.mxms_per_hemisphere == 1
+        && memory.hemispheres == 2
+        && throughput.mxm_result_streams == 4
+        && target.streams().streams_per_direction >= 24
+        && supportsConcurrentTempAndHiddenWrites;
+    if (strategy == FfnScheduleStrategy::Fused && !supportsFusedSwish)
         strategy = FfnScheduleStrategy::Tail;
     if (weightSlices.size()
             != static_cast<std::size_t>(

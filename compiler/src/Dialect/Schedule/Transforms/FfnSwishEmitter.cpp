@@ -20,11 +20,22 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
     const auto dataFormat = lpu_16bit_data_format(
         llvm::cast<mlir::RankedTensorType>(
             resultType).getElementType());
-    mlir::Value value = create_vxm(rewriter, location, gateValue, upValue,
+    auto head = create_vxm(rewriter, location, gateValue, upValue,
         resultType, cycle, 0, "negate", "stream_bf16",
         encodedInput, 0, "stream_bf16",
         encodedInput + 2, 0, "fp32", -1, repeatCount, repeatInterval,
-        hemi, hemi).getResult();
+        hemi, hemi);
+    if (strategy == FfnScheduleStrategy::Fused) {
+        // A fused task feeds one completed projection tile from one
+        // hemisphere. Feed both mirrored VXM chains so neither physical
+        // output is left on the passive SR path. Only the owner chain is the
+        // authoritative result; the fused stage repairs the sink copy before
+        // Down projection consumes it.
+        const auto source = rewriter.getStringAttr(hemi);
+        head->setAttr("lhs_stream_source", source);
+        head->setAttr("rhs_stream_source", source);
+    }
+    mlir::Value value = head.getResult();
     value = create_vxm(rewriter, location, value, upValue,
         resultType, cycle, 1, "exp", "previous", 0, 0,
         "immediate", 0, 0, "fp32", -1, repeatCount, repeatInterval,
@@ -62,12 +73,12 @@ mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
     PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,
     llvm::ArrayRef<int64_t> hiddenSlices, mlir::Value output,
     int64_t inputCycle, int64_t mTile, int64_t pair, int64_t row,
-    int64_t sourceHemisphere)
+    int64_t sourceHemisphere, bool mirroredBroadcast)
 {
     constexpr int64_t kVxmSwishLatency = 17;
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t destination = 1 - sourceHemisphere;
-    const int64_t outputStream = sourceHemisphere == 0 ? 6 : 14;
+    const int64_t destinationStream = sourceHemisphere == 0 ? 6 : 14;
     const auto hiddenKind =
         plan.getHidden0Placement().getAs<mlir::StringAttr>("kind");
     const bool singleMxmVector =
@@ -108,34 +119,30 @@ mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
             target::StreamEndpoint::Mem,
             target::StreamDirection::East, slice);
         if (!latency) return {};
-        const auto emitWrite = [&](int64_t hemisphere) {
+        const auto emitWrite = [&](int64_t hemisphere, int64_t stream) {
             auto placement = schedule_placement(rewriter, {slice}, address,
                 1, 1, hemisphere_name(hemisphere), kind, hiddenBank);
             auto write = rewriter.create<MemWriteOp>(plan.getLoc(), output,
                 inputCycle + kVxmSwishLatency + *latency,
-                1, outputStream + byte, 1, 0,
+                1, stream + byte, 1, 0,
                 rewriter.getStringAttr("east"), plan.getHidden0Address(),
                 placement, tile);
             lastHidden = write.getOutput();
         };
-        emitWrite(destination);
+        emitWrite(destination, destinationStream);
+        if (mirroredBroadcast) {
+            // Compact queue 7 controls physical C7 and C15. Their fixed
+            // outputs are W6/W7 and E14/E15. Consume the non-owner result in
+            // the peer hidden slot before it can drift into the MXM weight
+            // stream window. The stage later overwrites this sink copy from
+            // the authoritative owner result.
+            const int64_t mirroredDestination = sourceHemisphere;
+            const int64_t mirroredStream =
+                sourceHemisphere == 0 ? 14 : 6;
+            emitWrite(mirroredDestination, mirroredStream);
+        }
     }
     return lastHidden;
-}
-
-mlir::Value emitFfnSwishRow(mlir::IRRewriter& rewriter,
-    PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,
-    FfnScheduleStrategy strategy, llvm::ArrayRef<int64_t> hiddenSlices,
-    mlir::Value gateValue, mlir::Value upValue, int64_t cycle,
-    int64_t mTile, int64_t pair, int64_t row, int64_t hemisphere,
-    int64_t outputStream)
-{
-    auto outputs = emitFfnSwishAlu(rewriter, plan.getLoc(),
-        plan.getResult().getType(), gateValue, upValue, target, strategy,
-        cycle, hemisphere, outputStream);
-
-    return emitFfnSwishResultRow(rewriter, plan, target, hiddenSlices,
-        outputs.second.getResult(), cycle, mTile, pair, row, hemisphere);
 }
 
 } // namespace ftlpu::compiler::schedule::ffn_detail
