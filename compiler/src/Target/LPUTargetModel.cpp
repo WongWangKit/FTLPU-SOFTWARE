@@ -103,6 +103,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     const auto* streams = root->getObject("streams");
     const auto* throughput = root->getObject("throughput");
     const auto* externalMemory = root->getObject("external_memory");
+    const auto* icuMemory = root->getObject("icu_memory");
     LPUTargetModel model;
 
     // Schema v1 is the shared physical-target format consumed by both the
@@ -380,6 +381,24 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_EXTERNAL(ddr_latency_random_seed);
 #undef READ_EXTERNAL
 
+#define READ_ICU_MEMORY(field) \
+    read_json_integer(icuMemory, #field, &IcuMemoryGeometry::field, \
+        model.icu_memory_)
+    READ_ICU_MEMORY(mem_instruction_bits);
+    READ_ICU_MEMORY(mem_imem_depth);
+    READ_ICU_MEMORY(mxm_instruction_bits);
+    READ_ICU_MEMORY(mxm_imem_depth);
+    READ_ICU_MEMORY(vxm_instruction_bits);
+    READ_ICU_MEMORY(vxm_imem_depth);
+    READ_ICU_MEMORY(sxm_instruction_bits);
+    READ_ICU_MEMORY(sxm_imem_depth);
+    READ_ICU_MEMORY(macro_encoding_version);
+    READ_ICU_MEMORY(mem_macro_contexts);
+    READ_ICU_MEMORY(mxm_macro_contexts);
+    READ_ICU_MEMORY(mem_macro_context_bits);
+    READ_ICU_MEMORY(mxm_macro_context_bits);
+#undef READ_ICU_MEMORY
+
     if (mlir::failed(model.validate(&error))) return mlir::failure();
     return model;
 }
@@ -418,6 +437,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     const auto throughput = target.getAs<mlir::DictionaryAttr>("throughput");
     const auto externalMemory =
         target.getAs<mlir::DictionaryAttr>("external_memory");
+    const auto icuMemory =
+        target.getAs<mlir::DictionaryAttr>("icu_memory");
 #define READ_MEMORY(field) \
     read_attr_integer(memory, #field, &MemoryTopology::field, model.memory_)
     READ_MEMORY(hemispheres);
@@ -504,6 +525,23 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_EXTERNAL(ddr_request_queue_depth);
     READ_EXTERNAL(ddr_latency_random_seed);
 #undef READ_EXTERNAL
+#define READ_ICU_MEMORY(field) \
+    read_attr_integer(icuMemory, #field, &IcuMemoryGeometry::field, \
+        model.icu_memory_)
+    READ_ICU_MEMORY(mem_instruction_bits);
+    READ_ICU_MEMORY(mem_imem_depth);
+    READ_ICU_MEMORY(mxm_instruction_bits);
+    READ_ICU_MEMORY(mxm_imem_depth);
+    READ_ICU_MEMORY(vxm_instruction_bits);
+    READ_ICU_MEMORY(vxm_imem_depth);
+    READ_ICU_MEMORY(sxm_instruction_bits);
+    READ_ICU_MEMORY(sxm_imem_depth);
+    READ_ICU_MEMORY(macro_encoding_version);
+    READ_ICU_MEMORY(mem_macro_contexts);
+    READ_ICU_MEMORY(mxm_macro_contexts);
+    READ_ICU_MEMORY(mem_macro_context_bits);
+    READ_ICU_MEMORY(mxm_macro_context_bits);
+#undef READ_ICU_MEMORY
     std::string error;
     if (mlir::failed(model.validate(&error))) {
         operation->emitError("invalid ftlpu.target configuration: ") << error;
@@ -619,6 +657,21 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(external_memory_, ddr_request_queue_depth),
         I64(external_memory_, ddr_latency_random_seed),
     });
+    const auto icuMemory = builder.getDictionaryAttr({
+        I64(icu_memory_, mem_instruction_bits),
+        I64(icu_memory_, mem_imem_depth),
+        I64(icu_memory_, mxm_instruction_bits),
+        I64(icu_memory_, mxm_imem_depth),
+        I64(icu_memory_, vxm_instruction_bits),
+        I64(icu_memory_, vxm_imem_depth),
+        I64(icu_memory_, sxm_instruction_bits),
+        I64(icu_memory_, sxm_imem_depth),
+        I64(icu_memory_, macro_encoding_version),
+        I64(icu_memory_, mem_macro_contexts),
+        I64(icu_memory_, mxm_macro_contexts),
+        I64(icu_memory_, mem_macro_context_bits),
+        I64(icu_memory_, mxm_macro_context_bits),
+    });
 #undef I64
     return builder.getDictionaryAttr({
         builder.getNamedAttr("name", builder.getStringAttr(name_)),
@@ -627,6 +680,7 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         builder.getNamedAttr("streams", streams),
         builder.getNamedAttr("throughput", throughput),
         builder.getNamedAttr("external_memory", externalMemory),
+        builder.getNamedAttr("icu_memory", icuMemory),
     });
 }
 
@@ -666,8 +720,26 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             external_memory_.ddr_scheduling_efficiency_percent,
             external_memory_.ddr_read_latency_cycles,
             external_memory_.ddr_write_latency_cycles,
-            external_memory_.ddr_request_queue_depth}))
+            external_memory_.ddr_request_queue_depth,
+            icu_memory_.mem_instruction_bits,
+            icu_memory_.mem_imem_depth,
+            icu_memory_.mxm_instruction_bits,
+            icu_memory_.mxm_imem_depth,
+            icu_memory_.vxm_instruction_bits,
+            icu_memory_.vxm_imem_depth,
+            icu_memory_.sxm_instruction_bits,
+            icu_memory_.sxm_imem_depth,
+            icu_memory_.macro_encoding_version,
+            icu_memory_.mem_macro_contexts,
+            icu_memory_.mxm_macro_contexts,
+            icu_memory_.mem_macro_context_bits,
+            icu_memory_.mxm_macro_context_bits}))
         return fail("topology dimensions and throughput values must be positive");
+    if (icu_memory_.mem_instruction_bits % 32 != 0
+        || icu_memory_.mxm_instruction_bits % 32 != 0
+        || icu_memory_.vxm_instruction_bits % 32 != 0
+        || icu_memory_.sxm_instruction_bits % 32 != 0)
+        return fail("ICU instruction widths must be multiples of 32 bits");
     if (external_memory_.ddr_read_latency_jitter_cycles < 0
         || external_memory_.ddr_write_latency_jitter_cycles < 0
         || external_memory_.ddr_latency_random_seed < 0)

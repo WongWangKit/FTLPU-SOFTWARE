@@ -123,6 +123,25 @@ struct ExternalMemoryModel {
     int64_t ddr_latency_random_seed = 0x46544c50;
 };
 
+// Physical instruction-memory geometry for each ICU family. Queue kinds that
+// share an ICU family (for example MXM load/compute/dequant) share the same
+// slot width and per-queue depth limit.
+struct IcuMemoryGeometry {
+    int64_t mem_instruction_bits = hw::kIcuMemInstructionBits;
+    int64_t mem_imem_depth = hw::kIcuMemImemDepth;
+    int64_t mxm_instruction_bits = hw::kIcuMxmInstructionBits;
+    int64_t mxm_imem_depth = hw::kIcuMxmImemDepth;
+    int64_t vxm_instruction_bits = hw::kIcuVxmInstructionBits;
+    int64_t vxm_imem_depth = hw::kIcuVxmImemDepth;
+    int64_t sxm_instruction_bits = hw::kIcuSxmInstructionBits;
+    int64_t sxm_imem_depth = hw::kIcuSxmImemDepth;
+    int64_t macro_encoding_version = 1;
+    int64_t mem_macro_contexts = hw::kIcuMemMacroContextDepth;
+    int64_t mxm_macro_contexts = hw::kIcuMxmMacroContextDepth;
+    int64_t mem_macro_context_bits = hw::kIcuMemMacroContextBits;
+    int64_t mxm_macro_context_bits = hw::kIcuMxmMacroContextBits;
+};
+
 class LPUTargetModel {
 public:
     LPUTargetModel();
@@ -145,6 +164,7 @@ public:
     {
         return external_memory_;
     }
+    const IcuMemoryGeometry& icu_memory() const { return icu_memory_; }
     int64_t external_read_transfer_cycles(int64_t bytes) const;
 
     bool supports_route(StreamEndpoint source, StreamEndpoint destination,
@@ -238,6 +258,7 @@ private:
     StreamTopology streams_;
     ThroughputModel throughput_;
     ExternalMemoryModel external_memory_;
+    IcuMemoryGeometry icu_memory_;
 };
 
 } // namespace ftlpu::compiler::target

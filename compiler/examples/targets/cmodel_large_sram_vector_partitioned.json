@@ -24,5 +24,20 @@
     "mxm_local_dequant_enabled": 1,
     "mxm_block_compute_enabled": 0,
     "mxm_weight_activation_overlap_enabled": 1
+  },
+  "icu_memory": {
+    "mem_instruction_bits": 96,
+    "mem_imem_depth": 131072,
+    "mxm_instruction_bits": 128,
+    "mxm_imem_depth": 65536,
+    "vxm_instruction_bits": 96,
+    "vxm_imem_depth": 2048,
+    "sxm_instruction_bits": 96,
+    "sxm_imem_depth": 2048,
+    "macro_encoding_version": 1,
+    "mem_macro_contexts": 32,
+    "mxm_macro_contexts": 136,
+    "mem_macro_context_bits": 160,
+    "mxm_macro_context_bits": 160
   }
 }

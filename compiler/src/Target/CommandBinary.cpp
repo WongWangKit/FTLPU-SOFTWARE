@@ -1769,6 +1769,7 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     const auto& streams = target->streams();
     const auto& throughput = target->throughput();
     const auto& externalMemory = target->external_memory();
+    const auto& icuMemory = target->icu_memory();
 #define COPY_MEMORY(field) \
     hardware.field = static_cast<std::uint32_t>(memory.field)
     COPY_MEMORY(hemispheres);
@@ -1837,6 +1838,22 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     COPY_EXTERNAL(ddr_request_queue_depth);
     COPY_EXTERNAL(ddr_latency_random_seed);
 #undef COPY_EXTERNAL
+#define COPY_ICU_MEMORY(field) \
+    hardware.icu_##field = static_cast<std::uint32_t>(icuMemory.field)
+    COPY_ICU_MEMORY(mem_instruction_bits);
+    COPY_ICU_MEMORY(mem_imem_depth);
+    COPY_ICU_MEMORY(mxm_instruction_bits);
+    COPY_ICU_MEMORY(mxm_imem_depth);
+    COPY_ICU_MEMORY(vxm_instruction_bits);
+    COPY_ICU_MEMORY(vxm_imem_depth);
+    COPY_ICU_MEMORY(sxm_instruction_bits);
+    COPY_ICU_MEMORY(sxm_imem_depth);
+    COPY_ICU_MEMORY(macro_encoding_version);
+    COPY_ICU_MEMORY(mem_macro_contexts);
+    COPY_ICU_MEMORY(mxm_macro_contexts);
+    COPY_ICU_MEMORY(mem_macro_context_bits);
+    COPY_ICU_MEMORY(mxm_macro_context_bits);
+#undef COPY_ICU_MEMORY
     program.memory_floors = static_memory_floors(module,
         target->memory().slices_per_hemisphere,
         target->memory().banks_per_slice,

@@ -1,4 +1,5 @@
 #include "ftlpu/software/runtime/icu_program.hpp"
+#include "ftlpu/software/runtime/macro_bitstream.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -442,7 +443,24 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
     InstructionControlUnit& icu,
     std::size_t logical_mxms_per_hemisphere)
 {
-    for (const auto& queue : queues) {
+    for (const auto& source_queue : queues) {
+        QueueProgram decoded_physical_queue;
+        const QueueProgram* queue_pointer = &source_queue;
+        if (source_queue.kind == QueueKind::Mem
+            && !source_queue.commands.empty()
+            && std::all_of(source_queue.commands.begin(),
+                source_queue.commands.end(), [](const QueueCommand& command) {
+                    return is_macro_schedule_command(command)
+                        && command.instruction_kind == InstructionKind::Mem;
+                })) {
+            // Exercise the exact target bitstream decoder on the CModel path;
+            // the distributed ICU then models the decoded finite Macro
+            // contexts and issue timing.
+            decoded_physical_queue = decode_mem_macro_bitstream(
+                encode_mem_macro_bitstream(source_queue), source_queue.index);
+            queue_pointer = &decoded_physical_queue;
+        }
+        const auto& queue = *queue_pointer;
         if (queue.commands.empty()) continue;
         const std::size_t queue_index = physical_queue_index(
             queue.kind, queue.index, logical_mxms_per_hemisphere);

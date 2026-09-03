@@ -1,6 +1,8 @@
 // Keep serialization rebuilt when BinaryProgram or BinaryBinding ABI evolves.
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/macro_bitstream.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -9,6 +11,7 @@
 #include <span>
 #include <stdexcept>
 #include <streambuf>
+#include <type_traits>
 
 namespace ftlpu::software::runtime {
 
@@ -20,6 +23,20 @@ constexpr std::uint8_t kCompactWordCountMask = 0x38;
 constexpr std::uint8_t kCompactWordCountShift = 3;
 constexpr std::uint8_t kCompactHasExtension = 0x40;
 constexpr std::uint8_t kCompactMacro = 0x80;
+
+enum class QueueEncodingMode : std::uint8_t {
+    Native = 0,
+    MacroSchedule = 1,
+    CompactTagged = 2,
+    MemMacroDeltaRle = 3,
+};
+
+constexpr std::uint32_t kNativeWordCountShift = 2;
+constexpr std::uint32_t kNativeWordCountMask = 0x1cu;
+constexpr std::uint32_t kNativeSxmFixedWordCount = 7;
+constexpr std::uint32_t kIcuLoopWindowMask = 0x3fu;
+constexpr std::uint32_t kIcuExtendedSubtypeShift = 8;
+constexpr std::uint32_t kIcuExtendedRepeat2D = 0;
 
 template <typename T>
 void write_scalar(std::ostream& os, T value)
@@ -39,6 +56,184 @@ T read_scalar(std::istream& is)
         throw std::runtime_error("truncated FTLPU binary");
     }
     return value;
+}
+
+InstructionKind instruction_kind_for_queue(QueueKind kind)
+{
+    switch (kind) {
+    case QueueKind::Mem:
+        return InstructionKind::Mem;
+    case QueueKind::MxmLoad:
+    case QueueKind::MxmCompute:
+        return InstructionKind::Mxm;
+    case QueueKind::MxmDequant:
+        return InstructionKind::MxmDequant;
+    case QueueKind::Vxm:
+        return InstructionKind::Vxm;
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute:
+        return InstructionKind::Sxm;
+    }
+    throw std::runtime_error("invalid FTLPU queue kind");
+}
+
+bool is_sxm_queue(QueueKind kind)
+{
+    return kind == QueueKind::SxmTranspose
+        || kind == QueueKind::SxmPermute;
+}
+
+QueueCommand sxm_queue_command(const SxmInstruction& instruction)
+{
+    QueueCommand command {
+        static_cast<isa::EncodedIcuCommand>(
+            isa::IcuCommandOpcode::Instruction),
+        InstructionKind::Sxm, 4, {},
+    };
+    command.words[0] = static_cast<std::uint32_t>(instruction.opcode);
+    command.words[1] =
+        static_cast<std::uint32_t>(instruction.shift_source);
+    command.words[2] = instruction.shift_distance;
+    command.words[3] =
+        (instruction.output_row == SxmInstruction::kAllOutputRows
+                ? 0xffu
+                : static_cast<std::uint32_t>(instruction.output_row))
+        | ((instruction.input_row == SxmInstruction::kAllInputRows
+                   ? 0xffu
+                   : static_cast<std::uint32_t>(instruction.input_row))
+            << 8)
+        | ((instruction.output_tile == SxmInstruction::kAllOutputTiles
+                   ? 0xffu
+                   : static_cast<std::uint32_t>(instruction.output_tile))
+            << 16);
+    command.extension_words.push_back(
+        static_cast<std::uint32_t>(instruction.src_streams.size()));
+    command.extension_words.push_back(
+        static_cast<std::uint32_t>(instruction.dst_streams.size()));
+    for (const auto stream : instruction.src_streams)
+        command.extension_words.push_back(
+            static_cast<std::uint32_t>(stream.stream));
+    for (const auto stream : instruction.dst_streams)
+        command.extension_words.push_back(
+            static_cast<std::uint32_t>(stream.stream));
+    for (const auto lane : instruction.permute_map)
+        command.extension_words.push_back(
+            lane == SxmInstruction::kZeroFill
+                ? UINT32_MAX
+                : static_cast<std::uint32_t>(lane));
+    return command;
+}
+
+SxmInstruction decode_sxm_queue_command(const QueueCommand& command)
+{
+    if (command.instruction_kind != InstructionKind::Sxm
+        || command.word_count != 4
+        || command.extension_words.size()
+            < 2 + SxmInstruction::kTotalLanes)
+        throw std::runtime_error(
+            "SXM queue command has an invalid variable payload");
+    SxmInstruction instruction {};
+    instruction.opcode = static_cast<SxmOpcode>(command.words[0]);
+    instruction.shift_source =
+        static_cast<SxmShiftSource>(command.words[1]);
+    instruction.shift_distance = command.words[2];
+    const auto outputRow = command.words[3] & 0xffu;
+    const auto inputRow = (command.words[3] >> 8) & 0xffu;
+    const auto outputTile = (command.words[3] >> 16) & 0xffu;
+    instruction.output_row = outputRow == 0xffu
+        ? SxmInstruction::kAllOutputRows : outputRow;
+    instruction.input_row = inputRow == 0xffu
+        ? SxmInstruction::kAllInputRows : inputRow;
+    instruction.output_tile = outputTile == 0xffu
+        ? SxmInstruction::kAllOutputTiles : outputTile;
+    const auto sourceCount = command.extension_words[0];
+    const auto destinationCount = command.extension_words[1];
+    const std::size_t mapBegin = 2 + sourceCount + destinationCount;
+    if (command.extension_words.size()
+        != mapBegin + SxmInstruction::kTotalLanes)
+        throw std::runtime_error("SXM queue command has malformed streams");
+    for (std::size_t index = 0; index < sourceCount; ++index)
+        instruction.src_streams.push_back(SxmStreamId {
+            command.extension_words[2 + index]});
+    for (std::size_t index = 0; index < destinationCount; ++index)
+        instruction.dst_streams.push_back(SxmStreamId {
+            command.extension_words[2 + sourceCount + index]});
+    for (std::size_t lane = 0;
+         lane < SxmInstruction::kTotalLanes; ++lane) {
+        const auto value = command.extension_words[mapBegin + lane];
+        instruction.permute_map[lane] = value == UINT32_MAX
+            ? SxmInstruction::kZeroFill : value;
+    }
+    return instruction;
+}
+
+std::array<std::uint32_t, 3> encode_binary_repeat_2d(
+    const IcuRepeat2D& repeat)
+{
+    // Validate the public iteration-space contract with the hardware codec,
+    // then repack it so word zero is a self-describing extended Loop record.
+    (void)isa::encode_icu_repeat_2d(repeat);
+    std::array<std::uint32_t, 3> words {};
+    const auto write = [&](std::size_t offset, std::size_t width,
+                           std::uint64_t value) {
+        for (std::size_t bit = 0; bit < width; ++bit)
+            if ((value & (std::uint64_t {1} << bit)) != 0)
+                words[(offset + bit) / 32]
+                    |= std::uint32_t {1} << ((offset + bit) % 32);
+    };
+    write(0, 2, static_cast<std::uint8_t>(isa::IcuCommandOpcode::Loop));
+    // bits 2..7 are the otherwise-invalid Loop window_size=0 escape.
+    write(kIcuExtendedSubtypeShift, 2, kIcuExtendedRepeat2D);
+    write(10, 10, repeat.inner_count);
+    write(20, 10, repeat.outer_count);
+    write(30, 16, repeat.inner_interval);
+    write(46, 16, repeat.outer_interval);
+    write(62, 16, static_cast<std::uint16_t>(repeat.inner_stride));
+    write(78, 16, static_cast<std::uint16_t>(repeat.outer_stride));
+    write(94, 2, static_cast<std::uint8_t>(repeat.induction_target));
+    return words;
+}
+
+IcuRepeat2D decode_binary_repeat_2d(
+    const std::array<std::uint32_t, 3>& words)
+{
+    const auto read = [&](std::size_t offset, std::size_t width) {
+        std::uint64_t value = 0;
+        for (std::size_t bit = 0; bit < width; ++bit)
+            if ((words[(offset + bit) / 32]
+                    & (std::uint32_t {1} << ((offset + bit) % 32))) != 0)
+                value |= std::uint64_t {1} << bit;
+        return value;
+    };
+    const auto signExtend16 = [](std::uint64_t value) {
+        return static_cast<std::int64_t>(
+            static_cast<std::int16_t>(value));
+    };
+    if (isa::decode_icu_command_opcode(words[0])
+            != isa::IcuCommandOpcode::Loop
+        || ((words[0] >> 2) & kIcuLoopWindowMask) != 0
+        || read(kIcuExtendedSubtypeShift, 2) != kIcuExtendedRepeat2D)
+        throw std::runtime_error("invalid compact Repeat2D record");
+    IcuRepeat2D repeat {
+        static_cast<std::size_t>(read(10, 10)),
+        static_cast<std::size_t>(read(30, 16)),
+        signExtend16(read(62, 16)),
+        static_cast<std::size_t>(read(20, 10)),
+        static_cast<std::size_t>(read(46, 16)),
+        signExtend16(read(78, 16)),
+        static_cast<IcuInductionTarget>(read(94, 2)),
+    };
+    (void)isa::encode_icu_repeat_2d(repeat);
+    return repeat;
+}
+
+QueueCommand repeat_2d_queue_command(const IcuRepeat2D& repeat)
+{
+    const auto encoded = isa::encode_icu_repeat_2d(repeat);
+    return QueueCommand {
+        encoded.words[0], InstructionKind::None, 3,
+        {encoded.words[0], encoded.words[1], encoded.words[2], 0},
+    };
 }
 
 struct CompactQueueRecordHeader {
@@ -118,6 +313,128 @@ void write_compact_queue_command(
         for (const auto word : command.extension_words)
             write_scalar<std::uint32_t>(os, word);
     }
+}
+
+QueueEncodingMode queue_encoding_mode(const QueueProgram& queue)
+{
+    const auto macroCount = std::count_if(queue.commands.begin(),
+        queue.commands.end(), [](const QueueCommand& command) {
+            return is_macro_schedule_command(command);
+        });
+    if (macroCount == 0) return QueueEncodingMode::Native;
+    if (macroCount == static_cast<std::ptrdiff_t>(queue.commands.size())) {
+        if (queue.kind == QueueKind::Mem)
+            return QueueEncodingMode::MemMacroDeltaRle;
+        return QueueEncodingMode::MacroSchedule;
+    }
+    return QueueEncodingMode::CompactTagged;
+}
+
+void write_native_queue_command(std::ostream& os, QueueKind queueKind,
+    const QueueCommand& command)
+{
+    if (is_macro_schedule_command(command))
+        throw std::runtime_error(
+            "native FTLPU queue cannot contain a macro record");
+    if (is_repeat_2d_command(command)) {
+        const auto words = encode_binary_repeat_2d(
+            decode_repeat_2d_command(command));
+        for (const auto word : words) write_scalar(os, word);
+        return;
+    }
+    if (command.instruction_kind == InstructionKind::None) {
+        if (command.word_count != 0 || !command.extension_words.empty()
+            || isa::decode_icu_command_opcode(command.command)
+                == isa::IcuCommandOpcode::Instruction)
+            throw std::runtime_error(
+                "invalid native FTLPU control record");
+        write_scalar(os, command.command);
+        return;
+    }
+    if (command.instruction_kind != instruction_kind_for_queue(queueKind)
+        || isa::decode_icu_command_opcode(command.command)
+            != isa::IcuCommandOpcode::Instruction)
+        throw std::runtime_error(
+            "functional instruction does not match its FTLPU queue");
+    if (is_sxm_queue(queueKind)) {
+        const auto encoded = isa::encode_sxm_instruction(
+            decode_sxm_queue_command(command));
+        write_scalar<std::uint32_t>(os,
+            kNativeSxmFixedWordCount << kNativeWordCountShift);
+        for (const auto word : encoded.words) write_scalar(os, word);
+        return;
+    }
+    if (command.word_count == 0 || command.word_count > 4
+        || !command.extension_words.empty())
+        throw std::runtime_error(
+            "functional instruction does not fit native FTLPU encoding");
+    write_scalar<std::uint32_t>(os,
+        static_cast<std::uint32_t>(command.word_count)
+            << kNativeWordCountShift);
+    for (std::uint16_t word = 0; word < command.word_count; ++word)
+        write_scalar(os, command.words[word]);
+}
+
+void write_macro_schedule_payload(
+    std::ostream& os, const IcuMacroSchedule& schedule)
+{
+    write_scalar<std::uint32_t>(os,
+        static_cast<std::uint32_t>(schedule.start_cycle));
+    write_scalar<std::uint32_t>(os,
+        static_cast<std::uint32_t>(schedule.inner_count));
+    write_scalar<std::uint32_t>(os,
+        static_cast<std::uint32_t>(schedule.inner_interval));
+    write_scalar<std::int32_t>(os,
+        static_cast<std::int32_t>(schedule.inner_stride));
+    write_scalar<std::uint32_t>(os,
+        static_cast<std::uint32_t>(schedule.outer_count));
+    write_scalar<std::uint32_t>(os,
+        static_cast<std::uint32_t>(schedule.outer_interval));
+    write_scalar<std::int32_t>(os,
+        static_cast<std::int32_t>(schedule.outer_stride));
+    write_scalar<std::uint8_t>(os,
+        static_cast<std::uint8_t>(schedule.induction_target));
+}
+
+void write_macro_queue_commands(
+    std::ostream& os, const QueueProgram& queue)
+{
+    std::vector<std::uint8_t> wideWords(
+        (queue.commands.size() + 7) / 8, 0);
+    for (std::size_t index = 0; index < queue.commands.size(); ++index) {
+        const auto& command = queue.commands[index];
+        if (!is_macro_schedule_command(command)
+            || command.instruction_kind
+                != instruction_kind_for_queue(queue.kind)
+            || command.word_count == 0 || command.word_count > 2)
+            throw std::runtime_error(
+                "invalid FTLPU macro queue command");
+        if (command.word_count == 2)
+            wideWords[index / 8]
+                |= static_cast<std::uint8_t>(1u << (index % 8));
+    }
+    for (const auto byte : wideWords) write_scalar(os, byte);
+    for (const auto& command : queue.commands) {
+        for (std::uint16_t word = 0; word < command.word_count; ++word)
+            write_scalar(os, command.words[word]);
+        write_macro_schedule_payload(
+            os, decode_macro_schedule_command(command));
+    }
+}
+
+void write_mem_macro_bitstream(std::ostream& os, const QueueProgram& queue)
+{
+    const auto image = encode_mem_macro_bitstream(queue);
+    write_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(image.version));
+    write_scalar<std::uint8_t>(os, image.delta_count);
+    write_scalar<std::uint64_t>(os, image.bit_count);
+    for (std::size_t i = 0; i < image.delta_count; ++i) {
+        write_scalar<std::uint32_t>(os, image.deltas[i].start_cycle);
+        write_scalar<std::int32_t>(os, image.deltas[i].address);
+    }
+    os.write(reinterpret_cast<const char*>(image.bytes.data()),
+        static_cast<std::streamsize>(image.bytes.size()));
+    if (!os) throw std::runtime_error("failed to write MEM Macro bitstream");
 }
 
 QueueCommand read_compact_queue_command(std::istream& is)
@@ -385,6 +702,209 @@ QueueCommand read_compact_queue_command(ByteReader& reader)
     return command;
 }
 
+template <typename T>
+T read_value(std::istream& is)
+{
+    return read_scalar<T>(is);
+}
+
+template <typename T>
+T read_value(ByteReader& reader)
+{
+    return reader.read<T>();
+}
+
+void skip_value(std::istream& is, std::uint64_t bytes)
+{
+    if (bytes > static_cast<std::uint64_t>(
+                    std::numeric_limits<std::streamoff>::max()))
+        throw std::runtime_error("FTLPU binary section is too large");
+    is.seekg(static_cast<std::streamoff>(bytes), std::ios_base::cur);
+    if (!is) throw std::runtime_error("truncated FTLPU binary");
+}
+
+void skip_value(ByteReader& reader, std::uint64_t bytes)
+{
+    reader.skip(bytes);
+}
+
+template <typename Reader>
+IcuMacroSchedule read_macro_schedule_payload(Reader& reader)
+{
+    return IcuMacroSchedule {
+        read_value<std::uint32_t>(reader),
+        read_value<std::uint32_t>(reader),
+        read_value<std::uint32_t>(reader),
+        read_value<std::int32_t>(reader),
+        read_value<std::uint32_t>(reader),
+        read_value<std::uint32_t>(reader),
+        read_value<std::int32_t>(reader),
+        static_cast<IcuInductionTarget>(read_value<std::uint8_t>(reader)),
+    };
+}
+
+template <typename Reader>
+QueueCommand read_native_queue_command(Reader& reader, QueueKind queueKind)
+{
+    const auto prefix = read_value<std::uint32_t>(reader);
+    const auto opcode = isa::decode_icu_command_opcode(prefix);
+    if (opcode == isa::IcuCommandOpcode::Instruction) {
+        if ((prefix & ~(kNativeWordCountMask | 0x3u)) != 0)
+            throw std::runtime_error(
+                "invalid native FTLPU instruction prefix");
+        const auto wordCount = static_cast<std::uint16_t>(
+            (prefix & kNativeWordCountMask) >> kNativeWordCountShift);
+        if (is_sxm_queue(queueKind)) {
+            if (wordCount != kNativeSxmFixedWordCount)
+                throw std::runtime_error(
+                    "invalid fixed SXM FTLPU instruction");
+            isa::EncodedSxmInstruction encoded {};
+            for (auto& word : encoded.words)
+                word = read_value<std::uint32_t>(reader);
+            return sxm_queue_command(isa::decode_sxm_instruction(encoded));
+        }
+        if (wordCount == 0 || wordCount > 4)
+            throw std::runtime_error(
+                "invalid native FTLPU instruction width");
+        QueueCommand command {
+            static_cast<isa::EncodedIcuCommand>(
+                isa::IcuCommandOpcode::Instruction),
+            instruction_kind_for_queue(queueKind), wordCount, {},
+        };
+        for (std::uint16_t word = 0; word < wordCount; ++word)
+            command.words[word] = read_value<std::uint32_t>(reader);
+        return command;
+    }
+    if (opcode == isa::IcuCommandOpcode::Loop
+        && ((prefix >> 2) & kIcuLoopWindowMask) == 0) {
+        std::array<std::uint32_t, 3> words {
+            prefix,
+            read_value<std::uint32_t>(reader),
+            read_value<std::uint32_t>(reader),
+        };
+        return repeat_2d_queue_command(decode_binary_repeat_2d(words));
+    }
+    return QueueCommand {prefix};
+}
+
+template <typename Reader>
+QueueCommand read_macro_queue_command(
+    Reader& reader, QueueKind queueKind, bool wide)
+{
+    const auto wordCount = static_cast<std::uint16_t>(wide ? 2 : 1);
+    QueueCommand instruction {
+        static_cast<isa::EncodedIcuCommand>(
+            isa::IcuCommandOpcode::Instruction),
+        instruction_kind_for_queue(queueKind), wordCount, {},
+    };
+    for (std::uint16_t word = 0; word < wordCount; ++word)
+        instruction.words[word] = read_value<std::uint32_t>(reader);
+    return encode_macro_schedule_command(
+        std::move(instruction), read_macro_schedule_payload(reader));
+}
+
+template <typename Reader>
+std::vector<std::uint8_t> read_macro_width_bitmap(
+    Reader& reader, std::uint32_t commandCount)
+{
+    std::vector<std::uint8_t> bitmap((commandCount + 7) / 8);
+    for (auto& byte : bitmap) byte = read_value<std::uint8_t>(reader);
+    return bitmap;
+}
+
+template <typename Reader>
+void skip_native_queue_command(Reader& reader, QueueKind queueKind)
+{
+    const auto prefix = read_value<std::uint32_t>(reader);
+    const auto opcode = isa::decode_icu_command_opcode(prefix);
+    if (opcode == isa::IcuCommandOpcode::Instruction) {
+        const auto wordCount = static_cast<std::uint16_t>(
+            (prefix & kNativeWordCountMask) >> kNativeWordCountShift);
+        if (is_sxm_queue(queueKind)) {
+            if (wordCount != kNativeSxmFixedWordCount)
+                throw std::runtime_error(
+                    "invalid fixed SXM FTLPU instruction");
+            skip_value(reader,
+                isa::EncodedSxmInstruction {}.words.size()
+                    * sizeof(std::uint32_t));
+            return;
+        }
+        if (wordCount == 0 || wordCount > 4)
+            throw std::runtime_error(
+                "invalid native FTLPU instruction width");
+        skip_value(reader,
+            static_cast<std::uint64_t>(wordCount)
+                * sizeof(std::uint32_t));
+        return;
+    }
+    if (opcode == isa::IcuCommandOpcode::Loop
+        && ((prefix >> 2) & kIcuLoopWindowMask) == 0) {
+        if (((prefix >> kIcuExtendedSubtypeShift) & 0x3u)
+            != kIcuExtendedRepeat2D)
+            throw std::runtime_error(
+                "unsupported extended FTLPU control record");
+        skip_value(reader, 2 * sizeof(std::uint32_t));
+    }
+}
+
+template <typename Reader>
+void skip_macro_queue_command(Reader& reader, bool wide)
+{
+    skip_value(reader,
+        static_cast<std::uint64_t>(wide ? 2 : 1)
+                * sizeof(std::uint32_t)
+            + 29);
+}
+
+QueueEncodingMode decode_queue_encoding_mode(std::uint8_t value)
+{
+    if (value > static_cast<std::uint8_t>(
+                    QueueEncodingMode::MemMacroDeltaRle))
+        throw std::runtime_error("invalid FTLPU queue encoding mode");
+    return static_cast<QueueEncodingMode>(value);
+}
+
+template <typename Reader>
+QueueProgram read_mem_macro_bitstream(Reader& reader,
+    std::uint32_t commandCount, std::size_t queueIndex)
+{
+    MemMacroBitstream image;
+    image.version = read_value<std::uint8_t>(reader);
+    image.command_count = commandCount;
+    image.delta_count = read_value<std::uint8_t>(reader);
+    image.bit_count = read_value<std::uint64_t>(reader);
+    if (image.delta_count > image.deltas.size())
+        throw std::runtime_error("invalid MEM Macro delta dictionary size");
+    for (std::size_t i = 0; i < image.delta_count; ++i) {
+        image.deltas[i].start_cycle = read_value<std::uint32_t>(reader);
+        image.deltas[i].address = read_value<std::int32_t>(reader);
+    }
+    const auto byteCount = (image.bit_count + 7) / 8;
+    if (byteCount > std::numeric_limits<std::size_t>::max())
+        throw std::runtime_error("MEM Macro bitstream is too large");
+    image.bytes.resize(static_cast<std::size_t>(byteCount));
+    if constexpr (std::is_same_v<Reader, std::istream>) {
+        reader.read(reinterpret_cast<char*>(image.bytes.data()),
+            static_cast<std::streamsize>(image.bytes.size()));
+        if (!reader) throw std::runtime_error("truncated MEM Macro bitstream");
+    } else {
+        reader.read_bytes(image.bytes.data(), image.bytes.size());
+    }
+    return decode_mem_macro_bitstream(image, queueIndex);
+}
+
+template <typename Reader>
+void skip_mem_macro_bitstream(Reader& reader)
+{
+    (void)read_value<std::uint8_t>(reader);
+    const auto deltaCount = read_value<std::uint8_t>(reader);
+    if (deltaCount > kMemMacroDeltaDictionarySize)
+        throw std::runtime_error("invalid MEM Macro delta dictionary size");
+    const auto bitCount = read_value<std::uint64_t>(reader);
+    skip_value(reader, static_cast<std::uint64_t>(deltaCount) * 8
+        + (bitCount + 7) / 8);
+}
+
 BinaryBinding read_binding(ByteReader& reader, std::uint32_t version)
 {
     BinaryBinding binding;
@@ -526,8 +1046,16 @@ BinaryHeader read_header(ByteReader& reader)
         program.target_name.resize(target_name_size);
         reader.read_bytes(
             program.target_name.data(), program.target_name.size());
-        if (version >= 24) {
+        if (version >= 28) {
             program.hardware.visit([&](std::uint32_t& value) {
+                value = reader.read<std::uint32_t>();
+            });
+        } else if (version >= 27) {
+            program.hardware.visit_pre_v28([&](std::uint32_t& value) {
+                value = reader.read<std::uint32_t>();
+            });
+        } else if (version >= 24) {
+            program.hardware.visit_pre_v27([&](std::uint32_t& value) {
                 value = reader.read<std::uint32_t>();
             });
         } else if (version >= 23) {
@@ -708,9 +1236,20 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
     for (const auto& queue : program.queues) {
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.kind));
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.index));
+        const auto mode = queue_encoding_mode(queue);
+        write_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(mode));
         write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(queue.commands.size()));
-        for (const auto& command : queue.commands)
-            write_compact_queue_command(os, command);
+        if (mode == QueueEncodingMode::MemMacroDeltaRle) {
+            write_mem_macro_bitstream(os, queue);
+        } else if (mode == QueueEncodingMode::MacroSchedule) {
+            write_macro_queue_commands(os, queue);
+        } else if (mode == QueueEncodingMode::CompactTagged) {
+            for (const auto& command : queue.commands)
+                write_compact_queue_command(os, command);
+        } else {
+            for (const auto& command : queue.commands)
+                write_native_queue_command(os, queue.kind, command);
+        }
     }
     for (const auto& relocation : program.scale_relocations) {
         write_scalar<std::uint32_t>(os, relocation.binding_index);
@@ -756,8 +1295,16 @@ BinaryProgram read_binary_program(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 24) {
+        if (version >= 28) {
             program.hardware.visit([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+        } else if (version >= 27) {
+            program.hardware.visit_pre_v28([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+        } else if (version >= 24) {
+            program.hardware.visit_pre_v27([&](std::uint32_t& value) {
                 value = read_scalar<std::uint32_t>(is);
             });
         } else if (version >= 23) {
@@ -842,10 +1389,37 @@ BinaryProgram read_binary_program(std::istream& is)
         auto queue = QueueProgram {};
         queue.kind = static_cast<QueueKind>(read_scalar<std::uint16_t>(is));
         queue.index = read_scalar<std::uint16_t>(is);
+        const auto mode = version >= 26
+            ? decode_queue_encoding_mode(read_scalar<std::uint8_t>(is))
+            : QueueEncodingMode::CompactTagged;
         const auto command_count = read_scalar<std::uint32_t>(is);
         queue.commands.reserve(command_count);
 
+        std::vector<std::uint8_t> macroWidths;
+        if (version >= 26 && mode == QueueEncodingMode::MacroSchedule)
+            macroWidths = read_macro_width_bitmap(is, command_count);
+
+        if (version >= 28
+            && mode == QueueEncodingMode::MemMacroDeltaRle) {
+            program.queues.push_back(read_mem_macro_bitstream(
+                is, command_count, queue.index));
+            continue;
+        }
+
         for (std::uint32_t command_id = 0; command_id < command_count; ++command_id) {
+            if (version >= 26) {
+                if (mode == QueueEncodingMode::Native)
+                    queue.commands.push_back(
+                        read_native_queue_command(is, queue.kind));
+                else if (mode == QueueEncodingMode::MacroSchedule)
+                    queue.commands.push_back(read_macro_queue_command(is,
+                        queue.kind,
+                        (macroWidths[command_id / 8]
+                            & (1u << (command_id % 8))) != 0));
+                else
+                    queue.commands.push_back(read_compact_queue_command(is));
+                continue;
+            }
             if (version >= 25) {
                 queue.commands.push_back(read_compact_queue_command(is));
                 continue;
@@ -920,8 +1494,16 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         is.read(program.target_name.data(),
             static_cast<std::streamsize>(program.target_name.size()));
         if (!is) throw std::runtime_error("truncated FTLPU target name");
-        if (version >= 24) {
+        if (version >= 28) {
             program.hardware.visit([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+        } else if (version >= 27) {
+            program.hardware.visit_pre_v28([&](std::uint32_t& value) {
+                value = read_scalar<std::uint32_t>(is);
+            });
+        } else if (version >= 24) {
+            program.hardware.visit_pre_v27([&](std::uint32_t& value) {
                 value = read_scalar<std::uint32_t>(is);
             });
         } else if (version >= 23) {
@@ -1001,11 +1583,34 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
     }
 
     for (std::uint32_t queue = 0; queue < queue_count; ++queue) {
+        const auto queueKind = static_cast<QueueKind>(
+            read_scalar<std::uint16_t>(is));
         (void)read_scalar<std::uint16_t>(is);
-        (void)read_scalar<std::uint16_t>(is);
+        const auto mode = version >= 26
+            ? decode_queue_encoding_mode(read_scalar<std::uint8_t>(is))
+            : QueueEncodingMode::CompactTagged;
         const auto command_count = read_scalar<std::uint32_t>(is);
+        std::vector<std::uint8_t> macroWidths;
+        if (version >= 26 && mode == QueueEncodingMode::MacroSchedule)
+            macroWidths = read_macro_width_bitmap(is, command_count);
+        if (version >= 28
+            && mode == QueueEncodingMode::MemMacroDeltaRle) {
+            skip_mem_macro_bitstream(is);
+            continue;
+        }
         for (std::uint32_t command = 0;
              command < command_count; ++command) {
+            if (version >= 26) {
+                if (mode == QueueEncodingMode::Native)
+                    skip_native_queue_command(is, queueKind);
+                else if (mode == QueueEncodingMode::MacroSchedule)
+                    skip_macro_queue_command(is,
+                        (macroWidths[command / 8]
+                            & (1u << (command % 8))) != 0);
+                else
+                    skip_compact_queue_command(is);
+                continue;
+            }
             if (version >= 25) {
                 skip_compact_queue_command(is);
                 continue;
@@ -1048,10 +1653,37 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
         queue.kind =
             static_cast<QueueKind>(reader.read<std::uint16_t>());
         queue.index = reader.read<std::uint16_t>();
+        const auto mode = header.version >= 26
+            ? decode_queue_encoding_mode(reader.read<std::uint8_t>())
+            : QueueEncodingMode::CompactTagged;
         const auto command_count = reader.read<std::uint32_t>();
         queue.commands.reserve(command_count);
+        std::vector<std::uint8_t> macroWidths;
+        if (header.version >= 26
+            && mode == QueueEncodingMode::MacroSchedule)
+            macroWidths = read_macro_width_bitmap(reader, command_count);
+        if (header.version >= 28
+            && mode == QueueEncodingMode::MemMacroDeltaRle) {
+            program.queues.push_back(read_mem_macro_bitstream(
+                reader, command_count, queue.index));
+            continue;
+        }
         for (std::uint32_t command_id = 0;
              command_id < command_count; ++command_id) {
+            if (header.version >= 26) {
+                if (mode == QueueEncodingMode::Native)
+                    queue.commands.push_back(
+                        read_native_queue_command(reader, queue.kind));
+                else if (mode == QueueEncodingMode::MacroSchedule)
+                    queue.commands.push_back(read_macro_queue_command(reader,
+                        queue.kind,
+                        (macroWidths[command_id / 8]
+                            & (1u << (command_id % 8))) != 0));
+                else
+                    queue.commands.push_back(
+                        read_compact_queue_command(reader));
+                continue;
+            }
             if (header.version >= 25) {
                 queue.commands.push_back(read_compact_queue_command(reader));
                 continue;
@@ -1124,11 +1756,35 @@ BinaryProgram read_binary_program_metadata(
     BinaryHeader header = read_header(reader);
     for (std::uint32_t queue = 0;
          queue < header.queue_count; ++queue) {
+        const auto queueKind =
+            static_cast<QueueKind>(reader.read<std::uint16_t>());
         (void)reader.read<std::uint16_t>();
-        (void)reader.read<std::uint16_t>();
+        const auto mode = header.version >= 26
+            ? decode_queue_encoding_mode(reader.read<std::uint8_t>())
+            : QueueEncodingMode::CompactTagged;
         const auto command_count = reader.read<std::uint32_t>();
+        std::vector<std::uint8_t> macroWidths;
+        if (header.version >= 26
+            && mode == QueueEncodingMode::MacroSchedule)
+            macroWidths = read_macro_width_bitmap(reader, command_count);
+        if (header.version >= 28
+            && mode == QueueEncodingMode::MemMacroDeltaRle) {
+            skip_mem_macro_bitstream(reader);
+            continue;
+        }
         for (std::uint32_t command = 0;
              command < command_count; ++command) {
+            if (header.version >= 26) {
+                if (mode == QueueEncodingMode::Native)
+                    skip_native_queue_command(reader, queueKind);
+                else if (mode == QueueEncodingMode::MacroSchedule)
+                    skip_macro_queue_command(reader,
+                        (macroWidths[command / 8]
+                            & (1u << (command % 8))) != 0);
+                else
+                    skip_compact_queue_command(reader);
+                continue;
+            }
             if (header.version >= 25) {
                 skip_compact_queue_command(reader);
                 continue;

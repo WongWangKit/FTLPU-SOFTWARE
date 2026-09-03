@@ -1,4 +1,5 @@
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/imem_capacity.hpp"
 #include "ftlpu/software/runtime/schedule_trace.hpp"
 
 #include <filesystem>
@@ -81,6 +82,7 @@ try {
     program.hardware.ddr_scheduling_efficiency_percent = 90;
     program.hardware.ddr_read_latency_cycles = 35;
     program.hardware.ddr_read_latency_jitter_cycles = 15;
+    program.hardware.icu_mem_imem_depth = 6;
     program.bindings = {
         weight(1, "gate", 2048),
         weight(2, "up", 2048),
@@ -132,16 +134,41 @@ try {
         std::span<const std::uint8_t>(
             reinterpret_cast<const std::uint8_t*>(bytes.data()),
             bytes.size()));
-    if (decoded.queues.size() != 1 || decoded.queues[0].commands.size() != 1
-        || !is_macro_schedule_command(decoded.queues[0].commands[0]))
+    if (decoded.queues.size() != 2 || decoded.queues[1].commands.size() != 1
+        || !is_macro_schedule_command(decoded.queues[1].commands[0]))
         throw std::runtime_error("compact macro binary did not round-trip");
+    if (decoded.hardware.icu_mem_imem_depth != 6
+        || decoded.hardware.icu_mxm_instruction_bits
+            != program.hardware.icu_mxm_instruction_bits)
+        throw std::runtime_error("i-MEM geometry did not round-trip");
+    const auto imem = analyze_cmodel_abstract_imem(decoded);
+    if (imem.fits() || imem.overflow_queues != 1
+        || imem.used_slots != 8 || imem.encoded_work_entries != 8
+        || imem.expanded_work != 21
+        || !imem.queues[0].overflow()
+        || imem.queues[0].overflow_slots() != 1)
+        throw std::runtime_error("cmodel-abstract i-MEM report is incorrect");
+    if (decoded.queues[0].commands.size() != 7
+        || !is_repeat_2d_command(decoded.queues[0].commands[3]))
+        throw std::runtime_error("compact Repeat2D binary did not round-trip");
+    const auto decodedRepeat2D =
+        decode_repeat_2d_command(decoded.queues[0].commands[3]);
+    if (decodedRepeat2D.inner_count != 3
+        || decodedRepeat2D.inner_interval != 2
+        || decodedRepeat2D.inner_stride != 1
+        || decodedRepeat2D.outer_count != 2
+        || decodedRepeat2D.outer_interval != 10
+        || decodedRepeat2D.outer_stride != 100
+        || decodedRepeat2D.induction_target
+            != ftlpu::IcuInductionTarget::MemAddress)
+        throw std::runtime_error("compact Repeat2D descriptor changed on disk");
     if (streamMetadata.target_abi != program.target_abi
         || spanMetadata.target_abi != program.target_abi
         || metadataStream.peek() != std::char_traits<char>::eof())
         throw std::runtime_error(
             "compact macro metadata-only read did not round-trip");
     const auto decodedMacro =
-        decode_macro_schedule_command(decoded.queues[0].commands[0]);
+        decode_macro_schedule_command(decoded.queues[1].commands[0]);
     if (decodedMacro.start_cycle != 10 || decodedMacro.inner_count != 3
         || decodedMacro.inner_interval != 2
         || decodedMacro.inner_stride != 1

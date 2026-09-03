@@ -21,6 +21,8 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
     src/runtime/icu_program.cpp
+    src/runtime/imem_capacity.cpp
+    src/runtime/macro_bitstream.cpp
     src/runtime/model_package.cpp
     src/runtime/model_session.cpp
     src/runtime/performance.cpp
@@ -73,6 +75,8 @@ add_library(ftlpu_software
     src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
     src/runtime/icu_program.cpp
+    src/runtime/imem_capacity.cpp
+    src/runtime/macro_bitstream.cpp
     src/runtime/model_package.cpp
     src/runtime/model_session.cpp
     src/runtime/performance.cpp
@@ -102,6 +106,11 @@ target_link_libraries(ftlpu_binary_inspect PRIVATE ftlpu_software)
 
 add_executable(ftlpu_binary_repack examples/binary_repack.cpp)
 target_link_libraries(ftlpu_binary_repack PRIVATE ftlpu_software)
+
+add_executable(macro_bitstream_test
+    tests/runtime/macro_bitstream_test.cpp)
+target_link_libraries(macro_bitstream_test PRIVATE ftlpu_software)
+add_test(NAME macro_bitstream_test COMMAND $<TARGET_FILE:macro_bitstream_test>)
 
 add_executable(schedule_trace_weight_page_test
     tests/runtime/schedule_trace_weight_page_test.cpp)

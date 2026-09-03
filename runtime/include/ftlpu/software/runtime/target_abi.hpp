@@ -70,6 +70,22 @@ struct ExecutableHardwareConfig {
     std::uint32_t ddr_write_latency_jitter_cycles{10};
     std::uint32_t ddr_request_queue_depth{256};
     std::uint32_t ddr_latency_random_seed{0x46544c50};
+    // Per-ICU physical instruction-memory geometry. The current CModel uses
+    // one decoded QueueCommand per slot; instruction_bits therefore describes
+    // the nominal physical storage cost of that abstract slot.
+    std::uint32_t icu_mem_instruction_bits{hw::kIcuMemInstructionBits};
+    std::uint32_t icu_mem_imem_depth{hw::kIcuMemImemDepth};
+    std::uint32_t icu_mxm_instruction_bits{hw::kIcuMxmInstructionBits};
+    std::uint32_t icu_mxm_imem_depth{hw::kIcuMxmImemDepth};
+    std::uint32_t icu_vxm_instruction_bits{hw::kIcuVxmInstructionBits};
+    std::uint32_t icu_vxm_imem_depth{hw::kIcuVxmImemDepth};
+    std::uint32_t icu_sxm_instruction_bits{hw::kIcuSxmInstructionBits};
+    std::uint32_t icu_sxm_imem_depth{hw::kIcuSxmImemDepth};
+    std::uint32_t icu_macro_encoding_version{1};
+    std::uint32_t icu_mem_macro_contexts{hw::kIcuMemMacroContextDepth};
+    std::uint32_t icu_mxm_macro_contexts{hw::kIcuMxmMacroContextDepth};
+    std::uint32_t icu_mem_macro_context_bits{hw::kIcuMemMacroContextBits};
+    std::uint32_t icu_mxm_macro_context_bits{hw::kIcuMxmMacroContextBits};
 
     template <typename Visitor>
     constexpr void visit(Visitor&& visitor)
@@ -110,19 +126,47 @@ struct ExecutableHardwareConfig {
                    false);
     }
 
+    template <typename Visitor>
+    constexpr void visit_pre_v27(Visitor&& visitor)
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
+                   true, false);
+    }
+
+    template <typename Visitor>
+    constexpr void visit_pre_v27(Visitor&& visitor) const
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
+                   true, false);
+    }
+
+    template <typename Visitor>
+    constexpr void visit_pre_v28(Visitor&& visitor)
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
+                   true, true, false);
+    }
+
+    template <typename Visitor>
+    constexpr void visit_pre_v28(Visitor&& visitor) const
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor), true, true, true,
+                   true, true, false);
+    }
+
 private:
     template <typename Self, typename Visitor>
     static constexpr void visit_pre_v19_impl(Self& self, Visitor&& visitor)
     {
         visit_impl(self, std::forward<Visitor>(visitor), false, false, false,
-                   false);
+                   false, false, false);
     }
 
     template <typename Self, typename Visitor>
     static constexpr void visit_impl(Self& self, Visitor&& visitor)
     {
         visit_impl(self, std::forward<Visitor>(visitor), true, true, true,
-                   true);
+                   true, true, true);
     }
 
     template <typename Self, typename Visitor>
@@ -130,7 +174,9 @@ private:
                                      bool include_accumulator_capacity,
                                      bool include_c2c_fabric,
                                      bool include_external_memory,
-                                     bool include_ddr_scheduling_efficiency)
+                                     bool include_ddr_scheduling_efficiency,
+                                     bool include_imem_geometry = false,
+                                     bool include_macro_geometry = false)
     {
         visitor(self.hemispheres); visitor(self.slices_per_hemisphere);
         visitor(self.banks_per_slice); visitor(self.words_per_bank);
@@ -182,6 +228,23 @@ private:
             visitor(self.ddr_request_queue_depth);
             visitor(self.ddr_latency_random_seed);
         }
+        if (include_imem_geometry) {
+            visitor(self.icu_mem_instruction_bits);
+            visitor(self.icu_mem_imem_depth);
+            visitor(self.icu_mxm_instruction_bits);
+            visitor(self.icu_mxm_imem_depth);
+            visitor(self.icu_vxm_instruction_bits);
+            visitor(self.icu_vxm_imem_depth);
+            visitor(self.icu_sxm_instruction_bits);
+            visitor(self.icu_sxm_imem_depth);
+        }
+        if (include_macro_geometry) {
+            visitor(self.icu_macro_encoding_version);
+            visitor(self.icu_mem_macro_contexts);
+            visitor(self.icu_mxm_macro_contexts);
+            visitor(self.icu_mem_macro_context_bits);
+            visitor(self.icu_mxm_macro_context_bits);
+        }
     }
 };
 
@@ -212,7 +275,10 @@ constexpr std::uint64_t lpu_32stream_target_abi(
         static_cast<std::uint32_t>(mxms_per_hemisphere);
     TargetAbiHasher hash;
     hash.add(16); // Hardware ABI schema version (DDR scheduling margin).
-    config.visit([&](std::uint32_t value) { hash.add(value); });
+    // i-MEM capacity is a deployment constraint rather than a command-bit ABI
+    // change. Keep legacy Schedule attributes valid and validate geometry
+    // explicitly when loading an executable into a CModel.
+    config.visit_pre_v27([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }
 
@@ -221,7 +287,7 @@ constexpr std::uint64_t executable_target_abi(
 {
     TargetAbiHasher hash;
     hash.add(16); // Hardware ABI schema version (DDR scheduling margin).
-    config.visit([&](std::uint32_t value) { hash.add(value); });
+    config.visit_pre_v27([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }
 

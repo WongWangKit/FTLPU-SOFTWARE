@@ -1,9 +1,11 @@
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/imem_capacity.hpp"
 #include "ftlpu/software/runtime/performance.hpp"
 #include "ftlpu/software/runtime/schedule_trace.hpp"
 
 #include <filesystem>
 #include <algorithm>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -26,6 +28,13 @@ try {
 
     const auto program = ftlpu::software::runtime::read_binary_program(
         std::filesystem::path(argv[1]));
+    std::ifstream binaryVersionStream(argv[1], std::ios::binary);
+    binaryVersionStream.seekg(8);
+    std::uint32_t binaryVersion = 0;
+    binaryVersionStream.read(reinterpret_cast<char*>(&binaryVersion),
+        sizeof(binaryVersion));
+    if (!binaryVersionStream)
+        throw std::runtime_error("failed to read FTLPU binary version");
     const auto cycles = program.max_cycle + 64;
     std::cout << "binary target=" << program.target_name
               << " max_cycle=" << program.max_cycle
@@ -58,19 +67,56 @@ try {
     std::size_t loopReplayed = 0;
     std::size_t macroExpanded = 0;
     std::size_t tracePatternRows = 0;
-    std::size_t serializedQueueBytes = program.queues.size() * 8;
+    std::size_t serializedQueueBytes =
+        program.queues.size() * (binaryVersion >= 26 ? 9 : 8);
     for (const auto& queue : program.queues) {
+        const auto macroCount = std::ranges::count_if(queue.commands,
+            [](const auto& command) {
+                return ftlpu::software::runtime::is_macro_schedule_command(
+                    command);
+            });
+        const bool macroQueue = binaryVersion >= 26
+            && macroCount == queue.commands.size()
+            && !queue.commands.empty();
+        const bool memDeltaQueue = binaryVersion >= 28 && macroQueue
+            && queue.kind == ftlpu::software::runtime::QueueKind::Mem;
+        const bool nativeQueue = binaryVersion >= 26
+            && macroCount == 0;
+        if (memDeltaQueue) {
+            const auto image =
+                ftlpu::software::runtime::encode_mem_macro_bitstream(queue);
+            serializedQueueBytes += 10
+                + image.delta_count * 8 + image.bytes.size();
+        } else if (macroQueue) {
+            serializedQueueBytes += (queue.commands.size() + 7) / 8;
+        }
         for (const auto& command : queue.commands) {
             const bool macro =
                 ftlpu::software::runtime::is_macro_schedule_command(command);
-            serializedQueueBytes += 1
-                + command.word_count * sizeof(std::uint32_t)
-                + (macro ? 29 : sizeof(std::uint32_t))
-                + (!macro && !command.extension_words.empty()
-                        ? sizeof(std::uint16_t)
-                            + command.extension_words.size()
-                                * sizeof(std::uint32_t)
-                        : 0);
+            if (memDeltaQueue) {
+                // Accounted once as a packed queue-level bitstream above.
+            } else if (macroQueue) {
+                serializedQueueBytes +=
+                    command.word_count * sizeof(std::uint32_t) + 29;
+            } else if (nativeQueue) {
+                if (ftlpu::software::runtime::is_repeat_2d_command(command))
+                    serializedQueueBytes += 3 * sizeof(std::uint32_t);
+                else if (command.instruction_kind
+                            == ftlpu::software::runtime::InstructionKind::Sxm)
+                    serializedQueueBytes += 14 * sizeof(std::uint32_t);
+                else
+                    serializedQueueBytes += sizeof(std::uint32_t)
+                        + command.word_count * sizeof(std::uint32_t);
+            } else {
+                serializedQueueBytes += 1
+                    + command.word_count * sizeof(std::uint32_t)
+                    + (macro ? 29 : sizeof(std::uint32_t))
+                    + (!macro && !command.extension_words.empty()
+                            ? sizeof(std::uint16_t)
+                                + command.extension_words.size()
+                                    * sizeof(std::uint32_t)
+                            : 0);
+            }
             if (macro) {
                 ++totalMacros;
                 const auto macro =
@@ -147,6 +193,169 @@ try {
               << " trace_queue_pattern_rows=" << tracePatternRows
               << " serialized_queue_bytes=" << serializedQueueBytes
               << '\n';
+    const auto imem =
+        ftlpu::software::runtime::analyze_cmodel_abstract_imem(program);
+    const auto savedImemWork = imem.expanded_work > imem.encoded_work_entries
+        ? imem.expanded_work - imem.encoded_work_entries : 0;
+    const auto workCompression = imem.expanded_work == 0 ? 0.0
+        : 100.0 * static_cast<double>(savedImemWork)
+            / static_cast<double>(imem.expanded_work);
+    std::cout << "imem model=cmodel-abstract"
+              << " deployable=" << (imem.fits() ? "yes" : "no")
+              << " queues=" << imem.queues.size()
+              << " overflow_queues=" << imem.overflow_queues
+              << " used_slots=" << imem.used_slots
+              << " used_bits=" << imem.used_bits
+              << " used_bytes_ceil=" << (imem.used_bits + 7) / 8
+              << " active_queue_capacity_bits="
+              << imem.active_queue_capacity_bits
+              << " expanded_work=" << imem.expanded_work
+              << " encoded_work_entries=" << imem.encoded_work_entries
+              << " saved_work_entries=" << savedImemWork
+              << " work_compression_percent=" << workCompression
+              << '\n';
+    for (const auto kind : {
+             ftlpu::software::runtime::QueueKind::Mem,
+             ftlpu::software::runtime::QueueKind::MxmLoad,
+             ftlpu::software::runtime::QueueKind::MxmCompute,
+             ftlpu::software::runtime::QueueKind::MxmDequant,
+             ftlpu::software::runtime::QueueKind::Vxm,
+             ftlpu::software::runtime::QueueKind::SxmTranspose,
+             ftlpu::software::runtime::QueueKind::SxmPermute}) {
+        std::size_t queueCount = 0;
+        std::size_t usedSlots = 0;
+        std::size_t overflowQueues = 0;
+        std::size_t maxUsed = 0;
+        std::uint64_t usedBits = 0;
+        std::uint64_t expandedWork = 0;
+        std::size_t encodedWork = 0;
+        std::uint32_t slotBits = 0;
+        std::uint32_t depth = 0;
+        for (const auto& queue : imem.queues) {
+            if (queue.kind != kind) continue;
+            ++queueCount;
+            usedSlots += queue.used_slots;
+            usedBits += queue.used_bits();
+            expandedWork += queue.expanded_work;
+            encodedWork += queue.instruction_entries
+                + queue.repeat_entries + queue.repeat_2d_entries
+                + queue.loop_entries + queue.macro_entries;
+            maxUsed = std::max(maxUsed, queue.used_slots);
+            overflowQueues += queue.overflow() ? 1 : 0;
+            slotBits = queue.slot_bits;
+            depth = queue.depth;
+        }
+        if (queueCount == 0) continue;
+        const auto saved = expandedWork > encodedWork
+            ? expandedWork - encodedWork : 0;
+        std::cout << "imem resource="
+                  << ftlpu::software::runtime::queue_kind_name(kind)
+                  << " slot_bits=" << slotBits
+                  << " depth_per_queue=" << depth
+                  << " queues=" << queueCount
+                  << " used_slots=" << usedSlots
+                  << " max_used_slots=" << maxUsed
+                  << " max_utilization_percent="
+                  << 100.0 * static_cast<double>(maxUsed) / depth
+                  << " used_bits=" << usedBits
+                  << " expanded_work=" << expandedWork
+                  << " encoded_work_entries=" << encodedWork
+                  << " saved_work_entries=" << saved
+                  << " overflow_queues=" << overflowQueues << '\n';
+    }
+    for (const auto& queue : imem.queues) {
+        if (!reportAllQueues && !queue.overflow()) continue;
+        std::cout << "imem queue resource="
+                  << ftlpu::software::runtime::queue_kind_name(queue.kind)
+                  << " queue=" << queue.index
+                  << " slot_bits=" << queue.slot_bits
+                  << " depth=" << queue.depth
+                  << " used_slots=" << queue.used_slots
+                  << " utilization_percent="
+                  << 100.0 * static_cast<double>(queue.used_slots)
+                      / queue.depth
+                  << " overflow_slots=" << queue.overflow_slots()
+                  << " expanded_work=" << queue.expanded_work
+                  << " instruction=" << queue.instruction_entries
+                  << " nop=" << queue.nop_entries
+                  << " repeat=" << queue.repeat_entries
+                  << " repeat2d=" << queue.repeat_2d_entries
+                  << " loop=" << queue.loop_entries
+                  << " macro=" << queue.macro_entries << '\n';
+    }
+    const auto physical =
+        ftlpu::software::runtime::analyze_physical_imem(program);
+    std::cout << "imem model=target-physical-v1"
+              << " deployable=" << (physical.fits() ? "yes" : "no")
+              << " queues=" << physical.queues.size()
+              << " mem_delta_rle_queues=" << physical.mem_delta_rle_queues
+              << " overflow_queues=" << physical.overflow_queues
+              << " context_overflow_queues="
+              << physical.macro_context_overflow_queues
+              << " used_slots=" << physical.used_slots
+              << " used_bits=" << physical.used_bits
+              << " used_bytes_ceil=" << (physical.used_bits + 7) / 8
+              << " active_queue_capacity_bits="
+              << physical.active_queue_capacity_bits
+              << " peak_macro_context_bits="
+              << physical.peak_macro_context_bits
+              << " provisioned_macro_context_bits="
+              << physical.provisioned_macro_context_bits << '\n';
+    for (const auto kind : {
+             ftlpu::software::runtime::QueueKind::Mem,
+             ftlpu::software::runtime::QueueKind::MxmLoad,
+             ftlpu::software::runtime::QueueKind::MxmCompute,
+             ftlpu::software::runtime::QueueKind::MxmDequant,
+             ftlpu::software::runtime::QueueKind::Vxm,
+             ftlpu::software::runtime::QueueKind::SxmTranspose,
+             ftlpu::software::runtime::QueueKind::SxmPermute}) {
+        std::size_t queues = 0;
+        std::size_t slots = 0;
+        std::size_t maxSlots = 0;
+        std::size_t peakContexts = 0;
+        std::size_t contextCapacity = 0;
+        std::uint64_t peakContextBits = 0;
+        std::uint64_t provisionedContextBits = 0;
+        std::size_t runs = 0;
+        std::size_t escapes = 0;
+        std::size_t compactTemplateRuns = 0;
+        std::size_t extendedTemplateRuns = 0;
+        std::uint64_t bits = 0;
+        for (const auto& queue : physical.queues) {
+            if (queue.kind != kind) continue;
+            ++queues;
+            slots += queue.physical_slots;
+            maxSlots = std::max(maxSlots, queue.physical_slots);
+            peakContexts = std::max(peakContexts, queue.peak_macro_contexts);
+            contextCapacity = std::max(
+                contextCapacity, queue.macro_context_capacity);
+            peakContextBits += static_cast<std::uint64_t>(
+                queue.peak_macro_contexts) * queue.macro_context_bits;
+            provisionedContextBits += static_cast<std::uint64_t>(
+                queue.macro_context_capacity) * queue.macro_context_bits;
+            runs += queue.macro_codec.run_count;
+            escapes += queue.macro_codec.escaped_transitions;
+            compactTemplateRuns += queue.macro_codec.compact_template_runs;
+            extendedTemplateRuns += queue.macro_codec.extended_template_runs;
+            bits += queue.physical_bits;
+        }
+        if (queues == 0) continue;
+        std::cout << "imem physical_resource="
+                  << ftlpu::software::runtime::queue_kind_name(kind)
+                  << " queues=" << queues
+                  << " used_slots=" << slots
+                  << " max_used_slots=" << maxSlots
+                  << " used_bits=" << bits
+                  << " peak_macro_contexts=" << peakContexts
+                  << " macro_context_capacity=" << contextCapacity
+                  << " peak_context_bits=" << peakContextBits
+                  << " provisioned_context_bits="
+                  << provisionedContextBits
+                  << " template_runs=" << runs
+                  << " compact_template_runs=" << compactTemplateRuns
+                  << " extended_template_runs=" << extendedTemplateRuns
+                  << " escaped_deltas=" << escapes << '\n';
+    }
     std::map<std::pair<std::uint32_t,
         ftlpu::software::runtime::QueueKind>, std::size_t>
         scaleRelocations;

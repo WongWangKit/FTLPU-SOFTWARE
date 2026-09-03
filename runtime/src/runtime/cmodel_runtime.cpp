@@ -172,6 +172,13 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     REQUIRE_EXACT(accumulator_to_vxm_latency);
     REQUIRE_EXACT(accumulator_read_to_vxm_latency);
     REQUIRE_EXACT(swiglu_write_latency);
+    REQUIRE_EXACT(icu_mem_instruction_bits);
+    REQUIRE_EXACT(icu_mxm_instruction_bits);
+    REQUIRE_EXACT(icu_vxm_instruction_bits);
+    REQUIRE_EXACT(icu_sxm_instruction_bits);
+    REQUIRE_EXACT(icu_macro_encoding_version);
+    REQUIRE_EXACT(icu_mem_macro_context_bits);
+    REQUIRE_EXACT(icu_mxm_macro_context_bits);
 #undef REQUIRE_EXACT
 
     require_capacity("sram_depth_rows", requested.sram_depth_rows,
@@ -185,6 +192,20 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     require_capacity("mxm_accumulator_blocks",
         requested.mxm_accumulator_blocks,
         physical.mxm_accumulator_blocks);
+    require_capacity("icu_mem_imem_depth", requested.icu_mem_imem_depth,
+        physical.icu_mem_imem_depth);
+    require_capacity("icu_mxm_imem_depth", requested.icu_mxm_imem_depth,
+        physical.icu_mxm_imem_depth);
+    require_capacity("icu_vxm_imem_depth", requested.icu_vxm_imem_depth,
+        physical.icu_vxm_imem_depth);
+    require_capacity("icu_sxm_imem_depth", requested.icu_sxm_imem_depth,
+        physical.icu_sxm_imem_depth);
+    require_capacity("icu_mem_macro_contexts",
+        requested.icu_mem_macro_contexts,
+        physical.icu_mem_macro_contexts);
+    require_capacity("icu_mxm_macro_contexts",
+        requested.icu_mxm_macro_contexts,
+        physical.icu_mxm_macro_contexts);
     require_capacity("vxm_alus", requested.vxm_alus, physical.vxm_alus);
     require_capacity("c2c_streams_per_direction",
         requested.c2c_streams_per_direction,
