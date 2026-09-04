@@ -10,6 +10,11 @@ Pipeline Viewer 是一个无外部依赖的 Canvas 波形工作台，可以查�
 浏览器直接打开 `index.html` 后载入任意一种 CSV。性能分析和流水验证应优先使用
 第一种实际运行 trace。
 
+对于包含多个 invocation 的 `ModelSession`，runtime segment 会追加到同一条 session
+物理 cycle 时间轴。`Session.Invocation` 标出每个 executable；
+`C2C.ModelWeightPage`、`C2C.HostInput` 和 `C2C.HostOutput` 保留发生在 executable
+局部 ICU cycle 之外的传输时间。
+
 旧版四列输入格式继续兼容：
 
 ```csv

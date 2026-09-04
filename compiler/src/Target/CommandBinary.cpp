@@ -7,6 +7,7 @@
 #include "ftlpu/core/instruction_codec.hpp"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -49,6 +50,9 @@ struct CommandSequence {
     int64_t outer_interval{1};
     int64_t outer_stride{0};
     IcuInductionTarget induction_target{IcuInductionTarget::None};
+    int64_t depth_count{1};
+    int64_t depth_interval{1};
+    int64_t depth_stride{0};
 };
 
 int64_t command_cycle(mlir::Operation* op)
@@ -720,6 +724,7 @@ void collect_sxm(command::SxmOp op, QueueMap& queues)
 int64_t sequence_final_cycle(const CommandSequence& sequence)
 {
     return sequence.cycle
+        + (sequence.depth_count - 1) * sequence.depth_interval
         + (sequence.outer_count - 1) * sequence.outer_interval
         + (sequence.repeat_count - 1) * sequence.repeat_interval;
 }
@@ -956,6 +961,101 @@ IcuInductionTarget macro_induction_target(QueueKind kind)
     return IcuInductionTarget::None;
 }
 
+IcuStreamNdSchedule canonicalize_stream_nd_dimensions(
+    IcuStreamNdSchedule schedule)
+{
+    std::array<std::size_t, IcuStreamNdSchedule::kMaxRank> order {
+        0, 1, 2};
+    std::stable_sort(order.begin(), order.begin() + schedule.rank,
+        [&](std::size_t lhs, std::size_t rhs) {
+            return schedule.cycle_strides[lhs]
+                < schedule.cycle_strides[rhs];
+        });
+
+    const auto counts = schedule.counts;
+    const auto cycleStrides = schedule.cycle_strides;
+    const auto operandStrides = schedule.operand_strides;
+    for (std::size_t dimension = 0; dimension < schedule.rank;
+         ++dimension) {
+        const auto source = order[dimension];
+        schedule.counts[dimension] = counts[source];
+        schedule.cycle_strides[dimension] = cycleStrides[source];
+        schedule.operand_strides[dimension] = operandStrides[source];
+    }
+    software::runtime::validate_stream_nd_iteration_space(
+        schedule, "STREAM_ND affine schedule");
+    return schedule;
+}
+
+// The DDR-backed ICU has no persistent instruction-memory history to replay.
+// Materialize the legacy Command IR window form before binary encoding so
+// every fetched FIFO entry is independently decodable.
+void materialize_legacy_loop_windows(
+    std::vector<CommandSequence>& sequences, QueueKind kind)
+{
+    std::sort(sequences.begin(), sequences.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return lhs.cycle < rhs.cycle;
+        });
+    std::vector<CommandSequence> materialized;
+    materialized.reserve(sequences.size());
+    std::vector<CommandSequence> staticHistory;
+    staticHistory.reserve(sequences.size());
+    for (const auto& sequence : sequences) {
+        if (!sequence.is_loop) {
+            materialized.push_back(sequence);
+            staticHistory.push_back(sequence);
+            continue;
+        }
+
+        if (sequence.loop_window_size <= 0 || sequence.repeat_count <= 0
+            || sequence.repeat_interval < sequence.loop_window_size
+            || static_cast<std::size_t>(sequence.loop_window_size)
+                > staticHistory.size()) {
+            throw std::runtime_error(
+                "Command IR Loop has an invalid replay window");
+        }
+        const auto window =
+            static_cast<std::size_t>(sequence.loop_window_size);
+        const auto first = staticHistory.size() - window;
+        const auto inductionTarget = macro_induction_target(kind);
+        if (sequence.address_stride != 0
+            && inductionTarget == IcuInductionTarget::None) {
+            throw std::runtime_error(
+                "Command IR Loop stride is unsupported for this queue kind");
+        }
+        for (std::size_t offset = 0; offset < window; ++offset) {
+            const auto& base = staticHistory[first + offset];
+            if (base.repeat_count != 1 || base.outer_count != 1
+                || base.is_loop) {
+                throw std::runtime_error(
+                    "Command IR Loop window must contain only single instructions");
+            }
+        }
+        for (int64_t round = 0; round < sequence.repeat_count; ++round) {
+            for (std::size_t offset = 0; offset < window; ++offset) {
+                auto replay = staticHistory[first + offset];
+                replay.cycle = sequence.cycle
+                    + round * sequence.repeat_interval
+                    + static_cast<int64_t>(offset);
+                replay.instruction = apply_outer_induction(
+                    std::move(replay.instruction), inductionTarget,
+                    (round + 1) * sequence.address_stride);
+                replay.repeat_count = 1;
+                replay.repeat_interval = 1;
+                replay.address_stride = 0;
+                replay.outer_count = 1;
+                replay.outer_interval = 1;
+                replay.outer_stride = 0;
+                replay.induction_target = IcuInductionTarget::None;
+                replay.is_loop = false;
+                materialized.push_back(std::move(replay));
+            }
+        }
+    }
+    sequences = std::move(materialized);
+}
+
 bool fold_loop_windows_into_macro(
     std::vector<CommandSequence>& sequences, QueueKind kind)
 {
@@ -1122,6 +1222,105 @@ void compress_interleaved_macro_windows(
             sequence.outer_stride = bestStride;
             if (bestStride != 0)
                 sequence.induction_target = macro_induction_target(kind);
+            compressed.push_back(std::move(sequence));
+        }
+        index += bestRounds * bestWindow;
+    }
+    sequences = std::move(compressed);
+}
+
+// STREAM_ND has one more affine counter than the legacy macro. Fold repeated
+// two-dimensional descriptors into that third dimension while preserving any
+// interleaved descriptor window on the same functional-unit queue.
+void compress_stream_nd_depth(
+    std::vector<CommandSequence>& sequences, QueueKind kind)
+{
+    constexpr std::size_t kMaxWindow = 63;
+    std::vector<CommandSequence> compressed;
+    compressed.reserve(sequences.size());
+    for (std::size_t index = 0; index < sequences.size();) {
+        std::size_t bestWindow = 0;
+        std::size_t bestRounds = 0;
+        int64_t bestInterval = 0;
+        int64_t bestStride = 0;
+        const std::size_t remaining = sequences.size() - index;
+        for (std::size_t window = 1;
+             window <= std::min(kMaxWindow, remaining / 2); ++window) {
+            const auto& first = sequences[index];
+            const auto& next = sequences[index + window];
+            if (first.is_loop || next.is_loop
+                || first.depth_count != 1 || next.depth_count != 1)
+                continue;
+            const int64_t interval = next.cycle - first.cycle;
+            const int64_t span =
+                (first.outer_count - 1) * first.outer_interval
+                + (first.repeat_count - 1) * first.repeat_interval;
+            if (interval <= span) continue;
+            const int64_t stride =
+                macro_instruction_stride(first, next, kind);
+            if (stride == std::numeric_limits<int64_t>::max()) continue;
+
+            std::size_t rounds = 1;
+            while (index + (rounds + 1) * window <= sequences.size()) {
+                bool same = true;
+                for (std::size_t offset = 0; offset < window; ++offset) {
+                    const auto& base = sequences[index + offset];
+                    const auto& candidate =
+                        sequences[index + rounds * window + offset];
+                    if (base.is_loop || candidate.is_loop
+                        || base.depth_count != 1
+                        || candidate.depth_count != 1
+                        || candidate.repeat_count != base.repeat_count
+                        || candidate.repeat_interval
+                            != base.repeat_interval
+                        || candidate.address_stride != base.address_stride
+                        || candidate.outer_count != base.outer_count
+                        || candidate.outer_interval != base.outer_interval
+                        || candidate.outer_stride != base.outer_stride
+                        || candidate.induction_target
+                            != base.induction_target
+                        || candidate.cycle
+                            != base.cycle
+                                + static_cast<int64_t>(rounds) * interval
+                        || !same_loop_instruction(base, candidate,
+                            kind,
+                            static_cast<int64_t>(rounds) * stride)) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (!same) break;
+                ++rounds;
+            }
+            if (rounds > 1
+                && rounds * window > bestRounds * bestWindow) {
+                bestWindow = window;
+                bestRounds = rounds;
+                bestInterval = interval;
+                bestStride = stride;
+            }
+        }
+        if (bestRounds <= 1) {
+            compressed.push_back(std::move(sequences[index++]));
+            continue;
+        }
+        for (std::size_t offset = 0; offset < bestWindow; ++offset) {
+            auto sequence = std::move(sequences[index + offset]);
+            sequence.depth_count = static_cast<int64_t>(bestRounds);
+            sequence.depth_interval = bestInterval;
+            sequence.depth_stride = bestStride;
+            if (bestStride != 0) {
+                const auto inductionTarget = macro_induction_target(kind);
+                if (inductionTarget == IcuInductionTarget::None)
+                    throw std::runtime_error(
+                        "STREAM_ND depth stride is unsupported for this queue kind");
+                if (sequence.induction_target
+                        != IcuInductionTarget::None
+                    && sequence.induction_target != inductionTarget)
+                    throw std::runtime_error(
+                        "STREAM_ND depth stride conflicts with the existing induction target");
+                sequence.induction_target = inductionTarget;
+            }
             compressed.push_back(std::move(sequence));
         }
         index += bestRounds * bestWindow;
@@ -1346,6 +1545,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
     std::sort(sequences.begin(), sequences.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.cycle < rhs.cycle;
     });
+    materialize_legacy_loop_windows(sequences, key.first);
     if (!macroScheduleEnabled)
         expand_interleaved_repeat_2d(sequences, repeat2DEnabled);
     std::sort(sequences.begin(), sequences.end(), [](const auto& lhs, const auto& rhs) {
@@ -1474,11 +1674,15 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
     const bool macroKind = key.first == QueueKind::Mem
         || key.first == QueueKind::MxmLoad
         || key.first == QueueKind::MxmCompute
-        || key.first == QueueKind::MxmDequant;
+        || key.first == QueueKind::MxmDequant
+        || key.first == QueueKind::Vxm
+        || key.first == QueueKind::SxmTranspose
+        || key.first == QueueKind::SxmPermute;
     const bool macroLoopsFolded = macroScheduleEnabled && macroKind
         && fold_loop_windows_into_macro(sequences, key.first);
     if (macroLoopsFolded) {
         compress_interleaved_macro_windows(sequences, key.first);
+        compress_stream_nd_depth(sequences, key.first);
         std::sort(sequences.begin(), sequences.end(),
             [](const auto& lhs, const auto& rhs) {
                 return lhs.cycle < rhs.cycle;
@@ -1494,34 +1698,147 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
             key.first, static_cast<std::size_t>(key.second), {}};
         std::unordered_set<int64_t> issueCycles;
         for (const CommandSequence& sequence : sequences) {
-            for (int64_t outer = 0; outer < sequence.outer_count;
-                 ++outer)
-                for (int64_t inner = 0;
-                     inner < sequence.repeat_count; ++inner) {
-                    const int64_t issueCycle = sequence.cycle
-                        + outer * sequence.outer_interval
-                        + inner * sequence.repeat_interval;
-                    if (!issueCycles.insert(issueCycle).second)
-                        throw std::runtime_error(
-                            "overlapping Command IR macro issue on ICU queue kind="
-                            + std::to_string(static_cast<int>(key.first))
-                            + " index=" + std::to_string(key.second)
-                            + " at cycle=" + std::to_string(issueCycle));
-                }
-            const std::size_t instructionIndex = queue.commands.size();
-            queue.commands.push_back(
-                software::runtime::encode_macro_schedule_command(
-                    sequence.instruction,
-                    IcuMacroSchedule {
+            for (int64_t depth = 0; depth < sequence.depth_count;
+                 ++depth)
+                for (int64_t outer = 0; outer < sequence.outer_count;
+                     ++outer)
+                    for (int64_t inner = 0;
+                         inner < sequence.repeat_count; ++inner) {
+                        const int64_t issueCycle = sequence.cycle
+                            + depth * sequence.depth_interval
+                            + outer * sequence.outer_interval
+                            + inner * sequence.repeat_interval;
+                        if (!issueCycles.insert(issueCycle).second)
+                            throw std::runtime_error(
+                                "overlapping Command IR coarse issue on ICU queue kind="
+                                + std::to_string(static_cast<int>(key.first))
+                                + " index=" + std::to_string(key.second)
+                                + " at cycle=" + std::to_string(issueCycle));
+                    }
+            std::size_t instructionIndex = queue.commands.size();
+            const std::size_t rank = sequence.depth_count > 1 ? 3
+                : sequence.outer_count > 1 ? 2 : 1;
+            if (key.first == QueueKind::Mem) {
+                queue.commands.push_back(
+                    software::runtime::encode_mem_stream_nd_command(
+                        sequence.instruction,
+                        IcuMemStreamNdSchedule {
+                            static_cast<std::size_t>(sequence.cycle),
+                            rank,
+                            {static_cast<std::size_t>(
+                                 sequence.repeat_count),
+                                static_cast<std::size_t>(
+                                    sequence.outer_count),
+                                static_cast<std::size_t>(
+                                    sequence.depth_count)},
+                            {static_cast<std::size_t>(
+                                 sequence.repeat_interval),
+                                static_cast<std::size_t>(
+                                    sequence.outer_interval),
+                                static_cast<std::size_t>(
+                                    sequence.depth_interval)},
+                            {sequence.address_stride,
+                                sequence.outer_stride,
+                                sequence.depth_stride},
+                        }));
+            } else if (key.first == QueueKind::MxmLoad
+                || key.first == QueueKind::MxmCompute
+                || key.first == QueueKind::MxmDequant) {
+                auto inductionTarget = sequence.induction_target;
+                if (sequence.address_stride == 0
+                    && sequence.outer_stride == 0
+                    && sequence.depth_stride == 0)
+                    inductionTarget = IcuInductionTarget::None;
+                const auto schedule = canonicalize_stream_nd_dimensions(
+                    IcuMxmStreamNdSchedule {
                         static_cast<std::size_t>(sequence.cycle),
-                        static_cast<std::size_t>(sequence.repeat_count),
-                        static_cast<std::size_t>(sequence.repeat_interval),
-                        sequence.address_stride,
-                        static_cast<std::size_t>(sequence.outer_count),
-                        static_cast<std::size_t>(sequence.outer_interval),
-                        sequence.outer_stride,
-                        sequence.induction_target,
-                    }));
+                        rank,
+                        {static_cast<std::size_t>(
+                             sequence.repeat_count),
+                            static_cast<std::size_t>(
+                                sequence.outer_count),
+                            static_cast<std::size_t>(
+                                sequence.depth_count)},
+                        {static_cast<std::size_t>(
+                             sequence.repeat_interval),
+                            static_cast<std::size_t>(
+                                sequence.outer_interval),
+                            static_cast<std::size_t>(
+                                sequence.depth_interval)},
+                        {sequence.address_stride,
+                            sequence.outer_stride,
+                            sequence.depth_stride},
+                        inductionTarget,
+                    });
+                queue.commands.push_back(
+                    software::runtime::encode_mxm_stream_nd_command(
+                        sequence.instruction, schedule));
+            } else if (key.first == QueueKind::Vxm) {
+                const auto schedule = canonicalize_stream_nd_dimensions(
+                    IcuVxmStreamNdSchedule {
+                        static_cast<std::size_t>(sequence.cycle),
+                        rank,
+                        {static_cast<std::size_t>(
+                             sequence.repeat_count),
+                            static_cast<std::size_t>(
+                                sequence.outer_count),
+                            static_cast<std::size_t>(
+                                sequence.depth_count)},
+                        {static_cast<std::size_t>(
+                             sequence.repeat_interval),
+                            static_cast<std::size_t>(
+                                sequence.outer_interval),
+                            static_cast<std::size_t>(
+                                sequence.depth_interval)},
+                        {0, 0, 0},
+                        IcuInductionTarget::None,
+                    });
+                queue.commands.push_back(
+                    software::runtime::encode_vxm_stream_nd_command(
+                        sequence.instruction, schedule));
+            } else if (key.first == QueueKind::SxmTranspose
+                || key.first == QueueKind::SxmPermute) {
+                const auto schedule = canonicalize_stream_nd_dimensions(
+                    IcuSxmTileProgramSchedule {
+                        static_cast<std::size_t>(sequence.cycle),
+                        rank,
+                        {static_cast<std::size_t>(
+                             sequence.repeat_count),
+                            static_cast<std::size_t>(
+                                sequence.outer_count),
+                            static_cast<std::size_t>(
+                                sequence.depth_count)},
+                        {static_cast<std::size_t>(
+                             sequence.repeat_interval),
+                            static_cast<std::size_t>(
+                                sequence.outer_interval),
+                            static_cast<std::size_t>(
+                                sequence.depth_interval)},
+                        {0, 0, 0},
+                        IcuInductionTarget::None,
+                    });
+                queue.commands.push_back(
+                    software::runtime::encode_sxm_tile_program_command(
+                        sequence.instruction, schedule));
+            } else {
+                queue.commands.push_back(
+                    software::runtime::encode_macro_schedule_command(
+                        sequence.instruction,
+                        IcuMacroSchedule {
+                            static_cast<std::size_t>(sequence.cycle),
+                            static_cast<std::size_t>(
+                                sequence.repeat_count),
+                            static_cast<std::size_t>(
+                                sequence.repeat_interval),
+                            sequence.address_stride,
+                            static_cast<std::size_t>(
+                                sequence.outer_count),
+                            static_cast<std::size_t>(
+                                sequence.outer_interval),
+                            sequence.outer_stride,
+                            sequence.induction_target,
+                        }));
+            }
             if (sequence.scale_binding >= 0) {
                 scaleRelocations.push_back(BinaryScaleRelocation {
                     static_cast<std::uint32_t>(sequence.scale_binding),
@@ -1559,67 +1876,18 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
         }
         return queue;
     }
-    // Loop control sequences are not functional MEM instructions. Perform
-    // read/write collision legalization before introducing them, otherwise
-    // the legalization code can decode a Loop placeholder as a MEM command
-    // and discard the replay window while attempting to expand it.
     legalize_encoded_repeat_limits(sequences);
     std::sort(sequences.begin(), sequences.end(), [](const auto& lhs,
                                                    const auto& rhs) {
         return lhs.cycle < rhs.cycle;
     });
-    if (repeat2DEnabled) {
-        auto simpleLoopCandidate = sequences;
-        compress_loop_windows(simpleLoopCandidate, key.first);
-        auto repeatedLoopCandidate = sequences;
-        compress_short_repeats_into_loop_windows(
-            repeatedLoopCandidate, key.first);
-        sequences = encoded_command_count(repeatedLoopCandidate)
-                < encoded_command_count(simpleLoopCandidate)
-            ? std::move(repeatedLoopCandidate)
-            : std::move(simpleLoopCandidate);
-    }
     QueueProgram queue {key.first, static_cast<std::size_t>(key.second), {}};
     int64_t cursor = 0;
     const CommandSequence* previous = nullptr;
     for (const CommandSequence& sequence : sequences) {
-        if (sequence.is_loop) {
-            if (sequence.cycle < cursor)
-                throw std::runtime_error(
-                    "Command IR Loop begins before its replay window ends");
-            const auto window = static_cast<std::size_t>(
-                sequence.loop_window_size);
-            if (window == 0 || window > queue.commands.size())
-                throw std::runtime_error(
-                    "Command IR Loop window exceeds prior queue commands");
-            for (std::size_t offset = 0; offset < window; ++offset) {
-                const auto& command = queue.commands[
-                    queue.commands.size() - window + offset];
-                if (isa::decode_icu_command_opcode(command.command)
-                    != isa::IcuCommandOpcode::Instruction)
-                    throw std::runtime_error(
-                        "Command IR Loop window must contain only contiguous instructions");
-            }
-            if (sequence.cycle > cursor)
-                queue.commands.push_back(control_command(
-                    isa::encode_icu_nop(static_cast<std::size_t>(
-                        sequence.cycle - cursor))));
-            queue.commands.push_back(control_command(isa::encode_icu_loop(
-                IcuLoop {
-                    window,
-                    static_cast<std::size_t>(sequence.repeat_count),
-                    static_cast<std::size_t>(sequence.repeat_interval),
-                    sequence.address_stride,
-                })));
-            const int64_t finalCycle = sequence.cycle
-                + (sequence.repeat_count - 1) * sequence.repeat_interval
-                + sequence.loop_window_size - 1;
-            cursor = finalCycle + 1;
-            max_cycle = std::max(max_cycle,
-                static_cast<std::size_t>(finalCycle));
-            previous = &sequence;
-            continue;
-        }
+        if (sequence.is_loop)
+            throw std::logic_error(
+                "legacy Command IR Loop survived materialization");
         if (sequence.cycle < cursor)
             throw std::runtime_error("overlapping Command IR sequences target ICU queue kind="
                 + std::to_string(static_cast<int>(key.first)) + " index="

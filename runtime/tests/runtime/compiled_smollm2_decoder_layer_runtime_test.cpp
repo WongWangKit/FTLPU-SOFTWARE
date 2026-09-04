@@ -166,6 +166,33 @@ std::size_t firstBindingReadCycle(
         for (std::size_t commandIndex = 0;
              commandIndex <= relocation.command_index; ++commandIndex) {
             const auto& command = queue->commands[commandIndex];
+            if (ftlpu::software::runtime::is_mem_stream_nd_command(
+                    command)) {
+                const auto schedule = ftlpu::software::runtime::
+                    decode_mem_stream_nd_command(command);
+                if (commandIndex == relocation.command_index) {
+                    const auto encoded =
+                        static_cast<ftlpu::isa::EncodedMemInstruction>(
+                            command.words[0])
+                        | (static_cast<ftlpu::isa::EncodedMemInstruction>(
+                               command.words[1])
+                            << 32);
+                    if (ftlpu::isa::decode_mem_instruction(encoded).opcode
+                        != ftlpu::MemOpcode::Read)
+                        throw std::logic_error(
+                            "binding relocation does not reference a MEM read");
+                    firstCycle = std::min(
+                        firstCycle, schedule.start_cycle);
+                    break;
+                }
+                std::size_t finalCycle = schedule.start_cycle;
+                for (std::size_t dimension = 0;
+                     dimension < schedule.rank; ++dimension)
+                    finalCycle += (schedule.counts[dimension] - 1)
+                        * schedule.cycle_strides[dimension];
+                cycle = std::max(cycle, finalCycle + 1);
+                continue;
+            }
             if (ftlpu::software::runtime::is_macro_schedule_command(
                     command)) {
                 const auto schedule =
@@ -220,13 +247,6 @@ std::size_t firstBindingReadCycle(
                 const auto repeat =
                     ftlpu::isa::decode_icu_repeat(command.command);
                 cycle += repeat.count * repeat.interval;
-                continue;
-            }
-            if (opcode == ftlpu::isa::IcuCommandOpcode::Loop) {
-                const auto loop =
-                    ftlpu::isa::decode_icu_loop(command.command);
-                cycle += (loop.count - 1) * loop.interval
-                    + loop.window_size;
                 continue;
             }
             if (opcode != ftlpu::isa::IcuCommandOpcode::Instruction

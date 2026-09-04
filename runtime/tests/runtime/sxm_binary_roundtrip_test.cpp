@@ -65,6 +65,33 @@ try {
     program.timelines.push_back({"rmsnorm.transpose", 7, 13});
     program.max_cycle = icu_program.last_cycle();
     program.queues = icu_program.encode_queues();
+    const auto nativePermuteQueue = std::find_if(program.queues.begin(),
+        program.queues.end(), [](const QueueProgram& queue) {
+            return queue.kind == QueueKind::SxmPermute
+                && queue.index == 0;
+        });
+    require(nativePermuteQueue != program.queues.end(),
+        "native SXM permute queue is missing");
+    const auto nativePermute = std::find_if(
+        nativePermuteQueue->commands.begin(),
+        nativePermuteQueue->commands.end(),
+        [](const QueueCommand& command) {
+            return command.instruction_kind == InstructionKind::Sxm;
+        });
+    require(nativePermute != nativePermuteQueue->commands.end(),
+        "native SXM permute instruction is missing");
+    const auto westPermuteQueue = std::find_if(program.queues.begin(),
+        program.queues.end(), [](const QueueProgram& queue) {
+            return queue.kind == QueueKind::SxmPermute
+                && queue.index == 1;
+        });
+    require(westPermuteQueue != program.queues.end(),
+        "west SXM permute queue is missing");
+    westPermuteQueue->commands.push_back(
+        encode_sxm_tile_program_command(*nativePermute,
+            IcuSxmTileProgramSchedule {
+                20, 2, {4, 2, 1}, {1, 8, 1}, {0, 0, 0},
+                IcuInductionTarget::None}));
     for (auto& queue : program.queues) {
         if (queue.kind != QueueKind::SxmPermute || queue.index != 0)
             continue;
@@ -133,6 +160,22 @@ try {
         found = true;
     }
     require(found, "serialized SXM permute queue is missing");
+    const auto tileQueue = std::find_if(decoded.queues.begin(),
+        decoded.queues.end(), [](const QueueProgram& queue) {
+            return queue.kind == QueueKind::SxmPermute
+                && queue.index == 1;
+        });
+    require(tileQueue != decoded.queues.end()
+            && tileQueue->commands.size() == 1
+            && is_sxm_tile_program_command(tileQueue->commands.front()),
+        "SXM_TILE_PROGRAM did not survive binary round-trip");
+    const auto tile = decode_sxm_tile_program_command(
+        tileQueue->commands.front());
+    require(tile.schedule.start_cycle == 20
+            && tile.schedule.rank == 2
+            && tile.schedule.counts[0] == 4
+            && tile.schedule.counts[1] == 2,
+        "SXM_TILE_PROGRAM schedule was not preserved");
 
     auto incompatible = decoded;
     incompatible.target_name = "incompatible-test-target";

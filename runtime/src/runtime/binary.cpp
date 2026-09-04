@@ -334,7 +334,17 @@ QueueEncodingMode queue_encoding_mode(const QueueProgram& queue)
         queue.commands.end(), [](const QueueCommand& command) {
             return is_macro_schedule_command(command);
         });
-    if (macroCount == 0) return QueueEncodingMode::Native;
+    if (macroCount == 0) {
+        const bool hasExtendedDescriptor = std::any_of(
+            queue.commands.begin(), queue.commands.end(),
+            [](const QueueCommand& command) {
+                return isa::decode_icu_command_opcode(command.command)
+                    == isa::IcuCommandOpcode::Extended;
+            });
+        return hasExtendedDescriptor
+            ? QueueEncodingMode::CompactTagged
+            : QueueEncodingMode::Native;
+    }
     if (macroCount == static_cast<std::ptrdiff_t>(queue.commands.size())) {
         if (queue.kind == QueueKind::Mem)
             return QueueEncodingMode::MemMacroDeltaRle;

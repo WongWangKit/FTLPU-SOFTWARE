@@ -40,7 +40,8 @@ BinaryBinding weight(
 void require_contains(const std::string& text, const std::string& expected)
 {
     if (text.find(expected) == std::string::npos)
-        throw std::runtime_error("trace is missing: " + expected);
+        throw std::runtime_error(
+            "trace is missing: " + expected + "\nactual trace:\n" + text);
 }
 
 template <typename T>
@@ -137,6 +138,21 @@ QueueCommand repeat_2d_command(const ftlpu::IcuRepeat2D& repeat)
 int main()
 try {
     verify_official_v26_header_compatibility();
+    bool rejectedInterleavedDimensions = false;
+    try {
+        static_cast<void>(encode_mxm_stream_nd_command(
+            mxm_command(ftlpu::MxmControlInstruction::Compute(
+                0, 0, 0, 4, 1,
+                ftlpu::MxmAccumulatorDestination::Sram)),
+            ftlpu::IcuMxmStreamNdSchedule {
+                0, 3, {32, 13, 2}, {1, 3102, 1536}, {0, 0, 0},
+                ftlpu::IcuInductionTarget::None}));
+    } catch (const std::invalid_argument&) {
+        rejectedInterleavedDimensions = true;
+    }
+    if (!rejectedInterleavedDimensions)
+        throw std::runtime_error(
+            "MXM_STREAM_ND accepted non-monotonic dimensions");
 
     BinaryProgram program;
     program.hardware.c2c_streams_per_direction = 8;
@@ -170,10 +186,18 @@ try {
             repeat_2d_command(ftlpu::IcuRepeat2D {
                 3, 2, 1, 2, 10, 100,
                 ftlpu::IcuInductionTarget::MemAddress}),
-            mem_command(ftlpu::MemInstruction::Read(300, 2)),
-            mem_command(ftlpu::MemInstruction::Read(301, 3)),
-            QueueCommand {ftlpu::isa::encode_icu_loop(
-                ftlpu::IcuLoop {2, 3, 4, 10})},
+            encode_macro_schedule_command(
+                mem_command(ftlpu::MemInstruction::Read(300, 2)),
+                ftlpu::IcuMacroSchedule {24, 3, 4, 10, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::MemAddress}),
+            encode_macro_schedule_command(
+                mem_command(ftlpu::MemInstruction::Read(301, 3)),
+                ftlpu::IcuMacroSchedule {25, 3, 4, 10, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::MemAddress}),
+            encode_mem_stream_nd_command(
+                mem_command(ftlpu::MemInstruction::Read(400, 4)),
+                ftlpu::IcuMemStreamNdSchedule {
+                    50, 3, {3, 2, 2}, {2, 8, 24}, {1, 16, 64}}),
         }});
     program.queues.push_back(QueueProgram {
         QueueKind::MxmLoad, 0,
@@ -181,6 +205,17 @@ try {
             mxm_command(ftlpu::MxmControlInstruction::IW(0, 3)),
             ftlpu::IcuMacroSchedule {10, 3, 2, 1, 1, 1, 0,
                 ftlpu::IcuInductionTarget::MxmWeightColumn})}});
+    program.queues.push_back(QueueProgram {
+        QueueKind::MxmCompute, 1,
+        {encode_mxm_stream_nd_command(
+            mxm_command(ftlpu::MxmControlInstruction::Compute(
+                0, 0, 0, 4, 1,
+                ftlpu::MxmAccumulatorDestination::Stream,
+                ftlpu::MxmDataFormat::BFloat16, true,
+                ftlpu::MxmAccumulatorOutputFormat::BFloat16)),
+            ftlpu::IcuMxmStreamNdSchedule {
+                40, 3, {3, 2, 2}, {1, 8, 24}, {0, 4, 16},
+                ftlpu::IcuInductionTarget::MxmAccumulatorAddress})}});
     auto vxm = ftlpu::VxmLaneAluInstruction {
         ftlpu::VxmAluOpcode::Multiply,
         ftlpu::VxmLaneOperand::StreamBFloat16(),
@@ -209,6 +244,15 @@ try {
     const auto decodedMxm = std::find_if(decoded.queues.begin(),
         decoded.queues.end(), [](const QueueProgram& queue) {
             return queue.kind == QueueKind::MxmLoad && queue.index == 0;
+        });
+    const auto decodedMem = std::find_if(decoded.queues.begin(),
+        decoded.queues.end(), [](const QueueProgram& queue) {
+            return queue.kind == QueueKind::Mem && queue.index == 0;
+        });
+    const auto decodedMxmNd = std::find_if(decoded.queues.begin(),
+        decoded.queues.end(), [](const QueueProgram& queue) {
+            return queue.kind == QueueKind::MxmCompute
+                && queue.index == 1;
         });
     if (decodedMxm == decoded.queues.end()
         || decodedMxm->commands.size() != 1
@@ -252,6 +296,39 @@ try {
         || decodedMacro.induction_target
             != ftlpu::IcuInductionTarget::MxmWeightColumn)
         throw std::runtime_error("compact macro descriptor changed on disk");
+    if (decodedMem == decoded.queues.end())
+        throw std::runtime_error("MEM queue did not round-trip");
+    const auto decodedStream = std::find_if(decodedMem->commands.begin(),
+        decodedMem->commands.end(), is_mem_stream_nd_command);
+    if (decodedStream == decodedMem->commands.end())
+        throw std::runtime_error("MEM_STREAM_ND binary did not round-trip");
+    const auto stream = decode_mem_stream_nd_command(*decodedStream);
+    if (stream.start_cycle != 50 || stream.rank != 3
+        || stream.counts != std::array<std::size_t, 3> {3, 2, 2}
+        || stream.cycle_strides
+            != std::array<std::size_t, 3> {2, 8, 24}
+        || stream.operand_strides
+            != std::array<std::int64_t, 3> {1, 16, 64})
+        throw std::runtime_error(
+            "MEM_STREAM_ND descriptor changed on disk");
+    if (decodedMxmNd == decoded.queues.end()
+        || decodedMxmNd->commands.size() != 1
+        || !is_mxm_stream_nd_command(decodedMxmNd->commands[0]))
+        throw std::runtime_error(
+            "MXM_STREAM_ND binary did not round-trip");
+    const auto mxmStream =
+        decode_mxm_stream_nd_command(decodedMxmNd->commands[0]);
+    if (mxmStream.start_cycle != 40 || mxmStream.rank != 3
+        || mxmStream.counts
+            != std::array<std::size_t, 3> {3, 2, 2}
+        || mxmStream.cycle_strides
+            != std::array<std::size_t, 3> {1, 8, 24}
+        || mxmStream.operand_strides
+            != std::array<std::int64_t, 3> {0, 4, 16}
+        || mxmStream.induction_target
+            != ftlpu::IcuInductionTarget::MxmAccumulatorAddress)
+        throw std::runtime_error(
+            "MXM_STREAM_ND descriptor changed on disk");
 
     const auto path = std::filesystem::temp_directory_path()
         / "ftlpu_schedule_trace_weight_page_test.csv";
@@ -310,10 +387,10 @@ try {
         "\"repeat2d\",3,2,1,2,10,100,1,\"mem_address\",0");
     require_contains(trace,
         "24,25,\"MEM.E.Read\",\"slice=0 bank=0 addr=300 stream=E2\","
-        "\"repeat\",3,4,10,1,0,0,0,\"mem_address\",10");
+        "\"repeat\",3,4,10,1,1,0,0,\"mem_address\",0");
     require_contains(trace,
         "25,26,\"MEM.E.Read\",\"slice=0 bank=0 addr=301 stream=E3\","
-        "\"repeat\",3,4,10,1,0,0,0,\"mem_address\",10");
+        "\"repeat\",3,4,10,1,1,0,0,\"mem_address\",0");
     require_contains(trace,
         "0,7,\"VXM.C0\",\"mul depth=2 repeat=7\",\"single\","
         "1,0,0,1,0,0,0,\"none\",0");

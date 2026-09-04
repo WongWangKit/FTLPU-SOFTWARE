@@ -83,6 +83,24 @@ try {
             "runtime trace did not contain the actual page-ready stall");
     input.close();
 
+    RuntimeExecutionTrace segmented;
+    segmented.begin_segment(program, 100, false);
+    segmented.record_interval(0, 1, "Session.Invocation", "index=0");
+    segmented.begin_segment(program, 200, true);
+    segmented.record_interval(0, 1, "Session.Invocation", "index=1");
+    segmented.write_csv(path);
+    std::ifstream segmentedInput(path);
+    const std::string segmentedTrace {
+        std::istreambuf_iterator<char>(segmentedInput),
+        std::istreambuf_iterator<char>()};
+    if (segmentedTrace.find("100,101,\"Session.Invocation\"")
+            == std::string::npos
+        || segmentedTrace.find("200,201,\"Session.Invocation\"")
+            == std::string::npos)
+        throw std::runtime_error(
+            "runtime trace did not append cycle-offset segments");
+    segmentedInput.close();
+
     RuntimeExecutionTrace repeated;
     repeated.record_interval(10, 11, "MEM.E.Read", "slice=0 bank=0");
     repeated.record_interval(18, 19, "MEM.E.Read", "slice=0 bank=0");

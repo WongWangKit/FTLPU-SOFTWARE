@@ -21,7 +21,7 @@ def run_phase(name: str, command: list[str]) -> None:
 def compile_executables(
     *,
     opt: Path,
-    translate: Path,
+    compiler: Path,
     stablehlo: Path,
     target_configs: list[Path],
     output_dir: Path,
@@ -35,8 +35,8 @@ def compile_executables(
     for index, target_config in enumerate(target_configs):
         executable_dir = output_dir / "executables" / f"variant{index}"
         executable_dir.mkdir(parents=True, exist_ok=True)
+        stream_ir = executable_dir / "decoder_layer.stream.mlir"
         schedule_ir = executable_dir / "decoder_layer.schedule.mlir"
-        command_ir = executable_dir / "decoder_layer.command.mlir"
         binary = executable_dir / "decoder_layer.ftlpu"
         if reuse_executables and binary.is_file():
             print(
@@ -49,36 +49,42 @@ def compile_executables(
             ["--weight-bank", str(weight_banks[index])]
             if weight_banks[index] is not None else []
         )
+        common = [
+            "--ffn-schedule", ffn_schedule,
+            "--rmsnorm-strategy", rmsnorm_strategy,
+            "--mxm-execution", mxm_execution,
+            "--target-config", str(target_config),
+            "--icu-macro-schedule",
+        ] + weight_bank_args
         run_phase(
-            f"lower executable variant {index} to Schedule IR",
+            f"lower executable variant {index} to Stream IR",
             [
                 str(opt),
                 "--input", str(stablehlo),
-                "--output", str(schedule_ir),
-                "--pipeline", "ftlpu-stablehlo-to-schedule",
-                "--ffn-schedule", ffn_schedule,
-                "--rmsnorm-strategy", rmsnorm_strategy,
-                "--mxm-execution", mxm_execution,
-                "--target-config", str(target_config),
-            ] + weight_bank_args,
+                "--output", str(stream_ir),
+                "--pipeline", "ftlpu-stablehlo-to-stream",
+            ] + common,
         )
         run_phase(
-            f"lower executable variant {index} to Command IR",
+            f"lower executable variant {index} to compressed Schedule IR",
             [
                 str(opt),
-                "--input", str(schedule_ir),
-                "--output", str(command_ir),
-                "--pipeline", "ftlpu-schedule-to-commands",
-                "--target-config", str(target_config),
-            ],
+                "--input", str(stream_ir),
+                "--output", str(schedule_ir),
+                "--pipeline", "ftlpu-stream-to-compressed-schedule",
+            ] + common,
         )
         run_phase(
-            f"translate executable variant {index}",
+            f"compile executable variant {index}",
             [
-                str(translate),
-                "--input", str(command_ir),
+                str(compiler),
+                "--input", str(schedule_ir),
                 "--output", str(binary),
-            ],
+                "--input-stage", "schedule",
+                "--target-config", str(target_config),
+                "--mxm-execution", mxm_execution,
+                "--icu-macro-schedule",
+            ] + weight_bank_args,
         )
         executables.append(binary)
     return executables
@@ -96,8 +102,8 @@ def main() -> None:
         help="ftlpu_opt used to compile decoder executable variants",
     )
     parser.add_argument(
-        "--translate", type=Path,
-        help="ftlpu-translate used to serialize executable variants",
+        "--compile", type=Path,
+        help="ftlpu-compile used to serialize compressed schedules",
     )
     parser.add_argument(
         "--stablehlo", type=Path,
@@ -136,6 +142,10 @@ def main() -> None:
     parser.add_argument(
         "--pack-model-weights", type=Path,
         help="ftlpu-pack-model-weights used by --c2c-weight-paging",
+    )
+    parser.add_argument(
+        "--first-weight-page-bank", type=int, choices=(0, 1), default=0,
+        help="bank receiving the first layer's non-paged weight page",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -194,7 +204,7 @@ def main() -> None:
             "--pack-model-weights is required by --c2c-weight-paging"
         )
     compile_options = (
-        args.opt, args.translate, args.stablehlo, args.target_config
+        args.opt, args.compile, args.stablehlo, args.target_config
     )
     compile_requested = any(value for value in compile_options)
     if compile_requested:
@@ -202,9 +212,9 @@ def main() -> None:
             raise ValueError(
                 "--executable cannot be combined with compiler options"
             )
-        if not all((args.opt, args.translate, args.stablehlo)):
+        if not all((args.opt, args.compile, args.stablehlo)):
             raise ValueError(
-                "--opt, --translate, and --stablehlo are required when "
+                "--opt, --compile, and --stablehlo are required when "
                 "compiling executables"
             )
         if not args.target_config or len(args.target_config) not in (
@@ -221,7 +231,7 @@ def main() -> None:
         )
         executables = compile_executables(
             opt=args.opt,
-            translate=args.translate,
+            compiler=args.compile,
             stablehlo=args.stablehlo,
             target_configs=target_configs,
             output_dir=args.output_dir,
@@ -230,7 +240,10 @@ def main() -> None:
             mxm_execution=args.mxm_execution,
             reuse_executables=args.reuse_executables,
             weight_banks=(
-                list(range(required_executables)) if args.c2c_weight_paging
+                [
+                    1 - ((args.first_weight_page_bank + index) % 2)
+                    for index in range(required_executables)
+                ] if args.c2c_weight_paging
                 else [None] * required_executables
             ),
         )
@@ -331,7 +344,7 @@ def main() -> None:
                 str(args.pack_model_weights),
                 "--input", str(logical_output),
                 "--output", str(args.output),
-                "--first-bank", "0",
+                "--first-bank", str(args.first_weight_page_bank),
             ],
         )
         logical_output.unlink()

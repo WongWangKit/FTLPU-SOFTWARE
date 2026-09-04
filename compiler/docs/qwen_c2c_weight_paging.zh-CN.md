@@ -101,13 +101,17 @@ C2C receive 指令描述一段连续 SRAM row burst。runtime 按目标 slice �
 - `weight_page_builder_test`：bank1 host upload 与离线 page image 逐字节一致，并确认 bank0 未被写入。
 - `qwen_weight_page_builder_test`：按 Qwen2.5-1.5B 的 Q/K/V/O、两组 norm、gate/up/down 真实 shape 生成一层 47.625 MiB page，共 176 个连续 C2C segment，且所有 row 均位于单个 32768-row bank 内。
 - `qwen2_5_1_5b_paged_weight_layout_test`：从标准 StableHLO lower 到 Tensor/Stream IR，检查 bank、slice、row 范围和 head-dim 128 的 attention weight row 公式。
-- `build_hf_decoder_stack_paging_test`：检查通用 stack builder 是否编译 bank0/bank1
-  两个 variant、将连续层交替绑定到两个 variant，并调用离线 C2C page packing。
+- `build_hf_decoder_stack_paging_test`：检查通用 stack builder 是否经过 Stream IR
+  与压缩 Schedule IR、编译交替 bank variant、将连续层绑定到对应 variant，并调用
+  离线 C2C page packing。page 0 位于 bank0 时，variant 0 的 projection weight
+  使用 bank1，使激活和非分页 RMSNorm 权重位于 bank0；variant 1 采用相反布局。
 - `model_session_c2c_io_test`：把 32x1536 BF16 tensor 经 DDR、C2C 和 MEM 做
   往返，并检查不存在 host/MEM 旁路。
-- 真实 Qwen seq_len=32 双层 package 数值通过：49,152 个输出中 6 个容差超限点，
-  P99=0.25、MAE=0.06079；外部 upload/download 各 1 次，device alias 1 次，
-  device copy 0 次。
+- 当前真实 Qwen seq_len=32 双层 fused package 数值通过：49,152 个输出中 9 个
+  容差超限点，最大绝对误差 20、P99=0.3125、MAE=0.0604967；外部
+  upload/download 各 1 次，device alias 1 次，device copy 0 次。由于当前 LPU
+  Attention lowering 尚未表达 bias，reference 使用 `--ignore-attention-bias`
+  同样忽略 checkpoint 自带的 Q/K/V bias。
 
 部署包转换命令：
 
@@ -124,23 +128,24 @@ build-ftlpu-vs2026/runtime/ftlpu-pack-model-weights.exe `
 python compiler/tools/build_hf_decoder_stack.py `
   --model-dir .cache/hf/Qwen2.5-1.5B `
   --opt build-ftlpu-vs2026/compiler/ftlpu_opt.exe `
-  --translate build-ftlpu-vs2026/compiler/ftlpu-translate.exe `
-  --stablehlo compiler/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir `
+  --compile build-ftlpu-vs2026/compiler/ftlpu-compile.exe `
+  --stablehlo compiler/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir `
   --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
   --pack-model-weights build-ftlpu-vs2026/runtime/ftlpu-pack-model-weights.exe `
-  --c2c-weight-paging --layer-count 2 --seq-len 128 `
+  --c2c-weight-paging --layer-count 2 --seq-len 32 `
+  --mxm-execution vector --ffn-schedule fused --ignore-attention-bias `
   --output-dir build-ftlpu-vs2026/qwen_two_layer `
   --output build-ftlpu-vs2026/qwen_two_layer/qwen_two_layer.paged.ftlpum
 ```
 
-该命令使用同一套通用 decoder lowering 编译 bank0/bank1 两个 executable，导入连续
-两层 HF 权重并打包为交替 C2C page。`hidden.1` 在两层之间保持 device-resident，不回传
-host。数值验证使用 `hf_two_decoder_layers_model_session_test.exe`。
+该命令将同一套通用 decoder 从 StableHLO 依次 lower 到 Stream IR 和压缩
+Schedule IR，再直接生成两个 bank 专用 binary；随后导入连续两层 HF 权重并打包为
+交替 C2C page。`hidden.1` 在两层之间保持 device-resident，不回传 host。数值验证
+使用 `hf_two_decoder_layers_model_session_test.exe`。
 
 两层数值执行链路已经接通；提供本地 Qwen2.5-1.5B checkpoint 时即可生成并验证，
-checkpoint 本身不放入仓库。仍待解决的问题是 seq_len=128 整层 Command IR 的完全
-展开和文本打印超过十分钟；部署路径下一步应让 binary emitter 直接消费压缩
-Schedule/repeat 表示，避免物化巨型 Command MLIR 文本。
+checkpoint 本身不放入仓库。部署构建器现在让 `ftlpu-compile` 直接消费压缩
+Schedule/repeat 表示，不再物化旧的巨型 Command MLIR 文本。
 
 ## 性能判断
 
@@ -149,5 +154,7 @@ prefill 的单层计算窗口较长，具备隐藏下一层权重搬运的机会
 默认 8-lane C2C 每方向峰值为 256 bytes/cycle，但这不是持续源端速率。默认
 双通道 DDR4-3200 峰值为 51.2 GB/s，在 500 MHz LPU 下等于 102.4 bytes/cycle；
 planner 只按 90% 峰值规划，即 92.16 bytes/cycle。每个读请求的延迟还会在
-35..50 cycle 之间变化。当前真实 seq_len=32 双层运行测得 layer boundary page
-wait 为 4,750 cycle，因此搬运与计算确实发生了重叠，但还没有被完全隐藏。
+35..50 cycle 之间变化。当前 8192-row SRAM 配置配合 executable 内部 projection
+分页时，真实 seq_len=32 双层运行测得初始 page wait 为 425,380 cycle，layer
+boundary page wait 为 9,340 cycle；第二层搬运与第一层计算确实发生了重叠，但尚未
+完全隐藏。

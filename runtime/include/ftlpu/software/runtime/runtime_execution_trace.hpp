@@ -21,6 +21,8 @@ namespace ftlpu::software::runtime {
 class RuntimeExecutionTrace {
 public:
     void reset(const BinaryProgram& program);
+    void begin_segment(const BinaryProgram& program,
+        std::int64_t cycle_offset, bool append);
     void sample(TspSliceSystem& system, std::uint64_t physical_cycle,
         bool program_issue_enabled,
         const BinaryWeightPageUse* waiting_page = nullptr);
@@ -54,6 +56,7 @@ private:
     std::unordered_map<std::string, std::size_t> last_event_by_resource_{};
     std::size_t mxms_per_hemisphere_{1};
     std::size_t sequence_{0};
+    std::int64_t cycle_offset_{0};
 };
 
 } // namespace ftlpu::software::runtime

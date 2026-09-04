@@ -123,6 +123,9 @@ private:
     std::optional<std::uint32_t>
         ddr_peak_bandwidth_mbytes_per_second_override_{};
     bool executable_clock_active_{false};
+    bool execution_trace_enabled_{false};
+    bool execution_trace_has_segment_{false};
+    std::int64_t execution_trace_cycle_cursor_{0};
     ModelPackage package_{};
     SessionMemoryPlan memory_plan_{};
     ModelSessionStats stats_{};

@@ -26,9 +26,12 @@ bool issued(IcuQueueAction action)
     switch (action) {
     case IcuQueueAction::FunctionalIssue:
     case IcuQueueAction::RepeatIssue:
-    case IcuQueueAction::LoopIssue:
     case IcuQueueAction::Repeat2DIssue:
     case IcuQueueAction::MacroIssue:
+    case IcuQueueAction::MemStreamNdIssue:
+    case IcuQueueAction::MxmStreamNdIssue:
+    case IcuQueueAction::VxmStreamNdIssue:
+    case IcuQueueAction::SxmTileProgramIssue:
     case IcuQueueAction::SynchronizedIssue:
         return true;
     default:
@@ -123,10 +126,19 @@ std::string with_issue_pc(std::string detail, const Queue& queue)
 
 void RuntimeExecutionTrace::reset(const BinaryProgram& program)
 {
+    begin_segment(program, 0, false);
+}
+
+void RuntimeExecutionTrace::begin_segment(const BinaryProgram& program,
+    std::int64_t cycleOffset, bool append)
+{
     queues_.clear();
-    events_.clear();
     last_event_by_resource_.clear();
-    sequence_ = 0;
+    if (!append) {
+        events_.clear();
+        sequence_ = 0;
+    }
+    cycle_offset_ = cycleOffset;
     mxms_per_hemisphere_ = std::max<std::size_t>(
         1, program.hardware.mxms_per_hemisphere);
     for (const QueueProgram& queue : program.queues)
@@ -137,6 +149,8 @@ void RuntimeExecutionTrace::record_interval(std::int64_t startCycle,
     std::int64_t endCycle, std::string resource, std::string detail,
     std::size_t issueCount)
 {
+    startCycle += cycle_offset_;
+    endCycle += cycle_offset_;
     if (endCycle <= startCycle) return;
     // One display resource can contain many independently issuing queues.
     // Keep a separate run for each instruction detail so repeated MEM

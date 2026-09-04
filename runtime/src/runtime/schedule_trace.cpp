@@ -126,7 +126,7 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
                 << 32);
         auto instruction = isa::decode_mxm_instruction(encoded);
         auto target = induction_target;
-        // Repeat and Loop predate explicit induction targets. Preserve their
+        // Repeat predates explicit induction targets. Preserve its
         // opcode-selected MXM stride semantics while honoring the typed target
         // carried by Repeat2D and macro schedule commands.
         if (target == IcuInductionTarget::None && address_delta != 0) {
@@ -458,6 +458,107 @@ void write_schedule_trace_csv(const BinaryProgram& program,
         const QueueCommand* previous = nullptr;
         std::deque<std::pair<const QueueCommand*, std::size_t>> history;
         for (const auto& command : queue.commands) {
+            if (is_vxm_stream_nd_command(command)) {
+                const auto descriptor =
+                    decode_vxm_stream_nd_command(command);
+                const auto& stream = descriptor.schedule;
+                const auto depthCount = stream.rank > 2
+                    ? stream.counts[2] : std::size_t {1};
+                for (std::size_t depth = 0; depth < depthCount; ++depth) {
+                    const auto outerCount = stream.rank > 1
+                        ? stream.counts[1] : std::size_t {1};
+                    const auto outerInterval = stream.rank > 1
+                        ? stream.cycle_strides[1] : std::size_t {1};
+                    write_pattern(output, queue, descriptor.instruction,
+                        stream.start_cycle
+                            + depth * stream.cycle_strides[2],
+                        program.hardware.mxms_per_hemisphere,
+                        program.hardware.sram_depth_rows,
+                        {outerCount > 1 ? "repeat2d"
+                                : stream.counts[0] > 1
+                                ? "repeat" : "single",
+                            stream.counts[0],
+                            stream.cycle_strides[0], 0,
+                            outerCount, outerInterval, 0, false,
+                            IcuInductionTarget::None, 0});
+                }
+                std::size_t finalCycle = stream.start_cycle;
+                for (std::size_t dimension = 0;
+                     dimension < stream.rank; ++dimension)
+                    finalCycle += (stream.counts[dimension] - 1)
+                        * stream.cycle_strides[dimension];
+                cursor = std::max(cursor, finalCycle + 1);
+                continue;
+            }
+            if (is_sxm_tile_program_command(command)) {
+                const auto tile = decode_sxm_tile_program_command(command);
+                const auto& stream = tile.schedule;
+                const auto depthCount = stream.rank > 2
+                    ? stream.counts[2] : std::size_t {1};
+                for (std::size_t depth = 0; depth < depthCount; ++depth) {
+                    const auto outerCount = stream.rank > 1
+                        ? stream.counts[1] : std::size_t {1};
+                    const auto outerInterval = stream.rank > 1
+                        ? stream.cycle_strides[1] : std::size_t {1};
+                    write_pattern(output, queue, tile.instruction,
+                        stream.start_cycle
+                            + depth * stream.cycle_strides[2],
+                        program.hardware.mxms_per_hemisphere,
+                        program.hardware.sram_depth_rows,
+                        {outerCount > 1 ? "repeat2d"
+                                : stream.counts[0] > 1
+                                ? "repeat" : "single",
+                            stream.counts[0],
+                            stream.cycle_strides[0], 0,
+                            outerCount, outerInterval, 0, false,
+                            IcuInductionTarget::None, 0});
+                }
+                std::size_t finalCycle = stream.start_cycle;
+                for (std::size_t dimension = 0;
+                     dimension < stream.rank; ++dimension)
+                    finalCycle += (stream.counts[dimension] - 1)
+                        * stream.cycle_strides[dimension];
+                cursor = std::max(cursor, finalCycle + 1);
+                continue;
+            }
+            if (is_mem_stream_nd_command(command)
+                || is_mxm_stream_nd_command(command)) {
+                const auto stream = is_mem_stream_nd_command(command)
+                    ? decode_mem_stream_nd_command(command)
+                    : decode_mxm_stream_nd_command(command);
+                const auto depthCount = stream.rank > 2
+                    ? stream.counts[2] : std::size_t {1};
+                for (std::size_t depth = 0; depth < depthCount; ++depth) {
+                    const auto outerCount = stream.rank > 1
+                        ? stream.counts[1] : std::size_t {1};
+                    const auto outerInterval = stream.rank > 1
+                        ? stream.cycle_strides[1] : std::size_t {1};
+                    const auto outerStride = stream.rank > 1
+                        ? stream.operand_strides[1] : std::int64_t {0};
+                    write_pattern(output, queue, command,
+                        stream.start_cycle
+                            + depth * stream.cycle_strides[2],
+                        program.hardware.mxms_per_hemisphere,
+                        program.hardware.sram_depth_rows,
+                        {outerCount > 1 ? "repeat2d"
+                                : stream.counts[0] > 1
+                                ? "repeat" : "single",
+                            stream.counts[0],
+                            stream.cycle_strides[0],
+                            stream.operand_strides[0], outerCount,
+                            outerInterval, outerStride, false,
+                            stream.induction_target,
+                            static_cast<std::int64_t>(depth)
+                                * stream.operand_strides[2]});
+                }
+                std::size_t finalCycle = stream.start_cycle;
+                for (std::size_t dimension = 0;
+                     dimension < stream.rank; ++dimension)
+                    finalCycle += (stream.counts[dimension] - 1)
+                        * stream.cycle_strides[dimension];
+                cursor = std::max(cursor, finalCycle + 1);
+                continue;
+            }
             if (is_macro_schedule_command(command)) {
                 const auto macro = decode_macro_schedule_command(command);
                 write_pattern(output, queue, command, macro.start_cycle,
@@ -513,26 +614,6 @@ void write_schedule_trace_csv(const BinaryProgram& program,
                             repeat.address_stride});
                     cursor = last + 1;
                 }
-                continue;
-            }
-            if (opcode == isa::IcuCommandOpcode::Loop) {
-                const auto loop = isa::decode_icu_loop(command.command);
-                if (loop.window_size > history.size())
-                    throw std::logic_error(
-                        "runtime trace found Loop with an invalid window");
-                const auto first = history.end() - loop.window_size;
-                std::size_t offset = 0;
-                for (auto item = first; item != history.end();
-                     ++item, ++offset)
-                    write_pattern(output, queue, *item->first,
-                        cursor + offset, program.hardware.mxms_per_hemisphere,
-                        program.hardware.sram_depth_rows,
-                        {"repeat", loop.count, loop.interval,
-                            loop.address_stride, 1, 0, 0, false,
-                            IcuInductionTarget::None,
-                            loop.address_stride});
-                cursor += (loop.count - 1) * loop.interval
-                    + loop.window_size;
                 continue;
             }
             if (opcode != isa::IcuCommandOpcode::Instruction)

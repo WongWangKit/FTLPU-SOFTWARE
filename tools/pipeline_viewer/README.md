@@ -13,6 +13,11 @@ kinds of CSV trace:
 Open `index.html` and load either format. Performance and pipeline validation
 should use the runtime execution trace.
 
+For a multi-invocation `ModelSession`, runtime segments are appended on one
+session-wide physical-cycle axis. `Session.Invocation` marks each executable;
+`C2C.ModelWeightPage`, `C2C.HostInput`, and `C2C.HostOutput` retain transfer
+time outside an executable's local ICU cycle counter.
+
 The original four-column CSV remains supported:
 
 ```csv

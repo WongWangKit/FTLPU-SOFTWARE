@@ -37,6 +37,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/command_mxm_column_binary_test.cpp
     tests/runtime/command_vxm_binary_runtime_test.cpp
     tests/runtime/sxm_binary_roundtrip_test.cpp
+    tests/runtime/vxm_stream_nd_binary_test.cpp
     tests/runtime/compiled_sxm_command_runtime_test.cpp
     tests/runtime/compiled_queue_program_runtime_test.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
@@ -169,6 +170,14 @@ add_test(
     NAME sxm_binary_roundtrip_test
     COMMAND $<TARGET_FILE:sxm_binary_roundtrip_test>
         ${CMAKE_CURRENT_BINARY_DIR}/test-output/sxm-v16.ftlpu)
+
+add_executable(vxm_stream_nd_binary_test
+    tests/runtime/vxm_stream_nd_binary_test.cpp)
+target_link_libraries(vxm_stream_nd_binary_test PRIVATE ftlpu_software)
+add_test(
+    NAME vxm_stream_nd_binary_test
+    COMMAND $<TARGET_FILE:vxm_stream_nd_binary_test>
+        ${CMAKE_CURRENT_BINARY_DIR}/test-output/vxm-stream-nd.ftlpu)
 
 add_executable(model_package_roundtrip_test
     tests/runtime/model_package_roundtrip_test.cpp)

@@ -96,7 +96,16 @@ try {
                     == ftlpu::software::runtime::QueueKind::MxmDequant;
             if (!macroQueue) continue;
             for (const auto& command : queue.commands) {
-                if (!ftlpu::software::runtime::is_macro_schedule_command(
+                const bool coarseMem = queue.kind
+                        == ftlpu::software::runtime::QueueKind::Mem
+                    && ftlpu::software::runtime::is_mem_stream_nd_command(
+                        command);
+                const bool coarseMxm = queue.kind
+                        != ftlpu::software::runtime::QueueKind::Mem
+                    && ftlpu::software::runtime::is_mxm_stream_nd_command(
+                        command);
+                if (!coarseMem && !coarseMxm
+                    && !ftlpu::software::runtime::is_macro_schedule_command(
                         command))
                     throw std::logic_error(
                         "macro FFN contains a fine-grained MEM/MXM command");

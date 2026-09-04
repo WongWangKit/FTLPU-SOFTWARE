@@ -38,6 +38,36 @@ std::size_t issued_commands(const QueueProgram& queue)
     std::size_t issued = 0;
     std::size_t prior_instructions = 0;
     for (const auto& command : queue.commands) {
+        if (is_vxm_stream_nd_command(command)) {
+            const auto stream = decode_vxm_stream_nd_command(command);
+            std::size_t points = 1;
+            for (std::size_t dimension = 0;
+                 dimension < stream.schedule.rank; ++dimension)
+                points *= stream.schedule.counts[dimension];
+            issued += points;
+            continue;
+        }
+        if (is_sxm_tile_program_command(command)) {
+            const auto tile = decode_sxm_tile_program_command(command);
+            std::size_t points = 1;
+            for (std::size_t dimension = 0;
+                 dimension < tile.schedule.rank; ++dimension)
+                points *= tile.schedule.counts[dimension];
+            issued += points;
+            continue;
+        }
+        if (is_mem_stream_nd_command(command)
+            || is_mxm_stream_nd_command(command)) {
+            const auto stream = is_mem_stream_nd_command(command)
+                ? decode_mem_stream_nd_command(command)
+                : decode_mxm_stream_nd_command(command);
+            std::size_t points = 1;
+            for (std::size_t dimension = 0;
+                 dimension < stream.rank; ++dimension)
+                points *= stream.counts[dimension];
+            issued += points;
+            continue;
+        }
         if (is_macro_schedule_command(command)) {
             const auto macro = decode_macro_schedule_command(command);
             issued += macro.inner_count * macro.outer_count;
@@ -58,14 +88,9 @@ std::size_t issued_commands(const QueueProgram& queue)
             continue;
         }
         if (opcode == isa::IcuCommandOpcode::Nop) continue;
-        if (opcode == isa::IcuCommandOpcode::Loop) {
-            const auto loop = isa::decode_icu_loop(command.command);
-            if (loop.window_size > prior_instructions)
-                throw std::logic_error(
-                    "runtime performance found Loop with an invalid window");
-            issued += loop.window_size * loop.count;
-            continue;
-        }
+        if (opcode != isa::IcuCommandOpcode::Repeat)
+            throw std::logic_error(
+                "runtime performance found unsupported ICU extension");
         if (prior_instructions == 0)
             throw std::logic_error("runtime performance found Repeat without instruction");
         issued += isa::decode_icu_repeat(command.command).count;

@@ -133,13 +133,18 @@ scales with segments rather than 32-byte vectors.
 - `qwen_weight_page_builder_test` packs the real Qwen2.5-1.5B Q/K/V/O, two norm, and gate/up/down shapes into one 47.625 MiB page with 176 contiguous C2C segments; every row stays within one 32768-row bank.
 - `qwen2_5_1_5b_paged_weight_layout_test` lowers standard StableHLO through Tensor and Stream IR and checks bank, slice, row ranges, including the head-dimension-128 attention weight formula.
 - `build_hf_decoder_stack_paging_test` checks that the generic stack builder
-  compiles bank-0/bank-1 variants, assigns consecutive layers to alternating
-  variants, and invokes offline C2C page packing.
+  lowers through Stream IR and compressed Schedule IR, compiles alternating
+  bank variants, assigns consecutive layers to them, and invokes offline C2C
+  page packing. With page 0 in bank 0, variant 0 uses projection weight bank 1
+  so its activation and non-paged RMSNorm weights reside in bank 0; variant 1
+  uses the opposite placement.
 - `model_session_c2c_io_test` round-trips a 32x1536 BF16 tensor through DDR,
   C2C, and MEM and rejects a host/MEM bypass.
-- The real two-layer Qwen seq-len-32 package passes with 6/49,152 tolerance
-  outliers, P99 0.25, and MAE 0.06079. It performs one external upload, one
-  external download, one device alias, and zero device copies.
+- The current real two-layer Qwen seq-len-32 fused package passes with
+  9/49,152 tolerance outliers, maximum absolute error 20, P99 0.3125, and MAE
+  0.0604967. It performs one external upload, one external download, one
+  device alias, and zero device copies. The reference deliberately omits the
+  checkpoint's Q/K/V biases because bias lowering is not implemented yet.
 
 Convert a logical package with:
 
@@ -156,27 +161,27 @@ Build a two-layer Qwen package directly from a local Hugging Face checkpoint:
 python compiler/tools/build_hf_decoder_stack.py `
   --model-dir .cache/hf/Qwen2.5-1.5B `
   --opt build-ftlpu-vs2026/compiler/ftlpu_opt.exe `
-  --translate build-ftlpu-vs2026/compiler/ftlpu-translate.exe `
-  --stablehlo compiler/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq128.stablehlo.mlir `
+  --compile build-ftlpu-vs2026/compiler/ftlpu-compile.exe `
+  --stablehlo compiler/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir `
   --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
   --pack-model-weights build-ftlpu-vs2026/runtime/ftlpu-pack-model-weights.exe `
-  --c2c-weight-paging --layer-count 2 --seq-len 128 `
+  --c2c-weight-paging --layer-count 2 --seq-len 32 `
+  --mxm-execution vector --ffn-schedule fused --ignore-attention-bias `
   --output-dir build-ftlpu-vs2026/qwen_two_layer `
   --output build-ftlpu-vs2026/qwen_two_layer/qwen_two_layer.paged.ftlpum
 ```
 
-The command compiles bank-0 and bank-1 variants of the same generic decoder
-lowering, imports consecutive HF layers, packs alternating C2C pages, and
-keeps `hidden.1` device-resident between the two invocations. Run the numerical
+The command lowers the same generic decoder through StableHLO, Stream IR, and
+compressed Schedule IR, then directly emits two bank-specialized binaries.
+It imports consecutive HF layers, packs alternating C2C pages, and keeps
+`hidden.1` device-resident between the two invocations. Run the numerical
 package with `hf_two_decoder_layers_model_session_test.exe`.
 
-The two-layer numerical path is now wired and checked whenever a local
+The two-layer numerical path is wired and checked whenever a local
 Qwen2.5-1.5B checkpoint is supplied; the checkpoint itself is intentionally not
-stored in this repository. A remaining issue is compilation performance: fully
-expanding and printing the sequence-length-128 layer Command IR takes over ten
-minutes. The deployment path should next let the binary emitter consume
-compressed Schedule/repeat representation directly, without materializing
-giant textual Command MLIR.
+stored in this repository. The deployment builder now feeds compressed
+Schedule/repeat representation directly to `ftlpu-compile` and no longer
+materializes the legacy giant textual Command MLIR.
 
 Prefill has a long enough compute window to hide much of the next-layer transfer. `M=1` decode has a short compute window and will generally be DDR/C2C-bandwidth bound when tens of MiB are loaded per layer. Double buffering enables overlap but cannot remove that bandwidth lower bound; decode will need higher link bandwidth, projection/wave-granular prefetch, or more resident capacity.
 
@@ -184,5 +189,7 @@ The default eight-lane C2C peak is 256 bytes/cycle per direction, but it is not
 the sustained source rate. The default dual-channel DDR4-3200 model peaks at
 51.2 GB/s = 102.4 bytes per 500 MHz LPU cycle, and the planner reserves only
 90% of it: 92.16 bytes/cycle. Request-level read latency varies from 35 to 50
-cycles. The current real two-layer seq-len-32 run therefore records a 4,750
-cycle layer-boundary page wait; the overlap is real but not yet complete.
+cycles. With the current 8192-row SRAM target and executable-internal
+projection paging, the real two-layer seq-len-32 run records 425,380 initial
+page-wait cycles and 9,340 layer-boundary page-wait cycles. The second-layer
+transfer overlaps the first layer's execution, but is not completely hidden.

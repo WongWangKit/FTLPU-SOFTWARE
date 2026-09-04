@@ -30,13 +30,12 @@ try {
     bool sawDequant = false;
     bool sawInt8Load = false;
     bool sawCompute = false;
-    bool sawLoop = false;
+    std::size_t materializedLoopReplays = 0;
     bool sawRepeat2D = false;
     bool sawMxmAccumulatorRepeat2D = false;
     bool sawInterleavedRepeat2D = false;
     bool sawInterleavedInnerStride = false;
     bool sawRepeatedLoopCandidate = false;
-    bool sawExpandedRepeatedLoopCandidate = false;
     std::size_t loopQueueCommands = 0;
     std::size_t repeat2DQueueCommands = 0;
     for (const QueueProgram& queue : program.queues) {
@@ -70,23 +69,6 @@ try {
                     && repeat.outer_stride == 16
                     && repeat.induction_target
                         == IcuInductionTarget::MemAddress;
-                continue;
-            }
-            if (isa::decode_icu_command_opcode(command.command)
-                == isa::IcuCommandOpcode::Loop) {
-                const auto loop = isa::decode_icu_loop(command.command);
-                sawExpandedRepeatedLoopCandidate |=
-                    queue.kind == QueueKind::Mem && queue.index == 8
-                    && loop.window_size == 1 && loop.count == 2
-                    && loop.interval == 1 && loop.address_stride == 1;
-                sawInterleavedInnerStride |=
-                    queue.kind == QueueKind::Mem && queue.index == 6
-                    && loop.window_size == 1 && loop.count == 3
-                    && loop.interval == 1 && loop.address_stride == 1;
-                sawLoop |= queue.kind == QueueKind::Mem
-                    && queue.index == 2 && loop.window_size == 3
-                    && loop.count == 2 && loop.interval == 5
-                    && loop.address_stride == 16;
                 continue;
             }
             if (isa::decode_icu_command_opcode(command.command)
@@ -127,6 +109,14 @@ try {
                     && instruction.opcode == MemOpcode::Write
                     && instruction.address == 20
                     && instruction.stream == 32;
+                if (queue.index == 2
+                    && instruction.opcode == MemOpcode::Read
+                    && ((instruction.address >= 116
+                            && instruction.address <= 118)
+                        || (instruction.address >= 132
+                            && instruction.address <= 134))) {
+                    ++materializedLoopReplays;
+                }
             } else if (command.instruction_kind
                 == InstructionKind::MxmDequant) {
                 const auto instruction =
@@ -163,9 +153,10 @@ try {
         "MXM dequant scale relocation was not preserved");
     require(sawInt8Load, "MXM INT8 dequant load mode was not preserved");
     require(sawCompute, "MXM compute command was not preserved");
-    require(sawLoop, "multi-instruction ICU Loop was not preserved");
-    require(loopQueueCommands == 4,
-        "ICU Loop was expanded instead of encoded as one control command");
+    require(materializedLoopReplays == 6,
+        "legacy Command IR Loop was not materialized correctly");
+    require(loopQueueCommands == 10,
+        "materialized Command IR Loop has an unexpected queue size");
     require(sawRepeat2D, "ICU Repeat2D descriptor was not preserved");
     require(sawMxmAccumulatorRepeat2D,
         "MXM accumulator-address Repeat2D descriptor was not preserved");
@@ -175,8 +166,8 @@ try {
         "interleaved outer waves cannot use blocking ICU Repeat2D");
     require(sawInterleavedInnerStride,
         "expanding interleaved outer waves lost the inner MEM address stride");
-    require(sawRepeatedLoopCandidate || sawExpandedRepeatedLoopCandidate,
-        "Loop compression lost a command's inner repeat space");
+    require(sawRepeatedLoopCandidate,
+        "Repeat encoding lost a command's inner repeat space");
 
     InstructionControlUnit icu;
     load_queue_programs_into_icu(program.queues, icu,

@@ -467,6 +467,126 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
         validate_queue_index(queue.kind, queue_index);
         for (std::size_t command_index = 0; command_index < queue.commands.size(); ++command_index) {
             const auto& command = queue.commands[command_index];
+            if (is_vxm_stream_nd_command(command)) {
+                if (queue.kind != QueueKind::Vxm)
+                    throw std::logic_error(
+                        "VXM_STREAM_ND must target a VXM queue");
+                const auto descriptor =
+                    decode_vxm_stream_nd_command(command);
+                const VxmCompactInstruction instruction {
+                    static_cast<std::uint64_t>(
+                        descriptor.instruction.words[0])
+                        | (static_cast<std::uint64_t>(
+                               descriptor.instruction.words[1])
+                            << 32),
+                    descriptor.instruction.words[2]};
+                icu.enqueue_vxm_stream_nd(queue_index,
+                    descriptor.schedule, instruction);
+                continue;
+            }
+            if (is_sxm_tile_program_command(command)) {
+                if (queue.kind != QueueKind::SxmTranspose
+                    && queue.kind != QueueKind::SxmPermute)
+                    throw std::logic_error(
+                        "SXM_TILE_PROGRAM must target an SXM queue");
+                const auto descriptor =
+                    decode_sxm_tile_program_command(command);
+                auto instruction = decode_sxm_command(
+                    descriptor.instruction);
+                const auto side = static_cast<Hemisphere>(queue_index);
+                if (queue.kind == QueueKind::SxmTranspose) {
+                    if (instruction.opcode != SxmOpcode::Transpose)
+                        throw std::logic_error(
+                            "SXM transpose tile program carries a non-transpose instruction");
+                    icu.enqueue_sxm_transpose_tile_program(side,
+                        descriptor.schedule, std::move(instruction));
+                } else {
+                    if (instruction.opcode != SxmOpcode::Permute)
+                        throw std::logic_error(
+                            "SXM permute tile program carries a non-permute instruction");
+                    icu.enqueue_sxm_permute_tile_program(side,
+                        descriptor.schedule, std::move(instruction));
+                }
+                continue;
+            }
+            if (is_mem_stream_nd_command(command)) {
+                if (queue.kind != QueueKind::Mem
+                    || command.word_count < 1 || command.word_count > 2)
+                    throw std::logic_error(
+                        "MEM_STREAM_ND must target a MEM queue and carry one or two MEM words");
+                const auto encoded =
+                    static_cast<isa::EncodedMemInstruction>(command.words[0])
+                    | (static_cast<isa::EncodedMemInstruction>(
+                           command.words[1])
+                        << 32);
+                icu.enqueue_mem_stream_nd(queue_index,
+                    decode_mem_stream_nd_command(command),
+                    isa::decode_mem_instruction(encoded));
+                continue;
+            }
+            if (is_mxm_stream_nd_command(command)) {
+                const auto schedule = decode_mxm_stream_nd_command(command);
+                try {
+                    if (queue.kind == QueueKind::MxmDequant) {
+                        if (command.instruction_kind
+                                != InstructionKind::MxmDequant
+                            || command.word_count != 1)
+                            throw std::logic_error(
+                                "MXM dequant STREAM_ND must carry one scale word");
+                        icu.enqueue_mxm_dequant_stream_nd(queue_index,
+                            schedule,
+                            isa::decode_mxm_dequant_instruction(
+                                static_cast<
+                                    isa::EncodedMxmDequantInstruction>(
+                                    command.words[0])));
+                    } else {
+                        if ((queue.kind != QueueKind::MxmLoad
+                                && queue.kind != QueueKind::MxmCompute)
+                            || command.instruction_kind
+                                != InstructionKind::Mxm
+                            || command.word_count < 1
+                            || command.word_count > 2)
+                            throw std::logic_error(
+                                "MXM_STREAM_ND must target an MXM queue and carry one or two MXM words");
+                        const auto encoded =
+                            static_cast<isa::EncodedMxmInstruction>(
+                                command.words[0])
+                            | (static_cast<isa::EncodedMxmInstruction>(
+                                   command.words[1])
+                                << 32);
+                        const auto instruction =
+                            isa::decode_mxm_instruction(encoded);
+                        validate_mxm_queue_opcode(
+                            queue.kind, queue_index, instruction);
+                        if (queue.kind == QueueKind::MxmLoad)
+                            icu.enqueue_mxm_load_stream_nd(
+                                queue_index, schedule, instruction);
+                        else
+                            icu.enqueue_mxm_compute_stream_nd(
+                                queue_index, schedule, instruction);
+                    }
+                } catch (const std::exception& error) {
+                    std::ostringstream message;
+                    message << error.what() << "; queue_kind="
+                            << static_cast<int>(queue.kind)
+                            << ", queue_index=" << queue.index
+                            << ", command_index=" << command_index
+                            << ", rank=" << schedule.rank << ", counts=";
+                    for (std::size_t dimension = 0;
+                         dimension < schedule.rank; ++dimension) {
+                        if (dimension != 0) message << 'x';
+                        message << schedule.counts[dimension];
+                    }
+                    message << ", cycle_strides=";
+                    for (std::size_t dimension = 0;
+                         dimension < schedule.rank; ++dimension) {
+                        if (dimension != 0) message << ',';
+                        message << schedule.cycle_strides[dimension];
+                    }
+                    throw std::logic_error(message.str());
+                }
+                continue;
+            }
             if (is_macro_schedule_command(command)) {
                 const auto schedule = decode_macro_schedule_command(command);
                 switch (queue.kind) {
@@ -622,46 +742,6 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                         repeat.count, repeat.interval);
                     break;
                 }
-                continue;
-            }
-
-            if (opcode == isa::IcuCommandOpcode::Loop) {
-                const auto loop = isa::decode_icu_loop(command.command);
-                IcuLocation location;
-                switch (queue.kind) {
-                case QueueKind::Mem:
-                    location = IcuLocation::Mem(
-                        static_cast<Hemisphere>(queue_index
-                            / InstructionControlUnit::kMemQueuesPerHemisphere),
-                        (queue_index
-                            % InstructionControlUnit::kMemQueuesPerHemisphere)
-                            / hw::kMemBanksPerSlice,
-                        queue_index % hw::kMemBanksPerSlice);
-                    break;
-                case QueueKind::MxmLoad:
-                    location = IcuLocation::MxmLoad(queue_index);
-                    break;
-                case QueueKind::MxmCompute:
-                    location = IcuLocation::MxmCompute(queue_index);
-                    break;
-                case QueueKind::MxmDequant:
-                    location = IcuLocation::MxmDequant(queue_index);
-                    break;
-                case QueueKind::Vxm:
-                    location = IcuLocation::Vxm(queue_index);
-                    break;
-                case QueueKind::SxmTranspose:
-                    location = IcuLocation::Sxm(
-                        static_cast<Hemisphere>(queue_index), 0);
-                    break;
-                case QueueKind::SxmPermute:
-                    location = IcuLocation::Sxm(
-                        static_cast<Hemisphere>(queue_index), 1);
-                    break;
-                }
-                icu.enqueue_control(location, IcuControlInstruction::Loop(
-                    loop.window_size, loop.count, loop.interval,
-                    loop.address_stride));
                 continue;
             }
 

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -32,6 +33,9 @@ try {
     auto system = std::make_unique<ftlpu::C2cDmaSystem>();
     ModelSession session(*system);
     session.load_file(std::filesystem::path(argv[1]));
+    const char* tracePath = std::getenv("FTLPU_QWEN_PIPELINE_CSV");
+    if (tracePath != nullptr)
+        session.enable_execution_trace();
     const bool invocationPaged = !session.package().weight_pages.empty();
     const bool executablePaged = std::any_of(
         session.package().executables.begin(),
@@ -64,6 +68,8 @@ try {
 
     session.set_input("hidden.0", session.value("golden.input"));
     session.run();
+    if (tracePath != nullptr)
+        session.write_execution_trace_csv(tracePath);
 
     const ModelSessionStats& stats = session.stats();
     const auto expectedHostDownloads = static_cast<std::size_t>(std::count_if(
