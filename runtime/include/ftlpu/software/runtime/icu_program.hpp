@@ -3,6 +3,7 @@
 #include "ftlpu/core/instruction_codec.hpp"
 #include "ftlpu/system/icu.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +45,7 @@ struct QueueCommand {
 
 inline constexpr std::uint32_t kIcuMacroScheduleMagic = 0x4d414352u;
 inline constexpr std::uint32_t kIcuMemStreamNdMagic = 0x4d534e44u;
+inline constexpr std::uint32_t kIcuMemSliceProgramMagic = 0x4d535047u;
 inline constexpr std::uint32_t kIcuMxmStreamNdMagic = 0x4d584e44u;
 inline constexpr std::uint32_t kIcuVxmStreamNdMagic = 0x56534e44u;
 inline constexpr std::uint32_t kIcuSxmTileProgramMagic = 0x53545047u;
@@ -166,6 +168,153 @@ inline QueueCommand encode_mem_stream_nd_command(
                 schedule.operand_strides[dimension]));
     }
     return instruction;
+}
+
+inline bool is_mem_slice_program_command(const QueueCommand& command)
+{
+    if (command.instruction_kind != InstructionKind::Mem
+        || command.word_count != 0
+        || isa::decode_icu_command_opcode(command.command)
+            != isa::IcuCommandOpcode::Extended
+        || command.extension_words.size() < 17
+        || command.extension_words[0] != kIcuMemSliceProgramMagic
+        || command.extension_words[1] != 1)
+        return false;
+    const auto bodyCount = command.extension_words[4];
+    return bodyCount != 0
+        && bodyCount <= IcuMemSliceProgram::kMaxBodyEntries
+        && command.extension_words.size() == 11 + bodyCount * 6;
+}
+
+inline IcuMemSliceProgram decode_mem_slice_program_command(
+    const QueueCommand& command)
+{
+    if (!is_mem_slice_program_command(command))
+        throw std::logic_error(
+            "queue command is not MEM_SLICE_PROGRAM");
+
+    IcuMemSliceProgram program;
+    program.schedule.start_cycle = command.extension_words[2];
+    program.schedule.rank = command.extension_words[3];
+    for (std::size_t dimension = 0;
+         dimension < IcuStreamNdSchedule::kMaxRank; ++dimension) {
+        const auto offset = 5 + dimension * 2;
+        program.schedule.counts[dimension] =
+            command.extension_words[offset];
+        program.schedule.cycle_strides[dimension] =
+            command.extension_words[offset + 1];
+    }
+    program.schedule.operand_strides = {0, 0, 0};
+    program.schedule.induction_target = IcuInductionTarget::None;
+    validate_stream_nd_iteration_space(
+        program.schedule, "MEM_SLICE_PROGRAM");
+
+    const auto bodyCount = command.extension_words[4];
+    program.body.reserve(bodyCount);
+    for (std::size_t index = 0; index < bodyCount; ++index) {
+        const auto offset = 11 + index * 6;
+        const auto encoded =
+            static_cast<isa::EncodedMemInstruction>(
+                command.extension_words[offset + 4])
+            | (static_cast<isa::EncodedMemInstruction>(
+                   command.extension_words[offset + 5])
+                << 32);
+        IcuMemSliceProgramEntry entry;
+        entry.cycle_offset = command.extension_words[offset];
+        for (std::size_t dimension = 0;
+             dimension < IcuStreamNdSchedule::kMaxRank; ++dimension)
+            entry.operand_strides[dimension] =
+                static_cast<std::int32_t>(
+                    command.extension_words[offset + 1 + dimension]);
+        entry.instruction = isa::decode_mem_instruction(encoded);
+
+        auto bodySchedule = program.schedule;
+        if (entry.cycle_offset
+            > std::numeric_limits<std::size_t>::max()
+                - bodySchedule.start_cycle)
+            throw std::overflow_error(
+                "MEM_SLICE_PROGRAM body start cycle overflows");
+        bodySchedule.start_cycle += entry.cycle_offset;
+        bodySchedule.operand_strides = entry.operand_strides;
+        bodySchedule.induction_target = IcuInductionTarget::MemAddress;
+        validate_stream_nd_iteration_space(
+            bodySchedule, "MEM_SLICE_PROGRAM body");
+        program.body.push_back(std::move(entry));
+    }
+    return program;
+}
+
+inline QueueCommand encode_mem_slice_program_command(
+    const IcuMemSliceProgram& program)
+{
+    const auto fits_u32 = [](std::size_t value) {
+        return value <= std::numeric_limits<std::uint32_t>::max();
+    };
+    const auto fits_i32 = [](std::int64_t value) {
+        return value >= std::numeric_limits<std::int32_t>::min()
+            && value <= std::numeric_limits<std::int32_t>::max();
+    };
+    if (program.body.empty()
+        || program.body.size() > IcuMemSliceProgram::kMaxBodyEntries)
+        throw std::invalid_argument(
+            "MEM_SLICE_PROGRAM body must contain between one and sixteen entries");
+    if (!fits_u32(program.schedule.start_cycle)
+        || program.schedule.rank == 0
+        || program.schedule.rank > IcuStreamNdSchedule::kMaxRank
+        || program.schedule.induction_target != IcuInductionTarget::None
+        || std::any_of(program.schedule.operand_strides.begin(),
+            program.schedule.operand_strides.end(),
+            [](std::int64_t stride) { return stride != 0; }))
+        throw std::invalid_argument(
+            "MEM_SLICE_PROGRAM has an invalid launch domain");
+    validate_stream_nd_iteration_space(
+        program.schedule, "MEM_SLICE_PROGRAM");
+
+    QueueCommand command;
+    command.command = static_cast<isa::EncodedIcuCommand>(
+        isa::IcuCommandOpcode::Extended);
+    command.instruction_kind = InstructionKind::Mem;
+    command.extension_words = {
+        kIcuMemSliceProgramMagic,
+        1,
+        static_cast<std::uint32_t>(program.schedule.start_cycle),
+        static_cast<std::uint32_t>(program.schedule.rank),
+        static_cast<std::uint32_t>(program.body.size()),
+    };
+    for (std::size_t dimension = 0;
+         dimension < IcuStreamNdSchedule::kMaxRank; ++dimension) {
+        if (program.schedule.counts[dimension] == 0
+            || program.schedule.cycle_strides[dimension] == 0
+            || !fits_u32(program.schedule.counts[dimension])
+            || !fits_u32(program.schedule.cycle_strides[dimension]))
+            throw std::invalid_argument(
+                "MEM_SLICE_PROGRAM dimension does not fit the binary descriptor");
+        command.extension_words.push_back(
+            static_cast<std::uint32_t>(
+                program.schedule.counts[dimension]));
+        command.extension_words.push_back(
+            static_cast<std::uint32_t>(
+                program.schedule.cycle_strides[dimension]));
+    }
+    for (const auto& entry : program.body) {
+        if (!fits_u32(entry.cycle_offset)
+            || std::any_of(entry.operand_strides.begin(),
+                entry.operand_strides.end(),
+                [&](std::int64_t stride) { return !fits_i32(stride); }))
+            throw std::invalid_argument(
+                "MEM_SLICE_PROGRAM body does not fit the binary descriptor");
+        const auto encoded = isa::encode_mem_instruction(entry.instruction);
+        command.extension_words.push_back(
+            static_cast<std::uint32_t>(entry.cycle_offset));
+        for (const auto stride : entry.operand_strides)
+            command.extension_words.push_back(
+                static_cast<std::uint32_t>(stride));
+        command.extension_words.push_back(
+            static_cast<std::uint32_t>(encoded));
+        command.extension_words.push_back(
+            static_cast<std::uint32_t>(encoded >> 32));
+    }
+    return command;
 }
 
 inline bool is_mxm_stream_nd_command(const QueueCommand& command)

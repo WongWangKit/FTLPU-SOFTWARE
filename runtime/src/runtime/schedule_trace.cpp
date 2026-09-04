@@ -521,6 +521,60 @@ void write_schedule_trace_csv(const BinaryProgram& program,
                 cursor = std::max(cursor, finalCycle + 1);
                 continue;
             }
+            if (is_mem_slice_program_command(command)) {
+                const auto sliceProgram =
+                    decode_mem_slice_program_command(command);
+                for (const auto& body : sliceProgram.body) {
+                    const auto encoded =
+                        isa::encode_mem_instruction(body.instruction);
+                    const QueueCommand native {
+                        static_cast<isa::EncodedIcuCommand>(
+                            isa::IcuCommandOpcode::Instruction),
+                        InstructionKind::Mem,
+                        static_cast<std::uint16_t>(
+                            (encoded >> 32) == 0 ? 1 : 2),
+                        {static_cast<std::uint32_t>(encoded),
+                            static_cast<std::uint32_t>(encoded >> 32),
+                            0, 0},
+                    };
+                    const auto& stream = sliceProgram.schedule;
+                    const auto depthCount = stream.rank > 2
+                        ? stream.counts[2] : std::size_t {1};
+                    for (std::size_t depth = 0; depth < depthCount;
+                         ++depth) {
+                        const auto outerCount = stream.rank > 1
+                            ? stream.counts[1] : std::size_t {1};
+                        const auto outerInterval = stream.rank > 1
+                            ? stream.cycle_strides[1] : std::size_t {1};
+                        const auto outerStride = stream.rank > 1
+                            ? body.operand_strides[1]
+                            : std::int64_t {0};
+                        write_pattern(output, queue, native,
+                            stream.start_cycle + body.cycle_offset
+                                + depth * stream.cycle_strides[2],
+                            program.hardware.mxms_per_hemisphere,
+                            program.hardware.sram_depth_rows,
+                            {outerCount > 1 ? "repeat2d"
+                                    : stream.counts[0] > 1
+                                    ? "repeat" : "single",
+                                stream.counts[0],
+                                stream.cycle_strides[0],
+                                body.operand_strides[0], outerCount,
+                                outerInterval, outerStride, false,
+                                IcuInductionTarget::MemAddress,
+                                static_cast<std::int64_t>(depth)
+                                    * body.operand_strides[2]});
+                    }
+                    std::size_t finalCycle = stream.start_cycle
+                        + body.cycle_offset;
+                    for (std::size_t dimension = 0;
+                         dimension < stream.rank; ++dimension)
+                        finalCycle += (stream.counts[dimension] - 1)
+                            * stream.cycle_strides[dimension];
+                    cursor = std::max(cursor, finalCycle + 1);
+                }
+                continue;
+            }
             if (is_mem_stream_nd_command(command)
                 || is_mxm_stream_nd_command(command)) {
                 const auto stream = is_mem_stream_nd_command(command)

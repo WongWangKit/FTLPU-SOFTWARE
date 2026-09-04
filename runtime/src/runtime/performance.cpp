@@ -38,6 +38,15 @@ std::size_t issued_commands(const QueueProgram& queue)
     std::size_t issued = 0;
     std::size_t prior_instructions = 0;
     for (const auto& command : queue.commands) {
+        if (is_mem_slice_program_command(command)) {
+            const auto program = decode_mem_slice_program_command(command);
+            std::size_t points = program.body.size();
+            for (std::size_t dimension = 0;
+                 dimension < program.schedule.rank; ++dimension)
+                points *= program.schedule.counts[dimension];
+            issued += points;
+            continue;
+        }
         if (is_vxm_stream_nd_command(command)) {
             const auto stream = decode_vxm_stream_nd_command(command);
             std::size_t points = 1;

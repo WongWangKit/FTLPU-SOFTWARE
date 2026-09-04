@@ -264,11 +264,18 @@ try {
         throw std::runtime_error("i-MEM geometry did not round-trip");
     const auto imem = analyze_cmodel_abstract_imem(decoded);
     if (imem.fits() || imem.overflow_queues != 1
-        || imem.used_slots != 9 || imem.encoded_work_entries != 9
-        || imem.expanded_work != 22
+        || imem.used_slots != 10 || imem.encoded_work_entries != 10
+        || imem.expanded_work != 44
         || !imem.queues[0].overflow()
         || imem.queues[0].overflow_slots() != 1)
-        throw std::runtime_error("cmodel-abstract i-MEM report is incorrect");
+        throw std::runtime_error(
+            "cmodel-abstract i-MEM report is incorrect: used_slots="
+            + std::to_string(imem.used_slots)
+            + " encoded_work_entries="
+            + std::to_string(imem.encoded_work_entries)
+            + " expanded_work=" + std::to_string(imem.expanded_work)
+            + " overflow_queues="
+            + std::to_string(imem.overflow_queues));
     if (decoded.queues[0].commands.size() != 7
         || !is_repeat_2d_command(decoded.queues[0].commands[3]))
         throw std::runtime_error("compact Repeat2D binary did not round-trip");

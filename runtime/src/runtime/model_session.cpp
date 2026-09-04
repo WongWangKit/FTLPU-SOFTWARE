@@ -190,6 +190,40 @@ BinaryProgram parameterize_program(const ModelPackage &package,
         relocation.command_index >= queue->commands.size())
       throw std::logic_error("address relocation references a missing command");
     QueueCommand &command = queue->commands[relocation.command_index];
+    if (relocation.write_port)
+      throw std::logic_error(
+          "legacy MEM ReadWrite relocation is not supported by "
+          "the banked MEM ISA");
+    const auto relocate_address = [&](std::size_t sourceAddress) {
+      auto [range, inserted] = relocation_address_ranges.try_emplace(
+          key, static_cast<std::int64_t>(sourceAddress),
+          static_cast<std::int64_t>(sourceAddress));
+      if (!inserted) {
+        range->second.first = std::min(
+            range->second.first, static_cast<std::int64_t>(sourceAddress));
+        range->second.second = std::max(
+            range->second.second, static_cast<std::int64_t>(sourceAddress));
+      }
+      const std::int64_t relocated =
+          static_cast<std::int64_t>(sourceAddress) + delta;
+      if (relocated < 0 || relocated >= program.hardware.sram_depth_rows)
+        throw std::logic_error(
+            "resident address relocation exceeds physical MEM: binding=" +
+            std::to_string(relocation.binding_index) +
+            " original_base=" + std::to_string(original_binding.base_row) +
+            " resolved_base=" + std::to_string(resolved_binding.base_row) +
+            " command_address=" + std::to_string(sourceAddress) +
+            " relocated=" + std::to_string(relocated));
+      return static_cast<std::size_t>(relocated);
+    };
+    if (is_mem_slice_program_command(command)) {
+      auto sliceProgram = decode_mem_slice_program_command(command);
+      for (auto &entry : sliceProgram.body)
+        entry.instruction.address =
+            relocate_address(entry.instruction.address);
+      command = encode_mem_slice_program_command(sliceProgram);
+      continue;
+    }
     if (command.instruction_kind != InstructionKind::Mem ||
         command.word_count == 0 || command.word_count > 2)
       throw std::logic_error(
@@ -198,31 +232,8 @@ BinaryProgram parameterize_program(const ModelPackage &package,
         static_cast<isa::EncodedMemInstruction>(command.words[0]) |
         (static_cast<isa::EncodedMemInstruction>(command.words[1]) << 32);
     MemInstruction instruction = isa::decode_mem_instruction(encoded);
-    if (relocation.write_port)
-      throw std::logic_error(
-          "legacy MEM ReadWrite relocation is not supported by "
-          "the banked MEM ISA");
     const std::size_t sourceAddress = instruction.address;
-    auto [range, inserted] = relocation_address_ranges.try_emplace(
-        key, static_cast<std::int64_t>(sourceAddress),
-        static_cast<std::int64_t>(sourceAddress));
-    if (!inserted) {
-      range->second.first = std::min(range->second.first,
-                                     static_cast<std::int64_t>(sourceAddress));
-      range->second.second = std::max(range->second.second,
-                                      static_cast<std::int64_t>(sourceAddress));
-    }
-    const std::int64_t relocated =
-        static_cast<std::int64_t>(sourceAddress) + delta;
-    if (relocated < 0 || relocated >= program.hardware.sram_depth_rows)
-      throw std::logic_error(
-          "resident address relocation exceeds physical MEM: binding=" +
-          std::to_string(relocation.binding_index) +
-          " original_base=" + std::to_string(original_binding.base_row) +
-          " resolved_base=" + std::to_string(resolved_binding.base_row) +
-          " command_address=" + std::to_string(sourceAddress) +
-          " relocated=" + std::to_string(relocated));
-    instruction.address = static_cast<std::size_t>(relocated);
+    instruction.address = relocate_address(sourceAddress);
     const isa::EncodedMemInstruction patched =
         isa::encode_mem_instruction(instruction);
     command.words[0] = static_cast<std::uint32_t>(patched);

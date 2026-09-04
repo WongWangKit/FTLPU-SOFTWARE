@@ -166,6 +166,39 @@ std::size_t firstBindingReadCycle(
         for (std::size_t commandIndex = 0;
              commandIndex <= relocation.command_index; ++commandIndex) {
             const auto& command = queue->commands[commandIndex];
+            if (ftlpu::software::runtime::is_mem_slice_program_command(
+                    command)) {
+                const auto sliceProgram = ftlpu::software::runtime::
+                    decode_mem_slice_program_command(command);
+                if (commandIndex == relocation.command_index) {
+                    bool foundRead = false;
+                    for (const auto& body : sliceProgram.body) {
+                        if (body.instruction.opcode != ftlpu::MemOpcode::Read)
+                            continue;
+                        firstCycle = std::min(firstCycle,
+                            sliceProgram.schedule.start_cycle
+                                + body.cycle_offset);
+                        foundRead = true;
+                    }
+                    if (!foundRead)
+                        throw std::logic_error(
+                            "binding relocation does not reference a MEM read");
+                    break;
+                }
+                std::size_t finalCycle = sliceProgram.schedule.start_cycle;
+                for (const auto& body : sliceProgram.body) {
+                    std::size_t bodyFinalCycle =
+                        sliceProgram.schedule.start_cycle + body.cycle_offset;
+                    for (std::size_t dimension = 0;
+                         dimension < sliceProgram.schedule.rank; ++dimension)
+                        bodyFinalCycle +=
+                            (sliceProgram.schedule.counts[dimension] - 1)
+                            * sliceProgram.schedule.cycle_strides[dimension];
+                    finalCycle = std::max(finalCycle, bodyFinalCycle);
+                }
+                cycle = std::max(cycle, finalCycle + 1);
+                continue;
+            }
             if (ftlpu::software::runtime::is_mem_stream_nd_command(
                     command)) {
                 const auto schedule = ftlpu::software::runtime::

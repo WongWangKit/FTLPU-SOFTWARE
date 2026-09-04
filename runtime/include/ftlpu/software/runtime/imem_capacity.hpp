@@ -25,6 +25,7 @@ struct CmodelAbstractImemQueue {
     std::size_t repeat_2d_entries{0};
     std::size_t loop_entries{0};
     std::size_t macro_entries{0};
+    std::size_t coarse_program_entries{0};
     std::uint64_t expanded_work{0};
 
     bool overflow() const { return used_slots > depth; }

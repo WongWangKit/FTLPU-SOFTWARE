@@ -66,6 +66,24 @@ address = base_address + sum(id * address_stride[d])
 cycle stride 为无符号 32 位，address stride 为有符号 32 位；各维在发射
 时间上不允许重叠。
 
+### MEM_SLICE_PROGRAM
+
+`MEM_SLICE_PROGRAM` 在一个共享 N 维启动域下，合并同一个物理 slice 上最多
+16 项 MEM 操作。每个 body entry 保留自己的原生 read/write 指令、相对 cycle
+offset 和三个仿射地址步长。对 body `b` 和启动坐标 `i`：
+
+```text
+cycle   = start_cycle + cycle_offset[b]
+          + sum(i[d] * cycle_stride[d])
+address = native[b].address + sum(i[d] * address_stride[b][d])
+```
+
+binary lowering 只会合并 rank、count、cycle stride 和 binding metadata 完全
+一致的 sequence，并在形成 program 前校验所有展开后的发射 cycle。一个
+relocation 指向父 command，runtime 会将其地址增量应用到每个 body 的原生
+MEM 指令。当前编译器把 body cycle offset 限制在 65,535 cycle 以内，为后续
+固定宽度 RTL 编码保留实现空间。
+
 ### MXM_STREAM_ND
 
 MXM load、compute 和 dequant 队列使用同样的一到三维调度描述符，并携带一条
@@ -179,6 +197,22 @@ binary，全部命令和字节数分别减少 65.5% 和 46.1%。
 
 粗粒度 binary 也通过同一套 49,152 点 CModel golden 对比：mismatch 为 0，
 MAE 为 `0.004514`，最大误差为 `0.09375`。
+
+继续加入 `MEM_SLICE_PROGRAM` 后，剩余 4,652 项 MEM N-D 操作会按物理 slice
+和启动域组合：
+
+| 指标 | 之前的全部粗粒度形式 | 加入 MEM slice program | 降幅 |
+| --- | ---: | ---: | ---: |
+| MEM 队列命令 | 4,652 | 1,628 条 program | 65.0% |
+| MEM program body entry | - | 4,652 | 语义不变 |
+| 全部队列命令 | 5,045 | 2,021 | 59.9% |
+| Binary 字节数 | 347,235 | 263,881 | 24.0% |
+| 展开后的功能指令 | 6,586,470 | 6,586,470 | 不变 |
+| 调度 `max_cycle` | 763,669 | 763,669 | 不变 |
+
+更新后的 binary 在 CModel 中仍执行 763,733 cycle，并通过相同的 49,152 点
+Qwen golden 对比：mismatch 为 0、MAE 为 `0.004514`、最大误差为
+`0.09375`。
 
 ## 本地 ICU 结构
 

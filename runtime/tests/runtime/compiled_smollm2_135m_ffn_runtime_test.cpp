@@ -98,8 +98,10 @@ try {
             for (const auto& command : queue.commands) {
                 const bool coarseMem = queue.kind
                         == ftlpu::software::runtime::QueueKind::Mem
-                    && ftlpu::software::runtime::is_mem_stream_nd_command(
-                        command);
+                    && (ftlpu::software::runtime::is_mem_stream_nd_command(
+                            command)
+                        || ftlpu::software::runtime::
+                            is_mem_slice_program_command(command));
                 const bool coarseMxm = queue.kind
                         != ftlpu::software::runtime::QueueKind::Mem
                     && ftlpu::software::runtime::is_mxm_stream_nd_command(

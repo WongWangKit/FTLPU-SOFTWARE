@@ -29,6 +29,7 @@ bool issued(IcuQueueAction action)
     case IcuQueueAction::Repeat2DIssue:
     case IcuQueueAction::MacroIssue:
     case IcuQueueAction::MemStreamNdIssue:
+    case IcuQueueAction::MemSliceProgramIssue:
     case IcuQueueAction::MxmStreamNdIssue:
     case IcuQueueAction::VxmStreamNdIssue:
     case IcuQueueAction::SxmTileProgramIssue:

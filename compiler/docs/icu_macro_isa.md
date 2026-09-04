@@ -69,6 +69,26 @@ descriptor cover regular token, block, and page dimensions. Counts and cycle
 strides are unsigned 32-bit values in the current binary envelope; address
 strides are signed 32-bit values. Dimensions must not overlap in issue time.
 
+### MEM_SLICE_PROGRAM
+
+`MEM_SLICE_PROGRAM` combines up to sixteen MEM operations for one physical
+slice under a shared N-D launch domain. Each body entry retains its native
+read/write instruction, relative cycle offset, and three affine address
+strides. For body `b` and launch coordinate `i`:
+
+```text
+cycle   = start_cycle + cycle_offset[b]
+          + sum(i[d] * cycle_stride[d])
+address = native[b].address + sum(i[d] * address_stride[b][d])
+```
+
+Binary lowering groups only sequences with identical rank, counts, cycle
+strides, and binding metadata. It validates all expanded issue cycles before
+forming a program. One relocation references the parent command and runtime
+applies its delta to every body instruction. The current compiler limits a
+body cycle offset to 65,535 cycles so a later fixed-width RTL encoding remains
+practical.
+
 ### MXM_STREAM_ND
 
 MXM load, compute, and dequant queues use the same one-to-three-dimensional
@@ -192,6 +212,22 @@ Adding `VXM_STREAM_ND` and `SXM_TILE_PROGRAM` to the same decoder gives:
 
 The coarse binary also passed the same 49,152-output CModel golden comparison
 with zero mismatches, MAE `0.004514`, and maximum error `0.09375`.
+
+Adding `MEM_SLICE_PROGRAM` groups the remaining 4,652 MEM N-D operations by
+physical slice and launch domain:
+
+| Metric | Previous coarse forms | With MEM slice programs | Reduction |
+| --- | ---: | ---: | ---: |
+| MEM queue commands | 4,652 | 1,628 programs | 65.0% |
+| MEM program body entries | - | 4,652 | no semantic change |
+| All queue commands | 5,045 | 2,021 | 59.9% |
+| Binary bytes | 347,235 | 263,881 | 24.0% |
+| Expanded functional issues | 6,586,470 | 6,586,470 | unchanged |
+| Scheduled `max_cycle` | 763,669 | 763,669 | unchanged |
+
+The updated binary completed in 763,733 modeled cycles and passed the same
+49,152-output Qwen golden comparison with zero mismatches, MAE `0.004514`, and
+maximum error `0.09375`.
 
 ## Local ICU
 

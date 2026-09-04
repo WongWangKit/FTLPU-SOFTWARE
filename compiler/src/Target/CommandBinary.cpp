@@ -1697,7 +1697,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
         QueueProgram queue {
             key.first, static_cast<std::size_t>(key.second), {}};
         std::unordered_set<int64_t> issueCycles;
-        for (const CommandSequence& sequence : sequences) {
+        const auto validateIssueCycles = [&](const CommandSequence& sequence) {
             for (int64_t depth = 0; depth < sequence.depth_count;
                  ++depth)
                 for (int64_t outer = 0; outer < sequence.outer_count;
@@ -1715,33 +1715,130 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
                                 + " index=" + std::to_string(key.second)
                                 + " at cycle=" + std::to_string(issueCycle));
                     }
+        };
+
+        if (key.first == QueueKind::Mem) {
+            constexpr int64_t kMaxProgramCycleOffset = 65535;
+            const auto scheduleFor = [](const CommandSequence& sequence) {
+                const std::size_t rank = sequence.depth_count > 1 ? 3
+                    : sequence.outer_count > 1 ? 2 : 1;
+                return IcuMemStreamNdSchedule {
+                    static_cast<std::size_t>(sequence.cycle),
+                    rank,
+                    {static_cast<std::size_t>(sequence.repeat_count),
+                        static_cast<std::size_t>(sequence.outer_count),
+                        static_cast<std::size_t>(sequence.depth_count)},
+                    {static_cast<std::size_t>(sequence.repeat_interval),
+                        static_cast<std::size_t>(sequence.outer_interval),
+                        static_cast<std::size_t>(sequence.depth_interval)},
+                    {sequence.address_stride, sequence.outer_stride,
+                        sequence.depth_stride},
+                    IcuInductionTarget::MemAddress,
+                };
+            };
+            const auto sameDomain = [&](const CommandSequence& lhs,
+                                        const CommandSequence& rhs) {
+                const auto left = scheduleFor(lhs);
+                const auto right = scheduleFor(rhs);
+                return left.rank == right.rank
+                    && left.counts == right.counts
+                    && left.cycle_strides == right.cycle_strides
+                    && lhs.scale_binding == rhs.scale_binding
+                    && lhs.address_binding == rhs.address_binding
+                    && lhs.write_address_binding
+                        == rhs.write_address_binding;
+            };
+            const auto decodeMem = [](const QueueCommand& command) {
+                const auto encoded =
+                    static_cast<isa::EncodedMemInstruction>(
+                        command.words[0])
+                    | (static_cast<isa::EncodedMemInstruction>(
+                           command.words[1])
+                        << 32);
+                return isa::decode_mem_instruction(encoded);
+            };
+
+            for (const auto& sequence : sequences) {
+                validateIssueCycles(sequence);
+                max_cycle = std::max(max_cycle,
+                    static_cast<std::size_t>(
+                        sequence_final_cycle(sequence)));
+            }
+
+            std::vector<bool> consumed(sequences.size(), false);
+            for (std::size_t seed = 0; seed < sequences.size(); ++seed) {
+                if (consumed[seed]) continue;
+                consumed[seed] = true;
+                std::vector<std::size_t> members {seed};
+                for (std::size_t candidate = seed + 1;
+                     candidate < sequences.size()
+                     && members.size()
+                         < IcuMemSliceProgram::kMaxBodyEntries;
+                     ++candidate) {
+                    if (consumed[candidate]
+                        || sequences[candidate].cycle
+                                - sequences[seed].cycle
+                            > kMaxProgramCycleOffset
+                        || !sameDomain(
+                            sequences[seed], sequences[candidate]))
+                        continue;
+                    consumed[candidate] = true;
+                    members.push_back(candidate);
+                }
+
+                auto launch = scheduleFor(sequences[seed]);
+                launch.operand_strides = {0, 0, 0};
+                launch.induction_target = IcuInductionTarget::None;
+                IcuMemSliceProgram program {launch, {}};
+                program.body.reserve(members.size());
+                for (const std::size_t member : members) {
+                    const auto bodySchedule = scheduleFor(sequences[member]);
+                    program.body.push_back(IcuMemSliceProgramEntry {
+                        static_cast<std::size_t>(
+                            sequences[member].cycle
+                            - sequences[seed].cycle),
+                        bodySchedule.operand_strides,
+                        decodeMem(sequences[member].instruction),
+                    });
+                }
+
+                const std::size_t instructionIndex = queue.commands.size();
+                queue.commands.push_back(
+                    software::runtime::encode_mem_slice_program_command(
+                        program));
+                const auto& sequence = sequences[seed];
+                if (sequence.address_binding >= 0) {
+                    addressRelocations.push_back(BinaryAddressRelocation {
+                        static_cast<std::uint32_t>(
+                            sequence.address_binding),
+                        software::runtime::BindingAccess::Input,
+                        key.first,
+                        static_cast<std::uint16_t>(key.second),
+                        static_cast<std::uint32_t>(instructionIndex),
+                        false,
+                    });
+                }
+                if (sequence.write_address_binding >= 0) {
+                    addressRelocations.push_back(BinaryAddressRelocation {
+                        static_cast<std::uint32_t>(
+                            sequence.write_address_binding),
+                        software::runtime::BindingAccess::Input,
+                        key.first,
+                        static_cast<std::uint16_t>(key.second),
+                        static_cast<std::uint32_t>(instructionIndex),
+                        true,
+                    });
+                }
+            }
+            return queue;
+        }
+
+        for (const CommandSequence& sequence : sequences) {
+            validateIssueCycles(sequence);
             std::size_t instructionIndex = queue.commands.size();
             const std::size_t rank = sequence.depth_count > 1 ? 3
                 : sequence.outer_count > 1 ? 2 : 1;
-            if (key.first == QueueKind::Mem) {
-                queue.commands.push_back(
-                    software::runtime::encode_mem_stream_nd_command(
-                        sequence.instruction,
-                        IcuMemStreamNdSchedule {
-                            static_cast<std::size_t>(sequence.cycle),
-                            rank,
-                            {static_cast<std::size_t>(
-                                 sequence.repeat_count),
-                                static_cast<std::size_t>(
-                                    sequence.outer_count),
-                                static_cast<std::size_t>(
-                                    sequence.depth_count)},
-                            {static_cast<std::size_t>(
-                                 sequence.repeat_interval),
-                                static_cast<std::size_t>(
-                                    sequence.outer_interval),
-                                static_cast<std::size_t>(
-                                    sequence.depth_interval)},
-                            {sequence.address_stride,
-                                sequence.outer_stride,
-                                sequence.depth_stride},
-                        }));
-            } else if (key.first == QueueKind::MxmLoad
+            if (key.first == QueueKind::MxmLoad
                 || key.first == QueueKind::MxmCompute
                 || key.first == QueueKind::MxmDequant) {
                 auto inductionTarget = sequence.induction_target;

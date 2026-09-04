@@ -509,6 +509,14 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                 }
                 continue;
             }
+            if (is_mem_slice_program_command(command)) {
+                if (queue.kind != QueueKind::Mem)
+                    throw std::logic_error(
+                        "MEM_SLICE_PROGRAM must target a MEM queue");
+                icu.enqueue_mem_slice_program(queue_index,
+                    decode_mem_slice_program_command(command));
+                continue;
+            }
             if (is_mem_stream_nd_command(command)) {
                 if (queue.kind != QueueKind::Mem
                     || command.word_count < 1 || command.word_count > 2)
