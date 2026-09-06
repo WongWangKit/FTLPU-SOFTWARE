@@ -47,7 +47,7 @@ constexpr bool has_mem_macro_delta_rle(std::uint32_t version)
 constexpr std::uint32_t kNativeWordCountShift = 2;
 constexpr std::uint32_t kNativeWordCountMask = 0x1cu;
 constexpr std::uint32_t kNativeSxmFixedWordCount = 7;
-constexpr std::uint32_t kIcuLoopWindowMask = 0x3fu;
+constexpr std::uint32_t kIcuExtendedReservedMask = 0x3fu;
 constexpr std::uint32_t kIcuExtendedSubtypeShift = 8;
 constexpr std::uint32_t kIcuExtendedRepeat2D = 0;
 
@@ -194,8 +194,9 @@ std::array<std::uint32_t, 3> encode_binary_repeat_2d(
                 words[(offset + bit) / 32]
                     |= std::uint32_t {1} << ((offset + bit) % 32);
     };
-    write(0, 2, static_cast<std::uint8_t>(isa::IcuCommandOpcode::Loop));
-    // bits 2..7 are the otherwise-invalid Loop window_size=0 escape.
+    write(0, 2, static_cast<std::uint8_t>(
+        isa::IcuCommandOpcode::Extended));
+    // Bits 2..7 remain zero to identify the fixed-width extended escape.
     write(kIcuExtendedSubtypeShift, 2, kIcuExtendedRepeat2D);
     write(10, 10, repeat.inner_count);
     write(20, 10, repeat.outer_count);
@@ -223,8 +224,8 @@ IcuRepeat2D decode_binary_repeat_2d(
             static_cast<std::int16_t>(value));
     };
     if (isa::decode_icu_command_opcode(words[0])
-            != isa::IcuCommandOpcode::Loop
-        || ((words[0] >> 2) & kIcuLoopWindowMask) != 0
+            != isa::IcuCommandOpcode::Extended
+        || ((words[0] >> 2) & kIcuExtendedReservedMask) != 0
         || read(kIcuExtendedSubtypeShift, 2) != kIcuExtendedRepeat2D)
         throw std::runtime_error("invalid compact Repeat2D record");
     IcuRepeat2D repeat {
@@ -334,7 +335,17 @@ QueueEncodingMode queue_encoding_mode(const QueueProgram& queue)
         queue.commands.end(), [](const QueueCommand& command) {
             return is_macro_schedule_command(command);
         });
-    if (macroCount == 0) return QueueEncodingMode::Native;
+    if (macroCount == 0) {
+        const bool hasExtendedDescriptor = std::any_of(
+            queue.commands.begin(), queue.commands.end(),
+            [](const QueueCommand& command) {
+                return isa::decode_icu_command_opcode(command.command)
+                    == isa::IcuCommandOpcode::Extended;
+            });
+        return hasExtendedDescriptor
+            ? QueueEncodingMode::CompactTagged
+            : QueueEncodingMode::Native;
+    }
     if (macroCount == static_cast<std::ptrdiff_t>(queue.commands.size())) {
         if (queue.kind == QueueKind::Mem)
             return QueueEncodingMode::MemMacroDeltaRle;
@@ -788,8 +799,8 @@ QueueCommand read_native_queue_command(Reader& reader, QueueKind queueKind)
             command.words[word] = read_value<std::uint32_t>(reader);
         return command;
     }
-    if (opcode == isa::IcuCommandOpcode::Loop
-        && ((prefix >> 2) & kIcuLoopWindowMask) == 0) {
+    if (opcode == isa::IcuCommandOpcode::Extended
+        && ((prefix >> 2) & kIcuExtendedReservedMask) == 0) {
         std::array<std::uint32_t, 3> words {
             prefix,
             read_value<std::uint32_t>(reader),
@@ -850,8 +861,8 @@ void skip_native_queue_command(Reader& reader, QueueKind queueKind)
                 * sizeof(std::uint32_t));
         return;
     }
-    if (opcode == isa::IcuCommandOpcode::Loop
-        && ((prefix >> 2) & kIcuLoopWindowMask) == 0) {
+    if (opcode == isa::IcuCommandOpcode::Extended
+        && ((prefix >> 2) & kIcuExtendedReservedMask) == 0) {
         if (((prefix >> kIcuExtendedSubtypeShift) & 0x3u)
             != kIcuExtendedRepeat2D)
             throw std::runtime_error(

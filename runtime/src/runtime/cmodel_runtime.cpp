@@ -1,4 +1,6 @@
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
+
+#include "ftlpu/system/c2c_dma_system.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include "ftlpu/core/bf16.hpp"
@@ -16,6 +18,20 @@
 
 namespace ftlpu::software::runtime {
 namespace {
+
+template <typename System>
+std::size_t stage_and_prime_icu_programs_if_supported(
+    System& system, std::uint64_t imageBase)
+{
+    if constexpr (requires(System& candidate) {
+                      candidate.stage_icu_programs_to_ddr(imageBase);
+                      candidate.prime_icu_instruction_queues();
+                  }) {
+        static_cast<void>(system.stage_icu_programs_to_ddr(imageBase));
+        return system.prime_icu_instruction_queues();
+    }
+    return 0;
+}
 
 void write_binding_sram_byte(TspSliceSystem& system,
     const BinaryBinding& binding, Hemisphere hemisphere, std::size_t slice,
@@ -348,6 +364,14 @@ CModelRuntime::CModelRuntime(TspSliceSystem& system,
 {
 }
 
+CModelRuntime::CModelRuntime(C2cDmaSystem& system,
+    std::function<void(TspSliceSystem::LogSinks)> tick)
+    : system_(system.chip())
+    , c2c_system_(&system)
+    , tick_(std::move(tick))
+{
+}
+
 void CModelRuntime::load(const BinaryProgram& program)
 {
     validate_cmodel_hardware_config(program);
@@ -363,7 +387,10 @@ void CModelRuntime::load(const BinaryProgram& program)
     hardware.mxm_weight_activation_overlap_enabled =
         program.hardware.mxm_weight_activation_overlap_enabled != 0;
     system_.configure_hardware(hardware);
-    system_.reset_execution_state();
+    if (c2c_system_ != nullptr)
+        c2c_system_->reset_execution_state();
+    else
+        system_.reset_execution_state();
     initialize_vxm_luts(system_);
     for (std::size_t group = 0; group < 16; ++group)
         system_.configure_vxm_input_group_source(group,
@@ -373,6 +400,14 @@ void CModelRuntime::load(const BinaryProgram& program)
             block < 4 ? Hemisphere::West : Hemisphere::East);
     load_queue_programs_into_icu(program.queues, system_.icu(),
         program.hardware.mxms_per_hemisphere);
+    instruction_prefill_cycles_ = 0;
+    if (c2c_system_ != nullptr) {
+        constexpr auto kInstructionImageBase =
+            std::uint64_t {0x1'0000'0000};
+        instruction_prefill_cycles_ =
+            stage_and_prime_icu_programs_if_supported(
+                *c2c_system_, kInstructionImageBase);
+    }
     loaded_max_cycle_ = program.max_cycle;
     loaded_mxms_per_hemisphere_ = program.hardware.mxms_per_hemisphere;
     loaded_vxm_alus_ = program.hardware.vxm_alus;
@@ -394,7 +429,9 @@ void CModelRuntime::load(const BinaryProgram& program)
     physical_cycles_ = 0;
     waiting_weight_page_use_.reset();
     system_.icu().set_program_issue_enabled(true);
-    if (execution_trace_enabled_) execution_trace_.reset(program);
+    if (execution_trace_enabled_)
+        execution_trace_.begin_segment(program,
+            execution_trace_cycle_offset_, execution_trace_append_on_load_);
     for (const BinaryBinding& binding : bindings_) {
         if (binding.access != BindingAccess::Internal) continue;
         if (binding.initializer == BindingInitializer::None) continue;
@@ -592,6 +629,13 @@ void CModelRuntime::set_weight_page_residency_checker(
 void CModelRuntime::enable_execution_trace(bool enabled) noexcept
 {
     execution_trace_enabled_ = enabled;
+}
+
+void CModelRuntime::configure_execution_trace_segment(
+    std::int64_t cycleOffset, bool append) noexcept
+{
+    execution_trace_cycle_offset_ = cycleOffset;
+    execution_trace_append_on_load_ = append;
 }
 
 void CModelRuntime::record_execution_trace_interval(

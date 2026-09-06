@@ -23,6 +23,16 @@
 namespace ftlpu::software::runtime {
 namespace {
 
+template <typename System>
+void configure_instruction_data_arbiter_if_supported(
+    System& system, std::size_t issueWidth)
+{
+  if constexpr (requires(System& candidate) {
+                  candidate.ddr_arbiter().set_issue_width(issueWidth);
+                })
+    system.ddr_arbiter().set_issue_width(issueWidth);
+}
+
 bool is_16bit_float(BindingElementType type) {
   return type == BindingElementType::F16 || type == BindingElementType::BF16;
 }
@@ -180,6 +190,40 @@ BinaryProgram parameterize_program(const ModelPackage &package,
         relocation.command_index >= queue->commands.size())
       throw std::logic_error("address relocation references a missing command");
     QueueCommand &command = queue->commands[relocation.command_index];
+    if (relocation.write_port)
+      throw std::logic_error(
+          "legacy MEM ReadWrite relocation is not supported by "
+          "the banked MEM ISA");
+    const auto relocate_address = [&](std::size_t sourceAddress) {
+      auto [range, inserted] = relocation_address_ranges.try_emplace(
+          key, static_cast<std::int64_t>(sourceAddress),
+          static_cast<std::int64_t>(sourceAddress));
+      if (!inserted) {
+        range->second.first = std::min(
+            range->second.first, static_cast<std::int64_t>(sourceAddress));
+        range->second.second = std::max(
+            range->second.second, static_cast<std::int64_t>(sourceAddress));
+      }
+      const std::int64_t relocated =
+          static_cast<std::int64_t>(sourceAddress) + delta;
+      if (relocated < 0 || relocated >= program.hardware.sram_depth_rows)
+        throw std::logic_error(
+            "resident address relocation exceeds physical MEM: binding=" +
+            std::to_string(relocation.binding_index) +
+            " original_base=" + std::to_string(original_binding.base_row) +
+            " resolved_base=" + std::to_string(resolved_binding.base_row) +
+            " command_address=" + std::to_string(sourceAddress) +
+            " relocated=" + std::to_string(relocated));
+      return static_cast<std::size_t>(relocated);
+    };
+    if (is_mem_slice_program_command(command)) {
+      auto sliceProgram = decode_mem_slice_program_command(command);
+      for (auto &entry : sliceProgram.body)
+        entry.instruction.address =
+            relocate_address(entry.instruction.address);
+      command = encode_mem_slice_program_command(sliceProgram);
+      continue;
+    }
     if (command.instruction_kind != InstructionKind::Mem ||
         command.word_count == 0 || command.word_count > 2)
       throw std::logic_error(
@@ -188,31 +232,8 @@ BinaryProgram parameterize_program(const ModelPackage &package,
         static_cast<isa::EncodedMemInstruction>(command.words[0]) |
         (static_cast<isa::EncodedMemInstruction>(command.words[1]) << 32);
     MemInstruction instruction = isa::decode_mem_instruction(encoded);
-    if (relocation.write_port)
-      throw std::logic_error(
-          "legacy MEM ReadWrite relocation is not supported by "
-          "the banked MEM ISA");
     const std::size_t sourceAddress = instruction.address;
-    auto [range, inserted] = relocation_address_ranges.try_emplace(
-        key, static_cast<std::int64_t>(sourceAddress),
-        static_cast<std::int64_t>(sourceAddress));
-    if (!inserted) {
-      range->second.first = std::min(range->second.first,
-                                     static_cast<std::int64_t>(sourceAddress));
-      range->second.second = std::max(range->second.second,
-                                      static_cast<std::int64_t>(sourceAddress));
-    }
-    const std::int64_t relocated =
-        static_cast<std::int64_t>(sourceAddress) + delta;
-    if (relocated < 0 || relocated >= program.hardware.sram_depth_rows)
-      throw std::logic_error(
-          "resident address relocation exceeds physical MEM: binding=" +
-          std::to_string(relocation.binding_index) +
-          " original_base=" + std::to_string(original_binding.base_row) +
-          " resolved_base=" + std::to_string(resolved_binding.base_row) +
-          " command_address=" + std::to_string(sourceAddress) +
-          " relocated=" + std::to_string(relocated));
-    instruction.address = static_cast<std::size_t>(relocated);
+    instruction.address = relocate_address(sourceAddress);
     const isa::EncodedMemInstruction patched =
         isa::encode_mem_instruction(instruction);
     command.words[0] = static_cast<std::uint32_t>(patched);
@@ -310,7 +331,7 @@ bool weight_page_overlaps_program(const C2cWeightPage &page,
 ModelSession::ModelSession(TspSliceSystem &system) : runtime_(system) {}
 
 ModelSession::ModelSession(C2cDmaSystem &system)
-    : runtime_(system.chip(),
+    : runtime_(system,
                [this, &system](TspSliceSystem::LogSinks sinks) {
                  system.tick(sinks);
                  observe_weight_page_tick();
@@ -351,6 +372,9 @@ ExecutableHardwareConfig ModelSession::effective_external_transport(
 }
 
 void ModelSession::enable_execution_trace(bool enabled) noexcept {
+  execution_trace_enabled_ = enabled;
+  execution_trace_has_segment_ = false;
+  execution_trace_cycle_cursor_ = 0;
   runtime_.enable_execution_trace(enabled);
 }
 
@@ -400,6 +424,8 @@ void ModelSession::configure_external_transport(
       1'000'000;
   ddr.latency_random_seed = hardware.ddr_latency_random_seed;
   c2c_system_->ddr4().configure(ddr);
+  configure_instruction_data_arbiter_if_supported(
+      *c2c_system_, ddr.transfer_channels);
 }
 
 void ModelSession::upload_binding_through_c2c(
@@ -1073,6 +1099,8 @@ void ModelSession::load(ModelPackage package) {
   stats_ = {};
   load_stats_ = {};
   completed_invocation_ = false;
+  execution_trace_has_segment_ = false;
+  execution_trace_cycle_cursor_ = 0;
   const ExecutableHardwareConfig *sessionHardware = nullptr;
   const bool usesLpu = !package_.invocations.empty() ||
                        !memory_plan_.resident_tensors.empty() ||
@@ -1186,12 +1214,16 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   const auto &executable = package_.executables.at(invocation.executable_index);
   const SessionInvocationPlan &invocation_plan =
       memory_plan_.invocations.at(index);
+  const std::size_t pageWaitBefore = stats_.weight_page_wait_cycles;
   if (invocation.weight_page != 0xffffffffu)
     ensure_weight_page(invocation.weight_page);
+  const std::size_t modelPageWaitCycles =
+      stats_.weight_page_wait_cycles - pageWaitBefore;
   const BinaryProgram program =
       parameterize_program(package_, invocation, invocation_plan,
                            materialize_model_executable(executable));
 
+  const std::size_t ingressBefore = stats_.c2c_ingress_cycles;
   for (const SessionInputPlan &input : invocation_plan.inputs) {
     if (input.transfer == SessionTransferKind::Resident ||
         input.transfer == SessionTransferKind::WeightPage)
@@ -1224,8 +1256,41 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     if (input.release_after_transfer)
       device_values_.erase(source);
   }
+  const std::size_t inputTransferCycles =
+      stats_.c2c_ingress_cycles - ingressBefore;
+  const std::size_t executablePageWaitBefore = stats_.weight_page_wait_cycles;
   prepare_executable_weight_pages(program, invocation);
+  const std::size_t executablePreExecutionCycles =
+      stats_.weight_page_wait_cycles - executablePageWaitBefore;
+  const auto traceOrigin = execution_trace_cycle_cursor_
+      + static_cast<std::int64_t>(modelPageWaitCycles)
+      + static_cast<std::int64_t>(inputTransferCycles)
+      + static_cast<std::int64_t>(executablePreExecutionCycles);
+  if (execution_trace_enabled_)
+    runtime_.configure_execution_trace_segment(
+        traceOrigin, execution_trace_has_segment_);
   runtime_.load(program);
+  if (execution_trace_enabled_) {
+    std::int64_t localCursor = -static_cast<std::int64_t>(
+        modelPageWaitCycles + inputTransferCycles
+        + executablePreExecutionCycles);
+    if (modelPageWaitCycles != 0) {
+      std::ostringstream detail;
+      detail << "invocation=" << index;
+      if (invocation.weight_page != 0xffffffffu)
+        detail << " page=" << invocation.weight_page;
+      detail << " phase="
+             << (completed_invocation_ ? "layer_boundary" : "initial");
+      runtime_.record_execution_trace_interval(localCursor,
+          localCursor + static_cast<std::int64_t>(modelPageWaitCycles),
+          "C2C.ModelWeightPage", detail.str());
+      localCursor += static_cast<std::int64_t>(modelPageWaitCycles);
+    }
+    if (inputTransferCycles != 0)
+      runtime_.record_execution_trace_interval(localCursor,
+          localCursor + static_cast<std::int64_t>(inputTransferCycles),
+          "C2C.HostInput", "invocation=" + std::to_string(index));
+  }
   schedule_executable_weight_pages();
   if (index + 1 < package_.invocations.size()) {
     const auto nextPage = package_.invocations[index + 1].weight_page;
@@ -1259,6 +1324,12 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   } else {
     runtime_.run_cycles(executionCycles);
   }
+  const std::size_t invocationPhysicalCycles = runtime_.physical_cycles();
+  if (execution_trace_enabled_)
+    runtime_.record_execution_trace_interval(0,
+        static_cast<std::int64_t>(invocationPhysicalCycles),
+        "Session.Invocation",
+        "index=" + std::to_string(index) + " name=" + invocation.name);
   executable_clock_active_ = false;
   completed_invocation_ = true;
   if (std::getenv("FTLPU_SESSION_TRACE_BINDINGS") != nullptr) {
@@ -1305,6 +1376,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
                 << " max=" << maximum << std::endl;
     }
   }
+  const std::size_t egressBefore = stats_.c2c_egress_cycles;
   const bool validate_fp16 =
       std::getenv("FTLPU_SESSION_VALIDATE_FP16") != nullptr;
   for (const SessionOutputPlan &output : invocation_plan.outputs) {
@@ -1338,6 +1410,18 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
       ++stats_.host_downloads;
     }
   }
+  const std::size_t outputTransferCycles =
+      stats_.c2c_egress_cycles - egressBefore;
+  if (execution_trace_enabled_ && outputTransferCycles != 0)
+    runtime_.record_execution_trace_interval(
+        static_cast<std::int64_t>(invocationPhysicalCycles),
+        static_cast<std::int64_t>(
+            invocationPhysicalCycles + outputTransferCycles),
+        "C2C.HostOutput", "invocation=" + std::to_string(index));
+  execution_trace_cycle_cursor_ = traceOrigin
+      + static_cast<std::int64_t>(invocationPhysicalCycles)
+      + static_cast<std::int64_t>(outputTransferCycles);
+  execution_trace_has_segment_ = true;
 }
 
 void ModelSession::run_embedding_lookups() {
@@ -1464,6 +1548,8 @@ void ModelSession::run(std::size_t drain_cycles) {
     throw std::logic_error("no FTLPU model package is loaded");
   device_values_.clear();
   stats_ = load_stats_;
+  execution_trace_has_segment_ = false;
+  execution_trace_cycle_cursor_ = 0;
   run_embedding_lookups();
   const bool report_progress = std::getenv("FTLPU_SESSION_PROGRESS") != nullptr;
   for (std::size_t index = 0; index < package_.invocations.size(); ++index) {

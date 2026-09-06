@@ -70,7 +70,7 @@ def main() -> None:
                 str(tool_path),
                 "--model-dir", str(model),
                 "--opt", str(root / "ftlpu_opt"),
-                "--translate", str(root / "ftlpu_translate"),
+                "--compile", str(root / "ftlpu_compile"),
                 "--stablehlo", str(root / "decoder.stablehlo.mlir"),
                 "--target-config", str(root / "target.json"),
                 "--pack-model-weights", str(root / "pack_weights"),
@@ -89,17 +89,41 @@ def main() -> None:
         lower_commands = [
             command for name, command in recorded
             if name.startswith("lower executable variant")
-            and name.endswith("to Schedule IR")
+            and name.endswith("to Stream IR")
         ]
         if len(lower_commands) != 2:
             raise RuntimeError("expected two bank-specific lowerings")
-        for bank, command in enumerate(lower_commands):
+        for bank, command in zip((1, 0), lower_commands):
             position = command.index("--weight-bank")
             if command[position + 1] != str(bank):
                 raise RuntimeError("decoder executable bank order is wrong")
             policy = command.index("--mxm-execution")
             if command[policy + 1] != "vector":
                 raise RuntimeError("decoder executable did not use Vector MXM")
+            pipeline = command.index("--pipeline")
+            if command[pipeline + 1] != "ftlpu-stablehlo-to-stream":
+                raise RuntimeError("decoder executable skipped Stream IR")
+
+        schedule_commands = [
+            command for name, command in recorded
+            if name.startswith("lower executable variant")
+            and name.endswith("to compressed Schedule IR")
+        ]
+        compile_commands = [
+            command for name, command in recorded
+            if name.startswith("compile executable variant")
+        ]
+        if len(schedule_commands) != 2 or len(compile_commands) != 2:
+            raise RuntimeError("expected compressed schedule compilation")
+        for command in schedule_commands:
+            pipeline = command.index("--pipeline")
+            if command[pipeline + 1] != \
+                    "ftlpu-stream-to-compressed-schedule":
+                raise RuntimeError("decoder executable used legacy Schedule IR")
+        for command in compile_commands:
+            stage = command.index("--input-stage")
+            if command[stage + 1] != "schedule":
+                raise RuntimeError("decoder executable used legacy Command IR")
 
         package = next(
             command for name, command in recorded
@@ -118,6 +142,13 @@ def main() -> None:
             raise RuntimeError("layer executable order does not alternate banks")
         if not output.is_file():
             raise RuntimeError("paged output was not produced")
+        pack = next(
+            command for name, command in recorded
+            if name == "pack alternating C2C weight pages"
+        )
+        first_bank = pack.index("--first-bank")
+        if pack[first_bank + 1] != "0":
+            raise RuntimeError("first non-paged weight page bank is wrong")
 
     print("build_hf_decoder_stack_paging_test passed")
 

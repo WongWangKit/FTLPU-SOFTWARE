@@ -37,11 +37,45 @@ void checked_add(std::uint64_t& destination, std::uint64_t value)
     destination += value;
 }
 
+std::uint64_t stream_points(const IcuStreamNdSchedule& schedule)
+{
+    std::uint64_t points = 1;
+    for (std::size_t dimension = 0; dimension < schedule.rank;
+         ++dimension) {
+        if (schedule.counts[dimension]
+            > std::numeric_limits<std::uint64_t>::max() / points)
+            throw std::overflow_error("STREAM_ND work statistic overflow");
+        points *= schedule.counts[dimension];
+    }
+    return points;
+}
+
 std::size_t peak_macro_contexts(const QueueProgram& queue)
 {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
     intervals.reserve(queue.commands.size());
     for (const auto& command : queue.commands) {
+        if (is_mem_slice_program_command(command)) {
+            const auto program = decode_mem_slice_program_command(command);
+            std::uint64_t end = program.schedule.start_cycle;
+            for (std::size_t dimension = 0;
+                 dimension < program.schedule.rank; ++dimension)
+                end += static_cast<std::uint64_t>(
+                           program.schedule.counts[dimension] - 1)
+                    * program.schedule.cycle_strides[dimension];
+            std::uint64_t start =
+                std::numeric_limits<std::uint64_t>::max();
+            std::uint64_t final = 0;
+            for (const auto& body : program.body) {
+                start = std::min(start,
+                    static_cast<std::uint64_t>(
+                        program.schedule.start_cycle)
+                        + body.cycle_offset);
+                final = std::max(final, end + body.cycle_offset);
+            }
+            intervals.push_back({start, final});
+            continue;
+        }
         if (!is_macro_schedule_command(command)) continue;
         const auto schedule = decode_macro_schedule_command(command);
         const auto end = static_cast<std::uint64_t>(schedule.start_cycle)
@@ -128,6 +162,42 @@ CmodelAbstractImemReport analyze_cmodel_abstract_imem(
         capacity.used_slots = queue.commands.size();
 
         for (const auto& command : queue.commands) {
+            if (is_mem_slice_program_command(command)) {
+                ++capacity.coarse_program_entries;
+                const auto program =
+                    decode_mem_slice_program_command(command);
+                const auto points = stream_points(program.schedule);
+                if (program.body.size()
+                    > std::numeric_limits<std::uint64_t>::max() / points)
+                    throw std::overflow_error(
+                        "MEM_SLICE_PROGRAM work statistic overflow");
+                checked_add(capacity.expanded_work,
+                    points * program.body.size());
+                continue;
+            }
+            if (is_vxm_stream_nd_command(command)) {
+                ++capacity.coarse_program_entries;
+                checked_add(capacity.expanded_work,
+                    stream_points(
+                        decode_vxm_stream_nd_command(command).schedule));
+                continue;
+            }
+            if (is_sxm_tile_program_command(command)) {
+                ++capacity.coarse_program_entries;
+                checked_add(capacity.expanded_work,
+                    stream_points(
+                        decode_sxm_tile_program_command(command).schedule));
+                continue;
+            }
+            if (is_mem_stream_nd_command(command)
+                || is_mxm_stream_nd_command(command)) {
+                ++capacity.coarse_program_entries;
+                checked_add(capacity.expanded_work,
+                    stream_points(is_mem_stream_nd_command(command)
+                            ? decode_mem_stream_nd_command(command)
+                            : decode_mxm_stream_nd_command(command)));
+                continue;
+            }
             if (is_macro_schedule_command(command)) {
                 ++capacity.macro_entries;
                 const auto macro = decode_macro_schedule_command(command);
@@ -162,14 +232,6 @@ CmodelAbstractImemReport analyze_cmodel_abstract_imem(
                 checked_add(capacity.expanded_work, repeat.count);
                 break;
             }
-            case isa::IcuCommandOpcode::Loop: {
-                ++capacity.loop_entries;
-                const auto loop = isa::decode_icu_loop(command.command);
-                checked_add(capacity.expanded_work,
-                    static_cast<std::uint64_t>(loop.window_size)
-                        * loop.count);
-                break;
-            }
             default:
                 break;
             }
@@ -177,7 +239,8 @@ CmodelAbstractImemReport analyze_cmodel_abstract_imem(
 
         const auto encodedWork = capacity.instruction_entries
             + capacity.repeat_entries + capacity.repeat_2d_entries
-            + capacity.loop_entries + capacity.macro_entries;
+            + capacity.loop_entries + capacity.macro_entries
+            + capacity.coarse_program_entries;
         report.used_slots += capacity.used_slots;
         report.encoded_work_entries += encodedWork;
         checked_add(report.expanded_work, capacity.expanded_work);
