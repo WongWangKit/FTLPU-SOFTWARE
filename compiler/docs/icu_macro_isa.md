@@ -7,14 +7,21 @@ host runtime into each functional-unit ICU. It does not change Schedule IR
 cycles or native MEM/MXM instructions. VXM and SXM keep the legacy queue format
 for now.
 
-Enable it with:
+Select ICU compression from the command line:
 
 ```text
-ftlpu-opt ... --icu-macro-schedule
+ftlpu-opt ... --icu-compression none|control|macro
 ```
 
-The generated module carries `ftlpu.icu_macro_schedule = true`; binary lowering
-then emits binary format version 22.
+`macro` is the default. `none` materializes functional instructions while
+retaining duration-encoded NOP gaps, `control` enables Repeat, Repeat2D, and
+Loop, and `macro` additionally enables Macro scheduling and physical Macro
+queue encoding. The old `--icu-macro-schedule` option remains an alias for
+`--icu-compression macro`.
+
+The generated module carries `ftlpu.icu_compression = "..."`. It also carries
+the legacy `ftlpu.icu_macro_schedule` boolean during the command-IR
+compatibility window.
 
 ## Descriptor
 

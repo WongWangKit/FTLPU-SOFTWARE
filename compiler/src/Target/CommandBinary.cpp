@@ -2,6 +2,7 @@
 #include "ftlpu/compiler/Target/command_binary.hpp"
 
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
+#include "ftlpu/compiler/Target/icu_compression.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "ftlpu/core/instruction_codec.hpp"
@@ -997,6 +998,71 @@ bool fold_loop_windows_into_macro(
     return true;
 }
 
+void expand_control_sequences(
+    std::vector<CommandSequence>& sequences, QueueKind kind)
+{
+    // Materialize Loop replays first. Replayed instructions do not extend the
+    // ICU's static instruction history, so keep a separate history here.
+    std::vector<CommandSequence> withoutLoops;
+    std::vector<CommandSequence> staticHistory;
+    for (const CommandSequence& sequence : sequences) {
+        if (!sequence.is_loop) {
+            withoutLoops.push_back(sequence);
+            staticHistory.push_back(sequence);
+            continue;
+        }
+        const std::size_t window = static_cast<std::size_t>(
+            sequence.loop_window_size);
+        if (window == 0 || window > staticHistory.size())
+            throw std::runtime_error(
+                "cannot expand Command IR Loop beyond static history");
+        const std::size_t begin = staticHistory.size() - window;
+        for (int64_t round = 0; round < sequence.repeat_count; ++round)
+            for (std::size_t offset = 0; offset < window; ++offset) {
+                CommandSequence item = staticHistory[begin + offset];
+                item.cycle = sequence.cycle
+                    + round * sequence.repeat_interval
+                    + static_cast<int64_t>(offset);
+                item.instruction = apply_outer_induction(
+                    std::move(item.instruction),
+                    macro_induction_target(kind),
+                    (round + 1) * sequence.address_stride);
+                withoutLoops.push_back(std::move(item));
+            }
+    }
+
+    // Materialize both Repeat dimensions into native instructions. NOP gaps
+    // remain duration encoded so the baseline measures functional compression.
+    std::vector<CommandSequence> expanded;
+    for (const CommandSequence& sequence : withoutLoops) {
+        for (int64_t outer = 0; outer < sequence.outer_count; ++outer)
+            for (int64_t inner = 0;
+                 inner < sequence.repeat_count; ++inner) {
+                CommandSequence item = sequence;
+                item.cycle += outer * sequence.outer_interval
+                    + inner * sequence.repeat_interval;
+                item.instruction = apply_outer_induction(
+                    std::move(item.instruction),
+                    sequence.induction_target,
+                    outer * sequence.outer_stride
+                        + inner * sequence.address_stride);
+                item.repeat_count = 1;
+                item.repeat_interval = 1;
+                item.address_stride = 0;
+                item.outer_count = 1;
+                item.outer_interval = 1;
+                item.outer_stride = 0;
+                item.induction_target = IcuInductionTarget::None;
+                expanded.push_back(std::move(item));
+            }
+    }
+    std::sort(expanded.begin(), expanded.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return lhs.cycle < rhs.cycle;
+        });
+    sequences = std::move(expanded);
+}
+
 int64_t macro_instruction_stride(const CommandSequence& first,
     const CommandSequence& next, QueueKind kind)
 {
@@ -1341,12 +1407,18 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
     std::vector<BinaryScaleRelocation>& scaleRelocations,
     std::vector<BinaryAddressRelocation>& addressRelocations,
     bool repeat2DEnabled,
-    bool macroScheduleEnabled)
+    IcuCompressionMode compressionMode)
 {
+    const bool controlCompressionEnabled =
+        compressionMode != IcuCompressionMode::None;
+    const bool macroScheduleEnabled =
+        compressionMode == IcuCompressionMode::Macro;
     std::sort(sequences.begin(), sequences.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.cycle < rhs.cycle;
     });
-    if (!macroScheduleEnabled)
+    if (!controlCompressionEnabled)
+        expand_control_sequences(sequences, key.first);
+    else if (!macroScheduleEnabled)
         expand_interleaved_repeat_2d(sequences, repeat2DEnabled);
     std::sort(sequences.begin(), sequences.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.cycle < rhs.cycle;
@@ -1568,7 +1640,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
                                                    const auto& rhs) {
         return lhs.cycle < rhs.cycle;
     });
-    if (repeat2DEnabled) {
+    if (controlCompressionEnabled && repeat2DEnabled) {
         auto simpleLoopCandidate = sequences;
         compress_loop_windows(simpleLoopCandidate, key.first);
         auto repeatedLoopCandidate = sequences;
@@ -1699,10 +1771,23 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     const auto target = LPUTargetModel::from_operation(module);
     if (mlir::failed(target))
         throw std::runtime_error("Command IR module has an invalid target");
-    const auto macroScheduleAttr =
-        module->getAttrOfType<mlir::BoolAttr>("ftlpu.icu_macro_schedule");
-    const bool macroScheduleEnabled =
-        macroScheduleAttr && macroScheduleAttr.getValue();
+    IcuCompressionMode compressionMode = IcuCompressionMode::Macro;
+    if (const auto compressionAttr =
+            module->getAttrOfType<mlir::StringAttr>(
+                "ftlpu.icu_compression")) {
+        const auto parsed = parse_icu_compression_mode(
+            compressionAttr.getValue().str());
+        if (!parsed)
+            throw std::runtime_error(
+                "Command IR module has an invalid ftlpu.icu_compression");
+        compressionMode = *parsed;
+    } else if (const auto legacyMacroAttr =
+                   module->getAttrOfType<mlir::BoolAttr>(
+                       "ftlpu.icu_macro_schedule")) {
+        compressionMode = legacyMacroAttr.getValue()
+            ? IcuCompressionMode::Macro
+            : IcuCompressionMode::Control;
+    }
     QueueMap queues;
     std::vector<BinaryBinding> bindings;
     std::vector<BinaryTimeline> timelines;
@@ -1896,7 +1981,7 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             program.max_cycle, program.scale_relocations,
             program.address_relocations,
             target->throughput().icu_repeat_2d_enabled != 0,
-            macroScheduleEnabled));
+            compressionMode));
     return program;
 }
 

@@ -4,6 +4,7 @@
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Tensor/IR/tensor_dialect.hpp"
 #include "ftlpu/compiler/Target/command_binary.hpp"
+#include "ftlpu/compiler/Target/icu_compression.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 #include "ftlpu/compiler/Target/mxm_execution_strategy.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
@@ -51,7 +52,8 @@ struct Args {
         ftlpu::compiler::target::MxmExecutionPolicy::Auto};
     std::int64_t weight_bank{-1};
     bool pass_timing{false};
-    bool icu_macro_schedule{false};
+    ftlpu::compiler::target::IcuCompressionMode icu_compression{
+        ftlpu::compiler::target::IcuCompressionMode::Macro};
 };
 
 InputStage parse_input_stage(const std::string& value)
@@ -84,7 +86,17 @@ Args parse_args(int argc, char** argv)
         else if (argument == "--pass-timing")
             args.pass_timing = true;
         else if (argument == "--icu-macro-schedule")
-            args.icu_macro_schedule = true;
+            args.icu_compression =
+                ftlpu::compiler::target::IcuCompressionMode::Macro;
+        else if (argument == "--icu-compression") {
+            const std::string value = next();
+            const auto parsed = ftlpu::compiler::target::
+                parse_icu_compression_mode(value);
+            if (!parsed)
+                throw std::runtime_error(
+                    "unknown ICU compression mode: " + value);
+            args.icu_compression = *parsed;
+        }
         else if (argument == "--ffn-schedule") {
             const std::string value = next();
             if (value == "tail")
@@ -136,7 +148,7 @@ Args parse_args(int argc, char** argv)
             "[--input-stage stablehlo|stream|schedule|verified-schedule|command] "
             "[--target-config target.json] [--weight-bank 0|1] "
             "[--mxm-execution auto|vector|legacy] "
-            "[--icu-macro-schedule] "
+            "[--icu-compression none|control|macro] "
             "[--ffn-schedule tail|fused] "
             "[--attention-schedule tail|fused] "
             "[--rmsnorm-strategy vxm-square-mxm-reduce|vxm-feedback]");
@@ -195,8 +207,15 @@ try {
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::mxm_execution_policy_name(
                 args.mxm_execution_policy)));
+    (*module)->setAttr("ftlpu.icu_compression",
+        mlir::StringAttr::get(&context,
+            ftlpu::compiler::target::icu_compression_mode_name(
+                args.icu_compression)));
+    // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
-        mlir::BoolAttr::get(&context, args.icu_macro_schedule));
+        mlir::BoolAttr::get(&context,
+            args.icu_compression
+                == ftlpu::compiler::target::IcuCompressionMode::Macro));
 
     mlir::PassManager passes(&context);
     // Model-scale schedules contain hundreds of thousands of primitive ops.
@@ -224,7 +243,9 @@ try {
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_assign_weight_bank_pass(
                 args.weight_bank));
-    if (args.input_stage != InputStage::VerifiedSchedule
+    if (args.icu_compression
+            != ftlpu::compiler::target::IcuCompressionMode::None
+        && args.input_stage != InputStage::VerifiedSchedule
         && args.input_stage != InputStage::Command)
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_compress_schedule_pass());

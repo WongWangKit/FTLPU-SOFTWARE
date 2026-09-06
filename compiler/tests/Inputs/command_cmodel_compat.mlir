@@ -1,4 +1,4 @@
-module {
+module attributes {ftlpu.icu_compression = "control"} {
   func.func @main() {
     ftlpu.command.mem {
       cycle = 0 : i64, queue = 0 : i64, opcode = "read",
