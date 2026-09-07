@@ -560,7 +560,8 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
         || binding.page_bank_count < 2
         || binding.page_storage_slices.empty()
         || binding.slices.size() != 8
-        || binding.page_storage_slices.size() % binding.slices.size() != 0)
+        || binding.page_storage_slices.size() % binding.slices.size() != 0
+        || binding.base_row < 0 || binding.address_stride == 0)
         throw std::invalid_argument(
             "invalid paged Vector-MXM weight binding");
     if (hardware.bytes_per_word != hw::kPhysicalVectorBytes
@@ -582,12 +583,31 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
     const bool ffnWave =
         binding.layout == BindingLayout::W8A16MxmWeightWaveStriped;
     const bool projection = rows < columns;
+    const BinaryWeightPagePlacement pagePlacement =
+        resolve_weight_page_placement(binding, page_index);
+    const std::uint64_t pageBegin = pagePlacement.base_row;
+    const std::uint64_t pageEnd = pageBegin + pagePlacement.row_count;
+    const std::uint64_t bindingBase =
+        static_cast<std::uint64_t>(binding.base_row);
+    const std::uint64_t stride = binding.address_stride;
+    if (pagePlacement.row_count == 0 || pageEnd <= pageBegin
+        || bindingBase + (pageEnd - 1) * stride
+            >= hardware.sram_depth_rows)
+        throw std::invalid_argument(
+            "paged weight placement exceeds the executable SRAM bank");
     const std::size_t reductionBlocks = rows / 32;
     const std::size_t outputWaves = columns / 128;
     const std::size_t pagesPerOutputWave = projection ? 0
         : (reductionBlocks + binding.page_granularity - 1)
             / binding.page_granularity;
     ImageWriter image(hardware);
+    const auto physicalRow = [&](std::size_t pageRelativeRow) {
+        if (pageRelativeRow < pageBegin || pageRelativeRow >= pageEnd)
+            throw std::out_of_range(
+                "packed weight row is outside its physical page");
+        return static_cast<std::uint32_t>(
+            bindingBase + pageRelativeRow * stride);
+    };
 
     if (!ffnWave) {
         const bool attention = binding.layout
@@ -605,13 +625,13 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
                 const std::size_t localItem = itemInPage
                     % binding.page_items_per_slice_group;
                 const std::size_t sliceGroup =
-                    binding.page_role_group_base
+                    pagePlacement.slice_group_base
                     + itemInPage / binding.page_items_per_slice_group;
                 const std::size_t local = n % 32;
                 const std::size_t pulse = 3 - local / 8;
                 const std::size_t stream = local % 8;
-                if (sliceGroup >= binding.page_role_group_base
-                        + binding.page_role_group_count
+                if (sliceGroup >= pagePlacement.slice_group_base
+                        + pagePlacement.slice_group_count
                     || sliceGroup * loadSlices + stream
                         >= binding.page_storage_slices.size())
                     throw std::out_of_range(
@@ -621,18 +641,14 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
                         attention ? (n / 64) % 2 : (n / 32) % 2);
                 const std::size_t slot = attention
                     ? (n % 64) / 32 : 0;
-                const std::size_t address =
-                    (localItem * reductionBlocks + reduction)
+                const std::size_t address = pagePlacement.base_row
+                    + (localItem * reductionBlocks + reduction)
                         * rowsPerItem
                     + slot * 4 + pulse;
-                if (address >= binding.page_rows)
-                    throw std::out_of_range(
-                        "paged weight row is outside its SRAM page");
                 image.write(hemisphere,
                     binding.page_storage_slices[
                         sliceGroup * loadSlices + stream],
-                    static_cast<std::uint32_t>(binding.base_row
-                        + address * binding.address_stride),
+                    physicalRow(address),
                     static_cast<std::uint32_t>(k % 32),
                     data[k * columns + n]);
             }
@@ -671,29 +687,26 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
             }
             if (logicalPage != page_index) continue;
             const std::size_t sliceGroup =
-                binding.page_role_group_base
+                pagePlacement.slice_group_base
                 + itemInPage / binding.page_items_per_slice_group;
-            if (sliceGroup >= binding.page_role_group_base
-                    + binding.page_role_group_count
+            if (sliceGroup >= pagePlacement.slice_group_base
+                    + pagePlacement.slice_group_count
                 || sliceGroup * loadSlices + stream
                     >= binding.page_storage_slices.size())
                 throw std::out_of_range(
                     "paged weight slice group is outside its binding");
             const std::uint16_t slice = binding.page_storage_slices[
                 sliceGroup * loadSlices + stream];
-            const std::size_t address = projection
+            const std::size_t address = pagePlacement.base_row
+                + (projection
                 ? ((localItem / logicalSlots) * reductionBlocks
                       + reduction)
                         * logicalSlots * rowsPerLoad
                     + slot * rowsPerLoad + pulse
                 : localItem * logicalSlots * rowsPerLoad
-                    + slot * rowsPerLoad + pulse;
-            if (address >= binding.page_rows)
-                throw std::out_of_range(
-                    "paged weight row is outside its SRAM page");
+                    + slot * rowsPerLoad + pulse);
             image.write(hemisphere, slice,
-                static_cast<std::uint32_t>(binding.base_row
-                    + address * binding.address_stride),
+                physicalRow(address),
                 static_cast<std::uint32_t>(k % 32),
                 data[k * columns + n]);
         }

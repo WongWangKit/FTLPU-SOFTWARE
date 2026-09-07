@@ -101,20 +101,29 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     const int64_t wavesPerPage = placement
                         .getAs<mlir::IntegerAttr>("page_granularity")
                         .getInt();
-                    const int64_t roleGroupBase = placement
-                        .getAs<mlir::IntegerAttr>("page_role_group_base")
-                        .getInt();
                     const int64_t itemsPerGroup = placement
                         .getAs<mlir::IntegerAttr>(
                             "page_items_per_slice_group")
                         .getInt();
-                    const int64_t bankCount = placement
-                        .getAs<mlir::IntegerAttr>("page_bank_count")
-                        .getInt();
+                    if (wavesPerPage <= 0 || itemsPerGroup <= 0) {
+                        ffn.getOperation()->emitError(
+                            "paged FFN projection has invalid page geometry");
+                        return mlir::failure();
+                    }
                     page = pair / wavesPerPage;
-                    bank = (bank + page) % bankCount;
+                    auto pagePlacement = resolve_page_placement(
+                        placement, page);
+                    if (mlir::failed(pagePlacement)) {
+                        ffn.getOperation()->emitError(
+                            "paged FFN projection has invalid physical page placement")
+                            << ": projection=" << projection
+                            << ", page=" << page;
+                        return mlir::failure();
+                    }
+                    bank = pagePlacement->bank;
                     const int64_t pairInPage = pair % wavesPerPage;
-                    const int64_t sliceGroup = roleGroupBase
+                    const int64_t sliceGroup =
+                        pagePlacement->slice_group_base
                         + pairInPage / itemsPerGroup;
                     const int64_t localPair = pairInPage % itemsPerGroup;
                     const auto storage = placement
@@ -123,8 +132,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         static_cast<int64_t>(selectedWeightSlices.size());
                     const int64_t storageOffset =
                         sliceGroup * loadSliceCount;
-                    if (wavesPerPage <= 0 || itemsPerGroup <= 0
-                        || bankCount <= 0 || storageOffset < 0
+                    if (sliceGroup
+                            >= pagePlacement->slice_group_base
+                                + pagePlacement->slice_group_count
+                        || storageOffset < 0
                         || storageOffset + loadSliceCount
                             > static_cast<int64_t>(storage.size())) {
                         ffn.getOperation()->emitError(
@@ -145,7 +156,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                 storage[storageOffset + index])
                                 .getInt());
                     const int64_t logicalSlots = singleMxm ? 2 : 1;
-                    base = ((localPair / logicalSlots) * (k / tile)
+                    base = bindingBase + pagePlacement->base_row
+                        + ((localPair / logicalSlots) * (k / tile)
                               + reduction)
                             * logicalSlots * weightLoadCycles
                         + (localPair % logicalSlots) * weightLoadCycles;

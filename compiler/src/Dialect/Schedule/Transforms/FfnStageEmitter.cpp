@@ -19,7 +19,13 @@ bool isPagedWeight(mlir::DictionaryAttr placement)
     return paged && paged.getValue();
 }
 
-llvm::SmallVector<int64_t> occupiedBanks(mlir::DictionaryAttr placement)
+struct OccupiedPage {
+    int64_t index;
+    int64_t bank;
+};
+
+llvm::SmallVector<OccupiedPage> occupiedPages(
+    mlir::DictionaryAttr placement)
 {
     const auto integerOr = [&](llvm::StringRef name, int64_t fallback) {
         const auto value = placement.getAs<mlir::IntegerAttr>(name);
@@ -30,21 +36,26 @@ llvm::SmallVector<int64_t> occupiedBanks(mlir::DictionaryAttr placement)
     const int64_t pageCount = std::max<int64_t>(
         1, integerOr("page_count", 1));
     const int64_t baseBank = integerOr("bank", 0);
-    llvm::SmallVector<int64_t> banks;
+    const auto exactBanks = placement.getAs<mlir::ArrayAttr>("page_banks");
+    llvm::SmallVector<OccupiedPage> pages;
     for (int64_t page = 0; page < pageCount; ++page) {
-        const int64_t bank = (baseBank + page) % bankCount;
-        if (!llvm::is_contained(banks, bank)) banks.push_back(bank);
+        const int64_t bank = exactBanks
+                && page < static_cast<int64_t>(exactBanks.size())
+            ? llvm::cast<mlir::IntegerAttr>(exactBanks[page]).getInt()
+            : (baseBank + page) % bankCount;
+        pages.push_back({page, bank});
     }
-    return banks;
+    return pages;
 }
 
 bool residencyOverlaps(mlir::DictionaryAttr lhs,
     mlir::DictionaryAttr rhs)
 {
-    for (int64_t lhsBank : occupiedBanks(lhs))
-        for (int64_t rhsBank : occupiedBanks(rhs))
+    for (const OccupiedPage lhsPage : occupiedPages(lhs))
+        for (const OccupiedPage rhsPage : occupiedPages(rhs))
             if (pagedWeightResidencyOverlaps(
-                    lhs, lhsBank, rhs, rhsBank))
+                    lhs, lhsPage.index, lhsPage.bank,
+                    rhs, rhsPage.index, rhsPage.bank))
                 return true;
     return false;
 }
@@ -107,6 +118,71 @@ FfnProjectionOrder chooseProjectionOrder(PrimitiveFfnSchedulePlan& ffn,
         return FfnProjectionOrder::Interleaved;
     return gateRefill ? FfnProjectionOrder::UpThenGate
                       : FfnProjectionOrder::GateThenUp;
+}
+
+mlir::DictionaryAttr orderDownPagesByProjectionRelease(
+    mlir::OpBuilder& builder, mlir::DictionaryAttr down,
+    mlir::DictionaryAttr gate, mlir::DictionaryAttr up,
+    FfnProjectionOrder order)
+{
+    const auto pageGroups = down.getAs<mlir::ArrayAttr>(
+        "page_slice_group_bases");
+    const auto pageGroupCounts = down.getAs<mlir::ArrayAttr>(
+        "page_slice_group_counts");
+    if (!pageGroups || !pageGroupCounts
+        || pageGroups.size() != pageGroupCounts.size()
+        || order == FfnProjectionOrder::Interleaved)
+        return down;
+    const auto integer = [](mlir::DictionaryAttr placement,
+                             llvm::StringRef name) -> std::optional<int64_t> {
+        if (const auto value = placement.getAs<mlir::IntegerAttr>(name))
+            return value.getInt();
+        return std::nullopt;
+    };
+    const auto gateBase = integer(gate, "page_role_group_base");
+    const auto gateCount = integer(gate, "page_role_group_count");
+    const auto upBase = integer(up, "page_role_group_base");
+    const auto upCount = integer(up, "page_role_group_count");
+    if (!gateBase || !gateCount || !upBase || !upCount
+        || *gateCount <= 0 || *upCount <= 0)
+        return down;
+
+    llvm::SmallVector<int64_t> canonical;
+    llvm::SmallVector<int64_t> releaseOrder;
+    const auto appendRange = [](llvm::SmallVectorImpl<int64_t>& values,
+                                 int64_t base, int64_t count) {
+        for (int64_t index = 0; index < count; ++index)
+            values.push_back(base + index);
+    };
+    appendRange(canonical, *gateBase, *gateCount);
+    appendRange(canonical, *upBase, *upCount);
+    if (order == FfnProjectionOrder::UpThenGate) {
+        appendRange(releaseOrder, *upBase, *upCount);
+        appendRange(releaseOrder, *gateBase, *gateCount);
+    } else {
+        appendRange(releaseOrder, *gateBase, *gateCount);
+        appendRange(releaseOrder, *upBase, *upCount);
+    }
+    if (canonical.size() != releaseOrder.size()) return down;
+
+    llvm::SmallVector<mlir::Attribute> reordered;
+    reordered.reserve(pageGroups.size());
+    for (std::size_t page = 0; page < pageGroups.size(); ++page) {
+        const int64_t group =
+            llvm::cast<mlir::IntegerAttr>(pageGroups[page]).getInt();
+        const int64_t groupCount =
+            llvm::cast<mlir::IntegerAttr>(pageGroupCounts[page]).getInt();
+        const auto position = llvm::find(canonical, group);
+        const bool remappable = groupCount == 1
+            && position != canonical.end();
+        const int64_t mapped = remappable
+            ? releaseOrder[std::distance(canonical.begin(), position)]
+            : group;
+        reordered.push_back(builder.getI64IntegerAttr(mapped));
+    }
+    mlir::NamedAttrList attrs(down);
+    attrs.set("page_slice_group_bases", builder.getArrayAttr(reordered));
+    return attrs.getDictionary(builder.getContext());
 }
 
 } // namespace
@@ -321,6 +397,9 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     const int64_t downAccumulatorBase = 0;
     auto projectionType = mlir::RankedTensorType::get(
         {tile, tile}, rewriter.getF32Type());
+    const auto downWeightPlacement = orderDownPagesByProjectionRelease(
+        rewriter, downRaw.getPlacement(), gateRaw.getPlacement(),
+        upRaw.getPlacement(), projectionOrder);
 
     return std::make_unique<FfnEmissionContext>(FfnEmissionContext {
         rewriter,
@@ -335,6 +414,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         gateRaw,
         upRaw,
         downRaw,
+        downWeightPlacement,
         std::move(weightSlices),
         std::move(upWeightSlices),
         std::move(downWeightSlices),

@@ -34,17 +34,29 @@ int64_t hemisphereMask(mlir::DictionaryAttr placement)
 }
 
 WeightResidencyRegion residencyRegion(
-    mlir::DictionaryAttr placement, int64_t bank)
+    mlir::DictionaryAttr placement, int64_t page, int64_t bank)
 {
     WeightResidencyRegion region;
     region.bank = bank;
     region.hemisphereMask = hemisphereMask(placement);
-    region.rowBegin = std::max<int64_t>(
+    const auto pageArrayValue = [&](llvm::StringRef name,
+                                    int64_t fallback) {
+        const auto values = placement.getAs<mlir::ArrayAttr>(name);
+        if (!values || page < 0
+            || page >= static_cast<int64_t>(values.size()))
+            return fallback;
+        return llvm::cast<mlir::IntegerAttr>(values[page]).getInt();
+    };
+    const int64_t bindingBase = std::max<int64_t>(
         0, integerAttrOr(placement, "base_row", 0));
-    const int64_t instructionCount = std::max<int64_t>(
-        1, integerAttrOr(placement, "instruction_count", 1));
+    const int64_t pageBase = std::max<int64_t>(
+        0, pageArrayValue("page_base_rows", 0));
+    const int64_t instructionCount = std::max<int64_t>(1,
+        pageArrayValue("page_row_counts",
+            integerAttrOr(placement, "instruction_count", 1)));
     const int64_t addressStride = std::max<int64_t>(
         1, integerAttrOr(placement, "address_stride", 1));
+    region.rowBegin = bindingBase + pageBase * addressStride;
     const int64_t maxSpan = std::numeric_limits<int64_t>::max()
         - region.rowBegin;
     const int64_t rowSpan = instructionCount > maxSpan / addressStride
@@ -57,10 +69,12 @@ WeightResidencyRegion residencyRegion(
     if (storageSlices) {
         const int64_t groupWidth = logicalSlices && !logicalSlices.empty()
             ? static_cast<int64_t>(logicalSlices.size()) : 8;
-        const int64_t groupBase = std::max<int64_t>(
-            0, integerAttrOr(placement, "page_role_group_base", 0));
-        const int64_t groupCount = std::max<int64_t>(
-            1, integerAttrOr(placement, "page_role_group_count", 1));
+        const int64_t groupBase = std::max<int64_t>(0,
+            pageArrayValue("page_slice_group_bases",
+                integerAttrOr(placement, "page_role_group_base", 0)));
+        const int64_t groupCount = std::max<int64_t>(1,
+            pageArrayValue("page_slice_group_counts",
+                integerAttrOr(placement, "page_role_group_count", 1)));
         const int64_t begin = std::min<int64_t>(
             storageSlices.size(), groupBase * groupWidth);
         const int64_t end = std::min<int64_t>(
@@ -92,15 +106,25 @@ bool pagedWeightResidencyOverlaps(
 {
     if (!lhs || !rhs) return true;
     return pagedWeightResidencyOverlaps(
-        lhs, placementBank(lhs), rhs, placementBank(rhs));
+        lhs, -1, placementBank(lhs), rhs, -1, placementBank(rhs));
 }
 
 bool pagedWeightResidencyOverlaps(mlir::DictionaryAttr lhs, int64_t lhsBank,
     mlir::DictionaryAttr rhs, int64_t rhsBank)
 {
+    return pagedWeightResidencyOverlaps(
+        lhs, -1, lhsBank, rhs, -1, rhsBank);
+}
+
+bool pagedWeightResidencyOverlaps(mlir::DictionaryAttr lhs, int64_t lhsPage,
+    int64_t lhsBank, mlir::DictionaryAttr rhs, int64_t rhsPage,
+    int64_t rhsBank)
+{
     if (!lhs || !rhs) return true;
-    const WeightResidencyRegion left = residencyRegion(lhs, lhsBank);
-    const WeightResidencyRegion right = residencyRegion(rhs, rhsBank);
+    const WeightResidencyRegion left = residencyRegion(
+        lhs, lhsPage, lhsBank);
+    const WeightResidencyRegion right = residencyRegion(
+        rhs, rhsPage, rhsBank);
     if (left.bank != right.bank
         || (left.hemisphereMask & right.hemisphereMask) == 0
         || left.rowBegin >= right.rowEnd || right.rowBegin >= left.rowEnd)

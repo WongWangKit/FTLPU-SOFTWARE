@@ -1459,8 +1459,11 @@ try {
             + " expected="
             + std::to_string(residualCheckpointMaxExpected));
 
-    const std::size_t ffnStartCycle =
-        firstBindingReadCycle(program, 7);
+    const std::size_t ffnStartCycle = std::min({
+        firstBindingReadCycle(program, 7),
+        firstBindingReadCycle(program, 8),
+        firstBindingReadCycle(program, 9),
+    });
     runtime.run_cycles(
         ffnStartCycle - attentionResidualEndCycle, cmodelLogSink);
     // Paged executables reuse the resident weight bank as scratch between

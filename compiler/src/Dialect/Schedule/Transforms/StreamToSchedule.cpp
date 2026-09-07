@@ -309,7 +309,8 @@ int64_t requiredWeightPrefetchDelay(
                 && prior.bank == use.bank)
                 continue;
             if (!schedule::pagedWeightResidencyOverlaps(
-                    prior.placement, prior.bank, use.placement, use.bank))
+                    prior.placement, prior.page, prior.bank,
+                    use.placement, use.page, use.bank))
                 continue;
             needsRefill = true;
             reusableCycle = std::max(reusableCycle,

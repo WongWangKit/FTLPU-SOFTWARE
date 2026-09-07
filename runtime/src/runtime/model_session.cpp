@@ -15,6 +15,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <ranges>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -324,6 +325,153 @@ bool weight_page_overlaps_program(const C2cWeightPage &page,
     }
   }
   return false;
+}
+
+bool region_overlaps_binding(const WeightResidencyRegion &region,
+                             const BinaryBinding &binding) {
+  if (binding.bank != region.bank ||
+      (binding.hemisphere_mask & region.hemisphere_mask) == 0 ||
+      binding.instruction_count <= 0)
+    return false;
+  if (!region.wildcard_slice && !binding.slices.empty() &&
+      std::find(binding.slices.begin(), binding.slices.end(), region.slice) ==
+          binding.slices.end())
+    return false;
+  const std::uint64_t bindingBegin = static_cast<std::uint64_t>(
+      std::max<std::int64_t>(0, binding.base_row));
+  const std::uint64_t stride = static_cast<std::uint64_t>(
+      std::max<std::int64_t>(1, binding.address_stride));
+  const std::uint64_t bindingEnd = bindingBegin +
+      static_cast<std::uint64_t>(binding.instruction_count) * stride;
+  return region.row_begin < bindingEnd && bindingBegin < region.row_end;
+}
+
+std::uint64_t safe_inter_invocation_prefetch_cycle(
+    const BinaryProgram &program,
+    std::span<const WeightPrefetchPlan> currentPlans,
+    const WeightPrefetchPlan &nextPlan) {
+  std::uint64_t safeCycle = 0;
+  for (const WeightPrefetchPlan &current : currentPlans)
+    if (weight_prefetch_plans_overlap(current, nextPlan))
+      safeCycle = std::max(safeCycle, current.release_cycle);
+
+  // Paged bindings have exact release intervals above. Other allocations do
+  // not yet carry a release cycle in the binary ABI, so an overlapping range
+  // remains live through the executable. This is conservative and keeps the
+  // same binary correct when DDR latency changes at runtime.
+  for (const BinaryBinding &binding : program.bindings) {
+    if (binding.paged_weight)
+      continue;
+    const bool overlaps = std::any_of(
+        nextPlan.regions.begin(), nextPlan.regions.end(),
+        [&](const WeightResidencyRegion &region) {
+          return region_overlaps_binding(region, binding);
+        });
+    if (overlaps)
+      safeCycle = std::max<std::uint64_t>(safeCycle, program.max_cycle);
+  }
+  return safeCycle;
+}
+
+struct C2cFabricLease {
+  std::uint16_t stream_base{0};
+  std::uint64_t start_cycle{0};
+};
+
+C2cFabricLease select_inter_invocation_c2c_fabric(
+    const BinaryProgram &program, std::uint64_t earliestCycle) {
+  const std::size_t streamCount = program.hardware.streams_per_direction;
+  const std::size_t laneCount =
+      program.hardware.c2c_streams_per_direction;
+  if (laneCount == 0 || laneCount > streamCount ||
+      streamCount > hw::kWestStreams)
+    throw std::logic_error(
+        "invalid target stream geometry for inter-invocation C2C");
+
+  const std::size_t defaultBase = streamCount - laneCount;
+  std::size_t releaseOffset = 0;
+  if (program.stream_release_cycles.size() ==
+      program.hardware.encoded_streams) {
+    if (program.hardware.encoded_streams != 2 * streamCount)
+      throw std::logic_error(
+          "directional stream-release metadata has invalid geometry");
+    // C2C RX enters the ordinary fabric through the West stream file.
+    releaseOffset = streamCount;
+  } else if (program.stream_release_cycles.size() != streamCount) {
+    return {static_cast<std::uint16_t>(defaultBase),
+            std::max<std::uint64_t>(
+                earliestCycle,
+                static_cast<std::uint64_t>(program.max_cycle) + 1)};
+  }
+
+  const auto availableAt = [&](std::size_t base) {
+    std::uint64_t cycle = earliestCycle;
+    for (std::size_t lane = 0; lane < laneCount; ++lane)
+      cycle = std::max(
+          cycle,
+          program.stream_release_cycles[releaseOffset + base + lane]);
+    return cycle;
+  };
+  std::size_t bestBase = defaultBase;
+  std::uint64_t bestCycle = availableAt(bestBase);
+  for (std::size_t base = 0; base + laneCount <= streamCount; ++base) {
+    const std::uint64_t cycle = availableAt(base);
+    if (cycle < bestCycle) {
+      bestBase = base;
+      bestCycle = cycle;
+    }
+  }
+  return {static_cast<std::uint16_t>(bestBase), bestCycle};
+}
+
+WeightPrefetchPlan model_page_plan(const C2cWeightPage &page,
+                                   std::uint32_t pageIndex) {
+  WeightPrefetchPlan plan;
+  plan.page_index = pageIndex;
+  plan.bank = page.bank;
+  plan.pre_execution = true;
+  for (const C2cWeightSegment &segment : page.segments) {
+    const auto side = hemisphere_index(segment.hemisphere);
+    plan.bytes[side] += static_cast<std::uint64_t>(segment.vector_count) *
+                        hw::kPhysicalVectorBytes;
+    plan.regions.push_back(WeightResidencyRegion{
+        segment.bank,
+        static_cast<std::uint16_t>(1u << side),
+        segment.slice,
+        segment.base_row,
+        static_cast<std::uint32_t>(segment.base_row + segment.vector_count),
+        false});
+  }
+  return plan;
+}
+
+void verify_c2c_weight_page_residency(C2cDmaSystem &system,
+                                      const C2cWeightPage &page) {
+  for (std::size_t segmentIndex = 0; segmentIndex < page.segments.size();
+       ++segmentIndex) {
+    const C2cWeightSegment &segment = page.segments[segmentIndex];
+    for (std::uint32_t row = 0; row < segment.vector_count; ++row) {
+      const C2cVector expected = system.ddr4().read_vector(
+          segment.ddr4_address +
+          static_cast<std::uint64_t>(row) * hw::kPhysicalVectorBytes);
+      for (std::size_t tile = 0; tile < hw::kTileRows; ++tile)
+        for (std::size_t lane = 0; lane < hw::kLanesPerTile; ++lane) {
+          const std::uint8_t actual = system.chip().read_mem_sram_lane_byte(
+              segment.hemisphere, segment.slice, segment.bank, tile,
+              segment.base_row + row, lane);
+          if (actual != expected.payload[tile][lane])
+            throw std::runtime_error(
+                "inter-invocation C2C residency verification failed: layer=" +
+                std::to_string(page.layer) + " segment=" +
+                std::to_string(segmentIndex) + " hemisphere=" +
+                std::to_string(hemisphere_index(segment.hemisphere)) +
+                " slice=" + std::to_string(segment.slice) + " bank=" +
+                std::to_string(segment.bank) + " row=" +
+                std::to_string(segment.base_row + row) + " tile=" +
+                std::to_string(tile) + " lane=" + std::to_string(lane));
+        }
+    }
+  }
 }
 
 } // namespace
@@ -742,13 +890,12 @@ void ModelSession::observe_weight_page_tick() {
   weight_pager_->retire();
 }
 
-void ModelSession::prepare_executable_weight_pages(
+std::vector<ModelSession::ExecutableWeightTransfer>
+ModelSession::build_executable_weight_pages(
     const BinaryProgram &program, const ModelInvocation &invocation) {
-  executable_weight_transfers_.clear();
-  executable_cycle_ = 0;
-  executable_clock_active_ = false;
+  std::vector<ExecutableWeightTransfer> transfers;
   if (program.weight_page_uses.empty())
-    return;
+    return transfers;
   if (c2c_system_ == nullptr || !weight_pager_)
     throw std::logic_error(
         "executable-local paged weights require ModelSession(C2cDmaSystem&)");
@@ -757,7 +904,7 @@ void ModelSession::prepare_executable_weight_pages(
   const ExecutableHardwareConfig runtimeHardware =
       effective_external_transport(program.hardware);
   auto plans = plan_weight_prefetches(program, runtimeHardware);
-  executable_weight_transfers_.reserve(plans.size());
+  transfers.reserve(plans.size());
   for (const WeightPrefetchPlan &plan : plans) {
     ExecutableWeightTransfer transfer;
     transfer.plan = plan;
@@ -836,15 +983,15 @@ void ModelSession::prepare_executable_weight_pages(
       transfer.plan.bytes[hemisphere_index(segment.hemisphere)] +=
           static_cast<std::uint64_t>(segment.vector_count) *
           hw::kPhysicalVectorBytes;
-    executable_weight_transfers_.push_back(std::move(transfer));
+    transfers.push_back(std::move(transfer));
   }
   for (std::size_t index = 0; index < plans.size(); ++index)
-    plans[index] = executable_weight_transfers_[index].plan;
+    plans[index] = transfers[index].plan;
   schedule_weight_prefetches(program, plans, runtimeHardware);
   for (std::size_t index = 0; index < plans.size(); ++index) {
-    executable_weight_transfers_[index].plan = plans[index];
+    transfers[index].plan = plans[index];
     if (std::getenv("FTLPU_SESSION_PROGRESS") == nullptr) continue;
-    const auto &transfer = executable_weight_transfers_[index];
+    const auto &transfer = transfers[index];
     std::size_t vectors = 0;
     for (const C2cWeightSegment &segment : transfer.page.segments)
       vectors += segment.vector_count;
@@ -863,8 +1010,36 @@ void ModelSession::prepare_executable_weight_pages(
               << " ready=" << transfer.plan.ready_cycle << std::endl;
   }
   executable_ddr4_address_ = nextDdrAddress;
+  return transfers;
+}
+
+void ModelSession::prepare_executable_weight_pages(
+    const BinaryProgram &program, const ModelInvocation &invocation,
+    std::size_t invocationIndex) {
+  executable_weight_transfers_.clear();
+  executable_cycle_ = 0;
+  executable_clock_active_ = false;
+  if (lookahead_invocation_index_ == invocationIndex) {
+    executable_weight_transfers_ =
+        std::move(lookahead_executable_weight_transfers_);
+    lookahead_invocation_index_.reset();
+    lookahead_model_weight_transfer_.reset();
+    for (ExecutableWeightTransfer &transfer :
+         executable_weight_transfers_) {
+      transfer.inter_invocation_lookahead = false;
+      if (transfer.plan.pre_execution && transfer.ready_before_execution)
+        ++stats_.weight_page_hidden_prefetches;
+    }
+  } else {
+    lookahead_executable_weight_transfers_.clear();
+    lookahead_model_weight_transfer_.reset();
+    lookahead_invocation_index_.reset();
+    executable_weight_transfers_ =
+        build_executable_weight_pages(program, invocation);
+  }
+
   for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
-    if (!transfer.plan.pre_execution)
+    if (!transfer.plan.pre_execution || transfer.ready_before_execution)
       continue;
     c2c_system_->reset_execution_state();
     weight_pager_->enqueue(transfer.page);
@@ -879,22 +1054,87 @@ void ModelSession::prepare_executable_weight_pages(
     const std::size_t waitCycles = c2c_system_->cycle() - beginCycle;
     transfer.pre_execution_cycles = waitCycles;
     stats_.weight_page_wait_cycles += waitCycles;
-    stats_.weight_page_initial_wait_cycles += waitCycles;
+    if (completed_invocation_)
+      stats_.weight_page_boundary_wait_cycles += waitCycles;
+    else
+      stats_.weight_page_initial_wait_cycles += waitCycles;
     weight_pager_->retire();
     transfer.ready_before_execution = true;
   }
 }
 
+void ModelSession::prepare_executable_weight_lookahead(
+    std::size_t invocationIndex, const BinaryProgram &program) {
+  lookahead_executable_weight_transfers_.clear();
+  lookahead_model_weight_transfer_.reset();
+  lookahead_invocation_index_.reset();
+  if (std::getenv("FTLPU_SESSION_STOP_CYCLE") != nullptr ||
+      invocationIndex + 1 >= package_.invocations.size())
+    return;
+
+  const std::size_t nextIndex = invocationIndex + 1;
+  const ModelInvocation &nextInvocation = package_.invocations[nextIndex];
+  const ModelExecutable &nextExecutable =
+      package_.executables.at(nextInvocation.executable_index);
+  const BinaryProgram nextProgram = parameterize_program(
+      package_, nextInvocation, memory_plan_.invocations.at(nextIndex),
+      materialize_model_executable(nextExecutable));
+  lookahead_executable_weight_transfers_ =
+      build_executable_weight_pages(nextProgram, nextInvocation);
+
+  std::vector<WeightPrefetchPlan> currentPlans;
+  currentPlans.reserve(executable_weight_transfers_.size());
+  for (const ExecutableWeightTransfer &transfer :
+       executable_weight_transfers_)
+    currentPlans.push_back(transfer.plan);
+  for (ExecutableWeightTransfer &transfer :
+       lookahead_executable_weight_transfers_) {
+    if (!transfer.plan.pre_execution)
+      continue;
+    transfer.inter_invocation_lookahead = true;
+    const auto fabric = select_inter_invocation_c2c_fabric(
+        program, safe_inter_invocation_prefetch_cycle(
+                     program, currentPlans, transfer.plan));
+    transfer.page.fabric_stream_base = fabric.stream_base;
+    transfer.plan.start_cycle = fabric.start_cycle;
+  }
+
+  const std::uint32_t nextPage = nextInvocation.weight_page;
+  const std::uint32_t currentPage =
+      package_.invocations[invocationIndex].weight_page;
+  if (nextPage != 0xffffffffu && nextPage != currentPage) {
+    if (nextPage >= c2c_pages_.size())
+      throw std::logic_error("next model weight page is unavailable");
+    ExecutableWeightTransfer transfer;
+    transfer.page = c2c_pages_[nextPage];
+    transfer.plan = model_page_plan(transfer.page, nextPage);
+    const auto fabric = select_inter_invocation_c2c_fabric(
+        program, safe_inter_invocation_prefetch_cycle(
+                     program, currentPlans, transfer.plan));
+    transfer.page.fabric_stream_base = fabric.stream_base;
+    transfer.plan.start_cycle = fabric.start_cycle;
+    transfer.plan.ready_cycle = program.max_cycle;
+    transfer.inter_invocation_lookahead = true;
+    transfer.model_page_index = nextPage;
+    if (transfer.plan.start_cycle >= program.max_cycle)
+      ++stats_.weight_page_deferred_prefetches;
+    lookahead_model_weight_transfer_ = std::move(transfer);
+  }
+  lookahead_invocation_index_ = nextIndex;
+}
+
 void ModelSession::schedule_executable_weight_pages() {
-  if (executable_weight_transfers_.empty())
+  if (executable_weight_transfers_.empty() &&
+      lookahead_executable_weight_transfers_.empty() &&
+      !lookahead_model_weight_transfer_)
     return;
   std::int64_t preExecutionCursor = 0;
   for (ExecutableWeightTransfer &transfer : executable_weight_transfers_)
-    if (transfer.plan.pre_execution)
+    if (transfer.plan.pre_execution && !transfer.trace_recorded)
       preExecutionCursor -= static_cast<std::int64_t>(
           transfer.pre_execution_cycles);
   for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
-    if (!transfer.plan.pre_execution)
+    if (!transfer.plan.pre_execution || transfer.trace_recorded)
       continue;
     transfer.actual_start_cycle = preExecutionCursor;
     transfer.actual_ready_cycle = preExecutionCursor
@@ -928,16 +1168,44 @@ void ModelSession::schedule_executable_weight_pages() {
           static_cast<std::size_t>(segment.vector_count) *
           hw::kPhysicalVectorBytes;
   }
+
+  std::vector<ExecutableWeightTransfer *> lookahead;
+  for (ExecutableWeightTransfer &transfer :
+       lookahead_executable_weight_transfers_)
+    if (transfer.plan.pre_execution)
+      lookahead.push_back(&transfer);
+  if (lookahead_model_weight_transfer_)
+    lookahead.push_back(&*lookahead_model_weight_transfer_);
+  std::ranges::sort(lookahead, [](const auto *lhs, const auto *rhs) {
+    return lhs->plan.start_cycle < rhs->plan.start_cycle;
+  });
+  for (std::size_t index = 0; index < lookahead.size(); ++index) {
+    ExecutableWeightTransfer &transfer = *lookahead[index];
+    const std::uint64_t duration = transfer.plan.transfer_end_cycle;
+    transfer.plan.start_cycle = std::max<std::uint64_t>(
+        transfer.plan.start_cycle,
+        weight_pager_->earliest_schedule_cycle(transfer.page));
+    transfer.plan.transfer_end_cycle = transfer.plan.start_cycle + duration;
+    transfer.launch_event_tag = 0x20000u + index;
+    transfer.fence = weight_pager_->schedule(
+        transfer.page, static_cast<std::size_t>(transfer.plan.start_cycle),
+        transfer.launch_event_tag);
+    ++stats_.weight_page_prefetches;
+    for (const C2cWeightSegment &segment : transfer.page.segments)
+      stats_.weight_page_prefetch_bytes +=
+          static_cast<std::size_t>(segment.vector_count) *
+          hw::kPhysicalVectorBytes;
+  }
   executable_clock_active_ = true;
 }
 
 void ModelSession::release_due_executable_weight_pages() {
   if (!executable_clock_active_ || c2c_system_ == nullptr)
     return;
-  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
-    if (transfer.plan.pre_execution || transfer.launch_released ||
+  const auto release = [&](ExecutableWeightTransfer &transfer) {
+    if (transfer.launch_event_tag == 0 || transfer.launch_released ||
         transfer.plan.start_cycle > executable_cycle_)
-      continue;
+      return;
     for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
       if (transfer.fence.dma_issues_end[side] ==
           transfer.fence.dma_issues_begin[side])
@@ -949,7 +1217,14 @@ void ModelSession::release_due_executable_weight_pages() {
           IcuLocation::C2cRx(hemisphere), transfer.launch_event_tag);
     }
     transfer.launch_released = true;
-  }
+  };
+  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_)
+    release(transfer);
+  for (ExecutableWeightTransfer &transfer :
+       lookahead_executable_weight_transfers_)
+    release(transfer);
+  if (lookahead_model_weight_transfer_)
+    release(*lookahead_model_weight_transfer_);
 }
 
 void ModelSession::observe_executable_weight_page_tick() {
@@ -957,20 +1232,123 @@ void ModelSession::observe_executable_weight_page_tick() {
     return;
   const auto physicalCycle =
       static_cast<std::int64_t>(runtime_.physical_cycles());
-  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
-    if (transfer.plan.pre_execution || !transfer.launch_released ||
+  const auto observe = [&](ExecutableWeightTransfer &transfer) {
+    if (transfer.launch_event_tag == 0 || !transfer.launch_released ||
         transfer.trace_recorded)
-      continue;
+      return;
     if (!transfer.actual_start_cycle &&
         weight_pager_->started(transfer.fence))
       transfer.actual_start_cycle = physicalCycle;
     if (!weight_pager_->ready(transfer.fence))
-      continue;
+      return;
     if (!transfer.actual_start_cycle)
       transfer.actual_start_cycle = physicalCycle;
     transfer.actual_ready_cycle = physicalCycle + 1;
     record_weight_page_trace(transfer);
+  };
+  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_)
+    observe(transfer);
+  for (ExecutableWeightTransfer &transfer :
+       lookahead_executable_weight_transfers_)
+    observe(transfer);
+  if (lookahead_model_weight_transfer_)
+    observe(*lookahead_model_weight_transfer_);
+}
+
+std::size_t ModelSession::settle_executable_weight_lookahead() {
+  if (!weight_pager_ || !c2c_system_ || !lookahead_invocation_index_)
+    return 0;
+  std::vector<ExecutableWeightTransfer *> transfers;
+  for (ExecutableWeightTransfer &transfer :
+       lookahead_executable_weight_transfers_)
+    if (transfer.plan.pre_execution && transfer.launch_event_tag != 0)
+      transfers.push_back(&transfer);
+  if (lookahead_model_weight_transfer_ &&
+      lookahead_model_weight_transfer_->launch_event_tag != 0)
+    transfers.push_back(&*lookahead_model_weight_transfer_);
+  if (transfers.empty())
+    return 0;
+
+  // Once the current executable has drained, every current-layer residency
+  // interval is over. Release any lookahead event that was intentionally
+  // placed at the tail and then wait only for real unfinished transport.
+  for (ExecutableWeightTransfer *transfer : transfers) {
+    if (transfer->launch_released)
+      continue;
+    for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
+      if (transfer->fence.dma_issues_end[side] ==
+          transfer->fence.dma_issues_begin[side])
+        continue;
+      const auto hemisphere = static_cast<Hemisphere>(side);
+      c2c_system_->chip().icu().notify_tagged(
+          IcuLocation::C2cDma(hemisphere), transfer->launch_event_tag);
+      c2c_system_->chip().icu().notify_tagged(
+          IcuLocation::C2cRx(hemisphere), transfer->launch_event_tag);
+    }
+    transfer->launch_released = true;
   }
+
+  std::size_t maximumCycles = 4096;
+  for (const ExecutableWeightTransfer *transfer : transfers)
+    for (const C2cWeightSegment &segment : transfer->page.segments) {
+      const std::size_t vectors = segment.vector_count;
+      if (vectors > (std::numeric_limits<std::size_t>::max() -
+                     maximumCycles) /
+                        64)
+        throw std::overflow_error("lookahead C2C timeout overflows size_t");
+      maximumCycles += vectors * 64;
+    }
+  const std::int64_t physicalBase =
+      static_cast<std::int64_t>(runtime_.physical_cycles());
+  std::size_t waited = 0;
+  const auto allReady = [&] {
+    return std::ranges::all_of(transfers, [&](const auto *transfer) {
+      return weight_pager_->ready(transfer->fence);
+    });
+  };
+  while (!allReady() && waited < maximumCycles) {
+    c2c_system_->tick();
+    ++waited;
+    const std::int64_t physicalCycle =
+        physicalBase + static_cast<std::int64_t>(waited);
+    for (ExecutableWeightTransfer *transfer : transfers) {
+      if (!transfer->actual_start_cycle &&
+          weight_pager_->started(transfer->fence))
+        transfer->actual_start_cycle = physicalCycle;
+      if (!transfer->trace_recorded &&
+          weight_pager_->ready(transfer->fence)) {
+        if (!transfer->actual_start_cycle)
+          transfer->actual_start_cycle = physicalCycle;
+        transfer->actual_ready_cycle = physicalCycle + 1;
+        record_weight_page_trace(*transfer);
+      }
+    }
+  }
+  if (!allReady())
+    throw std::runtime_error(
+        "inter-invocation C2C weight lookahead timed out");
+  if (std::getenv("FTLPU_VERIFY_LOOKAHEAD_WEIGHTS") != nullptr)
+    for (const ExecutableWeightTransfer *transfer : transfers)
+      verify_c2c_weight_page_residency(*c2c_system_, transfer->page);
+  for (ExecutableWeightTransfer *transfer : transfers) {
+    if (!transfer->actual_start_cycle)
+      transfer->actual_start_cycle = physicalBase;
+    if (!transfer->actual_ready_cycle)
+      transfer->actual_ready_cycle = physicalBase +
+          static_cast<std::int64_t>(waited) + 1;
+    record_weight_page_trace(*transfer);
+    transfer->ready_before_execution = true;
+  }
+  if (lookahead_model_weight_transfer_) {
+    ready_weight_page_ =
+        *lookahead_model_weight_transfer_->model_page_index;
+    inflight_weight_page_.reset();
+  }
+  if (waited != 0) {
+    stats_.weight_page_wait_cycles += waited;
+    stats_.weight_page_boundary_wait_cycles += waited;
+  }
+  return waited;
 }
 
 void ModelSession::record_weight_page_trace(
@@ -989,6 +1367,12 @@ void ModelSession::record_weight_page_trace(
           c2c_system_->chip().hardware_configuration()
               .c2c_streams_per_direction) *
       c2c_bytes_per_stream_per_cycle_;
+  const std::size_t c2cStreamCount =
+      c2c_system_->chip().hardware_configuration()
+          .c2c_streams_per_direction;
+  const std::size_t fabricStreamBase =
+      transfer.page.fabric_stream_base.value_or(
+          static_cast<std::uint16_t>(hw::kWestStreams - c2cStreamCount));
   for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
     if (transfer.plan.bytes[side] == 0)
       continue;
@@ -999,10 +1383,20 @@ void ModelSession::record_weight_page_trace(
            << " bindings=" << bindings.str()
            << " bytes=" << transfer.plan.bytes[side]
            << " bandwidth=" << bandwidth << "B/cycle"
+           << " fabric_streams=" << fabricStreamBase << ".."
+           << (fabricStreamBase + c2cStreamCount - 1)
            << " consumer_cycle=" << transfer.plan.ready_cycle
            << " actual_ready=" << *transfer.actual_ready_cycle
-           << " phase="
-           << (transfer.plan.pre_execution ? "pre_execution" : "overlap");
+           << " phase=";
+    if (transfer.inter_invocation_lookahead)
+      detail << "inter_invocation_lookahead";
+    else if (transfer.plan.pre_execution)
+      detail << "pre_execution";
+    else
+      detail << "overlap";
+    if (transfer.model_page_index)
+      detail << " scope=model invocation_page="
+             << *transfer.model_page_index;
     runtime_.record_execution_trace_interval(*transfer.actual_start_cycle,
         *transfer.actual_ready_cycle,
         std::string("C2C.") + sideName + ".Prefetch", detail.str());
@@ -1010,7 +1404,9 @@ void ModelSession::record_weight_page_trace(
         *transfer.actual_ready_cycle,
         std::string("SR.") + sideName + ".C2C.Shared",
         "page=" + std::to_string(transfer.plan.page_index) +
-            " bank=" + std::to_string(transfer.plan.bank));
+            " bank=" + std::to_string(transfer.plan.bank) +
+            " streams=" + std::to_string(fabricStreamBase) + ".." +
+            std::to_string(fabricStreamBase + c2cStreamCount - 1));
     runtime_.record_execution_trace_interval(*transfer.actual_start_cycle,
         *transfer.actual_ready_cycle,
         std::string("MEM.") + sideName + ".C2CWrite",
@@ -1098,6 +1494,10 @@ void ModelSession::load(ModelPackage package) {
   device_values_.clear();
   stats_ = {};
   load_stats_ = {};
+  executable_weight_transfers_.clear();
+  lookahead_executable_weight_transfers_.clear();
+  lookahead_model_weight_transfer_.reset();
+  lookahead_invocation_index_.reset();
   completed_invocation_ = false;
   execution_trace_has_segment_ = false;
   execution_trace_cycle_cursor_ = 0;
@@ -1259,7 +1659,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   const std::size_t inputTransferCycles =
       stats_.c2c_ingress_cycles - ingressBefore;
   const std::size_t executablePageWaitBefore = stats_.weight_page_wait_cycles;
-  prepare_executable_weight_pages(program, invocation);
+  prepare_executable_weight_pages(program, invocation, index);
   const std::size_t executablePreExecutionCycles =
       stats_.weight_page_wait_cycles - executablePageWaitBefore;
   const auto traceOrigin = execution_trace_cycle_cursor_
@@ -1291,10 +1691,13 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
           localCursor + static_cast<std::int64_t>(inputTransferCycles),
           "C2C.HostInput", "invocation=" + std::to_string(index));
   }
+  if (!program.weight_page_uses.empty())
+    prepare_executable_weight_lookahead(index, program);
   schedule_executable_weight_pages();
   if (index + 1 < package_.invocations.size()) {
     const auto nextPage = package_.invocations[index + 1].weight_page;
-    if (nextPage != 0xffffffffu && nextPage != invocation.weight_page) {
+    if (nextPage != 0xffffffffu && nextPage != invocation.weight_page &&
+        !lookahead_model_weight_transfer_) {
       if (nextPage >= c2c_pages_.size())
         throw std::logic_error("next model weight page is unavailable");
       if (!program.weight_page_uses.empty() ||
@@ -1325,6 +1728,8 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     runtime_.run_cycles(executionCycles);
   }
   const std::size_t invocationPhysicalCycles = runtime_.physical_cycles();
+  const std::size_t lookaheadBoundaryCycles =
+      settle_executable_weight_lookahead();
   if (execution_trace_enabled_)
     runtime_.record_execution_trace_interval(0,
         static_cast<std::int64_t>(invocationPhysicalCycles),
@@ -1414,12 +1819,15 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
       stats_.c2c_egress_cycles - egressBefore;
   if (execution_trace_enabled_ && outputTransferCycles != 0)
     runtime_.record_execution_trace_interval(
-        static_cast<std::int64_t>(invocationPhysicalCycles),
         static_cast<std::int64_t>(
-            invocationPhysicalCycles + outputTransferCycles),
+            invocationPhysicalCycles + lookaheadBoundaryCycles),
+        static_cast<std::int64_t>(
+            invocationPhysicalCycles + lookaheadBoundaryCycles +
+            outputTransferCycles),
         "C2C.HostOutput", "invocation=" + std::to_string(index));
   execution_trace_cycle_cursor_ = traceOrigin
       + static_cast<std::int64_t>(invocationPhysicalCycles)
+      + static_cast<std::int64_t>(lookaheadBoundaryCycles)
       + static_cast<std::int64_t>(outputTransferCycles);
   execution_trace_has_segment_ = true;
 }
@@ -1548,6 +1956,10 @@ void ModelSession::run(std::size_t drain_cycles) {
     throw std::logic_error("no FTLPU model package is loaded");
   device_values_.clear();
   stats_ = load_stats_;
+  executable_weight_transfers_.clear();
+  lookahead_executable_weight_transfers_.clear();
+  lookahead_model_weight_transfer_.reset();
+  lookahead_invocation_index_.reset();
   execution_trace_has_segment_ = false;
   execution_trace_cycle_cursor_ = 0;
   run_embedding_lookups();

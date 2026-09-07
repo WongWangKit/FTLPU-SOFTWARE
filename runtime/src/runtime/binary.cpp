@@ -498,6 +498,22 @@ QueueCommand read_compact_queue_command(std::istream& is)
 
 void write_binding(std::ostream& os, const BinaryBinding& binding)
 {
+    const auto pagePlacementCount = binding.page_banks.size();
+    if ((pagePlacementCount != 0
+            || !binding.page_slice_group_bases.empty()
+            || !binding.page_slice_group_counts.empty()
+            || !binding.page_base_rows.empty()
+            || !binding.page_row_counts.empty())
+        && (binding.page_slice_group_bases.size() != pagePlacementCount
+            || binding.page_slice_group_counts.size() != pagePlacementCount
+            || binding.page_base_rows.size() != pagePlacementCount
+            || binding.page_row_counts.size() != pagePlacementCount))
+        throw std::runtime_error(
+            "FTLPU binding page placement arrays have different lengths");
+    if (pagePlacementCount != 0
+        && pagePlacementCount != binding.page_count)
+        throw std::runtime_error(
+            "FTLPU binding page placement count does not match page_count");
     write_scalar<std::uint32_t>(os, binding.index);
     write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(binding.access));
     write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(binding.element_type));
@@ -536,6 +552,18 @@ void write_binding(std::ostream& os, const BinaryBinding& binding)
     write_scalar<std::uint32_t>(os, binding.page_bank_count);
     for (std::uint16_t slice : binding.page_storage_slices)
         write_scalar<std::uint16_t>(os, slice);
+    write_scalar<std::uint32_t>(
+        os, static_cast<std::uint32_t>(pagePlacementCount));
+    for (std::size_t page = 0; page < pagePlacementCount; ++page) {
+        write_scalar<std::uint16_t>(os, binding.page_banks[page]);
+        write_scalar<std::uint16_t>(
+            os, binding.page_slice_group_bases[page]);
+        write_scalar<std::uint16_t>(
+            os, binding.page_slice_group_counts[page]);
+        write_scalar<std::uint16_t>(os, 0);
+        write_scalar<std::uint32_t>(os, binding.page_base_rows[page]);
+        write_scalar<std::uint32_t>(os, binding.page_row_counts[page]);
+    }
     os.write(binding.role.data(),
         static_cast<std::streamsize>(binding.role.size()));
     os.write(binding.name.data(),
@@ -595,6 +623,29 @@ BinaryBinding read_binding(std::istream& is, std::uint32_t version)
                      index < page_slice_count; ++index)
                     binding.page_storage_slices.push_back(
                         read_scalar<std::uint16_t>(is));
+                if (version >= 30) {
+                    const auto placementCount =
+                        read_scalar<std::uint32_t>(is);
+                    binding.page_banks.reserve(placementCount);
+                    binding.page_slice_group_bases.reserve(placementCount);
+                    binding.page_slice_group_counts.reserve(placementCount);
+                    binding.page_base_rows.reserve(placementCount);
+                    binding.page_row_counts.reserve(placementCount);
+                    for (std::uint32_t page = 0;
+                         page < placementCount; ++page) {
+                        binding.page_banks.push_back(
+                            read_scalar<std::uint16_t>(is));
+                        binding.page_slice_group_bases.push_back(
+                            read_scalar<std::uint16_t>(is));
+                        binding.page_slice_group_counts.push_back(
+                            read_scalar<std::uint16_t>(is));
+                        (void)read_scalar<std::uint16_t>(is);
+                        binding.page_base_rows.push_back(
+                            read_scalar<std::uint32_t>(is));
+                        binding.page_row_counts.push_back(
+                            read_scalar<std::uint32_t>(is));
+                    }
+                }
             }
         } else if (binding.layout == BindingLayout::Fp32CausalMaskTile
                    || binding.layout == BindingLayout::Fp16CausalMaskTile) {
@@ -984,6 +1035,29 @@ BinaryBinding read_binding(ByteReader& reader, std::uint32_t version)
                      index < page_slice_count; ++index)
                     binding.page_storage_slices.push_back(
                         reader.read<std::uint16_t>());
+                if (version >= 30) {
+                    const auto placementCount =
+                        reader.read<std::uint32_t>();
+                    binding.page_banks.reserve(placementCount);
+                    binding.page_slice_group_bases.reserve(placementCount);
+                    binding.page_slice_group_counts.reserve(placementCount);
+                    binding.page_base_rows.reserve(placementCount);
+                    binding.page_row_counts.reserve(placementCount);
+                    for (std::uint32_t page = 0;
+                         page < placementCount; ++page) {
+                        binding.page_banks.push_back(
+                            reader.read<std::uint16_t>());
+                        binding.page_slice_group_bases.push_back(
+                            reader.read<std::uint16_t>());
+                        binding.page_slice_group_counts.push_back(
+                            reader.read<std::uint16_t>());
+                        (void)reader.read<std::uint16_t>();
+                        binding.page_base_rows.push_back(
+                            reader.read<std::uint32_t>());
+                        binding.page_row_counts.push_back(
+                            reader.read<std::uint32_t>());
+                    }
+                }
             }
         } else if (binding.layout == BindingLayout::Fp32CausalMaskTile
                    || binding.layout == BindingLayout::Fp16CausalMaskTile) {
@@ -1051,6 +1125,7 @@ struct BinaryHeader {
     std::uint32_t relocation_count;
     std::uint32_t address_relocation_count;
     std::uint32_t weight_page_use_count;
+    std::uint32_t stream_release_count;
 };
 
 template <typename ReadValue>
@@ -1140,6 +1215,8 @@ BinaryHeader read_header(ByteReader& reader)
         version >= 12 ? reader.read<std::uint32_t>() : 0;
     const auto weight_page_use_count =
         version >= 22 ? reader.read<std::uint32_t>() : 0;
+    const auto stream_release_count =
+        version >= 31 ? reader.read<std::uint32_t>() : 0;
     program.bindings.reserve(binding_count);
     for (std::uint32_t index = 0; index < binding_count; ++index)
         program.bindings.push_back(read_binding(reader, version));
@@ -1170,8 +1247,12 @@ BinaryHeader read_header(ByteReader& reader)
         use.release_cycle = reader.read<std::uint64_t>();
         program.weight_page_uses.push_back(use);
     }
+    program.stream_release_cycles.reserve(stream_release_count);
+    for (std::uint32_t index = 0; index < stream_release_count; ++index)
+        program.stream_release_cycles.push_back(reader.read<std::uint64_t>());
     return {std::move(program), version, queue_count, relocation_count,
-        address_relocation_count, weight_page_use_count};
+        address_relocation_count, weight_page_use_count,
+        stream_release_count};
 }
 
 void skip_bytes(std::istream& is, std::uint64_t bytes)
@@ -1213,6 +1294,43 @@ void skip_compact_queue_command(ByteReader& reader)
 
 } // namespace
 
+BinaryWeightPagePlacement resolve_weight_page_placement(
+    const BinaryBinding& binding, std::uint32_t pageIndex)
+{
+    if (!binding.paged_weight || pageIndex >= binding.page_count)
+        throw std::out_of_range(
+            "weight page placement index is outside its binding");
+    const bool hasExactPlacements = !binding.page_banks.empty();
+    if (hasExactPlacements) {
+        if (binding.page_banks.size() != binding.page_count
+            || binding.page_slice_group_bases.size() != binding.page_count
+            || binding.page_slice_group_counts.size() != binding.page_count
+            || binding.page_base_rows.size() != binding.page_count
+            || binding.page_row_counts.size() != binding.page_count)
+            throw std::logic_error(
+                "weight page placement arrays do not match page_count");
+        return BinaryWeightPagePlacement {
+            binding.page_banks[pageIndex],
+            binding.page_slice_group_bases[pageIndex],
+            binding.page_slice_group_counts[pageIndex],
+            binding.page_base_rows[pageIndex],
+            binding.page_row_counts[pageIndex],
+        };
+    }
+    const std::uint32_t bankCount =
+        std::max<std::uint32_t>(1, binding.page_bank_count);
+    return BinaryWeightPagePlacement {
+        static_cast<std::uint16_t>(
+            (binding.bank + pageIndex) % bankCount),
+        static_cast<std::uint16_t>(binding.page_role_group_base),
+        static_cast<std::uint16_t>(
+            std::max<std::uint32_t>(1, binding.page_role_group_count)),
+        0,
+        static_cast<std::uint32_t>(
+            std::max<std::int64_t>(1, binding.instruction_count)),
+    };
+}
+
 void write_binary_program(const BinaryProgram& program, std::ostream& os)
 {
     os.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
@@ -1233,6 +1351,12 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
     if (program.hardware.mxms_per_hemisphere == 0)
         throw std::runtime_error(
             "FTLPU binary requires a nonzero MXM topology");
+    if (!program.stream_release_cycles.empty()
+        && program.stream_release_cycles.size()
+            != program.hardware.encoded_streams)
+        throw std::runtime_error(
+            "FTLPU stream-release metadata must describe every packed "
+            "ordinary stream register");
     program.hardware.visit([&](std::uint32_t value) {
         write_scalar<std::uint32_t>(os, value);
     });
@@ -1249,6 +1373,8 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
         os, static_cast<std::uint32_t>(program.memory_floors.size()));
     write_scalar<std::uint32_t>(
         os, static_cast<std::uint32_t>(program.weight_page_uses.size()));
+    write_scalar<std::uint32_t>(
+        os, static_cast<std::uint32_t>(program.stream_release_cycles.size()));
 
     for (const auto& binding : program.bindings) write_binding(os, binding);
     for (const auto& timeline : program.timelines)
@@ -1267,6 +1393,8 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
         write_scalar<std::uint64_t>(os, use.ready_cycle);
         write_scalar<std::uint64_t>(os, use.release_cycle);
     }
+    for (const std::uint64_t cycle : program.stream_release_cycles)
+        write_scalar<std::uint64_t>(os, cycle);
 
     for (const auto& queue : program.queues) {
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.kind));
@@ -1358,6 +1486,8 @@ BinaryProgram read_binary_program(std::istream& is)
         version >= 12 ? read_scalar<std::uint32_t>(is) : 0;
     const auto weight_page_use_count =
         version >= 22 ? read_scalar<std::uint32_t>(is) : 0;
+    const auto stream_release_count =
+        version >= 31 ? read_scalar<std::uint32_t>(is) : 0;
     program.bindings.reserve(binding_count);
     for (std::uint32_t binding_id = 0; binding_id < binding_count; ++binding_id)
         program.bindings.push_back(read_binding(is, version));
@@ -1389,6 +1519,10 @@ BinaryProgram read_binary_program(std::istream& is)
         use.release_cycle = read_scalar<std::uint64_t>(is);
         program.weight_page_uses.push_back(use);
     }
+    program.stream_release_cycles.reserve(stream_release_count);
+    for (std::uint32_t index = 0; index < stream_release_count; ++index)
+        program.stream_release_cycles.push_back(
+            read_scalar<std::uint64_t>(is));
     program.queues.reserve(queue_count);
 
     for (std::uint32_t queue_id = 0; queue_id < queue_count; ++queue_id) {
@@ -1531,6 +1665,8 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         version >= 12 ? read_scalar<std::uint32_t>(is) : 0;
     const auto weight_page_use_count =
         version >= 22 ? read_scalar<std::uint32_t>(is) : 0;
+    const auto stream_release_count =
+        version >= 31 ? read_scalar<std::uint32_t>(is) : 0;
 
     program.bindings.reserve(binding_count);
     for (std::uint32_t index = 0; index < binding_count; ++index)
@@ -1559,6 +1695,10 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         (void)read_scalar<std::uint64_t>(is);
         (void)read_scalar<std::uint64_t>(is);
     }
+    program.stream_release_cycles.reserve(stream_release_count);
+    for (std::uint32_t index = 0; index < stream_release_count; ++index)
+        program.stream_release_cycles.push_back(
+            read_scalar<std::uint64_t>(is));
 
     for (std::uint32_t queue = 0; queue < queue_count; ++queue) {
         const auto queueKind = static_cast<QueueKind>(

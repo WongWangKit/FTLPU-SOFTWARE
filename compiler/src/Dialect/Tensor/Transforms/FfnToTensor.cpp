@@ -270,7 +270,8 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
                                       int64_t pageGranularity,
                                       int64_t pageRoleGroupBase,
                                       int64_t pageRoleGroupCount,
-                                      int64_t itemsPerSliceGroup) {
+                                      int64_t itemsPerSliceGroup,
+                                      tensor::FfnWeightTileKind kind) {
         if (!tiledWeights) return placement;
         mlir::NamedAttrList attrs(placement);
         attrs.set("paged_weight", rewriter.getBoolAttr(true));
@@ -289,6 +290,39 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             rewriter.getArrayAttr(weightStorageSliceAttrs));
         attrs.set("page_bank_count",
             rewriter.getI64IntegerAttr(memory.banks_per_slice));
+        llvm::SmallVector<mlir::Attribute> pageBanks;
+        llvm::SmallVector<mlir::Attribute> pageSliceGroupBases;
+        llvm::SmallVector<mlir::Attribute> pageSliceGroupCounts;
+        llvm::SmallVector<mlir::Attribute> pageBaseRows;
+        llvm::SmallVector<mlir::Attribute> pageRowCounts;
+        for (const tensor::FfnWeightTilePage& page :
+             weightTilePlan->pages) {
+            const auto span = llvm::find_if(page.spans,
+                [&](const tensor::FfnWeightTileSpan& candidate) {
+                    return candidate.kind == kind;
+                });
+            if (span == page.spans.end()) continue;
+            pageBanks.push_back(rewriter.getI64IntegerAttr(page.bank));
+            pageSliceGroupBases.push_back(
+                rewriter.getI64IntegerAttr(span->slice_group_begin));
+            pageSliceGroupCounts.push_back(
+                rewriter.getI64IntegerAttr(span->slice_group_count));
+            pageBaseRows.push_back(
+                rewriter.getI64IntegerAttr(span->page_base_row));
+            pageRowCounts.push_back(
+                rewriter.getI64IntegerAttr(span->rows_per_slice));
+        }
+        if (static_cast<int64_t>(pageBanks.size()) == pageCount) {
+            attrs.set("page_banks", rewriter.getArrayAttr(pageBanks));
+            attrs.set("page_slice_group_bases",
+                rewriter.getArrayAttr(pageSliceGroupBases));
+            attrs.set("page_slice_group_counts",
+                rewriter.getArrayAttr(pageSliceGroupCounts));
+            attrs.set("page_base_rows",
+                rewriter.getArrayAttr(pageBaseRows));
+            attrs.set("page_row_counts",
+                rewriter.getArrayAttr(pageRowCounts));
+        }
         return attrs.getDictionary(rewriter.getContext());
     };
     const auto gate_placement = withWeightPaging(w8a16
@@ -301,7 +335,8 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         tiledWeights ? weightTilePlan->projection_waves_per_page : 0,
         0,
         tiledWeights ? weightTilePlan->projection_slice_groups_per_role : 0,
-        tiledWeights ? weightTilePlan->projection_waves_per_slice_group : 0);
+        tiledWeights ? weightTilePlan->projection_waves_per_slice_group : 0,
+        tensor::FfnWeightTileKind::Gate);
     const auto up_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *up,
             singleMxmVector
@@ -312,7 +347,8 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         tiledWeights ? weightTilePlan->projection_waves_per_page : 0,
         tiledWeights ? weightTilePlan->projection_slice_groups_per_role : 0,
         tiledWeights ? weightTilePlan->projection_slice_groups_per_role : 0,
-        tiledWeights ? weightTilePlan->projection_waves_per_slice_group : 0);
+        tiledWeights ? weightTilePlan->projection_waves_per_slice_group : 0,
+        tensor::FfnWeightTileKind::Up);
     const auto down_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *down,
             "w8a16_mxm_weight_wave_striped",
@@ -321,7 +357,8 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         tiledWeights ? weightTilePlan->down_reduction_blocks_per_page : 0,
         0, tiledWeights ? weightTilePlan->slice_group_count : 0,
         tiledWeights
-            ? weightTilePlan->down_reduction_blocks_per_slice_group : 0);
+            ? weightTilePlan->down_reduction_blocks_per_slice_group : 0,
+        tensor::FfnWeightTileKind::Down);
     const auto hidden0_placement = w8a16
         ? make_profile_placement(rewriter, *hidden0,
             hiddenDistributed16 ? "fp16_mxm_distributed_16"

@@ -1,3 +1,4 @@
+// BinaryProgram crosses this tool/library ABI boundary by value.
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"

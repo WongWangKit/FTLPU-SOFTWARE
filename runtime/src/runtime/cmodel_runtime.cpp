@@ -593,6 +593,10 @@ bool CModelRuntime::load_ready_weight_pages()
             || use.bank >= binding.page_bank_count)
             throw std::logic_error(
                 "binary weight-page bank is outside the binding policy");
+        if (resolve_weight_page_placement(binding, use.page_index).bank
+            != use.bank)
+            throw std::logic_error(
+                "binary weight-page use disagrees with binding placement");
         const auto image = pack_weight_binding_page(binding,
             use.page_index, logical->second, hardware_);
         for (const auto& segment : image.segments) {

@@ -271,6 +271,135 @@ std::vector<BinaryMemoryFloor> static_memory_floors(
     return result;
 }
 
+struct StreamReleaseSummary {
+    std::vector<std::uint64_t> cycles;
+    bool has_explicit_loop{false};
+};
+
+StreamReleaseSummary stream_release_cycles(
+    mlir::ModuleOp module, const LPUTargetModel& target)
+{
+    const int64_t streamCount = target.streams().streams_per_direction;
+    const int64_t encodedStreamCount = target.streams().encoded_streams;
+    if (streamCount <= 0 || encodedStreamCount != 2 * streamCount)
+        throw std::runtime_error(
+            "target must encode matching East and West ordinary streams");
+    std::vector<std::uint64_t> releases(
+        static_cast<std::size_t>(encodedStreamCount), 0);
+    const int64_t fabricDrain = std::max<int64_t>(
+        1, target.streams().system_register_columns);
+
+    const auto sequenceEnd = [](mlir::Operation* operation,
+                                 int64_t firstCycle) {
+        int64_t end = firstCycle;
+        const auto addAxis = [&](llvm::StringRef countName,
+                                 llvm::StringRef intervalName) {
+            const auto count =
+                operation->getAttrOfType<mlir::IntegerAttr>(countName);
+            const auto interval =
+                operation->getAttrOfType<mlir::IntegerAttr>(intervalName);
+            if (count && interval && count.getInt() > 1)
+                end += (count.getInt() - 1) * interval.getInt();
+        };
+        addAxis("repeat_count", "repeat_interval");
+        addAxis("wave_count", "wave_interval");
+        addAxis("group_count", "group_interval");
+        return end;
+    };
+    const auto mark = [&](int64_t stream, int64_t endCycle) {
+        if (stream < 0 || stream >= encodedStreamCount)
+            throw std::runtime_error(
+                "Command IR stream is outside the target SR file");
+        const auto release = static_cast<std::uint64_t>(
+            std::max<int64_t>(0, endCycle + fabricDrain + 1));
+        auto& current = releases[static_cast<std::size_t>(stream)];
+        current = std::max(current, release);
+    };
+    const auto markRange = [&](int64_t base, int64_t count,
+                               int64_t endCycle) {
+        if (count < 0 || base < 0 || base + count > encodedStreamCount)
+            throw std::runtime_error(
+                "Command IR stream range is outside the target SR file");
+        for (int64_t offset = 0; offset < count; ++offset)
+            mark(base + offset, endCycle);
+    };
+    const auto markPacked = [&](int64_t packed, int64_t endCycle) {
+        if (packed < 0 || packed >= encodedStreamCount)
+            throw std::runtime_error(
+                "Command IR packed stream is outside the target encoding");
+        mark(packed, endCycle);
+    };
+
+    module.walk([&](command::MemOp op) {
+        markPacked(op.getPackedStream(),
+            sequenceEnd(op, command_cycle(op)));
+    });
+    module.walk([&](command::MemBundleOp op) {
+        for (std::size_t index = 0; index < op.getCycles().size(); ++index) {
+            const int64_t cycle = llvm::cast<mlir::IntegerAttr>(
+                op.getCycles()[index]).getInt();
+            const int64_t packed = llvm::cast<mlir::IntegerAttr>(
+                op.getPackedStreams()[index]).getInt();
+            markPacked(packed, sequenceEnd(op, cycle));
+        }
+    });
+    module.walk([&](command::MxmOp op) {
+        const int64_t end = sequenceEnd(op, command_cycle(op));
+        if (op.getOpcode() == "iw") {
+            const bool int8 = op.getWeightInputMode().value_or("direct16")
+                == "int8_dequant_bf16";
+            // CModel MXM weight ingress always consumes the East SR file.
+            markRange(op.getWeightStreamBase().value_or(0),
+                int8
+                    ? target.throughput().mxm_int8_load_streams_per_cycle
+                    : target.throughput().mxm_load_streams_per_cycle,
+                end);
+            return;
+        }
+        if (op.getOpcode() == "compute") {
+            // MXM ingress is East-facing; accumulator output is West-facing.
+            markRange(op.getActivationStreamBase() % streamCount,
+                target.throughput().mxm_activation_streams, end);
+            if (op.getAccumulatorDestination() == "stream")
+                markRange(streamCount
+                        + op.getOutputStreamBase() % streamCount,
+                    target.throughput().mxm_result_streams, end);
+            return;
+        }
+        if (op.getOpcode() == "accumulator_read")
+            markRange(streamCount + op.getOutputStreamBase() % streamCount,
+                target.throughput().mxm_result_streams, end);
+    });
+    module.walk([&](command::VxmOp op) {
+        const int64_t end = sequenceEnd(op, command_cycle(op));
+        const auto markOperand = [&](llvm::StringRef kind, int64_t index) {
+            if (!kind.starts_with("stream_")) return;
+            // VXM external operands are captured from the MEM West edge;
+            // stream_source selects a hemisphere, not a travel direction.
+            mark(streamCount + index % streamCount, end);
+            mark(streamCount + (index + 1) % streamCount, end);
+        };
+        markOperand(op.getLhsKind(), op.getLhsIndex());
+        markOperand(op.getRhsKind(), op.getRhsIndex());
+        const int64_t output = op.getOutputStreamAttr().getInt();
+        if (output < 0) return;
+        const int64_t width = op.getCastTarget() == "i8" ? 1
+            : op.getCastTarget() == "fp32" ? 4 : 2;
+        // VXM outputs are injected at the MEM East edge.
+        markRange(output % streamCount, width, end);
+    });
+    module.walk([&](command::SxmOp op) {
+        const int64_t end = sequenceEnd(op, command_cycle(op));
+        for (mlir::Attribute stream : op.getSourceStreams())
+            markPacked(llvm::cast<mlir::IntegerAttr>(stream).getInt(), end);
+        for (mlir::Attribute stream : op.getDestinationStreams())
+            markPacked(llvm::cast<mlir::IntegerAttr>(stream).getInt(), end);
+    });
+    bool hasExplicitLoop = false;
+    module.walk([&](command::LoopOp) { hasExplicitLoop = true; });
+    return {std::move(releases), hasExplicitLoop};
+}
+
 BindingLayout parse_layout(llvm::StringRef value)
 {
     if (value == "vector") return BindingLayout::Vector;
@@ -388,6 +517,20 @@ BinaryBinding translate_binding(command::BindingOp op)
             binding.page_storage_slices.push_back(
                 static_cast<std::uint16_t>(
                     llvm::cast<mlir::IntegerAttr>(slice).getInt()));
+    const auto copyPageArray = [&]<typename T>(llvm::StringRef name,
+                                   std::vector<T>& destination) {
+        if (const auto values = placement.getAs<mlir::ArrayAttr>(name))
+            for (mlir::Attribute value : values)
+                destination.push_back(static_cast<T>(
+                    llvm::cast<mlir::IntegerAttr>(value).getInt()));
+    };
+    copyPageArray("page_banks", binding.page_banks);
+    copyPageArray("page_slice_group_bases",
+        binding.page_slice_group_bases);
+    copyPageArray("page_slice_group_counts",
+        binding.page_slice_group_counts);
+    copyPageArray("page_base_rows", binding.page_base_rows);
+    copyPageArray("page_row_counts", binding.page_row_counts);
     return binding;
 }
 
@@ -2132,6 +2275,7 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             ? IcuCompressionMode::Macro
             : IcuCompressionMode::Control;
     }
+    auto streamReleaseSummary = stream_release_cycles(module, *target);
     QueueMap queues;
     std::vector<BinaryBinding> bindings;
     std::vector<BinaryTimeline> timelines;
@@ -2206,6 +2350,10 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
                     - static_cast<std::uint64_t>(cycle_origin)
                 : 0;
         }
+        for (std::uint64_t& release : streamReleaseSummary.cycles)
+            release = release > static_cast<std::uint64_t>(cycle_origin)
+                ? release - static_cast<std::uint64_t>(cycle_origin)
+                : 0;
     }
 
     std::sort(bindings.begin(), bindings.end(), [](const auto& lhs, const auto& rhs) {
@@ -2320,12 +2468,23 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
                        rhs.page_index);
         });
     program.weight_page_uses = std::move(weightPageUses);
+    program.stream_release_cycles =
+        std::move(streamReleaseSummary.cycles);
     for (auto& [key, sequences] : queues)
         program.queues.push_back(encode_queue(key, std::move(sequences),
             program.max_cycle, program.scale_relocations,
             program.address_relocations,
             target->throughput().icu_repeat_2d_enabled != 0,
             compressionMode));
+    if (streamReleaseSummary.has_explicit_loop) {
+        const std::uint64_t release =
+            static_cast<std::uint64_t>(program.max_cycle)
+            + static_cast<std::uint64_t>(
+                target->streams().system_register_columns)
+            + 1;
+        std::fill(program.stream_release_cycles.begin(),
+            program.stream_release_cycles.end(), release);
+    }
     return program;
 }
 
