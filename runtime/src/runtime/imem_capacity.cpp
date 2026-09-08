@@ -54,26 +54,33 @@ std::size_t peak_macro_contexts(const QueueProgram& queue)
 {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
     intervals.reserve(queue.commands.size());
+    const auto addStream = [&](const IcuStreamNdSchedule& schedule,
+                               std::size_t cycleOffset = 0) {
+        std::uint64_t start = schedule.start_cycle + cycleOffset;
+        std::uint64_t end = start;
+        for (std::size_t dimension = 0;
+             dimension < schedule.rank; ++dimension)
+            end += static_cast<std::uint64_t>(
+                       schedule.counts[dimension] - 1)
+                * schedule.cycle_strides[dimension];
+        intervals.push_back({start, end});
+    };
     for (const auto& command : queue.commands) {
         if (is_mem_slice_program_command(command)) {
             const auto program = decode_mem_slice_program_command(command);
-            std::uint64_t end = program.schedule.start_cycle;
-            for (std::size_t dimension = 0;
-                 dimension < program.schedule.rank; ++dimension)
-                end += static_cast<std::uint64_t>(
-                           program.schedule.counts[dimension] - 1)
-                    * program.schedule.cycle_strides[dimension];
-            std::uint64_t start =
-                std::numeric_limits<std::uint64_t>::max();
-            std::uint64_t final = 0;
-            for (const auto& body : program.body) {
-                start = std::min(start,
-                    static_cast<std::uint64_t>(
-                        program.schedule.start_cycle)
-                        + body.cycle_offset);
-                final = std::max(final, end + body.cycle_offset);
-            }
-            intervals.push_back({start, final});
+            // Each body entry becomes an independently active N-D context in
+            // the local ICU calendar. Counting the parent as one context
+            // hides the principal hardware cost of MEM_SLICE_PROGRAM.
+            for (const auto& body : program.body)
+                addStream(program.schedule, body.cycle_offset);
+            continue;
+        }
+        if (is_mem_stream_nd_command(command)) {
+            addStream(decode_mem_stream_nd_command(command));
+            continue;
+        }
+        if (is_mxm_stream_nd_command(command)) {
+            addStream(decode_mxm_stream_nd_command(command));
             continue;
         }
         if (!is_macro_schedule_command(command)) continue;
@@ -239,7 +246,7 @@ CmodelAbstractImemReport analyze_cmodel_abstract_imem(
 
         const auto encodedWork = capacity.instruction_entries
             + capacity.repeat_entries + capacity.repeat_2d_entries
-            + capacity.loop_entries + capacity.macro_entries
+            + capacity.macro_entries
             + capacity.coarse_program_entries;
         report.used_slots += capacity.used_slots;
         report.encoded_work_entries += encodedWork;

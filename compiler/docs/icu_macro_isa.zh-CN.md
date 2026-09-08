@@ -219,6 +219,26 @@ MAE 为 `0.004514`，最大误差为 `0.09375`。
 Qwen golden 对比：mismatch 为 0、MAE 为 `0.004514`、最大误差为
 `0.09375`。
 
+### MEM slice A/B 策略与 inspector
+
+`MEM_SLICE_PROGRAM` 仍是 `macro` 内部的一种子编码，不增加第四种压缩模式。
+`ftlpu-compile`、`ftlpu-opt` 和 `ftlpu-translate` 可通过
+`--mem-slice-program on|off` 单独开关它。lowering 不再生成单 body program，
+因为其 11-word 共享头比一条 `MEM_STREAM_ND` 更大。
+
+`ftlpu_binary_inspect left.ftlpu --compare right.ftlpu` 会把两个 binary 展开为
+精确的 `(queue, cycle, native instruction)` 稀疏时间线。直到 `max_cycle` 为止，
+没有功能发射的点都视为逻辑 NOP；NOP 数、发射 cycle 或原生指令任一变化都会
+返回非零并输出首个差异。`ftlpu-compile` 和 `ftlpu-translate` 还支持
+`--verify-icu-issues`，在写 binary 前将所选编码与 `none` 基线比较。
+
+分组不会降低硬件 context 成本：每个 body entry 仍对应一个活跃 N-D context，
+与多条独立 `MEM_STREAM_ND` 相同。因此 runtime 容量 inspector 现在按 body
+entry 而不是父 program 统计峰值 context。收益来自描述符存储以及 fetch/decode
+带宽。当前结论是：鉴于 decoder 实测降幅明显，保留该编码及独立开关；RTL
+应将 body 顺序装载进现有 MEM N-D context calendar，不应要求 16 路同时分配，
+也不应增加第二套 issue engine。硬件 capability 不支持时使用 `off` 回退。
+
 ## 本地 ICU 结构
 
 每个功能单元 ICU 包含 descriptor FIFO 和 next-issue calendar。多个描述符

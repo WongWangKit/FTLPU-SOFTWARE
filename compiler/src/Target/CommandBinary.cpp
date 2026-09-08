@@ -256,7 +256,6 @@ std::vector<BinaryMemoryFloor> static_memory_floors(
 
 struct StreamReleaseSummary {
     std::vector<std::uint64_t> cycles;
-    bool has_explicit_loop{false};
 };
 
 StreamReleaseSummary stream_release_cycles(
@@ -378,9 +377,7 @@ StreamReleaseSummary stream_release_cycles(
         for (mlir::Attribute stream : op.getDestinationStreams())
             markPacked(llvm::cast<mlir::IntegerAttr>(stream).getInt(), end);
     });
-    bool hasExplicitLoop = false;
-    module.walk([&](command::LoopOp) { hasExplicitLoop = true; });
-    return {std::move(releases), hasExplicitLoop};
+    return {std::move(releases)};
 }
 
 BindingLayout parse_layout(llvm::StringRef value)
@@ -1388,7 +1385,8 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
     std::vector<BinaryScaleRelocation>& scaleRelocations,
     std::vector<BinaryAddressRelocation>& addressRelocations,
     bool repeat2DEnabled,
-    IcuCompressionMode compressionMode)
+    IcuCompressionMode compressionMode,
+    bool memSliceProgramEnabled)
 {
     const bool controlCompressionEnabled =
         compressionMode != IcuCompressionMode::None;
@@ -1609,6 +1607,47 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
                 return isa::decode_mem_instruction(encoded);
             };
 
+            if (!memSliceProgramEnabled) {
+                for (const auto& sequence : sequences) {
+                    validateIssueCycles(sequence);
+                    max_cycle = std::max(max_cycle,
+                        static_cast<std::size_t>(
+                            sequence_final_cycle(sequence)));
+                    const std::size_t instructionIndex =
+                        queue.commands.size();
+                    queue.commands.push_back(
+                        software::runtime::encode_mem_stream_nd_command(
+                            sequence.instruction, scheduleFor(sequence)));
+                    if (sequence.address_binding >= 0) {
+                        addressRelocations.push_back(
+                            BinaryAddressRelocation {
+                                static_cast<std::uint32_t>(
+                                    sequence.address_binding),
+                                sequence.address_binding_access,
+                                key.first,
+                                static_cast<std::uint16_t>(key.second),
+                                static_cast<std::uint32_t>(
+                                    instructionIndex),
+                                false,
+                            });
+                    }
+                    if (sequence.write_address_binding >= 0) {
+                        addressRelocations.push_back(
+                            BinaryAddressRelocation {
+                                static_cast<std::uint32_t>(
+                                    sequence.write_address_binding),
+                                sequence.write_address_binding_access,
+                                key.first,
+                                static_cast<std::uint16_t>(key.second),
+                                static_cast<std::uint32_t>(
+                                    instructionIndex),
+                                true,
+                            });
+                    }
+                }
+                return queue;
+            }
+
             for (const auto& sequence : sequences) {
                 validateIssueCycles(sequence);
                 max_cycle = std::max(max_cycle,
@@ -1635,6 +1674,46 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
                         continue;
                     consumed[candidate] = true;
                     members.push_back(candidate);
+                }
+
+                // A one-entry slice program carries an eleven-word shared
+                // header and is larger than the equivalent MEM_STREAM_ND.
+                // Keep singletons in the simpler descriptor form.
+                if (members.size() == 1) {
+                    const auto& sequence = sequences[seed];
+                    const std::size_t instructionIndex =
+                        queue.commands.size();
+                    queue.commands.push_back(
+                        software::runtime::encode_mem_stream_nd_command(
+                            sequence.instruction,
+                            scheduleFor(sequence)));
+                    if (sequence.address_binding >= 0) {
+                        addressRelocations.push_back(
+                            BinaryAddressRelocation {
+                                static_cast<std::uint32_t>(
+                                    sequence.address_binding),
+                                sequence.address_binding_access,
+                                key.first,
+                                static_cast<std::uint16_t>(key.second),
+                                static_cast<std::uint32_t>(
+                                    instructionIndex),
+                                false,
+                            });
+                    }
+                    if (sequence.write_address_binding >= 0) {
+                        addressRelocations.push_back(
+                            BinaryAddressRelocation {
+                                static_cast<std::uint32_t>(
+                                    sequence.write_address_binding),
+                                sequence.write_address_binding_access,
+                                key.first,
+                                static_cast<std::uint16_t>(key.second),
+                                static_cast<std::uint32_t>(
+                                    instructionIndex),
+                                true,
+                            });
+                    }
+                    continue;
                 }
 
                 auto launch = scheduleFor(sequences[seed]);
@@ -1929,6 +2008,10 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             ? IcuCompressionMode::Macro
             : IcuCompressionMode::Control;
     }
+    bool memSliceProgramEnabled = true;
+    if (const auto attr = module->getAttrOfType<mlir::BoolAttr>(
+            "ftlpu.mem_slice_program"))
+        memSliceProgramEnabled = attr.getValue();
     auto streamReleaseSummary = stream_release_cycles(module, *target);
     QueueMap queues;
     std::vector<BinaryBinding> bindings;
@@ -2128,16 +2211,7 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             program.max_cycle, program.scale_relocations,
             program.address_relocations,
             target->throughput().icu_repeat_2d_enabled != 0,
-            compressionMode));
-    if (streamReleaseSummary.has_explicit_loop) {
-        const std::uint64_t release =
-            static_cast<std::uint64_t>(program.max_cycle)
-            + static_cast<std::uint64_t>(
-                target->streams().system_register_columns)
-            + 1;
-        std::fill(program.stream_release_cycles.begin(),
-            program.stream_release_cycles.end(), release);
-    }
+            compressionMode, memSliceProgramEnabled));
     return program;
 }
 

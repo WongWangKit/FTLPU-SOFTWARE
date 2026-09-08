@@ -48,6 +48,7 @@ struct Args {
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
         ftlpu::compiler::target::IcuCompressionMode::Macro};
+    bool mem_slice_program{true};
 };
 
 Args parse_args(int argc, char** argv)
@@ -126,6 +127,13 @@ Args parse_args(int argc, char** argv)
                     "unknown ICU compression mode: " + value);
             args.icu_compression = *parsed;
         }
+        else if (arg == "--mem-slice-program") {
+            const std::string value = next();
+            if (value == "on") args.mem_slice_program = true;
+            else if (value == "off") args.mem_slice_program = false;
+            else throw std::runtime_error(
+                "expected on or off for --mem-slice-program");
+        }
         else throw std::runtime_error("unknown argument: " + arg);
     }
     if (args.input.empty() || args.output.empty()) {
@@ -144,6 +152,7 @@ Args parse_args(int argc, char** argv)
                                  "vxm-square-mxm-reduce|vxm-feedback] "
                                  "[--mxm-execution auto|vector|legacy] "
                                  "[--icu-compression none|control|macro] "
+                                 "[--mem-slice-program on|off] "
                                  "[--weight-bank 0|1] "
                                  "[--kv-cache-capacity tokens] "
                                  "[--target-config target.json]");
@@ -211,6 +220,8 @@ try {
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::icu_compression_mode_name(
                 args.icu_compression)));
+    (*module)->setAttr("ftlpu.mem_slice_program",
+        mlir::BoolAttr::get(&context, args.mem_slice_program));
     // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,

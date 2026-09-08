@@ -564,6 +564,15 @@ if(Python3_Interpreter_FOUND)
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/schedule_wave_compression/command.mlir)
     add_test(
+        NAME mem_slice_program_ab_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/mem_slice_program_ab_test.py
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --inspect $<TARGET_FILE:ftlpu_binary_inspect>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/command_mem_slice_ab.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/mem_slice_program_ab)
+    add_test(
         NAME stablehlo_matmul_320_to_ftlpu_kernel_mlir_test
         COMMAND
             ${Python3_EXECUTABLE}

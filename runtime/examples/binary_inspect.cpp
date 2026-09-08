@@ -1,5 +1,6 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/imem_capacity.hpp"
+#include "ftlpu/software/runtime/issue_inspector.hpp"
 #include "ftlpu/software/runtime/performance.hpp"
 #include "ftlpu/software/runtime/schedule_trace.hpp"
 
@@ -9,22 +10,40 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
 
 int main(int argc, char** argv)
 try {
-    if (argc != 2 && argc != 3 && argc != 4)
+    if (argc < 2)
         throw std::runtime_error(
             "usage: ftlpu_binary_inspect program.ftlpu "
-            "[--all-queues] [--trace schedule.csv]");
-    const bool reportAllQueues = argc == 3
-        && std::string_view(argv[2]) == "--all-queues";
-    if (argc == 3 && !reportAllQueues)
-        throw std::runtime_error("expected --all-queues");
-    if (argc == 4 && std::string_view(argv[2]) != "--trace")
-        throw std::runtime_error("expected --trace before the CSV path");
+            "[--all-queues] [--trace schedule.csv] "
+            "[--compare reference.ftlpu]");
+    bool reportAllQueues = false;
+    std::optional<std::filesystem::path> tracePath;
+    std::optional<std::filesystem::path> comparePath;
+    for (int index = 2; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (argument == "--all-queues") {
+            reportAllQueues = true;
+            continue;
+        }
+        if (argument == "--trace" || argument == "--compare") {
+            if (++index >= argc)
+                throw std::runtime_error(std::string(argument)
+                    + " requires a path");
+            if (argument == "--trace")
+                tracePath = std::filesystem::path(argv[index]);
+            else
+                comparePath = std::filesystem::path(argv[index]);
+            continue;
+        }
+        throw std::runtime_error(
+            "unknown binary inspector option: " + std::string(argument));
+    }
 
     const auto program = ftlpu::software::runtime::read_binary_program(
         std::filesystem::path(argv[1]));
@@ -55,6 +74,13 @@ try {
               << " commands=" << total_commands
               << " file_bytes=" << std::filesystem::file_size(argv[1])
               << '\n';
+    const auto logicalIssues =
+        ftlpu::software::runtime::inspect_logical_issues(program);
+    std::cout << "binary logical_issue_summary queues="
+              << logicalIssues.queues.size()
+              << " functional_issues=" << logicalIssues.functional_issues
+              << " logical_nop_cycles="
+              << logicalIssues.logical_nop_cycles << '\n';
     std::size_t totalInstructions = 0;
     std::size_t totalNops = 0;
     std::size_t totalRepeats = 0;
@@ -63,6 +89,9 @@ try {
     std::size_t totalMemStreamNd = 0;
     std::size_t totalMemSlicePrograms = 0;
     std::size_t totalMemSliceBodyEntries = 0;
+    std::size_t maxMemSliceBodyEntries = 0;
+    std::size_t memSlicePayloadWords = 0;
+    std::size_t equivalentMemStreamPayloadWords = 0;
     std::size_t totalMxmStreamNd = 0;
     std::size_t totalVxmStreamNd = 0;
     std::size_t totalSxmTilePrograms = 0;
@@ -167,6 +196,15 @@ try {
                 const auto sliceProgram = ftlpu::software::runtime::
                     decode_mem_slice_program_command(command);
                 totalMemSliceBodyEntries += sliceProgram.body.size();
+                maxMemSliceBodyEntries = std::max(
+                    maxMemSliceBodyEntries, sliceProgram.body.size());
+                memSlicePayloadWords += command.extension_words.size();
+                for (const auto& body : sliceProgram.body) {
+                    const auto encoded = ftlpu::isa::encode_mem_instruction(
+                        body.instruction);
+                    equivalentMemStreamPayloadWords += 12
+                        + ((encoded >> 32) == 0 ? 1 : 2);
+                }
                 std::size_t points = sliceProgram.body.size();
                 for (std::size_t dimension = 0;
                      dimension < sliceProgram.schedule.rank; ++dimension)
@@ -289,6 +327,23 @@ try {
               << " trace_queue_pattern_rows=" << tracePatternRows
               << " serialized_queue_bytes=" << serializedQueueBytes
               << '\n';
+    if (totalMemSlicePrograms != 0) {
+        const auto savedPayloadWords =
+            static_cast<std::int64_t>(equivalentMemStreamPayloadWords)
+            - static_cast<std::int64_t>(memSlicePayloadWords);
+        std::cout << "binary mem_slice_cost programs="
+                  << totalMemSlicePrograms
+                  << " body_entries=" << totalMemSliceBodyEntries
+                  << " max_body_entries=" << maxMemSliceBodyEntries
+                  << " average_body_entries="
+                  << static_cast<double>(totalMemSliceBodyEntries)
+                        / totalMemSlicePrograms
+                  << " slice_payload_words=" << memSlicePayloadWords
+                  << " equivalent_mem_stream_payload_words="
+                  << equivalentMemStreamPayloadWords
+                  << " saved_payload_words=" << savedPayloadWords
+                  << '\n';
+    }
     const auto imem =
         ftlpu::software::runtime::analyze_cmodel_abstract_imem(program);
     const auto savedImemWork = imem.expanded_work > imem.encoded_work_entries
@@ -335,7 +390,7 @@ try {
             expandedWork += queue.expanded_work;
             encodedWork += queue.instruction_entries
                 + queue.repeat_entries + queue.repeat_2d_entries
-                + queue.loop_entries + queue.macro_entries
+                + queue.macro_entries
                 + queue.coarse_program_entries;
             maxUsed = std::max(maxUsed, queue.used_slots);
             overflowQueues += queue.overflow() ? 1 : 0;
@@ -377,7 +432,6 @@ try {
                   << " nop=" << queue.nop_entries
                   << " repeat=" << queue.repeat_entries
                   << " repeat2d=" << queue.repeat_2d_entries
-                  << " loop=" << queue.loop_entries
                   << " macro=" << queue.macro_entries
                   << " coarse_program=" << queue.coarse_program_entries
                   << '\n';
@@ -706,9 +760,61 @@ try {
     }
     ftlpu::software::runtime::print_runtime_performance(
         program, cycles, std::cout);
-    if (argc == 4)
+    if (tracePath)
         ftlpu::software::runtime::write_schedule_trace_csv(
-            program, std::filesystem::path(argv[3]));
+            program, *tracePath);
+    if (comparePath) {
+        const auto reference =
+            ftlpu::software::runtime::read_binary_program(*comparePath);
+        const auto referenceIssues =
+            ftlpu::software::runtime::inspect_logical_issues(reference);
+        const auto comparison =
+            ftlpu::software::runtime::compare_logical_issues(
+                program, reference);
+        const auto leftBytes = std::filesystem::file_size(argv[1]);
+        const auto rightBytes = std::filesystem::file_size(*comparePath);
+        const auto byteDelta = static_cast<std::int64_t>(leftBytes)
+            - static_cast<std::int64_t>(rightBytes);
+        std::cout << "binary compare result="
+                  << (comparison.equivalent ? "equivalent" : "mismatch")
+                  << " same_target=" << comparison.same_target
+                  << " same_horizon=" << comparison.same_horizon
+                  << " left_functional_issues="
+                  << logicalIssues.functional_issues
+                  << " right_functional_issues="
+                  << referenceIssues.functional_issues
+                  << " left_logical_nop_cycles="
+                  << logicalIssues.logical_nop_cycles
+                  << " right_logical_nop_cycles="
+                  << referenceIssues.logical_nop_cycles
+                  << " left_file_bytes=" << leftBytes
+                  << " right_file_bytes=" << rightBytes
+                  << " left_minus_right_bytes=" << byteDelta << '\n';
+        if (comparison.first_mismatch) {
+            const auto& mismatch = *comparison.first_mismatch;
+            std::cout << "binary compare_first_mismatch reason=\""
+                      << mismatch.reason << "\" cycle=" << mismatch.cycle;
+            if (mismatch.left || mismatch.right)
+                std::cout << " queue="
+                          << ftlpu::software::runtime::queue_kind_name(
+                                 mismatch.kind)
+                          << '[' << mismatch.index << ']';
+            std::cout << " left="
+                      << (mismatch.left
+                              ? ftlpu::software::runtime::
+                                    describe_logical_instruction(
+                                        *mismatch.left)
+                              : "NOP")
+                      << " right="
+                      << (mismatch.right
+                              ? ftlpu::software::runtime::
+                                    describe_logical_instruction(
+                                        *mismatch.right)
+                              : "NOP")
+                      << '\n';
+        }
+        if (!comparison.equivalent) return 2;
+    }
     return 0;
 } catch (const std::exception& ex) {
     std::cerr << "ftlpu_binary_inspect failed: " << ex.what() << '\n';

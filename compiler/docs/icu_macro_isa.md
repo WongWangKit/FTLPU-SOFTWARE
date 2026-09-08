@@ -236,6 +236,31 @@ The updated binary completed in 763,733 modeled cycles and passed the same
 49,152-output Qwen golden comparison with zero mismatches, MAE `0.004514`, and
 maximum error `0.09375`.
 
+### MEM slice A/B policy and inspector
+
+`MEM_SLICE_PROGRAM` remains a sub-encoding of `macro`, not a fourth compression
+mode. `--mem-slice-program on|off` independently selects it in `ftlpu-compile`,
+`ftlpu-opt`, and `ftlpu-translate`. Lowering never forms a one-body program,
+because its eleven-word shared header is larger than one `MEM_STREAM_ND`.
+
+`ftlpu_binary_inspect left.ftlpu --compare right.ftlpu` expands both binaries
+to exact sparse `(queue, cycle, native instruction)` timelines. Missing issue
+points are logical NOPs through `max_cycle`; a changed NOP count, issue cycle,
+or native instruction makes the command return nonzero and prints the first
+mismatch. `ftlpu-compile` and `ftlpu-translate` also accept
+`--verify-icu-issues`, which compares the selected encoding with a `none`
+baseline before writing the binary.
+
+The hardware context cost is not reduced by grouping: every body entry is one
+active N-D context, exactly as for independent `MEM_STREAM_ND` descriptors.
+The runtime capacity inspector therefore counts body entries, not parent
+programs, when computing peak contexts. The benefit is descriptor storage and
+fetch/decode bandwidth. The current decision is to retain the encoding behind
+its independent switch because the measured decoder reduction is material,
+but implement it as a sequential loader into the existing MEM N-D context
+calendar. It must not require sixteen-way allocation or a second issue engine;
+a hardware capability may select `off` as the fallback.
+
 ## Local ICU
 
 Each functional-unit ICU has a descriptor FIFO and a next-issue calendar. Multiple

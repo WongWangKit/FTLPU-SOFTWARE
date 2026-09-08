@@ -23,6 +23,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
     src/runtime/icu_program.cpp
+    src/runtime/issue_inspector.cpp
     src/runtime/imem_capacity.cpp
     src/runtime/macro_bitstream.cpp
     src/runtime/model_package.cpp
@@ -41,6 +42,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/sxm_binary_roundtrip_test.cpp
     tests/runtime/vxm_stream_nd_binary_test.cpp
     tests/runtime/mem_slice_program_binary_test.cpp
+    tests/runtime/issue_inspector_test.cpp
     tests/runtime/compiled_sxm_command_runtime_test.cpp
     tests/runtime/compiled_queue_program_runtime_test.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
@@ -80,6 +82,7 @@ add_library(ftlpu_software
     src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
     src/runtime/icu_program.cpp
+    src/runtime/issue_inspector.cpp
     src/runtime/imem_capacity.cpp
     src/runtime/macro_bitstream.cpp
     src/runtime/model_package.cpp
@@ -189,6 +192,13 @@ add_test(
     NAME mem_slice_program_binary_test
     COMMAND $<TARGET_FILE:mem_slice_program_binary_test>
         ${CMAKE_CURRENT_BINARY_DIR}/test-output/mem-slice-program.ftlpu)
+
+add_executable(issue_inspector_test
+    tests/runtime/issue_inspector_test.cpp)
+target_link_libraries(issue_inspector_test PRIVATE ftlpu_software)
+add_test(
+    NAME issue_inspector_test
+    COMMAND $<TARGET_FILE:issue_inspector_test>)
 
 add_executable(model_package_roundtrip_test
     tests/runtime/model_package_roundtrip_test.cpp)

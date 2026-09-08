@@ -184,7 +184,7 @@ std::array<std::uint32_t, 3> encode_binary_repeat_2d(
     const IcuRepeat2D& repeat)
 {
     // Validate the public iteration-space contract with the hardware codec,
-    // then repack it so word zero is a self-describing extended Loop record.
+    // then repack it so word zero is a self-describing extended-control record.
     (void)isa::encode_icu_repeat_2d(repeat);
     std::array<std::uint32_t, 3> words {};
     const auto write = [&](std::size_t offset, std::size_t width,

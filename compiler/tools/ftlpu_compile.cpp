@@ -10,6 +10,7 @@
 #include "ftlpu/compiler/Target/mxm_execution_strategy.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/issue_inspector.hpp"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -56,6 +57,8 @@ struct Args {
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
         ftlpu::compiler::target::IcuCompressionMode::Macro};
+    bool mem_slice_program{true};
+    bool verify_icu_issues{false};
 };
 
 InputStage parse_input_stage(const std::string& value)
@@ -89,6 +92,8 @@ Args parse_args(int argc, char** argv)
             args.kv_cache_capacity = std::stoll(next());
         else if (argument == "--pass-timing")
             args.pass_timing = true;
+        else if (argument == "--verify-icu-issues")
+            args.verify_icu_issues = true;
         else if (argument == "--icu-macro-schedule")
             args.icu_compression =
                 ftlpu::compiler::target::IcuCompressionMode::Macro;
@@ -100,6 +105,13 @@ Args parse_args(int argc, char** argv)
                 throw std::runtime_error(
                     "unknown ICU compression mode: " + value);
             args.icu_compression = *parsed;
+        }
+        else if (argument == "--mem-slice-program") {
+            const std::string value = next();
+            if (value == "on") args.mem_slice_program = true;
+            else if (value == "off") args.mem_slice_program = false;
+            else throw std::runtime_error(
+                "expected on or off for --mem-slice-program");
         }
         else if (argument == "--ffn-schedule") {
             const std::string value = next();
@@ -154,6 +166,8 @@ Args parse_args(int argc, char** argv)
             "[--kv-cache-capacity tokens] "
             "[--mxm-execution auto|vector|legacy] "
             "[--icu-compression none|control|macro] "
+            "[--mem-slice-program on|off] "
+            "[--verify-icu-issues] "
             "[--ffn-schedule tail|fused] "
             "[--attention-schedule tail|fused] "
             "[--rmsnorm-strategy vxm-square-mxm-reduce|vxm-feedback]");
@@ -224,6 +238,8 @@ try {
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::icu_compression_mode_name(
                 args.icu_compression)));
+    (*module)->setAttr("ftlpu.mem_slice_program",
+        mlir::BoolAttr::get(&context, args.mem_slice_program));
     // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,
@@ -276,6 +292,32 @@ try {
     std::filesystem::create_directories(args.output.parent_path(), error);
     auto program =
         ftlpu::compiler::target::translate_command_module(*module);
+    if (args.verify_icu_issues) {
+        (*module)->setAttr("ftlpu.icu_compression",
+            mlir::StringAttr::get(&context, "none"));
+        (*module)->setAttr("ftlpu.mem_slice_program",
+            mlir::BoolAttr::get(&context, false));
+        const auto baseline =
+            ftlpu::compiler::target::translate_command_module(*module);
+        const auto comparison =
+            ftlpu::software::runtime::compare_logical_issues(
+                program, baseline);
+        if (!comparison.equivalent) {
+            std::string detail = comparison.first_mismatch
+                ? comparison.first_mismatch->reason : "unknown mismatch";
+            if (comparison.first_mismatch)
+                detail += " at cycle="
+                    + std::to_string(
+                        comparison.first_mismatch->cycle);
+            throw std::runtime_error(
+                "ICU compression changed the logical issue stream: "
+                + detail);
+        }
+        std::cout << "verified ICU logical issue equivalence: functional_issues="
+                  << ftlpu::software::runtime::inspect_logical_issues(
+                         program).functional_issues
+                  << " max_cycle=" << program.max_cycle << '\n';
+    }
     ftlpu::software::runtime::write_binary_program(program, args.output);
     return 0;
 } catch (const std::exception& error) {
