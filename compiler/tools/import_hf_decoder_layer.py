@@ -88,6 +88,33 @@ def bf16(value: np.ndarray) -> np.ndarray:
     return words.view(np.float32)
 
 
+def fp16_ftz(value: np.ndarray) -> np.ndarray:
+    value = np.asarray(value, dtype=np.float32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        rounded = value.astype(np.float16).astype(np.float32)
+    minimum_normal = np.float32(2.0 ** -14)
+    rounded = np.where(
+        np.isfinite(value) & (np.abs(value) < minimum_normal),
+        np.copysign(np.float32(0.0), value),
+        rounded,
+    )
+    return np.where(
+        np.isfinite(rounded) & (np.abs(rounded) < minimum_normal),
+        np.copysign(np.float32(0.0), rounded),
+        rounded,
+    ).astype(np.float32)
+
+
+def fma32(lhs: np.ndarray, rhs: np.ndarray, addend: np.ndarray) -> np.ndarray:
+    # Float64 is wide enough to evaluate a float32 multiply-add before the
+    # single rounding performed by the CModel's std::fma implementation.
+    return (
+        np.asarray(lhs, dtype=np.float64)
+        * np.asarray(rhs, dtype=np.float64)
+        + np.asarray(addend, dtype=np.float64)
+    ).astype(np.float32)
+
+
 def write_bf16(path: Path, value: np.ndarray) -> None:
     bf16_bits(value).tofile(path)
 
@@ -98,8 +125,17 @@ def read_bf16(path: Path, shape: tuple[int, ...]) -> np.ndarray:
 
 
 def rms_norm(value: np.ndarray, weight: np.ndarray, epsilon: float) -> np.ndarray:
-    mean_square = np.mean(value * value, axis=-1, keepdims=True)
-    return bf16(value / np.sqrt(mean_square + epsilon) * weight)
+    squares = value * value
+    square_sum = np.add.accumulate(
+        squares, axis=-1, dtype=np.float32
+    )[..., -1:]
+    stored_sum = bf16(square_sum)
+    mean_square = (
+        stored_sum * np.float32(1.0 / value.shape[-1])
+        + np.float32(epsilon)
+    )
+    factor = vxm_lut(mean_square, "rsqrt")
+    return bf16((value * bf16(weight)) * factor)
 
 
 def linear(
@@ -120,11 +156,8 @@ def biased_linear(
     scale: float,
     bias: np.ndarray | None,
 ) -> np.ndarray:
-    dequantized = bf16(weight.astype(np.float32) * scale)
-    result = value @ dequantized
-    if bias is not None:
-        result += bias
-    return bf16(result)
+    result = linear(value, weight, scale, bf16_scale=True)
+    return result if bias is None else bf16(result + bf16(bias))
 
 
 def rope(value: np.ndarray, theta: float) -> np.ndarray:
@@ -139,6 +172,128 @@ def rope(value: np.ndarray, theta: float) -> np.ndarray:
     return bf16(np.concatenate(
         (low * cosine - high * sine, high * cosine + low * sine), axis=-1
     ))
+
+
+def biased_rope_linear(
+    value: np.ndarray,
+    weight: np.ndarray,
+    scale: float,
+    bias: np.ndarray | None,
+    heads: int,
+    theta: float,
+) -> np.ndarray:
+    projection = linear(value, weight, scale, bf16_scale=True).reshape(
+        value.shape[0], heads, -1
+    )
+    if bias is None:
+        return rope(projection, theta)
+
+    seq_len, _, head_dim = projection.shape
+    half = head_dim // 2
+    inverse = theta ** (
+        -np.arange(half, dtype=np.float32) * np.float32(2.0 / head_dim)
+    )
+    angle = np.arange(seq_len, dtype=np.float32)[:, None] * inverse[None, :]
+    cosine = bf16(np.cos(angle))[:, None, :]
+    sine = bf16(np.sin(angle))[:, None, :]
+    bias = bf16(bias).reshape(1, heads, head_dim)
+    low = projection[:, :, :half]
+    high = projection[:, :, half:]
+    bias_low = bias[:, :, :half]
+    bias_high = bias[:, :, half:]
+
+    low_cos = bf16(fma32(bias_low, cosine, low * cosine))
+    high_sin = bf16(fma32(bias_high, sine, high * sine))
+    high_cos = bf16(fma32(bias_high, cosine, high * cosine))
+    low_sin = bf16(fma32(bias_low, sine, low * sine))
+    return bf16(np.concatenate(
+        (low_cos - high_sin, high_cos + low_sin), axis=-1
+    ))
+
+
+def vxm_lut(value: np.ndarray, operation: str) -> np.ndarray:
+    value = fp16_ftz(value)
+    finite = np.isfinite(value)
+    safe_value = np.where(finite, value, np.float32(0.0))
+    entries = np.float32(256.0)
+
+    if operation == "exp":
+        ln2 = np.float32(0.6931471805599453)
+        exponent = np.rint(
+            safe_value * np.float32(1.4426950408889634)
+        ).astype(np.int32)
+        local = safe_value - exponent.astype(np.float32) * ln2
+        input_min = -ln2 / np.float32(2.0)
+        width = ln2 / entries
+        multiplier = np.ones_like(value)
+        result_exponent = exponent
+        function = np.exp
+    elif operation == "reciprocal":
+        mantissa, exponent = np.frexp(np.abs(safe_value))
+        local = mantissa.astype(np.float32) * np.float32(2.0)
+        input_min = np.float32(1.0)
+        width = np.float32(1.0) / entries
+        multiplier = np.copysign(np.ones_like(value), safe_value)
+        result_exponent = -(exponent - 1)
+        function = lambda x: np.float32(1.0) / x
+    elif operation == "rsqrt":
+        mantissa, exponent = np.frexp(safe_value)
+        local = mantissa.astype(np.float32) * np.float32(2.0)
+        exponent = exponent - 1
+        odd_exponent = (exponent & 1) != 0
+        local = np.where(odd_exponent, local * np.float32(2.0), local)
+        exponent = np.where(odd_exponent, exponent - 1, exponent)
+        input_min = np.float32(1.0)
+        width = np.float32(3.0) / entries
+        multiplier = np.ones_like(value)
+        result_exponent = -exponent // 2
+        function = lambda x: np.float32(1.0) / np.sqrt(x)
+    else:
+        raise ValueError(f"unsupported VXM LUT operation: {operation}")
+
+    index = np.clip(
+        np.floor((local - input_min) / width).astype(np.int32), 0, 255
+    )
+    x0 = input_min + index.astype(np.float32) * width
+    y0 = function(x0).astype(np.float32)
+    y1 = function(x0 + width).astype(np.float32)
+    slope = fp16_ftz((y1 - y0) / width)
+    intercept = fp16_ftz(y0)
+    interpolated = fma32(slope, local - x0, intercept)
+    result = fp16_ftz(np.ldexp(
+        interpolated * multiplier, result_exponent
+    ))
+    if operation == "exp":
+        result = np.where(np.isneginf(value), np.float32(0.0), result)
+        result = np.where(np.isposinf(value), np.float32(np.inf), result)
+    elif operation == "rsqrt":
+        result = np.where(value == 0.0, np.float32(np.inf), result)
+        result = np.where(np.isposinf(value), np.float32(0.0), result)
+        result = np.where(value < 0.0, np.float32(np.nan), result)
+    return result
+
+
+def lpu_softmax(
+    scores: np.ndarray, head_dim: int, causal: bool = True
+) -> np.ndarray:
+    sequence = scores.shape[-1]
+    scores = bf16(scores)
+    if causal:
+        mask_value = bf16(np.asarray([-1.0e9], dtype=np.float32))[0]
+        scores = scores + np.triu(
+            np.full((sequence, sequence), mask_value, dtype=np.float32), 1
+        )
+    scores = bf16(
+        scores * np.float32(1.0 / np.sqrt(np.float32(head_dim)))
+    )
+    maximum = np.max(scores, axis=-1, keepdims=True)
+    exponentials = vxm_lut(scores - maximum, "exp")
+    # VXM accumulates one streamed element per cycle in key order.
+    denominator = np.add.accumulate(
+        exponentials, axis=-1, dtype=np.float32
+    )[..., -1:]
+    reciprocal = vxm_lut(denominator, "reciprocal")
+    return bf16(exponentials * reciprocal)
 
 
 def decoder_layer_reference(
@@ -161,18 +316,14 @@ def decoder_layer_reference(
     if stage_outputs is not None:
         stage_outputs["norm0"] = normalized
     biases = biases or {}
-    query = rope(
-        biased_linear(normalized, weights["query"], scales["query"],
-                      biases.get("query")).reshape(
-            seq_len, query_heads, head_dim
-        ),
+    query = biased_rope_linear(
+        normalized, weights["query"], scales["query"],
+        biases.get("query"), query_heads,
         float(config["rope_theta"]),
     )
-    key = rope(
-        biased_linear(normalized, weights["key"], scales["key"],
-                      biases.get("key")).reshape(
-            seq_len, kv_heads, head_dim
-        ),
+    key = biased_rope_linear(
+        normalized, weights["key"], scales["key"],
+        biases.get("key"), kv_heads,
         float(config["rope_theta"]),
     )
     value = biased_linear(normalized, weights["value"], scales["value"],
@@ -189,17 +340,14 @@ def decoder_layer_reference(
     query = np.transpose(query, (1, 0, 2))
     key = np.transpose(key, (1, 0, 2))
     value = np.transpose(value, (1, 0, 2))
-    scores = query @ np.transpose(key, (0, 2, 1))
-    scores /= np.sqrt(np.float32(head_dim))
-    scores += np.triu(
-        np.full((seq_len, seq_len), -1.0e9, dtype=np.float32), 1
+    scores = bf16(query @ np.transpose(key, (0, 2, 1)))
+    probability = lpu_softmax(scores, head_dim)
+    context = bf16(
+        np.transpose(probability @ value, (1, 0, 2)).reshape(seq_len, hidden)
     )
-    scores -= np.max(scores, axis=-1, keepdims=True)
-    probability = bf16(
-        np.exp(scores) / np.sum(np.exp(scores), axis=-1, keepdims=True)
+    attention = linear(
+        context, weights["output"], scales["output"], bf16_scale=True
     )
-    context = np.transpose(probability @ value, (1, 0, 2)).reshape(seq_len, hidden)
-    attention = linear(context, weights["output"], scales["output"])
     residual = bf16(activation + attention)
     if stage_outputs is not None:
         stage_outputs["context"] = bf16(context)
@@ -237,8 +385,7 @@ def main() -> None:
         "--ignore-attention-bias",
         action="store_true",
         help=(
-            "omit checkpoint Q/K/V biases until the LPU attention lowering "
-            "supports projection bias adds"
+            "replace checkpoint Q/K/V biases with zero-valued operands"
         ),
     )
     args = parser.parse_args()
@@ -276,6 +423,17 @@ def main() -> None:
                            ("value", "v_proj")):
             biases[role] = store.read(f"{prefix}.self_attn.{stem}.bias")
 
+    hidden = int(config["hidden_size"])
+    kv_width = (
+        int(config["num_key_value_heads"])
+        * hidden // int(config["num_attention_heads"])
+    )
+    serialized_biases = {
+        "query": biases.get("query", np.zeros(hidden, dtype=np.float32)),
+        "key": biases.get("key", np.zeros(kv_width, dtype=np.float32)),
+        "value": biases.get("value", np.zeros(kv_width, dtype=np.float32)),
+    }
+
     norm0 = store.read(f"{prefix}.input_layernorm.weight")
     norm1 = store.read(f"{prefix}.post_attention_layernorm.weight")
     embedding = store.read("model.embed_tokens.weight")
@@ -310,7 +468,7 @@ def main() -> None:
     np.asarray(
         [scales[role] for role in names], dtype="<f4"
     ).tofile(args.output_dir / "quant_scales.f32.bin")
-    for role, value in biases.items():
+    for role, value in serialized_biases.items():
         write_bf16(args.output_dir / f"{role}_bias.bf16.bin", value)
 
     metadata = {
@@ -328,11 +486,13 @@ def main() -> None:
         "scales": scales,
         "source_tensors": names,
         "attention_bias": bool(biases),
+        "attention_bias_operands": True,
         "source_attention_bias": bool(source_has_attention_bias),
         "ignored_attention_bias": bool(
             source_has_attention_bias and args.ignore_attention_bias
         ),
         "bias_roles": sorted(biases),
+        "bias_operand_roles": sorted(serialized_biases),
         "bias_tensors": {
             role: f"{prefix}.self_attn.{stem}.bias"
             for role, stem in (("query", "q_proj"), ("key", "k_proj"),

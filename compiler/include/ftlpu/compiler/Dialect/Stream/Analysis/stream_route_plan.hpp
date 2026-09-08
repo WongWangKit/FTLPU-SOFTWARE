@@ -38,6 +38,7 @@ private:
     int64_t duration_ = 0;
 };
 
-StreamRoutePlan plan_attention_routes();
+StreamRoutePlan plan_attention_routes(bool hasQueryBias = false,
+    bool hasKeyBias = false, bool hasValueBias = false);
 
 } // namespace ftlpu::compiler::stream

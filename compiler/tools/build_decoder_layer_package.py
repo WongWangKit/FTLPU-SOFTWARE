@@ -139,6 +139,10 @@ def main() -> None:
         "down": [intermediate, hidden],
     }
     weight_order = ["query", "key", "value", "output", "gate", "up", "down"]
+    bias_operand_flags = [
+        bool(current.get("attention_bias_operands", False))
+        for current in metadata_list
+    ]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("wb") as stream:
@@ -151,7 +155,7 @@ def main() -> None:
         # reproducible from one package.
         scalar(
             stream, "I",
-            2 + 9 * len(golden_dirs)
+            2 + sum(9 + 3 * has_bias for has_bias in bias_operand_flags)
             + (len(golden_dirs) if args.checkpoint_outputs else 0)
             + (2 if include_boundaries else 0),
         )
@@ -159,7 +163,9 @@ def main() -> None:
             stream, "golden.input", BF16, [seq_len, hidden],
             (golden_dirs[0] / "input.bf16.bin").read_bytes()
         )
-        for golden_dir, layer_metadata in zip(golden_dirs, metadata_list):
+        for golden_dir, layer_metadata, has_bias in zip(
+            golden_dirs, metadata_list, bias_operand_flags
+        ):
             layer = int(layer_metadata["layer"])
             tensor(
                 stream, f"layers.{layer}.input_layernorm.weight",
@@ -174,6 +180,17 @@ def main() -> None:
                     SYMMETRIC_PER_TENSOR_I8,
                     [layer_metadata["scales"][role]],
                 )
+            if has_bias:
+                for role, width in (
+                    ("query", hidden),
+                    ("key", metadata["kv_heads"] * metadata["head_dim"]),
+                    ("value", metadata["kv_heads"] * metadata["head_dim"]),
+                ):
+                    tensor(
+                        stream, f"layers.{layer}.{role}.bias",
+                        BF16, [width],
+                        (golden_dir / f"{role}_bias.bf16.bin").read_bytes(),
+                    )
             tensor(
                 stream, f"layers.{layer}.post_attention_layernorm.weight",
                 BF16, [hidden],
@@ -292,18 +309,30 @@ def main() -> None:
                 stream, "I",
                 executable_indices[invocation_index],
             )
-            binding_refs(stream, [
+            input_refs = [
                 (0, f"hidden.{invocation_index}"),
                 (1, f"layers.{layer}.input_layernorm.weight"),
                 (2, f"layers.{layer}.query.weight"),
                 (3, f"layers.{layer}.key.weight"),
                 (4, f"layers.{layer}.value.weight"),
                 (5, f"layers.{layer}.output.weight"),
-                (6, f"layers.{layer}.post_attention_layernorm.weight"),
-                (7, f"layers.{layer}.gate.weight"),
-                (8, f"layers.{layer}.up.weight"),
-                (9, f"layers.{layer}.down.weight"),
+            ]
+            next_binding = 6
+            if bias_operand_flags[invocation_index]:
+                input_refs.extend([
+                    (6, f"layers.{layer}.query.bias"),
+                    (7, f"layers.{layer}.key.bias"),
+                    (8, f"layers.{layer}.value.bias"),
+                ])
+                next_binding = 9
+            input_refs.extend([
+                (next_binding,
+                 f"layers.{layer}.post_attention_layernorm.weight"),
+                (next_binding + 1, f"layers.{layer}.gate.weight"),
+                (next_binding + 2, f"layers.{layer}.up.weight"),
+                (next_binding + 3, f"layers.{layer}.down.weight"),
             ])
+            binding_refs(stream, input_refs)
             binding_refs(
                 stream, [(0, f"hidden.{invocation_index + 1}")]
             )

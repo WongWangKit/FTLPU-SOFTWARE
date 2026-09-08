@@ -441,6 +441,8 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::Fp16HeadPlanar;
     if (value == "fp16_head_block_packed")
         return BindingLayout::Fp16HeadBlockPacked;
+    if (value == "fp16_projection_bias_x4")
+        return BindingLayout::Fp16ProjectionBiasX4;
     throw std::runtime_error("unsupported Command IR binding layout");
 }
 

@@ -28,6 +28,14 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t blocks = seq_len / tile;
     const int64_t query_width = query_heads * head_dim;
     const int64_t kv_width = kv_heads * head_dim;
+    const mlir::Value query_bias =
+        graph.query_bias ? graph.query_bias.getBias() : mlir::Value {};
+    const mlir::Value key_bias =
+        graph.key_bias ? graph.key_bias.getBias() : mlir::Value {};
+    const mlir::Value value_bias =
+        graph.value_bias ? graph.value_bias.getBias() : mlir::Value {};
+    const bool has_qk_bias = query_bias || key_bias;
+    const bool has_attention_bias = query_bias || key_bias || value_bias;
     auto execution_policy =
         target::mxm_execution_policy_from_operation(op);
     if (mlir::failed(execution_policy)) {
@@ -115,6 +123,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         && target.throughput().vxm_cross_hemisphere_streams_enabled != 0
         && target.throughput().vxm_fma_enabled != 0
         && target.throughput().vxm_alus >= 4
+        && !has_qk_bias
         && target.memory().hemispheres == 2
         && head_blocks == 4;
     const int64_t logical_head_banks = (head_blocks + 1) / 2;
@@ -142,6 +151,23 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t input_staging_rows = seq_len * hidden / tile;
     const int64_t input_staging_base =
         target.memory().words_per_bank - input_staging_rows;
+    const auto projection_bias_rows = [&](int64_t width) {
+        const int64_t output_blocks = (width + tile - 1) / tile;
+        return 2 * ((output_blocks + 3) / 4);
+    };
+    const int64_t query_bias_rows = query_bias
+        ? projection_bias_rows(query_width) : 0;
+    const int64_t key_bias_rows = key_bias
+        ? projection_bias_rows(kv_width) : 0;
+    const int64_t value_bias_rows = value_bias
+        ? projection_bias_rows(kv_width) : 0;
+    const int64_t projection_bias_total_rows =
+        query_bias_rows + key_bias_rows + value_bias_rows;
+    const int64_t projection_bias_base =
+        target.attention_context_base_row() - projection_bias_total_rows;
+    const int64_t query_bias_base = projection_bias_base;
+    const int64_t key_bias_base = query_bias_base + query_bias_rows;
+    const int64_t value_bias_base = key_bias_base + key_bias_rows;
     // Attention intermediates live in the activation partition. Keep their
     // low row above the persistent residual input so later weight pages may
     // remain resident in the dedicated weight slices throughout RoPE and
@@ -186,12 +212,30 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const llvm::SmallVector<int64_t, 2> scratch_banks {
         scratch_bank, secondary_scratch_bank};
     tensor::PhysicalMemoryAllocator physical_allocator(target);
+    llvm::SmallVector<int64_t, 16> projection_bias_slices;
+    if (has_attention_bias) {
+        const auto storage = target.activation_storage_slices();
+        if (storage.size() < 20 || projection_bias_base < 0) {
+            op.emitError(
+                "attention projection bias requires four activation slices "
+                "and reserved rows below the context buffer");
+            return mlir::failure();
+        }
+        projection_bias_slices.assign(
+            storage.begin() + 12, storage.begin() + 16);
+    }
+    // Product-phase Q/K reads share the 16-slice RoPE staging footprint.
+    // Keep bias on the opposite bank so each cycle can fetch both operands
+    // without asking one SRAM read port for two addresses.
+    const int64_t projection_bias_bank = scratch_bank;
     const int64_t input_staging_bank = scratch_bank;
     const auto input_staging_values = target.uses_dedicated_slice_roles()
         ? target.activation_storage_slices() : planar_activation_slices;
     const auto input_staging_begin = direct_rope_streaming
         ? input_staging_values.end() - 2
-        : input_staging_values.begin();
+        : compact_rope_products
+            ? input_staging_values.begin() + 8
+            : input_staging_values.begin();
     const auto input_staging_end = input_staging_begin + 2;
     const llvm::SmallVector<int64_t, 16> input_staging_slices(
         input_staging_begin, input_staging_end);
@@ -225,17 +269,15 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         target.attention_rope_staging_slices();
     const llvm::SmallVector<int64_t, 16> rope_staging_slices(
         staging_slice_values.begin(), staging_slice_values.end());
-    // RoPE uses an explicit bank pipeline on dedicated-role targets:
-    // projection -> staging(bank 0) -> products(bank 1) -> Q/K(bank 0).
-    // Every step can therefore read and write in the same cycle without
-    // requiring a dual-port SRAM bank.
+    // Explicit RoPE products alternate banks. Keep the table on the opposite
+    // bank from the first product pair so an II=1 phase can read the table and
+    // write products without asking one SRAM bank for both operations.
     const int64_t rope_staging_bank =
         target.uses_dedicated_slice_roles()
             ? secondary_scratch_bank : scratch_bank;
     const int64_t rope_product_bank =
-        target.uses_dedicated_slice_roles()
-            && target.memory().banks_per_slice > 1
-        ? secondary_scratch_bank : scratch_bank;
+        compact_rope_products && direct_rope_streaming
+            ? secondary_scratch_bank : scratch_bank;
     llvm::SmallVector<int64_t, 16> rope_product_slices;
     llvm::SmallVector<int64_t, 4> rope_product_key_slices;
     if (compact_rope_products) {
@@ -267,13 +309,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t probability_diagonal_bank = scratch_bank;
     llvm::SmallVector<int64_t, 4> rope_table_slices;
     llvm::SmallVector<int64_t, 4> rope_mirror_slices;
-    int64_t rope_table_bank = direct_rope_streaming
+    int64_t rope_table_bank = compact_rope_products
         ? secondary_scratch_bank : scratch_bank;
-    int64_t rope_mirror_bank = direct_rope_streaming
-        ? scratch_bank : secondary_scratch_bank;
+    int64_t rope_mirror_bank = compact_rope_products
+        ? scratch_bank : rope_table_bank;
     const auto rope_slices = target.attention_rope_slices();
     rope_table_slices.assign(rope_slices.begin(), rope_slices.end());
-    if (direct_rope_streaming) {
+    if (compact_rope_products) {
         const auto storage = target.activation_storage_slices();
         rope_mirror_slices.assign(storage.begin(), storage.begin() + 4);
     } else {
@@ -293,10 +335,27 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         op.emitError("failed to reserve the attention RoPE product FIFO");
         return mlir::failure();
     }
+    int64_t next_bias_base = projection_bias_base;
+    const auto reserve_bias = [&](llvm::StringRef name, int64_t rows) {
+        if (rows == 0) return mlir::success();
+        const int64_t base = next_bias_base;
+        next_bias_base += rows;
+        return physical_allocator.reserve({name.str(),
+            projection_bias_slices, base, rows, 0, 2, false,
+            projection_bias_bank});
+    };
+    if (mlir::failed(reserve_bias("query_bias", query_bias_rows))
+        || mlir::failed(reserve_bias("key_bias", key_bias_rows))
+        || mlir::failed(reserve_bias("value_bias", value_bias_rows))) {
+        op.emitError(
+            "failed to reserve the attention projection-bias constants");
+        return mlir::failure();
+    }
     if (compact_rope_products
-        && mlir::failed(physical_allocator.reserve({"rope_product_bank1",
+        && mlir::failed(physical_allocator.reserve({"rope_product_alternate",
             rope_product_slices, rope_product_base, rope_product_rows,
-            0, 2, false, scratch_bank}))) {
+            0, 2, false,
+            (rope_product_bank + 1) % target.memory().banks_per_slice}))) {
         op.emitError(
             "failed to reserve the interleaved RoPE product FIFO");
         return mlir::failure();
@@ -694,7 +753,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         attrs.set("hemisphere_paired", rewriter.getBoolAttr(true));
         contextPlacement = attrs.getDictionary(rewriter.getContext());
     }
-    const auto plan = rewriter.getDictionaryAttr({
+    auto plan = rewriter.getDictionaryAttr({
         rewriter.getNamedAttr("input", inputPlacement),
         rewriter.getNamedAttr("input_staging",
             make_attention_placement(rewriter,
@@ -811,6 +870,25 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             seq_len * hidden / (tile * 2), "east",
             vector_result->bank)),
     });
+    if (has_attention_bias) {
+        mlir::NamedAttrList plan_attributes(plan);
+        const auto add_bias_placement = [&](llvm::StringRef name,
+                                            mlir::Value bias,
+                                            int64_t base,
+                                            int64_t rows) {
+            if (!bias) return;
+            plan_attributes.set(name, make_attention_placement(rewriter,
+                "fp16_projection_bias_x4", projection_bias_slices,
+                base, rows, "both", projection_bias_bank));
+        };
+        add_bias_placement(
+            "query_bias", query_bias, query_bias_base, query_bias_rows);
+        add_bias_placement(
+            "key_bias", key_bias, key_bias_base, key_bias_rows);
+        add_bias_placement(
+            "value_bias", value_bias, value_bias_base, value_bias_rows);
+        plan = plan_attributes.getDictionary(rewriter.getContext());
+    }
     const auto config = rewriter.getDictionaryAttr({
         rewriter.getNamedAttr(
             "seq_len", rewriter.getI64IntegerAttr(seq_len)),
@@ -839,8 +917,9 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         [&](std::initializer_list<llvm::StringRef> names) {
             llvm::SmallVector<mlir::NamedAttribute> entries;
             for (llvm::StringRef name : names)
-                entries.push_back(rewriter.getNamedAttr(
-                    name, plan.get(name)));
+                if (mlir::Attribute placement = plan.get(name))
+                    entries.push_back(
+                        rewriter.getNamedAttr(name, placement));
             return rewriter.getDictionaryAttr(entries);
         };
     const auto emptyPlan = rewriter.getDictionaryAttr({});
@@ -856,13 +935,14 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         {query_heads, seq_len, seq_len},
         elementType);
     const auto createProjection =
-        [&](mlir::Value input, mlir::Value weight,
+        [&](mlir::Value input, mlir::Value weight, mlir::Value bias,
             llvm::StringRef kind, mlir::Type resultType,
             mlir::DictionaryAttr memoryPlan) {
             mlir::OperationState state(
                 op.getLoc(),
                 tensor::ProjectionTaskOp::getOperationName());
             state.addOperands({input, weight});
+            if (bias) state.addOperands(bias);
             state.addTypes(resultType);
             state.addAttributes({
                 rewriter.getNamedAttr(
@@ -907,19 +987,19 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         };
 
     auto query = createProjection(
-        graph.query.getLhs(), graph.query.getRhs(),
+        graph.query.getLhs(), graph.query.getRhs(), query_bias,
         "query", matrixType(seq_len, query_width),
         subplan({"input", "input_staging",
             "query_weight", "query", "rope_staging", "rope_product",
-            "rope_mirror"}));
+            "rope_mirror", "query_bias"}));
     auto key = createProjection(
-        graph.key.getLhs(), graph.key.getRhs(),
+        graph.key.getLhs(), graph.key.getRhs(), key_bias,
         "key", matrixType(seq_len, kv_width),
-        subplan({"key_weight", "key", "rope_product_key"}));
+        subplan({"key_weight", "key", "rope_product_key", "key_bias"}));
     auto value = createProjection(
-        graph.value.getLhs(), graph.value.getRhs(),
+        graph.value.getLhs(), graph.value.getRhs(), value_bias,
         "value", matrixType(seq_len, kv_width),
-        subplan({"value_weight", "value"}));
+        subplan({"value_weight", "value", "value_bias"}));
     const mlir::Value rotatedQuery = createUnary(
         tensor::RopeTaskOp::getOperationName(), query.getResult(),
         "query", query.getResult().getType(), subplan({"rope"}));
@@ -949,7 +1029,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         matrixType(seq_len, query_width),
         subplan({"context"}));
     auto output = createProjection(pv.getResult(),
-        graph.output.getRhs(), "output",
+        graph.output.getRhs(), {}, "output",
         graph.output.getResult().getType(),
         subplan({"output_activation", "output_weight", "result"}));
     mlir::Operation* output_operation = graph.output.getOperation();

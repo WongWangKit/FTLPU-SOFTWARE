@@ -328,6 +328,32 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         }
         return image.finish();
     }
+    if (binding.layout == BindingLayout::Fp16ProjectionBiasX4
+        && (binding.element_type == BindingElementType::F16
+            || binding.element_type == BindingElementType::BF16)
+        && binding.slices.size() == 4) {
+        if (binding.shape.size() != 1 || columns % 32 != 0)
+            throw std::invalid_argument(
+                "projection bias requires a 32-aligned vector");
+        for (std::size_t column = 0; column < columns; ++column) {
+            const std::size_t block = column / 32;
+            const std::size_t pair = (block / 2) % 2;
+            const std::uint32_t address = base
+                + static_cast<std::uint32_t>(
+                    (block / 4) * 2 + block % 2) * stride;
+            const std::size_t offset = column * 2;
+            for_each_hemisphere(binding,
+                [&](std::uint16_t hemisphere) {
+                    image.write(hemisphere, binding.slices[2 * pair],
+                        address, static_cast<std::uint32_t>(column % 32),
+                        data[offset]);
+                    image.write(hemisphere, binding.slices[2 * pair + 1],
+                        address, static_cast<std::uint32_t>(column % 32),
+                        data[offset + 1]);
+                });
+        }
+        return image.finish();
+    }
 
     const auto write_i8 = [&](std::size_t k, std::size_t n,
                               std::uint16_t hemisphere,

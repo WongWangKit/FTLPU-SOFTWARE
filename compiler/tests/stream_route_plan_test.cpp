@@ -34,6 +34,32 @@ int main()
             && probability->buffer == "probability_diagonal",
         "PV route does not consume the SXM-transposed probability layout");
 
+    const StreamRoutePlan biasedPlan =
+        plan_attention_routes(true, true, true);
+    require(biasedPlan.valid(), "biased attention route plan is invalid");
+    require(biasedPlan.routes().size() == 28,
+        "biased attention route plan lost a physical transfer");
+    const auto valueToVxm = std::find_if(biasedPlan.routes().begin(),
+        biasedPlan.routes().end(), [](const RouteLifetime& route) {
+            return route.role == "value_to_vxm";
+        });
+    require(valueToVxm != biasedPlan.routes().end()
+            && valueToVxm->source
+                == ftlpu::compiler::target::StreamEndpoint::MxmResult
+            && valueToVxm->destination
+                == ftlpu::compiler::target::StreamEndpoint::VxmInput,
+        "biased V projection does not feed MXM output into VXM");
+    const auto valueResult = std::find_if(biasedPlan.routes().begin(),
+        biasedPlan.routes().end(), [](const RouteLifetime& route) {
+            return route.role == "value_result";
+        });
+    require(valueResult != biasedPlan.routes().end()
+            && valueResult->source
+                == ftlpu::compiler::target::StreamEndpoint::VxmResult
+            && valueResult->destination
+                == ftlpu::compiler::target::StreamEndpoint::Mem,
+        "biased V projection does not store the VXM result in MEM");
+
     StreamRoutePlan invalid;
     invalid.add("phase", "role",
         ftlpu::compiler::target::StreamEndpoint::Mem,

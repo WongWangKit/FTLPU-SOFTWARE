@@ -106,6 +106,26 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             llvm::cast<mlir::RankedTensorType>(argument.getType()),
             memoryPlan.getAs<mlir::DictionaryAttr>(placements[index]));
     }
+    const mlir::Value biases[] = {
+        op_.getQueryBias(), op_.getKeyBias(), op_.getValueBias()};
+    const char* biasPlacements[] = {
+        "query_bias", "key_bias", "value_bias"};
+    for (std::size_t index = 0; index < std::size(biases); ++index) {
+        if (!biases[index]) continue;
+        const auto argument =
+            llvm::dyn_cast<mlir::BlockArgument>(biases[index]);
+        const auto placement = memoryPlan.getAs<mlir::DictionaryAttr>(
+            biasPlacements[index]);
+        if (!argument || !placement) {
+            op_.emitError(
+                "attention bias is missing a runtime argument or placement");
+            return mlir::failure();
+        }
+        createBinding(rewriter_, op_.getLoc(), biases[index],
+            argument.getArgNumber(), "input", "bias",
+            llvm::cast<mlir::RankedTensorType>(argument.getType()),
+            placement, biasPlacements[index]);
+    }
     if (op_.getCausal()) {
         const auto maskType = mlir::RankedTensorType::get(
             {tile - 1, tile},

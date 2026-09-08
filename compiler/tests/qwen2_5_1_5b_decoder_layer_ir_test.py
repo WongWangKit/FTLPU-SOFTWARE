@@ -213,6 +213,10 @@ def main() -> None:
         f"tensor<{args.seq_len}x12x128xbf16>",
         f"tensor<{args.seq_len}x2x128xbf16>", "dense<1.000000e+06>",
         "dense<1.000000e-06>", "stablehlo.compare GE",
+        "%query_bias: tensor<1536xbf16>",
+        "stablehlo.add %attention_query_2d",
+        "stablehlo.add %attention_key_2d",
+        "stablehlo.add %attention_value_2d",
     ), "StableHLO")
 
     kernel = lower(args.tool, args.target_config, args.input,
@@ -222,7 +226,8 @@ def main() -> None:
     require(kernel, (
         "ftlpu.kernel.rms_norm", "ftlpu.kernel.rope",
         "ftlpu.kernel.softmax", "ftlpu.kernel.batch_matmul",
-        "ftlpu.kernel.swish", "head_dim = 128 : i64",
+        "ftlpu.kernel.swish", "ftlpu.kernel.bias_add",
+        "head_dim = 128 : i64",
         "query_heads = 12 : i64", "kv_heads = 2 : i64",
         "theta = 1.000000e+06 : f32", "n = 8960 : i64",
     ), "Kernel")
@@ -236,6 +241,8 @@ def main() -> None:
         "ftlpu.tensor.rope_task", "ftlpu.tensor.softmax_task",
         "ftlpu.tensor.swish_task", 'kind = "w8a16_mxm_weight_striped"',
         'kind = "fp16_mxm_distributed_16"',
+        'query_bias = {', 'key_bias = {', 'value_bias = {',
+        'kind = "fp16_projection_bias_x4"',
     ), "Tensor")
     for line in tensor.splitlines():
         if "ftlpu.tensor.rms_norm_task" not in line:
@@ -266,8 +273,23 @@ def main() -> None:
         "ftlpu.stream.swish_task", "ftlpu.stream.batch_matmul_task",
         "head_dim = 128 : i64", "query_heads = 12 : i64",
         "kv_heads = 2 : i64", "rope_theta = 1.000000e+06 : f32",
-        "stream_count = 16 : i64",
+        "stream_count = 16 : i64", 'role = "query_bias"',
+        'role = "key_bias"', 'role = "value_bias"',
     ), "Stream")
+    value_projection = next(
+        line for line in stream.splitlines()
+        if "ftlpu.stream.projection_task" in line
+        and 'kind = "value"' in line
+    )
+    for marker in (
+            'role = "value_to_vxm", source = "MXM.result"',
+            'destination = "MEM", direction = "east"',
+            'role = "value_result", source = "VXM.result"'):
+        if marker not in value_projection:
+            raise AssertionError(
+                f"biased V projection route is missing {marker}: "
+                f"{value_projection}"
+            )
     for legacy in ("ftlpu.kernel.attention", "ftlpu.tensor.attention",
                    "ftlpu.stream.attention", "ftlpu.stream.ffn"):
         if legacy in stream:

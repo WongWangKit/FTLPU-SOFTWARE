@@ -390,6 +390,7 @@ void sequentializeScheduleStages(mlir::func::FuncOp function,
         for (mlir::Operation* operation : stage) {
             shiftIntegerAttribute(*operation, "cycle", offset);
             shiftIntegerAttribute(*operation, "result_cycle", offset);
+            shiftIntegerAttribute(*operation, "ready_cycle", offset);
             shiftIntegerAttribute(*operation, "start", offset);
             shiftIntegerAttribute(*operation, "end", offset);
         }

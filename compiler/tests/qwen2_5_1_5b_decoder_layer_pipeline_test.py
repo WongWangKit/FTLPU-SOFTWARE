@@ -83,16 +83,21 @@ def main() -> None:
         'accumulator_clear = true',
     }
     qkv_interval: tuple[int, int] | None = None
+    rope_interval: tuple[int, int] | None = None
+    pv_interval: tuple[int, int] | None = None
     o_proj_interval: tuple[int, int] | None = None
     rmsnorm_restore_ends: list[int] = []
-    ffn_weight_first_cycles: dict[int, int | None] = {7: None, 8: None}
+    ffn_weight_first_cycles: dict[int, int | None] = {10: None, 11: None}
     fused_swish_outputs: set[str] = set()
     fused_swish_writes: dict[str, set[tuple[str, int]]] = {}
     fused_hidden_locations: list[tuple[int, int, frozenset[int]]] = []
     ffn_input_allocation: tuple[str, int, int, int, frozenset[int]] | None = None
-    direct_rope_intervals: list[tuple[int, int]] = []
-    direct_rope_fma = False
-    direct_rope_fms = False
+    rope_product_intervals: list[tuple[int, int]] = []
+    qk_bias_low_fma = False
+    qk_bias_high_fma = False
+    value_bias_add = False
+    bias_bindings: set[str] = set()
+    workspace_ready_cycles: dict[str, int] = {}
     mxm_compute_intervals: list[tuple[int, int]] = []
     streaming_bf16_compute_intervals: list[tuple[int, int]] = []
     accumulator_read_intervals: list[tuple[int, int]] = []
@@ -116,35 +121,28 @@ def main() -> None:
                     )
                 if all(marker in line for marker in (
                     'queue = 0 : i64', 'opcode = "multiply"',
-                    'lhs_index = 32 : i64', 'rhs_index = 40 : i64',
-                    'lhs_stream_source = "east"',
-                    'rhs_stream_source = "east"',
+                    'lhs_index = 32 : i64', 'rhs_index = 34 : i64',
                     'repeat_count = 32 : i64',
                 )):
-                    direct_rope_intervals.extend(repeated_intervals(line))
+                    rope_product_intervals.extend(repeated_intervals(line))
                 if all(marker in line for marker in (
-                    'queue = 1 : i64', 'opcode = "fms"',
-                    'lhs_stream_source = "west"',
-                    'rhs_stream_source = "east"',
+                    'queue = 1 : i64', 'opcode = "fma"',
+                    'lhs_index = 40 : i64', 'rhs_index = 34 : i64',
                     'output_stream = 0 : i64',
                 )):
-                    direct_rope_fms = True
+                    qk_bias_low_fma = True
                 if all(marker in line for marker in (
                     'queue = 3 : i64', 'opcode = "fma"',
-                    'lhs_stream_source = "east"',
-                    'rhs_stream_source = "east"',
+                    'lhs_index = 42 : i64', 'rhs_index = 38 : i64',
                     'output_stream = 2 : i64',
                 )):
-                    direct_rope_fma = True
+                    qk_bias_high_fma = True
                 if all(marker in line for marker in (
-                    'opcode = "multiply"', 'lhs_index = 32 : i64',
-                    'rhs_index = 34 : i64',
+                    '%arg8' , 'opcode = "add"',
+                    'lhs_index = 32 : i64', 'rhs_index = 40 : i64',
                     'repeat_count = 32 : i64',
                 )):
-                    raise AssertionError(
-                        "Schedule retained the legacy MEM-staged RoPE product path: "
-                        f"{line.strip()}"
-                    )
+                    value_bias_add = True
                 if all(marker in line for marker in (
                     'queue = 7 : i64', 'opcode = "bypass"',
                     'cast_target = "bf16"', 'output_stream = 6 : i64',
@@ -176,6 +174,17 @@ def main() -> None:
                                           re.findall(r"\d+", slices.group(1))),
                             ))
             if "ftlpu.schedule.binding" in line:
+                if 'role = "bias"' in line:
+                    name = re.search(r'name = "([^"]+)"', line)
+                    if name:
+                        bias_bindings.add(name.group(1))
+                if 'role = "workspace"' in line:
+                    name = re.search(r'name = "([^"]+)"', line)
+                    ready = re.search(r'ready_cycle = (\d+) : i64', line)
+                    if name and ready:
+                        workspace_ready_cycles[name.group(1)] = int(
+                            ready.group(1)
+                        )
                 slices_match = re.search(r"slices = \[([^\]]+)\]", line)
                 if slices_match:
                     name_match = re.search(r'name = "([^"]+)"', line)
@@ -199,6 +208,16 @@ def main() -> None:
             if ('ftlpu.schedule.timeline' in line
                     and 'name = "qkv"' in line):
                 qkv_interval = (
+                    integer_attr(line, "start"), integer_attr(line, "end")
+                )
+            if ('ftlpu.schedule.timeline' in line
+                    and 'name = "rope"' in line):
+                rope_interval = (
+                    integer_attr(line, "start"), integer_attr(line, "end")
+                )
+            if ('ftlpu.schedule.timeline' in line
+                    and 'name = "pv"' in line):
+                pv_interval = (
                     integer_attr(line, "start"), integer_attr(line, "end")
                 )
             if ('ftlpu.schedule.timeline' in line
@@ -274,12 +293,16 @@ def main() -> None:
                 )
     if qkv_interval is None:
         raise AssertionError("Schedule IR is missing the QKV timeline")
+    if rope_interval is None:
+        raise AssertionError("Schedule IR is missing the RoPE timeline")
+    if pv_interval is None:
+        raise AssertionError("Schedule IR is missing the PV timeline")
     if o_proj_interval is None:
         raise AssertionError("Schedule IR is missing the O projection timeline")
     if len(rmsnorm_restore_ends) < 2:
         raise AssertionError("Schedule IR is missing the second RMSNorm restore")
-    gate_first = ffn_weight_first_cycles[7]
-    up_first = ffn_weight_first_cycles[8]
+    gate_first = ffn_weight_first_cycles[10]
+    up_first = ffn_weight_first_cycles[11]
     if gate_first is None or up_first is None:
         raise AssertionError("Schedule IR is missing Gate/Up paged weight reads")
     mirrored_swish_outputs = [
@@ -322,9 +345,28 @@ def main() -> None:
             "FFN retained a large idle window after the second RMSNorm: "
             f"rms_end={second_rms_end}, first_up={up_first}"
         )
-    if not direct_rope_fma or not direct_rope_fms:
+    if bias_bindings != {"query_bias", "key_bias", "value_bias"}:
         raise AssertionError(
-            "Schedule IR is missing the direct MXM-to-VXM RoPE FMA/FMS chains"
+            f"Schedule IR has incomplete projection bias bindings: {bias_bindings}"
+        )
+    expected_ready_cycles = {
+        "attention.value": rope_interval[1],
+        "attention.context": pv_interval[1],
+    }
+    for name, expected in expected_ready_cycles.items():
+        observed = workspace_ready_cycles.get(name)
+        if observed != expected:
+            raise AssertionError(
+                f"{name} readiness is not on the global schedule timeline: "
+                f"observed={observed}, expected={expected}"
+            )
+    if not qk_bias_low_fma or not qk_bias_high_fma:
+        raise AssertionError(
+            "Schedule IR does not fuse Q/K bias into both RoPE product chains"
+        )
+    if not value_bias_add:
+        raise AssertionError(
+            "Schedule IR does not route V projection through VXM bias add"
         )
     qkv_mxm_intervals = [
         interval for interval in mxm_compute_intervals
@@ -332,13 +374,13 @@ def main() -> None:
     ]
     overlaps = [
         (rope, mxm)
-        for rope in direct_rope_intervals
+        for rope in rope_product_intervals
         for mxm in qkv_mxm_intervals
         if max(rope[0], mxm[0]) < min(rope[1], mxm[1])
     ]
     if not overlaps:
         raise AssertionError(
-            "QKV schedule does not overlap any direct VXM RoPE window with "
+            "QKV schedule does not overlap any VXM RoPE product window with "
             "an MXM projection compute window"
         )
     o_proj_accumulator_reads = [
@@ -363,8 +405,8 @@ def main() -> None:
         )
     first_rope, first_mxm = overlaps[0]
     print(
-        "QKV/direct-RoPE overlap: "
-        f"{len({rope for rope, _ in overlaps})} direct RoPE windows; "
+        "QKV/bias-RoPE overlap: "
+        f"{len({rope for rope, _ in overlaps})} RoPE product windows; "
         f"first RoPE {first_rope} with MXM {first_mxm}",
         flush=True,
     )

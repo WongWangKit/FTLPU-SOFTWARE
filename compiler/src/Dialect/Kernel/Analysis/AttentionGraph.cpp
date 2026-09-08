@@ -2,6 +2,22 @@
 
 namespace ftlpu::compiler::kernel {
 
+namespace {
+
+struct ProjectionRoot {
+    MatmulOp matmul;
+    BiasAddOp bias;
+};
+
+ProjectionRoot match_projection_root(mlir::Value value)
+{
+    if (auto bias = value.getDefiningOp<BiasAddOp>())
+        return {bias.getInput().getDefiningOp<MatmulOp>(), bias};
+    return {value.getDefiningOp<MatmulOp>(), {}};
+}
+
+} // namespace
+
 std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
 {
     auto context_reshape = output.getLhs().getDefiningOp<ReshapeOp>();
@@ -22,9 +38,10 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
     auto value_reshape = value_broadcast
         ? value_broadcast.getInput().getDefiningOp<ReshapeOp>()
         : ReshapeOp {};
-    auto value = value_reshape
-        ? value_reshape.getInput().getDefiningOp<MatmulOp>()
-        : MatmulOp {};
+    auto value_root = value_reshape
+        ? match_projection_root(value_reshape.getInput())
+        : ProjectionRoot {};
+    auto value = value_root.matmul;
     auto qk = softmax
         ? softmax.getInput().getDefiningOp<BatchMatmulOp>()
         : BatchMatmulOp {};
@@ -49,12 +66,14 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
     auto key_reshape = key_rope
         ? key_rope.getInput().getDefiningOp<ReshapeOp>()
         : ReshapeOp {};
-    auto query = query_reshape
-        ? query_reshape.getInput().getDefiningOp<MatmulOp>()
-        : MatmulOp {};
-    auto key = key_reshape
-        ? key_reshape.getInput().getDefiningOp<MatmulOp>()
-        : MatmulOp {};
+    auto query_root = query_reshape
+        ? match_projection_root(query_reshape.getInput())
+        : ProjectionRoot {};
+    auto key_root = key_reshape
+        ? match_projection_root(key_reshape.getInput())
+        : ProjectionRoot {};
+    auto query = query_root.matmul;
+    auto key = key_root.matmul;
     if (!query || !key || query.getLhs() != key.getLhs()
         || query.getLhs() != value.getLhs()
         || query_rope.getHeadDim() != key_rope.getHeadDim()
@@ -65,11 +84,14 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
         || key_broadcast.getKvHeads() != key_rope.getHeads())
         return std::nullopt;
 
-    return AttentionGraph {
+    AttentionGraph graph {
         output,
         query,
         key,
         value,
+        query_root.bias,
+        key_root.bias,
+        value_root.bias,
         context_reshape,
         query_reshape,
         key_reshape,
@@ -95,6 +117,17 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
             context_transpose.getOperation(), context_reshape.getOperation(),
             output.getOperation()}
     };
+    std::size_t bias_index = 3;
+    if (query_root.bias)
+        graph.operations.insert(graph.operations.begin() + bias_index++,
+            query_root.bias.getOperation());
+    if (key_root.bias)
+        graph.operations.insert(graph.operations.begin() + bias_index++,
+            key_root.bias.getOperation());
+    if (value_root.bias)
+        graph.operations.insert(graph.operations.begin() + bias_index++,
+            value_root.bias.getOperation());
+    return graph;
 }
 
 } // namespace ftlpu::compiler::kernel

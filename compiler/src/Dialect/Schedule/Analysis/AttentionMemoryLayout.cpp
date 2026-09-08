@@ -536,7 +536,10 @@ int64_t AttentionMemoryLayout::ropeProductBank(
     if (!ropeProductBankInterleaved_) return baseBank;
     if (product < 0 || product >= 4)
         throw std::out_of_range("invalid RoPE product");
-    if (projection == AttentionProjectionKind::Key && product < 2
+    // Keep every Key product on its dedicated scratch bank. The final Key
+    // tensor occupies the other bank on the same compact slices, so combine
+    // can sustain II=1 while product reads overlap delayed result writes.
+    if (projection == AttentionProjectionKind::Key
         && ropeProductKeyBank_ >= 0)
         return ropeProductKeyBank_;
     return product < 2 ? baseBank

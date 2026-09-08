@@ -31,6 +31,14 @@ def MatmulOp : FTLPU_Kernel_Op<"matmul", [Pure]> {
   let hasVerifier = 1;
 }
 
+def BiasAddOp : FTLPU_Kernel_Op<"bias_add", [Pure]> {
+  let summary = "Broadcast a rank-1 projection bias over matrix rows";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$bias);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $bias attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def ReshapeOp : FTLPU_Kernel_Op<"reshape", [Pure]> {
   let summary = "Logical tensor reshape preserved in LPU Kernel IR";
   let arguments = (ins AnyRankedTensor:$input);

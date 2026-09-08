@@ -369,6 +369,9 @@ static LogicalResult verify_attention_memory_subplan(
 LogicalResult ProjectionTaskOp::verify()
 {
     if (getKind() == "linear") {
+        if (getBias())
+            return emitOpError(
+                "linear projection bias lowering is not implemented");
         const auto input = getInput().getType();
         const auto weight = getWeight().getType();
         const auto result = getResult().getType();
@@ -404,6 +407,16 @@ LogicalResult ProjectionTaskOp::verify()
         || getWeight().getType().getRank() != 2
         || getResult().getType().getRank() != 2)
         return emitOpError("requires rank-2 input, weight, and result tensors");
+    if (mlir::Value bias = getBias()) {
+        const auto biasType =
+            llvm::dyn_cast<mlir::RankedTensorType>(bias.getType());
+        const auto resultType = getResult().getType();
+        if (getKind() == "output" || !biasType || biasType.getRank() != 1
+            || biasType.getDimSize(0) != resultType.getDimSize(1)
+            || biasType.getElementType() != resultType.getElementType())
+            return emitOpError(
+                "Q/K/V bias must match the projection output width");
+    }
     if (failed(verify_attention_task_config(getOperation(), getConfig())))
         return failure();
     return verify_attention_memory_subplan(

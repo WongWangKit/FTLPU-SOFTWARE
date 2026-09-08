@@ -72,6 +72,21 @@ struct AttentionTaskGraphView {
         auto op = output;
         return op.getWeight();
     }
+    mlir::Value getQueryBias() const
+    {
+        auto op = query;
+        return op.getBias();
+    }
+    mlir::Value getKeyBias() const
+    {
+        auto op = key;
+        return op.getBias();
+    }
+    mlir::Value getValueBias() const
+    {
+        auto op = value;
+        return op.getBias();
+    }
     mlir::Value getResult() const
     {
         auto op = output;

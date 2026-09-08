@@ -6,6 +6,9 @@ module {
       %key_weight: tensor<1536x256xi8>,
       %value_weight: tensor<1536x256xi8>,
       %output_weight: tensor<1536x1536xi8>,
+      %query_bias: tensor<1536xbf16>,
+      %key_bias: tensor<256xbf16>,
+      %value_bias: tensor<256xbf16>,
       %post_attention_norm_weight: tensor<1536xbf16>,
       %gate_weight: tensor<1536x8960xi8>,
       %up_weight: tensor<1536x8960xi8>,
@@ -62,11 +65,24 @@ module {
         contracting_dims = [1] x [0], precision = [] :
         (tensor<32x1536xbf16>, tensor<1536x256xbf16>) -> tensor<32x256xbf16>
 
-    %attention_query_heads = stablehlo.reshape %attention_query_2d :
+    %attention_query_bias_2d = stablehlo.broadcast_in_dim %query_bias, dims = [1] :
+        (tensor<1536xbf16>) -> tensor<32x1536xbf16>
+    %attention_key_bias_2d = stablehlo.broadcast_in_dim %key_bias, dims = [1] :
+        (tensor<256xbf16>) -> tensor<32x256xbf16>
+    %attention_value_bias_2d = stablehlo.broadcast_in_dim %value_bias, dims = [1] :
+        (tensor<256xbf16>) -> tensor<32x256xbf16>
+    %attention_query_biased = stablehlo.add %attention_query_2d, %attention_query_bias_2d :
+        tensor<32x1536xbf16>
+    %attention_key_biased = stablehlo.add %attention_key_2d, %attention_key_bias_2d :
+        tensor<32x256xbf16>
+    %attention_value_biased = stablehlo.add %attention_value_2d, %attention_value_bias_2d :
+        tensor<32x256xbf16>
+
+    %attention_query_heads = stablehlo.reshape %attention_query_biased :
         (tensor<32x1536xbf16>) -> tensor<32x12x128xbf16>
-    %attention_key_heads = stablehlo.reshape %attention_key_2d :
+    %attention_key_heads = stablehlo.reshape %attention_key_biased :
         (tensor<32x256xbf16>) -> tensor<32x2x128xbf16>
-    %attention_value_heads = stablehlo.reshape %attention_value_2d :
+    %attention_value_heads = stablehlo.reshape %attention_value_biased :
         (tensor<32x256xbf16>) -> tensor<32x2x128xbf16>
 
     %attention_theta_f32 = stablehlo.constant dense<1.000000e+06> : tensor<f32>
@@ -312,4 +328,3 @@ module {
     return %result : tensor<32x1536xbf16>
   }
 }
-

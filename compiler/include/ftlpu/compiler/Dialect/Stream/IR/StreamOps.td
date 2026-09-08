@@ -151,10 +151,11 @@ def SwigluOp : FTLPU_Stream_Op<"swiglu", [Pure]> {
 def ProjectionTaskOp : FTLPU_Stream_Op<"projection_task", [Pure]> {
   let summary = "Matrix projection task in a primitive stream graph";
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      Optional<AnyRankedTensor>:$bias,
       StrAttr:$kind, DictionaryAttr:$config,
       OptionalAttr<DictionaryAttr>:$memory_plan, ArrayAttr:$routes);
   let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$input `,` $weight attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$input `,` $weight (`,` $bias^)? attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 

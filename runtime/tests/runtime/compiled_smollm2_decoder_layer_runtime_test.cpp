@@ -370,6 +370,18 @@ try {
             + std::to_string(expectedAbi)
             + " timelines=" + std::to_string(program.timelines.size())
             + " max_cycle=" + std::to_string(program.max_cycle));
+    const bool hasAttentionBias = std::any_of(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Input
+                && binding.index == 6 && binding.role == "bias";
+        });
+    const std::size_t postAttentionNormBinding =
+        hasAttentionBias ? 9 : 6;
+    const std::size_t gateBinding = hasAttentionBias ? 10 : 7;
+    const std::size_t upBinding = hasAttentionBias ? 11 : 8;
+    const std::size_t downBinding = hasAttentionBias ? 12 : 9;
     for (const auto& stage : program.timelines) {
         if (stage.end_cycle <= stage.start_cycle
             || stage.end_cycle > program.max_cycle + 64)
@@ -480,7 +492,14 @@ try {
     runtime.upload_input(3, keyWeight);
     runtime.upload_input(4, valueWeight);
     runtime.upload_input(5, outputWeight);
-    runtime.upload_input(6, gamma1);
+    if (hasAttentionBias) {
+        runtime.upload_input(6, std::vector<std::uint8_t>(2 * kHidden, 0));
+        runtime.upload_input(
+            7, std::vector<std::uint8_t>(2 * kKvHeads * kHeadDim, 0));
+        runtime.upload_input(
+            8, std::vector<std::uint8_t>(2 * kKvHeads * kHeadDim, 0));
+    }
+    runtime.upload_input(postAttentionNormBinding, gamma1);
     const auto physicalBf16 = [&](ftlpu::Hemisphere hemisphere,
                                   std::size_t lowSlice,
                                   std::size_t highSlice,
@@ -1460,18 +1479,18 @@ try {
             + std::to_string(residualCheckpointMaxExpected));
 
     const std::size_t ffnStartCycle = std::min({
-        firstBindingReadCycle(program, 7),
-        firstBindingReadCycle(program, 8),
-        firstBindingReadCycle(program, 9),
+        firstBindingReadCycle(program, gateBinding),
+        firstBindingReadCycle(program, upBinding),
+        firstBindingReadCycle(program, downBinding),
     });
     runtime.run_cycles(
         ffnStartCycle - attentionResidualEndCycle, cmodelLogSink);
     // Paged executables reuse the resident weight bank as scratch between
     // stages. Model the C2C handoff by making the FFN page resident immediately
     // before its first binding read instead of uploading every page at cycle 0.
-    runtime.upload_input(7, gateWeight);
-    runtime.upload_input(8, upWeight);
-    runtime.upload_input(9, downWeight);
+    runtime.upload_input(gateBinding, gateWeight);
+    runtime.upload_input(upBinding, upWeight);
+    runtime.upload_input(downBinding, downWeight);
     const auto rms2Binding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
         [](const auto& binding) {

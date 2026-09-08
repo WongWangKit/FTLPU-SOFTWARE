@@ -58,6 +58,9 @@ struct AttentionMatch {
     mlir::Value key_weight;
     mlir::Value value_weight;
     mlir::Value output_weight;
+    mlir::Value query_bias;
+    mlir::Value key_bias;
+    mlir::Value value_bias;
     float query_scale;
     float key_scale;
     float value_scale;
@@ -198,6 +201,31 @@ std::optional<ScaledWeight> match_scaled_weight(mlir::Value value)
             return ScaledWeight {storage, *scale};
     }
     return std::nullopt;
+}
+
+mlir::Value match_projection_bias(mlir::Operation* dot)
+{
+    if (!dot || dot->getNumResults() != 1) return {};
+    const auto resultType = llvm::dyn_cast<mlir::RankedTensorType>(
+        dot->getResult(0).getType());
+    if (!resultType || resultType.getRank() != 2) return {};
+    for (mlir::Operation* user : dot->getResult(0).getUsers()) {
+        if (!named(user, "stablehlo.add") || user->getNumOperands() != 2
+            || user->getNumResults() != 1)
+            continue;
+        for (unsigned order = 0; order < 2; ++order) {
+            if (user->getOperand(order) != dot->getResult(0)) continue;
+            mlir::Value bias = strip_broadcast(user->getOperand(1 - order));
+            const auto biasType = llvm::dyn_cast<mlir::RankedTensorType>(
+                bias.getType());
+            if (biasType && biasType.getRank() == 1
+                && biasType.hasStaticShape()
+                && biasType.getDimSize(0) == resultType.getDimSize(1)
+                && biasType.getElementType() == resultType.getElementType())
+                return bias;
+        }
+    }
+    return {};
 }
 
 std::optional<RmsNormMatch> match_rms_norm(
@@ -374,6 +402,9 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
         key_weight->storage,
         value_weight->storage,
         output_weight->storage,
+        match_projection_bias(query_dot),
+        match_projection_bias(key_dot),
+        match_projection_bias(value_dot),
         query_weight->scale,
         key_weight->scale,
         value_weight->scale,
@@ -555,6 +586,15 @@ public:
                     rewriter.getF32FloatAttr(match->rope_theta));
                 return llvm::cast<kernel::RopeOp>(rewriter.create(state));
             };
+            const auto create_bias_add = [&](mlir::Value input,
+                                              mlir::Value bias) -> mlir::Value {
+                if (!bias) return input;
+                mlir::OperationState state(root->getLoc(),
+                    kernel::BiasAddOp::getOperationName());
+                state.addOperands({input, bias});
+                state.addTypes(input.getType());
+                return rewriter.create(state)->getResult(0);
+            };
             const auto create_gqa = [&](mlir::Value input) {
                 mlir::OperationState state(root->getLoc(),
                     kernel::GqaBroadcastOp::getOperationName());
@@ -600,11 +640,17 @@ public:
             value_2d.setRhsScaleAttr(
                 rewriter.getF32FloatAttr(match->value_scale));
 
-            auto query_heads = create_reshape(query_2d.getResult(),
+            const mlir::Value biased_query = create_bias_add(
+                query_2d.getResult(), match->query_bias);
+            const mlir::Value biased_key = create_bias_add(
+                key_2d.getResult(), match->key_bias);
+            const mlir::Value biased_value = create_bias_add(
+                value_2d.getResult(), match->value_bias);
+            auto query_heads = create_reshape(biased_query,
                 tensor_type({match->seq_len, match->query_heads, match->head_dim}));
-            auto key_heads = create_reshape(key_2d.getResult(),
+            auto key_heads = create_reshape(biased_key,
                 tensor_type({match->seq_len, match->kv_heads, match->head_dim}));
-            auto value_heads = create_reshape(value_2d.getResult(),
+            auto value_heads = create_reshape(biased_value,
                 tensor_type({match->seq_len, match->kv_heads, match->head_dim}));
             auto query_rope = create_rope(query_heads.getResult(), match->query_heads);
             auto key_rope = create_rope(key_heads.getResult(), match->kv_heads);

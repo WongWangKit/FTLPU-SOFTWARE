@@ -28,9 +28,10 @@ LogicalResult BindingOp::verify()
         return emitOpError("access must be input, output, or internal");
     if (getRole() != "activation" && getRole() != "weight"
         && getRole() != "result" && getRole() != "constant"
-        && getRole() != "workspace")
+        && getRole() != "workspace" && getRole() != "bias")
         return emitOpError(
-            "role must be activation, weight, result, constant, or workspace");
+            "role must be activation, weight, bias, result, constant, or "
+            "workspace");
     if (getElementType() != "i8" && getElementType() != "i32"
         && getElementType() != "f16" && getElementType() != "bf16"
         && getElementType() != "f32")
