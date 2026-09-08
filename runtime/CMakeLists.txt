@@ -1,7 +1,8 @@
 add_library(ftlpu_cmodel_static STATIC
     src/cmodel/cmodel_static.cpp
     "${FTLPU_CMODEL_DIR}/src/mem/sram.cpp"
-    "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp")
+    "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp"
+    "${FTLPU_CMODEL_DIR}/src/system/stream_topology_builder.cpp")
 
 file(GLOB_RECURSE FTLPU_CMODEL_PUBLIC_HEADERS CONFIGURE_DEPENDS
     "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
@@ -17,6 +18,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/cmodel/cmodel_static.cpp
     "${FTLPU_CMODEL_DIR}/src/mem/sram.cpp"
     "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp"
+    "${FTLPU_CMODEL_DIR}/src/system/stream_topology_builder.cpp"
     src/runtime/binary.cpp
     src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp

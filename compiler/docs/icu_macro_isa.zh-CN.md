@@ -13,8 +13,7 @@ ftlpu-opt ... --icu-compression none|control|macro
 
 默认使用 `macro`。`none` 会物化功能指令，但保留按时长编码的 NOP 间隔；
 `control` 启用 Repeat 和 Repeat2D；`macro` 进一步启用带类型的粗粒度 ICU
-描述符和物理 Macro 队列编码。由于 DDR-backed ICU 不保留持久指令历史，
-旧 Command IR 的 Loop window 在三种模式下都会被物化。旧选项
+描述符和物理 Macro 队列编码。旧选项
 `--icu-macro-schedule` 继续作为 `--icu-compression macro` 的兼容别名。
 
 生成的 module 带有 `ftlpu.icu_compression = "..."`。在 Command IR 兼容期内，

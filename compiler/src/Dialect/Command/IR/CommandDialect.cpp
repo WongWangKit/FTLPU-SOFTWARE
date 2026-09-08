@@ -283,42 +283,6 @@ LogicalResult MxmOp::verify()
     return success();
 }
 
-LogicalResult LoopOp::verify()
-{
-    auto targetModel = target::LPUTargetModel::from_operation(*this);
-    if (failed(targetModel)) return failure();
-    const auto& target = *targetModel;
-    const int64_t cycle = getCycleAttr().getInt();
-    const int64_t queue = getQueueAttr().getInt();
-    const int64_t windowSize = getWindowSizeAttr().getInt();
-    const int64_t count = getCountAttr().getInt();
-    const int64_t interval = getIntervalAttr().getInt();
-    const int64_t addressStride = getAddressStrideAttr().getInt();
-    if (cycle < 0 || queue < 0
-        || windowSize <= 0 || windowSize > 63
-        || count <= 0 || count > 255
-        || interval < windowSize || interval > 255
-        || addressStride < -128 || addressStride > 127)
-        return emitOpError("contains an invalid ICU Loop field");
-    const auto kind = getQueueKind();
-    const bool validQueue =
-        (kind == "mem"
-            && queue < target.memory().hemispheres
-                    * target.memory().slices_per_hemisphere)
-        || ((kind == "mxm_load" || kind == "mxm_compute"
-                || kind == "mxm_dequant")
-            && target.is_valid_mxm_unit(queue))
-        || (kind == "vxm" && target.is_valid_vxm_alu(queue))
-        || ((kind == "sxm_transpose" || kind == "sxm_permute")
-            && queue < target.memory().hemispheres);
-    if (!validQueue)
-        return emitOpError("contains an invalid ICU Loop queue");
-    if (kind != "mem" && addressStride != 0)
-        return emitOpError(
-            "only a MEM ICU Loop may use address_stride");
-    return success();
-}
-
 LogicalResult MxmDequantOp::verify()
 {
     auto targetModel = target::LPUTargetModel::from_operation(*this);

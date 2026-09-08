@@ -2,9 +2,10 @@
 
 ## Scope
 
-The v1 implementation moves deterministic command expansion from the host
-runtime into each functional-unit ICU. It does not change Schedule IR cycles or
-native functional-unit instructions.
+The v1 implementation moves deterministic MEM/MXM command expansion from the
+host runtime into each functional-unit ICU. It does not change Schedule IR
+cycles or native MEM/MXM instructions. VXM and SXM keep the legacy queue format
+for now.
 
 Select ICU compression from the command line:
 
@@ -14,16 +15,13 @@ ftlpu-opt ... --icu-compression none|control|macro
 
 `macro` is the default. `none` materializes functional instructions while
 retaining duration-encoded NOP gaps, `control` enables Repeat and Repeat2D,
-and `macro` additionally enables typed coarse ICU descriptors and physical
-Macro queue encoding. Legacy Command IR Loop windows are materialized in all
-three modes because the DDR-backed ICU does not retain persistent instruction
-history. The old `--icu-macro-schedule` option remains an alias for
+and `macro` additionally enables Macro scheduling and physical Macro queue
+encoding. The old `--icu-macro-schedule` option remains an alias for
 `--icu-compression macro`.
 
 The generated module carries `ftlpu.icu_compression = "..."`. It also carries
 the legacy `ftlpu.icu_macro_schedule` boolean during the command-IR
-compatibility window. Binary lowering emits the current binary envelope with
-typed extended ICU descriptors when Macro compression is selected.
+compatibility window.
 
 ## Descriptor
 

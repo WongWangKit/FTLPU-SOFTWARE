@@ -35,15 +35,6 @@ def WeightPageOp : FTLPU_Command_Op<"weight_page"> {
   let hasVerifier = 1;
 }
 
-def LoopOp : FTLPU_Command_Op<"loop"> {
-  let summary = "ICU control command replaying a prior instruction window";
-  let arguments = (ins I64Attr:$cycle, StrAttr:$queue_kind,
-      I64Attr:$queue, I64Attr:$window_size, I64Attr:$count,
-      I64Attr:$interval, I64Attr:$address_stride);
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
 def MemOp : FTLPU_Command_Op<"mem", [MemoryEffects<[MemWrite]>]> {
   let summary = "Compressed command for one ICU MEM queue";
   let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,

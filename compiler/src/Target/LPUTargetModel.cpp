@@ -106,11 +106,11 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     const auto* icuMemory = root->getObject("icu_memory");
     LPUTargetModel model;
 
-    // Schema v1 is the shared physical-target format consumed by both the
+    // Schema v2 is the shared physical-target format consumed by both the
     // CModel CMake build and FTLPU-SOFTWARE. Legacy compiler exploration
     // files keep using the memory/streams/throughput overlay below.
     if (const auto schema = root->getInteger("schema_version")) {
-        if (*schema != 1) {
+        if (*schema != 2) {
             error = "unsupported hardware configuration schema_version";
             return mlir::failure();
         }
@@ -124,6 +124,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
         const auto* topology = require_object("topology");
         const auto* mem = require_object("mem");
         const auto* sr = require_object("sr");
+        require_object("stream_topology");
         const auto* mxm = require_object("mxm");
         const auto* vxm = require_object("vxm");
         if (!error.empty()) return mlir::failure();

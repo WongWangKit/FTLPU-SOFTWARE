@@ -47,29 +47,6 @@ module attributes {ftlpu.icu_compression = "control"} {
       wave_accumulator_address_stride = 4 : i64
     }
     ftlpu.command.mem {
-      cycle = 0 : i64, queue = 2 : i64, opcode = "read",
-      address = 100 : i64, packed_stream = 0 : i64,
-      repeat_count = 1 : i64, repeat_interval = 1 : i64,
-      address_stride = 0 : i64
-    }
-    ftlpu.command.mem {
-      cycle = 1 : i64, queue = 2 : i64, opcode = "read",
-      address = 101 : i64, packed_stream = 1 : i64,
-      repeat_count = 1 : i64, repeat_interval = 1 : i64,
-      address_stride = 0 : i64
-    }
-    ftlpu.command.mem {
-      cycle = 2 : i64, queue = 2 : i64, opcode = "read",
-      address = 102 : i64, packed_stream = 2 : i64,
-      repeat_count = 1 : i64, repeat_interval = 1 : i64,
-      address_stride = 0 : i64
-    }
-    ftlpu.command.loop {
-      cycle = 3 : i64, queue_kind = "mem", queue = 2 : i64,
-      window_size = 3 : i64, count = 2 : i64,
-      interval = 5 : i64, address_stride = 16 : i64
-    }
-    ftlpu.command.mem {
       cycle = 0 : i64, queue = 4 : i64, opcode = "read",
       address = 200 : i64, packed_stream = 3 : i64,
       repeat_count = 4 : i64, repeat_interval = 1 : i64,
@@ -93,8 +70,7 @@ module attributes {ftlpu.icu_compression = "control"} {
       repeat_count = 1 : i64, repeat_interval = 1 : i64,
       address_stride = 0 : i64
     }
-    // A repeated candidate is not a legal round of a single-issue Loop
-    // window. Folding it would silently drop address 402.
+    // Preserve this affine sequence as one native instruction plus Repeat.
     ftlpu.command.mem {
       cycle = 0 : i64, queue = 8 : i64, opcode = "read",
       address = 400 : i64, packed_stream = 6 : i64,
