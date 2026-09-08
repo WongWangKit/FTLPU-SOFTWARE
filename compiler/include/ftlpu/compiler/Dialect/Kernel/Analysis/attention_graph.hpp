@@ -13,6 +13,9 @@ struct AttentionGraph {
     MatmulOp query;
     MatmulOp key;
     MatmulOp value;
+    BiasAddOp query_bias;
+    BiasAddOp key_bias;
+    BiasAddOp value_bias;
     ReshapeOp context_reshape;
     ReshapeOp query_reshape;
     ReshapeOp key_reshape;
@@ -28,7 +31,7 @@ struct AttentionGraph {
     BatchMatmulOp qk;
     SoftmaxOp softmax;
     BatchMatmulOp pv;
-    llvm::SmallVector<mlir::Operation*, 20> operations;
+    llvm::SmallVector<mlir::Operation*, 24> operations;
 };
 
 std::optional<AttentionGraph> match_attention_graph(MatmulOp output);

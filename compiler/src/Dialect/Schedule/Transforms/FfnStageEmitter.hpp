@@ -34,6 +34,7 @@ struct FfnEmissionContext {
     stream::RouteOp gate_raw;
     stream::RouteOp up_raw;
     stream::RouteOp down_raw;
+    mlir::DictionaryAttr down_weight_placement;
 
     llvm::SmallVector<int64_t> weight_slices;
     llvm::SmallVector<int64_t> up_weight_slices;

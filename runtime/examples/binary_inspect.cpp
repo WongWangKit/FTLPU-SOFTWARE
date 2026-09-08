@@ -476,6 +476,38 @@ try {
                   << " bank=" << use.bank
                   << " ready_cycle=" << use.ready_cycle
                   << " release_cycle=" << use.release_cycle << '\n';
+    std::cout << "binary stream_release_cycles="
+              << program.stream_release_cycles.size() << '\n';
+    const auto reportStreamReleases = [&](std::string_view direction,
+                                          std::size_t offset,
+                                          std::size_t count) {
+        for (std::size_t begin = 0; begin < count;) {
+            std::size_t end = begin + 1;
+            while (end < count
+                && program.stream_release_cycles[offset + end]
+                    == program.stream_release_cycles[offset + begin])
+                ++end;
+            std::cout << "binary stream_release direction=" << direction
+                      << " streams=" << begin;
+            if (end != begin + 1) std::cout << ".." << end - 1;
+            std::cout << " release_cycle="
+                      << program.stream_release_cycles[offset + begin]
+                      << '\n';
+            begin = end;
+        }
+    };
+    const std::size_t directionalStreams =
+        program.hardware.streams_per_direction;
+    if (program.stream_release_cycles.size()
+            == program.hardware.encoded_streams
+        && program.hardware.encoded_streams == 2 * directionalStreams) {
+        reportStreamReleases("east", 0, directionalStreams);
+        reportStreamReleases(
+            "west", directionalStreams, directionalStreams);
+    } else {
+        reportStreamReleases(
+            "merged", 0, program.stream_release_cycles.size());
+    }
     const std::size_t reported = reportAllQueues
         ? queues.size() : std::min<std::size_t>(queues.size(), 20);
     for (std::size_t i = 0; i < reported; ++i) {

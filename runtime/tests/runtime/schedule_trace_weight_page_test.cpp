@@ -8,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -34,6 +35,11 @@ BinaryBinding weight(
     binding.instruction_count = 8;
     binding.slices = {slice};
     binding.page_storage_slices = binding.slices;
+    binding.page_banks = {0, 1};
+    binding.page_slice_group_bases = {0, 0};
+    binding.page_slice_group_counts = {1, 1};
+    binding.page_base_rows = {0, 0};
+    binding.page_row_counts = {8, 8};
     return binding;
 }
 
@@ -262,6 +268,19 @@ try {
         || decoded.hardware.icu_mxm_instruction_bits
             != program.hardware.icu_mxm_instruction_bits)
         throw std::runtime_error("i-MEM geometry did not round-trip");
+    if (decoded.bindings.empty()
+        || decoded.bindings.front().page_banks
+            != std::vector<std::uint16_t>({0, 1})
+        || decoded.bindings.front().page_slice_group_bases
+            != std::vector<std::uint16_t>({0, 0})
+        || decoded.bindings.front().page_slice_group_counts
+            != std::vector<std::uint16_t>({1, 1})
+        || decoded.bindings.front().page_base_rows
+            != std::vector<std::uint32_t>({0, 0})
+        || decoded.bindings.front().page_row_counts
+            != std::vector<std::uint32_t>({8, 8}))
+        throw std::runtime_error(
+            "exact weight-page placement did not round-trip");
     const auto imem = analyze_cmodel_abstract_imem(decoded);
     if (imem.fits() || imem.overflow_queues != 1
         || imem.used_slots != 10 || imem.encoded_work_entries != 10

@@ -43,6 +43,22 @@ LogicalResult MatmulOp::verify()
     return success();
 }
 
+LogicalResult BiasAddOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto bias = getBias().getType();
+    const auto result = getResult().getType();
+    if (!input.hasStaticShape() || !bias.hasStaticShape()
+        || input.getRank() != 2 || bias.getRank() != 1 || result != input)
+        return emitOpError(
+            "requires a static rank-2 input/result and rank-1 bias");
+    if (bias.getDimSize(0) != input.getDimSize(1)
+        || bias.getElementType() != input.getElementType())
+        return emitOpError(
+            "requires a bias matching the final input dimension");
+    return success();
+}
+
 LogicalResult ReshapeOp::verify()
 {
     const auto input = getInput().getType();

@@ -62,8 +62,9 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
     const auto appendPage = [&](FfnWeightTilePage page,
                                 int64_t bindingPageIndex) {
         page.index = static_cast<int64_t>(result.pages.size());
-        page.bank =
-            (initialBank + bindingPageIndex) % memory.banks_per_slice;
+        if (page.bank < 0)
+            page.bank =
+                (initialBank + bindingPageIndex) % memory.banks_per_slice;
         page.transfer_cycles = target.external_read_transfer_cycles(
             page.transfer_vectors * memory.bytes_per_word);
         result.pages.push_back(std::move(page));
@@ -103,18 +104,52 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
     result.down_reduction_blocks_per_page = downReductionsPerPage;
     result.down_reduction_blocks_per_slice_group =
         downReductionsPerGroup;
+
+    // A Down output wave is independently consumed, so keep it as a transfer
+    // chunk while packing several chunks into disjoint rows of one physical
+    // slice group. This decouples transfer readiness from SRAM residency: for
+    // the 8192-row Qwen target, three waves fit per group and all twelve waves
+    // fit in one bank without overwriting each other.
+    const int64_t downRowsPerWave = downReductionBlocks
+        * downOutputBlocksPerHemisphere * rowsPerWeightTile;
+    const bool compactDownWaves = downRowsPerWave > 0
+        && downRowsPerWave <= memory.sram_depth_rows;
+    const int64_t downWavesPerGroup = compactDownWaves
+        ? memory.sram_depth_rows / downRowsPerWave : 0;
+    const int64_t downWavesPerBank =
+        downWavesPerGroup * sliceGroupCount;
     int64_t downPageIndex = 0;
     for (int64_t wave = 0; wave < downWaves; ++wave) {
         for (int64_t reduction = 0; reduction < downReductionBlocks;
              reduction += downReductionsPerPage) {
             const int64_t count = std::min(
                 downReductionsPerPage, downReductionBlocks - reduction);
-            const int64_t rows = std::min(count, downReductionsPerGroup)
-                * downOutputBlocksPerHemisphere * rowsPerWeightTile;
-            FfnWeightTilePage page {-1, -1, 0, rows,
+            const int64_t usedGroups = divideCeil(
+                count, downReductionsPerGroup);
+            int64_t bank = -1;
+            int64_t group = 0;
+            int64_t baseRow = 0;
+            if (compactDownWaves && reduction == 0
+                && count == downReductionBlocks) {
+                const int64_t residentSlot = wave
+                    % (downWavesPerBank * memory.banks_per_slice);
+                const int64_t bankSlot = residentSlot / downWavesPerBank;
+                const int64_t slotInBank = residentSlot % downWavesPerBank;
+                bank = (initialBank + bankSlot) % memory.banks_per_slice;
+                group = slotInBank / downWavesPerGroup;
+                baseRow = (slotInBank % downWavesPerGroup)
+                    * downRowsPerWave;
+            }
+            const int64_t rows = compactDownWaves
+                    && reduction == 0 && count == downReductionBlocks
+                ? downRowsPerWave
+                : std::min(count, downReductionsPerGroup)
+                    * downOutputBlocksPerHemisphere * rowsPerWeightTile;
+            FfnWeightTilePage page {-1, bank, baseRow, rows,
                 memory.hemispheres * weightSlices * rows, 0, {}};
-            page.spans.push_back({FfnWeightTileKind::Down, 0, 0,
-                sliceGroupCount, downReductionsPerGroup, wave, 1,
+            page.spans.push_back({FfnWeightTileKind::Down, baseRow, group,
+                compactDownWaves ? 1 : usedGroups,
+                downReductionsPerGroup, wave, 1,
                 reduction, count, downOutputBlocksPerHemisphere, rows});
             appendPage(std::move(page), downPageIndex++);
         }

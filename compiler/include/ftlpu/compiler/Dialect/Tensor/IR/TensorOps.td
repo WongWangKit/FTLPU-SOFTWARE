@@ -114,9 +114,10 @@ def SwigluOp : FTLPU_Tensor_Op<"swiglu", [Pure]> {
 def ProjectionTaskOp : FTLPU_Tensor_Op<"projection_task", [Pure]> {
   let summary = "Matrix projection with an assigned physical buffer sub-plan";
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      Optional<AnyRankedTensor>:$bias,
       StrAttr:$kind, DictionaryAttr:$config, DictionaryAttr:$memory_plan);
   let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$input `,` $weight attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$input `,` $weight (`,` $bias^)? attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 

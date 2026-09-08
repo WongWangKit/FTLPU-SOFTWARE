@@ -4,6 +4,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_softmax_planner.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
@@ -63,6 +64,62 @@ void createTimeline(mlir::IRRewriter& rewriter, mlir::Location location,
     rewriter.create(state);
 }
 
+int64_t annotateStateTransfers(mlir::func::FuncOp function,
+    BindingOp binding, mlir::IRRewriter& rewriter)
+{
+    const auto placement = binding.getPlacement();
+    const int64_t base =
+        placement.getAs<mlir::IntegerAttr>("base_row").getInt();
+    const int64_t count =
+        placement.getAs<mlir::IntegerAttr>("instruction_count").getInt();
+    const int64_t stride =
+        placement.getAs<mlir::IntegerAttr>("address_stride").getInt();
+    const int64_t final = base + (count - 1) * stride;
+    const int64_t begin = std::min(base, final);
+    const int64_t end = std::max(base, final) + 1;
+    const int64_t bank = placement.getAs<mlir::IntegerAttr>("bank")
+        ? placement.getAs<mlir::IntegerAttr>("bank").getInt() : 0;
+    const llvm::StringRef hemisphere =
+        placement.getAs<mlir::StringAttr>("hemisphere").getValue();
+    llvm::SmallDenseSet<int64_t, 32> slices;
+    for (mlir::Attribute value : placement.getAs<mlir::ArrayAttr>("slices"))
+        slices.insert(llvm::cast<mlir::IntegerAttr>(value).getInt());
+
+    int64_t annotated = 0;
+    function.walk([&](MemTransferOp transfer) {
+        if (transfer.getAddressBinding()
+            || transfer.getBank().value_or(0) != bank
+            || !slices.contains(transfer.getSlice()))
+            return;
+        if ((hemisphere == "east" && transfer.getHemisphere() != 0)
+            || (hemisphere == "west" && transfer.getHemisphere() != 1))
+            return;
+        const int64_t waveCount = transfer.getWaveCount().value_or(1);
+        const int64_t waveStride =
+            transfer.getWaveAddressStride().value_or(0);
+        const int64_t corners[] = {
+            transfer.getAddress(),
+            transfer.getAddress()
+                + (transfer.getRepeatCount() - 1)
+                    * transfer.getAddressStride(),
+            transfer.getAddress() + (waveCount - 1) * waveStride,
+            transfer.getAddress() + (waveCount - 1) * waveStride
+                + (transfer.getRepeatCount() - 1)
+                    * transfer.getAddressStride(),
+        };
+        if (llvm::any_of(corners, [&](int64_t address) {
+                return address < begin || address >= end;
+            }))
+            return;
+        transfer->setAttr("address_binding",
+            rewriter.getI64IntegerAttr(binding.getIndex()));
+        transfer->setAttr("address_binding_access",
+            rewriter.getStringAttr("internal"));
+        ++annotated;
+    });
+    return annotated;
+}
+
 } // namespace
 
 AttentionScheduleEmitter::AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
@@ -105,6 +162,26 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             index == 0 ? "activation" : "weight",
             llvm::cast<mlir::RankedTensorType>(argument.getType()),
             memoryPlan.getAs<mlir::DictionaryAttr>(placements[index]));
+    }
+    const mlir::Value biases[] = {
+        op_.getQueryBias(), op_.getKeyBias(), op_.getValueBias()};
+    const char* biasPlacements[] = {
+        "query_bias", "key_bias", "value_bias"};
+    for (std::size_t index = 0; index < std::size(biases); ++index) {
+        if (!biases[index]) continue;
+        const auto argument =
+            llvm::dyn_cast<mlir::BlockArgument>(biases[index]);
+        const auto placement = memoryPlan.getAs<mlir::DictionaryAttr>(
+            biasPlacements[index]);
+        if (!argument || !placement) {
+            op_.emitError(
+                "attention bias is missing a runtime argument or placement");
+            return mlir::failure();
+        }
+        createBinding(rewriter_, op_.getLoc(), biases[index],
+            argument.getArgNumber(), "input", "bias",
+            llvm::cast<mlir::RankedTensorType>(argument.getType()),
+            placement, biasPlacements[index]);
     }
     if (op_.getCausal()) {
         const auto maskType = mlir::RankedTensorType::get(
@@ -174,15 +251,36 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         "internal", "workspace", probabilityType,
         memoryPlan.getAs<mlir::DictionaryAttr>("probability_diagonal"),
         "attention.probability_diagonal");
-    const auto valueType = mlir::RankedTensorType::get(
-        {op_.getSeqLen(), op_.getKvHeads() * op_.getHeadDim()},
-        llvm::cast<mlir::RankedTensorType>(
-            op_.getInput().getType()).getElementType());
-    auto valueBinding = createBinding(
-        rewriter_, op_.getLoc(), {}, workspaceBindingBase + 2,
-        "internal", "workspace", valueType,
-        memoryPlan.getAs<mlir::DictionaryAttr>("value"),
-        "attention.value");
+    const auto elementType = llvm::cast<mlir::RankedTensorType>(
+        op_.getInput().getType()).getElementType();
+    const auto kvCapacity =
+        op_.config().getAs<mlir::IntegerAttr>("kv_cache_capacity");
+    BindingOp keyBinding;
+    BindingOp valueBinding;
+    if (kvCapacity) {
+        const auto stateType = mlir::RankedTensorType::get(
+            {kvCapacity.getInt(), op_.getKvHeads(), op_.getHeadDim()},
+            elementType);
+        key_state_binding_index_ = kAttentionKeyStateBindingIndex;
+        value_state_binding_index_ = kAttentionValueStateBindingIndex;
+        keyBinding = createBinding(rewriter_, op_.getLoc(), {},
+            key_state_binding_index_, "internal", "state.kv.key",
+            stateType, memoryPlan.getAs<mlir::DictionaryAttr>("key"),
+            "attention.key_cache");
+        valueBinding = createBinding(rewriter_, op_.getLoc(), {},
+            value_state_binding_index_, "internal", "state.kv.value",
+            stateType, memoryPlan.getAs<mlir::DictionaryAttr>("value"),
+            "attention.value_cache");
+    } else {
+        const auto valueType = mlir::RankedTensorType::get(
+            {op_.getSeqLen(), op_.getKvHeads() * op_.getHeadDim()},
+            elementType);
+        valueBinding = createBinding(
+            rewriter_, op_.getLoc(), {}, workspaceBindingBase + 2,
+            "internal", "workspace", valueType,
+            memoryPlan.getAs<mlir::DictionaryAttr>("value"),
+            "attention.value");
+    }
     const auto contextType = mlir::RankedTensorType::get(
         {op_.getSeqLen(), op_.getHidden()},
         llvm::cast<mlir::RankedTensorType>(
@@ -230,11 +328,23 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         rewriter_.getI64IntegerAttr(probabilityTransposeEnd));
     valueBinding->setAttr("ready_cycle",
         rewriter_.getI64IntegerAttr(projectionEnd));
+    if (keyBinding)
+        keyBinding->setAttr("ready_cycle",
+            rewriter_.getI64IntegerAttr(projectionEnd));
     const int64_t pvEnd = emitPv(probabilityTransposeEnd);
     contextBinding->setAttr("ready_cycle",
         rewriter_.getI64IntegerAttr(pvEnd));
     const int64_t outputProjectionEnd =
         emitOutputProjection(pvEnd, projectionEnd);
+    if (keyBinding) {
+        const auto function = op_.output->getParentOfType<mlir::func::FuncOp>();
+        if (annotateStateTransfers(function, keyBinding, rewriter_) == 0
+            || annotateStateTransfers(function, valueBinding, rewriter_) == 0) {
+            op_.emitError(
+                "persistent KV binding has no relocatable MEM transfers");
+            return mlir::failure();
+        }
+    }
 
     createTimeline(rewriter_, op_.getLoc(), "qkv", 0, qkvCycles);
     createTimeline(rewriter_, op_.getLoc(), "rope", qkvCycles, qkStart);

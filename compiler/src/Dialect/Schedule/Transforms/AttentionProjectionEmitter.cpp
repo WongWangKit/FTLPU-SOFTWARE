@@ -77,6 +77,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                      op_.getKvHeads()};
   const mlir::Value projectionValues[] = {
       op_.getQueryWeight(), op_.getKeyWeight(), op_.getValueWeight()};
+  const mlir::Value projectionBiases[] = {
+      op_.getQueryBias(), op_.getKeyBias(), op_.getValueBias()};
   const auto weightScale = [&](llvm::StringRef name) {
     const auto value = op_.query.getConfig().getAs<mlir::FloatAttr>(name);
     return value ? static_cast<float>(value.getValueAsDouble()) : 1.0f;
@@ -167,13 +169,14 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       };
   const int64_t alternateProductBank =
       (productBank + 1) % target_.memory().banks_per_slice;
+  const bool hasQkBias = projectionBiases[0] || projectionBiases[1];
   const bool directRopeCapable =
       target_.uses_dedicated_slice_roles() &&
       target_.memory().banks_per_slice > 1 &&
       target_.activation_storage_slices().size() >= 20 &&
       target_.throughput().vxm_cross_hemisphere_streams_enabled != 0 &&
       target_.throughput().vxm_fma_enabled != 0 &&
-      target_.throughput().vxm_alus >= 4 &&
+      target_.throughput().vxm_alus >= 4 && !hasQkBias &&
       target_.memory().hemispheres == 2 && projectionHeadBlocks == 4;
   const bool projectionRopeOverlap =
       !directRopeCapable && inputDistributed16 &&
@@ -287,6 +290,42 @@ int64_t AttentionScheduleEmitter::emitProjections() {
          ++projectionPosition) {
       const int64_t projection = projectionOrder[projectionPosition];
       const auto kind = projectionKind(projection);
+      const mlir::Value projectionBias = projectionBiases[projection];
+      const char *biasPlacementNames[] = {
+          "query_bias", "key_bias", "value_bias"};
+      const auto biasPlacement = projectionBias
+          ? op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(
+                biasPlacementNames[projection])
+          : mlir::DictionaryAttr {};
+      llvm::SmallVector<int64_t, 4> biasSlices;
+      int64_t biasBase = 0;
+      int64_t biasBank = 0;
+      if (projectionBias) {
+        const auto biasKind = biasPlacement
+            ? biasPlacement.getAs<mlir::StringAttr>("kind")
+            : mlir::StringAttr {};
+        if (!biasKind
+            || biasKind.getValue() != "fp16_projection_bias_x4") {
+          op_.emitError(
+              "attention projection bias has no x4 physical placement");
+          return -1;
+        }
+        for (mlir::Attribute slice :
+             biasPlacement.getAs<mlir::ArrayAttr>("slices"))
+          biasSlices.push_back(
+              llvm::cast<mlir::IntegerAttr>(slice).getInt());
+        if (biasSlices.size() != 4) {
+          op_.emitError(
+              "attention projection bias requires four MEM slices");
+          return -1;
+        }
+        biasBase =
+            biasPlacement.getAs<mlir::IntegerAttr>("base_row").getInt();
+        biasBank = biasPlacement.getAs<mlir::IntegerAttr>("bank").getInt();
+      }
+      const auto biasAddress = [&](int64_t outputBlock) {
+        return biasBase + (outputBlock / 4) * 2 + outputBlock % 2;
+      };
       const char *weightPlacementNames[] = {
           "query_weight", "key_weight", "value_weight"};
       const auto weightPlacement = op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(
@@ -428,9 +467,11 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 const int64_t accumulatorAddress =
                     tokenBlock * tile + half * accumulatorHalfStride;
                 const int64_t resultStreamBase =
-                    directRopeCapable && finalReduction &&
-                            kind != AttentionProjectionKind::Value &&
-                            hemisphere == 1
+                    finalReduction && hemisphere == 1 &&
+                            ((directRopeCapable &&
+                              kind != AttentionProjectionKind::Value) ||
+                             (kind == AttentionProjectionKind::Value &&
+                              projectionBias))
                         ? target_.streams().streams_per_direction / 2
                         : 0;
                 emitMxm(rewriter_, op_.getLoc(), computeCycle, hemisphere,
@@ -601,6 +642,75 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     const int64_t packedStream = (token % 8) * 2;
                     const int64_t row = (token % tile) / 8;
                     const auto slices = layout.valuePackSlices(headBlock);
+                    if (projectionBias) {
+                      const int64_t vxmInputCycle =
+                          computeCycle +
+                          target_.throughput().accumulator_to_vxm_latency +
+                          offset;
+                      if (offset == 0 && hemisphere == 0) {
+                        for (int64_t source = 0;
+                             source < target_.memory().hemispheres;
+                             ++source) {
+                          const int64_t sourceBlock =
+                              outputGroup * 4 + source * 2 + half;
+                          if (sourceBlock >= projectionOutputBlocks)
+                            continue;
+                          const char *sourceName =
+                              source == 0 ? "east" : "west";
+                          const int64_t alu = 4 + source * 2;
+                          emitVxmConfigured(
+                              rewriter_, op_.getLoc(), projectionBias,
+                              vxmInputCycle - 1, alu, "add", streamKind, 32,
+                              0.0f, streamKind, 40, 0.0f, "fp32", -1,
+                              sourceName, sourceName, -1, 2, tile, 1,
+                              sourceName, sourceName);
+                          emitVxmConfigured(
+                              rewriter_, op_.getLoc(), projectionBias,
+                              vxmInputCycle - 1, alu + 1, "pass", "previous",
+                              0, 0.0f, "immediate", 0, 0.0f, dataFormat,
+                              alu, sourceName, sourceName, -1, 2, tile, 1);
+                        }
+                      }
+                      const int64_t pair = (outputBlock / 2) % 2;
+                      for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t slice = biasSlices[2 * pair + byte];
+                        emitMem(
+                            rewriter_, op_.getLoc(),
+                            vxmInputCycle - vxmInputReadLatency(slice),
+                            hemisphere *
+                                    target_.memory().slices_per_hemisphere +
+                                slice,
+                            "read", biasAddress(outputBlock),
+                            40 + hemisphere * 16 + byte, 1, 1, 0, "sram",
+                            functionArgumentIndex(projectionBias), biasBank);
+                      }
+                      const int64_t outputCycle = vxmInputCycle + 1;
+                      const int64_t outputStream =
+                          (1 - hemisphere) * 8 + 4 + hemisphere * 2;
+                      for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t slice = slices[packedStream + byte];
+                        const int64_t latency =
+                            target_
+                                .transport_latency(
+                                    target::StreamEndpoint::VxmResult,
+                                    target::StreamEndpoint::Mem,
+                                    target::StreamDirection::East, slice)
+                                .value_or(readLatency(slice));
+                        const int64_t cycle = outputCycle + latency;
+                        emitMem(rewriter_, op_.getLoc(), cycle,
+                                hemisphere *
+                                        target_.memory()
+                                            .slices_per_hemisphere +
+                                    slice,
+                                "write",
+                                layout.valuePackAddress(
+                                    head, headBlock, tokenBlock, row),
+                                outputStream + byte, 1, 1, 0, "sram", -1,
+                                placementBank("value"));
+                        rawWriteEnd = std::max(rawWriteEnd, cycle + 1);
+                      }
+                      continue;
+                    }
                     for (int64_t byte = 0; byte < 2; ++byte) {
                       const int64_t slice = slices[packedStream + byte];
                       const int64_t latency = *target_.transport_latency(
@@ -747,27 +857,43 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                     replicateEnd + maxStagingReadLatency + 1);
         }
 
+        const int64_t productPipelineLatency = projectionBias ? 3 : 2;
         const auto emitRopeProducts = [&](int64_t cycle,
                                           int64_t inputHemisphere,
-                                          int64_t outputHemisphere) {
+                                          int64_t outputHemisphere,
+                                          bool swapBiasHalves) {
           const char *input = inputHemisphere == 0 ? "east" : "west";
           const char *output = outputHemisphere == 0 ? "east" : "west";
           emitVxmConfigured(rewriter_, op_.getLoc(),
                             projectionValues[projection], cycle, 0, "multiply",
                             streamKind, 32, 0.0f, streamKind, 34, 0.0f, "fp32",
                             -1, input, output, -1, 2, op_.getSeqLen(), 1);
-          emitVxmConfigured(
-              rewriter_, op_.getLoc(), projectionValues[projection], cycle, 1,
-              "pass", "previous", 0, 0.0f, "immediate", 0, 0.0f, dataFormat, 0,
-              input, output, -1, 2, op_.getSeqLen(), 1);
+          if (projectionBias)
+            emitVxmConfigured(
+                rewriter_, op_.getLoc(), projectionBias, cycle, 1, "fma",
+                streamKind, swapBiasHalves ? 42 : 40, 0.0f, streamKind,
+                34, 0.0f, dataFormat, 0, input, output, -1, 2,
+                op_.getSeqLen(), 1, input, input);
+          else
+            emitVxmConfigured(
+                rewriter_, op_.getLoc(), projectionValues[projection], cycle,
+                1, "pass", "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                dataFormat, 0, input, output, -1, 2, op_.getSeqLen(), 1);
           emitVxmConfigured(rewriter_, op_.getLoc(),
                             projectionValues[projection], cycle, 2, "multiply",
                             streamKind, 36, 0.0f, streamKind, 38, 0.0f, "fp32",
                             -1, input, output, -1, 2, op_.getSeqLen(), 1);
-          emitVxmConfigured(
-              rewriter_, op_.getLoc(), projectionValues[projection], cycle, 3,
-              "pass", "previous", 0, 0.0f, "immediate", 0, 0.0f, dataFormat, 2,
-              input, output, -1, 2, op_.getSeqLen(), 1);
+          if (projectionBias)
+            emitVxmConfigured(
+                rewriter_, op_.getLoc(), projectionBias, cycle, 3, "fma",
+                streamKind, swapBiasHalves ? 40 : 42, 0.0f, streamKind,
+                38, 0.0f, dataFormat, 2, input, output, -1, 2,
+                op_.getSeqLen(), 1, input, input);
+          else
+            emitVxmConfigured(
+                rewriter_, op_.getLoc(), projectionValues[projection], cycle,
+                3, "pass", "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                dataFormat, 2, input, output, -1, 2, op_.getSeqLen(), 1);
         };
         const auto emitRopeCombine = [&](int64_t cycle, int64_t inputHemisphere,
                                          int64_t outputHemisphere) {
@@ -874,12 +1000,14 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   };
                   const int64_t productAInputOffset = 1;
                   const int64_t productBConfigOffset =
-                      productAInputOffset + op_.getSeqLen() + 1 +
+                      productAInputOffset + op_.getSeqLen() +
+                      (productPipelineLatency - 1) +
                       maxProductWriteLatency + maxStagingReadLatency + 1;
                   const int64_t productBInputOffset =
                       productBConfigOffset + 1;
                   const int64_t combineConfigOffset =
-                      productBInputOffset + op_.getSeqLen() + 1 +
+                      productBInputOffset + op_.getSeqLen() +
+                      (productPipelineLatency - 1) +
                       maxProductWriteLatency + maxProductReadLatency + 1;
                   const int64_t combineInputOffset = combineConfigOffset + 1;
 
@@ -911,13 +1039,34 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           for (int64_t hemisphere = 0;
                                hemisphere < memory.hemispheres; ++hemisphere) {
                             for (int64_t byte = 0; byte < 4; ++byte) {
-                              const int64_t slice = layout.ropeSlices()[byte];
+                              const int64_t slice = mirroredRopeTable
+                                  ? layout.ropeMirrorSlices()[byte]
+                                  : layout.ropeSlices()[byte];
                               appendMemResources(
                                   windows,
                                   inputCycle - vxmInputReadLatency(slice),
                                   hemisphere, slice,
                                   mirroredRopeTable ? ropeMirrorBank : ropeBank,
                                   false);
+                            }
+                          }
+                          if (projectionBias) {
+                            for (int64_t half = 0; half < 2; ++half) {
+                              const int64_t outputBlock =
+                                  head * projectionHeadBlocks + blocks[half];
+                              const int64_t pair = (outputBlock / 2) % 2;
+                              for (int64_t hemisphere = 0;
+                                   hemisphere < memory.hemispheres;
+                                   ++hemisphere) {
+                                for (int64_t byte = 0; byte < 2; ++byte) {
+                                  const int64_t slice =
+                                      biasSlices[2 * pair + byte];
+                                  appendMemResources(
+                                      windows,
+                                      inputCycle - vxmInputReadLatency(slice),
+                                      hemisphere, slice, biasBank, false);
+                                }
+                              }
                             }
                           }
                           for (int64_t slot = 0; slot < 2; ++slot) {
@@ -937,7 +1086,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                    destination < memory.hemispheres;
                                    ++destination)
                                 appendMemResources(
-                                    windows, inputCycle + 2 + latency,
+                                    windows,
+                                    inputCycle + productPipelineLatency +
+                                        latency,
                                     destination, slice,
                                     candidateProductBank(product), true);
                             }
@@ -1050,7 +1201,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               for (int64_t hemisphere = 0; hemisphere < memory.hemispheres;
                    ++hemisphere) {
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                  const int64_t slice = layout.ropeSlices()[byte];
+                  const int64_t slice = mirror
+                      ? layout.ropeMirrorSlices()[byte]
+                      : layout.ropeSlices()[byte];
                   const int64_t stream =
                       (byte < 2 ? 34 + byte : 36 + byte) + hemisphere * 16;
                   emitMem(rewriter_, op_.getLoc(),
@@ -1062,6 +1215,29 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               : layout.ropeAddress(token, pairBlock),
                           stream, 1, 1, 0, "sram", -1,
                           mirror ? ropeMirrorBank : ropeBank);
+                }
+              }
+            };
+            const auto emitProjectionBias = [&](int64_t inputCycle) {
+              if (!projectionBias)
+                return;
+              for (int64_t half = 0; half < 2; ++half) {
+                const int64_t outputBlock =
+                    head * projectionHeadBlocks + blocks[half];
+                const int64_t pair = (outputBlock / 2) % 2;
+                for (int64_t hemisphere = 0;
+                     hemisphere < memory.hemispheres; ++hemisphere) {
+                  for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice = biasSlices[2 * pair + byte];
+                    emitMem(
+                        rewriter_, op_.getLoc(),
+                        inputCycle - vxmInputReadLatency(slice),
+                        hemisphere * memory.slices_per_hemisphere + slice,
+                        "read", biasAddress(outputBlock),
+                        40 + hemisphere * 16 + half * 2 + byte, 1, 1, 0,
+                        "sram", functionArgumentIndex(projectionBias),
+                        biasBank);
+                  }
                 }
               }
             };
@@ -1098,29 +1274,39 @@ int64_t AttentionScheduleEmitter::emitProjections() {
 
             const int64_t productAConfig = headEnd;
             const int64_t productAInput = productAConfig + 1;
-            emitRopeProducts(productAConfig, inputHemisphere, outputHemisphere);
+            emitRopeProducts(productAConfig, inputHemisphere, outputHemisphere,
+                             false);
             for (int64_t token = 0; token < op_.getSeqLen(); ++token) {
               const int64_t inputCycle = productAInput + token;
               emitSource(token, 0, 32, inputCycle);
               emitSource(token, 1, 36, inputCycle);
               emitRopeTable(token, inputCycle, false);
-              emitProductWrites(token, 0, inputCycle + 2);
+              emitProjectionBias(inputCycle);
+              emitProductWrites(token, 0,
+                                inputCycle + productPipelineLatency);
             }
 
-            const int64_t productBConfig = productAInput + op_.getSeqLen() + 1 +
+            const int64_t productBConfig =
+                productAInput + op_.getSeqLen() +
+                (productPipelineLatency - 1) +
                                            maxProductWriteLatency +
                                            maxStagingReadLatency + 1;
             const int64_t productBInput = productBConfig + 1;
-            emitRopeProducts(productBConfig, inputHemisphere, outputHemisphere);
+            emitRopeProducts(productBConfig, inputHemisphere, outputHemisphere,
+                             true);
             for (int64_t token = 0; token < op_.getSeqLen(); ++token) {
               const int64_t inputCycle = productBInput + token;
               emitSource(token, 1, 32, inputCycle);
               emitSource(token, 0, 36, inputCycle);
               emitRopeTable(token, inputCycle, true);
-              emitProductWrites(token, 2, inputCycle + 2);
+              emitProjectionBias(inputCycle);
+              emitProductWrites(token, 2,
+                                inputCycle + productPipelineLatency);
             }
 
-            const int64_t combineConfig = productBInput + op_.getSeqLen() + 1 +
+            const int64_t combineConfig =
+                productBInput + op_.getSeqLen() +
+                (productPipelineLatency - 1) +
                                            maxProductWriteLatency +
                                            maxProductReadLatency + 1;
             if (firstCombineConfig < 0)

@@ -65,9 +65,13 @@ void for_each_physical_slice(const BinaryProgram &program,
   for (std::uint16_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
     if ((binding.hemisphere_mask & (1u << hemisphere)) == 0)
       continue;
-    for (std::uint16_t slice : binding.slices)
+    std::unordered_set<std::uint16_t> visited;
+    for (std::uint16_t slice : binding.slices) {
+      if (!visited.insert(slice).second)
+        continue;
       callback(
           PhysicalSlice{program.target_abi, hemisphere, slice, binding.bank});
+    }
   }
 }
 

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <optional>
 #include <vector>
 
 namespace ftlpu::software::runtime {
@@ -23,6 +24,9 @@ struct C2cWeightPage {
     std::uint32_t layer{0};
     std::uint16_t bank{0};
     std::vector<C2cWeightSegment> segments{};
+    // Ordinary westbound SR range used after the C2C receive lanes. When
+    // absent, the pager retains the target's conventional high stream range.
+    std::optional<std::uint16_t> fabric_stream_base{};
 };
 
 struct C2cWeightPageStats {
@@ -42,6 +46,9 @@ struct C2cWeightPageFence {
         completed_segments{};
     std::array<std::size_t, InstructionControlUnit::kMemQueues>
         completed_mem_writes{};
+    // MEM ICU issue precedes the final tile's SRAM write. Record when every
+    // write has issued so ready() can account for the distributed MEM pipe.
+    mutable std::optional<std::size_t> mem_writes_issued_cycle{};
 };
 
 class C2cWeightPager {
@@ -53,6 +60,8 @@ public:
     C2cWeightPageFence schedule(
         const C2cWeightPage& page, std::size_t start_cycle,
         std::size_t launch_event_tag);
+    std::size_t earliest_schedule_cycle(
+        const C2cWeightPage& page) const;
     bool started(const C2cWeightPageFence& fence) const;
     bool ready(const C2cWeightPageFence& fence) const;
     bool busy() const noexcept;

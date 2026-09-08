@@ -40,6 +40,20 @@ std::vector<std::size_t> allocate_c2c_lanes(
     return assignments;
 }
 
+std::size_t resolve_fabric_stream_base(
+    const C2cWeightPage& page, std::size_t laneCount)
+{
+    if (laneCount == 0 || laneCount > hw::kWestStreams)
+        throw std::invalid_argument(
+            "invalid C2C lane count for the ordinary SR fabric");
+    const std::size_t base = page.fabric_stream_base.value_or(
+        static_cast<std::uint16_t>(hw::kWestStreams - laneCount));
+    if (base + laneCount > hw::kWestStreams)
+        throw std::out_of_range(
+            "C2C fabric stream range is outside the ordinary west SR file");
+    return base;
+}
+
 } // namespace
 
 C2cWeightPager::C2cWeightPager(C2cDmaSystem& system)
@@ -68,8 +82,8 @@ C2cWeightPageFence C2cWeightPager::schedule(
     const auto& hardware = chip.hardware_configuration();
     if (page.bank >= hw::kMemBanksPerSlice || page.segments.empty())
         throw std::invalid_argument("invalid executable C2C weight page");
-    const std::size_t sharedStreamBase =
-        hw::kWestStreams - hardware.c2c_streams_per_direction;
+    const std::size_t sharedStreamBase = resolve_fabric_stream_base(
+        page, hardware.c2c_streams_per_direction);
     const auto laneAssignments = allocate_c2c_lanes(
         page, hardware.c2c_streams_per_direction);
 
@@ -148,6 +162,24 @@ C2cWeightPageFence C2cWeightPager::schedule(
     return fence;
 }
 
+std::size_t C2cWeightPager::earliest_schedule_cycle(
+    const C2cWeightPage& page) const
+{
+    std::size_t cycle = 0;
+    for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
+        const bool usesSide = std::any_of(
+            page.segments.begin(), page.segments.end(),
+            [&](const C2cWeightSegment& segment) {
+                return hemisphere_index(segment.hemisphere) == side;
+            });
+        if (usesSide)
+            cycle = std::max(
+                {cycle, schedule_dma_cursor_[side],
+                 schedule_rx_cursor_[side]});
+    }
+    return cycle;
+}
+
 bool C2cWeightPager::started(const C2cWeightPageFence& fence) const
 {
     auto& icu = system_.chip().icu();
@@ -169,14 +201,23 @@ bool C2cWeightPager::ready(const C2cWeightPageFence& fence) const
              stream < hw::kC2cStreamsPerDirection; ++stream)
             if (chip.c2c_endpoint(static_cast<Hemisphere>(side))
                     .rx().completed_instruction_count(stream)
-                < fence.completed_segments[side][stream])
+                < fence.completed_segments[side][stream]) {
+                fence.mem_writes_issued_cycle.reset();
                 return false;
+            }
     for (std::size_t queue = 0;
          queue < fence.completed_mem_writes.size(); ++queue)
         if (chip.icu().c2c_mem_iq(queue).issued_count()
-            < fence.completed_mem_writes[queue])
+            < fence.completed_mem_writes[queue]) {
+            fence.mem_writes_issued_cycle.reset();
             return false;
-    return true;
+        }
+
+    if (!fence.mem_writes_issued_cycle)
+        fence.mem_writes_issued_cycle = system_.cycle();
+    const std::size_t elapsed =
+        system_.cycle() - *fence.mem_writes_issued_cycle + 1;
+    return elapsed >= hw::kTileRows;
 }
 
 void C2cWeightPager::enqueue(const C2cWeightPage& page)
@@ -197,8 +238,8 @@ void C2cWeightPager::enqueue(const C2cWeightPage& page)
 
     auto& chip = system_.chip();
     const auto& hardware = chip.hardware_configuration();
-    const std::size_t sharedStreamBase =
-        hw::kWestStreams - hardware.c2c_streams_per_direction;
+    const std::size_t sharedStreamBase = resolve_fabric_stream_base(
+        page, hardware.c2c_streams_per_direction);
     const auto laneAssignments = allocate_c2c_lanes(
         page, hardware.c2c_streams_per_direction);
     auto usedHemisphere = std::array<bool, hw::kHemispheres> {};

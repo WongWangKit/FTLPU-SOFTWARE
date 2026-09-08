@@ -107,11 +107,11 @@ C2C receive 指令描述一段连续 SRAM row burst。runtime 按目标 slice �
   使用 bank1，使激活和非分页 RMSNorm 权重位于 bank0；variant 1 采用相反布局。
 - `model_session_c2c_io_test`：把 32x1536 BF16 tensor 经 DDR、C2C 和 MEM 做
   往返，并检查不存在 host/MEM 旁路。
-- 当前真实 Qwen seq_len=32 双层 fused package 数值通过：49,152 个输出中 9 个
-  容差超限点，最大绝对误差 20、P99=0.3125、MAE=0.0604967；外部
-  upload/download 各 1 次，device alias 1 次，device copy 0 次。由于当前 LPU
-  Attention lowering 尚未表达 bias，reference 使用 `--ignore-attention-bias`
-  同样忽略 checkpoint 自带的 Q/K/V bias。
+- 真实 Qwen2.5-1.5B 第 0 层 seq_len=32 executable 的 49,152 个输出全部通过
+  硬件数值语义 golden，最大绝对误差 0.015625、MAE=0.000332287。checkpoint
+  的 Q/K/V bias 均以标准 StableHLO broadcast-plus-add operand 表达：Q/K bias
+  融入 VXM RoPE FMA；V 采用
+  `MXM BF16 stream -> VXM bias add -> distributed16 MEM`。
 
 部署包转换命令：
 
@@ -133,7 +133,7 @@ python compiler/tools/build_hf_decoder_stack.py `
   --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
   --pack-model-weights build-ftlpu-vs2026/runtime/ftlpu-pack-model-weights.exe `
   --c2c-weight-paging --layer-count 2 --seq-len 32 `
-  --mxm-execution vector --ffn-schedule fused --ignore-attention-bias `
+  --mxm-execution vector --ffn-schedule fused `
   --output-dir build-ftlpu-vs2026/qwen_two_layer `
   --output build-ftlpu-vs2026/qwen_two_layer/qwen_two_layer.paged.ftlpum
 ```

@@ -22,7 +22,8 @@ MxmLoadOp emitFfnWeightTile(
     llvm::ArrayRef<int64_t> weightSlices, const target::LPUTargetModel &target,
     float scale, int64_t startCycle, int64_t baseRow, int64_t hemisphere,
     int64_t localMxm, int64_t unit, int64_t weightBuffer, bool localDequant,
-    int64_t bank, int64_t pageIndex, int64_t logicalBaseRow) {
+    int64_t bank, int64_t pageIndex, int64_t logicalBaseRow,
+    mlir::DictionaryAttr bindingPlacement) {
   const auto &throughput = target.throughput();
   const int64_t duration = throughput.mxm_rows / throughput.lanes_per_tile;
   const int64_t encodedStreamBase = target.streams().streams_per_direction;
@@ -60,7 +61,9 @@ MxmLoadOp emitFfnWeightTile(
       auto placement = schedule_placement(rewriter, {slice}, baseRow, duration,
                                           1, hemi, "schedule_slice", bank);
       mlir::NamedAttrList attributes(placement);
-      attributes.set("binding_placement", rawRoute.getPlacement());
+      attributes.set("binding_placement",
+                     bindingPlacement ? bindingPlacement
+                                      : rawRoute.getPlacement());
       if (pageIndex >= 0) {
         attributes.set("weight_page", rewriter.getI64IntegerAttr(pageIndex));
         attributes.set("logical_base_row",
@@ -115,7 +118,9 @@ MxmLoadOp emitFfnWeightTile(
     auto placement = schedule_placement(rewriter, {slice}, baseRow, duration, 1,
                                         hemi, "schedule_slice", bank);
     mlir::NamedAttrList attributes(placement);
-    attributes.set("binding_placement", rawRoute.getPlacement());
+    attributes.set("binding_placement",
+                   bindingPlacement ? bindingPlacement
+                                    : rawRoute.getPlacement());
     if (pageIndex >= 0) {
       attributes.set("weight_page", rewriter.getI64IntegerAttr(pageIndex));
       attributes.set("logical_base_row",

@@ -12,6 +12,9 @@
 
 namespace ftlpu::compiler::schedule {
 
+inline constexpr int64_t kAttentionKeyStateBindingIndex = 65536;
+inline constexpr int64_t kAttentionValueStateBindingIndex = 65537;
+
 class AttentionScheduleEmitter {
 public:
     AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
@@ -35,6 +38,8 @@ private:
     const target::LPUTargetModel& target_;
     AttentionStagePlan stage_plan_;
     AttentionScheduleStrategy strategy_;
+    int64_t key_state_binding_index_{-1};
+    int64_t value_state_binding_index_{-1};
 };
 
 mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,

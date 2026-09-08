@@ -147,7 +147,8 @@ void create_mem_command(mlir::OpBuilder& builder, mlir::Location location,
     int64_t packed_stream, int64_t repeat_count, int64_t repeat_interval,
     int64_t address_stride, int64_t wave_count = 1,
     int64_t wave_interval = 1, int64_t wave_address_stride = 0,
-    int64_t address_binding = -1)
+    int64_t address_binding = -1,
+    llvm::StringRef address_binding_access = {})
 {
     mlir::OperationState state(location, command::MemOp::getOperationName());
     state.addAttributes({
@@ -168,9 +169,13 @@ void create_mem_command(mlir::OpBuilder& builder, mlir::Location location,
         state.addAttribute("wave_address_stride",
             builder.getI64IntegerAttr(wave_address_stride));
     }
-    if (address_binding >= 0)
+    if (address_binding >= 0) {
         state.addAttribute("address_binding",
             builder.getI64IntegerAttr(address_binding));
+        if (!address_binding_access.empty())
+            state.addAttribute("address_binding_access",
+                builder.getStringAttr(address_binding_access));
+    }
     builder.create(state);
 }
 
@@ -274,7 +279,7 @@ void create_mem_transfer_command(mlir::OpBuilder& builder,
             op.getBank().value_or(0))));
     for (llvm::StringRef name :
         {"wave_count", "wave_interval", "wave_address_stride",
-            "address_binding"})
+            "address_binding", "address_binding_access"})
         if (mlir::Attribute attribute = op->getAttr(name))
             state.addAttribute(name, attribute);
     builder.create(state);
@@ -338,7 +343,8 @@ void create_mem_bundle_command(mlir::OpBuilder& builder,
     llvm::ArrayRef<int64_t> packedStreams, int64_t repeatCount,
     int64_t repeatInterval, int64_t addressStride,
     int64_t waveCount = 1, int64_t waveInterval = 1,
-    int64_t waveAddressStride = 0, int64_t addressBinding = -1)
+    int64_t waveAddressStride = 0, int64_t addressBinding = -1,
+    llvm::StringRef addressBindingAccess = {})
 {
     const auto array = [&](llvm::ArrayRef<int64_t> values) {
         llvm::SmallVector<mlir::Attribute> attributes;
@@ -370,9 +376,13 @@ void create_mem_bundle_command(mlir::OpBuilder& builder,
         state.addAttribute("wave_address_stride",
             builder.getI64IntegerAttr(waveAddressStride));
     }
-    if (addressBinding >= 0)
+    if (addressBinding >= 0) {
         state.addAttribute("address_binding",
             builder.getI64IntegerAttr(addressBinding));
+        if (!addressBindingAccess.empty())
+            state.addAttribute("address_binding_access",
+                builder.getStringAttr(addressBindingAccess));
+    }
     builder.create(state);
 }
 
@@ -971,7 +981,9 @@ public:
                     && second.getPackedStream()
                         == first.getPackedStream()
                     && second.getAddressBinding()
-                        == first.getAddressBinding();
+                        == first.getAddressBinding()
+                    && second.getAddressBindingAccess()
+                        == first.getAddressBindingAccess();
                 if (compatible) {
                     interval = second.getCycle() - first.getCycle();
                     stride = second.getAddress() - first.getAddress();
@@ -1000,6 +1012,8 @@ public:
                                     != first.getPackedStream()
                                 || next.getAddressBinding()
                                     != first.getAddressBinding()
+                                || next.getAddressBindingAccess()
+                                    != first.getAddressBindingAccess()
                                 || next.getCycle()
                                     != first.getCycle()
                                         + repeat * interval
@@ -1024,7 +1038,8 @@ public:
                     first.getCycle(), queue, first.getOpcode(),
                     first.getAddress(), first.getPackedStream(),
                     runLength, interval, stride, 1, 1, 0,
-                    first.getAddressBinding().value_or(-1));
+                    first.getAddressBinding().value_or(-1),
+                    first.getAddressBindingAccess().value_or(""));
             } else {
                 create_mem_transfer_command(
                     builder, first, target);
@@ -1163,7 +1178,8 @@ public:
                 queues, "read", addresses, packedStreams, count, 1,
                 stride, read.getWaveCount().value_or(1),
                 read.getWaveInterval().value_or(1),
-                read.getWaveAddressStride().value_or(0), addressBinding);
+                read.getWaveAddressStride().value_or(0), addressBinding,
+                addressBinding >= 0 ? "input" : "");
         }
 
         for (std::size_t loadIndex = 0;

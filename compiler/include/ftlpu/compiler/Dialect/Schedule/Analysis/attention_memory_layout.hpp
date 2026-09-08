@@ -143,6 +143,7 @@ private:
 
     const target::LPUTargetModel& target_;
     int64_t seqLen_ = 0;
+    int64_t kvCacheCapacity_ = 0;
     int64_t hidden_ = 0;
     int64_t queryHeads_ = 0;
     int64_t kvHeads_ = 0;
@@ -158,6 +159,7 @@ private:
     std::array<std::array<int64_t, 16>, 2> queryIwSlices_ {};
     std::array<int64_t, 2> queryIwBanks_ {0, 0};
     std::array<int64_t, 2> keyBanks_ {0, 0};
+    int64_t keyBase_ = 0;
     std::array<int64_t, 4> ropeSlices_ {};
     int64_t ropeBank_ = 0;
     std::array<int64_t, 4> ropeMirrorSlices_ {};

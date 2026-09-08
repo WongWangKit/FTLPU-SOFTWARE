@@ -7,11 +7,14 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using namespace ftlpu::software::runtime;
+
+void require(bool condition, const std::string& message);
 
 BinaryBinding make_weight(std::uint16_t bank)
 {
@@ -48,6 +51,56 @@ std::vector<std::uint8_t> logical_weight()
     return result;
 }
 
+BinaryBinding make_kv_cache(BindingLayout layout, std::uint32_t index,
+    std::string name, std::vector<std::uint16_t> slices,
+    std::int64_t base_row, std::int64_t instruction_count)
+{
+    BinaryBinding binding;
+    binding.index = index;
+    binding.access = BindingAccess::Internal;
+    binding.element_type = BindingElementType::BF16;
+    binding.layout = layout;
+    binding.byte_size = 256 * 2 * 128 * 2;
+    binding.base_row = base_row;
+    binding.instruction_count = instruction_count;
+    binding.address_stride = 1;
+    binding.shape = {256, 2, 128};
+    binding.slices = std::move(slices);
+    binding.role = layout == BindingLayout::Fp16HeadPlanar
+        ? "state.kv.key" : "state.kv.value";
+    binding.name = std::move(name);
+    binding.hemisphere_mask = 3;
+    binding.bank = 0;
+    return binding;
+}
+
+void test_kv_cache_roundtrip()
+{
+    std::vector<std::uint8_t> logical(256 * 2 * 128 * 2);
+    for (std::size_t index = 0; index < logical.size(); ++index)
+        logical[index] = static_cast<std::uint8_t>(
+            (index * 29 + index / 257 + 11) & 0xff);
+
+    std::vector<std::uint16_t> value_slices;
+    for (std::uint16_t slice = 0; slice < 16; ++slice)
+        value_slices.push_back(slice);
+    const std::vector<BinaryBinding> bindings = {
+        make_kv_cache(BindingLayout::Fp16HeadPlanar, 65536,
+            "attention.key_cache", {16, 17, 18, 19}, 512, 1024),
+        make_kv_cache(BindingLayout::Fp16ValueX16, 65537,
+            "attention.value_cache", std::move(value_slices), 1024, 256),
+    };
+    for (const BinaryBinding& binding : bindings) {
+        const PackedWeightImage packed = pack_binding_image(
+            binding, logical, ExecutableHardwareConfig {});
+        require(!packed.data.empty(),
+            "KV cache packing produced an empty image");
+        require(unpack_binding_image(binding, packed,
+                    ExecutableHardwareConfig {}) == logical,
+            "KV cache physical layout did not round-trip exactly");
+    }
+}
+
 void require(bool condition, const std::string& message)
 {
     if (!condition) throw std::runtime_error(message);
@@ -57,6 +110,7 @@ void require(bool condition, const std::string& message)
 
 int main()
 try {
+    test_kv_cache_roundtrip();
     const auto data = logical_weight();
     const BinaryBinding binding = make_weight(1);
     const PackedWeightImage packed = pack_weight_binding(

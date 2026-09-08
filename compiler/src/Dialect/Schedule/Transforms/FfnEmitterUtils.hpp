@@ -17,6 +17,17 @@ llvm::SmallVector<int64_t> get_slices(mlir::DictionaryAttr placement);
 
 int64_t get_base_row(mlir::DictionaryAttr placement);
 
+struct PagedWeightPagePlacement {
+    int64_t bank;
+    int64_t slice_group_base;
+    int64_t slice_group_count;
+    int64_t base_row;
+    int64_t row_count;
+};
+
+mlir::FailureOr<PagedWeightPagePlacement> resolve_page_placement(
+    mlir::DictionaryAttr placement, int64_t page);
+
 mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
     llvm::ArrayRef<int64_t> slices, int64_t baseRow, int64_t count,
     int64_t stride, llvm::StringRef hemisphere, llvm::StringRef kind);
@@ -60,6 +71,7 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     int64_t baseRow, int64_t hemisphere, int64_t localMxm,
     int64_t unit, int64_t weightBuffer, bool localDequant,
     int64_t bank = 0, int64_t pageIndex = -1,
-    int64_t logicalBaseRow = -1);
+    int64_t logicalBaseRow = -1,
+    mlir::DictionaryAttr bindingPlacement = {});
 
 } // namespace ftlpu::compiler::schedule::ffn_detail

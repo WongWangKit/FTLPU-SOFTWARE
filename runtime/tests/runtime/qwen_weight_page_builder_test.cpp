@@ -1,8 +1,10 @@
+#include "ftlpu/software/runtime/cmodel_runtime.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -49,6 +51,47 @@ void require(bool condition, const std::string& message)
     if (!condition) throw std::runtime_error(message);
 }
 
+void verify_projection_bias_packing(const ExecutableHardwareConfig& hardware)
+{
+    BinaryBinding binding = make_binding(9, "query_bias",
+        BindingElementType::BF16, BindingLayout::Fp16ProjectionBiasX4,
+        {128}, 256, 2, {4, 5, 6, 7});
+    binding.role = "bias";
+    binding.bank = 0;
+    const auto logical = pattern(
+        static_cast<std::size_t>(binding.byte_size), 41);
+    const PackedWeightImage image = pack_binding_image(
+        binding, logical, hardware);
+    require(image.segments.size() == 8,
+        "projection bias must occupy four slices in both hemispheres");
+    require(image.data.size() == logical.size() * 2,
+        "projection bias image must contain one copy per hemisphere");
+
+    BinaryProgram program;
+    program.hardware = hardware;
+    program.target_abi = executable_target_abi(program.hardware);
+    program.bindings.push_back(binding);
+    auto system = std::make_unique<ftlpu::TspSliceSystem>();
+    CModelRuntime runtime(*system);
+    runtime.load(program);
+    runtime.upload_binding(binding, logical);
+    for (const PackedWeightSegment& segment : image.segments) {
+        for (std::uint32_t vector = 0; vector < segment.vector_count;
+             ++vector) {
+            for (std::uint32_t byte = 0; byte < 32; ++byte) {
+                const std::size_t offset = static_cast<std::size_t>(
+                    segment.byte_offset) + vector * 32 + byte;
+                const auto resident = system->read_mem_sram_lane_byte(
+                    static_cast<ftlpu::Hemisphere>(segment.hemisphere),
+                    segment.slice, binding.bank, byte / 8,
+                    segment.base_row + vector, byte % 8);
+                require(image.data[offset] == resident,
+                    "offline projection bias packing differs from CModel upload");
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main()
@@ -73,6 +116,7 @@ try {
 
     BinaryProgram program;
     program.hardware.mxms_per_hemisphere = 1;
+    verify_projection_bias_packing(program.hardware);
     const auto normBaseRow = static_cast<std::int64_t>(
         program.hardware.sram_depth_rows - hiddenSize);
     constexpr std::int64_t queryRows = hiddenSize * hiddenSize / 512;

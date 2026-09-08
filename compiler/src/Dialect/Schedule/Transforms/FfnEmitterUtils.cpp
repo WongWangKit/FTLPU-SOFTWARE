@@ -1,5 +1,8 @@
 #include "FfnEmitterUtils.hpp"
 
+#include <algorithm>
+#include <optional>
+
 namespace ftlpu::compiler::schedule::ffn_detail {
 
 llvm::SmallVector<int64_t> get_slices(mlir::DictionaryAttr placement)
@@ -13,6 +16,48 @@ llvm::SmallVector<int64_t> get_slices(mlir::DictionaryAttr placement)
 int64_t get_base_row(mlir::DictionaryAttr placement)
 {
     return placement.getAs<mlir::IntegerAttr>("base_row").getInt();
+}
+
+mlir::FailureOr<PagedWeightPagePlacement> resolve_page_placement(
+    mlir::DictionaryAttr placement, int64_t page)
+{
+    if (!placement || page < 0) return mlir::failure();
+    const auto integerOr = [&](llvm::StringRef name, int64_t fallback) {
+        const auto value = placement.getAs<mlir::IntegerAttr>(name);
+        return value ? value.getInt() : fallback;
+    };
+    const auto arrayValue = [&](llvm::StringRef name)
+        -> std::optional<int64_t> {
+        const auto values = placement.getAs<mlir::ArrayAttr>(name);
+        if (!values || page >= static_cast<int64_t>(values.size()))
+            return std::nullopt;
+        const auto value = llvm::dyn_cast<mlir::IntegerAttr>(values[page]);
+        if (!value) return std::nullopt;
+        return value.getInt();
+    };
+    if (placement.get("page_banks")) {
+        const auto bank = arrayValue("page_banks");
+        const auto groupBase = arrayValue("page_slice_group_bases");
+        const auto groupCount = arrayValue("page_slice_group_counts");
+        const auto baseRow = arrayValue("page_base_rows");
+        const auto rowCount = arrayValue("page_row_counts");
+        if (!bank || !groupBase || !groupCount || !baseRow || !rowCount
+            || *groupCount <= 0 || *rowCount <= 0)
+            return mlir::failure();
+        return PagedWeightPagePlacement {
+            *bank, *groupBase, *groupCount, *baseRow, *rowCount};
+    }
+    const int64_t bankCount = std::max<int64_t>(
+        1, integerOr("page_bank_count", 1));
+    return PagedWeightPagePlacement {
+        (integerOr("bank", 0) + page) % bankCount,
+        integerOr("page_role_group_base", 0),
+        std::max<int64_t>(1,
+            integerOr("page_role_group_count", 1)),
+        0,
+        std::max<int64_t>(1,
+            integerOr("instruction_count", 1)),
+    };
 }
 
 mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,

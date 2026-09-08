@@ -442,6 +442,9 @@ LogicalResult SwigluOp::verify()
 LogicalResult ProjectionTaskOp::verify()
 {
     if (getKind() == "linear") {
+        if (getBias())
+            return emitOpError(
+                "linear projection bias lowering is not implemented");
         const auto m = getConfig().getAs<IntegerAttr>("m");
         const auto n = getConfig().getAs<IntegerAttr>("n");
         const auto k = getConfig().getAs<IntegerAttr>("k");
@@ -472,6 +475,16 @@ LogicalResult ProjectionTaskOp::verify()
     if (getKind() != "query" && getKind() != "key"
         && getKind() != "value" && getKind() != "output")
         return emitOpError("kind must be query, key, value, or output");
+    if (mlir::Value bias = getBias()) {
+        const auto biasType =
+            llvm::dyn_cast<mlir::RankedTensorType>(bias.getType());
+        const auto resultType = getResult().getType();
+        if (getKind() == "output" || !biasType || biasType.getRank() != 1
+            || biasType.getDimSize(0) != resultType.getDimSize(1)
+            || biasType.getElementType() != resultType.getElementType())
+            return emitOpError(
+                "Q/K/V bias must match the projection output width");
+    }
     if (failed(verify_attention_config(getOperation(), getConfig())))
         return failure();
     if (getKind() == "output") {

@@ -66,6 +66,29 @@ try {
         || bankOnePlan->pages[1].bank != 0
         || bankOnePlan->pages[projectionPages].bank != 1)
         throw std::logic_error("FFN page banks ignore the initial bank");
+
+    memory.words_per_bank = 8192;
+    memory.sram_depth_rows = 8192;
+    target::LPUTargetModel largeTarget(memory, {}, throughput);
+    auto compact = tensor::planFfnWeightTiles(
+        {32, 1536, 8960, 1536}, largeTarget, 1);
+    if (mlir::failed(compact)
+        || compact->projection_waves_per_page != 84
+        || compact->pages.size() != 14)
+        throw std::logic_error(
+            "8192-row Qwen FFN did not select compact Down residency");
+    constexpr std::size_t compactProjectionPages = 2;
+    for (std::size_t wave = 0; wave < 12; ++wave) {
+        const auto& page = compact->pages[compactProjectionPages + wave];
+        const auto& span = page.spans.front();
+        if (page.bank != 1 || span.slice_group_count != 1
+            || span.slice_group_begin != static_cast<int64_t>(wave / 3)
+            || span.page_base_row
+                != static_cast<int64_t>(wave % 3) * 2240
+            || span.rows_per_slice != 2240)
+            throw std::logic_error(
+                "compact Down page has an unexpected physical slot");
+    }
     auto tasks = schedule::buildFfnWeightTileTaskPlan(
         *plan, {32, 1536, 8960, 1536}, target);
     schedule::ResourceScheduler resources;

@@ -47,33 +47,41 @@ void add_binding_bytes(WeightPrefetchPlan& plan,
 }
 
 std::vector<WeightResidencyRegion> binding_regions(
-    const BinaryBinding& binding, std::uint16_t bank)
+    const BinaryBinding& binding, std::uint32_t page,
+    std::uint16_t bank)
 {
+    const BinaryWeightPagePlacement pagePlacement =
+        resolve_weight_page_placement(binding, page);
+    if (pagePlacement.bank != bank)
+        throw std::logic_error(
+            "weight-page use bank differs from its physical placement");
     std::vector<std::uint16_t> slices;
     if (!binding.page_storage_slices.empty()) {
         const std::size_t groupWidth = binding.slices.empty()
             ? 8 : binding.slices.size();
         const std::size_t begin = std::min<std::size_t>(
             binding.page_storage_slices.size(),
-            static_cast<std::size_t>(binding.page_role_group_base)
+            static_cast<std::size_t>(pagePlacement.slice_group_base)
                 * groupWidth);
         const std::size_t end = std::min<std::size_t>(
             binding.page_storage_slices.size(),
-            static_cast<std::size_t>(binding.page_role_group_base
-                + binding.page_role_group_count) * groupWidth);
+            static_cast<std::size_t>(pagePlacement.slice_group_base
+                + pagePlacement.slice_group_count) * groupWidth);
         slices.assign(binding.page_storage_slices.begin() + begin,
             binding.page_storage_slices.begin() + end);
     } else {
         slices = binding.slices;
     }
 
+    const std::uint64_t bindingBase = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(0, binding.base_row));
+    const std::uint64_t stride =
+        std::max<std::uint32_t>(1, binding.address_stride);
     const std::uint32_t rowBegin = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(std::numeric_limits<std::uint32_t>::max(),
-            static_cast<std::uint64_t>(std::max<int64_t>(0,
-                binding.base_row))));
-    const std::uint64_t rowSpan = std::max<std::uint64_t>(1,
-        static_cast<std::uint64_t>(binding.instruction_count)
-            * std::max<std::uint32_t>(1, binding.address_stride));
+            bindingBase + pagePlacement.base_row * stride));
+    const std::uint64_t rowSpan = std::max<std::uint64_t>(
+        1, static_cast<std::uint64_t>(pagePlacement.row_count) * stride);
     const std::uint64_t rowEnd = std::min<std::uint64_t>(
         std::numeric_limits<std::uint32_t>::max(),
         static_cast<std::uint64_t>(rowBegin) + rowSpan);
@@ -103,7 +111,7 @@ bool regions_overlap(const WeightResidencyRegion& lhs,
         && lhs.row_begin < rhs.row_end && rhs.row_begin < lhs.row_end;
 }
 
-bool plans_overlap(
+bool plans_overlap_impl(
     const WeightPrefetchPlan& lhs, const WeightPrefetchPlan& rhs)
 {
     return std::ranges::any_of(lhs.regions, [&](const auto& left) {
@@ -181,7 +189,8 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
             plan.release_cycle = use.release_cycle;
             plan.use_indices.push_back(useIndex);
             plan.regions = binding_regions(
-                find_paged_weight(program, use.binding_index), use.bank);
+                find_paged_weight(program, use.binding_index),
+                use.page_index, use.bank);
             plans.push_back(std::move(plan));
             found = std::prev(plans.end());
         } else {
@@ -269,7 +278,7 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         // share a bank/slice/row range retain their release-ordered JIT load.
         bool canPreload = true;
         for (std::size_t previous = 0; previous < index; ++previous) {
-            if (!plans_overlap(plan, plans[previous])) continue;
+            if (!plans_overlap_impl(plan, plans[previous])) continue;
             // DDR latency is intentionally nondeterministic. With no staging
             // buffer between DDR and the shared C2C/MEM path, launching before
             // the old page's release could let an early response overwrite
@@ -278,7 +287,12 @@ void schedule_weight_prefetches(const BinaryProgram& program,
             const auto safeDmaStart = plans[previous].release_cycle;
             reusableCycles[index] = std::max(
                 reusableCycles[index], safeDmaStart);
-            if (plans[previous].pre_execution) canPreload = false;
+            // Loading this page before execution would overwrite the earlier
+            // resident page regardless of whether that earlier page was
+            // itself preloaded or fetched while the executable was running.
+            // The latter case matters for chained reuse such as
+            // projection -> projection -> down-projection page residency.
+            canPreload = false;
         }
         plan.pre_execution = canPreload;
         if (plan.pre_execution)
@@ -307,6 +321,12 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         nextQueueCursor = plan.start_cycle + 1
             + *std::max_element(segmentCounts.begin(), segmentCounts.end());
     }
+}
+
+bool weight_prefetch_plans_overlap(
+    const WeightPrefetchPlan& lhs, const WeightPrefetchPlan& rhs)
+{
+    return plans_overlap_impl(lhs, rhs);
 }
 
 } // namespace ftlpu::software::runtime

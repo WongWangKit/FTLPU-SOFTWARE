@@ -593,6 +593,10 @@ bool CModelRuntime::load_ready_weight_pages()
             || use.bank >= binding.page_bank_count)
             throw std::logic_error(
                 "binary weight-page bank is outside the binding policy");
+        if (resolve_weight_page_placement(binding, use.page_index).bank
+            != use.bank)
+            throw std::logic_error(
+                "binary weight-page use disagrees with binding placement");
         const auto image = pack_weight_binding_page(binding,
             use.page_index, logical->second, hardware_);
         for (const auto& segment : image.segments) {
@@ -726,6 +730,30 @@ void CModelRuntime::upload_binding(
                         k % 32, data[offset + 1]);
                 });
             }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16ProjectionBiasX4
+        && is_16bit_float(binding.element_type)
+        && binding.slices.size() == 4) {
+        if (!vector || columns % 32 != 0)
+            throw std::logic_error(
+                "projection bias requires a 32-aligned rank-1 tensor");
+        for (std::size_t column = 0; column < columns; ++column) {
+            const std::size_t block = column / 32;
+            const std::size_t pair = (block / 2) % 2;
+            const std::size_t address =
+                static_cast<std::size_t>(binding.base_row)
+                + (block / 4) * 2 + block % 2;
+            const std::size_t offset = column * 2;
+            for_each_binding_hemisphere(binding, [&](Hemisphere hemisphere) {
+                write_binding_sram_byte(system_, binding, hemisphere,
+                    binding.slices[2 * pair], address, column % 32,
+                    data[offset]);
+                write_binding_sram_byte(system_, binding, hemisphere,
+                    binding.slices[2 * pair + 1], address, column % 32,
+                    data[offset + 1]);
+            });
         }
         return;
     }

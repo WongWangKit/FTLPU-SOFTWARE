@@ -59,6 +59,8 @@ public:
 
     const ModelPackage& package() const;
     const std::vector<std::uint8_t>& value(const std::string& name) const;
+    std::vector<std::uint8_t> read_state(const std::string& name);
+    void reset_states();
     const SessionMemoryPlan& memory_plan() const;
     const ModelSessionStats& stats() const;
     std::vector<WeightPrefetchPlan> executable_weight_prefetch_plans() const;
@@ -81,6 +83,8 @@ private:
         bool launch_released{false};
         bool trace_recorded{false};
         bool ready_before_execution{false};
+        bool inter_invocation_lookahead{false};
+        std::optional<std::uint32_t> model_page_index{};
     };
 
     const std::vector<std::uint8_t>& resolve_value(const std::string& name) const;
@@ -94,9 +98,15 @@ private:
     void release_due_executable_weight_pages();
     void observe_executable_weight_page_tick();
     void record_weight_page_trace(ExecutableWeightTransfer& transfer);
-    void prepare_executable_weight_pages(
+    std::vector<ExecutableWeightTransfer> build_executable_weight_pages(
         const BinaryProgram& program, const ModelInvocation& invocation);
+    void prepare_executable_weight_pages(
+        const BinaryProgram& program, const ModelInvocation& invocation,
+        std::size_t invocation_index);
+    void prepare_executable_weight_lookahead(
+        std::size_t invocation_index, const BinaryProgram& program);
     void schedule_executable_weight_pages();
+    std::size_t settle_executable_weight_lookahead();
     bool executable_weight_page_ready(
         const BinaryWeightPageUse& use) const;
     void configure_external_transport(
@@ -117,6 +127,11 @@ private:
     std::optional<std::uint32_t> ready_weight_page_{};
     std::optional<std::uint32_t> inflight_weight_page_{};
     std::vector<ExecutableWeightTransfer> executable_weight_transfers_{};
+    std::vector<ExecutableWeightTransfer>
+        lookahead_executable_weight_transfers_{};
+    std::optional<ExecutableWeightTransfer>
+        lookahead_model_weight_transfer_{};
+    std::optional<std::size_t> lookahead_invocation_index_{};
     std::uint64_t executable_cycle_{0};
     std::uint64_t executable_ddr4_address_{0};
     std::size_t c2c_bytes_per_stream_per_cycle_{0};

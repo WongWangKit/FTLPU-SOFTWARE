@@ -15,6 +15,13 @@ F32 = 4
 I32 = 2
 RAW = 0
 SYMMETRIC_PER_TENSOR_I8 = 1
+KV_KEY = 1
+KV_VALUE = 2
+
+# Internal binding indices form a separate namespace from model inputs.
+# Keep these synchronized with attention_schedule_emitter.hpp.
+ATTENTION_KEY_STATE_BINDING_INDEX = 65536
+ATTENTION_VALUE_STATE_BINDING_INDEX = 65537
 
 
 def scalar(stream, code: str, value: object) -> None:
@@ -74,6 +81,12 @@ def main() -> None:
     parser.add_argument("--final-norm-bf16", type=Path)
     parser.add_argument("--final-rmsnorm-executable", type=Path)
     parser.add_argument(
+        "--kv-cache-capacity",
+        type=int,
+        default=0,
+        help="emit one persistent BF16 K/V cache pair per decoder layer",
+    )
+    parser.add_argument(
         "--checkpoint-outputs",
         action="store_true",
         help="embed and download every decoder-layer golden output",
@@ -129,6 +142,12 @@ def main() -> None:
     hidden = metadata["hidden_size"]
     intermediate = metadata["intermediate_size"]
     seq_len = metadata["seq_len"]
+    if args.kv_cache_capacity < 0:
+        raise ValueError("KV cache capacity must be non-negative")
+    if args.kv_cache_capacity and args.kv_cache_capacity < seq_len:
+        raise ValueError(
+            "KV cache capacity must be no smaller than seq_len"
+        )
     shapes = {
         "query": [hidden, hidden],
         "key": [hidden, metadata["kv_heads"] * metadata["head_dim"]],
@@ -139,6 +158,10 @@ def main() -> None:
         "down": [intermediate, hidden],
     }
     weight_order = ["query", "key", "value", "output", "gate", "up", "down"]
+    bias_operand_flags = [
+        bool(current.get("attention_bias_operands", False))
+        for current in metadata_list
+    ]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("wb") as stream:
@@ -151,7 +174,7 @@ def main() -> None:
         # reproducible from one package.
         scalar(
             stream, "I",
-            2 + 9 * len(golden_dirs)
+            2 + sum(9 + 3 * has_bias for has_bias in bias_operand_flags)
             + (len(golden_dirs) if args.checkpoint_outputs else 0)
             + (2 if include_boundaries else 0),
         )
@@ -159,7 +182,9 @@ def main() -> None:
             stream, "golden.input", BF16, [seq_len, hidden],
             (golden_dirs[0] / "input.bf16.bin").read_bytes()
         )
-        for golden_dir, layer_metadata in zip(golden_dirs, metadata_list):
+        for golden_dir, layer_metadata, has_bias in zip(
+            golden_dirs, metadata_list, bias_operand_flags
+        ):
             layer = int(layer_metadata["layer"])
             tensor(
                 stream, f"layers.{layer}.input_layernorm.weight",
@@ -174,6 +199,17 @@ def main() -> None:
                     SYMMETRIC_PER_TENSOR_I8,
                     [layer_metadata["scales"][role]],
                 )
+            if has_bias:
+                for role, width in (
+                    ("query", hidden),
+                    ("key", metadata["kv_heads"] * metadata["head_dim"]),
+                    ("value", metadata["kv_heads"] * metadata["head_dim"]),
+                ):
+                    tensor(
+                        stream, f"layers.{layer}.{role}.bias",
+                        BF16, [width],
+                        (golden_dir / f"{role}_bias.bf16.bin").read_bytes(),
+                    )
             tensor(
                 stream, f"layers.{layer}.post_attention_layernorm.weight",
                 BF16, [hidden],
@@ -254,13 +290,13 @@ def main() -> None:
             string(
                 stream,
                 f"decoder_layer_variant_{executable_index}_"
-                f"from_layer_{int(layer_metadata['layer'])}_seq128",
+                f"from_layer_{int(layer_metadata['layer'])}_seq{seq_len}",
             )
             executable = executable_path.read_bytes()
             scalar(stream, "Q", len(executable))
             stream.write(executable)
         if include_boundaries:
-            string(stream, "final_rmsnorm_seq128")
+            string(stream, f"final_rmsnorm_seq{seq_len}")
             executable = args.final_rmsnorm_executable.read_bytes()
             scalar(stream, "Q", len(executable))
             stream.write(executable)
@@ -280,9 +316,30 @@ def main() -> None:
             string(stream, "logits")
             scalar(stream, "B", 1)
 
-        # Version-4 persistent model state descriptors. Decoder executables
-        # add per-layer KV bindings here once cache lowering is enabled.
-        scalar(stream, "I", 0)
+        # Version-4 persistent model state descriptors.
+        scalar(
+            stream,
+            "I",
+            2 * len(golden_dirs) if args.kv_cache_capacity else 0,
+        )
+        if args.kv_cache_capacity:
+            state_shape = [
+                args.kv_cache_capacity,
+                metadata["kv_heads"],
+                metadata["head_dim"],
+            ]
+            for layer_metadata in metadata_list:
+                layer = int(layer_metadata["layer"])
+                for suffix, kind in (
+                    ("key_cache", KV_KEY),
+                    ("value_cache", KV_VALUE),
+                ):
+                    string(stream, f"layers.{layer}.{suffix}")
+                    scalar(stream, "H", kind)
+                    scalar(stream, "H", BF16)
+                    scalar(stream, "I", layer)
+                    scalar(stream, "I", args.kv_cache_capacity)
+                    vector(stream, "Q", state_shape)
 
         scalar(stream, "I", len(golden_dirs) + int(include_boundaries))
         for invocation_index, layer_metadata in enumerate(metadata_list):
@@ -292,22 +349,46 @@ def main() -> None:
                 stream, "I",
                 executable_indices[invocation_index],
             )
-            binding_refs(stream, [
+            input_refs = [
                 (0, f"hidden.{invocation_index}"),
                 (1, f"layers.{layer}.input_layernorm.weight"),
                 (2, f"layers.{layer}.query.weight"),
                 (3, f"layers.{layer}.key.weight"),
                 (4, f"layers.{layer}.value.weight"),
                 (5, f"layers.{layer}.output.weight"),
-                (6, f"layers.{layer}.post_attention_layernorm.weight"),
-                (7, f"layers.{layer}.gate.weight"),
-                (8, f"layers.{layer}.up.weight"),
-                (9, f"layers.{layer}.down.weight"),
+            ]
+            next_binding = 6
+            if bias_operand_flags[invocation_index]:
+                input_refs.extend([
+                    (6, f"layers.{layer}.query.bias"),
+                    (7, f"layers.{layer}.key.bias"),
+                    (8, f"layers.{layer}.value.bias"),
+                ])
+                next_binding = 9
+            input_refs.extend([
+                (next_binding,
+                 f"layers.{layer}.post_attention_layernorm.weight"),
+                (next_binding + 1, f"layers.{layer}.gate.weight"),
+                (next_binding + 2, f"layers.{layer}.up.weight"),
+                (next_binding + 3, f"layers.{layer}.down.weight"),
             ])
+            binding_refs(stream, input_refs)
             binding_refs(
                 stream, [(0, f"hidden.{invocation_index + 1}")]
             )
-            binding_refs(stream, [])
+            state_refs = []
+            if args.kv_cache_capacity:
+                state_refs = [
+                    (
+                        ATTENTION_KEY_STATE_BINDING_INDEX,
+                        f"layers.{layer}.key_cache",
+                    ),
+                    (
+                        ATTENTION_VALUE_STATE_BINDING_INDEX,
+                        f"layers.{layer}.value_cache",
+                    ),
+                ]
+            binding_refs(stream, state_refs)
         if include_boundaries:
             string(stream, "final_norm")
             scalar(stream, "I", len(unique_executables))

@@ -48,8 +48,10 @@ mlir::LogicalResult lower_attention(
         }));
         return true;
     };
-    const stream::StreamRoutePlan route_plan =
-        stream::plan_attention_routes();
+    const stream::StreamRoutePlan route_plan = stream::plan_attention_routes(
+        static_cast<bool>(op.getQueryBias()),
+        static_cast<bool>(op.getKeyBias()),
+        static_cast<bool>(op.getValueBias()));
     bool allocated = route_plan.valid();
     for (const stream::RouteLifetime& route : route_plan.routes()) {
         allocated = allocated
@@ -107,13 +109,14 @@ mlir::LogicalResult lower_attention(
             static_cast<int64_t>(op.getSeqLen())},
         elementType);
     const auto createProjection =
-        [&](mlir::Value input, mlir::Value weight,
+        [&](mlir::Value input, mlir::Value weight, mlir::Value bias,
             llvm::StringRef kind, mlir::Type resultType,
             mlir::ArrayAttr taskRoutes, bool ownsMemoryPlan = false) {
             mlir::OperationState state(
                 op.getLoc(),
                 stream::ProjectionTaskOp::getOperationName());
             state.addOperands({input, weight});
+            if (bias) state.addOperands(bias);
             state.addTypes(resultType);
             state.addAttributes({
                 rewriter.getNamedAttr(
@@ -160,21 +163,26 @@ mlir::LogicalResult lower_attention(
         };
 
     auto query = createProjection(op.getInput(), op.getQueryWeight(),
+        op.getQueryBias(),
         "query", matrixType(op.getSeqLen(),
                      op.getQueryHeads() * op.getHeadDim()),
         routesForPhaseAndRoles("qkv", {"query_weight",
-            "query_weight_dequant", "activation", "qkv_result"}));
+            "query_weight_dequant", "activation", "qkv_result",
+            "query_bias"}));
     auto key = createProjection(op.getInput(), op.getKeyWeight(),
+        op.getKeyBias(),
         "key", matrixType(op.getSeqLen(),
                    op.getKvHeads() * op.getHeadDim()),
         routesForPhaseAndRoles("qkv", {"key_weight",
-            "key_weight_dequant", "key_activation", "key_result"}));
+            "key_weight_dequant", "key_activation", "key_result",
+            "key_bias"}));
     auto value = createProjection(op.getInput(), op.getValueWeight(),
+        op.getValueBias(),
         "value", matrixType(op.getSeqLen(),
                      op.getKvHeads() * op.getHeadDim()),
         routesForPhaseAndRoles("qkv", {"value_weight",
             "value_weight_dequant", "value_activation",
-            "value_result"}));
+            "value_to_vxm", "value_bias", "value_result"}));
     const mlir::Value rotatedQuery = createUnary(
         stream::RopeTaskOp::getOperationName(), query.getResult(),
         "query", query.getResult().getType(),
@@ -202,7 +210,7 @@ mlir::LogicalResult lower_attention(
             op.getQueryHeads() * op.getHeadDim()),
         routesForPhase("pv"));
     auto output = createProjection(pv.getResult(),
-        op.getOutputWeight(), "output", op.getResult().getType(),
+        op.getOutputWeight(), {}, "output", op.getResult().getType(),
         routesForPhase("o_proj"), true);
     rewriter.replaceOp(op.output, output.getResult());
     rewriter.eraseOp(op.pv);

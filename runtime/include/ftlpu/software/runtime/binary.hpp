@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 29;
+inline constexpr std::uint32_t kBinaryFormatVersion = 32;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -55,6 +55,7 @@ enum class BindingLayout : std::uint16_t {
     Fp16ValueX16 = 23,
     Fp16HeadPlanar = 24,
     Fp16HeadBlockPacked = 25,
+    Fp16ProjectionBiasX4 = 26,
 };
 
 enum class BindingInitializer : std::uint16_t {
@@ -88,8 +89,9 @@ struct BinaryBinding {
     BindingInitializer initializer{BindingInitializer::None};
     float rope_theta{0.0f};
     std::uint32_t rope_head_dim{0};
-    // Intra-executable ping-pong paging metadata. A paged binding contains
-    // the logical tensor; only one page is resident in each physical bank.
+    // Intra-executable paging metadata. A paged binding contains the logical
+    // tensor; independently ready pages may share a bank when their exact
+    // slice-group and row regions are disjoint.
     bool paged_weight{false};
     std::uint32_t page_count{0};
     std::uint32_t page_rows{0};
@@ -99,7 +101,26 @@ struct BinaryBinding {
     std::uint32_t page_items_per_slice_group{0};
     std::uint32_t page_bank_count{0};
     std::vector<std::uint16_t> page_storage_slices{};
+    // Exact physical residency of each independently ready page. Empty
+    // vectors retain the legacy alternating-bank/full-role-group policy.
+    std::vector<std::uint16_t> page_banks{};
+    std::vector<std::uint16_t> page_slice_group_bases{};
+    std::vector<std::uint16_t> page_slice_group_counts{};
+    // Row offsets are relative to the binding-level base_row.
+    std::vector<std::uint32_t> page_base_rows{};
+    std::vector<std::uint32_t> page_row_counts{};
 };
+
+struct BinaryWeightPagePlacement {
+    std::uint16_t bank{0};
+    std::uint16_t slice_group_base{0};
+    std::uint16_t slice_group_count{1};
+    std::uint32_t base_row{0};
+    std::uint32_t row_count{1};
+};
+
+BinaryWeightPagePlacement resolve_weight_page_placement(
+    const BinaryBinding& binding, std::uint32_t page_index);
 
 struct BinaryWeightPageUse {
     std::uint32_t binding_index{0};
@@ -160,6 +181,11 @@ struct BinaryProgram {
     std::vector<BinaryScaleRelocation> scale_relocations{};
     std::vector<BinaryAddressRelocation> address_relocations{};
     std::vector<BinaryWeightPageUse> weight_page_uses{};
+    // Earliest cycle at which each packed ordinary SR is no longer used by
+    // this executable. East entries precede West entries, matching the
+    // hardware stream encoding. Runtime C2C lookahead borrows a contiguous
+    // range from the inbound West direction after its release point.
+    std::vector<std::uint64_t> stream_release_cycles{};
 };
 
 void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path);

@@ -51,4 +51,9 @@ void schedule_weight_prefetches(const BinaryProgram& program,
     std::vector<WeightPrefetchPlan>& plans,
     const ExecutableHardwareConfig& runtime_hardware);
 
+// Returns true when two independently packed pages occupy any common
+// physical SRAM byte range.
+bool weight_prefetch_plans_overlap(
+    const WeightPrefetchPlan& lhs, const WeightPrefetchPlan& rhs);
+
 } // namespace ftlpu::software::runtime

@@ -44,6 +44,7 @@ struct Args {
     ftlpu::compiler::target::MxmExecutionPolicy mxm_execution_policy{
         ftlpu::compiler::target::MxmExecutionPolicy::Auto};
     std::int64_t weight_bank{-1};
+    std::int64_t kv_cache_capacity{0};
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
         ftlpu::compiler::target::IcuCompressionMode::Macro};
@@ -109,6 +110,8 @@ Args parse_args(int argc, char** argv)
         }
         else if (arg == "--weight-bank")
             args.weight_bank = std::stoll(next());
+        else if (arg == "--kv-cache-capacity")
+            args.kv_cache_capacity = std::stoll(next());
         else if (arg == "--pass-timing")
             args.pass_timing = true;
         else if (arg == "--icu-macro-schedule")
@@ -142,6 +145,7 @@ Args parse_args(int argc, char** argv)
                                  "[--mxm-execution auto|vector|legacy] "
                                  "[--icu-compression none|control|macro] "
                                  "[--weight-bank 0|1] "
+                                 "[--kv-cache-capacity tokens] "
                                  "[--target-config target.json]");
     }
     return args;
@@ -190,7 +194,15 @@ try {
     if (args.weight_bank >= target.memory().banks_per_slice)
         throw std::runtime_error(
             "weight bank is outside the target memory");
+    if (args.kv_cache_capacity < 0)
+        throw std::runtime_error(
+            "KV cache capacity must be non-negative");
     (*module)->setAttr("ftlpu.target", target.to_attribute(&context));
+    if (args.kv_cache_capacity > 0)
+        (*module)->setAttr("ftlpu.kv_cache_capacity",
+            mlir::IntegerAttr::get(
+                mlir::IntegerType::get(&context, 64),
+                args.kv_cache_capacity));
     (*module)->setAttr("ftlpu.mxm_execution_policy",
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::mxm_execution_policy_name(

@@ -140,11 +140,11 @@ scales with segments rather than 32-byte vectors.
   uses the opposite placement.
 - `model_session_c2c_io_test` round-trips a 32x1536 BF16 tensor through DDR,
   C2C, and MEM and rejects a host/MEM bypass.
-- The current real two-layer Qwen seq-len-32 fused package passes with
-  9/49,152 tolerance outliers, maximum absolute error 20, P99 0.3125, and MAE
-  0.0604967. It performs one external upload, one external download, one
-  device alias, and zero device copies. The reference deliberately omits the
-  checkpoint's Q/K/V biases because bias lowering is not implemented yet.
+- The real Qwen2.5-1.5B layer-0 seq-len-32 executable passes all 49,152 output
+  values against the hardware-arithmetic golden with maximum absolute error
+  0.015625 and MAE 0.000332287. Checkpoint Q/K/V biases are ordinary StableHLO
+  broadcast-plus-add operands: Q/K bias is fused into the VXM RoPE FMA, while
+  V follows `MXM BF16 stream -> VXM bias add -> distributed16 MEM`.
 
 Convert a logical package with:
 
@@ -166,7 +166,7 @@ python compiler/tools/build_hf_decoder_stack.py `
   --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
   --pack-model-weights build-ftlpu-vs2026/runtime/ftlpu-pack-model-weights.exe `
   --c2c-weight-paging --layer-count 2 --seq-len 32 `
-  --mxm-execution vector --ffn-schedule fused --ignore-attention-bias `
+  --mxm-execution vector --ffn-schedule fused `
   --output-dir build-ftlpu-vs2026/qwen_two_layer `
   --output build-ftlpu-vs2026/qwen_two_layer/qwen_two_layer.paged.ftlpum
 ```

@@ -37,7 +37,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
     const bool hiddenDistributed16 = hiddenKind
         && hiddenKind.getValue() == "fp16_mxm_distributed_16";
 
-    const auto downPlacement = context.down_route.getPlacement();
+    const auto downPlacement = context.down_weight_placement;
     int64_t reductionsPerWeightPage = 0;
     if (const auto paged = downPlacement.getAs<mlir::BoolAttr>(
             "paged_weight"); paged && paged.getValue()) {
@@ -74,7 +74,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         + (hemisphere * logicalSlotsPerHemisphere
                               + logicalSlot)
                             * weightLoadCycles;
-                const auto placement = context.down_route.getPlacement();
+                const auto placement = context.down_weight_placement;
                 const int64_t bindingBase = placement
                         .getAs<mlir::IntegerAttr>("base_row")
                         .getInt();
@@ -95,25 +95,34 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     const int64_t reductionsPerPage = placement
                         .getAs<mlir::IntegerAttr>("page_granularity")
                         .getInt();
-                    const int64_t roleGroupBase = placement
-                        .getAs<mlir::IntegerAttr>("page_role_group_base")
-                        .getInt();
                     const int64_t reductionsPerGroup = placement
                         .getAs<mlir::IntegerAttr>(
                             "page_items_per_slice_group")
                         .getInt();
-                    const int64_t bankCount = placement
-                        .getAs<mlir::IntegerAttr>("page_bank_count")
-                        .getInt();
+                    if (reductionsPerPage <= 0
+                        || reductionsPerGroup <= 0) {
+                        ffn.getOperation()->emitError(
+                            "paged Down projection has invalid page geometry");
+                        return mlir::failure();
+                    }
                     const int64_t pagesPerWave =
                         (intermediate / tile + reductionsPerPage - 1)
                         / reductionsPerPage;
                     page = outputWave * pagesPerWave
                         + reduction / reductionsPerPage;
-                    bank = (bank + page) % bankCount;
+                    auto pagePlacement = resolve_page_placement(
+                        placement, page);
+                    if (mlir::failed(pagePlacement)) {
+                        ffn.getOperation()->emitError(
+                            "paged Down projection has invalid physical page placement")
+                            << ": page=" << page;
+                        return mlir::failure();
+                    }
+                    bank = pagePlacement->bank;
                     const int64_t reductionInPage =
                         reduction % reductionsPerPage;
-                    const int64_t sliceGroup = roleGroupBase
+                    const int64_t sliceGroup =
+                        pagePlacement->slice_group_base
                         + reductionInPage / reductionsPerGroup;
                     const int64_t localReduction =
                         reductionInPage % reductionsPerGroup;
@@ -121,13 +130,23 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         .getAs<mlir::ArrayAttr>("page_storage_slices");
                     const int64_t loadSliceCount =
                         static_cast<int64_t>(selectedWeightSlices.size());
+                    if (sliceGroup
+                            >= pagePlacement->slice_group_base
+                                + pagePlacement->slice_group_count) {
+                        ffn.getOperation()->emitError(
+                            "paged Down reduction exceeds its physical slice groups")
+                            << ": page=" << page
+                            << ", reduction=" << reduction;
+                        return mlir::failure();
+                    }
                     selectedWeightSlices.clear();
                     for (int64_t index = 0; index < loadSliceCount; ++index)
                         selectedWeightSlices.push_back(
                             llvm::cast<mlir::IntegerAttr>(
                                 storage[sliceGroup * loadSliceCount + index])
                                 .getInt());
-                    base = localReduction * logicalSlotsPerHemisphere
+                    base = bindingBase + pagePlacement->base_row
+                        + localReduction * logicalSlotsPerHemisphere
                             * weightLoadCycles
                         + logicalSlot * weightLoadCycles;
                 }
@@ -148,7 +167,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     base, hemisphere, logicalSlot, unit,
                     singleMxm ? logicalSlot : weightBuffer,
                     context.local_weight_dequant, bank, page,
-                    logicalBase);
+                    logicalBase, context.down_weight_placement);
             }
         }
 

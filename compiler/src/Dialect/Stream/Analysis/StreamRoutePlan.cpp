@@ -25,7 +25,8 @@ bool StreamRoutePlan::valid() const
     return true;
 }
 
-StreamRoutePlan plan_attention_routes()
+StreamRoutePlan plan_attention_routes(
+    bool hasQueryBias, bool hasKeyBias, bool hasValueBias)
 {
     using E = target::StreamEndpoint;
     using D = target::StreamDirection;
@@ -44,6 +45,9 @@ StreamRoutePlan plan_attention_routes()
         "input", 4, 8);
     add("qkv", "qkv_result", E::MxmResult, E::Mem, D::West,
         "query", 8, 10);
+    if (hasQueryBias)
+        add("qkv", "query_bias", E::Mem, E::VxmInput, D::West,
+            "query_bias", 8, 10);
     add("qkv", "key_weight", E::Mem, E::VxmInput, D::East,
         "key_weight", 10, 12);
     add("qkv", "key_weight_dequant", E::VxmResult, E::MxmWeight,
@@ -52,14 +56,26 @@ StreamRoutePlan plan_attention_routes()
         "input", 14, 18);
     add("qkv", "key_result", E::MxmResult, E::Mem, D::West,
         "key", 18, 20);
+    if (hasKeyBias)
+        add("qkv", "key_bias", E::Mem, E::VxmInput, D::West,
+            "key_bias", 18, 20);
     add("qkv", "value_weight", E::Mem, E::VxmInput, D::East,
         "value_weight", 20, 22);
     add("qkv", "value_weight_dequant", E::VxmResult, E::MxmWeight,
         D::East, "value_weight", 22, 24);
     add("qkv", "value_activation", E::Mem, E::MxmActivation, D::East,
         "input", 24, 28);
-    add("qkv", "value_result", E::MxmResult, E::Mem, D::West,
-        "value", 28, 30);
+    if (hasValueBias) {
+        add("qkv", "value_to_vxm", E::MxmResult, E::VxmInput, D::West,
+            "value", 28, 30);
+        add("qkv", "value_bias", E::Mem, E::VxmInput, D::West,
+            "value_bias", 28, 30);
+        add("qkv", "value_result", E::VxmResult, E::Mem, D::East,
+            "value", 30, 32);
+    } else {
+        add("qkv", "value_result", E::MxmResult, E::Mem, D::West,
+            "value", 28, 30);
+    }
     add("rope", "qk_to_vxm", E::Mem, E::VxmInput, D::East,
         "query", 30, 32);
     add("qk", "query_activation", E::Mem, E::MxmActivation, D::East,

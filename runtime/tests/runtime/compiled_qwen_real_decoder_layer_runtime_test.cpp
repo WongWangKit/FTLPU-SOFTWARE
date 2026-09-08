@@ -59,8 +59,15 @@ void print_weight_page_residency_error(
     const ftlpu::TspSliceSystem &system, const BinaryBinding &binding,
     std::span<const std::uint8_t> logical,
     const ExecutableHardwareConfig &hardware) {
-  const PackedWeightImage expected =
-      pack_weight_binding_page(binding, 0, logical, hardware);
+  const bool paged_matrix_weight =
+      binding.layout == BindingLayout::W8A16MxmWeightStriped ||
+      binding.layout == BindingLayout::W8A16MxmWeightWaveStriped ||
+      binding.layout == BindingLayout::W8A16AttentionWeightStriped ||
+      binding.layout == BindingLayout::W8A16Block8WeightWaveStriped ||
+      binding.layout == BindingLayout::W8A16MxmWeightReplicated;
+  const PackedWeightImage expected = paged_matrix_weight
+      ? pack_weight_binding_page(binding, 0, logical, hardware)
+      : pack_binding_image(binding, logical, hardware);
   std::size_t mismatches = 0;
   bool printed_first = false;
   for (const PackedWeightSegment &segment : expected.segments) {
@@ -148,6 +155,17 @@ const BinaryBinding &find_internal_binding_by_name(
   return *binding;
 }
 
+const BinaryBinding *find_internal_binding_by_role(
+    const BinaryProgram &program, std::string_view role) {
+  const auto binding = std::find_if(
+      program.bindings.begin(), program.bindings.end(),
+      [&](const BinaryBinding &candidate) {
+        return candidate.access == BindingAccess::Internal &&
+               candidate.role == role;
+      });
+  return binding == program.bindings.end() ? nullptr : &*binding;
+}
+
 std::vector<std::uint8_t> download_swiglu_stage(
     CModelRuntime &runtime, const BinaryBinding &distributed_template) {
   BinaryBinding binding = distributed_template;
@@ -214,7 +232,7 @@ void append_packed_tensor(ModelPackage &package, ModelWeightPage &page,
     throw std::logic_error("packed tensor byte size does not match binding " +
                            std::to_string(binding_index));
   PackedWeightImage image =
-      pack_weight_binding(binding, logical, program.hardware);
+      pack_binding_image(binding, logical, program.hardware);
   const std::string tensor_name = name;
   package.tensors.push_back(
       ModelTensor{std::move(name),
@@ -323,15 +341,76 @@ void print_stage_error(const std::string &label,
   }
 }
 
+void require_kv_state_matches(const std::string &label,
+                              const std::vector<std::uint8_t> &state,
+                              const std::vector<std::uint8_t> &expected) {
+  if (state.size() < expected.size() || expected.size() % 2 != 0)
+    throw std::logic_error(label + " state has an invalid byte size");
+
+  double absolute_error = 0.0;
+  float maximum_error = 0.0f;
+  std::size_t mismatches = 0;
+  for (std::size_t index = 0; index < expected.size() / 2; ++index) {
+    const float observed = bf16_at(state, index);
+    const float golden = bf16_at(expected, index);
+    if (!std::isfinite(observed) || !std::isfinite(golden))
+      throw std::logic_error(label + " state contains a non-finite value");
+    const float error = std::fabs(observed - golden);
+    absolute_error += error;
+    maximum_error = std::max(maximum_error, error);
+    if (error > 0.25f + 0.05f * std::fabs(golden)) {
+      if (mismatches < 8) {
+        constexpr std::size_t kKvHeads = 2;
+        constexpr std::size_t kHeadDim = 128;
+        const std::size_t token = index / (kKvHeads * kHeadDim);
+        const std::size_t head = (index / kHeadDim) % kKvHeads;
+        const std::size_t dimension = index % kHeadDim;
+        std::cout << "Qwen KV state mismatch: name=" << label
+                  << " token=" << token << " head=" << head
+                  << " dimension=" << dimension << " actual=" << observed
+                  << " golden=" << golden << " error=" << error << '\n';
+      }
+      ++mismatches;
+    }
+  }
+
+  const auto values = expected.size() / 2;
+  const double mismatch_fraction =
+      static_cast<double>(mismatches) / static_cast<double>(values);
+  const double mean_absolute_error =
+      absolute_error / static_cast<double>(values);
+  const std::size_t nonzero_tail = static_cast<std::size_t>(std::count_if(
+      state.begin() + static_cast<std::ptrdiff_t>(expected.size()), state.end(),
+      [](std::uint8_t byte) { return byte != 0; }));
+  std::cout << "Qwen KV state summary: name=" << label
+            << " values=" << values << " capacity_bytes=" << state.size()
+            << " mismatches=" << mismatches << " mae=" << mean_absolute_error
+            << " max_error=" << maximum_error
+            << " nonzero_tail_bytes=" << nonzero_tail << '\n';
+  if (mismatch_fraction > 0.001 || mean_absolute_error > 0.075 ||
+      maximum_error > 32.0f || nonzero_tail != 0)
+    throw std::logic_error(label + " persistent KV state mismatch");
+}
+
+void require_zero_state(const std::string &label,
+                        const std::vector<std::uint8_t> &state) {
+  const auto nonzero = std::count_if(
+      state.begin(), state.end(), [](std::uint8_t byte) { return byte != 0; });
+  if (nonzero != 0)
+    throw std::logic_error(label + " state was not cleared");
+}
+
 std::vector<std::uint8_t> download_value_stage(
-    const ftlpu::TspSliceSystem &system, std::size_t bank,
+    const ftlpu::TspSliceSystem &system, const BinaryBinding &binding,
     bool source_hemisphere = false) {
   constexpr std::size_t kSeqLen = 32;
   constexpr std::size_t kKvHeads = 2;
   constexpr std::size_t kHeadDim = 128;
   constexpr std::size_t kHeadBlock = 32;
   constexpr std::size_t kTokenLanes = 8;
-  constexpr std::size_t kValueBaseRow = 672;
+  if (binding.layout != BindingLayout::Fp16ValueX16 ||
+      binding.slices.size() != 32)
+    throw std::logic_error("Qwen value stage has an invalid binding layout");
   std::vector<std::uint8_t> result(kSeqLen * kKvHeads * kHeadDim * 2);
   for (std::size_t token = 0; token < kSeqLen; ++token) {
     const std::size_t token_lane = token % kTokenLanes;
@@ -344,17 +423,20 @@ std::vector<std::uint8_t> download_value_stage(
             ? static_cast<ftlpu::Hemisphere>(
                   ((head * (kHeadDim / kHeadBlock) + feature_block) % 4) / 2)
             : hemisphere;
-        const std::size_t address = kValueBaseRow +
+        const std::size_t address = binding.base_row +
             (head * (kHeadDim / kHeadBlock) + feature_block) * 4 + token_wave;
         const std::size_t column = feature % kHeadBlock;
+        const std::size_t slice_index =
+            (feature_block % 2) * 16 + 2 * token_lane;
         const std::size_t logical =
             (token * kKvHeads * kHeadDim + head * kHeadDim + feature) * 2;
         result[logical] = system.read_mem_sram_lane_byte(
-            physical_hemisphere, 2 * token_lane, bank,
+            physical_hemisphere, binding.slices[slice_index], binding.bank,
             column / ftlpu::hw::kLanesPerTile, address,
             column % ftlpu::hw::kLanesPerTile);
         result[logical + 1] = system.read_mem_sram_lane_byte(
-            physical_hemisphere, 2 * token_lane + 1, bank,
+            physical_hemisphere, binding.slices[slice_index + 1],
+            binding.bank,
             column / ftlpu::hw::kLanesPerTile, address,
             column % ftlpu::hw::kLanesPerTile);
       }
@@ -658,6 +740,16 @@ int main(int argc, char **argv) try {
         "Qwen decoder binary has no intra-executable weight pages");
   const auto scales = read_quant_scales(fixture);
 
+  const BinaryBinding *key_state_binding =
+      find_internal_binding_by_role(program, "state.kv.key");
+  const BinaryBinding *value_state_binding =
+      find_internal_binding_by_role(program, "state.kv.value");
+  if ((key_state_binding == nullptr) != (value_state_binding == nullptr))
+    throw std::logic_error(
+        "Qwen decoder binary must declare both K and V cache states");
+  const bool has_kv_state = key_state_binding != nullptr;
+  std::vector<ModelStateBindingRef> state_refs;
+
   ModelPackage package;
   package.model_name = "Qwen2.5-1.5B-layer0-seq32";
   package.architecture = "Qwen2ForCausalLM";
@@ -673,11 +765,11 @@ int main(int argc, char **argv) try {
       make_tensor(program, 5, "self_attn.o_proj.weight",
                   fixture / "output.i8.bin",
                   ModelTensorEncoding::SymmetricPerTensorI8, {scales[3]}),
-      make_tensor(program, 7, "mlp.gate_proj.weight", fixture / "gate.i8.bin",
+      make_tensor(program, 10, "mlp.gate_proj.weight", fixture / "gate.i8.bin",
                   ModelTensorEncoding::SymmetricPerTensorI8, {scales[4]}),
-      make_tensor(program, 8, "mlp.up_proj.weight", fixture / "up.i8.bin",
+      make_tensor(program, 11, "mlp.up_proj.weight", fixture / "up.i8.bin",
                   ModelTensorEncoding::SymmetricPerTensorI8, {scales[5]}),
-      make_tensor(program, 9, "mlp.down_proj.weight", fixture / "down.i8.bin",
+      make_tensor(program, 12, "mlp.down_proj.weight", fixture / "down.i8.bin",
                   ModelTensorEncoding::SymmetricPerTensorI8, {scales[6]}),
   };
   ModelWeightPage parameter_page;
@@ -688,8 +780,17 @@ int main(int argc, char **argv) try {
   append_packed_tensor(package, parameter_page, program, 1,
                        "input_layernorm.weight",
                        fixture / "input_layernorm.bf16.bin", next_stream);
+  append_packed_tensor(package, parameter_page, program, 6,
+                       "self_attn.q_proj.bias",
+                       fixture / "query_bias.bf16.bin", next_stream);
+  append_packed_tensor(package, parameter_page, program, 7,
+                       "self_attn.k_proj.bias",
+                       fixture / "key_bias.bf16.bin", next_stream);
+  append_packed_tensor(package, parameter_page, program, 8,
+                       "self_attn.v_proj.bias",
+                       fixture / "value_bias.bf16.bin", next_stream);
   append_packed_tensor(
-      package, parameter_page, program, 6, "post_attention_layernorm.weight",
+      package, parameter_page, program, 9, "post_attention_layernorm.weight",
       fixture / "post_attention_layernorm.bf16.bin", next_stream);
   package.weight_pages.push_back(std::move(parameter_page));
 
@@ -699,6 +800,28 @@ int main(int argc, char **argv) try {
       {"hidden.0", input.element_type, input.shape, true, false},
       {"hidden.1", output.element_type, output.shape, false, true},
   };
+  if (has_kv_state) {
+    if (key_state_binding->element_type != BindingElementType::BF16 ||
+        value_state_binding->element_type != BindingElementType::BF16 ||
+        key_state_binding->shape.size() != 3 ||
+        key_state_binding->shape != value_state_binding->shape ||
+        key_state_binding->shape.front() < 32)
+      throw std::logic_error("Qwen decoder has invalid BF16 KV cache bindings");
+    const auto capacity =
+        static_cast<std::uint32_t>(key_state_binding->shape.front());
+    package.states = {
+        {"layers.0.key_cache", ModelStateKind::KvKey,
+         key_state_binding->element_type, key_state_binding->shape, 0,
+         capacity},
+        {"layers.0.value_cache", ModelStateKind::KvValue,
+         value_state_binding->element_type, value_state_binding->shape, 0,
+         capacity},
+    };
+    state_refs = {
+        {key_state_binding->index, "layers.0.key_cache"},
+        {value_state_binding->index, "layers.0.value_cache"},
+    };
+  }
   package.executables.push_back({"decoder.layer0", std::move(program), {}});
   package.invocations.push_back(
       ModelInvocation{"decoder.layer0",
@@ -709,12 +832,15 @@ int main(int argc, char **argv) try {
                        {3, "self_attn.k_proj.weight"},
                        {4, "self_attn.v_proj.weight"},
                        {5, "self_attn.o_proj.weight"},
-                       {6, "post_attention_layernorm.weight"},
-                       {7, "mlp.gate_proj.weight"},
-                       {8, "mlp.up_proj.weight"},
-                       {9, "mlp.down_proj.weight"}},
+                       {6, "self_attn.q_proj.bias"},
+                       {7, "self_attn.k_proj.bias"},
+                       {8, "self_attn.v_proj.bias"},
+                       {9, "post_attention_layernorm.weight"},
+                       {10, "mlp.gate_proj.weight"},
+                       {11, "mlp.up_proj.weight"},
+                       {12, "mlp.down_proj.weight"}},
                       {{0, "hidden.1"}},
-                      {},
+                      std::move(state_refs),
                       0});
 
   ftlpu::C2cDmaSystem system;
@@ -735,6 +861,25 @@ int main(int argc, char **argv) try {
     session.enable_execution_trace();
   session.run();
 
+  std::vector<std::uint8_t> key_state;
+  std::vector<std::uint8_t> value_state;
+  if (has_kv_state) {
+    key_state = session.read_state("layers.0.key_cache");
+    value_state = session.read_state("layers.0.value_cache");
+    if (const char *dump_dir = std::getenv("FTLPU_QWEN_KV_DUMP_DIR")) {
+      const std::filesystem::path directory(dump_dir);
+      std::filesystem::create_directories(directory);
+      write_bytes(directory / "key_cache.actual.bf16.bin", key_state);
+      write_bytes(directory / "value_cache.actual.bf16.bin", value_state);
+    }
+    require_kv_state_matches(
+        "layers.0.key_cache", key_state,
+        read_bytes(fixture / "golden.key.bf16.bin"));
+    require_kv_state_matches(
+        "layers.0.value_cache", value_state,
+        read_bytes(fixture / "golden.value.bf16.bin"));
+  }
+
   if (trace_path != nullptr)
     session.write_execution_trace_csv(trace_path);
 
@@ -744,11 +889,12 @@ int main(int argc, char **argv) try {
         session.package().executables[0].program;
     const std::uint32_t binding_index =
         static_cast<std::uint32_t>(std::stoul(binding_text));
-    const std::array<const char *, 10> fixture_names = {
+    const std::array<const char *, 13> fixture_names = {
         "input.bf16.bin", "input_layernorm.bf16.bin", "query.i8.bin",
         "key.i8.bin", "value.i8.bin", "output.i8.bin",
-        "post_attention_layernorm.bf16.bin", "gate.i8.bin", "up.i8.bin",
-        "down.i8.bin"};
+        "query_bias.bf16.bin", "key_bias.bf16.bin",
+        "value_bias.bf16.bin", "post_attention_layernorm.bf16.bin",
+        "gate.i8.bin", "up.i8.bin", "down.i8.bin"};
     if (binding_index >= fixture_names.size())
       throw std::logic_error("invalid Qwen weight-page binding index");
     print_weight_page_residency_error(
@@ -762,7 +908,7 @@ int main(int argc, char **argv) try {
     const BinaryProgram &loaded_program =
         session.package().executables[0].program;
     const std::size_t weight_bank =
-        find_binding(loaded_program, BindingAccess::Input, 1).bank;
+        find_binding(loaded_program, BindingAccess::Input, 2).bank;
     const std::size_t scratch_bank =
         (weight_bank + 1) % loaded_program.hardware.banks_per_slice;
     const auto distributed_binding = std::find_if(
@@ -777,6 +923,28 @@ int main(int argc, char **argv) try {
       throw std::logic_error(
           "Qwen decoder has no distributed attention-stage binding");
     CModelRuntime observer(system.chip());
+    constexpr std::size_t kPrefillKvBytes = 32 * 2 * 128 * 2;
+    const auto state_prefix = [](const std::vector<std::uint8_t> &state) {
+      if (state.size() < kPrefillKvBytes)
+        throw std::logic_error("Qwen KV state is shorter than the prefill");
+      return std::vector<std::uint8_t>(
+          state.begin(),
+          state.begin() + static_cast<std::ptrdiff_t>(kPrefillKvBytes));
+    };
+    const auto capture_key = [&](bool east_only = false) {
+      return has_kv_state ? state_prefix(key_state)
+                          : download_key_stage(system.chip(), weight_bank,
+                                               east_only);
+    };
+    const auto capture_value = [&](bool source_hemisphere = false) {
+      return has_kv_state
+                 ? state_prefix(value_state)
+                 : download_value_stage(
+                       system.chip(),
+                       find_internal_binding_by_name(loaded_program,
+                                                     "attention.value"),
+                       source_hemisphere);
+    };
     const std::string stage_name(stage);
     if (stage_name == "all") {
       const auto capture = [&](const std::string &name,
@@ -793,8 +961,8 @@ int main(int argc, char **argv) try {
                     << " values=" << observed.size() / 2 << '\n';
       };
       capture("query", download_query_stage(system.chip(), scratch_bank));
-      capture("key", download_key_stage(system.chip(), weight_bank));
-      capture("value", download_value_stage(system.chip(), scratch_bank));
+      capture("key", capture_key());
+      capture("value", capture_value());
       capture("context", download_context_stage(
                              system.chip(), find_internal_binding_by_name(
                                                 loaded_program,
@@ -823,8 +991,8 @@ int main(int argc, char **argv) try {
     } else {
       const auto capture_qkv = [&]() {
         auto query = download_query_stage(system.chip(), scratch_bank);
-        auto key = download_key_stage(system.chip(), weight_bank);
-        auto value = download_value_stage(system.chip(), scratch_bank);
+        auto key = capture_key();
+        auto value = capture_value();
         query.insert(query.end(), key.begin(), key.end());
         query.insert(query.end(), value.begin(), value.end());
         return query;
@@ -877,11 +1045,9 @@ int main(int argc, char **argv) try {
                               ? download_ffn_projection_stage(
                                     system.chip(), true)
                           : stage_name == "value"
-                              ? download_value_stage(
-                                    system.chip(), scratch_bank)
+                              ? capture_value()
                           : stage_name == "value_source"
-                              ? download_value_stage(
-                                    system.chip(), scratch_bank, true)
+                              ? capture_value(true)
                           : stage_name == "context"
                               ? download_context_stage(
                                     system.chip(),
@@ -907,11 +1073,9 @@ int main(int argc, char **argv) try {
                               ? download_query_stage(
                                     system.chip(), scratch_bank)
                           : stage_name == "key"
-                              ? download_key_stage(
-                                    system.chip(), weight_bank)
+                              ? capture_key()
                           : stage_name == "key_east"
-                              ? download_key_stage(
-                                    system.chip(), weight_bank, true)
+                              ? capture_key(true)
                           : stage_name == "key_staging"
                               ? download_key_staging(system.chip())
                           : stage_name == "key_staging_east"
@@ -1059,6 +1223,14 @@ int main(int argc, char **argv) try {
         std::to_string(mismatches) +
         " fraction=" + std::to_string(mismatch_fraction));
 
+  if (has_kv_state) {
+    session.reset_states();
+    require_zero_state("layers.0.key_cache",
+                       session.read_state("layers.0.key_cache"));
+    require_zero_state("layers.0.value_cache",
+                       session.read_state("layers.0.value_cache"));
+  }
+
   const auto &stats = session.stats();
   std::cout << "Qwen2.5-1.5B layer0 real decoder passed: values=" << values
             << " pages="
@@ -1066,6 +1238,7 @@ int main(int argc, char **argv) try {
             << " cycles="
             << session.package().executables[0].program.max_cycle + 64
             << " resident_uploads=" << stats.resident_uploads
+            << " state_initializations=" << stats.state_initializations
             << " host_uploads=" << stats.host_uploads
             << " host_downloads=" << stats.host_downloads
             << " compiled_ddr_mbytes=" << compiled_ddr_bandwidth

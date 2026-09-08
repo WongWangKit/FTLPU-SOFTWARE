@@ -11,5 +11,8 @@ bool pagedWeightResidencyOverlaps(
     mlir::DictionaryAttr lhs, mlir::DictionaryAttr rhs);
 bool pagedWeightResidencyOverlaps(mlir::DictionaryAttr lhs, int64_t lhsBank,
     mlir::DictionaryAttr rhs, int64_t rhsBank);
+bool pagedWeightResidencyOverlaps(mlir::DictionaryAttr lhs, int64_t lhsPage,
+    int64_t lhsBank, mlir::DictionaryAttr rhs, int64_t rhsPage,
+    int64_t rhsBank);
 
 } // namespace ftlpu::compiler::schedule

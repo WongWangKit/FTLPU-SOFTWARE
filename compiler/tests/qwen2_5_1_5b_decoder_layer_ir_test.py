@@ -14,13 +14,15 @@ from pathlib import Path
 
 def lower(tool: Path, target: Path, source: Path, output: Path,
           pipeline: str, weight_bank: int | None,
-          mxm_execution: str) -> str:
+          mxm_execution: str, kv_cache_capacity: int) -> str:
     command = [
         str(tool), "--input", str(source), "--output", str(output),
         "--pipeline", pipeline, "--mxm-execution", mxm_execution,
         "--ffn-schedule", "tail", "--target-config", str(target),
         "--rmsnorm-strategy", "vxm-feedback",
     ]
+    if kv_cache_capacity:
+        command += ["--kv-cache-capacity", str(kv_cache_capacity)]
     if weight_bank is not None:
         command += ["--weight-bank", str(weight_bank)]
     subprocess.run(command, check=True)
@@ -202,6 +204,7 @@ def main() -> None:
     parser.add_argument("--mxm-execution", choices=("vector",),
                         default="vector")
     parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--kv-cache-capacity", type=int, default=0)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.input, args.output_dir / "decoder_layer.stablehlo.mlir")
@@ -213,16 +216,21 @@ def main() -> None:
         f"tensor<{args.seq_len}x12x128xbf16>",
         f"tensor<{args.seq_len}x2x128xbf16>", "dense<1.000000e+06>",
         "dense<1.000000e-06>", "stablehlo.compare GE",
+        "%query_bias: tensor<1536xbf16>",
+        "stablehlo.add %attention_query_2d",
+        "stablehlo.add %attention_key_2d",
+        "stablehlo.add %attention_value_2d",
     ), "StableHLO")
 
     kernel = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.kernel.mlir",
                    "ftlpu-stablehlo-to-kernel", args.weight_bank,
-                   args.mxm_execution)
+                   args.mxm_execution, args.kv_cache_capacity)
     require(kernel, (
         "ftlpu.kernel.rms_norm", "ftlpu.kernel.rope",
         "ftlpu.kernel.softmax", "ftlpu.kernel.batch_matmul",
-        "ftlpu.kernel.swish", "head_dim = 128 : i64",
+        "ftlpu.kernel.swish", "ftlpu.kernel.bias_add",
+        "head_dim = 128 : i64",
         "query_heads = 12 : i64", "kv_heads = 2 : i64",
         "theta = 1.000000e+06 : f32", "n = 8960 : i64",
     ), "Kernel")
@@ -230,12 +238,14 @@ def main() -> None:
     tensor = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.tensor.mlir",
                    "ftlpu-stablehlo-to-tensor", args.weight_bank,
-                   args.mxm_execution)
+                   args.mxm_execution, args.kv_cache_capacity)
     require(tensor, (
         "ftlpu.tensor.rms_norm_task", "ftlpu.tensor.projection_task",
         "ftlpu.tensor.rope_task", "ftlpu.tensor.softmax_task",
         "ftlpu.tensor.swish_task", 'kind = "w8a16_mxm_weight_striped"',
         'kind = "fp16_mxm_distributed_16"',
+        'query_bias = {', 'key_bias = {', 'value_bias = {',
+        'kind = "fp16_projection_bias_x4"',
     ), "Tensor")
     for line in tensor.splitlines():
         if "ftlpu.tensor.rms_norm_task" not in line:
@@ -255,19 +265,40 @@ def main() -> None:
     if args.weight_bank is not None:
         validate_paged_weights(tensor, args.target_config, args.weight_bank,
                                args.mxm_execution)
+    if args.kv_cache_capacity:
+        require(tensor, (
+            f"kv_cache_capacity = {args.kv_cache_capacity} : i64",
+            'kind = "fp16_head_planar"',
+            'kind = "fp16_value_x16"',
+        ), "KV-aware Tensor")
 
     stream = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.stream.mlir",
                    "ftlpu-stablehlo-to-stream", args.weight_bank,
-                   args.mxm_execution)
+                   args.mxm_execution, args.kv_cache_capacity)
     require(stream, (
         "ftlpu.stream.rms_norm_task", "ftlpu.stream.projection_task",
         "ftlpu.stream.rope_task", "ftlpu.stream.softmax_task",
         "ftlpu.stream.swish_task", "ftlpu.stream.batch_matmul_task",
         "head_dim = 128 : i64", "query_heads = 12 : i64",
         "kv_heads = 2 : i64", "rope_theta = 1.000000e+06 : f32",
-        "stream_count = 16 : i64",
+        "stream_count = 16 : i64", 'role = "query_bias"',
+        'role = "key_bias"', 'role = "value_bias"',
     ), "Stream")
+    value_projection = next(
+        line for line in stream.splitlines()
+        if "ftlpu.stream.projection_task" in line
+        and 'kind = "value"' in line
+    )
+    for marker in (
+            'role = "value_to_vxm", source = "MXM.result"',
+            'destination = "MEM", direction = "east"',
+            'role = "value_result", source = "VXM.result"'):
+        if marker not in value_projection:
+            raise AssertionError(
+                f"biased V projection route is missing {marker}: "
+                f"{value_projection}"
+            )
     for legacy in ("ftlpu.kernel.attention", "ftlpu.tensor.attention",
                    "ftlpu.stream.attention", "ftlpu.stream.ffn"):
         if legacy in stream:
