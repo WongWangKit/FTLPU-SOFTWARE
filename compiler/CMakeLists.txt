@@ -334,6 +334,7 @@ if(Python3_Interpreter_FOUND)
             --weight-bank 0
             --mxm-execution vector
             --seq-len 32
+            --kv-cache-capacity 256
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer)
     add_test(
         NAME qwen2_5_1_5b_decoder_layer_seq32_vector_weight_bank1_test
@@ -357,6 +358,7 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --weight-bank 1
+            --kv-cache-capacity 256
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer
         DEPENDS ftlpu_opt ftlpu_compile
         USES_TERMINAL)

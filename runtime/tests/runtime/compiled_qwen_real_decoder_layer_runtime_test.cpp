@@ -155,6 +155,17 @@ const BinaryBinding &find_internal_binding_by_name(
   return *binding;
 }
 
+const BinaryBinding *find_internal_binding_by_role(
+    const BinaryProgram &program, std::string_view role) {
+  const auto binding = std::find_if(
+      program.bindings.begin(), program.bindings.end(),
+      [&](const BinaryBinding &candidate) {
+        return candidate.access == BindingAccess::Internal &&
+               candidate.role == role;
+      });
+  return binding == program.bindings.end() ? nullptr : &*binding;
+}
+
 std::vector<std::uint8_t> download_swiglu_stage(
     CModelRuntime &runtime, const BinaryBinding &distributed_template) {
   BinaryBinding binding = distributed_template;
@@ -328,6 +339,65 @@ void print_stage_error(const std::string &label,
                 << " mae=" << block_absolute_error[block] / (32 * 32)
                 << " max_error=" << block_maximum_error[block] << '\n';
   }
+}
+
+void require_kv_state_matches(const std::string &label,
+                              const std::vector<std::uint8_t> &state,
+                              const std::vector<std::uint8_t> &expected) {
+  if (state.size() < expected.size() || expected.size() % 2 != 0)
+    throw std::logic_error(label + " state has an invalid byte size");
+
+  double absolute_error = 0.0;
+  float maximum_error = 0.0f;
+  std::size_t mismatches = 0;
+  for (std::size_t index = 0; index < expected.size() / 2; ++index) {
+    const float observed = bf16_at(state, index);
+    const float golden = bf16_at(expected, index);
+    if (!std::isfinite(observed) || !std::isfinite(golden))
+      throw std::logic_error(label + " state contains a non-finite value");
+    const float error = std::fabs(observed - golden);
+    absolute_error += error;
+    maximum_error = std::max(maximum_error, error);
+    if (error > 0.25f + 0.05f * std::fabs(golden)) {
+      if (mismatches < 8) {
+        constexpr std::size_t kKvHeads = 2;
+        constexpr std::size_t kHeadDim = 128;
+        const std::size_t token = index / (kKvHeads * kHeadDim);
+        const std::size_t head = (index / kHeadDim) % kKvHeads;
+        const std::size_t dimension = index % kHeadDim;
+        std::cout << "Qwen KV state mismatch: name=" << label
+                  << " token=" << token << " head=" << head
+                  << " dimension=" << dimension << " actual=" << observed
+                  << " golden=" << golden << " error=" << error << '\n';
+      }
+      ++mismatches;
+    }
+  }
+
+  const auto values = expected.size() / 2;
+  const double mismatch_fraction =
+      static_cast<double>(mismatches) / static_cast<double>(values);
+  const double mean_absolute_error =
+      absolute_error / static_cast<double>(values);
+  const std::size_t nonzero_tail = static_cast<std::size_t>(std::count_if(
+      state.begin() + static_cast<std::ptrdiff_t>(expected.size()), state.end(),
+      [](std::uint8_t byte) { return byte != 0; }));
+  std::cout << "Qwen KV state summary: name=" << label
+            << " values=" << values << " capacity_bytes=" << state.size()
+            << " mismatches=" << mismatches << " mae=" << mean_absolute_error
+            << " max_error=" << maximum_error
+            << " nonzero_tail_bytes=" << nonzero_tail << '\n';
+  if (mismatch_fraction > 0.001 || mean_absolute_error > 0.075 ||
+      maximum_error > 32.0f || nonzero_tail != 0)
+    throw std::logic_error(label + " persistent KV state mismatch");
+}
+
+void require_zero_state(const std::string &label,
+                        const std::vector<std::uint8_t> &state) {
+  const auto nonzero = std::count_if(
+      state.begin(), state.end(), [](std::uint8_t byte) { return byte != 0; });
+  if (nonzero != 0)
+    throw std::logic_error(label + " state was not cleared");
 }
 
 std::vector<std::uint8_t> download_value_stage(
@@ -670,6 +740,16 @@ int main(int argc, char **argv) try {
         "Qwen decoder binary has no intra-executable weight pages");
   const auto scales = read_quant_scales(fixture);
 
+  const BinaryBinding *key_state_binding =
+      find_internal_binding_by_role(program, "state.kv.key");
+  const BinaryBinding *value_state_binding =
+      find_internal_binding_by_role(program, "state.kv.value");
+  if ((key_state_binding == nullptr) != (value_state_binding == nullptr))
+    throw std::logic_error(
+        "Qwen decoder binary must declare both K and V cache states");
+  const bool has_kv_state = key_state_binding != nullptr;
+  std::vector<ModelStateBindingRef> state_refs;
+
   ModelPackage package;
   package.model_name = "Qwen2.5-1.5B-layer0-seq32";
   package.architecture = "Qwen2ForCausalLM";
@@ -720,6 +800,28 @@ int main(int argc, char **argv) try {
       {"hidden.0", input.element_type, input.shape, true, false},
       {"hidden.1", output.element_type, output.shape, false, true},
   };
+  if (has_kv_state) {
+    if (key_state_binding->element_type != BindingElementType::BF16 ||
+        value_state_binding->element_type != BindingElementType::BF16 ||
+        key_state_binding->shape.size() != 3 ||
+        key_state_binding->shape != value_state_binding->shape ||
+        key_state_binding->shape.front() < 32)
+      throw std::logic_error("Qwen decoder has invalid BF16 KV cache bindings");
+    const auto capacity =
+        static_cast<std::uint32_t>(key_state_binding->shape.front());
+    package.states = {
+        {"layers.0.key_cache", ModelStateKind::KvKey,
+         key_state_binding->element_type, key_state_binding->shape, 0,
+         capacity},
+        {"layers.0.value_cache", ModelStateKind::KvValue,
+         value_state_binding->element_type, value_state_binding->shape, 0,
+         capacity},
+    };
+    state_refs = {
+        {key_state_binding->index, "layers.0.key_cache"},
+        {value_state_binding->index, "layers.0.value_cache"},
+    };
+  }
   package.executables.push_back({"decoder.layer0", std::move(program), {}});
   package.invocations.push_back(
       ModelInvocation{"decoder.layer0",
@@ -738,7 +840,7 @@ int main(int argc, char **argv) try {
                        {11, "mlp.up_proj.weight"},
                        {12, "mlp.down_proj.weight"}},
                       {{0, "hidden.1"}},
-                      {},
+                      std::move(state_refs),
                       0});
 
   ftlpu::C2cDmaSystem system;
@@ -758,6 +860,25 @@ int main(int argc, char **argv) try {
   if (trace_path != nullptr)
     session.enable_execution_trace();
   session.run();
+
+  std::vector<std::uint8_t> key_state;
+  std::vector<std::uint8_t> value_state;
+  if (has_kv_state) {
+    key_state = session.read_state("layers.0.key_cache");
+    value_state = session.read_state("layers.0.value_cache");
+    if (const char *dump_dir = std::getenv("FTLPU_QWEN_KV_DUMP_DIR")) {
+      const std::filesystem::path directory(dump_dir);
+      std::filesystem::create_directories(directory);
+      write_bytes(directory / "key_cache.actual.bf16.bin", key_state);
+      write_bytes(directory / "value_cache.actual.bf16.bin", value_state);
+    }
+    require_kv_state_matches(
+        "layers.0.key_cache", key_state,
+        read_bytes(fixture / "golden.key.bf16.bin"));
+    require_kv_state_matches(
+        "layers.0.value_cache", value_state,
+        read_bytes(fixture / "golden.value.bf16.bin"));
+  }
 
   if (trace_path != nullptr)
     session.write_execution_trace_csv(trace_path);
@@ -802,10 +923,30 @@ int main(int argc, char **argv) try {
       throw std::logic_error(
           "Qwen decoder has no distributed attention-stage binding");
     CModelRuntime observer(system.chip());
+    constexpr std::size_t kPrefillKvBytes = 32 * 2 * 128 * 2;
+    const auto state_prefix = [](const std::vector<std::uint8_t> &state) {
+      if (state.size() < kPrefillKvBytes)
+        throw std::logic_error("Qwen KV state is shorter than the prefill");
+      return std::vector<std::uint8_t>(
+          state.begin(),
+          state.begin() + static_cast<std::ptrdiff_t>(kPrefillKvBytes));
+    };
+    const auto capture_key = [&](bool east_only = false) {
+      return has_kv_state ? state_prefix(key_state)
+                          : download_key_stage(system.chip(), weight_bank,
+                                               east_only);
+    };
+    const auto capture_value = [&](bool source_hemisphere = false) {
+      return has_kv_state
+                 ? state_prefix(value_state)
+                 : download_value_stage(
+                       system.chip(),
+                       find_internal_binding_by_name(loaded_program,
+                                                     "attention.value"),
+                       source_hemisphere);
+    };
     const std::string stage_name(stage);
     if (stage_name == "all") {
-      const BinaryBinding &value_binding =
-          find_internal_binding_by_name(loaded_program, "attention.value");
       const auto capture = [&](const std::string &name,
                                std::vector<std::uint8_t> observed,
                                bool compare = true) {
@@ -820,8 +961,8 @@ int main(int argc, char **argv) try {
                     << " values=" << observed.size() / 2 << '\n';
       };
       capture("query", download_query_stage(system.chip(), scratch_bank));
-      capture("key", download_key_stage(system.chip(), weight_bank));
-      capture("value", download_value_stage(system.chip(), value_binding));
+      capture("key", capture_key());
+      capture("value", capture_value());
       capture("context", download_context_stage(
                              system.chip(), find_internal_binding_by_name(
                                                 loaded_program,
@@ -849,11 +990,9 @@ int main(int argc, char **argv) try {
                   {16, 17, 18, 19})));
     } else {
       const auto capture_qkv = [&]() {
-        const BinaryBinding &value_binding =
-            find_internal_binding_by_name(loaded_program, "attention.value");
         auto query = download_query_stage(system.chip(), scratch_bank);
-        auto key = download_key_stage(system.chip(), weight_bank);
-        auto value = download_value_stage(system.chip(), value_binding);
+        auto key = capture_key();
+        auto value = capture_value();
         query.insert(query.end(), key.begin(), key.end());
         query.insert(query.end(), value.begin(), value.end());
         return query;
@@ -906,16 +1045,9 @@ int main(int argc, char **argv) try {
                               ? download_ffn_projection_stage(
                                     system.chip(), true)
                           : stage_name == "value"
-                              ? download_value_stage(
-                                    system.chip(), find_internal_binding_by_name(
-                                                       loaded_program,
-                                                       "attention.value"))
+                              ? capture_value()
                           : stage_name == "value_source"
-                              ? download_value_stage(
-                                    system.chip(), find_internal_binding_by_name(
-                                                       loaded_program,
-                                                       "attention.value"),
-                                    true)
+                              ? capture_value(true)
                           : stage_name == "context"
                               ? download_context_stage(
                                     system.chip(),
@@ -941,11 +1073,9 @@ int main(int argc, char **argv) try {
                               ? download_query_stage(
                                     system.chip(), scratch_bank)
                           : stage_name == "key"
-                              ? download_key_stage(
-                                    system.chip(), weight_bank)
+                              ? capture_key()
                           : stage_name == "key_east"
-                              ? download_key_stage(
-                                    system.chip(), weight_bank, true)
+                              ? capture_key(true)
                           : stage_name == "key_staging"
                               ? download_key_staging(system.chip())
                           : stage_name == "key_staging_east"
@@ -1093,6 +1223,14 @@ int main(int argc, char **argv) try {
         std::to_string(mismatches) +
         " fraction=" + std::to_string(mismatch_fraction));
 
+  if (has_kv_state) {
+    session.reset_states();
+    require_zero_state("layers.0.key_cache",
+                       session.read_state("layers.0.key_cache"));
+    require_zero_state("layers.0.value_cache",
+                       session.read_state("layers.0.value_cache"));
+  }
+
   const auto &stats = session.stats();
   std::cout << "Qwen2.5-1.5B layer0 real decoder passed: values=" << values
             << " pages="
@@ -1100,6 +1238,7 @@ int main(int argc, char **argv) try {
             << " cycles="
             << session.package().executables[0].program.max_cycle + 64
             << " resident_uploads=" << stats.resident_uploads
+            << " state_initializations=" << stats.state_initializations
             << " host_uploads=" << stats.host_uploads
             << " host_downloads=" << stats.host_downloads
             << " compiled_ddr_mbytes=" << compiled_ddr_bandwidth

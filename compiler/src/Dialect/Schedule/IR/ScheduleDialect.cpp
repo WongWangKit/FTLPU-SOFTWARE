@@ -548,6 +548,15 @@ LogicalResult MemTransferOp::verify()
         && getOpcode() != "write_tap" && getOpcode() != "accumulate")
         return emitOpError(
             "opcode must be read, write, write_tap, or accumulate");
+    if (getAddressBindingAccess()
+        && !getAddressBinding())
+        return emitOpError(
+            "address_binding_access requires address_binding");
+    if (getAddressBindingAccess()
+        && *getAddressBindingAccess() != "input"
+        && *getAddressBindingAccess() != "internal")
+        return emitOpError(
+            "address_binding_access must be input or internal");
     return success();
 }
 

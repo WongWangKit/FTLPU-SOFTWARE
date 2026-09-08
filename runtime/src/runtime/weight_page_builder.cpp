@@ -175,6 +175,124 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
     const std::uint32_t stride =
         static_cast<std::uint32_t>(binding.address_stride);
 
+    if (binding.layout == BindingLayout::Fp16HeadPlanar
+        && (binding.element_type == BindingElementType::F16
+            || binding.element_type == BindingElementType::BF16)
+        && binding.shape.size() == 3 && binding.slices.size() == 4) {
+        const std::size_t tokens = checked_dimension(binding, 0);
+        const std::size_t heads = checked_dimension(binding, 1);
+        const std::size_t headDim = checked_dimension(binding, 2);
+        const std::size_t blockColumns = hardware.bytes_per_word;
+        const std::size_t tokenRows = hardware.mxm_rows;
+        if (blockColumns == 0 || tokenRows == 0
+            || tokens % tokenRows || headDim % blockColumns
+            || hardware.hemispheres == 0)
+            throw std::invalid_argument(
+                "KV Key cache must have tile-aligned token/head dimensions");
+        const std::size_t headBlocks = headDim / blockColumns;
+        const std::size_t blocksPerHalf =
+            std::max<std::size_t>(1, headBlocks / 2);
+        if (headBlocks > 2 * blocksPerHalf)
+            throw std::invalid_argument(
+                "KV Key cache supports at most two rotary slice groups");
+        const bool replicated = binding.role == "state.kv.key";
+        for (std::size_t token = 0; token < tokens; ++token)
+            for (std::size_t head = 0; head < heads; ++head)
+                for (std::uint16_t hemisphere = 0;
+                     hemisphere < hardware.hemispheres; ++hemisphere) {
+                    const auto owner = static_cast<std::uint16_t>(
+                        head % hardware.hemispheres);
+                    if (!replicated && hemisphere != owner) continue;
+                    if ((binding.hemisphere_mask & (1u << hemisphere)) == 0) {
+                        if (hemisphere == owner)
+                            throw std::invalid_argument(
+                                "KV Key cache head maps to a disabled hemisphere");
+                        continue;
+                    }
+                    for (std::size_t dimension = 0;
+                         dimension < headDim; ++dimension) {
+                        const std::size_t block = dimension / blockColumns;
+                        const std::size_t group = block / blocksPerHalf;
+                        const std::size_t within = block % blocksPerHalf;
+                        const std::uint32_t address = base
+                            + static_cast<std::uint32_t>(
+                                (head * blocksPerHalf + within) * tokens
+                                + token) * stride;
+                        const std::size_t offset =
+                            ((token * heads + head) * headDim + dimension) * 2;
+                        image.write(hemisphere, binding.slices[group * 2],
+                            address,
+                            static_cast<std::uint32_t>(
+                                dimension % blockColumns),
+                            data[offset]);
+                        image.write(hemisphere,
+                            binding.slices[group * 2 + 1], address,
+                            static_cast<std::uint32_t>(
+                                dimension % blockColumns),
+                            data[offset + 1]);
+                    }
+                }
+        return image.finish();
+    }
+
+    if (binding.layout == BindingLayout::Fp16ValueX16
+        && (binding.element_type == BindingElementType::F16
+            || binding.element_type == BindingElementType::BF16)
+        && binding.shape.size() == 3
+        && (binding.slices.size() == 16 || binding.slices.size() == 32)) {
+        const std::size_t tokens = checked_dimension(binding, 0);
+        const std::size_t heads = checked_dimension(binding, 1);
+        const std::size_t headDim = checked_dimension(binding, 2);
+        const std::size_t blockColumns = hardware.bytes_per_word;
+        const std::size_t tokenRows = hardware.mxm_rows;
+        const std::size_t tileRows = hardware.tile_rows;
+        const std::size_t lanesPerTile = hardware.lanes_per_tile;
+        const std::size_t slicesPerGroup = 2 * lanesPerTile;
+        if (blockColumns == 0 || tokenRows == 0 || tileRows == 0
+            || lanesPerTile == 0 || tokenRows != tileRows * lanesPerTile
+            || tokens % tokenRows || headDim % blockColumns
+            || slicesPerGroup == 0
+            || binding.slices.size() % slicesPerGroup != 0
+            || hardware.hemispheres == 0)
+            throw std::invalid_argument(
+                "KV Value cache must have tile-aligned token/head dimensions");
+        const std::size_t headBlocks = headDim / blockColumns;
+        const std::size_t tokenBlocks = tokens / tokenRows;
+        const std::size_t sliceGroups =
+            binding.slices.size() / slicesPerGroup;
+        for (std::size_t token = 0; token < tokens; ++token)
+            for (std::size_t head = 0; head < heads; ++head) {
+                const auto hemisphere = static_cast<std::uint16_t>(
+                    head % hardware.hemispheres);
+                if ((binding.hemisphere_mask & (1u << hemisphere)) == 0)
+                    throw std::invalid_argument(
+                        "KV Value cache head maps to a disabled hemisphere");
+                for (std::size_t dimension = 0;
+                     dimension < headDim; ++dimension) {
+                    const std::size_t block = dimension / blockColumns;
+                    const std::size_t group = block % sliceGroups;
+                    const std::uint32_t address = base
+                        + static_cast<std::uint32_t>(
+                            ((head * headBlocks + block) * tokenBlocks
+                                + token / tokenRows) * tileRows
+                            + (token % tokenRows) / lanesPerTile) * stride;
+                    const std::size_t sliceBase = group * slicesPerGroup
+                        + 2 * (token % lanesPerTile);
+                    const std::size_t offset =
+                        ((token * heads + head) * headDim + dimension) * 2;
+                    image.write(hemisphere, binding.slices[sliceBase],
+                        address, static_cast<std::uint32_t>(
+                                     dimension % blockColumns),
+                        data[offset]);
+                    image.write(hemisphere, binding.slices[sliceBase + 1],
+                        address, static_cast<std::uint32_t>(
+                                     dimension % blockColumns),
+                        data[offset + 1]);
+                }
+            }
+        return image.finish();
+    }
+
     if ((binding.layout == BindingLayout::Fp16MxmDistributed16
             || binding.layout
                 == BindingLayout::Fp16MxmBlock8Distributed16)
@@ -482,7 +600,8 @@ std::vector<std::uint8_t> unpack_binding_image(
     const BinaryBinding& binding, const PackedWeightImage& image,
     const ExecutableHardwareConfig& hardware)
 {
-    if (binding.base_row < 0 || binding.shape.size() != 2
+    if (binding.base_row < 0
+        || (binding.shape.size() != 2 && binding.shape.size() != 3)
         || binding.slices.empty()
         || hardware.bytes_per_word != hw::kPhysicalVectorBytes)
         throw std::invalid_argument(
@@ -513,6 +632,114 @@ std::vector<std::uint8_t> unpack_binding_image(
 
     const std::size_t rows = checked_dimension(binding, 0);
     const std::size_t columns = checked_dimension(binding, 1);
+    if (binding.layout == BindingLayout::Fp16HeadPlanar
+        && (binding.element_type == BindingElementType::F16
+            || binding.element_type == BindingElementType::BF16)
+        && binding.shape.size() == 3 && binding.slices.size() == 4) {
+        const std::size_t tokens = checked_dimension(binding, 0);
+        const std::size_t heads = checked_dimension(binding, 1);
+        const std::size_t headDim = checked_dimension(binding, 2);
+        const std::size_t blockColumns = hardware.bytes_per_word;
+        const std::size_t tokenRows = hardware.mxm_rows;
+        if (blockColumns == 0 || tokenRows == 0
+            || tokens % tokenRows || headDim % blockColumns
+            || hardware.hemispheres == 0)
+            throw std::invalid_argument(
+                "KV Key cache must have tile-aligned token/head dimensions");
+        const std::size_t headBlocks = headDim / blockColumns;
+        const std::size_t blocksPerHalf =
+            std::max<std::size_t>(1, headBlocks / 2);
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        for (std::size_t token = 0; token < tokens; ++token)
+            for (std::size_t head = 0; head < heads; ++head) {
+                const auto hemisphere = static_cast<std::uint16_t>(
+                    head % hardware.hemispheres);
+                for (std::size_t dimension = 0;
+                     dimension < headDim; ++dimension) {
+                    const std::size_t block = dimension / blockColumns;
+                    const std::size_t group = block / blocksPerHalf;
+                    const std::size_t within = block % blocksPerHalf;
+                    const std::uint32_t address =
+                        static_cast<std::uint32_t>(binding.base_row)
+                        + static_cast<std::uint32_t>(
+                            (head * blocksPerHalf + within) * tokens
+                            + token) * static_cast<std::uint32_t>(
+                                binding.address_stride);
+                    const std::size_t offset =
+                        ((token * heads + head) * headDim + dimension) * 2;
+                    result[offset] = read(hemisphere,
+                        binding.slices[group * 2], address,
+                        static_cast<std::uint32_t>(
+                            dimension % blockColumns));
+                    result[offset + 1] = read(hemisphere,
+                        binding.slices[group * 2 + 1], address,
+                        static_cast<std::uint32_t>(
+                            dimension % blockColumns));
+                }
+            }
+        return result;
+    }
+
+    if (binding.layout == BindingLayout::Fp16ValueX16
+        && (binding.element_type == BindingElementType::F16
+            || binding.element_type == BindingElementType::BF16)
+        && binding.shape.size() == 3
+        && (binding.slices.size() == 16 || binding.slices.size() == 32)) {
+        const std::size_t tokens = checked_dimension(binding, 0);
+        const std::size_t heads = checked_dimension(binding, 1);
+        const std::size_t headDim = checked_dimension(binding, 2);
+        const std::size_t blockColumns = hardware.bytes_per_word;
+        const std::size_t tokenRows = hardware.mxm_rows;
+        const std::size_t tileRows = hardware.tile_rows;
+        const std::size_t lanesPerTile = hardware.lanes_per_tile;
+        const std::size_t slicesPerGroup = 2 * lanesPerTile;
+        if (blockColumns == 0 || tokenRows == 0 || tileRows == 0
+            || lanesPerTile == 0 || tokenRows != tileRows * lanesPerTile
+            || tokens % tokenRows || headDim % blockColumns
+            || slicesPerGroup == 0
+            || binding.slices.size() % slicesPerGroup != 0
+            || hardware.hemispheres == 0)
+            throw std::invalid_argument(
+                "KV Value cache must have tile-aligned token/head dimensions");
+        const std::size_t headBlocks = headDim / blockColumns;
+        const std::size_t tokenBlocks = tokens / tokenRows;
+        const std::size_t sliceGroups =
+            binding.slices.size() / slicesPerGroup;
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        for (std::size_t token = 0; token < tokens; ++token)
+            for (std::size_t head = 0; head < heads; ++head) {
+                const auto hemisphere = static_cast<std::uint16_t>(
+                    head % hardware.hemispheres);
+                for (std::size_t dimension = 0;
+                     dimension < headDim; ++dimension) {
+                    const std::size_t block = dimension / blockColumns;
+                    const std::size_t group = block % sliceGroups;
+                    const std::uint32_t address =
+                        static_cast<std::uint32_t>(binding.base_row)
+                        + static_cast<std::uint32_t>(
+                            ((head * headBlocks + block) * tokenBlocks
+                                + token / tokenRows) * tileRows
+                            + (token % tokenRows) / lanesPerTile)
+                            * static_cast<std::uint32_t>(
+                                binding.address_stride);
+                    const std::size_t sliceBase = group * slicesPerGroup
+                        + 2 * (token % lanesPerTile);
+                    const std::size_t offset =
+                        ((token * heads + head) * headDim + dimension) * 2;
+                    result[offset] = read(hemisphere,
+                        binding.slices[sliceBase], address,
+                        static_cast<std::uint32_t>(
+                            dimension % blockColumns));
+                    result[offset + 1] = read(hemisphere,
+                        binding.slices[sliceBase + 1], address,
+                        static_cast<std::uint32_t>(
+                            dimension % blockColumns));
+                }
+            }
+        return result;
+    }
     if ((binding.layout == BindingLayout::Fp16MxmDistributed16
             || binding.layout
                 == BindingLayout::Fp16MxmBlock8Distributed16)

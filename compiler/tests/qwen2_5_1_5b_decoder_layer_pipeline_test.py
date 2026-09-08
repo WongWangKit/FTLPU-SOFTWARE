@@ -48,6 +48,7 @@ def main() -> None:
     parser.add_argument("--ffn-schedule", choices=("tail", "fused"),
                         default="fused")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--kv-cache-capacity", type=int, default=0)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -66,6 +67,8 @@ def main() -> None:
         "--rmsnorm-strategy", "vxm-feedback",
         "--icu-macro-schedule",
     ]
+    if args.kv_cache_capacity:
+        common += ["--kv-cache-capacity", str(args.kv_cache_capacity)]
     run([
         str(args.opt), "--input", str(stablehlo), "--output", str(stream),
         "--pipeline", "ftlpu-stablehlo-to-stream", *common,
@@ -97,7 +100,9 @@ def main() -> None:
     qk_bias_high_fma = False
     value_bias_add = False
     bias_bindings: set[str] = set()
-    workspace_ready_cycles: dict[str, int] = {}
+    binding_ready_cycles: dict[str, int] = {}
+    state_bindings: dict[str, tuple[str, int]] = {}
+    internal_address_bindings: set[int] = set()
     mxm_compute_intervals: list[tuple[int, int]] = []
     streaming_bf16_compute_intervals: list[tuple[int, int]] = []
     accumulator_read_intervals: list[tuple[int, int]] = []
@@ -178,13 +183,17 @@ def main() -> None:
                     name = re.search(r'name = "([^"]+)"', line)
                     if name:
                         bias_bindings.add(name.group(1))
-                if 'role = "workspace"' in line:
-                    name = re.search(r'name = "([^"]+)"', line)
-                    ready = re.search(r'ready_cycle = (\d+) : i64', line)
-                    if name and ready:
-                        workspace_ready_cycles[name.group(1)] = int(
-                            ready.group(1)
-                        )
+                name = re.search(r'name = "([^"]+)"', line)
+                ready = re.search(r'ready_cycle = (\d+) : i64', line)
+                if name and ready:
+                    binding_ready_cycles[name.group(1)] = int(
+                        ready.group(1)
+                    )
+                state_role = re.search(r'role = "(state\.kv\.[^"]+)"', line)
+                if name and state_role:
+                    state_bindings[name.group(1)] = (
+                        state_role.group(1), integer_attr(line, "index")
+                    )
                 slices_match = re.search(r"slices = \[([^\]]+)\]", line)
                 if slices_match:
                     name_match = re.search(r'name = "([^"]+)"', line)
@@ -205,6 +214,11 @@ def main() -> None:
                             and 'initializer = "none"' not in line
                             and "initializer =" in line):
                         initialized_allocations.append(allocation)
+            if ('ftlpu.schedule.mem_transfer' in line
+                    and 'address_binding_access = "internal"' in line):
+                internal_address_bindings.add(
+                    integer_attr(line, "address_binding")
+                )
             if ('ftlpu.schedule.timeline' in line
                     and 'name = "qkv"' in line):
                 qkv_interval = (
@@ -350,11 +364,28 @@ def main() -> None:
             f"Schedule IR has incomplete projection bias bindings: {bias_bindings}"
         )
     expected_ready_cycles = {
-        "attention.value": rope_interval[1],
+        ("attention.value_cache" if args.kv_cache_capacity
+         else "attention.value"): rope_interval[1],
         "attention.context": pv_interval[1],
     }
+    if args.kv_cache_capacity:
+        expected_ready_cycles["attention.key_cache"] = rope_interval[1]
+        expected_states = {
+            "attention.key_cache": ("state.kv.key", 65536),
+            "attention.value_cache": ("state.kv.value", 65537),
+        }
+        if state_bindings != expected_states:
+            raise AssertionError(
+                "Schedule IR has incorrect KV state bindings: "
+                f"observed={state_bindings}, expected={expected_states}"
+            )
+        if not {65536, 65537}.issubset(internal_address_bindings):
+            raise AssertionError(
+                "Schedule IR does not relocate both persistent KV states: "
+                f"{sorted(internal_address_bindings)}"
+            )
     for name, expected in expected_ready_cycles.items():
-        observed = workspace_ready_cycles.get(name)
+        observed = binding_ready_cycles.get(name)
         if observed != expected:
             raise AssertionError(
                 f"{name} readiness is not on the global schedule timeline: "
@@ -424,6 +455,8 @@ def main() -> None:
         "--mxm-execution", "vector",
         "--weight-bank", str(args.weight_bank),
         "--icu-macro-schedule",
+        *(["--kv-cache-capacity", str(args.kv_cache_capacity)]
+          if args.kv_cache_capacity else []),
     ], "compressed-schedule-to-binary")
     if binary.stat().st_size < 64:
         raise AssertionError("Qwen decoder-layer binary is unexpectedly small")

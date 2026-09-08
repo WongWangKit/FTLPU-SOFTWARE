@@ -105,6 +105,81 @@ void run_overlap_hazard_test()
             "session did not defer an overlapping next-bank weight page");
 }
 
+void run_resident_then_page_test()
+{
+    BinaryProgram program = make_program(0);
+    BinaryBinding bias;
+    bias.index = 1;
+    bias.access = BindingAccess::Input;
+    bias.element_type = BindingElementType::I8;
+    bias.layout = BindingLayout::Vector;
+    bias.byte_size = hw::kPhysicalVectorBytes;
+    bias.base_row = hw::kSramDepthRows - 1;
+    bias.instruction_count = 1;
+    bias.address_stride = 1;
+    bias.shape = {hw::kPhysicalVectorBytes};
+    bias.slices = {17};
+    bias.role = "bias";
+    bias.name = "bias.resident";
+    bias.hemisphere_mask = 2;
+    bias.bank = 0;
+    program.bindings.push_back(std::move(bias));
+
+    const auto weight = page_bytes(0x20);
+    const auto resident = page_bytes(0xa0);
+    ModelPackage package;
+    package.model_name = "resident-then-c2c-page";
+    package.architecture = "Qwen2ForCausalLM";
+    package.executables = {{"layer.bank0", std::move(program), {}}};
+    package.tensors.push_back(ModelTensor {
+        "layers.0.weights.packed", BindingElementType::I8,
+        {hw::kPhysicalVectorBytes}, weight,
+        ModelTensorEncoding::TargetPackedSramVectors});
+    package.tensors.push_back(ModelTensor {
+        "layers.0.bias", BindingElementType::I8,
+        {hw::kPhysicalVectorBytes}, resident});
+    ModelWeightPage page;
+    page.layer = 0;
+    page.bank = 0;
+    page.tensors = {"layers.0.weights.packed"};
+    page.segments.push_back(ModelWeightPage::Segment {
+        "layers.0.weights.packed", 0, 1, 16, 10, 1, 5});
+    package.weight_pages.push_back(std::move(page));
+    package.invocations.push_back(ModelInvocation {
+        "layers.0", 0,
+        {{0, "layers.0.weights.packed"}, {1, "layers.0.bias"}},
+        {}, {}, 0});
+
+    auto system = std::make_unique<C2cDmaSystem>(
+        Ddr4Config {32, 2, 2, 256, 8});
+    ModelSession session(*system);
+    session.load(std::move(package));
+    if (session.stats().resident_uploads != 1)
+        throw std::runtime_error("resident bias was not uploaded");
+    session.run_invocation(0, 0);
+    if (session.stats().weight_page_prefetches != 1)
+        throw std::runtime_error("weight page was not loaded after resident data");
+
+    for (std::size_t byte = 0; byte < weight.size(); ++byte) {
+        const auto actual = system->chip().read_mem_sram_lane_byte(
+            Hemisphere::West, 16, 0,
+            byte / hw::kLanesPerTile, 10,
+            byte % hw::kLanesPerTile);
+        if (actual != weight[byte])
+            throw std::runtime_error(
+                "weight page was corrupted after resident upload");
+    }
+    for (std::size_t byte = 0; byte < resident.size(); ++byte) {
+        const auto actual = system->chip().read_mem_sram_lane_byte(
+            Hemisphere::West, 17, 0,
+            byte / hw::kLanesPerTile, hw::kSramDepthRows - 1,
+            byte % hw::kLanesPerTile);
+        if (actual != resident[byte])
+            throw std::runtime_error(
+                "resident data did not survive the ICU execution reset");
+    }
+}
+
 } // namespace
 
 int main()
@@ -210,6 +285,7 @@ try {
         throw std::runtime_error(
             "C2C pages were also allocated as resident weights");
     run_overlap_hazard_test();
+    run_resident_then_page_test();
     std::cout << "model_session_c2c_weight_pages_test passed"
               << " prefetches="
               << session.stats().weight_page_prefetches

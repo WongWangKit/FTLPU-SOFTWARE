@@ -35,6 +35,7 @@ bool same_mem_body(
         && lhs.getSlice() == rhs.getSlice()
         && lhs.getBank().value_or(0) == rhs.getBank().value_or(0)
         && lhs.getAddressBinding() == rhs.getAddressBinding()
+        && lhs.getAddressBindingAccess() == rhs.getAddressBindingAccess()
         && lhs.getWeightPage() == rhs.getWeightPage()
         && lhs.getLogicalBaseRow() == rhs.getLogicalBaseRow()
         && lhs.getOpcode() == rhs.getOpcode()
@@ -279,9 +280,14 @@ public:
                     lhs.getAddressBinding().value_or(-1);
                 const int64_t rhsBinding =
                     rhs.getAddressBinding().value_or(-1);
-                return lhsBinding != rhsBinding
-                    ? lhsBinding < rhsBinding
-                    : lhs.getCycle() < rhs.getCycle();
+                if (lhsBinding != rhsBinding)
+                    return lhsBinding < rhsBinding;
+                const auto lhsAccess = lhs.getAddressBindingAccess();
+                const auto rhsAccess = rhs.getAddressBindingAccess();
+                if (lhsAccess != rhsAccess)
+                    return lhsAccess.value_or("")
+                        < rhsAccess.value_or("");
+                return lhs.getCycle() < rhs.getCycle();
                 });
 
             llvm::SmallVector<schedule::MemTransferOp> toErase;

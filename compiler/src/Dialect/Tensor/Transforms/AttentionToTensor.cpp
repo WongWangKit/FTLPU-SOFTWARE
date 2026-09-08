@@ -26,6 +26,25 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t block_rows = target.throughput().mxm_block_rows;
     const int64_t blocks = seq_len / tile;
+    int64_t kv_cache_capacity = 0;
+    if (const auto module = op->getParentOfType<mlir::ModuleOp>())
+        if (const auto capacity = module->getAttrOfType<mlir::IntegerAttr>(
+                "ftlpu.kv_cache_capacity"))
+            kv_cache_capacity = capacity.getInt();
+    if (kv_cache_capacity != 0
+        && (kv_cache_capacity < seq_len || kv_cache_capacity % tile != 0)) {
+        op.emitError(
+            "KV cache capacity must be zero or a tile-aligned value no "
+            "smaller than seq_len");
+        return mlir::failure();
+    }
+    const bool kv_cache_enabled = kv_cache_capacity != 0;
+    const int64_t kv_storage_tokens = kv_cache_enabled
+        ? kv_cache_capacity : seq_len;
+    // Projection and attention routing use the global KV-head index in each
+    // participating hemisphere. Preserve that stride in persistent storage;
+    // K is replicated and V is copied to its owning hemisphere by Schedule.
+    const int64_t kv_storage_heads = kv_heads;
     const int64_t query_width = query_heads * head_dim;
     const int64_t kv_width = kv_heads * head_dim;
     const mlir::Value query_bias =
@@ -127,6 +146,10 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         && target.memory().hemispheres == 2
         && head_blocks == 4;
     const int64_t logical_head_banks = (head_blocks + 1) / 2;
+    const int64_t key_rows =
+        kv_storage_heads * logical_head_banks * kv_storage_tokens;
+    const int64_t value_rows = kv_storage_heads * head_blocks
+        * (kv_storage_tokens / tile) * target.throughput().tile_rows;
     const int64_t query_rows = query_heads * logical_head_banks * blocks
         * target.throughput().tile_rows;
     const int64_t rope_frequency_blocks = head_dim / (2 * tile);
@@ -191,9 +214,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         query_base + query_rows, rope_product_base + rope_product_rows);
     const int64_t causal_mask_base = target.uses_dedicated_slice_roles()
         ? rope_rows : target.attention_mask_base_row();
-    if (value_base
-            + kv_heads * (head_dim / tile) * blocks
-                * target.throughput().tile_rows
+    if (value_base + value_rows
             > target.memory().words_per_bank
         || rope_staging_base + rope_staging_rows
             > target.memory().words_per_bank
@@ -212,6 +233,21 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const llvm::SmallVector<int64_t, 2> scratch_banks {
         scratch_bank, secondary_scratch_bank};
     tensor::PhysicalMemoryAllocator physical_allocator(target);
+    const int64_t value_bank = compact_rope_products
+        ? secondary_scratch_bank : scratch_bank;
+    if (kv_cache_enabled) {
+        llvm::SmallVector<int64_t, 16> value_cache_slices;
+        for (int64_t slice : target.attention_value_slices())
+            if (!llvm::is_contained(value_cache_slices, slice))
+                value_cache_slices.push_back(slice);
+        if (mlir::failed(physical_allocator.reserve({"value_cache",
+                value_cache_slices, value_base, value_rows, 0, 7, false,
+                value_bank}))) {
+            op.emitError(
+                "persistent Value cache overlaps attention scratch memory");
+            return mlir::failure();
+        }
+    }
     llvm::SmallVector<int64_t, 16> projection_bias_slices;
     if (has_attention_bias) {
         const auto storage = target.activation_storage_slices();
@@ -460,11 +496,23 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // Key and Query are consumed concurrently by QK. Allocate Key from the
     // activation pool while excluding every Query slice on the same bank.
     // The exact cycle-level MEM ICU check is performed by the QK planner.
-    auto key_allocation = physical_allocator.allocate({"key",
-        static_cast<int64_t>(target.throughput().mxm_result_streams),
-        0, kv_heads * logical_head_banks * seq_len,
-        2, 3, scratch_candidates, false, key_candidate_banks,
-        qk_excluded_slices});
+    const auto allocate_key = [&](int64_t base_row) {
+        return physical_allocator.allocate({"key",
+            static_cast<int64_t>(target.throughput().mxm_result_streams),
+            base_row, key_rows,
+            kv_cache_enabled ? 0 : 2, kv_cache_enabled ? 7 : 3,
+            scratch_candidates, false, key_candidate_banks,
+            qk_excluded_slices});
+    };
+    auto key_allocation = allocate_key(0);
+    if (kv_cache_enabled && mlir::failed(key_allocation)) {
+        for (int64_t base_row = 1;
+             base_row + key_rows <= target.memory().words_per_bank;
+             ++base_row) {
+            key_allocation = allocate_key(base_row);
+            if (mlir::succeeded(key_allocation)) break;
+        }
+    }
     if (mlir::failed(key_allocation)) {
         op.emitError(
             "cannot place QK Key storage outside concurrent Query MEM ICU "
@@ -709,10 +757,12 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     });
     const auto key_segments = rewriter.getArrayAttr({
         make_segment(0, blocks_per_rotary_half, key_allocation->bank,
-            llvm::ArrayRef<int64_t>(key_allocation->slices).take_front(2), 0),
+            llvm::ArrayRef<int64_t>(key_allocation->slices).take_front(2),
+            key_allocation->base_row),
         make_segment(blocks_per_rotary_half, head_blocks,
             key_allocation->bank,
-            llvm::ArrayRef<int64_t>(key_allocation->slices).take_back(2), 0),
+            llvm::ArrayRef<int64_t>(key_allocation->slices).take_back(2),
+            key_allocation->base_row),
     });
     const auto with_segments = [&](mlir::DictionaryAttr placement,
                                    mlir::ArrayAttr segments) {
@@ -727,8 +777,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         query_segments);
     const auto key_placement = with_segments(
         make_attention_placement(rewriter, "fp16_head_planar",
-            key_allocation->slices, 0,
-            kv_heads * logical_head_banks * seq_len, "both",
+            key_allocation->slices, key_allocation->base_row,
+            key_rows, "both",
             key_allocation->bank),
         key_segments);
     auto ropeProductPlacement = make_attention_placement(rewriter,
@@ -781,10 +831,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr("key", key_placement),
         rewriter.getNamedAttr("value", make_attention_placement(rewriter,
             "fp16_value_x16", target.attention_value_slices(),
-            value_base,
-            kv_heads * (head_dim / tile) * blocks
-                * target.throughput().tile_rows, "both",
-            compact_rope_products ? secondary_scratch_bank : scratch_bank)),
+            value_base, value_rows, "both", value_bank)),
         rewriter.getNamedAttr("score", make_attention_placement(rewriter,
             "fp16_score_block", score0->slices,
             score_base, score_rows, "both",
@@ -889,7 +936,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             "value_bias", value_bias, value_bias_base, value_bias_rows);
         plan = plan_attributes.getDictionary(rewriter.getContext());
     }
-    const auto config = rewriter.getDictionaryAttr({
+    auto config = rewriter.getDictionaryAttr({
         rewriter.getNamedAttr(
             "seq_len", rewriter.getI64IntegerAttr(seq_len)),
         rewriter.getNamedAttr(
@@ -913,6 +960,12 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr(
             "output_weight_scale", graph.output.getRhsScaleAttr()),
     });
+    if (kv_cache_enabled) {
+        mlir::NamedAttrList config_attributes(config);
+        config_attributes.set("kv_cache_capacity",
+            rewriter.getI64IntegerAttr(kv_cache_capacity));
+        config = config_attributes.getDictionary(rewriter.getContext());
+    }
     const auto subplan =
         [&](std::initializer_list<llvm::StringRef> names) {
             llvm::SmallVector<mlir::NamedAttribute> entries;

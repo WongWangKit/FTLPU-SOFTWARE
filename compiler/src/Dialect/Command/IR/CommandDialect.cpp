@@ -28,10 +28,12 @@ LogicalResult BindingOp::verify()
         return emitOpError("access must be input, output, or internal");
     if (getRole() != "activation" && getRole() != "weight"
         && getRole() != "result" && getRole() != "constant"
-        && getRole() != "workspace" && getRole() != "bias")
+        && getRole() != "workspace" && getRole() != "bias"
+        && getRole() != "state.kv.key"
+        && getRole() != "state.kv.value")
         return emitOpError(
             "role must be activation, weight, bias, result, constant, or "
-            "workspace");
+            "workspace, state.kv.key, or state.kv.value");
     if (getElementType() != "i8" && getElementType() != "i32"
         && getElementType() != "f16" && getElementType() != "bf16"
         && getElementType() != "f32")
@@ -115,6 +117,14 @@ LogicalResult MemOp::verify()
     if (getOpcode() != "read" && getOpcode() != "write"
         && getOpcode() != "write_tap")
         return emitOpError("opcode must be read, write, or write_tap");
+    if (getAddressBindingAccess() && !getAddressBinding())
+        return emitOpError(
+            "address_binding_access requires address_binding");
+    if (getAddressBindingAccess()
+        && *getAddressBindingAccess() != "input"
+        && *getAddressBindingAccess() != "internal")
+        return emitOpError(
+            "address_binding_access must be input or internal");
     const int64_t corners[] = {
         getAddress(),
         getAddress() + (getRepeatCount() - 1) * getAddressStride(),
@@ -152,6 +162,14 @@ LogicalResult MemBundleOp::verify()
     if (getOpcode() != "read" && getOpcode() != "write"
         && getOpcode() != "write_tap")
         return emitOpError("opcode must be read, write, or write_tap");
+    if (getAddressBindingAccess() && !getAddressBinding())
+        return emitOpError(
+            "address_binding_access requires address_binding");
+    if (getAddressBindingAccess()
+        && *getAddressBindingAccess() != "input"
+        && *getAddressBindingAccess() != "internal")
+        return emitOpError(
+            "address_binding_access must be input or internal");
     for (auto [cycleAttr, queueAttr, addressAttr, streamAttr] :
         llvm::zip(getCycles(), getQueues(), getAddresses(),
             getPackedStreams())) {

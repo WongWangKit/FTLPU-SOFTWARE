@@ -14,13 +14,15 @@ from pathlib import Path
 
 def lower(tool: Path, target: Path, source: Path, output: Path,
           pipeline: str, weight_bank: int | None,
-          mxm_execution: str) -> str:
+          mxm_execution: str, kv_cache_capacity: int) -> str:
     command = [
         str(tool), "--input", str(source), "--output", str(output),
         "--pipeline", pipeline, "--mxm-execution", mxm_execution,
         "--ffn-schedule", "tail", "--target-config", str(target),
         "--rmsnorm-strategy", "vxm-feedback",
     ]
+    if kv_cache_capacity:
+        command += ["--kv-cache-capacity", str(kv_cache_capacity)]
     if weight_bank is not None:
         command += ["--weight-bank", str(weight_bank)]
     subprocess.run(command, check=True)
@@ -202,6 +204,7 @@ def main() -> None:
     parser.add_argument("--mxm-execution", choices=("vector",),
                         default="vector")
     parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--kv-cache-capacity", type=int, default=0)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.input, args.output_dir / "decoder_layer.stablehlo.mlir")
@@ -222,7 +225,7 @@ def main() -> None:
     kernel = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.kernel.mlir",
                    "ftlpu-stablehlo-to-kernel", args.weight_bank,
-                   args.mxm_execution)
+                   args.mxm_execution, args.kv_cache_capacity)
     require(kernel, (
         "ftlpu.kernel.rms_norm", "ftlpu.kernel.rope",
         "ftlpu.kernel.softmax", "ftlpu.kernel.batch_matmul",
@@ -235,7 +238,7 @@ def main() -> None:
     tensor = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.tensor.mlir",
                    "ftlpu-stablehlo-to-tensor", args.weight_bank,
-                   args.mxm_execution)
+                   args.mxm_execution, args.kv_cache_capacity)
     require(tensor, (
         "ftlpu.tensor.rms_norm_task", "ftlpu.tensor.projection_task",
         "ftlpu.tensor.rope_task", "ftlpu.tensor.softmax_task",
@@ -262,11 +265,17 @@ def main() -> None:
     if args.weight_bank is not None:
         validate_paged_weights(tensor, args.target_config, args.weight_bank,
                                args.mxm_execution)
+    if args.kv_cache_capacity:
+        require(tensor, (
+            f"kv_cache_capacity = {args.kv_cache_capacity} : i64",
+            'kind = "fp16_head_planar"',
+            'kind = "fp16_value_x16"',
+        ), "KV-aware Tensor")
 
     stream = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.stream.mlir",
                    "ftlpu-stablehlo-to-stream", args.weight_bank,
-                   args.mxm_execution)
+                   args.mxm_execution, args.kv_cache_capacity)
     require(stream, (
         "ftlpu.stream.rms_norm_task", "ftlpu.stream.projection_task",
         "ftlpu.stream.rope_task", "ftlpu.stream.softmax_task",

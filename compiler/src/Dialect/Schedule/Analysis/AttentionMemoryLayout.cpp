@@ -11,6 +11,9 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
       queryHeads_(op.getQueryHeads()), kvHeads_(op.getKvHeads()),
       headBlocks_(op.getHeadDim() / target.throughput().mxm_rows)
 {
+    if (const auto capacity =
+            op.config().getAs<mlir::IntegerAttr>("kv_cache_capacity"))
+        kvCacheCapacity_ = capacity.getInt();
     const auto plan = op.getMemoryPlan();
     for (std::size_t group = 0; group < queryIwSlices_.size(); ++group)
         queryIwSlices_[group] = target_.attention_query_iw_slices(
@@ -53,6 +56,7 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
                 llvm::cast<mlir::IntegerAttr>(slices[i]).getInt();
     }
     if (const auto key = plan.getAs<mlir::DictionaryAttr>("key")) {
+        keyBase_ = key.getAs<mlir::IntegerAttr>("base_row").getInt();
         const auto slices = key.getAs<mlir::ArrayAttr>("slices");
         for (std::size_t i = 0; i < keySlices_.size(); ++i)
             keySlices_[i] =
@@ -319,9 +323,11 @@ int64_t AttentionMemoryLayout::keyAddress(int64_t kvHead,
     int64_t reductionBlock, int64_t keyBlock) const
 {
     const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
-    return (kvHead * blocksPerRotaryHalf
+    const int64_t storageTokens = kvCacheCapacity_ != 0
+        ? kvCacheCapacity_ : seqLen_;
+    return keyBase_ + (kvHead * blocksPerRotaryHalf
                + reductionBlock % blocksPerRotaryHalf)
-            * seqLen_
+            * storageTokens
         + keyBlock * target_.throughput().mxm_rows;
 }
 
@@ -392,7 +398,10 @@ int64_t AttentionMemoryLayout::valuePackAddress(int64_t head,
     int64_t reductionBlock, int64_t tokenBlock, int64_t row) const
 {
     const int64_t tileRows = target_.throughput().tile_rows;
-    const int64_t tokenBlocks = seqLen_ / target_.throughput().mxm_rows;
+    const int64_t storageTokens = kvCacheCapacity_ != 0
+        ? kvCacheCapacity_ : seqLen_;
+    const int64_t tokenBlocks =
+        storageTokens / target_.throughput().mxm_rows;
     return valuePackBase_
         + ((head * headBlocks_ + reductionBlock) * tokenBlocks
               + tokenBlock)

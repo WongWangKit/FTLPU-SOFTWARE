@@ -30,6 +30,7 @@ def compile_executables(
     mxm_execution: str,
     reuse_executables: bool,
     weight_banks: list[int | None],
+    kv_cache_capacity: int,
 ) -> list[Path]:
     executables: list[Path] = []
     for index, target_config in enumerate(target_configs):
@@ -56,6 +57,10 @@ def compile_executables(
             "--target-config", str(target_config),
             "--icu-macro-schedule",
         ] + weight_bank_args
+        if kv_cache_capacity:
+            common.extend([
+                "--kv-cache-capacity", str(kv_cache_capacity)
+            ])
         run_phase(
             f"lower executable variant {index} to Stream IR",
             [
@@ -150,6 +155,12 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument(
+        "--kv-cache-capacity",
+        type=int,
+        default=0,
+        help="reserve persistent BF16 K/V state for this many tokens",
+    )
     parser.add_argument("--first-layer", type=int, default=0)
     parser.add_argument(
         "--reuse-golden", action="store_true",
@@ -246,6 +257,7 @@ def main() -> None:
                 ] if args.c2c_weight_paging
                 else [None] * required_executables
             ),
+            kv_cache_capacity=args.kv_cache_capacity,
         )
     else:
         executables = args.executable or []
@@ -314,6 +326,10 @@ def main() -> None:
         if args.c2c_weight_paging else args.output
     )
     package_command.extend(["--output", str(logical_output)])
+    if args.kv_cache_capacity:
+        package_command.extend([
+            "--kv-cache-capacity", str(args.kv_cache_capacity)
+        ])
     if args.checkpoint_outputs:
         package_command.append("--checkpoint-outputs")
     if args.final_rmsnorm_executable:

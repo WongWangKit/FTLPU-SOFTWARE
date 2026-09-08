@@ -59,6 +59,8 @@ public:
 
     const ModelPackage& package() const;
     const std::vector<std::uint8_t>& value(const std::string& name) const;
+    std::vector<std::uint8_t> read_state(const std::string& name);
+    void reset_states();
     const SessionMemoryPlan& memory_plan() const;
     const ModelSessionStats& stats() const;
     std::vector<WeightPrefetchPlan> executable_weight_prefetch_plans() const;

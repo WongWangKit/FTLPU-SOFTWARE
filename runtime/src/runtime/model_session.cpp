@@ -1464,12 +1464,13 @@ void ModelSession::ensure_weight_page(std::uint32_t page_index) {
     return;
   }
   if (inflight_weight_page_ != page_index) {
-    // A deferred page is loaded at an invocation boundary. The previous
-    // executable has already launched its ICU queues, so clear execution
-    // state before enqueueing C2C commands. SRAM and DDR contents remain
-    // intact across this reset.
-    if (completed_invocation_)
-      c2c_system_->reset_execution_state();
+    if (inflight_weight_page_)
+      throw std::logic_error(
+          "cannot replace a model weight page while another page is in flight");
+    // Standalone C2C transactions, including resident uploads during session
+    // load, leave their ICU programs launched. Start each unscheduled model
+    // page from a fresh execution context; SRAM and DDR contents survive.
+    c2c_system_->reset_execution_state();
     start_weight_page(page_index);
   }
   const std::size_t beginCycle = c2c_system_->cycle();
@@ -1573,6 +1574,38 @@ void ModelSession::load(ModelPackage package) {
 
 void ModelSession::load_file(const std::filesystem::path &path) {
   load(read_model_package(path, ModelPackageLoadMode::LazyExecutables));
+}
+
+std::vector<std::uint8_t> ModelSession::read_state(const std::string &name) {
+  if (!loaded_)
+    throw std::logic_error("no FTLPU model package is loaded");
+  const auto state = std::find_if(
+      memory_plan_.persistent_states.begin(),
+      memory_plan_.persistent_states.end(),
+      [&](const SessionMemoryPlan::PersistentState &candidate) {
+        return candidate.state == name;
+      });
+  if (state == memory_plan_.persistent_states.end())
+    throw std::out_of_range("unknown FTLPU model state: " + name);
+  if (package_.executables.empty())
+    throw std::logic_error("persistent LPU state has no executable target");
+  return download_binding_through_c2c(
+      state->binding, package_.executables.front().program.hardware);
+}
+
+void ModelSession::reset_states() {
+  if (!loaded_)
+    throw std::logic_error("no FTLPU model package is loaded");
+  if (package_.executables.empty() && !memory_plan_.persistent_states.empty())
+    throw std::logic_error("persistent LPU state has no executable target");
+  for (const auto &state : memory_plan_.persistent_states) {
+    const std::vector<std::uint8_t> zero(
+        static_cast<std::size_t>(state.binding.byte_size), 0);
+    upload_binding_through_c2c(
+        state.binding, zero, package_.executables.front().program.hardware);
+    ++stats_.state_initializations;
+    stats_.state_initialization_bytes += zero.size();
+  }
 }
 
 const ModelValue *

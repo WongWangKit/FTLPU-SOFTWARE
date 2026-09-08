@@ -54,7 +54,17 @@ struct CommandSequence {
     int64_t depth_count{1};
     int64_t depth_interval{1};
     int64_t depth_stride{0};
+    BindingAccess address_binding_access{BindingAccess::Input};
+    BindingAccess write_address_binding_access{BindingAccess::Input};
 };
+
+BindingAccess address_binding_access(mlir::Operation* operation)
+{
+    const auto access = operation->getAttrOfType<mlir::StringAttr>(
+        "address_binding_access");
+    return access && access.getValue() == "internal"
+        ? BindingAccess::Internal : BindingAccess::Input;
+}
 
 int64_t command_cycle(mlir::Operation* op)
 {
@@ -551,7 +561,7 @@ void collect_mem(command::MemOp op, QueueMap& queues)
             : op.getOpcode() == "write_tap"
             ? MemInstruction::WriteTap(address, op.getPackedStream())
             : MemInstruction::Write(address, op.getPackedStream());
-    queues[{QueueKind::Mem, queue}].push_back(CommandSequence {
+    CommandSequence sequence {
             command_cycle(op),
             op->getAttrOfType<mlir::IntegerAttr>("repeat_count").getInt(),
             op->getAttrOfType<mlir::IntegerAttr>("repeat_interval").getInt(),
@@ -564,7 +574,9 @@ void collect_mem(command::MemOp op, QueueMap& queues)
             -1,
             false, 0, waveCount, waveInterval, waveAddressStride,
             IcuInductionTarget::MemAddress
-        });
+        };
+    sequence.address_binding_access = address_binding_access(op);
+    queues[{QueueKind::Mem, queue}].push_back(std::move(sequence));
 }
 
 void collect_mem_bundle(command::MemBundleOp op, QueueMap& queues)
@@ -587,7 +599,7 @@ void collect_mem_bundle(command::MemBundleOp op, QueueMap& queues)
             : op.getOpcode() == "write_tap"
             ? MemInstruction::WriteTap(address, packedStream)
             : MemInstruction::Write(address, packedStream);
-        queues[{QueueKind::Mem, queue}].push_back(CommandSequence {
+        CommandSequence sequence {
             cycle, static_cast<int64_t>(op.getRepeatCount()),
             static_cast<int64_t>(op.getRepeatInterval()),
             static_cast<int64_t>(op.getAddressStride()),
@@ -598,7 +610,9 @@ void collect_mem_bundle(command::MemBundleOp op, QueueMap& queues)
                 ? static_cast<int64_t>(*op.getAddressBinding()) : -1,
             -1, false, 0, waveCount, waveInterval, waveStride,
             IcuInductionTarget::MemAddress,
-        });
+        };
+        sequence.address_binding_access = address_binding_access(op);
+        queues[{QueueKind::Mem, queue}].push_back(std::move(sequence));
     }
 }
 
@@ -1047,7 +1061,10 @@ bool same_loop_instruction(const CommandSequence& first,
 {
     if (first.scale_binding != next.scale_binding
         || first.address_binding != next.address_binding
+        || first.address_binding_access != next.address_binding_access
         || first.write_address_binding != next.write_address_binding
+        || first.write_address_binding_access
+            != next.write_address_binding_access
         || first.instruction.instruction_kind
             != next.instruction.instruction_kind
         || first.instruction.word_count != next.instruction.word_count
@@ -1941,8 +1958,12 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
                     && left.cycle_strides == right.cycle_strides
                     && lhs.scale_binding == rhs.scale_binding
                     && lhs.address_binding == rhs.address_binding
+                    && lhs.address_binding_access
+                        == rhs.address_binding_access
                     && lhs.write_address_binding
-                        == rhs.write_address_binding;
+                        == rhs.write_address_binding
+                    && lhs.write_address_binding_access
+                        == rhs.write_address_binding_access;
             };
             const auto decodeMem = [](const QueueCommand& command) {
                 const auto encoded =
@@ -2007,7 +2028,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
                     addressRelocations.push_back(BinaryAddressRelocation {
                         static_cast<std::uint32_t>(
                             sequence.address_binding),
-                        software::runtime::BindingAccess::Input,
+                        sequence.address_binding_access,
                         key.first,
                         static_cast<std::uint16_t>(key.second),
                         static_cast<std::uint32_t>(instructionIndex),
@@ -2018,7 +2039,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
                     addressRelocations.push_back(BinaryAddressRelocation {
                         static_cast<std::uint32_t>(
                             sequence.write_address_binding),
-                        software::runtime::BindingAccess::Input,
+                        sequence.write_address_binding_access,
                         key.first,
                         static_cast<std::uint16_t>(key.second),
                         static_cast<std::uint32_t>(instructionIndex),
@@ -2145,7 +2166,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
             if (sequence.address_binding >= 0) {
                 addressRelocations.push_back(BinaryAddressRelocation {
                     static_cast<std::uint32_t>(sequence.address_binding),
-                    software::runtime::BindingAccess::Input,
+                    sequence.address_binding_access,
                     key.first,
                     static_cast<std::uint16_t>(key.second),
                     static_cast<std::uint32_t>(instructionIndex),
@@ -2156,7 +2177,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
                 addressRelocations.push_back(BinaryAddressRelocation {
                     static_cast<std::uint32_t>(
                         sequence.write_address_binding),
-                    software::runtime::BindingAccess::Input,
+                    sequence.write_address_binding_access,
                     key.first,
                     static_cast<std::uint16_t>(key.second),
                     static_cast<std::uint32_t>(instructionIndex),
@@ -2209,7 +2230,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
         if (sequence.address_binding >= 0) {
             addressRelocations.push_back(BinaryAddressRelocation {
                 static_cast<std::uint32_t>(sequence.address_binding),
-                software::runtime::BindingAccess::Input,
+                sequence.address_binding_access,
                 key.first,
                 static_cast<std::uint16_t>(key.second),
                 static_cast<std::uint32_t>(instructionIndex),
@@ -2220,7 +2241,7 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
             addressRelocations.push_back(BinaryAddressRelocation {
                 static_cast<std::uint32_t>(
                     sequence.write_address_binding),
-                software::runtime::BindingAccess::Input,
+                sequence.write_address_binding_access,
                 key.first,
                 static_cast<std::uint16_t>(key.second),
                 static_cast<std::uint32_t>(instructionIndex),
