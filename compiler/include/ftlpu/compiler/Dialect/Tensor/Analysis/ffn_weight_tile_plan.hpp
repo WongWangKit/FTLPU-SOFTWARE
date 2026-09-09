@@ -61,6 +61,7 @@ struct FfnWeightTilePlan {
 
 mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
     FfnWeightShape shape, const target::LPUTargetModel& target,
-    int64_t initialBank = 0);
+    int64_t initialBank = 0,
+    bool streamingDownDoubleBuffer = false);
 
 } // namespace ftlpu::compiler::tensor

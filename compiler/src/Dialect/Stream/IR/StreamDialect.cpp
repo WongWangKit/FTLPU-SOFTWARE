@@ -499,6 +499,22 @@ LogicalResult RopeTaskOp::verify()
         return emitOpError("kind must be query or key");
     if (getInput().getType() != getResult().getType())
         return emitOpError("must preserve its tensor type");
+    if (mlir::Value weight = getNormWeight()) {
+        const auto weightType =
+            llvm::dyn_cast<mlir::RankedTensorType>(weight.getType());
+        const auto inputType = getInput().getType();
+        const auto headDim =
+            getConfig().getAs<mlir::IntegerAttr>("head_dim");
+        const auto epsilon =
+            getConfig().getAs<mlir::FloatAttr>("qk_norm_epsilon");
+        if (!weightType || weightType.getRank() != 1 || !headDim
+            || weightType.getDimSize(0) != headDim.getInt()
+            || weightType.getElementType() != inputType.getElementType()
+            || !epsilon || !std::isfinite(epsilon.getValueAsDouble())
+            || epsilon.getValueAsDouble() <= 0.0)
+            return emitOpError(
+                "head RMSNorm weight must be [head_dim] with positive epsilon");
+    }
     if (failed(verify_attention_config(getOperation(), getConfig())))
         return failure();
     return verify_optional_attention_routes(getOperation(), getRoutes());

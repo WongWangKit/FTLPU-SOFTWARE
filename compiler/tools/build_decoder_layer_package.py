@@ -159,6 +159,12 @@ def main() -> None:
     hidden = metadata["hidden_size"]
     intermediate = metadata["intermediate_size"]
     seq_len = metadata["seq_len"]
+    query_width = metadata.get(
+        "query_width", metadata["query_heads"] * metadata["head_dim"]
+    )
+    kv_width = metadata.get(
+        "kv_width", metadata["kv_heads"] * metadata["head_dim"]
+    )
     if args.kv_cache_capacity < 0:
         raise ValueError("KV cache capacity must be non-negative")
     if args.kv_cache_capacity and args.kv_cache_capacity < seq_len:
@@ -180,10 +186,10 @@ def main() -> None:
             "KV cache resident window exceeds logical capacity"
         )
     shapes = {
-        "query": [hidden, hidden],
-        "key": [hidden, metadata["kv_heads"] * metadata["head_dim"]],
-        "value": [hidden, metadata["kv_heads"] * metadata["head_dim"]],
-        "output": [hidden, hidden],
+        "query": [hidden, query_width],
+        "key": [hidden, kv_width],
+        "value": [hidden, kv_width],
+        "output": [query_width, hidden],
         "gate": [hidden, intermediate],
         "up": [hidden, intermediate],
         "down": [intermediate, hidden],
@@ -191,6 +197,10 @@ def main() -> None:
     weight_order = ["query", "key", "value", "output", "gate", "up", "down"]
     bias_operand_flags = [
         bool(current.get("attention_bias_operands", False))
+        for current in metadata_list
+    ]
+    qk_norm_operand_flags = [
+        bool(current.get("qk_norm", False))
         for current in metadata_list
     ]
 
@@ -205,7 +215,12 @@ def main() -> None:
         # reproducible from one package.
         scalar(
             stream, "I",
-            2 + sum(9 + 3 * has_bias for has_bias in bias_operand_flags)
+            2 + sum(
+                9 + 3 * has_bias + 2 * has_qk_norm
+                for has_bias, has_qk_norm in zip(
+                    bias_operand_flags, qk_norm_operand_flags
+                )
+            )
             + (len(golden_dirs) if args.checkpoint_outputs else 0)
             + (2 if include_boundaries else 0)
             + int(args.final_hidden_golden_bf16 is not None),
@@ -214,8 +229,9 @@ def main() -> None:
             stream, "golden.input", BF16, [seq_len, hidden],
             (golden_dirs[0] / "input.bf16.bin").read_bytes()
         )
-        for golden_dir, layer_metadata, has_bias in zip(
-            golden_dirs, metadata_list, bias_operand_flags
+        for golden_dir, layer_metadata, has_bias, has_qk_norm in zip(
+            golden_dirs, metadata_list, bias_operand_flags,
+            qk_norm_operand_flags,
         ):
             layer = int(layer_metadata["layer"])
             tensor(
@@ -233,14 +249,21 @@ def main() -> None:
                 )
             if has_bias:
                 for role, width in (
-                    ("query", hidden),
-                    ("key", metadata["kv_heads"] * metadata["head_dim"]),
-                    ("value", metadata["kv_heads"] * metadata["head_dim"]),
+                    ("query", query_width),
+                    ("key", kv_width),
+                    ("value", kv_width),
                 ):
                     tensor(
                         stream, f"layers.{layer}.{role}.bias",
                         BF16, [width],
                         (golden_dir / f"{role}_bias.bf16.bin").read_bytes(),
+                    )
+            if has_qk_norm:
+                for role in ("query", "key"):
+                    tensor(
+                        stream, f"layers.{layer}.{role}_norm.weight",
+                        BF16, [metadata["head_dim"]],
+                        (golden_dir / f"{role}_norm.bf16.bin").read_bytes(),
                     )
             tensor(
                 stream, f"layers.{layer}.post_attention_layernorm.weight",
@@ -413,6 +436,12 @@ def main() -> None:
                     (8, f"layers.{layer}.value.bias"),
                 ])
                 next_binding = 9
+            if qk_norm_operand_flags[invocation_index]:
+                input_refs.extend([
+                    (next_binding, f"layers.{layer}.query_norm.weight"),
+                    (next_binding + 1, f"layers.{layer}.key_norm.weight"),
+                ])
+                next_binding += 2
             input_refs.extend([
                 (next_binding,
                  f"layers.{layer}.post_attention_layernorm.weight"),

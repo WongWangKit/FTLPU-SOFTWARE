@@ -106,6 +106,17 @@ FfnProjectionOrder chooseProjectionOrder(PrimitiveFfnSchedulePlan& ffn,
         || !isPagedWeight(gateRaw.getPlacement())
         || !isPagedWeight(upRaw.getPlacement()))
         return FfnProjectionOrder::Interleaved;
+    const auto gatePageCount = gateRaw.getPlacement()
+        .getAs<mlir::IntegerAttr>("page_count");
+    const auto upPageCount = upRaw.getPlacement()
+        .getAs<mlir::IntegerAttr>("page_count");
+    // Single-page projections can both be resident by the shared FFN start.
+    // Serializing them only lengthens the schedule and exposes an unnecessary
+    // fused-Swish tail boundary; residency-first ordering is for multi-page
+    // projections whose refills must be sequenced.
+    if (gatePageCount && upPageCount
+        && gatePageCount.getInt() == 1 && upPageCount.getInt() == 1)
+        return FfnProjectionOrder::Interleaved;
     llvm::SmallPtrSet<mlir::Operation*, 32> visited;
     llvm::SmallVector<mlir::DictionaryAttr, 8> priorPlacements;
     collectProducerPagedWeightPlacements(
@@ -299,7 +310,15 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     const auto& memory = target.memory();
     const int64_t hiddenBank = ffn.getHidden0Placement()
         .getAs<mlir::IntegerAttr>("bank").getInt();
-    const int64_t tempBank = pagedWeights && memory.banks_per_slice > 1
+    const auto gateTempSlices = target.ffn_gate_temp_slices();
+    const auto upTempSlices = target.ffn_up_temp_slices();
+    const bool tempOverlapsHiddenSlices = llvm::any_of(hiddenSlices,
+        [&](int64_t slice) {
+            return llvm::is_contained(gateTempSlices, slice)
+                || llvm::is_contained(upTempSlices, slice);
+        });
+    const int64_t tempBank = memory.banks_per_slice > 1
+            && (pagedWeights || tempOverlapsHiddenSlices)
         ? (hiddenBank + 1) % memory.banks_per_slice : hiddenBank;
     auto resultSlices = get_slices(ffn.getResultPlacement());
     auto executionPolicy =
@@ -323,15 +342,16 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         return mlir::failure();
     }
     const auto& throughput = target.throughput();
-    const auto gateTempSlices = target.ffn_gate_temp_slices();
-    const auto upTempSlices = target.ffn_up_temp_slices();
-    const bool tempOverlapsHiddenSlices = llvm::any_of(hiddenSlices,
-        [&](int64_t slice) {
-            return llvm::is_contained(gateTempSlices, slice)
-                || llvm::is_contained(upTempSlices, slice);
-        });
     const bool supportsConcurrentTempAndHiddenWrites =
         tempBank != hiddenBank || !tempOverlapsHiddenSlices;
+    const int64_t activationBank = activationRoute.getPlacement()
+        .getAs<mlir::IntegerAttr>("bank").getInt();
+    const bool activationOverlapsHiddenSlices = llvm::any_of(hiddenSlices,
+        [&](int64_t slice) {
+            return llvm::is_contained(activationSlices, slice);
+        });
+    const bool supportsConcurrentActivationAndHiddenWrites =
+        activationBank != hiddenBank || !activationOverlapsHiddenSlices;
     // Fused Swish relies on the current vector path's local MXM dequant and
     // one logical Gate/Up slot per physical MXM. Its hidden writes must also
     // be physically independent from projection temporary writes. Keep Tail
@@ -341,7 +361,8 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         && memory.hemispheres == 2
         && throughput.mxm_result_streams == 4
         && target.streams().streams_per_direction >= 24
-        && supportsConcurrentTempAndHiddenWrites;
+        && supportsConcurrentTempAndHiddenWrites
+        && supportsConcurrentActivationAndHiddenWrites;
     if (strategy == FfnScheduleStrategy::Fused && !supportsFusedSwish)
         strategy = FfnScheduleStrategy::Tail;
     if (weightSlices.size()

@@ -20,6 +20,8 @@ Qwen decoder 层不再要求全部权重同时常驻片上 MEM。runtime 首先�
 
 - 每个 MEM slice 有 2 个独立单端口 SRAM bank。
 - MEM ICU queue 唯一标识 `(hemisphere, slice, bank)`。
+- 同一 queue 上即使两个页面占用不相交的 row，C2C 写与计算读仍会争用同一个
+  单端口；runtime 会按 compiler 的 release cycle 串行化这类端口访问。
 - SRAM 地址是 bank-local row，每 row 为 32 bytes。共享配置包含两个 256 KiB bank，因此每个 bank 的地址范围是 `0..8191`。
 - bank 0 read 与 bank 1 write 可以同 cycle 发射；同一 bank 内仍服从单端口约束。
 - 计算保持原有 32 条 eastward 和 32 条 westward stream。C2C 对外提供可配置
@@ -62,6 +64,19 @@ Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gat
 4. 同一个 runtime cycle driver 同时推进 chip、DMA 和 DDR。
 5. layer 0 完成后确认 page 1 ready；若未完成则只等待剩余搬运。
 6. 加载 layer 1 ICU 程序，执行完整 Attention -> FFN，同时启动 page 2 到 bank 0，依次交替。
+
+### Executable 内的 Down tile 流水
+
+Qwen3-0.6B seq32 的 Down projection 把每个 output wave 作为一个可独立消费的
+weight tile。8 个 tile 只占两个物理 slot：`bank1,row0` 和 `bank0,row0`，并按
+`1,0,1,0,...` 交替。每个 tile 在 binary 中保留自己的 `ready_cycle` 和
+`release_cycle`。runtime 先按同 bank 前一个 tile 的 release 求出最早安全启动周期，
+再按这个周期而不是 consumer 顺序发射 DMA。因此 tile `i` 在一个 bank 上计算时，
+tile `i+1` 可以写入另一个 bank；tile `i` 释放后，tile `i+2` 立即复用它的 slot。
+
+这里的“空间空出来”同时要求容量可复用和 SRAM 端口可用。同一
+`(hemisphere,slice,bank)` 即便 row 不重叠也只有一个 MEM queue，不能让 C2C write
+和 MXM weight read 同时访问。bank 交替为传输和计算提供了两个独立端口。
 
 ### Page-ready 同步
 
@@ -107,6 +122,9 @@ C2C receive 指令描述一段连续 SRAM row burst。runtime 按目标 slice �
   使用 bank1，使激活和非分页 RMSNorm 权重位于 bank0；variant 1 采用相反布局。
 - `model_session_c2c_io_test`：把 32x1536 BF16 tensor 经 DDR、C2C 和 MEM 做
   往返，并检查不存在 host/MEM 旁路。
+- Qwen3-0.6B seq32 单层完整 C2C 数值测试比较全部 32,768 个 BF16 输出，最大
+  绝对误差 0.09375；Down 的后 6 个 tile 预取均与 MXM compute 重叠，
+  `weight_page_runtime_wait_cycles=0`，runtime trace 中没有 `ICU.PageReadyWait`。
 - 真实 Qwen2.5-1.5B 第 0 层 seq_len=32 executable 的 49,152 个输出全部通过
   硬件数值语义 golden，最大绝对误差 0.015625、MAE=0.000332287。checkpoint
   的 Q/K/V bias 均以标准 StableHLO broadcast-plus-add operand 表达：Q/K bias

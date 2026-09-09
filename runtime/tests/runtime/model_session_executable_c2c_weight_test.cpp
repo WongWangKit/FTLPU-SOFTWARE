@@ -121,6 +121,53 @@ try {
         throw std::runtime_error(
             "chained weight-region reuse was scheduled before release");
 
+    std::vector<WeightPrefetchPlan> sharedQueuePlans(3);
+    sharedQueuePlans[0].ready_cycle = 100;
+    sharedQueuePlans[0].release_cycle = 200;
+    sharedQueuePlans[0].bytes[0] = 128;
+    sharedQueuePlans[0].regions = {{1, 1, 20, 100, 108, false}};
+    sharedQueuePlans[1].ready_cycle = 300;
+    sharedQueuePlans[1].release_cycle = 600;
+    sharedQueuePlans[1].bytes[0] = 128;
+    sharedQueuePlans[1].regions = {{1, 1, 20, 0, 8, false}};
+    sharedQueuePlans[2].ready_cycle = 700;
+    sharedQueuePlans[2].release_cycle = 800;
+    sharedQueuePlans[2].bytes[0] = 128;
+    sharedQueuePlans[2].regions = {{1, 1, 20, 100, 108, false}};
+    schedule_weight_prefetches(chainedOverlapProgram, sharedQueuePlans);
+    if (!sharedQueuePlans[0].pre_execution
+        || !sharedQueuePlans[1].pre_execution
+        || sharedQueuePlans[2].pre_execution
+        || sharedQueuePlans[2].start_cycle != 600)
+        throw std::runtime_error(
+            "disjoint-row C2C write was not ordered after shared MEM port use");
+
+    std::vector<WeightPrefetchPlan> earlyAlternateBankPlans(4);
+    earlyAlternateBankPlans[0].ready_cycle = 10;
+    earlyAlternateBankPlans[0].release_cycle = 300;
+    earlyAlternateBankPlans[0].bytes[0] = 128;
+    earlyAlternateBankPlans[0].regions = {{1, 1, 20, 0, 8, false}};
+    earlyAlternateBankPlans[1].ready_cycle = 20;
+    earlyAlternateBankPlans[1].release_cycle = 100;
+    earlyAlternateBankPlans[1].bytes[0] = 128;
+    earlyAlternateBankPlans[1].regions = {{0, 1, 20, 0, 8, false}};
+    earlyAlternateBankPlans[2].ready_cycle = 400;
+    earlyAlternateBankPlans[2].release_cycle = 500;
+    earlyAlternateBankPlans[2].bytes[0] = 128;
+    earlyAlternateBankPlans[2].regions = {{1, 1, 20, 0, 8, false}};
+    earlyAlternateBankPlans[3].ready_cycle = 500;
+    earlyAlternateBankPlans[3].release_cycle = 600;
+    earlyAlternateBankPlans[3].bytes[0] = 128;
+    earlyAlternateBankPlans[3].regions = {{0, 1, 20, 0, 8, false}};
+    schedule_weight_prefetches(
+        chainedOverlapProgram, earlyAlternateBankPlans);
+    if (earlyAlternateBankPlans[2].pre_execution
+        || earlyAlternateBankPlans[3].pre_execution
+        || earlyAlternateBankPlans[2].start_cycle != 300
+        || earlyAlternateBankPlans[3].start_cycle != 100)
+        throw std::runtime_error(
+            "alternate-bank page was not launched at its earliest free slot");
+
     BinaryProgram program;
     program.bindings.push_back(make_weight_binding());
     program.weight_page_uses.push_back({0, 0, 0, 200, 220});

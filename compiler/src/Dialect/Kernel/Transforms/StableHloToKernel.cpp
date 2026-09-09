@@ -61,6 +61,9 @@ struct AttentionMatch {
     mlir::Value query_bias;
     mlir::Value key_bias;
     mlir::Value value_bias;
+    mlir::Value query_norm_weight;
+    mlir::Value key_norm_weight;
+    float qk_norm_epsilon;
     float query_scale;
     float key_scale;
     float value_scale;
@@ -328,6 +331,32 @@ std::optional<RmsNormMatch> match_rms_norm(
     return std::nullopt;
 }
 
+std::optional<RmsNormMatch> match_rms_norm_between(
+    mlir::Value value, mlir::Operation* boundary,
+    llvm::SmallPtrSetImpl<mlir::Operation*>& visited)
+{
+    mlir::Operation* operation = value.getDefiningOp();
+    if (!operation || operation == boundary
+        || !visited.insert(operation).second)
+        return std::nullopt;
+    if (auto match = match_rms_norm(operation)) {
+        if (find_backward(match->input, "stablehlo.dot_general") == boundary)
+            return match;
+    }
+    for (mlir::Value operand : operation->getOperands())
+        if (auto match = match_rms_norm_between(
+                operand, boundary, visited))
+            return match;
+    return std::nullopt;
+}
+
+std::optional<RmsNormMatch> match_rms_norm_between(
+    mlir::Value value, mlir::Operation* boundary)
+{
+    llvm::SmallPtrSet<mlir::Operation*, 32> visited;
+    return match_rms_norm_between(value, boundary, visited);
+}
+
 std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_dot)
 {
     if (!named(output_dot, "stablehlo.dot_general")
@@ -395,6 +424,15 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
         && backward_slice_contains(pv_dot->getOperand(0), "stablehlo.compare")
         && backward_slice_contains(pv_dot->getOperand(0), "stablehlo.iota");
 
+    const auto query_norm = match_rms_norm_between(
+        qk_dot->getOperand(0), query_dot);
+    const auto key_norm = match_rms_norm_between(
+        qk_dot->getOperand(1), key_dot);
+    if (static_cast<bool>(query_norm) != static_cast<bool>(key_norm))
+        return std::nullopt;
+    if (query_norm && query_norm->epsilon != key_norm->epsilon)
+        return std::nullopt;
+
     AttentionMatch match {
         output_dot,
         input,
@@ -405,6 +443,9 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
         match_projection_bias(query_dot),
         match_projection_bias(key_dot),
         match_projection_bias(value_dot),
+        query_norm ? query_norm->weight : mlir::Value {},
+        key_norm ? key_norm->weight : mlir::Value {},
+        query_norm ? query_norm->epsilon : 0.0f,
         query_weight->scale,
         key_weight->scale,
         value_weight->scale,
@@ -586,6 +627,26 @@ public:
                     rewriter.getF32FloatAttr(match->rope_theta));
                 return llvm::cast<kernel::RopeOp>(rewriter.create(state));
             };
+            const auto create_head_norm = [&](mlir::Value input,
+                                               mlir::Value weight,
+                                               int64_t heads) {
+                if (!weight)
+                    return create_reshape(input, tensor_type(
+                        {match->seq_len, heads, match->head_dim}));
+                auto flattened = create_reshape(input, tensor_type(
+                    {match->seq_len * heads, match->head_dim}));
+                mlir::OperationState state(root->getLoc(),
+                    kernel::RmsNormOp::getOperationName());
+                state.addOperands({flattened.getResult(), weight});
+                state.addTypes(flattened.getResult().getType());
+                state.addAttribute("axis", rewriter.getI64IntegerAttr(-1));
+                state.addAttribute("epsilon", rewriter.getF32FloatAttr(
+                    match->qk_norm_epsilon));
+                auto normalized = llvm::cast<kernel::RmsNormOp>(
+                    rewriter.create(state));
+                return create_reshape(normalized.getResult(), tensor_type(
+                    {match->seq_len, heads, match->head_dim}));
+            };
             const auto create_bias_add = [&](mlir::Value input,
                                               mlir::Value bias) -> mlir::Value {
                 if (!bias) return input;
@@ -646,10 +707,10 @@ public:
                 key_2d.getResult(), match->key_bias);
             const mlir::Value biased_value = create_bias_add(
                 value_2d.getResult(), match->value_bias);
-            auto query_heads = create_reshape(biased_query,
-                tensor_type({match->seq_len, match->query_heads, match->head_dim}));
-            auto key_heads = create_reshape(biased_key,
-                tensor_type({match->seq_len, match->kv_heads, match->head_dim}));
+            auto query_heads = create_head_norm(biased_query,
+                match->query_norm_weight, match->query_heads);
+            auto key_heads = create_head_norm(biased_key,
+                match->key_norm_weight, match->kv_heads);
             auto value_heads = create_reshape(biased_value,
                 tensor_type({match->seq_len, match->kv_heads, match->head_dim}));
             auto query_rope = create_rope(query_heads.getResult(), match->query_heads);

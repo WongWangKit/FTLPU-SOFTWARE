@@ -383,6 +383,21 @@ target_link_libraries(
     compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test
     PRIVATE ftlpu_software)
 
+add_executable(compiled_qwen3_0_6b_decoder_layer_seq32_runtime_test
+    tests/runtime/compiled_qwen3_0_6b_decoder_layer_runtime_test.cpp)
+target_link_libraries(
+    compiled_qwen3_0_6b_decoder_layer_seq32_runtime_test
+    PRIVATE ftlpu_software)
+
+add_custom_target(qwen3_0_6b_decoder_layer_seq32_prefill_cmodel_test
+    COMMAND
+        $<TARGET_FILE:compiled_qwen3_0_6b_decoder_layer_seq32_runtime_test>
+        ${CMAKE_BINARY_DIR}/compiler/ftlpu_lower/qwen3_0_6b_decoder_layer_prefill/decoder_layer.ftlpu
+    DEPENDS
+        qwen3_0_6b_decoder_layer_prefill_pipeline
+        compiled_qwen3_0_6b_decoder_layer_seq32_runtime_test
+    USES_TERMINAL)
+
 add_executable(hf_decoder_layer_model_session_test
     tests/runtime/hf_decoder_layer_model_session_test.cpp)
 

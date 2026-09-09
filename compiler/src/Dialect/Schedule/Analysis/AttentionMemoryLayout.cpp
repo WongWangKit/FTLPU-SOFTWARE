@@ -450,7 +450,7 @@ int64_t AttentionMemoryLayout::contextSlice(
 int64_t AttentionMemoryLayout::outputWeightAddress(int64_t outputGroup,
     int64_t reductionBlock, int64_t column) const
 {
-    const int64_t reductionBlocks = hidden_ / target_.throughput().mxm_rows;
+    const int64_t reductionBlocks = queryHeads_ * headBlocks_;
     const int64_t localGroup = outputWeightPaging_.enabled
         ? outputGroup % outputWeightPaging_.itemsPerGroup : outputGroup;
     return outputWeightBase_

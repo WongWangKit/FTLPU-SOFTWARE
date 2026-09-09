@@ -87,6 +87,21 @@ struct AttentionTaskGraphView {
         auto op = value;
         return op.getBias();
     }
+    mlir::Value getQueryNormWeight() const
+    {
+        auto op = query_rope;
+        return op.getNormWeight();
+    }
+    mlir::Value getKeyNormWeight() const
+    {
+        auto op = key_rope;
+        return op.getNormWeight();
+    }
+    bool hasQkNorm() const
+    {
+        return static_cast<bool>(getQueryNormWeight())
+            && static_cast<bool>(getKeyNormWeight());
+    }
     mlir::Value getResult() const
     {
         auto op = output;
@@ -203,6 +218,8 @@ collect_attention_task_graphs(
         }
         if (graph.query.getInput() != graph.key.getInput()
             || graph.query.getInput() != graph.value.getInput()
+            || static_cast<bool>(graph.getQueryNormWeight())
+                != static_cast<bool>(graph.getKeyNormWeight())
             || !has_common_attention_config(graph)) {
             output.emitError(
                 "primitive attention tasks disagree on input or configuration");

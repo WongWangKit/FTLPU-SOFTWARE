@@ -111,12 +111,31 @@ bool regions_overlap(const WeightResidencyRegion& lhs,
         && lhs.row_begin < rhs.row_end && rhs.row_begin < lhs.row_end;
 }
 
+bool regions_share_mem_queue(const WeightResidencyRegion& lhs,
+    const WeightResidencyRegion& rhs)
+{
+    return lhs.bank == rhs.bank
+        && (lhs.hemisphere_mask & rhs.hemisphere_mask) != 0
+        && (lhs.wildcard_slice || rhs.wildcard_slice
+            || lhs.slice == rhs.slice);
+}
+
 bool plans_overlap_impl(
     const WeightPrefetchPlan& lhs, const WeightPrefetchPlan& rhs)
 {
     return std::ranges::any_of(lhs.regions, [&](const auto& left) {
         return std::ranges::any_of(rhs.regions, [&](const auto& right) {
             return regions_overlap(left, right);
+        });
+    });
+}
+
+bool plans_share_mem_queue(
+    const WeightPrefetchPlan& lhs, const WeightPrefetchPlan& rhs)
+{
+    return std::ranges::any_of(lhs.regions, [&](const auto& left) {
+        return std::ranges::any_of(rhs.regions, [&](const auto& right) {
+            return regions_share_mem_queue(left, right);
         });
     });
 }
@@ -277,7 +296,12 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         // physically disjoint pages may be loaded before execution; pages that
         // share a bank/slice/row range retain their release-ordered JIT load.
         bool canPreload = true;
+        std::uint64_t sharedQueueReusableCycle = 0;
         for (std::size_t previous = 0; previous < index; ++previous) {
+            if (plans_share_mem_queue(plan, plans[previous]))
+                sharedQueueReusableCycle = std::max(
+                    sharedQueueReusableCycle,
+                    plans[previous].release_cycle);
             if (!plans_overlap_impl(plan, plans[previous])) continue;
             // DDR latency is intentionally nondeterministic. With no staging
             // buffer between DDR and the shared C2C/MEM path, launching before
@@ -295,14 +319,34 @@ void schedule_weight_prefetches(const BinaryProgram& program,
             canPreload = false;
         }
         plan.pre_execution = canPreload;
-        if (plan.pre_execution)
+        if (plan.pre_execution) {
             plan.transfer_end_cycle = durations[index];
+        } else {
+            // MEM has one ICU queue and one SRAM port per
+            // (hemisphere, slice, bank). A later page may occupy disjoint rows
+            // yet still contend with an earlier page's compute reads. Once a
+            // page must be fetched during execution, defer its C2C writes
+            // until every earlier consumer on each shared queue has released
+            // the port. This mirrors the compiler FFN page-task dependency.
+            reusableCycles[index] = std::max(
+                reusableCycles[index], sharedQueueReusableCycle);
+        }
     }
 
+    std::vector<std::size_t> launchOrder;
+    launchOrder.reserve(plans.size());
+    for (std::size_t index = 0; index < plans.size(); ++index)
+        if (!plans[index].pre_execution)
+            launchOrder.push_back(index);
+    std::ranges::sort(launchOrder, [&](std::size_t lhs, std::size_t rhs) {
+        return reusableCycles[lhs] != reusableCycles[rhs]
+            ? reusableCycles[lhs] < reusableCycles[rhs]
+            : plans[lhs].ready_cycle < plans[rhs].ready_cycle;
+    });
+
     std::uint64_t nextQueueCursor = 0;
-    for (std::size_t index = 0; index < plans.size(); ++index) {
+    for (const std::size_t index : launchOrder) {
         auto& plan = plans[index];
-        if (plan.pre_execution) continue;
         // Once every overlapping SRAM region has been released, retaining
         // the transfer until just before its consumer only reduces the time
         // available to absorb DDR latency and jitter. Launch at the earliest

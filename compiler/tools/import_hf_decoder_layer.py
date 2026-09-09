@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Imports one Llama/Qwen2 Hugging Face decoder layer without PyTorch."""
+"""Imports one Llama/Qwen2/Qwen3 Hugging Face decoder layer without PyTorch."""
 
 from __future__ import annotations
 
@@ -138,6 +138,37 @@ def rms_norm(value: np.ndarray, weight: np.ndarray, epsilon: float) -> np.ndarra
     return bf16((value * bf16(weight)) * factor)
 
 
+def attention_head_dim(config: dict[str, object]) -> int:
+    """Returns the explicit attention head width used by the checkpoint."""
+    query_heads = int(config["num_attention_heads"])
+    hidden = int(config["hidden_size"])
+    if query_heads <= 0:
+        raise ValueError("attention head count must be positive")
+    configured = config.get("head_dim")
+    if configured is None and hidden % query_heads:
+        raise ValueError("hidden_size must divide evenly across attention heads")
+    head_dim = int(configured if configured is not None else hidden // query_heads)
+    if head_dim <= 0:
+        raise ValueError("attention head count and head_dim must be positive")
+    return head_dim
+
+
+def head_rms_norm(
+    value: np.ndarray, weight: np.ndarray, epsilon: float
+) -> np.ndarray:
+    """Applies the Qwen3 Q/K RMSNorm independently to every attention head."""
+    if value.ndim != 3:
+        raise ValueError("head RMSNorm input must have shape [tokens, heads, dim]")
+    head_dim = value.shape[-1]
+    if weight.shape != (head_dim,):
+        raise ValueError(
+            f"head RMSNorm weight must have shape {(head_dim,)}, got {weight.shape}"
+        )
+    return rms_norm(value.reshape(-1, head_dim), weight, epsilon).reshape(
+        value.shape
+    )
+
+
 def linear(
     value: np.ndarray,
     weight: np.ndarray,
@@ -160,11 +191,16 @@ def biased_linear(
     return result if bias is None else bf16(result + bf16(bias))
 
 
-def rope(value: np.ndarray, theta: float) -> np.ndarray:
+def rope_at_positions(
+    value: np.ndarray, positions: np.ndarray, theta: float
+) -> np.ndarray:
     seq_len, _, head_dim = value.shape
+    positions = np.asarray(positions, dtype=np.float32)
+    if positions.shape != (seq_len,):
+        raise ValueError("RoPE positions must have one entry per token")
     half = head_dim // 2
     inverse = theta ** (-np.arange(half, dtype=np.float32) * 2.0 / head_dim)
-    angle = np.arange(seq_len, dtype=np.float32)[:, None] * inverse[None, :]
+    angle = positions[:, None] * inverse[None, :]
     cosine = bf16(np.cos(angle))[:, None, :]
     sine = bf16(np.sin(angle))[:, None, :]
     low = value[:, :, :half]
@@ -174,26 +210,36 @@ def rope(value: np.ndarray, theta: float) -> np.ndarray:
     ))
 
 
-def biased_rope_linear(
+def rope(value: np.ndarray, theta: float) -> np.ndarray:
+    return rope_at_positions(
+        value, np.arange(value.shape[0], dtype=np.float32), theta
+    )
+
+
+def biased_rope_linear_at_positions(
     value: np.ndarray,
     weight: np.ndarray,
     scale: float,
     bias: np.ndarray | None,
     heads: int,
     theta: float,
+    positions: np.ndarray,
 ) -> np.ndarray:
     projection = linear(value, weight, scale, bf16_scale=True).reshape(
         value.shape[0], heads, -1
     )
+    positions = np.asarray(positions, dtype=np.float32)
+    if positions.shape != (value.shape[0],):
+        raise ValueError("RoPE positions must have one entry per token")
     if bias is None:
-        return rope(projection, theta)
+        return rope_at_positions(projection, positions, theta)
 
-    seq_len, _, head_dim = projection.shape
+    _, _, head_dim = projection.shape
     half = head_dim // 2
     inverse = theta ** (
         -np.arange(half, dtype=np.float32) * np.float32(2.0 / head_dim)
     )
-    angle = np.arange(seq_len, dtype=np.float32)[:, None] * inverse[None, :]
+    angle = positions[:, None] * inverse[None, :]
     cosine = bf16(np.cos(angle))[:, None, :]
     sine = bf16(np.sin(angle))[:, None, :]
     bias = bf16(bias).reshape(1, heads, head_dim)
@@ -209,6 +255,48 @@ def biased_rope_linear(
     return bf16(np.concatenate(
         (low_cos - high_sin, high_cos + low_sin), axis=-1
     ))
+
+
+def normalized_rope_linear_at_positions(
+    value: np.ndarray,
+    weight: np.ndarray,
+    scale: float,
+    bias: np.ndarray | None,
+    heads: int,
+    theta: float,
+    positions: np.ndarray,
+    norm_weight: np.ndarray | None = None,
+    epsilon: float = 1.0e-6,
+) -> np.ndarray:
+    """Projects Q/K, applies optional per-head RMSNorm, and then RoPE."""
+    if norm_weight is None:
+        return biased_rope_linear_at_positions(
+            value, weight, scale, bias, heads, theta, positions
+        )
+    projection = biased_linear(value, weight, scale, bias).reshape(
+        value.shape[0], heads, -1
+    )
+    projection = head_rms_norm(projection, norm_weight, epsilon)
+    return rope_at_positions(projection, positions, theta)
+
+
+def biased_rope_linear(
+    value: np.ndarray,
+    weight: np.ndarray,
+    scale: float,
+    bias: np.ndarray | None,
+    heads: int,
+    theta: float,
+) -> np.ndarray:
+    return biased_rope_linear_at_positions(
+        value,
+        weight,
+        scale,
+        bias,
+        heads,
+        theta,
+        np.arange(value.shape[0], dtype=np.float32),
+    )
 
 
 def vxm_lut(value: np.ndarray, operation: str) -> np.ndarray:
@@ -296,6 +384,164 @@ def lpu_softmax(
     return bf16(exponentials * reciprocal)
 
 
+def decoder_layer_prefill_kv_reference(
+    activation: np.ndarray,
+    norm0: np.ndarray,
+    weights: dict[str, np.ndarray],
+    scales: dict[str, float],
+    config: dict[str, object],
+    biases: dict[str, np.ndarray] | None = None,
+    qk_norms: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if activation.ndim != 2:
+        raise ValueError("prefill activation must have shape [tokens, hidden]")
+    seq_len, hidden = activation.shape
+    query_heads = int(config["num_attention_heads"])
+    kv_heads = int(config["num_key_value_heads"])
+    head_dim = attention_head_dim(config)
+    query_width = query_heads * head_dim
+    kv_width = kv_heads * head_dim
+    if weights["query"].shape != (hidden, query_width):
+        raise ValueError("query projection shape does not match Qwen configuration")
+    if weights["key"].shape != (hidden, kv_width):
+        raise ValueError("key projection shape does not match Qwen configuration")
+    epsilon = float(config["rms_norm_eps"])
+    biases = biases or {}
+    qk_norms = qk_norms or {}
+
+    normalized = rms_norm(activation, norm0, epsilon)
+    positions = np.arange(seq_len, dtype=np.float32)
+    key = normalized_rope_linear_at_positions(
+        normalized,
+        weights["key"],
+        scales["key"],
+        biases.get("key"),
+        kv_heads,
+        float(config["rope_theta"]),
+        positions,
+        qk_norms.get("key"),
+        epsilon,
+    )
+    value = biased_linear(
+        normalized,
+        weights["value"],
+        scales["value"],
+        biases.get("value"),
+    ).reshape(seq_len, kv_heads, head_dim)
+    return key, value
+
+
+def decoder_layer_decode_reference(
+    activation: np.ndarray,
+    key_cache: np.ndarray,
+    value_cache: np.ndarray,
+    position: int,
+    norm0: np.ndarray,
+    norm1: np.ndarray,
+    weights: dict[str, np.ndarray],
+    scales: dict[str, float],
+    config: dict[str, object],
+    biases: dict[str, np.ndarray] | None = None,
+    stage_outputs: dict[str, np.ndarray] | None = None,
+    qk_norms: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if activation.ndim != 2 or activation.shape[0] != 1:
+        raise ValueError("decode activation must have shape [1, hidden]")
+    _, hidden = activation.shape
+    query_heads = int(config["num_attention_heads"])
+    kv_heads = int(config["num_key_value_heads"])
+    if query_heads % kv_heads != 0:
+        raise ValueError("invalid grouped-query attention dimensions")
+    head_dim = attention_head_dim(config)
+    query_width = query_heads * head_dim
+    expected_cache_shape = (position, kv_heads, head_dim)
+    if key_cache.shape != expected_cache_shape:
+        raise ValueError(
+            f"key cache shape must be {expected_cache_shape}, got {key_cache.shape}"
+        )
+    if value_cache.shape != expected_cache_shape:
+        raise ValueError(
+            f"value cache shape must be {expected_cache_shape}, got {value_cache.shape}"
+        )
+    biases = biases or {}
+    qk_norms = qk_norms or {}
+    epsilon = float(config["rms_norm_eps"])
+    positions = np.asarray([position], dtype=np.float32)
+
+    normalized = rms_norm(activation, norm0, epsilon)
+    query = normalized_rope_linear_at_positions(
+        normalized,
+        weights["query"],
+        scales["query"],
+        biases.get("query"),
+        query_heads,
+        float(config["rope_theta"]),
+        positions,
+        qk_norms.get("query"),
+        epsilon,
+    )
+    new_key = normalized_rope_linear_at_positions(
+        normalized,
+        weights["key"],
+        scales["key"],
+        biases.get("key"),
+        kv_heads,
+        float(config["rope_theta"]),
+        positions,
+        qk_norms.get("key"),
+        epsilon,
+    )
+    new_value = biased_linear(
+        normalized,
+        weights["value"],
+        scales["value"],
+        biases.get("value"),
+    ).reshape(1, kv_heads, head_dim)
+    present_key = np.concatenate((key_cache, new_key), axis=0)
+    present_value = np.concatenate((value_cache, new_value), axis=0)
+
+    repeats = query_heads // kv_heads
+    attention_key = np.transpose(
+        np.repeat(present_key, repeats, axis=1), (1, 0, 2)
+    )
+    attention_value = np.transpose(
+        np.repeat(present_value, repeats, axis=1), (1, 0, 2)
+    )
+    query = np.transpose(query, (1, 0, 2))
+    scores = bf16(query @ np.transpose(attention_key, (0, 2, 1)))
+    probability = lpu_softmax(scores, head_dim, causal=False)
+    context = bf16(
+        np.transpose(probability @ attention_value, (1, 0, 2)).reshape(
+            1, query_width
+        )
+    )
+    attention = linear(
+        context, weights["output"], scales["output"], bf16_scale=True
+    )
+    residual = bf16(activation + attention)
+    normalized_ffn = rms_norm(residual, norm1, epsilon)
+    gate = linear(normalized_ffn, weights["gate"], scales["gate"], True)
+    up = linear(normalized_ffn, weights["up"], scales["up"], True)
+    swiglu = bf16((gate / (1.0 + np.exp(-gate))) * up)
+    down = linear(swiglu, weights["down"], scales["down"], True)
+    output = bf16(residual + down)
+
+    if stage_outputs is not None:
+        stage_outputs["normalized"] = normalized
+        stage_outputs["query"] = np.transpose(query, (1, 0, 2))
+        stage_outputs["new_key"] = new_key
+        stage_outputs["new_value"] = new_value
+        stage_outputs["scores"] = scores
+        stage_outputs["probability"] = probability
+        stage_outputs["context"] = context
+        stage_outputs["attention"] = attention
+        stage_outputs["residual0"] = residual
+        stage_outputs["norm1"] = normalized_ffn
+        stage_outputs["swiglu"] = swiglu
+        stage_outputs["down"] = down
+    return output, present_key, present_value
+
+
 def decoder_layer_reference(
     activation: np.ndarray,
     norm0: np.ndarray,
@@ -305,33 +551,39 @@ def decoder_layer_reference(
     config: dict[str, object],
     biases: dict[str, np.ndarray] | None = None,
     stage_outputs: dict[str, np.ndarray] | None = None,
+    qk_norms: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     seq_len, hidden = activation.shape
     query_heads = int(config["num_attention_heads"])
     kv_heads = int(config["num_key_value_heads"])
-    head_dim = hidden // query_heads
+    head_dim = attention_head_dim(config)
+    query_width = query_heads * head_dim
     epsilon = float(config["rms_norm_eps"])
 
     normalized = rms_norm(activation, norm0, epsilon)
     if stage_outputs is not None:
         stage_outputs["norm0"] = normalized
     biases = biases or {}
-    query = biased_rope_linear(
+    qk_norms = qk_norms or {}
+    positions = np.arange(seq_len, dtype=np.float32)
+    query = normalized_rope_linear_at_positions(
         normalized, weights["query"], scales["query"],
         biases.get("query"), query_heads,
-        float(config["rope_theta"]),
+        float(config["rope_theta"]), positions,
+        qk_norms.get("query"), epsilon,
     )
-    key = biased_rope_linear(
+    key = normalized_rope_linear_at_positions(
         normalized, weights["key"], scales["key"],
         biases.get("key"), kv_heads,
-        float(config["rope_theta"]),
+        float(config["rope_theta"]), positions,
+        qk_norms.get("key"), epsilon,
     )
     value = biased_linear(normalized, weights["value"], scales["value"],
                           biases.get("value")).reshape(
         seq_len, kv_heads, head_dim
     )
     if stage_outputs is not None:
-        stage_outputs["query"] = query.reshape(seq_len, hidden)
+        stage_outputs["query"] = query.reshape(seq_len, query_width)
         stage_outputs["key"] = key.reshape(seq_len, kv_heads * head_dim)
         stage_outputs["value"] = value.reshape(seq_len, kv_heads * head_dim)
     repeats = query_heads // kv_heads
@@ -343,7 +595,9 @@ def decoder_layer_reference(
     scores = bf16(query @ np.transpose(key, (0, 2, 1)))
     probability = lpu_softmax(scores, head_dim)
     context = bf16(
-        np.transpose(probability @ value, (1, 0, 2)).reshape(seq_len, hidden)
+        np.transpose(probability @ value, (1, 0, 2)).reshape(
+            seq_len, query_width
+        )
     )
     attention = linear(
         context, weights["output"], scales["output"], bf16_scale=True
@@ -393,8 +647,10 @@ def main() -> None:
     config = json.loads(
         (args.model_dir / "config.json").read_text(encoding="utf-8")
     )
-    if config.get("model_type") not in ("llama", "qwen2"):
-        raise ValueError("only standard Llama and Qwen2 checkpoints are supported")
+    if config.get("model_type") not in ("llama", "qwen2", "qwen3"):
+        raise ValueError(
+            "only standard Llama, Qwen2, and dense Qwen3 checkpoints are supported"
+        )
     if args.seq_len % 32:
         raise ValueError("current LPU decoder executable requires seq_len divisible by 32")
 
@@ -424,15 +680,44 @@ def main() -> None:
             biases[role] = store.read(f"{prefix}.self_attn.{stem}.bias")
 
     hidden = int(config["hidden_size"])
-    kv_width = (
-        int(config["num_key_value_heads"])
-        * hidden // int(config["num_attention_heads"])
-    )
+    query_heads = int(config["num_attention_heads"])
+    kv_heads = int(config["num_key_value_heads"])
+    head_dim = attention_head_dim(config)
+    query_width = query_heads * head_dim
+    kv_width = kv_heads * head_dim
+    expected_weight_shapes = {
+        "query": (hidden, query_width),
+        "key": (hidden, kv_width),
+        "value": (hidden, kv_width),
+        "output": (query_width, hidden),
+        "gate": (hidden, int(config["intermediate_size"])),
+        "up": (hidden, int(config["intermediate_size"])),
+        "down": (int(config["intermediate_size"]), hidden),
+    }
+    for role, expected in expected_weight_shapes.items():
+        if quantized[role].shape != expected:
+            raise ValueError(
+                f"{role} weight must have shape {expected}, "
+                f"got {quantized[role].shape}"
+            )
     serialized_biases = {
-        "query": biases.get("query", np.zeros(hidden, dtype=np.float32)),
+        "query": biases.get("query", np.zeros(query_width, dtype=np.float32)),
         "key": biases.get("key", np.zeros(kv_width, dtype=np.float32)),
         "value": biases.get("value", np.zeros(kv_width, dtype=np.float32)),
     }
+
+    qk_norms: dict[str, np.ndarray] = {}
+    if config.get("model_type") == "qwen3":
+        qk_norms = {
+            "query": store.read(f"{prefix}.self_attn.q_norm.weight"),
+            "key": store.read(f"{prefix}.self_attn.k_norm.weight"),
+        }
+        for role, value in qk_norms.items():
+            if value.shape != (head_dim,):
+                raise ValueError(
+                    f"{role} norm weight must have shape {(head_dim,)}, "
+                    f"got {value.shape}"
+                )
 
     norm0 = store.read(f"{prefix}.input_layernorm.weight")
     norm1 = store.read(f"{prefix}.post_attention_layernorm.weight")
@@ -448,7 +733,7 @@ def main() -> None:
     stage_outputs: dict[str, np.ndarray] = {}
     golden = decoder_layer_reference(
         activation, norm0, norm1, quantized, scales, config, biases,
-        stage_outputs,
+        stage_outputs, qk_norms,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -470,6 +755,8 @@ def main() -> None:
     ).tofile(args.output_dir / "quant_scales.f32.bin")
     for role, value in serialized_biases.items():
         write_bf16(args.output_dir / f"{role}_bias.bf16.bin", value)
+    for role, value in qk_norms.items():
+        write_bf16(args.output_dir / f"{role}_norm.bf16.bin", value)
 
     metadata = {
         "model": args.model_dir.name,
@@ -478,9 +765,11 @@ def main() -> None:
         "seq_len": args.seq_len,
         "hidden_size": int(config["hidden_size"]),
         "intermediate_size": int(config["intermediate_size"]),
-        "query_heads": int(config["num_attention_heads"]),
-        "kv_heads": int(config["num_key_value_heads"]),
-        "head_dim": int(config["hidden_size"]) // int(config["num_attention_heads"]),
+        "query_heads": query_heads,
+        "kv_heads": kv_heads,
+        "head_dim": head_dim,
+        "query_width": query_width,
+        "kv_width": kv_width,
         "rope_theta": float(config["rope_theta"]),
         "rms_norm_eps": float(config["rms_norm_eps"]),
         "scales": scales,
@@ -493,6 +782,12 @@ def main() -> None:
         ),
         "bias_roles": sorted(biases),
         "bias_operand_roles": sorted(serialized_biases),
+        "qk_norm": bool(qk_norms),
+        "qk_norm_roles": sorted(qk_norms),
+        "qk_norm_tensors": {
+            "query": f"{prefix}.self_attn.q_norm.weight",
+            "key": f"{prefix}.self_attn.k_norm.weight",
+        } if qk_norms else {},
         "bias_tensors": {
             role: f"{prefix}.self_attn.{stem}.bias"
             for role, stem in (("query", "q_proj"), ("key", "k_proj"),

@@ -143,6 +143,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
 mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const target::LPUTargetModel& target, EastMemoryAllocator& allocator,
     AllocateValueFn allocate_value, int64_t weight_bank,
+    bool follows_paged_attention,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_swiglu(kernel::SwigluOp op,
     EastMemoryAllocator& allocator, AllocateValueFn allocate_value,

@@ -23,6 +23,9 @@ the C2C path. Device-resident aliases between decoder layers remain internal.
 
 - Each MEM slice has two independent single-port SRAM banks.
 - A MEM ICU queue identifies `(hemisphere, slice, bank)`.
+- Pages with disjoint rows still share that queue and SRAM port. Runtime orders
+  C2C writes after the compiler release cycle of earlier compute on the same
+  port.
 - SRAM addresses are bank-local rows; each row is 32 bytes. The shared target
   has two 256 KiB banks, so each bank exposes rows `0..8191`.
 - A bank-0 read may issue in the same cycle as a bank-1 write. Operations in one bank still obey its single-port constraint.
@@ -80,6 +83,22 @@ packed page remains a separate valid layout.
 5. At layer completion, wait only for any unfinished part of page 1.
 6. Load layer 1, start its complete Attention -> FFN execution, start page 2
    into bank 0, and continue alternating.
+
+### Intra-executable Down-tile streaming
+
+The Qwen3-0.6B seq-32 Down projection treats each output wave as an independently
+consumable weight tile. Its eight tiles use only two physical slots:
+`bank1,row0` and `bank0,row0`, alternating `1,0,1,0,...`. Every tile retains its
+own binary `ready_cycle` and `release_cycle`. Runtime derives the earliest safe
+launch from the preceding tile's same-bank release and dispatches DMA in that
+order rather than consumer order. While tile `i` computes from one bank, C2C
+writes tile `i+1` into the other bank. Once tile `i` releases, tile `i+2` reuses
+its slot.
+
+A free byte range alone is insufficient: one `(hemisphere,slice,bank)` has one
+MEM queue, even for disjoint rows, so a C2C write cannot overlap an MXM weight
+read on that port. Alternating banks supplies independent ports for transfer
+and compute.
 
 ### Page-ready synchronization
 
@@ -140,6 +159,10 @@ scales with segments rather than 32-byte vectors.
   uses the opposite placement.
 - `model_session_c2c_io_test` round-trips a 32x1536 BF16 tensor through DDR,
   C2C, and MEM and rejects a host/MEM bypass.
+- The complete Qwen3-0.6B seq-32 C2C layer test compares all 32,768 BF16
+  outputs with maximum absolute error 0.09375. Prefetch for the final six Down
+  tiles overlaps MXM compute, `weight_page_runtime_wait_cycles=0`, and the
+  runtime trace contains no `ICU.PageReadyWait` rows.
 - The real Qwen2.5-1.5B layer-0 seq-len-32 executable passes all 49,152 output
   values against the hardware-arithmetic golden with maximum absolute error
   0.015625 and MAE 0.000332287. Checkpoint Q/K/V biases are ordinary StableHLO

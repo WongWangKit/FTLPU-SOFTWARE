@@ -57,6 +57,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         graph.key_bias ? graph.key_bias.getBias() : mlir::Value {};
     const mlir::Value value_bias =
         graph.value_bias ? graph.value_bias.getBias() : mlir::Value {};
+    const mlir::Value query_norm_weight =
+        graph.query_norm ? graph.query_norm.getWeight() : mlir::Value {};
+    const mlir::Value key_norm_weight =
+        graph.key_norm ? graph.key_norm.getWeight() : mlir::Value {};
+    const bool has_qk_norm = query_norm_weight && key_norm_weight;
     const bool has_qk_bias = query_bias || key_bias;
     const bool has_attention_bias = query_bias || key_bias || value_bias;
     auto execution_policy =
@@ -147,6 +152,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         && target.throughput().vxm_fma_enabled != 0
         && target.throughput().vxm_alus >= 4
         && !has_qk_bias
+        && !has_qk_norm
         && target.memory().hemispheres == 2
         && head_blocks == 4;
     const int64_t logical_head_banks = (head_blocks + 1) / 2;
@@ -162,6 +168,9 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // Only its four 32-column blocks are live in the staging FIFO; later
     // heads reuse the same rows.
     const int64_t rope_staging_rows = 4 * seq_len;
+    const int64_t qk_norm_matrix_rows =
+        seq_len * head_dim
+        / (tile * target.throughput().lanes_per_tile);
     const int64_t rope_product_rows =
         (query_heads + kv_heads) * (head_blocks / 2) * 4
         * (compact_rope_products ? seq_len : (seq_len + 1) / 2);
@@ -195,6 +204,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t query_bias_base = projection_bias_base;
     const int64_t key_bias_base = query_bias_base + query_bias_rows;
     const int64_t value_bias_base = key_bias_base + key_bias_rows;
+    const int64_t qk_norm_gamma_base =
+        input_staging_base - 2 * head_dim;
+    const int64_t query_norm_gamma_base = qk_norm_gamma_base;
+    const int64_t key_norm_gamma_base =
+        query_norm_gamma_base + head_dim;
     // Attention intermediates live in the activation partition. Keep their
     // low row above the persistent residual input so later weight pages may
     // remain resident in the dedicated weight slices throughout RoPE and
@@ -208,7 +222,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // below the late input-staging window instead of relying on stage lifetime
     // reuse.
     const int64_t score_base = target.uses_dedicated_slice_roles()
-        ? distributed_input_rows : target.attention_score_base_row();
+        ? std::max(distributed_input_rows, key_rows)
+        : target.attention_score_base_row();
     const int64_t query_base = score_base + score_rows;
     // Value is independent of QK and may be projected before Key so the
     // following layer's weight refill can overlap the rest of attention.
@@ -223,12 +238,20 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t value_base = kv_cache_enabled
         ? target.memory().words_per_bank - value_rows
         : transient_value_base;
+    const int64_t qk_norm_scratch_base = std::max(
+        kv_cache_enabled ? transient_value_base : value_base + value_rows,
+        rope_product_base + rope_product_rows);
+    const int64_t qk_norm_input_base = qk_norm_scratch_base;
+    const int64_t qk_norm_output_base = qk_norm_scratch_base;
     const int64_t causal_mask_base = target.uses_dedicated_slice_roles()
         ? rope_rows : target.attention_mask_base_row();
     if (value_base < 0 || value_base + value_rows
             > target.memory().words_per_bank
-        || rope_staging_base + rope_staging_rows
-            > target.memory().words_per_bank
+        || (has_qk_norm
+            && (qk_norm_input_base + qk_norm_matrix_rows + 1
+                    > input_staging_base
+                || qk_norm_output_base + qk_norm_matrix_rows
+                    > input_staging_base))
         || rope_product_base + rope_product_rows
             > target.memory().words_per_bank
         || (compact_rope_products
@@ -270,6 +293,27 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         }
         projection_bias_slices.assign(
             storage.begin() + 12, storage.begin() + 16);
+    }
+    llvm::SmallVector<int64_t, 16> qk_norm_input_slices;
+    llvm::SmallVector<int64_t, 16> qk_norm_output_slices;
+    llvm::SmallVector<int64_t, 2> qk_norm_weight_slices;
+    if (has_qk_norm) {
+        const auto storage = target.activation_storage_slices();
+        const auto norm_scratch =
+            target.mxm_distributed_activation_slices();
+        if (storage.size() < 2 || qk_norm_gamma_base < 0
+            || norm_scratch.size() < 16) {
+            op.emitError(
+                "Q/K head RMSNorm requires 16 activation scratch slices "
+                "and two activation gamma slices");
+            return mlir::failure();
+        }
+        qk_norm_input_slices.assign(
+            norm_scratch.begin(), norm_scratch.begin() + 16);
+        qk_norm_output_slices.assign(
+            norm_scratch.begin(), norm_scratch.begin() + 16);
+        qk_norm_weight_slices.assign(
+            storage.end() - 2, storage.end());
     }
     // Product-phase Q/K reads share the 16-slice RoPE staging footprint.
     // Keep bias on the opposite bank so each cycle can fetch both operands
@@ -375,6 +419,17 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         op.emitError("failed to reserve the attention RoPE staging FIFO");
         return mlir::failure();
     }
+    if (has_qk_norm
+        && (mlir::failed(physical_allocator.reserve({"qk_norm_input",
+                qk_norm_input_slices, qk_norm_input_base,
+                qk_norm_matrix_rows + 1, 0, 2, false, scratch_bank}))
+            || mlir::failed(physical_allocator.reserve({"qk_norm_output",
+                qk_norm_output_slices, qk_norm_output_base,
+                qk_norm_matrix_rows, 0, 2, false,
+                secondary_scratch_bank})))) {
+        op.emitError("failed to reserve Q/K head RMSNorm scratch");
+        return mlir::failure();
+    }
     if (mlir::failed(physical_allocator.reserve({"rope_product",
             rope_product_slices, rope_product_base, rope_product_rows,
             0, 2, !compact_rope_products,
@@ -396,6 +451,18 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         || mlir::failed(reserve_bias("value_bias", value_bias_rows))) {
         op.emitError(
             "failed to reserve the attention projection-bias constants");
+        return mlir::failure();
+    }
+    if (has_qk_norm
+        && (mlir::failed(physical_allocator.reserve({"query_norm_weight",
+                llvm::SmallVector<int64_t, 16>(qk_norm_weight_slices.begin(),
+                    qk_norm_weight_slices.end()), query_norm_gamma_base, head_dim,
+                0, 3, false, scratch_bank}))
+            || mlir::failed(physical_allocator.reserve({"key_norm_weight",
+                llvm::SmallVector<int64_t, 16>(qk_norm_weight_slices.begin(),
+                    qk_norm_weight_slices.end()), key_norm_gamma_base, head_dim,
+                0, 3, false, scratch_bank})))) {
+        op.emitError("failed to reserve Q/K head RMSNorm gamma constants");
         return mlir::failure();
     }
     if (compact_rope_products
@@ -929,6 +996,40 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             seq_len * hidden / (tile * 2), "east",
             vector_result->bank)),
     });
+    if (has_qk_norm) {
+        mlir::NamedAttrList plan_attributes(plan);
+        plan_attributes.set("query_norm_weight",
+            make_attention_placement(rewriter,
+                "fp16_vxm_gamma_broadcast", qk_norm_weight_slices,
+                query_norm_gamma_base, head_dim, "both",
+                scratch_bank));
+        plan_attributes.set("key_norm_weight",
+            make_attention_placement(rewriter,
+                "fp16_vxm_gamma_broadcast", qk_norm_weight_slices,
+                key_norm_gamma_base, head_dim, "both",
+                scratch_bank));
+        plan_attributes.set("query_norm_input",
+            make_attention_placement(rewriter,
+                "fp16_vxm_distributed_16", qk_norm_input_slices,
+                qk_norm_input_base, qk_norm_matrix_rows + 1, "both",
+                scratch_bank));
+        plan_attributes.set("query_norm_output",
+            make_attention_placement(rewriter,
+                "fp16_vxm_distributed_16", qk_norm_output_slices,
+                qk_norm_output_base, qk_norm_matrix_rows, "both",
+                secondary_scratch_bank));
+        plan_attributes.set("key_norm_input",
+            make_attention_placement(rewriter,
+                "fp16_vxm_distributed_16", qk_norm_input_slices,
+                qk_norm_input_base, qk_norm_matrix_rows + 1, "both",
+                scratch_bank));
+        plan_attributes.set("key_norm_output",
+            make_attention_placement(rewriter,
+                "fp16_vxm_distributed_16", qk_norm_output_slices,
+                qk_norm_output_base, qk_norm_matrix_rows, "both",
+                secondary_scratch_bank));
+        plan = plan_attributes.getDictionary(rewriter.getContext());
+    }
     if (has_attention_bias) {
         mlir::NamedAttrList plan_attributes(plan);
         const auto add_bias_placement = [&](llvm::StringRef name,
@@ -972,6 +1073,12 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr(
             "output_weight_scale", graph.output.getRhsScaleAttr()),
     });
+    if (has_qk_norm) {
+        mlir::NamedAttrList config_attributes(config);
+        config_attributes.set("qk_norm_epsilon",
+            graph.query_norm.getEpsilonAttr());
+        config = config_attributes.getDictionary(rewriter.getContext());
+    }
     if (kv_cache_enabled) {
         mlir::NamedAttrList config_attributes(config);
         config_attributes.set("kv_cache_capacity",
@@ -1036,6 +1143,24 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                     "kind", rewriter.getStringAttr(kind));
             return rewriter.create(state)->getResult(0);
         };
+    const auto createRope =
+        [&](mlir::Value input, mlir::Value normWeight,
+            llvm::StringRef kind, mlir::Type resultType,
+            mlir::DictionaryAttr memoryPlan) {
+            mlir::OperationState state(
+                op.getLoc(), tensor::RopeTaskOp::getOperationName());
+            state.addOperands(input);
+            if (normWeight) state.addOperands(normWeight);
+            state.addTypes(resultType);
+            state.addAttributes({
+                rewriter.getNamedAttr(
+                    "kind", rewriter.getStringAttr(kind)),
+                rewriter.getNamedAttr("config", config),
+                rewriter.getNamedAttr("memory_plan", memoryPlan),
+            });
+            return llvm::cast<tensor::RopeTaskOp>(
+                rewriter.create(state)).getResult();
+        };
     const auto createBatchMatmul =
         [&](mlir::Value lhs, mlir::Value rhs,
             llvm::StringRef kind, mlir::Type resultType,
@@ -1069,12 +1194,16 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         graph.value.getLhs(), graph.value.getRhs(), value_bias,
         "value", matrixType(seq_len, kv_width),
         subplan({"value_weight", "value", "value_bias"}));
-    const mlir::Value rotatedQuery = createUnary(
-        tensor::RopeTaskOp::getOperationName(), query.getResult(),
-        "query", query.getResult().getType(), subplan({"rope"}));
-    const mlir::Value rotatedKey = createUnary(
-        tensor::RopeTaskOp::getOperationName(), key.getResult(),
-        "key", key.getResult().getType(), emptyPlan);
+    const mlir::Value rotatedQuery = createRope(
+        query.getResult(), query_norm_weight, "query",
+        query.getResult().getType(),
+        subplan({"rope", "query_norm_weight",
+            "query_norm_input", "query_norm_output"}));
+    const mlir::Value rotatedKey = createRope(
+        key.getResult(), key_norm_weight, "key",
+        key.getResult().getType(),
+        subplan({"key_norm_weight",
+            "key_norm_input", "key_norm_output"}));
     auto qk = createBatchMatmul(
         rotatedQuery, rotatedKey, "qk", scoreType,
         subplan({"score", "score_mxm1"}));
@@ -1103,10 +1232,22 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         subplan({"output_activation", "output_weight", "result"}));
     mlir::Operation* output_operation = graph.output.getOperation();
     rewriter.replaceOp(graph.output, output.getResult());
-    for (mlir::Operation* operation :
-         llvm::reverse(graph.operations)) {
-        if (operation != output_operation && operation->use_empty())
-            rewriter.eraseOp(operation);
+    // Optional Q/K RMSNorm inserts a second producer chain between the
+    // projection and the heads reshape.  Remove dead graph nodes to a fixed
+    // point because a single reverse walk cannot cover both chains with the
+    // legacy operation ordering.
+    bool erasedOperation = true;
+    while (erasedOperation) {
+        erasedOperation = false;
+        for (mlir::Operation*& operation :
+             llvm::reverse(graph.operations)) {
+            if (operation && operation != output_operation
+                && operation->use_empty()) {
+                rewriter.eraseOp(operation);
+                operation = nullptr;
+                erasedOperation = true;
+            }
+        }
     }
     return mlir::success();
 }

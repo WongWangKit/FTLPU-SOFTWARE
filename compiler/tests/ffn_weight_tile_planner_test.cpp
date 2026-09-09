@@ -89,6 +89,22 @@ try {
             throw std::logic_error(
                 "compact Down page has an unexpected physical slot");
     }
+    auto streaming = tensor::planFfnWeightTiles(
+        {32, 1536, 8960, 1536}, largeTarget, 1, true);
+    if (mlir::failed(streaming)
+        || streaming->pages.size() != compact->pages.size())
+        throw std::logic_error(
+            "8192-row Qwen FFN streaming plan has invalid geometry");
+    for (std::size_t wave = 0; wave < 12; ++wave) {
+        const auto& page = streaming->pages[compactProjectionPages + wave];
+        const auto& span = page.spans.front();
+        if (page.bank != static_cast<int64_t>((1 + wave) % 2)
+            || span.slice_group_begin != 0
+            || span.page_base_row != 0
+            || span.rows_per_slice != 2240)
+            throw std::logic_error(
+                "streaming Down page does not reuse alternating bank slots");
+    }
     auto tasks = schedule::buildFfnWeightTileTaskPlan(
         *plan, {32, 1536, 8960, 1536}, target);
     schedule::ResourceScheduler resources;

@@ -277,6 +277,7 @@ public:
             ffn_roots[ffns[index].output.getOperation()] = index;
 
         mlir::IRRewriter rewriter(&getContext());
+        bool loweredPagedAttention = false;
         for (mlir::Operation* operation : operation_order) {
             planner.release_before(operation);
             if (auto found = attention_roots.find(operation);
@@ -287,12 +288,14 @@ public:
                     signalPassFailure();
                     return;
                 }
+                loweredPagedAttention |= weight_bank_ >= 0;
                 continue;
             }
             if (auto found = ffn_roots.find(operation);
                 found != ffn_roots.end()) {
                 if (mlir::failed(lower_ffn(ffns[found->second], target,
-                        allocator, allocate_value, weight_bank_, rewriter))) {
+                        allocator, allocate_value, weight_bank_,
+                        loweredPagedAttention, rewriter))) {
                     signalPassFailure();
                     return;
                 }

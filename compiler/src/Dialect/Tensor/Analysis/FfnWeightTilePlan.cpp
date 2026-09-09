@@ -12,7 +12,7 @@ int64_t divideCeil(int64_t value, int64_t divisor)
 
 mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
     FfnWeightShape shape, const target::LPUTargetModel& target,
-    int64_t initialBank)
+    int64_t initialBank, bool streamingDownDoubleBuffer)
 {
     const auto& memory = target.memory();
     const auto& streams = target.streams();
@@ -131,14 +131,26 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
             int64_t baseRow = 0;
             if (compactDownWaves && reduction == 0
                 && count == downReductionBlocks) {
-                const int64_t residentSlot = wave
-                    % (downWavesPerBank * memory.banks_per_slice);
-                const int64_t bankSlot = residentSlot / downWavesPerBank;
-                const int64_t slotInBank = residentSlot % downWavesPerBank;
-                bank = (initialBank + bankSlot) % memory.banks_per_slice;
-                group = slotInBank / downWavesPerGroup;
-                baseRow = (slotInBank % downWavesPerGroup)
-                    * downRowsPerWave;
+                if (streamingDownDoubleBuffer) {
+                    // One Down output wave is a complete consumer tile. Keep
+                    // exactly one reusable slot per bank so C2C can fill tile
+                    // i+1 while MXM consumes tile i. The compiler-provided
+                    // release interval tells runtime when tile i+2 may reuse
+                    // the same bank slot.
+                    bank = (initialBank + downPageIndex)
+                        % memory.banks_per_slice;
+                    group = 0;
+                    baseRow = 0;
+                } else {
+                    const int64_t residentSlot = wave
+                        % (downWavesPerBank * memory.banks_per_slice);
+                    const int64_t bankSlot = residentSlot / downWavesPerBank;
+                    const int64_t slotInBank = residentSlot % downWavesPerBank;
+                    bank = (initialBank + bankSlot) % memory.banks_per_slice;
+                    group = slotInBank / downWavesPerGroup;
+                    baseRow = (slotInBank % downWavesPerGroup)
+                        * downRowsPerWave;
+                }
             }
             const int64_t rows = compactDownWaves
                     && reduction == 0 && count == downReductionBlocks

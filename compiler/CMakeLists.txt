@@ -319,6 +319,21 @@ if(Python3_Interpreter_FOUND)
             ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/import_hf_decoder_layer_math_test.py)
     add_test(
+        NAME qwen2_5_1_5b_single_layer_decode_reference_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decode_reference_test.py)
+    add_test(
+        NAME qwen3_0_6b_single_layer_decode_reference_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_0_6b_decode_reference_test.py)
+    add_test(
+        NAME qwen3_0_6b_importer_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_0_6b_importer_test.py)
+    add_test(
         NAME build_hf_decoder_stack_paging_test
         COMMAND
             ${Python3_EXECUTABLE}
@@ -360,6 +375,19 @@ if(Python3_Interpreter_FOUND)
             --weight-bank 1
             --kv-cache-capacity 256
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer
+        DEPENDS ftlpu_opt ftlpu_compile
+        USES_TERMINAL)
+    add_custom_target(
+        qwen3_0_6b_decoder_layer_prefill_pipeline
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_0_6b_decoder_layer_pipeline_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen3_0_6b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --weight-bank 1
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen3_0_6b_decoder_layer_prefill
         DEPENDS ftlpu_opt ftlpu_compile
         USES_TERMINAL)
     add_test(

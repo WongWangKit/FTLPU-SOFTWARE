@@ -7,13 +7,30 @@ namespace {
 struct ProjectionRoot {
     MatmulOp matmul;
     BiasAddOp bias;
+    RmsNormOp norm;
+    ReshapeOp norm_input_reshape;
 };
 
 ProjectionRoot match_projection_root(mlir::Value value)
 {
     if (auto bias = value.getDefiningOp<BiasAddOp>())
-        return {bias.getInput().getDefiningOp<MatmulOp>(), bias};
-    return {value.getDefiningOp<MatmulOp>(), {}};
+        return {bias.getInput().getDefiningOp<MatmulOp>(), bias, {}, {}};
+    return {value.getDefiningOp<MatmulOp>(), {}, {}, {}};
+}
+
+ProjectionRoot match_normalized_projection_root(ReshapeOp heads_reshape)
+{
+    if (!heads_reshape) return {};
+    auto norm = heads_reshape.getInput().getDefiningOp<RmsNormOp>();
+    if (!norm) return match_projection_root(heads_reshape.getInput());
+    auto norm_input_reshape =
+        norm.getInput().getDefiningOp<ReshapeOp>();
+    if (!norm_input_reshape) return {};
+    ProjectionRoot root =
+        match_projection_root(norm_input_reshape.getInput());
+    root.norm = norm;
+    root.norm_input_reshape = norm_input_reshape;
+    return root;
 }
 
 } // namespace
@@ -67,14 +84,16 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
         ? key_rope.getInput().getDefiningOp<ReshapeOp>()
         : ReshapeOp {};
     auto query_root = query_reshape
-        ? match_projection_root(query_reshape.getInput())
+        ? match_normalized_projection_root(query_reshape)
         : ProjectionRoot {};
     auto key_root = key_reshape
-        ? match_projection_root(key_reshape.getInput())
+        ? match_normalized_projection_root(key_reshape)
         : ProjectionRoot {};
     auto query = query_root.matmul;
     auto key = key_root.matmul;
-    if (!query || !key || query.getLhs() != key.getLhs()
+    if (!query || !key || static_cast<bool>(query_root.norm)
+            != static_cast<bool>(key_root.norm)
+        || query.getLhs() != key.getLhs()
         || query.getLhs() != value.getLhs()
         || query_rope.getHeadDim() != key_rope.getHeadDim()
         || query_rope.getTheta() != key_rope.getTheta()
@@ -82,6 +101,11 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
         || value_broadcast.getKvHeads() != key_rope.getHeads()
         || key_broadcast.getQueryHeads() != query_rope.getHeads()
         || key_broadcast.getKvHeads() != key_rope.getHeads())
+        return std::nullopt;
+    if (query_root.norm
+        && (query_root.norm.getEpsilon() != key_root.norm.getEpsilon()
+            || query_root.norm.getAxis() != -1
+            || key_root.norm.getAxis() != -1))
         return std::nullopt;
 
     AttentionGraph graph {
@@ -92,10 +116,14 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
         query_root.bias,
         key_root.bias,
         value_root.bias,
+        query_root.norm,
+        key_root.norm,
         context_reshape,
         query_reshape,
         key_reshape,
         value_reshape,
+        query_root.norm_input_reshape,
+        key_root.norm_input_reshape,
         context_transpose,
         query_transpose,
         key_transpose,
@@ -127,6 +155,16 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
     if (value_root.bias)
         graph.operations.insert(graph.operations.begin() + bias_index++,
             value_root.bias.getOperation());
+    if (query_root.norm) {
+        graph.operations.push_back(
+            query_root.norm_input_reshape.getOperation());
+        graph.operations.push_back(query_root.norm.getOperation());
+    }
+    if (key_root.norm) {
+        graph.operations.push_back(
+            key_root.norm_input_reshape.getOperation());
+        graph.operations.push_back(key_root.norm.getOperation());
+    }
     return graph;
 }
 

@@ -178,7 +178,12 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
         || static_cast<int64_t>(gateTempSlices.size()) < requiredTempSlices
         || static_cast<int64_t>(upTempSlices.size()) < requiredTempSlices) {
         ffn.getOperation()->emitError(
-            "FFN Swish temporary storage does not cover every projection pair");
+            "FFN Swish temporary storage does not cover every projection pair: "
+            "m_tile_count=") << mTileCount << ", pair_count=" << pairCount
+            << ", pairs_per_group=" << pairsPerTempGroup
+            << ", required_slices=" << requiredTempSlices
+            << ", gate_slices=" << gateTempSlices.size()
+            << ", up_slices=" << upTempSlices.size();
         return mlir::failure();
     }
 

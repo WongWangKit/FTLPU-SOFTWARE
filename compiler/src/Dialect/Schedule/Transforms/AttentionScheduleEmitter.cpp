@@ -183,6 +183,26 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             llvm::cast<mlir::RankedTensorType>(argument.getType()),
             placement, biasPlacements[index]);
     }
+    const mlir::Value normWeights[] = {
+        op_.getQueryNormWeight(), op_.getKeyNormWeight()};
+    const char* normPlacements[] = {
+        "query_norm_weight", "key_norm_weight"};
+    for (std::size_t index = 0; index < std::size(normWeights); ++index) {
+        if (!normWeights[index]) continue;
+        const auto argument =
+            llvm::dyn_cast<mlir::BlockArgument>(normWeights[index]);
+        const auto placement = memoryPlan.getAs<mlir::DictionaryAttr>(
+            normPlacements[index]);
+        if (!argument || !placement) {
+            op_.emitError(
+                "Q/K head RMSNorm weight is missing a runtime argument or placement");
+            return mlir::failure();
+        }
+        createBinding(rewriter_, op_.getLoc(), normWeights[index],
+            argument.getArgNumber(), "input", "weight",
+            llvm::cast<mlir::RankedTensorType>(argument.getType()),
+            placement, normPlacements[index]);
+    }
     if (op_.getCausal()) {
         const auto maskType = mlir::RankedTensorType::get(
             {tile - 1, tile},
@@ -287,7 +307,7 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             "attention.value");
     }
     const auto contextType = mlir::RankedTensorType::get(
-        {op_.getSeqLen(), op_.getHidden()},
+        {op_.getSeqLen(), op_.getQueryHeads() * op_.getHeadDim()},
         llvm::cast<mlir::RankedTensorType>(
             op_.getInput().getType()).getElementType());
     auto contextBinding = createBinding(
@@ -295,7 +315,6 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         "internal", "workspace", contextType,
         memoryPlan.getAs<mlir::DictionaryAttr>("context"),
         "attention.context");
-
     const int64_t projectionEnd = emitProjections();
     const int64_t qkvCycles = projectionEnd - 1;
     if (qkvCycles <= 0) {

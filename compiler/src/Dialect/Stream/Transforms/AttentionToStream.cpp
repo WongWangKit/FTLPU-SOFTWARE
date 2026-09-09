@@ -143,6 +143,24 @@ mlir::LogicalResult lower_attention(
                     "kind", rewriter.getStringAttr(kind));
             return rewriter.create(state)->getResult(0);
         };
+    const auto createRope =
+        [&](mlir::Value input, mlir::Value normWeight,
+            llvm::StringRef kind, mlir::Type resultType,
+            mlir::ArrayAttr taskRoutes) {
+            mlir::OperationState state(
+                op.getLoc(), stream::RopeTaskOp::getOperationName());
+            state.addOperands(input);
+            if (normWeight) state.addOperands(normWeight);
+            state.addTypes(resultType);
+            state.addAttributes({
+                rewriter.getNamedAttr(
+                    "kind", rewriter.getStringAttr(kind)),
+                rewriter.getNamedAttr("config", config),
+                rewriter.getNamedAttr("routes", taskRoutes),
+            });
+            return llvm::cast<stream::RopeTaskOp>(
+                rewriter.create(state)).getResult();
+        };
     const auto createBatchMatmul =
         [&](mlir::Value lhs, mlir::Value rhs,
             llvm::StringRef kind, mlir::Type resultType,
@@ -183,12 +201,12 @@ mlir::LogicalResult lower_attention(
         routesForPhaseAndRoles("qkv", {"value_weight",
             "value_weight_dequant", "value_activation",
             "value_to_vxm", "value_bias", "value_result"}));
-    const mlir::Value rotatedQuery = createUnary(
-        stream::RopeTaskOp::getOperationName(), query.getResult(),
+    const mlir::Value rotatedQuery = createRope(
+        query.getResult(), op.getQueryNormWeight(),
         "query", query.getResult().getType(),
         routesForPhase("rope"));
-    const mlir::Value rotatedKey = createUnary(
-        stream::RopeTaskOp::getOperationName(), key.getResult(),
+    const mlir::Value rotatedKey = createRope(
+        key.getResult(), op.getKeyNormWeight(),
         "key", key.getResult().getType(),
         rewriter.getArrayAttr({}));
     auto qk = createBatchMatmul(

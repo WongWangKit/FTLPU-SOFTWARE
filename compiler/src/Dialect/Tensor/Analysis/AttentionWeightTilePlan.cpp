@@ -23,7 +23,6 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
     const auto storage = target.weight_storage_slices();
     if (hidden <= 0 || queryHeads <= 0 || kvHeads <= 0
         || headDim <= 0 || hidden % tile != 0
-        || queryHeads * headDim != hidden
         || headDim % tile != 0 || memory.banks_per_slice < 2
         || initialBank < 0 || initialBank >= memory.banks_per_slice
         || throughput.mxms_per_hemisphere != 1
@@ -33,9 +32,10 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
         return mlir::failure();
 
     const int64_t groups = storage.size() / loadSlices;
-    const int64_t reductionBlocks = hidden / tile;
-    const int64_t projectionRowsPerItem = reductionBlocks * 8;
-    const int64_t outputRowsPerItem = reductionBlocks * 4;
+    const int64_t projectionReductionBlocks = hidden / tile;
+    const int64_t outputReductionBlocks = queryHeads * headDim / tile;
+    const int64_t projectionRowsPerItem = projectionReductionBlocks * 8;
+    const int64_t outputRowsPerItem = outputReductionBlocks * 4;
     const int64_t projectionItemsPerGroup =
         memory.sram_depth_rows / projectionRowsPerItem;
     const int64_t outputItemsPerGroup =
@@ -65,21 +65,22 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
     if (projectionGroupsUsed > groups || outputGroups > groups)
         return mlir::failure();
 
-    const auto transferCycles = [&](int64_t columns) {
-        return target.external_read_transfer_cycles(hidden * columns);
+    const auto transferCycles = [&](int64_t rows, int64_t columns) {
+        return target.external_read_transfer_cycles(rows * columns);
     };
     const auto placement = [&](AttentionWeightTileKind kind,
                                int64_t bank, int64_t baseRow,
                                int64_t groupBegin, int64_t groupCount,
                                int64_t itemsPerGroup, int64_t itemCount,
-                               int64_t rowsPerItem, int64_t columns) {
+                               int64_t rowsPerItem, int64_t rows,
+                               int64_t columns) {
         const int64_t residentRows =
             std::min(itemsPerGroup, itemCount) * rowsPerItem;
         return AttentionWeightTilePlacement {kind, bank, 0, baseRow,
             std::min(memory.sram_depth_rows - baseRow,
                 residentRows),
             groupBegin, groupCount, itemsPerGroup, itemCount,
-            rowsPerItem, transferCycles(columns)};
+            rowsPerItem, transferCycles(rows, columns)};
     };
 
     AttentionWeightTilePlan result;
@@ -92,18 +93,18 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
     result.placements = {
         placement(AttentionWeightTileKind::Query, initialBank, 0,
             0, queryGroups, projectionItemsPerGroup, queryItems,
-            projectionRowsPerItem, queryHeads * headDim),
+            projectionRowsPerItem, hidden, queryHeads * headDim),
         placement(AttentionWeightTileKind::Key, initialBank, keyBase,
             keyGroup, 1, projectionItemsPerGroup, keyItems,
-            projectionRowsPerItem, kvHeads * headDim),
+            projectionRowsPerItem, hidden, kvHeads * headDim),
         placement(AttentionWeightTileKind::Value, initialBank, 0,
             valueGroup, divideCeil(valueItems, projectionItemsPerGroup),
             projectionItemsPerGroup, valueItems,
-            projectionRowsPerItem, kvHeads * headDim),
+            projectionRowsPerItem, hidden, kvHeads * headDim),
         placement(AttentionWeightTileKind::Output,
             (initialBank + 1) % memory.banks_per_slice, 0,
             0, outputGroups, outputItemsPerGroup, outputItems,
-            outputRowsPerItem, hidden),
+            outputRowsPerItem, queryHeads * headDim, hidden),
     };
     return result;
 }

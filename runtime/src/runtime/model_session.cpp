@@ -1161,12 +1161,22 @@ void ModelSession::schedule_executable_weight_pages() {
   if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
     debugStopCycle = static_cast<std::size_t>(std::stoull(stop));
   weight_pager_->begin_schedule();
+  std::vector<std::size_t> launchOrder;
+  launchOrder.reserve(executable_weight_transfers_.size());
   for (std::size_t transferIndex = 0;
-       transferIndex < executable_weight_transfers_.size(); ++transferIndex) {
+       transferIndex < executable_weight_transfers_.size(); ++transferIndex)
+    if (!executable_weight_transfers_[transferIndex].plan.pre_execution)
+      launchOrder.push_back(transferIndex);
+  std::ranges::sort(launchOrder, [&](std::size_t lhs, std::size_t rhs) {
+    const auto &left = executable_weight_transfers_[lhs].plan;
+    const auto &right = executable_weight_transfers_[rhs].plan;
+    return left.start_cycle != right.start_cycle
+               ? left.start_cycle < right.start_cycle
+               : left.ready_cycle < right.ready_cycle;
+  });
+  for (const std::size_t transferIndex : launchOrder) {
     ExecutableWeightTransfer &transfer =
         executable_weight_transfers_[transferIndex];
-    if (transfer.plan.pre_execution)
-      continue;
     // A bounded diagnostic run must not inject traffic for a page whose first
     // consumer is beyond the stop point. Besides saving time, this keeps
     // stage captures isolated from future C2C/MEM traffic.

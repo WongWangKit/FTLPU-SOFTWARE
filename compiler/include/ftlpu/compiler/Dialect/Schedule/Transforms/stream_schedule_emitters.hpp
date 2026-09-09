@@ -26,6 +26,16 @@ mlir::LogicalResult lowerLinearProjectionSchedules(
 mlir::LogicalResult lowerRmsNormSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target);
 
+// Emit the VXM feedback implementation used by fused operations that already
+// own their input, gamma, and scratch placements.
+int64_t emitVxmFeedbackRmsNorm(mlir::IRRewriter& rewriter,
+    mlir::Location location, mlir::Value input, mlir::Value weight,
+    mlir::RankedTensorType inputType, double epsilon,
+    const target::LPUTargetModel& target,
+    mlir::DictionaryAttr inputPlacement,
+    mlir::DictionaryAttr weightPlacement,
+    mlir::DictionaryAttr outputPlacement, int64_t start);
+
 mlir::LogicalResult lowerElementwiseSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target);
 

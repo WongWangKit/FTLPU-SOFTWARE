@@ -7,6 +7,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_work_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/lpu_resource_model.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/resource_scheduler.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Transforms/stream_schedule_emitters.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
@@ -21,6 +22,131 @@ int64_t functionArgumentIndex(mlir::Value value) {
   if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(value))
     return argument.getArgNumber();
   return -1;
+}
+
+llvm::SmallVector<int64_t> placementSlices(
+    mlir::DictionaryAttr placement) {
+  llvm::SmallVector<int64_t> result;
+  for (mlir::Attribute value : placement.getAs<mlir::ArrayAttr>("slices"))
+    result.push_back(llvm::cast<mlir::IntegerAttr>(value).getInt());
+  return result;
+}
+
+int64_t placementBase(mlir::DictionaryAttr placement) {
+  return placement.getAs<mlir::IntegerAttr>("base_row").getInt();
+}
+
+int64_t placementBankValue(mlir::DictionaryAttr placement) {
+  return placement.getAs<mlir::IntegerAttr>("bank").getInt();
+}
+
+// Convert one projected head between the RoPE FIFO's MXM-oriented layout and
+// the packed VXM layout used by the feedback RMSNorm implementation.
+int64_t emitRopeNormTranspose(
+    mlir::IRRewriter &rewriter, mlir::Location location,
+    const target::LPUTargetModel &target,
+    const AttentionMemoryLayout &layout, AttentionProjectionKind kind,
+    int64_t head, int64_t seqLen, int64_t headDim,
+    int64_t rawBank, mlir::DictionaryAttr packedPlacement,
+    bool rawToPacked, int64_t start) {
+  const auto rawSlices = layout.ropeStagingSlices();
+  const auto packedSlices = placementSlices(packedPlacement);
+  const int64_t width = 2 * target.throughput().lanes_per_tile;
+  const int64_t tile = target.throughput().mxm_rows;
+  const int64_t tileRows = target.throughput().tile_rows;
+  const int64_t headBlocks = headDim / tile;
+  const int64_t inputBeats = (seqLen / tile) * headBlocks * tileRows;
+  if (rawSlices.size() != static_cast<std::size_t>(width) ||
+      packedSlices.size() != static_cast<std::size_t>(width))
+    return start;
+
+  llvm::SmallVector<int64_t> sourceStreams(
+      static_cast<std::size_t>(width));
+  llvm::SmallVector<int64_t> transposeStreams(
+      static_cast<std::size_t>(width));
+  llvm::SmallVector<int64_t> outputStreams(
+      static_cast<std::size_t>(width));
+  const int64_t sourceBase = target.streams().streams_per_direction - width;
+  const int64_t outputBase = target.streams().streams_per_direction;
+  for (int64_t stream = 0; stream < width; ++stream) {
+    sourceStreams[static_cast<std::size_t>(stream)] = sourceBase + stream;
+    transposeStreams[static_cast<std::size_t>(stream)] = stream;
+    outputStreams[static_cast<std::size_t>(stream)] = outputBase + stream;
+  }
+  const auto readLatency = [&](int64_t slice) {
+    return target
+        .transport_latency(target::StreamEndpoint::Mem,
+                           target::StreamEndpoint::SxmInput,
+                           target::StreamDirection::East, slice)
+        .value();
+  };
+  const auto writeLatency = [&](int64_t slice) {
+    return target
+        .transport_latency(target::StreamEndpoint::SxmResult,
+                           target::StreamEndpoint::Mem,
+                           target::StreamDirection::West, slice)
+        .value();
+  };
+  int64_t maxReadLatency = 0;
+  int64_t maxWriteLatency = 0;
+  for (int64_t slice : rawToPacked ? rawSlices
+                                   : llvm::ArrayRef<int64_t>(packedSlices))
+    maxReadLatency = std::max(maxReadLatency, readLatency(slice));
+  for (int64_t slice : rawToPacked ? llvm::ArrayRef<int64_t>(packedSlices)
+                                   : rawSlices)
+    maxWriteLatency = std::max(maxWriteLatency, writeLatency(slice));
+
+  const int64_t packedBank = placementBankValue(packedPlacement);
+  const int64_t captureStart = start + maxReadLatency;
+  for (int64_t wave = 0; wave < inputBeats; ++wave) {
+    const int64_t tokenBlock = wave / (headBlocks * tileRows);
+    const int64_t headWave = wave % (headBlocks * tileRows);
+    const int64_t headBlock = headWave / tileRows;
+    const int64_t beat = headWave % tileRows;
+    const int64_t rawAddress = layout.ropeStagingAddress(
+        kind, head, headBlock, tokenBlock, beat);
+    const int64_t packedAddress = placementBase(packedPlacement) + wave;
+    for (int64_t hemisphere = 0;
+         hemisphere < target.memory().hemispheres; ++hemisphere) {
+      const int64_t capture = captureStart + wave;
+      for (int64_t stream = 0; stream < width; ++stream) {
+        const int64_t rawSlice =
+            rawSlices[(stream + 2 * headBlock) % width];
+        const int64_t inputSlice = rawToPacked
+                                       ? rawSlice
+                                       : packedSlices[stream];
+        emitMem(rewriter, location, capture - readLatency(inputSlice),
+                hemisphere * target.memory().slices_per_hemisphere +
+                    inputSlice,
+                "read", rawToPacked ? rawAddress : packedAddress,
+                sourceBase + stream, 1, 1, 0, "sram", -1,
+                rawToPacked ? rawBank : packedBank);
+      }
+      emitWavefrontBeat(rewriter, location, target, capture, hemisphere, wave,
+                        sourceStreams, transposeStreams, outputStreams);
+      for (int64_t stream = 0; stream < width; ++stream) {
+        const int64_t rawSlice =
+            rawSlices[(stream + 2 * headBlock) % width];
+        const int64_t outputSlice = rawToPacked
+                                        ? packedSlices[stream]
+                                        : rawSlice;
+        emitMem(rewriter, location, capture + 1 + writeLatency(outputSlice),
+                hemisphere * target.memory().slices_per_hemisphere +
+                    outputSlice,
+                "write", rawToPacked ? packedAddress : rawAddress,
+                outputBase + stream, 1, 1, 0, "sram", -1,
+                rawToPacked ? packedBank : rawBank);
+      }
+    }
+  }
+  for (int64_t hemisphere = 0;
+       hemisphere < target.memory().hemispheres; ++hemisphere)
+    for (int64_t tail = 0; tail < tileRows - 1; ++tail)
+      emitWavefrontTail(rewriter, location, target,
+                        captureStart + inputBeats + tail, hemisphere, tail,
+                        transposeStreams, outputStreams);
+  return captureStart + inputBeats +
+         std::max(tileRows, maxWriteLatency + 1);
 }
 
 } // namespace
@@ -177,6 +303,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       target_.throughput().vxm_cross_hemisphere_streams_enabled != 0 &&
       target_.throughput().vxm_fma_enabled != 0 &&
       target_.throughput().vxm_alus >= 4 && !hasQkBias &&
+      !op_.hasQkNorm() &&
       target_.memory().hemispheres == 2 && projectionHeadBlocks == 4;
   const bool projectionRopeOverlap =
       !directRopeCapable && inputDistributed16 &&
@@ -855,6 +982,61 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           }
           replicateCycle = std::max(replicateCycle,
                                     replicateEnd + maxStagingReadLatency + 1);
+        }
+
+        if (op_.hasQkNorm()) {
+          if (firstOutputBlock % projectionHeadBlocks != 0 ||
+              lastOutputBlock - firstOutputBlock != projectionHeadBlocks) {
+            op_.emitError("Q/K head RMSNorm requires one complete head per "
+                          "projection output group");
+            return -1;
+          }
+          const int64_t head = firstOutputBlock / projectionHeadBlocks;
+          const char *normInputName =
+              kind == AttentionProjectionKind::Query ? "query_norm_input"
+                                                     : "key_norm_input";
+          const char *normOutputName =
+              kind == AttentionProjectionKind::Query ? "query_norm_output"
+                                                     : "key_norm_output";
+          const auto normInputPlacement =
+              op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(normInputName);
+          const auto normOutputPlacement =
+              op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(normOutputName);
+          const char *normWeightName =
+              kind == AttentionProjectionKind::Query ? "query_norm_weight"
+                                                     : "key_norm_weight";
+          const auto normWeightPlacement =
+              op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(normWeightName);
+          const mlir::Value normWeight =
+              kind == AttentionProjectionKind::Query
+                  ? op_.getQueryNormWeight()
+                  : op_.getKeyNormWeight();
+          const auto epsilonAttr = op_.query_rope.getConfig()
+              .getAs<mlir::FloatAttr>("qk_norm_epsilon");
+          if (!normInputPlacement || !normOutputPlacement ||
+              !normWeightPlacement || !epsilonAttr) {
+            op_.emitError("Q/K head RMSNorm is missing a placement or epsilon");
+            return -1;
+          }
+          const int64_t normStart = std::max(
+              replicateCycle, replicateEnd + maxStagingReadLatency + 1);
+          const int64_t transposeEnd = emitRopeNormTranspose(
+              rewriter_, op_.getLoc(), target_, layout, kind, head,
+              op_.getSeqLen(), op_.getHeadDim(), stagingBank,
+              normInputPlacement, true, normStart);
+          const auto headType = mlir::RankedTensorType::get(
+              {op_.getSeqLen(), op_.getHeadDim()}, elementType);
+          const int64_t feedbackEnd = emitVxmFeedbackRmsNorm(
+              rewriter_, op_.getLoc(), projectionValues[projection],
+              normWeight, headType, epsilonAttr.getValueAsDouble(), target_,
+              normInputPlacement, normWeightPlacement, normOutputPlacement,
+              transposeEnd);
+          const int64_t restoreEnd = emitRopeNormTranspose(
+              rewriter_, op_.getLoc(), target_, layout, kind, head,
+              op_.getSeqLen(), op_.getHeadDim(), stagingBank,
+              normOutputPlacement, false, feedbackEnd);
+          replicateCycle = restoreEnd;
+          replicateEnd = restoreEnd;
         }
 
         const int64_t productPipelineLatency = projectionBias ? 3 : 2;

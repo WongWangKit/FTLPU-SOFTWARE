@@ -53,6 +53,7 @@ StableHLO 是主要的前端/共同模型 IR 边界。IREE 作为参考编译器
 [compiler/docs/compiler_architecture.zh-CN.md](compiler/docs/compiler_architecture.zh-CN.md)、
 [runtime/docs/model_package.zh-CN.md](runtime/docs/model_package.zh-CN.md)、
 [compiler/docs/qwen_kv_cache.zh-CN.md](compiler/docs/qwen_kv_cache.zh-CN.md)、
+[compiler/examples/qwen3_0_6b_decoder_layer/README.zh-CN.md](compiler/examples/qwen3_0_6b_decoder_layer/README.zh-CN.md)、
 [compiler/docs/iree_frontend_integration.zh-CN.md](compiler/docs/iree_frontend_integration.zh-CN.md)，
 示例见
 [compiler/examples/iree_frontend/simple_stablehlo.mlir](compiler/examples/iree_frontend/simple_stablehlo.mlir)。

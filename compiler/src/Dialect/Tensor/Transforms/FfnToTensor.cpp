@@ -11,6 +11,7 @@ namespace ftlpu::compiler::tensor_lowering {
 mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const target::LPUTargetModel& target, EastMemoryAllocator& allocator,
     AllocateValueFn allocate_value, int64_t weight_bank,
+    bool follows_paged_attention,
     mlir::IRRewriter& rewriter)
 {
     kernel::MatmulOp op = graph.output;
@@ -87,9 +88,15 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const bool pagedWeights = weight_bank >= 0 || requiresWeightPaging;
     const int64_t initialWeightBank = std::max<int64_t>(0, weight_bank);
     std::optional<tensor::FfnWeightTilePlan> weightTilePlan;
-    if (requiresWeightPaging) {
+    // An earlier paged attention stage owns the same weight-storage slices.
+    // Even when each FFN matrix fits by itself, it cannot stay resident across
+    // those attention page loads, so give the FFN explicit C2C page lifetimes.
+    const bool requiresLifetimePaging =
+        follows_paged_attention && weight_bank >= 0;
+    if (requiresWeightPaging || requiresLifetimePaging) {
         auto planned = tensor::planFfnWeightTiles(
-            {m, k, hidden, n}, target, initialWeightBank);
+            {m, k, hidden, n}, target, initialWeightBank,
+            requiresLifetimePaging);
         if (mlir::failed(planned)) {
             op.emitError("cannot tile FFN weights into the configured SRAM banks");
             return mlir::failure();
@@ -123,7 +130,23 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         ? (inputBank + 1) % memory.banks_per_slice
         : pagedWeights
             ? (initialWeightBank + 1) % memory.banks_per_slice : 0;
-    const int64_t hiddenBank = tiledWeights ? inputBank : workingBank;
+    const auto gateTempSlices = target.ffn_gate_temp_slices();
+    const auto upTempSlices = target.ffn_up_temp_slices();
+    const bool hiddenOverlapsTempSlices = llvm::any_of(hidden_slices,
+        [&](int64_t hiddenSlice) {
+            return llvm::is_contained(gateTempSlices, hiddenSlice)
+                || llvm::is_contained(upTempSlices, hiddenSlice);
+        });
+    // With two banks and overlapping temporary/hidden slice roles, keep the
+    // completed hidden tensor beside the input and put Gate/Up temporaries in
+    // the other bank.  Tail Swish starts after projection has drained, so the
+    // input and hidden values do not contend for the shared ICU in time.
+    const bool isolateNonPagedTemporaries = !tiledWeights
+        && target.uses_dedicated_slice_roles()
+        && memory.banks_per_slice > 1
+        && hiddenOverlapsTempSlices;
+    const int64_t hiddenBank = tiledWeights || isolateNonPagedTemporaries
+        ? inputBank : workingBank;
     int64_t hiddenBaseRow = memory.w8a16_hidden_base_row;
     if (hiddenBank == inputBank) {
         int64_t inputBaseRow = 0;

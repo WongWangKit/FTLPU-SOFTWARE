@@ -29,6 +29,21 @@ FFN 0.03125、attention residual 0、第二次 RMSNorm 0.03125。
 完整 compiler/binary/runtime/CModel 链路；它还不是 Hugging Face 原始 checkpoint
 全部 28 层的执行。
 
+## 单 token decode reference
+
+`compiler/tests/qwen2_5_1_5b_decode_reference_test.py` 使用真实的 Qwen2.5-1.5B
+层尺寸，先为 32 个 token 生成 RoPE 后的 K cache 和 V cache，再在绝对位置 32
+执行一次单 token decode。测试验证 GQA 12:2 head 映射、KV append、cache 前缀保持、
+decode attention、残差和 1536/8960 FFN，并与 33-token 单层数学 golden 的最后一个
+token 逐位比较。
+
+```powershell
+python compiler/tests/qwen2_5_1_5b_decode_reference_test.py
+```
+
+该测试建立 compiler decode lowering 所需的数值规范；当前生成的 `.ftlpu` executable
+尚未包含 KV cache read/write command，因此它不代表 compiled CModel decode 已经实现。
+
 ## 真实 checkpoint FFN
 
 `compiler/tools/import_hf_ffn.py` 从 Hugging Face Qwen2.5-1.5B checkpoint

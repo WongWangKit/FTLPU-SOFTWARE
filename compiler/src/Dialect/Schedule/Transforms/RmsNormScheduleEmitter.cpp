@@ -958,8 +958,10 @@ int64_t emitLegacyVxmFeedback(mlir::IRRewriter& rewriter,
     return cycle;
 }
 
-int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
-    stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
+int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
+    mlir::Location location, mlir::Value input, mlir::Value weight,
+    mlir::RankedTensorType inputType, double epsilon,
+    const target::LPUTargetModel& target,
     mlir::DictionaryAttr inputPlacement,
     mlir::DictionaryAttr weightPlacement,
     mlir::DictionaryAttr outputPlacement, int64_t start)
@@ -967,8 +969,6 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
     const auto inputSlices = slices(inputPlacement);
     const auto weightSlices = slices(weightPlacement);
     const auto outputSlices = slices(outputPlacement);
-    const auto inputType =
-        llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
     const llvm::StringRef streamKind =
         lpu_16bit_stream_kind(inputType.getElementType());
     const llvm::StringRef dataFormat =
@@ -1020,8 +1020,8 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
                          bool accumulatorWrite = false,
                          bool accumulatorEmit = true,
                          bool localScalarWrite = false) {
-        return create_vxm(rewriter, op.getLoc(), op.getInput(),
-            op.getWeight(), inputType, cycle, queue, opcode,
+        return create_vxm(rewriter, location, input,
+            weight, inputType, cycle, queue, opcode,
             lhsKind, lhsIndex, lhsImmediate,
             rhsKind, rhsIndex, rhsImmediate,
             castTarget, outputStream, repeatCount, 1,
@@ -1037,7 +1037,7 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
              hemisphere < target.memory().hemispheres; ++hemisphere) {
             for (int64_t byte = 0; byte < 2; ++byte) {
                 const int64_t slice = memorySlices[2 * pair + byte];
-                emitMem(rewriter, op.getLoc(),
+                emitMem(rewriter, location,
                     inputCycle - readLatency(slice),
                     hemisphere * target.memory().slices_per_hemisphere
                         + slice,
@@ -1056,7 +1056,7 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
             const int64_t source = 1 - destination;
             for (int64_t byte = 0; byte < byteCount; ++byte) {
                 const int64_t slice = memorySlices[byte];
-                emitMem(rewriter, op.getLoc(),
+                emitMem(rewriter, location,
                     outputCycle + writeLatency(slice),
                     destination * target.memory().slices_per_hemisphere
                         + slice,
@@ -1115,7 +1115,7 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
             1.0f / static_cast<float>(hidden), "fp32", -1, 1, 4);
         vxm(factorConfig, 1, "add",
             "previous", 0, 0.0f, "immediate", 0,
-            static_cast<float>(op.getEpsilon().convertToDouble()),
+            static_cast<float>(epsilon),
             "fp32", -1, 1, 4);
         vxm(factorConfig, 2, "pass",
             "previous", 0, 0.0f, "immediate", 0, 0.0f,
@@ -1160,7 +1160,7 @@ int64_t emitVxmFeedback(mlir::IRRewriter& rewriter,
             emitMirroredPairRead(weightSlices,
                 broadcastWeight ? 0 : pair, weightAddress, 2,
                 normalizeInput + feature, bank(weightPlacement),
-                inputBindingIndex(op.getWeight()));
+                inputBindingIndex(weight));
             const int64_t outputCycle = normalizeInput + feature + 5;
             const auto outputPair =
                 llvm::ArrayRef<int64_t>(outputSlices).slice(2 * pair, 2);
@@ -1519,8 +1519,9 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
         return op.emitError(
             "feedback RMSNorm requires VXM-oriented distributed16 gamma");
     const int64_t weightTransposeEnd = inputTransposeEnd;
-    const int64_t feedbackEnd = emitVxmFeedback(
-        rewriter, op, target, feedbackInput,
+    const int64_t feedbackEnd = emitVxmFeedbackRmsNorm(
+        rewriter, op.getLoc(), op.getInput(), op.getWeight(), inputType,
+        op.getEpsilon().convertToDouble(), target, feedbackInput,
         weightPlacement, feedbackOutputPlacement,
         weightTransposeEnd);
     const auto resultKind =
@@ -1565,6 +1566,19 @@ mlir::LogicalResult lowerRmsNorm(mlir::IRRewriter& rewriter,
 }
 
 } // namespace
+
+int64_t emitVxmFeedbackRmsNorm(mlir::IRRewriter& rewriter,
+    mlir::Location location, mlir::Value input, mlir::Value weight,
+    mlir::RankedTensorType inputType, double epsilon,
+    const target::LPUTargetModel& target,
+    mlir::DictionaryAttr inputPlacement,
+    mlir::DictionaryAttr weightPlacement,
+    mlir::DictionaryAttr outputPlacement, int64_t start)
+{
+    return emitVxmFeedbackImpl(rewriter, location, input, weight, inputType,
+        epsilon, target, inputPlacement, weightPlacement, outputPlacement,
+        start);
+}
 
 mlir::LogicalResult lowerRmsNormSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target)

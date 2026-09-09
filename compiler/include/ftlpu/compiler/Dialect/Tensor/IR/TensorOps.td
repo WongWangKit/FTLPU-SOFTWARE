@@ -122,11 +122,12 @@ def ProjectionTaskOp : FTLPU_Tensor_Op<"projection_task", [Pure]> {
 }
 
 def RopeTaskOp : FTLPU_Tensor_Op<"rope_task", [Pure]> {
-  let summary = "Rotary-position embedding with an assigned physical sub-plan";
-  let arguments = (ins AnyRankedTensor:$input, StrAttr:$kind,
+  let summary = "Optional head RMS normalization followed by rotary-position embedding";
+  let arguments = (ins AnyRankedTensor:$input,
+      Optional<AnyRankedTensor>:$norm_weight, StrAttr:$kind,
       DictionaryAttr:$config, DictionaryAttr:$memory_plan);
   let results = (outs AnyRankedTensor:$result);
-  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$input (`,` $norm_weight^)? attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 
