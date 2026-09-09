@@ -28,10 +28,8 @@ public:
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerKernelToTensorPass)
 
     LowerKernelToTensorPass() = default;
-    LowerKernelToTensorPass(
-        RmsNormLoweringStrategy strategy, int64_t weightBank)
-        : rmsnorm_strategy_(strategy)
-        , weight_bank_(weightBank)
+    explicit LowerKernelToTensorPass(int64_t weightBank)
+        : weight_bank_(weightBank)
     {
     }
 
@@ -129,9 +127,7 @@ public:
         int64_t rmsWeightBase = 0;
         llvm::DenseMap<mlir::Value, FeedbackGammaPlacement>
             feedbackRmsWeightPlacements;
-        if (rmsnorm_strategy_
-                == RmsNormLoweringStrategy::VxmFeedback
-            && target.uses_dedicated_slice_roles()) {
+        if (target.uses_dedicated_slice_roles()) {
             const auto distributedSlices =
                 target.mxm_distributed_activation_slices();
             llvm::SmallVector<int64_t> constantSlices;
@@ -179,9 +175,7 @@ public:
                     nextRows[pair], constantSlices[2 * pair],
                     constantBank};
             }
-        } else if (weight_bank_ >= 0
-            && rmsnorm_strategy_
-                == RmsNormLoweringStrategy::VxmFeedback) {
+        } else if (weight_bank_ >= 0) {
             int64_t totalRows = 0;
             for (kernel::RmsNormOp rmsNorm : rmsNorms)
                 totalRows += rmsNorm.getWeight().getType().getNumElements();
@@ -201,14 +195,11 @@ public:
                 && is_lpu_16bit_float(type.getElementType())
                 && type.getDimSize(1) % target.throughput().mxm_rows == 0) {
                 bool feedsFeedbackRmsNorm = false;
-                if (rmsnorm_strategy_
-                    == RmsNormLoweringStrategy::VxmFeedback) {
-                    for (mlir::OpOperand& use : argument.getUses()) {
-                        auto rmsNorm = llvm::dyn_cast<kernel::RmsNormOp>(
-                            use.getOwner());
-                        feedsFeedbackRmsNorm |= rmsNorm
-                            && use.getOperandNumber() == 0;
-                    }
+                for (mlir::OpOperand& use : argument.getUses()) {
+                    auto rmsNorm = llvm::dyn_cast<kernel::RmsNormOp>(
+                        use.getOwner());
+                    feedsFeedbackRmsNorm |= rmsNorm
+                        && use.getOperandNumber() == 0;
                 }
                 if (feedsFeedbackRmsNorm) {
                     const int64_t bytes = type.getNumElements() * 2;
@@ -244,48 +235,20 @@ public:
                 const auto type =
                     llvm::cast<mlir::RankedTensorType>(
                         argument.getType());
-                const bool distributed =
-                    rmsnorm_strategy_
-                    == RmsNormLoweringStrategy::VxmFeedback;
                 // Feedback RMSNorm chooses weight slices from the actual
                 // input placement when the op is lowered. Binding every
                 // RMSNorm weight to one target-wide slice set here can
                 // collide with the second norm's transpose scratch.
-                const int64_t instructions = distributed
-                    ? type.getNumElements()
-                    : type.getNumElements()
-                        / target.throughput().mxm_rows;
-                const int64_t baseRow = distributed && weight_bank_ < 0
+                const int64_t instructions = type.getNumElements();
+                const int64_t baseRow = weight_bank_ < 0
                     ? 7168 + rmsWeightBase : rmsWeightBase;
-                if (distributed) {
-                    if (!target.uses_dedicated_slice_roles()) {
-                        feedbackRmsWeightPlacements[argument] = {
-                            baseRow, -1};
-                        rmsWeightBase += instructions;
-                    } else if (!feedbackRmsWeightPlacements.contains(argument)) {
-                        function.emitError(
-                            "feedback RMSNorm gamma was not assigned to the activation constant area");
-                        signalPassFailure();
-                        return;
-                    }
-                    continue;
-                }
-                const auto allocation = fixed_allocation(
-                    PlacementKind::Activation,
-                    distributed
-                        ? target.mxm_distributed_activation_slices()
-                        : llvm::ArrayRef<int64_t>({20, 21}),
-                    baseRow, instructions, type.getNumElements() * 2,
-                    distributed ? "fp16_vxm_row_parallel_8"
-                                : "fp16_pair_planar",
-                    "both", std::max<int64_t>(0, weight_bank_));
-                rmsWeightBase += distributed
-                    ? instructions
-                    : std::max<int64_t>(1,
-                          (instructions - 1) * 16 + 1);
-                if (mlir::failed(planner.bind(argument, allocation))) {
+                if (!target.uses_dedicated_slice_roles()) {
+                    feedbackRmsWeightPlacements[argument] = {
+                        baseRow, -1};
+                    rmsWeightBase += instructions;
+                } else if (!feedbackRmsWeightPlacements.contains(argument)) {
                     function.emitError(
-                        "conflicting RMSNorm weight placement");
+                        "feedback RMSNorm gamma was not assigned to the activation constant area");
                     signalPassFailure();
                     return;
                 }
@@ -343,24 +306,20 @@ public:
                 int64_t feedbackWeightSliceBase = -1;
                 int64_t feedbackWeightBank =
                     std::max<int64_t>(0, weight_bank_);
-                if (rmsnorm_strategy_
-                    == RmsNormLoweringStrategy::VxmFeedback) {
-                    auto found =
-                        feedbackRmsWeightPlacements.find(op.getWeight());
-                    if (found == feedbackRmsWeightPlacements.end()) {
-                        op.emitError(
-                            "feedback RMSNorm weight is not a "
-                            "function argument");
-                        signalPassFailure();
-                        return;
-                    }
-                    feedbackWeightBaseRow = found->second.base_row;
-                    feedbackWeightSliceBase = found->second.slice_base;
-                    feedbackWeightBank = found->second.bank;
+                auto found =
+                    feedbackRmsWeightPlacements.find(op.getWeight());
+                if (found == feedbackRmsWeightPlacements.end()) {
+                    op.emitError(
+                        "feedback RMSNorm weight is not a function argument");
+                    signalPassFailure();
+                    return;
                 }
+                feedbackWeightBaseRow = found->second.base_row;
+                feedbackWeightSliceBase = found->second.slice_base;
+                feedbackWeightBank = found->second.bank;
                 if (mlir::failed(lower_rms_norm(
-                        op, target, rmsnorm_strategy_,
-                        feedbackWeightBaseRow, feedbackWeightSliceBase,
+                        op, target, feedbackWeightBaseRow,
+                        feedbackWeightSliceBase,
                         feedbackWeightBank, weight_bank_, planner,
                         rewriter))) {
                     signalPassFailure();
@@ -371,7 +330,7 @@ public:
             if (auto op = llvm::dyn_cast<kernel::ElementwiseOp>(operation)) {
                 if (mlir::failed(lower_elementwise(
                         op, target, allocator, allocate_value,
-                        rmsnorm_strategy_, weight_bank_, rewriter))) {
+                        weight_bank_, rewriter))) {
                     signalPassFailure();
                     return;
                 }
@@ -396,18 +355,15 @@ public:
     }
 
 private:
-    RmsNormLoweringStrategy rmsnorm_strategy_ =
-        RmsNormLoweringStrategy::VxmSquareMxmReduce;
     int64_t weight_bank_ = -1;
 };
 
 } // namespace
 
 std::unique_ptr<mlir::Pass> create_lower_kernel_to_tensor_pass(
-    RmsNormLoweringStrategy rmsnorm_strategy, std::int64_t weight_bank)
+    std::int64_t weight_bank)
 {
-    return std::make_unique<LowerKernelToTensorPass>(
-        rmsnorm_strategy, weight_bank);
+    return std::make_unique<LowerKernelToTensorPass>(weight_bank);
 }
 
 } // namespace ftlpu::compiler

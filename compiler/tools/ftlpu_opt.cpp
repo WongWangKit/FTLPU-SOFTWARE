@@ -39,8 +39,6 @@ struct Args {
         ftlpu::compiler::FfnScheduleStrategy::Tail};
     ftlpu::compiler::AttentionScheduleStrategy attention_schedule{
         ftlpu::compiler::AttentionScheduleStrategy::Tail};
-    ftlpu::compiler::RmsNormLoweringStrategy rmsnorm_strategy{
-        ftlpu::compiler::RmsNormLoweringStrategy::VxmSquareMxmReduce};
     ftlpu::compiler::target::MxmExecutionPolicy mxm_execution_policy{
         ftlpu::compiler::target::MxmExecutionPolicy::Auto};
     std::int64_t weight_bank{-1};
@@ -85,19 +83,6 @@ Args parse_args(int argc, char** argv)
             else
                 throw std::runtime_error(
                     "unknown Attention schedule strategy: " + strategy);
-        }
-        else if (arg == "--rmsnorm-strategy") {
-            const std::string strategy = next();
-            if (strategy == "vxm-square-mxm-reduce")
-                args.rmsnorm_strategy =
-                    ftlpu::compiler::RmsNormLoweringStrategy::
-                        VxmSquareMxmReduce;
-            else if (strategy == "vxm-feedback")
-                args.rmsnorm_strategy =
-                    ftlpu::compiler::RmsNormLoweringStrategy::VxmFeedback;
-            else
-                throw std::runtime_error(
-                    "unknown RMSNorm lowering strategy: " + strategy);
         }
         else if (arg == "--mxm-execution") {
             const std::string policy = next();
@@ -148,8 +133,6 @@ Args parse_args(int argc, char** argv)
                                  "ftlpu-compress-schedule|ftlpu-verify-schedule] "
                                  "[--ffn-schedule tail|fused] "
                                  "[--attention-schedule tail|fused] "
-                                 "[--rmsnorm-strategy "
-                                 "vxm-square-mxm-reduce|vxm-feedback] "
                                  "[--mxm-execution auto|vector|legacy] "
                                  "[--icu-compression none|control|macro] "
                                  "[--mem-slice-program on|off] "
@@ -262,7 +245,7 @@ try {
         || args.pipeline == "ftlpu-stablehlo-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_kernel_to_tensor_pass(
-                args.rmsnorm_strategy, args.weight_bank));
+                args.weight_bank));
     if (args.pipeline == "ftlpu-stablehlo-to-stream" || args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands")
         pass_manager.addNestedPass<mlir::func::FuncOp>(ftlpu::compiler::create_lower_tensor_to_stream_pass());

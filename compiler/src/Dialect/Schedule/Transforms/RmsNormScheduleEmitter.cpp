@@ -10,14 +10,12 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
 #include <algorithm>
-#include <array>
 #include <string>
 
 namespace ftlpu::compiler::schedule {
 namespace {
 
 using attention_detail::emitMem;
-using attention_detail::emitMxm;
 using attention_detail::emitSxm;
 using attention_detail::emitWavefrontBeat;
 using attention_detail::emitWavefrontTail;
@@ -67,11 +65,6 @@ int64_t inputBindingIndex(mlir::Value value)
     return -1;
 }
 
-struct TileAddress {
-    std::array<int64_t, 2> slices;
-    int64_t row;
-};
-
 int64_t baseRow(mlir::DictionaryAttr placement)
 {
     return placement.getAs<mlir::IntegerAttr>("base_row").getInt();
@@ -82,31 +75,6 @@ int64_t bank(mlir::DictionaryAttr placement)
     if (auto value = placement.getAs<mlir::IntegerAttr>("bank"))
         return value.getInt();
     return 0;
-}
-
-mlir::FailureOr<TileAddress> tileAddress(
-    mlir::DictionaryAttr placement, int64_t block, int64_t rows)
-{
-    const auto layout = placement.getAs<mlir::StringAttr>("kind");
-    const auto memorySlices = slices(placement);
-    if (!layout || memorySlices.size() < 2) return mlir::failure();
-
-    if (layout.getValue() == "fp16_mxm_activation_planar") {
-        return TileAddress {
-            {memorySlices[0], memorySlices[1]},
-            baseRow(placement) + block * rows,
-        };
-    }
-    if (layout.getValue() == "fp16_pair_planar") {
-        const int64_t pair = block % 2;
-        if (memorySlices.size() < static_cast<std::size_t>(2 * pair + 2))
-            return mlir::failure();
-        return TileAddress {
-            {memorySlices[2 * pair], memorySlices[2 * pair + 1]},
-            baseRow(placement) + (block / 2) * rows,
-        };
-    }
-    return mlir::failure();
 }
 
 BindingOp createBinding(mlir::IRRewriter& rewriter, mlir::Location location,
@@ -1589,315 +1557,11 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
     return mlir::success();
 }
 
-mlir::LogicalResult lowerRmsNormMxm(mlir::IRRewriter& rewriter,
-    stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
-    int64_t outputIndex)
-{
-    const auto inputType =
-        llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
-    const auto weightType =
-        llvm::cast<mlir::RankedTensorType>(op.getWeight().getType());
-    const llvm::StringRef streamKind =
-        lpu_16bit_stream_kind(inputType.getElementType());
-    const llvm::StringRef dataFormat =
-        lpu_16bit_data_format(inputType.getElementType());
-    const int64_t rows = inputType.getDimSize(0);
-    const int64_t hidden = inputType.getDimSize(1);
-    const int64_t tile = target.throughput().mxm_rows;
-    if (inputType.getRank() != 2 || weightType.getRank() != 1
-        || rows % tile != 0 || hidden % tile != 0) {
-        return op.emitError(
-            "RMSNorm schedule requires [M,K] and [K] tile-aligned tensors");
-    }
-
-    const auto inputPlacement =
-        allocationPlacement(op.getInputAllocations(), 0);
-    const auto weightPlacement =
-        allocationPlacement(op.getWeightAllocations(), 0);
-    const auto squarePlacement =
-        allocationPlacement(op.getScratchAllocations(), 0);
-    const auto factorPlacement =
-        allocationPlacement(op.getScratchAllocations(), 1);
-    const auto resultPlacement =
-        allocationPlacement(op.getResultAllocations(), 0);
-    const auto inputSlices = slices(inputPlacement);
-    const auto weightSlices = slices(weightPlacement);
-    const auto squareSlices = slices(squarePlacement);
-    const auto factorSlices = slices(factorPlacement);
-    const auto resultSlices = slices(resultPlacement);
-    if (inputSlices.size() < 2 || weightSlices.size() < 2
-        || squareSlices.size() < 2 || factorSlices.size() < 2
-        || resultSlices.size() < 4) {
-        return op.emitError(
-            "RMSNorm schedule requires 16-bit float byte-pair slices");
-    }
-
-    rewriter.setInsertionPoint(op);
-    if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(op.getInput()))
-        createBinding(rewriter, op.getLoc(), op.getInput(),
-            argument.getArgNumber(), "input", "activation",
-            inputType, inputPlacement);
-    if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(op.getWeight()))
-        createBinding(rewriter, op.getLoc(), op.getWeight(),
-            argument.getArgNumber(), "input", "weight",
-            weightType, weightPlacement);
-
-    const auto eastReadLatency = [&](int64_t slice) {
-        return target.transport_latency(target::StreamEndpoint::Mem,
-            target::StreamEndpoint::MxmActivation,
-            target::StreamDirection::East, slice).value();
-    };
-    const auto westReadLatency = [&](int64_t slice) {
-        return target.transport_latency(target::StreamEndpoint::Mem,
-            target::StreamEndpoint::VxmInput,
-            target::StreamDirection::West, slice).value();
-    };
-    const auto eastWriteLatency = [&](int64_t slice) {
-        return target.transport_latency(target::StreamEndpoint::VxmResult,
-            target::StreamEndpoint::Mem,
-            target::StreamDirection::East, slice).value();
-    };
-
-    // Build one reusable 32x32 matrix whose entries are 1 / hidden.
-    // Four VXM pulses provide the 16 FP16 weight streams consumed by IW.
-    const int64_t weightCastStart = 0;
-    const int64_t weightToIw =
-        target.throughput().vxm_weight_to_iw_latency;
-    for (int64_t pulse = 0; pulse < target.throughput().tile_rows; ++pulse) {
-        for (int64_t lane = 0; lane < 8; ++lane) {
-            auto constant = create_vxm(rewriter, op.getLoc(),
-                op.getInput(), op.getInput(), inputType,
-                weightCastStart + pulse, lane, "pass",
-                "immediate", 0, 1.0f / static_cast<float>(hidden),
-                "immediate", 0, 0.0f, "fp32", -1, 1, 1,
-                "east", "east");
-            create_vxm(rewriter, op.getLoc(), constant.getResult(),
-                constant.getResult(), inputType,
-                weightCastStart + pulse + 1, 8 + lane, "cast",
-                "alu", lane, 0.0f, "immediate", 0, 0.0f,
-                dataFormat, lane * 2, 1, 1, "east", "east");
-        }
-        emitMxm(rewriter, op.getLoc(), weightCastStart + pulse + weightToIw,
-            0, "iw", 0, 3 - pulse, 0, 0, 1, 1);
-    }
-    const int64_t weightReady =
-        weightCastStart + weightToIw + target.throughput().tile_rows;
-
-    // Square each activation tile and retain the original MXM activation
-    // layout, so the following reduction and downstream layers compose.
-    const int64_t squareStart = std::max<int64_t>(
-        weightReady, *std::max_element(inputSlices.begin(), inputSlices.end())
-            / target.streams().mem_slices_per_register_group + 2);
-    int64_t cycle = squareStart;
-    for (int64_t block = 0; block < hidden / tile; ++block) {
-        auto inputTile = tileAddress(inputPlacement, block, rows);
-        auto squareTile = tileAddress(squarePlacement, block, rows);
-        if (mlir::failed(inputTile) || mlir::failed(squareTile))
-            return op.emitError("unsupported RMSNorm square layout");
-        const int64_t vxmCycle = cycle;
-        for (int64_t byte = 0; byte < 2; ++byte)
-            emitMem(rewriter, op.getLoc(),
-                vxmCycle - westReadLatency(inputTile->slices[byte]),
-                inputTile->slices[byte], "read", inputTile->row, 32 + byte,
-                rows, 1, 1);
-        auto squared = create_vxm(rewriter, op.getLoc(),
-            op.getInput(), op.getInput(), inputType, vxmCycle, 8,
-            "square", streamKind, 32, 0.0f,
-            "immediate", 0, 0.0f, "fp32", -1,
-            rows, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(),
-            op.getInput(), op.getInput(), inputType, vxmCycle, 10,
-            "pass", streamKind, 32, 0.0f,
-            "immediate", 0, 0.0f, dataFormat, 2,
-            rows, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(), squared.getResult(),
-            squared.getResult(), inputType, vxmCycle + 1, 9, "cast",
-            "alu", 8, 0.0f, "immediate", 0, 0.0f,
-            dataFormat, 0, rows, 1, "east", "east");
-        for (int64_t byte = 0; byte < 2; ++byte)
-            emitMem(rewriter, op.getLoc(),
-                vxmCycle + 1 + eastWriteLatency(squareTile->slices[byte]),
-                squareTile->slices[byte], "write", squareTile->row, byte,
-                rows, 1, 1);
-        for (int64_t byte = 0; byte < 2; ++byte)
-            emitMem(rewriter, op.getLoc(),
-                vxmCycle + eastWriteLatency(squareSlices[2 + byte]),
-                squareSlices[2 + byte], "write", squareTile->row,
-                2 + byte, rows, 1, 1);
-        cycle += rows + 1 + std::max(
-            eastWriteLatency(squareSlices[1]),
-            eastWriteLatency(squareSlices[3])) + 1;
-    }
-    const int64_t squareEnd = cycle;
-
-    // Accumulate all hidden tiles in MXM0. A compute command may cover at
-    // most one physical 32-row MXM wave: the CModel wraps its internal row
-    // selector after that point. Keep each token wave in a distinct external
-    // accumulator address range, then stream the four final waves to VXM.
-    const int64_t tokenWaves = rows / tile;
-    const int64_t clearStart = squareEnd;
-    for (int64_t row = 0; row < rows; ++row)
-        emitMxm(rewriter, op.getLoc(), clearStart + row,
-            0, "accumulator_read", 0, 0, 0, 0, 1, 1,
-            row, 1, "sram", true, "supercell", 0, dataFormat);
-    const int64_t reduceStart = std::max(
-        clearStart + rows
-            + target.throughput().accumulator_read_to_vxm_latency + 1,
-        squareEnd + std::max(
-        eastReadLatency(squareSlices[0]),
-        eastReadLatency(squareSlices[1])));
-    int64_t finalCompute = 0;
-    const int64_t issue = target.mxm_block_issue_interval();
-    for (int64_t block = 0; block < hidden / tile; ++block) {
-        const bool final = block + 1 == hidden / tile;
-        for (int64_t wave = 0; wave < tokenWaves; ++wave) {
-            const int64_t ordinal = block * tokenWaves + wave;
-            const int64_t computeCycle = reduceStart + ordinal * issue;
-            const int64_t tokenBase = wave * tile;
-            auto squareTile = tileAddress(squarePlacement, block, rows);
-            if (mlir::failed(squareTile))
-                return op.emitError("unsupported RMSNorm reduction layout");
-            for (int64_t byte = 0; byte < 2; ++byte)
-                emitMem(rewriter, op.getLoc(),
-                    computeCycle - eastReadLatency(
-                        squareTile->slices[byte]),
-                    squareTile->slices[byte], "read",
-                    squareTile->row + tokenBase, byte, tile, 1, 1);
-            emitMxm(rewriter, op.getLoc(), computeCycle, 0, "compute",
-                0, 0, 0, 0, tile, 1, tokenBase, 1,
-                final ? "stream" : "sram", final, "supercell", 0,
-                dataFormat);
-            if (final && wave == 0) finalCompute = computeCycle;
-        }
-    }
-    const int64_t factorVxm =
-        finalCompute + target.throughput().accumulator_to_vxm_latency;
-    auto meanPlusEpsilon = create_vxm(rewriter, op.getLoc(),
-        op.getInput(), op.getInput(), inputType, factorVxm, 0, "add",
-        "stream_f32", 32, 0.0f, "immediate", 0,
-        static_cast<float>(op.getEpsilon().convertToDouble()),
-        "fp32", -1, rows, 1, "east", "east");
-    auto root = create_vxm(rewriter, op.getLoc(),
-        meanPlusEpsilon.getResult(), meanPlusEpsilon.getResult(), inputType,
-        factorVxm + 1, 1, "sqrt", "alu", 0, 0.0f,
-        "immediate", 0, 0.0f, "fp32", -1,
-        rows, 1, "east", "east");
-    auto inverse = create_vxm(rewriter, op.getLoc(),
-        root.getResult(), root.getResult(), inputType, factorVxm + 2, 2,
-        "divide", "immediate", 0, 1.0f, "alu", 1, 0.0f,
-        "fp32", -1, rows, 1, "east", "east");
-    create_vxm(rewriter, op.getLoc(), inverse.getResult(),
-        inverse.getResult(), inputType, factorVxm + 3, 3, "cast",
-        "alu", 2, 0.0f, "immediate", 0, 0.0f,
-        dataFormat, 0, rows, 1, "east", "east");
-    for (int64_t byte = 0; byte < 2; ++byte)
-        emitMem(rewriter, op.getLoc(),
-            factorVxm + 3 + eastWriteLatency(factorSlices[byte]),
-            factorSlices[byte], "write", baseRow(factorPlacement), byte,
-            rows, 1, 1);
-    const int64_t factorEnd =
-        factorVxm + 3 + rows + eastWriteLatency(factorSlices[1]);
-
-    // Broadcast the stored row factor over each 32-column activation tile,
-    // multiply by gamma, and write a standard activation-planar result.
-    cycle = factorEnd + std::max(
-        westReadLatency(factorSlices[0]),
-        westReadLatency(factorSlices[1]));
-    mlir::Value finalValue = op.getInput();
-    for (int64_t block = 0; block < hidden / tile; ++block) {
-        auto inputTile = tileAddress(squarePlacement, block, rows);
-        auto resultTile = tileAddress(resultPlacement, block, rows);
-        if (mlir::failed(inputTile) || mlir::failed(resultTile))
-            return op.emitError("unsupported RMSNorm scale layout");
-        inputTile->slices = {squareSlices[2], squareSlices[3]};
-        const int64_t vxmCycle = cycle;
-        for (int64_t byte = 0; byte < 2; ++byte) {
-            emitMem(rewriter, op.getLoc(),
-                vxmCycle - westReadLatency(inputTile->slices[byte]),
-                inputTile->slices[byte], "read", inputTile->row,
-                32 + byte, rows, 1, 1);
-            emitMem(rewriter, op.getLoc(),
-                vxmCycle - westReadLatency(factorSlices[byte]),
-                factorSlices[byte], "read", baseRow(factorPlacement),
-                34 + byte, rows, 1, 1);
-            emitMem(rewriter, op.getLoc(),
-                vxmCycle - westReadLatency(weightSlices[byte]),
-                weightSlices[byte], "read",
-                baseRow(weightPlacement) + block,
-                36 + byte, rows, 1, 0, "sram",
-                inputBindingIndex(op.getWeight()));
-        }
-        auto normalized = create_vxm(rewriter, op.getLoc(),
-            op.getInput(), op.getInput(), inputType, vxmCycle, 4,
-            "multiply", streamKind, 32, 0.0f,
-            streamKind, 34, 0.0f, "fp32", -1,
-            rows, 1, "east", "east");
-        auto scaled = create_vxm(rewriter, op.getLoc(),
-            normalized.getResult(), op.getWeight(), inputType,
-            vxmCycle + 1, 5, "multiply", "alu", 4, 0.0f,
-            streamKind, 36, 0.0f, "fp32", -1,
-            rows, 1, "east", "east");
-        auto cast = create_vxm(rewriter, op.getLoc(),
-            scaled.getResult(), scaled.getResult(), inputType,
-            vxmCycle + 2, 6, "cast", "alu", 5, 0.0f,
-            "immediate", 0, 0.0f, dataFormat, 0,
-            rows, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(),
-            scaled.getResult(), scaled.getResult(), inputType,
-            vxmCycle + 2, 7, "cast", "alu", 5, 0.0f,
-            "immediate", 0, 0.0f, dataFormat, 2,
-            rows, 1, "east", "east");
-        create_vxm(rewriter, op.getLoc(),
-            scaled.getResult(), scaled.getResult(), inputType,
-            vxmCycle + 2, 8, "cast", "alu", 5, 0.0f,
-            "immediate", 0, 0.0f, dataFormat, 0,
-            rows, 1, "east", "west");
-        create_vxm(rewriter, op.getLoc(),
-            scaled.getResult(), scaled.getResult(), inputType,
-            vxmCycle + 2, 9, "cast", "alu", 5, 0.0f,
-            "immediate", 0, 0.0f, dataFormat, 2,
-            rows, 1, "east", "west");
-        finalValue = cast.getResult();
-        for (int64_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
-            for (int64_t byte = 0; byte < 4; ++byte)
-                emitMem(rewriter, op.getLoc(),
-                    vxmCycle + 2
-                        + eastWriteLatency(resultSlices[byte]),
-                    hemisphere
-                            * target.memory().slices_per_hemisphere
-                        + resultSlices[byte],
-                    "write", resultTile->row, byte,
-                    rows, 1, 1);
-        }
-        cycle += rows + 2 + eastWriteLatency(resultSlices[1]) + 1;
-    }
-
-    createTimeline(rewriter, op.getLoc(), "rmsnorm.square",
-        squareStart, squareEnd);
-    createTimeline(rewriter, op.getLoc(), "rmsnorm.reduce",
-        reduceStart, factorEnd);
-    createTimeline(rewriter, op.getLoc(), "rmsnorm.scale",
-        factorEnd, cycle);
-    auto output = createBinding(rewriter, op.getLoc(), {},
-        outputIndex, "output", "result",
-        llvm::cast<mlir::RankedTensorType>(op.getResult().getType()),
-        resultPlacement);
-    output->setAttr("name", rewriter.getStringAttr(
-        "rmsnorm.result." + std::to_string(outputIndex)));
-    rewriter.replaceOp(op, output.getValue());
-    return mlir::success();
-}
-
 mlir::LogicalResult lowerRmsNorm(mlir::IRRewriter& rewriter,
     stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
     int64_t outputIndex)
 {
-    const auto strategy =
-        op.getConfig().getAs<mlir::StringAttr>("strategy");
-    if (strategy && strategy.getValue() == "vxm_feedback")
-        return lowerRmsNormFeedback(
-            rewriter, op, target, outputIndex);
-    return lowerRmsNormMxm(rewriter, op, target, outputIndex);
+    return lowerRmsNormFeedback(rewriter, op, target, outputIndex);
 }
 
 } // namespace

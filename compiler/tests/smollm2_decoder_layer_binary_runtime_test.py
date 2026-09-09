@@ -52,7 +52,6 @@ def main() -> None:
         str(args.opt), "--input", str(args.input), "--output",
         str(schedule_ir), "--pipeline", "ftlpu-stablehlo-to-schedule",
         "--ffn-schedule", "tail",
-        "--rmsnorm-strategy", "vxm-feedback",
         "--mxm-execution", args.mxm_execution,
         "--target-config", str(args.target_config),
     ])

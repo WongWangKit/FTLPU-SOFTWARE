@@ -275,10 +275,8 @@ LogicalResult RmsNormTaskOp::verify()
         || getEpsilon().convertToFloat() <= 0.0f)
         return emitOpError("requires a finite positive epsilon");
     const auto strategy = getConfig().getAs<mlir::StringAttr>("strategy");
-    if (!strategy
-        || (strategy.getValue() != "vxm_square_mxm_reduce"
-            && strategy.getValue() != "vxm_feedback"))
-        return emitOpError("requires a supported RMSNorm strategy");
+    if (!strategy || strategy.getValue() != "vxm_feedback")
+        return emitOpError("requires the VXM feedback RMSNorm lowering");
     const std::size_t expectedScratch = 2;
     if (getScratchAllocations().size() != expectedScratch)
         return emitOpError("scratch allocation count does not match strategy");

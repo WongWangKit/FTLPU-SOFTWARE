@@ -26,7 +26,6 @@ def compile_executables(
     target_configs: list[Path],
     output_dir: Path,
     ffn_schedule: str,
-    rmsnorm_strategy: str,
     mxm_execution: str,
     reuse_executables: bool,
     weight_banks: list[int | None],
@@ -52,7 +51,6 @@ def compile_executables(
         )
         common = [
             "--ffn-schedule", ffn_schedule,
-            "--rmsnorm-strategy", rmsnorm_strategy,
             "--mxm-execution", mxm_execution,
             "--target-config", str(target_config),
             "--icu-macro-schedule",
@@ -121,11 +119,6 @@ def main() -> None:
     parser.add_argument(
         "--ffn-schedule", choices=("tail", "fused"), default="tail",
         help="FFN SwiGLU scheduling strategy used for compiled executables",
-    )
-    parser.add_argument(
-        "--rmsnorm-strategy",
-        choices=("vxm-square-mxm-reduce", "vxm-feedback"),
-        default="vxm-feedback",
     )
     parser.add_argument(
         "--mxm-execution",
@@ -247,7 +240,6 @@ def main() -> None:
             target_configs=target_configs,
             output_dir=args.output_dir,
             ffn_schedule=args.ffn_schedule,
-            rmsnorm_strategy=args.rmsnorm_strategy,
             mxm_execution=args.mxm_execution,
             reuse_executables=args.reuse_executables,
             weight_banks=(

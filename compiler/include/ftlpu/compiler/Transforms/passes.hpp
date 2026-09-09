@@ -16,15 +16,8 @@ enum class AttentionScheduleStrategy {
     Fused,
 };
 
-enum class RmsNormLoweringStrategy {
-    VxmSquareMxmReduce,
-    VxmFeedback,
-};
-
 std::unique_ptr<mlir::Pass> create_lower_stablehlo_to_kernel_pass();
 std::unique_ptr<mlir::Pass> create_lower_kernel_to_tensor_pass(
-    RmsNormLoweringStrategy rmsnorm_strategy =
-        RmsNormLoweringStrategy::VxmSquareMxmReduce,
     std::int64_t weight_bank = -1);
 std::unique_ptr<mlir::Pass> create_lower_tensor_to_stream_pass();
 std::unique_ptr<mlir::Pass> create_lower_stream_to_schedule_pass(

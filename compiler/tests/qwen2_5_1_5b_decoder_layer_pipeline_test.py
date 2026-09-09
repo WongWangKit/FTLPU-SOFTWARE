@@ -64,7 +64,6 @@ def main() -> None:
         "--mxm-execution", "vector", "--ffn-schedule", args.ffn_schedule,
         "--target-config", str(args.target_config),
         "--weight-bank", str(args.weight_bank),
-        "--rmsnorm-strategy", "vxm-feedback",
         "--icu-macro-schedule",
     ]
     if args.kv_cache_capacity:

@@ -8,7 +8,7 @@ namespace ftlpu::compiler::tensor_lowering {
 
 mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const target::LPUTargetModel& target,
-    RmsNormLoweringStrategy strategy, int64_t feedbackWeightBaseRow,
+    int64_t feedbackWeightBaseRow,
     int64_t feedbackWeightSliceBase,
     int64_t feedbackWeightBank, int64_t weightBank,
     FunctionMemoryPlanner& planner,
@@ -26,7 +26,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             != inputType.getElementType()
         || rows % tile != 0 || hidden % tile != 0) {
         op.emitError(
-            "current RMSNorm strategy requires tile-aligned matching "
+            "RMSNorm lowering requires tile-aligned matching "
             "16-bit float tensors");
         return mlir::failure();
     }
@@ -35,34 +35,11 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const auto& throughput = target.throughput();
     const int64_t workingBank = weightBank >= 0
         ? (weightBank + 1) % memory.banks_per_slice : 0;
-    llvm::SmallVector<int64_t> inputSlices;
-    llvm::SmallVector<int64_t> squareSlices;
-    llvm::SmallVector<int64_t> resultSlices;
-    const auto activationStorage = target.activation_storage_slices();
-    if (activationStorage.size()
-        < static_cast<std::size_t>(2 * throughput.mxm_activation_streams)) {
-        op.emitError("RMSNorm requires independent input and square MEM slices");
-        return mlir::failure();
-    }
     const bool preservesInput = llvm::any_of(
         op.getInput().getUses(), [&](mlir::OpOperand& use) {
             return use.getOwner() != op.getOperation();
         });
-    for (int64_t index = 0;
-         index < throughput.mxm_activation_streams; ++index) {
-        inputSlices.push_back(
-            memory.w8a16_activation_slice_base + index);
-        squareSlices.push_back(activationStorage[
-            throughput.mxm_activation_streams + index]);
-        resultSlices.push_back(preservesInput
-                ? activationStorage[
-                      activationStorage.size()
-                      - throughput.mxm_activation_streams + index]
-                : memory.w8a16_activation_slice_base + index);
-    }
-    const int64_t matrixRows = rows * hidden / tile;
     const int64_t matrixBytes = rows * hidden * 2;
-    const int64_t factorBytes = rows * tile * 2;
     auto existingInput = planner.lookup(op.getInput());
     const auto distributedInputSlices =
         target.mxm_distributed_activation_slices();
@@ -74,26 +51,14 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const bool existingInputIsDistributed =
         mlir::succeeded(existingInput)
         && existingInput->layout == "fp16_mxm_distributed_16";
-    const bool existingInputIsMxmPlanar =
-        mlir::succeeded(existingInput)
-        && existingInput->layout == "fp16_mxm_activation_planar"
-        && existingInput->slices.size()
-            >= static_cast<std::size_t>(
-                throughput.mxm_activation_streams);
     const Allocation input =
-        strategy == RmsNormLoweringStrategy::VxmFeedback
-        ? existingInputIsDistributed
+        existingInputIsDistributed
             ? *existingInput
             : fixed_allocation(PlacementKind::Activation,
                   distributedInputSlices,
                   target.uses_dedicated_slice_roles() ? 0 : 4096,
                   rows * hidden / 256, matrixBytes,
-                  "fp16_mxm_distributed_16", "both", workingBank)
-        : existingInputIsMxmPlanar
-            ? *existingInput
-             : fixed_allocation(PlacementKind::Activation,
-                   inputSlices, 0, matrixRows, matrixBytes,
-                   "fp16_mxm_activation_planar", "both");
+                  "fp16_mxm_distributed_16", "both", workingBank);
     const int64_t inputBank = input.bank;
     const int64_t resultBank = memory.banks_per_slice > 1
         ? (inputBank + 1) % memory.banks_per_slice : inputBank;
@@ -112,11 +77,10 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
                 llvm::cast<mlir::IntegerAttr>(slice).getInt());
     }
     llvm::SmallVector<int64_t, 16> feedbackInputSlices;
-    if (strategy == RmsNormLoweringStrategy::VxmFeedback) {
-        if (target.uses_dedicated_slice_roles()) {
-            feedbackInputSlices.assign(distributedInputSlices.begin(),
-                distributedInputSlices.end());
-        } else {
+    if (target.uses_dedicated_slice_roles()) {
+        feedbackInputSlices.assign(distributedInputSlices.begin(),
+            distributedInputSlices.end());
+    } else {
         for (int64_t slice = 0;
              slice < memory.slices_per_hemisphere
              && feedbackInputSlices.size() < 16;
@@ -124,18 +88,15 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             if (!llvm::is_contained(effectiveInputSlices, slice))
                 feedbackInputSlices.push_back(slice);
         }
-        }
-        if (feedbackInputSlices.size() != 16) {
-            op.emitError(
-                "target does not provide 16 VXM feedback slices disjoint "
-                "from the RMSNorm input");
-            return mlir::failure();
-        }
     }
-    const auto plannedWeight = planner.lookup(op.getWeight());
+    if (feedbackInputSlices.size() != 16) {
+        op.emitError(
+            "target does not provide 16 VXM feedback slices disjoint "
+            "from the RMSNorm input");
+        return mlir::failure();
+    }
     llvm::SmallVector<int64_t, 16> distributedWeightBindingSlices;
-    if (target.uses_dedicated_slice_roles()
-        && strategy == RmsNormLoweringStrategy::VxmFeedback) {
+    if (target.uses_dedicated_slice_roles()) {
         if (feedbackWeightSliceBase < 0
             || !target.is_activation_storage_slice(feedbackWeightSliceBase)
             || !target.is_activation_storage_slice(
@@ -157,44 +118,31 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
                 distributedWeightBindingSlices.push_back(slice);
         }
     }
-    if (strategy == RmsNormLoweringStrategy::VxmFeedback
-        && distributedWeightBindingSlices.size()
+    if (distributedWeightBindingSlices.size()
             != (target.uses_dedicated_slice_roles() ? 2u : 16u)) {
         op.emitError(
             "target does not provide the required gamma slice layout");
         return mlir::failure();
     }
-    const Allocation weight =
-        strategy == RmsNormLoweringStrategy::VxmFeedback
-        ? fixed_allocation(PlacementKind::Activation,
-              distributedWeightBindingSlices,
-              feedbackWeightBaseRow,
-              target.uses_dedicated_slice_roles()
-                  ? hidden : hidden / throughput.lanes_per_tile,
-              hidden * 2,
-              target.uses_dedicated_slice_roles()
-                  ? "fp16_vxm_gamma_broadcast"
-                  : "fp16_vxm_distributed_16",
-              "both",
-              target.uses_dedicated_slice_roles()
-                  ? feedbackWeightBank
-                  : std::max<int64_t>(0, weightBank))
-        : mlir::succeeded(plannedWeight)
-            && plannedWeight->layout == "fp16_pair_planar"
-        ? *plannedWeight
-        : fixed_allocation(PlacementKind::Activation,
-              {20, 21}, 0, hidden / tile, hidden * 2,
-              "fp16_pair_planar", "both",
-              std::max<int64_t>(0, weightBank));
+    const Allocation weight = fixed_allocation(PlacementKind::Activation,
+        distributedWeightBindingSlices, feedbackWeightBaseRow,
+        target.uses_dedicated_slice_roles()
+            ? hidden : hidden / throughput.lanes_per_tile,
+        hidden * 2,
+        target.uses_dedicated_slice_roles()
+            ? "fp16_vxm_gamma_broadcast"
+            : "fp16_vxm_distributed_16",
+        "both", target.uses_dedicated_slice_roles()
+            ? feedbackWeightBank
+            : std::max<int64_t>(0, weightBank));
     llvm::SmallVector<Allocation, 4> scratch;
-    if (strategy == RmsNormLoweringStrategy::VxmFeedback) {
-        const auto canonicalResultSlices =
-            target.mxm_distributed_activation_slices();
-        llvm::SmallVector<int64_t, 16> normalizedSlices;
-        if (target.uses_dedicated_slice_roles()) {
-            normalizedSlices.assign(canonicalResultSlices.begin(),
-                canonicalResultSlices.end());
-        } else {
+    const auto canonicalResultSlices =
+        target.mxm_distributed_activation_slices();
+    llvm::SmallVector<int64_t, 16> normalizedSlices;
+    if (target.uses_dedicated_slice_roles()) {
+        normalizedSlices.assign(canonicalResultSlices.begin(),
+            canonicalResultSlices.end());
+    } else {
         for (int64_t slice = 0;
              slice < memory.slices_per_hemisphere
              && normalizedSlices.size() < 16;
@@ -204,59 +152,46 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
                 == canonicalResultSlices.end())
                 normalizedSlices.push_back(slice);
         }
-        }
-        if (normalizedSlices.size() != 16) {
-            op.emitError(
-                "target does not provide 16 normalized scratch slices "
-                "disjoint from canonical MXM output");
-            return mlir::failure();
-        }
-        const int64_t distributedRows =
-            rows * hidden / (tile * throughput.lanes_per_tile);
-        const int64_t tokenBlocks = rows / tile;
-        const int64_t firstScratchBase =
-            target.uses_dedicated_slice_roles() ? 0 : 4608;
-        const int64_t normalizedScratchBase =
-            target.uses_dedicated_slice_roles()
+    }
+    if (normalizedSlices.size() != 16) {
+        op.emitError(
+            "target does not provide 16 normalized scratch slices "
+            "disjoint from canonical MXM output");
+        return mlir::failure();
+    }
+    const int64_t distributedRows =
+        rows * hidden / (tile * throughput.lanes_per_tile);
+    const int64_t tokenBlocks = rows / tile;
+    const int64_t firstScratchBase =
+        target.uses_dedicated_slice_roles() ? 0 : 4608;
+    const int64_t normalizedScratchBase =
+        target.uses_dedicated_slice_roles()
             ? preservesInput ? input.base_row + input.row_span : 0
             : 5632;
-        if (normalizedScratchBase + distributedRows
-            > memory.words_per_bank) {
-            op.emitError(
-                "RMSNorm normalized scratch does not fit after the live input");
-            return mlir::failure();
-        }
-        scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
-            feedbackInputSlices, firstScratchBase,
-            distributedRows + tokenBlocks,
-            matrixBytes + rows * 2, "fp16_vxm_distributed_16", "both",
-            target.uses_dedicated_slice_roles() ? resultBank : workingBank));
-        scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
-            normalizedSlices, normalizedScratchBase,
-            distributedRows, matrixBytes,
-            "fp16_vxm_distributed_16", "both",
-            target.uses_dedicated_slice_roles() ? inputBank : workingBank));
-    } else {
-        scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
-            squareSlices, 0, matrixRows, matrixBytes,
-            "fp16_mxm_activation_planar", "both"));
-        scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
-            {10, 11}, 0, rows, factorBytes,
-            "fp16_pair_planar", "both"));
+    if (normalizedScratchBase + distributedRows
+        > memory.words_per_bank) {
+        op.emitError(
+            "RMSNorm normalized scratch does not fit after the live input");
+        return mlir::failure();
     }
+    scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
+        feedbackInputSlices, firstScratchBase,
+        distributedRows + tokenBlocks,
+        matrixBytes + rows * 2, "fp16_vxm_distributed_16", "both",
+        target.uses_dedicated_slice_roles() ? resultBank : workingBank));
+    scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
+        normalizedSlices, normalizedScratchBase,
+        distributedRows, matrixBytes,
+        "fp16_vxm_distributed_16", "both",
+        target.uses_dedicated_slice_roles() ? inputBank : workingBank));
     const auto distributedResultSlices =
         target.mxm_distributed_activation_slices();
-    const Allocation result =
-        strategy == RmsNormLoweringStrategy::VxmFeedback
-        ? fixed_allocation(PlacementKind::FinalResult,
-              distributedResultSlices,
-              target.uses_dedicated_slice_roles() ? 0 : 5632,
-              rows * hidden / 256, matrixBytes,
-              "fp16_mxm_distributed_16", "both",
-              target.uses_dedicated_slice_roles() ? resultBank : workingBank)
-        : fixed_allocation(PlacementKind::FinalResult,
-              resultSlices, 0, matrixRows, matrixBytes,
-              "fp16_mxm_activation_planar", "both");
+    const Allocation result = fixed_allocation(PlacementKind::FinalResult,
+        distributedResultSlices,
+        target.uses_dedicated_slice_roles() ? 0 : 5632,
+        rows * hidden / 256, matrixBytes,
+        "fp16_mxm_distributed_16", "both",
+        target.uses_dedicated_slice_roles() ? resultBank : workingBank);
     if (mlir::failed(planner.bind(op.getInput(), input))
         || mlir::failed(planner.bind(op.getWeight(), weight))
         || mlir::failed(planner.bind(op.getResult(), result))) {
@@ -268,8 +203,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         input.layout, input.hemisphere);
     auto weightPlacement = make_profile_placement(rewriter, weight,
         weight.layout, "both");
-    if (strategy == RmsNormLoweringStrategy::VxmFeedback
-        && target.uses_dedicated_slice_roles()) {
+    if (target.uses_dedicated_slice_roles()) {
         mlir::NamedAttrList attributes(weightPlacement);
         attributes.set("bank_locked", rewriter.getBoolAttr(true));
         weightPlacement = attributes.getDictionary(rewriter.getContext());
@@ -307,10 +241,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         rewriter.getNamedAttr("result_allocations", resultAllocations),
         rewriter.getNamedAttr("config", rewriter.getDictionaryAttr({
             rewriter.getNamedAttr("strategy",
-                rewriter.getStringAttr(
-                    strategy == RmsNormLoweringStrategy::VxmFeedback
-                        ? "vxm_feedback"
-                        : "vxm_square_mxm_reduce")),
+                rewriter.getStringAttr("vxm_feedback")),
             rewriter.getNamedAttr("reduction_width",
                 rewriter.getI64IntegerAttr(tile)),
         })),
@@ -326,8 +257,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
 mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
     const target::LPUTargetModel& target,
     EastMemoryAllocator& allocator, AllocateValueFn allocateValue,
-    RmsNormLoweringStrategy rmsnormStrategy, int64_t weightBank,
-    mlir::IRRewriter& rewriter)
+    int64_t weightBank, mlir::IRRewriter& rewriter)
 {
     const auto allocationPlan =
         [&](mlir::Value value) -> mlir::FailureOr<mlir::ArrayAttr> {
@@ -357,13 +287,11 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
         const int64_t rows = resultType.getDimSize(0);
         const int64_t columns = resultType.getDimSize(1);
         bool feedsFeedbackRmsNorm = false;
-        if (rmsnormStrategy == RmsNormLoweringStrategy::VxmFeedback) {
-            for (mlir::OpOperand& use : op.getResult().getUses()) {
-                auto rmsNorm =
-                    llvm::dyn_cast<kernel::RmsNormOp>(use.getOwner());
-                feedsFeedbackRmsNorm |= rmsNorm
-                    && use.getOperandNumber() == 0;
-            }
+        for (mlir::OpOperand& use : op.getResult().getUses()) {
+            auto rmsNorm =
+                llvm::dyn_cast<kernel::RmsNormOp>(use.getOwner());
+            feedsFeedbackRmsNorm |= rmsNorm
+                && use.getOperandNumber() == 0;
         }
         llvm::SmallVector<int64_t, 32> occupiedSlices;
         const auto collectSlices =
@@ -460,9 +388,7 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
             op.getResult().getUses(), [](mlir::OpOperand& use) {
                 return llvm::isa<mlir::func::ReturnOp>(use.getOwner());
             });
-        const bool usesPersistentActivationAbi =
-            rmsnormStrategy == RmsNormLoweringStrategy::VxmFeedback
-            && isFunctionResult;
+        const bool usesPersistentActivationAbi = isFunctionResult;
         const int64_t workingBank = weightBank >= 0
             ? (weightBank + 1) % target.memory().banks_per_slice : 0;
         const auto lhsPlacement = llvm::cast<mlir::DictionaryAttr>(

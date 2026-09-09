@@ -9,10 +9,6 @@ mlir::LogicalResult lower_rms_norm(
     auto weight = get_task_allocation(op.getWeightAllocations(), 0);
     auto square = get_task_allocation(op.getScratchAllocations(), 0);
     auto secondary = get_task_allocation(op.getScratchAllocations(), 1);
-    const auto strategy =
-        op.getConfig().getAs<mlir::StringAttr>("strategy");
-    const bool feedback =
-        strategy && strategy.getValue() == "vxm_feedback";
     auto result = get_task_allocation(op.getResultAllocations(), 0);
     if (mlir::failed(input) || mlir::failed(weight)
         || mlir::failed(square) || mlir::failed(secondary)
@@ -71,60 +67,29 @@ mlir::LogicalResult lower_rms_norm(
     };
 
     bool valid = true;
-    int64_t stageCount = 14;
-    if (feedback) {
-        valid &= addRoute("transpose_input", "input",
-            target::StreamEndpoint::Mem, target::StreamEndpoint::SxmInput,
-            target::StreamDirection::East, *input, stage, stage + 2);
-        valid &= addRoute("transpose_input", "feedback_input",
-            target::StreamEndpoint::SxmResult, target::StreamEndpoint::Mem,
-            target::StreamDirection::West, *square, stage + 2, stage + 4);
-        valid &= addRoute("feedback", "input",
-            target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
-            target::StreamDirection::West, *square, stage + 4, stage + 6);
-        valid &= addRoute("feedback", "weight",
-            target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
-            target::StreamDirection::West, *weight, stage + 4, stage + 6);
-        valid &= addRoute("feedback", "normalized",
-            target::StreamEndpoint::VxmResult, target::StreamEndpoint::Mem,
-            target::StreamDirection::East, *secondary,
-            stage + 6, stage + 8);
-        valid &= addRoute("restore_layout", "normalized",
-            target::StreamEndpoint::Mem, target::StreamEndpoint::SxmInput,
-            target::StreamDirection::East, *secondary,
-            stage + 8, stage + 10);
-        valid &= addRoute("restore_layout", "result",
-            target::StreamEndpoint::SxmResult, target::StreamEndpoint::Mem,
-            target::StreamDirection::West, *result, stage + 10, stage + 12);
-        stageCount = 12;
-    } else {
-        valid &= addRoute("square", "input",
-            target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
-            target::StreamDirection::West, *input, stage, stage + 2);
-        valid &= addRoute("square", "square_write",
-            target::StreamEndpoint::VxmResult, target::StreamEndpoint::Mem,
-            target::StreamDirection::East, *square, stage + 2, stage + 4);
-        valid &= addRoute("reduce", "square_read",
-            target::StreamEndpoint::Mem,
-            target::StreamEndpoint::MxmActivation,
-            target::StreamDirection::East, *square, stage + 4, stage + 6);
-        valid &= addRoute("factor", "reduction_result",
-            target::StreamEndpoint::MxmResult,
-            target::StreamEndpoint::VxmInput,
-            target::StreamDirection::West, *secondary, stage + 6, stage + 8);
-        valid &= addRoute("factor", "factor_write",
-            target::StreamEndpoint::VxmResult, target::StreamEndpoint::Mem,
-            target::StreamDirection::East, *secondary, stage + 8, stage + 10);
-        valid &= addRoute("scale", "input",
-            target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
-            target::StreamDirection::West, *input, stage + 10, stage + 12);
-        valid &= addRoute("scale", "weight",
-            target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
-            target::StreamDirection::West, *weight, stage + 10, stage + 12);
-        valid &= addRoute("scale", "result",
-            target::StreamEndpoint::VxmResult, target::StreamEndpoint::Mem,
-            target::StreamDirection::East, *result, stage + 12, stage + 14);
-    }
+    valid &= addRoute("transpose_input", "input",
+        target::StreamEndpoint::Mem, target::StreamEndpoint::SxmInput,
+        target::StreamDirection::East, *input, stage, stage + 2);
+    valid &= addRoute("transpose_input", "feedback_input",
+        target::StreamEndpoint::SxmResult, target::StreamEndpoint::Mem,
+        target::StreamDirection::West, *square, stage + 2, stage + 4);
+    valid &= addRoute("feedback", "input",
+        target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
+        target::StreamDirection::West, *square, stage + 4, stage + 6);
+    valid &= addRoute("feedback", "weight",
+        target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
+        target::StreamDirection::West, *weight, stage + 4, stage + 6);
+    valid &= addRoute("feedback", "normalized",
+        target::StreamEndpoint::VxmResult, target::StreamEndpoint::Mem,
+        target::StreamDirection::East, *secondary,
+        stage + 6, stage + 8);
+    valid &= addRoute("restore_layout", "normalized",
+        target::StreamEndpoint::Mem, target::StreamEndpoint::SxmInput,
+        target::StreamDirection::East, *secondary,
+        stage + 8, stage + 10);
+    valid &= addRoute("restore_layout", "result",
+        target::StreamEndpoint::SxmResult, target::StreamEndpoint::Mem,
+        target::StreamDirection::West, *result, stage + 10, stage + 12);
     if (!valid) {
         op.emitError("cannot allocate RMSNorm stream routes");
         return mlir::failure();
@@ -155,7 +120,7 @@ mlir::LogicalResult lower_rms_norm(
         llvm::cast<stream::RmsNormTaskOp>(
             context.rewriter.create(state));
     context.rewriter.replaceOp(op, lowered.getResult());
-    context.stage += stageCount;
+    context.stage += 12;
     return mlir::success();
 }
 

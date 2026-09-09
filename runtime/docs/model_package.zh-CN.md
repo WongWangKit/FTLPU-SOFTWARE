@@ -182,7 +182,7 @@ SmolLM2-135M 第 0 层、`seq_len=128` 测试包包含：
 
 ## 真实双层 Golden
 
-`seq_len=128` 的第 0/1 层测试分别编译 executable，因为两层的 W8A16 scale 不同。`hidden.1` 在 invocation 之间保留于 CModel MEM。采用 `vxm_feedback` RMSNorm 策略的 decoder 以 `fp16_mxm_distributed_16` 作为持久化外部激活 ABI。最终 residual add 直接写入下一次 decoder invocation 所需的相同 slices 和 base row，因此 planner 选择 device alias，不再执行 layout copy。
+`seq_len=128` 的第 0/1 层测试分别编译 executable，因为两层的 W8A16 scale 不同。`hidden.1` 在 invocation 之间保留于 CModel MEM。decoder 固定使用 VXM-feedback RMSNorm lowering，并以 `fp16_mxm_distributed_16` 作为持久化外部激活 ABI。最终 residual add 直接写入下一次 decoder invocation 所需的相同 slices 和 base row，因此 planner 选择 device alias，不再执行 layout copy。
 
 所有层常量都在 `load()` 阶段作为 resident upload 一次性完成。每次 run 只需要动态上传模型输入、最终下载一次结果，并执行一次 device alias、零次 device copy；`hidden.1` 不经过 host。
 

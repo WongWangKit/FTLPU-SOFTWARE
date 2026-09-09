@@ -19,7 +19,6 @@ def lower(tool: Path, target: Path, source: Path, output: Path,
         str(tool), "--input", str(source), "--output", str(output),
         "--pipeline", pipeline, "--mxm-execution", mxm_execution,
         "--ffn-schedule", "tail", "--target-config", str(target),
-        "--rmsnorm-strategy", "vxm-feedback",
     ]
     if kv_cache_capacity:
         command += ["--kv-cache-capacity", str(kv_cache_capacity)]

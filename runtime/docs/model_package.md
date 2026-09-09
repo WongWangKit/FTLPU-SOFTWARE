@@ -188,7 +188,7 @@ The test now obtains its RoPE table exclusively from the typed internal binary b
 
 ## Real two-layer golden
 
-The sequence-length-128 layer-0/layer-1 test uses two independently compiled executables because each layer has different W8A16 scales. `hidden.1` remains resident in CModel MEM between invocations. A decoder compiled with the `vxm_feedback` RMSNorm strategy uses `fp16_mxm_distributed_16` as its persistent external-activation ABI. The final residual add writes directly to the same slices and base row expected by the next decoder invocation, so the planner selects a device alias instead of a layout copy.
+The sequence-length-128 layer-0/layer-1 test uses two independently compiled executables because each layer has different W8A16 scales. `hidden.1` remains resident in CModel MEM between invocations. The decoder always uses the VXM-feedback RMSNorm lowering and `fp16_mxm_distributed_16` as its persistent external-activation ABI. The final residual add writes directly to the same slices and base row expected by the next decoder invocation, so the planner selects a device alias instead of a layout copy.
 
 All layer constants are resident uploads performed by `load()`. A run performs only the dynamic model-input upload, one final host download, one device alias, zero device copies, and no host transfer for `hidden.1`.
 
