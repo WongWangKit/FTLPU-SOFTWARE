@@ -154,6 +154,12 @@ def main() -> None:
         default=0,
         help="reserve persistent BF16 K/V state for this many tokens",
     )
+    parser.add_argument(
+        "--kv-cache-page-tokens",
+        type=int,
+        default=0,
+        help="override the target-derived KV cache page size",
+    )
     parser.add_argument("--first-layer", type=int, default=0)
     parser.add_argument(
         "--reuse-golden", action="store_true",
@@ -319,28 +325,72 @@ def main() -> None:
     )
     package_command.extend(["--output", str(logical_output)])
     if args.kv_cache_capacity:
+        page_tokens = args.kv_cache_page_tokens
+        if page_tokens == 0 and args.target_config:
+            target_page_sizes = set()
+            for target_config in args.target_config:
+                target = json.loads(
+                    target_config.read_text(encoding="utf-8")
+                )
+                topology = target["topology"]
+                target_page_sizes.add(
+                    int(topology["tiles_per_slice"])
+                    * int(topology["lanes_per_tile"])
+                )
+            if len(target_page_sizes) != 1:
+                raise ValueError(
+                    "decoder target variants disagree on KV page size"
+                )
+            page_tokens = target_page_sizes.pop()
+        if page_tokens == 0:
+            page_tokens = args.seq_len
         package_command.extend([
-            "--kv-cache-capacity", str(args.kv_cache_capacity)
+            "--kv-cache-capacity", str(args.kv_cache_capacity),
+            "--kv-cache-page-tokens", str(page_tokens),
         ])
     if args.checkpoint_outputs:
         package_command.append("--checkpoint-outputs")
     if args.final_rmsnorm_executable:
         sys.path.insert(0, str(tools_dir))
-        from import_hf_decoder_layer import SafeTensorStore, write_bf16
+        from import_hf_decoder_layer import (
+            SafeTensorStore,
+            read_bf16,
+            rms_norm,
+            write_bf16,
+        )
 
         store = SafeTensorStore(args.model_dir)
         boundary_dir = args.output_dir / "model_boundaries"
         boundary_dir.mkdir(parents=True, exist_ok=True)
         embedding_path = boundary_dir / "embed_tokens.bf16.bin"
         final_norm_path = boundary_dir / "final_norm.bf16.bin"
+        final_hidden_golden_path = (
+            boundary_dir / "golden.final_hidden.bf16.bin"
+        )
+        hidden_size = int(config["hidden_size"])
+        final_norm = store.read("model.norm.weight")
         write_bf16(
             embedding_path, store.read("model.embed_tokens.weight")
         )
-        write_bf16(final_norm_path, store.read("model.norm.weight"))
+        write_bf16(final_norm_path, final_norm)
+        decoder_golden = read_bf16(
+            golden_dirs[-1] / "golden.bf16.bin",
+            (args.seq_len, hidden_size),
+        )
+        write_bf16(
+            final_hidden_golden_path,
+            rms_norm(
+                decoder_golden,
+                final_norm,
+                float(config["rms_norm_eps"]),
+            ),
+        )
         package_command.extend([
             "--embedding-table-bf16", str(embedding_path),
             "--vocab-size", str(int(config["vocab_size"])),
             "--final-norm-bf16", str(final_norm_path),
+            "--final-hidden-golden-bf16",
+            str(final_hidden_golden_path),
             "--final-rmsnorm-executable",
             str(args.final_rmsnorm_executable),
         ])

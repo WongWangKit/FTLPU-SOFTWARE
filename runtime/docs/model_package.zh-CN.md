@@ -10,8 +10,8 @@
 | --- | --- | --- | --- |
 | `ModelPackage` | 序列化模型或已加载 package | 命名 value/tensor、executable 模板、invocation 顺序、host operation、持久状态声明 | 可变设备状态和最终物理地址 |
 | `ModelExecutable` | package 内可复用模板 | 一份 `.ftlpu` program、typed binding、target ABI 和 relocation record | 各层 tensor payload 和 session lifetime |
-| `SessionMemoryPlanner` | `load()` 中的一次规划调用 | producer/consumer lifetime、常驻 tensor/state placement、每次 invocation 的 transfer 决策 | 上传、执行 command 或修改 CModel |
-| `ModelSession` | 一个已加载的 runtime 实例 | package 副本、memory plan、host value、设备驻留 value map、统计、预处理和顺序执行 | 编译器调度和指令生成 |
+| `SessionMemoryPlanner` | `load()` 中的一次规划调用 | producer/consumer lifetime、常驻 tensor placement、state staging 预留、每次 invocation 的 transfer 决策 | state 内容、上传、执行 command 或修改 CModel |
+| `ModelSession` | 一个已加载的 runtime 实例 | package 副本、memory plan、host value、逻辑 state backing、设备驻留 value map、统计、预处理和顺序执行 | 编译器调度和指令生成 |
 | `CModelRuntime` | 每次执行一个已解析 executable | binding 上传/复制、internal 初始化、ICU queue 装载、tick 和结果下载 | 模型级 invocation 顺序和跨 invocation lifetime |
 
 ```mermaid
@@ -35,7 +35,7 @@ flowchart LR
 
 ## 模型包内容
 
-第四版 `.ftlpum` 格式包含：
+第六版 `.ftlpum` 格式包含：
 
 - 模型名和架构标识；
 - 命名常量 tensor；
@@ -48,6 +48,10 @@ flowchart LR
 - 将命名 value 映射到 executable binding 的有序 invocation 列表。
 
 文件 magic 为 `FTLPUM01`。量化 tensor 元数据包括 encoding、axis、block size 和 scale。量化描述不决定物理 SRAM 布局，物理布局仍以内嵌 executable 的 `BinaryBinding` 为准。
+
+v4 引入 persistent state，v6 用 `page_tokens` 和 `resident_tokens` 将逻辑容量
+与 executable 的物理 SRAM window 分开。reader 仍兼容旧版本，并将旧 state
+解释为全部常驻。
 
 ## 模型入口预处理
 
@@ -77,14 +81,14 @@ host embedding -> LPU decoder stack -> LPU final RMSNorm -> host LM head
 2. 在修改设备内存前调用 `SessionMemoryPlanner::plan`；
 3. 替换此前的 package、value map、plan 和统计；
 4. 把所有已规划的 resident tensor 上传到解析后的 binding；
-5. 为每份 persistent state 分配物理区间并清零一次。
+5. 为每份 persistent state 分配完整的片外逻辑 backing，并清零一次。
 
-`load_file(path)` 使用 lazy executable materialization 读取 package，随后进入同一流程。因此常驻权重在 `load()` 阶段传输，而不是每层传一次。包括 KV cache 在内的 persistent state 不会被 `run()` 自动清零；重新加载 package 才会再次初始化。
+`load_file(path)` 使用 lazy executable materialization 读取 package，随后进入同一流程。因此常驻权重在 `load()` 阶段传输，而不是每层传一次。包括 KV cache 在内的 persistent state 不会被 `run()` 自动清零；重新加载 package 才会重新初始化逻辑 backing。
 
 ### 外部传输约束
 
 LPU MEM 不提供 host 可见的初始化旁路。所有 resident 常量、persistent state
-初始化、动态输入、分页权重和 external output，都必须沿
+window、动态输入、分页权重和 external output，都必须沿
 `host backing store -> DDR -> C2C DMA -> C2C -> MEM` 或反向路径跨越设备边界。
 `Ddr4Model::initialize_vector/read_vector` 只是 host 访问外部 DDR backing store
 的接口，不会直接读写 LPU SRAM。invocation 之间仍允许 `DeviceAlias`，因为它只是
@@ -108,14 +112,16 @@ consumer cycle，也就是启动预取和放置同步点的提示。runtime 在�
 `set_input(name, bytes)` 只接受声明为 external input 的 value。`run()` 会清空临时 device-value map，执行 host embedding lookup，按 package 顺序运行 invocation，最后执行 host LM head。每次 invocation 会：
 
 1. 物化 executable 模板，并根据 session plan 应用 scale/MEM relocation；
-2. reset 并重新装载 CModel ICU queue，同时保留 MEM SRAM；
-3. 把每个输入解析为 resident tensor、动态 host upload、device alias 或 device layout copy；
-4. 执行 command program 和 drain cycle；
-5. 让设备输出驻留到最后一个 consumer，仅下载 external output。
+2. 通过 DDR/C2C 把该 invocation 的逻辑 K/V resident window 搬入可复用 SRAM slot；
+3. reset 并重新装载 CModel ICU queue，同时保留 MEM SRAM；
+4. 把每个输入解析为 resident tensor、动态 host upload、device alias 或 device layout copy；
+5. 执行 command program 和 drain cycle；
+6. 把更新后的 K/V window 搬回片外 backing；
+7. 让设备输出驻留到最后一个 consumer，仅下载 external output。
 
 `run_invocation(index)` 暴露单次设备 invocation，供定点测试和调试使用；它不能替代 `run()` 完成的 package 级前处理与后处理。物理 binding 兼容时直接 alias；16-bit float layout 不兼容时，在 CModel MEM 内完成 layout transfer，不在 host 中物化完整逻辑 tensor。该显式 backend operation 后续可替换为 ICU MEM/SXM adapter executable。
 
-生产路径中的 activation、RMSNorm 参数、RoPE 表、embedding 和 LM-head 边界使用 BF16。以 `Fp16` 开头的旧 layout 名称只描述双字节物理拓扑，`BindingElementType::BF16` 才是权威数值格式。切换 executable 时会清空 ICU、stream、MXM、VXM 和 SXM 状态，但 MEM 与 persistent state 保持存活。`stats()` 统计 resident upload、state initialization、host transfer、device alias/copy 和 host operation。
+生产路径中的 activation、RMSNorm 参数、RoPE 表、embedding 和 LM-head 边界使用 BF16。以 `Fp16` 开头的旧 layout 名称只描述双字节物理拓扑，`BindingElementType::BF16` 才是权威数值格式。切换 executable 时会清空 ICU、stream、MXM、VXM 和 SXM 状态；MEM 在 reset 时保留，逻辑 persistent state 则由 session backing 保留。`stats()` 除常驻、host、device-copy 和 host-operation 流量外，还单独统计 state page-in/page-out 的次数、字节数和 cycle。
 
 `weight_page_runtime_wait_cycles` 统计 executable 内因 page-ready fence 产生的真实
 physical-cycle 等待。启用 execution trace 后，
@@ -125,7 +131,7 @@ physical-cycle 等待。启用 execution trace 后，
 
 ## 地址规划与 relocation
 
-地址规划分为三个不同作用域。Compiler Tensor lowering 决定 binding layout、slice 集合、初始 row geometry 和算子 scratch；`SessionMemoryPlanner` 跨 invocation 全局 relocation 常驻常量与 persistent state；Schedule verifier 检查逐 cycle 的 MEM port 和 queue。Schedule 冲突检查不能替代空间地址重叠检查。
+地址规划分为三个不同作用域。Compiler Tensor lowering 决定 binding layout、slice 集合、初始 row geometry、算子 scratch 和 persistent state 的可复用 SRAM staging window；`SessionMemoryPlanner` 跨 invocation 全局 relocation 常驻常量，同时保留这些 state window；Schedule verifier 检查逐 cycle 的 MEM port 和 queue。invocation 之间的逻辑 state 内容保存在 `ModelSession` 的片外 backing 中。Schedule 冲突检查不能替代空间地址重叠检查。
 
 `BinaryBinding` 固定 target ABI、access class、hemisphere mask、slice、layout、shape、元素类型、字节数、指令数和有符号 address stride。Runtime relocation 必须保持这些字段不变，只能修改 `base_row`。Binding 占用的半开 row 区间按 `begin = base_row + min(0, (instruction_count - 1) * address_stride)`、`end = base_row + max(0, (instruction_count - 1) * address_stride) + 1` 推导，因此也能覆盖反向遍历 row 的 weight command。
 
@@ -133,11 +139,11 @@ physical-cycle 等待。启用 execution trace 后，
 
 1. 根据有序 invocation 列表，为命名 value 建立 producer 到最后一个 consumer 的 lifetime。
 2. 以 `(target_abi, hemisphere, slice)` 为物理内存 key，并校验共享 ABI 的 executable 对 row capacity 认识一致。
-3. 根据 binary memory floor 和 non-resident binding，为每个物理 slice 计算保守的 `reserved_floor`。匿名 command scratch 没有全部枚举为 binding，因此 floor 以下区域都不能分给 resident allocation。
-4. 把每个 slice 的初始空闲区间设为 `[reserved_floor, capacity)`，再收集全部 invocation 的 immutable tensor input 和去重后的 persistent state。
+3. 根据 binary memory floor 为匿名 command scratch 保留 `[0, first_free_row)`，并为每个具名 non-resident binding 保留精确 row interval。
+4. 在 `[0, capacity)` 中求合并保留区间的补集，记录每个 invocation 由 compiler 声明的 state staging binding，再收集需要 relocation 的 immutable tensor input。
 5. 依次按 slice 数量降序、同 slice-group 总 extent 降序、slice 集合字典序、单个 extent 降序排列 request，让约束最强的 group 先分配。
 6. 从每个 free interval 的 begin 和 `end - extent` 生成候选。使用至少16个 slice 的 binding 从低 row 向高 row 搜索，较窄 group 从高 row 向低 row 搜索；只有同一 row 区间在全部相关物理 slice 上都空闲时才合法。
-7. 在每个 slice 上切割选中的 interval，更新解析后的 `base_row`，并记录为 resident tensor 或 persistent-state allocation。
+7. 在每个 slice 上切割 resident-tensor interval 并更新 `base_row`；state binding 保留 compiler 规划的地址及独立逻辑 backing 名称。
 
 ```mermaid
 flowchart LR
@@ -145,19 +151,22 @@ flowchart LR
     Floors["Binary memory floor<br/>dynamic 和 scratch 预留"]
     Graph["Package invocation graph<br/>producer / last consumer"]
     Free["逐 slice free interval"]
-    Requests["Resident tensor + persistent state"]
+    Requests["Resident tensor placement request"]
+    State["Compiler state staging reservation"]
     Search["排序后的公共区间搜索"]
     Plan["SessionMemoryPlan<br/>解析后 binding + transfer"]
     Reloc["Typed MEM relocation"]
     Run["ModelSession 执行"]
 
-    Binding --> Floors --> Free
+    Binding --> Floors
+    Binding --> State --> Free
+    Floors --> Free
     Graph --> Requests
     Free --> Search
     Requests --> Search --> Plan --> Reloc --> Run
 ```
 
-完成 placement 后，每个 invocation input 会独立分类：`Resident` 使用规划后的 binding；`HostUpload` 物化动态 external value；`DeviceAlias` 复用完全相同的物理 binding；`DeviceCopy` 执行显式且兼容的 layout transfer。Persistent state 在整个 session 中只分配一次，并通过 `BindingAccess::Internal` 引用。
+完成 placement 后，每个 invocation input 会独立分类：`Resident` 使用规划后的 binding；`HostUpload` 物化动态 external value；`DeviceAlias` 复用完全相同的物理 binding；`DeviceCopy` 执行显式且兼容的 layout transfer。Persistent state 通过 `BindingAccess::Internal` 引用；顺序执行的 state 复用 compiler 声明的 SRAM staging 地址。
 
 容量耗尽、slice group 找不到公共区间、共享 ABI 的 executable 对容量认识不一致、state binding 的 type/layout/shape/slice/hemisphere 不一致、设备 value 跨 target ABI，或者地址移动缺少 relocation 时，planner 会失败，不会静默产生地址重叠。编译器侧的单函数和算子地址规划见[编译器架构文档](../../compiler/docs/compiler_architecture.zh-CN.md)。
 
@@ -214,7 +223,29 @@ CModel 端到端 golden 结果为：
 
 验证同时检查按 BF16 数值尺度变化的误差、相对 L2、余弦相似度和 LM-head Top-K 一致性。只使用固定绝对误差阈值并不合适，因为 BF16 激活值越大，一个 ULP 对应的绝对间隔也越大。
 
-使用 `build_hf_decoder_stack.py --checkpoint-outputs` 可以把每层 golden 写入模型包，并把每个 `hidden.N` 标记为外部输出。随后 `hf_decoder_stack_checkpoint_test` 会逐层报告数值漂移，同时不改变正常模型包的 ABI。
+使用 `build_hf_decoder_stack.py --checkpoint-outputs` 可以把每层 golden
+写入模型包，把每个 decoder 边界标记为外部输出，同时将其暴露为可重启输入。
+因此 `hf_decoder_stack_checkpoint_test` 可以从任意层的 golden 输入开始，区分
+本层 lowering 错误与逐层累积的 BF16 漂移。显式调用
+`ModelSession::set_input("hidden.N", ...)` 会覆盖该 value 原先静态规划的
+device alias/device copy，并执行建模后的 C2C upload。带完整模型边界的模型包
+还会保存 `golden.final_hidden`，它由最后一层 decoder golden 和 checkpoint 的
+final RMSNorm 计算得到。
+
+对于 seq_len=32 的 Qwen2.5-1.5B，完整 CModel 路径依次执行 host embedding、
+28 次分页 decoder invocation、LPU final RMSNorm 和 tied host LM head。当前真实
+权重 INT8/BF16 测量结果为：final hidden 相对 L2 误差 `0.024953`、余弦相似度
+`0.999689`、LM-head logits 余弦相似度 `0.999307`，Top-5 完全一致。final hidden
+平均绝对误差 `0.054659` 仍会作为诊断信息输出，但不作为验收阈值，因为它会随
+激活值尺度和网络深度变化；严格的局部 BF16 tolerance 由可独立重启的逐层
+checkpoint 测试负责。
+
+checkpoint harness 会从每个 invocation 的 binding 表推导重启输入和 golden
+输出。默认情况下，每个 invocation 都从自己的 golden 输入重新开始，因此严格
+BF16 tolerance 可以定位本层 lowering 错误；设置
+`FTLPU_CHECKPOINT_CHAINED=1` 后，所选范围会保留实际输出，用于测量累计漂移。
+decoder 边界与可选的 `final_norm -> final_hidden` 边界使用同一套验证机制，不再
+假设每个 invocation 都一定产生下一个 `hidden.N`。
 
 完整模型 executable 当前采用 FFN tail 调度。其静态 decoder-layer schedule 结束于约 197,978 cycle，fused 调度约为 192,125 cycle，因此当前 tail 约慢 3.0%。这里保留 tail 作为更保守的完整 prefill 基线，并不把它描述成性能优化。
 
@@ -226,10 +257,26 @@ CModel 端到端 golden 结果为：
 
 ## 持久 KV cache
 
-`SessionMemoryPlanner` 会把模型状态与常驻权重一起做全局分配。由状态支持的 internal binding 不再计入 executable 的普通 scratch 保留区；它在整个 session 中只分配一个物理区间。每个引用该状态的 invocation 都必须具有相同的元素类型、layout、shape、slice 集合和 hemisphere placement。
+`ModelState.shape` 和 `max_tokens` 表示逻辑容量。v6 新增 `page_tokens` 与
+`resident_tokens`，executable internal binding 使用
+`[resident_tokens, kv_heads, head_dim]`，不再使用完整逻辑 shape。
 
-`ModelSession::load` 只对每份状态清零一次。切换 executable 时会保留 MEM SRAM，因此后续 prefill layer 和 decode step 能继续观察同一份 cache。对于 `[max_tokens, kv_heads, head_dim]` 这样的 rank-3 KV shape，runtime 会在物理 distributed-matrix layout 中将后两维展平。
+`SessionMemoryPlanner` 在 relocation 常驻权重前，会先保留 compiler 声明的
+state staging slot。Tensor lowering 将 persistent K/V window 放在对应 slice
+group 的 SRAM 高端，并让它一直存活到 executable 结束；planner 会拒绝它与任何
+其他 executable binding 重叠，session-lifetime resident tensor 同样不能覆盖它。
+顺序 layer 复用相同物理地址，每个 state name 仍保留独立逻辑 backing。每次引用
+都会校验元素类型、layout、resident shape、slice、bank、hemisphere、binding
+index 和 target ABI。
+
+`ModelSession::load` 只对每份完整逻辑 backing 清零一次。invocation 开始前，
+runtime 通过建模的 DDR/C2C 把 resident prefix 搬到 SRAM；执行后再把更新窗口
+搬回。runtime CSV 将这两个区间标为 `C2C.StatePageIn` 和
+`C2C.StatePageOut`。rank-3 KV shape 的后两维由物理 layout 展平。
 
 `.ftlpu` 二进制格式 v10 为每条 MEM address relocation 增加了 `BindingAccess`。这样，即使 input binding 与 internal KV binding 使用相同数字编号，runtime 也不会把地址修补到错误的命名空间。
 
-当前 52-slice CModel 在两个 hemisphere 合计提供 208 MiB SRAM。SmolLM2-135M 在 8192 token 下的 BF16 KV cache 约为 180 MiB，尚未计入权重和 scratch，因此无法与全部 decoder 权重同时驻留。当前整模型目标使用 2048-token profile；更长上下文需要 paged 或 off-chip KV storage。
+对 Qwen2.5-1.5B 的 seq32、capacity=256 配置，28 层逻辑 BF16 K/V 共 7 MiB，
+但 SRAM 每个乒乓 bank 只占一对 32-token K/V staging slot。当前 prefill 始终传输 offset=0 的
+prefix；超过该窗口的 decode 仍需动态 cache length、page offset、append range
+以及面向历史前缀的 QK/PV 调度。

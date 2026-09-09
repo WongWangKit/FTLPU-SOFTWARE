@@ -45,16 +45,6 @@ const ModelState &find_state(const ModelPackage &package,
       "model invocation references an unknown persistent state");
 }
 
-bool is_state_binding(const ModelInvocation &invocation,
-                      const BinaryBinding &binding) {
-  if (binding.access != BindingAccess::Internal)
-    return false;
-  return std::any_of(invocation.states.begin(), invocation.states.end(),
-                     [&](const ModelStateBindingRef &ref) {
-                       return ref.binding_index == binding.index;
-                     });
-}
-
 using PhysicalSlice =
     std::tuple<std::uint64_t, std::uint16_t, std::uint16_t, std::uint16_t>;
 
@@ -86,6 +76,35 @@ binding_row_range(const BinaryBinding &binding) {
       binding.base_row + std::min<std::int64_t>(0, final_offset),
       binding.base_row + std::max<std::int64_t>(0, final_offset) + 1,
   };
+}
+
+std::vector<std::uint64_t> resident_state_shape(const ModelState &state) {
+  std::vector<std::uint64_t> shape = state.shape;
+  shape.front() = state.resident_tokens == 0 ? state.max_tokens
+                                             : state.resident_tokens;
+  return shape;
+}
+
+bool bindings_overlap(const BinaryProgram &program,
+                      const BinaryBinding &lhs,
+                      const BinaryBinding &rhs) {
+  if (lhs.bank != rhs.bank ||
+      (lhs.hemisphere_mask & rhs.hemisphere_mask) == 0)
+    return false;
+  const auto [lhs_begin, lhs_end] = binding_row_range(lhs);
+  const auto [rhs_begin, rhs_end] = binding_row_range(rhs);
+  if (lhs_begin >= rhs_end || rhs_begin >= lhs_end)
+    return false;
+  bool overlap = false;
+  for_each_physical_slice(program, lhs, [&](const PhysicalSlice &lhs_slice) {
+    if (overlap)
+      return;
+    for_each_physical_slice(
+        program, rhs, [&](const PhysicalSlice &rhs_slice) {
+          overlap |= lhs_slice == rhs_slice;
+        });
+  });
+  return overlap;
 }
 
 bool is_embedding_output(const ModelPackage &package, const std::string &name) {
@@ -139,7 +158,8 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
   };
   std::unordered_map<std::string, Producer> producers;
   std::unordered_map<std::string, std::vector<std::size_t>> consumers;
-  std::map<PhysicalSlice, std::int64_t> reserved_floor;
+  using Interval = std::pair<std::int64_t, std::int64_t>;
+  std::map<PhysicalSlice, std::vector<Interval>> reserved_intervals;
   std::map<PhysicalSlice, std::int64_t> memory_capacity;
   for (std::size_t invocation_index = 0;
        invocation_index < package.invocations.size(); ++invocation_index) {
@@ -167,9 +187,9 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
     result.lifetimes.push_back({name, producer.invocation, last_consumer});
   }
 
-  // Binary bindings do not enumerate every anonymous command scratch
-  // interval. Conservatively reserve everything below the highest declared
-  // non-resident row, then pack constants downward from the top of MEM.
+  // Memory floors cover anonymous command scratch. Named non-resident
+  // bindings contribute their exact intervals so resident data may use holes
+  // without overlapping either form of executable-owned storage.
   for (std::size_t invocation_index = 0;
        invocation_index < package.invocations.size(); ++invocation_index) {
     const ModelInvocation &invocation = package.invocations[invocation_index];
@@ -181,8 +201,8 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
         throw std::invalid_argument("binary MEM floor exceeds physical MEM");
       const PhysicalSlice slice{program.target_abi, floor.hemisphere,
                                 floor.slice, floor.bank};
-      reserved_floor[slice] =
-          std::max<std::int64_t>(reserved_floor[slice], floor.first_free_row);
+      reserved_intervals[slice].push_back(
+          {0, static_cast<std::int64_t>(floor.first_free_row)});
     }
     for (const BinaryBinding &binding : program.bindings) {
       bool resident_input = false;
@@ -195,8 +215,7 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
           }
         }
       }
-      if (resident_input || is_state_binding(invocation, binding) ||
-          binding.slices.empty())
+      if (resident_input || binding.slices.empty())
         continue;
       const auto [begin, end] = binding_row_range(binding);
       if (begin < 0 ||
@@ -205,7 +224,7 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
             "compiler-assigned binding exceeds physical MEM");
       for_each_physical_slice(
           program, binding, [&](const PhysicalSlice &slice) {
-            reserved_floor[slice] = std::max(reserved_floor[slice], end);
+            reserved_intervals[slice].push_back({begin, end});
           });
     }
     for (const BinaryBinding &binding : program.bindings) {
@@ -224,8 +243,45 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
   }
   using FreeInterval = std::pair<std::int64_t, std::int64_t>;
   std::map<PhysicalSlice, std::vector<FreeInterval>> free_intervals;
-  for (const auto &[slice, capacity] : memory_capacity)
-    free_intervals[slice].push_back({reserved_floor[slice], capacity});
+  for (const auto &[slice, capacity] : memory_capacity) {
+    auto &reserved = reserved_intervals[slice];
+    std::sort(reserved.begin(), reserved.end());
+    std::vector<Interval> merged;
+    for (const Interval &interval : reserved) {
+      if (interval.first < 0 || interval.second > capacity ||
+          interval.first > interval.second)
+        throw std::invalid_argument(
+            "compiler-assigned MEM reservation exceeds physical MEM");
+      if (interval.first == interval.second)
+        continue;
+      if (merged.empty() || merged.back().second < interval.first)
+        merged.push_back(interval);
+      else
+        merged.back().second = std::max(merged.back().second, interval.second);
+    }
+    std::int64_t cursor = 0;
+    for (const Interval &interval : merged) {
+      if (cursor < interval.first)
+        free_intervals[slice].push_back({cursor, interval.first});
+      cursor = std::max(cursor, interval.second);
+    }
+    if (cursor < capacity)
+      free_intervals[slice].push_back({cursor, capacity});
+  }
+  const auto intervals_for =
+      [&](const PhysicalSlice &slice) -> std::vector<FreeInterval> & {
+    const auto intervals = free_intervals.find(slice);
+    if (intervals == free_intervals.end()) {
+      const auto [target, hemisphere, physical_slice, bank] = slice;
+      throw std::logic_error(
+          "planner has no MEM capacity for binding slice: target_abi=" +
+          std::to_string(target) + " hemisphere=" +
+          std::to_string(hemisphere) + " slice=" +
+          std::to_string(physical_slice) + " bank=" +
+          std::to_string(bank));
+    }
+    return intervals->second;
+  };
 
   struct ResidentRequest {
     std::size_t invocation_index;
@@ -234,12 +290,13 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
     const BinaryProgram *program;
     BinaryBinding binding;
     std::int64_t extent;
-    bool persistent_state{false};
   };
   std::vector<ResidentRequest> resident_requests;
   std::map<PhysicalSlice, std::int64_t> requested_rows;
   std::map<std::pair<std::size_t, std::uint32_t>, BinaryBinding>
       resolved_residents;
+  std::map<std::pair<std::size_t, std::uint32_t>, BinaryBinding>
+      resolved_states;
   for (std::size_t invocation_index = 0;
        invocation_index < package.invocations.size(); ++invocation_index) {
     const ModelInvocation &invocation = package.invocations[invocation_index];
@@ -255,15 +312,15 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
         continue;
       const auto [begin, end] = binding_row_range(resident);
       resident_requests.push_back({invocation_index, input.binding_index,
-                                   input.value, &program, resident, end - begin,
-                                   false});
+                                   input.value, &program, resident,
+                                   end - begin});
       for_each_physical_slice(program, resident,
                               [&](const PhysicalSlice &slice) {
                                 requested_rows[slice] += end - begin;
                               });
     }
   }
-  std::unordered_set<std::string> requested_states;
+  std::unordered_set<std::string> emitted_states;
   for (std::size_t invocation_index = 0;
        invocation_index < package.invocations.size(); ++invocation_index) {
     const ModelInvocation &invocation = package.invocations[invocation_index];
@@ -274,19 +331,40 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
           find_binding(program, BindingAccess::Internal, ref.binding_index);
       const ModelState &state = find_state(package, ref.state);
       if (binding.element_type != state.element_type ||
-          binding.shape != state.shape)
+          binding.shape != resident_state_shape(state))
         throw std::invalid_argument(
             "persistent state does not match its executable binding");
-      if (!requested_states.insert(ref.state).second)
-        continue;
-      const auto [begin, end] = binding_row_range(binding);
-      resident_requests.push_back({invocation_index, ref.binding_index,
-                                   ref.state, &program, binding, end - begin,
-                                   true});
-      for_each_physical_slice(program, binding,
-                              [&](const PhysicalSlice &slice) {
-                                requested_rows[slice] += end - begin;
-                              });
+      const auto [state_begin, state_end] = binding_row_range(binding);
+      for_each_physical_slice(
+          program, binding, [&](const PhysicalSlice &physical_slice) {
+            const auto [target_abi, hemisphere, slice, bank] = physical_slice;
+            (void)target_abi;
+            for (const BinaryMemoryFloor &floor : program.memory_floors) {
+              if (floor.hemisphere != hemisphere || floor.slice != slice ||
+                  floor.bank != bank)
+                continue;
+              if (state_begin <
+                      static_cast<std::int64_t>(floor.first_free_row) &&
+                  state_end > 0)
+                throw std::invalid_argument(
+                    "persistent state SRAM staging overlaps anonymous "
+                    "command scratch: state=" +
+                    ref.state + " binding=" +
+                    std::to_string(binding.index));
+            }
+          });
+      for (const BinaryBinding &other : program.bindings) {
+        if (&other == &binding || !bindings_overlap(program, binding, other))
+          continue;
+        throw std::invalid_argument(
+            "persistent state SRAM staging overlaps another executable "
+            "binding: state=" +
+            ref.state + " binding=" + std::to_string(binding.index) +
+            " other=" + other.name);
+      }
+      resolved_states[{invocation_index, ref.binding_index}] = binding;
+      if (emitted_states.insert(ref.state).second)
+        result.persistent_states.push_back({ref.state, binding});
     }
   }
   std::map<std::vector<std::uint16_t>, std::int64_t> group_extents;
@@ -317,7 +395,7 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
           request.value);
     std::vector<std::int64_t> candidates;
     for (const PhysicalSlice &slice : physical_slices) {
-      for (const auto &[begin, end] : free_intervals.at(slice))
+      for (const auto &[begin, end] : intervals_for(slice))
         if (end - begin >= request.extent) {
           candidates.push_back(begin);
           candidates.push_back(end - request.extent);
@@ -334,7 +412,7 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
       const bool fits = std::all_of(
           physical_slices.begin(), physical_slices.end(),
           [&](const PhysicalSlice &slice) {
-            const auto &intervals = free_intervals.at(slice);
+            const auto &intervals = intervals_for(slice);
             return std::any_of(intervals.begin(), intervals.end(),
                                [&](const FreeInterval &interval) {
                                  return interval.first <= candidate &&
@@ -357,7 +435,7 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
         if (slice_hemisphere != hemisphere)
           continue;
         interval_details << " s" << slice_index << "b" << slice_bank << '=';
-        for (const auto &[begin, end] : free_intervals.at(slice))
+        for (const auto &[begin, end] : intervals_for(slice))
           interval_details << '[' << begin << ',' << end << ')';
       }
       throw std::invalid_argument(
@@ -368,14 +446,12 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
           std::to_string(physical_slice) + " bank=" + std::to_string(bank) +
           " extent=" + std::to_string(request.extent) + " requested_total=" +
           std::to_string(requested_rows[physical_slices.front()]) +
-          " usable_capacity=" +
-          std::to_string(static_cast<std::int64_t>(
-                             request.program->hardware.sram_depth_rows) -
-                         reserved_floor[physical_slices.front()]) +
+          " physical_capacity=" +
+          std::to_string(request.program->hardware.sram_depth_rows) +
           " free_intervals=" + interval_details.str());
     }
     for (const PhysicalSlice &slice : physical_slices) {
-      auto &intervals = free_intervals.at(slice);
+      auto &intervals = intervals_for(slice);
       const auto containing = std::find_if(
           intervals.begin(), intervals.end(),
           [&](const FreeInterval &interval) {
@@ -397,13 +473,9 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
       }
     }
     request.binding.base_row += *allocated_begin - old_begin;
-    if (request.persistent_state) {
-      result.persistent_states.push_back({request.value, request.binding});
-    } else {
-      resolved_residents[{request.invocation_index, request.binding_index}] =
-          request.binding;
-      result.resident_tensors.push_back({request.value, request.binding});
-    }
+    resolved_residents[{request.invocation_index, request.binding_index}] =
+        request.binding;
+    result.resident_tensors.push_back({request.value, request.binding});
   }
 
   for (std::size_t invocation_index = 0;
@@ -492,25 +564,23 @@ SessionMemoryPlan SessionMemoryPlanner::plan(const ModelPackage &package) {
       invocation_plan.outputs.push_back(std::move(output_plan));
     }
     for (const ModelStateBindingRef &ref : invocation.states) {
-      const auto state = std::find_if(
-          result.persistent_states.begin(), result.persistent_states.end(),
-          [&](const SessionMemoryPlan::PersistentState &candidate) {
-            return candidate.state == ref.state;
-          });
-      if (state == result.persistent_states.end())
+      const auto state =
+          resolved_states.find({invocation_index, ref.binding_index});
+      if (state == resolved_states.end())
         throw std::logic_error("persistent state has no physical allocation");
       const BinaryBinding &executable_binding = find_binding(
           executable.program, BindingAccess::Internal, ref.binding_index);
-      if (executable_binding.element_type != state->binding.element_type ||
-          executable_binding.layout != state->binding.layout ||
-          executable_binding.shape != state->binding.shape ||
-          executable_binding.byte_size != state->binding.byte_size ||
-          executable_binding.slices != state->binding.slices ||
-          executable_binding.hemisphere_mask != state->binding.hemisphere_mask)
+      if (executable_binding.element_type != state->second.element_type ||
+          executable_binding.layout != state->second.layout ||
+          executable_binding.shape != state->second.shape ||
+          executable_binding.byte_size != state->second.byte_size ||
+          executable_binding.slices != state->second.slices ||
+          executable_binding.hemisphere_mask !=
+              state->second.hemisphere_mask)
         throw std::invalid_argument(
             "persistent state bindings are physically incompatible");
       invocation_plan.states.push_back(
-          {ref.binding_index, ref.state, state->binding});
+          {ref.binding_index, ref.state, state->second});
     }
   }
   return result;

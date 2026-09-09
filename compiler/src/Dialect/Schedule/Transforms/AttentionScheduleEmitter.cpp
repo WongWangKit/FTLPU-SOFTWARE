@@ -255,11 +255,16 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         op_.getInput().getType()).getElementType();
     const auto kvCapacity =
         op_.config().getAs<mlir::IntegerAttr>("kv_cache_capacity");
+    const auto kvResident =
+        op_.config().getAs<mlir::IntegerAttr>(
+            "kv_cache_resident_tokens");
     BindingOp keyBinding;
     BindingOp valueBinding;
     if (kvCapacity) {
+        const int64_t residentTokens =
+            kvResident ? kvResident.getInt() : kvCapacity.getInt();
         const auto stateType = mlir::RankedTensorType::get(
-            {kvCapacity.getInt(), op_.getKvHeads(), op_.getHeadDim()},
+            {residentTokens, op_.getKvHeads(), op_.getHeadDim()},
             elementType);
         key_state_binding_index_ = kAttentionKeyStateBindingIndex;
         value_state_binding_index_ = kAttentionValueStateBindingIndex;

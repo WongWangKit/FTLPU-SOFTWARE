@@ -76,6 +76,10 @@ struct ModelState {
     std::vector<std::uint64_t> shape{};
     std::uint32_t layer{0};
     std::uint32_t max_tokens{0};
+    // The logical state may be larger than the executable's current SRAM
+    // window. Zero retains the legacy fully-resident interpretation.
+    std::uint32_t page_tokens{0};
+    std::uint32_t resident_tokens{0};
 };
 
 struct ModelBindingRef {

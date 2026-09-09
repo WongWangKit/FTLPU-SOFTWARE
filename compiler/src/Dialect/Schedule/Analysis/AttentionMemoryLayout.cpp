@@ -11,9 +11,14 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
       queryHeads_(op.getQueryHeads()), kvHeads_(op.getKvHeads()),
       headBlocks_(op.getHeadDim() / target.throughput().mxm_rows)
 {
-    if (const auto capacity =
-            op.config().getAs<mlir::IntegerAttr>("kv_cache_capacity"))
-        kvCacheCapacity_ = capacity.getInt();
+    if (const auto resident =
+            op.config().getAs<mlir::IntegerAttr>(
+                "kv_cache_resident_tokens"))
+        kvStorageTokens_ = resident.getInt();
+    else if (const auto capacity =
+                 op.config().getAs<mlir::IntegerAttr>(
+                     "kv_cache_capacity"))
+        kvStorageTokens_ = capacity.getInt();
     const auto plan = op.getMemoryPlan();
     for (std::size_t group = 0; group < queryIwSlices_.size(); ++group)
         queryIwSlices_[group] = target_.attention_query_iw_slices(
@@ -323,8 +328,8 @@ int64_t AttentionMemoryLayout::keyAddress(int64_t kvHead,
     int64_t reductionBlock, int64_t keyBlock) const
 {
     const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
-    const int64_t storageTokens = kvCacheCapacity_ != 0
-        ? kvCacheCapacity_ : seqLen_;
+    const int64_t storageTokens = kvStorageTokens_ != 0
+        ? kvStorageTokens_ : seqLen_;
     return keyBase_ + (kvHead * blocksPerRotaryHalf
                + reductionBlock % blocksPerRotaryHalf)
             * storageTokens
@@ -398,8 +403,8 @@ int64_t AttentionMemoryLayout::valuePackAddress(int64_t head,
     int64_t reductionBlock, int64_t tokenBlock, int64_t row) const
 {
     const int64_t tileRows = target_.throughput().tile_rows;
-    const int64_t storageTokens = kvCacheCapacity_ != 0
-        ? kvCacheCapacity_ : seqLen_;
+    const int64_t storageTokens = kvStorageTokens_ != 0
+        ? kvStorageTokens_ : seqLen_;
     const int64_t tokenBlocks =
         storageTokens / target_.throughput().mxm_rows;
     return valuePackBase_

@@ -12,7 +12,7 @@ namespace ftlpu::software::runtime {
 namespace {
 
 constexpr std::array<char, 8> kMagic {'F', 'T', 'L', 'P', 'U', 'M', '0', '1'};
-constexpr std::uint32_t kVersion = 5;
+constexpr std::uint32_t kVersion = 6;
 
 template <typename T>
 void write_scalar(std::ostream& stream, T value)
@@ -181,10 +181,19 @@ void validate_model_package(const ModelPackage& package)
     }
     std::unordered_set<std::string> state_names;
     for (const auto& state : package.states) {
+        const std::uint32_t page_tokens =
+            state.page_tokens == 0 ? state.max_tokens : state.page_tokens;
+        const std::uint32_t resident_tokens = state.resident_tokens == 0
+            ? state.max_tokens : state.resident_tokens;
         if (state.name.empty() || !names.insert(state.name).second
             || !state_names.insert(state.name).second
             || state.shape.empty() || state.max_tokens == 0
-            || state.shape.front() != state.max_tokens)
+            || state.shape.front() != state.max_tokens
+            || page_tokens == 0 || page_tokens > state.max_tokens
+            || resident_tokens == 0
+            || resident_tokens > state.max_tokens
+            || (resident_tokens != state.max_tokens
+                && resident_tokens % page_tokens != 0))
             throw std::invalid_argument(
                 "FTLPU model state metadata is invalid");
     }
@@ -361,6 +370,8 @@ void write_model_package(
             static_cast<std::uint16_t>(state.element_type));
         write_scalar(stream, state.layer);
         write_scalar(stream, state.max_tokens);
+        write_scalar(stream, state.page_tokens);
+        write_scalar(stream, state.resident_tokens);
         write_vector(stream, state.shape);
     }
 
@@ -516,6 +527,13 @@ ModelPackage read_model_package(
                     read_scalar<std::uint16_t>(stream));
             state.layer = read_scalar<std::uint32_t>(stream);
             state.max_tokens = read_scalar<std::uint32_t>(stream);
+            if (version >= 6) {
+                state.page_tokens = read_scalar<std::uint32_t>(stream);
+                state.resident_tokens = read_scalar<std::uint32_t>(stream);
+            } else {
+                state.page_tokens = state.max_tokens;
+                state.resident_tokens = state.max_tokens;
+            }
             state.shape = read_vector<std::uint64_t>(stream);
             package.states.push_back(std::move(state));
         }

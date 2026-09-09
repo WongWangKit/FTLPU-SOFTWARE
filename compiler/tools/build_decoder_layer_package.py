@@ -79,6 +79,7 @@ def main() -> None:
     parser.add_argument("--embedding-table-bf16", type=Path)
     parser.add_argument("--vocab-size", type=int)
     parser.add_argument("--final-norm-bf16", type=Path)
+    parser.add_argument("--final-hidden-golden-bf16", type=Path)
     parser.add_argument("--final-rmsnorm-executable", type=Path)
     parser.add_argument(
         "--kv-cache-capacity",
@@ -87,9 +88,21 @@ def main() -> None:
         help="emit one persistent BF16 K/V cache pair per decoder layer",
     )
     parser.add_argument(
+        "--kv-cache-page-tokens",
+        type=int,
+        default=0,
+        help=(
+            "KV page size; defaults to the current prefill length when no "
+            "target-derived value is supplied"
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-outputs",
         action="store_true",
-        help="embed and download every decoder-layer golden output",
+        help=(
+            "embed and download every decoder-layer golden output, and expose "
+            "layer boundaries as restart inputs"
+        ),
     )
     args = parser.parse_args()
     boundary_options = (
@@ -105,6 +118,10 @@ def main() -> None:
         raise ValueError(
             "embedding table, vocab size, final norm, and final RMSNorm "
             "executable must be provided together"
+        )
+    if args.final_hidden_golden_bf16 is not None and not include_boundaries:
+        raise ValueError(
+            "final hidden golden requires complete model boundaries"
         )
 
     golden_dirs = args.golden_dir
@@ -148,6 +165,20 @@ def main() -> None:
         raise ValueError(
             "KV cache capacity must be no smaller than seq_len"
         )
+    kv_cache_page_tokens = args.kv_cache_page_tokens or seq_len
+    if args.kv_cache_capacity and kv_cache_page_tokens <= 0:
+        raise ValueError("KV cache page size must be positive")
+    kv_cache_resident_tokens = (
+        (seq_len + kv_cache_page_tokens - 1) // kv_cache_page_tokens
+        * kv_cache_page_tokens
+    )
+    if (
+        args.kv_cache_capacity
+        and kv_cache_resident_tokens > args.kv_cache_capacity
+    ):
+        raise ValueError(
+            "KV cache resident window exceeds logical capacity"
+        )
     shapes = {
         "query": [hidden, hidden],
         "key": [hidden, metadata["kv_heads"] * metadata["head_dim"]],
@@ -166,7 +197,7 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("wb") as stream:
         stream.write(b"FTLPUM01")
-        scalar(stream, "I", 4)
+        scalar(stream, "I", 6)
         string(stream, metadata["model"])
         string(stream, metadata["architecture"])
 
@@ -176,7 +207,8 @@ def main() -> None:
             stream, "I",
             2 + sum(9 + 3 * has_bias for has_bias in bias_operand_flags)
             + (len(golden_dirs) if args.checkpoint_outputs else 0)
-            + (2 if include_boundaries else 0),
+            + (2 if include_boundaries else 0)
+            + int(args.final_hidden_golden_bf16 is not None),
         )
         tensor(
             stream, "golden.input", BF16, [seq_len, hidden],
@@ -244,6 +276,12 @@ def main() -> None:
                 stream, "model.norm.weight", BF16, [hidden],
                 args.final_norm_bf16.read_bytes(),
             )
+            if args.final_hidden_golden_bf16 is not None:
+                tensor(
+                    stream, "golden.final_hidden", BF16,
+                    [seq_len, hidden],
+                    args.final_hidden_golden_bf16.read_bytes(),
+                )
 
         value_count = len(golden_dirs) + 1 + (
             3 if include_boundaries else 0
@@ -259,9 +297,12 @@ def main() -> None:
                 2 if index == len(golden_dirs)
                     and not include_boundaries else 0
             )
-            if args.checkpoint_outputs and index > 0:
-                flags |= 2
-            if include_boundaries and index == 0:
+            if args.checkpoint_outputs:
+                flags |= 1
+                if index > 0:
+                    flags |= 2
+            if include_boundaries and index == 0 \
+                    and not args.checkpoint_outputs:
                 flags = 0
             name = f"hidden.{index}"
             string(stream, name)
@@ -316,7 +357,8 @@ def main() -> None:
             string(stream, "logits")
             scalar(stream, "B", 1)
 
-        # Version-4 persistent model state descriptors.
+        # Version-6 persistent state separates logical capacity from the
+        # executable's current SRAM-resident token window.
         scalar(
             stream,
             "I",
@@ -339,7 +381,13 @@ def main() -> None:
                     scalar(stream, "H", BF16)
                     scalar(stream, "I", layer)
                     scalar(stream, "I", args.kv_cache_capacity)
+                    scalar(stream, "I", kv_cache_page_tokens)
+                    scalar(stream, "I", kv_cache_resident_tokens)
                     vector(stream, "Q", state_shape)
+
+        # Version-5 weight-page descriptors. The packer fills this section
+        # when C2C weight paging is requested.
+        scalar(stream, "I", 0)
 
         scalar(stream, "I", len(golden_dirs) + int(include_boundaries))
         for invocation_index, layer_metadata in enumerate(metadata_list):
@@ -389,6 +437,7 @@ def main() -> None:
                     ),
                 ]
             binding_refs(stream, state_refs)
+            scalar(stream, "I", 0xFFFFFFFF)
         if include_boundaries:
             string(stream, "final_norm")
             scalar(stream, "I", len(unique_executables))
@@ -398,6 +447,7 @@ def main() -> None:
             ])
             binding_refs(stream, [(0, "final_hidden")])
             binding_refs(stream, [])
+            scalar(stream, "I", 0xFFFFFFFF)
 
     print(f"wrote {args.output} ({args.output.stat().st_size} bytes)")
 

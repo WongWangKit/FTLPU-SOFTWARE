@@ -91,6 +91,20 @@ std::size_t element_count(const std::vector<std::uint64_t> &shape) {
   return result;
 }
 
+std::size_t element_size(BindingElementType type) {
+  switch (type) {
+  case BindingElementType::I8:
+    return 1;
+  case BindingElementType::F16:
+  case BindingElementType::BF16:
+    return 2;
+  case BindingElementType::I32:
+  case BindingElementType::F32:
+    return 4;
+  }
+  throw std::invalid_argument("model state has an unknown element type");
+}
+
 BinaryProgram parameterize_program(const ModelPackage &package,
                                    const ModelInvocation &invocation,
                                    const SessionInvocationPlan &invocation_plan,
@@ -1492,7 +1506,9 @@ void ModelSession::load(ModelPackage package) {
   memory_plan_ = SessionMemoryPlanner::plan(package);
   package_ = std::move(package);
   values_.clear();
+  host_input_overrides_.clear();
   device_values_.clear();
+  state_backing_.clear();
   stats_ = {};
   load_stats_ = {};
   executable_weight_transfers_.clear();
@@ -1552,21 +1568,25 @@ void ModelSession::load(ModelPackage package) {
     if (sessionHardware == nullptr)
       throw std::logic_error(
           "resident LPU data requires an executable hardware target");
-    upload_binding_through_c2c(
-        resident.binding, resolve_value(resident.value), *sessionHardware);
+    upload_binding_through_c2c(resident.binding, resolve_value(resident.value),
+                               *sessionHardware);
     ++stats_.resident_uploads;
     stats_.resident_upload_bytes +=
         static_cast<std::size_t>(resident.binding.byte_size);
   }
-  for (const auto &state : memory_plan_.persistent_states) {
-    const std::vector<std::uint8_t> zero(
-        static_cast<std::size_t>(state.binding.byte_size), 0);
-    if (sessionHardware == nullptr)
-      throw std::logic_error(
-          "persistent LPU state requires an executable hardware target");
-    upload_binding_through_c2c(state.binding, zero, *sessionHardware);
+  for (const ModelState &state : package_.states) {
+    const std::size_t elements = element_count(state.shape);
+    const std::size_t bytesPerElement = element_size(state.element_type);
+    if (elements > std::numeric_limits<std::size_t>::max() / bytesPerElement)
+      throw std::overflow_error("persistent state backing is too large");
+    const std::size_t logicalBytes = elements * bytesPerElement;
+    const auto [_, inserted] = state_backing_.emplace(
+        state.name, std::vector<std::uint8_t>(logicalBytes, 0));
+    if (!inserted)
+      throw std::logic_error("duplicate persistent state backing: " +
+                             state.name);
     ++stats_.state_initializations;
-    stats_.state_initialization_bytes += zero.size();
+    stats_.state_initialization_bytes += logicalBytes;
   }
   load_stats_ = stats_;
   loaded_ = true;
@@ -1579,32 +1599,20 @@ void ModelSession::load_file(const std::filesystem::path &path) {
 std::vector<std::uint8_t> ModelSession::read_state(const std::string &name) {
   if (!loaded_)
     throw std::logic_error("no FTLPU model package is loaded");
-  const auto state = std::find_if(
-      memory_plan_.persistent_states.begin(),
-      memory_plan_.persistent_states.end(),
-      [&](const SessionMemoryPlan::PersistentState &candidate) {
-        return candidate.state == name;
-      });
-  if (state == memory_plan_.persistent_states.end())
+  const auto state = state_backing_.find(name);
+  if (state == state_backing_.end())
     throw std::out_of_range("unknown FTLPU model state: " + name);
-  if (package_.executables.empty())
-    throw std::logic_error("persistent LPU state has no executable target");
-  return download_binding_through_c2c(
-      state->binding, package_.executables.front().program.hardware);
+  return state->second;
 }
 
 void ModelSession::reset_states() {
   if (!loaded_)
     throw std::logic_error("no FTLPU model package is loaded");
-  if (package_.executables.empty() && !memory_plan_.persistent_states.empty())
-    throw std::logic_error("persistent LPU state has no executable target");
-  for (const auto &state : memory_plan_.persistent_states) {
-    const std::vector<std::uint8_t> zero(
-        static_cast<std::size_t>(state.binding.byte_size), 0);
-    upload_binding_through_c2c(
-        state.binding, zero, package_.executables.front().program.hardware);
+  for (auto &[name, state] : state_backing_) {
+    (void)name;
+    std::fill(state.begin(), state.end(), 0);
     ++stats_.state_initializations;
-    stats_.state_initialization_bytes += zero.size();
+    stats_.state_initialization_bytes += state.size();
   }
 }
 
@@ -1624,6 +1632,7 @@ void ModelSession::set_input(std::string name,
   if (!metadata || !metadata->external_input)
     throw std::invalid_argument(
         "FTLPU model input is not declared as external");
+  host_input_overrides_.insert(name);
   values_[std::move(name)] =
       std::vector<std::uint8_t>(data.begin(), data.end());
 }
@@ -1643,6 +1652,12 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     throw std::logic_error("no FTLPU model package is loaded");
   if (index >= package_.invocations.size())
     throw std::out_of_range("FTLPU model invocation index is out of range");
+  const bool reportProgress = std::getenv("FTLPU_SESSION_PROGRESS") != nullptr;
+  const auto report = [&](const char *phase) {
+    if (reportProgress)
+      std::clog << "FTLPU invocation " << index << ": " << phase << std::endl;
+  };
+  report("begin");
   const auto &invocation = package_.invocations[index];
   const auto &executable = package_.executables.at(invocation.executable_index);
   const SessionInvocationPlan &invocation_plan =
@@ -1650,18 +1665,50 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   const std::size_t pageWaitBefore = stats_.weight_page_wait_cycles;
   if (invocation.weight_page != 0xffffffffu)
     ensure_weight_page(invocation.weight_page);
+  report("model weight page ready");
   const std::size_t modelPageWaitCycles =
       stats_.weight_page_wait_cycles - pageWaitBefore;
   const BinaryProgram program =
       parameterize_program(package_, invocation, invocation_plan,
                            materialize_model_executable(executable));
+  report("program parameterized");
+
+  const std::size_t stateIngressCyclesBefore = stats_.c2c_ingress_cycles;
+  const std::size_t stateIngressBytesBefore = stats_.c2c_ingress_bytes;
+  for (const SessionStatePlan &state : invocation_plan.states) {
+    const BinaryBinding &binding =
+        find_binding(program, BindingAccess::Internal, state.binding_index);
+    const auto backing = state_backing_.find(state.state);
+    if (backing == state_backing_.end())
+      throw std::logic_error("persistent state backing is unavailable: " +
+                             state.state);
+    const std::size_t residentBytes =
+        static_cast<std::size_t>(binding.byte_size);
+    if (backing->second.size() < residentBytes)
+      throw std::logic_error(
+          "persistent state backing is smaller than its SRAM window: " +
+          state.state);
+    upload_binding_through_c2c(
+        binding,
+        std::span<const std::uint8_t>(backing->second.data(), residentBytes),
+        program.hardware);
+    ++stats_.state_page_ins;
+  }
+  const std::size_t statePageInCycles =
+      stats_.c2c_ingress_cycles - stateIngressCyclesBefore;
+  const std::size_t statePageInBytes =
+      stats_.c2c_ingress_bytes - stateIngressBytesBefore;
+  stats_.state_page_in_cycles += statePageInCycles;
+  stats_.state_page_in_bytes += statePageInBytes;
+  report("persistent state paged in");
 
   const std::size_t ingressBefore = stats_.c2c_ingress_cycles;
   for (const SessionInputPlan &input : invocation_plan.inputs) {
     if (input.transfer == SessionTransferKind::Resident ||
         input.transfer == SessionTransferKind::WeightPage)
       continue;
-    if (input.transfer == SessionTransferKind::HostUpload) {
+    if (input.transfer == SessionTransferKind::HostUpload ||
+        host_input_overrides_.contains(input.value)) {
       upload_binding_through_c2c(
           find_binding(program, BindingAccess::Input, input.binding_index),
           resolve_value(input.value), program.hardware);
@@ -1691,22 +1738,28 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   }
   const std::size_t inputTransferCycles =
       stats_.c2c_ingress_cycles - ingressBefore;
+  report("inputs ready");
   const std::size_t executablePageWaitBefore = stats_.weight_page_wait_cycles;
   prepare_executable_weight_pages(program, invocation, index);
   const std::size_t executablePreExecutionCycles =
       stats_.weight_page_wait_cycles - executablePageWaitBefore;
-  const auto traceOrigin = execution_trace_cycle_cursor_
-      + static_cast<std::int64_t>(modelPageWaitCycles)
-      + static_cast<std::int64_t>(inputTransferCycles)
-      + static_cast<std::int64_t>(executablePreExecutionCycles);
+  report("executable weight pages prepared");
+  const auto traceOrigin =
+      execution_trace_cycle_cursor_ +
+      static_cast<std::int64_t>(modelPageWaitCycles) +
+      static_cast<std::int64_t>(statePageInCycles) +
+      static_cast<std::int64_t>(inputTransferCycles) +
+      static_cast<std::int64_t>(executablePreExecutionCycles);
   if (execution_trace_enabled_)
-    runtime_.configure_execution_trace_segment(
-        traceOrigin, execution_trace_has_segment_);
+    runtime_.configure_execution_trace_segment(traceOrigin,
+                                               execution_trace_has_segment_);
+  report("loading runtime program");
   runtime_.load(program);
+  report("runtime program loaded");
   if (execution_trace_enabled_) {
     std::int64_t localCursor = -static_cast<std::int64_t>(
-        modelPageWaitCycles + inputTransferCycles
-        + executablePreExecutionCycles);
+        modelPageWaitCycles + statePageInCycles + inputTransferCycles +
+        executablePreExecutionCycles);
     if (modelPageWaitCycles != 0) {
       std::ostringstream detail;
       detail << "invocation=" << index;
@@ -1714,13 +1767,25 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
         detail << " page=" << invocation.weight_page;
       detail << " phase="
              << (completed_invocation_ ? "layer_boundary" : "initial");
-      runtime_.record_execution_trace_interval(localCursor,
+      runtime_.record_execution_trace_interval(
+          localCursor,
           localCursor + static_cast<std::int64_t>(modelPageWaitCycles),
           "C2C.ModelWeightPage", detail.str());
       localCursor += static_cast<std::int64_t>(modelPageWaitCycles);
     }
+    if (statePageInCycles != 0) {
+      runtime_.record_execution_trace_interval(
+          localCursor,
+          localCursor + static_cast<std::int64_t>(statePageInCycles),
+          "C2C.StatePageIn",
+          "invocation=" + std::to_string(index) +
+              " states=" + std::to_string(invocation_plan.states.size()) +
+              " bytes=" + std::to_string(statePageInBytes));
+      localCursor += static_cast<std::int64_t>(statePageInCycles);
+    }
     if (inputTransferCycles != 0)
-      runtime_.record_execution_trace_interval(localCursor,
+      runtime_.record_execution_trace_interval(
+          localCursor,
           localCursor + static_cast<std::int64_t>(inputTransferCycles),
           "C2C.HostInput", "invocation=" + std::to_string(index));
   }
@@ -1744,6 +1809,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
     executionCycles =
         std::min(executionCycles, static_cast<std::size_t>(std::stoull(stop)));
+  report("executing runtime program");
   const char *traceStartText = std::getenv("FTLPU_SESSION_TRACE_START");
   const char *traceCyclesText = std::getenv("FTLPU_SESSION_TRACE_CYCLES");
   if (traceStartText != nullptr && traceCyclesText != nullptr) {
@@ -1760,12 +1826,13 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   } else {
     runtime_.run_cycles(executionCycles);
   }
+  report("runtime program completed");
   const std::size_t invocationPhysicalCycles = runtime_.physical_cycles();
   const std::size_t lookaheadBoundaryCycles =
       settle_executable_weight_lookahead();
   if (execution_trace_enabled_)
-    runtime_.record_execution_trace_interval(0,
-        static_cast<std::int64_t>(invocationPhysicalCycles),
+    runtime_.record_execution_trace_interval(
+        0, static_cast<std::int64_t>(invocationPhysicalCycles),
         "Session.Invocation",
         "index=" + std::to_string(index) + " name=" + invocation.name);
   executable_clock_active_ = false;
@@ -1814,6 +1881,40 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
                 << " max=" << maximum << std::endl;
     }
   }
+  const std::size_t stateEgressCyclesBefore = stats_.c2c_egress_cycles;
+  const std::size_t stateEgressBytesBefore = stats_.c2c_egress_bytes;
+  for (const SessionStatePlan &state : invocation_plan.states) {
+    const BinaryBinding &binding =
+        find_binding(program, BindingAccess::Internal, state.binding_index);
+    std::vector<std::uint8_t> resident =
+        download_binding_through_c2c(binding, program.hardware);
+    auto backing = state_backing_.find(state.state);
+    if (backing == state_backing_.end() ||
+        backing->second.size() < resident.size())
+      throw std::logic_error(
+          "persistent state backing cannot receive its SRAM window: " +
+          state.state);
+    std::copy(resident.begin(), resident.end(), backing->second.begin());
+    ++stats_.state_page_outs;
+  }
+  const std::size_t statePageOutCycles =
+      stats_.c2c_egress_cycles - stateEgressCyclesBefore;
+  const std::size_t statePageOutBytes =
+      stats_.c2c_egress_bytes - stateEgressBytesBefore;
+  stats_.state_page_out_cycles += statePageOutCycles;
+  stats_.state_page_out_bytes += statePageOutBytes;
+  report("persistent state paged out");
+  if (execution_trace_enabled_ && statePageOutCycles != 0)
+    runtime_.record_execution_trace_interval(
+        static_cast<std::int64_t>(invocationPhysicalCycles +
+                                  lookaheadBoundaryCycles),
+        static_cast<std::int64_t>(invocationPhysicalCycles +
+                                  lookaheadBoundaryCycles + statePageOutCycles),
+        "C2C.StatePageOut",
+        "invocation=" + std::to_string(index) +
+            " states=" + std::to_string(invocation_plan.states.size()) +
+            " bytes=" + std::to_string(statePageOutBytes));
+
   const std::size_t egressBefore = stats_.c2c_egress_cycles;
   const bool validate_fp16 =
       std::getenv("FTLPU_SESSION_VALIDATE_FP16") != nullptr;
@@ -1824,18 +1925,18 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     if (validate_fp16 || output.download_to_host)
       hostData = download_binding_through_c2c(binding, program.hardware);
     if (validate_fp16 && is_16bit_float(binding.element_type)) {
-        const auto &data = *hostData;
-        for (std::size_t element = 0;
-             element < data.size() / sizeof(std::uint16_t); ++element) {
-          std::uint16_t bits = 0;
-          std::memcpy(&bits, data.data() + element * sizeof(std::uint16_t),
-                      sizeof(bits));
-          if (!std::isfinite(decode_16bit_float(bits, binding.element_type)))
-            throw std::logic_error("model invocation produced non-finite "
-                                   "16-bit float: " +
-                                   invocation.name +
-                                   " element=" + std::to_string(element));
-        }
+      const auto &data = *hostData;
+      for (std::size_t element = 0;
+           element < data.size() / sizeof(std::uint16_t); ++element) {
+        std::uint16_t bits = 0;
+        std::memcpy(&bits, data.data() + element * sizeof(std::uint16_t),
+                    sizeof(bits));
+        if (!std::isfinite(decode_16bit_float(bits, binding.element_type)))
+          throw std::logic_error("model invocation produced non-finite "
+                                 "16-bit float: " +
+                                 invocation.name +
+                                 " element=" + std::to_string(element));
+      }
     }
     if (output.retain_on_device) {
       device_values_[output.value] = DeviceValue{
@@ -1850,19 +1951,22 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   }
   const std::size_t outputTransferCycles =
       stats_.c2c_egress_cycles - egressBefore;
+  report("outputs resolved");
   if (execution_trace_enabled_ && outputTransferCycles != 0)
     runtime_.record_execution_trace_interval(
-        static_cast<std::int64_t>(
-            invocationPhysicalCycles + lookaheadBoundaryCycles),
-        static_cast<std::int64_t>(
-            invocationPhysicalCycles + lookaheadBoundaryCycles +
-            outputTransferCycles),
+        static_cast<std::int64_t>(invocationPhysicalCycles +
+                                  lookaheadBoundaryCycles + statePageOutCycles),
+        static_cast<std::int64_t>(invocationPhysicalCycles +
+                                  lookaheadBoundaryCycles + statePageOutCycles +
+                                  outputTransferCycles),
         "C2C.HostOutput", "invocation=" + std::to_string(index));
-  execution_trace_cycle_cursor_ = traceOrigin
-      + static_cast<std::int64_t>(invocationPhysicalCycles)
-      + static_cast<std::int64_t>(lookaheadBoundaryCycles)
-      + static_cast<std::int64_t>(outputTransferCycles);
+  execution_trace_cycle_cursor_ =
+      traceOrigin + static_cast<std::int64_t>(invocationPhysicalCycles) +
+      static_cast<std::int64_t>(lookaheadBoundaryCycles) +
+      static_cast<std::int64_t>(statePageOutCycles) +
+      static_cast<std::int64_t>(outputTransferCycles);
   execution_trace_has_segment_ = true;
+  report("complete");
 }
 
 void ModelSession::run_embedding_lookups() {
@@ -1993,6 +2097,7 @@ void ModelSession::run(std::size_t drain_cycles) {
   lookahead_executable_weight_transfers_.clear();
   lookahead_model_weight_transfer_.reset();
   lookahead_invocation_index_.reset();
+  completed_invocation_ = false;
   execution_trace_has_segment_ = false;
   execution_trace_cycle_cursor_ = 0;
   run_embedding_lookups();

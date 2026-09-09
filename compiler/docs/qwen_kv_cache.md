@@ -2,11 +2,11 @@
 
 ## Scope
 
-The first implementation keeps a BF16 KV cache in LPU MEM for a compiled
-decoder-layer invocation. It establishes the persistent-state ABI needed by
-decode while preserving the existing sequence-32 prefill schedule. It does not
-yet implement token-by-token append, attention over past tokens, DDR spill, or
-KV quantization.
+The implementation gives each decoder layer a logical BF16 KV cache backed by
+off-chip session storage while keeping only the executable's current window in
+LPU MEM. It preserves the sequence-32 prefill schedule and establishes the
+persistent-state ABI needed by decode. Token-by-token append, attention over a
+past prefix, moving page offsets, and KV quantization are not implemented yet.
 
 The cache capacity is a target-independent compiler option:
 
@@ -15,24 +15,26 @@ ftlpu-opt input.mlir --target-config ftlpu-lpu32.json `
   --kv-cache-capacity 256 -o tensor.mlir
 ```
 
-Capacity must be a multiple of the MXM tile width and no smaller than the
-compiled sequence length. A value of zero keeps the previous transient
-attention buffers.
+Capacity is the logical maximum and must be no smaller than the compiled
+sequence length. The physical resident window is the sequence length rounded
+up to `mxm_rows`; `page_tokens` is derived from the target topology. A value of
+zero keeps the previous transient attention buffers.
 
 ## ABI
 
 Each decoder executable exposes two internal bindings with stable indices:
 
-| Binding | Index | Role | Type and logical shape |
+| Binding | Index | Role | Executable SRAM shape |
 | --- | ---: | --- | --- |
-| K cache | 65536 | `state.kv.key` | `bf16[capacity, kv_heads, head_dim]` |
-| V cache | 65537 | `state.kv.value` | `bf16[capacity, kv_heads, head_dim]` |
+| K cache | 65536 | `state.kv.key` | `bf16[resident_tokens, kv_heads, head_dim]` |
+| V cache | 65537 | `state.kv.value` | `bf16[resident_tokens, kv_heads, head_dim]` |
 
 Schedule MEM transfers carry both `address_binding` and
 `address_binding_access = "internal"`. Schedule-to-Command lowering preserves
 that pair, and binary relocations therefore resolve against `ModelState`
-instead of model inputs. `ModelPackage` records one named K/V state pair per
-layer and each `ModelInvocation` references those state names.
+instead of model inputs. `ModelPackage` v6 records each state's logical
+`[capacity, kv_heads, head_dim]` shape plus `page_tokens` and
+`resident_tokens`; each `ModelInvocation` references its layer's state names.
 
 ## Physical Layout
 
@@ -40,48 +42,51 @@ K uses `fp16_head_planar`. The global KV-head stride is retained because K is
 consumed by query-head groups in both hemispheres. The runtime therefore
 replicates K into every enabled hemisphere. V uses `fp16_value_x16`; each KV
 head is stored only in its owning hemisphere and is already laid out for PV.
+Both persistent windows are placed at the high end of their selected slice
+groups and remain reserved until executable exit. This prevents a later FFN
+stage from overwriting KV data before runtime pages it back out.
 
-For Qwen2.5-1.5B with capacity 256, two KV heads, head dimension 128, two
-hemispheres, and 32-byte SRAM vectors:
+For sequence length 32 and Qwen2.5-1.5B capacity 256, two KV heads, head
+dimension 128, two hemispheres, and 32-byte SRAM vectors:
 
 | Quantity | K | V |
 | --- | ---: | ---: |
 | Logical bytes per layer | 128 KiB | 128 KiB |
-| Rows per selected slice | 1024 | 256 |
+| Logical bytes in the resident window | 16 KiB | 16 KiB |
+| Rows per selected slice | 128 | 32 |
 | Selected slices | 4 | 16 |
-| Data physically written | 256 KiB | 128 KiB |
-| Space conservatively reserved | 256 KiB | 256 KiB |
+| Data transferred through C2C | 32 KiB | 16 KiB |
+| SRAM interval reserved | 32 KiB | 32 KiB |
 
 The V reservation is larger than the written data because one binding keeps a
 global-head address range in both hemispheres. Splitting it into segmented
 per-hemisphere bindings is a future allocator optimization.
 
-The current fixed-slice placement is deliberately a single-layer milestone,
-not a claim that the entire model cache fits. With 8,192 rows per SRAM bank,
-the K placement consumes 1,024 rows per layer on the same four slices and can
-hold at most eight layers at capacity 256. V consumes 256 rows per layer and
-can hold 32 layers. A 28-layer Qwen deployment therefore needs either
-layer-aware spreading of K across more activation slices or DDR-paged KV; the
-present global lifetime planner correctly rejects an overcommitted layout.
+All 28 Qwen layers have distinct logical states, totaling 7 MiB at capacity
+256. Sequential invocations reuse the compiler-declared K/V staging addresses.
+The bank0/bank1 executable variants therefore need at most one K/V pair per
+ping-pong bank, rather than 28 pairs. The planner reserves separate slots when
+target ABI, layout, shape, slices, bank, or binding index differs.
 
 ## Runtime Lifecycle
 
-`ModelSession::load` allocates each state for the session lifetime and zeros it
-through C2C. A decoder invocation relocates its internal K/V MEM commands to
-that allocation. `read_state(name)` downloads and converts the physical layout
-back to logical `[token, head, dimension]` order through C2C.
-`reset_states()` zeros all persistent states through the same path. No host API
-directly writes MEM.
+`ModelSession::load` allocates and zeros each full logical state in off-chip
+session backing. Before a decoder invocation, runtime transfers that layer's
+resident K/V window through DDR and C2C into the shared SRAM slots. After the
+invocation it transfers both windows back and updates the logical backing.
+`read_state(name)` returns the logical `[token, head, dimension]` image, and
+`reset_states()` clears all logical states. No host API directly writes MEM.
 
 For a multi-layer model, state names are `layers.N.key_cache` and
-`layers.N.value_cache`. They are distinct from ping-pong weight pages and are
-not evicted at invocation boundaries when their physical placement fits.
+`layers.N.value_cache`. They are distinct from ping-pong weight pages. Runtime
+statistics and the pipeline CSV expose `state_page_in/out` and
+`C2C.StatePageIn/Out` separately from weight traffic.
 
 ## Verified Path
 
 The sequence-32 Qwen2.5-1.5B layer-0 test compiles with capacity 256, builds a
-logical ModelPackage, converts it to a v5 paged package, reloads it from disk,
-and runs the CModel. The test compares all 8,192 produced K values and all
+logical ModelPackage, serializes a v6 package, and runs the CModel. The test
+compares all 8,192 produced K values and all
 8,192 V values with the Hugging Face fixture, checks that the unused capacity
 remains zero, validates the 49,152-value decoder output, and verifies state
 reset.
@@ -97,7 +102,8 @@ Current measured errors are:
 ## Next Decode Work
 
 The next compiler/runtime contract needs a dynamic token position (or cache
-length), append-only K/V write ranges, QK/PV bounds over the valid prefix, and
-causal-mask handling for `past_len + current_len`. After that is numerically
-closed, an off-chip page table and optional per-head/per-page KV quantization
-can be added without changing the logical state ABI.
+length), a resident-window page offset, append-only K/V write ranges, QK/PV
+bounds over the valid prefix, and causal-mask handling for
+`past_len + current_len`. The logical state and page-size ABI already leaves
+room for that moving window; optional per-head/per-page KV quantization can be
+added after decode is numerically closed.

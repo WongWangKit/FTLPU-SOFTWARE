@@ -31,16 +31,20 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         if (const auto capacity = module->getAttrOfType<mlir::IntegerAttr>(
                 "ftlpu.kv_cache_capacity"))
             kv_cache_capacity = capacity.getInt();
+    const int64_t kv_cache_page_tokens = tile;
+    const int64_t kv_cache_resident_tokens =
+        ((seq_len + kv_cache_page_tokens - 1) / kv_cache_page_tokens)
+        * kv_cache_page_tokens;
     if (kv_cache_capacity != 0
-        && (kv_cache_capacity < seq_len || kv_cache_capacity % tile != 0)) {
+        && kv_cache_capacity < kv_cache_resident_tokens) {
         op.emitError(
-            "KV cache capacity must be zero or a tile-aligned value no "
-            "smaller than seq_len");
+            "KV cache capacity must be zero or no smaller than the "
+            "tile-aligned resident prefill window");
         return mlir::failure();
     }
     const bool kv_cache_enabled = kv_cache_capacity != 0;
     const int64_t kv_storage_tokens = kv_cache_enabled
-        ? kv_cache_capacity : seq_len;
+        ? kv_cache_resident_tokens : seq_len;
     // Projection and attention routing use the global KV-head index in each
     // participating hemisphere. Preserve that stride in persistent storage;
     // K is replicated and V is copied to its owning hemisphere by Schedule.
@@ -210,11 +214,18 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // following layer's weight refill can overlap the rest of attention.
     // Keep it beyond the transient RoPE product plane for that longer live
     // range; half-open row intervals still allow exact adjacency.
-    const int64_t value_base = std::max(
+    const int64_t transient_value_base = std::max(
         query_base + query_rows, rope_product_base + rope_product_rows);
+    // A persistent cache is paged out only after the executable finishes, so
+    // its SRAM window must not be reused by later decoder stages. Keep it at
+    // the high end of its slice group; ordinary attention scratch grows from
+    // low rows and can retain its existing lifetime reuse.
+    const int64_t value_base = kv_cache_enabled
+        ? target.memory().words_per_bank - value_rows
+        : transient_value_base;
     const int64_t causal_mask_base = target.uses_dedicated_slice_roles()
         ? rope_rows : target.attention_mask_base_row();
-    if (value_base + value_rows
+    if (value_base < 0 || value_base + value_rows
             > target.memory().words_per_bank
         || rope_staging_base + rope_staging_rows
             > target.memory().words_per_bank
@@ -504,11 +515,12 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             scratch_candidates, false, key_candidate_banks,
             qk_excluded_slices});
     };
-    auto key_allocation = allocate_key(0);
+    const int64_t preferred_key_base = kv_cache_enabled
+        ? target.memory().words_per_bank - key_rows : 0;
+    auto key_allocation = allocate_key(preferred_key_base);
     if (kv_cache_enabled && mlir::failed(key_allocation)) {
-        for (int64_t base_row = 1;
-             base_row + key_rows <= target.memory().words_per_bank;
-             ++base_row) {
+        for (int64_t base_row = preferred_key_base - 1;
+             base_row >= 0; --base_row) {
             key_allocation = allocate_key(base_row);
             if (mlir::succeeded(key_allocation)) break;
         }
@@ -964,6 +976,10 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         mlir::NamedAttrList config_attributes(config);
         config_attributes.set("kv_cache_capacity",
             rewriter.getI64IntegerAttr(kv_cache_capacity));
+        config_attributes.set("kv_cache_page_tokens",
+            rewriter.getI64IntegerAttr(kv_cache_page_tokens));
+        config_attributes.set("kv_cache_resident_tokens",
+            rewriter.getI64IntegerAttr(kv_cache_resident_tokens));
         config = config_attributes.getDictionary(rewriter.getContext());
     }
     const auto subplan =

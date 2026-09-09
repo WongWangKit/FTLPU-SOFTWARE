@@ -10,8 +10,8 @@ The model runtime deliberately separates serialized model data, planning, sessio
 | --- | --- | --- | --- |
 | `ModelPackage` | Serialized model / loaded package | Named values and tensors, executable templates, invocation order, host operations, persistent-state declarations | Mutable device state or resolved physical addresses |
 | `ModelExecutable` | Reusable template inside the package | One `.ftlpu` program, typed bindings, target ABI, relocation records | Per-layer tensor payloads or session lifetimes |
-| `SessionMemoryPlanner` | One planning call during `load()` | Producer/consumer lifetimes, resident and state placements, invocation transfer decisions | Uploads, command execution, or CModel mutation |
-| `ModelSession` | One loaded runtime instance | Package copy, memory plan, host values, device-resident value map, statistics, preprocessing and ordered invocation execution | Compiler scheduling or instruction generation |
+| `SessionMemoryPlanner` | One planning call during `load()` | Producer/consumer lifetimes, resident-tensor placement, state-staging reservations, invocation transfer decisions | State contents, uploads, command execution, or CModel mutation |
+| `ModelSession` | One loaded runtime instance | Package copy, memory plan, host values, logical state backing, device-resident value map, statistics, preprocessing and ordered invocation execution | Compiler scheduling or instruction generation |
 | `CModelRuntime` | One resolved executable execution at a time | Binding upload/copy, internal initialization, ICU queue loading, ticking and output download | Model-level invocation order or cross-invocation lifetime decisions |
 
 ```mermaid
@@ -35,7 +35,7 @@ A package can be reused to create multiple independent sessions. A session is th
 
 ## Package contents
 
-The version-4 `.ftlpum` format contains:
+The version-6 `.ftlpum` format contains:
 
 - model and architecture identity;
 - named constant tensors;
@@ -53,7 +53,11 @@ The file magic is `FTLPUM01`. Quantized tensor metadata includes encoding, axis,
 
 Version 3 keeps reading version-1 and version-2 packages. An embedding lookup names an external rank-1 I32 token-id value, a raw rank-2 F16 table, and a rank-2 F16 output. `ModelSession` materializes that output before the first device invocation. This is an explicit host fallback for gather while the LPU ISA has no indirect MEM addressing operation; it is not represented as a fake ICU command.
 
-Version 4 remains backward compatible with version-1 through version-3 packages. A persistent state records its semantic kind, layer, element type, maximum token capacity, and logical shape. An invocation maps that state to an `internal` executable binding separately from ordinary inputs and outputs.
+Version 4 added persistent state and remains readable. Version 6 separates its
+logical maximum from the executable's physical SRAM window with
+`page_tokens` and `resident_tokens`; older packages are interpreted as fully
+resident. An invocation maps a state to an `internal` executable binding
+separately from ordinary inputs and outputs.
 
 A host LM head names a rank-2 F16 hidden value, a raw `[vocab, hidden]` F16 weight tensor, and an F16 or F32 logits value. With tied embeddings it references the same `model.embed_tokens.weight` tensor used by the input lookup. The default `last_token_only` mode computes `[1, vocab]` logits after the final LPU invocation, avoiding full prefill-logits materialization.
 
@@ -75,15 +79,15 @@ host embedding -> LPU decoder stack -> LPU final RMSNorm -> host LM head
 2. call `SessionMemoryPlanner::plan` before mutating device memory;
 3. replace the previous package, value maps, plan, and statistics;
 4. upload every planned resident tensor to its resolved binding;
-5. allocate and zero each persistent state exactly once.
+5. allocate and zero one full logical off-chip backing image per persistent state.
 
-`load_file(path)` reads the package with lazy executable materialization and then follows the same path. Resident weights therefore move during `load()`, not once per layer. Persistent state, including KV cache, is not automatically cleared by `run()`; loading a package initializes it again.
+`load_file(path)` reads the package with lazy executable materialization and then follows the same path. Resident weights therefore move during `load()`, not once per layer. Persistent state, including KV cache, is not automatically cleared by `run()`; loading a package initializes its logical backing again.
 
 ### External-transfer contract
 
 LPU MEM has no host-visible initialization backdoor. Every resident constant,
-persistent-state initialization, dynamic input, paged weight, and external
-output crosses the modeled boundary as
+persistent-state window, dynamic input, paged weight, and external output
+crosses the modeled boundary as
 `host backing store -> DDR -> C2C DMA -> C2C -> MEM` or the reverse path.
 `Ddr4Model::initialize_vector` and `read_vector` are host accesses to the
 external DDR backing store; they never read or write LPU SRAM. A `DeviceAlias`
@@ -111,14 +115,16 @@ of correctness depending on a static prediction.
 `set_input(name, bytes)` accepts only values declared as external inputs. `run()` clears the transient device-value map, executes host embedding lookups, runs invocations in package order, and finally executes host LM-head operations. For each invocation it:
 
 1. materializes the executable template and applies scale/MEM relocations from the session plan;
-2. resets and reloads the CModel ICU queues while preserving MEM SRAM;
-3. resolves each input as a resident tensor, dynamic host upload, device alias, or device layout copy;
-4. runs the command program and drain cycles;
-5. retains device outputs through their last consumer and downloads only external outputs.
+2. pages the invocation's logical K/V resident windows through DDR/C2C into reusable SRAM slots;
+3. resets and reloads the CModel ICU queues while preserving MEM SRAM;
+4. resolves each input as a resident tensor, dynamic host upload, device alias, or device layout copy;
+5. runs the command program and drain cycles;
+6. pages updated K/V windows back to off-chip backing;
+7. retains device outputs through their last consumer and downloads only external outputs.
 
 `run_invocation(index)` exposes the device-invocation step for focused tests and debugging; it does not replace the package-level preprocessing and postprocessing performed by `run()`. Compatible physical bindings alias directly. Incompatible 16-bit float layouts use a CModel MEM-to-MEM layout transfer without materializing the logical tensor in a host buffer; this explicit backend operation can later become an ICU MEM/SXM adapter executable.
 
-Production activations, RMSNorm parameters, RoPE tables, embeddings, and LM-head boundaries use BF16. Legacy layout names beginning with `Fp16` describe two-byte physical topology only; `BindingElementType::BF16` is authoritative. At executable boundaries, ICU, stream, MXM, VXM, and SXM state is cleared, while MEM and persistent state remain live. `stats()` reports resident uploads, state initialization, host transfers, device aliases/copies, and host operations.
+Production activations, RMSNorm parameters, RoPE tables, embeddings, and LM-head boundaries use BF16. Legacy layout names beginning with `Fp16` describe two-byte physical topology only; `BindingElementType::BF16` is authoritative. At executable boundaries, ICU, stream, MXM, VXM, and SXM state is cleared; MEM survives the reset and logical persistent state survives in session backing. `stats()` separately reports state page-in/page-out counts, bytes, and cycles in addition to resident, host, device-copy, and host-operation traffic.
 
 `weight_page_runtime_wait_cycles` counts physical cycles spent at executable
 page-ready fences. With execution tracing enabled,
@@ -129,7 +135,7 @@ CModel tick and records actual issues, C2C completion intervals, and
 
 ## Address planning and relocation
 
-Address planning has three distinct scopes. Compiler Tensor lowering chooses the binding layout, slice set, initial row geometry, and operator scratch; `SessionMemoryPlanner` globally relocates resident constants and persistent state across invocations; the Schedule verifier checks cycle-level MEM ports and queues. A Schedule conflict check does not replace spatial address-overlap validation.
+Address planning has three distinct scopes. Compiler Tensor lowering chooses the binding layout, slice set, initial row geometry, operator scratch, and the reusable SRAM staging window for each persistent state; `SessionMemoryPlanner` globally relocates resident constants while reserving those state windows; the Schedule verifier checks cycle-level MEM ports and queues. Logical state contents remain in `ModelSession`'s off-chip backing between invocations. A Schedule conflict check does not replace spatial address-overlap validation.
 
 A `BinaryBinding` fixes target ABI, access class, hemisphere mask, slices, layout, shape, element type, byte size, instruction count, and signed address stride. Runtime relocation preserves all of those fields and changes only `base_row`. For a binding, the occupied half-open row interval is derived as `begin = base_row + min(0, (instruction_count - 1) * address_stride)` and `end = base_row + max(0, (instruction_count - 1) * address_stride) + 1`; this also handles reverse-walking weight commands.
 
@@ -137,11 +143,11 @@ A `BinaryBinding` fixes target ABI, access class, hemisphere mask, slices, layou
 
 1. Build producer/consumer lifetimes for named values over the ordered invocation list.
 2. Key physical memory by `(target_abi, hemisphere, slice)` and verify that executables sharing an ABI agree on row capacity.
-3. Compute a conservative `reserved_floor` per physical slice from binary memory floors and non-resident bindings. Anonymous command scratch is not fully enumerated as bindings, so everything below that floor remains unavailable to resident allocation.
-4. Initialize each slice's free interval to `[reserved_floor, capacity)`, then collect all immutable tensor inputs and unique persistent states from every invocation.
+3. Reserve `[0, first_free_row)` from binary memory floors for anonymous command scratch, and reserve the exact row interval of every named non-resident binding.
+4. Compute the complement of those merged intervals in `[0, capacity)`, record each invocation's compiler-declared state staging binding, and collect immutable tensor inputs for relocation.
 5. Sort requests by descending slice count, descending total extent of their slice group, lexicographic slice set, and descending individual extent. This places the most constrained groups first.
 6. Generate candidates from each free interval's beginning and `end - extent`. Bindings using at least 16 slices search low rows first; narrower groups search high rows first. A candidate is legal only when the same row interval is free on every referenced physical slice.
-7. Carve the selected interval from every slice, update the resolved `base_row`, and record either a resident tensor or a persistent-state allocation.
+7. Carve each resident-tensor interval from every slice and update its resolved `base_row`; state bindings keep their compiler-planned addresses and distinct logical backing names.
 
 ```mermaid
 flowchart LR
@@ -149,19 +155,22 @@ flowchart LR
     Floors["Binary memory floors<br/>dynamic and scratch reservation"]
     Graph["Package invocation graph<br/>producer / last consumer"]
     Free["Per-slice free intervals"]
-    Requests["Resident tensors + persistent states"]
+    Requests["Resident-tensor placement requests"]
+    State["Compiler state-staging reservations"]
     Search["Sorted common-interval search"]
     Plan["SessionMemoryPlan<br/>resolved bindings + transfers"]
     Reloc["Typed MEM relocation"]
     Run["ModelSession execution"]
 
-    Binding --> Floors --> Free
+    Binding --> Floors
+    Binding --> State --> Free
+    Floors --> Free
     Graph --> Requests
     Free --> Search
     Requests --> Search --> Plan --> Reloc --> Run
 ```
 
-After placement, each invocation input is classified independently: `Resident` uses its planned binding, `HostUpload` materializes a dynamic external value, `DeviceAlias` reuses an identical physical binding, and `DeviceCopy` performs an explicit compatible layout transfer. Persistent states receive one allocation for the whole session and are referenced through `BindingAccess::Internal`.
+After placement, each invocation input is classified independently: `Resident` uses its planned binding, `HostUpload` materializes a dynamic external value, `DeviceAlias` reuses an identical physical binding, and `DeviceCopy` performs an explicit compatible layout transfer. Persistent states are referenced through `BindingAccess::Internal`; sequential states reuse their compiler-declared SRAM staging addresses.
 
 Planning fails instead of silently overlapping memory when capacity is exhausted, no common interval exists across a slice group, executables disagree on target capacity, state bindings disagree on type/layout/shape/slices/hemisphere, a device value crosses target ABIs, or an address move lacks the required relocation. Compiler-side per-function and operator address planning is described in the [compiler architecture document](../../compiler/docs/compiler_architecture.md).
 
@@ -220,7 +229,33 @@ The CModel end-to-end golden reports:
 
 The validation combines scale-aware BF16 error, relative L2, cosine similarity, and LM-head Top-K agreement. A fixed absolute threshold alone is misleading for large BF16 activations because one ULP grows with exponent.
 
-`build_hf_decoder_stack.py --checkpoint-outputs` embeds every layer golden and marks each `hidden.N` as an external output. The `hf_decoder_stack_checkpoint_test` executable then reports the first numerical drift per layer without changing the normal package ABI.
+`build_hf_decoder_stack.py --checkpoint-outputs` embeds every layer golden,
+marks each decoder boundary as an external output, and exposes it as a restart
+input. `hf_decoder_stack_checkpoint_test` can therefore start at any layer from
+that layer's golden input, which separates a local lowering error from
+cumulative BF16 drift. An explicit `ModelSession::set_input("hidden.N", ...)`
+overrides the statically planned device alias or device copy for that value and
+performs a modeled C2C upload. Packages with complete model boundaries also
+carry `golden.final_hidden`, computed by applying the checkpoint's final
+RMSNorm to the last decoder golden.
+
+For Qwen2.5-1.5B at sequence length 32, the complete CModel path executes host
+embedding, 28 paged decoder invocations, LPU final RMSNorm, and the tied host
+LM head. The current real-weight INT8/BF16 measurement reports final-hidden
+relative L2 error `0.024953`, cosine similarity `0.999689`, LM-head logit
+cosine similarity `0.999307`, and complete Top-5 overlap. The final-hidden
+mean absolute error is still reported (`0.054659`) for diagnostics, but is not
+an acceptance threshold because it scales with activation magnitude and stack
+depth. Strict local BF16 tolerance remains the responsibility of independent
+checkpoint-restart tests.
+
+The checkpoint harness derives restart inputs and golden outputs from each
+invocation's binding table. By default it restarts every invocation from its
+own golden input, so strict BF16 tolerance identifies local lowering errors.
+Set `FTLPU_CHECKPOINT_CHAINED=1` to preserve actual outputs across the selected
+range and measure cumulative drift. Decoder boundaries and the optional
+`final_norm -> final_hidden` boundary use the same mechanism instead of
+assuming that every invocation produces another `hidden.N` value.
 
 The full-model executable currently uses FFN tail scheduling. Its static decoder-layer schedule ends at approximately 197,978 cycles versus 192,125 for the fused schedule, so tail is about 3.0% slower in the current scheduler. It is retained here as the conservative full-prefill baseline, not as a performance improvement.
 
@@ -243,10 +278,30 @@ the same bank. The three-layer runtime test covers the full
 
 ## Persistent KV cache
 
-`SessionMemoryPlanner` allocates package states globally together with resident weights. State-backed internal bindings are excluded from executable scratch reservation, receive one physical interval for the whole session, and are validated for identical element type, layout, shape, slices, and hemisphere placement at every invocation that uses them.
+`ModelState.shape` and `max_tokens` describe logical capacity. Version 6 adds
+`page_tokens` and `resident_tokens`; the executable internal binding uses
+`[resident_tokens, kv_heads, head_dim]`, not the full logical shape.
 
-`ModelSession::load` zero-initializes each state once. Executable resets retain MEM SRAM, so later prefill layers and decode steps observe the same cache contents. Rank-3 KV shapes such as `[max_tokens, kv_heads, head_dim]` are flattened across their trailing dimensions by the physical distributed-matrix layout.
+`SessionMemoryPlanner` reserves compiler-declared state staging slots before it
+relocates resident weights. Tensor lowering places persistent K/V windows at
+the high end of their slice groups and keeps them live until executable exit;
+the planner rejects overlap with any other executable binding. A
+session-lifetime resident tensor cannot be placed over these windows either.
+Sequential layers reuse the same physical addresses while each state name
+keeps independent logical backing. Every invocation is validated for element
+type, layout, resident shape, slices, bank, hemisphere placement, binding
+index, and target ABI.
+
+`ModelSession::load` zero-initializes each full logical backing once. Before an
+invocation it transfers the resident prefix to SRAM through modeled DDR/C2C;
+after execution it transfers the updated window back. Runtime CSV traces label
+these intervals `C2C.StatePageIn` and `C2C.StatePageOut`. Rank-3 KV shapes are
+flattened across their trailing dimensions by the physical layout.
 
 Binary format version 10 adds `BindingAccess` to every MEM address relocation. This disambiguates an input binding and an internal KV binding that use the same numeric index.
 
-The current 52-slice CModel exposes 208 MiB across both hemispheres. A full BF16 SmolLM2-135M cache for 8192 tokens is about 180 MiB before weights and scratch, so that profile does not fit with all decoder weights resident. The current whole-model target is a 2048-token profile; supporting longer contexts requires paged or off-chip KV storage.
+For Qwen2.5-1.5B sequence length 32 and capacity 256, all 28 layers have 7 MiB
+of logical BF16 K/V state but consume only one 32-token K/V staging pair per
+ping-pong bank in SRAM. The current prefill path always transfers the prefix at offset zero.
+Decode beyond that window still needs dynamic cache length, page offset,
+append ranges, and past-prefix QK/PV scheduling.

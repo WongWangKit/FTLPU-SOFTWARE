@@ -72,6 +72,9 @@ try {
         session.write_execution_trace_csv(tracePath);
 
     const ModelSessionStats& stats = session.stats();
+    std::size_t expectedStatePages = 0;
+    for (const SessionInvocationPlan& invocation : plan.invocations)
+        expectedStatePages += invocation.states.size();
     const auto expectedHostDownloads = static_cast<std::size_t>(std::count_if(
         session.package().values.begin(), session.package().values.end(),
         [](const ModelValue& value) { return value.external_output; }));
@@ -79,7 +82,9 @@ try {
         || stats.host_downloads != expectedHostDownloads
         || stats.device_aliases != 1 || stats.device_copies != 0
         || stats.device_copy_bytes != 0 || stats.c2c_ingress_bytes == 0
-        || stats.c2c_egress_bytes == 0)
+        || stats.c2c_egress_bytes == 0
+        || stats.state_page_ins != expectedStatePages
+        || stats.state_page_outs != expectedStatePages)
         throw std::logic_error(
             "two-layer session used an unexpected host/device transfer plan: "
             "host_uploads=" + std::to_string(stats.host_uploads)
@@ -91,7 +96,9 @@ try {
             + " c2c_ingress_bytes=" +
                 std::to_string(stats.c2c_ingress_bytes)
             + " c2c_egress_bytes=" +
-                std::to_string(stats.c2c_egress_bytes));
+                std::to_string(stats.c2c_egress_bytes)
+            + " state_page_ins=" + std::to_string(stats.state_page_ins)
+            + " state_page_outs=" + std::to_string(stats.state_page_outs));
     if (paged && stats.weight_page_prefetches == 0)
         throw std::logic_error(
             "two-layer session did not execute C2C page ping-pong");
@@ -163,6 +170,10 @@ try {
         << " c2c_ingress_cycles=" << stats.c2c_ingress_cycles
         << " c2c_egress_bytes=" << stats.c2c_egress_bytes
         << " c2c_egress_cycles=" << stats.c2c_egress_cycles
+        << " state_page_ins=" << stats.state_page_ins
+        << " state_page_in_bytes=" << stats.state_page_in_bytes
+        << " state_page_outs=" << stats.state_page_outs
+        << " state_page_out_bytes=" << stats.state_page_out_bytes
         << " initial_page_wait_cycles="
         << stats.weight_page_initial_wait_cycles
         << " boundary_page_wait_cycles="

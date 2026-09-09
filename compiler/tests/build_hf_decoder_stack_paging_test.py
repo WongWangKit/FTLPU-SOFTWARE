@@ -31,6 +31,15 @@ def main() -> None:
         (model / "config.json").write_text(
             json.dumps({"num_hidden_layers": 2}), encoding="utf-8"
         )
+        (root / "target.json").write_text(
+            json.dumps({
+                "topology": {
+                    "tiles_per_slice": 4,
+                    "lanes_per_tile": 8,
+                }
+            }),
+            encoding="utf-8",
+        )
         metadata = {
             "model": "Qwen2.5-1.5B",
             "architecture": "Qwen2ForCausalLM",
@@ -78,6 +87,7 @@ def main() -> None:
                 "--mxm-execution", "vector",
                 "--layer-count", "2",
                 "--seq-len", "128",
+                "--kv-cache-capacity", "256",
                 "--reuse-golden",
                 "--output-dir", str(output_dir),
                 "--output", str(output),
@@ -140,6 +150,9 @@ def main() -> None:
             or "variant1" not in executable_args[1]
         ):
             raise RuntimeError("layer executable order does not alternate banks")
+        page_tokens = package.index("--kv-cache-page-tokens")
+        if package[page_tokens + 1] != "32":
+            raise RuntimeError("KV page size was not derived from the target")
         if not output.is_file():
             raise RuntimeError("paged output was not produced")
         pack = next(

@@ -58,12 +58,14 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/smollm2_full_prefill_lm_head_e2e_test.cpp
     tests/runtime/host_lm_head_test.cpp
     tests/runtime/model_package_roundtrip_test.cpp
+    tests/runtime/kv_cache_page_planner_test.cpp
     tests/runtime/model_session_embedding_test.cpp
     tests/runtime/resident_weight_planner_test.cpp
     tests/runtime/c2c_weight_ping_pong_test.cpp
     tests/runtime/weight_page_planner_test.cpp
     tests/runtime/model_session_c2c_weight_pages_test.cpp
     tests/runtime/model_session_c2c_io_test.cpp
+    tests/runtime/model_session_host_override_test.cpp
     tests/runtime/model_session_executable_c2c_weight_test.cpp
     tests/runtime/weight_page_builder_test.cpp
     tests/runtime/qwen_weight_page_builder_test.cpp)
@@ -209,6 +211,13 @@ add_test(
     COMMAND $<TARGET_FILE:model_package_roundtrip_test>
         ${CMAKE_CURRENT_BINARY_DIR}/test-output/roundtrip.ftlpum)
 
+add_executable(kv_cache_page_planner_test
+    tests/runtime/kv_cache_page_planner_test.cpp)
+target_link_libraries(kv_cache_page_planner_test PRIVATE ftlpu_software)
+add_test(
+    NAME kv_cache_page_planner_test
+    COMMAND $<TARGET_FILE:kv_cache_page_planner_test>)
+
 add_executable(model_session_embedding_test
     tests/runtime/model_session_embedding_test.cpp)
 target_link_libraries(model_session_embedding_test PRIVATE ftlpu_software)
@@ -263,6 +272,13 @@ target_link_libraries(model_session_c2c_io_test PRIVATE ftlpu_software)
 add_test(
     NAME model_session_c2c_io_test
     COMMAND $<TARGET_FILE:model_session_c2c_io_test>)
+
+add_executable(model_session_host_override_test
+    tests/runtime/model_session_host_override_test.cpp)
+target_link_libraries(model_session_host_override_test PRIVATE ftlpu_software)
+add_test(
+    NAME model_session_host_override_test
+    COMMAND $<TARGET_FILE:model_session_host_override_test>)
 
 add_executable(weight_page_builder_test
     tests/runtime/weight_page_builder_test.cpp)

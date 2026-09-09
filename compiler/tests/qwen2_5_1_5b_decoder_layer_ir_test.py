@@ -54,6 +54,22 @@ def parse_placement(body: str) -> dict[str, object]:
     }
 
 
+def find_dictionary(text: str, name: str) -> str:
+    match = re.search(rf"\b{re.escape(name)} = \{{", text)
+    if not match:
+        raise AssertionError(f"IR has no {name} dictionary")
+    begin = match.end() - 1
+    depth = 0
+    for index in range(begin, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[begin + 1:index]
+    raise AssertionError(f"unterminated {name} dictionary")
+
+
 def validate_attention_output_allocation(tensor: str) -> None:
     pv = next((line for line in tensor.splitlines()
                if "ftlpu.tensor.batch_matmul_task" in line
@@ -82,6 +98,20 @@ def validate_attention_output_allocation(tensor: str) -> None:
             "O projection result aliases its still-live PV context: "
             f"context={context}, result={result}"
         )
+
+
+def validate_kv_cache_staging(tensor: str, target_config: Path) -> None:
+    target = json.loads(target_config.read_text(encoding="utf-8"))
+    physical_rows = target.get("mem", {}).get("rows_per_bank", 8192)
+    bank_rows = int(target.get("memory", {}).get(
+        "words_per_bank", physical_rows))
+    for name in ("key", "value"):
+        placement = parse_placement(find_dictionary(tensor, name))
+        if int(placement["base"]) + int(placement["count"]) != bank_rows:
+            raise AssertionError(
+                f"persistent {name} cache is not isolated at the high end "
+                f"of SRAM: {placement}"
+            )
 
 
 def validate_paged_weights(tensor: str, target_config: Path,
@@ -267,9 +297,12 @@ def main() -> None:
     if args.kv_cache_capacity:
         require(tensor, (
             f"kv_cache_capacity = {args.kv_cache_capacity} : i64",
+            f"kv_cache_page_tokens = 32 : i64",
+            f"kv_cache_resident_tokens = {args.seq_len} : i64",
             'kind = "fp16_head_planar"',
             'kind = "fp16_value_x16"',
         ), "KV-aware Tensor")
+        validate_kv_cache_staging(tensor, args.target_config)
 
     stream = lower(args.tool, args.target_config, args.input,
                    args.output_dir / "decoder_layer.stream.mlir",

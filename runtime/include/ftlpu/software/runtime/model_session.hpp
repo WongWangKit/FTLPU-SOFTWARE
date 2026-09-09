@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ftlpu::software::runtime {
@@ -22,6 +23,12 @@ struct ModelSessionStats {
     std::size_t resident_upload_bytes{0};
     std::size_t state_initializations{0};
     std::size_t state_initialization_bytes{0};
+    std::size_t state_page_ins{0};
+    std::size_t state_page_in_bytes{0};
+    std::size_t state_page_in_cycles{0};
+    std::size_t state_page_outs{0};
+    std::size_t state_page_out_bytes{0};
+    std::size_t state_page_out_cycles{0};
     std::size_t host_uploads{0};
     std::size_t host_downloads{0};
     std::size_t c2c_ingress_bytes{0};
@@ -148,7 +155,11 @@ private:
     bool loaded_{false};
     bool completed_invocation_{false};
     std::unordered_map<std::string, std::vector<std::uint8_t>> values_{};
+    std::unordered_set<std::string> host_input_overrides_{};
     std::unordered_map<std::string, DeviceValue> device_values_{};
+    // Logical persistent states live in DDR-facing session storage. Each
+    // invocation pages its executable-sized window through C2C into SRAM.
+    std::unordered_map<std::string, std::vector<std::uint8_t>> state_backing_{};
 };
 
 } // namespace ftlpu::software::runtime

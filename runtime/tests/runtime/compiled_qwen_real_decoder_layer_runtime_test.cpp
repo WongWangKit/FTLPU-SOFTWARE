@@ -807,15 +807,19 @@ int main(int argc, char **argv) try {
         key_state_binding->shape != value_state_binding->shape ||
         key_state_binding->shape.front() < 32)
       throw std::logic_error("Qwen decoder has invalid BF16 KV cache bindings");
-    const auto capacity =
+    const auto resident_tokens =
         static_cast<std::uint32_t>(key_state_binding->shape.front());
+    constexpr std::uint32_t capacity = 256;
+    const auto page_tokens = program.hardware.mxm_rows;
+    auto logical_shape = key_state_binding->shape;
+    logical_shape.front() = capacity;
     package.states = {
         {"layers.0.key_cache", ModelStateKind::KvKey,
-         key_state_binding->element_type, key_state_binding->shape, 0,
-         capacity},
+         key_state_binding->element_type, logical_shape, 0,
+         capacity, page_tokens, resident_tokens},
         {"layers.0.value_cache", ModelStateKind::KvValue,
-         value_state_binding->element_type, value_state_binding->shape, 0,
-         capacity},
+         value_state_binding->element_type, logical_shape, 0,
+         capacity, page_tokens, resident_tokens},
     };
     state_refs = {
         {key_state_binding->index, "layers.0.key_cache"},
@@ -1232,6 +1236,12 @@ int main(int argc, char **argv) try {
   }
 
   const auto &stats = session.stats();
+  if (has_kv_state &&
+      (stats.state_page_ins != 2 || stats.state_page_outs != 2 ||
+       stats.state_page_in_bytes == 0 || stats.state_page_out_bytes == 0 ||
+       stats.state_page_in_cycles == 0 || stats.state_page_out_cycles == 0))
+    throw std::logic_error(
+        "Qwen decoder did not page both K/V windows through C2C");
   std::cout << "Qwen2.5-1.5B layer0 real decoder passed: values=" << values
             << " pages="
             << session.package().executables[0].program.weight_page_uses.size()
@@ -1239,6 +1249,8 @@ int main(int argc, char **argv) try {
             << session.package().executables[0].program.max_cycle + 64
             << " resident_uploads=" << stats.resident_uploads
             << " state_initializations=" << stats.state_initializations
+            << " state_page_in_bytes=" << stats.state_page_in_bytes
+            << " state_page_out_bytes=" << stats.state_page_out_bytes
             << " host_uploads=" << stats.host_uploads
             << " host_downloads=" << stats.host_downloads
             << " compiled_ddr_mbytes=" << compiled_ddr_bandwidth

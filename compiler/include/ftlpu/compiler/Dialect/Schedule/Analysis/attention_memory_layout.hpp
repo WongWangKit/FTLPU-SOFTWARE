@@ -143,7 +143,7 @@ private:
 
     const target::LPUTargetModel& target_;
     int64_t seqLen_ = 0;
-    int64_t kvCacheCapacity_ = 0;
+    int64_t kvStorageTokens_ = 0;
     int64_t hidden_ = 0;
     int64_t queryHeads_ = 0;
     int64_t kvHeads_ = 0;

@@ -100,7 +100,7 @@ try {
         {"lm_head", "hidden.1", "model.embed_tokens.weight", "logits", true});
     package.states.push_back(ModelState {
         "layers.0.key_cache", ModelStateKind::KvKey,
-        BindingElementType::F16, {2048, 3, 64}, 0, 2048});
+        BindingElementType::F16, {2048, 3, 64}, 0, 2048, 128, 2048});
     package.weight_pages.push_back(ModelWeightPage {
         0, 1, {"layers.0.page.packed"},
         {ModelWeightPage::Segment {
@@ -170,6 +170,8 @@ try {
             && decoded.states[0].shape
                 == std::vector<std::uint64_t>({2048, 3, 64})
             && decoded.states[0].max_tokens == 2048
+            && decoded.states[0].page_tokens == 128
+            && decoded.states[0].resident_tokens == 2048
             && decoded.invocations[0].states.size() == 1
             && decoded.invocations[0].states[0].binding_index == 10,
         "persistent KV state metadata was not preserved");
