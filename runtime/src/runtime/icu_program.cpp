@@ -527,12 +527,9 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                     | (static_cast<isa::EncodedMemInstruction>(
                            command.words[1])
                         << 32);
-                icu.enqueue_mem_stream_nd_packet(queue_index,
-                    encode_icu_stream_nd_packet({
-                        IcuStreamNdUnit::Mem,
-                        decode_mem_stream_nd_command(command),
-                        encoded,
-                    }));
+                icu.enqueue_mem_stream_nd(queue_index,
+                    decode_mem_stream_nd_command(command),
+                    isa::decode_mem_instruction(encoded));
                 continue;
             }
             if (is_mxm_stream_nd_command(command)) {
@@ -544,13 +541,12 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                             || command.word_count != 1)
                             throw std::logic_error(
                                 "MXM dequant STREAM_ND must carry one scale word");
-                        icu.enqueue_mxm_dequant_stream_nd_packet(
-                            queue_index,
-                            encode_icu_stream_nd_packet({
-                                IcuStreamNdUnit::MxmDequant,
-                                schedule,
-                                command.words[0],
-                            }));
+                        icu.enqueue_mxm_dequant_stream_nd(queue_index,
+                            schedule,
+                            isa::decode_mxm_dequant_instruction(
+                                static_cast<
+                                    isa::EncodedMxmDequantInstruction>(
+                                    command.words[0])));
                     } else {
                         if ((queue.kind != QueueKind::MxmLoad
                                 && queue.kind != QueueKind::MxmCompute)
@@ -571,21 +567,11 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                         validate_mxm_queue_opcode(
                             queue.kind, queue_index, instruction);
                         if (queue.kind == QueueKind::MxmLoad)
-                            icu.enqueue_mxm_load_stream_nd_packet(
-                                queue_index,
-                                encode_icu_stream_nd_packet({
-                                    IcuStreamNdUnit::MxmLoad,
-                                    schedule,
-                                    encoded,
-                                }));
+                            icu.enqueue_mxm_load_stream_nd(
+                                queue_index, schedule, instruction);
                         else
-                            icu.enqueue_mxm_compute_stream_nd_packet(
-                                queue_index,
-                                encode_icu_stream_nd_packet({
-                                    IcuStreamNdUnit::MxmCompute,
-                                    schedule,
-                                    encoded,
-                                }));
+                            icu.enqueue_mxm_compute_stream_nd(
+                                queue_index, schedule, instruction);
                     }
                 } catch (const std::exception& error) {
                     std::ostringstream message;
