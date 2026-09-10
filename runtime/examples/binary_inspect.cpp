@@ -442,6 +442,7 @@ try {
               << " deployable=" << (physical.fits() ? "yes" : "no")
               << " queues=" << physical.queues.size()
               << " mem_delta_rle_queues=" << physical.mem_delta_rle_queues
+              << " stream_nd_packets=" << physical.stream_nd_packets
               << " overflow_queues=" << physical.overflow_queues
               << " context_overflow_queues="
               << physical.macro_context_overflow_queues
@@ -473,6 +474,7 @@ try {
         std::size_t escapes = 0;
         std::size_t compactTemplateRuns = 0;
         std::size_t extendedTemplateRuns = 0;
+        std::size_t streamNdPackets = 0;
         std::uint64_t bits = 0;
         for (const auto& queue : physical.queues) {
             if (queue.kind != kind) continue;
@@ -490,6 +492,7 @@ try {
             escapes += queue.macro_codec.escaped_transitions;
             compactTemplateRuns += queue.macro_codec.compact_template_runs;
             extendedTemplateRuns += queue.macro_codec.extended_template_runs;
+            streamNdPackets += queue.stream_nd_packets;
             bits += queue.physical_bits;
         }
         if (queues == 0) continue;
@@ -499,6 +502,7 @@ try {
                   << " used_slots=" << slots
                   << " max_used_slots=" << maxSlots
                   << " used_bits=" << bits
+                  << " stream_nd_packets=" << streamNdPackets
                   << " peak_macro_contexts=" << peakContexts
                   << " macro_context_capacity=" << contextCapacity
                   << " peak_context_bits=" << peakContextBits

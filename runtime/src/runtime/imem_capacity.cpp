@@ -284,14 +284,30 @@ PhysicalImemReport analyze_physical_imem(const BinaryProgram& program)
             physical.mem_delta_rle = true;
             physical.macro_codec = image.stats;
             physical.physical_bits = image.stats.physical_bits();
+            physical.physical_slots = physical.slot_bits == 0 ? 0
+                : static_cast<std::size_t>((physical.physical_bits
+                      + physical.slot_bits - 1) / physical.slot_bits);
             ++report.mem_delta_rle_queues;
         } else {
-            physical.physical_bits = static_cast<std::uint64_t>(
-                physical.used_slots) * physical.slot_bits;
+            if (physical.slot_bits == 0)
+                throw std::invalid_argument(
+                    "target i-MEM slot width must be non-zero");
+            for (const auto& command : queue.commands) {
+                if (is_mem_stream_nd_command(command)
+                    || is_mxm_stream_nd_command(command)) {
+                    ++physical.stream_nd_packets;
+                    physical.physical_bits += IcuStreamNdPacket::kBitCount;
+                    physical.physical_slots +=
+                        (IcuStreamNdPacket::kBitCount
+                            + physical.slot_bits - 1)
+                        / physical.slot_bits;
+                } else {
+                    physical.physical_bits += physical.slot_bits;
+                    ++physical.physical_slots;
+                }
+            }
+            report.stream_nd_packets += physical.stream_nd_packets;
         }
-        physical.physical_slots = physical.slot_bits == 0 ? 0
-            : static_cast<std::size_t>((physical.physical_bits
-                  + physical.slot_bits - 1) / physical.slot_bits);
         checked_add(report.used_bits, physical.physical_bits);
         report.used_slots += physical.physical_slots;
         checked_add(report.peak_macro_context_bits,

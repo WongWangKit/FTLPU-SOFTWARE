@@ -18,7 +18,9 @@ ftlpu-opt ... --icu-compression none|control|macro
 
 生成的 module 带有 `ftlpu.icu_compression = "..."`。在 Command IR 兼容期内，
 仍会同时携带旧的 `ftlpu.icu_macro_schedule` 布尔属性。选择 Macro 压缩时，
-binary lowering 会在当前文件 envelope 中生成带类型的扩展 ICU 描述符。
+binary lowering 会在当前文件 envelope 中生成带类型的扩展 ICU 描述符。runtime
+完成 relocation 后，把 MEM/MXM `STREAM_ND` 重打包为下面定义的固定硬件包，
+再写入目标 ICU；文件 envelope 只承担传输和 relocation，不进入本地 ICU。
 
 ## 描述符
 
@@ -69,7 +71,7 @@ address = base_address + sum(id * address_stride[d])
 发射 cycle 交错执行。这样既保留不规则的 phase 边界，又能用一条描述符覆盖
 规则的 token、block 和 page 三层循环。当前 binary envelope 中 count 和
 cycle stride 为无符号 32 位，address stride 为有符号 32 位；各维在发射
-时间上不允许重叠。
+时间上不允许重叠。装载到硬件包时，runtime 进一步检查下面的固定字段范围。
 
 ### MEM_SLICE_PROGRAM
 
@@ -112,6 +114,49 @@ operand_delta =               sum(i[d] * operand_stride[d])
 
 编译器按 cycle stride 对仿射维度排序，并验证嵌套硬件计数器能够单调发射。
 不同描述符仍可通过每队列的 next-issue calendar 交错执行。
+
+### MEM/MXM 固定硬件 STREAM_ND 包
+
+MEM、MXM load、MXM compute 和 MXM dequant 共用一条固定 320-bit 指令格式。
+它由 10 个 32-bit little-endian 传输 word 组成，rank 不改变取指长度：
+
+| bit | 宽度 | 字段 |
+| ---: | ---: | --- |
+| 3:0 | 4 | opcode，`8` 表示 `STREAM_ND` |
+| 5:4 | 2 | version，当前为 `0` |
+| 8:6 | 3 | unit：MEM/load/compute/dequant |
+| 10:9 | 2 | `rank - 1` |
+| 12:11 | 2 | induction target |
+| 31:13 | 19 | 保留，必须为 0 |
+| 55:32 | 24 | `start_cycle` |
+| 119:56 | 64 | 原生 MEM/MXM 指令 |
+| 135:120 | 16 | `count[0] - 1` |
+| 159:136 | 24 | `cycle_stride[0]` |
+| 177:160 | 18 | 有符号 `operand_stride[0]` |
+| 235:178 | 58 | 第 1 维，字段顺序同上 |
+| 293:236 | 58 | 第 2 维，字段顺序同上 |
+| 319:294 | 26 | padding，必须为 0 |
+
+因此 count 上限为 65,536，cycle 和 cycle stride 使用 24 bit，operand stride
+范围为 -131,072 到 131,071。未使用维必须编码为 `count=1`、
+`cycle_stride=1`、`operand_stride=0`。decoder 还检查版本、保留位、unit 与原生
+opcode 的对应关系，以及各维发射 cycle 不重叠。
+
+固定包在本地 i-MEM 中占完整槽：96-bit MEM i-MEM 使用 4 槽，128-bit MXM
+i-MEM 使用 3 槽。它仍是一条逻辑描述符，只建立一个三维循环上下文。ICU 在
+描述符到达队首时解码和锁存原生指令、三个 count、cycle stride 与 operand
+stride；之后计数器/calendar 每 cycle 产生至多一条原生功能指令，不再由 host
+逐条展开。
+
+Qwen2.5-1.5B、`seq_len=32` 的 FFN Up 规则主循环测试使用 `M=32`、
+`K=1536`（48 个 K tile）、每半球 `N=4480`（140 个 N tile）。一个本地 MEM
+weight 队列、MXM load、dequant 和 compute 队列各只装入一条固定包，分别展开
+26,880、26,880、26,880 和 215,040 条逐 cycle 指令。完整 FFN binary 也通过
+同一固定包装载路径执行，49,152 个 BF16 输出与参考结果逐点一致。
+
+完整 projection 中遇到 SRAM page 边界、weight buffer 切换或末次
+accumulator clear/output opcode 时，原生模板发生变化，编译器必须保留独立
+描述符；单条 `STREAM_ND` 只合并“原生指令不变且三维坐标仿射”的区域。
 
 ### VXM_STREAM_ND
 
@@ -252,7 +297,8 @@ cycle 排序的最小堆；RTL 可采用小型有序 calendar、timing wheel 或
 
 ## RTL 定型建议
 
-当前 extension-word 格式属于软件验证格式。硬件版建议使用固定描述符头、
-FU 专用 payload、显式版本和长度，并将最大 in-flight 数纳入 target model；
-超长 count/interval 可使用 escape word。硬件 capability bit 正式可用之前，
-runtime 必须保留旧细粒度队列作为回退路径。
+MEM/MXM `STREAM_ND` 已采用上述固定 320-bit 硬件包。当前文件 envelope 仍用于
+磁盘传输和 relocation，装载器输出才是 ICU 接口上的最终 bit pattern。
+`MEM_SLICE_PROGRAM`、`VXM_STREAM_ND` 和 `SXM_TILE_PROGRAM` 仍属于软件验证
+格式，后续需要各自冻结固定 payload。最大 in-flight 数应纳入 target model；
+硬件 capability bit 正式可用之前，runtime 保留旧细粒度队列作为回退路径。

@@ -70,6 +70,12 @@ try {
     require(slicedCapacity.queues[0].peak_macro_contexts == 2
             && streamCapacity.queues[0].peak_macro_contexts == 2,
         "physical inspector did not count each active MEM stream context");
+    require(streamCapacity.stream_nd_packets == 2
+            && streamCapacity.queues[0].stream_nd_packets == 2
+            && streamCapacity.queues[0].physical_bits
+                == 2 * IcuStreamNdPacket::kBitCount
+            && streamCapacity.queues[0].physical_slots == 8,
+        "physical inspector did not account for fixed 320-bit STREAM_ND packets");
 
     BinaryProgram control;
     control.max_cycle = 4;

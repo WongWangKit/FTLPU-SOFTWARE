@@ -21,7 +21,10 @@ encoding. The old `--icu-macro-schedule` option remains an alias for
 
 The generated module carries `ftlpu.icu_compression = "..."`. It also carries
 the legacy `ftlpu.icu_macro_schedule` boolean during the command-IR
-compatibility window.
+compatibility window. Binary lowering keeps typed descriptors in the current
+file envelope. After relocations, runtime repacks MEM/MXM `STREAM_ND` commands
+into the fixed hardware packet below before writing a target ICU; the file
+envelope is only a transport and relocation format.
 
 ## Descriptor
 
@@ -75,6 +78,7 @@ interleaves them, which preserves irregular phase boundaries while letting one
 descriptor cover regular token, block, and page dimensions. Counts and cycle
 strides are unsigned 32-bit values in the current binary envelope; address
 strides are signed 32-bit values. Dimensions must not overlap in issue time.
+Runtime additionally checks the fixed hardware field ranges during loading.
 
 ### MEM_SLICE_PROGRAM
 
@@ -122,6 +126,55 @@ operand_delta =               sum(i[d] * operand_stride[d])
 The compiler sorts affine dimensions by cycle stride and verifies that nested
 hardware counters can emit them monotonically. Multiple descriptors can still
 interleave through the per-queue next-issue calendar.
+
+### Fixed MEM/MXM hardware STREAM_ND packet
+
+MEM, MXM load, MXM compute, and MXM dequant use one fixed 320-bit instruction
+format. It is transferred as ten little-endian 32-bit words, and its fetch
+length does not depend on rank:
+
+| Bits | Width | Field |
+| ---: | ---: | --- |
+| 3:0 | 4 | Opcode; `8` means `STREAM_ND` |
+| 5:4 | 2 | Version; currently `0` |
+| 8:6 | 3 | Unit: MEM/load/compute/dequant |
+| 10:9 | 2 | `rank - 1` |
+| 12:11 | 2 | Induction target |
+| 31:13 | 19 | Reserved; must be zero |
+| 55:32 | 24 | `start_cycle` |
+| 119:56 | 64 | Native MEM/MXM instruction |
+| 135:120 | 16 | `count[0] - 1` |
+| 159:136 | 24 | `cycle_stride[0]` |
+| 177:160 | 18 | Signed `operand_stride[0]` |
+| 235:178 | 58 | Dimension 1 in the same field order |
+| 293:236 | 58 | Dimension 2 in the same field order |
+| 319:294 | 26 | Padding; must be zero |
+
+Counts are limited to 65,536, cycles and cycle strides use 24 bits, and operand
+strides range from -131,072 through 131,071. An inactive dimension has the
+canonical encoding `count=1`, `cycle_stride=1`, `operand_stride=0`. The decoder
+also validates the version, reserved bits, unit/native-opcode pairing, and
+non-overlapping issue cycles.
+
+The packet occupies whole local i-MEM slots: four 96-bit slots in a MEM ICU or
+three 128-bit slots in an MXM ICU. It remains one logical descriptor and creates
+one three-dimensional loop context. When the descriptor reaches the queue
+head, the ICU decodes and latches the native instruction, counts, cycle strides,
+and operand strides. Its counters/calendar then emit at most one native
+functional instruction per cycle without host expansion.
+
+The Qwen2.5-1.5B FFN Up regular-loop test at `seq_len=32` uses `M=32`, `K=1536`
+(48 K tiles), and `N=4480` per hemisphere (140 N tiles). One local MEM weight,
+MXM load, dequant, and compute queue each contains one fixed packet; they expand
+to 26,880, 26,880, 26,880, and 215,040 cycle-level instructions respectively.
+The complete FFN binary also executes through this fixed-packet load path and
+matches all 49,152 BF16 reference outputs exactly.
+
+A complete projection still needs separate descriptors at SRAM page boundaries,
+weight-buffer changes, and the final accumulator clear/output opcode because
+the native instruction template changes. One `STREAM_ND` merges only regions
+with one invariant native instruction and affine coordinates in up to three
+dimensions.
 
 ### VXM_STREAM_ND
 
@@ -275,9 +328,10 @@ writing the binary.
 
 ## RTL Encoding Direction
 
-The current extension-word representation is a software validation format, not
-the final wire width. A hardware encoding should use a fixed descriptor header,
-FU-specific payload words, explicit descriptor length/version, and a bounded
-in-flight count exposed through the target model. Long intervals/counts can use
-an escape word. Runtime must retain the legacy queue path until the hardware
+MEM/MXM `STREAM_ND` now uses the fixed 320-bit hardware packet above. The file
+envelope remains a disk transport and relocation representation; the loader's
+output is the final bit pattern on the ICU interface. `MEM_SLICE_PROGRAM`,
+`VXM_STREAM_ND`, and `SXM_TILE_PROGRAM` remain software validation formats and
+still need fixed payload definitions. The target model should expose the
+bounded in-flight count. Runtime retains the legacy queue path until a hardware
 capability bit selects macro v1.
