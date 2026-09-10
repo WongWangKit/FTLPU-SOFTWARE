@@ -10,18 +10,26 @@ for now.
 Select ICU compression from the command line:
 
 ```text
-ftlpu-opt ... --icu-compression none|control|macro
+ftlpu-opt ... --icu-compression none|repeat|macro|macro-slice
 ```
 
 `macro` is the default. `none` materializes functional instructions while
-retaining duration-encoded NOP gaps, `control` enables Repeat and Repeat2D,
-and `macro` additionally enables Macro scheduling and physical Macro queue
-encoding. The old `--icu-macro-schedule` option remains an alias for
-`--icu-compression macro`.
+retaining duration-encoded NOP gaps; `repeat` enables Repeat and Repeat2D;
+`macro` additionally enables the original two-dimensional Macro v1 for MEM
+and MXM queues, while VXM and SXM continue to use Repeat/Repeat2D. The
+experimental `macro-slice` mode also enables `MEM_SLICE_PROGRAM`. The old
+`control` spelling remains an alias for `repeat`, and
+`--icu-macro-schedule` remains an alias for `--icu-compression macro`.
 
 The generated module carries `ftlpu.icu_compression = "..."`. It also carries
 the legacy `ftlpu.icu_macro_schedule` boolean during the command-IR
 compatibility window.
+
+The active validation scope is Macro v1 only. Compiler generation of
+rank-three `STREAM_ND` descriptors is disabled; repeated 2-D schedules remain
+independent Macro records. The `STREAM_ND` and slice-program formats below are
+retained for binary compatibility and future experiments, but are not part of
+the current performance sign-off.
 
 ## Descriptor
 
@@ -49,7 +57,7 @@ cycle = start_cycle + outer * outer_interval + inner * inner_interval
 operand_delta = outer * outer_stride + inner * inner_stride
 ```
 
-### MEM_STREAM_ND
+### MEM_STREAM_ND (deferred)
 
 MEM queues additionally use `MEM_STREAM_ND`, a MEM-specific descriptor with
 one native read/write and up to three affine counters:
@@ -96,7 +104,7 @@ applies its delta to every body instruction. The current compiler limits a
 body cycle offset to 65,535 cycles so a later fixed-width RTL encoding remains
 practical.
 
-### MXM_STREAM_ND
+### MXM_STREAM_ND (deferred)
 
 MXM load, compute, and dequant queues use the same one-to-three-dimensional
 schedule around one native MXM instruction. `operand_stride[d]` is interpreted
@@ -123,7 +131,7 @@ The compiler sorts affine dimensions by cycle stride and verifies that nested
 hardware counters can emit them monotonically. Multiple descriptors can still
 interleave through the per-queue next-issue calendar.
 
-### VXM_STREAM_ND
+### VXM_STREAM_ND (deferred)
 
 `VXM_STREAM_ND` carries one 96-bit compact VXM packet and a one-to-three-
 dimensional absolute-cycle launch domain in one ICU macro instruction. The ICU
@@ -135,7 +143,7 @@ inside the compact packet is independently retained and controls the duration
 of each Superlane configuration. Version 1 has no operand induction. A scale
 relocation directly patches the packet carried by the macro instruction.
 
-### SXM_TILE_PROGRAM
+### SXM_TILE_PROGRAM (deferred)
 
 `SXM_TILE_PROGRAM` stores one complete transpose or permute template together
 with a one-to-three-dimensional launch domain. Its payload preserves source
@@ -146,11 +154,11 @@ per-cycle instructions.
 
 ## Compiler Lowering
 
-Binary lowering recognizes repeated queue windows with identical native
-instruction shape, fixed cycle interval, and fixed operand stride. It first
-forms interleaved two-dimensional schedules, then folds repeated schedules into
-a third affine dimension. This is queue-generic and is not an FFN-specific
-lowering rule.
+Binary lowering recognizes repeated MEM/MXM queue windows with identical
+native instruction shape, fixed cycle interval, and fixed operand stride, and
+forms interleaved two-dimensional Macro schedules. It deliberately does not
+fold repeated schedules into a third affine dimension. VXM and SXM use the
+Repeat/Repeat2D path.
 
 Compression is represented before binary lowering as well:
 
@@ -163,6 +171,10 @@ Compression is represented before binary lowering as well:
 
 Schedule verification expands every logical point when checking resource
 occupancy. The compact form therefore does not relax cycle accuracy.
+
+The measurements below were produced by the earlier coarse-program experiment
+and include `STREAM_ND`; they are retained as historical data and must not be
+used as evidence for the current 2-D-only Macro performance sign-off.
 
 For the SmolLM2-135M sequence-32 Vector FFN test:
 
@@ -238,10 +250,12 @@ maximum error `0.09375`.
 
 ### MEM slice A/B policy and inspector
 
-`MEM_SLICE_PROGRAM` remains a sub-encoding of `macro`, not a fourth compression
-mode. `--mem-slice-program on|off` independently selects it in `ftlpu-compile`,
-`ftlpu-opt`, and `ftlpu-translate`. Lowering never forms a one-body program,
-because its eleven-word shared header is larger than one `MEM_STREAM_ND`.
+`MEM_SLICE_PROGRAM` is enabled only by the fourth, experimental
+`macro-slice` mode. The legacy `--mem-slice-program on|off` option is retained
+as a compatibility override between `macro` and `macro-slice` in
+`ftlpu-compile`, `ftlpu-opt`, and `ftlpu-translate`. Lowering never forms a
+one-body program, because its eleven-word shared header is larger than one
+`MEM_STREAM_ND`.
 
 `ftlpu_binary_inspect left.ftlpu --compare right.ftlpu` expands both binaries
 to exact sparse `(queue, cycle, native instruction)` timelines. Missing issue

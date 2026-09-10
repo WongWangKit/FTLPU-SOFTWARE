@@ -1,6 +1,7 @@
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 
 #include "ftlpu/system/c2c_dma_system.hpp"
+#include "ftlpu/software/runtime/imem_capacity.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include "ftlpu/core/bf16.hpp"
@@ -375,6 +376,24 @@ CModelRuntime::CModelRuntime(C2cDmaSystem& system,
 void CModelRuntime::load(const BinaryProgram& program)
 {
     validate_cmodel_hardware_config(program);
+    const auto imem = analyze_physical_imem(program);
+    if (!imem.fits()) {
+        for (const auto& queue : imem.queues) {
+            if (!queue.deployment_overflow()) continue;
+            std::ostringstream message;
+            message << "ICU program does not fit the configured CModel: "
+                    << "queue_kind=" << static_cast<int>(queue.kind)
+                    << ", queue_index=" << queue.index
+                    << ", physical_slots=" << queue.physical_slots
+                    << "/" << queue.depth
+                    << ", peak_macro_contexts="
+                    << queue.peak_macro_contexts << "/"
+                    << queue.macro_context_capacity;
+            throw std::invalid_argument(message.str());
+        }
+        throw std::invalid_argument(
+            "ICU program does not fit the configured CModel");
+    }
     SystemHardwareConfiguration hardware;
     hardware.sram_depth_rows = program.hardware.sram_depth_rows;
     hardware.mxms_per_hemisphere = program.hardware.mxms_per_hemisphere;
@@ -1414,6 +1433,23 @@ void CModelRuntime::print_datapath_performance(std::ostream& os) const
 {
     datapath_performance_.print(
         system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_, os);
+}
+
+IcuFrontendStatistics CModelRuntime::icu_frontend_statistics() const noexcept
+{
+    return system_.icu().frontend_statistics();
+}
+
+void CModelRuntime::print_icu_frontend_performance(std::ostream& os) const
+{
+    const auto statistics = icu_frontend_statistics();
+    os << "runtime perf resource=ICU.frontend"
+       << " imem_entries=" << statistics.imem_entries
+       << " fetched_entries=" << statistics.fetched_entries
+       << " issued_instructions=" << statistics.issued_instructions
+       << " macro_queues=" << statistics.macro_queues
+       << " peak_macro_contexts_per_queue="
+       << statistics.peak_macro_contexts_per_queue << '\n';
 }
 
 } // namespace ftlpu::software::runtime

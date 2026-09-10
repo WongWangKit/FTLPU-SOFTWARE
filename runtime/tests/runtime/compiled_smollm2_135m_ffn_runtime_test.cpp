@@ -96,21 +96,10 @@ try {
                     == ftlpu::software::runtime::QueueKind::MxmDequant;
             if (!macroQueue) continue;
             for (const auto& command : queue.commands) {
-                const bool coarseMem = queue.kind
-                        == ftlpu::software::runtime::QueueKind::Mem
-                    && (ftlpu::software::runtime::is_mem_stream_nd_command(
-                            command)
-                        || ftlpu::software::runtime::
-                            is_mem_slice_program_command(command));
-                const bool coarseMxm = queue.kind
-                        != ftlpu::software::runtime::QueueKind::Mem
-                    && ftlpu::software::runtime::is_mxm_stream_nd_command(
-                        command);
-                if (!coarseMem && !coarseMxm
-                    && !ftlpu::software::runtime::is_macro_schedule_command(
+                if (!ftlpu::software::runtime::is_macro_schedule_command(
                         command))
                     throw std::logic_error(
-                        "macro FFN contains a fine-grained MEM/MXM command");
+                        "Macro v1 FFN contains a non-2-D MEM/MXM descriptor");
                 ++macroCount;
             }
         }
@@ -185,6 +174,7 @@ try {
     }
     ftlpu::software::runtime::print_runtime_performance(
         program, program.max_cycle + 64, std::cout);
+    runtime.print_icu_frontend_performance(std::cout);
     runtime.print_datapath_performance(std::cout);
     const auto output_binding = std::find_if(program.bindings.begin(),
         program.bindings.end(), [](const auto& binding) {

@@ -570,6 +570,7 @@ if(Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/mem_slice_program_ab_test.py
             --translate $<TARGET_FILE:ftlpu_translate>
             --inspect $<TARGET_FILE:ftlpu_binary_inspect>
+            --runtime-test $<TARGET_FILE:macro_bitstream_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/command_mem_slice_ab.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/mem_slice_program_ab)
     add_test(

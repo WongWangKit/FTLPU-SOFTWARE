@@ -8,17 +8,23 @@ v1 将确定性的指令展开从 host runtime 下沉到各功能单元的本地
 通过命令行选择 ICU 压缩模式：
 
 ```text
-ftlpu-opt ... --icu-compression none|control|macro
+ftlpu-opt ... --icu-compression none|repeat|macro|macro-slice
 ```
 
 默认使用 `macro`。`none` 会物化功能指令，但保留按时长编码的 NOP 间隔；
-`control` 启用 Repeat 和 Repeat2D；`macro` 进一步启用带类型的粗粒度 ICU
-描述符和物理 Macro 队列编码。旧选项
+`repeat` 启用 Repeat 和 Repeat2D；`macro` 进一步为 MEM/MXM 队列启用原始的
+二维 Macro v1，VXM/SXM 仍使用 Repeat/Repeat2D；实验性的 `macro-slice` 在此
+基础上启用 `MEM_SLICE_PROGRAM`。
+旧拼写 `control` 继续作为 `repeat` 的兼容别名，旧选项
 `--icu-macro-schedule` 继续作为 `--icu-compression macro` 的兼容别名。
 
 生成的 module 带有 `ftlpu.icu_compression = "..."`。在 Command IR 兼容期内，
 仍会同时携带旧的 `ftlpu.icu_macro_schedule` 布尔属性。选择 Macro 压缩时，
 binary lowering 会在当前文件 envelope 中生成带类型的扩展 ICU 描述符。
+
+当前只验证 Macro v1。编译器已经关闭 rank-3 `STREAM_ND` 生成；重复的二维
+调度会保留为多条独立 Macro。下文的 `STREAM_ND` 和 slice-program 格式仅为
+binary 兼容和后续实验保留，不进入当前性能验收。
 
 ## 描述符
 
@@ -45,7 +51,7 @@ cycle = start_cycle + outer * outer_interval + inner * inner_interval
 operand_delta = outer * outer_stride + inner * inner_stride
 ```
 
-### MEM_STREAM_ND
+### MEM_STREAM_ND（暂缓）
 
 MEM 队列进一步使用专用的 `MEM_STREAM_ND`。一条描述符携带一条原生
 read/write 指令和最多三层仿射计数器：
@@ -89,7 +95,7 @@ relocation 指向父 command，runtime 会将其地址增量应用到每个 body
 MEM 指令。当前编译器把 body cycle offset 限制在 65,535 cycle 以内，为后续
 固定宽度 RTL 编码保留实现空间。
 
-### MXM_STREAM_ND
+### MXM_STREAM_ND（暂缓）
 
 MXM load、compute 和 dequant 队列使用同样的一到三维调度描述符，并携带一条
 原生 MXM 指令。`operand_stride[d]` 的含义由强类型 `induction_target` 决定：
@@ -113,7 +119,7 @@ operand_delta =               sum(i[d] * operand_stride[d])
 编译器按 cycle stride 对仿射维度排序，并验证嵌套硬件计数器能够单调发射。
 不同描述符仍可通过每队列的 next-issue calendar 交错执行。
 
-### VXM_STREAM_ND
+### VXM_STREAM_ND（暂缓）
 
 `VXM_STREAM_ND` 将一条 96-bit VXM 紧凑配置包和一到三维绝对 cycle 启动域
 放在同一条 ICU 宏指令中。ICU 取到描述符后锁存一次配置，再由 ND counter
@@ -123,7 +129,7 @@ ND 迭代次数表示 ICU 启动次数。紧凑配置包内部的 `repeat_count`
 决定每次启动后 Superlane 配置持续执行多久。v1 不做操作数字段归纳；量化
 scale relocation 直接修改宏指令携带的 packet。
 
-### SXM_TILE_PROGRAM
+### SXM_TILE_PROGRAM（暂缓）
 
 `SXM_TILE_PROGRAM` 将一个完整 transpose 或 permute 模板与一到三维启动域放在
 一起。payload 保留源/目标 stream 列表、row/tile 选择器和完整 32-lane map。
@@ -132,10 +138,10 @@ map 会成为多条可交错 program，而不再逐 cycle 展开。
 
 ## 编译器压缩
 
-binary lowering 会识别同一队列中“原生指令形状相同、cycle 间隔固定、
-地址或 column/accumulator 步长固定”的重复窗口，先形成可交错的二维调度，
-再把重复调度折叠为第三个仿射维度。该规则面向所有队列，不是 FFN 专用
-helper。
+binary lowering 会识别同一 MEM/MXM 队列中“原生指令形状相同、cycle 间隔
+固定、地址或 column/accumulator 步长固定”的重复窗口，并形成可交错的二维
+Macro；当前明确不再把重复二维调度折叠为第三个仿射维度。VXM/SXM 使用
+Repeat/Repeat2D 路径。
 
 压缩在 binary lowering 之前就有明确的 IR 表达：
 
@@ -148,6 +154,9 @@ helper。
 
 Schedule verifier 会展开所有逻辑发射点再检查资源占用，因此紧凑表示不会放宽
 逐 cycle 精度。
+
+以下数据来自此前的 coarse-program 实验，其中包含 `STREAM_ND`。这些数据仅作
+历史记录，不能作为当前纯二维 Macro 性能验收的依据。
 
 SmolLM2-135M、seq_len=32、Vector FFN 的结果如下：
 
@@ -221,10 +230,11 @@ Qwen golden 对比：mismatch 为 0、MAE 为 `0.004514`、最大误差为
 
 ### MEM slice A/B 策略与 inspector
 
-`MEM_SLICE_PROGRAM` 仍是 `macro` 内部的一种子编码，不增加第四种压缩模式。
-`ftlpu-compile`、`ftlpu-opt` 和 `ftlpu-translate` 可通过
-`--mem-slice-program on|off` 单独开关它。lowering 不再生成单 body program，
-因为其 11-word 共享头比一条 `MEM_STREAM_ND` 更大。
+`MEM_SLICE_PROGRAM` 只由第四种实验模式 `macro-slice` 启用。
+`ftlpu-compile`、`ftlpu-opt` 和 `ftlpu-translate` 仍保留旧的
+`--mem-slice-program on|off`，作为 `macro` 与 `macro-slice` 之间的兼容覆盖项。
+lowering 不再生成单 body program，因为其 11-word 共享头比一条
+`MEM_STREAM_ND` 更大。
 
 `ftlpu_binary_inspect left.ftlpu --compare right.ftlpu` 会把两个 binary 展开为
 精确的 `(queue, cycle, native instruction)` 稀疏时间线。直到 `max_cycle` 为止，

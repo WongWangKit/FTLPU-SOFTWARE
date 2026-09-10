@@ -7,7 +7,7 @@
 
 `Repeat2D` 负责第一类。曾提议的多指令 `Loop` ISA 已删除：其额外 ICU body
 存储和回放控制成本与实测收益不匹配。多指令重复窗口改为物化；若窗口中的
-单条指令各自满足仿射条件，则使用独立的绝对 cycle Macro/STREAM_ND 描述符。
+MEM/MXM 单条指令各自满足仿射条件，则使用独立的绝对 cycle 二维 Macro 描述符。
 
 ## 已实现决策
 
@@ -22,8 +22,10 @@ MEM 地址、MXM IW weight column 或无归纳。
 compiler capability `throughput.icu_repeat_2d_enabled` 可为不支持该指令的硬件强制展开，
 也可用于压缩前后语义 A/B。
 
-当前不存在 `Loop` command、binary record 或 runtime decoder，也不增加第四种
-压缩模式；支持的模式仍为 `none`、`control` 和 `macro`。
+当前不存在 `Loop` command、binary record 或 runtime decoder。支持的模式为
+`none`、`repeat`、`macro` 和实验性的 `macro-slice`；旧拼写 `control` 仍作为
+`repeat` 的兼容别名。
+Macro v1 验证期间关闭 rank-3 `STREAM_ND` 生成。
 
 ## 实测结果
 

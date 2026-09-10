@@ -8,8 +8,8 @@ Generated schedules contain two distinct kinds of repetition:
 `Repeat2D` handles the first case. The proposed multi-instruction `Loop` ISA
 was removed: its additional ICU body storage and replay control were not
 justified by the measured gain. Repeated multi-instruction windows are
-materialized, or represented by independent absolute-cycle Macro/STREAM_ND
-descriptors when their instructions are individually affine.
+materialized, or represented by independent absolute-cycle 2-D Macro
+descriptors when their MEM/MXM instructions are individually affine.
 
 ## Implemented Decision
 
@@ -26,8 +26,10 @@ This legality check is a linear scan over cycle-sorted queue sequences.
 The compiler capability `throughput.icu_repeat_2d_enabled` can force expansion
 for hardware without Repeat2D and for semantic A/B testing.
 
-There is no `Loop` command, binary record, runtime decoder, or fourth
-compression mode. The supported modes remain `none`, `control`, and `macro`.
+There is no `Loop` command, binary record, or runtime decoder. The supported
+modes are `none`, `repeat`, `macro`, and the experimental `macro-slice` mode.
+The old `control` spelling remains an alias for `repeat`.
+Rank-three `STREAM_ND` generation is disabled during Macro v1 validation.
 
 ## Measured Result
 

@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -46,7 +47,7 @@ struct Args {
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
         ftlpu::compiler::target::IcuCompressionMode::Macro};
-    bool mem_slice_program{true};
+    std::optional<bool> mem_slice_program_override{};
 };
 
 Args parse_args(int argc, char** argv)
@@ -114,8 +115,8 @@ Args parse_args(int argc, char** argv)
         }
         else if (arg == "--mem-slice-program") {
             const std::string value = next();
-            if (value == "on") args.mem_slice_program = true;
-            else if (value == "off") args.mem_slice_program = false;
+            if (value == "on") args.mem_slice_program_override = true;
+            else if (value == "off") args.mem_slice_program_override = false;
             else throw std::runtime_error(
                 "expected on or off for --mem-slice-program");
         }
@@ -134,12 +135,16 @@ Args parse_args(int argc, char** argv)
                                  "[--ffn-schedule tail|fused] "
                                  "[--attention-schedule tail|fused] "
                                  "[--mxm-execution auto|vector|legacy] "
-                                 "[--icu-compression none|control|macro] "
+                                 "[--icu-compression none|repeat|macro|macro-slice] "
                                  "[--mem-slice-program on|off] "
                                  "[--weight-bank 0|1] "
                                  "[--kv-cache-capacity tokens] "
                                  "[--target-config target.json]");
     }
+    if (args.mem_slice_program_override)
+        args.icu_compression =
+            ftlpu::compiler::target::set_mem_slice_program(
+                args.icu_compression, *args.mem_slice_program_override);
     return args;
 }
 
@@ -204,12 +209,15 @@ try {
             ftlpu::compiler::target::icu_compression_mode_name(
                 args.icu_compression)));
     (*module)->setAttr("ftlpu.mem_slice_program",
-        mlir::BoolAttr::get(&context, args.mem_slice_program));
+        mlir::BoolAttr::get(&context,
+            ftlpu::compiler::target::
+                icu_compression_uses_mem_slice_program(
+                    args.icu_compression)));
     // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,
-            args.icu_compression
-                == ftlpu::compiler::target::IcuCompressionMode::Macro));
+            ftlpu::compiler::target::icu_compression_uses_macro(
+                args.icu_compression)));
 
     mlir::PassManager pass_manager(&context);
     const bool deferVerificationUntilCompressed =

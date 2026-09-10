@@ -53,7 +53,7 @@ try {
     if (input.empty() || output.empty())
         throw std::runtime_error(
             "usage: ftlpu-translate --input command.mlir --output program.ftlpu "
-            "[--icu-compression none|control|macro] "
+            "[--icu-compression none|repeat|macro|macro-slice] "
             "[--mem-slice-program on|off] [--verify-icu-issues]");
 
     mlir::DialectRegistry registry;
@@ -62,14 +62,43 @@ try {
     context.loadAllAvailableDialects();
     auto module = mlir::parseSourceFile<mlir::ModuleOp>(input.string(), &context);
     if (!module) return 1;
-    if (icuCompression)
-        (*module)->setAttr("ftlpu.icu_compression",
-            mlir::StringAttr::get(&context,
-                ftlpu::compiler::target::icu_compression_mode_name(
-                    *icuCompression)));
+    using ftlpu::compiler::target::IcuCompressionMode;
+    auto effectiveCompression = IcuCompressionMode::Macro;
+    if (icuCompression) {
+        effectiveCompression = *icuCompression;
+    } else if (const auto attr = (*module)->getAttrOfType<mlir::StringAttr>(
+                   "ftlpu.icu_compression")) {
+        const auto parsed = ftlpu::compiler::target::
+            parse_icu_compression_mode(attr.getValue().str());
+        if (!parsed)
+            throw std::runtime_error(
+                "Command IR module has an invalid ftlpu.icu_compression");
+        effectiveCompression = *parsed;
+    } else if (const auto attr = (*module)->getAttrOfType<mlir::BoolAttr>(
+                   "ftlpu.icu_macro_schedule")) {
+        effectiveCompression = attr.getValue()
+            ? IcuCompressionMode::Macro : IcuCompressionMode::Repeat;
+    }
+    if (!icuCompression && effectiveCompression == IcuCompressionMode::Macro)
+        if (const auto attr = (*module)->getAttrOfType<mlir::BoolAttr>(
+                "ftlpu.mem_slice_program"); attr && attr.getValue())
+            effectiveCompression = IcuCompressionMode::MacroSlice;
     if (memSliceProgram)
-        (*module)->setAttr("ftlpu.mem_slice_program",
-            mlir::BoolAttr::get(&context, *memSliceProgram));
+        effectiveCompression = ftlpu::compiler::target::
+            set_mem_slice_program(effectiveCompression, *memSliceProgram);
+    (*module)->setAttr("ftlpu.icu_compression",
+        mlir::StringAttr::get(&context,
+            ftlpu::compiler::target::icu_compression_mode_name(
+                effectiveCompression)));
+    (*module)->setAttr("ftlpu.mem_slice_program",
+        mlir::BoolAttr::get(&context,
+            ftlpu::compiler::target::
+                icu_compression_uses_mem_slice_program(
+                    effectiveCompression)));
+    (*module)->setAttr("ftlpu.icu_macro_schedule",
+        mlir::BoolAttr::get(&context,
+            ftlpu::compiler::target::icu_compression_uses_macro(
+                effectiveCompression)));
 
     std::error_code error;
     std::filesystem::create_directories(output.parent_path(), error);
