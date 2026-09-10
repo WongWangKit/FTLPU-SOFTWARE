@@ -574,6 +574,15 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/command_mem_slice_ab.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/mem_slice_program_ab)
     add_test(
+        NAME macro_rectangle_folding_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/macro_rectangle_folding_test.py
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --inspect $<TARGET_FILE:ftlpu_binary_inspect>
+            --runtime-test $<TARGET_FILE:macro_bitstream_test>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/macro_rectangle_folding)
+    add_test(
         NAME stablehlo_matmul_320_to_ftlpu_kernel_mlir_test
         COMMAND
             ${Python3_EXECUTABLE}

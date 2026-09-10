@@ -635,7 +635,23 @@ try {
                   << " mem_slice_program=" << memSlicePrograms
                   << " mxm_stream_nd=" << mxmStreamNd
                   << " vxm_stream_nd=" << vxmStreamNd
-                  << " sxm_tile_program=" << sxmTilePrograms << '\n';
+                  << " sxm_tile_program=" << sxmTilePrograms;
+        const auto physicalQueue = std::ranges::find_if(physical.queues,
+            [&](const auto& candidate) {
+                return candidate.kind == queue.kind
+                    && candidate.index == queue.index;
+            });
+        if (physicalQueue != physical.queues.end())
+            std::cout << " physical_slots=" << physicalQueue->physical_slots
+                      << " physical_bits=" << physicalQueue->physical_bits
+                      << " peak_macro_contexts="
+                      << physicalQueue->peak_macro_contexts
+                      << " macro_context_capacity="
+                      << physicalQueue->macro_context_capacity
+                      << " context_overflow="
+                      << (physicalQueue->macro_context_overflow()
+                              ? "yes" : "no");
+        std::cout << '\n';
     }
     for (const auto kind : {
              ftlpu::software::runtime::QueueKind::Mem,

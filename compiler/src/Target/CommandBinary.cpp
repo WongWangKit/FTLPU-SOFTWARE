@@ -1220,6 +1220,184 @@ int64_t macro_instruction_stride(const CommandSequence& first,
         : std::numeric_limits<int64_t>::max();
 }
 
+bool fold_interleaved_macro_rectangle(
+    const std::vector<CommandSequence>& sequences, std::size_t index,
+    std::size_t window, std::size_t rounds, int64_t outerInterval,
+    int64_t outerStride, QueueKind kind, CommandSequence& folded)
+{
+    // A window is a genuine second Macro dimension when both its issue cycles
+    // and its inducted instruction field are affine. Existing inner repeats
+    // can form either interleaved columns or consecutive blocks in that
+    // dimension. The old compressor only joined equal offsets across rounds,
+    // leaving one descriptor per window offset for both layouts.
+    if (window <= 1 || rounds <= 1) return false;
+    const auto& first = sequences[index];
+    const auto& second = sequences[index + 1];
+    if (first.repeat_count <= 0 || first.outer_count != 1
+        || second.repeat_count != first.repeat_count
+        || second.outer_count != 1
+        || first.repeat_count
+            > static_cast<int64_t>(
+                  std::numeric_limits<std::uint32_t>::max() / window))
+        return false;
+
+    const int64_t repeatCount = first.repeat_count;
+    const int64_t combinedCount = static_cast<int64_t>(window) * repeatCount;
+    const auto target = macro_induction_target(kind);
+    const auto tryLayout = [&](bool interleaved) {
+        const int64_t innerInterval = interleaved
+            ? second.cycle - first.cycle : first.repeat_interval;
+        const int64_t innerStride = interleaved
+            ? macro_instruction_stride(first, second, kind)
+            : first.address_stride;
+        if (innerInterval <= 0
+            || innerStride == std::numeric_limits<int64_t>::max()
+            || outerInterval <= (combinedCount - 1) * innerInterval
+            || ((innerStride != 0 || outerStride != 0)
+                && target == IcuInductionTarget::None))
+            return false;
+        for (std::size_t offset = 0; offset < window; ++offset) {
+            const auto& candidate = sequences[index + offset];
+            const int64_t baseOrdinal = interleaved
+                ? static_cast<int64_t>(offset)
+                : static_cast<int64_t>(offset) * repeatCount;
+            const int64_t expectedRepeatInterval = interleaved
+                ? static_cast<int64_t>(window) * innerInterval
+                : innerInterval;
+            const int64_t expectedRepeatStride = interleaved
+                ? static_cast<int64_t>(window) * innerStride
+                : innerStride;
+            if (candidate.repeat_count != repeatCount
+                || candidate.outer_count != 1
+                || candidate.cycle
+                    != first.cycle + baseOrdinal * innerInterval
+                || (repeatCount > 1
+                    && (candidate.repeat_interval != expectedRepeatInterval
+                        || candidate.address_stride != expectedRepeatStride
+                        || (expectedRepeatStride != 0
+                            && candidate.induction_target != target)))
+                || !same_affine_instruction(first, candidate, kind,
+                    baseOrdinal * innerStride))
+                return false;
+        }
+
+        folded = first;
+        folded.repeat_count = combinedCount;
+        folded.repeat_interval = innerInterval;
+        folded.address_stride = innerStride;
+        folded.outer_count = static_cast<int64_t>(rounds);
+        folded.outer_interval = outerInterval;
+        folded.outer_stride = outerStride;
+        folded.induction_target =
+            innerStride != 0 || outerStride != 0 ? target
+                                                 : IcuInductionTarget::None;
+        return true;
+    };
+    return tryLayout(true) || tryLayout(false);
+}
+
+void compress_existing_outer_macro_windows(
+    std::vector<CommandSequence>& sequences, QueueKind kind)
+{
+    // Schedule lowering can already provide the outer Macro dimension. Merge
+    // affine singleton columns into the still-unused inner dimension. This is
+    // common for tiled MEM traffic, where Read and Write columns alternate in
+    // the queue and every column shares the same outer wave.
+    constexpr std::size_t kMaxWindow = 63;
+    std::vector<CommandSequence> compressed;
+    compressed.reserve(sequences.size());
+    for (std::size_t index = 0; index < sequences.size();) {
+        std::size_t bestWindow = 0;
+        std::size_t bestRounds = 0;
+        std::size_t bestSavings = 0;
+        int64_t bestInterval = 0;
+        int64_t bestStride = 0;
+        const std::size_t remaining = sequences.size() - index;
+        for (std::size_t window = 1;
+             window <= std::min(kMaxWindow, remaining / 2); ++window) {
+            const auto& first = sequences[index];
+            const auto& next = sequences[index + window];
+            if (first.repeat_count != 1 || next.repeat_count != 1
+                || first.outer_count <= 1
+                || next.outer_count != first.outer_count
+                || next.outer_interval != first.outer_interval
+                || next.outer_stride != first.outer_stride
+                || next.induction_target != first.induction_target)
+                continue;
+            const int64_t interval = next.cycle - first.cycle;
+            if (interval <= 0) continue;
+            const int64_t stride =
+                macro_instruction_stride(first, next, kind);
+            if (stride == std::numeric_limits<int64_t>::max()) continue;
+
+            std::size_t rounds = 1;
+            while (index + (rounds + 1) * window <= sequences.size()) {
+                bool same = true;
+                for (std::size_t offset = 0; offset < window; ++offset) {
+                    const auto& base = sequences[index + offset];
+                    const auto& candidate =
+                        sequences[index + rounds * window + offset];
+                    if (base.repeat_count != 1
+                        || candidate.repeat_count != 1
+                        || base.outer_count <= 1
+                        || candidate.outer_count != base.outer_count
+                        || candidate.outer_interval != base.outer_interval
+                        || candidate.outer_stride != base.outer_stride
+                        || candidate.induction_target
+                            != base.induction_target
+                        || base.outer_interval
+                            <= static_cast<int64_t>(rounds) * interval
+                        || candidate.cycle
+                            != base.cycle
+                                + static_cast<int64_t>(rounds) * interval
+                        || !same_affine_instruction(base, candidate, kind,
+                            static_cast<int64_t>(rounds) * stride)) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (!same) break;
+                ++rounds;
+            }
+            const std::size_t covered = rounds * window;
+            const std::size_t savings = rounds > 1
+                ? covered - window : 0;
+            if (rounds > 1
+                && (savings > bestSavings
+                    || (savings == bestSavings
+                        && covered > bestRounds * bestWindow))) {
+                bestWindow = window;
+                bestRounds = rounds;
+                bestSavings = savings;
+                bestInterval = interval;
+                bestStride = stride;
+            }
+        }
+        if (bestRounds <= 1) {
+            compressed.push_back(std::move(sequences[index++]));
+            continue;
+        }
+
+        const auto target = macro_induction_target(kind);
+        for (std::size_t offset = 0; offset < bestWindow; ++offset) {
+            auto sequence = std::move(sequences[index + offset]);
+            if ((bestStride != 0 || sequence.outer_stride != 0)
+                && target == IcuInductionTarget::None)
+                throw std::runtime_error(
+                    "cannot fold a Macro window without an induction target");
+            sequence.repeat_count = static_cast<int64_t>(bestRounds);
+            sequence.repeat_interval = bestInterval;
+            sequence.address_stride = bestStride;
+            sequence.induction_target =
+                bestStride != 0 || sequence.outer_stride != 0
+                ? target : IcuInductionTarget::None;
+            compressed.push_back(std::move(sequence));
+        }
+        index += bestRounds * bestWindow;
+    }
+    sequences = std::move(compressed);
+}
+
 void compress_interleaved_macro_windows(
     std::vector<CommandSequence>& sequences, QueueKind kind)
 {
@@ -1231,6 +1409,9 @@ void compress_interleaved_macro_windows(
         std::size_t bestRounds = 0;
         int64_t bestInterval = 0;
         int64_t bestStride = 0;
+        bool bestFoldsRectangle = false;
+        CommandSequence bestFolded;
+        std::size_t bestSavings = 0;
         const std::size_t remaining = sequences.size() - index;
         for (std::size_t window = 1;
              window <= std::min(kMaxWindow, remaining / 2); ++window) {
@@ -1277,26 +1458,42 @@ void compress_interleaved_macro_windows(
                 if (!same) break;
                 ++rounds;
             }
+            CommandSequence folded;
+            const bool foldsRectangle = rounds > 1
+                && fold_interleaved_macro_rectangle(sequences, index,
+                    window, rounds, interval, stride, kind, folded);
+            const std::size_t covered = rounds * window;
+            const std::size_t emitted = foldsRectangle ? 1 : window;
+            const std::size_t savings = rounds > 1 ? covered - emitted : 0;
             if (rounds > 1
-                && rounds * window > bestRounds * bestWindow) {
+                && (savings > bestSavings
+                    || (savings == bestSavings
+                        && covered > bestRounds * bestWindow))) {
                 bestWindow = window;
                 bestRounds = rounds;
                 bestInterval = interval;
                 bestStride = stride;
+                bestFoldsRectangle = foldsRectangle;
+                bestFolded = std::move(folded);
+                bestSavings = savings;
             }
         }
         if (bestRounds <= 1) {
             compressed.push_back(std::move(sequences[index++]));
             continue;
         }
-        for (std::size_t offset = 0; offset < bestWindow; ++offset) {
-            auto sequence = std::move(sequences[index + offset]);
-            sequence.outer_count = static_cast<int64_t>(bestRounds);
-            sequence.outer_interval = bestInterval;
-            sequence.outer_stride = bestStride;
-            if (bestStride != 0)
-                sequence.induction_target = macro_induction_target(kind);
-            compressed.push_back(std::move(sequence));
+        if (bestFoldsRectangle) {
+            compressed.push_back(std::move(bestFolded));
+        } else {
+            for (std::size_t offset = 0; offset < bestWindow; ++offset) {
+                auto sequence = std::move(sequences[index + offset]);
+                sequence.outer_count = static_cast<int64_t>(bestRounds);
+                sequence.outer_interval = bestInterval;
+                sequence.outer_stride = bestStride;
+                if (bestStride != 0)
+                    sequence.induction_target = macro_induction_target(kind);
+                compressed.push_back(std::move(sequence));
+            }
         }
         index += bestRounds * bestWindow;
     }
@@ -1457,7 +1654,20 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
         }
     }
     if (macroQueue) {
+        compress_existing_outer_macro_windows(sequences, key.first);
+        std::sort(sequences.begin(), sequences.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.cycle < rhs.cycle;
+            });
         compress_interleaved_macro_windows(sequences, key.first);
+        std::sort(sequences.begin(), sequences.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.cycle < rhs.cycle;
+            });
+        // The interleaved pass above can create a common outer dimension for
+        // several neighboring columns. Revisit them so that affine columns
+        // consume the remaining inner dimension instead of separate contexts.
+        compress_existing_outer_macro_windows(sequences, key.first);
         std::sort(sequences.begin(), sequences.end(),
             [](const auto& lhs, const auto& rhs) {
                 return lhs.cycle < rhs.cycle;
