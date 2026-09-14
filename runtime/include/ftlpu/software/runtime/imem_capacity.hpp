@@ -50,16 +50,21 @@ struct CmodelAbstractImemReport {
     bool fits() const { return overflow_queues == 0; }
 };
 
-CmodelAbstractImemReport analyze_cmodel_abstract_imem(
-    const BinaryProgram& program);
+CmodelAbstractImemReport
+analyze_cmodel_abstract_imem(const BinaryProgram& program);
 
-// Target-facing packed storage estimate. MEM all-Macro queues use the real
-// inline-template Delta-RLE v1 codec. Other queues retain one native target
+// Target-facing packed storage estimate. MEM/MXM all-Macro queues use their
+// inline-template Delta-RLE v1 codecs. Other queues retain one native target
 // word per QueueCommand until their physical codecs are defined.
 struct PhysicalImemQueue : CmodelAbstractImemQueue {
+    // Meaningful queue payload, excluding the word-0 control word and final
+    // physical-word padding.
+    std::uint64_t payload_bits{0};
+    // Allocated physical storage, including word 0 and word padding.
     std::uint64_t physical_bits{0};
     std::size_t physical_slots{0};
     bool mem_delta_rle{false};
+    bool mxm_delta_rle{false};
     MemMacroBitstreamStats macro_codec{};
     std::size_t peak_macro_contexts{0};
     std::size_t macro_context_capacity{0};
@@ -84,6 +89,7 @@ struct PhysicalImemReport {
     std::size_t overflow_queues{0};
     std::size_t macro_context_overflow_queues{0};
     std::size_t mem_delta_rle_queues{0};
+    std::size_t mxm_delta_rle_queues{0};
     std::uint64_t peak_macro_context_bits{0};
     std::uint64_t provisioned_macro_context_bits{0};
 

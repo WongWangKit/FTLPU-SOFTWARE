@@ -57,6 +57,53 @@ cycle = start_cycle + outer * outer_interval + inner * inner_interval
 operand_delta = outer * outer_stride + inner * inner_stride
 ```
 
+### Independent QueueMode packed encoding
+
+Macro v1 uses a queue-level mode: one MEM/MXM queue is either legacy
+native/Repeat/Repeat2D or entirely Macro. A singleton functional operation is
+represented by a Macro whose two counts are one; NOP gaps are represented by
+the next Macro's absolute start cycle. Legacy and Macro records are not mixed
+inside one physical queue image.
+
+The hardware QueueMode is fixed at two bits: `00=Native`, `01=Macro packed
+v1`, with `10` and `11` reserved. This hardware value is independent from the
+internal `.ftlpu` container-mode enum retained for compatibility with older
+files.
+
+The physical i-MEM SRAM port remains fixed width: MEM reads 96 bits and MXM
+reads 128 bits per access. Macro records are variable-length packed records
+that may cross these word boundaries. A small fetch reservoir supplies the
+bitstream decoder. The low bits of i-MEM word 0 hold `valid[0]`, `enable[1]`,
+`mode[3:2]`, and a 24-bit `command_count[27:4]`; all remaining bits are
+reserved zero. Queue kind is implicit in the independently owned physical ICU
+i-MEM, and the dictionary count is the first three payload bits. The final
+partial word is zero padded. Thus variable-length Macro records do not require
+a variable-width SRAM port.
+
+`command_count` counts stored Macro records, not runs or dynamically expanded
+functional issues. Hardware stops after the self-describing grammar has
+reconstructed that many records. `valid_bit_length` remains software-only
+`.ftlpu` container metadata for validation and DMA sizing; it is not a hardware
+control-word field. Physical occupancy is one control word plus the rounded-up
+payload words. Existing i-MEM depths remain provisional until the packed codec
+is remeasured across the target workload set.
+
+The reference v1 codec groups adjacent records with a common normalized native
+instruction and 2-D schedule template. It stores the first absolute cycle and
+induced operand, then Delta-RLE encodes subsequent `(cycle, operand)` states
+using a seven-entry queue-local dictionary. The induced operand is a 13-bit MEM
+address, 2-bit MXM load weight column, or 13-bit MXM compute accumulator
+address; MXM dequant has no induced operand. Template and delta escape forms
+preserve the complete semantic field ranges. Runtime round-trips the packed
+image before loading CModel contexts, and the physical capacity inspector
+rounds each queue's valid payload bits up to its 96/128-bit fetch width and
+then accounts for word 0.
+
+Starting with `.ftlpu` v33, all-Macro MEM, MXM load, MXM compute, and MXM
+dequant queues use the packed container writer, stream/span readers, and
+metadata-skip path. Packed mode in legacy v28-v32 files remains valid only for
+MEM queues.
+
 ### MEM_STREAM_ND (deferred)
 
 MEM queues additionally use `MEM_STREAM_ND`, a MEM-specific descriptor with

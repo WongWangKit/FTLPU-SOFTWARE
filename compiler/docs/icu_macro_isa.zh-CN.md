@@ -51,6 +51,45 @@ cycle = start_cycle + outer * outer_interval + inner * inner_interval
 operand_delta = outer * outer_stride + inner * inner_stride
 ```
 
+### 独立 QueueMode packed 编码
+
+Macro v1 使用 queue 级模式：一个 MEM/MXM queue 要么是旧的
+native/Repeat/Repeat2D 模式，要么全部按 Macro 解释。不能继续合并的单条
+功能指令使用两个 count 均为一的 singleton Macro；NOP 间隔由下一条 Macro
+的绝对 start cycle 表示。同一个物理 queue image 内不混合 legacy 与 Macro
+记录。
+
+硬件 QueueMode 固定为 2 bit：`00=Native`、`01=Macro packed v1`，`10` 和
+`11` 保留。该数值与 `.ftlpu` 为兼容旧文件保留的内部 container mode 枚举
+相互独立。
+
+物理 i-MEM SRAM 端口仍为固定宽度：MEM 每次读取 96 bit，MXM 每次读取
+128 bit。Macro 是允许跨 word 边界的变长 packed record，固定宽 word 先进入
+一个小型 fetch reservoir，再由 bitstream decoder 消耗。i-MEM word 0 的低位依次
+保存 `valid[0]`、`enable[1]`、`mode[3:2]` 和 24-bit
+`command_count[27:4]`，其余位保留为零。queue kind 由独立物理 ICU 隐含，
+dictionary count 是 payload 的起始 3 bit。最后一个 word 的无效尾部补零。因此，
+变长 Macro descriptor 不要求可变宽 SRAM 读口。
+
+`command_count` 统计存储的 Macro record，不统计 run，也不统计 Macro 展开后的
+动态 issue。硬件根据自描述 grammar 解够 record 后停止；`valid_bit_length` 只在
+`.ftlpu` 软件 container 中保留，用于文件校验和 DMA 长度，不进入硬件控制字。
+每个 queue 的占用为一个控制 word 加向上取整后的 payload word。当前 i-MEM 深度
+继续沿用既有参数，后续根据多模型物理编码统计重新确定。
+
+v1 reference codec 将具有相同归一化 native 指令和二维 schedule template 的
+相邻记录组成 run。位流保存首条记录的绝对 cycle 和被归纳 operand，后续
+`(cycle, operand)` 状态使用带 7 项 queue-local dictionary 的 Delta-RLE。
+operand 分别是 13-bit MEM address、2-bit MXM load weight column 或 13-bit
+MXM compute accumulator address；MXM dequant 没有归纳 operand。Template 和
+delta 的 escape 形式保留完整语义范围。Runtime 在加载 CModel context 前先对
+packed image 做 encode/decode round-trip，物理容量检测器则把每个 queue 的
+payload 有效 bit 长度分别向上取整到 96/128-bit fetch word，再计入 word 0。
+
+`.ftlpu` v33 已将 MEM、MXM load、MXM compute 和 MXM dequant 的 all-Macro
+queue 全部接入 packed container writer、stream/span reader 和 metadata skip。
+旧 v28～v32 文件中的 packed mode 只允许用于 MEM queue，继续保持可读。
+
 ### MEM_STREAM_ND（暂缓）
 
 MEM 队列进一步使用专用的 `MEM_STREAM_ND`。一条描述符携带一条原生
