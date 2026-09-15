@@ -1001,7 +1001,9 @@ QueueProgram read_mem_macro_bitstream(Reader& reader,
     } else {
         reader.read_bytes(image.bytes.data(), image.bytes.size());
     }
-    return decode_mem_macro_bitstream(image, queueIndex);
+    auto queue = decode_mem_macro_bitstream(image, queueIndex);
+    queue.packed_macro_imem = pack_mem_macro_imem(image);
+    return queue;
 }
 
 template <typename Reader>
@@ -1033,7 +1035,9 @@ QueueProgram read_mxm_macro_bitstream(Reader& reader,
     } else {
         reader.read_bytes(image.bytes.data(), image.bytes.size());
     }
-    return decode_mxm_macro_bitstream(image, queueIndex);
+    auto queue = decode_mxm_macro_bitstream(image, queueIndex);
+    queue.packed_macro_imem = pack_mxm_macro_imem(image);
+    return queue;
 }
 
 template <typename Reader>

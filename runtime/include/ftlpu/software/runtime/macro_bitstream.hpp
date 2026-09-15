@@ -49,21 +49,6 @@ struct IcuQueueControl {
 std::uint32_t encode_icu_queue_control(const IcuQueueControl& control);
 IcuQueueControl decode_icu_queue_control(std::uint32_t word);
 
-// Word-aligned physical i-MEM bytes. software_valid_bit_length is container
-// metadata used for file I/O and bit-exact validation; it is not stored in the
-// hardware control word. It includes the complete word-0 control word and the
-// meaningful payload bits, but excludes final word padding.
-struct PackedMacroImemImage {
-    std::uint32_t word_bits{0};
-    std::uint64_t software_valid_bit_length{0};
-    std::vector<std::uint8_t> bytes{};
-
-    std::size_t word_count() const
-    {
-        return word_bits == 0 ? 0 : bytes.size() * 8 / word_bits;
-    }
-};
-
 struct MemMacroDelta {
     std::uint32_t start_cycle{0};
     std::int32_t address{0};

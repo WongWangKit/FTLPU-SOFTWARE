@@ -224,6 +224,142 @@ std::size_t physical_queue_index(QueueKind kind, std::size_t logical_index,
     return hemisphere * hw::kMxmsPerHemisphere + local_mxm;
 }
 
+bool is_all_macro_queue(const QueueProgram& queue)
+{
+    if (queue.commands.empty()) return false;
+    InstructionKind expected;
+    switch (queue.kind) {
+    case QueueKind::Mem:
+        expected = InstructionKind::Mem;
+        break;
+    case QueueKind::MxmLoad:
+    case QueueKind::MxmCompute:
+        expected = InstructionKind::Mxm;
+        break;
+    case QueueKind::MxmDequant:
+        expected = InstructionKind::MxmDequant;
+        break;
+    case QueueKind::Vxm:
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute:
+        return false;
+    }
+    return std::all_of(queue.commands.begin(), queue.commands.end(),
+        [&](const QueueCommand& command) {
+            return is_macro_schedule_command(command)
+                && command.instruction_kind == expected;
+        });
+}
+
+template <typename RawWord>
+RawWord raw_imem_word(
+    const PackedMacroImemImage& image, std::size_t address)
+{
+    static_assert(RawWord::bit_count % 32 == 0);
+    if (image.word_bits != RawWord::bit_count)
+        throw std::logic_error(
+            "packed Macro image does not match the CModel i-MEM width");
+    const auto wordBytes = RawWord::bit_count / 8;
+    if (image.bytes.size() % wordBytes != 0
+        || address >= image.bytes.size() / wordBytes)
+        throw std::logic_error(
+            "packed Macro image is not word aligned");
+
+    RawWord word{};
+    const auto wordOffset = address * wordBytes;
+    for (std::size_t lane = 0; lane < RawWord::lane_count; ++lane) {
+        const auto byteOffset = wordOffset + lane * sizeof(std::uint32_t);
+        word.lanes[lane] =
+            static_cast<std::uint32_t>(image.bytes[byteOffset])
+            | (static_cast<std::uint32_t>(image.bytes[byteOffset + 1]) << 8)
+            | (static_cast<std::uint32_t>(image.bytes[byteOffset + 2]) << 16)
+            | (static_cast<std::uint32_t>(image.bytes[byteOffset + 3]) << 24);
+    }
+    return word;
+}
+
+bool load_raw_macro_queue(const QueueProgram& queue,
+                          InstructionControlUnit& icu,
+                          std::size_t logical_mxms_per_hemisphere)
+{
+    if (!is_all_macro_queue(queue)) return false;
+
+    const auto queueIndex = physical_queue_index(
+        queue.kind, queue.index, logical_mxms_per_hemisphere);
+    validate_queue_index(queue.kind, queueIndex);
+
+    PackedMacroImemImage generatedImage;
+    const PackedMacroImemImage* image = nullptr;
+    if (queue.packed_macro_imem.has_value()) {
+        image = &*queue.packed_macro_imem;
+    } else if (queue.kind == QueueKind::Mem) {
+        generatedImage =
+            pack_mem_macro_imem(encode_mem_macro_bitstream(queue));
+        image = &generatedImage;
+    } else {
+        generatedImage =
+            pack_mxm_macro_imem(encode_mxm_macro_bitstream(queue));
+        image = &generatedImage;
+    }
+
+    if (image->word_count() == 0)
+        throw std::logic_error("packed Macro image has no control word");
+
+    if (queue.kind == QueueKind::Mem) {
+        for (std::size_t address = 0; address < image->word_count(); ++address)
+            icu.write_mem_raw_macro_imem(
+                queueIndex, address,
+                raw_imem_word<InstructionControlUnit::MemRawImemWord>(
+                    *image, address));
+        icu.configure_mem_raw_macro_imem(queueIndex, image->word_count());
+        return true;
+    }
+
+    for (std::size_t address = 0; address < image->word_count(); ++address) {
+        const auto word =
+            raw_imem_word<InstructionControlUnit::MxmRawImemWord>(
+                *image, address);
+        switch (queue.kind) {
+        case QueueKind::MxmLoad:
+            icu.write_mxm_load_raw_macro_imem(queueIndex, address, word);
+            break;
+        case QueueKind::MxmCompute:
+            icu.write_mxm_compute_raw_macro_imem(queueIndex, address, word);
+            break;
+        case QueueKind::MxmDequant:
+            icu.write_mxm_dequant_raw_macro_imem(queueIndex, address, word);
+            break;
+        case QueueKind::Mem:
+        case QueueKind::Vxm:
+        case QueueKind::SxmTranspose:
+        case QueueKind::SxmPermute:
+            throw std::logic_error(
+                "unsupported queue kind for MXM Macro raw i-MEM");
+        }
+    }
+    switch (queue.kind) {
+    case QueueKind::MxmLoad:
+        icu.configure_mxm_load_raw_macro_imem(
+            queueIndex, image->word_count());
+        break;
+    case QueueKind::MxmCompute:
+        icu.configure_mxm_compute_raw_macro_imem(
+            queueIndex, image->word_count());
+        break;
+    case QueueKind::MxmDequant:
+        icu.configure_mxm_dequant_raw_macro_imem(
+            queueIndex, image->word_count());
+        break;
+    case QueueKind::Mem:
+    case QueueKind::Vxm:
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute:
+        throw std::logic_error(
+            "unsupported queue kind for MXM Macro raw i-MEM");
+    }
+    return true;
+}
+
 } // namespace
 
 const char* queue_kind_name(QueueKind kind)
@@ -496,49 +632,21 @@ bool IcuProgram::empty() const
     return true;
 }
 
-void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
-                                  InstructionControlUnit& icu,
-                                  std::size_t logical_mxms_per_hemisphere)
+std::size_t load_queue_programs_into_icu(
+    const std::vector<QueueProgram>& queues,
+    InstructionControlUnit& icu,
+    std::size_t logical_mxms_per_hemisphere)
 {
     for (const auto& source_queue : queues) {
-        QueueProgram decoded_physical_queue;
-        const QueueProgram* queue_pointer = &source_queue;
-        if (source_queue.kind == QueueKind::Mem &&
-            !source_queue.commands.empty() &&
-            std::all_of(
-                source_queue.commands.begin(), source_queue.commands.end(),
-                [](const QueueCommand& command) {
-                    return is_macro_schedule_command(command) &&
-                           command.instruction_kind == InstructionKind::Mem;
-                })) {
-            // Exercise the exact target bitstream decoder on the CModel path;
-            // the distributed ICU then models the decoded finite Macro
-            // contexts and issue timing.
-            decoded_physical_queue = decode_mem_macro_imem(
-                pack_mem_macro_imem(encode_mem_macro_bitstream(source_queue)),
-                source_queue.index);
-            queue_pointer = &decoded_physical_queue;
-        } else if ((source_queue.kind == QueueKind::MxmLoad ||
-                    source_queue.kind == QueueKind::MxmCompute ||
-                    source_queue.kind == QueueKind::MxmDequant) &&
-                   !source_queue.commands.empty() &&
-                   std::all_of(source_queue.commands.begin(),
-                               source_queue.commands.end(),
-                               [&](const QueueCommand& command) {
-                                   const auto expected =
-                                       source_queue.kind ==
-                                               QueueKind::MxmDequant
-                                           ? InstructionKind::MxmDequant
-                                           : InstructionKind::Mxm;
-                                   return is_macro_schedule_command(command) &&
-                                          command.instruction_kind == expected;
-                               })) {
-            decoded_physical_queue = decode_mxm_macro_imem(
-                pack_mxm_macro_imem(encode_mxm_macro_bitstream(source_queue)),
-                source_queue.kind, source_queue.index);
-            queue_pointer = &decoded_physical_queue;
-        }
-        const auto& queue = *queue_pointer;
+        // Independent Macro QueueMode: runtime writes the physical 96/128-bit
+        // image and CModel alone decodes it into active contexts/calendar.
+        // Packed .ftlpu images are reused bit-for-bit unless relocation has
+        // invalidated the cached image.
+        if (load_raw_macro_queue(
+                source_queue, icu, logical_mxms_per_hemisphere))
+            continue;
+
+        const auto& queue = source_queue;
         if (queue.commands.empty())
             continue;
         const std::size_t queue_index = physical_queue_index(
@@ -938,6 +1046,7 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
             }
         }
     }
+    return icu.prime_raw_macro_frontends();
 }
 
 void IcuProgram::check_mem_column(std::size_t column) const

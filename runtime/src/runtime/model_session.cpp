@@ -120,6 +120,7 @@ BinaryProgram parameterize_program(const ModelPackage &package,
       command.words[0] = static_cast<std::uint32_t>(
           isa::encode_mxm_dequant_instruction(MxmDequantInstruction::Scale(
               tensor.scales[relocation.scale_index])));
+      queue->packed_macro_imem.reset();
       continue;
     }
     if (command.instruction_kind != InstructionKind::Vxm ||
@@ -223,6 +224,7 @@ BinaryProgram parameterize_program(const ModelPackage &package,
         entry.instruction.address =
             relocate_address(entry.instruction.address);
       command = encode_mem_slice_program_command(sliceProgram);
+      queue->packed_macro_imem.reset();
       continue;
     }
     if (command.instruction_kind != InstructionKind::Mem ||
@@ -241,6 +243,7 @@ BinaryProgram parameterize_program(const ModelPackage &package,
     command.words[1] = static_cast<std::uint32_t>(patched >> 32);
     command.word_count =
         static_cast<std::uint16_t>((patched >> 32) == 0 ? 1 : 2);
+    queue->packed_macro_imem.reset();
   }
   for (const SessionInputPlan &input : invocation_plan.inputs) {
     if (input.transfer != SessionTransferKind::Resident)

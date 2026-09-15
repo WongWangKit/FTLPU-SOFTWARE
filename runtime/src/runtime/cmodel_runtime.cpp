@@ -417,13 +417,13 @@ void CModelRuntime::load(const BinaryProgram& program)
     for (std::size_t block = 0; block < 8; ++block)
         system_.configure_vxm_output_block_destination(block,
             block < 4 ? Hemisphere::West : Hemisphere::East);
-    load_queue_programs_into_icu(program.queues, system_.icu(),
+    instruction_prefill_cycles_ = load_queue_programs_into_icu(
+        program.queues, system_.icu(),
         program.hardware.mxms_per_hemisphere);
-    instruction_prefill_cycles_ = 0;
     if (c2c_system_ != nullptr) {
         constexpr auto kInstructionImageBase =
             std::uint64_t {0x1'0000'0000};
-        instruction_prefill_cycles_ =
+        instruction_prefill_cycles_ +=
             stage_and_prime_icu_programs_if_supported(
                 *c2c_system_, kInstructionImageBase);
     }
@@ -1449,7 +1449,17 @@ void CModelRuntime::print_icu_frontend_performance(std::ostream& os) const
        << " issued_instructions=" << statistics.issued_instructions
        << " macro_queues=" << statistics.macro_queues
        << " peak_macro_contexts_per_queue="
-       << statistics.peak_macro_contexts_per_queue << '\n';
+       << statistics.peak_macro_contexts_per_queue
+       << " decoded_macro_contexts="
+       << statistics.decoded_macro_contexts
+       << " macro_decoder_bit_wait_cycles="
+       << statistics.macro_decoder_bit_wait_cycles
+       << " macro_decoder_context_stall_cycles="
+       << statistics.macro_decoder_context_stall_cycles
+       << " peak_macro_reservoir_bits="
+       << statistics.peak_macro_reservoir_bits
+       << " instruction_prefill_cycles="
+       << instruction_prefill_cycles_ << '\n';
 }
 
 } // namespace ftlpu::software::runtime

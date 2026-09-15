@@ -441,17 +441,36 @@ try {
                   {3, 3, 4, 1, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}),
         }});
     executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::MxmLoad,
+        0,
+        {macro(ftlpu::MxmControlInstruction::IW(0, 1),
+               {4, 2, 3, 1, 1, 1, 0,
+                ftlpu::IcuInductionTarget::MxmWeightColumn})}});
+    executionProgram.queues.push_back(rt::QueueProgram{
         rt::QueueKind::MxmCompute,
         0,
         {macro(ftlpu::MxmControlInstruction::Compute(0, 0, 0, 10),
                {2, 2, 3, 1, 2, 8, 10,
                 ftlpu::IcuInductionTarget::MxmAccumulatorAddress})}});
+    executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::MxmDequant,
+        0,
+        {macro(ftlpu::MxmDequantInstruction::ScaleBits(0x3f80),
+               {1, 1, 1, 0, 1, 1, 0,
+                ftlpu::IcuInductionTarget::None})}});
 
     std::stringstream binary(std::ios::in | std::ios::out | std::ios::binary);
     rt::write_binary_program(executionProgram, binary);
     binary.seekg(0);
     const auto restoredProgram = rt::read_binary_program(binary);
-    for (const auto& restoredQueue : restoredProgram.queues)
+    for (const auto& restoredQueue : restoredProgram.queues) {
+        expect(restoredQueue.packed_macro_imem.has_value(),
+               "binary reader did not retain the packed Macro i-MEM image");
+        expect(restoredQueue.packed_macro_imem->word_bits ==
+                   (restoredQueue.kind == rt::QueueKind::Mem
+                        ? rt::kMemIcuImemWordBits
+                        : rt::kMxmIcuImemWordBits),
+               "retained Macro image has the wrong physical word width");
         for (const auto& command : restoredQueue.commands) {
             expect(rt::is_macro_schedule_command(command),
                    "2-D Macro changed representation during binary round-trip");
@@ -459,30 +478,78 @@ try {
                        !rt::is_mxm_stream_nd_command(command),
                    "2-D Macro unexpectedly became STREAM_ND");
         }
+    }
 
     ftlpu::InstructionControlUnit icu;
-    rt::load_queue_programs_into_icu(restoredProgram.queues, icu);
+    const auto prefillCycles =
+        rt::load_queue_programs_into_icu(restoredProgram.queues, icu);
+    expect(prefillCycles != 0,
+           "runtime did not schedule the finite-bandwidth Macro decoder");
+    expect(icu.mem_iq(0).raw_macro_mode()
+               && icu.mxm_load_iq(0).raw_macro_mode()
+               && icu.mxm_compute_iq(0).raw_macro_mode()
+               && icu.mxm_dequant_iq(0).raw_macro_mode(),
+           "runtime bypassed the CModel raw Macro frontend");
     std::vector<std::pair<std::size_t, std::size_t>> memIssues;
+    std::vector<std::pair<std::size_t, std::size_t>> mxmLoadIssues;
     std::vector<std::pair<std::size_t, std::size_t>> mxmIssues;
+    std::vector<std::pair<std::size_t, std::uint16_t>> dequantIssues;
     for (std::size_t cycle = 0; cycle <= executionProgram.max_cycle; ++cycle) {
         if (const auto issued = icu.mem_iq(0).tick())
             memIssues.emplace_back(cycle, issued->address);
+        if (const auto issued = icu.mxm_load_iq(0).tick())
+            mxmLoadIssues.emplace_back(cycle, issued->weight_column);
         if (const auto issued = icu.mxm_compute_iq(0).tick())
             mxmIssues.emplace_back(cycle, issued->accumulator_address);
+        if (const auto issued = icu.mxm_dequant_iq(0).tick())
+            dequantIssues.emplace_back(cycle, issued->scale_bf16);
     }
     expect(
         memIssues ==
             std::vector<std::pair<std::size_t, std::size_t>>{
                 {2, 100}, {3, 200}, {6, 101}, {7, 201}, {10, 102}, {11, 202}},
         "runtime/CModel MEM Macro emitted incorrect cycles or addresses");
+    expect(mxmLoadIssues ==
+               std::vector<std::pair<std::size_t, std::size_t>>{
+                   {4, 1}, {7, 2}},
+           "runtime/CModel MXM-load Macro emitted incorrect cycles or columns");
     expect(mxmIssues ==
                std::vector<std::pair<std::size_t, std::size_t>>{
                    {2, 10}, {5, 11}, {10, 20}, {13, 21}},
            "runtime/CModel MXM Macro emitted incorrect cycles or accumulators");
+    expect(dequantIssues ==
+               std::vector<std::pair<std::size_t, std::uint16_t>>{
+                   {1, 0x3f80}},
+           "runtime/CModel dequant Macro emitted an incorrect scale");
     expect(icu.mem_iq(0).peak_active_macros() == 2,
            "runtime/CModel did not model interleaved finite Macro contexts");
-    expect(icu.mem_iq(0).done() && icu.mxm_compute_iq(0).done(),
+    expect(icu.mem_iq(0).macro_decoder_statistics().decoded_contexts == 2 &&
+               icu.mxm_load_iq(0)
+                       .macro_decoder_statistics()
+                       .decoded_contexts == 1 &&
+               icu.mxm_compute_iq(0)
+                       .macro_decoder_statistics()
+                       .decoded_contexts == 1 &&
+               icu.mxm_dequant_iq(0)
+                       .macro_decoder_statistics()
+                       .decoded_contexts == 1,
+           "CModel Macro decoder did not enqueue every physical context");
+    expect(icu.mem_iq(0).done() && icu.mxm_load_iq(0).done()
+               && icu.mxm_compute_iq(0).done()
+               && icu.mxm_dequant_iq(0).done(),
            "runtime/CModel Macro queues did not complete");
+
+    // A corrupt retained physical image must reach the CModel decoder. If the
+    // runtime silently re-encoded semantic QueueCommands this would pass.
+    auto corruptProgram = restoredProgram;
+    corruptProgram.queues.front().packed_macro_imem->bytes[3] |= 0x80u;
+    ftlpu::InstructionControlUnit corruptIcu;
+    expect_throw(
+        [&]() {
+            (void)rt::load_queue_programs_into_icu(
+                corruptProgram.queues, corruptIcu);
+        },
+        "runtime did not forward the retained raw Macro image to CModel");
 
     std::cout << "macro_bitstream_test passed: bits="
               << image.stats.physical_bits() << '\n';

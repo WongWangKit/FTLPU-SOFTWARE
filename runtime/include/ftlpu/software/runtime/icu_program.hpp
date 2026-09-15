@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -41,6 +42,21 @@ struct QueueCommand {
     // MEM/MXM/VXM fit in the fixed header. Extended ICU descriptors and SXM's
     // variable stream/lane maps use this trailing payload.
     std::vector<std::uint32_t> extension_words{};
+};
+
+// Word-aligned physical i-MEM bytes retained by the binary reader for an
+// all-Macro queue. software_valid_bit_length is file/container metadata: it
+// includes word 0 and the meaningful payload bits, but excludes final word
+// padding. Runtime writes bytes to CModel in lane/bit-low-first order.
+struct PackedMacroImemImage {
+    std::uint32_t word_bits{0};
+    std::uint64_t software_valid_bit_length{0};
+    std::vector<std::uint8_t> bytes{};
+
+    std::size_t word_count() const
+    {
+        return word_bits == 0 ? 0 : bytes.size() * 8 / word_bits;
+    }
 };
 
 inline constexpr std::uint32_t kIcuMacroScheduleMagic = 0x4d414352u;
@@ -705,6 +721,9 @@ struct QueueProgram {
     QueueKind kind{QueueKind::Mem};
     std::size_t index{0};
     std::vector<QueueCommand> commands{};
+    // Present when this QueueProgram came from a packed-Macro .ftlpu record.
+    // Any operation that mutates a command must reset this cached image.
+    std::optional<PackedMacroImemImage> packed_macro_imem{};
 };
 
 class IcuProgram {
@@ -772,7 +791,7 @@ private:
 };
 
 const char* queue_kind_name(QueueKind kind);
-void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
+std::size_t load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
     InstructionControlUnit& icu,
     std::size_t logical_mxms_per_hemisphere = hw::kMxmsPerHemisphere);
 
