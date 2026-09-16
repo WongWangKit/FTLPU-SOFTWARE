@@ -88,8 +88,10 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const bool paged_weights = weight_bank >= 0;
     const int64_t scratch_bank = paged_weights
         ? (weight_bank + 1) % target.memory().banks_per_slice : 0;
-    const int64_t secondary_scratch_bank = paged_weights
-        ? weight_bank : scratch_bank;
+    const int64_t secondary_scratch_bank =
+        target.memory().banks_per_slice > 1
+        ? (scratch_bank + 1) % target.memory().banks_per_slice
+        : scratch_bank;
     const auto weight_slices = paged_weights
         ? target.page_resident_attention_weight_slices()
         : target.attention_weight_slices();
@@ -214,14 +216,46 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         query_base + query_rows, rope_product_base + rope_product_rows);
     const int64_t causal_mask_base = target.uses_dedicated_slice_roles()
         ? rope_rows : target.attention_mask_base_row();
+    const auto input_staging_values = target.uses_dedicated_slice_roles()
+        ? target.activation_storage_slices() : planar_activation_slices;
+    const auto input_staging_begin = direct_rope_streaming
+        ? input_staging_values.end() - 2
+        : compact_rope_products
+            ? input_staging_values.begin() + 8
+            : input_staging_values.begin();
+    const auto input_staging_end = input_staging_begin + 2;
+    const llvm::SmallVector<int64_t, 16> input_staging_slices(
+        input_staging_begin, input_staging_end);
+    const int64_t input_staging_bank = scratch_bank;
+    llvm::SmallVector<int64_t, 4> rope_table_slices;
+    llvm::SmallVector<int64_t, 4> rope_mirror_slices;
+    int64_t rope_table_bank = compact_rope_products
+        ? secondary_scratch_bank : scratch_bank;
+    int64_t rope_mirror_bank = compact_rope_products
+        ? scratch_bank : rope_table_bank;
+    const auto rope_slices = target.attention_rope_slices();
+    rope_table_slices.assign(rope_slices.begin(), rope_slices.end());
+    if (compact_rope_products) {
+        const auto storage = target.activation_storage_slices();
+        rope_mirror_slices.assign(storage.begin(), storage.begin() + 4);
+    } else {
+        rope_mirror_slices = rope_table_slices;
+    }
+    const bool rope_mirror_overlaps_input_staging =
+        compact_rope_products
+        && rope_mirror_bank == input_staging_bank
+        && llvm::any_of(rope_mirror_slices, [&](int64_t slice) {
+               return llvm::is_contained(input_staging_slices, slice);
+           })
+        && rope_mirror_base < input_staging_base + input_staging_rows
+        && input_staging_base < rope_mirror_base + rope_rows;
     if (value_base + value_rows
             > target.memory().words_per_bank
         || rope_staging_base + rope_staging_rows
             > target.memory().words_per_bank
         || rope_product_base + rope_product_rows
             > target.memory().words_per_bank
-        || (compact_rope_products
-            && rope_mirror_base + rope_rows > input_staging_base)
+        || rope_mirror_overlaps_input_staging
         || causal_mask_base + tile > input_staging_base) {
         op.emitError(
             "attention activation scratch does not fit around persistent "
@@ -264,17 +298,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // Keep bias on the opposite bank so each cycle can fetch both operands
     // without asking one SRAM read port for two addresses.
     const int64_t projection_bias_bank = scratch_bank;
-    const int64_t input_staging_bank = scratch_bank;
-    const auto input_staging_values = target.uses_dedicated_slice_roles()
-        ? target.activation_storage_slices() : planar_activation_slices;
-    const auto input_staging_begin = direct_rope_streaming
-        ? input_staging_values.end() - 2
-        : compact_rope_products
-            ? input_staging_values.begin() + 8
-            : input_staging_values.begin();
-    const auto input_staging_end = input_staging_begin + 2;
-    const llvm::SmallVector<int64_t, 16> input_staging_slices(
-        input_staging_begin, input_staging_end);
     if (mlir::failed(physical_allocator.reserve({"input_staging",
             input_staging_slices, input_staging_base,
             input_staging_rows, 0, 2, true, input_staging_bank}))) {
@@ -343,20 +366,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         probability_diagonal_slices.assign(values.begin(), values.end());
     }
     const int64_t probability_diagonal_bank = scratch_bank;
-    llvm::SmallVector<int64_t, 4> rope_table_slices;
-    llvm::SmallVector<int64_t, 4> rope_mirror_slices;
-    int64_t rope_table_bank = compact_rope_products
-        ? secondary_scratch_bank : scratch_bank;
-    int64_t rope_mirror_bank = compact_rope_products
-        ? scratch_bank : rope_table_bank;
-    const auto rope_slices = target.attention_rope_slices();
-    rope_table_slices.assign(rope_slices.begin(), rope_slices.end());
-    if (compact_rope_products) {
-        const auto storage = target.activation_storage_slices();
-        rope_mirror_slices.assign(storage.begin(), storage.begin() + 4);
-    } else {
-        rope_mirror_slices = rope_table_slices;
-    }
     if (mlir::failed(physical_allocator.reserve({"rope_staging",
             rope_staging_slices, rope_staging_base,
             rope_staging_rows, 0, 2, true,
@@ -445,9 +454,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t fused_slice_base = target.uses_dedicated_slice_roles()
         ? activation_storage.front()
         : target.memory().slices_per_hemisphere - 16;
-    const int64_t fused_scratch_bank =
-        target.uses_dedicated_slice_roles()
-        ? secondary_scratch_bank : scratch_bank;
+    const int64_t fused_scratch_bank = scratch_bank;
     const llvm::SmallVector<int64_t, 16> fused_score0 {
         fused_slice_base, fused_slice_base + 1,
         fused_slice_base + 2, fused_slice_base + 3};
@@ -542,8 +549,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             live_start, live_end, scratch_banks);
     };
     // The final QK partial streams scores while the next wave reloads Query
-    // IW. Query's first rotary half is on scratch_bank, so keep tail-softmax
-    // scores on the other bank and let both MEM ICU queues run concurrently.
+    // IW from scratch_bank. Keep tail-softmax scores on the other bank so
+    // both MEM ICU queues can run concurrently.
     const llvm::SmallVector<int64_t, 1> qk_score_banks {
         secondary_scratch_bank};
     auto score0 = allocate_scratch_in_banks(
@@ -552,12 +559,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     auto score1 = allocate_scratch_in_banks(
         "score_mxm1", 4, score_base,
         score_rows, 2, 3, qk_score_banks);
-    auto exp0 = allocate_scratch(
-        "exp_mxm0", 4, score_base,
-        score_rows, 2, 3);
-    auto exp1 = allocate_scratch(
-        "exp_mxm1", 4, score_base,
-        score_rows, 2, 3);
     // The external activation binding is not owned by this local allocator
     // and occupies the activation plane at low rows. Keep persistent mask
     // initializers on the target's parameter slices so initialization cannot
@@ -577,6 +578,12 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     };
     auto mask0 = allocate_mask("causal_mask_mxm0", 0);
     auto mask1 = allocate_mask("causal_mask_mxm1", 2);
+    auto exp0 = allocate_scratch(
+        "exp_mxm0", 4, score_base,
+        score_rows, 2, 3);
+    auto exp1 = allocate_scratch(
+        "exp_mxm1", 4, score_base,
+        score_rows, 2, 3);
     const auto require_allocation = [&](bool allocated,
                                         llvm::StringRef name) {
         if (allocated) return mlir::success();
@@ -603,16 +610,20 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // time, so the probability-pack window must not reuse either input's MEM
     // slices on the same bank.  Prefer activation slices, then use otherwise
     // idle weight-role slices when weights live in a separate bank.
+    const int64_t probability_pack_target_bank = secondary_scratch_bank;
     llvm::SmallVector<int64_t, 64> probability_pack_candidates(
         activation_storage.begin(), activation_storage.end());
-    if (paged_weights && target.uses_dedicated_slice_roles()) {
+    const int64_t resident_weight_bank = std::max<int64_t>(0, weight_bank);
+    if (target.uses_dedicated_slice_roles()
+        && (paged_weights
+            || probability_pack_target_bank != resident_weight_bank)) {
         const auto weight_storage = target.weight_storage_slices();
         probability_pack_candidates.append(
             weight_storage.begin(), weight_storage.end());
     }
     llvm::SmallVector<int64_t, 32> probability_pack_excluded;
     const auto exclude_softmax_input = [&](const auto& allocation) {
-        if (allocation->bank != scratch_bank) return;
+        if (allocation->bank != probability_pack_target_bank) return;
         for (int64_t slice : allocation->slices)
             if (!llvm::is_contained(probability_pack_excluded, slice))
                 probability_pack_excluded.push_back(slice);
@@ -623,13 +634,26 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     exclude_softmax_input(exp1);
     // The pack-to-diagonal transpose pipelines reads and writes across its
     // nominal phase boundary.  Keep those slice sets disjoint as well.
-    for (int64_t slice : probability_diagonal_slices)
-        if (!llvm::is_contained(probability_pack_excluded, slice))
-            probability_pack_excluded.push_back(slice);
+    if (probability_diagonal_bank == probability_pack_target_bank) {
+        for (int64_t slice : probability_diagonal_slices)
+            if (!llvm::is_contained(probability_pack_excluded, slice))
+                probability_pack_excluded.push_back(slice);
+    }
+    const int64_t probability_pack_base =
+        target.attention_probability_pack_base_row();
+    const bool probability_pack_overlaps_value_rows =
+        probability_pack_base < value_base + value_rows
+        && value_base < probability_pack_base + probability_pack_rows;
+    if (value_bank == probability_pack_target_bank
+        && probability_pack_overlaps_value_rows) {
+        for (int64_t slice : target.attention_value_slices())
+            if (!llvm::is_contained(probability_pack_excluded, slice))
+                probability_pack_excluded.push_back(slice);
+    }
     const llvm::SmallVector<int64_t, 1> probability_pack_banks {
-        scratch_bank};
+        probability_pack_target_bank};
     auto probability_pack = physical_allocator.allocate({"probability_pack",
-        16, target.attention_probability_pack_base_row(),
+        16, probability_pack_base,
         probability_pack_rows, 3, 4, probability_pack_candidates,
         true, probability_pack_banks, probability_pack_excluded});
     if (mlir::failed(probability_pack)) {

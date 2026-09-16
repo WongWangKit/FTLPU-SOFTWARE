@@ -355,9 +355,12 @@ try {
     if (argc != 2)
         throw std::runtime_error(
             "usage: compiled_decoder_layer_runtime_test program.ftlpu");
-    const auto program =
+    auto program =
         ftlpu::software::runtime::read_binary_program(
             std::filesystem::path(argv[1]));
+    if (std::getenv("FTLPU_DISABLE_RAW_MACRO_IMEM"))
+        for (auto& queue : program.queues)
+            queue.packed_macro_imem.reset();
     const auto expectedAbi =
         ftlpu::software::runtime::executable_target_abi(
             program.hardware);
@@ -701,6 +704,95 @@ try {
     runtime.run_cycles(
         qkvEndCycle - attentionPrepackEndCycle,
         scopedCmodelLog ? nullptr : cmodelLogSink);
+    // Validate the compact RoPE output at the exact physical locations that
+    // feed QK.  This catches layout or lifetime failures before QK/softmax
+    // can turn them into an opaque probability mismatch.
+    const std::size_t blocksPerRotaryHalf =
+        std::max<std::size_t>(1, kHeadBlocks / 2);
+    const std::size_t distributedInputRows =
+        kSeqLen * kHidden / (32 * 8);
+    const std::size_t scoreRows =
+        kQueryHeads * kTokenBlocks * kSeqLen;
+    const std::size_t queryIwBase = distributedInputRows + scoreRows;
+    float queryRopePhysicalMaxError = 0.0f;
+    float keyRopePhysicalMaxError = 0.0f;
+    std::array<std::size_t, 3> queryRopePhysicalLocation {};
+    std::array<std::size_t, 3> keyRopePhysicalLocation {};
+    std::array<float, 2> queryRopePhysicalValues {};
+    std::array<float, 2> keyRopePhysicalValues {};
+    std::vector<float> qkCheckpointQuery(inputValues.size(), 0.0f);
+    std::vector<float> qkCheckpointKey(inputValues.size(), 0.0f);
+    for (std::size_t token = 0; token < kSeqLen; ++token) {
+        for (std::size_t column = 0; column < kHidden; ++column)
+            qkCheckpointQuery[token * kHidden + column] = bf16(
+                normalized0[token * kHidden + sourceHidden(0, column)]
+                * projectionSign(0, column));
+        for (std::size_t column = 0;
+             column < kKvHeads * kHeadDim; ++column)
+            qkCheckpointKey[token * kHidden + column] = bf16(
+                normalized0[token * kHidden + sourceHidden(1, column)]
+                * projectionSign(1, column));
+    }
+    for (std::size_t token = 0; token < kSeqLen; ++token) {
+        const std::size_t tokenLane = token % 8;
+        const std::size_t tokenWave = (token % 32) / 8;
+        const std::size_t tokenBlock = token / 32;
+        for (std::size_t head = 0; head < kQueryHeads; ++head) {
+            for (std::size_t dimension = 0;
+                 dimension < kHeadDim; ++dimension) {
+                const std::size_t reduction = dimension / 32;
+                const std::size_t address = queryIwBase
+                    + ((head * blocksPerRotaryHalf
+                           + reduction % blocksPerRotaryHalf)
+                          * kTokenBlocks
+                        + tokenBlock)
+                        * 4
+                    + tokenWave;
+                const float actual = physicalBf16(
+                    ftlpu::Hemisphere::East,
+                    2 * tokenLane, 2 * tokenLane + 1, address,
+                    dimension % 32,
+                    reduction / blocksPerRotaryHalf);
+                const float expected = ropeValue(
+                    qkCheckpointQuery, token, head, dimension);
+                const float error = std::fabs(actual - expected);
+                if (error > queryRopePhysicalMaxError) {
+                    queryRopePhysicalMaxError = error;
+                    queryRopePhysicalLocation = {token, head, dimension};
+                    queryRopePhysicalValues = {actual, expected};
+                }
+            }
+        }
+        for (std::size_t head = 0; head < kKvHeads; ++head) {
+            for (std::size_t dimension = 0;
+                 dimension < kHeadDim; ++dimension) {
+                const std::size_t reduction = dimension / 32;
+                const float actual = physicalBf16(
+                    ftlpu::Hemisphere::East, 16 + 2 * reduction,
+                    17 + 2 * reduction,
+                    head * blocksPerRotaryHalf * kSeqLen + token,
+                    dimension % 32, 1);
+                const float expected = ropeValue(
+                    qkCheckpointKey, token, head, dimension);
+                const float error = std::fabs(actual - expected);
+                if (error > keyRopePhysicalMaxError) {
+                    keyRopePhysicalMaxError = error;
+                    keyRopePhysicalLocation = {token, head, dimension};
+                    keyRopePhysicalValues = {actual, expected};
+                }
+            }
+        }
+    }
+    if (queryRopePhysicalMaxError > 0.04f
+        || keyRopePhysicalMaxError > 0.04f)
+        throw std::logic_error(
+            "QK physical RoPE input mismatch query_error="
+            + std::to_string(queryRopePhysicalMaxError)
+            + " query_location=" + arrayValues(queryRopePhysicalLocation)
+            + " query_values=" + arrayValues(queryRopePhysicalValues)
+            + " key_error=" + std::to_string(keyRopePhysicalMaxError)
+            + " key_location=" + arrayValues(keyRopePhysicalLocation)
+            + " key_values=" + arrayValues(keyRopePhysicalValues));
     const auto valueBinding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
         [](const auto& binding) {
@@ -729,6 +821,7 @@ try {
             static_cast<std::size_t>(valueBinding->base_row)
             + (head * kHeadBlocks + headBlock)
                 * kTokenBlocks * kTileRows
+            + (token / 32) * kTileRows
             + (token % 32) / 8;
         return physicalBf16(hemisphere,
             valueBinding->slices[sliceGroup + packedStream],
@@ -989,6 +1082,8 @@ try {
     std::vector<float> checkpointContext(inputValues.size(), 0.0f);
     std::vector<float> checkpointScores(kSeqLen);
     std::vector<float> checkpointProbabilities(kSeqLen);
+    std::vector<float> hostAttentionProbabilities(
+        kQueryHeads * kSeqLen * kSeqLen, 0.0f);
     for (std::size_t query = 0; query < kSeqLen; ++query) {
         for (std::size_t queryHead = 0;
              queryHead < kQueryHeads; ++queryHead) {
@@ -1017,6 +1112,10 @@ try {
             for (std::size_t key = 0; key <= query; ++key)
                 checkpointProbabilities[key] = bf16(
                     checkpointProbabilities[key] / denominator);
+            for (std::size_t key = 0; key <= query; ++key)
+                hostAttentionProbabilities[
+                    (queryHead * kSeqLen + query) * kSeqLen + key] =
+                    checkpointProbabilities[key];
             for (std::size_t dimension = 0;
                  dimension < kHeadDim; ++dimension) {
                 float context = 0.0f;
@@ -1056,6 +1155,9 @@ try {
     const std::size_t probabilityBaseRow =
         static_cast<std::size_t>(
             probabilityDiagonalBinding->base_row);
+    float hostProbabilityMaxError = 0.0f;
+    std::array<std::size_t, 3> hostProbabilityMaxLocation {};
+    std::array<float, 2> hostProbabilityMaxValues {};
     const std::size_t pvEndCycle =
         static_cast<std::size_t>(timeline(program, "o_proj").start_cycle);
     constexpr std::size_t kCheckpointDrainCycles = 64;
@@ -1108,6 +1210,16 @@ try {
                         probabilitySlices[queryRow * 2],
                         probabilitySlices[queryRow * 2 + 1], address,
                         key % 32, probabilityDiagonalBinding->bank);
+                    const float hostProbability = hostAttentionProbabilities[
+                        (head * kSeqLen + query) * kSeqLen + key];
+                    const float hostProbabilityError =
+                        std::fabs(probability - hostProbability);
+                    if (hostProbabilityError > hostProbabilityMaxError) {
+                        hostProbabilityMaxError = hostProbabilityError;
+                        hostProbabilityMaxLocation = {query, head, key};
+                        hostProbabilityMaxValues = {
+                            probability, hostProbability};
+                    }
                     context += probability
                         * checkpointValue[key * kHidden
                             + kvHead * kHeadDim + dimension];
@@ -1645,6 +1757,50 @@ try {
                     + " expected=" + std::to_string(expected)
                     + " h0=" + std::to_string(h0)
                     + " h1=" + std::to_string(h1)
+                    + " hidden0.owner=" + std::to_string(
+                        physicalBf16(owner, rms2Binding->slices[0],
+                            rms2Binding->slices[1],
+                            rms2BaseRow + rms2Binding->instruction_count
+                                + (h0 / 64) * kSeqLen + row,
+                            h0 % 32, rms2Binding->bank))
+                    + " hidden1.owner=" + std::to_string(
+                        physicalBf16(owner, rms2Binding->slices[2],
+                            rms2Binding->slices[3],
+                            rms2BaseRow + rms2Binding->instruction_count
+                                + (h1 / 64) * kSeqLen + row,
+                            h1 % 32, rms2Binding->bank))
+                    + " hidden0.replica=" + std::to_string(
+                        physicalBf16(replica, rms2Binding->slices[0],
+                            rms2Binding->slices[1],
+                            rms2BaseRow + rms2Binding->instruction_count
+                                + (h0 / 64) * kSeqLen + row,
+                            h0 % 32, rms2Binding->bank))
+                    + " hidden1.replica=" + std::to_string(
+                        physicalBf16(replica, rms2Binding->slices[2],
+                            rms2Binding->slices[3],
+                            rms2BaseRow + rms2Binding->instruction_count
+                                + (h1 / 64) * kSeqLen + row,
+                            h1 % 32, rms2Binding->bank))
+                    + " hidden0.expected="
+                        + std::to_string(hiddenValue(row, h0))
+                    + " hidden1.expected="
+                        + std::to_string(hiddenValue(row, h1))
+                    + " gate1.temp=" + std::to_string(
+                        physicalBf16(ftlpu::Hemisphere::East, 0, 1,
+                            ((1 * (kSeqLen / 32) + row / 32) * 32)
+                                + row % 32,
+                            h1 % 32, 0))
+                    + " up1.temp=" + std::to_string(
+                        physicalBf16(ftlpu::Hemisphere::East, 8, 9,
+                            ((1 * (kSeqLen / 32) + row / 32) * 32)
+                                + row % 32,
+                            h1 % 32, 0))
+                    + " gate1.expected=" + std::to_string(
+                        rms2Output[row * kHidden + gateK(h1)]
+                            * gateSign(h1))
+                    + " up1.expected=" + std::to_string(
+                        rms2Output[row * kHidden + upK(h1)]
+                            * upSign(h1))
                     + " bank="
                     + std::to_string(ffnBinding->bank)
                     + " base_row="
@@ -1689,6 +1845,8 @@ try {
     std::vector<float> scores(kSeqLen);
     std::vector<float> probabilities(kSeqLen);
     float hostAttentionContextMaxError = 0.0f;
+    std::array<std::size_t, 3> hostAttentionContextMaxLocation {};
+    std::array<float, 2> hostAttentionContextMaxValues {};
     for (std::size_t query = 0; query < kSeqLen; ++query) {
         for (std::size_t queryHead = 0;
              queryHead < kQueryHeads; ++queryHead) {
@@ -1731,10 +1889,15 @@ try {
         }
         for (std::size_t column = 0; column < kHidden; ++column) {
             const std::size_t index = query * kHidden + column;
-            hostAttentionContextMaxError = std::max(
-                hostAttentionContextMaxError,
-                std::fabs(attentionContext[index]
-                    - checkpointContext[index]));
+            const float contextError = std::fabs(
+                attentionContext[index] - checkpointContext[index]);
+            if (contextError > hostAttentionContextMaxError) {
+                hostAttentionContextMaxError = contextError;
+                hostAttentionContextMaxLocation = {
+                    query, column / kHeadDim, column % kHeadDim};
+                hostAttentionContextMaxValues = {
+                    checkpointContext[index], attentionContext[index]};
+            }
             // QK is accumulated in 32x32 hardware blocks, so its FP32 add
             // order differs from the linear host loop above. Use the actual
             // BF16 probability SRAM golden for strict downstream checks.
@@ -1758,7 +1921,15 @@ try {
     if (hostAttentionContextMaxError > 0.1f)
         throw std::logic_error(
             "host/hardware attention context drift max_error="
-            + std::to_string(hostAttentionContextMaxError));
+            + std::to_string(hostAttentionContextMaxError)
+            + " location=" + arrayValues(hostAttentionContextMaxLocation)
+            + " values=" + arrayValues(hostAttentionContextMaxValues)
+            + " probability_max_error="
+                + std::to_string(hostProbabilityMaxError)
+            + " probability_location="
+                + arrayValues(hostProbabilityMaxLocation)
+            + " probability_values="
+                + arrayValues(hostProbabilityMaxValues));
     float attentionResidualMaxError = 0.0f;
     std::size_t residualMaxRow = 0;
     std::size_t residualMaxColumn = 0;
@@ -1915,6 +2086,14 @@ try {
             + " final.west=" + std::to_string(physicalBf16(
                 ftlpu::Hemisphere::West, 32, 33, 0, 0)));
     }
+    const auto icuFrontend = runtime.icu_frontend_statistics();
+    if (icuFrontend.macro_queues == 0
+        || icuFrontend.decoded_macro_contexts == 0
+        || runtime.instruction_prefill_cycles() == 0) {
+        throw std::logic_error(
+            "decoder layer did not exercise the raw Macro iMEM frontend");
+    }
+    runtime.print_icu_frontend_performance(std::cout);
     std::cout << "Complete " FTLPU_TEST_MODEL_NAME
                  " decoder layer passed: "
               << kSeqLen * kHidden << " BF16 values, nonzero="

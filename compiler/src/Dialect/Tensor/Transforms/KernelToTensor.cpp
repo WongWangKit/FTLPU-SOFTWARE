@@ -143,14 +143,13 @@ public:
             const std::size_t pairCount = constantSlices.size() / 2;
             llvm::SmallVector<int64_t> nextRows(
                 pairCount, target.memory().words_per_bank);
-            // Attention keeps the direct-stream RoPE table in the weight
-            // bank. Put eagerly uploaded gamma constants in the opposite
-            // activation bank so host initialization cannot overwrite either
-            // constant before execution begins.
-            const int64_t constantBank = target.memory().banks_per_slice > 1
-                ? (std::max<int64_t>(0, weight_bank_) + 1)
-                    % target.memory().banks_per_slice
-                : 0;
+            // Compact Attention places its primary RoPE table in the
+            // secondary activation bank.  Keep eagerly uploaded gamma
+            // constants in the weight bank; their dedicated activation
+            // slice pair is disjoint from resident weight slices, and this
+            // prevents initialization from overwriting the RoPE rows.
+            const int64_t constantBank =
+                std::max<int64_t>(0, weight_bank_);
             for (kernel::RmsNormOp rmsNorm : llvm::reverse(rmsNorms)) {
                 if (feedbackRmsWeightPlacements.contains(rmsNorm.getWeight()))
                     continue;

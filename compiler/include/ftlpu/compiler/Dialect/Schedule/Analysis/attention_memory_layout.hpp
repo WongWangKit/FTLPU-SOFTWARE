@@ -167,6 +167,7 @@ private:
     std::array<int64_t, 16> ropeStagingSlices_ {};
     llvm::SmallVector<int64_t, 16> ropeProductSlices_;
     llvm::SmallVector<int64_t, 4> ropeProductKeySlices_;
+    int64_t ropeProductKeyBase_ = 0;
     int64_t ropeProductKeyBank_ = -1;
     bool ropeProductBankInterleaved_ = false;
     // Each local MXM owns an independent softmax scratch plane. This permits

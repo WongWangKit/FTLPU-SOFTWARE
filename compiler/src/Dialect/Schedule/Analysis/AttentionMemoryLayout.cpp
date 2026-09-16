@@ -115,6 +115,8 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     }
     if (const auto keyProduct =
             plan.getAs<mlir::DictionaryAttr>("rope_product_key")) {
+        ropeProductKeyBase_ =
+            keyProduct.getAs<mlir::IntegerAttr>("base_row").getInt();
         for (mlir::Attribute slice :
              keyProduct.getAs<mlir::ArrayAttr>("slices"))
             ropeProductKeySlices_.push_back(
@@ -505,10 +507,23 @@ int64_t AttentionMemoryLayout::ropeProductAddress(
     AttentionProjectionKind projection, int64_t head, int64_t pairBlock,
     int64_t product, int64_t token) const
 {
-    const int64_t globalHead = projection == AttentionProjectionKind::Query
-        ? head : queryHeads_ + head;
     const int64_t productRowsPerVector = ropeProductBankInterleaved_
         ? seqLen_ : (seqLen_ + 1) / 2;
+    if (ropeProductBankInterleaved_
+        && projection == AttentionProjectionKind::Key && product < 2
+        && ropeProductKeySlices_.size() >= 4) {
+        // The low Key products have their own slices and therefore their own
+        // address plane.  Do not retain the common Q+K global-head offset:
+        // for compact heads that offset can land inside the long-lived Query
+        // IW rows on the same bank and slices.
+        const int64_t pairBlocks = std::max<int64_t>(1, headBlocks_ / 2);
+        return ropeProductKeyBase_
+            + ((head * pairBlocks + pairBlock) * 2 + product)
+                * productRowsPerVector
+            + token;
+    }
+    const int64_t globalHead = projection == AttentionProjectionKind::Query
+        ? head : queryHeads_ + head;
     return ropeProductBase_
         + ((globalHead * (headBlocks_ / 2) + pairBlock) * 4 + product)
             * productRowsPerVector

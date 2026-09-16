@@ -133,9 +133,15 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
                 && !result.blocks.empty()) {
                 const int64_t previousLastCompute =
                     result.blocks.back().tiles.back().compute_cycle;
+                // Down0 and Down1 use fixed weight buffers 0 and 1.  The
+                // second buffer load starts one tile after dequant_start,
+                // while the preceding Down1 issue starts one projection slot
+                // after the preceding Down0 issue.  Preserve the final MXM
+                // pipeline rows before replacing buffer 1.
                 block.dequant_start = std::max(block.dequant_start,
                     previousLastCompute
-                        + target.mxm_result_window_cycles(tile));
+                        + projection.projection_slot_interval
+                        + target.mxm_first_result_latency());
             }
             block.weight_buffer = block.index % 2;
             block.final_reduction =

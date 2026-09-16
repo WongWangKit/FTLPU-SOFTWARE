@@ -299,7 +299,9 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
     const auto& memory = target.memory();
     const int64_t hiddenBank = ffn.getHidden0Placement()
         .getAs<mlir::IntegerAttr>("bank").getInt();
-    const int64_t tempBank = pagedWeights && memory.banks_per_slice > 1
+    const bool separateTempBank = memory.banks_per_slice > 1
+        && (pagedWeights || target.uses_dedicated_slice_roles());
+    const int64_t tempBank = separateTempBank
         ? (hiddenBank + 1) % memory.banks_per_slice : hiddenBank;
     auto resultSlices = get_slices(ffn.getResultPlacement());
     auto executionPolicy =

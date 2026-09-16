@@ -123,7 +123,10 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         ? (inputBank + 1) % memory.banks_per_slice
         : pagedWeights
             ? (initialWeightBank + 1) % memory.banks_per_slice : 0;
-    const int64_t hiddenBank = tiledWeights ? inputBank : workingBank;
+    const int64_t hiddenBank = target.uses_dedicated_slice_roles()
+            && memory.banks_per_slice > 1
+        ? inputBank
+        : tiledWeights ? inputBank : workingBank;
     int64_t hiddenBaseRow = memory.w8a16_hidden_base_row;
     if (hiddenBank == inputBank) {
         int64_t inputBaseRow = 0;

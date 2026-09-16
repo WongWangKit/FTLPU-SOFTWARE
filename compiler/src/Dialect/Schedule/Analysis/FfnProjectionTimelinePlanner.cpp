@@ -100,9 +100,21 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
                         static_cast<std::size_t>(previousIndex)];
                     const int64_t previousLastCompute =
                         previous.tiles.back().compute_cycle;
-                    block.dequant_start = std::max(block.dequant_start,
-                        previousLastCompute
-                            + target.mxm_result_window_cycles(tile));
+                    int64_t bufferRelease = previousLastCompute
+                        + target.mxm_result_window_cycles(tile);
+                    if (singleMxm && !serializedProjections) {
+                        // Gate and Up occupy fixed buffers 0 and 1.  The next
+                        // block's Up load starts one tile after dequant_start,
+                        // while the previous Up compute starts one projection
+                        // slot after its Gate compute.  Account for both
+                        // offsets; using only the previous Gate tile truncates
+                        // the final MXM pipeline rows when m_tile_count > 1.
+                        bufferRelease = previousLastCompute
+                            + result.projection_slot_interval
+                            + target.mxm_first_result_latency();
+                    }
+                    block.dequant_start = std::max(
+                        block.dequant_start, bufferRelease);
                 }
             }
             block.final_reduction = reduction + 1 == reductionBlocks;

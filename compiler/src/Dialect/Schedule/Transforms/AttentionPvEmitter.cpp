@@ -508,7 +508,9 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                 ? hemisphere + 1
                                 : target_.memory().hemispheres;
                             const int64_t copyCount =
-                                sourceLocalContext ? 1 : 2;
+                                sourceLocalContext
+                                    || layout.contextHemispherePaired()
+                                ? 1 : 2;
                             for (int64_t destinationHemisphere =
                                      firstDestination;
                                  destinationHemisphere < destinationEnd;
