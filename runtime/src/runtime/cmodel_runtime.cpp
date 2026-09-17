@@ -1458,6 +1458,61 @@ void CModelRuntime::print_icu_frontend_performance(std::ostream& os) const
        << statistics.macro_decoder_context_stall_cycles
        << " peak_macro_reservoir_bits="
        << statistics.peak_macro_reservoir_bits
+       << " macro_frontend_cycles="
+       << statistics.macro_frontend_cycles
+       << " macro_payload_bits_consumed="
+       << statistics.macro_payload_bits_consumed
+       << " macro_reservoir_empty_cycles="
+       << statistics.macro_reservoir_empty_cycles
+       << " macro_reservoir_full_cycles="
+       << statistics.macro_reservoir_full_cycles
+       << " macro_reservoir_occupancy_bit_samples="
+       << statistics.macro_reservoir_occupancy_bit_samples
+       << " macro_descriptor_count="
+       << statistics.macro_descriptor_count
+       << " macro_mem_descriptor_count="
+       << statistics.macro_mem_descriptor_count
+       << " macro_mxm_descriptor_count="
+       << statistics.macro_mxm_descriptor_count
+       << " macro_descriptor_decode_cycles="
+       << statistics.macro_descriptor_decode_cycles
+       << " macro_max_descriptor_decode_cycles="
+       << statistics.macro_max_descriptor_decode_cycles
+       << " macro_decoder_starvation_cycles="
+       << statistics.macro_decoder_starvation_cycles
+       << " macro_decoder_ddb_stall_cycles="
+       << statistics.macro_decoder_ddb_stall_cycles
+       << " macro_ddb_entries=" << statistics.macro_ddb_entries
+       << " peak_macro_ddb_occupancy="
+       << statistics.peak_macro_ddb_occupancy
+       << " macro_ddb_full_cycles="
+       << statistics.macro_ddb_full_cycles
+       << " macro_ddb_residency_cycles="
+       << statistics.macro_ddb_residency_cycles
+       << " macro_ddb_occupancy_samples="
+       << statistics.macro_ddb_occupancy_samples
+       << " macro_max_ddb_residency_cycles="
+       << statistics.macro_max_ddb_residency_cycles
+       << " macro_contexts_generated="
+       << statistics.macro_contexts_generated
+       << " macro_timing_window_block_cycles="
+       << statistics.macro_timing_window_block_cycles
+       << " macro_active_ram_full_cycles="
+       << statistics.macro_active_ram_full_cycles
+       << " macro_admission_count="
+       << statistics.macro_admission_count
+       << " macro_admission_stall_cycles="
+       << statistics.macro_admission_stall_cycles
+       << " macro_admission_to_start_cycles="
+       << statistics.macro_admission_to_start_cycles
+       << " macro_max_admission_to_start_cycles="
+       << statistics.macro_max_admission_to_start_cycles
+       << " macro_active_occupancy_samples="
+       << statistics.macro_active_occupancy_samples
+       << " macro_context_active_lifetime_cycles="
+       << statistics.macro_context_active_lifetime_cycles
+       << " macro_max_context_active_lifetime_cycles="
+       << statistics.macro_max_context_active_lifetime_cycles
        << " instruction_prefill_cycles="
        << instruction_prefill_cycles_ << '\n';
 }

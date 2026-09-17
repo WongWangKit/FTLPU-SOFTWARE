@@ -66,6 +66,29 @@ void expect(bool value, const char* message)
         throw std::runtime_error(message);
 }
 
+template <typename RawWord>
+std::vector<RawWord> raw_words(const rt::PackedMacroImemImage& image)
+{
+    expect(image.word_bits == RawWord::bit_count,
+           "packed image has the wrong raw i-MEM width");
+    const auto wordBytes = RawWord::bit_count / 8;
+    expect(image.bytes.size() % wordBytes == 0,
+           "packed image is not raw-word aligned");
+    std::vector<RawWord> result(image.bytes.size() / wordBytes);
+    for (std::size_t address = 0; address < result.size(); ++address) {
+        for (std::size_t lane = 0; lane < RawWord::lane_count; ++lane) {
+            const auto offset = address * wordBytes
+                + lane * sizeof(std::uint32_t);
+            result[address].lanes[lane] =
+                static_cast<std::uint32_t>(image.bytes[offset])
+                | (static_cast<std::uint32_t>(image.bytes[offset + 1]) << 8)
+                | (static_cast<std::uint32_t>(image.bytes[offset + 2]) << 16)
+                | (static_cast<std::uint32_t>(image.bytes[offset + 3]) << 24);
+        }
+    }
+    return result;
+}
+
 template <typename Fn>
 void expect_throw(Fn&& function, const char* message)
 {
@@ -538,6 +561,102 @@ try {
                && icu.mxm_compute_iq(0).done()
                && icu.mxm_dequant_iq(0).done(),
            "runtime/CModel Macro queues did not complete");
+
+    // A 32-record physical run exercises decode-ahead, finite DDB pressure,
+    // lazy one-context expansion, late admission, and Active RAM credits. The
+    // first contexts are four cycles apart while lookahead is eight cycles,
+    // so a one-entry Active RAM must backpressure admission without stalling
+    // or corrupting the parser state. Later unequal gaps also force compact
+    // escape deltas, keeping enough payload behind a full reservoir.
+    rt::QueueProgram lazyRun{rt::QueueKind::Mem, 0, {}};
+    constexpr std::size_t lazyContextCount = 32;
+    constexpr std::size_t lazyFirstCycle = 100;
+    const auto lazyStartCycle = [](std::size_t index) {
+        return lazyFirstCycle + 4 * index
+            + index * (index - 1) / 2;
+    };
+    for (std::size_t index = 0; index < lazyContextCount; ++index) {
+        lazyRun.commands.push_back(macro(
+            ftlpu::MemInstruction::Read(300 + index, 2),
+            {lazyStartCycle(index),
+             1, 1, 0, 1, 1, 0,
+             ftlpu::IcuInductionTarget::MemAddress}));
+    }
+    const auto lazyPacked =
+        rt::pack_mem_macro_imem(rt::encode_mem_macro_bitstream(lazyRun));
+    using LazyQueue = ftlpu::DistributedIcuQueue<
+        ftlpu::MemInstruction, 96, 64, 4, 1,
+        1, 3, 32, 2, 8, 4>;
+    LazyQueue lazyQueue;
+    lazyQueue.load_raw_macro(
+        ftlpu::IcuMacroQueueKind::Mem,
+        raw_words<LazyQueue::RawImemWord>(lazyPacked));
+    std::size_t lazyPrimeCycles = 0;
+    while (!lazyQueue.raw_macro_ready()) {
+        lazyQueue.prefetch_raw_macro();
+        expect(++lazyPrimeCycles < 256,
+               "finite DDB frontend did not reach a decode-ahead boundary");
+    }
+    expect(lazyQueue.peak_active_macros() == 0,
+           "far-future contexts occupied Active RAM during decode ahead");
+    expect(lazyQueue.macro_decoder_statistics().peak_ddb_occupancy == 2,
+           "finite DDB did not fill to its configured depth");
+    expect(lazyQueue.macro_decoder_statistics().reservoir_full_cycles != 0
+               && lazyQueue.macro_decoder_statistics().fetched_words
+                   < lazyPacked.word_count(),
+           "DDB pressure did not propagate through reservoir to IMEM fetch");
+
+    std::vector<std::pair<std::size_t, std::size_t>> lazyIssues;
+    const auto lazyLastCycle = lazyStartCycle(lazyContextCount - 1);
+    for (std::size_t cycle = 0; cycle <= lazyLastCycle; ++cycle)
+        if (const auto issued = lazyQueue.tick())
+            lazyIssues.emplace_back(cycle, issued->address);
+    expect(lazyIssues.size() == lazyContextCount,
+           "lazy expander did not generate every run context");
+    for (std::size_t index = 0; index < lazyIssues.size(); ++index) {
+        expect(lazyIssues[index].first
+                       == lazyStartCycle(index)
+                   && lazyIssues[index].second == 300 + index,
+               "lazy run expansion changed issue timing or operand deltas");
+    }
+    const auto& lazyStats = lazyQueue.macro_decoder_statistics();
+    expect(lazyQueue.done() && lazyQueue.peak_active_macros() == 1,
+           "late admission exceeded the one-entry Active Context RAM");
+    expect(lazyStats.descriptor_count == 1
+               && lazyStats.ddb_entries_committed >= 8
+               && lazyStats.decoder_ddb_stall_cycles != 0
+               && lazyStats.ddb_full_cycles != 0,
+           "DDB capacity did not propagate parser backpressure");
+    expect(lazyStats.timing_window_block_cycles != 0
+               && lazyStats.active_ram_full_cycles != 0
+               && lazyStats.admission_count == lazyContextCount,
+           "late-admission timing/credit gates were not exercised");
+    expect(lazyStats.contexts_generated == lazyContextCount
+               && lazyStats.peak_reservoir_bits <= 3 * 96
+               && lazyStats.fetched_words == lazyPacked.word_count(),
+           "frontend violated expansion width or reservoir capacity");
+    expect(lazyStats.max_context_active_lifetime_cycles <= 9,
+           "late admission retained a context longer than lookahead permits");
+
+    // Packed-v1 is globally start-time monotonic. Rejecting this sequence is
+    // the compiler/codec contract that prevents FIFO DDB head-of-line blocking
+    // (A0=100, A1=10000 would otherwise hide B0=150 behind A1).
+    rt::QueueProgram holRun{rt::QueueKind::Mem, 0, {}};
+    holRun.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(1, 0),
+        {100, 1, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    holRun.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(2, 0),
+        {10000, 1, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    holRun.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(3, 1),
+        {150, 1, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    expect_throw(
+        [&]() { (void)rt::encode_mem_macro_bitstream(holRun); },
+        "codec accepted a descriptor order that causes FIFO DDB HOL blocking");
 
     // A corrupt retained physical image must reach the CModel decoder. If the
     // runtime silently re-encoded semantic QueueCommands this would pass.
