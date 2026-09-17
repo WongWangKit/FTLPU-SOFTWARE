@@ -1,4 +1,5 @@
 #include "ftlpu/software/runtime/icu_program.hpp"
+#include "ftlpu/software/runtime/imem_capacity.hpp"
 #include "ftlpu/software/runtime/macro_bitstream.hpp"
 
 #include <algorithm>
@@ -8,6 +9,25 @@
 namespace ftlpu::software::runtime {
 
 namespace {
+
+void validate_fu_3d_context_capacity(
+    const std::vector<QueueProgram>& queues)
+{
+    BinaryProgram probe;
+    probe.queues = queues;
+    const auto report = analyze_physical_imem(probe);
+    for (const auto& queue : report.queues) {
+        if (!queue.fu_3d_context_overflow()) continue;
+        std::ostringstream message;
+        message << "binary FU 3-D context capacity exceeded: resource="
+                << queue_kind_name(queue.kind)
+                << " queue=" << queue.index
+                << " peak=" << queue.peak_fu_3d_contexts
+                << " capacity=" << queue.fu_3d_context_capacity
+                << "; lower overlapping work into one FU-specific 3-D instruction";
+        throw StaticScheduleError(message.str());
+    }
+}
 
 constexpr isa::EncodedIcuCommand kInstructionCommand =
     static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction);
@@ -177,6 +197,11 @@ void validate_queue_index(QueueKind kind, std::size_t index)
     if ((kind == QueueKind::SxmTranspose || kind == QueueKind::SxmPermute)
         && index >= hw::kHemispheres)
         throw std::out_of_range("binary SXM hemisphere index is outside the CModel ICU range");
+    if ((kind == QueueKind::C2cDma || kind == QueueKind::C2cTx
+            || kind == QueueKind::C2cRx)
+        && index >= hw::kHemispheres)
+        throw std::out_of_range(
+            "binary C2C hemisphere index is outside the CModel ICU range");
 }
 
 bool is_mxm_queue(QueueKind kind)
@@ -184,6 +209,134 @@ bool is_mxm_queue(QueueKind kind)
     return kind == QueueKind::MxmLoad
         || kind == QueueKind::MxmCompute
         || kind == QueueKind::MxmDequant;
+}
+
+InstructionKind instruction_kind_for_raw_queue(QueueKind kind)
+{
+    switch (kind) {
+    case QueueKind::Mem:
+        return InstructionKind::Mem;
+    case QueueKind::MxmLoad:
+    case QueueKind::MxmCompute:
+        return InstructionKind::Mxm;
+    case QueueKind::MxmDequant:
+        return InstructionKind::MxmDequant;
+    case QueueKind::Vxm:
+        return InstructionKind::Vxm;
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute:
+        return InstructionKind::Sxm;
+    case QueueKind::C2cDma:
+    case QueueKind::C2cTx:
+    case QueueKind::C2cRx:
+        break;
+    }
+    throw std::logic_error(
+        "raw FU loop words are unsupported on this ICU queue");
+}
+
+std::size_t raw_3d_packet_word_count(QueueKind kind)
+{
+    switch (kind) {
+    case QueueKind::Mem:
+        return isa::EncodedMemIcu3DPacket::kWordCount;
+    case QueueKind::MxmLoad:
+    case QueueKind::MxmCompute:
+    case QueueKind::MxmDequant:
+        return isa::EncodedMxmLoadIcu3DPacket::kWordCount;
+    case QueueKind::Vxm:
+        return isa::EncodedVxmIcuRun2DPacket::kWordCount;
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute:
+        return isa::EncodedSxmIcuRun2DPacket::kWordCount;
+    case QueueKind::C2cDma:
+    case QueueKind::C2cTx:
+    case QueueKind::C2cRx:
+        break;
+    }
+    throw std::logic_error(
+        "raw FU loop packets are unsupported on this ICU queue");
+}
+
+bool begins_raw_3d_packet(
+    QueueKind kind, const QueueCommand& command)
+{
+    if (kind != QueueKind::Mem && !is_mxm_queue(kind)
+        && kind != QueueKind::Vxm
+        && kind != QueueKind::SxmTranspose
+        && kind != QueueKind::SxmPermute)
+        return false;
+    return is_fu_3d_raw_packet_header(command);
+}
+
+IcuLocation queue_location(QueueKind kind, std::size_t queueIndex)
+{
+    switch (kind) {
+    case QueueKind::Mem: {
+        const auto hemisphere = static_cast<Hemisphere>(queueIndex
+            / InstructionControlUnit::kMemQueuesPerHemisphere);
+        const auto local = queueIndex
+            % InstructionControlUnit::kMemQueuesPerHemisphere;
+        return IcuLocation::Mem(hemisphere,
+            local / hw::kMemBanksPerSlice,
+            local % hw::kMemBanksPerSlice);
+    }
+    case QueueKind::MxmLoad:
+        return IcuLocation::MxmLoad(queueIndex);
+    case QueueKind::MxmCompute:
+        return IcuLocation::MxmCompute(queueIndex);
+    case QueueKind::MxmDequant:
+        return IcuLocation::MxmDequant(queueIndex);
+    case QueueKind::Vxm:
+        return IcuLocation::Vxm(queueIndex);
+    case QueueKind::SxmTranspose:
+        return IcuLocation::Sxm(
+            static_cast<Hemisphere>(queueIndex), 0);
+    case QueueKind::SxmPermute:
+        return IcuLocation::Sxm(
+            static_cast<Hemisphere>(queueIndex), 1);
+    case QueueKind::C2cDma:
+        return IcuLocation::C2cDma(
+            static_cast<Hemisphere>(queueIndex));
+    case QueueKind::C2cTx:
+        return IcuLocation::C2cTx(
+            static_cast<Hemisphere>(queueIndex));
+    case QueueKind::C2cRx:
+        return IcuLocation::C2cRx(
+            static_cast<Hemisphere>(queueIndex));
+    }
+    throw std::logic_error("unknown ICU queue kind");
+}
+
+template <typename Packet>
+Packet read_raw_3d_packet(const QueueProgram& queue,
+    std::size_t commandIndex)
+{
+    constexpr auto physicalWordCount = Packet::kWordCount;
+    constexpr auto lanesPerWord = Packet::kLanesPerWord;
+    if (commandIndex > queue.commands.size()
+        || physicalWordCount > queue.commands.size() - commandIndex)
+        throw std::logic_error("truncated FU 3-D raw packet in binary queue");
+    const auto expectedKind = instruction_kind_for_raw_queue(queue.kind);
+    Packet packet {};
+    for (std::size_t wordIndex = 0;
+         wordIndex < physicalWordCount; ++wordIndex) {
+        const auto& command = queue.commands[commandIndex + wordIndex];
+        if (command.instruction_kind != expectedKind
+            || command.word_count != lanesPerWord
+            || !command.extension_words.empty()
+            || command.command != command.words[0]
+            || isa::decode_icu_command_opcode(command.command)
+                != isa::IcuCommandOpcode::Extended
+            || ((command.words[0] >> 2)
+                    & (expectedKind == InstructionKind::Sxm
+                            ? 0x7U : 0x3U)) != wordIndex)
+            throw std::logic_error(
+                "malformed FU 3-D raw packet word in binary queue");
+        for (std::size_t lane = 0; lane < lanesPerWord; ++lane)
+            packet.words[wordIndex].lanes[lane] = command.words[lane];
+    }
+    return packet;
 }
 
 std::size_t physical_queue_index(QueueKind kind, std::size_t logical_index,
@@ -208,6 +361,236 @@ std::size_t physical_queue_index(QueueKind kind, std::size_t logical_index,
 
 } // namespace
 
+QueueCommand encode_icu_control_raw_word(
+    const IcuControlInstruction& instruction)
+{
+    const auto word =
+        InstructionControlUnit::MemIcu::encode_control_raw_word(
+            instruction);
+    QueueCommand command;
+    command.command = word.lanes[0];
+    command.instruction_kind = InstructionKind::None;
+    command.word_count = 3;
+    std::copy(word.lanes.begin(), word.lanes.end(),
+        command.words.begin());
+    return command;
+}
+
+bool is_icu_control_raw_word_command(
+    const QueueCommand& command) noexcept
+{
+    if (command.instruction_kind != InstructionKind::None
+        || command.word_count != 3
+        || !command.extension_words.empty()
+        || command.command != command.words[0])
+        return false;
+
+    const auto opcode =
+        isa::decode_icu_command_opcode(command.command);
+    if (opcode == isa::IcuCommandOpcode::Nop
+        || opcode == isa::IcuCommandOpcode::Repeat)
+        return true;
+    if (opcode != isa::IcuCommandOpcode::Extended) return false;
+    const auto subtype = (command.words[2] >> 24) & 0xfU;
+    return subtype == 1 || subtype == 3 || subtype == 4
+        || subtype == 5;
+}
+
+IcuControlInstruction decode_icu_control_raw_word(
+    const QueueCommand& command)
+{
+    if (!is_icu_control_raw_word_command(command))
+        throw std::logic_error(
+            "queue command is not a physical ICU control word");
+    isa::EncodedMemIcu3DWord word {{
+        command.words[0], command.words[1], command.words[2]}};
+    return InstructionControlUnit::MemIcu::decode_control_raw_word(word);
+}
+
+std::array<QueueCommand,
+    InstructionControlUnit::MemIcu::synchronized_packet_word_count>
+encode_mem_synchronized_icu_packet(
+    const InstructionControlUnit::MemIcu::EncodedSynchronizedPacket& packet)
+{
+    std::array<QueueCommand,
+        InstructionControlUnit::MemIcu::synchronized_packet_word_count>
+        commands {};
+    for (std::size_t index = 0; index < commands.size(); ++index) {
+        auto& command = commands[index];
+        command.command = packet[index].lanes[0];
+        command.instruction_kind = InstructionKind::Mem;
+        command.word_count = 3;
+        std::copy(packet[index].lanes.begin(), packet[index].lanes.end(),
+            command.words.begin());
+    }
+    return commands;
+}
+
+bool is_mem_synchronized_raw_word_command(
+    const QueueCommand& command) noexcept
+{
+    if (command.instruction_kind != InstructionKind::Mem
+        || command.word_count != 3
+        || !command.extension_words.empty()
+        || command.command != command.words[0])
+        return false;
+    const auto opcode =
+        isa::decode_icu_command_opcode(command.command);
+    return opcode == isa::IcuCommandOpcode::Instruction
+        || (opcode == isa::IcuCommandOpcode::Extended
+            && ((command.words[2] >> 24) & 0xfU) == 6);
+}
+
+bool is_mem_synchronized_raw_packet_header(
+    const QueueCommand& command) noexcept
+{
+    return is_mem_synchronized_raw_word_command(command)
+        && isa::decode_icu_command_opcode(command.command)
+            == isa::IcuCommandOpcode::Extended
+        && ((command.words[2] >> 24) & 0xfU) == 6;
+}
+
+InstructionControlUnit::MemIcu::EncodedSynchronizedPacket
+decode_mem_synchronized_icu_packet(
+    const QueueProgram& queue, std::size_t commandIndex)
+{
+    constexpr auto kWordCount =
+        InstructionControlUnit::MemIcu::synchronized_packet_word_count;
+    if (queue.kind != QueueKind::Mem
+        || commandIndex > queue.commands.size()
+        || kWordCount > queue.commands.size() - commandIndex
+        || !is_mem_synchronized_raw_packet_header(
+            queue.commands[commandIndex]))
+        throw std::logic_error(
+            "truncated or malformed MEM_WRITE_SYNC raw packet");
+
+    const auto& continuation = queue.commands[commandIndex + 1];
+    if (!is_mem_synchronized_raw_word_command(continuation)
+        || isa::decode_icu_command_opcode(continuation.command)
+            != isa::IcuCommandOpcode::Instruction)
+        throw std::logic_error(
+            "MEM_WRITE_SYNC continuation is not a native MEM word");
+
+    InstructionControlUnit::MemIcu::EncodedSynchronizedPacket packet {};
+    for (std::size_t word = 0; word < kWordCount; ++word) {
+        for (std::size_t lane = 0; lane < 3; ++lane)
+            packet[word].lanes[lane] =
+                queue.commands[commandIndex + word].words[lane];
+    }
+
+    // Reuse the CModel's hardware decoder to validate reserved fields and
+    // that the native template is a MEM Write before returning the packet.
+    InstructionControlUnit::MemIcu validator;
+    validator.push_encoded_synchronized_packet(packet);
+    return packet;
+}
+
+bool is_fu_3d_raw_word_command(const QueueCommand& command) noexcept
+{
+    const bool supportedPair =
+        (command.instruction_kind == InstructionKind::Mem
+            && command.word_count
+                == isa::EncodedMemIcu3DPacket::kLanesPerWord)
+        || ((command.instruction_kind == InstructionKind::Mxm
+                || command.instruction_kind
+                    == InstructionKind::MxmDequant)
+            && command.word_count
+                == isa::EncodedMxmLoadIcu3DPacket::kLanesPerWord)
+        || (command.instruction_kind == InstructionKind::Vxm
+            && command.word_count
+                == isa::EncodedVxmIcuRun2DPacket::kLanesPerWord)
+        || (command.instruction_kind == InstructionKind::Sxm
+            && command.word_count
+                == isa::EncodedSxmIcuRun2DPacket::kLanesPerWord);
+    if (!supportedPair) return false;
+    if (!command.extension_words.empty()
+        || command.command != command.words[0]
+        || isa::decode_icu_command_opcode(command.command)
+            != isa::IcuCommandOpcode::Extended)
+        return false;
+    const auto wordIndex = (command.words[0] >> 2)
+        & (command.instruction_kind == InstructionKind::Sxm ? 0x7U : 0x3U);
+    // Extended subtype lives at physical [91:88] of packet word zero.
+    const auto subtype = (command.words[2] >> 24) & 0xfU;
+    return wordIndex != 0 || subtype == 2
+        || (command.instruction_kind == InstructionKind::Mem
+            && subtype == 7 && ((command.words[0] >> 4) & 0x3U) == 3);
+}
+
+bool is_mem_write_read_2d_raw_packet_header(
+    const QueueCommand& command) noexcept
+{
+    return command.instruction_kind == InstructionKind::Mem
+        && is_fu_3d_raw_packet_header(command)
+        && ((command.words[2] >> 24) & 0xfU) == 7
+        && ((command.words[0] >> 4) & 0x3U) == 3;
+}
+
+MemIcuWriteRead2DInstruction decode_mem_write_read_2d_raw_packet(
+    const QueueProgram& queue, std::size_t commandIndex)
+{
+    if (queue.kind != QueueKind::Mem
+        || commandIndex >= queue.commands.size()
+        || !is_mem_write_read_2d_raw_packet_header(
+            queue.commands[commandIndex]))
+        throw std::logic_error(
+            "expected WRITE_READ_2D raw packet header in MEM queue");
+    return isa::decode_mem_icu_write_read_2d_instruction(
+        read_raw_3d_packet<isa::EncodedMemIcuWriteRead2DPacket>(
+            queue, commandIndex));
+}
+
+bool is_fu_3d_raw_packet_header(
+    const QueueCommand& command) noexcept
+{
+    return is_fu_3d_raw_word_command(command)
+        && ((command.words[0] >> 2)
+            & (command.instruction_kind == InstructionKind::Sxm
+                    ? 0x7U : 0x3U)) == 0;
+}
+
+std::size_t fu_3d_raw_packet_word_count(QueueKind kind)
+{
+    return raw_3d_packet_word_count(kind);
+}
+
+IcuLoop3D decode_fu_3d_raw_packet_loop(
+    const QueueProgram& queue, std::size_t commandIndex)
+{
+    switch (queue.kind) {
+    case QueueKind::Mem:
+        return isa::decode_mem_icu_3d_instruction(
+            read_raw_3d_packet<isa::EncodedMemIcu3DPacket>(
+                queue, commandIndex)).loop;
+    case QueueKind::MxmLoad:
+        return isa::decode_mxm_load_icu_3d_instruction(
+            read_raw_3d_packet<isa::EncodedMxmLoadIcu3DPacket>(
+                queue, commandIndex)).loop;
+    case QueueKind::MxmDequant:
+        return isa::decode_mxm_dequant_icu_3d_instruction(
+            read_raw_3d_packet<isa::EncodedMxmDequantIcu3DPacket>(
+                queue, commandIndex)).loop;
+    case QueueKind::MxmCompute:
+        return isa::decode_mxm_compute_icu_3d_instruction(
+            read_raw_3d_packet<isa::EncodedMxmComputeIcu3DPacket>(
+                queue, commandIndex)).loop;
+    case QueueKind::Vxm:
+        return isa::decode_vxm_icu_run_2d_instruction(
+            read_raw_3d_packet<isa::EncodedVxmIcuRun2DPacket>(
+                queue, commandIndex)).loop;
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute:
+        return isa::decode_sxm_icu_run_2d_instruction(
+            read_raw_3d_packet<isa::EncodedSxmIcuRun2DPacket>(
+                queue, commandIndex)).loop;
+    case QueueKind::C2cDma:
+    case QueueKind::C2cTx:
+    case QueueKind::C2cRx:
+        break;
+    }
+    throw std::logic_error("unknown ICU queue kind");
+}
+
 const char* queue_kind_name(QueueKind kind)
 {
     switch (kind) {
@@ -225,6 +608,12 @@ const char* queue_kind_name(QueueKind kind)
         return "sxm_transpose";
     case QueueKind::SxmPermute:
         return "sxm_permute";
+    case QueueKind::C2cDma:
+        return "c2c_dma";
+    case QueueKind::C2cTx:
+        return "c2c_tx";
+    case QueueKind::C2cRx:
+        return "c2c_rx";
     }
     return "unknown";
 }
@@ -443,30 +832,146 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
     InstructionControlUnit& icu,
     std::size_t logical_mxms_per_hemisphere)
 {
-    for (const auto& source_queue : queues) {
-        QueueProgram decoded_physical_queue;
-        const QueueProgram* queue_pointer = &source_queue;
-        if (source_queue.kind == QueueKind::Mem
-            && !source_queue.commands.empty()
-            && std::all_of(source_queue.commands.begin(),
-                source_queue.commands.end(), [](const QueueCommand& command) {
-                    return is_macro_schedule_command(command)
-                        && command.instruction_kind == InstructionKind::Mem;
-                })) {
-            // Exercise the exact target bitstream decoder on the CModel path;
-            // the distributed ICU then models the decoded finite Macro
-            // contexts and issue timing.
-            decoded_physical_queue = decode_mem_macro_bitstream(
-                encode_mem_macro_bitstream(source_queue), source_queue.index);
-            queue_pointer = &decoded_physical_queue;
-        }
-        const auto& queue = *queue_pointer;
+    validate_fu_3d_context_capacity(queues);
+    for (const auto& queue : queues) {
         if (queue.commands.empty()) continue;
         const std::size_t queue_index = physical_queue_index(
             queue.kind, queue.index, logical_mxms_per_hemisphere);
         validate_queue_index(queue.kind, queue_index);
         for (std::size_t command_index = 0; command_index < queue.commands.size(); ++command_index) {
             const auto& command = queue.commands[command_index];
+            if (command.instruction_kind
+                    == InstructionKind::C2cEndpoint) {
+                if (queue.kind != QueueKind::C2cTx
+                    && queue.kind != QueueKind::C2cRx)
+                    throw std::logic_error(
+                        "C2C endpoint word targets a non-endpoint queue");
+                const auto word = decode_c2c_raw_word(
+                    command, InstructionKind::C2cEndpoint);
+                const auto side = static_cast<Hemisphere>(queue_index);
+                if (queue.kind == QueueKind::C2cTx) {
+                    const auto decoded = C2cIcuPacketCodec::decode_tx(word);
+                    if (decoded.endpoint_hemisphere != side)
+                        throw std::logic_error(
+                            "C2C TX packet hemisphere does not match its queue");
+                    icu.c2c_tx_iq(side)
+                        .push_encoded_c2c_endpoint_packet(word);
+                } else {
+                    const auto decoded = C2cIcuPacketCodec::decode_rx(word);
+                    if (decoded.endpoint_hemisphere != side)
+                        throw std::logic_error(
+                            "C2C RX packet hemisphere does not match its queue");
+                    icu.c2c_rx_iq(side)
+                        .push_encoded_c2c_endpoint_packet(word);
+                }
+                continue;
+            }
+            if (command.instruction_kind == InstructionKind::C2cDma) {
+                if (queue.kind != QueueKind::C2cDma)
+                    throw std::logic_error(
+                        "C2C DMA word targets a non-DMA queue");
+                const auto packet = decode_c2c_dma_icu_packet(
+                    queue, command_index);
+                const auto decoded = C2cIcuPacketCodec::decode_dma(packet);
+                const auto side = static_cast<Hemisphere>(queue_index);
+                if (decoded.endpoint_hemisphere != side)
+                    throw std::logic_error(
+                        "C2C DMA packet hemisphere does not match its queue");
+                icu.c2c_dma_iq(side).push_encoded_c2c_dma_packet(packet);
+                command_index += C2cDmaIcuPacket::kWordCount - 1;
+                continue;
+            }
+            if (is_mem_synchronized_raw_packet_header(command)) {
+                if (queue.kind != QueueKind::Mem)
+                    throw std::logic_error(
+                        "MEM_WRITE_SYNC must target a MEM queue");
+                icu.mem_iq(queue_index)
+                    .push_encoded_synchronized_packet(
+                        decode_mem_synchronized_icu_packet(
+                            queue, command_index));
+                command_index +=
+                    InstructionControlUnit::MemIcu::
+                        synchronized_packet_word_count - 1;
+                continue;
+            }
+            if (is_mem_synchronized_raw_word_command(command)
+                && isa::decode_icu_command_opcode(command.command)
+                    == isa::IcuCommandOpcode::Instruction)
+                throw std::logic_error(
+                    "orphan MEM_WRITE_SYNC continuation word in binary queue");
+            if (is_icu_control_raw_word_command(command)) {
+                icu.enqueue_control(queue_location(queue.kind, queue_index),
+                    decode_icu_control_raw_word(command));
+                continue;
+            }
+            if (begins_raw_3d_packet(queue.kind, command)) {
+                switch (queue.kind) {
+                case QueueKind::Mem: {
+                    if (is_mem_write_read_2d_raw_packet_header(command)) {
+                        icu.mem_iq(queue_index)
+                            .push_encoded_mem_write_read_2d_packet(
+                                read_raw_3d_packet<
+                                    isa::EncodedMemIcuWriteRead2DPacket>(
+                                    queue, command_index));
+                    } else {
+                        const auto packet = read_raw_3d_packet<
+                            isa::EncodedMemIcu3DPacket>(
+                            queue, command_index);
+                        icu.mem_iq(queue_index).push_encoded_3d_packet(packet);
+                    }
+                    break;
+                }
+                case QueueKind::MxmLoad:
+                    icu.mxm_load_iq(queue_index).push_encoded_3d_packet(
+                        read_raw_3d_packet<
+                            isa::EncodedMxmLoadIcu3DPacket>(
+                            queue, command_index));
+                    break;
+                case QueueKind::MxmDequant:
+                    icu.mxm_dequant_iq(queue_index)
+                        .push_encoded_3d_packet(
+                            read_raw_3d_packet<
+                                isa::EncodedMxmDequantIcu3DPacket>(
+                                queue, command_index));
+                    break;
+                case QueueKind::MxmCompute:
+                    icu.mxm_compute_iq(queue_index)
+                        .push_encoded_3d_packet(
+                            read_raw_3d_packet<
+                                isa::EncodedMxmComputeIcu3DPacket>(
+                                queue, command_index));
+                    break;
+                case QueueKind::Vxm:
+                    icu.vxm_iq(queue_index).push_encoded_3d_packet(
+                        read_raw_3d_packet<
+                            isa::EncodedVxmIcuRun2DPacket>(
+                            queue, command_index));
+                    break;
+                case QueueKind::SxmTranspose:
+                    icu.sxm_transpose_iq(
+                        static_cast<Hemisphere>(queue_index))
+                        .push_encoded_3d_packet(
+                            read_raw_3d_packet<
+                                isa::EncodedSxmIcuRun2DPacket>(
+                                queue, command_index));
+                    break;
+                case QueueKind::SxmPermute:
+                    icu.sxm_permute_iq(
+                        static_cast<Hemisphere>(queue_index))
+                        .push_encoded_3d_packet(
+                            read_raw_3d_packet<
+                                isa::EncodedSxmIcuRun2DPacket>(
+                                queue, command_index));
+                    break;
+                case QueueKind::C2cDma:
+                case QueueKind::C2cTx:
+                case QueueKind::C2cRx:
+                    throw std::logic_error(
+                        "C2C queues do not carry FU 3-D packets");
+                }
+                command_index += raw_3d_packet_word_count(queue.kind) - 1;
+                continue;
+            }
             if (is_vxm_stream_nd_command(command)) {
                 if (queue.kind != QueueKind::Vxm)
                     throw std::logic_error(
@@ -527,12 +1032,9 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                     | (static_cast<isa::EncodedMemInstruction>(
                            command.words[1])
                         << 32);
-                icu.enqueue_mem_stream_nd_packet(queue_index,
-                    encode_icu_stream_nd_packet({
-                        IcuStreamNdUnit::Mem,
-                        decode_mem_stream_nd_command(command),
-                        encoded,
-                    }));
+                icu.enqueue_mem_stream_nd(queue_index,
+                    decode_mem_stream_nd_command(command),
+                    isa::decode_mem_instruction(encoded));
                 continue;
             }
             if (is_mxm_stream_nd_command(command)) {
@@ -544,13 +1046,12 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                             || command.word_count != 1)
                             throw std::logic_error(
                                 "MXM dequant STREAM_ND must carry one scale word");
-                        icu.enqueue_mxm_dequant_stream_nd_packet(
-                            queue_index,
-                            encode_icu_stream_nd_packet({
-                                IcuStreamNdUnit::MxmDequant,
-                                schedule,
-                                command.words[0],
-                            }));
+                        icu.enqueue_mxm_dequant_stream_nd(queue_index,
+                            schedule,
+                            isa::decode_mxm_dequant_instruction(
+                                static_cast<
+                                    isa::EncodedMxmDequantInstruction>(
+                                    command.words[0])));
                     } else {
                         if ((queue.kind != QueueKind::MxmLoad
                                 && queue.kind != QueueKind::MxmCompute)
@@ -571,21 +1072,11 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                         validate_mxm_queue_opcode(
                             queue.kind, queue_index, instruction);
                         if (queue.kind == QueueKind::MxmLoad)
-                            icu.enqueue_mxm_load_stream_nd_packet(
-                                queue_index,
-                                encode_icu_stream_nd_packet({
-                                    IcuStreamNdUnit::MxmLoad,
-                                    schedule,
-                                    encoded,
-                                }));
+                            icu.enqueue_mxm_load_stream_nd(queue_index,
+                                schedule, instruction);
                         else
-                            icu.enqueue_mxm_compute_stream_nd_packet(
-                                queue_index,
-                                encode_icu_stream_nd_packet({
-                                    IcuStreamNdUnit::MxmCompute,
-                                    schedule,
-                                    encoded,
-                                }));
+                            icu.enqueue_mxm_compute_stream_nd(queue_index,
+                                schedule, instruction);
                     }
                 } catch (const std::exception& error) {
                     std::ostringstream message;
@@ -663,46 +1154,18 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                 case QueueKind::Vxm:
                 case QueueKind::SxmTranspose:
                 case QueueKind::SxmPermute:
+                case QueueKind::C2cDma:
+                case QueueKind::C2cTx:
+                case QueueKind::C2cRx:
                     throw std::logic_error(
                         "ICU macro v1 supports MEM and MXM queues only");
                 }
                 continue;
             }
             if (is_repeat_2d_command(command)) {
-                IcuLocation location;
-                switch (queue.kind) {
-                case QueueKind::Mem:
-                    location = IcuLocation::Mem(
-                        static_cast<Hemisphere>(queue_index
-                            / InstructionControlUnit::kMemQueuesPerHemisphere),
-                        (queue_index
-                            % InstructionControlUnit::kMemQueuesPerHemisphere)
-                            / hw::kMemBanksPerSlice,
-                        queue_index % hw::kMemBanksPerSlice);
-                    break;
-                case QueueKind::MxmLoad:
-                    location = IcuLocation::MxmLoad(queue_index);
-                    break;
-                case QueueKind::MxmCompute:
-                    location = IcuLocation::MxmCompute(queue_index);
-                    break;
-                case QueueKind::MxmDequant:
-                    location = IcuLocation::MxmDequant(queue_index);
-                    break;
-                case QueueKind::Vxm:
-                    location = IcuLocation::Vxm(queue_index);
-                    break;
-                case QueueKind::SxmTranspose:
-                    location = IcuLocation::Sxm(
-                        static_cast<Hemisphere>(queue_index), 0);
-                    break;
-                case QueueKind::SxmPermute:
-                    location = IcuLocation::Sxm(
-                        static_cast<Hemisphere>(queue_index), 1);
-                    break;
-                }
-                icu.enqueue_control(location, IcuControlInstruction::Repeat2D(
-                    decode_repeat_2d_command(command)));
+                icu.enqueue_control(queue_location(queue.kind, queue_index),
+                    IcuControlInstruction::Repeat2D(
+                        decode_repeat_2d_command(command)));
                 continue;
             }
             const auto opcode = isa::decode_icu_command_opcode(command.command);
@@ -729,6 +1192,18 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                     break;
                 case QueueKind::SxmPermute:
                     icu.enqueue_sxm_permute_nop(static_cast<Hemisphere>(queue_index), cycles);
+                    break;
+                case QueueKind::C2cDma:
+                    icu.enqueue_c2c_dma_nop(
+                        static_cast<Hemisphere>(queue_index), cycles);
+                    break;
+                case QueueKind::C2cTx:
+                    icu.enqueue_c2c_tx_nop(
+                        static_cast<Hemisphere>(queue_index), cycles);
+                    break;
+                case QueueKind::C2cRx:
+                    icu.enqueue_c2c_rx_nop(
+                        static_cast<Hemisphere>(queue_index), cycles);
                     break;
                 }
                 continue;
@@ -762,6 +1237,27 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                     icu.enqueue_sxm_permute_repeat(
                         static_cast<Hemisphere>(queue_index),
                         repeat.count, repeat.interval);
+                    break;
+                case QueueKind::C2cDma:
+                    icu.enqueue_control(
+                        IcuLocation::C2cDma(
+                            static_cast<Hemisphere>(queue_index)),
+                        IcuControlInstruction::Repeat(repeat.count,
+                            repeat.interval, repeat.address_stride));
+                    break;
+                case QueueKind::C2cTx:
+                    icu.enqueue_control(
+                        IcuLocation::C2cTx(
+                            static_cast<Hemisphere>(queue_index)),
+                        IcuControlInstruction::Repeat(repeat.count,
+                            repeat.interval, repeat.address_stride));
+                    break;
+                case QueueKind::C2cRx:
+                    icu.enqueue_control(
+                        IcuLocation::C2cRx(
+                            static_cast<Hemisphere>(queue_index)),
+                        IcuControlInstruction::Repeat(repeat.count,
+                            repeat.interval, repeat.address_stride));
                     break;
                 }
                 continue;
@@ -847,6 +1343,11 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                 icu.enqueue_sxm_permute(static_cast<Hemisphere>(queue_index), std::move(instruction));
                 break;
             }
+            case QueueKind::C2cDma:
+            case QueueKind::C2cTx:
+            case QueueKind::C2cRx:
+                throw std::logic_error(
+                    "C2C functional commands must use fixed raw packets");
             }
         }
     }

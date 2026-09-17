@@ -861,8 +861,11 @@ int main(int argc, char **argv) try {
   const auto input_bytes = read_bytes(fixture / "input.bf16.bin");
   session.set_input("hidden.0", input_bytes);
   const char *trace_path = std::getenv("FTLPU_QWEN_PIPELINE_CSV");
+  const char *mem_trace_path = std::getenv("FTLPU_QWEN_MEM_CSV");
   if (trace_path != nullptr)
     session.enable_execution_trace();
+  if (mem_trace_path != nullptr)
+    session.enable_mem_execution_trace();
   session.run();
 
   std::vector<std::uint8_t> key_state;
@@ -886,6 +889,8 @@ int main(int argc, char **argv) try {
 
   if (trace_path != nullptr)
     session.write_execution_trace_csv(trace_path);
+  if (mem_trace_path != nullptr)
+    session.write_mem_execution_trace_csv(mem_trace_path);
 
   if (const char *binding_text =
           std::getenv("FTLPU_TRACE_QWEN_WEIGHT_PAGE")) {

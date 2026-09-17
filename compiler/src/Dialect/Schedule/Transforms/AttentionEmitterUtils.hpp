@@ -9,8 +9,29 @@
 #include "mlir/IR/PatternMatch.h"
 
 #include <array>
+#include <optional>
 
 namespace ftlpu::compiler::schedule::attention_detail {
+
+struct MxmDomain3D {
+  int64_t repeat_count = 1;
+  int64_t repeat_interval = 1;
+  int64_t repeat_weight_column_stride = 0;
+  int64_t repeat_accumulator_address_stride = 0;
+  int64_t wave_count = 1;
+  int64_t wave_interval = 1;
+  int64_t wave_weight_column_stride = 0;
+  int64_t wave_accumulator_address_stride = 0;
+  int64_t group_count = 1;
+  int64_t group_interval = 1;
+  int64_t group_weight_column_stride = 0;
+  int64_t group_accumulator_address_stride = 0;
+  llvm::StringRef weight_buffer_mode = "fixed";
+  int64_t terminal_dimension = -1;
+  llvm::StringRef terminal_accumulator_destination;
+  std::optional<bool> terminal_accumulator_clear;
+  llvm::StringRef terminal_accumulator_output_format;
+};
 
 void emitMem(mlir::IRRewriter &rewriter, mlir::Location location, int64_t cycle,
              int64_t queue, llvm::StringRef opcode, int64_t address,
@@ -35,6 +56,22 @@ void emitMemWave(mlir::IRRewriter &rewriter, mlir::Location location,
                  int64_t waveCount, int64_t waveInterval,
                  int64_t waveAddressStride, int64_t bank);
 
+// Emit one hardware MEM loop descriptor.  The three domains map directly to
+// the three counters in READ_3D/WRITE_3D/WRITE_TAP_3D; callers do not need to
+// enumerate their logical rows before Schedule IR is formed.
+void emitMem3D(mlir::IRRewriter &rewriter, mlir::Location location,
+               int64_t cycle, int64_t queue, llvm::StringRef opcode,
+               int64_t address, int64_t packedStream, int64_t repeatCount,
+               int64_t repeatInterval, int64_t addressStride,
+               llvm::StringRef destination, int64_t addressBinding,
+               int64_t waveCount, int64_t waveInterval,
+               int64_t waveAddressStride, int64_t groupCount,
+               int64_t groupInterval, int64_t groupAddressStride,
+               int64_t bank = -1, int64_t weightPage = -1,
+               int64_t logicalBaseRow = -1, int64_t outerGroupSize = 1,
+               int64_t outerInnerStride = 0,
+               int64_t outerGroupStride = 0);
+
 void emitMxm(mlir::IRRewriter &rewriter, mlir::Location location, int64_t cycle,
              int64_t queue, llvm::StringRef opcode, int64_t weightBuffer,
              int64_t weightColumn, int64_t activationStream,
@@ -47,6 +84,20 @@ void emitMxm(mlir::IRRewriter &rewriter, mlir::Location location, int64_t cycle,
              llvm::StringRef weightInputMode = {},
              llvm::StringRef accumulatorOutputFormat = {},
              int64_t weightStreamBase = -1);
+
+// Emit one physical MXM LOAD_3D, COMPUTE_3D, or ACCUMULATOR_READ_3D
+// descriptor. Every loop axis and operand induction is supplied by the
+// operator lowering; this helper never reconstructs a domain from prior ops.
+void emitMxm3D(mlir::IRRewriter &rewriter, mlir::Location location,
+               int64_t cycle, int64_t queue, llvm::StringRef opcode,
+               int64_t weightBuffer, int64_t weightColumn,
+               int64_t activationStream, int64_t outputStream,
+               int64_t accumulatorAddress, int64_t accumulatorRowStride,
+               llvm::StringRef accumulatorDestination, bool accumulatorClear,
+               llvm::StringRef weightLoadMode, int64_t weightInnerColumn,
+               llvm::StringRef dataFormat, llvm::StringRef weightInputMode,
+               llvm::StringRef accumulatorOutputFormat,
+               const MxmDomain3D &domain, int64_t weightStreamBase = -1);
 
 void emitMxmWave(mlir::IRRewriter &rewriter, mlir::Location location,
                  int64_t cycle, int64_t queue, llvm::StringRef opcode,
@@ -74,6 +125,13 @@ void emitMxmDequantWave(mlir::IRRewriter &rewriter, mlir::Location location,
                         int64_t waveCount, int64_t waveInterval,
                         int64_t scaleBinding = -1);
 
+void emitMxmDequant3D(mlir::IRRewriter &rewriter, mlir::Location location,
+                      int64_t cycle, int64_t unitId, float scale,
+                      int64_t repeatCount, int64_t repeatInterval,
+                      int64_t waveCount, int64_t waveInterval,
+                      int64_t groupCount, int64_t groupInterval,
+                      int64_t scaleBinding = -1);
+
 using sxm_detail::blockDiagonalMap;
 using sxm_detail::emitSxm;
 using sxm_detail::emitWavefrontBeat;
@@ -99,7 +157,9 @@ VxmOp emitVxmConfigured(mlir::IRRewriter &rewriter, mlir::Location location,
                         int64_t chainDepth, int64_t repeatCount,
                         int64_t repeatInterval,
                         llvm::StringRef lhsStreamSource = {},
-                        llvm::StringRef rhsStreamSource = {});
+                        llvm::StringRef rhsStreamSource = {},
+                        int64_t waveCount = 1,
+                        int64_t waveInterval = 1);
 
 AttentionProjectionKind projectionKind(int64_t index);
 

@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
+#include "ftlpu/compiler/Dialect/Command/Transforms/fu_3d_command_materializer.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <stdexcept>
 #include <tuple>
 
 namespace ftlpu::compiler {
@@ -142,497 +144,438 @@ void create_binding(mlir::OpBuilder& builder, mlir::Location location,
     builder.create(state);
 }
 
-void create_mem_command(mlir::OpBuilder& builder, mlir::Location location,
-    int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t address,
-    int64_t packed_stream, int64_t repeat_count, int64_t repeat_interval,
-    int64_t address_stride, int64_t wave_count = 1,
-    int64_t wave_interval = 1, int64_t wave_address_stride = 0,
-    int64_t address_binding = -1,
-    llvm::StringRef address_binding_access = {})
+VxmLaneOperation parse_schedule_vxm_operation(llvm::StringRef value)
 {
-    mlir::OperationState state(location, command::MemOp::getOperationName());
-    state.addAttributes({
-        builder.getNamedAttr("cycle", builder.getI64IntegerAttr(cycle)),
-        builder.getNamedAttr("queue", builder.getI64IntegerAttr(queue)),
-        builder.getNamedAttr("opcode", builder.getStringAttr(opcode)),
-        builder.getNamedAttr("address", builder.getI64IntegerAttr(address)),
-        builder.getNamedAttr("packed_stream", builder.getI64IntegerAttr(packed_stream)),
-        builder.getNamedAttr("repeat_count", builder.getI64IntegerAttr(repeat_count)),
-        builder.getNamedAttr("repeat_interval", builder.getI64IntegerAttr(repeat_interval)),
-        builder.getNamedAttr("address_stride", builder.getI64IntegerAttr(address_stride)),
-    });
-    if (wave_count > 1) {
-        state.addAttribute(
-            "wave_count", builder.getI64IntegerAttr(wave_count));
-        state.addAttribute(
-            "wave_interval", builder.getI64IntegerAttr(wave_interval));
-        state.addAttribute("wave_address_stride",
-            builder.getI64IntegerAttr(wave_address_stride));
-    }
-    if (address_binding >= 0) {
-        state.addAttribute("address_binding",
-            builder.getI64IntegerAttr(address_binding));
-        if (!address_binding_access.empty())
-            state.addAttribute("address_binding_access",
-                builder.getStringAttr(address_binding_access));
-    }
-    builder.create(state);
+    if (value == "pass" || value == "bypass" || value == "cast")
+        return VxmAluOpcode::Bypass;
+    if (value == "add") return VxmAluOpcode::Add;
+    if (value == "subtract") return VxmAluOpcode::Subtract;
+    if (value == "multiply") return VxmAluOpcode::Multiply;
+    if (value == "fma") return VxmAluOpcode::FusedMultiplyAdd;
+    if (value == "fms") return VxmAluOpcode::FusedMultiplySubtract;
+    if (value == "negate") return VxmAluOpcode::Negate;
+    if (value == "max") return VxmAluOpcode::Max;
+    if (value == "exp") return VxmSpecialAluOpcode::Exp;
+    if (value == "reciprocal" || value == "divide")
+        return VxmSpecialAluOpcode::Reciprocal;
+    if (value == "rsqrt") return VxmSpecialAluOpcode::Rsqrt;
+    throw std::runtime_error(
+        "Schedule IR VXM operation is not implemented by the current CModel");
 }
 
-command::MxmOp create_mxm_command(
-    mlir::OpBuilder& builder, mlir::Location location,
-    int64_t cycle, int64_t queue, llvm::StringRef opcode, int64_t weight_buffer,
-    int64_t weight_column, int64_t activation_stream_base, int64_t output_stream_base,
-    int64_t repeat_count, int64_t repeat_interval, int64_t accumulator_address,
-    int64_t accumulator_row_stride, llvm::StringRef accumulator_destination,
-    bool accumulator_clear = true, llvm::StringRef data_format = "fp16",
-    llvm::StringRef accumulator_output_format = "fp32")
+std::size_t as_size(int64_t value, llvm::StringRef field)
 {
-    mlir::OperationState state(location, command::MxmOp::getOperationName());
-    state.addAttributes({
-        builder.getNamedAttr("cycle", builder.getI64IntegerAttr(cycle)),
-        builder.getNamedAttr("queue", builder.getI64IntegerAttr(queue)),
-        builder.getNamedAttr("opcode", builder.getStringAttr(opcode)),
-        builder.getNamedAttr("weight_buffer", builder.getI64IntegerAttr(weight_buffer)),
-        builder.getNamedAttr("weight_column", builder.getI64IntegerAttr(weight_column)),
-        builder.getNamedAttr("activation_stream_base", builder.getI64IntegerAttr(activation_stream_base)),
-        builder.getNamedAttr("output_stream_base", builder.getI64IntegerAttr(output_stream_base)),
-        builder.getNamedAttr("repeat_count", builder.getI64IntegerAttr(repeat_count)),
-        builder.getNamedAttr("repeat_interval", builder.getI64IntegerAttr(repeat_interval)),
-        builder.getNamedAttr("accumulator_address", builder.getI64IntegerAttr(accumulator_address)),
-        builder.getNamedAttr("accumulator_row_stride", builder.getI64IntegerAttr(accumulator_row_stride)),
-        builder.getNamedAttr("accumulator_destination", builder.getStringAttr(accumulator_destination)),
-        builder.getNamedAttr("accumulator_clear", builder.getBoolAttr(accumulator_clear)),
-        builder.getNamedAttr("data_format", builder.getStringAttr(data_format)),
-        builder.getNamedAttr("accumulator_output_format",
-            builder.getStringAttr(accumulator_output_format)),
-    });
-    return llvm::cast<command::MxmOp>(builder.create(state));
+    if (value < 0)
+        throw std::runtime_error((field + " must be non-negative").str());
+    return static_cast<std::size_t>(value);
 }
 
-void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op,
-    int64_t repeatCount = -1, int64_t repeatInterval = -1)
+IcuLoop3D loop_3d(int64_t cycle, int64_t innerCount,
+    int64_t innerInterval, int64_t middleCount = 1,
+    int64_t middleInterval = 1, int64_t outerCount = 1,
+    int64_t outerInterval = 1)
 {
-    mlir::OperationState state(op.getLoc(), command::VxmOp::getOperationName());
-      for (llvm::StringRef name : {"cycle", "queue", "opcode", "lhs_kind",
-               "lhs_index", "lhs_immediate", "lhs_stream_source",
-               "rhs_kind", "rhs_index", "rhs_stream_source",
-               "rhs_immediate", "cast_target", "output_stream", "repeat_count",
-               "repeat_interval", "input_hemisphere", "output_hemisphere",
-               "accumulator_reset", "accumulator_write", "accumulator_emit",
-               "local_scalar_write"})
-          if (mlir::Attribute attribute = op->getAttr(name))
-              state.addAttribute(name, attribute);
-    state.addAttribute("chain_depth",
-        op->getAttr("chain_depth")
-            ? op->getAttr("chain_depth")
-            : builder.getI64IntegerAttr(8));
-    if (auto scaleBinding = op.getScaleBindingAttr())
-        state.addAttribute("scale_binding", scaleBinding);
-    if (repeatCount >= 0)
-        state.attributes.set("repeat_count",
-            builder.getI64IntegerAttr(repeatCount));
-    if (repeatInterval >= 0)
-        state.attributes.set("repeat_interval",
-            builder.getI64IntegerAttr(repeatInterval));
-    builder.create(state);
+    return IcuLoop3D {
+        as_size(cycle, "start cycle"),
+        {as_size(innerCount, "inner count"),
+            as_size(middleCount, "middle count"),
+            as_size(outerCount, "outer count")},
+        {as_size(innerInterval, "inner interval"),
+            as_size(middleInterval, "middle interval"),
+            as_size(outerInterval, "outer interval")},
+    };
 }
 
-bool same_vxm_command(schedule::VxmOp lhs, schedule::VxmOp rhs)
+MemIcuAddress3D mem_address_3d(mlir::Operation* operation,
+    std::size_t baseAddress, int64_t innerStride, int64_t middleStride,
+    int64_t affineOuterStride)
 {
-    for (llvm::StringRef name : {"queue", "opcode", "chain_depth", "lhs_kind",
-             "lhs_index", "lhs_immediate", "lhs_stream_source",
-             "rhs_kind", "rhs_index", "rhs_stream_source",
-             "rhs_immediate", "cast_target", "output_stream",
-             "input_hemisphere", "output_hemisphere", "scale_binding",
-             "accumulator_reset", "accumulator_write", "accumulator_emit",
-             "local_scalar_write"}) {
-        if (lhs->getAttr(name) != rhs->getAttr(name)) return false;
+    const auto outerGroupSize =
+        operation->getAttrOfType<mlir::IntegerAttr>("outer_group_size");
+    if (!outerGroupSize)
+        return MemIcuAddress3D::Affine(baseAddress,
+            {innerStride, middleStride, affineOuterStride});
+    const auto outerInnerStride =
+        operation->getAttrOfType<mlir::IntegerAttr>("outer_inner_stride");
+    const auto outerGroupStride =
+        operation->getAttrOfType<mlir::IntegerAttr>("outer_group_stride");
+    if (!outerInnerStride || !outerGroupStride)
+        throw std::runtime_error(
+            "blocked MEM address fields must be specified together");
+    return MemIcuAddress3D::BlockedOuter(baseAddress, innerStride,
+        middleStride,
+        as_size(outerGroupSize.getInt(), "MEM outer group size"),
+        outerInnerStride.getInt(), outerGroupStride.getInt());
+}
+
+MxmDataFormat mxm_data_format(llvm::StringRef value)
+{
+    if (value == "bf16") return MxmDataFormat::BFloat16;
+    if (value == "fp16") return MxmDataFormat::Float16;
+    throw std::runtime_error("MXM data format must be fp16 or bf16");
+}
+
+MxmAccumulatorOutputFormat mxm_accumulator_format(llvm::StringRef value)
+{
+    if (value == "bf16") return MxmAccumulatorOutputFormat::BFloat16;
+    if (value == "fp32") return MxmAccumulatorOutputFormat::Float32;
+    throw std::runtime_error("MXM accumulator format must be fp32 or bf16");
+}
+
+MxmAccumulatorDestination mxm_destination(llvm::StringRef value)
+{
+    return value == "stream"
+        ? MxmAccumulatorDestination::Stream
+        : MxmAccumulatorDestination::Sram;
+}
+
+MxmWeightInputMode mxm_weight_input_mode(llvm::StringRef value)
+{
+    return value == "int8_dequant_bf16"
+        ? MxmWeightInputMode::Int8DequantBf16
+        : MxmWeightInputMode::Direct16;
+}
+
+MxmIcuBufferMode mxm_buffer_mode(llvm::StringRef value)
+{
+    if (value.empty() || value == "fixed") return MxmIcuBufferMode::Fixed;
+    if (value == "toggle_dim0") return MxmIcuBufferMode::ToggleDimension0;
+    if (value == "toggle_dim1") return MxmIcuBufferMode::ToggleDimension1;
+    if (value == "toggle_dim2") return MxmIcuBufferMode::ToggleDimension2;
+    throw std::runtime_error(
+        "MXM buffer mode must be fixed or toggle_dim0/1/2");
+}
+
+void require_materialized(mlir::LogicalResult result,
+    llvm::StringRef unit, const std::string& error)
+{
+    if (mlir::failed(result))
+        throw std::runtime_error(("invalid direct " + unit +
+            " lowering: " + llvm::StringRef(error)).str());
+}
+
+VxmStreamSource parse_schedule_vxm_stream_source(llvm::StringRef value)
+{
+    if (value.empty() || value == "local") return VxmStreamSource::Local;
+    if (value == "east") return VxmStreamSource::East;
+    if (value == "west") return VxmStreamSource::West;
+    throw std::runtime_error(
+        "Schedule IR VXM stream source must be local, east, or west");
+}
+
+VxmLaneOperand parse_schedule_vxm_operand(llvm::StringRef kind,
+    int64_t index, float immediate, int64_t queue,
+    llvm::StringRef streamSource)
+{
+    if (kind == "previous") return VxmLaneOperand::Previous();
+    if (kind == "original") return VxmLaneOperand::Original();
+    if (kind == "auxiliary") return VxmLaneOperand::Aux();
+    if (kind == "accumulator") return VxmLaneOperand::Acc();
+    if (kind == "feedback") return VxmLaneOperand::Feedback();
+    if (kind == "alu") {
+        if (index == queue - 1) return VxmLaneOperand::Previous();
+        throw std::runtime_error(
+            "arbitrary VXM alu(N) references require chain legalization");
     }
-    return lhs.getRepeatCount() == 1 && rhs.getRepeatCount() == 1;
+    const auto streamGroup = [&]() -> std::int32_t {
+        if (index < 0 || index >= 64 || index % 2 != 0)
+            throw std::runtime_error(
+                "VXM 16-bit stream operand requires an even packed stream index");
+        return static_cast<std::int32_t>(((index % 32) / 2) % 8);
+    };
+    if (kind == "stream_f16")
+        return VxmLaneOperand::StreamFloat16(1.0f, streamGroup(),
+            parse_schedule_vxm_stream_source(streamSource));
+    if (kind == "stream_bf16")
+        return VxmLaneOperand::StreamBFloat16(1.0f, streamGroup(),
+            parse_schedule_vxm_stream_source(streamSource));
+    if (kind == "immediate") return VxmLaneOperand::Imm(immediate);
+    throw std::runtime_error(
+        "legacy integer/FP32 VXM stream operands require BF16 legalization");
+}
+
+VxmCastTarget parse_schedule_vxm_cast_target(llvm::StringRef value)
+{
+    if (value == "fp32") return VxmCastTarget::Float32;
+    if (value == "fp16") return VxmCastTarget::Float16;
+    if (value == "bf16") return VxmCastTarget::BFloat16;
+    if (value == "i8") return VxmCastTarget::Int8;
+    throw std::runtime_error("unsupported Schedule IR VXM cast target");
+}
+
+void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op)
+{
+    const int64_t effectiveRepeatCount = op.getRepeatCount();
+    const int64_t effectiveRepeatInterval = op.getRepeatInterval();
+        const int64_t queue = op.getQueue();
+        try {
+        auto instruction = VxmLaneAluInstruction {};
+        instruction.operation = parse_schedule_vxm_operation(op.getOpcode());
+        const auto lhsSource =
+            op->getAttrOfType<mlir::StringAttr>("lhs_stream_source");
+        const auto rhsSource =
+            op->getAttrOfType<mlir::StringAttr>("rhs_stream_source");
+        instruction.lhs = parse_schedule_vxm_operand(op.getLhsKind(),
+            op.getLhsIndex(),
+            static_cast<float>(op.getLhsImmediateAttr().getValueAsDouble()),
+            queue, lhsSource ? lhsSource.getValue() : llvm::StringRef {});
+        instruction.rhs = parse_schedule_vxm_operand(op.getRhsKind(),
+            op.getRhsIndex(),
+            static_cast<float>(op.getRhsImmediateAttr().getValueAsDouble()),
+            queue, rhsSource ? rhsSource.getValue() : llvm::StringRef {});
+        instruction.output_type =
+            parse_schedule_vxm_cast_target(op.getCastTarget());
+        instruction.precision = VxmAluPrecision::Float32;
+        const bool contiguousRun = effectiveRepeatInterval == 1;
+        instruction.repeat_count = static_cast<std::size_t>(
+            contiguousRun ? effectiveRepeatCount : 1);
+        instruction.accumulator_reset =
+            op.getAccumulatorReset().value_or(false);
+        instruction.accumulator_write =
+            op.getAccumulatorWrite().value_or(false);
+        instruction.accumulator_emit =
+            op.getAccumulatorEmit().value_or(true);
+        instruction.local_scalar_write =
+            op.getLocalScalarWrite().value_or(false);
+        const int64_t outputStream = op.getOutputStreamAttr().getInt();
+        if (outputStream >= 0)
+            instruction.output_stream =
+                static_cast<std::size_t>(outputStream);
+        const auto depth = static_cast<VxmChainDepth>(
+            op->getAttrOfType<mlir::IntegerAttr>("chain_depth")
+                ? op->getAttrOfType<mlir::IntegerAttr>("chain_depth").getInt()
+                : 8);
+        const auto run = VxmIcuRun2DInstruction::Run2D(
+            static_cast<std::size_t>(op.getCycle()),
+            {static_cast<std::size_t>(
+                 contiguousRun ? 1 : effectiveRepeatCount),
+                static_cast<std::size_t>(op.getWaveCount().value_or(1))},
+            {static_cast<std::size_t>(
+                 contiguousRun ? 1 : effectiveRepeatInterval),
+                static_cast<std::size_t>(op.getWaveInterval().value_or(1))},
+            isa::encode_vxm_instruction(queue, depth, instruction));
+        std::string error;
+        if (mlir::failed(command::materializeVxmRun2DCommand(builder,
+                op.getLoc(), static_cast<std::size_t>(queue), run, &error,
+                op.getScaleBinding().value_or(-1))))
+            throw std::runtime_error(error);
+        } catch (const std::exception& exception) {
+            throw std::runtime_error("invalid Schedule IR VXM RUN_2D at cycle "
+                + std::to_string(op.getCycle()) + ", queue "
+                + std::to_string(queue) + ", chain_depth "
+                + std::to_string(op.getChainDepth().value_or(8)) + ": "
+                + exception.what());
+        }
 }
 
 void create_sxm_command(mlir::OpBuilder& builder, schedule::SxmOp op)
 {
-    mlir::OperationState state(op.getLoc(), command::SxmOp::getOperationName());
-    for (llvm::StringRef name : {"cycle", "hemisphere", "opcode", "source_streams",
-               "destination_streams", "permute_map", "weight_layout",
-               "output_row", "input_row", "output_tile"})
-        if (op->getAttr(name))
-        state.addAttribute(name, op->getAttr(name));
-    state.addAttribute("repeat_count", builder.getI64IntegerAttr(
-        op.getRepeatCount().value_or(1)));
-    state.addAttribute("repeat_interval", builder.getI64IntegerAttr(
-        op.getRepeatInterval().value_or(1)));
-    builder.create(state);
+    SxmInstruction instruction {};
+    instruction.opcode = op.getOpcode() == "transpose"
+        ? SxmOpcode::Transpose : SxmOpcode::Permute;
+    if (op.getOutputRow())
+        instruction.output_row =
+            static_cast<std::size_t>(*op.getOutputRow());
+    if (op.getInputRow())
+        instruction.input_row =
+            static_cast<std::size_t>(*op.getInputRow());
+    if (op.getOutputTile())
+        instruction.output_tile =
+            static_cast<std::size_t>(*op.getOutputTile());
+    for (mlir::Attribute stream : op.getSourceStreams())
+        instruction.src_streams.push_back(SxmStreamId {
+            static_cast<std::size_t>(
+                llvm::cast<mlir::IntegerAttr>(stream).getInt())});
+    for (mlir::Attribute stream : op.getDestinationStreams())
+        instruction.dst_streams.push_back(SxmStreamId {
+            static_cast<std::size_t>(
+                llvm::cast<mlir::IntegerAttr>(stream).getInt())});
+    for (std::size_t lane = 0;
+         lane < instruction.permute_map.size(); ++lane) {
+        const auto value = llvm::cast<mlir::IntegerAttr>(
+            op.getPermuteMap()[lane]).getInt();
+        instruction.permute_map[lane] = value < 0
+            ? SxmInstruction::kZeroFill
+            : static_cast<std::size_t>(value);
+    }
+    const auto run = SxmIcuRun2DInstruction::Run2D(
+        static_cast<std::size_t>(op.getCycle()),
+        {static_cast<std::size_t>(op.getRepeatCount().value_or(1)),
+            static_cast<std::size_t>(op.getWaveCount().value_or(1))},
+        {static_cast<std::size_t>(op.getRepeatInterval().value_or(1)),
+            static_cast<std::size_t>(op.getWaveInterval().value_or(1))},
+        std::move(instruction),
+        static_cast<std::size_t>(op->getAttrOfType<mlir::IntegerAttr>(
+            "permute_map_stride")
+                ? op->getAttrOfType<mlir::IntegerAttr>(
+                    "permute_map_stride").getInt()
+                : 0));
+    std::string error;
+    if (mlir::failed(command::materializeSxmRun2DCommand(builder,
+            op.getLoc(), op.getOpcode() == "transpose",
+            static_cast<std::size_t>(op.getHemisphere()), run, &error)))
+        throw std::runtime_error(error);
 }
 
 void create_mem_transfer_command(mlir::OpBuilder& builder,
     schedule::MemTransferOp op, const target::LPUTargetModel& target)
 {
-    mlir::OperationState state(op.getLoc(), command::MemOp::getOperationName());
-    for (llvm::StringRef name : {"cycle", "opcode", "address", "packed_stream",
-             "repeat_count", "repeat_interval", "address_stride"})
-        state.addAttribute(name, op->getAttr(name));
-    state.addAttribute("queue", builder.getI64IntegerAttr(
-        mem_queue(target, op.getHemisphere(), op.getSlice(),
-            op.getBank().value_or(0))));
-    for (llvm::StringRef name :
-        {"wave_count", "wave_interval", "wave_address_stride",
-            "address_binding", "address_binding_access"})
-        if (mlir::Attribute attribute = op->getAttr(name))
-            state.addAttribute(name, attribute);
-    builder.create(state);
+    const auto loop = loop_3d(op.getCycle(), op.getRepeatCount(),
+        op.getRepeatInterval(), op.getWaveCount().value_or(1),
+        op.getWaveInterval().value_or(1), op.getGroupCount().value_or(1),
+        op.getGroupInterval().value_or(1));
+    const auto address = mem_address_3d(op.getOperation(),
+        as_size(op.getAddress(), "MEM address"),
+        static_cast<int64_t>(op.getAddressStride()),
+        static_cast<int64_t>(op.getWaveAddressStride().value_or(0)),
+        static_cast<int64_t>(op.getGroupAddressStride().value_or(0)));
+    const auto stream = StreamId::from_packed(
+        as_size(op.getPackedStream(), "MEM stream"));
+    const auto instruction = op.getOpcode() == "read"
+        ? MemIcuInstruction::Read3D(loop, address, stream)
+        : op.getOpcode() == "write_tap"
+        ? MemIcuInstruction::WriteTap3D(loop, address, stream)
+        : MemIcuInstruction::Write3D(loop, address, stream);
+    std::string error;
+    require_materialized(command::materializeMem3DCommand(builder,
+        op.getLoc(), as_size(mem_queue(target, op.getHemisphere(),
+            op.getSlice(), op.getBank().value_or(0)), "MEM queue"),
+        instruction, op.getAddressBinding().value_or(-1),
+        op.getAddressBindingAccess().value_or(""), &error),
+        "MEM cycle " + std::to_string(op.getCycle()) + " stream " +
+            std::to_string(op.getPackedStream()), error);
+}
+
+void create_mem_write_read_2d_command(mlir::OpBuilder& builder,
+    schedule::MemWriteRead2DOp op, const target::LPUTargetModel& target)
+{
+    MemIcuWriteRead2DInstruction instruction{};
+    instruction.counts = {
+        as_size(op.getCount0(), "MEM write/read inner count"),
+        as_size(op.getCount1(), "MEM write/read outer count")};
+    instruction.write_cycle_strides = {
+        as_size(op.getWriteCycleStride0(), "MEM write stride 0"),
+        as_size(op.getWriteCycleStride1(), "MEM write stride 1")};
+    instruction.read_cycle_strides = {
+        as_size(op.getReadCycleStride0(), "MEM read stride 0"),
+        as_size(op.getReadCycleStride1(), "MEM read stride 1")};
+    instruction.read_start_offset =
+        as_size(op.getReadStartOffset(), "MEM read start offset");
+    instruction.base_address = as_size(op.getAddress(), "MEM address");
+    instruction.address_strides = {
+        static_cast<int64_t>(op.getAddressStride0()),
+        static_cast<int64_t>(op.getAddressStride1())};
+    instruction.write_stream = as_size(op.getWriteStream(), "MEM write stream");
+    instruction.read_stream_base =
+        as_size(op.getReadStreamBase(), "MEM read stream base");
+    instruction.read_stream_outer_stride =
+        static_cast<int64_t>(op.getReadStreamOuterStride());
+    const auto queue = mem_queue(target, op.getHemisphere(),
+        op.getSlice(), op.getBank());
+    std::string error;
+    require_materialized(command::materializeMemWriteRead2DCommand(builder,
+        op.getLoc(), as_size(op.getCycle(), "MEM write/read cycle"),
+        as_size(queue, "MEM write/read queue"), instruction, &error),
+        "MEM write/read", error);
 }
 
 void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
 {
-    mlir::OperationState state(op.getLoc(), command::MxmOp::getOperationName());
-    for (llvm::StringRef name : {"cycle", "opcode", "weight_buffer",
-             "weight_column", "activation_stream_base", "output_stream_base",
-             "repeat_count", "repeat_interval", "accumulator_address",
-             "accumulator_row_stride", "accumulator_destination",
-             "accumulator_clear"})
-        state.addAttribute(name, op->getAttr(name));
-    state.addAttribute("data_format", op.getDataFormatAttr()
-            ? op.getDataFormatAttr()
-            : builder.getStringAttr("fp16"));
-    state.addAttribute("accumulator_output_format",
-        op.getAccumulatorOutputFormatAttr()
-            ? op.getAccumulatorOutputFormatAttr()
-            : builder.getStringAttr("fp32"));
-    state.addAttribute("queue", builder.getI64IntegerAttr(op.getUnitId()));
-    for (llvm::StringRef name :
-        {"weight_load_mode", "weight_inner_column",
-            "weight_input_mode", "weight_stream_base", "wave_count",
-            "wave_interval", "wave_weight_column_stride",
-            "wave_accumulator_address_stride",
-            "group_count", "group_interval"})
-        if (mlir::Attribute attribute = op->getAttr(name))
-            state.addAttribute(name, attribute);
-    builder.create(state);
+    const auto loop = loop_3d(op.getCycle(), op.getRepeatCount(),
+        op.getRepeatInterval(), op.getWaveCount().value_or(1),
+        op.getWaveInterval().value_or(1), op.getGroupCount().value_or(1),
+        op.getGroupInterval().value_or(1));
+    const auto queue = as_size(op.getUnitId(), "MXM queue");
+    std::string error;
+    if (op.getOpcode() == "iw") {
+        if (op.getWeightLoadMode().value_or("supercell") == "column"
+            || op.getWeightInnerColumn().value_or(0) != 0)
+            throw std::runtime_error(
+                "direct MXM LOAD_3D does not encode legacy IWColumn mode");
+        auto instruction = MxmLoadIcuInstruction::Load3D(loop,
+            as_size(op.getWeightBuffer(), "weight buffer"),
+            mxm_buffer_mode(op.getWeightBufferMode().value_or("fixed")),
+            as_size(op.getWeightColumn(), "weight column"),
+            {static_cast<int64_t>(
+                 op.getRepeatWeightColumnStride().value_or(0)),
+                static_cast<int64_t>(
+                    op.getWaveWeightColumnStride().value_or(0)),
+                static_cast<int64_t>(
+                    op.getGroupWeightColumnStride().value_or(0))},
+            as_size(op.getWeightStreamBase().value_or(0),
+                "weight stream base"),
+            mxm_weight_input_mode(
+                op.getWeightInputMode().value_or("direct16")));
+        require_materialized(command::materializeMxmLoad3DCommand(builder,
+            op.getLoc(), queue, instruction, &error), "MXM load", error);
+        return;
+    }
+    const auto destination = mxm_destination(op.getAccumulatorDestination());
+    const auto outputFormat = mxm_accumulator_format(
+        op.getAccumulatorOutputFormat().value_or("fp32"));
+    if (op.getOpcode() == "accumulator_read") {
+        auto instruction = MxmComputeIcuInstruction::AccumulatorRead3D(loop,
+            as_size(op.getOutputStreamBase(), "MXM output stream"),
+            as_size(op.getAccumulatorAddress(), "accumulator address"),
+            {static_cast<int64_t>(
+                 op.getRepeatAccumulatorAddressStride().value_or(0)),
+                static_cast<int64_t>(
+                    op.getWaveAccumulatorAddressStride().value_or(0)),
+                static_cast<int64_t>(
+                    op.getGroupAccumulatorAddressStride().value_or(0))},
+            op.getAccumulatorClear(), outputFormat, destination);
+        require_materialized(command::materializeMxmCompute3DCommand(builder,
+            op.getLoc(), queue, instruction, &error), "MXM accumulator read",
+            error);
+        return;
+    }
+    if (op.getOpcode() != "compute")
+        throw std::runtime_error("unsupported direct MXM opcode");
+    const MxmComputeIcuMode mode {destination, op.getAccumulatorClear(),
+        outputFormat};
+    const MxmComputeIcuMode terminalMode {
+        mxm_destination(op.getTerminalAccumulatorDestination().value_or(
+            op.getAccumulatorDestination())),
+        op.getTerminalAccumulatorClear().value_or(op.getAccumulatorClear()),
+        mxm_accumulator_format(
+            op.getTerminalAccumulatorOutputFormat().value_or(
+                op.getAccumulatorOutputFormat().value_or("fp32")))};
+    auto instruction = MxmComputeIcuInstruction::Compute3D(loop,
+        as_size(op.getWeightBuffer(), "weight buffer"),
+        mxm_buffer_mode(op.getWeightBufferMode().value_or("fixed")),
+        as_size(op.getActivationStreamBase(), "activation stream"),
+        as_size(op.getOutputStreamBase(), "output stream"),
+        as_size(op.getAccumulatorAddress(), "accumulator address"),
+        {static_cast<int64_t>(
+             op.getRepeatAccumulatorAddressStride().value_or(0)),
+            static_cast<int64_t>(
+                op.getWaveAccumulatorAddressStride().value_or(0)),
+            static_cast<int64_t>(
+                op.getGroupAccumulatorAddressStride().value_or(0))},
+        as_size(op.getAccumulatorRowStride(), "accumulator row stride"),
+        mxm_data_format(op.getDataFormat().value_or("fp16")), mode,
+        static_cast<std::size_t>(op.getTerminalDimension().value_or(
+            MxmComputeIcuInstruction::kNoTerminalDimension)), terminalMode);
+    require_materialized(command::materializeMxmCompute3DCommand(builder,
+        op.getLoc(), queue, instruction, &error), "MXM compute", error);
 }
 
 void create_mxm_dequant_command(
     mlir::OpBuilder& builder, schedule::MxmDequantOp op)
 {
-    mlir::OperationState state(
-        op.getLoc(), command::MxmDequantOp::getOperationName());
-    state.addAttributes({
-        builder.getNamedAttr("cycle", op.getCycleAttr()),
-        builder.getNamedAttr(
-            "queue", builder.getI64IntegerAttr(op.getUnitId())),
-        builder.getNamedAttr("scale", op.getScaleAttr()),
-        builder.getNamedAttr(
-            "repeat_count", op.getRepeatCountAttr()),
-        builder.getNamedAttr(
-            "repeat_interval", op.getRepeatIntervalAttr()),
-    });
-    for (llvm::StringRef name : {"wave_count", "wave_interval"})
-        if (mlir::Attribute attribute = op->getAttr(name))
-            state.addAttribute(name, attribute);
-    if (auto scaleBinding = op.getScaleBindingAttr())
-        state.addAttribute("scale_binding", scaleBinding);
-    builder.create(state);
-}
-
-void create_mem_bundle_command(mlir::OpBuilder& builder,
-    mlir::Location location, llvm::ArrayRef<int64_t> cycles,
-    llvm::ArrayRef<int64_t> queues, llvm::StringRef opcode,
-    llvm::ArrayRef<int64_t> addresses,
-    llvm::ArrayRef<int64_t> packedStreams, int64_t repeatCount,
-    int64_t repeatInterval, int64_t addressStride,
-    int64_t waveCount = 1, int64_t waveInterval = 1,
-    int64_t waveAddressStride = 0, int64_t addressBinding = -1,
-    llvm::StringRef addressBindingAccess = {})
-{
-    const auto array = [&](llvm::ArrayRef<int64_t> values) {
-        llvm::SmallVector<mlir::Attribute> attributes;
-        attributes.reserve(values.size());
-        for (int64_t value : values)
-            attributes.push_back(builder.getI64IntegerAttr(value));
-        return builder.getArrayAttr(attributes);
-    };
-    mlir::OperationState state(
-        location, command::MemBundleOp::getOperationName());
-    state.addAttributes({
-        builder.getNamedAttr("cycles", array(cycles)),
-        builder.getNamedAttr("queues", array(queues)),
-        builder.getNamedAttr("opcode", builder.getStringAttr(opcode)),
-        builder.getNamedAttr("addresses", array(addresses)),
-        builder.getNamedAttr("packed_streams", array(packedStreams)),
-        builder.getNamedAttr(
-            "repeat_count", builder.getI64IntegerAttr(repeatCount)),
-        builder.getNamedAttr(
-            "repeat_interval", builder.getI64IntegerAttr(repeatInterval)),
-        builder.getNamedAttr(
-            "address_stride", builder.getI64IntegerAttr(addressStride)),
-    });
-    if (waveCount > 1) {
-        state.addAttribute(
-            "wave_count", builder.getI64IntegerAttr(waveCount));
-        state.addAttribute(
-            "wave_interval", builder.getI64IntegerAttr(waveInterval));
-        state.addAttribute("wave_address_stride",
-            builder.getI64IntegerAttr(waveAddressStride));
-    }
-    if (addressBinding >= 0) {
-        state.addAttribute("address_binding",
-            builder.getI64IntegerAttr(addressBinding));
-        if (!addressBindingAccess.empty())
-            state.addAttribute("address_binding_access",
-                builder.getStringAttr(addressBindingAccess));
-    }
-    builder.create(state);
-}
-
-mlir::DictionaryAttr command_pattern_attributes(mlir::Operation* operation,
-    mlir::MLIRContext* context, llvm::ArrayRef<llvm::StringRef> excluded)
-{
-    llvm::SmallVector<mlir::NamedAttribute> attributes;
-    for (mlir::NamedAttribute attribute : operation->getAttrs())
-        if (!llvm::is_contained(excluded,
-                attribute.getName().strref()))
-            attributes.push_back(attribute);
-    return mlir::DictionaryAttr::get(context, attributes);
-}
-
-void compress_mxm_command_waves(
-    mlir::func::FuncOp function, mlir::Builder& builder)
-{
-    struct Group {
-        mlir::DictionaryAttr key;
-        llvm::SmallVector<command::MxmOp> operations;
-    };
-    std::map<const void*, Group> groups;
-    function.walk([&](command::MxmOp op) {
-        if (op.getOpcode() != "compute"
-            || op.getWaveCount().value_or(1) != 1
-            || op.getGroupCount().value_or(1) != 1)
-            return;
-        auto key = command_pattern_attributes(op, function.getContext(),
-            {"cycle", "accumulator_address", "wave_count",
-                "wave_interval", "wave_accumulator_address_stride"});
-        auto& group = groups[key.getAsOpaquePointer()];
-        group.key = key;
-        group.operations.push_back(op);
-    });
-
-    llvm::SmallVector<command::MxmOp> toErase;
-    for (auto& [key, group] : groups) {
-        (void)key;
-        auto& operations = group.operations;
-        llvm::sort(operations,
-            [](command::MxmOp lhs, command::MxmOp rhs) {
-                return lhs.getCycle() < rhs.getCycle();
-            });
-        std::map<std::pair<int64_t, int64_t>, std::size_t> lookup;
-        for (std::size_t index = 0; index < operations.size(); ++index)
-            lookup.emplace(
-                std::pair {static_cast<int64_t>(operations[index].getCycle()),
-                    static_cast<int64_t>(
-                        operations[index].getAccumulatorAddress())},
-                index);
-        llvm::SmallVector<bool> used(operations.size(), false);
-        for (std::size_t seed = 0; seed < operations.size(); ++seed) {
-            if (used[seed]) continue;
-            llvm::SmallVector<std::size_t> best {seed};
-            const int64_t seedCycle = operations[seed].getCycle();
-            const int64_t seedAddress =
-                operations[seed].getAccumulatorAddress();
-            const std::size_t candidateEnd = std::min(
-                operations.size(), seed + std::size_t {17});
-            for (std::size_t candidate = seed + 1;
-                 candidate < candidateEnd; ++candidate) {
-                if (used[candidate]) continue;
-                const int64_t interval =
-                    operations[candidate].getCycle() - seedCycle;
-                const int64_t stride =
-                    operations[candidate].getAccumulatorAddress()
-                    - seedAddress;
-                if (interval <= 0 || interval > 65535
-                    || stride < -32768 || stride > 32767)
-                    continue;
-                llvm::SmallVector<std::size_t> sequence {seed};
-                for (int64_t wave = 1; wave < 1023; ++wave) {
-                    auto found = lookup.find(
-                        {seedCycle + wave * interval,
-                            seedAddress + wave * stride});
-                    if (found == lookup.end() || used[found->second])
-                        break;
-                    sequence.push_back(found->second);
-                }
-                if (sequence.size() > best.size())
-                    best = std::move(sequence);
-            }
-            if (best.size() < 2) {
-                used[seed] = true;
-                continue;
-            }
-            command::MxmOp representative = operations[best.front()];
-            representative->setAttr("wave_count",
-                builder.getI64IntegerAttr(best.size()));
-            representative->setAttr("wave_interval",
-                builder.getI64IntegerAttr(
-                    operations[best[1]].getCycle() - seedCycle));
-            representative->setAttr("wave_accumulator_address_stride",
-                builder.getI64IntegerAttr(
-                    operations[best[1]].getAccumulatorAddress()
-                    - seedAddress));
-            for (std::size_t index : best) {
-                used[index] = true;
-                if (index != best.front())
-                    toErase.push_back(operations[index]);
-            }
-        }
-    }
-    for (command::MxmOp operation : toErase) operation.erase();
-}
-
-void compress_mxm_command_groups(
-    mlir::func::FuncOp function, mlir::Builder& builder)
-{
-    struct Group {
-        mlir::DictionaryAttr key;
-        llvm::SmallVector<command::MxmOp> operations;
-    };
-    std::map<const void*, Group> groups;
-    function.walk([&](command::MxmOp op) {
-        if (op.getRepeatCount() != 1
-            || op.getGroupCount().value_or(1) != 1)
-            return;
-        auto key = command_pattern_attributes(op, function.getContext(),
-            {"cycle", "group_count", "group_interval"});
-        auto& group = groups[key.getAsOpaquePointer()];
-        group.key = key;
-        group.operations.push_back(op);
-    });
-
-    llvm::SmallVector<command::MxmOp> toErase;
-    for (auto& [key, group] : groups) {
-        (void)key;
-        auto& operations = group.operations;
-        llvm::sort(operations,
-            [](command::MxmOp lhs, command::MxmOp rhs) {
-                return lhs.getCycle() < rhs.getCycle();
-            });
-        llvm::SmallVector<bool> used(operations.size(), false);
-        std::map<int64_t, std::size_t> lookup;
-        for (std::size_t index = 0; index < operations.size(); ++index)
-            lookup.emplace(operations[index].getCycle(), index);
-        for (std::size_t seed = 0; seed < operations.size(); ++seed) {
-            if (used[seed]) continue;
-            llvm::SmallVector<std::size_t> best {seed};
-            const int64_t seedCycle = operations[seed].getCycle();
-            const std::size_t candidateEnd = std::min(
-                operations.size(), seed + std::size_t {17});
-            for (std::size_t candidate = seed + 1;
-                 candidate < candidateEnd; ++candidate) {
-                if (used[candidate]) continue;
-                const int64_t interval =
-                    operations[candidate].getCycle() - seedCycle;
-                if (interval <= 0 || interval > 65535) continue;
-                llvm::SmallVector<std::size_t> sequence {seed};
-                for (int64_t groupIndex = 1;
-                     groupIndex < 1023; ++groupIndex) {
-                    auto found = lookup.find(
-                        seedCycle + groupIndex * interval);
-                    if (found == lookup.end() || used[found->second]) break;
-                    sequence.push_back(found->second);
-                }
-                if (sequence.size() > best.size())
-                    best = std::move(sequence);
-            }
-            if (best.size() < 2) {
-                used[seed] = true;
-                continue;
-            }
-            command::MxmOp representative = operations[best.front()];
-            representative->setAttr("group_count",
-                builder.getI64IntegerAttr(best.size()));
-            representative->setAttr("group_interval",
-                builder.getI64IntegerAttr(
-                    operations[best[1]].getCycle() - seedCycle));
-            for (std::size_t index : best) {
-                used[index] = true;
-                if (index != best.front())
-                    toErase.push_back(operations[index]);
-            }
-        }
-    }
-    for (command::MxmOp operation : toErase) operation.erase();
-}
-
-void compress_mxm_dequant_command_waves(
-    mlir::func::FuncOp function, mlir::Builder& builder)
-{
-    struct Group {
-        mlir::DictionaryAttr key;
-        llvm::SmallVector<command::MxmDequantOp> operations;
-    };
-    std::map<const void*, Group> groups;
-    function.walk([&](command::MxmDequantOp op) {
-        if (op.getWaveCount().value_or(1) != 1) return;
-        auto key = command_pattern_attributes(op, function.getContext(),
-            {"cycle", "wave_count", "wave_interval"});
-        auto& group = groups[key.getAsOpaquePointer()];
-        group.key = key;
-        group.operations.push_back(op);
-    });
-    llvm::SmallVector<command::MxmDequantOp> toErase;
-    for (auto& [key, group] : groups) {
-        (void)key;
-        auto& operations = group.operations;
-        llvm::sort(operations,
-            [](command::MxmDequantOp lhs,
-                command::MxmDequantOp rhs) {
-                return lhs.getCycle() < rhs.getCycle();
-            });
-        std::map<int64_t, std::size_t> lookup;
-        for (std::size_t index = 0; index < operations.size(); ++index)
-            lookup.emplace(operations[index].getCycle(), index);
-        llvm::SmallVector<bool> used(operations.size(), false);
-        for (std::size_t seed = 0; seed < operations.size(); ++seed) {
-            if (used[seed]) continue;
-            llvm::SmallVector<std::size_t> best {seed};
-            const int64_t seedCycle = operations[seed].getCycle();
-            const std::size_t candidateEnd = std::min(
-                operations.size(), seed + std::size_t {17});
-            for (std::size_t candidate = seed + 1;
-                 candidate < candidateEnd; ++candidate) {
-                if (used[candidate]) continue;
-                const int64_t interval =
-                    operations[candidate].getCycle() - seedCycle;
-                if (interval <= 0 || interval > 65535) continue;
-                llvm::SmallVector<std::size_t> sequence {seed};
-                for (int64_t wave = 1; wave < 1023; ++wave) {
-                    auto found = lookup.find(seedCycle + wave * interval);
-                    if (found == lookup.end() || used[found->second]) break;
-                    sequence.push_back(found->second);
-                }
-                if (sequence.size() > best.size())
-                    best = std::move(sequence);
-            }
-            if (best.size() < 2) {
-                used[seed] = true;
-                continue;
-            }
-            command::MxmDequantOp representative =
-                operations[best.front()];
-            representative->setAttr("wave_count",
-                builder.getI64IntegerAttr(best.size()));
-            representative->setAttr("wave_interval",
-                builder.getI64IntegerAttr(
-                    operations[best[1]].getCycle() - seedCycle));
-            for (std::size_t index : best) {
-                used[index] = true;
-                if (index != best.front())
-                    toErase.push_back(operations[index]);
-            }
-        }
-    }
-    for (command::MxmDequantOp operation : toErase)
-        operation.erase();
+    auto instruction = MxmDequantIcuInstruction::Dequant3D(
+        loop_3d(op.getCycle(), op.getRepeatCount(), op.getRepeatInterval(),
+            op.getWaveCount().value_or(1),
+            op.getWaveInterval().value_or(1),
+            op.getGroupCount().value_or(1),
+            op.getGroupInterval().value_or(1)),
+        MxmDequantInstruction::Scale(
+            static_cast<float>(op.getScaleAttr().getValueAsDouble())));
+    std::string error;
+    require_materialized(command::materializeMxmDequant3DCommand(builder,
+        op.getLoc(), as_size(op.getUnitId(), "MXM dequant queue"),
+        instruction, op.getScaleBinding().value_or(-1), &error),
+        "MXM dequant", error);
 }
 
 class ScheduleToCommandPass final
@@ -659,8 +602,21 @@ public:
         function.walk([&](command::MxmDequantOp) {
             has_commands = true;
         });
+        function.walk([&](command::Mem3DOp) { has_commands = true; });
+        function.walk([&](command::MemWriteRead2DOp) { has_commands = true; });
+        function.walk([&](command::MxmLoad3DOp) {
+            has_commands = true;
+        });
+        function.walk([&](command::MxmDequant3DOp) {
+            has_commands = true;
+        });
+        function.walk([&](command::MxmCompute3DOp) {
+            has_commands = true;
+        });
         function.walk([&](command::VxmOp) { has_commands = true; });
         function.walk([&](command::SxmOp) { has_commands = true; });
+        function.walk([&](command::VxmRun2DOp) { has_commands = true; });
+        function.walk([&](command::SxmRun2DOp) { has_commands = true; });
         if (has_commands) {
             function.emitError("Command IR has already been generated");
             signalPassFailure();
@@ -674,6 +630,7 @@ public:
         llvm::SmallVector<schedule::VxmOp> vxms;
         llvm::SmallVector<schedule::SxmOp> sxms;
         llvm::SmallVector<schedule::MemTransferOp> mem_transfers;
+        llvm::SmallVector<schedule::MemWriteRead2DOp> mem_write_reads;
         llvm::SmallVector<schedule::MxmIssueOp> mxm_issues;
         llvm::SmallVector<schedule::MxmDequantOp> mxm_dequants;
         llvm::SmallVector<schedule::BindingOp> bindings;
@@ -701,6 +658,9 @@ public:
         function.walk([&](schedule::MemTransferOp op) {
             mem_transfers.push_back(op);
         });
+        function.walk([&](schedule::MemWriteRead2DOp op) {
+            mem_write_reads.push_back(op);
+        });
         function.walk([&](schedule::MxmIssueOp op) {
             mxm_issues.push_back(op);
         });
@@ -722,6 +682,7 @@ public:
         if (reads.empty() && loads.empty() && computes.empty()
             && accumulator_reads.empty() && vxms.empty() && sxms.empty()
             && mem_transfers.empty() && mxm_issues.empty()
+            && mem_write_reads.empty()
             && mxm_dequants.empty()
             && bindings.empty() && timelines.empty() && writes.empty()
             && accumulates.empty()) {
@@ -746,6 +707,8 @@ public:
                 outputReadyCycle,
                 static_cast<int64_t>(
                     write.getCycle()
+                    + (write.getGroupCount().value_or(1) - 1)
+                        * write.getGroupInterval().value_or(1)
                     + (write.getWaveCount().value_or(1) - 1)
                         * write.getWaveInterval().value_or(1)
                     + write.getDuration()));
@@ -810,6 +773,8 @@ public:
                 interval.ready, read.getCycle());
             interval.release = std::max<int64_t>(interval.release,
                 read.getCycle()
+                    + (read.getGroupCount().value_or(1) - 1)
+                        * read.getGroupInterval().value_or(1)
                     + (read.getWaveCount().value_or(1) - 1)
                         * read.getWaveInterval().value_or(1)
                     + read.getDuration());
@@ -834,6 +799,8 @@ public:
                     transfer.getLoc()});
             auto& interval = position->second;
             const int64_t endCycle = transfer.getCycle()
+                + (transfer.getGroupCount().value_or(1) - 1)
+                    * transfer.getGroupInterval().value_or(1)
                 + (transfer.getWaveCount().value_or(1) - 1)
                     * transfer.getWaveInterval().value_or(1)
                 + (transfer.getRepeatCount() - 1)
@@ -917,6 +884,8 @@ public:
             create_binding(builder, write.getLoc(), outputIndex++,
                 "output", "result", "result",
                 write.getCycle()
+                    + (write.getGroupCount().value_or(1) - 1)
+                        * write.getGroupInterval().value_or(1)
                     + (write.getWaveCount().value_or(1) - 1)
                         * write.getWaveInterval().value_or(1)
                     + write.getDuration(), type,
@@ -935,118 +904,15 @@ public:
                     read.getPlacement(), "instruction_count");
             loadRepeatCounts.push_back(repeatCount);
         }
-        llvm::sort(mem_transfers,
-            [&](schedule::MemTransferOp lhs,
-                schedule::MemTransferOp rhs) {
-                const int64_t lhsQueue = lhs.getHemisphere()
-                        * target.memory().slices_per_hemisphere
-                        * target.memory().banks_per_slice
-                    + lhs.getSlice() * target.memory().banks_per_slice
-                    + lhs.getBank().value_or(0);
-                const int64_t rhsQueue = rhs.getHemisphere()
-                        * target.memory().slices_per_hemisphere
-                        * target.memory().banks_per_slice
-                    + rhs.getSlice() * target.memory().banks_per_slice
-                    + rhs.getBank().value_or(0);
-                return lhsQueue != rhsQueue
-                    ? lhsQueue < rhsQueue
-                    : lhs.getCycle() < rhs.getCycle();
-            });
-        for (std::size_t index = 0;
-             index < mem_transfers.size();) {
-            schedule::MemTransferOp first = mem_transfers[index];
-            const int64_t queue = mem_queue(target, first.getHemisphere(),
-                first.getSlice(),
-                first.getBank().value_or(0));
-            std::size_t end = index + 1;
-            int64_t interval = 1;
-            int64_t stride = first.getAddressStride();
-            const int64_t firstWaveCount =
-                first->getAttrOfType<mlir::IntegerAttr>("wave_count")
-                ? first->getAttrOfType<mlir::IntegerAttr>("wave_count").getInt()
-                : 1;
-            if (first.getRepeatCount() == 1 && firstWaveCount == 1
-                && end < mem_transfers.size()) {
-                schedule::MemTransferOp second = mem_transfers[end];
-                const int64_t secondQueue = second.getHemisphere()
-                        * target.memory().slices_per_hemisphere
-                        * target.memory().banks_per_slice
-                    + second.getSlice() * target.memory().banks_per_slice
-                    + second.getBank().value_or(0);
-                const bool compatible =
-                    secondQueue == queue
-                    && second.getRepeatCount() == 1
-                    && !second->getAttr("wave_count")
-                    && second.getOpcode() == first.getOpcode()
-                    && second.getPackedStream()
-                        == first.getPackedStream()
-                    && second.getAddressBinding()
-                        == first.getAddressBinding()
-                    && second.getAddressBindingAccess()
-                        == first.getAddressBindingAccess();
-                if (compatible) {
-                    interval = second.getCycle() - first.getCycle();
-                    stride = second.getAddress() - first.getAddress();
-                    if (interval > 0
-                        && interval <= kMaxRepeatInterval
-                        && stride >= kMinRepeatStride
-                        && stride <= kMaxRepeatStride) {
-                        ++end;
-                        while (end < mem_transfers.size()
-                            && static_cast<int64_t>(end - index)
-                                < kMaxRepeatCount) {
-                            schedule::MemTransferOp next =
-                                mem_transfers[end];
-                            const int64_t nextQueue =
-                                mem_queue(target, next.getHemisphere(),
-                                    next.getSlice(),
-                                    next.getBank().value_or(0));
-                            const int64_t repeat =
-                                static_cast<int64_t>(end - index);
-                            if (nextQueue != queue
-                                || next.getRepeatCount() != 1
-                                || next->getAttr("wave_count")
-                                || next.getOpcode()
-                                    != first.getOpcode()
-                                || next.getPackedStream()
-                                    != first.getPackedStream()
-                                || next.getAddressBinding()
-                                    != first.getAddressBinding()
-                                || next.getAddressBindingAccess()
-                                    != first.getAddressBindingAccess()
-                                || next.getCycle()
-                                    != first.getCycle()
-                                        + repeat * interval
-                                || next.getAddress()
-                                    != first.getAddress()
-                                        + repeat * stride)
-                                break;
-                            ++end;
-                        }
-                    } else {
-                        end = index + 1;
-                        interval = first.getRepeatInterval();
-                        stride = first.getAddressStride();
-                    }
-                }
-            }
-            builder.setInsertionPointAfter(first);
-            const int64_t runLength =
-                static_cast<int64_t>(end - index);
-            if (runLength > 1) {
-                create_mem_command(builder, first.getLoc(),
-                    first.getCycle(), queue, first.getOpcode(),
-                    first.getAddress(), first.getPackedStream(),
-                    runLength, interval, stride, 1, 1, 0,
-                    first.getAddressBinding().value_or(-1),
-                    first.getAddressBindingAccess().value_or(""));
-            } else {
-                create_mem_transfer_command(
-                    builder, first, target);
-            }
-            for (std::size_t erase = index; erase < end; ++erase)
-                mem_transfers[erase].erase();
-            index = end;
+        for (schedule::MemTransferOp transfer : mem_transfers) {
+            builder.setInsertionPointAfter(transfer);
+            create_mem_transfer_command(builder, transfer, target);
+            transfer.erase();
+        }
+        for (schedule::MemWriteRead2DOp transfer : mem_write_reads) {
+            builder.setInsertionPointAfter(transfer);
+            create_mem_write_read_2d_command(builder, transfer, target);
+            transfer.erase();
         }
         for (schedule::MxmIssueOp mxm : mxm_issues) {
             builder.setInsertionPointAfter(mxm);
@@ -1058,45 +924,9 @@ public:
             create_mxm_dequant_command(builder, dequant);
             dequant.erase();
         }
-        llvm::sort(vxms, [](schedule::VxmOp lhs, schedule::VxmOp rhs) {
-            return lhs.getQueue() != rhs.getQueue()
-                ? lhs.getQueue() < rhs.getQueue()
-                : lhs.getCycle() < rhs.getCycle();
-        });
-        for (std::size_t index = 0; index < vxms.size();) {
-            schedule::VxmOp first = vxms[index];
-            std::size_t end = index + 1;
-            int64_t interval = first.getRepeatInterval();
-            if (end < vxms.size()
-                && same_vxm_command(first, vxms[end])) {
-                  interval =
-                      vxms[end].getCycle() - first.getCycle();
-                  if (interval == 1) {
-                    ++end;
-                    while (end < vxms.size()
-                        && static_cast<int64_t>(end - index)
-                            < kMaxRepeatCount) {
-                        const int64_t repeat =
-                            static_cast<int64_t>(end - index);
-                        if (!same_vxm_command(first, vxms[end])
-                            || vxms[end].getCycle()
-                                != first.getCycle()
-                                    + repeat * interval)
-                            break;
-                        ++end;
-                    }
-                } else {
-                    end = index + 1;
-                    interval = first.getRepeatInterval();
-                }
-            }
-            builder.setInsertionPointAfter(first);
-            const int64_t runLength =
-                static_cast<int64_t>(end - index);
-            create_vxm_command(builder, first,
-                runLength > 1 ? runLength : -1,
-                runLength > 1 ? interval : -1);
-            index = end;
+        for (schedule::VxmOp vxm : vxms) {
+            builder.setInsertionPointAfter(vxm);
+            create_vxm_command(builder, vxm);
         }
         for (schedule::SxmOp sxm : sxms) {
             builder.setInsertionPointAfter(sxm);
@@ -1152,34 +982,39 @@ public:
                 signalPassFailure();
                 return;
             }
-            llvm::SmallVector<int64_t> cycles;
-            llvm::SmallVector<int64_t> queues;
-            llvm::SmallVector<int64_t> addresses;
-            llvm::SmallVector<int64_t> packedStreams;
-            cycles.reserve(slices.size());
-            queues.reserve(slices.size());
-            addresses.reserve(slices.size());
-            packedStreams.reserve(slices.size());
+            builder.setInsertionPointAfter(read);
             for (size_t index = 0; index < slices.size(); ++index) {
                 const int64_t latency = *target.transport_latency(
                     target::StreamEndpoint::Mem, destination,
                     direction, slices[index]);
-                cycles.push_back(static_cast<int64_t>(read.getCycle())
-                    + max_latency - latency);
-                queues.push_back(mem_queue(target,
-                    west_hemisphere ? 1 : 0, slices[index], bank));
-                addresses.push_back(command_base);
-                packedStreams.push_back((west_stream ? 32 : 0)
+                const int64_t cycle = static_cast<int64_t>(read.getCycle())
+                    + max_latency - latency;
+                const int64_t queue = mem_queue(target,
+                    west_hemisphere ? 1 : 0, slices[index], bank);
+                const int64_t packedStream = (west_stream ? 32 : 0)
                     + static_cast<int64_t>(read.getStreamBase())
-                    + static_cast<int64_t>(index));
+                    + static_cast<int64_t>(index);
+                const auto loop = loop_3d(cycle, count, 1,
+                    read.getWaveCount().value_or(1),
+                    read.getWaveInterval().value_or(1),
+                    read.getGroupCount().value_or(1),
+                    read.getGroupInterval().value_or(1));
+                const auto instruction = MemIcuInstruction::Read3D(loop,
+                    mem_address_3d(read.getOperation(),
+                        as_size(command_base, "MEM read address"), stride,
+                        static_cast<int64_t>(
+                            read.getWaveAddressStride().value_or(0)),
+                        static_cast<int64_t>(
+                            read.getGroupAddressStride().value_or(0))),
+                    StreamId::from_packed(as_size(packedStream,
+                        "MEM read stream")));
+                std::string error;
+                require_materialized(command::materializeMem3DCommand(
+                    builder, read.getLoc(), as_size(queue, "MEM read queue"),
+                    instruction, addressBinding,
+                    addressBinding >= 0 ? "input" : "", &error),
+                    "MEM read", error);
             }
-            builder.setInsertionPointAfter(read);
-            create_mem_bundle_command(builder, read.getLoc(), cycles,
-                queues, "read", addresses, packedStreams, count, 1,
-                stride, read.getWaveCount().value_or(1),
-                read.getWaveInterval().value_or(1),
-                read.getWaveAddressStride().value_or(0), addressBinding,
-                addressBinding >= 0 ? "input" : "");
         }
 
         for (std::size_t loadIndex = 0;
@@ -1190,39 +1025,39 @@ public:
                 loadRepeatCounts[loadIndex];
             const int64_t columnsPerWave =
                 target.throughput().tile_rows;
-            for (int64_t column = 0; column < repeat_count;
-                 column += columnsPerWave) {
-                // The four west-to-east weight pulses reach the MXM column
-                // controls in reverse physical order.
-                const int64_t waveCount = std::min(
-                    columnsPerWave, repeat_count - column);
-                const int64_t weight_column = columnsPerWave - 1;
-                auto command = create_mxm_command(builder, load.getLoc(),
-                    load.getCycle() + column, load.getUnitId(),
-                    "iw", load.getWeightBuffer(), weight_column,
-                    0, 0, 1, 1, 0, 1, "sram", true,
-                    load.getDataFormat().value_or("fp16"));
-                if (waveCount > 1) {
-                    command->setAttr("wave_count",
-                        builder.getI64IntegerAttr(waveCount));
-                    command->setAttr("wave_interval",
-                        builder.getI64IntegerAttr(1));
-                    command->setAttr("wave_weight_column_stride",
-                        builder.getI64IntegerAttr(-1));
-                }
-                if (auto mode = load.getWeightInputModeAttr())
-                    command->setAttr("weight_input_mode", mode);
-                command->setAttr("weight_stream_base",
-                    builder.getI64IntegerAttr(load.getStreamBase()));
-                if (load.getGroupCount().value_or(1) > 1) {
-                    command->setAttr("group_count",
-                        builder.getI64IntegerAttr(static_cast<int64_t>(
-                            load.getGroupCount().value_or(1))));
-                    command->setAttr("group_interval",
-                        builder.getI64IntegerAttr(static_cast<int64_t>(
-                            load.getGroupInterval().value_or(1))));
-                }
-            }
+            const int64_t fullWaves = repeat_count / columnsPerWave;
+            const int64_t tailColumns = repeat_count % columnsPerWave;
+            const auto materializeLoadDomain = [&](int64_t startOffset,
+                                                   int64_t innerCount,
+                                                   int64_t waveCount) {
+                // The compiler emits one rectangular full-wave domain and,
+                // when needed, one tail domain instead of enumerating weight
+                // columns. West-to-east pulses reach the column controls in
+                // reverse physical order within each wave.
+                const auto loop = loop_3d(load.getCycle() + startOffset,
+                    innerCount, 1, waveCount, columnsPerWave,
+                    load.getGroupCount().value_or(1),
+                    load.getGroupInterval().value_or(1));
+                auto instruction = MxmLoadIcuInstruction::Load3D(loop,
+                    as_size(load.getWeightBuffer(), "weight buffer"),
+                    mxm_buffer_mode(
+                        load.getWeightBufferMode().value_or("fixed")),
+                    as_size(columnsPerWave - 1, "weight column"),
+                    {-1, 0, 0},
+                    as_size(load.getStreamBase(), "weight stream base"),
+                    mxm_weight_input_mode(
+                        load.getWeightInputMode().value_or("direct16")));
+                std::string error;
+                require_materialized(
+                    command::materializeMxmLoad3DCommand(builder,
+                        load.getLoc(), as_size(load.getUnitId(), "MXM queue"),
+                        instruction, &error), "MXM load", error);
+            };
+            if (fullWaves > 0)
+                materializeLoadDomain(0, columnsPerWave, fullWaves);
+            if (tailColumns > 0)
+                materializeLoadDomain(
+                    fullWaves * columnsPerWave, tailColumns, 1);
         }
         for (schedule::MxmComputeOp compute : computes) {
             schedule::MxmAccumulateOp accumulator;
@@ -1257,33 +1092,86 @@ public:
                 return;
             }
             builder.setInsertionPointAfter(compute);
-            auto command = create_mxm_command(builder, compute.getLoc(), compute.getCycle(), compute.getUnitId(),
-                "compute", compute.getWeightBuffer(), 0, compute.getActivationStreamBase(),
-                compute.getOutputStreamBase(), compute.getDuration(), 1,
-                accumulator.getAccumulatorAddress(),
-                accumulator.getAccumulatorStride(),
-                accumulator.getDestination() == "local" ? "sram" : "stream",
-                true, compute.getDataFormat().value_or("fp16"),
+            const auto destination = accumulator.getDestination() == "local"
+                ? MxmAccumulatorDestination::Sram
+                : MxmAccumulatorDestination::Stream;
+            const auto outputFormat = mxm_accumulator_format(
                 accumulator.getAccumulatorOutputFormat().value_or("fp32"));
-            if (compute.getWaveCount().value_or(1) > 1) {
-                command->setAttr("wave_count",
-                    builder.getI64IntegerAttr(static_cast<int64_t>(
-                        compute.getWaveCount().value_or(1))));
-                command->setAttr("wave_interval",
-                    builder.getI64IntegerAttr(static_cast<int64_t>(
-                        compute.getWaveInterval().value_or(1))));
-                command->setAttr("wave_accumulator_address_stride",
-                    builder.getI64IntegerAttr(static_cast<int64_t>(compute
-                        .getWaveAccumulatorAddressStride().value_or(0))));
-            }
+            const MxmComputeIcuMode mode {destination, true, outputFormat};
+            const MxmComputeIcuMode terminalMode {
+                mxm_destination(compute
+                    .getTerminalAccumulatorDestination()
+                    .value_or(accumulator.getDestination() == "local"
+                            ? "sram" : "stream")),
+                compute.getTerminalAccumulatorClear().value_or(true),
+                mxm_accumulator_format(compute
+                    .getTerminalAccumulatorOutputFormat()
+                    .value_or(accumulator
+                        .getAccumulatorOutputFormat().value_or("fp32")))};
+            const int64_t groupCount = compute.getGroupCount().value_or(
+                accumulator.getGroupCount().value_or(1));
+            const int64_t groupInterval = compute.getGroupInterval().value_or(
+                accumulator.getGroupInterval().value_or(1));
+            const int64_t groupAccumulatorStride =
+                compute.getGroupAccumulatorAddressStride().value_or(
+                    accumulator
+                        .getGroupAccumulatorAddressStride().value_or(0));
+            auto instruction = MxmComputeIcuInstruction::Compute3D(
+                loop_3d(compute.getCycle(), compute.getDuration(), 1,
+                    compute.getWaveCount().value_or(1),
+                    compute.getWaveInterval().value_or(1), groupCount,
+                    groupInterval),
+                as_size(compute.getWeightBuffer(), "weight buffer"),
+                mxm_buffer_mode(
+                    compute.getWeightBufferMode().value_or("fixed")),
+                as_size(compute.getActivationStreamBase(),
+                    "activation stream"),
+                as_size(compute.getOutputStreamBase(), "output stream"),
+                as_size(accumulator.getAccumulatorAddress(),
+                    "accumulator address"),
+                {0, static_cast<int64_t>(compute
+                        .getWaveAccumulatorAddressStride().value_or(0)),
+                    groupAccumulatorStride},
+                as_size(accumulator.getAccumulatorStride(),
+                    "accumulator row stride"),
+                mxm_data_format(compute.getDataFormat().value_or("fp16")),
+                mode, static_cast<std::size_t>(
+                    compute.getTerminalDimension().value_or(
+                        MxmComputeIcuInstruction::kNoTerminalDimension)),
+                terminalMode);
+            std::string error;
+            require_materialized(command::materializeMxmCompute3DCommand(
+                builder, compute.getLoc(),
+                as_size(compute.getUnitId(), "MXM queue"), instruction,
+                &error), "MXM compute", error);
         }
         for (schedule::MxmAccumulatorReadOp read : accumulator_reads) {
             builder.setInsertionPointAfter(read);
-            auto command = create_mxm_command(builder, read.getLoc(), read.getCycle(),
-                read.getUnitId(), "accumulator_read", 0, 0, 0,
-                read.getOutputStreamBase(), 1, 1,
-                read.getAccumulatorAddress(), 1, "sram",
-                read.getClear(), read.getDataFormat().value_or("fp16"));
+            auto instruction = MxmComputeIcuInstruction::AccumulatorRead3D(
+                loop_3d(read.getCycle(), read.getRepeatCount().value_or(1),
+                    read.getRepeatInterval().value_or(1),
+                    read.getWaveCount().value_or(1),
+                    read.getWaveInterval().value_or(1),
+                    read.getGroupCount().value_or(1),
+                    read.getGroupInterval().value_or(1)),
+                as_size(read.getOutputStreamBase(), "output stream"),
+                as_size(read.getAccumulatorAddress(), "accumulator address"),
+                {static_cast<int64_t>(
+                     read.getRepeatAccumulatorAddressStride().value_or(0)),
+                    static_cast<int64_t>(
+                        read.getWaveAccumulatorAddressStride().value_or(0)),
+                    static_cast<int64_t>(
+                        read.getGroupAccumulatorAddressStride().value_or(0))},
+                read.getClear(),
+                read.getDataFormat().value_or("fp32") == "bf16"
+                    ? MxmAccumulatorOutputFormat::BFloat16
+                    : MxmAccumulatorOutputFormat::Float32,
+                MxmAccumulatorDestination::Stream);
+            std::string error;
+            require_materialized(command::materializeMxmCompute3DCommand(
+                builder, read.getLoc(),
+                as_size(read.getUnitId(), "MXM queue"), instruction,
+                &error), "MXM accumulator read", error);
         }
         for (schedule::MemWriteOp write : writes) {
             const auto slices = placement_slices(write.getPlacement());
@@ -1302,31 +1190,32 @@ public:
             const bool west_hemisphere = hemisphere.getValue() == "west";
             const bool west_stream = write.getDirection() == "west";
             builder.setInsertionPointAfter(write);
-            llvm::SmallVector<int64_t> cycles(
-                slices.size(), write.getCycle());
-            llvm::SmallVector<int64_t> queues;
-            llvm::SmallVector<int64_t> addresses(
-                slices.size(), base_row);
-            llvm::SmallVector<int64_t> packedStreams;
-            queues.reserve(slices.size());
-            packedStreams.reserve(slices.size());
             for (size_t index = 0; index < slices.size(); ++index) {
-                queues.push_back(mem_queue(target,
-                    west_hemisphere ? 1 : 0, slices[index], bank));
-                packedStreams.push_back((west_stream ? 32 : 0)
+                const int64_t queue = mem_queue(target,
+                    west_hemisphere ? 1 : 0, slices[index], bank);
+                const int64_t packedStream = (west_stream ? 32 : 0)
                     + write.getStreamBase()
-                    + static_cast<int64_t>(index));
+                    + static_cast<int64_t>(index);
+                const auto instruction = MemIcuInstruction::Write3D(
+                    loop_3d(write.getCycle(), count, 1,
+                        write.getWaveCount().value_or(1),
+                        write.getWaveInterval().value_or(1),
+                        write.getGroupCount().value_or(1),
+                        write.getGroupInterval().value_or(1)),
+                    mem_address_3d(write.getOperation(),
+                        as_size(base_row, "MEM write address"), stride,
+                        static_cast<int64_t>(
+                            write.getWaveAddressStride().value_or(0)),
+                        static_cast<int64_t>(
+                            write.getGroupAddressStride().value_or(0))),
+                    StreamId::from_packed(as_size(packedStream,
+                        "MEM write stream")));
+                std::string error;
+                require_materialized(command::materializeMem3DCommand(
+                    builder, write.getLoc(), as_size(queue, "MEM write queue"),
+                    instruction, -1, {}, &error), "MEM write", error);
             }
-            create_mem_bundle_command(builder, write.getLoc(), cycles,
-                queues, "write", addresses, packedStreams, count, 1,
-                stride, write.getWaveCount().value_or(1),
-                write.getWaveInterval().value_or(1),
-                write.getWaveAddressStride().value_or(0));
         }
-
-        compress_mxm_command_waves(function, builder);
-        compress_mxm_command_groups(function, builder);
-        compress_mxm_dequant_command_waves(function, builder);
 
         function.walk([](mlir::func::ReturnOp op) {
             op->setOperands(mlir::ValueRange {});

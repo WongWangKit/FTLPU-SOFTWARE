@@ -6,9 +6,13 @@
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "ftlpu/core/instruction_codec.hpp"
+#include "ftlpu/icu/fu_3d_codec.hpp"
+#include "ftlpu/icu/sxm_run_2d.hpp"
+#include "ftlpu/icu/vxm_run_2d.hpp"
 
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -76,6 +80,282 @@ int64_t command_integer(mlir::Operation* op, llvm::StringRef name)
 
 using QueueKey = std::pair<QueueKind, int64_t>;
 using QueueMap = std::map<QueueKey, std::vector<CommandSequence>>;
+
+struct Raw3DPacketSequence {
+    std::size_t start_cycle{0};
+    std::size_t final_cycle{0};
+    std::vector<QueueCommand> physical_words;
+    int64_t address_binding{-1};
+    BindingAccess address_binding_access{BindingAccess::Input};
+    int64_t scale_binding{-1};
+};
+
+using Raw3DQueueMap =
+    std::map<QueueKey, std::vector<Raw3DPacketSequence>>;
+
+bool can_encode_packet_wait(const Raw3DPacketSequence& packet,
+    std::size_t wait)
+{
+    if (packet.physical_words.empty() || wait >= (std::size_t {1} << 24))
+        return false;
+    const auto kind = packet.physical_words.front().instruction_kind;
+    if (kind != InstructionKind::Mem && kind != InstructionKind::Mxm
+        && kind != InstructionKind::MxmDequant
+        && kind != InstructionKind::Vxm && kind != InstructionKind::Sxm)
+        return false;
+    // FU 3-D and VXM/SXM RUN_2D use bits 8..31 of word zero for the
+    // queue-local wait_cycle. WRITE_READ_2D has a separate packet layout.
+    return ((packet.physical_words.front().words[2] >> 24) & 0xfU) == 2U;
+}
+
+void set_packet_wait(Raw3DPacketSequence& packet, std::size_t wait)
+{
+    if (!can_encode_packet_wait(packet, wait))
+        throw std::runtime_error("FU 3-D wait_cycle is not encodable");
+    auto& header = packet.physical_words.front();
+    header.words[0] = (header.words[0] & 0xffU)
+        | (static_cast<std::uint32_t>(wait) << 8);
+    header.command = header.words[0];
+}
+
+const char* raw_loop_queue_name(QueueKind kind)
+{
+    switch (kind) {
+    case QueueKind::Mem: return "mem";
+    case QueueKind::MxmLoad: return "mxm_load";
+    case QueueKind::MxmCompute: return "mxm_compute";
+    case QueueKind::MxmDequant: return "mxm_dequant";
+    case QueueKind::Vxm: return "vxm";
+    case QueueKind::SxmTranspose: return "sxm_transpose";
+    case QueueKind::SxmPermute: return "sxm_permute";
+    }
+    return "unknown";
+}
+
+std::size_t raw_loop_iq_depth(QueueKind kind)
+{
+    switch (kind) {
+    case QueueKind::Mem: return hw::kIcuMemIqDepth;
+    case QueueKind::MxmLoad:
+    case QueueKind::MxmCompute:
+    case QueueKind::MxmDequant: return hw::kIcuMxmIqDepth;
+    case QueueKind::Vxm: return hw::kIcuVxmIqDepth;
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute: return hw::kIcuSxmIqDepth;
+    }
+    throw std::logic_error("raw FU loop has no physical ICU IQ depth");
+}
+
+// The physical ICU preloads one full IQ before cycle zero. Each consumed word
+// opens one IQ slot, and the single local-iMEM frontend can start one ordered
+// word fetch per cycle. A fetch started after dispatch in cycle T is visible at
+// the beginning of T + fetch_latency. Raw multiword packets are decoded
+// atomically, so every packet word must be resident at its exact scheduled
+// launch cycle; silently waiting for the rest would break cross-FU alignment.
+void validate_raw_3d_frontend(const QueueKey& key,
+    const std::vector<Raw3DPacketSequence>& packets)
+{
+    constexpr std::size_t refillWordsPerCycle = 1;
+    static_assert(hw::kIcuFetchLatencyCycles > 0);
+
+    const auto checkedAdd = [](std::size_t lhs, std::size_t rhs,
+                                const char* description) {
+        if (rhs > std::numeric_limits<std::size_t>::max() - lhs)
+            throw std::runtime_error(description);
+        return lhs + rhs;
+    };
+
+    std::size_t totalWords = 0;
+    std::size_t scheduleCursor = 0;
+    for (const Raw3DPacketSequence& packet : packets) {
+        if (packet.start_cycle < scheduleCursor)
+            throw std::runtime_error(
+                "overlapping FU loop packets target a single-context ICU "
+                "queue: resource="
+                + std::string(raw_loop_queue_name(key.first))
+                + ", queue=" + std::to_string(key.second)
+                + ", start_cycle=" + std::to_string(packet.start_cycle)
+                + ", busy_through=" + std::to_string(scheduleCursor - 1));
+        if (packet.start_cycle > scheduleCursor
+            && !can_encode_packet_wait(
+                packet, packet.start_cycle - scheduleCursor))
+            totalWords = checkedAdd(totalWords, 1,
+                "raw FU loop queue word count overflows");
+        totalWords = checkedAdd(totalWords, packet.physical_words.size(),
+            "raw FU loop queue word count overflows");
+        if (packet.final_cycle == std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("FU loop packet end cycle overflows");
+        scheduleCursor = packet.final_cycle + 1;
+    }
+
+    const std::size_t iqDepth = raw_loop_iq_depth(key.first);
+    std::size_t iqWords = std::min(iqDepth, totalWords);
+    std::size_t scheduledWords = iqWords;
+    std::size_t nextFetchStartCycle = 0;
+    std::vector<std::size_t> fetchReadyCycles;
+    fetchReadyCycles.reserve(totalWords - scheduledWords);
+    std::size_t nextReadyFetch = 0;
+
+    const auto consume = [&](std::size_t cycle, std::size_t requiredWords,
+                             const char* commandName) {
+        while (nextReadyFetch < fetchReadyCycles.size()
+               && fetchReadyCycles[nextReadyFetch] <= cycle) {
+            ++iqWords;
+            ++nextReadyFetch;
+        }
+        if (iqWords < requiredWords) {
+            throw std::runtime_error(
+                "raw FU loop schedule exceeds ICU frontend bandwidth: "
+                "resource=" + std::string(raw_loop_queue_name(key.first))
+                + ", queue=" + std::to_string(key.second)
+                + ", cycle=" + std::to_string(cycle)
+                + ", command=" + commandName
+                + ", required_words=" + std::to_string(requiredWords)
+                + ", available_words=" + std::to_string(iqWords)
+                + ", iq_depth=" + std::to_string(iqDepth)
+                + ", refill_words_per_cycle="
+                + std::to_string(refillWordsPerCycle)
+                + ", fetch_latency="
+                + std::to_string(hw::kIcuFetchLatencyCycles));
+        }
+        iqWords -= requiredWords;
+
+        // Every consumed resident word opens one slot. Reserve those slots for
+        // the next sequential i-MEM words at one fetch start per cycle.
+        for (std::size_t word = 0;
+             word < requiredWords && scheduledWords < totalWords; ++word) {
+            const std::size_t fetchStart =
+                std::max(cycle, nextFetchStartCycle);
+            if (fetchStart > std::numeric_limits<std::size_t>::max()
+                    - hw::kIcuFetchLatencyCycles
+                || fetchStart == std::numeric_limits<std::size_t>::max())
+                throw std::runtime_error(
+                    "raw FU loop frontend fetch cycle overflows");
+            fetchReadyCycles.push_back(
+                fetchStart + hw::kIcuFetchLatencyCycles);
+            ++scheduledWords;
+            nextFetchStartCycle = fetchStart + refillWordsPerCycle;
+        }
+    };
+
+    scheduleCursor = 0;
+    for (const Raw3DPacketSequence& packet : packets) {
+        const auto wait = packet.start_cycle - scheduleCursor;
+        if (wait != 0 && !can_encode_packet_wait(packet, wait))
+            consume(scheduleCursor, 1, "NOP");
+        consume(wait != 0 && can_encode_packet_wait(packet, wait)
+                ? scheduleCursor : packet.start_cycle,
+            packet.physical_words.size(), "packet");
+        scheduleCursor = packet.final_cycle + 1;
+    }
+}
+
+std::size_t loop_final_cycle(const IcuLoop3D& loop)
+{
+    std::size_t cycle = loop.start_cycle;
+    for (std::size_t dimension = 0;
+         dimension < IcuLoop3D::kDimensions; ++dimension)
+        cycle += (loop.counts[dimension] - 1)
+            * loop.cycle_strides[dimension];
+    return cycle;
+}
+
+int64_t raw_loop_absolute_final_cycle(mlir::Operation* operation,
+    const IcuLoop3D& loop, std::size_t trailingCycles = 0)
+{
+    const int64_t startCycle = command_cycle(operation);
+    if (startCycle < 0)
+        throw std::runtime_error(
+            "FU loop has a negative compiler schedule cycle");
+    const std::size_t localFinal = loop_final_cycle(loop);
+    constexpr auto int64Max = static_cast<std::size_t>(
+        std::numeric_limits<int64_t>::max());
+    if (localFinal > int64Max || trailingCycles > int64Max - localFinal
+        || localFinal + trailingCycles
+            > int64Max - static_cast<std::size_t>(startCycle))
+        throw std::runtime_error("FU loop absolute final cycle overflows");
+    return startCycle
+        + static_cast<int64_t>(localFinal + trailingCycles);
+}
+
+template <typename Packet>
+Packet raw_3d_packet(mlir::Operation* operation, mlir::ArrayAttr words)
+{
+    constexpr std::size_t expected =
+        Packet::kWordCount * Packet::kLanesPerWord;
+    if (words.size() != expected)
+        throw std::runtime_error(
+            "FU 3-D Command op has an invalid physical packet width");
+    Packet packet {};
+    for (std::size_t index = 0; index < expected; ++index) {
+        const auto word = llvm::dyn_cast<mlir::IntegerAttr>(words[index]);
+        if (!word || word.getValue().isNegative()
+            || word.getValue().getActiveBits() > 32)
+            throw std::runtime_error(
+                "FU 3-D Command op contains a non-u32 packet word");
+        packet.words[index / Packet::kLanesPerWord]
+            .lanes[index % Packet::kLanesPerWord] =
+            static_cast<std::uint32_t>(word.getValue().getZExtValue());
+    }
+    (void)operation;
+    return packet;
+}
+
+template <typename Packet>
+std::vector<QueueCommand> raw_3d_queue_words(
+    const Packet& packet, InstructionKind instructionKind)
+{
+    std::vector<QueueCommand> result;
+    result.reserve(Packet::kWordCount);
+    for (const auto& physicalWord : packet.words) {
+        QueueCommand command;
+        command.command = physicalWord.lanes[0];
+        command.instruction_kind = instructionKind;
+        command.word_count = static_cast<std::uint16_t>(
+            Packet::kLanesPerWord);
+        for (std::size_t lane = 0;
+             lane < Packet::kLanesPerWord; ++lane)
+            command.words[lane] = physicalWord.lanes[lane];
+        result.push_back(std::move(command));
+    }
+    return result;
+}
+
+template <typename Packet, typename Instruction, typename Decode>
+void collect_raw_3d(mlir::Operation* operation, int64_t queue,
+    mlir::ArrayAttr words, QueueKind queueKind,
+    InstructionKind instructionKind, Decode&& decode,
+    Raw3DQueueMap& queues)
+{
+    const Packet packet = raw_3d_packet<Packet>(operation, words);
+    Instruction instruction;
+    try {
+        instruction = decode(packet);
+    } catch (const std::exception& error) {
+        throw std::runtime_error(
+            std::string("invalid FU 3-D Command packet: ")
+            + error.what());
+    }
+    const int64_t commandCycle = command_integer(operation, "cycle");
+    if (commandCycle < 0)
+        throw std::runtime_error(
+            "FU 3-D Command op has a negative compiler schedule cycle");
+    if (instruction.loop.start_cycle != 0)
+        throw std::runtime_error(
+            "FU 3-D hardware packet contains an absolute start cycle");
+    const std::size_t startCycle = static_cast<std::size_t>(commandCycle);
+    const std::size_t localFinalCycle = loop_final_cycle(instruction.loop);
+    if (localFinalCycle
+        > std::numeric_limits<std::size_t>::max() - startCycle)
+        throw std::runtime_error("FU 3-D Command cycle range overflows");
+    queues[{queueKind, queue}].push_back(Raw3DPacketSequence {
+        startCycle,
+        startCycle + localFinalCycle,
+        raw_3d_queue_words(packet, instructionKind),
+        -1,
+        BindingAccess::Input,
+    });
+}
 
 QueueCommand mem_instruction_command(isa::EncodedMemInstruction encoded)
 {
@@ -181,29 +461,35 @@ std::vector<BinaryMemoryFloor> static_memory_floors(
     int64_t banks_per_slice, int64_t rows_per_bank)
 {
     std::map<std::tuple<int64_t, int64_t, int64_t>, int64_t> floors;
+    const auto reserveAddress = [&](int64_t queue, int64_t address) {
+        if (queue < 0)
+            throw std::runtime_error(
+                "Command IR MEM queue is outside the target");
+        const int64_t queuesPerHemisphere =
+            slices_per_hemisphere * banks_per_slice;
+        const int64_t hemisphere = queue / queuesPerHemisphere;
+        const int64_t localQueue = queue % queuesPerHemisphere;
+        const int64_t slice = localQueue / banks_per_slice;
+        const int64_t bank = localQueue % banks_per_slice;
+        if (hemisphere >= 2)
+            throw std::runtime_error(
+                "Command IR MEM queue is outside the target");
+        if (address < 0 || address >= rows_per_bank)
+            throw std::runtime_error(
+                "Command IR MEM scratch address is outside the target");
+        auto& floor = floors[{hemisphere, slice, bank}];
+        floor = std::max(floor, address + 1);
+    };
     const auto reserveFloor = [&](int64_t queue, int64_t base,
                                   int64_t repeatCount,
                                   int64_t repeatStride,
                                   int64_t waveCount,
                                   int64_t waveStride) {
-        const int64_t hemisphere =
-            queue / (slices_per_hemisphere * banks_per_slice);
-        const int64_t localQueue =
-            queue % (slices_per_hemisphere * banks_per_slice);
-        const int64_t slice = localQueue / banks_per_slice;
-        const int64_t bank = localQueue % banks_per_slice;
-        if (queue < 0 || hemisphere >= 2)
-            throw std::runtime_error(
-                "Command IR MEM queue is outside the target");
         for (int64_t repeat : {int64_t {0}, repeatCount - 1})
             for (int64_t wave : {int64_t {0}, waveCount - 1}) {
                 const int64_t address = base
                     + repeat * repeatStride + wave * waveStride;
-                if (address < 0 || address >= rows_per_bank)
-                    throw std::runtime_error(
-                        "Command IR MEM scratch address is outside the target");
-                auto& floor = floors[{hemisphere, slice, bank}];
-                floor = std::max(floor, address + 1);
+                reserveAddress(queue, address);
             }
     };
     module.walk([&](command::MemOp op) {
@@ -238,6 +524,53 @@ std::vector<BinaryMemoryFloor> static_memory_floors(
                 op.getRepeatCount(), op.getAddressStride(),
                 waveCount, waveStride);
         }
+    });
+    module.walk([&](command::Mem3DOp op) {
+        if (op.getAddressBinding()) return;
+        const auto packet = raw_3d_packet<isa::EncodedMemIcu3DPacket>(
+            op.getOperation(), op.getWords());
+        const auto instruction =
+            isa::decode_mem_icu_3d_instruction(packet);
+
+        // The blocked outer address is affine within each power-of-two
+        // group. Its extrema therefore occur at the first or last point of
+        // the first or final group; the two inner affine dimensions only
+        // need their endpoints as well.
+        const std::size_t lastOuter = instruction.loop.counts[2] - 1;
+        const std::size_t groupSize =
+            instruction.address.outer_group_size;
+        const std::array<std::size_t, 4> outerCandidates {
+            0,
+            std::min(lastOuter, groupSize - 1),
+            (lastOuter / groupSize) * groupSize,
+            lastOuter,
+        };
+        for (const auto inner : {std::size_t {0},
+                 instruction.loop.counts[0] - 1}) {
+            for (const auto middle : {std::size_t {0},
+                     instruction.loop.counts[1] - 1}) {
+                for (const auto outer : outerCandidates) {
+                    const auto address = ::ftlpu::detail::mem_icu_address_3d(
+                        instruction,
+                        IcuCoordinate3D {{inner, middle, outer}});
+                    reserveAddress(op.getQueue(),
+                        static_cast<int64_t>(address));
+                }
+            }
+        }
+    });
+    module.walk([&](command::MemWriteRead2DOp op) {
+        const auto packet = raw_3d_packet<
+            isa::EncodedMemIcuWriteRead2DPacket>(
+            op.getOperation(), op.getWords());
+        const auto instruction =
+            isa::decode_mem_icu_write_read_2d_instruction(packet);
+        for (const auto i : {std::size_t {0}, instruction.counts[0] - 1})
+            for (const auto j : {std::size_t {0}, instruction.counts[1] - 1})
+                reserveAddress(op.getQueue(), static_cast<int64_t>(
+                    instruction.base_address)
+                    + static_cast<int64_t>(i) * instruction.address_strides[0]
+                    + static_cast<int64_t>(j) * instruction.address_strides[1]);
     });
     std::vector<BinaryMemoryFloor> result;
     result.reserve(floors.size());
@@ -376,6 +709,126 @@ StreamReleaseSummary stream_release_cycles(
             markPacked(llvm::cast<mlir::IntegerAttr>(stream).getInt(), end);
         for (mlir::Attribute stream : op.getDestinationStreams())
             markPacked(llvm::cast<mlir::IntegerAttr>(stream).getInt(), end);
+    });
+    module.walk([&](command::Mem3DOp op) {
+        const auto packet = raw_3d_packet<isa::EncodedMemIcu3DPacket>(
+            op.getOperation(), op.getWords());
+        const auto instruction =
+            isa::decode_mem_icu_3d_instruction(packet);
+        markPacked(static_cast<int64_t>(instruction.stream),
+            raw_loop_absolute_final_cycle(
+                op.getOperation(), instruction.loop));
+    });
+    module.walk([&](command::MemWriteRead2DOp op) {
+        const auto packet = raw_3d_packet<
+            isa::EncodedMemIcuWriteRead2DPacket>(
+            op.getOperation(), op.getWords());
+        const auto instruction =
+            isa::decode_mem_icu_write_read_2d_instruction(packet);
+        const int64_t end = op.getCycle() + static_cast<int64_t>(
+            ::ftlpu::detail::mem_icu_write_read_2d_last_issue_cycle(
+                instruction));
+        markPacked(static_cast<int64_t>(instruction.write_stream), end);
+        for (std::size_t outer = 0; outer < instruction.counts[1]; ++outer)
+            markPacked(static_cast<int64_t>(instruction.read_stream_base)
+                + static_cast<int64_t>(outer)
+                    * instruction.read_stream_outer_stride, end);
+    });
+    module.walk([&](command::MxmLoad3DOp op) {
+        const auto packet = raw_3d_packet<
+            isa::EncodedMxmLoadIcu3DPacket>(
+            op.getOperation(), op.getWords());
+        const auto instruction =
+            isa::decode_mxm_load_icu_3d_instruction(packet);
+        const int64_t streamWidth = instruction.weight_input_mode
+                == MxmWeightInputMode::Int8DequantBf16
+            ? target.throughput().mxm_int8_load_streams_per_cycle
+            : target.throughput().mxm_load_streams_per_cycle;
+        markRange(static_cast<int64_t>(instruction.weight_stream_base),
+            streamWidth,
+            raw_loop_absolute_final_cycle(
+                op.getOperation(), instruction.loop));
+    });
+    module.walk([&](command::MxmCompute3DOp op) {
+        const auto packet = raw_3d_packet<
+            isa::EncodedMxmComputeIcu3DPacket>(
+            op.getOperation(), op.getWords());
+        const auto instruction =
+            isa::decode_mxm_compute_icu_3d_instruction(packet);
+        const int64_t end = raw_loop_absolute_final_cycle(
+            op.getOperation(), instruction.loop);
+        if (instruction.opcode == MxmComputeIcuOpcode::Compute3D) {
+            markRange(static_cast<int64_t>(
+                          instruction.activation_stream_base),
+                target.throughput().mxm_activation_streams, end);
+        }
+        const bool regularStream =
+            instruction.regular_mode.accumulator_destination
+            == MxmAccumulatorDestination::Stream;
+        const bool terminalStream = instruction.opcode
+                == MxmComputeIcuOpcode::Compute3D
+            && instruction.terminal_dimension
+                < IcuLoop3D::kDimensions
+            && instruction.terminal_mode.accumulator_destination
+                == MxmAccumulatorDestination::Stream;
+        if (regularStream || terminalStream)
+            markRange(streamCount
+                    + static_cast<int64_t>(
+                        instruction.result_stream_base),
+                target.throughput().mxm_result_streams, end);
+    });
+    module.walk([&](command::VxmRun2DOp op) {
+        const auto packet = raw_3d_packet<
+            isa::EncodedVxmIcuRun2DPacket>(
+            op.getOperation(), op.getWords());
+        const auto run =
+            isa::decode_vxm_icu_run_2d_instruction(packet);
+        const auto decoded = isa::decode_vxm_instruction(
+            static_cast<std::size_t>(op.getQueue()), run.instruction);
+        const auto& instruction = decoded.instruction;
+        const int64_t end = raw_loop_absolute_final_cycle(
+            op.getOperation(), run.loop, instruction.repeat_count - 1);
+        const auto markOperand = [&](const VxmLaneOperand& operand,
+                                     bool rhsPort) {
+            if (operand.kind != VxmLaneOperandKind::StreamFloat16
+                && operand.kind != VxmLaneOperandKind::StreamBFloat16)
+                return;
+            const auto group = VxmLane::input_group_for_operand(
+                static_cast<std::size_t>(op.getQueue()), rhsPort, operand);
+            const int64_t packedBase = group < 8
+                ? static_cast<int64_t>(group * 2)
+                : streamCount
+                    + static_cast<int64_t>((group - 8) * 2);
+            markRange(packedBase, 2, end);
+        };
+        markOperand(instruction.lhs, false);
+        markOperand(instruction.rhs, true);
+        if (instruction.output_stream) {
+            const auto block = VxmLane::block_for_stage(
+                static_cast<std::size_t>(op.getQueue()));
+            const int64_t packedBase = block < 4
+                ? streamCount
+                    + static_cast<int64_t>(*instruction.output_stream)
+                : static_cast<int64_t>(*instruction.output_stream);
+            const int64_t width =
+                instruction.output_type == VxmCastTarget::Int8 ? 1
+                : instruction.output_type == VxmCastTarget::Float32 ? 4
+                : 2;
+            markRange(packedBase, width, end);
+        }
+    });
+    module.walk([&](command::SxmRun2DOp op) {
+        const auto packet = raw_3d_packet<
+            isa::EncodedSxmIcuRun2DPacket>(
+            op.getOperation(), op.getWords());
+        const auto run =
+            isa::decode_sxm_icu_run_2d_instruction(packet);
+        const int64_t end = raw_loop_absolute_final_cycle(
+            op.getOperation(), run.loop);
+        for (const auto stream : run.instruction.src_streams)
+            markPacked(static_cast<int64_t>(stream.stream), end);
+        for (const auto stream : run.instruction.dst_streams)
+            markPacked(static_cast<int64_t>(stream.stream), end);
     });
     return {std::move(releases)};
 }
@@ -1203,7 +1656,10 @@ int64_t macro_instruction_stride(const CommandSequence& first,
 void compress_interleaved_macro_windows(
     std::vector<CommandSequence>& sequences, QueueKind kind)
 {
-    constexpr std::size_t kMaxWindow = 63;
+    // The physical ICU has one active loop state. With a depth of one this
+    // pass can only fold consecutive same-body descriptors into an outer
+    // loop; it cannot construct an interleaved launch window.
+    constexpr std::size_t maxWindow = 1;
     std::vector<CommandSequence> compressed;
     compressed.reserve(sequences.size());
     for (std::size_t index = 0; index < sequences.size();) {
@@ -1213,7 +1669,7 @@ void compress_interleaved_macro_windows(
         int64_t bestStride = 0;
         const std::size_t remaining = sequences.size() - index;
         for (std::size_t window = 1;
-             window <= std::min(kMaxWindow, remaining / 2); ++window) {
+             window <= std::min(maxWindow, remaining / 2); ++window) {
             const auto& first = sequences[index];
             const auto& next = sequences[index + window];
             if (first.outer_count != 1 || next.outer_count != 1)
@@ -1289,7 +1745,9 @@ void compress_interleaved_macro_windows(
 void compress_stream_nd_depth(
     std::vector<CommandSequence>& sequences, QueueKind kind)
 {
-    constexpr std::size_t kMaxWindow = 63;
+    // A hardware ICU owns one live loop context, so only a consecutive
+    // same-body sequence can be folded into the depth dimension.
+    constexpr std::size_t maxWindow = 1;
     std::vector<CommandSequence> compressed;
     compressed.reserve(sequences.size());
     for (std::size_t index = 0; index < sequences.size();) {
@@ -1299,7 +1757,7 @@ void compress_stream_nd_depth(
         int64_t bestStride = 0;
         const std::size_t remaining = sequences.size() - index;
         for (std::size_t window = 1;
-             window <= std::min(kMaxWindow, remaining / 2); ++window) {
+             window <= std::min(maxWindow, remaining / 2); ++window) {
             const auto& first = sequences[index];
             const auto& next = sequences[index + window];
             if (first.depth_count != 1 || next.depth_count != 1)
@@ -1531,12 +1989,38 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
         || key.first == QueueKind::SxmPermute;
     const bool macroQueue = macroScheduleEnabled && macroKind;
     if (macroQueue) {
-        compress_interleaved_macro_windows(sequences, key.first);
-        compress_stream_nd_depth(sequences, key.first);
-        std::sort(sequences.begin(), sequences.end(),
+        // This compatibility encoder may only fold already-serial affine
+        // regions.  It must never repair an invalid schedule by exposing loop
+        // coordinates: hardware owns one active context, so an interleaved
+        // schedule has to be rejected and regenerated by direct FU lowering.
+        std::stable_sort(sequences.begin(), sequences.end(),
             [](const auto& lhs, const auto& rhs) {
                 return lhs.cycle < rhs.cycle;
             });
+        compress_interleaved_macro_windows(sequences, key.first);
+        std::stable_sort(sequences.begin(), sequences.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.cycle < rhs.cycle;
+            });
+        compress_stream_nd_depth(sequences, key.first);
+        std::stable_sort(sequences.begin(), sequences.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.cycle < rhs.cycle;
+            });
+
+        int64_t activeUntil = std::numeric_limits<int64_t>::min();
+        for (const auto& sequence : sequences) {
+            if (sequence.cycle <= activeUntil)
+                throw std::runtime_error(
+                    "direct FU lowering required: legacy Schedule IR produced "
+                    "overlapping coarse instructions for single-context ICU "
+                    "queue kind="
+                    + std::to_string(static_cast<int>(key.first))
+                    + " index=" + std::to_string(key.second)
+                    + " start=" + std::to_string(sequence.cycle)
+                    + " active_until=" + std::to_string(activeUntil));
+            activeUntil = sequence_final_cycle(sequence);
+        }
     }
     if (macroQueue) {
         QueueProgram queue {
@@ -1991,6 +2475,14 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     const auto target = LPUTargetModel::from_operation(module);
     if (mlir::failed(target))
         throw std::runtime_error("Command IR module has an invalid target");
+    const auto loweringMode = module->getAttrOfType<mlir::StringAttr>(
+        "ftlpu.command_lowering");
+    if (loweringMode && loweringMode.getValue() != "direct"
+        && loweringMode.getValue() != "legacy")
+        throw std::runtime_error(
+            "Command IR module has an invalid ftlpu.command_lowering");
+    const bool requiresDirectLowering = loweringMode
+        && loweringMode.getValue() == "direct";
     IcuCompressionMode compressionMode = IcuCompressionMode::Macro;
     if (const auto compressionAttr =
             module->getAttrOfType<mlir::StringAttr>(
@@ -2008,12 +2500,16 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             ? IcuCompressionMode::Macro
             : IcuCompressionMode::Control;
     }
-    bool memSliceProgramEnabled = true;
+    // MEM_SLICE_PROGRAM has no fixed hardware packet and the FU raw-word
+    // queues deliberately reject it.  Keep it available only when a module
+    // explicitly opts into the legacy software-validation format.
+    bool memSliceProgramEnabled = false;
     if (const auto attr = module->getAttrOfType<mlir::BoolAttr>(
             "ftlpu.mem_slice_program"))
         memSliceProgramEnabled = attr.getValue();
     auto streamReleaseSummary = stream_release_cycles(module, *target);
     QueueMap queues;
+    Raw3DQueueMap raw3DQueues;
     std::vector<BinaryBinding> bindings;
     std::vector<BinaryTimeline> timelines;
     std::vector<BinaryWeightPageUse> weightPageUses;
@@ -2044,7 +2540,91 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     });
     module.walk([&](command::VxmOp op) { collect_vxm(op, queues); });
     module.walk([&](command::SxmOp op) { collect_sxm(op, queues); });
-    if (queues.empty()) throw std::runtime_error("Command IR module has no queue commands");
+    module.walk([&](command::Mem3DOp op) {
+        collect_raw_3d<isa::EncodedMemIcu3DPacket,
+            MemIcuInstruction>(op.getOperation(), op.getQueue(),
+            op.getWords(), QueueKind::Mem, InstructionKind::Mem,
+            isa::decode_mem_icu_3d_instruction, raw3DQueues);
+        auto& packet = raw3DQueues[
+            {QueueKind::Mem, op.getQueue()}].back();
+        packet.address_binding = op.getAddressBinding()
+            ? static_cast<int64_t>(*op.getAddressBinding()) : -1;
+        packet.address_binding_access = address_binding_access(op);
+    });
+    module.walk([&](command::MemWriteRead2DOp op) {
+        const auto packet = raw_3d_packet<
+            isa::EncodedMemIcuWriteRead2DPacket>(
+            op.getOperation(), op.getWords());
+        const auto instruction =
+            isa::decode_mem_icu_write_read_2d_instruction(packet);
+        const auto cycle = static_cast<std::size_t>(op.getCycle());
+        const auto last =
+            ::ftlpu::detail::mem_icu_write_read_2d_last_issue_cycle(
+                instruction);
+        if (last > std::numeric_limits<std::size_t>::max() - cycle)
+            throw std::runtime_error(
+                "MEM WRITE_READ_2D cycle range overflows");
+        raw3DQueues[{QueueKind::Mem, op.getQueue()}].push_back(
+            Raw3DPacketSequence {cycle, cycle + last,
+                raw_3d_queue_words(packet, InstructionKind::Mem),
+                -1, BindingAccess::Input});
+    });
+    module.walk([&](command::MxmLoad3DOp op) {
+        collect_raw_3d<isa::EncodedMxmLoadIcu3DPacket,
+            MxmLoadIcuInstruction>(op.getOperation(), op.getQueue(),
+            op.getWords(), QueueKind::MxmLoad, InstructionKind::Mxm,
+            isa::decode_mxm_load_icu_3d_instruction, raw3DQueues);
+    });
+    module.walk([&](command::MxmDequant3DOp op) {
+        collect_raw_3d<isa::EncodedMxmDequantIcu3DPacket,
+            MxmDequantIcuInstruction>(op.getOperation(), op.getQueue(),
+            op.getWords(), QueueKind::MxmDequant,
+            InstructionKind::MxmDequant,
+            isa::decode_mxm_dequant_icu_3d_instruction, raw3DQueues);
+        raw3DQueues[{QueueKind::MxmDequant, op.getQueue()}].back()
+            .scale_binding = op.getScaleBinding()
+            ? static_cast<int64_t>(*op.getScaleBinding()) : -1;
+    });
+    module.walk([&](command::MxmCompute3DOp op) {
+        collect_raw_3d<isa::EncodedMxmComputeIcu3DPacket,
+            MxmComputeIcuInstruction>(op.getOperation(), op.getQueue(),
+            op.getWords(), QueueKind::MxmCompute, InstructionKind::Mxm,
+            isa::decode_mxm_compute_icu_3d_instruction, raw3DQueues);
+    });
+    module.walk([&](command::VxmRun2DOp op) {
+        collect_raw_3d<isa::EncodedVxmIcuRun2DPacket,
+            VxmIcuRun2DInstruction>(op.getOperation(), op.getQueue(),
+            op.getWords(), QueueKind::Vxm, InstructionKind::Vxm,
+            isa::decode_vxm_icu_run_2d_instruction, raw3DQueues);
+        raw3DQueues[{QueueKind::Vxm, op.getQueue()}].back()
+            .scale_binding = op.getScaleBinding()
+            ? static_cast<int64_t>(*op.getScaleBinding()) : -1;
+    });
+    module.walk([&](command::SxmRun2DOp op) {
+        const auto kind = op.getKind() == "transpose"
+            ? QueueKind::SxmTranspose : QueueKind::SxmPermute;
+        collect_raw_3d<isa::EncodedSxmIcuRun2DPacket,
+            SxmIcuRun2DInstruction>(op.getOperation(), op.getQueue(),
+            op.getWords(), kind, InstructionKind::Sxm,
+            isa::decode_sxm_icu_run_2d_instruction, raw3DQueues);
+    });
+    if (queues.empty() && raw3DQueues.empty())
+        throw std::runtime_error("Command IR module has no queue commands");
+    if (requiresDirectLowering && !queues.empty())
+        throw std::runtime_error(
+            "direct lowering produced a legacy CommandSequence; FU loop "
+            "instructions must be emitted directly from operator domains");
+
+    // A raw FU packet owns the physical queue i-MEM image. Mixing it with
+    // legacy CommandSequence output would require an explicit packet-order
+    // model and must not silently route the raw instruction through the
+    // legacy compression path.
+    for (const auto& [key, packets] : raw3DQueues) {
+        (void)packets;
+        if (queues.contains(key))
+            throw std::runtime_error(
+                "a physical ICU queue cannot mix raw FU loop packets with legacy commands");
+    }
 
     // A binary program starts its ICU clock at zero. Full programs naturally
     // have an origin of zero; rebasing also makes a standalone scheduled phase
@@ -2059,6 +2639,10 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     for (const BinaryTimeline& timeline : timelines)
         cycle_origin = std::min(
             cycle_origin, static_cast<int64_t>(timeline.start_cycle));
+    // Raw FU operations retain their compiler schedule relative to program
+    // cycle zero. CommandBinary materializes that initial delay as an ICU NOP;
+    // no absolute cycle is stored in the hardware packet itself.
+    if (!raw3DQueues.empty()) cycle_origin = 0;
     if (cycle_origin > 0) {
         for (auto& [key, sequences] : queues) {
             (void)key;
@@ -2212,6 +2796,72 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             program.address_relocations,
             target->throughput().icu_repeat_2d_enabled != 0,
             compressionMode, memSliceProgramEnabled));
+    for (auto& [key, packets] : raw3DQueues) {
+        std::stable_sort(packets.begin(), packets.end(),
+            [](const Raw3DPacketSequence& lhs,
+                const Raw3DPacketSequence& rhs) {
+                return lhs.start_cycle < rhs.start_cycle;
+            });
+        validate_raw_3d_frontend(key, packets);
+        QueueProgram queue {key.first,
+            static_cast<std::size_t>(key.second), {}};
+        // The physical ICU owns one active coarse instruction. Encode the
+        // queue-local gap in each FU 3-D packet's wait_cycle field.
+        std::size_t cursor = 0;
+        for (Raw3DPacketSequence& packet : packets) {
+            if (packet.start_cycle < cursor)
+                throw std::runtime_error(
+                    "overlapping FU loop packets target a single-context ICU "
+                    "queue: resource="
+                    + std::string(raw_loop_queue_name(key.first))
+                    + ", queue=" + std::to_string(key.second)
+                    + ", start_cycle="
+                    + std::to_string(packet.start_cycle)
+                    + ", busy_through=" + std::to_string(cursor - 1));
+            if (packet.start_cycle > cursor) {
+                const auto wait = packet.start_cycle - cursor;
+                if (can_encode_packet_wait(packet, wait))
+                    set_packet_wait(packet, wait);
+                else
+                    queue.commands.push_back(control_command(
+                        isa::encode_icu_nop(wait)));
+            }
+            program.max_cycle = std::max(
+                program.max_cycle, packet.final_cycle);
+            const std::size_t packetStart = queue.commands.size();
+            queue.commands.insert(queue.commands.end(),
+                std::make_move_iterator(packet.physical_words.begin()),
+                std::make_move_iterator(packet.physical_words.end()));
+            if (packet.address_binding >= 0)
+                program.address_relocations.push_back(
+                    BinaryAddressRelocation {
+                        static_cast<std::uint32_t>(
+                            packet.address_binding),
+                        packet.address_binding_access,
+                        key.first,
+                        static_cast<std::uint16_t>(key.second),
+                        static_cast<std::uint32_t>(packetStart),
+                        false,
+                    });
+            if (packet.scale_binding >= 0)
+                program.scale_relocations.push_back(BinaryScaleRelocation {
+                    static_cast<std::uint32_t>(packet.scale_binding),
+                    0, key.first, static_cast<std::uint16_t>(key.second),
+                    static_cast<std::uint32_t>(packetStart),
+                    VxmImmediateOperand::Rhs,
+                });
+            if (packet.final_cycle
+                == std::numeric_limits<std::size_t>::max())
+                throw std::runtime_error("FU loop packet end cycle overflows");
+            cursor = packet.final_cycle + 1;
+        }
+        program.queues.push_back(std::move(queue));
+    }
+    std::sort(program.queues.begin(), program.queues.end(),
+        [](const QueueProgram& lhs, const QueueProgram& rhs) {
+            return std::tie(lhs.kind, lhs.index)
+                < std::tie(rhs.kind, rhs.index);
+        });
     return program;
 }
 

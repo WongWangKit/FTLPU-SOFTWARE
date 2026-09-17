@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 
 #include "AttentionEmitterUtils.hpp"
+#include "DirectDomainEmitterUtils.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_work_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
@@ -115,25 +116,26 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
 
     const auto emitValueLoad = [&](int64_t hemisphere, int64_t head,
                                    int64_t keyBlock, int64_t localMxm,
-                                   int64_t routeStart) {
+                                   int64_t routeStart,
+                                   bool emitMemoryRead = true) {
         const int64_t kvHead = head / queryHeadsPerKv;
         const int64_t capture = routeStart + memToSxm;
         const auto slices = layout.valuePackSlices(localMxm);
-        for (int64_t beat = 0; beat < tileRows; ++beat) {
+        if (emitMemoryRead) {
             for (int64_t stream = 0; stream < 16; ++stream) {
                 const int64_t slice =
                     slices[static_cast<std::size_t>(stream)];
                 const int64_t latency = memToSxm
                     - slice
                         / target_.streams().mem_slices_per_register_group;
-                emitMem(rewriter_, op_.getLoc(),
-                    capture + beat - latency,
+                direct_domain_detail::emitMem3D(
+                    rewriter_, op_.getLoc(), target_, capture - latency,
                     hemisphere * target_.memory().slices_per_hemisphere
                         + slice,
                     "read", layout.valuePackAddress(
-                        kvHead, localMxm, keyBlock, beat),
+                        kvHead, localMxm, keyBlock, 0),
                     inputStreams[static_cast<std::size_t>(stream)],
-                    1, 1, 0, "sram", -1, valueBank);
+                    tileRows, 1, 1, 1, 1, 0, 1, 1, 0, -1, valueBank);
             }
         }
         std::array<int64_t, 16> mxmStreams {};
@@ -143,30 +145,24 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
             mxmStreams[static_cast<std::size_t>(stream)] =
                 (singleMxm ? singleMxmWeightStreamBase : localMxm * 16)
                 + stream;
-        for (int64_t wavefront = 0; wavefront < tileRows; ++wavefront) {
-            const int64_t cycle = capture + wavefront;
-            emitWavefrontBeat(rewriter_, op_.getLoc(), target_, cycle,
-                hemisphere, wavefront, inputStreams, transposeStreams,
-                mxmStreams, "matrix_columns");
-            emitMxm(rewriter_, op_.getLoc(), cycle + 2,
-                hemisphere * target_.throughput().mxms_per_hemisphere
-                    + (singleMxm ? 0 : localMxm),
-                "iw",
-                singleMxm
-                    ? localMxm
-                        % target_.throughput().mxm_weight_buffers
-                    : 0,
-                wavefront,
-                0, 0, 1, 1, 0, 1, "stream", true,
-                "supercell", 0, dataFormat, {}, {},
-                singleMxm ? singleMxmWeightStreamBase : -1);
-        }
-        for (int64_t tail = 0; tail < tileRows - 1; ++tail) {
-            const int64_t wavefront = tileRows + tail;
-            emitWavefrontTail(rewriter_, op_.getLoc(), target_,
-                capture + wavefront, hemisphere, wavefront,
-                transposeStreams, mxmStreams, "matrix_columns");
-        }
+        emitSxm(rewriter_, op_.getLoc(), capture, hemisphere, "transpose",
+            inputStreams, transposeStreams, identityMap(),
+            "vector_columns", -1, -1, -1, tileRows, 1);
+        emitSxm(rewriter_, op_.getLoc(), capture + 1, hemisphere, "permute",
+            transposeStreams, mxmStreams, blockDiagonalMap(0, target_),
+            "matrix_columns", -1, -1, -1, 2 * tileRows - 1,
+            1, 1, 1, lanes);
+        emitMxmWave(rewriter_, op_.getLoc(), capture + 2,
+            hemisphere * target_.throughput().mxms_per_hemisphere
+                + (singleMxm ? 0 : localMxm),
+            "iw",
+            singleMxm
+                ? localMxm % target_.throughput().mxm_weight_buffers
+                : 0,
+            0, 0, 0, 1, 1, 0, 1, "stream", true,
+            "supercell", 0, dataFormat, {}, {}, tileRows, 1, 1,
+            1, 1, 0,
+            singleMxm ? singleMxmWeightStreamBase : -1);
         return capture + 2 * tileRows + 1;
     };
 
@@ -179,6 +175,22 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
         // Forward the result through the passive VXM bridge so both
         // hemispheres own a complete planar context.
         const bool pipelineHeadBlocks = tokenBlocks == 1;
+        const auto contextSlices = layout.contextSlices();
+        const auto disjointFromContext = [&](llvm::ArrayRef<int64_t> slices) {
+            return std::none_of(slices.begin(), slices.end(),
+                [&](int64_t slice) {
+                    return std::find(contextSlices.begin(),
+                        contextSlices.end(), slice)
+                        != contextSlices.end();
+                });
+        };
+        bool groupPvMemory = pipelineHeadBlocks
+            && valueBank != probabilityBank
+            && disjointFromContext(layout.probabilityDiagonalSlices());
+        for (int64_t headBlock = 0;
+             groupPvMemory && headBlock < headBlocks; ++headBlock)
+            groupPvMemory &= disjointFromContext(
+                layout.valuePackSlices(headBlock));
         const int64_t valueLoadLead = memToSxm + 2 * tileRows + 1
             + 8 + memToMxm;
         const int64_t firstIwOffset = memToSxm + 2;
@@ -191,6 +203,13 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                     target_.throughput().mxm_weight_buffers),
                 0));
         for (const auto& wave : waves) {
+            // With one query tile, every head block replays the same
+            // probability address on its physical MEM queue.  Retain the
+            // planned compute starts and lower them as one 3D domain after
+            // the wave has been timed.  Keep separate domains when value and
+            // probability share a physical MEM queue.
+            std::array<std::vector<int64_t>, 2> probabilityStarts;
+            std::array<std::vector<int64_t>, 2> valueRouteStarts;
             for (int64_t headBlock = 0;
                  headBlock < headBlocks; ++headBlock) {
                 const int64_t weightBuffer = headBlock
@@ -223,9 +242,15 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                             const auto head =
                                 wave[static_cast<std::size_t>(hemisphere)];
                             if (!head) continue;
+                            if (groupPvMemory)
+                                valueRouteStarts[static_cast<std::size_t>(
+                                    hemisphere)].push_back(
+                                        routeStarts[static_cast<std::size_t>(
+                                            hemisphere)]);
                             const int64_t ready = emitValueLoad(
                                 hemisphere, *head, keyBlock, headBlock,
-                                routeStarts[static_cast<std::size_t>(hemisphere)]);
+                                routeStarts[static_cast<std::size_t>(hemisphere)],
+                                !groupPvMemory);
                             firstCompute = std::max(firstCompute,
                                 ready + 1
                                     - hemisphere
@@ -263,35 +288,40 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                         ? hemisphere
                                             * finalOutputHemisphereStagger
                                         : 0);
-                            for (int64_t query = 0; query < tile;
-                                 ++query) {
-                                const int64_t row = query % lanes;
-                                const int64_t diagonal = query / lanes;
-                                for (int64_t byte = 0; byte < 2;
-                                     ++byte) {
-                                    const int64_t slice =
-                                        layout.probabilityDiagonalSlices()
-                                            [row * 2 + byte];
-                                    const auto latency =
-                                        target_.transport_latency(
-                                            target::StreamEndpoint::Mem,
-                                            target::StreamEndpoint::MxmActivation,
-                                            target::StreamDirection::East,
-                                            slice);
-                                    if (!latency) return -1;
-                                    emitMem(rewriter_, op_.getLoc(),
-                                        hemisphereCompute + query - *latency,
-                                        hemisphere
-                                                * target_.memory()
-                                                      .slices_per_hemisphere
-                                            + slice,
-                                        "read",
-                                        layout.probabilityDiagonalAddress(
-                                            *head, queryBlock, keyBlock,
-                                            diagonal),
-                                        activationStreamBase + byte,
-                                        1, 1, 0,
-                                        "sram", -1, probabilityBank);
+                            if (groupPvMemory) {
+                                probabilityStarts[static_cast<std::size_t>(
+                                    hemisphere)].push_back(
+                                        hemisphereCompute);
+                            } else {
+                                for (int64_t row = 0; row < lanes; ++row) {
+                                    for (int64_t byte = 0; byte < 2;
+                                         ++byte) {
+                                        const int64_t slice =
+                                            layout.probabilityDiagonalSlices()
+                                                [row * 2 + byte];
+                                        const auto latency =
+                                            target_.transport_latency(
+                                                target::StreamEndpoint::Mem,
+                                                target::StreamEndpoint::MxmActivation,
+                                                target::StreamDirection::East,
+                                                slice);
+                                        if (!latency) return -1;
+                                        direct_domain_detail::emitMem3D(
+                                            rewriter_, op_.getLoc(), target_,
+                                            hemisphereCompute + row - *latency,
+                                            hemisphere
+                                                    * target_.memory()
+                                                          .slices_per_hemisphere
+                                                + slice,
+                                            "read",
+                                            layout.probabilityDiagonalAddress(
+                                                *head, queryBlock, keyBlock,
+                                                0),
+                                            activationStreamBase + byte,
+                                            tileRows, lanes, 1,
+                                            1, 1, 0, 1, 1, 0, -1,
+                                            probabilityBank);
+                                    }
                                 }
                             }
                             emitMxm(rewriter_, op_.getLoc(),
@@ -327,7 +357,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                     if (!latency) return -1;
                                     const int64_t writeCycle =
                                         resultStart + *latency;
-                                    emitMem(rewriter_, op_.getLoc(),
+                                    direct_domain_detail::emitMem3D(
+                                        rewriter_, op_.getLoc(), target_,
                                         writeCycle,
                                         hemisphere
                                                 * target_.memory()
@@ -338,7 +369,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                             *head, headBlock,
                                             queryBlock * tile),
                                         32 + byte, tile, 1, 1,
-                                        "sram", -1, contextBank);
+                                        1, 1, 0, 1, 1, 0, -1,
+                                        contextBank);
                                     blockEnd = std::max(
                                         blockEnd, writeCycle + tile);
                                     continue;
@@ -372,7 +404,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                             + destinationGroup + 1;
                                         packedStream = byte;
                                     }
-                                    emitMem(rewriter_, op_.getLoc(),
+                                    direct_domain_detail::emitMem3D(
+                                        rewriter_, op_.getLoc(), target_,
                                         writeCycle,
                                         destinationHemisphere
                                                 * target_.memory()
@@ -383,7 +416,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                             *head, headBlock,
                                             queryBlock * tile),
                                         packedStream, tile, 1, 1,
-                                        "sram", -1, contextBank);
+                                        1, 1, 0, 1, 1, 0, -1,
+                                        contextBank);
                                     blockEnd = std::max(
                                         blockEnd, writeCycle + tile);
                                     lastContextWriteCycle = std::max(
@@ -397,6 +431,126 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                             pipelinedEnd = std::max(pipelinedEnd, blockEnd + 1);
                         } else {
                             phaseStart = blockEnd + 1;
+                        }
+                    }
+                }
+            }
+            if (groupPvMemory) {
+                for (int64_t hemisphere = 0;
+                     hemisphere < target_.memory().hemispheres;
+                     ++hemisphere) {
+                    const auto head =
+                        wave[static_cast<std::size_t>(hemisphere)];
+                    if (!head) continue;
+                    const auto& routes = valueRouteStarts[
+                        static_cast<std::size_t>(hemisphere)];
+                    if (routes.size()
+                        != static_cast<std::size_t>(headBlocks))
+                        return -1;
+                    const int64_t kvHead = *head / queryHeadsPerKv;
+                    for (int64_t stream = 0; stream < 16; ++stream) {
+                        const int64_t firstSlice =
+                            layout.valuePackSlices(0)[stream];
+                        bool fixedSlice = true;
+                        for (int64_t headBlock = 1;
+                             headBlock < headBlocks; ++headBlock) {
+                            fixedSlice &= layout.valuePackSlices(headBlock)
+                                [stream] == firstSlice;
+                        }
+                        int64_t begin = 0;
+                        while (begin < headBlocks) {
+                            const int64_t slice =
+                                layout.valuePackSlices(begin)[stream];
+                            const int64_t address =
+                                layout.valuePackAddress(
+                                    kvHead, begin, 0, 0);
+                            int64_t count = 1;
+                            int64_t cycleStride = 1;
+                            int64_t addressStride = 0;
+                            if (fixedSlice && begin + 1 < headBlocks) {
+                                cycleStride = routes[begin + 1]
+                                    - routes[begin];
+                                addressStride = layout.valuePackAddress(
+                                    kvHead, begin + 1, 0, 0) - address;
+                                if (cycleStride >= tileRows) {
+                                    count = 2;
+                                    while (begin + count < headBlocks
+                                        && routes[begin + count]
+                                            - routes[begin + count - 1]
+                                            == cycleStride
+                                        && layout.valuePackAddress(kvHead,
+                                            begin + count, 0, 0)
+                                            - layout.valuePackAddress(kvHead,
+                                                begin + count - 1, 0, 0)
+                                            == addressStride)
+                                        ++count;
+                                }
+                            }
+                            const int64_t latency = memToSxm
+                                - slice / target_.streams()
+                                    .mem_slices_per_register_group;
+                            direct_domain_detail::emitMem3D(
+                                rewriter_, op_.getLoc(), target_,
+                                routes[begin] + memToSxm - latency,
+                                hemisphere
+                                        * target_.memory()
+                                              .slices_per_hemisphere
+                                    + slice,
+                                "read", address,
+                                inputStreams[static_cast<std::size_t>(stream)],
+                                tileRows, 1, 1, 1, 1, 0,
+                                count, cycleStride, addressStride,
+                                -1, valueBank);
+                            begin += count;
+                        }
+                    }
+                }
+                for (int64_t hemisphere = 0;
+                     hemisphere < target_.memory().hemispheres;
+                     ++hemisphere) {
+                    const auto head =
+                        wave[static_cast<std::size_t>(hemisphere)];
+                    if (!head) continue;
+                    const auto& starts = probabilityStarts[
+                        static_cast<std::size_t>(hemisphere)];
+                    if (starts.empty()) return -1;
+                    const int64_t groupInterval = starts.size() > 1
+                        ? starts[1] - starts[0] : 1;
+                    const bool affine = groupInterval >= tile
+                        && std::adjacent_find(
+                        starts.begin(), starts.end(),
+                        [&](int64_t lhs, int64_t rhs) {
+                            return rhs - lhs != groupInterval;
+                        }) == starts.end();
+                    const int64_t domainCount = affine
+                        ? static_cast<int64_t>(starts.size()) : 1;
+                    for (std::size_t domain = 0;
+                         domain < (affine ? 1 : starts.size()); ++domain) {
+                        const int64_t firstCompute = starts[domain];
+                        for (int64_t row = 0; row < lanes; ++row) {
+                            for (int64_t byte = 0; byte < 2; ++byte) {
+                                const int64_t slice =
+                                    layout.probabilityDiagonalSlices()
+                                        [row * 2 + byte];
+                                const auto latency = target_.transport_latency(
+                                    target::StreamEndpoint::Mem,
+                                    target::StreamEndpoint::MxmActivation,
+                                    target::StreamDirection::East, slice);
+                                if (!latency) return -1;
+                                direct_domain_detail::emitMem3D(
+                                    rewriter_, op_.getLoc(), target_,
+                                    firstCompute + row - *latency,
+                                    hemisphere
+                                            * target_.memory()
+                                                  .slices_per_hemisphere
+                                        + slice,
+                                    "read", layout.probabilityDiagonalAddress(
+                                        *head, 0, 0, 0),
+                                    activationStreamBase + byte,
+                                    tileRows, lanes, 1,
+                                    1, 1, 0, domainCount,
+                                    groupInterval, 0, -1, probabilityBank);
+                            }
                         }
                     }
                 }
@@ -453,9 +607,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                         const int64_t computeCycle = finalComputeStart
                             + (singleMxm ? localMxm * tile : 0);
                         if (singleMxm || localMxm == 0) {
-                            for (int64_t query = 0; query < tile; ++query) {
-                                const int64_t row = query % lanes;
-                                const int64_t diagonal = query / lanes;
+                            for (int64_t row = 0; row < lanes; ++row) {
                                 for (int64_t byte = 0; byte < 2; ++byte) {
                                     const int64_t slice =
                                         layout.probabilityDiagonalSlices()
@@ -463,21 +615,23 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                     const int64_t latency =
                                         *target_.transport_latency(
                                             target::StreamEndpoint::Mem,
-                                            target::StreamEndpoint::MxmActivation,
-                                            target::StreamDirection::East,
-                                            slice);
-                                    emitMem(rewriter_, op_.getLoc(),
-                                        computeCycle + query - latency,
+                                        target::StreamEndpoint::MxmActivation,
+                                        target::StreamDirection::East,
+                                        slice);
+                                    direct_domain_detail::emitMem3D(
+                                        rewriter_, op_.getLoc(), target_,
+                                        computeCycle + row - latency,
                                         hemisphere
                                                 * target_.memory()
                                                       .slices_per_hemisphere
                                             + slice,
                                         "read",
                                         layout.probabilityDiagonalAddress(*head,
-                                            queryBlock, keyBlock, diagonal),
+                                            queryBlock, keyBlock, 0),
                                         activationStreamBase + byte,
-                                        1, 1, 0,
-                                        "sram", -1, probabilityBank);
+                                        tileRows, lanes, 1,
+                                        1, 1, 0, 1, 1, 0, -1,
+                                        probabilityBank);
                                 }
                             }
                         }
@@ -556,7 +710,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                             !sourceLocalContext
                                             && (local
                                                 || copy + 1 < copyCount);
-                                        emitMem(rewriter_, op_.getLoc(),
+                                        direct_domain_detail::emitMem3D(
+                                            rewriter_, op_.getLoc(), target_,
                                             writeCycle,
                                             destinationHemisphere
                                                     * target_.memory()
@@ -569,7 +724,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                                 contextBlock,
                                                 queryBlock * tile),
                                             packedStream, tile, 1, 1,
-                                            "sram", -1, contextBank);
+                                            1, 1, 0, 1, 1, 0, -1,
+                                            contextBank);
                                         lastContextWriteCycle = std::max(
                                             lastContextWriteCycle,
                                             writeCycle + tile - 1);

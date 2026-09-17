@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/stream_schedule_emitters.hpp"
 
 #include "AttentionEmitterUtils.hpp"
+#include "DirectDomainEmitterUtils.hpp"
 #include "FfnEmitterUtils.hpp"
 
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
@@ -16,6 +17,7 @@ namespace ftlpu::compiler::schedule {
 namespace {
 
 using attention_detail::emitMem;
+using direct_domain_detail::emitMem3D;
 using attention_detail::emitSxm;
 using attention_detail::emitWavefrontBeat;
 using attention_detail::emitWavefrontTail;
@@ -415,7 +417,8 @@ int64_t emitDistributedMatrixTranspose(mlir::IRRewriter& rewriter,
 {
     const auto inputSlices = slices(inputPlacement);
     const auto outputSlices = slices(outputPlacement);
-    const int64_t width = 2 * target.throughput().lanes_per_tile;
+    const int64_t lanes = target.throughput().lanes_per_tile;
+    const int64_t width = 2 * lanes;
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t tileRows = target.throughput().tile_rows;
     if (inputSlices.size() != static_cast<std::size_t>(width)
@@ -457,43 +460,42 @@ int64_t emitDistributedMatrixTranspose(mlir::IRRewriter& rewriter,
     const int64_t blockCount = (rows / tile) * hiddenBlocks;
     const int64_t inputBeats = blockCount * tileRows;
     const int64_t captureStart = start + maxReadLatency;
-    for (int64_t wave = 0; wave < inputBeats; ++wave) {
-        for (int64_t hemisphere = 0;
-             hemisphere < target.memory().hemispheres; ++hemisphere) {
-            const int64_t capture = captureStart + wave;
-            for (int64_t stream = 0; stream < width; ++stream) {
-                const int64_t slice =
-                    inputSlices[static_cast<std::size_t>(stream)];
-                emitMem(rewriter, location,
-                    capture - readLatency(slice),
-                    hemisphere * target.memory().slices_per_hemisphere
-                        + slice,
-                    "read", baseRow(inputPlacement) + wave,
-                    sourceBase + stream, 1, 1, 0, "sram", -1,
-                    bank(inputPlacement));
-            }
-            emitWavefrontBeat(rewriter, location, target, capture,
-                hemisphere, wave, sourceStreams, transposeStreams,
-                outputStreams);
-            for (int64_t stream = 0; stream < width; ++stream) {
-                const int64_t slice =
-                    outputSlices[static_cast<std::size_t>(stream)];
-                emitMem(rewriter, location,
-                    capture + 1 + writeLatency(slice),
-                    hemisphere * target.memory().slices_per_hemisphere
-                        + slice,
-                    "write", baseRow(outputPlacement) + wave,
-                    outputBase + stream, 1, 1, 0, "sram", -1,
-                    bank(outputPlacement));
-            }
-        }
-    }
     for (int64_t hemisphere = 0;
          hemisphere < target.memory().hemispheres; ++hemisphere) {
-        for (int64_t tail = 0; tail < tileRows - 1; ++tail)
-            emitWavefrontTail(rewriter, location, target,
-                captureStart + inputBeats + tail, hemisphere, tail,
-                transposeStreams, outputStreams);
+        for (int64_t stream = 0; stream < width; ++stream) {
+            const int64_t slice =
+                inputSlices[static_cast<std::size_t>(stream)];
+            emitMem3D(rewriter, location, target,
+                captureStart - readLatency(slice),
+                hemisphere * target.memory().slices_per_hemisphere + slice,
+                "read", baseRow(inputPlacement), sourceBase + stream,
+                inputBeats, 1, 1, 1, 1, 0, 1, 1, 0, -1,
+                bank(inputPlacement));
+        }
+
+        // The transpose body is invariant.  The permute body advances by one
+        // physical lane group on every beat, which is exactly the native SXM
+        // map-stride induction field.
+        emitSxm(rewriter, location, captureStart, hemisphere, "transpose",
+            sourceStreams, transposeStreams,
+            attention_detail::identityMap(), "vector_columns", -1, -1,
+            -1, inputBeats, 1);
+        emitSxm(rewriter, location, captureStart + 1, hemisphere, "permute",
+            transposeStreams, outputStreams,
+            blockDiagonalMap(0, target), "vector_columns", -1, -1,
+            -1, inputBeats + tileRows - 1, 1, 1, 1, lanes);
+
+        for (int64_t stream = 0; stream < width; ++stream) {
+            const int64_t slice =
+                outputSlices[static_cast<std::size_t>(stream)];
+            emitMem3D(rewriter, location, target,
+                captureStart + 1 + writeLatency(slice),
+                hemisphere * target.memory().slices_per_hemisphere + slice,
+                "write", baseRow(outputPlacement), outputBase + stream,
+                inputBeats, 1, 1, 1, 1, 0, 1, 1, 0, -1,
+                bank(outputPlacement));
+        }
+
     }
     return captureStart + inputBeats
         + std::max(tileRows, maxWriteLatency + 1);
@@ -790,6 +792,7 @@ int64_t emitLegacyVxmFeedback(mlir::IRRewriter& rewriter,
     const int64_t rows = inputType.getDimSize(0);
     const int64_t hidden = inputType.getDimSize(1);
     const int64_t tile = target.throughput().mxm_rows;
+    const int64_t waves = target.throughput().tile_rows;
     const auto westReadLatency = [&](int64_t slice) {
         return target.transport_latency(target::StreamEndpoint::Mem,
             target::StreamEndpoint::VxmInput,
@@ -802,7 +805,6 @@ int64_t emitLegacyVxmFeedback(mlir::IRRewriter& rewriter,
     };
 
     const int64_t hiddenBlocks = hidden / tile;
-    const int64_t waves = target.throughput().tile_rows;
     const int64_t featuresPerBeat = target.throughput().lanes_per_tile;
     int64_t cycle = start;
     for (int64_t tokenBlock = 0;
@@ -977,7 +979,6 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
     const int64_t hidden = inputType.getDimSize(1);
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t lanes = target.throughput().lanes_per_tile;
-    const int64_t waves = target.throughput().tile_rows;
     const int64_t hiddenBlocks = hidden / tile;
     const int64_t tokenBlocks = rows / tile;
     const int64_t distributedRows =
@@ -1032,37 +1033,49 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
     const auto emitMirroredPairRead =
         [&](llvm::ArrayRef<int64_t> memorySlices, int64_t pair,
             int64_t address, int64_t stream, int64_t inputCycle,
-            int64_t memoryBank, int64_t addressBinding = -1) {
+            int64_t memoryBank, int64_t addressBinding = -1,
+            int64_t repeatCount = 1, int64_t repeatInterval = 1,
+            int64_t addressStride = 0, int64_t waveCount = 1,
+            int64_t waveInterval = 1,
+            int64_t waveAddressStride = 0) {
         for (int64_t hemisphere = 0;
              hemisphere < target.memory().hemispheres; ++hemisphere) {
             for (int64_t byte = 0; byte < 2; ++byte) {
                 const int64_t slice = memorySlices[2 * pair + byte];
-                emitMem(rewriter, location,
+                emitMem3D(rewriter, location, target,
                     inputCycle - readLatency(slice),
                     hemisphere * target.memory().slices_per_hemisphere
                         + slice,
                     "read", address,
                     32 + hemisphere * 16 + stream + byte,
-                    1, 1, 0, "sram", addressBinding, memoryBank);
+                    repeatCount, repeatInterval, addressStride,
+                    waveCount, waveInterval, waveAddressStride,
+                    1, 1, 0, addressBinding, memoryBank);
             }
         }
     };
     const auto emitMirroredWrite =
         [&](llvm::ArrayRef<int64_t> memorySlices, int64_t address,
             int64_t originalOutputStream, int64_t outputCycle,
-            int64_t byteCount, int64_t memoryBank) {
+            int64_t byteCount, int64_t memoryBank,
+            int64_t repeatCount = 1, int64_t repeatInterval = 1,
+            int64_t addressStride = 0, int64_t waveCount = 1,
+            int64_t waveInterval = 1,
+            int64_t waveAddressStride = 0) {
         for (int64_t destination = 0;
              destination < target.memory().hemispheres; ++destination) {
             const int64_t source = 1 - destination;
             for (int64_t byte = 0; byte < byteCount; ++byte) {
                 const int64_t slice = memorySlices[byte];
-                emitMem(rewriter, location,
+                emitMem3D(rewriter, location, target,
                     outputCycle + writeLatency(slice),
                     destination * target.memory().slices_per_hemisphere
                         + slice,
                     "write", address,
                     source * 8 + originalOutputStream + byte,
-                    1, 1, 0, "sram", -1, memoryBank);
+                    repeatCount, repeatInterval, addressStride,
+                    waveCount, waveInterval, waveAddressStride,
+                    1, 1, 0, -1, memoryBank);
             }
         }
     };
@@ -1086,15 +1099,13 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             "previous", 0, 0.0f, "accumulator", 0, 0.0f,
             dataFormat, 0, 1, 2, false, true, true);
 
-        for (int64_t feature = 0; feature < hidden; ++feature) {
-            const int64_t hiddenBlock = feature / tile;
-            const int64_t featureInBlock = feature % tile;
-            const int64_t wave = featureInBlock / lanes;
-            const int64_t pair = featureInBlock % lanes;
+        const int64_t featuresPerPair = hidden / lanes;
+        for (int64_t pair = 0; pair < lanes; ++pair) {
             emitMirroredPairRead(inputSlices, pair,
                 packedAddress(inputPlacement, tokenBlock,
-                    hiddenBlock, wave, hiddenBlocks),
-                0, reductionInput + feature, bank(inputPlacement));
+                    0, 0, hiddenBlocks),
+                0, reductionInput + pair, bank(inputPlacement), -1,
+                featuresPerPair, lanes, 1);
         }
 
         const int64_t scalarAddress = baseRow(inputPlacement)
@@ -1143,32 +1154,33 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
 
         int64_t normalizeWriteEnd = normalizeInput;
         const bool broadcastWeight = weightSlices.size() == 2;
-        for (int64_t feature = 0; feature < hidden; ++feature) {
-            const int64_t hiddenBlock = feature / tile;
-            const int64_t featureInBlock = feature % tile;
-            const int64_t wave = featureInBlock / lanes;
-            const int64_t pair = featureInBlock % lanes;
-            const int64_t inputAddress = packedAddress(inputPlacement,
-                tokenBlock, hiddenBlock, wave, hiddenBlocks);
-            const int64_t weightAddress = broadcastWeight
-                ? baseRow(weightPlacement) + feature
-                : baseRow(weightPlacement) + hiddenBlock * waves + wave;
-            const int64_t outputAddress = packedAddress(outputPlacement,
-                tokenBlock, hiddenBlock, wave, hiddenBlocks);
+        for (int64_t pair = 0; pair < lanes; ++pair) {
+            const int64_t inputAddress = packedAddress(
+                inputPlacement, tokenBlock, 0, 0, hiddenBlocks);
+            const int64_t outputAddress = packedAddress(
+                outputPlacement, tokenBlock, 0, 0, hiddenBlocks);
             emitMirroredPairRead(inputSlices, pair, inputAddress, 0,
-                normalizeInput + feature, bank(inputPlacement));
-            emitMirroredPairRead(weightSlices,
-                broadcastWeight ? 0 : pair, weightAddress, 2,
-                normalizeInput + feature, bank(weightPlacement),
-                inputBindingIndex(weight));
-            const int64_t outputCycle = normalizeInput + feature + 5;
+                normalizeInput + pair, bank(inputPlacement), -1,
+                featuresPerPair, lanes, 1);
+            if (!broadcastWeight)
+                emitMirroredPairRead(weightSlices, pair,
+                    baseRow(weightPlacement), 2,
+                    normalizeInput + pair, bank(weightPlacement),
+                    inputBindingIndex(weight), featuresPerPair, lanes, 1);
+            const int64_t outputCycle = normalizeInput + pair + 5;
             const auto outputPair =
                 llvm::ArrayRef<int64_t>(outputSlices).slice(2 * pair, 2);
             emitMirroredWrite(outputPair, outputAddress, 2,
-                outputCycle, 2, bank(outputPlacement));
+                outputCycle, 2, bank(outputPlacement),
+                featuresPerPair, lanes, 1);
             normalizeWriteEnd = std::max(normalizeWriteEnd,
-                outputCycle + maxWriteLatency(outputPair) + 1);
+                outputCycle + (featuresPerPair - 1) * lanes
+                    + maxWriteLatency(outputPair) + 1);
         }
+        if (broadcastWeight)
+            emitMirroredPairRead(weightSlices, 0, baseRow(weightPlacement),
+                2, normalizeInput, bank(weightPlacement),
+                inputBindingIndex(weight), hidden, 1, 1);
         cycle = normalizeWriteEnd + 1;
     }
     return cycle;

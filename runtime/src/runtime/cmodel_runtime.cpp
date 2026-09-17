@@ -432,6 +432,9 @@ void CModelRuntime::load(const BinaryProgram& program)
     if (execution_trace_enabled_)
         execution_trace_.begin_segment(program,
             execution_trace_cycle_offset_, execution_trace_append_on_load_);
+    if (mem_execution_trace_enabled_)
+        mem_execution_trace_.begin_segment(
+            execution_trace_cycle_offset_, execution_trace_append_on_load_);
     for (const BinaryBinding& binding : bindings_) {
         if (binding.access != BindingAccess::Internal) continue;
         if (binding.initializer == BindingInitializer::None) continue;
@@ -658,6 +661,27 @@ void CModelRuntime::write_execution_trace_csv(
         throw std::logic_error(
             "runtime execution trace was not enabled before program load");
     execution_trace_.write_csv(path);
+}
+
+void CModelRuntime::enable_mem_execution_trace(bool enabled) noexcept
+{
+    mem_execution_trace_enabled_ = enabled;
+}
+
+void CModelRuntime::stream_mem_execution_trace_csv(
+    const std::filesystem::path& path)
+{
+    mem_execution_trace_.stream_csv(path);
+    mem_execution_trace_enabled_ = true;
+}
+
+void CModelRuntime::write_mem_execution_trace_csv(
+    const std::filesystem::path& path) const
+{
+    if (!mem_execution_trace_enabled_)
+        throw std::logic_error(
+            "MEM execution trace was not enabled before program load");
+    mem_execution_trace_.write_csv(path);
 }
 
 void CModelRuntime::upload_binding(
@@ -1354,6 +1378,7 @@ void CModelRuntime::load_file(const std::filesystem::path& path)
 void CModelRuntime::run_logical_cycles(
     std::size_t cycles, TspSliceSystem::LogSinks sinks)
 {
+    sinks.capture_mem_trace = mem_execution_trace_enabled_;
     const auto count = cycles == 0 ? loaded_max_cycle_ + 1 : cycles;
     std::size_t advanced = 0;
     std::size_t consecutiveStalls = 0;
@@ -1366,6 +1391,9 @@ void CModelRuntime::run_logical_cycles(
             execution_trace_.sample(system_, physical_cycles_, pageReady,
                 waiting_weight_page_use_
                     ? &*waiting_weight_page_use_ : nullptr);
+        if (mem_execution_trace_enabled_)
+            mem_execution_trace_.sample(
+                system_, physical_cycles_, pageReady);
         datapath_performance_.sample(
             system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
         ++physical_cycles_;

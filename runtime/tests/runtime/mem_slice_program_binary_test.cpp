@@ -59,11 +59,26 @@ try {
             && descriptor.body[1].instruction.address == 200,
         "MEM_SLICE_PROGRAM payload changed during binary round-trip");
 
-    InstructionControlUnit icu;
-    load_queue_programs_into_icu(decoded.queues, icu);
+    bool hardwareRuntimeRejected = false;
+    try {
+        InstructionControlUnit icu;
+        load_queue_programs_into_icu(decoded.queues, icu);
+    } catch (const std::invalid_argument&) {
+        hardwareRuntimeRejected = true;
+    }
+    require(hardwareRuntimeRejected,
+        "hardware runtime accepted legacy MEM_SLICE_PROGRAM");
+
+    // The variable-length descriptor remains available as an explicit
+    // software-validation format. Exercise it on the isolated legacy queue;
+    // the production InstructionControlUnit above uses fixed raw-word i-MEM.
+    using LegacyMemQueue =
+        DistributedIcuQueue<MemInstruction, 128, 32, 8>;
+    LegacyMemQueue legacyQueue;
+    legacyQueue.push_mem_slice_program(descriptor);
     std::vector<std::pair<std::size_t, MemInstruction>> issues;
     for (std::size_t cycle = 0; cycle <= 8; ++cycle) {
-        if (const auto issued = icu.mem_iq(0).tick())
+        if (const auto issued = legacyQueue.tick())
             issues.emplace_back(cycle, *issued);
     }
     require(issues.size() == 6

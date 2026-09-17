@@ -13,6 +13,30 @@ kinds of CSV trace:
 Open `index.html` and load either format. Performance and pipeline validation
 should use the runtime execution trace.
 
+## Cycle-accurate MEM viewer
+
+`mem.html` is a dedicated dynamic view of every physical MEM port. Each
+`hemisphere / slice / bank / read-write port` row has separate bands for ICU
+issue or wait state, tile 0..3 pipeline execution, and the actual SRAM
+`read_to_sr` or `write_commit`. SRAM events retain the row address, SR column,
+stream, vector tag, and eight transferred bytes.
+
+Enable and write the sparse trace around a run:
+
+```cpp
+CModelRuntime runtime(system);
+runtime.enable_mem_execution_trace();
+runtime.load(program);
+runtime.run_cycles(cycles);
+runtime.write_mem_execution_trace_csv("run.mem.csv");
+```
+
+`ModelSession` exposes the same two methods. The Qwen2.5 and Qwen3 decoder
+runtime tests also recognize `FTLPU_QWEN_MEM_CSV`. Missing port/cycle rows are
+idle by definition; the viewer synthesizes them and can expand the complete
+2 hemisphere × 32 slice × 2 bank × 2 port grid. Its playback controls list
+every active MEM behavior at the selected cycle.
+
 For a multi-invocation `ModelSession`, runtime segments are appended on one
 session-wide physical-cycle axis. `Session.Invocation` marks each executable;
 `C2C.ModelWeightPage`, `C2C.HostInput`, and `C2C.HostOutput` retain transfer
@@ -36,6 +60,11 @@ start,end,resource,detail,pattern,inner_count,inner_interval,inner_stride,outer_
 `repeat` and `repeat2d` rows describe iteration spaces rather than expanded
 events. The viewer expands only the instances intersecting the visible cycle
 window. `induction` identifies the numeric field changed by the strides.
+
+For raw FU 3-D packets, the offline writer emits one row per third-counter
+coordinate and preserves the first two counters as a `repeat` or `repeat2d`
+pattern. This keeps the CSV practical while representing every hardware launch
+without reconstructing a fine-command stream.
 
 In an execution trace, `C2C.E.Prefetch`, `C2C.W.Prefetch`, shared-SR, and
 `MEM.*.C2CWrite` intervals come from completed CModel DMA/RX/MEM-write work.

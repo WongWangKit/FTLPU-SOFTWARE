@@ -61,7 +61,8 @@ try {
         CModelRuntime runtime(*system);
         runtime.load(program);
     } else {
-        load_queue_programs_into_icu(*queues_to_load, system->icu());
+        load_queue_programs_into_icu(*queues_to_load, system->icu(),
+            program.hardware.mxms_per_hemisphere);
     }
     std::cout << "ICU queues loaded" << std::endl;
     std::cout << "compiled_queue_program_runtime_test passed\n";

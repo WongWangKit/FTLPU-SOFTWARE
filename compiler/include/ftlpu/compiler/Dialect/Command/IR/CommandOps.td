@@ -100,6 +100,73 @@ def MxmDequantOp : FTLPU_Command_Op<"mxm_dequant",
   let hasVerifier = 1;
 }
 
+// Hardware-facing FU loop instructions. `words` is the flattened sequence of
+// physical 32-bit lanes: three 96-bit MEM/VXM i-MEM words or two 128-bit MXM
+// i-MEM words. MEM/MXM use three launch counters; VXM keeps its contiguous
+// run length in the compact config and uses two outer launch counters. These
+// operations are produced directly by closed-form lowering and must never be
+// reconstructed from per-cycle Schedule events. `cycle` is compiler-only
+// schedule metadata: CommandBinary emits queue-local NOPs for gaps, while the
+// encoded hardware packet keeps its former start-cycle field reserved at zero.
+def Mem3DOp : FTLPU_Command_Op<"mem_3d", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Raw three-word MEM ICU 3-D instruction";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words,
+      OptionalAttr<I64Attr>:$address_binding,
+      OptionalAttr<StrAttr>:$address_binding_access);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def MemWriteRead2DOp : FTLPU_Command_Op<"mem_write_read_2d", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Raw three-word MEM ICU write/read 2-D instruction";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def MxmLoad3DOp : FTLPU_Command_Op<"mxm_load_3d",
+    [MemoryEffects<[MemWrite]>]> {
+  let summary = "Raw two-word MXM-load ICU 3-D instruction";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def MxmDequant3DOp : FTLPU_Command_Op<"mxm_dequant_3d",
+    [MemoryEffects<[MemWrite]>]> {
+  let summary = "Raw two-word MXM-dequant ICU 3-D instruction";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words,
+      OptionalAttr<I64Attr>:$scale_binding);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def MxmCompute3DOp : FTLPU_Command_Op<"mxm_compute_3d",
+    [MemoryEffects<[MemWrite]>]> {
+  let summary = "Raw two-word MXM-compute ICU 3-D instruction";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def VxmRun2DOp : FTLPU_Command_Op<"vxm_run_2d",
+    [MemoryEffects<[MemWrite]>]> {
+  let summary = "Raw three-word VXM ICU RUN_2D instruction";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words,
+      OptionalAttr<I64Attr>:$scale_binding);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def SxmRun2DOp : FTLPU_Command_Op<"sxm_run_2d",
+    [MemoryEffects<[MemWrite]>]> {
+  let summary = "Raw six-word SXM ICU RUN_2D instruction";
+  let arguments = (ins StrAttr:$kind, I64Attr:$cycle, I64Attr:$queue,
+      ArrayAttr:$words);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
 def VxmOp : FTLPU_Command_Op<"vxm", [MemoryEffects<[MemWrite]>]> {
     let summary = "Compressed command for one ICU VXM ALU queue";
     let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,

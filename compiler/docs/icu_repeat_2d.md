@@ -1,4 +1,9 @@
-# ICU Repeat2D Compiler Design
+# Legacy ICU Repeat2D Compiler Design
+
+This document describes the legacy `CommandSequence` compatibility path.
+Hardware-facing direct lowering emits FU-specific `READ_3D`, `WRITE_3D`,
+`LOAD_3D`, `DEQUANT_3D`, `COMPUTE_3D`, and `RUN_2D` packets from operator
+domains and does not run this reconstruction policy.
 
 `Repeat2D` compresses a regular two-dimensional iteration of one functional
 instruction. Command IR keeps its existing `repeat_*`, `wave_*`, and
@@ -27,9 +32,10 @@ MXM induction is valid only for an `IW` weight column.
 
 ## Compiler Policy
 
-The binary emitter preserves inner and outer dimensions in queue-local
-`CommandSequence` objects. A linear scan of cycle-sorted sequences selects
-blocking Repeat2D when legal and expands interleaved outer waves otherwise.
+The legacy binary emitter preserves inner and outer dimensions in queue-local
+`CommandSequence` objects. It selects blocking Repeat2D only when the complete
+range is already legal. Interleaved outer waves are rejected and must be
+replaced by direct operator lowering; they are not split after scheduling.
 `throughput.icu_repeat_2d_enabled = 0` forces expansion for hardware without
 this capability and for compression-equivalence testing.
 
@@ -41,7 +47,7 @@ inherits the other port's address induction.
 
 - CModel codec, MEM induction, and MXM-column unit tests pass.
 - Command IR to binary to runtime to CModel ICU compatibility passes.
-- Interleaved same-queue events trigger automatic expansion.
+- Interleaved same-queue events are rejected at the hardware boundary.
 - Repeat2D and fully expanded SmolLM2 sequence-128 Block8 fused FFN binaries
   have identical `max_cycle=21095`, dynamic issue counts, and numeric output.
 - The measured binary size falls from 17,650,899 to 12,865,201 bytes, a 27.1%

@@ -19,6 +19,7 @@ def lower(tool: Path, target: Path, source: Path, output: Path,
         str(tool), "--input", str(source), "--output", str(output),
         "--pipeline", pipeline, "--mxm-execution", mxm_execution,
         "--ffn-schedule", "tail", "--target-config", str(target),
+        "--projection-rope-overlap", "on",
     ]
     if kv_cache_capacity:
         command += ["--kv-cache-capacity", str(kv_cache_capacity)]
@@ -185,7 +186,8 @@ def validate_paged_weights(tensor: str, target_config: Path,
         raise AssertionError("paged lowering requires a separate working bank")
 
     attention_workspaces = (
-        "input_staging", "query", "key", "value", "score",
+        "input_staging", "input_staging_pong",
+        "query", "key", "value", "score",
         "score_mxm1", "exp", "exp_mxm1", "causal_mask",
         "causal_mask_mxm1", "fused_score", "fused_score_bank1",
         "fused_causal_mask", "fused_causal_mask_bank1",
@@ -203,6 +205,36 @@ def validate_paged_weights(tensor: str, target_config: Path,
                         f"attention workspace {name} is in weight bank: "
                         f"{placement}"
                     )
+    else:
+        staging = parse_placement(find_dictionary(tensor, "input_staging"))
+        staging_pong = parse_placement(
+            find_dictionary(tensor, "input_staging_pong")
+        )
+        weight_base = int(target.get("memory", {}).get(
+            "w8a16_weight_slice_base", 20))
+        expected_primary_slices = (8, 9)
+        expected_pong_slices = (0, 1)
+        if (staging["bank"] != working_bank
+                or staging["slices"] != expected_primary_slices
+                or int(staging["base"]) + int(staging["count"]) != bank_rows):
+            raise AssertionError(
+                "attention input staging primary copy is not on activation "
+                f"slices 8/9 at the top of the working bank: {staging}"
+            )
+        if (staging_pong["bank"] != working_bank
+                or staging_pong["slices"] != expected_pong_slices
+                or staging_pong["base"] != staging["base"]
+                or staging_pong["count"] != staging["count"]):
+            raise AssertionError(
+                "attention input staging pong copy is not the same affine "
+                f"buffer on activation slices 0/1: {staging_pong}"
+            )
+        if (max((*staging["slices"], *staging_pong["slices"]))
+                >= weight_base):
+            raise AssertionError(
+                "attention input ping/pong escaped the activation slice "
+                f"partition: primary={staging}, pong={staging_pong}"
+            )
 
     for line in tensor.splitlines():
         if "ftlpu.tensor.rms_norm_task" not in line:

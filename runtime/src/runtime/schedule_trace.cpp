@@ -111,6 +111,8 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
                 "runtime trace MEM induction underflows the address");
         std::ostringstream detail;
         detail << "slice=" << slice << " bank=" << bank
+               << " operation="
+               << (instruction.opcode == MemOpcode::Read ? "read" : "write")
                << " addr=" << address << " stream=" << stream_name(instruction.stream);
         const char* opcodeName = instruction.preserve_stream
             ? "WriteTap"
@@ -265,6 +267,81 @@ struct EventPattern {
     std::int64_t base_delta{0};
 };
 
+InstructionKind raw_instruction_kind(QueueKind kind)
+{
+    switch (kind) {
+    case QueueKind::Mem: return InstructionKind::Mem;
+    case QueueKind::MxmLoad:
+    case QueueKind::MxmCompute: return InstructionKind::Mxm;
+    case QueueKind::MxmDequant: return InstructionKind::MxmDequant;
+    case QueueKind::Vxm: return InstructionKind::Vxm;
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute: return InstructionKind::Sxm;
+    }
+    throw std::logic_error("unknown raw FU queue kind in schedule trace");
+}
+
+template <typename Packet>
+Packet read_raw_trace_packet(
+    const QueueProgram& queue, std::size_t commandIndex)
+{
+    if (commandIndex > queue.commands.size()
+        || Packet::kWordCount > queue.commands.size() - commandIndex)
+        throw std::logic_error("truncated raw FU packet in schedule trace");
+    const auto expectedKind = raw_instruction_kind(queue.kind);
+    Packet packet{};
+    for (std::size_t word = 0; word < Packet::kWordCount; ++word) {
+        const auto& command = queue.commands[commandIndex + word];
+        const auto wordIndexMask = expectedKind == InstructionKind::Sxm
+            ? std::uint32_t{0x7} : std::uint32_t{0x3};
+        if (command.instruction_kind != expectedKind
+            || command.word_count != Packet::kLanesPerWord
+            || !command.extension_words.empty()
+            || command.command != command.words[0]
+            || !is_fu_3d_raw_word_command(command)
+            || ((command.words[0] >> 2) & wordIndexMask) != word)
+            throw std::logic_error(
+                "malformed raw FU packet in schedule trace");
+        for (std::size_t lane = 0; lane < Packet::kLanesPerWord; ++lane)
+            packet.words[word].lanes[lane] = command.words[lane];
+    }
+    return packet;
+}
+
+EventPattern loop_pattern(const IcuLoop3D& loop,
+    std::int64_t innerStride = 0, std::int64_t outerStride = 0,
+    IcuInductionTarget induction = IcuInductionTarget::None)
+{
+    return {loop.counts[1] > 1 ? "repeat2d"
+            : loop.counts[0] > 1 ? "repeat" : "single",
+        loop.counts[0], loop.cycle_strides[0], innerStride,
+        loop.counts[1], loop.cycle_strides[1], outerStride, false,
+        induction, 0};
+}
+
+const char* buffer_mode_name(MxmIcuBufferMode mode)
+{
+    switch (mode) {
+    case MxmIcuBufferMode::Fixed: return "fixed";
+    case MxmIcuBufferMode::ToggleDimension0: return "toggle_d0";
+    case MxmIcuBufferMode::ToggleDimension1: return "toggle_d1";
+    case MxmIcuBufferMode::ToggleDimension2: return "toggle_d2";
+    }
+    return "unknown";
+}
+
+std::string mxm_resource(const QueueProgram& queue,
+    std::size_t mxmsPerHemisphere, std::string_view suffix)
+{
+    if (mxmsPerHemisphere == 0)
+        throw std::logic_error(
+            "schedule trace requires at least one MXM per hemisphere");
+    const auto side = queue.index < mxmsPerHemisphere ? "E" : "W";
+    const auto local = queue.index % mxmsPerHemisphere;
+    return "MXM." + std::string(side) + std::to_string(local)
+        + "." + std::string(suffix);
+}
+
 std::size_t event_duration(
     const QueueProgram& queue, const QueueCommand& command)
 {
@@ -323,6 +400,287 @@ void write_event(std::ostream& output, std::int64_t start, std::int64_t end,
            << ',' << (pattern.skip_first ? 1 : 0) << ','
            << csv_field(std::string(induction_name(pattern.induction_target)))
            << ',' << pattern.base_delta << '\n';
+}
+
+std::size_t raw_loop_final_offset(const IcuLoop3D& loop)
+{
+    std::size_t offset = loop.wait_cycle;
+    for (std::size_t dimension = 0;
+         dimension < IcuLoop3D::kDimensions; ++dimension)
+        offset += (loop.counts[dimension] - 1)
+            * loop.cycle_strides[dimension];
+    return offset;
+}
+
+std::size_t write_raw_fu_packet(std::ostream& output,
+    const QueueProgram& queue, std::size_t commandIndex,
+    std::size_t packetIssueCycle, std::size_t mxmsPerHemisphere)
+{
+    const auto writeDepthRows = [&](const IcuLoop3D& loop,
+                                    const EventPattern& pattern,
+                                    std::size_t duration,
+                                    const auto& describeDepth) {
+        for (std::size_t depth = 0; depth < loop.counts[2]; ++depth) {
+            const auto start = packetIssueCycle + loop.start_cycle
+                + loop.wait_cycle
+                + depth * loop.cycle_strides[2];
+            write_event(output, static_cast<std::int64_t>(start),
+                static_cast<std::int64_t>(start + duration),
+                describeDepth(depth), pattern);
+        }
+    };
+
+    switch (queue.kind) {
+    case QueueKind::Mem: {
+        if (is_mem_write_read_2d_raw_packet_header(
+                queue.commands[commandIndex])) {
+            const auto instruction =
+                decode_mem_write_read_2d_raw_packet(queue, commandIndex);
+            const auto local = queue.index
+                % InstructionControlUnit::kMemQueuesPerHemisphere;
+            const auto slice = local / hw::kMemBanksPerSlice;
+            const auto bank = local % hw::kMemBanksPerSlice;
+            const auto side = queue.index
+                < InstructionControlUnit::kMemQueuesPerHemisphere
+                ? "E" : "W";
+            std::ostringstream writeDetail;
+            writeDetail << "slice=" << slice << " bank=" << bank
+                        << " operation=write addr="
+                        << instruction.base_address << " stream="
+                        << stream_name(instruction.write_stream);
+            std::ostringstream readDetail;
+            readDetail << "slice=" << slice << " bank=" << bank
+                       << " operation=read addr="
+                       << instruction.base_address << " stream_base="
+                       << stream_name(instruction.read_stream_base)
+                       << " stream_outer_stride="
+                       << instruction.read_stream_outer_stride;
+            const auto pattern = [&](const auto& cycleStrides) {
+                return EventPattern {"repeat2d", instruction.counts[0],
+                    cycleStrides[0], instruction.address_strides[0],
+                    instruction.counts[1], cycleStrides[1],
+                    instruction.address_strides[1], false,
+                    IcuInductionTarget::MemAddress, 0};
+            };
+            const auto writeStart = packetIssueCycle
+                + instruction.start_wait;
+            const auto readStart = writeStart
+                + instruction.read_start_offset;
+            write_event(output, static_cast<std::int64_t>(writeStart),
+                static_cast<std::int64_t>(writeStart + 1),
+                {std::string("MEM.") + side + ".WRITE_READ_2D.Write",
+                    writeDetail.str()},
+                pattern(instruction.write_cycle_strides));
+            write_event(output, static_cast<std::int64_t>(readStart),
+                static_cast<std::int64_t>(readStart + 1),
+                {std::string("MEM.") + side + ".WRITE_READ_2D.Read",
+                    readDetail.str()},
+                pattern(instruction.read_cycle_strides));
+            return packetIssueCycle
+                + ftlpu::detail::mem_icu_write_read_2d_last_issue_cycle(
+                    instruction) + 1;
+        }
+        const auto instruction = isa::decode_mem_icu_3d_instruction(
+            read_raw_trace_packet<isa::EncodedMemIcu3DPacket>(
+                queue, commandIndex));
+        const auto local = queue.index
+            % InstructionControlUnit::kMemQueuesPerHemisphere;
+        const auto slice = local / hw::kMemBanksPerSlice;
+        const auto bank = local % hw::kMemBanksPerSlice;
+        const auto east = queue.index
+            < InstructionControlUnit::kMemQueuesPerHemisphere;
+        const auto opcode = instruction.opcode == MemIcuOpcode::Read3D
+            ? "Read3D"
+            : instruction.opcode == MemIcuOpcode::Write3D
+                ? "Write3D" : "WriteTap3D";
+        const auto pattern = loop_pattern(instruction.loop,
+            instruction.address.inner_stride,
+            instruction.address.middle_stride,
+            IcuInductionTarget::MemAddress);
+        writeDepthRows(instruction.loop, pattern, 1,
+            [&](std::size_t depth) {
+                const auto address = ftlpu::detail::mem_icu_address_3d(
+                    instruction,
+                    IcuCoordinate3D{{0, 0, depth}});
+                std::ostringstream detail;
+                detail << "slice=" << slice << " bank=" << bank
+                       << " operation="
+                       << (instruction.opcode == MemIcuOpcode::Read3D
+                               ? "read" : "write")
+                       << " addr=" << address
+                       << " stream=" << stream_name(instruction.stream)
+                       << " depth=" << depth << '/'
+                       << instruction.loop.counts[2]
+                       << " d2_cycle_stride="
+                       << instruction.loop.cycle_strides[2]
+                       << " outer_group_size="
+                       << instruction.address.outer_group_size
+                       << " outer_inner_stride="
+                       << instruction.address.outer_inner_stride
+                       << " outer_group_stride="
+                       << instruction.address.outer_group_stride;
+                return EventDescription{
+                    std::string("MEM.") + (east ? "E." : "W.")
+                        + opcode,
+                    detail.str()};
+            });
+        return packetIssueCycle
+            + raw_loop_final_offset(instruction.loop) + 1;
+    }
+    case QueueKind::MxmLoad: {
+        const auto instruction = isa::decode_mxm_load_icu_3d_instruction(
+            read_raw_trace_packet<isa::EncodedMxmLoadIcu3DPacket>(
+                queue, commandIndex));
+        const auto pattern = loop_pattern(instruction.loop,
+            instruction.weight_column_strides[0],
+            instruction.weight_column_strides[1],
+            IcuInductionTarget::MxmWeightColumn);
+        writeDepthRows(instruction.loop, pattern, 1,
+            [&](std::size_t depth) {
+                const auto column = ftlpu::detail::checked_icu_3d_operand(
+                    instruction.weight_column_base,
+                    instruction.weight_column_strides,
+                    IcuCoordinate3D{{0, 0, depth}},
+                    "trace MXM weight column");
+                std::ostringstream detail;
+                detail << "Load3D buffer="
+                       << instruction.weight_buffer_base
+                       << " buffer_mode="
+                       << buffer_mode_name(instruction.weight_buffer_mode)
+                       << " column=" << column
+                       << " stream="
+                       << stream_name(instruction.weight_stream_base)
+                       << " input_mode="
+                       << static_cast<unsigned>(
+                              instruction.weight_input_mode)
+                       << " depth=" << depth << '/'
+                       << instruction.loop.counts[2]
+                       << " d2_column_stride="
+                       << instruction.weight_column_strides[2];
+                return EventDescription{
+                    mxm_resource(queue, mxmsPerHemisphere, "Load"),
+                    detail.str()};
+            });
+        return packetIssueCycle
+            + raw_loop_final_offset(instruction.loop) + 1;
+    }
+    case QueueKind::MxmDequant: {
+        const auto instruction = isa::decode_mxm_dequant_icu_3d_instruction(
+            read_raw_trace_packet<isa::EncodedMxmDequantIcu3DPacket>(
+                queue, commandIndex));
+        const auto pattern = loop_pattern(instruction.loop);
+        writeDepthRows(instruction.loop, pattern, 1,
+            [&](std::size_t depth) {
+                std::ostringstream detail;
+                detail << "Dequant3D scale="
+                       << instruction.instruction.scale()
+                       << " depth=" << depth << '/'
+                       << instruction.loop.counts[2];
+                return EventDescription{
+                    mxm_resource(queue, mxmsPerHemisphere, "Dequant"),
+                    detail.str()};
+            });
+        return packetIssueCycle
+            + raw_loop_final_offset(instruction.loop) + 1;
+    }
+    case QueueKind::MxmCompute: {
+        const auto instruction = isa::decode_mxm_compute_icu_3d_instruction(
+            read_raw_trace_packet<isa::EncodedMxmComputeIcu3DPacket>(
+                queue, commandIndex));
+        const auto pattern = loop_pattern(instruction.loop,
+            instruction.accumulator_address_strides[0],
+            instruction.accumulator_address_strides[1],
+            IcuInductionTarget::MxmAccumulatorAddress);
+        writeDepthRows(instruction.loop, pattern, 1,
+            [&](std::size_t depth) {
+                const auto accumulator =
+                    ftlpu::detail::checked_icu_3d_operand(
+                    instruction.accumulator_address_base,
+                    instruction.accumulator_address_strides,
+                    IcuCoordinate3D{{0, 0, depth}},
+                    "trace MXM accumulator address");
+                std::ostringstream detail;
+                if (instruction.opcode
+                    == MxmComputeIcuOpcode::AccumulatorRead3D) {
+                    detail << "AccumulatorRead3D out="
+                           << stream_name(instruction.result_stream_base)
+                           << " acc=" << accumulator;
+                } else {
+                    detail << "Compute3D buffer="
+                           << instruction.weight_buffer_base
+                           << " buffer_mode="
+                           << buffer_mode_name(
+                                  instruction.weight_buffer_mode)
+                           << " act="
+                           << stream_name(
+                                  instruction.activation_stream_base)
+                           << " out="
+                           << stream_name(instruction.result_stream_base)
+                           << " acc=" << accumulator
+                           << " row_stride="
+                           << instruction.accumulator_row_stride
+                           << " format="
+                           << mxm_data_format_name(instruction.data_format)
+                           << " terminal_dimension="
+                           << instruction.terminal_dimension;
+                }
+                detail << " depth=" << depth << '/'
+                       << instruction.loop.counts[2]
+                       << " d2_acc_stride="
+                       << instruction.accumulator_address_strides[2];
+                return EventDescription{
+                    mxm_resource(queue, mxmsPerHemisphere, "Compute"),
+                    detail.str()};
+            });
+        return packetIssueCycle
+            + raw_loop_final_offset(instruction.loop) + 1;
+    }
+    case QueueKind::Vxm: {
+        const auto run = isa::decode_vxm_icu_run_2d_instruction(
+            read_raw_trace_packet<isa::EncodedVxmIcuRun2DPacket>(
+                queue, commandIndex));
+        const auto decoded = VxmCompactInstructionCodec::decode(
+            queue.index, run.instruction);
+        std::ostringstream detail;
+        detail << VxmLane::operation_name(decoded.instruction.operation)
+               << " depth="
+               << static_cast<std::size_t>(decoded.chain_depth)
+               << " repeat=" << decoded.instruction.repeat_count
+               << " Run2D";
+        write_event(output,
+            static_cast<std::int64_t>(packetIssueCycle
+                + run.loop.start_cycle + run.loop.wait_cycle),
+            static_cast<std::int64_t>(packetIssueCycle
+                + run.loop.start_cycle + run.loop.wait_cycle
+                + decoded.instruction.repeat_count),
+            {"VXM.C" + std::to_string(queue.index), detail.str()},
+            loop_pattern(run.loop));
+        return packetIssueCycle + raw_loop_final_offset(run.loop) + 1;
+    }
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute: {
+        const auto run = isa::decode_sxm_icu_run_2d_instruction(
+            read_raw_trace_packet<isa::EncodedSxmIcuRun2DPacket>(
+                queue, commandIndex));
+        std::ostringstream detail;
+        detail << (queue.kind == QueueKind::SxmTranspose
+                       ? "transpose" : "permute")
+               << " Run2D map_stride=" << run.permute_map_stride;
+        const auto side = queue.index == 0 ? "E" : "W";
+        write_event(output,
+            static_cast<std::int64_t>(packetIssueCycle
+                + run.loop.start_cycle + run.loop.wait_cycle),
+            static_cast<std::int64_t>(packetIssueCycle
+                + run.loop.start_cycle + run.loop.wait_cycle + 1),
+            {std::string("SXM.") + side
+                    + (queue.kind == QueueKind::SxmTranspose
+                            ? ".Transpose" : ".Permute"),
+                detail.str()},
+            loop_pattern(run.loop));
+        return packetIssueCycle + raw_loop_final_offset(run.loop) + 1;
+    }
+    }
+    throw std::logic_error("unknown raw FU packet in schedule trace");
 }
 
 void write_pattern(std::ostream& output, const QueueProgram& queue,
@@ -457,7 +815,89 @@ void write_schedule_trace_csv(const BinaryProgram& program,
         std::size_t previous_cycle = 0;
         const QueueCommand* previous = nullptr;
         std::deque<std::pair<const QueueCommand*, std::size_t>> history;
-        for (const auto& command : queue.commands) {
+        for (std::size_t commandIndex = 0;
+             commandIndex < queue.commands.size(); ++commandIndex) {
+            const auto& command = queue.commands[commandIndex];
+            if (queue.kind == QueueKind::C2cDma
+                && command.instruction_kind == InstructionKind::C2cDma) {
+                const auto packet = decode_c2c_dma_icu_packet(
+                    queue, commandIndex);
+                const auto instruction = C2cIcuPacketCodec::decode_dma(packet);
+                std::ostringstream detail;
+                detail << (instruction.direction
+                                   == C2cDmaDirection::Ddr4ToC2c
+                               ? "load" : "store")
+                       << " lane=" << instruction.lane
+                       << " vectors=" << instruction.vector_count
+                       << " stride=" << instruction.address_stride_bytes
+                       << " sync=" << instruction.sync_tag;
+                const auto side = queue.index == 0 ? "E" : "W";
+                write_event(output, cursor,
+                    cursor + static_cast<std::int64_t>(
+                        instruction.vector_count),
+                    {std::string("C2C.") + side + ".DMA",
+                        detail.str()});
+                commandIndex += C2cDmaIcuPacket::kWordCount - 1;
+                ++cursor;
+                previous = nullptr;
+                history.clear();
+                continue;
+            }
+            if ((queue.kind == QueueKind::C2cTx
+                    || queue.kind == QueueKind::C2cRx)
+                && command.instruction_kind
+                    == InstructionKind::C2cEndpoint) {
+                const auto packet = decode_c2c_raw_word(
+                    command, InstructionKind::C2cEndpoint);
+                const auto rx = queue.kind == QueueKind::C2cRx;
+                std::size_t lane = 0;
+                std::size_t fabricStream = 0;
+                std::size_t vectorCount = 0;
+                std::uint32_t syncTag = 0;
+                if (rx) {
+                    const auto instruction =
+                        C2cIcuPacketCodec::decode_rx(packet);
+                    lane = instruction.lane;
+                    fabricStream = instruction.fabric_stream;
+                    vectorCount = instruction.vector_count;
+                    syncTag = instruction.sync_tag;
+                } else {
+                    const auto instruction =
+                        C2cIcuPacketCodec::decode_tx(packet);
+                    lane = instruction.lane;
+                    fabricStream = instruction.fabric_stream;
+                    vectorCount = instruction.vector_count;
+                    syncTag = instruction.sync_tag;
+                }
+                std::ostringstream detail;
+                detail << "lane=" << lane
+                       << " sr=" << fabricStream
+                       << " vectors=" << vectorCount
+                       << " sync=" << syncTag;
+                const auto side = queue.index == 0 ? "E" : "W";
+                write_event(output, cursor,
+                    cursor + static_cast<std::int64_t>(
+                        vectorCount),
+                    {std::string("C2C.") + side
+                            + (rx ? ".RX" : ".TX"),
+                        detail.str()});
+                ++cursor;
+                previous = nullptr;
+                history.clear();
+                continue;
+            }
+            if (is_fu_3d_raw_packet_header(command)) {
+                cursor = write_raw_fu_packet(
+                    output, queue, commandIndex, cursor,
+                    program.hardware.mxms_per_hemisphere);
+                commandIndex += fu_3d_raw_packet_word_count(queue.kind) - 1;
+                previous = nullptr;
+                history.clear();
+                continue;
+            }
+            if (is_fu_3d_raw_word_command(command))
+                throw std::logic_error(
+                    "runtime trace found an orphan raw FU packet word");
             if (is_vxm_stream_nd_command(command)) {
                 const auto descriptor =
                     decode_vxm_stream_nd_command(command);

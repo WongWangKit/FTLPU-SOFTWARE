@@ -14,6 +14,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
@@ -48,6 +49,8 @@ struct Args {
         ftlpu::compiler::FfnScheduleStrategy::Tail};
     ftlpu::compiler::AttentionScheduleStrategy attention_schedule{
         ftlpu::compiler::AttentionScheduleStrategy::Tail};
+    bool projection_rope_overlap_enabled{false};
+    bool projection_rope_overlap_specified{false};
     ftlpu::compiler::target::MxmExecutionPolicy mxm_execution_policy{
         ftlpu::compiler::target::MxmExecutionPolicy::Auto};
     std::int64_t weight_bank{-1};
@@ -55,8 +58,9 @@ struct Args {
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
         ftlpu::compiler::target::IcuCompressionMode::Macro};
-    bool mem_slice_program{true};
+    bool mem_slice_program{false};
     bool verify_icu_issues{false};
+    bool direct_ffn_up_3d{false};
 };
 
 InputStage parse_input_stage(const std::string& value)
@@ -92,6 +96,8 @@ Args parse_args(int argc, char** argv)
             args.pass_timing = true;
         else if (argument == "--verify-icu-issues")
             args.verify_icu_issues = true;
+        else if (argument == "--direct-ffn-up-3d")
+            args.direct_ffn_up_3d = true;
         else if (argument == "--icu-macro-schedule")
             args.icu_compression =
                 ftlpu::compiler::target::IcuCompressionMode::Macro;
@@ -133,6 +139,16 @@ Args parse_args(int argc, char** argv)
             else
                 throw std::runtime_error(
                     "unknown Attention schedule strategy: " + value);
+        } else if (argument == "--projection-rope-overlap") {
+            args.projection_rope_overlap_specified = true;
+            const std::string value = next();
+            if (value == "on")
+                args.projection_rope_overlap_enabled = true;
+            else if (value == "off")
+                args.projection_rope_overlap_enabled = false;
+            else
+                throw std::runtime_error(
+                    "unknown projection-RoPE overlap setting: " + value);
         } else if (argument == "--mxm-execution") {
             const std::string value = next();
             auto parsed = ftlpu::compiler::target::
@@ -155,8 +171,10 @@ Args parse_args(int argc, char** argv)
             "[--icu-compression none|control|macro] "
             "[--mem-slice-program on|off] "
             "[--verify-icu-issues] "
+            "[--direct-ffn-up-3d (standalone, SRAM-preloaded)] "
             "[--ffn-schedule tail|fused] "
-            "[--attention-schedule tail|fused]");
+            "[--attention-schedule tail|fused] "
+            "[--projection-rope-overlap on|off]");
     return args;
 }
 
@@ -199,8 +217,40 @@ try {
     auto module = mlir::parseSourceFile<mlir::ModuleOp>(
         args.input.string(), &context);
     if (!module) return 1;
+    const auto inheritedProjectionRopeOverlap =
+        (*module)->getAttrOfType<mlir::BoolAttr>(
+            "ftlpu.projection_rope_overlap");
+    const bool projectionRopeOverlapEnabled =
+        args.projection_rope_overlap_specified
+            ? args.projection_rope_overlap_enabled
+            : (inheritedProjectionRopeOverlap &&
+               inheritedProjectionRopeOverlap.getValue());
+    (*module)->setAttr("ftlpu.projection_rope_overlap",
+        mlir::BoolAttr::get(&context, projectionRopeOverlapEnabled));
 
     const auto target = load_target(args.target_config);
+    if (args.direct_ffn_up_3d
+        && args.input_stage != InputStage::Stream)
+        throw std::runtime_error(
+            "--direct-ffn-up-3d requires --input-stage stream");
+    if (args.direct_ffn_up_3d && args.weight_bank >= 0)
+        throw std::runtime_error(
+            "--direct-ffn-up-3d takes banks from explicit route placement; do not pass --weight-bank");
+    if (args.direct_ffn_up_3d && args.verify_icu_issues)
+        throw std::runtime_error(
+            "--direct-ffn-up-3d already emits raw FU 3-D commands and cannot use --verify-icu-issues");
+    if (args.direct_ffn_up_3d) {
+        std::size_t functionCount = 0;
+        bool declaration = false;
+        for (mlir::func::FuncOp function :
+             module->getOps<mlir::func::FuncOp>()) {
+            ++functionCount;
+            declaration |= function.isDeclaration();
+        }
+        if (functionCount != 1 || declaration)
+            throw std::runtime_error(
+                "--direct-ffn-up-3d requires exactly one defined function");
+    }
     if (!args.target_config.empty()
         || args.input_stage == InputStage::StableHlo
         || args.input_stage == InputStage::Stream)
@@ -220,25 +270,47 @@ try {
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::mxm_execution_policy_name(
                 args.mxm_execution_policy)));
+    const auto existingLowering =
+        (*module)->getAttrOfType<mlir::StringAttr>("ftlpu.command_lowering");
+    const bool directLowering = args.direct_ffn_up_3d
+        || args.input_stage != InputStage::Command
+        || (existingLowering && existingLowering.getValue() == "direct");
+    const auto effectiveCompression = directLowering
+        ? ftlpu::compiler::target::IcuCompressionMode::None
+        : args.icu_compression;
+    const bool effectiveMemSliceProgram =
+        directLowering ? false : args.mem_slice_program;
     (*module)->setAttr("ftlpu.icu_compression",
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::icu_compression_mode_name(
-                args.icu_compression)));
+                effectiveCompression)));
     (*module)->setAttr("ftlpu.mem_slice_program",
-        mlir::BoolAttr::get(&context, args.mem_slice_program));
+        mlir::BoolAttr::get(&context, effectiveMemSliceProgram));
     // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,
-            args.icu_compression
+            effectiveCompression
                 == ftlpu::compiler::target::IcuCompressionMode::Macro));
+    (*module)->setAttr("ftlpu.command_lowering",
+        mlir::StringAttr::get(&context,
+            directLowering ? "direct" : "legacy"));
+    if (args.direct_ffn_up_3d)
+        (*module)->setAttr("ftlpu.external_sram_preload",
+            mlir::BoolAttr::get(&context, true));
 
     mlir::PassManager passes(&context);
-    // Model-scale schedules contain hundreds of thousands of primitive ops.
-    // Verify once after schedule compression and once after command lowering
-    // instead of rescanning the uncompressed IR after every pass.
+    // Verify the operator-owned closed-form Schedule IR once before direct
+    // command lowering and verify the resulting Command IR once afterward.
     passes.enableVerifier(false);
     if (args.pass_timing) passes.enableTiming();
-    if (args.input_stage == InputStage::StableHlo) {
+    if (args.direct_ffn_up_3d) {
+        // This is an intentionally isolated production path for one Up
+        // projection. It consumes shape/placement/timeline directly and must
+        // never pass through fine Schedule IR or ScheduleCompression.
+        passes.addNestedPass<mlir::func::FuncOp>(
+            ftlpu::compiler::
+                create_lower_standalone_ffn_up_to_3d_command_pass());
+    } else if (args.input_stage == InputStage::StableHlo) {
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stablehlo_to_kernel_pass());
         passes.addNestedPass<mlir::func::FuncOp>(
@@ -247,28 +319,29 @@ try {
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_tensor_to_stream_pass());
     }
-    if (args.input_stage == InputStage::StableHlo
-        || args.input_stage == InputStage::Stream)
+    if (!args.direct_ffn_up_3d
+        && (args.input_stage == InputStage::StableHlo
+            || args.input_stage == InputStage::Stream))
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stream_to_schedule_pass(
                 args.ffn_schedule, args.attention_schedule,
-                args.pass_timing));
-    if (args.weight_bank >= 0
+                args.pass_timing,
+                projectionRopeOverlapEnabled));
+    if (!args.direct_ffn_up_3d && args.weight_bank >= 0
         && args.input_stage != InputStage::Command)
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_assign_weight_bank_pass(
                 args.weight_bank));
-    if (args.icu_compression
-            != ftlpu::compiler::target::IcuCompressionMode::None
+    // Direct lowering consumes the loop domains emitted by each operator.
+    // Schedule compression is a legacy compatibility path for pre-existing
+    // Command IR and must not participate in hardware command generation.
+    if (!args.direct_ffn_up_3d
         && args.input_stage != InputStage::VerifiedSchedule
         && args.input_stage != InputStage::Command)
         passes.addNestedPass<mlir::func::FuncOp>(
-            ftlpu::compiler::create_compress_schedule_pass());
-    if (args.input_stage != InputStage::VerifiedSchedule
-        && args.input_stage != InputStage::Command)
-        passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_verify_schedule_pass());
-    if (args.input_stage != InputStage::Command)
+    if (!args.direct_ffn_up_3d
+        && args.input_stage != InputStage::Command)
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_schedule_to_command_pass());
     if (mlir::failed(passes.run(*module))) return 1;

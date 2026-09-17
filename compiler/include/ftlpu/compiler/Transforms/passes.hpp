@@ -24,11 +24,14 @@ std::unique_ptr<mlir::Pass> create_lower_stream_to_schedule_pass(
     FfnScheduleStrategy ffn_strategy = FfnScheduleStrategy::Tail,
     AttentionScheduleStrategy attention_strategy =
         AttentionScheduleStrategy::Tail,
-    bool stage_timing = false);
+    bool stage_timing = false,
+    bool projection_rope_overlap_enabled = false);
 std::unique_ptr<mlir::Pass> create_assign_weight_bank_pass(
     std::int64_t bank);
 std::unique_ptr<mlir::Pass> create_compress_schedule_pass();
 std::unique_ptr<mlir::Pass> create_verify_schedule_pass();
 std::unique_ptr<mlir::Pass> create_lower_schedule_to_command_pass();
+std::unique_ptr<mlir::Pass>
+create_lower_standalone_ffn_up_to_3d_command_pass();
 void register_ftlpu_passes();
 } // namespace ftlpu::compiler

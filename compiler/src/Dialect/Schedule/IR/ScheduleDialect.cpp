@@ -7,7 +7,13 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OpImplementation.h"
 
+#include "llvm/Support/MathExtras.h"
+
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <optional>
+#include <utility>
 
 using namespace mlir;
 
@@ -20,6 +26,151 @@ using namespace mlir;
 
 namespace ftlpu::compiler::schedule {
 namespace {
+
+std::optional<std::pair<int64_t, int64_t>> affine_3d_bounds(
+    int64_t base, std::array<int64_t, 3> counts,
+    std::array<int64_t, 3> strides)
+{
+    int64_t minimum = base;
+    int64_t maximum = base;
+    for (std::size_t dimension = 0; dimension < counts.size(); ++dimension) {
+        if (counts[dimension] <= 0) return std::nullopt;
+        int64_t delta = 0;
+        if (llvm::MulOverflow(
+                counts[dimension] - 1, strides[dimension], delta))
+            return std::nullopt;
+        int64_t nextMinimum = 0;
+        int64_t nextMaximum = 0;
+        if (llvm::AddOverflow(
+                minimum, std::min<int64_t>(0, delta), nextMinimum)
+            || llvm::AddOverflow(
+                maximum, std::max<int64_t>(0, delta), nextMaximum))
+            return std::nullopt;
+        minimum = nextMinimum;
+        maximum = nextMaximum;
+    }
+    return std::pair<int64_t, int64_t> {minimum, maximum};
+}
+
+std::optional<std::pair<int64_t, int64_t>> blocked_outer_3d_bounds(
+    int64_t base, std::array<int64_t, 3> counts,
+    int64_t innerStride, int64_t middleStride, int64_t outerGroupSize,
+    int64_t outerInnerStride, int64_t outerGroupStride)
+{
+    if (counts[0] <= 0 || counts[1] <= 0 || counts[2] <= 0
+        || outerGroupSize <= 0)
+        return std::nullopt;
+    auto innerBounds = affine_3d_bounds(base,
+        {counts[0], counts[1], 1}, {innerStride, middleStride, 0});
+    if (!innerBounds) return std::nullopt;
+
+    bool hasOuterBounds = false;
+    int64_t outerMinimum = 0;
+    int64_t outerMaximum = 0;
+    const auto includeOuter = [&](int64_t group, int64_t within) {
+        int64_t groupDelta = 0;
+        int64_t withinDelta = 0;
+        int64_t value = 0;
+        if (llvm::MulOverflow(group, outerGroupStride, groupDelta)
+            || llvm::MulOverflow(within, outerInnerStride, withinDelta)
+            || llvm::AddOverflow(groupDelta, withinDelta, value))
+            return false;
+        if (!hasOuterBounds) {
+            outerMinimum = value;
+            outerMaximum = value;
+            hasOuterBounds = true;
+        } else {
+            outerMinimum = std::min(outerMinimum, value);
+            outerMaximum = std::max(outerMaximum, value);
+        }
+        return true;
+    };
+
+    const int64_t lastOuter = counts[2] - 1;
+    const int64_t lastGroup = lastOuter / outerGroupSize;
+    const int64_t lastWithin = lastOuter % outerGroupSize;
+    if (!includeOuter(0, 0)) return std::nullopt;
+    if (lastGroup == 0) {
+        if (!includeOuter(0, lastWithin)) return std::nullopt;
+    } else {
+        // Every group before the last is complete. A linear address term has
+        // its extrema at the first/last group and first/last member; the last
+        // (possibly partial) group contributes its two endpoints separately.
+        if (!includeOuter(0, outerGroupSize - 1)
+            || !includeOuter(lastGroup - 1, 0)
+            || !includeOuter(lastGroup - 1, outerGroupSize - 1)
+            || !includeOuter(lastGroup, 0)
+            || !includeOuter(lastGroup, lastWithin))
+            return std::nullopt;
+    }
+
+    int64_t minimum = 0;
+    int64_t maximum = 0;
+    if (llvm::AddOverflow(
+            innerBounds->first, outerMinimum, minimum)
+        || llvm::AddOverflow(
+            innerBounds->second, outerMaximum, maximum))
+        return std::nullopt;
+    return std::pair<int64_t, int64_t> {minimum, maximum};
+}
+
+LogicalResult verify_mem_3d_address_domain(Operation* op, int64_t base,
+    std::array<int64_t, 3> counts, int64_t innerStride,
+    int64_t middleStride, int64_t affineOuterStride, int64_t memoryRows,
+    llvm::StringRef description)
+{
+    const auto outerGroupSize =
+        op->getAttrOfType<IntegerAttr>("outer_group_size");
+    const auto outerInnerStride =
+        op->getAttrOfType<IntegerAttr>("outer_inner_stride");
+    const auto outerGroupStride =
+        op->getAttrOfType<IntegerAttr>("outer_group_stride");
+    const bool hasAnyBlockedField =
+        outerGroupSize || outerInnerStride || outerGroupStride;
+    const bool hasAllBlockedFields =
+        outerGroupSize && outerInnerStride && outerGroupStride;
+    if (hasAnyBlockedField && !hasAllBlockedFields)
+        return op->emitOpError(
+            "outer_group_size, outer_inner_stride, and outer_group_stride must be specified together");
+
+    std::optional<std::pair<int64_t, int64_t>> bounds;
+    if (!hasAllBlockedFields) {
+        bounds = affine_3d_bounds(base, counts,
+            {innerStride, middleStride, affineOuterStride});
+    } else {
+        const int64_t groupSize = outerGroupSize.getInt();
+        if (groupSize <= 0 || groupSize > 65536
+            || (groupSize & (groupSize - 1)) != 0)
+            return op->emitOpError(
+                "outer_group_size must be a power of two in [1, 65536]");
+        constexpr int64_t kMinimumSigned20 = -(int64_t {1} << 19);
+        constexpr int64_t kMaximumSigned20 = (int64_t {1} << 19) - 1;
+        if (outerInnerStride.getInt() < kMinimumSigned20
+            || outerInnerStride.getInt() > kMaximumSigned20
+            || outerGroupStride.getInt() < kMinimumSigned20
+            || outerGroupStride.getInt() > kMaximumSigned20)
+            return op->emitOpError(
+                "blocked outer address strides must fit signed 20-bit fields")
+                << ": outer_inner_stride=" << outerInnerStride.getInt()
+                << ", outer_group_stride=" << outerGroupStride.getInt();
+        bounds = blocked_outer_3d_bounds(base, counts, innerStride,
+            middleStride, groupSize, outerInnerStride.getInt(),
+            outerGroupStride.getInt());
+    }
+
+    if (!bounds || bounds->first < 0 || bounds->second >= memoryRows) {
+        auto diagnostic = op->emitOpError()
+            << description << " 3-D address range is outside physical SRAM";
+        if (bounds)
+            diagnostic << ": [" << bounds->first << ", "
+                       << bounds->second << "] not in [0, "
+                       << memoryRows << ")";
+        else
+            diagnostic << " or overflows int64";
+        return failure();
+    }
+    return success();
+}
 
 LogicalResult verify_timing(Operation* op, int64_t cycle, int64_t duration)
 {
@@ -75,15 +226,21 @@ LogicalResult verify_mem_placement(Operation* op, DictionaryAttr placement,
     if (count.getInt() <= 0)
         return op->emitOpError(
             "MEM placement instruction_count must be positive");
-    const int64_t firstRow = base.getInt();
-    const int64_t lastRow = firstRow
-        + (count.getInt() - 1) * stride.getInt();
-    if (std::min(firstRow, lastRow) < 0
-        || std::max(firstRow, lastRow) >= memory.sram_depth_rows)
-        return op->emitOpError("MEM placement row range is outside SRAM: [")
-            << std::min(firstRow, lastRow) << ", "
-            << std::max(firstRow, lastRow) << "] not in [0, "
-            << memory.sram_depth_rows << "); placement " << placement;
+    const auto bounds = affine_3d_bounds(base.getInt(),
+        {count.getInt(), 1, 1}, {stride.getInt(), 0, 0});
+    if (!bounds || bounds->first < 0
+        || bounds->second >= memory.sram_depth_rows) {
+        auto diagnostic = op->emitOpError(
+            "MEM placement row range is outside SRAM");
+        if (bounds)
+            diagnostic << ": [" << bounds->first << ", "
+                       << bounds->second << "] not in [0, "
+                       << memory.sram_depth_rows << ")";
+        else
+            diagnostic << " or overflows int64";
+        diagnostic << "; placement " << placement;
+        return failure();
+    }
     return success();
 }
 
@@ -103,16 +260,29 @@ LogicalResult MemReadOp::verify()
     const int64_t waveInterval = getWaveInterval().value_or(1);
     const int64_t waveAddressStride =
         getWaveAddressStride().value_or(0);
-    if (waveCount <= 0 || waveInterval <= 0)
+    const int64_t groupCount = getGroupCount().value_or(1);
+    const int64_t groupInterval = getGroupInterval().value_or(1);
+    const int64_t groupAddressStride =
+        getGroupAddressStride().value_or(0);
+    if (waveCount <= 0 || waveInterval <= 0
+        || groupCount <= 0 || groupInterval <= 0)
         return emitOpError(
-            "requires positive wave_count and wave_interval");
-    if (auto base = placement.getAs<IntegerAttr>("base_row")) {
-        const int64_t finalBase = base.getInt()
-            + (waveCount - 1) * waveAddressStride;
-        if (finalBase < 0
-            || finalBase >= targetModel->memory().sram_depth_rows)
-            return emitOpError("MEM read wave leaves physical SRAM");
-    }
+            "requires positive wave/group counts and intervals");
+    const int64_t repeatSpan = getDuration() - 1;
+    const int64_t waveSpan = repeatSpan
+        + (waveCount - 1) * waveInterval;
+    if (waveCount > 1 && waveInterval <= repeatSpan)
+        return emitOpError("MEM read wave overlaps its inner domain");
+    if (groupCount > 1 && groupInterval <= waveSpan)
+        return emitOpError("MEM read group overlaps its wave domain");
+    const auto base = placement.getAs<IntegerAttr>("base_row");
+    const auto count = placement.getAs<IntegerAttr>("instruction_count");
+    const auto stride = placement.getAs<IntegerAttr>("address_stride");
+    if (failed(verify_mem_3d_address_domain(*this, base.getInt(),
+            {count.getInt(), waveCount, groupCount}, stride.getInt(),
+            waveAddressStride, groupAddressStride,
+            targetModel->memory().sram_depth_rows, "MEM read")))
+        return failure();
     auto kind = placement.getAs<StringAttr>("kind");
     if (kind && kind.getValue() == "schedule_slice") {
         if (getDirection() != "east" && getDirection() != "west")
@@ -172,6 +342,14 @@ LogicalResult MxmLoadOp::verify()
         || getGroupInterval().value_or(1) <= 0)
         return emitOpError(
             "requires positive group_count and group_interval");
+    if (getGroupCount().value_or(1) > 1
+        && getGroupInterval().value_or(1) < getDuration())
+        return emitOpError("MXM load groups overlap their inner domain");
+    const llvm::StringRef bufferMode =
+        getWeightBufferMode().value_or("fixed");
+    if (bufferMode != "fixed" && bufferMode != "toggle_dim0"
+        && bufferMode != "toggle_dim1" && bufferMode != "toggle_dim2")
+        return emitOpError("contains an invalid MXM weight buffer mode");
     const int64_t expectedStreams = loadMode == "column"
         ? 2
         : inputMode == "int8_dequant_bf16"
@@ -214,9 +392,37 @@ LogicalResult MxmComputeOp::verify()
         return emitOpError("data_format must be fp16 or bf16");
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
-    if (waveCount <= 0 || waveInterval <= 0)
+    const int64_t groupCount = getGroupCount().value_or(1);
+    const int64_t groupInterval = getGroupInterval().value_or(1);
+    const int64_t innerSpan = getDuration() - 1;
+    const int64_t waveSpan = innerSpan
+        + (waveCount - 1) * waveInterval;
+    if (waveCount <= 0 || waveInterval <= 0
+        || groupCount <= 0 || groupInterval <= 0)
         return emitOpError(
-            "requires positive wave_count and wave_interval");
+            "requires positive wave/group counts and intervals");
+    if (waveCount > 1 && waveInterval <= innerSpan)
+        return emitOpError("MXM compute waves overlap their inner domain");
+    if (groupCount > 1 && groupInterval <= waveSpan)
+        return emitOpError("MXM compute groups overlap their wave domain");
+    const llvm::StringRef bufferMode =
+        getWeightBufferMode().value_or("fixed");
+    if (bufferMode != "fixed" && bufferMode != "toggle_dim0"
+        && bufferMode != "toggle_dim1" && bufferMode != "toggle_dim2")
+        return emitOpError("contains an invalid MXM weight buffer mode");
+    if (getTerminalDimension()
+        && (*getTerminalDimension() < 0 || *getTerminalDimension() > 2))
+        return emitOpError("terminal_dimension must select loop dimension 0..2");
+    const llvm::StringRef terminalDestination =
+        getTerminalAccumulatorDestination().value_or("sram");
+    if (terminalDestination != "sram" && terminalDestination != "stream")
+        return emitOpError(
+            "terminal_accumulator_destination must be sram or stream");
+    const llvm::StringRef terminalFormat =
+        getTerminalAccumulatorOutputFormat().value_or("fp32");
+    if (terminalFormat != "fp32" && terminalFormat != "bf16")
+        return emitOpError(
+            "terminal_accumulator_output_format must be fp32 or bf16");
     if (getDuration() != target.mxm_compute_issue_cycles(getM())
         || getResultCycle() != getCycle() + target.mxm_first_result_latency()
         || getResultDuration() != target.mxm_result_window_cycles(getM()))
@@ -233,10 +439,13 @@ LogicalResult VxmOp::verify()
     if (failed(targetModel)) return failure();
     const auto& target = *targetModel;
     const int64_t chainDepth = getChainDepth().value_or(8);
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
     if (getCycleAttr().getInt() < 0
         || !target.is_valid_vxm_alu(getQueue()) || getQueue() >= 8
         || (chainDepth != 2 && chainDepth != 4 && chainDepth != 8)
-        || getRepeatCount() <= 0 || getRepeatInterval() <= 0)
+        || getRepeatCount() <= 0 || getRepeatInterval() <= 0
+        || waveCount <= 0 || waveInterval <= 0)
         return emitOpError("contains invalid cycle, ALU queue, or repeat metadata: cycle=")
             << getCycle() << ", queue=" << getQueue()
             << ", opcode=" << getOpcode()
@@ -246,6 +455,13 @@ LogicalResult VxmOp::verify()
             << ", chain_depth=" << chainDepth
             << ", repeat_count=" << getRepeatCount()
             << ", repeat_interval=" << getRepeatInterval();
+    int64_t launchSpan = 0;
+    if (llvm::MulOverflow(
+            static_cast<int64_t>(getRepeatCount()) - 1,
+            static_cast<int64_t>(getRepeatInterval()), launchSpan))
+        return emitOpError("VXM RUN_2D inner domain overflows int64");
+    if (waveCount > 1 && waveInterval <= launchSpan)
+        return emitOpError("VXM waves overlap their RUN_2D inner domain");
     if (getAccumulatorReset().value_or(false)
         && !getAccumulatorWrite().value_or(false))
         return emitOpError(
@@ -333,7 +549,6 @@ LogicalResult VxmOp::verify()
 LogicalResult MxmAccumulateOp::verify()
 {
     if (getRepeatCount() <= 0 || getRepeatInterval() <= 0
-        || getAccumulatorAddress() < 0 || getAccumulatorAddress() >= 8192
         || getAccumulatorStride() <= 0 || getAccumulatorStride() > 4095)
         return emitOpError("contains invalid accumulation timing or stride: cycle=")
             << getCycle() << ", repeat_count=" << getRepeatCount()
@@ -356,12 +571,31 @@ LogicalResult MxmAccumulateOp::verify()
             "a retained accumulator value must keep FP32 format");
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
-    const int64_t finalAddress = getAccumulatorAddress()
-        + (waveCount - 1)
-            * getWaveAccumulatorAddressStride().value_or(0);
+    const int64_t groupCount = getGroupCount().value_or(1);
+    const int64_t groupInterval = getGroupInterval().value_or(1);
+    const int64_t repeatSpan =
+        (getRepeatCount() - 1) * getRepeatInterval();
+    const int64_t waveSpan = repeatSpan
+        + (waveCount - 1) * waveInterval;
+    const int64_t accumulatorRows =
+        targetModel->throughput().mxm_accumulator_blocks
+        * targetModel->throughput().mxm_rows;
+    const auto bounds = affine_3d_bounds(getAccumulatorAddress(),
+        {static_cast<int64_t>(getRepeatCount()), waveCount, groupCount},
+        {static_cast<int64_t>(getAccumulatorStride()),
+            static_cast<int64_t>(
+                getWaveAccumulatorAddressStride().value_or(0)),
+            static_cast<int64_t>(
+                getGroupAccumulatorAddressStride().value_or(0))});
     if (waveCount <= 0 || waveInterval <= 0
-        || finalAddress < 0 || finalAddress >= 8192)
-        return emitOpError("contains an invalid accumulator wave");
+        || groupCount <= 0 || groupInterval <= 0
+        || !bounds || bounds->first < 0
+        || bounds->second >= accumulatorRows)
+        return emitOpError("contains an invalid accumulator domain");
+    if (waveCount > 1 && waveInterval <= repeatSpan)
+        return emitOpError("accumulator waves overlap their repeat domain");
+    if (groupCount > 1 && groupInterval <= waveSpan)
+        return emitOpError("accumulator groups overlap their wave domain");
     if (failed(verify_stream_range(*this, getStreamBase(), getStreamCount())))
         return failure();
     return success();
@@ -372,9 +606,37 @@ LogicalResult MxmAccumulatorReadOp::verify()
     auto targetModel = target::LPUTargetModel::from_operation(*this);
     if (failed(targetModel)) return failure();
     const auto& target = *targetModel;
+    const int64_t repeatCount = getRepeatCount().value_or(1);
+    const int64_t repeatInterval = getRepeatInterval().value_or(1);
+    const int64_t waveCount = getWaveCount().value_or(1);
+    const int64_t waveInterval = getWaveInterval().value_or(1);
+    const int64_t groupCount = getGroupCount().value_or(1);
+    const int64_t groupInterval = getGroupInterval().value_or(1);
+    const int64_t repeatSpan = (repeatCount - 1) * repeatInterval;
+    const int64_t waveSpan = repeatSpan
+        + (waveCount - 1) * waveInterval;
+    const int64_t accumulatorRows =
+        target.throughput().mxm_accumulator_blocks
+        * target.throughput().mxm_rows;
+    const auto bounds = affine_3d_bounds(getAccumulatorAddress(),
+        {repeatCount, waveCount, groupCount},
+        {static_cast<int64_t>(
+             getRepeatAccumulatorAddressStride().value_or(0)),
+            static_cast<int64_t>(
+                getWaveAccumulatorAddressStride().value_or(0)),
+            static_cast<int64_t>(
+                getGroupAccumulatorAddressStride().value_or(0))});
     if (getCycle() < 0 || !target.is_valid_mxm_unit(getUnitId())
-        || getAccumulatorAddress() < 0 || getAccumulatorAddress() >= 8192)
+        || repeatCount <= 0 || repeatInterval <= 0
+        || waveCount <= 0 || waveInterval <= 0
+        || groupCount <= 0 || groupInterval <= 0
+        || !bounds || bounds->first < 0
+        || bounds->second >= accumulatorRows)
         return emitOpError("contains an invalid MXM accumulator read field");
+    if (waveCount > 1 && waveInterval <= repeatSpan)
+        return emitOpError("accumulator read waves overlap the repeat domain");
+    if (groupCount > 1 && groupInterval <= waveSpan)
+        return emitOpError("accumulator read groups overlap the wave domain");
     if (getOutputStreamBase() < 0
         || getOutputStreamBase()
                 + target.throughput().mxm_result_streams
@@ -395,30 +657,34 @@ LogicalResult MemWriteOp::verify()
         || failed(verify_stream_range(*this, getStreamBase(), getStreamCount())))
         return failure();
     auto placement = getPlacement();
+    if (failed(verify_mem_placement(*this, placement, target)))
+        return failure();
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
     const int64_t waveAddressStride =
         getWaveAddressStride().value_or(0);
-    if (waveCount <= 0 || waveInterval <= 0)
+    const int64_t groupCount = getGroupCount().value_or(1);
+    const int64_t groupInterval = getGroupInterval().value_or(1);
+    const int64_t groupAddressStride =
+        getGroupAddressStride().value_or(0);
+    if (waveCount <= 0 || waveInterval <= 0
+        || groupCount <= 0 || groupInterval <= 0)
         return emitOpError(
-            "requires positive wave_count and wave_interval");
-    if (auto base = placement.getAs<IntegerAttr>("base_row")) {
-        const int64_t finalBase = base.getInt()
-            + (waveCount - 1) * waveAddressStride;
-        if (finalBase < 0 || finalBase >= target.memory().sram_depth_rows)
-            return emitOpError()
-                << "MEM write wave leaves physical SRAM: base="
-                << base.getInt() << ", wave_count=" << waveCount
-                << ", wave_address_stride=" << waveAddressStride
-                << ", final_base=" << finalBase
-                << ", depth=" << target.memory().sram_depth_rows
-                << ", cycle=" << getCycle()
-                << ", duration=" << getDuration()
-                << ", stream_base=" << getStreamBase()
-                << ", stream_count=" << getStreamCount()
-                << ", placement=" << placement;
-    }
-    if (failed(verify_mem_placement(*this, placement, target)))
+            "requires positive wave/group counts and intervals");
+    const int64_t repeatSpan = getDuration() - 1;
+    const int64_t waveSpan = repeatSpan
+        + (waveCount - 1) * waveInterval;
+    if (waveCount > 1 && waveInterval <= repeatSpan)
+        return emitOpError("MEM write wave overlaps its inner domain");
+    if (groupCount > 1 && groupInterval <= waveSpan)
+        return emitOpError("MEM write group overlaps its wave domain");
+    const auto base = placement.getAs<IntegerAttr>("base_row");
+    const auto count = placement.getAs<IntegerAttr>("instruction_count");
+    const auto stride = placement.getAs<IntegerAttr>("address_stride");
+    if (failed(verify_mem_3d_address_domain(*this, base.getInt(),
+            {count.getInt(), waveCount, groupCount}, stride.getInt(),
+            waveAddressStride, groupAddressStride,
+            target.memory().sram_depth_rows, "MEM write")))
         return failure();
     auto kind = placement.getAs<StringAttr>("kind");
     auto hemisphere = placement.getAs<StringAttr>("hemisphere");
@@ -503,6 +769,10 @@ LogicalResult MemTransferOp::verify()
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
     const int64_t waveAddressStride = getWaveAddressStride().value_or(0);
+    const int64_t groupCount = getGroupCount().value_or(1);
+    const int64_t groupInterval = getGroupInterval().value_or(1);
+    const int64_t groupAddressStride =
+        getGroupAddressStride().value_or(0);
     if (failed(verify_queue_issue(*this, getCycle(), getSlice(),
             getRepeatCount(), getRepeatInterval())))
         return failure();
@@ -530,24 +800,28 @@ LogicalResult MemTransferOp::verify()
         return emitOpError("packed stream is outside the target: ")
             << getPackedStream() << " not in [0, "
             << target.streams().encoded_streams << ")";
-    if (waveCount <= 0 || waveInterval <= 0)
-        return emitOpError("requires positive wave_count and wave_interval");
-    const int64_t corners[] = {
-        getAddress(),
-        getAddress() + (getRepeatCount() - 1) * getAddressStride(),
-        getAddress() + (waveCount - 1) * waveAddressStride,
-        getAddress() + (waveCount - 1) * waveAddressStride
-            + (getRepeatCount() - 1) * getAddressStride(),
-    };
-    if (llvm::any_of(corners,
-            [&](int64_t address) {
-                return address < 0 || address >= memoryRows;
-            }))
-        return emitOpError("wave/repeat address range is outside SRAM");
-    if (getOpcode() != "read" && getOpcode() != "write"
-        && getOpcode() != "write_tap" && getOpcode() != "accumulate")
+    if (waveCount <= 0 || waveInterval <= 0
+        || groupCount <= 0 || groupInterval <= 0)
         return emitOpError(
-            "opcode must be read, write, write_tap, or accumulate");
+            "requires positive wave/group counts and intervals");
+    const int64_t repeatSpan =
+        (getRepeatCount() - 1) * getRepeatInterval();
+    const int64_t waveSpan =
+        repeatSpan + (waveCount - 1) * waveInterval;
+    if (waveCount > 1 && waveInterval <= repeatSpan)
+        return emitOpError("wave domain overlaps the repeat domain");
+    if (groupCount > 1 && groupInterval <= waveSpan)
+        return emitOpError("group domain overlaps the wave domain");
+    if (failed(verify_mem_3d_address_domain(*this, getAddress(),
+            {static_cast<int64_t>(getRepeatCount()), waveCount,
+                groupCount},
+            static_cast<int64_t>(getAddressStride()), waveAddressStride,
+            groupAddressStride, memoryRows, "MEM transfer")))
+        return failure();
+    if (getOpcode() != "read" && getOpcode() != "write"
+        && getOpcode() != "write_tap")
+        return emitOpError(
+            "opcode must be read, write, or write_tap");
     if (getAddressBindingAccess()
         && !getAddressBinding())
         return emitOpError(
@@ -557,6 +831,85 @@ LogicalResult MemTransferOp::verify()
         && *getAddressBindingAccess() != "internal")
         return emitOpError(
             "address_binding_access must be input or internal");
+    return success();
+}
+
+LogicalResult MemWriteRead2DOp::verify()
+{
+    auto targetModel = target::LPUTargetModel::from_operation(*this);
+    if (failed(targetModel)) return failure();
+    const auto& target = *targetModel;
+    constexpr int64_t kMaxCount = int64_t {1} << 16;
+    constexpr int64_t kMaxCycle = int64_t {1} << 24;
+    constexpr int64_t kMinAddressStride = -(int64_t {1} << 19);
+    constexpr int64_t kMaxAddressStride = (int64_t {1} << 19) - 1;
+    const int64_t count0 = getCount0();
+    const int64_t count1 = getCount1();
+    const int64_t ws0 = getWriteCycleStride0();
+    const int64_t ws1 = getWriteCycleStride1();
+    const int64_t rs0 = getReadCycleStride0();
+    const int64_t rs1 = getReadCycleStride1();
+    const int64_t readOffset = getReadStartOffset();
+    const int64_t addressStride0 =
+        static_cast<int64_t>(getAddressStride0());
+    const int64_t addressStride1 =
+        static_cast<int64_t>(getAddressStride1());
+    const int64_t readStreamOuterStride =
+        static_cast<int64_t>(getReadStreamOuterStride());
+    const int64_t readStreamBase =
+        static_cast<int64_t>(getReadStreamBase());
+    const int64_t writeStream = static_cast<int64_t>(getWriteStream());
+    if (getCycle() < 0 || getHemisphere() < 0
+        || getHemisphere() >= target.memory().hemispheres
+        || getSlice() < 0
+        || getSlice() >= target.memory().slices_per_hemisphere
+        || getBank() < 0 || getBank() >= target.memory().banks_per_slice)
+        return emitOpError("has an invalid start cycle or physical MEM queue");
+    if (count0 < 1 || count0 > kMaxCount
+        || count1 < 1 || count1 > kMaxCount)
+        return emitOpError("2-D counts must fit unsigned 16-bit count-minus-one fields");
+    if (ws0 < 1 || ws0 >= kMaxCycle || ws1 < 1 || ws1 >= kMaxCycle
+        || rs0 < 1 || rs0 >= kMaxCycle || rs1 < 1 || rs1 >= kMaxCycle
+        || readOffset < 1 || readOffset >= kMaxCycle)
+        return emitOpError("cycle strides and read offset must fit positive 24-bit fields");
+    const int64_t writeInnerSpan = (count0 - 1) * ws0;
+    const int64_t readInnerSpan = (count0 - 1) * rs0;
+    if ((count1 > 1 && ws1 <= writeInnerSpan)
+        || (count1 > 1 && rs1 <= readInnerSpan))
+        return emitOpError("write/read outer cycles must follow their inner sweeps");
+    const int64_t writeLast = writeInnerSpan + (count1 - 1) * ws1;
+    const int64_t readLast = readOffset + readInnerSpan
+        + (count1 - 1) * rs1;
+    if (writeLast >= kMaxCycle || readLast >= kMaxCycle)
+        return emitOpError("2-D issue span exceeds the 24-bit local cycle domain");
+    const int64_t minimumReadAfterWrite = readOffset
+        + std::min<int64_t>(0, (count0 - 1) * (rs0 - ws0))
+        + std::min<int64_t>(0, (count1 - 1) * (rs1 - ws1));
+    if (minimumReadAfterWrite < 1)
+        return emitOpError("each read must issue after its matching write");
+    if (getAddress() < 0 || getAddress() >= (int64_t {1} << 13)
+        || addressStride0 < kMinAddressStride
+        || addressStride0 > kMaxAddressStride
+        || addressStride1 < kMinAddressStride
+        || addressStride1 > kMaxAddressStride)
+        return emitOpError("shared address fields exceed their packet widths");
+    const auto bounds = affine_3d_bounds(getAddress(), {count0, count1, 1},
+        {addressStride0, addressStride1, 0});
+    if (!bounds || bounds->first < 0
+        || bounds->second >= target.memory().sram_depth_rows)
+        return emitOpError("2-D address domain is outside physical SRAM");
+    if (writeStream < 0
+        || writeStream >= target.streams().encoded_streams
+        || readStreamBase < 0
+        || readStreamBase >= target.streams().encoded_streams
+        || readStreamOuterStride < -32
+        || readStreamOuterStride > 31
+        || readStreamBase
+            + (count1 - 1) * readStreamOuterStride < 0
+        || readStreamBase
+            + (count1 - 1) * readStreamOuterStride
+            >= target.streams().encoded_streams)
+        return emitOpError("write/read stream domain exceeds encoded stream range");
     return success();
 }
 
@@ -585,22 +938,41 @@ LogicalResult MxmIssueOp::verify()
         getWaveAccumulatorAddressStride().value_or(0);
     const int64_t groupCount = getGroupCount().value_or(1);
     const int64_t groupInterval = getGroupInterval().value_or(1);
-    const int64_t finalWeightColumn = getWeightColumn()
-        + (waveCount - 1) * waveColumnStride;
+    const int64_t repeatColumnStride =
+        getRepeatWeightColumnStride().value_or(0);
+    const int64_t repeatAccumulatorStride =
+        getRepeatAccumulatorAddressStride().value_or(0);
+    const int64_t groupColumnStride =
+        getGroupWeightColumnStride().value_or(0);
+    const int64_t groupAccumulatorStride =
+        getGroupAccumulatorAddressStride().value_or(0);
+    const int64_t repeatSpan =
+        (getRepeatCount() - 1) * getRepeatInterval();
+    const int64_t waveSpan = repeatSpan
+        + (waveCount - 1) * waveInterval;
     if (waveCount <= 0 || waveInterval <= 0
         || groupCount <= 0 || groupInterval <= 0
-        || finalWeightColumn < 0
-        || finalWeightColumn >= target.throughput().tile_rows)
-        return emitOpError("contains an invalid MXM issue wave");
-    if (waveColumnStride != 0 && waveAccumulatorStride != 0)
+        || (waveCount > 1 && waveInterval <= repeatSpan)
+        || (groupCount > 1 && groupInterval <= waveSpan))
+        return emitOpError("contains an invalid MXM issue 3-D domain");
+    const std::array<int64_t, 3> counts {
+        static_cast<int64_t>(getRepeatCount()), waveCount, groupCount};
+    const auto weightColumnBounds = affine_3d_bounds(
+        getWeightColumn(), counts,
+        {repeatColumnStride, waveColumnStride, groupColumnStride});
+    if (!weightColumnBounds || weightColumnBounds->first < 0
+        || weightColumnBounds->second >= target.throughput().tile_rows)
+        return emitOpError("contains an invalid MXM issue 3-D domain");
+    if (getOpcode() == "iw"
+        && (repeatAccumulatorStride != 0 || waveAccumulatorStride != 0
+            || groupAccumulatorStride != 0))
         return emitOpError(
-            "an MXM issue wave may induct only one hardware field");
-    if (getOpcode() == "iw" && waveAccumulatorStride != 0)
+            "an iw domain cannot induct the MXM accumulator address");
+    if (getOpcode() != "iw"
+        && (repeatColumnStride != 0 || waveColumnStride != 0
+            || groupColumnStride != 0))
         return emitOpError(
-            "an iw wave cannot induct the MXM accumulator address");
-    if (getOpcode() != "iw" && waveColumnStride != 0)
-        return emitOpError(
-            "only an iw wave may induct the MXM weight column");
+            "only an iw domain may induct the MXM weight column");
     const llvm::StringRef dataFormat =
         getDataFormat().value_or("fp16");
     if (dataFormat != "fp16" && dataFormat != "bf16")
@@ -628,17 +1000,47 @@ LogicalResult MxmIssueOp::verify()
     const int64_t accumulatorRows =
         target.throughput().mxm_accumulator_blocks
         * target.throughput().mxm_rows;
-    const int64_t finalAccumulatorAddress = getAccumulatorAddress()
-        + (waveCount - 1) * waveAccumulatorStride;
+    if (getOpcode() == "compute"
+        && static_cast<int64_t>(getRepeatCount())
+            > static_cast<int64_t>(target.throughput().mxm_rows))
+        return emitOpError(
+            "a compute domain repeat_count cannot exceed one physical MXM row wave: repeat_count=")
+            << getRepeatCount() << ", mxm_rows="
+            << target.throughput().mxm_rows;
+    if (getOpcode() == "compute" && repeatAccumulatorStride != 0)
+        return emitOpError(
+            "compute dimension 0 cannot induct the accumulator base because the MXM row wave applies accumulator_row_stride");
+    const auto accumulatorBounds = affine_3d_bounds(
+        getAccumulatorAddress(), counts,
+        {repeatAccumulatorStride, waveAccumulatorStride,
+            groupAccumulatorStride});
+    int64_t accumulatorRowSpan = 0;
+    int64_t accumulatorMaximum = 0;
+    const bool invalidComputeRowSpan = getOpcode() == "compute"
+        && (llvm::MulOverflow(
+                static_cast<int64_t>(getRepeatCount()) - 1,
+                static_cast<int64_t>(getAccumulatorRowStride()),
+                accumulatorRowSpan)
+            || !accumulatorBounds
+            || llvm::AddOverflow(accumulatorBounds->second,
+                accumulatorRowSpan, accumulatorMaximum));
     if (getAccumulatorAddress() < 0
         || getAccumulatorAddress() >= accumulatorRows
-        || finalAccumulatorAddress < 0
-        || finalAccumulatorAddress >= accumulatorRows
+        || !accumulatorBounds || accumulatorBounds->first < 0
+        || accumulatorBounds->second >= accumulatorRows
+        || invalidComputeRowSpan
+        || (getOpcode() == "compute"
+            && accumulatorMaximum >= accumulatorRows)
         || getAccumulatorRowStride() <= 0)
         return emitOpError(
             "contains an invalid MXM accumulator address or stride: address=")
             << getAccumulatorAddress()
             << ", stride=" << getAccumulatorRowStride();
+    const llvm::StringRef bufferMode =
+        getWeightBufferMode().value_or("fixed");
+    if (bufferMode != "fixed" && bufferMode != "toggle_dim0"
+        && bufferMode != "toggle_dim1" && bufferMode != "toggle_dim2")
+        return emitOpError("contains an invalid MXM weight buffer mode");
     if (getAccumulatorDestination() != "sram"
         && getAccumulatorDestination() != "stream")
         return emitOpError("accumulator_destination must be sram or stream");
@@ -658,6 +1060,21 @@ LogicalResult MxmIssueOp::verify()
         || weightStreamBase + weightStreams
             > target.streams().streams_per_direction)
         return emitOpError("contains an invalid MXM weight stream range");
+    if (getTerminalDimension()
+        && (getOpcode() != "compute" || *getTerminalDimension() < 0
+            || *getTerminalDimension() > 2))
+        return emitOpError(
+            "terminal_dimension is valid only for compute dimension 0..2");
+    const llvm::StringRef terminalDestination =
+        getTerminalAccumulatorDestination().value_or("sram");
+    if (terminalDestination != "sram" && terminalDestination != "stream")
+        return emitOpError(
+            "terminal_accumulator_destination must be sram or stream");
+    const llvm::StringRef terminalFormat =
+        getTerminalAccumulatorOutputFormat().value_or("fp32");
+    if (terminalFormat != "fp32" && terminalFormat != "bf16")
+        return emitOpError(
+            "terminal_accumulator_output_format must be fp32 or bf16");
     return success();
 }
 
@@ -670,10 +1087,23 @@ LogicalResult MxmDequantOp::verify()
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0
         || getWaveCount().value_or(1) <= 0
         || getWaveInterval().value_or(1) <= 0
+        || getGroupCount().value_or(1) <= 0
+        || getGroupInterval().value_or(1) <= 0
         || (getScaleBinding() && *getScaleBinding() < 0)
         || !std::isfinite(getScaleAttr().getValueAsDouble()))
         return emitOpError(
             "contains an invalid MXM dequant schedule field");
+    const int64_t repeatSpan =
+        (getRepeatCount() - 1) * getRepeatInterval();
+    const int64_t waveSpan = repeatSpan
+        + (getWaveCount().value_or(1) - 1)
+            * getWaveInterval().value_or(1);
+    if (getWaveCount().value_or(1) > 1
+        && getWaveInterval().value_or(1) <= repeatSpan)
+        return emitOpError("MXM dequant waves overlap their repeat domain");
+    if (getGroupCount().value_or(1) > 1
+        && getGroupInterval().value_or(1) <= waveSpan)
+        return emitOpError("MXM dequant groups overlap their wave domain");
     return success();
 }
 
@@ -686,8 +1116,17 @@ LogicalResult SxmOp::verify()
         || getHemisphere() >= target.memory().hemispheres)
         return emitOpError("contains an invalid SXM queue selector");
     if (getRepeatCount().value_or(1) <= 0
-        || getRepeatInterval().value_or(1) <= 0)
-        return emitOpError("repeat count and interval must be positive");
+        || getRepeatInterval().value_or(1) <= 0
+        || getWaveCount().value_or(1) <= 0
+        || getWaveInterval().value_or(1) <= 0)
+        return emitOpError(
+            "repeat/wave counts and intervals must be positive");
+    const int64_t repeatSpan =
+        (getRepeatCount().value_or(1) - 1)
+        * getRepeatInterval().value_or(1);
+    if (getWaveCount().value_or(1) > 1
+        && getWaveInterval().value_or(1) <= repeatSpan)
+        return emitOpError("SXM waves overlap their RUN_2D inner domain");
     if (getOpcode() != "transpose" && getOpcode() != "permute")
         return emitOpError("opcode must be transpose or permute");
     if (getOutputRow()

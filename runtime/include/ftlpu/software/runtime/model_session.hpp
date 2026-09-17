@@ -47,6 +47,9 @@ struct ModelSessionStats {
     std::size_t weight_page_hidden_prefetches{0};
     std::size_t weight_page_deferred_prefetches{0};
     std::size_t weight_page_runtime_wait_cycles{0};
+    // Actual FU writes issued by runtime-linked MEM_WRITE_SYNC packets. The
+    // value is captured before output/state C2C transfers reset ICU state.
+    std::size_t weight_page_synchronized_writes{0};
 };
 
 class ModelSession {
@@ -61,6 +64,10 @@ public:
     void run_invocation(std::size_t index, std::size_t drain_cycles = 64);
     void enable_execution_trace(bool enabled = true) noexcept;
     void write_execution_trace_csv(const std::filesystem::path& path) const;
+    void enable_mem_execution_trace(bool enabled = true) noexcept;
+    void stream_mem_execution_trace_csv(const std::filesystem::path& path);
+    void write_mem_execution_trace_csv(
+        const std::filesystem::path& path) const;
     void set_ddr_peak_bandwidth_mbytes_per_second(
         std::uint32_t bandwidth);
 
@@ -71,6 +78,8 @@ public:
     const SessionMemoryPlan& memory_plan() const;
     const ModelSessionStats& stats() const;
     std::vector<WeightPrefetchPlan> executable_weight_prefetch_plans() const;
+    const BinaryProgram& last_linked_program() const;
+    void write_last_linked_program(const std::filesystem::path& path) const;
 
 private:
     struct DeviceValue {
@@ -112,7 +121,7 @@ private:
         std::size_t invocation_index);
     void prepare_executable_weight_lookahead(
         std::size_t invocation_index, const BinaryProgram& program);
-    void schedule_executable_weight_pages();
+    void schedule_executable_weight_pages(BinaryProgram& program);
     std::size_t settle_executable_weight_lookahead();
     bool executable_weight_page_ready(
         const BinaryWeightPageUse& use) const;
@@ -146,12 +155,14 @@ private:
         ddr_peak_bandwidth_mbytes_per_second_override_{};
     bool executable_clock_active_{false};
     bool execution_trace_enabled_{false};
+    bool mem_execution_trace_enabled_{false};
     bool execution_trace_has_segment_{false};
     std::int64_t execution_trace_cycle_cursor_{0};
     ModelPackage package_{};
     SessionMemoryPlan memory_plan_{};
     ModelSessionStats stats_{};
     ModelSessionStats load_stats_{};
+    std::optional<BinaryProgram> last_linked_program_{};
     bool loaded_{false};
     bool completed_invocation_{false};
     std::unordered_map<std::string, std::vector<std::uint8_t>> values_{};

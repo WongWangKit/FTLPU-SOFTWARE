@@ -39,43 +39,42 @@ void emitAccumulatorClearPrelude(
         const int64_t outputStream =
             (unit % throughput.mxms_per_hemisphere)
             * throughput.mxm_result_streams;
-        for (int64_t offset = 0; offset < rows; ++offset) {
-            mlir::OperationState state(
-                context.ffn.getLoc(),
-                ftlpu::compiler::schedule::MxmIssueOp::
-                    getOperationName());
-            state.addAttributes({
-                rewriter.getNamedAttr("cycle",
-                    rewriter.getI64IntegerAttr(offset)),
-                rewriter.getNamedAttr("unit_id",
-                    rewriter.getI64IntegerAttr(unit)),
-                rewriter.getNamedAttr("opcode",
-                    rewriter.getStringAttr("accumulator_read")),
-                rewriter.getNamedAttr("weight_buffer",
-                    rewriter.getI64IntegerAttr(0)),
-                rewriter.getNamedAttr("weight_column",
-                    rewriter.getI64IntegerAttr(0)),
-                rewriter.getNamedAttr("activation_stream_base",
-                    rewriter.getI64IntegerAttr(0)),
-                rewriter.getNamedAttr("output_stream_base",
-                    rewriter.getI64IntegerAttr(outputStream)),
-                rewriter.getNamedAttr("repeat_count",
-                    rewriter.getI64IntegerAttr(1)),
-                rewriter.getNamedAttr("repeat_interval",
-                    rewriter.getI64IntegerAttr(1)),
-                rewriter.getNamedAttr("accumulator_address",
-                    rewriter.getI64IntegerAttr(offset)),
-                rewriter.getNamedAttr("accumulator_row_stride",
-                    rewriter.getI64IntegerAttr(1)),
-                rewriter.getNamedAttr("accumulator_destination",
-                    rewriter.getStringAttr("sram")),
-                rewriter.getNamedAttr("accumulator_clear",
-                    rewriter.getBoolAttr(true)),
-                rewriter.getNamedAttr("data_format",
-                    rewriter.getStringAttr(dataFormat)),
-            });
-            rewriter.create(state);
-        }
+        mlir::OperationState state(
+            context.ffn.getLoc(),
+            ftlpu::compiler::schedule::MxmIssueOp::getOperationName());
+        state.addAttributes({
+            rewriter.getNamedAttr("cycle",
+                rewriter.getI64IntegerAttr(0)),
+            rewriter.getNamedAttr("unit_id",
+                rewriter.getI64IntegerAttr(unit)),
+            rewriter.getNamedAttr("opcode",
+                rewriter.getStringAttr("accumulator_read")),
+            rewriter.getNamedAttr("weight_buffer",
+                rewriter.getI64IntegerAttr(0)),
+            rewriter.getNamedAttr("weight_column",
+                rewriter.getI64IntegerAttr(0)),
+            rewriter.getNamedAttr("activation_stream_base",
+                rewriter.getI64IntegerAttr(0)),
+            rewriter.getNamedAttr("output_stream_base",
+                rewriter.getI64IntegerAttr(outputStream)),
+            rewriter.getNamedAttr("repeat_count",
+                rewriter.getI64IntegerAttr(rows)),
+            rewriter.getNamedAttr("repeat_interval",
+                rewriter.getI64IntegerAttr(1)),
+            rewriter.getNamedAttr("repeat_accumulator_address_stride",
+                rewriter.getI64IntegerAttr(0)),
+            rewriter.getNamedAttr("accumulator_address",
+                rewriter.getI64IntegerAttr(0)),
+            rewriter.getNamedAttr("accumulator_row_stride",
+                rewriter.getI64IntegerAttr(1)),
+            rewriter.getNamedAttr("accumulator_destination",
+                rewriter.getStringAttr("sram")),
+            rewriter.getNamedAttr("accumulator_clear",
+                rewriter.getBoolAttr(true)),
+            rewriter.getNamedAttr("data_format",
+                rewriter.getStringAttr(dataFormat)),
+        });
+        rewriter.create(state);
     }
 }
 

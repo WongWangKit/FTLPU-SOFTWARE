@@ -101,22 +101,24 @@ FfnProjectionOrder chooseProjectionOrder(PrimitiveFfnSchedulePlan& ffn,
     stream::RouteOp gateRaw, stream::RouteOp upRaw,
     const target::LPUTargetModel& target, bool localWeightDequant)
 {
-    if (target.throughput().mxms_per_hemisphere != 1
-        || !localWeightDequant
+    if (target.throughput().mxms_per_hemisphere != 1)
+        return FfnProjectionOrder::Interleaved;
+    // Gate and Up are different command bodies. A single physical MXM cannot
+    // keep both bodies resident and alternate them inside one loop domain, so
+    // serialize them even when all weights are already resident.
+    if (!localWeightDequant
         || !isPagedWeight(gateRaw.getPlacement())
         || !isPagedWeight(upRaw.getPlacement()))
-        return FfnProjectionOrder::Interleaved;
+        return FfnProjectionOrder::GateThenUp;
     const auto gatePageCount = gateRaw.getPlacement()
         .getAs<mlir::IntegerAttr>("page_count");
     const auto upPageCount = upRaw.getPlacement()
         .getAs<mlir::IntegerAttr>("page_count");
-    // Single-page projections can both be resident by the shared FFN start.
-    // Serializing them only lengthens the schedule and exposes an unnecessary
-    // fused-Swish tail boundary; residency-first ordering is for multi-page
-    // projections whose refills must be sequenced.
+    // Single-page projections need no refill-dependent ordering, but still
+    // require a stable body for the one physical instruction queue.
     if (gatePageCount && upPageCount
         && gatePageCount.getInt() == 1 && upPageCount.getInt() == 1)
-        return FfnProjectionOrder::Interleaved;
+        return FfnProjectionOrder::GateThenUp;
     llvm::SmallPtrSet<mlir::Operation*, 32> visited;
     llvm::SmallVector<mlir::DictionaryAttr, 8> priorPlacements;
     collectProducerPagedWeightPlacements(
@@ -126,7 +128,7 @@ FfnProjectionOrder chooseProjectionOrder(PrimitiveFfnSchedulePlan& ffn,
     const bool upRefill = overlapsPriorPagedWeight(
         upRaw.getPlacement(), priorPlacements);
     if (gateRefill == upRefill)
-        return FfnProjectionOrder::Interleaved;
+        return FfnProjectionOrder::GateThenUp;
     return gateRefill ? FfnProjectionOrder::UpThenGate
                       : FfnProjectionOrder::GateThenUp;
 }
@@ -239,7 +241,7 @@ schedule::MemReadOp FfnEmissionContext::emitSliceRead(
         stride, hemisphere, "schedule_slice", bank);
     mlir::NamedAttrList placementAttrs(placement);
     placementAttrs.set("binding_placement", route.getPlacement());
-    return rewriter.create<schedule::MemReadOp>(ffn.getLoc(), value,
+    return emitFfnMemRead3D(rewriter, ffn.getLoc(), value,
         cycle, count, stream, 1,
         slice / target.streams().mem_slices_per_register_group + 1,
         rewriter.getStringAttr(direction), rewriter.getStringAttr(role),

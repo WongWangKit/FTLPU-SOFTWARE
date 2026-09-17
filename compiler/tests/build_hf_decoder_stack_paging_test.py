@@ -117,19 +117,19 @@ def main() -> None:
         schedule_commands = [
             command for name, command in recorded
             if name.startswith("lower executable variant")
-            and name.endswith("to compressed Schedule IR")
+            and name.endswith("to closed-form Schedule IR")
         ]
         compile_commands = [
             command for name, command in recorded
             if name.startswith("compile executable variant")
         ]
         if len(schedule_commands) != 2 or len(compile_commands) != 2:
-            raise RuntimeError("expected compressed schedule compilation")
+            raise RuntimeError("expected closed-form schedule compilation")
         for command in schedule_commands:
             pipeline = command.index("--pipeline")
             if command[pipeline + 1] != \
-                    "ftlpu-stream-to-compressed-schedule":
-                raise RuntimeError("decoder executable used legacy Schedule IR")
+                    "ftlpu-stream-to-schedule":
+                raise RuntimeError("decoder executable did not use direct Schedule IR")
         for command in compile_commands:
             stage = command.index("--input-stage")
             if command[stage + 1] != "schedule":

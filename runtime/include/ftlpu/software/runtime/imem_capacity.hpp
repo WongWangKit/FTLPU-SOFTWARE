@@ -53,10 +53,9 @@ struct CmodelAbstractImemReport {
 CmodelAbstractImemReport analyze_cmodel_abstract_imem(
     const BinaryProgram& program);
 
-// Target-facing storage estimate. MEM all-Macro queues use the inline-template
-// Delta-RLE v1 codec. MEM/MXM STREAM_ND commands use the fixed 320-bit packet
-// decoded by the local ICU; each packet occupies an integral number of that
-// queue's physical i-MEM slots.
+// Target-facing storage estimate. MEM/MXM Macro and STREAM_ND commands are
+// lowered into FU-specific 3-D packets and occupy that packet's word count in
+// local physical i-MEM.
 struct PhysicalImemQueue : CmodelAbstractImemQueue {
     std::uint64_t physical_bits{0};
     std::size_t physical_slots{0};
@@ -66,15 +65,27 @@ struct PhysicalImemQueue : CmodelAbstractImemQueue {
     std::size_t peak_macro_contexts{0};
     std::size_t macro_context_capacity{0};
     std::uint32_t macro_context_bits{0};
+    // MEM/MXM Macro and STREAM_ND descriptors are converted to the same
+    // FU-specific 3-D context as an already encoded raw packet. Keep the
+    // legacy descriptor statistics above for visibility, while accounting
+    // for the deployable one-context hardware independently here.
+    std::size_t peak_fu_3d_contexts{0};
+    std::size_t fu_3d_context_capacity{0};
+    std::uint32_t fu_3d_context_bits{0};
 
     bool physical_overflow() const { return physical_slots > depth; }
     bool macro_context_overflow() const
     {
         return peak_macro_contexts > macro_context_capacity;
     }
+    bool fu_3d_context_overflow() const
+    {
+        return peak_fu_3d_contexts > fu_3d_context_capacity;
+    }
     bool deployment_overflow() const
     {
-        return physical_overflow() || macro_context_overflow();
+        return physical_overflow() || macro_context_overflow()
+            || fu_3d_context_overflow();
     }
 };
 
@@ -85,10 +96,13 @@ struct PhysicalImemReport {
     std::size_t used_slots{0};
     std::size_t overflow_queues{0};
     std::size_t macro_context_overflow_queues{0};
+    std::size_t fu_3d_context_overflow_queues{0};
     std::size_t mem_delta_rle_queues{0};
     std::size_t stream_nd_packets{0};
     std::uint64_t peak_macro_context_bits{0};
     std::uint64_t provisioned_macro_context_bits{0};
+    std::uint64_t peak_fu_3d_context_bits{0};
+    std::uint64_t provisioned_fu_3d_context_bits{0};
 
     bool fits() const { return overflow_queues == 0; }
 };

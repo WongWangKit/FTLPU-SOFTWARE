@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/stream_schedule_emitters.hpp"
 
 #include "AttentionEmitterUtils.hpp"
+#include "DirectDomainEmitterUtils.hpp"
 #include "FfnEmitterUtils.hpp"
 
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
@@ -15,7 +16,6 @@
 namespace ftlpu::compiler::schedule {
 namespace {
 
-using attention_detail::emitMem;
 using ffn_detail::create_vxm;
 
 mlir::DictionaryAttr allocationPlacement(
@@ -47,6 +47,59 @@ int64_t placementBank(mlir::DictionaryAttr placement)
     if (const auto bank = placement.getAs<mlir::IntegerAttr>("bank"))
         return bank.getInt();
     return 0;
+}
+
+bool sharesMemQueue(mlir::DictionaryAttr lhs,
+    mlir::DictionaryAttr rhs)
+{
+    if (placementBank(lhs) != placementBank(rhs))
+        return false;
+    const auto lhsSlices = placementSlices(lhs);
+    const auto rhsSlices = placementSlices(rhs);
+    return std::any_of(lhsSlices.begin(), lhsSlices.end(),
+        [&](int64_t lhsSlice) {
+            return std::find(rhsSlices.begin(), rhsSlices.end(), lhsSlice)
+                != rhsSlices.end();
+        });
+}
+
+bool usesMemQueue(mlir::DictionaryAttr placement,
+    int64_t bank, int64_t slice)
+{
+    if (placementBank(placement) != bank)
+        return false;
+    const auto slices = placementSlices(placement);
+    return std::find(slices.begin(), slices.end(), slice) != slices.end();
+}
+
+void emitMemColumnDomain(mlir::IRRewriter& rewriter,
+    mlir::Location location, const target::LPUTargetModel& target,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    int64_t address, int64_t packedStream,
+    int64_t repeatCount, int64_t repeatInterval, int64_t addressStride,
+    int64_t waveCount, int64_t waveInterval, int64_t waveAddressStride,
+    int64_t columnCount, int64_t columnInterval,
+    int64_t columnAddressStride, int64_t bank, bool splitColumns)
+{
+    if (!splitColumns || columnCount == 1) {
+        direct_domain_detail::emitMem3D(rewriter, location, target,
+            cycle, queue, opcode, address, packedStream,
+            repeatCount, repeatInterval, addressStride,
+            waveCount, waveInterval, waveAddressStride,
+            columnCount, columnInterval, columnAddressStride, -1, bank);
+        return;
+    }
+    // This loop is the operator's direct lowering for queues that must
+    // alternate READ_3D and WRITE_3D.  Each emitted command is already a
+    // closed hardware domain; no later pass splits or moves it.
+    for (int64_t column = 0; column < columnCount; ++column) {
+        direct_domain_detail::emitMem3D(rewriter, location, target,
+            cycle + column * columnInterval, queue, opcode,
+            address + column * columnAddressStride, packedStream,
+            repeatCount, repeatInterval, addressStride,
+            waveCount, waveInterval, waveAddressStride,
+            1, 1, 0, -1, bank);
+    }
 }
 
 bool isDistributed16(mlir::DictionaryAttr placement)
@@ -225,7 +278,169 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
     const int64_t start = cycle;
     mlir::Value finalValue = op.getLhs();
     const int64_t columnBlocks = columns / tile;
-    for (int64_t block = 0; block < columnBlocks; ++block) {
+    // Every supported layout repeats its physical command body after four
+    // column blocks.  pair_planar uses block%2 for the slice pair and
+    // (block/2)%2 for the hemisphere; distributed16 and activation_planar
+    // have an affine address at that same period.  Compute the four physical
+    // body durations once, then make column-block progression an ICU domain
+    // instead of materializing one copy of every command per model block.
+    // Run residue domains consecutively: a physical queue completes every
+    // group of one coarse command before the next residue starts.
+    constexpr int64_t kColumnBlockResidues = 4;
+    // A distributed result can reuse an operand's physical bank/slice queue.
+    // In that case a token-major READ_3D stays live across the interleaved
+    // result WRITE_3D launches, and a column domain would keep both contexts
+    // live across every block as well.  Visit the four rows owned by each
+    // slice pair consecutively and retire both MEM descriptors inside one
+    // column block.  Only those aliasing queue domains are emitted once per
+    // block; non-alias MEM queues and the VXM keep the 12-column domain.  The
+    // VXM still consumes one element per cycle, and all operand/result
+    // addresses use the same pair-major permutation.
+    const bool pairMajorMemOrder = resultDistributed && rows == tile
+        && (sharesMemQueue(lhsPlacement, resultPlacement)
+            || sharesMemQueue(rhsPlacement, resultPlacement));
+    const bool closedColumnDomain = resultDistributed && rows == tile;
+    // Depth four adds two pass stages after the add.  This lets an aliased
+    // READ_3D retire before the corresponding result WRITE_3D begins without
+    // presenting input data before the VXM has configured its Bundle.
+    const int64_t outputPipelineLatency = pairMajorMemOrder ? 3 : 1;
+    const int64_t emittedColumnBlocks = closedColumnDomain
+        ? std::min<int64_t>(columnBlocks, kColumnBlockResidues)
+        : columnBlocks;
+    struct ResidueDuration {
+        int64_t active = 0;
+        int64_t bridge = 0;
+    };
+    std::array<ResidueDuration, kColumnBlockResidues> residueDurations {};
+    const bool operandsMirrored = isDistributed16(lhsPlacement)
+        && isDistributed16(rhsPlacement);
+    if (closedColumnDomain) {
+        const auto blockDuration = [&](int64_t block)
+            -> mlir::FailureOr<ResidueDuration> {
+            auto probeLhs = tileAddress(
+                lhsPlacement, block, rows, 0, target);
+            auto probeRhs = tileAddress(
+                rhsPlacement, block, rows, 0, target);
+            if (mlir::failed(probeLhs) || mlir::failed(probeRhs))
+                return mlir::failure();
+            const int64_t hemisphere = std::max(
+                probeLhs->hemisphere, probeRhs->hemisphere);
+            auto result = tileAddress(
+                resultPlacement, block, rows, hemisphere, target);
+            if (mlir::failed(result)) return mlir::failure();
+
+            const int64_t validOutputHemisphere = 1 - hemisphere;
+            const int64_t mirrorOutputHemisphere = hemisphere;
+            auto persistent = persistentResultPlacement
+                ? tileAddress(persistentResultPlacement, block, rows,
+                      validOutputHemisphere, target)
+                : mlir::FailureOr<TileAddress>(mlir::failure());
+            if (persistentResultPlacement && mlir::failed(persistent))
+                return mlir::failure();
+            const bool persistentOnValidOutput =
+                persistentResultPlacement
+                && persistent->hemisphere == validOutputHemisphere;
+            const bool persistentOnMirrorOutput =
+                persistentResultPlacement
+                && persistent->hemisphere == mirrorOutputHemisphere;
+            if (persistentResultPlacement
+                && !persistentOnValidOutput
+                && !persistentOnMirrorOutput)
+                return mlir::failure();
+
+            int64_t activeWriteEnd = 0;
+            const int64_t tokenBlocks = rows / tile;
+            const int64_t tileRows = target.throughput().tile_rows;
+            const int64_t lanes = target.throughput().lanes_per_tile;
+            for (int64_t outputHemisphere = 0;
+                 outputHemisphere < target.memory().hemispheres;
+                 ++outputHemisphere) {
+                const bool preserveValidOutput = persistentOnValidOutput
+                    && outputHemisphere == validOutputHemisphere;
+                for (int64_t pair = 0; pair < lanes; ++pair) {
+                    auto output = distributedAddress(resultPlacement,
+                        block, pair, columnBlocks, outputHemisphere);
+                    if (mlir::failed(output)) return mlir::failure();
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t pairCycle = pairMajorMemOrder
+                            ? pair * tileRows : pair;
+                        const int64_t writeCycle = outputPipelineLatency
+                            + pairCycle
+                            + eastLatency(output->slices[byte]);
+                        activeWriteEnd = std::max(activeWriteEnd,
+                            writeCycle + (tileRows - 1)
+                                    * (pairMajorMemOrder ? 1 : lanes)
+                                + (tokenBlocks - 1) * tile + 1);
+                    }
+                }
+                if (preserveValidOutput) {
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t persistentWriteCycle =
+                            outputPipelineLatency
+                            + eastLatency(persistent->slices[byte]);
+                        activeWriteEnd = std::max(activeWriteEnd,
+                            persistentWriteCycle + rows);
+                    }
+                }
+            }
+
+            const int64_t activeDuration = activeWriteEnd + 1;
+            if (operandsMirrored)
+                return ResidueDuration {activeDuration, 0};
+
+            int64_t maximumReadLatency = 0;
+            for (int64_t slice : resultSlices)
+                maximumReadLatency = std::max(
+                    maximumReadLatency, passiveReadLatency(slice));
+            const int64_t bridgeStart = activeDuration;
+            const int64_t bridgeCycle =
+                bridgeStart + maximumReadLatency;
+            int64_t bridgeEnd = bridgeCycle;
+            for (int64_t pair = 0; pair < lanes; ++pair) {
+                auto mirror = distributedAddress(resultPlacement,
+                    block, pair, columnBlocks, mirrorOutputHemisphere);
+                if (mlir::failed(mirror)) return mlir::failure();
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t mirrorWriteCycle = bridgeCycle + pair
+                        + bridgeWriteLatency(mirror->slices[byte]);
+                    bridgeEnd = std::max(bridgeEnd,
+                        mirrorWriteCycle + (tileRows - 1) * lanes
+                            + (tokenBlocks - 1) * tile + 1);
+                }
+            }
+            if (persistentOnMirrorOutput) {
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t persistentWriteCycle = bridgeCycle
+                        + bridgeWriteLatency(persistent->slices[byte]);
+                    bridgeEnd = std::max(
+                        bridgeEnd, persistentWriteCycle + rows);
+                }
+            }
+            return ResidueDuration {
+                activeDuration, bridgeEnd + 1 - bridgeStart};
+        };
+
+        for (int64_t residue = 0; residue < emittedColumnBlocks;
+             ++residue) {
+            auto duration = blockDuration(residue);
+            if (mlir::failed(duration))
+                return op.emitError(
+                    "cannot form closed elementwise column domain");
+            residueDurations[static_cast<std::size_t>(residue)] = *duration;
+        }
+    }
+
+    for (int64_t block = 0; block < emittedColumnBlocks; ++block) {
+        const int64_t columnDomainCount = closedColumnDomain
+            ? 1 + (columnBlocks - 1 - block) / kColumnBlockResidues
+            : 1;
+        const ResidueDuration residueDuration = closedColumnDomain
+            ? residueDurations[static_cast<std::size_t>(block)]
+            : ResidueDuration {1, 1};
+        const int64_t activeColumnInterval = closedColumnDomain
+            ? residueDuration.active : 1;
+        const int64_t bridgeColumnInterval = closedColumnDomain
+            ? residueDuration.bridge : 1;
         auto probeLhs = tileAddress(
             lhsPlacement, block, rows, 0, target);
         auto probeRhs = tileAddress(
@@ -258,35 +473,89 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                                      int64_t inputCycle,
                                      int64_t streamBase,
                                      int64_t sourceHemisphere) {
+            const int64_t tileRows = target.throughput().tile_rows;
+            const int64_t lanes = target.throughput().lanes_per_tile;
             if (isDistributed16(placement)) {
-                for (int64_t row = 0; row < rows; ++row) {
+                const int64_t tokenBlocks = rows / tile;
+                for (int64_t pair = 0; pair < lanes; ++pair) {
                     auto distributed = distributedAddress(placement,
-                        block, row, columnBlocks, sourceHemisphere);
+                        block, pair, columnBlocks, sourceHemisphere);
                     if (mlir::failed(distributed)) return false;
+                    int64_t columnAddressStride = 0;
+                    if (columnDomainCount > 1) {
+                        auto next = distributedAddress(placement,
+                            block + kColumnBlockResidues, pair,
+                            columnBlocks, sourceHemisphere);
+                        if (mlir::failed(next)) return false;
+                        columnAddressStride =
+                            next->row - distributed->row;
+                    }
                     for (int64_t byte = 0; byte < 2; ++byte) {
-                        emitMem(rewriter, op.getLoc(),
-                            inputCycle + row
-                                - westLatency(
-                                    distributed->slices[byte]),
+                        const int64_t pairCycle = pairMajorMemOrder
+                            ? pair * tileRows : pair;
+                        const int64_t slice = distributed->slices[byte];
+                        const bool splitColumnDomain = pairMajorMemOrder
+                            && usesMemQueue(resultPlacement,
+                                distributed->bank, slice);
+                        emitMemColumnDomain(
+                            rewriter, op.getLoc(), target,
+                            inputCycle + pairCycle
+                                - westLatency(slice),
                             distributed->hemisphere
                                     * target.memory()
                                           .slices_per_hemisphere
-                                + distributed->slices[byte],
+                                + slice,
                             "read", distributed->row,
-                            streamBase + byte, 1, 1, 1,
-                            "sram", -1, distributed->bank);
+                            streamBase + byte,
+                            tileRows,
+                            pairMajorMemOrder ? 1 : lanes, 1,
+                            tokenBlocks, tile, columnBlocks * tileRows,
+                            columnDomainCount, activeColumnInterval,
+                            columnAddressStride, distributed->bank,
+                            splitColumnDomain);
                     }
                 }
                 return true;
             }
+            int64_t columnAddressStride = 0;
+            if (columnDomainCount > 1) {
+                auto next = tileAddress(placement,
+                    block + kColumnBlockResidues, rows,
+                    sourceHemisphere, target);
+                if (mlir::failed(next)) return false;
+                columnAddressStride = next->row - address.row;
+            }
             for (int64_t byte = 0; byte < 2; ++byte) {
-                emitMem(rewriter, op.getLoc(),
-                    inputCycle - westLatency(address.slices[byte]),
-                    sourceHemisphere
-                            * target.memory().slices_per_hemisphere
-                        + address.slices[byte],
-                    "read", address.row, streamBase + byte,
-                    rows, 1, 1, "sram", -1, address.bank);
+                const int64_t slice = address.slices[byte];
+                const bool splitColumnDomain = pairMajorMemOrder
+                    && usesMemQueue(
+                        resultPlacement, address.bank, slice);
+                if (pairMajorMemOrder) {
+                    emitMemColumnDomain(
+                        rewriter, op.getLoc(), target,
+                        inputCycle - westLatency(slice),
+                        sourceHemisphere
+                                * target.memory().slices_per_hemisphere
+                            + slice,
+                        "read", address.row, streamBase + byte,
+                        tileRows, 1, lanes,
+                        lanes, tileRows, 1,
+                        columnDomainCount, activeColumnInterval,
+                        columnAddressStride,
+                        address.bank, splitColumnDomain);
+                } else {
+                    emitMemColumnDomain(
+                        rewriter, op.getLoc(), target,
+                        inputCycle - westLatency(slice),
+                        sourceHemisphere
+                                * target.memory().slices_per_hemisphere
+                            + slice,
+                        "read", address.row, streamBase + byte,
+                        rows, 1, 1, 1, 1, 0,
+                        columnDomainCount, activeColumnInterval,
+                        columnAddressStride,
+                        address.bank, splitColumnDomain);
+                }
             }
             return true;
         };
@@ -308,15 +577,58 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             "fp32", -1, rows, 1,
             hemisphere == 0 ? "east" : "west",
             hemisphere == 0 ? "east" : "west",
-            -1, false, false, true, false, 2);
-        auto cast = create_vxm(rewriter, op.getLoc(),
-            sum.getResult(), sum.getResult(), type, vxmCycle - 1, 1,
-            "cast", "alu", 0, 0.0f, "immediate", 0, 0.0f,
-            dataFormat, 0, rows, 1,
-            hemisphere == 0 ? "east" : "west",
-            hemisphere == 0 ? "east" : "west",
-            -1, false, false, true, false, 2);
-        finalValue = cast.getResult();
+            -1, false, false, true, false,
+            pairMajorMemOrder ? 4 : 2);
+        const auto setColumnDomain = [&](VxmOp instruction) {
+            if (columnDomainCount <= 1)
+                return;
+            instruction->setAttr("wave_count",
+                rewriter.getI64IntegerAttr(columnDomainCount));
+            instruction->setAttr("wave_interval",
+                rewriter.getI64IntegerAttr(activeColumnInterval));
+        };
+        setColumnDomain(sum);
+        if (pairMajorMemOrder) {
+            auto pass1 = create_vxm(rewriter, op.getLoc(),
+                sum.getResult(), sum.getResult(), type,
+                vxmCycle - 1, 1, "pass",
+                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                "fp32", -1, rows, 1,
+                hemisphere == 0 ? "east" : "west",
+                hemisphere == 0 ? "east" : "west",
+                -1, false, false, true, false, 4);
+            auto pass2 = create_vxm(rewriter, op.getLoc(),
+                pass1.getResult(), pass1.getResult(), type,
+                vxmCycle - 1, 2, "pass",
+                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                "fp32", -1, rows, 1,
+                hemisphere == 0 ? "east" : "west",
+                hemisphere == 0 ? "east" : "west",
+                -1, false, false, true, false, 4);
+            auto cast = create_vxm(rewriter, op.getLoc(),
+                pass2.getResult(), pass2.getResult(), type,
+                vxmCycle - 1, 3, "cast",
+                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                dataFormat, 2, rows, 1,
+                hemisphere == 0 ? "east" : "west",
+                hemisphere == 0 ? "east" : "west",
+                -1, false, false, true, false, 4);
+            setColumnDomain(pass1);
+            setColumnDomain(pass2);
+            setColumnDomain(cast);
+            finalValue = cast.getResult();
+        } else {
+            auto cast = create_vxm(rewriter, op.getLoc(),
+                sum.getResult(), sum.getResult(), type,
+                vxmCycle - 1, 1, "cast",
+                "alu", 0, 0.0f, "immediate", 0, 0.0f,
+                dataFormat, 0, rows, 1,
+                hemisphere == 0 ? "east" : "west",
+                hemisphere == 0 ? "east" : "west",
+                -1, false, false, true, false, 2);
+            setColumnDomain(cast);
+            finalValue = cast.getResult();
+        }
 
         int64_t outputSliceCount = 2;
         int64_t secondOutputCycle = -1;
@@ -342,13 +654,25 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "east" : "west",
                 -1, false, false, true, false, 2);
-            create_vxm(rewriter, op.getLoc(),
+            if (columnDomainCount > 1) {
+                secondSum->setAttr("wave_count",
+                    rewriter.getI64IntegerAttr(columnDomainCount));
+                secondSum->setAttr("wave_interval",
+                    rewriter.getI64IntegerAttr(activeColumnInterval));
+            }
+            auto secondCast = create_vxm(rewriter, op.getLoc(),
                 secondSum.getResult(), secondSum.getResult(), type,
                 secondVxmCycle - 1, 3, "cast", "previous", 0, 0.0f,
                 "immediate", 0, 0.0f, dataFormat, 2, rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "east" : "west",
                 -1, false, false, true, false, 2);
+            if (columnDomainCount > 1) {
+                secondCast->setAttr("wave_count",
+                    rewriter.getI64IntegerAttr(columnDomainCount));
+                secondCast->setAttr("wave_interval",
+                    rewriter.getI64IntegerAttr(activeColumnInterval));
+            }
             outputSliceCount = 4;
             secondOutputCycle = secondVxmCycle + 1;
         }
@@ -374,97 +698,185 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 return op.emitError(
                     "persistent elementwise result hemisphere is not "
                     "reachable from either VXM output");
+            int64_t persistentColumnAddressStride = 0;
+            if (persistentResultPlacement && columnDomainCount > 1) {
+                auto nextPersistent = tileAddress(persistentResultPlacement,
+                    block + kColumnBlockResidues, rows,
+                    validOutputHemisphere, target);
+                if (mlir::failed(nextPersistent))
+                    return op.emitError(
+                        "invalid persistent elementwise column domain");
+                persistentColumnAddressStride =
+                    nextPersistent->row - persistent->row;
+            }
             int64_t activeWriteEnd = vxmCycle;
+            const int64_t tokenBlocks = rows / tile;
+            const int64_t tileRows = target.throughput().tile_rows;
+            const int64_t lanes = target.throughput().lanes_per_tile;
             for (int64_t outputHemisphere = 0;
                  outputHemisphere < target.memory().hemispheres;
                  ++outputHemisphere) {
+                const int64_t fixedOutputStream =
+                    pairMajorMemOrder ? 2 : 0;
                 const int64_t streamBase =
-                    outputHemisphere == 0 ? 8 : 0;
+                    (outputHemisphere == 0 ? 8 : 0)
+                    + fixedOutputStream;
                 const bool preserveValidOutput =
                     persistentOnValidOutput
                     && outputHemisphere == validOutputHemisphere;
-                for (int64_t row = 0; row < rows; ++row) {
+                for (int64_t pair = 0; pair < lanes; ++pair) {
                     auto output = distributedAddress(resultPlacement,
-                        block, row, columnBlocks, outputHemisphere);
+                        block, pair, columnBlocks, outputHemisphere);
                     if (mlir::failed(output))
                         return op.emitError(
                             "invalid distributed elementwise result");
+                    int64_t outputColumnAddressStride = 0;
+                    if (columnDomainCount > 1) {
+                        auto nextOutput = distributedAddress(resultPlacement,
+                            block + kColumnBlockResidues, pair,
+                            columnBlocks, outputHemisphere);
+                        if (mlir::failed(nextOutput))
+                            return op.emitError(
+                                "invalid distributed elementwise column domain");
+                        outputColumnAddressStride =
+                            nextOutput->row - output->row;
+                    }
                     for (int64_t byte = 0; byte < 2; ++byte) {
-                        const int64_t writeCycle = vxmCycle + 1 + row
-                            + eastLatency(output->slices[byte]);
-                        emitMem(rewriter, op.getLoc(),
+                        const int64_t pairCycle = pairMajorMemOrder
+                            ? pair * tileRows : pair;
+                        const int64_t slice = output->slices[byte];
+                        const int64_t writeCycle = vxmCycle
+                            + outputPipelineLatency + pairCycle
+                            + eastLatency(slice);
+                        const bool splitColumnDomain = pairMajorMemOrder
+                            && (usesMemQueue(
+                                    lhsPlacement, output->bank, slice)
+                                || usesMemQueue(
+                                    rhsPlacement, output->bank, slice));
+                        emitMemColumnDomain(
+                            rewriter, op.getLoc(), target,
                             writeCycle,
                             outputHemisphere
                                     * target.memory()
                                           .slices_per_hemisphere
-                                + output->slices[byte],
+                                + slice,
                             preserveValidOutput ? "write_tap" : "write",
                             output->row,
-                            streamBase + byte, 1, 1, 1,
-                            "sram", -1, output->bank);
-                        activeWriteEnd =
-                            std::max(activeWriteEnd, writeCycle + 1);
-                        if (preserveValidOutput) {
-                            const int64_t persistentWriteCycle =
-                                vxmCycle + 1 + row
-                                + eastLatency(
-                                    persistent->slices[byte]);
-                            emitMem(rewriter, op.getLoc(),
-                                persistentWriteCycle,
-                                validOutputHemisphere
-                                        * target.memory()
-                                              .slices_per_hemisphere
-                                    + persistent->slices[byte],
-                                "write", persistent->row + row,
-                                streamBase + byte, 1, 1, 1,
-                                "sram", -1, persistent->bank);
-                            activeWriteEnd = std::max(activeWriteEnd,
-                                persistentWriteCycle + 1);
-                        }
+                            streamBase + byte,
+                            tileRows,
+                            pairMajorMemOrder ? 1 : lanes, 1,
+                            tokenBlocks, tile, columnBlocks * tileRows,
+                            columnDomainCount, activeColumnInterval,
+                            outputColumnAddressStride, output->bank,
+                            splitColumnDomain);
+                        activeWriteEnd = std::max(activeWriteEnd,
+                            writeCycle + (tileRows - 1)
+                                    * (pairMajorMemOrder ? 1 : lanes)
+                                + (tokenBlocks - 1) * tile + 1);
+                    }
+                }
+                if (preserveValidOutput) {
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t slice = persistent->slices[byte];
+                        const int64_t persistentWriteCycle =
+                            vxmCycle + outputPipelineLatency
+                            + eastLatency(slice);
+                        const bool splitColumnDomain = pairMajorMemOrder
+                            && (usesMemQueue(lhsPlacement,
+                                    persistent->bank, slice)
+                                || usesMemQueue(rhsPlacement,
+                                    persistent->bank, slice));
+                        emitMemColumnDomain(
+                            rewriter, op.getLoc(), target,
+                            persistentWriteCycle,
+                            validOutputHemisphere
+                                    * target.memory().slices_per_hemisphere
+                                + slice,
+                            "write", persistent->row,
+                            streamBase + byte,
+                            pairMajorMemOrder ? tileRows : rows,
+                            1, pairMajorMemOrder ? lanes : 1,
+                            pairMajorMemOrder ? lanes : 1,
+                            pairMajorMemOrder ? tileRows : 1,
+                            pairMajorMemOrder ? 1 : 0,
+                            columnDomainCount, activeColumnInterval,
+                            persistentColumnAddressStride,
+                            persistent->bank, splitColumnDomain);
+                        activeWriteEnd = std::max(activeWriteEnd,
+                            persistentWriteCycle + rows);
                     }
                 }
             }
 
-            const bool operandsMirrored = isDistributed16(lhsPlacement)
-                && isDistributed16(rhsPlacement);
+            const int64_t oneActiveEnd = activeWriteEnd + 1;
+            const int64_t bridgePhaseStart = closedColumnDomain
+                ? vxmCycle + columnDomainCount * residueDuration.active
+                : activeWriteEnd;
             if (!operandsMirrored) {
                 // A logical VXM instruction drives both physical chains. If
                 // one operand is hemisphere-local, only that hemisphere's
                 // chain produces a valid result. Bridge it to the other side
-                // so distributed16 remains physically mirrored.
+                // so distributed16 remains physically mirrored.  For a
+                // closed column domain, finish every active-result group
+                // before launching the bridge domain; the two write bodies
+                // can share a physical MEM queue and one ICU context cannot
+                // interleave them.
                 constexpr int64_t bridgeStream = 20;
                 int64_t maximumReadLatency = 0;
                 for (int64_t slice : resultSlices)
                     maximumReadLatency = std::max(
                         maximumReadLatency, passiveReadLatency(slice));
                 const int64_t bridgeCycle =
-                    activeWriteEnd + maximumReadLatency;
+                    bridgePhaseStart + maximumReadLatency;
                 int64_t bridgeEnd = bridgeCycle;
-                for (int64_t row = 0; row < rows; ++row) {
+                for (int64_t pair = 0; pair < lanes; ++pair) {
                     auto source = distributedAddress(resultPlacement,
-                        block, row, columnBlocks,
+                        block, pair, columnBlocks,
                         validOutputHemisphere);
                     auto mirror = distributedAddress(resultPlacement,
-                        block, row, columnBlocks,
+                        block, pair, columnBlocks,
                         mirrorOutputHemisphere);
                     if (mlir::failed(source) || mlir::failed(mirror))
                         return op.emitError(
                             "invalid distributed elementwise mirror");
+                    int64_t sourceColumnAddressStride = 0;
+                    int64_t mirrorColumnAddressStride = 0;
+                    if (columnDomainCount > 1) {
+                        auto nextSource = distributedAddress(resultPlacement,
+                            block + kColumnBlockResidues, pair,
+                            columnBlocks, validOutputHemisphere);
+                        auto nextMirror = distributedAddress(resultPlacement,
+                            block + kColumnBlockResidues, pair,
+                            columnBlocks, mirrorOutputHemisphere);
+                        if (mlir::failed(nextSource)
+                            || mlir::failed(nextMirror))
+                            return op.emitError(
+                                "invalid distributed elementwise mirror domain");
+                        sourceColumnAddressStride =
+                            nextSource->row - source->row;
+                        mirrorColumnAddressStride =
+                            nextMirror->row - mirror->row;
+                    }
                     for (int64_t byte = 0; byte < 2; ++byte) {
-                        emitMem(rewriter, op.getLoc(),
-                            bridgeCycle + row
+                        const int64_t readCycle = bridgeCycle + pair
                                 - passiveReadLatency(
-                                    source->slices[byte]),
+                                    source->slices[byte]);
+                        direct_domain_detail::emitMem3D(
+                            rewriter, op.getLoc(), target, readCycle,
                             validOutputHemisphere
                                     * target.memory()
                                           .slices_per_hemisphere
                                 + source->slices[byte],
                             "read", source->row,
-                            32 + bridgeStream + byte, 1, 1, 1,
-                            "sram", -1, source->bank);
-                        const int64_t mirrorWriteCycle = bridgeCycle + row
+                            32 + bridgeStream + byte,
+                            tileRows, lanes, 1,
+                            tokenBlocks, tile, columnBlocks * tileRows,
+                            columnDomainCount, bridgeColumnInterval,
+                            sourceColumnAddressStride, -1, source->bank);
+                        const int64_t mirrorWriteCycle = bridgeCycle + pair
                             + bridgeWriteLatency(mirror->slices[byte]);
-                        emitMem(rewriter, op.getLoc(), mirrorWriteCycle,
+                        direct_domain_detail::emitMem3D(
+                            rewriter, op.getLoc(), target, mirrorWriteCycle,
                             mirrorOutputHemisphere
                                     * target.memory()
                                           .slices_per_hemisphere
@@ -472,32 +884,54 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                             persistentOnMirrorOutput
                                 ? "write_tap" : "write",
                             mirror->row,
-                            bridgeStream + byte, 1, 1, 1,
-                            "sram", -1, mirror->bank);
+                            bridgeStream + byte,
+                            tileRows, lanes, 1,
+                            tokenBlocks, tile, columnBlocks * tileRows,
+                            columnDomainCount, bridgeColumnInterval,
+                            mirrorColumnAddressStride, -1, mirror->bank);
                         bridgeEnd = std::max(
-                            bridgeEnd, mirrorWriteCycle + 1);
-                        if (persistentOnMirrorOutput) {
-                            const int64_t persistentWriteCycle =
-                                bridgeCycle + row
-                                + bridgeWriteLatency(
-                                    persistent->slices[byte]);
-                            emitMem(rewriter, op.getLoc(),
-                                persistentWriteCycle,
-                                mirrorOutputHemisphere
-                                        * target.memory()
-                                              .slices_per_hemisphere
-                                    + persistent->slices[byte],
-                                "write", persistent->row + row,
-                                bridgeStream + byte, 1, 1, 1,
-                                "sram", -1, persistent->bank);
-                            bridgeEnd = std::max(
-                                bridgeEnd, persistentWriteCycle + 1);
-                        }
+                            bridgeEnd,
+                            mirrorWriteCycle + (tileRows - 1) * lanes
+                                + (tokenBlocks - 1) * tile + 1);
+                    }
+                }
+                if (persistentOnMirrorOutput) {
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t persistentWriteCycle = bridgeCycle
+                            + bridgeWriteLatency(persistent->slices[byte]);
+                        direct_domain_detail::emitMem3D(
+                            rewriter, op.getLoc(), target,
+                            persistentWriteCycle,
+                            mirrorOutputHemisphere
+                                    * target.memory().slices_per_hemisphere
+                                + persistent->slices[byte],
+                            "write", persistent->row,
+                            bridgeStream + byte, rows, 1, 1,
+                            1, 1, 0,
+                            columnDomainCount, bridgeColumnInterval,
+                            persistentColumnAddressStride, -1,
+                            persistent->bank);
+                        bridgeEnd = std::max(
+                            bridgeEnd, persistentWriteCycle + rows);
                     }
                 }
                 cycle = bridgeEnd + 1;
             } else {
-                cycle = activeWriteEnd + 1;
+                cycle = oneActiveEnd;
+            }
+            if (closedColumnDomain) {
+                if (oneActiveEnd
+                    != vxmCycle + residueDuration.active)
+                    return op.emitError(
+                        "elementwise active residue duration does not match emitted body");
+                if (!operandsMirrored
+                    && cycle
+                        != bridgePhaseStart + residueDuration.bridge)
+                    return op.emitError(
+                        "elementwise bridge residue duration does not match emitted body");
+                cycle = vxmCycle
+                    + columnDomainCount
+                        * (residueDuration.active + residueDuration.bridge);
             }
             continue;
         }
@@ -518,14 +952,15 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     ? vxmCycle + 1 : secondOutputCycle;
                 const int64_t physicalStreamBase =
                     outputHemisphere == 0 ? 8 : 0;
-                emitMem(rewriter, op.getLoc(),
+                direct_domain_detail::emitMem3D(
+                    rewriter, op.getLoc(), target,
                     pairCycle + eastLatency(slice),
                     outputHemisphere
                             * target.memory().slices_per_hemisphere
                         + slice,
                     "write", result->row,
                     physicalStreamBase + byte, rows, 1, 1,
-                    "sram", -1, result->bank);
+                    1, 1, 0, 1, 1, 0, -1, result->bank);
             }
         }
         cycle = std::max(cycle,

@@ -16,7 +16,9 @@ void emitSxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::ArrayRef<int64_t> permuteMap,
     llvm::StringRef weightLayout = "vector_columns",
     int64_t outputRow = -1, int64_t inputRow = -1,
-    int64_t outputTile = -1);
+    int64_t outputTile = -1, int64_t repeatCount = 1,
+    int64_t repeatInterval = 1, int64_t waveCount = 1,
+    int64_t waveInterval = 1, int64_t permuteMapStride = 0);
 
 std::array<int64_t, 32> identityMap();
 

@@ -19,7 +19,8 @@ class AttentionScheduleEmitter {
 public:
     AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
         AttentionTaskGraph graph, const target::LPUTargetModel& target,
-        AttentionStagePlan stagePlan, AttentionScheduleStrategy strategy);
+        AttentionStagePlan stagePlan, AttentionScheduleStrategy strategy,
+        bool projectionRopeOverlapEnabled);
 
     mlir::FailureOr<mlir::Value> emit(int64_t outputIndex);
 
@@ -38,12 +39,14 @@ private:
     const target::LPUTargetModel& target_;
     AttentionStagePlan stage_plan_;
     AttentionScheduleStrategy strategy_;
+    bool projection_rope_overlap_enabled_;
     int64_t key_state_binding_index_{-1};
     int64_t value_state_binding_index_{-1};
 };
 
 mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target,
-    AttentionScheduleStrategy strategy = AttentionScheduleStrategy::Tail);
+    AttentionScheduleStrategy strategy = AttentionScheduleStrategy::Tail,
+    bool projectionRopeOverlapEnabled = false);
 
 } // namespace ftlpu::compiler::schedule

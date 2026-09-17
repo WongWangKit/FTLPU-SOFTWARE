@@ -93,6 +93,24 @@ try {
         || overlappingPlans[1].start_cycle != 320)
         throw std::runtime_error(
             "overlapping weight replacement did not launch at release");
+    auto sharedStreamProgram = overlappingProgram;
+    sharedStreamProgram.stream_release_cycles.assign(
+        sharedStreamProgram.hardware.encoded_streams, 0);
+    const auto firstSharedWestStream =
+        2 * sharedStreamProgram.hardware.streams_per_direction
+        - sharedStreamProgram.hardware.c2c_streams_per_direction;
+    for (std::size_t lane = 0;
+         lane < sharedStreamProgram.hardware.c2c_streams_per_direction;
+         ++lane)
+        sharedStreamProgram.stream_release_cycles[
+            firstSharedWestStream + lane] = 400;
+    const auto sharedStreamPlans =
+        plan_weight_prefetches(sharedStreamProgram);
+    if (sharedStreamPlans.size() != 2
+        || !sharedStreamPlans[0].pre_execution
+        || sharedStreamPlans[1].start_cycle != 400)
+        throw std::runtime_error(
+            "runtime C2C prefetch overlapped an ordinary West SR stream");
 
     BinaryProgram chainedOverlapProgram;
     chainedOverlapProgram.hardware = overlappingProgram.hardware;
@@ -140,7 +158,7 @@ try {
         || sharedQueuePlans[2].pre_execution
         || sharedQueuePlans[2].start_cycle != 600)
         throw std::runtime_error(
-            "disjoint-row C2C write was not ordered after shared MEM port use");
+            "disjoint-row C2C write was not ordered after shared MEM queue use");
 
     std::vector<WeightPrefetchPlan> earlyAlternateBankPlans(4);
     earlyAlternateBankPlans[0].ready_cycle = 10;

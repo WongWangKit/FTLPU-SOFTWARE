@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <fstream>
+#include <iomanip>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 
 namespace ftlpu::software::runtime {
 namespace {
@@ -58,6 +60,68 @@ const char* mem_opcode_name(const MemInstruction& instruction)
     return "Unknown";
 }
 
+const char* icu_action_name(IcuQueueAction action)
+{
+    switch (action) {
+    case IcuQueueAction::Idle: return "idle";
+    case IcuQueueAction::WaitingForStart: return "waiting_for_start";
+    case IcuQueueAction::PrefetchOnly: return "prefetch";
+    case IcuQueueAction::FunctionalIssue: return "issue";
+    case IcuQueueAction::Nop: return "nop";
+    case IcuQueueAction::NopWait: return "nop_wait";
+    case IcuQueueAction::RepeatIssue: return "repeat_issue";
+    case IcuQueueAction::RepeatWait: return "repeat_wait";
+    case IcuQueueAction::Repeat2DIssue: return "repeat2d_issue";
+    case IcuQueueAction::Repeat2DWait: return "repeat2d_wait";
+    case IcuQueueAction::MacroIssue: return "macro_issue";
+    case IcuQueueAction::MacroWait: return "macro_wait";
+    case IcuQueueAction::MemStreamNdIssue: return "stream_nd_issue";
+    case IcuQueueAction::MemStreamNdWait: return "stream_nd_wait";
+    case IcuQueueAction::MemSliceProgramIssue: return "slice_program_issue";
+    case IcuQueueAction::MemSliceProgramWait: return "slice_program_wait";
+    case IcuQueueAction::MxmStreamNdIssue: return "mxm_stream_nd_issue";
+    case IcuQueueAction::MxmStreamNdWait: return "mxm_stream_nd_wait";
+    case IcuQueueAction::VxmStreamNdIssue: return "vxm_stream_nd_issue";
+    case IcuQueueAction::VxmStreamNdWait: return "vxm_stream_nd_wait";
+    case IcuQueueAction::VxmRun2DIssue: return "vxm_run2d_issue";
+    case IcuQueueAction::VxmRun2DWait: return "vxm_run2d_wait";
+    case IcuQueueAction::SxmRun2DIssue: return "sxm_run2d_issue";
+    case IcuQueueAction::SxmRun2DWait: return "sxm_run2d_wait";
+    case IcuQueueAction::SxmTileProgramIssue: return "sxm_tile_issue";
+    case IcuQueueAction::SxmTileProgramWait: return "sxm_tile_wait";
+    case IcuQueueAction::Mem3DIssue: return "mem3d_issue";
+    case IcuQueueAction::Mem3DWait: return "mem3d_wait";
+    case IcuQueueAction::MxmLoad3DIssue: return "mxm_load3d_issue";
+    case IcuQueueAction::MxmLoad3DWait: return "mxm_load3d_wait";
+    case IcuQueueAction::MxmDequant3DIssue: return "mxm_dequant3d_issue";
+    case IcuQueueAction::MxmDequant3DWait: return "mxm_dequant3d_wait";
+    case IcuQueueAction::MxmCompute3DIssue: return "mxm_compute3d_issue";
+    case IcuQueueAction::MxmCompute3DWait: return "mxm_compute3d_wait";
+    case IcuQueueAction::ThreeDDecodeWait: return "decode3d_wait";
+    case IcuQueueAction::ThreeDContextFullWait: return "context_full_wait";
+    case IcuQueueAction::SynchronizedWait: return "sync_data_wait";
+    case IcuQueueAction::SynchronizedDelay: return "sync_transport_delay";
+    case IcuQueueAction::SynchronizedIssue: return "sync_issue";
+    case IcuQueueAction::SyncWait: return "barrier_wait";
+    case IcuQueueAction::SyncRelease: return "barrier_release";
+    case IcuQueueAction::EventWait: return "event_wait";
+    case IcuQueueAction::EventRelease: return "event_release";
+    case IcuQueueAction::Notify: return "notify";
+    case IcuQueueAction::Underflow: return "underflow";
+    }
+    return "unknown";
+}
+
+std::string transfer_bytes_hex(
+    const MemArrayModel::MemTransfer& transfer)
+{
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (const auto byte : transfer.bytes)
+        output << std::setw(2) << static_cast<unsigned>(byte);
+    return output.str();
+}
+
 std::pair<std::string, std::string> describe_mem(
     std::size_t queue, const MemInstruction& instruction)
 {
@@ -67,8 +131,11 @@ std::pair<std::string, std::string> describe_mem(
         queue % InstructionControlUnit::kMemQueuesPerHemisphere;
     const std::size_t slice = local / hw::kMemBanksPerSlice;
     const std::size_t bank = local % hw::kMemBanksPerSlice;
+    const bool write = instruction.opcode == MemOpcode::Write
+        || instruction.opcode == MemOpcode::Scatter;
     std::ostringstream detail;
     detail << "slice=" << slice << " bank=" << bank
+           << " operation=" << (write ? "write" : "read")
            << " stream=" << stream_name(instruction.stream_id());
     return {std::string("MEM.") + (east ? "E." : "W.")
             + mem_opcode_name(instruction), detail.str()};
@@ -210,6 +277,15 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
 
     if (programIssueEnabled) {
         for (const QueueRef& ref : queues_) {
+            // Binary MXM queue ids are dense in the executable's logical
+            // topology. The ICU arrays use the CModel's physical stride.
+            const auto physicalMxmIndex = [&] {
+                const auto hemisphere =
+                    ref.index / mxms_per_hemisphere_;
+                const auto localMxm =
+                    ref.index % mxms_per_hemisphere_;
+                return hemisphere * hw::kMxmsPerHemisphere + localMxm;
+            };
             switch (ref.kind) {
             case QueueKind::Mem: {
                 const auto& queue = icu.mem_iq(ref.index);
@@ -222,19 +298,23 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
             }
             case QueueKind::MxmLoad:
             case QueueKind::MxmCompute: {
-                const auto& queue = ref.kind == QueueKind::MxmLoad
-                    ? icu.mxm_load_iq(ref.index)
-                    : icu.mxm_compute_iq(ref.index);
-                const auto* instruction = last_issued(queue);
-                if (instruction == nullptr) break;
-                auto [resource, detail] = describe_mxm(ref.index,
-                    mxms_per_hemisphere_, ref.kind, *instruction);
-                record(std::move(resource),
-                    with_issue_pc(std::move(detail), queue));
+                const auto sampleMxm = [&](const auto& queue) {
+                    const auto* instruction = last_issued(queue);
+                    if (instruction == nullptr) return;
+                    auto [resource, detail] = describe_mxm(ref.index,
+                        mxms_per_hemisphere_, ref.kind, *instruction);
+                    record(std::move(resource),
+                        with_issue_pc(std::move(detail), queue));
+                };
+                if (ref.kind == QueueKind::MxmLoad)
+                    sampleMxm(icu.mxm_load_iq(physicalMxmIndex()));
+                else
+                    sampleMxm(icu.mxm_compute_iq(physicalMxmIndex()));
                 break;
             }
             case QueueKind::MxmDequant: {
-                const auto& queue = icu.mxm_dequant_iq(ref.index);
+                const auto& queue =
+                    icu.mxm_dequant_iq(physicalMxmIndex());
                 const auto* instruction = last_issued(queue);
                 if (instruction == nullptr) break;
                 const bool east = ref.index < mxms_per_hemisphere_;
@@ -372,6 +452,223 @@ void RuntimeExecutionTrace::write_csv(
                << event.repeat_interval
                << ",0," << event.outer_count << ','
                << event.outer_interval << ",0,0,\"none\",0\n";
+    }
+}
+
+void MemExecutionTrace::begin_segment(
+    std::int64_t cycleOffset, bool append)
+{
+    if (!append) events_.clear();
+    cycle_offset_ = cycleOffset;
+}
+
+void MemExecutionTrace::write_header(std::ostream& output)
+{
+    output << "cycle,hemisphere,slice,bank,port,tile,stage,action,opcode,"
+              "address,stream_direction,stream_index,sr_column,vector_tag,"
+              "data_hex,source,pc,iq_before,iq_after\n";
+}
+
+void MemExecutionTrace::write_event(
+    std::ostream& output, const Event& event)
+{
+    output << event.cycle << ','
+           << (event.hemisphere == 0 ? "E" : "W") << ','
+           << event.slice << ',' << event.bank << ','
+           << (event.port == 0 ? "read" : "write") << ',';
+    if (event.tile >= 0) output << event.tile;
+    output << ',' << csv_field(event.stage)
+           << ',' << csv_field(event.action)
+           << ',' << csv_field(event.opcode) << ',';
+    if (event.address >= 0) output << event.address;
+    output << ',' << event.stream_direction << ',';
+    if (event.stream_index >= 0) output << event.stream_index;
+    output << ',';
+    if (event.sr_column >= 0) output << event.sr_column;
+    output << ',';
+    if (event.has_vector_tag) output << event.vector_tag;
+    output << ',' << csv_field(event.data_hex)
+           << ',' << csv_field(event.source) << ',';
+    if (event.pc >= 0) output << event.pc;
+    output << ',' << event.iq_before << ',' << event.iq_after << '\n';
+}
+
+void MemExecutionTrace::stream_csv(const std::filesystem::path& path)
+{
+    if (stream_output_.is_open()) stream_output_.close();
+    stream_output_.clear();
+    stream_buffer_.resize(8 * 1024 * 1024);
+    stream_output_.rdbuf()->pubsetbuf(
+        stream_buffer_.data(),
+        static_cast<std::streamsize>(stream_buffer_.size()));
+    stream_output_.open(path, std::ios::trunc);
+    if (!stream_output_)
+        throw std::runtime_error(
+            "cannot open streaming MEM execution trace: " + path.string());
+    stream_path_ = path;
+    events_.clear();
+    write_header(stream_output_);
+}
+
+void MemExecutionTrace::record(Event event)
+{
+    if (stream_output_.is_open())
+        write_event(stream_output_, event);
+    else
+        events_.push_back(std::move(event));
+}
+
+void MemExecutionTrace::sample(TspSliceSystem& system,
+    std::uint64_t physicalCycle, bool programIssueEnabled)
+{
+    const auto cycle = cycle_offset_
+        + static_cast<std::int64_t>(physicalCycle);
+    auto& icu = system.icu();
+
+    const auto addIcu = [&](std::size_t queueIndex,
+                            const auto& queue,
+                            const char* source,
+                            bool gated) {
+        const auto side = queueIndex
+            / InstructionControlUnit::kMemQueuesPerHemisphere;
+        const auto local = queueIndex
+            % InstructionControlUnit::kMemQueuesPerHemisphere;
+        const auto slice = local / hw::kMemBanksPerSlice;
+        const auto bank = local % hw::kMemBanksPerSlice;
+        const auto& trace = queue.last_trace();
+        const bool pending = !queue.done();
+        if (gated && !pending) return;
+        if (!gated && trace.action == IcuQueueAction::Idle) return;
+
+        Event event;
+        event.cycle = cycle;
+        event.hemisphere = static_cast<std::uint16_t>(side);
+        event.slice = static_cast<std::uint16_t>(slice);
+        event.bank = static_cast<std::uint16_t>(bank);
+        event.port = 0;
+        event.stage = "icu";
+        event.action = gated ? "program_gated"
+                             : icu_action_name(trace.action);
+        event.source = source;
+        event.pc = trace.issue_pc.has_value()
+            ? static_cast<std::int64_t>(*trace.issue_pc) : -1;
+        event.iq_before = trace.iq_before;
+        event.iq_after = trace.iq_after;
+        if (!gated) {
+            if (const auto* instruction = last_issued(queue)) {
+                event.opcode = mem_opcode_name(*instruction);
+                event.port = static_cast<std::uint16_t>(
+                    instruction->opcode == MemOpcode::Write
+                    || instruction->opcode == MemOpcode::Scatter);
+                event.address = static_cast<std::int64_t>(
+                    instruction->address);
+                event.stream_direction =
+                    instruction->stream_id().direction()
+                            == StreamDirection::East ? "E" : "W";
+                event.stream_index = static_cast<std::int32_t>(
+                    instruction->stream_id().index());
+            }
+        }
+        record(std::move(event));
+    };
+
+    for (std::size_t queue = 0;
+         queue < InstructionControlUnit::kMemQueues; ++queue) {
+        const auto& memQueue = icu.mem_iq(queue);
+        const bool gated = !programIssueEnabled
+            && memQueue.last_trace().action
+                == IcuQueueAction::ProgramPaused;
+        addIcu(queue, memQueue, "program", gated);
+    }
+
+    for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
+        const auto hemisphere = static_cast<Hemisphere>(side);
+        const auto& mem = system.mem_array(hemisphere);
+        for (const auto& trace : mem.executed_instructions()) {
+            Event event;
+            event.cycle = cycle;
+            event.hemisphere = static_cast<std::uint16_t>(side);
+            event.slice = static_cast<std::uint16_t>(trace.mem_slice);
+            event.bank = static_cast<std::uint16_t>(trace.bank);
+            event.port = static_cast<std::uint16_t>(
+                trace.instruction.opcode == MemOpcode::Write
+                    || trace.instruction.opcode == MemOpcode::Scatter);
+            event.tile = static_cast<std::int16_t>(trace.tile);
+            event.stage = "pipeline";
+            event.action = "execute";
+            event.opcode = mem_opcode_name(trace.instruction);
+            event.address = static_cast<std::int64_t>(
+                trace.instruction.address);
+            event.stream_direction =
+                trace.instruction.stream_id().direction()
+                        == StreamDirection::East ? "E" : "W";
+            event.stream_index = static_cast<std::int32_t>(
+                trace.instruction.stream_id().index());
+            event.source = "mem_fu";
+            record(std::move(event));
+        }
+        for (const auto& transfer : mem.executed_transfers()) {
+            Event event;
+            event.cycle = cycle;
+            event.hemisphere = static_cast<std::uint16_t>(side);
+            event.slice = static_cast<std::uint16_t>(transfer.mem_slice);
+            event.bank = static_cast<std::uint16_t>(transfer.bank);
+            event.port = static_cast<std::uint16_t>(
+                transfer.kind
+                    == MemArrayModel::MemTransfer::Kind::StoreStreamToSram);
+            event.tile = static_cast<std::int16_t>(transfer.tile);
+            event.stage = "sram";
+            event.action = transfer.kind
+                    == MemArrayModel::MemTransfer::Kind::StoreStreamToSram
+                ? "write_commit" : "read_to_sr";
+            event.opcode = transfer.kind
+                    == MemArrayModel::MemTransfer::Kind::StoreStreamToSram
+                ? "Write" : "Read";
+            event.address = static_cast<std::int64_t>(transfer.address);
+            event.stream_direction =
+                transfer.stream.direction() == StreamDirection::East
+                    ? "E" : "W";
+            event.stream_index = static_cast<std::int32_t>(
+                transfer.stream.index());
+            event.sr_column = static_cast<std::int64_t>(
+                transfer.sr_column);
+            event.vector_tag = transfer.vector_tag;
+            event.has_vector_tag = true;
+            event.data_hex = transfer_bytes_hex(transfer);
+            event.source = "mem_fu";
+            record(std::move(event));
+        }
+    }
+}
+
+void MemExecutionTrace::write_csv(
+    const std::filesystem::path& path) const
+{
+    if (stream_output_.is_open()) {
+        if (std::filesystem::absolute(path).lexically_normal()
+            != std::filesystem::absolute(stream_path_).lexically_normal())
+            throw std::logic_error(
+                "streaming MEM execution trace was opened at a different path");
+        stream_output_.flush();
+        if (!stream_output_)
+            throw std::runtime_error(
+                "failed to flush MEM execution trace: " + path.string());
+        return;
+    }
+    std::ofstream output(path, std::ios::trunc);
+    if (!output)
+        throw std::runtime_error(
+            "cannot open MEM execution trace: " + path.string());
+    write_header(output);
+    auto events = events_;
+    std::ranges::sort(events, [](const Event& left, const Event& right) {
+        return std::tie(left.cycle, left.hemisphere, left.slice, left.bank,
+                   left.port, left.tile, left.stage)
+            < std::tie(right.cycle, right.hemisphere, right.slice, right.bank,
+                   right.port, right.tile, right.stage);
+    });
+    for (const auto& event : events) {
+        write_event(output, event);
     }
 }
 

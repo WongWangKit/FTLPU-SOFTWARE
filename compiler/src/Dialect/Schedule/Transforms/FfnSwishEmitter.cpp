@@ -69,14 +69,16 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
     return {output, output};
 }
 
-mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
+mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
     PrimitiveFfnSchedulePlan& plan, const target::LPUTargetModel& target,
     llvm::ArrayRef<int64_t> hiddenSlices, mlir::Value output,
-    int64_t inputCycle, int64_t mTile, int64_t pair, int64_t row,
-    int64_t sourceHemisphere, bool mirroredBroadcast)
+    int64_t inputCycle, int64_t mTile, int64_t pair,
+    int64_t sourceHemisphere, int64_t rowCount, bool mirroredBroadcast,
+    FfnLoopDomain3D outerDomain)
 {
     constexpr int64_t kVxmSwishLatency = 17;
     const int64_t tile = target.throughput().mxm_rows;
+    const int64_t blockRows = target.throughput().mxm_block_rows;
     const int64_t destination = 1 - sourceHemisphere;
     const int64_t destinationStream = sourceHemisphere == 0 ? 6 : 14;
     const auto hiddenKind =
@@ -92,54 +94,71 @@ mlir::Value emitFfnSwishResultRow(mlir::IRRewriter& rewriter,
         .getAs<mlir::IntegerAttr>("bank").getInt();
     const bool distributed16 = hiddenKind
         && hiddenKind.getValue() == "fp16_mxm_distributed_16";
-
     mlir::Value lastHidden;
-    for (int64_t byte = 0; byte < 2; ++byte) {
-        int64_t slice = hiddenSlices[2 * (nblock % 2) + byte];
-        int64_t address = hiddenBaseRow
-            + (nblock / 2) * plan.getM() + mTile * tile + row;
-        llvm::StringRef kind = "fp16_mxm_activation_planar";
-        if (distributed16) {
-            const int64_t token = mTile * tile + row;
-            const int64_t tokenWithinBlock = token % tile;
-            const int64_t tokenWave =
-                tokenWithinBlock / target.throughput().mxm_block_rows;
-            const int64_t tokenLane =
-                tokenWithinBlock % target.throughput().mxm_block_rows;
-            const int64_t reductionBlocks = plan.getHidden() / tile;
-            slice = hiddenSlices[2 * tokenLane + byte];
-            address = hiddenBaseRow
-                + ((token / tile) * reductionBlocks + nblock)
-                    * target.throughput().tile_rows
-                + tokenWave;
-            kind = "fp16_mxm_distributed_16";
-        }
+
+    const auto emitWrite = [&](int64_t slice, int64_t address,
+                               int64_t firstRow, int64_t byte,
+                               int64_t hemisphere, int64_t stream,
+                               FfnLoopDomain3D domain,
+                               llvm::StringRef kind) {
         const auto latency = target.transport_latency(
             target::StreamEndpoint::VxmResult,
             target::StreamEndpoint::Mem,
             target::StreamDirection::East, slice);
-        if (!latency) return {};
-        const auto emitWrite = [&](int64_t hemisphere, int64_t stream) {
-            auto placement = schedule_placement(rewriter, {slice}, address,
-                1, 1, hemisphere_name(hemisphere), kind, hiddenBank);
-            auto write = rewriter.create<MemWriteOp>(plan.getLoc(), output,
-                inputCycle + kVxmSwishLatency + *latency,
-                1, stream + byte, 1, 0,
-                rewriter.getStringAttr("east"), plan.getHidden0Address(),
-                placement, tile);
-            lastHidden = write.getOutput();
-        };
-        emitWrite(destination, destinationStream);
-        if (mirroredBroadcast) {
-            // Compact queue 7 controls physical C7 and C15. Their fixed
-            // outputs are W6/W7 and E14/E15. Consume the non-owner result in
-            // the peer hidden slot before it can drift into the MXM weight
-            // stream window. The stage later overwrites this sink copy from
-            // the authoritative owner result.
-            const int64_t mirroredDestination = sourceHemisphere;
-            const int64_t mirroredStream =
-                sourceHemisphere == 0 ? 14 : 6;
-            emitWrite(mirroredDestination, mirroredStream);
+        if (!latency) return;
+        const int64_t innerCount = distributed16 ? 1 : rowCount;
+        auto placement = schedule_placement(rewriter, {slice}, address,
+            innerCount, 1, hemisphere_name(hemisphere), kind, hiddenBank);
+        auto write = rewriter.create<MemWriteOp>(plan.getLoc(), output,
+            inputCycle + firstRow + kVxmSwishLatency + *latency,
+            innerCount, stream + byte, 1, 0,
+            rewriter.getStringAttr("east"), plan.getHidden0Address(),
+            placement, innerCount * tile);
+        setFfnLoopDomain3D(write.getOperation(), rewriter, domain);
+        lastHidden = write.getOutput();
+    };
+
+    if (!distributed16) {
+        FfnLoopDomain3D domain = outerDomain;
+        for (int64_t byte = 0; byte < 2; ++byte) {
+            const int64_t slice = hiddenSlices[2 * (nblock % 2) + byte];
+            const int64_t address = hiddenBaseRow
+                + (nblock / 2) * plan.getM() + mTile * tile;
+            emitWrite(slice, address, 0, byte, destination,
+                destinationStream, domain, "fp16_mxm_activation_planar");
+            if (mirroredBroadcast) {
+                emitWrite(slice, address, 0, byte, sourceHemisphere,
+                    sourceHemisphere == 0 ? 14 : 6, domain,
+                    "fp16_mxm_activation_planar");
+            }
+        }
+        return lastHidden;
+    }
+
+    const int64_t hiddenBlocks = plan.getHidden() / tile;
+    for (int64_t tokenLane = 0; tokenLane < blockRows; ++tokenLane) {
+        if (tokenLane >= rowCount) break;
+        const int64_t occurrenceCount = 1
+            + (rowCount - 1 - tokenLane) / blockRows;
+        const int64_t token = mTile * tile + tokenLane;
+        const int64_t tokenWave = (token % tile) / blockRows;
+        const int64_t address = hiddenBaseRow
+            + ((token / tile) * hiddenBlocks + nblock)
+                * target.throughput().tile_rows
+            + tokenWave;
+        FfnLoopDomain3D domain = outerDomain;
+        domain.wave_count = occurrenceCount;
+        domain.wave_interval = blockRows;
+        domain.wave_address_stride = 1;
+        for (int64_t byte = 0; byte < 2; ++byte) {
+            const int64_t slice = hiddenSlices[2 * tokenLane + byte];
+            emitWrite(slice, address, tokenLane, byte, destination,
+                destinationStream, domain, "fp16_mxm_distributed_16");
+            if (mirroredBroadcast) {
+                emitWrite(slice, address, tokenLane, byte, sourceHemisphere,
+                    sourceHemisphere == 0 ? 14 : 6, domain,
+                    "fp16_mxm_distributed_16");
+            }
         }
     }
     return lastHidden;

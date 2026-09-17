@@ -64,6 +64,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const bool has_qk_norm = query_norm_weight && key_norm_weight;
     const bool has_qk_bias = query_bias || key_bias;
     const bool has_attention_bias = query_bias || key_bias || value_bias;
+    bool projection_rope_overlap = false;
+    if (const auto module = op->getParentOfType<mlir::ModuleOp>())
+        if (const auto overlap = module->getAttrOfType<mlir::BoolAttr>(
+                "ftlpu.projection_rope_overlap"))
+            projection_rope_overlap = overlap.getValue();
     auto execution_policy =
         target::mxm_execution_policy_from_operation(op);
     if (mlir::failed(execution_policy)) {
@@ -145,7 +150,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         && target.activation_storage_slices().size() >= 20;
     const int64_t head_blocks = head_dim / tile;
     const bool direct_rope_streaming =
-        target.uses_dedicated_slice_roles()
+        projection_rope_overlap
+        && target.uses_dedicated_slice_roles()
         && target.memory().banks_per_slice > 1
         && target.activation_storage_slices().size() >= 20
         && target.throughput().vxm_cross_hemisphere_streams_enabled != 0
@@ -164,10 +170,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         * target.throughput().tile_rows;
     const int64_t rope_frequency_blocks = head_dim / (2 * tile);
     const int64_t rope_rows = seq_len * rope_frequency_blocks;
-    // Projection and RoPE consume one 128-column physical wave at a time.
-    // Only its four 32-column blocks are live in the staging FIFO; later
-    // heads reuse the same rows.
-    const int64_t rope_staging_rows = 4 * seq_len;
+    // The overlapped schedule only retains one four-block projection wave.
+    // Serial projection finishes every Q head before RoPE consumes any of
+    // them, so each output block needs a distinct staging address.
+    const int64_t rope_staging_rows =
+        (projection_rope_overlap ? 4
+                                 : std::max(query_heads, kv_heads) * head_blocks)
+        * seq_len;
     const int64_t qk_norm_matrix_rows =
         seq_len * head_dim
         / (tile * target.throughput().lanes_per_tile);
@@ -213,9 +222,9 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // low row above the persistent residual input so later weight pages may
     // remain resident in the dedicated weight slices throughout RoPE and
     // softmax.
-    const int64_t rope_staging_base = distributed_input_rows;
     const int64_t rope_product_base = distributed_input_rows;
     const int64_t rope_mirror_base = rope_product_base + rope_product_rows;
+    const int64_t rope_staging_mirror_base = rope_mirror_base + rope_rows;
     // The function input remains live until the attention residual add. Keep
     // Q/V and score scratch above its distributed16 rows. The RoPE table and
     // causal mask are initialized before execution, so the mask must also sit
@@ -225,6 +234,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         ? std::max(distributed_input_rows, key_rows)
         : target.attention_score_base_row();
     const int64_t query_base = score_base + score_rows;
+    // Serial Q/K projection retains every raw head until RoPE starts. Its
+    // larger staging allocation must stay clear of the Query IW rows, which
+    // remain live for QK and can occupy either scratch bank by rotary half.
+    const int64_t rope_staging_base = projection_rope_overlap
+        ? distributed_input_rows : query_base + query_rows;
     // Value is independent of QK and may be projected before Key so the
     // following layer's weight refill can overlap the rest of attention.
     // Keep it beyond the transient RoPE product plane for that longer live
@@ -252,6 +266,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                     > input_staging_base
                 || qk_norm_output_base + qk_norm_matrix_rows
                     > input_staging_base))
+        || rope_staging_base + rope_staging_rows
+            > target.memory().words_per_bank
         || rope_product_base + rope_product_rows
             > target.memory().words_per_bank
         || (compact_rope_products
@@ -282,6 +298,22 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             return mlir::failure();
         }
     }
+    const auto weightStorage = target.weight_storage_slices();
+    const bool use_disjoint_q_rope_slices = projection_rope_overlap &&
+        query_bias && tiled_weights && target.uses_dedicated_slice_roles() &&
+        target.memory().banks_per_slice == 2 && !has_qk_norm &&
+        seq_len == tile && hidden == 1536 && query_heads == 12 &&
+        kv_heads == 2 && head_dim == 128 && weight_bank == 1 &&
+        target.name() == "ftlpu-lpu32" && weightStorage.size() >= 30 &&
+        weightStorage[0] == 20 && weightStorage[8] == 28 &&
+        weightStorage[12] == 32 && weightStorage[22] == 42 &&
+        weightStorage[29] == 49 &&
+        weight_tile_plan->get(tensor::AttentionWeightTileKind::Output).bank ==
+            scratch_bank &&
+        weight_tile_plan->get(tensor::AttentionWeightTileKind::Output)
+                .slice_group_begin == 0 &&
+        weight_tile_plan->get(tensor::AttentionWeightTileKind::Output)
+                .slice_group_count == 1;
     llvm::SmallVector<int64_t, 16> projection_bias_slices;
     if (has_attention_bias) {
         const auto storage = target.activation_storage_slices();
@@ -291,8 +323,18 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 "and reserved rows below the context buffer");
             return mlir::failure();
         }
-        projection_bias_slices.assign(
-            storage.begin() + 12, storage.begin() + 16);
+        // In the Q projection WRITE_READ pipeline the remote RoPE staging
+        // copy uses the scratch bank of activation slices 0..15. Move all
+        // projection-bias constants to bank-0 slices beyond the pages that
+        // runtime may preload before Q. The output page owns slices 20..27;
+        // the preloaded FFN Down page owns a subset of 31..41.
+        if (use_disjoint_q_rope_slices) {
+            projection_bias_slices.assign(
+                weightStorage.begin() + 22, weightStorage.begin() + 26);
+        } else {
+            projection_bias_slices.assign(
+                storage.begin() + 12, storage.begin() + 16);
+        }
     }
     llvm::SmallVector<int64_t, 16> qk_norm_input_slices;
     llvm::SmallVector<int64_t, 16> qk_norm_output_slices;
@@ -315,26 +357,43 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         qk_norm_weight_slices.assign(
             storage.end() - 2, storage.end());
     }
-    // Product-phase Q/K reads share the 16-slice RoPE staging footprint.
-    // Keep bias on the opposite bank so each cycle can fetch both operands
-    // without asking one SRAM read port for two addresses.
+    // The bias bank is opposite the raw RoPE staging bank. On the overlapping
+    // Q path its slices are disjoint from the mirrored staging bank as well.
     const int64_t projection_bias_bank = scratch_bank;
     const int64_t input_staging_bank = scratch_bank;
     const auto input_staging_values = target.uses_dedicated_slice_roles()
         ? target.activation_storage_slices() : planar_activation_slices;
+    llvm::SmallVector<int64_t, 16> input_staging_slices;
     const auto input_staging_begin = direct_rope_streaming
         ? input_staging_values.end() - 2
         : compact_rope_products
             ? input_staging_values.begin() + 8
             : input_staging_values.begin();
-    const auto input_staging_end = input_staging_begin + 2;
-    const llvm::SmallVector<int64_t, 16> input_staging_slices(
-        input_staging_begin, input_staging_end);
+    input_staging_slices.assign(
+        input_staging_begin, input_staging_begin + 2);
     if (mlir::failed(physical_allocator.reserve({"input_staging",
             input_staging_slices, input_staging_base,
             input_staging_rows, 0, 2, true, input_staging_bank}))) {
         op.emitError("failed to reserve the attention input staging buffer");
         return mlir::failure();
+    }
+    llvm::SmallVector<int64_t, 16> input_staging_pong_slices;
+    if (projection_rope_overlap && tiled_weights
+            && compact_rope_products && !direct_rope_streaming
+            && input_staging_values.size() >= 10) {
+        // Keep both copies inside the activation partition.  The primary
+        // pair (8/9) is preferred for its shorter MXM route; the 0/1 copy is
+        // used only for issue cycles where the previous group's RoPE owns a
+        // primary MEM ICU.  Equal row coordinates make the switch affine.
+        input_staging_pong_slices.assign(
+            input_staging_values.begin(), input_staging_values.begin() + 2);
+        if (mlir::failed(physical_allocator.reserve({"input_staging_pong",
+                input_staging_pong_slices, input_staging_base,
+                input_staging_rows, 0, 2, true, input_staging_bank}))) {
+            op.emitError(
+                "failed to reserve the attention input staging pong buffer");
+            return mlir::failure();
+        }
     }
     // Keep the long-lived O-projection weights out of the fixed probability
     // staging window. Larger models can make O weights cross that window even
@@ -400,6 +459,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t probability_diagonal_bank = scratch_bank;
     llvm::SmallVector<int64_t, 4> rope_table_slices;
     llvm::SmallVector<int64_t, 4> rope_mirror_slices;
+    llvm::SmallVector<int64_t, 16> rope_staging_mirror_slices;
     int64_t rope_table_bank = compact_rope_products
         ? secondary_scratch_bank : scratch_bank;
     int64_t rope_mirror_bank = compact_rope_products
@@ -407,8 +467,46 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const auto rope_slices = target.attention_rope_slices();
     rope_table_slices.assign(rope_slices.begin(), rope_slices.end());
     if (compact_rope_products) {
-        const auto storage = target.activation_storage_slices();
-        rope_mirror_slices.assign(storage.begin(), storage.begin() + 4);
+        if (use_disjoint_q_rope_slices) {
+            // Keep the second RoPE table and four busy staging mirrors away
+            // from both pre-execution weight pages and the Q bias streams.
+            rope_mirror_slices.assign(
+                weightStorage.begin() + 26, weightStorage.begin() + 30);
+            rope_staging_mirror_slices.assign(
+                rope_staging_slices.begin(), rope_staging_slices.end());
+            llvm::SmallVector<int64_t, 4> busyActivationSlices;
+            busyActivationSlices.append(input_staging_slices.begin(),
+                                        input_staging_slices.end());
+            busyActivationSlices.append(input_staging_pong_slices.begin(),
+                                        input_staging_pong_slices.end());
+            std::sort(busyActivationSlices.begin(),
+                      busyActivationSlices.end());
+            busyActivationSlices.erase(
+                std::unique(busyActivationSlices.begin(),
+                            busyActivationSlices.end()),
+                busyActivationSlices.end());
+            if (busyActivationSlices.size() != 4 ||
+                rope_staging_mirror_base + rope_staging_rows >
+                    target.memory().words_per_bank) {
+                op.emitError("cannot place the Q RoPE staging mirror");
+                return mlir::failure();
+            }
+            for (int64_t index = 0; index < 4; ++index) {
+                auto it = std::find(rope_staging_slices.begin(),
+                                    rope_staging_slices.end(),
+                                    busyActivationSlices[index]);
+                if (it == rope_staging_slices.end()) {
+                    op.emitError("Q staging slice is absent from RoPE staging");
+                    return mlir::failure();
+                }
+                rope_staging_mirror_slices[std::distance(
+                    rope_staging_slices.begin(), it)] =
+                    weightStorage[8 + index + (index == 3 ? 1 : 0)];
+            }
+        } else {
+            const auto storage = target.activation_storage_slices();
+            rope_mirror_slices.assign(storage.begin(), storage.begin() + 4);
+        }
     } else {
         rope_mirror_slices = rope_table_slices;
     }
@@ -417,6 +515,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             rope_staging_rows, 0, 2, true,
             rope_staging_bank}))) {
         op.emitError("failed to reserve the attention RoPE staging FIFO");
+        return mlir::failure();
+    }
+    if (use_disjoint_q_rope_slices &&
+        mlir::failed(physical_allocator.reserve({"rope_staging_mirror",
+            rope_staging_mirror_slices, rope_staging_mirror_base,
+            rope_staging_rows, 0, 2, false, scratch_bank}))) {
+        op.emitError("failed to reserve the Q RoPE staging mirror");
         return mlir::failure();
     }
     if (has_qk_norm
@@ -996,6 +1101,25 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             seq_len * hidden / (tile * 2), "east",
             vector_result->bank)),
     });
+    if (!input_staging_pong_slices.empty()) {
+        mlir::NamedAttrList plan_attributes(plan);
+        plan_attributes.set("input_staging_pong",
+            make_attention_placement(rewriter,
+                "fp16_pair_planar", input_staging_pong_slices,
+                input_staging_base, input_staging_rows, "both",
+                input_staging_bank));
+        plan = plan_attributes.getDictionary(rewriter.getContext());
+    }
+    if (use_disjoint_q_rope_slices) {
+        mlir::NamedAttrList plan_attributes(plan);
+        plan_attributes.set("rope_staging_mirror",
+            make_attention_placement(rewriter,
+                "fp16_rope_fifo_mirror_x16",
+                rope_staging_mirror_slices,
+                rope_staging_mirror_base, rope_staging_rows, "both",
+                scratch_bank));
+        plan = plan_attributes.getDictionary(rewriter.getContext());
+    }
     if (has_qk_norm) {
         mlir::NamedAttrList plan_attributes(plan);
         plan_attributes.set("query_norm_weight",
@@ -1183,9 +1307,9 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     auto query = createProjection(
         graph.query.getLhs(), graph.query.getRhs(), query_bias,
         "query", matrixType(seq_len, query_width),
-        subplan({"input", "input_staging",
+        subplan({"input", "input_staging", "input_staging_pong",
             "query_weight", "query", "rope_staging", "rope_product",
-            "rope_mirror", "query_bias"}));
+            "rope_mirror", "rope_staging_mirror", "query_bias"}));
     auto key = createProjection(
         graph.key.getLhs(), graph.key.getRhs(), key_bias,
         "key", matrixType(seq_len, kv_width),

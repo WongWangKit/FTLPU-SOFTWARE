@@ -101,6 +101,10 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
             plan.getAs<mlir::DictionaryAttr>("rope_staging")) {
         ropeStagingBase_ =
             staging.getAs<mlir::IntegerAttr>("base_row").getInt();
+        if (const auto rows =
+                staging.getAs<mlir::IntegerAttr>("instruction_count"))
+            ropeStagingOutputBlocks_ =
+                std::max<int64_t>(1, rows.getInt() / seqLen_);
         const auto slices = staging.getAs<mlir::ArrayAttr>("slices");
         for (std::size_t i = 0; i < ropeStagingSlices_.size(); ++i)
             ropeStagingSlices_[i] =
@@ -502,7 +506,7 @@ int64_t AttentionMemoryLayout::ropeStagingAddress(
     int64_t tokenBlock, int64_t row) const
 {
     return ropeStagingBase_
-        + ((head * headBlocks_ + half) % 4) * seqLen_
+        + ((head * headBlocks_ + half) % ropeStagingOutputBlocks_) * seqLen_
         + tokenBlock * target_.throughput().mxm_rows + row;
 }
 

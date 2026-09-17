@@ -1,5 +1,6 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/imem_capacity.hpp"
+#include "ftlpu/software/runtime/performance.hpp"
 #include "ftlpu/software/runtime/schedule_trace.hpp"
 
 #include <filesystem>
@@ -137,6 +138,28 @@ QueueCommand repeat_2d_command(const ftlpu::IcuRepeat2D& repeat)
         encoded.words[0], InstructionKind::None, 3,
         {encoded.words[0], encoded.words[1], encoded.words[2], 0},
     };
+}
+
+template <typename Packet>
+std::vector<QueueCommand> raw_fu_commands(
+    const Packet& packet, InstructionKind instructionKind,
+    std::size_t leadingNopCycles = 0)
+{
+    std::vector<QueueCommand> commands;
+    commands.reserve(Packet::kWordCount + (leadingNopCycles != 0 ? 1 : 0));
+    if (leadingNopCycles != 0)
+        commands.push_back(
+            QueueCommand{ftlpu::isa::encode_icu_nop(leadingNopCycles)});
+    for (const auto& word : packet.words) {
+        QueueCommand command;
+        command.command = word.lanes[0];
+        command.instruction_kind = instructionKind;
+        command.word_count = Packet::kLanesPerWord;
+        for (std::size_t lane = 0; lane < Packet::kLanesPerWord; ++lane)
+            command.words[lane] = word.lanes[lane];
+        commands.push_back(std::move(command));
+    }
+    return commands;
 }
 
 } // namespace
@@ -406,20 +429,219 @@ try {
     if (trace.find("12,13,\"MXM.E0.Load\"") != std::string::npos)
         throw std::runtime_error("macro schedule was expanded in CSV v2");
     require_contains(trace,
-        "2,3,\"MEM.E.Read\",\"slice=0 bank=0 addr=100 stream=E0\","
+        "2,3,\"MEM.E.Read\",\"slice=0 bank=0 operation=read addr=100 stream=E0\","
         "\"repeat\",3,2,1,1,0,0,0,\"mem_address\",1");
     require_contains(trace,
-        "7,8,\"MEM.E.Read\",\"slice=0 bank=0 addr=200 stream=E1\","
+        "7,8,\"MEM.E.Read\",\"slice=0 bank=0 operation=read addr=200 stream=E1\","
         "\"repeat2d\",3,2,1,2,10,100,1,\"mem_address\",0");
     require_contains(trace,
-        "24,25,\"MEM.E.Read\",\"slice=0 bank=0 addr=300 stream=E2\","
+        "24,25,\"MEM.E.Read\",\"slice=0 bank=0 operation=read addr=300 stream=E2\","
         "\"repeat\",3,4,10,1,1,0,0,\"mem_address\",0");
     require_contains(trace,
-        "25,26,\"MEM.E.Read\",\"slice=0 bank=0 addr=301 stream=E3\","
+        "25,26,\"MEM.E.Read\",\"slice=0 bank=0 operation=read addr=301 stream=E3\","
         "\"repeat\",3,4,10,1,1,0,0,\"mem_address\",0");
     require_contains(trace,
         "0,7,\"VXM.C0\",\"mul depth=2 repeat=7\",\"single\","
         "1,0,0,1,0,0,0,\"none\",0");
+
+    BinaryProgram rawProgram;
+    rawProgram.hardware.mxms_per_hemisphere = 1;
+    const ftlpu::IcuLoop3D rawMemLoop{
+        0, {3, 2, 2}, {2, 8, 24}};
+    rawProgram.queues.push_back(QueueProgram{QueueKind::Mem, 0,
+        raw_fu_commands(ftlpu::isa::encode_mem_icu_3d_instruction(
+            ftlpu::MemIcuInstruction::Read3D(rawMemLoop,
+                ftlpu::MemIcuAddress3D::Affine(100, {1, 16, 64}),
+                ftlpu::StreamId::East(0))), InstructionKind::Mem, 10)});
+
+    rawProgram.queues[0].commands.push_back(
+        QueueCommand{ftlpu::isa::encode_icu_nop(3)});
+    const auto trailingMem = raw_fu_commands(
+        ftlpu::isa::encode_mem_icu_3d_instruction(
+            ftlpu::MemIcuInstruction::Read3D(
+                ftlpu::IcuLoop3D{0, {1, 1, 1}, {1, 1, 1}},
+                ftlpu::MemIcuAddress3D::Affine(999, {0, 0, 0}),
+                ftlpu::StreamId::East(1))),
+        InstructionKind::Mem);
+    rawProgram.queues[0].commands.insert(
+        rawProgram.queues[0].commands.end(),
+        trailingMem.begin(), trailingMem.end());
+
+    const ftlpu::IcuLoop3D rawMxmLoop{0, {2, 1, 1}, {2, 1, 1}};
+    rawProgram.queues.push_back(QueueProgram{QueueKind::MxmLoad, 0,
+        raw_fu_commands(ftlpu::isa::encode_mxm_load_icu_3d_instruction(
+            ftlpu::MxmLoadIcuInstruction::Load3D(rawMxmLoop, 0,
+                ftlpu::MxmIcuBufferMode::ToggleDimension0, 0,
+                {1, 0, 0}, 8)), InstructionKind::Mxm, 70)});
+    rawProgram.queues.push_back(QueueProgram{QueueKind::MxmDequant, 0,
+        raw_fu_commands(ftlpu::isa::encode_mxm_dequant_icu_3d_instruction(
+            ftlpu::MxmDequantIcuInstruction::Dequant3D(rawMxmLoop,
+                ftlpu::MxmDequantInstruction::ScaleBits(0x3c00))),
+            InstructionKind::MxmDequant, 70)});
+    rawProgram.queues.push_back(QueueProgram{QueueKind::MxmCompute, 1,
+        raw_fu_commands(ftlpu::isa::encode_mxm_compute_icu_3d_instruction(
+            ftlpu::MxmComputeIcuInstruction::Compute3D(rawMxmLoop, 0,
+                ftlpu::MxmIcuBufferMode::ToggleDimension0, 16, 12, 4,
+                {0, 0, 0}, 1, ftlpu::MxmDataFormat::BFloat16,
+                ftlpu::MxmComputeIcuMode{})), InstructionKind::Mxm, 70)});
+
+    auto rawVxm = ftlpu::VxmLaneAluInstruction{
+        ftlpu::VxmAluOpcode::Multiply,
+        ftlpu::VxmLaneOperand::StreamBFloat16(),
+        ftlpu::VxmLaneOperand::Imm(0.5f)};
+    rawVxm.repeat_count = 4;
+    const auto compact = ftlpu::VxmCompactInstructionCodec::encode(
+        0, ftlpu::VxmChainDepth::Two, rawVxm);
+    rawProgram.queues.push_back(QueueProgram{QueueKind::Vxm, 0,
+        raw_fu_commands(ftlpu::isa::encode_vxm_icu_run_2d_instruction(
+            ftlpu::VxmIcuRun2DInstruction::Run2D(
+                0, {2, 2}, {8, 24}, compact)), InstructionKind::Vxm,
+            90)});
+
+    auto map = ftlpu::SxmInstruction::PermuteMap{};
+    for (std::size_t lane = 0; lane < map.size(); ++lane)
+        map[lane] = (lane + ftlpu::hw::kLanesPerTile) % map.size();
+    const auto sxm = ftlpu::SxmInstruction::Permute(
+        {{0}, {1}}, {{16}, {17}}, map);
+    rawProgram.queues.push_back(QueueProgram{QueueKind::SxmPermute, 0,
+        raw_fu_commands(ftlpu::isa::encode_sxm_icu_run_2d_instruction(
+            ftlpu::SxmIcuRun2DInstruction::Run2D(
+                0, {2, 2}, {2, 12}, sxm, 8)), InstructionKind::Sxm,
+            120)});
+
+    const auto rawPath = std::filesystem::temp_directory_path()
+        / "ftlpu_schedule_trace_raw_fu_test.csv";
+    write_schedule_trace_csv(rawProgram, rawPath);
+    std::ostringstream rawContents;
+    {
+        std::ifstream input(rawPath);
+        rawContents << input.rdbuf();
+    }
+    std::filesystem::remove(rawPath);
+    const auto rawTrace = rawContents.str();
+    require_contains(rawTrace,
+        "10,11,\"MEM.E.Read3D\",\"slice=0 bank=0 operation=read addr=100 "
+        "stream=E0 depth=0/2");
+    require_contains(rawTrace,
+        "34,35,\"MEM.E.Read3D\",\"slice=0 bank=0 operation=read addr=164 "
+        "stream=E0 depth=1/2");
+    require_contains(rawTrace,
+        "50,51,\"MEM.E.Read3D\",\"slice=0 bank=0 operation=read addr=999 "
+        "stream=E1 depth=0/1");
+    require_contains(rawTrace, "\"MXM.E0.Load\",\"Load3D");
+    require_contains(rawTrace, "\"MXM.E0.Dequant\",\"Dequant3D");
+    require_contains(rawTrace, "\"MXM.W0.Compute\",\"Compute3D");
+    require_contains(rawTrace, "\"VXM.C0\",\"mul depth=2 repeat=4 Run2D\"");
+    require_contains(rawTrace, "\"SXM.E.Permute\",\"permute Run2D map_stride=8\"");
+
+    std::ostringstream rawPerformance;
+    print_runtime_performance(rawProgram, 128, rawPerformance);
+    require_contains(rawPerformance.str(),
+        "runtime perf resource=MEM cycles=128 active_queues=1/"
+            + std::to_string(rawProgram.hardware.hemispheres
+                * rawProgram.hardware.slices_per_hemisphere
+                * rawProgram.hardware.banks_per_slice)
+            + " issued=13");
+    require_contains(rawPerformance.str(),
+        "runtime perf resource=MXM.load cycles=128 active_queues=1/2 issued=2");
+    require_contains(rawPerformance.str(),
+        "runtime perf resource=VXM cycles=128 active_queues=1/"
+            + std::to_string(rawProgram.hardware.vxm_alus)
+            + " issued=4");
+
+    // A MEM queue may mix ordinary READ3D with the three-word WRITE_READ_2D
+    // packet. Both the performance walk and CSV trace must advance by the
+    // complete packet before decoding the following instruction.
+    ftlpu::MemIcuWriteRead2DInstruction writeRead{};
+    writeRead.start_wait = 5;
+    writeRead.counts = {2, 2};
+    writeRead.write_cycle_strides = {8, 20};
+    writeRead.read_cycle_strides = {8, 20};
+    writeRead.read_start_offset = 2;
+    writeRead.base_address = 30;
+    writeRead.address_strides = {1, 4};
+    writeRead.write_stream = ftlpu::StreamId::East(3).packed();
+    writeRead.read_stream_base = ftlpu::StreamId::East(4).packed();
+    writeRead.read_stream_outer_stride = 1;
+    const auto rawRead = raw_fu_commands(
+        ftlpu::isa::encode_mem_icu_3d_instruction(
+            ftlpu::MemIcuInstruction::Read3D(
+                ftlpu::IcuLoop3D{0, {1, 1, 1}, {1, 1, 1}},
+                ftlpu::MemIcuAddress3D::Affine(50, {0, 0, 0}),
+                ftlpu::StreamId::East(0))),
+        InstructionKind::Mem);
+    auto mixedCommands = rawRead;
+    mixedCommands.push_back(QueueCommand{ftlpu::isa::encode_icu_nop(3)});
+    const auto writeReadCommands = raw_fu_commands(
+        ftlpu::isa::encode_mem_icu_write_read_2d_instruction(writeRead),
+        InstructionKind::Mem);
+    mixedCommands.insert(mixedCommands.end(), writeReadCommands.begin(),
+        writeReadCommands.end());
+    mixedCommands.insert(mixedCommands.end(), rawRead.begin(), rawRead.end());
+    BinaryProgram mixedProgram;
+    mixedProgram.queues.push_back(
+        QueueProgram{QueueKind::Mem, 0, std::move(mixedCommands)});
+    std::ostringstream mixedPerformance;
+    print_runtime_performance(mixedProgram, 128, mixedPerformance);
+    require_contains(mixedPerformance.str(),
+        "runtime perf resource=MEM cycles=128 active_queues=1/"
+            + std::to_string(mixedProgram.hardware.hemispheres
+                * mixedProgram.hardware.slices_per_hemisphere
+                * mixedProgram.hardware.banks_per_slice)
+            + " issued=10");
+    const auto mixedPath = std::filesystem::temp_directory_path()
+        / "ftlpu_schedule_trace_mixed_mem_test.csv";
+    write_schedule_trace_csv(mixedProgram, mixedPath);
+    std::ostringstream mixedContents;
+    {
+        std::ifstream input(mixedPath);
+        mixedContents << input.rdbuf();
+    }
+    std::filesystem::remove(mixedPath);
+    require_contains(mixedContents.str(),
+        "9,10,\"MEM.E.WRITE_READ_2D.Write\"");
+    require_contains(mixedContents.str(),
+        "11,12,\"MEM.E.WRITE_READ_2D.Read\"");
+    require_contains(mixedContents.str(),
+        "40,41,\"MEM.E.Read3D\"");
+
+    BinaryProgram synchronizedProgram;
+    const auto synchronizedPacket =
+        ftlpu::InstructionControlUnit::MemIcu::
+            encode_synchronized_raw_packet(
+                3, 17, 2, 1,
+                ftlpu::MemInstruction::Write(
+                    64, ftlpu::StreamId::East(0)),
+                8);
+    const auto synchronizedCommands =
+        encode_mem_synchronized_icu_packet(synchronizedPacket);
+    std::vector<QueueCommand> synchronizedQueueCommands(
+        synchronizedCommands.begin(), synchronizedCommands.end());
+    synchronizedProgram.queues.push_back(
+        QueueProgram {QueueKind::Mem, 0,
+            std::move(synchronizedQueueCommands)});
+    std::ostringstream synchronizedPerformance;
+    print_runtime_performance(
+        synchronizedProgram, 16, synchronizedPerformance);
+    require_contains(synchronizedPerformance.str(),
+        "runtime perf resource=MEM cycles=16 active_queues=1/"
+            + std::to_string(
+                synchronizedProgram.hardware.hemispheres
+                * synchronizedProgram.hardware.slices_per_hemisphere
+                * synchronizedProgram.hardware.banks_per_slice)
+            + " issued=3");
+
+    BinaryProgram rawControlProgram;
+    rawControlProgram.queues.push_back(QueueProgram {QueueKind::C2cDma, 0,
+        {encode_icu_control_raw_word(
+            ftlpu::IcuControlInstruction::WaitEvent(23)),
+         encode_icu_control_raw_word(
+            ftlpu::IcuControlInstruction::Notify())}});
+    std::ostringstream rawControlPerformance;
+    print_runtime_performance(
+        rawControlProgram, 16, rawControlPerformance);
+    require_contains(rawControlPerformance.str(),
+        "runtime perf resource=C2C.DMA cycles=16 active_queues=0/2 issued=0");
 
     std::cout << "schedule_trace_weight_page_test passed\n";
     return 0;

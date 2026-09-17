@@ -10,6 +10,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AsmState.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -39,6 +40,8 @@ struct Args {
         ftlpu::compiler::FfnScheduleStrategy::Tail};
     ftlpu::compiler::AttentionScheduleStrategy attention_schedule{
         ftlpu::compiler::AttentionScheduleStrategy::Tail};
+    bool projection_rope_overlap_enabled{false};
+    bool projection_rope_overlap_specified{false};
     ftlpu::compiler::target::MxmExecutionPolicy mxm_execution_policy{
         ftlpu::compiler::target::MxmExecutionPolicy::Auto};
     std::int64_t weight_bank{-1};
@@ -46,7 +49,7 @@ struct Args {
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
         ftlpu::compiler::target::IcuCompressionMode::Macro};
-    bool mem_slice_program{true};
+    bool mem_slice_program{false};
 };
 
 Args parse_args(int argc, char** argv)
@@ -83,6 +86,17 @@ Args parse_args(int argc, char** argv)
             else
                 throw std::runtime_error(
                     "unknown Attention schedule strategy: " + strategy);
+        }
+        else if (arg == "--projection-rope-overlap") {
+            args.projection_rope_overlap_specified = true;
+            const std::string value = next();
+            if (value == "on")
+                args.projection_rope_overlap_enabled = true;
+            else if (value == "off")
+                args.projection_rope_overlap_enabled = false;
+            else
+                throw std::runtime_error(
+                    "unknown projection-RoPE overlap setting: " + value);
         }
         else if (arg == "--mxm-execution") {
             const std::string policy = next();
@@ -133,6 +147,7 @@ Args parse_args(int argc, char** argv)
                                  "ftlpu-compress-schedule|ftlpu-verify-schedule] "
                                  "[--ffn-schedule tail|fused] "
                                  "[--attention-schedule tail|fused] "
+                                 "[--projection-rope-overlap on|off] "
                                  "[--mxm-execution auto|vector|legacy] "
                                  "[--icu-compression none|control|macro] "
                                  "[--mem-slice-program on|off] "
@@ -165,6 +180,16 @@ try {
 
     auto module = mlir::parseSourceFile<mlir::ModuleOp>(args.input.string(), &context);
     if (!module) return 1;
+    const auto inheritedProjectionRopeOverlap =
+        (*module)->getAttrOfType<mlir::BoolAttr>(
+            "ftlpu.projection_rope_overlap");
+    const bool projectionRopeOverlapEnabled =
+        args.projection_rope_overlap_specified
+            ? args.projection_rope_overlap_enabled
+            : (inheritedProjectionRopeOverlap &&
+               inheritedProjectionRopeOverlap.getValue());
+    (*module)->setAttr("ftlpu.projection_rope_overlap",
+        mlir::BoolAttr::get(&context, projectionRopeOverlapEnabled));
     ftlpu::compiler::target::LPUTargetModel target;
     if (!args.target_config.empty()) {
         std::ifstream file(args.target_config, std::ios::binary);
@@ -199,16 +224,31 @@ try {
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::mxm_execution_policy_name(
                 args.mxm_execution_policy)));
+    const bool producesCommands =
+        args.pipeline == "ftlpu-stablehlo-to-commands"
+        || args.pipeline == "ftlpu-schedule-to-commands"
+        || args.pipeline == "ftlpu-verified-schedule-to-commands";
+    const bool producesDirectSchedule =
+        args.pipeline == "ftlpu-stablehlo-to-schedule"
+        || args.pipeline == "ftlpu-stream-to-uncompressed-schedule"
+        || args.pipeline == "ftlpu-stream-to-schedule";
     (*module)->setAttr("ftlpu.icu_compression",
         mlir::StringAttr::get(&context,
-            ftlpu::compiler::target::icu_compression_mode_name(
-                args.icu_compression)));
+            producesCommands || producesDirectSchedule ? "none"
+                : ftlpu::compiler::target::icu_compression_mode_name(
+                    args.icu_compression)));
     (*module)->setAttr("ftlpu.mem_slice_program",
-        mlir::BoolAttr::get(&context, args.mem_slice_program));
+        mlir::BoolAttr::get(&context,
+            producesCommands || producesDirectSchedule
+                ? false : args.mem_slice_program));
+    if (producesCommands || producesDirectSchedule)
+        (*module)->setAttr("ftlpu.command_lowering",
+            mlir::StringAttr::get(&context, "direct"));
     // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,
-            args.icu_compression
+            !producesCommands && !producesDirectSchedule
+                && args.icu_compression
                 == ftlpu::compiler::target::IcuCompressionMode::Macro));
 
     mlir::PassManager pass_manager(&context);
@@ -257,7 +297,8 @@ try {
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stream_to_schedule_pass(
                 args.ffn_schedule, args.attention_schedule,
-                args.pass_timing));
+                args.pass_timing,
+                projectionRopeOverlapEnabled));
     if (args.weight_bank >= 0
         && (args.pipeline == "ftlpu-stablehlo-to-schedule"
             || args.pipeline == "ftlpu-stablehlo-to-commands"
@@ -269,13 +310,10 @@ try {
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_assign_weight_bank_pass(
                 args.weight_bank));
-    if (args.icu_compression
+    if (!producesCommands && !producesDirectSchedule && args.icu_compression
             != ftlpu::compiler::target::IcuCompressionMode::None
-        && (args.pipeline == "ftlpu-stablehlo-to-schedule"
-        || args.pipeline == "ftlpu-stablehlo-to-commands"
-        || args.pipeline == "ftlpu-stream-to-compressed-schedule"
-        || args.pipeline == "ftlpu-schedule-to-commands"
-        || args.pipeline == "ftlpu-compress-schedule"))
+        && (args.pipeline == "ftlpu-stream-to-compressed-schedule"
+            || args.pipeline == "ftlpu-compress-schedule"))
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_compress_schedule_pass());
     if (args.pipeline == "ftlpu-stablehlo-to-schedule"

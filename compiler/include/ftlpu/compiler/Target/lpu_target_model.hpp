@@ -138,6 +138,8 @@ struct IcuMemoryGeometry {
     int64_t sxm_instruction_bits = hw::kIcuSxmInstructionBits;
     int64_t sxm_imem_depth = hw::kIcuSxmImemDepth;
     int64_t macro_encoding_version = 1;
+    // One queue-local loop state is shared by compatibility macro and raw
+    // packet decoding; neither representation may require interleaving.
     int64_t mem_macro_contexts = hw::kIcuMemMacroContextDepth;
     int64_t mxm_macro_contexts = hw::kIcuMxmMacroContextDepth;
     int64_t mem_macro_context_bits = hw::kIcuMemMacroContextBits;

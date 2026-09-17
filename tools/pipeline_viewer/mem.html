@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FTLPU MEM Cycle Viewer</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="mem_style.css">
+</head>
+<body>
+  <main class="app-shell mem-app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark mem-mark" aria-hidden="true"></span>
+        <div>
+          <h1>FTLPU MEM Cycle Viewer</h1>
+          <p id="traceSummary">内置示例 · cycle-accurate MEM trace</p>
+        </div>
+      </div>
+      <div class="toolbar mem-toolbar" role="toolbar" aria-label="MEM trace controls">
+        <label class="file-button">
+          <input id="fileInput" type="file" accept=".csv,text/csv">
+          <span aria-hidden="true">↥</span><span>打开 MEM CSV</span>
+        </label>
+        <button id="sampleButton" type="button">示例</button>
+        <button id="fitButton" type="button">适应</button>
+        <button id="zoomInButton" class="icon-button" type="button" title="放大">＋</button>
+        <button id="zoomOutButton" class="icon-button" type="button" title="缩小">−</button>
+        <a class="viewer-link" href="index.html">总流水 Viewer</a>
+      </div>
+    </header>
+
+    <section class="mem-controls">
+      <label>半球
+        <select id="hemisphereFilter">
+          <option value="ALL">E + W</option><option value="E">East</option><option value="W">West</option>
+        </select>
+      </label>
+      <label>Slice
+        <select id="sliceFilter"><option value="ALL">全部</option></select>
+      </label>
+      <label>Bank
+        <select id="bankFilter"><option value="ALL">全部</option></select>
+      </label>
+      <label>端口
+        <select id="portFilter"><option value="ALL">Read + Write</option><option value="read">Read</option><option value="write">Write</option></select>
+      </label>
+      <label>阶段
+        <select id="stageFilter"><option value="ALL">全部</option><option value="icu">ICU</option><option value="pipeline">Tile pipeline</option><option value="sram">SRAM</option></select>
+      </label>
+      <label class="search-control mem-search"><span>⌕</span><input id="searchInput" type="search" placeholder="opcode / address / stream / action"></label>
+      <label class="check-control"><input id="allPortsToggle" type="checkbox"> 显示空闲物理端口</label>
+    </section>
+
+    <section class="play-strip">
+      <button id="firstButton" type="button" title="第一周期">|‹</button>
+      <button id="prevButton" type="button" title="上一周期">‹</button>
+      <button id="playButton" class="play-button" type="button" title="播放">▶</button>
+      <button id="nextButton" type="button" title="下一周期">›</button>
+      <button id="lastButton" type="button" title="最后周期">›|</button>
+      <label>Cycle <input id="cycleInput" type="number" min="0" value="0"></label>
+      <label>速度
+        <select id="speedSelect"><option value="1">1×</option><option value="4">4×</option><option value="16">16×</option><option value="64">64×</option></select>
+      </label>
+      <span class="play-spacer"></span>
+      <span><b>窗口</b> <output id="viewportReadout">0 – 16</output></span>
+      <span><b>事件</b> <output id="eventReadout">0</output></span>
+      <span><b>端口</b> <output id="portReadout">0</output></span>
+    </section>
+
+    <section class="mem-workspace">
+      <div class="mem-wave-panel">
+        <div class="mem-wave-header">
+          <div class="resource-heading">PHYSICAL MEM PORT</div>
+          <canvas id="rulerCanvas" aria-label="Cycle ruler"></canvas>
+        </div>
+        <div class="mem-wave-body">
+          <div id="resourceLabels" class="resource-labels mem-resource-labels"></div>
+          <div id="waveScroller" class="mem-wave-scroller">
+            <div id="waveTrack" class="mem-wave-track">
+              <canvas id="waveCanvas" tabindex="0" aria-label="MEM cycle timeline"></canvas>
+            </div>
+            <div id="dropOverlay" class="drop-overlay">拖入 MEM CSV</div>
+          </div>
+        </div>
+        <div class="mem-stage-legend">
+          <span><i class="swatch icu-issue"></i>ICU issue</span>
+          <span><i class="swatch icu-wait"></i>ICU wait / gated</span>
+          <span><i class="swatch tile-run"></i>Tile pipeline</span>
+          <span><i class="swatch sram-read"></i>SRAM → SR</span>
+          <span><i class="swatch sram-write"></i>SR → SRAM commit</span>
+          <span class="gesture-help">滚轮上下滚动 · Ctrl+滚轮缩放 · Shift+滚轮平移 · 拖动平移</span>
+        </div>
+      </div>
+
+      <aside class="mem-inspector">
+        <section>
+          <h2>Cycle <output id="inspectorCycle">0</output></h2>
+          <p id="cycleSummary">该周期没有 MEM 行为，所有显示端口均为空闲。</p>
+          <div class="cycle-table-wrap">
+            <table class="cycle-table">
+              <thead><tr><th>端口</th><th>阶段</th><th>行为</th><th>Tile</th><th>地址 / Stream</th></tr></thead>
+              <tbody id="cycleTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="event-detail">
+          <h3>选中事件</h3>
+          <dl id="eventDetail"><dt>状态</dt><dd>单击时间线中的事件</dd></dl>
+        </section>
+      </aside>
+    </section>
+
+    <footer class="footer"><span id="fileName">built-in.mem.csv</span><span id="interactionState">Ready</span></footer>
+  </main>
+  <script src="mem_viewer.js"></script>
+</body>
+</html>

@@ -3,6 +3,7 @@
 #include "ftlpu/core/bf16.hpp"
 #include "ftlpu/core/fp16.hpp"
 #include "ftlpu/c2c/dma_instruction.hpp"
+#include "ftlpu/icu/fu_3d_codec.hpp"
 #include "ftlpu/icu/instruction.hpp"
 #include "ftlpu/icu/location.hpp"
 #include "ftlpu/mem/slice.hpp"
@@ -129,6 +130,81 @@ BinaryProgram parameterize_program(const ModelPackage &package,
       throw std::logic_error(
           "executable scale relocation references a missing command");
     QueueCommand &command = queue->commands[relocation.command_index];
+    if (is_fu_3d_raw_packet_header(command) &&
+        relocation.queue_kind == QueueKind::MxmDequant) {
+      constexpr std::size_t packetWords =
+          isa::EncodedMxmDequantIcu3DPacket::kWordCount;
+      if (relocation.command_index + packetWords > queue->commands.size())
+        throw std::logic_error(
+            "raw MXM DEQUANT_3D scale relocation references a truncated packet");
+      isa::EncodedMxmDequantIcu3DPacket packet{};
+      for (std::size_t word = 0; word < packetWords; ++word) {
+        const QueueCommand &source =
+            queue->commands[relocation.command_index + word];
+        if (source.instruction_kind != InstructionKind::MxmDequant ||
+            source.word_count !=
+                isa::EncodedMxmDequantIcu3DPacket::kLanesPerWord)
+          throw std::logic_error(
+              "raw MXM DEQUANT_3D scale relocation has an invalid word");
+        for (std::size_t lane = 0;
+             lane < isa::EncodedMxmDequantIcu3DPacket::kLanesPerWord; ++lane)
+          packet.words[word].lanes[lane] = source.words[lane];
+      }
+      auto instruction = isa::decode_mxm_dequant_icu_3d_instruction(packet);
+      instruction.instruction =
+          MxmDequantInstruction::Scale(tensor.scales[relocation.scale_index]);
+      packet = isa::encode_mxm_dequant_icu_3d_instruction(instruction);
+      for (std::size_t word = 0; word < packetWords; ++word) {
+        QueueCommand &target =
+            queue->commands[relocation.command_index + word];
+        target.command = packet.words[word].lanes[0];
+        for (std::size_t lane = 0;
+             lane < isa::EncodedMxmDequantIcu3DPacket::kLanesPerWord; ++lane)
+          target.words[lane] = packet.words[word].lanes[lane];
+      }
+      continue;
+    }
+    if (is_fu_3d_raw_packet_header(command) &&
+        relocation.queue_kind == QueueKind::Vxm) {
+      constexpr std::size_t packetWords =
+          isa::EncodedVxmIcuRun2DPacket::kWordCount;
+      if (relocation.command_index + packetWords > queue->commands.size())
+        throw std::logic_error(
+            "raw VXM RUN_2D scale relocation references a truncated packet");
+      isa::EncodedVxmIcuRun2DPacket packet{};
+      for (std::size_t word = 0; word < packetWords; ++word) {
+        const QueueCommand &source =
+            queue->commands[relocation.command_index + word];
+        if (source.instruction_kind != InstructionKind::Vxm ||
+            source.word_count != isa::EncodedVxmIcuRun2DPacket::kLanesPerWord)
+          throw std::logic_error(
+              "raw VXM RUN_2D scale relocation has an invalid word");
+        for (std::size_t lane = 0;
+             lane < isa::EncodedVxmIcuRun2DPacket::kLanesPerWord; ++lane)
+          packet.words[word].lanes[lane] = source.words[lane];
+      }
+      auto run = isa::decode_vxm_icu_run_2d_instruction(packet);
+      auto decoded = isa::decode_vxm_instruction(queue->index,
+                                                  run.instruction);
+      VxmLaneOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
+          ? decoded.instruction.lhs : decoded.instruction.rhs;
+      if (operand.kind != VxmLaneOperandKind::Immediate)
+        throw std::logic_error(
+            "raw VXM RUN_2D scale relocation target is not immediate");
+      operand = VxmLaneOperand::Imm(tensor.scales[relocation.scale_index]);
+      run.instruction = isa::encode_vxm_instruction(
+          queue->index, decoded.chain_depth, decoded.instruction);
+      packet = isa::encode_vxm_icu_run_2d_instruction(run);
+      for (std::size_t word = 0; word < packetWords; ++word) {
+        QueueCommand &target =
+            queue->commands[relocation.command_index + word];
+        target.command = packet.words[word].lanes[0];
+        for (std::size_t lane = 0;
+             lane < isa::EncodedVxmIcuRun2DPacket::kLanesPerWord; ++lane)
+          target.words[lane] = packet.words[word].lanes[lane];
+      }
+      continue;
+    }
     if (command.instruction_kind == InstructionKind::MxmDequant &&
         command.word_count == 1) {
       command.words[0] = static_cast<std::uint32_t>(
@@ -237,6 +313,66 @@ BinaryProgram parameterize_program(const ModelPackage &package,
         entry.instruction.address =
             relocate_address(entry.instruction.address);
       command = encode_mem_slice_program_command(sliceProgram);
+      continue;
+    }
+    if (relocation.queue_kind == QueueKind::Mem &&
+        is_mem_write_read_2d_raw_packet_header(command)) {
+      constexpr std::size_t packetWords =
+          isa::EncodedMemIcuWriteRead2DPacket::kWordCount;
+      if (relocation.command_index + packetWords > queue->commands.size())
+        throw std::logic_error(
+            "WRITE_READ_2D relocation references a truncated packet");
+      auto instruction = decode_mem_write_read_2d_raw_packet(
+          *queue, relocation.command_index);
+      instruction.base_address = relocate_address(instruction.base_address);
+      const auto packet =
+          isa::encode_mem_icu_write_read_2d_instruction(instruction);
+      for (std::size_t word = 0; word < packetWords; ++word) {
+        QueueCommand &target =
+            queue->commands[relocation.command_index + word];
+        target.command = packet.words[word].lanes[0];
+        target.word_count = static_cast<std::uint16_t>(
+            isa::EncodedMemIcuWriteRead2DPacket::kLanesPerWord);
+        for (std::size_t lane = 0;
+             lane < isa::EncodedMemIcuWriteRead2DPacket::kLanesPerWord;
+             ++lane)
+          target.words[lane] = packet.words[word].lanes[lane];
+      }
+      continue;
+    }
+    if (relocation.queue_kind == QueueKind::Mem &&
+        is_fu_3d_raw_packet_header(command)) {
+      constexpr std::size_t packetWords =
+          isa::EncodedMemIcu3DPacket::kWordCount;
+      if (relocation.command_index + packetWords > queue->commands.size())
+        throw std::logic_error(
+            "raw MEM 3-D relocation references a truncated packet");
+      isa::EncodedMemIcu3DPacket packet{};
+      for (std::size_t word = 0; word < packetWords; ++word) {
+        const QueueCommand &source =
+            queue->commands[relocation.command_index + word];
+        if (source.instruction_kind != InstructionKind::Mem ||
+            source.word_count != isa::EncodedMemIcu3DPacket::kLanesPerWord)
+          throw std::logic_error(
+              "raw MEM 3-D relocation target has an invalid physical word");
+        for (std::size_t lane = 0;
+             lane < isa::EncodedMemIcu3DPacket::kLanesPerWord; ++lane)
+          packet.words[word].lanes[lane] = source.words[lane];
+      }
+      auto instruction = isa::decode_mem_icu_3d_instruction(packet);
+      instruction.address.base_address =
+          relocate_address(instruction.address.base_address);
+      packet = isa::encode_mem_icu_3d_instruction(instruction);
+      for (std::size_t word = 0; word < packetWords; ++word) {
+        QueueCommand &target =
+            queue->commands[relocation.command_index + word];
+        target.command = packet.words[word].lanes[0];
+        target.word_count = static_cast<std::uint16_t>(
+            isa::EncodedMemIcu3DPacket::kLanesPerWord);
+        for (std::size_t lane = 0;
+             lane < isa::EncodedMemIcu3DPacket::kLanesPerWord; ++lane)
+          target.words[lane] = packet.words[word].lanes[lane];
+      }
       continue;
     }
     if (command.instruction_kind != InstructionKind::Mem ||
@@ -543,6 +679,26 @@ void ModelSession::enable_execution_trace(bool enabled) noexcept {
 void ModelSession::write_execution_trace_csv(
     const std::filesystem::path &path) const {
   runtime_.write_execution_trace_csv(path);
+}
+
+void ModelSession::enable_mem_execution_trace(bool enabled) noexcept {
+  mem_execution_trace_enabled_ = enabled;
+  execution_trace_has_segment_ = false;
+  execution_trace_cycle_cursor_ = 0;
+  runtime_.enable_mem_execution_trace(enabled);
+}
+
+void ModelSession::stream_mem_execution_trace_csv(
+    const std::filesystem::path &path) {
+  mem_execution_trace_enabled_ = true;
+  execution_trace_has_segment_ = false;
+  execution_trace_cycle_cursor_ = 0;
+  runtime_.stream_mem_execution_trace_csv(path);
+}
+
+void ModelSession::write_mem_execution_trace_csv(
+    const std::filesystem::path &path) const {
+  runtime_.write_mem_execution_trace_csv(path);
 }
 
 void ModelSession::configure_external_transport(
@@ -1121,7 +1277,11 @@ void ModelSession::prepare_executable_weight_lookahead(
       throw std::logic_error("next model weight page is unavailable");
     ExecutableWeightTransfer transfer;
     transfer.page = c2c_pages_[nextPage];
-    transfer.plan = model_page_plan(transfer.page, nextPage);
+    auto modelPagePlans = std::vector<WeightPrefetchPlan> {
+        model_page_plan(transfer.page, nextPage)};
+    schedule_weight_prefetches(program, modelPagePlans,
+                               effective_external_transport(program.hardware));
+    transfer.plan = std::move(modelPagePlans.front());
     const auto fabric = select_inter_invocation_c2c_fabric(
         program, safe_inter_invocation_prefetch_cycle(
                      program, currentPlans, transfer.plan));
@@ -1137,7 +1297,7 @@ void ModelSession::prepare_executable_weight_lookahead(
   lookahead_invocation_index_ = nextIndex;
 }
 
-void ModelSession::schedule_executable_weight_pages() {
+void ModelSession::schedule_executable_weight_pages(BinaryProgram &program) {
   if (executable_weight_transfers_.empty() &&
       lookahead_executable_weight_transfers_.empty() &&
       !lookahead_model_weight_transfer_)
@@ -1160,7 +1320,7 @@ void ModelSession::schedule_executable_weight_pages() {
   std::optional<std::size_t> debugStopCycle;
   if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
     debugStopCycle = static_cast<std::size_t>(std::stoull(stop));
-  weight_pager_->begin_schedule();
+  weight_pager_->begin_schedule(program);
   std::vector<std::size_t> launchOrder;
   launchOrder.reserve(executable_weight_transfers_.size());
   for (std::size_t transferIndex = 0;
@@ -1183,9 +1343,14 @@ void ModelSession::schedule_executable_weight_pages() {
     if (debugStopCycle && transfer.plan.ready_cycle > *debugStopCycle)
       continue;
     transfer.launch_event_tag = 0x10000u + transferIndex;
-    transfer.fence = weight_pager_->schedule(transfer.page,
+    transfer.fence = weight_pager_->schedule(program, transfer.page,
         static_cast<std::size_t>(transfer.plan.start_cycle),
+        static_cast<std::size_t>(transfer.plan.transfer_end_cycle),
+        static_cast<std::size_t>(transfer.plan.ready_cycle),
         transfer.launch_event_tag);
+    transfer.plan.start_cycle = transfer.fence.scheduled_start_cycle;
+    transfer.plan.transfer_end_cycle =
+        transfer.fence.scheduled_end_cycle;
     ++stats_.weight_page_prefetches;
     for (const C2cWeightSegment &segment : transfer.page.segments)
       stats_.weight_page_prefetch_bytes +=
@@ -1211,15 +1376,21 @@ void ModelSession::schedule_executable_weight_pages() {
         weight_pager_->earliest_schedule_cycle(transfer.page));
     transfer.plan.transfer_end_cycle = transfer.plan.start_cycle + duration;
     transfer.launch_event_tag = 0x20000u + index;
-    transfer.fence = weight_pager_->schedule(
-        transfer.page, static_cast<std::size_t>(transfer.plan.start_cycle),
+    transfer.fence = weight_pager_->schedule(program, transfer.page,
+        static_cast<std::size_t>(transfer.plan.start_cycle),
+        static_cast<std::size_t>(transfer.plan.transfer_end_cycle),
+        std::numeric_limits<std::size_t>::max(),
         transfer.launch_event_tag);
+    transfer.plan.start_cycle = transfer.fence.scheduled_start_cycle;
+    transfer.plan.transfer_end_cycle =
+        transfer.fence.scheduled_end_cycle;
     ++stats_.weight_page_prefetches;
     for (const C2cWeightSegment &segment : transfer.page.segments)
       stats_.weight_page_prefetch_bytes +=
           static_cast<std::size_t>(segment.vector_count) *
           hw::kPhysicalVectorBytes;
   }
+  weight_pager_->finalize_schedule(program);
   executable_clock_active_ = true;
 }
 
@@ -1521,6 +1692,7 @@ void ModelSession::load(ModelPackage package) {
   state_backing_.clear();
   stats_ = {};
   load_stats_ = {};
+  last_linked_program_.reset();
   executable_weight_transfers_.clear();
   lookahead_executable_weight_transfers_.clear();
   lookahead_model_weight_transfer_.reset();
@@ -1662,6 +1834,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     throw std::logic_error("no FTLPU model package is loaded");
   if (index >= package_.invocations.size())
     throw std::out_of_range("FTLPU model invocation index is out of range");
+  last_linked_program_.reset();
   const bool reportProgress = std::getenv("FTLPU_SESSION_PROGRESS") != nullptr;
   const auto report = [&](const char *phase) {
     if (reportProgress)
@@ -1678,7 +1851,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   report("model weight page ready");
   const std::size_t modelPageWaitCycles =
       stats_.weight_page_wait_cycles - pageWaitBefore;
-  const BinaryProgram program =
+  BinaryProgram program =
       parameterize_program(package_, invocation, invocation_plan,
                            materialize_model_executable(executable));
   report("program parameterized");
@@ -1760,9 +1933,18 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
       static_cast<std::int64_t>(statePageInCycles) +
       static_cast<std::int64_t>(inputTransferCycles) +
       static_cast<std::int64_t>(executablePreExecutionCycles);
-  if (execution_trace_enabled_)
+  if (execution_trace_enabled_ || mem_execution_trace_enabled_)
     runtime_.configure_execution_trace_segment(traceOrigin,
                                                execution_trace_has_segment_);
+  if (weight_pager_) {
+    prepare_executable_weight_lookahead(index, program);
+    schedule_executable_weight_pages(program);
+  }
+  // Keep the fully linked image available even when execution reports a
+  // datapath error.  Besides making failures diagnosable, this reflects the
+  // program that was actually handed to the runtime rather than the original
+  // executable before its C2C/MEM queues were linked.
+  last_linked_program_ = program;
   report("loading runtime program");
   runtime_.load(program);
   report("runtime program loaded");
@@ -1799,22 +1981,6 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
           localCursor + static_cast<std::int64_t>(inputTransferCycles),
           "C2C.HostInput", "invocation=" + std::to_string(index));
   }
-  if (!program.weight_page_uses.empty())
-    prepare_executable_weight_lookahead(index, program);
-  schedule_executable_weight_pages();
-  if (index + 1 < package_.invocations.size()) {
-    const auto nextPage = package_.invocations[index + 1].weight_page;
-    if (nextPage != 0xffffffffu && nextPage != invocation.weight_page &&
-        !lookahead_model_weight_transfer_) {
-      if (nextPage >= c2c_pages_.size())
-        throw std::logic_error("next model weight page is unavailable");
-      if (!program.weight_page_uses.empty() ||
-          weight_page_overlaps_program(c2c_pages_[nextPage], program))
-        ++stats_.weight_page_deferred_prefetches;
-      else
-        start_weight_page(nextPage);
-    }
-  }
   std::size_t executionCycles = program.max_cycle + drain_cycles;
   if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
     executionCycles =
@@ -1840,6 +2006,12 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   const std::size_t invocationPhysicalCycles = runtime_.physical_cycles();
   const std::size_t lookaheadBoundaryCycles =
       settle_executable_weight_lookahead();
+  if (c2c_system_ != nullptr)
+    for (std::size_t queue = 0;
+         queue < InstructionControlUnit::kMemQueues; ++queue)
+      stats_.weight_page_synchronized_writes +=
+          c2c_system_->chip().icu().mem_iq(queue)
+              .synchronized_issued_count();
   if (execution_trace_enabled_)
     runtime_.record_execution_trace_interval(
         0, static_cast<std::int64_t>(invocationPhysicalCycles),
@@ -1977,6 +2149,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
       static_cast<std::int64_t>(outputTransferCycles);
   execution_trace_has_segment_ = true;
   report("complete");
+  last_linked_program_ = std::move(program);
 }
 
 void ModelSession::run_embedding_lookups() {
@@ -2152,6 +2325,18 @@ ModelSession::executable_weight_prefetch_plans() const {
   for (const ExecutableWeightTransfer &transfer : executable_weight_transfers_)
     plans.push_back(transfer.plan);
   return plans;
+}
+
+const BinaryProgram &ModelSession::last_linked_program() const {
+  if (!last_linked_program_)
+    throw std::logic_error(
+        "no successfully linked FTLPU invocation is available");
+  return *last_linked_program_;
+}
+
+void ModelSession::write_last_linked_program(
+    const std::filesystem::path &path) const {
+  write_binary_program(last_linked_program(), path);
 }
 
 } // namespace ftlpu::software::runtime

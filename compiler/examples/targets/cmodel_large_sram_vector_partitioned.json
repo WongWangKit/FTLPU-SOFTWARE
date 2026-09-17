@@ -35,8 +35,8 @@
     "sxm_instruction_bits": 96,
     "sxm_imem_depth": 2048,
     "macro_encoding_version": 1,
-    "mem_macro_contexts": 32,
-    "mxm_macro_contexts": 136,
+    "mem_macro_contexts": 1,
+    "mxm_macro_contexts": 1,
     "mem_macro_context_bits": 160,
     "mxm_macro_context_bits": 160
   }

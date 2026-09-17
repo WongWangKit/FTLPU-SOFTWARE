@@ -3,6 +3,11 @@
 #include "FfnEmitterUtils.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <map>
+#include <tuple>
+#include <vector>
 
 namespace ftlpu::compiler::schedule::ffn_detail {
 
@@ -32,6 +37,157 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
         context.projection_timeline.projection_order;
     const bool serializedProjections = singleMxm
         && projectionOrder != FfnProjectionOrder::Interleaved;
+    const int64_t reductionBlockCount = k / tile;
+    const auto activationType = llvm::cast<mlir::RankedTensorType>(
+        ffn.getActivation().getType());
+    const llvm::StringRef dataFormat =
+        activationType.getElementType().isBF16() ? "bf16" : "fp16";
+    const int64_t pairCount = context.projection_timeline.pair_count;
+    const int64_t totalProjectionBlocks = pairCount * reductionBlockCount;
+
+    // Local-dequant projection planning has exactly one non-affine timing
+    // boundary: the first reuse of the finite MXM weight-buffer set.  The
+    // planner delays that load by the result-window hazard, after which all
+    // remaining block starts have the steady projection-block interval.
+    // Record that known hardware boundary directly instead of scanning a
+    // list of per-reduction operations and rediscovering affine runs.
+    int64_t dequantSplitBlock = -1;
+    const int64_t firstBufferReuse =
+        std::min(totalProjectionBlocks, throughput.mxm_weight_buffers);
+    if (context.local_weight_dequant && firstBufferReuse > 0
+        && firstBufferReuse < totalProjectionBlocks) {
+        const auto& before = context.projection_timeline.blocks[
+            firstBufferReuse - 1];
+        const auto& after = context.projection_timeline.blocks[
+            firstBufferReuse];
+        if (after.dequant_start - before.dequant_start
+            != context.projection_timeline.projection_block_interval)
+            dequantSplitBlock = firstBufferReuse;
+    }
+    int64_t weightStartupDelay = 0;
+    if (dequantSplitBlock > 0
+        && dequantSplitBlock < reductionBlockCount) {
+        const int64_t blockInterval =
+            context.projection_timeline.projection_block_interval;
+        const int64_t delayedStart =
+            context.projection_timeline.blocks[dequantSplitBlock]
+                .dequant_start;
+        const int64_t nominalStart =
+            context.projection_timeline.blocks.front().dequant_start
+                + dequantSplitBlock * blockInterval;
+        bool regularPrelude = true;
+        for (int64_t index = 1; index < dequantSplitBlock; ++index)
+            regularPrelude &=
+                context.projection_timeline.blocks[index].dequant_start
+                    - context.projection_timeline.blocks[index - 1]
+                          .dequant_start
+                == blockInterval;
+        if (regularPrelude
+            && delayedStart - nominalStart
+                == target.mxm_first_result_latency()) {
+            // Loading the short prelude at the steady-state offset keeps
+            // every later FU issue unchanged.  Its first pair can then join
+            // the following pairs in one blocked-address MEM 3D domain.
+            weightStartupDelay = delayedStart - nominalStart;
+            dequantSplitBlock = -1;
+        }
+    }
+
+    struct ReductionDomain {
+        bool leader{false};
+        int64_t count{0};
+        int64_t interval{1};
+    };
+    const auto weightReductionDomain =
+        [&](int64_t pair, int64_t reduction) {
+            const int64_t flatBegin = pair * reductionBlockCount;
+            const int64_t flatEnd = flatBegin + reductionBlockCount;
+            int64_t first = 0;
+            int64_t end = reductionBlockCount;
+            if (dequantSplitBlock > flatBegin
+                && dequantSplitBlock < flatEnd) {
+                const int64_t split = dequantSplitBlock - flatBegin;
+                if (reduction < split)
+                    end = split;
+                else
+                    first = split;
+            }
+            if (reduction != first) return ReductionDomain {};
+            const int64_t count = end - first;
+            const int64_t index = flatBegin + first;
+            const int64_t interval = count > 1
+                ? context.projection_timeline.blocks[index + 1]
+                        .dequant_start
+                    - context.projection_timeline.blocks[index]
+                          .dequant_start
+                : 1;
+            return ReductionDomain {true, count, interval};
+        };
+
+    // Pair is the outer weight-address dimension.  Page and slice-group
+    // boundaries change the physical bank/slice mapping and therefore end a
+    // MEM command body.  Within one such resident region, the hardware
+    // blocked-outer address generator represents the alternating two-slot
+    // one-MXM layout without splitting the pair domain.
+    const auto makeWeightPairDomains = [&](mlir::DictionaryAttr placement) {
+        std::vector<int64_t> result(
+            static_cast<std::size_t>(pairCount), 0);
+        const bool paged = [&] {
+            const auto value = placement.getAs<mlir::BoolAttr>(
+                "paged_weight");
+            return value && value.getValue();
+        }();
+        const int64_t pairsPerPage = paged
+            ? placement.getAs<mlir::IntegerAttr>("page_granularity")
+                  .getInt()
+            : pairCount;
+        const int64_t pairsPerSliceGroup = paged
+            ? placement
+                  .getAs<mlir::IntegerAttr>(
+                      "page_items_per_slice_group")
+                  .getInt()
+            : pairCount;
+        for (int64_t pair = 0; pair < pairCount;) {
+            const int64_t flatBegin = pair * reductionBlockCount;
+            const int64_t flatEnd = flatBegin + reductionBlockCount;
+            const bool splitInsidePair = dequantSplitBlock > flatBegin
+                && dequantSplitBlock < flatEnd;
+            int64_t count = 1;
+            if (!splitInsidePair) {
+                const int64_t pairInPage = paged
+                    ? pair % pairsPerPage : pair;
+                const int64_t pageRemaining = paged
+                    ? pairsPerPage - pairInPage : pairCount - pair;
+                const int64_t sliceGroupRemaining = paged
+                    ? pairsPerSliceGroup
+                        - pairInPage % pairsPerSliceGroup
+                    : pairCount - pair;
+                count = std::min({pairCount - pair, pageRemaining,
+                    sliceGroupRemaining});
+                // A split exactly at a pair boundary changes the temporal
+                // stride and cannot be crossed by one descriptor.
+                if (dequantSplitBlock > flatBegin
+                    && dequantSplitBlock < (pair + count)
+                        * reductionBlockCount)
+                    count = std::max<int64_t>(1,
+                        dequantSplitBlock / reductionBlockCount - pair);
+            }
+            result[static_cast<std::size_t>(pair)] = count;
+            pair += count;
+        }
+        return result;
+    };
+    const std::array<std::vector<int64_t>, 2> weightPairDomains = {
+        makeWeightPairDomains(context.gate_route.getPlacement()),
+        makeWeightPairDomains(context.up_route.getPlacement()),
+    };
+
+    // The active Qwen path uses local dequant, whose projection planner emits
+    // one stable stream segment per hemisphere and tile.  Its compute launch
+    // domain is therefore closed form even when a weight-load hazard splits
+    // the corresponding MEM domain.
+    const bool closedProjectionDomains = context.local_weight_dequant
+        && reductionBlockCount > 0 && pairCount > 0;
     const auto computeProjectionOffset = [&](int64_t projection) {
         if (!singleMxm) return int64_t{0};
         if (!serializedProjections)
@@ -45,6 +201,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
     };
 
     FfnProjectionEmission emission;
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, mlir::Value>
+        tempDomainOutputs;
     rewriter.setInsertionPoint(ffn.getOperation());
     for (const FfnProjectionBlockSchedule& block :
         context.projection_timeline.blocks) {
@@ -73,6 +231,11 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                       * throughput.mxms_per_hemisphere
                                   + localMxm)
                                 * weightLoadCycles);
+                const bool shiftedFirstWeight =
+                    weightStartupDelay > 0 && pair == 0
+                    && reduction == 0;
+                const int64_t weightStart = start
+                    + (shiftedFirstWeight ? weightStartupDelay : 0);
                 const auto placement = cooked.getPlacement();
                 const int64_t bindingBase = placement
                                                 .getAs<mlir::IntegerAttr>(
@@ -171,6 +334,56 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 const auto dequantizedType =
                     mlir::RankedTensorType::get(rawType.getShape(),
                         activationType.getElementType());
+                const ReductionDomain reductionDomain =
+                    weightReductionDomain(pair, reduction);
+                if (!reductionDomain.leader) continue;
+                const int64_t weightPairCount =
+                    reductionDomain.count == reductionBlockCount
+                    ? weightPairDomains[static_cast<std::size_t>(projection)]
+                          [static_cast<std::size_t>(pair)]
+                    : 1;
+                if (weightPairCount == 0) continue;
+                FfnLoopDomain3D weightDomain;
+                weightDomain.wave_count = reductionDomain.count;
+                weightDomain.wave_interval = reductionDomain.interval;
+                weightDomain.wave_address_stride =
+                    (singleMxm ? 2 : 1) * weightLoadCycles;
+                weightDomain.group_count = weightPairCount;
+                if (weightPairCount > 1) {
+                    const auto& nextPairBlock =
+                        context.projection_timeline.blocks[
+                            (pair + 1) * reductionBlockCount + reduction];
+                    weightDomain.group_interval =
+                        nextPairBlock.dequant_start - dequantStart
+                            - (shiftedFirstWeight
+                                  ? weightStartupDelay : 0);
+                    if (singleMxm) {
+                        const int64_t addressPair = page >= 0
+                            ? pair
+                                % placement
+                                      .getAs<mlir::IntegerAttr>(
+                                          "page_granularity")
+                                      .getInt()
+                            : pair;
+                        // Logical pair rows use [slot0, slot1] inside each
+                        // reduction-sized physical group.  The first domain
+                        // may start on either slot, so encode its local
+                        // parity in the within-group stride while retaining
+                        // the regular two-pair carry stride.
+                        weightDomain.blocked_outer_address = true;
+                        weightDomain.outer_group_size = 2;
+                        weightDomain.outer_inner_stride =
+                            (addressPair & 1)
+                            ? (2 * reductionBlockCount - 1)
+                                * weightLoadCycles
+                            : weightLoadCycles;
+                        weightDomain.outer_group_stride =
+                            2 * reductionBlockCount * weightLoadCycles;
+                    } else {
+                        weightDomain.group_address_stride =
+                            reductionBlockCount * weightLoadCycles;
+                    }
+                }
                 emitFfnWeightTile(rewriter, ffn.getLoc(), raw,
                     dequantizedType,
                     selectedWeightSlices,
@@ -178,13 +391,15 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     projection == 0
                         ? ffn.getGateScale().convertToFloat()
                         : ffn.getUpScale().convertToFloat(),
-                    start, base, hemisphere, localMxm,
+                    weightStart, base, hemisphere, localMxm,
                     hemisphere * throughput.mxms_per_hemisphere
                         + localMxm,
                     singleMxm && !serializedProjections
                         ? projection : weightBuffer,
                     context.local_weight_dequant, bank, page,
-                    logicalBase);
+                    logicalBase, {}, weightDomain,
+                    reductionDomain.count * weightPairCount > 1
+                        ? "toggle_dim2" : "fixed");
             }
         }
 
@@ -203,183 +418,293 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             ? 8 + hemisphere * 8
                             : 0)
                     : 0;
+                const int64_t terminalStreamBase =
+                    context.strategy == FfnScheduleStrategy::Fused
+                    ? 8 + hemisphere * 8 : 0;
+                const bool computeCanCrossPairs =
+                    closedProjectionDomains
+                    && (reductionBlockCount % 2 == 0
+                        || reductionBlockCount == 1);
+                const int64_t computeDomainPairCount =
+                    computeCanCrossPairs ? pairCount : 1;
+                const bool closedComputeLeader =
+                    closedProjectionDomains && reduction == 0
+                    && (!computeCanCrossPairs || pair == 0);
 
-                MxmComputeOp gateCompute;
-                MxmComputeOp upCompute;
+                mlir::Value gateAccumulatorValue;
+                mlir::Value upAccumulatorValue;
                 int64_t rowOffset = 0;
                 for (const FfnStreamSegment& segment :
                     tileSchedule.hemisphere_segments[
                         static_cast<std::size_t>(hemisphere)]) {
                     const int64_t segmentCycle =
                         computeCycle + rowOffset;
+                    const int64_t gateCycle = segmentCycle
+                        + computeProjectionOffset(0);
+                    const int64_t upCycle = segmentCycle
+                        + computeProjectionOffset(1);
+                    const int64_t reductionInterval =
+                        reductionBlockCount > 1
+                        ? context.projection_timeline.blocks[
+                              pair * reductionBlockCount + 1]
+                                  .tiles[mTile]
+                                  .compute_cycle
+                            - context.projection_timeline.blocks[
+                                  pair * reductionBlockCount]
+                                      .tiles[mTile]
+                                      .compute_cycle
+                        : 1;
+                    const int64_t pairInterval = pairCount > 1
+                        ? context.projection_timeline.blocks[
+                              reductionBlockCount]
+                                  .tiles[mTile]
+                                  .compute_cycle
+                            - context.projection_timeline.blocks.front()
+                                  .tiles[mTile]
+                                  .compute_cycle
+                        : reductionBlockCount
+                            * context.projection_timeline
+                                  .projection_block_interval;
                     const auto emitActivation =
-                        [&](int64_t consumerCycle) {
-                            mlir::Value activationValue;
+                        [&](int64_t consumerCycle,
+                            FfnLoopDomain3D projectionDomain) {
+                            mlir::Value activationValue =
+                                context.activation_route.getInput();
                             if (context.activation_distributed16) {
                                 const int64_t base =
                                     context.activation_route.getPlacement()
                                         .getAs<mlir::IntegerAttr>("base_row")
                                         .getInt();
                                 const int64_t reductionBlocks = k / tile;
-                                for (int64_t localRow = 0;
-                                     localRow < segment.rows; ++localRow) {
+                                const int64_t blockRows =
+                                    throughput.mxm_block_rows;
+                                const int64_t segmentTokenBase =
+                                    mTile * tile + rowOffset;
+                                for (int64_t tokenLane = 0;
+                                     tokenLane < blockRows; ++tokenLane) {
+                                    const int64_t firstOffset =
+                                        (tokenLane
+                                            - segmentTokenBase % blockRows
+                                            + blockRows)
+                                        % blockRows;
+                                    if (firstOffset >= segment.rows) continue;
+                                    const int64_t occurrenceCount = 1
+                                        + (segment.rows - 1 - firstOffset)
+                                            / blockRows;
                                     const int64_t token =
-                                        mTile * tile + rowOffset + localRow;
+                                        segmentTokenBase + firstOffset;
                                     const int64_t tokenBlock = token / tile;
-                                    const int64_t tokenWithinBlock =
-                                        token % tile;
+                                    const int64_t tokenWithinBlock = token % tile;
                                     const int64_t tokenWave =
-                                        tokenWithinBlock / 8;
-                                    const int64_t tokenLane =
-                                        tokenWithinBlock % 8;
+                                        tokenWithinBlock / blockRows;
                                     const int64_t row = base
                                         + (tokenBlock * reductionBlocks
                                               + reduction)
-                                            * 4
+                                            * throughput.tile_rows
                                         + tokenWave;
                                     for (int64_t byte = 0; byte < 2;
                                          ++byte) {
                                         const int64_t slice =
                                             context.activation_slices[
                                                 2 * tokenLane + byte];
-                                        activationValue = context
-                                            .emitSliceRead(
-                                                context.activation_route
-                                                    .getInput(),
-                                                context.activation_route,
-                                                consumerCycle + localRow
-                                                    - context.eastMxmLatency(
-                                                        slice),
-                                                slice, row, 1, 1,
-                                                segment.stream_base + byte,
-                                                "east", "activation",
-                                                context.hemisphereName(
-                                                    hemisphere))
-                                            .getOutput();
+                                        FfnLoopDomain3D domain =
+                                            projectionDomain;
+                                        emitFfnMemTransfer3D(rewriter,
+                                            ffn.getLoc(),
+                                            consumerCycle + firstOffset
+                                                - context.eastMxmLatency(slice),
+                                            hemisphere, slice, "read", row,
+                                            segment.stream_base + byte,
+                                            occurrenceCount, blockRows, 1,
+                                            context.activation_route
+                                                .getPlacement()
+                                                .getAs<mlir::IntegerAttr>(
+                                                    "bank")
+                                                .getInt(),
+                                            domain);
                                     }
                                 }
                             } else {
                                 for (int64_t byte = 0; byte < 2; ++byte) {
-                                    activationValue = context.emitSliceRead(
-                                        context.activation_route.getInput(),
-                                        context.activation_route,
+                                    const int64_t slice =
+                                        context.activation_slices[byte];
+                                    emitFfnMemTransfer3D(rewriter,
+                                        ffn.getLoc(),
                                         consumerCycle
                                             - context.activation_latency,
-                                        context.activation_slices[byte],
+                                        hemisphere, slice, "read",
                                         activationBase + rowOffset,
-                                        segment.rows, 1,
                                         segment.stream_base + byte,
-                                        "east", "activation",
-                                        context.hemisphereName(hemisphere))
-                                        .getOutput();
+                                        segment.rows, 1, 1,
+                                        context.activation_route
+                                            .getPlacement()
+                                            .getAs<mlir::IntegerAttr>("bank")
+                                            .getInt(),
+                                        projectionDomain);
                                 }
                             }
                             return activationValue;
                         };
-                    const int64_t gateCycle = segmentCycle
-                        + computeProjectionOffset(0);
-                    const int64_t upCycle = segmentCycle
-                        + computeProjectionOffset(1);
-                    mlir::Value gateActivation = emitActivation(gateCycle);
-                    mlir::Value upActivation = singleMxm
-                        ? emitActivation(upCycle) : gateActivation;
-                    gateCompute =
-                        rewriter.create<MxmComputeOp>(ffn.getLoc(),
-                            gateActivation, ffn.getGateWeight(),
-                            context.projection_type, gateCycle,
-                            segment.rows,
-                            gateCycle
-                                + target.mxm_first_result_latency(),
-                            target.mxm_result_window_cycles(
-                                segment.rows),
-                            segment.stream_base, resultStreamBase,
+                    mlir::Value gateActivation =
+                        context.activation_route.getInput();
+                    mlir::Value upActivation = gateActivation;
+                    if (closedProjectionDomains) {
+                        if (pair == 0 && reduction == 0) {
+                            FfnLoopDomain3D activationDomain;
+                            activationDomain.wave_count =
+                                reductionBlockCount;
+                            activationDomain.wave_interval =
+                                reductionInterval;
+                            activationDomain.wave_address_stride =
+                                context.activation_distributed16
+                                ? throughput.tile_rows : m;
+                            activationDomain.group_count = pairCount;
+                            activationDomain.group_interval = pairInterval;
+                            const int64_t projectionSpan =
+                                std::abs(upCycle - gateCycle);
+                            const bool contiguousSerializedProjections =
+                                serializedProjections
+                                && projectionSpan
+                                    == pairCount * pairInterval;
+                            if (contiguousSerializedProjections) {
+                                activationDomain.group_count = 2 * pairCount;
+                                gateActivation = emitActivation(
+                                    std::min(gateCycle, upCycle),
+                                    activationDomain);
+                                upActivation = gateActivation;
+                            } else {
+                                gateActivation = emitActivation(
+                                    gateCycle, activationDomain);
+                                if (singleMxm)
+                                    upActivation = emitActivation(
+                                        upCycle, activationDomain);
+                            }
+                        }
+                    } else {
+                        const int64_t activationReductionCount =
+                            mTileCount == 1 && reduction == 0
+                            ? reductionBlockCount
+                            : mTileCount == 1 ? 0 : 1;
+                        if (activationReductionCount > 0) {
+                            FfnLoopDomain3D activationDomain;
+                            const bool groupedProjections = singleMxm
+                                && !serializedProjections
+                                && upCycle > gateCycle;
+                            if (groupedProjections) {
+                                activationDomain.wave_count = 2;
+                                activationDomain.wave_interval =
+                                    upCycle - gateCycle;
+                            }
+                            activationDomain.group_count =
+                                activationReductionCount;
+                            activationDomain.group_interval =
+                                reductionInterval;
+                            // In the legacy layout reduction is the outer
+                            // counter, so its address increment belongs to
+                            // dimension 2 rather than the direct domain's
+                            // reduction dimension 1.
+                            activationDomain.group_address_stride =
+                                context.activation_distributed16
+                                ? throughput.tile_rows : m;
+                            activationDomain.wave_address_stride = 0;
+                            gateActivation = emitActivation(
+                                gateCycle, activationDomain);
+                            if (singleMxm && !groupedProjections)
+                                upActivation = emitActivation(
+                                    upCycle, activationDomain);
+                        }
+                    }
+                    if (closedComputeLeader) {
+                        FfnMxmDomain3D domain;
+                        domain.repeat_count = segment.rows;
+                        domain.repeat_accumulator_address_stride = 0;
+                        domain.wave_count = reductionBlockCount;
+                        domain.wave_interval = reductionInterval;
+                        domain.group_count = computeDomainPairCount;
+                        domain.group_interval = pairInterval;
+                        if (throughput.mxm_weight_buffers == 2) {
+                            if (reductionBlockCount > 1)
+                                domain.weight_buffer_mode = "toggle_dim1";
+                            else if (computeDomainPairCount > 1)
+                                domain.weight_buffer_mode = "toggle_dim2";
+                        }
+                        if (reductionBlockCount > 1) {
+                            // Reduction is dimension 1.  Terminal mode fires
+                            // at its last coordinate for every outer pair,
+                            // draining and clearing that pair before reuse.
+                            domain.terminal_dimension = 1;
+                            domain.terminal_accumulator_destination = "stream";
+                            domain.terminal_accumulator_clear = true;
+                            domain.terminal_accumulator_output_format =
+                                "bf16";
+                        }
+                        const bool finalOnly = reductionBlockCount == 1;
+                        emitFfnMxmIssue3D(rewriter, ffn.getLoc(), gateCycle,
+                            hemisphere * throughput.mxms_per_hemisphere,
+                            "compute", weightBuffer, 0,
+                            segment.stream_base, terminalStreamBase,
+                            mTile * tile + rowOffset, 1,
+                            finalOnly ? "stream" : "sram", true,
+                            dataFormat, finalOnly ? "bf16" : "fp32",
+                            domain);
+                        emitFfnMxmIssue3D(rewriter, ffn.getLoc(), upCycle,
+                            hemisphere * throughput.mxms_per_hemisphere
+                                + (singleMxm ? 0 : 1),
+                            "compute", weightBuffer, 0,
+                            segment.stream_base,
+                            terminalStreamBase
+                                + throughput.mxm_result_streams,
+                            mTile * tile + rowOffset
+                                + (singleMxm ? m : 0), 1,
+                            finalOnly ? "stream" : "sram", true,
+                            dataFormat, finalOnly ? "bf16" : "fp32",
+                            domain);
+                    } else if (!closedProjectionDomains) {
+                        FfnMxmDomain3D domain;
+                        domain.repeat_count = segment.rows;
+                        domain.repeat_accumulator_address_stride = 0;
+                        emitFfnMxmIssue3D(rewriter, ffn.getLoc(), gateCycle,
+                            hemisphere * throughput.mxms_per_hemisphere,
+                            "compute",
                             singleMxm && !serializedProjections
                                 ? 0 : weightBuffer,
-                            hemisphere
-                                * throughput.mxms_per_hemisphere,
-                            segment.rows, tile, tile);
-                    upCompute =
-                        rewriter.create<MxmComputeOp>(ffn.getLoc(),
-                            upActivation, ffn.getUpWeight(),
-                            context.projection_type, upCycle,
-                            segment.rows,
-                            upCycle
-                                + target.mxm_first_result_latency(),
-                            target.mxm_result_window_cycles(
-                                segment.rows),
-                            segment.stream_base,
-                            resultStreamBase
-                                + throughput.mxm_result_streams,
+                            0, segment.stream_base, resultStreamBase,
+                            mTile * tile + rowOffset, 1,
+                            finalReduction ? "stream" : "sram", true,
+                            dataFormat,
+                            finalReduction ? "bf16" : "fp32", domain);
+                        emitFfnMxmIssue3D(rewriter, ffn.getLoc(), upCycle,
+                            hemisphere * throughput.mxms_per_hemisphere
+                                + (singleMxm ? 0 : 1),
+                            "compute",
                             singleMxm && !serializedProjections
                                 ? 1 : weightBuffer,
-                            hemisphere
-                                    * throughput.mxms_per_hemisphere
-                                + (singleMxm ? 0 : 1),
-                            segment.rows, tile, tile);
+                            0, segment.stream_base,
+                            resultStreamBase
+                                + throughput.mxm_result_streams,
+                            mTile * tile + rowOffset
+                                + (singleMxm ? m : 0), 1,
+                            finalReduction ? "stream" : "sram", true,
+                            dataFormat,
+                            finalReduction ? "bf16" : "fp32", domain);
+                    }
+                    (void)gateActivation;
+                    (void)upActivation;
                     rowOffset += segment.rows;
                 }
 
                 // Each physical MXM owns its accumulator. A pair is fully
                 // reduced and drained before the next pair starts, so all
                 // projection pairs can reuse the same token-row window.
-                const int64_t accumulatorBase = mTile * tile;
                 const int64_t gateComputeCycle = computeCycle
                     + computeProjectionOffset(0);
                 const int64_t upComputeCycle = computeCycle
                     + computeProjectionOffset(1);
 
-                const auto emitAccumulator =
-                    [&](mlir::Value input, int64_t unitId,
-                        int64_t accumulatorAddress, int64_t cycle,
-                        int64_t streamBase) {
-                        mlir::OperationState state(
-                            ffn.getLoc(),
-                            MxmAccumulateOp::getOperationName());
-                        state.addOperands(input);
-                        state.addTypes(context.projection_type);
-                        state.addAttributes({
-                            rewriter.getNamedAttr("cycle",
-                                rewriter.getI64IntegerAttr(cycle)),
-                            rewriter.getNamedAttr("unit_id",
-                                rewriter.getI64IntegerAttr(unitId)),
-                            rewriter.getNamedAttr("stream_base",
-                                rewriter.getI64IntegerAttr(streamBase)),
-                            rewriter.getNamedAttr("stream_count",
-                                rewriter.getI64IntegerAttr(
-                                    finalReduction ? 2
-                                                   : throughput
-                                                         .mxm_result_streams)),
-                            rewriter.getNamedAttr("accumulator_address",
-                                rewriter.getI64IntegerAttr(
-                                    accumulatorAddress)),
-                            rewriter.getNamedAttr("accumulator_stride",
-                                rewriter.getI64IntegerAttr(1)),
-                            rewriter.getNamedAttr("destination",
-                                rewriter.getStringAttr(
-                                    finalReduction ? "stream" : "local")),
-                            rewriter.getNamedAttr("repeat_count",
-                                rewriter.getI64IntegerAttr(tile)),
-                            rewriter.getNamedAttr("repeat_interval",
-                                rewriter.getI64IntegerAttr(1)),
-                            rewriter.getNamedAttr(
-                                "accumulator_output_format",
-                                rewriter.getStringAttr(
-                                    finalReduction ? "bf16" : "fp32")),
-                        });
-                        return llvm::cast<MxmAccumulateOp>(
-                            rewriter.create(state));
-                    };
-                auto gateAccumulator = emitAccumulator(
-                    gateCompute.getResult(), gateCompute.getUnitId(),
-                    accumulatorBase, gateComputeCycle + gateAccLatency,
-                    resultStreamBase);
+                gateAccumulatorValue = context.activation_route.getInput();
+                upAccumulatorValue = context.activation_route.getInput();
                 const int64_t effectiveUpAccLatency =
                     singleMxm ? gateAccLatency : upAccLatency;
-                auto upAccumulator = emitAccumulator(
-                    upCompute.getResult(), upCompute.getUnitId(),
-                    accumulatorBase + (singleMxm ? m : 0),
-                    upComputeCycle + effectiveUpAccLatency,
-                    resultStreamBase + throughput.mxm_result_streams);
 
                 if (!finalReduction) continue;
 
@@ -406,10 +731,11 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     const int64_t tempBase =
                         ((pair % pairsPerTempGroup) * mTileCount + mTile)
                         * tile;
-                    const auto emitTempWrite =
-                        [&](MxmAccumulateOp source,
+                        const auto emitTempWrite =
+                            [&](mlir::Value source,
                             llvm::ArrayRef<int64_t> tempSlices,
                             int64_t streamBase, int64_t sourceComputeCycle,
+                            int64_t projection,
                             mlir::Value& lastWrite) {
                             for (int64_t byte = 0; byte < 2; ++byte) {
                                 const int64_t targetSlice =
@@ -430,24 +756,65 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                 const int64_t writeCycle = sourceComputeCycle
                                     + target.mxm_first_result_latency()
                                     + *transportLatency;
-                                auto placement = schedule_placement(
-                                    rewriter, {targetSlice}, tempBase,
-                                    tile, 1,
-                                    context.hemisphereName(hemisphere),
-                                    "bf16_swiglu_temp_byte",
-                                    context.temp_bank);
-                                auto write =
-                                    rewriter.create<MemWriteOp>(
-                                        ffn.getLoc(), source.getOutput(),
+                                const auto key = std::tuple {hemisphere,
+                                    projection, tempGroup, byte};
+                                const int64_t groupPairBase =
+                                    tempGroup * pairsPerTempGroup;
+                                const bool domainLeader =
+                                    pair == groupPairBase && mTile == 0;
+                                if (domainLeader) {
+                                    const int64_t pairsInGroup = std::min(
+                                        pairsPerTempGroup,
+                                        context.projection_timeline.pair_count
+                                            - groupPairBase);
+                                    FfnLoopDomain3D domain;
+                                    domain.wave_count = mTileCount;
+                                    domain.wave_interval = context
+                                        .projection_timeline
+                                        .pipelined_block_interval;
+                                    domain.wave_address_stride = tile;
+                                    domain.group_count = pairsInGroup;
+                                    domain.group_address_stride =
+                                        mTileCount * tile;
+                                    if (pairsInGroup > 1) {
+                                        const int64_t reductionBlocks =
+                                            k / tile;
+                                        const auto& nextFinal = context
+                                            .projection_timeline.blocks[
+                                                reductionBlocks
+                                                    * (groupPairBase + 2)
+                                                - 1];
+                                        domain.group_interval =
+                                            nextFinal.tiles.front()
+                                                .compute_cycle
+                                            - computeCycle;
+                                    }
+                                    auto placement = schedule_placement(
+                                        rewriter, {targetSlice}, tempBase,
+                                        tile, 1,
+                                        context.hemisphereName(hemisphere),
+                                        "bf16_swiglu_temp_byte",
+                                        context.temp_bank);
+                                    auto write = rewriter.create<MemWriteOp>(
+                                        ffn.getLoc(), source,
                                         writeCycle, tile,
                                         streamBase + byte, 1,
                                         targetBoundary,
                                         rewriter.getStringAttr("west"),
-                                        ffn.getHidden1Address(),
-                                        placement,
+                                        ffn.getHidden1Address(), placement,
                                         tile
                                             * throughput.lanes_per_tile);
-                                lastWrite = write.getOutput();
+                                    setFfnLoopDomain3D(
+                                        write.getOperation(), rewriter,
+                                        domain);
+                                    tempDomainOutputs[key] =
+                                        write.getOutput();
+                                }
+                                const auto output =
+                                    tempDomainOutputs.find(key);
+                                if (output == tempDomainOutputs.end())
+                                    return;
+                                lastWrite = output->second;
                                 emission
                                     .temp_mem_busy_windows[hemisphere]
                                     .push_back({
@@ -460,17 +827,17 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                                 targetSlice));
                             }
                         };
-                    emitTempWrite(gateAccumulator,
+                    emitTempWrite(gateAccumulatorValue,
                         llvm::ArrayRef<int64_t>(gateTempSlices)
                             .slice(2 * tempGroup, 2),
-                        resultStreamBase, gateComputeCycle,
+                        resultStreamBase, gateComputeCycle, 0,
                         gateTemp);
-                    emitTempWrite(upAccumulator,
+                    emitTempWrite(upAccumulatorValue,
                         llvm::ArrayRef<int64_t>(upTempSlices)
                             .slice(2 * tempGroup, 2),
                         resultStreamBase
                             + throughput.mxm_result_streams,
-                        upComputeCycle,
+                        upComputeCycle, 1,
                         upTemp);
                 }
                 emission.completed_tiles.push_back({
@@ -479,8 +846,6 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     hemisphere,
                     std::max(gateComputeCycle, upComputeCycle),
                     deferredReadyCycle,
-                    gateAccumulator,
-                    upAccumulator,
                     gateTemp,
                     upTemp,
                 });

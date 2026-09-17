@@ -19,10 +19,32 @@ def MemTransferOp : FTLPU_Schedule_Op<"mem_transfer", [MemoryEffects<[MemWrite]>
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
       OptionalAttr<I64Attr>:$wave_address_stride,
+      OptionalAttr<I64Attr>:$group_count,
+      OptionalAttr<I64Attr>:$group_interval,
+      OptionalAttr<I64Attr>:$group_address_stride,
+      OptionalAttr<I64Attr>:$outer_group_size,
+      OptionalAttr<I64Attr>:$outer_inner_stride,
+      OptionalAttr<I64Attr>:$outer_group_stride,
       OptionalAttr<I64Attr>:$address_binding,
       OptionalAttr<StrAttr>:$address_binding_access,
       OptionalAttr<I64Attr>:$weight_page,
       OptionalAttr<I64Attr>:$logical_base_row);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def MemWriteRead2DOp : FTLPU_Schedule_Op<"mem_write_read_2d",
+    [MemoryEffects<[MemWrite]>]> {
+  let summary = "Two statically scheduled MEM sweeps sharing a 2-D address domain";
+  let arguments = (ins I64Attr:$cycle, I64Attr:$hemisphere,
+      I64Attr:$slice, I64Attr:$bank, I64Attr:$address,
+      I64Attr:$count0, I64Attr:$count1,
+      I64Attr:$write_cycle_stride0, I64Attr:$write_cycle_stride1,
+      I64Attr:$read_cycle_stride0, I64Attr:$read_cycle_stride1,
+      I64Attr:$read_start_offset,
+      I64Attr:$address_stride0, I64Attr:$address_stride1,
+      I64Attr:$write_stream, I64Attr:$read_stream_base,
+      I64Attr:$read_stream_outer_stride);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -41,12 +63,21 @@ def MxmIssueOp : FTLPU_Schedule_Op<"mxm_issue", [MemoryEffects<[MemWrite]>]> {
       OptionalAttr<I64Attr>:$weight_inner_column,
       OptionalAttr<StrAttr>:$weight_input_mode,
       OptionalAttr<I64Attr>:$weight_stream_base,
+      OptionalAttr<StrAttr>:$weight_buffer_mode,
+      OptionalAttr<I64Attr>:$repeat_weight_column_stride,
+      OptionalAttr<I64Attr>:$repeat_accumulator_address_stride,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
       OptionalAttr<I64Attr>:$wave_weight_column_stride,
       OptionalAttr<I64Attr>:$wave_accumulator_address_stride,
       OptionalAttr<I64Attr>:$group_count,
-      OptionalAttr<I64Attr>:$group_interval);
+      OptionalAttr<I64Attr>:$group_interval,
+      OptionalAttr<I64Attr>:$group_weight_column_stride,
+      OptionalAttr<I64Attr>:$group_accumulator_address_stride,
+      OptionalAttr<I64Attr>:$terminal_dimension,
+      OptionalAttr<StrAttr>:$terminal_accumulator_destination,
+      OptionalAttr<BoolAttr>:$terminal_accumulator_clear,
+      OptionalAttr<StrAttr>:$terminal_accumulator_output_format);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -58,7 +89,9 @@ def MxmDequantOp : FTLPU_Schedule_Op<"mxm_dequant",
       I64Attr:$repeat_count, I64Attr:$repeat_interval,
       OptionalAttr<I64Attr>:$scale_binding,
       OptionalAttr<I64Attr>:$wave_count,
-      OptionalAttr<I64Attr>:$wave_interval);
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$group_count,
+      OptionalAttr<I64Attr>:$group_interval);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -72,7 +105,13 @@ def MemReadOp : FTLPU_Schedule_Op<"mem_read"> {
       DictionaryAttr:$placement, I64Attr:$bytes,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
-      OptionalAttr<I64Attr>:$wave_address_stride);
+      OptionalAttr<I64Attr>:$wave_address_stride,
+      OptionalAttr<I64Attr>:$group_count,
+      OptionalAttr<I64Attr>:$group_interval,
+      OptionalAttr<I64Attr>:$group_address_stride,
+      OptionalAttr<I64Attr>:$outer_group_size,
+      OptionalAttr<I64Attr>:$outer_inner_stride,
+      OptionalAttr<I64Attr>:$outer_group_stride);
   let results = (outs AnyRankedTensor:$output);
   let builders = [OpBuilder<(ins "::mlir::Value":$input, "int64_t":$cycle,
       "int64_t":$duration, "int64_t":$stream_base, "int64_t":$stream_count,
@@ -105,7 +144,8 @@ def MxmLoadOp : FTLPU_Schedule_Op<"mxm_load"> {
         OptionalAttr<I64Attr>:$weight_inner_column,
         OptionalAttr<StrAttr>:$weight_input_mode,
         OptionalAttr<I64Attr>:$group_count,
-        OptionalAttr<I64Attr>:$group_interval);
+        OptionalAttr<I64Attr>:$group_interval,
+        OptionalAttr<StrAttr>:$weight_buffer_mode);
   let results = (outs AnyRankedTensor:$output);
   let builders = [OpBuilder<(ins "::mlir::Value":$input, "int64_t":$cycle,
       "int64_t":$duration, "int64_t":$stream_base, "int64_t":$stream_count,
@@ -136,9 +176,17 @@ def MxmComputeOp : FTLPU_Schedule_Op<"mxm_compute"> {
       I64Attr:$output_stream_base, I64Attr:$weight_buffer,
       I64Attr:$unit_id, OptionalAttr<StrAttr>:$data_format,
       I64Attr:$m, I64Attr:$n, I64Attr:$k,
+      OptionalAttr<StrAttr>:$weight_buffer_mode,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
-      OptionalAttr<I64Attr>:$wave_accumulator_address_stride);
+      OptionalAttr<I64Attr>:$wave_accumulator_address_stride,
+      OptionalAttr<I64Attr>:$group_count,
+      OptionalAttr<I64Attr>:$group_interval,
+      OptionalAttr<I64Attr>:$group_accumulator_address_stride,
+      OptionalAttr<I64Attr>:$terminal_dimension,
+      OptionalAttr<StrAttr>:$terminal_accumulator_destination,
+      OptionalAttr<BoolAttr>:$terminal_accumulator_clear,
+      OptionalAttr<StrAttr>:$terminal_accumulator_output_format);
   let results = (outs AnyRankedTensor:$result);
   let builders = [OpBuilder<(ins "::mlir::Value":$activation, "::mlir::Value":$weight,
       "::mlir::Type":$result_type, "int64_t":$cycle, "int64_t":$duration,
@@ -174,7 +222,16 @@ def MxmAccumulatorReadOp : FTLPU_Schedule_Op<"mxm_accumulator_read"> {
   let arguments = (ins AnyRankedTensor:$input, I64Attr:$cycle,
       I64Attr:$unit_id, I64Attr:$accumulator_address,
       I64Attr:$output_stream_base, BoolAttr:$clear,
-      OptionalAttr<StrAttr>:$data_format);
+      OptionalAttr<StrAttr>:$data_format,
+      OptionalAttr<I64Attr>:$repeat_count,
+      OptionalAttr<I64Attr>:$repeat_interval,
+      OptionalAttr<I64Attr>:$repeat_accumulator_address_stride,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
+      OptionalAttr<I64Attr>:$wave_accumulator_address_stride,
+      OptionalAttr<I64Attr>:$group_count,
+      OptionalAttr<I64Attr>:$group_interval,
+      OptionalAttr<I64Attr>:$group_accumulator_address_stride);
   let results = (outs AnyRankedTensor:$output);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
@@ -191,6 +248,8 @@ def VxmOp : FTLPU_Schedule_Op<"vxm", [MemoryEffects<[MemWrite]>]> {
       OptionalAttr<StrAttr>:$rhs_stream_source,
       StrAttr:$cast_target, I64Attr:$output_stream,
       I64Attr:$repeat_count, I64Attr:$repeat_interval,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval,
       StrAttr:$input_hemisphere, StrAttr:$output_hemisphere,
       OptionalAttr<I64Attr>:$scale_binding,
       OptionalAttr<BoolAttr>:$accumulator_reset,
@@ -211,7 +270,10 @@ def MxmAccumulateOp : FTLPU_Schedule_Op<"mxm_accumulate"> {
       OptionalAttr<StrAttr>:$accumulator_output_format,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
-      OptionalAttr<I64Attr>:$wave_accumulator_address_stride);
+      OptionalAttr<I64Attr>:$wave_accumulator_address_stride,
+      OptionalAttr<I64Attr>:$group_count,
+      OptionalAttr<I64Attr>:$group_interval,
+      OptionalAttr<I64Attr>:$group_accumulator_address_stride);
   let results = (outs AnyRankedTensor:$output);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
@@ -225,7 +287,13 @@ def MemWriteOp : FTLPU_Schedule_Op<"mem_write"> {
       I64Attr:$bytes,
       OptionalAttr<I64Attr>:$wave_count,
       OptionalAttr<I64Attr>:$wave_interval,
-      OptionalAttr<I64Attr>:$wave_address_stride);
+      OptionalAttr<I64Attr>:$wave_address_stride,
+      OptionalAttr<I64Attr>:$group_count,
+      OptionalAttr<I64Attr>:$group_interval,
+      OptionalAttr<I64Attr>:$group_address_stride,
+      OptionalAttr<I64Attr>:$outer_group_size,
+      OptionalAttr<I64Attr>:$outer_inner_stride,
+      OptionalAttr<I64Attr>:$outer_group_stride);
   let results = (outs AnyRankedTensor:$output);
   let builders = [OpBuilder<(ins "::mlir::Value":$input, "int64_t":$cycle,
       "int64_t":$duration, "int64_t":$stream_base, "int64_t":$stream_count,
@@ -275,7 +343,9 @@ def SxmOp : FTLPU_Schedule_Op<"sxm"> {
       OptionalAttr<I64Attr>:$input_row,
       OptionalAttr<I64Attr>:$output_tile,
       OptionalAttr<I64Attr>:$repeat_count,
-      OptionalAttr<I64Attr>:$repeat_interval);
+      OptionalAttr<I64Attr>:$repeat_interval,
+      OptionalAttr<I64Attr>:$wave_count,
+      OptionalAttr<I64Attr>:$wave_interval);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }

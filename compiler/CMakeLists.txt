@@ -113,6 +113,7 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Analysis/FfnWeightLoadScheduleBuilder.cpp
     src/Dialect/Schedule/Analysis/FfnProjectionScheduleBuilder.cpp
     src/Dialect/Schedule/Analysis/FfnProjectionTimelinePlanner.cpp
+    src/Dialect/Schedule/Analysis/FfnUp3DLowering.cpp
     src/Dialect/Schedule/Analysis/FfnWeightTilePlanner.cpp
     src/Dialect/Schedule/Analysis/FfnSwishScheduleBuilder.cpp
     src/Dialect/Schedule/Analysis/FfnSwishPlanner.cpp
@@ -153,6 +154,8 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Transforms/SwigluScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/VerifySchedule.cpp
     src/Dialect/Command/IR/CommandDialect.cpp
+    src/Dialect/Command/Transforms/Fu3DCommandMaterializer.cpp
+    src/Dialect/Command/Transforms/StandaloneFfnUp3DToCommand.cpp
     src/Dialect/Command/Transforms/ScheduleToCommand.cpp
     src/Target/LPUTargetModel.cpp
     src/Target/MxmExecutionStrategy.cpp
@@ -201,10 +204,19 @@ set_property(SOURCE src/Dialect/Schedule/IR/ScheduleDialect.cpp
         "${CMAKE_CURRENT_BINARY_DIR}/ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.cpp.inc")
 file(GLOB_RECURSE FTLPU_CMODEL_COMPILER_HEADERS CONFIGURE_DEPENDS
     "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
-set_source_files_properties(
+set(FTLPU_CMODEL_COMPILER_CONSUMER_SOURCES
+    src/Dialect/Schedule/Analysis/FfnUp3DLowering.cpp
+    src/Dialect/Command/IR/CommandDialect.cpp
+    src/Dialect/Command/Transforms/Fu3DCommandMaterializer.cpp
+    src/Dialect/Command/Transforms/StandaloneFfnUp3DToCommand.cpp
     src/Target/CommandBinary.cpp
     tools/ftlpu_translate.cpp
-    PROPERTIES OBJECT_DEPENDS
+    tools/ftlpu_compile.cpp
+    tests/ffn_up_3d_lowering_test.cpp)
+list(APPEND FTLPU_CMODEL_COMPILER_CONSUMER_SOURCES
+    tests/vxm_run_2d_command_test.cpp)
+set_property(SOURCE ${FTLPU_CMODEL_COMPILER_CONSUMER_SOURCES}
+    APPEND PROPERTY OBJECT_DEPENDS
         "${FTLPU_GENERATED_HARDWARE_CONFIG};${FTLPU_CMODEL_COMPILER_HEADERS};${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${FTLPU_RUNTIME_ABI_HEADERS}")
 
 add_dependencies(ftlpu_compiler FTLPUKernelOpsIncGen FTLPUTensorOpsIncGen
@@ -289,6 +301,12 @@ add_test(NAME stream_route_plan_test COMMAND $<TARGET_FILE:stream_route_plan_tes
 add_executable(ffn_schedule_builders_test tests/ffn_schedule_builders_test.cpp)
 target_link_libraries(ffn_schedule_builders_test PRIVATE ftlpu_compiler)
 add_test(NAME ffn_schedule_builders_test COMMAND $<TARGET_FILE:ffn_schedule_builders_test>)
+add_executable(ffn_up_3d_lowering_test tests/ffn_up_3d_lowering_test.cpp)
+target_link_libraries(ffn_up_3d_lowering_test PRIVATE ftlpu_compiler)
+add_test(NAME ffn_up_3d_lowering_test COMMAND $<TARGET_FILE:ffn_up_3d_lowering_test>)
+add_executable(vxm_run_2d_command_test tests/vxm_run_2d_command_test.cpp)
+target_link_libraries(vxm_run_2d_command_test PRIVATE ftlpu_compiler)
+add_test(NAME vxm_run_2d_command_test COMMAND $<TARGET_FILE:vxm_run_2d_command_test>)
 add_executable(ffn_weight_tile_planner_test
     tests/ffn_weight_tile_planner_test.cpp)
 target_link_libraries(ffn_weight_tile_planner_test PRIVATE ftlpu_compiler)
@@ -313,6 +331,17 @@ if(MSVC)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME standalone_ffn_up_3d_compile_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/standalone_ffn_up_3d_compile_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --inspect $<TARGET_FILE:ftlpu_binary_inspect>
+            --runtime-test $<TARGET_FILE:compiled_queue_program_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/qwen2_5_up_direct_3d.stream.mlir
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/direct_ffn_up_3d)
     add_test(
         NAME import_hf_decoder_layer_math_test
         COMMAND
@@ -363,6 +392,15 @@ if(Python3_Interpreter_FOUND)
             --mxm-execution vector
             --seq-len 32
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_paged)
+    add_test(
+        NAME qwen2_5_projection_rope_overlap_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_projection_rope_overlap_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_projection_rope_overlap)
     add_custom_target(
         qwen2_5_1_5b_decoder_layer_pipeline
         COMMAND
@@ -591,6 +629,15 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/schedule_wave_compression.mlir
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/schedule_wave_compression/command.mlir)
+    add_test(
+        NAME mem_3d_blocked_outer_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/mem_3d_blocked_outer_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/mem_3d_blocked_outer.schedule.mlir
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/mem_3d_blocked_outer)
     add_test(
         NAME mem_slice_program_ab_test
         COMMAND

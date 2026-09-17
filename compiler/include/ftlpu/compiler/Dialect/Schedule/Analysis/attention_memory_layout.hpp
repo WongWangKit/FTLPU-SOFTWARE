@@ -188,6 +188,7 @@ private:
     int64_t ropeBase_ = 7000;
     int64_t ropeMirrorBase_ = 7000;
     int64_t ropeStagingBase_ = 0;
+    int64_t ropeStagingOutputBlocks_ = 4;
     int64_t ropeProductBase_ = 0;
     int64_t queryIwBase_ = 7600;
     int64_t scaledScoreBase_ = 0;

@@ -73,8 +73,6 @@ struct CompletedProjectionTile {
     int64_t hemisphere;
     int64_t compute_cycle;
     int64_t deferred_ready_cycle;
-    schedule::MxmAccumulateOp gate;
-    schedule::MxmAccumulateOp up;
     mlir::Value gate_temp;
     mlir::Value up_temp;
 };

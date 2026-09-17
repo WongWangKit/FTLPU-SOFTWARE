@@ -3,6 +3,8 @@
 #include "ftlpu/software/runtime/issue_inspector.hpp"
 #include "ftlpu/software/runtime/performance.hpp"
 #include "ftlpu/software/runtime/schedule_trace.hpp"
+#include "ftlpu/software/runtime/weight_prefetch_plan.hpp"
+#include "ftlpu/icu/fu_3d_codec.hpp"
 
 #include <filesystem>
 #include <algorithm>
@@ -74,13 +76,32 @@ try {
               << " commands=" << total_commands
               << " file_bytes=" << std::filesystem::file_size(argv[1])
               << '\n';
-    const auto logicalIssues =
-        ftlpu::software::runtime::inspect_logical_issues(program);
-    std::cout << "binary logical_issue_summary queues="
-              << logicalIssues.queues.size()
-              << " functional_issues=" << logicalIssues.functional_issues
-              << " logical_nop_cycles="
-              << logicalIssues.logical_nop_cycles << '\n';
+    const bool hasRawFu3D = std::ranges::any_of(program.queues,
+        [](const auto& queue) {
+            return std::ranges::any_of(queue.commands,
+                [](const auto& command) {
+                    return ftlpu::software::runtime::
+                        is_fu_3d_raw_packet_header(command);
+                });
+        });
+    std::optional<ftlpu::software::runtime::LogicalIssueProgram>
+        logicalIssues;
+    if (hasRawFu3D) {
+        // A raw FU packet is already the hardware ICU program.  The legacy
+        // logical inspector expands only Schedule-derived encodings, so keep
+        // reporting physical packet/i-MEM data without reinterpreting it.
+        std::cout << "binary logical_issue_summary mode=raw_fu_3d"
+                  << " status=not_expanded\n";
+    } else {
+        logicalIssues =
+            ftlpu::software::runtime::inspect_logical_issues(program);
+        std::cout << "binary logical_issue_summary queues="
+                  << logicalIssues->queues.size()
+                  << " functional_issues="
+                  << logicalIssues->functional_issues
+                  << " logical_nop_cycles="
+                  << logicalIssues->logical_nop_cycles << '\n';
+    }
     std::size_t totalInstructions = 0;
     std::size_t totalNops = 0;
     std::size_t totalRepeats = 0;
@@ -95,6 +116,8 @@ try {
     std::size_t totalMxmStreamNd = 0;
     std::size_t totalVxmStreamNd = 0;
     std::size_t totalSxmTilePrograms = 0;
+    std::size_t totalWriteRead2D = 0;
+    std::size_t writeRead2DExpanded = 0;
     std::size_t expandedInstructions = 0;
     std::size_t repeatReplayed = 0;
     std::size_t repeat2DReplayed = 0;
@@ -134,7 +157,9 @@ try {
         } else if (macroQueue) {
             serializedQueueBytes += (queue.commands.size() + 7) / 8;
         }
-        for (const auto& command : queue.commands) {
+        for (std::size_t commandIndex = 0;
+             commandIndex < queue.commands.size(); ++commandIndex) {
+            const auto& command = queue.commands[commandIndex];
             const bool macro =
                 ftlpu::software::runtime::is_macro_schedule_command(command);
             if (memDeltaQueue) {
@@ -160,6 +185,20 @@ try {
                                 + command.extension_words.size()
                                     * sizeof(std::uint32_t)
                             : 0);
+            }
+            if (ftlpu::software::runtime::
+                    is_mem_write_read_2d_raw_packet_header(command)) {
+                const auto instruction =
+                    ftlpu::software::runtime::
+                        decode_mem_write_read_2d_raw_packet(
+                            queue, commandIndex);
+                ++totalWriteRead2D;
+                const auto points = 2 * instruction.counts[0]
+                    * instruction.counts[1];
+                writeRead2DExpanded += points;
+                expandedInstructions += points;
+                tracePatternRows += 2;
+                continue;
             }
             if (ftlpu::software::runtime::is_vxm_stream_nd_command(command)) {
                 ++totalVxmStreamNd;
@@ -298,7 +337,7 @@ try {
     const std::size_t encodedWorkEntries = totalInstructions + totalRepeats
         + totalRepeat2D + totalMacros + totalMemStreamNd
         + totalMemSlicePrograms + totalMxmStreamNd + totalVxmStreamNd
-        + totalSxmTilePrograms;
+        + totalSxmTilePrograms + totalWriteRead2D;
     const std::size_t savedWorkEntries = expandedInstructions
         > encodedWorkEntries ? expandedInstructions - encodedWorkEntries : 0;
     std::cout << "binary aggregate instruction=" << totalInstructions
@@ -312,6 +351,7 @@ try {
               << " mxm_stream_nd=" << totalMxmStreamNd
               << " vxm_stream_nd=" << totalVxmStreamNd
               << " sxm_tile_program=" << totalSxmTilePrograms
+              << " mem_write_read_2d=" << totalWriteRead2D
               << " repeat_replayed=" << repeatReplayed
               << " repeat2d_replayed=" << repeat2DReplayed
               << " macro_expanded=" << macroExpanded
@@ -321,6 +361,7 @@ try {
               << " mxm_stream_nd_expanded=" << mxmStreamNdExpanded
               << " vxm_stream_nd_expanded=" << vxmStreamNdExpanded
               << " sxm_tile_program_expanded=" << sxmTileProgramExpanded
+              << " mem_write_read_2d_expanded=" << writeRead2DExpanded
               << " expanded_instruction=" << expandedInstructions
               << " encoded_work_entries=" << encodedWorkEntries
               << " saved_work_entries=" << savedWorkEntries
@@ -372,7 +413,10 @@ try {
              ftlpu::software::runtime::QueueKind::MxmDequant,
              ftlpu::software::runtime::QueueKind::Vxm,
              ftlpu::software::runtime::QueueKind::SxmTranspose,
-             ftlpu::software::runtime::QueueKind::SxmPermute}) {
+             ftlpu::software::runtime::QueueKind::SxmPermute,
+             ftlpu::software::runtime::QueueKind::C2cDma,
+             ftlpu::software::runtime::QueueKind::C2cTx,
+             ftlpu::software::runtime::QueueKind::C2cRx}) {
         std::size_t queueCount = 0;
         std::size_t usedSlots = 0;
         std::size_t overflowQueues = 0;
@@ -444,8 +488,10 @@ try {
               << " mem_delta_rle_queues=" << physical.mem_delta_rle_queues
               << " stream_nd_packets=" << physical.stream_nd_packets
               << " overflow_queues=" << physical.overflow_queues
-              << " context_overflow_queues="
+              << " macro_context_overflow_queues="
               << physical.macro_context_overflow_queues
+              << " fu_3d_context_overflow_queues="
+              << physical.fu_3d_context_overflow_queues
               << " used_slots=" << physical.used_slots
               << " used_bits=" << physical.used_bits
               << " used_bytes_ceil=" << (physical.used_bits + 7) / 8
@@ -454,7 +500,11 @@ try {
               << " peak_macro_context_bits="
               << physical.peak_macro_context_bits
               << " provisioned_macro_context_bits="
-              << physical.provisioned_macro_context_bits << '\n';
+              << physical.provisioned_macro_context_bits
+              << " peak_fu_3d_context_bits="
+              << physical.peak_fu_3d_context_bits
+              << " provisioned_fu_3d_context_bits="
+              << physical.provisioned_fu_3d_context_bits << '\n';
     for (const auto kind : {
              ftlpu::software::runtime::QueueKind::Mem,
              ftlpu::software::runtime::QueueKind::MxmLoad,
@@ -462,7 +512,10 @@ try {
              ftlpu::software::runtime::QueueKind::MxmDequant,
              ftlpu::software::runtime::QueueKind::Vxm,
              ftlpu::software::runtime::QueueKind::SxmTranspose,
-             ftlpu::software::runtime::QueueKind::SxmPermute}) {
+             ftlpu::software::runtime::QueueKind::SxmPermute,
+             ftlpu::software::runtime::QueueKind::C2cDma,
+             ftlpu::software::runtime::QueueKind::C2cTx,
+             ftlpu::software::runtime::QueueKind::C2cRx}) {
         std::size_t queues = 0;
         std::size_t slots = 0;
         std::size_t maxSlots = 0;
@@ -470,6 +523,10 @@ try {
         std::size_t contextCapacity = 0;
         std::uint64_t peakContextBits = 0;
         std::uint64_t provisionedContextBits = 0;
+        std::size_t peakFu3DContexts = 0;
+        std::size_t fu3DContextCapacity = 0;
+        std::uint64_t peakFu3DContextBits = 0;
+        std::uint64_t provisionedFu3DContextBits = 0;
         std::size_t runs = 0;
         std::size_t escapes = 0;
         std::size_t compactTemplateRuns = 0;
@@ -488,6 +545,14 @@ try {
                 queue.peak_macro_contexts) * queue.macro_context_bits;
             provisionedContextBits += static_cast<std::uint64_t>(
                 queue.macro_context_capacity) * queue.macro_context_bits;
+            peakFu3DContexts = std::max(
+                peakFu3DContexts, queue.peak_fu_3d_contexts);
+            fu3DContextCapacity = std::max(
+                fu3DContextCapacity, queue.fu_3d_context_capacity);
+            peakFu3DContextBits += static_cast<std::uint64_t>(
+                queue.peak_fu_3d_contexts) * queue.fu_3d_context_bits;
+            provisionedFu3DContextBits += static_cast<std::uint64_t>(
+                queue.fu_3d_context_capacity) * queue.fu_3d_context_bits;
             runs += queue.macro_codec.run_count;
             escapes += queue.macro_codec.escaped_transitions;
             compactTemplateRuns += queue.macro_codec.compact_template_runs;
@@ -505,9 +570,14 @@ try {
                   << " stream_nd_packets=" << streamNdPackets
                   << " peak_macro_contexts=" << peakContexts
                   << " macro_context_capacity=" << contextCapacity
-                  << " peak_context_bits=" << peakContextBits
-                  << " provisioned_context_bits="
+                  << " peak_macro_context_bits=" << peakContextBits
+                  << " provisioned_macro_context_bits="
                   << provisionedContextBits
+                  << " peak_fu_3d_contexts=" << peakFu3DContexts
+                  << " fu_3d_context_capacity=" << fu3DContextCapacity
+                  << " peak_fu_3d_context_bits=" << peakFu3DContextBits
+                  << " provisioned_fu_3d_context_bits="
+                  << provisionedFu3DContextBits
                   << " template_runs=" << runs
                   << " compact_template_runs=" << compactTemplateRuns
                   << " extended_template_runs=" << extendedTemplateRuns
@@ -534,6 +604,17 @@ try {
                   << " bank=" << use.bank
                   << " ready_cycle=" << use.ready_cycle
                   << " release_cycle=" << use.release_cycle << '\n';
+    for (const auto& plan :
+         ftlpu::software::runtime::plan_weight_prefetches(program)) {
+        std::cout << "binary weight_prefetch_plan page=" << plan.page_index
+                  << " bank=" << plan.bank
+                  << " pre_execution=" << plan.pre_execution
+                  << " start_cycle=" << plan.start_cycle
+                  << " transfer_end_cycle=" << plan.transfer_end_cycle
+                  << " ready_cycle=" << plan.ready_cycle
+                  << " release_cycle=" << plan.release_cycle
+                  << " uses=" << plan.use_indices.size() << '\n';
+    }
     std::cout << "binary stream_release_cycles="
               << program.stream_release_cycles.size() << '\n';
     const auto reportStreamReleases = [&](std::string_view direction,
@@ -648,7 +729,10 @@ try {
              ftlpu::software::runtime::QueueKind::MxmDequant,
              ftlpu::software::runtime::QueueKind::Vxm,
              ftlpu::software::runtime::QueueKind::SxmTranspose,
-             ftlpu::software::runtime::QueueKind::SxmPermute}) {
+             ftlpu::software::runtime::QueueKind::SxmPermute,
+             ftlpu::software::runtime::QueueKind::C2cDma,
+             ftlpu::software::runtime::QueueKind::C2cTx,
+             ftlpu::software::runtime::QueueKind::C2cRx}) {
         std::size_t kindQueues = 0;
         std::size_t kindCommands = 0;
         std::size_t kindMin = std::numeric_limits<std::size_t>::max();
@@ -768,6 +852,9 @@ try {
         ftlpu::software::runtime::write_schedule_trace_csv(
             program, *tracePath);
     if (comparePath) {
+        if (!logicalIssues)
+            throw std::runtime_error(
+                "--compare does not expand raw FU 3-D packet programs");
         const auto reference =
             ftlpu::software::runtime::read_binary_program(*comparePath);
         const auto referenceIssues =
@@ -784,11 +871,11 @@ try {
                   << " same_target=" << comparison.same_target
                   << " same_horizon=" << comparison.same_horizon
                   << " left_functional_issues="
-                  << logicalIssues.functional_issues
+                  << logicalIssues->functional_issues
                   << " right_functional_issues="
                   << referenceIssues.functional_issues
                   << " left_logical_nop_cycles="
-                  << logicalIssues.logical_nop_cycles
+                  << logicalIssues->logical_nop_cycles
                   << " right_logical_nop_cycles="
                   << referenceIssues.logical_nop_cycles
                   << " left_file_bytes=" << leftBytes

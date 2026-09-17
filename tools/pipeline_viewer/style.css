@@ -458,6 +458,15 @@ select {
   font-size: 11px;
 }
 
+.viewer-link {
+  color: #176d67;
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.viewer-link:hover { text-decoration: underline; }
+
 @media (max-width: 1050px) {
   :root {
     --inspector-width: 225px;

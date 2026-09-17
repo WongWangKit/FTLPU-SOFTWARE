@@ -175,6 +175,8 @@ llvm::SmallVector<StageWeightUse> collectStageWeightUses(
                 placementBank ? placementBank.getInt() : 0);
             const int64_t ready = read.getCycle() + cycleOffset;
             const int64_t release = ready
+                + (read.getGroupCount().value_or(1) - 1)
+                    * read.getGroupInterval().value_or(1)
                 + (read.getWaveCount().value_or(1) - 1)
                     * read.getWaveInterval().value_or(1)
                 + read.getDuration();
@@ -193,6 +195,8 @@ llvm::SmallVector<StageWeightUse> collectStageWeightUses(
         if (binding == bindings.end()) continue;
         const int64_t ready = transfer.getCycle() + cycleOffset;
         const int64_t release = ready
+            + (transfer.getGroupCount().value_or(1) - 1)
+                * transfer.getGroupInterval().value_or(1)
             + (transfer.getWaveCount().value_or(1) - 1)
                 * transfer.getWaveInterval().value_or(1)
             + (transfer.getRepeatCount() - 1)
@@ -359,12 +363,21 @@ void sequentializeScheduleStages(mlir::func::FuncOp function,
             if (auto cycle =
                     operation->getAttrOfType<mlir::IntegerAttr>("cycle")) {
                 first = std::min(first, cycle.getInt());
-                const int64_t duration = std::max<int64_t>(
-                    1, integerAttribute(*operation, "duration",
-                        integerAttribute(*operation, "repeat_count", 1)
-                            * integerAttribute(
-                                *operation, "repeat_interval", 1)));
-                end = std::max(end, cycle.getInt() + duration);
+                const int64_t repeatCount =
+                    integerAttribute(*operation, "repeat_count", 1);
+                const int64_t repeatInterval =
+                    integerAttribute(*operation, "repeat_interval", 1);
+                const int64_t duration = std::max<int64_t>(1,
+                    integerAttribute(*operation, "duration",
+                        (repeatCount - 1) * repeatInterval + 1));
+                const int64_t waveSpan =
+                    (integerAttribute(*operation, "wave_count", 1) - 1)
+                    * integerAttribute(*operation, "wave_interval", 1);
+                const int64_t groupSpan =
+                    (integerAttribute(*operation, "group_count", 1) - 1)
+                    * integerAttribute(*operation, "group_interval", 1);
+                end = std::max(end,
+                    cycle.getInt() + groupSpan + waveSpan + duration);
             }
             if (auto resultCycle = operation->getAttrOfType<
                     mlir::IntegerAttr>("result_cycle")) {
@@ -435,10 +448,12 @@ public:
 
     LowerStreamToSchedulePass() = default;
     explicit LowerStreamToSchedulePass(FfnScheduleStrategy ffnStrategy,
-        AttentionScheduleStrategy attentionStrategy, bool stageTiming)
+        AttentionScheduleStrategy attentionStrategy, bool stageTiming,
+        bool projectionRopeOverlapEnabled)
         : ffn_strategy_(ffnStrategy)
         , attention_strategy_(attentionStrategy)
         , stage_timing_(stageTiming)
+        , projection_rope_overlap_enabled_(projectionRopeOverlapEnabled)
     {
     }
 
@@ -514,7 +529,8 @@ public:
         }
         if (mlir::failed(
                 schedule::lowerAttentionSchedules(
-                    rewriter, function, target, attention_strategy_))) {
+                    rewriter, function, target, attention_strategy_,
+                    projection_rope_overlap_enabled_))) {
             signalPassFailure();
             return;
         }
@@ -552,6 +568,8 @@ public:
 
         assignMxmDataFormats(function);
         sequentializeScheduleStages(function, target);
+        function->setAttr(
+            "ftlpu.schedule.closed_form", rewriter.getUnitAttr());
         reportStage("finalize");
     }
 
@@ -560,16 +578,19 @@ private:
     AttentionScheduleStrategy attention_strategy_ =
         AttentionScheduleStrategy::Tail;
     bool stage_timing_ = false;
+    bool projection_rope_overlap_enabled_ = false;
 };
 
 } // namespace
 
 std::unique_ptr<mlir::Pass> create_lower_stream_to_schedule_pass(
     FfnScheduleStrategy ffn_strategy,
-    AttentionScheduleStrategy attention_strategy, bool stage_timing)
+    AttentionScheduleStrategy attention_strategy, bool stage_timing,
+    bool projection_rope_overlap_enabled)
 {
     return std::make_unique<LowerStreamToSchedulePass>(
-        ffn_strategy, attention_strategy, stage_timing);
+        ffn_strategy, attention_strategy, stage_timing,
+        projection_rope_overlap_enabled);
 }
 
 } // namespace ftlpu::compiler

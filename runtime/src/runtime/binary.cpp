@@ -86,6 +86,11 @@ InstructionKind instruction_kind_for_queue(QueueKind kind)
     case QueueKind::SxmTranspose:
     case QueueKind::SxmPermute:
         return InstructionKind::Sxm;
+    case QueueKind::C2cTx:
+    case QueueKind::C2cRx:
+        return InstructionKind::C2cEndpoint;
+    case QueueKind::C2cDma:
+        return InstructionKind::C2cDma;
     }
     throw std::runtime_error("invalid FTLPU queue kind");
 }
@@ -267,7 +272,7 @@ CompactQueueRecordHeader decode_compact_queue_record_header(
     const bool has_extension = (flags & kCompactHasExtension) != 0;
     const bool macro = (flags & kCompactMacro) != 0;
     if (static_cast<std::uint16_t>(instruction_kind)
-            > static_cast<std::uint16_t>(InstructionKind::MxmDequant)
+            > static_cast<std::uint16_t>(InstructionKind::C2cDma)
         || word_count > QueueCommand {}.words.size()
         || (macro && (instruction_kind == InstructionKind::None
                          || has_extension)))
@@ -279,7 +284,7 @@ std::uint8_t compact_queue_record_flags(const QueueCommand& command,
     bool macro)
 {
     if (static_cast<std::uint16_t>(command.instruction_kind)
-            > static_cast<std::uint16_t>(InstructionKind::MxmDequant)
+            > static_cast<std::uint16_t>(InstructionKind::C2cDma)
         || command.word_count > command.words.size()
         || command.extension_words.size()
             > std::numeric_limits<std::uint16_t>::max())

@@ -124,12 +124,14 @@ int64_t annotateStateTransfers(mlir::func::FuncOp function,
 
 AttentionScheduleEmitter::AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
     AttentionTaskGraph op, const target::LPUTargetModel& target,
-    AttentionStagePlan stagePlan, AttentionScheduleStrategy strategy)
+    AttentionStagePlan stagePlan, AttentionScheduleStrategy strategy,
+    bool projectionRopeOverlapEnabled)
     : rewriter_(rewriter)
     , op_(op)
     , target_(target)
     , stage_plan_(std::move(stagePlan))
     , strategy_(strategy)
+    , projection_rope_overlap_enabled_(projectionRopeOverlapEnabled)
 {
 }
 
@@ -392,7 +394,7 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
 
 mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target,
-    AttentionScheduleStrategy strategy)
+    AttentionScheduleStrategy strategy, bool projectionRopeOverlapEnabled)
 {
     auto graphs = collectAttentionTaskGraphs(function);
     if (mlir::failed(graphs)) return mlir::failure();
@@ -410,7 +412,8 @@ mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
             return mlir::failure();
         }
         AttentionScheduleEmitter emitter(
-            rewriter, operation, target, std::move(stagePlan), strategy);
+            rewriter, operation, target, std::move(stagePlan), strategy,
+            projectionRopeOverlapEnabled);
         auto lowered = emitter.emit(outputIndex++);
         if (mlir::failed(lowered)) return mlir::failure();
         rewriter.replaceOp(operation.output, *lowered);

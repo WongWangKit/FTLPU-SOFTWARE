@@ -141,8 +141,10 @@ buffer 0/1。每个 block 连续发射 32 行 MXM compute，行发射占用率�
 
 本文中的 MEM slice 编号均为单个半球内的 local 编号。因此 gate accumulator 在东、西
 半球内分别使用 local slice 36..39，up accumulator 分别使用 local slice 40..43。
-在 CModel 扁平化的 88 条 MEM queue 视图中，东半球 queue 为 `local_slice`，西半球
-queue 为 `44 + local_slice`。
+每个 `(hemisphere, local_slice, bank)` 对应一个物理 MEM ICU 和一条 iMEM 队列。
+CModel 的扁平 queue 编号为
+`hemisphere * (local_slice_count * banks_per_slice) + local_slice * banks_per_slice + bank`；
+读、写和 C2C 同步写都进入这条队列。
 
 编译器现在将 compute mode 与权重反量化位置作为两个独立选择。`legacy` 保留下图所示的
 双 byte-stream Vector compute；但当目标启用 `mxm_local_dequant_enabled` 时，原始 INT8

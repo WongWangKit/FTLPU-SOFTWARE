@@ -29,15 +29,16 @@ def main() -> None:
     stablehlo = args.output_dir / "decoder_layer.stablehlo.mlir"
     stream = args.output_dir / "decoder_layer.stream.mlir"
     schedule = args.output_dir / "decoder_layer.schedule.mlir"
+    command = args.output_dir / "decoder_layer.command.mlir"
     binary = args.output_dir / "decoder_layer.ftlpu"
     shutil.copyfile(args.input, stablehlo)
 
     common = [
         "--mxm-execution", "vector",
         "--ffn-schedule", "fused",
+        "--projection-rope-overlap", "on",
         "--target-config", str(args.target_config),
         "--weight-bank", str(args.weight_bank),
-        "--icu-macro-schedule",
     ]
     run([
         str(args.opt), "--input", str(stablehlo), "--output", str(stream),
@@ -45,12 +46,12 @@ def main() -> None:
     ], "stablehlo-to-stream")
     run([
         str(args.opt), "--input", str(stream), "--output", str(schedule),
-        "--pipeline", "ftlpu-stream-to-compressed-schedule", *common,
-    ], "stream-to-compressed-schedule")
+        "--pipeline", "ftlpu-stream-to-schedule", *common,
+    ], "stream-to-closed-form-schedule")
 
     text = schedule.read_text(encoding="utf-8")
     required = [
-        "ftlpu.schedule.compressed",
+        "ftlpu.schedule.closed_form",
         'name = "query_norm_weight"',
         'name = "key_norm_weight"',
         'name = "qkv"',
@@ -116,18 +117,42 @@ def main() -> None:
             )
 
     run([
-        str(args.compile), "--input", str(schedule),
-        "--output", str(binary), "--input-stage", "schedule",
+        str(args.opt), "--input", str(schedule), "--output", str(command),
+        "--pipeline", "ftlpu-schedule-to-commands", *common,
+    ], "closed-form-schedule-to-hardware-commands")
+    command_text = command.read_text(encoding="utf-8")
+    vxm_run_2d = command_text.count("ftlpu.command.vxm_run_2d")
+    sxm_run_2d = command_text.count("ftlpu.command.sxm_run_2d")
+    if vxm_run_2d == 0 or sxm_run_2d == 0:
+        raise AssertionError(
+            "Qwen3 command lowering did not emit VXM/SXM RUN_2D packets"
+        )
+    if sxm_run_2d >= 1000:
+        raise AssertionError(
+            "interleaved Qwen3 SXM maps were not grouped into RUN_2D loops: "
+            f"{sxm_run_2d} packets"
+        )
+    for legacy in ("mem ", "mem_bundle ", "mxm ", "mxm_dequant ",
+                   "vxm ", "sxm "):
+        if f"ftlpu.command.{legacy}" in command_text:
+            raise AssertionError(
+                f"Qwen3 command lowering retained legacy fine command "
+                f"{legacy.strip()}"
+            )
+
+    run([
+        str(args.compile), "--input", str(command),
+        "--output", str(binary), "--input-stage", "command",
         "--target-config", str(args.target_config),
         "--mxm-execution", "vector",
         "--weight-bank", str(args.weight_bank),
-        "--icu-macro-schedule",
-    ], "compressed-schedule-to-binary")
+    ], "hardware-commands-to-binary")
     if binary.stat().st_size < 64:
         raise AssertionError("Qwen3 decoder-layer binary is unexpectedly small")
     print(
         f"Qwen3-0.6B seq32 prefill executable: {binary} "
-        f"({binary.stat().st_size} bytes)",
+        f"({binary.stat().st_size} bytes, VXM RUN_2D={vxm_run_2d}, "
+        f"SXM RUN_2D={sxm_run_2d})",
         flush=True,
     )
 

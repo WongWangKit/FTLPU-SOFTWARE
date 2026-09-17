@@ -10,6 +10,38 @@ Pipeline Viewer 是一个无外部依赖的 Canvas 波形工作台，可以查�
 浏览器直接打开 `index.html` 后载入任意一种 CSV。性能分析和流水验证应优先使用
 第一种实际运行 trace。
 
+## MEM 每周期 Viewer
+
+`mem.html` 是 MEM 专用的动态查看器。它按 `hemisphere / slice / bank /
+read-write port` 展开物理端口，并在每一行内分别显示：
+
+- MEM ICU 当周期的 issue、wait、同步等待、3D decode 和 program gate；
+- 指令经过 tile 0 到 tile 3 的流水位置；
+- SRAM 实际完成的 `read_to_sr` 或 `write_commit`，包括 row address、SR
+  column、stream、vector tag 和 8-byte 数据。
+
+运行前启用专用 trace，运行后写 CSV：
+
+```cpp
+CModelRuntime runtime(system);
+runtime.enable_mem_execution_trace();
+runtime.load(program);
+runtime.run_cycles(cycles);
+runtime.write_mem_execution_trace_csv("run.mem.csv");
+```
+
+`ModelSession` 提供同名的 `enable_mem_execution_trace()` 和
+`write_mem_execution_trace_csv()`。Qwen2.5/Qwen3 decoder runtime 测试也可通过
+环境变量直接输出：
+
+```powershell
+$env:FTLPU_QWEN_MEM_CSV = "decoder_layer.mem.csv"
+```
+
+专用 CSV 是稀疏事件表；没有行为的端口周期不写入文件。`mem.html` 会把空白自动
+解释为空闲，并可用“显示空闲物理端口”展开完整的 2 hemisphere × 32 slice ×
+2 bank × 2 port 视图。播放控制会逐周期列出当时所有 MEM 行为。
+
 对于包含多个 invocation 的 `ModelSession`，runtime segment 会追加到同一条 session
 物理 cycle 时间轴。`Session.Invocation` 标出每个 executable；
 `C2C.ModelWeightPage`、`C2C.HostInput` 和 `C2C.HostOutput` 保留发生在 executable
@@ -32,6 +64,10 @@ start,end,resource,detail,pattern,inner_count,inner_interval,inner_stride,outer_
 
 `repeat` 和 `repeat2d` 行描述迭代空间，不再提前展开所有 event。Viewer 只展开
 与当前可见 cycle 窗口相交的实例；`induction` 指明 stride 修改的数值字段。
+
+对于 raw FU 3D packet，离线 writer 为第三层 counter 的每个坐标输出一行，前两层
+counter 继续保留为 `repeat` 或 `repeat2d` pattern。这样既完整表示硬件 launch，
+又不需要恢复逐条细指令，CSV 大小也保持在可加载范围内。
 
 实际运行 trace 中的 `C2C.E.Prefetch`、`C2C.W.Prefetch`、共享 SR 和
 `MEM.*.C2CWrite` 区间来自 CModel 已完成的 DMA/RX/MEM write；`detail` 使用

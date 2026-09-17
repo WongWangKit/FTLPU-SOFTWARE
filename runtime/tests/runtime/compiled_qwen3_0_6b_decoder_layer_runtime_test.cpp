@@ -418,12 +418,14 @@ try {
         {{0, "hidden.1"}}, {}, 0});
 
     const char* tracePath = std::getenv("FTLPU_QWEN_PIPELINE_CSV");
+    const char* memTracePath = std::getenv("FTLPU_QWEN_MEM_CSV");
     std::vector<std::uint8_t> actual;
     ModelSessionStats sessionStats;
     if (std::getenv("FTLPU_QWEN_DIRECT_RUNTIME") != nullptr) {
         auto system = std::make_unique<ftlpu::TspSliceSystem>();
         CModelRuntime runtime(*system);
         if (tracePath != nullptr) runtime.enable_execution_trace();
+        if (memTracePath != nullptr) runtime.enable_mem_execution_trace();
         runtime.load(program);
         runtime.upload_input(0, encodeBf16(inputValues));
         runtime.upload_input(1, encodeBf16(inputGamma));
@@ -441,16 +443,21 @@ try {
         actual = runtime.download_output(0);
         if (tracePath != nullptr)
             runtime.write_execution_trace_csv(tracePath);
+        if (memTracePath != nullptr)
+            runtime.write_mem_execution_trace_csv(memTracePath);
     } else {
-        ftlpu::C2cDmaSystem system;
-        ModelSession session(system);
+        auto system = std::make_unique<ftlpu::C2cDmaSystem>();
+        ModelSession session(*system);
         session.load(std::move(package));
         session.set_input("hidden.0", encodeBf16(inputValues));
         if (tracePath != nullptr) session.enable_execution_trace();
+        if (memTracePath != nullptr) session.enable_mem_execution_trace();
         session.run();
         actual = session.value("hidden.1");
         if (tracePath != nullptr)
             session.write_execution_trace_csv(tracePath);
+        if (memTracePath != nullptr)
+            session.write_mem_execution_trace_csv(memTracePath);
         sessionStats = session.stats();
         if (sessionStats.weight_page_prefetches < 4
             || sessionStats.c2c_ingress_bytes == 0

@@ -1,8 +1,12 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
+#include "ftlpu/software/runtime/icu_program.hpp"
+#include "ftlpu/software/runtime/model_session.hpp"
 #include "ftlpu/software/runtime/schedule_trace.hpp"
+#include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include "ftlpu/core/bf16.hpp"
+#include "ftlpu/system/c2c_dma_system.hpp"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -45,6 +50,9 @@ namespace {
 #endif
 #ifndef FTLPU_TEST_MODEL_NAME
 #define FTLPU_TEST_MODEL_NAME "SmolLM2"
+#endif
+#ifndef FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES
+#define FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES 0
 #endif
 
 constexpr std::size_t kSeqLen = FTLPU_TEST_SEQUENCE_LENGTH;
@@ -166,6 +174,74 @@ std::size_t firstBindingReadCycle(
         for (std::size_t commandIndex = 0;
              commandIndex <= relocation.command_index; ++commandIndex) {
             const auto& command = queue->commands[commandIndex];
+            if (ftlpu::software::runtime::
+                    is_mem_write_read_2d_raw_packet_header(command)) {
+                constexpr std::size_t packetWords =
+                    ftlpu::isa::EncodedMemIcuWriteRead2DPacket::kWordCount;
+                if (commandIndex + packetWords > queue->commands.size())
+                    throw std::logic_error(
+                        "truncated WRITE_READ_2D packet before binding relocation");
+                if (relocation.command_index >= commandIndex
+                    && relocation.command_index < commandIndex + packetWords)
+                    throw std::logic_error(
+                        "binding relocation references a WRITE_READ_2D packet");
+                const auto instruction = ftlpu::software::runtime::
+                    decode_mem_write_read_2d_raw_packet(*queue, commandIndex);
+                cycle += ftlpu::detail::
+                    mem_icu_write_read_2d_last_issue_cycle(instruction) + 1;
+                commandIndex += packetWords - 1;
+                continue;
+            }
+            if (ftlpu::software::runtime::is_fu_3d_raw_packet_header(
+                    command)) {
+                constexpr std::size_t packetWords =
+                    ftlpu::isa::EncodedMemIcu3DPacket::kWordCount;
+                if (commandIndex + packetWords > queue->commands.size())
+                    throw std::logic_error(
+                        "truncated raw MEM 3-D binding relocation");
+                if (relocation.command_index > commandIndex
+                    && relocation.command_index < commandIndex + packetWords)
+                    throw std::logic_error(
+                        "binding relocation references the middle of a raw MEM 3-D packet");
+
+                ftlpu::isa::EncodedMemIcu3DPacket packet{};
+                for (std::size_t word = 0; word < packetWords; ++word) {
+                    const auto& source = queue->commands[commandIndex + word];
+                    if (source.instruction_kind
+                            != ftlpu::software::runtime::InstructionKind::Mem
+                        || source.word_count
+                            != ftlpu::isa::EncodedMemIcu3DPacket::kLanesPerWord)
+                        throw std::logic_error(
+                            "raw MEM 3-D binding relocation has an invalid physical word");
+                    for (std::size_t lane = 0;
+                         lane < ftlpu::isa::EncodedMemIcu3DPacket::kLanesPerWord;
+                         ++lane)
+                        packet.words[word].lanes[lane] = source.words[lane];
+                }
+                const auto instruction =
+                    ftlpu::isa::decode_mem_icu_3d_instruction(packet);
+                if (commandIndex == relocation.command_index) {
+                    if (instruction.opcode != ftlpu::MemIcuOpcode::Read3D)
+                        throw std::logic_error(
+                            "binding relocation does not reference a MEM read");
+                    // Account for queue-local wait_cycle when locating the
+                    // first binding read after NOP removal.
+                    firstCycle = std::min(firstCycle,
+                        cycle + instruction.loop.start_cycle
+                            + instruction.loop.wait_cycle);
+                    break;
+                }
+                std::size_t finalCycle = cycle
+                    + instruction.loop.start_cycle
+                    + instruction.loop.wait_cycle;
+                for (std::size_t dimension = 0;
+                     dimension < ftlpu::IcuLoop3D::kDimensions; ++dimension)
+                    finalCycle += (instruction.loop.counts[dimension] - 1)
+                        * instruction.loop.cycle_strides[dimension];
+                cycle = finalCycle + 1;
+                commandIndex += packetWords - 1;
+                continue;
+            }
             if (ftlpu::software::runtime::is_mem_slice_program_command(
                     command)) {
                 const auto sliceProgram = ftlpu::software::runtime::
@@ -414,6 +490,15 @@ try {
         appendBf16(gamma1, gammaValue(column, 1));
     }
 
+    std::vector<std::uint8_t> queryBias;
+    std::vector<std::uint8_t> keyBias;
+    std::vector<std::uint8_t> valueBias;
+    if (hasAttentionBias) {
+        queryBias.resize(2 * kHidden, 0);
+        keyBias.resize(2 * kKvHeads * kHeadDim, 0);
+        valueBias.resize(2 * kKvHeads * kHeadDim, 0);
+    }
+
     std::vector<std::uint8_t> queryWeight(kHidden * kHidden, 0);
     std::vector<std::uint8_t> keyWeight(
         kHidden * kKvHeads * kHeadDim, 0);
@@ -483,8 +568,14 @@ try {
             static_cast<std::uint8_t>(-1);
     }
 
-    auto* system = new ftlpu::TspSliceSystem();
-    ftlpu::software::runtime::CModelRuntime runtime(*system);
+    auto systemOwner = std::make_unique<ftlpu::TspSliceSystem>();
+    auto* system = systemOwner.get();
+    auto runtimeOwner = std::make_unique<
+        ftlpu::software::runtime::CModelRuntime>(*system);
+    auto& runtime = *runtimeOwner;
+    const char* memTracePath = std::getenv("FTLPU_QWEN_MEM_CSV");
+    if (memTracePath != nullptr)
+        runtime.stream_mem_execution_trace_csv(memTracePath);
     runtime.load(program);
     runtime.upload_input(0, input);
     runtime.upload_input(1, gamma0);
@@ -493,11 +584,9 @@ try {
     runtime.upload_input(4, valueWeight);
     runtime.upload_input(5, outputWeight);
     if (hasAttentionBias) {
-        runtime.upload_input(6, std::vector<std::uint8_t>(2 * kHidden, 0));
-        runtime.upload_input(
-            7, std::vector<std::uint8_t>(2 * kKvHeads * kHeadDim, 0));
-        runtime.upload_input(
-            8, std::vector<std::uint8_t>(2 * kKvHeads * kHeadDim, 0));
+        runtime.upload_input(6, queryBias);
+        runtime.upload_input(7, keyBias);
+        runtime.upload_input(8, valueBias);
     }
     runtime.upload_input(postAttentionNormBinding, gamma1);
     const auto physicalBf16 = [&](ftlpu::Hemisphere hemisphere,
@@ -706,7 +795,9 @@ try {
         [](const auto& binding) {
             return binding.access
                     == ftlpu::software::runtime::BindingAccess::Internal
-                && binding.name == "attention.value";
+                && (binding.name == "attention.value"
+                    || (binding.name == "attention.value_cache"
+                        && binding.role == "state.kv.value"));
         });
     if (valueBinding == program.bindings.end()
         || valueBinding->layout
@@ -715,6 +806,14 @@ try {
         || valueBinding->slices.size() % 16 != 0)
         throw std::logic_error(
             "decoder binary is missing attention value metadata");
+    const auto keyBinding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "attention.key_cache"
+                && binding.role == "state.kv.key";
+        });
     const std::size_t valueSliceGroups =
         valueBinding->slices.size() / 16;
     const auto readPackedValue = [&](std::size_t head,
@@ -921,8 +1020,16 @@ try {
         }
     }
     if constexpr (kSeqLen == 32 && kHeadDim == 128) {
+        if (keyBinding == program.bindings.end()
+            || keyBinding->layout
+                != ftlpu::software::runtime::BindingLayout::Fp16HeadPlanar
+            || keyBinding->shape.empty() || keyBinding->slices.size() < 4)
+            throw std::logic_error(
+                "decoder binary is missing attention key-cache metadata");
         float queryRopeMaxError = 0.0f;
         float keyRopeMaxError = 0.0f;
+        std::size_t queryRopeMismatchCount = 0;
+        std::size_t keyRopeMismatchCount = 0;
         std::array<std::size_t, 4> queryLocation {};
         std::array<std::size_t, 4> keyLocation {};
         std::array<float, 2> queryValues {};
@@ -945,6 +1052,17 @@ try {
                         const float expected = ropeValue(
                             checkpointQuery, token, head, dimension);
                         const float error = std::fabs(actual - expected);
+                        if (error > 0.02f) {
+                            if (queryRopeMismatchCount < 16)
+                                std::cerr << "Q RoPE mismatch hemisphere="
+                                          << hemisphere << " head=" << head
+                                          << " token=" << token
+                                          << " dimension=" << dimension
+                                          << " actual=" << actual
+                                          << " expected=" << expected
+                                          << " error=" << error << '\n';
+                            ++queryRopeMismatchCount;
+                        }
                         if (error > queryRopeMaxError) {
                             queryRopeMaxError = error;
                             queryLocation = {
@@ -957,15 +1075,38 @@ try {
                     for (std::size_t dimension = 0;
                          dimension < kHeadDim; ++dimension) {
                         const std::size_t reduction = dimension / 32;
-                        const std::size_t slice = 16 + 2 * (reduction / 2);
+                        const std::size_t blocksPerRotaryHalf =
+                            std::max<std::size_t>(1, kHeadBlocks / 2);
+                        const std::size_t sliceGroup =
+                            reduction / blocksPerRotaryHalf;
+                        const std::size_t slice =
+                            keyBinding->slices[2 * sliceGroup];
+                        const std::size_t storageTokens =
+                            static_cast<std::size_t>(keyBinding->shape[0]);
                         const std::size_t address =
-                            (head * 2 + reduction % 2) * kSeqLen + token;
+                            static_cast<std::size_t>(keyBinding->base_row)
+                            + (head * blocksPerRotaryHalf
+                                  + reduction % blocksPerRotaryHalf)
+                                * storageTokens
+                            + token;
                         const float actual = physicalBf16(
                             static_cast<ftlpu::Hemisphere>(hemisphere),
-                            slice, slice + 1, address, dimension % 32, 1);
+                            slice, slice + 1, address, dimension % 32,
+                            keyBinding->bank);
                         const float expected = ropeValue(
                             checkpointKey, token, head, dimension);
                         const float error = std::fabs(actual - expected);
+                        if (error > 0.02f) {
+                            if (keyRopeMismatchCount < 16)
+                                std::cerr << "K RoPE mismatch hemisphere="
+                                          << hemisphere << " head=" << head
+                                          << " token=" << token
+                                          << " dimension=" << dimension
+                                          << " actual=" << actual
+                                          << " expected=" << expected
+                                          << " error=" << error << '\n';
+                            ++keyRopeMismatchCount;
+                        }
                         if (error > keyRopeMaxError) {
                             keyRopeMaxError = error;
                             keyLocation = {
@@ -980,9 +1121,13 @@ try {
             throw std::logic_error(
                 "direct RoPE physical checkpoint mismatch query_error="
                 + std::to_string(queryRopeMaxError)
+                + " query_mismatches="
+                + std::to_string(queryRopeMismatchCount)
                 + " query_location=" + arrayValues(queryLocation)
                 + " query_values=" + arrayValues(queryValues)
                 + " key_error=" + std::to_string(keyRopeMaxError)
+                + " key_mismatches="
+                + std::to_string(keyRopeMismatchCount)
                 + " key_location=" + arrayValues(keyLocation)
                 + " key_values=" + arrayValues(keyValues));
     }
@@ -1484,13 +1629,14 @@ try {
         firstBindingReadCycle(program, downBinding),
     });
     runtime.run_cycles(
-        ffnStartCycle - attentionResidualEndCycle, cmodelLogSink);
+        ffnStartCycle - attentionResidualEndCycle - 1, cmodelLogSink);
     // Paged executables reuse the resident weight bank as scratch between
     // stages. Model the C2C handoff by making the FFN page resident immediately
     // before its first binding read instead of uploading every page at cycle 0.
     runtime.upload_input(gateBinding, gateWeight);
     runtime.upload_input(upBinding, upWeight);
     runtime.upload_input(downBinding, downWeight);
+    runtime.run_cycles(1, cmodelLogSink);
     const auto rms2Binding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
         [](const auto& binding) {
@@ -1664,6 +1810,8 @@ try {
     runtime.run_cycles(
         program.max_cycle + kCheckpointDrainCycles
         - finalResidualStartCycle);
+    if (memTracePath != nullptr)
+        runtime.write_mem_execution_trace_csv(memTracePath);
     const auto actual = runtime.download_output(0);
 
     std::vector<float> queryProjection(inputValues.size(), 0.0f);
@@ -1915,6 +2063,353 @@ try {
             + " final.west=" + std::to_string(physicalBf16(
                 ftlpu::Hemisphere::West, 32, 33, 0, 0)));
     }
+#if FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES
+    using namespace ftlpu::software::runtime;
+    if (program.weight_page_uses.size() != 20)
+        throw std::logic_error(
+            "Qwen dynamic C2C test expected 20 executable weight-page uses, got "
+            + std::to_string(program.weight_page_uses.size()));
+
+    const auto inputBindingByIndex = [&](std::uint32_t index)
+        -> const BinaryBinding& {
+        const auto binding = std::ranges::find_if(
+            program.bindings, [&](const BinaryBinding& candidate) {
+                return candidate.access == BindingAccess::Input
+                    && candidate.index == index;
+            });
+        if (binding == program.bindings.end())
+            throw std::logic_error(
+                "Qwen dynamic C2C test is missing input binding "
+                + std::to_string(index));
+        return *binding;
+    };
+    const auto logicalWeight = [&](std::uint32_t index)
+        -> const std::vector<std::uint8_t>& {
+        switch (index) {
+        case 2: return queryWeight;
+        case 3: return keyWeight;
+        case 4: return valueWeight;
+        case 5: return outputWeight;
+        default:
+            if (index == gateBinding) return gateWeight;
+            if (index == upBinding) return upWeight;
+            if (index == downBinding) return downWeight;
+            throw std::logic_error(
+                "Qwen dynamic C2C page references a non-matrix binding "
+                + std::to_string(index));
+        }
+    };
+    std::size_t expectedPagedBytes = 0;
+    std::vector<std::size_t> syncInstructionsPerUse(
+        program.weight_page_uses.size());
+    std::vector<std::size_t> synchronizedWritesPerUse(
+        program.weight_page_uses.size());
+    for (std::size_t useIndex = 0;
+         useIndex < program.weight_page_uses.size(); ++useIndex) {
+        const BinaryWeightPageUse& use =
+            program.weight_page_uses[useIndex];
+        const auto image = pack_weight_binding_page(
+            inputBindingByIndex(use.binding_index), use.page_index,
+            logicalWeight(use.binding_index), program.hardware);
+        for (const PackedWeightSegment& segment : image.segments) {
+            expectedPagedBytes += static_cast<std::size_t>(
+                segment.vector_count) * ftlpu::hw::kPhysicalVectorBytes;
+            ++syncInstructionsPerUse[useIndex];
+            synchronizedWritesPerUse[useIndex] += segment.vector_count;
+        }
+    }
+    const auto expectedPlans = plan_weight_prefetches(program);
+    std::size_t expectedPrefetches = expectedPlans.size();
+    std::size_t expectedSyncInstructions = 0;
+    std::size_t expectedSynchronizedWrites = 0;
+    for (const WeightPrefetchPlan& plan : expectedPlans) {
+        if (plan.pre_execution)
+            continue;
+        for (const std::size_t useIndex : plan.use_indices) {
+            expectedSyncInstructions += syncInstructionsPerUse.at(useIndex);
+            expectedSynchronizedWrites +=
+                synchronizedWritesPerUse.at(useIndex);
+        }
+    }
+    if (expectedPrefetches == 0 || expectedPagedBytes == 0
+        || expectedSyncInstructions == 0)
+        throw std::logic_error(
+            "Qwen dynamic C2C page plan is unexpectedly empty");
+
+    ModelPackage dynamicPackage;
+    dynamicPackage.model_name = FTLPU_TEST_MODEL_NAME;
+    dynamicPackage.architecture = "Qwen2ForCausalLM";
+    const auto appendTensor = [&](std::uint32_t bindingIndex,
+                                  std::string name,
+                                  const std::vector<std::uint8_t>& data,
+                                  bool quantized = false) {
+        const BinaryBinding& binding = inputBindingByIndex(bindingIndex);
+        ModelTensor tensor;
+        tensor.name = std::move(name);
+        tensor.element_type = binding.element_type;
+        tensor.shape = binding.shape;
+        tensor.data = data;
+        if (quantized) {
+            tensor.encoding = ModelTensorEncoding::SymmetricPerTensorI8;
+            tensor.scales = {1.0f};
+        }
+        dynamicPackage.tensors.push_back(std::move(tensor));
+    };
+    ModelWeightPage parameterPage;
+    parameterPage.layer = 0;
+    parameterPage.bank = inputBindingByIndex(1).bank;
+    std::uint16_t nextParameterStream = 0;
+    const auto appendPackedParameter = [&] (
+        std::uint32_t bindingIndex, std::string name,
+        const std::vector<std::uint8_t>& logical) {
+        const BinaryBinding& binding = inputBindingByIndex(bindingIndex);
+        if (binding.bank != parameterPage.bank)
+            throw std::logic_error(
+                "Qwen parameter page spans multiple MEM banks");
+        PackedWeightImage image =
+            pack_binding_image(binding, logical, program.hardware);
+        const std::string tensorName = name;
+        dynamicPackage.tensors.push_back(ModelTensor{
+            std::move(name), BindingElementType::I8,
+            {static_cast<std::uint64_t>(image.data.size())},
+            std::move(image.data),
+            ModelTensorEncoding::TargetPackedSramVectors});
+        parameterPage.tensors.push_back(tensorName);
+        for (const PackedWeightSegment& segment : image.segments) {
+            parameterPage.segments.push_back(ModelWeightPage::Segment{
+                tensorName, segment.byte_offset, segment.hemisphere,
+                segment.slice, segment.base_row, segment.vector_count,
+                nextParameterStream});
+            expectedPagedBytes += static_cast<std::size_t>(
+                segment.vector_count) * ftlpu::hw::kPhysicalVectorBytes;
+            nextParameterStream = static_cast<std::uint16_t>(
+                (nextParameterStream + 1)
+                % program.hardware.c2c_streams_per_direction);
+        }
+    };
+    appendPackedParameter(1, "input_layernorm.weight", gamma0);
+    if (hasAttentionBias) {
+        appendPackedParameter(6, "self_attn.q_proj.bias", queryBias);
+        appendPackedParameter(7, "self_attn.k_proj.bias", keyBias);
+        appendPackedParameter(8, "self_attn.v_proj.bias", valueBias);
+    }
+    appendPackedParameter(
+        static_cast<std::uint32_t>(postAttentionNormBinding),
+        "post_attention_layernorm.weight", gamma1);
+    dynamicPackage.weight_pages.push_back(std::move(parameterPage));
+    ++expectedPrefetches;
+
+    appendTensor(2, "self_attn.q_proj.weight", queryWeight, true);
+    appendTensor(3, "self_attn.k_proj.weight", keyWeight, true);
+    appendTensor(4, "self_attn.v_proj.weight", valueWeight, true);
+    appendTensor(5, "self_attn.o_proj.weight", outputWeight, true);
+    appendTensor(static_cast<std::uint32_t>(gateBinding),
+        "mlp.gate_proj.weight", gateWeight, true);
+    appendTensor(static_cast<std::uint32_t>(upBinding),
+        "mlp.up_proj.weight", upWeight, true);
+    appendTensor(static_cast<std::uint32_t>(downBinding),
+        "mlp.down_proj.weight", downWeight, true);
+
+    const BinaryBinding& dynamicInput = inputBindingByIndex(0);
+    const auto dynamicOutput = std::ranges::find_if(
+        program.bindings, [](const BinaryBinding& binding) {
+            return binding.access == BindingAccess::Output
+                && binding.index == 0;
+        });
+    if (dynamicOutput == program.bindings.end())
+        throw std::logic_error(
+            "Qwen dynamic C2C test is missing output binding 0");
+    dynamicPackage.values = {
+        {"hidden.0", dynamicInput.element_type, dynamicInput.shape,
+         true, false},
+        {"hidden.1", dynamicOutput->element_type, dynamicOutput->shape,
+         false, true},
+    };
+
+    std::vector<ModelStateBindingRef> stateRefs;
+    for (const BinaryBinding& binding : program.bindings) {
+        ModelStateKind kind{};
+        std::string name;
+        if (binding.access != BindingAccess::Internal)
+            continue;
+        if (binding.role == "state.kv.key") {
+            kind = ModelStateKind::KvKey;
+            name = "layers.0.key_cache";
+        } else if (binding.role == "state.kv.value") {
+            kind = ModelStateKind::KvValue;
+            name = "layers.0.value_cache";
+        } else {
+            continue;
+        }
+        auto logicalShape = binding.shape;
+        if (logicalShape.empty())
+            throw std::logic_error(
+                "Qwen dynamic C2C state binding has an empty shape");
+        const auto residentTokens = static_cast<std::uint32_t>(
+            logicalShape.front());
+        const auto capacity = std::max<std::uint32_t>(256, residentTokens);
+        logicalShape.front() = capacity;
+        dynamicPackage.states.push_back(ModelState{
+            name, kind, binding.element_type, std::move(logicalShape), 0,
+            capacity, program.hardware.mxm_rows, residentTokens});
+        stateRefs.push_back({binding.index, std::move(name)});
+    }
+
+    dynamicPackage.executables.push_back(
+        {"decoder.layer0", program, {}});
+    ModelInvocation dynamicInvocation;
+    dynamicInvocation.name = "decoder.layer0";
+    dynamicInvocation.executable_index = 0;
+    dynamicInvocation.inputs = {
+        {0, "hidden.0"},
+        {1, "input_layernorm.weight"},
+        {2, "self_attn.q_proj.weight"},
+        {3, "self_attn.k_proj.weight"},
+        {4, "self_attn.v_proj.weight"},
+        {5, "self_attn.o_proj.weight"},
+    };
+    if (hasAttentionBias) {
+        dynamicInvocation.inputs.push_back(
+            {6, "self_attn.q_proj.bias"});
+        dynamicInvocation.inputs.push_back(
+            {7, "self_attn.k_proj.bias"});
+        dynamicInvocation.inputs.push_back(
+            {8, "self_attn.v_proj.bias"});
+    }
+    dynamicInvocation.inputs.push_back({
+        static_cast<std::uint32_t>(postAttentionNormBinding),
+        "post_attention_layernorm.weight"});
+    dynamicInvocation.inputs.push_back({
+        static_cast<std::uint32_t>(gateBinding), "mlp.gate_proj.weight"});
+    dynamicInvocation.inputs.push_back({
+        static_cast<std::uint32_t>(upBinding), "mlp.up_proj.weight"});
+    dynamicInvocation.inputs.push_back({
+        static_cast<std::uint32_t>(downBinding), "mlp.down_proj.weight"});
+    dynamicInvocation.outputs = {{0, "hidden.1"}};
+    dynamicInvocation.states = std::move(stateRefs);
+    dynamicInvocation.weight_page = 0;
+    dynamicPackage.invocations.push_back(std::move(dynamicInvocation));
+
+    // The direct run has completed and `actual` owns its downloaded output.
+    // Release its large chip model before constructing the C2C-backed one.
+    runtimeOwner.reset();
+    systemOwner.reset();
+    system = nullptr;
+    ftlpu::C2cDmaSystem dynamicSystem;
+    ModelSession dynamicSession(dynamicSystem);
+    const char* dynamicPipelineTracePath =
+        std::getenv("FTLPU_QWEN_C2C_PIPELINE_CSV");
+    if (dynamicPipelineTracePath != nullptr)
+        dynamicSession.enable_execution_trace();
+    if (const char* dynamicMemTrace =
+            std::getenv("FTLPU_QWEN_C2C_MEM_CSV"))
+        dynamicSession.stream_mem_execution_trace_csv(dynamicMemTrace);
+    dynamicSession.load(std::move(dynamicPackage));
+    dynamicSession.set_input("hidden.0", input);
+    try {
+        dynamicSession.run(kCheckpointDrainCycles);
+    } catch (...) {
+        if (const char* linkedPath =
+                std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
+            dynamicSession.write_last_linked_program(linkedPath);
+        throw;
+    }
+    if (dynamicPipelineTracePath != nullptr)
+        dynamicSession.write_execution_trace_csv(dynamicPipelineTracePath);
+    const auto& dynamicActual = dynamicSession.value("hidden.1");
+    if (dynamicActual.size() != actual.size())
+        throw std::logic_error(
+            "Qwen dynamic C2C output byte size differs from direct golden: "
+            + std::to_string(dynamicActual.size()) + " vs "
+            + std::to_string(actual.size()));
+    if (dynamicActual != actual) {
+        std::size_t firstMismatch = 0;
+        while (firstMismatch < actual.size()
+            && dynamicActual[firstMismatch] == actual[firstMismatch])
+            ++firstMismatch;
+        throw std::logic_error(
+            "Qwen dynamic C2C output differs from direct golden at byte "
+            + std::to_string(firstMismatch));
+    }
+    const ModelSessionStats& dynamicStats = dynamicSession.stats();
+    if (dynamicStats.weight_page_prefetches != expectedPrefetches
+        || dynamicStats.weight_page_prefetch_bytes != expectedPagedBytes)
+        throw std::logic_error(
+            "Qwen dynamic C2C transfer accounting mismatch: prefetches="
+            + std::to_string(dynamicStats.weight_page_prefetches)
+            + " expected_prefetches=" + std::to_string(expectedPrefetches)
+            + " bytes="
+            + std::to_string(dynamicStats.weight_page_prefetch_bytes)
+            + " expected_bytes=" + std::to_string(expectedPagedBytes));
+    if (dynamicStats.weight_page_runtime_wait_cycles != 0)
+        throw std::logic_error(
+            "Qwen dynamic C2C execution stalled after program start: "
+            + std::to_string(dynamicStats.weight_page_runtime_wait_cycles)
+            + " cycles");
+    const BinaryProgram& linkedProgram =
+        dynamicSession.last_linked_program();
+    std::array<bool, ftlpu::InstructionControlUnit::kMemQueues>
+        seenLinkedMemQueue{};
+    std::size_t linkedSyncInstructions = 0;
+    for (const QueueProgram& queue : linkedProgram.queues) {
+        if (queue.kind != QueueKind::Mem)
+            continue;
+        if (queue.index >= seenLinkedMemQueue.size()
+            || seenLinkedMemQueue[queue.index])
+            throw std::logic_error(
+                "Qwen dynamic linker produced a duplicate MEM ICU queue");
+        seenLinkedMemQueue[queue.index] = true;
+        for (std::size_t pc = 0; pc < queue.commands.size();) {
+            if (is_mem_synchronized_raw_packet_header(
+                    queue.commands[pc])) {
+                static_cast<void>(
+                    decode_mem_synchronized_icu_packet(queue, pc));
+                ++linkedSyncInstructions;
+                pc += ftlpu::InstructionControlUnit::MemIcu::
+                          synchronized_packet_word_count;
+                continue;
+            }
+            if (is_fu_3d_raw_packet_header(queue.commands[pc])) {
+                if (is_mem_write_read_2d_raw_packet_header(
+                        queue.commands[pc]))
+                    static_cast<void>(
+                        decode_mem_write_read_2d_raw_packet(queue, pc));
+                else
+                    static_cast<void>(decode_fu_3d_raw_packet_loop(
+                        queue, pc));
+                pc += fu_3d_raw_packet_word_count(queue.kind);
+                continue;
+            }
+            ++pc;
+        }
+    }
+    if (linkedSyncInstructions != expectedSyncInstructions)
+        throw std::logic_error(
+            "Qwen dynamic linker MEM_WRITE_SYNC count mismatch: linked="
+            + std::to_string(linkedSyncInstructions)
+            + " expected=" + std::to_string(expectedSyncInstructions));
+    if (dynamicStats.weight_page_synchronized_writes
+        != expectedSynchronizedWrites)
+        throw std::logic_error(
+            "Qwen dynamic C2C synchronized MEM FU write mismatch: issued="
+            + std::to_string(
+                dynamicStats.weight_page_synchronized_writes)
+            + " expected=" + std::to_string(expectedSynchronizedWrites));
+    if (const char* linkedPath =
+            std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
+        dynamicSession.write_last_linked_program(linkedPath);
+    std::cout << "Qwen dynamic C2C pages passed: uses="
+              << program.weight_page_uses.size()
+              << ", prefetches=" << dynamicStats.weight_page_prefetches
+              << ", bytes=" << dynamicStats.weight_page_prefetch_bytes
+              << ", linked_mem_sync=" << linkedSyncInstructions
+              << ", synchronized_fu_writes="
+              << dynamicStats.weight_page_synchronized_writes
+              << ", initial_wait_cycles="
+              << dynamicStats.weight_page_initial_wait_cycles
+              << ", runtime_wait_cycles="
+              << dynamicStats.weight_page_runtime_wait_cycles << '\n';
+#endif
     std::cout << "Complete " FTLPU_TEST_MODEL_NAME
                  " decoder layer passed: "
               << kSeqLen * kHidden << " BF16 values, nonzero="

@@ -1,8 +1,10 @@
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/imem_capacity.hpp"
 
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -10,6 +12,26 @@ namespace {
 void require(bool condition, const char* message)
 {
     if (!condition) throw std::logic_error(message);
+}
+
+template <typename Packet>
+std::vector<ftlpu::software::runtime::QueueCommand> raw_commands(
+    const Packet& packet)
+{
+    using namespace ftlpu::software::runtime;
+    std::vector<QueueCommand> commands;
+    commands.reserve(Packet::kWordCount);
+    for (const auto& physicalWord : packet.words) {
+        QueueCommand command;
+        command.command = physicalWord.lanes[0];
+        command.instruction_kind = InstructionKind::Vxm;
+        command.word_count = Packet::kLanesPerWord;
+        for (std::size_t laneIndex = 0;
+             laneIndex < Packet::kLanesPerWord; ++laneIndex)
+            command.words[laneIndex] = physicalWord.lanes[laneIndex];
+        commands.push_back(command);
+    }
+    return commands;
 }
 
 } // namespace
@@ -79,7 +101,57 @@ try {
     require(issueCycles == std::vector<std::size_t> {2, 7, 19, 24},
         "VXM_STREAM_ND issued at incorrect absolute cycles");
 
-    std::cout << "vxm_stream_nd_binary_test passed\n";
+    const auto rawPacket = isa::encode_vxm_icu_run_2d_instruction(
+        VxmIcuRun2DInstruction::Run2D(
+            0, {2, 2}, {5, 17}, packet));
+    BinaryProgram rawProgram;
+    rawProgram.max_cycle = 24;
+    auto rawCommands = raw_commands(rawPacket);
+    rawCommands.insert(rawCommands.begin(),
+        QueueCommand {isa::encode_icu_nop(2)});
+    rawProgram.queues.push_back(QueueProgram {
+        QueueKind::Vxm, 0, std::move(rawCommands)});
+    write_binary_program(rawProgram, path);
+    const auto rawDecoded = read_binary_program(path);
+    require(rawDecoded.queues.size() == 1
+            && rawDecoded.queues[0].commands.size()
+                == isa::EncodedVxmIcuRun2DPacket::kWordCount + 1
+            && is_fu_3d_raw_packet_header(
+                rawDecoded.queues[0].commands[1]),
+        "raw VXM RUN_2D did not survive binary round-trip");
+    for (std::size_t word = 0; word < rawPacket.words.size(); ++word)
+        require(rawDecoded.queues[0].commands[word + 1].words
+                    == rawProgram.queues[0].commands[word + 1].words,
+            "raw VXM RUN_2D changed a physical i-MEM word");
+
+    const auto capacity = analyze_physical_imem(rawDecoded);
+    require(capacity.fits() && capacity.queues.size() == 1
+            && capacity.queues[0].physical_slots == 4
+            && capacity.queues[0].nop_entries == 1
+            && capacity.queues[0].coarse_program_entries == 1
+            && capacity.queues[0].expanded_work == 4
+            && capacity.queues[0].peak_fu_3d_contexts == 1
+            && capacity.queues[0].fu_3d_context_capacity
+                == hw::kIcuVxmRun2DContextDepth
+            && capacity.queues[0].fu_3d_context_bits
+                == hw::kIcuVxmRun2DContextBits,
+        "raw VXM RUN_2D capacity accounting is incorrect");
+
+    InstructionControlUnit rawIcu;
+    load_queue_programs_into_icu(rawDecoded.queues, rawIcu);
+    issueCycles.clear();
+    for (std::size_t cycle = 0; cycle <= 24; ++cycle) {
+        if (const auto issued = rawIcu.vxm_iq(0).tick()) {
+            require(*issued == packet,
+                "raw runtime loader changed the VXM compact config");
+            issueCycles.push_back(cycle);
+        }
+    }
+    require(issueCycles == std::vector<std::size_t> {2, 7, 19, 24},
+        "raw VXM RUN_2D issued at incorrect absolute cycles");
+
+    std::cout << "vxm_stream_nd_binary_test passed: legacy_adapter=1 "
+              << "raw_run_2d_words=3 launches=4 run_length=32\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "vxm_stream_nd_binary_test failed: "

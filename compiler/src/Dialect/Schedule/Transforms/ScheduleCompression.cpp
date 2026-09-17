@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <tuple>
 
 namespace ftlpu::compiler {
@@ -91,18 +92,55 @@ bool same_vxm_body(schedule::VxmOp lhs, schedule::VxmOp rhs)
         if (lhs->getAttr(name) != rhs->getAttr(name))
             return false;
     return lhs.getRepeatCount() == 1 && rhs.getRepeatCount() == 1
+        && lhs.getWaveCount().value_or(1) == 1
+        && rhs.getWaveCount().value_or(1) == 1
         && lhs.getResult().getType() == rhs.getResult().getType();
 }
 
-bool same_sxm_body(schedule::SxmOp lhs, schedule::SxmOp rhs)
+std::optional<int64_t> sxm_permute_map_delta(
+    schedule::SxmOp lhs, schedule::SxmOp rhs)
 {
-    for (llvm::StringRef name : {"hemisphere", "opcode",
-               "source_streams", "destination_streams", "permute_map",
-               "weight_layout", "output_row", "input_row", "output_tile"})
-        if (lhs->getAttr(name) != rhs->getAttr(name))
-            return false;
-    return lhs.getRepeatCount().value_or(1) == 1
-        && rhs.getRepeatCount().value_or(1) == 1;
+    if (lhs.getOpcode() != rhs.getOpcode()) return std::nullopt;
+    if (lhs.getOpcode() != "permute")
+        return lhs.getPermuteMap() == rhs.getPermuteMap()
+            ? std::optional<int64_t> {0} : std::nullopt;
+
+    std::optional<int64_t> delta;
+    for (std::size_t lane = 0; lane < lhs.getPermuteMap().size(); ++lane) {
+        const auto left = llvm::cast<mlir::IntegerAttr>(
+            lhs.getPermuteMap()[lane]).getInt();
+        const auto right = llvm::cast<mlir::IntegerAttr>(
+            rhs.getPermuteMap()[lane]).getInt();
+        if (left < 0 || right < 0) {
+            if (left != right) return std::nullopt;
+            continue;
+        }
+        const auto current = (right - left + 32) % 32;
+        if (!delta) delta = current;
+        else if (*delta != current) return std::nullopt;
+    }
+    return delta.value_or(0);
+}
+
+bool sxm_permute_map_matches(schedule::SxmOp base,
+    schedule::SxmOp candidate, int64_t stride, std::size_t index)
+{
+    if (base.getOpcode() != candidate.getOpcode()) return false;
+    if (base.getOpcode() != "permute")
+        return base.getPermuteMap() == candidate.getPermuteMap();
+    const auto delta = static_cast<int64_t>(index) * stride;
+    for (std::size_t lane = 0; lane < base.getPermuteMap().size(); ++lane) {
+        const auto first = llvm::cast<mlir::IntegerAttr>(
+            base.getPermuteMap()[lane]).getInt();
+        const auto value = llvm::cast<mlir::IntegerAttr>(
+            candidate.getPermuteMap()[lane]).getInt();
+        if (first < 0 || value < 0) {
+            if (first != value) return false;
+            continue;
+        }
+        if ((first + delta) % 32 != value) return false;
+    }
+    return true;
 }
 
 const void* attribute_pointer(mlir::Attribute attribute)
@@ -704,7 +742,9 @@ private:
         };
         std::map<const void*, Group> groups;
         function.walk([&](schedule::MxmDequantOp op) {
-            if (op.getWaveCount().value_or(1) != 1) return;
+            if (op.getWaveCount().value_or(1) != 1
+                || op.getGroupCount().value_or(1) != 1)
+                return;
             auto attributes = operation_pattern_attributes(op,
                 &getContext(), {"cycle", "wave_count", "wave_interval"});
             groups[attributes.getAsOpaquePointer()].operations.push_back(op);
@@ -777,7 +817,9 @@ private:
             const void*, int64_t, int64_t>;
         std::map<GroupKey, llvm::SmallVector<ComputePair>> groups;
         function.walk([&](schedule::MxmComputeOp compute) {
-            if (compute.getWaveCount().value_or(1) != 1) return;
+            if (compute.getWaveCount().value_or(1) != 1
+                || compute.getGroupCount().value_or(1) != 1)
+                return;
             schedule::MxmAccumulateOp accumulator;
             for (mlir::Operation* user : compute.getResult().getUsers()) {
                 auto candidate =
@@ -786,7 +828,8 @@ private:
                 accumulator = candidate;
             }
             if (!accumulator
-                || accumulator.getWaveCount().value_or(1) != 1)
+                || accumulator.getWaveCount().value_or(1) != 1
+                || accumulator.getGroupCount().value_or(1) != 1)
                 return;
             auto computeAttributes = operation_pattern_attributes(compute,
                 &getContext(), {"cycle", "result_cycle", "wave_count",
@@ -1210,52 +1253,64 @@ private:
     void compressSxm(
         mlir::func::FuncOp function, mlir::Builder& builder)
     {
-        llvm::SmallVector<schedule::SxmOp> operations;
-        function.walk(
-            [&](schedule::SxmOp op) { operations.push_back(op); });
-        llvm::sort(operations,
-            [](schedule::SxmOp lhs, schedule::SxmOp rhs) {
-                if (lhs.getHemisphere() != rhs.getHemisphere())
-                    return lhs.getHemisphere() < rhs.getHemisphere();
-                if (lhs.getOpcode() != rhs.getOpcode())
-                    return lhs.getOpcode() < rhs.getOpcode();
-                return lhs.getCycle() < rhs.getCycle();
-            });
-
+        std::map<const void*, llvm::SmallVector<schedule::SxmOp>> groups;
+        function.walk([&](schedule::SxmOp op) {
+            if (op.getRepeatCount().value_or(1) != 1
+                || op.getWaveCount().value_or(1) != 1)
+                return;
+            const auto key = operation_pattern_attributes(op, &getContext(),
+                {"cycle", "repeat_count", "repeat_interval",
+                    "permute_map", "permute_map_stride"});
+            groups[key.getAsOpaquePointer()].push_back(op);
+        });
         llvm::SmallVector<schedule::SxmOp> toErase;
-        for (std::size_t index = 0; index < operations.size();) {
-            schedule::SxmOp first = operations[index];
-            std::size_t end = index + 1;
-            if (end >= operations.size()
-                || !same_sxm_body(first, operations[end])) {
-                ++index;
-                continue;
-            }
-            const int64_t interval =
-                operations[end].getCycle() - first.getCycle();
-            if (interval <= 0 || interval > kMaxRepeatInterval) {
-                ++index;
-                continue;
-            }
-            ++end;
-            while (end < operations.size()
-                && static_cast<int64_t>(end - index)
-                    < kMaxRepeatCount) {
-                const int64_t repeat =
-                    static_cast<int64_t>(end - index);
-                if (!same_sxm_body(first, operations[end])
-                    || operations[end].getCycle()
-                        != first.getCycle() + repeat * interval)
-                    break;
+        for (auto& [key, operations] : groups) {
+            (void)key;
+            llvm::sort(operations,
+                [](schedule::SxmOp lhs, schedule::SxmOp rhs) {
+                    return lhs.getCycle() < rhs.getCycle();
+                });
+            for (std::size_t index = 0; index < operations.size();) {
+                schedule::SxmOp first = operations[index];
+                std::size_t end = index + 1;
+                if (end >= operations.size()) {
+                    ++index;
+                    continue;
+                }
+                const int64_t interval =
+                    operations[end].getCycle() - first.getCycle();
+                if (interval <= 0 || interval > kMaxRepeatInterval) {
+                    ++index;
+                    continue;
+                }
+                const auto mapStride =
+                    sxm_permute_map_delta(first, operations[end]);
+                if (!mapStride) {
+                    ++index;
+                    continue;
+                }
                 ++end;
+                while (end < operations.size()
+                    && static_cast<int64_t>(end - index)
+                        < kMaxRepeatCount
+                    && operations[end].getCycle()
+                        == first.getCycle()
+                            + static_cast<int64_t>(end - index)
+                                * interval
+                    && sxm_permute_map_matches(first, operations[end],
+                        *mapStride, end - index))
+                    ++end;
+                first->setAttr("repeat_count",
+                    builder.getI64IntegerAttr(end - index));
+                first->setAttr("repeat_interval",
+                    builder.getI64IntegerAttr(interval));
+                first->setAttr("permute_map_stride",
+                    builder.getI64IntegerAttr(*mapStride));
+                for (std::size_t erase = index + 1;
+                     erase < end; ++erase)
+                    toErase.push_back(operations[erase]);
+                index = end;
             }
-            first->setAttr("repeat_count",
-                builder.getI64IntegerAttr(end - index));
-            first->setAttr(
-                "repeat_interval", builder.getI64IntegerAttr(interval));
-            for (std::size_t erase = index + 1; erase < end; ++erase)
-                toErase.push_back(operations[erase]);
-            index = end;
         }
         for (schedule::SxmOp operation : toErase)
             operation.erase();

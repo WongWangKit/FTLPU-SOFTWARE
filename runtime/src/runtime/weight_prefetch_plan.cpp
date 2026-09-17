@@ -254,6 +254,24 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         throw std::logic_error(
             "paged weights require non-zero C2C bandwidth");
     const std::uint64_t bandwidth = lanes * bytesPerLane;
+    // Runtime C2C RX enters the high-numbered ordinary West streams. A page
+    // transfer must not inject there while the executable still has an
+    // in-flight producer on those same SR lanes. The compiler-provided
+    // release includes the fabric drain after the last ordinary use.
+    std::uint64_t sharedStreamRelease = 0;
+    const std::size_t streamCount =
+        program.hardware.streams_per_direction;
+    if (lanes <= streamCount &&
+        program.stream_release_cycles.size() ==
+            program.hardware.encoded_streams &&
+        program.hardware.encoded_streams == 2 * streamCount) {
+        const std::size_t firstShared =
+            2 * streamCount - static_cast<std::size_t>(lanes);
+        for (std::size_t lane = 0; lane < lanes; ++lane)
+            sharedStreamRelease = std::max(
+                sharedStreamRelease,
+                program.stream_release_cycles[firstShared + lane]);
+    }
     const std::uint64_t clockMhz = runtimeHardware.lpu_clock_mhz;
     const std::uint64_t ddrBandwidth =
         runtimeHardware.ddr_peak_bandwidth_mbytes_per_second;
@@ -352,8 +370,8 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         // available to absorb DDR latency and jitter. Launch at the earliest
         // physically safe cycle; page-ready synchronization still protects
         // the consumer when runtime bandwidth is lower than planned.
-        plan.start_cycle = std::max(
-            reusableCycles[index], nextQueueCursor);
+        plan.start_cycle = std::max({reusableCycles[index],
+            nextQueueCursor, sharedStreamRelease});
         plan.transfer_end_cycle = plan.start_cycle + durations[index];
         std::array<std::uint64_t, hw::kHemispheres> segmentCounts{};
         for (const auto& region : plan.regions)

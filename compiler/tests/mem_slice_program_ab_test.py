@@ -16,6 +16,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     enabled = args.output_dir / "mem-slice-on.ftlpu"
     disabled = args.output_dir / "mem-slice-off.ftlpu"
+    defaulted = args.output_dir / "mem-slice-default.ftlpu"
 
     common = [
         str(args.translate), "--input", str(args.input),
@@ -29,6 +30,10 @@ def main() -> None:
     subprocess.run(
         common + ["--output", str(disabled),
                   "--mem-slice-program", "off"],
+        check=True,
+    )
+    subprocess.run(
+        common + ["--output", str(defaulted)],
         check=True,
     )
     if enabled.stat().st_size >= disabled.stat().st_size:
@@ -47,6 +52,17 @@ def main() -> None:
         raise RuntimeError("runtime inspector did not prove A/B equivalence")
     if "mem_slice_program=1 mem_slice_body=2" not in result.stdout:
         raise RuntimeError("compiler did not form the expected two-body program")
+
+    default_result = subprocess.run(
+        [str(args.inspect), str(defaulted), "--compare", str(disabled)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    if "binary compare result=equivalent" not in default_result.stdout:
+        raise RuntimeError("default MEM encoding differs from explicit hardware-compatible mode")
+    if "mem_slice_program=0" not in default_result.stdout:
+        raise RuntimeError("compiler enabled legacy MEM_SLICE_PROGRAM by default")
 
 
 if __name__ == "__main__":

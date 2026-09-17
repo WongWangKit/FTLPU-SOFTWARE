@@ -29,6 +29,9 @@ std::size_t group_index(QueueKind kind)
     case QueueKind::Vxm: return 4;
     case QueueKind::SxmTranspose: return 5;
     case QueueKind::SxmPermute: return 6;
+    case QueueKind::C2cDma: return 7;
+    case QueueKind::C2cTx: return 8;
+    case QueueKind::C2cRx: return 9;
     }
     throw std::logic_error("unknown ICU queue kind in runtime performance report");
 }
@@ -37,7 +40,57 @@ std::size_t issued_commands(const QueueProgram& queue)
 {
     std::size_t issued = 0;
     std::size_t prior_instructions = 0;
-    for (const auto& command : queue.commands) {
+    for (std::size_t commandIndex = 0;
+         commandIndex < queue.commands.size(); ++commandIndex) {
+        const auto& command = queue.commands[commandIndex];
+        if (is_mem_synchronized_raw_packet_header(command)) {
+            static_cast<void>(decode_mem_synchronized_icu_packet(
+                queue, commandIndex));
+            issued += static_cast<std::size_t>(
+                (command.words[0] >> 2) & 0xffffU) + 1;
+            ++prior_instructions;
+            commandIndex += InstructionControlUnit::MemIcu::
+                synchronized_packet_word_count - 1;
+            continue;
+        }
+        if (is_mem_synchronized_raw_word_command(command)
+            && isa::decode_icu_command_opcode(command.command)
+                == isa::IcuCommandOpcode::Instruction)
+            throw std::logic_error(
+                "runtime performance found an orphan MEM_WRITE_SYNC continuation word");
+        if (queue.kind == QueueKind::C2cDma
+            && command.instruction_kind == InstructionKind::C2cDma) {
+            static_cast<void>(decode_c2c_dma_icu_packet(
+                queue, commandIndex));
+            ++issued;
+            ++prior_instructions;
+            commandIndex += C2cDmaIcuPacket::kWordCount - 1;
+            continue;
+        }
+        if (is_fu_3d_raw_packet_header(command)) {
+            if (queue.kind == QueueKind::Mem
+                && is_mem_write_read_2d_raw_packet_header(command)) {
+                const auto instruction =
+                    decode_mem_write_read_2d_raw_packet(queue, commandIndex);
+                issued += 2 * instruction.counts[0]
+                    * instruction.counts[1];
+                ++prior_instructions;
+                commandIndex +=
+                    isa::EncodedMemIcuWriteRead2DPacket::kWordCount - 1;
+                continue;
+            }
+            const auto loop =
+                decode_fu_3d_raw_packet_loop(queue, commandIndex);
+            std::size_t points = 1;
+            for (const auto count : loop.counts) points *= count;
+            issued += points;
+            ++prior_instructions;
+            commandIndex += fu_3d_raw_packet_word_count(queue.kind) - 1;
+            continue;
+        }
+        if (is_fu_3d_raw_word_command(command))
+            throw std::logic_error(
+                "runtime performance found an orphan raw FU packet word");
         if (is_mem_slice_program_command(command)) {
             const auto program = decode_mem_slice_program_command(command);
             std::size_t points = program.body.size();
@@ -90,6 +143,13 @@ std::size_t issued_commands(const QueueProgram& queue)
             issued += repeat.inner_count * repeat.outer_count - 1;
             continue;
         }
+        if (is_icu_control_raw_word_command(command)) {
+            const auto control = decode_icu_control_raw_word(command);
+            if (control.opcode == IcuControlOpcode::Sync
+                || control.opcode == IcuControlOpcode::Notify
+                || control.opcode == IcuControlOpcode::WaitEvent)
+                continue;
+        }
         const auto opcode = isa::decode_icu_command_opcode(command.command);
         if (opcode == isa::IcuCommandOpcode::Instruction) {
             ++issued;
@@ -117,7 +177,7 @@ void print_runtime_performance(
     const std::size_t logical_mxm_queues =
         program.hardware.hemispheres
         * program.hardware.mxms_per_hemisphere;
-    std::array<QueueGroupStats, 7> groups {{
+    std::array<QueueGroupStats, 10> groups {{
         {"MEM", program.hardware.hemispheres
                 * program.hardware.slices_per_hemisphere
                 * program.hardware.banks_per_slice},
@@ -127,6 +187,9 @@ void print_runtime_performance(
         {"VXM", program.hardware.vxm_alus},
         {"SXM.transpose", program.hardware.hemispheres},
         {"SXM.permute", program.hardware.hemispheres},
+        {"C2C.DMA", program.hardware.hemispheres},
+        {"C2C.TX", program.hardware.hemispheres},
+        {"C2C.RX", program.hardware.hemispheres},
     }};
 
     for (const auto& queue : program.queues) {

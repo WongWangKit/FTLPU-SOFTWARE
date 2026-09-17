@@ -47,9 +47,11 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
   const llvm::StringRef dataFormat = lpu_16bit_data_format(elementType);
   const int64_t tile = target_.throughput().mxm_rows;
   const int64_t tokenBlocks = op_.getSeqLen() / tile;
+  const int64_t headBlocks = op_.getHeadDim() / tile;
   const int64_t reductionBlocks = op_.getQueryHeads() * op_.getHeadDim() / tile;
   const int64_t outputGroups =
       op_.getHidden() / (tile * target_.memory().hemispheres);
+  const int64_t computeInterval = tile;
   const int64_t localMxm = 0;
   const int64_t weightToIw = target_.throughput().vxm_weight_to_iw_latency;
   const bool localDequant = target_.supports_mxm_local_dequant();
@@ -114,6 +116,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
             qkvEnd + transferCycles.getInt() + kC2cTransportGuardCycles);
     }
   }
+  int64_t nextOutputWeightDomain = 0;
   for (int64_t outputGroup = 0; outputGroup < outputGroups; ++outputGroup) {
     const auto selectedWeightSlices = layout.outputWeightSlices(outputGroup);
     int64_t maxWeightReadLatency = 0;
@@ -122,8 +125,12 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
           std::max(maxWeightReadLatency, weightReadLatency(slice));
     const int64_t initialReadyLead =
         std::max(maxWeightReadLatency + weightLoadLead, contextReadLatency);
-    int64_t nextReductionCompute = phaseStart + initialReadyLead;
-    std::vector<int64_t> weightBufferRelease(
+    std::vector<int64_t> firstComputeCycles(
+        static_cast<std::size_t>(reductionBlocks));
+    std::vector<int64_t> dequantStartCycles(
+        static_cast<std::size_t>(reductionBlocks));
+    int64_t plannedNextCompute = phaseStart + initialReadyLead;
+    std::vector<int64_t> plannedWeightBufferRelease(
         static_cast<std::size_t>(target_.throughput().mxm_weight_buffers),
         std::numeric_limits<int64_t>::min());
     for (int64_t reductionBlock = 0; reductionBlock < reductionBlocks;
@@ -131,33 +138,360 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
       const int64_t weightBuffer =
           (outputGroup * reductionBlocks + reductionBlock) %
           target_.throughput().mxm_weight_buffers;
-      int64_t firstCompute = nextReductionCompute;
-      int64_t dequantStart = firstCompute - weightLoadLead;
-      dequantStart = std::max(dequantStart,
-          weightBufferRelease[static_cast<std::size_t>(weightBuffer)]);
-      firstCompute = std::max(
-          firstCompute, dequantStart + weightLoadLead);
+      int64_t firstCompute = plannedNextCompute;
+      int64_t dequantStart = std::max(
+          firstCompute - weightLoadLead,
+          plannedWeightBufferRelease[static_cast<std::size_t>(weightBuffer)]);
+      firstCompute = std::max(firstCompute, dequantStart + weightLoadLead);
+      firstComputeCycles[static_cast<std::size_t>(reductionBlock)] =
+          firstCompute;
+      dequantStartCycles[static_cast<std::size_t>(reductionBlock)] =
+          dequantStart;
+      const int64_t lastCompute =
+          firstCompute + (tokenBlocks - 1) * computeInterval;
+      plannedWeightBufferRelease[static_cast<std::size_t>(weightBuffer)] =
+          lastCompute + target_.mxm_result_window_cycles(tile);
+      plannedNextCompute = firstCompute + tokenBlocks * computeInterval;
+    }
+
+    // The output projection has one more affine loop outside the reduction
+    // domain: outputGroup.  Work out the exact distance to the next group
+    // before emitting any MEM operations, so the weight reader can represent
+    // all groups that retain the same physical placement with its third
+    // hardware counter.
+    const auto plannedOutputGroupEnd = [&](int64_t finalFirstCompute) {
+      const int64_t resultCycle =
+          finalFirstCompute + target_.mxm_first_result_latency();
+      int64_t finalWriteEnd = finalFirstCompute;
+      for (int64_t hemisphere = 0;
+           hemisphere < target_.memory().hemispheres; ++hemisphere) {
+        for (int64_t byte = 0; byte < 2; ++byte) {
+          const int64_t slice = resultSlices[hemisphere * 2 + byte];
+          const int64_t latency = *target_.transport_latency(
+              target::StreamEndpoint::MxmResult,
+              target::StreamEndpoint::Mem,
+              target::StreamDirection::West, slice);
+          finalWriteEnd = std::max(
+              finalWriteEnd, resultCycle + latency + op_.getSeqLen());
+          if (hemisphere != 0) {
+            const int64_t registerGroup =
+                slice / target_.streams().mem_slices_per_register_group;
+            finalWriteEnd = std::max(
+                finalWriteEnd,
+                resultCycle + target_.streams().system_register_columns +
+                    registerGroup + 1 + op_.getSeqLen());
+          }
+        }
+      }
+      return std::max(finalFirstCompute + tokenBlocks * computeInterval,
+                      finalWriteEnd);
+    };
+    const int64_t outputGroupEnd = plannedOutputGroupEnd(
+        firstComputeCycles[static_cast<std::size_t>(reductionBlocks - 1)]);
+    const int64_t outputGroupInterval = outputGroupEnd - phaseStart;
+
+    // A long-lived MEM descriptor owns one physical (hemisphere,slice,bank)
+    // ICU until its last generated request.  Do not carry a weight-read domain
+    // across an output-group boundary when context reads or result writes use
+    // that same ICU between two weight waves.
+    const auto slicesIntersect = [](llvm::ArrayRef<int64_t> lhs,
+                                    llvm::ArrayRef<int64_t> rhs) {
+      return llvm::any_of(lhs,
+                          [&](int64_t slice) {
+                            return llvm::is_contained(rhs, slice);
+                          });
+    };
+    const bool contextConflictsWithWeight =
+        contextBank == layout.outputWeightBank() &&
+        slicesIntersect(selectedWeightSlices, layout.contextSlices());
+    const bool resultConflictsWithWeight =
+        resultBank == layout.outputWeightBank() &&
+        llvm::any_of(resultSlices, [&](int64_t slice) {
+          return llvm::is_contained(selectedWeightSlices, slice);
+        });
+    const int64_t weightDomainSpan =
+        dequantStartCycles.back() - dequantStartCycles.front() + 4;
+    const bool mayMergeOutputGroups =
+        !contextConflictsWithWeight && !resultConflictsWithWeight &&
+        outputGroupInterval >= weightDomainSpan;
+    const auto sameWeightSlices = [](llvm::ArrayRef<int64_t> lhs,
+                                     llvm::ArrayRef<int64_t> rhs) {
+      return lhs.size() == rhs.size() && std::ranges::equal(lhs, rhs);
+    };
+    int64_t weightOutputGroupCount = 1;
+    if (mayMergeOutputGroups && outputGroup == nextOutputWeightDomain) {
+      const int64_t baseAddress =
+          layout.outputWeightAddress(outputGroup, 0, 0);
+      const int64_t groupAddressStride =
+          outputGroup + 1 < outputGroups
+              ? layout.outputWeightAddress(outputGroup + 1, 0, 0) -
+                    baseAddress
+              : 0;
+      weightOutputGroupCount = 1;
+      while (outputGroup + weightOutputGroupCount < outputGroups) {
+        const int64_t candidateGroup =
+            outputGroup + weightOutputGroupCount;
+        if (!sameWeightSlices(layout.outputWeightSlices(candidateGroup),
+                              selectedWeightSlices) ||
+            layout.outputWeightAddress(candidateGroup, 0, 0) !=
+                baseAddress +
+                    weightOutputGroupCount * groupAddressStride)
+          break;
+        ++weightOutputGroupCount;
+      }
+      nextOutputWeightDomain = outputGroup + weightOutputGroupCount;
+    } else if (mayMergeOutputGroups) {
+      // The first group in this placement run already emitted the complete
+      // outer domain.
+      weightOutputGroupCount = 0;
+    } else {
+      nextOutputWeightDomain = outputGroup + 1;
+    }
+
+    // Context activation reads are affine in three logical coordinates:
+    // row, reduction within one physical-slice run, and recurring slice run.
+    // Flatten the contiguous token blocks into the row coordinate so that the
+    // other two MEM counters can cover head blocks/query heads directly.  The
+    // domain is emitted here from the operator layout; no scalar MEM events
+    // are formed and subsequently compressed.
+    const auto emitContextReadDomain =
+        [&](int64_t firstReduction, int64_t waveReductionStride,
+            int64_t waveCount, int64_t groupReductionStride,
+            int64_t groupCount, int64_t hemisphere, int64_t byte) {
+          if (firstReduction < 0 || waveReductionStride <= 0 ||
+              waveCount <= 0 || groupReductionStride <= 0 ||
+              groupCount <= 0)
+            return false;
+          const auto reductionAt = [&](int64_t wave, int64_t group) {
+            return firstReduction + wave * waveReductionStride +
+                   group * groupReductionStride;
+          };
+          const int64_t lastReduction =
+              reductionAt(waveCount - 1, groupCount - 1);
+          if (lastReduction >= reductionBlocks)
+            return false;
+
+          const int64_t queryHead = firstReduction / headBlocks;
+          const int64_t headBlock = firstReduction % headBlocks;
+          const int64_t slice =
+              layout.contextSlice(queryHead, headBlock, byte);
+          // A long-lived READ_3D context cannot cross an output-weight read on
+          // the same physical MEM ICU.  Keep that topology as an explicit
+          // piecewise-domain boundary.
+          if (std::ranges::find(selectedWeightSlices, slice) !=
+              selectedWeightSlices.end())
+            return false;
+          const int64_t address =
+              layout.contextAddress(queryHead, headBlock, 0);
+          const int64_t latency = *target_.transport_latency(
+              target::StreamEndpoint::Mem,
+              target::StreamEndpoint::MxmActivation,
+              target::StreamDirection::East, slice);
+          const int64_t cycle =
+              firstComputeCycles[static_cast<std::size_t>(firstReduction)] -
+              latency;
+          const auto addressAt = [&](int64_t reduction) {
+            return layout.contextAddress(reduction / headBlocks,
+                                         reduction % headBlocks, 0);
+          };
+          const int64_t waveInterval =
+              waveCount > 1
+                  ? firstComputeCycles[static_cast<std::size_t>(
+                        reductionAt(1, 0))] -
+                        firstComputeCycles[static_cast<std::size_t>(
+                            firstReduction)]
+                  : 1;
+          const int64_t waveAddressStride =
+              waveCount > 1 ? addressAt(reductionAt(1, 0)) - address : 0;
+          const int64_t groupInterval =
+              groupCount > 1
+                  ? firstComputeCycles[static_cast<std::size_t>(
+                        reductionAt(0, 1))] -
+                        firstComputeCycles[static_cast<std::size_t>(
+                            firstReduction)]
+                  : 1;
+          const int64_t groupAddressStride =
+              groupCount > 1 ? addressAt(reductionAt(0, 1)) - address : 0;
+
+          // Prove that the requested rectangle is affine before materializing
+          // its single hardware descriptor.  This inspects the operator's
+          // closed-form schedule plan, not a list of generated instructions.
+          for (int64_t group = 0; group < groupCount; ++group) {
+            for (int64_t wave = 0; wave < waveCount; ++wave) {
+              const int64_t reduction = reductionAt(wave, group);
+              const int64_t candidateHead = reduction / headBlocks;
+              const int64_t candidateBlock = reduction % headBlocks;
+              if (layout.contextSlice(candidateHead, candidateBlock, byte) !=
+                      slice ||
+                  firstComputeCycles[static_cast<std::size_t>(reduction)] !=
+                      firstComputeCycles[static_cast<std::size_t>(
+                          firstReduction)] +
+                          wave * waveInterval + group * groupInterval ||
+                  layout.contextAddress(candidateHead, candidateBlock, 0) !=
+                      address + wave * waveAddressStride +
+                          group * groupAddressStride)
+                return false;
+            }
+          }
+          const int64_t repeatSpan = op_.getSeqLen() - 1;
+          const int64_t waveSpan =
+              repeatSpan + (waveCount - 1) * waveInterval;
+          if ((waveCount > 1 && waveInterval <= repeatSpan) ||
+              (groupCount > 1 && groupInterval <= waveSpan))
+            return false;
+
+          emitMem3D(
+              rewriter_, op_.getLoc(), cycle,
+              hemisphere * target_.memory().slices_per_hemisphere + slice,
+              "read", address, hemisphere * 2 + byte, op_.getSeqLen(), 1, 1,
+              "sram", -1, waveCount, waveInterval, waveAddressStride,
+              groupCount, groupInterval, groupAddressStride, contextBank);
+          return true;
+        };
+    const auto emitContextReadPiece =
+        [&](int64_t firstReduction, int64_t waveReductionStride,
+            int64_t waveCount, int64_t groupReductionStride,
+            int64_t groupCount, int64_t hemisphere, int64_t byte) {
+          if (emitContextReadDomain(firstReduction, waveReductionStride,
+                                    waveCount, groupReductionStride,
+                                    groupCount, hemisphere, byte))
+            return;
+          // A non-affine outer recurrence is still emitted directly as a
+          // finite set of closed-form slice-run domains.  Scalar reduction
+          // domains remain only for a true physical/body conflict.
+          for (int64_t group = 0; group < groupCount; ++group) {
+            const int64_t groupBase =
+                firstReduction + group * groupReductionStride;
+            if (emitContextReadDomain(groupBase, waveReductionStride,
+                                      waveCount, 1, 1, hemisphere, byte))
+              continue;
+            for (int64_t wave = 0; wave < waveCount; ++wave) {
+              const int64_t reduction =
+                  groupBase + wave * waveReductionStride;
+              const int64_t queryHead = reduction / headBlocks;
+              const int64_t headBlock = reduction % headBlocks;
+              const int64_t slice =
+                  layout.contextSlice(queryHead, headBlock, byte);
+              const int64_t latency = *target_.transport_latency(
+                  target::StreamEndpoint::Mem,
+                  target::StreamEndpoint::MxmActivation,
+                  target::StreamDirection::East, slice);
+              emitMem3D(
+                  rewriter_, op_.getLoc(),
+                  firstComputeCycles[static_cast<std::size_t>(reduction)] -
+                      latency,
+                  hemisphere * target_.memory().slices_per_hemisphere + slice,
+                  "read", layout.contextAddress(queryHead, headBlock, 0),
+                  hemisphere * 2 + byte, tile, 1, 1, "sram", -1,
+                  tokenBlocks, computeInterval, tile, 1, 1, 0, contextBank);
+            }
+          }
+        };
+
+    for (int64_t hemisphere = 0;
+         hemisphere < target_.memory().hemispheres; ++hemisphere) {
+      for (int64_t byte = 0; byte < 2; ++byte) {
+        if (!layout.contextHeadBlockPacked()) {
+          for (int64_t headBlock = 0; headBlock < headBlocks; ++headBlock)
+            emitContextReadPiece(headBlock, headBlocks, op_.getQueryHeads(), 1,
+                                 1, hemisphere, byte);
+          continue;
+        }
+        if (!layout.contextHemispherePaired()) {
+          emitContextReadPiece(0, 1, headBlocks, headBlocks,
+                               op_.getQueryHeads(), hemisphere, byte);
+          continue;
+        }
+        const int64_t queryHeadsPerKv =
+            op_.getQueryHeads() / op_.getKvHeads();
+        const int64_t sourceGroups =
+            queryHeadsPerKv > 0 ? op_.getQueryHeads() / queryHeadsPerKv : 0;
+        const int64_t reductionsPerSourceGroup =
+            queryHeadsPerKv * headBlocks;
+        if (queryHeadsPerKv <= 0 ||
+            queryHeadsPerKv * op_.getKvHeads() != op_.getQueryHeads()) {
+          emitContextReadPiece(0, 1, reductionBlocks, 1, 1, hemisphere,
+                               byte);
+          continue;
+        }
+        for (int64_t sourceHemisphere = 0;
+             sourceHemisphere < target_.memory().hemispheres &&
+             sourceHemisphere < sourceGroups;
+             ++sourceHemisphere) {
+          const int64_t recurringGroups =
+              1 + (sourceGroups - 1 - sourceHemisphere) /
+                      target_.memory().hemispheres;
+          emitContextReadPiece(
+              sourceHemisphere * reductionsPerSourceGroup, 1,
+              reductionsPerSourceGroup,
+              target_.memory().hemispheres * reductionsPerSourceGroup,
+              recurringGroups, hemisphere, byte);
+        }
+      }
+    }
+
+    int64_t nextReductionDomain = 0;
+    for (int64_t reductionBlock = 0; reductionBlock < reductionBlocks;
+         ++reductionBlock) {
+      const int64_t weightBuffer =
+          (outputGroup * reductionBlocks + reductionBlock) %
+          target_.throughput().mxm_weight_buffers;
+      const int64_t firstCompute =
+          firstComputeCycles[static_cast<std::size_t>(reductionBlock)];
+      const int64_t dequantStart =
+          dequantStartCycles[static_cast<std::size_t>(reductionBlock)];
+      int64_t reductionDomainCount = 0;
+      int64_t reductionDomainInterval = reductionBlocks > 1
+                                            ? dequantStartCycles[1] -
+                                                  dequantStartCycles[0]
+                                            : 1;
+      if (target_.throughput().mxm_weight_buffers > 2) {
+        reductionDomainCount = 1;
+        nextReductionDomain = reductionBlock + 1;
+      } else if (reductionBlock == nextReductionDomain) {
+        reductionDomainCount = 1;
+        if (reductionBlock + 1 < reductionBlocks) {
+          reductionDomainInterval =
+              dequantStartCycles[static_cast<std::size_t>(reductionBlock + 1)] -
+              dequantStart;
+          while (reductionBlock + reductionDomainCount < reductionBlocks &&
+                 dequantStartCycles[static_cast<std::size_t>(
+                     reductionBlock + reductionDomainCount)] ==
+                     dequantStart +
+                         reductionDomainCount * reductionDomainInterval)
+            ++reductionDomainCount;
+        }
+        nextReductionDomain = reductionBlock + reductionDomainCount;
+      }
       for (int64_t hemisphere = 0; hemisphere < target_.memory().hemispheres;
            ++hemisphere) {
         const char *hemi = hemisphere == 0 ? "east" : "west";
-        for (int64_t pulse = 0; pulse < 4; ++pulse) {
-          const int64_t cycle = dequantStart + hemisphere * 8 + pulse;
+        const int64_t loadCycle = dequantStart + hemisphere * 8;
+        if (reductionDomainCount != 0 && weightOutputGroupCount != 0) {
           for (int64_t stream = 0; stream < 8; ++stream) {
             const int64_t slice = selectedWeightSlices[stream];
-            emitMem(
-                rewriter_, op_.getLoc(), cycle - weightReadLatency(slice),
+            emitMem3D(
+                rewriter_, op_.getLoc(), loadCycle - weightReadLatency(slice),
                 hemisphere * target_.memory().slices_per_hemisphere + slice,
                 "read",
-                layout.outputWeightAddress(outputGroup, reductionBlock, pulse),
-                weightStreamBase + stream, 1, 1, 0, "sram",
+                layout.outputWeightAddress(outputGroup, reductionBlock, 0),
+                weightStreamBase + stream, 4, 1, 1, "sram",
                 functionArgumentIndex(op_.getOutputWeight()),
+                reductionDomainCount, reductionDomainInterval, 4,
+                weightOutputGroupCount, outputGroupInterval,
+                reductionBlocks * 4,
                 layout.outputWeightBank(), layout.outputWeightPage());
           }
-          if (localDequant) {
-            emitMxmDequant(rewriter_, op_.getLoc(), cycle, hemisphere,
-                           outputWeightScale, 1, 1,
-                           functionArgumentIndex(op_.getOutputWeight()));
-          } else {
+        }
+        if (reductionDomainCount != 0 && localDequant)
+          emitMxmDequant3D(
+              rewriter_, op_.getLoc(), loadCycle, hemisphere,
+              outputWeightScale, 4, 1, reductionDomainCount,
+              reductionDomainInterval, 1, 1,
+              functionArgumentIndex(op_.getOutputWeight()));
+        if (!localDequant) {
+          for (int64_t pulse = 0; pulse < 4; ++pulse) {
+            const int64_t cycle = loadCycle + pulse;
             for (int64_t lane = 0; lane < target_.throughput().lanes_per_tile;
                  ++lane) {
               emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), cycle,
@@ -173,95 +507,114 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
                       hemi, hemi);
             }
           }
-          emitMxm(rewriter_, op_.getLoc(), cycle + loadToIw,
-                  hemisphere * target_.throughput().mxms_per_hemisphere +
-                      localMxm,
-                  "iw", weightBuffer, 3 - pulse, 0, 0, 1, 1, 0, 1, "stream",
-                  true, "supercell", 0, dataFormat,
-                  localDequant ? "int8_dequant_bf16" : "", {},
-                  localDequant ? weightStreamBase : -1);
+        }
+        if (reductionDomainCount != 0 ||
+            target_.throughput().mxm_weight_buffers > 2) {
+          const int64_t loadGroupCount =
+              target_.throughput().mxm_weight_buffers > 2
+                  ? 1
+                  : reductionDomainCount;
+          MxmDomain3D loadDomain;
+          loadDomain.wave_count = 4;
+          loadDomain.wave_interval = 1;
+          loadDomain.wave_weight_column_stride = -1;
+          loadDomain.group_count = loadGroupCount;
+          loadDomain.group_interval = reductionDomainInterval;
+          if (loadGroupCount > 1 &&
+              target_.throughput().mxm_weight_buffers == 2)
+            loadDomain.weight_buffer_mode = "toggle_dim2";
+          emitMxm3D(
+              rewriter_, op_.getLoc(), loadCycle + loadToIw,
+              hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
+              "iw", weightBuffer, 3, 0, 0, 0, 1, "stream", true,
+              "supercell", 0, dataFormat,
+              localDequant ? "int8_dequant_bf16" : llvm::StringRef{},
+              llvm::StringRef{}, loadDomain,
+              localDequant ? weightStreamBase : -1);
         }
       }
 
       const bool finalReduction = reductionBlock + 1 == reductionBlocks;
-      const int64_t computeInterval = tile;
-      const int64_t queryHead = reductionBlock / (op_.getHeadDim() / tile);
-      const int64_t headBlock = reductionBlock % (op_.getHeadDim() / tile);
       int64_t finalWriteEnd = firstCompute;
-      for (int64_t tokenBlock = 0; tokenBlock < tokenBlocks; ++tokenBlock) {
-        const int64_t computeBase = firstCompute + tokenBlock * computeInterval;
-        for (int64_t hemisphere = 0; hemisphere < target_.memory().hemispheres;
-             ++hemisphere) {
-          const int64_t computeCycle = computeBase;
-          for (int64_t byte = 0; byte < 2; ++byte) {
-            const int64_t slice =
-                layout.contextSlice(queryHead, headBlock, byte);
-            const int64_t latency = *target_.transport_latency(
-                target::StreamEndpoint::Mem,
-                target::StreamEndpoint::MxmActivation,
-                target::StreamDirection::East, slice);
-            emitMem(rewriter_, op_.getLoc(), computeCycle - latency,
-                    hemisphere * target_.memory().slices_per_hemisphere + slice,
-                    "read", layout.contextAddress(
-                        queryHead, headBlock, tokenBlock * tile),
-                    hemisphere * 2 + byte, tile, 1, 1, "sram", -1,
-                    contextBank);
+      for (int64_t hemisphere = 0; hemisphere < target_.memory().hemispheres;
+           ++hemisphere) {
+        if (reductionDomainCount != 0 ||
+            target_.throughput().mxm_weight_buffers > 2) {
+          const int64_t computeGroupCount =
+              target_.throughput().mxm_weight_buffers > 2
+                  ? 1
+                  : reductionDomainCount;
+          const bool includesFinal =
+              reductionBlock + computeGroupCount == reductionBlocks;
+          const bool finalOnly = includesFinal && computeGroupCount == 1;
+          MxmDomain3D computeDomain;
+          computeDomain.repeat_count = tile;
+          computeDomain.repeat_accumulator_address_stride = 0;
+          computeDomain.wave_count = tokenBlocks;
+          computeDomain.wave_interval = computeInterval;
+          computeDomain.wave_accumulator_address_stride = tile;
+          computeDomain.group_count = computeGroupCount;
+          computeDomain.group_interval = reductionDomainInterval;
+          if (computeGroupCount > 1 &&
+              target_.throughput().mxm_weight_buffers == 2)
+            computeDomain.weight_buffer_mode = "toggle_dim2";
+          if (includesFinal && computeGroupCount > 1) {
+            computeDomain.terminal_dimension = 2;
+            computeDomain.terminal_accumulator_destination = "stream";
+            computeDomain.terminal_accumulator_clear = true;
+            computeDomain.terminal_accumulator_output_format = dataFormat;
           }
-          emitMxm(rewriter_, op_.getLoc(), computeCycle,
-                  hemisphere * target_.throughput().mxms_per_hemisphere +
-                      localMxm,
-                  "compute", weightBuffer, 0, hemisphere * 2, 0, tile, 1,
-                  accumulatorAddress(tokenBlock * tile), 1,
-                  finalReduction ? "stream" : "sram", finalReduction,
-                  "supercell", 0, dataFormat, {},
-                  finalReduction ? dataFormat : llvm::StringRef{});
-          if (!finalReduction)
-            continue;
+          emitMxm3D(
+              rewriter_, op_.getLoc(), firstCompute,
+              hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
+              "compute", weightBuffer, 0, hemisphere * 2, 0,
+              accumulatorAddress(0), 1, finalOnly ? "stream" : "sram",
+              finalOnly, "supercell", 0, dataFormat, llvm::StringRef{},
+              finalOnly ? dataFormat : "fp32", computeDomain);
+        }
 
-          for (int64_t row = 0; row < tile; ++row) {
-            const int64_t token = tokenBlock * tile + row;
-            const int64_t resultCycle =
-                computeCycle + target_.mxm_first_result_latency() + row;
-            for (int64_t byte = 0; byte < 2; ++byte) {
-              const int64_t slice = resultSlices[hemisphere * 2 + byte];
-              const int64_t latency = *target_.transport_latency(
-                  target::StreamEndpoint::MxmResult,
-                  target::StreamEndpoint::Mem,
-                  target::StreamDirection::West, slice);
-              const int64_t packedStream =
-                  target_.streams().streams_per_direction + byte;
-              const int64_t localWriteCycle = resultCycle + latency;
-              const bool remoteResult = hemisphere != 0;
-              emitMem(rewriter_, op_.getLoc(), localWriteCycle,
-                      hemisphere * target_.memory().slices_per_hemisphere +
-                          slice,
-                      remoteResult ? "write_tap" : "write",
-                      layout.resultAddress(outputGroup, token), packedStream,
-                      1, 1, 0, "sram", -1, resultBank);
-              finalWriteEnd = std::max(finalWriteEnd, localWriteCycle + 1);
-              if (remoteResult) {
-                const int64_t group =
-                    slice / target_.streams().mem_slices_per_register_group;
-                const int64_t remoteWriteCycle =
-                    resultCycle + target_.streams().system_register_columns +
-                    group + 1;
-                emitMem(rewriter_, op_.getLoc(), remoteWriteCycle, slice,
-                        "write", layout.resultAddress(outputGroup, token),
-                        byte, 1, 1, 0, "sram", -1, resultBank);
-                finalWriteEnd =
-                    std::max(finalWriteEnd, remoteWriteCycle + 1);
-              }
-            }
+        if (!finalReduction)
+          continue;
+
+        const int64_t resultCycle =
+            firstCompute + target_.mxm_first_result_latency();
+        for (int64_t byte = 0; byte < 2; ++byte) {
+          const int64_t slice = resultSlices[hemisphere * 2 + byte];
+          const int64_t latency = *target_.transport_latency(
+              target::StreamEndpoint::MxmResult,
+              target::StreamEndpoint::Mem,
+              target::StreamDirection::West, slice);
+          const int64_t packedStream =
+              target_.streams().streams_per_direction + byte;
+          const int64_t localWriteCycle = resultCycle + latency;
+          const bool remoteResult = hemisphere != 0;
+          emitMem3D(
+              rewriter_, op_.getLoc(), localWriteCycle,
+              hemisphere * target_.memory().slices_per_hemisphere + slice,
+              remoteResult ? "write_tap" : "write",
+              layout.resultAddress(outputGroup, 0), packedStream,
+              op_.getSeqLen(), 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0,
+              resultBank);
+          finalWriteEnd =
+              std::max(finalWriteEnd, localWriteCycle + op_.getSeqLen());
+          if (remoteResult) {
+            const int64_t group =
+                slice / target_.streams().mem_slices_per_register_group;
+            const int64_t remoteWriteCycle =
+                resultCycle + target_.streams().system_register_columns +
+                group + 1;
+            emitMem3D(rewriter_, op_.getLoc(), remoteWriteCycle, slice,
+                      "write", layout.resultAddress(outputGroup, 0), byte,
+                      op_.getSeqLen(), 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0,
+                      resultBank);
+            finalWriteEnd =
+                std::max(finalWriteEnd, remoteWriteCycle + op_.getSeqLen());
           }
         }
       }
-      const int64_t lastCompute =
-          firstCompute + (tokenBlocks - 1) * computeInterval;
-      weightBufferRelease[static_cast<std::size_t>(weightBuffer)] =
-          lastCompute + target_.mxm_result_window_cycles(tile);
-      nextReductionCompute = firstCompute + tokenBlocks * computeInterval;
       if (finalReduction)
-        phaseStart = std::max(nextReductionCompute, finalWriteEnd);
+        phaseStart = std::max(firstCompute + tokenBlocks * computeInterval,
+                              finalWriteEnd);
     }
   }
   return phaseStart;

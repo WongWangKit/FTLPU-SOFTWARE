@@ -27,6 +27,7 @@ def compile_executables(
     output_dir: Path,
     ffn_schedule: str,
     mxm_execution: str,
+    projection_rope_overlap: str,
     reuse_executables: bool,
     weight_banks: list[int | None],
     kv_cache_capacity: int,
@@ -52,8 +53,8 @@ def compile_executables(
         common = [
             "--ffn-schedule", ffn_schedule,
             "--mxm-execution", mxm_execution,
+            "--projection-rope-overlap", projection_rope_overlap,
             "--target-config", str(target_config),
-            "--icu-macro-schedule",
         ] + weight_bank_args
         if kv_cache_capacity:
             common.extend([
@@ -69,12 +70,12 @@ def compile_executables(
             ] + common,
         )
         run_phase(
-            f"lower executable variant {index} to compressed Schedule IR",
+            f"lower executable variant {index} to closed-form Schedule IR",
             [
                 str(opt),
                 "--input", str(stream_ir),
                 "--output", str(schedule_ir),
-                "--pipeline", "ftlpu-stream-to-compressed-schedule",
+                "--pipeline", "ftlpu-stream-to-schedule",
             ] + common,
         )
         run_phase(
@@ -86,7 +87,7 @@ def compile_executables(
                 "--input-stage", "schedule",
                 "--target-config", str(target_config),
                 "--mxm-execution", mxm_execution,
-                "--icu-macro-schedule",
+                "--projection-rope-overlap", projection_rope_overlap,
             ] + weight_bank_args,
         )
         executables.append(binary)
@@ -125,6 +126,10 @@ def main() -> None:
         choices=("auto", "vector", "legacy"),
         default="auto",
         help="MXM projection execution policy for every decoder variant",
+    )
+    parser.add_argument(
+        "--projection-rope-overlap", choices=("on", "off"), default="off",
+        help="overlap each Q/K projection group with its RoPE work",
     )
     parser.add_argument(
         "--layers-per-executable", type=int, default=6,
@@ -247,6 +252,7 @@ def main() -> None:
             output_dir=args.output_dir,
             ffn_schedule=args.ffn_schedule,
             mxm_execution=args.mxm_execution,
+            projection_rope_overlap=args.projection_rope_overlap,
             reuse_executables=args.reuse_executables,
             weight_banks=(
                 [

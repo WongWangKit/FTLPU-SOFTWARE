@@ -856,7 +856,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
 std::uint64_t LPUTargetModel::abi_fingerprint() const
 {
     software::runtime::TargetAbiHasher hash;
-    hash.add(17);
+    hash.add(19); // Single MEM ICU queue per physical SRAM bank.
 #define HASH(field) hash.add(memory_.field)
     HASH(hemispheres);
     HASH(slices_per_hemisphere);

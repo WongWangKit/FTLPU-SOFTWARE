@@ -68,7 +68,8 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/model_session_host_override_test.cpp
     tests/runtime/model_session_executable_c2c_weight_test.cpp
     tests/runtime/weight_page_builder_test.cpp
-    tests/runtime/qwen_weight_page_builder_test.cpp)
+    tests/runtime/qwen_weight_page_builder_test.cpp
+    tests/runtime/mem_execution_trace_test.cpp)
 set_source_files_properties(${FTLPU_CMODEL_CONSUMER_SOURCES}
     PROPERTIES OBJECT_DEPENDS
         "${FTLPU_GENERATED_HARDWARE_CONFIG};${FTLPU_CMODEL_PUBLIC_HEADERS};${FTLPU_RUNTIME_PUBLIC_HEADERS}")
@@ -115,6 +116,9 @@ target_link_libraries(ftlpu_software
 add_executable(ftlpu_binary_inspect examples/binary_inspect.cpp)
 target_link_libraries(ftlpu_binary_inspect PRIVATE ftlpu_software)
 
+add_executable(ftlpu_icu_program_export examples/icu_program_export.cpp)
+target_link_libraries(ftlpu_icu_program_export PRIVATE ftlpu_software)
+
 add_executable(ftlpu_binary_repack examples/binary_repack.cpp)
 target_link_libraries(ftlpu_binary_repack PRIVATE ftlpu_software)
 
@@ -144,6 +148,14 @@ target_link_libraries(runtime_page_ready_sync_test PRIVATE ftlpu_software)
 add_test(
     NAME runtime_page_ready_sync_test
     COMMAND $<TARGET_FILE:runtime_page_ready_sync_test>)
+
+add_executable(mem_execution_trace_test
+    tests/runtime/mem_execution_trace_test.cpp)
+target_link_libraries(mem_execution_trace_test PRIVATE ftlpu_software)
+add_test(
+    NAME mem_execution_trace_test
+    COMMAND $<TARGET_FILE:mem_execution_trace_test>
+        ${CMAKE_CURRENT_BINARY_DIR}/test-output/mem-execution-trace.csv)
 
 add_executable(ftlpu_pack_model_weights
     examples/pack_model_weights.cpp)
@@ -201,6 +213,20 @@ target_link_libraries(issue_inspector_test PRIVATE ftlpu_software)
 add_test(
     NAME issue_inspector_test
     COMMAND $<TARGET_FILE:issue_inspector_test>)
+
+add_executable(icu_program_test
+    tests/runtime/icu_program_test.cpp)
+target_link_libraries(icu_program_test PRIVATE ftlpu_software)
+add_test(
+    NAME icu_program_test
+    COMMAND $<TARGET_FILE:icu_program_test>)
+
+add_executable(imem_capacity_test
+    tests/runtime/imem_capacity_test.cpp)
+target_link_libraries(imem_capacity_test PRIVATE ftlpu_software)
+add_test(
+    NAME imem_capacity_test
+    COMMAND $<TARGET_FILE:imem_capacity_test>)
 
 add_executable(model_package_roundtrip_test
     tests/runtime/model_package_roundtrip_test.cpp)
@@ -378,7 +404,8 @@ target_compile_definitions(
     FTLPU_TEST_HEAD_DIM=128
     FTLPU_TEST_RMS_EPSILON=1.0e-6f
     FTLPU_TEST_ROPE_THETA=1000000.0f
-    FTLPU_TEST_MODEL_NAME="Qwen2.5-1.5B-seq32")
+    FTLPU_TEST_MODEL_NAME="Qwen2.5-1.5B-seq32"
+    FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES=1)
 target_link_libraries(
     compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test
     PRIVATE ftlpu_software)

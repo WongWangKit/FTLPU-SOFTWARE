@@ -22,6 +22,9 @@ enum class QueueKind : std::uint16_t {
     Vxm = 4,
     SxmTranspose = 5,
     SxmPermute = 6,
+    C2cDma = 7,
+    C2cTx = 8,
+    C2cRx = 9,
 };
 
 enum class InstructionKind : std::uint16_t {
@@ -31,6 +34,8 @@ enum class InstructionKind : std::uint16_t {
     Vxm = 3,
     Sxm = 4,
     MxmDequant = 5,
+    C2cEndpoint = 6,
+    C2cDma = 7,
 };
 
 struct QueueCommand {
@@ -688,8 +693,11 @@ inline bool is_repeat_2d_command(const QueueCommand& command)
 {
     return command.instruction_kind == InstructionKind::None
         && command.word_count == 3
+        && command.extension_words.empty()
+        && command.command == command.words[0]
         && isa::decode_icu_command_opcode(command.command)
-            == isa::IcuCommandOpcode::Extended;
+            == isa::IcuCommandOpcode::Extended
+        && ((command.words[2] >> 24) & 0xfU) == 1;
 }
 
 inline IcuRepeat2D decode_repeat_2d_command(const QueueCommand& command)
@@ -706,6 +714,114 @@ struct QueueProgram {
     std::size_t index{0};
     std::vector<QueueCommand> commands{};
 };
+
+// Raw control records preserve one physical 96-bit local-iMEM word. They are
+// used for tagged WAIT_EVENT/NOTIFY/SYNC commands that do not fit the legacy
+// 32-bit QueueCommand::command field.
+QueueCommand encode_icu_control_raw_word(
+    const IcuControlInstruction& instruction);
+bool is_icu_control_raw_word_command(
+    const QueueCommand& command) noexcept;
+IcuControlInstruction decode_icu_control_raw_word(
+    const QueueCommand& command);
+
+// MEM_WRITE_SYNC is one coarse MEM ICU instruction encoded as two consecutive
+// physical 96-bit words: a synchronized header and a native MEM Write
+// template. Each QueueCommand below corresponds to exactly one iMEM slot.
+std::array<QueueCommand,
+    InstructionControlUnit::MemIcu::synchronized_packet_word_count>
+encode_mem_synchronized_icu_packet(
+    const InstructionControlUnit::MemIcu::EncodedSynchronizedPacket& packet);
+bool is_mem_synchronized_raw_word_command(
+    const QueueCommand& command) noexcept;
+bool is_mem_synchronized_raw_packet_header(
+    const QueueCommand& command) noexcept;
+InstructionControlUnit::MemIcu::EncodedSynchronizedPacket
+decode_mem_synchronized_icu_packet(
+    const QueueProgram& queue, std::size_t command_index);
+
+// C2C queue records preserve one physical 96-bit local-iMEM word per
+// QueueCommand.  Endpoint packets contain one record and DMA packets contain
+// two consecutive records.  Keeping this boundary visible makes instruction
+// memory accounting match the hardware fetch path.
+inline QueueCommand encode_c2c_raw_word(
+    InstructionKind kind, const C2cEndpointIcuPacket& word)
+{
+    if (kind != InstructionKind::C2cEndpoint
+        && kind != InstructionKind::C2cDma)
+        throw std::invalid_argument(
+            "C2C raw word requires a C2C instruction kind");
+    QueueCommand command;
+    command.command = static_cast<isa::EncodedIcuCommand>(
+        isa::IcuCommandOpcode::Instruction);
+    command.instruction_kind = kind;
+    command.word_count = 3;
+    command.words[0] = word.lanes[0];
+    command.words[1] = word.lanes[1];
+    command.words[2] = word.lanes[2];
+    return command;
+}
+
+inline C2cEndpointIcuPacket decode_c2c_raw_word(
+    const QueueCommand& command, InstructionKind expected_kind)
+{
+    if ((expected_kind != InstructionKind::C2cEndpoint
+            && expected_kind != InstructionKind::C2cDma)
+        || command.instruction_kind != expected_kind
+        || command.word_count != 3
+        || !command.extension_words.empty()
+        || isa::decode_icu_command_opcode(command.command)
+            != isa::IcuCommandOpcode::Instruction)
+        throw std::logic_error("malformed C2C 96-bit raw word");
+    return C2cEndpointIcuPacket {{
+        command.words[0], command.words[1], command.words[2]}};
+}
+
+inline QueueCommand encode_c2c_endpoint_icu_packet(
+    const C2cEndpointIcuPacket& packet)
+{
+    return encode_c2c_raw_word(
+        InstructionKind::C2cEndpoint, packet);
+}
+
+inline std::array<QueueCommand, C2cDmaIcuPacket::kWordCount>
+encode_c2c_dma_icu_packet(const C2cDmaIcuPacket& packet)
+{
+    std::array<QueueCommand, C2cDmaIcuPacket::kWordCount> commands {};
+    for (std::size_t word = 0; word < commands.size(); ++word)
+        commands[word] = encode_c2c_raw_word(
+            InstructionKind::C2cDma, packet.words[word]);
+    return commands;
+}
+
+inline C2cDmaIcuPacket decode_c2c_dma_icu_packet(
+    const QueueProgram& queue, std::size_t command_index)
+{
+    if (queue.kind != QueueKind::C2cDma
+        || command_index > queue.commands.size()
+        || C2cDmaIcuPacket::kWordCount
+            > queue.commands.size() - command_index)
+        throw std::logic_error("truncated C2C DMA raw packet");
+    C2cDmaIcuPacket packet {};
+    for (std::size_t word = 0; word < packet.words.size(); ++word)
+        packet.words[word] = decode_c2c_raw_word(
+            queue.commands[command_index + word],
+            InstructionKind::C2cDma);
+    return packet;
+}
+
+// A FU 3-D packet is stored as consecutive physical i-MEM words. Each
+// QueueCommand below is exactly one 96-bit MEM or 128-bit MXM word; the
+// packet header is the word whose local word index is zero.
+bool is_fu_3d_raw_word_command(const QueueCommand& command) noexcept;
+bool is_fu_3d_raw_packet_header(const QueueCommand& command) noexcept;
+bool is_mem_write_read_2d_raw_packet_header(
+    const QueueCommand& command) noexcept;
+MemIcuWriteRead2DInstruction decode_mem_write_read_2d_raw_packet(
+    const QueueProgram& queue, std::size_t command_index);
+std::size_t fu_3d_raw_packet_word_count(QueueKind kind);
+IcuLoop3D decode_fu_3d_raw_packet_loop(
+    const QueueProgram& queue, std::size_t command_index);
 
 class IcuProgram {
 public:

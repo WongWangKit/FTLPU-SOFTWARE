@@ -49,6 +49,10 @@ public:
         std::int64_t end_cycle, std::string resource, std::string detail,
         std::size_t issue_count = 1);
     void write_execution_trace_csv(const std::filesystem::path& path) const;
+    void enable_mem_execution_trace(bool enabled = true) noexcept;
+    void stream_mem_execution_trace_csv(const std::filesystem::path& path);
+    void write_mem_execution_trace_csv(
+        const std::filesystem::path& path) const;
     std::size_t physical_cycles() const noexcept { return physical_cycles_; }
     std::size_t logical_cycles() const noexcept { return executed_cycles_; }
     std::size_t instruction_prefill_cycles() const noexcept
@@ -82,7 +86,9 @@ private:
     std::optional<BinaryWeightPageUse> waiting_weight_page_use_{};
     DatapathPerformanceMonitor datapath_performance_{};
     RuntimeExecutionTrace execution_trace_{};
+    MemExecutionTrace mem_execution_trace_{};
     bool execution_trace_enabled_{false};
+    bool mem_execution_trace_enabled_{false};
     std::int64_t execution_trace_cycle_offset_{0};
     bool execution_trace_append_on_load_{false};
     std::function<void(TspSliceSystem::LogSinks)> tick_{};
