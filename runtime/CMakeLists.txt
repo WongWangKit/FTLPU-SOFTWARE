@@ -37,6 +37,8 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     examples/binary_inspect.cpp
     examples/binary_repack.cpp
     examples/pack_model_weights.cpp
+    tests/runtime/command_mxm_decode_binary_test.cpp
+    tests/runtime/compiled_mxm_decode_runtime_test.cpp
     tests/runtime/command_mxm_column_binary_test.cpp
     tests/runtime/command_vxm_binary_runtime_test.cpp
     tests/runtime/sxm_binary_roundtrip_test.cpp
@@ -158,6 +160,16 @@ add_executable(command_mxm_column_binary_test
     tests/runtime/command_mxm_column_binary_test.cpp)
 
 target_link_libraries(command_mxm_column_binary_test PRIVATE ftlpu_software)
+
+add_executable(command_mxm_decode_binary_test
+    tests/runtime/command_mxm_decode_binary_test.cpp)
+
+target_link_libraries(command_mxm_decode_binary_test PRIVATE ftlpu_software)
+
+add_executable(compiled_mxm_decode_runtime_test
+    tests/runtime/compiled_mxm_decode_runtime_test.cpp)
+
+target_link_libraries(compiled_mxm_decode_runtime_test PRIVATE ftlpu_software)
 
 add_executable(command_bf16_binary_test
     tests/runtime/command_bf16_binary_test.cpp)

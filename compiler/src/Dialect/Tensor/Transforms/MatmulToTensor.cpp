@@ -18,11 +18,12 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
         && rhsType.getElementType().isInteger(8)
         && is_lpu_16bit_float(resultType.getElementType());
     if (w8a16) {
-        if (op.getM() % tile || op.getN() % (2 * tile)
+        const bool decode = op.getM() == 1;
+        if ((!decode && op.getM() % tile) || op.getN() % (2 * tile)
             || op.getK() % tile) {
             op.emitError(
-                "W8A16 linear projection requires M/K aligned to the "
-                "MXM tile and N aligned to two MXM tiles");
+                "W8A16 linear projection requires either M=1 decode or "
+                "tile-aligned M/K, with N aligned to two MXM tiles");
             return mlir::failure();
         }
         auto executionPolicy =
@@ -44,14 +45,17 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             return mlir::failure();
         }
         const auto activationSlices = target.attention_activation_slices();
-        const auto weightSlices =
-            target.attention_output_weight_slices();
+        auto weightSlices = decode
+            ? target.weight_storage_slices()
+            : target.attention_output_weight_slices();
+        if (decode && weightSlices.size() > 32)
+            weightSlices.resize(32);
         const auto resultSlices = target.attention_result_slices();
         const std::size_t expectedActivationSlices = 2;
-        const std::size_t expectedResultSlices = 4;
         if (activationSlices.size() < expectedActivationSlices
-            || weightSlices.size() != 8
-            || resultSlices.size() != expectedResultSlices) {
+            || weightSlices.size() != (decode ? 32u : 8u)
+            || (decode ? resultSlices.size() < 2
+                       : resultSlices.size() != 4)) {
             op.emitError(
                 "target does not provide the W8A16 linear projection "
                 "memory lanes");
@@ -66,12 +70,21 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             "fp16_pair_planar", "both");
         const auto weight = fixed_allocation(PlacementKind::Weight,
             weightSlices, 0,
-            (op.getN() / (2 * tile)) * (op.getK() / tile) * 4,
-            rhsBytes, "w8a16_mxm_weight_striped", "both");
+            decode
+                ? (op.getN() / (2 * tile)) * (op.getK() / tile)
+                : (op.getN() / (2 * tile)) * (op.getK() / tile) * 4,
+            rhsBytes,
+            decode ? "w8a16_mxm_decode_streamed"
+                   : "w8a16_mxm_weight_striped",
+            "both");
         const auto result = fixed_allocation(PlacementKind::FinalResult,
-            resultSlices, 0,
+            decode
+                ? llvm::ArrayRef<int64_t>(resultSlices).take_front(2)
+                : llvm::ArrayRef<int64_t>(resultSlices), 0,
             op.getM() * op.getN() / (2 * tile),
-            resultBytes, "fp16_pair_planar", "east");
+            resultBytes,
+            decode ? "fp16_mxm_decode_pair_planar" : "fp16_pair_planar",
+            decode ? "both" : "east");
         const auto memoryPlan = rewriter.getDictionaryAttr({
             rewriter.getNamedAttr(
                 "input", make_placement_attr(rewriter, input)),

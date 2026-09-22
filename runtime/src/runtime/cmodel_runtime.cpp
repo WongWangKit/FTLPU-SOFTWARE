@@ -1053,6 +1053,27 @@ void CModelRuntime::upload_binding(
         }
         return;
     }
+    if (binding.layout == BindingLayout::W8A16MxmDecodeStreamed
+        && binding.element_type == BindingElementType::I8
+        && binding.slices.size() == hw::kEastStreams) {
+        if (rows % 32 != 0 || columns % 64 != 0)
+            throw std::logic_error(
+                "decode-streamed W8A16 weight must be K32/N64 aligned");
+        const std::size_t wavesPerHemisphere = columns / 64;
+        for (std::size_t k = 0; k < rows; ++k) {
+            for (std::size_t n = 0; n < columns; ++n) {
+                const auto hemisphere =
+                    static_cast<Hemisphere>((n / 32) % 2);
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (k / 32) * wavesPerHemisphere + n / 64;
+                write_binding_sram_byte(system_, binding, hemisphere,
+                    binding.slices[n % 32], address, k % 32,
+                    data[k * columns + n]);
+            }
+        }
+        return;
+    }
     if (binding.layout
             == BindingLayout::W8A16Block8WeightWaveStriped
         && binding.element_type == BindingElementType::I8
@@ -1175,6 +1196,27 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
                     binding.slices[local_mxm * 2], address, column % 32);
                 result[offset + 1] = read_binding_sram_byte(system_, binding, hemisphere,
                     binding.slices[local_mxm * 2 + 1], address, column % 32);
+            }
+        }
+        return result;
+    }
+    if (binding.layout == BindingLayout::Fp16MxmDecodePairPlanar
+        && is_16bit_float(binding.element_type)
+        && binding.slices.size() == 2) {
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const auto hemisphere = static_cast<Hemisphere>(
+                    (column / 32) % hw::kHemispheres);
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (column / 64) * rows + row;
+                const std::size_t offset = (row * columns + column) * 2;
+                result[offset] = read_binding_sram_byte(system_, binding,
+                    hemisphere, binding.slices[0], address, column % 32);
+                result[offset + 1] = read_binding_sram_byte(system_, binding,
+                    hemisphere, binding.slices[1], address, column % 32);
             }
         }
         return result;

@@ -49,18 +49,25 @@ mlir::LogicalResult lower_linear_projection(
             rewriter.getNamedAttr("placement", placement),
         });
     };
-    llvm::SmallVector<mlir::Attribute> routes {
-        route("activation", "MEM", "MXM.activation", "east",
-            0, 2, input),
-        route("weight_i8", "MEM", "VXM", "west",
-            0, context.target.throughput().lanes_per_tile, weight),
-        route("weight_bf16", "VXM", "MXM.weight", "east",
+    const auto weightKind =
+        weight.getAs<mlir::StringAttr>("kind");
+    const bool decode = weightKind
+        && weightKind.getValue() == "w8a16_mxm_decode_streamed";
+    llvm::SmallVector<mlir::Attribute> routes;
+    routes.push_back(route("activation", "MEM", "MXM.activation", "east",
+        0, 2, input));
+    if (decode) {
+        routes.push_back(route("weight_i8", "MEM", "MXM.weight", "east",
+            0, context.target.streams().streams_per_direction, weight));
+    } else {
+        routes.push_back(route("weight_i8", "MEM", "VXM", "west",
+            0, context.target.throughput().lanes_per_tile, weight));
+        routes.push_back(route("weight_bf16", "VXM", "MXM.weight", "east",
             0, context.target.throughput().mxm_load_streams_per_cycle,
-            weight),
-        route("result", "MXM.accumulator", "MEM", "east",
-            0, context.target.throughput().mxm_result_streams * 2,
-            result),
-    };
+            weight));
+    }
+    routes.push_back(route("result", "MXM.accumulator", "MEM", "east",
+        0, context.target.throughput().mxm_result_streams * 2, result));
 
     rewriter.setInsertionPoint(op);
     mlir::OperationState state(

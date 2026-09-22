@@ -304,7 +304,8 @@ void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
     state.addAttribute("queue", builder.getI64IntegerAttr(op.getUnitId()));
     for (llvm::StringRef name :
         {"weight_load_mode", "weight_inner_column",
-            "weight_input_mode", "weight_stream_base", "wave_count",
+            "weight_input_mode", "weight_stream_base", "decode_layout",
+            "wave_count",
             "wave_interval", "wave_weight_column_stride",
             "wave_accumulator_address_stride",
             "group_count", "group_interval"})

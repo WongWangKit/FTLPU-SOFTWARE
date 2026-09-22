@@ -92,6 +92,43 @@ void verify_projection_bias_packing(const ExecutableHardwareConfig& hardware)
     }
 }
 
+void verify_decode_streamed_packing(const ExecutableHardwareConfig& hardware)
+{
+    std::vector<std::uint16_t> slices;
+    for (std::uint16_t slice = 20; slice < 52; ++slice)
+        slices.push_back(slice);
+    BinaryBinding binding = make_binding(10, "decode.weight",
+        BindingElementType::I8, BindingLayout::W8A16MxmDecodeStreamed,
+        {32, 64}, 512, 1, slices);
+    const auto logical = pattern(
+        static_cast<std::size_t>(binding.byte_size), 73);
+    const PackedWeightImage image = pack_weight_binding(
+        binding, logical, hardware);
+    require(image.segments.size() == 64,
+        "decode-streamed weight must occupy 32 streams per hemisphere");
+    require(image.data.size() == logical.size(),
+        "decode-streamed packed image changed the logical byte count");
+
+    BinaryProgram program;
+    program.hardware = hardware;
+    program.target_abi = executable_target_abi(program.hardware);
+    program.bindings.push_back(binding);
+    auto system = std::make_unique<ftlpu::TspSliceSystem>();
+    CModelRuntime runtime(*system);
+    runtime.load(program);
+    runtime.upload_binding(binding, logical);
+    for (const PackedWeightSegment& segment : image.segments) {
+        for (std::uint32_t byte = 0; byte < 32; ++byte) {
+            const auto resident = system->read_mem_sram_lane_byte(
+                static_cast<ftlpu::Hemisphere>(segment.hemisphere),
+                segment.slice, binding.bank, byte / 8,
+                segment.base_row, byte % 8);
+            require(image.data[segment.byte_offset + byte] == resident,
+                "offline decode packing differs from CModel upload");
+        }
+    }
+}
+
 } // namespace
 
 int main()
@@ -117,6 +154,7 @@ try {
     BinaryProgram program;
     program.hardware.mxms_per_hemisphere = 1;
     verify_projection_bias_packing(program.hardware);
+    verify_decode_streamed_packing(program.hardware);
     const auto normBaseRow = static_cast<std::int64_t>(
         program.hardware.sram_depth_rows - hiddenSize);
     constexpr std::int64_t queryRows = hiddenSize * hiddenSize / 512;

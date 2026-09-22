@@ -574,9 +574,15 @@ LogicalResult MxmIssueOp::verify()
             << ", weight_column=" << getWeightColumn()
             << ", activation_stream_base=" << getActivationStreamBase()
             << ", output_stream_base=" << getOutputStreamBase();
-    if (getOpcode() != "iw" && getOpcode() != "compute"
-        && getOpcode() != "accumulator_read")
-        return emitOpError("opcode must be iw, compute, or accumulator_read");
+    const bool weightLoad = getOpcode() == "iw";
+    const bool decodeLoad = getOpcode() == "decode_load_activation";
+    const bool decodeCompute = getOpcode() == "decode_stream_compute";
+    if (!weightLoad && getOpcode() != "compute"
+        && getOpcode() != "accumulator_read" && !decodeLoad
+        && !decodeCompute)
+        return emitOpError(
+            "opcode must be iw, compute, accumulator_read, "
+            "decode_load_activation, or decode_stream_compute");
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
     const int64_t waveColumnStride =
@@ -595,12 +601,20 @@ LogicalResult MxmIssueOp::verify()
     if (waveColumnStride != 0 && waveAccumulatorStride != 0)
         return emitOpError(
             "an MXM issue wave may induct only one hardware field");
-    if (getOpcode() == "iw" && waveAccumulatorStride != 0)
+    if ((weightLoad || decodeLoad) && waveAccumulatorStride != 0)
         return emitOpError(
-            "an iw wave cannot induct the MXM accumulator address");
-    if (getOpcode() != "iw" && waveColumnStride != 0)
+            "an MXM load wave cannot induct the accumulator address");
+    if (!weightLoad && waveColumnStride != 0)
         return emitOpError(
             "only an iw wave may induct the MXM weight column");
+    const llvm::StringRef decodeLayout =
+        getDecodeLayout().value_or("linear_1x16");
+    if (decodeLayout != "linear_1x16" && decodeLayout != "native_4x4")
+        return emitOpError(
+            "decode_layout must be linear_1x16 or native_4x4");
+    if (!decodeLoad && !decodeCompute && getDecodeLayout())
+        return emitOpError(
+            "decode_layout is valid only for an MXM Decode operation");
     const llvm::StringRef dataFormat =
         getDataFormat().value_or("fp16");
     if (dataFormat != "fp16" && dataFormat != "bf16")
@@ -617,7 +631,7 @@ LogicalResult MxmIssueOp::verify()
     if (loadMode != "supercell" && loadMode != "column")
         return emitOpError(
             "weight_load_mode must be supercell or column");
-    if (getOpcode() != "iw" && loadMode != "supercell")
+    if (!weightLoad && loadMode != "supercell")
         return emitOpError(
             "only iw may use column weight loading");
     if ((loadMode == "supercell" && innerColumn != 0)

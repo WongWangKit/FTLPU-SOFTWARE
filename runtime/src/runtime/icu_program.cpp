@@ -157,15 +157,23 @@ SxmInstruction decode_sxm_command(const QueueCommand& command)
 void validate_mxm_queue_opcode(QueueKind kind, std::size_t mxm,
                                const MxmControlInstruction& instruction)
 {
-    if (kind == QueueKind::MxmLoad &&
-        instruction.opcode != MxmControlOpcode::IW) {
-        throw std::logic_error("MXM load queue only accepts IW instructions");
+    const bool decodeLoad = instruction.opcode == MxmControlOpcode::Decode
+        && instruction.decode_operation == MxmDecodeOperation::LoadActivation;
+    const bool decodeCompute = instruction.opcode == MxmControlOpcode::Decode
+        && instruction.decode_operation == MxmDecodeOperation::StreamCompute;
+    if (kind == QueueKind::MxmLoad
+        && instruction.opcode != MxmControlOpcode::IW && !decodeLoad) {
+        throw std::logic_error(
+            "MXM load queue only accepts WeightLoad or "
+            "Decode.LoadActivation instructions");
     }
     if (kind == QueueKind::MxmCompute &&
         instruction.opcode != MxmControlOpcode::Compute &&
-        instruction.opcode != MxmControlOpcode::AccumulatorRead) {
-        throw std::logic_error("MXM compute queue only accepts Compute or "
-                               "AccumulatorRead instructions");
+        instruction.opcode != MxmControlOpcode::AccumulatorRead &&
+        !decodeCompute) {
+        throw std::logic_error(
+            "MXM compute queue only accepts Compute, AccumulatorRead, or "
+            "Decode.StreamCompute instructions");
     }
     (void)mxm;
 }

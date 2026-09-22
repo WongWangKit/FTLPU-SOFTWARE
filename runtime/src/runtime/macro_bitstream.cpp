@@ -389,10 +389,25 @@ bool is_mxm_macro_kind(QueueKind kind)
            kind == QueueKind::MxmDequant;
 }
 
-unsigned mxm_instruction_bits(QueueKind kind)
+bool is_decode_load(const MxmControlInstruction& instruction)
+{
+    return instruction.opcode == MxmControlOpcode::Decode
+        && instruction.decode_operation == MxmDecodeOperation::LoadActivation;
+}
+
+bool is_decode_compute(const MxmControlInstruction& instruction)
+{
+    return instruction.opcode == MxmControlOpcode::Decode
+        && instruction.decode_operation == MxmDecodeOperation::StreamCompute;
+}
+
+unsigned mxm_instruction_bits(QueueKind kind, std::uint64_t native)
 {
     switch (kind) {
-    case QueueKind::MxmLoad:
+    case QueueKind::MxmLoad: {
+        const auto opcode = static_cast<MxmControlOpcode>(native & 0x3u);
+        return opcode == MxmControlOpcode::Decode ? 29 : 16;
+    }
     case QueueKind::MxmDequant:
         return 16;
     case QueueKind::MxmCompute:
@@ -401,6 +416,15 @@ unsigned mxm_instruction_bits(QueueKind kind)
         throw std::invalid_argument(
             "MXM Macro bitstream requires an MXM queue");
     }
+}
+
+std::uint64_t read_mxm_native(BitReader& reader, QueueKind kind)
+{
+    if (kind != QueueKind::MxmLoad)
+        return reader.bits(mxm_instruction_bits(kind, 0));
+    const auto opcode = reader.bits(2);
+    const auto width = mxm_instruction_bits(kind, opcode);
+    return opcode | (reader.bits(width - 2) << 2);
 }
 
 unsigned mxm_operand_bits(QueueKind kind)
@@ -446,9 +470,10 @@ std::uint32_t mxm_operand(const MxmMacroRecord& record, QueueKind kind)
     if (kind == QueueKind::MxmDequant)
         return 0;
     const auto instruction = isa::decode_mxm_instruction(record.instruction);
-    return static_cast<std::uint32_t>(kind == QueueKind::MxmLoad
-                                          ? instruction.weight_column
-                                          : instruction.accumulator_address);
+    if (kind == QueueKind::MxmLoad)
+        return is_decode_load(instruction)
+            ? 0 : static_cast<std::uint32_t>(instruction.weight_column);
+    return static_cast<std::uint32_t>(instruction.accumulator_address);
 }
 
 std::uint64_t normalized_mxm_instruction(const MxmMacroRecord& record,
@@ -457,9 +482,9 @@ std::uint64_t normalized_mxm_instruction(const MxmMacroRecord& record,
     if (kind == QueueKind::MxmDequant)
         return record.instruction;
     auto instruction = isa::decode_mxm_instruction(record.instruction);
-    if (kind == QueueKind::MxmLoad)
+    if (kind == QueueKind::MxmLoad && !is_decode_load(instruction))
         instruction.weight_column = 0;
-    else
+    else if (kind == QueueKind::MxmCompute)
         instruction.accumulator_address = 0;
     return isa::encode_mxm_instruction(instruction);
 }
@@ -470,9 +495,9 @@ void set_mxm_operand(MxmMacroRecord& record, QueueKind kind,
     if (kind == QueueKind::MxmDequant)
         return;
     auto instruction = isa::decode_mxm_instruction(record.instruction);
-    if (kind == QueueKind::MxmLoad)
+    if (kind == QueueKind::MxmLoad && !is_decode_load(instruction))
         instruction.weight_column = operand;
-    else
+    else if (kind == QueueKind::MxmCompute)
         instruction.accumulator_address = operand;
     record.instruction = isa::encode_mxm_instruction(instruction);
 }
@@ -489,14 +514,24 @@ void validate_mxm_record(const MxmMacroRecord& record, QueueKind kind)
     }
     const auto instruction = isa::decode_mxm_instruction(record.instruction);
     if (kind == QueueKind::MxmLoad) {
-        if (instruction.opcode != MxmControlOpcode::IW ||
-            (record.schedule.induction_target != IcuInductionTarget::None &&
-             record.schedule.induction_target !=
-                 IcuInductionTarget::MxmWeightColumn))
+        const bool decodeLoad = is_decode_load(instruction);
+        if ((instruction.opcode != MxmControlOpcode::IW && !decodeLoad) ||
+            (decodeLoad
+                 ? record.schedule.induction_target != IcuInductionTarget::None
+                     || record.schedule.inner_stride != 0
+                     || record.schedule.outer_stride != 0
+                 : record.schedule.induction_target
+                           != IcuInductionTarget::None
+                       && record.schedule.induction_target
+                           != IcuInductionTarget::MxmWeightColumn))
             throw std::invalid_argument(
                 "MXM load Macro has an invalid opcode or induction target");
     } else {
-        if (instruction.opcode == MxmControlOpcode::IW ||
+        const bool computeOperation =
+            instruction.opcode == MxmControlOpcode::Compute
+            || instruction.opcode == MxmControlOpcode::AccumulatorRead
+            || is_decode_compute(instruction);
+        if (!computeOperation ||
             (record.schedule.induction_target != IcuInductionTarget::None &&
              record.schedule.induction_target !=
                  IcuInductionTarget::MxmAccumulatorAddress))
@@ -552,7 +587,7 @@ void write_mxm_template(BitWriter& writer, const MxmMacroRecord& record,
     const auto native = normalized_mxm_instruction(record, kind);
     if (!compact_mxm_template(record)) {
         writer.bit(true);
-        writer.bits(native, mxm_instruction_bits(kind));
+        writer.bits(native, mxm_instruction_bits(kind, native));
         writer.bits(record.schedule.inner_count, 32);
         writer.bits(record.schedule.inner_interval, 32);
         writer.bits(static_cast<std::uint32_t>(record.schedule.inner_stride),
@@ -567,7 +602,7 @@ void write_mxm_template(BitWriter& writer, const MxmMacroRecord& record,
         return;
     }
     writer.bit(false);
-    writer.bits(native, mxm_instruction_bits(kind));
+    writer.bits(native, mxm_instruction_bits(kind, native));
     const auto shape = shape_of(record.schedule);
     writer.bits(static_cast<std::uint8_t>(shape), 2);
     writer.bits(static_cast<std::uint8_t>(record.schedule.induction_target), 2);
@@ -590,7 +625,7 @@ MxmMacroRecord read_mxm_template(BitReader& reader, QueueKind kind)
 {
     MxmMacroRecord result;
     const bool extended = reader.bit();
-    result.instruction = reader.bits(mxm_instruction_bits(kind));
+    result.instruction = read_mxm_native(reader, kind);
     if (extended) {
         result.schedule.inner_count = reader.bits(32);
         result.schedule.inner_interval = reader.bits(32);

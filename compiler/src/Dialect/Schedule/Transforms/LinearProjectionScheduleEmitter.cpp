@@ -65,6 +65,218 @@ BindingOp createBinding(mlir::IRRewriter& rewriter,
     return llvm::cast<BindingOp>(rewriter.create(state));
 }
 
+void emitDecodeMxm(mlir::IRRewriter& rewriter, mlir::Location location,
+    int64_t cycle, int64_t unit, llvm::StringRef opcode,
+    int64_t activationBuffer, int64_t accumulatorAddress,
+    llvm::StringRef dataFormat)
+{
+    mlir::OperationState state(location, MxmIssueOp::getOperationName());
+    state.addAttributes({
+        rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(cycle)),
+        rewriter.getNamedAttr("unit_id", rewriter.getI64IntegerAttr(unit)),
+        rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
+        rewriter.getNamedAttr("weight_buffer",
+            rewriter.getI64IntegerAttr(activationBuffer)),
+        rewriter.getNamedAttr("weight_column", rewriter.getI64IntegerAttr(0)),
+        rewriter.getNamedAttr("activation_stream_base",
+            rewriter.getI64IntegerAttr(0)),
+        rewriter.getNamedAttr("output_stream_base",
+            rewriter.getI64IntegerAttr(0)),
+        rewriter.getNamedAttr("repeat_count", rewriter.getI64IntegerAttr(1)),
+        rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(1)),
+        rewriter.getNamedAttr("accumulator_address",
+            rewriter.getI64IntegerAttr(accumulatorAddress)),
+        rewriter.getNamedAttr("accumulator_row_stride",
+            rewriter.getI64IntegerAttr(1)),
+        rewriter.getNamedAttr("accumulator_destination",
+            rewriter.getStringAttr("sram")),
+        rewriter.getNamedAttr("accumulator_clear", rewriter.getBoolAttr(false)),
+        rewriter.getNamedAttr("data_format", rewriter.getStringAttr(dataFormat)),
+        rewriter.getNamedAttr("weight_load_mode",
+            rewriter.getStringAttr("supercell")),
+        rewriter.getNamedAttr("weight_inner_column",
+            rewriter.getI64IntegerAttr(0)),
+        rewriter.getNamedAttr("decode_layout",
+            rewriter.getStringAttr("native_4x4")),
+    });
+    rewriter.create(state);
+}
+
+mlir::FailureOr<mlir::Value> emitDecodeLinearProjection(
+    mlir::IRRewriter& rewriter, stream::ProjectionTaskOp op,
+    const target::LPUTargetModel& target, int64_t outputIndex,
+    mlir::DictionaryAttr inputPlacement,
+    mlir::DictionaryAttr weightPlacement,
+    mlir::DictionaryAttr resultPlacement, int64_t n, int64_t k,
+    float scale)
+{
+    const auto inputSlices = slices(inputPlacement);
+    const auto weightSlices = slices(weightPlacement);
+    const auto resultSlices = slices(resultPlacement);
+    if (inputSlices.size() != 2 || weightSlices.size() != 32
+        || resultSlices.size() != 2) {
+        op.emitError("decode linear projection requires 2 activation, "
+                     "32 streamed-weight, and 2 result slices");
+        return mlir::failure();
+    }
+    const int64_t tile = target.throughput().mxm_rows;
+    if (tile != 32 || k % tile || n % (2 * tile)) {
+        op.emitError("decode linear projection requires K32/N64 alignment");
+        return mlir::failure();
+    }
+    const int64_t inputBinding = argumentIndex(op.getInput());
+    const int64_t weightBinding = argumentIndex(op.getWeight());
+    if (inputBinding < 0 || weightBinding < 0) {
+        op.emitError("decode activation and weight must be function arguments");
+        return mlir::failure();
+    }
+    const auto inputType =
+        llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
+    const auto weightType =
+        llvm::cast<mlir::RankedTensorType>(op.getWeight().getType());
+    const auto resultType =
+        llvm::cast<mlir::RankedTensorType>(op.getResult().getType());
+    const llvm::StringRef dataFormat =
+        lpu_16bit_data_format(resultType.getElementType());
+    const int64_t inputBase =
+        inputPlacement.getAs<mlir::IntegerAttr>("base_row").getInt();
+    const int64_t weightBase =
+        weightPlacement.getAs<mlir::IntegerAttr>("base_row").getInt();
+    const int64_t resultBase =
+        resultPlacement.getAs<mlir::IntegerAttr>("base_row").getInt();
+    const int64_t reductions = k / tile;
+    const int64_t outputGroups = n / (2 * tile);
+    const int64_t accumulatorCapacity =
+        target.throughput().mxm_accumulator_blocks
+        * target.throughput().mxm_rows;
+    if (accumulatorCapacity <= 0) return mlir::failure();
+
+    rewriter.setInsertionPoint(op);
+    createBinding(rewriter, op.getLoc(), op.getInput(), inputBinding,
+        "input", "activation", inputType, inputPlacement);
+    createBinding(rewriter, op.getLoc(), op.getWeight(), weightBinding,
+        "input", "weight", weightType, weightPlacement);
+
+    const auto activationLatency = [&](int64_t slice) {
+        return target.transport_latency(target::StreamEndpoint::Mem,
+            target::StreamEndpoint::MxmActivation,
+            target::StreamDirection::East, slice);
+    };
+    const auto weightLatency = [&](int64_t slice) {
+        return target.transport_latency(target::StreamEndpoint::Mem,
+            target::StreamEndpoint::MxmWeight,
+            target::StreamDirection::East, slice);
+    };
+    for (int64_t slice : inputSlices)
+        if (!activationLatency(slice)) return mlir::failure();
+    for (int64_t slice : weightSlices)
+        if (!weightLatency(slice)) return mlir::failure();
+
+    int64_t phaseStart = 32;
+    for (int64_t batchBase = 0; batchBase < outputGroups;
+         batchBase += accumulatorCapacity) {
+        const int64_t batchCount = std::min(
+            accumulatorCapacity, outputGroups - batchBase);
+        for (int64_t reduction = 0; reduction < reductions; ++reduction) {
+            const int64_t buffer = reduction
+                % target.throughput().mxm_weight_buffers;
+            for (int64_t hemisphere = 0;
+                 hemisphere < target.memory().hemispheres; ++hemisphere) {
+                const int64_t unit = hemisphere
+                    * target.throughput().mxms_per_hemisphere;
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice = inputSlices[byte];
+                    emitMem(rewriter, op.getLoc(),
+                        phaseStart - *activationLatency(slice),
+                        hemisphere * target.memory().slices_per_hemisphere
+                            + slice,
+                        "read", inputBase + reduction, byte,
+                        1, 1, 0, "sram", inputBinding);
+                }
+                emitDecodeMxm(rewriter, op.getLoc(), phaseStart, unit,
+                    "decode_load_activation", buffer, 0, dataFormat);
+            }
+            const int64_t computeStart = phaseStart
+                + target.throughput().tile_rows;
+            for (int64_t localGroup = 0; localGroup < batchCount;
+                 ++localGroup) {
+                const int64_t globalGroup = batchBase + localGroup;
+                const int64_t computeCycle = computeStart + localGroup;
+                for (int64_t hemisphere = 0;
+                     hemisphere < target.memory().hemispheres; ++hemisphere) {
+                    const int64_t unit = hemisphere
+                        * target.throughput().mxms_per_hemisphere;
+                    for (int64_t stream = 0; stream < 32; ++stream) {
+                        const int64_t slice = weightSlices[stream];
+                        const int64_t boundaryCycle = computeCycle + stream / 8;
+                        emitMem(rewriter, op.getLoc(),
+                            boundaryCycle - *weightLatency(slice),
+                            hemisphere
+                                    * target.memory().slices_per_hemisphere
+                                + slice,
+                            "read",
+                            weightBase + reduction * outputGroups
+                                + globalGroup,
+                            stream, 1, 1, 0, "sram", weightBinding);
+                    }
+                    emitMxmDequant(rewriter, op.getLoc(), computeCycle,
+                        unit, scale, 1, 1, weightBinding);
+                    emitDecodeMxm(rewriter, op.getLoc(), computeCycle, unit,
+                        "decode_stream_compute", buffer, localGroup,
+                        dataFormat);
+                }
+            }
+            phaseStart = computeStart + batchCount
+                + target.throughput().mxm0_accumulator_latency + 4;
+        }
+
+        const int64_t readStart = phaseStart;
+        for (int64_t localGroup = 0; localGroup < batchCount;
+             ++localGroup) {
+            const int64_t globalGroup = batchBase + localGroup;
+            for (int64_t hemisphere = 0;
+                 hemisphere < target.memory().hemispheres; ++hemisphere) {
+                const int64_t unit = hemisphere
+                    * target.throughput().mxms_per_hemisphere;
+                const int64_t readCycle = readStart + localGroup;
+                emitMxm(rewriter, op.getLoc(), readCycle,
+                    unit, "accumulator_read", 0, 0, 0, 0, 1, 1,
+                    localGroup, 1, "stream", true, "supercell", 0,
+                    dataFormat, {}, "bf16");
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice = resultSlices[byte];
+                    const auto latency = target.transport_latency(
+                        target::StreamEndpoint::MxmResult,
+                        target::StreamEndpoint::Mem,
+                        target::StreamDirection::West, slice);
+                    if (!latency) return mlir::failure();
+                    emitMem(rewriter, op.getLoc(), readCycle + *latency,
+                        hemisphere * target.memory().slices_per_hemisphere
+                            + slice,
+                        "write", resultBase + globalGroup,
+                        target.streams().streams_per_direction + byte,
+                        1, 1, 0);
+                }
+            }
+        }
+        phaseStart = readStart + batchCount
+            + target.memory().slices_per_hemisphere
+                / target.streams().mem_slices_per_register_group + 2;
+    }
+
+    mlir::OperationState timeline(op.getLoc(), TimelineOp::getOperationName());
+    timeline.addAttributes({
+        rewriter.getNamedAttr("name",
+            rewriter.getStringAttr("decode_linear_projection")),
+        rewriter.getNamedAttr("start", rewriter.getI64IntegerAttr(0)),
+        rewriter.getNamedAttr("end", rewriter.getI64IntegerAttr(phaseStart)),
+    });
+    rewriter.create(timeline);
+    auto output = createBinding(rewriter, op.getLoc(), {}, outputIndex,
+        "output", "result", resultType, resultPlacement);
+    return output.getValue();
+}
+
 mlir::FailureOr<mlir::Value> emitLinearProjection(
     mlir::IRRewriter& rewriter, stream::ProjectionTaskOp op,
     const target::LPUTargetModel& target, int64_t outputIndex)
@@ -98,6 +310,10 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     const int64_t m = mAttr.getInt();
     const int64_t n = nAttr.getInt();
     const int64_t k = kAttr.getInt();
+    if (m == 1)
+        return emitDecodeLinearProjection(rewriter, op, target, outputIndex,
+            inputPlacement, weightPlacement, resultPlacement, n, k,
+            static_cast<float>(scaleAttr.getValueAsDouble()));
     auto executionPolicy =
         target::mxm_execution_policy_from_operation(op.getOperation());
     if (mlir::failed(executionPolicy)) {

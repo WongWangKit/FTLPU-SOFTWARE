@@ -607,22 +607,6 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/kernel_matmul_lifetime.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_tensor_lifetime_reuse/matmul_lifetime.tensor.mlir)
     add_test(
-        NAME stablehlo_matmul_320_to_ftlpu_stream_mlir_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_matmul_stream_mlir_test.py
-            --tool $<TARGET_FILE:ftlpu_opt>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
-            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/stablehlo_matmul_320_to_ftlpu_stream/matmul_320.stream.mlir)
-    add_test(
-        NAME stablehlo_matmul_320_to_ftlpu_command_mlir_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_matmul_command_mlir_test.py
-            --tool $<TARGET_FILE:ftlpu_opt>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
-            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/stablehlo_matmul_320_to_ftlpu_command/matmul_320.command.mlir)
-    add_test(
         NAME ftlpu_stream_allocator_reuse_mlir_test
         COMMAND
             ${Python3_EXECUTABLE}
@@ -630,14 +614,6 @@ if(Python3_Interpreter_FOUND)
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/kernel_matmul_lifetime.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_stream_allocator_reuse/matmul_lifetime.stream.mlir)
-    add_test(
-        NAME ftlpu_schedule_resource_and_dependency_mlir_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/schedule_resource_dependency_mlir_test.py
-            --tool $<TARGET_FILE:ftlpu_opt>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/kernel_matmul_lifetime.mlir
-            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_schedule_resource_and_dependency/matmul_lifetime.schedule.mlir)
     add_test(
         NAME ftlpu_command_vxm_binary_runtime_test
         COMMAND
@@ -656,6 +632,25 @@ if(Python3_Interpreter_FOUND)
             --runtime-test $<TARGET_FILE:command_mxm_column_binary_test>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/command_mxm_column.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_command_mxm_column/command_mxm_column.ftlpu)
+    add_test(
+        NAME ftlpu_command_mxm_decode_binary_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/command_vxm_binary_runtime_test.py
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:command_mxm_decode_binary_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/command_mxm_decode.mlir
+            --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_command_mxm_decode/command_mxm_decode.ftlpu)
+    add_test(
+        NAME ftlpu_mxm_decode_pipeline_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/mxm_decode_pipeline_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_mxm_decode_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/kernel_mxm_decode.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/ftlpu_mxm_decode_pipeline)
     add_test(
         NAME ftlpu_command_bf16_binary_test
         COMMAND

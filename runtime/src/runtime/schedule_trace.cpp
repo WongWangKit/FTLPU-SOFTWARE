@@ -148,7 +148,10 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
             instruction.weight_column = static_cast<std::size_t>(column);
         } else if (target == IcuInductionTarget::MxmAccumulatorAddress) {
             if (instruction.opcode != MxmControlOpcode::Compute
-                && instruction.opcode != MxmControlOpcode::AccumulatorRead)
+                && instruction.opcode != MxmControlOpcode::AccumulatorRead
+                && !(instruction.opcode == MxmControlOpcode::Decode
+                    && instruction.decode_operation
+                        == MxmDecodeOperation::StreamCompute))
                 throw std::logic_error(
                     "runtime trace MXM accumulator induction requires compute or accumulator-read");
             const auto address =
@@ -188,10 +191,23 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
                                    == MxmAccumulatorOutputFormat::BFloat16
                                ? "bf16"
                                : "fp32");
-        } else {
+        } else if (instruction.opcode
+            == MxmControlOpcode::AccumulatorRead) {
             detail << "AccumulatorRead acc=" << instruction.accumulator_address
                    << " out=" << stream_name(instruction.stream_base)
                    << (instruction.accumulator_clear ? " clear" : " keep");
+        } else if (instruction.decode_operation
+            == MxmDecodeOperation::LoadActivation) {
+            detail << "Decode.LoadActivation buffer="
+                   << instruction.weight_buffer
+                   << " act=" << stream_name(
+                          instruction.activation_stream_base);
+        } else {
+            detail << "Decode.StreamCompute buffer="
+                   << instruction.weight_buffer
+                   << " out=" << stream_name(instruction.stream_base)
+                   << " acc=" << instruction.accumulator_address
+                   << " column=" << instruction.weight_column;
         }
         return {std::string("MXM.") + side + std::to_string(queue.index % per_hemisphere)
                 + (queue.kind == QueueKind::MxmLoad ? ".Load" : ".Compute"), detail.str()};

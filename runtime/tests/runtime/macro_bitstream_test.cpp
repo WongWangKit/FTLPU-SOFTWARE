@@ -345,8 +345,40 @@ try {
          {
              macro(ftlpu::MxmDequantInstruction::ScaleBits(0x3f80),
                    {5, 16, 2, 0, 1, 1, 0, ftlpu::IcuInductionTarget::None}),
-             macro(ftlpu::MxmDequantInstruction::ScaleBits(0x3f80),
-                   {69, 16, 2, 0, 1, 1, 0, ftlpu::IcuInductionTarget::None}),
+              macro(ftlpu::MxmDequantInstruction::ScaleBits(0x3f80),
+                    {69, 16, 2, 0, 1, 1, 0, ftlpu::IcuInductionTarget::None}),
+          }});
+    mxmQueues.push_back(
+        {rt::QueueKind::MxmLoad,
+         1,
+         {
+             macro(ftlpu::MxmControlInstruction::DecodeLoadActivation(
+                       0, 0, ftlpu::MxmDataFormat::BFloat16,
+                       ftlpu::MxmDecodeLayout::Native4x4),
+                   {12, 3, 5, 0, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::None}),
+             macro(ftlpu::MxmControlInstruction::DecodeLoadActivation(
+                       1, 8, ftlpu::MxmDataFormat::BFloat16,
+                       ftlpu::MxmDecodeLayout::Linear1x16),
+                   {64, 1, 1, 0, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::None}),
+         }});
+    mxmQueues.push_back(
+        {rt::QueueKind::MxmCompute,
+         1,
+         {
+             macro(ftlpu::MxmControlInstruction::DecodeStreamCompute(
+                       0, 0, ftlpu::MxmDataFormat::BFloat16, 300, 0,
+                       ftlpu::MxmAccumulatorDestination::Sram, false,
+                       ftlpu::MxmDecodeLayout::Native4x4),
+                   {24, 4, 7, 1, 2, 31, 16,
+                    ftlpu::IcuInductionTarget::MxmAccumulatorAddress}),
+             macro(ftlpu::MxmControlInstruction::DecodeStreamCompute(
+                       1, 4, ftlpu::MxmDataFormat::BFloat16, 320, 1,
+                       ftlpu::MxmAccumulatorDestination::Stream, true,
+                       ftlpu::MxmDecodeLayout::Linear1x16),
+                   {96, 1, 1, 0, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::None}),
          }});
     bool sawMxmCompact = false;
     bool sawMxmExtended = false;
@@ -481,6 +513,23 @@ try {
         {macro(ftlpu::MxmDequantInstruction::ScaleBits(0x3f80),
                {1, 1, 1, 0, 1, 1, 0,
                 ftlpu::IcuInductionTarget::None})}});
+    executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::MxmLoad,
+        1,
+        {macro(ftlpu::MxmControlInstruction::DecodeLoadActivation(
+                   1, 4, ftlpu::MxmDataFormat::BFloat16,
+                   ftlpu::MxmDecodeLayout::Native4x4),
+               {3, 1, 1, 0, 1, 1, 0,
+                ftlpu::IcuInductionTarget::None})}});
+    executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::MxmCompute,
+        1,
+        {macro(ftlpu::MxmControlInstruction::DecodeStreamCompute(
+                   1, 2, ftlpu::MxmDataFormat::BFloat16, 40, 2,
+                   ftlpu::MxmAccumulatorDestination::Sram, false,
+                   ftlpu::MxmDecodeLayout::Native4x4),
+               {5, 2, 3, 4, 1, 1, 0,
+                ftlpu::IcuInductionTarget::MxmAccumulatorAddress})}});
 
     std::stringstream binary(std::ios::in | std::ios::out | std::ios::binary);
     rt::write_binary_program(executionProgram, binary);
@@ -511,12 +560,18 @@ try {
     expect(icu.mem_iq(0).raw_macro_mode()
                && icu.mxm_load_iq(0).raw_macro_mode()
                && icu.mxm_compute_iq(0).raw_macro_mode()
-               && icu.mxm_dequant_iq(0).raw_macro_mode(),
+               && icu.mxm_dequant_iq(0).raw_macro_mode()
+               && icu.mxm_load_iq(1).raw_macro_mode()
+               && icu.mxm_compute_iq(1).raw_macro_mode(),
            "runtime bypassed the CModel raw Macro frontend");
     std::vector<std::pair<std::size_t, std::size_t>> memIssues;
     std::vector<std::pair<std::size_t, std::size_t>> mxmLoadIssues;
     std::vector<std::pair<std::size_t, std::size_t>> mxmIssues;
     std::vector<std::pair<std::size_t, std::uint16_t>> dequantIssues;
+    std::vector<std::pair<std::size_t, ftlpu::MxmControlInstruction>>
+        decodeLoadIssues;
+    std::vector<std::pair<std::size_t, ftlpu::MxmControlInstruction>>
+        decodeComputeIssues;
     for (std::size_t cycle = 0; cycle <= executionProgram.max_cycle; ++cycle) {
         if (const auto issued = icu.mem_iq(0).tick())
             memIssues.emplace_back(cycle, issued->address);
@@ -526,6 +581,10 @@ try {
             mxmIssues.emplace_back(cycle, issued->accumulator_address);
         if (const auto issued = icu.mxm_dequant_iq(0).tick())
             dequantIssues.emplace_back(cycle, issued->scale_bf16);
+        if (const auto issued = icu.mxm_load_iq(1).tick())
+            decodeLoadIssues.emplace_back(cycle, *issued);
+        if (const auto issued = icu.mxm_compute_iq(1).tick())
+            decodeComputeIssues.emplace_back(cycle, *issued);
     }
     expect(
         memIssues ==
@@ -544,6 +603,25 @@ try {
                std::vector<std::pair<std::size_t, std::uint16_t>>{
                    {1, 0x3f80}},
            "runtime/CModel dequant Macro emitted an incorrect scale");
+    expect(decodeLoadIssues.size() == 1
+               && decodeLoadIssues[0].first == 3
+               && decodeLoadIssues[0].second.opcode
+                   == ftlpu::MxmControlOpcode::Decode
+               && decodeLoadIssues[0].second.decode_operation
+                   == ftlpu::MxmDecodeOperation::LoadActivation
+               && decodeLoadIssues[0].second.weight_buffer == 1
+               && decodeLoadIssues[0].second.activation_stream_base == 4,
+           "runtime/CModel Decode.LoadActivation Macro was not preserved");
+    expect(decodeComputeIssues.size() == 2
+               && decodeComputeIssues[0].first == 5
+               && decodeComputeIssues[1].first == 8
+               && decodeComputeIssues[0].second.opcode
+                   == ftlpu::MxmControlOpcode::Decode
+               && decodeComputeIssues[0].second.decode_operation
+                   == ftlpu::MxmDecodeOperation::StreamCompute
+               && decodeComputeIssues[0].second.accumulator_address == 40
+               && decodeComputeIssues[1].second.accumulator_address == 44,
+           "runtime/CModel Decode.StreamCompute Macro induction changed");
     expect(icu.mem_iq(0).peak_active_macros() == 2,
            "runtime/CModel did not model interleaved finite Macro contexts");
     expect(icu.mem_iq(0).macro_decoder_statistics().decoded_contexts == 2 &&
@@ -559,7 +637,9 @@ try {
            "CModel Macro decoder did not enqueue every physical context");
     expect(icu.mem_iq(0).done() && icu.mxm_load_iq(0).done()
                && icu.mxm_compute_iq(0).done()
-               && icu.mxm_dequant_iq(0).done(),
+               && icu.mxm_dequant_iq(0).done()
+               && icu.mxm_load_iq(1).done()
+               && icu.mxm_compute_iq(1).done(),
            "runtime/CModel Macro queues did not complete");
 
     // A 32-record physical run exercises decode-ahead, finite DDB pressure,

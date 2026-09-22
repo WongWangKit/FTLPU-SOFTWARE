@@ -530,6 +530,26 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         return image.finish();
     }
 
+    if (binding.layout == BindingLayout::W8A16MxmDecodeStreamed
+        && binding.element_type == BindingElementType::I8
+        && binding.slices.size() == hardware.streams_per_direction) {
+        if (rows % 32 || columns % 64)
+            throw std::invalid_argument(
+                "decode-streamed W8A16 weight must be K32/N64 aligned");
+        const std::size_t waves_per_hemisphere = columns / 64;
+        for (std::size_t k = 0; k < rows; ++k)
+            for (std::size_t n = 0; n < columns; ++n) {
+                const std::uint16_t hemisphere =
+                    static_cast<std::uint16_t>((n / 32) % 2);
+                const std::uint32_t address = base
+                    + static_cast<std::uint32_t>(
+                        (k / 32) * waves_per_hemisphere + n / 64)
+                        * stride;
+                write_i8(k, n, hemisphere, n % 32, address);
+            }
+        return image.finish();
+    }
+
     if (binding.layout == BindingLayout::W8A16AttentionWeightStriped
         && binding.element_type == BindingElementType::I8
         && binding.slices.size() == 8) {

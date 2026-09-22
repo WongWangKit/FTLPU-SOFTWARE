@@ -391,6 +391,10 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::W8A16MxmWeightWaveStriped;
     if (value == "w8a16_attention_weight_striped")
         return BindingLayout::W8A16AttentionWeightStriped;
+    if (value == "w8a16_mxm_decode_streamed")
+        return BindingLayout::W8A16MxmDecodeStreamed;
+    if (value == "fp16_mxm_decode_pair_planar")
+        return BindingLayout::Fp16MxmDecodePairPlanar;
     if (value == "fp16_pair_planar") return BindingLayout::Fp16PairPlanar;
     if (value == "fp32_causal_mask_tile")
         return BindingLayout::Fp32CausalMaskTile;
@@ -587,6 +591,10 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
 {
     const bool is_load = op.getOpcode() == "iw";
     const bool is_accumulator_read = op.getOpcode() == "accumulator_read";
+    const bool is_decode_load =
+        op.getOpcode() == "decode_load_activation";
+    const bool is_decode_compute =
+        op.getOpcode() == "decode_stream_compute";
     const auto destination = op.getAccumulatorDestination() == "stream"
         ? MxmAccumulatorDestination::Stream : MxmAccumulatorDestination::Sram;
     const auto inputMode =
@@ -594,7 +602,8 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
             == "int8_dequant_bf16"
         ? MxmWeightInputMode::Int8DequantBf16
         : MxmWeightInputMode::Direct16;
-    const auto kind = is_load ? QueueKind::MxmLoad : QueueKind::MxmCompute;
+    const auto kind = is_load || is_decode_load
+        ? QueueKind::MxmLoad : QueueKind::MxmCompute;
     const int64_t waveCount = op.getWaveCount().value_or(1);
     const int64_t waveInterval = op.getWaveInterval().value_or(1);
     const int64_t waveColumnStride =
@@ -637,7 +646,13 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
         inductionTarget = waveInductionTarget;
     }
     const int64_t weightColumn = op.getWeightColumn();
-        const auto instruction = is_load
+    const auto dataFormat =
+        op.getDataFormat().value_or("fp16") == "bf16"
+        ? MxmDataFormat::BFloat16 : MxmDataFormat::Float16;
+    const auto decodeLayout =
+        op.getDecodeLayout().value_or("linear_1x16") == "native_4x4"
+        ? MxmDecodeLayout::Native4x4 : MxmDecodeLayout::Linear1x16;
+    const auto instruction = is_load
             ? op.getWeightLoadMode().value_or("supercell") == "column"
                 ? MxmControlInstruction::IWColumn(
                     op.getWeightBuffer(), weightColumn,
@@ -654,18 +669,25 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
                     ? MxmAccumulatorOutputFormat::BFloat16
                     : MxmAccumulatorOutputFormat::Float32,
                 destination)
+            : is_decode_load
+            ? MxmControlInstruction::DecodeLoadActivation(
+                op.getWeightBuffer(), op.getActivationStreamBase(),
+                dataFormat, decodeLayout)
+            : is_decode_compute
+            ? MxmControlInstruction::DecodeStreamCompute(
+                op.getWeightBuffer(), op.getOutputStreamBase(), dataFormat,
+                op.getAccumulatorAddress(), weightColumn, destination,
+                op.getAccumulatorClear(), decodeLayout)
             : MxmControlInstruction::Compute(op.getWeightBuffer(),
                 op.getActivationStreamBase(), op.getOutputStreamBase(),
                 op.getAccumulatorAddress(), op.getAccumulatorRowStride(),
                 destination,
-                op.getDataFormat().value_or("fp16") == "bf16"
-                    ? MxmDataFormat::BFloat16
-                    : MxmDataFormat::Float16,
+                dataFormat,
                 op.getAccumulatorClear(),
                 op.getAccumulatorOutputFormat().value_or("fp32") == "bf16"
                     ? MxmAccumulatorOutputFormat::BFloat16
                     : MxmAccumulatorOutputFormat::Float32);
-        queues[{kind, static_cast<int64_t>(op.getQueue())}]
+    queues[{kind, static_cast<int64_t>(op.getQueue())}]
             .push_back(CommandSequence {
                 command_cycle(op), innerCount, innerInterval, innerStride,
                 mxm_instruction_command(
@@ -1209,7 +1231,10 @@ int64_t macro_instruction_stride(const CommandSequence& first,
                 - static_cast<int64_t>(lhs.weight_column);
         if (kind == QueueKind::MxmCompute
             && (lhs.opcode == MxmControlOpcode::Compute
-                || lhs.opcode == MxmControlOpcode::AccumulatorRead))
+                || lhs.opcode == MxmControlOpcode::AccumulatorRead
+                || (lhs.opcode == MxmControlOpcode::Decode
+                    && lhs.decode_operation
+                        == MxmDecodeOperation::StreamCompute)))
             return static_cast<int64_t>(rhs.accumulator_address)
                 - static_cast<int64_t>(lhs.accumulator_address);
         return isa::encode_mxm_instruction(lhs)
