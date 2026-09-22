@@ -45,9 +45,9 @@ IMEM -> bit deque / combinational parser -> full context -> Active RAM
 | Parser FSM | 每周期执行一个 state；每周期最多消费 `Wdecode` bit；长字段分周期 assemble | 单周期解析完整 descriptor |
 | DDB | 保存 decoded template、base timing/operand、compact deltas、run progress、residency state | 保存 N 份 full Context |
 | Lazy expander | FIFO head 每周期最多生成一个 context | 多 context/cycle 批量展开 |
-| Admission | 检查 timing window 和 Active RAM credit | scheduler 物理仲裁 |
-| Active Context RAM | 有限容量、allocation/free、valid lifecycle | 固化 RAM/CAM、端口数和 banking |
-| Issue boundary | 保留 ready/issue/update/complete 的功能语义 | 固化 issue width、selection tree、writeback network |
+| Admission | 检查 timing window 和 Active RAM credit | issue match 与 context update |
+| Active Context RAM | 固定深度、allocation/free、valid lifecycle，以及显式 `next_issue_cycle` | descriptor decode 与 DDB storage |
+| Issue scheduler | 每个 queue 平坦比较全部 valid context；唯一 due context 发射并更新 | 动态优先级、冲突后的延迟发射 |
 
 各 stage 在同一 tick 并行推进。一个 cycle 内最多发生一次 fetch commit、一次
 parser state、一次 DDB commit 和一次 context admission；本周期 admit 的 context
@@ -186,7 +186,20 @@ B0.start = 150
 
 ## 10. Issue Scheduler 接口边界
 
-本次沿用现有 functional priority queue 作为抽象 scheduler，仅依赖以下事件：
+Issue scheduler 已冻结为每个物理 queue 独立的一份固定深度 Active Context RAM。
+MXM baseline 深度为 40；每个 entry 单独保存 valid 和 32-bit
+`next_issue_cycle`。正常发射路径对全部 entry 执行：
+
+```text
+match[i] = valid[i] && (next_issue_cycle[i] == current_cycle)
+```
+
+40-bit match vector 全零时等待，one-hot 时发射对应 context，多命中时报告静态
+schedule 冲突。编译器已保证合法 binary 在同一个 queue/cycle 最多一个 issue，
+因此 scheduler 没有动态 priority policy，也不会在冲突时选择一个 context 并推迟
+其他 context。
+
+接口事件为：
 
 ```text
 context_admitted(context, valid)
@@ -196,8 +209,15 @@ context_state_updated (loop index advance)
 context_completed -> Active RAM credit returned
 ```
 
-该容器不代表 RTL 必须使用 priority queue、CAM 或多端口 RAM。本版没有冻结 read
-ports、write ports、issue width、priority encoder、banking、update/writeback 冲突网络。
+每周期先对周期开始时可见的 context 做 match/issue/update/complete，再接收最多一个
+admission。新 admission 在下一周期才参与 match，没有组合 bypass。非末次 issue
+会在同周期写回 counter 和下一次绝对 issue cycle；末次 issue 释放 slot，该 slot
+可以在本周期末被 admission 复用。
+
+首版不使用 priority queue、heap、calendar wheel 或分层 scheduler。RTL 可以把
+match-vector reduction 和 payload one-hot mux 综合为树，但逻辑结构仍是 flat match。
+正常关键路径只需要 32-bit equality compare；`late` 与 multi-hit 属于错误检测，
+不参与动态仲裁。
 
 ## 11. 统计与派生指标
 
@@ -293,8 +313,8 @@ Active RAM depth:      workload peak around the knee point
 - admission lookahead 与 Active RAM depth 的 workload sweep；
 - reservoir 2-word 是否足够，以及 refill latency 敏感性；
 - parser/predecode 的具体 pipeline register placement；
-- Active RAM 端口数、scheduler ports、banking、issue width；
-- ready selection、update/writeback 和 issue/update conflict；
+- Active Context RAM 的具体寄存器/RAM 映射和物理布线；
+- 编译器按 40-entry MXM 容量做精确峰值验证与必要的 Macro 时间分块；
 - 多 queue 同时 frontend 活动时的功耗和 clock gating；
 - packed-v1 arbitrary-delta run 是否值得在下一版 ISA 中增加 stride mode 或显式 index。
 
