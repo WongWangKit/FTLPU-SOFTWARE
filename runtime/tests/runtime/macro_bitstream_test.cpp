@@ -255,7 +255,7 @@ try {
     // Forces both the wide delta escape and the extended template path.
     queue.commands.push_back(macro(
         ftlpu::MemInstruction::Write(90, 6),
-        {5000000, 4097, 3, 2, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}));
+        {5000000, 4097, 3, 1, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}));
 
     const auto image = rt::encode_mem_macro_bitstream(queue);
     const auto decoded = rt::decode_mem_macro_bitstream(image, queue.index);
@@ -269,6 +269,25 @@ try {
            "extended template was not exercised");
     expect(image.stats.wide_escaped_transitions != 0,
            "wide delta escape was not exercised");
+
+    rt::QueueProgram oversizedContext{rt::QueueKind::Mem, 0, {}};
+    oversizedContext.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(0, 0),
+        {0, 65537, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    expect_throw(
+        [&]() { (void)rt::encode_mem_macro_bitstream(oversizedContext); },
+        "bitstream encoder accepted a count outside the Active Context");
+
+    rt::QueueProgram invalidOperandContext{rt::QueueKind::Mem, 0, {}};
+    invalidOperandContext.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(0, 0),
+        {0, 2, 1, -1, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    expect_throw(
+        [&]() { (void)rt::encode_mem_macro_bitstream(
+                    invalidOperandContext); },
+        "bitstream encoder accepted an out-of-range Active Context operand");
 
     const auto packedMem = rt::pack_mem_macro_imem(image);
     const auto memControl =
@@ -318,11 +337,11 @@ try {
         {rt::QueueKind::MxmLoad,
          0,
          {
-             macro(ftlpu::MxmControlInstruction::IW(0, 1),
-                   {10, 4, 2, 1, 2, 11, 2,
+             macro(ftlpu::MxmControlInstruction::IW(0, 0),
+                   {10, 4, 2, 1, 2, 11, 0,
                     ftlpu::IcuInductionTarget::MxmWeightColumn}),
-             macro(ftlpu::MxmControlInstruction::IW(0, 3),
-                   {42, 4, 2, 1, 2, 11, 2,
+             macro(ftlpu::MxmControlInstruction::IW(0, 0),
+                   {42, 4, 2, 1, 2, 11, 0,
                     ftlpu::IcuInductionTarget::MxmWeightColumn}),
          }});
     mxmQueues.push_back(

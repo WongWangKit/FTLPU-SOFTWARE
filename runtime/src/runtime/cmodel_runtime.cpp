@@ -1591,6 +1591,7 @@ void CModelRuntime::print_icu_frontend_performance(std::ostream& os) const
            << " issued_instructions=" << queue.issued_instructions
            << " peak_active_contexts=" << queue.peak_active_contexts
            << " active_context_capacity=" << queue.active_context_capacity
+           << " active_context_bits=" << queue.active_context_bits
            << " instruction_bits=" << queue.instruction_bits
            << " imem_read_latency=" << queue.imem_read_latency
            << " imem_request_ii="

@@ -106,7 +106,7 @@ queue 在同一个 cycle 不允许产生两条 issue。
 
 # 固定宽 i-MEM 与变长 Macro record
 
-160 bit 是解码后的 active Macro context 预算，不是 i-MEM 中 descriptor 的固定长度。
+256 bit 是解码后的 active Macro context 宽度，不是 i-MEM 中 descriptor 的固定长度。
 
 物理 i-MEM SRAM 保留现有固定宽读口：
 
@@ -121,7 +121,7 @@ queue 在同一个 cycle 不允许产生两条 issue。
 ```text
 固定宽 i-MEM → bit reservoir → Macro decoder
                                   ↓
-                           160-bit context RAM
+                           256-bit context RAM
                                   ↓
                          next-issue calendar → FU
 ```
@@ -518,7 +518,7 @@ decoder 依次执行：
 4. 使用 Dictionary 或 Escape 恢复 cycle/operand；
 5. 把 base operand 写回归一化 native instruction；
 6. 构造完整二维 Macro；
-7. 初始化一个 160-bit active context；
+7. 初始化一个 256-bit active context；
 8. 把 context 加入 next-issue calendar。
 
 next-issue calendar 选择最早到期的 context，计算当前 inner/outer 对应的 operand

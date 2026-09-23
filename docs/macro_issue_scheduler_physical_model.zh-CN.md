@@ -19,6 +19,7 @@ DDB / lazy admission (<= 1 context/cycle)
 |---|---:|
 | MXM Active Context depth | 40 |
 | MEM Active Context depth | 32 |
+| Active Context width | 256 bit（8 × 32-bit word） |
 | Issue width | 1 / queue / cycle |
 | Admission width | 1 / queue / cycle |
 | Match key | 32-bit absolute `next_issue_cycle` |
@@ -31,22 +32,40 @@ CModel 仍使用同一个 MXM depth 参数；未来编译器容量分析可以�
 
 ## 2. Active Context 状态
 
-每个 entry 至少包含：
+每个 entry 使用以下固定物理编码：
 
 ```text
-valid
-native instruction template
-inner_count / inner_interval / inner_stride
-outer_count / outer_interval / outer_stride
-induction_target
-inner_index / outer_index
-next_issue_cycle
-final_issue_cycle
+bit   0       valid
+bit   49:1    current native instruction              49 bit
+bit   51:50   induction_target                         2 bit
+bit   67:52   inner_count_minus_1                     16 bit
+bit   83:68   inner_remaining_minus_1                 16 bit
+bit   99:84   outer_remaining_minus_1                 16 bit
+bit  131:100  inner_interval_minus_1                  32 bit
+bit  163:132  outer_residual_minus_1                  32 bit
+bit  177:164  inner_operand_step, signed              14 bit
+bit  191:178  row_transition_step, signed             14 bit
+bit  223:192  next_issue_cycle                        32 bit
+bit  255:224  final_issue_cycle                       32 bit
 ```
 
-`next_issue_cycle` 是显式状态，match 路径不实时计算二维乘加。context 首次
-admission 时写入 `start_cycle`；每次非末次 issue 后，根据更新后的 inner/outer
-counter 计算并写回下一次绝对 cycle。
+其中：
+
+```text
+inner_span = (inner_count - 1) * inner_interval
+outer_residual = outer_interval - inner_span
+row_transition_step = outer_stride
+                    - (inner_count - 1) * inner_stride
+```
+
+entry 保存的是下一次将直接发射的 current native instruction，而不是需要在 issue
+路径上重新做二维乘加的 base template。非末次 issue 后只更新 remaining counter、
+current operand 和 `next_issue_cycle`。count 最大为 65,536；超范围 Macro 必须在
+compiler/encoder 侧等价拆分。MEM address 与 MXM accumulator 都是 13-bit operand，
+因此任意两个合法 operand 之间的差可由 signed 14 bit 保存。
+
+`record_index/pc` 和 `admission_cycle` 只用于 CModel trace/统计，作为同 slot 的
+sidecar 保存，不计入 256-bit 物理 RAM。
 
 ## 3. Match 与错误语义
 

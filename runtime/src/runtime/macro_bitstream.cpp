@@ -773,8 +773,13 @@ MemMacroBitstream encode_mem_macro_bitstream(const QueueProgram& queue)
 
     std::vector<MacroRecord> records;
     records.reserve(queue.commands.size());
-    for (const auto& command : queue.commands)
-        records.push_back(decode_record(command));
+    for (const auto& command : queue.commands) {
+        auto record = decode_record(command);
+        static_cast<void>(
+            IcuActiveMacroContextCodec256<MemInstruction>::pack_initial(
+                record.schedule, record.instruction));
+        records.push_back(std::move(record));
+    }
 
     MemMacroBitstream image;
     image.command_count = static_cast<std::uint32_t>(records.size());
@@ -919,6 +924,19 @@ MxmMacroBitstream encode_mxm_macro_bitstream(const QueueProgram& queue)
     for (const auto& command : queue.commands) {
         records.push_back(decode_mxm_record(command, queue.kind));
         validate_mxm_record(records.back(), queue.kind);
+        const auto& record = records.back();
+        if (queue.kind == QueueKind::MxmDequant) {
+            static_cast<void>(IcuActiveMacroContextCodec256<
+                MxmDequantInstruction>::pack_initial(
+                    record.schedule,
+                    isa::decode_mxm_dequant_instruction(
+                        static_cast<std::uint16_t>(record.instruction))));
+        } else {
+            static_cast<void>(IcuActiveMacroContextCodec256<
+                MxmControlInstruction>::pack_initial(
+                    record.schedule,
+                    isa::decode_mxm_instruction(record.instruction)));
+        }
     }
 
     MxmMacroBitstream image;
