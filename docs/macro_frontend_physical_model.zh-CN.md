@@ -281,7 +281,7 @@ occupancy 和 lifetime 均由 sum/count 计算，避免在每个 queue 内提前
 ```text
 DDB depth:             2, 4, 8, 16
 decode window:         32, 64
-reservoir words:       2 (research only), 3
+reservoir words:       2, 3, 4
 admission lookahead:   2, 4, 8, 16, 32
 Active RAM depth:      workload peak around the knee point
 ```

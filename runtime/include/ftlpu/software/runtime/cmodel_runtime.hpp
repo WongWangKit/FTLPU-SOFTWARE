@@ -58,6 +58,8 @@ public:
     void dispatch_icu_cycles(std::size_t cycles, std::ostream* log = nullptr);
     void run_cycles(std::size_t cycles, std::ostream* log = nullptr);
     IcuFrontendStatistics icu_frontend_statistics() const noexcept;
+    std::vector<IcuMacroQueueFrontendStatistics>
+    icu_macro_queue_frontend_statistics() const;
     void print_icu_frontend_performance(std::ostream& os) const;
     void print_datapath_performance(std::ostream& os) const;
 
