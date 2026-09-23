@@ -21,7 +21,9 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
     result.qk_waves = workPlanner.qk_waves();
     result.pv_waves = workPlanner.pv_waves();
     const int64_t tile = target.throughput().mxm_rows;
-    const int64_t tokenBlocks = shape.sequence_length / tile;
+    const int64_t keySequenceLength = shape.key_sequence_length > 0
+        ? shape.key_sequence_length : shape.sequence_length;
+    const int64_t tokenBlocks = keySequenceLength / tile;
     const int64_t headBlocks = shape.head_dim / tile;
     const int64_t qkIssueCount = tokenBlocks * headBlocks;
     const int64_t qkWaveComputeCycles =

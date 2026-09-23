@@ -47,7 +47,7 @@ struct ModelSessionStats {
     std::size_t weight_page_hidden_prefetches{0};
     std::size_t weight_page_deferred_prefetches{0};
     std::size_t weight_page_runtime_wait_cycles{0};
-    // Actual FU writes issued by runtime-linked MEM_WRITE_SYNC packets. The
+    // Actual FU writes issued by executable MEM_WRITE_SYNC packets. The
     // value is captured before output/state C2C transfers reset ICU state.
     std::size_t weight_page_synchronized_writes{0};
 };
@@ -73,6 +73,7 @@ public:
 
     const ModelPackage& package() const;
     const std::vector<std::uint8_t>& value(const std::string& name) const;
+    void set_state(std::string name, std::span<const std::uint8_t> data);
     std::vector<std::uint8_t> read_state(const std::string& name);
     void reset_states();
     const SessionMemoryPlan& memory_plan() const;
@@ -80,6 +81,8 @@ public:
     std::vector<WeightPrefetchPlan> executable_weight_prefetch_plans() const;
     const BinaryProgram& last_linked_program() const;
     void write_last_linked_program(const std::filesystem::path& path) const;
+    void write_pre_execution_icu_programs(
+        const std::filesystem::path& directory) const;
 
 private:
     struct DeviceValue {
@@ -93,10 +96,15 @@ private:
         C2cWeightPageFence fence{};
         std::vector<BinaryWeightPageUse> uses{};
         std::size_t launch_event_tag{0};
+        std::size_t page_ready_event_tag{0};
+        std::vector<C2cWeightPager::PageReadyRelease>
+            page_ready_releases{};
+        std::size_t next_page_ready_release{0};
         std::optional<std::int64_t> actual_start_cycle{};
         std::optional<std::int64_t> actual_ready_cycle{};
         std::size_t pre_execution_cycles{0};
         bool launch_released{false};
+        bool page_ready_event_released{false};
         bool trace_recorded{false};
         bool ready_before_execution{false};
         bool inter_invocation_lookahead{false};
@@ -114,6 +122,7 @@ private:
     void release_due_executable_weight_pages();
     void observe_executable_weight_page_tick();
     void record_weight_page_trace(ExecutableWeightTransfer& transfer);
+    std::size_t wait_for_standalone_weight_page(std::size_t max_cycles);
     std::vector<ExecutableWeightTransfer> build_executable_weight_pages(
         const BinaryProgram& program, const ModelInvocation& invocation);
     void prepare_executable_weight_pages(
@@ -131,10 +140,12 @@ private:
         const ExecutableHardwareConfig& hardware) const;
     void upload_binding_through_c2c(
         const BinaryBinding& binding, std::span<const std::uint8_t> data,
-        const ExecutableHardwareConfig& hardware);
+        const ExecutableHardwareConfig& hardware,
+        std::string trace_resource, std::string trace_detail);
     std::vector<std::uint8_t> download_binding_through_c2c(
         const BinaryBinding& binding,
-        const ExecutableHardwareConfig& hardware);
+        const ExecutableHardwareConfig& hardware,
+        const BinaryProgram* compiler_program = nullptr);
 
     CModelRuntime runtime_;
     C2cDmaSystem* c2c_system_{nullptr};
@@ -163,6 +174,7 @@ private:
     ModelSessionStats stats_{};
     ModelSessionStats load_stats_{};
     std::optional<BinaryProgram> last_linked_program_{};
+    std::vector<BinaryProgram> pre_execution_icu_programs_{};
     bool loaded_{false};
     bool completed_invocation_{false};
     std::unordered_map<std::string, std::vector<std::uint8_t>> values_{};

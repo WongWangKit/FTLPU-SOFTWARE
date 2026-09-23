@@ -45,7 +45,10 @@ $env:FTLPU_QWEN_MEM_CSV = "decoder_layer.mem.csv"
 对于包含多个 invocation 的 `ModelSession`，runtime segment 会追加到同一条 session
 物理 cycle 时间轴。`Session.Invocation` 标出每个 executable；
 `C2C.ModelWeightPage`、`C2C.HostInput` 和 `C2C.HostOutput` 保留发生在 executable
-局部 ICU cycle 之外的传输时间。
+局部 ICU cycle 之外的传输时间。冷启动 model page、state page、host input 和
+executable prefetch 也会逐 cycle 采样其真实 C2C DMA/RX 与 MEM `WRITE_SYNC`；因此
+动态 CSV 从第一次数据读入的 cycle 0 开始，而 `Session.Invocation` 在启动数据全部
+就绪之后才开始。
 
 旧版四列输入格式继续兼容：
 

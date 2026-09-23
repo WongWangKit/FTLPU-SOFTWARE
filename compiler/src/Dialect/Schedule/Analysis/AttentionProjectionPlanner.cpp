@@ -9,10 +9,12 @@ AttentionProjectionPlanner::AttentionProjectionPlanner(AttentionProjectionShape 
 {
     const int64_t tile = target.throughput().mxm_rows;
     if (shape.sequence_length <= 0 || shape.hidden_size <= 0 || shape.head_dim <= 0
-        || shape.sequence_length % tile || shape.hidden_size % tile || shape.head_dim % tile)
+        || (shape.sequence_length != 1 && shape.sequence_length % tile)
+        || shape.hidden_size % tile || shape.head_dim % tile)
         throw std::invalid_argument("attention projection shape must be MXM-tile aligned");
     const int64_t reductions = shape.hidden_size / tile;
-    const int64_t token_blocks = shape.sequence_length / tile;
+    const int64_t token_blocks =
+        (shape.sequence_length + tile - 1) / tile;
     const int64_t projection_heads[] = {shape.query_heads, shape.kv_heads, shape.kv_heads};
     for (int64_t projection = 0; projection < 3; ++projection) {
         for (int64_t group = 0; group < projection_heads[projection]; group += 2) {

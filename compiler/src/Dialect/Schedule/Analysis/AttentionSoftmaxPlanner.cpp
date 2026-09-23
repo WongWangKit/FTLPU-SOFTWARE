@@ -73,7 +73,7 @@ mlir::FailureOr<AttentionSoftmaxSchedule> planAttentionSoftmax(
     result.end_cycle = fused ? qkStart : qkEnd + 16;
     if (fused) {
         const int64_t tile = target.throughput().mxm_rows;
-        const int64_t tokenBlocks = op.getSeqLen() / tile;
+        const int64_t tokenBlocks = (op.getSeqLen() + tile - 1) / tile;
         const int64_t headBlocks = op.getHeadDim() / tile;
         const int64_t firstIwOffset =
             target.throughput().mxm_earliest_iw_cycle

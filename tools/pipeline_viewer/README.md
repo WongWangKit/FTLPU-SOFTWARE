@@ -40,7 +40,11 @@ every active MEM behavior at the selected cycle.
 For a multi-invocation `ModelSession`, runtime segments are appended on one
 session-wide physical-cycle axis. `Session.Invocation` marks each executable;
 `C2C.ModelWeightPage`, `C2C.HostInput`, and `C2C.HostOutput` retain transfer
-time outside an executable's local ICU cycle counter.
+time outside an executable's local ICU cycle counter. Cold-start model pages,
+state pages, host inputs, and executable prefetches are sampled cycle by cycle
+as real C2C DMA/RX and MEM `WRITE_SYNC` activity. The dynamic CSV therefore
+starts with the first data read at cycle 0, and `Session.Invocation` begins only
+after all required startup data is resident.
 
 The original four-column CSV remains supported:
 

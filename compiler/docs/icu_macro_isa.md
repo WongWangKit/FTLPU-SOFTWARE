@@ -14,7 +14,7 @@ The current raw local-iMEM formats are:
 | --- | --- | ---: |
 | MEM | `READ_3D`, `WRITE_3D`, `WRITE_TAP_3D` | 3 consecutive 96-bit words |
 | MEM | `WRITE_READ_2D` | 3 consecutive 96-bit words |
-| MEM | `MEM_WRITE_SYNC` | 2 consecutive 96-bit words |
+| MEM | `MEM_READ_SYNC` / `MEM_WRITE_SYNC` | 2 consecutive 96-bit words |
 | MXM load | `LOAD_3D` | 2 consecutive 128-bit words |
 | MXM dequant | `DEQUANT_3D` | 2 consecutive 128-bit words |
 | MXM compute | `COMPUTE_3D`, `ACCUMULATOR_READ_3D` | 2 consecutive 128-bit words |
@@ -327,10 +327,12 @@ shared address formula, and exactly one write and one read per coordinate.
 Independent address domains, repeated reads, or multiple write sources are
 not implicit in this instruction.
 
-### MEM_WRITE_SYNC: 2 x 96 bits
+### MEM_READ_SYNC / MEM_WRITE_SYNC: 2 x 96 bits
 
 This command is decoded by the same per-bank MEM ICU as the 3-D commands above.
-Word 0 uses extended subtype 6 and word 1 is a native MEM `Write` template:
+Word 0 uses extended subtype 6 and word 1 is a native MEM `Read` or `Write`
+template. The native opcode distinguishes `MEM_READ_SYNC` from
+`MEM_WRITE_SYNC`; both use the same fixed two-word format:
 
 | Word-0 physical bits | Field |
 | ---: | --- |
@@ -344,11 +346,13 @@ Word 0 uses extended subtype 6 and word 1 is a native MEM `Write` template:
 | `[95:92]` | Reserved, zero |
 
 After activation, the command owns the MEM ICU for at least its reserved
-window. Every matching C2C token becomes one native write after the encoded SR
-delay. If all writes finish early, the ICU holds the command until the window
-ends; if data arrives late, the command retires only after the final write.
-The next read or write therefore cannot bypass it, and early DDR completion
-cannot move the following static MEM schedule forward.
+window. For `MEM_WRITE_SYNC`, every matching C2C RX token becomes one native
+write after the encoded SR delay. `MEM_READ_SYNC` drives MEM-to-DDR page-out:
+a C2C TX lane sends one matching token only when its input pipeline has room,
+and each token becomes one native read. TX, DMA, and DDR backpressure therefore
+propagates to MEM instead of releasing a whole burst at once. If work finishes
+early, the ICU still holds the command until the window ends; late work retires
+only after the final read or write. Later MEM commands cannot bypass it.
 
 ### MXM load: 2 x 128 bits
 

@@ -11,6 +11,7 @@
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
+#include <tuple>
 
 namespace ftlpu::compiler::schedule {
 using namespace attention_detail;
@@ -55,7 +56,8 @@ int64_t emitRopeNormTranspose(
   const int64_t tile = target.throughput().mxm_rows;
   const int64_t tileRows = target.throughput().tile_rows;
   const int64_t headBlocks = headDim / tile;
-  const int64_t inputBeats = (seqLen / tile) * headBlocks * tileRows;
+  const int64_t inputBeats = ((seqLen + tile - 1) / tile)
+      * headBlocks * tileRows;
   if (rawSlices.size() != static_cast<std::size_t>(width) ||
       packedSlices.size() != static_cast<std::size_t>(width))
     return start;
@@ -98,7 +100,7 @@ int64_t emitRopeNormTranspose(
 
   const int64_t packedBank = placementBankValue(packedPlacement);
   const int64_t captureStart = start + maxReadLatency;
-  const int64_t tokenBlocks = seqLen / tile;
+  const int64_t tokenBlocks = (seqLen + tile - 1) / tile;
   for (int64_t tokenBlock = 0; tokenBlock < tokenBlocks; ++tokenBlock) {
     for (int64_t headBlock = 0; headBlock < headBlocks; ++headBlock) {
       const int64_t firstWave =
@@ -164,7 +166,28 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   const llvm::StringRef streamKind = lpu_16bit_stream_kind(elementType);
   const llvm::StringRef dataFormat = lpu_16bit_data_format(elementType);
   const int64_t tile = target_.throughput().mxm_rows;
-  const int64_t tokenBlocks = op_.getSeqLen() / tile;
+  const int64_t tokenBlocks = (op_.getSeqLen() + tile - 1) / tile;
+  const int64_t projectionRows = std::min(tile, op_.getSeqLen());
+  // A one-token decode only occupies one physical MXM row.  Reusing the same
+  // accumulator before its feedback result is available is illegal, but
+  // waiting for the full 32-row tile leaves 26 idle issue slots after every
+  // reduction.  Keep prefill at the tile cadence and use the actual feedback
+  // dependency for decode.
+  const int64_t projectionIssueInterval =
+      op_.getSeqLen() == 1
+          ? std::max(target_.throughput().mxm0_accumulator_latency,
+                     target_.throughput().mxm1_accumulator_latency)
+          : tile;
+  const int64_t projectionReductionInterval =
+      tokenBlocks * projectionIssueInterval;
+  // RoPE and the legacy head layouts still operate on one 32-row logical
+  // tile.  Keep that domain width separate from the reduced decode cadence.
+  const int64_t projectionCycleSpan = tokenBlocks * tile;
+  const int64_t cacheTokenBlock = op_.getPositionOffset() / tile;
+  const int64_t currentTokens = op_.getCurrentLen();
+  const auto validTokensInBlock = [&](int64_t tokenBlock) {
+    return std::clamp(currentTokens - tokenBlock * tile, int64_t{0}, tile);
+  };
   const int64_t hiddenBlocks = op_.getHidden() / tile;
   const int64_t projectionHeadBlocks = op_.getHeadDim() / tile;
   if (!projection_rope_overlap_enabled_ &&
@@ -300,6 +323,14 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   const int64_t projectionActivationBank =
       inputDistributed16 ? inputStagingBank : inputBank;
   const int64_t stagingBank = placementBank("rope_staging");
+  const auto alternateStagingPlacement =
+      op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(
+          "rope_staging_alternate");
+  const int64_t alternateStagingBank = alternateStagingPlacement
+      ? placementBankValue(alternateStagingPlacement) : stagingBank;
+  const auto alternateStagingSlices = alternateStagingPlacement
+      ? placementSlices(alternateStagingPlacement)
+      : llvm::SmallVector<int64_t>{};
   const auto ropeStagingMirrorPlacement =
       op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(
           "rope_staging_mirror");
@@ -309,6 +340,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           : llvm::SmallVector<int64_t>{};
   const int64_t ropeStagingBase = placementBase(
       op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("rope_staging"));
+  const int64_t alternateStagingBase = alternateStagingPlacement
+      ? placementBase(alternateStagingPlacement) : ropeStagingBase;
   const int64_t ropeStagingMirrorBase = ropeStagingMirrorPlacement
       ? placementBase(ropeStagingMirrorPlacement)
       : ropeStagingBase;
@@ -396,8 +429,15 @@ int64_t AttentionScheduleEmitter::emitProjections() {
     const int64_t stagingCycle = 16;
     const int64_t stagingBase =
         inputStagingPlacement.getAs<mlir::IntegerAttr>("base_row").getInt();
-    const int64_t tokenWaves = tile / 8;
-    for (int64_t tokenLane = 0; tokenLane < 8; ++tokenLane) {
+    // A partial decode tile contains only the physical token lanes that are
+    // logically present.  Emitting the prefill-sized 4x8 lane domain for an
+    // m=1 decode would make the 48 hidden-block groups overlap on the same
+    // MEM ICU (the next hidden block starts one cycle later while the stale
+    // lane domain still spans 25 cycles).
+    const int64_t activeTokenLanes = std::min<int64_t>(8, op_.getSeqLen());
+    for (int64_t tokenLane = 0; tokenLane < activeTokenLanes; ++tokenLane) {
+      const int64_t tokenWaves =
+          (op_.getSeqLen() - tokenLane + 7) / 8;
       for (int64_t hemisphere = 0;
            hemisphere < target_.memory().hemispheres; ++hemisphere) {
         for (int64_t byte = 0; byte < 2; ++byte) {
@@ -476,7 +516,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
     const int64_t accumulatorHalfStride =
         target_.throughput().mxm_accumulator_blocks
         * target_.throughput().mxm_rows / 2;
-    const int64_t conservativeComputeSpacing = tile;
+    const int64_t conservativeComputeSpacing = projectionIssueInterval;
     int64_t projectionBlock = 0;
     int64_t postprocessReady = phaseStart;
     struct MemIcuInterval {
@@ -630,8 +670,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 hemisphere * target_.memory().slices_per_hemisphere + slice,
                 "read", baseAddress, weightStreamBase + stream, 4, 1, 1,
                 "sram", functionArgumentIndex(projectionValues[projection]),
-                hiddenBlocks, op_.getSeqLen(), 8, projectionGroups * 2,
-                hiddenBlocks * op_.getSeqLen(), 0,
+                hiddenBlocks, projectionReductionInterval, 8,
+                projectionGroups * 2,
+                hiddenBlocks * projectionReductionInterval, 0,
                 layout.weightBank(kind), layout.weightPage(kind), -1,
                 2, halfStride, groupStride);
           }
@@ -663,10 +704,12 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 rewriter_, op_.getLoc(),
                 phaseStart + 4 + loadToIw - readToActivation,
                 hemisphere * target_.memory().slices_per_hemisphere + slice,
-                "read", placementBase(inputStagingPlacement), byte, tile, 1,
-                1, "sram", -1, hiddenBlocks, op_.getSeqLen(),
+                "read", placementBase(inputStagingPlacement), byte,
+                projectionRows, 1,
+                1, "sram", -1, hiddenBlocks, projectionReductionInterval,
                 op_.getSeqLen(), projectionGroups * 2,
-                hiddenBlocks * op_.getSeqLen(), 0, projectionActivationBank);
+                hiddenBlocks * projectionReductionInterval, 0,
+                projectionActivationBank);
           }
         }
       }
@@ -674,10 +717,57 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       // Q/K RoPE and V's cross-hemisphere packing run only after the complete
       // projection, leaving each activation and weight MEM queue uninterrupted.
       const bool deferPostprocess = !projection_rope_overlap_enabled_;
+      const bool serialQueryProductsFirst =
+          deferPostprocess && kind == AttentionProjectionKind::Query &&
+          tokenBlocks == 1 && alternateStagingPlacement &&
+          !op_.hasQkNorm() &&
+          target_.throughput().vxm_cross_hemisphere_streams_enabled != 0 &&
+          target_.memory().hemispheres == 2 && projectionHeadBlocks == 4;
       llvm::SmallVector<int64_t> deferredRawWriteEnds(
           static_cast<std::size_t>(deferPostprocess ? projectionGroups : 0));
       const int64_t scheduleGroups =
-          deferPostprocess ? 2 * projectionGroups : projectionGroups;
+          (deferPostprocess ? (serialQueryProductsFirst ? 3 : 2) : 1) *
+          projectionGroups;
+      struct PendingQueryIwWrite {
+        int64_t cycle;
+        int64_t queue;
+        int64_t address;
+        int64_t stream;
+        int64_t bank;
+        int64_t head;
+        int64_t pairBlock;
+      };
+      llvm::SmallVector<PendingQueryIwWrite, 32> pendingQueryIwWrites;
+      struct PendingQuerySourceRead {
+        int64_t cycle;
+        int64_t queue;
+        int64_t address;
+        int64_t stream;
+        int64_t bank;
+        int64_t head;
+        int64_t pairBlock;
+        int64_t phase;
+      };
+      llvm::SmallVector<PendingQuerySourceRead, 32> pendingQuerySourceReads;
+      struct PendingQueryMirrorTable {
+        int64_t cycle;
+        int64_t queue;
+        int64_t address;
+        int64_t stream;
+        int64_t bank;
+        int64_t head;
+        int64_t pairInterval;
+      };
+      llvm::SmallVector<PendingQueryMirrorTable, 96>
+          pendingQueryMirrorTables;
+      struct PendingQueryCombine {
+        int64_t cycle;
+        int64_t inputHemisphere;
+        int64_t outputHemisphere;
+      };
+      llvm::SmallVector<PendingQueryCombine, 32> pendingQueryCombines;
+      int64_t serialQueryProductBaseCycle = -1;
+      int64_t serialQueryCombineBaseCycle = -1;
       for (int64_t scheduleGroup = 0; scheduleGroup < scheduleGroups;
            ++scheduleGroup) {
         if (deferPostprocess && scheduleGroup == projectionGroups) {
@@ -685,6 +775,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           // just the final MXM issue.
           int64_t maxReadLead = 0;
           for (int64_t slice : layout.ropeStagingSlices())
+            maxReadLead = std::max(maxReadLead, readLatency(slice));
+          for (int64_t slice : alternateStagingSlices)
             maxReadLead = std::max(maxReadLead, readLatency(slice));
           phaseStart = std::max(
               phaseStart,
@@ -694,6 +786,12 @@ int64_t AttentionScheduleEmitter::emitProjections() {
         }
         const bool emitProjectionPass =
             !deferPostprocess || scheduleGroup < projectionGroups;
+        const bool emitQueryProducts =
+            !serialQueryProductsFirst ||
+            scheduleGroup < 2 * projectionGroups;
+        const bool emitQueryCombine =
+            !serialQueryProductsFirst ||
+            scheduleGroup >= 2 * projectionGroups;
         const int64_t outputGroup = scheduleGroup % projectionGroups;
         // The Q staging write and its first cross-hemisphere copy read visit
         // the same four SRAM rows with different issue rates. Keep their
@@ -714,6 +812,29 @@ int64_t AttentionScheduleEmitter::emitProjections() {
         const int64_t replicatedStagingBank = qWriteRead2D
             ? (stagingBank + 1) % target_.memory().banks_per_slice
             : stagingBank;
+        const bool splitSerialQueryStaging =
+            !projection_rope_overlap_enabled_ && alternateStagingPlacement
+            && kind == AttentionProjectionKind::Query;
+        // Serial Q and K rotary halves originate in opposite hemispheres.
+        // Select the original streams at VXM rather than mirror staging SRAM.
+        const bool directSplitRope =
+            !projection_rope_overlap_enabled_ &&
+            (kind == AttentionProjectionKind::Key ||
+             splitSerialQueryStaging) &&
+            !op_.hasQkNorm() &&
+            target_.throughput().vxm_cross_hemisphere_streams_enabled != 0 &&
+            target_.memory().hemispheres == 2 && projectionHeadBlocks == 4;
+        const auto stagingSliceFor = [&](int64_t sourceBlock,
+                                         int64_t sourceSlice) {
+          if (!splitSerialQueryStaging ||
+              sourceBlock < projectionHeadBlocks / 2)
+            return sourceSlice;
+          const auto stagingSlices = layout.ropeStagingSlices();
+          const auto it = std::find(stagingSlices.begin(),
+                                    stagingSlices.end(), sourceSlice);
+          return alternateStagingSlices[
+              std::distance(stagingSlices.begin(), it)];
+        };
         // Q activation uses eastbound SR streams 0..7, and Q weights use
         // 24..31. Keep the mirror in 8..23 while Q groups overlap. At the
         // final Q/V boundary, V activation takes 16/17 and no next Q group
@@ -736,9 +857,19 @@ int64_t AttentionScheduleEmitter::emitProjections() {
         };
         const auto stagingBankFor = [&](int64_t sourceBlock,
                                         int64_t hemisphere) {
+          if (splitSerialQueryStaging)
+            return sourceBlock >= projectionHeadBlocks / 2
+                ? alternateStagingBank : stagingBank;
           return qWriteRead2D && hemisphere != sourceBlock / 2
                      ? replicatedStagingBank
                      : stagingBank;
+        };
+        const auto stagingAddressFor = [&](int64_t sourceBlock,
+                                           int64_t address) {
+          return splitSerialQueryStaging
+                     && sourceBlock >= projectionHeadBlocks / 2
+              ? address + alternateStagingBase - ropeStagingBase
+              : address;
         };
         struct PendingQWriteRead {
           int64_t writeCycle[2] = {-1, -1};
@@ -795,7 +926,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               emitMem3D(
                   rewriter_, op_.getLoc(), domain.cycle, domain.queue, "read",
                   domain.address, domain.packedStream, 4, 1, 1, "sram",
-                  domain.addressBinding, hiddenBlocks, op_.getSeqLen(), 8,
+                  domain.addressBinding, hiddenBlocks,
+                  projectionReductionInterval, 8,
                   groupCount, groupInterval, groupAddressStride, domain.bank,
                   domain.weightPage);
             };
@@ -815,12 +947,15 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             kind != AttentionProjectionKind::Value &&
             projectionHeadBlocks == 4 &&
             outputGroup * 4 + 3 < projectionOutputBlocks;
-        int64_t firstRawWriteCycle[2][16];
-        int64_t firstRawWriteAddress[2][16];
-        std::fill(&firstRawWriteCycle[0][0],
-                  &firstRawWriteCycle[0][0] + 32, -1);
-        std::fill(&firstRawWriteAddress[0][0],
-                  &firstRawWriteAddress[0][0] + 32, -1);
+        llvm::SmallVector<int64_t, 64> firstRawWriteCycle[2];
+        llvm::SmallVector<int64_t, 64> firstRawWriteAddress[2];
+        for (int64_t hemisphere = 0;
+             hemisphere < target_.memory().hemispheres; ++hemisphere) {
+          firstRawWriteCycle[hemisphere].assign(
+              target_.memory().slices_per_hemisphere, -1);
+          firstRawWriteAddress[hemisphere].assign(
+              target_.memory().slices_per_hemisphere, -1);
+        }
         for (int64_t half = 0; half < 2; ++half) {
           int64_t nextWeightDomain = 0;
           int64_t nextActivationDomain = 0;
@@ -920,7 +1055,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       const int64_t groupAddressStride =
                           current.address - pending.address;
                       const int64_t innerDomainLastOffset =
-                          (hiddenBlocks - 1) * op_.getSeqLen() + 3;
+                          (hiddenBlocks - 1) * projectionReductionInterval + 3;
                       const bool pairCompleteHalves =
                           half == 1 && completeReductionDomain && pending.valid &&
                           current.queue == pending.queue &&
@@ -941,14 +1076,17 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             current.queue, "read", current.address,
                             current.packedStream, 4, 1, 1, "sram",
                             current.addressBinding, weightDomainCount,
-                            op_.getSeqLen(), 8, 1, 1, 0, current.bank,
+                            projectionReductionInterval, 8, 1, 1, 0,
+                            current.bank,
                             current.weightPage);
                       }
                     }
                   }
                   currentProjectionWeightRelease = std::max(
                       currentProjectionWeightRelease,
-                      readCycle + (weightDomainCount - 1) * op_.getSeqLen() +
+                      readCycle +
+                          (weightDomainCount - 1) *
+                              projectionReductionInterval +
                           4);
                 }
                 if (localDequant &&
@@ -957,10 +1095,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   emitMxmDequant3D(
                       rewriter_, op_.getLoc(), dequantStart, hemisphere,
                       projectionScales[projection], 4, 1, weightDomainCount,
-                      op_.getSeqLen(),
+                      projectionReductionInterval,
                       mergeProjectionMxm ? projectionGroups * 2 : 1,
                       mergeProjectionMxm
-                          ? hiddenBlocks * op_.getSeqLen()
+                          ? hiddenBlocks * projectionReductionInterval
                           : 1,
                       functionArgumentIndex(projectionValues[projection]));
               }
@@ -983,7 +1121,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 loadDomain.wave_interval = 1;
                 loadDomain.wave_weight_column_stride = -1;
                 loadDomain.group_count = loadGroupCount;
-                loadDomain.group_interval = op_.getSeqLen();
+                loadDomain.group_interval = projectionReductionInterval;
                 if (loadGroupCount > 1 &&
                     target_.throughput().mxm_weight_buffers == 2)
                   loadDomain.weight_buffer_mode = "toggle_dim2";
@@ -992,11 +1130,11 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   loadDomain.repeat_interval = 1;
                   loadDomain.repeat_weight_column_stride = -1;
                   loadDomain.wave_count = hiddenBlocks;
-                  loadDomain.wave_interval = op_.getSeqLen();
+                  loadDomain.wave_interval = projectionReductionInterval;
                   loadDomain.wave_weight_column_stride = 0;
                   loadDomain.group_count = projectionGroups * 2;
                   loadDomain.group_interval =
-                      hiddenBlocks * op_.getSeqLen();
+                      hiddenBlocks * projectionReductionInterval;
                   loadDomain.weight_buffer_mode = "toggle_dim1";
                 }
                 emitMxm3D(
@@ -1047,7 +1185,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     return true;
                   };
               const int64_t flattenedRows =
-                  activationDomainCount * op_.getSeqLen();
+                  activationDomainCount * projectionReductionInterval;
               for (int64_t flat = 0; flat < flattenedRows; ++flat) {
                 const int64_t consumeCycle = firstCompute + flat;
                 const bool primaryFree = pairIsFree(
@@ -1144,8 +1282,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                   target_.memory().slices_per_hemisphere +
                               slice,
                           "read", inputAddress, activationStreamBase + byte,
-                          tile, 1, 1, "sram", -1, tokenBlocks, computeSpacing,
-                          tile, activationDomainCount, op_.getSeqLen(),
+                          projectionRows, 1, 1, "sram", -1, tokenBlocks,
+                          computeSpacing,
+                          tile, activationDomainCount,
+                          projectionReductionInterval,
                           op_.getSeqLen(), projectionActivationBank);
                     }
                   }
@@ -1167,13 +1307,13 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   const bool terminalDomain =
                       computeDomainIncludesFinal && computeDomainCount > 1;
                   MxmDomain3D computeDomain;
-                  computeDomain.repeat_count = tile;
+                  computeDomain.repeat_count = projectionRows;
                   computeDomain.repeat_accumulator_address_stride = 0;
                   computeDomain.wave_count = tokenBlocks;
                   computeDomain.wave_interval = computeSpacing;
                   computeDomain.wave_accumulator_address_stride = tile;
                   computeDomain.group_count = computeDomainCount;
-                  computeDomain.group_interval = op_.getSeqLen();
+                  computeDomain.group_interval = projectionReductionInterval;
                   if (computeDomainCount > 1 &&
                       target_.throughput().mxm_weight_buffers == 2)
                     computeDomain.weight_buffer_mode = "toggle_dim2";
@@ -1185,14 +1325,14 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         dataFormat;
                   }
                   if (mergeProjectionMxm) {
-                    computeDomain.repeat_count = tile;
+                    computeDomain.repeat_count = projectionRows;
                     computeDomain.repeat_interval = 1;
                     computeDomain.wave_count = hiddenBlocks;
-                    computeDomain.wave_interval = op_.getSeqLen();
+                    computeDomain.wave_interval = projectionReductionInterval;
                     computeDomain.wave_accumulator_address_stride = 0;
                     computeDomain.group_count = projectionGroups * 2;
                     computeDomain.group_interval =
-                        hiddenBlocks * op_.getSeqLen();
+                        hiddenBlocks * projectionReductionInterval;
                     computeDomain.weight_buffer_mode = "toggle_dim1";
                     computeDomain.terminal_dimension = 1;
                     computeDomain.terminal_accumulator_destination = "stream";
@@ -1231,22 +1371,22 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       rewriter_, op_.getLoc(), projectionValues[projection],
                       configCycle, 0, "multiply", streamKind, 32, 0.0f,
                       streamKind, 40, 0.0f, "fp32", -1, "east", "east", -1,
-                      2, tile, 1, "east", "east");
+                      2, projectionRows, 1, "east", "east");
                   emitVxmConfigured(
                       rewriter_, op_.getLoc(), projectionValues[projection],
                       configCycle, 1, "fms", streamKind, 32, 0.0f,
                       streamKind, 42, 0.0f, dataFormat, 0, "east", "east", -1,
-                      2, tile, 1, "west", "east");
+                      2, projectionRows, 1, "west", "east");
                   emitVxmConfigured(
                       rewriter_, op_.getLoc(), projectionValues[projection],
                       configCycle, 2, "multiply", streamKind, 32, 0.0f,
                       streamKind, 40, 0.0f, "fp32", -1, "east", "east", -1,
-                      2, tile, 1, "west", "east");
+                      2, projectionRows, 1, "west", "east");
                   emitVxmConfigured(
                       rewriter_, op_.getLoc(), projectionValues[projection],
                       configCycle, 3, "fma", streamKind, 32, 0.0f,
                       streamKind, 42, 0.0f, dataFormat, 2, "east", "east", -1,
-                      2, tile, 1, "east", "east");
+                      2, projectionRows, 1, "east", "east");
 
                   const bool useMirrorTable =
                       kind == AttentionProjectionKind::Key;
@@ -1263,9 +1403,14 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         firstVxmInput - vxmInputReadLatency(cosineSlice),
                         cosineSlice, "read",
                         useMirrorTable
-                            ? layout.ropeMirrorAddress(tokenBlock * tile, half)
-                            : layout.ropeAddress(tokenBlock * tile, half),
-                        40 + byte, tile, 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0,
+                            ? layout.ropeMirrorAddress(
+                                  op_.getPositionOffset() + tokenBlock * tile,
+                                  half)
+                            : layout.ropeAddress(
+                                  op_.getPositionOffset() + tokenBlock * tile,
+                                  half),
+                        40 + byte, projectionRows, 1, 1, "sram", -1, 1, 1,
+                        0, 1, 1, 0,
                         directRopeBank);
                     const int64_t sineSlice = ropeSlices[2 + byte];
                     emitMem3D(
@@ -1273,13 +1418,22 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         firstVxmInput - vxmInputReadLatency(sineSlice),
                         sineSlice, "read",
                         useMirrorTable
-                            ? layout.ropeMirrorAddress(tokenBlock * tile, half)
-                            : layout.ropeAddress(tokenBlock * tile, half),
-                        42 + byte, tile, 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0,
+                            ? layout.ropeMirrorAddress(
+                                  op_.getPositionOffset() + tokenBlock * tile,
+                                  half)
+                            : layout.ropeAddress(
+                                  op_.getPositionOffset() + tokenBlock * tile,
+                                  half),
+                        42 + byte, projectionRows, 1, 1, "sram", -1, 1, 1,
+                        0, 1, 1, 0,
                         directRopeBank);
                   }
 
                   const int64_t blocks[] = {half, half + 2};
+                  const int64_t validTokens =
+                      validTokensInBlock(tokenBlock);
+                  if (validTokens == 0)
+                    continue;
                   for (int64_t outputHalf = 0; outputHalf < 2;
                        ++outputHalf) {
                     const int64_t reduction = blocks[outputHalf];
@@ -1347,9 +1501,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                   slice,
                               "write",
                               layout.keyAddress(
-                                  head, reduction, tokenBlock),
+                                  head, reduction,
+                                  cacheTokenBlock + tokenBlock),
                               source * 8 + outputHalf * 2 + byte,
-                              tile, 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0,
+                              validTokens, 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0,
                               layout.keyBank(reduction));
                         }
                         rawWriteEnd =
@@ -1360,8 +1515,20 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   continue;
                 }
 
-                for (int64_t offset = 0; offset < tile; ++offset) {
+                // A decode/tail block only issues projectionRows MXM rows.
+                // Schedule writeback for exactly those rows: padding the MEM
+                // domain to a full tile would make later slice queues consume
+                // result slots that the MXM never produces.
+                const int64_t validProjectionRows =
+                    validTokensInBlock(tokenBlock);
+                for (int64_t offset = 0; offset < validProjectionRows;
+                     ++offset) {
                   const int64_t token = tokenBlock * tile + offset;
+                  // One physical MEM queue owns one token lane modulo eight.
+                  // Its repeated starts cover only the rows present for that
+                  // lane in this (possibly partial) token block.
+                  const int64_t packedRowCount =
+                      (validProjectionRows - (offset % 8) + 7) / 8;
                   const int64_t resultCycle =
                       computeCycle + target_.mxm_first_result_latency() +
                       offset;
@@ -1369,19 +1536,21 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     const int64_t packedStream = (token % 8) * 2;
                     const int64_t row = (token % tile) / 8;
                     for (int64_t byte = 0; byte < 2; ++byte) {
-                      const int64_t slice =
-                          layout.ropeStagingSlices()[(packedStream + byte +
-                                                      2 * headBlock) %
-                                                     16];
+                      const int64_t slice = stagingSliceFor(headBlock,
+                          layout.ropeStagingSlices()
+                              [(packedStream + byte +
+                                (serialQueryProductsFirst ? 0
+                                                          : 2 * headBlock)) %
+                               16]);
                       const int64_t latency = *target_.transport_latency(
                           target::StreamEndpoint::MxmResult,
                           target::StreamEndpoint::Mem,
                           target::StreamDirection::West, slice);
                       if (tokenBlock == 0 && row == 0) {
                         const int64_t cycle = resultCycle + latency;
-                        const int64_t address =
-                            layout.ropeStagingAddress(
-                                kind, head, headBlock, 0, 0);
+                        const int64_t address = stagingAddressFor(
+                            headBlock, layout.ropeStagingAddress(
+                                kind, head, headBlock, 0, 0));
                         if (qWriteRead2D) {
                           auto &pending = pendingQWriteRead[hemisphere][slice];
                           pending.writeCycle[half] = cycle;
@@ -1402,6 +1571,13 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               : address;
                           const bool mergeWholeProjection =
                               mergeProjectionMxm && pairHalves;
+                          const int64_t nextGroupAddress =
+                              mergeWholeProjection
+                                  ? stagingAddressFor(headBlock - 1,
+                                        layout.ropeStagingAddress(
+                                            kind, head + 1, headBlock - 1,
+                                            0, 0))
+                                  : domainAddress;
                           if (!mergeWholeProjection || outputGroup == 0) {
                             // The two output halves form dimension 1; all
                             // heads form dimension 2. Each physical queue
@@ -1412,7 +1588,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                         target_.memory().slices_per_hemisphere +
                                     slice,
                                 "write", domainAddress, 32 + byte,
-                                target_.throughput().tile_rows, 8, 1,
+                                packedRowCount, 8, 1,
                                 "sram", -1,
                                 mergeWholeProjection ? 2 : tokenBlocks,
                                 mergeWholeProjection ? cycle - domainCycle
@@ -1423,20 +1599,19 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                     ? projectionGroups
                                     : (pairHalves ? 2 : 1),
                                 mergeWholeProjection
-                                    ? 2 * hiddenBlocks * op_.getSeqLen()
+                                    ? 2 * hiddenBlocks *
+                                          projectionReductionInterval
                                     : (pairHalves ? cycle - domainCycle : 1),
                                 mergeWholeProjection
-                                    ? layout.ropeStagingAddress(
-                                          kind, head + 1, headBlock - 1, 0, 0) -
-                                          domainAddress
+                                    ? nextGroupAddress - domainAddress
                                     : (pairHalves ? address - domainAddress
                                                   : 0),
-                                stagingBank);
+                                stagingBankFor(headBlock, hemisphere));
                           }
                         }
                         rawWriteEnd = std::max(
                             rawWriteEnd,
-                            cycle + (target_.throughput().tile_rows - 1) * 8 +
+                            cycle + (packedRowCount - 1) * 8 +
                                 (tokenBlocks - 1) * computeSpacing + 1);
                       }
                     }
@@ -1464,19 +1639,35 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               rewriter_, op_.getLoc(), projectionBias,
                               vxmInputCycle - 1, alu, "add", streamKind, 32,
                               0.0f, streamKind, 40, 0.0f, "fp32", -1,
-                              sourceName, sourceName, -1, 2, tile, 1,
+                              sourceName, sourceName, -1, 2, projectionRows, 1,
                               sourceName, sourceName);
                           emitVxmConfigured(
                               rewriter_, op_.getLoc(), projectionBias,
                               vxmInputCycle - 1, alu + 1, "pass", "previous",
                               0, 0.0f, "immediate", 0, 0.0f, dataFormat,
-                              alu, sourceName, sourceName, -1, 2, tile, 1);
+                              alu, sourceName, sourceName, -1, 2,
+                              projectionRows, 1);
                         }
                       }
                       const int64_t pair = (outputBlock / 2) % 2;
                       for (int64_t byte = 0; byte < 2; ++byte) {
                         const int64_t slice = biasSlices[2 * pair + byte];
-                        if (offset == 0 && tokenBlock == 0)
+                        const bool mergeValueBias =
+                            kind == AttentionProjectionKind::Value &&
+                            mergeProjectionMxm && tokenBlocks == 1 &&
+                            target_.uses_dedicated_slice_roles() &&
+                            projectionOutputBlocks == projectionGroups * 4 &&
+                            biasAddress(outputGroup * 4 + hemisphere * 2 + 1) -
+                                    biasAddress(outputGroup * 4 +
+                                                hemisphere * 2) ==
+                                1 &&
+                            biasAddress(outputGroup * 4 + hemisphere * 2 + 4) -
+                                    biasAddress(outputGroup * 4 +
+                                                hemisphere * 2) ==
+                                2;
+                        if (offset == 0 && tokenBlock == 0 &&
+                            (!mergeValueBias ||
+                             (outputGroup == 0 && half == 0)))
                           emitMem3D(
                               rewriter_, op_.getLoc(),
                               vxmInputCycle - vxmInputReadLatency(slice),
@@ -1484,9 +1675,15 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                       target_.memory().slices_per_hemisphere +
                                   slice,
                               "read", biasAddress(outputBlock),
-                              40 + hemisphere * 16 + byte, tile, 1, 0, "sram",
+                              40 + hemisphere * 16 + byte, projectionRows, 1,
+                              0, "sram",
                               functionArgumentIndex(projectionBias),
-                              tokenBlocks, computeSpacing, 0, 1, 1, 0,
+                              tokenBlocks, computeSpacing, 0,
+                              mergeValueBias ? projectionGroups * 2 : 1,
+                              mergeValueBias
+                                  ? hiddenBlocks * projectionReductionInterval
+                                  : 1,
+                              mergeValueBias ? 1 : 0,
                               biasBank);
                       }
                       const int64_t outputCycle = vxmInputCycle + 1;
@@ -1512,35 +1709,40 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                             .slices_per_hemisphere +
                                     slice,
                                 "write",
-                                layout.valuePackAddress(head, headBlock, 0, 0),
+                                layout.valuePackAddress(
+                                    head, headBlock, cacheTokenBlock, 0),
                                 outputStream + byte,
-                                target_.throughput().tile_rows, 8, 1,
+                                packedRowCount, 8, 1,
                                 "sram", -1,
                                 mergeProjectionMxm ? 1 : tokenBlocks,
                                 mergeProjectionMxm ? 1 : computeSpacing,
                                 mergeProjectionMxm ? 0 : tile,
                                 mergeProjectionMxm ? projectionGroups * 2 : 1,
                                 mergeProjectionMxm
-                                    ? hiddenBlocks * op_.getSeqLen()
+                                    ? hiddenBlocks * projectionReductionInterval
                                     : 1,
                                 0, placementBank("value"), -1, -1,
                                 mergeProjectionMxm ? 2 : 1,
                                 mergeProjectionMxm
                                     ? layout.valuePackAddress(
-                                          head, headBlock + 1, 0, 0) -
+                                          head, headBlock + 1,
+                                          cacheTokenBlock, 0) -
                                           layout.valuePackAddress(
-                                              head, headBlock, 0, 0)
+                                              head, headBlock,
+                                              cacheTokenBlock, 0)
                                     : 0,
                                 mergeProjectionMxm
                                     ? layout.valuePackAddress(
-                                          head + 1, headBlock, 0, 0) -
+                                          head + 1, headBlock,
+                                          cacheTokenBlock, 0) -
                                           layout.valuePackAddress(
-                                              head, headBlock, 0, 0)
+                                              head, headBlock,
+                                              cacheTokenBlock, 0)
                                     : 0);
                           rawWriteEnd = std::max(
                               rawWriteEnd,
                               cycle +
-                                  (target_.throughput().tile_rows - 1) * 8 +
+                                  (packedRowCount - 1) * 8 +
                                   (tokenBlocks - 1) * computeSpacing + 1);
                         }
                       }
@@ -1562,33 +1764,38 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                       target_.memory().slices_per_hemisphere +
                                   slice,
                               "write",
-                              layout.valuePackAddress(head, headBlock, 0, 0),
-                              32 + byte, target_.throughput().tile_rows, 8, 1,
+                              layout.valuePackAddress(
+                                  head, headBlock, cacheTokenBlock, 0),
+                              32 + byte, packedRowCount, 8, 1,
                               "sram", -1,
                               mergeProjectionMxm ? 1 : tokenBlocks,
                               mergeProjectionMxm ? 1 : computeSpacing,
                               mergeProjectionMxm ? 0 : tile,
                               mergeProjectionMxm ? projectionGroups * 2 : 1,
                               mergeProjectionMxm
-                                  ? hiddenBlocks * op_.getSeqLen()
+                                  ? hiddenBlocks * projectionReductionInterval
                                   : 1,
                               0, placementBank("value"), -1, -1,
                               mergeProjectionMxm ? 2 : 1,
                               mergeProjectionMxm
                                   ? layout.valuePackAddress(
-                                        head, headBlock + 1, 0, 0) -
+                                        head, headBlock + 1,
+                                        cacheTokenBlock, 0) -
                                         layout.valuePackAddress(
-                                            head, headBlock, 0, 0)
+                                            head, headBlock,
+                                            cacheTokenBlock, 0)
                                   : 0,
                               mergeProjectionMxm
                                   ? layout.valuePackAddress(
-                                        head + 1, headBlock, 0, 0) -
+                                        head + 1, headBlock,
+                                        cacheTokenBlock, 0) -
                                         layout.valuePackAddress(
-                                            head, headBlock, 0, 0)
+                                            head, headBlock,
+                                            cacheTokenBlock, 0)
                                   : 0);
                         rawWriteEnd = std::max(
                             rawWriteEnd,
-                            cycle + (target_.throughput().tile_rows - 1) * 8 +
+                            cycle + (packedRowCount - 1) * 8 +
                                 (tokenBlocks - 1) * computeSpacing + 1);
                       }
                     }
@@ -1602,7 +1809,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             // by rawWriteEnd and may overlap a different accumulator window.
             const int64_t lastCompute = firstCompute
                 + (tokenBlocks - 1) * computeSpacing;
-            phaseStart = lastCompute + tile - (4 + loadToIw);
+            phaseStart = lastCompute + projectionIssueInterval -
+                         (4 + loadToIw);
             ++projectionBlock;
           }
         }
@@ -1618,6 +1826,16 @@ int64_t AttentionScheduleEmitter::emitProjections() {
         const auto &memory = target_.memory();
         const int64_t blockRows = target_.throughput().mxm_block_rows;
         const int64_t tileRows = target_.throughput().tile_rows;
+        // Tokens are striped over blockRows lanes, with consecutive rows of
+        // one lane separated by blockRows logical tokens.  A decode tail must
+        // describe only the populated lane/row rectangle; using the full
+        // 8-lane x 4-row prefill tile makes MEM request results which VXM did
+        // not produce.  The current decode contract is one token, so its
+        // affine domain is exactly one lane by one row.
+        const bool singletonRopeDomain =
+            tokenBlocks == 1 && currentTokens == 1;
+        const int64_t ropeLaneCount = singletonRopeDomain ? 1 : blockRows;
+        const int64_t ropeRowsPerLane = singletonRopeDomain ? 1 : tileRows;
         const int64_t blockIssues = tile / blockRows;
         const auto ropeTokenCycleOffset = [&](int64_t token) {
           const int64_t tokenBlock = token / tile;
@@ -1631,6 +1849,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
         for (int64_t slice : layout.ropeStagingSlices())
           maxStagingReadLatency =
               std::max(maxStagingReadLatency, readLatency(slice));
+        for (int64_t slice : alternateStagingSlices)
+          maxStagingReadLatency =
+              std::max(maxStagingReadLatency, readLatency(slice));
         const int64_t firstOutputBlock = outputGroup * 4;
         const int64_t lastOutputBlock =
             std::min<int64_t>(projectionOutputBlocks, firstOutputBlock + 4);
@@ -1640,6 +1861,19 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               std::max({phaseStart, postprocessReady,
                         rawWriteEnd + maxStagingReadLatency + 1});
           int64_t copyEnd = copyCycle;
+          struct PendingValueCopy {
+            int64_t cycle;
+            int64_t queue;
+            int64_t address;
+            int64_t stream;
+            int64_t bank;
+            bool write;
+          };
+          llvm::SmallVector<PendingValueCopy, 64> pendingValueCopies;
+          const bool mergeValueCopyPairs =
+              tokenBlocks == 1 && projectionHeadBlocks == 4 &&
+              memory.hemispheres == 2 &&
+              lastOutputBlock - firstOutputBlock == 4;
           for (int64_t outputBlock = firstOutputBlock;
                outputBlock < lastOutputBlock; ++outputBlock) {
             const int64_t head = outputBlock / projectionHeadBlocks;
@@ -1652,13 +1886,21 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             for (int64_t stream = 0; stream < 16; ++stream) {
               const int64_t slice = slices[stream];
               const int64_t address =
-                  layout.valuePackAddress(head, headBlock, 0, 0);
-              emitMem3D(
-                  rewriter_, op_.getLoc(), copyCycle - readLatency(slice),
-                  sourceHemisphere * memory.slices_per_hemisphere + slice,
-                  "read", address, 32 + stream, blockIssues, 1, 1, "sram", -1,
-                  tokenBlocks, blockIssues, blockIssues, 1, 1, 0,
-                  placementBank("value"));
+                  layout.valuePackAddress(
+                      head, headBlock, cacheTokenBlock, 0);
+              const int64_t readCycle = copyCycle - readLatency(slice);
+              const int64_t readQueue =
+                  sourceHemisphere * memory.slices_per_hemisphere + slice;
+              const int64_t valueBank = placementBank("value");
+              if (mergeValueCopyPairs)
+                pendingValueCopies.push_back(
+                    {readCycle, readQueue, address, 32 + stream,
+                     valueBank, false});
+              else
+                emitMem3D(rewriter_, op_.getLoc(), readCycle, readQueue,
+                          "read", address, 32 + stream, blockIssues, 1, 1,
+                          "sram", -1, tokenBlocks, blockIssues,
+                          blockIssues, 1, 1, 0, valueBank);
               const int64_t latency =
                   target_
                       .transport_latency(
@@ -1666,12 +1908,20 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           target::StreamEndpoint::Mem,
                           target::StreamDirection::East, slice)
                       .value_or(readLatency(slice));
-              emitMem3D(
-                  rewriter_, op_.getLoc(), copyCycle + latency,
-                  destinationHemisphere * memory.slices_per_hemisphere + slice,
-                  "write", address, stream, blockIssues, 1, 1, "sram", -1,
-                  tokenBlocks, blockIssues, blockIssues, 1, 1, 0,
-                  placementBank("value"));
+              const int64_t writeCycle = copyCycle + latency;
+              const int64_t writeQueue =
+                  destinationHemisphere *
+                      memory.slices_per_hemisphere +
+                  slice;
+              if (mergeValueCopyPairs)
+                pendingValueCopies.push_back(
+                    {writeCycle, writeQueue, address, stream,
+                     valueBank, true});
+              else
+                emitMem3D(rewriter_, op_.getLoc(), writeCycle, writeQueue,
+                          "write", address, stream, blockIssues, 1, 1,
+                          "sram", -1, tokenBlocks, blockIssues,
+                          blockIssues, 1, 1, 0, valueBank);
               copyEnd = std::max(
                   copyEnd,
                   copyCycle + latency + tokenBlocks * blockIssues);
@@ -1679,6 +1929,51 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             copyCycle += tokenBlocks * blockIssues;
             copyCycle =
                 std::max(copyCycle, copyEnd + maxStagingReadLatency + 1);
+          }
+          if (mergeValueCopyPairs) {
+            std::sort(pendingValueCopies.begin(), pendingValueCopies.end(),
+                      [](const auto &a, const auto &b) {
+                        return std::tie(a.queue, a.bank, a.write,
+                                        a.stream, a.cycle) <
+                               std::tie(b.queue, b.bank, b.write,
+                                        b.stream, b.cycle);
+                      });
+            for (size_t first = 0; first < pendingValueCopies.size();) {
+              size_t end = first + 1;
+              while (end < pendingValueCopies.size() &&
+                     pendingValueCopies[end].queue ==
+                         pendingValueCopies[first].queue &&
+                     pendingValueCopies[end].bank ==
+                         pendingValueCopies[first].bank &&
+                     pendingValueCopies[end].write ==
+                         pendingValueCopies[first].write &&
+                     pendingValueCopies[end].stream ==
+                         pendingValueCopies[first].stream)
+                ++end;
+              const auto &base = pendingValueCopies[first];
+              const bool affinePair =
+                  end - first == 2 &&
+                  pendingValueCopies[first + 1].cycle - base.cycle >=
+                      blockIssues &&
+                  pendingValueCopies[first + 1].address - base.address ==
+                      blockIssues;
+              if (affinePair) {
+                emitMem3D(rewriter_, op_.getLoc(), base.cycle, base.queue,
+                          base.write ? "write" : "read", base.address,
+                          base.stream, blockIssues, 1, 1, "sram", -1, 2,
+                          pendingValueCopies[first + 1].cycle - base.cycle,
+                          blockIssues, 1, 1, 0, base.bank);
+              } else {
+                for (size_t index = first; index < end; ++index) {
+                  const auto &copy = pendingValueCopies[index];
+                  emitMem3D(rewriter_, op_.getLoc(), copy.cycle, copy.queue,
+                            copy.write ? "write" : "read", copy.address,
+                            copy.stream, blockIssues, 1, 1, "sram", -1, 1,
+                            1, 0, 1, 1, 0, copy.bank);
+                }
+              }
+              first = end;
+            }
           }
           // The next group's MXM can run while the completed Value group is
           // copied, provided its activation stream pair is disjoint from the
@@ -1703,20 +1998,26 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       rawWriteEnd + maxStagingReadLatency + 1});
         int64_t replicateEnd = replicateCycle;
         for (int64_t outputBlock = firstOutputBlock;
-             outputBlock < lastOutputBlock; ++outputBlock) {
+             outputBlock < lastOutputBlock && !directSplitRope;
+             ++outputBlock) {
           const int64_t head = outputBlock / projectionHeadBlocks;
           const int64_t headBlock = outputBlock % projectionHeadBlocks;
           const int64_t sourceHemisphere = (outputBlock % 4) / 2;
           const int64_t destinationHemisphere = 1 - sourceHemisphere;
+          const int64_t sourceStagingBank =
+              stagingBankFor(headBlock, sourceHemisphere);
+          const int64_t destinationStagingBank =
+              stagingBankFor(headBlock, destinationHemisphere);
           for (int64_t stream = 0; stream < 16; ++stream) {
             const int64_t sourceChannel =
                 (stream + 2 * headBlock) % 16;
-            const int64_t slice =
-                layout.ropeStagingSlices()[sourceChannel];
+            const int64_t slice = stagingSliceFor(headBlock,
+                layout.ropeStagingSlices()[sourceChannel]);
             const int64_t replicateStream = replicateStreamBase +
                 (qWriteRead2D ? sourceChannel : stream);
-            const int64_t address =
-                layout.ropeStagingAddress(kind, head, headBlock, 0, 0);
+            const int64_t address = stagingAddressFor(headBlock,
+                layout.ropeStagingAddress(
+                    kind, head, headBlock, 0, 0));
             const int64_t copyReadCycle =
                 replicateCycle - readLatency(slice);
             if (qWriteRead2D) {
@@ -1786,7 +2087,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         pending.writeStream[part],
                         target_.throughput().tile_rows,
                         target_.throughput().mxm_block_rows, 1, "sram", -1,
-                        1, 1, 0, 1, 1, 0, stagingBank);
+                        1, 1, 0, 1, 1, 0, sourceStagingBank);
                     emitMem3D(
                         rewriter_, op_.getLoc(), pending.readCycle[part],
                         sourceHemisphere * memory.slices_per_hemisphere +
@@ -1794,7 +2095,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         "read", pending.readAddress[part],
                         pending.readStream[part], blockIssues, 1, 1,
                         "sram", -1, tokenBlocks, blockIssues, tile, 1, 1,
-                        0, stagingBank);
+                        0, sourceStagingBank);
                   }
                 }
               }
@@ -1805,7 +2106,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   "read", address, 32 + replicateStream,
                   blockIssues, 1, 1,
                   "sram", -1, tokenBlocks, blockIssues, tile, 1, 1, 0,
-                  stagingBank);
+                  sourceStagingBank);
             }
             const int64_t latency =
                 target_
@@ -1823,7 +2124,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 replicateStream,
                 blockIssues, 1, 1, "sram", -1,
                 tokenBlocks, blockIssues, tile, 1, 1, 0,
-                replicatedStagingBank);
+                destinationStagingBank);
             replicateEnd = std::max(
                 replicateEnd,
                 replicateCycle + latency + tokenBlocks * blockIssues);
@@ -1895,10 +2196,25 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                           bool swapBiasHalves) {
           const char *input = inputHemisphere == 0 ? "east" : "west";
           const char *output = outputHemisphere == 0 ? "east" : "west";
+          // Product A takes the low half from E and high half from W; B swaps
+          // their stream positions. Absolute source selection broadcasts the
+          // same pair to both physical VXM chains without SRAM copies.
+          const char *firstSource = directSplitRope
+                                        ? (swapBiasHalves ? "west" : "east")
+                                        : "";
+          const char *secondSource = directSplitRope
+                                         ? (swapBiasHalves ? "east" : "west")
+                                         : "";
+          const int64_t firstIndex =
+              directSplitRope && swapBiasHalves ? 36 : 32;
+          const int64_t secondIndex =
+              directSplitRope && swapBiasHalves ? 32 : 36;
           emitVxmConfigured(rewriter_, op_.getLoc(),
                             projectionValues[projection], cycle, 0, "multiply",
-                            streamKind, 32, 0.0f, streamKind, 34, 0.0f, "fp32",
-                            -1, input, output, -1, 2, op_.getSeqLen(), 1);
+                            streamKind, firstIndex, 0.0f, streamKind, 34,
+                            0.0f, "fp32",
+                            -1, input, output, -1, 2, op_.getSeqLen(), 1,
+                            firstSource);
           if (projectionBias)
             emitVxmConfigured(
                 rewriter_, op_.getLoc(), projectionBias, cycle, 1, "fma",
@@ -1912,8 +2228,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 dataFormat, 0, input, output, -1, 2, op_.getSeqLen(), 1);
           emitVxmConfigured(rewriter_, op_.getLoc(),
                             projectionValues[projection], cycle, 2, "multiply",
-                            streamKind, 36, 0.0f, streamKind, 38, 0.0f, "fp32",
-                            -1, input, output, -1, 2, op_.getSeqLen(), 1);
+                            streamKind, secondIndex, 0.0f, streamKind, 38,
+                            0.0f, "fp32",
+                            -1, input, output, -1, 2, op_.getSeqLen(), 1,
+                            secondSource);
           if (projectionBias)
             emitVxmConfigured(
                 rewriter_, op_.getLoc(), projectionBias, cycle, 3, "fma",
@@ -1927,25 +2245,31 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 dataFormat, 2, input, output, -1, 2, op_.getSeqLen(), 1);
         };
         const auto emitRopeCombine = [&](int64_t cycle, int64_t inputHemisphere,
-                                         int64_t outputHemisphere) {
+                                         int64_t outputHemisphere,
+                                         int64_t domainCount,
+                                         int64_t domainInterval) {
           const char *input = inputHemisphere == 0 ? "east" : "west";
           const char *output = outputHemisphere == 0 ? "east" : "west";
           emitVxmConfigured(rewriter_, op_.getLoc(),
                             projectionValues[projection], cycle, 0, "subtract",
                             streamKind, 32, 0.0f, streamKind, 34, 0.0f, "fp32",
-                            -1, input, output, -1, 2, op_.getSeqLen(), 1);
+                            -1, input, output, -1, 2, op_.getSeqLen(), 1,
+                            {}, {}, domainCount, domainInterval);
           emitVxmConfigured(
               rewriter_, op_.getLoc(), projectionValues[projection], cycle, 1,
               "pass", "previous", 0, 0.0f, "immediate", 0, 0.0f, dataFormat, 0,
-              input, output, -1, 2, op_.getSeqLen(), 1);
+              input, output, -1, 2, op_.getSeqLen(), 1,
+              {}, {}, domainCount, domainInterval);
           emitVxmConfigured(rewriter_, op_.getLoc(),
                             projectionValues[projection], cycle, 2, "add",
                             streamKind, 36, 0.0f, streamKind, 38, 0.0f, "fp32",
-                            -1, input, output, -1, 2, op_.getSeqLen(), 1);
+                            -1, input, output, -1, 2, op_.getSeqLen(), 1,
+                            {}, {}, domainCount, domainInterval);
           emitVxmConfigured(
               rewriter_, op_.getLoc(), projectionValues[projection], cycle, 3,
               "pass", "previous", 0, 0.0f, "immediate", 0, 0.0f, dataFormat, 2,
-              input, output, -1, 2, op_.getSeqLen(), 1);
+              input, output, -1, 2, op_.getSeqLen(), 1,
+              {}, {}, domainCount, domainInterval);
         };
 
         int64_t ropeEnd =
@@ -1978,20 +2302,127 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           maxProductReadLatency =
               std::max(maxProductReadLatency, vxmInputReadLatency(slice));
         }
+        const int64_t serialQueryProductSlotCycles = std::max<int64_t>(
+            5 * projectionCycleSpan,
+            2 * projectionCycleSpan + 2 * productPipelineLatency +
+                2 * maxProductWriteLatency + 2 * maxStagingReadLatency +
+                maxProductReadLatency +
+                target_.streams().system_register_columns + 8);
+        const int64_t serialQueryCombineSlotCycles = std::max<int64_t>(
+            2 * projectionCycleSpan +
+                target_.streams().system_register_columns,
+            serialQueryProductSlotCycles +
+                2 * target_.throughput().mxm_block_rows);
+        if (serialQueryProductsFirst && emitQueryProducts &&
+            serialQueryProductBaseCycle < 0)
+          serialQueryProductBaseCycle = ropeEnd;
         for (int64_t head = firstHead; head <= lastHead; ++head) {
           int64_t headEnd = ropeEnd;
           // A MEM ICU has one iMEM, FIFO, and PC for both reads and writes.
-          // Keeping a descriptor alive across the gap between rotary pair
-          // blocks would require another MEM command to execute in that gap
-          // (for example, the mirror-table read spans a Query-IW/product
-          // write).  Emit each pair block as its own closed-form 3D domain so
-          // the single hardware queue can retire one descriptor before the
-          // next descriptor starts.
+          // Most queues execute another command between rotary pair blocks,
+          // so their domains must retire before the next pair. Serial Q's
+          // east low-half result queues are idle across pairs and heads and
+          // can be joined after all heads have been scheduled.
           const bool pairBlockDomain = false;
+          // Serial Q keeps mirror-table and bias reads on dedicated slices.
+          // Those two queues stay idle between rotary pairs, so their reads
+          // can use one non-preemptible 3D descriptor across both pairs even
+          // though product and Query-IW queues cannot.
+          const bool keyPairDomains =
+              kind == AttentionProjectionKind::Key && tokenBlocks == 1 &&
+              projectionHeadBlocks == 4 && !op_.hasQkNorm() &&
+              layout.ropeMirrorSlices().size() == 4 &&
+              biasSlices.size() == 4;
+          const bool mirrorTablePairDomain =
+              splitSerialQueryStaging || keyPairDomains;
+          const bool projectionBiasPairDomain =
+              splitSerialQueryStaging ||
+              (keyPairDomains && projectionBias);
           int64_t firstPairProductOutput[2] = {-1, -1};
           int64_t firstPairBiasInput = -1;
           int64_t firstPairMirrorTableInput = -1;
           int64_t firstPairCombineInput = -1;
+          struct PendingRopeSourceRead {
+            int64_t cycle;
+            int64_t queue;
+            int64_t address;
+            int64_t stream;
+            int64_t bank;
+            int64_t pairBlock;
+            int64_t phase;
+          };
+          llvm::SmallVector<PendingRopeSourceRead, 32> pendingSourceReads;
+          const auto emitPendingSourceReads =
+              [&](int64_t pairCount, int64_t firstPair) {
+                std::sort(pendingSourceReads.begin(), pendingSourceReads.end(),
+                          [](const auto &a, const auto &b) {
+                            return std::tie(a.queue, a.bank, a.pairBlock,
+                                            a.phase) <
+                                   std::tie(b.queue, b.bank, b.pairBlock,
+                                            b.phase);
+                          });
+                for (size_t first = 0; first < pendingSourceReads.size();) {
+                  size_t end = first + 1;
+                  while (end < pendingSourceReads.size() &&
+                         pendingSourceReads[end].queue ==
+                             pendingSourceReads[first].queue &&
+                         pendingSourceReads[end].bank ==
+                             pendingSourceReads[first].bank)
+                    ++end;
+                  const auto &base = pendingSourceReads[first];
+                  const bool fullDomain =
+                      end - first == static_cast<size_t>(2 * pairCount);
+                  const int64_t phaseCycleStride =
+                      fullDomain
+                          ? pendingSourceReads[first + 1].cycle - base.cycle
+                          : 0;
+                  const int64_t pairCycleStride =
+                      fullDomain && pairCount > 1
+                          ? pendingSourceReads[first + 2].cycle - base.cycle
+                          : 1;
+                  const int64_t pairAddressStride =
+                      fullDomain && pairCount > 1
+                          ? pendingSourceReads[first + 2].address -
+                                base.address
+                          : 0;
+                  bool affine =
+                      fullDomain &&
+                      phaseCycleStride > ropeRowsPerLane - 1 &&
+                      (pairCount == 1 ||
+                       pairCycleStride > phaseCycleStride +
+                                             ropeRowsPerLane - 1);
+                  for (size_t index = first; affine && index < end; ++index) {
+                    const auto &read = pendingSourceReads[index];
+                    const int64_t pairOffset = read.pairBlock - firstPair;
+                    affine = pairOffset >= 0 && pairOffset < pairCount &&
+                             read.phase >= 0 && read.phase < 2 &&
+                             read.stream == base.stream &&
+                             read.cycle == base.cycle +
+                                               pairOffset * pairCycleStride +
+                                               read.phase * phaseCycleStride &&
+                             read.address == base.address +
+                                                 pairOffset * pairAddressStride;
+                  }
+                  if (affine) {
+                    emitMem3D(rewriter_, op_.getLoc(), base.cycle, base.queue,
+                              "read", base.address, base.stream,
+                              ropeRowsPerLane, 1, 1, "sram",
+                              -1, 2, phaseCycleStride, 0, pairCount,
+                              pairCycleStride, pairAddressStride, base.bank);
+                  } else {
+                    for (size_t index = first; index < end; ++index) {
+                      const auto &read = pendingSourceReads[index];
+                      emitMem3D(rewriter_, op_.getLoc(), read.cycle,
+                                read.queue, "read", read.address,
+                                read.stream, ropeRowsPerLane,
+                                1, 1, "sram", -1, 1, 1, 0, 1, 1, 0,
+                                read.bank);
+                    }
+                  }
+                  first = end;
+                }
+                pendingSourceReads.clear();
+              };
           for (int64_t pairBlock = 0; pairBlock < projectionHeadBlocks / 2;
                ++pairBlock) {
             const int64_t blocks[] = {pairBlock,
@@ -2036,13 +2467,13 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   };
                   const int64_t productAInputOffset = 1;
                   const int64_t productBConfigOffset =
-                      productAInputOffset + op_.getSeqLen() +
+                      productAInputOffset + 2 * projectionCycleSpan +
                       (productPipelineLatency - 1) +
                       maxProductWriteLatency + maxStagingReadLatency + 1;
                   const int64_t productBInputOffset =
                       productBConfigOffset + 1;
                   const int64_t combineConfigOffset =
-                      productBInputOffset + op_.getSeqLen() +
+                      productBInputOffset + projectionCycleSpan +
                       (productPipelineLatency - 1) +
                       maxProductWriteLatency + maxProductReadLatency + 1;
                   const int64_t combineInputOffset = combineConfigOffset + 1;
@@ -2060,12 +2491,18 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             for (int64_t hemisphere = 0;
                                  hemisphere < memory.hemispheres;
                                  ++hemisphere) {
+                              if (directSplitRope &&
+                                  hemisphere != sourceBlock / 2)
+                                continue;
                               for (int64_t byte = 0; byte < 2; ++byte) {
                                 const int64_t stagingSlice =
-                                    layout.ropeStagingSlices()
-                                        [(2 * tokenLane + byte +
-                                             2 * sourceBlock) %
-                                            16];
+                                    stagingSliceFor(sourceBlock,
+                                        layout.ropeStagingSlices()
+                                            [(2 * tokenLane + byte +
+                                              (serialQueryProductsFirst
+                                                   ? 0
+                                                   : 2 * sourceBlock)) %
+                                             16]);
                                 const int64_t slice =
                                     qWriteRead2D &&
                                             hemisphere != sourceBlock / 2
@@ -2231,50 +2668,74 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                          : productBank;
             };
             const auto emitSourceDomain = [&](int64_t half, int64_t stream,
-                                              int64_t inputCycle) {
+                                              int64_t inputCycle,
+                                              int64_t phase) {
               const int64_t sourceBlock = blocks[half];
-              for (int64_t tokenLane = 0; tokenLane < blockRows;
+              for (int64_t tokenLane = 0; tokenLane < ropeLaneCount;
                    ++tokenLane) {
                 for (int64_t hemisphere = 0;
                      hemisphere < memory.hemispheres; ++hemisphere) {
+                  if (directSplitRope &&
+                      hemisphere != sourceBlock / 2)
+                    continue;
                   for (int64_t byte = 0; byte < 2; ++byte) {
                     const int64_t stagingSlice =
-                        layout.ropeStagingSlices()[(2 * tokenLane + byte +
-                                                    2 * sourceBlock) %
-                                                   16];
+                        stagingSliceFor(sourceBlock,
+                            layout.ropeStagingSlices()
+                                [(2 * tokenLane + byte +
+                                  (serialQueryProductsFirst
+                                       ? 0
+                                       : 2 * sourceBlock)) %
+                                 16]);
                     const int64_t slice =
                         qWriteRead2D && hemisphere != sourceBlock / 2
                             ? mirroredStagingSlice(stagingSlice)
                             : stagingSlice;
-                    emitMem3D(
-                        rewriter_, op_.getLoc(),
+                    const int64_t cycle =
                         inputCycle +
-                            tokenLane * target_.throughput().tile_rows -
-                            vxmInputReadLatency(slice),
-                        hemisphere * memory.slices_per_hemisphere + slice,
-                        "read",
+                        tokenLane * target_.throughput().tile_rows -
+                        vxmInputReadLatency(slice);
+                    const int64_t queue =
+                        hemisphere * memory.slices_per_hemisphere + slice;
+                    const int64_t address =
                         qWriteRead2D && hemisphere != sourceBlock / 2
                             ? mirroredStagingAddress(
                                   layout.ropeStagingAddress(
                                       kind, head, sourceBlock, 0, 0))
-                            : layout.ropeStagingAddress(
-                                  kind, head, sourceBlock, 0, 0),
-                        stream + hemisphere * 16 + byte,
-                        target_.throughput().tile_rows, 1, 1, "sram", -1,
-                        tokenBlocks, tile, tile, 1, 1, 0,
-                        stagingBankFor(sourceBlock, hemisphere));
+                            : stagingAddressFor(sourceBlock,
+                                  layout.ropeStagingAddress(
+                                      kind, head, sourceBlock, 0, 0));
+                    const int64_t packedStream =
+                        stream + hemisphere * 16 + byte;
+                    const int64_t bank =
+                        stagingBankFor(sourceBlock, hemisphere);
+                    if (serialQueryProductsFirst) {
+                      pendingQuerySourceReads.push_back(
+                          {cycle, queue, address, packedStream, bank, head,
+                           pairBlock, phase});
+                    } else if (directSplitRope && tokenBlocks == 1) {
+                      pendingSourceReads.push_back(
+                          {cycle, queue, address, packedStream, bank,
+                           pairBlock, phase});
+                    } else {
+                      emitMem3D(rewriter_, op_.getLoc(), cycle, queue,
+                                "read", address, packedStream,
+                                ropeRowsPerLane, 1, 1,
+                                "sram", -1, tokenBlocks, tile, tile,
+                                1, 1, 0, bank);
+                    }
                   }
                 }
               }
             };
             const auto emitRopeTableDomain = [&](int64_t inputCycle,
                                                  bool mirror) {
-              if (pairBlockDomain && mirror && pairBlock == 0) {
+              if (mirrorTablePairDomain && mirror && pairBlock == 0) {
                 firstPairMirrorTableInput = inputCycle;
                 return;
               }
               const bool pairDomain =
-                  pairBlockDomain && mirror && pairBlock != 0;
+                  mirrorTablePairDomain && mirror && pairBlock != 0;
               const int64_t domainPairBlock = pairDomain ? 0 : pairBlock;
               const int64_t domainInputCycle =
                   pairDomain ? firstPairMirrorTableInput : inputCycle;
@@ -2291,13 +2752,24 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       hemisphere * memory.slices_per_hemisphere + slice;
                   const int64_t domainCycle =
                       domainInputCycle - vxmInputReadLatency(slice);
+                  if (serialQueryProductsFirst && mirror && pairDomain) {
+                    pendingQueryMirrorTables.push_back(
+                        {domainCycle, queue,
+                         layout.ropeMirrorAddress(
+                             op_.getPositionOffset(), domainPairBlock),
+                         stream, bank, head,
+                         inputCycle - firstPairMirrorTableInput});
+                    continue;
+                  }
                   emitMem3D(
                       rewriter_, op_.getLoc(), domainCycle, queue,
                       "read",
-                      mirror ? layout.ropeMirrorAddress(0, domainPairBlock)
-                             : layout.ropeAddress(0, domainPairBlock),
-                      stream, target_.throughput().tile_rows, 1, blockRows,
-                      "sram", -1, blockRows,
+                      mirror ? layout.ropeMirrorAddress(
+                                   op_.getPositionOffset(), domainPairBlock)
+                             : layout.ropeAddress(
+                                   op_.getPositionOffset(), domainPairBlock),
+                      stream, ropeRowsPerLane, 1, blockRows,
+                      "sram", -1, ropeLaneCount,
                       target_.throughput().tile_rows, 1,
                       pairDomain ? 2 : tokenBlocks,
                       pairDomain
@@ -2306,8 +2778,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       pairDomain ? op_.getSeqLen() : tile, bank);
                   recordRopeMemDomain(
                       queue, bank, domainCycle,
-                      target_.throughput().tile_rows, 1,
-                      blockRows, target_.throughput().tile_rows,
+                      ropeRowsPerLane, 1,
+                      ropeLaneCount, target_.throughput().tile_rows,
                       pairDomain ? 2 : tokenBlocks,
                       pairDomain ? inputCycle - firstPairMirrorTableInput
                                  : tile);
@@ -2318,13 +2790,35 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                                        int64_t phaseInterval) {
               if (!projectionBias)
                 return;
-              if (pairBlockDomain && pairBlock == 0) {
+              if (projectionBiasPairDomain && pairBlock == 0) {
                 firstPairBiasInput = inputCycle;
                 return;
               }
-              const bool pairDomain = pairBlockDomain && pairBlock != 0;
+              const bool pairDomain =
+                  projectionBiasPairDomain && pairBlock != 0;
               const int64_t domainInputCycle =
                   pairDomain ? firstPairBiasInput : inputCycle;
+              bool mergeSerialBiasHeads =
+                  serialQueryProductsFirst && pairDomain &&
+                  tokenBlocks == 1 &&
+                  inputCycle - firstPairBiasInput ==
+                      serialQueryProductSlotCycles;
+              if (mergeSerialBiasHeads) {
+                for (int64_t biasHead = 0;
+                     biasHead < op_.getQueryHeads(); ++biasHead) {
+                  const int64_t firstBlock =
+                      biasHead * projectionHeadBlocks;
+                  if (biasAddress(firstBlock + 1) !=
+                          biasAddress(0) + 2 * biasHead + 1 ||
+                      biasAddress(firstBlock) !=
+                          biasAddress(0) + 2 * biasHead) {
+                    mergeSerialBiasHeads = false;
+                    break;
+                  }
+                }
+              }
+              if (mergeSerialBiasHeads && head != 0)
+                return;
               for (int64_t half = 0; half < 2; ++half) {
                 const int64_t domainReductionBlock = pairDomain
                     ? half * (projectionHeadBlocks / 2)
@@ -2344,9 +2838,21 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         40 + hemisphere * 16 + half * 2 + byte,
                         op_.getSeqLen(), 1, 0, "sram",
                         functionArgumentIndex(projectionBias), 2,
-                        phaseInterval, 0, pairDomain ? 2 : 1,
-                        pairDomain ? inputCycle - firstPairBiasInput : 1,
-                        0, biasBank);
+                        phaseInterval, 0,
+                        mergeSerialBiasHeads
+                            ? op_.getQueryHeads() *
+                                  (projectionHeadBlocks / 2)
+                            : (pairDomain ? 2 : 1),
+                        mergeSerialBiasHeads
+                            ? serialQueryProductSlotCycles
+                            : (pairDomain
+                                   ? inputCycle - firstPairBiasInput
+                                   : 1),
+                        pairDomain
+                            ? biasAddress(outputBlock + 1) -
+                                  biasAddress(outputBlock)
+                            : 0,
+                        biasBank);
                   }
                 }
               }
@@ -2384,8 +2890,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     const int64_t baseAddress = layout.ropeProductAddress(
                         kind, head, domainPairBlock, product, parity);
                     const int64_t laneStride = paritySplit ? 2 : 1;
-                    const int64_t laneCount =
-                        paritySplit ? (blockRows - parity + 1) / 2 : blockRows;
+                    const int64_t laneCount = paritySplit
+                        ? std::max<int64_t>(
+                              0, (ropeLaneCount - parity + 1) / 2)
+                        : ropeLaneCount;
                     const int64_t rowAddressStride =
                         layout.ropeProductAddress(
                             kind, head, domainPairBlock, product,
@@ -2404,6 +2912,24 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               kind, head, pairBlock, product,
                               parity + tile) -
                               baseAddress;
+                    // In the serial Q schedule every head/pair product slot
+                    // starts at a fixed interval. Product A lives on the
+                    // scratch bank separate from the RoPE table, so its MEM
+                    // queues have no intervening table reads. Lower their
+                    // complete head/pair domain directly to one 3D command.
+                    const bool mergeSerialProductWrites =
+                        serialQueryProductsFirst && compactProductLayout &&
+                        !pairBlockDomain && tokenBlocks == 1 && product < 2 &&
+                        productStorageBank(product) == productBank &&
+                        productBank != ropeBank;
+                    if (mergeSerialProductWrites && (head != 0 || pairBlock != 0))
+                      continue;
+                    const int64_t serialSlotAddressStride =
+                        mergeSerialProductWrites
+                            ? layout.ropeProductAddress(kind, 0, 1, product,
+                                                        parity) -
+                                  baseAddress
+                            : 0;
                     for (int64_t destination = 0;
                          destination < memory.hemispheres; ++destination) {
                       const int64_t source = 1 - destination;
@@ -2414,15 +2940,23 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           destination * memory.slices_per_hemisphere + slice,
                           "write", baseAddress,
                           source * 8 + slot * 2 + byte,
-                          target_.throughput().tile_rows, 1, rowAddressStride,
+                          ropeRowsPerLane, 1, rowAddressStride,
                           "sram", -1, laneCount,
                           laneStride * target_.throughput().tile_rows,
                           laneAddressStride,
-                          pairBlockDomain ? 2 : tokenBlocks,
-                          pairBlockDomain
-                              ? outputCycle - firstPairProductOutput[productPhase]
-                              : tile,
-                          groupAddressStride,
+                          mergeSerialProductWrites
+                              ? op_.getQueryHeads() *
+                                    (projectionHeadBlocks / 2)
+                              : (pairBlockDomain ? 2 : tokenBlocks),
+                          mergeSerialProductWrites
+                              ? serialQueryProductSlotCycles
+                              : (pairBlockDomain
+                                     ? outputCycle -
+                                           firstPairProductOutput[productPhase]
+                                     : tile),
+                          mergeSerialProductWrites
+                              ? serialSlotAddressStride
+                              : groupAddressStride,
                           productStorageBank(product));
                     }
                   }
@@ -2430,45 +2964,96 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               }
             };
 
+            if (serialQueryProductsFirst && emitQueryProducts) {
+              const int64_t slot =
+                  head * (projectionHeadBlocks / 2) + pairBlock;
+              const int64_t scheduled =
+                  serialQueryProductBaseCycle +
+                  slot * serialQueryProductSlotCycles;
+              if (headEnd > scheduled) {
+                op_.emitError("serial Q RoPE product slot is too short");
+                return -1;
+              }
+              headEnd = scheduled;
+            }
             const int64_t productAConfig = headEnd;
             const int64_t productAInput = productAConfig + 1;
             const int64_t productBConfig =
-                productAInput + op_.getSeqLen() +
+                productAInput + 2 * projectionCycleSpan +
                 (productPipelineLatency - 1) +
                 maxProductWriteLatency + maxStagingReadLatency + 1;
             const int64_t productBInput = productBConfig + 1;
-            emitRopeProducts(productAConfig, inputHemisphere, outputHemisphere,
-                             false);
-            emitRopeTableDomain(productAInput, false);
-            // Product A and Product B consume the same two bias vectors on
-            // the same physical MEM read queues.  No other read instruction
-            // targets those bank-0 slice queues between the two phases, so
-            // make the phase axis native MEM3D work instead of emitting two
-            // independent descriptors.
-            emitProjectionBiasDomain(productAInput,
-                                     productBInput - productAInput);
-            emitProductWriteDomain(
-                0, productAInput + productPipelineLatency);
-            emitSourceDomain(0, 32, productAInput);
-            emitSourceDomain(1, 36, productAInput);
+            if (emitQueryProducts) {
+              emitRopeProducts(productAConfig, inputHemisphere,
+                               outputHemisphere, false);
+              emitRopeTableDomain(productAInput, false);
+              // Both product phases read the same projection bias vectors.
+              emitProjectionBiasDomain(productAInput,
+                                       productBInput - productAInput);
+              emitProductWriteDomain(
+                  0, productAInput + productPipelineLatency);
+              emitSourceDomain(0, 32, productAInput, 0);
+              emitSourceDomain(1, 36, productAInput, 0);
 
-            emitRopeProducts(productBConfig, inputHemisphere, outputHemisphere,
-                             true);
-            emitRopeTableDomain(productBInput, true);
-            emitProductWriteDomain(
-                2, productBInput + productPipelineLatency);
-            emitSourceDomain(1, 32, productBInput);
-            emitSourceDomain(0, 36, productBInput);
+              emitRopeProducts(productBConfig, inputHemisphere,
+                               outputHemisphere, true);
+              emitRopeTableDomain(productBInput, true);
+              emitProductWriteDomain(
+                  2, productBInput + productPipelineLatency);
+              emitSourceDomain(1, directSplitRope ? 36 : 32,
+                               productBInput, 1);
+              emitSourceDomain(0, directSplitRope ? 32 : 36,
+                               productBInput, 1);
+              if (kind == AttentionProjectionKind::Query &&
+                  !serialQueryProductsFirst)
+                emitPendingSourceReads(1, pairBlock);
+            }
+            if (!emitQueryCombine) {
+              // Product SRAM has a separate address for every Q head/pair.
+              // Finish all source reads before any Query-IW writeback.
+              headEnd = std::max(
+                  headEnd,
+                   productBInput + projectionCycleSpan +
+                      productPipelineLatency + maxProductWriteLatency +
+                      std::max(maxStagingReadLatency,
+                               maxProductReadLatency) + 1);
+              continue;
+            }
 
+            if (serialQueryProductsFirst) {
+              if (serialQueryCombineBaseCycle < 0)
+                serialQueryCombineBaseCycle = headEnd;
+              const int64_t slot =
+                  head * (projectionHeadBlocks / 2) + pairBlock;
+              const int64_t scheduled =
+                  serialQueryCombineBaseCycle +
+                  slot * serialQueryCombineSlotCycles;
+              if (headEnd > scheduled) {
+                op_.emitError("serial Q RoPE combine slot is too short")
+                    << ": head_end=" << headEnd
+                    << ", scheduled=" << scheduled
+                    << ", slot=" << slot
+                    << ", slot_cycles=" << serialQueryCombineSlotCycles;
+                return -1;
+              }
+              headEnd = scheduled;
+            }
             const int64_t combineConfig =
-                productBInput + op_.getSeqLen() +
-                (productPipelineLatency - 1) +
-                                           maxProductWriteLatency +
-                                           maxProductReadLatency + 1;
+                serialQueryProductsFirst
+                    ? headEnd
+                    : productBInput + projectionCycleSpan +
+                          (productPipelineLatency - 1) +
+                          maxProductWriteLatency +
+                          maxProductReadLatency + 1;
             const int64_t combineInput = combineConfig + 1;
             if (pairBlockDomain && pairBlock == 0)
               firstPairCombineInput = combineInput;
-            emitRopeCombine(combineConfig, inputHemisphere, outputHemisphere);
+            if (serialQueryProductsFirst)
+              pendingQueryCombines.push_back(
+                  {combineConfig, inputHemisphere, outputHemisphere});
+            else
+              emitRopeCombine(combineConfig, inputHemisphere,
+                              outputHemisphere, 1, 1);
             for (int64_t product = 0; product < 4; ++product) {
               for (int64_t byte = 0; byte < 2; ++byte) {
                 const int64_t slice0 = productSlice(product, 0, byte);
@@ -2517,8 +3102,25 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             kind, head, pairBlock, product,
                             firstToken + tile) -
                             address;
-                  const int64_t laneCount =
-                      paritySplit ? (blockRows - parity + 1) / 2 : blockRows;
+                  const int64_t laneCount = paritySplit
+                      ? std::max<int64_t>(
+                            0, (ropeLaneCount - parity + 1) / 2)
+                      : ropeLaneCount;
+                  // The serial Q combine now reserves one equal-sized slot
+                  // per head/pair. All four product scratch banks are read
+                  // after the product pass and have no intervening commands.
+                  const bool mergeSerialProductReads =
+                      serialQueryProductsFirst && compactProductLayout &&
+                      !pairBlockDomain && tokenBlocks == 1;
+                  if (mergeSerialProductReads &&
+                      (head != 0 || pairBlock != 0))
+                    continue;
+                  const int64_t serialSlotAddressStride =
+                      mergeSerialProductReads
+                          ? layout.ropeProductAddress(kind, 0, 1, product,
+                                                      firstToken) -
+                                address
+                          : 0;
                   for (int64_t hemisphere = 0;
                        hemisphere < memory.hemispheres; ++hemisphere)
                     emitMem3D(
@@ -2527,14 +3129,22 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             vxmInputReadLatency(slice),
                         hemisphere * memory.slices_per_hemisphere + slice,
                         "read", address,
-                        32 + hemisphere * 16 + product * 2 + byte, tileRows,
+                        32 + hemisphere * 16 + product * 2 + byte,
+                        ropeRowsPerLane,
                         1, rowAddressStride, "sram", -1, laneCount,
                         laneStride * tileRows, laneAddressStride,
-                        pairCombineDomain ? 2 : tokenBlocks,
-                        pairCombineDomain
-                            ? combineInput - firstPairCombineInput
-                            : tile,
-                        groupAddressStride,
+                        mergeSerialProductReads
+                            ? op_.getQueryHeads() *
+                                  (projectionHeadBlocks / 2)
+                            : (pairCombineDomain ? 2 : tokenBlocks),
+                        mergeSerialProductReads
+                            ? serialQueryCombineSlotCycles
+                            : (pairCombineDomain
+                                   ? combineInput - firstPairCombineInput
+                                   : tile),
+                        mergeSerialProductReads
+                            ? serialSlotAddressStride
+                            : groupAddressStride,
                         productStorageBank(product));
                 }
               }
@@ -2548,7 +3158,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       : reductionBlock;
               for (int64_t byte = 0; byte < 2; ++byte) {
                 if (kind == AttentionProjectionKind::Query) {
-                  for (int64_t tokenLane = 0; tokenLane < blockRows;
+                  for (int64_t tokenLane = 0; tokenLane < ropeLaneCount;
                        ++tokenLane) {
                     const int64_t slice = layout.queryIwSlices(
                         domainReductionBlock)[2 * tokenLane + byte];
@@ -2586,30 +3196,42 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         const int64_t groupInterval = pairBlockDomain
                             ? combineInput - firstPairCombineInput
                             : 1;
-                        // Each pair block remains an independent closed
-                        // descriptor.  Combining them into one sparse outer
-                        // group would hold this MEM ICU across the 136-cycle
-                        // gap and prevent activation ping/pong from using it.
-                        emitMem3D(
-                            rewriter_, op_.getLoc(), domainCycle, queue,
-                            "write", baseAddress,
-                            source * 8 + half * 2 + byte,
-                            target_.throughput().tile_rows, 1, 1, "sram", -1,
-                            tokenBlocks, tile,
-                            target_.throughput().tile_rows,
-                            groupCount, groupInterval, pairAddressStride,
-                            bank);
-                        recordRopeMemDomain(
-                            queue, bank, domainCycle,
-                            target_.throughput().tile_rows, 1,
-                            tokenBlocks, tile,
-                            groupCount, groupInterval);
+                        // After all serial Q products have completed, every
+                        // Query-IW queue stays idle between pair/head writes.
+                        // Defer those writes to form one three-counter
+                        // WRITE_3D per physical bank queue. The older serial
+                        // path can only join east low-half queues.
+                        if (directSplitRope &&
+                            kind == AttentionProjectionKind::Query &&
+                            tokenBlocks == 1 && !pairBlockDomain &&
+                            (serialQueryProductsFirst ||
+                             (destination == 0 &&
+                              domainReductionBlock <
+                                  projectionHeadBlocks / 2))) {
+                          pendingQueryIwWrites.push_back(
+                              {domainCycle, queue, baseAddress,
+                               source * 8 + half * 2 + byte, bank, head,
+                               pairBlock});
+                        } else {
+                          emitMem3D(
+                              rewriter_, op_.getLoc(), domainCycle, queue,
+                              "write", baseAddress,
+                              source * 8 + half * 2 + byte,
+                              ropeRowsPerLane, 1, 1, "sram",
+                              -1, tokenBlocks, tile,
+                              target_.throughput().tile_rows, groupCount,
+                              groupInterval, pairAddressStride, bank);
+                          recordRopeMemDomain(
+                              queue, bank, domainCycle,
+                              ropeRowsPerLane, 1, tokenBlocks,
+                              tile, groupCount, groupInterval);
+                        }
                       }
                     }
                     headEnd = std::max(
                         headEnd,
                         currentCycle +
-                            (target_.throughput().tile_rows - 1) +
+                            (ropeRowsPerLane - 1) +
                             (tokenBlocks - 1) * tile + 1);
                   }
                 } else {
@@ -2628,38 +3250,383 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         ? firstPairCombineInput + 1 + latency
                         : currentCycle;
                     const int64_t baseAddress = layout.keyAddress(
-                        head, domainReductionBlock, 0);
+                        head, domainReductionBlock, cacheTokenBlock);
                     const int64_t groupAddressStride = pairBlockDomain
                         ? layout.keyAddress(
-                              head, domainReductionBlock + 1, 0) -
+                              head, domainReductionBlock + 1,
+                              cacheTokenBlock) -
                               baseAddress
                         : tile;
                     for (int64_t destination = 0;
                          destination < memory.hemispheres; ++destination) {
                       const int64_t source = 1 - destination;
-                      emitMem3D(
-                          rewriter_, op_.getLoc(), domainCycle,
-                          destination * memory.slices_per_hemisphere + slice,
-                          "write", baseAddress,
-                          source * 8 + half * 2 + byte, tileRows, 1, blockRows,
-                          "sram", -1, blockRows, tileRows, 1,
-                          pairBlockDomain ? 2 : tokenBlocks,
-                          pairBlockDomain
-                              ? combineInput - firstPairCombineInput
-                              : tile,
-                          groupAddressStride,
-                          layout.keyBank(domainReductionBlock));
+                      const int64_t queue =
+                          destination * memory.slices_per_hemisphere + slice;
+                      const int64_t stream =
+                          source * 8 + half * 2 + byte;
+                      const int64_t bank =
+                          layout.keyBank(domainReductionBlock);
+                      if (currentTokens < tile &&
+                          tokenBlocks == 1 && !pairBlockDomain) {
+                        const int64_t fullRows = currentTokens / blockRows;
+                        const int64_t partialLanes =
+                            currentTokens % blockRows;
+                        const auto emitLaneDomain =
+                            [&](int64_t firstLane, int64_t laneCount,
+                                int64_t rowCount) {
+                              if (laneCount <= 0 || rowCount <= 0)
+                                return;
+                              emitMem3D(
+                                  rewriter_, op_.getLoc(),
+                                  domainCycle + firstLane * tileRows,
+                                  queue, "write",
+                                  baseAddress + firstLane, stream,
+                                  rowCount, 1, blockRows, "sram", -1,
+                                  laneCount, tileRows, 1,
+                                  1, 1, 0, bank);
+                            };
+                        emitLaneDomain(0, partialLanes, fullRows + 1);
+                        emitLaneDomain(partialLanes,
+                                       blockRows - partialLanes,
+                                       fullRows);
+                      } else {
+                        emitMem3D(
+                            rewriter_, op_.getLoc(), domainCycle,
+                            queue, "write", baseAddress, stream,
+                            tileRows, 1, blockRows, "sram", -1,
+                            blockRows, tileRows, 1,
+                            pairBlockDomain ? 2 : tokenBlocks,
+                            pairBlockDomain
+                                ? combineInput - firstPairCombineInput
+                                : tile,
+                            groupAddressStride, bank);
+                      }
                     }
                   }
                   headEnd = std::max(headEnd,
-                                     currentCycle + op_.getSeqLen());
+                                     currentCycle + projectionCycleSpan);
                 }
               }
             }
-            headEnd = std::max(headEnd, combineInput + op_.getSeqLen() + 1) +
-                      maxStagingReadLatency + 1;
+            headEnd =
+                std::max(headEnd, combineInput + projectionCycleSpan + 1) +
+                       maxStagingReadLatency + 1;
           }
+          if (kind == AttentionProjectionKind::Key)
+            emitPendingSourceReads(projectionHeadBlocks / 2, 0);
           ropeEnd = std::max(ropeEnd, headEnd);
+        }
+        if (serialQueryProductsFirst &&
+            scheduleGroup + 1 == 2 * projectionGroups) {
+          std::sort(pendingQueryMirrorTables.begin(),
+                    pendingQueryMirrorTables.end(),
+                    [](const auto &a, const auto &b) {
+                      return std::tie(a.queue, a.bank, a.head) <
+                             std::tie(b.queue, b.bank, b.head);
+                    });
+          for (size_t first = 0; first < pendingQueryMirrorTables.size();) {
+            size_t end = first + 1;
+            while (end < pendingQueryMirrorTables.size() &&
+                   pendingQueryMirrorTables[end].queue ==
+                       pendingQueryMirrorTables[first].queue &&
+                   pendingQueryMirrorTables[end].bank ==
+                       pendingQueryMirrorTables[first].bank)
+              ++end;
+            const auto &base = pendingQueryMirrorTables[first];
+            const int64_t headCount = op_.getQueryHeads();
+            const int64_t slot = serialQueryProductSlotCycles;
+            const int64_t mergedEnd =
+                base.cycle + (2 * headCount - 1) * slot +
+                (ropeLaneCount - 1) * target_.throughput().tile_rows +
+                ropeRowsPerLane;
+            bool affine = end - first == static_cast<size_t>(headCount) &&
+                          slot > ropeLaneCount *
+                                     target_.throughput().tile_rows &&
+                          layout.ropeMirrorAddress(
+                              op_.getPositionOffset(), 1) - base.address ==
+                              op_.getSeqLen();
+            for (size_t index = first; affine && index < end; ++index) {
+              const auto &table = pendingQueryMirrorTables[index];
+              const int64_t headOffset =
+                  static_cast<int64_t>(index - first);
+              affine = table.head == headOffset &&
+                       table.cycle == base.cycle + 2 * headOffset * slot &&
+                       table.pairInterval == slot &&
+                       table.address == base.address &&
+                       table.stream == base.stream;
+            }
+            // A MEM ICU cannot switch commands inside this 24-pair domain.
+            // Inspect every already emitted command on the physical queue,
+            // including reads, writes, and combined write/read descriptors.
+            const int64_t hemisphere =
+                base.queue / memory.slices_per_hemisphere;
+            const int64_t slice =
+                base.queue % memory.slices_per_hemisphere;
+            for (mlir::Operation &operation : *rewriter_.getInsertionBlock()) {
+              if (!affine)
+                break;
+              auto opHemisphere = operation.getAttrOfType<mlir::IntegerAttr>(
+                  "hemisphere");
+              auto opSlice =
+                  operation.getAttrOfType<mlir::IntegerAttr>("slice");
+              auto opBank =
+                  operation.getAttrOfType<mlir::IntegerAttr>("bank");
+              auto opCycle =
+                  operation.getAttrOfType<mlir::IntegerAttr>("cycle");
+              if (!opHemisphere || !opSlice || !opCycle ||
+                  opHemisphere.getInt() != hemisphere ||
+                  opSlice.getInt() != slice ||
+                  (opBank ? opBank.getInt() : 0) != base.bank)
+                continue;
+              const int64_t busyStart = opCycle.getInt();
+              int64_t busyEnd = busyStart + 1;
+              if (auto transfer = llvm::dyn_cast<MemTransferOp>(&operation)) {
+                busyEnd +=
+                    (transfer.getGroupCount().value_or(1) - 1) *
+                        transfer.getGroupInterval().value_or(1) +
+                    (transfer.getWaveCount().value_or(1) - 1) *
+                        transfer.getWaveInterval().value_or(1) +
+                    (transfer.getRepeatCount() - 1) *
+                        transfer.getRepeatInterval();
+              } else if (auto count0 =
+                             operation.getAttrOfType<mlir::IntegerAttr>(
+                                 "count0")) {
+                const auto attr = [&](llvm::StringRef name) {
+                  return operation
+                      .getAttrOfType<mlir::IntegerAttr>(name)
+                      .getInt();
+                };
+                const int64_t outer = count0.getInt() - 1;
+                const int64_t inner = attr("count1") - 1;
+                busyEnd = busyStart + 1 +
+                    std::max(outer * attr("write_cycle_stride0") +
+                                 inner * attr("write_cycle_stride1"),
+                             attr("read_start_offset") +
+                                 outer * attr("read_cycle_stride0") +
+                                 inner * attr("read_cycle_stride1"));
+              }
+              affine = busyEnd <= base.cycle || busyStart >= mergedEnd;
+            }
+            if (affine) {
+              emitMem3D(rewriter_, op_.getLoc(), base.cycle, base.queue,
+                        "read", base.address, base.stream,
+                        ropeRowsPerLane, 1, blockRows,
+                        "sram", -1, ropeLaneCount,
+                        target_.throughput().tile_rows, 1,
+                        2 * headCount, slot, 0, base.bank, -1, -1,
+                        2, op_.getSeqLen(), 0);
+            } else {
+              for (size_t index = first; index < end; ++index) {
+                const auto &table = pendingQueryMirrorTables[index];
+                emitMem3D(rewriter_, op_.getLoc(), table.cycle,
+                          table.queue, "read", table.address,
+                          table.stream,
+                          ropeRowsPerLane, 1, blockRows,
+                          "sram", -1, ropeLaneCount,
+                          target_.throughput().tile_rows, 1, 2,
+                          table.pairInterval, op_.getSeqLen(), table.bank);
+              }
+            }
+            first = end;
+          }
+          pendingQueryMirrorTables.clear();
+          std::sort(pendingQuerySourceReads.begin(),
+                    pendingQuerySourceReads.end(),
+                    [](const auto &a, const auto &b) {
+                      return std::tie(a.queue, a.bank, a.head, a.pairBlock,
+                                      a.phase) <
+                             std::tie(b.queue, b.bank, b.head, b.pairBlock,
+                                      b.phase);
+                    });
+          for (size_t first = 0; first < pendingQuerySourceReads.size();) {
+            size_t end = first + 1;
+            while (end < pendingQuerySourceReads.size() &&
+                   pendingQuerySourceReads[end].queue ==
+                       pendingQuerySourceReads[first].queue &&
+                   pendingQuerySourceReads[end].bank ==
+                       pendingQuerySourceReads[first].bank)
+              ++end;
+            const auto &base = pendingQuerySourceReads[first];
+            const int64_t headCount = op_.getQueryHeads();
+            const int64_t pairCount = projectionHeadBlocks / 2;
+            const bool fullDomain =
+                end - first ==
+                static_cast<size_t>(headCount * pairCount * 2);
+            const int64_t phaseCycleStride =
+                fullDomain
+                    ? pendingQuerySourceReads[first + 1].cycle - base.cycle
+                    : 0;
+            const int64_t pairCycleStride =
+                fullDomain
+                    ? pendingQuerySourceReads[first + 2].cycle - base.cycle
+                    : 0;
+            const int64_t pairAddressStride =
+                fullDomain
+                    ? pendingQuerySourceReads[first + 2].address -
+                          base.address
+                    : 0;
+            const int64_t headAddressStride =
+                fullDomain && headCount > 1
+                    ? pendingQuerySourceReads[first + 2 * pairCount].address -
+                          base.address
+                    : 0;
+            bool affine =
+                fullDomain && pairCount == 2 &&
+                phaseCycleStride > ropeRowsPerLane - 1 &&
+                pairCycleStride > phaseCycleStride +
+                                      ropeRowsPerLane - 1;
+            for (size_t index = first; affine && index < end; ++index) {
+              const auto &read = pendingQuerySourceReads[index];
+              const int64_t flatPair = read.head * pairCount + read.pairBlock;
+              affine = read.head >= 0 && read.head < headCount &&
+                       read.pairBlock >= 0 && read.pairBlock < pairCount &&
+                       read.phase >= 0 && read.phase < 2 &&
+                       read.stream == base.stream &&
+                       read.cycle == base.cycle +
+                                         flatPair * pairCycleStride +
+                                         read.phase * phaseCycleStride &&
+                       read.address == base.address +
+                                           read.head * headAddressStride +
+                                           read.pairBlock * pairAddressStride;
+            }
+            if (affine) {
+              emitMem3D(
+                  rewriter_, op_.getLoc(), base.cycle, base.queue,
+                  "read", base.address, base.stream,
+                  ropeRowsPerLane, 1, 1, "sram", -1,
+                  2, phaseCycleStride, 0, headCount * pairCount,
+                  pairCycleStride, 0, base.bank, -1, -1,
+                  pairCount, pairAddressStride, headAddressStride);
+            } else {
+              for (size_t index = first; index < end; ++index) {
+                const auto &read = pendingQuerySourceReads[index];
+                emitMem3D(rewriter_, op_.getLoc(), read.cycle, read.queue,
+                          "read", read.address, read.stream,
+                          ropeRowsPerLane, 1, 1, "sram", -1,
+                          1, 1, 0, 1, 1, 0, read.bank);
+              }
+            }
+            first = end;
+          }
+          pendingQuerySourceReads.clear();
+        }
+        if (scheduleGroup + 1 == scheduleGroups) {
+          std::sort(pendingQueryIwWrites.begin(), pendingQueryIwWrites.end(),
+                    [](const auto &a, const auto &b) {
+                      return std::tie(a.queue, a.bank, a.head, a.pairBlock) <
+                             std::tie(b.queue, b.bank, b.head, b.pairBlock);
+                    });
+          for (size_t first = 0; first < pendingQueryIwWrites.size();) {
+            size_t end = first + 1;
+            while (end < pendingQueryIwWrites.size() &&
+                   pendingQueryIwWrites[end].queue ==
+                       pendingQueryIwWrites[first].queue &&
+                   pendingQueryIwWrites[end].bank ==
+                       pendingQueryIwWrites[first].bank)
+              ++end;
+            const auto &base = pendingQueryIwWrites[first];
+            const int64_t headCount = op_.getQueryHeads();
+            const bool fullDomain =
+                end - first == static_cast<size_t>(headCount * 2);
+            const int64_t pairCycleStride =
+                fullDomain ? pendingQueryIwWrites[first + 1].cycle - base.cycle
+                           : 0;
+            const int64_t pairAddressStride =
+                fullDomain ? pendingQueryIwWrites[first + 1].address -
+                                 base.address
+                           : 0;
+            const int64_t headCycleStride =
+                fullDomain && headCount > 1
+                    ? pendingQueryIwWrites[first + 2].cycle - base.cycle
+                    : 1;
+            const int64_t headAddressStride =
+                fullDomain && headCount > 1
+                    ? pendingQueryIwWrites[first + 2].address - base.address
+                    : 0;
+            bool affine =
+                fullDomain &&
+                pairCycleStride > ropeRowsPerLane - 1 &&
+                (headCount == 1 ||
+                 headCycleStride > pairCycleStride +
+                                       ropeRowsPerLane - 1);
+            for (size_t index = first; affine && index < end; ++index) {
+              const auto &write = pendingQueryIwWrites[index];
+              const int64_t headOffset = write.head;
+              affine = write.pairBlock >= 0 && write.pairBlock < 2 &&
+                       write.bank == base.bank && write.stream == base.stream &&
+                       write.cycle == base.cycle +
+                                          headOffset * headCycleStride +
+                                          write.pairBlock * pairCycleStride &&
+                       write.address == base.address +
+                                            headOffset * headAddressStride +
+                                            write.pairBlock * pairAddressStride;
+            }
+            if (affine) {
+              emitMem3D(rewriter_, op_.getLoc(), base.cycle, base.queue,
+                        "write", base.address, base.stream,
+                        ropeRowsPerLane, 1, 1, "sram", -1,
+                        2, pairCycleStride, pairAddressStride, headCount,
+                        headCycleStride, headAddressStride, base.bank);
+              recordRopeMemDomain(
+                  base.queue, base.bank, base.cycle,
+                  ropeRowsPerLane, 1, 2, pairCycleStride,
+                  headCount, headCycleStride);
+            } else {
+              for (size_t index = first; index < end; ++index) {
+                const auto &write = pendingQueryIwWrites[index];
+                emitMem3D(rewriter_, op_.getLoc(), write.cycle, write.queue,
+                          "write", write.address, write.stream,
+                          ropeRowsPerLane, 1, 1, "sram", -1,
+                          1, 1, 0, 1, 1, 0, write.bank);
+                recordRopeMemDomain(write.queue, write.bank, write.cycle,
+                                    ropeRowsPerLane, 1, 1, 1,
+                                    1, 1);
+              }
+            }
+            first = end;
+          }
+          // Query combine uses one fixed VXM body for each output
+          // hemisphere. The head/pair plan is already timed, so lower each
+          // affine hemisphere run directly as one RUN_2D command.
+          std::sort(pendingQueryCombines.begin(),
+                    pendingQueryCombines.end(),
+                    [](const auto &lhs, const auto &rhs) {
+                      return std::tie(lhs.outputHemisphere,
+                                      lhs.inputHemisphere, lhs.cycle) <
+                             std::tie(rhs.outputHemisphere,
+                                      rhs.inputHemisphere, rhs.cycle);
+                    });
+          for (size_t first = 0; first < pendingQueryCombines.size();) {
+            size_t end = first + 1;
+            int64_t interval = 1;
+            if (end < pendingQueryCombines.size()) {
+              const auto &base = pendingQueryCombines[first];
+              const auto &next = pendingQueryCombines[end];
+              interval = next.cycle - base.cycle;
+              if (base.inputHemisphere == next.inputHemisphere &&
+                  base.outputHemisphere == next.outputHemisphere &&
+                  interval >= op_.getSeqLen()) {
+                ++end;
+                while (end < pendingQueryCombines.size() &&
+                       pendingQueryCombines[end].inputHemisphere ==
+                           base.inputHemisphere &&
+                       pendingQueryCombines[end].outputHemisphere ==
+                           base.outputHemisphere &&
+                       pendingQueryCombines[end].cycle -
+                               pendingQueryCombines[end - 1].cycle ==
+                           interval)
+                  ++end;
+              } else {
+                interval = 1;
+              }
+            }
+            const auto &base = pendingQueryCombines[first];
+            emitRopeCombine(base.cycle, base.inputHemisphere,
+                            base.outputHemisphere,
+                            static_cast<int64_t>(end - first), interval);
+            first = end;
+          }
+          pendingQueryCombines.clear();
         }
         postprocessReady =
             ropeEnd + target_.streams().system_register_columns;
@@ -2844,7 +3811,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       rewriter_, op_.getLoc(), vxmCycle - readLatency(slice),
                       hemisphere * target_.memory().slices_per_hemisphere +
                           slice,
-                      "read", layout.ropeAddress(token), 40 + byte, 1, 1, 0,
+                      "read",
+                      layout.ropeAddress(op_.getPositionOffset() + token),
+                      40 + byte, 1, 1, 0,
                       "sram", -1, ropeBank);
                 }
               }
@@ -2899,7 +3868,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         hemisphere * target_.memory().slices_per_hemisphere +
                             slice,
                         "write",
-                        layout.valuePackAddress(head, reduction, tokenBlock,
+                        layout.valuePackAddress(head, reduction,
+                                                cacheTokenBlock + tokenBlock,
                                                 row),
                         reduction * 2 + byte, 1, 1, 0, "sram", -1,
                         valueBank);
@@ -2978,7 +3948,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   for (int64_t keyHead = 0; keyHead < op_.getKvHeads(); ++keyHead) {
     const int64_t hemisphere = keyHead % target_.memory().hemispheres;
     const char *hemi = hemisphereName(hemisphere);
-    for (int64_t token = 0; token < op_.getSeqLen(); ++token, ++keyCopyCycle) {
+    for (int64_t token = 0; token < op_.getKvSeqLen(); ++token, ++keyCopyCycle) {
       for (int64_t byte = 0; byte < 4; ++byte) {
         emitMem(rewriter_, op_.getLoc(), keyCopyCycle - readLatency(byte),
                 hemisphere * target_.memory().slices_per_hemisphere + byte,
@@ -3023,7 +3993,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
           .getElementType();
   const llvm::StringRef dataFormat = lpu_16bit_data_format(elementType);
   const int64_t tile = target_.throughput().mxm_rows;
-  const int64_t tokenBlocks = op_.getSeqLen() / tile;
+  const int64_t keyBlocks = op_.getKvSeqLen() / tile;
   const int64_t headBlocks = op_.getHeadDim() / tile;
   const int64_t issue = target_.mxm_block_issue_interval();
   const bool wavefront = target_.supports_mxm_weight_activation_overlap() &&
@@ -3031,7 +4001,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
                          target_.throughput().mxms_per_hemisphere == 1;
   const auto reductionComputeCycle = [&](int64_t firstComputeCycle,
                                          int64_t reduction) {
-    return firstComputeCycle + reduction * tokenBlocks * issue;
+    return firstComputeCycle + reduction * keyBlocks * issue;
   };
   const auto reductionIwCycle = [&](int64_t firstIwCycle,
                                     int64_t firstComputeCycle,
@@ -3084,7 +4054,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
                        layout.queryIwBank(reduction));
           }
         }
-        for (int64_t keyBlock = 0; keyBlock < tokenBlocks; ++keyBlock) {
+        for (int64_t keyBlock = 0; keyBlock < keyBlocks; ++keyBlock) {
           const int64_t compute =
               reductionComputeCycle(firstComputeCycle, reduction) +
               keyBlock * issue;
@@ -3106,6 +4076,54 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
     }
   }
 
+  struct PendingQkInputRead {
+    int64_t cycle;
+    int64_t queue;
+    int64_t address;
+    int64_t stream;
+    int64_t bank;
+    int64_t wave;
+    int64_t innerCount;
+    int64_t middleCount;
+    int64_t middleInterval;
+    int64_t innerAddressStride;
+    int64_t middleAddressStride;
+  };
+  llvm::SmallVector<PendingQkInputRead, 128> pendingQueryIwReads;
+  llvm::SmallVector<PendingQkInputRead, 64> pendingKeyActivationReads;
+  const bool mergeQkInputWaves =
+      keyBlocks == 1 && headBlocks == 4 &&
+      target_.throughput().mxms_per_hemisphere == 1 &&
+      stage_plan_.qk_waves.size() > 1;
+  bool mergeQkMxmWaves =
+      mergeQkInputWaves && wavefront &&
+      target_.throughput().mxm_weight_buffers == 2 &&
+      qkWaveCycles == headBlocks * issue;
+  if (mergeQkMxmWaves) {
+    for (const auto &wave : stage_plan_.qk_waves) {
+      std::vector<int64_t> perHemisphere(
+          static_cast<std::size_t>(target_.memory().hemispheres), 0);
+      for (const auto &work : wave.slots) {
+        if (!work)
+          continue;
+        if (work->hemisphere < 0 ||
+            work->hemisphere >= target_.memory().hemispheres ||
+            work->local_mxm != 0 ||
+            layout.scoreAccumulatorAddress(work->query_head,
+                                           work->query_block, 0) != 0) {
+          mergeQkMxmWaves = false;
+          break;
+        }
+        ++perHemisphere[static_cast<std::size_t>(work->hemisphere)];
+      }
+      if (!mergeQkMxmWaves ||
+          llvm::any_of(perHemisphere,
+                       [](int64_t count) { return count != 1; })) {
+        mergeQkMxmWaves = false;
+        break;
+      }
+    }
+  }
   for (std::size_t waveIndex = 0; waveIndex < stage_plan_.qk_waves.size();
        ++waveIndex) {
     const int64_t waveStart =
@@ -3161,30 +4179,69 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
           const int64_t latency = *target_.transport_latency(
               target::StreamEndpoint::Mem, target::StreamEndpoint::MxmWeight,
               target::StreamDirection::East, slice);
-          emitMem3D(
-              rewriter_, op_.getLoc(), reductionIw - latency,
-              work->hemisphere * target_.memory().slices_per_hemisphere + slice,
-              "read", queryAddress,
-              work->local_mxm * static_cast<int64_t>(iwSlices.size()) + stream,
-              phases, 1, -1, "sram", -1, reductionCount,
-              iwReductionInterval, reductionAddressStride, 1, 1, 0,
-              layout.queryIwBank(reductionBase));
+          const int64_t queue =
+              work->hemisphere * target_.memory().slices_per_hemisphere +
+              slice;
+          const int64_t packedStream =
+              work->local_mxm * static_cast<int64_t>(iwSlices.size()) +
+              stream;
+          const int64_t cycle = reductionIw - latency;
+          const int64_t bank = layout.queryIwBank(reductionBase);
+          // Score results can write the same physical Query-IW queue between
+          // waves. Such a queue cannot execute one non-preemptible READ_3D.
+          // Only the first two scaled-score slices receive the MXM result;
+          // the other layout slices are unused by this QK score writer.
+          const auto scoreWriteSlices =
+              layout.scaledScoreSlices(work->local_mxm);
+          const bool scoreSharesQueue =
+              !fusedSoftmax &&
+              bank == placementBank(work->local_mxm == 0 ? "score"
+                                                         : "score_mxm1") &&
+              (slice == scoreWriteSlices[0] ||
+               slice == scoreWriteSlices[1]);
+          if (mergeQkInputWaves && reductionCount == 2 &&
+              !scoreSharesQueue) {
+            pendingQueryIwReads.push_back(
+                {cycle, queue, queryAddress, packedStream, bank,
+                 static_cast<int64_t>(waveIndex), phases, reductionCount,
+                 iwReductionInterval, -1, reductionAddressStride});
+          } else {
+            emitMem3D(rewriter_, op_.getLoc(), cycle, queue, "read",
+                      queryAddress, packedStream, phases, 1, -1, "sram",
+                      -1, reductionCount, iwReductionInterval,
+                      reductionAddressStride, 1, 1, 0, bank);
+          }
         }
       }
 
       if (target_.throughput().mxm_weight_buffers <= 2) {
-        MxmDomain3D iwDomain;
-        iwDomain.wave_count = phases;
-        iwDomain.wave_interval = 1;
-        iwDomain.wave_weight_column_stride = -1;
-        iwDomain.group_count = headBlocks;
-        iwDomain.group_interval = iwReductionInterval;
-        if (headBlocks > 1 && target_.throughput().mxm_weight_buffers == 2)
-          iwDomain.weight_buffer_mode = "toggle_dim2";
-        emitMxm3D(
-            rewriter_, op_.getLoc(), firstReductionIw, mxm, "iw", 0,
-            firstSourcePhase, 0, 0, 0, 1, "stream", true, "supercell", 0,
-            dataFormat, llvm::StringRef{}, llvm::StringRef{}, iwDomain);
+        if (!mergeQkMxmWaves || waveIndex == 0) {
+          MxmDomain3D iwDomain;
+          if (mergeQkMxmWaves) {
+            iwDomain.repeat_count = phases;
+            iwDomain.repeat_interval = 1;
+            iwDomain.repeat_weight_column_stride = -1;
+            iwDomain.wave_count = headBlocks;
+            iwDomain.wave_interval = iwReductionInterval;
+            iwDomain.group_count =
+                static_cast<int64_t>(stage_plan_.qk_waves.size());
+            iwDomain.group_interval = qkWaveCycles;
+            iwDomain.weight_buffer_mode = "toggle_dim1";
+          } else {
+            iwDomain.wave_count = phases;
+            iwDomain.wave_interval = 1;
+            iwDomain.wave_weight_column_stride = -1;
+            iwDomain.group_count = headBlocks;
+            iwDomain.group_interval = iwReductionInterval;
+            if (headBlocks > 1 &&
+                target_.throughput().mxm_weight_buffers == 2)
+              iwDomain.weight_buffer_mode = "toggle_dim2";
+          }
+          emitMxm3D(
+              rewriter_, op_.getLoc(), firstReductionIw, mxm, "iw", 0,
+              firstSourcePhase, 0, 0, 0, 1, "stream", true, "supercell", 0,
+              dataFormat, llvm::StringRef{}, llvm::StringRef{}, iwDomain);
+        }
       } else {
         for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
           MxmDomain3D iwDomain;
@@ -3199,7 +4256,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
               dataFormat, llvm::StringRef{}, llvm::StringRef{}, iwDomain);
         }
       }
-      const int64_t computeReductionInterval = tokenBlocks * issue;
+      const int64_t computeReductionInterval = keyBlocks * issue;
       const int64_t keyReductionGroup =
           target_.throughput().mxms_per_hemisphere == 1
               ? blocksPerRotaryHalf
@@ -3219,52 +4276,79 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
               target::StreamEndpoint::Mem,
               target::StreamEndpoint::MxmActivation,
               target::StreamDirection::East, slice);
-          emitMem3D(
-              rewriter_, op_.getLoc(), computeCycle - latency,
-              work->hemisphere * target_.memory().slices_per_hemisphere + slice,
-              "read", layout.keyAddress(work->kv_head, reduction, 0),
-              activationStream + byte, tile, 1, 1, "sram", -1, tokenBlocks,
-              issue, tile, reductionCount, computeReductionInterval,
+          const int64_t queue =
+              work->hemisphere * target_.memory().slices_per_hemisphere +
+              slice;
+          const int64_t cycle = computeCycle - latency;
+          const int64_t address =
+              layout.keyAddress(work->kv_head, reduction, 0);
+          const int64_t reductionAddressStride =
               reductionCount > 1
                   ? layout.keyAddress(work->kv_head, reduction + 1, 0) -
-                        layout.keyAddress(work->kv_head, reduction, 0)
-                  : 0,
-              layout.keyBank(reduction));
+                        address
+                  : 0;
+          const int64_t bank = layout.keyBank(reduction);
+          if (mergeQkInputWaves && reductionCount == 2) {
+            pendingKeyActivationReads.push_back(
+                {cycle, queue, address, activationStream + byte, bank,
+                 static_cast<int64_t>(waveIndex), tile, reductionCount,
+                 computeReductionInterval, 1, reductionAddressStride});
+          } else {
+            emitMem3D(rewriter_, op_.getLoc(), cycle, queue, "read",
+                      address, activationStream + byte, tile, 1, 1,
+                      "sram", -1, keyBlocks, issue, tile,
+                      reductionCount, computeReductionInterval,
+                      reductionAddressStride, bank);
+          }
         }
       }
 
       if (target_.throughput().mxm_weight_buffers <= 2) {
-        MxmDomain3D computeDomain;
-        computeDomain.repeat_count = tile;
-        computeDomain.repeat_accumulator_address_stride = 0;
-        computeDomain.wave_count = tokenBlocks;
-        computeDomain.wave_interval = issue;
-        computeDomain.wave_accumulator_address_stride = tile;
-        computeDomain.group_count = headBlocks;
-        computeDomain.group_interval = computeReductionInterval;
-        if (headBlocks > 1 && target_.throughput().mxm_weight_buffers == 2)
-          computeDomain.weight_buffer_mode = "toggle_dim2";
-        if (headBlocks > 1) {
-          computeDomain.terminal_dimension = 2;
-          computeDomain.terminal_accumulator_destination = "stream";
-          computeDomain.terminal_accumulator_clear = true;
-          computeDomain.terminal_accumulator_output_format = dataFormat;
+        if (!mergeQkMxmWaves || waveIndex == 0) {
+          MxmDomain3D computeDomain;
+          computeDomain.repeat_count = tile;
+          computeDomain.repeat_accumulator_address_stride = 0;
+          if (mergeQkMxmWaves) {
+            computeDomain.wave_count = headBlocks;
+            computeDomain.wave_interval = computeReductionInterval;
+            computeDomain.group_count =
+                static_cast<int64_t>(stage_plan_.qk_waves.size());
+            computeDomain.group_interval = qkWaveCycles;
+            computeDomain.weight_buffer_mode = "toggle_dim1";
+            computeDomain.terminal_dimension = 1;
+          } else {
+            computeDomain.wave_count = keyBlocks;
+            computeDomain.wave_interval = issue;
+            computeDomain.wave_accumulator_address_stride = tile;
+            computeDomain.group_count = headBlocks;
+            computeDomain.group_interval = computeReductionInterval;
+            if (headBlocks > 1 &&
+                target_.throughput().mxm_weight_buffers == 2)
+              computeDomain.weight_buffer_mode = "toggle_dim2";
+            if (headBlocks > 1)
+              computeDomain.terminal_dimension = 2;
+          }
+          if (headBlocks > 1) {
+            computeDomain.terminal_accumulator_destination = "stream";
+            computeDomain.terminal_accumulator_clear = true;
+            computeDomain.terminal_accumulator_output_format = dataFormat;
+          }
+          emitMxm3D(
+              rewriter_, op_.getLoc(), firstComputeCycle, mxm, "compute", 0,
+              0, activationStream, outputStream,
+              layout.scoreAccumulatorAddress(work->query_head,
+                                             work->query_block, 0),
+              1, headBlocks == 1 ? "stream" : "sram", headBlocks == 1,
+              "supercell", 0, dataFormat, llvm::StringRef{},
+              headBlocks == 1 ? dataFormat : "fp32", computeDomain);
         }
-        emitMxm3D(
-            rewriter_, op_.getLoc(), firstComputeCycle, mxm, "compute", 0, 0,
-            activationStream, outputStream,
-            layout.scoreAccumulatorAddress(work->query_head,
-                                           work->query_block, 0),
-            1, headBlocks == 1 ? "stream" : "sram", headBlocks == 1,
-            "supercell", 0, dataFormat, llvm::StringRef{},
-            headBlocks == 1 ? dataFormat : "fp32", computeDomain);
       } else {
         for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
           const bool finalReduction = reduction + 1 == headBlocks;
           MxmDomain3D computeDomain;
           computeDomain.repeat_count = tile;
           computeDomain.repeat_accumulator_address_stride = 0;
-          computeDomain.wave_count = tokenBlocks;
+          computeDomain.wave_count = keyBlocks;
           computeDomain.wave_interval = issue;
           computeDomain.wave_accumulator_address_stride = tile;
           emitMxm3D(
@@ -3300,13 +4384,72 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
               work->hemisphere * target_.memory().slices_per_hemisphere + slice,
               "write",
               layout.scoreAddress(work->query_head, work->query_block, 0),
-              32 + outputStream + byte, tile, 1, 1, "sram", -1, tokenBlocks,
+              32 + outputStream + byte, tile, 1, 1, "sram", -1, keyBlocks,
               issue, tile, 1, 1, 0,
               placementBank(work->local_mxm == 0 ? "score" : "score_mxm1"));
         }
       }
     }
   }
+  // Each physical Query-IW or K-activation queue sees one input domain per
+  // QK wave. The wave plan has already reserved the exact FU issue windows;
+  // emit a single outer 3D loop only when the whole per-queue sequence is
+  // affine in both time and SRAM address.
+  const auto emitPendingQkInputs = [&](auto &pending) {
+    std::sort(pending.begin(), pending.end(), [](const auto &a, const auto &b) {
+      return std::tie(a.queue, a.bank, a.wave) <
+             std::tie(b.queue, b.bank, b.wave);
+    });
+    for (size_t first = 0; first < pending.size();) {
+      size_t end = first + 1;
+      while (end < pending.size() &&
+             pending[end].queue == pending[first].queue &&
+             pending[end].bank == pending[first].bank)
+        ++end;
+      const auto &base = pending[first];
+      const int64_t waveCount =
+          static_cast<int64_t>(stage_plan_.qk_waves.size());
+      const bool fullDomain =
+          end - first == static_cast<size_t>(waveCount);
+      const int64_t outerAddressStride =
+          fullDomain ? pending[first + 1].address - base.address : 0;
+      bool affine = fullDomain && base.wave == 0 &&
+                    base.middleCount == 2 && base.middleInterval > 0 &&
+                    qkWaveCycles >= base.middleInterval * base.middleCount;
+      for (size_t index = first; affine && index < end; ++index) {
+        const auto &read = pending[index];
+        const int64_t wave = static_cast<int64_t>(index - first);
+        affine = read.wave == wave && read.stream == base.stream &&
+                 read.innerCount == base.innerCount &&
+                 read.middleCount == base.middleCount &&
+                 read.middleInterval == base.middleInterval &&
+                 read.innerAddressStride == base.innerAddressStride &&
+                 read.middleAddressStride == base.middleAddressStride &&
+                 read.cycle == base.cycle + wave * qkWaveCycles &&
+                 read.address ==
+                     base.address + wave * outerAddressStride;
+      }
+      if (affine) {
+        emitMem3D(rewriter_, op_.getLoc(), base.cycle, base.queue, "read",
+                  base.address, base.stream, base.innerCount, 1,
+                  base.innerAddressStride, "sram", -1, base.middleCount,
+                  base.middleInterval, base.middleAddressStride,
+                  waveCount, qkWaveCycles, outerAddressStride, base.bank);
+      } else {
+        for (size_t index = first; index < end; ++index) {
+          const auto &read = pending[index];
+          emitMem3D(rewriter_, op_.getLoc(), read.cycle, read.queue, "read",
+                    read.address, read.stream, read.innerCount, 1,
+                    read.innerAddressStride, "sram", -1, read.middleCount,
+                    read.middleInterval, read.middleAddressStride,
+                    1, 1, 0, read.bank);
+        }
+      }
+      first = end;
+    }
+  };
+  emitPendingQkInputs(pendingQueryIwReads);
+  emitPendingQkInputs(pendingKeyActivationReads);
   return mlir::success();
 }
 

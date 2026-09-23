@@ -63,6 +63,7 @@ def MxmIssueOp : FTLPU_Schedule_Op<"mxm_issue", [MemoryEffects<[MemWrite]>]> {
       OptionalAttr<I64Attr>:$weight_inner_column,
       OptionalAttr<StrAttr>:$weight_input_mode,
       OptionalAttr<I64Attr>:$weight_stream_base,
+      OptionalAttr<StrAttr>:$decode_layout,
       OptionalAttr<StrAttr>:$weight_buffer_mode,
       OptionalAttr<I64Attr>:$repeat_weight_column_stride,
       OptionalAttr<I64Attr>:$repeat_accumulator_address_stride,

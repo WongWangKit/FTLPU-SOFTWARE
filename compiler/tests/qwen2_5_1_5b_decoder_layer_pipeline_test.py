@@ -186,6 +186,23 @@ def main() -> None:
             f"primary={sorted(staging_slices)}, pong={sorted(pong_slices)}"
         )
 
+    pack_bank, _, pack_slices = flat_memory_plan_placement(
+        stream_text, "probability_pack"
+    )
+    for input_name in ("score", "score_mxm1", "exp", "exp_mxm1",
+                       "causal_mask", "causal_mask_mxm1"):
+        input_bank, _, input_slices = flat_memory_plan_placement(
+            stream_text, input_name
+        )
+        shared_slices = pack_slices & input_slices
+        if pack_bank == input_bank and shared_slices:
+            raise AssertionError(
+                "Softmax probability writes must use MEM ICU queues that "
+                "are disjoint from all score, exp, and causal-mask reads: "
+                f"probability_pack and {input_name} share bank {pack_bank}, "
+                f"slices={sorted(shared_slices)}"
+            )
+
     schedule_markers = {
         "ftlpu.schedule.closed_form", 'name = "qkv"',
         'name = "softmax"', 'name = "o_proj"',
@@ -227,6 +244,7 @@ def main() -> None:
     internal_address_bindings: set[int] = set()
     mxm_compute_intervals: list[tuple[int, int]] = []
     projection_compute_domains: dict[int, list[tuple[int, int, int, int]]] = {}
+    ffn_activation_page_domains: list[tuple[int, int]] = []
     qkv_overlap_compute_domains: list[dict[str, int | bool]] = []
     streaming_bf16_compute_intervals: list[tuple[int, int]] = []
     accumulator_read_intervals: list[tuple[int, int]] = []
@@ -378,6 +396,17 @@ def main() -> None:
                 hemisphere = integer_attr(line, "hemisphere")
                 address = integer_attr(line, "address")
                 queue = (hemisphere, slice_id, bank)
+                if (hemisphere == 0 and slice_id == 0 and bank == 1
+                        and address == 0 and 'opcode = "read"' in line
+                        and integer_attr(line, "packed_stream") == 16
+                        and integer_attr(line, "repeat_count", 1) == 4
+                        and integer_attr(line, "wave_count", 1) == 48
+                        and integer_attr(line, "group_interval", 1) == 1536
+                        and integer_attr(line, "group_count", 1) in (84, 56)):
+                    ffn_activation_page_domains.append((
+                        integer_attr(line, "cycle"),
+                        integer_attr(line, "group_count"),
+                    ))
                 if (slice_id in rope_staging_slices | mirror_spare_slices
                         and ((rope_staging_base <= address <
                               rope_staging_base + 4 * 32)
@@ -625,6 +654,86 @@ def main() -> None:
         raise AssertionError(
             f"Schedule IR is missing {sorted(schedule_markers)}"
         )
+    schedule_lines = schedule.read_text(encoding="utf-8").splitlines()
+    softmax_timeline = next(
+        (line for line in schedule_lines
+         if "ftlpu.schedule.timeline" in line
+         and 'name = "softmax"' in line),
+        None,
+    )
+    if softmax_timeline is None:
+        raise AssertionError("Schedule IR is missing the Softmax timeline")
+    softmax_begin = integer_attr(softmax_timeline, "start")
+    softmax_end = integer_attr(softmax_timeline, "end")
+    softmax_mem_commands: dict[
+        tuple[int, int, int], list[tuple[int, int, str]]
+    ] = {}
+    for order, line in enumerate(schedule_lines):
+        if "ftlpu.schedule.mem_transfer" not in line:
+            continue
+        cycle = integer_attr(line, "cycle")
+        if not softmax_begin <= cycle < softmax_end:
+            continue
+        opcode_match = re.search(r'opcode = "(read|write)"', line)
+        if opcode_match is None:
+            continue
+        queue = (integer_attr(line, "hemisphere"),
+                 integer_attr(line, "slice"),
+                 integer_attr(line, "bank"))
+        softmax_mem_commands.setdefault(queue, []).append(
+            (cycle, order, opcode_match.group(1))
+        )
+    transition_count = 0
+    transition_runs: dict[tuple[int, int, int], list[str]] = {}
+    for queue, commands in softmax_mem_commands.items():
+        runs: list[str] = []
+        for _, _, opcode in sorted(commands):
+            if not runs or runs[-1] != opcode:
+                runs.append(opcode)
+        transition_runs[queue] = runs
+        transition_count += max(0, len(runs) - 1)
+    softmax_mem_workload = sum(
+        integer_attr(line, "repeat_count", 1)
+        * integer_attr(line, "wave_count", 1)
+        * integer_attr(line, "group_count", 1)
+        for line in schedule_lines
+        if "ftlpu.schedule.mem_transfer" in line
+        and softmax_begin <= integer_attr(line, "cycle") < softmax_end
+    )
+    if len([command for commands in softmax_mem_commands.values()
+            for command in commands]) > 68 or softmax_mem_workload != 15_360:
+        raise AssertionError(
+            "Softmax MEM work axis is not represented by maximal closed 3-D "
+            "domains: "
+            f"instructions={sum(len(commands) for commands in softmax_mem_commands.values())}, "
+            f"expanded_work={softmax_mem_workload}"
+        )
+    if transition_count > 18:
+        raise AssertionError(
+            "Softmax regressed from phase-major scheduling to work-major "
+            "MEM read/write alternation: "
+            f"transitions={transition_count}, runs={transition_runs}"
+        )
+    for name, expected_opcode in (("probability_pack", "write"),
+                                  ("causal_mask", "read"),
+                                  ("causal_mask_mxm1", "read")):
+        bank, _, slices = flat_memory_plan_placement(stream_text, name)
+        affected = {
+            opcode
+            for (hemisphere, slice_id, queue_bank), commands
+            in softmax_mem_commands.items()
+            if queue_bank == bank and slice_id in slices
+            for _, _, opcode in commands
+        }
+        invalid = affected - {expected_opcode}
+        missing_probability_write = (
+            name == "probability_pack" and not affected
+        )
+        if invalid or missing_probability_write:
+            raise AssertionError(
+                f"Softmax {name} queues must remain {expected_opcode}-only: "
+                f"observed={sorted(affected)}"
+            )
     for host in host_preloaded_allocations:
         for initialized in initialized_allocations:
             host_name, host_bank, host_base, host_rows, host_slices = host
@@ -852,6 +961,14 @@ def main() -> None:
             "Gate/Up closed domains lost the real two-buffer reuse hazard: "
             f"observed={ffn_projection_hazard_waves}, "
             f"expected={expected_hazard_waves}"
+        )
+    ordered_activation_pages = sorted(ffn_activation_page_domains)
+    if ([count for _, count in ordered_activation_pages]
+            != [84, 56, 84, 56]):
+        raise AssertionError(
+            "Gate/Up activation READ_3D domains do not stop at dynamic "
+            "weight-page boundaries: "
+            f"observed={ordered_activation_pages}"
         )
     required_swish_routes = {
         ("west", 6), ("west", 7), ("east", 14), ("east", 15),

@@ -299,9 +299,10 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         && (binding.element_type == BindingElementType::F16
             || binding.element_type == BindingElementType::BF16)
         && binding.slices.size() == 16) {
-        if (binding.shape.size() != 2 || rows % 32 || columns % 32)
+        if (binding.shape.size() != 2 || rows == 0 || columns % 32)
             throw std::invalid_argument(
-                "MXM distributed16 binding must be a 32-aligned matrix");
+                "MXM distributed16 binding must have non-zero rows and "
+                "32-aligned columns");
         const std::size_t hidden_blocks = columns / 32;
         for (std::size_t row = 0; row < rows; ++row) {
             const std::size_t token_block = row / 32;
@@ -480,6 +481,25 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         image.write(hemisphere, binding.slices.at(slice_index), address,
             static_cast<std::uint32_t>(k % 32), data[k * columns + n]);
     };
+    if (binding.layout == BindingLayout::W8A16Native4Weight
+        && binding.element_type == BindingElementType::I8
+        && binding.slices.size() == 32) {
+        if (rows % 32 || columns % 64)
+            throw std::invalid_argument(
+                "Native4 weight must be K32/N64 aligned");
+        const std::size_t reductions = rows / 32;
+        for (std::size_t k = 0; k < rows; ++k)
+            for (std::size_t n = 0; n < columns; ++n) {
+                const std::uint16_t hemisphere =
+                    static_cast<std::uint16_t>((n / 32) % 2);
+                const std::size_t localWave = n / 64;
+                const std::uint32_t address = base
+                    + static_cast<std::uint32_t>(
+                        localWave * reductions + k / 32) * stride;
+                write_i8(k, n, hemisphere, n % 32, address);
+            }
+        return image.finish();
+    }
     if ((binding.layout == BindingLayout::W8A16MxmWeightStriped
             || binding.layout == BindingLayout::W8A16MxmWeightWaveStriped)
         && binding.element_type == BindingElementType::I8
@@ -746,9 +766,10 @@ std::vector<std::uint8_t> unpack_binding_image(
         && (binding.element_type == BindingElementType::F16
             || binding.element_type == BindingElementType::BF16)
         && binding.slices.size() == 16) {
-        if (rows % 32 || columns % 32)
+        if (rows == 0 || columns % 32)
             throw std::invalid_argument(
-                "MXM distributed16 binding must be 32-aligned");
+                "MXM distributed16 binding must have non-zero rows and "
+                "32-aligned columns");
         std::vector<std::uint8_t> result(
             static_cast<std::size_t>(binding.byte_size));
         const std::size_t hidden_blocks = columns / 32;
@@ -799,6 +820,48 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
     std::span<const std::uint8_t> data,
     const ExecutableHardwareConfig& hardware)
 {
+    if (binding.layout == BindingLayout::W8A16Native4Weight) {
+        if (!binding.paged_weight || binding.role != "weight"
+            || binding.element_type != BindingElementType::I8
+            || binding.shape.size() != 2 || data.size() != binding.byte_size
+            || binding.slices.size() != 32
+            || binding.page_storage_slices.size() < 32
+            || binding.page_count != 1 || page_index != 0
+            || binding.base_row < 0 || binding.address_stride == 0)
+            throw std::invalid_argument(
+                "invalid paged Native4 weight binding");
+        const std::size_t rows = checked_dimension(binding, 0);
+        const std::size_t columns = checked_dimension(binding, 1);
+        if (rows % 32 || columns % 64)
+            throw std::invalid_argument(
+                "paged Native4 weight must be K32/N64 aligned");
+        const auto placement = resolve_weight_page_placement(binding, 0);
+        const std::size_t reductions = rows / 32;
+        const std::size_t localWaves = columns / 64;
+        if (placement.row_count < localWaves * reductions
+            || static_cast<std::uint64_t>(binding.base_row)
+                    + (placement.base_row + localWaves * reductions - 1)
+                        * static_cast<std::uint64_t>(binding.address_stride)
+                >= hardware.sram_depth_rows)
+            throw std::invalid_argument(
+                "paged Native4 weight exceeds SRAM residency");
+        ImageWriter image(hardware);
+        for (std::size_t k = 0; k < rows; ++k)
+            for (std::size_t n = 0; n < columns; ++n) {
+                const std::uint16_t hemisphere =
+                    static_cast<std::uint16_t>((n / 32) % 2);
+                const std::size_t localWave = n / 64;
+                const auto address = static_cast<std::uint32_t>(
+                    binding.base_row + placement.base_row
+                    + (localWave * reductions + k / 32)
+                        * binding.address_stride);
+                image.write(hemisphere,
+                    binding.page_storage_slices[n % 32], address,
+                    static_cast<std::uint32_t>(k % 32),
+                    data[k * columns + n]);
+            }
+        return image.finish();
+    }
     if (!binding.paged_weight || binding.role != "weight"
         || binding.element_type != BindingElementType::I8
         || (binding.layout != BindingLayout::W8A16MxmWeightWaveStriped

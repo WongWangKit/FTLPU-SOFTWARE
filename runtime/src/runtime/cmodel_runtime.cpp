@@ -633,6 +633,12 @@ void CModelRuntime::set_weight_page_residency_checker(
     weight_page_residency_checker_ = std::move(checker);
 }
 
+void CModelRuntime::set_weight_page_wait_observer(
+    std::function<void()> observer)
+{
+    weight_page_wait_observer_ = std::move(observer);
+}
+
 void CModelRuntime::enable_execution_trace(bool enabled) noexcept
 {
     execution_trace_enabled_ = enabled;
@@ -661,6 +667,26 @@ void CModelRuntime::write_execution_trace_csv(
         throw std::logic_error(
             "runtime execution trace was not enabled before program load");
     execution_trace_.write_csv(path);
+}
+
+void CModelRuntime::begin_external_execution_trace_segment(
+    const BinaryProgram& program, std::int64_t cycleOffset, bool append)
+{
+    if (execution_trace_enabled_)
+        execution_trace_.begin_segment(program, cycleOffset, append);
+    if (mem_execution_trace_enabled_)
+        mem_execution_trace_.begin_segment(cycleOffset, append);
+}
+
+void CModelRuntime::sample_external_execution_trace_cycle(
+    std::uint64_t physicalCycle, bool programIssueEnabled)
+{
+    if (execution_trace_enabled_)
+        execution_trace_.sample(
+            system_, physicalCycle, programIssueEnabled, nullptr);
+    if (mem_execution_trace_enabled_)
+        mem_execution_trace_.sample(
+            system_, physicalCycle, programIssueEnabled);
 }
 
 void CModelRuntime::enable_mem_execution_trace(bool enabled) noexcept
@@ -975,10 +1001,10 @@ void CModelRuntime::upload_binding(
                 == BindingLayout::Fp16MxmBlock8Distributed16)
         && is_16bit_float(binding.element_type)
         && binding.slices.size() == 16) {
-        if (rows % 32 != 0 || columns % 32 != 0)
+        if (rows == 0 || columns % 32 != 0)
             throw std::logic_error(
                 "MXM distributed16 16-bit float input requires "
-                "32-aligned dimensions");
+                "non-zero rows and 32-aligned columns");
         const std::size_t hidden_blocks = columns / 32;
         for (std::size_t row = 0; row < rows; ++row) {
             const std::size_t token_block = row / 32;
@@ -1002,6 +1028,28 @@ void CModelRuntime::upload_binding(
                             binding.slices[2 * token_lane + 1], address,
                             feature_wave * 8 + feature_lane, data[offset + 1]);
                     });
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::W8A16Native4Weight
+        && binding.element_type == BindingElementType::I8
+        && binding.slices.size() == 32) {
+        if (rows % 32 || columns % 64)
+            throw std::logic_error(
+                "Native4 weight binding must be K32/N64 aligned");
+        const std::size_t reductions = rows / 32;
+        for (std::size_t k = 0; k < rows; ++k) {
+            for (std::size_t n = 0; n < columns; ++n) {
+                const auto hemisphere = static_cast<Hemisphere>(
+                    (n / 32) % 2);
+                const std::size_t localWave = n / 64;
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + localWave * reductions + k / 32;
+                write_binding_sram_byte(system_, binding, hemisphere,
+                    binding.slices[n % 32], address, k % 32,
+                    data[k * columns + n]);
             }
         }
         return;
@@ -1284,10 +1332,10 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
                 == BindingLayout::Fp16MxmBlock8Distributed16)
         && is_16bit_float(binding.element_type)
         && binding.slices.size() == 16) {
-        if (rows % 32 != 0 || columns % 32 != 0)
+        if (rows == 0 || columns % 32 != 0)
             throw std::logic_error(
                 "MXM distributed16 16-bit float output requires "
-                "32-aligned dimensions");
+                "non-zero rows and 32-aligned columns");
         std::vector<std::uint8_t> result(
             static_cast<std::size_t>(binding.byte_size));
         const std::size_t hidden_blocks = columns / 32;
@@ -1385,6 +1433,15 @@ void CModelRuntime::run_logical_cycles(
     constexpr std::size_t kNoProgressWatchdogCycles = 10'000'000;
     while (advanced < count) {
         const bool pageReady = load_ready_weight_pages();
+        // A page-ready SYNC is a chip-wide consumer barrier.  While its
+        // producer is late, keep C2C and an in-order MEM_WRITE_SYNC moving,
+        // but hold every ordinary FU queue at the same logical boundary.
+        // Letting queues that have already reached WAIT_EVENT resume before
+        // slower queues arrive would skew the statically aligned MEM/MXM
+        // streams.  InstructionControlUnit's paused mode is transport-aware:
+        // C2C always advances and MEM ticks only a synchronized write at the
+        // queue head, so the page producer cannot deadlock behind its own
+        // consumer barrier.
         system_.icu().set_program_issue_enabled(pageReady);
         tick_(sinks);
         if (execution_trace_enabled_)
@@ -1403,6 +1460,8 @@ void CModelRuntime::run_logical_cycles(
             consecutiveStalls = 0;
             continue;
         }
+        if (weight_page_wait_observer_)
+            weight_page_wait_observer_();
         if (++consecutiveStalls > kNoProgressWatchdogCycles)
             throw std::runtime_error(
                 "runtime page-ready wait made no progress for "

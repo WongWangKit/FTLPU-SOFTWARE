@@ -181,6 +181,45 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
         makeWeightPairDomains(context.gate_route.getPlacement()),
         makeWeightPairDomains(context.up_route.getPlacement()),
     };
+    // MXM control does not depend on the physical MEM slice group.  It only
+    // needs an instruction boundary when page residency changes.  Splitting
+    // it at every MEM slice-group boundary would restart the MXM domain
+    // counters partway through a resident page.
+    const auto makeWeightPageDomains = [&](mlir::DictionaryAttr placement) {
+        std::vector<int64_t> result(
+            static_cast<std::size_t>(pairCount), 0);
+        const auto paged = placement.getAs<mlir::BoolAttr>("paged_weight");
+        const bool isPaged = paged && paged.getValue();
+        const int64_t pairsPerPage = isPaged
+            ? placement.getAs<mlir::IntegerAttr>("page_granularity").getInt()
+            : pairCount;
+        for (int64_t pair = 0; pair < pairCount;) {
+            const int64_t flatBegin = pair * reductionBlockCount;
+            int64_t count = std::min(pairCount - pair,
+                isPaged ? pairsPerPage - pair % pairsPerPage
+                        : pairCount - pair);
+            if (dequantSplitBlock > flatBegin
+                && dequantSplitBlock
+                    < (pair + count) * reductionBlockCount)
+                count = std::max<int64_t>(1,
+                    dequantSplitBlock / reductionBlockCount - pair);
+            result[static_cast<std::size_t>(pair)] = count;
+            pair += count;
+        }
+        return result;
+    };
+    const std::array<std::vector<int64_t>, 2> weightPageDomains = {
+        makeWeightPageDomains(context.gate_route.getPlacement()),
+        makeWeightPageDomains(context.up_route.getPlacement()),
+    };
+    const auto isPagedPlacement = [](mlir::DictionaryAttr placement) {
+        const auto paged = placement.getAs<mlir::BoolAttr>("paged_weight");
+        return paged && paged.getValue();
+    };
+    const bool splitSerializedActivationDomains = singleMxm
+        && serializedProjections
+        && (isPagedPlacement(context.gate_route.getPlacement())
+            || isPagedPlacement(context.up_route.getPlacement()));
 
     // The active Qwen path uses local dequant, whose projection planner emits
     // one stable stream segment per hemisphere and tile.  Its compute launch
@@ -188,6 +227,34 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
     // the corresponding MEM domain.
     const bool closedProjectionDomains = context.local_weight_dequant
         && reductionBlockCount > 0 && pairCount > 0;
+    // Weight SRAM descriptors stop at page/slice-group boundaries.  MXM
+    // dequant and load must stop at the same boundaries: a hardware ICU
+    // cannot suspend an already decoded 3-D domain while the next dynamic
+    // weight page arrives.  Each resident affine region therefore owns one
+    // MEM domain and one matching MXM control domain.
+    int64_t mxmPairInterval = 1;
+    bool closedWeightMxmControl = closedProjectionDomains
+        && pairCount > 1 && dequantSplitBlock < 0
+        && (serializedProjections || !singleMxm)
+        && pairCount * reductionBlockCount <= 65536;
+    if (closedWeightMxmControl) {
+        const int64_t first =
+            context.projection_timeline.blocks.front().dequant_start
+                + weightStartupDelay;
+        mxmPairInterval =
+            context.projection_timeline.blocks[reductionBlockCount]
+                .dequant_start - first;
+        closedWeightMxmControl = mxmPairInterval
+            == reductionBlockCount
+                * context.projection_timeline.projection_block_interval;
+        for (int64_t pair = 1;
+             closedWeightMxmControl && pair < pairCount; ++pair) {
+            closedWeightMxmControl =
+                context.projection_timeline.blocks[
+                    pair * reductionBlockCount].dequant_start
+                == first + pair * mxmPairInterval;
+        }
+    }
     const auto computeProjectionOffset = [&](int64_t projection) {
         if (!singleMxm) return int64_t{0};
         if (!serializedProjections)
@@ -280,7 +347,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         ffn.getOperation()->emitError(
                             "paged FFN projection has invalid physical page placement")
                             << ": projection=" << projection
-                            << ", page=" << page;
+                            << ", pair=" << pair
+                            << ", pair_count=" << pairCount
+                            << ", page=" << page
+                            << ", waves_per_page=" << wavesPerPage;
                         return mlir::failure();
                     }
                     bank = pagePlacement->bank;
@@ -384,6 +454,16 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             reductionBlockCount * weightLoadCycles;
                     }
                 }
+                std::optional<FfnLoopDomain3D> mxmControlDomain;
+                const int64_t mxmControlPairCount =
+                    weightPageDomains[static_cast<std::size_t>(projection)]
+                        [static_cast<std::size_t>(pair)];
+                if (closedWeightMxmControl && reduction == 0
+                    && mxmControlPairCount > 0) {
+                    mxmControlDomain = weightDomain;
+                    mxmControlDomain->group_count = mxmControlPairCount;
+                    mxmControlDomain->group_interval = mxmPairInterval;
+                }
                 emitFfnWeightTile(rewriter, ffn.getLoc(), raw,
                     dequantizedType,
                     selectedWeightSlices,
@@ -399,7 +479,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     context.local_weight_dequant, bank, page,
                     logicalBase, {}, weightDomain,
                     reductionDomain.count * weightPairCount > 1
-                        ? "toggle_dim2" : "fixed");
+                        ? "toggle_dim2" : "fixed",
+                    mxmControlDomain,
+                    !closedWeightMxmControl
+                        || (reduction == 0 && mxmControlPairCount > 0));
             }
         }
 
@@ -425,11 +508,22 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     closedProjectionDomains
                     && (reductionBlockCount % 2 == 0
                         || reductionBlockCount == 1);
-                const int64_t computeDomainPairCount =
-                    computeCanCrossPairs ? pairCount : 1;
-                const bool closedComputeLeader =
+                const std::array<int64_t, 2> computeDomainPairCounts = {
+                    computeCanCrossPairs
+                        ? weightPageDomains[0][static_cast<std::size_t>(pair)]
+                        : 1,
+                    computeCanCrossPairs
+                        ? weightPageDomains[1][static_cast<std::size_t>(pair)]
+                        : 1,
+                };
+                const std::array<bool, 2> closedComputeLeaders = {
                     closedProjectionDomains && reduction == 0
-                    && (!computeCanCrossPairs || pair == 0);
+                        && (!computeCanCrossPairs
+                            || computeDomainPairCounts[0] > 0),
+                    closedProjectionDomains && reduction == 0
+                        && (!computeCanCrossPairs
+                            || computeDomainPairCounts[1] > 0),
+                };
 
                 mlir::Value gateAccumulatorValue;
                 mlir::Value upAccumulatorValue;
@@ -549,7 +643,35 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         context.activation_route.getInput();
                     mlir::Value upActivation = gateActivation;
                     if (closedProjectionDomains) {
-                        if (pair == 0 && reduction == 0) {
+                        if (splitSerializedActivationDomains
+                            && reduction == 0) {
+                            // The MEM activation producer must stop at every
+                            // dynamic weight-page boundary together with the
+                            // MXM consumer. A hardware ICU cannot suspend one
+                            // decoded READ_3D while COMPUTE_3D waits on the
+                            // next page, so lower one matching affine domain
+                            // per projection page directly.
+                            const auto makeActivationDomain =
+                                [&](int64_t domainPairCount) {
+                                    FfnLoopDomain3D domain;
+                                    domain.wave_count = reductionBlockCount;
+                                    domain.wave_interval = reductionInterval;
+                                    domain.wave_address_stride =
+                                        context.activation_distributed16
+                                        ? throughput.tile_rows : m;
+                                    domain.group_count = domainPairCount;
+                                    domain.group_interval = pairInterval;
+                                    return domain;
+                                };
+                            if (closedComputeLeaders[0])
+                                gateActivation = emitActivation(gateCycle,
+                                    makeActivationDomain(
+                                        computeDomainPairCounts[0]));
+                            if (closedComputeLeaders[1])
+                                upActivation = emitActivation(upCycle,
+                                    makeActivationDomain(
+                                        computeDomainPairCounts[1]));
+                        } else if (pair == 0 && reduction == 0) {
                             FfnLoopDomain3D activationDomain;
                             activationDomain.wave_count =
                                 reductionBlockCount;
@@ -614,31 +736,39 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                     upCycle, activationDomain);
                         }
                     }
-                    if (closedComputeLeader) {
-                        FfnMxmDomain3D domain;
-                        domain.repeat_count = segment.rows;
-                        domain.repeat_accumulator_address_stride = 0;
-                        domain.wave_count = reductionBlockCount;
-                        domain.wave_interval = reductionInterval;
-                        domain.group_count = computeDomainPairCount;
-                        domain.group_interval = pairInterval;
-                        if (throughput.mxm_weight_buffers == 2) {
-                            if (reductionBlockCount > 1)
-                                domain.weight_buffer_mode = "toggle_dim1";
-                            else if (computeDomainPairCount > 1)
-                                domain.weight_buffer_mode = "toggle_dim2";
-                        }
-                        if (reductionBlockCount > 1) {
-                            // Reduction is dimension 1.  Terminal mode fires
-                            // at its last coordinate for every outer pair,
-                            // draining and clearing that pair before reuse.
-                            domain.terminal_dimension = 1;
-                            domain.terminal_accumulator_destination = "stream";
-                            domain.terminal_accumulator_clear = true;
-                            domain.terminal_accumulator_output_format =
-                                "bf16";
-                        }
-                        const bool finalOnly = reductionBlockCount == 1;
+                    const auto makeComputeDomain =
+                        [&](int64_t domainPairCount) {
+                            FfnMxmDomain3D domain;
+                            domain.repeat_count = segment.rows;
+                            domain.repeat_accumulator_address_stride = 0;
+                            domain.wave_count = reductionBlockCount;
+                            domain.wave_interval = reductionInterval;
+                            domain.group_count = domainPairCount;
+                            domain.group_interval = pairInterval;
+                            if (throughput.mxm_weight_buffers == 2) {
+                                if (reductionBlockCount > 1)
+                                    domain.weight_buffer_mode = "toggle_dim1";
+                                else if (domainPairCount > 1)
+                                    domain.weight_buffer_mode = "toggle_dim2";
+                            }
+                            if (reductionBlockCount > 1) {
+                                // Reduction is dimension 1. Terminal mode
+                                // fires at its last coordinate for every
+                                // outer pair, draining and clearing that pair
+                                // before reuse.
+                                domain.terminal_dimension = 1;
+                                domain.terminal_accumulator_destination =
+                                    "stream";
+                                domain.terminal_accumulator_clear = true;
+                                domain.terminal_accumulator_output_format =
+                                    "bf16";
+                            }
+                            return domain;
+                        };
+                    const bool finalOnly = reductionBlockCount == 1;
+                    if (closedComputeLeaders[0]) {
+                        const FfnMxmDomain3D domain =
+                            makeComputeDomain(computeDomainPairCounts[0]);
                         emitFfnMxmIssue3D(rewriter, ffn.getLoc(), gateCycle,
                             hemisphere * throughput.mxms_per_hemisphere,
                             "compute", weightBuffer, 0,
@@ -647,6 +777,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             finalOnly ? "stream" : "sram", true,
                             dataFormat, finalOnly ? "bf16" : "fp32",
                             domain);
+                    }
+                    if (closedComputeLeaders[1]) {
+                        const FfnMxmDomain3D domain =
+                            makeComputeDomain(computeDomainPairCounts[1]);
                         emitFfnMxmIssue3D(rewriter, ffn.getLoc(), upCycle,
                             hemisphere * throughput.mxms_per_hemisphere
                                 + (singleMxm ? 0 : 1),
@@ -756,33 +890,48 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                 const int64_t writeCycle = sourceComputeCycle
                                     + target.mxm_first_result_latency()
                                     + *transportLatency;
-                                const auto key = std::tuple {hemisphere,
-                                    projection, tempGroup, byte};
-                                const int64_t groupPairBase =
+                                const auto& pageDomains =
+                                    weightPageDomains[
+                                        static_cast<std::size_t>(projection)];
+                                int64_t pagePairBase = pair;
+                                while (pagePairBase > 0
+                                    && pageDomains[static_cast<std::size_t>(
+                                        pagePairBase)] == 0)
+                                    --pagePairBase;
+                                const int64_t pagePairCount =
+                                    pageDomains[static_cast<std::size_t>(
+                                        pagePairBase)];
+                                const int64_t tempGroupPairBase =
                                     tempGroup * pairsPerTempGroup;
+                                const int64_t domainPairBase = std::max(
+                                    pagePairBase, tempGroupPairBase);
+                                const int64_t domainPairEnd = std::min({
+                                    pagePairBase + pagePairCount,
+                                    tempGroupPairBase + pairsPerTempGroup,
+                                    context.projection_timeline.pair_count});
+                                const int64_t pairsInDomain =
+                                    domainPairEnd - domainPairBase;
+                                const auto key = std::tuple {hemisphere,
+                                    projection, domainPairBase, byte};
                                 const bool domainLeader =
-                                    pair == groupPairBase && mTile == 0;
+                                    pair == domainPairBase && mTile == 0;
                                 if (domainLeader) {
-                                    const int64_t pairsInGroup = std::min(
-                                        pairsPerTempGroup,
-                                        context.projection_timeline.pair_count
-                                            - groupPairBase);
                                     FfnLoopDomain3D domain;
                                     domain.wave_count = mTileCount;
                                     domain.wave_interval = context
                                         .projection_timeline
                                         .pipelined_block_interval;
                                     domain.wave_address_stride = tile;
-                                    domain.group_count = pairsInGroup;
+                                    domain.group_count = pairsInDomain;
                                     domain.group_address_stride =
                                         mTileCount * tile;
-                                    if (pairsInGroup > 1) {
+                                    if (pairsInDomain > 1) {
                                         const int64_t reductionBlocks =
                                             k / tile;
                                         const auto& nextFinal = context
                                             .projection_timeline.blocks[
                                                 reductionBlocks
-                                                    * (groupPairBase + 2)
+                                                    * (domainPairBase + 2)
                                                 - 1];
                                         domain.group_interval =
                                             nextFinal.tiles.front()

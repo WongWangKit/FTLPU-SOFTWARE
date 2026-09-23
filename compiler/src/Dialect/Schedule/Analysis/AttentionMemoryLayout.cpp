@@ -7,7 +7,8 @@ namespace ftlpu::compiler::schedule {
 
 AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     const target::LPUTargetModel& target)
-    : target_(target), seqLen_(op.getSeqLen()), hidden_(op.getHidden()),
+    : target_(target), seqLen_(op.getSeqLen()), kvSeqLen_(op.getKvSeqLen()),
+      hidden_(op.getHidden()),
       queryHeads_(op.getQueryHeads()), kvHeads_(op.getKvHeads()),
       headBlocks_(op.getHeadDim() / target.throughput().mxm_rows)
 {
@@ -380,7 +381,7 @@ int64_t AttentionMemoryLayout::scoreAddress(int64_t queryHead,
     const int64_t tokenBlocks =
         seqLen_ / target_.throughput().mxm_rows;
     return scaledScoreBase_
-        + (queryHead * tokenBlocks + queryBlock) * seqLen_ + key;
+        + (queryHead * tokenBlocks + queryBlock) * kvSeqLen_ + key;
 }
 
 int64_t AttentionMemoryLayout::probabilityPackAddress(int64_t queryHead,
@@ -389,16 +390,17 @@ int64_t AttentionMemoryLayout::probabilityPackAddress(int64_t queryHead,
     const int64_t tokenBlocks = seqLen_ / target_.throughput().mxm_rows;
     return probabilityPackBase_
         + (queryHead * tokenBlocks + queryBlock)
-            * (seqLen_ / target_.throughput().lanes_per_tile)
+            * (kvSeqLen_ / target_.throughput().lanes_per_tile)
         + keyBlock;
 }
 
 int64_t AttentionMemoryLayout::probabilityDiagonalAddress(int64_t queryHead,
     int64_t queryBlock, int64_t keyBlock, int64_t diagonal) const
 {
-    const int64_t tokenBlocks = seqLen_ / target_.throughput().mxm_rows;
+    const int64_t queryBlocks = seqLen_ / target_.throughput().mxm_rows;
+    const int64_t keyBlocks = kvSeqLen_ / target_.throughput().mxm_rows;
     return probabilityDiagonalBase_
-        + ((queryHead * tokenBlocks + queryBlock) * tokenBlocks + keyBlock)
+        + ((queryHead * queryBlocks + queryBlock) * keyBlocks + keyBlock)
             * target_.throughput().tile_rows
         + diagonal;
 }

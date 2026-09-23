@@ -12,7 +12,7 @@
 | --- | --- | ---: |
 | MEM | `READ_3D`、`WRITE_3D`、`WRITE_TAP_3D` | 连续 3 个 96-bit word |
 | MEM | `WRITE_READ_2D` | 连续 3 个 96-bit word |
-| MEM | `MEM_WRITE_SYNC` | 连续 2 个 96-bit word |
+| MEM | `MEM_READ_SYNC` / `MEM_WRITE_SYNC` | 连续 2 个 96-bit word |
 | MXM load | `LOAD_3D` | 连续 2 个 128-bit word |
 | MXM dequant | `DEQUANT_3D` | 连续 2 个 128-bit word |
 | MXM compute | `COMPUTE_3D`、`ACCUMULATOR_READ_3D` | 连续 2 个 128-bit word |
@@ -292,10 +292,12 @@ ICU 每周期最多给该 bank 发一条 MEM FU 指令。编译器需静态证�
 固定三 word 的代价是两侧必须具有相同迭代次数、相同地址公式，且每个坐标
 恰好一次写和一次读。独立地址域、多次读取或多种写源不能隐含在本指令中。
 
-### MEM_WRITE_SYNC：2 x 96 bit
+### MEM_READ_SYNC / MEM_WRITE_SYNC：2 x 96 bit
 
 这条指令由上述 3D 指令所在的同一个、每 bank 唯一 MEM ICU 解码。word 0 使用
-extended subtype 6，word 1 是原生 MEM `Write` 模板：
+extended subtype 6，word 1 是原生 MEM `Read` 或 `Write` 模板。原生 opcode
+区分 `MEM_READ_SYNC` 与 `MEM_WRITE_SYNC`，两者使用完全相同的固定两 word
+格式：
 
 | word 0 物理 bit | 字段 |
 | ---: | --- |
@@ -308,10 +310,12 @@ extended subtype 6，word 1 是原生 MEM `Write` 模板：
 | `[91:88]` | Extended subtype 6 |
 | `[95:92]` | 保留，必须为 0 |
 
-激活后，该指令至少占用 MEM ICU 到预留窗口结束。每个匹配的 C2C token 经过编码的
-SR 延迟后产生一次原生 write。数据提前写完时，ICU 仍持有该指令直到窗口末尾；
-数据迟到时，则完成最后一次 write 才退出。后续 read/write 不能越过它，DDR 提前
-完成也不会把后面的静态 MEM 排程提前。
+激活后，该指令至少占用 MEM ICU 到预留窗口结束。`MEM_WRITE_SYNC` 的每个匹配
+C2C RX token 经过编码的 SR 延迟后产生一次原生 write。`MEM_READ_SYNC` 用于
+MEM 到片外 DDR 的 page-out：C2C TX lane 只有在其接收流水线有空位时才发一个
+匹配 token，MEM ICU 每个 token 产生一次原生 read，因此 TX/DMA/DDR 背压会逐级
+传回 MEM，不会一次释放整个 burst。数据提前完成时 ICU 仍持有指令到窗口末尾；
+数据迟到时则完成最后一次 read/write 才退出。后续 MEM 指令不能越过它。
 
 ### MXM load：2 x 128 bit
 

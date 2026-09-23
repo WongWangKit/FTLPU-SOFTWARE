@@ -12,7 +12,9 @@ namespace ftlpu::software::runtime {
 // macro-schedule, and raw FU 3-D/2-D packets remain compact patterns that the
 // viewer expands only for its visible cycle window. A raw 3-D packet emits one
 // row per third-counter coordinate so the CSV schema can retain the first two
-// counters losslessly.
+// counters losslessly. Compiler-authored MEM_WRITE_SYNC occupies its reserved
+// MEM ICU window; an ordinary SYNC is a one-cycle fetch marker because its
+// actual drain time depends on runtime FU completion.
 void write_schedule_trace_csv(
     const BinaryProgram& program, const std::filesystem::path& path);
 void write_schedule_trace_csv(const BinaryProgram& program,

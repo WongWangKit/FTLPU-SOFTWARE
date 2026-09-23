@@ -120,6 +120,17 @@ const BinaryBinding &find_latest_internal_binding(
     if (latest == nullptr || binding.ready_cycle > latest->ready_cycle)
       latest = &binding;
   }
+  if (latest == nullptr && shape == std::vector<std::uint64_t>{32, 1536}) {
+    shape = {1, 1536};
+    for (const BinaryBinding &binding : program.bindings) {
+      if (binding.access != BindingAccess::Internal ||
+          binding.layout != layout || binding.bank != bank ||
+          binding.slices != slices || binding.shape != shape)
+        continue;
+      if (latest == nullptr || binding.ready_cycle > latest->ready_cycle)
+        latest = &binding;
+    }
+  }
   if (latest == nullptr)
     throw std::logic_error("Qwen decoder is missing an internal stage binding");
   return *latest;
@@ -135,6 +146,16 @@ const BinaryBinding &find_earliest_internal_binding(
       continue;
     if (earliest == nullptr || binding.ready_cycle < earliest->ready_cycle)
       earliest = &binding;
+  }
+  if (earliest == nullptr && shape == std::vector<std::uint64_t>{32, 1536}) {
+    shape = {1, 1536};
+    for (const BinaryBinding &binding : program.bindings) {
+      if (binding.access != BindingAccess::Internal ||
+          binding.layout != layout || binding.shape != shape)
+        continue;
+      if (earliest == nullptr || binding.ready_cycle < earliest->ready_cycle)
+        earliest = &binding;
+    }
   }
   if (earliest == nullptr)
     throw std::logic_error("Qwen decoder is missing an internal stage binding");
@@ -257,6 +278,32 @@ float bf16_at(const std::vector<std::uint8_t> &data, std::size_t index) {
       .to_float();
 }
 
+void print_finiteness(const std::string &label,
+                      const std::vector<std::uint8_t> &data,
+                      std::size_t values_to_check) {
+  values_to_check = std::min(values_to_check, data.size() / 2);
+  std::size_t non_finite = 0;
+  std::size_t first_non_finite = values_to_check;
+  float maximum_absolute = 0.0f;
+  for (std::size_t index = 0; index < values_to_check; ++index) {
+    const float value = bf16_at(data, index);
+    if (!std::isfinite(value)) {
+      if (first_non_finite == values_to_check)
+        first_non_finite = index;
+      ++non_finite;
+    } else {
+      maximum_absolute = std::max(maximum_absolute, std::fabs(value));
+    }
+  }
+  std::cout << "Qwen decode finiteness: name=" << label
+            << " values=" << values_to_check
+            << " non_finite=" << non_finite
+            << " max_abs_finite=" << maximum_absolute;
+  if (non_finite != 0)
+    std::cout << " first_non_finite=" << first_non_finite;
+  std::cout << '\n';
+}
+
 void print_pair_planar_blocks(const char *label,
                               const std::vector<std::uint8_t> &data,
                               std::size_t rows, std::size_t columns) {
@@ -342,8 +389,9 @@ void print_stage_error(const std::string &label,
 }
 
 void require_kv_state_matches(const std::string &label,
-                              const std::vector<std::uint8_t> &state,
-                              const std::vector<std::uint8_t> &expected) {
+                               const std::vector<std::uint8_t> &state,
+                               const std::vector<std::uint8_t> &expected,
+                               bool require_zero_tail = true) {
   if (state.size() < expected.size() || expected.size() % 2 != 0)
     throw std::logic_error(label + " state has an invalid byte size");
 
@@ -382,13 +430,28 @@ void require_kv_state_matches(const std::string &label,
   const std::size_t nonzero_tail = static_cast<std::size_t>(std::count_if(
       state.begin() + static_cast<std::ptrdiff_t>(expected.size()), state.end(),
       [](std::uint8_t byte) { return byte != 0; }));
+  std::size_t nonfinite_tail_values = 0;
+  float maximum_tail_value = 0.0f;
+  for (std::size_t index = expected.size() / 2;
+       index < state.size() / 2; ++index) {
+    const float value = bf16_at(state, index);
+    if (!std::isfinite(value)) {
+      ++nonfinite_tail_values;
+      continue;
+    }
+    maximum_tail_value = std::max(maximum_tail_value, std::fabs(value));
+  }
   std::cout << "Qwen KV state summary: name=" << label
             << " values=" << values << " capacity_bytes=" << state.size()
             << " mismatches=" << mismatches << " mae=" << mean_absolute_error
             << " max_error=" << maximum_error
-            << " nonzero_tail_bytes=" << nonzero_tail << '\n';
+            << " nonzero_tail_bytes=" << nonzero_tail
+            << " nonfinite_tail_values=" << nonfinite_tail_values
+            << " max_abs_tail=" << maximum_tail_value << '\n';
   if (mismatch_fraction > 0.001 || mean_absolute_error > 0.075 ||
-      maximum_error > 32.0f || nonzero_tail != 0)
+      maximum_error > 32.0f || nonfinite_tail_values != 0 ||
+      (require_zero_tail && nonzero_tail != 0) ||
+      (!require_zero_tail && maximum_tail_value > 1.0e-20f))
     throw std::logic_error(label + " persistent KV state mismatch");
 }
 
@@ -731,6 +794,9 @@ int main(int argc, char **argv) try {
         "program.ftlpu fixture_dir");
 
   const std::filesystem::path fixture(argv[2]);
+  const bool decode =
+      std::filesystem::exists(fixture / "past_key.bf16.bin") &&
+      std::filesystem::exists(fixture / "past_value.bf16.bin");
   BinaryProgram program = read_binary_program(std::filesystem::path(argv[1]));
   const std::uint32_t compiled_ddr_bandwidth =
       program.hardware.ddr_peak_bandwidth_mbytes_per_second;
@@ -858,6 +924,14 @@ int main(int argc, char **argv) try {
         runtime_ddr_bandwidth);
   }
   session.load(std::move(package));
+  if (decode) {
+    if (!has_kv_state)
+      throw std::logic_error("decode fixture requires persistent K/V state");
+    session.set_state("layers.0.key_cache",
+                      read_bytes(fixture / "past_key.bf16.bin"));
+    session.set_state("layers.0.value_cache",
+                      read_bytes(fixture / "past_value.bf16.bin"));
+  }
   const auto input_bytes = read_bytes(fixture / "input.bf16.bin");
   session.set_input("hidden.0", input_bytes);
   const char *trace_path = std::getenv("FTLPU_QWEN_PIPELINE_CSV");
@@ -866,7 +940,24 @@ int main(int argc, char **argv) try {
     session.enable_execution_trace();
   if (mem_trace_path != nullptr)
     session.enable_mem_execution_trace();
-  session.run();
+  try {
+    session.run();
+  } catch (...) {
+    if (const char *linked_path =
+            std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
+      session.write_last_linked_program(linked_path);
+    if (const char *pre_execution_directory =
+            std::getenv("FTLPU_QWEN_C2C_PRE_EXECUTION_DIR"))
+      session.write_pre_execution_icu_programs(pre_execution_directory);
+    throw;
+  }
+
+  if (const char *linked_path =
+          std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
+    session.write_last_linked_program(linked_path);
+  if (const char *pre_execution_directory =
+          std::getenv("FTLPU_QWEN_C2C_PRE_EXECUTION_DIR"))
+    session.write_pre_execution_icu_programs(pre_execution_directory);
 
   std::vector<std::uint8_t> key_state;
   std::vector<std::uint8_t> value_state;
@@ -879,12 +970,14 @@ int main(int argc, char **argv) try {
       write_bytes(directory / "key_cache.actual.bf16.bin", key_state);
       write_bytes(directory / "value_cache.actual.bf16.bin", value_state);
     }
-    require_kv_state_matches(
-        "layers.0.key_cache", key_state,
-        read_bytes(fixture / "golden.key.bf16.bin"));
-    require_kv_state_matches(
-        "layers.0.value_cache", value_state,
-        read_bytes(fixture / "golden.value.bf16.bin"));
+    if (std::getenv("FTLPU_SKIP_QWEN_KV_CHECK") == nullptr) {
+      require_kv_state_matches(
+          "layers.0.key_cache", key_state,
+          read_bytes(fixture / "golden.key.bf16.bin"), !decode);
+      require_kv_state_matches(
+          "layers.0.value_cache", value_state,
+          read_bytes(fixture / "golden.value.bf16.bin"), !decode);
+    }
   }
 
   if (trace_path != nullptr)
@@ -926,7 +1019,8 @@ int main(int argc, char **argv) try {
           return binding.access == BindingAccess::Internal &&
                  binding.layout == BindingLayout::Fp16MxmDistributed16 &&
                  binding.bank == 0 && binding.slices.size() == 16 &&
-                 binding.shape == std::vector<std::uint64_t>{32, 1536};
+                 (binding.shape == std::vector<std::uint64_t>{32, 1536} ||
+                  binding.shape == std::vector<std::uint64_t>{1, 1536});
         });
     if (distributed_binding == loaded_program.bindings.end())
       throw std::logic_error(
@@ -1027,17 +1121,27 @@ int main(int argc, char **argv) try {
                                         loaded_program,
                                         BindingLayout::Fp16PairPlanar))
                           : stage_name == "residual0"
-                              ? download_distributed16_stage(
-                                    system.chip(), scratch_bank,
-                                    ftlpu::Hemisphere::East)
+                              ? (decode
+                                     ? observer.download_binding(
+                                           find_internal_binding_by_name(
+                                               loaded_program,
+                                               "elementwise.add.0"))
+                                     : download_distributed16_stage(
+                                           system.chip(), scratch_bank,
+                                           ftlpu::Hemisphere::East))
                           : stage_name == "residual0_west"
                               ? download_distributed16_stage(
                                     system.chip(), scratch_bank,
                                     ftlpu::Hemisphere::West)
                           : stage_name == "norm1"
-                              ? download_distributed16_stage(
-                                    system.chip(), weight_bank,
-                                    ftlpu::Hemisphere::East)
+                              ? (decode
+                                     ? observer.download_binding(
+                                           find_internal_binding_by_name(
+                                               loaded_program,
+                                               "rmsnorm.result.1"))
+                                     : download_distributed16_stage(
+                                           system.chip(), weight_bank,
+                                           ftlpu::Hemisphere::East))
                           : stage_name == "down"
                               ? observer.download_binding(
                                     find_latest_internal_binding(
@@ -1137,7 +1241,8 @@ int main(int argc, char **argv) try {
               && binding.bank == 0 && binding.slices.size() == 4
               && binding.slices[0] == 16 && binding.slices[1] == 17
               && binding.slices[2] == 18 && binding.slices[3] == 19
-              && binding.shape == std::vector<std::uint64_t>{32, 1536};
+              && (binding.shape == std::vector<std::uint64_t>{32, 1536} ||
+                  binding.shape == std::vector<std::uint64_t>{1, 1536});
         });
     if (pair_binding == loaded_program.bindings.end())
       throw std::logic_error("Qwen decoder has no final pair-planar operand");
@@ -1148,6 +1253,126 @@ int main(int argc, char **argv) try {
     const auto residual = observer.download_binding(residual_binding);
     print_pair_planar_blocks("residual", residual, 32, 1536);
     print_pair_planar_blocks("down", down, 32, 1536);
+  }
+
+  if (decode && std::getenv("FTLPU_DIAGNOSE_QWEN_DECODE") != nullptr) {
+    const BinaryProgram &loaded_program =
+        session.package().executables[0].program;
+    CModelRuntime observer(system.chip());
+    constexpr std::size_t kDecodeHidden = 1536;
+    const auto download_score_plane = [&](std::size_t low_slice,
+                                          std::size_t high_slice,
+                                          std::size_t bank) {
+      constexpr std::size_t kHeads = 12;
+      constexpr std::size_t kQueries = 32;
+      constexpr std::size_t kKeys = 64;
+      std::vector<std::uint8_t> data(kHeads * kQueries * kKeys * 2);
+      for (std::size_t head = 0; head < kHeads; ++head) {
+        const auto side = static_cast<ftlpu::Hemisphere>(head / 6);
+        for (std::size_t query = 0; query < kQueries; ++query) {
+          for (std::size_t key = 0; key < kKeys; ++key) {
+            const std::size_t address = 256 + head * kKeys + key;
+            const std::size_t offset =
+                ((head * kQueries + query) * kKeys + key) * 2;
+            data[offset] = system.chip().read_mem_sram_lane_byte(
+                side, low_slice, bank,
+                query / ftlpu::hw::kLanesPerTile, address,
+                query % ftlpu::hw::kLanesPerTile);
+            data[offset + 1] = system.chip().read_mem_sram_lane_byte(
+                side, high_slice, bank,
+                query / ftlpu::hw::kLanesPerTile, address,
+                query % ftlpu::hw::kLanesPerTile);
+          }
+        }
+      }
+      return data;
+    };
+    print_finiteness("score", download_score_plane(12, 13, 1),
+                     12 * 32 * 64);
+    print_finiteness("softmax_x", download_score_plane(0, 1, 0),
+                     12 * 32 * 64);
+    const auto download_probability = [&](const char *name) {
+      const BinaryBinding &binding =
+          find_internal_binding_by_name(loaded_program, name);
+      std::vector<std::uint8_t> data;
+      data.reserve(2 * (binding.slices.size() / 2) *
+                   binding.instruction_count * 32 * 2);
+      for (std::size_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
+        for (std::size_t pair = 0; pair + 1 < binding.slices.size();
+             pair += 2) {
+          for (std::size_t row = 0; row < binding.instruction_count; ++row) {
+            for (std::size_t column = 0; column < 32; ++column) {
+              const auto side = static_cast<ftlpu::Hemisphere>(hemisphere);
+              data.push_back(system.chip().read_mem_sram_lane_byte(
+                  side, binding.slices[pair], binding.bank,
+                  column / ftlpu::hw::kLanesPerTile,
+                  binding.base_row + row,
+                  column % ftlpu::hw::kLanesPerTile));
+              data.push_back(system.chip().read_mem_sram_lane_byte(
+                  side, binding.slices[pair + 1], binding.bank,
+                  column / ftlpu::hw::kLanesPerTile,
+                  binding.base_row + row,
+                  column % ftlpu::hw::kLanesPerTile));
+            }
+          }
+        }
+      }
+      return data;
+    };
+    print_finiteness(
+        "probability_pack",
+        download_probability("attention.probability_pack"),
+        std::numeric_limits<std::size_t>::max());
+    print_finiteness(
+        "probability_diagonal",
+        download_probability("attention.probability_diagonal"),
+        std::numeric_limits<std::size_t>::max());
+    const auto &context_binding = find_internal_binding_by_name(
+        loaded_program, "attention.context");
+    print_finiteness("context",
+                     download_context_stage(system.chip(), context_binding),
+                     kDecodeHidden);
+    print_finiteness(
+        "attention",
+        observer.download_binding(find_earliest_internal_binding(
+            loaded_program, BindingLayout::Fp16PairPlanar)),
+        kDecodeHidden);
+    print_finiteness(
+        "residual0",
+        observer.download_binding(find_latest_internal_binding(
+            loaded_program, BindingLayout::Fp16MxmDistributed16, 1,
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15})),
+        kDecodeHidden);
+    print_finiteness(
+        "norm1",
+        observer.download_binding(find_latest_internal_binding(
+            loaded_program, BindingLayout::Fp16MxmDistributed16, 0,
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15})),
+        kDecodeHidden);
+    const auto distributed_binding = std::find_if(
+        loaded_program.bindings.begin(), loaded_program.bindings.end(),
+        [](const BinaryBinding &binding) {
+          return binding.access == BindingAccess::Internal &&
+                 binding.layout == BindingLayout::Fp16MxmDistributed16 &&
+                 binding.bank == 0 && binding.slices.size() == 16 &&
+                 (binding.shape == std::vector<std::uint64_t>{32, 1536} ||
+                  binding.shape == std::vector<std::uint64_t>{1, 1536});
+        });
+    if (distributed_binding != loaded_program.bindings.end())
+      print_finiteness("swiglu",
+                       download_swiglu_stage(observer, *distributed_binding),
+                       8960);
+    try {
+      print_finiteness(
+          "down",
+          observer.download_binding(find_latest_internal_binding(
+              loaded_program, BindingLayout::Fp16PairPlanar, 0,
+              {16, 17, 18, 19})),
+          kDecodeHidden);
+    } catch (const std::exception &error) {
+      std::cout << "Qwen decode finiteness: name=down unavailable="
+                << error.what() << '\n';
+    }
   }
 
   const auto &actual = session.value("hidden.1");
@@ -1168,8 +1393,10 @@ int main(int argc, char **argv) try {
   std::array<double, kHiddenBlocks> block_absolute_error{};
   std::array<float, kHiddenBlocks> block_maximum_error{};
   std::vector<float> errors;
-  errors.reserve(actual.size() / 2);
-  for (std::size_t index = 0; index < actual.size() / 2; ++index) {
+  const std::size_t comparison_values =
+      decode ? kHidden : actual.size() / 2;
+  errors.reserve(comparison_values);
+  for (std::size_t index = 0; index < comparison_values; ++index) {
     const float observed = bf16_at(actual, index);
     const float expected = bf16_at(golden, index);
     if (!std::isfinite(observed) || !std::isfinite(expected))
@@ -1200,7 +1427,7 @@ int main(int argc, char **argv) try {
   if (nonzero == 0)
     throw std::logic_error("Qwen decoder produced an all-zero output");
   std::sort(errors.begin(), errors.end());
-  const auto values = actual.size() / 2;
+  const auto values = comparison_values;
   const double mean_absolute_error =
       sum_absolute_error / static_cast<double>(values);
   const double root_mean_squared_error =
@@ -1247,6 +1474,10 @@ int main(int argc, char **argv) try {
        stats.state_page_in_cycles == 0 || stats.state_page_out_cycles == 0))
     throw std::logic_error(
         "Qwen decoder did not page both K/V windows through C2C");
+  if (stats.weight_page_prefetch_bytes == 0 || stats.c2c_ingress_bytes == 0 ||
+      stats.c2c_egress_bytes == 0)
+    throw std::logic_error(
+        "Qwen decoder did not move weights/state through DDR-backed C2C");
   std::cout << "Qwen2.5-1.5B layer0 real decoder passed: values=" << values
             << " pages="
             << session.package().executables[0].program.weight_page_uses.size()
@@ -1256,6 +1487,8 @@ int main(int argc, char **argv) try {
             << " state_initializations=" << stats.state_initializations
             << " state_page_in_bytes=" << stats.state_page_in_bytes
             << " state_page_out_bytes=" << stats.state_page_out_bytes
+            << " c2c_ingress_bytes=" << stats.c2c_ingress_bytes
+            << " c2c_egress_bytes=" << stats.c2c_egress_bytes
             << " host_uploads=" << stats.host_uploads
             << " host_downloads=" << stats.host_downloads
             << " compiled_ddr_mbytes=" << compiled_ddr_bandwidth

@@ -56,6 +56,7 @@ enum class BindingLayout : std::uint16_t {
     Fp16HeadPlanar = 24,
     Fp16HeadBlockPacked = 25,
     Fp16ProjectionBiasX4 = 26,
+    W8A16Native4Weight = 27,
 };
 
 enum class BindingInitializer : std::uint16_t {

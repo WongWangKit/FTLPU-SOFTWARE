@@ -25,15 +25,38 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t head_dim = graph.query_rope.getHeadDim();
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t block_rows = target.throughput().mxm_block_rows;
-    const int64_t blocks = seq_len / tile;
+    // A one-token decode is one physical query block even though its public
+    // tensor has no padded rows. Schedule uses decode_current_len to mask the
+    // remaining lanes in that block.
+    const int64_t blocks = (seq_len + tile - 1) / tile;
+    int64_t decode_past_len = 0;
+    int64_t decode_current_len = 0;
     int64_t kv_cache_capacity = 0;
-    if (const auto module = op->getParentOfType<mlir::ModuleOp>())
+    if (const auto module = op->getParentOfType<mlir::ModuleOp>()) {
         if (const auto capacity = module->getAttrOfType<mlir::IntegerAttr>(
                 "ftlpu.kv_cache_capacity"))
             kv_cache_capacity = capacity.getInt();
+        if (const auto past = module->getAttrOfType<mlir::IntegerAttr>(
+                "ftlpu.decode_past_len"))
+            decode_past_len = past.getInt();
+        if (const auto current = module->getAttrOfType<mlir::IntegerAttr>(
+                "ftlpu.decode_current_len"))
+            decode_current_len = current.getInt();
+    }
+    const bool decode = decode_current_len != 0;
+    if (decode && (decode_current_len > seq_len
+            || decode_past_len % tile != 0)) {
+        op.emitError(
+            "decode requires current_len no greater than its padded input "
+            "tile and a tile-aligned past_len");
+        return mlir::failure();
+    }
+    const int64_t kv_seq_len = decode
+        ? ((decode_past_len + decode_current_len + tile - 1) / tile) * tile
+        : seq_len;
     const int64_t kv_cache_page_tokens = tile;
     const int64_t kv_cache_resident_tokens =
-        ((seq_len + kv_cache_page_tokens - 1) / kv_cache_page_tokens)
+        ((kv_seq_len + kv_cache_page_tokens - 1) / kv_cache_page_tokens)
         * kv_cache_page_tokens;
     if (kv_cache_capacity != 0
         && kv_cache_capacity < kv_cache_resident_tokens) {
@@ -90,7 +113,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             "cannot select an MXM execution strategy for attention");
         return mlir::failure();
     }
+    // Q/K/V/O still use the proven vector layout while their decode-specific
+    // bias/RoPE/KV postprocess is being moved to the Native4 accumulator
+    // drain.  The FFN path below already exercises the real Native4 ISA.
+    const bool native4 = false;
     const auto attention_weight_rows = [&](int64_t columns) {
+        if (native4)
+            return (columns / 64) * (hidden / 32);
         // W8A16AttentionWeightStriped stores 128 output columns per
         // physical wave: two 32-column groups in each hemisphere.
         const int64_t columns_per_wave = 4 * tile;
@@ -104,11 +133,23 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         ? (weight_bank + 1) % target.memory().banks_per_slice : 0;
     const int64_t secondary_scratch_bank = paged_weights
         ? weight_bank : scratch_bank;
-    const auto weight_slices = paged_weights
-        ? target.page_resident_attention_weight_slices()
-        : target.attention_weight_slices();
-    const auto output_weight_slices = paged_weights
-        ? weight_slices : target.attention_output_weight_slices();
+    llvm::SmallVector<int64_t, 32> weight_slices;
+    if (native4) {
+        for (int64_t slice = 20; slice < 52; ++slice)
+            weight_slices.push_back(slice);
+    } else {
+        const auto selected = paged_weights
+            ? target.page_resident_attention_weight_slices()
+            : target.attention_weight_slices();
+        weight_slices.assign(selected.begin(), selected.end());
+    }
+    llvm::SmallVector<int64_t, 32> output_weight_slices;
+    if (native4 || paged_weights)
+        output_weight_slices = weight_slices;
+    else {
+        const auto selected = target.attention_output_weight_slices();
+        output_weight_slices.assign(selected.begin(), selected.end());
+    }
     const auto planar_activation_slices =
         target.attention_activation_slices();
     const auto activation_slices = planar_activation_slices;
@@ -122,8 +163,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t q_weight_rows = attention_weight_rows(query_width);
     const int64_t k_weight_rows = attention_weight_rows(kv_width);
     const int64_t v_weight_rows = attention_weight_rows(kv_width);
-    const int64_t o_weight_rows = hidden * query_width
-        / (target.memory().hemispheres * target.memory().w8a16_weight_slice_count * tile);
+    const int64_t o_weight_rows = native4
+        ? (hidden / 64) * (query_width / 32)
+        : hidden * query_width
+            / (target.memory().hemispheres
+                * target.memory().w8a16_weight_slice_count * tile);
     const bool requires_weight_tiling = paged_weights
         && target.throughput().mxms_per_hemisphere == 1
         && (std::max({q_weight_rows, k_weight_rows, v_weight_rows,
@@ -169,7 +213,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t query_rows = query_heads * logical_head_banks * blocks
         * target.throughput().tile_rows;
     const int64_t rope_frequency_blocks = head_dim / (2 * tile);
-    const int64_t rope_rows = seq_len * rope_frequency_blocks;
+    const int64_t rope_table_tokens = decode_past_len + seq_len;
+    const int64_t rope_rows = rope_table_tokens * rope_frequency_blocks;
     // The overlapped schedule only retains one four-block projection wave.
     // Serial projection finishes every Q head before RoPE consumes any of
     // them, so each output block needs a distinct staging address.
@@ -183,9 +228,12 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t rope_product_rows =
         (query_heads + kv_heads) * (head_blocks / 2) * 4
         * (compact_rope_products ? seq_len : (seq_len + 1) / 2);
-    const int64_t score_rows = query_heads * blocks * seq_len;
+    const int64_t score_rows = query_heads * blocks * kv_seq_len;
     const int64_t probability_pack_rows = query_heads * blocks
-        * (seq_len / target.throughput().lanes_per_tile);
+        * (kv_seq_len / target.throughput().lanes_per_tile);
+    const int64_t kv_blocks = kv_seq_len / tile;
+    const int64_t probability_diagonal_rows = query_heads * blocks
+        * kv_blocks * target.throughput().tile_rows;
     const int64_t context_rows = query_heads
         * (compact_rope_products ? head_blocks : 1) * seq_len;
     const int64_t output_activation_rows =
@@ -299,10 +347,12 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         }
     }
     const auto weightStorage = target.weight_storage_slices();
-    const bool use_disjoint_q_rope_slices = projection_rope_overlap &&
-        query_bias && tiled_weights && target.uses_dedicated_slice_roles() &&
+    const bool can_use_disjoint_q_rope_slices =
+        query_bias && tiled_weights && compact_rope_products &&
+        target.uses_dedicated_slice_roles() &&
         target.memory().banks_per_slice == 2 && !has_qk_norm &&
-        seq_len == tile && hidden == 1536 && query_heads == 12 &&
+        seq_len > 0 && seq_len <= tile && hidden == 1536 &&
+        query_heads == 12 &&
         kv_heads == 2 && head_dim == 128 && weight_bank == 1 &&
         target.name() == "ftlpu-lpu32" && weightStorage.size() >= 30 &&
         weightStorage[0] == 20 && weightStorage[8] == 28 &&
@@ -314,6 +364,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 .slice_group_begin == 0 &&
         weight_tile_plan->get(tensor::AttentionWeightTileKind::Output)
                 .slice_group_count == 1;
+    const bool use_disjoint_q_rope_slices =
+        projection_rope_overlap && can_use_disjoint_q_rope_slices;
+    const bool split_serial_q_rope_staging =
+        !projection_rope_overlap && can_use_disjoint_q_rope_slices &&
+        head_blocks == 4;
     llvm::SmallVector<int64_t, 16> projection_bias_slices;
     if (has_attention_bias) {
         const auto storage = target.activation_storage_slices();
@@ -323,12 +378,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 "and reserved rows below the context buffer");
             return mlir::failure();
         }
-        // In the Q projection WRITE_READ pipeline the remote RoPE staging
-        // copy uses the scratch bank of activation slices 0..15. Move all
-        // projection-bias constants to bank-0 slices beyond the pages that
-        // runtime may preload before Q. The output page owns slices 20..27;
-        // the preloaded FFN Down page owns a subset of 31..41.
-        if (use_disjoint_q_rope_slices) {
+        // Q's overlapping mirror or serial alternate staging uses bank-0
+        // activation slices. Keep projection-bias reads on free bank-0 weight
+        // slices beyond the pages runtime may preload before Q. The output
+        // page owns slices 20..27; FFN Down uses a subset of 31..41.
+        if (use_disjoint_q_rope_slices || split_serial_q_rope_staging) {
             projection_bias_slices.assign(
                 weightStorage.begin() + 22, weightStorage.begin() + 26);
         } else {
@@ -419,12 +473,26 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         target.attention_rope_staging_slices();
     const llvm::SmallVector<int64_t, 16> rope_staging_slices(
         staging_slice_values.begin(), staging_slice_values.end());
+    llvm::SmallVector<int64_t, 16> alternate_rope_staging_slices(
+        rope_staging_slices.begin(), rope_staging_slices.end());
+    if (split_serial_q_rope_staging) {
+        // The long Q activation READ_3D owns bank-0 slices 8/9 until the
+        // projection ends. Keep the alternate raw output off those ICUs.
+        alternate_rope_staging_slices[8] = weightStorage[8];
+        alternate_rope_staging_slices[9] = weightStorage[9];
+    }
     // Explicit RoPE products alternate banks. Keep the table on the opposite
     // bank from the first product pair so an II=1 phase can read the table and
     // write products without asking one SRAM bank for both operations.
     const int64_t rope_staging_bank =
         target.uses_dedicated_slice_roles()
             ? secondary_scratch_bank : scratch_bank;
+    // A serial Q projection can retain each rotary half on a different
+    // staging bank. Query IW already uses opposite banks for its two halves;
+    // place each raw half opposite its own final Query half. The other half
+    // can still use the same ICU, so this is not a global read/write split.
+    const int64_t alternate_rope_staging_base =
+        rope_staging_mirror_base;
     const int64_t rope_product_bank =
         compact_rope_products && direct_rope_streaming
             ? secondary_scratch_bank : scratch_bank;
@@ -466,12 +534,26 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         ? scratch_bank : rope_table_bank;
     const auto rope_slices = target.attention_rope_slices();
     rope_table_slices.assign(rope_slices.begin(), rope_slices.end());
+    if (split_serial_q_rope_staging) {
+        // Decode Q postprocessing writes the activation-region slices while
+        // consuming RoPE constants.  Keep both constant copies on otherwise
+        // idle bank-0 weight-region ICUs so neither non-preemptible MEM
+        // program has to interleave with a Q write.
+        rope_table_slices.assign(
+            weightStorage.begin() + 26, weightStorage.begin() + 30);
+        rope_table_bank = scratch_bank;
+    }
     if (compact_rope_products) {
-        if (use_disjoint_q_rope_slices) {
-            // Keep the second RoPE table and four busy staging mirrors away
-            // from both pre-execution weight pages and the Q bias streams.
+        if (split_serial_q_rope_staging) {
+            rope_mirror_slices.assign(
+                weightStorage.begin() + 18, weightStorage.begin() + 22);
+            rope_mirror_bank = scratch_bank;
+        } else if (use_disjoint_q_rope_slices)
             rope_mirror_slices.assign(
                 weightStorage.begin() + 26, weightStorage.begin() + 30);
+        if (use_disjoint_q_rope_slices) {
+            // Keep the four busy staging mirrors away from both
+            // pre-execution weight pages and the Q bias streams.
             rope_staging_mirror_slices.assign(
                 rope_staging_slices.begin(), rope_staging_slices.end());
             llvm::SmallVector<int64_t, 4> busyActivationSlices;
@@ -503,7 +585,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                     rope_staging_slices.begin(), it)] =
                     weightStorage[8 + index + (index == 3 ? 1 : 0)];
             }
-        } else {
+        } else if (!split_serial_q_rope_staging) {
             const auto storage = target.activation_storage_slices();
             rope_mirror_slices.assign(storage.begin(), storage.begin() + 4);
         }
@@ -515,6 +597,14 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             rope_staging_rows, 0, 2, true,
             rope_staging_bank}))) {
         op.emitError("failed to reserve the attention RoPE staging FIFO");
+        return mlir::failure();
+    }
+    if (split_serial_q_rope_staging
+        && mlir::failed(physical_allocator.reserve({
+            "rope_staging_alternate", alternate_rope_staging_slices,
+            alternate_rope_staging_base, rope_staging_rows, 0, 2, false,
+            scratch_bank}))) {
+        op.emitError("failed to reserve the alternate Q RoPE staging bank");
         return mlir::failure();
     }
     if (use_disjoint_q_rope_slices &&
@@ -805,6 +895,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     exclude_softmax_input(score1);
     exclude_softmax_input(exp0);
     exclude_softmax_input(exp1);
+    exclude_softmax_input(mask0);
+    exclude_softmax_input(mask1);
     // The pack-to-diagonal transpose pipelines reads and writes across its
     // nominal phase boundary.  Keep those slice sets disjoint as well.
     for (int64_t slice : probability_diagonal_slices)
@@ -995,20 +1087,24 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 input_staging_base, input_staging_rows, "both",
                 input_staging_bank)),
         rewriter.getNamedAttr("query_weight", weight_placement(
-            "w8a16_attention_weight_striped",
+            native4 ? "w8a16_native4_weight"
+                    : "w8a16_attention_weight_striped",
             tensor::AttentionWeightTileKind::Query, 0, q_weight_rows,
             weight_slices, 0)),
         rewriter.getNamedAttr("key_weight", weight_placement(
-            "w8a16_attention_weight_striped",
+            native4 ? "w8a16_native4_weight"
+                    : "w8a16_attention_weight_striped",
             tensor::AttentionWeightTileKind::Key, q_weight_rows,
             k_weight_rows, weight_slices, 0)),
         rewriter.getNamedAttr("value_weight", weight_placement(
-            "w8a16_attention_weight_striped",
+            native4 ? "w8a16_native4_weight"
+                    : "w8a16_attention_weight_striped",
             tensor::AttentionWeightTileKind::Value,
             q_weight_rows + k_weight_rows, v_weight_rows,
             weight_slices, 0)),
         rewriter.getNamedAttr("output_weight", weight_placement(
-            "w8a16_mxm_weight_striped",
+            native4 ? "w8a16_native4_weight"
+                    : "w8a16_mxm_weight_striped",
             tensor::AttentionWeightTileKind::Output, output_weight_base,
             o_weight_rows, output_weight_slices, 1)),
         rewriter.getNamedAttr("query", query_placement),
@@ -1059,15 +1155,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr("probability_pack", make_attention_placement(rewriter,
             "fp16_probability_x16", probability_pack_slices,
             target.attention_probability_pack_base_row(),
-            query_heads * blocks
-                * (seq_len / target.throughput().lanes_per_tile), "both",
+            probability_pack_rows, "both",
             probability_pack_bank)),
         rewriter.getNamedAttr("probability_diagonal", make_attention_placement(rewriter,
             "fp16_probability_diagonal",
             probability_diagonal_slices,
             target.attention_probability_diagonal_base_row(),
-            query_heads * blocks * blocks
-                * target.throughput().tile_rows, "both",
+            probability_diagonal_rows, "both",
             probability_diagonal_bank)),
         rewriter.getNamedAttr("rope", make_attention_placement(rewriter,
             "fp16_rope_table", rope_table_slices,
@@ -1108,6 +1202,15 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 "fp16_pair_planar", input_staging_pong_slices,
                 input_staging_base, input_staging_rows, "both",
                 input_staging_bank));
+        plan = plan_attributes.getDictionary(rewriter.getContext());
+    }
+    if (split_serial_q_rope_staging) {
+        mlir::NamedAttrList plan_attributes(plan);
+        plan_attributes.set("rope_staging_alternate",
+            make_attention_placement(rewriter,
+                "fp16_rope_fifo_x16", alternate_rope_staging_slices,
+                alternate_rope_staging_base, rope_staging_rows, "both",
+                scratch_bank));
         plan = plan_attributes.getDictionary(rewriter.getContext());
     }
     if (use_disjoint_q_rope_slices) {
@@ -1177,6 +1280,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr(
             "seq_len", rewriter.getI64IntegerAttr(seq_len)),
         rewriter.getNamedAttr(
+            "kv_seq_len", rewriter.getI64IntegerAttr(kv_seq_len)),
+        rewriter.getNamedAttr(
+            "position_offset", rewriter.getI64IntegerAttr(decode_past_len)),
+        rewriter.getNamedAttr(
+            "current_len", rewriter.getI64IntegerAttr(
+                decode ? decode_current_len : seq_len)),
+        rewriter.getNamedAttr(
             "hidden", rewriter.getI64IntegerAttr(hidden)),
         rewriter.getNamedAttr(
             "query_heads", graph.query_rope.getHeadsAttr()),
@@ -1232,7 +1342,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             {rows, columns}, elementType);
     };
     const auto scoreType = mlir::RankedTensorType::get(
-        {query_heads, seq_len, seq_len},
+        {query_heads, seq_len, kv_seq_len},
         elementType);
     const auto createProjection =
         [&](mlir::Value input, mlir::Value weight, mlir::Value bias,
@@ -1308,7 +1418,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         graph.query.getLhs(), graph.query.getRhs(), query_bias,
         "query", matrixType(seq_len, query_width),
         subplan({"input", "input_staging", "input_staging_pong",
-            "query_weight", "query", "rope_staging", "rope_product",
+            "query_weight", "query", "rope_staging",
+            "rope_staging_alternate", "rope_product",
             "rope_mirror", "rope_staging_mirror", "query_bias"}));
     auto key = createProjection(
         graph.key.getLhs(), graph.key.getRhs(), key_bias,

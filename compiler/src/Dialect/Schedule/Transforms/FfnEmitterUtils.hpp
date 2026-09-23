@@ -129,7 +129,8 @@ mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
     int64_t inputCycle, int64_t mTile, int64_t pair,
     int64_t sourceHemisphere, int64_t rowCount,
     bool mirroredBroadcast = false,
-    FfnLoopDomain3D outerDomain = {});
+    FfnLoopDomain3D outerDomain = {},
+    bool directParityDomain = false);
 
 MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Location location, stream::RouteOp rawRoute,
@@ -141,6 +142,8 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     int64_t logicalBaseRow = -1,
     mlir::DictionaryAttr bindingPlacement = {},
     FfnLoopDomain3D domain = {},
-    llvm::StringRef weightBufferMode = "fixed");
+    llvm::StringRef weightBufferMode = "fixed",
+    std::optional<FfnLoopDomain3D> mxmControlDomain = std::nullopt,
+    bool emitMxmControl = true);
 
 } // namespace ftlpu::compiler::schedule::ffn_detail

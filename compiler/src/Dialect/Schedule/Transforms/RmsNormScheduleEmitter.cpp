@@ -975,8 +975,10 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
         lpu_16bit_stream_kind(inputType.getElementType());
     const llvm::StringRef dataFormat =
         lpu_16bit_data_format(inputType.getElementType());
-    const int64_t rows = inputType.getDimSize(0);
+    const int64_t logicalRows = inputType.getDimSize(0);
     const int64_t hidden = inputType.getDimSize(1);
+    const int64_t rows = logicalRows == 1
+        ? target.throughput().mxm_rows : logicalRows;
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t lanes = target.throughput().lanes_per_tile;
     const int64_t hiddenBlocks = hidden / tile;
@@ -1037,7 +1039,9 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             int64_t repeatCount = 1, int64_t repeatInterval = 1,
             int64_t addressStride = 0, int64_t waveCount = 1,
             int64_t waveInterval = 1,
-            int64_t waveAddressStride = 0) {
+            int64_t waveAddressStride = 0,
+            int64_t groupCount = 1,
+            int64_t groupInterval = 1) {
         for (int64_t hemisphere = 0;
              hemisphere < target.memory().hemispheres; ++hemisphere) {
             for (int64_t byte = 0; byte < 2; ++byte) {
@@ -1050,7 +1054,8 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                     32 + hemisphere * 16 + stream + byte,
                     repeatCount, repeatInterval, addressStride,
                     waveCount, waveInterval, waveAddressStride,
-                    1, 1, 0, addressBinding, memoryBank);
+                    groupCount, groupInterval, 0,
+                    addressBinding, memoryBank);
             }
         }
     };
@@ -1100,26 +1105,52 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             dataFormat, 0, 1, 2, false, true, true);
 
         const int64_t featuresPerPair = hidden / lanes;
-        for (int64_t pair = 0; pair < lanes; ++pair) {
-            emitMirroredPairRead(inputSlices, pair,
-                packedAddress(inputPlacement, tokenBlock,
-                    0, 0, hiddenBlocks),
-                0, reductionInput + pair, bank(inputPlacement), -1,
-                featuresPerPair, lanes, 1);
-        }
-
         const int64_t scalarAddress = baseRow(inputPlacement)
             + distributedRows + tokenBlock;
         const int64_t sumOutput = reductionInput + hidden + 1;
-        emitMirroredWrite(llvm::ArrayRef<int64_t>(inputSlices).take_front(2),
-            scalarAddress, 0, sumOutput, 2, bank(inputPlacement));
-
         const auto scalarSlices =
             llvm::ArrayRef<int64_t>(inputSlices).take_front(2);
         const int64_t scalarWriteEnd = sumOutput
             + maxWriteLatency(scalarSlices) + 1;
         const int64_t factorInput = scalarWriteEnd
             + maxReadLatency(scalarSlices) + 1;
+        const int64_t normalizeInput = factorInput + 10;
+        // The first input pair also holds the reduction scalar. A later pair
+        // may span both passes only when no other memory role can insert a
+        // command into its physical (hemisphere, slice, bank) ICU queue.
+        const auto canGroupInputPair = [&](int64_t pair) {
+            if (pair == 0 || normalizeInput - reductionInput
+                    <= (featuresPerPair - 1) * lanes)
+                return false;
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const int64_t slice = inputSlices[2 * pair + byte];
+                if (std::count(inputSlices.begin(), inputSlices.end(), slice)
+                        != 1
+                    || (bank(inputPlacement) == bank(weightPlacement)
+                        && std::find(weightSlices.begin(),
+                            weightSlices.end(), slice)
+                            != weightSlices.end())
+                    || (bank(inputPlacement) == bank(outputPlacement)
+                        && std::find(outputSlices.begin(),
+                            outputSlices.end(), slice)
+                            != outputSlices.end()))
+                    return false;
+            }
+            return true;
+        };
+        for (int64_t pair = 0; pair < lanes; ++pair) {
+            emitMirroredPairRead(inputSlices, pair,
+                packedAddress(inputPlacement, tokenBlock,
+                    0, 0, hiddenBlocks),
+                0, reductionInput + pair, bank(inputPlacement), -1,
+                featuresPerPair, lanes, 1, 1, 1, 0,
+                canGroupInputPair(pair) ? 2 : 1,
+                normalizeInput - reductionInput);
+        }
+
+        emitMirroredWrite(llvm::ArrayRef<int64_t>(inputSlices).take_front(2),
+            scalarAddress, 0, sumOutput, 2, bank(inputPlacement));
+
         const int64_t factorConfig = factorInput - 1;
         vxm(factorConfig, 0, "multiply",
             streamKind, 32, 0.0f, "immediate", 0,
@@ -1137,7 +1168,6 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
         emitMirroredPairRead(scalarSlices, 0, scalarAddress, 0,
             factorInput, bank(inputPlacement));
 
-        const int64_t normalizeInput = factorInput + 10;
         const int64_t normalizeConfig = normalizeInput - 1;
         vxm(normalizeConfig, 0, "multiply",
             streamKind, 32, 0.0f, streamKind, 34, 0.0f,
@@ -1159,9 +1189,10 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                 inputPlacement, tokenBlock, 0, 0, hiddenBlocks);
             const int64_t outputAddress = packedAddress(
                 outputPlacement, tokenBlock, 0, 0, hiddenBlocks);
-            emitMirroredPairRead(inputSlices, pair, inputAddress, 0,
-                normalizeInput + pair, bank(inputPlacement), -1,
-                featuresPerPair, lanes, 1);
+            if (!canGroupInputPair(pair))
+                emitMirroredPairRead(inputSlices, pair, inputAddress, 0,
+                    normalizeInput + pair, bank(inputPlacement), -1,
+                    featuresPerPair, lanes, 1);
             if (!broadcastWeight)
                 emitMirroredPairRead(weightSlices, pair,
                     baseRow(weightPlacement), 2,
@@ -1482,8 +1513,14 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
 {
     const auto inputType =
         llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
-    const int64_t rows = inputType.getDimSize(0);
+    const int64_t logicalRows = inputType.getDimSize(0);
     const int64_t hidden = inputType.getDimSize(1);
+    const int64_t rows = logicalRows == 1
+        ? target.throughput().mxm_rows : logicalRows;
+    const auto executionInputType = logicalRows == rows
+        ? inputType
+        : mlir::RankedTensorType::get(
+            {rows, hidden}, inputType.getElementType());
     const auto inputPlacement =
         allocationPlacement(op.getInputAllocations(), 0);
     const auto weightPlacement =
@@ -1532,8 +1569,9 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
             "feedback RMSNorm requires VXM-oriented distributed16 gamma");
     const int64_t weightTransposeEnd = inputTransposeEnd;
     const int64_t feedbackEnd = emitVxmFeedbackRmsNorm(
-        rewriter, op.getLoc(), op.getInput(), op.getWeight(), inputType,
-        op.getEpsilon().convertToDouble(), target, feedbackInput,
+        rewriter, op.getLoc(), op.getInput(), op.getWeight(),
+        executionInputType, op.getEpsilon().convertToDouble(), target,
+        feedbackInput,
         weightPlacement, feedbackOutputPlacement,
         weightTransposeEnd);
     const auto resultKind =

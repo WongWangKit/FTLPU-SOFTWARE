@@ -818,6 +818,83 @@ void write_schedule_trace_csv(const BinaryProgram& program,
         for (std::size_t commandIndex = 0;
              commandIndex < queue.commands.size(); ++commandIndex) {
             const auto& command = queue.commands[commandIndex];
+            if (is_mem_synchronized_raw_packet_header(command)) {
+                if (queue.kind != QueueKind::Mem)
+                    throw std::logic_error(
+                        "synchronized MEM packet is outside a MEM queue");
+                const auto packet = decode_mem_synchronized_icu_packet(
+                    queue, commandIndex);
+                const auto& header = packet[0].lanes;
+                const auto& native = packet[1].lanes;
+                const std::size_t reservation =
+                    (header[2] & 0x00ffffffU) + 1;
+                const std::size_t vectors =
+                    ((header[0] >> 2) & 0xffffU) + 1;
+                const std::size_t tag =
+                    ((header[0] >> 18) | (header[1] << 14)) & 0xffffU;
+                const std::size_t localQueue = queue.index
+                    % InstructionControlUnit::kMemQueuesPerHemisphere;
+                const auto side = queue.index
+                        < InstructionControlUnit::kMemQueuesPerHemisphere
+                    ? "E" : "W";
+                const auto encoded =
+                    (static_cast<isa::EncodedMemInstruction>(native[0])
+                     | (static_cast<isa::EncodedMemInstruction>(native[1])
+                        << 32)) >> 2
+                    | (static_cast<isa::EncodedMemInstruction>(native[2])
+                       << 62);
+                const auto transfer = decode_mem_instruction_for_target(
+                    encoded, program.hardware.sram_depth_rows);
+                const bool readSync = transfer.opcode == MemOpcode::Read;
+                std::ostringstream detail;
+                detail << "opcode="
+                       << (readSync ? "MEM_READ_SYNC" : "MEM_WRITE_SYNC")
+                       << " slice="
+                       << localQueue / hw::kMemBanksPerSlice
+                       << " bank=" << localQueue % hw::kMemBanksPerSlice
+                       << " pc=" << commandIndex
+                       << " sync_tag=" << tag
+                       << " vectors=" << vectors
+                       << " reservation_cycles=" << reservation
+                       << " addr=" << transfer.address
+                       << " stream=" << stream_name(
+                              transfer.stream_id().packed());
+                write_event(output, cursor, cursor + reservation,
+                    {std::string("MEM.") + side
+                         + (readSync ? ".ReadSync" : ".WriteSync"),
+                     detail.str()});
+                cursor += reservation;
+                commandIndex += InstructionControlUnit::MemIcu::
+                    synchronized_packet_word_count - 1;
+                previous = nullptr;
+                history.clear();
+                continue;
+            }
+            if (is_icu_control_raw_word_command(command)) {
+                const auto control = decode_icu_control_raw_word(command);
+                if (control.opcode == IcuControlOpcode::Sync) {
+                    const auto side = queue.kind == QueueKind::Mem
+                        ? (queue.index
+                                < InstructionControlUnit::
+                                    kMemQueuesPerHemisphere ? "E" : "W")
+                        : (queue.index == 0 ? "E" : "W");
+                    const auto resource = queue.kind == QueueKind::Mem
+                        ? std::string("MEM.") + side + ".Sync"
+                        : std::string("C2C.") + side + ".Sync";
+                    std::ostringstream detail;
+                    detail << "opcode=SYNC queue="
+                           << queue_kind_name(queue.kind)
+                           << " index=" << queue.index
+                           << " pc=" << commandIndex
+                           << " actual_wait=runtime_dependent";
+                    write_event(output, cursor, cursor + 1,
+                        {resource, detail.str()});
+                    ++cursor;
+                    previous = nullptr;
+                    history.clear();
+                    continue;
+                }
+            }
             if (queue.kind == QueueKind::C2cDma
                 && command.instruction_kind == InstructionKind::C2cDma) {
                 const auto packet = decode_c2c_dma_icu_packet(
@@ -895,6 +972,10 @@ void write_schedule_trace_csv(const BinaryProgram& program,
                 history.clear();
                 continue;
             }
+            if (queue.kind == QueueKind::Mem
+                && is_mem_synchronized_raw_word_command(command))
+                throw std::logic_error(
+                    "schedule trace found an orphan MEM_WRITE_SYNC word");
             if (is_fu_3d_raw_word_command(command))
                 throw std::logic_error(
                     "runtime trace found an orphan raw FU packet word");

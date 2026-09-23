@@ -58,7 +58,10 @@ MXM 域可以连续运行，每个 MEM ICU 仍然只有一个 live context。
 
 对于其他 projection，每条 O-projection 权重队列只需一条
 `counts=(4,48,24)`、cycle stride 为 `(1,32,1578)` 的 READ；Gate 和 Up 使用
-MEM ICU 的 blocked-outer 地址模式表达交替 weight buffer，不再把每个 pair 拆开。
+每条 O-projection context 队列也直接生成一条 `counts=(32,24,24)` 的 READ，
+结果队列各生成一条 `counts=(32,1,24)` 的 WRITE 或 WRITE_TAP。第三维覆盖
+全部 24 个输出组，周期步长为 1578。Gate 和 Up 使用 MEM ICU 的 blocked-outer
+地址模式表达交替 weight buffer，不再把每个 pair 拆开。
 只有 operand read 与 result write 落在同一物理 MEM 队列时，residual block 才在
 direct lowering 阶段拆域，并由 VXM 流水延迟结果，保证 read 域退出后再执行
 write 域。
@@ -116,6 +119,12 @@ MXM 内部执行流水和动态 C2C 页面传输并不由它控制。分阶段�
 可在 StableHLO 到 Stream 阶段设置一次；后续工具会从 IR 中继承
 `ftlpu.projection_rope_overlap` 属性，也可以再次用命令行显式覆盖。
 
+seq32 串行 Q RoPE 会先把所有 A/B 乘积写入现有的按 head 分配的 product SRAM，
+再统一执行 combine 和 Query-IW 写回。12 个 head、每个 head 两组 rotary pair 的
+源数据读取合成每个物理 staging MEM 队列一条 `READ_3D`（`counts=(4,2,24)`）；
+该读取域执行期间不会插入同队列的结果写入。随后 Query-IW 的结果写回也合成
+每个物理 bank 队列一条 `WRITE_3D`（`counts=(4,2,12)`）。
+
 在 seq32 串行配置下，Q、K、V projection 的激活和权重读取现已直接 lower
 为每个参与的物理 MEM ICU 各一条 `READ_3D`。第三维覆盖全部输出半组：Q 为
 24，K/V 各为 4。V 的跨半球输出搬运也移到完整 V projection 之后，避免打断
@@ -170,9 +179,15 @@ ctest --test-dir build-ftlpu-vs2026-direct -C Release `
 完整 CModel 检查：
 
 ```powershell
-build-ftlpu-vs2026-direct/runtime/compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test.exe `
-  build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/decoder_layer.ftlpu
+tools/run_qwen2_5_decoder_layer_prefill.ps1
 ```
+
+该脚本固定覆盖 `results/qwen2_5_decoder_layer_prefill`，保存本次输入 binary、
+runtime pipeline CSV、runtime 链接后的 binary、测试日志和运行清单；同时把真实
+pre-execution ICU images 保存到 `pre_execution_programs`，并将它们与主程序合并，
+在 `icu_programs` 中按每个物理 ICU 导出一个 CSV。后续重跑继续更新同一目录，
+不创建新的结果目录。默认使用 500 MHz / 25.6 GB/s 的 page-sync 测试程序；可用
+`-Program` 和 `-DdrBandwidthMBps` 显式替换输入配置。
 
 把整个 prefill 的静态 ICU 程序按物理 ICU 拆成独立文件：
 
@@ -210,6 +225,29 @@ linked export 中的 C2C DMA/RX 队列不再为空，MEM 队列包含 14 个重�
 256 条同步指令。7 个启动页在 linked executable 加载前已经到达 SRAM，因此其临时
 传输程序不会出现在该镜像中。测试成功时会写出这个诊断镜像；如果执行在完成链接后
 失败，也会尝试保留该镜像。
+
+如果要在每个物理 ICU 的 CSV 中同时看到预执行权重页的普通 `SYNC`，运行数值测试时
+还需保存各次临时加载的真实 ICU 指令，再合并导出。CSV 的 `phase` 和 `load_id` 用于
+区分临时加载与主程序；每次临时加载的 `pc_word` 从 0 重新开始：
+
+```powershell
+$env:FTLPU_QWEN_C2C_PRE_EXECUTION_DIR = "build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/pre_execution_icu"
+$env:FTLPU_QWEN_C2C_LINKED_BINARY = "build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/decoder_layer.linked.ftlpu"
+build-ftlpu-vs2026-direct/runtime/compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test.exe `
+  build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/decoder_layer.ftlpu
+Remove-Item Env:FTLPU_QWEN_C2C_PRE_EXECUTION_DIR
+Remove-Item Env:FTLPU_QWEN_C2C_LINKED_BINARY
+
+build-ftlpu-vs2026-direct/runtime/ftlpu_icu_program_export.exe `
+  build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/decoder_layer.linked.ftlpu `
+  build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/icu_all_phases `
+  --pre-execution-dir build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/pre_execution_icu
+```
+
+普通 `SYNC` 是 C2C DMA ICU 等待完成通知的控制指令，与 MEM ICU 的
+`MEM_WRITE_SYNC` 不同。只有发生过真实预执行加载，才能在对应的 C2C DMA CSV
+中看到前者。完整 seq32 测试保存 10 次临时加载：7 个启动权重页和 3 次输入上传；
+每次东西两个 C2C DMA ICU 各有一条普通 `SYNC`。
 
 生成 MEM 专用逐周期 CSV：
 

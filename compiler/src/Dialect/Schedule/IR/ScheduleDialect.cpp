@@ -167,6 +167,20 @@ LogicalResult verify_mem_3d_address_domain(Operation* op, int64_t base,
                        << memoryRows << ")";
         else
             diagnostic << " or overflows int64";
+        diagnostic << "; base=" << base
+                   << ", counts=[" << counts[0] << ", " << counts[1]
+                   << ", " << counts[2] << "]"
+                   << ", strides=[" << innerStride << ", " << middleStride
+                   << ", " << affineOuterStride << "]";
+        if (const auto hemisphere =
+                op->getAttrOfType<IntegerAttr>("hemisphere"))
+            diagnostic << ", hemisphere=" << hemisphere.getInt();
+        if (const auto slice = op->getAttrOfType<IntegerAttr>("slice"))
+            diagnostic << ", slice=" << slice.getInt();
+        if (const auto bank = op->getAttrOfType<IntegerAttr>("bank"))
+            diagnostic << ", bank=" << bank.getInt();
+        if (const auto opcode = op->getAttrOfType<StringAttr>("opcode"))
+            diagnostic << ", opcode=" << opcode.getValue();
         return failure();
     }
     return success();
@@ -316,8 +330,15 @@ LogicalResult MemReadOp::verify()
     if (getRole() == "weight") endpoint = target::StreamEndpoint::MxmWeight;
     else if (getRole() == "activation") endpoint = target::StreamEndpoint::MxmActivation;
     else return emitOpError("role must be weight or activation");
-    const auto expected_count = targetModel->route_stream_count(
-        target::StreamEndpoint::Mem, endpoint, target::StreamDirection::East);
+    const bool native4Weight = getRole() == "weight" && kind
+        && kind.getValue() == "w8a16_native4_weight";
+    const auto expected_count = native4Weight
+        ? std::optional<int64_t>(
+              targetModel->streams().streams_per_direction
+              / targetModel->throughput().tile_rows)
+        : targetModel->route_stream_count(
+              target::StreamEndpoint::Mem, endpoint,
+              target::StreamDirection::East);
     auto instruction_count = placement.getAs<IntegerAttr>("instruction_count");
     if (!expected_count || !instruction_count || getStreamCount() != *expected_count
         || getDuration() != instruction_count.getInt())
@@ -809,9 +830,23 @@ LogicalResult MemTransferOp::verify()
     const int64_t waveSpan =
         repeatSpan + (waveCount - 1) * waveInterval;
     if (waveCount > 1 && waveInterval <= repeatSpan)
-        return emitOpError("wave domain overlaps the repeat domain");
+        return emitOpError("wave domain overlaps the repeat domain: repeat_count=")
+            << getRepeatCount() << ", repeat_interval=" << getRepeatInterval()
+            << ", wave_count=" << waveCount
+            << ", wave_interval=" << waveInterval
+            << ", group_count=" << groupCount
+            << ", group_interval=" << groupInterval
+            << ", slice=" << getSlice() << ", bank=" << bank
+            << ", opcode=" << getOpcode();
     if (groupCount > 1 && groupInterval <= waveSpan)
-        return emitOpError("group domain overlaps the wave domain");
+        return emitOpError("group domain overlaps the wave domain: repeat_count=")
+            << getRepeatCount() << ", repeat_interval=" << getRepeatInterval()
+            << ", wave_count=" << waveCount
+            << ", wave_interval=" << waveInterval
+            << ", group_count=" << groupCount
+            << ", group_interval=" << groupInterval
+            << ", slice=" << getSlice() << ", bank=" << bank
+            << ", opcode=" << getOpcode();
     if (failed(verify_mem_3d_address_domain(*this, getAddress(),
             {static_cast<int64_t>(getRepeatCount()), waveCount,
                 groupCount},
@@ -927,9 +962,16 @@ LogicalResult MxmIssueOp::verify()
             << ", weight_column=" << getWeightColumn()
             << ", activation_stream_base=" << getActivationStreamBase()
             << ", output_stream_base=" << getOutputStreamBase();
+    const bool decodeLoad = getOpcode() == "decode_load_activation";
+    const bool decodeCompute = getOpcode() == "decode_stream_compute";
     if (getOpcode() != "iw" && getOpcode() != "compute"
-        && getOpcode() != "accumulator_read")
-        return emitOpError("opcode must be iw, compute, or accumulator_read");
+        && getOpcode() != "accumulator_read" && !decodeLoad
+        && !decodeCompute)
+        return emitOpError("opcode must be iw, compute, accumulator_read, "
+                           "decode_load_activation, or decode_stream_compute");
+    if ((decodeLoad || decodeCompute)
+        && getDecodeLayout().value_or("") != "native4")
+        return emitOpError("decode MXM issue requires decode_layout=native4");
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
     const int64_t waveColumnStride =
@@ -963,11 +1005,11 @@ LogicalResult MxmIssueOp::verify()
     if (!weightColumnBounds || weightColumnBounds->first < 0
         || weightColumnBounds->second >= target.throughput().tile_rows)
         return emitOpError("contains an invalid MXM issue 3-D domain");
-    if (getOpcode() == "iw"
+    if ((getOpcode() == "iw" || decodeLoad)
         && (repeatAccumulatorStride != 0 || waveAccumulatorStride != 0
             || groupAccumulatorStride != 0))
         return emitOpError(
-            "an iw domain cannot induct the MXM accumulator address");
+            "an MXM load domain cannot induct the accumulator address");
     if (getOpcode() != "iw"
         && (repeatColumnStride != 0 || waveColumnStride != 0
             || groupColumnStride != 0))
@@ -1060,6 +1102,9 @@ LogicalResult MxmIssueOp::verify()
         || weightStreamBase + weightStreams
             > target.streams().streams_per_direction)
         return emitOpError("contains an invalid MXM weight stream range");
+    if ((decodeLoad || decodeCompute)
+        && getDataFormat().value_or("bf16") != "bf16")
+        return emitOpError("native4 decode currently requires BF16 data");
     if (getTerminalDimension()
         && (getOpcode() != "compute" || *getTerminalDimension() < 0
             || *getTerminalDimension() > 2))

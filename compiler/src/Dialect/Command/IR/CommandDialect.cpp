@@ -293,9 +293,16 @@ LogicalResult MxmOp::verify()
         || getWeightColumn() < 0 || getWeightColumn() >= target.throughput().tile_rows
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0)
         return emitOpError("contains an invalid ICU MXM queue command field");
+    const bool decodeLoad = getOpcode() == "decode_load_activation";
+    const bool decodeCompute = getOpcode() == "decode_stream_compute";
     if (getOpcode() != "iw" && getOpcode() != "compute"
-        && getOpcode() != "accumulator_read")
-        return emitOpError("opcode must be iw, compute, or accumulator_read");
+        && getOpcode() != "accumulator_read" && !decodeLoad
+        && !decodeCompute)
+        return emitOpError("opcode must be iw, compute, accumulator_read, "
+                           "decode_load_activation, or decode_stream_compute");
+    if ((decodeLoad || decodeCompute)
+        && getDecodeLayout().value_or("") != "native4")
+        return emitOpError("decode MXM command requires decode_layout=native4");
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
     const int64_t waveColumnStride =
@@ -314,9 +321,10 @@ LogicalResult MxmOp::verify()
     if (waveColumnStride != 0 && waveAccumulatorStride != 0)
         return emitOpError(
             "an ICU MXM command wave may induct only one hardware field");
-    if (getOpcode() == "iw" && waveAccumulatorStride != 0)
+    if ((getOpcode() == "iw" || decodeLoad)
+        && waveAccumulatorStride != 0)
         return emitOpError(
-            "an iw wave cannot induct the MXM accumulator address");
+            "an MXM load wave cannot induct the accumulator address");
     if (getOpcode() != "iw" && waveColumnStride != 0)
         return emitOpError(
             "only an iw wave may induct the MXM weight column");
@@ -373,6 +381,9 @@ LogicalResult MxmOp::verify()
         && inputMode != "int8_dequant_bf16")
         return emitOpError(
             "weight_input_mode must be direct16 or int8_dequant_bf16");
+    if ((decodeLoad || decodeCompute)
+        && getDataFormat().value_or("bf16") != "bf16")
+        return emitOpError("native4 decode currently requires BF16 data");
     const int64_t weightStreams = loadMode == "column"
         ? inputMode == "int8_dequant_bf16" ? 1 : 2
         : inputMode == "int8_dequant_bf16"

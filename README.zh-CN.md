@@ -4,6 +4,9 @@
 
 FTLPU 项目的软件栈。
 
+整体职责、跨层接口和验收边界见[软件栈总规范](docs/software_stack_spec.zh-CN.md)，
+可编辑文档见[Word 版](docs/software_stack_spec.zh-CN.docx)。
+
 本仓库用于承载驱动 FTLPU CModel 以及后续硬件目标的编译器、底层 IR、
 二进制格式和 runtime。
 

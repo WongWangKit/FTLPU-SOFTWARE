@@ -12,6 +12,9 @@ struct AttentionStageShape {
     int64_t query_heads;
     int64_t kv_heads;
     int64_t head_dim;
+    // Zero keeps the historical self-attention shape where Q and KV have
+    // the same sequence length. Decode supplies the padded resident KV span.
+    int64_t key_sequence_length = 0;
 };
 
 struct AttentionStageTaskIds {

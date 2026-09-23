@@ -4,6 +4,8 @@
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
+#include <map>
+#include <tuple>
 
 namespace ftlpu::compiler::schedule::ffn_detail {
 
@@ -52,6 +54,19 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         context.result_slices, target, reductionsPerWeightPage);
     if (mlir::failed(timeline)) return mlir::failure();
     int64_t downEnd = timeline->phase_start;
+    struct PendingResultWrite {
+        mlir::Value source;
+        mlir::DictionaryAttr placement;
+        int64_t cycle;
+        int64_t outputWave;
+        int64_t mTile;
+        int64_t hemisphere;
+        int64_t slice;
+        int64_t stream;
+        int64_t address;
+    };
+    std::map<std::tuple<int64_t, int64_t, int64_t>,
+        llvm::SmallVector<PendingResultWrite>> pendingResultWrites;
     const int64_t reductionBlockCount =
         timeline->reduction_block_count;
     const auto sameWeightStorageDomain = [&](int64_t outputWave,
@@ -209,7 +224,9 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         while (cursor < reductionBlockCount) {
             int64_t count = 1;
             int64_t interval = 1;
-            if (cursor + step < reductionBlockCount) {
+            if (cursor + step < reductionBlockCount
+                && sameWeightStorageDomain(
+                    outputWave, cursor, cursor + step)) {
                 interval = timeline->blocks[blockBase + cursor + step]
                     .tiles[mTile]
                     .compute_cycle
@@ -220,6 +237,15 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     const int64_t previousReduction =
                         cursor + (count - 1) * step;
                     const int64_t currentReduction = cursor + count * step;
+                    // The activation stream is consumed by the MXM domain
+                    // for the same dynamic weight page.  Keep its MEM 3-D
+                    // loop inside that page so the linker can place one
+                    // page-ready SYNC before every participating ICU.  A
+                    // hardware ICU cannot stop halfway through an already
+                    // decoded 3-D loop while the next page arrives.
+                    if (!sameWeightStorageDomain(outputWave,
+                            previousReduction, currentReduction))
+                        break;
                     const auto& previous = timeline->blocks[
                         blockBase + previousReduction];
                     const auto& current = timeline->blocks[
@@ -266,6 +292,10 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
             return false;
         for (int64_t reduction = 0; reduction < reductionBlockCount;
              ++reduction) {
+            if (reduction != 0
+                && !sameWeightStorageDomain(
+                    outputWave, reduction - 1, reduction))
+                return false;
             const auto& current = timeline->blocks[blockBase + reduction];
             if (hemisphere >= current.active_hemispheres
                 || current.tiles.size() != 1
@@ -445,6 +475,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     weightDomain.wave_address_stride =
                         logicalSlotsPerHemisphere * weightLoadCycles;
                 }
+                // Down projection keeps its per-window MXM control domains.
                 emitFfnWeightTile(rewriter, ffn.getLoc(),
                     context.down_raw,
                     dequantizedType,
@@ -742,21 +773,89 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             context.result_slices, 0,
                             ffn.getM() * timeline->wave_count, 1,
                             "both", "fp16_pair_planar", resultBank));
-                    auto write = rewriter.create<MemWriteOp>(
-                        ffn.getLoc(),
-                        swish.hidden,
-                        (byte < 2 ? down0ComputeCycle
-                                  : down1ComputeCycle)
-                            + target.mxm_first_result_latency()
-                            + *latency,
-                        tile, streamBase + byte % 2, 1, 0,
-                        rewriter.getStringAttr("west"),
-                        ffn.getResultAddress(),
-                        attributes.getDictionary(rewriter.getContext()),
-                        tile * tile);
-                    (void)write;
+                    const int64_t writeCycle =
+                        (byte < 2 ? down0ComputeCycle : down1ComputeCycle)
+                        + target.mxm_first_result_latency() + *latency;
+                    pendingResultWrites[{hemisphere, slice, resultBank}]
+                        .push_back(PendingResultWrite {
+                            swish.hidden,
+                            attributes.getDictionary(rewriter.getContext()),
+                            writeCycle, outputWave, mTile, hemisphere,
+                            slice, streamBase + byte % 2,
+                            outputWave * m + mTile * tile});
                 }
             }
+        }
+    }
+    // Plan the whole Down output before emitting MEM instructions.  A result
+    // queue that is independent of Down weights/hidden reads and has one
+    // equally spaced tile per output wave needs only one non-preemptible ICU
+    // WRITE_3D.  Keep the original per-tile path for other layouts/timelines.
+    const auto resultSliceIsIndependent = [&](int64_t slice) {
+        const auto contains = [&](llvm::ArrayRef<int64_t> slices) {
+            return std::find(slices.begin(), slices.end(), slice)
+                != slices.end();
+        };
+        if (contains(context.hidden_slices)
+            || contains(context.down_weight_slices))
+            return false;
+        if (auto storage = downPlacement.getAs<mlir::ArrayAttr>(
+                "page_storage_slices")) {
+            for (mlir::Attribute entry : storage)
+                if (llvm::cast<mlir::IntegerAttr>(entry).getInt() == slice)
+                    return false;
+        }
+        return true;
+    };
+    for (auto& [resource, writes] : pendingResultWrites) {
+        std::sort(writes.begin(), writes.end(),
+            [](const PendingResultWrite& lhs,
+               const PendingResultWrite& rhs) {
+                return lhs.cycle < rhs.cycle;
+            });
+        const PendingResultWrite& first = writes.front();
+        const int64_t waveCount = timeline->wave_count;
+        const int64_t cycleStride = writes.size() > 1
+            ? writes[1].cycle - first.cycle : 1;
+        const int64_t addressStride = writes.size() > 1
+            ? writes[1].address - first.address : 0;
+        // Every paged Down output wave is produced after a distinct weight
+        // residency barrier.  One WRITE_3D cannot remain decoded across that
+        // runtime-dependent pause, so keep each wave as its own hardware ICU
+        // instruction.  Resident weights retain the larger closed domain.
+        bool closedDomain = reductionsPerWeightPage <= 0
+            && mTileCount == 1 && waveCount > 1
+            && static_cast<int64_t>(writes.size()) == waveCount
+            && cycleStride >= tile && addressStride == m
+            && resultSliceIsIndependent(first.slice);
+        for (int64_t wave = 0;
+             wave < static_cast<int64_t>(writes.size()) && closedDomain;
+             ++wave) {
+            const auto& write = writes[wave];
+            closedDomain = write.outputWave == wave && write.mTile == 0
+                && write.source == first.source
+                && write.hemisphere == first.hemisphere
+                && write.slice == first.slice
+                && write.stream == first.stream
+                && write.cycle == first.cycle + wave * cycleStride
+                && write.address == first.address + wave * addressStride;
+        }
+        const auto emitWrite = [&](const PendingResultWrite& write) {
+            return rewriter.create<MemWriteOp>(ffn.getLoc(), write.source,
+                write.cycle, tile, write.stream, 1, 0,
+                rewriter.getStringAttr("west"), ffn.getResultAddress(),
+                write.placement, tile * tile);
+        };
+        if (closedDomain) {
+            auto write = emitWrite(first);
+            FfnLoopDomain3D domain;
+            domain.wave_count = waveCount;
+            domain.wave_interval = cycleStride;
+            domain.wave_address_stride = addressStride;
+            setFfnLoopDomain3D(write.getOperation(), rewriter, domain);
+        } else {
+            for (const auto& write : writes)
+                emitWrite(write);
         }
     }
     mlir::OperationState timelineState(

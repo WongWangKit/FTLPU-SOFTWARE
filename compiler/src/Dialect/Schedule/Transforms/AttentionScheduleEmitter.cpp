@@ -225,7 +225,8 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         }
     }
     const auto ropeType = mlir::RankedTensorType::get(
-        {op_.getSeqLen(), op_.getHeadDim() / 2, 2},
+        {op_.getPositionOffset() + op_.getSeqLen(),
+            op_.getHeadDim() / 2, 2},
         llvm::cast<mlir::RankedTensorType>(
             op_.getInput().getType()).getElementType());
     const int64_t constantBindingBase =
@@ -258,7 +259,7 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             }));
     }
     const auto probabilityType = mlir::RankedTensorType::get(
-        {op_.getQueryHeads(), op_.getSeqLen(), op_.getSeqLen()},
+        {op_.getQueryHeads(), op_.getSeqLen(), op_.getKvSeqLen()},
         llvm::cast<mlir::RankedTensorType>(
             op_.getInput().getType()).getElementType());
     const int64_t workspaceBindingBase =
@@ -340,7 +341,7 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
                 target::StreamDirection::East, 0)
             + stagePlan.qk_iw_to_compute_cycles
             + (op_.getHeadDim() / tile - 1)
-                * (op_.getSeqLen() / tile)
+                * (op_.getKvSeqLen() / tile)
                 * target_.mxm_block_issue_interval()
             + target_.mxm_first_result_latency()
         : qkEnd;
@@ -405,7 +406,8 @@ mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
                 static_cast<int64_t>(operation.getHidden()),
                 static_cast<int64_t>(operation.getQueryHeads()),
                 static_cast<int64_t>(operation.getKvHeads()),
-                static_cast<int64_t>(operation.getHeadDim())},
+                static_cast<int64_t>(operation.getHeadDim()),
+                static_cast<int64_t>(operation.getKvSeqLen())},
             target);
         if (mlir::failed(stagePlan.tasks.validate())) {
             operation.emitError("failed to construct the attention task DAG");

@@ -203,6 +203,19 @@ public:
                 }
                 if (feedsFeedbackRmsNorm) {
                     const int64_t bytes = type.getNumElements() * 2;
+                    // distributed16 stores every 32-feature block in four
+                    // consecutive SRAM rows.  A one-token decode tensor
+                    // still occupies the full 32-row physical MXM tile, so
+                    // its address span is hidden / 8 rows rather than the
+                    // logical byte count divided by the 16 slices.  Keep the
+                    // binding extent equal to the physical address span;
+                    // otherwise the memory planner may reuse rows 12..191
+                    // while the decode input remains live for the residual.
+                    const int64_t physicalRows = type.getDimSize(0) == 1
+                        ? target.throughput().mxm_rows
+                        : type.getDimSize(0);
+                    const int64_t physicalRowSpan = physicalRows
+                        * type.getDimSize(1) / 256;
                     const int64_t inputBank =
                         target.uses_dedicated_slice_roles()
                             && weight_bank_ >= 0
@@ -213,7 +226,7 @@ public:
                         PlacementKind::Activation,
                         target.mxm_distributed_activation_slices(),
                         target.uses_dedicated_slice_roles() ? 0 : 4096,
-                        type.getNumElements() / 128, bytes,
+                        physicalRowSpan, bytes,
                         "fp16_mxm_distributed_16", "both", inputBank);
                     if (mlir::failed(planner.bind(argument, allocation))) {
                         function.emitError(

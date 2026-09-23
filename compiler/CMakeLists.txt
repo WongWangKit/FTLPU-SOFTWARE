@@ -401,6 +401,15 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_projection_rope_overlap)
+    add_test(
+        NAME qwen2_5_o_projection_direct_3d_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_o_projection_direct_3d_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_o_projection_direct_3d)
     add_custom_target(
         qwen2_5_1_5b_decoder_layer_pipeline
         COMMAND
@@ -414,6 +423,28 @@ if(Python3_Interpreter_FOUND)
             --kv-cache-capacity 256
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer
         DEPENDS ftlpu_opt ftlpu_compile
+        USES_TERMINAL)
+    add_custom_target(
+        qwen2_5_1_5b_decoder_layer_decode_cmodel_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_5_1_5b_decode_cmodel_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runtime-test $<TARGET_FILE:compiled_qwen_real_decoder_layer_runtime_test>
+            --icu-export $<TARGET_FILE:ftlpu_icu_program_export>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --weight-bank 1
+            --past-len 32
+            --current-len 1
+            --kv-cache-capacity 256
+            --output-dir ${CMAKE_SOURCE_DIR}/results/qwen2_5_decoder_layer_decode
+        DEPENDS
+            ftlpu_opt
+            ftlpu_compile
+            compiled_qwen_real_decoder_layer_runtime_test
+            ftlpu_icu_program_export
         USES_TERMINAL)
     add_custom_target(
         qwen3_0_6b_decoder_layer_prefill_pipeline

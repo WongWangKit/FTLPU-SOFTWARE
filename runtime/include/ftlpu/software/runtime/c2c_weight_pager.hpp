@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <vector>
@@ -81,6 +82,9 @@ struct C2cWeightSegmentIcuProgram {
 
 struct C2cWeightPageIcuProgram {
     std::vector<C2cWeightSegmentIcuProgram> segments{};
+    // The lowering owns these ordinary DMA completion barriers. The loader
+    // must not invent control instructions after the program is built.
+    std::array<bool, hw::kHemispheres> dma_completion_sync{};
     std::uint32_t next_sync_tag{1};
 
     std::size_t physical_word_count() const noexcept
@@ -89,7 +93,9 @@ struct C2cWeightPageIcuProgram {
             * (1
                 + InstructionControlUnit::MemIcu::
                     synchronized_packet_word_count
-                + C2cDmaIcuPacket::kWordCount);
+                + C2cDmaIcuPacket::kWordCount)
+            + std::count(dma_completion_sync.begin(),
+                dma_completion_sync.end(), true);
     }
 };
 
@@ -106,6 +112,11 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
 
 class C2cWeightPager {
 public:
+    struct PageReadyRelease {
+        IcuLocation location{};
+        std::size_t phase_offset{0};
+    };
+
     explicit C2cWeightPager(C2cDmaSystem& system);
 
     void enqueue(const C2cWeightPage& page);
@@ -114,8 +125,14 @@ public:
         BinaryProgram& binary, const C2cWeightPage& page,
         std::size_t start_cycle, std::size_t transfer_end_cycle,
         std::size_t ready_cycle,
-        std::size_t launch_event_tag);
+        std::size_t launch_event_tag,
+        std::size_t page_ready_event_tag = 0);
     void finalize_schedule(BinaryProgram& program);
+    // Apply the scheduled page-ready waits to a parallel compiler image that
+    // already contains compiler-authored MEM_READ/WRITE_SYNC packets.
+    void inject_page_ready_barriers(BinaryProgram& program) const;
+    std::vector<PageReadyRelease> page_ready_releases(
+        std::size_t event_tag) const;
     std::size_t earliest_schedule_cycle(
         const C2cWeightPage& page) const;
     bool started(const C2cWeightPageFence& fence) const;
@@ -128,6 +145,10 @@ public:
     void wait(std::size_t max_cycles);
 
     const C2cWeightPageStats& stats() const noexcept { return stats_; }
+    const BinaryProgram& last_enqueued_program() const noexcept
+    {
+        return last_enqueued_program_;
+    }
 
 private:
     struct MemIdleWindow {
@@ -142,7 +163,19 @@ private:
             EncodedSynchronizedPacket> packets{};
     };
 
+    struct LinkedPageBarrier {
+        std::size_t ready_cycle{0};
+        std::size_t event_tag{0};
+    };
+
+    struct LinkedPageRelease {
+        std::size_t event_tag{0};
+        IcuLocation location{};
+        std::size_t barrier_cycle{0};
+    };
+
     C2cDmaSystem& system_;
+    BinaryProgram last_enqueued_program_{};
     C2cWeightPageStats stats_{};
     std::vector<std::size_t> target_mem_queues_{};
     std::array<std::size_t, hw::kHemispheres> schedule_dma_cursor_{};
@@ -163,6 +196,8 @@ private:
         InstructionControlUnit::kMemQueues> mem_idle_windows_{};
     std::array<std::vector<LinkedMemWindow>,
         InstructionControlUnit::kMemQueues> linked_mem_windows_{};
+    std::vector<LinkedPageBarrier> linked_page_barriers_{};
+    std::vector<LinkedPageRelease> linked_page_releases_{};
     std::uint32_t next_sync_tag_{1};
     std::uint32_t drain_cycles_{0};
     bool schedule_open_{false};

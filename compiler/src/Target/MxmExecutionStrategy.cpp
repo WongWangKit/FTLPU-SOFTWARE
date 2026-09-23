@@ -9,6 +9,7 @@ llvm::StringRef mxm_execution_policy_name(MxmExecutionPolicy policy)
     switch (policy) {
     case MxmExecutionPolicy::Auto: return "auto";
     case MxmExecutionPolicy::Vector: return "vector";
+    case MxmExecutionPolicy::Native4: return "native4";
     case MxmExecutionPolicy::Legacy: return "legacy";
     }
     return "auto";
@@ -19,6 +20,8 @@ mlir::FailureOr<MxmExecutionPolicy> parse_mxm_execution_policy(
 {
     if (value == "auto") return MxmExecutionPolicy::Auto;
     if (value == "vector") return MxmExecutionPolicy::Vector;
+    if (value == "native4" || value == "native4x4")
+        return MxmExecutionPolicy::Native4;
     if (value == "legacy") return MxmExecutionPolicy::Legacy;
     return mlir::failure();
 }
@@ -70,6 +73,27 @@ mlir::FailureOr<MxmExecutionStrategy> plan_mxm_execution_strategy(
     strategy.activation_stream_count =
         throughput.mxm_activation_streams;
 
+    if (policy == MxmExecutionPolicy::Native4) {
+        const bool native4Legal = request.m == 1
+            && request.activation_is_bf16
+            && request.weight_is_i8
+            && request.result_is_16bit_float
+            && request.k % (throughput.tile_rows
+                * throughput.lanes_per_tile) == 0
+            && request.n % (throughput.tile_rows
+                * throughput.lanes_per_tile) == 0
+            && target.supports_mxm_local_dequant();
+        if (!native4Legal) return mlir::failure();
+        strategy.weight_preparation =
+            MxmWeightPreparation::LocalInt8DequantBf16;
+        strategy.weight_stream_count =
+            target.streams().streams_per_direction;
+        strategy.activation_stream_count = 2;
+        strategy.rows_per_compute_issue = 1;
+        strategy.decode_native4 = true;
+        return strategy;
+    }
+
     const bool localDequantLegal =
         target.supports_mxm_local_dequant()
         && request.weight_is_i8
@@ -79,7 +103,6 @@ mlir::FailureOr<MxmExecutionStrategy> plan_mxm_execution_strategy(
         && throughput.mxm_int8_load_streams_per_cycle > 0
         && throughput.mxm_int8_load_streams_per_cycle
             <= target.streams().streams_per_direction;
-    (void)policy;
     if (localDequantLegal) {
         strategy.weight_preparation =
             MxmWeightPreparation::LocalInt8DequantBf16;

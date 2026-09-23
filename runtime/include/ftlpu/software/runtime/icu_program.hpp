@@ -14,6 +14,8 @@
 
 namespace ftlpu::software::runtime {
 
+struct BinaryProgram;
+
 enum class QueueKind : std::uint16_t {
     Mem = 0,
     MxmLoad = 1,
@@ -739,6 +741,12 @@ bool is_mem_synchronized_raw_packet_header(
 InstructionControlUnit::MemIcu::EncodedSynchronizedPacket
 decode_mem_synchronized_icu_packet(
     const QueueProgram& queue, std::size_t command_index);
+// Recover the scheduled MEM idle slots for a direct CModel golden run or a
+// transport-plan check. The executable keeps its compiler-authored packets.
+BinaryProgram without_compiled_mem_write_sync(const BinaryProgram& compiled);
+// Recover compiler-authored KV-cache page-out packets. Runtime links C2C TX
+// and DMA around the extracted MEM_READ_SYNC program after main execution.
+BinaryProgram without_compiled_mem_read_sync(const BinaryProgram& compiled);
 
 // C2C queue records preserve one physical 96-bit local-iMEM word per
 // QueueCommand.  Endpoint packets contain one record and DMA packets contain

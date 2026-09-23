@@ -183,7 +183,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
         (target.memory().hemispheres - 1)
             * target.throughput().lanes_per_tile
         + 3 + weightToIw + 1;
-    const int64_t tokenBlocks = m / tile;
+    const int64_t tokenBlocks = (m + tile - 1) / tile;
     const int64_t reductionBlocks = k / tile;
     const int64_t outputGroups = n / (2 * tile);
     const int64_t localMxm = 0;

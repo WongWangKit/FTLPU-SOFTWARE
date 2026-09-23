@@ -440,6 +440,8 @@ select {
 .c2c-prefetch { background: #d58a35; }
 .mem-read { background: #62a982; }
 .mem-write { background: #e0ae4f; }
+.mem-write-sync { background: #9b71c9; }
+.mem-sync { background: #6f65b5; }
 .sxm { background: #2e9e96; }
 .vxm { background: #dc7855; }
 .mxm-load { background: #78a7d7; }

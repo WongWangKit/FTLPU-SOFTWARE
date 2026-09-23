@@ -46,12 +46,17 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
           .getElementType();
   const llvm::StringRef dataFormat = lpu_16bit_data_format(elementType);
   const int64_t tile = target_.throughput().mxm_rows;
-  const int64_t tokenBlocks = op_.getSeqLen() / tile;
+  const int64_t tokenBlocks = (op_.getSeqLen() + tile - 1) / tile;
+  const int64_t projectionRows = std::min<int64_t>(tile, op_.getSeqLen());
   const int64_t headBlocks = op_.getHeadDim() / tile;
   const int64_t reductionBlocks = op_.getQueryHeads() * op_.getHeadDim() / tile;
   const int64_t outputGroups =
       op_.getHidden() / (tile * target_.memory().hemispheres);
-  const int64_t computeInterval = tile;
+  int64_t projectionIssueInterval =
+      op_.getSeqLen() == 1
+          ? std::max(target_.throughput().mxm0_accumulator_latency,
+                     target_.throughput().mxm1_accumulator_latency)
+          : tile;
   const int64_t localMxm = 0;
   const int64_t weightToIw = target_.throughput().vxm_weight_to_iw_latency;
   const bool localDequant = target_.supports_mxm_local_dequant();
@@ -72,6 +77,21 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
   };
   const int64_t weightLoadLead =
       (target_.memory().hemispheres - 1) * 8 + 3 + loadToIw + 1;
+  if (op_.getSeqLen() == 1) {
+    // With two alternating weight buffers, the next use of a buffer cannot
+    // begin loading until the previous reduction has released it.  Fold that
+    // residency constraint into a uniform reduction cadence.  Besides being
+    // the fastest legal cadence, keeping it affine lets MEM/MXM ICUs express
+    // the whole projection as one closed-form domain instead of interleaving
+    // many long-lived descriptors.
+    const int64_t weightBuffers = target_.throughput().mxm_weight_buffers;
+    const int64_t bufferResidency =
+        weightLoadLead + target_.mxm_result_window_cycles(projectionRows);
+    projectionIssueInterval =
+        std::max(projectionIssueInterval,
+                 (bufferResidency + weightBuffers - 1) / weightBuffers);
+  }
+  const int64_t computeInterval = projectionIssueInterval;
   int64_t contextReadLatency = 0;
   for (int64_t slice : layout.contextSlices())
     contextReadLatency =
@@ -116,7 +136,42 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
             qkvEnd + transferCycles.getInt() + kC2cTransportGuardCycles);
     }
   }
-  int64_t nextOutputWeightDomain = 0;
+  const auto plannedOutputGroupEnd = [&](int64_t finalFirstCompute) {
+    const int64_t resultCycle =
+        finalFirstCompute + target_.mxm_first_result_latency();
+    int64_t finalWriteEnd = finalFirstCompute;
+    for (int64_t hemisphere = 0;
+         hemisphere < target_.memory().hemispheres; ++hemisphere) {
+      for (int64_t byte = 0; byte < 2; ++byte) {
+        const int64_t slice = resultSlices[hemisphere * 2 + byte];
+        const int64_t latency = *target_.transport_latency(
+            target::StreamEndpoint::MxmResult,
+            target::StreamEndpoint::Mem,
+            target::StreamDirection::West, slice);
+        finalWriteEnd = std::max(
+            finalWriteEnd, resultCycle + latency + op_.getSeqLen());
+        if (hemisphere != 0) {
+          const int64_t registerGroup =
+              slice / target_.streams().mem_slices_per_register_group;
+          finalWriteEnd = std::max(
+              finalWriteEnd,
+              resultCycle + target_.streams().system_register_columns +
+                  registerGroup + 1 + op_.getSeqLen());
+        }
+      }
+    }
+    return std::max(finalFirstCompute + tokenBlocks * computeInterval,
+                    finalWriteEnd);
+  };
+  struct OutputGroupPlan {
+    int64_t start;
+    int64_t end;
+    std::vector<int64_t> firstComputeCycles;
+    std::vector<int64_t> dequantStartCycles;
+  };
+  std::vector<OutputGroupPlan> groupPlans;
+  groupPlans.reserve(static_cast<std::size_t>(outputGroups));
+  int64_t plannedPhaseStart = phaseStart;
   for (int64_t outputGroup = 0; outputGroup < outputGroups; ++outputGroup) {
     const auto selectedWeightSlices = layout.outputWeightSlices(outputGroup);
     int64_t maxWeightReadLatency = 0;
@@ -125,11 +180,11 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
           std::max(maxWeightReadLatency, weightReadLatency(slice));
     const int64_t initialReadyLead =
         std::max(maxWeightReadLatency + weightLoadLead, contextReadLatency);
-    std::vector<int64_t> firstComputeCycles(
-        static_cast<std::size_t>(reductionBlocks));
-    std::vector<int64_t> dequantStartCycles(
-        static_cast<std::size_t>(reductionBlocks));
-    int64_t plannedNextCompute = phaseStart + initialReadyLead;
+    OutputGroupPlan plan;
+    plan.start = plannedPhaseStart;
+    plan.firstComputeCycles.resize(static_cast<std::size_t>(reductionBlocks));
+    plan.dequantStartCycles.resize(static_cast<std::size_t>(reductionBlocks));
+    int64_t plannedNextCompute = plannedPhaseStart + initialReadyLead;
     std::vector<int64_t> plannedWeightBufferRelease(
         static_cast<std::size_t>(target_.throughput().mxm_weight_buffers),
         std::numeric_limits<int64_t>::min());
@@ -143,68 +198,190 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
           firstCompute - weightLoadLead,
           plannedWeightBufferRelease[static_cast<std::size_t>(weightBuffer)]);
       firstCompute = std::max(firstCompute, dequantStart + weightLoadLead);
-      firstComputeCycles[static_cast<std::size_t>(reductionBlock)] =
+      plan.firstComputeCycles[static_cast<std::size_t>(reductionBlock)] =
           firstCompute;
-      dequantStartCycles[static_cast<std::size_t>(reductionBlock)] =
+      plan.dequantStartCycles[static_cast<std::size_t>(reductionBlock)] =
           dequantStart;
       const int64_t lastCompute =
           firstCompute + (tokenBlocks - 1) * computeInterval;
       plannedWeightBufferRelease[static_cast<std::size_t>(weightBuffer)] =
-          lastCompute + target_.mxm_result_window_cycles(tile);
+          lastCompute + target_.mxm_result_window_cycles(projectionRows);
       plannedNextCompute = firstCompute + tokenBlocks * computeInterval;
     }
+    plan.end = plannedOutputGroupEnd(plan.firstComputeCycles.back());
+    plannedPhaseStart = plan.end;
+    groupPlans.push_back(std::move(plan));
+  }
 
-    // The output projection has one more affine loop outside the reduction
-    // domain: outputGroup.  Work out the exact distance to the next group
-    // before emitting any MEM operations, so the weight reader can represent
-    // all groups that retain the same physical placement with its third
-    // hardware counter.
-    const auto plannedOutputGroupEnd = [&](int64_t finalFirstCompute) {
-      const int64_t resultCycle =
-          finalFirstCompute + target_.mxm_first_result_latency();
-      int64_t finalWriteEnd = finalFirstCompute;
-      for (int64_t hemisphere = 0;
-           hemisphere < target_.memory().hemispheres; ++hemisphere) {
-        for (int64_t byte = 0; byte < 2; ++byte) {
-          const int64_t slice = resultSlices[hemisphere * 2 + byte];
-          const int64_t latency = *target_.transport_latency(
-              target::StreamEndpoint::MxmResult,
-              target::StreamEndpoint::Mem,
-              target::StreamDirection::West, slice);
-          finalWriteEnd = std::max(
-              finalWriteEnd, resultCycle + latency + op_.getSeqLen());
-          if (hemisphere != 0) {
-            const int64_t registerGroup =
-                slice / target_.streams().mem_slices_per_register_group;
-            finalWriteEnd = std::max(
-                finalWriteEnd,
-                resultCycle + target_.streams().system_register_columns +
-                    registerGroup + 1 + op_.getSeqLen());
-          }
-        }
+  // Prove the output-group recurrence from the operator schedule before
+  // emitting any ICU instruction.  An affine recurrence can occupy the third
+  // MEM counter when the per-group domain uses only row and reduction axes.
+  int64_t outerGroupInterval = 1;
+  bool affineOutputGroups = outputGroups > 1;
+  if (affineOutputGroups) {
+    outerGroupInterval = groupPlans[1].start - groupPlans[0].start;
+    affineOutputGroups = outerGroupInterval > 0;
+    for (int64_t group = 1; affineOutputGroups && group < outputGroups;
+         ++group) {
+      const auto &base = groupPlans[0].firstComputeCycles;
+      const auto &current = groupPlans[static_cast<std::size_t>(group)];
+      if (current.start != groupPlans[0].start +
+                               group * outerGroupInterval)
+        affineOutputGroups = false;
+      for (int64_t reduction = 0;
+           affineOutputGroups && reduction < reductionBlocks; ++reduction)
+        if (current.firstComputeCycles[static_cast<std::size_t>(reduction)] !=
+            base[static_cast<std::size_t>(reduction)] +
+                group * outerGroupInterval)
+          affineOutputGroups = false;
+    }
+  }
+  const auto slicesIntersect = [](llvm::ArrayRef<int64_t> lhs,
+                                  llvm::ArrayRef<int64_t> rhs) {
+    return llvm::any_of(lhs, [&](int64_t slice) {
+      return llvm::is_contained(rhs, slice);
+    });
+  };
+  bool contextConflictsWithWeight = false;
+  bool resultConflictsWithWeight = false;
+  for (int64_t group = 0; group < outputGroups; ++group) {
+    const auto slices = layout.outputWeightSlices(group);
+    contextConflictsWithWeight |=
+        contextBank == layout.outputWeightBank() &&
+        slicesIntersect(slices, layout.contextSlices());
+    resultConflictsWithWeight |=
+        resultBank == layout.outputWeightBank() &&
+        llvm::any_of(resultSlices, [&](int64_t slice) {
+          return llvm::is_contained(slices, slice);
+        });
+  }
+  const bool contextConflictsWithResult =
+      contextBank == resultBank &&
+      llvm::any_of(resultSlices, [&](int64_t slice) {
+        return llvm::is_contained(layout.contextSlices(), slice);
+      });
+  const bool mergeContextOutputGroups =
+      affineOutputGroups && !contextConflictsWithWeight &&
+      !contextConflictsWithResult;
+  bool mergeResultOutputGroups =
+      affineOutputGroups && !resultConflictsWithWeight &&
+      !contextConflictsWithResult && outerGroupInterval >= op_.getSeqLen();
+  const int64_t resultGroupAddressStride =
+      outputGroups > 1 ? layout.resultAddress(1, 0) -
+                             layout.resultAddress(0, 0)
+                       : 0;
+  for (int64_t group = 1; mergeResultOutputGroups && group < outputGroups;
+       ++group)
+    if (layout.resultAddress(group, 0) !=
+        layout.resultAddress(0, 0) + group * resultGroupAddressStride)
+      mergeResultOutputGroups = false;
+
+  // The O MXM has three independent loop coordinates: row/weight byte,
+  // reduction, and output group.  Reindex the per-group reduction domain so
+  // the hardware can keep one LOAD/DEQUANT/COMPUTE descriptor per MXM queue.
+  // In particular, the terminal result belongs to the last reduction of
+  // every output group, not to the last output group of the entire operator.
+  int64_t mxmReductionInterval = 0;
+  bool mergeMxmOutputGroups = localDequant && tokenBlocks == 1 &&
+      target_.throughput().mxm_weight_buffers == 2 &&
+      outputGroups > 1 && reductionBlocks > 1 &&
+      reductionBlocks % 2 == 0 && affineOutputGroups;
+  if (mergeMxmOutputGroups) {
+    const auto &base = groupPlans[0];
+    mxmReductionInterval = base.dequantStartCycles[1] -
+                           base.dequantStartCycles[0];
+    mergeMxmOutputGroups =
+        mxmReductionInterval >= projectionIssueInterval &&
+        base.firstComputeCycles[1] - base.firstComputeCycles[0] ==
+            mxmReductionInterval &&
+        outerGroupInterval >=
+            (reductionBlocks - 1) * mxmReductionInterval +
+                projectionIssueInterval;
+    const auto firstWeightSlices = layout.outputWeightSlices(0);
+    for (int64_t group = 0;
+         mergeMxmOutputGroups && group < outputGroups; ++group) {
+      const auto &plan = groupPlans[static_cast<std::size_t>(group)];
+      mergeMxmOutputGroups &=
+          std::ranges::equal(layout.outputWeightSlices(group),
+                             firstWeightSlices);
+      for (int64_t reduction = 0;
+           mergeMxmOutputGroups && reduction < reductionBlocks; ++reduction) {
+        const int64_t expected = reduction * mxmReductionInterval +
+            group * outerGroupInterval;
+        mergeMxmOutputGroups &=
+            plan.dequantStartCycles[static_cast<std::size_t>(reduction)] ==
+                base.dequantStartCycles[0] + expected &&
+            plan.firstComputeCycles[static_cast<std::size_t>(reduction)] ==
+                base.firstComputeCycles[0] + expected;
       }
-      return std::max(finalFirstCompute + tokenBlocks * computeInterval,
-                      finalWriteEnd);
-    };
-    const int64_t outputGroupEnd = plannedOutputGroupEnd(
-        firstComputeCycles[static_cast<std::size_t>(reductionBlocks - 1)]);
-    const int64_t outputGroupInterval = outputGroupEnd - phaseStart;
+    }
+  }
+  if (mergeMxmOutputGroups) {
+    const auto &base = groupPlans[0];
+    for (int64_t hemisphere = 0;
+         hemisphere < target_.memory().hemispheres; ++hemisphere) {
+      const int64_t loadCycle = base.dequantStartCycles[0] + hemisphere * 8;
+      emitMxmDequant3D(
+          rewriter_, op_.getLoc(), loadCycle, hemisphere,
+          outputWeightScale, 4, 1, reductionBlocks,
+          mxmReductionInterval, outputGroups, outerGroupInterval,
+          functionArgumentIndex(op_.getOutputWeight()));
+
+      MxmDomain3D loadDomain;
+      loadDomain.repeat_count = 4;
+      loadDomain.repeat_interval = 1;
+      loadDomain.repeat_weight_column_stride = -1;
+      loadDomain.wave_count = reductionBlocks;
+      loadDomain.wave_interval = mxmReductionInterval;
+      loadDomain.group_count = outputGroups;
+      loadDomain.group_interval = outerGroupInterval;
+      loadDomain.weight_buffer_mode = "toggle_dim1";
+      emitMxm3D(
+          rewriter_, op_.getLoc(), loadCycle + loadToIw,
+          hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
+          "iw", 0, 3, 0, 0, 0, 1, "stream", true,
+          "supercell", 0, dataFormat, "int8_dequant_bf16",
+          llvm::StringRef{}, loadDomain, weightStreamBase);
+
+      MxmDomain3D computeDomain;
+      computeDomain.repeat_count = projectionRows;
+      computeDomain.repeat_interval = 1;
+      computeDomain.wave_count = reductionBlocks;
+      computeDomain.wave_interval = mxmReductionInterval;
+      computeDomain.group_count = outputGroups;
+      computeDomain.group_interval = outerGroupInterval;
+      computeDomain.weight_buffer_mode = "toggle_dim1";
+      computeDomain.terminal_dimension = 1;
+      computeDomain.terminal_accumulator_destination = "stream";
+      computeDomain.terminal_accumulator_clear = true;
+      computeDomain.terminal_accumulator_output_format = dataFormat;
+      emitMxm3D(
+          rewriter_, op_.getLoc(), base.firstComputeCycles[0],
+          hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
+          "compute", 0, 0, hemisphere * 2, 0,
+          accumulatorAddress(0), 1, "sram", false,
+          "supercell", 0, dataFormat, llvm::StringRef{}, "fp32",
+          computeDomain);
+    }
+  }
+
+  int64_t nextOutputWeightDomain = 0;
+  for (int64_t outputGroup = 0; outputGroup < outputGroups; ++outputGroup) {
+    const auto &plan = groupPlans[static_cast<std::size_t>(outputGroup)];
+    phaseStart = plan.start;
+    const auto selectedWeightSlices = layout.outputWeightSlices(outputGroup);
+    const auto &firstComputeCycles = plan.firstComputeCycles;
+    const auto &dequantStartCycles = plan.dequantStartCycles;
+    const int64_t outputGroupInterval = plan.end - plan.start;
 
     // A long-lived MEM descriptor owns one physical (hemisphere,slice,bank)
     // ICU until its last generated request.  Do not carry a weight-read domain
     // across an output-group boundary when context reads or result writes use
     // that same ICU between two weight waves.
-    const auto slicesIntersect = [](llvm::ArrayRef<int64_t> lhs,
-                                    llvm::ArrayRef<int64_t> rhs) {
-      return llvm::any_of(lhs,
-                          [&](int64_t slice) {
-                            return llvm::is_contained(rhs, slice);
-                          });
-    };
-    const bool contextConflictsWithWeight =
+    const bool localContextConflictsWithWeight =
         contextBank == layout.outputWeightBank() &&
         slicesIntersect(selectedWeightSlices, layout.contextSlices());
-    const bool resultConflictsWithWeight =
+    const bool localResultConflictsWithWeight =
         resultBank == layout.outputWeightBank() &&
         llvm::any_of(resultSlices, [&](int64_t slice) {
           return llvm::is_contained(selectedWeightSlices, slice);
@@ -212,7 +389,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
     const int64_t weightDomainSpan =
         dequantStartCycles.back() - dequantStartCycles.front() + 4;
     const bool mayMergeOutputGroups =
-        !contextConflictsWithWeight && !resultConflictsWithWeight &&
+        !localContextConflictsWithWeight && !localResultConflictsWithWeight &&
         outputGroupInterval >= weightDomainSpan;
     const auto sameWeightSlices = [](llvm::ArrayRef<int64_t> lhs,
                                      llvm::ArrayRef<int64_t> rhs) {
@@ -340,12 +517,20 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
               (groupCount > 1 && groupInterval <= waveSpan))
             return false;
 
+          const bool useOutputGroupCounter =
+              mergeContextOutputGroups && groupCount == 1 &&
+              outerGroupInterval > waveSpan;
+          if (useOutputGroupCounter && outputGroup != 0)
+            return true;
+
           emitMem3D(
               rewriter_, op_.getLoc(), cycle,
               hemisphere * target_.memory().slices_per_hemisphere + slice,
               "read", address, hemisphere * 2 + byte, op_.getSeqLen(), 1, 1,
               "sram", -1, waveCount, waveInterval, waveAddressStride,
-              groupCount, groupInterval, groupAddressStride, contextBank);
+              useOutputGroupCounter ? outputGroups : groupCount,
+              useOutputGroupCounter ? outerGroupInterval : groupInterval,
+              useOutputGroupCounter ? 0 : groupAddressStride, contextBank);
           return true;
         };
     const auto emitContextReadPiece =
@@ -382,7 +567,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
                       latency,
                   hemisphere * target_.memory().slices_per_hemisphere + slice,
                   "read", layout.contextAddress(queryHead, headBlock, 0),
-                  hemisphere * 2 + byte, tile, 1, 1, "sram", -1,
+                  hemisphere * 2 + byte, projectionRows, 1, 1, "sram", -1,
                   tokenBlocks, computeInterval, tile, 1, 1, 0, contextBank);
             }
           }
@@ -483,7 +668,8 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
                 layout.outputWeightBank(), layout.outputWeightPage());
           }
         }
-        if (reductionDomainCount != 0 && localDequant)
+        if (reductionDomainCount != 0 && localDequant &&
+            !mergeMxmOutputGroups)
           emitMxmDequant3D(
               rewriter_, op_.getLoc(), loadCycle, hemisphere,
               outputWeightScale, 4, 1, reductionDomainCount,
@@ -508,8 +694,9 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
             }
           }
         }
-        if (reductionDomainCount != 0 ||
-            target_.throughput().mxm_weight_buffers > 2) {
+        if (!mergeMxmOutputGroups &&
+            (reductionDomainCount != 0 ||
+             target_.throughput().mxm_weight_buffers > 2)) {
           const int64_t loadGroupCount =
               target_.throughput().mxm_weight_buffers > 2
                   ? 1
@@ -538,8 +725,9 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
       int64_t finalWriteEnd = firstCompute;
       for (int64_t hemisphere = 0; hemisphere < target_.memory().hemispheres;
            ++hemisphere) {
-        if (reductionDomainCount != 0 ||
-            target_.throughput().mxm_weight_buffers > 2) {
+        if (!mergeMxmOutputGroups &&
+            (reductionDomainCount != 0 ||
+             target_.throughput().mxm_weight_buffers > 2)) {
           const int64_t computeGroupCount =
               target_.throughput().mxm_weight_buffers > 2
                   ? 1
@@ -548,7 +736,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
               reductionBlock + computeGroupCount == reductionBlocks;
           const bool finalOnly = includesFinal && computeGroupCount == 1;
           MxmDomain3D computeDomain;
-          computeDomain.repeat_count = tile;
+          computeDomain.repeat_count = projectionRows;
           computeDomain.repeat_accumulator_address_stride = 0;
           computeDomain.wave_count = tokenBlocks;
           computeDomain.wave_interval = computeInterval;
@@ -588,13 +776,17 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
               target_.streams().streams_per_direction + byte;
           const int64_t localWriteCycle = resultCycle + latency;
           const bool remoteResult = hemisphere != 0;
-          emitMem3D(
-              rewriter_, op_.getLoc(), localWriteCycle,
-              hemisphere * target_.memory().slices_per_hemisphere + slice,
-              remoteResult ? "write_tap" : "write",
-              layout.resultAddress(outputGroup, 0), packedStream,
-              op_.getSeqLen(), 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0,
-              resultBank);
+          if (!mergeResultOutputGroups || outputGroup == 0)
+            emitMem3D(
+                rewriter_, op_.getLoc(), localWriteCycle,
+                hemisphere * target_.memory().slices_per_hemisphere + slice,
+                remoteResult ? "write_tap" : "write",
+                layout.resultAddress(outputGroup, 0), packedStream,
+                op_.getSeqLen(), 1, 1, "sram", -1, 1, 1, 0,
+                mergeResultOutputGroups ? outputGroups : 1,
+                mergeResultOutputGroups ? outerGroupInterval : 1,
+                mergeResultOutputGroups ? resultGroupAddressStride : 0,
+                resultBank);
           finalWriteEnd =
               std::max(finalWriteEnd, localWriteCycle + op_.getSeqLen());
           if (remoteResult) {
@@ -603,10 +795,15 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
             const int64_t remoteWriteCycle =
                 resultCycle + target_.streams().system_register_columns +
                 group + 1;
-            emitMem3D(rewriter_, op_.getLoc(), remoteWriteCycle, slice,
-                      "write", layout.resultAddress(outputGroup, 0), byte,
-                      op_.getSeqLen(), 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0,
-                      resultBank);
+            if (!mergeResultOutputGroups || outputGroup == 0)
+              emitMem3D(
+                  rewriter_, op_.getLoc(), remoteWriteCycle, slice, "write",
+                  layout.resultAddress(outputGroup, 0), byte,
+                  op_.getSeqLen(), 1, 1, "sram", -1, 1, 1, 0,
+                  mergeResultOutputGroups ? outputGroups : 1,
+                  mergeResultOutputGroups ? outerGroupInterval : 1,
+                  mergeResultOutputGroups ? resultGroupAddressStride : 0,
+                  resultBank);
             finalWriteEnd =
                 std::max(finalWriteEnd, remoteWriteCycle + op_.getSeqLen());
           }

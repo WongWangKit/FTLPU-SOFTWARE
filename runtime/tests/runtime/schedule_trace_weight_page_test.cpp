@@ -631,6 +631,31 @@ try {
                 * synchronizedProgram.hardware.banks_per_slice)
             + " issued=3");
 
+    auto syncTraceProgram = synchronizedProgram;
+    auto& syncTraceQueue = syncTraceProgram.queues.front().commands;
+    syncTraceQueue.insert(syncTraceQueue.end(),
+        rawRead.begin(), rawRead.end());
+    syncTraceQueue.push_back(encode_icu_control_raw_word(
+        ftlpu::IcuControlInstruction::Sync()));
+    const auto syncTracePath = std::filesystem::temp_directory_path()
+        / "ftlpu_schedule_trace_sync_test.csv";
+    write_schedule_trace_csv(syncTraceProgram, syncTracePath);
+    std::ostringstream syncTraceContents;
+    {
+        std::ifstream input(syncTracePath);
+        syncTraceContents << input.rdbuf();
+    }
+    std::filesystem::remove(syncTracePath);
+    require_contains(syncTraceContents.str(),
+        "0,8,\"MEM.E.WriteSync\",\"opcode=MEM_WRITE_SYNC "
+        "slice=0 bank=0 pc=0 sync_tag=17 vectors=3 "
+        "reservation_cycles=8 addr=64 stream=E0\"");
+    require_contains(syncTraceContents.str(),
+        "8,9,\"MEM.E.Read3D\"");
+    require_contains(syncTraceContents.str(),
+        "9,10,\"MEM.E.Sync\",\"opcode=SYNC queue=mem "
+        "index=0 pc=5 actual_wait=runtime_dependent\"");
+
     BinaryProgram rawControlProgram;
     rawControlProgram.queues.push_back(QueueProgram {QueueKind::C2cDma, 0,
         {encode_icu_control_raw_word(

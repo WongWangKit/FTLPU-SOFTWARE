@@ -36,7 +36,7 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     FfnProjectionTimeline result;
     result.weight_load_cycles = tile / throughput.lanes_per_tile;
     result.pipelined_block_interval = target.mxm_block_issue_interval();
-    result.m_tile_count = shape.m / tile;
+    result.m_tile_count = (shape.m + tile - 1) / tile;
     result.projection_slot_interval =
         result.m_tile_count * result.pipelined_block_interval;
     const bool singleMxm = throughput.mxms_per_hemisphere == 1;

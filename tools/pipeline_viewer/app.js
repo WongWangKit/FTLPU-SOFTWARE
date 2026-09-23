@@ -28,6 +28,8 @@ const palette = {
   "C2C.Prefetch": "#d58a35",
   "MEM.Read": "#62a982",
   "MEM.Write": "#e0ae4f",
+  "MEM.WriteSync": "#9b71c9",
+  "MEM.Sync": "#6f65b5",
   "MEM.ReadWrite": "#b78c48",
   "MEM.Gather": "#559b83",
   "MEM.Scatter": "#d0914c",
@@ -398,7 +400,8 @@ function compareTuple(a, b) {
 
 function eventColor(event) {
   const family = resourceFamily(event.resource);
-  if (family === "C2C") return palette["C2C.Prefetch"];
+  if (family === "C2C") return event.resource.endsWith("Sync")
+    ? palette["MEM.Sync"] : palette["C2C.Prefetch"];
   if (family === "MEM") {
     const operation = event.resource.split(".").at(-1);
     return palette[`MEM.${operation}`] || palette.other;

@@ -1,4 +1,5 @@
 #include "ftlpu/software/runtime/icu_program.hpp"
+#include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/imem_capacity.hpp"
 #include "ftlpu/software/runtime/macro_bitstream.hpp"
 
@@ -162,14 +163,23 @@ void validate_mxm_queue_opcode(
     std::size_t mxm,
     const MxmControlInstruction& instruction)
 {
-    if (kind == QueueKind::MxmLoad && instruction.opcode != MxmControlOpcode::IW) {
+    const bool decodeLoad = instruction.opcode == MxmControlOpcode::Decode
+        && instruction.decode_operation
+            == MxmDecodeOperation::LoadActivation;
+    const bool decodeCompute = instruction.opcode == MxmControlOpcode::Decode
+        && instruction.decode_operation
+            == MxmDecodeOperation::StreamCompute;
+    if (kind == QueueKind::MxmLoad
+        && instruction.opcode != MxmControlOpcode::IW && !decodeLoad) {
         throw std::logic_error("MXM load queue only accepts IW instructions");
     }
     if (kind == QueueKind::MxmCompute
         && instruction.opcode != MxmControlOpcode::Compute
-        && instruction.opcode != MxmControlOpcode::AccumulatorRead) {
+        && instruction.opcode != MxmControlOpcode::AccumulatorRead
+        && !decodeCompute) {
         throw std::logic_error(
-            "MXM compute queue only accepts Compute or AccumulatorRead instructions");
+            "MXM compute queue only accepts Compute, AccumulatorRead, or "
+            "DecodeStreamCompute instructions");
     }
     (void)mxm;
 }
@@ -462,14 +472,14 @@ decode_mem_synchronized_icu_packet(
         || !is_mem_synchronized_raw_packet_header(
             queue.commands[commandIndex]))
         throw std::logic_error(
-            "truncated or malformed MEM_WRITE_SYNC raw packet");
+            "truncated or malformed synchronized MEM raw packet");
 
     const auto& continuation = queue.commands[commandIndex + 1];
     if (!is_mem_synchronized_raw_word_command(continuation)
         || isa::decode_icu_command_opcode(continuation.command)
             != isa::IcuCommandOpcode::Instruction)
         throw std::logic_error(
-            "MEM_WRITE_SYNC continuation is not a native MEM word");
+            "synchronized MEM continuation is not a native MEM word");
 
     InstructionControlUnit::MemIcu::EncodedSynchronizedPacket packet {};
     for (std::size_t word = 0; word < kWordCount; ++word) {
@@ -479,10 +489,93 @@ decode_mem_synchronized_icu_packet(
     }
 
     // Reuse the CModel's hardware decoder to validate reserved fields and
-    // that the native template is a MEM Write before returning the packet.
+    // that the native template is a MEM Read or Write before returning it.
     InstructionControlUnit::MemIcu validator;
     validator.push_encoded_synchronized_packet(packet);
     return packet;
+}
+
+namespace {
+
+MemOpcode synchronized_mem_opcode(
+    const InstructionControlUnit::MemIcu::EncodedSynchronizedPacket& packet)
+{
+    const auto& native = packet[1].lanes;
+    const auto encoded =
+        ((static_cast<isa::EncodedMemInstruction>(native[0])
+          | (static_cast<isa::EncodedMemInstruction>(native[1]) << 32))
+            >> 2)
+        | (static_cast<isa::EncodedMemInstruction>(native[2]) << 62);
+    return isa::decode_mem_instruction(encoded).opcode;
+}
+
+BinaryProgram without_compiled_mem_sync(
+    const BinaryProgram& compiled, MemOpcode removedOpcode)
+{
+    BinaryProgram base = compiled;
+    for (auto& queue : base.queues) {
+        if (queue.kind != QueueKind::Mem) continue;
+        const auto original = queue.commands;
+        std::vector<QueueCommand> unlinked;
+        std::vector<std::size_t> oldToNew(original.size(),
+            std::numeric_limits<std::size_t>::max());
+        for (std::size_t index = 0; index < original.size();) {
+            if (is_mem_synchronized_raw_packet_header(original[index])) {
+                QueueProgram source{QueueKind::Mem, queue.index, original};
+                const auto packet = decode_mem_synchronized_icu_packet(
+                    source, index);
+                constexpr auto words = InstructionControlUnit::MemIcu::
+                    synchronized_packet_word_count;
+                if (synchronized_mem_opcode(packet) == removedOpcode) {
+                    const auto reservation =
+                        (original[index].words[2] & 0x00ffffffU) + 1;
+                    oldToNew[index] = unlinked.size();
+                    unlinked.push_back(encode_icu_control_raw_word(
+                        IcuControlInstruction::Nop(reservation)));
+                } else {
+                    for (std::size_t word = 0; word < words; ++word) {
+                        oldToNew[index + word] = unlinked.size();
+                        unlinked.push_back(original[index + word]);
+                    }
+                }
+                index += words;
+            } else {
+                oldToNew[index] = unlinked.size();
+                unlinked.push_back(original[index]);
+                ++index;
+            }
+        }
+        const auto relocate = [&](auto& relocations) {
+            for (auto& relocation : relocations) {
+                if (relocation.queue_kind != QueueKind::Mem
+                    || relocation.queue_index != queue.index)
+                    continue;
+                if (relocation.command_index >= oldToNew.size()
+                    || oldToNew[relocation.command_index]
+                        == std::numeric_limits<std::size_t>::max())
+                    throw std::logic_error(
+                        "compiler synchronized MEM packet contains an invalid relocation");
+                relocation.command_index = static_cast<std::uint32_t>(
+                    oldToNew[relocation.command_index]);
+            }
+        };
+        relocate(base.address_relocations);
+        relocate(base.scale_relocations);
+        queue.commands = std::move(unlinked);
+    }
+    return base;
+}
+
+} // namespace
+
+BinaryProgram without_compiled_mem_write_sync(const BinaryProgram& compiled)
+{
+    return without_compiled_mem_sync(compiled, MemOpcode::Write);
+}
+
+BinaryProgram without_compiled_mem_read_sync(const BinaryProgram& compiled)
+{
+    return without_compiled_mem_sync(compiled, MemOpcode::Read);
 }
 
 bool is_fu_3d_raw_word_command(const QueueCommand& command) noexcept

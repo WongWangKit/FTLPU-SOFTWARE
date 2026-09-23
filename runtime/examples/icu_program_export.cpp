@@ -36,6 +36,8 @@ struct IcuSpec {
 
 struct InstructionRow {
     std::size_t ordinal{0};
+    std::string phase{"execution"};
+    std::optional<std::size_t> load_id{};
     std::size_t pc{0};
     std::size_t words{0};
     std::string opcode{};
@@ -339,7 +341,7 @@ InstructionRow decode_3d(
     return row;
 }
 
-InstructionRow decode_mem_write_sync(
+InstructionRow decode_mem_sync(
     const QueueProgram& queue, std::size_t pc, std::size_t ordinal,
     std::size_t startCycle)
 {
@@ -360,9 +362,11 @@ InstructionRow decode_mem_write_sync(
               ((~strideBits) & kStrideMask) + 1);
     const std::size_t reservationCycles =
         (header[2] & 0x00ffffffU) + 1;
-    const auto encoded = static_cast<ftlpu::isa::EncodedMemInstruction>(
-                             native[0])
-        | (static_cast<ftlpu::isa::EncodedMemInstruction>(native[1]) << 32);
+    const auto encoded =
+        (static_cast<ftlpu::isa::EncodedMemInstruction>(native[0])
+         | (static_cast<ftlpu::isa::EncodedMemInstruction>(native[1]) << 32))
+            >> 2
+        | (static_cast<ftlpu::isa::EncodedMemInstruction>(native[2]) << 62);
     const auto instruction = ftlpu::isa::decode_mem_instruction(encoded);
 
     InstructionRow row;
@@ -370,7 +374,8 @@ InstructionRow decode_mem_write_sync(
     row.pc = pc;
     row.words = ftlpu::InstructionControlUnit::MemIcu::
         synchronized_packet_word_count;
-    row.opcode = "MEM_WRITE_SYNC";
+    row.opcode = instruction.opcode == ftlpu::MemOpcode::Read
+        ? "MEM_READ_SYNC" : "MEM_WRITE_SYNC";
     row.loop.start_cycle = startCycle;
     row.loop.counts = {1, 1, 1};
     row.loop.cycle_strides = {1, 1, 1};
@@ -408,7 +413,7 @@ std::vector<InstructionRow> decode_queue(const QueueProgram& queue)
         const auto& command = queue.commands[pc];
         if (ftlpu::software::runtime::
                 is_mem_synchronized_raw_packet_header(command)) {
-            auto row = decode_mem_write_sync(
+            auto row = decode_mem_sync(
                 queue, pc, rows.size(), cursor);
             cursor += (queue.commands[pc].words[2] & 0x00ffffffU) + 1;
             pc += row.words;
@@ -438,7 +443,35 @@ std::vector<InstructionRow> decode_queue(const QueueProgram& queue)
         row.loop.cycle_strides = {1, 1, 1};
         const auto opcode =
             ftlpu::isa::decode_icu_command_opcode(command.command);
-        if (opcode == ftlpu::isa::IcuCommandOpcode::Nop) {
+        if (ftlpu::software::runtime::
+                is_icu_control_raw_word_command(command)
+            && [] (ftlpu::IcuControlOpcode controlOpcode) {
+                return controlOpcode == ftlpu::IcuControlOpcode::Sync
+                    || controlOpcode == ftlpu::IcuControlOpcode::WaitEvent
+                    || controlOpcode == ftlpu::IcuControlOpcode::Notify;
+            }(ftlpu::software::runtime::
+                    decode_icu_control_raw_word(command).opcode)) {
+            const auto control = ftlpu::software::runtime::
+                decode_icu_control_raw_word(command);
+            if (control.opcode == ftlpu::IcuControlOpcode::Sync)
+                row.opcode = "SYNC";
+            else if (control.opcode
+                == ftlpu::IcuControlOpcode::WaitEvent) {
+                const bool c2cProducer = queue.kind == QueueKind::C2cDma
+                    || queue.kind == QueueKind::C2cRx
+                    || queue.kind == QueueKind::C2cTx;
+                row.opcode = c2cProducer ? "SYNC_LAUNCH" : "SYNC_PAGE";
+            }
+            else
+                row.opcode = "NOTIFY";
+            row.expanded = 0;
+            row.end_cycle = cursor;
+            row.details = "actual_wait=runtime_dependent";
+            if (control.opcode == ftlpu::IcuControlOpcode::WaitEvent)
+                row.details += " event_tag="
+                    + std::to_string(control.event_tag);
+            ++cursor;
+        } else if (opcode == ftlpu::isa::IcuCommandOpcode::Nop) {
             const auto cycles =
                 ftlpu::isa::decode_icu_nop_cycles(command.command);
             row.expanded = 0;
@@ -546,17 +579,39 @@ void write_icu_file(const std::filesystem::path& path,
            << "# queue_index=" << spec.index << '\n'
            << "# physical_location=" << spec.location << '\n'
            << "# coarse_instructions=" << rows.size() << '\n'
+           << "# mem_read_sync="
+           << std::count_if(rows.begin(), rows.end(),
+                  [](const InstructionRow& row) {
+                      return row.opcode == "MEM_READ_SYNC";
+                  }) << '\n'
            << "# mem_write_sync="
            << std::count_if(rows.begin(), rows.end(),
                   [](const InstructionRow& row) {
                       return row.opcode == "MEM_WRITE_SYNC";
                   }) << '\n'
+           << "# sync="
+           << std::count_if(rows.begin(), rows.end(),
+                  [](const InstructionRow& row) {
+                      return row.opcode == "SYNC";
+                  }) << '\n'
+           << "# page_sync="
+           << std::count_if(rows.begin(), rows.end(),
+                  [](const InstructionRow& row) {
+                      return row.opcode == "SYNC_PAGE";
+                  }) << '\n'
+           << "# launch_sync="
+           << std::count_if(rows.begin(), rows.end(),
+                  [](const InstructionRow& row) {
+                      return row.opcode == "SYNC_LAUNCH";
+                  }) << '\n'
            << "# imem_words=" << imemWords << '\n'
-           << "instruction,pc_word,imem_words,opcode,start_cycle,wait_cycle,end_cycle,"
+           << "instruction,phase,load_id,pc_word,imem_words,opcode,start_cycle,wait_cycle,end_cycle,"
               "count0,count1,count2,cycle_stride0,cycle_stride1,"
               "cycle_stride2,expanded_fu_issues,raw_words,details\n";
-    for (const auto& row : rows)
-        output << row.ordinal << ',' << row.pc << ',' << row.words << ','
+    for (const auto& row : rows) {
+        output << row.ordinal << ',' << row.phase << ',';
+        if (row.load_id) output << *row.load_id;
+        output << ',' << row.pc << ',' << row.words << ','
                << row.opcode << ',' << row.loop.start_cycle << ','
                << row.wait_cycle << ','
                << final_cycle(row) << ',' << row.loop.counts[0] << ','
@@ -565,20 +620,50 @@ void write_icu_file(const std::filesystem::path& path,
                << row.loop.cycle_strides[1] << ','
                << row.loop.cycle_strides[2] << ',' << row.expanded << ','
                << csv_field(row.raw) << ',' << csv_field(row.details) << '\n';
+    }
 }
 
 } // namespace
 
 int main(int argc, char** argv)
 try {
-    if (argc != 3)
+    if (argc != 3 && argc != 5)
         throw std::runtime_error(
-            "usage: ftlpu_icu_program_export program.ftlpu output_directory");
+            "usage: ftlpu_icu_program_export program.ftlpu output_directory "
+            "[--pre-execution-dir directory]");
+    if (argc == 5 && std::string_view(argv[3]) != "--pre-execution-dir")
+        throw std::runtime_error("expected --pre-execution-dir");
     const auto input = std::filesystem::absolute(argv[1]).lexically_normal();
     const auto outputDirectory =
         std::filesystem::absolute(argv[2]).lexically_normal();
     const auto program =
         ftlpu::software::runtime::read_binary_program(input);
+    std::vector<ftlpu::software::runtime::BinaryProgram> preExecution;
+    if (argc == 5) {
+        std::vector<std::pair<std::size_t, std::filesystem::path>> files;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(argv[4])) {
+            if (!entry.is_regular_file()) continue;
+            const auto name = entry.path().filename().string();
+            if (!name.starts_with("pre_execution_")
+                || !name.ends_with(".ftlpu")) continue;
+            const auto id = name.substr(14, name.size() - 20);
+            if (id.empty() || !std::all_of(id.begin(), id.end(),
+                    [](char ch) { return ch >= '0' && ch <= '9'; }))
+                throw std::runtime_error(
+                    "invalid pre-execution image name: " + name);
+            files.emplace_back(std::stoull(id), entry.path());
+        }
+        std::ranges::sort(files);
+        for (std::size_t index = 0; index < files.size(); ++index) {
+            if (files[index].first != index)
+                throw std::runtime_error(
+                    "pre-execution image IDs must be contiguous from zero");
+            preExecution.push_back(
+                ftlpu::software::runtime::read_binary_program(
+                    files[index].second));
+        }
+    }
     std::filesystem::create_directories(outputDirectory);
 
     std::map<std::pair<QueueKind, std::size_t>, const QueueProgram*> queues;
@@ -622,22 +707,48 @@ try {
     std::size_t coarse = 0;
     std::size_t imem = 0;
     std::size_t expanded = 0;
+    std::size_t memReadSync = 0;
     std::size_t memWriteSync = 0;
+    std::size_t ordinarySync = 0;
+    std::size_t pageSync = 0;
+    std::size_t launchSync = 0;
     std::map<QueueKind, ExportSummary> resourceSummaries;
     for (const auto& spec : specs) {
         const auto found = queues.find({spec.kind, spec.index});
         std::vector<InstructionRow> rows;
         std::size_t queueWords = 0;
+        for (std::size_t load = 0; load < preExecution.size(); ++load) {
+            for (const auto& queue : preExecution[load].queues) {
+                if (queue.kind != spec.kind || queue.index != spec.index)
+                    continue;
+                auto pageRows = decode_queue(queue);
+                for (auto& row : pageRows) {
+                    row.ordinal = rows.size();
+                    row.phase = "pre_execution";
+                    row.load_id = load;
+                    rows.push_back(std::move(row));
+                }
+                queueWords += queue.commands.size();
+            }
+        }
         if (found != queues.end()) {
-            rows = decode_queue(*found->second);
-            queueWords = found->second->commands.size();
+            auto executionRows = decode_queue(*found->second);
+            for (auto& row : executionRows) {
+                row.ordinal = rows.size();
+                rows.push_back(std::move(row));
+            }
+            queueWords += found->second->commands.size();
         }
         write_icu_file(outputDirectory / spec.filename,
             program, spec, rows, queueWords);
         std::size_t queueExpanded = 0;
         for (const auto& row : rows) {
             queueExpanded += row.expanded;
+            if (row.opcode == "MEM_READ_SYNC") ++memReadSync;
             if (row.opcode == "MEM_WRITE_SYNC") ++memWriteSync;
+            if (row.opcode == "SYNC") ++ordinarySync;
+            if (row.opcode == "SYNC_PAGE") ++pageSync;
+            if (row.opcode == "SYNC_LAUNCH") ++launchSync;
         }
         std::optional<std::size_t> firstCycle;
         std::optional<std::size_t> lastCycle;
@@ -671,24 +782,39 @@ try {
     std::ofstream readme(outputDirectory / "README.txt", std::ios::trunc);
     readme << "Source: " << input.string() << '\n'
            << "Target: " << program.target_name << '\n'
-           << "Qwen2.5 prefill horizon: 0.." << program.max_cycle << '\n'
+           << "Executable prefill horizon: 0.." << program.max_cycle << '\n'
+           << "Pre-execution ICU loads: " << preExecution.size() << '\n'
            << "Physical ICU files: " << specs.size() << '\n'
            << "Active ICU files: " << active << '\n'
            << "ICU coarse instructions: " << coarse << '\n'
+           << "MEM_READ_SYNC instructions: " << memReadSync << '\n'
            << "MEM_WRITE_SYNC instructions: " << memWriteSync << '\n'
-           << "Physical i-MEM words: " << imem << '\n'
+           << "Ordinary SYNC instructions: " << ordinarySync << '\n'
+           << "Page SYNC instructions: " << pageSync << '\n'
+           << "C2C launch SYNC instructions: " << launchSync << '\n'
+           << "Total loaded i-MEM words: " << imem << '\n'
            << "Expanded FU issues: " << expanded << "\n\n"
            << "Each *.icu.csv is one physical ICU program. One data row is "
-              "one coarse ICU instruction; pc_word addresses physical i-MEM "
+              "one coarse ICU instruction; phase and load_id identify "
+              "pre-execution page loads, whose pc_word restarts at zero. "
+              "pc_word addresses physical i-MEM within its load, "
+              "imem_words sums words loaded across phases rather than "
+              "simultaneous i-MEM capacity, "
               "and raw_words preserves every encoded 96/128-bit word. Empty "
               "files represent physical ICUs with no static prefill work. "
-              "start_cycle/end_cycle are reconstructed by replaying the "
-              "preceding NOP durations; work packets encode only relative "
-              "loop offsets.\n\n"
-           << "A compiler .ftlpu image precedes dynamic C2C weight-page "
-              "linking and normally contains no MEM_WRITE_SYNC packets. "
-              "Export the ModelSession linked .ftlpu image to inspect the "
-              "actual MEM ICU queues loaded into CModel.\n\n"
+              "start_cycle/end_cycle replay NOP durations, packet wait_cycle, "
+              "and synchronized MEM reservations. SYNC_PAGE is a tagged "
+              "WAIT_EVENT placed before a dynamic weight-page consumer; "
+              "its event_tag identifies the page-ready broadcast. Ordinary "
+              "SYNC and SYNC_PAGE mark their fetch cycles; their actual wait "
+              "is dynamic. SYNC_LAUNCH is the corresponding tagged wait in "
+              "a C2C producer queue.\n\n"
+           << "Compiler-authored KV-cache MEM_READ_SYNC and executable "
+              "weight-page MEM_WRITE_SYNC packets appear in the MEM ICU "
+              "files. Ordinary SYNC appears "
+              "only when encoded in an ICU queue. Use --pre-execution-dir "
+              "with the ModelSession snapshots to include the standalone "
+              "C2C RX/DMA queues and their ordinary SYNC instructions.\n\n"
            << "C2C ICU programs in this binary:\n";
     for (const auto kind : {
              QueueKind::C2cDma, QueueKind::C2cRx, QueueKind::C2cTx}) {
@@ -709,7 +835,11 @@ try {
               << " files=" << specs.size() << " active=" << active
               << " stale_files_removed=" << staleFilesRemoved
               << " coarse_instructions=" << coarse
+              << " mem_read_sync=" << memReadSync
               << " mem_write_sync=" << memWriteSync
+              << " sync=" << ordinarySync
+              << " page_sync=" << pageSync
+              << " launch_sync=" << launchSync
               << " imem_words=" << imem
               << " expanded_fu_issues=" << expanded << '\n';
     return 0;

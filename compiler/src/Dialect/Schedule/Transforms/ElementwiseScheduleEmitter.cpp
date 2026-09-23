@@ -208,16 +208,23 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
 {
     const auto type =
         llvm::cast<mlir::RankedTensorType>(op.getResult().getType());
-    const int64_t rows = type.getDimSize(0);
+    const int64_t logicalRows = type.getDimSize(0);
     const int64_t columns = type.getDimSize(1);
     const int64_t tile = target.throughput().mxm_rows;
+    // One decode token occupies one SRAM vector.  Its four tile segments are
+    // presented to VXM on four cycles while the SRAM row address stays fixed.
+    // Treating it as a 32-token MXM tile walks into the following column
+    // blocks of pair-planar storage after the first 64 features.
+    const bool singleRowDecode = logicalRows == 1;
+    const int64_t rows = singleRowDecode
+        ? target.throughput().tile_rows : logicalRows;
     const auto streamKind =
         lpu_16bit_stream_kind(type.getElementType());
     const auto dataFormat =
         lpu_16bit_data_format(type.getElementType());
     if (op.getKind() != "add" || type.getRank() != 2
         || !is_lpu_16bit_float(type.getElementType())
-        || rows % tile != 0
+        || (logicalRows != 1 && logicalRows % tile != 0)
         || columns % tile != 0) {
         return op.emitError(
             "elementwise schedule currently supports tile-aligned "
@@ -296,10 +303,12 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
     // block; non-alias MEM queues and the VXM keep the 12-column domain.  The
     // VXM still consumes one element per cycle, and all operand/result
     // addresses use the same pair-major permutation.
-    const bool pairMajorMemOrder = resultDistributed && rows == tile
+    const bool pairMajorMemOrder = resultDistributed
+        && (rows == tile || singleRowDecode)
         && (sharesMemQueue(lhsPlacement, resultPlacement)
             || sharesMemQueue(rhsPlacement, resultPlacement));
-    const bool closedColumnDomain = resultDistributed && rows == tile;
+    const bool closedColumnDomain = resultDistributed
+        && (rows == tile || singleRowDecode);
     // Depth four adds two pass stages after the add.  This lets an aliased
     // READ_3D retire before the corresponding result WRITE_3D begins without
     // presenting input data before the VXM has configured its Bundle.
@@ -318,21 +327,21 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
         const auto blockDuration = [&](int64_t block)
             -> mlir::FailureOr<ResidueDuration> {
             auto probeLhs = tileAddress(
-                lhsPlacement, block, rows, 0, target);
+                lhsPlacement, block, logicalRows, 0, target);
             auto probeRhs = tileAddress(
-                rhsPlacement, block, rows, 0, target);
+                rhsPlacement, block, logicalRows, 0, target);
             if (mlir::failed(probeLhs) || mlir::failed(probeRhs))
                 return mlir::failure();
             const int64_t hemisphere = std::max(
                 probeLhs->hemisphere, probeRhs->hemisphere);
             auto result = tileAddress(
-                resultPlacement, block, rows, hemisphere, target);
+                resultPlacement, block, logicalRows, hemisphere, target);
             if (mlir::failed(result)) return mlir::failure();
 
             const int64_t validOutputHemisphere = 1 - hemisphere;
             const int64_t mirrorOutputHemisphere = hemisphere;
             auto persistent = persistentResultPlacement
-                ? tileAddress(persistentResultPlacement, block, rows,
+                ? tileAddress(persistentResultPlacement, block, logicalRows,
                       validOutputHemisphere, target)
                 : mlir::FailureOr<TileAddress>(mlir::failure());
             if (persistentResultPlacement && mlir::failed(persistent))
@@ -349,15 +358,16 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 return mlir::failure();
 
             int64_t activeWriteEnd = 0;
-            const int64_t tokenBlocks = rows / tile;
+            const int64_t tokenBlocks = singleRowDecode ? 1 : rows / tile;
             const int64_t tileRows = target.throughput().tile_rows;
             const int64_t lanes = target.throughput().lanes_per_tile;
+            const int64_t physicalPairs = singleRowDecode ? 1 : lanes;
             for (int64_t outputHemisphere = 0;
                  outputHemisphere < target.memory().hemispheres;
                  ++outputHemisphere) {
                 const bool preserveValidOutput = persistentOnValidOutput
                     && outputHemisphere == validOutputHemisphere;
-                for (int64_t pair = 0; pair < lanes; ++pair) {
+                for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                     auto output = distributedAddress(resultPlacement,
                         block, pair, columnBlocks, outputHemisphere);
                     if (mlir::failed(output)) return mlir::failure();
@@ -369,7 +379,8 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                             + eastLatency(output->slices[byte]);
                         activeWriteEnd = std::max(activeWriteEnd,
                             writeCycle + (tileRows - 1)
-                                    * (pairMajorMemOrder ? 1 : lanes)
+                                    * (singleRowDecode ? 1
+                                        : (pairMajorMemOrder ? 1 : lanes))
                                 + (tokenBlocks - 1) * tile + 1);
                     }
                 }
@@ -396,7 +407,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             const int64_t bridgeCycle =
                 bridgeStart + maximumReadLatency;
             int64_t bridgeEnd = bridgeCycle;
-            for (int64_t pair = 0; pair < lanes; ++pair) {
+            for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                 auto mirror = distributedAddress(resultPlacement,
                     block, pair, columnBlocks, mirrorOutputHemisphere);
                 if (mlir::failed(mirror)) return mlir::failure();
@@ -404,7 +415,8 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     const int64_t mirrorWriteCycle = bridgeCycle + pair
                         + bridgeWriteLatency(mirror->slices[byte]);
                     bridgeEnd = std::max(bridgeEnd,
-                        mirrorWriteCycle + (tileRows - 1) * lanes
+                        mirrorWriteCycle + (tileRows - 1)
+                                * (singleRowDecode ? 1 : lanes)
                             + (tokenBlocks - 1) * tile + 1);
                 }
             }
@@ -442,9 +454,9 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
         const int64_t bridgeColumnInterval = closedColumnDomain
             ? residueDuration.bridge : 1;
         auto probeLhs = tileAddress(
-            lhsPlacement, block, rows, 0, target);
+            lhsPlacement, block, logicalRows, 0, target);
         auto probeRhs = tileAddress(
-            rhsPlacement, block, rows, 0, target);
+            rhsPlacement, block, logicalRows, 0, target);
         if (mlir::failed(probeLhs) || mlir::failed(probeRhs))
             return op.emitError("unsupported elementwise operand layout")
                 << " during hemisphere probe: lhs="
@@ -453,11 +465,11 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
         const int64_t hemisphere = std::max(
             probeLhs->hemisphere, probeRhs->hemisphere);
         auto lhs = tileAddress(
-            lhsPlacement, block, rows, hemisphere, target);
+            lhsPlacement, block, logicalRows, hemisphere, target);
         auto rhs = tileAddress(
-            rhsPlacement, block, rows, hemisphere, target);
+            rhsPlacement, block, logicalRows, hemisphere, target);
         auto result = tileAddress(
-            resultPlacement, block, rows, hemisphere, target);
+            resultPlacement, block, logicalRows, hemisphere, target);
         if (mlir::failed(lhs) || mlir::failed(rhs)
             || mlir::failed(result))
             return op.emitError("unsupported elementwise operand layout")
@@ -476,8 +488,9 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             const int64_t tileRows = target.throughput().tile_rows;
             const int64_t lanes = target.throughput().lanes_per_tile;
             if (isDistributed16(placement)) {
-                const int64_t tokenBlocks = rows / tile;
-                for (int64_t pair = 0; pair < lanes; ++pair) {
+                const int64_t tokenBlocks = singleRowDecode ? 1 : rows / tile;
+                const int64_t physicalPairs = singleRowDecode ? 1 : lanes;
+                for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                     auto distributed = distributedAddress(placement,
                         block, pair, columnBlocks, sourceHemisphere);
                     if (mlir::failed(distributed)) return false;
@@ -508,7 +521,9 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                             "read", distributed->row,
                             streamBase + byte,
                             tileRows,
-                            pairMajorMemOrder ? 1 : lanes, 1,
+                            singleRowDecode ? 1
+                                : (pairMajorMemOrder ? 1 : lanes),
+                            singleRowDecode ? 0 : 1,
                             tokenBlocks, tile, columnBlocks * tileRows,
                             columnDomainCount, activeColumnInterval,
                             columnAddressStride, distributed->bank,
@@ -520,7 +535,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             int64_t columnAddressStride = 0;
             if (columnDomainCount > 1) {
                 auto next = tileAddress(placement,
-                    block + kColumnBlockResidues, rows,
+                    block + kColumnBlockResidues, logicalRows,
                     sourceHemisphere, target);
                 if (mlir::failed(next)) return false;
                 columnAddressStride = next->row - address.row;
@@ -538,8 +553,9 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                                 * target.memory().slices_per_hemisphere
                             + slice,
                         "read", address.row, streamBase + byte,
-                        tileRows, 1, lanes,
-                        lanes, tileRows, 1,
+                        tileRows, 1,
+                        singleRowDecode ? 0 : lanes,
+                        singleRowDecode ? 1 : lanes, tileRows, 1,
                         columnDomainCount, activeColumnInterval,
                         columnAddressStride,
                         address.bank, splitColumnDomain);
@@ -551,7 +567,8 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                                 * target.memory().slices_per_hemisphere
                             + slice,
                         "read", address.row, streamBase + byte,
-                        rows, 1, 1, 1, 1, 0,
+                        rows, 1, singleRowDecode ? 0 : 1,
+                        1, 1, 0,
                         columnDomainCount, activeColumnInterval,
                         columnAddressStride,
                         address.bank, splitColumnDomain);
@@ -680,7 +697,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             const int64_t validOutputHemisphere = 1 - hemisphere;
             const int64_t mirrorOutputHemisphere = hemisphere;
             auto persistent = persistentResultPlacement
-                ? tileAddress(persistentResultPlacement, block, rows,
+                ? tileAddress(persistentResultPlacement, block, logicalRows,
                       validOutputHemisphere, target)
                 : mlir::FailureOr<TileAddress>(mlir::failure());
             if (persistentResultPlacement && mlir::failed(persistent))
@@ -701,7 +718,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             int64_t persistentColumnAddressStride = 0;
             if (persistentResultPlacement && columnDomainCount > 1) {
                 auto nextPersistent = tileAddress(persistentResultPlacement,
-                    block + kColumnBlockResidues, rows,
+                    block + kColumnBlockResidues, logicalRows,
                     validOutputHemisphere, target);
                 if (mlir::failed(nextPersistent))
                     return op.emitError(
@@ -710,9 +727,10 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     nextPersistent->row - persistent->row;
             }
             int64_t activeWriteEnd = vxmCycle;
-            const int64_t tokenBlocks = rows / tile;
+            const int64_t tokenBlocks = singleRowDecode ? 1 : rows / tile;
             const int64_t tileRows = target.throughput().tile_rows;
             const int64_t lanes = target.throughput().lanes_per_tile;
+            const int64_t physicalPairs = singleRowDecode ? 1 : lanes;
             for (int64_t outputHemisphere = 0;
                  outputHemisphere < target.memory().hemispheres;
                  ++outputHemisphere) {
@@ -724,7 +742,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 const bool preserveValidOutput =
                     persistentOnValidOutput
                     && outputHemisphere == validOutputHemisphere;
-                for (int64_t pair = 0; pair < lanes; ++pair) {
+                for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                     auto output = distributedAddress(resultPlacement,
                         block, pair, columnBlocks, outputHemisphere);
                     if (mlir::failed(output))
@@ -764,14 +782,17 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                             output->row,
                             streamBase + byte,
                             tileRows,
-                            pairMajorMemOrder ? 1 : lanes, 1,
+                            singleRowDecode ? 1
+                                : (pairMajorMemOrder ? 1 : lanes),
+                            singleRowDecode ? 0 : 1,
                             tokenBlocks, tile, columnBlocks * tileRows,
                             columnDomainCount, activeColumnInterval,
                             outputColumnAddressStride, output->bank,
                             splitColumnDomain);
                         activeWriteEnd = std::max(activeWriteEnd,
                             writeCycle + (tileRows - 1)
-                                    * (pairMajorMemOrder ? 1 : lanes)
+                                    * (singleRowDecode ? 1
+                                        : (pairMajorMemOrder ? 1 : lanes))
                                 + (tokenBlocks - 1) * tile + 1);
                     }
                 }
@@ -795,8 +816,10 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                             "write", persistent->row,
                             streamBase + byte,
                             pairMajorMemOrder ? tileRows : rows,
-                            1, pairMajorMemOrder ? lanes : 1,
-                            pairMajorMemOrder ? lanes : 1,
+                            1, singleRowDecode ? 0
+                                    : (pairMajorMemOrder ? lanes : 1),
+                            pairMajorMemOrder
+                                ? (singleRowDecode ? 1 : lanes) : 1,
                             pairMajorMemOrder ? tileRows : 1,
                             pairMajorMemOrder ? 1 : 0,
                             columnDomainCount, activeColumnInterval,
@@ -829,7 +852,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 const int64_t bridgeCycle =
                     bridgePhaseStart + maximumReadLatency;
                 int64_t bridgeEnd = bridgeCycle;
-                for (int64_t pair = 0; pair < lanes; ++pair) {
+                for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                     auto source = distributedAddress(resultPlacement,
                         block, pair, columnBlocks,
                         validOutputHemisphere);
@@ -869,7 +892,8 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                                 + source->slices[byte],
                             "read", source->row,
                             32 + bridgeStream + byte,
-                            tileRows, lanes, 1,
+                            tileRows, singleRowDecode ? 1 : lanes,
+                            singleRowDecode ? 0 : 1,
                             tokenBlocks, tile, columnBlocks * tileRows,
                             columnDomainCount, bridgeColumnInterval,
                             sourceColumnAddressStride, -1, source->bank);
@@ -885,13 +909,15 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                                 ? "write_tap" : "write",
                             mirror->row,
                             bridgeStream + byte,
-                            tileRows, lanes, 1,
+                            tileRows, singleRowDecode ? 1 : lanes,
+                            singleRowDecode ? 0 : 1,
                             tokenBlocks, tile, columnBlocks * tileRows,
                             columnDomainCount, bridgeColumnInterval,
                             mirrorColumnAddressStride, -1, mirror->bank);
                         bridgeEnd = std::max(
                             bridgeEnd,
-                            mirrorWriteCycle + (tileRows - 1) * lanes
+                            mirrorWriteCycle + (tileRows - 1)
+                                    * (singleRowDecode ? 1 : lanes)
                                 + (tokenBlocks - 1) * tile + 1);
                     }
                 }

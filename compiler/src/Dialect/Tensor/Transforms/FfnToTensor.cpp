@@ -30,6 +30,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         op.emitError("invalid MXM execution policy");
         return mlir::failure();
     }
+    bool native4 = false;
     if (w8a16) {
         auto strategy = target::plan_mxm_execution_strategy(
             {m, n, hidden,
@@ -44,22 +45,39 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
                 "cannot select an MXM execution strategy for FFN");
             return mlir::failure();
         }
+        native4 = strategy->decode_native4;
     }
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
-    const auto gate_weight_slices = target.ffn_projection_weight_slices(
-        target::FfnProjectionKind::Gate);
-    const auto up_weight_slices = target.ffn_projection_weight_slices(
-        target::FfnProjectionKind::Up);
-    const auto down_weight_slices =
-        target.ffn_down_projection_weight_slices();
+    llvm::SmallVector<int64_t, 32> gate_weight_slices;
+    llvm::SmallVector<int64_t, 32> up_weight_slices;
+    llvm::SmallVector<int64_t, 32> down_weight_slices;
+    if (native4) {
+        for (int64_t slice = 20; slice < 52; ++slice) {
+            gate_weight_slices.push_back(slice);
+            up_weight_slices.push_back(slice);
+            down_weight_slices.push_back(slice);
+        }
+    } else {
+        const auto gateSelected = target.ffn_projection_weight_slices(
+            target::FfnProjectionKind::Gate);
+        const auto upSelected = target.ffn_projection_weight_slices(
+            target::FfnProjectionKind::Up);
+        const auto downSelected = target.ffn_down_projection_weight_slices();
+        gate_weight_slices.assign(gateSelected.begin(), gateSelected.end());
+        up_weight_slices.assign(upSelected.begin(), upSelected.end());
+        down_weight_slices.assign(downSelected.begin(), downSelected.end());
+    }
     llvm::SmallVector<int64_t> activation_slices;
     llvm::SmallVector<int64_t> hidden_slices = target.ffn_hidden_slices();
     llvm::SmallVector<int64_t> result_slices;
     for (int64_t index = 0;
-         index < throughput.mxm_activation_streams; ++index) {
+         index < (native4 ? 2 : throughput.mxm_activation_streams); ++index) {
         activation_slices.push_back(
             memory.w8a16_activation_slice_base + index);
+    }
+    for (int64_t index = 0;
+         index < (native4 ? 4 : throughput.mxm_activation_streams); ++index) {
         result_slices.push_back(
             memory.w8a16_result_slice_base + index);
     }
@@ -68,7 +86,9 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         : m * 320;
     const bool singleMxmVector = w8a16
         && throughput.mxms_per_hemisphere == 1;
-    const int64_t gate_rows = w8a16
+    const int64_t gate_rows = native4
+        ? (hidden / 64) * (k / 32)
+        : w8a16
         ? k * hidden
             / ((singleMxmVector ? memory.hemispheres : 1)
                 * memory.w8a16_weight_slice_count
@@ -78,7 +98,9 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         * (singleMxmVector
                 ? 2 : throughput.mxms_per_hemisphere)
         * throughput.tile_rows * throughput.lanes_per_tile;
-    const int64_t down_rows = w8a16
+    const int64_t down_rows = native4
+        ? (n / 64) * (hidden / 32)
+        : w8a16
         ? ((n + down_wave_columns - 1) / down_wave_columns)
             * (hidden / throughput.mxm_rows)
             * memory.w8a16_weight_slice_count
@@ -93,7 +115,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     // those attention page loads, so give the FFN explicit C2C page lifetimes.
     const bool requiresLifetimePaging =
         follows_paged_attention && weight_bank >= 0;
-    if (requiresWeightPaging || requiresLifetimePaging) {
+    if (!native4 && (requiresWeightPaging || requiresLifetimePaging)) {
         auto planned = tensor::planFfnWeightTiles(
             {m, k, hidden, n}, target, initialWeightBank,
             requiresLifetimePaging);
@@ -216,21 +238,21 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
             gate_weight_slices, ffnWeightBase,
             tiledWeights ? memory.sram_depth_rows : gate_rows,
-            k * hidden, {}, "east",
+            k * hidden, {}, native4 ? "both" : "east",
             initialWeightBank))
         : allocate_value(gate_weight, PlacementKind::Weight);
     auto up = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
             up_weight_slices, ffnWeightBase,
             tiledWeights ? memory.sram_depth_rows : gate_rows,
-            k * hidden, {}, "east",
+            k * hidden, {}, native4 ? "both" : "east",
             initialWeightBank))
         : allocate_value(up_weight, PlacementKind::Weight);
     auto down = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
             down_weight_slices, ffnWeightBase,
             tiledWeights ? memory.sram_depth_rows : down_rows,
-            hidden * n, {}, "east",
+            hidden * n, {}, native4 ? "both" : "east",
             initialWeightBank))
         : allocate_value(down_weight, PlacementKind::Weight);
     auto hidden0 = w8a16
@@ -284,8 +306,10 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             - projectionPageCount
         : 0;
     llvm::SmallVector<mlir::Attribute> weightStorageSliceAttrs;
-    if (tiledWeights)
-        for (int64_t slice : target.weight_storage_slices())
+    if (tiledWeights || native4)
+        for (int64_t slice : (native4
+                ? llvm::ArrayRef<int64_t>(gate_weight_slices)
+                : target.weight_storage_slices()))
             weightStorageSliceAttrs.push_back(
                 rewriter.getI64IntegerAttr(slice));
     const auto withWeightPaging = [&](mlir::DictionaryAttr placement,
@@ -295,6 +319,31 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
                                       int64_t pageRoleGroupCount,
                                       int64_t itemsPerSliceGroup,
                                       tensor::FfnWeightTileKind kind) {
+        if (native4) {
+            mlir::NamedAttrList attrs(placement);
+            const auto rows = placement.getAs<mlir::IntegerAttr>(
+                "instruction_count").getInt();
+            attrs.set("paged_weight", rewriter.getBoolAttr(true));
+            attrs.set("page_count", rewriter.getI64IntegerAttr(1));
+            attrs.set("page_rows",
+                rewriter.getI64IntegerAttr(memory.sram_depth_rows));
+            attrs.set("page_granularity", rewriter.getI64IntegerAttr(1));
+            attrs.set("page_role_group_base", rewriter.getI64IntegerAttr(0));
+            attrs.set("page_role_group_count", rewriter.getI64IntegerAttr(1));
+            attrs.set("page_items_per_slice_group",
+                rewriter.getI64IntegerAttr(1));
+            attrs.set("page_storage_slices",
+                rewriter.getArrayAttr(weightStorageSliceAttrs));
+            attrs.set("page_bank_count",
+                rewriter.getI64IntegerAttr(memory.banks_per_slice));
+            attrs.set("page_banks", rewriter.getI64ArrayAttr(
+                {initialWeightBank}));
+            attrs.set("page_slice_group_bases", rewriter.getI64ArrayAttr({0}));
+            attrs.set("page_slice_group_counts", rewriter.getI64ArrayAttr({1}));
+            attrs.set("page_base_rows", rewriter.getI64ArrayAttr({0}));
+            attrs.set("page_row_counts", rewriter.getI64ArrayAttr({rows}));
+            return attrs.getDictionary(rewriter.getContext());
+        }
         if (!tiledWeights) return placement;
         mlir::NamedAttrList attrs(placement);
         attrs.set("paged_weight", rewriter.getBoolAttr(true));
@@ -350,7 +399,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     };
     const auto gate_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *gate,
-            singleMxmVector
+            native4 ? "w8a16_native4_weight" : singleMxmVector
                 ? "w8a16_mxm_weight_wave_striped"
                 : "w8a16_mxm_weight_replicated",
             "both")
@@ -362,7 +411,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         tensor::FfnWeightTileKind::Gate);
     const auto up_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *up,
-            singleMxmVector
+            native4 ? "w8a16_native4_weight" : singleMxmVector
                 ? "w8a16_mxm_weight_wave_striped"
                 : "w8a16_mxm_weight_replicated",
             "both")
@@ -374,7 +423,8 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         tensor::FfnWeightTileKind::Up);
     const auto down_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *down,
-            "w8a16_mxm_weight_wave_striped",
+            native4 ? "w8a16_native4_weight"
+                    : "w8a16_mxm_weight_wave_striped",
             "both")
         : make_placement_attr(rewriter, *down), downPageCount,
         tiledWeights ? weightTilePlan->down_reduction_blocks_per_page : 0,

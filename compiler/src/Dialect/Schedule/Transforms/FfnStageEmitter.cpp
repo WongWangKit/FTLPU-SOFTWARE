@@ -340,7 +340,12 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         target, *executionPolicy);
     if (mlir::failed(execution)) {
         ffn.getOperation()->emitError(
-            "cannot plan the FFN MXM execution strategy");
+            "cannot plan the FFN MXM execution strategy")
+            << ": m=" << ffn.getM()
+            << ", n=" << ffn.getN()
+            << ", k=" << ffn.getHidden()
+            << ", mxm_rows=" << target.throughput().mxm_rows
+            << ", mxm_columns=" << target.throughput().mxm_columns;
         return mlir::failure();
     }
     const auto& throughput = target.throughput();

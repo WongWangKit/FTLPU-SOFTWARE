@@ -4,6 +4,7 @@
 #include "ftlpu/icu/instruction.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -279,6 +280,176 @@ void test_linked_mem_window_preserves_trailing_3d_cycle()
         "boundary MEM_WRITE_SYNC completion delayed the following real MEM 3-D issue");
 }
 
+void test_late_page_barrier_follows_its_mem_write_window()
+{
+    constexpr std::size_t startCycle = 3;
+    constexpr std::size_t consumerCycle = 5;
+    constexpr std::size_t transferEndCycle = 11;
+    constexpr std::size_t pageReadyEvent = 0x6a6a;
+
+    C2cDmaSystem system;
+    BinaryProgram program;
+    program.max_cycle = 24;
+    program.hardware.mxms_per_hemisphere = 1;
+    program.queues.push_back(QueueProgram{
+        QueueKind::Mem, timing_mem_queue(),
+        {encode_icu_control_raw_word(IcuControlInstruction::Nop(20))}});
+    const auto crossingQueue = InstructionControlUnit::mem_queue(
+        Hemisphere::East, 0, 0);
+    auto crossingCommands =
+        raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+            MemIcuInstruction::Read3D(
+                IcuLoop3D{0, {16, 1, 1}, {1, 1, 1}},
+                MemIcuAddress3D::Affine(300, {1, 0, 0}),
+                StreamId::East(0))));
+    crossingCommands.push_back(encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(4)));
+    program.queues.push_back(QueueProgram{
+        QueueKind::Mem, crossingQueue, std::move(crossingCommands)});
+    const std::array consumerQueues {
+        std::pair {QueueKind::MxmLoad, std::size_t {0}},
+        std::pair {QueueKind::MxmDequant, std::size_t {0}},
+        std::pair {QueueKind::MxmCompute, std::size_t {0}},
+        std::pair {QueueKind::MxmCompute, std::size_t {1}},
+        std::pair {QueueKind::Vxm, std::size_t {0}},
+        std::pair {QueueKind::SxmTranspose, std::size_t {0}},
+    };
+    for (const auto& [kind, index] : consumerQueues)
+        program.queues.push_back(QueueProgram {kind, index,
+            {encode_icu_control_raw_word(
+                IcuControlInstruction::Nop(20))}});
+
+    C2cWeightPager pager(system);
+    pager.begin_schedule(program);
+    static_cast<void>(pager.schedule(program, timing_page(), startCycle,
+        transferEndCycle, consumerCycle, kTimingLaunchEvent,
+        pageReadyEvent));
+    pager.finalize_schedule(program);
+
+    const auto releases = pager.page_ready_releases(pageReadyEvent);
+    const auto crossingRelease = std::ranges::find_if(releases,
+        [&](const C2cWeightPager::PageReadyRelease& release) {
+            return release.location == IcuLocation::Mem(
+                Hemisphere::East, 0, 0);
+        });
+    const auto mxmRelease = std::ranges::find_if(releases,
+        [](const C2cWeightPager::PageReadyRelease& release) {
+            return release.location == IcuLocation::MxmLoad(0);
+        });
+    const auto westMxmRelease = std::ranges::find_if(releases,
+        [](const C2cWeightPager::PageReadyRelease& release) {
+            return release.location
+                == IcuLocation::MxmCompute(hw::kMxmsPerHemisphere);
+        });
+    require(crossingRelease != releases.end()
+            && mxmRelease != releases.end()
+            && westMxmRelease != releases.end()
+            && crossingRelease->phase_offset == 11
+            && mxmRelease->phase_offset == 0
+            && westMxmRelease->phase_offset == 0,
+        "page-ready release plan did not preserve ICU phase or physical MXM mapping");
+
+    const auto queue = std::ranges::find_if(program.queues,
+        [](const QueueProgram& candidate) {
+            return candidate.kind == QueueKind::Mem
+                && candidate.index == timing_mem_queue();
+        });
+    require(queue != program.queues.end(),
+        "late page barrier test lost its MEM queue");
+    std::optional<std::size_t> writeSyncIndex;
+    std::optional<std::size_t> pageWaitIndex;
+    for (std::size_t index = 0; index < queue->commands.size(); ++index) {
+        if (is_mem_synchronized_raw_packet_header(queue->commands[index]))
+            writeSyncIndex = index;
+        if (is_icu_control_raw_word_command(queue->commands[index])) {
+            const auto control = decode_icu_control_raw_word(
+                queue->commands[index]);
+            if (control.opcode == IcuControlOpcode::WaitEvent
+                && control.event_tag == pageReadyEvent)
+                pageWaitIndex = index;
+        }
+    }
+    require(writeSyncIndex.has_value() && pageWaitIndex.has_value()
+            && *writeSyncIndex < *pageWaitIndex,
+        "late page barrier did not follow its causal MEM_WRITE_SYNC window");
+
+    for (const auto& [kind, index] : consumerQueues) {
+        const auto consumer = std::ranges::find_if(program.queues,
+            [&](const QueueProgram& candidate) {
+                return candidate.kind == kind && candidate.index == index;
+            });
+        require(consumer != program.queues.end(),
+            "page barrier test lost a consumer ICU queue");
+        const bool hasPageSync = std::ranges::any_of(consumer->commands,
+            [&](const QueueCommand& command) {
+                if (!is_icu_control_raw_word_command(command)) return false;
+                const auto control = decode_icu_control_raw_word(command);
+                return control.opcode == IcuControlOpcode::WaitEvent
+                    && control.event_tag == pageReadyEvent;
+            });
+        require(hasPageSync,
+            "page consumer ICU queue is missing its tagged SYNC");
+    }
+
+    const auto crossing = std::ranges::find_if(program.queues,
+        [&](const QueueProgram& candidate) {
+            return candidate.kind == QueueKind::Mem
+                && candidate.index == crossingQueue;
+        });
+    require(crossing != program.queues.end()
+            && !crossing->commands.empty()
+            && is_fu_3d_raw_packet_header(crossing->commands.front()),
+        "unrelated crossing MEM 3-D domain was gated by a page barrier");
+    std::optional<std::size_t> deferredPageWait;
+    for (std::size_t index = 0; index < crossing->commands.size(); ++index) {
+        if (!is_icu_control_raw_word_command(crossing->commands[index]))
+            continue;
+        const auto control = decode_icu_control_raw_word(
+            crossing->commands[index]);
+        if (control.opcode == IcuControlOpcode::WaitEvent
+            && control.event_tag == pageReadyEvent)
+            deferredPageWait = index;
+    }
+    require(deferredPageWait.has_value()
+            && *deferredPageWait
+                >= fu_3d_raw_packet_word_count(QueueKind::Mem),
+        "page barrier crossed by a 3-D domain was not deferred to its next command boundary");
+}
+
+void test_early_page_event_is_latched_until_consumer()
+{
+    constexpr std::size_t eventTag = 0x6b6b;
+    InstructionControlUnit icu;
+    const auto location = IcuLocation::Mem(Hemisphere::East, 0, 0);
+    const auto queueIndex = InstructionControlUnit::mem_queue(
+        Hemisphere::East, 0, 0);
+    icu.enqueue_control(location,
+        IcuControlInstruction::Nop(3));
+    icu.enqueue_control(location,
+        IcuControlInstruction::WaitEvent(eventTag));
+    icu.enqueue_mem(queueIndex,
+        MemInstruction::Read(123, StreamId::East(0)));
+
+    auto& queue = icu.mem_iq(queueIndex);
+    for (std::size_t cycle = 0;
+         cycle < 16 && queue.last_trace().action != IcuQueueAction::Nop;
+         ++cycle)
+        static_cast<void>(queue.tick());
+    require(queue.last_trace().action == IcuQueueAction::Nop,
+        "page-event latch test did not enter its queue delay");
+    queue.notify(eventTag);
+    std::optional<MemInstruction> released;
+    for (std::size_t cycle = 0; cycle < 16 && !released; ++cycle) {
+        released = queue.tick();
+        require(queue.last_trace().action != IcuQueueAction::EventWait,
+            "early page event was lost before WAIT_EVENT reached the head");
+    }
+    require(released.has_value()
+            && released->opcode == MemOpcode::Read
+            && released->address == 123,
+        "early page event was not latched until its MEM consumer");
+}
+
 void test_c2c_dma_frontend_tail()
 {
     constexpr std::size_t packetCount = 20;
@@ -326,6 +497,8 @@ void test_c2c_dma_frontend_tail()
 
 void run_test()
 {
+    test_late_page_barrier_follows_its_mem_write_window();
+    test_early_page_event_is_latched_until_consumer();
     test_c2c_dma_frontend_tail();
     test_linked_mem_window_preserves_trailing_3d_cycle();
 
@@ -353,8 +526,10 @@ void run_test()
             == InstructionControlUnit::mem_queue(
                 hemisphere, slice, next_bank),
         "direct C2C lowering targeted the wrong unified MEM queue");
-    require(lowered.physical_word_count() == 5,
-        "one C2C segment must occupy five 96-bit i-MEM words");
+    require(lowered.physical_word_count() == 6
+            && lowered.dma_completion_sync[hemisphere_index(hemisphere)]
+            && !lowered.dma_completion_sync[1 - hemisphere_index(hemisphere)],
+        "C2C lowering must emit a DMA completion SYNC on the used ICU");
     const auto decodedRx = C2cIcuPacketCodec::decode_rx(
         lowered.segments[0].rx);
     const auto decodedDma = C2cIcuPacketCodec::decode_dma(
@@ -421,14 +596,15 @@ void run_test()
             && linkedFence.scheduled_end_cycle == 60,
         "pre-load linker changed an already legal MEM idle window");
     require(linkedMem != linkedProgram.queues.end()
-            && linkedMem->commands.size() == 4
+            && linkedMem->commands.size() == 3
             && is_mem_synchronized_raw_packet_header(
-                linkedMem->commands[1]),
-        "pre-load linker appended MEM_WRITE_SYNC instead of splitting its NOP window");
+                linkedMem->commands[0])
+            && (linkedMem->commands[0].words[2] & 0xffffffU) + 1 == 96,
+        "pre-load linker did not absorb the leading NOP into MEM_WRITE_SYNC");
     auto linkedIcu = std::make_unique<InstructionControlUnit>();
     load_queue_programs_into_icu(linkedProgram.queues, *linkedIcu);
     require(linkedIcu->mem_iq(lowered.segments[0].mem_queue)
-                .imem_occupancy() == 4,
+                .imem_occupancy() == 3,
         "linked MEM queue did not occupy one physical i-MEM");
 
     C2cWeightPage multiQueuePage;
@@ -469,20 +645,17 @@ void run_test()
     auto boundedShortWindowSystem = std::make_unique<C2cDmaSystem>();
     C2cWeightPager boundedShortWindowPager(*boundedShortWindowSystem);
     boundedShortWindowPager.begin_schedule(boundedShortWindowProgram);
-    bool rejectedLateC2cTail = false;
-    try {
-        static_cast<void>(boundedShortWindowPager.schedule(
+    const auto boundedShortWindowFence =
+        boundedShortWindowPager.schedule(
             boundedShortWindowProgram, multiQueuePage,
-            linkedStart, linkedTransferEnd, linkedC2cTail - 1, 0x3456));
-    } catch (const std::logic_error& error) {
-        rejectedLateC2cTail = std::string(error.what()).find(
-            "past its first consumer") != std::string::npos;
-    }
-    require(rejectedLateC2cTail,
-        "ready_cycle accepted a C2C DMA/RX queue tail after the consumer");
+            linkedStart, linkedTransferEnd, linkedC2cTail - 1, 0x3456);
+    require(boundedShortWindowFence.scheduled_end_cycle
+                == linkedTransferEnd
+            && boundedShortWindowProgram.max_cycle == linkedC2cTail,
+        "page-ready synchronization did not retain a late C2C queue tail");
 
     BinaryProgram capacityProgram;
-    capacityProgram.hardware.icu_mem_imem_depth = 3;
+    capacityProgram.hardware.icu_mem_imem_depth = 2;
     capacityProgram.queues.push_back(QueueProgram {QueueKind::Mem,
         lowered.segments[0].mem_queue,
         {encode_icu_control_raw_word(IcuControlInstruction::Nop(128))}});
@@ -500,6 +673,34 @@ void run_test()
     }
     require(rejectedMemImemOverflow,
         "pre-load linker exceeded the target MEM i-MEM depth");
+
+    constexpr std::size_t oversizedStart = std::size_t {1} << 24;
+    BinaryProgram oversizedGapProgram;
+    oversizedGapProgram.queues.push_back(QueueProgram {QueueKind::Mem,
+        lowered.segments[0].mem_queue,
+        {encode_icu_control_raw_word(
+            IcuControlInstruction::Nop(oversizedStart + 128))}});
+    auto oversizedGapSystem = std::make_unique<C2cDmaSystem>();
+    C2cWeightPager oversizedGapPager(*oversizedGapSystem);
+    oversizedGapPager.begin_schedule(oversizedGapProgram);
+    static_cast<void>(oversizedGapPager.schedule(oversizedGapProgram,
+        logicalPage, oversizedStart, oversizedStart + 40,
+        oversizedStart + 96, 0x5678));
+    oversizedGapPager.finalize_schedule(oversizedGapProgram);
+    const auto oversizedMem = std::find_if(
+        oversizedGapProgram.queues.begin(),
+        oversizedGapProgram.queues.end(),
+        [&](const QueueProgram& queue) {
+            return queue.kind == QueueKind::Mem
+                && queue.index == lowered.segments[0].mem_queue;
+        });
+    require(oversizedMem != oversizedGapProgram.queues.end()
+            && oversizedMem->commands.size() == 4
+            && decode_icu_control_raw_word(
+                oversizedMem->commands[0]).count == oversizedStart
+            && is_mem_synchronized_raw_packet_header(
+                oversizedMem->commands[1]),
+        "oversized leading wait did not retain its NOP fallback");
 
     auto system = std::make_unique<C2cDmaSystem>(
         Ddr4Config {32, 2, 2, 256, 8});
@@ -523,6 +724,25 @@ void run_test()
 
     C2cWeightPager pager(*system);
     pager.enqueue(logicalPage);
+    const auto& captured = pager.last_enqueued_program();
+    const auto capturedDmaQueue = std::find_if(captured.queues.begin(),
+        captured.queues.end(), [&](const QueueProgram& queue) {
+            return queue.kind == QueueKind::C2cDma
+                && queue.index == hemisphere_index(hemisphere);
+        });
+    require(capturedDmaQueue != captured.queues.end()
+            && !capturedDmaQueue->commands.empty()
+            && is_icu_control_raw_word_command(
+                capturedDmaQueue->commands.back())
+            && decode_icu_control_raw_word(
+                capturedDmaQueue->commands.back()).opcode
+                == IcuControlOpcode::Sync,
+        "standalone C2C DMA program must end with lowered SYNC");
+    std::ostringstream capturedBytes(std::ios::binary);
+    write_binary_program(captured, capturedBytes);
+    std::istringstream capturedInput(capturedBytes.str(), std::ios::binary);
+    require(!read_binary_program(capturedInput).queues.empty(),
+        "standalone C2C ICU program must serialize with a valid target ABI");
 
     bool overlapped_bank_issue = false;
     for (std::size_t cycle = 0; cycle < 512 && !pager.ready(); ++cycle) {

@@ -1593,7 +1593,8 @@ bool LPUTargetModel::supports_w8a16_ffn_shape(
 {
     const int64_t tile = throughput_.mxm_rows;
     const int64_t output_pair = tile * throughput_.mxms_per_hemisphere;
-    return m > 0 && m % tile == 0 && k > 0 && hidden > 0 && n > 0
+    return m > 0 && (m == 1 || m % tile == 0)
+        && k > 0 && hidden > 0 && n > 0
         && k % tile == 0
         && hidden % output_pair == 0
         && n % output_pair == 0;

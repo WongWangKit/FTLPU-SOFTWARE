@@ -39,6 +39,7 @@ int main()
 try {
     constexpr std::size_t kWaitTag = 0x1234;
     constexpr std::size_t kWriteTag = 0x2345;
+    constexpr std::size_t kReadTag = 0x3456;
     const IcuLoop3D onePoint {0, {1, 1, 1}, {1, 1, 1}, 0};
 
     QueueProgram queue {QueueKind::Mem, 0, {}};
@@ -78,9 +79,22 @@ try {
         "MEM_WRITE_SYNC raw packet was not recognized structurally");
     append(synchronizedCommands);
 
+    const auto synchronizedRead =
+        InstructionControlUnit::MemIcu::encode_synchronized_raw_packet(
+            2, kReadTag, 0, 1,
+            MemInstruction::Read(40, StreamId::East(4)));
+    const auto synchronizedReadCommands =
+        encode_mem_synchronized_icu_packet(synchronizedRead);
+    require(is_mem_synchronized_raw_packet_header(
+                synchronizedReadCommands[0])
+            && is_mem_synchronized_raw_word_command(
+                synchronizedReadCommands[1]),
+        "MEM_READ_SYNC raw packet was not recognized structurally");
+    append(synchronizedReadCommands);
+
     const auto expectedWords =
         2 * isa::EncodedMemIcu3DPacket::kWordCount + 1
-        + InstructionControlUnit::MemIcu::
+        + 2 * InstructionControlUnit::MemIcu::
             synchronized_packet_word_count;
 
     InstructionControlUnit icu;
@@ -95,6 +109,8 @@ try {
     mem.notify(kWaitTag);
     mem.notify(kWriteTag);
     mem.notify(kWriteTag);
+    mem.notify(kReadTag);
+    mem.notify(kReadTag);
     std::vector<MemInstruction> issued;
     for (std::size_t cycle = 0; cycle < 512 && !mem.done(); ++cycle) {
         if (const auto instruction = mem.tick())
@@ -112,7 +128,7 @@ try {
                 mem.last_trace().action)));
     require(mem.fetch_pc() == expectedWords,
         "unified MEM ICU PC did not traverse the complete program");
-    require(issued.size() == 4,
+    require(issued.size() == 6,
         "unified MEM ICU emitted the wrong number of FU instructions");
     require(issued[0].opcode == MemOpcode::Read
             && issued[0].address == 10
@@ -121,10 +137,14 @@ try {
             && issued[2].opcode == MemOpcode::Write
             && issued[2].address == 30
             && issued[3].opcode == MemOpcode::Write
-            && issued[3].address == 31,
-        "Read3D, Write3D, and MEM_WRITE_SYNC did not execute in iMEM order");
-    require(mem.synchronized_issued_count() == 2,
-        "MEM_WRITE_SYNC issue accounting is incorrect");
+            && issued[3].address == 31
+            && issued[4].opcode == MemOpcode::Read
+            && issued[4].address == 40
+            && issued[5].opcode == MemOpcode::Read
+            && issued[5].address == 41,
+        "Read3D, Write3D, MEM_WRITE_SYNC, and MEM_READ_SYNC did not execute in iMEM order");
+    require(mem.synchronized_issued_count() == 4,
+        "MEM synchronized issue accounting is incorrect");
 
     MemIcuWriteRead2DInstruction writeRead{};
     writeRead.start_wait = 5;

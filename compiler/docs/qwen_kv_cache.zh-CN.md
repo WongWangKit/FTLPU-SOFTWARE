@@ -69,6 +69,13 @@ resident window 搬到共享 SRAM slot；执行后再把两个 window 搬回并�
 backing。`read_state(name)` 返回逻辑 `[token, head, dimension]` image，
 `reset_states()` 清零所有逻辑状态。host API 不会绕过 C2C 直接写 MEM。
 
+page-out 的 MEM 行为由 compiler 直接生成。每个 K/V 物理连续段对应一条固定
+两 word 的 `MEM_READ_SYNC`，并带 internal-binding 地址 relocation。runtime 只
+补齐带相同 tag 和目标 MEM ICU 路由的 C2C TX 指令以及 DMA Store；它不再临时
+合成普通 `Read + Repeat`。TX lane 按接收流水线空位逐向量发 token，所以 DDR
+背压会让 `MEM_READ_SYNC` 停等，而不会丢失已经从 MEM 读出的向量。seq32 单层
+当前共有 40 条 `MEM_READ_SYNC`，在 ICU CSV 中可直接查看。
+
 多层模型使用 `layers.N.key_cache` 和 `layers.N.value_cache` 命名。它们与权重
 乒乓页相互独立。runtime stats 和 pipeline CSV 分别用 `state_page_in/out` 与
 `C2C.StatePageIn/Out` 展示 KV 流量。
@@ -79,6 +86,8 @@ Qwen2.5-1.5B 第 0 层 seq32 测试以 capacity=256 编译，生成逻辑
 ModelPackage，序列化为 v6 package 后运行 CModel。测试会
 对比 Hugging Face fixture 中全部 8,192 个 K 和 8,192 个 V，检查未使用容量
 仍为零，验证 49,152 个 decoder 输出，并验证 state reset。
+同一完整测试还验证链接后的 256 条 `MEM_WRITE_SYNC`、40 条
+`MEM_READ_SYNC`，以及 K/V 经 C2C TX/DMA 写回 DDR 的 page-out 链路。
 
 当前误差为：
 

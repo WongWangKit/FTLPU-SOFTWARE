@@ -207,7 +207,9 @@ MxmLoadOp emitFfnWeightTile(
     int64_t localMxm, int64_t unit, int64_t weightBuffer, bool localDequant,
     int64_t bank, int64_t pageIndex, int64_t logicalBaseRow,
     mlir::DictionaryAttr bindingPlacement, FfnLoopDomain3D domain,
-    llvm::StringRef weightBufferMode) {
+    llvm::StringRef weightBufferMode,
+    std::optional<FfnLoopDomain3D> mxmControlDomain,
+    bool emitMxmControl) {
   const auto &throughput = target.throughput();
   const int64_t duration = throughput.mxm_rows / throughput.lanes_per_tile;
   const int64_t encodedStreamBase = target.streams().streams_per_direction;
@@ -264,6 +266,9 @@ MxmLoadOp emitFfnWeightTile(
       readValue = read.getOutput();
     }
 
+    if (!emitMxmControl)
+      return MxmLoadOp {};
+    const FfnLoopDomain3D control = mxmControlDomain.value_or(domain);
     mlir::OperationState dequantState(location,
                                       MxmDequantOp::getOperationName());
     dequantState.addAttributes({
@@ -279,33 +284,33 @@ MxmLoadOp emitFfnWeightTile(
       dequantState.addAttribute("scale_binding",
                                 rewriter.getI64IntegerAttr(scaleBinding));
     dequantState.addAttribute("wave_count",
-                              rewriter.getI64IntegerAttr(domain.wave_count));
+                              rewriter.getI64IntegerAttr(control.wave_count));
     dequantState.addAttribute("wave_interval",
-                              rewriter.getI64IntegerAttr(domain.wave_interval));
+                              rewriter.getI64IntegerAttr(control.wave_interval));
     dequantState.addAttribute("group_count",
-                              rewriter.getI64IntegerAttr(domain.group_count));
+                              rewriter.getI64IntegerAttr(control.group_count));
     dequantState.addAttribute("group_interval",
-                              rewriter.getI64IntegerAttr(domain.group_interval));
+                              rewriter.getI64IntegerAttr(control.group_interval));
     rewriter.create(dequantState);
 
-    const bool flatLoadDomain = domain.wave_count == 1
-        || domain.group_count == 1
-        || domain.group_interval
-            == domain.wave_count * domain.wave_interval;
+    const bool flatLoadDomain = control.wave_count == 1
+        || control.group_count == 1
+        || control.group_interval
+            == control.wave_count * control.wave_interval;
     const int64_t loadDomainCount = flatLoadDomain
-        ? 1 : domain.group_count;
+        ? 1 : control.group_count;
     MxmLoadOp lastLoad;
     for (int64_t group = 0; group < loadDomainCount; ++group) {
       const int64_t loopCount = flatLoadDomain
-          ? domain.wave_count * domain.group_count
-          : domain.wave_count;
-      const int64_t loopInterval = domain.wave_count > 1
-          ? domain.wave_interval : domain.group_interval;
+          ? control.wave_count * control.group_count
+          : control.wave_count;
+      const int64_t loopInterval = control.wave_count > 1
+          ? control.wave_interval : control.group_interval;
       const int64_t groupBuffer = weightBuffer
-          ^ ((group * domain.wave_count) & 1);
+          ^ ((group * control.wave_count) & 1);
       auto load = rewriter.create<MxmLoadOp>(
           location, readValue,
-          startCycle + (flatLoadDomain ? 0 : group * domain.group_interval),
+          startCycle + (flatLoadDomain ? 0 : group * control.group_interval),
           duration, streamBase,
           throughput.mxm_int8_load_streams_per_cycle, unit, groupBuffer);
       load->setAttr("data_format", rewriter.getStringAttr(dataFormat));

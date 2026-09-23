@@ -66,7 +66,11 @@ domain remains continuous and each MEM ICU still has one live context.
 
 For the other projections,
 each O-projection weight queue uses one `counts=(4,48,24)` READ with cycle
-strides `(1,32,1578)`. Gate and Up use the MEM ICU blocked-outer address mode
+strides `(1,32,1578)`. The O-projection context queues directly emit one
+`counts=(32,24,24)` READ each, and its result queues emit one
+`counts=(32,1,24)` WRITE or WRITE_TAP each. The outer counter covers all 24
+output groups, with a 1,578-cycle stride. Gate and Up use the MEM ICU
+blocked-outer address mode
 to express alternating weight buffers without splitting each pair. A residual
 block is split during direct lowering only when an operand read and result
 write use the same physical MEM queue; its VXM pipeline delays the result until
@@ -136,6 +140,13 @@ multi-step `ftlpu-opt` flow, set the flag on the StableHLO-to-Stream step; later
 tools inherit the `ftlpu.projection_rope_overlap` IR attribute unless an
 explicit command-line setting overrides it.
 
+For serial seq32 Q RoPE, the compiler schedules every A/B product first into
+the existing per-head product SRAM, then runs the combines and Query-IW writes.
+The source reads for all 12 heads and two rotary pairs form one `READ_3D` per
+physical staging MEM queue (`counts=(4,2,24)`). No result write interrupts
+that queue's source-read domain. The following Query-IW writes also form one
+`WRITE_3D` per physical result bank queue (`counts=(4,2,12)`).
+
 For the seq32 serial configuration, Q, K, and V projection reads are lowered
 directly to one `READ_3D` per active physical MEM queue for activations and one
 for weights. The outer counter covers all output halves (24 for Q, 4 for K/V).
@@ -193,9 +204,17 @@ ctest --test-dir build-ftlpu-vs2026-direct -C Release `
 Run the full CModel check with:
 
 ```powershell
-build-ftlpu-vs2026-direct/runtime/compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test.exe `
-  build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/decoder_layer.ftlpu
+tools/run_qwen2_5_decoder_layer_prefill.ps1
 ```
+
+The wrapper always replaces `results/qwen2_5_decoder_layer_prefill` with the
+current input binary, runtime pipeline CSV, runtime-linked binary, test log,
+and run manifest. It also stores the real startup ICU images under
+`pre_execution_programs` and merges them with the linked executable into one
+CSV per physical ICU under `icu_programs`. Repeated runs update this directory
+instead of creating new result directories. It defaults to the 500 MHz /
+25.6 GB/s page-sync program; use `-Program` and `-DdrBandwidthMBps` to select
+another explicit input.
 
 Split the complete static prefill program into one file per physical ICU:
 
@@ -239,6 +258,30 @@ startup transfer programs because those pages have already reached SRAM before
 the linked executable is loaded. The test writes this diagnostic image after a
 successful run and also attempts to preserve it when execution fails after
 linking.
+
+To include ordinary `SYNC` instructions from the actual pre-execution C2C DMA
+programs in the per-ICU CSVs, save the temporary ICU loads during the runtime
+test and pass them to the exporter. The `phase` and `load_id` columns distinguish
+each load, whose physical `pc_word` starts again at zero:
+
+```powershell
+$env:FTLPU_QWEN_C2C_PRE_EXECUTION_DIR = "build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/pre_execution_icu"
+$env:FTLPU_QWEN_C2C_LINKED_BINARY = "build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/decoder_layer.linked.ftlpu"
+build-ftlpu-vs2026-direct/runtime/compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test.exe `
+  build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/decoder_layer.ftlpu
+Remove-Item Env:FTLPU_QWEN_C2C_PRE_EXECUTION_DIR
+Remove-Item Env:FTLPU_QWEN_C2C_LINKED_BINARY
+
+build-ftlpu-vs2026-direct/runtime/ftlpu_icu_program_export.exe `
+  build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/decoder_layer.linked.ftlpu `
+  build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/icu_all_phases `
+  --pre-execution-dir build-ftlpu-vs2026-direct/compiler/ftlpu_lower/qwen2_5_1_5b_decoder_layer/pre_execution_icu
+```
+
+Ordinary `SYNC` is a C2C DMA ICU wait for a completion notification; it is
+distinct from the MEM ICU `MEM_WRITE_SYNC` packet. The complete seq32 test
+records ten temporary loads: seven startup weight pages and three input
+uploads. Each load has one ordinary `SYNC` on each C2C DMA ICU.
 
 Generate the dedicated cycle-accurate MEM CSV:
 

@@ -9,12 +9,18 @@
 #include "ftlpu/icu/fu_3d_codec.hpp"
 #include "ftlpu/icu/sxm_run_2d.hpp"
 #include "ftlpu/icu/vxm_run_2d.hpp"
+#include "ftlpu/software/runtime/c2c_weight_pager.hpp"
+#include "ftlpu/software/runtime/weight_prefetch_plan.hpp"
+#include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include <algorithm>
 #include <array>
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
+#include <ranges>
+#include <span>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_set>
@@ -847,6 +853,8 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::W8A16MxmWeightWaveStriped;
     if (value == "w8a16_attention_weight_striped")
         return BindingLayout::W8A16AttentionWeightStriped;
+    if (value == "w8a16_native4_weight")
+        return BindingLayout::W8A16Native4Weight;
     if (value == "fp16_pair_planar") return BindingLayout::Fp16PairPlanar;
     if (value == "fp32_causal_mask_tile")
         return BindingLayout::Fp32CausalMaskTile;
@@ -1838,6 +1846,74 @@ void compress_stream_nd_depth(
     sequences = std::move(compressed);
 }
 
+bool is_native4_decode(command::MxmOp op)
+{
+    return (op.getOpcode() == "decode_load_activation"
+            || op.getOpcode() == "decode_stream_compute")
+        && op.getDecodeLayout().value_or("") == "native4";
+}
+
+void collect_native4_decode(
+    command::MxmOp op, Raw3DQueueMap& queues)
+{
+    const bool load = op.getOpcode() == "decode_load_activation";
+    const auto format = op.getDataFormat().value_or("bf16") == "bf16"
+        ? MxmDataFormat::BFloat16 : MxmDataFormat::Float16;
+    const auto destination = op.getAccumulatorDestination() == "stream"
+        ? MxmAccumulatorDestination::Stream
+        : MxmAccumulatorDestination::Sram;
+    const auto instruction = load
+        ? MxmControlInstruction::DecodeLoadActivation(
+            static_cast<std::size_t>(op.getWeightBuffer()),
+            static_cast<std::size_t>(op.getActivationStreamBase()), format,
+            MxmDecodeLayout::Native4x4)
+        : MxmControlInstruction::DecodeStreamCompute(
+            static_cast<std::size_t>(op.getWeightBuffer()),
+            static_cast<std::size_t>(op.getOutputStreamBase()), format,
+            static_cast<std::size_t>(op.getAccumulatorAddress()),
+            static_cast<std::size_t>(op.getWeightColumn()), destination,
+            op.getAccumulatorClear(), MxmDecodeLayout::Native4x4);
+    const std::size_t repeatCount =
+        static_cast<std::size_t>(op.getRepeatCount());
+    const std::size_t waveCount = static_cast<std::size_t>(
+        op.getWaveCount().value_or(1));
+    const std::size_t groupCount = static_cast<std::size_t>(
+        op.getGroupCount().value_or(1));
+    const std::size_t repeatInterval =
+        static_cast<std::size_t>(op.getRepeatInterval());
+    const std::size_t waveInterval = static_cast<std::size_t>(
+        op.getWaveInterval().value_or(1));
+    const std::size_t groupInterval = static_cast<std::size_t>(
+        op.getGroupInterval().value_or(1));
+    const int64_t repeatStride = op->getAttrOfType<mlir::IntegerAttr>(
+        "repeat_accumulator_address_stride")
+        ? op->getAttrOfType<mlir::IntegerAttr>(
+              "repeat_accumulator_address_stride").getInt()
+        : 0;
+    const int64_t waveStride =
+        op.getWaveAccumulatorAddressStride().value_or(0);
+    const auto induction = repeatStride != 0 || waveStride != 0
+        ? IcuInductionTarget::MxmAccumulatorAddress
+        : IcuInductionTarget::None;
+    IcuMxmStreamNdSchedule schedule {
+        static_cast<std::size_t>(command_cycle(op)), 3,
+        {repeatCount, waveCount, groupCount},
+        {repeatInterval, waveInterval, groupInterval},
+        {repeatStride, waveStride, 0}, induction};
+    auto encoded = software::runtime::encode_mxm_stream_nd_command(
+        mxm_instruction_command(isa::encode_mxm_instruction(instruction)),
+        schedule);
+    const std::size_t start = static_cast<std::size_t>(command_cycle(op));
+    const std::size_t final = start
+        + (repeatCount - 1) * repeatInterval
+        + (waveCount - 1) * waveInterval
+        + (groupCount - 1) * groupInterval;
+    const auto kind = load ? QueueKind::MxmLoad : QueueKind::MxmCompute;
+    queues[{kind, static_cast<int64_t>(op.getQueue())}].push_back(
+        Raw3DPacketSequence {start, final, {std::move(encoded)}, -1,
+            BindingAccess::Input});
+}
+
 QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequences,
     std::size_t& max_cycle,
     std::vector<BinaryScaleRelocation>& scaleRelocations,
@@ -2468,6 +2544,164 @@ QueueProgram encode_queue(const QueueKey& key, std::vector<CommandSequence> sequ
     return queue;
 }
 
+void emit_compiled_mem_write_sync(software::runtime::BinaryProgram& program)
+{
+    using namespace software::runtime;
+    if (program.weight_page_uses.empty()) return;
+
+    auto plans = plan_weight_prefetches(program);
+    std::vector<C2cWeightPage> pages;
+    pages.reserve(plans.size());
+    std::vector<std::uint8_t> geometryBytes;
+    for (auto& plan : plans) {
+        C2cWeightPage page;
+        page.bank = plan.bank;
+        plan.bytes = {};
+        for (const std::size_t useIndex : plan.use_indices) {
+            const auto& use = program.weight_page_uses.at(useIndex);
+            const auto binding = std::ranges::find_if(program.bindings,
+                [&](const BinaryBinding& candidate) {
+                    return candidate.access == BindingAccess::Input
+                        && candidate.index == use.binding_index;
+                });
+            if (binding == program.bindings.end()
+                || binding->byte_size >
+                    std::numeric_limits<std::size_t>::max())
+                throw std::runtime_error(
+                    "paged MEM_WRITE_SYNC needs a valid input binding");
+            const auto logicalBytes =
+                static_cast<std::size_t>(binding->byte_size);
+            if (geometryBytes.size() < logicalBytes)
+                geometryBytes.resize(logicalBytes);
+            // Packing geometry depends on the binding and page placement,
+            // never on weight values. Use zeros to get the exact touched-row
+            // runs; residency regions may conservatively include holes.
+            const auto image = pack_weight_binding_page(*binding,
+                use.page_index,
+                std::span<const std::uint8_t>(
+                    geometryBytes.data(), logicalBytes),
+                program.hardware);
+            for (const auto& segment : image.segments) {
+                if (segment.vector_count
+                    > std::numeric_limits<std::uint16_t>::max())
+                    throw std::runtime_error(
+                        "paged MEM_WRITE_SYNC segment exceeds its count field");
+                page.segments.push_back(C2cWeightSegment {
+                    static_cast<Hemisphere>(segment.hemisphere),
+                    segment.slice, plan.bank, segment.base_row, 0, 0,
+                    static_cast<std::uint16_t>(segment.vector_count)});
+                plan.bytes[segment.hemisphere] +=
+                    static_cast<std::uint64_t>(segment.vector_count)
+                    * hw::kPhysicalVectorBytes;
+            }
+        }
+        if (page.segments.empty())
+            throw std::runtime_error("paged MEM_WRITE_SYNC has no segments");
+        pages.push_back(std::move(page));
+    }
+    schedule_weight_prefetches(program, plans);
+
+    auto system = std::make_unique<C2cDmaSystem>();
+    SystemHardwareConfiguration hardware;
+    hardware.sram_depth_rows = program.hardware.sram_depth_rows;
+    hardware.mxms_per_hemisphere = program.hardware.mxms_per_hemisphere;
+    hardware.mxm_weight_buffers = program.hardware.mxm_weight_buffers;
+    hardware.vxm_alus = program.hardware.vxm_alus;
+    hardware.c2c_streams_per_direction =
+        program.hardware.c2c_streams_per_direction;
+    system->chip().configure_hardware(hardware);
+    C2cWeightPager pager(*system);
+    pager.begin_schedule(program);
+    std::vector<std::size_t> launchOrder;
+    for (std::size_t index = 0; index < plans.size(); ++index)
+        if (!plans[index].pre_execution) launchOrder.push_back(index);
+    std::ranges::sort(launchOrder, [&](std::size_t lhs, std::size_t rhs) {
+        return std::tie(plans[lhs].start_cycle, plans[lhs].ready_cycle)
+            < std::tie(plans[rhs].start_cycle, plans[rhs].ready_cycle);
+    });
+    for (const auto index : launchOrder) {
+        const auto& plan = plans[index];
+        static_cast<void>(pager.schedule(program, pages[index],
+            static_cast<std::size_t>(plan.start_cycle),
+            static_cast<std::size_t>(plan.transfer_end_cycle),
+            static_cast<std::size_t>(plan.ready_cycle),
+            0x10000u + index));
+    }
+    pager.finalize_schedule(program);
+    // DDR addresses and launch events belong to the model-package link.
+    // Only the MEM iMEM words are part of this compiler image.
+    std::erase_if(program.queues, [](const QueueProgram& queue) {
+        return queue.kind == QueueKind::C2cDma
+            || queue.kind == QueueKind::C2cRx;
+    });
+}
+
+void emit_compiled_mem_read_sync(software::runtime::BinaryProgram& program)
+{
+    using namespace software::runtime;
+    constexpr std::uint32_t kFirstStateReadTag = 0x8000;
+    std::uint32_t nextTag = kFirstStateReadTag;
+    std::array<std::size_t, hw::kHemispheres> nextLane{};
+
+    for (const BinaryBinding& binding : program.bindings) {
+        if (binding.access != BindingAccess::Internal
+            || !binding.role.starts_with("state.kv."))
+            continue;
+        if (binding.byte_size > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error(
+                "KV-cache MEM_READ_SYNC binding is too large");
+        const std::vector<std::uint8_t> zero(
+            static_cast<std::size_t>(binding.byte_size), 0);
+        const auto image = pack_binding_image(binding, zero, program.hardware);
+        for (const PackedWeightSegment& segment : image.segments) {
+            if (segment.vector_count == 0
+                || segment.vector_count
+                    > std::numeric_limits<std::uint16_t>::max())
+                throw std::runtime_error(
+                    "KV-cache MEM_READ_SYNC segment count is invalid");
+            if (nextTag > std::numeric_limits<std::uint16_t>::max())
+                throw std::runtime_error(
+                    "KV-cache MEM_READ_SYNC exhausted synchronization tags");
+            const auto hemisphere =
+                static_cast<Hemisphere>(segment.hemisphere);
+            const auto side = static_cast<std::size_t>(segment.hemisphere);
+            const std::size_t lane = nextLane.at(side)++
+                % program.hardware.c2c_streams_per_direction;
+            const std::size_t queueIndex = InstructionControlUnit::mem_queue(
+                hemisphere, segment.slice, binding.bank);
+            auto queue = std::ranges::find_if(program.queues,
+                [&](const QueueProgram& candidate) {
+                    return candidate.kind == QueueKind::Mem
+                        && candidate.index == queueIndex;
+                });
+            if (queue == program.queues.end()) {
+                program.queues.push_back(
+                    QueueProgram {QueueKind::Mem, queueIndex, {}});
+                queue = std::prev(program.queues.end());
+            }
+            const auto packet = InstructionControlUnit::MemIcu::
+                encode_synchronized_raw_packet(segment.vector_count,
+                    nextTag++, 0, 1,
+                    MemInstruction::Read(segment.base_row,
+                        StreamId::East(lane)),
+                    segment.vector_count);
+            const auto commands = encode_mem_synchronized_icu_packet(packet);
+            const std::size_t packetStart = queue->commands.size();
+            queue->commands.insert(queue->commands.end(),
+                commands.begin(), commands.end());
+            program.address_relocations.push_back(BinaryAddressRelocation {
+                binding.index, BindingAccess::Internal, QueueKind::Mem,
+                static_cast<std::uint16_t>(queueIndex),
+                static_cast<std::uint32_t>(packetStart), false});
+        }
+    }
+    std::sort(program.queues.begin(), program.queues.end(),
+        [](const QueueProgram& lhs, const QueueProgram& rhs) {
+            return std::tie(lhs.kind, lhs.index)
+                < std::tie(rhs.kind, rhs.index);
+        });
+}
+
 } // namespace
 
 software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
@@ -2534,7 +2768,12 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     module.walk([&](command::MemBundleOp op) {
         collect_mem_bundle(op, queues);
     });
-    module.walk([&](command::MxmOp op) { collect_mxm(op, queues); });
+    module.walk([&](command::MxmOp op) {
+        if (is_native4_decode(op))
+            collect_native4_decode(op, raw3DQueues);
+        else
+            collect_mxm(op, queues);
+    });
     module.walk([&](command::MxmDequantOp op) {
         collect_mxm_dequant(op, queues);
     });
@@ -2862,6 +3101,10 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             return std::tie(lhs.kind, lhs.index)
                 < std::tie(rhs.kind, rhs.index);
         });
+    if (requiresDirectLowering) {
+        emit_compiled_mem_write_sync(program);
+        emit_compiled_mem_read_sync(program);
+    }
     return program;
 }
 

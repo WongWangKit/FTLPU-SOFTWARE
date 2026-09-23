@@ -39,6 +39,27 @@ struct AttentionTaskGraphView {
         return op.getLoc();
     }
     int64_t getSeqLen() const { return integer_config("seq_len"); }
+    int64_t getKvSeqLen() const
+    {
+        if (const auto value = config().template getAs<mlir::IntegerAttr>(
+                "kv_seq_len"))
+            return value.getInt();
+        return getSeqLen();
+    }
+    int64_t getPositionOffset() const
+    {
+        if (const auto value = config().template getAs<mlir::IntegerAttr>(
+                "position_offset"))
+            return value.getInt();
+        return 0;
+    }
+    int64_t getCurrentLen() const
+    {
+        if (const auto value = config().template getAs<mlir::IntegerAttr>(
+                "current_len"))
+            return value.getInt();
+        return getSeqLen();
+    }
     int64_t getHidden() const { return integer_config("hidden"); }
     int64_t getQueryHeads() const { return integer_config("query_heads"); }
     int64_t getKvHeads() const { return integer_config("kv_heads"); }

@@ -9,8 +9,11 @@ ScheduleTaskId AttentionPvStagePlanner::append(SchedulePlan& plan,
     const target::LPUTargetModel& target) const
 {
     const int64_t tile = target.throughput().mxm_rows;
+    const int64_t keySequenceLength = shape.key_sequence_length > 0
+        ? shape.key_sequence_length : shape.sequence_length;
     const int64_t work = shape.query_heads
-        * (shape.sequence_length / tile) * (shape.head_dim / tile);
+        * (shape.sequence_length / tile)
+        * (keySequenceLength / tile) * (shape.head_dim / tile);
     const auto id = plan.addTask("attention.pv", ScheduleTaskKind::MxmCompute,
         ScheduleStage::Pv, 0, std::max<int64_t>(1, work));
     (void)plan.addDependency(softmax, id,

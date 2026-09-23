@@ -103,6 +103,11 @@ void load_c2c_weight_page_icu_program(
     }
     for (const auto& segment : program.segments)
         icu.push_c2c_dma_raw(segment.hemisphere, segment.dma);
+    for (std::size_t side = 0; side < hw::kHemispheres; ++side)
+        if (program.dma_completion_sync[side])
+            icu.enqueue_control(
+                IcuLocation::C2cDma(static_cast<Hemisphere>(side)),
+                IcuControlInstruction::Sync());
 }
 
 QueueProgram* find_queue(BinaryProgram& program, QueueKind kind,
@@ -228,6 +233,297 @@ std::size_t c2c_queue_end(std::size_t startCycle,
     return packetEnd + frontendWaitCycles;
 }
 
+IcuLocation linked_queue_location(QueueKind kind, std::size_t queueIndex,
+    std::size_t logicalMxmsPerHemisphere)
+{
+    const auto physicalMxm = [&] {
+        if (logicalMxmsPerHemisphere == 0
+            || logicalMxmsPerHemisphere > hw::kMxmsPerHemisphere)
+            throw std::out_of_range(
+                "linked MXM topology cannot be mapped onto the CModel");
+        const auto logicalMxmCount =
+            hw::kHemispheres * logicalMxmsPerHemisphere;
+        if (queueIndex >= logicalMxmCount)
+            throw std::out_of_range(
+                "linked MXM queue index is outside its logical topology");
+        const auto hemisphere = queueIndex / logicalMxmsPerHemisphere;
+        const auto localMxm = queueIndex % logicalMxmsPerHemisphere;
+        return hemisphere * hw::kMxmsPerHemisphere + localMxm;
+    };
+    switch (kind) {
+    case QueueKind::Mem: {
+        const auto hemisphere = static_cast<Hemisphere>(queueIndex
+            / InstructionControlUnit::kMemQueuesPerHemisphere);
+        const auto local = queueIndex
+            % InstructionControlUnit::kMemQueuesPerHemisphere;
+        return IcuLocation::Mem(hemisphere,
+            local / hw::kMemBanksPerSlice,
+            local % hw::kMemBanksPerSlice);
+    }
+    case QueueKind::MxmLoad:
+        return IcuLocation::MxmLoad(physicalMxm());
+    case QueueKind::MxmCompute:
+        return IcuLocation::MxmCompute(physicalMxm());
+    case QueueKind::MxmDequant:
+        return IcuLocation::MxmDequant(physicalMxm());
+    case QueueKind::Vxm:
+        return IcuLocation::Vxm(queueIndex);
+    case QueueKind::SxmTranspose:
+        return IcuLocation::Sxm(
+            static_cast<Hemisphere>(queueIndex), 0);
+    case QueueKind::SxmPermute:
+        return IcuLocation::Sxm(
+            static_cast<Hemisphere>(queueIndex), 1);
+    case QueueKind::C2cDma:
+    case QueueKind::C2cTx:
+    case QueueKind::C2cRx:
+        break;
+    }
+    throw std::logic_error(
+        "page-ready release targets an unsupported ICU queue");
+}
+
+void inject_page_ready_barriers_impl(BinaryProgram& program,
+    const std::vector<std::pair<std::size_t, std::size_t>>& barriers,
+    const std::array<std::vector<std::pair<std::size_t, std::size_t>>,
+        InstructionControlUnit::kMemQueues>& memWriteWindows,
+    std::vector<std::tuple<std::size_t, QueueKind, std::size_t,
+        std::size_t>>* insertedBarriers = nullptr)
+{
+    if (barriers.empty()) return;
+    for (QueueProgram& queue : program.queues) {
+        if (queue.kind == QueueKind::C2cDma
+            || queue.kind == QueueKind::C2cRx
+            || queue.kind == QueueKind::C2cTx)
+            continue;
+
+        auto queueBarriers = barriers;
+        if (queue.kind == QueueKind::Mem
+            && queue.index < memWriteWindows.size()) {
+            // A page-ready event is produced only after that page's
+            // MEM_WRITE_SYNC packets have committed.  Therefore a MEM ICU
+            // must drain any C2C write reservation covering the nominal
+            // consumer boundary before it waits on the page event.  Other
+            // ICUs wait at the original boundary, so no consumer can run
+            // early while the MEM queue completes the causal writes.
+            for (auto& barrier : queueBarriers) {
+                bool moved = true;
+                while (moved) {
+                    moved = false;
+                    for (const auto& [begin, end] :
+                         memWriteWindows[queue.index]) {
+                        if (barrier.first >= begin && barrier.first < end) {
+                            barrier.first = end;
+                            moved = true;
+                        }
+                    }
+                }
+            }
+            std::ranges::sort(queueBarriers,
+                [](const auto& lhs, const auto& rhs) {
+                    return std::tie(lhs.first, lhs.second)
+                        < std::tie(rhs.first, rhs.second);
+                });
+        }
+
+        const auto original = queue.commands;
+        std::vector<QueueCommand> linked;
+        linked.reserve(original.size() + barriers.size());
+        std::vector<std::size_t> oldToNew(original.size(),
+            std::numeric_limits<std::size_t>::max());
+        std::size_t cursor = 0;
+        std::size_t barrierIndex = 0;
+
+        const auto appendBarrier = [&](const auto& barrier,
+                                       std::size_t actualCycle) {
+            append_control(linked,
+                IcuControlInstruction::WaitEvent(barrier.second));
+            if (insertedBarriers != nullptr)
+                insertedBarriers->emplace_back(
+                    barrier.second, queue.kind, queue.index, actualCycle);
+        };
+        auto appendDueBarriers = [&](std::size_t throughCycle) {
+            while (barrierIndex < queueBarriers.size()
+                && queueBarriers[barrierIndex].first <= throughCycle) {
+                appendBarrier(queueBarriers[barrierIndex], cursor);
+                ++barrierIndex;
+            }
+        };
+
+        for (std::size_t commandIndex = 0;
+             commandIndex < original.size();) {
+            appendDueBarriers(cursor);
+            const auto& command = original[commandIndex];
+            if (is_mem_synchronized_raw_packet_header(command)) {
+                constexpr auto words = InstructionControlUnit::MemIcu::
+                    synchronized_packet_word_count;
+                static_cast<void>(decode_mem_synchronized_icu_packet(
+                    queue, commandIndex));
+                const auto reservation =
+                    (command.words[2] & 0x00ffffffU) + 1;
+                for (std::size_t word = 0; word < words; ++word) {
+                    oldToNew[commandIndex + word] = linked.size();
+                    linked.push_back(original[commandIndex + word]);
+                }
+                cursor += reservation;
+                commandIndex += words;
+                continue;
+            }
+            if (const auto cycles = nop_cycles(command)) {
+                // Keep relocation indices total even when an idle command is
+                // split around one or more page barriers.  Parameterized
+                // programs normally have no live relocation into a NOP, but
+                // retaining the mapping keeps the linked image structurally
+                // valid for inspection and re-serialization.
+                oldToNew[commandIndex] = linked.size();
+                const auto idleEnd = cursor + *cycles;
+                while (barrierIndex < queueBarriers.size()
+                    && queueBarriers[barrierIndex].first < idleEnd) {
+                    const auto barrierCycle = std::max(
+                        cursor, queueBarriers[barrierIndex].first);
+                    append_nop(linked, barrierCycle - cursor);
+                    cursor = barrierCycle;
+                    appendBarrier(
+                        queueBarriers[barrierIndex], barrierCycle);
+                    ++barrierIndex;
+                }
+                append_nop(linked, idleEnd - cursor);
+                cursor = idleEnd;
+                ++commandIndex;
+                continue;
+            }
+            if (is_icu_control_raw_word_command(command)) {
+                oldToNew[commandIndex] = linked.size();
+                linked.push_back(command);
+                ++commandIndex;
+                continue;
+            }
+            if (is_mem_write_read_2d_raw_packet_header(command)
+                || is_fu_3d_raw_packet_header(command)) {
+                const auto words = fu_3d_raw_packet_word_count(queue.kind);
+                const bool writeRead =
+                    is_mem_write_read_2d_raw_packet_header(command);
+                const auto loop = writeRead
+                    ? IcuLoop3D {}
+                    : decode_fu_3d_raw_packet_loop(queue, commandIndex);
+                const auto wait = writeRead ? std::size_t {0}
+                                            : loop.wait_cycle;
+                const auto idleEnd = cursor + wait;
+                while (barrierIndex < queueBarriers.size()
+                    && queueBarriers[barrierIndex].first <= idleEnd) {
+                    const auto barrierCycle = std::max(
+                        cursor, queueBarriers[barrierIndex].first);
+                    append_nop(linked, barrierCycle - cursor);
+                    cursor = barrierCycle;
+                    appendBarrier(
+                        queueBarriers[barrierIndex], barrierCycle);
+                    ++barrierIndex;
+                }
+                const auto consumedWait = cursor
+                    - (idleEnd - wait);
+                const auto duration = writeRead
+                    ? detail::mem_icu_write_read_2d_last_issue_cycle(
+                          decode_mem_write_read_2d_raw_packet(
+                              queue, commandIndex)) + 1
+                    : loop_cycles(loop);
+                const auto commandEnd = idleEnd - wait + duration;
+                // A hardware ICU cannot suspend a decoded 3-D domain halfway
+                // through its nested loop. Keep a barrier crossed by the
+                // active domain pending so appendDueBarriers places it at the
+                // next coarse-instruction boundary. This matters when the
+                // active command consumes the previous weight page and the
+                // following command is the first consumer of the new page.
+                const auto newHeader = linked.size();
+                for (std::size_t word = 0; word < words; ++word) {
+                    oldToNew[commandIndex + word] = linked.size();
+                    linked.push_back(original[commandIndex + word]);
+                }
+                if (!writeRead && consumedWait != 0)
+                    set_raw_3d_wait(
+                        linked[newHeader], wait - consumedWait);
+                cursor = commandEnd;
+                commandIndex += words;
+                continue;
+            }
+            const auto appendStreamNd = [&](const auto& schedule) {
+                const auto start = schedule.start_cycle;
+                std::size_t final = start;
+                for (std::size_t dimension = 0;
+                     dimension < schedule.rank; ++dimension)
+                    final += (schedule.counts[dimension] - 1)
+                        * schedule.cycle_strides[dimension];
+                appendDueBarriers(start);
+                oldToNew[commandIndex] = linked.size();
+                linked.push_back(command);
+                cursor = final + 1;
+                ++commandIndex;
+            };
+            if (is_mem_stream_nd_command(command)) {
+                appendStreamNd(decode_mem_stream_nd_command(command));
+                continue;
+            }
+            if (is_mxm_stream_nd_command(command)) {
+                appendStreamNd(decode_mxm_stream_nd_command(command));
+                continue;
+            }
+            if (is_vxm_stream_nd_command(command)) {
+                appendStreamNd(
+                    decode_vxm_stream_nd_command(command).schedule);
+                continue;
+            }
+            if (command.instruction_kind != InstructionKind::None
+                && command.extension_words.empty()) {
+                // Native one-cycle FU instructions remain legal alongside
+                // direct 3-D domains. Their absolute placement has already
+                // been materialized as preceding NOPs, so a page barrier can
+                // be inserted at either instruction boundary.
+                oldToNew[commandIndex] = linked.size();
+                linked.push_back(command);
+                ++cursor;
+                ++commandIndex;
+                continue;
+            }
+            if (is_fu_3d_raw_word_command(command))
+                throw std::logic_error(
+                    "orphan FU 3-D word while injecting page barrier");
+            throw std::logic_error(
+                "page-ready barrier requires direct FU 3-D/NOP queues: "
+                "kind="
+                + std::to_string(static_cast<unsigned>(queue.kind))
+                + ", queue=" + std::to_string(queue.index)
+                + ", command_index=" + std::to_string(commandIndex)
+                + ", instruction_kind="
+                + std::to_string(static_cast<unsigned>(
+                    command.instruction_kind))
+                + ", word_count=" + std::to_string(command.word_count)
+                + ", extension_words="
+                + std::to_string(command.extension_words.size())
+                + ", opcode="
+                + std::to_string(static_cast<unsigned>(
+                    isa::decode_icu_command_opcode(command.command)))
+                + ", word0=" + std::to_string(command.words[0]));
+        }
+        queue.commands = std::move(linked);
+
+        const auto relocate = [&](auto& relocations) {
+            for (auto& relocation : relocations) {
+                if (relocation.queue_kind != queue.kind
+                    || relocation.queue_index != queue.index)
+                    continue;
+                if (relocation.command_index >= oldToNew.size()
+                    || oldToNew[relocation.command_index]
+                        == std::numeric_limits<std::size_t>::max())
+                    throw std::logic_error(
+                        "page barrier relocation target was not preserved");
+                relocation.command_index = static_cast<std::uint32_t>(
+                    oldToNew[relocation.command_index]);
+            }
+        };
+        relocate(program.address_relocations);
+        relocate(program.scale_relocations);
+    }
+}
+
 } // namespace
 
 C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
@@ -318,6 +614,8 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
             dma,
             segment.vector_count,
         });
+        program.dma_completion_sync[hemisphere_index(segment.hemisphere)] =
+            true;
     }
     program.next_sync_tag = firstSyncTag
         + static_cast<std::uint32_t>(program.segments.size());
@@ -345,6 +643,8 @@ void C2cWeightPager::begin_schedule(const BinaryProgram& program)
     schedule_open_ = true;
     for (auto& windows : mem_idle_windows_) windows.clear();
     for (auto& windows : linked_mem_windows_) windows.clear();
+    linked_page_barriers_.clear();
+    linked_page_releases_.clear();
 
     std::array<bool, InstructionControlUnit::kMemQueues> seenMem{};
     for (const auto& queue : program.queues) {
@@ -424,7 +724,8 @@ void C2cWeightPager::begin_schedule(const BinaryProgram& program)
 C2cWeightPageFence C2cWeightPager::schedule(
     BinaryProgram& binary, const C2cWeightPage& page,
     std::size_t startCycle, std::size_t transferEndCycle,
-    std::size_t readyCycle, std::size_t launchEventTag)
+    std::size_t readyCycle, std::size_t launchEventTag,
+    std::size_t pageReadyEventTag)
 {
     if (!schedule_open_)
         throw std::logic_error(
@@ -523,15 +824,14 @@ C2cWeightPageFence C2cWeightPager::schedule(
         c2cLogicalEnd = std::max({c2cLogicalEnd,
             rxLogicalEnds[side], dmaLogicalEnds[side]});
     }
-    if (hasFiniteReadyCycle
-        && std::max(transportEnd, c2cLogicalEnd) > readyCycle)
-        throw std::logic_error(
-            "C2C/MEM ICU linking moved a weight page past its first consumer");
-
     // Transport end is an estimate derived from the external-memory model.
-    // Keep the single MEM ICU owned through the first consumer so a late DDR
-    // response cannot shift the ordinary static MEM program. Page-ready
-    // synchronization absorbs any completion later than this boundary.
+    // Keep the single MEM ICU owned through the first consumer.  If the
+    // estimated transfer itself is late, the synchronized MEM packet remains
+    // at the queue head while the page-ready consumer barrier holds every
+    // ordinary ICU.  C2C DMA/RX and MEM transport-only issue keep advancing;
+    // once every page write retires the barrier releases all page consumers
+    // together.  Rejecting transportEnd > readyCycle here would bypass the
+    // hardware synchronization mechanism that exists precisely for this case.
     const auto reservationEnd = hasFiniteReadyCycle
         ? readyCycle : transportEnd;
     if (reservationEnd <= resolvedStart)
@@ -540,6 +840,9 @@ C2cWeightPageFence C2cWeightPager::schedule(
     const auto reservationDuration = reservationEnd - resolvedStart;
     const auto lowered = lower_c2c_weight_page_to_icu(
         page, hardware, next_sync_tag_, reservationDuration);
+    if (pageReadyEventTag != 0)
+        linked_page_barriers_.push_back(
+            LinkedPageBarrier {readyCycle, pageReadyEventTag});
 
     for (const auto queue : targetQueues) {
         auto remaining = std::vector<MemIdleWindow> {};
@@ -625,11 +928,79 @@ C2cWeightPageFence C2cWeightPager::schedule(
     return fence;
 }
 
+void C2cWeightPager::inject_page_ready_barriers(
+    BinaryProgram& program) const
+{
+    std::vector<std::pair<std::size_t, std::size_t>> pageBarriers;
+    pageBarriers.reserve(linked_page_barriers_.size());
+    for (const LinkedPageBarrier& barrier : linked_page_barriers_)
+        pageBarriers.emplace_back(barrier.ready_cycle, barrier.event_tag);
+    std::array<std::vector<std::pair<std::size_t, std::size_t>>,
+        InstructionControlUnit::kMemQueues> memWriteWindows;
+    for (std::size_t queue = 0; queue < linked_mem_windows_.size(); ++queue) {
+        memWriteWindows[queue].reserve(linked_mem_windows_[queue].size());
+        for (const LinkedMemWindow& window : linked_mem_windows_[queue])
+            memWriteWindows[queue].emplace_back(window.begin, window.end);
+    }
+    inject_page_ready_barriers_impl(program, pageBarriers, memWriteWindows);
+}
+
+std::vector<C2cWeightPager::PageReadyRelease>
+C2cWeightPager::page_ready_releases(std::size_t eventTag) const
+{
+    const auto barrier = std::ranges::find_if(linked_page_barriers_,
+        [&](const LinkedPageBarrier& candidate) {
+            return candidate.event_tag == eventTag;
+        });
+    if (barrier == linked_page_barriers_.end()) return {};
+    std::vector<PageReadyRelease> releases;
+    for (const LinkedPageRelease& release : linked_page_releases_)
+        if (release.event_tag == eventTag)
+            releases.push_back(PageReadyRelease {
+                release.location,
+                release.barrier_cycle - barrier->ready_cycle});
+    std::ranges::sort(releases,
+        [](const PageReadyRelease& lhs, const PageReadyRelease& rhs) {
+            return lhs.phase_offset < rhs.phase_offset;
+        });
+    return releases;
+}
+
 void C2cWeightPager::finalize_schedule(BinaryProgram& program)
 {
     if (!schedule_open_)
         throw std::logic_error(
             "begin_schedule must precede executable C2C page finalization");
+
+    std::ranges::sort(linked_page_barriers_,
+        [](const LinkedPageBarrier& lhs, const LinkedPageBarrier& rhs) {
+            return std::tie(lhs.ready_cycle, lhs.event_tag)
+                < std::tie(rhs.ready_cycle, rhs.event_tag);
+        });
+    std::vector<std::pair<std::size_t, std::size_t>> pageBarriers;
+    pageBarriers.reserve(linked_page_barriers_.size());
+    for (const LinkedPageBarrier& barrier : linked_page_barriers_)
+        pageBarriers.emplace_back(barrier.ready_cycle, barrier.event_tag);
+    std::array<std::vector<std::pair<std::size_t, std::size_t>>,
+        InstructionControlUnit::kMemQueues> memWriteWindows;
+    for (std::size_t queue = 0; queue < linked_mem_windows_.size(); ++queue) {
+        memWriteWindows[queue].reserve(linked_mem_windows_[queue].size());
+        for (const LinkedMemWindow& window : linked_mem_windows_[queue])
+            memWriteWindows[queue].emplace_back(window.begin, window.end);
+    }
+    std::vector<std::tuple<std::size_t, QueueKind, std::size_t,
+        std::size_t>> insertedBarriers;
+    inject_page_ready_barriers_impl(
+        program, pageBarriers, memWriteWindows, &insertedBarriers);
+    linked_page_releases_.clear();
+    linked_page_releases_.reserve(insertedBarriers.size());
+    for (const auto& [eventTag, kind, queueIndex, barrierCycle] :
+         insertedBarriers)
+        linked_page_releases_.push_back(LinkedPageRelease {
+            eventTag,
+            linked_queue_location(kind, queueIndex,
+                program.hardware.mxms_per_hemisphere),
+            barrierCycle});
 
     for (std::size_t queueIndex = 0;
          queueIndex < InstructionControlUnit::kMemQueues; ++queueIndex) {
@@ -658,8 +1029,26 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
                     || (!unbounded && window.end > idleEnd))
                     throw std::logic_error(
                         "linked MEM_WRITE_SYNC escaped its reserved idle window");
-                append_nop(linked, window.begin - cursor);
-                for (const auto& packet : window.packets) {
+                const auto leadingWait = window.begin - cursor;
+                // WRITE_SYNC already waits for its tagged C2C notification.
+                // Let it own the preceding idle cycles too, while extending
+                // its reservation so the following MEM packet stays at the
+                // same scheduled cycle. The header has a 24-bit reservation.
+                constexpr auto kReservationMask = std::uint32_t {0xffffff};
+                const auto canAbsorbWait = !window.packets.empty()
+                    && leadingWait <= kReservationMask
+                        - (window.packets.front()[0].lanes[2]
+                            & kReservationMask);
+                if (!canAbsorbWait) append_nop(linked, leadingWait);
+                for (std::size_t packetIndex = 0;
+                     packetIndex < window.packets.size(); ++packetIndex) {
+                    auto packet = window.packets[packetIndex];
+                    if (packetIndex == 0 && canAbsorbWait) {
+                        auto& header = packet[0].lanes[2];
+                        header = (header & ~kReservationMask)
+                            | ((header & kReservationMask)
+                                + static_cast<std::uint32_t>(leadingWait));
+                    }
                     const auto encoded =
                         encode_mem_synchronized_icu_packet(packet);
                     linked.insert(linked.end(),
@@ -678,6 +1067,17 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
                 emitWindows(idleEnd, false);
                 append_nop(linked, idleEnd - cursor);
                 cursor = idleEnd;
+                ++commandIndex;
+                continue;
+            }
+            if (is_icu_control_raw_word_command(command)) {
+                const auto control = decode_icu_control_raw_word(command);
+                if (control.opcode != IcuControlOpcode::WaitEvent)
+                    throw std::logic_error(
+                        "linked MEM page barrier decoded as another control");
+                emitWindows(cursor, false);
+                oldToNew[commandIndex] = linked.size();
+                linked.push_back(command);
                 ++commandIndex;
                 continue;
             }
@@ -841,12 +1241,9 @@ void C2cWeightPager::enqueue(const C2cWeightPage& page)
          queue < active_mem_reservations_target_.size(); ++queue)
         active_mem_reservations_target_[queue] =
             chip.icu().mem_iq(queue).synchronized_completed_count();
-    auto usedHemisphere = std::array<bool, hw::kHemispheres> {};
     for (std::size_t segmentIndex = 0;
          segmentIndex < page.segments.size(); ++segmentIndex) {
         const auto& segment = page.segments[segmentIndex];
-        const auto side = hemisphere_index(segment.hemisphere);
-        usedHemisphere[side] = true;
         const auto queue = program.segments[segmentIndex].mem_queue;
         if (std::find(target_mem_queues_.begin(),
                 target_mem_queues_.end(), queue)
@@ -857,10 +1254,44 @@ void C2cWeightPager::enqueue(const C2cWeightPage& page)
         stats_.vectors += segment.vector_count;
     }
     load_c2c_weight_page_icu_program(chip.icu(), program);
+    // Keep the exact standalone packets sent to each physical ICU. The
+    // executable linker cannot contain these pre-execution commands because
+    // each page is loaded and retired before the executable starts.
+    last_enqueued_program_ = BinaryProgram {};
+    last_enqueued_program_.hardware.words_per_bank =
+        static_cast<std::uint32_t>(hardware.sram_depth_rows);
+    last_enqueued_program_.hardware.sram_depth_rows =
+        static_cast<std::uint32_t>(hardware.sram_depth_rows);
+    last_enqueued_program_.hardware.mxms_per_hemisphere =
+        static_cast<std::uint32_t>(hardware.mxms_per_hemisphere);
+    last_enqueued_program_.hardware.mxm_weight_buffers =
+        static_cast<std::uint32_t>(hardware.mxm_weight_buffers);
+    last_enqueued_program_.hardware.vxm_alus =
+        static_cast<std::uint32_t>(hardware.vxm_alus);
+    last_enqueued_program_.hardware.c2c_streams_per_direction =
+        static_cast<std::uint32_t>(hardware.c2c_streams_per_direction);
+    last_enqueued_program_.hardware.mxm_local_dequant_enabled =
+        hardware.mxm_local_dequant_enabled;
+    last_enqueued_program_.hardware.mxm_weight_activation_overlap_enabled =
+        hardware.mxm_weight_activation_overlap_enabled;
+    last_enqueued_program_.target_abi =
+        executable_target_abi(last_enqueued_program_.hardware);
+    for (const auto& segment : program.segments) {
+        const auto side = hemisphere_index(segment.hemisphere);
+        append_c2c_endpoint(find_or_create_queue(last_enqueued_program_,
+            QueueKind::C2cRx, side).commands, segment.rx);
+        append_c2c_dma(find_or_create_queue(last_enqueued_program_,
+            QueueKind::C2cDma, side).commands, segment.dma);
+        auto encoded = encode_mem_synchronized_icu_packet(
+            segment.mem_write_sync);
+        auto& mem = find_or_create_queue(last_enqueued_program_,
+            QueueKind::Mem, segment.mem_queue).commands;
+        mem.insert(mem.end(), encoded.begin(), encoded.end());
+    }
     for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
-        if (!usedHemisphere[side]) continue;
-        chip.icu().enqueue_control(
-            IcuLocation::C2cDma(static_cast<Hemisphere>(side)),
+        if (!program.dma_completion_sync[side]) continue;
+        append_control(find_or_create_queue(last_enqueued_program_,
+            QueueKind::C2cDma, side).commands,
             IcuControlInstruction::Sync());
     }
     stats_.bytes = stats_.vectors * hw::kPhysicalVectorBytes;

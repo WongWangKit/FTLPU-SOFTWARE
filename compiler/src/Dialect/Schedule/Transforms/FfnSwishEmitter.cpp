@@ -74,7 +74,7 @@ mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
     llvm::ArrayRef<int64_t> hiddenSlices, mlir::Value output,
     int64_t inputCycle, int64_t mTile, int64_t pair,
     int64_t sourceHemisphere, int64_t rowCount, bool mirroredBroadcast,
-    FfnLoopDomain3D outerDomain)
+    FfnLoopDomain3D outerDomain, bool directParityDomain)
 {
     constexpr int64_t kVxmSwishLatency = 17;
     const int64_t tile = target.throughput().mxm_rows;
@@ -146,6 +146,25 @@ mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
             + ((token / tile) * hiddenBlocks + nblock)
                 * target.throughput().tile_rows
             + tokenWave;
+        if (directParityDomain && distributed16) {
+            // Tail finishes even pairs before odd pairs.  Token wave, pair,
+            // and parity fit directly in the three hardware MEM loops.
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const int64_t slice = hiddenSlices[2 * tokenLane + byte];
+                const auto latency = target.transport_latency(
+                    target::StreamEndpoint::VxmResult,
+                    target::StreamEndpoint::Mem,
+                    target::StreamDirection::East, slice);
+                if (!latency) continue;
+                emitFfnMemTransfer3D(rewriter, plan.getLoc(),
+                    inputCycle + tokenLane + kVxmSwishLatency + *latency,
+                    destination, slice, "write", address,
+                    destinationStream + byte, occurrenceCount, blockRows, 1,
+                    hiddenBank, outerDomain);
+            }
+            lastHidden = output;
+            continue;
+        }
         FfnLoopDomain3D domain = outerDomain;
         domain.wave_count = occurrenceCount;
         domain.wave_interval = blockRows;

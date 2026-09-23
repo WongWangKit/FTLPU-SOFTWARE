@@ -13,6 +13,7 @@ namespace ftlpu::compiler::target {
 enum class MxmExecutionPolicy {
     Auto,
     Vector,
+    Native4,
     Legacy,
 };
 
@@ -37,6 +38,7 @@ struct MxmExecutionStrategy {
     int64_t weight_stream_count = 16;
     int64_t activation_stream_count = 2;
     int64_t rows_per_compute_issue = 1;
+    bool decode_native4 = false;
 
     bool uses_local_dequant() const
     {

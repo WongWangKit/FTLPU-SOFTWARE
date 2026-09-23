@@ -77,6 +77,16 @@ invocation it transfers both windows back and updates the logical backing.
 `read_state(name)` returns the logical `[token, head, dimension]` image, and
 `reset_states()` clears all logical states. No host API directly writes MEM.
 
+The compiler directly emits the MEM side of page-out. Every physically
+contiguous K/V segment has one fixed two-word `MEM_READ_SYNC` with an internal
+binding address relocation. Runtime adds only the C2C TX packet carrying the
+same tag and destination MEM ICU route plus the DMA Store; it no longer
+synthesizes an ordinary `Read + Repeat`. Each TX lane grants tokens one vector
+at a time as input pipeline space becomes available, so DDR backpressure stalls
+`MEM_READ_SYNC` without losing data already read from MEM. The sequence-32
+single-layer program currently contains 40 `MEM_READ_SYNC` instructions, all
+visible in the per-ICU CSV export.
+
 For a multi-layer model, state names are `layers.N.key_cache` and
 `layers.N.value_cache`. They are distinct from ping-pong weight pages. Runtime
 statistics and the pipeline CSV expose `state_page_in/out` and
@@ -90,6 +100,8 @@ compares all 8,192 produced K values and all
 8,192 V values with the Hugging Face fixture, checks that the unused capacity
 remains zero, validates the 49,152-value decoder output, and verifies state
 reset.
+The same full test checks 256 linked `MEM_WRITE_SYNC` instructions, 40 linked
+`MEM_READ_SYNC` instructions, and K/V page-out through C2C TX/DMA into DDR.
 
 Current measured errors are:
 

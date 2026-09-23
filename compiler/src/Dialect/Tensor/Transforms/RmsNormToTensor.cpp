@@ -19,12 +19,15 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const int64_t rows = inputType.getDimSize(0);
     const int64_t hidden = inputType.getDimSize(1);
     const int64_t tile = target.throughput().mxm_rows;
+    const bool singleTokenDecode = rows == 1;
+    const int64_t physicalRows = singleTokenDecode ? tile : rows;
     if (!is_lpu_16bit_float(inputType.getElementType())
         || weightType.getElementType()
             != inputType.getElementType()
         || op.getResult().getType().getElementType()
             != inputType.getElementType()
-        || rows % tile != 0 || hidden % tile != 0) {
+        || (!singleTokenDecode && rows % tile != 0)
+        || hidden % tile != 0) {
         op.emitError(
             "RMSNorm lowering requires tile-aligned matching "
             "16-bit float tensors");
@@ -57,7 +60,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             : fixed_allocation(PlacementKind::Activation,
                   distributedInputSlices,
                   target.uses_dedicated_slice_roles() ? 0 : 4096,
-                  rows * hidden / 256, matrixBytes,
+                  physicalRows * hidden / 256, matrixBytes,
                   "fp16_mxm_distributed_16", "both", workingBank);
     const int64_t inputBank = input.bank;
     const int64_t resultBank = memory.banks_per_slice > 1
@@ -160,8 +163,8 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         return mlir::failure();
     }
     const int64_t distributedRows =
-        rows * hidden / (tile * throughput.lanes_per_tile);
-    const int64_t tokenBlocks = rows / tile;
+        physicalRows * hidden / (tile * throughput.lanes_per_tile);
+    const int64_t tokenBlocks = physicalRows / tile;
     const int64_t firstScratchBase =
         target.uses_dedicated_slice_roles() ? 0 : 4608;
     const int64_t normalizedScratchBase =
@@ -177,11 +180,12 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
         feedbackInputSlices, firstScratchBase,
         distributedRows + tokenBlocks,
-        matrixBytes + rows * 2, "fp16_vxm_distributed_16", "both",
+        physicalRows * hidden * 2 + physicalRows * 2,
+        "fp16_vxm_distributed_16", "both",
         target.uses_dedicated_slice_roles() ? resultBank : workingBank));
     scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
         normalizedSlices, normalizedScratchBase,
-        distributedRows, matrixBytes,
+        distributedRows, physicalRows * hidden * 2,
         "fp16_vxm_distributed_16", "both",
         target.uses_dedicated_slice_roles() ? inputBank : workingBank));
     const auto distributedResultSlices =
@@ -189,7 +193,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const Allocation result = fixed_allocation(PlacementKind::FinalResult,
         distributedResultSlices,
         target.uses_dedicated_slice_roles() ? 0 : 5632,
-        rows * hidden / 256, matrixBytes,
+        physicalRows * hidden / 256, matrixBytes,
         "fp16_mxm_distributed_16", "both",
         target.uses_dedicated_slice_roles() ? resultBank : workingBank);
     if (mlir::failed(planner.bind(op.getInput(), input))

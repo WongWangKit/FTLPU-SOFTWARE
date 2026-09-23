@@ -12,11 +12,13 @@ AttentionWorkPlanner::AttentionWorkPlanner(
     const auto& memory = target.memory();
     if (shape_.sequence_length <= 0 || shape_.query_heads <= 0 || shape_.kv_heads <= 0
         || shape_.head_dim <= 0 || shape_.query_heads % shape_.kv_heads != 0
-        || shape_.sequence_length % throughput.mxm_rows != 0
+        || (shape_.sequence_length != 1
+            && shape_.sequence_length % throughput.mxm_rows != 0)
         || shape_.head_dim % throughput.mxm_rows != 0)
         throw std::invalid_argument("attention shape is not tile-aligned GQA");
 
-    query_block_count_ = shape_.sequence_length / throughput.mxm_rows;
+    query_block_count_ = (shape_.sequence_length
+        + throughput.mxm_rows - 1) / throughput.mxm_rows;
     const int64_t groups = shape_.query_heads / shape_.kv_heads;
     const int64_t slots_per_wave = memory.hemispheres * throughput.mxms_per_hemisphere;
     if (slots_per_wave <= 0) throw std::invalid_argument("target has no MXM slots");

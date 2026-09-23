@@ -175,14 +175,24 @@ IcuLoop3D loop_3d(int64_t cycle, int64_t innerCount,
     int64_t middleInterval = 1, int64_t outerCount = 1,
     int64_t outerInterval = 1)
 {
+    // A zero stride is harmless for a singleton schedule dimension, but the
+    // physical ICU packet reserves zero as an invalid encoding. Canonicalize
+    // unused dimensions here instead of making each schedule emitter invent a
+    // dummy interval.
+    const auto encodedInterval = [](int64_t count, int64_t interval) {
+        return count == 1 && interval == 0 ? int64_t {1} : interval;
+    };
     return IcuLoop3D {
         as_size(cycle, "start cycle"),
         {as_size(innerCount, "inner count"),
             as_size(middleCount, "middle count"),
             as_size(outerCount, "outer count")},
-        {as_size(innerInterval, "inner interval"),
-            as_size(middleInterval, "middle interval"),
-            as_size(outerInterval, "outer interval")},
+        {as_size(encodedInterval(innerCount, innerInterval),
+             "inner interval"),
+            as_size(encodedInterval(middleCount, middleInterval),
+                "middle interval"),
+            as_size(encodedInterval(outerCount, outerInterval),
+                "outer interval")},
     };
 }
 
@@ -481,6 +491,55 @@ void create_mem_write_read_2d_command(mlir::OpBuilder& builder,
 
 void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
 {
+    if (op.getOpcode() == "decode_load_activation"
+        || op.getOpcode() == "decode_stream_compute") {
+        // Decode is a native MXM control instruction wrapped by the hardware
+        // STREAM_ND ICU descriptor.  Keep it explicit in Command IR; the
+        // binary lowering encodes this op directly and never reconstructs it
+        // from per-cycle FU issues.
+        mlir::OperationState state(op.getLoc(),
+            command::MxmOp::getOperationName());
+        state.addAttributes({
+            builder.getNamedAttr("cycle", op.getCycleAttr()),
+            builder.getNamedAttr("queue", op.getUnitIdAttr()),
+            builder.getNamedAttr("opcode", op.getOpcodeAttr()),
+            builder.getNamedAttr("weight_buffer", op.getWeightBufferAttr()),
+            builder.getNamedAttr("weight_column", op.getWeightColumnAttr()),
+            builder.getNamedAttr("activation_stream_base",
+                op.getActivationStreamBaseAttr()),
+            builder.getNamedAttr("output_stream_base",
+                op.getOutputStreamBaseAttr()),
+            builder.getNamedAttr("repeat_count", op.getRepeatCountAttr()),
+            builder.getNamedAttr("repeat_interval",
+                op.getRepeatIntervalAttr()),
+            builder.getNamedAttr("accumulator_address",
+                op.getAccumulatorAddressAttr()),
+            builder.getNamedAttr("accumulator_row_stride",
+                op.getAccumulatorRowStrideAttr()),
+            builder.getNamedAttr("accumulator_destination",
+                op.getAccumulatorDestinationAttr()),
+            builder.getNamedAttr("accumulator_clear",
+                op.getAccumulatorClearAttr()),
+        });
+        const auto copy = [&](llvm::StringRef name) {
+            if (auto attr = op->getAttr(name)) state.addAttribute(name, attr);
+        };
+        copy("data_format");
+        copy("accumulator_output_format");
+        copy("weight_load_mode");
+        copy("weight_inner_column");
+        copy("weight_input_mode");
+        copy("weight_stream_base");
+        copy("decode_layout");
+        copy("wave_count");
+        copy("wave_interval");
+        copy("wave_weight_column_stride");
+        copy("wave_accumulator_address_stride");
+        copy("group_count");
+        copy("group_interval");
+        builder.create(state);
+        return;
+    }
     const auto loop = loop_3d(op.getCycle(), op.getRepeatCount(),
         op.getRepeatInterval(), op.getWaveCount().value_or(1),
         op.getWaveInterval().value_or(1), op.getGroupCount().value_or(1),

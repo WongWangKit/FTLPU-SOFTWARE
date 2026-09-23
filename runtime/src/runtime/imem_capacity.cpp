@@ -125,7 +125,7 @@ std::uint64_t synchronized_mem_points(const QueueCommand& header)
 {
     if (!is_mem_synchronized_raw_packet_header(header))
         throw std::logic_error(
-            "queue command is not a MEM_WRITE_SYNC header");
+            "queue command is not a synchronized MEM header");
     return static_cast<std::uint64_t>((header.words[0] >> 2) & 0xffffU)
         + 1;
 }

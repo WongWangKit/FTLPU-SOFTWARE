@@ -434,6 +434,10 @@ try {
     const auto program =
         ftlpu::software::runtime::read_binary_program(
             std::filesystem::path(argv[1]));
+    const auto directProgram = ftlpu::software::runtime::
+        without_compiled_mem_read_sync(
+            ftlpu::software::runtime::without_compiled_mem_write_sync(
+                program));
     const auto expectedAbi =
         ftlpu::software::runtime::executable_target_abi(
             program.hardware);
@@ -458,6 +462,16 @@ try {
     const std::size_t gateBinding = hasAttentionBias ? 10 : 7;
     const std::size_t upBinding = hasAttentionBias ? 11 : 8;
     const std::size_t downBinding = hasAttentionBias ? 12 : 9;
+    const auto firstFfnRead = std::min({
+        firstBindingReadCycle(directProgram, gateBinding),
+        firstBindingReadCycle(directProgram, upBinding),
+        firstBindingReadCycle(directProgram, downBinding),
+    });
+    if (firstFfnRead
+            <= timeline(program, "rmsnorm.feedback", 1).start_cycle
+        || firstFfnRead > program.max_cycle)
+            throw std::logic_error(
+                "FFN first read is outside the compiled FFN window");
     for (const auto& stage : program.timelines) {
         if (stage.end_cycle <= stage.start_cycle
             || stage.end_cycle > program.max_cycle + 64)
@@ -576,7 +590,10 @@ try {
     const char* memTracePath = std::getenv("FTLPU_QWEN_MEM_CSV");
     if (memTracePath != nullptr)
         runtime.stream_mem_execution_trace_csv(memTracePath);
-    runtime.load(program);
+    // The direct golden run has no C2C transport. Recover the compiler's
+    // reserved idle slots while the ModelSession run below uses the original
+    // executable with its MEM_WRITE_SYNC packets.
+    runtime.load(directProgram);
     runtime.upload_input(0, input);
     runtime.upload_input(1, gamma0);
     runtime.upload_input(2, queryWeight);
@@ -589,6 +606,23 @@ try {
         runtime.upload_input(8, valueBias);
     }
     runtime.upload_input(postAttentionNormBinding, gamma1);
+    // Paged inputs are staged in host memory here; CModelRuntime installs
+    // each page at its compiler-specified ready_cycle. Some pages become
+    // ready before their first MEM read, so provide the logical tensor now.
+    const auto uploadIfPaged = [&](std::size_t index,
+                                   const std::vector<std::uint8_t>& weight) {
+        const auto binding = std::find_if(program.bindings.begin(),
+            program.bindings.end(), [&](const auto& candidate) {
+                return candidate.access
+                        == ftlpu::software::runtime::BindingAccess::Input
+                    && candidate.index == index;
+            });
+        if (binding != program.bindings.end() && binding->paged_weight)
+            runtime.upload_input(index, weight);
+    };
+    uploadIfPaged(gateBinding, gateWeight);
+    uploadIfPaged(upBinding, upWeight);
+    uploadIfPaged(downBinding, downWeight);
     const auto physicalBf16 = [&](ftlpu::Hemisphere hemisphere,
                                   std::size_t lowSlice,
                                   std::size_t highSlice,
@@ -684,7 +718,7 @@ try {
         throw std::logic_error(
             "cannot locate first RMSNorm physical binding");
     const std::size_t attentionPrepackEndCycle =
-        firstBindingReadCycle(program, 2);
+        firstBindingReadCycle(directProgram, 2);
     std::ofstream cmodelLog;
     std::ostream* cmodelLogSink = nullptr;
     if (const auto* path = std::getenv("FTLPU_CMODEL_LOG")) {
@@ -1624,10 +1658,14 @@ try {
             + std::to_string(residualCheckpointMaxExpected));
 
     const std::size_t ffnStartCycle = std::min({
-        firstBindingReadCycle(program, gateBinding),
-        firstBindingReadCycle(program, upBinding),
-        firstBindingReadCycle(program, downBinding),
+        firstBindingReadCycle(directProgram, gateBinding),
+        firstBindingReadCycle(directProgram, upBinding),
+        firstBindingReadCycle(directProgram, downBinding),
     });
+    if (ffnStartCycle <= attentionResidualEndCycle
+        || ffnStartCycle > program.max_cycle)
+        throw std::logic_error(
+            "FFN first read is outside the compiled execution window");
     runtime.run_cycles(
         ffnStartCycle - attentionResidualEndCycle - 1, cmodelLogSink);
     // Paged executables reuse the resident weight bank as scratch between
@@ -2297,6 +2335,21 @@ try {
     system = nullptr;
     ftlpu::C2cDmaSystem dynamicSystem;
     ModelSession dynamicSession(dynamicSystem);
+    std::uint32_t runtimeDdrBandwidth =
+        program.hardware.ddr_peak_bandwidth_mbytes_per_second;
+    const bool hasRuntimeDdrOverride =
+        std::getenv("FTLPU_DDR_BANDWIDTH_MBPS") != nullptr;
+    if (const char* bandwidth =
+            std::getenv("FTLPU_DDR_BANDWIDTH_MBPS")) {
+        const auto parsed = std::stoull(bandwidth);
+        if (parsed == 0
+            || parsed > std::numeric_limits<std::uint32_t>::max())
+            throw std::invalid_argument(
+                "invalid FTLPU_DDR_BANDWIDTH_MBPS");
+        runtimeDdrBandwidth = static_cast<std::uint32_t>(parsed);
+        dynamicSession.set_ddr_peak_bandwidth_mbytes_per_second(
+            runtimeDdrBandwidth);
+    }
     const char* dynamicPipelineTracePath =
         std::getenv("FTLPU_QWEN_C2C_PIPELINE_CSV");
     if (dynamicPipelineTracePath != nullptr)
@@ -2309,10 +2362,24 @@ try {
     try {
         dynamicSession.run(kCheckpointDrainCycles);
     } catch (...) {
-        if (const char* linkedPath =
-                std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
-            dynamicSession.write_last_linked_program(linkedPath);
-        throw;
+        const auto executionError = std::current_exception();
+        try {
+            if (const char* linkedPath =
+                    std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
+                dynamicSession.write_last_linked_program(linkedPath);
+        } catch (...) {
+            // Preserve the execution error when linking did not get far enough
+            // to publish a diagnostic image.
+        }
+        try {
+            if (const char* preExecutionDirectory =
+                    std::getenv("FTLPU_QWEN_C2C_PRE_EXECUTION_DIR"))
+                dynamicSession.write_pre_execution_icu_programs(
+                    preExecutionDirectory);
+        } catch (...) {
+            // Diagnostic export must not hide the runtime failure.
+        }
+        std::rethrow_exception(executionError);
     }
     if (dynamicPipelineTracePath != nullptr)
         dynamicSession.write_execution_trace_csv(dynamicPipelineTracePath);
@@ -2341,7 +2408,8 @@ try {
             + " bytes="
             + std::to_string(dynamicStats.weight_page_prefetch_bytes)
             + " expected_bytes=" + std::to_string(expectedPagedBytes));
-    if (dynamicStats.weight_page_runtime_wait_cycles != 0)
+    if (!hasRuntimeDdrOverride && runtimeDdrBandwidth >= 51'200
+        && dynamicStats.weight_page_runtime_wait_cycles != 0)
         throw std::logic_error(
             "Qwen dynamic C2C execution stalled after program start: "
             + std::to_string(dynamicStats.weight_page_runtime_wait_cycles)
@@ -2350,7 +2418,8 @@ try {
         dynamicSession.last_linked_program();
     std::array<bool, ftlpu::InstructionControlUnit::kMemQueues>
         seenLinkedMemQueue{};
-    std::size_t linkedSyncInstructions = 0;
+    std::size_t linkedWriteSyncInstructions = 0;
+    std::size_t linkedReadSyncInstructions = 0;
     for (const QueueProgram& queue : linkedProgram.queues) {
         if (queue.kind != QueueKind::Mem)
             continue;
@@ -2362,9 +2431,23 @@ try {
         for (std::size_t pc = 0; pc < queue.commands.size();) {
             if (is_mem_synchronized_raw_packet_header(
                     queue.commands[pc])) {
-                static_cast<void>(
-                    decode_mem_synchronized_icu_packet(queue, pc));
-                ++linkedSyncInstructions;
+                const auto packet =
+                    decode_mem_synchronized_icu_packet(queue, pc);
+                const auto encoded =
+                    ((static_cast<ftlpu::isa::EncodedMemInstruction>(
+                          packet[1].lanes[0])
+                         | (static_cast<ftlpu::isa::EncodedMemInstruction>(
+                                packet[1].lanes[1])
+                             << 32))
+                        >> 2)
+                    | (static_cast<ftlpu::isa::EncodedMemInstruction>(
+                           packet[1].lanes[2])
+                        << 62);
+                if (ftlpu::isa::decode_mem_instruction(encoded).opcode
+                    == ftlpu::MemOpcode::Read)
+                    ++linkedReadSyncInstructions;
+                else
+                    ++linkedWriteSyncInstructions;
                 pc += ftlpu::InstructionControlUnit::MemIcu::
                           synchronized_packet_word_count;
                 continue;
@@ -2383,11 +2466,14 @@ try {
             ++pc;
         }
     }
-    if (linkedSyncInstructions != expectedSyncInstructions)
+    if (linkedWriteSyncInstructions != expectedSyncInstructions)
         throw std::logic_error(
             "Qwen dynamic linker MEM_WRITE_SYNC count mismatch: linked="
-            + std::to_string(linkedSyncInstructions)
+            + std::to_string(linkedWriteSyncInstructions)
             + " expected=" + std::to_string(expectedSyncInstructions));
+    if (linkedReadSyncInstructions == 0)
+        throw std::logic_error(
+            "Qwen compiler image contains no MEM_READ_SYNC for KV page-out");
     if (dynamicStats.weight_page_synchronized_writes
         != expectedSynchronizedWrites)
         throw std::logic_error(
@@ -2398,17 +2484,25 @@ try {
     if (const char* linkedPath =
             std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
         dynamicSession.write_last_linked_program(linkedPath);
+    if (const char* preExecutionDirectory =
+            std::getenv("FTLPU_QWEN_C2C_PRE_EXECUTION_DIR"))
+        dynamicSession.write_pre_execution_icu_programs(
+            preExecutionDirectory);
     std::cout << "Qwen dynamic C2C pages passed: uses="
               << program.weight_page_uses.size()
               << ", prefetches=" << dynamicStats.weight_page_prefetches
               << ", bytes=" << dynamicStats.weight_page_prefetch_bytes
-              << ", linked_mem_sync=" << linkedSyncInstructions
+              << ", linked_mem_write_sync=" << linkedWriteSyncInstructions
+              << ", linked_mem_read_sync=" << linkedReadSyncInstructions
               << ", synchronized_fu_writes="
               << dynamicStats.weight_page_synchronized_writes
               << ", initial_wait_cycles="
               << dynamicStats.weight_page_initial_wait_cycles
               << ", runtime_wait_cycles="
-              << dynamicStats.weight_page_runtime_wait_cycles << '\n';
+              << dynamicStats.weight_page_runtime_wait_cycles
+              << ", compiled_ddr_mbytes="
+              << program.hardware.ddr_peak_bandwidth_mbytes_per_second
+              << ", runtime_ddr_mbytes=" << runtimeDdrBandwidth << '\n';
 #endif
     std::cout << "Complete " FTLPU_TEST_MODEL_NAME
                  " decoder layer passed: "

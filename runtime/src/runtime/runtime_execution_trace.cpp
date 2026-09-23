@@ -35,6 +35,12 @@ bool issued(IcuQueueAction action)
     case IcuQueueAction::MxmStreamNdIssue:
     case IcuQueueAction::VxmStreamNdIssue:
     case IcuQueueAction::SxmTileProgramIssue:
+    case IcuQueueAction::VxmRun2DIssue:
+    case IcuQueueAction::SxmRun2DIssue:
+    case IcuQueueAction::Mem3DIssue:
+    case IcuQueueAction::MxmLoad3DIssue:
+    case IcuQueueAction::MxmDequant3DIssue:
+    case IcuQueueAction::MxmCompute3DIssue:
     case IcuQueueAction::SynchronizedIssue:
         return true;
     default:
@@ -123,7 +129,8 @@ std::string transfer_bytes_hex(
 }
 
 std::pair<std::string, std::string> describe_mem(
-    std::size_t queue, const MemInstruction& instruction)
+    std::size_t queue, const MemInstruction& instruction,
+    IcuQueueAction action)
 {
     const bool east =
         queue < InstructionControlUnit::kMemQueuesPerHemisphere;
@@ -137,8 +144,13 @@ std::pair<std::string, std::string> describe_mem(
     detail << "slice=" << slice << " bank=" << bank
            << " operation=" << (write ? "write" : "read")
            << " stream=" << stream_name(instruction.stream_id());
+    std::string opcode = mem_opcode_name(instruction);
+    if (action == IcuQueueAction::Mem3DIssue)
+        opcode += "3D";
+    else if (action == IcuQueueAction::SynchronizedIssue)
+        opcode += "Sync";
     return {std::string("MEM.") + (east ? "E." : "W.")
-            + mem_opcode_name(instruction), detail.str()};
+            + opcode, detail.str()};
 }
 
 std::pair<std::string, std::string> describe_mxm(std::size_t queue,
@@ -275,8 +287,16 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
         record("ICU.PageReadyWait", detail.str());
     }
 
-    if (programIssueEnabled) {
-        for (const QueueRef& ref : queues_) {
+    for (const QueueRef& ref : queues_) {
+        // During a page-ready hold, all ordinary queues retain their previous
+        // trace state because they are not ticked. MEM queues are different:
+        // transport-only mode ticks them so an in-order MEM_WRITE_SYNC can
+        // keep draining the arriving page. Sample only those MEM queues while
+        // the ordinary program is paused; otherwise stale MXM/VXM/SXM state
+        // would look like repeated FU issues.
+        if (!programIssueEnabled && ref.kind != QueueKind::Mem)
+            continue;
+        {
             // Binary MXM queue ids are dense in the executable's logical
             // topology. The ICU arrays use the CModel's physical stride.
             const auto physicalMxmIndex = [&] {
@@ -291,7 +311,8 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
                 const auto& queue = icu.mem_iq(ref.index);
                 const auto* instruction = last_issued(queue);
                 if (instruction == nullptr) break;
-                auto [resource, detail] = describe_mem(ref.index, *instruction);
+                auto [resource, detail] = describe_mem(ref.index,
+                    *instruction, queue.last_trace().action);
                 record(std::move(resource),
                     with_issue_pc(std::move(detail), queue));
                 break;
@@ -355,6 +376,11 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
                             ? "transpose" : "permute", queue));
                 break;
             }
+            case QueueKind::C2cDma:
+            case QueueKind::C2cTx:
+            case QueueKind::C2cRx:
+                // Sampled once below, independent of the program hold.
+                break;
             }
         }
     }

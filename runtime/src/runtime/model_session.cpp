@@ -7,6 +7,7 @@
 #include "ftlpu/icu/instruction.hpp"
 #include "ftlpu/icu/location.hpp"
 #include "ftlpu/mem/slice.hpp"
+#include "ftlpu/software/runtime/icu_program.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 #include "ftlpu/system/hardware_configuration.hpp"
 
@@ -18,6 +19,7 @@
 #include <limits>
 #include <ranges>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -313,6 +315,37 @@ BinaryProgram parameterize_program(const ModelPackage &package,
         entry.instruction.address =
             relocate_address(entry.instruction.address);
       command = encode_mem_slice_program_command(sliceProgram);
+      continue;
+    }
+    if (relocation.queue_kind == QueueKind::Mem &&
+        is_mem_synchronized_raw_packet_header(command)) {
+      auto packet = decode_mem_synchronized_icu_packet(
+          *queue, relocation.command_index);
+      const auto &header = packet[0].lanes;
+      const auto &native = packet[1].lanes;
+      const std::size_t count = ((header[0] >> 2) & 0xffffU) + 1;
+      const std::size_t tag =
+          ((header[0] >> 18) | (header[1] << 14)) & 0xffffU;
+      const std::size_t delay = (header[1] >> 2) & 0xffffU;
+      constexpr std::uint32_t kStrideMask = (1U << 14) - 1;
+      constexpr std::uint32_t kStrideSign = 1U << 13;
+      const std::uint32_t strideBits = (header[1] >> 18) & kStrideMask;
+      const std::int64_t stride = (strideBits & kStrideSign) == 0
+          ? static_cast<std::int64_t>(strideBits)
+          : -static_cast<std::int64_t>(
+                ((~strideBits) & kStrideMask) + 1);
+      const std::size_t reservation = (header[2] & 0x00ffffffU) + 1;
+      const auto encoded =
+          ((static_cast<isa::EncodedMemInstruction>(native[0]) |
+            (static_cast<isa::EncodedMemInstruction>(native[1]) << 32)) >> 2) |
+          (static_cast<isa::EncodedMemInstruction>(native[2]) << 62);
+      auto instruction = isa::decode_mem_instruction(encoded);
+      instruction.address = relocate_address(instruction.address);
+      packet = InstructionControlUnit::MemIcu::encode_synchronized_raw_packet(
+          count, tag, delay, stride, instruction, reservation);
+      const auto commands = encode_mem_synchronized_icu_packet(packet);
+      for (std::size_t word = 0; word < commands.size(); ++word)
+        queue->commands[relocation.command_index + word] = commands[word];
       continue;
     }
     if (relocation.queue_kind == QueueKind::Mem &&
@@ -624,6 +657,124 @@ void verify_c2c_weight_page_residency(C2cDmaSystem &system,
   }
 }
 
+bool has_compiler_mem_sync(const BinaryProgram &program) {
+  for (const auto &queue : program.queues)
+    if (queue.kind == QueueKind::Mem)
+      for (const auto &command : queue.commands)
+        if (is_mem_synchronized_raw_packet_header(command)) return true;
+  return false;
+}
+
+void preserve_compiler_mem_sync(BinaryProgram &compiled,
+                               const BinaryProgram &linked) {
+  // MEM_READ_SYNC belongs to the post-execution KV page-out path. The
+  // executable weight-page linker sees a same-duration NOP in its place, so
+  // compare against that view while preserving the compiler packet in the
+  // final linked image.
+  const BinaryProgram executableView =
+      without_compiled_mem_read_sync(compiled);
+  const auto sameCommand = [](const QueueCommand &lhs,
+                              const QueueCommand &rhs) {
+    return lhs.command == rhs.command
+        && lhs.instruction_kind == rhs.instruction_kind
+        && lhs.word_count == rhs.word_count
+        && lhs.words == rhs.words
+        && lhs.extension_words == rhs.extension_words;
+  };
+  for (const auto &queue : executableView.queues) {
+    if (queue.kind != QueueKind::Mem) continue;
+    const auto found = std::ranges::find_if(linked.queues,
+        [&](const QueueProgram &candidate) {
+          return candidate.kind == QueueKind::Mem
+              && candidate.index == queue.index;
+        });
+    if (found == linked.queues.end())
+      throw std::logic_error(
+          "runtime C2C plan is missing compiler MEM queue "
+          + std::to_string(queue.index));
+    if (found->commands.size() != queue.commands.size())
+      throw std::logic_error(
+          "runtime C2C plan differs from compiler MEM queue "
+          + std::to_string(queue.index) + " word count: compiler="
+          + std::to_string(queue.commands.size()) + " runtime="
+          + std::to_string(found->commands.size()));
+    for (std::size_t pc = 0; pc < queue.commands.size(); ++pc)
+      if (!sameCommand(queue.commands[pc], found->commands[pc]))
+        throw std::logic_error(
+            "runtime C2C plan differs from compiler MEM queue "
+            + std::to_string(queue.index) + " pc="
+            + std::to_string(pc) + " compiler_words="
+            + std::to_string(queue.commands[pc].words[0]) + ","
+            + std::to_string(queue.commands[pc].words[1]) + ","
+            + std::to_string(queue.commands[pc].words[2])
+            + " runtime_words="
+            + std::to_string(found->commands[pc].words[0]) + ","
+            + std::to_string(found->commands[pc].words[1]) + ","
+            + std::to_string(found->commands[pc].words[2]));
+  }
+  for (const auto &queue : linked.queues) {
+    if (queue.kind != QueueKind::C2cDma
+        && queue.kind != QueueKind::C2cRx)
+      continue;
+    const auto existing = std::ranges::find_if(compiled.queues,
+        [&](const QueueProgram &candidate) {
+          return candidate.kind == queue.kind
+              && candidate.index == queue.index;
+        });
+    if (existing == compiled.queues.end())
+      compiled.queues.push_back(queue);
+    else
+      *existing = queue;
+  }
+  compiled.max_cycle = std::max(compiled.max_cycle, linked.max_cycle);
+  std::ranges::sort(compiled.queues,
+      [](const QueueProgram &lhs, const QueueProgram &rhs) {
+        return std::tie(lhs.kind, lhs.index)
+            < std::tie(rhs.kind, rhs.index);
+      });
+}
+
+bool linked_queue_done(InstructionControlUnit &icu,
+                       const QueueProgram &queue) {
+  if (queue.commands.empty()) return true;
+  switch (queue.kind) {
+  case QueueKind::Mem:
+    return icu.mem_iq(queue.index).done();
+  case QueueKind::MxmLoad:
+    return icu.mxm_load_iq(queue.index).done();
+  case QueueKind::MxmCompute:
+    return icu.mxm_compute_iq(queue.index).done();
+  case QueueKind::MxmDequant:
+    return icu.mxm_dequant_iq(queue.index).done();
+  case QueueKind::Vxm:
+    return icu.vxm_iq(queue.index).done();
+  case QueueKind::SxmTranspose:
+    return icu.sxm_transpose_iq(
+        static_cast<Hemisphere>(queue.index)).done();
+  case QueueKind::SxmPermute:
+    return icu.sxm_permute_iq(
+        static_cast<Hemisphere>(queue.index)).done();
+  case QueueKind::C2cDma:
+    return icu.c2c_dma_iq(
+        static_cast<Hemisphere>(queue.index)).done();
+  case QueueKind::C2cTx:
+    return icu.c2c_tx_iq(
+        static_cast<Hemisphere>(queue.index)).done();
+  case QueueKind::C2cRx:
+    return icu.c2c_rx_iq(
+        static_cast<Hemisphere>(queue.index)).done();
+  }
+  throw std::logic_error("unknown linked ICU queue kind");
+}
+
+bool linked_program_done(C2cDmaSystem &system,
+                         const BinaryProgram &program) {
+  auto &icu = system.chip().icu();
+  return std::ranges::all_of(program.queues, [&](const QueueProgram &queue) {
+    return linked_queue_done(icu, queue);
+  });
+}
+
 } // namespace
 
 ModelSession::ModelSession(TspSliceSystem &system) : runtime_(system) {}
@@ -635,12 +786,6 @@ ModelSession::ModelSession(C2cDmaSystem &system)
                  observe_weight_page_tick();
                  observe_executable_weight_page_tick();
                  release_due_executable_weight_pages();
-                 if (executable_clock_active_) {
-                   if (system.chip().icu().program_issue_enabled())
-                     ++executable_cycle_;
-                   else
-                     ++stats_.weight_page_runtime_wait_cycles;
-                 }
                }),
       c2c_system_(&system),
       weight_pager_(std::make_unique<C2cWeightPager>(system)) {
@@ -648,6 +793,9 @@ ModelSession::ModelSession(C2cDmaSystem &system)
       [this](const BinaryWeightPageUse &use) {
         return executable_weight_page_ready(use);
       });
+  runtime_.set_weight_page_wait_observer([this] {
+    ++stats_.weight_page_runtime_wait_cycles;
+  });
 }
 
 void ModelSession::set_ddr_peak_bandwidth_mbytes_per_second(
@@ -748,7 +896,8 @@ void ModelSession::configure_external_transport(
 
 void ModelSession::upload_binding_through_c2c(
     const BinaryBinding &binding, std::span<const std::uint8_t> data,
-    const ExecutableHardwareConfig &hardware) {
+    const ExecutableHardwareConfig &hardware, std::string traceResource,
+    std::string traceDetail) {
   if (c2c_system_ == nullptr || !weight_pager_)
     throw std::logic_error(
         "LPU input cannot bypass C2C in this ModelSession");
@@ -804,11 +953,24 @@ void ModelSession::upload_binding_through_c2c(
 
   c2c_system_->reset_execution_state();
   weight_pager_->enqueue(page);
+  pre_execution_icu_programs_.push_back(
+      weight_pager_->last_enqueued_program());
   const std::size_t beginCycle = c2c_system_->cycle();
   std::size_t vectors = 0;
   for (const auto &segment : page.segments)
     vectors += segment.vector_count;
-  weight_pager_->wait(std::max<std::size_t>(4096, vectors * 64));
+  const std::size_t transferCycles = wait_for_standalone_weight_page(
+      std::max<std::size_t>(4096, vectors * 64));
+  if (execution_trace_enabled_ && transferCycles != 0) {
+    if (!traceDetail.empty())
+      traceDetail += ' ';
+    traceDetail += "binding=" + std::to_string(binding.index) +
+                   " role=" + binding.role +
+                   " bytes=" + std::to_string(data.size());
+    runtime_.record_execution_trace_interval(
+        0, static_cast<std::int64_t>(transferCycles),
+        std::move(traceResource), std::move(traceDetail));
+  }
   stats_.c2c_ingress_cycles += c2c_system_->cycle() - beginCycle;
   stats_.c2c_ingress_bytes += vectors * hw::kPhysicalVectorBytes;
   weight_pager_->retire();
@@ -816,7 +978,8 @@ void ModelSession::upload_binding_through_c2c(
 
 std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
     const BinaryBinding &binding,
-    const ExecutableHardwareConfig &hardware) {
+    const ExecutableHardwareConfig &hardware,
+    const BinaryProgram *compilerProgram) {
   if (c2c_system_ == nullptr)
     throw std::logic_error(
         "LPU output cannot bypass C2C in this ModelSession");
@@ -828,6 +991,54 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
 
   const ExecutableHardwareConfig runtimeHardware =
       effective_external_transport(hardware);
+
+  struct CompiledReadSegment {
+    std::size_t queue{0};
+    InstructionControlUnit::MemIcu::EncodedSynchronizedPacket packet{};
+    MemInstruction instruction{};
+    std::size_t count{0};
+    std::size_t tag{0};
+    bool used{false};
+  };
+  std::vector<CompiledReadSegment> compiledReads;
+  if (compilerProgram != nullptr) {
+    for (const BinaryAddressRelocation &relocation :
+         compilerProgram->address_relocations) {
+      if (relocation.binding_access != BindingAccess::Internal ||
+          relocation.binding_index != binding.index ||
+          relocation.queue_kind != QueueKind::Mem)
+        continue;
+      const auto queue = std::find_if(
+          compilerProgram->queues.begin(), compilerProgram->queues.end(),
+          [&](const QueueProgram &candidate) {
+            return candidate.kind == QueueKind::Mem &&
+                   candidate.index == relocation.queue_index;
+          });
+      if (queue == compilerProgram->queues.end() ||
+          relocation.command_index >= queue->commands.size() ||
+          !is_mem_synchronized_raw_packet_header(
+              queue->commands[relocation.command_index]))
+        continue;
+      const auto packet = decode_mem_synchronized_icu_packet(
+          *queue, relocation.command_index);
+      const auto &header = packet[0].lanes;
+      const auto &native = packet[1].lanes;
+      const auto encoded =
+          ((static_cast<isa::EncodedMemInstruction>(native[0]) |
+            (static_cast<isa::EncodedMemInstruction>(native[1]) << 32)) >> 2) |
+          (static_cast<isa::EncodedMemInstruction>(native[2]) << 62);
+      const auto instruction = isa::decode_mem_instruction(encoded);
+      if (instruction.opcode != MemOpcode::Read)
+        continue;
+      compiledReads.push_back(CompiledReadSegment{
+          relocation.queue_index, packet, instruction,
+          ((header[0] >> 2) & 0xffffU) + 1,
+          ((header[0] >> 18) | (header[1] << 14)) & 0xffffU, false});
+    }
+    if (binding.role.starts_with("state.kv.") && compiledReads.empty())
+      throw std::logic_error(
+          "KV-cache page-out has no compiler-authored MEM_READ_SYNC");
+  }
 
   const std::size_t laneCount = hardware.c2c_streams_per_direction;
   std::array<std::vector<std::size_t>, hw::kHemispheres> byHemisphere;
@@ -846,6 +1057,7 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
       std::size_t image_index{0};
       std::uint64_t ddr_address{0};
       std::size_t lane{0};
+      std::optional<std::size_t> compiled_read{};
     };
     std::vector<BatchSegment> batch;
     std::vector<std::size_t> memQueues;
@@ -861,7 +1073,28 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
         executable_ddr4_address_ +=
             static_cast<std::uint64_t>(segment.vector_count) *
             hw::kPhysicalVectorBytes;
-        batch.push_back(BatchSegment{imageIndex, ddrAddress, lane});
+        std::optional<std::size_t> compiledRead;
+        std::size_t transportLane = lane;
+        if (!compiledReads.empty()) {
+          const auto queue = InstructionControlUnit::mem_queue(
+              hemisphere, segment.slice, binding.bank);
+          for (std::size_t read = 0; read < compiledReads.size(); ++read) {
+            auto &candidate = compiledReads[read];
+            if (candidate.used || candidate.queue != queue ||
+                candidate.instruction.address != segment.base_row ||
+                candidate.count != segment.vector_count)
+              continue;
+            candidate.used = true;
+            compiledRead = read;
+            transportLane = candidate.instruction.stream_id().index();
+            break;
+          }
+          if (!compiledRead.has_value())
+            throw std::logic_error(
+                "KV-cache segment has no matching MEM_READ_SYNC packet");
+        }
+        batch.push_back(BatchSegment{
+            imageIndex, ddrAddress, transportLane, compiledRead});
         transferredVectors += segment.vector_count;
         batchVectors += segment.vector_count;
       }
@@ -888,15 +1121,29 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
       const std::size_t fabricStream = copy.lane;
       const auto queue = InstructionControlUnit::mem_queue(
           hemisphere, segment.slice, binding.bank);
-      c2c_system_->chip().icu().enqueue_mem_nop(queue, laneCount);
-      c2c_system_->chip().icu().enqueue_mem(
-          queue, MemInstruction::Read(segment.base_row,
-                     StreamId::East(fabricStream)));
-      if (segment.vector_count > 1)
-        c2c_system_->chip().icu().enqueue_mem_repeat(
-            queue, segment.vector_count - 1, memReadInterval, 1);
-      c2c_system_->chip().icu().enqueue_c2c_send(
-          hemisphere, copy.lane, segment.vector_count, fabricStream);
+      if (copy.compiled_read.has_value()) {
+        const auto &read = compiledReads[*copy.compiled_read];
+        c2c_system_->chip().icu().push_mem_synchronized_raw(
+            queue, EncodedMemIcuSynchronizedPacket{
+                       {read.packet[0], read.packet[1]}});
+        c2c_system_->chip().icu().enqueue_c2c_tx_raw(
+            hemisphere,
+            C2cIcuPacketCodec::encode(C2cTxIcuInstruction::Send(
+                hemisphere, copy.lane, fabricStream,
+                segment.vector_count, static_cast<std::uint32_t>(read.tag),
+                C2cMemNotifyRoute::Mem(
+                    hemisphere, segment.slice, binding.bank))));
+      } else {
+        c2c_system_->chip().icu().enqueue_mem_nop(queue, laneCount);
+        c2c_system_->chip().icu().enqueue_mem(
+            queue, MemInstruction::Read(segment.base_row,
+                       StreamId::East(fabricStream)));
+        if (segment.vector_count > 1)
+          c2c_system_->chip().icu().enqueue_mem_repeat(
+              queue, segment.vector_count - 1, memReadInterval, 1);
+        c2c_system_->chip().icu().enqueue_c2c_send(
+            hemisphere, copy.lane, segment.vector_count, fabricStream);
+      }
       c2c_system_->chip().icu().enqueue_c2c_dma(
           hemisphere,
           C2cDmaInstruction::Store(copy.ddr_address, segment.vector_count,
@@ -982,7 +1229,36 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
   }
   stats_.c2c_egress_bytes +=
       transferredVectors * hw::kPhysicalVectorBytes;
+  if (!compiledReads.empty() &&
+      std::ranges::any_of(compiledReads,
+                          [](const auto &read) { return !read.used; }))
+    throw std::logic_error(
+        "compiler-authored MEM_READ_SYNC packet was not consumed");
   return unpack_binding_image(binding, image, hardware);
+}
+
+std::size_t ModelSession::wait_for_standalone_weight_page(
+    std::size_t maxCycles) {
+  if (!execution_trace_enabled_ && !mem_execution_trace_enabled_) {
+    const std::size_t beginCycle = c2c_system_->cycle();
+    weight_pager_->wait(maxCycles);
+    return c2c_system_->cycle() - beginCycle;
+  }
+
+  runtime_.begin_external_execution_trace_segment(
+      weight_pager_->last_enqueued_program(), execution_trace_cycle_cursor_,
+      execution_trace_has_segment_);
+  execution_trace_has_segment_ = true;
+  std::size_t elapsed = 0;
+  while (elapsed < maxCycles && !weight_pager_->ready()) {
+    weight_pager_->tick();
+    runtime_.sample_external_execution_trace_cycle(elapsed);
+    ++elapsed;
+  }
+  if (!weight_pager_->ready())
+    throw std::runtime_error("C2C weight-page prefetch timed out");
+  execution_trace_cycle_cursor_ += static_cast<std::int64_t>(elapsed);
+  return elapsed;
 }
 
 void ModelSession::prepare_weight_pages() {
@@ -1041,6 +1317,8 @@ void ModelSession::start_weight_page(std::uint32_t page_index) {
     throw std::logic_error(
         "cannot start a weight page while another page is in flight");
   weight_pager_->enqueue(c2c_pages_[page_index]);
+  pre_execution_icu_programs_.push_back(
+      weight_pager_->last_enqueued_program());
   ++stats_.weight_page_prefetches;
   stats_.weight_page_prefetch_bytes += weight_pager_->stats().bytes;
   inflight_weight_page_ = page_index;
@@ -1213,21 +1491,25 @@ void ModelSession::prepare_executable_weight_pages(
       continue;
     c2c_system_->reset_execution_state();
     weight_pager_->enqueue(transfer.page);
+    pre_execution_icu_programs_.push_back(
+        weight_pager_->last_enqueued_program());
     ++stats_.weight_page_prefetches;
     std::size_t vectors = 0;
     for (const C2cWeightSegment &segment : transfer.page.segments)
       vectors += segment.vector_count;
     stats_.weight_page_prefetch_bytes +=
         vectors * hw::kPhysicalVectorBytes;
-    const std::size_t beginCycle = c2c_system_->cycle();
-    weight_pager_->wait(std::max<std::size_t>(4096, vectors * 64));
-    const std::size_t waitCycles = c2c_system_->cycle() - beginCycle;
+    const std::size_t waitCycles = wait_for_standalone_weight_page(
+        std::max<std::size_t>(4096, vectors * 64));
     transfer.pre_execution_cycles = waitCycles;
     stats_.weight_page_wait_cycles += waitCycles;
     if (completed_invocation_)
       stats_.weight_page_boundary_wait_cycles += waitCycles;
     else
       stats_.weight_page_initial_wait_cycles += waitCycles;
+    transfer.actual_start_cycle = 0;
+    transfer.actual_ready_cycle = static_cast<std::int64_t>(waitCycles);
+    record_weight_page_trace(transfer);
     weight_pager_->retire();
     transfer.ready_before_execution = true;
   }
@@ -1238,7 +1520,10 @@ void ModelSession::prepare_executable_weight_lookahead(
   lookahead_executable_weight_transfers_.clear();
   lookahead_model_weight_transfer_.reset();
   lookahead_invocation_index_.reset();
-  if (std::getenv("FTLPU_SESSION_STOP_CYCLE") != nullptr ||
+  // A compiler-authored MEM iMEM cannot accept writes for the next
+  // executable at runtime. Load those pages at the invocation boundary.
+  if (has_compiler_mem_sync(program)
+      || std::getenv("FTLPU_SESSION_STOP_CYCLE") != nullptr ||
       invocationIndex + 1 >= package_.invocations.size())
     return;
 
@@ -1320,7 +1605,13 @@ void ModelSession::schedule_executable_weight_pages(BinaryProgram &program) {
   std::optional<std::size_t> debugStopCycle;
   if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
     debugStopCycle = static_cast<std::size_t>(std::stoull(stop));
-  weight_pager_->begin_schedule(program);
+  const bool compilerMemSync = has_compiler_mem_sync(program);
+  BinaryProgram relinked;
+  if (compilerMemSync)
+    relinked = without_compiled_mem_read_sync(
+        without_compiled_mem_write_sync(program));
+  BinaryProgram &linkProgram = compilerMemSync ? relinked : program;
+  weight_pager_->begin_schedule(linkProgram);
   std::vector<std::size_t> launchOrder;
   launchOrder.reserve(executable_weight_transfers_.size());
   for (std::size_t transferIndex = 0;
@@ -1340,14 +1631,16 @@ void ModelSession::schedule_executable_weight_pages(BinaryProgram &program) {
     // A bounded diagnostic run must not inject traffic for a page whose first
     // consumer is beyond the stop point. Besides saving time, this keeps
     // stage captures isolated from future C2C/MEM traffic.
-    if (debugStopCycle && transfer.plan.ready_cycle > *debugStopCycle)
+    if (debugStopCycle && !compilerMemSync
+        && transfer.plan.ready_cycle > *debugStopCycle)
       continue;
     transfer.launch_event_tag = 0x10000u + transferIndex;
-    transfer.fence = weight_pager_->schedule(program, transfer.page,
+    transfer.page_ready_event_tag = 0x30000u + transferIndex;
+    transfer.fence = weight_pager_->schedule(linkProgram, transfer.page,
         static_cast<std::size_t>(transfer.plan.start_cycle),
         static_cast<std::size_t>(transfer.plan.transfer_end_cycle),
         static_cast<std::size_t>(transfer.plan.ready_cycle),
-        transfer.launch_event_tag);
+        transfer.launch_event_tag, transfer.page_ready_event_tag);
     transfer.plan.start_cycle = transfer.fence.scheduled_start_cycle;
     transfer.plan.transfer_end_cycle =
         transfer.fence.scheduled_end_cycle;
@@ -1376,7 +1669,7 @@ void ModelSession::schedule_executable_weight_pages(BinaryProgram &program) {
         weight_pager_->earliest_schedule_cycle(transfer.page));
     transfer.plan.transfer_end_cycle = transfer.plan.start_cycle + duration;
     transfer.launch_event_tag = 0x20000u + index;
-    transfer.fence = weight_pager_->schedule(program, transfer.page,
+    transfer.fence = weight_pager_->schedule(linkProgram, transfer.page,
         static_cast<std::size_t>(transfer.plan.start_cycle),
         static_cast<std::size_t>(transfer.plan.transfer_end_cycle),
         std::numeric_limits<std::size_t>::max(),
@@ -1390,7 +1683,19 @@ void ModelSession::schedule_executable_weight_pages(BinaryProgram &program) {
           static_cast<std::size_t>(segment.vector_count) *
           hw::kPhysicalVectorBytes;
   }
-  weight_pager_->finalize_schedule(program);
+  weight_pager_->finalize_schedule(linkProgram);
+  for (ExecutableWeightTransfer &transfer : executable_weight_transfers_)
+    if (transfer.page_ready_event_tag != 0) {
+      transfer.page_ready_releases = weight_pager_->page_ready_releases(
+          transfer.page_ready_event_tag);
+    }
+  if (compilerMemSync) {
+    // The compiler image retains its MEM_READ_SYNC page-out packets while the
+    // runtime relinked view replaces them with idle time.  Apply the same
+    // page-ready barriers to that image before comparing/merging the queues.
+    weight_pager_->inject_page_ready_barriers(program);
+    preserve_compiler_mem_sync(program, relinked);
+  }
   executable_clock_active_ = true;
 }
 
@@ -1399,7 +1704,7 @@ void ModelSession::release_due_executable_weight_pages() {
     return;
   const auto release = [&](ExecutableWeightTransfer &transfer) {
     if (transfer.launch_event_tag == 0 || transfer.launch_released ||
-        transfer.plan.start_cycle > executable_cycle_)
+        transfer.plan.start_cycle > runtime_.logical_cycles())
       return;
     for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
       if (transfer.fence.dma_issues_end[side] ==
@@ -1429,17 +1734,43 @@ void ModelSession::observe_executable_weight_page_tick() {
       static_cast<std::int64_t>(runtime_.physical_cycles());
   const auto observe = [&](ExecutableWeightTransfer &transfer) {
     if (transfer.launch_event_tag == 0 || !transfer.launch_released ||
-        transfer.trace_recorded)
+        (transfer.trace_recorded && transfer.page_ready_event_released))
       return;
     if (!transfer.actual_start_cycle &&
         weight_pager_->started(transfer.fence))
       transfer.actual_start_cycle = physicalCycle;
-    if (!weight_pager_->ready(transfer.fence))
+    if (!transfer.actual_ready_cycle) {
+      if (!weight_pager_->ready(transfer.fence))
+        return;
+      if (!transfer.actual_start_cycle)
+        transfer.actual_start_cycle = physicalCycle;
+      transfer.actual_ready_cycle = physicalCycle + 1;
+      record_weight_page_trace(transfer);
+    }
+    if (transfer.page_ready_event_tag == 0) {
+      transfer.page_ready_event_released = true;
       return;
-    if (!transfer.actual_start_cycle)
-      transfer.actual_start_cycle = physicalCycle;
-    transfer.actual_ready_cycle = physicalCycle + 1;
-    record_weight_page_trace(transfer);
+    }
+    const auto elapsed = static_cast<std::size_t>(
+        physicalCycle + 1 - *transfer.actual_ready_cycle);
+    if (transfer.page_ready_releases.empty()) {
+      c2c_system_->chip().icu().broadcast_tagged_notification(
+          transfer.page_ready_event_tag);
+      transfer.page_ready_event_released = true;
+      return;
+    }
+    while (transfer.next_page_ready_release
+               < transfer.page_ready_releases.size()
+           && transfer.page_ready_releases[
+                  transfer.next_page_ready_release].phase_offset <= elapsed) {
+      const auto& release = transfer.page_ready_releases[
+          transfer.next_page_ready_release++];
+      c2c_system_->chip().icu().notify_tagged(
+          release.location, transfer.page_ready_event_tag);
+    }
+    transfer.page_ready_event_released =
+        transfer.next_page_ready_release
+        == transfer.page_ready_releases.size();
   };
   for (ExecutableWeightTransfer &transfer : executable_weight_transfers_)
     observe(transfer);
@@ -1625,7 +1956,7 @@ bool ModelSession::executable_weight_page_ready(
         if (!ready && std::getenv("FTLPU_SESSION_PROGRESS") != nullptr) {
           std::clog << "FTLPU executable page wait: binding="
                     << use.binding_index << " page=" << use.page_index
-                    << " cycle=" << executable_cycle_
+                    << " cycle=" << runtime_.logical_cycles()
                     << " planned_start=" << transfer.plan.start_cycle
                     << " planned_end=" << transfer.plan.transfer_end_cycle
                     << " ddr_read_bytes="
@@ -1668,10 +1999,14 @@ void ModelSession::ensure_weight_page(std::uint32_t page_index) {
     c2c_system_->reset_execution_state();
     start_weight_page(page_index);
   }
-  const std::size_t beginCycle = c2c_system_->cycle();
-  weight_pager_->wait(
+  const std::size_t waitCycles = wait_for_standalone_weight_page(
       std::max<std::size_t>(1024, weight_pager_->stats().vectors * 64));
-  const std::size_t waitCycles = c2c_system_->cycle() - beginCycle;
+  if (execution_trace_enabled_ && waitCycles != 0) {
+    runtime_.record_execution_trace_interval(
+        0, static_cast<std::int64_t>(waitCycles), "C2C.ModelWeightPage",
+        "page=" + std::to_string(page_index) + " phase=" +
+            (completed_invocation_ ? "layer_boundary" : "initial"));
+  }
   stats_.weight_page_wait_cycles += waitCycles;
   if (completed_invocation_)
     stats_.weight_page_boundary_wait_cycles += waitCycles;
@@ -1693,6 +2028,7 @@ void ModelSession::load(ModelPackage package) {
   stats_ = {};
   load_stats_ = {};
   last_linked_program_.reset();
+  pre_execution_icu_programs_.clear();
   executable_weight_transfers_.clear();
   lookahead_executable_weight_transfers_.clear();
   lookahead_model_weight_transfer_.reset();
@@ -1750,8 +2086,9 @@ void ModelSession::load(ModelPackage package) {
     if (sessionHardware == nullptr)
       throw std::logic_error(
           "resident LPU data requires an executable hardware target");
-    upload_binding_through_c2c(resident.binding, resolve_value(resident.value),
-                               *sessionHardware);
+    upload_binding_through_c2c(
+        resident.binding, resolve_value(resident.value), *sessionHardware,
+        "C2C.ResidentInput", "value=" + resident.value);
     ++stats_.resident_uploads;
     stats_.resident_upload_bytes +=
         static_cast<std::size_t>(resident.binding.byte_size);
@@ -1776,6 +2113,23 @@ void ModelSession::load(ModelPackage package) {
 
 void ModelSession::load_file(const std::filesystem::path &path) {
   load(read_model_package(path, ModelPackageLoadMode::LazyExecutables));
+}
+
+void ModelSession::set_state(std::string name,
+                             std::span<const std::uint8_t> data) {
+  if (!loaded_)
+    throw std::logic_error("no FTLPU model package is loaded");
+  const auto state = state_backing_.find(name);
+  if (state == state_backing_.end())
+    throw std::out_of_range("unknown FTLPU model state: " + name);
+  if (data.size() != state->second.size())
+    throw std::invalid_argument("persistent state byte size mismatch for " +
+                                name + ": expected " +
+                                std::to_string(state->second.size()) +
+                                ", got " + std::to_string(data.size()));
+  std::copy(data.begin(), data.end(), state->second.begin());
+  ++stats_.state_initializations;
+  stats_.state_initialization_bytes += data.size();
 }
 
 std::vector<std::uint8_t> ModelSession::read_state(const std::string &name) {
@@ -1845,12 +2199,9 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   const auto &executable = package_.executables.at(invocation.executable_index);
   const SessionInvocationPlan &invocation_plan =
       memory_plan_.invocations.at(index);
-  const std::size_t pageWaitBefore = stats_.weight_page_wait_cycles;
   if (invocation.weight_page != 0xffffffffu)
     ensure_weight_page(invocation.weight_page);
   report("model weight page ready");
-  const std::size_t modelPageWaitCycles =
-      stats_.weight_page_wait_cycles - pageWaitBefore;
   BinaryProgram program =
       parameterize_program(package_, invocation, invocation_plan,
                            materialize_model_executable(executable));
@@ -1874,7 +2225,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     upload_binding_through_c2c(
         binding,
         std::span<const std::uint8_t>(backing->second.data(), residentBytes),
-        program.hardware);
+        program.hardware, "C2C.StatePageIn", "state=" + state.state);
     ++stats_.state_page_ins;
   }
   const std::size_t statePageInCycles =
@@ -1885,7 +2236,6 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   stats_.state_page_in_bytes += statePageInBytes;
   report("persistent state paged in");
 
-  const std::size_t ingressBefore = stats_.c2c_ingress_cycles;
   for (const SessionInputPlan &input : invocation_plan.inputs) {
     if (input.transfer == SessionTransferKind::Resident ||
         input.transfer == SessionTransferKind::WeightPage)
@@ -1894,7 +2244,8 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
         host_input_overrides_.contains(input.value)) {
       upload_binding_through_c2c(
           find_binding(program, BindingAccess::Input, input.binding_index),
-          resolve_value(input.value), program.hardware);
+          resolve_value(input.value), program.hardware, "C2C.HostInput",
+          "value=" + input.value);
       ++stats_.host_uploads;
       continue;
     }
@@ -1919,20 +2270,14 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     if (input.release_after_transfer)
       device_values_.erase(source);
   }
-  const std::size_t inputTransferCycles =
-      stats_.c2c_ingress_cycles - ingressBefore;
   report("inputs ready");
-  const std::size_t executablePageWaitBefore = stats_.weight_page_wait_cycles;
   prepare_executable_weight_pages(program, invocation, index);
-  const std::size_t executablePreExecutionCycles =
-      stats_.weight_page_wait_cycles - executablePageWaitBefore;
   report("executable weight pages prepared");
-  const auto traceOrigin =
-      execution_trace_cycle_cursor_ +
-      static_cast<std::int64_t>(modelPageWaitCycles) +
-      static_cast<std::int64_t>(statePageInCycles) +
-      static_cast<std::int64_t>(inputTransferCycles) +
-      static_cast<std::int64_t>(executablePreExecutionCycles);
+  // Standalone model-page, state, host-input and executable-page transfers
+  // have already advanced this cursor while recording their real ICU cycles.
+  // The main executable therefore starts immediately after the last sampled
+  // pre-execution transport segment.
+  const auto traceOrigin = execution_trace_cycle_cursor_;
   if (execution_trace_enabled_ || mem_execution_trace_enabled_)
     runtime_.configure_execution_trace_segment(traceOrigin,
                                                execution_trace_has_segment_);
@@ -1942,45 +2287,19 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   }
   // Keep the fully linked image available even when execution reports a
   // datapath error.  Besides making failures diagnosable, this reflects the
-  // program that was actually handed to the runtime rather than the original
-  // executable before its C2C/MEM queues were linked.
+  // program that was actually handed to the runtime, including its linked
+  // C2C queues and compiler-authored MEM sync words.
   last_linked_program_ = program;
   report("loading runtime program");
-  runtime_.load(program);
+  BinaryProgram runtimeProgram = without_compiled_mem_read_sync(program);
+  // The linked WAIT_EVENT instructions are the hardware-visible page
+  // synchronization.  The legacy CModel residency list freezes every queue
+  // at one logical cycle and can suspend a decoded 3-D domain halfway through
+  // its loop, which a physical ICU cannot do.
+  if (weight_pager_ && !executable_weight_transfers_.empty())
+    runtimeProgram.weight_page_uses.clear();
+  runtime_.load(runtimeProgram);
   report("runtime program loaded");
-  if (execution_trace_enabled_) {
-    std::int64_t localCursor = -static_cast<std::int64_t>(
-        modelPageWaitCycles + statePageInCycles + inputTransferCycles +
-        executablePreExecutionCycles);
-    if (modelPageWaitCycles != 0) {
-      std::ostringstream detail;
-      detail << "invocation=" << index;
-      if (invocation.weight_page != 0xffffffffu)
-        detail << " page=" << invocation.weight_page;
-      detail << " phase="
-             << (completed_invocation_ ? "layer_boundary" : "initial");
-      runtime_.record_execution_trace_interval(
-          localCursor,
-          localCursor + static_cast<std::int64_t>(modelPageWaitCycles),
-          "C2C.ModelWeightPage", detail.str());
-      localCursor += static_cast<std::int64_t>(modelPageWaitCycles);
-    }
-    if (statePageInCycles != 0) {
-      runtime_.record_execution_trace_interval(
-          localCursor,
-          localCursor + static_cast<std::int64_t>(statePageInCycles),
-          "C2C.StatePageIn",
-          "invocation=" + std::to_string(index) +
-              " states=" + std::to_string(invocation_plan.states.size()) +
-              " bytes=" + std::to_string(statePageInBytes));
-      localCursor += static_cast<std::int64_t>(statePageInCycles);
-    }
-    if (inputTransferCycles != 0)
-      runtime_.record_execution_trace_interval(
-          localCursor,
-          localCursor + static_cast<std::int64_t>(inputTransferCycles),
-          "C2C.HostInput", "invocation=" + std::to_string(index));
-  }
   std::size_t executionCycles = program.max_cycle + drain_cycles;
   if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
     executionCycles =
@@ -2001,6 +2320,22 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     runtime_.run_cycles(executionCycles - traceStart - traceCycles);
   } else {
     runtime_.run_cycles(executionCycles);
+  }
+  if (c2c_system_ != nullptr && !executable_weight_transfers_.empty()
+      && std::getenv("FTLPU_SESSION_STOP_CYCLE") == nullptr) {
+    constexpr std::size_t kCompletionWatchdogCycles = 10'000'000;
+    std::size_t delayedCycles = 0;
+    while (!linked_program_done(*c2c_system_, runtimeProgram)) {
+      if (delayedCycles++ == kCompletionWatchdogCycles)
+        throw std::runtime_error(
+            "linked ICU queues did not complete after page-ready waits");
+      runtime_.run_cycles(1);
+    }
+    if (delayedCycles != 0) {
+      stats_.weight_page_runtime_wait_cycles += delayedCycles;
+      runtime_.run_cycles(drain_cycles);
+      executionCycles += delayedCycles + drain_cycles;
+    }
   }
   report("runtime program completed");
   const std::size_t invocationPhysicalCycles = runtime_.physical_cycles();
@@ -2069,7 +2404,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     const BinaryBinding &binding =
         find_binding(program, BindingAccess::Internal, state.binding_index);
     std::vector<std::uint8_t> resident =
-        download_binding_through_c2c(binding, program.hardware);
+        download_binding_through_c2c(binding, program.hardware, &program);
     auto backing = state_backing_.find(state.state);
     if (backing == state_backing_.end() ||
         backing->second.size() < resident.size())
@@ -2337,6 +2672,22 @@ const BinaryProgram &ModelSession::last_linked_program() const {
 void ModelSession::write_last_linked_program(
     const std::filesystem::path &path) const {
   write_binary_program(last_linked_program(), path);
+}
+
+void ModelSession::write_pre_execution_icu_programs(
+    const std::filesystem::path &directory) const {
+  std::filesystem::create_directories(directory);
+  for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+    if (!entry.is_regular_file()) continue;
+    const auto name = entry.path().filename().string();
+    if (name.starts_with("pre_execution_") && name.ends_with(".ftlpu"))
+      std::filesystem::remove(entry.path());
+  }
+  for (std::size_t index = 0; index < pre_execution_icu_programs_.size();
+       ++index)
+    write_binary_program(pre_execution_icu_programs_[index],
+        directory / ("pre_execution_" + std::to_string(index)
+            + ".ftlpu"));
 }
 
 } // namespace ftlpu::software::runtime

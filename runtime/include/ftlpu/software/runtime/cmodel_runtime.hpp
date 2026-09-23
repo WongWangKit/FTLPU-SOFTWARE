@@ -42,9 +42,18 @@ public:
         const BinaryBinding& source, const BinaryBinding& destination);
     void set_weight_page_residency_checker(
         std::function<bool(const BinaryWeightPageUse&)> checker);
+    void set_weight_page_wait_observer(std::function<void()> observer);
     void enable_execution_trace(bool enabled = true) noexcept;
     void configure_execution_trace_segment(
         std::int64_t cycle_offset, bool append) noexcept;
+    // Trace a standalone transport ICU image that runs before or after the
+    // main executable.  ModelSession uses this for cold-start/page/input C2C
+    // traffic so the exported physical timeline begins at the first DMA/RX/
+    // MEM_WRITE_SYNC issue rather than at Session.Invocation.
+    void begin_external_execution_trace_segment(const BinaryProgram& program,
+        std::int64_t cycle_offset, bool append);
+    void sample_external_execution_trace_cycle(
+        std::uint64_t physical_cycle, bool program_issue_enabled = true);
     void record_execution_trace_interval(std::int64_t start_cycle,
         std::int64_t end_cycle, std::string resource, std::string detail,
         std::size_t issue_count = 1);
@@ -94,6 +103,7 @@ private:
     std::function<void(TspSliceSystem::LogSinks)> tick_{};
     std::function<bool(const BinaryWeightPageUse&)>
         weight_page_residency_checker_{};
+    std::function<void()> weight_page_wait_observer_{};
 };
 
 } // namespace ftlpu::software::runtime

@@ -166,6 +166,278 @@ def main() -> None:
            for vxm in serial["rope_products"]):
         raise AssertionError("overlap=off ran Q MXM and Q RoPE concurrently")
 
+    # On the split-bank Qwen2.5 layout, the original low half in E and high
+    # half in W feed both VXM product phases directly. A replicated staging
+    # write after projection would reintroduce the MEM direction switches.
+    split_stream = args.output_dir / "qwen2_5_seq32_split.stream.mlir"
+    split_schedule = args.output_dir / "qwen2_5_seq32_split.schedule.mlir"
+    split_common = [
+        "--target-config", str(args.target_config),
+        "--weight-bank", "1", "--mxm-execution", "vector",
+        "--projection-rope-overlap", "off",
+    ]
+    subprocess.run([
+        str(args.opt), "--input", str(args.input), "--output",
+        str(split_stream), "--pipeline", "ftlpu-stablehlo-to-stream",
+        *split_common,
+    ], check=True)
+    subprocess.run([
+        str(args.opt), "--input", str(split_stream), "--output",
+        str(split_schedule), "--pipeline", "ftlpu-stream-to-schedule",
+        *split_common,
+    ], check=True)
+    split_lines = split_schedule.read_text(encoding="utf-8").splitlines()
+    q_start = next(index for index, line in enumerate(split_lines)
+                   if "ftlpu.schedule.mem_transfer" in line
+                   and integer_attr(line, "address_binding", -1) == 2
+                   and 'opcode = "read"' in line)
+    v_start = next(index for index, line in enumerate(split_lines)
+                   if index > q_start
+                   and "ftlpu.schedule.mem_transfer" in line
+                   and integer_attr(line, "address_binding", -1) == 4
+                   and 'opcode = "read"' in line)
+    q_lines = split_lines[q_start:v_start]
+    k_start = next(index for index, line in enumerate(split_lines)
+                   if index > v_start
+                   and "ftlpu.schedule.mem_transfer" in line
+                   and integer_attr(line, "address_binding", -1) == 3
+                   and 'opcode = "read"' in line)
+    o_start = next(index for index, line in enumerate(split_lines)
+                   if index > k_start
+                   and "ftlpu.schedule.mem_transfer" in line
+                   and integer_attr(line, "address_binding", -1) == 5
+                   and 'opcode = "read"' in line)
+    k_lines = split_lines[k_start:o_start]
+    sources = [
+        (integer_attr(line, "queue"),
+         re.search(r'lhs_stream_source = "(east|west)"', line).group(1))
+        for line in q_lines
+        if "ftlpu.schedule.vxm " in line
+        and 'opcode = "multiply"' in line
+        and 'lhs_stream_source = "' in line
+        and integer_attr(line, "queue") in (0, 2)
+    ]
+    if sources[:4] != [(0, "east"), (2, "west"),
+                       (0, "west"), (2, "east")]:
+        raise AssertionError(f"Q rotary halves did not enter VXM from E/W: {sources[:4]}")
+    source_reads = {
+        (integer_attr(line, "hemisphere"), integer_attr(line, "packed_stream"))
+        for line in q_lines if "ftlpu.schedule.mem_transfer" in line
+        and 'opcode = "read"' in line
+        and integer_attr(line, "packed_stream") in
+        (32, 33, 36, 37, 48, 49, 52, 53)
+        and "address_binding =" not in line
+    }
+    expected_reads = {(0, stream) for stream in (32, 33, 36, 37)} | {
+        (1, stream) for stream in (48, 49, 52, 53)
+    }
+    if source_reads != expected_reads:
+        raise AssertionError(f"Q rotary inputs were not split by hemisphere: {source_reads}")
+    split_stream_text = split_stream.read_text(encoding="utf-8")
+    staging_regions = []
+    for name in ("rope_staging", "rope_staging_alternate"):
+        base, rows = placement_region(split_stream_text, name)
+        placement = re.search(rf"\b{name} = \{{([^{{}}]*)", split_stream_text)
+        slices = re.search(r"slices = \[([^]]+)\]", placement.group(1))
+        staging_regions.append((base, rows, {
+            int(value) for value in re.findall(r"\d+", slices.group(1))
+        }))
+    raw_writes = [issue_interval(line)[1] for line in q_lines
+                  if "ftlpu.schedule.mem_transfer" in line
+                  and 'opcode = "write"' in line
+                  and integer_attr(line, "packed_stream") in (32, 33)]
+    if not raw_writes:
+        raise AssertionError("split Q projection produced no raw staging writes")
+    raw_end = max(raw_writes)
+    query_source_domains = [line for line in q_lines
+                            if "ftlpu.schedule.mem_transfer" in line
+                            and 'opcode = "read"' in line
+                            and integer_attr(line, "hemisphere") == 0
+                            and integer_attr(line, "slice") == 0
+                            and integer_attr(line, "bank") == 1
+                            and integer_attr(line, "packed_stream") == 32
+                            and integer_attr(line, "cycle") >= raw_end]
+    if (len(query_source_domains) != 1
+            or integer_attr(query_source_domains[0], "wave_count") != 2
+            or integer_attr(query_source_domains[0], "group_count") != 24
+            or integer_attr(query_source_domains[0], "outer_group_size") != 2):
+        raise AssertionError(
+            "serial Q source reads should cover both product phases with "
+            f"one READ_3D per physical MEM queue: {query_source_domains}")
+    merged_source_domains = [
+        line for line in q_lines
+        if "ftlpu.schedule.mem_transfer" in line
+        and 'opcode = "read"' in line
+        and "address_binding =" not in line
+        and integer_attr(line, "group_count") == 24
+        and integer_attr(line, "wave_count") == 2
+        and integer_attr(line, "outer_group_size", 0) == 2
+        and integer_attr(line, "packed_stream") in
+        (32, 33, 36, 37, 48, 49, 52, 53)
+    ]
+    source_queues = Counter(
+        (integer_attr(line, "hemisphere"), integer_attr(line, "slice"),
+         integer_attr(line, "bank"))
+        for line in merged_source_domains
+    )
+    if len(source_queues) != 32 or any(count != 1 for count in source_queues.values()):
+        raise AssertionError(
+            "serial Q should use one source READ_3D on each of 32 MEM queues: "
+            f"{source_queues}")
+    for source in merged_source_domains:
+        queue = (integer_attr(source, "hemisphere"),
+                 integer_attr(source, "slice"), integer_attr(source, "bank"))
+        source_start, source_end = issue_interval(source)
+        interfering = [
+            line for line in q_lines
+            if line is not source and "ftlpu.schedule.mem_transfer" in line
+            and (integer_attr(line, "hemisphere"),
+                 integer_attr(line, "slice"), integer_attr(line, "bank")) == queue
+            and max(source_start, issue_interval(line)[0])
+            < min(source_end, issue_interval(line)[1])
+        ]
+        if interfering:
+            raise AssertionError(
+                f"MEM queue {queue} switches instructions during Q source READ_3D: "
+                f"{interfering[:2]}")
+    q_mem_queues: dict[tuple[int, int, int], list[tuple[int, int, str]]] = {}
+    for line in q_lines:
+        if "ftlpu.schedule.mem_transfer" not in line:
+            continue
+        queue = (integer_attr(line, "hemisphere"), integer_attr(line, "slice"),
+                 integer_attr(line, "bank"))
+        start, end = issue_interval(line)
+        q_mem_queues.setdefault(queue, []).append((start, end, line))
+    for queue, domains in q_mem_queues.items():
+        domains.sort()
+        for previous, current in zip(domains, domains[1:]):
+            if previous[1] > current[0]:
+                raise AssertionError(
+                    f"serial Q overlaps non-preemptible MEM domains on {queue}: "
+                    f"{previous[2]}, {current[2]}")
+    copied_staging = [line for line in q_lines
+                      if "ftlpu.schedule.mem_transfer" in line
+                      and 'opcode = "write"' in line
+                      and integer_attr(line, "cycle") >= raw_end
+                      and any(base <= integer_attr(line, "address") < base + rows
+                              and integer_attr(line, "slice") in slices
+                              for base, rows, slices in staging_regions)]
+    if copied_staging:
+        raise AssertionError(
+            f"Q rotary halves were copied back into SRAM: {copied_staging[:2]}")
+
+    query_base, query_rows = placement_region(split_stream_text, "query")
+    east_query_writes = [line for line in q_lines
+                         if "ftlpu.schedule.mem_transfer" in line
+                         and 'opcode = "write"' in line
+                         and integer_attr(line, "hemisphere") == 0
+                         and integer_attr(line, "bank") == 0
+                         and integer_attr(line, "packed_stream") in (8, 9)
+                         and integer_attr(line, "slice") < 16
+                         and query_base <= integer_attr(line, "address")
+                         < query_base + query_rows]
+    query_write_queues = Counter(integer_attr(line, "slice")
+                                 for line in east_query_writes)
+    if (len(query_write_queues) != 16
+            or any(count != 1 for count in query_write_queues.values())
+            or any(integer_attr(line, "wave_count") != 2
+                   or integer_attr(line, "group_count") != 12
+                   for line in east_query_writes)):
+        raise AssertionError(
+            "serial Q low-half results need one WRITE_3D per E bank0 queue: "
+            f"{query_write_queues}")
+    all_query_iw_writes = [
+        line for line in q_lines
+        if "ftlpu.schedule.mem_transfer" in line
+        and 'opcode = "write"' in line
+        and integer_attr(line, "slice") < 16
+        and query_base <= integer_attr(line, "address")
+        < query_base + query_rows
+        and integer_attr(line, "group_count") == 12
+        and integer_attr(line, "wave_count") == 2
+    ]
+    query_iw_queues = Counter(
+        (integer_attr(line, "hemisphere"), integer_attr(line, "slice"),
+         integer_attr(line, "bank"))
+        for line in all_query_iw_writes
+    )
+    if len(query_iw_queues) != 64 or any(
+            count != 1 for count in query_iw_queues.values()):
+        raise AssertionError(
+            "serial Q output needs one WRITE_3D per physical Query-IW queue: "
+            f"{query_iw_queues}")
+
+    key_sources = [
+        (integer_attr(line, "queue"),
+         re.search(r'lhs_stream_source = "(east|west)"', line).group(1))
+        for line in k_lines
+        if "ftlpu.schedule.vxm " in line
+        and 'opcode = "multiply"' in line
+        and 'lhs_stream_source = "' in line
+        and integer_attr(line, "queue") in (0, 2)
+    ]
+    if key_sources[:4] != [(0, "east"), (2, "west"),
+                           (0, "west"), (2, "east")]:
+        raise AssertionError(
+            f"K rotary halves did not enter VXM from E/W: {key_sources[:4]}")
+    key_rope_end = max(issue_interval(line)[1] for line in k_lines
+                       if "ftlpu.schedule.vxm " in line
+                       and 'opcode = "multiply"' in line
+                       and 'lhs_stream_source = "' in line
+                       and integer_attr(line, "queue") in (0, 2))
+    key_rope_start = min(issue_interval(line)[0] for line in k_lines
+                         if "ftlpu.schedule.vxm " in line
+                         and 'opcode = "multiply"' in line
+                         and 'lhs_stream_source = "' in line
+                         and integer_attr(line, "queue") in (0, 2))
+    key_source_reads = {
+        (integer_attr(line, "hemisphere"), integer_attr(line, "packed_stream"))
+        for line in k_lines if "ftlpu.schedule.mem_transfer" in line
+        and 'opcode = "read"' in line
+        and integer_attr(line, "packed_stream") in
+        (32, 33, 36, 37, 48, 49, 52, 53)
+        and integer_attr(line, "cycle") < key_rope_end
+        and "address_binding =" not in line
+    }
+    if key_source_reads != expected_reads:
+        raise AssertionError(
+            f"K rotary inputs were not split by hemisphere: {key_source_reads}")
+    key_raw_writes = [issue_interval(line)[1] for line in k_lines
+                      if "ftlpu.schedule.mem_transfer" in line
+                      and 'opcode = "write"' in line
+                      and integer_attr(line, "packed_stream") in (32, 33)
+                      and integer_attr(line, "cycle") < key_rope_start]
+    if not key_raw_writes:
+        raise AssertionError("split K projection produced no raw staging writes")
+    key_raw_end = max(key_raw_writes)
+    key_source_domains = [line for line in k_lines
+                          if "ftlpu.schedule.mem_transfer" in line
+                          and 'opcode = "read"' in line
+                          and integer_attr(line, "hemisphere") == 0
+                          and integer_attr(line, "slice") == 0
+                          and integer_attr(line, "bank") == 1
+                          and integer_attr(line, "packed_stream") == 32
+                          and key_raw_end <= integer_attr(line, "cycle")
+                          < key_rope_end]
+    if (len(key_source_domains) != 2
+            or any(integer_attr(line, "wave_count") != 2
+                   or integer_attr(line, "group_count") != 2
+                   for line in key_source_domains)):
+        raise AssertionError(
+            "serial K source reads should cover both phases and pairs with "
+            f"one READ_3D per head: {len(key_source_domains)}")
+    key_copied_staging = [line for line in k_lines
+                          if "ftlpu.schedule.mem_transfer" in line
+                          and 'opcode = "write"' in line
+                          and integer_attr(line, "cycle") >= key_raw_end
+                          and any(base <= integer_attr(line, "address") < base + rows
+                                  and integer_attr(line, "slice") in slices
+                                  for base, rows, slices in staging_regions)]
+    if key_copied_staging:
+        raise AssertionError(
+            "K rotary halves were copied back into SRAM: "
+            f"{key_copied_staging[:2]}")
+
     # Q/K/V each need one closed-form read per active physical MEM queue.
     serial_transfers = [
         line for line in schedules["off"].read_text(encoding="utf-8").splitlines()
