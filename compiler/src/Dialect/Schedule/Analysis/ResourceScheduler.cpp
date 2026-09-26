@@ -1,9 +1,58 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/resource_scheduler.hpp"
 
 #include <algorithm>
+#include <functional>
+#include <iterator>
+#include <stdexcept>
 #include <vector>
 
 namespace ftlpu::compiler::schedule {
+
+std::size_t PhysicalResourceIdHash::operator()(
+    const PhysicalResourceId& resource) const noexcept
+{
+    std::size_t value = std::hash<int> {}(static_cast<int>(resource.kind));
+    const auto combine = [&](std::size_t next) {
+        value ^= next + 0x9e3779b9u + (value << 6) + (value >> 2);
+    };
+    combine(std::hash<int64_t> {}(resource.first));
+    combine(std::hash<int64_t> {}(resource.second));
+    combine(std::hash<int64_t> {}(resource.third));
+    combine(std::hash<std::string> {}(resource.legacy_name));
+    return value;
+}
+
+std::string physical_resource_name(const PhysicalResourceId& resource)
+{
+    if (resource.kind == PhysicalResourceKind::Legacy)
+        return resource.legacy_name;
+    const auto suffix = [&](const char* name) {
+        std::string result(name);
+        result += "." + std::to_string(resource.first);
+        if (resource.second >= 0)
+            result += "." + std::to_string(resource.second);
+        if (resource.third >= 0)
+            result += "." + std::to_string(resource.third);
+        return result;
+    };
+    switch (resource.kind) {
+    case PhysicalResourceKind::MemIcuQueue: return suffix("mem.icu");
+    case PhysicalResourceKind::MemReadPort: return suffix("mem.read");
+    case PhysicalResourceKind::MemWritePort: return suffix("mem.write");
+    case PhysicalResourceKind::MxmLoadQueue: return suffix("mxm.load");
+    case PhysicalResourceKind::MxmComputeQueue: return suffix("mxm.compute");
+    case PhysicalResourceKind::MxmDequantQueue: return suffix("mxm.dequant");
+    case PhysicalResourceKind::MxmWeightBuffer: return suffix("mxm.weight_buffer");
+    case PhysicalResourceKind::VxmQueue: return suffix("vxm.queue");
+    case PhysicalResourceKind::VxmAlu: return suffix("vxm.alu");
+    case PhysicalResourceKind::SxmTransposeQueue: return suffix("sxm.transpose");
+    case PhysicalResourceKind::SxmPermuteQueue: return suffix("sxm.permute");
+    case PhysicalResourceKind::SxmUnit: return suffix("sxm.unit");
+    case PhysicalResourceKind::StreamChannel: return suffix("stream");
+    case PhysicalResourceKind::Legacy: break;
+    }
+    return "unknown";
+}
 
 int64_t ResourceScheduler::find_earliest(int64_t earliest_cycle,
     llvm::ArrayRef<ResourceWindow> windows) const
@@ -43,7 +92,8 @@ bool ResourceScheduler::is_free_at(int64_t cycle,
 bool ResourceScheduler::has_internal_conflict(
     llvm::ArrayRef<ResourceWindow> windows) const
 {
-    std::unordered_map<std::string, std::vector<std::pair<int64_t, int64_t>>>
+    std::unordered_map<PhysicalResourceId,
+        std::vector<std::pair<int64_t, int64_t>>, PhysicalResourceIdHash>
         intervalsByResource;
     for (const ResourceWindow& window : windows) {
         if (window.duration <= 0) return true;
@@ -71,7 +121,7 @@ bool ResourceScheduler::try_reserve_at(int64_t cycle,
     llvm::ArrayRef<ResourceWindow> windows)
 {
     if (!is_free_at(cycle, windows)) return false;
-    reserve_at(cycle, windows);
+    commit_at(cycle, windows);
     return true;
 }
 
@@ -80,19 +130,57 @@ std::optional<int64_t> ResourceScheduler::try_reserve(
 {
     if (has_internal_conflict(windows)) return std::nullopt;
     const int64_t cycle = find_earliest(earliest_cycle, windows);
-    reserve_at(cycle, windows);
+    commit_at(cycle, windows);
     return cycle;
 }
 
 int64_t ResourceScheduler::reserve(int64_t earliest_cycle,
     llvm::ArrayRef<ResourceWindow> windows)
 {
-    const int64_t anchor = find_earliest(earliest_cycle, windows);
-    reserve_at(anchor, windows);
-    return anchor;
+    const auto cycle = try_reserve(earliest_cycle, windows);
+    if (!cycle)
+        throw std::invalid_argument(
+            "cannot reserve a resource bundle with internal conflicts");
+    return *cycle;
 }
 
 void ResourceScheduler::reserve_at(int64_t cycle,
+    llvm::ArrayRef<ResourceWindow> windows)
+{
+    if (!try_reserve_at(cycle, windows))
+        throw std::invalid_argument(
+            "cannot reserve a conflicting resource bundle at a fixed cycle");
+}
+
+void ResourceScheduler::block_at(int64_t cycle,
+    llvm::ArrayRef<ResourceWindow> windows)
+{
+    for (const ResourceWindow& window : windows) {
+        if (window.duration <= 0)
+            throw std::invalid_argument(
+                "cannot block a resource for a non-positive duration");
+        int64_t start = cycle + window.offset;
+        int64_t end = start + window.duration;
+        auto& intervals = reservations_[window.resource];
+        auto position = intervals.lower_bound(start);
+        if (position != intervals.begin()) {
+            auto previous = std::prev(position);
+            if (previous->second >= start) position = previous;
+        }
+        while (position != intervals.end() && position->first <= end) {
+            if (position->second < start) {
+                ++position;
+                continue;
+            }
+            start = std::min(start, position->first);
+            end = std::max(end, position->second);
+            position = intervals.erase(position);
+        }
+        intervals.emplace(start, end);
+    }
+}
+
+void ResourceScheduler::commit_at(int64_t cycle,
     llvm::ArrayRef<ResourceWindow> windows)
 {
     for (const auto& window : windows) {

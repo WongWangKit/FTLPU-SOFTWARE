@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/schedule_graph.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/lpu_resource_model.hpp"
 
 #include <stdexcept>
 
@@ -63,4 +64,35 @@ int main()
         "legal transactional bundle was rejected");
     require(!transactional.try_reserve_at(100, legalBundle),
         "existing ICU reservation was ignored");
+
+    bool fixedCycleRejected = false;
+    try {
+        transactional.reserve_at(200, conflictingBundle);
+    } catch (const std::invalid_argument&) {
+        fixedCycleRejected = true;
+    }
+    require(fixedCycleRejected,
+        "fixed-cycle API silently committed an internal conflict");
+
+    ResourceScheduler blocked;
+    blocked.block_at(10, {{"external.busy", 0, 4}});
+    blocked.block_at(12, {{"external.busy", 0, 4}});
+    blocked.block_at(13, {{"external.busy", 0, 1}});
+    require(blocked.find_earliest(10, {{"external.busy", 0, 1}}) == 16,
+        "overlapping external busy windows were not treated as a union");
+
+    const ftlpu::compiler::target::LPUTargetModel target;
+    const LPUResourceModel model(target);
+    require(model.mem_queue(0, 0, 0).index == 0,
+        "east MEM queue origin changed");
+    require(model.mem_queue(1, 0, 0).index
+            == target.memory().slices_per_hemisphere
+                * target.memory().banks_per_slice,
+        "west MEM queue flattening is inconsistent");
+    require(model.mem_icu(0, 0, 0)
+            == model.queue_resource(model.mem_queue(0, 0, 0)),
+        "MEM scheduler resource and command queue identity diverged");
+    require(model.queue_resource(model.mxm_load_queue(0))
+            != model.queue_resource(model.mxm_compute_queue(0)),
+        "MXM load and compute queues were aliased");
 }

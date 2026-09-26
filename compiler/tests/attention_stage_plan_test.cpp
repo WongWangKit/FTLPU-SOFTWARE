@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_stage_plan.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_pv_timeline.hpp"
 
 #include <cstdio>
 #include <stdexcept>
@@ -37,6 +38,17 @@ int main()
 
     require(plan.qk_wave_interval == 256,
         "single-MXM QK waves should overlap without a refill gap");
+
+    // Qwen2.5 uses head_dim=128 on a 32-row MXM and seq_len=128.  The paged
+    // single-MXM PV path therefore has four query blocks and must issue them
+    // in four distinct 32-cycle windows while reusing the resident V block.
+    constexpr int64_t qwenFirstCompute = 436504;
+    for (int64_t queryBlock = 0; queryBlock < 4; ++queryBlock) {
+        require(schedule::attention_pv_query_compute_cycle(
+                    qwenFirstCompute, queryBlock, 32)
+                == qwenFirstCompute + queryBlock * 32,
+            "Qwen PV query blocks overlap one MXM issue window");
+    }
 
     target::ThroughputModel dualMxmThroughput;
     dualMxmThroughput.mxms_per_hemisphere = 2;

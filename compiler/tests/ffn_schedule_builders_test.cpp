@@ -49,6 +49,51 @@ int main() try
     require((*cycles)[0] == 10 && (*cycles)[1] == 47,
         "FFN Swish planner did not serialize the shared VXM pipeline");
 
+    schedule::FfnSwishScheduleRequest busySwish;
+    busySwish.tasks = {{10, 0}};
+    busySwish.temp_mem_windows[0] = {{10, 20}};
+    busySwish.tile_rows = 32;
+    auto busyCycles = schedule::planFfnSwishCycles(busySwish, target);
+    require(mlir::succeeded(busyCycles),
+        "FFN Swish busy-window plan failed");
+    int64_t maximumWestLatency = 0;
+    for (int64_t slice : target.ffn_gate_temp_slices()) {
+        const auto latency = target.transport_latency(
+            target::StreamEndpoint::Mem,
+            target::StreamEndpoint::VxmInput,
+            target::StreamDirection::West, slice);
+        require(latency.has_value(), "FFN gate slice has no west route");
+        maximumWestLatency = std::max(maximumWestLatency, *latency);
+    }
+    for (int64_t slice : target.ffn_up_temp_slices()) {
+        const auto latency = target.transport_latency(
+            target::StreamEndpoint::Mem,
+            target::StreamEndpoint::VxmInput,
+            target::StreamDirection::West, slice);
+        require(latency.has_value(), "FFN up slice has no west route");
+        maximumWestLatency = std::max(maximumWestLatency, *latency);
+    }
+    require((*busyCycles)[0] == 20 + maximumWestLatency,
+        "FFN Swish read issue ignored the MEM busy window or route latency");
+
+    schedule::FfnSwishScheduleRequest hiddenConflict;
+    hiddenConflict.tasks = {{10, 0}};
+    hiddenConflict.hidden_slices = {0};
+    hiddenConflict.hidden_bank = 1;
+    hiddenConflict.tile_rows = 32;
+    const auto hiddenLatency = target.transport_latency(
+        target::StreamEndpoint::VxmResult,
+        target::StreamEndpoint::Mem,
+        target::StreamDirection::East, 0);
+    require(hiddenLatency.has_value(), "FFN hidden slice has no east route");
+    const int64_t firstHiddenWrite = 10 + 17 + *hiddenLatency;
+    hiddenConflict.mem_windows.push_back(
+        {0, 0, 1, firstHiddenWrite, firstHiddenWrite + 1, false});
+    auto hiddenCycles =
+        schedule::planFfnSwishCycles(hiddenConflict, target);
+    require(mlir::succeeded(hiddenCycles) && (*hiddenCycles)[0] == 11,
+        "FFN Swish hidden write ignored an existing activation read");
+
     const auto& memory = target.memory();
     llvm::SmallVector<int64_t> weightSlices;
     for (int64_t index = 0; index < memory.w8a16_weight_slice_count; ++index)

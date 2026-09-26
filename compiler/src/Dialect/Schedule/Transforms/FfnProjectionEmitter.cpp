@@ -242,36 +242,53 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                         const int64_t slice =
                                             context.activation_slices[
                                                 2 * tokenLane + byte];
-                                        activationValue = context
-                                            .emitSliceRead(
+                                        const int64_t issueCycle =
+                                            consumerCycle + localRow
+                                            - context.eastMxmLatency(slice);
+                                        auto read = context.emitSliceRead(
                                                 context.activation_route
                                                     .getInput(),
                                                 context.activation_route,
-                                                consumerCycle + localRow
-                                                    - context.eastMxmLatency(
-                                                        slice),
+                                                issueCycle,
                                                 slice, row, 1, 1,
                                                 segment.stream_base + byte,
                                                 "east", "activation",
                                                 context.hemisphereName(
-                                                    hemisphere))
-                                            .getOutput();
+                                                    hemisphere));
+                                        const int64_t bank = read.getPlacement()
+                                            .getAs<mlir::IntegerAttr>("bank")
+                                            .getInt();
+                                        emission.mem_busy_windows.push_back({
+                                            hemisphere, slice, bank,
+                                            issueCycle, issueCycle + 1,
+                                            false});
+                                        activationValue = read.getOutput();
                                     }
                                 }
                             } else {
                                 for (int64_t byte = 0; byte < 2; ++byte) {
-                                    activationValue = context.emitSliceRead(
+                                    const int64_t issueCycle = consumerCycle
+                                        - context.activation_latency;
+                                    const int64_t slice =
+                                        context.activation_slices[byte];
+                                    auto read = context.emitSliceRead(
                                         context.activation_route.getInput(),
                                         context.activation_route,
-                                        consumerCycle
-                                            - context.activation_latency,
-                                        context.activation_slices[byte],
+                                        issueCycle, slice,
                                         activationBase + rowOffset,
                                         segment.rows, 1,
                                         segment.stream_base + byte,
                                         "east", "activation",
-                                        context.hemisphereName(hemisphere))
-                                        .getOutput();
+                                        context.hemisphereName(hemisphere));
+                                    const int64_t bank = read.getPlacement()
+                                        .getAs<mlir::IntegerAttr>("bank")
+                                        .getInt();
+                                    emission.mem_busy_windows.push_back({
+                                        hemisphere, slice, bank,
+                                        issueCycle,
+                                        issueCycle + segment.rows,
+                                        false});
+                                    activationValue = read.getOutput();
                                 }
                             }
                             return activationValue;

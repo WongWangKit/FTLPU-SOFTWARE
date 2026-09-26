@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/lpu_resource_model.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
@@ -17,7 +18,9 @@ namespace {
 
 class ScheduleVerifier {
 public:
-    explicit ScheduleVerifier(mlir::func::FuncOp function) : function_(function) {}
+    ScheduleVerifier(mlir::func::FuncOp function,
+        const target::LPUTargetModel& target)
+        : function_(function), resources_model_(target) {}
 
     mlir::LogicalResult run()
     {
@@ -50,14 +53,16 @@ private:
             for (mlir::Attribute sliceAttr : slicesAttr) {
                 const int64_t slice =
                     llvm::cast<mlir::IntegerAttr>(sliceAttr).getInt();
-                const std::string base = "mem."
-                    + std::to_string(hemisphere) + "."
-                    + std::to_string(slice) + ".bank"
-                    + std::to_string(bank) + ".";
-                auto queueResult = reserve(operation, base + "icu",
+                auto queueResult = reserve(operation,
+                    resources_model_.mem_icu(hemisphere, slice, bank),
                     cycle, duration, 1);
                 if (queueResult.wasInterrupted()) return queueResult;
-                auto portResult = reserve(operation, base + port.str(),
+                const auto portResource = port == "read"
+                    ? resources_model_.mem_read_port(
+                        hemisphere, slice, bank)
+                    : resources_model_.mem_write_port(
+                        hemisphere, slice, bank);
+                auto portResult = reserve(operation, portResource,
                     cycle, duration, 1);
                 if (portResult.wasInterrupted()) return portResult;
             }
@@ -65,7 +70,8 @@ private:
         return mlir::WalkResult::advance();
     }
 
-    mlir::WalkResult reserve(mlir::Operation* operation, std::string resource,
+    mlir::WalkResult reserve(mlir::Operation* operation,
+        schedule::PhysicalResourceId resource,
         int64_t start, int64_t repeatCount = 1, int64_t repeatInterval = 1)
     {
         auto& reservations = resources_[resource];
@@ -75,7 +81,9 @@ private:
                 reservations.try_emplace(cycle, operation);
             if (!inserted) {
                 operation->emitError()
-                    << "resource '" << resource << "' overlaps at cycle "
+                    << "resource '"
+                    << schedule::physical_resource_name(resource)
+                    << "' overlaps at cycle "
                     << cycle << " with " << position->second->getName()
                     << "; current attributes "
                     << operation->getAttrDictionary()
@@ -115,20 +123,20 @@ private:
         }
         if (auto op = llvm::dyn_cast<schedule::MemTransferOp>(operation)) {
             const int64_t bank = op.getBank().value_or(0);
-            const std::string base = "mem."
-                + std::to_string(op.getHemisphere()) + "."
-                + std::to_string(op.getSlice()) + ".bank"
-                + std::to_string(bank) + ".";
             for (int64_t wave = 0;
                  wave < op.getWaveCount().value_or(1); ++wave) {
                 const int64_t cycle = op.getCycle()
                     + wave * op.getWaveInterval().value_or(1);
-                auto queueResult = reserve(operation, base + "icu",
+                auto queueResult = reserve(operation,
+                    resources_model_.mem_icu(
+                        op.getHemisphere(), op.getSlice(), bank),
                     cycle, op.getRepeatCount(), op.getRepeatInterval());
                 if (queueResult.wasInterrupted()) return queueResult;
                 if (op.getOpcode() == "read"
                     || op.getOpcode() == "read_write") {
-                    auto result = reserve(operation, base + "read",
+                    auto result = reserve(operation,
+                        resources_model_.mem_read_port(
+                            op.getHemisphere(), op.getSlice(), bank),
                         cycle, op.getRepeatCount(),
                         op.getRepeatInterval());
                     if (result.wasInterrupted()) return result;
@@ -136,7 +144,9 @@ private:
                 if (op.getOpcode() == "write"
                     || op.getOpcode() == "write_tap"
                     || op.getOpcode() == "read_write") {
-                    auto result = reserve(operation, base + "write",
+                    auto result = reserve(operation,
+                        resources_model_.mem_write_port(
+                            op.getHemisphere(), op.getSlice(), bank),
                         cycle, op.getRepeatCount(),
                         op.getRepeatInterval());
                     if (result.wasInterrupted()) return result;
@@ -151,9 +161,12 @@ private:
             const int64_t groupInterval = op.getGroupInterval().value_or(1);
             for (int64_t group = 0; group < groupCount; ++group) {
                 for (int64_t wave = 0; wave < waveCount; ++wave) {
+                    const bool load = op.getOpcode() == "iw"
+                        || op.getOpcode() == "decode_load_activation";
                     auto result = reserve(operation,
-                        "mxm." + op.getOpcode().str() + "."
-                            + std::to_string(op.getUnitId()),
+                        resources_model_.queue_resource(load
+                                ? resources_model_.mxm_load_queue(op.getUnitId())
+                                : resources_model_.mxm_compute_queue(op.getUnitId())),
                         op.getCycle() + group * groupInterval
                             + wave * waveInterval,
                         op.getRepeatCount(), op.getRepeatInterval());
@@ -166,7 +179,8 @@ private:
             for (int64_t wave = 0;
                  wave < op.getWaveCount().value_or(1); ++wave) {
                 auto result = reserve(operation,
-                    "mxm.dequant." + std::to_string(op.getUnitId()),
+                    resources_model_.queue_resource(
+                        resources_model_.mxm_dequant_queue(op.getUnitId())),
                     op.getCycle()
                         + wave * op.getWaveInterval().value_or(1),
                     op.getRepeatCount(), op.getRepeatInterval());
@@ -175,18 +189,21 @@ private:
             return mlir::WalkResult::advance();
         }
         if (auto op = llvm::dyn_cast<schedule::VxmOp>(operation))
-            return reserve(operation, "vxm." + std::to_string(op.getQueue()),
+            return reserve(operation, resources_model_.queue_resource(
+                    resources_model_.vxm_queue(op.getQueue())),
                 op.getCycle(), 1, 1);
         if (auto op = llvm::dyn_cast<schedule::SxmOp>(operation))
-            return reserve(operation, "sxm." + op.getOpcode().str() + "."
-                    + std::to_string(op.getHemisphere()),
+            return reserve(operation, resources_model_.queue_resource(
+                    resources_model_.sxm_queue(
+                        op.getOpcode() == "transpose", op.getHemisphere())),
                 op.getCycle(), op.getRepeatCount().value_or(1),
                 op.getRepeatInterval().value_or(1));
         if (auto op = llvm::dyn_cast<schedule::MxmLoadOp>(operation)) {
             for (int64_t group = 0;
                  group < op.getGroupCount().value_or(1); ++group) {
                 auto result = reserve(operation,
-                    "mxm.iw." + std::to_string(op.getUnitId()),
+                    resources_model_.queue_resource(
+                        resources_model_.mxm_load_queue(op.getUnitId())),
                     op.getCycle()
                         + group * op.getGroupInterval().value_or(1),
                     op.getDuration(), 1);
@@ -198,7 +215,8 @@ private:
             for (int64_t wave = 0;
                  wave < op.getWaveCount().value_or(1); ++wave) {
                 auto result = reserve(operation,
-                    "mxm.compute." + std::to_string(op.getUnitId()),
+                    resources_model_.queue_resource(
+                        resources_model_.mxm_compute_queue(op.getUnitId())),
                     op.getCycle()
                         + wave * op.getWaveInterval().value_or(1),
                     op.getDuration(), 1);
@@ -210,8 +228,10 @@ private:
     }
 
     mlir::func::FuncOp function_;
-    std::unordered_map<std::string,
-        std::unordered_map<int64_t, mlir::Operation*>> resources_;
+    schedule::LPUResourceModel resources_model_;
+    std::unordered_map<schedule::PhysicalResourceId,
+        std::unordered_map<int64_t, mlir::Operation*>,
+        schedule::PhysicalResourceIdHash> resources_;
 };
 
 class VerifySchedulePass final
@@ -232,7 +252,12 @@ public:
             signalPassFailure();
             return;
         }
-        ScheduleVerifier verifier(getOperation());
+        auto targetModel = target::LPUTargetModel::from_operation(getOperation());
+        if (mlir::failed(targetModel)) {
+            signalPassFailure();
+            return;
+        }
+        ScheduleVerifier verifier(getOperation(), *targetModel);
         if (mlir::failed(verifier.run())) signalPassFailure();
     }
 };

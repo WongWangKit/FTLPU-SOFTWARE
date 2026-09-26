@@ -307,6 +307,11 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
         request.temp_mem_windows[hemisphere] =
             std::move(emission.temp_mem_busy_windows[hemisphere]);
     }
+    request.mem_windows = std::move(emission.mem_busy_windows);
+    request.hidden_slices.assign(
+        context.hidden_slices.begin(), context.hidden_slices.end());
+    request.hidden_bank = ffn.getHidden0Placement()
+        .getAs<mlir::IntegerAttr>("bank").getInt();
 
     llvm::SmallVector<const CompletedProjectionTile*> deferred;
     for (const CompletedProjectionTile& completed :

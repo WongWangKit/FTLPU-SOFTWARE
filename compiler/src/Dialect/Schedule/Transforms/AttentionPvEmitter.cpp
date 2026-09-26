@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 
 #include "AttentionEmitterUtils.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_pv_timeline.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_work_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
@@ -248,9 +249,12 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                     }
                     for (int64_t queryBlock = 0;
                          queryBlock < tokenBlocks; ++queryBlock) {
+                        const int64_t queryCompute =
+                            attention_pv_query_compute_cycle(
+                                firstCompute, queryBlock, tile);
                         const bool finalReduction =
                             keyBlock + 1 == tokenBlocks;
-                        int64_t blockEnd = firstCompute + tile;
+                        int64_t blockEnd = queryCompute + tile;
                         for (int64_t hemisphere = 0;
                              hemisphere
                                  < target_.memory().hemispheres;
@@ -258,7 +262,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                             const auto head =
                                 wave[static_cast<std::size_t>(hemisphere)];
                             if (!head) continue;
-                            const int64_t hemisphereCompute = firstCompute
+                            const int64_t hemisphereCompute = queryCompute
                                 + (finalReduction && !sourceLocalContext
                                         ? hemisphere
                                             * finalOutputHemisphereStagger
@@ -393,7 +397,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                             }
                         }
                         if (pipelineHeadBlocks) {
-                            nextPipelinedCompute = firstCompute + tile;
+                            nextPipelinedCompute = queryCompute + tile;
                             pipelinedEnd = std::max(pipelinedEnd, blockEnd + 1);
                         } else {
                             phaseStart = blockEnd + 1;

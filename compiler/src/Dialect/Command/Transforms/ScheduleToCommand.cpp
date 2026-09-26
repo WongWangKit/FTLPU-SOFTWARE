@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/lpu_resource_model.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
@@ -48,9 +49,8 @@ int64_t placement_integer_or(mlir::DictionaryAttr placement,
 int64_t mem_queue(const target::LPUTargetModel& target,
     int64_t hemisphere, int64_t slice, int64_t bank)
 {
-    return hemisphere * target.memory().slices_per_hemisphere
-            * target.memory().banks_per_slice
-        + slice * target.memory().banks_per_slice + bank;
+    return schedule::LPUResourceModel(target)
+        .mem_queue(hemisphere, slice, bank).index;
 }
 
 mlir::StringAttr placement_hemisphere(mlir::DictionaryAttr placement,
@@ -939,16 +939,12 @@ public:
         llvm::sort(mem_transfers,
             [&](schedule::MemTransferOp lhs,
                 schedule::MemTransferOp rhs) {
-                const int64_t lhsQueue = lhs.getHemisphere()
-                        * target.memory().slices_per_hemisphere
-                        * target.memory().banks_per_slice
-                    + lhs.getSlice() * target.memory().banks_per_slice
-                    + lhs.getBank().value_or(0);
-                const int64_t rhsQueue = rhs.getHemisphere()
-                        * target.memory().slices_per_hemisphere
-                        * target.memory().banks_per_slice
-                    + rhs.getSlice() * target.memory().banks_per_slice
-                    + rhs.getBank().value_or(0);
+                const int64_t lhsQueue = mem_queue(target,
+                    lhs.getHemisphere(), lhs.getSlice(),
+                    lhs.getBank().value_or(0));
+                const int64_t rhsQueue = mem_queue(target,
+                    rhs.getHemisphere(), rhs.getSlice(),
+                    rhs.getBank().value_or(0));
                 return lhsQueue != rhsQueue
                     ? lhsQueue < rhsQueue
                     : lhs.getCycle() < rhs.getCycle();
@@ -969,11 +965,9 @@ public:
             if (first.getRepeatCount() == 1 && firstWaveCount == 1
                 && end < mem_transfers.size()) {
                 schedule::MemTransferOp second = mem_transfers[end];
-                const int64_t secondQueue = second.getHemisphere()
-                        * target.memory().slices_per_hemisphere
-                        * target.memory().banks_per_slice
-                    + second.getSlice() * target.memory().banks_per_slice
-                    + second.getBank().value_or(0);
+                const int64_t secondQueue = mem_queue(target,
+                    second.getHemisphere(), second.getSlice(),
+                    second.getBank().value_or(0));
                 const bool compatible =
                     secondQueue == queue
                     && second.getRepeatCount() == 1

@@ -22,13 +22,50 @@ mlir::FailureOr<std::vector<int64_t>> planFfnSwishCycles(
     for (int64_t alu = 0; alu < 16; ++alu)
         allVxmAlus.push_back({resourceModel.vxm_alu(alu), 0, 1});
 
+    int64_t earliestTaskAnchor = 0;
+    int64_t minimumTaskOffset = 0;
+    if (!request.tasks.empty()) {
+        earliestTaskAnchor = request.tasks.front().earliest_cycle;
+        for (const FfnSwishTaskRequest& task : request.tasks) {
+            if (task.earliest_cycle < 0 || task.hemisphere < 0
+                || task.hemisphere >= target.memory().hemispheres)
+                return mlir::failure();
+            earliestTaskAnchor =
+                std::min(earliestTaskAnchor, task.earliest_cycle);
+        }
+        for (int64_t slice : target.ffn_gate_temp_slices()) {
+            const auto latency = target.transport_latency(
+                target::StreamEndpoint::Mem,
+                target::StreamEndpoint::VxmInput,
+                target::StreamDirection::West, slice);
+            if (!latency) return mlir::failure();
+            minimumTaskOffset = std::min(minimumTaskOffset, -*latency);
+        }
+        for (int64_t slice : target.ffn_up_temp_slices()) {
+            const auto latency = target.transport_latency(
+                target::StreamEndpoint::Mem,
+                target::StreamEndpoint::VxmInput,
+                target::StreamDirection::West, slice);
+            if (!latency) return mlir::failure();
+            minimumTaskOffset = std::min(minimumTaskOffset, -*latency);
+        }
+    }
+    // Anchors only move forward. An imported interval ending before the first
+    // possible task window can never participate in a conflict, and retaining
+    // the complete projection history makes long-sequence scheduling needlessly
+    // expensive.
+    const int64_t earliestRelevantCycle =
+        earliestTaskAnchor + minimumTaskOffset;
+
     for (FfnCycleWindow dequant : request.dequant_windows) {
         if (dequant.end <= dequant.start) return mlir::failure();
+        if (!request.tasks.empty() && dequant.end <= earliestRelevantCycle)
+            continue;
         llvm::SmallVector<ResourceWindow, 16> windows;
         for (const auto& resource : allVxmAlus)
             windows.push_back(
                 {resource.resource, 0, dequant.end - dequant.start});
-        resources.reserve_at(dequant.start, windows);
+        resources.block_at(dequant.start, windows);
     }
 
     for (int64_t hemisphere = 0;
@@ -41,15 +78,29 @@ mlir::FailureOr<std::vector<int64_t>> planFfnSwishCycles(
         for (FfnCycleWindow busy :
              request.temp_mem_windows[static_cast<std::size_t>(hemisphere)]) {
             if (busy.end <= busy.start) return mlir::failure();
+            if (!request.tasks.empty() && busy.end <= earliestRelevantCycle)
+                continue;
             llvm::SmallVector<ResourceWindow, 8> windows;
             for (int64_t slice : tempSlices) {
-                windows.push_back({resourceModel.mem_read_port(hemisphere, slice),
-                    0, busy.end - busy.start});
-                windows.push_back({resourceModel.mem_write_port(hemisphere, slice),
+                windows.push_back({resourceModel.mem_icu(hemisphere, slice, 0),
                     0, busy.end - busy.start});
             }
-            resources.reserve_at(busy.start, windows);
+            resources.block_at(busy.start, windows);
         }
+    }
+
+    for (const FfnMemResourceWindow& busy : request.mem_windows) {
+        if (busy.hemisphere < 0
+            || busy.hemisphere >= target.memory().hemispheres
+            || busy.end <= busy.start)
+            return mlir::failure();
+        if (!request.tasks.empty() && busy.end <= earliestRelevantCycle)
+            continue;
+        const ResourceWindow window{resourceModel.mem_icu(
+                                        busy.hemisphere, busy.slice,
+                                        busy.bank),
+            0, busy.end - busy.start};
+        resources.block_at(busy.start, window);
     }
 
     SchedulePlan plan;
@@ -57,24 +108,45 @@ mlir::FailureOr<std::vector<int64_t>> planFfnSwishCycles(
     taskIds.reserve(request.tasks.size());
     for (std::size_t index = 0; index < request.tasks.size(); ++index) {
         const auto& task = request.tasks[index];
-        if (task.earliest_cycle < 0 || task.hemisphere < 0
-            || task.hemisphere >= target.memory().hemispheres)
-            return mlir::failure();
         llvm::SmallVector<ResourceWindow, 24> windows;
         for (const auto& resource : allVxmAlus)
             windows.push_back(
                 {resource.resource, 0, request.tile_rows + 5});
         for (int64_t slice : target.ffn_gate_temp_slices()) {
-            windows.push_back({resourceModel.mem_read_port(task.hemisphere, slice),
-                0, request.tile_rows});
-            windows.push_back({resourceModel.mem_write_port(task.hemisphere, slice),
-                0, request.tile_rows});
+            const auto latency = target.transport_latency(
+                target::StreamEndpoint::Mem,
+                target::StreamEndpoint::VxmInput,
+                target::StreamDirection::West, slice);
+            if (!latency) return mlir::failure();
+            windows.push_back({resourceModel.mem_icu(
+                                   task.hemisphere, slice, 0),
+                -*latency, request.tile_rows});
         }
         for (int64_t slice : target.ffn_up_temp_slices()) {
-            windows.push_back({resourceModel.mem_read_port(task.hemisphere, slice),
-                0, request.tile_rows});
-            windows.push_back({resourceModel.mem_write_port(task.hemisphere, slice),
-                0, request.tile_rows});
+            const auto latency = target.transport_latency(
+                target::StreamEndpoint::Mem,
+                target::StreamEndpoint::VxmInput,
+                target::StreamDirection::West, slice);
+            if (!latency) return mlir::failure();
+            windows.push_back({resourceModel.mem_icu(
+                                   task.hemisphere, slice, 0),
+                -*latency, request.tile_rows});
+        }
+        constexpr int64_t swishLatency = 17;
+        for (int64_t hemisphere = 0;
+             hemisphere < target.memory().hemispheres; ++hemisphere) {
+            for (int64_t slice : request.hidden_slices) {
+                const auto latency = target.transport_latency(
+                    target::StreamEndpoint::VxmResult,
+                    target::StreamEndpoint::Mem,
+                    target::StreamDirection::East, slice);
+                if (!latency) return mlir::failure();
+                const int64_t offset = swishLatency + *latency;
+                windows.push_back({resourceModel.mem_icu(
+                                       hemisphere, slice,
+                                       request.hidden_bank),
+                    offset, request.tile_rows});
+            }
         }
         taskIds.push_back(plan.addTask(
             llvm::formatv("ffn.swish.{0}", index).str(),

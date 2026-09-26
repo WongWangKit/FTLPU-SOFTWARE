@@ -20,10 +20,22 @@ struct FfnSwishTaskRequest {
     int64_t hemisphere;
 };
 
+struct FfnMemResourceWindow {
+    int64_t hemisphere;
+    int64_t slice;
+    int64_t bank;
+    int64_t start;
+    int64_t end;
+    bool write;
+};
+
 struct FfnSwishScheduleRequest {
     std::vector<FfnSwishTaskRequest> tasks;
     std::vector<FfnCycleWindow> dequant_windows;
     std::array<std::vector<FfnCycleWindow>, 2> temp_mem_windows;
+    std::vector<FfnMemResourceWindow> mem_windows;
+    std::vector<int64_t> hidden_slices;
+    int64_t hidden_bank{0};
     int64_t tile_rows;
 };
 

@@ -82,6 +82,7 @@ struct CompletedProjectionTile {
 struct FfnProjectionEmission {
     llvm::SmallVector<CompletedProjectionTile> completed_tiles;
     std::array<std::vector<FfnCycleWindow>, 2> temp_mem_busy_windows;
+    std::vector<FfnMemResourceWindow> mem_busy_windows;
 };
 
 struct FfnSwishEmission {
