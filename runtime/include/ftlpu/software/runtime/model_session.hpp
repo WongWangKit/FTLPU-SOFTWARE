@@ -47,6 +47,10 @@ struct ModelSessionStats {
     std::size_t weight_page_hidden_prefetches{0};
     std::size_t weight_page_deferred_prefetches{0};
     std::size_t weight_page_runtime_wait_cycles{0};
+    // Number of statically linked execution epochs. Epoch 0 contains all
+    // pre-execution resources (including KV/state page-in); every later epoch
+    // begins at a page-ready WAIT_EVENT boundary in the ICU programs.
+    std::size_t execution_epochs{0};
     // Actual FU writes issued by executable MEM_WRITE_SYNC packets. The
     // value is captured before output/state C2C transfers reset ICU state.
     std::size_t weight_page_synchronized_writes{0};
@@ -97,18 +101,25 @@ private:
         std::vector<BinaryWeightPageUse> uses{};
         std::size_t launch_event_tag{0};
         std::size_t page_ready_event_tag{0};
-        std::vector<C2cWeightPager::PageReadyRelease>
-            page_ready_releases{};
-        std::size_t next_page_ready_release{0};
         std::optional<std::int64_t> actual_start_cycle{};
+        std::optional<std::int64_t> actual_transport_ready_cycle{};
         std::optional<std::int64_t> actual_ready_cycle{};
         std::size_t pre_execution_cycles{0};
         bool launch_released{false};
-        bool page_ready_event_released{false};
         bool trace_recorded{false};
         bool ready_before_execution{false};
         bool inter_invocation_lookahead{false};
         std::optional<std::uint32_t> model_page_index{};
+    };
+
+    struct ExecutionEpoch {
+        std::size_t start_cycle{0};
+        std::size_t event_tag{0};
+        std::vector<std::size_t> transfer_indices{};
+        std::vector<C2cWeightPager::PageReadyRelease> releases{};
+        std::size_t next_release{0};
+        std::optional<std::int64_t> actual_ready_cycle{};
+        bool released{false};
     };
 
     const std::vector<std::uint8_t>& resolve_value(const std::string& name) const;
@@ -132,8 +143,6 @@ private:
         std::size_t invocation_index, const BinaryProgram& program);
     void schedule_executable_weight_pages(BinaryProgram& program);
     std::size_t settle_executable_weight_lookahead();
-    bool executable_weight_page_ready(
-        const BinaryWeightPageUse& use) const;
     void configure_external_transport(
         const ExecutableHardwareConfig& hardware);
     ExecutableHardwareConfig effective_external_transport(
@@ -154,6 +163,7 @@ private:
     std::optional<std::uint32_t> ready_weight_page_{};
     std::optional<std::uint32_t> inflight_weight_page_{};
     std::vector<ExecutableWeightTransfer> executable_weight_transfers_{};
+    std::vector<ExecutionEpoch> execution_epochs_{};
     std::vector<ExecutableWeightTransfer>
         lookahead_executable_weight_transfers_{};
     std::optional<ExecutableWeightTransfer>

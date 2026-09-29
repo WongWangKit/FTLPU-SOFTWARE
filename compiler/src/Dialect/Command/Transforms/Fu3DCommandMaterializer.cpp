@@ -237,8 +237,13 @@ mlir::LogicalResult materializeSxmRun2DCommand(mlir::OpBuilder& builder,
             throw std::overflow_error(
                 "compiler schedule cycle does not fit Command IR i64");
         hardwareInstruction.loop.start_cycle = 0;
-        const auto packet =
-            isa::encode_sxm_icu_run_2d_instruction(hardwareInstruction);
+        const auto words = transpose
+            ? packetWords(builder,
+                isa::encode_sxm_transpose_icu_run_2d_instruction(
+                    hardwareInstruction))
+            : packetWords(builder,
+                isa::encode_sxm_permute_icu_run_2d_instruction(
+                    hardwareInstruction));
         mlir::OperationState state(location,
             SxmRun2DOp::getOperationName());
         state.addAttributes({
@@ -248,7 +253,7 @@ mlir::LogicalResult materializeSxmRun2DCommand(mlir::OpBuilder& builder,
                 static_cast<std::int64_t>(cycle))),
             builder.getNamedAttr("queue", builder.getI64IntegerAttr(
                 static_cast<std::int64_t>(queue))),
-            builder.getNamedAttr("words", packetWords(builder, packet)),
+            builder.getNamedAttr("words", words),
         });
         builder.create(state);
         return mlir::success();

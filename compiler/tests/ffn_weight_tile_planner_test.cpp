@@ -73,21 +73,39 @@ try {
     auto compact = tensor::planFfnWeightTiles(
         {32, 1536, 8960, 1536}, largeTarget, 1);
     if (mlir::failed(compact)
-        || compact->projection_waves_per_page != 84
-        || compact->pages.size() != 14)
+        || !compact->bank_level_ping_pong
+        || compact->projection_waves_per_page != 168
+        || compact->projection_slice_groups_per_role != 4
+        || compact->projection_gate_slice_group_base != 0
+        || compact->projection_up_slice_group_base != 0
+        || compact->down_output_waves_per_page != 3
+        || compact->down_items_per_page != 840
+        || compact->down_items_per_slice_group != 840
+        || compact->pages.size() != 5)
         throw std::logic_error(
-            "8192-row Qwen FFN did not select compact Down residency");
-    constexpr std::size_t compactProjectionPages = 2;
-    for (std::size_t wave = 0; wave < 12; ++wave) {
-        const auto& page = compact->pages[compactProjectionPages + wave];
+            "8192-row Qwen FFN did not select bank-level ping-pong");
+    constexpr std::size_t compactProjectionPages = 1;
+    if (compact->pages.front().spans.size() != 2
+        || compact->pages.front().spans[0].bank != 1
+        || compact->pages.front().spans[1].bank != 0
+        || compact->pages.front().spans[0].slice_group_count != 4
+        || compact->pages.front().spans[1].slice_group_count != 4)
+        throw std::logic_error(
+            "Gate/Up do not occupy opposite full banks");
+    for (std::size_t pageIndex = 0; pageIndex < 4; ++pageIndex) {
+        const auto& page = compact->pages[
+            compactProjectionPages + pageIndex];
         const auto& span = page.spans.front();
-        if (page.bank != 1 || span.slice_group_count != 1
-            || span.slice_group_begin != static_cast<int64_t>(wave / 3)
-            || span.page_base_row
-                != static_cast<int64_t>(wave % 3) * 2240
-            || span.rows_per_slice != 2240)
+        if (page.bank != 1 || span.bank != 1
+            || span.slice_group_count != 1
+            || span.slice_group_begin != static_cast<int64_t>(pageIndex)
+            || span.page_base_row != 0
+            || span.output_wave_begin
+                != static_cast<int64_t>(pageIndex * 3)
+            || span.output_wave_count != 3
+            || span.rows_per_slice != 6720)
             throw std::logic_error(
-                "compact Down page has an unexpected physical slot");
+                "compact Down page does not group one slice-group residency");
     }
     auto streaming = tensor::planFfnWeightTiles(
         {32, 1536, 8960, 1536}, largeTarget, 1, true);
@@ -95,15 +113,17 @@ try {
         || streaming->pages.size() != compact->pages.size())
         throw std::logic_error(
             "8192-row Qwen FFN streaming plan has invalid geometry");
-    for (std::size_t wave = 0; wave < 12; ++wave) {
-        const auto& page = streaming->pages[compactProjectionPages + wave];
+    for (std::size_t pageIndex = 0; pageIndex < 4; ++pageIndex) {
+        const auto& page = streaming->pages[
+            compactProjectionPages + pageIndex];
         const auto& span = page.spans.front();
-        if (page.bank != static_cast<int64_t>((1 + wave) % 2)
-            || span.slice_group_begin != 0
+        if (page.bank != 1 || span.bank != 1
+            || span.slice_group_begin != static_cast<int64_t>(pageIndex)
             || span.page_base_row != 0
-            || span.rows_per_slice != 2240)
+            || span.output_wave_count != 3
+            || span.rows_per_slice != 6720)
             throw std::logic_error(
-                "streaming Down page does not reuse alternating bank slots");
+                "streaming Down page does not reuse the released Gate bank");
     }
     auto tasks = schedule::buildFfnWeightTileTaskPlan(
         *plan, {32, 1536, 8960, 1536}, target);
@@ -124,6 +144,20 @@ try {
         for (std::size_t previous = index; previous-- > 0;) {
             if (plan->pages[previous].bank != plan->pages[index].bank)
                 continue;
+            const auto sharesSliceGroup = llvm::any_of(
+                plan->pages[index].spans,
+                [&](const tensor::FfnWeightTileSpan& current) {
+                    return llvm::any_of(plan->pages[previous].spans,
+                        [&](const tensor::FfnWeightTileSpan& earlier) {
+                            return current.slice_group_begin
+                                    < earlier.slice_group_begin
+                                        + earlier.slice_group_count
+                                && earlier.slice_group_begin
+                                    < current.slice_group_begin
+                                        + current.slice_group_count;
+                        });
+                });
+            if (!sharesSliceGroup) continue;
             const auto& sameBank = (*assignment)[
                 tasks.page_tasks[previous].compute];
             if (prefetch.cycle < sameBank.end_cycle)

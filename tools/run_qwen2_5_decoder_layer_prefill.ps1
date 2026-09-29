@@ -2,14 +2,22 @@ param(
     [string]$Program = "E:\timesintelli\workspace2\projection_rope_run\ttft_sweep\f500_bw25600.pagesync.ftlpu",
     [uint32]$DdrBandwidthMBps = 25600,
     [uint32]$ClockMHz = 500,
+    [ValidateRange(1, 2)]
+    [uint32]$Layers = 1,
     [string]$ResultDir = "",
-    [switch]$NoPipeline
+    [switch]$NoPipeline,
+    [switch]$SkipNumericChecks
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ResultDir)) {
-    $resultDir = Join-Path $repoRoot "results\qwen2_5_decoder_layer_prefill"
+    $resultName = if ($Layers -eq 1) {
+        "qwen2_5_decoder_layer_prefill"
+    } else {
+        "qwen2_5_two_decoder_layers_prefill"
+    }
+    $resultDir = Join-Path $repoRoot ("results\" + $resultName)
 } elseif ([System.IO.Path]::IsPathRooted($ResultDir)) {
     $resultDir = $ResultDir
 } else {
@@ -54,8 +62,11 @@ $oldBandwidth = $env:FTLPU_DDR_BANDWIDTH_MBPS
 $oldPipeline = $env:FTLPU_QWEN_C2C_PIPELINE_CSV
 $oldLinked = $env:FTLPU_QWEN_C2C_LINKED_BINARY
 $oldPreExecution = $env:FTLPU_QWEN_C2C_PRE_EXECUTION_DIR
+$oldSkipNumericChecks = $env:FTLPU_SKIP_QWEN_NUMERIC_CHECK
+$oldDecoderLayers = $env:FTLPU_QWEN_DECODER_LAYERS
 try {
     $env:FTLPU_DDR_BANDWIDTH_MBPS = [string]$DdrBandwidthMBps
+    $env:FTLPU_QWEN_DECODER_LAYERS = [string]$Layers
     if ($NoPipeline) {
         Remove-Item Env:FTLPU_QWEN_C2C_PIPELINE_CSV -ErrorAction SilentlyContinue
     } else {
@@ -63,6 +74,11 @@ try {
     }
     $env:FTLPU_QWEN_C2C_LINKED_BINARY = $linkedProgram
     $env:FTLPU_QWEN_C2C_PRE_EXECUTION_DIR = $preExecutionDir
+    if ($SkipNumericChecks) {
+        $env:FTLPU_SKIP_QWEN_NUMERIC_CHECK = "1"
+    } else {
+        Remove-Item Env:FTLPU_SKIP_QWEN_NUMERIC_CHECK -ErrorAction SilentlyContinue
+    }
 
     $started = Get-Date
     $savedErrorActionPreference = $ErrorActionPreference
@@ -91,7 +107,11 @@ try {
         $failureText = (($output | Out-String).Trim() -split "`r?`n" |
             Select-Object -First 3) -join " "
         [ordered]@{
-            test = "qwen2_5_decoder_layer_prefill"
+            test = if ($Layers -eq 1) {
+                "qwen2_5_decoder_layer_prefill"
+            } else {
+                "qwen2_5_two_decoder_layers_prefill"
+            }
             status = "failed"
             exit_code = $exitCode
             icu_export_exit_code = $icuExitCode
@@ -100,6 +120,8 @@ try {
             elapsed_seconds = ($finished - $started).TotalSeconds
             lpu_clock_mhz = $ClockMHz
             ddr_bandwidth_mbytes_per_second = $DdrBandwidthMBps
+            decoder_layers = $Layers
+            numeric_validation = if ($SkipNumericChecks) { "skipped" } else { "enabled" }
             failure = $failureText
             program = "program.ftlpu"
             runtime_pipeline = if ($NoPipeline) { $null } else { "runtime.pipeline.csv" }
@@ -127,7 +149,11 @@ try {
 
     $finished = Get-Date
     [ordered]@{
-        test = "qwen2_5_decoder_layer_prefill"
+        test = if ($Layers -eq 1) {
+            "qwen2_5_decoder_layer_prefill"
+        } else {
+            "qwen2_5_two_decoder_layers_prefill"
+        }
         status = "passed"
         exit_code = $exitCode
         icu_export_exit_code = $icuExitCode
@@ -136,6 +162,8 @@ try {
         elapsed_seconds = ($finished - $started).TotalSeconds
         lpu_clock_mhz = $ClockMHz
         ddr_bandwidth_mbytes_per_second = $DdrBandwidthMBps
+        decoder_layers = $Layers
+        numeric_validation = if ($SkipNumericChecks) { "skipped" } else { "enabled" }
         program = "program.ftlpu"
         runtime_pipeline = if ($NoPipeline) { $null } else { "runtime.pipeline.csv" }
         linked_program = "linked.ftlpu"
@@ -149,6 +177,8 @@ try {
     $env:FTLPU_QWEN_C2C_PIPELINE_CSV = $oldPipeline
     $env:FTLPU_QWEN_C2C_LINKED_BINARY = $oldLinked
     $env:FTLPU_QWEN_C2C_PRE_EXECUTION_DIR = $oldPreExecution
+    $env:FTLPU_SKIP_QWEN_NUMERIC_CHECK = $oldSkipNumericChecks
+    $env:FTLPU_QWEN_DECODER_LAYERS = $oldDecoderLayers
 }
 
 Write-Host "Updated Qwen2.5 prefill results: $resultDir"

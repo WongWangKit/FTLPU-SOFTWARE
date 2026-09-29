@@ -395,30 +395,30 @@ try {
         "inner_stride,outer_count,outer_interval,outer_stride,skip_first,"
         "induction,base_delta");
     require_contains(trace,
-        "\"C2C.E.Prefetch\",\"page=0 bank=0 "
+        "\"C2C.E.Prefetch\",\"page=0 residency_page=0 bank=0 "
         "bindings=gate bytes=512 lanes=8 bandwidth=256B/cycle "
         "consumer_cycle=200 phase=pre_execution scheduled=true\"");
     require_contains(trace,
-        "\"C2C.W.Prefetch\",\"page=0 bank=0 "
+        "\"C2C.W.Prefetch\",\"page=0 residency_page=0 bank=0 "
         "bindings=gate bytes=512 lanes=8 bandwidth=256B/cycle "
         "consumer_cycle=200 phase=pre_execution scheduled=true\"");
     require_contains(trace,
-        "\"C2C.E.Prefetch\",\"page=0 bank=0 "
+        "\"C2C.E.Prefetch\",\"page=0 residency_page=0 bank=0 "
         "bindings=up bytes=512 lanes=8 bandwidth=256B/cycle "
         "consumer_cycle=202 phase=pre_execution scheduled=true\"");
     require_contains(trace,
-        "\"C2C.E.Prefetch\",\"page=0 bank=0 "
+        "\"C2C.E.Prefetch\",\"page=0 residency_page=1 bank=0 "
         "bindings=reuse bytes=256 lanes=8 bandwidth=256B/cycle "
         "consumer_cycle=450 phase=overlap scheduled=true\"");
     require_contains(trace,
-        "\"C2C.E.Prefetch\",\"page=0 bank=0 "
+        "\"C2C.E.Prefetch\",\"page=0 residency_page=2 bank=0 "
         "bindings=down bytes=256 lanes=8 bandwidth=256B/cycle "
         "consumer_cycle=700 phase=overlap scheduled=true\"");
     require_contains(trace,
-        "\"SR.E.C2C.Shared\",\"page=0 bank=0 streams=W24..W31 "
+        "\"SR.E.C2C.Shared\",\"page=0 residency_page=0 bank=0 streams=W24..W31 "
         "sync=target_mem+stream_tag timing=per_vector_notification\"");
     require_contains(trace,
-        "\"MEM.E.C2CWrite\",\"page=0 bank=0 streams=W24..W31 "
+        "\"MEM.E.C2CWrite\",\"page=0 residency_page=0 bank=0 streams=W24..W31 "
         "sync=target_mem+stream_tag timing=per_vector_notification\"");
     if (trace.find("bindings=gate+up+reuse") != std::string::npos)
         throw std::runtime_error(
@@ -501,10 +501,16 @@ try {
     auto map = ftlpu::SxmInstruction::PermuteMap{};
     for (std::size_t lane = 0; lane < map.size(); ++lane)
         map[lane] = (lane + ftlpu::hw::kLanesPerTile) % map.size();
+    auto sxmSources = ftlpu::SxmInstruction::StreamList{};
+    auto sxmDestinations = ftlpu::SxmInstruction::StreamList{};
+    for (std::size_t stream = 0; stream < 16; ++stream) {
+        sxmSources.push_back(ftlpu::SxmStreamId {stream});
+        sxmDestinations.push_back(ftlpu::SxmStreamId {16 + stream});
+    }
     const auto sxm = ftlpu::SxmInstruction::Permute(
-        {{0}, {1}}, {{16}, {17}}, map);
+        std::move(sxmSources), std::move(sxmDestinations), map);
     rawProgram.queues.push_back(QueueProgram{QueueKind::SxmPermute, 0,
-        raw_fu_commands(ftlpu::isa::encode_sxm_icu_run_2d_instruction(
+        raw_fu_commands(ftlpu::isa::encode_sxm_permute_icu_run_2d_instruction(
             ftlpu::SxmIcuRun2DInstruction::Run2D(
                 0, {2, 2}, {2, 12}, sxm, 8)), InstructionKind::Sxm,
             120)});

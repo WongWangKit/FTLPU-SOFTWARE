@@ -52,8 +52,10 @@ MXM accumulator 位于功能单元内部，其容量由 `mxm_accumulator_blocks`
 的资源隔离允许权重预取与 RMSNorm 重叠；两条路径都不能绕过 C2C 外部边界。
 
 该分区消除的是传输和端口冲突，并不会增加容量。对于 seq_len=32 的
-Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gate 与 Up
-共享 7 个乒乓页，Down 使用 12 个页，每页都不超过每 bank 8192 行。
+Qwen2.5-1.5B FFN，通用 Vector planner 使用四组 8-slice 权重平面：Gate 用 bank A
+的一页覆盖四组，Up 用 bank B 的一页覆盖四组。Down 回到 bank A，按 slice-group
+分成 4 页，每页把 3 个输出 wave 连续放入 6720 行。这样 Gate 计算时可以预取 Up，
+Up 计算时可以预取全部 Down 页，同时不会在同一个 MEM ICU 队列里交错覆盖和读取。
 现有 Block8 紧凑分页布局仍是另一条独立可用路径。
 
 ## 执行顺序

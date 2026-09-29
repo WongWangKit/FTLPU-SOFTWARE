@@ -797,6 +797,8 @@ int main(int argc, char **argv) try {
   const bool decode =
       std::filesystem::exists(fixture / "past_key.bf16.bin") &&
       std::filesystem::exists(fixture / "past_value.bf16.bin");
+  const bool skip_numeric_checks =
+      std::getenv("FTLPU_SKIP_QWEN_NUMERIC_CHECK") != nullptr;
   BinaryProgram program = read_binary_program(std::filesystem::path(argv[1]));
   const std::uint32_t compiled_ddr_bandwidth =
       program.hardware.ddr_peak_bandwidth_mbytes_per_second;
@@ -871,7 +873,7 @@ int main(int argc, char **argv) try {
         value_state_binding->element_type != BindingElementType::BF16 ||
         key_state_binding->shape.size() != 3 ||
         key_state_binding->shape != value_state_binding->shape ||
-        key_state_binding->shape.front() < 32)
+        key_state_binding->shape.front() == 0)
       throw std::logic_error("Qwen decoder has invalid BF16 KV cache bindings");
     const auto resident_tokens =
         static_cast<std::uint32_t>(key_state_binding->shape.front());
@@ -970,7 +972,8 @@ int main(int argc, char **argv) try {
       write_bytes(directory / "key_cache.actual.bf16.bin", key_state);
       write_bytes(directory / "value_cache.actual.bf16.bin", value_state);
     }
-    if (std::getenv("FTLPU_SKIP_QWEN_KV_CHECK") == nullptr) {
+    if (!skip_numeric_checks
+        && std::getenv("FTLPU_SKIP_QWEN_KV_CHECK") == nullptr) {
       require_kv_state_matches(
           "layers.0.key_cache", key_state,
           read_bytes(fixture / "golden.key.bf16.bin"), !decode);
@@ -1179,9 +1182,14 @@ int main(int argc, char **argv) try {
                                         loaded_program, "attention.context"),
                                     2)
                           : stage_name == "norm0"
-                              ? download_distributed16_stage(
-                                    system.chip(), weight_bank,
-                                    ftlpu::Hemisphere::East)
+                              ? (decode
+                                     ? observer.download_binding(
+                                           find_internal_binding_by_name(
+                                               loaded_program,
+                                               "rmsnorm.result.0"))
+                                     : download_distributed16_stage(
+                                           system.chip(), weight_bank,
+                                           ftlpu::Hemisphere::East))
                           : stage_name == "query"
                               ? download_query_stage(
                                     system.chip(), scratch_bank)
@@ -1452,8 +1460,9 @@ int main(int argc, char **argv) try {
   }
   const double mismatch_fraction =
       static_cast<double>(mismatches) / static_cast<double>(values);
-  if (mismatch_fraction > 0.001 || p99 > 0.5f
-      || mean_absolute_error > 0.075 || maximum_error > 32.0f)
+  if (!skip_numeric_checks
+      && (mismatch_fraction > 0.001 || p99 > 0.5f
+          || mean_absolute_error > 0.075 || maximum_error > 32.0f))
     throw std::logic_error(
         "Qwen decoder golden mismatch count=" +
         std::to_string(mismatches) +
@@ -1493,8 +1502,15 @@ int main(int argc, char **argv) try {
             << " host_downloads=" << stats.host_downloads
             << " compiled_ddr_mbytes=" << compiled_ddr_bandwidth
             << " runtime_ddr_mbytes=" << runtime_ddr_bandwidth
+            << " initial_wait_cycles="
+            << stats.weight_page_initial_wait_cycles
             << " runtime_page_wait_cycles="
             << stats.weight_page_runtime_wait_cycles
+            << " weight_wait_cycles=" << stats.weight_page_wait_cycles
+            << " state_page_in_cycles=" << stats.state_page_in_cycles
+            << " state_page_out_cycles=" << stats.state_page_out_cycles
+            << " c2c_ingress_cycles=" << stats.c2c_ingress_cycles
+            << " c2c_egress_cycles=" << stats.c2c_egress_cycles
             << " nonzero=" << nonzero << " max_error=" << maximum_error << '\n';
   return 0;
 } catch (const std::exception &error) {

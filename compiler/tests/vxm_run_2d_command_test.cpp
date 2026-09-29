@@ -22,6 +22,15 @@ void require(bool condition, const char* message)
     if (!condition) throw std::logic_error(message);
 }
 
+ftlpu::SxmInstruction::StreamList stream_range(
+    std::size_t base, std::size_t count)
+{
+    auto streams = ftlpu::SxmInstruction::StreamList{};
+    for (std::size_t index = 0; index < count; ++index)
+        streams.push_back(ftlpu::SxmStreamId {base + index});
+    return streams;
+}
+
 } // namespace
 
 int main() try
@@ -42,6 +51,7 @@ int main() try
         2, {2, 2}, {5, 17}, compact);
     auto hardwareInstruction = instruction;
     hardwareInstruction.loop.start_cycle = 0;
+    hardwareInstruction.loop.wait_cycle = 2;
     const auto expectedPacket =
         isa::encode_vxm_icu_run_2d_instruction(hardwareInstruction);
 
@@ -74,19 +84,16 @@ int main() try
     require(binary.scale_relocations.size() == 1
             && binary.scale_relocations[0].binding_index == 3
             && binary.scale_relocations[0].queue_kind == QueueKind::Vxm
-            && binary.scale_relocations[0].command_index == 1,
+            && binary.scale_relocations[0].command_index == 0,
         "raw VXM scale relocation was not preserved");
     require(binary.queues.size() == 1
             && binary.queues[0].kind == QueueKind::Vxm
             && binary.queues[0].index == 0
             && binary.queues[0].commands.size()
-                == isa::EncodedVxmIcuRun2DPacket::kWordCount + 1,
-        "VXM RUN_2D did not translate to NOP plus one three-word queue packet");
-    require(isa::decode_icu_nop_cycles(
-                binary.queues[0].commands[0].command) == 2,
-        "VXM RUN_2D initial schedule gap was not encoded as NOP(2)");
+                == isa::EncodedVxmIcuRun2DPacket::kWordCount,
+        "VXM RUN_2D did not absorb its launch delay into the packet");
     for (std::size_t word = 0; word < expectedPacket.words.size(); ++word) {
-        const auto& actual = binary.queues[0].commands[word + 1];
+        const auto& actual = binary.queues[0].commands[word];
         require(actual.word_count
                     == isa::EncodedVxmIcuRun2DPacket::kLanesPerWord,
             "CommandBinary changed the VXM RUN_2D word width");
@@ -98,7 +105,7 @@ int main() try
     }
 
     const auto capacity = analyze_physical_imem(binary);
-    require(capacity.used_slots == 4 && capacity.queues.size() == 1
+    require(capacity.used_slots == 3 && capacity.queues.size() == 1
             && capacity.queues[0].coarse_program_entries == 1
             && capacity.queues[0].expanded_work == 4
             && capacity.queues[0].peak_fu_3d_contexts == 1,
@@ -125,13 +132,14 @@ int main() try
         sxmMap[laneIndex] =
             (laneIndex + hw::kLanesPerTile) % sxmMap.size();
     const auto sxmTile = SxmInstruction::Permute(
-        {{0}, {1}}, {{16}, {17}}, sxmMap);
+        stream_range(0, 16), stream_range(16, 16), sxmMap);
     const auto sxmRun = SxmIcuRun2DInstruction::Run2D(
         7, {3, 2}, {2, 13}, sxmTile);
     auto sxmHardwareRun = sxmRun;
     sxmHardwareRun.loop.start_cycle = 0;
+    sxmHardwareRun.loop.wait_cycle = 7;
     const auto sxmExpectedPacket =
-        isa::encode_sxm_icu_run_2d_instruction(sxmHardwareRun);
+        isa::encode_sxm_permute_icu_run_2d_instruction(sxmHardwareRun);
     auto sxmModule = mlir::ModuleOp::create(location);
     sxmModule->setAttr("ftlpu.target", targetModel.to_attribute(&context));
     sxmModule->setAttr("ftlpu.command_lowering",
@@ -152,24 +160,21 @@ int main() try
     require(sxmBinary.queues.size() == 1
             && sxmBinary.queues[0].kind == QueueKind::SxmPermute
             && sxmBinary.queues[0].commands.size()
-                == isa::EncodedSxmIcuRun2DPacket::kWordCount + 1,
-        "SXM RUN_2D did not translate to NOP plus one six-word queue packet");
-    require(isa::decode_icu_nop_cycles(
-                sxmBinary.queues[0].commands[0].command) == 7,
-        "SXM RUN_2D initial schedule gap was not encoded as NOP(7)");
+                == isa::EncodedSxmPermuteIcuRun2DPacket::kWordCount,
+        "SXM RUN_2D did not absorb its launch delay into the packet");
     for (std::size_t word = 0; word < sxmExpectedPacket.words.size(); ++word)
         for (std::size_t laneIndex = 0;
              laneIndex < sxmExpectedPacket.words[word].lanes.size();
              ++laneIndex)
-            require(sxmBinary.queues[0].commands[word + 1].words[laneIndex]
+            require(sxmBinary.queues[0].commands[word].words[laneIndex]
                         == sxmExpectedPacket.words[word].lanes[laneIndex],
                 "CommandBinary changed an SXM RUN_2D physical word");
     const auto sxmCapacity = analyze_physical_imem(sxmBinary);
-    require(sxmCapacity.used_slots == 7
+    require(sxmCapacity.used_slots == 4
             && sxmCapacity.queues[0].coarse_program_entries == 1
             && sxmCapacity.queues[0].expanded_work == 6
             && sxmCapacity.queues[0].fu_3d_context_bits
-                == hw::kIcuSxmRun2DContextBits,
+                == hw::kIcuSxmPermuteRun2DContextBits,
         "SXM RUN_2D i-MEM or context accounting is incorrect");
     InstructionControlUnit sxmIcu;
     load_queue_programs_into_icu(sxmBinary.queues, sxmIcu);
@@ -186,6 +191,43 @@ int main() try
     require(issueCycles
             == std::vector<std::size_t> {7, 9, 11, 20, 22, 24},
         "SXM RUN_2D ICU issued at incorrect absolute cycles");
+
+    const auto transposeTile = SxmInstruction::Transpose(
+        stream_range(0, 16), stream_range(16, 16));
+    const auto transposeRun = SxmIcuRun2DInstruction::Run2D(
+        3, {1, 1}, {1, 1}, transposeTile);
+    auto transposeModule = mlir::ModuleOp::create(location);
+    transposeModule->setAttr(
+        "ftlpu.target", targetModel.to_attribute(&context));
+    transposeModule->setAttr("ftlpu.command_lowering",
+        mlir::StringAttr::get(&context, "direct"));
+    auto transposeFunction = mlir::func::FuncOp::create(location,
+        "sxm_transpose_run_2d", mlir::FunctionType::get(&context, {}, {}));
+    auto* transposeEntry = transposeFunction.addEntryBlock();
+    transposeModule.push_back(transposeFunction);
+    mlir::OpBuilder transposeBuilder(
+        transposeEntry, transposeEntry->begin());
+    require(mlir::succeeded(command::materializeSxmRun2DCommand(
+                transposeBuilder, location, true, 0, transposeRun, &error)),
+        "direct SXM transpose RUN_2D materialization failed");
+    transposeBuilder.create<mlir::func::ReturnOp>(location);
+    require(mlir::succeeded(mlir::verify(transposeModule)),
+        "command.sxm_run_2d transpose did not verify");
+    const auto transposeBinary =
+        ftlpu::compiler::target::translate_command_module(transposeModule);
+    require(transposeBinary.queues.size() == 1
+            && transposeBinary.queues[0].kind == QueueKind::SxmTranspose
+            && transposeBinary.queues[0].commands.size()
+                == isa::EncodedSxmTransposeIcuRun2DPacket::kWordCount,
+        "SXM transpose did not become one two-word queue packet");
+    InstructionControlUnit transposeIcu;
+    load_queue_programs_into_icu(transposeBinary.queues, transposeIcu);
+    issueCycles.clear();
+    for (std::size_t cycle = 0; cycle <= 3; ++cycle)
+        if (transposeIcu.sxm_transpose_iq(Hemisphere::East).tick())
+            issueCycles.push_back(cycle);
+    require(issueCycles == std::vector<std::size_t> {3},
+        "SXM transpose compact packet changed its issue cycle");
 
     const auto makeSxmFrontendModule =
         [&](const std::vector<std::size_t>& startCycles,
@@ -217,11 +259,11 @@ int main() try
             return frontendModule;
         };
 
-    // Four adjacent six-word packets fit the static one-context schedule, but
-    // not the physical frontend: the 16-word initial IQ and one-word/cycle
-    // refill leave only one word resident for the packet due at cycle 3.
+    // Six adjacent four-word packets fit the static one-context schedule, but
+    // not the physical frontend: after the 16-word initial IQ is consumed,
+    // one-word/cycle refill leaves only one word for the packet due at cycle 5.
     auto impossibleFrontendModule = makeSxmFrontendModule(
-        {0, 1, 2, 3}, "sxm_impossible_frontend");
+        {0, 1, 2, 3, 4, 5}, "sxm_impossible_frontend");
     std::string frontendDiagnostic;
     try {
         static_cast<void>(ftlpu::compiler::target::translate_command_module(
@@ -234,32 +276,32 @@ int main() try
                 != std::string::npos
             && frontendDiagnostic.find("resource=sxm_permute, queue=0")
                 != std::string::npos
-            && frontendDiagnostic.find("cycle=3") != std::string::npos
-            && frontendDiagnostic.find("required_words=6")
+            && frontendDiagnostic.find("cycle=5") != std::string::npos
+            && frontendDiagnostic.find("required_words=4")
                 != std::string::npos
             && frontendDiagnostic.find("available_words=1")
                 != std::string::npos,
         "CommandBinary accepted an SXM packet that the ICU cannot fetch on time");
 
-    // Moving only the fourth packet to cycle 9 gives the same frontend enough
-    // time to fetch all six words, including the intervening NOP descriptor.
+    // Five adjacent packets are the maximum burst sustained by the initial IQ
+    // contents plus the one-word/cycle refill before the next packet decode.
     auto feasibleFrontendModule = makeSxmFrontendModule(
-        {0, 1, 2, 9}, "sxm_feasible_frontend");
+        {0, 1, 2, 3, 4}, "sxm_feasible_frontend");
     const auto feasibleFrontendBinary =
         ftlpu::compiler::target::translate_command_module(
             feasibleFrontendModule);
     require(feasibleFrontendBinary.queues.size() == 1
-            && feasibleFrontendBinary.queues[0].commands.size() == 25,
+            && feasibleFrontendBinary.queues[0].commands.size() == 20,
         "feasible SXM frontend fixture produced an unexpected i-MEM image");
     InstructionControlUnit feasibleFrontendIcu;
     load_queue_programs_into_icu(
         feasibleFrontendBinary.queues, feasibleFrontendIcu);
     issueCycles.clear();
-    for (std::size_t cycle = 0; cycle <= 9; ++cycle) {
+    for (std::size_t cycle = 0; cycle <= 4; ++cycle) {
         if (feasibleFrontendIcu.sxm_permute_iq(Hemisphere::East).tick())
             issueCycles.push_back(cycle);
     }
-    require(issueCycles == std::vector<std::size_t> {0, 1, 2, 9},
+    require(issueCycles == std::vector<std::size_t> {0, 1, 2, 3, 4},
         "frontend-feasible SXM packets did not retain their exact schedule");
 
     auto dequantModule = mlir::ModuleOp::create(location);
@@ -287,7 +329,7 @@ int main() try
             && dequantBinary.scale_relocations[0].binding_index == 7
             && dequantBinary.scale_relocations[0].queue_kind
                 == QueueKind::MxmDequant
-            && dequantBinary.scale_relocations[0].command_index == 1,
+            && dequantBinary.scale_relocations[0].command_index == 0,
         "raw MXM dequant scale relocation was not preserved");
 
     auto scheduleModule = mlir::ModuleOp::create(location);
@@ -356,7 +398,8 @@ int main() try
 
     std::cout << "vxm_run_2d_command_test passed: "
               << "vxm_words=3 vxm_launches=4 run_length=32 "
-              << "sxm_words=6 sxm_launches=6\n";
+              << "sxm_transpose_words=2 sxm_permute_words=4 "
+              << "sxm_launches=6\n";
     return 0;
 } catch (const std::exception& exception) {
     std::cerr << "vxm_run_2d_command_test failed: "

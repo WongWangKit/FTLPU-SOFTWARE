@@ -1,10 +1,12 @@
 #include "ftlpu/software/runtime/weight_prefetch_plan.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <ranges>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace ftlpu::software::runtime {
 namespace {
@@ -140,6 +142,115 @@ bool plans_share_mem_queue(
     });
 }
 
+struct InitializedInternalRegion {
+    WeightResidencyRegion region{};
+    std::uint64_t release_cycle{0};
+};
+
+std::uint64_t initialized_binding_release_cycle(
+    const BinaryProgram& program, const BinaryBinding& binding)
+{
+    const auto timelineName = binding.initializer == BindingInitializer::RopeTable
+        ? std::string_view {"rope"}
+        : binding.initializer == BindingInitializer::CausalMask
+        ? std::string_view {"softmax"}
+        : std::string_view {};
+    std::uint64_t release = binding.ready_cycle;
+    if (!timelineName.empty()) {
+        bool found = false;
+        for (const BinaryTimeline& timeline : program.timelines)
+            if (timeline.name == timelineName) {
+                release = std::max(release, timeline.end_cycle);
+                found = true;
+            }
+        if (found) return release;
+    }
+    // Older binaries may not carry the named operator timeline. Callers clamp
+    // this fallback to the first overlapping weight consumer.
+    return std::numeric_limits<std::uint64_t>::max();
+}
+
+std::vector<InitializedInternalRegion> initialized_internal_regions(
+    const BinaryProgram& program)
+{
+    std::vector<InitializedInternalRegion> regions;
+    for (const BinaryBinding& binding : program.bindings) {
+        if (binding.access != BindingAccess::Internal
+            || binding.initializer == BindingInitializer::None
+            || binding.base_row < 0 || binding.instruction_count <= 0)
+            continue;
+        const auto stride = static_cast<std::uint64_t>(
+            std::max<std::int64_t>(1, std::abs(binding.address_stride)));
+        const auto begin = static_cast<std::uint64_t>(binding.base_row);
+        const auto last = begin
+            + static_cast<std::uint64_t>(binding.instruction_count - 1)
+                * stride;
+        const auto end = std::min<std::uint64_t>(
+            std::numeric_limits<std::uint32_t>::max(), last + 1);
+        const auto release = initialized_binding_release_cycle(program, binding);
+        for (const std::uint16_t slice : binding.slices)
+            regions.push_back({
+                {binding.bank, binding.hemisphere_mask, slice,
+                    static_cast<std::uint32_t>(begin),
+                    static_cast<std::uint32_t>(end), false},
+                release});
+    }
+    return regions;
+}
+
+void assign_disjoint_residency_pages(
+    std::vector<WeightPrefetchPlan>& fragments)
+{
+    // BinaryWeightPageUse is binding-local, but a hardware page is a
+    // bank-local resident image. Fragments in disjoint physical slice/row
+    // ranges belong to one residency generation, while retaining independent
+    // DMA/page-ready events so an early consumer does not wait for unrelated
+    // bytes. A new generation is needed only when a fragment would overwrite
+    // an existing region in that bank.
+    struct ResidencyPage {
+        std::uint16_t bank{0};
+        std::uint32_t index{0};
+        std::vector<WeightResidencyRegion> regions{};
+    };
+    std::vector<std::size_t> order(fragments.size());
+    for (std::size_t index = 0; index < order.size(); ++index)
+        order[index] = index;
+    std::ranges::sort(order, [&](std::size_t lhs, std::size_t rhs) {
+        return std::tie(fragments[lhs].ready_cycle, fragments[lhs].bank,
+                   fragments[lhs].page_index)
+            < std::tie(fragments[rhs].ready_cycle, fragments[rhs].bank,
+                   fragments[rhs].page_index);
+    });
+    std::vector<ResidencyPage> pages;
+    for (const std::size_t fragmentIndex : order) {
+        WeightPrefetchPlan& fragment = fragments[fragmentIndex];
+        const auto page = std::ranges::find_if(pages,
+            [&](const ResidencyPage& candidate) {
+                if (candidate.bank != fragment.bank) return false;
+                return std::ranges::none_of(candidate.regions,
+                    [&](const WeightResidencyRegion& resident) {
+                        return std::ranges::any_of(fragment.regions,
+                            [&](const WeightResidencyRegion& incoming) {
+                                return regions_overlap(resident, incoming);
+                            });
+                    });
+            });
+        if (page == pages.end()) {
+            std::uint32_t nextIndex = 0;
+            for (const ResidencyPage& candidate : pages)
+                if (candidate.bank == fragment.bank)
+                    nextIndex = std::max(nextIndex, candidate.index + 1);
+            fragment.residency_page_index = nextIndex;
+            pages.push_back(ResidencyPage{
+                fragment.bank, nextIndex, fragment.regions});
+            continue;
+        }
+        fragment.residency_page_index = page->index;
+        page->regions.insert(page->regions.end(),
+            fragment.regions.begin(), fragment.regions.end());
+    }
+}
+
 } // namespace
 
 std::vector<WeightPrefetchPlan> plan_weight_prefetches(
@@ -162,16 +273,7 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
             "paged weights require non-zero C2C bandwidth");
     if (lanes > std::numeric_limits<std::uint64_t>::max() / bytesPerLane)
         throw std::overflow_error("C2C bandwidth overflows uint64_t");
-    const std::uint64_t bandwidth = lanes * bytesPerLane;
-    const std::uint64_t clockMhz = runtimeHardware.lpu_clock_mhz;
-    const std::uint64_t ddrBandwidth =
-        runtimeHardware.ddr_peak_bandwidth_mbytes_per_second;
-    const std::uint64_t ddrEfficiency =
-        runtimeHardware.ddr_scheduling_efficiency_percent;
-    if (clockMhz == 0 || ddrBandwidth == 0 || ddrEfficiency == 0
-        || ddrEfficiency > 100)
-        throw std::logic_error(
-            "paged weights require a valid external-memory bandwidth model");
+    static_cast<void>(runtimeHardware);
 
     std::vector<std::size_t> ordered(program.weight_page_uses.size());
     for (std::size_t index = 0; index < ordered.size(); ++index)
@@ -204,6 +306,7 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
             WeightPrefetchPlan plan;
             plan.page_index = use.page_index;
             plan.bank = use.bank;
+            plan.runtime_prefetch = use.runtime_prefetch;
             plan.ready_cycle = use.ready_cycle;
             plan.release_cycle = use.release_cycle;
             plan.use_indices.push_back(useIndex);
@@ -217,6 +320,8 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
                 std::min(found->ready_cycle, use.ready_cycle);
             found->release_cycle =
                 std::max(found->release_cycle, use.release_cycle);
+            found->runtime_prefetch =
+                found->runtime_prefetch || use.runtime_prefetch;
             found->use_indices.push_back(useIndex);
         }
         const auto& binding = find_paged_weight(program, use.binding_index);
@@ -224,6 +329,7 @@ std::vector<WeightPrefetchPlan> plan_weight_prefetches(
             *found, binding, page_byte_size(binding, use.page_index));
     }
 
+    assign_disjoint_residency_pages(plans);
     schedule_weight_prefetches(program, plans, runtimeHardware);
     return plans;
 }
@@ -253,68 +359,64 @@ void schedule_weight_prefetches(const BinaryProgram& program,
     if (lanes == 0 || bytesPerLane == 0)
         throw std::logic_error(
             "paged weights require non-zero C2C bandwidth");
-    const std::uint64_t bandwidth = lanes * bytesPerLane;
-    // Runtime C2C RX enters the high-numbered ordinary West streams. A page
-    // transfer must not inject there while the executable still has an
-    // in-flight producer on those same SR lanes. The compiler-provided
-    // release includes the fabric drain after the last ordinary use.
-    std::uint64_t sharedStreamRelease = 0;
+    if (lanes > std::numeric_limits<std::uint64_t>::max() / bytesPerLane)
+        throw std::overflow_error("C2C bandwidth overflows uint64_t");
+    const std::uint64_t fullBandwidth = lanes * bytesPerLane;
+    // C2C transport lanes and ordinary SR numbers are independent hardware
+    // fields.  Select, per page, the West SR lanes whose final compiled use
+    // has already drained at the earliest legal SRAM-reuse cycle.  This lets
+    // a transfer start on an idle subset instead of waiting for the fixed
+    // high 24..31 range as a unit.
     const std::size_t streamCount =
         program.hardware.streams_per_direction;
-    if (lanes <= streamCount &&
-        program.stream_release_cycles.size() ==
-            program.hardware.encoded_streams &&
-        program.hardware.encoded_streams == 2 * streamCount) {
-        const std::size_t firstShared =
-            2 * streamCount - static_cast<std::size_t>(lanes);
-        for (std::size_t lane = 0; lane < lanes; ++lane)
-            sharedStreamRelease = std::max(
-                sharedStreamRelease,
-                program.stream_release_cycles[firstShared + lane]);
-    }
-    const std::uint64_t clockMhz = runtimeHardware.lpu_clock_mhz;
-    const std::uint64_t ddrBandwidth =
-        runtimeHardware.ddr_peak_bandwidth_mbytes_per_second;
-    const std::uint64_t ddrEfficiency =
-        runtimeHardware.ddr_scheduling_efficiency_percent;
-    if (clockMhz == 0 || ddrBandwidth == 0 || ddrEfficiency == 0
-        || ddrEfficiency > 100)
-        throw std::logic_error(
-            "paged weights require a valid runtime external-memory model");
-
+    const bool hasStreamReleases = lanes <= streamCount
+        && program.stream_release_cycles.size()
+            == program.hardware.encoded_streams
+        && program.hardware.encoded_streams == 2 * streamCount;
     std::vector<std::uint64_t> durations(plans.size());
     std::vector<std::uint64_t> reusableCycles(plans.size());
+    const auto initializedRegions = initialized_internal_regions(program);
     for (std::size_t index = 0; index < plans.size(); ++index) {
         auto& plan = plans[index];
         const auto sideBytes = std::max(plan.bytes[0], plan.bytes[1]);
-        const auto c2cCycles = (sideBytes + bandwidth - 1) / bandwidth;
-        const auto totalBytes = plan.bytes[0] + plan.bytes[1];
-        if (totalBytes >
-            std::numeric_limits<std::uint64_t>::max() / clockMhz / 100)
-            throw std::overflow_error(
-                "DDR weight-page duration overflows uint64_t");
-        const auto effectiveBandwidth = ddrBandwidth * ddrEfficiency;
-        const auto ddrCycles =
-            (totalBytes * clockMhz * 100 + effectiveBandwidth - 1)
-            / effectiveBandwidth;
-        const auto queueDrain =
-            (static_cast<std::uint64_t>(
-                 runtimeHardware.ddr_request_queue_depth)
-                + lanes - 1)
-            / lanes;
-        const auto transportGuard = queueDrain
-            + hw::kMemEastBoundaryStreamRegisterColumn
+        const auto c2cCycles =
+            (sideBytes + fullBandwidth - 1) / fullBandwidth;
+        // The linked ICU program describes only deterministic on-chip work.
+        // DDR bandwidth, latency, queue depth and jitter are runtime state;
+        // the page-ready event below absorbs their actual completion time.
+        // Keeping them out of this duration makes one ICU image valid across
+        // bandwidth changes instead of encoding a prediction as long NOPs.
+        const auto transportGuard =
+            hw::kMemEastBoundaryStreamRegisterColumn
             + hw::kTileRows + lanes;
-        durations[index] = std::max(c2cCycles, ddrCycles)
-            + runtimeHardware.ddr_read_latency_cycles
-            + runtimeHardware.ddr_read_latency_jitter_cycles
-            + transportGuard;
+        durations[index] = c2cCycles + transportGuard;
         // The compiler's dedicated-slice layout keeps activation scratch out
         // of the weight residency regions represented here. Consequently,
         // physically disjoint pages may be loaded before execution; pages that
         // share a bank/slice/row range retain their release-ordered JIT load.
-        bool canPreload = true;
+        bool canPreload = !plan.runtime_prefetch;
         std::uint64_t sharedQueueReusableCycle = 0;
+        std::uint64_t initializedDataRelease = 0;
+        bool overlapsInitializedData = false;
+        for (const WeightResidencyRegion& incoming : plan.regions)
+            for (const InitializedInternalRegion& initialized :
+                 initializedRegions)
+                if (regions_overlap(incoming, initialized.region)) {
+                    overlapsInitializedData = true;
+                    initializedDataRelease = std::max(initializedDataRelease,
+                        std::min(initialized.release_cycle,
+                            plan.ready_cycle));
+                }
+        if (overlapsInitializedData) {
+            // Internal constants are materialized before execution and may
+            // legally share SRAM with a later weight page.  Without a
+            // initializer-specific timeline is its last legal use. If an
+            // older binary has no such timeline, the first weight-consumer
+            // cycle remains the conservative fallback. WAIT_EVENT still
+            // absorbs real transport time when the window is too short.
+            canPreload = false;
+            reusableCycles[index] = initializedDataRelease;
+        }
         for (std::size_t previous = 0; previous < index; ++previous) {
             if (plans_share_mem_queue(plan, plans[previous]))
                 sharedQueueReusableCycle = std::max(
@@ -362,7 +464,12 @@ void schedule_weight_prefetches(const BinaryProgram& program,
             : plans[lhs].ready_cycle < plans[rhs].ready_cycle;
     });
 
-    std::uint64_t nextQueueCursor = 0;
+    // Each hemisphere has one C2C DMA ICU and one C2C RX ICU.  A page is one
+    // coarse transport instruction on those queues: the following page may
+    // not enter either queue until the complete transport window has ended.
+    // The runtime additionally holds the next launch event until real DDR and
+    // MEM completion, so this static cursor is the deterministic lower bound.
+    std::uint64_t nextTransportCursor = 0;
     for (const std::size_t index : launchOrder) {
         auto& plan = plans[index];
         // Once every overlapping SRAM region has been released, retaining
@@ -370,18 +477,75 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         // available to absorb DDR latency and jitter. Launch at the earliest
         // physically safe cycle; page-ready synchronization still protects
         // the consumer when runtime bandwidth is lower than planned.
-        plan.start_cycle = std::max({reusableCycles[index],
-            nextQueueCursor, sharedStreamRelease});
+        const std::uint64_t earliest = std::max(
+            reusableCycles[index], nextTransportCursor);
+        plan.fabric_streams.clear();
+        if (hasStreamReleases) {
+            struct StreamSelection {
+                std::uint64_t start{0};
+                std::uint64_t end{std::numeric_limits<std::uint64_t>::max()};
+                std::vector<std::uint16_t> streams{};
+            } selected;
+            std::vector<std::uint64_t> candidates {earliest};
+            for (std::size_t stream = 0; stream < streamCount; ++stream) {
+                const auto release =
+                    program.stream_release_cycles[streamCount + stream];
+                if (release > earliest) candidates.push_back(release);
+            }
+            std::ranges::sort(candidates);
+            candidates.erase(std::ranges::unique(candidates).begin(),
+                candidates.end());
+            for (const std::uint64_t candidateStart : candidates) {
+                std::vector<std::uint16_t> candidateStreams;
+                // Prefer the conventional high streams when release times
+                // tie, which keeps standalone/default page lowering stable.
+                for (std::size_t stream = streamCount;
+                     stream-- > 0
+                     && candidateStreams.size() < lanes;) {
+                    if (program.stream_release_cycles[streamCount + stream]
+                        <= candidateStart)
+                        candidateStreams.push_back(
+                            static_cast<std::uint16_t>(stream));
+                }
+                if (candidateStreams.empty()) continue;
+                const auto active = static_cast<std::uint64_t>(
+                    candidateStreams.size());
+                const auto sideBytes = std::max(plan.bytes[0], plan.bytes[1]);
+                const auto cycles = (sideBytes
+                    + active * bytesPerLane - 1)
+                    / (active * bytesPerLane);
+                const auto guard =
+                    hw::kMemEastBoundaryStreamRegisterColumn
+                    + hw::kTileRows + active;
+                const auto candidateEnd = candidateStart + cycles + guard;
+                if (candidateEnd < selected.end
+                    || (candidateEnd == selected.end
+                        && candidateStart < selected.start))
+                    selected = StreamSelection {candidateStart,
+                        candidateEnd, std::move(candidateStreams)};
+            }
+            if (selected.streams.empty())
+                throw std::logic_error(
+                    "no ordinary West stream can carry a C2C weight page");
+            plan.start_cycle = selected.start;
+            plan.fabric_streams = std::move(selected.streams);
+        } else {
+            plan.start_cycle = earliest;
+            for (std::size_t lane = 0; lane < lanes; ++lane)
+                plan.fabric_streams.push_back(static_cast<std::uint16_t>(
+                    streamCount - static_cast<std::size_t>(lanes) + lane));
+        }
+        const std::uint64_t activeLanes = plan.fabric_streams.size();
+        const auto sideBytes = std::max(plan.bytes[0], plan.bytes[1]);
+        const auto c2cCycles = (sideBytes
+            + activeLanes * bytesPerLane - 1)
+            / (activeLanes * bytesPerLane);
+        const auto transportGuard =
+            hw::kMemEastBoundaryStreamRegisterColumn
+            + hw::kTileRows + activeLanes;
+        durations[index] = c2cCycles + transportGuard;
         plan.transfer_end_cycle = plan.start_cycle + durations[index];
-        std::array<std::uint64_t, hw::kHemispheres> segmentCounts{};
-        for (const auto& region : plan.regions)
-            for (std::size_t side = 0; side < hw::kHemispheres; ++side)
-                if ((region.hemisphere_mask & (1u << side)) != 0)
-                    ++segmentCounts[side];
-        // One queue cycle releases WAIT_EVENT, followed by one issue per
-        // segment on the busiest hemisphere.
-        nextQueueCursor = plan.start_cycle + 1
-            + *std::max_element(segmentCounts.begin(), segmentCounts.end());
+        nextTransportCursor = plan.transfer_end_cycle;
     }
 }
 

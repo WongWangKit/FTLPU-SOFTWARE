@@ -57,6 +57,7 @@ enum class BindingLayout : std::uint16_t {
     Fp16HeadBlockPacked = 25,
     Fp16ProjectionBiasX4 = 26,
     W8A16Native4Weight = 27,
+    Fp16RopeTableDecodeCompact = 28,
 };
 
 enum class BindingInitializer : std::uint16_t {
@@ -129,6 +130,10 @@ struct BinaryWeightPageUse {
     std::uint16_t bank{0};
     std::uint64_t ready_cycle{0};
     std::uint64_t release_cycle{0};
+    // Keep this page on the executable timeline even when its SRAM region is
+    // disjoint from every startup page. This is used for the next ping-pong
+    // epoch so its C2C transfer overlaps current-epoch compute.
+    bool runtime_prefetch{false};
 };
 
 enum class VxmImmediateOperand : std::uint16_t {

@@ -659,9 +659,15 @@ std::size_t write_raw_fu_packet(std::ostream& output,
     }
     case QueueKind::SxmTranspose:
     case QueueKind::SxmPermute: {
-        const auto run = isa::decode_sxm_icu_run_2d_instruction(
-            read_raw_trace_packet<isa::EncodedSxmIcuRun2DPacket>(
-                queue, commandIndex));
+        const auto run = queue.kind == QueueKind::SxmTranspose
+            ? isa::decode_sxm_transpose_icu_run_2d_instruction(
+                read_raw_trace_packet<
+                    isa::EncodedSxmTransposeIcuRun2DPacket>(
+                    queue, commandIndex))
+            : isa::decode_sxm_permute_icu_run_2d_instruction(
+                read_raw_trace_packet<
+                    isa::EncodedSxmPermuteIcuRun2DPacket>(
+                    queue, commandIndex));
         std::ostringstream detail;
         detail << (queue.kind == QueueKind::SxmTranspose
                        ? "transpose" : "permute")
@@ -750,6 +756,7 @@ void write_weight_prefetches(
             if (prefetch.bytes[side] == 0) continue;
             std::ostringstream detail;
             detail << "page=" << prefetch.page_index
+                   << " residency_page=" << prefetch.residency_page_index
                    << " bank=" << prefetch.bank << " bindings=";
             for (std::size_t index = 0; index < bindings.size(); ++index) {
                 if (index != 0) detail << '+';
@@ -779,6 +786,8 @@ void write_weight_prefetches(
             const auto sideName = side == 0 ? "E" : "W";
             std::ostringstream pathDetail;
             pathDetail << "page=" << prefetch.page_index
+                       << " residency_page="
+                       << prefetch.residency_page_index
                        << " bank=" << prefetch.bank
                        << " streams=W" << (hw::kWestStreams - lanes)
                        << "..W" << (hw::kWestStreams - 1)
@@ -872,6 +881,12 @@ void write_schedule_trace_csv(const BinaryProgram& program,
             }
             if (is_icu_control_raw_word_command(command)) {
                 const auto control = decode_icu_control_raw_word(command);
+                if (control.opcode == IcuControlOpcode::Nop) {
+                    cursor += control.count;
+                    previous = nullptr;
+                    history.clear();
+                    continue;
+                }
                 if (control.opcode == IcuControlOpcode::Sync) {
                     const auto side = queue.kind == QueueKind::Mem
                         ? (queue.index
@@ -889,6 +904,35 @@ void write_schedule_trace_csv(const BinaryProgram& program,
                            << " actual_wait=runtime_dependent";
                     write_event(output, cursor, cursor + 1,
                         {resource, detail.str()});
+                    ++cursor;
+                    previous = nullptr;
+                    history.clear();
+                    continue;
+                }
+                if (control.opcode == IcuControlOpcode::WaitEvent
+                    || control.opcode == IcuControlOpcode::Notify) {
+                    const auto side = queue.kind == QueueKind::Mem
+                        ? (queue.index
+                                < InstructionControlUnit::
+                                    kMemQueuesPerHemisphere ? "E" : "W")
+                        : (queue.index < program.hardware.mxms_per_hemisphere
+                                ? "E" : "W");
+                    std::ostringstream detail;
+                    detail << "opcode="
+                           << (control.opcode == IcuControlOpcode::WaitEvent
+                                   ? "WAIT_EVENT" : "NOTIFY")
+                           << " queue=" << queue_kind_name(queue.kind)
+                           << " index=" << queue.index
+                           << " pc=" << commandIndex
+                           << " event_tag=" << control.event_tag
+                           << (control.opcode == IcuControlOpcode::WaitEvent
+                                   ? " actual_wait=runtime_dependent" : "");
+                    write_event(output, cursor, cursor + 1,
+                        {std::string("ICU.") + side
+                             + (control.opcode
+                                        == IcuControlOpcode::WaitEvent
+                                    ? ".PageReadyWait" : ".Notify"),
+                         detail.str()});
                     ++cursor;
                     previous = nullptr;
                     history.clear();

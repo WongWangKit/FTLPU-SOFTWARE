@@ -13,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -596,17 +597,74 @@ try {
                   << " resource="
                   << ftlpu::software::runtime::queue_kind_name(key.second)
                   << " count=" << count << '\n';
+    for (const auto& timeline : program.timelines)
+        std::cout << "binary timeline name=" << timeline.name
+                  << " start_cycle=" << timeline.start_cycle
+                  << " end_cycle=" << timeline.end_cycle << '\n';
+    std::map<std::pair<ftlpu::software::runtime::BindingAccess,
+        std::uint32_t>, std::size_t> addressRelocations;
+    for (const auto& relocation : program.address_relocations)
+        ++addressRelocations[{relocation.binding_access,
+            relocation.binding_index}];
+    for (const auto& [key, count] : addressRelocations)
+        std::cout << "binary address_relocation access="
+                  << static_cast<unsigned>(key.first)
+                  << " binding=" << key.second
+                  << " count=" << count << '\n';
     std::cout << "binary weight_page_uses="
               << program.weight_page_uses.size() << '\n';
     for (const auto& use : program.weight_page_uses)
         std::cout << "binary weight_page_use binding=" << use.binding_index
                   << " page=" << use.page_index
                   << " bank=" << use.bank
+                  << " runtime_prefetch=" << use.runtime_prefetch
                   << " ready_cycle=" << use.ready_cycle
                   << " release_cycle=" << use.release_cycle << '\n';
-    for (const auto& plan :
-         ftlpu::software::runtime::plan_weight_prefetches(program)) {
+    const auto weightPrefetches =
+        ftlpu::software::runtime::plan_weight_prefetches(program);
+    std::map<std::pair<std::uint16_t, std::uint32_t>, std::size_t>
+        residencyFragments;
+    std::map<std::pair<std::uint16_t, std::uint32_t>, std::uint64_t>
+        residencyVectors;
+    std::map<std::uint16_t,
+        std::set<std::pair<std::size_t, std::uint16_t>>> weightLanes;
+    for (const auto& plan : weightPrefetches) {
+        ++residencyFragments[{plan.bank, plan.residency_page_index}];
+        for (const auto& region : plan.regions) {
+            const auto rows = static_cast<std::uint64_t>(
+                region.row_end - region.row_begin);
+            for (std::size_t side = 0; side < 2; ++side) {
+                if ((region.hemisphere_mask & (1u << side)) == 0) continue;
+                residencyVectors[{plan.bank, plan.residency_page_index}]
+                    += rows;
+                if (!region.wildcard_slice)
+                    weightLanes[plan.bank].insert({side, region.slice});
+            }
+        }
+    }
+    std::cout << "binary weight_residency_pages="
+              << residencyFragments.size()
+              << " transfer_fragments=" << weightPrefetches.size() << '\n';
+    for (const auto& [key, fragments] : residencyFragments) {
+        const std::uint64_t capacityVectors =
+            weightLanes[key.first].size()
+            * static_cast<std::uint64_t>(program.hardware.sram_depth_rows);
+        const std::uint64_t usedVectors = residencyVectors[key];
+        const double utilization = capacityVectors == 0 ? 0.0
+            : 100.0 * static_cast<double>(usedVectors)
+                / static_cast<double>(capacityVectors);
+        std::cout << "binary weight_residency_page bank=" << key.first
+                  << " page=" << key.second
+                  << " fragments=" << fragments
+                  << " used_bytes="
+                  << usedVectors * ftlpu::hw::kPhysicalVectorBytes
+                  << " capacity_bytes="
+                  << capacityVectors * ftlpu::hw::kPhysicalVectorBytes
+                  << " utilization_percent=" << utilization << '\n';
+    }
+    for (const auto& plan : weightPrefetches) {
         std::cout << "binary weight_prefetch_plan page=" << plan.page_index
+                  << " residency_page=" << plan.residency_page_index
                   << " bank=" << plan.bank
                   << " pre_execution=" << plan.pre_execution
                   << " start_cycle=" << plan.start_cycle
@@ -843,6 +901,29 @@ try {
         for (std::size_t i = 0; i < binding.slices.size(); ++i) {
             if (i != 0) std::cout << ',';
             std::cout << binding.slices[i];
+        }
+        if (binding.paged_weight) {
+            std::cout << " page_granularity=" << binding.page_granularity
+                      << " page_items_per_slice_group="
+                      << binding.page_items_per_slice_group
+                      << " page_storage_slices=";
+            for (std::size_t i = 0;
+                 i < binding.page_storage_slices.size(); ++i) {
+                if (i != 0) std::cout << ',';
+                std::cout << binding.page_storage_slices[i];
+            }
+            std::cout << " page_placements=";
+            for (std::uint32_t page = 0; page < binding.page_count; ++page) {
+                if (page != 0) std::cout << ';';
+                const auto placement =
+                    ftlpu::software::runtime::resolve_weight_page_placement(
+                        binding, page);
+                std::cout << "bank" << placement.bank
+                          << ":groups" << placement.slice_group_base
+                          << '+' << placement.slice_group_count
+                          << ":rows" << placement.base_row
+                          << '+' << placement.row_count;
+            }
         }
         std::cout << '\n';
     }

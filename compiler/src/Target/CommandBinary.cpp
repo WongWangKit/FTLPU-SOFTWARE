@@ -824,11 +824,13 @@ StreamReleaseSummary stream_release_cycles(
         }
     });
     module.walk([&](command::SxmRun2DOp op) {
-        const auto packet = raw_3d_packet<
-            isa::EncodedSxmIcuRun2DPacket>(
-            op.getOperation(), op.getWords());
-        const auto run =
-            isa::decode_sxm_icu_run_2d_instruction(packet);
+        const auto run = op.getKind() == "transpose"
+            ? isa::decode_sxm_transpose_icu_run_2d_instruction(
+                raw_3d_packet<isa::EncodedSxmTransposeIcuRun2DPacket>(
+                    op.getOperation(), op.getWords()))
+            : isa::decode_sxm_permute_icu_run_2d_instruction(
+                raw_3d_packet<isa::EncodedSxmPermuteIcuRun2DPacket>(
+                    op.getOperation(), op.getWords()));
         const int64_t end = raw_loop_absolute_final_cycle(
             op.getOperation(), run.loop);
         for (const auto stream : run.instruction.src_streams)
@@ -872,6 +874,8 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::Fp16MxmDistributed16;
     if (value == "fp16_rope_table")
         return BindingLayout::Fp16RopeTable;
+    if (value == "fp16_rope_table_decode_compact")
+        return BindingLayout::Fp16RopeTableDecodeCompact;
     if (value == "fp16_probability_x16")
         return BindingLayout::Fp16ProbabilityX16;
     if (value == "fp16_probability_diagonal")
@@ -2600,6 +2604,8 @@ void emit_compiled_mem_write_sync(software::runtime::BinaryProgram& program)
         pages.push_back(std::move(page));
     }
     schedule_weight_prefetches(program, plans);
+    for (std::size_t index = 0; index < pages.size(); ++index)
+        pages[index].fabric_streams = plans[index].fabric_streams;
 
     auto system = std::make_unique<C2cDmaSystem>();
     SystemHardwareConfiguration hardware;
@@ -2756,12 +2762,15 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
         });
     });
     module.walk([&](command::WeightPageOp op) {
+        const auto runtimePrefetch =
+            op->getAttrOfType<mlir::BoolAttr>("runtime_prefetch");
         weightPageUses.push_back(BinaryWeightPageUse {
             static_cast<std::uint32_t>(op.getBindingIndex()),
             static_cast<std::uint32_t>(op.getPageIndex()),
             static_cast<std::uint16_t>(op.getBank()),
             static_cast<std::uint64_t>(op.getReadyCycle()),
             static_cast<std::uint64_t>(op.getReleaseCycle()),
+            runtimePrefetch && runtimePrefetch.getValue(),
         });
     });
     module.walk([&](command::MemOp op) { collect_mem(op, queues); });
@@ -2840,12 +2849,20 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             ? static_cast<int64_t>(*op.getScaleBinding()) : -1;
     });
     module.walk([&](command::SxmRun2DOp op) {
-        const auto kind = op.getKind() == "transpose"
-            ? QueueKind::SxmTranspose : QueueKind::SxmPermute;
-        collect_raw_3d<isa::EncodedSxmIcuRun2DPacket,
-            SxmIcuRun2DInstruction>(op.getOperation(), op.getQueue(),
-            op.getWords(), kind, InstructionKind::Sxm,
-            isa::decode_sxm_icu_run_2d_instruction, raw3DQueues);
+        if (op.getKind() == "transpose")
+            collect_raw_3d<isa::EncodedSxmTransposeIcuRun2DPacket,
+                SxmIcuRun2DInstruction>(op.getOperation(), op.getQueue(),
+                op.getWords(), QueueKind::SxmTranspose,
+                InstructionKind::Sxm,
+                isa::decode_sxm_transpose_icu_run_2d_instruction,
+                raw3DQueues);
+        else
+            collect_raw_3d<isa::EncodedSxmPermuteIcuRun2DPacket,
+                SxmIcuRun2DInstruction>(op.getOperation(), op.getQueue(),
+                op.getWords(), QueueKind::SxmPermute,
+                InstructionKind::Sxm,
+                isa::decode_sxm_permute_icu_run_2d_instruction,
+                raw3DQueues);
     });
     if (queues.empty() && raw3DQueues.empty())
         throw std::runtime_error("Command IR module has no queue commands");

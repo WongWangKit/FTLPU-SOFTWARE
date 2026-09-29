@@ -101,11 +101,20 @@ LPU cycle 102.4 bytes；调度按 90% 峰值规划，即 46.08 GB/s、92.16 byte
 因此不同请求的完成 cycle 不同，同时测试可以稳定复现。
 
 预取没有硬件 deadline。compiler/binary 提供的 page `ready_cycle` 是首个逻辑
-consumer cycle，也就是启动预取和放置同步点的提示。runtime 在该 consumer 到达时
-检查 page fence；只有 C2C RX 和全部目标 MEM write 都完成才算 SRAM-ready。未完成时
-计算侧 ICU 停止发射，DDR/C2C 路径继续推进 physical clock，完成后通过 page-ready
-事件恢复计算。这样 DDR 带宽和 latency jitter 直接表现为运行时等待，而不是依赖
-静态预测保证正确性。
+consumer cycle，用来标识静态 execution epoch 的依赖坐标；它不是所有 ICU 都能看到的
+绝对时钟边界。同一坐标需要的所有页面属于同一 epoch。linker 在参与计算的每条 ICU
+queue 中插入一个共享 tag 的 `WAIT_EVENT`，形成分布式的流水波前边界：每条 queue 都在
+保持原有流水相位的前提下，于本 ICU 的下一个安全 ICU 指令边界等待。已经开始解码的
+ICU 指令（包括完整 3D 循环）只属于一个 epoch，runtime linker 不会暂停或拆分它；它
+结束后的下一条 ICU 指令才进入新 epoch。只有本 epoch 全部页面的 C2C RX 和目标 MEM
+write 都已 commit 到 SRAM，epoch 事件才会释放。DDR/C2C 传输 queue 和异步
+`MEM_WRITE_SYNC` 预约可以跨越计算 epoch；执行这类传输的 MEM queue 会在预约结束处重新
+汇入计算波前，然后才能发射后续计算流量。CModelRuntime 不会为 page ready 冻结
+logical time，也不会切换全芯片 issue enable。
+
+epoch 0 是执行前资源集合。目前 persistent KV/state window 在 launch 前完成 page-in，
+因此属于 epoch 0。以后若把 KV 分页传输重叠到 executable 内，KV 页必须与权重页一起
+加入对应 epoch 的资源集合，不能重新引入全局 issue gate。
 
 ### Run 阶段
 
@@ -123,10 +132,11 @@ consumer cycle，也就是启动预取和放置同步点的提示。runtime 在�
 
 生产路径中的 activation、RMSNorm 参数、RoPE 表、embedding 和 LM-head 边界使用 BF16。以 `Fp16` 开头的旧 layout 名称只描述双字节物理拓扑，`BindingElementType::BF16` 才是权威数值格式。切换 executable 时会清空 ICU、stream、MXM、VXM 和 SXM 状态；MEM 在 reset 时保留，逻辑 persistent state 则由 session backing 保留。`stats()` 除常驻、host、device-copy 和 host-operation 流量外，还单独统计 state page-in/page-out 的次数、字节数和 cycle。
 
-`weight_page_runtime_wait_cycles` 统计 executable 内因 page-ready fence 产生的真实
-physical-cycle 等待。启用 execution trace 后，
+`execution_epochs` 统计 epoch 0 加静态链接的 page-ready 边界数量；
+`weight_page_runtime_wait_cycles` 统计本地 epoch 等待使实际完成时间超过静态 program
+span 的 physical-cycle 尾部。启用 execution trace 后，
 `ModelSession::write_execution_trace_csv()` 从每次 CModel tick 后的 ICU queue 状态
-记录实际发射事件、C2C 完成区间与 `ICU.PageReadyWait`；它不同于只读取 binary 的
+记录实际发射事件、C2C 完成区间与各 queue 自己的 `ICU.PageReadyWait`；它不同于只读取 binary 的
 静态 `write_schedule_trace_csv()`。
 
 ## 地址规划与 relocation

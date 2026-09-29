@@ -1208,3 +1208,19 @@ window.addEventListener("resize", () => {
 });
 
 setTrace(parseCsv(SAMPLE_CSV), "sample_trace.csv");
+
+const csvUrl = new URLSearchParams(window.location.search).get("csv");
+if (csvUrl) {
+  const name = csvUrl.split("/").filter(Boolean).pop() || "runtime.csv";
+  dom.interactionState.textContent = "Fetching runtime CSV";
+  fetch(csvUrl)
+    .then((response) => {
+      if (!response.ok)
+        throw new Error(`CSV fetch failed: ${response.status}`);
+      return response.blob();
+    })
+    .then((blob) => loadFile(new File([blob], name, {type: "text/csv"})))
+    .catch((error) => {
+      dom.interactionState.textContent = error.message;
+    });
+}

@@ -7,6 +7,7 @@
 
 #include "ftlpu/core/bf16.hpp"
 #include "ftlpu/system/c2c_dma_system.hpp"
+#include "ftlpu/vxm/special_alu.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,8 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -64,6 +67,7 @@ constexpr std::size_t kHeadDim = FTLPU_TEST_HEAD_DIM;
 constexpr std::size_t kHeadBlocks = kHeadDim / 32;
 constexpr std::size_t kTokenBlocks = kSeqLen / 32;
 constexpr std::size_t kTileRows = 4;
+constexpr std::size_t kMxmBlockRows = 8;
 constexpr float kEpsilon = FTLPU_TEST_RMS_EPSILON;
 constexpr float kRopeTheta = FTLPU_TEST_ROPE_THETA;
 
@@ -84,6 +88,40 @@ std::string arrayValues(const std::array<T, N>& values)
 float bf16(float value)
 {
     return ftlpu::Bf16::from_float(value).to_float();
+}
+
+template <typename Fn>
+std::vector<ftlpu::VxmLutEntry> makeVxmLut(
+    float inputMin, float segmentWidth, std::size_t count, Fn fn)
+{
+    std::vector<ftlpu::VxmLutEntry> entries;
+    entries.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const float x0 = inputMin
+            + static_cast<float>(index) * segmentWidth;
+        const float y0 = fn(x0);
+        entries.push_back(ftlpu::VxmLutEntry::from_float(
+            (fn(x0 + segmentWidth) - y0) / segmentWidth, y0));
+    }
+    return entries;
+}
+
+ftlpu::VxmSpecialAlu makeReferenceVxmSpecialAlu()
+{
+    constexpr std::size_t entries = 256;
+    constexpr float ln2 = 0.6931471805599453f;
+    ftlpu::VxmSpecialAlu alu;
+    const float expWidth = ln2 / static_cast<float>(entries);
+    alu.configure_lut(ftlpu::VxmSpecialAluOpcode::Exp,
+        {-ln2 / 2.0f, expWidth},
+        makeVxmLut(-ln2 / 2.0f, expWidth, entries,
+            [](float x) { return std::exp(x); }));
+    const float reciprocalWidth = 1.0f / static_cast<float>(entries);
+    alu.configure_lut(ftlpu::VxmSpecialAluOpcode::Reciprocal,
+        {1.0f, reciprocalWidth},
+        makeVxmLut(1.0f, reciprocalWidth, entries,
+            [](float x) { return 1.0f / x; }));
+    return alu;
 }
 
 std::size_t bf16UlpDistance(float lhs, float rhs)
@@ -431,6 +469,19 @@ try {
     if (argc != 2)
         throw std::runtime_error(
             "usage: compiled_decoder_layer_runtime_test program.ftlpu");
+    const bool skipNumericChecks =
+        std::getenv("FTLPU_SKIP_QWEN_NUMERIC_CHECK") != nullptr;
+    std::size_t decoderLayerCount = 1;
+    if (const char* layers = std::getenv("FTLPU_QWEN_DECODER_LAYERS")) {
+        decoderLayerCount = std::stoull(layers);
+        if (decoderLayerCount == 0 || decoderLayerCount > 2)
+            throw std::invalid_argument(
+                "FTLPU_QWEN_DECODER_LAYERS must be 1 or 2");
+    }
+    if (decoderLayerCount > 1 && !skipNumericChecks)
+        throw std::invalid_argument(
+            "two-layer Qwen scheduling runs require "
+            "FTLPU_SKIP_QWEN_NUMERIC_CHECK=1");
     const auto program =
         ftlpu::software::runtime::read_binary_program(
             std::filesystem::path(argv[1]));
@@ -702,6 +753,27 @@ try {
             slices[2 * tokenLane], slices[2 * tokenLane + 1],
             address, featureWave * 8 + featureLane, bank);
     };
+    const auto readMxmDistributedWidth = [&physicalBf16](
+                                             const std::vector<std::uint16_t>& slices,
+                                             std::size_t baseRow,
+                                             std::size_t row,
+                                             std::size_t column,
+                                             std::size_t logicalColumns,
+                                             ftlpu::Hemisphere hemisphere,
+                                             std::size_t bank) {
+        const std::size_t columnBlocks = logicalColumns / 32;
+        const std::size_t tokenBlock = row / 32;
+        const std::size_t tokenWave = (row % 32) / 8;
+        const std::size_t tokenLane = row % 8;
+        const std::size_t columnBlock = column / 32;
+        const std::size_t featureWave = (column % 32) / 8;
+        const std::size_t featureLane = column % 8;
+        const std::size_t address = baseRow
+            + (tokenBlock * columnBlocks + columnBlock) * 4 + tokenWave;
+        return physicalBf16(hemisphere,
+            slices[2 * tokenLane], slices[2 * tokenLane + 1],
+            address, featureWave * 8 + featureLane, bank);
+    };
     const auto normalized0 = rmsNorm(inputValues, 0);
     const auto rms1Binding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
@@ -847,6 +919,13 @@ try {
                     == ftlpu::software::runtime::BindingAccess::Internal
                 && binding.name == "attention.key_cache"
                 && binding.role == "state.kv.key";
+        });
+    const auto queryBiasBinding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Input
+                && binding.name == "query_bias";
         });
     const std::size_t valueSliceGroups =
         valueBinding->slices.size() / 16;
@@ -1055,6 +1134,7 @@ try {
     }
     if constexpr (kSeqLen == 32 && kHeadDim == 128) {
         if (keyBinding == program.bindings.end()
+            || queryBiasBinding == program.bindings.end()
             || keyBinding->layout
                 != ftlpu::software::runtime::BindingLayout::Fp16HeadPlanar
             || keyBinding->shape.empty() || keyBinding->slices.size() < 4)
@@ -1082,7 +1162,8 @@ try {
                         const float actual = physicalBf16(
                             static_cast<ftlpu::Hemisphere>(hemisphere),
                             2 * tokenLane, 2 * tokenLane + 1, address,
-                            dimension % 32, reduction / 2);
+                            dimension % 32,
+                            (queryBiasBinding->bank + reduction / 2) % 2);
                         const float expected = ropeValue(
                             checkpointQuery, token, head, dimension);
                         const float error = std::fabs(actual - expected);
@@ -1635,7 +1716,8 @@ try {
             const float observed = readMxmDistributed(
                 residualSlices,
                 static_cast<std::size_t>(residualBinding->base_row),
-                row, column);
+                row, column, ftlpu::Hemisphere::East,
+                residualBinding->bank);
             residual1[row * kHidden + column] = observed;
             const float error = std::fabs(observed - expected);
             if (error > residualCheckpointMaxError) {
@@ -1700,7 +1782,8 @@ try {
             + std::to_string(rms2Value)
             + " input=" + std::to_string(readMxmDistributed(
                 residualSlices,
-                static_cast<std::size_t>(residualBinding->base_row), 0, 0)));
+                static_cast<std::size_t>(residualBinding->base_row), 0, 0,
+                ftlpu::Hemisphere::East, residualBinding->bank)));
     std::vector<float> rms2Output(kSeqLen * kHidden);
     const auto expectedRms2Output = rmsNorm(residual1, 1);
     float rms2CheckpointMaxError = 0.0f;
@@ -1756,8 +1839,79 @@ try {
             rms2Output[row * kHidden + upK(h)] * upSign(h);
         return bf16(gate * (1.0f / (1.0f + std::exp(-gate))) * up);
     };
+    const auto referenceSpecialAlu = makeReferenceVxmSpecialAlu();
+    const auto hardwareHiddenValue = [&](std::size_t row, std::size_t h) {
+        const float gate =
+            rms2Output[row * kHidden + gateK(h)] * gateSign(h);
+        const float up =
+            rms2Output[row * kHidden + upK(h)] * upSign(h);
+        const float exponential = referenceSpecialAlu.execute(
+            ftlpu::VxmSpecialAluOpcode::Exp, -gate);
+        const float reciprocal = referenceSpecialAlu.execute(
+            ftlpu::VxmSpecialAluOpcode::Reciprocal,
+            exponential + 1.0f);
+        return bf16(reciprocal * gate * up);
+    };
+    const std::size_t hiddenBaseRow = rms2BaseRow
+        + static_cast<std::size_t>(rms2Binding->instruction_count);
+    std::vector<float> physicalHidden(kSeqLen * kIntermediate);
+    std::size_t hiddenMismatchCount = 0;
+    float hiddenMaxError = 0.0f;
+    std::size_t hardwareHiddenMismatchCount = 0;
+    float hardwareHiddenMaxError = 0.0f;
+    float hiddenReplicaMaxError = 0.0f;
+    for (std::size_t row = 0; row < kSeqLen; ++row) {
+        for (std::size_t h = 0; h < kIntermediate; ++h) {
+            const std::size_t index = row * kIntermediate + h;
+            const float east = readMxmDistributedWidth(
+                rms2Binding->slices, hiddenBaseRow, row, h, kIntermediate,
+                ftlpu::Hemisphere::East, rms2Binding->bank);
+            const float west = readMxmDistributedWidth(
+                rms2Binding->slices, hiddenBaseRow, row, h, kIntermediate,
+                ftlpu::Hemisphere::West, rms2Binding->bank);
+            const float expected = hiddenValue(row, h);
+            const float hardwareExpected = hardwareHiddenValue(row, h);
+            physicalHidden[index] = east;
+            const float error = std::fabs(east - expected);
+            const float hardwareError = std::fabs(east - hardwareExpected);
+            hiddenMaxError = std::max(hiddenMaxError, error);
+            hardwareHiddenMaxError = std::max(
+                hardwareHiddenMaxError, hardwareError);
+            hiddenReplicaMaxError = std::max(
+                hiddenReplicaMaxError, std::fabs(east - west));
+            if (error > 0.04f) ++hiddenMismatchCount;
+            if (hardwareError > 0.0f) {
+                if (hardwareHiddenMismatchCount < 16) {
+                    const float gate = rms2Output[
+                        row * kHidden + gateK(h)] * gateSign(h);
+                    const float up = rms2Output[
+                        row * kHidden + upK(h)] * upSign(h);
+                    const float swapped = bf16(
+                        up * (1.0f / (1.0f + std::exp(-up))) * gate);
+                    std::cerr << "FFN hidden mismatch row=" << row
+                              << " h=" << h << " actual=" << east
+                              << " mathematical=" << expected
+                              << " hardware=" << hardwareExpected
+                              << " swapped=" << swapped
+                              << " gate=" << gate << " up=" << up
+                              << '\n';
+                }
+                ++hardwareHiddenMismatchCount;
+            }
+        }
+    }
+    std::cout << "FFN hidden checkpoint summary: mismatches="
+              << hiddenMismatchCount << " max_error=" << hiddenMaxError
+              << " hardware_mismatches=" << hardwareHiddenMismatchCount
+              << " hardware_max_error=" << hardwareHiddenMaxError
+              << " replica_max_error=" << hiddenReplicaMaxError << '\n';
     std::vector<float> ffnOutput(kSeqLen * kHidden);
     float ffnCheckpointMaxError = 0.0f;
+    std::size_t ffnCheckpointMismatchCount = 0;
+    float ffnPhysicalInputMaxError = 0.0f;
+    std::size_t ffnPhysicalInputMismatchCount = 0;
+    std::array<std::size_t, kHidden / 32>
+        ffnCheckpointBlockMismatchCounts {};
     for (std::size_t row = 0; row < kSeqLen; ++row) {
         for (std::size_t column = 0; column < kHidden; ++column) {
             const std::size_t h0 =
@@ -1814,31 +1968,60 @@ try {
             ffnOutput[row * kHidden + column] = ownerValue;
             const float ownerError = std::fabs(ownerValue - expected);
             const float replicaError = std::fabs(replicaValue - expected);
+            const float expectedFromPhysicalHidden = bf16(
+                physicalHidden[row * kIntermediate + h0]
+                - physicalHidden[row * kIntermediate + h1]);
+            const float physicalInputError =
+                std::fabs(ownerValue - expectedFromPhysicalHidden);
+            ffnPhysicalInputMaxError = std::max(
+                ffnPhysicalInputMaxError, physicalInputError);
+            if (physicalInputError > 0.04f)
+                ++ffnPhysicalInputMismatchCount;
             ffnCheckpointMaxError = std::max(
                 ffnCheckpointMaxError, std::max(ownerError, replicaError));
-            if (ownerError > 0.04f || replicaError > 0.04f)
-                throw std::logic_error(
-                    "FFN down checkpoint mismatch row="
-                    + std::to_string(row)
-                    + " column=" + std::to_string(column)
-                    + " output_block=" + std::to_string(outputBlock)
-                    + " owner="
-                    + std::to_string(static_cast<std::size_t>(owner))
-                    + " owner_actual=" + std::to_string(ownerValue)
-                    + " replica_actual=" + std::to_string(replicaValue)
-                    + " expected=" + std::to_string(expected)
-                    + " h0=" + std::to_string(h0)
-                    + " h1=" + std::to_string(h1)
-                    + " bank="
-                    + std::to_string(ffnBinding->bank)
-                    + " base_row="
-                    + std::to_string(ffnBinding->base_row));
+            if (ownerError > 0.04f || replicaError > 0.04f) {
+                ++ffnCheckpointBlockMismatchCounts[outputBlock];
+                if (ffnCheckpointMismatchCount < 16)
+                    std::cerr << "FFN down checkpoint mismatch row="
+                              << row << " column=" << column
+                              << " output_block=" << outputBlock
+                              << " owner="
+                              << static_cast<std::size_t>(owner)
+                              << " owner_actual=" << ownerValue
+                              << " replica_actual=" << replicaValue
+                              << " expected=" << expected
+                              << " physical_hidden_expected="
+                              << expectedFromPhysicalHidden
+                              << " h0=" << h0 << " h1=" << h1
+                              << " bank=" << ffnBinding->bank
+                              << " base_row=" << ffnBinding->base_row
+                              << '\n';
+                ++ffnCheckpointMismatchCount;
+            }
         }
+    }
+    if (!skipNumericChecks && ffnCheckpointMismatchCount != 0) {
+        std::ostringstream message;
+        message << "FFN down checkpoint mismatch count="
+                << ffnCheckpointMismatchCount
+                << " max_error=" << ffnCheckpointMaxError
+                << " physical_hidden_mismatches="
+                << ffnPhysicalInputMismatchCount
+                << " physical_hidden_max_error="
+                << ffnPhysicalInputMaxError
+                << " block_counts=";
+        for (std::size_t block = 0;
+             block < ffnCheckpointBlockMismatchCounts.size(); ++block) {
+            if (block != 0) message << ',';
+            message << ffnCheckpointBlockMismatchCounts[block];
+        }
+        throw std::logic_error(message.str());
     }
     const float preFinalResidualSample = readMxmDistributed(
         residualSlices,
         static_cast<std::size_t>(residualBinding->base_row),
-        kSeqLen - 1, 0);
+        kSeqLen - 1, 0, ftlpu::Hemisphere::East,
+        residualBinding->bank);
     const float expectedResidualSample = residual1[(kSeqLen - 1) * kHidden];
     if (preFinalResidualSample != expectedResidualSample)
         throw std::logic_error(
@@ -2103,9 +2286,21 @@ try {
     }
 #if FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES
     using namespace ftlpu::software::runtime;
-    if (program.weight_page_uses.size() != 20)
+    const std::size_t declaredExecutableWeightPages =
+        std::accumulate(program.bindings.begin(), program.bindings.end(),
+            std::size_t {0}, [](std::size_t total,
+                const BinaryBinding& binding) {
+                return total + (binding.access == BindingAccess::Input
+                        && binding.paged_weight
+                    ? binding.page_count : 0);
+            });
+    if (program.weight_page_uses.size()
+        != declaredExecutableWeightPages)
         throw std::logic_error(
-            "Qwen dynamic C2C test expected 20 executable weight-page uses, got "
+            "Qwen dynamic C2C test expected one executable use per declared "
+            "weight page: declared="
+            + std::to_string(declaredExecutableWeightPages)
+            + ", uses="
             + std::to_string(program.weight_page_uses.size()));
 
     const auto inputBindingByIndex = [&](std::uint32_t index)
@@ -2137,7 +2332,7 @@ try {
                 + std::to_string(index));
         }
     };
-    std::size_t expectedPagedBytes = 0;
+    std::size_t expectedExecutablePagedBytes = 0;
     std::vector<std::size_t> syncInstructionsPerUse(
         program.weight_page_uses.size());
     std::vector<std::size_t> synchronizedWritesPerUse(
@@ -2150,14 +2345,14 @@ try {
             inputBindingByIndex(use.binding_index), use.page_index,
             logicalWeight(use.binding_index), program.hardware);
         for (const PackedWeightSegment& segment : image.segments) {
-            expectedPagedBytes += static_cast<std::size_t>(
+            expectedExecutablePagedBytes += static_cast<std::size_t>(
                 segment.vector_count) * ftlpu::hw::kPhysicalVectorBytes;
             ++syncInstructionsPerUse[useIndex];
             synchronizedWritesPerUse[useIndex] += segment.vector_count;
         }
     }
     const auto expectedPlans = plan_weight_prefetches(program);
-    std::size_t expectedPrefetches = expectedPlans.size();
+    const std::size_t expectedExecutablePrefetches = expectedPlans.size();
     std::size_t expectedSyncInstructions = 0;
     std::size_t expectedSynchronizedWrites = 0;
     for (const WeightPrefetchPlan& plan : expectedPlans) {
@@ -2169,7 +2364,8 @@ try {
                 synchronizedWritesPerUse.at(useIndex);
         }
     }
-    if (expectedPrefetches == 0 || expectedPagedBytes == 0
+    if (expectedExecutablePrefetches == 0
+        || expectedExecutablePagedBytes == 0
         || expectedSyncInstructions == 0)
         throw std::logic_error(
             "Qwen dynamic C2C page plan is unexpectedly empty");
@@ -2196,6 +2392,7 @@ try {
     ModelWeightPage parameterPage;
     parameterPage.layer = 0;
     parameterPage.bank = inputBindingByIndex(1).bank;
+    std::size_t expectedParameterPagedBytes = 0;
     std::uint16_t nextParameterStream = 0;
     const auto appendPackedParameter = [&] (
         std::uint32_t bindingIndex, std::string name,
@@ -2218,7 +2415,7 @@ try {
                 tensorName, segment.byte_offset, segment.hemisphere,
                 segment.slice, segment.base_row, segment.vector_count,
                 nextParameterStream});
-            expectedPagedBytes += static_cast<std::size_t>(
+            expectedParameterPagedBytes += static_cast<std::size_t>(
                 segment.vector_count) * ftlpu::hw::kPhysicalVectorBytes;
             nextParameterStream = static_cast<std::uint16_t>(
                 (nextParameterStream + 1)
@@ -2235,18 +2432,34 @@ try {
         static_cast<std::uint32_t>(postAttentionNormBinding),
         "post_attention_layernorm.weight", gamma1);
     dynamicPackage.weight_pages.push_back(std::move(parameterPage));
-    ++expectedPrefetches;
+    const std::size_t expectedPrefetches = 1
+        + decoderLayerCount * expectedExecutablePrefetches;
+    const std::size_t expectedPagedBytes = expectedParameterPagedBytes
+        + decoderLayerCount * expectedExecutablePagedBytes;
 
-    appendTensor(2, "self_attn.q_proj.weight", queryWeight, true);
-    appendTensor(3, "self_attn.k_proj.weight", keyWeight, true);
-    appendTensor(4, "self_attn.v_proj.weight", valueWeight, true);
-    appendTensor(5, "self_attn.o_proj.weight", outputWeight, true);
-    appendTensor(static_cast<std::uint32_t>(gateBinding),
-        "mlp.gate_proj.weight", gateWeight, true);
-    appendTensor(static_cast<std::uint32_t>(upBinding),
-        "mlp.up_proj.weight", upWeight, true);
-    appendTensor(static_cast<std::uint32_t>(downBinding),
-        "mlp.down_proj.weight", downWeight, true);
+    const auto layerTensorName = [](std::size_t layer,
+                                    std::string_view suffix) {
+        return "layers." + std::to_string(layer) + "." +
+            std::string(suffix);
+    };
+    for (std::size_t layer = 0; layer < decoderLayerCount; ++layer) {
+        appendTensor(2, layerTensorName(layer, "self_attn.q_proj.weight"),
+            queryWeight, true);
+        appendTensor(3, layerTensorName(layer, "self_attn.k_proj.weight"),
+            keyWeight, true);
+        appendTensor(4, layerTensorName(layer, "self_attn.v_proj.weight"),
+            valueWeight, true);
+        appendTensor(5, layerTensorName(layer, "self_attn.o_proj.weight"),
+            outputWeight, true);
+        appendTensor(static_cast<std::uint32_t>(gateBinding),
+            layerTensorName(layer, "mlp.gate_proj.weight"), gateWeight,
+            true);
+        appendTensor(static_cast<std::uint32_t>(upBinding),
+            layerTensorName(layer, "mlp.up_proj.weight"), upWeight, true);
+        appendTensor(static_cast<std::uint32_t>(downBinding),
+            layerTensorName(layer, "mlp.down_proj.weight"), downWeight,
+            true);
+    }
 
     const BinaryBinding& dynamicInput = inputBindingByIndex(0);
     const auto dynamicOutput = std::ranges::find_if(
@@ -2257,76 +2470,116 @@ try {
     if (dynamicOutput == program.bindings.end())
         throw std::logic_error(
             "Qwen dynamic C2C test is missing output binding 0");
-    dynamicPackage.values = {
-        {"hidden.0", dynamicInput.element_type, dynamicInput.shape,
-         true, false},
-        {"hidden.1", dynamicOutput->element_type, dynamicOutput->shape,
-         false, true},
-    };
+    for (std::size_t layer = 0; layer <= decoderLayerCount; ++layer) {
+        dynamicPackage.values.push_back(ModelValue{
+            "hidden." + std::to_string(layer),
+            layer == 0 ? dynamicInput.element_type
+                       : dynamicOutput->element_type,
+            layer == 0 ? dynamicInput.shape : dynamicOutput->shape,
+            layer == 0, layer == decoderLayerCount});
+    }
 
-    std::vector<ModelStateBindingRef> stateRefs;
-    for (const BinaryBinding& binding : program.bindings) {
-        ModelStateKind kind{};
-        std::string name;
-        if (binding.access != BindingAccess::Internal)
-            continue;
-        if (binding.role == "state.kv.key") {
-            kind = ModelStateKind::KvKey;
-            name = "layers.0.key_cache";
-        } else if (binding.role == "state.kv.value") {
-            kind = ModelStateKind::KvValue;
-            name = "layers.0.value_cache";
-        } else {
-            continue;
+    dynamicPackage.executables.push_back({"decoder.layer", program, {}});
+    for (std::size_t layer = 0; layer < decoderLayerCount; ++layer) {
+        std::vector<ModelStateBindingRef> stateRefs;
+        for (const BinaryBinding& binding : program.bindings) {
+            ModelStateKind kind{};
+            std::string suffix;
+            if (binding.access != BindingAccess::Internal)
+                continue;
+            if (binding.role == "state.kv.key") {
+                kind = ModelStateKind::KvKey;
+                suffix = "key_cache";
+            } else if (binding.role == "state.kv.value") {
+                kind = ModelStateKind::KvValue;
+                suffix = "value_cache";
+            } else {
+                continue;
+            }
+            auto logicalShape = binding.shape;
+            if (logicalShape.empty())
+                throw std::logic_error(
+                    "Qwen dynamic C2C state binding has an empty shape");
+            const auto residentTokens = static_cast<std::uint32_t>(
+                logicalShape.front());
+            const auto capacity = std::max<std::uint32_t>(
+                256, residentTokens);
+            logicalShape.front() = capacity;
+            std::string name = "layers." + std::to_string(layer) + "." +
+                suffix;
+            dynamicPackage.states.push_back(ModelState{
+                name, kind, binding.element_type, std::move(logicalShape), 0,
+                capacity, program.hardware.mxm_rows, residentTokens});
+            stateRefs.push_back({binding.index, std::move(name)});
         }
-        auto logicalShape = binding.shape;
-        if (logicalShape.empty())
-            throw std::logic_error(
-                "Qwen dynamic C2C state binding has an empty shape");
-        const auto residentTokens = static_cast<std::uint32_t>(
-            logicalShape.front());
-        const auto capacity = std::max<std::uint32_t>(256, residentTokens);
-        logicalShape.front() = capacity;
-        dynamicPackage.states.push_back(ModelState{
-            name, kind, binding.element_type, std::move(logicalShape), 0,
-            capacity, program.hardware.mxm_rows, residentTokens});
-        stateRefs.push_back({binding.index, std::move(name)});
+
+        ModelInvocation dynamicInvocation;
+        dynamicInvocation.name = "decoder.layer" + std::to_string(layer);
+        dynamicInvocation.executable_index = 0;
+        dynamicInvocation.inputs = {
+            {0, "hidden." + std::to_string(layer)},
+            {1, "input_layernorm.weight"},
+            {2, layerTensorName(layer, "self_attn.q_proj.weight")},
+            {3, layerTensorName(layer, "self_attn.k_proj.weight")},
+            {4, layerTensorName(layer, "self_attn.v_proj.weight")},
+            {5, layerTensorName(layer, "self_attn.o_proj.weight")},
+        };
+        if (hasAttentionBias) {
+            dynamicInvocation.inputs.push_back(
+                {6, "self_attn.q_proj.bias"});
+            dynamicInvocation.inputs.push_back(
+                {7, "self_attn.k_proj.bias"});
+            dynamicInvocation.inputs.push_back(
+                {8, "self_attn.v_proj.bias"});
+        }
+        dynamicInvocation.inputs.push_back({
+            static_cast<std::uint32_t>(postAttentionNormBinding),
+            "post_attention_layernorm.weight"});
+        dynamicInvocation.inputs.push_back({
+            static_cast<std::uint32_t>(gateBinding),
+            layerTensorName(layer, "mlp.gate_proj.weight")});
+        dynamicInvocation.inputs.push_back({
+            static_cast<std::uint32_t>(upBinding),
+            layerTensorName(layer, "mlp.up_proj.weight")});
+        dynamicInvocation.inputs.push_back({
+            static_cast<std::uint32_t>(downBinding),
+            layerTensorName(layer, "mlp.down_proj.weight")});
+        dynamicInvocation.outputs = {
+            {0, "hidden." + std::to_string(layer + 1)}};
+        dynamicInvocation.states = std::move(stateRefs);
+        dynamicInvocation.weight_page = 0;
+        dynamicPackage.invocations.push_back(std::move(dynamicInvocation));
     }
 
-    dynamicPackage.executables.push_back(
-        {"decoder.layer0", program, {}});
-    ModelInvocation dynamicInvocation;
-    dynamicInvocation.name = "decoder.layer0";
-    dynamicInvocation.executable_index = 0;
-    dynamicInvocation.inputs = {
-        {0, "hidden.0"},
-        {1, "input_layernorm.weight"},
-        {2, "self_attn.q_proj.weight"},
-        {3, "self_attn.k_proj.weight"},
-        {4, "self_attn.v_proj.weight"},
-        {5, "self_attn.o_proj.weight"},
-    };
-    if (hasAttentionBias) {
-        dynamicInvocation.inputs.push_back(
-            {6, "self_attn.q_proj.bias"});
-        dynamicInvocation.inputs.push_back(
-            {7, "self_attn.k_proj.bias"});
-        dynamicInvocation.inputs.push_back(
-            {8, "self_attn.v_proj.bias"});
+    // Preserve the direct projection temporaries for the bounded dynamic-C2C
+    // checkpoint.  Gate and Up share activation slices 0..15, live in the
+    // bank opposite the normalized input, and occupy one 32-row window per
+    // output pair.  Keeping raw bytes avoids baking a logical layout into the
+    // diagnostic and tells us whether corruption precedes fused Swish.
+    std::vector<std::uint8_t> directFfnTempBytes;
+    constexpr std::size_t kFfnTempSlices = 16;
+    constexpr std::size_t kFfnTempColumns = 32;
+    const std::size_t ffnTempRows = (kIntermediate / 64) * kSeqLen;
+    const std::size_t ffnTempBank = 1 - rms2Binding->bank;
+    if (std::getenv("FTLPU_QWEN_HIDDEN_CHECKPOINT_ONLY") != nullptr) {
+        directFfnTempBytes.reserve(
+            2 * kFfnTempSlices * ffnTempRows * kFfnTempColumns);
+        for (std::size_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
+            for (std::size_t slice = 0; slice < kFfnTempSlices; ++slice) {
+                for (std::size_t address = 0; address < ffnTempRows;
+                     ++address) {
+                    for (std::size_t column = 0; column < kFfnTempColumns;
+                         ++column) {
+                        directFfnTempBytes.push_back(
+                            system->read_mem_sram_lane_byte(
+                                static_cast<ftlpu::Hemisphere>(hemisphere),
+                                slice, ffnTempBank, column / 8, address,
+                                column % 8));
+                    }
+                }
+            }
+        }
     }
-    dynamicInvocation.inputs.push_back({
-        static_cast<std::uint32_t>(postAttentionNormBinding),
-        "post_attention_layernorm.weight"});
-    dynamicInvocation.inputs.push_back({
-        static_cast<std::uint32_t>(gateBinding), "mlp.gate_proj.weight"});
-    dynamicInvocation.inputs.push_back({
-        static_cast<std::uint32_t>(upBinding), "mlp.up_proj.weight"});
-    dynamicInvocation.inputs.push_back({
-        static_cast<std::uint32_t>(downBinding), "mlp.down_proj.weight"});
-    dynamicInvocation.outputs = {{0, "hidden.1"}};
-    dynamicInvocation.states = std::move(stateRefs);
-    dynamicInvocation.weight_page = 0;
-    dynamicPackage.invocations.push_back(std::move(dynamicInvocation));
 
     // The direct run has completed and `actual` owns its downloaded output.
     // Release its large chip model before constructing the C2C-backed one.
@@ -2383,20 +2636,288 @@ try {
     }
     if (dynamicPipelineTracePath != nullptr)
         dynamicSession.write_execution_trace_csv(dynamicPipelineTracePath);
-    const auto& dynamicActual = dynamicSession.value("hidden.1");
+    if (const char* linkedPath =
+            std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
+        dynamicSession.write_last_linked_program(linkedPath);
+    if (std::getenv("FTLPU_QWEN_HIDDEN_CHECKPOINT_ONLY") != nullptr) {
+        const auto checkpointPhysicalBf16 = [&](
+                ftlpu::Hemisphere hemisphere, std::size_t lowSlice,
+                std::size_t highSlice, std::size_t address,
+                std::size_t column, std::size_t bank) {
+            const auto low = dynamicSystem.chip().read_mem_sram_lane_byte(
+                hemisphere, lowSlice, bank, column / 8, address, column % 8);
+            const auto high = dynamicSystem.chip().read_mem_sram_lane_byte(
+                hemisphere, highSlice, bank, column / 8, address, column % 8);
+            return ftlpu::Bf16::from_bits(
+                static_cast<std::uint16_t>(low)
+                | (static_cast<std::uint16_t>(high) << 8)).to_float();
+        };
+        std::size_t tempMismatches = 0;
+        std::array<std::size_t, kFfnTempSlices> tempSliceMismatches {};
+        std::size_t tempByteIndex = 0;
+        for (std::size_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
+            for (std::size_t slice = 0; slice < kFfnTempSlices; ++slice) {
+                for (std::size_t address = 0; address < ffnTempRows;
+                     ++address) {
+                    for (std::size_t column = 0; column < kFfnTempColumns;
+                         ++column, ++tempByteIndex) {
+                        const auto dynamicByte =
+                            dynamicSystem.chip().read_mem_sram_lane_byte(
+                                static_cast<ftlpu::Hemisphere>(hemisphere),
+                                slice, ffnTempBank, column / 8, address,
+                                column % 8);
+                        if (dynamicByte == directFfnTempBytes[tempByteIndex])
+                            continue;
+                        if (tempMismatches < 32)
+                            std::cerr << "dynamic FFN temp mismatch hemisphere="
+                                      << hemisphere << " slice=" << slice
+                                      << " bank=" << ffnTempBank
+                                      << " address=" << address
+                                      << " column=" << column
+                                      << " dynamic="
+                                      << static_cast<unsigned>(dynamicByte)
+                                      << " direct=" << static_cast<unsigned>(
+                                             directFfnTempBytes[tempByteIndex])
+                                      << '\n';
+                        ++tempMismatches;
+                        ++tempSliceMismatches[slice];
+                    }
+                }
+            }
+        }
+        std::cout << "dynamic FFN temp checkpoint: mismatches="
+                  << tempMismatches << " slice_counts=";
+        for (std::size_t slice = 0; slice < tempSliceMismatches.size();
+             ++slice) {
+            if (slice != 0) std::cout << ',';
+            std::cout << tempSliceMismatches[slice];
+        }
+        std::cout << '\n';
+
+        std::size_t mismatches = 0;
+        float maxError = 0.0f;
+        std::array<std::size_t, kIntermediate / 32> blockMismatches {};
+        for (std::size_t row = 0; row < kSeqLen; ++row) {
+            for (std::size_t h = 0; h < kIntermediate; ++h) {
+                const std::size_t block = h / 32;
+                const std::size_t tokenLane = row % kMxmBlockRows;
+                const std::size_t tokenWave = (row % 32) / kMxmBlockRows;
+                const std::size_t address = hiddenBaseRow
+                    + ((row / 32) * (kIntermediate / 32) + block)
+                        * kTileRows
+                    + tokenWave;
+                const float actualValue = checkpointPhysicalBf16(
+                    ftlpu::Hemisphere::East,
+                    rms2Binding->slices[2 * tokenLane],
+                    rms2Binding->slices[2 * tokenLane + 1], address,
+                    h % 32, rms2Binding->bank);
+                const float expectedValue =
+                    physicalHidden[row * kIntermediate + h];
+                const float error = std::fabs(actualValue - expectedValue);
+                maxError = std::max(maxError, error);
+                if (error == 0.0f) continue;
+                if (mismatches < 16)
+                    std::cerr << "dynamic hidden checkpoint mismatch row="
+                              << row << " h=" << h << " block=" << block
+                              << " address=" << address
+                              << " actual=" << actualValue
+                              << " direct=" << expectedValue << '\n';
+                ++mismatches;
+                ++blockMismatches[block];
+            }
+        }
+        std::cout << "dynamic hidden checkpoint: mismatches=" << mismatches
+                  << " max_error=" << maxError << " block_counts=";
+        for (std::size_t block = 0; block < blockMismatches.size(); ++block) {
+            if (block != 0) std::cout << ',';
+            std::cout << blockMismatches[block];
+        }
+        std::cout << '\n';
+        return mismatches == 0 && tempMismatches == 0 ? 0 : 1;
+    }
+    const auto& dynamicActual = dynamicSession.value(
+        "hidden." + std::to_string(decoderLayerCount));
     if (dynamicActual.size() != actual.size())
         throw std::logic_error(
             "Qwen dynamic C2C output byte size differs from direct golden: "
             + std::to_string(dynamicActual.size()) + " vs "
             + std::to_string(actual.size()));
-    if (dynamicActual != actual) {
+    if (!skipNumericChecks && dynamicActual != actual) {
         std::size_t firstMismatch = 0;
+        std::size_t outputMismatchCount = 0;
+        float outputMaxError = 0.0f;
         while (firstMismatch < actual.size()
             && dynamicActual[firstMismatch] == actual[firstMismatch])
             ++firstMismatch;
+        for (std::size_t offset = 0; offset + 1 < actual.size(); offset += 2) {
+            const float directValue = readBf16(actual, offset / 2);
+            const float dynamicValue = readBf16(dynamicActual, offset / 2);
+            const float error = std::fabs(directValue - dynamicValue);
+            if (error != 0.0f) ++outputMismatchCount;
+            outputMaxError = std::max(outputMaxError, error);
+        }
+        const auto dynamicPhysicalBf16 = [&](ftlpu::Hemisphere hemisphere,
+                                             std::size_t lowSlice,
+                                             std::size_t highSlice,
+                                             std::size_t address,
+                                             std::size_t column,
+                                             std::size_t bank) {
+            const auto low = dynamicSystem.chip().read_mem_sram_lane_byte(
+                hemisphere, lowSlice, bank, column / 8, address, column % 8);
+            const auto high = dynamicSystem.chip().read_mem_sram_lane_byte(
+                hemisphere, highSlice, bank, column / 8, address, column % 8);
+            return ftlpu::Bf16::from_bits(
+                static_cast<std::uint16_t>(low)
+                | (static_cast<std::uint16_t>(high) << 8)).to_float();
+        };
+        const auto dynamicDistributed = [&](std::size_t row, std::size_t column,
+                                            std::size_t width) {
+            const std::size_t block = column / 32;
+            const std::size_t tokenLane = row % kMxmBlockRows;
+            const std::size_t tokenWave = (row % 32) / kMxmBlockRows;
+            const std::size_t address = hiddenBaseRow
+                + ((row / 32) * (width / 32) + block) * kTileRows
+                + tokenWave;
+            return dynamicPhysicalBf16(ftlpu::Hemisphere::East,
+                rms2Binding->slices[2 * tokenLane],
+                rms2Binding->slices[2 * tokenLane + 1], address,
+                column % 32, rms2Binding->bank);
+        };
+        std::size_t dynamicHiddenMismatches = 0;
+        float dynamicHiddenMaxError = 0.0f;
+        for (std::size_t row = 0; row < kSeqLen; ++row) {
+            for (std::size_t h = 0; h < kIntermediate; ++h) {
+                const std::size_t index = row * kIntermediate + h;
+                const float error = std::fabs(
+                    dynamicDistributed(row, h, kIntermediate)
+                    - physicalHidden[index]);
+                if (error != 0.0f) ++dynamicHiddenMismatches;
+                dynamicHiddenMaxError = std::max(dynamicHiddenMaxError, error);
+            }
+        }
+        std::size_t dynamicFfnMismatches = 0;
+        float dynamicFfnMaxError = 0.0f;
+        std::array<std::size_t, kHidden / 32>
+            dynamicFfnBlockMismatchCounts {};
+        if (ffnBinding->layout
+            == ftlpu::software::runtime::BindingLayout::Fp16PairPlanar) {
+            for (std::size_t row = 0; row < kSeqLen; ++row) {
+                for (std::size_t column = 0; column < kHidden; ++column) {
+                    const std::size_t outputBlock = column / 32;
+                    const auto owner = static_cast<ftlpu::Hemisphere>(
+                        (outputBlock % 4) / 2);
+                    const std::size_t pair = outputBlock % 2;
+                    const std::size_t address =
+                        static_cast<std::size_t>(ffnBinding->base_row)
+                        + (outputBlock / 4) * kSeqLen + row;
+                    const float dynamicValue = dynamicPhysicalBf16(owner,
+                        ffnBinding->slices[pair * 2],
+                        ffnBinding->slices[pair * 2 + 1], address,
+                        column % 32, ffnBinding->bank);
+                    const float error = std::fabs(dynamicValue
+                        - ffnOutput[row * kHidden + column]);
+                    if (error != 0.0f) {
+                        if (dynamicFfnMismatches < 16)
+                        {
+                            const std::size_t h0 =
+                                (column * 5 + 17) % kIntermediate;
+                            const std::size_t h1 =
+                                (h0 + 37) % kIntermediate;
+                            std::cerr << "dynamic FFN mismatch row=" << row
+                                      << " column=" << column
+                                      << " block=" << outputBlock
+                                      << " owner="
+                                      << static_cast<std::size_t>(owner)
+                                      << " actual=" << dynamicValue
+                                      << " direct="
+                                      << ffnOutput[row * kHidden + column]
+                                      << " error=" << error
+                                      << " h0=" << h0
+                                      << " h0.dynamic="
+                                      << dynamicDistributed(
+                                             row, h0, kIntermediate)
+                                      << " h0.direct=" << physicalHidden[
+                                             row * kIntermediate + h0]
+                                      << " h1=" << h1
+                                      << " h1.dynamic="
+                                      << dynamicDistributed(
+                                             row, h1, kIntermediate)
+                                      << " h1.direct=" << physicalHidden[
+                                             row * kIntermediate + h1]
+                                      << '\n';
+                        }
+                        ++dynamicFfnMismatches;
+                        ++dynamicFfnBlockMismatchCounts[outputBlock];
+                    }
+                    dynamicFfnMaxError = std::max(dynamicFfnMaxError, error);
+                }
+            }
+        }
+        std::vector<std::size_t> downPageByteMismatches(
+            inputBindingByIndex(static_cast<std::uint32_t>(downBinding))
+                .page_count);
+        for (std::uint32_t page = 0;
+             page < downPageByteMismatches.size(); ++page) {
+            const auto image = pack_weight_binding_page(
+                inputBindingByIndex(static_cast<std::uint32_t>(downBinding)),
+                page, downWeight, program.hardware);
+            const auto placement = resolve_weight_page_placement(
+                inputBindingByIndex(static_cast<std::uint32_t>(downBinding)),
+                page);
+            for (const PackedWeightSegment& segment : image.segments)
+                for (std::uint32_t vector = 0;
+                     vector < segment.vector_count; ++vector)
+                    for (std::uint32_t byte = 0;
+                         byte < ftlpu::hw::kPhysicalVectorBytes; ++byte) {
+                        const auto expected = image.data.at(
+                            static_cast<std::size_t>(segment.byte_offset)
+                            + static_cast<std::size_t>(vector)
+                                * ftlpu::hw::kPhysicalVectorBytes + byte);
+                        const auto resident =
+                            dynamicSystem.chip().read_mem_sram_lane_byte(
+                                static_cast<ftlpu::Hemisphere>(
+                                    segment.hemisphere),
+                                segment.slice, placement.bank, byte / 8,
+                                segment.base_row + vector, byte % 8);
+                        if (resident != expected)
+                            ++downPageByteMismatches[page];
+                    }
+        }
+        const auto joinCounts = [](const auto& counts) {
+            std::ostringstream text;
+            for (std::size_t index = 0; index < counts.size(); ++index) {
+                if (index != 0) text << ',';
+                text << counts[index];
+            }
+            return text.str();
+        };
+        const std::size_t firstElement = firstMismatch / 2;
+        const ModelSessionStats& mismatchStats = dynamicSession.stats();
         throw std::logic_error(
             "Qwen dynamic C2C output differs from direct golden at byte "
-            + std::to_string(firstMismatch));
+            + std::to_string(firstMismatch)
+            + " row=" + std::to_string(firstElement / kHidden)
+            + " column=" + std::to_string(firstElement % kHidden)
+            + " direct=" + std::to_string(readBf16(actual, firstElement))
+            + " dynamic="
+                + std::to_string(readBf16(dynamicActual, firstElement))
+            + " output_mismatches=" + std::to_string(outputMismatchCount)
+            + " output_max_error=" + std::to_string(outputMaxError)
+            + " hidden_mismatches="
+                + std::to_string(dynamicHiddenMismatches)
+            + " hidden_max_error=" + std::to_string(dynamicHiddenMaxError)
+            + " ffn_mismatches=" + std::to_string(dynamicFfnMismatches)
+            + " ffn_max_error=" + std::to_string(dynamicFfnMaxError)
+            + " ffn_block_mismatches="
+                + joinCounts(dynamicFfnBlockMismatchCounts)
+            + " down_page_byte_mismatches="
+                + joinCounts(downPageByteMismatches)
+            + " initial_wait_cycles="
+                + std::to_string(
+                    mismatchStats.weight_page_initial_wait_cycles)
+            + " runtime_wait_cycles="
+                + std::to_string(
+                    mismatchStats.weight_page_runtime_wait_cycles));
     }
     const ModelSessionStats& dynamicStats = dynamicSession.stats();
     if (dynamicStats.weight_page_prefetches != expectedPrefetches
@@ -2475,12 +2996,13 @@ try {
         throw std::logic_error(
             "Qwen compiler image contains no MEM_READ_SYNC for KV page-out");
     if (dynamicStats.weight_page_synchronized_writes
-        != expectedSynchronizedWrites)
+        != decoderLayerCount * expectedSynchronizedWrites)
         throw std::logic_error(
             "Qwen dynamic C2C synchronized MEM FU write mismatch: issued="
             + std::to_string(
                 dynamicStats.weight_page_synchronized_writes)
-            + " expected=" + std::to_string(expectedSynchronizedWrites));
+            + " expected=" + std::to_string(
+                decoderLayerCount * expectedSynchronizedWrites));
     if (const char* linkedPath =
             std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
         dynamicSession.write_last_linked_program(linkedPath);

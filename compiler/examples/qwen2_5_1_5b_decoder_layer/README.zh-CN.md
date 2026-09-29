@@ -77,36 +77,41 @@ RMSNorm 2 为 0.015625。
 ### 动态 C2C 单层执行
 
 同一个 seq32 runtime 测试还会通过 `ModelSession(C2cDmaSystem)` 执行整层。
-executable 声明 20 个权重页使用项：Q、K、V、O 各 1 页，Gate 2 页，Up 2 页，
-Down 12 页。ModelPackage 另建 1 个参数页，装入两组 RMSNorm scale 和 Q/K/V bias。
-该参数页不计入 20 个 executable page use，因此整次运行共有 21 次物理预取。
+executable 声明 10 个权重页使用项：Q、K、V、O 各 1 页，Gate 和 Up 各 1 页，
+Down 4 页。Q/K/V/O 全部使用 bank A 的互不重叠 slice group：Q/K 共用 group 0
+的不同 row，V 使用 group 1，O 使用 group 2。FFN 随后以 Gate B、Up A、Down B
+继续 bank 级 ping-pong。每个 Down 页占用
+一个 slice-group 并容纳 3 个输出 wave。ModelPackage 另建 1 个参数页，装入两组
+RMSNorm scale 和 Q/K/V bias。该参数页不计入 10 个 executable page use，因此整次
+运行共有 11 次物理预取。
 
 在加载链接后的 executable 之前，`ModelSession` 会同步搬入参数页，以及 planner
-标为 `pre_execution` 的 6 个 executable 页，即 Q/K/V/O 和两个 Up 页。其余
-14 个 executable 页（两个 Gate 页和全部 12 个 Down 页）会链接进静态程序的空闲
-窗口。linker 向 C2C DMA/RX 队列和普通 MEM ICU 队列加入指令；后者使用
+标为 `pre_execution` 的 4 个 executable 页，即 Q/K/V/O。其余 6 个 executable
+页（Gate、Up 和 4 个 Down 页）会链接进静态程序的空闲窗口。Gate 在 bank B 上
+消费时预取 bank A 的 Up；Up 在 bank A 上消费时预取 bank B 的 4 个 Down 页。
+linker 向 C2C DMA/RX 队列和普通 MEM ICU 队列加入指令；后者使用
 `MEM_WRITE_SYNC`，与普通读写共享同一物理队列。page fence 会保留目标队列直到首个
 consumer 边界，page-ready 同步负责吸收更晚的传输完成时间，避免逻辑静态时序偏移。
 
 启动前传输程序是临时程序：它们在 `runtime.load()` 之前完成，不会复制到
 `ModelSession::last_linked_program()`。任何 `BinaryProgram` 都不序列化页面 payload；
 所有页数据仍保存在 `ModelPackage`/外部 DDR backing store 中。因此，链接后的
-`.ftlpu` 包含原静态 executable 和 14 个重叠页的传输指令，同时仍保留原有 20 个
+`.ftlpu` 包含原静态 executable 和 6 个重叠页的传输指令，同时仍保留原有 10 个
 page-use descriptor 作为 metadata。统计导出的 linked image 指令时必须区分这两类页面。
 
 已验证的动态运行统计如下：
 
 | 动态 C2C 项目 | 结果 |
 | --- | --- |
-| 页面计划 | 20 个 executable 页 + 1 个参数页 = 21 次预取 |
+| 页面计划 | 10 个 executable 页 + 1 个参数页 = 11 次预取 |
 | 物理传输字节数 | 47,194,112 = 46,792,704 executable + 401,408 parameter |
-| 启动页 / 初始等待 | 7 页 / 217,183 cycles |
-| 运行期链接页面 | 14 个 executable 页 |
-| 链接后指令镜像 | 1,321,249 bytes、230 个序列化队列、85,242 个物理 iMEM slot |
-| 链接后的 MEM 同步 | 256 条 `MEM_WRITE_SYNC` 指令 |
-| 同步 MEM FU 工作量 | 860,160 次 vector 写入 = 27,525,120 bytes |
-| executable page-ready 等待 | 0 cycles |
-| 数值结果 | 与 direct run 逐字节一致；49,152 个 BF16 值、49,116 个非零、最大误差 0.0625 |
+| 启动页 / 初始等待 | 5 页 / 68,954 cycles |
+| 运行期链接页面 | 6 个 executable 页 |
+| 链接后指令镜像 | 882,705 bytes、230 个有效序列化队列、50,978 个物理 iMEM word |
+| 链接后的 MEM 同步 | 192 条 `MEM_WRITE_SYNC`、40 条 `MEM_READ_SYNC` |
+| 同步 MEM FU 工作量 | 1,290,240 次 vector 写入 = 41,287,680 bytes |
+| executable page-ready 等待 | 59,292 cycles |
+| 数值结果 | 49,152 个 BF16 值、49,117 个非零、最大误差 0.0625 |
 
 ## 编译和检查
 
@@ -285,9 +290,37 @@ build-ftlpu-vs2026-direct/runtime/ftlpu_binary_inspect.exe `
 decode attention、残差和 1536/8960 FFN，并与 33-token 单层数学 golden 的最后一个
 token 逐位比较。
 
-该测试建立 compiler decode lowering 所需的数值规范；当前生成的 `.ftlpu`
-executable 尚未包含编译后的 KV cache read/write command，因此它不代表 compiled
-CModel decode 已经实现。
+当前 decode lowering 已生成完整 ICU/CModel 程序，包括 DDR 权重加载、KV cache
+page-in、单层 decoder 计算、KV append 和更新后 cache page-out。逻辑输入输出均为
+`1x1536`，MXM 使用 Native4。
+
+为常用上下文长度预编译 decode 程序：
+
+```powershell
+python tools/build_qwen2_5_decode_buckets.py `
+  --past-lengths 32 64 128 224 `
+  --capacity 256
+```
+
+产物固定写入 `results/qwen2_5_decoder_layer_decode_buckets`。`manifest.json` 记录每个
+程序的 `past_len`、绝对 RoPE 位置、KV resident token 数、binary 和 fixture 路径。
+当前 binary 把 RoPE 位置、KV append 地址和有效 attention 长度静态编译进 ICU
+程序，因此 selector 只允许精确匹配，不能拿更大的桶代替较短上下文：
+
+```powershell
+python tools/select_qwen2_5_decode_bucket.py `
+  --manifest results/qwen2_5_decoder_layer_decode_buckets/manifest.json `
+  --past-len 64
+
+tools/run_qwen2_5_decode_bucket.ps1 `
+  -Manifest results/qwen2_5_decoder_layer_decode_buckets/manifest.json `
+  -PastLen 64 -DdrBandwidthMBps 16000 -ClockMHz 1000 `
+  -ResultDir results/qwen2_5_decoder_layer_decode_buckets/past_0064/run
+```
+
+要让一个 bucket 覆盖任意区间，还需要把 RoPE position、KV append offset 和 valid
+KV length 改成 runtime 参数，并对 bucket 尾部插入动态 mask；在这些 relocation
+完成前，错误地向上取整会改变 attention 数值。
 
 ## 历史兼容路径数值基线
 

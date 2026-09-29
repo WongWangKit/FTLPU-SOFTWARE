@@ -1,5 +1,6 @@
 #include "ftlpu/software/runtime/binary.hpp"
 
+#include "ftlpu/c2c/icu_instruction.hpp"
 #include "ftlpu/icu/fu_3d_codec.hpp" // Includes the shared wait_cycle field.
 #include "ftlpu/icu/sxm_run_2d.hpp"
 #include "ftlpu/icu/vxm_run_2d.hpp"
@@ -314,20 +315,48 @@ InstructionRow decode_3d(
     }
     case QueueKind::SxmTranspose:
     case QueueKind::SxmPermute: {
-        const auto instruction =
-            ftlpu::isa::decode_sxm_icu_run_2d_instruction(
-                packet_at<ftlpu::isa::EncodedSxmIcuRun2DPacket>(queue, pc));
+        const auto instruction = queue.kind == QueueKind::SxmTranspose
+            ? ftlpu::isa::decode_sxm_transpose_icu_run_2d_instruction(
+                packet_at<
+                    ftlpu::isa::EncodedSxmTransposeIcuRun2DPacket>(
+                    queue, pc))
+            : ftlpu::isa::decode_sxm_permute_icu_run_2d_instruction(
+                packet_at<
+                    ftlpu::isa::EncodedSxmPermuteIcuRun2DPacket>(
+                    queue, pc));
         row.loop = instruction.loop;
         row.opcode = "RUN_2D";
-        const auto encoded =
-            ftlpu::isa::encode_sxm_instruction(instruction.instruction);
-        details << "sxm_opcode="
-                << static_cast<unsigned>(instruction.instruction.opcode)
-                << " permute_map_stride="
-                << instruction.permute_map_stride << " sxm_words=";
-        for (std::size_t word = 0; word < encoded.words.size(); ++word) {
-            if (word != 0) details << ':';
-            details << hex32(encoded.words[word]);
+        details << "src_base="
+                << instruction.instruction.src_streams.front().stream
+                << " dst_base="
+                << instruction.instruction.dst_streams.front().stream;
+        if (queue.kind == QueueKind::SxmTranspose) {
+            details << " input_row=";
+            if (instruction.instruction.input_row
+                == ftlpu::SxmInstruction::kAllInputRows)
+                details << "all";
+            else
+                details << instruction.instruction.input_row;
+        } else {
+            details << " output_row=";
+            if (instruction.instruction.output_row
+                == ftlpu::SxmInstruction::kAllOutputRows)
+                details << "all";
+            else
+                details << instruction.instruction.output_row;
+            details << " output_tile=";
+            if (instruction.instruction.output_tile
+                == ftlpu::SxmInstruction::kAllOutputTiles)
+                details << "all";
+            else
+                details << instruction.instruction.output_tile;
+            details << " permute_map_stride="
+                    << instruction.permute_map_stride << " permute_map=";
+            for (std::size_t lane = 0;
+                 lane < instruction.instruction.permute_map.size(); ++lane) {
+                if (lane != 0) details << ':';
+                details << instruction.instruction.permute_map[lane];
+            }
         }
         break;
     }
@@ -481,6 +510,31 @@ std::vector<InstructionRow> decode_queue(const QueueProgram& queue)
         } else {
             row.expanded = 1;
             ++cursor;
+        }
+        if (command.instruction_kind == InstructionKind::C2cEndpoint
+            && (queue.kind == QueueKind::C2cRx
+                || queue.kind == QueueKind::C2cTx)) {
+            const auto packet = ftlpu::software::runtime::decode_c2c_raw_word(
+                command, InstructionKind::C2cEndpoint);
+            std::ostringstream c2c;
+            if (queue.kind == QueueKind::C2cRx) {
+                const auto instruction =
+                    ftlpu::C2cIcuPacketCodec::decode_rx(packet);
+                row.opcode = "RECEIVE";
+                c2c << "lane=" << instruction.lane
+                    << " fabric_stream=W" << instruction.fabric_stream
+                    << " vectors=" << instruction.vector_count
+                    << " synchronization_tag=" << instruction.sync_tag;
+            } else {
+                const auto instruction =
+                    ftlpu::C2cIcuPacketCodec::decode_tx(packet);
+                row.opcode = "SEND";
+                c2c << "lane=" << instruction.lane
+                    << " fabric_stream=W" << instruction.fabric_stream
+                    << " vectors=" << instruction.vector_count
+                    << " synchronization_tag=" << instruction.sync_tag;
+            }
+            row.details = c2c.str();
         }
         row.raw = raw_words(queue, pc, 1);
         if (!row.details.empty()) row.details += ' ';
@@ -804,8 +858,8 @@ try {
               "files represent physical ICUs with no static prefill work. "
               "start_cycle/end_cycle replay NOP durations, packet wait_cycle, "
               "and synchronized MEM reservations. SYNC_PAGE is a tagged "
-              "WAIT_EVENT placed before a dynamic weight-page consumer; "
-              "its event_tag identifies the page-ready broadcast. Ordinary "
+              "WAIT_EVENT placed at a static execution-epoch boundary; "
+              "all pages required by that epoch share its event_tag. Ordinary "
               "SYNC and SYNC_PAGE mark their fetch cycles; their actual wait "
               "is dynamic. SYNC_LAUNCH is the corresponding tagged wait in "
               "a C2C producer queue.\n\n"

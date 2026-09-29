@@ -6,6 +6,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -51,21 +52,26 @@ try {
 
     TspSliceSystem system;
     std::size_t physicalTicks = 0;
+    bool issueWasAlwaysEnabled = true;
     CModelRuntime runtime(system,
         [&](TspSliceSystem::LogSinks sinks) {
+            issueWasAlwaysEnabled = issueWasAlwaysEnabled
+                && system.icu().program_issue_enabled();
             system.tick(sinks);
             ++physicalTicks;
         });
     runtime.enable_execution_trace();
     runtime.load(program);
-    runtime.set_weight_page_residency_checker(
-        [&](const BinaryWeightPageUse&) { return physicalTicks >= 7; });
+    std::vector<std::uint8_t> logical(program.bindings[0].byte_size);
+    for (std::size_t index = 0; index < logical.size(); ++index)
+        logical[index] = static_cast<std::uint8_t>(index * 17 + 3);
+    runtime.upload_input(0, logical);
     runtime.run_cycles(4);
 
-    if (runtime.logical_cycles() != 4 || runtime.physical_cycles() != 9
-        || physicalTicks != 9)
+    if (runtime.logical_cycles() != 4 || runtime.physical_cycles() != 4
+        || physicalTicks != 4 || !issueWasAlwaysEnabled)
         throw std::runtime_error(
-            "page-ready wait did not separate logical and physical cycles");
+            "runtime changed global ICU issue state for a page boundary");
     if (!system.icu().program_issue_enabled())
         throw std::runtime_error(
             "runtime left the compute ICUs held after page release");
@@ -77,10 +83,9 @@ try {
     const std::string trace {
         std::istreambuf_iterator<char>(input),
         std::istreambuf_iterator<char>()};
-    if (trace.find("2,7,\"ICU.PageReadyWait\"") == std::string::npos
-        || trace.find("source=runtime issues=5") == std::string::npos)
+    if (trace.find("ICU.PageReadyWait") != std::string::npos)
         throw std::runtime_error(
-            "runtime trace did not contain the actual page-ready stall");
+            "runtime trace still contains the removed global page gate");
     input.close();
 
     RuntimeExecutionTrace segmented;
@@ -122,8 +127,8 @@ try {
     repeatedInput.close();
     std::filesystem::remove(path);
 
-    std::cout << "runtime_page_ready_sync_test passed logical=4 physical=9 "
-                 "wait=5\n";
+    std::cout << "runtime_page_ready_sync_test passed logical=4 physical=4 "
+                 "global_gate=off\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "runtime_page_ready_sync_test failed: "

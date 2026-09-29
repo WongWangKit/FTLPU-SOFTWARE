@@ -1,15 +1,17 @@
 param(
     [int]$MaxParallel = 3,
     [switch]$Resume,
-    [switch]$NoPipeline
+    [switch]$NoPipeline,
+    [switch]$SkipNumericChecks
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $workspaceRoot = Split-Path -Parent $repoRoot
 $resultRoot = Join-Path $repoRoot "results"
-$sourceStream = Join-Path $workspaceRoot "projection_rope_run\softmax_closed3d\decoder_layer.stream.mlir"
 $loweringDir = Join-Path $workspaceRoot "projection_rope_run\ttft_sweep_direct"
+$sourceStablehlo = Join-Path $workspaceRoot "projection_rope_run\page_aligned\decoder_layer.stablehlo.mlir"
+$sourceStream = Join-Path $loweringDir "decoder_layer.stream.mlir"
 $sourceSchedule = Join-Path $loweringDir "decoder_layer.schedule.mlir"
 $sourceCommand = Join-Path $loweringDir "decoder_layer.command.mlir"
 $baseConfig = Join-Path $workspaceRoot "FTLPU-CMODEL\config\ftlpu-lpu32.json"
@@ -18,7 +20,7 @@ $compiler = Join-Path $repoRoot "build-ftlpu-vs2026-direct\compiler\ftlpu-compil
 $runner = Join-Path $PSScriptRoot "run_qwen2_5_decoder_layer_prefill.ps1"
 $summaryPath = Join-Path $resultRoot "qwen2_5_decoder_layer_prefill_sweep.csv"
 
-foreach ($path in @($sourceStream, $baseConfig, $optimizer, $compiler, $runner)) {
+foreach ($path in @($sourceStablehlo, $baseConfig, $optimizer, $compiler, $runner)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Required sweep input does not exist: $path"
     }
@@ -62,6 +64,26 @@ $loweringCombination = $combinations |
 $loweringTarget = Join-Path `
     (Join-Path $resultRoot $loweringCombination.Name) "target.json"
 $loweringLog = Join-Path $loweringDir "lowering.log"
+$commonLoweringArgs = @(
+    "--mxm-execution", "vector",
+    "--ffn-schedule", "fused",
+    "--projection-rope-overlap", "off",
+    "--target-config", $loweringTarget,
+    "--weight-bank", "1",
+    "--kv-cache-capacity", "256"
+)
+$loweringOutput = & $optimizer `
+    --input $sourceStablehlo `
+    --output $sourceStream `
+    --pipeline ftlpu-stablehlo-to-stream `
+    @commonLoweringArgs 2>&1
+$loweringExitCode = $LASTEXITCODE
+if ($loweringOutput) {
+    $loweringOutput | Set-Content -LiteralPath $loweringLog -Encoding utf8
+}
+if ($loweringExitCode -ne 0) {
+    throw "StableHLO-to-stream lowering failed; see $loweringLog"
+}
 $loweringOutput = & $optimizer `
     --input $sourceStream `
     --output $sourceSchedule `
@@ -129,11 +151,15 @@ foreach ($combination in $combinations) {
 $pending = [System.Collections.Generic.Queue[object]]::new()
 foreach ($combination in $combinations) {
     $manifestPath = Join-Path (Join-Path $resultRoot $combination.Name) "run.json"
+    $programPath = Join-Path (Join-Path $resultRoot $combination.Name) "compiled.ftlpu"
     $passed = $false
     if (Test-Path -LiteralPath $manifestPath) {
         $manifest = Get-Content -LiteralPath $manifestPath -Raw |
             ConvertFrom-Json
-        $passed = $manifest.status -eq "passed"
+        $passed = $manifest.status -eq "passed" `
+            -and (Test-Path -LiteralPath $programPath) `
+            -and (Get-Item -LiteralPath $programPath).LastWriteTimeUtc `
+                -le (Get-Item -LiteralPath $manifestPath).LastWriteTimeUtc
     }
     if (-not $Resume -or -not $passed) {
         $pending.Enqueue($combination)
@@ -158,6 +184,9 @@ while ($pending.Count -gt 0 -or $running.Count -gt 0) {
         )
         if ($NoPipeline) {
             $arguments += "-NoPipeline"
+        }
+        if ($SkipNumericChecks) {
+            $arguments += "-SkipNumericChecks"
         }
         $process = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments `
             -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `

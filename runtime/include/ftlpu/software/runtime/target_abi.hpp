@@ -288,7 +288,7 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     config.mxms_per_hemisphere =
         static_cast<std::uint32_t>(mxms_per_hemisphere);
     TargetAbiHasher hash;
-    hash.add(19); // Single MEM ICU queue per physical SRAM bank.
+    hash.add(20); // Queue-specific compact SXM Transpose/Permute RUN_2D packets.
     // i-MEM capacity is a deployment constraint rather than a command-bit ABI
     // change. Keep legacy Schedule attributes valid and validate geometry
     // explicitly when loading an executable into a CModel.
@@ -300,7 +300,7 @@ constexpr std::uint64_t executable_target_abi(
     const ExecutableHardwareConfig& config)
 {
     TargetAbiHasher hash;
-    hash.add(19); // Single MEM ICU queue per physical SRAM bank.
+    hash.add(20); // Queue-specific compact SXM Transpose/Permute RUN_2D packets.
     config.visit_command_abi([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }

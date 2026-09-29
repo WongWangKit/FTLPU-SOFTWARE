@@ -62,7 +62,7 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
         + divideCeil(valueItems, projectionItemsPerGroup);
     const int64_t outputGroups = divideCeil(
         outputItems, outputItemsPerGroup);
-    if (projectionGroupsUsed > groups || outputGroups > groups)
+    if (projectionGroupsUsed + outputGroups > groups)
         return mlir::failure();
 
     const auto transferCycles = [&](int64_t rows, int64_t columns) {
@@ -101,9 +101,12 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
             valueGroup, divideCeil(valueItems, projectionItemsPerGroup),
             projectionItemsPerGroup, valueItems,
             projectionRowsPerItem, hidden, kvHeads * headDim),
-        placement(AttentionWeightTileKind::Output,
-            (initialBank + 1) % memory.banks_per_slice, 0,
-            0, outputGroups, outputItemsPerGroup, outputItems,
+        // Keep the complete attention residency epoch in one bank. Q/K/V
+        // occupy the leading storage groups; O uses the next disjoint group
+        // and can therefore be prefetched without replacing Q.
+        placement(AttentionWeightTileKind::Output, initialBank, 0,
+            projectionGroupsUsed, outputGroups,
+            outputItemsPerGroup, outputItems,
             outputRowsPerItem, queryHeads * headDim, hidden),
     };
     return result;

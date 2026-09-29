@@ -20,6 +20,7 @@ enum class FfnWeightTileKind : std::uint8_t { Gate, Up, Down };
 
 struct FfnWeightTileSpan {
     FfnWeightTileKind kind;
+    int64_t bank;
     int64_t page_base_row;
     int64_t slice_group_begin;
     int64_t slice_group_count;
@@ -51,10 +52,16 @@ struct FfnWeightTilePlan {
     int64_t projection_wave_count;
     int64_t projection_waves_per_page;
     int64_t projection_slice_groups_per_role;
+    int64_t projection_gate_slice_group_base;
+    int64_t projection_up_slice_group_base;
     int64_t projection_waves_per_slice_group;
+    bool bank_level_ping_pong;
     int64_t down_wave_count;
     int64_t down_reduction_blocks_per_page;
     int64_t down_reduction_blocks_per_slice_group;
+    int64_t down_items_per_page;
+    int64_t down_items_per_slice_group;
+    int64_t down_output_waves_per_page;
     int64_t minimum_hidden_slices;
     llvm::SmallVector<FfnWeightTilePage, 32> pages;
 };

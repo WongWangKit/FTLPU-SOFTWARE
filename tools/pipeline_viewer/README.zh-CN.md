@@ -74,8 +74,9 @@ counter 继续保留为 `repeat` 或 `repeat2d` pattern。这样既完整表示�
 
 实际运行 trace 中的 `C2C.E.Prefetch`、`C2C.W.Prefetch`、共享 SR 和
 `MEM.*.C2CWrite` 区间来自 CModel 已完成的 DMA/RX/MEM write；`detail` 使用
-`source=runtime`，并记录 `consumer_cycle` 与 `actual_ready`。当页面没有及时完成时，
-`ICU.PageReadyWait` 显示计算侧 ICU 被同步屏障阻塞的真实 physical-cycle 区间。
+`source=runtime`，并记录 `consumer_cycle` 与 `actual_ready`。当 execution epoch 的资源
+集合没有及时完成时，`ICU.PageReadyWait` 显示该条 ICU queue 在 tagged boundary 本地
+等待的真实 physical-cycle 区间；它不代表全芯片 issue gate。
 离线计划 CSV 仍使用 `planned=true`，其区间只是目标带宽模型的预测。
 
 `C2C.E/W.DMA` 是东西半球各自的 DDR-to-C2C DMA 命令发射行；

@@ -69,9 +69,12 @@ overlap; neither path may bypass the external C2C boundary.
 
 This partition removes transport and port conflicts; it does not increase
 capacity. For Qwen2.5-1.5B FFN at sequence length 32, the generic Vector planner
-uses four 8-slice weight groups. Gate and Up share seven ping-pong pages, while
-Down uses twelve pages. Every page stays within 8192 rows per bank. Block8's
-packed page remains a separate valid layout.
+uses four 8-slice weight groups. One Gate page fills all four groups in bank A,
+and one Up page fills all four groups in bank B. Down returns to bank A with
+four pages, one per slice group; each page packs three output waves into 6720
+rows. This allows Up to be prefetched during Gate and all Down pages to be
+prefetched during Up without interleaving overwrite and read operations in one
+MEM ICU queue. Block8's packed page remains a separate valid layout.
 
 ## Execution
 

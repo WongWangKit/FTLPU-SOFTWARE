@@ -19,8 +19,14 @@ struct WeightResidencyRegion {
 };
 
 struct WeightPrefetchPlan {
+    // Binding-local page index used to pack this transfer fragment.
     std::uint32_t page_index{0};
+    // Bank-local residency generation. Transfer fragments with the same
+    // (bank, residency_page_index) occupy disjoint physical slice/row ranges
+    // and therefore coexist in one hardware page.
+    std::uint32_t residency_page_index{0};
     std::uint16_t bank{0};
+    bool runtime_prefetch{false};
     bool pre_execution{false};
     std::uint64_t start_cycle{0};
     std::uint64_t transfer_end_cycle{0};
@@ -29,6 +35,8 @@ struct WeightPrefetchPlan {
     std::array<std::uint64_t, 2> bytes{};
     std::vector<std::size_t> use_indices{};
     std::vector<WeightResidencyRegion> regions{};
+    // Ordinary West SR selected for each active C2C transport lane.
+    std::vector<std::uint16_t> fabric_streams{};
 };
 
 // Builds the executable-local C2C schedule from compiler-provided weight

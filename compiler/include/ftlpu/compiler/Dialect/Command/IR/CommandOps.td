@@ -30,7 +30,8 @@ def TimelineOp : FTLPU_Command_Op<"timeline"> {
 def WeightPageOp : FTLPU_Command_Op<"weight_page"> {
   let summary = "Runtime-visible residency interval for one logical weight page";
   let arguments = (ins I64Attr:$binding_index, I64Attr:$page_index,
-      I64Attr:$bank, I64Attr:$ready_cycle, I64Attr:$release_cycle);
+      I64Attr:$bank, I64Attr:$ready_cycle, I64Attr:$release_cycle,
+      OptionalAttr<BoolAttr>:$runtime_prefetch);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }
@@ -161,7 +162,7 @@ def VxmRun2DOp : FTLPU_Command_Op<"vxm_run_2d",
 
 def SxmRun2DOp : FTLPU_Command_Op<"sxm_run_2d",
     [MemoryEffects<[MemWrite]>]> {
-  let summary = "Raw six-word SXM ICU RUN_2D instruction";
+  let summary = "Queue-specific compact SXM ICU RUN_2D instruction";
   let arguments = (ins StrAttr:$kind, I64Attr:$cycle, I64Attr:$queue,
       ArrayAttr:$words);
   let assemblyFormat = "attr-dict";

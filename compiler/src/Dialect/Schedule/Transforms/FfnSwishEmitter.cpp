@@ -25,16 +25,13 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
         encodedInput, 0, "stream_bf16",
         encodedInput + 2, 0, "fp32", -1, repeatCount, repeatInterval,
         hemi, hemi);
-    if (strategy == FfnScheduleStrategy::Fused) {
-        // A fused task feeds one completed projection tile from one
-        // hemisphere. Feed both mirrored VXM chains so neither physical
-        // output is left on the passive SR path. Only the owner chain is the
-        // authoritative result; the fused stage repairs the sink copy before
-        // Down projection consumes it.
-        const auto source = rewriter.getStringAttr(hemi);
-        head->setAttr("lhs_stream_source", source);
-        head->setAttr("rhs_stream_source", source);
-    }
+    // The encoded 32+ stream ids identify the register column, while the
+    // source attribute selects the physical hemisphere that supplies it.
+    // Tail and fused schedules both issue this mirrored VXM chain, so leaving
+    // the source implicit can make the passive chain consume the peer bundle.
+    const auto source = rewriter.getStringAttr(hemi);
+    head->setAttr("lhs_stream_source", source);
+    head->setAttr("rhs_stream_source", source);
     mlir::Value value = head.getResult();
     value = create_vxm(rewriter, location, value, upValue,
         resultType, cycle, 1, "exp", "previous", 0, 0,

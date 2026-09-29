@@ -69,6 +69,16 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         llvm::SmallVector<PendingResultWrite>> pendingResultWrites;
     const int64_t reductionBlockCount =
         timeline->reduction_block_count;
+    const int64_t pagesPerOutputWave = reductionsPerWeightPage > 0
+        ? (reductionBlockCount + reductionsPerWeightPage - 1)
+            / reductionsPerWeightPage
+        : 0;
+    const auto pageCountAttr = downPlacement.getAs<mlir::IntegerAttr>(
+        "page_count");
+    const bool flattenedDownPages = reductionsPerWeightPage > 0
+        && pageCountAttr
+        && pageCountAttr.getInt()
+            < timeline->wave_count * pagesPerOutputWave;
     const auto sameWeightStorageDomain = [&](int64_t outputWave,
                                               int64_t lhs,
                                               int64_t rhs) {
@@ -76,15 +86,17 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         const int64_t reductionsPerGroup = downPlacement
             .getAs<mlir::IntegerAttr>("page_items_per_slice_group")
             .getInt();
-        const int64_t pagesPerWave =
-            (reductionBlockCount + reductionsPerWeightPage - 1)
-            / reductionsPerWeightPage;
         const auto domainKey = [&](int64_t reduction) {
-            const int64_t page = outputWave * pagesPerWave
-                + reduction / reductionsPerWeightPage;
-            const int64_t group =
-                (reduction % reductionsPerWeightPage)
-                / reductionsPerGroup;
+            const int64_t flatItem = outputWave * reductionBlockCount
+                + reduction;
+            const int64_t page = flattenedDownPages
+                ? flatItem / reductionsPerWeightPage
+                : outputWave * pagesPerOutputWave
+                    + reduction / reductionsPerWeightPage;
+            const int64_t itemInPage = flattenedDownPages
+                ? flatItem % reductionsPerWeightPage
+                : reduction % reductionsPerWeightPage;
+            const int64_t group = itemInPage / reductionsPerGroup;
             return std::pair {page, group};
         };
         return domainKey(lhs) == domainKey(rhs);
@@ -393,11 +405,12 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             "paged Down projection has invalid page geometry");
                         return mlir::failure();
                     }
-                    const int64_t pagesPerWave =
-                        (intermediate / tile + reductionsPerPage - 1)
-                        / reductionsPerPage;
-                    page = outputWave * pagesPerWave
-                        + reduction / reductionsPerPage;
+                    const int64_t flatItem = outputWave
+                        * reductionBlockCount + reduction;
+                    page = flattenedDownPages
+                        ? flatItem / reductionsPerPage
+                        : outputWave * pagesPerOutputWave
+                            + reduction / reductionsPerPage;
                     auto pagePlacement = resolve_page_placement(
                         placement, page);
                     if (mlir::failed(pagePlacement)) {
@@ -407,8 +420,9 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         return mlir::failure();
                     }
                     bank = pagePlacement->bank;
-                    const int64_t reductionInPage =
-                        reduction % reductionsPerPage;
+                    const int64_t reductionInPage = flattenedDownPages
+                        ? flatItem % reductionsPerPage
+                        : reduction % reductionsPerPage;
                     const int64_t sliceGroup =
                         pagePlacement->slice_group_base
                         + reductionInPage / reductionsPerGroup;

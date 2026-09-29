@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -66,15 +67,87 @@ try {
         || !preloadPlans[1].pre_execution)
         throw std::runtime_error(
             "disjoint alternate-bank weight page was not preloaded");
+    auto runtimePrefetchProgram = preloadProgram;
+    runtimePrefetchProgram.weight_page_uses[1].runtime_prefetch = true;
+    std::ostringstream runtimePrefetchBinary(
+        std::ios::out | std::ios::binary);
+    write_binary_program(runtimePrefetchProgram, runtimePrefetchBinary);
+    std::istringstream runtimePrefetchStream(
+        runtimePrefetchBinary.str(), std::ios::in | std::ios::binary);
+    const auto decodedRuntimePrefetch =
+        read_binary_program(runtimePrefetchStream);
+    if (decodedRuntimePrefetch.weight_page_uses.size() != 2
+        || !decodedRuntimePrefetch.weight_page_uses[1].runtime_prefetch)
+        throw std::runtime_error(
+            "runtime-prefetch policy did not survive binary round-trip");
+    const auto runtimePrefetchPlans =
+        plan_weight_prefetches(runtimePrefetchProgram);
+    if (runtimePrefetchPlans.size() != 2
+        || !runtimePrefetchPlans[0].pre_execution
+        || runtimePrefetchPlans[1].pre_execution
+        || runtimePrefetchPlans[1].start_cycle != 0)
+        throw std::runtime_error(
+            "explicit next-epoch page was not left on the runtime timeline");
+    auto initializedOverlapProgram = preloadProgram;
+    BinaryBinding rope;
+    rope.access = BindingAccess::Internal;
+    rope.element_type = BindingElementType::F16;
+    rope.layout = BindingLayout::Fp16RopeTable;
+    rope.base_row = 0;
+    rope.instruction_count = 8;
+    rope.address_stride = 1;
+    rope.slices = alternateBankPreload.slices;
+    rope.hemisphere_mask = 3;
+    rope.bank = 0;
+    rope.initializer = BindingInitializer::RopeTable;
+    initializedOverlapProgram.bindings.push_back(rope);
+    initializedOverlapProgram.timelines.push_back({"rope", 20, 40});
+    const auto initializedOverlapPlans =
+        plan_weight_prefetches(initializedOverlapProgram);
+    if (initializedOverlapPlans.size() != 2
+        || !initializedOverlapPlans[0].pre_execution
+        || initializedOverlapPlans[1].pre_execution
+        || initializedOverlapPlans[1].start_cycle != 40)
+        throw std::runtime_error(
+            "weight page ignored initialized SRAM release timeline");
     auto lowBandwidthHardware = preloadProgram.hardware;
     lowBandwidthHardware.ddr_peak_bandwidth_mbytes_per_second = 12800;
     const auto lowBandwidthPlans =
         plan_weight_prefetches(preloadProgram, lowBandwidthHardware);
     if (lowBandwidthPlans.size() != preloadPlans.size()
         || lowBandwidthPlans[0].transfer_end_cycle
-            <= preloadPlans[0].transfer_end_cycle)
+            != preloadPlans[0].transfer_end_cycle)
         throw std::runtime_error(
-            "runtime DDR bandwidth did not retime weight prefetches");
+            "DDR bandwidth changed the static ICU prefetch timeline");
+
+    BinaryProgram coalescedProgram;
+    auto coalescedFirst = make_weight_binding(1);
+    auto coalescedDisjoint = make_weight_binding(1);
+    coalescedDisjoint.index = 1;
+    coalescedDisjoint.base_row = 16;
+    auto coalescedReplacement = make_weight_binding(1);
+    coalescedReplacement.index = 2;
+    coalescedProgram.bindings = {
+        coalescedFirst, coalescedDisjoint, coalescedReplacement};
+    coalescedProgram.weight_page_uses = {
+        {0, 0, 1, 100, 200},
+        {1, 0, 1, 300, 400},
+        {2, 0, 1, 500, 600},
+    };
+    const auto coalescedPlans =
+        plan_weight_prefetches(coalescedProgram);
+    if (coalescedPlans.size() != 3
+        || coalescedPlans[0].residency_page_index != 0
+        || coalescedPlans[1].residency_page_index != 0
+        || coalescedPlans[2].residency_page_index != 1
+        || coalescedPlans[0].ready_cycle != 100
+        || coalescedPlans[0].release_cycle != 200
+        || !coalescedPlans[0].pre_execution
+        || !coalescedPlans[1].pre_execution
+        || coalescedPlans[2].pre_execution
+        || coalescedPlans[2].start_cycle != 400)
+        throw std::runtime_error(
+            "disjoint fragments did not share a residency page while retaining independent transfers");
 
     BinaryProgram overlappingProgram;
     auto resident = make_weight_binding();
@@ -96,21 +169,26 @@ try {
     auto sharedStreamProgram = overlappingProgram;
     sharedStreamProgram.stream_release_cycles.assign(
         sharedStreamProgram.hardware.encoded_streams, 0);
-    const auto firstSharedWestStream =
-        2 * sharedStreamProgram.hardware.streams_per_direction
-        - sharedStreamProgram.hardware.c2c_streams_per_direction;
-    for (std::size_t lane = 0;
-         lane < sharedStreamProgram.hardware.c2c_streams_per_direction;
-         ++lane)
-        sharedStreamProgram.stream_release_cycles[
-            firstSharedWestStream + lane] = 400;
+    const auto westBase =
+        sharedStreamProgram.hardware.streams_per_direction;
+    for (std::size_t stream = 0;
+         stream < sharedStreamProgram.hardware.streams_per_direction;
+         ++stream)
+        sharedStreamProgram.stream_release_cycles[westBase + stream] = 400;
+    // Four high West streams are already idle at the SRAM reuse boundary.
+    // The linker must start immediately with those four transport lanes
+    // instead of waiting for a fixed contiguous eight-stream range.
+    for (std::size_t stream = 28; stream < 32; ++stream)
+        sharedStreamProgram.stream_release_cycles[westBase + stream] = 0;
     const auto sharedStreamPlans =
         plan_weight_prefetches(sharedStreamProgram);
     if (sharedStreamPlans.size() != 2
         || !sharedStreamPlans[0].pre_execution
-        || sharedStreamPlans[1].start_cycle != 400)
+        || sharedStreamPlans[1].start_cycle != 320
+        || sharedStreamPlans[1].fabric_streams
+            != std::vector<std::uint16_t>({31, 30, 29, 28}))
         throw std::runtime_error(
-            "runtime C2C prefetch overlapped an ordinary West SR stream");
+            "runtime C2C prefetch did not use the idle West SR subset");
 
     BinaryProgram chainedOverlapProgram;
     chainedOverlapProgram.hardware = overlappingProgram.hardware;
@@ -185,6 +263,55 @@ try {
         || earlyAlternateBankPlans[3].start_cycle != 100)
         throw std::runtime_error(
             "alternate-bank page was not launched at its earliest free slot");
+
+    std::vector<WeightPrefetchPlan> sharedTransportPlans(4);
+    sharedTransportPlans[0].ready_cycle = 100;
+    sharedTransportPlans[0].release_cycle = 300;
+    sharedTransportPlans[0].bytes[0] = 128;
+    sharedTransportPlans[0].regions = {{1, 1, 20, 0, 8, false}};
+    sharedTransportPlans[1].ready_cycle = 110;
+    sharedTransportPlans[1].release_cycle = 300;
+    sharedTransportPlans[1].bytes[0] = 128;
+    sharedTransportPlans[1].regions = {{1, 1, 28, 0, 8, false}};
+    sharedTransportPlans[2].ready_cycle = 400;
+    sharedTransportPlans[2].release_cycle = 500;
+    sharedTransportPlans[2].bytes[0] = 128;
+    sharedTransportPlans[2].regions = {{1, 1, 20, 0, 8, false}};
+    sharedTransportPlans[3].ready_cycle = 410;
+    sharedTransportPlans[3].release_cycle = 510;
+    sharedTransportPlans[3].bytes[0] = 128;
+    sharedTransportPlans[3].regions = {{1, 1, 28, 0, 8, false}};
+    schedule_weight_prefetches(
+        chainedOverlapProgram, sharedTransportPlans);
+    if (sharedTransportPlans[2].start_cycle != 300
+        || sharedTransportPlans[3].start_cycle
+            < sharedTransportPlans[2].transfer_end_cycle)
+        throw std::runtime_error(
+            "different C2C coarse instructions overlapped one ICU queue");
+
+    BinaryProgram wideningStreamProgram = overlappingProgram;
+    wideningStreamProgram.stream_release_cycles.assign(
+        wideningStreamProgram.hardware.encoded_streams, 400);
+    for (std::size_t stream = 28; stream < 32; ++stream)
+        wideningStreamProgram.stream_release_cycles[westBase + stream] = 0;
+    for (std::size_t stream = 24; stream < 28; ++stream)
+        wideningStreamProgram.stream_release_cycles[westBase + stream] = 8;
+    std::vector<WeightPrefetchPlan> wideningPlans(2);
+    wideningPlans[0].ready_cycle = 100;
+    wideningPlans[0].release_cycle = 0;
+    wideningPlans[0].bytes[0] = 128;
+    wideningPlans[0].regions = {{1, 1, 20, 0, 8, false}};
+    wideningPlans[1].ready_cycle = 1000;
+    wideningPlans[1].release_cycle = 1100;
+    wideningPlans[1].bytes[0] = 8192;
+    wideningPlans[1].regions = {{1, 1, 20, 0, 8, false}};
+    schedule_weight_prefetches(wideningStreamProgram, wideningPlans);
+    if (wideningPlans[1].start_cycle != 8
+        || wideningPlans[1].fabric_streams
+            != std::vector<std::uint16_t>(
+                {31, 30, 29, 28, 27, 26, 25, 24}))
+        throw std::runtime_error(
+            "C2C planner did not wait briefly for the faster wide stream set");
 
     BinaryProgram program;
     program.bindings.push_back(make_weight_binding());

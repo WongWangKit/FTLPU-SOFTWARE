@@ -99,10 +99,17 @@ void run_overlap_hazard_test()
     const ModelSessionStats& stats = session.stats();
     if (stats.weight_page_prefetches != 2
         || stats.weight_page_deferred_prefetches != 1
-        || stats.weight_page_hidden_prefetches != 0
-        || stats.weight_page_boundary_wait_cycles == 0)
+        || stats.weight_page_hidden_prefetches != 1
+        || stats.weight_page_boundary_wait_cycles != 0)
         throw std::runtime_error(
-            "session did not defer an overlapping next-bank weight page");
+            "session did not defer and then hide an overlapping next-bank weight page: "
+            "prefetches=" + std::to_string(stats.weight_page_prefetches)
+            + " deferred="
+            + std::to_string(stats.weight_page_deferred_prefetches)
+            + " hidden="
+            + std::to_string(stats.weight_page_hidden_prefetches)
+            + " boundary_wait="
+            + std::to_string(stats.weight_page_boundary_wait_cycles));
 }
 
 void run_resident_then_page_test()

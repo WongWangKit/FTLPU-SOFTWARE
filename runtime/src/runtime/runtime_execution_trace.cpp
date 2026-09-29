@@ -275,6 +275,16 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
             static_cast<std::int64_t>(physicalCycle + duration),
             std::move(resource), std::move(detail));
     };
+    const auto recordEventWait = [&](const auto& queue,
+                                     std::string location) {
+        if (queue.last_trace().action != IcuQueueAction::EventWait)
+            return false;
+        if (queue.last_trace().issue_pc.has_value())
+            location += " pc="
+                + std::to_string(*queue.last_trace().issue_pc);
+        record("ICU.PageReadyWait", std::move(location));
+        return true;
+    };
 
     if (!programIssueEnabled) {
         std::ostringstream detail;
@@ -309,6 +319,9 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
             switch (ref.kind) {
             case QueueKind::Mem: {
                 const auto& queue = icu.mem_iq(ref.index);
+                if (recordEventWait(queue,
+                        "queue=mem index=" + std::to_string(ref.index)))
+                    break;
                 const auto* instruction = last_issued(queue);
                 if (instruction == nullptr) break;
                 auto [resource, detail] = describe_mem(ref.index,
@@ -320,6 +333,12 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
             case QueueKind::MxmLoad:
             case QueueKind::MxmCompute: {
                 const auto sampleMxm = [&](const auto& queue) {
+                    if (recordEventWait(queue,
+                            std::string("queue=")
+                                + (ref.kind == QueueKind::MxmLoad
+                                      ? "mxm_load" : "mxm_compute")
+                                + " index=" + std::to_string(ref.index)))
+                        return;
                     const auto* instruction = last_issued(queue);
                     if (instruction == nullptr) return;
                     auto [resource, detail] = describe_mxm(ref.index,
@@ -336,6 +355,10 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
             case QueueKind::MxmDequant: {
                 const auto& queue =
                     icu.mxm_dequant_iq(physicalMxmIndex());
+                if (recordEventWait(queue,
+                        "queue=mxm_dequant index="
+                            + std::to_string(ref.index)))
+                    break;
                 const auto* instruction = last_issued(queue);
                 if (instruction == nullptr) break;
                 const bool east = ref.index < mxms_per_hemisphere_;
@@ -347,6 +370,9 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
             }
             case QueueKind::Vxm: {
                 const auto& queue = icu.vxm_iq(ref.index);
+                if (recordEventWait(queue,
+                        "queue=vxm index=" + std::to_string(ref.index)))
+                    break;
                 const auto* packet = last_issued(queue);
                 if (packet == nullptr) break;
                 const auto decoded =
@@ -364,16 +390,25 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
             case QueueKind::SxmTranspose:
             case QueueKind::SxmPermute: {
                 const auto side = static_cast<Hemisphere>(ref.index);
-                const auto& queue = ref.kind == QueueKind::SxmTranspose
-                    ? icu.sxm_transpose_iq(side)
-                    : icu.sxm_permute_iq(side);
-                if (last_issued(queue) == nullptr) break;
-                record(std::string("SXM.")
-                        + (side == Hemisphere::East ? "E." : "W.")
-                        + (ref.kind == QueueKind::SxmTranspose
-                                  ? "Transpose" : "Permute"),
-                    with_issue_pc(ref.kind == QueueKind::SxmTranspose
-                            ? "transpose" : "permute", queue));
+                const auto recordSxm = [&](const auto& queue,
+                                           const char* queueName,
+                                           const char* unitName) {
+                    if (recordEventWait(queue,
+                            std::string("queue=") + queueName
+                                + " index=" + std::to_string(ref.index)))
+                        return;
+                    if (last_issued(queue) == nullptr) return;
+                    record(std::string("SXM.")
+                            + (side == Hemisphere::East ? "E." : "W.")
+                            + unitName,
+                        with_issue_pc(queueName, queue));
+                };
+                if (ref.kind == QueueKind::SxmTranspose)
+                    recordSxm(icu.sxm_transpose_iq(side),
+                        "sxm_transpose", "Transpose");
+                else
+                    recordSxm(icu.sxm_permute_iq(side),
+                        "sxm_permute", "Permute");
                 break;
             }
             case QueueKind::C2cDma:
@@ -550,7 +585,6 @@ void MemExecutionTrace::sample(TspSliceSystem& system,
     const auto cycle = cycle_offset_
         + static_cast<std::int64_t>(physicalCycle);
     auto& icu = system.icu();
-
     const auto addIcu = [&](std::size_t queueIndex,
                             const auto& queue,
                             const char* source,

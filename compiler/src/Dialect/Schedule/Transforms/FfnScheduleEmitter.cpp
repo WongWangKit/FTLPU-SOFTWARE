@@ -116,14 +116,13 @@ int64_t native4WeightTransferCycles(
     const int64_t c2cCycles =
         (sideBytes + lanes * bytesPerLane - 1)
         / (lanes * bytesPerLane);
-    const auto& external = target.external_memory();
-    const int64_t queueDrain =
-        (external.ddr_request_queue_depth + lanes - 1) / lanes;
-    const int64_t transportGuard = queueDrain
-        + target.streams().mem_boundary_register_columns
+    // Only deterministic on-chip transport belongs in the compiled FFN
+    // timeline. DDR service time is variable and is enforced by the runtime
+    // page-ready event at the first consumer.
+    const int64_t transportGuard =
+        target.streams().mem_boundary_register_columns
         + target.throughput().tile_rows + lanes;
-    return std::max(target.external_read_transfer_cycles(bytes), c2cCycles)
-        + transportGuard;
+    return c2cCycles + transportGuard;
 }
 
 mlir::FailureOr<Native4ProjectionResult> emitNative4Projection(
@@ -141,7 +140,13 @@ mlir::FailureOr<Native4ProjectionResult> emitNative4Projection(
         return mlir::failure();
     const int64_t waveStages = target.throughput().tile_rows
         + target.throughput().mxm_block_rows / 2 + 2;
-    const int64_t reductionInterval = localWaves + waveStages + 4;
+    // The array tail only has to drain once, after the final reduction.  The
+    // next activation load can start as soon as the previous reduction has
+    // issued its last output wave; its four-cycle local-load latency fills
+    // the interval before the next compute domain.  Charging waveStages on
+    // every reduction created a ten-cycle idle hole in the physical MXM ICU.
+    const int64_t reductionInterval =
+        localWaves + target.throughput().tile_rows;
     auto weightSlices = schedule::ffn_detail::get_slices(weightRoute.getPlacement());
     if (weightSlices.size() != 32) return mlir::failure();
     int64_t weightReadLatency = 0;

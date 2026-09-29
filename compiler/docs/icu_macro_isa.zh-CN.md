@@ -17,12 +17,13 @@
 | MXM dequant | `DEQUANT_3D` | 连续 2 个 128-bit word |
 | MXM compute | `COMPUTE_3D`、`ACCUMULATOR_READ_3D` | 连续 2 个 128-bit word |
 | VXM | `RUN_2D` + 96-bit compact config | 连续 3 个 96-bit word |
-| SXM | `RUN_2D` + 416-bit tile-local config | 连续 6 个 96-bit word |
+| SXM transpose | `RUN_2D` + stream base + input-row selector | 连续 2 个 96-bit word |
+| SXM permute | `RUN_2D` + stream base + 32-lane map + output selector | 连续 4 个 96-bit word |
 
 队列类型直接决定 decoder，因此这些包不携带共享的 MEM/MXM unit selector，也
 不采用统一 320-bit 格式。每个本地 iMEM entry 就是一个物理 96-bit 或 128-bit
 word，所以一条完整 MEM 3D 或 VXM 包占 3 槽，一条完整 MEM 同步写或 MXM 包
-占 2 槽，一条完整 SXM 包占 6 槽。
+占 2 槽；SXM transpose 占 2 槽，SXM permute 占 4 槽。
 
 `MEM_SLICE_PROGRAM` 尚未冻结硬件包布局。旧 `VXM_STREAM_ND` 和
 `SXM_TILE_PROGRAM` 仍是兼容文件格式，但其 rank 不超过 2、无操作数归纳的
@@ -410,18 +411,24 @@ config，VXM 自己执行其中的 `repeat_count` 个连续元素。这样不会
 `VXM_STREAM_ND` 现在只是旧文件兼容描述符。rank 1/2 且无操作数归纳的输入会
 闭式映射为上述 `RUN_2D`；rank 3 会被拒绝，因为 VXM 没有第三个外层 counter。
 
-### SXM：RUN_2D，6 x 96 bit
+### SXM：队列专用 RUN_2D
 
-SXM 的 tile-local payload 是现有 416-bit 编码，保留 transpose/permute opcode、
-stream 列表、row/tile selector、16-lane tile map 和 32-lane permute map。
-`RUN_2D` 在它前面放入与 VXM 相同的 104-bit 两维 launch 域：24-bit `wait_cycle`、
-两个 count 和两个 cycle stride。对 permute，`P[521:520]` 表示每次 launch
-按 8 lane 为单位旋转 map，可把 Qwen 中四个反复出现的 permutation phase 合成
-一个循环；`P[523:522]` 保留且必须为 0。
+Transpose 和 Permute 是两条独立物理 ICU 队列，队列身份已经确定操作类型，包内不再
+编码 opcode，也不再携带另一条队列才会使用的字段。两种包都先保存 104-bit 两维
+launch 域：24-bit `wait_cycle`、两个 count 和两个 cycle stride。
 
-SXM 包有 6 个 word，所以 FU-local header 用 `[4:2]` 三位 word index；队列类型
-已经确定 SXM，header 不再重复 local operation，tile opcode 保留在 payload 内。
-每条物理 SXM 队列只有一个 512-bit decoded context。
+Transpose 在 `P[119:104]` 只保存 6-bit source base、6-bit destination base 和
+4-bit input-row selector。全行操作隐含 16 条连续输入 stream；单行操作隐含两条
+连续输入 stream；输出固定为 16 条连续 stream。整个包占 2 x 96 bit，decoded
+context 为 256 bit。
+
+Permute 在 `P[115:104]` 保存两个 6-bit stream base，在 `P[275:116]` 保存完整
+32 x 5-bit permute map，在 `P[282:276]` 保存 output-row/output-tile selector，
+`P[284:283]` 保存按 8 lane 为单位的每次 launch map 旋转量。输入和输出数量都
+隐含为 16 条连续 stream。整个包占 4 x 96 bit，decoded context 为 384 bit。
+
+因此旧通用 SXM config 中的 shift、16-lane tile map、显式 stream count、无关
+selector 和重复 opcode 都不会进入这两条硬件 ICU 指令。
 
 旧 `SXM_TILE_PROGRAM` 的 rank 1/2、无 operand induction 子集会闭式映射为该
 `RUN_2D`。rank 3 或带 instruction-field induction 的描述符会被拒绝。
@@ -503,7 +510,8 @@ binary 大小 1,055,197 bytes；展开 FU 发射数保持 6,646,042。
 VXM/SXM 路径使用同一原则：`materializeVxmRun2DCommand` 和
 `materializeSxmRun2DCommand` 接收已经由 shape、placement 和闭式 timeline
 确定的两维 launch 域，直接生成 `command.vxm_run_2d` 或
-`command.sxm_run_2d`。CommandBinary 原样写入 3 或 6 个物理 word。端到端测试
+`command.sxm_run_2d`。CommandBinary 原样写入 VXM 的 3 个、SXM transpose 的
+2 个或 SXM permute 的 4 个物理 word。端到端测试
 检查了 raw bit、iMEM 槽数、单 context 占用和全部 launch cycle。
 
 ## 旧文件兼容
@@ -654,8 +662,8 @@ binary 装入 FU raw-word 队列时会被拒绝。
 ## 本地 ICU 执行约束
 
 raw 队列的每个本地 iMEM entry 取一个物理 word，并在队首识别 FU loop header。
-激活以整包为原子：MEM 3D/VXM 的 3 个 word、MEM 同步写/MXM 的 2 个 word 或
-SXM 的 6 个 word 必须全部可用，且
+激活以整包为原子：MEM 3D/VXM 的 3 个 word、MEM 同步写/MXM/SXM transpose
+的 2 个 word，或 SXM permute 的 4 个 word 必须全部可用，且
 header 一致。decoder 锁存队列唯一的 active context，按 FU 类型推进两个或三个
 counter，每 cycle 最多向 FU 发射一条原生指令；当前循环退出后才激活下一条 packet。
 
@@ -668,6 +676,6 @@ interval 重叠都会报错。每条物理 FU 队列的容量与调度约束都�
 （3 x 96 bit）和 `MEM_WRITE_SYNC`（2 x 96 bit），以及 MXM `LOAD_3D`、
 `DEQUANT_3D`、`COMPUTE_3D`、
 `ACCUMULATOR_READ_3D`（2 x 128 bit）、VXM `RUN_2D`（3 x 96 bit），以及 SXM
-`RUN_2D`（6 x 96 bit）。旧
+transpose `RUN_2D`（2 x 96 bit）和 SXM permute `RUN_2D`（4 x 96 bit）。旧
 Macro/STREAM_ND 记录只作为 closed-form adapter 的兼容文件输入。
 `MEM_SLICE_PROGRAM` 仍需定义硬件包，之后才能视为 raw ICU 指令。

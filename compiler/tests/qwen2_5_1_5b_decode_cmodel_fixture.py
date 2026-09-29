@@ -32,20 +32,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--capacity", type=int, default=256)
+    parser.add_argument("--past-len", type=int, default=PREFILL)
     args = parser.parse_args()
-    if args.capacity < PREFILL + 1:
+    if args.past_len <= 0:
+        raise ValueError("decode past length must be positive")
+    if args.capacity < args.past_len + 1:
         raise ValueError("KV capacity must hold the prefill and decode token")
 
-    activation, norm0, norm1, weights, scales, config, biases = make_fixture()
+    activation, norm0, norm1, weights, scales, config, biases = make_fixture(
+        args.past_len
+    )
     prefill_key, prefill_value = decoder_layer_prefill_kv_reference(
-        activation[:PREFILL], norm0, weights, scales, config, biases
+        activation[:args.past_len], norm0, weights, scales, config, biases
     )
     stages: dict[str, np.ndarray] = {}
     output, present_key, present_value = decoder_layer_decode_reference(
-        activation[PREFILL:],
+        activation[args.past_len:],
         prefill_key,
         prefill_value,
-        PREFILL,
+        args.past_len,
         norm0,
         norm1,
         weights,
@@ -58,11 +63,14 @@ def main() -> None:
     state_shape = (args.capacity, KV_HEADS, HEAD_DIM)
     past_key = np.zeros(state_shape, dtype=np.float32)
     past_value = np.zeros(state_shape, dtype=np.float32)
-    past_key[:PREFILL] = prefill_key
-    past_value[:PREFILL] = prefill_value
+    past_key[:args.past_len] = prefill_key
+    past_value[:args.past_len] = prefill_value
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    write_bf16(args.output_dir / "input.bf16.bin", activation[PREFILL:PREFILL + 1])
+    write_bf16(
+        args.output_dir / "input.bf16.bin",
+        activation[args.past_len:args.past_len + 1],
+    )
     write_bf16(args.output_dir / "golden.bf16.bin", output)
     write_bf16(args.output_dir / "input_layernorm.bf16.bin", norm0)
     write_bf16(args.output_dir / "post_attention_layernorm.bf16.bin", norm1)
@@ -90,7 +98,8 @@ def main() -> None:
 
     print(
         "Qwen2.5 decode CModel fixture generated: "
-        f"past={PREFILL}, position={PREFILL}, capacity={args.capacity}, "
+        f"past={args.past_len}, position={args.past_len}, "
+        f"capacity={args.capacity}, "
         f"output={output.shape}, cache={present_key.shape}"
     )
 

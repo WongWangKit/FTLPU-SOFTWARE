@@ -137,24 +137,44 @@ def main() -> None:
     rope_staging_bank, rope_staging_base, rope_staging_slices = (
         flat_memory_plan_placement(stream_text, "rope_staging")
     )
-    staging_mirror_bank, staging_mirror_base, staging_mirror_slices = (
-        flat_memory_plan_placement(stream_text, "rope_staging_mirror")
-    )
-    mirror_spare_slices = staging_mirror_slices - rope_staging_slices
+    has_staging_mirror = "rope_staging_mirror = {" in stream_text
+    if has_staging_mirror:
+        staging_mirror_bank, staging_mirror_base, staging_mirror_slices = (
+            flat_memory_plan_placement(stream_text, "rope_staging_mirror")
+        )
+        mirror_spare_slices = staging_mirror_slices - rope_staging_slices
+    else:
+        # When all attention weights occupy one bank, Q's ordinary staging
+        # queues are already disjoint from the weight epoch.  No physical
+        # staging mirror is needed or emitted.
+        staging_mirror_bank = rope_staging_bank
+        staging_mirror_base = -1
+        staging_mirror_slices = frozenset()
+        mirror_spare_slices = frozenset()
     bias_bank, _, bias_slices = flat_memory_plan_placement(
         stream_text, "query_bias"
     )
     mirror_bank, _, mirror_slices = flat_memory_plan_placement(
         stream_text, "rope_mirror"
     )
-    if ((bias_bank, bias_slices) != (0, frozenset(range(42, 46)))
-            or (mirror_bank, mirror_slices) !=
-            (0, frozenset(range(46, 50)))
-            or (staging_mirror_bank, mirror_spare_slices) !=
-            (0, frozenset({28, 29, 30, 32}))
-            or len(staging_mirror_slices) != 16
-            or staging_mirror_base < 384
-            or staging_mirror_base + 4 * 32 > staging_base):
+    scratch_bank = (args.weight_bank + 1) % 2
+    mirror_layout_invalid = (
+        has_staging_mirror
+        and ((staging_mirror_bank, mirror_spare_slices) !=
+             (scratch_bank, frozenset({28, 29, 30, 32}))
+             or len(staging_mirror_slices) != 16
+             or staging_mirror_base < 384
+             or staging_mirror_base + 4 * 32 > staging_base)
+    )
+    expected_bias = ((scratch_bank, frozenset({42, 43, 44, 45}))
+                     if has_staging_mirror else
+                     (scratch_bank, frozenset({12, 13, 14, 15})))
+    expected_mirror = ((scratch_bank, frozenset({46, 47, 48, 49}))
+                       if has_staging_mirror else
+                       (scratch_bank, frozenset({0, 1, 2, 3})))
+    if ((bias_bank, bias_slices) != expected_bias
+            or (mirror_bank, mirror_slices) != expected_mirror
+            or mirror_layout_invalid):
         raise AssertionError(
             "Q bias, mirrored RoPE table and staging remap must avoid "
             "pre-execution weight-page slices and each other: "
@@ -162,11 +182,13 @@ def main() -> None:
             f"table={(mirror_bank, sorted(mirror_slices))}, "
             f"staging_mirror={(staging_mirror_bank, staging_mirror_base, sorted(staging_mirror_slices))}"
         )
-    preloaded_bank0_slices = set(range(20, 28)) | {
-        31, 33, 34, 35, 37, 38, 39, 41,
-    }
-    if not (bias_slices | mirror_slices | mirror_spare_slices).isdisjoint(
-            preloaded_bank0_slices):
+    preloaded_weight_slices = set(range(20, 44))
+    if ((bias_bank == args.weight_bank
+         and not (bias_slices | mirror_slices)
+         .isdisjoint(preloaded_weight_slices))
+            or (staging_mirror_bank == args.weight_bank
+                and not mirror_spare_slices.isdisjoint(
+                    preloaded_weight_slices))):
         raise AssertionError("Q constants or staging overlap a preloaded page")
     if (len(staging_slices) != 2 or len(pong_slices) != 2
             or not staging_slices.isdisjoint(pong_slices)
@@ -217,6 +239,7 @@ def main() -> None:
     rmsnorm_restore_ends: list[int] = []
     ffn_weight_first_cycles: dict[int, int | None] = {10: None, 11: None}
     ffn_projection_weight_reads: dict[int, int] = {10: 0, 11: 0}
+    ffn_projection_weight_workloads: dict[int, int] = {10: 0, 11: 0}
     ffn_projection_blocked_reads: dict[int, int] = {10: 0, 11: 0}
     ffn_projection_hazard_waves: dict[int, dict[int, int]] = {
         10: {}, 11: {},
@@ -231,6 +254,7 @@ def main() -> None:
     o_projection_weight_domains: dict[tuple[int, int], int] = {}
     swish_output_workloads: dict[str, int] = {}
     swish_write_workloads: dict[str, dict[tuple[str, int], int]] = {}
+    direct_swish_write_workloads: dict[tuple[str, int], int] = {}
     fused_hidden_locations: list[tuple[int, int, frozenset[int]]] = []
     ffn_input_allocation: tuple[str, int, int, int, frozenset[int]] | None = None
     rope_product_intervals: list[tuple[int, int]] = []
@@ -396,13 +420,35 @@ def main() -> None:
                 hemisphere = integer_attr(line, "hemisphere")
                 address = integer_attr(line, "address")
                 queue = (hemisphere, slice_id, bank)
-                if (hemisphere == 0 and slice_id == 0 and bank == 1
+                packed_stream = integer_attr(line, "packed_stream", -1)
+                if (args.ffn_schedule == "fused"
+                        and 'opcode = "write"' in line
+                        and bank == args.weight_bank
+                        and address in (192, 200)
+                        and slice_id < 16
+                        and packed_stream in (6, 7, 14, 15)
+                        and integer_attr(line, "repeat_count", 1) == 4
+                        and integer_attr(line, "repeat_interval", 1) == 8
+                        and integer_attr(line, "wave_count", 1) == 70
+                        and integer_attr(line, "wave_interval", 1) == 32
+                        and integer_attr(line, "group_count", 1) == 2
+                        and integer_attr(line, "group_interval", 1) == 2240):
+                    route = ("east" if hemisphere == 0 else "west",
+                             packed_stream)
+                    direct_swish_write_workloads[route] = (
+                        direct_swish_write_workloads.get(route, 0)
+                        + integer_attr(line, "repeat_count", 1)
+                        * integer_attr(line, "wave_count", 1)
+                        * integer_attr(line, "group_count", 1)
+                    )
+                if (hemisphere == 0 and slice_id == 0
+                        and bank == args.weight_bank
                         and address == 0 and 'opcode = "read"' in line
                         and integer_attr(line, "packed_stream") == 16
                         and integer_attr(line, "repeat_count", 1) == 4
                         and integer_attr(line, "wave_count", 1) == 48
                         and integer_attr(line, "group_interval", 1) == 1536
-                        and integer_attr(line, "group_count", 1) in (84, 56)):
+                        and integer_attr(line, "group_count", 1) == 140):
                     ffn_activation_page_domains.append((
                         integer_attr(line, "cycle"),
                         integer_attr(line, "group_count"),
@@ -410,7 +456,8 @@ def main() -> None:
                 if (slice_id in rope_staging_slices | mirror_spare_slices
                         and ((rope_staging_base <= address <
                               rope_staging_base + 4 * 32)
-                             or (staging_mirror_base <= address <
+                             or (has_staging_mirror
+                                 and staging_mirror_base <= address <
                                  staging_mirror_base + 4 * 32))):
                     if (bank == staging_mirror_bank
                             and staging_mirror_base <= address <
@@ -570,6 +617,11 @@ def main() -> None:
                     continue
                 ffn_projection_weight_reads[binding] += 1
                 group_count = integer_attr(line, "group_count", 1)
+                ffn_projection_weight_workloads[binding] += (
+                    group_count
+                    * integer_attr(line, "wave_count", 1)
+                    * integer_attr(line, "outer_group_size", 1)
+                )
                 if group_count > 1:
                     for field in ("outer_group_size", "outer_inner_stride",
                                   "outer_group_stride"):
@@ -756,7 +808,7 @@ def main() -> None:
         for hemisphere in range(2)
         for slice_id in rope_staging_slices
     }
-    if (len(rope_staging_slices) != 16
+    if has_staging_mirror and (len(rope_staging_slices) != 16
             or set(q_write_read_domains) != expected_q_write_read_queues
             or any(len(domains) != 12
                    for domains in q_write_read_domains.values())
@@ -767,7 +819,7 @@ def main() -> None:
             "output group and physical rope-staging queue: "
             f"observed={{{', '.join(f'{queue}: {len(domains)}' for queue, domains in sorted(q_write_read_domains.items()))}}}"
         )
-    for queue, streams in q_copy_streams.items():
+    for queue, streams in q_copy_streams.items() if has_staging_mirror else ():
         ordered = sorted(streams)
         slice_id = queue[1]
         if (len(ordered) != 12
@@ -778,20 +830,23 @@ def main() -> None:
                 "Q copy must use E/W8..23 until its final output group, "
                 f"then E/W0..15 before V activation: {queue}: {ordered}"
             )
-    q_last_pair_end = max(end for domains in q_write_read_domains.values()
-                          for _, end, _ in domains)
+    q_last_pair_end = (max(
+        end for domains in q_write_read_domains.values()
+        for _, end, _ in domains
+    ) if q_write_read_domains else qkv_interval[1])
     q_staging_reads = [
         (hemisphere, slice_id, bank, address)
         for cycle, hemisphere, slice_id, bank, address, opcode
         in q_staging_accesses
-        if cycle < q_last_pair_end and opcode == "read"
+        if qkv_interval[0] <= cycle < q_last_pair_end
+        and opcode == "read"
     ]
     local_reads = 0
     mirrored_reads = 0
     for hemisphere, _, bank, address in q_staging_reads:
         # The four output blocks reuse FIFO row offsets for every Q head, so
         # the source hemisphere cannot be inferred from the address alone.
-        is_mirror_address = (
+        is_mirror_address = (has_staging_mirror and
             staging_mirror_base <= address < staging_mirror_base + 4 * 32
         )
         expected_bank = (staging_mirror_bank if is_mirror_address
@@ -808,7 +863,7 @@ def main() -> None:
             mirrored_reads += 1
     q_mirror_writes = [
         access for access in q_staging_accesses
-        if access[0] < q_last_pair_end + 32
+        if qkv_interval[0] <= access[0] < q_last_pair_end + 32
         and access[3] == (rope_staging_bank + 1) % 2
         and access[5] == "write"
     ]
@@ -816,9 +871,12 @@ def main() -> None:
         access for access in q_mirror_writes
         if access[2] in mirror_spare_slices
     ]
-    if (not local_reads or not mirrored_reads
-            or len(q_mirror_writes) != 12 * 32 * 2
-            or len(remapped_mirror_writes) != 12 * 4 * 4):
+    mirror_behavior_invalid = has_staging_mirror and (
+        not local_reads or not mirrored_reads
+        or len(q_mirror_writes) != 12 * 32 * 2
+        or len(remapped_mirror_writes) != 12 * 4 * 4
+    )
+    if mirror_behavior_invalid:
         raise AssertionError(
             "Q staging mirror did not use bank 0 writes and matching "
             "bank 0 Product A/B reads: "
@@ -938,12 +996,17 @@ def main() -> None:
     up_first = ffn_weight_first_cycles[11]
     if gate_first is None or up_first is None:
         raise AssertionError("Schedule IR is missing Gate/Up paged weight reads")
-    expected_projection_reads = {10: 96, 11: 96}
-    if ffn_projection_weight_reads != expected_projection_reads:
+    expected_projection_reads = {10: 64, 11: 64}
+    expected_projection_workloads = {10: 215_040, 11: 215_040}
+    if (ffn_projection_weight_reads != expected_projection_reads
+            or ffn_projection_weight_workloads
+            != expected_projection_workloads):
         raise AssertionError(
             "Gate/Up weight reads were not emitted as maximal closed 3-D "
             f"domains: observed={ffn_projection_weight_reads}, "
-            f"expected={expected_projection_reads}"
+            f"expected={expected_projection_reads}, "
+            f"workloads={ffn_projection_weight_workloads}, "
+            f"expected_workloads={expected_projection_workloads}"
         )
     expected_blocked_reads = {10: 64, 11: 64}
     if ffn_projection_blocked_reads != expected_blocked_reads:
@@ -952,22 +1015,21 @@ def main() -> None:
             f"boundaries: observed={ffn_projection_blocked_reads}, "
             f"expected={expected_blocked_reads}"
         )
-    expected_hazard_waves = {
-        10: {2: 16, 46: 16},
-        11: {2: 16, 46: 16},
-    }
+    # Adjacent pages live in different banks, so the former 2+46 reuse split
+    # is unnecessary: all page/slice-group work stays in the blocked domains.
+    expected_hazard_waves = {10: {}, 11: {}}
     if ffn_projection_hazard_waves != expected_hazard_waves:
         raise AssertionError(
-            "Gate/Up closed domains lost the real two-buffer reuse hazard: "
+            "Gate/Up closed domains unexpectedly retained a page-bank split: "
             f"observed={ffn_projection_hazard_waves}, "
             f"expected={expected_hazard_waves}"
         )
     ordered_activation_pages = sorted(ffn_activation_page_domains)
     if ([count for _, count in ordered_activation_pages]
-            != [84, 56, 84, 56]):
+            != [140, 140]):
         raise AssertionError(
-            "Gate/Up activation READ_3D domains do not stop at dynamic "
-            "weight-page boundaries: "
+            "Gate/Up activation READ_3D domains are not one full projection "
+            "per bank-resident page: "
             f"observed={ordered_activation_pages}"
         )
     required_swish_routes = {
@@ -987,14 +1049,28 @@ def main() -> None:
                 "output_workload": workload,
                 "write_workloads": mismatches,
             }
-    if (args.ffn_schedule == "fused"
-            and (total_swish_workload <= 0 or invalid_swish_coverage)):
-        raise AssertionError(
-            "FFN Swish queue-7 output workload is not fully consumed by "
-            "W6/W7 and E14/E15 hidden writes: "
-            f"total_output_workload={total_swish_workload}, "
-            f"invalid={invalid_swish_coverage}"
-        )
+    if args.ffn_schedule == "fused":
+        expected_direct_swish_workloads = {
+            route: total_swish_workload // 2 for route in required_swish_routes
+        }
+        if total_swish_workload <= 0 or (
+                direct_swish_write_workloads
+                and direct_swish_write_workloads
+                != expected_direct_swish_workloads):
+            raise AssertionError(
+                "FFN direct Swish WRITE_3D domains do not cover W6/W7 and "
+                "E14/E15 exactly: "
+                f"total_output_workload={total_swish_workload}, "
+                f"observed={direct_swish_write_workloads}, "
+                f"expected={expected_direct_swish_workloads}"
+            )
+        if not direct_swish_write_workloads and invalid_swish_coverage:
+            raise AssertionError(
+                "FFN Swish queue-7 output workload is not fully consumed by "
+                "W6/W7 and E14/E15 hidden writes: "
+                f"total_output_workload={total_swish_workload}, "
+                f"invalid={invalid_swish_coverage}"
+            )
     if args.ffn_schedule == "fused":
         if ffn_input_allocation is None or not fused_hidden_locations:
             raise AssertionError(
@@ -1013,16 +1089,16 @@ def main() -> None:
                     f"bank={hidden_bank}, row={hidden_base}, "
                     f"slices={sorted(hidden_slices & input_slices)}"
                 )
-    if up_first >= gate_first:
+    if gate_first >= up_first:
         raise AssertionError(
-            "FFN did not schedule the resident Up projection before the "
-            f"refilled Gate projection: up={up_first}, gate={gate_first}"
+            "FFN did not schedule Gate from bank A before Up from bank B: "
+            f"gate={gate_first}, up={up_first}"
         )
     second_rms_end = rmsnorm_restore_ends[-1]
-    if up_first - second_rms_end > 256:
+    if gate_first - second_rms_end > 256:
         raise AssertionError(
             "FFN retained a large idle window after the second RMSNorm: "
-            f"rms_end={second_rms_end}, first_up={up_first}"
+            f"rms_end={second_rms_end}, first_gate={gate_first}"
         )
     if bias_bindings != {"query_bias", "key_bias", "value_bias"}:
         raise AssertionError(
@@ -1153,9 +1229,9 @@ def main() -> None:
         flush=True,
     )
     print(
-        "FFN resident-first: "
-        f"second RMS end={second_rms_end}, first Up read={up_first}, "
-        f"first Gate read={gate_first}",
+        "FFN bank ping-pong: "
+        f"second RMS end={second_rms_end}, first Gate/A read={gate_first}, "
+        f"first Up/B read={up_first}",
         flush=True,
     )
 
@@ -1169,9 +1245,9 @@ def main() -> None:
         3: 1,   # key projection
         4: 1,   # value projection
         5: 1,   # output projection
-        10: 2,  # gate projection
-        11: 2,  # up projection
-        12: 12,  # down projection
+        10: 1,  # gate projection, bank A
+        11: 1,  # up projection, bank B
+        12: 4,  # down projection, three output waves per slice group
     }
     binding_page_banks: dict[int, list[int]] = {}
     for line in command_text.splitlines():
@@ -1260,7 +1336,12 @@ def main() -> None:
             "mxm_compute_3d", "vxm_run_2d", "sxm_run_2d",
         )
     }
-    if any(count == 0 for count in raw_counts.values()):
+    required_raw_packets = set(raw_counts)
+    if not has_staging_mirror:
+        # WRITE_READ_2D is the Q staging-mirror copy primitive.  The
+        # single-bank attention epoch does not allocate that mirror.
+        required_raw_packets.remove("mem_write_read_2d")
+    if any(raw_counts[name] == 0 for name in required_raw_packets):
         raise AssertionError(
             f"Qwen2.5 direct lowering is missing raw FU packets: {raw_counts}"
         )

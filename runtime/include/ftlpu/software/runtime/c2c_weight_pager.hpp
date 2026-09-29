@@ -30,6 +30,12 @@ struct C2cWeightPage {
     // Ordinary westbound SR range used after the C2C receive lanes. When
     // absent, the pager retains the target's conventional high stream range.
     std::optional<std::uint16_t> fabric_stream_base{};
+    // Optional lane-to-SR mapping.  The C2C transport lane number and the
+    // ordinary West SR number are independent hardware fields, so a linked
+    // page may use any statically idle subset instead of waiting for one
+    // fixed contiguous range.  When present this takes precedence over
+    // fabric_stream_base and its size is the number of active C2C lanes.
+    std::vector<std::uint16_t> fabric_streams{};
 };
 
 struct C2cWeightPageStats {
@@ -136,6 +142,10 @@ public:
     std::size_t earliest_schedule_cycle(
         const C2cWeightPage& page) const;
     bool started(const C2cWeightPageFence& fence) const;
+    // True once DDR/RX/MEM data movement and the distributed MEM write pipe
+    // have completed.  The MEM ICU reservation may remain live until the
+    // compiler-selected consumer boundary.
+    bool transport_ready(const C2cWeightPageFence& fence) const;
     bool ready(const C2cWeightPageFence& fence) const;
     bool busy() const noexcept;
     bool ready() const;
@@ -159,6 +169,7 @@ private:
     struct LinkedMemWindow {
         std::size_t begin{0};
         std::size_t end{0};
+        std::size_t page_ready_event_tag{0};
         std::vector<InstructionControlUnit::MemIcu::
             EncodedSynchronizedPacket> packets{};
     };

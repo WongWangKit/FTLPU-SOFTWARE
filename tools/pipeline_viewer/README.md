@@ -13,6 +13,13 @@ kinds of CSV trace:
 Open `index.html` and load either format. Performance and pipeline validation
 should use the runtime execution trace.
 
+When the viewer is served over HTTP, `?csv=/path/to/trace.csv` loads a trace
+automatically. For example:
+
+```text
+http://127.0.0.1:8765/tools/pipeline_viewer/index.html?csv=/results/run/pipeline.csv
+```
+
 ## Cycle-accurate MEM viewer
 
 `mem.html` is a dedicated dynamic view of every physical MEM port. Each
@@ -73,8 +80,9 @@ without reconstructing a fine-command stream.
 In an execution trace, `C2C.E.Prefetch`, `C2C.W.Prefetch`, shared-SR, and
 `MEM.*.C2CWrite` intervals come from completed CModel DMA/RX/MEM-write work.
 Their details carry `source=runtime`, `consumer_cycle`, and `actual_ready`.
-When a page finishes late, `ICU.PageReadyWait` shows the physical-cycle interval
-for which compute-side ICU issue was held at the synchronization barrier.
+When an execution epoch's resource set finishes late, `ICU.PageReadyWait`
+shows the physical-cycle interval for which that individual ICU queue waited
+at its tagged boundary. It does not represent a chip-wide issue gate.
 Offline-plan rows retain `planned=true` and are bandwidth-model predictions.
 
 `C2C.E/W.DMA` are the DDR-to-C2C DMA command-issue rows for the east and west

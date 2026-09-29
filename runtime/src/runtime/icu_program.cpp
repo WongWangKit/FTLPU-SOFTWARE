@@ -257,8 +257,9 @@ std::size_t raw_3d_packet_word_count(QueueKind kind)
     case QueueKind::Vxm:
         return isa::EncodedVxmIcuRun2DPacket::kWordCount;
     case QueueKind::SxmTranspose:
+        return isa::EncodedSxmTransposeIcuRun2DPacket::kWordCount;
     case QueueKind::SxmPermute:
-        return isa::EncodedSxmIcuRun2DPacket::kWordCount;
+        return isa::EncodedSxmPermuteIcuRun2DPacket::kWordCount;
     case QueueKind::C2cDma:
     case QueueKind::C2cTx:
     case QueueKind::C2cRx:
@@ -594,7 +595,7 @@ bool is_fu_3d_raw_word_command(const QueueCommand& command) noexcept
                 == isa::EncodedVxmIcuRun2DPacket::kLanesPerWord)
         || (command.instruction_kind == InstructionKind::Sxm
             && command.word_count
-                == isa::EncodedSxmIcuRun2DPacket::kLanesPerWord);
+                == isa::EncodedSxmIcuRun2DWord{}.lanes.size());
     if (!supportedPair) return false;
     if (!command.extension_words.empty()
         || command.command != command.words[0]
@@ -672,9 +673,12 @@ IcuLoop3D decode_fu_3d_raw_packet_loop(
             read_raw_3d_packet<isa::EncodedVxmIcuRun2DPacket>(
                 queue, commandIndex)).loop;
     case QueueKind::SxmTranspose:
+        return isa::decode_sxm_transpose_icu_run_2d_instruction(
+            read_raw_3d_packet<isa::EncodedSxmTransposeIcuRun2DPacket>(
+                queue, commandIndex)).loop;
     case QueueKind::SxmPermute:
-        return isa::decode_sxm_icu_run_2d_instruction(
-            read_raw_3d_packet<isa::EncodedSxmIcuRun2DPacket>(
+        return isa::decode_sxm_permute_icu_run_2d_instruction(
+            read_raw_3d_packet<isa::EncodedSxmPermuteIcuRun2DPacket>(
                 queue, commandIndex)).loop;
     case QueueKind::C2cDma:
     case QueueKind::C2cTx:
@@ -1045,7 +1049,7 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                         static_cast<Hemisphere>(queue_index))
                         .push_encoded_3d_packet(
                             read_raw_3d_packet<
-                                isa::EncodedSxmIcuRun2DPacket>(
+                                isa::EncodedSxmTransposeIcuRun2DPacket>(
                                 queue, command_index));
                     break;
                 case QueueKind::SxmPermute:
@@ -1053,7 +1057,7 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                         static_cast<Hemisphere>(queue_index))
                         .push_encoded_3d_packet(
                             read_raw_3d_packet<
-                                isa::EncodedSxmIcuRun2DPacket>(
+                                isa::EncodedSxmPermuteIcuRun2DPacket>(
                                 queue, command_index));
                     break;
                 case QueueKind::C2cDma:

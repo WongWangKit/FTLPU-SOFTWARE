@@ -805,6 +805,7 @@ public:
             int64_t bank;
             int64_t ready{std::numeric_limits<int64_t>::max()};
             int64_t release{0};
+            bool runtimePrefetch{false};
             mlir::Location location;
         };
         std::map<std::tuple<int64_t, int64_t, int64_t>,
@@ -826,8 +827,15 @@ public:
                 std::tuple {*binding, page.getInt(), bank},
                 WeightPageInterval {*binding, page.getInt(), bank,
                     std::numeric_limits<int64_t>::max(), 0,
-                    read.getLoc()});
+                    false, read.getLoc()});
             auto& interval = position->second;
+            if (const auto bindingPlacement = read.getPlacement()
+                    .getAs<mlir::DictionaryAttr>("binding_placement"))
+                if (const auto runtimePrefetch = bindingPlacement
+                        .getAs<mlir::BoolAttr>("runtime_prefetch"))
+                    interval.runtimePrefetch =
+                        interval.runtimePrefetch
+                        || runtimePrefetch.getValue();
             interval.ready = std::min<int64_t>(
                 interval.ready, read.getCycle());
             interval.release = std::max<int64_t>(interval.release,
@@ -855,7 +863,7 @@ public:
                 std::tuple {bindingIndex, pageIndex, bank},
                 WeightPageInterval {bindingIndex, pageIndex, bank,
                     std::numeric_limits<int64_t>::max(), 0,
-                    transfer.getLoc()});
+                    false, transfer.getLoc()});
             auto& interval = position->second;
             const int64_t endCycle = transfer.getCycle()
                 + (transfer.getGroupCount().value_or(1) - 1)
@@ -887,6 +895,9 @@ public:
                 builder.getNamedAttr("release_cycle",
                     builder.getI64IntegerAttr(interval.release)),
             });
+            if (interval.runtimePrefetch)
+                state.addAttribute("runtime_prefetch",
+                    builder.getBoolAttr(true));
             builder.create(state);
         }
         for (schedule::MemReadOp read : reads) {

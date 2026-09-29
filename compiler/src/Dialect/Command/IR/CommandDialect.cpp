@@ -500,22 +500,13 @@ LogicalResult SxmRun2DOp::verify()
         return emitOpError("kind must be transpose or permute");
     if (failed(verifySxmRun2DQueue(getOperation(), getQueue())))
         return failure();
-    if (failed(verifyFu3DPacket<isa::EncodedSxmIcuRun2DPacket>(
+    if (getKind() == "transpose")
+        return verifyFu3DPacket<isa::EncodedSxmTransposeIcuRun2DPacket>(
             getOperation(), getWords(),
-            isa::decode_sxm_icu_run_2d_instruction)))
-        return failure();
-    isa::EncodedSxmIcuRun2DPacket packet {};
-    for (std::size_t index = 0; index < getWords().size(); ++index)
-        packet.words[index / packet.kLanesPerWord]
-            .lanes[index % packet.kLanesPerWord] =
-            static_cast<std::uint32_t>(
-                cast<IntegerAttr>(getWords()[index]).getInt());
-    const auto decoded = isa::decode_sxm_icu_run_2d_instruction(packet);
-    const auto expected = getKind() == "transpose"
-        ? SxmOpcode::Transpose : SxmOpcode::Permute;
-    if (decoded.instruction.opcode != expected)
-        return emitOpError("kind does not match the SXM tile opcode");
-    return success();
+            isa::decode_sxm_transpose_icu_run_2d_instruction);
+    return verifyFu3DPacket<isa::EncodedSxmPermuteIcuRun2DPacket>(
+        getOperation(), getWords(),
+        isa::decode_sxm_permute_icu_run_2d_instruction);
 }
 
 LogicalResult VxmOp::verify()

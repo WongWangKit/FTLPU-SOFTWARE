@@ -42,7 +42,8 @@ try {
             "occupied rows");
     if (query.slice_group_begin != key.slice_group_begin
         || value.slice_group_begin == query.slice_group_begin
-        || output.bank == query.bank)
+        || output.bank != query.bank
+        || output.slice_group_begin != 2)
         throw std::logic_error("unexpected attention weight placement");
 
     std::cout << "attention_weight_tile_planner_test passed\n";

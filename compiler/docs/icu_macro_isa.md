@@ -19,13 +19,14 @@ The current raw local-iMEM formats are:
 | MXM dequant | `DEQUANT_3D` | 2 consecutive 128-bit words |
 | MXM compute | `COMPUTE_3D`, `ACCUMULATOR_READ_3D` | 2 consecutive 128-bit words |
 | VXM | `RUN_2D` plus a 96-bit compact config | 3 consecutive 96-bit words |
-| SXM | `RUN_2D` plus a 416-bit tile-local config | 6 consecutive 96-bit words |
+| SXM transpose | `RUN_2D` plus stream bases and input-row selector | 2 consecutive 96-bit words |
+| SXM permute | `RUN_2D` plus stream bases, 32-lane map, and output selectors | 4 consecutive 96-bit words |
 
 The queue type identifies the decoder, so these packet families do not carry a
 shared MEM/MXM unit selector and do not use a common 320-bit layout. Every
 local-iMEM entry is one physical 96-bit or 128-bit word. A complete packet
-therefore consumes three MEM-3D/VXM slots, two MEM-write-sync/MXM slots, or six
-SXM slots.
+therefore consumes three MEM-3D/VXM slots or two MEM-write-sync/MXM slots. SXM
+transpose consumes two slots and SXM permute consumes four.
 
 `MEM_SLICE_PROGRAM` does not yet have a frozen hardware packet layout.
 `VXM_STREAM_ND` and `SXM_TILE_PROGRAM` remain legacy file forms, but the subset
@@ -453,20 +454,28 @@ materializes per-cycle VXM instructions.
 without operand induction map directly to `RUN_2D`. Rank three is rejected
 because VXM has no third outer launch counter.
 
-### SXM: RUN_2D, 6 x 96 bits
+### SXM: queue-specific RUN_2D packets
 
-The SXM tile-local payload uses the existing 416-bit encoding. It retains the
-transpose/permute opcode, stream lists, row/tile selectors, the 16-lane tile
-map, and the 32-lane permute map. `RUN_2D` prefixes the same 104-bit two-counter
-launch domain used by VXM: a 24-bit `wait_cycle`, two counts, and two cycle strides.
-For permute, `P[521:520]` encodes a per-launch map rotation in multiples of
-eight lanes; this folds the four recurring Qwen permutation phases into one
-loop. `P[523:522]` is reserved and must be zero.
+Transpose and Permute have independent physical ICU queues. Queue identity
+selects the operation, so the packet does not encode an opcode or fields used
+only by the other queue. Both packets start with the same 104-bit two-counter
+launch domain: a 24-bit `wait_cycle`, two counts, and two cycle strides.
 
-Because an SXM packet has six words, its FU-local header uses a three-bit word
-index in `[4:2]`. The physical queue already identifies SXM, so the header does
-not duplicate a local operation; the tile opcode remains in the payload. Each
-physical SXM queue has one 512-bit decoded context.
+Transpose uses `P[119:104]` for a 6-bit source base, a 6-bit destination base,
+and a 4-bit input-row selector. An all-row operation implies 16 consecutive
+source streams; a selected row implies two. The destination always implies 16
+consecutive streams. The packet is 2 x 96 bits and its decoded context is 256
+bits.
+
+Permute uses `P[115:104]` for two 6-bit stream bases, `P[275:116]` for the full
+32 x 5-bit permutation map, `P[282:276]` for output-row/output-tile selectors,
+and `P[284:283]` for per-launch map rotation in multiples of eight lanes. Both
+stream ranges implicitly contain 16 consecutive streams. The packet is 4 x 96
+bits and its decoded context is 384 bits.
+
+The shift controls, 16-lane tile map, explicit stream counts, unrelated
+selectors, and repeated opcode from the legacy generic SXM config are absent
+from these hardware ICU instructions.
 
 Legacy `SXM_TILE_PROGRAM` descriptors of rank one or two without operand
 induction map directly to this `RUN_2D`. Rank three and instruction-field
@@ -732,8 +741,8 @@ or the hardware execution mechanism.
 
 The raw queue fetches one physical word per local-iMEM entry and recognizes an
 FU-loop header at the queue head. Activation is atomic at packet granularity:
-all three MEM-3D/VXM words, both MEM-write-sync/MXM words, or all six SXM words
-must be available and have consistent headers. The decoder latches the queue's sole active
+all three MEM-3D/VXM words, both MEM-write-sync/MXM/SXM-transpose words, or all
+four SXM-permute words must be available and have consistent headers. The decoder latches the queue's sole active
 context, advances two or three counters for the selected FU, and emits at most
 one native FU instruction per cycle. It activates the next packet only after
 the current loop retires.
@@ -747,7 +756,8 @@ context is the capacity and scheduling rule for every physical FU queue.
 The frozen hardware-facing formats covered here are MEM `READ_3D`,
 `WRITE_3D`, and `WRITE_TAP_3D` at 3 x 96 bits, plus MXM `LOAD_3D`,
 `DEQUANT_3D`, `COMPUTE_3D`, and `ACCUMULATOR_READ_3D` at 2 x 128 bits, plus VXM
-`RUN_2D` at 3 x 96 bits, plus SXM `RUN_2D` at 6 x 96 bits. Legacy
+`RUN_2D` at 3 x 96 bits, plus SXM transpose `RUN_2D` at 2 x 96 bits and SXM
+permute `RUN_2D` at 4 x 96 bits. Legacy
 Macro/STREAM_ND records remain only as compatible file input to the closed-form
 adapter. `MEM_SLICE_PROGRAM` still requires a hardware packet definition before
 it can be treated as a raw ICU instruction.

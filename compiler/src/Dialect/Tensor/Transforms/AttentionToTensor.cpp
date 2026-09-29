@@ -238,8 +238,14 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         * (compact_rope_products ? head_blocks : 1) * seq_len;
     const int64_t output_activation_rows =
         query_width / tile * blocks * (tile / block_rows);
+    // fp16_mxm_distributed_16 allocates addresses by a full 32-token block:
+    // each hidden block owns one address per tile row even when decode has a
+    // single logical token.  Scratch and initialized constants must begin
+    // after that padded physical span, otherwise decode RoPE initialization
+    // overwrites the still-live residual input.
     const int64_t distributed_input_rows =
-        seq_len * hidden / (tile * block_rows);
+        ((seq_len + tile - 1) / tile) * (hidden / tile)
+        * target.throughput().tile_rows;
     const int64_t output_activation_base = distributed_input_rows;
     const int64_t input_staging_rows = seq_len * hidden / tile;
     const int64_t input_staging_base =
@@ -271,6 +277,10 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // remain resident in the dedicated weight slices throughout RoPE and
     // softmax.
     const int64_t rope_product_base = distributed_input_rows;
+    // Decode RoPE is compact and only needs two rows per resident token.
+    // Its long-lived primary copy shares activation slices with the transient
+    // score plane, so place it immediately after that plane. The persistent
+    // Key cache continues to grow down from the high end of SRAM.
     const int64_t rope_mirror_base = rope_product_base + rope_product_rows;
     const int64_t rope_staging_mirror_base = rope_mirror_base + rope_rows;
     // The function input remains live until the attention residual add. Keep
@@ -282,6 +292,9 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         ? std::max(distributed_input_rows, key_rows)
         : target.attention_score_base_row();
     const int64_t query_base = score_base + score_rows;
+    const int64_t rope_table_base = decode
+        ? query_base
+        : target.attention_probability_diagonal_base_row();
     // Serial Q/K projection retains every raw head until RoPE starts. Its
     // larger staging allocation must stay clear of the Query IW rows, which
     // remain live for QK and can occupy either scratch bank by rotary half.
@@ -348,7 +361,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     const auto weightStorage = target.weight_storage_slices();
     const bool can_use_disjoint_q_rope_slices =
-        query_bias && tiled_weights && compact_rope_products &&
+        !decode && query_bias && tiled_weights && compact_rope_products &&
         target.uses_dedicated_slice_roles() &&
         target.memory().banks_per_slice == 2 && !has_qk_norm &&
         seq_len > 0 && seq_len <= tile && hidden == 1536 &&
@@ -476,7 +489,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     llvm::SmallVector<int64_t, 16> alternate_rope_staging_slices(
         rope_staging_slices.begin(), rope_staging_slices.end());
     if (split_serial_q_rope_staging) {
-        // The long Q activation READ_3D owns bank-0 slices 8/9 until the
+        // The long Q activation READ_3D owns staging slices 8/9 until the
         // projection ends. Keep the alternate raw output off those ICUs.
         alternate_rope_staging_slices[8] = weightStorage[8];
         alternate_rope_staging_slices[9] = weightStorage[9];
@@ -536,8 +549,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     rope_table_slices.assign(rope_slices.begin(), rope_slices.end());
     if (split_serial_q_rope_staging) {
         // Decode Q postprocessing writes the activation-region slices while
-        // consuming RoPE constants.  Keep both constant copies on otherwise
-        // idle bank-0 weight-region ICUs so neither non-preemptible MEM
+        // consuming RoPE constants. Keep both constant copies on otherwise
+        // idle scratch-bank weight-region ICUs so neither non-preemptible MEM
         // program has to interleave with a Q write.
         rope_table_slices.assign(
             weightStorage.begin() + 26, weightStorage.begin() + 30);
@@ -591,6 +604,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         }
     } else {
         rope_mirror_slices = rope_table_slices;
+    }
+    if (mlir::failed(physical_allocator.reserve({"rope_table",
+            llvm::SmallVector<int64_t, 16>(
+                rope_table_slices.begin(), rope_table_slices.end()),
+            rope_table_base, rope_rows, 0, 7, false, rope_table_bank}))) {
+        op.emitError("failed to reserve the attention RoPE table");
+        return mlir::failure();
     }
     if (mlir::failed(physical_allocator.reserve({"rope_staging",
             rope_staging_slices, rope_staging_base,
@@ -875,11 +895,23 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // Softmax broadcasts the score scalar and streams the exponentials while
     // it writes the packed probability vectors.  These accesses overlap in
     // time, so the probability-pack window must not reuse either input's MEM
-    // slices on the same bank.  Prefer activation slices, then use otherwise
-    // idle weight-role slices when weights live in a separate bank.
-    llvm::SmallVector<int64_t, 64> probability_pack_candidates(
-        activation_storage.begin(), activation_storage.end());
-    if (paged_weights && target.uses_dedicated_slice_roles()) {
+    // slices on the same bank. For the bank-ping-pong Qwen layout, Q/K/V have
+    // drained by this phase: reuse their bank-A groups and leave bank B's
+    // complete weight plane available to the incoming Gate page.
+    llvm::SmallVector<int64_t, 64> probability_pack_candidates;
+    const bool reuse_attention_weight_plane_for_probability =
+        paged_weights && tiled_weights
+        && weight_bank == secondary_scratch_bank
+        && weightStorage.size() >= 16;
+    if (reuse_attention_weight_plane_for_probability) {
+        probability_pack_candidates.append(
+            weightStorage.begin(), weightStorage.begin() + 16);
+    } else {
+        probability_pack_candidates.append(
+            activation_storage.begin(), activation_storage.end());
+    }
+    if (!reuse_attention_weight_plane_for_probability && paged_weights
+        && target.uses_dedicated_slice_roles()) {
         const auto weight_storage = target.weight_storage_slices();
         probability_pack_candidates.append(
             weight_storage.begin(), weight_storage.end());
@@ -903,7 +935,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         if (!llvm::is_contained(probability_pack_excluded, slice))
             probability_pack_excluded.push_back(slice);
     const llvm::SmallVector<int64_t, 1> probability_pack_banks {
-        scratch_bank};
+        reuse_attention_weight_plane_for_probability
+            ? secondary_scratch_bank : scratch_bank};
     auto probability_pack = physical_allocator.allocate({"probability_pack",
         16, target.attention_probability_pack_base_row(),
         probability_pack_rows, 3, 4, probability_pack_candidates,
@@ -1164,11 +1197,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             probability_diagonal_rows, "both",
             probability_diagonal_bank)),
         rewriter.getNamedAttr("rope", make_attention_placement(rewriter,
-            "fp16_rope_table", rope_table_slices,
-            target.attention_probability_diagonal_base_row(),
+            decode ? "fp16_rope_table_decode_compact" : "fp16_rope_table",
+            rope_table_slices,
+            rope_table_base,
             rope_rows, "both", rope_table_bank)),
         rewriter.getNamedAttr("rope_mirror", make_attention_placement(rewriter,
-            "fp16_rope_table", rope_mirror_slices,
+            decode ? "fp16_rope_table_decode_compact" : "fp16_rope_table",
+            rope_mirror_slices,
             compact_rope_products ? rope_mirror_base
                                   : target.attention_probability_diagonal_base_row(),
             rope_rows, "both", rope_mirror_bank)),

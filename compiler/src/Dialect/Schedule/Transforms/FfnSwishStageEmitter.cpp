@@ -353,19 +353,26 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
             inputCycle = std::max(
                 inputCycle, completed.deferred_ready_cycle);
 
-        mlir::Value gateValue;
-        mlir::Value upValue;
-        const int64_t firstInputCycle = inputCycle;
-        for (int64_t mTile = 0; mTile < mTileCount; ++mTile) {
-            // All Tail projection tiles are resident before Swish starts.
-            // Execute even pairs followed by odd pairs so each physical
-            // hidden-layout residue becomes one chronological affine run.
-            for (int64_t parity = 0; parity < pairResidues; ++parity) {
-            // Temporary slices change only at a storage-group boundary.
-            // Within one group, pairStep advances both the issue cycle
-            // and SRAM row by constants, so emit that complete run as
-            // one hardware 3-D domain instead of enumerating its pairs.
-            for (int64_t pair = parity; pair < pairCount;) {
+        // A VXM instruction has one fixed absolute input hemisphere.  Tail
+        // Swish therefore consumes the two projection owners in consecutive
+        // runs.  Feeding both SR hemispheres in the same run made the chain
+        // repeatedly consume East while writes labelled the second half as
+        // West, corrupting every hidden block starting at block 2.
+        for (int64_t hemisphere = 0;
+             hemisphere < memory.hemispheres; ++hemisphere) {
+            mlir::Value gateValue;
+            mlir::Value upValue;
+            const int64_t firstInputCycle = inputCycle;
+            for (int64_t mTile = 0; mTile < mTileCount; ++mTile) {
+                // All Tail projection tiles are resident before Swish starts.
+                // Execute even pairs followed by odd pairs so each physical
+                // hidden-layout residue becomes one chronological affine run.
+                for (int64_t parity = 0; parity < pairResidues; ++parity) {
+                // Temporary slices change only at a storage-group boundary.
+                // Within one group, pairStep advances both the issue cycle
+                // and SRAM row by constants, so emit that complete run as
+                // one hardware 3-D domain instead of enumerating its pairs.
+                for (int64_t pair = parity; pair < pairCount;) {
                     if (combineTailParities && parity != 0) break;
                     const int64_t tempGroup = pair / pairsPerTempGroup;
                     const int64_t groupPairEnd = std::min<int64_t>(
@@ -373,84 +380,77 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                     const int64_t groupCount =
                         1 + (groupPairEnd - 1 - pair) / pairStep;
                     const int64_t tileInputCycle = inputCycle;
-                    for (int64_t hemisphere = 0;
-                         hemisphere < memory.hemispheres; ++hemisphere) {
-                        const CompletedProjectionTile* leader = nullptr;
-                        const int64_t checkedPairs = combineTailParities
-                            ? pairCount : groupCount;
-                        for (int64_t index = 0;
-                             index < checkedPairs; ++index) {
-                            const int64_t currentPair = combineTailParities
-                                ? (index < groupCount
-                                    ? pair + index * pairStep
-                                    : pair + 1
-                                        + (index - groupCount) * pairStep)
-                                : pair + index * pairStep;
-                            const auto completed = llvm::find_if(
-                                emission.completed_tiles,
-                                [&](const CompletedProjectionTile& tile) {
-                                    return tile.m_tile == mTile
-                                        && tile.pair == currentPair
-                                        && tile.hemisphere == hemisphere;
-                                });
-                            if (completed == emission.completed_tiles.end()) {
-                                ffn.getOperation()->emitError(
-                                    "missing completed FFN projection tile for "
-                                    "vector Swish input");
-                                return mlir::failure();
-                            }
-                            if (index == 0) leader = &*completed;
+                    const CompletedProjectionTile* leader = nullptr;
+                    const int64_t checkedPairs = combineTailParities
+                        ? pairCount : groupCount;
+                    for (int64_t index = 0;
+                         index < checkedPairs; ++index) {
+                        const int64_t currentPair = combineTailParities
+                            ? (index < groupCount
+                                ? pair + index * pairStep
+                                : pair + 1
+                                    + (index - groupCount) * pairStep)
+                            : pair + index * pairStep;
+                        const auto completed = llvm::find_if(
+                            emission.completed_tiles,
+                            [&](const CompletedProjectionTile& tile) {
+                                return tile.m_tile == mTile
+                                    && tile.pair == currentPair
+                                    && tile.hemisphere == hemisphere;
+                            });
+                        if (completed == emission.completed_tiles.end()) {
+                            ffn.getOperation()->emitError(
+                                "missing completed FFN projection tile for "
+                                "vector Swish input");
+                            return mlir::failure();
                         }
-                        const int64_t tempBase =
-                            ((pair % pairsPerTempGroup) * mTileCount + mTile)
-                            * tile;
-                        const int64_t streamBase = hemisphere * 16;
-                        FfnLoopDomain3D domain;
-                        if (combineTailParities) {
-                            domain.wave_count = groupCount;
-                            domain.wave_interval = tile;
-                            domain.wave_address_stride =
-                                pairStep * mTileCount * tile;
-                            domain.group_count = 2;
-                            domain.group_interval = groupCount * tile;
-                            domain.group_address_stride =
-                                mTileCount * tile;
-                        } else {
-                            domain.group_count = groupCount;
-                            domain.group_interval = tile;
-                            domain.group_address_stride =
-                                pairStep * mTileCount * tile;
-                        }
-                        for (int64_t byte = 0; byte < 2; ++byte) {
-                            const int64_t gateSlice =
-                                gateTempSlices[2 * tempGroup + byte];
-                            const int64_t upSlice =
-                                upTempSlices[2 * tempGroup + byte];
-                            auto gateRead = context.emitSliceRead(
-                                leader->gate_temp,
-                                context.activation_route,
-                                tileInputCycle
-                                    - context.westLatency(gateSlice),
-                                gateSlice, tempBase, tile, 1,
-                                streamBase + byte, "west", "vxm_bf16",
-                                context.hemisphereName(hemisphere));
-                            setFfnLoopDomain3D(
-                                gateRead.getOperation(), context.rewriter,
-                                domain);
-                            gateValue = gateRead.getOutput();
-                            auto upRead = context.emitSliceRead(
-                                leader->up_temp,
-                                context.activation_route,
-                                tileInputCycle - context.westLatency(upSlice),
-                                upSlice, tempBase, tile, 1,
-                                streamBase + 2 + byte,
-                                "west", "vxm_bf16",
-                                context.hemisphereName(hemisphere));
-                            setFfnLoopDomain3D(
-                                upRead.getOperation(), context.rewriter,
-                                domain);
-                            upValue = upRead.getOutput();
-                        }
+                        if (index == 0) leader = &*completed;
+                    }
+                    const int64_t tempBase =
+                        ((pair % pairsPerTempGroup) * mTileCount + mTile)
+                        * tile;
+                    const int64_t streamBase = hemisphere * 16;
+                    FfnLoopDomain3D domain;
+                    if (combineTailParities) {
+                        domain.wave_count = groupCount;
+                        domain.wave_interval = tile;
+                        domain.wave_address_stride =
+                            pairStep * mTileCount * tile;
+                        domain.group_count = 2;
+                        domain.group_interval = groupCount * tile;
+                        domain.group_address_stride =
+                            mTileCount * tile;
+                    } else {
+                        domain.group_count = groupCount;
+                        domain.group_interval = tile;
+                        domain.group_address_stride =
+                            pairStep * mTileCount * tile;
+                    }
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t gateSlice =
+                            gateTempSlices[2 * tempGroup + byte];
+                        const int64_t upSlice =
+                            upTempSlices[2 * tempGroup + byte];
+                        auto gateRead = context.emitSliceRead(
+                            leader->gate_temp,
+                            context.activation_route,
+                            tileInputCycle - context.westLatency(gateSlice),
+                            gateSlice, tempBase, tile, 1,
+                            streamBase + byte, "west", "vxm_bf16",
+                            context.hemisphereName(hemisphere));
+                        setFfnLoopDomain3D(
+                            gateRead.getOperation(), context.rewriter, domain);
+                        gateValue = gateRead.getOutput();
+                        auto upRead = context.emitSliceRead(
+                            leader->up_temp,
+                            context.activation_route,
+                            tileInputCycle - context.westLatency(upSlice),
+                            upSlice, tempBase, tile, 1,
+                            streamBase + 2 + byte, "west", "vxm_bf16",
+                            context.hemisphereName(hemisphere));
+                        setFfnLoopDomain3D(
+                            upRead.getOperation(), context.rewriter, domain);
+                        upValue = upRead.getOutput();
                     }
                     inputCycle += (combineTailParities
                         ? pairCount : groupCount) * tile;
@@ -458,52 +458,51 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                         ? pairCount : groupCount * pairStep;
                 }
             }
-        }
-        const int64_t repeatCount = inputCycle - firstInputCycle;
-        if (!gateValue || !upValue || repeatCount <= 0) {
-            ffn.getOperation()->emitError(
-                "vector FFN projection did not produce Swish temporaries");
-            return mlir::failure();
-        }
-        auto [output, mirroredOutput] = emitFfnSwishAlu(
-            context.rewriter, ffn.getLoc(), ffn.getResult().getType(),
-            gateValue, upValue, target, context.strategy,
-            firstInputCycle - 1, 0, outputStream, repeatCount, 1);
-        (void)mirroredOutput;
-        if (combineTailParities) {
-            FfnLoopDomain3D domain;
-            domain.wave_count = pairCount / 2;
-            domain.wave_interval = tile;
-            domain.wave_address_stride = 4 * throughput.tile_rows;
-            domain.group_count = 2;
-            domain.group_interval = domain.wave_count * tile;
-            domain.group_address_stride = throughput.tile_rows;
-            for (int64_t hemisphere = 0;
-                 hemisphere < memory.hemispheres; ++hemisphere)
+            }
+            const int64_t repeatCount = inputCycle - firstInputCycle;
+            if (!gateValue || !upValue || repeatCount <= 0) {
+                ffn.getOperation()->emitError(
+                    "vector FFN projection did not produce Swish temporaries");
+                return mlir::failure();
+            }
+            auto [output, mirroredOutput] = emitFfnSwishAlu(
+                context.rewriter, ffn.getLoc(), ffn.getResult().getType(),
+                gateValue, upValue, target, context.strategy,
+                firstInputCycle - 1, hemisphere, outputStream,
+                repeatCount, 1);
+            (void)mirroredOutput;
+            if (combineTailParities) {
+                FfnLoopDomain3D domain;
+                domain.wave_count = pairCount / 2;
+                domain.wave_interval = tile;
+                domain.wave_address_stride = 4 * throughput.tile_rows;
+                domain.group_count = 2;
+                domain.group_interval = domain.wave_count * tile;
+                domain.group_address_stride = throughput.tile_rows;
                 result.hidden = emitFfnSwishResultTile(
                     context.rewriter, ffn, target,
                     context.hidden_slices, output.getResult(),
                     firstInputCycle, 0, 0, hemisphere, tile, false,
                     domain, true);
-        } else {
-            int64_t pairOrdinal = 0;
-            for (int64_t mTile = 0; mTile < mTileCount; ++mTile) {
-                for (int64_t parity = 0; parity < pairResidues; ++parity) {
-                    FfnLoopDomain3D domain;
-                    domain.group_count =
-                        1 + (pairCount - 1 - parity) / pairStep;
-                    domain.group_interval = tile;
-                    domain.group_address_stride =
-                        (singleMxmVector ? 4 : 1)
-                        * throughput.tile_rows;
-                    for (int64_t hemisphere = 0;
-                         hemisphere < memory.hemispheres; ++hemisphere)
+            } else {
+                int64_t pairOrdinal = 0;
+                for (int64_t mTile = 0; mTile < mTileCount; ++mTile) {
+                    for (int64_t parity = 0;
+                         parity < pairResidues; ++parity) {
+                        FfnLoopDomain3D domain;
+                        domain.group_count =
+                            1 + (pairCount - 1 - parity) / pairStep;
+                        domain.group_interval = tile;
+                        domain.group_address_stride =
+                            (singleMxmVector ? 4 : 1)
+                            * throughput.tile_rows;
                         result.hidden = emitFfnSwishResultTile(
                             context.rewriter, ffn, target,
                             context.hidden_slices, output.getResult(),
                             firstInputCycle + pairOrdinal * tile,
                             mTile, parity, hemisphere, tile, false, domain);
-                    pairOrdinal += domain.group_count;
+                        pairOrdinal += domain.group_count;
+                    }
                 }
             }
         }

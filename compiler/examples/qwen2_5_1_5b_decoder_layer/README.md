@@ -88,17 +88,23 @@ for the attention context, 0 for the residual, and 0.015625 for RMSNorm 2.
 ### Dynamic C2C single-layer execution
 
 The same seq32 runtime test also executes the layer through
-`ModelSession(C2cDmaSystem)`. The executable declares 20 weight-page uses: one
-page each for Q, K, V, and O, two Gate pages, two Up pages, and twelve Down
-pages. The model package adds one parameter page for the two RMSNorm scales and
-the Q/K/V biases. The parameter page is separate from the 20 executable page
-uses, so the run performs 21 physical prefetches in total.
+`ModelSession(C2cDmaSystem)`. The executable declares 10 weight-page uses: one
+page each for Q, K, V, O, Gate, and Up, plus four Down pages. Q/K/V/O use
+disjoint slice groups in bank A: Q/K share different rows of group 0, V uses
+group 1, and O uses group 2. FFN continues the bank-level ping-pong as Gate B,
+Up A, and Down B. Each page occupies one
+slice group and stores three output waves. The model package adds one parameter
+page for the two RMSNorm scales and the Q/K/V biases. The parameter page is
+separate from the 10 executable page uses, so the run performs 11 physical
+prefetches in total.
 
 Before loading the linked executable, `ModelSession` synchronously transfers
-the parameter page and the six executable pages that the planner marks
-`pre_execution` (Q/K/V/O and both Up pages). It then links the remaining 14
-executable pages (both Gate pages and all twelve Down pages) into static idle
-windows. The linker adds C2C DMA/RX packets and `MEM_WRITE_SYNC` packets to the
+the parameter page and the four executable pages that the planner marks
+`pre_execution` (Q/K/V/O). It then links the remaining six executable pages
+(Gate, Up, and all four Down pages) into static idle windows. Up is prefetched
+to bank A while Gate consumes bank B; the four Down pages are prefetched to
+bank B while Up consumes bank A. The linker adds C2C DMA/RX packets and
+`MEM_WRITE_SYNC` packets to the
 same physical MEM ICU queues used by ordinary reads and writes. Page fences
 reserve each target queue until its first consumer boundary, while page-ready
 synchronization absorbs any later transport completion without shifting the
@@ -108,8 +114,8 @@ The startup transfer programs are transient: they execute before
 `runtime.load()` and are not copied into `ModelSession::last_linked_program()`.
 No page payload bytes are serialized in a `BinaryProgram`; all payloads remain
 in the `ModelPackage`/external DDR backing store. The linked `.ftlpu` therefore
-contains the static executable plus the transfer instructions for the 14
-overlapped pages, while retaining the original 20 page-use descriptors as
+contains the static executable plus the transfer instructions for the six
+overlapped pages, while retaining the original 10 page-use descriptors as
 metadata. This distinction matters when counting instructions in an exported
 linked image.
 
@@ -117,15 +123,15 @@ The verified dynamic run reports:
 
 | Dynamic C2C property | Result |
 | --- | --- |
-| Page plan | 20 executable pages + 1 parameter page = 21 prefetches |
+| Page plan | 10 executable pages + 1 parameter page = 11 prefetches |
 | Physical bytes transferred | 47,194,112 = 46,792,704 executable + 401,408 parameter |
-| Startup pages / initial wait | 7 pages / 217,183 cycles |
-| Runtime-linked pages | 14 executable pages |
-| Post-link instruction image | 1,321,249 bytes, 230 serialized queues, 85,242 physical iMEM slots |
-| Linked MEM synchronization | 256 `MEM_WRITE_SYNC` instructions |
-| Synchronized MEM FU work | 860,160 vector writes = 27,525,120 bytes |
-| Executable page-ready wait | 0 cycles |
-| Numerical result | Byte-identical to the direct run; 49,152 BF16 values, 49,116 nonzero, maximum error 0.0625 |
+| Startup pages / initial wait | 5 pages / 68,954 cycles |
+| Runtime-linked pages | 6 executable pages |
+| Post-link instruction image | 882,705 bytes, 230 active serialized queues, 50,978 physical iMEM words |
+| Linked MEM synchronization | 192 `MEM_WRITE_SYNC` and 40 `MEM_READ_SYNC` instructions |
+| Synchronized MEM FU work | 1,290,240 vector writes = 41,287,680 bytes |
+| Executable page-ready wait | 59,292 cycles |
+| Numerical result | 49,152 BF16 values, 49,117 nonzero, maximum error 0.0625 |
 
 ## Build and inspect
 
@@ -322,9 +328,38 @@ checks the 12:2 GQA mapping, KV append and prefix preservation, decode
 attention, residuals, and the 1536/8960 FFN against the last token of a
 33-token single-layer mathematical golden.
 
-This test defines the numerical contract needed by compiler decode lowering.
-The current `.ftlpu` executable does not yet contain compiled KV-cache
-read/write commands, so this reference is not a compiled CModel decode run.
+Decode lowering now emits the complete ICU/CModel program: DDR weight loads,
+KV-cache page-in, one decoder-layer step, KV append, and updated cache
+page-out. The logical input and output are `1x1536`, and MXM uses Native4.
+
+Precompile common context lengths with:
+
+```powershell
+python tools/build_qwen2_5_decode_buckets.py `
+  --past-lengths 32 64 128 224 `
+  --capacity 256
+```
+
+The fixed output is `results/qwen2_5_decoder_layer_decode_buckets`.
+`manifest.json` records each program's past length, absolute RoPE position,
+resident KV tokens, binary, and fixture. The current binary encodes RoPE
+position, KV append address, and valid attention length statically, so the
+selector requires an exact match:
+
+```powershell
+python tools/select_qwen2_5_decode_bucket.py `
+  --manifest results/qwen2_5_decoder_layer_decode_buckets/manifest.json `
+  --past-len 64
+
+tools/run_qwen2_5_decode_bucket.ps1 `
+  -Manifest results/qwen2_5_decoder_layer_decode_buckets/manifest.json `
+  -PastLen 64 -DdrBandwidthMBps 16000 -ClockMHz 1000 `
+  -ResultDir results/qwen2_5_decoder_layer_decode_buckets/past_0064/run
+```
+
+A range-covering bucket additionally requires runtime relocations for RoPE
+position, KV append offset, and valid KV length, plus a dynamic tail mask.
+Rounding up before those relocations exist changes attention numerics.
 
 ## Historical compatibility numerical baselines
 

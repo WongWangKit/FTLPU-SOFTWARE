@@ -1247,7 +1247,7 @@ BinaryHeader read_header(ByteReader& reader)
         use.binding_index = reader.read<std::uint32_t>();
         use.page_index = reader.read<std::uint32_t>();
         use.bank = reader.read<std::uint16_t>();
-        (void)reader.read<std::uint16_t>();
+        use.runtime_prefetch = reader.read<std::uint16_t>() != 0;
         use.ready_cycle = reader.read<std::uint64_t>();
         use.release_cycle = reader.read<std::uint64_t>();
         program.weight_page_uses.push_back(use);
@@ -1394,7 +1394,7 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
         write_scalar<std::uint32_t>(os, use.binding_index);
         write_scalar<std::uint32_t>(os, use.page_index);
         write_scalar<std::uint16_t>(os, use.bank);
-        write_scalar<std::uint16_t>(os, 0);
+        write_scalar<std::uint16_t>(os, use.runtime_prefetch ? 1 : 0);
         write_scalar<std::uint64_t>(os, use.ready_cycle);
         write_scalar<std::uint64_t>(os, use.release_cycle);
     }
@@ -1519,7 +1519,7 @@ BinaryProgram read_binary_program(std::istream& is)
         use.binding_index = read_scalar<std::uint32_t>(is);
         use.page_index = read_scalar<std::uint32_t>(is);
         use.bank = read_scalar<std::uint16_t>(is);
-        (void)read_scalar<std::uint16_t>(is);
+        use.runtime_prefetch = read_scalar<std::uint16_t>(is) != 0;
         use.ready_cycle = read_scalar<std::uint64_t>(is);
         use.release_cycle = read_scalar<std::uint64_t>(is);
         program.weight_page_uses.push_back(use);

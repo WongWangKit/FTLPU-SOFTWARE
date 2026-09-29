@@ -30,7 +30,9 @@ public:
     CModelRuntime(C2cDmaSystem& system,
         std::function<void(TspSliceSystem::LogSinks)> tick);
 
-    void load(const BinaryProgram& program);
+    void load(const BinaryProgram& program,
+        bool initialize_internal_data = true);
+    void initialize_internal_data(const BinaryProgram& program);
     void load_file(const std::filesystem::path& path);
     void upload_input(std::size_t index, std::span<const std::uint8_t> data);
     void upload_binding(
@@ -40,9 +42,6 @@ public:
     std::vector<std::uint8_t> download_output(std::size_t index) const;
     void copy_binding(
         const BinaryBinding& source, const BinaryBinding& destination);
-    void set_weight_page_residency_checker(
-        std::function<bool(const BinaryWeightPageUse&)> checker);
-    void set_weight_page_wait_observer(std::function<void()> observer);
     void enable_execution_trace(bool enabled = true) noexcept;
     void configure_execution_trace_segment(
         std::int64_t cycle_offset, bool append) noexcept;
@@ -74,7 +73,7 @@ public:
 
 private:
     const BinaryBinding& find_binding(BindingAccess access, std::size_t index) const;
-    bool load_ready_weight_pages();
+    void load_ready_weight_pages();
     void run_logical_cycles(std::size_t cycles,
         TspSliceSystem::LogSinks sinks);
 
@@ -92,7 +91,6 @@ private:
     std::size_t executed_cycles_{0};
     std::size_t physical_cycles_{0};
     std::size_t instruction_prefill_cycles_{0};
-    std::optional<BinaryWeightPageUse> waiting_weight_page_use_{};
     DatapathPerformanceMonitor datapath_performance_{};
     RuntimeExecutionTrace execution_trace_{};
     MemExecutionTrace mem_execution_trace_{};
@@ -101,9 +99,6 @@ private:
     std::int64_t execution_trace_cycle_offset_{0};
     bool execution_trace_append_on_load_{false};
     std::function<void(TspSliceSystem::LogSinks)> tick_{};
-    std::function<bool(const BinaryWeightPageUse&)>
-        weight_page_residency_checker_{};
-    std::function<void()> weight_page_wait_observer_{};
 };
 
 } // namespace ftlpu::software::runtime

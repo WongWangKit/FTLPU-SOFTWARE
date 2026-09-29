@@ -102,13 +102,26 @@ Jitter is derived from request ID, address, operation, and a target seed, so
 tests are repeatable while requests still complete at different cycles.
 
 Prefetch has no hardware deadline. A page `ready_cycle` in compiler/binary data
-is the first logical consumer cycle: a hint for launching prefetch and placing
-the synchronization point. Runtime checks the page fence when that consumer is
-reached. SRAM-ready requires both C2C RX completion and every target MEM write
-to commit. Until then, compute-side ICU issue is held while DDR/C2C continues
-to advance on physical clocks; the page-ready event releases compute. DDR
-bandwidth and latency jitter therefore become observed runtime stalls instead
-of correctness depending on a static prediction.
+is the first logical consumer cycle and names a static execution-epoch
+dependency coordinate. It is not an absolute cycle edge visible to every ICU.
+All pages with the same coordinate are members of one epoch. The linker
+materializes a distributed wavefront boundary by inserting one tagged
+`WAIT_EVENT` in every participating compute ICU queue. Each wait is placed at
+that ICU's next safe coarse-instruction boundary while retaining the queue's
+pipeline phase. A decoded ICU instruction, including an entire 3-D loop, is
+owned by one epoch and is never suspended or split by runtime linking; the
+following ICU instruction begins the new epoch. The epoch event is released
+only after C2C RX and every target MEM write for every member page have
+committed to SRAM. DDR/C2C transfer queues and an asynchronous
+`MEM_WRITE_SYNC` reservation may span compute epochs. A MEM queue that performs
+such a transfer rejoins the compute wavefront at the reservation end before
+issuing later compute traffic. CModelRuntime never freezes logical time or
+changes the chip-wide issue enable for page readiness.
+
+Epoch 0 is the pre-execution resource set. Current persistent KV/state windows
+are paged in before launch and therefore belong to epoch 0. When KV paging is
+later overlapped inside an executable, its pages must be added to the same
+epoch resource set as weights; it must not reintroduce a global issue gate.
 
 ### Run phase
 
@@ -126,11 +139,13 @@ of correctness depending on a static prediction.
 
 Production activations, RMSNorm parameters, RoPE tables, embeddings, and LM-head boundaries use BF16. Legacy layout names beginning with `Fp16` describe two-byte physical topology only; `BindingElementType::BF16` is authoritative. At executable boundaries, ICU, stream, MXM, VXM, and SXM state is cleared; MEM survives the reset and logical persistent state survives in session backing. `stats()` separately reports state page-in/page-out counts, bytes, and cycles in addition to resident, host, device-copy, and host-operation traffic.
 
-`weight_page_runtime_wait_cycles` counts physical cycles spent at executable
-page-ready fences. With execution tracing enabled,
+`execution_epochs` counts epoch 0 plus the statically linked page-ready
+boundaries. `weight_page_runtime_wait_cycles` counts the physical tail by which
+local epoch waits extend execution beyond the static program span. With
+execution tracing enabled,
 `ModelSession::write_execution_trace_csv()` samples ICU queue state after each
-CModel tick and records actual issues, C2C completion intervals, and
-`ICU.PageReadyWait`. This is distinct from the static
+CModel tick and records actual issues, C2C completion intervals, and each
+queue's local `ICU.PageReadyWait`. This is distinct from the static
 `write_schedule_trace_csv()` path, which only inspects a binary plan.
 
 ## Address planning and relocation

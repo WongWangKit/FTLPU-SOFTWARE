@@ -916,6 +916,8 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
     const std::size_t pagesPerOutputWave = projection ? 0
         : (reductionBlocks + binding.page_granularity - 1)
             / binding.page_granularity;
+    const bool flattenedDownPages = !projection
+        && binding.page_count < outputWaves * pagesPerOutputWave;
     ImageWriter image(hardware);
     const auto physicalRow = [&](std::size_t pageRelativeRow) {
         if (pageRelativeRow < pageBegin || pageRelativeRow >= pageEnd)
@@ -994,9 +996,15 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
                 slot = localItem % logicalSlots;
             } else {
                 const std::size_t outputWave = n / 128;
-                logicalPage = outputWave * pagesPerOutputWave
-                    + reduction / binding.page_granularity;
-                itemInPage = reduction % binding.page_granularity;
+                const std::size_t flatItem =
+                    outputWave * reductionBlocks + reduction;
+                logicalPage = flattenedDownPages
+                    ? flatItem / binding.page_granularity
+                    : outputWave * pagesPerOutputWave
+                        + reduction / binding.page_granularity;
+                itemInPage = flattenedDownPages
+                    ? flatItem % binding.page_granularity
+                    : reduction % binding.page_granularity;
                 localItem = itemInPage
                     % binding.page_items_per_slice_group;
                 slot = (n % 64) / 32;

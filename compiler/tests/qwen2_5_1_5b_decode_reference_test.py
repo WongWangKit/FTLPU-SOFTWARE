@@ -46,7 +46,7 @@ def sparse_weight(rows: int, columns: int, seed: int) -> np.ndarray:
     return result
 
 
-def make_fixture() -> tuple[
+def make_fixture(prefill: int = PREFILL) -> tuple[
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -55,7 +55,9 @@ def make_fixture() -> tuple[
     dict[str, object],
     dict[str, np.ndarray],
 ]:
-    token = np.arange(PREFILL + 1, dtype=np.int32)[:, None]
+    if prefill <= 0:
+        raise ValueError("prefill length must be positive")
+    token = np.arange(prefill + 1, dtype=np.int32)[:, None]
     feature = np.arange(HIDDEN, dtype=np.int32)[None, :]
     activation = bf16(
         (((token * 13 + feature * 7) % 37) - 18).astype(np.float32)

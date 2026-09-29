@@ -68,6 +68,25 @@ int main() try {
     require(peer.getQueue() == 7 && peer.getOutputStream() == 6,
         "Swish output must use the fixed 8-stage chain tail");
 
+    static_cast<void>(schedule::ffn_detail::emitFfnSwishAlu(
+        rewriter, rewriter.getUnknownLoc(), tensor,
+        entry->getArgument(0), entry->getArgument(1), target,
+        FfnScheduleStrategy::Tail, 20, 1, 6));
+    schedule::VxmOp tailHead;
+    function.walk([&](schedule::VxmOp op) {
+        if (op.getCycle() == 20 && op.getQueue() == 0)
+            tailHead = op;
+    });
+    require(tailHead != nullptr,
+        "Tail Swish emitter must create its VXM chain head");
+    const auto tailLhsSource =
+        tailHead->getAttrOfType<mlir::StringAttr>("lhs_stream_source");
+    const auto tailRhsSource =
+        tailHead->getAttrOfType<mlir::StringAttr>("rhs_stream_source");
+    require(tailLhsSource && tailLhsSource.getValue() == "west"
+            && tailRhsSource && tailRhsSource.getValue() == "west",
+        "Tail Swish streams must name their physical source hemisphere");
+
     auto placement = schedule::ffn_detail::schedule_placement(rewriter,
         {31}, 8192 + 3 * 128 + 64, 1, 1, "east",
         "fp16_mxm_activation_planar");

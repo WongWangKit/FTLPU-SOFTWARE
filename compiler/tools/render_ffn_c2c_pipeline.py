@@ -117,17 +117,13 @@ def build_rounds(bindings: list[Binding], uses: list[PageUse],
 
     total_bandwidth = 2 * lanes_per_direction * bytes_per_lane
     rounds: list[Round] = []
-    projection_pages = min(binding.page_count for binding in projection)
-    for page in range(projection_pages):
-        page_uses = [uses_by_binding[binding.index][page] for binding in projection]
-        if len({use.bank for use in page_uses}) != 1:
-            raise ValueError("Gate and Up page banks do not match")
-        byte_size = sum(page_bytes(binding, page) for binding in projection)
-        rounds.append(Round(
-            "Gate + Up", page, page_uses[0].bank,
-            min(use.ready for use in page_uses),
-            max(use.release for use in page_uses), byte_size,
-            math.ceil(byte_size / total_bandwidth)))
+    for stage, binding in zip(("Gate", "Up"), projection):
+        for page in range(binding.page_count):
+            use = uses_by_binding[binding.index][page]
+            byte_size = page_bytes(binding, page)
+            rounds.append(Round(
+                stage, page, use.bank, use.ready, use.release, byte_size,
+                math.ceil(byte_size / total_bandwidth)))
     for page in range(down.page_count):
         use = uses_by_binding[down.index][page]
         byte_size = page_bytes(down, page)
@@ -147,8 +143,8 @@ def format_mib(byte_size: int) -> str:
 
 def render(rounds: list[Round], output: Path, lanes: int,
            bytes_per_lane: int, sequence_length: int) -> None:
-    initial = rounds[0].transfer_cycles
-    axis_start = -initial
+    axis_start = min(0, min(
+        item.ready - item.transfer_cycles for item in rounds))
     axis_end = max(item.release for item in rounds)
     width, height = 1920, 590
     left, right = 250, 50
@@ -159,13 +155,14 @@ def render(rounds: list[Round], output: Path, lanes: int,
         f"C2C West ({lanes} lanes)": 216,
         "MEM weight bank 0": 282,
         "MEM weight bank 1": 322,
-        "MXM Gate + Up": 388,
+        "MXM Gate / Up": 388,
         "VXM SwiGLU tail": 428,
         "MXM Down": 468,
     }
     bank_colors = {0: "#66b59a", 1: "#6f9fd8"}
     c2c_color = "#e9a24b"
-    swiglu_start = max(item.release for item in rounds if item.stage == "Gate + Up")
+    swiglu_start = max(
+        item.release for item in rounds if item.stage in ("Gate", "Up"))
     swiglu_end = min(item.ready for item in rounds if item.stage == "Down")
 
     def x(cycle: int) -> float:
@@ -198,7 +195,10 @@ def render(rounds: list[Round], output: Path, lanes: int,
         '<text x="516" y="99" class="sub">bank 1 resident / compute</text>',
         '<rect x="742" y="88" width="18" height="12" rx="2" fill="#df8167" stroke="#52606c"/>',
         '<text x="768" y="99" class="sub">SwiGLU tail</text>',
-        f'<text x="{width - right}" y="99" text-anchor="end" class="sub">19 rounds: 7 Gate/Up + 12 Down</text>',
+        f'<text x="{width - right}" y="99" text-anchor="end" class="sub">{len(rounds)} rounds: '
+        f'{sum(item.stage == "Gate" for item in rounds)} Gate + '
+        f'{sum(item.stage == "Up" for item in rounds)} Up + '
+        f'{sum(item.stage == "Down" for item in rounds)} Down</text>',
     ]
 
     for tick in range(11):
@@ -217,7 +217,7 @@ def render(rounds: list[Round], output: Path, lanes: int,
     for item in rounds:
         transfer_start = item.ready - item.transfer_cycles
         transfer_width = max(2.0, x(item.ready) - x(transfer_start))
-        transfer_label = f'{"GU" if item.stage == "Gate + Up" else "D"}{item.page}'
+        transfer_label = f'{item.stage[0]}{item.page}'
         per_direction = item.byte_size // 2
         tooltip = (
             f"{item.stage} page {item.page}: C2C {transfer_start}..{item.ready}; "
@@ -233,12 +233,13 @@ def render(rounds: list[Round], output: Path, lanes: int,
 
         compute_width = max(2.0, x(item.release) - x(item.ready))
         mem_y = lanes_y[f"MEM weight bank {item.bank}"]
-        label = f'{"Gate/Up" if item.stage == "Gate + Up" else "Down"} p{item.page}'
+        label = f'{item.stage} p{item.page}'
         compute_tooltip = (
             f"{item.stage} page {item.page}: ready {item.ready}, release {item.release}; "
             f"{format_mib(item.byte_size)}; bank {item.bank}"
         )
-        for y in (mem_y, lanes_y[f"MXM {item.stage}"]):
+        mxm_lane = "MXM Down" if item.stage == "Down" else "MXM Gate / Up"
+        for y in (mem_y, lanes_y[mxm_lane]):
             lines.append(
                 f'<rect x="{x(item.ready):.2f}" y="{y + 4}" width="{compute_width:.2f}" height="20" '
                 f'rx="2" fill="{bank_colors[item.bank]}" stroke="#46545f" stroke-width="0.7"><title>{esc(compute_tooltip)}</title></rect>')
@@ -255,10 +256,11 @@ def render(rounds: list[Round], output: Path, lanes: int,
     total_bytes = sum(item.byte_size for item in rounds)
     transfer_summary = ", ".join(
         f"{stage}: {next(item.transfer_cycles for item in rounds if item.stage == stage):,} cycles/page"
-        for stage in ("Gate + Up", "Down")
+        for stage in ("Gate", "Up", "Down")
+        if any(item.stage == stage for item in rounds)
     )
     lines.extend([
-        f'<text x="42" y="542" class="sub">Cold start: GU0 is prefetched before ICU cycle 0. During each compute round, the next page is loaded into the other SRAM bank.</text>',
+        f'<text x="42" y="542" class="sub">Bank-level ping-pong: Gate uses bank A; Up uses bank B while Down is prefetched into the released bank A groups.</text>',
         f'<text x="42" y="566" class="sub">C2C windows are derived from Command IR readiness and target bandwidth ({transfer_summary}); compute windows are executable residency intervals. Total weights: {format_mib(total_bytes)}.</text>',
         "</svg>",
     ])

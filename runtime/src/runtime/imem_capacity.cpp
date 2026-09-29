@@ -49,8 +49,9 @@ std::size_t fu_3d_packet_words(QueueKind kind)
     case QueueKind::Vxm:
         return isa::EncodedVxmIcuRun2DPacket::kWordCount;
     case QueueKind::SxmTranspose:
+        return isa::EncodedSxmTransposeIcuRun2DPacket::kWordCount;
     case QueueKind::SxmPermute:
-        return isa::EncodedSxmIcuRun2DPacket::kWordCount;
+        return isa::EncodedSxmPermuteIcuRun2DPacket::kWordCount;
     case QueueKind::C2cDma:
     case QueueKind::C2cTx:
     case QueueKind::C2cRx:
@@ -445,9 +446,11 @@ std::uint32_t fu_3d_context_bits_for(QueueKind kind)
     case QueueKind::Vxm:
         return static_cast<std::uint32_t>(hw::kIcuVxmRun2DContextBits);
     case QueueKind::SxmTranspose:
+        return static_cast<std::uint32_t>(
+            hw::kIcuSxmTransposeRun2DContextBits);
     case QueueKind::SxmPermute:
         return static_cast<std::uint32_t>(
-            hw::kIcuSxmRun2DContextBits);
+            hw::kIcuSxmPermuteRun2DContextBits);
     case QueueKind::C2cDma:
     case QueueKind::C2cTx:
     case QueueKind::C2cRx:

@@ -419,7 +419,7 @@ if(Python3_Interpreter_FOUND)
             --compile $<TARGET_FILE:ftlpu_compile>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
             --target-config ${FTLPU_HARDWARE_CONFIG}
-            --weight-bank 1
+            --weight-bank 0
             --kv-cache-capacity 256
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer
         DEPENDS ftlpu_opt ftlpu_compile

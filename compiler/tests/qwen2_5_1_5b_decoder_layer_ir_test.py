@@ -153,6 +153,25 @@ def validate_paged_weights(tensor: str, target_config: Path,
     physical_rows = target.get("mem", {}).get("rows_per_bank", 8192)
     bank_rows = int(target.get("memory", {}).get(
         "words_per_bank", physical_rows))
+    weight_slice_base = int(target.get("memory", {}).get(
+        "w8a16_weight_slice_base", 20))
+    slices_per_hemisphere = int(target.get("mem", {}).get(
+        "slices_per_hemisphere", 52))
+    expected_storage_slices = tuple(range(
+        weight_slice_base, slices_per_hemisphere
+    ))
+    storage_lists = re.findall(
+        r"page_storage_slices = \[([^\]]*)\]", tensor
+    )
+    if not storage_lists:
+        raise AssertionError("paged weights have no physical storage slices")
+    for body in storage_lists:
+        observed = tuple(int(value) for value in re.findall(r"\d+", body))
+        if observed != expected_storage_slices:
+            raise AssertionError(
+                "paged weight physical storage slices are corrupt: "
+                f"observed={observed}, expected={expected_storage_slices}"
+            )
     for weight in weights:
         if int(weight["count"]) <= 0:
             raise AssertionError(f"weight placement is empty: {weight}")

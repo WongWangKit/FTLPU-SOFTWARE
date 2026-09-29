@@ -43,7 +43,9 @@ mlir::LogicalResult lower_ffn(
                 element_type(op.getInput()).isBF16(), true, true, true},
             target, *executionPolicy);
         if (mlir::failed(strategy)) {
-            op.emitError("cannot select an MXM execution strategy for FFN");
+            op.emitError("cannot select an MXM execution strategy for FFN")
+                << " (m=" << op.getM() << ", n=" << op.getN()
+                << ", k=" << op.getHidden() << ")";
             return mlir::failure();
         }
         localDequantFfn = strategy->uses_local_dequant();

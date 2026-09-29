@@ -942,11 +942,22 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                   ? phaseStart
                                   : deferredRawWriteEnds[outputGroup];
         if (emitProjectionPass) {
+        // A half may be deferred only when the following half writes the
+        // same physical MEM queues.  Serial Query fixes the staging-slice
+        // rotation while it joins the two halves.  A full projection tile
+        // visits every packed result lane, so both rotated halves also cover
+        // the same queues.  A decode/tail block with fewer than eight rows
+        // does not: Key keeps the head-block rotation and its halves land on
+        // disjoint queues, so deferring half 0 there would leave the previous
+        // Query value in SRAM.
+        const bool rawHalvesShareQueues =
+            serialQueryProductsFirst || projectionRows >= 8;
         const bool rawQkHalfDomain =
             !directRopeCapable &&
             kind != AttentionProjectionKind::Value &&
             projectionHeadBlocks == 4 &&
-            outputGroup * 4 + 3 < projectionOutputBlocks;
+            outputGroup * 4 + 3 < projectionOutputBlocks &&
+            rawHalvesShareQueues;
         llvm::SmallVector<int64_t, 64> firstRawWriteCycle[2];
         llvm::SmallVector<int64_t, 64> firstRawWriteAddress[2];
         for (int64_t hemisphere = 0;

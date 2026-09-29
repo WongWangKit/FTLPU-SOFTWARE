@@ -372,7 +372,8 @@ CModelRuntime::CModelRuntime(C2cDmaSystem& system,
 {
 }
 
-void CModelRuntime::load(const BinaryProgram& program)
+void CModelRuntime::load(
+    const BinaryProgram& program, bool initializeInternalData)
 {
     validate_cmodel_hardware_config(program);
     SystemHardwareConfiguration hardware;
@@ -427,7 +428,6 @@ void CModelRuntime::load(const BinaryProgram& program)
     next_weight_page_use_ = 0;
     executed_cycles_ = 0;
     physical_cycles_ = 0;
-    waiting_weight_page_use_.reset();
     system_.icu().set_program_issue_enabled(true);
     if (execution_trace_enabled_)
         execution_trace_.begin_segment(program,
@@ -435,7 +435,13 @@ void CModelRuntime::load(const BinaryProgram& program)
     if (mem_execution_trace_enabled_)
         mem_execution_trace_.begin_segment(
             execution_trace_cycle_offset_, execution_trace_append_on_load_);
-    for (const BinaryBinding& binding : bindings_) {
+    if (initializeInternalData)
+        initialize_internal_data(program);
+}
+
+void CModelRuntime::initialize_internal_data(const BinaryProgram& program)
+{
+    for (const BinaryBinding& binding : program.bindings) {
         if (binding.access != BindingAccess::Internal) continue;
         if (binding.initializer == BindingInitializer::None) continue;
         if (binding.initializer == BindingInitializer::Zero) {
@@ -490,7 +496,9 @@ void CModelRuntime::load(const BinaryProgram& program)
             continue;
         }
         if (binding.initializer == BindingInitializer::RopeTable) {
-            if (binding.layout != BindingLayout::Fp16RopeTable
+            const bool decodeCompact = binding.layout
+                == BindingLayout::Fp16RopeTableDecodeCompact;
+            if ((binding.layout != BindingLayout::Fp16RopeTable && !decodeCompact)
                 || !is_16bit_float(binding.element_type)
                 || binding.shape.size() != 3 || binding.shape[2] != 2
                 || binding.slices.size() != 4 || binding.base_row < 0
@@ -517,7 +525,9 @@ void CModelRuntime::load(const BinaryProgram& program)
                     const std::size_t localDimension = dimension % lanes;
                     const std::size_t address =
                         static_cast<std::size_t>(binding.base_row)
-                        + (frequencyBlock * sequence + token) * stride;
+                        + (decodeCompact
+                            ? token + frequencyBlock
+                            : frequencyBlock * sequence + token) * stride;
                     const float inverse = 1.0f / std::pow(
                         binding.rope_theta,
                         static_cast<float>(2 * dimension)
@@ -572,7 +582,7 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
     upload_binding(binding, data);
 }
 
-bool CModelRuntime::load_ready_weight_pages()
+void CModelRuntime::load_ready_weight_pages()
 {
     while (next_weight_page_use_ < weight_page_uses_.size()
         && weight_page_uses_[next_weight_page_use_].ready_cycle
@@ -580,14 +590,6 @@ bool CModelRuntime::load_ready_weight_pages()
         const auto& use = weight_page_uses_[next_weight_page_use_];
         const auto& binding = find_binding(
             BindingAccess::Input, use.binding_index);
-        if (weight_page_residency_checker_) {
-            if (!weight_page_residency_checker_(use)) {
-                waiting_weight_page_use_ = use;
-                return false;
-            }
-            ++next_weight_page_use_;
-            continue;
-        }
         const auto logical = paged_weight_data_.find(use.binding_index);
         if (logical == paged_weight_data_.end())
             throw std::logic_error(
@@ -623,20 +625,6 @@ bool CModelRuntime::load_ready_weight_pages()
         }
         ++next_weight_page_use_;
     }
-    waiting_weight_page_use_.reset();
-    return true;
-}
-
-void CModelRuntime::set_weight_page_residency_checker(
-    std::function<bool(const BinaryWeightPageUse&)> checker)
-{
-    weight_page_residency_checker_ = std::move(checker);
-}
-
-void CModelRuntime::set_weight_page_wait_observer(
-    std::function<void()> observer)
-{
-    weight_page_wait_observer_ = std::move(observer);
 }
 
 void CModelRuntime::enable_execution_trace(bool enabled) noexcept
@@ -1428,47 +1416,24 @@ void CModelRuntime::run_logical_cycles(
 {
     sinks.capture_mem_trace = mem_execution_trace_enabled_;
     const auto count = cycles == 0 ? loaded_max_cycle_ + 1 : cycles;
-    std::size_t advanced = 0;
-    std::size_t consecutiveStalls = 0;
-    constexpr std::size_t kNoProgressWatchdogCycles = 10'000'000;
-    while (advanced < count) {
-        const bool pageReady = load_ready_weight_pages();
-        // A page-ready SYNC is a chip-wide consumer barrier.  While its
-        // producer is late, keep C2C and an in-order MEM_WRITE_SYNC moving,
-        // but hold every ordinary FU queue at the same logical boundary.
-        // Letting queues that have already reached WAIT_EVENT resume before
-        // slower queues arrive would skew the statically aligned MEM/MXM
-        // streams.  InstructionControlUnit's paused mode is transport-aware:
-        // C2C always advances and MEM ticks only a synchronized write at the
-        // queue head, so the page producer cannot deadlock behind its own
-        // consumer barrier.
-        system_.icu().set_program_issue_enabled(pageReady);
+    system_.icu().set_program_issue_enabled(true);
+    for (std::size_t advanced = 0; advanced < count; ++advanced) {
+        // Locally uploaded pages are installed at their static boundary.
+        // Executable C2C pages are linked as per-ICU WAIT_EVENT epochs and are
+        // removed from weight_page_uses before CModelRuntime::load(). Runtime
+        // never changes the global issue enable or freezes logical time.
+        load_ready_weight_pages();
         tick_(sinks);
         if (execution_trace_enabled_)
-            execution_trace_.sample(system_, physical_cycles_, pageReady,
-                waiting_weight_page_use_
-                    ? &*waiting_weight_page_use_ : nullptr);
+            execution_trace_.sample(
+                system_, physical_cycles_, true, nullptr);
         if (mem_execution_trace_enabled_)
-            mem_execution_trace_.sample(
-                system_, physical_cycles_, pageReady);
+            mem_execution_trace_.sample(system_, physical_cycles_, true);
         datapath_performance_.sample(
             system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
         ++physical_cycles_;
-        if (pageReady) {
-            ++executed_cycles_;
-            ++advanced;
-            consecutiveStalls = 0;
-            continue;
-        }
-        if (weight_page_wait_observer_)
-            weight_page_wait_observer_();
-        if (++consecutiveStalls > kNoProgressWatchdogCycles)
-            throw std::runtime_error(
-                "runtime page-ready wait made no progress for "
-                + std::to_string(kNoProgressWatchdogCycles)
-                + " physical cycles");
+        ++executed_cycles_;
     }
-    system_.icu().set_program_issue_enabled(true);
 }
 
 void CModelRuntime::dispatch_icu_cycles(std::size_t cycles, std::ostream* log)
