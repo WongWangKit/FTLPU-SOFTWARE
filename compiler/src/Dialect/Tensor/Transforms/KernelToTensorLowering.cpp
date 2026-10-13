@@ -357,6 +357,13 @@ mlir::FailureOr<mlir::ArrayAttr> get_value_task_allocations(
         return op.getResultAllocations();
     if (auto op = value.getDefiningOp<tensor::ElementwiseTaskOp>())
         return op.getResultAllocations();
+    if (auto op = value.getDefiningOp<tensor::DepthwiseConv1DTaskOp>())
+        return op.getResultAllocations();
+    if (auto op = value.getDefiningOp<tensor::GatedDeltaRuleTaskOp>()) {
+        if (value == op.getOutput()) return op.getOutputAllocations();
+        if (value == op.getFinalState())
+            return op.getFinalStateAllocations();
+    }
     if (auto op = value.getDefiningOp<tensor::ProjectionTaskOp>()) {
         auto placement =
             op.getMemoryPlan().getAs<mlir::DictionaryAttr>("result");

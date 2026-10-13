@@ -44,14 +44,14 @@ try {
 
     using namespace ftlpu;
     using namespace ftlpu::software::runtime;
-    VxmLaneAluInstruction lane {};
+    VxmSrInstruction lane {};
     lane.operation = VxmAluOpcode::Add;
-    lane.lhs = VxmLaneOperand::StreamBFloat16(1.0f, 0);
-    lane.rhs = VxmLaneOperand::Imm(0.25f);
-    lane.output_type = VxmCastTarget::BFloat16;
+    lane.lhs = VxmSrOperand::StreamBFloat16(StreamId::East(0).packed());
+    lane.rhs = VxmSrOperand::Immediate(0.25f);
+    lane.result_sr = static_cast<std::uint8_t>(StreamId::East(0).packed());
+    lane.result_type = VxmCastTarget::BFloat16;
     lane.repeat_count = 32;
-    const auto packet = VxmCompactInstructionCodec::encode(
-        0, VxmChainDepth::Eight, lane);
+    const auto packet = VxmSrCompactInstructionCodec::encode(lane);
 
     QueueCommand native;
     native.command = static_cast<isa::EncodedIcuCommand>(
@@ -92,8 +92,8 @@ try {
         if (const auto issued = icu.vxm_iq(0).tick()) {
             require(*issued == packet,
                 "runtime loader changed the VXM packet");
-            require(VxmCompactInstructionCodec::decode(0, *issued)
-                        .instruction.repeat_count == 32,
+            require(VxmSrCompactInstructionCodec::decode(*issued)
+                        .repeat_count == 32,
                 "runtime loader expanded the VXM datapath repeat");
             issueCycles.push_back(cycle);
         }

@@ -37,6 +37,8 @@ struct WeightPrefetchPlan {
     std::vector<WeightResidencyRegion> regions{};
     // Ordinary West SR selected for each active C2C transport lane.
     std::vector<std::uint16_t> fabric_streams{};
+    // SRAM reuse boundary before transport serialization delays are applied.
+    std::uint64_t earliest_mem_cycle{0};
 };
 
 // Builds the executable-local C2C schedule from compiler-provided weight

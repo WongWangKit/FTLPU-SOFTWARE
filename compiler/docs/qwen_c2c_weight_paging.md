@@ -169,7 +169,7 @@ scales with segments rather than 32-byte vectors.
 - The real Qwen2.5-1.5B layer-0 seq-len-32 executable passes all 49,152 output
   values against the hardware-arithmetic golden with maximum absolute error
   0.015625 and MAE 0.000332287. Checkpoint Q/K/V biases are ordinary StableHLO
-  broadcast-plus-add operands: Q/K bias is fused into the VXM RoPE FMA, while
+  broadcast-plus-add operands: Q/K bias uses explicit VXM multiply and add columns in the RoPE product, while
   V follows `MXM BF16 stream -> VXM bias add -> distributed16 MEM`.
 
 Convert a logical package with:
@@ -219,3 +219,5 @@ cycles. With the current 8192-row SRAM target and executable-internal
 projection paging, the real two-layer seq-len-32 run records 425,380 initial
 page-wait cycles and 9,340 layer-boundary page-wait cycles. The second-layer
 transfer overlaps the first layer's execution, but is not completely hidden.
+
+A MEM queue performing asynchronous weight prefetch can skip an intervening compute epoch rendezvous when it has no ordinary MEM FU access before the next page barrier. It waits early at the next consumer barrier, retaining that barrier's logical phase offset but removing the fixed idle interval following WRITE_SYNC. Compute participants and page commits determine the release, so a late DDR transfer does not replay the static gap. Queues with an intervening MEM access retain their synchronization and relative timing. No decoded ICU loop is interrupted.

@@ -43,8 +43,15 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
     const int64_t sliceGroupCount = storageSlices / weightSlices;
     if (sliceGroupCount % 2 != 0) return mlir::failure();
     const int64_t splitProjectionGroupsPerRole = sliceGroupCount / 2;
-    const int64_t projectionWavesPerGroup =
+    // Two adjacent 64-column projection waves share one doubled physical
+    // reduction-row stripe. Keep the per-group capacity even and leave one
+    // complete pair below the raw SRAM limit; an odd tail still occupies the
+    // full doubled stripe and therefore does not save rows.
+    const int64_t rawProjectionWavesPerGroup =
         memory.sram_depth_rows / projectionRowsPerWave;
+    const int64_t projectionWavesPerGroup =
+        2 * ((rawProjectionWavesPerGroup - 1) / 2);
+    if (projectionWavesPerGroup <= 0) return mlir::failure();
     const bool bankLevelPingPong = projectionWaves
         <= sliceGroupCount * projectionWavesPerGroup;
     const int64_t projectionGroupsPerRole = bankLevelPingPong
@@ -84,8 +91,10 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
          wave += projectionWavesPerPage) {
         const int64_t count = std::min(
             projectionWavesPerPage, projectionWaves - wave);
-        const int64_t rows = std::min(count, projectionWavesPerGroup)
-            * projectionRowsPerWave;
+        const int64_t itemsInLargestGroup =
+            std::min(count, projectionWavesPerGroup);
+        const int64_t rows = divideCeil(itemsInLargestGroup, 2)
+            * 2 * projectionRowsPerWave;
         FfnWeightTilePage page {-1, -1, 0, rows,
             memory.hemispheres * weightSlices * count
                 * projectionRowsPerWave * 2,
@@ -135,33 +144,12 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
         ? memory.sram_depth_rows / downRowsPerWave : 0;
     const int64_t downWavesPerBank =
         downWavesPerGroup * sliceGroupCount;
-    const bool groupedDownPages = bankLevelPingPong && compactDownWaves
-        && downWavesPerGroup > 0 && downWaves <= downWavesPerBank;
-    if (groupedDownPages) {
-        result.down_output_waves_per_page = downWavesPerGroup;
-        result.down_items_per_page =
-            downWavesPerGroup * downReductionBlocks;
-        result.down_items_per_slice_group = result.down_items_per_page;
-        int64_t bindingPageIndex = 0;
-        for (int64_t wave = 0; wave < downWaves;
-             wave += downWavesPerGroup) {
-            const int64_t waveCount = std::min(
-                downWavesPerGroup, downWaves - wave);
-            const int64_t group = wave / downWavesPerGroup;
-            const int64_t rows = waveCount * downRowsPerWave;
-            FfnWeightTilePage page {-1, initialBank, 0, rows,
-                memory.hemispheres * weightSlices * rows, 0, {}};
-            page.spans.push_back({FfnWeightTileKind::Down,
-                initialBank, 0, group, 1,
-                waveCount * downReductionBlocks, wave, waveCount,
-                0, downReductionBlocks, downOutputBlocksPerHemisphere,
-                rows});
-            appendPage(std::move(page), bindingPageIndex++);
-        }
-        result.minimum_hidden_slices = divideCeil(
-            shape.m * shape.hidden * 2, result.bank_bytes);
-        return result;
-    }
+    // Keep one logical Down output wave per runtime page. Several waves may
+    // remain resident simultaneously in disjoint slice-group/row slots, but
+    // the page identity must stay aligned with the compute timeline and the
+    // per-page synchronization ABI. Packing several output waves into one
+    // logical page loses that boundary and can release the tail waves before
+    // their result writes drain.
     int64_t downPageIndex = 0;
     for (int64_t wave = 0; wave < downWaves; ++wave) {
         for (int64_t reduction = 0; reduction < downReductionBlocks;

@@ -188,14 +188,13 @@ BinaryProgram parameterize_program(const ModelPackage &package,
       auto run = isa::decode_vxm_icu_run_2d_instruction(packet);
       auto decoded = isa::decode_vxm_instruction(queue->index,
                                                   run.instruction);
-      VxmLaneOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
-          ? decoded.instruction.lhs : decoded.instruction.rhs;
-      if (operand.kind != VxmLaneOperandKind::Immediate)
+      VxmSrOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
+          ? decoded.lhs : decoded.rhs;
+      if (operand.kind != VxmSrOperandKind::Immediate)
         throw std::logic_error(
             "raw VXM RUN_2D scale relocation target is not immediate");
-      operand = VxmLaneOperand::Imm(tensor.scales[relocation.scale_index]);
-      run.instruction = isa::encode_vxm_instruction(
-          queue->index, decoded.chain_depth, decoded.instruction);
+      operand = VxmSrOperand::Immediate(tensor.scales[relocation.scale_index]);
+      run.instruction = VxmSrCompactInstructionCodec::encode(decoded);
       packet = isa::encode_vxm_icu_run_2d_instruction(run);
       for (std::size_t word = 0; word < packetWords; ++word) {
         QueueCommand &target =
@@ -223,16 +222,14 @@ BinaryProgram parameterize_program(const ModelPackage &package,
             (static_cast<std::uint64_t>(command.words[1]) << 32),
         command.words[2]};
     auto decoded = isa::decode_vxm_instruction(queue->index, encoded);
-    VxmLaneAluInstruction &instruction = decoded.instruction;
-    VxmLaneOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
-                                  ? instruction.lhs
-                                  : instruction.rhs;
-    if (operand.kind != VxmLaneOperandKind::Immediate)
+    VxmSrOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
+                                  ? decoded.lhs
+                                  : decoded.rhs;
+    if (operand.kind != VxmSrOperandKind::Immediate)
       throw std::logic_error(
           "scale relocation target is not an immediate operand");
-    operand = VxmLaneOperand::Imm(tensor.scales[relocation.scale_index]);
-    encoded = isa::encode_vxm_instruction(queue->index, decoded.chain_depth,
-                                          instruction);
+    operand = VxmSrOperand::Immediate(tensor.scales[relocation.scale_index]);
+    encoded = VxmSrCompactInstructionCodec::encode(decoded);
     command.words = {static_cast<std::uint32_t>(encoded.control),
                      static_cast<std::uint32_t>(encoded.control >> 32),
                      encoded.immediate_bits, 0};
@@ -1760,7 +1757,8 @@ void ModelSession::schedule_executable_weight_pages(BinaryProgram &program) {
         static_cast<std::size_t>(transfer.plan.start_cycle),
         static_cast<std::size_t>(transfer.plan.transfer_end_cycle),
         static_cast<std::size_t>(transfer.plan.ready_cycle),
-        transfer.launch_event_tag, transfer.page_ready_event_tag);
+        transfer.launch_event_tag, transfer.page_ready_event_tag,
+        static_cast<std::size_t>(transfer.plan.earliest_mem_cycle));
     transfer.plan.start_cycle = transfer.fence.scheduled_start_cycle;
     transfer.plan.transfer_end_cycle =
         transfer.fence.scheduled_end_cycle;
@@ -1803,6 +1801,27 @@ void ModelSession::schedule_executable_weight_pages(BinaryProgram &program) {
           static_cast<std::size_t>(segment.vector_count) *
           hw::kPhysicalVectorBytes;
   }
+  // Pages occupying one MEM idle interval can have different first uses but
+  // share the same earliest queue collision. Admit all of them with one
+  // rendezvous at that cut; stacked events would replay the wavefront skew.
+  const auto eventAliases = weight_pager_->coalesce_page_ready_events();
+  std::vector<ExecutionEpoch> mergedEpochs;
+  for (auto& epoch : execution_epochs_) {
+    for (const auto& [oldTag, newTag] : eventAliases)
+      if (epoch.event_tag == oldTag) { epoch.event_tag = newTag; break; }
+    const auto existing = std::ranges::find_if(mergedEpochs,
+        [&](const auto& other) { return other.event_tag == epoch.event_tag; });
+    if (existing == mergedEpochs.end()) mergedEpochs.push_back(std::move(epoch));
+    else existing->transfer_indices.insert(existing->transfer_indices.end(),
+        epoch.transfer_indices.begin(), epoch.transfer_indices.end());
+  }
+  execution_epochs_ = std::move(mergedEpochs);
+  for (auto& transfer : executable_weight_transfers_)
+    for (const auto& [oldTag, newTag] : eventAliases)
+      if (transfer.page_ready_event_tag == oldTag) {
+        transfer.page_ready_event_tag = newTag;
+        break;
+      }
   weight_pager_->finalize_schedule(linkProgram);
   for (ExecutionEpoch &epoch : execution_epochs_)
     epoch.releases = weight_pager_->page_ready_releases(epoch.event_tag);
@@ -1904,8 +1923,11 @@ void ModelSession::observe_executable_weight_page_tick() {
 
   // An epoch event represents a set of SRAM resources, not one transfer.
   // Release it only after every page required by that epoch has committed.
-  // Each ICU then leaves its own WAIT_EVENT; no global runtime issue gate is
-  // involved and no decoded 3-D loop can be suspended halfway through.
+  // A release phase is a real multi-ICU rendezvous: all queues in that phase
+  // must have reached their WAIT_EVENT before any receives the token.  This
+  // matters when C2C runs later than its static estimate.  Otherwise an MXM
+  // queue can consume a latched token while its MEM producer is still in the
+  // NOP that originally separated ingress from the consumer boundary.
   for (ExecutionEpoch &epoch : execution_epochs_) {
     if (epoch.released)
       continue;
@@ -1923,19 +1945,64 @@ void ModelSession::observe_executable_weight_page_tick() {
       continue;
     if (!epoch.actual_ready_cycle)
       epoch.actual_ready_cycle = readyCycle;
-    const auto elapsed = static_cast<std::size_t>(
-        physicalCycle + 1 - *epoch.actual_ready_cycle);
     if (epoch.releases.empty()) {
       c2c_system_->chip().icu().broadcast_tagged_notification(
           epoch.event_tag);
       epoch.released = true;
     } else {
-      while (epoch.next_release < epoch.releases.size()
-             && epoch.releases[epoch.next_release].phase_offset <= elapsed) {
-        const auto &release = epoch.releases[epoch.next_release++];
-        c2c_system_->chip().icu().notify_tagged(
-            release.location, epoch.event_tag);
+      // Join the startup phases before launching a new activation wave.
+      // Their skew is bounded by the MEM-to-MXM SR flight window. A later
+      // downstream phase can require results produced by this epoch, so it
+      // must rendezvous separately rather than blocking the launch itself.
+      // Without the startup join, an early MEM queue can emit a new wave
+      // while another producer is still draining the preceding Read3D.
+      if (!epoch.release_origin_cycle) {
+        constexpr auto startupWindow =
+            hw::kMxmBoundaryStreamRegisterColumn + 1;
+        bool allParticipantsAtBarrier = true;
+        for (const auto& release : epoch.releases) {
+          if (release.phase_offset > startupWindow && !release.activation_producer)
+            continue;
+          if (!c2c_system_->chip().icu().blocked_on_tagged_event(
+                  release.location, epoch.event_tag)) {
+            allParticipantsAtBarrier = false;
+            break;
+          }
+        }
+        if (!allParticipantsAtBarrier)
+          continue;
       }
+      const auto phaseBegin = epoch.next_release;
+      const auto phaseOffset = epoch.releases[phaseBegin].phase_offset;
+      auto phaseEnd = phaseBegin;
+      while (phaseEnd < epoch.releases.size()
+             && epoch.releases[phaseEnd].phase_offset == phaseOffset)
+        ++phaseEnd;
+
+      const auto now = physicalCycle + 1;
+      const auto expected = epoch.release_origin_cycle
+          ? *epoch.release_origin_cycle
+              + static_cast<std::int64_t>(phaseOffset)
+          : *epoch.actual_ready_cycle;
+      if (now < expected)
+        continue;
+      bool allAtBarrier = true;
+      for (auto index = phaseBegin; index < phaseEnd; ++index)
+        if (!c2c_system_->chip().icu().blocked_on_tagged_event(
+                epoch.releases[index].location, epoch.event_tag)) {
+          allAtBarrier = false;
+          break;
+        }
+      if (!allAtBarrier)
+        continue;
+
+      if (!epoch.release_origin_cycle)
+        epoch.release_origin_cycle = now
+            - static_cast<std::int64_t>(phaseOffset);
+      for (auto index = phaseBegin; index < phaseEnd; ++index)
+        c2c_system_->chip().icu().notify_tagged(
+            epoch.releases[index].location, epoch.event_tag);
+      epoch.next_release = phaseEnd;
       epoch.released = epoch.next_release == epoch.releases.size();
     }
   }
@@ -2463,6 +2530,9 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   // program that was actually handed to the runtime, including its linked
   // C2C queues and compiler-authored MEM sync words.
   last_linked_program_ = program;
+  if (const char *diagnosticPath =
+          std::getenv("FTLPU_SESSION_DIAGNOSTIC_PROGRAM"))
+    write_last_linked_program(diagnosticPath);
   report("loading runtime program");
   BinaryProgram runtimeProgram = without_compiled_mem_read_sync(program);
   // The linked WAIT_EVENT instructions are the hardware-visible page
@@ -2492,13 +2562,71 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     runtime_.run_cycles(traceCycles, &std::cerr);
     runtime_.run_cycles(executionCycles - traceStart - traceCycles);
   } else {
-    runtime_.run_cycles(executionCycles);
+    if (!reportProgress) {
+      runtime_.run_cycles(executionCycles);
+    } else {
+      for (std::size_t cycle = 0; cycle < executionCycles;) {
+        const auto count = std::min<std::size_t>(100'000, executionCycles - cycle);
+        runtime_.run_cycles(count);
+        cycle += count;
+        std::clog << "FTLPU invocation " << index << ": execution cycle="
+                  << cycle << "/" << executionCycles << std::endl;
+        if (c2c_system_ != nullptr) {
+          for (const auto &epoch : execution_epochs_) {
+            if (epoch.released) continue;
+            std::clog << "FTLPU pending epoch: tag=" << epoch.event_tag
+                      << " ready=" << epoch.actual_ready_cycle.has_value()
+                      << " release=" << epoch.next_release << "/"
+                      << epoch.releases.size() << std::endl;
+            if (epoch.next_release < epoch.releases.size()) {
+              const auto offset = epoch.releases[epoch.next_release].phase_offset;
+              std::size_t missing = 0;
+              for (auto i = epoch.next_release; i < epoch.releases.size()
+                   && epoch.releases[i].phase_offset == offset; ++i) {
+                const auto location = epoch.releases[i].location;
+                if (c2c_system_->chip().icu().blocked_on_tagged_event(
+                        location, epoch.event_tag)) continue;
+                if (missing++ < 8)
+                  std::clog << "FTLPU epoch participant not waiting: kind="
+                            << static_cast<int>(location.kind)
+                            << " unit=" << location.unit
+                            << " index=" << location.index
+                            << " bank=" << location.bank
+                            << " offset=" << offset << std::endl;
+              }
+              std::clog << "FTLPU epoch missing participants=" << missing
+                        << std::endl;
+            }
+            break;
+          }
+        }
+      }
+    }
   }
   if (c2c_system_ != nullptr && !executable_weight_transfers_.empty()
       && std::getenv("FTLPU_SESSION_STOP_CYCLE") == nullptr) {
     constexpr std::size_t kCompletionWatchdogCycles = 10'000'000;
     std::size_t delayedCycles = 0;
     while (!linked_program_done(*c2c_system_, runtimeProgram)) {
+      if (reportProgress && delayedCycles % 100'000 == 0) {
+        std::clog << "FTLPU invocation " << index
+                  << ": completion wait cycles=" << delayedCycles << std::endl;
+        const auto reportQueue = [&](const auto &iq, const char *kind,
+                                     std::size_t queue) {
+          if (!iq.done())
+            std::clog << "FTLPU unfinished queue: " << kind << " index="
+                      << queue << " fetch_pc=" << iq.fetch_pc() << std::endl;
+        };
+        auto &icu = c2c_system_->chip().icu();
+        for (std::size_t queue = 0; queue < InstructionControlUnit::kMemQueues;
+             ++queue)
+          reportQueue(icu.mem_iq(queue), "mem", queue);
+        for (std::size_t queue = 0; queue < 2; ++queue) {
+          const auto hemisphere = static_cast<Hemisphere>(queue);
+          reportQueue(icu.c2c_dma_iq(hemisphere), "c2c_dma", queue);
+          reportQueue(icu.c2c_rx_iq(hemisphere), "c2c_rx", queue);
+        }
+      }
       if (delayedCycles++ == kCompletionWatchdogCycles)
         throw std::runtime_error(
             "linked ICU queues did not complete after page-ready waits");

@@ -54,6 +54,12 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
             target::StreamEndpoint::Mem,
             target::StreamDirection::East, slice);
     };
+    const auto bridgeWriteLatency = [&](int64_t slice) {
+        return *target_.transport_latency(
+            target::StreamEndpoint::VxmBridgeResult,
+            target::StreamEndpoint::Mem,
+            target::StreamDirection::East, slice);
+    };
     const auto maxReadLatency = [&](llvm::ArrayRef<int64_t> slices) {
         int64_t latency = 0;
         for (int64_t slice : slices)
@@ -110,126 +116,29 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                                        int64_t outputCycle,
                                        int64_t count, int64_t stride,
                                        int64_t bank,
-                                       int64_t repeatInterval = 1) {
+                                       int64_t repeatInterval = 1,
+                                       int64_t terminalPipelineLatency = 0) {
         for (int64_t destination = 0;
              destination < target_.memory().hemispheres; ++destination) {
-            const int64_t source = 1 - destination;
             for (int64_t byte = 0; byte < 2; ++byte) {
                 const int64_t slice = slices[byte];
-                plan.push_back({outputCycle + writeLatency(slice),
+                plan.push_back({outputCycle + writeLatency(slice)
+                        + terminalPipelineLatency,
                     destination
                             * target_.memory().slices_per_hemisphere
                         + slice,
                     "write", address,
-                    source * 8 + originalOutputStream + byte,
+                    destination * 8 + originalOutputStream + byte,
                     count, repeatInterval, stride,
                     1, 1, 0, bank});
             }
         }
     };
+    std::vector<PlannedMemTransfer> deferredMemTransfers;
     const auto emitPlannedTransfers =
         [&](std::vector<PlannedMemTransfer>& plan) {
-        std::sort(plan.begin(), plan.end(),
-            [](const PlannedMemTransfer& lhs,
-                const PlannedMemTransfer& rhs) {
-                return std::tie(lhs.queue, lhs.opcode, lhs.bank, lhs.cycle)
-                    < std::tie(rhs.queue, rhs.opcode, rhs.bank, rhs.cycle);
-            });
-        const auto sameShape = [](const PlannedMemTransfer& lhs,
-                                  const PlannedMemTransfer& rhs) {
-            return lhs.queue == rhs.queue && lhs.opcode == rhs.opcode
-                && lhs.stream == rhs.stream && lhs.bank == rhs.bank
-                && lhs.repeat_count == rhs.repeat_count
-                && lhs.repeat_interval == rhs.repeat_interval
-                && lhs.address_stride == rhs.address_stride
-                && lhs.wave_count == rhs.wave_count
-                && lhs.wave_interval == rhs.wave_interval
-                && lhs.wave_address_stride == rhs.wave_address_stride;
-        };
-        for (std::size_t begin = 0; begin < plan.size();) {
-            const PlannedMemTransfer& base = plan[begin];
-            std::size_t end = begin + 1;
-            while (end < plan.size() && sameShape(base, plan[end])) ++end;
-            const std::size_t count = end - begin;
-            const int64_t issueSpan =
-                (base.repeat_count - 1) * base.repeat_interval
-                + (base.wave_count - 1) * base.wave_interval + 1;
-            const int64_t cycleStride = count > 1
-                ? plan[begin + 1].cycle - base.cycle : 1;
-            bool affineCycles = count > 1 && cycleStride >= issueSpan;
-            for (std::size_t index = 0;
-                 affineCycles && index < count; ++index)
-                affineCycles = plan[begin + index].cycle
-                    == base.cycle
-                        + static_cast<int64_t>(index) * cycleStride;
-
-            int64_t groupAddressStride = 0;
-            bool affineAddress = affineCycles;
-            if (count > 1) {
-                groupAddressStride =
-                    plan[begin + 1].address - base.address;
-                for (std::size_t index = 0;
-                     affineAddress && index < count; ++index)
-                    affineAddress = plan[begin + index].address
-                        == base.address
-                            + static_cast<int64_t>(index)
-                                * groupAddressStride;
-            }
-
-            int64_t outerGroupSize = 1;
-            int64_t outerInnerStride = 0;
-            int64_t outerGroupStride = 0;
-            if (affineCycles && !affineAddress) {
-                for (std::size_t candidate = 2;
-                     candidate < count && candidate <= 65536;
-                     candidate *= 2) {
-                    const int64_t innerStride =
-                        plan[begin + 1].address - base.address;
-                    const int64_t outerStride =
-                        plan[begin + candidate].address - base.address;
-                    bool blocked = true;
-                    for (std::size_t index = 0;
-                         blocked && index < count; ++index)
-                        blocked = plan[begin + index].address
-                            == base.address
-                                + static_cast<int64_t>(index % candidate)
-                                    * innerStride
-                                + static_cast<int64_t>(index / candidate)
-                                    * outerStride;
-                    if (!blocked) continue;
-                    outerGroupSize = static_cast<int64_t>(candidate);
-                    outerInnerStride = innerStride;
-                    outerGroupStride = outerStride;
-                    break;
-                }
-            }
-
-            if (affineAddress || outerGroupSize > 1) {
-                attention_detail::emitMem3D(rewriter_, op_.getLoc(),
-                    base.cycle, base.queue, base.opcode, base.address,
-                    base.stream, base.repeat_count, base.repeat_interval,
-                    base.address_stride, "", -1,
-                    base.wave_count, base.wave_interval,
-                    base.wave_address_stride,
-                    static_cast<int64_t>(count), cycleStride,
-                    affineAddress ? groupAddressStride : 0,
-                    base.bank, -1, -1, outerGroupSize,
-                    outerInnerStride, outerGroupStride);
-            } else {
-                for (std::size_t index = begin; index < end; ++index) {
-                    const PlannedMemTransfer& transfer = plan[index];
-                    direct_domain_detail::emitMem3D(
-                        rewriter_, op_.getLoc(), target_, transfer.cycle,
-                        transfer.queue, transfer.opcode, transfer.address,
-                        transfer.stream, transfer.repeat_count,
-                        transfer.repeat_interval, transfer.address_stride,
-                        transfer.wave_count, transfer.wave_interval,
-                        transfer.wave_address_stride, 1, 1, 0, -1,
-                        transfer.bank);
-                }
-            }
-            begin = end;
-        }
+        deferredMemTransfers.insert(deferredMemTransfers.end(),
+            plan.begin(), plan.end());
     };
     struct ProbabilityPackWrite {
         int64_t cycle;
@@ -240,6 +149,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         int64_t interval;
     };
     std::vector<ProbabilityPackWrite> pendingPackWrites;
+    int64_t probabilityPackComplete = 0;
     const auto probabilityPackSlices = layout.probabilityPackSlices();
     const auto canGroupPackSlice = [&](int64_t slice) {
         if (std::count(probabilityPackSlices.begin(),
@@ -264,6 +174,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         }
         return true;
     };
+    static_cast<void>(canGroupPackSlice);
     const auto vxm = [&](int64_t cycle, int64_t queue,
                          llvm::StringRef opcode,
                          llvm::StringRef lhsKind, int64_t lhsIndex,
@@ -276,15 +187,42 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                          bool accumulatorWrite = false,
                          bool accumulatorEmit = true,
                          bool localScalarWrite = false) {
-        return ffn_detail::create_vxm(rewriter_, op_.getLoc(),
+        auto primary = ffn_detail::create_vxm(rewriter_, op_.getLoc(),
             op_.getInput(), op_.getInput(), op_.getInput().getType(),
             cycle, queue, opcode,
             lhsKind, lhsIndex, lhsImmediate,
             rhsKind, rhsIndex, rhsImmediate,
             castTarget, outputStream, repeatCount, 1,
-            "east", "east", -1,
+            "east", outputStream < 0 ? "east" : "west", -1,
             accumulatorReset, accumulatorWrite, accumulatorEmit,
             localScalarWrite, chainDepth);
+        const int64_t mirrorQueue =
+            target_.throughput().vxm_alus - 1 - queue;
+        const auto mirroredKind = [](llvm::StringRef kind) {
+            return kind == "previous" || kind == "feedback"
+                ? llvm::StringRef("alu") : kind;
+        };
+        const auto mirroredIndex = [&](llvm::StringRef kind, int64_t index) {
+            if (kind.starts_with("stream_")) return index + 16;
+            if (kind == "previous") return mirrorQueue + 1;
+            if (kind == "feedback")
+                return mirrorQueue - chainDepth + 1;
+            if (kind == "alu")
+                return target_.throughput().vxm_alus - 1 - index;
+            return index;
+        };
+        ffn_detail::create_vxm(rewriter_, op_.getLoc(),
+            op_.getInput(), op_.getInput(), op_.getInput().getType(),
+            cycle, mirrorQueue, opcode,
+            mirroredKind(lhsKind), mirroredIndex(lhsKind, lhsIndex),
+            lhsImmediate, mirroredKind(rhsKind),
+            mirroredIndex(rhsKind, rhsIndex), rhsImmediate,
+            castTarget, outputStream < 0 ? outputStream : outputStream + 8,
+            repeatCount, 1, "west",
+            outputStream < 0 ? "west" : "east", -1,
+            accumulatorReset, accumulatorWrite, accumulatorEmit,
+            localScalarWrite, chainDepth);
+        return primary;
     };
 
     struct SoftmaxWorkState {
@@ -334,8 +272,12 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
             if (state.hemisphere != sourceHemisphere) continue;
             const int64_t copyBridge = cursor
                 + maxReadLatency(state.score_slices) + 1;
+            int64_t maxBridgeWriteLatency = 0;
+            for (int64_t slice : state.score_slices)
+                maxBridgeWriteLatency = std::max(
+                    maxBridgeWriteLatency, bridgeWriteLatency(slice));
             const int64_t mirrorWriteEnd = copyBridge
-                + maxWriteLatency(state.score_slices) + sequence - 1;
+                + maxBridgeWriteLatency + 1 + sequence - 1;
             for (int64_t byte = 0; byte < 2; ++byte) {
                 const int64_t slice = state.score_slices[byte];
                 mirrorTransfers.push_back({copyBridge - readLatency(slice),
@@ -344,7 +286,8 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                         + slice,
                     "read", state.score_address, 32 + byte,
                     sequence, 1, 1, 1, 1, 0, scoreBank});
-                mirrorTransfers.push_back({copyBridge + writeLatency(slice),
+                mirrorTransfers.push_back({
+                    copyBridge + bridgeWriteLatency(slice) + 1,
                     (1 - sourceHemisphere)
                             * target_.memory().slices_per_hemisphere
                         + slice,
@@ -405,9 +348,12 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         const int64_t generateOutput = generateInput + 2;
         planMirroredWrite(generateTransfers,
             state.x_slices, state.x_address, 0,
-            generateOutput, sequence, 1, expBank);
+            generateOutput, sequence, 1, expBank, 1,
+            // Queue 1 reverses a two-cycle Multiply result back through C1
+            // and the VXM/system boundary before local MEM can consume it.
+            3);
         cursor = generateOutput + maxWriteLatency(state.x_slices)
-            + sequence;
+            + 3 + sequence;
     }
     emitPlannedTransfers(generateTransfers);
 
@@ -436,8 +382,12 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
             maxInput, sequence, 1, expBank);
         planMirroredWrite(maxTransfers,
             state.score_slices, state.score_address, 0,
-            maxOutput, 1, 0, scoreBank);
-        cursor = maxOutput + maxWriteLatency(state.score_slices) + 1;
+            maxOutput, 1, 0, scoreBank, 1,
+            // The accumulator-emitting Queue 1 Max retires one cycle after a
+            // normal one-cycle Basic ALU result, then reverses through C1 and
+            // the VXM/system boundary.
+            3);
+        cursor = maxOutput + maxWriteLatency(state.score_slices) + 3 + 1;
     }
     emitPlannedTransfers(maxTransfers);
 
@@ -468,14 +418,15 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         vxm(sumConfig + 2, 3, "add", "previous", 0, 0.0f,
             "accumulator", 0, 0.0f, "fp32", -1, 1, 4,
             false, true, true);
-        vxm(sumConfig + 1, 0, "pass", "feedback", 0, 0.0f,
-            "immediate", 0, 0.0f, "fp32", -1, 1, 4);
-        vxm(sumConfig + 1, 1, "pass", "previous", 0, 0.0f,
-            "immediate", 0, 0.0f, "fp32", -1, 1, 4);
-        vxm(sumConfig + 1, 2, "pass", "previous", 0, 0.0f,
-            "immediate", 0, 0.0f, "fp32", -1, 1, 4);
-        vxm(sumConfig + 3, 3, "reciprocal",
-            "previous", 0, 0.0f, "immediate", 0, 0.0f,
+        // The physical SR fabric has no tail-to-head feedback path.  Queue 3
+        // owns the reduction accumulator, so reciprocal reads that scalar
+        // directly and writes the reciprocal back into the same local scalar
+        // register for the following normalize multiply.
+        // Queue 3 already holds the reset, body, and final accumulator
+        // configs.  Wait until its first config starts before enqueueing this
+        // fourth config into the three-entry Current/Next FIFO.
+        vxm(sumConfig + 12, 3, "reciprocal",
+            "accumulator", 0, 0.0f, "immediate", 0, 0.0f,
             "fp32", -1, 1, 4, false, false, true, true);
         const int64_t normalizeConfig = sumInput + sequence + 12;
         const int64_t normalizeInput = normalizeConfig + 1;
@@ -519,33 +470,29 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
             for (int64_t destination = 0;
                  destination < target_.memory().hemispheres;
                  ++destination) {
-                const int64_t source = 1 - destination;
                 for (int64_t byte = 0; byte < 2; ++byte) {
                     const int64_t slice = probabilityPackSlices[
                         static_cast<std::size_t>(packedStream + byte)];
                     const int64_t cycle = normalizeInput
                         + normalizePipelineLatency + lane
-                        + writeLatency(slice);
+                        + writeLatency(slice)
+                        // Queue 3 reverses a two-cycle Multiply result back
+                        // across three physical columns and the boundary.
+                        + 5;
                     const int64_t queue = destination
                         * target_.memory().slices_per_hemisphere + slice;
-                    const int64_t stream = source * 8 + 2 + byte;
-                    if (canGroupPackSlice(slice)) {
-                        pendingPackWrites.push_back({cycle, queue,
-                            address, stream, keysPerLane,
-                            target_.throughput().lanes_per_tile});
-                    } else {
-                        direct_domain_detail::emitMem3D(
-                            rewriter_, op_.getLoc(), target_, cycle,
-                            queue, "write", address, stream,
-                            keysPerLane,
-                            target_.throughput().lanes_per_tile, 1,
-                            1, 1, 0, 1, 1, 0, -1,
-                            probabilityPackBank);
-                    }
+                    const int64_t stream = destination * 8 + 2 + byte;
+                    probabilityPackComplete = std::max(
+                        probabilityPackComplete,
+                        cycle + (keysPerLane - 1)
+                            * target_.throughput().lanes_per_tile + 1);
+                    pendingPackWrites.push_back({cycle, queue,
+                        address, stream, keysPerLane,
+                        target_.throughput().lanes_per_tile});
                 }
             }
         }
-        cursor = normalizeInput + normalizePipelineLatency
+        cursor = normalizeInput + normalizePipelineLatency + 5
             + sequence + 8
             + target_.throughput().tile_rows
             + target_.streams().system_register_columns;
@@ -561,10 +508,9 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                 < std::tie(rhs.queue, rhs.cycle);
         });
     const auto emitPackWrite = [&](const ProbabilityPackWrite& write) {
-        direct_domain_detail::emitMem3D(rewriter_, op_.getLoc(), target_,
-            write.cycle, write.queue, "write", write.address,
-            write.stream, write.count, write.interval, 1,
-            1, 1, 0, 1, 1, 0, -1, probabilityPackBank);
+        deferredMemTransfers.push_back({write.cycle, write.queue,
+            "write", write.address, write.stream, write.count,
+            write.interval, 1, 1, 1, 0, probabilityPackBank});
     };
     for (std::size_t begin = 0; begin < pendingPackWrites.size();) {
         std::size_t end = begin + 1;
@@ -572,43 +518,35 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                && pendingPackWrites[end].queue
                    == pendingPackWrites[begin].queue)
             ++end;
-        const auto& base = pendingPackWrites[begin];
-        const std::size_t count = end - begin;
-        const int64_t cycleStride = count > 1
-            ? pendingPackWrites[begin + 1].cycle - base.cycle : 0;
-        const int64_t innerAddressStride = count > 1
-            ? pendingPackWrites[begin + 1].address - base.address : 0;
-        const int64_t groupAddressStride = count > 2
-            ? pendingPackWrites[begin + 2].address - base.address : 0;
-        bool affine = count >= 2 && count % 2 == 0
-            && cycleStride > (base.count - 1) * base.interval;
-        for (std::size_t index = 0; affine && index < count; ++index) {
-            const auto& write = pendingPackWrites[begin + index];
-            affine = write.cycle == base.cycle
-                    + static_cast<int64_t>(index) * cycleStride
-                && write.address == base.address
-                    + static_cast<int64_t>(index / 2)
-                        * groupAddressStride
-                    + static_cast<int64_t>(index % 2)
-                        * innerAddressStride
-                && write.stream == base.stream
-                && write.count == base.count
-                && write.interval == base.interval;
-        }
-        if (affine) {
-            attention_detail::emitMem3D(rewriter_, op_.getLoc(),
-                base.cycle, base.queue, "write", base.address,
-                base.stream, base.count, base.interval, 1, "sram", -1,
-                1, 1, 0, static_cast<int64_t>(count), cycleStride, 0,
-                probabilityPackBank, -1, -1, 2,
-                innerAddressStride, groupAddressStride);
-        } else {
-            for (std::size_t index = begin; index < end; ++index)
-                emitPackWrite(pendingPackWrites[index]);
-        }
+        for (std::size_t index = begin; index < end; ++index)
+            emitPackWrite(pendingPackWrites[index]);
         begin = end;
     }
-    return cursor;
+    // Queue order is architectural: a physical MEM ICU cannot skip an older
+    // coarse instruction whose scheduled cycle lies in the future.  Emit all
+    // Softmax transfers once, ordered by physical queue and cycle, so program
+    // order agrees with the static schedule.
+    std::sort(deferredMemTransfers.begin(), deferredMemTransfers.end(),
+        [](const PlannedMemTransfer& lhs,
+           const PlannedMemTransfer& rhs) {
+            return std::tie(lhs.queue, lhs.bank, lhs.cycle, lhs.opcode)
+                < std::tie(rhs.queue, rhs.bank, rhs.cycle, rhs.opcode);
+        });
+    for (const PlannedMemTransfer& transfer : deferredMemTransfers) {
+        direct_domain_detail::emitMem3D(
+            rewriter_, op_.getLoc(), target_, transfer.cycle,
+            transfer.queue, transfer.opcode, transfer.address,
+            transfer.stream, transfer.repeat_count,
+            transfer.repeat_interval, transfer.address_stride,
+            transfer.wave_count, transfer.wave_interval,
+            transfer.wave_address_stride, 1, 1, 0, -1,
+            transfer.bank);
+    }
+    // A physical MEM ICU cannot preempt a coarse Write3D in order to start
+    // the following probability-pack Read3D.  Some compact attention layouts
+    // place both domains on the same bank, so the transpose phase must begin
+    // after the last packed-probability write has retired on every queue.
+    return std::max(cursor, probabilityPackComplete);
 }
 
 int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
@@ -646,6 +584,13 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
     std::array<int64_t, 2> plannedReady {packEnd, packEnd};
     const int64_t transposeBeats =
         tokenBlocks * target_.throughput().tile_rows;
+    // The transpose needs one explicit flush input after the four useful
+    // probability rows. Without it, output streams 44..47 retire after tile
+    // 2 and the farthest MEM write has no tile-3 segment to consume. The
+    // flush row is never committed; it only drains the SXM pipeline.
+    const int64_t transposePipelineBeats = transposeBeats + 1;
+    const int64_t transposeWorkCycles =
+        transposePipelineBeats + target_.throughput().tile_rows;
     for (const auto& wave : stage_plan_.qk_waves) {
         for (const auto& work : wave.slots) {
             if (!work) continue;
@@ -657,8 +602,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
                     work->query_head, work->query_block, 0),
                 layout.probabilityDiagonalAddress(
                     work->query_head, work->query_block, 0, 0)});
-            plannedReady[hemisphere] +=
-                transposeBeats + target_.throughput().tile_rows;
+            plannedReady[hemisphere] += transposeWorkCycles;
         }
     }
     std::array<bool, 2> groupedTranspose {};
@@ -668,7 +612,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
             hemisphere)];
         if (work.size() < 2) continue;
         const int64_t interval = work[1].start - work[0].start;
-        if (interval < transposeBeats
+        if (interval < transposePipelineBeats
             || std::adjacent_find(work.begin(), work.end(),
                 [&](const TransposeWork& lhs, const TransposeWork& rhs) {
                     return rhs.start - lhs.start != interval;
@@ -678,17 +622,21 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
         emitSxm(rewriter_, op_.getLoc(), work[0].start + memToSxm,
             hemisphere, "transpose", inputStreams, transposeStreams,
             identityMap(), "vector_columns", -1, -1, -1,
-            transposeBeats, 1, static_cast<int64_t>(work.size()),
+            transposePipelineBeats, 1, static_cast<int64_t>(work.size()),
             interval);
     }
     std::array<bool, 2> groupedMem {};
     const auto packSlices = layout.probabilityPackSlices();
     const auto diagonalSlices = layout.probabilityDiagonalSlices();
-    const bool disjointReadWriteSlices = std::none_of(
-        packSlices.begin(), packSlices.end(), [&](int64_t slice) {
-            return std::find(diagonalSlices.begin(),
-                diagonalSlices.end(), slice) != diagonalSlices.end();
-        });
+    // A MEM ICU/port is identified by (hemisphere, slice, bank). Equal slice
+    // numbers in opposite banks are therefore fully disjoint and may use the
+    // same grouped transpose domain.
+    const bool disjointReadWriteSlices = packBank != diagonalBank
+        || std::none_of(
+            packSlices.begin(), packSlices.end(), [&](int64_t slice) {
+                return std::find(diagonalSlices.begin(),
+                    diagonalSlices.end(), slice) != diagonalSlices.end();
+            });
     for (int64_t hemisphere = 0;
          hemisphere < target_.memory().hemispheres; ++hemisphere) {
         const auto& work = hemisphereWork[static_cast<std::size_t>(
@@ -699,7 +647,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
             work[1].packAddress - work[0].packAddress;
         const int64_t diagonalStride =
             work[1].diagonalAddress - work[0].diagonalAddress;
-        const bool affine = cycleStride >= transposeBeats
+        const bool affine = cycleStride >= transposePipelineBeats
             && std::adjacent_find(work.begin(), work.end(),
             [&](const TransposeWork& lhs, const TransposeWork& rhs) {
                 return rhs.start - lhs.start != cycleStride
@@ -721,7 +669,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
                 hemisphere * target_.memory().slices_per_hemisphere
                     + packSlice,
                 "read", work[0].packAddress,
-                sxmInputBase + stream, transposeBeats, 1, 1,
+                sxmInputBase + stream, transposePipelineBeats, 1, 1,
                 1, 1, 0, static_cast<int64_t>(work.size()),
                 cycleStride, packStride, -1, packBank);
             const int64_t diagonalSlice =
@@ -761,7 +709,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
                         + slice,
                     "read", layout.probabilityPackAddress(
                         work->query_head, work->query_block, 0),
-                    sxmInputBase + stream, transposeBeats, 1, 1,
+                    sxmInputBase + stream, transposePipelineBeats, 1, 1,
                     1, 1, 0, 1, 1, 0, -1, packBank);
               }
             }
@@ -769,12 +717,16 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
                 emitSxm(rewriter_, op_.getLoc(), capture, hemisphere,
                     "transpose", inputStreams, transposeStreams,
                     identityMap(), "vector_columns", -1, -1, -1,
-                    transposeBeats, 1);
+                    transposePipelineBeats, 1);
             emitSxm(rewriter_, op_.getLoc(), capture + 1, hemisphere,
                 "permute", transposeStreams, outputStreams,
                 blockDiagonalMap(0, target_), "vector_columns",
                 -1, -1, -1,
-                transposeBeats + target_.throughput().tile_rows - 1,
+                // Keep one final launch beat so the last vector reaches tile
+                // 3 before the farthest MEM group consumes it.  A length of
+                // input+pipeline-1 covers the SXM output itself, while the
+                // downstream fabric needs the additional boundary beat.
+                transposePipelineBeats + target_.throughput().tile_rows - 1,
                 1, 1, 1,
                 target_.throughput().lanes_per_tile);
             if (!groupedMem[static_cast<std::size_t>(hemisphere)]) {
@@ -803,8 +755,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
             // does not need to switch packets while a transpose wavefront is
             // still live in the SXM tile pipeline.
             ready[static_cast<std::size_t>(hemisphere)] =
-                start + transposeBeats
-                    + target_.throughput().tile_rows;
+                start + transposeWorkCycles;
         }
     }
     return std::max(ready[0], ready[1]) + memToSxm + groups + 1;

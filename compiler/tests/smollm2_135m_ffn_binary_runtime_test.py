@@ -42,14 +42,13 @@ def main() -> None:
     command_text = commands.read_text(encoding="utf-8")
     block8_selected = False
     if not block8_selected:
-        for marker in (
-            'weight_input_mode = "int8_dequant_bf16"',
-            "ftlpu.command.mxm_dequant",
-        ):
-            if marker not in command_text:
-                raise RuntimeError(
-                    f"Vector FFN is missing MXM-local dequant marker: {marker}"
-                )
+        if "ftlpu.command.mxm_dequant" not in command_text:
+            raise RuntimeError("Vector FFN is missing MXM-local dequant commands")
+        if ('weight_input_mode = "int8_dequant_bf16"' not in command_text
+                and "ftlpu.command.mxm_dequant_3d" not in command_text):
+            raise RuntimeError(
+                "Vector FFN does not encode the MXM-local INT8-to-BF16 path"
+            )
         if 'lhs_kind = "stream_i8"' in command_text:
             raise RuntimeError(
                 "Vector FFN must not use VXM for weight dequantization"
@@ -410,7 +409,7 @@ def main() -> None:
         return
     renderer = Path(__file__).resolve().parents[1] / "tools" / "render_ffn_pipeline.py"
     source = args.input.read_text(encoding="utf-8")
-    sequence_match = re.search(r"tensor<(\d+)x576xbf16>", source)
+    sequence_match = re.search(r"tensor<(\d+)x\d+xbf16>", source)
     if not sequence_match:
         raise RuntimeError("cannot determine FFN sequence length from StableHLO input")
     subprocess.run([

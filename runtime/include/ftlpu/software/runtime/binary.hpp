@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 32;
+inline constexpr std::uint32_t kBinaryFormatVersion = 33;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -58,6 +58,21 @@ enum class BindingLayout : std::uint16_t {
     Fp16ProjectionBiasX4 = 26,
     W8A16Native4Weight = 27,
     Fp16RopeTableDecodeCompact = 28,
+    Fp16DepthwiseKernel4 = 29,
+    // Dense row-major FP32 values split byte-wise over four MEM slices.
+    // Column c is stored in lane c%32 at row
+    // base_row + (c/32)*rows + r, matching Fp16PairPlanar while retaining
+    // all four bytes needed by recurrent state.
+    Fp32QuadPlanar = 30,
+    // Each logical 16-bit scalar occupies one SRAM row and is replicated to
+    // all 32 lanes.  This is a generic producer/consumer layout for vector
+    // operations that broadcast a scalar across one hardware tile.
+    Fp16ScalarBroadcastPlanar = 31,
+    // FP32 counterpart of Fp16ScalarBroadcastPlanar, split over four byte
+    // planes so the VXM consumes it through an ordinary stream_f32 operand.
+    Fp32ScalarBroadcastPlanar = 32,
+    // Alternating 32-feature blocks on East/West, one byte-plane pair each.
+    Fp16HemispherePairPlanar = 33,
 };
 
 enum class BindingInitializer : std::uint16_t {
@@ -91,6 +106,10 @@ struct BinaryBinding {
     BindingInitializer initializer{BindingInitializer::None};
     float rope_theta{0.0f};
     std::uint32_t rope_head_dim{0};
+    // Zero retains the legacy full-head layout. Partial Q/K projection
+    // bindings pack rotary pairs ahead of unchanged tail pairs.
+    std::uint32_t rope_rotary_dim{0};
+    float rope_attention_factor{1.0f};
     // Intra-executable paging metadata. A paged binding contains the logical
     // tensor; independently ready pages may share a bank when their exact
     // slice-group and row regions are disjoint.

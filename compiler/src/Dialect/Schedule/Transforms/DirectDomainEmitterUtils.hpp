@@ -63,8 +63,8 @@ inline void emitMem3D(mlir::IRRewriter& rewriter, mlir::Location location,
         state.addAttribute(
             "weight_page", rewriter.getI64IntegerAttr(weightPage));
     if (logicalBaseRow >= 0)
-        state.addAttribute(
-            "logical_base_row", rewriter.getI64IntegerAttr(logicalBaseRow));
+        state.addAttribute("logical_base_row",
+            rewriter.getI64IntegerAttr(logicalBaseRow));
     rewriter.create(state);
 }
 

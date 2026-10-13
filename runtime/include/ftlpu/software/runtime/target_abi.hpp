@@ -53,7 +53,9 @@ struct ExecutableHardwareConfig {
     std::uint32_t mxm_weight_buffers{2};
     std::uint32_t vxm_alus{hw::kVxmAluCount};
     std::uint32_t vxm_cross_hemisphere_streams_enabled{1};
-    std::uint32_t vxm_fma_enabled{1};
+    // Reserved to preserve the command ABI field offsets used by v26+.
+    // VXM has no fused multiply opcode; new executables always write zero.
+    std::uint32_t vxm_reserved_feature{0};
     std::uint32_t vxm_weight_to_iw_latency{16};
     std::uint32_t mem_to_sxm_latency{14};
     std::uint32_t mem_to_mxm_latency{16};
@@ -184,7 +186,7 @@ private:
                                      bool include_c2c_fabric,
                                      bool include_external_memory,
                                      bool include_ddr_scheduling_efficiency,
-                                     bool include_vxm_stream_fma,
+                                     bool include_vxm_stream_capabilities,
                                      bool include_imem_geometry,
                                      bool include_macro_geometry)
     {
@@ -217,9 +219,9 @@ private:
         visitor(self.qk_iw_to_compute_latency);
         visitor(self.mxms_per_hemisphere);
         visitor(self.mxm_weight_buffers); visitor(self.vxm_alus);
-        if (include_vxm_stream_fma) {
+        if (include_vxm_stream_capabilities) {
             visitor(self.vxm_cross_hemisphere_streams_enabled);
-            visitor(self.vxm_fma_enabled);
+            visitor(self.vxm_reserved_feature);
         }
         visitor(self.vxm_weight_to_iw_latency);
         visitor(self.mem_to_sxm_latency); visitor(self.mem_to_mxm_latency);
@@ -288,7 +290,7 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     config.mxms_per_hemisphere =
         static_cast<std::uint32_t>(mxms_per_hemisphere);
     TargetAbiHasher hash;
-    hash.add(20); // Queue-specific compact SXM Transpose/Permute RUN_2D packets.
+    hash.add(21); // VXM terminal accumulator controls in compact ICU packets.
     // i-MEM capacity is a deployment constraint rather than a command-bit ABI
     // change. Keep legacy Schedule attributes valid and validate geometry
     // explicitly when loading an executable into a CModel.
@@ -300,7 +302,7 @@ constexpr std::uint64_t executable_target_abi(
     const ExecutableHardwareConfig& config)
 {
     TargetAbiHasher hash;
-    hash.add(20); // Queue-specific compact SXM Transpose/Permute RUN_2D packets.
+    hash.add(21); // VXM terminal accumulator controls in compact ICU packets.
     config.visit_command_abi([&](std::uint32_t value) { hash.add(value); });
     return hash.value();
 }

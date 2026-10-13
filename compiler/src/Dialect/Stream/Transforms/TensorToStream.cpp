@@ -201,6 +201,8 @@ public:
         llvm::SmallVector<tensor::MatmulOp> matmuls;
         llvm::SmallVector<tensor::SwigluOp> swiglus;
         llvm::SmallVector<tensor::RmsNormTaskOp> rmsNorms;
+        llvm::SmallVector<tensor::DepthwiseConv1DTaskOp> depthwiseConvs;
+        llvm::SmallVector<tensor::GatedDeltaRuleTaskOp> gatedDeltaRules;
         llvm::SmallVector<tensor::ProjectionTaskOp> linearProjections;
         function.walk(
             [&](tensor::MatmulOp op) { matmuls.push_back(op); });
@@ -208,6 +210,12 @@ public:
             [&](tensor::SwigluOp op) { swiglus.push_back(op); });
         function.walk(
             [&](tensor::RmsNormTaskOp op) { rmsNorms.push_back(op); });
+        function.walk([&](tensor::DepthwiseConv1DTaskOp op) {
+            depthwiseConvs.push_back(op);
+        });
+        function.walk([&](tensor::GatedDeltaRuleTaskOp op) {
+            gatedDeltaRules.push_back(op);
+        });
         function.walk([&](tensor::ProjectionTaskOp op) {
             if (op.getKind() == "linear")
                 linearProjections.push_back(op);
@@ -229,6 +237,18 @@ public:
         }
         for (tensor::RmsNormTaskOp op : rmsNorms) {
             if (mlir::failed(lower_rms_norm(op, context))) {
+                signalPassFailure();
+                return;
+            }
+        }
+        for (tensor::DepthwiseConv1DTaskOp op : depthwiseConvs) {
+            if (mlir::failed(lower_depthwise_conv1d(op, context))) {
+                signalPassFailure();
+                return;
+            }
+        }
+        for (tensor::GatedDeltaRuleTaskOp op : gatedDeltaRules) {
+            if (mlir::failed(lower_gated_delta_rule(op, context))) {
                 signalPassFailure();
                 return;
             }
@@ -267,6 +287,8 @@ public:
             if (!unlowered_task
                 && (llvm::isa<tensor::MatmulTaskOp>(operation)
                     || llvm::isa<tensor::SwishTaskOp>(operation)
+                    || llvm::isa<tensor::DepthwiseConv1DTaskOp>(operation)
+                    || llvm::isa<tensor::GatedDeltaRuleTaskOp>(operation)
                     || llvm::isa<tensor::ElementwiseTaskOp>(operation)
                     || llvm::isa<tensor::ProjectionTaskOp>(operation)
                     || llvm::isa<tensor::RopeTaskOp>(operation)

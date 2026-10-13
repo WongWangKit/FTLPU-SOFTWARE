@@ -143,7 +143,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         > memory.sram_depth_rows;
     if (planarHiddenExceedsSram)
         hidden_slices = target.mxm_distributed_activation_slices();
-    const bool hiddenDistributed16 = tiledWeights
+    bool hiddenDistributed16 = tiledWeights
         && hidden_slices.size() == 16;
     const int64_t distributedElementsPerRow =
         throughput.mxm_rows * throughput.mxm_block_rows;
@@ -178,6 +178,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const int64_t hiddenBank = tiledWeights || isolateNonPagedTemporaries
         ? inputBank : workingBank;
     int64_t hiddenBaseRow = memory.w8a16_hidden_base_row;
+    int64_t liveInputEndRow = 0;
     if (hiddenBank == inputBank) {
         int64_t inputBaseRow = 0;
         int64_t inputRowCount = m * k / throughput.mxm_rows;
@@ -212,9 +213,25 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         if (hiddenOverlapsInputSlices)
             hiddenBaseRow = std::max(
                 hiddenBaseRow, inputBaseRow + inputRowCount);
+        liveInputEndRow = inputBaseRow + inputRowCount;
     }
-    const int64_t hiddenRowCount = hiddenDistributed16
+    int64_t hiddenRowCount = hiddenDistributed16
         ? distributedHiddenRows : planarHiddenRows;
+    if (hiddenBaseRow + hiddenRowCount > memory.sram_depth_rows
+        && tiledWeights && !hiddenDistributed16) {
+        // Some dense models have a smaller input width but a large FFN
+        // intermediate (for example Llama-3.2 2048 -> 8192). The planar
+        // hidden value fits in an empty bank, yet not above the still-live
+        // normalized input. Move it to the normal distributed activation
+        // slices instead of rejecting an otherwise tileable FFN.
+        hidden_slices = target.mxm_distributed_activation_slices();
+        hiddenDistributed16 = hidden_slices.size() == 16;
+        hiddenRowCount = hiddenDistributed16
+            ? distributedHiddenRows : planarHiddenRows;
+        if (hiddenBank == inputBank)
+            hiddenBaseRow = std::max(
+                memory.w8a16_hidden_base_row, liveInputEndRow);
+    }
     if (hiddenBaseRow + hiddenRowCount > memory.sram_depth_rows) {
         op.emitError(
             "FFN hidden allocation cannot remain disjoint from its live input");

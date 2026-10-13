@@ -88,6 +88,7 @@ bool same_vxm_body(schedule::VxmOp lhs, schedule::VxmOp rhs)
                "input_hemisphere", "output_hemisphere", "scale_binding",
                "chain_depth",
                "accumulator_reset", "accumulator_write", "accumulator_emit",
+               "accumulator_reset_first", "accumulator_emit_last",
              "local_scalar_write"})
         if (lhs->getAttr(name) != rhs->getAttr(name))
             return false;

@@ -62,20 +62,28 @@ void sequentializeScheduleStages(mlir::func::FuncOp function,
     llvm::SmallVector<llvm::SmallVector<mlir::Operation*>> stages;
     llvm::SmallVector<mlir::Operation*> current;
     std::optional<mlir::Location> currentLocation;
+    mlir::Attribute currentStage;
     for (mlir::Operation& operation : function.getBody().front()) {
         if (!isScheduleOperation(operation)) {
             if (!current.empty()) {
                 stages.push_back(std::move(current));
                 current.clear();
                 currentLocation.reset();
+                currentStage = {};
             }
             continue;
         }
-        if (!current.empty() && operation.getLoc() != *currentLocation) {
+        const auto stageId = operation.getAttr("ftlpu.schedule_stage");
+        const bool stageChanged = stageId || currentStage
+            ? stageId != currentStage : operation.getLoc() != currentLocation.value_or(operation.getLoc());
+        if (!current.empty() && stageChanged) {
             stages.push_back(std::move(current));
             current.clear();
         }
-        if (current.empty()) currentLocation = operation.getLoc();
+        if (current.empty()) {
+            currentLocation = operation.getLoc();
+            currentStage = stageId;
+        }
         current.push_back(&operation);
     }
     if (!current.empty()) stages.push_back(std::move(current));
@@ -270,6 +278,22 @@ public:
             return;
         }
         reportStage("linear-projection");
+        if (mlir::failed(schedule::lowerDepthwiseConv1DSchedules(
+                rewriter, function, target))) {
+            signalPassFailure();
+            return;
+        }
+        reportStage("depthwise-conv1d");
+        if (mlir::failed(schedule::lowerGatedDeltaRuleSchedules(
+                rewriter, function, target))) {
+            signalPassFailure();
+            return;
+        }
+        reportStage("gated-delta-rule");
+        if (mlir::failed(schedule::lowerVectorAluSchedules(rewriter, function, target))) {
+            signalPassFailure();
+            return;
+        }
         if (mlir::failed(schedule::lowerElementwiseSchedules(
                 rewriter, function, target))) {
             signalPassFailure();

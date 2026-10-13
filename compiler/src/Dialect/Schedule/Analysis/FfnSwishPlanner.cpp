@@ -19,7 +19,7 @@ mlir::FailureOr<std::vector<int64_t>> planFfnSwishCycles(
     ResourceScheduler resources;
     LPUResourceModel resourceModel(target);
     llvm::SmallVector<ResourceWindow, 16> allVxmAlus;
-    for (int64_t alu = 0; alu < 16; ++alu)
+    for (int64_t alu = 0; alu < target.throughput().vxm_alus; ++alu)
         allVxmAlus.push_back({resourceModel.vxm_alu(alu), 0, 1});
 
     for (FfnCycleWindow dequant : request.dequant_windows) {

@@ -184,6 +184,8 @@ def VxmOp : FTLPU_Command_Op<"vxm", [MemoryEffects<[MemWrite]>]> {
       OptionalAttr<BoolAttr>:$accumulator_reset,
       OptionalAttr<BoolAttr>:$accumulator_write,
       OptionalAttr<BoolAttr>:$accumulator_emit,
+      OptionalAttr<BoolAttr>:$accumulator_reset_first,
+      OptionalAttr<BoolAttr>:$accumulator_emit_last,
       OptionalAttr<BoolAttr>:$local_scalar_write);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;

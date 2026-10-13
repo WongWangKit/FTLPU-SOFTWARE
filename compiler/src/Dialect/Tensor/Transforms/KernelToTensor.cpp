@@ -60,6 +60,7 @@ public:
         llvm::SmallVector<kernel::SwigluOp> swiglus;
         llvm::SmallVector<kernel::RmsNormOp> rmsNorms;
         llvm::SmallVector<kernel::ElementwiseOp> elementwiseOps;
+        llvm::SmallVector<kernel::DepthwiseConv1DOp> depthwiseConvs;
         llvm::SmallVector<kernel::FfnGraph, 2> ffns;
         llvm::SmallDenseSet<mlir::Operation*, 16> ffn_operations;
         llvm::SmallDenseSet<mlir::Operation*, 16> fixed_ffn_operations;
@@ -76,6 +77,9 @@ public:
             if (auto elementwise =
                     llvm::dyn_cast<kernel::ElementwiseOp>(&operation))
                 elementwiseOps.push_back(elementwise);
+            if (auto conv =
+                    llvm::dyn_cast<kernel::DepthwiseConv1DOp>(&operation))
+                depthwiseConvs.push_back(conv);
         }
         for (kernel::MatmulOp root : llvm::reverse(matmuls)) {
             auto graph = kernel::match_attention_graph(root);
@@ -119,6 +123,11 @@ public:
                     if (use.getOperandNumber() == 1 || use.getOperandNumber() == 2)
                         return PlacementKind::Weight;
                 }
+                if (auto conv = llvm::dyn_cast<kernel::DepthwiseConv1DOp>(
+                        use.getOwner())) {
+                    if (use.getOperandNumber() == 1)
+                        return PlacementKind::Weight;
+                }
             }
             return PlacementKind::Activation;
         };
@@ -158,9 +167,12 @@ public:
                     rmsNorm.getWeight().getType().getNumElements();
                 std::optional<std::size_t> selected;
                 for (std::size_t pair = 0; pair < pairCount; ++pair) {
-                    if (nextRows[pair] >= rows) {
+                    // Spread gamma constants across slice pairs before
+                    // stacking them below each other. Lower rows are also
+                    // needed by attention and FFN activation scratch.
+                    if (nextRows[pair] >= rows
+                        && (!selected || nextRows[pair] > nextRows[*selected])) {
                         selected = pair;
-                        break;
                     }
                 }
                 if (!selected.has_value()) {
@@ -269,6 +281,10 @@ public:
             }
             bool fixed_w8a16_operand = false;
             for (mlir::OpOperand& use : argument.getUses()) {
+                // The recurrent operator owns disjoint, packed physical
+                // buffers, including a state that can occupy a whole bank.
+                fixed_w8a16_operand |=
+                    llvm::isa<kernel::GatedDeltaRuleOp>(use.getOwner());
                 fixed_w8a16_operand |=
                     fixed_ffn_operations.contains(use.getOwner());
                 fixed_w8a16_operand |=
@@ -347,6 +363,24 @@ public:
                 if (mlir::failed(lower_elementwise(
                         op, target, allocator, allocate_value,
                         weight_bank_, rewriter))) {
+                    signalPassFailure();
+                    return;
+                }
+                continue;
+            }
+            if (auto op =
+                    llvm::dyn_cast<kernel::DepthwiseConv1DOp>(operation)) {
+                if (mlir::failed(lower_depthwise_conv1d(
+                        op, allocator, allocate_value, rewriter))) {
+                    signalPassFailure();
+                    return;
+                }
+                continue;
+            }
+            if (auto op =
+                    llvm::dyn_cast<kernel::GatedDeltaRuleOp>(operation)) {
+                if (mlir::failed(lower_gated_delta_rule(
+                        op, allocator, allocate_value, rewriter))) {
                     signalPassFailure();
                     return;
                 }

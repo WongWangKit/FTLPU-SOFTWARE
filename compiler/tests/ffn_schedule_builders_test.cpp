@@ -136,8 +136,9 @@ int main() try
     require(residencyFirstProjection->initial_compute_cycle
                 + residencyFirstProjection->second_projection_offset
             == finalFirstProjectionBlock.tiles.back().compute_cycle
-                + residencyFirstProjection->projection_slot_interval,
-        "residency-first FFN left a bubble between projection phases");
+                + residencyFirstProjection->projection_slot_interval
+                + singleMxmTarget.mxm_first_result_latency(),
+        "residency-first FFN did not retire the first projection's weight buffer");
     require(residencyFirstProjection->blocks[0].weight_buffer == 0
             && residencyFirstProjection->blocks[1].weight_buffer == 1,
         "residency-first FFN did not make both weight buffers available");
@@ -226,6 +227,12 @@ int main() try
     require(mlir::succeeded(singleMxmDown)
             && singleMxmDown->blocks.size() > 1,
         "single-MXM local-dequant FFN down timeline failed");
+    for (const auto& block : singleMxmDown->blocks)
+        for (const auto& tileSchedule : block.tiles)
+            require(tileSchedule.segments.size() == 1
+                    && tileSchedule.segments.front().stream_base
+                        == singleMxmThroughput.mxm_load_streams_per_cycle,
+                "single-tile FFN down activation overlaps INT8 weight streams");
     require(singleMxmDown->blocks[1].dequant_start
             >= singleMxmDown->blocks[0].tiles.back().compute_cycle
                 + singleMxmTarget.mxm_result_window_cycles(

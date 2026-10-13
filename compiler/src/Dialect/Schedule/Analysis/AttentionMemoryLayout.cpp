@@ -520,8 +520,13 @@ int64_t AttentionMemoryLayout::ropeProductAddress(
         ? head : queryHeads_ + head;
     const int64_t productRowsPerVector = ropeProductBankInterleaved_
         ? seqLen_ : (seqLen_ + 1) / 2;
+    // Compact products 0/1 and 2/3 live on different banks (Key uses
+    // different slice groups). Their row coordinates may therefore reuse
+    // the same two-product span without aliasing physical SRAM cells.
     return ropeProductBase_
-        + ((globalHead * (headBlocks_ / 2) + pairBlock) * 4 + product)
+        + ((globalHead * (headBlocks_ / 2) + pairBlock)
+               * (ropeProductBankInterleaved_ ? 2 : 4)
+            + (ropeProductBankInterleaved_ ? product % 2 : product))
             * productRowsPerVector
         + (ropeProductBankInterleaved_ ? token : token / 2);
 }

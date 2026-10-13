@@ -256,6 +256,8 @@ def VxmOp : FTLPU_Schedule_Op<"vxm", [MemoryEffects<[MemWrite]>]> {
       OptionalAttr<BoolAttr>:$accumulator_reset,
       OptionalAttr<BoolAttr>:$accumulator_write,
       OptionalAttr<BoolAttr>:$accumulator_emit,
+      OptionalAttr<BoolAttr>:$accumulator_reset_first,
+      OptionalAttr<BoolAttr>:$accumulator_emit_last,
       OptionalAttr<BoolAttr>:$local_scalar_write);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$gate `,` $up attr-dict `:` functional-type(operands, results)";

@@ -159,6 +159,12 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
     const target::LPUTargetModel& target,
     EastMemoryAllocator& allocator, AllocateValueFn allocate_value,
     int64_t weight_bank, mlir::IRRewriter& rewriter);
+mlir::LogicalResult lower_depthwise_conv1d(kernel::DepthwiseConv1DOp op,
+    EastMemoryAllocator& allocator, AllocateValueFn allocate_value,
+    mlir::IRRewriter& rewriter);
+mlir::LogicalResult lower_gated_delta_rule(kernel::GatedDeltaRuleOp op,
+    EastMemoryAllocator& allocator, AllocateValueFn allocate_value,
+    mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
     const target::LPUTargetModel& target,
     FunctionMemoryPlanner& planner,

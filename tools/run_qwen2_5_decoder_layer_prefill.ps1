@@ -84,12 +84,13 @@ try {
     $savedErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $output = & $testExe $programCopy 2>&1
+        $output = & $testExe $programCopy 2>&1 |
+            Tee-Object -FilePath $testLog
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $savedErrorActionPreference
     }
-    $output | Tee-Object -FilePath $testLog
+    $output | Write-Output
     if ($exitCode -ne 0) {
         $icuExitCode = $null
         if (Test-Path -LiteralPath $linkedProgram) {

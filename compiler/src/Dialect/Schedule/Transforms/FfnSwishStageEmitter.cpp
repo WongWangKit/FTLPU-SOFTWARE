@@ -48,6 +48,7 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
         && pairCount % 2 == 0
         && pairCount <= memory.sram_depth_rows / tile;
     int64_t maxOutputLatency = 0;
+    int64_t maxBridgeLatency = 0;
     int64_t maxReadLatency = 0;
     for (int64_t slice : context.hidden_slices) {
         const auto outputLatency = target.transport_latency(
@@ -58,7 +59,11 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
             target::StreamEndpoint::Mem,
             target::StreamEndpoint::VxmInput,
             target::StreamDirection::West, slice);
-        if (!outputLatency || !readLatency) {
+        const auto bridgeLatency = target.transport_latency(
+            target::StreamEndpoint::VxmBridgeResult,
+            target::StreamEndpoint::Mem,
+            target::StreamDirection::East, slice);
+        if (!outputLatency || !readLatency || !bridgeLatency) {
             ffn.getOperation()->emitError()
                 << "vector FFN hidden slice " << slice
                 << " is not routable through VXM (output="
@@ -67,10 +72,12 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
             return mlir::failure();
         }
         maxOutputLatency = std::max(maxOutputLatency, *outputLatency);
-        maxReadLatency = std::max(maxReadLatency, *readLatency);
+        maxBridgeLatency = std::max(maxBridgeLatency, bridgeLatency.value());
+        maxReadLatency = std::max(maxReadLatency, *readLatency + 1);
     }
 
-    constexpr int64_t kVxmSwishLatency = 17;
+    const int64_t kVxmSwishLatency =
+        18 + (target.throughput().vxm_alus - 8);
     int64_t bridgeInputCycle = lastInputCycle + kVxmSwishLatency
         + maxOutputLatency + maxReadLatency + 2;
     int64_t lastCopyCycle = bridgeInputCycle;
@@ -79,7 +86,7 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
     for (int64_t sourceHemisphere = 0;
          sourceHemisphere < memory.hemispheres; ++sourceHemisphere) {
         if (sourceHemisphere != 0)
-            bridgeInputCycle += maxReadLatency + maxOutputLatency + 1;
+            bridgeInputCycle += maxReadLatency + maxBridgeLatency + 1;
         // Derive the passive-copy domains directly from the tile shape. Pair
         // parity selects the physical hidden block, while a distributed
         // layout splits only at the physical token-lane boundary.
@@ -102,7 +109,7 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
                     target::StreamEndpoint::VxmInput,
                     target::StreamDirection::West, slice);
                 const auto writeLatency = target.transport_latency(
-                    target::StreamEndpoint::VxmResult,
+                    target::StreamEndpoint::VxmBridgeResult,
                     target::StreamEndpoint::Mem,
                     target::StreamDirection::East, slice);
                 if (!readLatency || !writeLatency) return false;
@@ -117,7 +124,7 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
                     ffn.getHidden0Placement());
                 auto read = emitFfnMemRead3D(context.rewriter,
                     ffn.getLoc(), bridgeSource,
-                    bridgeInputCycle + firstOffset - *readLatency,
+                    bridgeInputCycle + firstOffset - *readLatency - 1,
                     innerCount, byte, 1,
                     slice
                             / target.streams()
@@ -192,13 +199,13 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
                             target::StreamEndpoint::VxmInput,
                             target::StreamDirection::West, slice);
                         const auto writeLatency = target.transport_latency(
-                            target::StreamEndpoint::VxmResult,
+                            target::StreamEndpoint::VxmBridgeResult,
                             target::StreamEndpoint::Mem,
                             target::StreamDirection::East, slice);
                         if (!readLatency || !writeLatency)
                             return false;
                         emitFfnMemTransfer3D(context.rewriter, ffn.getLoc(),
-                            bridgeInputCycle + firstOffset - *readLatency,
+                            bridgeInputCycle + firstOffset - *readLatency - 1,
                             owner, slice, "read", address, 32 + byte,
                             occurrenceCount, blockRows, 1, hiddenBank,
                             outerDomain);
@@ -261,9 +268,11 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
                         domain.group_count = 1
                             + (pairCount - 1 - parity) / pairStep;
                         domain.group_interval = tile;
-                        domain.group_address_stride =
-                            (singleMxmVector ? 4 : 1)
-                            * throughput.tile_rows;
+                        domain.group_address_stride = hiddenDistributed16
+                            ? (singleMxmVector ? 4 : 1)
+                                * throughput.tile_rows
+                            : (singleMxmVector ? 2 : 1)
+                                * context.m();
                         if (!emitTileCopy(mTile, parity, domain))
                             return mlir::failure();
                     }
@@ -282,6 +291,109 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
     return mlir::success();
 }
 
+mlir::FailureOr<FfnSwishEmission> emitSrSwish(
+    FfnEmissionContext& context, const FfnProjectionEmission& projection)
+{
+    auto& rewriter = context.rewriter;
+    auto& ffn = context.ffn;
+    const auto& target = context.target;
+    const auto gateSlices = target.ffn_gate_temp_slices();
+    const auto upSlices = target.ffn_up_temp_slices();
+    const int64_t tile = context.tile();
+    const int64_t columns = target.throughput().vxm_alus;
+    const int64_t residentRows = context.projection_timeline.pair_count
+        * context.projection_timeline.m_tile_count * tile;
+    if (residentRows > target.memory().sram_depth_rows || gateSlices.size() < 4
+        || upSlices.size() < 2 || gateSlices[2] <= gateSlices[0]
+        || gateSlices[3] <= gateSlices[1]) {
+        ffn.getOperation()->emitError(
+            "physical SR SwiGLU requires two disjoint Gate copies on the West route");
+        return mlir::failure();
+    }
+    int64_t maxRead = 0;
+    int64_t maxOutput = 0;
+    for (int64_t slice : gateSlices)
+        maxRead = std::max(maxRead, context.westLatency(slice));
+    for (int64_t slice : upSlices)
+        maxRead = std::max(maxRead, context.westLatency(slice));
+    for (int64_t slice : context.hidden_slices)
+        maxOutput = std::max(maxOutput, target.transport_latency(
+            target::StreamEndpoint::VxmResult, target::StreamEndpoint::Mem,
+            target::StreamDirection::East, slice).value());
+    int64_t inputCycle = context.projection_timeline.final_projection_cycle
+        + context.projection_timeline.accumulator_queue_release;
+    for (const auto& completed : projection.completed_tiles)
+        inputCycle = std::max(inputCycle, completed.deferred_ready_cycle);
+    inputCycle += maxRead + columns + 2;
+    FfnSwishEmission result {};
+    for (const auto& completed : projection.completed_tiles) {
+        const int64_t hemisphere = completed.hemisphere;
+        const auto hemi = context.hemisphereName(hemisphere);
+        const auto column = [&](int64_t stage) {
+            return hemisphere == 0 ? stage : columns - 1 - stage;
+        };
+        const int64_t gateStream = 8 + hemisphere * 8;
+        const int64_t tempRow = (completed.pair
+            * context.projection_timeline.m_tile_count + completed.m_tile) * tile;
+        mlir::Value gateValue, upValue;
+        for (int64_t byte = 0; byte < 2; ++byte) {
+            gateValue = context.emitSliceRead(completed.gate_temp,
+                context.activation_route,
+                inputCycle - context.westLatency(gateSlices[byte]),
+                gateSlices[byte], tempRow, tile, 1, gateStream + byte,
+                "west", "vxm_bf16", hemi).getOutput();
+            // Two LUTs add eight cycles before C4. Feed the independent
+            // Gate copy eight cycles later so it meets sigmoid at C4.
+            context.emitSliceRead(completed.gate_temp, context.activation_route,
+                inputCycle + 8 - context.westLatency(gateSlices[2 + byte]),
+                gateSlices[2 + byte], tempRow, tile, 1, gateStream + 4 + byte,
+                "west", "vxm_bf16", hemi);
+            // C4 multiply adds one more cycle before Up is consumed at C5.
+            upValue = context.emitSliceRead(completed.up_temp,
+                context.activation_route,
+                inputCycle + 9 - context.westLatency(upSlices[byte]),
+                upSlices[byte], tempRow, tile, 1, gateStream + 2 + byte,
+                "west", "vxm_bf16", hemi).getOutput();
+        }
+        auto value = create_vxm(rewriter, ffn.getLoc(), gateValue, gateValue,
+            ffn.getResult().getType(), inputCycle - 1, column(0),
+            "negate", "stream_bf16", 32 + gateStream, 0,
+            "immediate", 0, 0, "fp32", -1, tile, 1, hemi, hemi).getResult();
+        const char* operations[] = {"exp", "add", "reciprocal"};
+        for (int64_t stage = 1; stage < 4; ++stage)
+            value = create_vxm(rewriter, ffn.getLoc(), value, gateValue,
+                ffn.getResult().getType(), inputCycle - 1, column(stage),
+                operations[stage - 1], "alu", column(stage - 1), 0,
+                "immediate", 0, stage == 2 ? 1 : 0, "fp32", -1,
+                tile, 1, hemi, hemi).getResult();
+        auto multiply = create_vxm(rewriter, ffn.getLoc(), value, gateValue,
+            ffn.getResult().getType(), inputCycle - 1, column(4),
+            "multiply", "alu", column(3), 0,
+            "stream_bf16", 32 + gateStream + 4, 0, "fp32", -1,
+            tile, 1, hemi, hemi);
+        auto output = create_vxm(rewriter, ffn.getLoc(), multiply.getResult(),
+            upValue, ffn.getResult().getType(), inputCycle - 1, column(5),
+            "multiply", "alu", column(4), 0,
+            "stream_bf16", 32 + gateStream + 2, 0,
+            lpu_16bit_data_format(llvm::cast<mlir::RankedTensorType>(
+                ffn.getResult().getType()).getElementType()),
+            hemisphere * 8 + 6, tile, 1, hemi, hemi);
+        result.hidden = emitFfnSwishResultTile(rewriter, ffn, target,
+            context.hidden_slices, output.getResult(), inputCycle,
+            completed.m_tile, completed.pair, hemisphere, tile,
+            false, {}, false, columns + 11);
+        result.last_cycle = inputCycle + tile - 1;
+        inputCycle += tile + columns + maxOutput + maxRead + 12;
+    }
+    llvm::SmallVector<const CompletedProjectionTile*> tiles;
+    for (const auto& completed : projection.completed_tiles)
+        tiles.push_back(&completed);
+    if (mlir::failed(emitHiddenMirrorCopies(context, tiles,
+            result.last_cycle, result)))
+        return mlir::failure();
+    return result;
+}
+
 } // namespace
 
 mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
@@ -289,6 +401,8 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
 {
     auto& ffn = context.ffn;
     const auto& target = context.target;
+    if (target.throughput().vxm_alus == 16)
+        return emitSrSwish(context, emission);
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
     const int64_t tile = context.tile();
@@ -493,9 +607,13 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
                         domain.group_count =
                             1 + (pairCount - 1 - parity) / pairStep;
                         domain.group_interval = tile;
-                        domain.group_address_stride =
-                            (singleMxmVector ? 4 : 1)
-                            * throughput.tile_rows;
+                        domain.group_address_stride = hiddenKind
+                                && hiddenKind.getValue()
+                                    == "fp16_mxm_distributed_16"
+                            ? (singleMxmVector ? 4 : 1)
+                                * throughput.tile_rows
+                            : (singleMxmVector ? 2 : 1)
+                                * context.m();
                         result.hidden = emitFfnSwishResultTile(
                             context.rewriter, ffn, target,
                             context.hidden_slices, output.getResult(),

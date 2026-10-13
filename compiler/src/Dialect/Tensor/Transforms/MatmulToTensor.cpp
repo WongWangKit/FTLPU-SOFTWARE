@@ -69,9 +69,10 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             (op.getN() / (2 * tile)) * (op.getK() / tile) * 4,
             rhsBytes, "w8a16_mxm_weight_striped", "both");
         const auto result = fixed_allocation(PlacementKind::FinalResult,
-            resultSlices, 0,
+            llvm::ArrayRef<int64_t>(resultSlices).take_front(2), 0,
             op.getM() * op.getN() / (2 * tile),
-            resultBytes, "fp16_pair_planar", "east");
+            resultBytes, "fp16_hemisphere_pair_planar", "both",
+            target.memory().banks_per_slice > 1 ? 1 : 0);
         const auto memoryPlan = rewriter.getDictionaryAttr({
             rewriter.getNamedAttr(
                 "input", make_placement_attr(rewriter, input)),

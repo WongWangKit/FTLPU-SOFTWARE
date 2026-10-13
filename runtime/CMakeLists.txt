@@ -28,6 +28,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/macro_bitstream.cpp
     src/runtime/model_package.cpp
     src/runtime/model_session.cpp
+    src/runtime/moe_router.cpp
     src/runtime/performance.cpp
     src/runtime/runtime_execution_trace.cpp
     src/runtime/schedule_trace.cpp
@@ -90,6 +91,7 @@ add_library(ftlpu_software
     src/runtime/macro_bitstream.cpp
     src/runtime/model_package.cpp
     src/runtime/model_session.cpp
+    src/runtime/moe_router.cpp
     src/runtime/performance.cpp
     src/runtime/runtime_execution_trace.cpp
     src/runtime/schedule_trace.cpp
@@ -148,6 +150,13 @@ target_link_libraries(runtime_page_ready_sync_test PRIVATE ftlpu_software)
 add_test(
     NAME runtime_page_ready_sync_test
     COMMAND $<TARGET_FILE:runtime_page_ready_sync_test>)
+
+add_executable(qwen3_moe_router_test
+    tests/runtime/qwen3_moe_router_test.cpp)
+target_link_libraries(qwen3_moe_router_test PRIVATE ftlpu_software)
+add_test(
+    NAME qwen3_moe_router_test
+    COMMAND $<TARGET_FILE:qwen3_moe_router_test>)
 
 add_executable(mem_execution_trace_test
     tests/runtime/mem_execution_trace_test.cpp)
@@ -342,10 +351,44 @@ add_executable(compiled_queue_program_runtime_test
 
 target_link_libraries(compiled_queue_program_runtime_test PRIVATE ftlpu_software)
 
+add_executable(compiled_depthwise_conv1d_runtime_test
+    tests/runtime/compiled_depthwise_conv1d_runtime_test.cpp)
+target_link_libraries(compiled_depthwise_conv1d_runtime_test
+    PRIVATE ftlpu_software)
+
+add_executable(compiled_gated_delta_rule_runtime_test
+    tests/runtime/compiled_gated_delta_rule_runtime_test.cpp)
+target_link_libraries(compiled_gated_delta_rule_runtime_test
+    PRIVATE ftlpu_software)
+
+add_executable(fp32_quad_planar_binding_test
+    tests/runtime/fp32_quad_planar_binding_test.cpp)
+target_link_libraries(fp32_quad_planar_binding_test PRIVATE ftlpu_software)
+add_test(
+    NAME fp32_quad_planar_binding_test
+    COMMAND $<TARGET_FILE:fp32_quad_planar_binding_test>)
+
+add_executable(fp16_pair_planar_binding_test
+    tests/runtime/fp16_pair_planar_binding_test.cpp)
+target_link_libraries(fp16_pair_planar_binding_test PRIVATE ftlpu_software)
+add_test(
+    NAME fp16_pair_planar_binding_test
+    COMMAND $<TARGET_FILE:fp16_pair_planar_binding_test>)
+
 add_executable(compiled_smollm2_135m_ffn_runtime_test
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
 
 target_link_libraries(compiled_smollm2_135m_ffn_runtime_test PRIVATE ftlpu_software)
+
+add_executable(compiled_vxm_sr_ffn_runtime_test
+    tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
+target_compile_definitions(compiled_vxm_sr_ffn_runtime_test PRIVATE
+    FTLPU_TEST_SEQUENCE_LENGTH=32
+    FTLPU_TEST_HIDDEN_SIZE=64
+    FTLPU_TEST_INTERMEDIATE_SIZE=128
+    FTLPU_TEST_SR_SWISH_CHECKPOINT=1
+    FTLPU_TEST_MODEL_NAME="VXM-SR-FFN")
+target_link_libraries(compiled_vxm_sr_ffn_runtime_test PRIVATE ftlpu_software)
 
 add_executable(compiled_qwen2_5_1_5b_ffn_seq32_runtime_test
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
@@ -356,6 +399,17 @@ target_compile_definitions(compiled_qwen2_5_1_5b_ffn_seq32_runtime_test
     FTLPU_TEST_INTERMEDIATE_SIZE=8960
     FTLPU_TEST_MODEL_NAME="Qwen2.5-1.5B-seq32")
 target_link_libraries(compiled_qwen2_5_1_5b_ffn_seq32_runtime_test
+    PRIVATE ftlpu_software)
+
+add_executable(compiled_qwen3_moe_expert_ffn_seq32_runtime_test
+    tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp)
+target_compile_definitions(compiled_qwen3_moe_expert_ffn_seq32_runtime_test
+    PRIVATE
+    FTLPU_TEST_SEQUENCE_LENGTH=32
+    FTLPU_TEST_HIDDEN_SIZE=2048
+    FTLPU_TEST_INTERMEDIATE_SIZE=768
+    FTLPU_TEST_MODEL_NAME="Qwen3-30B-A3B-expert-seq32")
+target_link_libraries(compiled_qwen3_moe_expert_ffn_seq32_runtime_test
     PRIVATE ftlpu_software)
 
 add_executable(compiled_qwen_real_ffn_runtime_test
@@ -442,3 +496,6 @@ add_executable(hf_decoder_stack_checkpoint_test
 
 target_link_libraries(hf_decoder_stack_checkpoint_test
     PRIVATE ftlpu_software)
+
+add_executable(compiled_stage_file_runner tests/runtime/compiled_stage_file_runner.cpp)
+target_link_libraries(compiled_stage_file_runner PRIVATE ftlpu_software)

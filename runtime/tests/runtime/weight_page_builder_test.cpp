@@ -1,8 +1,11 @@
 #include "ftlpu/software/runtime/model_package.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
+#include "ftlpu/core/bf16.hpp"
 
 #include <cstdint>
+#include <cmath>
+#include <sstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -15,6 +18,57 @@ namespace {
 using namespace ftlpu::software::runtime;
 
 void require(bool condition, const std::string& message);
+
+void test_planar_transport()
+{
+    for (const auto layout : {BindingLayout::Fp16PairPlanar,
+             BindingLayout::Fp32QuadPlanar,
+             BindingLayout::Fp16ScalarBroadcastPlanar,
+             BindingLayout::Fp32ScalarBroadcastPlanar,
+             BindingLayout::Fp16DepthwiseKernel4}) {
+        const bool fp32 = layout == BindingLayout::Fp32QuadPlanar
+            || layout == BindingLayout::Fp32ScalarBroadcastPlanar;
+        const bool scalar = layout == BindingLayout::Fp16ScalarBroadcastPlanar
+            || layout == BindingLayout::Fp32ScalarBroadcastPlanar;
+        const bool kernel = layout == BindingLayout::Fp16DepthwiseKernel4;
+        BinaryBinding b;
+        b.access = BindingAccess::Input;
+        b.element_type = fp32 ? BindingElementType::F32 : BindingElementType::BF16;
+        b.layout = layout;
+        b.shape = kernel ? std::vector<std::uint64_t>{64, 4}
+                         : std::vector<std::uint64_t>{3, 64};
+        b.byte_size = b.shape[0] * b.shape[1] * (fp32 ? 4 : 2);
+        b.base_row = 19;
+        b.bank = 1;
+        b.hemisphere_mask = 2;
+        b.address_stride = 1;
+        b.instruction_count = kernel ? 8 : scalar ? 192 : 6;
+        for (std::uint16_t i = 0; i < (kernel ? 8 : fp32 ? 4 : 2); ++i)
+            b.slices.push_back(32 + i);
+        std::vector<std::uint8_t> bytes(b.byte_size);
+        for (std::size_t i = 0; i < bytes.size(); ++i)
+            bytes[i] = static_cast<std::uint8_t>(i * 37 + i / 7);
+        BinaryProgram p;
+        p.bindings.push_back(b);
+        auto system = std::make_unique<ftlpu::TspSliceSystem>();
+        CModelRuntime runtime(*system);
+        runtime.load(p);
+        runtime.upload_input(0, bytes);
+        const auto image = pack_binding_image(b, bytes, p.hardware);
+        for (const auto& segment : image.segments)
+            for (std::size_t row = 0; row < segment.vector_count; ++row)
+                for (std::size_t lane = 0; lane < 32; ++lane)
+                    require(image.data[segment.byte_offset + row * 32 + lane]
+                        == system->read_mem_sram_lane_byte(
+                            static_cast<ftlpu::Hemisphere>(segment.hemisphere),
+                            segment.slice, b.bank, lane / 8,
+                            segment.base_row + row, lane % 8),
+                        "planar C2C packing differs from native upload");
+        if (!kernel)
+            require(unpack_binding_image(b, image, p.hardware) == bytes,
+                "planar C2C output failed bitwise roundtrip");
+    }
+}
 
 BinaryBinding make_weight(std::uint16_t bank)
 {
@@ -108,9 +162,92 @@ void require(bool condition, const std::string& message)
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 try {
+    if (argc == 2) {
+        const auto compiled = read_binary_program(argv[1]);
+        int projectionCount = 0, tableCount = 0;
+        for (const auto& binding : compiled.bindings) {
+            if (binding.role == "weight" && binding.rope_rotary_dim == 96
+                && binding.rope_head_dim == 128) ++projectionCount;
+            if (binding.initializer == BindingInitializer::RopeTable) {
+                require(binding.rope_rotary_dim == 96 && binding.rope_head_dim == 128
+                    && std::abs(binding.rope_attention_factor - std::sqrt(1.0f + 5.0f / 12.0f)) < 1.0e-5f,
+                    "compiled Phi RoPE table metadata lost partial width or LongRoPE amplitude");
+                ++tableCount;
+            }
+        }
+        require(projectionCount == 2 && tableCount >= 1,
+            "compiled Phi Q/K packing metadata does not match partial RoPE");
+    }
+    {
+        BinaryBinding table;
+        table.access = BindingAccess::Internal;
+        table.element_type = BindingElementType::BF16;
+        table.layout = BindingLayout::Fp16RopeTable;
+        table.role = "constant";
+        table.initializer = BindingInitializer::RopeTable;
+        table.shape = {32, 64, 2};
+        table.byte_size = 32 * 64 * 2 * 2;
+        table.slices = {0, 1, 2, 3};
+        table.address_stride = 1;
+        table.instruction_count = 64;
+        table.hemisphere_mask = 3;
+        table.rope_theta = 10000.0f;
+        table.rope_head_dim = 128;
+        table.rope_rotary_dim = 96;
+        table.rope_attention_factor = 1.19f;
+        BinaryProgram program;
+        program.bindings.push_back(table);
+        std::stringstream encoded(std::ios::in | std::ios::out | std::ios::binary);
+        write_binary_program(program, encoded);
+        const auto decoded = read_binary_program(encoded);
+        require(decoded.bindings[0].rope_rotary_dim == 96
+            && decoded.bindings[0].rope_attention_factor == 1.19f,
+            "binary round-trip dropped partial RoPE parameters");
+        const auto bytes = encoded.str();
+        const auto metadata = read_binary_program_metadata(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+        require(metadata.bindings[0].rope_rotary_dim == 96,
+            "binary metadata reader dropped partial RoPE parameters");
+        auto system = std::make_unique<ftlpu::TspSliceSystem>();
+        CModelRuntime runtime(*system);
+        runtime.load(decoded);
+        for (std::size_t d = 0; d < 64; ++d) {
+            const float angle = d < 48 ? 7.0f / std::pow(10000.0f, float(2 * d) / 96) : 0.0f;
+            const float factor = d < 48 ? 1.19f : 1.0f;
+            const std::uint16_t expected[] = {
+                ftlpu::Bf16::from_float(std::cos(angle) * factor).bits(),
+                ftlpu::Bf16::from_float(std::sin(angle) * factor).bits()};
+            for (int hemisphere = 0; hemisphere < 2; ++hemisphere)
+                for (int trig = 0; trig < 2; ++trig)
+                    for (int byte = 0; byte < 2; ++byte)
+                        require(system->read_mem_sram_lane_byte(static_cast<ftlpu::Hemisphere>(hemisphere),
+                            trig * 2 + byte, 0, (d % 32) / 8, (d / 32) * 32 + 7, d % 8)
+                                == std::uint8_t(expected[trig] >> (byte * 8)),
+                            "partial RoPE table has wrong frequency, amplitude or unchanged tail");
+        }
+    }
+    {
+        auto partial = make_weight(1);
+        partial.rope_head_dim = 128;
+        partial.rope_rotary_dim = 96;
+        auto source = logical_weight();
+        const auto canonical = pack_rope_projection_data(partial, source);
+        for (std::size_t k = 0; k < 64; ++k)
+            for (std::size_t n = 0; n < 128; ++n) {
+                const std::size_t expected = n < 48 ? n : n < 64 ? n + 48
+                    : n < 112 ? n - 16 : n;
+                require(canonical[k * 128 + n] == source[k * 128 + expected],
+                    "partial Q/K packing mixes rotary or unchanged tail features");
+            }
+        const auto packedPartial = pack_weight_binding(partial, source, ExecutableHardwareConfig{});
+        partial.rope_rotary_dim = 0;
+        require(packedPartial.data == pack_weight_binding(partial, canonical, ExecutableHardwareConfig{}).data,
+            "partial Q/K offline image did not apply the compiler-selected permutation");
+    }
     test_kv_cache_roundtrip();
+    test_planar_transport();
     const auto data = logical_weight();
     const BinaryBinding binding = make_weight(1);
     const PackedWeightImage packed = pack_weight_binding(

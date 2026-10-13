@@ -733,9 +733,14 @@ try {
             [&](const IcuSpec& spec) {
                 return spec.kind == key.first && spec.index == key.second;
             });
-        if (!mapped)
-            throw std::logic_error(
-                "binary queue has no physical ICU in the current topology");
+        if (!mapped) {
+            auto message = std::string {
+                "binary queue has no physical ICU in the current topology: "};
+            message += ftlpu::software::runtime::queue_kind_name(key.first);
+            message += " index=";
+            message += std::to_string(key.second);
+            throw std::logic_error(message);
+        }
     }
 
     // The physical topology can change between exporter versions. Remove only

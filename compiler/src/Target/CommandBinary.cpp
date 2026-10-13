@@ -791,37 +791,27 @@ StreamReleaseSummary stream_release_cycles(
             isa::decode_vxm_icu_run_2d_instruction(packet);
         const auto decoded = isa::decode_vxm_instruction(
             static_cast<std::size_t>(op.getQueue()), run.instruction);
-        const auto& instruction = decoded.instruction;
+        const auto& instruction = decoded;
         const int64_t end = raw_loop_absolute_final_cycle(
             op.getOperation(), run.loop, instruction.repeat_count - 1);
-        const auto markOperand = [&](const VxmLaneOperand& operand,
-                                     bool rhsPort) {
-            if (operand.kind != VxmLaneOperandKind::StreamFloat16
-                && operand.kind != VxmLaneOperandKind::StreamBFloat16)
+        const auto markOperand = [&](const VxmSrOperand& operand) {
+            const auto width =
+                operand.kind == VxmSrOperandKind::StreamFloat32 ? 4
+                : operand.kind == VxmSrOperandKind::StreamInt8 ? 1
+                : (operand.kind == VxmSrOperandKind::StreamFloat16
+                      || operand.kind == VxmSrOperandKind::StreamBFloat16)
+                ? 2 : 0;
+            if (width == 0)
                 return;
-            const auto group = VxmLane::input_group_for_operand(
-                static_cast<std::size_t>(op.getQueue()), rhsPort, operand);
-            const int64_t packedBase = group < 8
-                ? static_cast<int64_t>(group * 2)
-                : streamCount
-                    + static_cast<int64_t>((group - 8) * 2);
-            markRange(packedBase, 2, end);
+            markRange(static_cast<int64_t>(operand.sr), width, end);
         };
-        markOperand(instruction.lhs, false);
-        markOperand(instruction.rhs, true);
-        if (instruction.output_stream) {
-            const auto block = VxmLane::block_for_stage(
-                static_cast<std::size_t>(op.getQueue()));
-            const int64_t packedBase = block < 4
-                ? streamCount
-                    + static_cast<int64_t>(*instruction.output_stream)
-                : static_cast<int64_t>(*instruction.output_stream);
-            const int64_t width =
-                instruction.output_type == VxmCastTarget::Int8 ? 1
-                : instruction.output_type == VxmCastTarget::Float32 ? 4
-                : 2;
-            markRange(packedBase, width, end);
-        }
+        markOperand(instruction.lhs);
+        markOperand(instruction.rhs);
+        const int64_t width =
+            instruction.result_type == VxmCastTarget::Int8 ? 1
+            : instruction.result_type == VxmCastTarget::Float32 ? 4
+            : 2;
+        markRange(static_cast<int64_t>(instruction.result_sr), width, end);
     });
     module.walk([&](command::SxmRun2DOp op) {
         const auto run = op.getKind() == "transpose"
@@ -858,6 +848,12 @@ BindingLayout parse_layout(llvm::StringRef value)
     if (value == "w8a16_native4_weight")
         return BindingLayout::W8A16Native4Weight;
     if (value == "fp16_pair_planar") return BindingLayout::Fp16PairPlanar;
+    if (value == "fp16_hemisphere_pair_planar") return BindingLayout::Fp16HemispherePairPlanar;
+    if (value == "fp32_quad_planar") return BindingLayout::Fp32QuadPlanar;
+    if (value == "fp16_scalar_broadcast_planar")
+        return BindingLayout::Fp16ScalarBroadcastPlanar;
+    if (value == "fp32_scalar_broadcast_planar")
+        return BindingLayout::Fp32ScalarBroadcastPlanar;
     if (value == "fp32_causal_mask_tile")
         return BindingLayout::Fp32CausalMaskTile;
     if (value == "fp16_causal_mask_tile")
@@ -868,6 +864,8 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::Fp16VxmDistributed16;
     if (value == "fp16_vxm_row_parallel_8")
         return BindingLayout::Fp16VxmRowParallel8;
+    if (value == "fp16_depthwise_kernel4")
+        return BindingLayout::Fp16DepthwiseKernel4;
     if (value == "fp16_vxm_gamma_broadcast")
         return BindingLayout::Fp16VxmGammaBroadcast;
     if (value == "fp16_mxm_distributed_16")
@@ -919,6 +917,13 @@ BinaryBinding translate_binding(command::BindingOp op)
     binding.instruction_count = op.getPlacement().getAs<mlir::IntegerAttr>("instruction_count").getInt();
     binding.address_stride = op.getPlacement().getAs<mlir::IntegerAttr>("address_stride").getInt();
     const llvm::StringRef initializer = op.getInitializer();
+    const auto ropeConfig = op.getInitializerConfig();
+    if (const auto dim = ropeConfig.getAs<mlir::IntegerAttr>("rotary_dim")) {
+        binding.rope_rotary_dim = static_cast<std::uint32_t>(dim.getInt());
+        binding.rope_head_dim = static_cast<std::uint32_t>(ropeConfig.getAs<mlir::IntegerAttr>("head_dim").getInt());
+    }
+    if (const auto factor = ropeConfig.getAs<mlir::FloatAttr>("attention_factor"))
+        binding.rope_attention_factor = static_cast<float>(factor.getValueAsDouble());
     binding.initializer = initializer == "zero"
         ? software::runtime::BindingInitializer::Zero
         : initializer == "causal_mask"
@@ -1172,8 +1177,9 @@ VxmLaneOperation parse_vxm_operation(llvm::StringRef value)
     if (value == "add") return VxmAluOpcode::Add;
     if (value == "subtract") return VxmAluOpcode::Subtract;
     if (value == "multiply") return VxmAluOpcode::Multiply;
-    if (value == "fma") return VxmAluOpcode::FusedMultiplyAdd;
-    if (value == "fms") return VxmAluOpcode::FusedMultiplySubtract;
+    if (value == "fma" || value == "fms")
+        throw std::runtime_error(
+            "VXM ISA has no FMA/FMS; lower to multiply plus add/subtract");
     if (value == "negate") return VxmAluOpcode::Negate;
     if (value == "max") return VxmAluOpcode::Max;
     if (value == "exp") return VxmSpecialAluOpcode::Exp;
@@ -1184,43 +1190,94 @@ VxmLaneOperation parse_vxm_operation(llvm::StringRef value)
         "Command IR VXM operation is not implemented by the current CModel");
 }
 
-VxmStreamSource parse_vxm_stream_source(llvm::StringRef value)
+StreamDirection parse_vxm_stream_direction(
+    llvm::StringRef value, llvm::StringRef localHemisphere)
 {
-    if (value.empty() || value == "local") return VxmStreamSource::Local;
-    if (value == "east") return VxmStreamSource::East;
-    if (value == "west") return VxmStreamSource::West;
+    if (value.empty() || value == "local") value = localHemisphere;
+    if (value == "east") return StreamDirection::East;
+    if (value == "west") return StreamDirection::West;
     throw std::runtime_error(
         "Command IR VXM stream source must be local, east, or west");
 }
 
-VxmLaneOperand parse_vxm_operand(llvm::StringRef kind, int64_t index,
-    float immediate, int64_t queue, llvm::StringRef streamSource)
+std::uint8_t command_sr(StreamDirection direction, int64_t index,
+    std::size_t width, llvm::StringRef field)
 {
-    if (kind == "previous") return VxmLaneOperand::Previous();
-    if (kind == "original") return VxmLaneOperand::Original();
-    if (kind == "auxiliary") return VxmLaneOperand::Aux();
-    if (kind == "accumulator") return VxmLaneOperand::Acc();
-    if (kind == "feedback") return VxmLaneOperand::Feedback();
-    if (kind == "alu") {
-        if (index == queue - 1) return VxmLaneOperand::Previous();
+    if (index < 0 || index >= static_cast<int64_t>(hw::kStreamsPerDirection)
+        || index + static_cast<int64_t>(width)
+            > static_cast<int64_t>(hw::kStreamsPerDirection)
+        || index % static_cast<int64_t>(width) != 0)
+        throw std::runtime_error((field + " is not an aligned SR span").str());
+    return static_cast<std::uint8_t>(
+        direction == StreamDirection::East
+            ? StreamId::East(static_cast<std::size_t>(index)).packed()
+            : StreamId::West(static_cast<std::size_t>(index)).packed());
+}
+
+std::uint8_t command_alu_result_sr(
+    int64_t producer, StreamDirection direction)
+{
+    if (producer < 0 || producer >= static_cast<int64_t>(hw::kVxmAluCount))
         throw std::runtime_error(
-            "arbitrary VXM alu(N) references require chain legalization");
+            "VXM alu(N) producer exceeds the configured physical column count");
+    // Raw BF16 operands occupy SR0..SR15 while they cross the physical VXM
+    // columns.  Keep all inter-column FP32 temporaries in SR16..SR31 so a
+    // downstream VALU cannot mistake an in-flight raw operand for an ALU
+    // result. Four rotating slots suffice because a value is consumed before
+    // its producer slot is reused four columns later.
+    const int64_t slot = producer % 4;
+    const int64_t base = producer < 8 ? 16 : 0;
+    return command_sr(direction, base + 4 * slot, 4,
+        "VXM internal FP32 result SR");
+}
+
+VxmSrOperand parse_vxm_sr_operand(llvm::StringRef kind, int64_t index,
+    float immediate, int64_t queue, int64_t chainDepth,
+    llvm::StringRef streamSource, llvm::StringRef inputHemisphere)
+{
+    if (kind == "accumulator") return VxmSrOperand::Accumulator();
+    if (kind == "immediate") return VxmSrOperand::Immediate(immediate);
+    if (kind == "previous" || kind == "feedback") {
+        const int64_t producer = kind == "previous" ? queue - 1
+                                                     : queue + chainDepth - 1;
+        const auto direction = producer < queue
+            ? StreamDirection::East : StreamDirection::West;
+        return VxmSrOperand::StreamFloat32(
+            command_alu_result_sr(producer, direction));
     }
-    const auto streamGroup = [&]() -> std::int32_t {
-        if (index < 0 || index >= 64 || index % 2 != 0)
-            throw std::runtime_error(
-                "VXM 16-bit stream operand requires an even packed stream index");
-        return static_cast<std::int32_t>(((index % 32) / 2) % 8);
-    };
+    if (kind == "alu") {
+        const auto direction = index < queue
+            ? StreamDirection::East : StreamDirection::West;
+        return VxmSrOperand::StreamFloat32(
+            command_alu_result_sr(index, direction));
+    }
+    if (kind == "original" || kind == "auxiliary") {
+        const int64_t head = queue - queue % chainDepth;
+        const int64_t group = (head / 2) * 2
+            + (kind == "auxiliary" ? 1 : 0);
+        const auto direction = parse_vxm_stream_direction(
+            "local", inputHemisphere);
+        const auto sr = command_sr(direction, group * 2, 2,
+            "VXM preserved input SR");
+        return VxmSrOperand::StreamBFloat16(sr);
+    }
+    const auto direction = parse_vxm_stream_direction(
+        streamSource, inputHemisphere);
+    if (index >= static_cast<int64_t>(hw::kStreamsPerDirection)) index %= 32;
     if (kind == "stream_f16")
-        return VxmLaneOperand::StreamFloat16(
-            1.0f, streamGroup(), parse_vxm_stream_source(streamSource));
+        return VxmSrOperand::StreamFloat16(
+            command_sr(direction, index, 2, "VXM FP16 operand SR"));
     if (kind == "stream_bf16")
-        return VxmLaneOperand::StreamBFloat16(
-            1.0f, streamGroup(), parse_vxm_stream_source(streamSource));
-    if (kind == "immediate") return VxmLaneOperand::Imm(immediate);
+        return VxmSrOperand::StreamBFloat16(
+            command_sr(direction, index, 2, "VXM BF16 operand SR"));
+    if (kind == "stream_f32")
+        return VxmSrOperand::StreamFloat32(
+            command_sr(direction, index, 4, "VXM FP32 operand SR"));
+    if (kind == "stream_i8")
+        return VxmSrOperand::StreamInt8(
+            command_sr(direction, index, 1, "VXM int8 operand SR"));
     throw std::runtime_error(
-        "legacy integer/FP32 VXM stream operands require BF16 legalization");
+        "unsupported Command IR VXM SR operand kind");
 }
 
 VxmCastTarget parse_vxm_cast_target(llvm::StringRef value)
@@ -1237,39 +1294,52 @@ void collect_vxm(command::VxmOp op, QueueMap& queues)
     const int64_t queue = op.getQueue();
     if (queue < 0 || queue >= InstructionControlUnit::kVxmQueues)
         throw std::runtime_error(
-            "Command IR VXM queue exceeds the 8 compact control queues");
+            "Command IR VXM queue exceeds the configured physical VALU columns");
     const int64_t output_stream = op.getOutputStreamAttr().getInt();
-    auto instruction = VxmLaneAluInstruction {};
+    const int64_t chainDepth = op.getChainDepth().value_or(8);
+    if (chainDepth <= 0 || hw::kVxmAluCount % chainDepth != 0)
+        throw std::runtime_error("Command IR VXM chain depth is invalid");
+    auto instruction = VxmSrInstruction {};
     instruction.operation = parse_vxm_operation(op.getOpcode());
     const auto lhsSource =
         op->getAttrOfType<mlir::StringAttr>("lhs_stream_source");
     const auto rhsSource =
         op->getAttrOfType<mlir::StringAttr>("rhs_stream_source");
-    instruction.lhs = parse_vxm_operand(op.getLhsKind(), op.getLhsIndex(),
+    instruction.lhs = parse_vxm_sr_operand(op.getLhsKind(), op.getLhsIndex(),
         static_cast<float>(op.getLhsImmediateAttr().getValueAsDouble()), queue,
-        lhsSource ? lhsSource.getValue() : llvm::StringRef{});
-    instruction.rhs = parse_vxm_operand(op.getRhsKind(), op.getRhsIndex(),
+        chainDepth, lhsSource ? lhsSource.getValue() : llvm::StringRef{},
+        op.getInputHemisphere());
+    instruction.rhs = parse_vxm_sr_operand(op.getRhsKind(), op.getRhsIndex(),
         static_cast<float>(op.getRhsImmediateAttr().getValueAsDouble()), queue,
-        rhsSource ? rhsSource.getValue() : llvm::StringRef{});
-    instruction.output_type = parse_vxm_cast_target(op.getCastTarget());
+        chainDepth, rhsSource ? rhsSource.getValue() : llvm::StringRef{},
+        op.getInputHemisphere());
+    instruction.result_type = parse_vxm_cast_target(op.getCastTarget());
     instruction.precision = VxmAluPrecision::Float32;
     instruction.repeat_count = static_cast<std::size_t>(op.getRepeatCount());
     instruction.accumulator_reset = op.getAccumulatorReset().value_or(false);
-    instruction.accumulator_write = op.getAccumulatorWrite().value_or(false);
+    instruction.accumulator_write = op.getAccumulatorWrite().value_or(false)
+        || op.getLocalScalarWrite().value_or(false);
     instruction.accumulator_emit = op.getAccumulatorEmit().value_or(true);
-    instruction.local_scalar_write = op.getLocalScalarWrite().value_or(false);
-    if (output_stream >= 0)
-        instruction.output_stream = static_cast<std::size_t>(output_stream);
-    const auto depth = static_cast<VxmChainDepth>(
-        op->getAttrOfType<mlir::IntegerAttr>("chain_depth")
-            ? op->getAttrOfType<mlir::IntegerAttr>("chain_depth").getInt()
-            : 8);
+    instruction.accumulator_reset_first =
+        op.getAccumulatorResetFirst().value_or(false);
+    instruction.accumulator_emit_last =
+        op.getAccumulatorEmitLast().value_or(false);
+    const auto resultDirection = output_stream >= 0
+        ? parse_vxm_stream_direction(
+              op.getOutputHemisphere(), op.getOutputHemisphere())
+        : parse_vxm_stream_direction("local", op.getInputHemisphere());
+    instruction.result_sr = output_stream >= 0
+        ? command_sr(resultDirection, output_stream % 32,
+              instruction.result_type == VxmCastTarget::Float32 ? 4
+                  : instruction.result_type == VxmCastTarget::Int8 ? 1 : 2,
+              "VXM output SR")
+        : command_alu_result_sr(queue, resultDirection);
     try {
         queues[{QueueKind::Vxm, queue}].push_back(CommandSequence {
             command_cycle(op),
             1, 1, 0,
             vxm_instruction_command(
-                isa::encode_vxm_instruction(queue, depth, instruction)),
+                VxmSrCompactInstructionCodec::encode(instruction)),
             op.getScaleBinding()
                 ? static_cast<int64_t>(*op.getScaleBinding()) : -1,
         });
@@ -1278,7 +1348,7 @@ void collect_vxm(command::VxmOp op, QueueMap& queues)
             "invalid Command IR VXM instruction at cycle "
             + std::to_string(command_cycle(op)) + ", queue "
             + std::to_string(queue) + ", chain_depth "
-            + std::to_string(static_cast<int64_t>(depth))
+            + std::to_string(chainDepth)
             + ", output_stream " + std::to_string(output_stream)
             + ": " + error.what());
     }
@@ -2992,7 +3062,7 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     COPY_THROUGHPUT(mxm_accumulator_blocks);
     COPY_THROUGHPUT(vxm_alus);
     COPY_THROUGHPUT(vxm_cross_hemisphere_streams_enabled);
-    COPY_THROUGHPUT(vxm_fma_enabled);
+    hardware.vxm_reserved_feature = 0;
     COPY_THROUGHPUT(vxm_weight_to_iw_latency);
     COPY_THROUGHPUT(mem_to_sxm_latency);
     COPY_THROUGHPUT(mem_to_mxm_latency);

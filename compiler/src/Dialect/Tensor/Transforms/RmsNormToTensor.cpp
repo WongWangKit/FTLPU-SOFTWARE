@@ -284,7 +284,7 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
     mlir::ArrayAttr resultPlan;
     const auto resultType =
         llvm::cast<mlir::RankedTensorType>(op.getResult().getType());
-    if (op.getKind() == "add"
+    if ((op.getKind() == "add" || op->hasAttr("rhs_immediate"))
         && is_lpu_16bit_float(resultType.getElementType())
         && resultType.getRank() == 2
         && resultType.getDimSize(1) % 64 == 0) {
@@ -412,10 +412,32 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
             ? llvm::SmallVector<int64_t, 4>(
                   distributedSlices.begin(), distributedSlices.begin() + 4)
             : llvm::SmallVector<int64_t, 4>({16, 17, 18, 19});
-        const llvm::SmallVector<int64_t, 4> pairResultSlices =
+        llvm::SmallVector<int64_t, 4> pairResultSlices =
             target.uses_dedicated_slice_roles()
             ? planarResultSlices
             : llvm::SmallVector<int64_t, 4>({32, 33, 34, 35});
+        if (op->hasAttr("rhs_immediate") && target.uses_dedicated_slice_roles()) {
+            pairResultSlices.clear();
+            const auto hiddenSlices = target.mxm_distributed_activation_slices();
+            for (int64_t slice : target.activation_storage_slices()) {
+                if (!llvm::is_contained(hiddenSlices, slice))
+                    pairResultSlices.push_back(slice);
+                if (pairResultSlices.size() == 4) break;
+            }
+            if (pairResultSlices.size() != 4)
+                return op.emitError("scalar residual requires four separate temporary slices");
+            const auto inputSlices = lhsPlacement.getAs<mlir::ArrayAttr>("slices");
+            const bool inputUsesTemporary = llvm::any_of(inputSlices, [&](mlir::Attribute slice) {
+                return llvm::is_contained(pairResultSlices,
+                    llvm::cast<mlir::IntegerAttr>(slice).getInt());
+            });
+            if (inputUsesTemporary) {
+                // The persistent attention residual occupies the temporary
+                // slice group during FFN. Keep the scaled Down result on
+                // another pair group for the final residual add.
+                pairResultSlices.assign(hiddenSlices.begin() + 4, hiddenSlices.begin() + 8);
+            }
+        }
         const int64_t feedbackResultBase =
             target.uses_dedicated_slice_roles() ? 0 : 4096;
         const Allocation result = usesPersistentActivationAbi
@@ -482,13 +504,16 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
         op.getLoc(), tensor::ElementwiseTaskOp::getOperationName());
     state.addOperands({op.getLhs(), op.getRhs()});
     state.addTypes(op.getResult().getType());
+    llvm::SmallVector<mlir::NamedAttribute> elementwiseConfig;
+    if (auto immediate = op->getAttr("rhs_immediate"))
+        elementwiseConfig.push_back(rewriter.getNamedAttr("rhs_immediate", immediate));
     state.addAttributes({
         rewriter.getNamedAttr("kind", op.getKindAttr()),
         rewriter.getNamedAttr("lhs_allocations", *lhsPlan),
         rewriter.getNamedAttr("rhs_allocations", *rhsPlan),
         rewriter.getNamedAttr("result_allocations", resultPlan),
         rewriter.getNamedAttr(
-            "config", rewriter.getDictionaryAttr({})),
+            "config", rewriter.getDictionaryAttr(elementwiseConfig)),
     });
     auto lowered =
         llvm::cast<tensor::ElementwiseTaskOp>(rewriter.create(state));

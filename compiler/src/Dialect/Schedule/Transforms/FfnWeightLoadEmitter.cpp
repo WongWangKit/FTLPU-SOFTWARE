@@ -364,8 +364,13 @@ MxmLoadOp emitFfnWeightTile(
   for (int64_t group = 0; group < domain.group_count; ++group) {
     const int64_t groupCycle = startCycle + group * domain.group_interval;
     for (int64_t stream = 0; stream < rawRoute.getStreamCount(); ++stream) {
+      const int64_t multiplyColumn = hemisphere == 0
+          ? stream : target.throughput().vxm_alus - 1 - stream;
+      const int64_t castColumn = hemisphere == 0
+          ? 8 + stream
+          : target.throughput().vxm_alus - 1 - (8 + stream);
       auto multiply = create_vxm(rewriter, location, readValue, readValue,
-          dequantizedType, groupCycle, stream, "multiply", "stream_i8",
+          dequantizedType, groupCycle, multiplyColumn, "multiply", "stream_i8",
           encodedStreamBase + stream, 0.0f, "immediate", 0, scale,
           "fp32", -1, duration, 1, hemi, hemi,
           functionArgumentIndex(rawRoute.getInput()));
@@ -375,8 +380,8 @@ MxmLoadOp emitFfnWeightTile(
           rewriter.getI64IntegerAttr(domain.wave_interval));
       value = multiply.getResult();
       auto cast = create_vxm(rewriter, location, value, readValue,
-          dequantizedType, groupCycle + 1, 8 + stream, "cast", "alu",
-          stream, 0.0f, "immediate", 0, 0.0f, dataFormat,
+          dequantizedType, groupCycle + 1, castColumn, "cast", "alu",
+          multiplyColumn, 0.0f, "immediate", 0, 0.0f, dataFormat,
           localMxm * throughput.mxm_load_streams_per_cycle + stream * 2,
           duration, 1, hemi, hemi);
       cast->setAttr("wave_count",

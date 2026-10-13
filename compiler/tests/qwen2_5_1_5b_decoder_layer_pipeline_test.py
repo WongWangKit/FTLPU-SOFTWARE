@@ -259,8 +259,8 @@ def main() -> None:
     ffn_input_allocation: tuple[str, int, int, int, frozenset[int]] | None = None
     rope_product_intervals: list[tuple[int, int]] = []
     rope_combine_intervals: list[tuple[int, int]] = []
-    qk_bias_low_fma = False
-    qk_bias_high_fma = False
+    qk_bias_low_mul_add = False
+    qk_bias_high_mul_add = False
     value_bias_add = False
     bias_bindings: set[str] = set()
     binding_ready_cycles: dict[str, int] = {}
@@ -296,10 +296,10 @@ def main() -> None:
             }
             if "ftlpu.schedule.vxm" in line:
                 queue = re.search(r"queue = (\d+) : i64", line)
-                if queue and int(queue.group(1)) >= 8:
+                if queue and int(queue.group(1)) >= 16:
                     raise AssertionError(
                         "Schedule IR addresses a physical VXM ALU instead of "
-                        f"one of the 8 mirrored control queues: {line.strip()}"
+                        f"one of the 16 physical column queues: {line.strip()}"
                     )
                 if all(marker in line for marker in (
                     'queue = 0 : i64', 'opcode = "multiply"',
@@ -314,17 +314,19 @@ def main() -> None:
                 )):
                     rope_combine_intervals.extend(repeated_intervals(line))
                 if all(marker in line for marker in (
-                    'queue = 1 : i64', 'opcode = "fma"',
-                    'lhs_index = 40 : i64', 'rhs_index = 34 : i64',
+                    'queue = 2 : i64', 'opcode = "add"',
+                    'lhs_kind = "alu"', 'lhs_index = 0 : i64',
+                    'rhs_kind = "alu"', 'rhs_index = 1 : i64',
                     'output_stream = 0 : i64',
                 )):
-                    qk_bias_low_fma = True
+                    qk_bias_low_mul_add = True
                 if all(marker in line for marker in (
-                    'queue = 3 : i64', 'opcode = "fma"',
-                    'lhs_index = 42 : i64', 'rhs_index = 38 : i64',
+                    'queue = 5 : i64', 'opcode = "add"',
+                    'lhs_kind = "alu"', 'lhs_index = 3 : i64',
+                    'rhs_kind = "alu"', 'rhs_index = 4 : i64',
                     'output_stream = 2 : i64',
                 )):
-                    qk_bias_high_fma = True
+                    qk_bias_high_mul_add = True
                 if all(marker in line for marker in (
                     '%arg8' , 'opcode = "add"',
                     'lhs_index = 32 : i64', 'rhs_index = 40 : i64',
@@ -1132,9 +1134,10 @@ def main() -> None:
                 f"{name} readiness is not on the global schedule timeline: "
                 f"observed={observed}, expected={expected}"
             )
-    if not qk_bias_low_fma or not qk_bias_high_fma:
+    if not qk_bias_low_mul_add or not qk_bias_high_mul_add:
         raise AssertionError(
-            "Schedule IR does not fuse Q/K bias into both RoPE product chains"
+            "Schedule IR does not lower Q/K bias products to both "
+            "mul/mul/add RoPE column groups"
         )
     if not value_bias_add:
         raise AssertionError(

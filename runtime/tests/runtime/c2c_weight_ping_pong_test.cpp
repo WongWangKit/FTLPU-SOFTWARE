@@ -144,7 +144,7 @@ LinkedTimingResult run_controlled_linked_timing_case(
     load_queue_programs_into_icu({*linkedMem}, icu);
     auto& mem = icu.mem_iq(timing_mem_queue());
     LinkedTimingResult result;
-    for (std::size_t cycle = 0; cycle <= readyCycle + 4; ++cycle) {
+    for (std::size_t cycle = 0; cycle <= readyCycle + 32; ++cycle) {
         for (const auto notificationCycle : notificationCycles)
             if (notificationCycle == cycle)
                 mem.notify(kTimingSyncTag);
@@ -234,7 +234,7 @@ LinkedTimingResult run_real_linked_timing_case(std::size_t readyCycle)
     return result;
 }
 
-void test_linked_mem_window_preserves_trailing_3d_cycle()
+void test_linked_mem_window_releases_after_ingress()
 {
     constexpr std::size_t readyCycle = 11;
     const auto early = run_controlled_linked_timing_case(readyCycle,
@@ -248,14 +248,27 @@ void test_linked_mem_window_preserves_trailing_3d_cycle()
             && boundary.last_sync_issue_cycle == readyCycle - 1
             && *boundary.last_sync_issue_cycle >= kTimingTransferEnd,
         "controlled late MEM_WRITE_SYNC did not finish on the reservation boundary");
-    require(early.trailing_mem_issue_cycle == readyCycle
-            && boundary.trailing_mem_issue_cycle == readyCycle,
-        "linked MEM_WRITE_SYNC completion shifted the following MEM 3-D cycle");
+    require(early.trailing_mem_issue_cycle == readyCycle + 1,
+        "early linked MEM_WRITE_SYNC did not release the port immediately after ingress");
+    const auto boundaryTimingFailure =
+        "late MEM_WRITE_SYNC ordering: trailing="
+        + (boundary.trailing_mem_issue_cycle
+            ? std::to_string(*boundary.trailing_mem_issue_cycle)
+            : std::string("none"))
+        + ", last sync="
+        + (boundary.last_sync_issue_cycle
+            ? std::to_string(*boundary.last_sync_issue_cycle)
+            : std::string("none"));
+    require(boundary.trailing_mem_issue_cycle.has_value()
+            && *boundary.trailing_mem_issue_cycle >= readyCycle
+            && *boundary.trailing_mem_issue_cycle
+                > *boundary.last_sync_issue_cycle,
+        boundaryTimingFailure.c_str());
 
     // First observe the deterministic end-to-end completion with ample slack,
-    // then make that same final write land on the last reserved cycle. This
-    // exercises WAIT_EVENT -> DMA -> RX -> MEM_WRITE_SYNC without baking the
-    // transport pipeline latency into the test.
+    // then move the consumer boundary next to that completion. The MEM port is
+    // reserved for ingress only; any transport delay beyond the static window
+    // shifts later commands through the queue's normal WAIT_EVENT semantics.
     constexpr std::size_t probeReadyCycle = 64;
     const auto realEarly = run_real_linked_timing_case(probeReadyCycle);
     require(realEarly.synchronized_issue_count == kTimingVectorCount
@@ -263,10 +276,14 @@ void test_linked_mem_window_preserves_trailing_3d_cycle()
             && *realEarly.last_sync_issue_cycle + 1 < probeReadyCycle
             && realEarly.transport_ready_cycle.has_value()
             && *realEarly.transport_ready_cycle < probeReadyCycle
-            && realEarly.trailing_mem_issue_cycle == probeReadyCycle
+            && realEarly.trailing_mem_issue_cycle.has_value()
+            && *realEarly.trailing_mem_issue_cycle >= probeReadyCycle
+            && *realEarly.trailing_mem_issue_cycle
+                > *realEarly.last_sync_issue_cycle
             && realEarly.pager_ready_cycle.has_value()
-            && *realEarly.pager_ready_cycle >= probeReadyCycle,
-        "real linked C2C path did not complete inside its probe reservation");
+            && *realEarly.pager_ready_cycle
+                >= *realEarly.transport_ready_cycle,
+        "real linked C2C path did not release the MEM port after ingress");
     const auto realBoundaryReadyCycle =
         *realEarly.last_sync_issue_cycle + 1;
     require(realBoundaryReadyCycle > kTimingTransferEnd,
@@ -282,9 +299,12 @@ void test_linked_mem_window_preserves_trailing_3d_cycle()
             && *realBoundary.pager_ready_cycle
                 >= realBoundaryReadyCycle,
         "real linked C2C path did not reproduce its boundary completion");
-    require(realBoundary.trailing_mem_issue_cycle
-            == realBoundaryReadyCycle,
-        "boundary MEM_WRITE_SYNC completion delayed the following real MEM 3-D issue");
+    require(realBoundary.trailing_mem_issue_cycle.has_value()
+            && *realBoundary.trailing_mem_issue_cycle
+                >= realBoundaryReadyCycle
+            && *realBoundary.trailing_mem_issue_cycle
+                > *realBoundary.last_sync_issue_cycle,
+        "following real MEM 3-D issue did not remain ordered after MEM_WRITE_SYNC");
 }
 
 void test_late_page_barrier_follows_its_mem_write_window()
@@ -313,6 +333,20 @@ void test_late_page_barrier_follows_its_mem_write_window()
         IcuControlInstruction::Nop(4)));
     program.queues.push_back(QueueProgram{
         QueueKind::Mem, crossingQueue, std::move(crossingCommands)});
+    const auto zeroWaitQueue = InstructionControlUnit::mem_queue(
+        Hemisphere::East, 1, 0);
+    auto zeroWaitCommands = raw_mem_3d_commands(
+        isa::encode_mem_icu_3d_instruction(MemIcuInstruction::Read3D(
+            IcuLoop3D{0, {16, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(400, {1, 0, 0}), StreamId::East(0))));
+    auto followingDomain = raw_mem_3d_commands(
+        isa::encode_mem_icu_3d_instruction(MemIcuInstruction::Read3D(
+            IcuLoop3D{0, {4, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(416, {1, 0, 0}), StreamId::East(0))));
+    zeroWaitCommands.insert(zeroWaitCommands.end(),
+        followingDomain.begin(), followingDomain.end());
+    program.queues.push_back(QueueProgram {
+        QueueKind::Mem, zeroWaitQueue, std::move(zeroWaitCommands)});
     const std::array consumerQueues {
         std::pair {QueueKind::MxmLoad, std::size_t {0}},
         std::pair {QueueKind::MxmDequant, std::size_t {0}},
@@ -339,6 +373,14 @@ void test_late_page_barrier_follows_its_mem_write_window()
             return release.location == IcuLocation::Mem(
                 Hemisphere::East, 0, 0);
         });
+    const auto zeroWaitRelease = std::ranges::find_if(releases,
+        [](const C2cWeightPager::PageReadyRelease& release) {
+            return release.location == IcuLocation::Mem(
+                Hemisphere::East, 1, 0);
+        });
+    require(zeroWaitRelease != releases.end()
+            && zeroWaitRelease->phase_offset + 1 == 12,
+        "SYNC issue cycle changed the zero-wait consumer wavefront phase");
     const auto mxmRelease = std::ranges::find_if(releases,
         [](const C2cWeightPager::PageReadyRelease& release) {
             return release.location == IcuLocation::MxmLoad(0);
@@ -351,7 +393,7 @@ void test_late_page_barrier_follows_its_mem_write_window()
     require(crossingRelease != releases.end()
             && mxmRelease != releases.end()
             && westMxmRelease != releases.end()
-            && crossingRelease->phase_offset == 11
+            && crossingRelease->phase_offset == 12
             && mxmRelease->phase_offset == 0
             && westMxmRelease->phase_offset == 0,
         "page-ready release plan did not preserve ICU wavefront phase or physical MXM mapping");
@@ -424,6 +466,58 @@ void test_late_page_barrier_follows_its_mem_write_window()
             && *deferredPageWait
                 >= fu_3d_raw_packet_word_count(QueueKind::Mem),
         "page barrier split or interrupted the crossing 3-D ICU instruction");
+}
+
+void test_direct_compute_joins_late_activation_producer()
+{
+    C2cDmaSystem system;
+    BinaryProgram program;
+    program.max_cycle = 96;
+    program.hardware.mxms_per_hemisphere = 1;
+    program.queues.push_back(QueueProgram {QueueKind::Mem, timing_mem_queue(),
+        {encode_icu_control_raw_word(IcuControlInstruction::Nop(96))}});
+    const auto producerQueue = InstructionControlUnit::mem_queue(
+        Hemisphere::East, 12, 0);
+    auto reads = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D{0, {40, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(0, {1, 0, 0}), StreamId::East(0))));
+    auto nextRead = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D{0, {4, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(40, {1, 0, 0}), StreamId::East(16))));
+    reads.insert(reads.end(), nextRead.begin(), nextRead.end());
+    program.queues.push_back(QueueProgram {QueueKind::Mem, producerQueue,
+        std::move(reads)});
+    const auto packet = isa::encode_mxm_compute_icu_3d_instruction(
+        MxmComputeIcuInstruction::Compute3D(
+            IcuLoop3D{0, {4, 1, 1}, {1, 1, 1}, 55}, 0,
+            MxmIcuBufferMode::Fixed, 16, 0, 0, {0, 0, 0}, 1,
+            MxmDataFormat::BFloat16, MxmComputeIcuMode {}));
+    std::vector<QueueCommand> compute;
+    for (const auto& word : packet.words) {
+        QueueCommand command;
+        command.command = word.lanes[0];
+        command.instruction_kind = InstructionKind::Mxm;
+        command.word_count = packet.kLanesPerWord;
+        for (std::size_t lane = 0; lane < command.word_count; ++lane)
+            command.words[lane] = word.lanes[lane];
+        compute.push_back(command);
+    }
+    program.queues.push_back(QueueProgram {QueueKind::MxmCompute, 0,
+        std::move(compute)});
+    C2cWeightPager pager(system);
+    pager.begin_schedule(program);
+    constexpr std::size_t event = 0x7d00;
+    static_cast<void>(pager.schedule(program, timing_page(), 3, 5, 16,
+        0x7100, event));
+    pager.finalize_schedule(program);
+    const auto releases = pager.page_ready_releases(event);
+    const auto producer = std::ranges::find_if(releases,
+        [](const auto& release) {
+            return release.location == IcuLocation::Mem(Hemisphere::East, 12, 0);
+        });
+    require(producer != releases.end() && producer->activation_producer
+            && producer->phase_offset > 16,
+        "direct BF16 COMPUTE_3D omitted its late MEM activation producer");
 }
 
 void test_same_boundary_pages_share_one_execution_epoch()
@@ -556,10 +650,11 @@ void test_c2c_dma_frontend_tail()
 void run_test()
 {
     test_late_page_barrier_follows_its_mem_write_window();
+    test_direct_compute_joins_late_activation_producer();
     test_same_boundary_pages_share_one_execution_epoch();
     test_early_page_event_is_latched_until_consumer();
     test_c2c_dma_frontend_tail();
-    test_linked_mem_window_preserves_trailing_3d_cycle();
+    test_linked_mem_window_releases_after_ingress();
 
     constexpr auto hemisphere = Hemisphere::West;
     constexpr std::size_t slice = 16;
@@ -669,8 +764,8 @@ void run_test()
             && linkedMem->commands.size() == 3
             && is_mem_synchronized_raw_packet_header(
                 linkedMem->commands[0])
-            && (linkedMem->commands[0].words[2] & 0xffffffU) + 1 == 96,
-        "pre-load linker did not absorb the leading NOP into MEM_WRITE_SYNC");
+            && (linkedMem->commands[0].words[2] & 0xffffffU) + 1 == 60,
+        "pre-load linker did not reserve MEM_WRITE_SYNC through page ingress");
     auto linkedIcu = std::make_unique<InstructionControlUnit>();
     load_queue_programs_into_icu(linkedProgram.queues, *linkedIcu);
     require(linkedIcu->mem_iq(lowered.segments[0].mem_queue)
@@ -738,13 +833,194 @@ void run_test()
             return queue.kind == QueueKind::Mem
                 && queue.index == lowered.segments[0].mem_queue;
         });
+    const auto boundaryLaunchHasWrite =
+        boundaryLaunchMem != boundaryLaunchProgram.queues.end()
+        && std::ranges::any_of(boundaryLaunchMem->commands,
+            [](const QueueCommand& command) {
+                return is_mem_synchronized_raw_packet_header(command);
+            });
     require(boundaryLaunchFence.scheduled_start_cycle == 96
-            && boundaryLaunchMem != boundaryLaunchProgram.queues.end()
-            && std::ranges::any_of(boundaryLaunchMem->commands,
-                [](const QueueCommand& command) {
-                    return is_mem_synchronized_raw_packet_header(command);
-                }),
-        "consumer-boundary page launch did not reserve its MEM writes");
+            && boundaryLaunchHasWrite,
+        "slow DDR page was moved behind its consumer instead of waiting in MEM_WRITE_SYNC");
+    const auto boundaryWrite = std::ranges::find_if(boundaryLaunchMem->commands,
+        [](const QueueCommand& command) {
+            return is_mem_synchronized_raw_packet_header(command);
+        });
+    require(boundaryWrite != boundaryLaunchMem->commands.end()
+            && (boundaryWrite->words[2] & 0xffffffU) + 1 <= 96,
+        "late DDR launch did not arm its MEM_WRITE_SYNC before the consumer");
+
+    BinaryProgram fragmentedIdleProgram;
+    IcuLoop3D fragmentedLoop {0, {1, 1, 1}, {1, 1, 1}};
+    fragmentedLoop.wait_cycle = 32;
+    auto fragmentedRead = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(fragmentedLoop,
+            MemIcuAddress3D::Affine(next_row, {1, 0, 0}), StreamId::East(0))));
+    fragmentedRead.insert(fragmentedRead.begin(), encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(40)));
+    fragmentedRead.insert(fragmentedRead.begin(), encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(28)));
+    fragmentedIdleProgram.queues.push_back(QueueProgram {QueueKind::Mem,
+        lowered.segments[0].mem_queue, std::move(fragmentedRead)});
+    auto fragmentedIdleSystem = std::make_unique<C2cDmaSystem>();
+    C2cWeightPager fragmentedIdlePager(*fragmentedIdleSystem);
+    fragmentedIdlePager.begin_schedule(fragmentedIdleProgram);
+    static_cast<void>(fragmentedIdlePager.schedule(fragmentedIdleProgram,
+        logicalPage, 0, 10, 100, 0x3200, 0x3201));
+    fragmentedIdlePager.finalize_schedule(fragmentedIdleProgram);
+    const auto fragmentedMem = std::ranges::find_if(fragmentedIdleProgram.queues,
+        [&](const QueueProgram& queue) {
+            return queue.kind == QueueKind::Mem
+                && queue.index == lowered.segments[0].mem_queue;
+        });
+    require(fragmentedMem != fragmentedIdleProgram.queues.end()
+            && fragmentedMem->commands.size() == 7
+            && decode_icu_control_raw_word(fragmentedMem->commands[2]).count == 89
+            && decode_fu_3d_raw_packet_loop(*fragmentedMem, 4).wait_cycle == 0,
+        "fragmented NOP/wait idle span introduced a false early page barrier");
+
+    BinaryProgram groupedPagesProgram;
+    auto groupedRead = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D {0, {1, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(next_row, {1, 0, 0}), StreamId::East(0))));
+    groupedRead.insert(groupedRead.begin(), encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(100)));
+    groupedPagesProgram.queues.push_back(QueueProgram {QueueKind::Mem,
+        lowered.segments[0].mem_queue, std::move(groupedRead)});
+    auto groupedPagesSystem = std::make_unique<C2cDmaSystem>();
+    C2cWeightPager groupedPagesPager(*groupedPagesSystem);
+    groupedPagesPager.begin_schedule(groupedPagesProgram);
+    for (std::size_t page = 0; page < 3; ++page) {
+        auto disjoint = logicalPage;
+        disjoint.segments[0].slice += static_cast<std::uint16_t>(page);
+        static_cast<void>(groupedPagesPager.schedule(groupedPagesProgram,
+            disjoint, page * 10, page * 10 + 10, 100,
+            0x3400 + page, 0x3500 + page));
+    }
+    groupedPagesPager.finalize_schedule(groupedPagesProgram);
+    const auto groupedMem = std::ranges::find_if(groupedPagesProgram.queues,
+        [&](const QueueProgram& queue) {
+            return queue.kind == QueueKind::Mem
+                && queue.index == lowered.segments[0].mem_queue;
+        });
+    require(groupedMem != groupedPagesProgram.queues.end()
+            && groupedMem->commands.size() == 9
+            && decode_icu_control_raw_word(groupedMem->commands[2]).count == 87
+            && decode_fu_3d_raw_packet_loop(*groupedMem, 6).wait_cycle == 0,
+        "three page waits at one boundary moved the following MEM wavefront");
+
+    BinaryProgram mergedBoundaryProgram;
+    auto mergedRead = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D {0, {1, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(next_row, {1, 0, 0}), StreamId::East(0))));
+    mergedRead.insert(mergedRead.begin(), encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(100)));
+    mergedBoundaryProgram.queues.push_back(QueueProgram {QueueKind::Mem,
+        lowered.segments[0].mem_queue, std::move(mergedRead)});
+    auto mergedSystem = std::make_unique<C2cDmaSystem>();
+    C2cWeightPager mergedPager(*mergedSystem);
+    mergedPager.begin_schedule(mergedBoundaryProgram);
+    for (std::size_t page = 0; page < 3; ++page) {
+        auto disjoint = logicalPage;
+        disjoint.segments[0].slice += static_cast<std::uint16_t>(page);
+        static_cast<void>(mergedPager.schedule(mergedBoundaryProgram,
+            disjoint, page * 10, page * 10 + 10, 100, 0x3600 + page, 0x3700 + page));
+    }
+    const auto aliases = mergedPager.coalesce_page_ready_events();
+    require(aliases.size() == 3 && std::ranges::all_of(aliases,
+        [](const auto& alias) { return alias.second == 0x3700; }),
+        "pages sharing one queue collision did not share one release event");
+    mergedPager.finalize_schedule(mergedBoundaryProgram);
+    const auto mergedMem = std::ranges::find_if(mergedBoundaryProgram.queues,
+        [&](const QueueProgram& queue) {
+            return queue.kind == QueueKind::Mem && queue.index == lowered.segments[0].mem_queue;
+        });
+    require(mergedMem != mergedBoundaryProgram.queues.end(), "merged page cut lost its MEM queue");
+    std::size_t mergedWaits = 0;
+    for (const auto& command : mergedMem->commands)
+        if (is_icu_control_raw_word_command(command)) {
+            const auto control = decode_icu_control_raw_word(command);
+            if (control.opcode == IcuControlOpcode::WaitEvent) {
+                ++mergedWaits;
+                require(control.event_tag == 0x3700, "merged cut retained a stale page tag");
+            }
+        }
+    require(mergedWaits == 1 && mergedPager.page_ready_releases(0x3701).empty(),
+        "merged cut replayed multiple page rendezvous");
+
+    BinaryProgram joinedEpochProgram;
+    auto joinedRead = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D {0, {1, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(next_row, {1, 0, 0}), StreamId::East(0))));
+    joinedRead.insert(joinedRead.begin(), encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(100)));
+    joinedEpochProgram.queues.push_back(QueueProgram {QueueKind::Mem,
+        lowered.segments[0].mem_queue, std::move(joinedRead)});
+    auto joinedEpochSystem = std::make_unique<C2cDmaSystem>();
+    C2cWeightPager joinedEpochPager(*joinedEpochSystem);
+    joinedEpochPager.begin_schedule(joinedEpochProgram);
+    static_cast<void>(joinedEpochPager.schedule(joinedEpochProgram,
+        timing_page(), 0, 10, 20, 0x3300, 0x3301));
+    static_cast<void>(joinedEpochPager.schedule(joinedEpochProgram,
+        logicalPage, 20, 140, 100, 0x3302, 0x3303));
+    joinedEpochPager.finalize_schedule(joinedEpochProgram);
+    const auto joinedMem = std::ranges::find_if(joinedEpochProgram.queues,
+        [&](const QueueProgram& queue) {
+            return queue.kind == QueueKind::Mem
+                && queue.index == lowered.segments[0].mem_queue;
+        });
+    require(joinedMem != joinedEpochProgram.queues.end()
+            && joinedMem->commands.size() == 6
+            && is_mem_synchronized_raw_packet_header(joinedMem->commands[0])
+            && (joinedMem->commands[0].words[2] & 0xffffffU) + 1 == 98
+            && decode_icu_control_raw_word(joinedMem->commands[2]).event_tag == 0x3303
+            && decode_fu_3d_raw_packet_loop(*joinedMem, 3).wait_cycle == 0,
+        "prefetch-only MEM queue retained an unrelated epoch rendezvous");
+
+    BinaryProgram earlyJoinProgram;
+    auto earlyRead = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D {0, {1, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(next_row, {1, 0, 0}), StreamId::East(0))));
+    earlyRead.insert(earlyRead.begin(), encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(300)));
+    earlyJoinProgram.queues.push_back(QueueProgram {QueueKind::Mem,
+        lowered.segments[0].mem_queue, std::move(earlyRead)});
+    auto earlyJoinSystem = std::make_unique<C2cDmaSystem>();
+    C2cWeightPager earlyJoinPager(*earlyJoinSystem);
+    earlyJoinPager.begin_schedule(earlyJoinProgram);
+    static_cast<void>(earlyJoinPager.schedule(earlyJoinProgram,
+        timing_page(), 0, 10, 80, 0x3400, 0x3401));
+    // The unrelated epoch arrives before this queue's WRITE_SYNC window,
+    // not inside it. There is still no consumer until this page's own join.
+    static_cast<void>(earlyJoinPager.schedule(earlyJoinProgram,
+        logicalPage, 120, 180, 300, 0x3402, 0x3403, 120));
+    earlyJoinPager.finalize_schedule(earlyJoinProgram);
+    const auto earlyMem = std::ranges::find_if(earlyJoinProgram.queues,
+        [&](const QueueProgram& queue) {
+            return queue.kind == QueueKind::Mem
+                && queue.index == lowered.segments[0].mem_queue;
+        });
+    require(earlyMem != earlyJoinProgram.queues.end(),
+        "early prefetch join lost its MEM queue");
+    const auto findWait = [&](std::size_t tag) {
+        return std::ranges::find_if(earlyMem->commands,
+            [&](const QueueCommand& command) {
+                if (!is_icu_control_raw_word_command(command)) return false;
+                const auto control = decode_icu_control_raw_word(command);
+                return control.opcode == IcuControlOpcode::WaitEvent
+                    && control.event_tag == tag;
+            });
+    };
+    require(findWait(0x3401) == earlyMem->commands.end(),
+        "prefetch-only MEM queue kept an epoch preceding its write window");
+    const auto ownWait = findWait(0x3403);
+    require(ownWait != earlyMem->commands.end()
+            && ownWait + 1 != earlyMem->commands.end()
+            && is_fu_3d_raw_packet_header(*(ownWait + 1))
+            && decode_fu_3d_raw_packet_loop(*earlyMem,
+                static_cast<std::size_t>(ownWait + 1
+                    - earlyMem->commands.begin())).wait_cycle == 0,
+        "late prefetch replayed static idle time before its consumer rendezvous");
 
     C2cWeightPage multiQueuePage;
     multiQueuePage.layer = 2;

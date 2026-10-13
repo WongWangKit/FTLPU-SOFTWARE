@@ -159,10 +159,22 @@ def group_dequant_lanes(events: list[Event]) -> list[Event]:
     return sorted(grouped, key=lambda event: (event.start, resource_key(event.resource)))
 
 
+def is_mem_read(resource: str) -> bool:
+    return resource.startswith("MEM") and bool(
+        re.search(r"\.Read(?:3D)?$", resource)
+    )
+
+
+def is_mem_write(resource: str) -> bool:
+    return resource.startswith("MEM") and bool(
+        re.search(r"\.Write(?:3D)?$", resource)
+    )
+
+
 def detect_schedule_policy(events: list[Event]) -> str:
     fused_hidden_streams = {"E30", "E31"}
     for event in events:
-        if not event.resource.startswith("MEM") or not event.resource.endswith(".Write"):
+        if not is_mem_write(event.resource):
             continue
         match = re.search(r"stream=([EW]\d+)", event.detail)
         if match and match.group(1) in fused_hidden_streams:
@@ -179,15 +191,9 @@ def discover_windows(events: list[Event], policy: str) -> tuple[Window, ...]:
         if event.resource.startswith("VXM")
         and re.match(r"(?:neg|negate)\b", event.detail)
     )
-    hidden_write_end = max(
-        event.end for event in events
-        if event.resource.startswith("MEM")
-        and event.resource.endswith(".Write")
-        and re.search(r"slice=(21|22|23|29)\b", event.detail)
-    )
     down = min(
         event.start for event in events
-        if event.start >= hidden_write_end and event.resource.endswith(".Load")
+        if event.start >= swiglu and event.resource.endswith(".Load")
     )
 
     if policy == "fused":
@@ -218,7 +224,7 @@ def resource_key(resource: str) -> tuple[int, int, int, str]:
     if resource.startswith("MEM"):
         if resource.endswith("Accumulate"):
             return 3, hemisphere, 3, resource
-        operation = 0 if resource.endswith("Read") else 1
+        operation = 0 if is_mem_read(resource) else 1
         return 0, hemisphere, operation, resource
     if resource.startswith("SXM"):
         operation = 0 if resource.endswith("Transpose") else 1
@@ -244,7 +250,7 @@ def event_color(event: Event) -> str:
         if resource.endswith(".Accumulate"):
             destination = "Stream" if "dst=stream+clear" in event.detail else "Sram"
             return COLORS["MEM.Accumulate." + destination]
-        return COLORS["MEM." + resource.rsplit(".", 1)[-1]]
+        return COLORS["MEM.Read" if is_mem_read(resource) else "MEM.Write"]
     if resource.startswith("SXM"):
         return COLORS["SXM." + resource.rsplit(".", 1)[-1]]
     if resource.startswith("VXM"):
@@ -258,9 +264,9 @@ def detail_class(event: Event) -> str:
     if event.resource.startswith("ACC."):
         return event.detail
     if event.resource.startswith("MEM"):
-        if event.resource.endswith(".Read"):
+        if is_mem_read(event.resource):
             return "continuous reads"
-        if event.resource.endswith(".Write"):
+        if is_mem_write(event.resource):
             return "continuous writes"
         destination = "stream + clear" if "dst=stream+clear" in event.detail else "SRAM"
         return f"continuous accumulates -> {destination}"

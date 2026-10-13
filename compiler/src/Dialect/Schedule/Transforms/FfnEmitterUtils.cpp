@@ -90,7 +90,8 @@ mlir::DictionaryAttr schedule_placement(mlir::OpBuilder& builder,
     });
 }
 
-VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
+VxmOp create_vxm_with_terminal_controls(
+    mlir::IRRewriter& rewriter, mlir::Location location,
     mlir::Value lhsValue, mlir::Value rhsValue, mlir::Type resultType,
     int64_t cycle, int64_t queue, llvm::StringRef opcode,
     llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
@@ -100,7 +101,8 @@ VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
     llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
     int64_t scaleBinding, bool accumulatorReset,
     bool accumulatorWrite, bool accumulatorEmit,
-    bool localScalarWrite, int64_t chainDepth)
+    bool localScalarWrite, int64_t chainDepth,
+    bool accumulatorResetFirst, bool accumulatorEmitLast)
 {
     mlir::OperationState state(location, VxmOp::getOperationName());
     state.addOperands({lhsValue, rhsValue});
@@ -143,9 +145,36 @@ VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
         state.addAttribute("accumulator_write", rewriter.getBoolAttr(true));
     if (!accumulatorEmit)
         state.addAttribute("accumulator_emit", rewriter.getBoolAttr(false));
+    if (accumulatorResetFirst)
+        state.addAttribute(
+            "accumulator_reset_first", rewriter.getBoolAttr(true));
+    if (accumulatorEmitLast)
+        state.addAttribute(
+            "accumulator_emit_last", rewriter.getBoolAttr(true));
     if (localScalarWrite)
         state.addAttribute("local_scalar_write", rewriter.getBoolAttr(true));
     return llvm::cast<VxmOp>(rewriter.create(state));
+}
+
+VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
+    mlir::Value lhsValue, mlir::Value rhsValue, mlir::Type resultType,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
+    llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
+    llvm::StringRef castTarget, int64_t outputStream,
+    int64_t repeatCount, int64_t repeatInterval,
+    llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
+    int64_t scaleBinding, bool accumulatorReset,
+    bool accumulatorWrite, bool accumulatorEmit,
+    bool localScalarWrite, int64_t chainDepth)
+{
+    return create_vxm_with_terminal_controls(
+        rewriter, location, lhsValue, rhsValue, resultType,
+        cycle, queue, opcode, lhsKind, lhsIndex, lhsImmediate,
+        rhsKind, rhsIndex, rhsImmediate, castTarget, outputStream,
+        repeatCount, repeatInterval, inputHemisphere, outputHemisphere,
+        scaleBinding, accumulatorReset, accumulatorWrite, accumulatorEmit,
+        localScalarWrite, chainDepth, false, false);
 }
 
 llvm::StringRef hemisphere_name(int64_t hemisphere)

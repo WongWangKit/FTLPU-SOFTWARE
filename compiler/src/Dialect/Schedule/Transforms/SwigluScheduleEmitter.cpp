@@ -111,7 +111,8 @@ mlir::LogicalResult lowerSwigluSchedules(mlir::IRRewriter& rewriter,
             windows.push_back({llvm::formatv("MXM.{0}.weight_buffer.{1}",
                 swiglu.getUpUnitId(), swiglu.getUpWeightBuffer()).str(),
                 activation_latency, compute_duration});
-            for (int64_t alu = 0; alu < 16; ++alu)
+            for (int64_t alu = 0;
+                 alu < target.throughput().vxm_alus; ++alu)
                 windows.push_back({llvm::formatv("VXM.alu.{0}", alu).str(),
                     result_offset, compute_duration + vxm_latency});
             const int64_t result_slice = get_slice(swiglu.getResultAddress());
@@ -248,7 +249,7 @@ mlir::LogicalResult lowerSwigluSchedules(mlir::IRRewriter& rewriter,
                     rewriter.getNamedAttr("cycle", rewriter.getI64IntegerAttr(result_cycle + stage)),
                     rewriter.getNamedAttr("queue", rewriter.getI64IntegerAttr(alu)),
                     rewriter.getNamedAttr("opcode", rewriter.getStringAttr(opcode)),
-                    rewriter.getNamedAttr("chain_depth", rewriter.getI64IntegerAttr(8)),
+                    rewriter.getNamedAttr("chain_depth", rewriter.getI64IntegerAttr(16)),
                     rewriter.getNamedAttr("lhs_kind", rewriter.getStringAttr(lhs_kind)),
                     rewriter.getNamedAttr("lhs_index", rewriter.getI64IntegerAttr(lhs_index)),
                     rewriter.getNamedAttr("lhs_immediate", rewriter.getF32FloatAttr(lhs_imm)),

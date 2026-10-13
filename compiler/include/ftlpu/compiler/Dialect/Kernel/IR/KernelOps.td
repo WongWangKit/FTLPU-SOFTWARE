@@ -108,6 +108,48 @@ def SwishOp : FTLPU_Kernel_Op<"swish", [Pure]> {
   let hasVerifier = 1;
 }
 
+def VectorAluOp : FTLPU_Kernel_Op<"vector_alu", [Pure]> {
+  let summary = "Generic scalar-broadcast vector arithmetic and row reduction";
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+      StrAttr:$kind, BoolAttr:$use_immediate, F32Attr:$immediate,
+      BoolAttr:$reduce);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def DepthwiseConv1DOp : FTLPU_Kernel_Op<"depthwise_conv1d", [Pure]> {
+  let summary = "Channel-wise causal one-dimensional convolution";
+  let description = [{
+    A model-independent depthwise convolution over a [tokens, channels]
+    tensor.  Each channel owns one kernel and no cross-channel reduction is
+    performed.  Causal mode supplies zeros before the first token.
+  }];
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      I64Attr:$kernel_size, BoolAttr:$causal, StrAttr:$activation);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $weight attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def GatedDeltaRuleOp : FTLPU_Kernel_Op<"gated_delta_rule", [Pure]> {
+  let summary = "Stateful recurrent gated delta-rule scan";
+  let description = [{
+    A model-independent recurrent linear-attention primitive. Query and key
+    are normalized before this operation; decay contains the multiplicative
+    state coefficient. The operation returns both token outputs and the final
+    FP32 state so prefill and decode use the same state ABI.
+  }];
+  let arguments = (ins AnyRankedTensor:$query, AnyRankedTensor:$key,
+      AnyRankedTensor:$value, AnyRankedTensor:$decay,
+      AnyRankedTensor:$beta, AnyRankedTensor:$initial_state,
+      I64Attr:$heads, I64Attr:$key_dim, I64Attr:$value_dim);
+  let results = (outs AnyRankedTensor:$output,
+      AnyRankedTensor:$final_state);
+  let assemblyFormat = "$query `,` $key `,` $value `,` $decay `,` $beta `,` $initial_state attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def ElementwiseOp : FTLPU_Kernel_Op<"elementwise", [Pure]> {
   let summary = "Binary elementwise operation";
   let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,

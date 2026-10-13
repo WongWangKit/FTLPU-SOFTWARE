@@ -222,7 +222,10 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
         lpu_16bit_stream_kind(type.getElementType());
     const auto dataFormat =
         lpu_16bit_data_format(type.getElementType());
-    if (op.getKind() != "add" || type.getRank() != 2
+    const auto rhsImmediate = op.getConfig().getAs<mlir::FloatAttr>("rhs_immediate");
+    const bool scalarMultiply = op.getKind() == "multiply" && rhsImmediate;
+    const float immediateValue = rhsImmediate ? rhsImmediate.getValueAsDouble() : 0.0f;
+    if ((op.getKind() != "add" && !scalarMultiply) || type.getRank() != 2
         || !is_lpu_16bit_float(type.getElementType())
         || (logicalRows != 1 && logicalRows % tile != 0)
         || columns % tile != 0) {
@@ -309,10 +312,12 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             || sharesMemQueue(rhsPlacement, resultPlacement));
     const bool closedColumnDomain = resultDistributed
         && (rows == tile || singleRowDecode);
-    // Depth four adds two pass stages after the add.  This lets an aliased
-    // READ_3D retire before the corresponding result WRITE_3D begins without
-    // presenting input data before the VXM has configured its Bundle.
-    const int64_t outputPipelineLatency = pairMajorMemOrder ? 3 : 1;
+    // A result still crosses every physical VXM column.  Active ALUs replace
+    // passive forwarding at their columns; they do not shorten the fabric.
+    // Include the input-to-first-column beat, then let VxmResult->Mem account
+    // for the system-register and MEM-side transport after the far boundary.
+    const int64_t outputPipelineLatency =
+        target.throughput().vxm_alus + 1 + (scalarMultiply ? 1 : 0);
     const int64_t emittedColumnBlocks = closedColumnDomain
         ? std::min<int64_t>(columnBlocks, kColumnBlockResidues)
         : columnBlocks;
@@ -365,6 +370,9 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             for (int64_t outputHemisphere = 0;
                  outputHemisphere < target.memory().hemispheres;
                  ++outputHemisphere) {
+                if (!operandsMirrored
+                    && outputHemisphere != validOutputHemisphere)
+                    continue;
                 const bool preserveValidOutput = persistentOnValidOutput
                     && outputHemisphere == validOutputHemisphere;
                 for (int64_t pair = 0; pair < physicalPairs; ++pair) {
@@ -583,17 +591,43 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 sourceHemisphere * 16;
             if (!emitOperand(lhsPlacement, *lhs, vxmCycle,
                     32 + mirroredStreamOffset, sourceHemisphere)
-                || !emitOperand(rhsPlacement, *rhs, vxmCycle,
-                    34 + mirroredStreamOffset, sourceHemisphere))
+                || (!scalarMultiply && !emitOperand(rhsPlacement, *rhs, vxmCycle,
+                    34 + mirroredStreamOffset, sourceHemisphere)))
                 return op.emitError(
                     "invalid distributed elementwise address");
         }
+        const auto primaryColumn = [&](int64_t stage) {
+            return hemisphere == 0
+                ? stage
+                : target.throughput().vxm_alus - 1 - stage;
+        };
+        const auto mirrorColumn = [&](int64_t stage) {
+            return hemisphere == 0
+                ? target.throughput().vxm_alus - 1 - stage
+                : stage;
+        };
+        const int64_t primaryInputStream = 32 + hemisphere * 16;
+        const int64_t mirrorInputStream = 32 + (1 - hemisphere) * 16;
         auto sum = create_vxm(rewriter, op.getLoc(),
-            op.getLhs(), op.getRhs(), type, vxmCycle - 1, 0, "add",
-            streamKind, 32, 0.0f, streamKind, 34, 0.0f,
+            op.getLhs(), op.getRhs(), type, vxmCycle - 1,
+            primaryColumn(0), scalarMultiply ? "multiply" : "add",
+            streamKind, primaryInputStream, 0.0f,
+            scalarMultiply ? "immediate" : streamKind,
+            scalarMultiply ? 0 : primaryInputStream + 2, immediateValue,
             "fp32", -1, rows, 1,
             hemisphere == 0 ? "east" : "west",
             hemisphere == 0 ? "east" : "west",
+            -1, false, false, true, false,
+            pairMajorMemOrder ? 4 : 2);
+        auto mirrorSum = create_vxm(rewriter, op.getLoc(),
+            op.getLhs(), op.getRhs(), type, vxmCycle - 1,
+            mirrorColumn(0), scalarMultiply ? "multiply" : "add",
+            streamKind, mirrorInputStream, 0.0f,
+            scalarMultiply ? "immediate" : streamKind,
+            scalarMultiply ? 0 : mirrorInputStream + 2, immediateValue,
+            "fp32", -1, rows, 1,
+            hemisphere == 0 ? "west" : "east",
+            hemisphere == 0 ? "west" : "east",
             -1, false, false, true, false,
             pairMajorMemOrder ? 4 : 2);
         const auto setColumnDomain = [&](VxmOp instruction) {
@@ -605,45 +639,82 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 rewriter.getI64IntegerAttr(activeColumnInterval));
         };
         setColumnDomain(sum);
+        setColumnDomain(mirrorSum);
         if (pairMajorMemOrder) {
             auto pass1 = create_vxm(rewriter, op.getLoc(),
                 sum.getResult(), sum.getResult(), type,
-                vxmCycle - 1, 1, "pass",
-                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                vxmCycle - 1, primaryColumn(1), "pass",
+                "alu", primaryColumn(0), 0.0f, "immediate", 0, 0.0f,
                 "fp32", -1, rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "east" : "west",
+                -1, false, false, true, false, 4);
+            auto mirrorPass1 = create_vxm(rewriter, op.getLoc(),
+                mirrorSum.getResult(), mirrorSum.getResult(), type,
+                vxmCycle - 1, mirrorColumn(1), "pass",
+                "alu", mirrorColumn(0), 0.0f, "immediate", 0, 0.0f,
+                "fp32", -1, rows, 1,
+                hemisphere == 0 ? "west" : "east",
+                hemisphere == 0 ? "west" : "east",
                 -1, false, false, true, false, 4);
             auto pass2 = create_vxm(rewriter, op.getLoc(),
                 pass1.getResult(), pass1.getResult(), type,
-                vxmCycle - 1, 2, "pass",
-                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                vxmCycle - 1, primaryColumn(2), "pass",
+                "alu", primaryColumn(1), 0.0f, "immediate", 0, 0.0f,
                 "fp32", -1, rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "east" : "west",
                 -1, false, false, true, false, 4);
+            auto mirrorPass2 = create_vxm(rewriter, op.getLoc(),
+                mirrorPass1.getResult(), mirrorPass1.getResult(), type,
+                vxmCycle - 1, mirrorColumn(2), "pass",
+                "alu", mirrorColumn(1), 0.0f, "immediate", 0, 0.0f,
+                "fp32", -1, rows, 1,
+                hemisphere == 0 ? "west" : "east",
+                hemisphere == 0 ? "west" : "east",
+                -1, false, false, true, false, 4);
             auto cast = create_vxm(rewriter, op.getLoc(),
                 pass2.getResult(), pass2.getResult(), type,
-                vxmCycle - 1, 3, "cast",
-                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                vxmCycle - 1, primaryColumn(3), "cast",
+                "alu", primaryColumn(2), 0.0f, "immediate", 0, 0.0f,
                 dataFormat, 2, rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "east" : "west",
                 -1, false, false, true, false, 4);
+            auto mirrorCast = create_vxm(rewriter, op.getLoc(),
+                mirrorPass2.getResult(), mirrorPass2.getResult(), type,
+                vxmCycle - 1, mirrorColumn(3), "cast",
+                "alu", mirrorColumn(2), 0.0f, "immediate", 0, 0.0f,
+                dataFormat, 10, rows, 1,
+                hemisphere == 0 ? "west" : "east",
+                hemisphere == 0 ? "west" : "east",
+                -1, false, false, true, false, 4);
             setColumnDomain(pass1);
+            setColumnDomain(mirrorPass1);
             setColumnDomain(pass2);
+            setColumnDomain(mirrorPass2);
             setColumnDomain(cast);
+            setColumnDomain(mirrorCast);
             finalValue = cast.getResult();
         } else {
             auto cast = create_vxm(rewriter, op.getLoc(),
                 sum.getResult(), sum.getResult(), type,
-                vxmCycle - 1, 1, "cast",
-                "alu", 0, 0.0f, "immediate", 0, 0.0f,
+                vxmCycle - 1, primaryColumn(1), "cast",
+                "alu", primaryColumn(0), 0.0f, "immediate", 0, 0.0f,
                 dataFormat, 0, rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "east" : "west",
                 -1, false, false, true, false, 2);
+            auto mirrorCast = create_vxm(rewriter, op.getLoc(),
+                mirrorSum.getResult(), mirrorSum.getResult(), type,
+                vxmCycle - 1, mirrorColumn(1), "cast",
+                "alu", mirrorColumn(0), 0.0f, "immediate", 0, 0.0f,
+                dataFormat, 8, rows, 1,
+                hemisphere == 0 ? "west" : "east",
+                hemisphere == 0 ? "west" : "east",
+                -1, false, false, true, false, 2);
             setColumnDomain(cast);
+            setColumnDomain(mirrorCast);
             finalValue = cast.getResult();
         }
 
@@ -658,40 +729,69 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     sourceHemisphere * 16;
                 if (!emitOperand(lhsPlacement, *lhs, secondVxmCycle,
                         36 + mirroredStreamOffset, sourceHemisphere)
-                    || !emitOperand(rhsPlacement, *rhs, secondVxmCycle,
-                        38 + mirroredStreamOffset, sourceHemisphere))
+                    || (!scalarMultiply && !emitOperand(rhsPlacement, *rhs, secondVxmCycle,
+                        38 + mirroredStreamOffset, sourceHemisphere)))
                     return op.emitError(
                         "invalid second planar elementwise input pass");
             }
             auto secondSum = create_vxm(rewriter, op.getLoc(),
                 op.getLhs(), op.getRhs(), type,
-                secondVxmCycle - 1, 2, "add",
-                streamKind, 36, 0.0f, streamKind, 38, 0.0f,
+                secondVxmCycle - 1, primaryColumn(2), scalarMultiply ? "multiply" : "add",
+                streamKind, primaryInputStream + 4, 0.0f,
+                scalarMultiply ? "immediate" : streamKind,
+                scalarMultiply ? 0 : primaryInputStream + 6, immediateValue,
                 "fp32", -1, rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "east" : "west",
+                -1, false, false, true, false, 2);
+            auto mirrorSecondSum = create_vxm(rewriter, op.getLoc(),
+                op.getLhs(), op.getRhs(), type,
+                secondVxmCycle - 1, mirrorColumn(2), scalarMultiply ? "multiply" : "add",
+                streamKind, mirrorInputStream + 4, 0.0f,
+                scalarMultiply ? "immediate" : streamKind,
+                scalarMultiply ? 0 : mirrorInputStream + 6, immediateValue,
+                "fp32", -1, rows, 1,
+                hemisphere == 0 ? "west" : "east",
+                hemisphere == 0 ? "west" : "east",
                 -1, false, false, true, false, 2);
             if (columnDomainCount > 1) {
                 secondSum->setAttr("wave_count",
                     rewriter.getI64IntegerAttr(columnDomainCount));
                 secondSum->setAttr("wave_interval",
                     rewriter.getI64IntegerAttr(activeColumnInterval));
+                mirrorSecondSum->setAttr("wave_count",
+                    rewriter.getI64IntegerAttr(columnDomainCount));
+                mirrorSecondSum->setAttr("wave_interval",
+                    rewriter.getI64IntegerAttr(activeColumnInterval));
             }
             auto secondCast = create_vxm(rewriter, op.getLoc(),
                 secondSum.getResult(), secondSum.getResult(), type,
-                secondVxmCycle - 1, 3, "cast", "previous", 0, 0.0f,
+                secondVxmCycle - 1, primaryColumn(3), "cast", "alu",
+                primaryColumn(2), 0.0f,
                 "immediate", 0, 0.0f, dataFormat, 2, rows, 1,
                 hemisphere == 0 ? "east" : "west",
                 hemisphere == 0 ? "east" : "west",
+                -1, false, false, true, false, 2);
+            auto mirrorSecondCast = create_vxm(rewriter, op.getLoc(),
+                mirrorSecondSum.getResult(), mirrorSecondSum.getResult(),
+                type, secondVxmCycle - 1, mirrorColumn(3), "cast",
+                "alu", mirrorColumn(2), 0.0f, "immediate", 0, 0.0f,
+                dataFormat, 10, rows, 1,
+                hemisphere == 0 ? "west" : "east",
+                hemisphere == 0 ? "west" : "east",
                 -1, false, false, true, false, 2);
             if (columnDomainCount > 1) {
                 secondCast->setAttr("wave_count",
                     rewriter.getI64IntegerAttr(columnDomainCount));
                 secondCast->setAttr("wave_interval",
                     rewriter.getI64IntegerAttr(activeColumnInterval));
+                mirrorSecondCast->setAttr("wave_count",
+                    rewriter.getI64IntegerAttr(columnDomainCount));
+                mirrorSecondCast->setAttr("wave_interval",
+                    rewriter.getI64IntegerAttr(activeColumnInterval));
             }
             outputSliceCount = 4;
-            secondOutputCycle = secondVxmCycle + 1;
+            secondOutputCycle = secondVxmCycle + outputPipelineLatency;
         }
         if (resultDistributed) {
             const int64_t validOutputHemisphere = 1 - hemisphere;
@@ -734,10 +834,13 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             for (int64_t outputHemisphere = 0;
                  outputHemisphere < target.memory().hemispheres;
                  ++outputHemisphere) {
+                if (!operandsMirrored
+                    && outputHemisphere != validOutputHemisphere)
+                    continue;
                 const int64_t fixedOutputStream =
                     pairMajorMemOrder ? 2 : 0;
                 const int64_t streamBase =
-                    (outputHemisphere == 0 ? 8 : 0)
+                    (outputHemisphere == validOutputHemisphere ? 0 : 8)
                     + fixedOutputStream;
                 const bool preserveValidOutput =
                     persistentOnValidOutput
@@ -836,9 +939,8 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 ? vxmCycle + columnDomainCount * residueDuration.active
                 : activeWriteEnd;
             if (!operandsMirrored) {
-                // A logical VXM instruction drives both physical chains. If
-                // one operand is hemisphere-local, only that hemisphere's
-                // chain produces a valid result. Bridge it to the other side
+                // If one operand is hemisphere-local, only the chain fed
+                // from that hemisphere produces a valid result. Bridge it to the other side
                 // so distributed16 remains physically mirrored.  For a
                 // closed column domain, finish every active-result group
                 // before launching the bridge domain; the two write bodies
@@ -961,11 +1063,15 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             }
             continue;
         }
-        const int64_t firstOutputHemisphere =
+        const int64_t firstOutputHemisphere = scalarMultiply
+            ? 1 - hemisphere :
             resultKind == "fp16_mxm_activation_planar"
             ? 0 : result->hemisphere;
         const int64_t outputHemispheres =
             resultKind == "fp16_mxm_activation_planar" ? 2 : 1;
+        const int64_t physicalOutputRow = result->row
+            + (scalarMultiply && result->hemisphere != firstOutputHemisphere
+                ? ((columnBlocks + 3) / 4) * rows : 0);
         for (int64_t outputHemisphere = firstOutputHemisphere;
              outputHemisphere
                 < firstOutputHemisphere + outputHemispheres;
@@ -975,16 +1081,16 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     resultKind == "fp16_pair_planar"
                     ? result->slices[byte] : resultSlices[byte];
                 const int64_t pairCycle = byte < 2
-                    ? vxmCycle + 1 : secondOutputCycle;
+                    ? vxmCycle + outputPipelineLatency : secondOutputCycle;
                 const int64_t physicalStreamBase =
-                    outputHemisphere == 0 ? 8 : 0;
+                    outputHemisphere == 1 - hemisphere ? 0 : 8;
                 direct_domain_detail::emitMem3D(
                     rewriter, op.getLoc(), target,
                     pairCycle + eastLatency(slice),
                     outputHemisphere
                             * target.memory().slices_per_hemisphere
                         + slice,
-                    "write", result->row,
+                    "write", physicalOutputRow,
                     physicalStreamBase + byte, rows, 1, 1,
                     1, 1, 0, 1, 1, 0, -1, result->bank);
             }
@@ -992,8 +1098,29 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
         cycle = std::max(cycle,
             (secondOutputCycle >= 0
                  ? secondOutputCycle + rows + 1
-                 : vxmCycle + rows + 2)
+                 : vxmCycle + outputPipelineLatency + rows + 1)
             + eastLatency(resultSlices[outputSliceCount - 1]));
+        if (scalarMultiply && result->hemisphere != firstOutputHemisphere) {
+            const int64_t bridgeStream = 20;
+            const int64_t bridgeCycle = cycle
+                + std::max(passiveReadLatency(result->slices[0]),
+                    passiveReadLatency(result->slices[1]));
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const int64_t slice = result->slices[byte];
+                direct_domain_detail::emitMem3D(rewriter, op.getLoc(), target,
+                    bridgeCycle - passiveReadLatency(slice),
+                    firstOutputHemisphere * target.memory().slices_per_hemisphere + slice,
+                    "read", physicalOutputRow, 32 + bridgeStream + byte,
+                    rows, 1, 1, 1, 1, 0, 1, 1, 0, -1, result->bank);
+                const int64_t writeCycle = bridgeCycle + bridgeWriteLatency(slice);
+                direct_domain_detail::emitMem3D(rewriter, op.getLoc(), target,
+                    writeCycle,
+                    result->hemisphere * target.memory().slices_per_hemisphere + slice,
+                    "write", result->row, bridgeStream + byte,
+                    rows, 1, 1, 1, 1, 0, 1, 1, 0, -1, result->bank);
+                cycle = std::max(cycle, writeCycle + rows + 1);
+            }
+        }
     }
     createTimeline(rewriter, op, start, cycle);
     auto output =

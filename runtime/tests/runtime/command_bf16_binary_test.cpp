@@ -57,15 +57,13 @@ try {
                                    command.words[1])
                                 << 32),
                         command.words[2]});
-                const auto& instruction = decoded.instruction;
+                const auto& instruction = decoded;
                 require(instruction.lhs.kind
-                        == VxmLaneOperandKind::StreamBFloat16,
+                        == VxmSrOperandKind::StreamBFloat16,
                     "VXM BF16 stream operand was lost");
-                require(instruction.output_type
+                require(instruction.result_type
                         == VxmCastTarget::BFloat16,
                     "VXM BF16 cast target was lost");
-                require(decoded.chain_depth == VxmChainDepth::Two,
-                    "VXM chain depth was lost");
                 sawVxm = true;
             }
         }

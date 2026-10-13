@@ -62,7 +62,7 @@ void verify_official_v26_header_compatibility()
     constexpr char magic[8] {'F', 'T', 'L', 'P', 'U', 'B', '0', '1'};
     ExecutableHardwareConfig hardware;
     hardware.vxm_cross_hemisphere_streams_enabled = 0;
-    hardware.vxm_fma_enabled = 1;
+    hardware.vxm_reserved_feature = 0;
     const std::string targetName = "official-v26-fixture";
 
     std::ostringstream os(std::ios::out | std::ios::binary);
@@ -84,7 +84,7 @@ void verify_official_v26_header_compatibility()
         reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
     if (decoded.target_name != targetName || !decoded.queues.empty()
         || decoded.hardware.vxm_cross_hemisphere_streams_enabled != 0
-        || decoded.hardware.vxm_fma_enabled != 1)
+        || decoded.hardware.vxm_reserved_feature != 0)
         throw std::runtime_error("official v26 header did not round-trip");
 }
 
@@ -441,7 +441,7 @@ try {
         "25,26,\"MEM.E.Read\",\"slice=0 bank=0 operation=read addr=301 stream=E3\","
         "\"repeat\",3,4,10,1,1,0,0,\"mem_address\",0");
     require_contains(trace,
-        "0,7,\"VXM.C0\",\"mul depth=2 repeat=7\",\"single\","
+        "0,7,\"VXM.C0\",\"mul repeat=7 -> SR0\",\"single\","
         "1,0,0,1,0,0,0,\"none\",0");
 
     BinaryProgram rawProgram;
@@ -485,13 +485,14 @@ try {
                 {0, 0, 0}, 1, ftlpu::MxmDataFormat::BFloat16,
                 ftlpu::MxmComputeIcuMode{})), InstructionKind::Mxm, 70)});
 
-    auto rawVxm = ftlpu::VxmLaneAluInstruction{
-        ftlpu::VxmAluOpcode::Multiply,
-        ftlpu::VxmLaneOperand::StreamBFloat16(),
-        ftlpu::VxmLaneOperand::Imm(0.5f)};
+    auto rawVxm = ftlpu::VxmSrInstruction{};
+    rawVxm.operation = ftlpu::VxmAluOpcode::Multiply;
+    rawVxm.lhs = ftlpu::VxmSrOperand::StreamBFloat16(0);
+    rawVxm.rhs = ftlpu::VxmSrOperand::Immediate(0.5f);
+    rawVxm.result_sr = 8;
+    rawVxm.result_type = ftlpu::VxmCastTarget::BFloat16;
     rawVxm.repeat_count = 4;
-    const auto compact = ftlpu::VxmCompactInstructionCodec::encode(
-        0, ftlpu::VxmChainDepth::Two, rawVxm);
+    const auto compact = ftlpu::VxmSrCompactInstructionCodec::encode(rawVxm);
     rawProgram.queues.push_back(QueueProgram{QueueKind::Vxm, 0,
         raw_fu_commands(ftlpu::isa::encode_vxm_icu_run_2d_instruction(
             ftlpu::VxmIcuRun2DInstruction::Run2D(
@@ -537,7 +538,8 @@ try {
     require_contains(rawTrace, "\"MXM.E0.Load\",\"Load3D");
     require_contains(rawTrace, "\"MXM.E0.Dequant\",\"Dequant3D");
     require_contains(rawTrace, "\"MXM.W0.Compute\",\"Compute3D");
-    require_contains(rawTrace, "\"VXM.C0\",\"mul depth=2 repeat=4 Run2D\"");
+    require_contains(rawTrace,
+        "\"VXM.C0\",\"mul result_sr=8 repeat=4 Run2D\"");
     require_contains(rawTrace, "\"SXM.E.Permute\",\"permute Run2D map_stride=8\"");
 
     std::ostringstream rawPerformance;

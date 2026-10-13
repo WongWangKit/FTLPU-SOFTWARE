@@ -522,8 +522,9 @@ LogicalResult VxmOp::verify()
     const int64_t repeat_count = getRepeatCountAttr().getInt();
     const int64_t repeat_interval = getRepeatIntervalAttr().getInt();
     const int64_t chainDepth = getChainDepth().value_or(8);
-    if (cycle < 0 || !target.is_valid_vxm_alu(queue) || queue >= 8
-        || (chainDepth != 2 && chainDepth != 4 && chainDepth != 8)
+    if (cycle < 0 || !target.is_valid_vxm_alu(queue)
+        || (chainDepth != 2 && chainDepth != 4 && chainDepth != 8
+            && chainDepth != 16)
         || repeat_count <= 0 || repeat_interval <= 0)
         return emitOpError("contains an invalid ICU VXM queue command field: cycle=")
             << cycle << ", queue=" << queue
@@ -538,6 +539,15 @@ LogicalResult VxmOp::verify()
         && !getAccumulatorEmit().value_or(true))
         return emitOpError(
             "accumulator_emit=false requires accumulator_write");
+    if (getAccumulatorResetFirst().value_or(false)
+        && !getAccumulatorReset().value_or(false))
+        return emitOpError(
+            "accumulator_reset_first requires accumulator_reset");
+    if (getAccumulatorEmitLast().value_or(false)
+        && (!getAccumulatorWrite().value_or(false)
+            || !getAccumulatorEmit().value_or(true)))
+        return emitOpError(
+            "accumulator_emit_last requires an emitting accumulator write");
     if (getLocalScalarWrite().value_or(false)
         && getAccumulatorWrite().value_or(false))
         return emitOpError(
@@ -546,7 +556,7 @@ LogicalResult VxmOp::verify()
     const auto opcode = getOpcode();
     if (opcode != "pass" && opcode != "bypass" && opcode != "cast"
         && opcode != "add" && opcode != "subtract"
-        && opcode != "multiply" && opcode != "fma" && opcode != "fms"
+        && opcode != "multiply"
         && opcode != "negate"
         && opcode != "max" && opcode != "exp"
         && opcode != "reciprocal" && opcode != "rsqrt")
@@ -558,7 +568,8 @@ LogicalResult VxmOp::verify()
             || kind == "auxiliary" || kind == "accumulator"
             || kind == "feedback")
             return index == 0;
-        if (kind == "alu") return index == queue - 1;
+        if (kind == "alu")
+            return index >= 0 && index < target.throughput().vxm_alus;
         if (kind == "stream_i8" || kind == "stream_f16"
             || kind == "stream_bf16" || kind == "stream_f32")
             return index >= 0
@@ -568,7 +579,6 @@ LogicalResult VxmOp::verify()
     if (!verify_operand(getLhsKind(), lhs_index)
         || !verify_operand(getRhsKind(), rhs_index))
         return emitOpError("contains an invalid VXM operand kind or index");
-    const bool chainHead = queue % chainDepth == 0;
     const auto isStreamOperand = [](StringRef kind) {
         return kind == "stream_i8" || kind == "stream_f16"
             || kind == "stream_bf16" || kind == "stream_f32";
@@ -587,37 +597,6 @@ LogicalResult VxmOp::verify()
         || !validStreamSource(getRhsKind(), "rhs_stream_source"))
         return emitOpError(
             "stream source must be local/east/west and requires a stream operand");
-    const bool fused = opcode == "fma" || opcode == "fms";
-    if (chainHead) {
-        if (fused)
-            return emitOpError("fma/fms cannot be a VXM chain head");
-        const bool validLhs = isStreamOperand(getLhsKind())
-            || getLhsKind() == "immediate" || getLhsKind() == "feedback";
-        const bool validRhs = isStreamOperand(getRhsKind())
-            || getRhsKind() == "immediate";
-        if (!validLhs || !validRhs)
-            return emitOpError(
-                "VXM chain head operands must use stream/immediate, "
-                "except lhs may use feedback");
-    } else {
-        if (fused) {
-            if ((queue - 1) % chainDepth != 0
-                || !isStreamOperand(getLhsKind())
-                || !isStreamOperand(getRhsKind()))
-                return emitOpError(
-                    "fma/fms must immediately follow a VXM chain head and use two stream operands");
-        } else {
-        const bool validRhs = getRhsKind() == "original"
-            || getRhsKind() == "auxiliary" || getRhsKind() == "immediate"
-            || (getRhsKind() == "accumulator"
-                && (queue % 4 == 1 || queue % 4 == 3));
-        const bool validLhs = getLhsKind() == "previous"
-            || (getLhsKind() == "alu" && lhs_index == queue - 1);
-        if (!validLhs || !validRhs)
-            return emitOpError(
-                "VXM internal stage operands are outside the fixed local mux");
-        }
-    }
     if (!std::isfinite(getLhsImmediateAttr().getValueAsDouble())
         || !std::isfinite(getRhsImmediateAttr().getValueAsDouble()))
         return emitOpError("VXM immediate operands must be finite");
@@ -627,15 +606,6 @@ LogicalResult VxmOp::verify()
             "cast_target must be fp32, fp16, bf16, or i8");
     if (output_stream < -1 || output_stream >= target.streams().encoded_streams)
         return emitOpError("output_stream must be -1 or a packed stream selector");
-    if (output_stream >= 0 && queue % chainDepth != chainDepth - 1)
-        return emitOpError("output_stream requires a configured VXM chain tail: queue=")
-            << queue << ", chain_depth=" << chainDepth
-            << ", output_stream=" << output_stream
-            << ", cycle=" << cycle;
-    if (output_stream >= 0 && output_stream != (queue / 2) * 2)
-        return emitOpError("output_stream does not match the fixed VXM output block: queue=")
-            << queue << ", output_stream=" << output_stream
-            << ", expected=" << (queue / 2) * 2;
     if ((getInputHemisphere() != "east" && getInputHemisphere() != "west")
         || (getOutputHemisphere() != "east" && getOutputHemisphere() != "west"))
         return emitOpError("hemisphere must be east or west");
@@ -657,7 +627,7 @@ LogicalResult SxmOp::verify()
         return emitOpError("opcode must be transpose or permute");
     if (getOutputRow()
         && (*getOutputRow() < 0
-            || *getOutputRow() >= target.throughput().lanes_per_tile))
+            || *getOutputRow() > 15))
         return emitOpError("output_row must be in the physical lane range");
       if (getInputRow()
           && (*getInputRow() < 0

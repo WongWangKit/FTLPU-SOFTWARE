@@ -733,6 +733,17 @@ try {
         || probabilityDiagonalBinding->slices.size() != 16)
         throw std::logic_error(
             "decoder binary is missing diagonal probability metadata");
+    const auto probabilityPackBinding = std::find_if(
+        program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access
+                    == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "attention.probability_pack";
+        });
+    if (probabilityPackBinding == program.bindings.end()
+        || probabilityPackBinding->slices.size() != 16)
+        throw std::logic_error(
+            "decoder binary is missing packed probability metadata");
     const auto readMxmDistributed = [&](const std::vector<std::uint16_t>& slices,
                                         std::size_t baseRow,
                                         std::size_t row,
@@ -801,8 +812,30 @@ try {
     }
     const bool scopedCmodelLog =
         std::getenv("FTLPU_CMODEL_LOG_START") != nullptr;
-    runtime.run_cycles(attentionPrepackEndCycle,
-        scopedCmodelLog ? nullptr : cmodelLogSink);
+    const std::size_t scopedCmodelLogStart = scopedCmodelLog
+        ? static_cast<std::size_t>(std::strtoull(
+              std::getenv("FTLPU_CMODEL_LOG_START"), nullptr, 10))
+        : 0;
+    const auto* scopedCmodelLogCyclesText =
+        std::getenv("FTLPU_CMODEL_LOG_CYCLES");
+    const std::size_t scopedCmodelLogCycles = scopedCmodelLogCyclesText
+        ? static_cast<std::size_t>(
+              std::strtoull(scopedCmodelLogCyclesText, nullptr, 10))
+        : 64;
+    const bool scopedPrepackLog = scopedCmodelLog
+        && scopedCmodelLogStart < attentionPrepackEndCycle;
+    if (scopedPrepackLog) {
+        runtime.run_cycles(scopedCmodelLogStart);
+        const std::size_t logCycles = std::min(
+            scopedCmodelLogCycles,
+            attentionPrepackEndCycle - scopedCmodelLogStart);
+        runtime.run_cycles(logCycles, cmodelLogSink);
+        runtime.run_cycles(
+            attentionPrepackEndCycle - scopedCmodelLogStart - logCycles);
+    } else {
+        runtime.run_cycles(attentionPrepackEndCycle,
+            scopedCmodelLog ? nullptr : cmodelLogSink);
+    }
     float prepackMaxError = 0.0f;
     std::size_t prepackMaxRow = 0;
     std::size_t prepackMaxColumn = 0;
@@ -893,9 +926,22 @@ try {
             + " max_errors=" + arrayValues(prepackHemisphereMaxErrors));
     const std::size_t qkvEndCycle =
         static_cast<std::size_t>(timeline(program, "qk").start_cycle);
-    runtime.run_cycles(
-        qkvEndCycle - attentionPrepackEndCycle,
-        scopedCmodelLog ? nullptr : cmodelLogSink);
+    const bool scopedQkvLog = scopedCmodelLog
+        && scopedCmodelLogStart >= attentionPrepackEndCycle
+        && scopedCmodelLogStart < qkvEndCycle;
+    if (scopedQkvLog) {
+        runtime.run_cycles(
+            scopedCmodelLogStart - attentionPrepackEndCycle);
+        const std::size_t logCycles = std::min(
+            scopedCmodelLogCycles, qkvEndCycle - scopedCmodelLogStart);
+        runtime.run_cycles(logCycles, cmodelLogSink);
+        runtime.run_cycles(
+            qkvEndCycle - scopedCmodelLogStart - logCycles);
+    } else {
+        runtime.run_cycles(
+            qkvEndCycle - attentionPrepackEndCycle,
+            scopedCmodelLog ? nullptr : cmodelLogSink);
+    }
     const auto valueBinding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
         [](const auto& binding) {
@@ -995,7 +1041,7 @@ try {
             }
         }
     }
-    if (valueTensorMaxError > 0.04f)
+    if (valueTensorMaxError > 0.04f) {
         throw std::logic_error(
             "full attention value checkpoint mismatch max_error="
             + std::to_string(valueTensorMaxError)
@@ -1004,6 +1050,7 @@ try {
             + " dimension=" + std::to_string(valueTensorMaxDimension)
             + " actual=" + std::to_string(valueTensorMaxActual)
             + " expected=" + std::to_string(valueTensorMaxExpected));
+    }
     for (std::size_t column = 0;
          column < kKvHeads * kHeadDim; ++column) {
         const std::size_t head = column / kHeadDim;
@@ -1049,11 +1096,14 @@ try {
                 std::uint64_t {1} << (column % 64);
         }
     }
-    std::array<std::size_t, 8> vxmRemaining {};
-    for (std::size_t stage = 0; stage < vxmRemaining.size(); ++stage)
-        vxmRemaining[stage] = system->vxm_unit()
-                                   .superlane(0)
-                                   .remaining_executions(stage);
+    std::array<std::size_t, ftlpu::VxmSrSlice::kAluQueues> vxmRemaining {};
+    for (std::size_t column = 0; column < vxmRemaining.size(); ++column) {
+        for (std::size_t tile = 0; tile < ftlpu::VxmSrSlice::kTileCount;
+             ++tile) {
+            vxmRemaining[column] +=
+                system->vxm_unit().config_entry_count(tile, column);
+        }
+    }
     const auto copiedBlockSlices = valueBinding->slices.begin();
     const float copiedToken4 = physicalBf16(
         ftlpu::Hemisphere::East,
@@ -1292,8 +1342,20 @@ try {
     }
     const std::size_t pvStartCycle =
         static_cast<std::size_t>(timeline(program, "pv").start_cycle);
-    runtime.run_cycles(pvStartCycle - qkvEndCycle,
-        scopedCmodelLog ? nullptr : cmodelLogSink);
+    const bool scopedAttentionGapLog = scopedCmodelLog
+        && scopedCmodelLogStart >= qkvEndCycle
+        && scopedCmodelLogStart < pvStartCycle;
+    if (scopedAttentionGapLog) {
+        runtime.run_cycles(scopedCmodelLogStart - qkvEndCycle);
+        const std::size_t logCycles = std::min(
+            scopedCmodelLogCycles, pvStartCycle - scopedCmodelLogStart);
+        runtime.run_cycles(logCycles, cmodelLogSink);
+        runtime.run_cycles(
+            pvStartCycle - scopedCmodelLogStart - logCycles);
+    } else {
+        runtime.run_cycles(pvStartCycle - qkvEndCycle,
+            scopedCmodelLog ? nullptr : cmodelLogSink);
+    }
     for (std::size_t head = 0; head < kQueryHeads; ++head) {
         const std::size_t kvHead =
             head / (kQueryHeads / kKvHeads);
@@ -1309,7 +1371,47 @@ try {
             throw std::logic_error(
                 "softmax probability checkpoint mismatch head="
                 + std::to_string(head) + " actual="
-                + std::to_string(probability) + " expected=1.0");
+                + std::to_string(probability) + " expected=1.0"
+                + " pack_east=" + std::to_string(physicalBf16(
+                    ftlpu::Hemisphere::East,
+                    probabilityPackBinding->slices[0],
+                    probabilityPackBinding->slices[1],
+                    static_cast<std::size_t>(
+                        probabilityPackBinding->base_row)
+                        + head * kTokenBlocks * kTokenBlocks * kTileRows,
+                    0, probabilityPackBinding->bank))
+                + " pack_west=" + std::to_string(physicalBf16(
+                    ftlpu::Hemisphere::West,
+                    probabilityPackBinding->slices[0],
+                    probabilityPackBinding->slices[1],
+                    static_cast<std::size_t>(
+                        probabilityPackBinding->base_row)
+                        + head * kTokenBlocks * kTokenBlocks * kTileRows,
+                    0, probabilityPackBinding->bank))
+                + " diagonal8=" + std::to_string(physicalBf16(
+                    static_cast<ftlpu::Hemisphere>(kvHead % 2),
+                    probabilityDiagonalBinding->slices[0],
+                    probabilityDiagonalBinding->slices[1],
+                    static_cast<std::size_t>(
+                        probabilityDiagonalBinding->base_row)
+                        + head * kTokenBlocks * kTokenBlocks * kTileRows,
+                    8, probabilityDiagonalBinding->bank))
+                + " diagonal16=" + std::to_string(physicalBf16(
+                    static_cast<ftlpu::Hemisphere>(kvHead % 2),
+                    probabilityDiagonalBinding->slices[0],
+                    probabilityDiagonalBinding->slices[1],
+                    static_cast<std::size_t>(
+                        probabilityDiagonalBinding->base_row)
+                        + head * kTokenBlocks * kTokenBlocks * kTileRows,
+                    16, probabilityDiagonalBinding->bank))
+                + " diagonal24=" + std::to_string(physicalBf16(
+                    static_cast<ftlpu::Hemisphere>(kvHead % 2),
+                    probabilityDiagonalBinding->slices[0],
+                    probabilityDiagonalBinding->slices[1],
+                    static_cast<std::size_t>(
+                        probabilityDiagonalBinding->base_row)
+                        + head * kTokenBlocks * kTokenBlocks * kTileRows,
+                    24, probabilityDiagonalBinding->bank)));
     }
     const auto& probabilitySlices =
         probabilityDiagonalBinding->slices;
@@ -1321,14 +1423,10 @@ try {
     constexpr std::size_t kCheckpointDrainCycles = 64;
     const std::size_t pvCheckpointCycles =
         pvEndCycle - pvStartCycle + kCheckpointDrainCycles;
-    if (scopedCmodelLog) {
-        const std::size_t logStart = static_cast<std::size_t>(
-            std::strtoull(std::getenv("FTLPU_CMODEL_LOG_START"), nullptr, 10));
-        const auto* logCyclesText = std::getenv("FTLPU_CMODEL_LOG_CYCLES");
-        const std::size_t requestedLogCycles = logCyclesText
-            ? static_cast<std::size_t>(
-                  std::strtoull(logCyclesText, nullptr, 10))
-            : 64;
+    if (scopedCmodelLog && !scopedPrepackLog && !scopedQkvLog
+        && !scopedAttentionGapLog) {
+        const std::size_t logStart = scopedCmodelLogStart;
+        const std::size_t requestedLogCycles = scopedCmodelLogCycles;
         if (logStart < pvStartCycle
             || logStart >= pvStartCycle + pvCheckpointCycles)
             throw std::logic_error(
@@ -1340,7 +1438,9 @@ try {
         runtime.run_cycles(logCycles, cmodelLogSink);
         runtime.run_cycles(pvCheckpointCycles - prefixCycles - logCycles);
     } else {
-        runtime.run_cycles(pvCheckpointCycles, cmodelLogSink);
+        runtime.run_cycles(pvCheckpointCycles,
+            (scopedPrepackLog || scopedQkvLog || scopedAttentionGapLog)
+                ? nullptr : cmodelLogSink);
     }
     // Softmax and PV intentionally overlap across head waves. Read the final
     // probability tensor after PV has drained; a snapshot at pv.start would
@@ -1820,8 +1920,20 @@ try {
     const std::size_t finalResidualStartCycle =
         static_cast<std::size_t>(
             timeline(program, "elementwise.add", 1).start_cycle);
-    runtime.run_cycles(
-        finalResidualStartCycle - ffnStartCycle, cmodelLogSink);
+    if (finalResidualStartCycle < ffnStartCycle)
+        throw std::logic_error("final residual precedes FFN execution");
+    const bool reportFfnProgress =
+        std::getenv("FTLPU_SESSION_PROGRESS") != nullptr;
+    for (std::size_t cycle = ffnStartCycle;
+         cycle < finalResidualStartCycle;) {
+        const auto count = std::min<std::size_t>(
+            100'000, finalResidualStartCycle - cycle);
+        runtime.run_cycles(count, cmodelLogSink);
+        cycle += count;
+        if (reportFfnProgress)
+            std::cout << FTLPU_TEST_MODEL_NAME << " FFN cycle=" << cycle
+                      << "/" << finalResidualStartCycle << std::endl;
+    }
     const auto ffnBinding = std::find_if(
         program.bindings.begin(), program.bindings.end(),
         [](const auto& binding) {

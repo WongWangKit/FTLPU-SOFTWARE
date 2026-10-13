@@ -20,8 +20,14 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
     const auto dataFormat = lpu_16bit_data_format(
         llvm::cast<mlir::RankedTensorType>(
             resultType).getElementType());
+    const auto column = [&](int64_t stage) {
+        return hemisphere == 0
+            ? stage
+            : target.throughput().vxm_alus - 1 - stage;
+    };
+    const int64_t physicalOutputStream = hemisphere * 8 + outputStream;
     auto head = create_vxm(rewriter, location, gateValue, upValue,
-        resultType, cycle, 0, "negate", "stream_bf16",
+        resultType, cycle, column(0), "negate", "stream_bf16",
         encodedInput, 0, "stream_bf16",
         encodedInput + 2, 0, "fp32", -1, repeatCount, repeatInterval,
         hemi, hemi);
@@ -34,35 +40,34 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
     head->setAttr("rhs_stream_source", source);
     mlir::Value value = head.getResult();
     value = create_vxm(rewriter, location, value, upValue,
-        resultType, cycle, 1, "exp", "previous", 0, 0,
+        resultType, cycle, column(1), "exp", "alu", column(0), 0,
         "immediate", 0, 0, "fp32", -1, repeatCount, repeatInterval,
         hemi, hemi).getResult();
     value = create_vxm(rewriter, location, value, upValue,
-        resultType, cycle, 2, "add", "previous", 0, 0,
+        resultType, cycle, column(2), "add", "alu", column(1), 0,
         "immediate", 0, 1, "fp32", -1, repeatCount, repeatInterval,
         hemi, hemi).getResult();
     value = create_vxm(rewriter, location, value, upValue,
-        resultType, cycle, 3, "reciprocal", "previous",
-        0, 0, "immediate", 0, 0, "fp32", -1,
+        resultType, cycle, column(3), "reciprocal", "alu",
+        column(2), 0, "immediate", 0, 0, "fp32", -1,
         repeatCount, repeatInterval,
         hemi, hemi).getResult();
     value = create_vxm(rewriter, location, value, upValue,
-        resultType, cycle, 4, "multiply", "previous", 0, 0,
+        resultType, cycle, column(4), "multiply", "alu", column(3), 0,
         "original", 0, 0, "fp32", -1, repeatCount, repeatInterval,
         hemi, hemi).getResult();
     value = create_vxm(rewriter, location, value, upValue,
-        resultType, cycle, 5, "multiply", "previous", 0, 0,
+        resultType, cycle, column(5), "multiply", "alu", column(4), 0,
         "auxiliary", 0, 0, "fp32", -1, repeatCount, repeatInterval,
         hemi, hemi).getResult();
     value = create_vxm(rewriter, location, value, upValue,
-        resultType, cycle, 6, "bypass", "previous", 0, 0,
+        resultType, cycle, column(6), "bypass", "alu", column(5), 0,
         "immediate", 0, 0, "fp32", -1, repeatCount, repeatInterval,
         hemi, hemi).getResult();
-    const int64_t peer = 1 - hemisphere;
     auto output = create_vxm(rewriter, location, value, upValue,
-        resultType, cycle, 7, "bypass", "previous", 0, 0,
-        "immediate", 0, 0, dataFormat, outputStream,
-        repeatCount, repeatInterval, hemi, hemisphere_name(peer));
+        resultType, cycle, column(7), "bypass", "alu", column(6), 0,
+        "immediate", 0, 0, dataFormat, physicalOutputStream,
+        repeatCount, repeatInterval, hemi, hemi);
     return {output, output};
 }
 
@@ -71,9 +76,15 @@ mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
     llvm::ArrayRef<int64_t> hiddenSlices, mlir::Value output,
     int64_t inputCycle, int64_t mTile, int64_t pair,
     int64_t sourceHemisphere, int64_t rowCount, bool mirroredBroadcast,
-    FfnLoopDomain3D outerDomain, bool directParityDomain)
+    FfnLoopDomain3D outerDomain, bool directParityDomain,
+    int64_t pipelineLatency)
 {
-    constexpr int64_t kVxmSwishLatency = 17;
+    // The eight active SwiGLU columns are followed by eight passive columns
+    // before the result reaches the opposite VXM boundary.  The old bridge
+    // model hid those passive hops; the physical 16-column fabric does not.
+    const int64_t kVxmSwishLatency =
+        pipelineLatency >= 0 ? pipelineLatency
+            : 18 + (target.throughput().vxm_alus - 8);
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t blockRows = target.throughput().mxm_block_rows;
     const int64_t destination = 1 - sourceHemisphere;

@@ -59,6 +59,19 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
           : tile;
   const int64_t localMxm = 0;
   const int64_t weightToIw = target_.throughput().vxm_weight_to_iw_latency;
+  const int64_t mxmResultToVxmLatency =
+      target_.throughput().accumulator_to_vxm_latency
+      - target_.mxm_first_result_latency();
+  const auto remoteResultToMemLatency = [&](int64_t slice) {
+    const auto bridgeLatency = target_.transport_latency(
+        target::StreamEndpoint::VxmBridgeResult,
+        target::StreamEndpoint::Mem,
+        target::StreamDirection::East, slice);
+    return bridgeLatency
+        ? std::optional<int64_t>(
+              mxmResultToVxmLatency + *bridgeLatency + 1)
+        : std::nullopt;
+  };
   const bool localDequant = target_.supports_mxm_local_dequant();
   const int64_t loadToIw = localDequant ? 0 : weightToIw;
   const int64_t weightStreamBase =
@@ -118,9 +131,12 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
   const auto outputWeightPlacement =
       op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("output_weight");
   if (outputWeightPlacement) {
+    const auto pingPong = outputWeightPlacement.getAs<mlir::BoolAttr>(
+        "page_bank_ping_pong");
     if (const auto transferCycles =
             outputWeightPlacement.getAs<mlir::IntegerAttr>(
-                "page_transfer_cycles")) {
+                "page_transfer_cycles");
+        transferCycles && !(pingPong && pingPong.getValue())) {
       const auto memoryPlan = op_.getMemoryPlan();
       const char *priorWeights[] = {
           "query_weight", "key_weight", "value_weight"};
@@ -151,12 +167,11 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
         finalWriteEnd = std::max(
             finalWriteEnd, resultCycle + latency + op_.getSeqLen());
         if (hemisphere != 0) {
-          const int64_t registerGroup =
-              slice / target_.streams().mem_slices_per_register_group;
+          const auto remoteLatency = remoteResultToMemLatency(slice);
+          if (!remoteLatency) return finalFirstCompute;
           finalWriteEnd = std::max(
               finalWriteEnd,
-              resultCycle + target_.streams().system_register_columns +
-                  registerGroup + 1 + op_.getSeqLen());
+              resultCycle + *remoteLatency + op_.getSeqLen());
         }
       }
     }
@@ -680,12 +695,18 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
             const int64_t cycle = loadCycle + pulse;
             for (int64_t lane = 0; lane < target_.throughput().lanes_per_tile;
                  ++lane) {
+              const int64_t multiplyColumn = hemisphere == 0
+                  ? lane : target_.throughput().vxm_alus - 1 - lane;
+              const int64_t castColumn = hemisphere == 0
+                  ? 8 + lane
+                  : target_.throughput().vxm_alus - 1 - (8 + lane);
               emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), cycle,
-                      lane, "multiply", "stream_i8", 32 + lane, 0.0f,
+                      multiplyColumn, "multiply", "stream_i8", 32 + lane, 0.0f,
                       "immediate", 0, outputWeightScale, "fp32", -1, hemi, hemi,
                       functionArgumentIndex(op_.getOutputWeight()));
               emitVxm(rewriter_, op_.getLoc(), op_.getOutputWeight(), cycle + 1,
-                      lane, "cast", "alu", lane, 0.0f, "immediate", 0, 0.0f,
+                      castColumn, "cast", "alu", multiplyColumn, 0.0f,
+                      "immediate", 0, 0.0f,
                       dataFormat,
                       localMxm *
                               target_.throughput().mxm_load_streams_per_cycle +
@@ -790,11 +811,10 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
           finalWriteEnd =
               std::max(finalWriteEnd, localWriteCycle + op_.getSeqLen());
           if (remoteResult) {
-            const int64_t group =
-                slice / target_.streams().mem_slices_per_register_group;
+            const auto remoteLatency = remoteResultToMemLatency(slice);
+            if (!remoteLatency) return -1;
             const int64_t remoteWriteCycle =
-                resultCycle + target_.streams().system_register_columns +
-                group + 1;
+                resultCycle + *remoteLatency;
             if (!mergeResultOutputGroups || outputGroup == 0)
               emitMem3D(
                   rewriter_, op_.getLoc(), remoteWriteCycle, slice, "write",

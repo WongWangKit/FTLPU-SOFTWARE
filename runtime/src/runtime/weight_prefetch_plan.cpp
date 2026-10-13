@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <ranges>
 #include <sstream>
 #include <stdexcept>
@@ -113,31 +114,12 @@ bool regions_overlap(const WeightResidencyRegion& lhs,
         && lhs.row_begin < rhs.row_end && rhs.row_begin < lhs.row_end;
 }
 
-bool regions_share_mem_queue(const WeightResidencyRegion& lhs,
-    const WeightResidencyRegion& rhs)
-{
-    return lhs.bank == rhs.bank
-        && (lhs.hemisphere_mask & rhs.hemisphere_mask) != 0
-        && (lhs.wildcard_slice || rhs.wildcard_slice
-            || lhs.slice == rhs.slice);
-}
-
 bool plans_overlap_impl(
     const WeightPrefetchPlan& lhs, const WeightPrefetchPlan& rhs)
 {
     return std::ranges::any_of(lhs.regions, [&](const auto& left) {
         return std::ranges::any_of(rhs.regions, [&](const auto& right) {
             return regions_overlap(left, right);
-        });
-    });
-}
-
-bool plans_share_mem_queue(
-    const WeightPrefetchPlan& lhs, const WeightPrefetchPlan& rhs)
-{
-    return std::ranges::any_of(lhs.regions, [&](const auto& left) {
-        return std::ranges::any_of(rhs.regions, [&](const auto& right) {
-            return regions_share_mem_queue(left, right);
         });
     });
 }
@@ -362,6 +344,28 @@ void schedule_weight_prefetches(const BinaryProgram& program,
     if (lanes > std::numeric_limits<std::uint64_t>::max() / bytesPerLane)
         throw std::overflow_error("C2C bandwidth overflows uint64_t");
     const std::uint64_t fullBandwidth = lanes * bytesPerLane;
+    const auto externalTransferCycles = [&](const WeightPrefetchPlan& plan) {
+        const auto efficiency = static_cast<std::uint64_t>(
+            runtimeHardware.ddr_scheduling_efficiency_percent);
+        const auto bandwidth = static_cast<std::uint64_t>(
+            runtimeHardware.ddr_peak_bandwidth_mbytes_per_second);
+        const auto clock = static_cast<std::uint64_t>(
+            runtimeHardware.lpu_clock_mhz);
+        if (efficiency == 0 || bandwidth == 0 || clock == 0)
+            throw std::logic_error(
+                "paged weights require non-zero DDR timing parameters");
+        const auto totalBytes = plan.bytes[0] + plan.bytes[1];
+        if (totalBytes > std::numeric_limits<std::uint64_t>::max()
+                / clock / 100)
+            throw std::overflow_error(
+                "paged-weight DDR duration overflows uint64_t");
+        const auto numerator = totalBytes * clock * 100;
+        const auto denominator = bandwidth * efficiency;
+        const auto transfer = (numerator + denominator - 1) / denominator;
+        return transfer
+            + runtimeHardware.ddr_read_latency_cycles
+            + runtimeHardware.ddr_read_latency_jitter_cycles;
+    };
     // C2C transport lanes and ordinary SR numbers are independent hardware
     // fields.  Select, per page, the West SR lanes whose final compiled use
     // has already drained at the earliest legal SRAM-reuse cycle.  This lets
@@ -389,13 +393,14 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         const auto transportGuard =
             hw::kMemEastBoundaryStreamRegisterColumn
             + hw::kTileRows + lanes;
-        durations[index] = c2cCycles + transportGuard;
+        durations[index] = std::max<std::uint64_t>(
+            c2cCycles + transportGuard,
+            externalTransferCycles(plan));
         // The compiler's dedicated-slice layout keeps activation scratch out
         // of the weight residency regions represented here. Consequently,
         // physically disjoint pages may be loaded before execution; pages that
         // share a bank/slice/row range retain their release-ordered JIT load.
         bool canPreload = !plan.runtime_prefetch;
-        std::uint64_t sharedQueueReusableCycle = 0;
         std::uint64_t initializedDataRelease = 0;
         bool overlapsInitializedData = false;
         for (const WeightResidencyRegion& incoming : plan.regions)
@@ -418,10 +423,6 @@ void schedule_weight_prefetches(const BinaryProgram& program,
             reusableCycles[index] = initializedDataRelease;
         }
         for (std::size_t previous = 0; previous < index; ++previous) {
-            if (plans_share_mem_queue(plan, plans[previous]))
-                sharedQueueReusableCycle = std::max(
-                    sharedQueueReusableCycle,
-                    plans[previous].release_cycle);
             if (!plans_overlap_impl(plan, plans[previous])) continue;
             // DDR latency is intentionally nondeterministic. With no staging
             // buffer between DDR and the shared C2C/MEM path, launching before
@@ -441,15 +442,6 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         plan.pre_execution = canPreload;
         if (plan.pre_execution) {
             plan.transfer_end_cycle = durations[index];
-        } else {
-            // MEM has one ICU queue and one SRAM port per
-            // (hemisphere, slice, bank). A later page may occupy disjoint rows
-            // yet still contend with an earlier page's compute reads. Once a
-            // page must be fetched during execution, defer its C2C writes
-            // until every earlier consumer on each shared queue has released
-            // the port. This mirrors the compiler FFN page-task dependency.
-            reusableCycles[index] = std::max(
-                reusableCycles[index], sharedQueueReusableCycle);
         }
     }
 
@@ -459,9 +451,8 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         if (!plans[index].pre_execution)
             launchOrder.push_back(index);
     std::ranges::sort(launchOrder, [&](std::size_t lhs, std::size_t rhs) {
-        return reusableCycles[lhs] != reusableCycles[rhs]
-            ? reusableCycles[lhs] < reusableCycles[rhs]
-            : plans[lhs].ready_cycle < plans[rhs].ready_cycle;
+        return std::tie(reusableCycles[lhs], plans[lhs].ready_cycle)
+            < std::tie(reusableCycles[rhs], plans[rhs].ready_cycle);
     });
 
     // Each hemisphere has one C2C DMA ICU and one C2C RX ICU.  A page is one
@@ -470,8 +461,56 @@ void schedule_weight_prefetches(const BinaryProgram& program,
     // The runtime additionally holds the next launch event until real DDR and
     // MEM completion, so this static cursor is the deterministic lower bound.
     std::uint64_t nextTransportCursor = 0;
-    for (const std::size_t index : launchOrder) {
+    while (!launchOrder.empty()) {
+        const auto firstReusable = launchOrder.front();
+        const auto selectionCycle = std::max(
+            nextTransportCursor, reusableCycles[firstReusable]);
+        const auto bindingPendingBefore = [&](std::size_t candidate) {
+            const auto& uses = plans[candidate].use_indices;
+            if (uses.empty()) return false;
+            const auto binding = program.weight_page_uses.at(uses.front())
+                .binding_index;
+            for (const auto earlier : launchOrder) {
+                if (earlier == candidate) break;
+                const auto& earlierUses = plans[earlier].use_indices;
+                if (!earlierUses.empty()
+                    && program.weight_page_uses.at(earlierUses.front())
+                        .binding_index == binding)
+                    return true;
+            }
+            return false;
+        };
+        std::size_t index = firstReusable;
+        for (const auto candidate : launchOrder)
+            if (reusableCycles[candidate] <= selectionCycle
+                && plans[candidate].ready_cycle < plans[index].ready_cycle
+                && !bindingPendingBefore(candidate))
+                index = candidate;
+        // A coarse C2C instruction cannot be preempted. Do not let a large,
+        // distant-consumer page occupy the transport across the release of
+        // a page needed sooner (for example Gate page 1 ahead of Up page 0).
+        // Short transfers may still fill the idle window before that release.
+        // Preserve release ordering within one binding: the linked epoch
+        // barriers of its pages may couple otherwise disjoint MEM queues.
+        for (;;) {
+            const auto selectedEnd = std::max(
+                selectionCycle, reusableCycles[index]) + durations[index];
+            std::optional<std::size_t> sooner;
+            for (const auto candidate : launchOrder) {
+                if (plans[candidate].ready_cycle >= plans[index].ready_cycle
+                    || reusableCycles[candidate] >= selectedEnd
+                    || bindingPendingBefore(candidate))
+                    continue;
+                if (!sooner || plans[candidate].ready_cycle
+                        < plans[*sooner].ready_cycle)
+                    sooner = candidate;
+            }
+            if (!sooner) break;
+            index = *sooner;
+        }
+        launchOrder.erase(std::ranges::find(launchOrder, index));
         auto& plan = plans[index];
+        plan.earliest_mem_cycle = reusableCycles[index];
         // Once every overlapping SRAM region has been released, retaining
         // the transfer until just before its consumer only reduces the time
         // available to absorb DDR latency and jitter. Launch at the earliest
@@ -543,7 +582,9 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         const auto transportGuard =
             hw::kMemEastBoundaryStreamRegisterColumn
             + hw::kTileRows + activeLanes;
-        durations[index] = c2cCycles + transportGuard;
+        durations[index] = std::max<std::uint64_t>(
+            c2cCycles + transportGuard,
+            externalTransferCycles(plan));
         plan.transfer_end_cycle = plan.start_cycle + durations[index];
         nextTransportCursor = plan.transfer_end_cycle;
     }

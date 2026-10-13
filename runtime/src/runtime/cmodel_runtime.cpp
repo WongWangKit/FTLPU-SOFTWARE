@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 
@@ -56,6 +57,13 @@ void for_each_binding_hemisphere(const BinaryBinding& binding, Fn&& fn)
 {
     if ((binding.hemisphere_mask & 1) != 0) fn(Hemisphere::East);
     if ((binding.hemisphere_mask & 2) != 0) fn(Hemisphere::West);
+}
+
+Hemisphere single_binding_hemisphere(const BinaryBinding& binding)
+{
+    return (binding.hemisphere_mask & 2) != 0
+        && (binding.hemisphere_mask & 1) == 0
+        ? Hemisphere::West : Hemisphere::East;
 }
 
 void require_matrix_binding(const BinaryBinding& binding)
@@ -117,7 +125,9 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     if (program.target_abi != executable_target_abi(requested)) {
         std::ostringstream message;
         message << "binary target '" << program.target_name
-                << "' ABI does not match its embedded hardware configuration";
+                << "' ABI does not match its embedded hardware configuration"
+                << ": encoded=" << program.target_abi
+                << " computed=" << executable_target_abi(requested);
         throw std::invalid_argument(message.str());
     }
 
@@ -238,9 +248,6 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     require_capability("vxm_cross_hemisphere_streams_enabled",
         requested.vxm_cross_hemisphere_streams_enabled,
         physical.vxm_cross_hemisphere_streams_enabled);
-    require_capability("vxm_fma_enabled",
-        requested.vxm_fma_enabled,
-        physical.vxm_fma_enabled);
 }
 
 std::uint16_t encode_16bit_float(float value, BindingElementType type)
@@ -264,7 +271,7 @@ std::uint16_t read_16bit_element(const TspSliceSystem& system,
         const bool dual_hemisphere = (binding.hemisphere_mask & 3) == 3;
         const auto hemisphere = dual_hemisphere
             ? static_cast<Hemisphere>((column / 64) % 2)
-            : Hemisphere::East;
+            : single_binding_hemisphere(binding);
         const std::size_t address = static_cast<std::size_t>(binding.base_row)
             + (dual_hemisphere ? column / 128 : column / 64) * rows + row;
         return static_cast<std::uint16_t>(read_binding_sram_byte(system, binding, hemisphere,
@@ -277,10 +284,11 @@ std::uint16_t read_16bit_element(const TspSliceSystem& system,
         && binding.slices.size() == 2) {
         const std::size_t address = static_cast<std::size_t>(binding.base_row)
             + (column / 32) * rows + row;
+        const auto hemisphere = single_binding_hemisphere(binding);
         return static_cast<std::uint16_t>(read_binding_sram_byte(system, binding,
-                   Hemisphere::East, binding.slices[0], address, column % 32))
+                   hemisphere, binding.slices[0], address, column % 32))
             | (static_cast<std::uint16_t>(read_binding_sram_byte(system, binding,
-                   Hemisphere::East, binding.slices[1], address, column % 32))
+                   hemisphere, binding.slices[1], address, column % 32))
                 << 8);
     }
     if ((binding.layout == BindingLayout::Fp16MxmDistributed16
@@ -504,6 +512,9 @@ void CModelRuntime::initialize_internal_data(const BinaryProgram& program)
                 || binding.slices.size() != 4 || binding.base_row < 0
                 || binding.address_stride == 0
                 || binding.rope_head_dim != 2 * binding.shape[1]
+                || (binding.rope_rotary_dim && (binding.rope_rotary_dim > binding.rope_head_dim
+                    || binding.rope_rotary_dim % 2))
+                || !std::isfinite(binding.rope_attention_factor) || binding.rope_attention_factor <= 0.0f
                 || !std::isfinite(binding.rope_theta)
                 || binding.rope_theta <= 1.0f)
                 throw std::logic_error("invalid internal RoPE-table binding");
@@ -528,15 +539,18 @@ void CModelRuntime::initialize_internal_data(const BinaryProgram& program)
                         + (decodeCompact
                             ? token + frequencyBlock
                             : frequencyBlock * sequence + token) * stride;
-                    const float inverse = 1.0f / std::pow(
+                    const auto rotary = binding.rope_rotary_dim
+                        ? binding.rope_rotary_dim : binding.rope_head_dim;
+                    const bool rotated = dimension < rotary / 2;
+                    const float inverse = rotated ? 1.0f / std::pow(
                         binding.rope_theta,
                         static_cast<float>(2 * dimension)
-                            / binding.rope_head_dim);
+                            / rotary) : 0.0f;
                     const float angle = static_cast<float>(token) * inverse;
                     const auto cosine = encode_16bit_float(
-                        std::cos(angle), binding.element_type);
+                        std::cos(angle) * (rotated ? binding.rope_attention_factor : 1.0f), binding.element_type);
                     const auto sine = encode_16bit_float(
-                        std::sin(angle), binding.element_type);
+                        std::sin(angle) * (rotated ? binding.rope_attention_factor : 1.0f), binding.element_type);
                     for_each_binding_hemisphere(binding,
                         [&](Hemisphere hemisphere) {
                             write_binding_sram_byte(system_, binding, hemisphere,
@@ -701,6 +715,13 @@ void CModelRuntime::write_mem_execution_trace_csv(
 void CModelRuntime::upload_binding(
     const BinaryBinding& binding, std::span<const std::uint8_t> data)
 {
+    if (binding.role == "weight" && binding.rope_rotary_dim
+        && binding.rope_rotary_dim < binding.rope_head_dim) {
+        auto physical = binding;
+        physical.rope_rotary_dim = 0;
+        upload_binding(physical, pack_rope_projection_data(binding, data));
+        return;
+    }
     if ((binding.shape.empty() || binding.shape.size() > 3)
         || binding.base_row < 0 || binding.address_stride == 0
         || binding.slices.empty())
@@ -793,6 +814,19 @@ void CModelRuntime::upload_binding(
                     data[offset + 1]);
             });
         }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar
+        && is_16bit_float(binding.element_type) && binding.slices.size() == 2
+        && (binding.hemisphere_mask & 3) == 3) {
+        for (std::size_t r = 0; r < rows; ++r)
+            for (std::size_t c = 0; c < columns; ++c) {
+                const auto hemisphere = static_cast<Hemisphere>((c / 32) % 2);
+                const std::size_t address = binding.base_row + (c / 64) * rows + r;
+                for (std::size_t byte = 0; byte < 2; ++byte)
+                    write_binding_sram_byte(system_, binding, hemisphere,
+                        binding.slices[byte], address, c % 32, data[(r * columns + c) * 2 + byte]);
+            }
         return;
     }
     if (binding.layout == BindingLayout::Fp16PairPlanar
@@ -1042,6 +1076,99 @@ void CModelRuntime::upload_binding(
         }
         return;
     }
+    if (binding.layout == BindingLayout::Fp32QuadPlanar
+        && binding.element_type == BindingElementType::F32
+        && binding.slices.size() == 4) {
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (column / 32) * rows + row;
+                const std::size_t offset = (row * columns + column) * 4;
+                for_each_binding_hemisphere(binding,
+                    [&](Hemisphere hemisphere) {
+                        for (std::size_t byte = 0; byte < 4; ++byte)
+                            write_binding_sram_byte(system_, binding,
+                                hemisphere, binding.slices[byte], address,
+                                column % 32, data[offset + byte]);
+                    });
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16ScalarBroadcastPlanar
+        && is_16bit_float(binding.element_type)
+        && binding.slices.size() == 2) {
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + row * columns + column;
+                const std::size_t offset = (row * columns + column) * 2;
+                for_each_binding_hemisphere(binding,
+                    [&](Hemisphere hemisphere) {
+                        for (std::size_t lane = 0; lane < 32; ++lane) {
+                            write_binding_sram_byte(system_, binding,
+                                hemisphere, binding.slices[0], address,
+                                lane, data[offset]);
+                            write_binding_sram_byte(system_, binding,
+                                hemisphere, binding.slices[1], address,
+                                lane, data[offset + 1]);
+                        }
+                    });
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp32ScalarBroadcastPlanar
+        && binding.element_type == BindingElementType::F32
+        && binding.slices.size() == 4) {
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + row * columns + column;
+                const std::size_t offset = (row * columns + column) * 4;
+                for_each_binding_hemisphere(binding,
+                    [&](Hemisphere hemisphere) {
+                        for (std::size_t byte = 0; byte < 4; ++byte)
+                            for (std::size_t lane = 0; lane < 32; ++lane)
+                                write_binding_sram_byte(system_, binding,
+                                    hemisphere, binding.slices[byte],
+                                    address, lane, data[offset + byte]);
+                    });
+            }
+        }
+        return;
+    }
+    if (binding.layout == BindingLayout::Fp16DepthwiseKernel4
+        && is_16bit_float(binding.element_type)
+        && binding.slices.size() == 8) {
+        if (rows == 0 || columns != 4)
+            throw std::logic_error(
+                "depthwise kernel-4 input requires shape [channels, 4]");
+        const std::size_t channelBlocks = (rows + 31) / 32;
+        for (std::size_t channel = 0; channel < rows; ++channel) {
+            const std::size_t block = channel / 32;
+            const std::size_t lane = channel % 32;
+            for (std::size_t tap = 0; tap < 4; ++tap) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + tap * channelBlocks + block;
+                const std::size_t offset = (channel * 4 + tap) * 2;
+                for_each_binding_hemisphere(binding,
+                    [&](Hemisphere hemisphere) {
+                        write_binding_sram_byte(system_, binding, hemisphere,
+                            binding.slices[2 * tap], address, lane,
+                            data[offset]);
+                        write_binding_sram_byte(system_, binding, hemisphere,
+                            binding.slices[2 * tap + 1], address, lane,
+                            data[offset + 1]);
+                    });
+            }
+        }
+        return;
+    }
     if ((binding.layout == BindingLayout::W8A16MxmWeightStriped
             || binding.layout == BindingLayout::W8A16MxmWeightWaveStriped)
         && binding.element_type == BindingElementType::I8
@@ -1198,24 +1325,103 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
         }
         return result;
     }
+    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar
+        && is_16bit_float(binding.element_type) && binding.slices.size() == 2
+        && (binding.hemisphere_mask & 3) == 3) {
+        std::vector<std::uint8_t> result(static_cast<std::size_t>(binding.byte_size));
+        for (std::size_t r = 0; r < rows; ++r)
+            for (std::size_t c = 0; c < columns; ++c) {
+                const auto hemisphere = static_cast<Hemisphere>((c / 32) % 2);
+                const std::size_t address = binding.base_row + (c / 64) * rows + r;
+                for (std::size_t byte = 0; byte < 2; ++byte)
+                    result[(r * columns + c) * 2 + byte] = read_binding_sram_byte(
+                        system_, binding, hemisphere, binding.slices[byte], address, c % 32);
+            }
+        return result;
+    }
     if (binding.layout == BindingLayout::Fp16PairPlanar
         && is_16bit_float(binding.element_type)
-        && binding.slices.size() == 4) {
+        && (binding.slices.size() == 2 || binding.slices.size() == 4)) {
         std::vector<std::uint8_t> result(static_cast<std::size_t>(binding.byte_size));
         for (std::size_t row = 0; row < rows; ++row) {
             for (std::size_t column = 0; column < columns; ++column) {
-                const std::size_t local_mxm = (column % 64) / 32;
-                const bool dual_hemisphere = (binding.hemisphere_mask & 3) == 3;
+                const std::size_t local_mxm = binding.slices.size() == 2
+                    ? 0 : (column % 64) / 32;
+                const bool dual_hemisphere = binding.slices.size() == 4
+                    && (binding.hemisphere_mask & 3) == 3;
                 const auto hemisphere = dual_hemisphere
                     ? static_cast<Hemisphere>((column / 64) % 2)
-                    : Hemisphere::East;
+                    : single_binding_hemisphere(binding);
+                const std::size_t columnBlock = binding.slices.size() == 2
+                    ? column / 32
+                    : (dual_hemisphere ? column / 128 : column / 64);
                 const std::size_t address = static_cast<std::size_t>(binding.base_row)
-                    + (dual_hemisphere ? column / 128 : column / 64) * rows + row;
+                    + columnBlock * rows + row;
                 const std::size_t offset = (row * columns + column) * 2;
                 result[offset] = read_binding_sram_byte(system_, binding, hemisphere,
                     binding.slices[local_mxm * 2], address, column % 32);
                 result[offset + 1] = read_binding_sram_byte(system_, binding, hemisphere,
                     binding.slices[local_mxm * 2 + 1], address, column % 32);
+            }
+        }
+        return result;
+    }
+    if (binding.layout == BindingLayout::Fp32QuadPlanar
+        && binding.element_type == BindingElementType::F32
+        && binding.slices.size() == 4) {
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        const auto hemisphere = single_binding_hemisphere(binding);
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + (column / 32) * rows + row;
+                const std::size_t offset = (row * columns + column) * 4;
+                for (std::size_t byte = 0; byte < 4; ++byte)
+                    result[offset + byte] = read_binding_sram_byte(
+                        system_, binding, hemisphere,
+                        binding.slices[byte], address, column % 32);
+            }
+        }
+        return result;
+    }
+    if (binding.layout == BindingLayout::Fp16ScalarBroadcastPlanar
+        && is_16bit_float(binding.element_type)
+        && binding.slices.size() == 2) {
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        const auto hemisphere = single_binding_hemisphere(binding);
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + row * columns + column;
+                const std::size_t offset = (row * columns + column) * 2;
+                result[offset] = read_binding_sram_byte(system_, binding,
+                    hemisphere, binding.slices[0], address, 0);
+                result[offset + 1] = read_binding_sram_byte(system_, binding,
+                    hemisphere, binding.slices[1], address, 0);
+            }
+        }
+        return result;
+    }
+    if (binding.layout == BindingLayout::Fp32ScalarBroadcastPlanar
+        && binding.element_type == BindingElementType::F32
+        && binding.slices.size() == 4) {
+        std::vector<std::uint8_t> result(
+            static_cast<std::size_t>(binding.byte_size));
+        const auto hemisphere = single_binding_hemisphere(binding);
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t address =
+                    static_cast<std::size_t>(binding.base_row)
+                    + row * columns + column;
+                const std::size_t offset = (row * columns + column) * 4;
+                for (std::size_t byte = 0; byte < 4; ++byte)
+                    result[offset + byte] = read_binding_sram_byte(
+                        system_, binding, hemisphere,
+                        binding.slices[byte], address, 0);
             }
         }
         return result;

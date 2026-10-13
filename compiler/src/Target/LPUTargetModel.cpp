@@ -153,7 +153,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
         int64_t bytes_per_lane = 0;
         int64_t registers_per_lane = 0;
         int64_t bytes_per_stream_per_lane = 0;
-        int64_t vxm_alus_per_direction = 0;
+        int64_t vxm_columns = 0;
         if (!read_required(topology, "topology", "hemispheres",
                 model.memory_.hemispheres)
             || !read_required(topology, "topology", "tiles_per_slice",
@@ -174,8 +174,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
                 bytes_per_stream_per_lane)
             || !read_required(mxm, "mxm", "accum_contexts",
                 model.throughput_.mxm_accumulator_blocks)
-            || !read_required(vxm, "vxm", "alus",
-                vxm_alus_per_direction))
+            || !read_required(vxm, "vxm", "alus", vxm_columns))
             return mlir::failure();
 
         if (model.memory_.hemispheres <= 0
@@ -188,7 +187,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
             || registers_per_lane <= 0
             || bytes_per_stream_per_lane <= 0
             || model.throughput_.mxm_accumulator_blocks <= 0
-            || vxm_alus_per_direction <= 0) {
+            || vxm_columns <= 0) {
             error = "hardware configuration integer fields must be positive";
             return mlir::failure();
         }
@@ -246,7 +245,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
             * bytes_per_stream_per_lane;
         model.throughput_.mxm_pipeline_rows =
             model.throughput_.tile_rows;
-        model.throughput_.vxm_alus = 2 * vxm_alus_per_direction;
+        model.throughput_.vxm_alus = vxm_columns;
         model.throughput_.mxm_block_compute_enabled = 0;
         model.throughput_.mem_to_sxm_latency =
             model.streams_.system_register_columns - 2;
@@ -359,7 +358,6 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_THROUGHPUT(mxm_accumulator_blocks);
     READ_THROUGHPUT(vxm_alus);
     READ_THROUGHPUT(vxm_cross_hemisphere_streams_enabled);
-    READ_THROUGHPUT(vxm_fma_enabled);
     READ_THROUGHPUT(vxm_weight_to_iw_latency);
     READ_THROUGHPUT(mem_to_sxm_latency);
     READ_THROUGHPUT(mem_to_mxm_latency);
@@ -507,7 +505,6 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_THROUGHPUT(mxm_accumulator_blocks);
     READ_THROUGHPUT(vxm_alus);
     READ_THROUGHPUT(vxm_cross_hemisphere_streams_enabled);
-    READ_THROUGHPUT(vxm_fma_enabled);
     READ_THROUGHPUT(vxm_weight_to_iw_latency);
     READ_THROUGHPUT(mem_to_sxm_latency);
     READ_THROUGHPUT(mem_to_mxm_latency);
@@ -643,7 +640,6 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(throughput_, mxm_accumulator_blocks),
         I64(throughput_, vxm_alus),
         I64(throughput_, vxm_cross_hemisphere_streams_enabled),
-        I64(throughput_, vxm_fma_enabled),
         I64(throughput_, vxm_weight_to_iw_latency),
         I64(throughput_, mem_to_sxm_latency),
         I64(throughput_, mem_to_mxm_latency),
@@ -742,6 +738,8 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             icu_memory_.mem_macro_context_bits,
             icu_memory_.mxm_macro_context_bits}))
         return fail("topology dimensions and throughput values must be positive");
+    if (throughput_.vxm_alus < 16 || throughput_.vxm_alus % 8 != 0)
+        return fail("vxm_alus must be at least 16 and a multiple of 8");
     if (icu_memory_.mem_instruction_bits % 32 != 0
         || icu_memory_.mxm_instruction_bits % 32 != 0
         || icu_memory_.vxm_instruction_bits % 32 != 0
@@ -761,8 +759,6 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             && throughput_.mxm_weight_activation_overlap_enabled != 1)
         || (throughput_.vxm_cross_hemisphere_streams_enabled != 0
             && throughput_.vxm_cross_hemisphere_streams_enabled != 1)
-        || (throughput_.vxm_fma_enabled != 0
-            && throughput_.vxm_fma_enabled != 1)
         || (throughput_.icu_repeat_2d_enabled != 0
             && throughput_.icu_repeat_2d_enabled != 1))
         return fail("target feature switches must be zero or one");
@@ -856,7 +852,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
 std::uint64_t LPUTargetModel::abi_fingerprint() const
 {
     software::runtime::TargetAbiHasher hash;
-    hash.add(20); // Queue-specific compact SXM Transpose/Permute RUN_2D packets.
+    hash.add(21); // VXM terminal accumulator controls in compact ICU packets.
 #define HASH(field) hash.add(memory_.field)
     HASH(hemispheres);
     HASH(slices_per_hemisphere);
@@ -901,7 +897,7 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
     HASH(mxm_weight_buffers);
     HASH(vxm_alus);
     HASH(vxm_cross_hemisphere_streams_enabled);
-    HASH(vxm_fma_enabled);
+    hash.add(0); // ExecutableHardwareConfig::vxm_reserved_feature.
     HASH(vxm_weight_to_iw_latency);
     HASH(mem_to_sxm_latency);
     HASH(mem_to_mxm_latency);
@@ -1617,7 +1613,7 @@ std::optional<int64_t> LPUTargetModel::transport_latency(StreamEndpoint source,
         return 1;
     if (source == StreamEndpoint::VxmBridgeResult
         && destination == StreamEndpoint::Mem)
-        return group;
+        return throughput_.vxm_alus + 1 + group;
     if (source == StreamEndpoint::SxmResult
         && destination == StreamEndpoint::Mem)
         return streams_.system_register_columns - 2 - group;

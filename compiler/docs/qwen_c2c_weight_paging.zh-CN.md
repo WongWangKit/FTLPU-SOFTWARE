@@ -32,6 +32,14 @@ Qwen decoder 层不再要求全部权重同时常驻片上 MEM。runtime 首先�
   `Write` 提交 SRAM。系统不存在 C2C RX 直写 SRAM 的旁路，host 也不能直接写 LPU MEM。
 - C2C page ready 表示最后一个目标 SRAM 写入已经提交，不等同于 DMA 把最后一个 vector 放入 RX FIFO。
 
+权重页的 MEM 队列占位与 C2C 发起时间分别规划。`MEM_WRITE_SYNC` 必须在首个
+consumer 之前进入该 bank 的 ICU 队列；预计 DDR 传输时长超过这段空闲窗口时，
+占位只覆盖 consumer 前可用的周期，实际晚到的数据由指令自身等待，page barrier
+继续阻止 consumer。排入 MEM 队列的下界仍是 compiler 提供的旧权重 release cycle，
+不能在旧页后续读取之前阻塞该队列。page `SYNC` 自身占一拍，需安排在首个 consumer
+的前一拍以保留各 MEM slice 的传输相位。C2C 发起仍受原定时间和前一页传输完成约束。不能因为预计
+传输时间太长，就把写入放到 consumer 之后的空闲窗口，否则会形成循环等待。
+
 ## 软件表示
 
 Binary v24 在 target ABI 中保存 bank 和外部存储参数。ModelPackage v5 用 `ModelWeightPage` 描述层号、目标 bank、target-packed tensor，以及每个物理 segment 的 DDR offset、半球、slice、row、vector 数和 stream。
@@ -130,7 +138,7 @@ C2C receive 指令描述一段连续 SRAM row burst。runtime 按目标 slice �
 - 真实 Qwen2.5-1.5B 第 0 层 seq_len=32 executable 的 49,152 个输出全部通过
   硬件数值语义 golden，最大绝对误差 0.015625、MAE=0.000332287。checkpoint
   的 Q/K/V bias 均以标准 StableHLO broadcast-plus-add operand 表达：Q/K bias
-  融入 VXM RoPE FMA；V 采用
+  以独立 multiply 和 add 列融入 VXM RoPE product；V 采用
   `MXM BF16 stream -> VXM bias add -> distributed16 MEM`。
 
 部署包转换命令：
@@ -178,3 +186,5 @@ planner 只按 90% 峰值规划，即 92.16 bytes/cycle。每个读请求的延�
 分页时，真实 seq_len=32 双层运行测得初始 page wait 为 425,380 cycle，layer
 boundary page wait 为 9,340 cycle；第二层搬运与第一层计算确实发生了重叠，但尚未
 完全隐藏。
+
+异步预取 MEM 队列跨越一个与自身无关的计算 epoch 时，若到下一个 page barrier 前没有普通 MEM FU 访问，则不加入该中间 epoch 的汇合。它在自己的下一个 consumer barrier 提前等待，保留该 barrier 的逻辑 phase offset，删除 WRITE_SYNC 后到该 barrier 的固定空闲周期。实际计算队列和页提交共同决定释放时间，避免迟到的 DDR 等待与静态 NOP 重复累加。存在中间普通 MEM 访问时保留原来的汇合与相对时序；不会暂停或交错执行粗指令。

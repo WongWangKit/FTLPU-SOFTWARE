@@ -8,6 +8,11 @@
 
 namespace ftlpu::software::runtime {
 
+// Compile-selected Q/K feature permutation: rotary low/high halves precede
+// unchanged tail halves in the existing full-head VXM pair layout.
+std::vector<std::uint8_t> pack_rope_projection_data(
+    const BinaryBinding& binding, std::span<const std::uint8_t> data);
+
 struct PackedWeightSegment {
     std::uint64_t byte_offset{0};
     std::uint16_t hemisphere{0};

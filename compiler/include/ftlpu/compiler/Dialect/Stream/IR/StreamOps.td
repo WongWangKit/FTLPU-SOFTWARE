@@ -119,6 +119,37 @@ def SwishTaskOp : FTLPU_Stream_Op<"swish_task", [Pure]> {
   let hasVerifier = 1;
 }
 
+def DepthwiseConv1DTaskOp : FTLPU_Stream_Op<"depthwise_conv1d_task", [Pure]> {
+  let summary = "Routed depthwise causal Conv1D task";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      I64Attr:$kernel_size, BoolAttr:$causal, StrAttr:$activation,
+      I64Attr:$input_stream_base, I64Attr:$weight_stream_base,
+      I64Attr:$output_stream_base, ArrayAttr:$input_allocations,
+      ArrayAttr:$weight_allocations, ArrayAttr:$scratch_allocations,
+      ArrayAttr:$result_allocations, DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $weight attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def GatedDeltaRuleTaskOp : FTLPU_Stream_Op<"gated_delta_rule_task", [Pure]> {
+  let summary = "Routed recurrent delta-rule scan";
+  let arguments = (ins AnyRankedTensor:$query, AnyRankedTensor:$key,
+      AnyRankedTensor:$value, AnyRankedTensor:$decay,
+      AnyRankedTensor:$beta, AnyRankedTensor:$initial_state,
+      I64Attr:$heads, I64Attr:$key_dim, I64Attr:$value_dim,
+      ArrayAttr:$input_stream_bases, ArrayAttr:$output_stream_bases,
+      ArrayAttr:$query_allocations, ArrayAttr:$key_allocations,
+      ArrayAttr:$value_allocations, ArrayAttr:$decay_allocations,
+      ArrayAttr:$beta_allocations, ArrayAttr:$state_allocations,
+      ArrayAttr:$scratch_allocations, ArrayAttr:$output_allocations,
+      ArrayAttr:$final_state_allocations, DictionaryAttr:$config);
+  let results = (outs AnyRankedTensor:$output,
+      AnyRankedTensor:$final_state);
+  let assemblyFormat = "$query `,` $key `,` $value `,` $decay `,` $beta `,` $initial_state attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def ElementwiseTaskOp : FTLPU_Stream_Op<"elementwise_task", [Pure]> {
   let summary = "VXM binary elementwise task over functional-unit streams";
   let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,

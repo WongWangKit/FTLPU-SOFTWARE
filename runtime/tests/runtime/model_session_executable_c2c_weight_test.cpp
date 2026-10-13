@@ -107,7 +107,8 @@ try {
     if (initializedOverlapPlans.size() != 2
         || !initializedOverlapPlans[0].pre_execution
         || initializedOverlapPlans[1].pre_execution
-        || initializedOverlapPlans[1].start_cycle != 40)
+        || initializedOverlapPlans[1].start_cycle != 40
+        || initializedOverlapPlans[1].earliest_mem_cycle != 40)
         throw std::runtime_error(
             "weight page ignored initialized SRAM release timeline");
     auto lowBandwidthHardware = preloadProgram.hardware;
@@ -115,10 +116,12 @@ try {
     const auto lowBandwidthPlans =
         plan_weight_prefetches(preloadProgram, lowBandwidthHardware);
     if (lowBandwidthPlans.size() != preloadPlans.size()
+        || lowBandwidthPlans[0].start_cycle != preloadPlans[0].start_cycle
+        || lowBandwidthPlans[0].ready_cycle != preloadPlans[0].ready_cycle
         || lowBandwidthPlans[0].transfer_end_cycle
-            != preloadPlans[0].transfer_end_cycle)
+            < preloadPlans[0].transfer_end_cycle)
         throw std::runtime_error(
-            "DDR bandwidth changed the static ICU prefetch timeline");
+            "DDR bandwidth changed the consumer boundary or shortened transport");
 
     BinaryProgram coalescedProgram;
     auto coalescedFirst = make_weight_binding(1);
@@ -145,7 +148,8 @@ try {
         || !coalescedPlans[0].pre_execution
         || !coalescedPlans[1].pre_execution
         || coalescedPlans[2].pre_execution
-        || coalescedPlans[2].start_cycle != 400)
+        || coalescedPlans[2].start_cycle != 200
+        || coalescedPlans[2].earliest_mem_cycle != 200)
         throw std::runtime_error(
             "disjoint fragments did not share a residency page while retaining independent transfers");
 
@@ -234,9 +238,9 @@ try {
     if (!sharedQueuePlans[0].pre_execution
         || !sharedQueuePlans[1].pre_execution
         || sharedQueuePlans[2].pre_execution
-        || sharedQueuePlans[2].start_cycle != 600)
+        || sharedQueuePlans[2].start_cycle != 200)
         throw std::runtime_error(
-            "disjoint-row C2C write was not ordered after shared MEM queue use");
+            "disjoint-row C2C write waited for an unrelated MEM row");
 
     std::vector<WeightPrefetchPlan> earlyAlternateBankPlans(4);
     earlyAlternateBankPlans[0].ready_cycle = 10;
@@ -288,6 +292,69 @@ try {
             < sharedTransportPlans[2].transfer_end_cycle)
         throw std::runtime_error(
             "different C2C coarse instructions overlapped one ICU queue");
+
+    // A distant, large Gate page must not monopolize the non-preemptible
+    // transport just before the bank for an earlier Up consumer becomes free.
+    std::vector<WeightPrefetchPlan> deadlinePlans(4);
+    deadlinePlans[0].ready_cycle = 10;
+    deadlinePlans[0].release_cycle = 100;
+    deadlinePlans[0].bytes[0] = 128;
+    deadlinePlans[0].regions = {{0, 1, 20, 0, 8, false}};
+    deadlinePlans[1].ready_cycle = 20;
+    deadlinePlans[1].release_cycle = 150;
+    deadlinePlans[1].bytes[0] = 128;
+    deadlinePlans[1].regions = {{1, 1, 20, 0, 8, false}};
+    deadlinePlans[2].ready_cycle = 1000;
+    deadlinePlans[2].release_cycle = 1100;
+    deadlinePlans[2].bytes[0] = 131072;
+    deadlinePlans[2].regions = deadlinePlans[0].regions;
+    deadlinePlans[3].ready_cycle = 250;
+    deadlinePlans[3].release_cycle = 300;
+    deadlinePlans[3].bytes[0] = 128;
+    deadlinePlans[3].regions = deadlinePlans[1].regions;
+    schedule_weight_prefetches(chainedOverlapProgram, deadlinePlans);
+    // The scheduler returns plans in consumer order: Up precedes Gate.
+    if (deadlinePlans[2].start_cycle != 150
+        || deadlinePlans[3].start_cycle < deadlinePlans[2].transfer_end_cycle)
+        throw std::runtime_error("distant Gate page blocked the earlier Up consumer");
+    // A short page that fits before that bank release must still use the gap.
+    deadlinePlans[1].release_cycle = 500;
+    deadlinePlans[3].bytes[0] = 128;
+    deadlinePlans[2].ready_cycle = 600;
+    deadlinePlans[2].release_cycle = 700;
+    schedule_weight_prefetches(chainedOverlapProgram, deadlinePlans);
+    if (deadlinePlans[3].start_cycle != 100 || deadlinePlans[2].start_cycle != 500)
+        throw std::runtime_error("short prefetch did not fill the transport gap");
+
+    // After yielding to a future Up page, preserve the release ordering of
+    // pages from one binding. Reordering those can invert shared epoch
+    // barriers in the linked MEM queues even when their SRAM rows differ.
+    deadlinePlans[1].release_cycle = 150;
+    deadlinePlans[2].ready_cycle = 250;
+    deadlinePlans[2].release_cycle = 300;
+    deadlinePlans[3].bytes[0] = 131072;
+    deadlinePlans[3].use_indices = {0};
+    WeightPrefetchPlan thirdResident;
+    thirdResident.ready_cycle = 30;
+    thirdResident.release_cycle = 160;
+    thirdResident.bytes[0] = 128;
+    thirdResident.regions = {{0, 1, 28, 0, 8, false}};
+    deadlinePlans.push_back(thirdResident);
+    WeightPrefetchPlan eligibleGate;
+    eligibleGate.ready_cycle = 800;
+    eligibleGate.release_cycle = 900;
+    eligibleGate.bytes[0] = 128;
+    eligibleGate.regions = thirdResident.regions;
+    eligibleGate.use_indices = {1};
+    deadlinePlans.push_back(eligibleGate);
+    BinaryProgram orderedBindingProgram = chainedOverlapProgram;
+    orderedBindingProgram.weight_page_uses = {
+        {7, 1, 0, 1000, 1100}, {7, 0, 0, 800, 900}};
+    schedule_weight_prefetches(orderedBindingProgram, deadlinePlans);
+    if (deadlinePlans[3].start_cycle != 150
+        || deadlinePlans[5].start_cycle < deadlinePlans[3].transfer_end_cycle
+        || deadlinePlans[4].start_cycle < deadlinePlans[5].transfer_end_cycle)
+        throw std::runtime_error("eligible pages inverted their release order");
 
     BinaryProgram wideningStreamProgram = overlappingProgram;
     wideningStreamProgram.stream_release_cycles.assign(

@@ -39,14 +39,14 @@ int main() try
     using namespace ftlpu::compiler;
     using namespace ftlpu::software::runtime;
 
-    VxmLaneAluInstruction lane {};
+    VxmSrInstruction lane {};
     lane.operation = VxmAluOpcode::Multiply;
-    lane.lhs = VxmLaneOperand::StreamBFloat16(1.0f, 0);
-    lane.rhs = VxmLaneOperand::Imm(0.5f);
-    lane.output_type = VxmCastTarget::BFloat16;
+    lane.lhs = VxmSrOperand::StreamBFloat16(StreamId::East(0).packed());
+    lane.rhs = VxmSrOperand::Immediate(0.5f);
+    lane.result_sr = static_cast<std::uint8_t>(StreamId::East(0).packed());
+    lane.result_type = VxmCastTarget::BFloat16;
     lane.repeat_count = 32;
-    const auto compact = VxmCompactInstructionCodec::encode(
-        0, VxmChainDepth::Two, lane);
+    const auto compact = VxmSrCompactInstructionCodec::encode(lane);
     const auto instruction = VxmIcuRun2DInstruction::Run2D(
         2, {2, 2}, {5, 17}, compact);
     auto hardwareInstruction = instruction;
@@ -118,8 +118,8 @@ int main() try
         if (const auto issued = icu.vxm_iq(0).tick()) {
             require(*issued == compact,
                 "runtime changed the VXM compact instruction");
-            require(VxmCompactInstructionCodec::decode(0, *issued)
-                        .instruction.repeat_count == 32,
+            require(VxmSrCompactInstructionCodec::decode(*issued)
+                        .repeat_count == 32,
                 "runtime expanded the VXM contiguous datapath run");
             issueCycles.push_back(cycle);
         }

@@ -93,6 +93,12 @@ LogicalResult TransposeOp::verify()
 
 LogicalResult RopeOp::verify()
 {
+    if (const auto dim = (*this)->getAttrOfType<mlir::IntegerAttr>("rotary_dim"))
+        if (dim.getInt() <= 0 || dim.getInt() > getHeadDim() || dim.getInt() % 2)
+            return emitOpError("rotary_dim must be positive, even and <= head_dim");
+    if (const auto factor = (*this)->getAttrOfType<mlir::FloatAttr>("attention_factor"))
+        if (!std::isfinite(factor.getValueAsDouble()) || factor.getValueAsDouble() <= 0)
+            return emitOpError("attention_factor must be finite and positive");
     const auto input = getInput().getType();
     const auto result = getResult().getType();
     if (!input.hasStaticShape() || input.getRank() != 3
@@ -185,6 +191,105 @@ LogicalResult SwishOp::verify()
 {
     if (getInput().getType() != getResult().getType())
         return emitOpError("requires matching input and result types");
+    return success();
+}
+
+LogicalResult VectorAluOp::verify()
+{
+    const auto lhs = getLhs().getType();
+    const auto rhs = getRhs().getType();
+    const auto result = getResult().getType();
+    const auto floating = [](Type t) {
+        return t.isBF16() || t.isF16() || t.isF32();
+    };
+    if (!lhs.hasStaticShape() || !rhs.hasStaticShape() || !result.hasStaticShape()
+        || lhs.getRank() != 2 || lhs.getDimSize(0) <= 0 || lhs.getDimSize(1) <= 0
+        || rhs.getRank() != 2 || result.getRank() != 2
+        || (rhs.getDimSize(0) != 1 && rhs.getDimSize(0) != lhs.getDimSize(0))
+        || (rhs.getDimSize(1) != 1 && rhs.getDimSize(1) != lhs.getDimSize(1))
+        || !floating(lhs.getElementType()) || !floating(rhs.getElementType())
+        || !floating(result.getElementType())
+        || result.getDimSize(0) != lhs.getDimSize(0)
+        || result.getDimSize(1) != (getReduce() ? 1 : lhs.getDimSize(1)))
+        return emitOpError("requires static rank-2 floating operands, broadcast-compatible RHS and a map or row-reduction result");
+    if (getKind() != "add" && getKind() != "subtract"
+        && getKind() != "multiply" && getKind() != "max"
+        && getKind() != "negate" && getKind() != "cast"
+        && getKind() != "exp" && getKind() != "reciprocal"
+        && getKind() != "rsqrt")
+        return emitOpError("unsupported generic vector ALU operation");
+    if (getReduce() && getKind() != "multiply")
+        return emitOpError("row reduction currently sums products");
+    return success();
+}
+
+LogicalResult DepthwiseConv1DOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto weight = getWeight().getType();
+    const auto result = getResult().getType();
+    if (!input.hasStaticShape() || !weight.hasStaticShape()
+        || input.getRank() != 2 || weight.getRank() != 2
+        || result != input)
+        return emitOpError(
+            "requires static [tokens, channels] input/result and "
+            "[channels, kernel] weight");
+    if (getKernelSize() <= 0
+        || weight.getDimSize(0) != input.getDimSize(1)
+        || weight.getDimSize(1) != getKernelSize()
+        || weight.getElementType() != input.getElementType())
+        return emitOpError("weight shape or type does not match the input");
+    if (!getCausal())
+        return emitOpError("currently requires causal=true");
+    if (getActivation() != "none" && getActivation() != "silu")
+        return emitOpError("activation must be none or silu");
+    return success();
+}
+
+LogicalResult GatedDeltaRuleOp::verify()
+{
+    const auto query = getQuery().getType();
+    const auto key = getKey().getType();
+    const auto value = getValue().getType();
+    const auto decay = getDecay().getType();
+    const auto beta = getBeta().getType();
+    const auto state = getInitialState().getType();
+    const auto output = getOutput().getType();
+    const auto finalState = getFinalState().getType();
+    if (!query.hasStaticShape() || !key.hasStaticShape()
+        || !value.hasStaticShape() || !decay.hasStaticShape()
+        || !beta.hasStaticShape() || !state.hasStaticShape()
+        || !output.hasStaticShape() || !finalState.hasStaticShape()
+        || query.getRank() != 2 || key.getRank() != 2
+        || value.getRank() != 2 || decay.getRank() != 2
+        || beta.getRank() != 2 || state.getRank() != 2
+        || output.getRank() != 2 || finalState.getRank() != 2)
+        return emitOpError("requires static rank-2 tensors");
+    if (getHeads() <= 0 || getKeyDim() <= 0 || getValueDim() <= 0)
+        return emitOpError("heads and head dimensions must be positive");
+    const int64_t tokens = query.getDimSize(0);
+    if (key.getShape() != query.getShape()
+        || query.getDimSize(1) != getHeads() * getKeyDim()
+        || value.getDimSize(0) != tokens
+        || value.getDimSize(1) != getHeads() * getValueDim()
+        || output.getShape() != value.getShape()
+        || decay.getDimSize(0) != tokens
+        || decay.getDimSize(1) != getHeads()
+        || beta.getShape() != decay.getShape()
+        || state.getDimSize(0) != getHeads() * getKeyDim()
+        || state.getDimSize(1) != getValueDim()
+        || finalState != state)
+        return emitOpError("tensor shapes do not match the recurrent domain");
+    if (query.getElementType() != key.getElementType()
+        || query.getElementType() != value.getElementType()
+        || query.getElementType() != output.getElementType()
+        || (!query.getElementType().isF16()
+            && !query.getElementType().isBF16()))
+        return emitOpError("Q/K/V/output must use one 16-bit float type");
+    if (!decay.getElementType().isF32()
+        || !beta.getElementType().isF32()
+        || !state.getElementType().isF32())
+        return emitOpError("decay, beta, and recurrent state must be FP32");
     return success();
 }
 

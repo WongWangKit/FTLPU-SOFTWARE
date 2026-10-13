@@ -37,6 +37,7 @@ struct AttentionWeightTilePlan {
     int64_t storage_slice_count;
     int64_t slice_group_count;
     int64_t transfer_phase_count;
+    bool bank_level_ping_pong{false};
     llvm::SmallVector<int64_t, 32> storage_slices;
     std::array<AttentionWeightTilePlacement, 4> placements;
 

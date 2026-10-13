@@ -147,6 +147,19 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
 
     rewriter_.setInsertionPoint(op_.output);
     const auto memoryPlan = op_.getMemoryPlan();
+    const auto rotaryDimAttr = op_.config().getAs<mlir::IntegerAttr>("rotary_dim")
+        ? op_.config().getAs<mlir::IntegerAttr>("rotary_dim")
+        : rewriter_.getI64IntegerAttr(op_.getHeadDim());
+    const auto ropeFactorAttr = op_.config().getAs<mlir::FloatAttr>("rope_attention_factor")
+        ? op_.config().getAs<mlir::FloatAttr>("rope_attention_factor")
+        : rewriter_.getF32FloatAttr(1.0f);
+    if (rotaryDimAttr.getInt() < op_.getHeadDim()
+        && (op_.getQueryBias() || op_.getKeyBias()
+            || op_.config().getAs<mlir::FloatAttr>("qk_norm_epsilon")
+            || op_.config().getAs<mlir::IntegerAttr>("kv_cache_capacity"))) {
+        op_.emitError("partial RoPE currently requires bias-free prefill without persistent KV export");
+        return mlir::failure();
+    }
     const mlir::Value inputs[] = {op_.getInput(), op_.getQueryWeight(),
         op_.getKeyWeight(), op_.getValueWeight(), op_.getOutputWeight()};
     const char* placements[] = {"input", "query_weight", "key_weight",
@@ -163,7 +176,11 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             argument.getArgNumber(), "input",
             index == 0 ? "activation" : "weight",
             llvm::cast<mlir::RankedTensorType>(argument.getType()),
-            memoryPlan.getAs<mlir::DictionaryAttr>(placements[index]));
+            memoryPlan.getAs<mlir::DictionaryAttr>(placements[index]), {}, "none",
+            (index == 1 || index == 2) ? rewriter_.getDictionaryAttr({
+                rewriter_.getNamedAttr("head_dim", rewriter_.getI64IntegerAttr(op_.getHeadDim())),
+                rewriter_.getNamedAttr("rotary_dim", rotaryDimAttr)
+            }) : rewriter_.getDictionaryAttr({}));
     }
     const mlir::Value biases[] = {
         op_.getQueryBias(), op_.getKeyBias(), op_.getValueBias()};
@@ -240,6 +257,8 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
                 "theta", op_.config().getAs<mlir::FloatAttr>("rope_theta")),
             rewriter_.getNamedAttr("head_dim",
                 rewriter_.getI64IntegerAttr(op_.getHeadDim())),
+            rewriter_.getNamedAttr("rotary_dim", rotaryDimAttr),
+            rewriter_.getNamedAttr("attention_factor", ropeFactorAttr),
         }));
     const auto ropeProduct =
         memoryPlan.getAs<mlir::DictionaryAttr>("rope_product");
@@ -256,6 +275,8 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
                     op_.config().getAs<mlir::FloatAttr>("rope_theta")),
                 rewriter_.getNamedAttr("head_dim",
                     rewriter_.getI64IntegerAttr(op_.getHeadDim())),
+                rewriter_.getNamedAttr("rotary_dim", rotaryDimAttr),
+                rewriter_.getNamedAttr("attention_factor", ropeFactorAttr),
             }));
     }
     const auto probabilityType = mlir::RankedTensorType::get(
@@ -325,12 +346,33 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         return mlir::failure();
     }
     const int64_t qkStart = projectionEnd;
-    const int64_t qkEnd = stagePlan.qkEnd(qkStart);
+    const auto placementBank = [&](llvm::StringRef name) {
+        const auto placement =
+            op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(name);
+        const auto bank = placement
+            ? placement.getAs<mlir::IntegerAttr>("bank")
+            : mlir::IntegerAttr{};
+        return bank ? bank.getInt() : 0;
+    };
+    // When tail-QK score output shares the first Query-IW bank, its 32-row
+    // WRITE_3D must drain before the next wave starts the corresponding
+    // READ_3D.  The historical layout placed scores on the second bank and
+    // only needed the ordinary wave interval.  Runtime-paged FFN keeps that
+    // second activation bank for the probability pack, so serialize this
+    // same-queue boundary explicitly.
+    const int64_t qkWaveInterval = stagePlan.qk_wave_interval
+        + (placementBank("score") == placementBank("query") ? tile : 0);
+    const int64_t qkEnd = stagePlan.qk_waves.empty()
+        ? qkStart
+        : qkStart
+            + static_cast<int64_t>(stagePlan.qk_waves.size() - 1)
+                * qkWaveInterval
+            + stagePlan.qk_wave_duration;
     // The compact 8-queue CModel path currently uses the correctness-first
     // tail schedule. Fused planning remains an optional optimization, but it
     // must not suppress the BF16 score materialization consumed below.
     const bool fusedSoftmax = false;
-    if (mlir::failed(emitQk(qkStart, stagePlan.qk_wave_interval,
+    if (mlir::failed(emitQk(qkStart, qkWaveInterval,
             stagePlan.qk_iw_to_compute_cycles, fusedSoftmax)))
         return mlir::failure();
     const int64_t softmaxEnd = emitSoftmax(qkStart, qkEnd, fusedSoftmax);

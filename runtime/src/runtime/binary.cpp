@@ -545,6 +545,8 @@ void write_binding(std::ostream& os, const BinaryBinding& binding)
     write_scalar<std::uint16_t>(os, binding.bank);
     write_scalar<float>(os, binding.rope_theta);
     write_scalar<std::uint32_t>(os, binding.rope_head_dim);
+    write_scalar<std::uint32_t>(os, binding.rope_rotary_dim);
+    write_scalar<float>(os, binding.rope_attention_factor);
     write_scalar<std::uint16_t>(os, binding.paged_weight ? 1 : 0);
     write_scalar<std::uint16_t>(os,
         static_cast<std::uint16_t>(binding.page_storage_slices.size()));
@@ -608,6 +610,10 @@ BinaryBinding read_binding(std::istream& is, std::uint32_t version)
             binding.bank = version >= 17 ? bank_or_reserved : 0;
             binding.rope_theta = read_scalar<float>(is);
             binding.rope_head_dim = read_scalar<std::uint32_t>(is);
+            if (version >= 33) {
+                binding.rope_rotary_dim = read_scalar<std::uint32_t>(is);
+                binding.rope_attention_factor = read_scalar<float>(is);
+            }
             if (version >= 22) {
                 binding.paged_weight =
                     read_scalar<std::uint16_t>(is) != 0;
@@ -1020,6 +1026,10 @@ BinaryBinding read_binding(ByteReader& reader, std::uint32_t version)
             binding.bank = version >= 17 ? bank_or_reserved : 0;
             binding.rope_theta = reader.read<float>();
             binding.rope_head_dim = reader.read<std::uint32_t>();
+            if (version >= 33) {
+                binding.rope_rotary_dim = reader.read<std::uint32_t>();
+                binding.rope_attention_factor = reader.read<float>();
+            }
             if (version >= 22) {
                 binding.paged_weight =
                     reader.read<std::uint16_t>() != 0;

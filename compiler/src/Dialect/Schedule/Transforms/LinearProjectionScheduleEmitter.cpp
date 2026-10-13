@@ -115,7 +115,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     }
     const bool localDequant = execution->uses_local_dequant();
     const std::size_t expectedActivationSlices = 2;
-    const std::size_t expectedResultSlices = 4;
+    const std::size_t expectedResultSlices = 2;
     if (inputSlices.size() != expectedActivationSlices
         || weightSlices.size() != 8
         || resultSlices.size() != expectedResultSlices) {
@@ -136,6 +136,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
         weightPlacement.getAs<mlir::IntegerAttr>("base_row").getInt();
     const int64_t resultBase =
         resultPlacement.getAs<mlir::IntegerAttr>("base_row").getInt();
+    const int64_t resultBank = resultPlacement.getAs<mlir::IntegerAttr>("bank").getInt();
     const int64_t inputBinding = argumentIndex(op.getInput());
     const int64_t weightBinding = argumentIndex(op.getWeight());
     if (inputBinding < 0 || weightBinding < 0) {
@@ -196,6 +197,80 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     const float scale =
         static_cast<float>(scaleAttr.getValueAsDouble());
 
+    if (localDequant && tokenBlocks == 1) {
+        // Emit the projection's loop nest directly. Final-K compute exports
+        // BF16 and clears its accumulator, so no accumulator-read command
+        // has to interrupt the COMPUTE_3D instruction between output groups.
+        const int64_t period = std::max<int64_t>(64,
+            maxWeightLatency + target.throughput().mxm_local_load_to_compute_latency + m);
+        const int64_t groupPeriod = reductionBlocks * period;
+        const int64_t weightCycle = maxWeightLatency;
+        const int64_t computeCycle = weightCycle
+            + target.throughput().mxm_local_load_to_compute_latency;
+        for (int64_t hemisphere = 0; hemisphere < target.memory().hemispheres; ++hemisphere) {
+            const int64_t unit = hemisphere * target.throughput().mxms_per_hemisphere;
+            for (int64_t stream = 0; stream < 8; ++stream) {
+                const int64_t slice = weightSlices[stream];
+                emitMem3D(rewriter, op.getLoc(), weightCycle - weightReadLatency(slice),
+                    hemisphere * target.memory().slices_per_hemisphere + slice,
+                    "read", weightBase, stream, 4, 1, 1, "sram", weightBinding,
+                    reductionBlocks, period, 4, outputGroups, groupPeriod, reductionBlocks * 4);
+            }
+            emitMxmDequant3D(rewriter, op.getLoc(), weightCycle, unit, scale,
+                4, 1, reductionBlocks, period, outputGroups, groupPeriod, weightBinding);
+            MxmDomain3D load;
+            load.repeat_count = 4;
+            load.repeat_weight_column_stride = -1;
+            load.wave_count = reductionBlocks; load.wave_interval = period;
+            load.group_count = outputGroups; load.group_interval = groupPeriod;
+            load.weight_buffer_mode = "toggle_dim1";
+            emitMxm3D(rewriter, op.getLoc(), weightCycle, unit, "iw", 0, 3, 0, 0,
+                0, 1, "sram", true, "supercell", 0, dataFormat,
+                execution->weight_input_mode(), {}, load);
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const auto slice = inputSlices[byte];
+                const auto latency = target.transport_latency(target::StreamEndpoint::Mem,
+                    target::StreamEndpoint::MxmActivation, target::StreamDirection::East, slice);
+                if (!latency) return mlir::failure();
+                emitMem3D(rewriter, op.getLoc(), computeCycle - *latency,
+                    hemisphere * target.memory().slices_per_hemisphere + slice,
+                    "read", inputBase, hemisphere * 2 + byte, m, 1, 1,
+                    "sram", inputBinding, reductionBlocks, period, m,
+                    outputGroups, groupPeriod, 0);
+            }
+            MxmDomain3D compute;
+            compute.repeat_count = m;
+            compute.wave_count = reductionBlocks; compute.wave_interval = period;
+            compute.group_count = outputGroups; compute.group_interval = groupPeriod;
+            compute.weight_buffer_mode = "toggle_dim1";
+            compute.terminal_dimension = 1;
+            compute.terminal_accumulator_destination = "stream";
+            compute.terminal_accumulator_clear = true;
+            compute.terminal_accumulator_output_format = dataFormat;
+            emitMxm3D(rewriter, op.getLoc(), computeCycle, unit, "compute", 0, 0,
+                hemisphere * 2, 0, accumulatorAddress, 1, "sram", false,
+                "supercell", 0, dataFormat, {}, {}, compute);
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const auto slice = resultSlices[byte];
+                const auto latency = target.transport_latency(target::StreamEndpoint::MxmResult,
+                    target::StreamEndpoint::Mem, target::StreamDirection::West, slice);
+                if (!latency) return mlir::failure();
+                emitMem3D(rewriter, op.getLoc(), computeCycle + (reductionBlocks - 1) * period
+                        + target.mxm_first_result_latency() + *latency,
+                    hemisphere * target.memory().slices_per_hemisphere + slice,
+                    "write", resultBase, target.streams().streams_per_direction + byte,
+                    m, 1, 1, "sram", -1, outputGroups, groupPeriod, m,
+                    1, 1, 0, resultBank);
+            }
+        }
+        mlir::OperationState timeline(op.getLoc(), TimelineOp::getOperationName());
+        timeline.addAttributes({rewriter.getNamedAttr("name", rewriter.getStringAttr("linear_projection")),
+            rewriter.getNamedAttr("start", rewriter.getI64IntegerAttr(0)),
+            rewriter.getNamedAttr("end", rewriter.getI64IntegerAttr(computeCycle + outputGroups * groupPeriod + 64))});
+        rewriter.create(timeline);
+        return createBinding(rewriter, op.getLoc(), {}, outputIndex, "output", "result", resultType, resultPlacement).getValue();
+    }
+
     int64_t phaseStart = 0;
     for (int64_t outputGroup = 0;
          outputGroup < outputGroups; ++outputGroup) {
@@ -216,78 +291,47 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                  ++hemisphere) {
                 const char* hemi =
                     hemisphere == 0 ? "east" : "west";
-                for (int64_t pulse = 0; pulse < 4; ++pulse) {
-                    const int64_t cycle = dequantStart
-                        + (localDequant
-                                ? 0
-                                : hemisphere
-                                    * target.throughput()
-                                          .lanes_per_tile)
-                        + pulse;
-                    const int64_t address = weightBase
-                        + (outputGroup * reductionBlocks + reduction)
-                            * 4
-                        + pulse;
-                    for (int64_t stream = 0; stream < 8; ++stream) {
-                        const int64_t slice = weightSlices[stream];
-                        emitMem(rewriter, op.getLoc(),
-                            cycle - weightReadLatency(slice),
-                            hemisphere
-                                    * target.memory()
-                                          .slices_per_hemisphere
-                                + slice,
-                            "read", address,
-                            localDequant
-                                ? localMxm
-                                        * target.throughput()
-                                              .mxm_int8_load_streams_per_cycle
-                                    + stream
-                                : target.streams()
-                                      .streams_per_direction
-                                    + stream,
-                            1, 1, 0, "sram", weightBinding);
-                    }
-                    const int64_t unit = hemisphere
-                            * target.throughput()
-                                  .mxms_per_hemisphere
-                        + localMxm;
-                    if (localDequant) {
-                        emitMxmDequant(rewriter, op.getLoc(),
-                            cycle, unit, scale, 1, 1, weightBinding);
-                        emitMxm(rewriter, op.getLoc(), cycle, unit,
-                            "iw", weightBuffer, 3 - pulse, 0, 0,
-                            1, 1, 0, 1, "sram", true,
-                            "supercell", 0, dataFormat,
-                            execution->weight_input_mode());
-                        continue;
-                    }
-                    for (int64_t lane = 0;
-                         lane < target.throughput().lanes_per_tile;
-                         ++lane) {
-                        emitVxm(rewriter, op.getLoc(), op.getWeight(),
-                            cycle, lane, "multiply", "stream_i8",
-                            target.streams().streams_per_direction
-                                + lane,
-                            0.0f, "immediate", 0, scale,
-                            "fp32", -1, hemi, hemi, weightBinding);
-                        emitVxm(rewriter, op.getLoc(), op.getWeight(),
-                            cycle + 1, 8 + lane, "cast", "alu",
-                            lane, 0.0f, "immediate", 0, 0.0f,
-                            dataFormat,
-                            localMxm
-                                    * target.throughput()
-                                          .mxm_load_streams_per_cycle
-                                + lane * 2,
-                            hemi, hemi);
-                    }
-                    emitMxm(rewriter, op.getLoc(),
-                        cycle + weightToIw,
-                        unit,
-                        "iw", weightBuffer, 3 - pulse, 0, 0,
-                        1, 1, 0, 1, "stream", true,
-                        "supercell", 0, dataFormat,
-                        execution->weight_input_mode());
+                const int64_t cycle = dequantStart + (localDequant ? 0
+                    : hemisphere * target.throughput().lanes_per_tile);
+                const int64_t address = weightBase
+                    + (outputGroup * reductionBlocks + reduction) * 4;
+                for (int64_t stream = 0; stream < 8; ++stream) {
+                    const int64_t slice = weightSlices[stream];
+                    emitMem3D(rewriter, op.getLoc(), cycle - weightReadLatency(slice),
+                        hemisphere * target.memory().slices_per_hemisphere + slice,
+                        "read", address,
+                        localDequant ? localMxm * target.throughput().mxm_int8_load_streams_per_cycle + stream
+                            : target.streams().streams_per_direction + stream,
+                        4, 1, 1, "sram", weightBinding, 1, 1, 0, 1, 1, 0);
                 }
+                const int64_t unit = hemisphere * target.throughput().mxms_per_hemisphere + localMxm;
+                if (localDequant) {
+                    emitMxmDequant(rewriter, op.getLoc(), cycle, unit, scale, 4, 1, weightBinding);
+                } else {
+                    for (int64_t lane = 0; lane < target.throughput().lanes_per_tile; ++lane) {
+                        const int64_t multiplyColumn = hemisphere == 0 ? lane
+                            : target.throughput().vxm_alus - 1 - lane;
+                        const int64_t castColumn = hemisphere == 0 ? 8 + lane
+                            : target.throughput().vxm_alus - 1 - (8 + lane);
+                        emitVxmConfigured(rewriter, op.getLoc(), op.getWeight(), cycle,
+                            multiplyColumn, "multiply", "stream_i8",
+                            target.streams().streams_per_direction + lane, 0.0f,
+                            "immediate", 0, scale, "fp32", -1, hemi, hemi,
+                            weightBinding, 8, 4, 1);
+                        emitVxmConfigured(rewriter, op.getLoc(), op.getWeight(), cycle + 1,
+                            castColumn, "cast", "alu", multiplyColumn, 0.0f,
+                            "immediate", 0, 0.0f, dataFormat,
+                            localMxm * target.throughput().mxm_load_streams_per_cycle + lane * 2,
+                            hemi, hemi, -1, 8, 4, 1);
+                    }
+                }
+                MxmDomain3D loadDomain;
+                loadDomain.repeat_count = 4;
+                loadDomain.repeat_weight_column_stride = -1;
+                emitMxm3D(rewriter, op.getLoc(), cycle + (localDequant ? 0 : weightToIw),
+                    unit, "iw", weightBuffer, 3, 0, 0, 0, 1,
+                    localDequant ? "sram" : "stream", true, "supercell", 0,
+                    dataFormat, execution->weight_input_mode(), {}, loadDomain);
             }
 
             const bool finalReduction =
@@ -326,7 +370,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                         "compute", weightBuffer, 0,
                         hemisphere * 2, 0, tile, 1,
                         accumulatorAddress + tokenBlock * tile,
-                        1, "sram", true, "supercell", 0,
+                        1, "sram", false, "supercell", 0,
                         dataFormat);
                 }
             }
@@ -339,50 +383,34 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
             for (int64_t hemisphere = 0;
                  hemisphere < target.memory().hemispheres;
                  ++hemisphere) {
-                const char* inputHemisphere =
-                    hemisphere == 0 ? "east" : "west";
-                const int64_t inputStream =
-                    target.streams().streams_per_direction;
-                const int64_t outputStream = hemisphere * 2;
-                for (int64_t token = 0; token < m; ++token) {
-                    const int64_t vxmCycle = castStart + token;
-                    emitMxm(rewriter, op.getLoc(),
-                        vxmCycle
-                            - target.throughput()
-                                  .accumulator_read_to_vxm_latency,
-                        hemisphere
-                                * target.throughput()
-                                      .mxms_per_hemisphere
-                            + localMxm,
-                        "accumulator_read", 0, 0, 0, 0, 1, 1,
-                        accumulatorAddress + token, 1, "sram",
-                        true, "supercell", 0, dataFormat);
-                    emitVxm(rewriter, op.getLoc(), op.getWeight(),
-                        vxmCycle, hemisphere, "pass",
-                        "stream_f32", inputStream, 0.0f,
-                        "immediate", 0, 0.0f, dataFormat,
-                        outputStream, inputHemisphere, "east");
-                    for (int64_t byte = 0; byte < 2; ++byte) {
-                        const int64_t slice =
-                            resultSlices[hemisphere * 2 + byte];
-                        const auto latency = target.transport_latency(
-                            target::StreamEndpoint::VxmResult,
-                            target::StreamEndpoint::Mem,
-                            target::StreamDirection::East, slice);
-                        if (!latency) return mlir::failure();
-                        emitMem(rewriter, op.getLoc(),
-                            vxmCycle + *latency, slice, "write",
-                            resultBase + outputGroup * m + token,
-                            outputStream + byte, 1, 1, 0);
-                    }
+                const int64_t outputStream = 0;
+                const int64_t readCycle = phaseStart + accumulatorLatency;
+                MxmDomain3D readDomain;
+                readDomain.repeat_count = m;
+                readDomain.repeat_accumulator_address_stride = 1;
+                emitMxm3D(rewriter, op.getLoc(), readCycle,
+                    hemisphere * target.throughput().mxms_per_hemisphere + localMxm,
+                    "accumulator_read", 0, 0, 0, outputStream, accumulatorAddress, 1,
+                    "stream", true, "supercell", 0, dataFormat, {}, dataFormat, readDomain);
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice = resultSlices[byte];
+                    const auto latency = target.transport_latency(target::StreamEndpoint::MxmResult,
+                        target::StreamEndpoint::Mem, target::StreamDirection::West, slice);
+                    if (!latency) return mlir::failure();
+                    emitMem3D(rewriter, op.getLoc(), readCycle + *latency,
+                        hemisphere * target.memory().slices_per_hemisphere + slice, "write",
+                        resultBase + outputGroup * m,
+                        target.streams().streams_per_direction + outputStream + byte,
+                        m, 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0, resultBank);
                 }
             }
+
             int64_t finalWriteLatency = 0;
             for (int64_t slice : resultSlices) {
                 const auto latency = target.transport_latency(
-                    target::StreamEndpoint::VxmResult,
+                    target::StreamEndpoint::MxmResult,
                     target::StreamEndpoint::Mem,
-                    target::StreamDirection::East, slice);
+                    target::StreamDirection::West, slice);
                 if (!latency) return mlir::failure();
                 finalWriteLatency =
                     std::max(finalWriteLatency, *latency);

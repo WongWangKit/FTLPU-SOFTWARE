@@ -11,7 +11,7 @@ void emitMem(mlir::IRRewriter &rewriter, mlir::Location location, int64_t cycle,
   emitMem3D(rewriter, location, cycle, queue, opcode, address, packedStream,
             repeatCount, repeatInterval, addressStride, destination,
             addressBinding, 1, 1, 0, 1, 1, 0, bank, weightPage,
-            logicalBaseRow);
+            logicalBaseRow, 1, 0, 0);
 }
 
 void emitMem3D(mlir::IRRewriter &rewriter, mlir::Location location,

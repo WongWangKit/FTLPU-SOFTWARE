@@ -63,8 +63,8 @@ int main() try {
     require(lastCycle == 10, "Swish chain is issued in one cycle");
     require(local == peer,
         "one compact VXM packet represents both physical chain outputs");
-    require(peer.getOutputHemisphere() == "west",
-        "peer Swish output must cross to the other hemisphere");
+    require(peer.getOutputHemisphere() == "east",
+        "Swish output must keep its eastward physical propagation");
     require(peer.getQueue() == 7 && peer.getOutputStream() == 6,
         "Swish output must use the fixed 8-stage chain tail");
 
@@ -73,8 +73,9 @@ int main() try {
         entry->getArgument(0), entry->getArgument(1), target,
         FfnScheduleStrategy::Tail, 20, 1, 6));
     schedule::VxmOp tailHead;
+    const int64_t tailColumnBase = target.throughput().vxm_alus - 1;
     function.walk([&](schedule::VxmOp op) {
-        if (op.getCycle() == 20 && op.getQueue() == 0)
+        if (op.getCycle() == 20 && op.getQueue() == tailColumnBase)
             tailHead = op;
     });
     require(tailHead != nullptr,
@@ -86,6 +87,13 @@ int main() try {
     require(tailLhsSource && tailLhsSource.getValue() == "west"
             && tailRhsSource && tailRhsSource.getValue() == "west",
         "Tail Swish streams must name their physical source hemisphere");
+    schedule::VxmOp tailOutput;
+    function.walk([&](schedule::VxmOp op) {
+        if (op.getCycle() == 20 && op.getQueue() == 8)
+            tailOutput = op;
+    });
+    require(tailOutput != nullptr && tailOutput.getOutputHemisphere() == "west",
+        "west Swish chain must descend from C15 to C8 and continue westward");
 
     auto placement = schedule::ffn_detail::schedule_placement(rewriter,
         {31}, 8192 + 3 * 128 + 64, 1, 1, "east",

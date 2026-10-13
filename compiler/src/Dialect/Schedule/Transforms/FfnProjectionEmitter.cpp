@@ -956,6 +956,26 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                     setFfnLoopDomain3D(
                                         write.getOperation(), rewriter,
                                         domain);
+                                    // The upstream copy keeps the West result
+                                    // alive for the ordinary downstream write.
+                                    // Each Gate copy has its own MEM read queue
+                                    // in the physical SR SwiGLU pipeline.
+                                    if (projection == 0
+                                        && throughput.vxm_alus == 16
+                                        && tempGroup == 0
+                                        && gateTempSlices.size() >= 4) {
+                                        const int64_t copySlice = gateTempSlices[2 + byte];
+                                        const auto copyLatency = target.transport_latency(
+                                            target::StreamEndpoint::MxmResult,
+                                            target::StreamEndpoint::Mem,
+                                            target::StreamDirection::West, copySlice);
+                                        emitFfnMemTransfer3D(rewriter, ffn.getLoc(),
+                                            sourceComputeCycle + target.mxm_first_result_latency()
+                                                + *copyLatency,
+                                            hemisphere, copySlice, "write_tap", tempBase,
+                                            32 + streamBase + byte, tile, 1, 1,
+                                            context.temp_bank, domain);
+                                    }
                                     tempDomainOutputs[key] =
                                         write.getOutput();
                                 }

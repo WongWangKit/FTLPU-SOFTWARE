@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace ftlpu::software::runtime {
@@ -121,6 +122,7 @@ public:
     struct PageReadyRelease {
         IcuLocation location{};
         std::size_t phase_offset{0};
+        bool activation_producer{false};
     };
 
     explicit C2cWeightPager(C2cDmaSystem& system);
@@ -132,8 +134,10 @@ public:
         std::size_t start_cycle, std::size_t transfer_end_cycle,
         std::size_t ready_cycle,
         std::size_t launch_event_tag,
-        std::size_t page_ready_event_tag = 0);
+        std::size_t page_ready_event_tag = 0,
+        std::size_t earliest_mem_cycle = 0);
     void finalize_schedule(BinaryProgram& program);
+    std::vector<std::pair<std::size_t, std::size_t>> coalesce_page_ready_events();
     // Apply the scheduled page-ready waits to a parallel compiler image that
     // already contains compiler-authored MEM_READ/WRITE_SYNC packets.
     void inject_page_ready_barriers(BinaryProgram& program) const;
@@ -183,6 +187,7 @@ private:
         std::size_t event_tag{0};
         IcuLocation location{};
         std::size_t barrier_cycle{0};
+        bool activation_producer{false};
     };
 
     C2cDmaSystem& system_;

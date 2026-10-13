@@ -63,10 +63,17 @@ AttentionStagePlan planAttentionStages(AttentionStageShape shape,
         result.qk_wave_interval = computeEnd - firstIwOffset;
     } else if (target.throughput().mxms_per_hemisphere == 1) {
         // Query IW uses the alternate physical buffer while the current wave
-        // computes. The final partial streams scores west, so neither the ACC
-        // rows nor the east-side weight path need a drain bubble before the
-        // next wave starts computing.
-        result.qk_wave_interval = qkWaveComputeCycles;
+        // computes.  With two head blocks and one resident KV tile, however,
+        // the final score stream writes the same bank/slices used by the
+        // second Query-IW half.  That MEM ICU command is non-preemptible: the
+        // next wave may not start its second-half read until the 32-row score
+        // write has drained.  Wider heads naturally provide this separation
+        // before they revisit that half, and multi-tile KV waves hide it in
+        // their existing compute span.
+        const bool needsScoreWriteDrain =
+            headBlocks == 2 && tokenBlocks == 1;
+        result.qk_wave_interval = qkWaveComputeCycles
+            + (needsScoreWriteDrain ? tile : 0);
     } else {
         // A dual-MXM QK wave uses E16..E31 both for MXM1 weights and for
         // activation traffic. The next wave can start loading only after the

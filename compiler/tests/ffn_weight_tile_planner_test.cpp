@@ -27,12 +27,12 @@ try {
         || plan->projection_wave_count != 140
         || plan->weight_storage_slice_count != 32
         || plan->slice_group_count != 4
-        || plan->projection_waves_per_page != 20
-        || plan->projection_waves_per_slice_group != 10
+        || plan->projection_waves_per_page != 16
+        || plan->projection_waves_per_slice_group != 8
         || plan->down_wave_count != 12
         || plan->down_reduction_blocks_per_page != 1024
         || plan->minimum_hidden_slices != 9
-        || plan->pages.size() != 19)
+        || plan->pages.size() != 21)
         throw std::logic_error("unexpected Qwen FFN tile geometry");
 
     const auto projectionPages = std::count_if(
@@ -40,7 +40,7 @@ try {
             return page.spans.size() == 2;
         });
     const auto downPages = plan->pages.size() - projectionPages;
-    if (projectionPages != 7 || downPages != 12)
+    if (projectionPages != 9 || downPages != 12)
         throw std::logic_error("unexpected Qwen FFN page count");
     for (std::size_t index = 0; index < plan->pages.size(); ++index) {
         const auto& page = plan->pages[index];
@@ -52,12 +52,12 @@ try {
             || page.transfer_cycles <= 0)
             throw std::logic_error("invalid FFN weight page");
     }
-    if (plan->pages.front().rows_per_slice != 1920
+    if (plan->pages.front().rows_per_slice != 1536
         || plan->pages.front().spans[0].page_base_row != 0
         || plan->pages.front().spans[0].slice_group_count != 2
         || plan->pages.front().spans[1].slice_group_begin != 2
-        || plan->pages[7].rows_per_slice != 2048
-        || plan->pages[7].spans[0].reduction_block_count != 280)
+        || plan->pages[9].rows_per_slice != 2048
+        || plan->pages[9].spans[0].reduction_block_count != 280)
         throw std::logic_error("Down K split does not honor 64 KiB bank");
     auto bankOnePlan = tensor::planFfnWeightTiles(
         {32, 1536, 8960, 1536}, target, 1);
@@ -74,14 +74,14 @@ try {
         {32, 1536, 8960, 1536}, largeTarget, 1);
     if (mlir::failed(compact)
         || !compact->bank_level_ping_pong
-        || compact->projection_waves_per_page != 168
+        || compact->projection_waves_per_page != 160
         || compact->projection_slice_groups_per_role != 4
         || compact->projection_gate_slice_group_base != 0
         || compact->projection_up_slice_group_base != 0
-        || compact->down_output_waves_per_page != 3
-        || compact->down_items_per_page != 840
-        || compact->down_items_per_slice_group != 840
-        || compact->pages.size() != 5)
+        || compact->down_output_waves_per_page != 1
+        || compact->down_items_per_page != 4096
+        || compact->down_items_per_slice_group != 1024
+        || compact->pages.size() != 13)
         throw std::logic_error(
             "8192-row Qwen FFN did not select bank-level ping-pong");
     constexpr std::size_t compactProjectionPages = 1;
@@ -92,18 +92,19 @@ try {
         || compact->pages.front().spans[1].slice_group_count != 4)
         throw std::logic_error(
             "Gate/Up do not occupy opposite full banks");
-    for (std::size_t pageIndex = 0; pageIndex < 4; ++pageIndex) {
+    for (std::size_t pageIndex = 0; pageIndex < 12; ++pageIndex) {
         const auto& page = compact->pages[
             compactProjectionPages + pageIndex];
         const auto& span = page.spans.front();
         if (page.bank != 1 || span.bank != 1
             || span.slice_group_count != 1
-            || span.slice_group_begin != static_cast<int64_t>(pageIndex)
-            || span.page_base_row != 0
-            || span.output_wave_begin
-                != static_cast<int64_t>(pageIndex * 3)
-            || span.output_wave_count != 3
-            || span.rows_per_slice != 6720)
+            || span.slice_group_begin
+                != static_cast<int64_t>(pageIndex / 3)
+            || span.page_base_row
+                != static_cast<int64_t>((pageIndex % 3) * 2240)
+            || span.output_wave_begin != static_cast<int64_t>(pageIndex)
+            || span.output_wave_count != 1
+            || span.rows_per_slice != 2240)
             throw std::logic_error(
                 "compact Down page does not group one slice-group residency");
     }
@@ -113,15 +114,17 @@ try {
         || streaming->pages.size() != compact->pages.size())
         throw std::logic_error(
             "8192-row Qwen FFN streaming plan has invalid geometry");
-    for (std::size_t pageIndex = 0; pageIndex < 4; ++pageIndex) {
+    for (std::size_t pageIndex = 0; pageIndex < 12; ++pageIndex) {
         const auto& page = streaming->pages[
             compactProjectionPages + pageIndex];
         const auto& span = page.spans.front();
         if (page.bank != 1 || span.bank != 1
-            || span.slice_group_begin != static_cast<int64_t>(pageIndex)
-            || span.page_base_row != 0
-            || span.output_wave_count != 3
-            || span.rows_per_slice != 6720)
+            || span.slice_group_begin
+                != static_cast<int64_t>(pageIndex / 3)
+            || span.page_base_row
+                != static_cast<int64_t>((pageIndex % 3) * 2240)
+            || span.output_wave_count != 1
+            || span.rows_per_slice != 2240)
             throw std::logic_error(
                 "streaming Down page does not reuse the released Gate bank");
     }

@@ -1023,7 +1023,7 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                          bool accumulatorWrite = false,
                          bool accumulatorEmit = true,
                          bool localScalarWrite = false) {
-        return create_vxm(rewriter, location, input,
+        auto primary = create_vxm(rewriter, location, input,
             weight, inputType, cycle, queue, opcode,
             lhsKind, lhsIndex, lhsImmediate,
             rhsKind, rhsIndex, rhsImmediate,
@@ -1031,6 +1031,39 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             "east", "east", -1, accumulatorReset,
             accumulatorWrite, accumulatorEmit, localScalarWrite,
             chainDepth);
+        // Both VXM hemispheres have independent physical ICU queues.  The
+        // west-side MEM reads use the corresponding stream indices in the
+        // second fabric, so issue the same operation to the second half of
+        // the configured physical columns instead of relying on implicit
+        // mirroring.
+        const int64_t mirrorQueue =
+            target.throughput().vxm_alus - 1 - queue;
+        const auto mirroredKind = [](llvm::StringRef kind) {
+            return kind == "previous" || kind == "feedback"
+                ? llvm::StringRef("alu") : kind;
+        };
+        const auto mirroredIndex = [&](llvm::StringRef kind, int64_t index) {
+            if (kind == "stream_bf16" || kind == "stream_fp16")
+                return index + 16;
+            if (kind == "previous") return mirrorQueue + 1;
+            if (kind == "feedback")
+                return mirrorQueue - chainDepth + 1;
+            if (kind == "alu")
+                return target.throughput().vxm_alus - 1 - index;
+            return index;
+        };
+        create_vxm(rewriter, location, input,
+            weight, inputType, cycle,
+            mirrorQueue, opcode,
+            mirroredKind(lhsKind), mirroredIndex(lhsKind, lhsIndex),
+            lhsImmediate, mirroredKind(rhsKind),
+            mirroredIndex(rhsKind, rhsIndex), rhsImmediate,
+            castTarget, outputStream < 0 ? outputStream : outputStream + 8,
+            repeatCount, 1,
+            "west", "west", -1, accumulatorReset,
+            accumulatorWrite, accumulatorEmit, localScalarWrite,
+            chainDepth);
+        return primary;
     };
     const auto emitMirroredPairRead =
         [&](llvm::ArrayRef<int64_t> memorySlices, int64_t pair,
@@ -1070,10 +1103,17 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
         for (int64_t destination = 0;
              destination < target.memory().hemispheres; ++destination) {
             const int64_t source = 1 - destination;
+            // East chains occupy C0, C1, ... while their west mirrors occupy
+            // C15, C14, ... . Their final values therefore have identical
+            // distances to the corresponding VXM boundary.
+            const int64_t vxmSrTraversal =
+                target.throughput().vxm_alus - originalOutputStream;
             for (int64_t byte = 0; byte < byteCount; ++byte) {
                 const int64_t slice = memorySlices[byte];
+                const int64_t startCycle = outputCycle
+                    + writeLatency(slice) + vxmSrTraversal;
                 emitMem3D(rewriter, location, target,
-                    outputCycle + writeLatency(slice),
+                    startCycle,
                     destination * target.memory().slices_per_hemisphere
                         + slice,
                     "write", address,
@@ -1111,7 +1151,8 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
         const auto scalarSlices =
             llvm::ArrayRef<int64_t>(inputSlices).take_front(2);
         const int64_t scalarWriteEnd = sumOutput
-            + maxWriteLatency(scalarSlices) + 1;
+            + maxWriteLatency(scalarSlices)
+            + target.throughput().vxm_alus + 2;
         const int64_t factorInput = scalarWriteEnd
             + maxReadLatency(scalarSlices) + 1;
         const int64_t normalizeInput = factorInput + 10;
@@ -1180,7 +1221,7 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             "fp32", -1, hidden, 4);
         vxm(normalizeConfig, 3, "multiply",
             "previous", 0, 0.0f, "accumulator", 0, 0.0f,
-            dataFormat, 2, hidden, 4);
+            dataFormat, 2, hidden, 4, false, false, true, false);
 
         int64_t normalizeWriteEnd = normalizeInput;
         const bool broadcastWeight = weightSlices.size() == 2;
@@ -1203,10 +1244,11 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                 llvm::ArrayRef<int64_t>(outputSlices).slice(2 * pair, 2);
             emitMirroredWrite(outputPair, outputAddress, 2,
                 outputCycle, 2, bank(outputPlacement),
-                featuresPerPair, lanes, 1);
+                featuresPerPair, lanes, 1, 1, 1, 0);
             normalizeWriteEnd = std::max(normalizeWriteEnd,
                 outputCycle + (featuresPerPair - 1) * lanes
-                    + maxWriteLatency(outputPair) + 1);
+                    + maxWriteLatency(outputPair)
+                    + target.throughput().vxm_alus + 4);
         }
         if (broadcastWeight)
             emitMirroredPairRead(weightSlices, 0, baseRow(weightPlacement),
@@ -1490,8 +1532,13 @@ int64_t emitRowParallelVxmFeedback(mlir::IRRewriter& rewriter,
                     "read", address(outputPlacement, batch, 0),
                     32 + pair * 2 + byte, hidden, 1, 1,
                     "sram", -1, bank(outputPlacement));
+                const int64_t bridgeWriteLatency =
+                    *target.transport_latency(
+                        target::StreamEndpoint::VxmBridgeResult,
+                        target::StreamEndpoint::Mem,
+                        target::StreamDirection::East, slice);
                 const int64_t writeCycle = bridgeInput
-                    + writeLatency(slice);
+                    + bridgeWriteLatency;
                 emitMem(rewriter, op.getLoc(), writeCycle,
                     peer * target.memory().slices_per_hemisphere
                         + slice,

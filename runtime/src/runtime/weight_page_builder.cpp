@@ -153,10 +153,41 @@ const BinaryBinding& find_input_binding(
 
 } // namespace
 
+std::vector<std::uint8_t> pack_rope_projection_data(
+    const BinaryBinding& binding, std::span<const std::uint8_t> data)
+{
+    const std::size_t head = binding.rope_head_dim;
+    const std::size_t rotary = binding.rope_rotary_dim;
+    if (head == 0 || head % 2 || rotary == 0 || rotary > head || rotary % 2
+        || binding.shape.size() != 2 || binding.element_type != BindingElementType::I8
+        || binding.shape[1] % head || data.size() != binding.byte_size)
+        throw std::invalid_argument("invalid partial RoPE projection packing");
+    const std::size_t columns = binding.shape[1];
+    std::vector<std::uint8_t> packed(data.size());
+    for (std::size_t row = 0; row < binding.shape[0]; ++row)
+        for (std::size_t column = 0; column < columns; ++column) {
+            const auto lane = column % head;
+            const auto half = head / 2;
+            const auto rotatedHalf = rotary / 2;
+            const auto part = lane % half;
+            const auto source = part < rotatedHalf
+                ? (lane < half ? part : rotatedHalf + part)
+                : (lane < half ? rotary + part - rotatedHalf : lane);
+            packed[row * columns + column] = data[row * columns + column - lane + source];
+        }
+    return packed;
+}
+
 PackedWeightImage pack_binding_image(const BinaryBinding& binding,
     std::span<const std::uint8_t> data,
     const ExecutableHardwareConfig& hardware)
 {
+    if (binding.role == "weight" && binding.rope_rotary_dim
+        && binding.rope_rotary_dim < binding.rope_head_dim) {
+        auto physical = binding;
+        physical.rope_rotary_dim = 0;
+        return pack_binding_image(physical, pack_rope_projection_data(binding, data), hardware);
+    }
     if (binding.base_row < 0 || binding.slices.empty()
         || binding.address_stride <= 0
         || data.size() != binding.byte_size)
@@ -174,6 +205,53 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
     const std::uint32_t base = static_cast<std::uint32_t>(binding.base_row);
     const std::uint32_t stride =
         static_cast<std::uint32_t>(binding.address_stride);
+
+    const bool scalarPlanar =
+        binding.layout == BindingLayout::Fp16ScalarBroadcastPlanar
+        || binding.layout == BindingLayout::Fp32ScalarBroadcastPlanar;
+    const bool packedPlanar = binding.layout == BindingLayout::Fp16PairPlanar
+        || binding.layout == BindingLayout::Fp32QuadPlanar;
+    if (scalarPlanar || packedPlanar) {
+        const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
+        if ((bytes == 4 && binding.element_type != BindingElementType::F32)
+            || (bytes == 2 && binding.element_type != BindingElementType::F16
+                && binding.element_type != BindingElementType::BF16)
+            || binding.slices.size() != bytes
+            || (packedPlanar && columns % 32))
+            throw std::invalid_argument("invalid planar C2C binding");
+        for (std::size_t row = 0; row < rows; ++row)
+            for (std::size_t column = 0; column < columns; ++column) {
+                const auto word = scalarPlanar ? row * columns + column
+                    : (column / 32) * rows + row;
+                const auto address = base + static_cast<std::uint32_t>(word) * stride;
+                const auto offset = (row * columns + column) * bytes;
+                for_each_hemisphere(binding, [&](std::uint16_t hemisphere) {
+                    for (std::size_t byte = 0; byte < bytes; ++byte)
+                        for (std::size_t lane = scalarPlanar ? 0 : column % 32;
+                             lane < (scalarPlanar ? 32 : column % 32 + 1); ++lane)
+                            image.write(hemisphere, binding.slices[byte], address,
+                                static_cast<std::uint32_t>(lane), data[offset + byte]);
+                });
+            }
+        return image.finish();
+    }
+    if (binding.layout == BindingLayout::Fp16DepthwiseKernel4
+        && (binding.element_type == BindingElementType::F16
+            || binding.element_type == BindingElementType::BF16)
+        && binding.slices.size() == 8) {
+        if (!rows || columns != 4)
+            throw std::invalid_argument("kernel-4 binding requires [channels, 4]");
+        const auto blocks = (rows + 31) / 32;
+        for (std::size_t channel = 0; channel < rows; ++channel)
+            for (std::size_t tap = 0; tap < 4; ++tap)
+                for_each_hemisphere(binding, [&](std::uint16_t hemisphere) {
+                    const auto address = base + static_cast<std::uint32_t>(tap * blocks + channel / 32) * stride;
+                    for (std::size_t byte = 0; byte < 2; ++byte)
+                        image.write(hemisphere, binding.slices[2 * tap + byte], address,
+                            static_cast<std::uint32_t>(channel % 32), data[(channel * 4 + tap) * 2 + byte]);
+                });
+        return image.finish();
+    }
 
     if (binding.layout == BindingLayout::Fp16HeadPlanar
         && (binding.element_type == BindingElementType::F16
@@ -652,6 +730,34 @@ std::vector<std::uint8_t> unpack_binding_image(
 
     const std::size_t rows = checked_dimension(binding, 0);
     const std::size_t columns = checked_dimension(binding, 1);
+    const bool scalarPlanar =
+        binding.layout == BindingLayout::Fp16ScalarBroadcastPlanar
+        || binding.layout == BindingLayout::Fp32ScalarBroadcastPlanar;
+    const bool packedPlanar = binding.layout == BindingLayout::Fp16PairPlanar
+        || binding.layout == BindingLayout::Fp32QuadPlanar;
+    if (scalarPlanar || packedPlanar) {
+        const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
+        if (binding.slices.size() != bytes || binding.address_stride <= 0
+            || (packedPlanar && columns % 32))
+            throw std::invalid_argument("invalid planar C2C output binding");
+        std::uint16_t hemisphere = 0;
+        while (hemisphere < hardware.hemispheres
+            && !(binding.hemisphere_mask & (1u << hemisphere))) ++hemisphere;
+        if (hemisphere == hardware.hemispheres)
+            throw std::invalid_argument("planar binding has no enabled hemisphere");
+        std::vector<std::uint8_t> result(static_cast<std::size_t>(binding.byte_size));
+        for (std::size_t row = 0; row < rows; ++row)
+            for (std::size_t column = 0; column < columns; ++column) {
+                const auto word = scalarPlanar ? row * columns + column
+                    : (column / 32) * rows + row;
+                const auto address = static_cast<std::uint32_t>(binding.base_row)
+                    + static_cast<std::uint32_t>(word) * static_cast<std::uint32_t>(binding.address_stride);
+                for (std::size_t byte = 0; byte < bytes; ++byte)
+                    result[(row * columns + column) * bytes + byte] = read(hemisphere,
+                        binding.slices[byte], address, scalarPlanar ? 0 : static_cast<std::uint32_t>(column % 32));
+            }
+        return result;
+    }
     if (binding.layout == BindingLayout::Fp16HeadPlanar
         && (binding.element_type == BindingElementType::F16
             || binding.element_type == BindingElementType::BF16)
@@ -820,6 +926,12 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
     std::span<const std::uint8_t> data,
     const ExecutableHardwareConfig& hardware)
 {
+    if (binding.rope_rotary_dim && binding.rope_rotary_dim < binding.rope_head_dim) {
+        auto physical = binding;
+        physical.rope_rotary_dim = 0;
+        return pack_weight_binding_page(physical, page_index,
+            pack_rope_projection_data(binding, data), hardware);
+    }
     if (binding.layout == BindingLayout::W8A16Native4Weight) {
         if (!binding.paged_weight || binding.role != "weight"
             || binding.element_type != BindingElementType::I8

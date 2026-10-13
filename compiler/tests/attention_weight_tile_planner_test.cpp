@@ -43,8 +43,50 @@ try {
     if (query.slice_group_begin != key.slice_group_begin
         || value.slice_group_begin == query.slice_group_begin
         || output.bank != query.bank
-        || output.slice_group_begin != 2)
+        || output.slice_group_begin != 2 || plan->bank_level_ping_pong)
         throw std::logic_error("unexpected attention weight placement");
+
+    auto phiPlan = tensor::planAttentionWeightTiles(
+        3072, 24, 8, 128, 1, target);
+    if (mlir::failed(phiPlan))
+        throw std::logic_error("Phi attention residency paging failed");
+    for (const auto kind : {
+             tensor::AttentionWeightTileKind::Query,
+             tensor::AttentionWeightTileKind::Key,
+             tensor::AttentionWeightTileKind::Value,
+             tensor::AttentionWeightTileKind::Output}) {
+        const auto& placement = phiPlan->get(kind);
+        if (placement.slice_group_begin != 0
+            || placement.slice_group_count > phiPlan->slice_group_count)
+            throw std::logic_error(
+                "Phi attention projection did not reuse the page slot");
+    }
+    if (phiPlan->transfer_phase_count != 4
+        || !phiPlan->bank_level_ping_pong)
+        throw std::logic_error(
+            "Phi attention projections need four refill phases");
+
+    // Projection order is Q -> V -> K -> O. Exercise both initial banks
+    // and the dense shapes whose complete attention residency exceeds one
+    // bank, while each individual projection still fits.
+    const int64_t shapes[][4] = {
+        {2048, 32, 8, 64}, {3072, 24, 8, 128},
+        {3072, 32, 8, 128}, {2048, 16, 4, 128}};
+    for (const auto& shape : shapes) {
+        for (int64_t bank = 0; bank < 2; ++bank) {
+            const auto tiled = tensor::planAttentionWeightTiles(
+                shape[0], shape[1], shape[2], shape[3], bank, target);
+            if (mlir::failed(tiled) || !tiled->bank_level_ping_pong)
+                throw std::logic_error("dense attention needs bank ping-pong");
+            const auto& q = tiled->get(tensor::AttentionWeightTileKind::Query);
+            const auto& k = tiled->get(tensor::AttentionWeightTileKind::Key);
+            const auto& v = tiled->get(tensor::AttentionWeightTileKind::Value);
+            const auto& o = tiled->get(tensor::AttentionWeightTileKind::Output);
+            if (q.bank != bank || k.bank != bank
+                || v.bank != 1 - bank || o.bank != 1 - bank)
+                throw std::logic_error("Q/V/K/O did not alternate banks");
+        }
+    }
 
     std::cout << "attention_weight_tile_planner_test passed\n";
     return 0;

@@ -235,6 +235,39 @@ std::vector<Native4ActivationStarts> find_native4_activation_starts(
         program.hardware.mxms_per_hemisphere;
     if (mxmsPerHemisphere == 0) return starts;
     for (const auto& queue : program.queues) {
+        if (queue.kind == QueueKind::MxmCompute) {
+            const auto hemisphere = queue.index / mxmsPerHemisphere;
+            if (hemisphere >= hw::kHemispheres) continue;
+            std::size_t cursor = 0;
+            for (std::size_t pc = 0; pc < queue.commands.size();) {
+                const auto& command = queue.commands[pc];
+                if (const auto idle = nop_cycles(command)) {
+                    cursor += *idle;
+                    ++pc;
+                } else if (is_fu_3d_raw_packet_header(command)) {
+                    isa::EncodedMxmComputeIcu3DPacket packet {};
+                    for (std::size_t word = 0; word < packet.kWordCount; ++word)
+                        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+                            packet.words[word].lanes[lane] = queue.commands[pc + word].words[lane];
+                    const auto instruction = isa::decode_mxm_compute_icu_3d_instruction(packet);
+                    const auto issue = cursor + instruction.loop.wait_cycle;
+                    // Ordinary BF16 COMPUTE_3D consumes the activation stream
+                    // directly, without a separate Native4 LoadActivation.
+                    if (instruction.opcode == MxmComputeIcuOpcode::Compute3D
+                        && instruction.data_format == MxmDataFormat::BFloat16)
+                        for (std::size_t index = 0; index < barriers.size(); ++index)
+                            if (issue >= barriers[index].first
+                                && issue < starts[index][hemisphere].cycle)
+                                starts[index][hemisphere] = Native4ActivationStart {
+                                    issue, instruction.activation_stream_base};
+                    cursor += loop_cycles(instruction.loop);
+                    pc += packet.kWordCount;
+                } else {
+                    ++pc;
+                }
+            }
+            continue;
+        }
         if (queue.kind != QueueKind::MxmLoad) continue;
         const auto hemisphere = queue.index / mxmsPerHemisphere;
         if (hemisphere >= hw::kHemispheres) continue;
@@ -255,9 +288,7 @@ std::vector<Native4ActivationStarts> find_native4_activation_starts(
                 continue;
             for (std::size_t index = 0; index < barriers.size(); ++index) {
                 const auto ready = barriers[index].first;
-                if (schedule.start_cycle < ready
-                    || schedule.start_cycle - ready
-                        > kNative4ActivationStartupWindow)
+                if (schedule.start_cycle < ready)
                     continue;
                 auto& candidate = starts[index][hemisphere];
                 if (schedule.start_cycle < candidate.cycle)
@@ -268,6 +299,54 @@ std::vector<Native4ActivationStarts> find_native4_activation_starts(
         }
     }
     return starts;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> native4_launch_producers(
+    const BinaryProgram& program,
+    const std::vector<std::pair<std::size_t, std::size_t>>& barriers)
+{
+    const auto starts = find_native4_activation_starts(program, barriers);
+    std::vector<std::pair<std::size_t, std::size_t>> producers;
+    for (const auto& queue : program.queues) {
+        if (queue.kind != QueueKind::Mem) continue;
+        const auto side = queue.index / InstructionControlUnit::kMemQueuesPerHemisphere;
+        std::size_t cursor = 0;
+        for (std::size_t pc = 0; pc < queue.commands.size();) {
+            const auto& command = queue.commands[pc];
+            if (const auto idle = nop_cycles(command)) {
+                cursor += *idle;
+                ++pc;
+            } else if (is_mem_synchronized_raw_packet_header(command)) {
+                cursor += (command.words[2] & 0xffffffU) + 1;
+                pc += InstructionControlUnit::MemIcu::synchronized_packet_word_count;
+            } else if (is_fu_3d_raw_packet_header(command)) {
+                const auto instruction = decode_mem_3d_instruction(queue, pc);
+                const auto issue = cursor + instruction.loop.start_cycle + instruction.loop.wait_cycle;
+                if (instruction.opcode == MemIcuOpcode::Read3D)
+                    for (std::size_t i = 0; i < barriers.size(); ++i) {
+                        const auto& activation = starts[i][side];
+                        if (activation.cycle == std::numeric_limits<std::size_t>::max()) continue;
+                        const auto distance = issue > activation.cycle
+                            ? issue - activation.cycle : activation.cycle - issue;
+                        const auto stream = StreamId::from_packed(instruction.stream).index();
+                        if (distance <= kNative4ActivationStartupWindow
+                            && stream >= activation.stream_base
+                            && stream < activation.stream_base + sizeof(std::uint16_t))
+                            producers.emplace_back(barriers[i].second, queue.index);
+                    }
+                cursor += loop_cycles(instruction.loop);
+                pc += fu_3d_raw_packet_word_count(queue.kind);
+            } else if (is_mem_write_read_2d_raw_packet_header(command)) {
+                cursor += detail::mem_icu_write_read_2d_last_issue_cycle(
+                    decode_mem_write_read_2d_raw_packet(queue, pc)) + 1;
+                pc += fu_3d_raw_packet_word_count(queue.kind);
+            } else {
+                ++cursor;
+                ++pc;
+            }
+        }
+    }
+    return producers;
 }
 
 void retreat_native4_activation_producer_barriers(
@@ -490,6 +569,22 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
         std::size_t>>* insertedBarriers = nullptr)
 {
     if (barriers.empty()) return;
+    auto timedBarriers = barriers;
+    std::ranges::stable_sort(timedBarriers,
+        [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+    for (std::size_t begin = 0; begin < timedBarriers.size();) {
+        auto end = begin + 1;
+        while (end < timedBarriers.size()
+            && timedBarriers[end].first == timedBarriers[begin].first)
+            ++end;
+        const auto precedingSlots = end - begin - 1;
+        if (timedBarriers[begin].first < precedingSlots)
+            throw std::logic_error("page barriers have no space before their consumer");
+        const auto firstSlot = timedBarriers[begin].first - precedingSlots;
+        for (auto index = begin; index < end; ++index)
+            timedBarriers[index].first = firstSlot;
+        begin = end;
+    }
     const auto native4ActivationStarts =
         find_native4_activation_starts(program, barriers);
     for (QueueProgram& queue : program.queues) {
@@ -498,19 +593,69 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
             || queue.kind == QueueKind::C2cTx)
             continue;
 
-        auto queueBarriers = barriers;
+        auto queueBarriers = timedBarriers;
+        std::vector<std::size_t> earlyJoinTags;
         if (queue.kind == QueueKind::Mem
             && queue.index < memWriteWindows.size()) {
             retreat_native4_activation_producer_barriers(
                 queue, queueBarriers, native4ActivationStarts);
-            // MEM_WRITE_SYNC belongs to the asynchronous prefetch timeline,
-            // not to a compute execution epoch, so it may span compute epoch
-            // boundaries. The queue must nevertheless rejoin the compute
-            // timeline with the phase accumulated by every covered epoch;
-            // otherwise its following MEM reads can outrun the delayed MXM
-            // consumers. Move those waits to the reservation end as rejoin
-            // fences. A future join-event opcode can coalesce them into one
-            // control word without changing this dependency.
+            // Prefetch-only MEM queues do not participate in intervening
+            // compute epochs. Join at the next consumer barrier instead;
+            // its release preserves the consumer's phase without replaying
+            // static idle time after a dynamically late WRITE_SYNC.
+            std::vector<std::pair<std::size_t, std::size_t>> activeWindows;
+            std::size_t position = 0;
+            for (std::size_t pc = 0; pc < queue.commands.size();) {
+                const auto& command = queue.commands[pc];
+                if (const auto cycles = nop_cycles(command)) {
+                    position += *cycles;
+                    ++pc;
+                } else if (is_mem_synchronized_raw_packet_header(command)) {
+                    position += (command.words[2] & 0x00ffffffU) + 1;
+                    pc += InstructionControlUnit::MemIcu::synchronized_packet_word_count;
+                } else if (is_fu_3d_raw_packet_header(command)) {
+                    const auto loop = decode_fu_3d_raw_packet_loop(queue, pc);
+                    activeWindows.emplace_back(position + loop.wait_cycle,
+                        position + loop_cycles(loop));
+                    position += loop_cycles(loop);
+                    pc += fu_3d_raw_packet_word_count(queue.kind);
+                } else {
+                    // Conservatively retain fences around other commands.
+                    activeWindows.emplace_back(position, position + 1);
+                    ++position;
+                    ++pc;
+                }
+            }
+            std::vector<std::pair<std::size_t, std::size_t>> retained;
+            for (std::size_t index = 0; index < queueBarriers.size(); ++index) {
+                const auto& barrier = queueBarriers[index];
+                bool asynchronous = false;
+                // Include idle time before the asynchronous write begins.
+                // A prefetch-only queue has no consumer for these earlier
+                // epochs either. Retaining their waits makes it replay old
+                // rendezvous after the page commits, skewing weight readers.
+                for (const auto& [begin, end, eventTag] : memWriteWindows[queue.index])
+                    asynchronous |= barrier.first < end
+                        && barrier.second != eventTag;
+                const auto next = index + 1;
+                if (asynchronous && next < queueBarriers.size()) {
+                    const auto nextCycle = queueBarriers[next].first;
+                    const bool hasConsumer = std::ranges::any_of(activeWindows,
+                        [&](const auto& window) {
+                            return window.second > barrier.first
+                                && window.first < nextCycle;
+                        });
+                    if (!hasConsumer) {
+                        earlyJoinTags.push_back(queueBarriers[next].second);
+                        continue;
+                    }
+                }
+                retained.push_back(barrier);
+            }
+            queueBarriers = std::move(retained);
+            // Remaining barriers protect actual consumers. A WRITE_SYNC
+            // cannot be interrupted, so place these joins after its reserved
+            // interval while retaining the consumer's relative phase.
             for (auto& barrier : queueBarriers) {
                 bool moved = true;
                 while (moved) {
@@ -541,28 +686,39 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
             std::numeric_limits<std::size_t>::max());
         std::size_t cursor = 0;
         std::size_t barrierIndex = 0;
+        std::size_t barrierIssueDrift = 0;
 
+        // actualCycle is the logical consumer phase, even for an early join
+        // whose queue reaches WAIT_EVENT before that logical cycle. Release
+        // waits for the compute participants and preserves this phase.
         const auto appendBarrier = [&](const auto& barrier,
                                        std::size_t actualCycle) {
             append_control(linked,
                 IcuControlInstruction::WaitEvent(barrier.second));
             if (insertedBarriers != nullptr)
                 insertedBarriers->emplace_back(
-                    barrier.second, queue.kind, queue.index, actualCycle);
+                    barrier.second, queue.kind, queue.index,
+                    actualCycle >= barrierIssueDrift
+                        ? actualCycle - barrierIssueDrift : 0);
         };
         auto appendDueBarriers = [&](std::size_t throughCycle) {
             while (barrierIndex < queueBarriers.size()
                 && queueBarriers[barrierIndex].first <= throughCycle) {
                 appendBarrier(queueBarriers[barrierIndex], cursor);
+                // WAIT_EVENT occupies one ICU issue cycle even when the
+                // event has already been latched.  Account for that cycle so
+                // the following command can consume one fewer idle cycle
+                // instead of drifting later once per injected barrier.
+                ++cursor;
                 ++barrierIndex;
             }
         };
 
         for (std::size_t commandIndex = 0;
              commandIndex < original.size();) {
-            appendDueBarriers(cursor);
             const auto& command = original[commandIndex];
             if (is_mem_synchronized_raw_packet_header(command)) {
+                appendDueBarriers(cursor);
                 constexpr auto words = InstructionControlUnit::MemIcu::
                     synchronized_packet_word_count;
                 static_cast<void>(decode_mem_synchronized_icu_packet(
@@ -589,18 +745,24 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     && queueBarriers[barrierIndex].first < idleEnd) {
                     const auto barrierCycle = std::max(
                         cursor, queueBarriers[barrierIndex].first);
-                    append_nop(linked, barrierCycle - cursor);
+                    if (std::ranges::find(earlyJoinTags,
+                            queueBarriers[barrierIndex].second) == earlyJoinTags.end())
+                        append_nop(linked, barrierCycle - cursor);
                     cursor = barrierCycle;
                     appendBarrier(
                         queueBarriers[barrierIndex], barrierCycle);
+                    ++cursor;
                     ++barrierIndex;
                 }
-                append_nop(linked, idleEnd - cursor);
-                cursor = idleEnd;
+                if (cursor < idleEnd) {
+                    append_nop(linked, idleEnd - cursor);
+                    cursor = idleEnd;
+                }
                 ++commandIndex;
                 continue;
             }
             if (is_icu_control_raw_word_command(command)) {
+                appendDueBarriers(cursor);
                 oldToNew[commandIndex] = linked.size();
                 linked.push_back(command);
                 ++commandIndex;
@@ -616,25 +778,37 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     : decode_fu_3d_raw_packet_loop(queue, commandIndex);
                 const auto wait = writeRead ? std::size_t {0}
                                             : loop.wait_cycle;
-                const auto idleEnd = cursor + wait;
+                const auto commandBase = cursor;
+                const auto idleEnd = commandBase + wait;
                 while (barrierIndex < queueBarriers.size()
                     && queueBarriers[barrierIndex].first <= idleEnd) {
                     const auto barrierCycle = std::max(
                         cursor, queueBarriers[barrierIndex].first);
-                    append_nop(linked, barrierCycle - cursor);
+                    if (std::ranges::find(earlyJoinTags,
+                            queueBarriers[barrierIndex].second) == earlyJoinTags.end())
+                        append_nop(linked, barrierCycle - cursor);
                     cursor = barrierCycle;
-                    appendBarrier(
-                        queueBarriers[barrierIndex], barrierCycle);
+                    // A barrier at a zero-wait boundary adds an issue cycle
+                    // to this queue. Express its release phase in the original
+                    // schedule so other queues (which absorb SYNC in wait_cycle)
+                    // keep their producer/consumer distance.
+                    const auto extraIssue = cursor >= idleEnd ? std::size_t {1}
+                                                             : std::size_t {0};
+                    barrierIssueDrift += extraIssue;
+                    appendBarrier(queueBarriers[barrierIndex], barrierCycle);
+                    ++cursor;
                     ++barrierIndex;
                 }
-                const auto consumedWait = cursor
-                    - (idleEnd - wait);
                 const auto duration = writeRead
                     ? detail::mem_icu_write_read_2d_last_issue_cycle(
                           decode_mem_write_read_2d_raw_packet(
                               queue, commandIndex)) + 1
                     : loop_cycles(loop);
-                const auto commandEnd = idleEnd - wait + duration;
+                const auto activeDuration = duration - wait;
+                const auto remainingWait = cursor < idleEnd
+                    ? idleEnd - cursor : std::size_t {0};
+                const auto commandEnd = cursor + remainingWait
+                    + activeDuration;
                 // A hardware ICU cannot suspend a decoded 3-D domain halfway
                 // through its nested loop. Keep a barrier crossed by the
                 // active domain pending so appendDueBarriers places it at the
@@ -646,9 +820,8 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     oldToNew[commandIndex + word] = linked.size();
                     linked.push_back(original[commandIndex + word]);
                 }
-                if (!writeRead && consumedWait != 0)
-                    set_raw_3d_wait(
-                        linked[newHeader], wait - consumedWait);
+                if (!writeRead && remainingWait != wait)
+                    set_raw_3d_wait(linked[newHeader], remainingWait);
                 cursor = commandEnd;
                 commandIndex += words;
                 continue;
@@ -923,6 +1096,14 @@ void C2cWeightPager::begin_schedule(const BinaryProgram& program)
         }
         mem_idle_windows_[queue.index].push_back(MemIdleWindow {
             cursor, std::numeric_limits<std::size_t>::max()});
+        auto merged = std::vector<MemIdleWindow> {};
+        for (const auto& window : mem_idle_windows_[queue.index]) {
+            if (!merged.empty() && merged.back().end == window.begin)
+                merged.back().end = window.end;
+            else
+                merged.push_back(window);
+        }
+        mem_idle_windows_[queue.index] = std::move(merged);
     }
     for (std::size_t queue = 0;
          queue < InstructionControlUnit::kMemQueues; ++queue)
@@ -935,7 +1116,7 @@ C2cWeightPageFence C2cWeightPager::schedule(
     BinaryProgram& binary, const C2cWeightPage& page,
     std::size_t startCycle, std::size_t transferEndCycle,
     std::size_t readyCycle, std::size_t launchEventTag,
-    std::size_t pageReadyEventTag)
+    std::size_t pageReadyEventTag, std::size_t earliestMemCycle)
 {
     if (!schedule_open_)
         throw std::logic_error(
@@ -972,21 +1153,54 @@ C2cWeightPageFence C2cWeightPager::schedule(
             minimumReservation, vectorsPerQueue[queue]);
     }
 
-    const bool hasFiniteReadyCycle =
-        readyCycle != std::numeric_limits<std::size_t>::max();
     const auto reservationEndAt = [&](std::size_t candidate) {
-        const auto duration = hasFiniteReadyCycle
-            ? minimumReservation : transportDuration;
+        // The synchronized packet owns the MEM port only while the page is
+        // entering SRAM.  The resident rows do not need the ICU queue after
+        // the writes complete, so extending this reservation to the first
+        // consumer would prevent disjoint-row pages from using the large
+        // pre-consumer idle window.  WAIT_EVENT still holds every consumer
+        // when real DDR/C2C latency exceeds this planned transfer window.
+        // A page must enter the queue before its consumer. A slow DDR
+        // estimate may exceed that idle window; the synchronized packet
+        // waits for the real transfer and the page barrier stalls consumers.
+        // Moving the packet after the consumer would create a dependency
+        // cycle: the consumer waits for a page whose writes are behind it.
+        // WAIT_EVENT itself consumes one ICU cycle. Leave that cycle before
+        // the first ordinary issue so its transport wavefront is preserved.
+        auto fenceCycle = readyCycle == 0 ? 0 : readyCycle - 1;
+        if (pageReadyEventTag != 0) {
+            const auto coveredWaits = std::ranges::count_if(
+                linked_page_barriers_, [&](const LinkedPageBarrier& barrier) {
+                    return barrier.ready_cycle >= candidate
+                        && barrier.ready_cycle <= fenceCycle;
+                });
+            fenceCycle -= std::min<std::size_t>(fenceCycle, coveredWaits);
+        }
+        const auto availableBeforeConsumer = fenceCycle > candidate
+            ? fenceCycle - candidate : std::size_t {0};
+        const auto duration = std::max(minimumReservation,
+            pageReadyEventTag != 0
+                ? std::min(transportDuration, availableBeforeConsumer)
+                : transportDuration);
         if (duration > std::numeric_limits<std::size_t>::max() - candidate)
             throw std::overflow_error(
                 "resolved C2C weight-page window overflows size_t");
-        const auto minimumEnd = candidate + duration;
-        return hasFiniteReadyCycle
-            ? std::max(readyCycle, minimumEnd) : minimumEnd;
+        return candidate + duration;
     };
 
-    std::size_t resolvedStart = std::max(
-        startCycle, earliest_schedule_cycle(page));
+    const auto earliestTransport = earliest_schedule_cycle(page);
+    // Arm MEM before its consumer even when serialized DDR traffic cannot
+    // launch until later. The launch token retains the transport start;
+    // MEM_WRITE_SYNC is allowed to wait at its own earlier queue position.
+    // Search earlier idle windows too: consecutive consumers can leave only
+    // a few cycles between domains, while disjoint page rows can be written
+    // in the larger gap before the first domain. The launch token prevents
+    // an armed packet from writing before the requested transport time.
+    const auto preferredMemStart = pageReadyEventTag != 0
+        ? earliestMemCycle : startCycle;
+    std::size_t resolvedStart = pageReadyEventTag != 0
+        ? preferredMemStart : std::max(startCycle, earliestTransport);
+    std::size_t resolvedReservationEnd = 0;
     for (;;) {
         std::size_t commonStart = resolvedStart;
         for (const auto queue : targetQueues) {
@@ -994,8 +1208,13 @@ C2cWeightPageFence C2cWeightPager::schedule(
             bool found = false;
             for (const auto& window : windows) {
                 const auto candidate = std::max(commonStart, window.begin);
-                const auto reservationEnd = reservationEndAt(candidate);
+                const auto reservationEnd = pageReadyEventTag != 0
+                    ? std::min(reservationEndAt(candidate), window.end)
+                    : reservationEndAt(candidate);
                 if (candidate > reservationEnd
+                    || reservationEnd - candidate < minimumReservation
+                    || (pageReadyEventTag != 0
+                        && (readyCycle == 0 || reservationEnd >= readyCycle))
                     || candidate > window.end
                     || reservationEnd > window.end)
                     continue;
@@ -1005,18 +1224,30 @@ C2cWeightPageFence C2cWeightPager::schedule(
             }
             if (!found)
                 throw std::logic_error(
-                    "no legal MEM ICU idle window can hold a C2C weight page");
+                        "no legal MEM ICU idle window can hold a C2C weight page: queue="
+                        + std::to_string(queue) + " consumer="
+                        + std::to_string(readyCycle) + " vectors="
+                        + std::to_string(minimumReservation));
         }
         bool allFit = true;
+        auto commonReservationEnd = reservationEndAt(commonStart);
         for (const auto queue : targetQueues) {
             const auto& windows = mem_idle_windows_[queue];
             const bool fits = std::ranges::any_of(windows,
                 [&](const MemIdleWindow& window) {
-                    const auto reservationEnd = reservationEndAt(commonStart);
-                    return commonStart >= window.begin
+                    const auto reservationEnd = pageReadyEventTag != 0
+                        ? std::min(reservationEndAt(commonStart), window.end)
+                        : reservationEndAt(commonStart);
+                    const bool fits = commonStart >= window.begin
+                        && (pageReadyEventTag == 0
+                            || (readyCycle != 0 && reservationEnd < readyCycle))
                         && commonStart <= window.end
                         && commonStart <= reservationEnd
-                        && reservationEnd <= window.end;
+                        && reservationEnd <= window.end
+                        && reservationEnd - commonStart >= minimumReservation;
+                    if (fits)
+                        commonReservationEnd = std::min(commonReservationEnd, reservationEnd);
+                    return fits;
                 });
             if (!fits) {
                 allFit = false;
@@ -1024,17 +1255,22 @@ C2cWeightPageFence C2cWeightPager::schedule(
             }
         }
         resolvedStart = commonStart;
-        if (allFit) break;
+        if (allFit) {
+            resolvedReservationEnd = commonReservationEnd;
+            break;
+        }
     }
+    const auto producerStart = std::max(
+        {startCycle, earliestTransport, resolvedStart});
     if (transportDuration > std::numeric_limits<std::size_t>::max()
-            - resolvedStart)
+            - producerStart)
         throw std::overflow_error(
             "resolved C2C weight-page window overflows size_t");
-    const auto transportEnd = resolvedStart + transportDuration;
+    const auto transportEnd = producerStart + transportDuration;
     auto segmentCounts = std::array<std::size_t, hw::kHemispheres> {};
     auto dmaLogicalEnds = std::array<std::size_t, hw::kHemispheres> {};
     auto rxLogicalEnds = std::array<std::size_t, hw::kHemispheres> {};
-    auto c2cLogicalEnd = resolvedStart;
+    auto c2cLogicalEnd = producerStart;
     for (const auto& segment : page.segments)
         ++segmentCounts[hemisphere_index(segment.hemisphere)];
     for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
@@ -1045,32 +1281,43 @@ C2cWeightPageFence C2cWeightPager::schedule(
         // after the initially primed IQ burst, its one-word/cycle frontend
         // inserts one decode wait before every remaining packet.
         rxLogicalEnds[side] = c2c_queue_end(
-            resolvedStart, segmentCount, 0);
-        dmaLogicalEnds[side] = c2c_queue_end(resolvedStart, segmentCount,
+            producerStart, segmentCount, 0);
+        dmaLogicalEnds[side] = c2c_queue_end(producerStart, segmentCount,
             c2c_dma_frontend_wait_cycles(segmentCount));
         c2cLogicalEnd = std::max({c2cLogicalEnd,
             rxLogicalEnds[side], dmaLogicalEnds[side]});
     }
     // Transport end is an estimate derived from the external-memory model.
-    // Keep the single MEM ICU owned through the first consumer.  If the
-    // estimated transfer itself is late, the synchronized MEM packet remains
-    // at the queue head while the page-ready consumer barrier holds every
-    // ordinary ICU.  C2C DMA/RX and MEM transport-only issue keep advancing;
-    // once every page write retires the barrier releases all page consumers
-    // together.  Rejecting transportEnd > readyCycle here would bypass the
-    // hardware synchronization mechanism that exists precisely for this case.
-    // Normally the static prefetch window ends at readyCycle.  A page whose
-    // storage aliases an initialized constant cannot launch until that
-    // constant is dead, which can be the consumer boundary itself.  In that
-    // case reserve enough cycles after the boundary for every MEM write and
-    // let the page-ready barrier hold the ordinary consumers until completion.
-    const auto reservationEnd = reservationEndAt(resolvedStart);
+    // When it is late, the synchronized MEM packet remains at the queue head
+    // while the page-ready barrier holds every ordinary consumer. C2C DMA/RX
+    // and MEM transport-only issue keep advancing until all writes retire.
+    const auto reservationEnd = resolvedReservationEnd;
     const auto reservationDuration = reservationEnd - resolvedStart;
     const auto lowered = lower_c2c_weight_page_to_icu(
         page, hardware, next_sync_tag_, reservationDuration);
-    if (pageReadyEventTag != 0)
+    if (pageReadyEventTag != 0) {
+        // A late asynchronous page can outlive its predicted reservation.
+        // Its MEM_WRITE_SYNC then remains at the head of every target MEM
+        // queue and delays the first ordinary command after the selected idle
+        // window.  Fence all ordinary ICUs at that earliest collision point;
+        // otherwise producers such as SXM continue on the static timeline and
+        // consume data that the delayed MEM queues have not emitted yet.
+        auto collisionCycle = readyCycle;
+        for (const auto queue : targetQueues) {
+            const auto& windows = mem_idle_windows_[queue];
+            const auto selected = std::ranges::find_if(windows,
+                [&](const MemIdleWindow& window) {
+                    return resolvedStart >= window.begin
+                        && reservationEnd <= window.end;
+                });
+            if (selected != windows.end()
+                && selected->end != std::numeric_limits<std::size_t>::max())
+                collisionCycle = std::min(collisionCycle, selected->end);
+        }
         linked_page_barriers_.push_back(
-            LinkedPageBarrier {readyCycle, pageReadyEventTag});
+            LinkedPageBarrier {collisionCycle == 0 ? 0 : collisionCycle - 1,
+                pageReadyEventTag});
+    }
 
     for (const auto queue : targetQueues) {
         auto remaining = std::vector<MemIdleWindow> {};
@@ -1102,14 +1349,14 @@ C2cWeightPageFence C2cWeightPager::schedule(
     fence.dma_issues_begin = scheduled_dma_issues_;
     fence.dma_issues_end = scheduled_dma_issues_;
     fence.completed_segments = scheduled_rx_segments_;
-    fence.scheduled_start_cycle = resolvedStart;
+    fence.scheduled_start_cycle = producerStart;
     fence.scheduled_end_cycle = transportEnd;
     for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
         const auto hemisphere = static_cast<Hemisphere>(side);
         const auto segmentCount = segmentCounts[side];
         if (segmentCount == 0) continue;
-        if (resolvedStart < schedule_dma_cursor_[side]
-            || resolvedStart < schedule_rx_cursor_[side])
+        if (producerStart < schedule_dma_cursor_[side]
+            || producerStart < schedule_rx_cursor_[side])
             throw std::logic_error(
                 "executable C2C page schedule overlaps an ICU queue");
 
@@ -1121,7 +1368,7 @@ C2cWeightPageFence C2cWeightPager::schedule(
             binary, QueueKind::C2cDma, side);
         auto& rxQueue = *find_queue(
             binary, QueueKind::C2cRx, side);
-        // The runtime releases launchEventTag at resolvedStart.  Encoding the
+        // The runtime releases launchEventTag at producerStart. Encoding the
         // same absolute delay as a queue-local NOP would make every page wait
         // twice: once in the NOP and again for the runtime event.  Keep pages
         // adjacent in program order instead.  The DMA completion SYNCs below
@@ -1203,12 +1450,43 @@ C2cWeightPager::page_ready_releases(std::size_t eventTag) const
         if (release.event_tag == eventTag)
             releases.push_back(PageReadyRelease {
                 release.location,
-                release.barrier_cycle - referenceCycle});
+                release.barrier_cycle - referenceCycle,
+                release.activation_producer});
     std::ranges::sort(releases,
         [](const PageReadyRelease& lhs, const PageReadyRelease& rhs) {
             return lhs.phase_offset < rhs.phase_offset;
         });
     return releases;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>>
+C2cWeightPager::coalesce_page_ready_events()
+{
+    if (!schedule_open_) throw std::logic_error("page event coalescing requires an open schedule");
+    std::ranges::sort(linked_page_barriers_, [](const auto& a, const auto& b) {
+        return std::tie(a.ready_cycle, a.event_tag) < std::tie(b.ready_cycle, b.event_tag);
+    });
+    std::vector<std::pair<std::size_t, std::size_t>> aliases;
+    for (std::size_t begin = 0; begin < linked_page_barriers_.size();) {
+        auto end = begin + 1;
+        while (end < linked_page_barriers_.size()
+            && linked_page_barriers_[end].ready_cycle == linked_page_barriers_[begin].ready_cycle)
+            ++end;
+        const auto tag = linked_page_barriers_[begin].event_tag;
+        for (auto i = begin; i < end; ++i) {
+            aliases.emplace_back(linked_page_barriers_[i].event_tag, tag);
+            linked_page_barriers_[i].event_tag = tag;
+        }
+        begin = end;
+    }
+    for (auto& windows : linked_mem_windows_)
+        for (auto& window : windows)
+            for (const auto& [oldTag, newTag] : aliases)
+                if (window.page_ready_event_tag == oldTag) {
+                    window.page_ready_event_tag = newTag;
+                    break;
+                }
+    return aliases;
 }
 
 void C2cWeightPager::finalize_schedule(BinaryProgram& program)
@@ -1243,20 +1521,6 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
             memWriteWindows[queue].emplace_back(window.begin, window.end,
                 window.page_ready_event_tag);
     }
-    std::vector<std::tuple<std::size_t, QueueKind, std::size_t,
-        std::size_t>> insertedBarriers;
-    inject_page_ready_barriers_impl(
-        program, pageBarriers, memWriteWindows, &insertedBarriers);
-    linked_page_releases_.clear();
-    linked_page_releases_.reserve(insertedBarriers.size());
-    for (const auto& [eventTag, kind, queueIndex, barrierCycle] :
-         insertedBarriers)
-        linked_page_releases_.push_back(LinkedPageRelease {
-            eventTag,
-            linked_queue_location(kind, queueIndex,
-                program.hardware.mxms_per_hemisphere),
-            barrierCycle});
-
     for (std::size_t queueIndex = 0;
          queueIndex < InstructionControlUnit::kMemQueues; ++queueIndex) {
         auto& windows = linked_mem_windows_[queueIndex];
@@ -1267,7 +1531,8 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
             });
         auto& queue = find_or_create_queue(
             program, QueueKind::Mem, queueIndex);
-        const auto original = queue.commands;
+        auto originalQueue = queue;
+        auto& original = originalQueue.commands;
         std::vector<QueueCommand> linked;
         linked.reserve(original.size() + windows.size() * 3);
         std::vector<std::size_t> oldToNew(original.size(),
@@ -1317,22 +1582,48 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
         for (std::size_t commandIndex = 0;
              commandIndex < original.size();) {
             const auto& command = original[commandIndex];
+            if (is_mem_synchronized_raw_packet_header(command)) {
+                constexpr auto words = InstructionControlUnit::MemIcu::
+                    synchronized_packet_word_count;
+                const auto reservation =
+                    (command.words[2] & 0x00ffffffU) + 1;
+                for (std::size_t word = 0; word < words; ++word) {
+                    oldToNew[commandIndex + word] = linked.size();
+                    linked.push_back(original[commandIndex + word]);
+                }
+                cursor += reservation;
+                commandIndex += words;
+                continue;
+            }
             if (const auto cycles = nop_cycles(command)) {
-                const auto idleEnd = cursor + *cycles;
+                auto idleEnd = cursor + *cycles;
+                auto next = commandIndex + 1;
+                while (next < original.size()) {
+                    const auto nextCycles = nop_cycles(original[next]);
+                    if (!nextCycles) break;
+                    oldToNew[next] = linked.size();
+                    idleEnd += *nextCycles;
+                    ++next;
+                }
+                if (next < original.size()
+                    && is_fu_3d_raw_packet_header(original[next])
+                    && !is_mem_write_read_2d_raw_packet_header(original[next])) {
+                    const auto wait = decode_fu_3d_raw_packet_loop(
+                        originalQueue, next).wait_cycle;
+                    idleEnd += wait;
+                    if (wait != 0) set_raw_3d_wait(original[next], 0);
+                }
                 emitWindows(idleEnd, false);
                 append_nop(linked, idleEnd - cursor);
                 cursor = idleEnd;
-                ++commandIndex;
+                commandIndex = next;
                 continue;
             }
             if (is_icu_control_raw_word_command(command)) {
-                const auto control = decode_icu_control_raw_word(command);
-                if (control.opcode != IcuControlOpcode::WaitEvent)
-                    throw std::logic_error(
-                        "linked MEM page barrier decoded as another control");
                 emitWindows(cursor, false);
                 oldToNew[commandIndex] = linked.size();
                 linked.push_back(command);
+                ++cursor;
                 ++commandIndex;
                 continue;
             }
@@ -1347,7 +1638,7 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
             const auto loop =
                 is_mem_write_read_2d_raw_packet_header(command)
                 ? IcuLoop3D {}
-                : decode_fu_3d_raw_packet_loop(queue, commandIndex);
+                : decode_fu_3d_raw_packet_loop(originalQueue, commandIndex);
             const auto wait = loop.wait_cycle;
             const auto idleEnd = cursor + wait;
             if (wait != 0)
@@ -1357,10 +1648,10 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
                 is_mem_write_read_2d_raw_packet_header(command)
                 ? detail::mem_icu_write_read_2d_last_issue_cycle(
                       decode_mem_write_read_2d_raw_packet(
-                          queue, commandIndex)) + 1
+                          originalQueue, commandIndex)) + 1
                 : loop_cycles(
                       decode_fu_3d_raw_packet_loop(
-                          queue, commandIndex));
+                          originalQueue, commandIndex));
             for (std::size_t word = 0; word < words; ++word) {
                 oldToNew[commandIndex + word] = linked.size();
                 linked.push_back(original[commandIndex + word]);
@@ -1399,6 +1690,26 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
         relocate(program.address_relocations);
         relocate(program.scale_relocations);
     }
+    // Materialize asynchronous C2C writes first.  Page barriers are then
+    // inserted into the remaining idle cycles and can be moved to the end of
+    // a write reservation without accidentally being placed before the
+    // MEM_WRITE_SYNC packet that owns that reservation.
+    const auto activationProducers = native4_launch_producers(program, pageBarriers);
+    std::vector<std::tuple<std::size_t, QueueKind, std::size_t,
+        std::size_t>> insertedBarriers;
+    inject_page_ready_barriers_impl(
+        program, pageBarriers, memWriteWindows, &insertedBarriers);
+    linked_page_releases_.clear();
+    linked_page_releases_.reserve(insertedBarriers.size());
+    for (const auto& [eventTag, kind, queueIndex, barrierCycle] :
+         insertedBarriers)
+        linked_page_releases_.push_back(LinkedPageRelease {
+            eventTag,
+            linked_queue_location(kind, queueIndex,
+                program.hardware.mxms_per_hemisphere),
+            barrierCycle,
+            kind == QueueKind::Mem && std::ranges::find(activationProducers,
+                std::pair {eventTag, queueIndex}) != activationProducers.end()});
     std::ranges::sort(program.queues,
         [](const QueueProgram& lhs, const QueueProgram& rhs) {
             return std::tie(lhs.kind, lhs.index)

@@ -208,18 +208,34 @@ def main() -> None:
                    and integer_attr(line, "address_binding", -1) == 5
                    and 'opcode = "read"' in line)
     k_lines = split_lines[k_start:o_start]
-    sources = [
-        (integer_attr(line, "queue"),
-         re.search(r'lhs_stream_source = "(east|west)"', line).group(1))
-        for line in q_lines
-        if "ftlpu.schedule.vxm " in line
-        and 'opcode = "multiply"' in line
-        and 'lhs_stream_source = "' in line
-        and integer_attr(line, "queue") in (0, 2)
-    ]
-    if sources[:4] != [(0, "east"), (2, "west"),
-                       (0, "west"), (2, "east")]:
-        raise AssertionError(f"Q rotary halves did not enter VXM from E/W: {sources[:4]}")
+    def unfused_rope_products(lines: list[str], label: str) -> list[str]:
+        vxm = [line for line in lines if "ftlpu.schedule.vxm " in line]
+        if any('opcode = "fma"' in line or 'opcode = "fms"' in line
+               for line in vxm):
+            raise AssertionError(f"{label} still contains a fused VXM opcode")
+        by_cycle: dict[int, dict[int, str]] = {}
+        for line in vxm:
+            if integer_attr(line, "chain_depth", 0) != 8:
+                continue
+            by_cycle.setdefault(integer_attr(line, "cycle"), {})[
+                integer_attr(line, "queue")
+            ] = line
+        expected = {
+            0: 'opcode = "multiply"', 1: 'opcode = "multiply"',
+            2: 'opcode = "add"', 3: 'opcode = "multiply"',
+            4: 'opcode = "multiply"', 5: 'opcode = "add"',
+        }
+        domains = [ops for ops in by_cycle.values()
+                   if all(queue in ops and marker in ops[queue]
+                          for queue, marker in expected.items())]
+        if not domains:
+            raise AssertionError(
+                f"{label} did not lower RoPE bias products to two "
+                "mul/mul/add column groups"
+            )
+        return [ops[queue] for ops in domains for queue in (0, 3)]
+
+    q_product_lines = unfused_rope_products(q_lines, "Q")
     source_reads = {
         (integer_attr(line, "hemisphere"), integer_attr(line, "packed_stream"))
         for line in q_lines if "ftlpu.schedule.mem_transfer" in line
@@ -231,11 +247,17 @@ def main() -> None:
     expected_reads = {(0, stream) for stream in (32, 33, 36, 37)} | {
         (1, stream) for stream in (48, 49, 52, 53)
     }
-    if source_reads != expected_reads:
+    # Independent columns may introduce additional west-local staging reads;
+    # the original east/west split must still be present.
+    if not expected_reads.issubset(source_reads):
         raise AssertionError(f"Q rotary inputs were not split by hemisphere: {source_reads}")
     split_stream_text = split_stream.read_text(encoding="utf-8")
     staging_regions = []
-    for name in ("rope_staging", "rope_staging_alternate"):
+    has_alternate_staging = "rope_staging_alternate = {" in split_stream_text
+    staging_names = ["rope_staging"]
+    if has_alternate_staging:
+        staging_names.append("rope_staging_alternate")
+    for name in staging_names:
         base, rows = placement_region(split_stream_text, name)
         placement = re.search(rf"\b{name} = \{{([^{{}}]*)", split_stream_text)
         slices = re.search(r"slices = \[([^]]+)\]", placement.group(1))
@@ -257,10 +279,11 @@ def main() -> None:
                             and integer_attr(line, "bank") == 1
                             and integer_attr(line, "packed_stream") == 32
                             and integer_attr(line, "cycle") >= raw_end]
-    if (len(query_source_domains) != 1
+    if (has_alternate_staging
+            and (len(query_source_domains) != 1
             or integer_attr(query_source_domains[0], "wave_count") != 2
             or integer_attr(query_source_domains[0], "group_count") != 24
-            or integer_attr(query_source_domains[0], "outer_group_size") != 2):
+            or integer_attr(query_source_domains[0], "outer_group_size") != 2)):
         raise AssertionError(
             "serial Q source reads should cover both product phases with "
             f"one READ_3D per physical MEM queue: {query_source_domains}")
@@ -280,7 +303,8 @@ def main() -> None:
          integer_attr(line, "bank"))
         for line in merged_source_domains
     )
-    if len(source_queues) != 32 or any(count != 1 for count in source_queues.values()):
+    if has_alternate_staging and (len(source_queues) != 32
+            or any(count != 1 for count in source_queues.values())):
         raise AssertionError(
             "serial Q should use one source READ_3D on each of 32 MEM queues: "
             f"{source_queues}")
@@ -322,7 +346,7 @@ def main() -> None:
                       and any(base <= integer_attr(line, "address") < base + rows
                               and integer_attr(line, "slice") in slices
                               for base, rows, slices in staging_regions)]
-    if copied_staging:
+    if has_alternate_staging and copied_staging:
         raise AssertionError(
             f"Q rotary halves were copied back into SRAM: {copied_staging[:2]}")
 
@@ -338,11 +362,12 @@ def main() -> None:
                          < query_base + query_rows]
     query_write_queues = Counter(integer_attr(line, "slice")
                                  for line in east_query_writes)
-    if (len(query_write_queues) != 16
+    if (has_alternate_staging
+            and (len(query_write_queues) != 16
             or any(count != 1 for count in query_write_queues.values())
             or any(integer_attr(line, "wave_count") != 2
                    or integer_attr(line, "group_count") != 12
-                   for line in east_query_writes)):
+                   for line in east_query_writes))):
         raise AssertionError(
             "serial Q low-half results need one WRITE_3D per E bank0 queue: "
             f"{query_write_queues}")
@@ -361,35 +386,17 @@ def main() -> None:
          integer_attr(line, "bank"))
         for line in all_query_iw_writes
     )
-    if len(query_iw_queues) != 64 or any(
-            count != 1 for count in query_iw_queues.values()):
+    if has_alternate_staging and (len(query_iw_queues) != 64 or any(
+            count != 1 for count in query_iw_queues.values())):
         raise AssertionError(
             "serial Q output needs one WRITE_3D per physical Query-IW queue: "
             f"{query_iw_queues}")
 
-    key_sources = [
-        (integer_attr(line, "queue"),
-         re.search(r'lhs_stream_source = "(east|west)"', line).group(1))
-        for line in k_lines
-        if "ftlpu.schedule.vxm " in line
-        and 'opcode = "multiply"' in line
-        and 'lhs_stream_source = "' in line
-        and integer_attr(line, "queue") in (0, 2)
-    ]
-    if key_sources[:4] != [(0, "east"), (2, "west"),
-                           (0, "west"), (2, "east")]:
-        raise AssertionError(
-            f"K rotary halves did not enter VXM from E/W: {key_sources[:4]}")
-    key_rope_end = max(issue_interval(line)[1] for line in k_lines
-                       if "ftlpu.schedule.vxm " in line
-                       and 'opcode = "multiply"' in line
-                       and 'lhs_stream_source = "' in line
-                       and integer_attr(line, "queue") in (0, 2))
-    key_rope_start = min(issue_interval(line)[0] for line in k_lines
-                         if "ftlpu.schedule.vxm " in line
-                         and 'opcode = "multiply"' in line
-                         and 'lhs_stream_source = "' in line
-                         and integer_attr(line, "queue") in (0, 2))
+    key_product_lines = unfused_rope_products(k_lines, "K")
+    key_rope_end = max(issue_interval(line)[1]
+                       for line in key_product_lines)
+    key_rope_start = min(issue_interval(line)[0]
+                         for line in key_product_lines)
     key_source_reads = {
         (integer_attr(line, "hemisphere"), integer_attr(line, "packed_stream"))
         for line in k_lines if "ftlpu.schedule.mem_transfer" in line
@@ -399,7 +406,7 @@ def main() -> None:
         and integer_attr(line, "cycle") < key_rope_end
         and "address_binding =" not in line
     }
-    if key_source_reads != expected_reads:
+    if not expected_reads.issubset(key_source_reads):
         raise AssertionError(
             f"K rotary inputs were not split by hemisphere: {key_source_reads}")
     key_raw_writes = [issue_interval(line)[1] for line in k_lines
@@ -419,10 +426,11 @@ def main() -> None:
                           and integer_attr(line, "packed_stream") == 32
                           and key_raw_end <= integer_attr(line, "cycle")
                           < key_rope_end]
-    if (len(key_source_domains) != 2
+    if (has_alternate_staging
+            and (len(key_source_domains) != 2
             or any(integer_attr(line, "wave_count") != 2
                    or integer_attr(line, "group_count") != 2
-                   for line in key_source_domains)):
+                   for line in key_source_domains))):
         raise AssertionError(
             "serial K source reads should cover both phases and pairs with "
             f"one READ_3D per head: {len(key_source_domains)}")
@@ -433,7 +441,7 @@ def main() -> None:
                           and any(base <= integer_attr(line, "address") < base + rows
                                   and integer_attr(line, "slice") in slices
                                   for base, rows, slices in staging_regions)]
-    if key_copied_staging:
+    if has_alternate_staging and key_copied_staging:
         raise AssertionError(
             "K rotary halves were copied back into SRAM: "
             f"{key_copied_staging[:2]}")

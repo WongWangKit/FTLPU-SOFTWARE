@@ -39,4 +39,16 @@ int64_t emitVxmFeedbackRmsNorm(mlir::IRRewriter& rewriter,
 mlir::LogicalResult lowerElementwiseSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target);
 
+mlir::LogicalResult lowerDepthwiseConv1DSchedules(
+    mlir::IRRewriter& rewriter, mlir::func::FuncOp function,
+    const target::LPUTargetModel& target);
+
+mlir::LogicalResult lowerGatedDeltaRuleSchedules(
+    mlir::IRRewriter& rewriter, mlir::func::FuncOp function,
+    const target::LPUTargetModel& target);
+
+mlir::LogicalResult lowerVectorAluSchedules(
+    mlir::IRRewriter& rewriter, mlir::func::FuncOp function,
+    const target::LPUTargetModel& target);
+
 } // namespace ftlpu::compiler::schedule

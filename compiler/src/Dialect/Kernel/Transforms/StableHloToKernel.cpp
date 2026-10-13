@@ -74,6 +74,8 @@ struct AttentionMatch {
     int64_t kv_heads;
     int64_t head_dim;
     float rope_theta;
+    int64_t rotary_dim;
+    float rope_attention_factor;
     bool causal;
     llvm::SmallPtrSet<mlir::Operation*, 32> operations;
 };
@@ -456,12 +458,27 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
         key_weight_storage.getDimSize(1) / head_dim,
         head_dim,
         100000.0f,
+        head_dim,
+        1.0f,
         causal,
         {},
     };
     collect_backward_slice(output_dot->getResult(0), match.operations);
     if (const auto theta = match_rope_theta(qk_dot))
         match.rope_theta = *theta;
+    if (auto* cosine = find_backward(qk_dot->getOperand(0), "stablehlo.cosine")) {
+        auto type = llvm::dyn_cast<mlir::RankedTensorType>(cosine->getResult(0).getType());
+        if (type && type.getRank() == 2)
+            match.rotary_dim = 2 * type.getDimSize(1);
+        for (auto* user : cosine->getResult(0).getUsers()) {
+            if (!named(user, "stablehlo.multiply")) continue;
+            for (auto operand : user->getOperands()) {
+                if (operand == cosine->getResult(0)) continue;
+                if (auto factor = scalar_constant_value(find_backward(operand, "stablehlo.constant")))
+                    match.rope_attention_factor = *factor;
+            }
+        }
+    }
     return match;
 }
 
@@ -625,6 +642,8 @@ public:
                     rewriter.getI64IntegerAttr(match->head_dim));
                 state.addAttribute("theta",
                     rewriter.getF32FloatAttr(match->rope_theta));
+                state.addAttribute("rotary_dim", rewriter.getI64IntegerAttr(match->rotary_dim));
+                state.addAttribute("attention_factor", rewriter.getF32FloatAttr(match->rope_attention_factor));
                 return llvm::cast<kernel::RopeOp>(rewriter.create(state));
             };
             const auto create_head_norm = [&](mlir::Value input,
@@ -1031,7 +1050,21 @@ public:
             rewriter.setInsertionPoint(operation);
             mlir::OperationState state(operation->getLoc(),
                 kernel::ElementwiseOp::getOperationName());
-            state.addOperands(operation->getOperands());
+            auto operands = llvm::SmallVector<mlir::Value>(operation->getOperands());
+            if (named(operation, "stablehlo.multiply")) {
+                auto immediate = scalar_constant(operands[1]);
+                if (!immediate) {
+                    immediate = scalar_constant(operands[0]);
+                    if (immediate) std::swap(operands[0], operands[1]);
+                }
+                if (immediate) {
+                    state.addAttribute("rhs_immediate", rewriter.getF32FloatAttr(*immediate));
+                    // The scalar is carried by the VXM instruction, so it
+                    // needs neither an activation allocation nor a MEM read.
+                    operands[1] = operands[0];
+                }
+            }
+            state.addOperands(operands);
             state.addTypes(result);
             state.addAttribute("kind", rewriter.getStringAttr(
                 named(operation, "stablehlo.add") ? "add" : "multiply"));

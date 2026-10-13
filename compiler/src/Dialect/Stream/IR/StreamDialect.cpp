@@ -343,6 +343,86 @@ LogicalResult SwishTaskOp::verify()
     return success();
 }
 
+LogicalResult DepthwiseConv1DTaskOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto weight = getWeight().getType();
+    if (!input.hasStaticShape() || !weight.hasStaticShape()
+        || input.getRank() != 2 || weight.getRank() != 2
+        || getResult().getType() != input
+        || weight.getDimSize(0) != input.getDimSize(1)
+        || weight.getDimSize(1) != getKernelSize())
+        return emitOpError("has incompatible depthwise Conv1D tensor types");
+    if (!getCausal() || getKernelSize() != 4)
+        return emitOpError("direct hardware lowering currently supports causal kernel_size=4");
+    auto targetModel = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(targetModel)) return failure();
+    const int64_t streams = targetModel->streams().streams_per_direction;
+    if (getInputStreamBase() < 0 || getWeightStreamBase() < 0
+        || getOutputStreamBase() < 0
+        || getInputStreamBase() + 7 >= streams
+        || getWeightStreamBase() + 7 >= streams
+        || getOutputStreamBase() + 1 >= streams)
+        return emitOpError("contains an invalid direction-local stream range");
+    if (failed(verify_task_allocations(getOperation(), getInputAllocations()))
+        || failed(verify_task_allocations(getOperation(), getWeightAllocations()))
+        || failed(verify_task_allocations(getOperation(), getScratchAllocations()))
+        || failed(verify_task_allocations(getOperation(), getResultAllocations())))
+        return failure();
+    if (getScratchAllocations().size() != 3)
+        return emitOpError(
+            "requires one replicated causal-pad buffer and two result buffers");
+    return success();
+}
+
+LogicalResult GatedDeltaRuleTaskOp::verify()
+{
+    const auto query = getQuery().getType();
+    const auto key = getKey().getType();
+    const auto value = getValue().getType();
+    const auto decay = getDecay().getType();
+    const auto beta = getBeta().getType();
+    const auto state = getInitialState().getType();
+    const int64_t tokens = query.getDimSize(0);
+    if (!query.hasStaticShape() || query.getRank() != 2
+        || key != query || value.getRank() != 2
+        || decay.getRank() != 2 || beta != decay
+        || state.getRank() != 2
+        || query.getDimSize(1) != getHeads() * getKeyDim()
+        || value.getDimSize(0) != tokens
+        || value.getDimSize(1) != getHeads() * getValueDim()
+        || getOutput().getType() != value
+        || decay.getDimSize(0) != tokens
+        || decay.getDimSize(1) != getHeads()
+        || state.getDimSize(0) != getHeads() * getKeyDim()
+        || state.getDimSize(1) != getValueDim()
+        || getFinalState().getType() != state)
+        return emitOpError("has incompatible recurrent delta-rule types");
+    auto targetModel = target::LPUTargetModel::from_operation(getOperation());
+    if (failed(targetModel)) return failure();
+    const int64_t streams = targetModel->streams().streams_per_direction;
+    if (getInputStreamBases().size() != 6
+        || getOutputStreamBases().size() != 2)
+        return emitOpError(
+            "requires six input and two output stream bases");
+    for (mlir::Attribute value : getOutputStreamBases()) {
+        const int64_t base = llvm::cast<mlir::IntegerAttr>(value).getInt();
+        if (base < 0 || base + 3 >= streams)
+            return emitOpError("contains an invalid output stream base");
+    }
+    for (auto allocations : {getQueryAllocations(), getKeyAllocations(),
+             getValueAllocations(), getDecayAllocations(),
+             getBetaAllocations(), getStateAllocations(),
+             getScratchAllocations(), getOutputAllocations(),
+             getFinalStateAllocations()})
+        if (failed(verify_task_allocations(getOperation(), allocations)))
+            return failure();
+    if (getScratchAllocations().size() < 4)
+        return emitOpError(
+            "requires state ping-pong, outer-product, remembered, and delta scratch");
+    return success();
+}
+
 LogicalResult ElementwiseTaskOp::verify()
 {
     if (getKind() != "multiply" && getKind() != "add"

@@ -38,6 +38,11 @@ int main()
     require(plan.qk_wave_interval == 256,
         "single-MXM QK waves should overlap without a refill gap");
 
+    const auto shortKvPlan = schedule::planAttentionStages(
+        {32, 2048, 32, 8, 64}, target);
+    require(shortKvPlan.qk_wave_interval == 96,
+        "single-tile head-dim-64 QK waves must drain score writes");
+
     target::ThroughputModel dualMxmThroughput;
     dualMxmThroughput.mxms_per_hemisphere = 2;
     target::LPUTargetModel dualMxmTarget(

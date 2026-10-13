@@ -227,6 +227,52 @@ try {
         return ftlpu::Bf16::from_float(
             gate * (1.0f / (1.0f + std::exp(-gate))) * up).to_float();
     };
+#ifdef FTLPU_TEST_SR_SWISH_CHECKPOINT
+    const auto activationBinding = std::find_if(program.bindings.begin(),
+        program.bindings.end(), [](const auto& binding) {
+            return binding.access == ftlpu::software::runtime::BindingAccess::Input
+                && binding.index == 0;
+        });
+    const std::size_t planarHiddenBase = activationBinding->base_row
+        + activationBinding->instruction_count;
+    for (std::size_t hemisphere = 0; hemisphere < 2; ++hemisphere)
+        for (std::size_t row = 0; row < kM; ++row)
+            for (std::size_t h = 0; h < kIntermediate; ++h) {
+                const std::size_t block = h / 32;
+                const std::size_t address = planarHiddenBase + (block / 2) * kM + row;
+                const std::size_t lowSlice = activationBinding->slices[2 * (block % 2)];
+                const std::size_t highSlice = activationBinding->slices[2 * (block % 2) + 1];
+                const auto side = static_cast<ftlpu::Hemisphere>(hemisphere);
+                const auto low = system->read_mem_sram_lane_byte(side, lowSlice,
+                    activationBinding->bank, (h % 32) / 8, address, h % 8);
+                const auto high = system->read_mem_sram_lane_byte(side, highSlice,
+                    activationBinding->bank, (h % 32) / 8, address, h % 8);
+                const float actualHidden = ftlpu::Bf16::from_bits(
+                    static_cast<std::uint16_t>(low)
+                    | (static_cast<std::uint16_t>(high) << 8)).to_float();
+                if (std::fabs(actualHidden - expected_hidden(row, h)) > 0.004f) {
+                    const auto source = static_cast<ftlpu::Hemisphere>((h / 64) % 2);
+                    const std::size_t tempAddress = ((h / 128) * 2 + (h / 32) % 2) * 32 + row;
+                    const auto tempValue = [&](std::size_t slice) {
+                        const auto lo = system->read_mem_sram_lane_byte(source, slice, 1,
+                            (h % 32) / 8, tempAddress, h % 8);
+                        const auto hi = system->read_mem_sram_lane_byte(source, slice + 1, 1,
+                            (h % 32) / 8, tempAddress, h % 8);
+                        return ftlpu::Bf16::from_bits(static_cast<std::uint16_t>(lo)
+                            | (static_cast<std::uint16_t>(hi) << 8)).to_float();
+                    };
+                    throw std::logic_error("SR SwiGLU checkpoint mismatch row="
+                        + std::to_string(row) + " hidden=" + std::to_string(h)
+                        + " hemisphere=" + std::to_string(hemisphere)
+                        + " actual=" + std::to_string(actualHidden)
+                        + " expected=" + std::to_string(expected_hidden(row, h))
+                        + " gate=" + std::to_string(tempValue(0))
+                        + " gate_expected=" + std::to_string(activation(row, gate_k(h)) * gate_sign(h))
+                        + " up=" + std::to_string(tempValue(8))
+                        + " up_expected=" + std::to_string(activation(row, up_k(h)) * up_sign(h)));
+                }
+            }
+#endif
     const std::size_t hidden_rows = is_block8
         ? (kM / 32) * (kIntermediate / 32) * 4 : 0;
     if (is_block8 && output_binding->base_row < hidden_rows)

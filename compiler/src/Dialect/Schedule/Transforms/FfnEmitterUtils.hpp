@@ -114,6 +114,20 @@ VxmOp create_vxm(mlir::IRRewriter& rewriter, mlir::Location location,
     bool accumulatorWrite = false, bool accumulatorEmit = true,
     bool localScalarWrite = false, int64_t chainDepth = 8);
 
+VxmOp create_vxm_with_terminal_controls(
+    mlir::IRRewriter& rewriter, mlir::Location location,
+    mlir::Value lhsValue, mlir::Value rhsValue, mlir::Type resultType,
+    int64_t cycle, int64_t queue, llvm::StringRef opcode,
+    llvm::StringRef lhsKind, int64_t lhsIndex, float lhsImmediate,
+    llvm::StringRef rhsKind, int64_t rhsIndex, float rhsImmediate,
+    llvm::StringRef castTarget, int64_t outputStream,
+    int64_t repeatCount, int64_t repeatInterval,
+    llvm::StringRef inputHemisphere, llvm::StringRef outputHemisphere,
+    int64_t scaleBinding, bool accumulatorReset,
+    bool accumulatorWrite, bool accumulatorEmit,
+    bool localScalarWrite, int64_t chainDepth,
+    bool accumulatorResetFirst, bool accumulatorEmitLast);
+
 llvm::StringRef hemisphere_name(int64_t hemisphere);
 
 std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
@@ -130,7 +144,7 @@ mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
     int64_t sourceHemisphere, int64_t rowCount,
     bool mirroredBroadcast = false,
     FfnLoopDomain3D outerDomain = {},
-    bool directParityDomain = false);
+    bool directParityDomain = false, int64_t pipelineLatency = -1);
 
 MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     mlir::Location location, stream::RouteOp rawRoute,

@@ -166,14 +166,14 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     const int64_t lastFirstProjectionCycle =
         result.blocks.back().tiles.back().compute_cycle;
     if (serializedProjections) {
-        // The accumulator drains row-by-row while the next compute consumes
-        // its activation rows. One complete projection slot is sufficient to
-        // hand the accumulator window to the second projection; an extra
-        // tile-sized guard would leave an avoidable bubble at every output
-        // block boundary.
+        // The accumulator drains row-by-row, but an INT8 load for the second
+        // projection must also wait for the last Gate rows to retire from
+        // the reused weight buffer. Preserve that pipeline latency at the
+        // Gate/Up boundary as well as at ordinary reduction boundaries.
         result.second_projection_offset =
             lastFirstProjectionCycle - result.initial_compute_cycle
-            + result.projection_slot_interval;
+            + result.projection_slot_interval
+            + (localWeightDequant ? target.mxm_first_result_latency() : 0);
         result.final_projection_cycle = lastFirstProjectionCycle
             + result.second_projection_offset;
     } else {

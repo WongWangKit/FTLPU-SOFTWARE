@@ -64,6 +64,12 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     const int64_t mxmResultToVxmLatency =
         target_.throughput().accumulator_to_vxm_latency
         - target_.mxm_first_result_latency();
+    const auto vxmBridgeToMemLatency = [&](int64_t slice) {
+        return target_.transport_latency(
+            target::StreamEndpoint::VxmBridgeResult,
+            target::StreamEndpoint::Mem,
+            target::StreamDirection::East, slice);
+    };
     // E0/E1 carry the previous BF16 context block through the passive VXM
     // bridge. Feed the next probability block on a disjoint pair so PV can
     // keep issuing one MXM row per cycle while that result is replicated.
@@ -76,10 +82,10 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                 target::StreamEndpoint::Mem,
                 target::StreamDirection::West, slice);
             if (!localLatency) return -1;
-            const int64_t destinationGroup = slice
-                / target_.streams().mem_slices_per_register_group;
+            const auto bridgeLatency = vxmBridgeToMemLatency(slice);
+            if (!bridgeLatency) return -1;
             const int64_t remoteLatency =
-                mxmResultToVxmLatency + destinationGroup + 1;
+                mxmResultToVxmLatency + *bridgeLatency + 1;
             finalOutputHemisphereStagger = std::max(
                 finalOutputHemisphereStagger,
                 tile + std::abs(*localLatency - remoteLatency));
@@ -455,13 +461,12 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                         writeCycle = resultStart + *latency;
                                         packedStream = 32 + byte;
                                     } else {
-                                        const int64_t destinationGroup =
-                                            slice
-                                            / target_.streams()
-                                                  .mem_slices_per_register_group;
+                                        const auto bridgeLatency =
+                                            vxmBridgeToMemLatency(slice);
+                                        if (!bridgeLatency) return -1;
                                         writeCycle = resultStart
                                             + mxmResultToVxmLatency
-                                            + destinationGroup + 1;
+                                            + *bridgeLatency + 1;
                                         packedStream = byte;
                                     }
                                     const int64_t queue =
@@ -853,27 +858,18 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                             const int64_t destinationEnd = sourceLocalContext
                                 ? hemisphere + 1
                                 : target_.memory().hemispheres;
-                            const int64_t copyCount =
-                                sourceLocalContext ? 1 : 2;
                             for (int64_t destinationHemisphere =
                                      firstDestination;
                                  destinationHemisphere < destinationEnd;
                                  ++destinationHemisphere) {
-                                for (int64_t copy = 0; copy < copyCount;
-                                     ++copy) {
-                                    for (int64_t byte = 0; byte < 2; ++byte) {
-                                        const int64_t contextBlock =
-                                            copy * 2 + half;
+                                for (int64_t byte = 0; byte < 2; ++byte) {
+                                        const int64_t contextBlock = half;
                                         const int64_t slice =
                                             layout.contextSlice(
                                                 *head, contextBlock, byte);
                                         const bool local =
                                             destinationHemisphere
                                             == hemisphere;
-                                        const int64_t destinationGroup =
-                                            slice
-                                            / target_.streams()
-                                                  .mem_slices_per_register_group;
                                         int64_t writeCycle = 0;
                                         int64_t packedStream = 0;
                                         if (local) {
@@ -887,21 +883,25 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                             writeCycle = resultStart + *latency;
                                             packedStream = resultStream + byte;
                                         } else {
+                                            const auto bridgeLatency =
+                                                vxmBridgeToMemLatency(slice);
+                                            if (!bridgeLatency) return -1;
                                             writeCycle = resultStart
                                                 + mxmResultToVxmLatency
-                                                + destinationGroup + 1;
+                                                + *bridgeLatency + 1;
                                             packedStream = resultStream + byte
                                                 - target_.streams()
                                                       .streams_per_direction;
                                         }
-                                        // Local writes must preserve the W
-                                        // stream for the passive VXM bridge.
-                                        // On the remote E path, only the last
-                                        // physical copy consumes the stream.
+                                        // The local write preserves the W
+                                        // stream for the passive VXM bridge;
+                                        // the remote write consumes that same
+                                        // head-block result.  Replication is
+                                        // across hemispheres, not across
+                                        // logical context blocks.
                                         const bool preserveStream =
                                             !sourceLocalContext
-                                            && (local
-                                                || copy + 1 < copyCount);
+                                            && local;
                                         direct_domain_detail::emitMem3D(
                                             rewriter_, op_.getLoc(), target_,
                                             writeCycle,
@@ -921,7 +921,6 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                         lastContextWriteCycle = std::max(
                                             lastContextWriteCycle,
                                             writeCycle + tile - 1);
-                                    }
                                 }
                             }
                         }

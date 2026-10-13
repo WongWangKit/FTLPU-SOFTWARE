@@ -88,16 +88,15 @@ def main() -> None:
         raise AssertionError("Down weight binding is missing streaming page slots")
     page_banks = [int(value.strip()) for value in banks_match.group(1).split(",")]
     page_rows = [int(value.strip()) for value in rows_match.group(1).split(",")]
-    expected_banks = [
-        (args.weight_bank + page) % 2 for page in range(len(page_banks))
-    ]
-    if len(page_banks) != 8 or page_banks != expected_banks:
+    # Logical pages retain one output wave each even though all eight remain
+    # resident in disjoint row slots of the same physical bank.
+    if page_banks != [args.weight_bank] * 8:
         raise AssertionError(
-            f"Down tiles do not alternate reusable SRAM banks: {page_banks}"
+            f"Down tiles do not stay in one resident bank: {page_banks}"
         )
-    if page_rows != [0] * len(page_banks):
+    if page_rows != [page * 768 for page in range(8)]:
         raise AssertionError(
-            f"Down tiles do not reuse one row slot per bank: {page_rows}"
+            f"Down resident pages do not use disjoint rows: {page_rows}"
         )
 
     timelines: dict[str, tuple[int, int]] = {}

@@ -82,6 +82,8 @@ add_library(ftlpu_compiler
     src/Dialect/Tensor/Analysis/PhysicalMemoryAllocator.cpp
     src/Dialect/Tensor/Analysis/FfnWeightTilePlan.cpp
     src/Dialect/Tensor/Transforms/AttentionToTensor.cpp
+      src/Dialect/Tensor/Transforms/DepthwiseConv1DToTensor.cpp
+      src/Dialect/Tensor/Transforms/GatedDeltaRuleToTensor.cpp
     src/Dialect/Tensor/Transforms/FfnToTensor.cpp
     src/Dialect/Tensor/Transforms/KernelToTensorLowering.cpp
     src/Dialect/Tensor/Transforms/KernelToTensor.cpp
@@ -92,6 +94,8 @@ add_library(ftlpu_compiler
     src/Dialect/Stream/Analysis/StreamAllocator.cpp
     src/Dialect/Stream/Analysis/StreamRoutePlan.cpp
     src/Dialect/Stream/Transforms/AttentionToStream.cpp
+      src/Dialect/Stream/Transforms/DepthwiseConv1DToStream.cpp
+      src/Dialect/Stream/Transforms/GatedDeltaRuleToStream.cpp
     src/Dialect/Stream/Transforms/FfnToStream.cpp
     src/Dialect/Stream/Transforms/ElementwiseToStream.cpp
     src/Dialect/Stream/Transforms/MatmulToStream.cpp
@@ -145,7 +149,10 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Transforms/FfnSwishStageEmitter.cpp
     src/Dialect/Schedule/Transforms/FfnWeightLoadEmitter.cpp
     src/Dialect/Schedule/Transforms/ElementwiseScheduleEmitter.cpp
-    src/Dialect/Schedule/Transforms/LinearProjectionScheduleEmitter.cpp
+      src/Dialect/Schedule/Transforms/DepthwiseConv1DScheduleEmitter.cpp
+      src/Dialect/Schedule/Transforms/GatedDeltaRuleScheduleEmitter.cpp
+      src/Dialect/Schedule/Transforms/VectorAluScheduleEmitter.cpp
+      src/Dialect/Schedule/Transforms/LinearProjectionScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/MatmulScheduleEmitter.cpp
       src/Dialect/Schedule/Transforms/RmsNormScheduleEmitter.cpp
       src/Dialect/Schedule/Transforms/ScheduleCompression.cpp
@@ -301,6 +308,9 @@ add_test(NAME stream_route_plan_test COMMAND $<TARGET_FILE:stream_route_plan_tes
 add_executable(ffn_schedule_builders_test tests/ffn_schedule_builders_test.cpp)
 target_link_libraries(ffn_schedule_builders_test PRIVATE ftlpu_compiler)
 add_test(NAME ffn_schedule_builders_test COMMAND $<TARGET_FILE:ffn_schedule_builders_test>)
+add_executable(elementwise_vxm_sr_direction_test tests/elementwise_vxm_sr_direction_test.cpp)
+target_link_libraries(elementwise_vxm_sr_direction_test PRIVATE ftlpu_compiler)
+add_test(NAME elementwise_vxm_sr_direction_test COMMAND $<TARGET_FILE:elementwise_vxm_sr_direction_test>)
 add_executable(ffn_up_3d_lowering_test tests/ffn_up_3d_lowering_test.cpp)
 target_link_libraries(ffn_up_3d_lowering_test PRIVATE ftlpu_compiler)
 add_test(NAME ffn_up_3d_lowering_test COMMAND $<TARGET_FILE:ffn_up_3d_lowering_test>)
@@ -362,6 +372,33 @@ if(Python3_Interpreter_FOUND)
         COMMAND
             ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_0_6b_importer_test.py)
+    add_test(
+        NAME qwen3_5_gated_deltanet_reference_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_5_gated_deltanet_reference_test.py)
+    add_test(
+        NAME qwen3_5_importer_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_5_importer_test.py)
+    add_test(
+        NAME qwen3_moe_importer_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_moe_importer_test.py)
+    add_test(
+        NAME dense_decoder_family_importer_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/dense_decoder_family_importer_test.py)
+    add_test(
+        NAME dense_attention_ping_pong_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/dense_attention_ping_pong_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --target-config ${FTLPU_HARDWARE_CONFIG})
     add_test(
         NAME build_hf_decoder_stack_paging_test
         COMMAND
@@ -544,6 +581,15 @@ if(Python3_Interpreter_FOUND)
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/w8a16_ffn_mtile_weight_reuse/ffn.schedule.mlir
             --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json)
     add_test(
+        NAME vxm_sr_ffn_binary_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/vxm_sr_ffn_binary_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runtime-test $<TARGET_FILE:compiled_vxm_sr_ffn_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64_bf16.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/vxm_sr_ffn
+            --target-config ${FTLPU_HARDWARE_CONFIG})
+    add_test(
         NAME smollm2_135m_ffn_binary_cmodel_runtime_test
         COMMAND
             ${Python3_EXECUTABLE}
@@ -554,6 +600,20 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_ffn/ffn.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/smollm2_135m_ffn_binary_runtime
             --target-config ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/cmodel_legacy_mxm.json)
+    add_test(
+        NAME qwen3_moe_expert_ffn_seq32_cmodel_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_135m_ffn_binary_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --runtime-test $<TARGET_FILE:compiled_qwen3_moe_expert_ffn_seq32_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen3_moe_30b_a3b/expert_ffn_seq32.stablehlo.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen3_moe_expert_ffn_seq32
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --mxm-execution vector)
+    set_tests_properties(qwen3_moe_expert_ffn_seq32_cmodel_test
+        PROPERTIES TIMEOUT 900)
     add_test(
         NAME smollm2_135m_ffn_vector_macro_binary_cmodel_runtime_test
         COMMAND
@@ -686,6 +746,56 @@ if(Python3_Interpreter_FOUND)
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/stablehlo_matmul_320_to_ftlpu_kernel/matmul_320.kernel.mlir)
+      add_test(
+          NAME depthwise_conv1d_direct_lowering_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/depthwise_conv1d_direct_lowering_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/depthwise_conv1d_kernel4.kernel.mlir
+              --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/depthwise_conv1d_direct)
+    add_test(
+        NAME depthwise_conv1d_binary_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/depthwise_conv1d_binary_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runtime-test $<TARGET_FILE:compiled_depthwise_conv1d_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/depthwise_conv1d_kernel4.kernel.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/depthwise_conv1d_runtime)
+      add_test(
+          NAME gated_delta_rule_ir_lowering_test
+          COMMAND
+              ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/gated_delta_rule_ir_lowering_test.py
+              --tool $<TARGET_FILE:ftlpu_opt>
+              --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/gated_delta_rule.kernel.mlir
+              --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gated_delta_rule)
+        add_test(NAME qwen3_5_compiled_decoder_layer_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_5_compiled_decoder_layer_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen3_5_compiled_decoder_layer)
+        add_test(NAME resident_layout_bridge_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/resident_layout_bridge_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/resident_layout_bridge)
+        add_test(NAME qwen3_5_resident_decoder_layer_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_5_resident_decoder_layer_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen3_5_resident_decoder_layer)
+        add_test(NAME vector_alu_binary_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/vector_alu_binary_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/vector_alu_binary_runtime)
     add_test(
         NAME stablehlo_matmul_320_to_ftlpu_tensor_mlir_test
         COMMAND

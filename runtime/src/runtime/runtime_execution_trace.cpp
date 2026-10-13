@@ -376,15 +376,15 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
                 const auto* packet = last_issued(queue);
                 if (packet == nullptr) break;
                 const auto decoded =
-                    VxmCompactInstructionCodec::decode(ref.index, *packet);
+                    VxmSrCompactInstructionCodec::decode(*packet);
                 std::ostringstream detail;
                 detail << VxmLane::operation_name(
-                              decoded.instruction.operation)
-                       << " depth="
-                       << static_cast<std::size_t>(decoded.chain_depth);
+                              decoded.operation)
+                       << " result_sr="
+                       << static_cast<std::size_t>(decoded.result_sr);
                 record("VXM.C" + std::to_string(ref.index),
                     with_issue_pc(detail.str(), queue),
-                    decoded.instruction.repeat_count);
+                    decoded.repeat_count);
                 break;
             }
             case QueueKind::SxmTranspose:

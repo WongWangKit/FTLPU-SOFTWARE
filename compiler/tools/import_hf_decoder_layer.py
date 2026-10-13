@@ -1,14 +1,58 @@
 #!/usr/bin/env python3
-"""Imports one Llama/Qwen2/Qwen3 Hugging Face decoder layer without PyTorch."""
+"""Imports one supported Hugging Face decoder layer without PyTorch."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import struct
 from pathlib import Path
 
 import numpy as np
+
+
+SUPPORTED_MODEL_TYPES = {
+    "llama",
+    "qwen2",
+    "qwen3",
+    "qwen3_moe",
+    "ministral3",
+    "phi3",
+    "smollm3",
+    "minicpm",
+    "glm",
+}
+
+
+def decoder_config(root_config: dict[str, object]) -> dict[str, object]:
+    """Returns the text decoder config from a text or multimodal wrapper."""
+    if root_config.get("model_type") is None:
+        architectures = root_config.get("architectures", [])
+        if any(str(name).startswith("MiniCPM") for name in architectures):
+            config = dict(root_config)
+            config["model_type"] = "minicpm"
+            return config
+    if root_config.get("model_type") != "mistral3":
+        return root_config
+    nested = root_config.get("text_config")
+    if not isinstance(nested, dict):
+        raise ValueError("Mistral3 config is missing text_config")
+    config = dict(nested)
+    config.setdefault("model_type", "ministral3")
+    return config
+
+
+def checkpoint_prefixes(
+    root_config: dict[str, object], layer: int
+) -> tuple[str, str]:
+    """Returns decoder-layer and embedding prefixes used by HF checkpoints."""
+    if root_config.get("model_type") == "mistral3":
+        return (
+            f"language_model.model.layers.{layer}",
+            "language_model.model.embed_tokens.weight",
+        )
+    return f"model.layers.{layer}", "model.embed_tokens.weight"
 
 
 class SafeTensorFile:
@@ -68,6 +112,9 @@ class SafeTensorStore:
             raise KeyError(f"checkpoint tensor is missing: {name}")
         return self.readers[filename].read(name)
 
+    def contains(self, name: str) -> bool:
+        return name in self.weight_map
+
 
 def quantize_linear(weight: np.ndarray) -> tuple[np.ndarray, float]:
     # Hugging Face stores Linear weights as [out, in]; StableHLO consumes [in, out].
@@ -75,6 +122,19 @@ def quantize_linear(weight: np.ndarray) -> tuple[np.ndarray, float]:
     scale = maximum / 127.0 if maximum else 1.0
     quantized = np.clip(np.rint(weight / scale), -127, 127).astype(np.int8)
     return np.ascontiguousarray(quantized.T), scale
+
+
+def quantize_expert_linear(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Quantizes stacked HF expert weights with one scale per expert."""
+    if weight.ndim != 3:
+        raise ValueError("stacked expert weight must have shape [experts, out, in]")
+    quantized = []
+    scales = []
+    for expert in weight:
+        packed, scale = quantize_linear(expert)
+        quantized.append(packed)
+        scales.append(scale)
+    return np.ascontiguousarray(np.stack(quantized)), np.asarray(scales, dtype=np.float32)
 
 
 def bf16_bits(value: np.ndarray) -> np.ndarray:
@@ -153,6 +213,142 @@ def attention_head_dim(config: dict[str, object]) -> int:
     return head_dim
 
 
+def layer_uses_rope(config: dict[str, object], layer: int) -> bool:
+    if config.get("model_type") != "smollm3":
+        return True
+    flags = config.get("no_rope_layers")
+    if not isinstance(flags, list) or layer >= len(flags):
+        raise ValueError("SmolLM3 config is missing the per-layer RoPE map")
+    # This field has a historical inverted name. Transformers assigns it
+    # directly to Attention.use_rope: 1 means apply RoPE, 0 means NoPE.
+    return bool(flags[layer])
+
+
+def residual_scale(config: dict[str, object]) -> float:
+    if config.get("model_type") != "minicpm":
+        return 1.0
+    layers = int(config["num_hidden_layers"])
+    return float(config["scale_depth"]) / math.sqrt(layers)
+
+
+def rope_theta_value(config: dict[str, object]) -> float:
+    params = config.get("rope_parameters") or config.get("rope_scaling") or {}
+    return float(config.get("rope_theta", params.get("rope_theta", 10_000.0)))
+
+
+def rope_parameters(
+    config: dict[str, object], seq_len: int
+) -> tuple[np.ndarray, float, int]:
+    """Returns inverse frequencies, cos/sin scale, and rotary width."""
+    head_dim = attention_head_dim(config)
+    partial = float(config.get("partial_rotary_factor", 1.0))
+    rotary_dim = int(head_dim * partial)
+    if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2:
+        raise ValueError("rotary dimension must be positive, even, and <= head_dim")
+
+    params_value = config.get("rope_parameters", config.get("rope_scaling"))
+    params = dict(params_value) if isinstance(params_value, dict) else {}
+    rope_type = str(params.get("rope_type", params.get("type", "default")))
+    base = float(params.get("rope_theta", config.get("rope_theta", 10_000.0)))
+    exponent = np.arange(0, rotary_dim, 2, dtype=np.float32) / np.float32(rotary_dim)
+    base_frequency = np.power(np.float32(base), exponent)
+    attention_factor = 1.0
+
+    if rope_type == "longrope":
+        original = int(params.get(
+            "original_max_position_embeddings",
+            config.get("original_max_position_embeddings", config["max_position_embeddings"]),
+        ))
+        factors = params["long_factor"] if seq_len > original else params["short_factor"]
+        ext = np.asarray(factors, dtype=np.float32)
+        if ext.shape != (rotary_dim // 2,):
+            raise ValueError(
+                f"LongRoPE factor must have shape {(rotary_dim // 2,)}, got {ext.shape}"
+            )
+        factor = float(params.get(
+            "factor", float(config["max_position_embeddings"]) / original
+        ))
+        attention_factor = float(params.get(
+            "attention_factor",
+            1.0 if factor <= 1.0 else math.sqrt(
+                1.0 + math.log(factor) / math.log(original)
+            ),
+        ))
+        inverse = 1.0 / (ext * base_frequency)
+    elif rope_type == "yarn":
+        factor = float(params["factor"])
+        original = int(params["original_max_position_embeddings"])
+        interpolation = 1.0 / (factor * base_frequency)
+        extrapolation = 1.0 / base_frequency
+        beta_fast = float(params.get("beta_fast", 32.0))
+        beta_slow = float(params.get("beta_slow", 1.0))
+
+        def correction(rotations: float) -> float:
+            return (
+                rotary_dim
+                * math.log(original / (rotations * 2.0 * math.pi))
+                / (2.0 * math.log(base))
+            )
+
+        low = max(math.floor(correction(beta_fast)), 0)
+        high = min(math.ceil(correction(beta_slow)), rotary_dim - 1)
+        if low == high:
+            high += 0.001
+        ramp = np.clip(
+            (np.arange(rotary_dim // 2, dtype=np.float32) - low)
+            / (high - low),
+            0.0,
+            1.0,
+        )
+        extrapolation_weight = 1.0 - ramp
+        inverse = (
+            interpolation * (1.0 - extrapolation_weight)
+            + extrapolation * extrapolation_weight
+        )
+        if "attention_factor" in params:
+            attention_factor = float(params["attention_factor"])
+        elif params.get("mscale") and params.get("mscale_all_dim"):
+            def mscale(scale: float, multiplier: float) -> float:
+                return 1.0 if scale <= 1.0 else (
+                    0.1 * multiplier * math.log(scale) + 1.0
+                )
+            attention_factor = (
+                mscale(factor, float(params["mscale"]))
+                / mscale(factor, float(params["mscale_all_dim"]))
+            )
+        else:
+            attention_factor = (
+                1.0 if factor <= 1.0 else 0.1 * math.log(factor) + 1.0
+            )
+    elif rope_type == "llama3":
+        inverse = 1.0 / base_frequency
+        factor = float(params["factor"])
+        low_factor = float(params["low_freq_factor"])
+        high_factor = float(params["high_freq_factor"])
+        original = float(params["original_max_position_embeddings"])
+        wavelength = 2.0 * math.pi / inverse
+        low_wavelength = original / low_factor
+        high_wavelength = original / high_factor
+        scaled = np.where(wavelength > low_wavelength, inverse / factor, inverse)
+        smooth = (
+            (original / wavelength - low_factor)
+            / (high_factor - low_factor)
+        )
+        smoothed = (1.0 - smooth) * scaled / factor + smooth * scaled
+        medium = (wavelength >= high_wavelength) & (wavelength <= low_wavelength)
+        inverse = np.where(medium, smoothed, scaled)
+    elif rope_type in ("default", "none"):
+        # Preserve the original reference's float32 evaluation order. Cache
+        # append tests compare this path bit-for-bit with prefill.
+        inverse = base ** (
+            -np.arange(rotary_dim // 2, dtype=np.float32)
+            * 2.0 / rotary_dim
+        )
+    else:
+        raise ValueError(f"unsupported RoPE type {rope_type}")
+    return np.asarray(inverse, dtype=np.float32), attention_factor, rotary_dim
+
+
 def head_rms_norm(
     value: np.ndarray, weight: np.ndarray, epsilon: float
 ) -> np.ndarray:
@@ -192,22 +388,46 @@ def biased_linear(
 
 
 def rope_at_positions(
-    value: np.ndarray, positions: np.ndarray, theta: float
+    value: np.ndarray,
+    positions: np.ndarray,
+    theta: float,
+    *,
+    inverse_frequencies: np.ndarray | None = None,
+    attention_factor: float = 1.0,
+    rotary_dim: int | None = None,
+    use_rope: bool = True,
 ) -> np.ndarray:
     seq_len, _, head_dim = value.shape
     positions = np.asarray(positions, dtype=np.float32)
     if positions.shape != (seq_len,):
         raise ValueError("RoPE positions must have one entry per token")
-    half = head_dim // 2
-    inverse = theta ** (-np.arange(half, dtype=np.float32) * 2.0 / head_dim)
+    if not use_rope:
+        return value
+    rotary_dim = head_dim if rotary_dim is None else rotary_dim
+    if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2:
+        raise ValueError("invalid partial RoPE width")
+    half = rotary_dim // 2
+    inverse = (
+        theta ** (-np.arange(half, dtype=np.float32) * 2.0 / rotary_dim)
+        if inverse_frequencies is None
+        else np.asarray(inverse_frequencies, dtype=np.float32)
+    )
+    if inverse.shape != (half,):
+        raise ValueError(
+            f"RoPE inverse frequencies must have shape {(half,)}, got {inverse.shape}"
+        )
     angle = positions[:, None] * inverse[None, :]
-    cosine = bf16(np.cos(angle))[:, None, :]
-    sine = bf16(np.sin(angle))[:, None, :]
-    low = value[:, :, :half]
-    high = value[:, :, half:]
-    return bf16(np.concatenate(
+    cosine = bf16(np.cos(angle) * attention_factor)[:, None, :]
+    sine = bf16(np.sin(angle) * attention_factor)[:, None, :]
+    rotated = value[:, :, :rotary_dim]
+    low = rotated[:, :, :half]
+    high = rotated[:, :, half:]
+    result = bf16(np.concatenate(
         (low * cosine - high * sine, high * cosine + low * sine), axis=-1
     ))
+    if rotary_dim != head_dim:
+        result = np.concatenate((result, value[:, :, rotary_dim:]), axis=-1)
+    return result
 
 
 def rope(value: np.ndarray, theta: float) -> np.ndarray:
@@ -267,17 +487,50 @@ def normalized_rope_linear_at_positions(
     positions: np.ndarray,
     norm_weight: np.ndarray | None = None,
     epsilon: float = 1.0e-6,
+    inverse_frequencies: np.ndarray | None = None,
+    attention_factor: float = 1.0,
+    rotary_dim: int | None = None,
+    use_rope: bool = True,
 ) -> np.ndarray:
     """Projects Q/K, applies optional per-head RMSNorm, and then RoPE."""
-    if norm_weight is None:
+    projected_head_dim = weight.shape[1] // heads
+    full_rotary_dim = (
+        projected_head_dim if rotary_dim is None else rotary_dim
+    )
+    default_inverse = theta ** (
+        -np.arange(projected_head_dim // 2, dtype=np.float32)
+        * 2.0 / projected_head_dim
+    )
+    uses_default_rope = (
+        use_rope
+        and full_rotary_dim == projected_head_dim
+        and attention_factor == 1.0
+        and (
+            inverse_frequencies is None
+            or np.array_equal(inverse_frequencies, default_inverse)
+        )
+    )
+    if (
+        norm_weight is None
+        and uses_default_rope
+    ):
         return biased_rope_linear_at_positions(
             value, weight, scale, bias, heads, theta, positions
         )
     projection = biased_linear(value, weight, scale, bias).reshape(
         value.shape[0], heads, -1
     )
-    projection = head_rms_norm(projection, norm_weight, epsilon)
-    return rope_at_positions(projection, positions, theta)
+    if norm_weight is not None:
+        projection = head_rms_norm(projection, norm_weight, epsilon)
+    return rope_at_positions(
+        projection,
+        positions,
+        theta,
+        inverse_frequencies=inverse_frequencies,
+        attention_factor=attention_factor,
+        rotary_dim=rotary_dim,
+        use_rope=use_rope,
+    )
 
 
 def biased_rope_linear(
@@ -392,6 +645,7 @@ def decoder_layer_prefill_kv_reference(
     config: dict[str, object],
     biases: dict[str, np.ndarray] | None = None,
     qk_norms: dict[str, np.ndarray] | None = None,
+    layer: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     if activation.ndim != 2:
         raise ValueError("prefill activation must have shape [tokens, hidden]")
@@ -408,6 +662,8 @@ def decoder_layer_prefill_kv_reference(
     epsilon = float(config["rms_norm_eps"])
     biases = biases or {}
     qk_norms = qk_norms or {}
+    inverse, rope_scale, rotary_dim = rope_parameters(config, seq_len)
+    use_rope = layer_uses_rope(config, layer)
 
     normalized = rms_norm(activation, norm0, epsilon)
     positions = np.arange(seq_len, dtype=np.float32)
@@ -417,10 +673,14 @@ def decoder_layer_prefill_kv_reference(
         scales["key"],
         biases.get("key"),
         kv_heads,
-        float(config["rope_theta"]),
+        rope_theta_value(config),
         positions,
         qk_norms.get("key"),
         epsilon,
+        inverse,
+        rope_scale,
+        rotary_dim,
+        use_rope,
     )
     value = biased_linear(
         normalized,
@@ -444,6 +704,7 @@ def decoder_layer_decode_reference(
     biases: dict[str, np.ndarray] | None = None,
     stage_outputs: dict[str, np.ndarray] | None = None,
     qk_norms: dict[str, np.ndarray] | None = None,
+    layer: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if activation.ndim != 2 or activation.shape[0] != 1:
         raise ValueError("decode activation must have shape [1, hidden]")
@@ -467,6 +728,8 @@ def decoder_layer_decode_reference(
     qk_norms = qk_norms or {}
     epsilon = float(config["rms_norm_eps"])
     positions = np.asarray([position], dtype=np.float32)
+    inverse, rope_scale, rotary_dim = rope_parameters(config, position + 1)
+    use_rope = layer_uses_rope(config, layer)
 
     normalized = rms_norm(activation, norm0, epsilon)
     query = normalized_rope_linear_at_positions(
@@ -475,10 +738,14 @@ def decoder_layer_decode_reference(
         scales["query"],
         biases.get("query"),
         query_heads,
-        float(config["rope_theta"]),
+        rope_theta_value(config),
         positions,
         qk_norms.get("query"),
         epsilon,
+        inverse,
+        rope_scale,
+        rotary_dim,
+        use_rope,
     )
     new_key = normalized_rope_linear_at_positions(
         normalized,
@@ -486,10 +753,14 @@ def decoder_layer_decode_reference(
         scales["key"],
         biases.get("key"),
         kv_heads,
-        float(config["rope_theta"]),
+        rope_theta_value(config),
         positions,
         qk_norms.get("key"),
         epsilon,
+        inverse,
+        rope_scale,
+        rotary_dim,
+        use_rope,
     )
     new_value = biased_linear(
         normalized,
@@ -518,13 +789,14 @@ def decoder_layer_decode_reference(
     attention = linear(
         context, weights["output"], scales["output"], bf16_scale=True
     )
-    residual = bf16(activation + attention)
+    depth_scale = residual_scale(config)
+    residual = bf16(activation + bf16(attention * depth_scale))
     normalized_ffn = rms_norm(residual, norm1, epsilon)
     gate = linear(normalized_ffn, weights["gate"], scales["gate"], True)
     up = linear(normalized_ffn, weights["up"], scales["up"], True)
     swiglu = bf16((gate / (1.0 + np.exp(-gate))) * up)
     down = linear(swiglu, weights["down"], scales["down"], True)
-    output = bf16(residual + down)
+    output = bf16(residual + bf16(down * depth_scale))
 
     if stage_outputs is not None:
         stage_outputs["normalized"] = normalized
@@ -542,6 +814,73 @@ def decoder_layer_decode_reference(
     return output, present_key, present_value
 
 
+def qwen3_moe_reference(
+    value: np.ndarray,
+    weights: dict[str, np.ndarray],
+    scales: dict[str, object],
+    config: dict[str, object],
+    routing_outputs: dict[str, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Runs the quantized Qwen3 MoE router, experts, and weighted combine."""
+    expert_count = int(config["num_experts"])
+    top_k = int(config["num_experts_per_tok"])
+    if top_k <= 0 or top_k > expert_count:
+        raise ValueError("num_experts_per_tok must be in [1, num_experts]")
+    router_logits = linear(
+        value, weights["router"], float(scales["router"]), True
+    )
+    shifted = router_logits.astype(np.float32) - np.max(
+        router_logits, axis=-1, keepdims=True
+    )
+    probability = np.exp(shifted, dtype=np.float32)
+    probability /= np.sum(probability, axis=-1, keepdims=True, dtype=np.float32)
+    # A stable order gives deterministic behavior for synthetic equal-logit
+    # tests. Real checkpoints almost never contain exact routing ties.
+    selected = np.argsort(-probability, axis=-1, kind="stable")[:, :top_k]
+    routing_weights = np.take_along_axis(probability, selected, axis=-1)
+    if bool(config.get("norm_topk_prob", False)):
+        routing_weights /= np.sum(
+            routing_weights, axis=-1, keepdims=True, dtype=np.float32
+        )
+    routing_weights = bf16(routing_weights)
+
+    expert_scales = {
+        role: np.asarray(scales[role], dtype=np.float32)
+        for role in ("expert_gate", "expert_up", "expert_down")
+    }
+    result = np.zeros_like(value, dtype=np.float32)
+    for expert in range(expert_count):
+        token_index, slot_index = np.where(selected == expert)
+        if token_index.size == 0:
+            continue
+        expert_input = value[token_index]
+        gate = linear(
+            expert_input, weights["expert_gate"][expert],
+            float(expert_scales["expert_gate"][expert]), True,
+        )
+        up = linear(
+            expert_input, weights["expert_up"][expert],
+            float(expert_scales["expert_up"][expert]), True,
+        )
+        hidden = bf16((gate / (1.0 + np.exp(-gate))) * up)
+        output = linear(
+            hidden, weights["expert_down"][expert],
+            float(expert_scales["expert_down"][expert]), True,
+        )
+        contribution = bf16(
+            output * routing_weights[token_index, slot_index, None]
+        )
+        np.add.at(result, token_index, contribution)
+    result = bf16(result)
+    if routing_outputs is not None:
+        routing_outputs["logits"] = router_logits
+        routing_outputs["indices"] = selected.astype(np.int32)
+        routing_outputs["weights"] = routing_weights
+        counts = np.bincount(selected.reshape(-1), minlength=expert_count)
+        routing_outputs["expert_counts"] = counts.astype(np.int32)
+    return result
+
+
 def decoder_layer_reference(
     activation: np.ndarray,
     norm0: np.ndarray,
@@ -552,6 +891,8 @@ def decoder_layer_reference(
     biases: dict[str, np.ndarray] | None = None,
     stage_outputs: dict[str, np.ndarray] | None = None,
     qk_norms: dict[str, np.ndarray] | None = None,
+    layer: int = 0,
+    routing_outputs: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     seq_len, hidden = activation.shape
     query_heads = int(config["num_attention_heads"])
@@ -566,17 +907,21 @@ def decoder_layer_reference(
     biases = biases or {}
     qk_norms = qk_norms or {}
     positions = np.arange(seq_len, dtype=np.float32)
+    inverse, rope_scale, rotary_dim = rope_parameters(config, seq_len)
+    use_rope = layer_uses_rope(config, layer)
     query = normalized_rope_linear_at_positions(
         normalized, weights["query"], scales["query"],
         biases.get("query"), query_heads,
-        float(config["rope_theta"]), positions,
+        rope_theta_value(config), positions,
         qk_norms.get("query"), epsilon,
+        inverse, rope_scale, rotary_dim, use_rope,
     )
     key = normalized_rope_linear_at_positions(
         normalized, weights["key"], scales["key"],
         biases.get("key"), kv_heads,
-        float(config["rope_theta"]), positions,
+        rope_theta_value(config), positions,
         qk_norms.get("key"), epsilon,
+        inverse, rope_scale, rotary_dim, use_rope,
     )
     value = biased_linear(normalized, weights["value"], scales["value"],
                           biases.get("value")).reshape(
@@ -594,6 +939,9 @@ def decoder_layer_reference(
     value = np.transpose(value, (1, 0, 2))
     scores = bf16(query @ np.transpose(key, (0, 2, 1)))
     probability = lpu_softmax(scores, head_dim)
+    if stage_outputs is not None:
+        stage_outputs["scores"] = scores
+        stage_outputs["probability"] = probability
     context = bf16(
         np.transpose(probability @ value, (1, 0, 2)).reshape(
             seq_len, query_width
@@ -602,7 +950,8 @@ def decoder_layer_reference(
     attention = linear(
         context, weights["output"], scales["output"], bf16_scale=True
     )
-    residual = bf16(activation + attention)
+    depth_scale = residual_scale(config)
+    residual = bf16(activation + bf16(attention * depth_scale))
     if stage_outputs is not None:
         stage_outputs["context"] = bf16(context)
         stage_outputs["attention"] = attention
@@ -614,14 +963,123 @@ def decoder_layer_reference(
     # Vector FFN uses the MXM local INT8 dequant instruction, whose immediate
     # scale is encoded as BF16. Attention retains its existing projection
     # reference semantics until that lowering uses the same local path.
-    gate = linear(normalized, weights["gate"], scales["gate"], True)
-    up = linear(normalized, weights["up"], scales["up"], True)
-    swiglu = bf16((gate / (1.0 + np.exp(-gate))) * up)
-    down = linear(swiglu, weights["down"], scales["down"], True)
-    if stage_outputs is not None:
-        stage_outputs["swiglu"] = swiglu
-        stage_outputs["down"] = down
-    return bf16(residual + down)
+    if config.get("model_type") == "qwen3_moe":
+        down = qwen3_moe_reference(
+            normalized, weights, scales, config, routing_outputs
+        )
+        if stage_outputs is not None:
+            stage_outputs["moe"] = down
+            stage_outputs["down"] = down
+    else:
+        gate = linear(normalized, weights["gate"], scales["gate"], True)
+        up = linear(normalized, weights["up"], scales["up"], True)
+        swiglu = bf16((gate / (1.0 + np.exp(-gate))) * up)
+        down = linear(swiglu, weights["down"], scales["down"], True)
+        if stage_outputs is not None:
+            stage_outputs["swiglu"] = swiglu
+            stage_outputs["down"] = down
+    return bf16(residual + bf16(down * depth_scale))
+
+
+def load_decoder_weights(
+    store: SafeTensorStore,
+    prefix: str,
+    config: dict[str, object],
+) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+    """Reads HF linear tensors and expands supported fused layouts."""
+    model_type = str(config["model_type"])
+    hidden = int(config["hidden_size"])
+    query_width = int(config["num_attention_heads"]) * attention_head_dim(config)
+    kv_width = int(config["num_key_value_heads"]) * attention_head_dim(config)
+    intermediate = int(config["intermediate_size"])
+    source_names: dict[str, str] = {}
+    weights: dict[str, np.ndarray] = {}
+
+    if model_type == "phi3":
+        qkv_name = f"{prefix}.self_attn.qkv_proj.weight"
+        qkv = store.read(qkv_name)
+        expected = (query_width + 2 * kv_width, hidden)
+        if qkv.shape != expected:
+            raise ValueError(f"fused QKV weight must have shape {expected}, got {qkv.shape}")
+        query_end = query_width
+        key_end = query_end + kv_width
+        weights["query"] = qkv[:query_end]
+        weights["key"] = qkv[query_end:key_end]
+        weights["value"] = qkv[key_end:]
+        source_names.update({role: qkv_name for role in ("query", "key", "value")})
+    else:
+        for role, stem in (("query", "q_proj"), ("key", "k_proj"),
+                           ("value", "v_proj")):
+            name = f"{prefix}.self_attn.{stem}.weight"
+            weights[role] = store.read(name)
+            source_names[role] = name
+
+    output_name = f"{prefix}.self_attn.o_proj.weight"
+    weights["output"] = store.read(output_name)
+    source_names["output"] = output_name
+
+    if model_type == "qwen3_moe":
+        expert_count = int(config["num_experts"])
+        moe_intermediate = int(config["moe_intermediate_size"])
+        router_name = f"{prefix}.mlp.gate.weight"
+        weights["router"] = store.read(router_name)
+        source_names["router"] = router_name
+
+        def first_tensor(*names: str) -> tuple[np.ndarray, str]:
+            for name in names:
+                if store.contains(name):
+                    return store.read(name), name
+            raise KeyError("checkpoint tensor is missing: " + " or ".join(names))
+
+        gate_up, gate_up_name = first_tensor(
+            f"{prefix}.mlp.experts.gate_up_proj",
+            f"{prefix}.mlp.experts.gate_up_proj.weight",
+        )
+        down, expert_down_name = first_tensor(
+            f"{prefix}.mlp.experts.down_proj",
+            f"{prefix}.mlp.experts.down_proj.weight",
+        )
+        expected_gate_up = (expert_count, 2 * moe_intermediate, hidden)
+        expected_down = (expert_count, hidden, moe_intermediate)
+        if gate_up.shape != expected_gate_up:
+            raise ValueError(
+                f"stacked expert Gate/Up weight must have shape {expected_gate_up}, "
+                f"got {gate_up.shape}"
+            )
+        if down.shape != expected_down:
+            raise ValueError(
+                f"stacked expert Down weight must have shape {expected_down}, "
+                f"got {down.shape}"
+            )
+        weights["expert_gate"] = gate_up[:, :moe_intermediate, :]
+        weights["expert_up"] = gate_up[:, moe_intermediate:, :]
+        weights["expert_down"] = down
+        source_names.update({
+            "expert_gate": gate_up_name,
+            "expert_up": gate_up_name,
+            "expert_down": expert_down_name,
+        })
+    elif model_type in ("phi3", "glm"):
+        gate_up_name = f"{prefix}.mlp.gate_up_proj.weight"
+        gate_up = store.read(gate_up_name)
+        expected = (2 * intermediate, hidden)
+        if gate_up.shape != expected:
+            raise ValueError(
+                f"fused Gate/Up weight must have shape {expected}, got {gate_up.shape}"
+            )
+        weights["gate"] = gate_up[:intermediate]
+        weights["up"] = gate_up[intermediate:]
+        source_names.update({"gate": gate_up_name, "up": gate_up_name})
+    else:
+        for role in ("gate", "up"):
+            name = f"{prefix}.mlp.{role}_proj.weight"
+            weights[role] = store.read(name)
+            source_names[role] = name
+    if model_type != "qwen3_moe":
+        down_name = f"{prefix}.mlp.down_proj.weight"
+        weights["down"] = store.read(down_name)
+        source_names["down"] = down_name
+    return weights, source_names
 
 
 def main() -> None:
@@ -644,31 +1102,31 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = json.loads(
+    root_config = json.loads(
         (args.model_dir / "config.json").read_text(encoding="utf-8")
     )
-    if config.get("model_type") not in ("llama", "qwen2", "qwen3"):
+    config = decoder_config(root_config)
+    if config.get("model_type") not in SUPPORTED_MODEL_TYPES:
         raise ValueError(
-            "only standard Llama, Qwen2, and dense Qwen3 checkpoints are supported"
+            "unsupported dense decoder model_type "
+            f"{config.get('model_type')!r}; supported: "
+            f"{', '.join(sorted(SUPPORTED_MODEL_TYPES))}"
         )
+    if config.get("hidden_act", "silu") not in ("silu", "swish"):
+        raise ValueError("current LPU dense decoder requires a SiLU-gated MLP")
     if args.seq_len % 32:
         raise ValueError("current LPU decoder executable requires seq_len divisible by 32")
 
     store = SafeTensorStore(args.model_dir)
-    prefix = f"model.layers.{args.layer}"
-    names = {
-        "query": f"{prefix}.self_attn.q_proj.weight",
-        "key": f"{prefix}.self_attn.k_proj.weight",
-        "value": f"{prefix}.self_attn.v_proj.weight",
-        "output": f"{prefix}.self_attn.o_proj.weight",
-        "gate": f"{prefix}.mlp.gate_proj.weight",
-        "up": f"{prefix}.mlp.up_proj.weight",
-        "down": f"{prefix}.mlp.down_proj.weight",
-    }
+    prefix, embedding_name = checkpoint_prefixes(root_config, args.layer)
+    source_weights, names = load_decoder_weights(store, prefix, config)
     quantized: dict[str, np.ndarray] = {}
-    scales: dict[str, float] = {}
-    for role, name in names.items():
-        quantized[role], scales[role] = quantize_linear(store.read(name))
+    scales: dict[str, object] = {}
+    for role, value in source_weights.items():
+        if role.startswith("expert_"):
+            quantized[role], scales[role] = quantize_expert_linear(value)
+        else:
+            quantized[role], scales[role] = quantize_linear(value)
 
     source_has_attention_bias = config.get(
         "attention_bias", config.get("model_type") == "qwen2"
@@ -690,10 +1148,25 @@ def main() -> None:
         "key": (hidden, kv_width),
         "value": (hidden, kv_width),
         "output": (query_width, hidden),
-        "gate": (hidden, int(config["intermediate_size"])),
-        "up": (hidden, int(config["intermediate_size"])),
-        "down": (int(config["intermediate_size"]), hidden),
     }
+    if config.get("model_type") == "qwen3_moe":
+        experts = int(config["num_experts"])
+        top_k = int(config["num_experts_per_tok"])
+        moe_intermediate = int(config["moe_intermediate_size"])
+        if top_k <= 0 or top_k > experts:
+            raise ValueError("Qwen3 MoE top-k must be in [1, num_experts]")
+        expected_weight_shapes.update({
+            "router": (hidden, experts),
+            "expert_gate": (experts, hidden, moe_intermediate),
+            "expert_up": (experts, hidden, moe_intermediate),
+            "expert_down": (experts, moe_intermediate, hidden),
+        })
+    else:
+        expected_weight_shapes.update({
+            "gate": (hidden, int(config["intermediate_size"])),
+            "up": (hidden, int(config["intermediate_size"])),
+            "down": (int(config["intermediate_size"]), hidden),
+        })
     for role, expected in expected_weight_shapes.items():
         if quantized[role].shape != expected:
             raise ValueError(
@@ -707,7 +1180,7 @@ def main() -> None:
     }
 
     qk_norms: dict[str, np.ndarray] = {}
-    if config.get("model_type") == "qwen3":
+    if config.get("model_type") in ("qwen3", "qwen3_moe"):
         qk_norms = {
             "query": store.read(f"{prefix}.self_attn.q_norm.weight"),
             "key": store.read(f"{prefix}.self_attn.k_norm.weight"),
@@ -721,7 +1194,7 @@ def main() -> None:
 
     norm0 = store.read(f"{prefix}.input_layernorm.weight")
     norm1 = store.read(f"{prefix}.post_attention_layernorm.weight")
-    embedding = store.read("model.embed_tokens.weight")
+    embedding = store.read(embedding_name)
     token_ids = np.arange(args.seq_len, dtype=np.int64) % embedding.shape[0]
     if args.input_bf16:
         activation = read_bf16(
@@ -729,11 +1202,14 @@ def main() -> None:
             (args.seq_len, int(config["hidden_size"])),
         )
     else:
-        activation = bf16(embedding[token_ids])
+        activation = bf16(
+            embedding[token_ids] * float(config.get("scale_emb", 1.0))
+        )
     stage_outputs: dict[str, np.ndarray] = {}
+    routing_outputs: dict[str, np.ndarray] = {}
     golden = decoder_layer_reference(
         activation, norm0, norm1, quantized, scales, config, biases,
-        stage_outputs, qk_norms,
+        stage_outputs, qk_norms, args.layer, routing_outputs,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -750,17 +1226,45 @@ def main() -> None:
     token_ids.astype("<i8").tofile(args.output_dir / "token_ids.i64.bin")
     for role, value in quantized.items():
         value.tofile(args.output_dir / f"{role}.i8.bin")
+    dense_scale_roles = ["query", "key", "value", "output"]
+    if config.get("model_type") != "qwen3_moe":
+        dense_scale_roles.extend(("gate", "up", "down"))
+    else:
+        dense_scale_roles.append("router")
     np.asarray(
-        [scales[role] for role in names], dtype="<f4"
+        [float(scales[role]) for role in dense_scale_roles], dtype="<f4"
     ).tofile(args.output_dir / "quant_scales.f32.bin")
+    if routing_outputs:
+        routing_outputs["indices"].astype("<i4").tofile(
+            args.output_dir / "router_indices.i32.bin"
+        )
+        routing_outputs["expert_counts"].astype("<i4").tofile(
+            args.output_dir / "expert_counts.i32.bin"
+        )
+        write_bf16(
+            args.output_dir / "router_logits.bf16.bin",
+            routing_outputs["logits"],
+        )
+        write_bf16(
+            args.output_dir / "router_weights.bf16.bin",
+            routing_outputs["weights"],
+        )
+        np.stack([
+            np.asarray(scales[role], dtype=np.float32)
+            for role in ("expert_gate", "expert_up", "expert_down")
+        ]).astype("<f4").tofile(args.output_dir / "expert_quant_scales.f32.bin")
     for role, value in serialized_biases.items():
         write_bf16(args.output_dir / f"{role}_bias.bf16.bin", value)
     for role, value in qk_norms.items():
         write_bf16(args.output_dir / f"{role}_norm.bf16.bin", value)
 
+    rope_config = config.get("rope_parameters") or config.get("rope_scaling") or {}
     metadata = {
         "model": args.model_dir.name,
-        "architecture": config.get("architectures", ["LlamaForCausalLM"])[0],
+        "architecture": root_config.get(
+            "architectures", config.get("architectures", ["LlamaForCausalLM"])
+        )[0],
+        "model_type": config["model_type"],
         "layer": args.layer,
         "seq_len": args.seq_len,
         "hidden_size": int(config["hidden_size"]),
@@ -770,12 +1274,27 @@ def main() -> None:
         "head_dim": head_dim,
         "query_width": query_width,
         "kv_width": kv_width,
-        "rope_theta": float(config["rope_theta"]),
+        "rope_theta": rope_theta_value(config),
+        "rope_type": str(rope_config.get(
+            "rope_type", rope_config.get("type", "default")
+        )),
+        "rotary_dim": rope_parameters(config, args.seq_len)[2],
+        "uses_rope": layer_uses_rope(config, args.layer),
         "rms_norm_eps": float(config["rms_norm_eps"]),
-        "scales": scales,
+        "residual_scale": residual_scale(config),
+        "embedding_scale": float(config.get("scale_emb", 1.0)),
+        "scales": {
+            role: (value.tolist() if isinstance(value, np.ndarray) else value)
+            for role, value in scales.items()
+        },
         "source_tensors": names,
+        "embedding_tensor": embedding_name,
         "attention_bias": bool(biases),
-        "attention_bias_operands": True,
+        # Preserve the executable ABI even when checkpoint biases are
+        # intentionally replaced with zeroes.  Architectures that do not
+        # define attention bias must not shift the following norm/FFN
+        # bindings by three slots.
+        "attention_bias_operands": bool(source_has_attention_bias),
         "source_attention_bias": bool(source_has_attention_bias),
         "ignored_attention_bias": bool(
             source_has_attention_bias and args.ignore_attention_bias
@@ -799,6 +1318,14 @@ def main() -> None:
             str(args.input_bf16) if args.input_bf16 else "embedding"
         ),
     }
+    if config.get("model_type") == "qwen3_moe":
+        metadata["moe"] = {
+            "num_experts": int(config["num_experts"]),
+            "num_experts_per_tok": int(config["num_experts_per_tok"]),
+            "moe_intermediate_size": int(config["moe_intermediate_size"]),
+            "norm_topk_prob": bool(config.get("norm_topk_prob", False)),
+            "expert_counts": routing_outputs["expert_counts"].tolist(),
+        }
     (args.output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )

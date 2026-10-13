@@ -161,6 +161,10 @@ mlir::LogicalResult lower_rms_norm(
     tensor::RmsNormTaskOp op, LoweringContext& context);
 mlir::LogicalResult lower_elementwise(
     tensor::ElementwiseTaskOp op, LoweringContext& context);
+mlir::LogicalResult lower_depthwise_conv1d(
+    tensor::DepthwiseConv1DTaskOp op, LoweringContext& context);
+mlir::LogicalResult lower_gated_delta_rule(
+    tensor::GatedDeltaRuleTaskOp op, LoweringContext& context);
 mlir::LogicalResult lower_matmul(
     tensor::MatmulOp op, LoweringContext& context);
 

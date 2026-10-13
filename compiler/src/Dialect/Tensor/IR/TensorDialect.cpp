@@ -236,6 +236,84 @@ LogicalResult SwishTaskOp::verify()
         getOperation(), getResultAllocations(), "result_allocations");
 }
 
+LogicalResult DepthwiseConv1DTaskOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto weight = getWeight().getType();
+    if (!input.hasStaticShape() || !weight.hasStaticShape()
+        || input.getRank() != 2 || weight.getRank() != 2
+        || getResult().getType() != input
+        || weight.getDimSize(0) != input.getDimSize(1)
+        || weight.getDimSize(1) != getKernelSize())
+        return emitOpError("has incompatible depthwise Conv1D tensor types");
+    if (!getCausal() || getKernelSize() != 4)
+        return emitOpError("direct hardware lowering currently supports causal kernel_size=4");
+    if (getActivation() != "none" && getActivation() != "silu")
+        return emitOpError("activation must be none or silu");
+    if (failed(verify_task_allocations(
+            getOperation(), getInputAllocations(), "input_allocations"))
+        || failed(verify_task_allocations(
+            getOperation(), getWeightAllocations(), "weight_allocations"))
+        || failed(verify_task_allocations(
+            getOperation(), getScratchAllocations(), "scratch_allocations"))
+        || failed(verify_task_allocations(
+            getOperation(), getResultAllocations(), "result_allocations")))
+        return failure();
+    if (getScratchAllocations().size() != 3)
+        return emitOpError(
+            "requires one replicated causal-pad buffer and two result buffers");
+    return success();
+}
+
+LogicalResult GatedDeltaRuleTaskOp::verify()
+{
+    const auto query = getQuery().getType();
+    const auto key = getKey().getType();
+    const auto value = getValue().getType();
+    const auto decay = getDecay().getType();
+    const auto beta = getBeta().getType();
+    const auto state = getInitialState().getType();
+    if (!query.hasStaticShape() || !key.hasStaticShape()
+        || !value.hasStaticShape() || !decay.hasStaticShape()
+        || !beta.hasStaticShape() || !state.hasStaticShape()
+        || query.getRank() != 2 || key.getRank() != 2
+        || value.getRank() != 2 || decay.getRank() != 2
+        || beta.getRank() != 2 || state.getRank() != 2)
+        return emitOpError("requires static rank-2 tensors");
+    const int64_t tokens = query.getDimSize(0);
+    if (getHeads() <= 0 || getKeyDim() <= 0 || getValueDim() <= 0
+        || key != query
+        || query.getDimSize(1) != getHeads() * getKeyDim()
+        || value.getDimSize(0) != tokens
+        || value.getDimSize(1) != getHeads() * getValueDim()
+        || getOutput().getType() != value
+        || decay.getDimSize(0) != tokens
+        || decay.getDimSize(1) != getHeads()
+        || beta != decay
+        || state.getDimSize(0) != getHeads() * getKeyDim()
+        || state.getDimSize(1) != getValueDim()
+        || getFinalState().getType() != state)
+        return emitOpError("has incompatible recurrent delta-rule types");
+    for (auto [allocations, name] : {
+             std::pair {getQueryAllocations(), "query_allocations"},
+             std::pair {getKeyAllocations(), "key_allocations"},
+             std::pair {getValueAllocations(), "value_allocations"},
+             std::pair {getDecayAllocations(), "decay_allocations"},
+             std::pair {getBetaAllocations(), "beta_allocations"},
+             std::pair {getStateAllocations(), "state_allocations"},
+             std::pair {getScratchAllocations(), "scratch_allocations"},
+             std::pair {getOutputAllocations(), "output_allocations"},
+             std::pair {getFinalStateAllocations(),
+                 "final_state_allocations"}})
+        if (failed(verify_task_allocations(
+                getOperation(), allocations, name)))
+            return failure();
+    if (getScratchAllocations().size() < 4)
+        return emitOpError(
+            "requires state ping-pong, outer-product, remembered, and delta scratch");
+    return success();
+}
+
 LogicalResult ElementwiseTaskOp::verify()
 {
     if (getKind() != "multiply" && getKind() != "add"

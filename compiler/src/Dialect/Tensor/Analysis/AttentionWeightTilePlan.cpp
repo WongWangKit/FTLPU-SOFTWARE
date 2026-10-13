@@ -38,8 +38,13 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
     const int64_t outputRowsPerItem = outputReductionBlocks * 4;
     const int64_t projectionItemsPerGroup =
         memory.sram_depth_rows / projectionRowsPerItem;
-    const int64_t outputItemsPerGroup =
-        memory.sram_depth_rows / outputRowsPerItem;
+    // W8 output reads use a doubled physical reduction stride while adjacent
+    // logical output groups begin at the compact row stride.  Reserve one
+    // compact item of tail headroom so the final doubled reduction remains
+    // inside the bank (for example, 20 rather than 21 Phi output groups in
+    // an 8192-row slot).
+    const int64_t outputItemsPerGroup = std::max<int64_t>(
+        1, memory.sram_depth_rows / outputRowsPerItem - 1);
     if (projectionItemsPerGroup <= 0 || outputItemsPerGroup <= 0)
         return mlir::failure();
 
@@ -57,12 +62,20 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
         ? queryGroups - 1 : queryGroups;
     const int64_t keyBase = keyFitsQueryTail
         ? queryTail * projectionRowsPerItem : 0;
-    const int64_t valueGroup = keyGroup + 1;
+    const int64_t keyGroups = keyFitsQueryTail
+        ? 1 : divideCeil(keyItems, projectionItemsPerGroup);
+    const int64_t valueGroups = divideCeil(
+        valueItems, projectionItemsPerGroup);
+    const int64_t valueGroup = keyGroup + keyGroups;
     const int64_t projectionGroupsUsed = valueGroup
-        + divideCeil(valueItems, projectionItemsPerGroup);
+        + valueGroups;
     const int64_t outputGroups = divideCeil(
         outputItems, outputItemsPerGroup);
-    if (projectionGroupsUsed + outputGroups > groups)
+    const bool disjointResidency =
+        projectionGroupsUsed + outputGroups <= groups;
+    if (!disjointResidency
+        && std::max({queryGroups, keyGroups, valueGroups, outputGroups})
+            > groups)
         return mlir::failure();
 
     const auto transferCycles = [&](int64_t rows, int64_t columns) {
@@ -88,24 +101,39 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
     result.load_slice_count = loadSlices;
     result.storage_slice_count = storage.size();
     result.slice_group_count = groups;
-    result.transfer_phase_count = 2;
+    // Prefer one disjoint attention epoch when it fits.  Wider dense models
+    // (for example Phi-4 Mini) need more slice groups than exist in one SRAM
+    // bank. Alternate Q -> V -> K -> O across two banks instead: K may
+    // replace Q while V computes, and O may replace V while K computes.
+    // Page-ready events protect consumers; the compiler still describes
+    // each bank's physical release so ingress never overwrites live weights.
+    result.transfer_phase_count = disjointResidency ? 2 : 4;
+    result.bank_level_ping_pong = !disjointResidency;
+    const int64_t alternateBank = (initialBank + 1) % memory.banks_per_slice;
     result.storage_slices.assign(storage.begin(), storage.end());
+    const int64_t queryGroupBegin = 0;
+    const int64_t keyGroupBegin = disjointResidency ? keyGroup : 0;
+    const int64_t keyRowBase = disjointResidency ? keyBase : 0;
+    const int64_t valueGroupBegin = disjointResidency ? valueGroup : 0;
+    const int64_t outputGroupBegin =
+        disjointResidency ? projectionGroupsUsed : 0;
     result.placements = {
         placement(AttentionWeightTileKind::Query, initialBank, 0,
-            0, queryGroups, projectionItemsPerGroup, queryItems,
+            queryGroupBegin, queryGroups, projectionItemsPerGroup, queryItems,
             projectionRowsPerItem, hidden, queryHeads * headDim),
-        placement(AttentionWeightTileKind::Key, initialBank, keyBase,
-            keyGroup, 1, projectionItemsPerGroup, keyItems,
+        placement(AttentionWeightTileKind::Key, initialBank, keyRowBase,
+            keyGroupBegin, keyGroups, projectionItemsPerGroup, keyItems,
             projectionRowsPerItem, hidden, kvHeads * headDim),
-        placement(AttentionWeightTileKind::Value, initialBank, 0,
-            valueGroup, divideCeil(valueItems, projectionItemsPerGroup),
+        placement(AttentionWeightTileKind::Value,
+            disjointResidency ? initialBank : alternateBank, 0,
+            valueGroupBegin, valueGroups,
             projectionItemsPerGroup, valueItems,
             projectionRowsPerItem, hidden, kvHeads * headDim),
-        // Keep the complete attention residency epoch in one bank. Q/K/V
-        // occupy the leading storage groups; O uses the next disjoint group
-        // and can therefore be prefetched without replacing Q.
-        placement(AttentionWeightTileKind::Output, initialBank, 0,
-            projectionGroupsUsed, outputGroups,
+        // When the whole epoch fits, O occupies a disjoint group in its
+        // bank. Otherwise O reuses V's bank while K consumes the other bank.
+        placement(AttentionWeightTileKind::Output,
+            disjointResidency ? initialBank : alternateBank, 0,
+            outputGroupBegin, outputGroups,
             outputItemsPerGroup, outputItems,
             outputRowsPerItem, queryHeads * headDim, hidden),
     };

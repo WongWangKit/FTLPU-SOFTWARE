@@ -119,6 +119,7 @@ private:
         std::vector<C2cWeightPager::PageReadyRelease> releases{};
         std::size_t next_release{0};
         std::optional<std::int64_t> actual_ready_cycle{};
+        std::optional<std::int64_t> release_origin_cycle{};
         bool released{false};
     };
 

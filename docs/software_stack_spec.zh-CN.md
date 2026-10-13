@@ -162,7 +162,7 @@ MEM/MXM 的公共三维循环以 counter 0 为最内层：`issue_offset = wait_c
 
 MXM 的 load、dequant、compute 分别有自己的 ICU 队列。Load 包指定 weight buffer、可归纳的 weight column、输入 stream 和数据格式；Dequant 包指定 BF16 scale；Compute 包指定 activation/result stream、accumulator base/stride、row stride、格式与 destination/clear/output mode。terminal mode 可在某个 loop 维度的最后一点切换输出/清零行为，让 reduction 末步仍在同一个闭式域内。`ACCUMULATOR_READ_3D` 从 compute ICU 独立读 accumulator，不能被误算成 MEM read。
 
-VXM `RUN_2D` 的每个外层坐标 launch 一次 96-bit compact config，config 的 `repeat_count` 再驱动连续元素；SXM `RUN_2D` 每次 launch 一个含 transpose/permute、stream 列表和 lane map 的 tile-local config。算子 emitter 必须从 shape、placement 与闭式 timeline 直接生成这些包，不得先为每个 token/reduction 建 FU event 再扫描压缩。`ftlpu-compile` 的 direct 路径遇到旧 `CommandSequence` 会报错，防止静默退回兼容模式。
+VXM `RUN_2D` 的每个外层坐标 launch 一次 96-bit compact config，config 的 `repeat_count` 再驱动连续元素；SXM `RUN_2D` 每次 launch 一个含 transpose/permute、stream 列表和 lane map 的 tile-local config。VXM 的物理列数 `N = ftlpu.target.vxm_alus` 来自共享硬件 JSON（默认 16）；当前完整软件 target 要求 `N >= 16` 且为 8 的倍数，因此东西两个方向各有 `N/2` 列，每个方向至少容纳一条完整 8 列算子链，并可按 4 列能力组扩展。`C0..C(N-1)` 都是独立可调度资源，每列分别拥有 ICU queue、decoder、current/next config 和 repeat 状态。VALU 列之间只放普通 SR：east 数据按列号递增、west 数据按列号递减传播；某列只消费指令显式列出的 lhs/rhs SR，其他 SR 数据沿普通 link 继续流动，结果按 dst SR 写入下一列。`chain_depth`、`previous`、`original`、`auxiliary` 和 `feedback` 只能存在于 lowering 前，编译器必须在 Command/ICU ISA 前把它们解析为明确 SR 号。算子 emitter 必须从 shape、placement 与闭式 timeline 直接生成这些包，不得先为每个 token/reduction 建 FU event 再扫描压缩。`ftlpu-compile` 的 direct 路径遇到旧 `CommandSequence` 会报错，防止静默退回兼容模式。
 
 Attention 的 primitive 图包含 Q/K/V projection、Q/K RoPE、QK batch matmul、causal softmax、probability/value transpose、PV、output projection、residual 和 RMSNorm。FFN 包含 gate/up projection、Swish、multiply、down projection 与 residual。Tensor 层负责各 task 的 placement，Stream 层把真实数据路径挂在对应 task，Schedule emitter 负责 projection、RoPE、softmax、PV、FFN 等阶段的闭式域。硬件看到的始终是 MEM/MXM/VXM/SXM/C2C 本地指令。
 
@@ -211,7 +211,7 @@ FFN 的语义是 Down(Swish(Gate(x))×Up(x))。Gate 和 Up 是两个共享输入
 
 当前 Attention 依赖链为 Q/K/V projection → 可选 Q/K bias 与逐 head RMSNorm → Q/K RoPE → GQA head 布局 → QK → scaled causal Softmax → PV → context 布局转换 → O projection。Kernel 层保留 primitive SSA 图，Tensor/Stream/Schedule 分别确定内存、路由和执行计划；最终没有 compound Attention ICU 指令。
 
-Q/K/V 与 O 用有权重 MXM projection。Q/K bias 在 MXM 结果舍入 BF16 后融入 RoPE 的 VXM product FMA；V 若有 bias，则先经 VXM add/bypass，再写入 distributed-16 MEM。RoPE 按成对旋转维进行 sin/cos 乘加。显式启用 projection–RoPE overlap 时，每个 Q/K 输出组进入 staging 后尽快启动 RoPE，让下一组 MXM compute 与当前组 VXM/MEM 工作并行；冲突的 activation read 可转向 pong slice，避免 RoPE write 打断同一 bank 的 read。没有合法独立 bank/stream 窗口时必须保留空档或切域。
+Q/K/V 与 O 用有权重 MXM projection。Q/K bias 在 MXM 结果舍入 BF16 后由独立 VXM 列执行两路 multiply，再由 add 合并到 RoPE product；V 若有 bias，则先经 VXM add/bypass，再写入 distributed-16 MEM。RoPE 按成对旋转维展开为显式 multiply 与 add/subtract。显式启用 projection–RoPE overlap 时，每个 Q/K 输出组进入 staging 后尽快启动 RoPE，让下一组 MXM compute 与当前组 VXM/MEM 工作并行；冲突的 activation read 可转向 pong slice，避免 RoPE write 打断同一 bank 的 read。没有合法独立 bank/stream 窗口时必须保留空档或切域。
 
 QK 与 PV 的 Kernel op 虽名为 batch_matmul，但 role 只接受 qk/pv；当前以激活乘激活的 MXM Vector compute、MEM 供数和 SXM 重排实现，不走 INT8 权重的 Block8 projection。GQA 要求 query_heads 是 kv_heads 的整数倍，软件按 head 组复用 K/V，计划 K 跨 hemisphere 的镜像和 V 的归属位置；硬件没有“复制 KV head”的模型级指令。
 

@@ -463,8 +463,9 @@ LogicalResult VxmOp::verify()
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
     if (getCycleAttr().getInt() < 0
-        || !target.is_valid_vxm_alu(getQueue()) || getQueue() >= 8
-        || (chainDepth != 2 && chainDepth != 4 && chainDepth != 8)
+        || !target.is_valid_vxm_alu(getQueue())
+        || (chainDepth != 2 && chainDepth != 4 && chainDepth != 8
+            && chainDepth != 16)
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0
         || waveCount <= 0 || waveInterval <= 0)
         return emitOpError("contains invalid cycle, ALU queue, or repeat metadata: cycle=")
@@ -491,6 +492,15 @@ LogicalResult VxmOp::verify()
         && !getAccumulatorEmit().value_or(true))
         return emitOpError(
             "accumulator_emit=false requires accumulator_write");
+    if (getAccumulatorResetFirst().value_or(false)
+        && !getAccumulatorReset().value_or(false))
+        return emitOpError(
+            "accumulator_reset_first requires accumulator_reset");
+    if (getAccumulatorEmitLast().value_or(false)
+        && (!getAccumulatorWrite().value_or(false)
+            || !getAccumulatorEmit().value_or(true)))
+        return emitOpError(
+            "accumulator_emit_last requires an emitting accumulator write");
     if (getLocalScalarWrite().value_or(false)
         && getAccumulatorWrite().value_or(false))
         return emitOpError(
@@ -498,7 +508,7 @@ LogicalResult VxmOp::verify()
     const auto opcode = getOpcode();
     if (opcode != "pass" && opcode != "bypass" && opcode != "cast"
         && opcode != "add" && opcode != "subtract"
-        && opcode != "multiply" && opcode != "fma" && opcode != "fms"
+        && opcode != "multiply"
         && opcode != "negate"
         && opcode != "max" && opcode != "exp"
         && opcode != "reciprocal" && opcode != "rsqrt")
@@ -537,7 +547,8 @@ LogicalResult VxmOp::verify()
             || kind == "auxiliary" || kind == "accumulator"
             || kind == "feedback")
             return index == 0;
-        if (kind == "alu") return index == getQueue() - 1;
+        if (kind == "alu")
+            return index >= 0 && index < target.throughput().vxm_alus;
         if (kind == "stream_i8" || kind == "stream_f16"
             || kind == "stream_bf16" || kind == "stream_f32")
             return index >= 0
@@ -550,14 +561,6 @@ LogicalResult VxmOp::verify()
             << getQueue() << ", opcode=" << getOpcode()
             << ", lhs=" << getLhsKind() << "(" << getLhsIndex() << ")"
             << ", rhs=" << getRhsKind() << "(" << getRhsIndex() << ")";
-    const bool fused = opcode == "fma" || opcode == "fms";
-    const bool chainHead = getQueue() % chainDepth == 0;
-    if (fused
-        && (chainHead || (getQueue() - 1) % chainDepth != 0
-            || !isStreamOperand(getLhsKind())
-            || !isStreamOperand(getRhsKind())))
-        return emitOpError(
-            "fma/fms must immediately follow a VXM chain head and use two stream operands");
     const int64_t output = getOutputStreamAttr().getInt();
     if (output < -1 || output >= target.streams().encoded_streams)
         return emitOpError("contains an invalid output stream");
@@ -1176,11 +1179,11 @@ LogicalResult SxmOp::verify()
         return emitOpError("opcode must be transpose or permute");
     if (getOutputRow()
         && (*getOutputRow() < 0
-            || *getOutputRow() >= target.throughput().lanes_per_tile))
+            || *getOutputRow() > 15))
         return emitOpError("output_row must be in the physical lane range");
       if (getInputRow()
           && (*getInputRow() < 0
-              || *getInputRow() >= target.throughput().lanes_per_tile))
+              || (*getInputRow() >= target.throughput().lanes_per_tile && *getInputRow() != 9)))
           return emitOpError("input_row must be in the physical lane range");
       if (getOutputTile()
           && (*getOutputTile() < 0
