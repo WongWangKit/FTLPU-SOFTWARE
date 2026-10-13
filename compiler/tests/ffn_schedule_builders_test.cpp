@@ -111,6 +111,17 @@ int main() try
             - singleMxmProjection->blocks[0].weight_compute_cycle
             == singleMxmProjection->weight_block_interval,
         "single-MXM FFN delayed compute instead of retiming weight load");
+    auto singleMxmMultiTileProjection = schedule::planFfnProjectionTimeline(
+        {128, 576, 1536, 576}, weightSlices, singleMxmTarget, true);
+    require(mlir::succeeded(singleMxmMultiTileProjection)
+            && singleMxmMultiTileProjection->blocks.size() > 1,
+        "multi-tile single-MXM FFN projection timeline failed");
+    require(singleMxmMultiTileProjection->blocks[1].dequant_start
+            >= singleMxmMultiTileProjection->blocks[0]
+                       .tiles.back().compute_cycle
+                + singleMxmMultiTileProjection->projection_slot_interval
+                + singleMxmTarget.mxm_first_result_latency(),
+        "multi-tile single-MXM FFN overwrote the live Up weight buffer");
     auto residencyFirstProjection = schedule::planFfnProjectionTimeline(
         {32, 576, 1536, 576}, weightSlices, singleMxmTarget, true,
         false, schedule::FfnProjectionOrder::UpThenGate);
@@ -242,6 +253,41 @@ int main() try
             - singleMxmDown->blocks[0].weight_compute_cycle
             == singleMxmDown->reduction_interval,
         "single-MXM FFN down delayed compute instead of retiming weight load");
+    auto singleMxmMultiTileDown = schedule::planFfnDownProjectionTimeline(
+        {128, 576, 1536, 576}, *singleMxmMultiTileProjection, 1000,
+        weightSlices, hiddenSlices, resultSlices, singleMxmTarget, 0);
+    require(mlir::succeeded(singleMxmMultiTileDown)
+            && singleMxmMultiTileDown->blocks.size() > 1,
+        "multi-tile single-MXM local-dequant FFN down timeline failed");
+    require(singleMxmMultiTileDown->blocks[1].dequant_start
+            >= singleMxmMultiTileDown->blocks[0]
+                       .tiles.back().compute_cycle
+                + singleMxmMultiTileProjection->projection_slot_interval
+                + singleMxmTarget.mxm_first_result_latency(),
+        "multi-tile single-MXM FFN down overwrote the live Down1 buffer");
+
+    for (int64_t tokens : {32, 64, 128, 256}) {
+        const schedule::FfnScheduleShape shape {tokens, 576, 1536, 576};
+        const auto gateUp = schedule::planFfnProjectionTimeline(
+            shape, weightSlices, singleMxmTarget, true);
+        require(mlir::succeeded(gateUp), "FFN token sweep projection failed");
+        const auto down = schedule::planFfnDownProjectionTimeline(
+            shape, *gateUp, 1000, weightSlices, hiddenSlices,
+            resultSlices, singleMxmTarget, 0);
+        require(mlir::succeeded(down), "FFN token sweep down failed");
+        const int64_t retireOffset = gateUp->projection_slot_interval
+            + singleMxmTarget.mxm_first_result_latency();
+        for (std::size_t i = 1; i < gateUp->blocks.size(); ++i)
+            require(gateUp->blocks[i].dequant_start
+                    >= gateUp->blocks[i - 1].tiles.back().compute_cycle
+                        + retireOffset,
+                "FFN token sweep overwrote the live Up buffer");
+        for (std::size_t i = 1; i < down->blocks.size(); ++i)
+            require(down->blocks[i].dequant_start
+                    >= down->blocks[i - 1].tiles.back().compute_cycle
+                        + retireOffset,
+                "FFN token sweep overwrote the live Down1 buffer");
+    }
 
     auto pagedSingleMxmDown = schedule::planFfnDownProjectionTimeline(
         {32, 576, 1536, 576}, *singleMxmProjection, 1000,

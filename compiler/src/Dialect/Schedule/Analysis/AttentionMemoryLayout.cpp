@@ -125,6 +125,8 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     }
     if (const auto keyProduct =
             plan.getAs<mlir::DictionaryAttr>("rope_product_key")) {
+        ropeProductKeyBase_ =
+            keyProduct.getAs<mlir::IntegerAttr>("base_row").getInt();
         for (mlir::Attribute slice :
              keyProduct.getAs<mlir::ArrayAttr>("slices"))
             ropeProductKeySlices_.push_back(
@@ -520,6 +522,18 @@ int64_t AttentionMemoryLayout::ropeProductAddress(
         ? head : queryHeads_ + head;
     const int64_t productRowsPerVector = ropeProductBankInterleaved_
         ? seqLen_ : (seqLen_ + 1) / 2;
+    if (ropeProductBankInterleaved_
+        && projection == AttentionProjectionKind::Key && product < 2
+        && ropeProductKeySlices_.size() >= 4) {
+        // The low Key products own a separate slice group and base row.
+        // Applying the shared Query+Key head offset escapes that placement
+        // and can overwrite long-lived Query IW rows on the same bank.
+        const int64_t pairBlocks = std::max<int64_t>(1, headBlocks_ / 2);
+        return ropeProductKeyBase_
+            + ((head * pairBlocks + pairBlock) * 2 + product)
+                * productRowsPerVector
+            + token;
+    }
     // Compact products 0/1 and 2/3 live on different banks (Key uses
     // different slice groups). Their row coordinates may therefore reuse
     // the same two-product span without aliasing physical SRAM cells.

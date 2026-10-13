@@ -970,14 +970,26 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     exclude_softmax_input(mask1);
     // The pack-to-diagonal transpose pipelines reads and writes across its
     // nominal phase boundary.  Keep those slice sets disjoint as well.
-    if (!isolate_probability_from_runtime_weight_plane)
+    if (probability_diagonal_bank == requested_probability_pack_bank)
         for (int64_t slice : probability_diagonal_slices)
             if (!llvm::is_contained(probability_pack_excluded, slice))
                 probability_pack_excluded.push_back(slice);
+    const int64_t probability_pack_base =
+        target.attention_probability_pack_base_row();
+    // Value survives Softmax until PV consumes it. Its transient placement
+    // is not reserved by the allocator, so explicitly keep an overlapping
+    // probability window off the same physical bank/slice/row cells.
+    if (value_bank == requested_probability_pack_bank
+        && probability_pack_base < value_base + value_rows
+        && value_base < probability_pack_base + probability_pack_rows) {
+        for (int64_t slice : target.attention_value_slices())
+            if (!llvm::is_contained(probability_pack_excluded, slice))
+                probability_pack_excluded.push_back(slice);
+    }
     const llvm::SmallVector<int64_t, 1> probability_pack_banks {
         requested_probability_pack_bank};
     auto probability_pack = physical_allocator.allocate({"probability_pack",
-        16, target.attention_probability_pack_base_row(),
+        16, probability_pack_base,
         probability_pack_rows, 3, 4, probability_pack_candidates,
         true, probability_pack_banks, probability_pack_excluded});
     if (mlir::failed(probability_pack)) {

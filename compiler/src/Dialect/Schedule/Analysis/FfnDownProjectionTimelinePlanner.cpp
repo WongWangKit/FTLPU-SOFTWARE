@@ -133,9 +133,13 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
                 && !result.blocks.empty()) {
                 const int64_t previousLastCompute =
                     result.blocks.back().tiles.back().compute_cycle;
+                // Down1 computes one slot after Down0 and its load begins
+                // one tile after dequant_start. Preserve the final pipeline
+                // rows before replacing buffer 1.
                 block.dequant_start = std::max(block.dequant_start,
                     previousLastCompute
-                        + target.mxm_result_window_cycles(tile));
+                        + projection.projection_slot_interval
+                        + target.mxm_first_result_latency());
             }
             block.weight_buffer = block.index % 2;
             block.final_reduction =

@@ -286,6 +286,9 @@ add_test(NAME attention_rope_emitter_test COMMAND $<TARGET_FILE:attention_rope_e
 add_executable(attention_target_layout_test tests/attention_target_layout_test.cpp)
 target_link_libraries(attention_target_layout_test PRIVATE ftlpu_compiler)
 add_test(NAME attention_target_layout_test COMMAND $<TARGET_FILE:attention_target_layout_test>)
+add_executable(attention_memory_layout_test tests/attention_memory_layout_test.cpp)
+target_link_libraries(attention_memory_layout_test PRIVATE ftlpu_compiler)
+add_test(NAME attention_memory_layout_test COMMAND $<TARGET_FILE:attention_memory_layout_test>)
 add_executable(attention_weight_tile_planner_test
     tests/attention_weight_tile_planner_test.cpp)
 target_link_libraries(attention_weight_tile_planner_test PRIVATE ftlpu_compiler)
@@ -341,6 +344,13 @@ if(MSVC)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME attention_probability_layout_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/attention_probability_layout_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/attention_probability_layout)
     add_test(
         NAME standalone_ffn_up_3d_compile_test
         COMMAND
