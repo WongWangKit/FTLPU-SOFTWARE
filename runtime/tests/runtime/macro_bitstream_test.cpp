@@ -289,6 +289,18 @@ try {
                     invalidOperandContext); },
         "bitstream encoder accepted an out-of-range Active Context operand");
 
+    rt::QueueProgram topAddressQueue{rt::QueueKind::Mem, 0, {}};
+    topAddressQueue.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(ftlpu::hw::kSramDepthRows - 1, 0),
+        {0, 1, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    const auto topAddressImage =
+        rt::encode_mem_macro_bitstream(topAddressQueue);
+    const auto topAddressDecoded = rt::decode_mem_macro_bitstream(
+        topAddressImage, topAddressQueue.index);
+    compare(topAddressQueue.commands.front(),
+            topAddressDecoded.commands.front());
+
     const auto packedMem = rt::pack_mem_macro_imem(image);
     const auto memControl =
         rt::decode_icu_queue_control(low_u32(packedMem.bytes));
