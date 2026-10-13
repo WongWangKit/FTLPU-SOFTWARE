@@ -2,7 +2,6 @@
 
 #include "AttentionEmitterUtils.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
-#include "ftlpu/compiler/Dialect/Schedule/Analysis/paged_weight_residency.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_projection_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_work_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/lpu_resource_model.hpp"
@@ -16,8 +15,6 @@
 namespace ftlpu::compiler::schedule {
 using namespace attention_detail;
 namespace {
-
-constexpr int64_t kC2cTransportGuardCycles = 64;
 
 int64_t functionArgumentIndex(mlir::Value value) {
   if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(value))
@@ -548,11 +545,6 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       int64_t end;
     };
     llvm::SmallVector<MemIcuInterval, 64> previousRopeMemUses;
-    struct ResidentWeight {
-      mlir::DictionaryAttr placement;
-      int64_t releaseCycle;
-    };
-    llvm::SmallVector<ResidentWeight, 3> residentWeights;
 
     // Value is consumed only by PV, while Key gates the immediately following
     // QK stage. Scheduling Q -> V -> K shortens Key's live range and releases
@@ -599,36 +591,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       const auto biasAddress = [&](int64_t outputBlock) {
         return biasBase + (outputBlock / 4) * 2 + outputBlock % 2;
       };
-      const char *weightPlacementNames[] = {
-          "query_weight", "key_weight", "value_weight"};
-      const auto weightPlacement = op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(
-          weightPlacementNames[projection]);
-      if (weightPlacement) {
-        const auto pingPong = weightPlacement.getAs<mlir::BoolAttr>(
-            "page_bank_ping_pong");
-        if (const auto transferCycles =
-                weightPlacement.getAs<mlir::IntegerAttr>(
-                    "page_transfer_cycles");
-            transferCycles && !(pingPong && pingPong.getValue())) {
-          int64_t maxWeightReadLatency = 0;
-          for (mlir::Attribute slice : weightPlacement.getAs<mlir::ArrayAttr>(
-                   "page_storage_slices"))
-            maxWeightReadLatency = std::max(
-                maxWeightReadLatency,
-                weightReadLatency(
-                    llvm::cast<mlir::IntegerAttr>(slice).getInt()));
-          for (const ResidentWeight &resident : residentWeights) {
-            if (!pagedWeightResidencyOverlaps(
-                    resident.placement, weightPlacement))
-              continue;
-            phaseStart = std::max(
-                phaseStart,
-                resident.releaseCycle + transferCycles.getInt() +
-                    kC2cTransportGuardCycles + maxWeightReadLatency);
-          }
-        }
-      }
-      int64_t currentProjectionWeightRelease = -1;
+      // External page completion is asynchronous. Compiler-authored page
+      // SYNCs gate these consumers; never predict DDR latency in phaseStart.
       const int64_t projectionOutputBlocks =
           projectionHeads[projection] * projectionHeadBlocks;
       const int64_t projectionGroups = (projectionOutputBlocks + 3) / 4;
@@ -1117,12 +1081,6 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       }
                     }
                   }
-                  currentProjectionWeightRelease = std::max(
-                      currentProjectionWeightRelease,
-                      readCycle +
-                          (weightDomainCount - 1) *
-                              projectionReductionInterval +
-                          4);
                 }
                 if (localDequant &&
                     (!mergeProjectionMxm ||
@@ -3844,8 +3802,6 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           phaseStart = std::max(phaseStart, postprocessReady);
         }
       }
-      residentWeights.push_back(
-          {weightPlacement, currentProjectionWeightRelease});
     }
     return std::max(phaseStart, postprocessReady) + 16;
   }

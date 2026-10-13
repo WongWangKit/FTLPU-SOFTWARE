@@ -404,7 +404,7 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     contextBinding->setAttr("ready_cycle",
         rewriter_.getI64IntegerAttr(pvEnd));
     const int64_t outputProjectionEnd =
-        emitOutputProjection(pvEnd, projectionEnd);
+        emitOutputProjection(pvEnd);
     if (keyBinding) {
         const auto function = op_.output->getParentOfType<mlir::func::FuncOp>();
         if (annotateStateTransfers(function, keyBinding, rewriter_) == 0

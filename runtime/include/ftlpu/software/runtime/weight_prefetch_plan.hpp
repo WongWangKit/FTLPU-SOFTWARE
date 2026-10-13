@@ -28,6 +28,8 @@ struct WeightPrefetchPlan {
     std::uint16_t bank{0};
     bool runtime_prefetch{false};
     bool pre_execution{false};
+    // Logical lower bounds from SRAM/SR lifetimes and deterministic C2C
+    // ingress. These do not contain a DDR latency/bandwidth prediction.
     std::uint64_t start_cycle{0};
     std::uint64_t transfer_end_cycle{0};
     std::uint64_t ready_cycle{0};
@@ -37,13 +39,15 @@ struct WeightPrefetchPlan {
     std::vector<WeightResidencyRegion> regions{};
     // Ordinary West SR selected for each active C2C transport lane.
     std::vector<std::uint16_t> fabric_streams{};
-    // SRAM reuse boundary before transport serialization delays are applied.
+    // Earliest MEM arm boundary: SRAM reuse plus preceding ordered on-chip
+    // transport. It never includes a predicted DDR completion.
     std::uint64_t earliest_mem_cycle{0};
 };
 
 // Builds the executable-local C2C schedule from compiler-provided weight
-// residency intervals. Pages whose physical regions can coexist are loaded
-// through C2C before the ICU executable starts. Later pages receive an
+// residency intervals, in stable first-consumer order. Only a contiguous
+// prefix whose physical regions can coexist is loaded before execution;
+// later free-bank pages cannot bypass an earlier runtime refill. Later pages receive an
 // earliest-safe launch hint derived from physical residency lifetimes. The
 // runtime uses page-ready events for correctness; this plan never acts as a
 // hardware deadline.

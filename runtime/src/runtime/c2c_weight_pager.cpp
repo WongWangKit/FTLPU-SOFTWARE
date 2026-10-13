@@ -1287,8 +1287,8 @@ C2cWeightPageFence C2cWeightPager::schedule(
         c2cLogicalEnd = std::max({c2cLogicalEnd,
             rxLogicalEnds[side], dmaLogicalEnds[side]});
     }
-    // Transport end is an estimate derived from the external-memory model.
-    // When it is late, the synchronized MEM packet remains at the queue head
+    // The planned end describes a deterministic on-chip transport window.
+    // When actual DDR completion is later, MEM_WRITE_SYNC stays at the head
     // while the page-ready barrier holds every ordinary consumer. C2C DMA/RX
     // and MEM transport-only issue keep advancing until all writes retire.
     const auto reservationEnd = resolvedReservationEnd;

@@ -82,12 +82,60 @@ try {
             "runtime-prefetch policy did not survive binary round-trip");
     const auto runtimePrefetchPlans =
         plan_weight_prefetches(runtimePrefetchProgram);
+    {
+        auto tagged = runtimePrefetchProgram;
+        tagged.queues.push_back({QueueKind::Vxm, 0,
+            {encode_icu_control_raw_word(IcuControlInstruction::WaitEvent(0x30000)),
+             encode_icu_control_raw_word(IcuControlInstruction::Sync()),
+             encode_icu_control_raw_word(IcuControlInstruction::WaitEvent(0x2ffff)),
+             encode_icu_control_raw_word(IcuControlInstruction::WaitEvent(0x40000))}});
+        const auto unlinked = without_compiled_mem_write_sync(tagged);
+        const auto& controls = unlinked.queues.back().commands;
+        if (decode_icu_control_raw_word(controls[0]).opcode != IcuControlOpcode::Nop
+            || decode_icu_control_raw_word(controls[0]).count != 1
+            || decode_icu_control_raw_word(controls[1]).opcode != IcuControlOpcode::Sync
+            || decode_icu_control_raw_word(controls[2]).opcode != IcuControlOpcode::WaitEvent
+            || decode_icu_control_raw_word(controls[2]).event_tag != 0x2ffff
+            || decode_icu_control_raw_word(controls[3]).opcode != IcuControlOpcode::WaitEvent
+            || decode_icu_control_raw_word(controls[3]).event_tag != 0x40000)
+            throw std::runtime_error("compiler page-event rebind changed ordinary SYNC");
+    }
     if (runtimePrefetchPlans.size() != 2
         || !runtimePrefetchPlans[0].pre_execution
         || runtimePrefetchPlans[1].pre_execution
         || runtimePrefetchPlans[1].start_cycle != 0)
         throw std::runtime_error(
             "explicit next-epoch page was not left on the runtime timeline");
+    auto scratchReuseProgram = runtimePrefetchProgram;
+    QueueProgram scratchQueue{QueueKind::Mem,
+        InstructionControlUnit::mem_queue(Hemisphere::East, 28, 0), {}};
+    scratchQueue.commands.push_back(encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(80)));
+    const auto scratchPacket = isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Write3D(IcuLoop3D{0, {4,1,1}, {5,1,1}},
+            MemIcuAddress3D::Affine(0, {1,0,0}), StreamId::East(0)));
+    for (const auto& word : scratchPacket.words) {
+        QueueCommand command;
+        command.command = word.lanes[0];
+        command.instruction_kind = InstructionKind::Mem;
+        command.word_count = isa::EncodedMemIcu3DPacket::kLanesPerWord;
+        for (std::size_t lane = 0; lane < command.word_count; ++lane)
+            command.words[lane] = word.lanes[lane];
+        scratchQueue.commands.push_back(command);
+    }
+    scratchReuseProgram.queues.push_back(scratchQueue);
+    BinaryBinding sharedScratch;
+    sharedScratch.access = BindingAccess::Internal;
+    sharedScratch.bank = 0;
+    sharedScratch.hemisphere_mask = 1;
+    sharedScratch.slices = {28};
+    sharedScratch.instruction_count = 4;
+    sharedScratch.address_stride = 1;
+    scratchReuseProgram.bindings.push_back(sharedScratch);
+    const auto scratchReusePlans = plan_weight_prefetches(scratchReuseProgram);
+    if (scratchReusePlans[1].earliest_mem_cycle != 96
+        || scratchReusePlans[1].start_cycle < 96)
+        throw std::runtime_error("C2C page overwrote a live native scratch domain");
     auto initializedOverlapProgram = preloadProgram;
     BinaryBinding rope;
     rope.access = BindingAccess::Internal;
@@ -112,16 +160,31 @@ try {
         throw std::runtime_error(
             "weight page ignored initialized SRAM release timeline");
     auto lowBandwidthHardware = preloadProgram.hardware;
-    lowBandwidthHardware.ddr_peak_bandwidth_mbytes_per_second = 12800;
-    const auto lowBandwidthPlans =
-        plan_weight_prefetches(preloadProgram, lowBandwidthHardware);
-    if (lowBandwidthPlans.size() != preloadPlans.size()
-        || lowBandwidthPlans[0].start_cycle != preloadPlans[0].start_cycle
-        || lowBandwidthPlans[0].ready_cycle != preloadPlans[0].ready_cycle
-        || lowBandwidthPlans[0].transfer_end_cycle
-            < preloadPlans[0].transfer_end_cycle)
-        throw std::runtime_error(
-            "DDR bandwidth changed the consumer boundary or shortened transport");
+    lowBandwidthHardware.lpu_clock_mhz = 1000;
+    lowBandwidthHardware.ddr_peak_bandwidth_mbytes_per_second = 6400;
+    lowBandwidthHardware.ddr_read_latency_cycles = 2500;
+    lowBandwidthHardware.ddr_read_latency_jitter_cycles = 500;
+    const auto requireDdrIndependentPlans = [&](const BinaryProgram& program) {
+        const auto normal = plan_weight_prefetches(program);
+        const auto slow = plan_weight_prefetches(program, lowBandwidthHardware);
+        if (normal.size() != slow.size())
+            throw std::runtime_error("DDR changed the page plan count");
+        for (std::size_t index = 0; index < normal.size(); ++index) {
+            const auto& a = normal[index];
+            const auto& b = slow[index];
+            if (a.start_cycle != b.start_cycle
+                || a.transfer_end_cycle != b.transfer_end_cycle
+                || a.earliest_mem_cycle != b.earliest_mem_cycle
+                || a.ready_cycle != b.ready_cycle
+                || a.pre_execution != b.pre_execution
+                || a.fabric_streams != b.fabric_streams)
+                throw std::runtime_error(
+                    "DDR prediction leaked into the logical ICU page timeline");
+        }
+    };
+    requireDdrIndependentPlans(preloadProgram);
+    requireDdrIndependentPlans(runtimePrefetchProgram);
+    requireDdrIndependentPlans(initializedOverlapProgram);
 
     BinaryProgram coalescedProgram;
     auto coalescedFirst = make_weight_binding(1);
@@ -264,9 +327,10 @@ try {
     if (earlyAlternateBankPlans[2].pre_execution
         || earlyAlternateBankPlans[3].pre_execution
         || earlyAlternateBankPlans[2].start_cycle != 300
-        || earlyAlternateBankPlans[3].start_cycle != 100)
+        || earlyAlternateBankPlans[3].start_cycle
+            < earlyAlternateBankPlans[2].transfer_end_cycle)
         throw std::runtime_error(
-            "alternate-bank page was not launched at its earliest free slot");
+            "later alternate-bank page bypassed its earlier consumer");
 
     std::vector<WeightPrefetchPlan> sharedTransportPlans(4);
     sharedTransportPlans[0].ready_cycle = 100;
@@ -293,68 +357,168 @@ try {
         throw std::runtime_error(
             "different C2C coarse instructions overlapped one ICU queue");
 
-    // A distant, large Gate page must not monopolize the non-preemptible
-    // transport just before the bank for an earlier Up consumer becomes free.
-    std::vector<WeightPrefetchPlan> deadlinePlans(4);
-    deadlinePlans[0].ready_cycle = 10;
-    deadlinePlans[0].release_cycle = 100;
-    deadlinePlans[0].bytes[0] = 128;
-    deadlinePlans[0].regions = {{0, 1, 20, 0, 8, false}};
-    deadlinePlans[1].ready_cycle = 20;
-    deadlinePlans[1].release_cycle = 150;
-    deadlinePlans[1].bytes[0] = 128;
-    deadlinePlans[1].regions = {{1, 1, 20, 0, 8, false}};
-    deadlinePlans[2].ready_cycle = 1000;
-    deadlinePlans[2].release_cycle = 1100;
-    deadlinePlans[2].bytes[0] = 131072;
-    deadlinePlans[2].regions = deadlinePlans[0].regions;
-    deadlinePlans[3].ready_cycle = 250;
-    deadlinePlans[3].release_cycle = 300;
-    deadlinePlans[3].bytes[0] = 128;
-    deadlinePlans[3].regions = deadlinePlans[1].regions;
-    schedule_weight_prefetches(chainedOverlapProgram, deadlinePlans);
-    // The scheduler returns plans in consumer order: Up precedes Gate.
-    if (deadlinePlans[2].start_cycle != 150
-        || deadlinePlans[3].start_cycle < deadlinePlans[2].transfer_end_cycle)
-        throw std::runtime_error("distant Gate page blocked the earlier Up consumer");
-    // A short page that fits before that bank release must still use the gap.
-    deadlinePlans[1].release_cycle = 500;
-    deadlinePlans[3].bytes[0] = 128;
-    deadlinePlans[2].ready_cycle = 600;
-    deadlinePlans[2].release_cycle = 700;
-    schedule_weight_prefetches(chainedOverlapProgram, deadlinePlans);
-    if (deadlinePlans[3].start_cycle != 100 || deadlinePlans[2].start_cycle != 500)
-        throw std::runtime_error("short prefetch did not fill the transport gap");
+    auto slowSharedTransportPlans = sharedTransportPlans;
+    schedule_weight_prefetches(chainedOverlapProgram,
+        slowSharedTransportPlans, lowBandwidthHardware);
+    for (std::size_t index = 0; index < sharedTransportPlans.size(); ++index)
+        if (sharedTransportPlans[index].start_cycle
+                != slowSharedTransportPlans[index].start_cycle
+            || sharedTransportPlans[index].transfer_end_cycle
+                != slowSharedTransportPlans[index].transfer_end_cycle)
+            throw std::runtime_error("DDR prediction serialized later C2C pages");
 
-    // After yielding to a future Up page, preserve the release ordering of
-    // pages from one binding. Reordering those can invert shared epoch
-    // barriers in the linked MEM queues even when their SRAM rows differ.
-    deadlinePlans[1].release_cycle = 150;
-    deadlinePlans[2].ready_cycle = 250;
-    deadlinePlans[2].release_cycle = 300;
-    deadlinePlans[3].bytes[0] = 131072;
-    deadlinePlans[3].use_indices = {0};
-    WeightPrefetchPlan thirdResident;
-    thirdResident.ready_cycle = 30;
-    thirdResident.release_cycle = 160;
-    thirdResident.bytes[0] = 128;
-    thirdResident.regions = {{0, 1, 28, 0, 8, false}};
-    deadlinePlans.push_back(thirdResident);
-    WeightPrefetchPlan eligibleGate;
-    eligibleGate.ready_cycle = 800;
-    eligibleGate.release_cycle = 900;
-    eligibleGate.bytes[0] = 128;
-    eligibleGate.regions = thirdResident.regions;
-    eligibleGate.use_indices = {1};
-    deadlinePlans.push_back(eligibleGate);
-    BinaryProgram orderedBindingProgram = chainedOverlapProgram;
-    orderedBindingProgram.weight_page_uses = {
-        {7, 1, 0, 1000, 1100}, {7, 0, 0, 800, 900}};
-    schedule_weight_prefetches(orderedBindingProgram, deadlinePlans);
-    if (deadlinePlans[3].start_cycle != 150
-        || deadlinePlans[5].start_cycle < deadlinePlans[3].transfer_end_cycle
-        || deadlinePlans[4].start_cycle < deadlinePlans[5].transfer_end_cycle)
-        throw std::runtime_error("eligible pages inverted their release order");
+    // Consumption order wins over SRAM availability for both single-page
+    // and multi-page bindings. The earlier consumer reuses SRAM at 150,
+    // while the later consumer's bank is already free at 100.
+    BinaryProgram projectionPriorityProgram = chainedOverlapProgram;
+    projectionPriorityProgram.bindings = {make_weight_binding(), make_weight_binding()};
+    projectionPriorityProgram.bindings[0].page_count = 2;
+    projectionPriorityProgram.bindings[1].index = 1;
+    projectionPriorityProgram.weight_page_uses = {
+        {0, 0, 0, 1000, 1100}, {1, 0, 1, 250, 300}};
+    std::vector<WeightPrefetchPlan> priorityPlans(4);
+    priorityPlans[0].ready_cycle = 10;
+    priorityPlans[0].release_cycle = 100;
+    priorityPlans[0].bytes[0] = 128;
+    priorityPlans[0].regions = {{0, 1, 20, 0, 8, false}};
+    priorityPlans[1].ready_cycle = 20;
+    priorityPlans[1].release_cycle = 150;
+    priorityPlans[1].bytes[0] = 128;
+    priorityPlans[1].regions = {{1, 1, 20, 0, 8, false}};
+    priorityPlans[2].ready_cycle = 1000;
+    priorityPlans[2].release_cycle = 1100;
+    priorityPlans[2].bytes[0] = 131072;
+    priorityPlans[2].regions = priorityPlans[0].regions;
+    priorityPlans[2].use_indices = {0};
+    priorityPlans[3].ready_cycle = 250;
+    priorityPlans[3].release_cycle = 300;
+    priorityPlans[3].bytes[0] = 128;
+    priorityPlans[3].regions = priorityPlans[1].regions;
+    for (const auto pageCount : {1u, 2u}) {
+        projectionPriorityProgram.bindings[1].page_count = pageCount;
+        schedule_weight_prefetches(projectionPriorityProgram, priorityPlans);
+        if (priorityPlans[2].ready_cycle != 250
+            || priorityPlans[2].start_cycle != 150
+            || priorityPlans[3].ready_cycle != 1000
+            || priorityPlans[3].start_cycle < priorityPlans[2].transfer_end_cycle
+            || priorityPlans[3].earliest_mem_cycle < priorityPlans[2].transfer_end_cycle)
+            throw std::runtime_error("page consumption order was changed");
+    }
+
+    // A free late Up bank must not be preloaded before the first Gate page
+    // whose bank still holds attention weights. Gate0 -> Gate1 -> Up0 also
+    // remains the DMA order when Gate1's SRAM becomes reusable first.
+    std::vector<WeightPrefetchPlan> prefixPlans(4);
+    prefixPlans[0].ready_cycle = 10;
+    prefixPlans[0].release_cycle = 300;
+    prefixPlans[0].bytes[0] = 128;
+    prefixPlans[0].regions = {{0, 1, 20, 0, 8, false}};
+    prefixPlans[1].ready_cycle = 400;
+    prefixPlans[1].release_cycle = 500;
+    prefixPlans[1].bytes[0] = 128;
+    prefixPlans[1].regions = prefixPlans[0].regions;
+    prefixPlans[2].ready_cycle = 600;
+    prefixPlans[2].release_cycle = 700;
+    prefixPlans[2].bytes[0] = 128;
+    prefixPlans[2].regions = {{1, 1, 28, 0, 8, false}};
+    prefixPlans[3].ready_cycle = 800;
+    prefixPlans[3].release_cycle = 900;
+    prefixPlans[3].bytes[0] = 128;
+    prefixPlans[3].regions = {{1, 1, 36, 0, 8, false}};
+    schedule_weight_prefetches(chainedOverlapProgram, prefixPlans);
+    if (!prefixPlans[0].pre_execution || prefixPlans[1].pre_execution
+        || prefixPlans[2].pre_execution || prefixPlans[3].pre_execution
+        || prefixPlans[1].start_cycle != 300
+        || prefixPlans[2].start_cycle < prefixPlans[1].transfer_end_cycle
+        || prefixPlans[3].start_cycle < prefixPlans[2].transfer_end_cycle)
+        throw std::runtime_error("late free-bank page bypassed the preload prefix");
+
+    BinaryProgram nativeWeightProgram;
+    QueueProgram nativeMem {QueueKind::Mem,
+        InstructionControlUnit::mem_queue(Hemisphere::East, 20, 0), {}};
+    nativeMem.commands.push_back(encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(40)));
+    const auto nativePacket = isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D {0, {16, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(100, {1, 0, 0}), StreamId::East(0)));
+    for (const auto& word : nativePacket.words) {
+        QueueCommand command;
+        command.command = word.lanes[0];
+        command.instruction_kind = InstructionKind::Mem;
+        command.word_count = isa::EncodedMemIcu3DPacket::kLanesPerWord;
+        for (std::size_t lane = 0; lane < command.word_count; ++lane)
+            command.words[lane] = word.lanes[lane];
+        nativeMem.commands.push_back(command);
+    }
+    nativeWeightProgram.queues.push_back(std::move(nativeMem));
+    std::vector<WeightPrefetchPlan> nativePlans(1);
+    nativePlans[0].runtime_prefetch = true;
+    nativePlans[0].ready_cycle = 100;
+    nativePlans[0].release_cycle = 120;
+    nativePlans[0].bytes[0] = 128;
+    nativePlans[0].regions = {{0, 1, 20, 100, 108, false}};
+    schedule_weight_prefetches(nativeWeightProgram, nativePlans);
+    if (nativePlans[0].earliest_mem_cycle != 0)
+        throw std::runtime_error("ordinary native weight reads deferred prefetch");
+    BinaryBinding scratch;
+    scratch.access = BindingAccess::Internal;
+    scratch.bank = 0;
+    scratch.hemisphere_mask = 1;
+    scratch.slices = {20};
+    nativeWeightProgram.bindings.push_back(scratch);
+    schedule_weight_prefetches(nativeWeightProgram, nativePlans);
+    if (nativePlans[0].earliest_mem_cycle != 56)
+        throw std::runtime_error("native scratch release did not protect page reuse");
+
+    // A compiler SYNC may consume an idle slot in one place and add an
+    // extra issue slot at a zero-wait boundary in another. Rebinding must
+    // recover both original phases, rather than turn every old SYNC into NOP.
+    auto beforeSync = nativeWeightProgram;
+    const auto secondPacket = isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D{0, {4, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(200, {1, 0, 0}), StreamId::East(0)));
+    const auto appendPacket = [](auto& commands, const auto& packet) {
+        for (const auto& word : packet.words) {
+            QueueCommand command;
+            command.command = word.lanes[0];
+            command.instruction_kind = InstructionKind::Mem;
+            command.word_count = isa::EncodedMemIcu3DPacket::kLanesPerWord;
+            for (std::size_t lane = 0; lane < command.word_count; ++lane)
+                command.words[lane] = word.lanes[lane];
+            commands.push_back(command);
+        }
+    };
+    appendPacket(beforeSync.queues[0].commands, secondPacket);
+    auto withSync = beforeSync;
+    auto& syncCommands = withSync.queues[0].commands;
+    syncCommands.clear();
+    syncCommands.push_back(encode_icu_control_raw_word(IcuControlInstruction::Nop(39)));
+    syncCommands.push_back(encode_icu_control_raw_word(IcuControlInstruction::WaitEvent(0x30000)));
+    appendPacket(syncCommands, nativePacket);
+    syncCommands.push_back(encode_icu_control_raw_word(IcuControlInstruction::WaitEvent(0x30001)));
+    appendPacket(syncCommands, secondPacket);
+    BinaryAddressRelocation phaseRelocation;
+    phaseRelocation.queue_kind = QueueKind::Mem;
+    phaseRelocation.queue_index = withSync.queues[0].index;
+    phaseRelocation.command_index = 2;
+    withSync.address_relocations.push_back(phaseRelocation);
+    record_compiler_sync_origins(withSync, beforeSync);
+    const auto pageOut = encode_mem_synchronized_icu_packet(
+        InstructionControlUnit::MemIcu::encode_synchronized_raw_packet(4, 1, 0, 1,
+            MemInstruction::Read(300, StreamId::East(0)), 4));
+    syncCommands.insert(syncCommands.end(), pageOut.begin(), pageOut.end());
+    std::ostringstream phaseBinary(std::ios::out | std::ios::binary);
+    write_binary_program(withSync, phaseBinary);
+    std::istringstream phaseInput(phaseBinary.str(), std::ios::in | std::ios::binary);
+    const auto restoredPhases = without_compiled_mem_write_sync(read_binary_program(phaseInput));
+    const auto& restoredQueue = restoredPhases.queues[0];
+    if (decode_fu_3d_raw_packet_loop(restoredQueue, 0).wait_cycle != 40
+        || decode_fu_3d_raw_packet_loop(restoredQueue,
+            fu_3d_raw_packet_word_count(QueueKind::Mem)).wait_cycle != 0
+        || !is_mem_synchronized_raw_packet_header(restoredQueue.commands[
+            2 * fu_3d_raw_packet_word_count(QueueKind::Mem)])
+        || restoredPhases.address_relocations[0].command_index != 0)
+        throw std::runtime_error("compiler SYNC rebind changed domain timing or relocation");
 
     BinaryProgram wideningStreamProgram = overlappingProgram;
     wideningStreamProgram.stream_release_cycles.assign(

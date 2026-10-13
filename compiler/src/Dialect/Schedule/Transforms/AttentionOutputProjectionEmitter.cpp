@@ -2,7 +2,6 @@
 
 #include "AttentionEmitterUtils.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
-#include "ftlpu/compiler/Dialect/Schedule/Analysis/paged_weight_residency.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
@@ -14,8 +13,6 @@ namespace ftlpu::compiler::schedule {
 using namespace attention_detail;
 namespace {
 
-constexpr int64_t kC2cTransportGuardCycles = 64;
-
 int64_t functionArgumentIndex(mlir::Value value) {
   if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(value))
     return argument.getArgNumber();
@@ -25,7 +22,7 @@ int64_t functionArgumentIndex(mlir::Value value) {
 } // namespace
 
 int64_t AttentionScheduleEmitter::emitOutputProjection(
-    int64_t pvEnd, int64_t qkvEnd) {
+    int64_t pvEnd) {
   const AttentionMemoryLayout layout(op_, target_);
   const auto contextPlacement =
       op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("context");
@@ -128,30 +125,8 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
   };
 
   int64_t phaseStart = pvEnd;
-  const auto outputWeightPlacement =
-      op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("output_weight");
-  if (outputWeightPlacement) {
-    const auto pingPong = outputWeightPlacement.getAs<mlir::BoolAttr>(
-        "page_bank_ping_pong");
-    if (const auto transferCycles =
-            outputWeightPlacement.getAs<mlir::IntegerAttr>(
-                "page_transfer_cycles");
-        transferCycles && !(pingPong && pingPong.getValue())) {
-      const auto memoryPlan = op_.getMemoryPlan();
-      const char *priorWeights[] = {
-          "query_weight", "key_weight", "value_weight"};
-      const bool reusesPriorResidency = std::ranges::any_of(
-          priorWeights, [&](const char *name) {
-            return pagedWeightResidencyOverlaps(
-                memoryPlan.getAs<mlir::DictionaryAttr>(name),
-                outputWeightPlacement);
-          });
-      if (reusesPriorResidency)
-        phaseStart = std::max(
-            phaseStart,
-            qkvEnd + transferCycles.getInt() + kC2cTransportGuardCycles);
-    }
-  }
+  // PV supplies the on-chip dependency. Actual external weight completion
+  // is handled by page-ready SYNC, independent of DDR bandwidth or jitter.
   const auto plannedOutputGroupEnd = [&](int64_t finalFirstCompute) {
     const int64_t resultCycle =
         finalFirstCompute + target_.mxm_first_result_latency();

@@ -2695,15 +2695,26 @@ void emit_compiled_mem_write_sync(software::runtime::BinaryProgram& program)
         return std::tie(plans[lhs].start_cycle, plans[lhs].ready_cycle)
             < std::tie(plans[rhs].start_cycle, plans[rhs].ready_cycle);
     });
+    const auto beforeSync = program;
     for (const auto index : launchOrder) {
         const auto& plan = plans[index];
+        // The compiler owns the consumer rendezvous as well as the MEM
+        // page write. Runtime binds the concrete DDR addresses/events.
+        const auto epoch = std::ranges::count_if(plans,
+            [&](const auto& candidate) {
+                return !candidate.pre_execution
+                    && candidate.ready_cycle < plan.ready_cycle;
+            });
         static_cast<void>(pager.schedule(program, pages[index],
             static_cast<std::size_t>(plan.start_cycle),
             static_cast<std::size_t>(plan.transfer_end_cycle),
             static_cast<std::size_t>(plan.ready_cycle),
-            0x10000u + index));
+            0x10000u + index, 0x30000u + epoch,
+            static_cast<std::size_t>(plan.earliest_mem_cycle)));
     }
+    static_cast<void>(pager.coalesce_page_ready_events());
     pager.finalize_schedule(program);
+    software::runtime::record_compiler_sync_origins(program, beforeSync);
     // DDR addresses and launch events belong to the model-package link.
     // Only the MEM iMEM words are part of this compiler image.
     std::erase_if(program.queues, [](const QueueProgram& queue) {

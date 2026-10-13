@@ -265,6 +265,19 @@ void test_linked_mem_window_releases_after_ingress()
                 > *boundary.last_sync_issue_cycle,
         boundaryTimingFailure.c_str());
 
+    // Use the identical linked program but deliver page data after the
+    // consumer's nominal cycle. Completion, rather than the predicted
+    // reservation end, must keep the following ordinary read blocked.
+    const auto late = run_controlled_linked_timing_case(readyCycle,
+        {readyCycle + 8, readyCycle + 9});
+    require(late.synchronized_issue_count == kTimingVectorCount
+            && late.last_sync_issue_cycle.has_value()
+            && *late.last_sync_issue_cycle > readyCycle
+            && late.trailing_mem_issue_cycle.has_value()
+            && *late.trailing_mem_issue_cycle > *late.last_sync_issue_cycle
+            && *late.trailing_mem_issue_cycle > *early.trailing_mem_issue_cycle,
+        "late completion did not dynamically delay the following MEM read");
+
     // First observe the deterministic end-to-end completion with ample slack,
     // then move the consumer boundary next to that completion. The MEM port is
     // reserved for ingress only; any transport delay beyond the static window

@@ -744,6 +744,10 @@ decode_mem_synchronized_icu_packet(
 // Recover the scheduled MEM idle slots for a direct CModel golden run or a
 // transport-plan check. The executable keeps its compiler-authored packets.
 BinaryProgram without_compiled_mem_write_sync(const BinaryProgram& compiled);
+// Host-only coarse-domain timing, kept separately from hardware i-MEM words,
+// lets rebinding recover the pre-SYNC queue phases without expanding FU issues.
+void record_compiler_sync_origins(BinaryProgram& compiled,
+    const BinaryProgram& before_sync);
 // Recover compiler-authored KV-cache page-out packets. Runtime links C2C TX
 // and DMA around the extracted MEM_READ_SYNC program after main execution.
 BinaryProgram without_compiled_mem_read_sync(const BinaryProgram& compiled);
