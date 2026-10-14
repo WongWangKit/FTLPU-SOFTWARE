@@ -20,6 +20,7 @@ def main():
     p.add_argument('--compile',type=Path,required=True)
     p.add_argument('--runner',type=Path,required=True)
     p.add_argument('--output-dir',type=Path,required=True)
+    p.add_argument('--target-config',type=Path,help='Shared build/compiler hardware target')
     p.add_argument('--pipeline-csv',type=Path,help='Record the actual CModel runtime issue trace')
     p.add_argument('--package',type=Path,help='Use an imported checkpoint package instead of synthetic mini weights')
     p.add_argument('--compile-only',action='store_true',help='Emit and check the ICU image without executing it')
@@ -38,13 +39,15 @@ def main():
     x=bf16(rng.normal(0,.2,(32,c.hidden_size)).astype(np.float32))
     if a.package:
         x,weights,packed,scales,c=load_imported_layer(a.package)
-    graph=ResidentGraph(a.opt.resolve(),a.output_dir/'kernels')
+    graph=ResidentGraph(a.opt.resolve(),a.output_dir/'kernels',a.target_config)
     finals=graph.layer(x,weights,packed,scales,c)
     linker=ResidentLinker(graph,finals)
     source=linker.build()
     schedule=a.output_dir/'decoder_layer.schedule.mlir';schedule.write_text(source,encoding='utf-8')
     binary=a.output_dir/'decoder_layer.ftlpu'
-    subprocess.run([str(a.compile.resolve()),'--input',str(schedule),'--input-stage','verified-schedule','--output',str(binary)],check=True)
+    compile_command=[str(a.compile.resolve()),'--input',str(schedule),'--input-stage','verified-schedule','--output',str(binary)]
+    if a.target_config:compile_command.extend(['--target-config',str(a.target_config)])
+    subprocess.run(compile_command,check=True)
     files=[]
     for i,(value,dtype) in enumerate(linker.inputs):
         path=a.output_dir/f'input{i}.bin'

@@ -248,18 +248,16 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             op_.getInput().getType()).getElementType());
     const int64_t constantBindingBase =
         strategy_ == AttentionScheduleStrategy::Fused ? 4 : 2;
+    mlir::NamedAttrList ropeInitializer;
+    ropeInitializer.set("theta", op_.config().getAs<mlir::FloatAttr>("rope_theta"));
+    ropeInitializer.set("head_dim", rewriter_.getI64IntegerAttr(op_.getHeadDim()));
+    ropeInitializer.set("rotary_dim", rotaryDimAttr);
+    ropeInitializer.set("attention_factor", ropeFactorAttr);
+    if (auto frequencies = op_.config().get("rope_inverse_frequencies"))
+        ropeInitializer.set("inverse_frequencies", frequencies);
     createBinding(rewriter_, op_.getLoc(), {}, constantBindingBase, "internal",
-        "constant", ropeType,
-        memoryPlan.getAs<mlir::DictionaryAttr>("rope"),
-        "rope.cos_sin", "rope_table",
-        rewriter_.getDictionaryAttr({
-            rewriter_.getNamedAttr(
-                "theta", op_.config().getAs<mlir::FloatAttr>("rope_theta")),
-            rewriter_.getNamedAttr("head_dim",
-                rewriter_.getI64IntegerAttr(op_.getHeadDim())),
-            rewriter_.getNamedAttr("rotary_dim", rotaryDimAttr),
-            rewriter_.getNamedAttr("attention_factor", ropeFactorAttr),
-        }));
+        "constant", ropeType, memoryPlan.getAs<mlir::DictionaryAttr>("rope"),
+        "rope.cos_sin", "rope_table", ropeInitializer.getDictionary(rewriter_.getContext()));
     const auto ropeProduct =
         memoryPlan.getAs<mlir::DictionaryAttr>("rope_product");
     const auto bankInterleaved =
@@ -270,14 +268,7 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
             "internal", "constant", ropeType,
             memoryPlan.getAs<mlir::DictionaryAttr>("rope_mirror"),
             "rope.cos_sin.mirror", "rope_table",
-            rewriter_.getDictionaryAttr({
-                rewriter_.getNamedAttr("theta",
-                    op_.config().getAs<mlir::FloatAttr>("rope_theta")),
-                rewriter_.getNamedAttr("head_dim",
-                    rewriter_.getI64IntegerAttr(op_.getHeadDim())),
-                rewriter_.getNamedAttr("rotary_dim", rotaryDimAttr),
-                rewriter_.getNamedAttr("attention_factor", ropeFactorAttr),
-            }));
+            ropeInitializer.getDictionary(rewriter_.getContext()));
     }
     const auto probabilityType = mlir::RankedTensorType::get(
         {op_.getQueryHeads(), op_.getSeqLen(), op_.getKvSeqLen()},

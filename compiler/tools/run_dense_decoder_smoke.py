@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -49,6 +48,8 @@ def main() -> None:
     parser.add_argument("--runtime-test", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--results-dir", type=Path, required=True)
+    parser.add_argument("--case-result-dir", type=Path,
+                        help="Exact output directory for this case")
     args = parser.parse_args()
 
     here = Path(__file__).resolve().parent
@@ -62,22 +63,9 @@ def main() -> None:
     model_work.mkdir(parents=True, exist_ok=True)
     compile_commands = []
     if args.compiler:
-        from create_dense_decoder_smoke_checkpoint import SPECS
-        from generate_dense_decoder_layer import generate
-        spec = SPECS[args.model]
+        from compile_dense_decoder_case import source_ir_for_fixture
         source = model_work / "decoder.stablehlo.mlir"
-        source.write_text(generate(
-            here.parent / "examples" / "qwen2_5_1_5b_decoder_layer"
-            / "decoder_layer_seq32.stablehlo.mlir",
-            name=args.model, hidden=spec.hidden, intermediate=spec.intermediate,
-            query_heads=spec.query_heads, kv_heads=spec.kv_heads,
-            head_dim=spec.head_dim, rope_theta=spec.rope_theta,
-            rms_norm_eps=spec.rms_epsilon,
-            rotary_dim=96 if spec.model_type == "phi3" else spec.head_dim,
-            rope_attention_factor=math.sqrt(1.0 + math.log(32.0) / math.log(4096.0))
-                if spec.model_type == "phi3" else 1.0,
-            residual_scale=1.4 / math.sqrt(spec.layers)
-                if spec.model_type == "minicpm" else 1.0), encoding="utf-8")
+        source.write_text(source_ir_for_fixture(args.model), encoding="utf-8")
         args.executable = args.executable or model_work / "decoder.ftlpu"
         compile_commands.append(("compile", [str(args.compiler),
             "--input", str(source), "--output", str(args.executable),
@@ -89,7 +77,7 @@ def main() -> None:
     checkpoint = model_work / "checkpoint"
     golden = model_work / "golden"
     package = model_work / f"{args.model}.ftlpum"
-    result_dir = args.results_dir / run_name
+    result_dir = args.case_result_dir or args.results_dir / run_name
     result_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc).isoformat()
     linked = Path(str(package) + ".linked.ftlpu")

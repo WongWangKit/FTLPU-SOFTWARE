@@ -342,6 +342,10 @@ endif()
 
 if(Python3_Interpreter_FOUND)
     add_test(
+        NAME model_test_entrypoint_test
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_SOURCE_DIR}/tools/tests/test_run_model_tests.py)
+    add_test(
         NAME standalone_ffn_up_3d_compile_test
         COMMAND
             ${Python3_EXECUTABLE}
@@ -397,6 +401,13 @@ if(Python3_Interpreter_FOUND)
         COMMAND
             ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/dense_attention_ping_pong_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --target-config ${FTLPU_HARDWARE_CONFIG})
+    add_test(
+        NAME official_dense_reference_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/official_dense_reference_test.py
             --tool $<TARGET_FILE:ftlpu_opt>
             --target-config ${FTLPU_HARDWARE_CONFIG})
     add_test(

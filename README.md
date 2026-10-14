@@ -7,6 +7,27 @@ Software stack for the FTLPU project.
 This repository is intended to host the compiler, low-level IR, binary format,
 and runtime code that drives the FTLPU CModel and later hardware targets.
 
+## Model Test Entry Point
+
+Use [tools/run_model_tests.py](tools/run_model_tests.py) to inspect coverage,
+check the environment, and run existing numerical CModel tests:
+
+```powershell
+python tools/run_model_tests.py list
+python tools/run_model_tests.py doctor --model qwen2_5_1_5b
+python tools/run_model_tests.py run --model minicpm4_0_5b --suite official --download --build
+python tools/run_model_tests.py run --model glm_edge_1_5b --suite official --download --build
+```
+
+`--build` requires a configured CMake build and the pinned MLIR toolchain;
+see [MLIR build instructions](compiler/docs/mlir_build.md) for first-time setup.
+The runner supports synthetic prefill, selected official checkpoints, Qwen2.5
+decode, and compile-only tests. It records scope, numerical status, phase logs,
+and actual runtime pipelines in fixed result directories. Qwen3.5 coverage is
+its linear-attention layer only. These are decoder-layer tests, not complete
+multi-layer text generation. See the [Chinese quickstart and coverage table](docs/model_test_quickstart.zh-CN.md)
+for commands, checkpoint access, artifacts, exit codes, and troubleshooting.
+
 ## Current Focus
 
 The first target is the CModel ICU boundary in `FTLPU-CMODEL`:

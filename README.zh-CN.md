@@ -10,6 +10,22 @@ FTLPU 项目的软件栈。
 本仓库用于承载驱动 FTLPU CModel 以及后续硬件目标的编译器、底层 IR、
 二进制格式和 runtime。
 
+## 新同事：运行模型测试
+
+统一入口为 [tools/run_model_tests.py](tools/run_model_tests.py)：
+
+```powershell
+python tools/run_model_tests.py list
+python tools/run_model_tests.py doctor --model qwen2_5_1_5b
+python tools/run_model_tests.py run --model minicpm4_0_5b --suite official --download --build
+python tools/run_model_tests.py run --model glm_edge_1_5b --suite official --download --build
+```
+
+首次构建、模型覆盖表、合成/官方权重区别、decode、结果目录及流水图说明见
+[模型测试快速开始](docs/model_test_quickstart.zh-CN.md)。当前验收范围是 decoder 单层；
+Qwen3.5 只覆盖 linear-attention 层，尚不代表完整多层模型文本生成。
+`--build` 要求已配置 CMake 和 MLIR 工具链；更新代码后使用它同步 compiler/runtime ABI。
+
 ## 当前重点
 
 首个目标是对接 `FTLPU-CMODEL` 的 CModel ICU 边界：

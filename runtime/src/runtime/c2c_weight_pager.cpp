@@ -911,7 +911,7 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
     const C2cWeightPage& page,
     const SystemHardwareConfiguration& hardware,
     std::uint32_t firstSyncTag,
-    std::size_t reservationCycles)
+    std::size_t reservationCycles, bool dynamicReservation)
 {
     validate_weight_page(page, hardware);
     const bool useMinimumReservation = reservationCycles == 0;
@@ -930,6 +930,7 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
 
     std::array<std::size_t, InstructionControlUnit::kMemQueues>
         vectorsPerQueue{};
+    std::array<std::size_t, InstructionControlUnit::kMemQueues> packetsPerQueue{};
     for (const auto& segment : page.segments) {
         const auto queue = InstructionControlUnit::mem_queue(
             segment.hemisphere, segment.slice, segment.bank);
@@ -940,11 +941,14 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
                 "C2C weight-page MEM vector count overflows size_t");
         vectorsPerQueue[queue] += segment.vector_count;
     }
-    for (const auto count : vectorsPerQueue)
+    for (const auto& segment : page.segments)
+        ++packetsPerQueue[InstructionControlUnit::mem_queue(
+            segment.hemisphere, segment.slice, segment.bank)];
+    const auto& logicalPerQueue = dynamicReservation ? packetsPerQueue : vectorsPerQueue;
+    for (const auto count : logicalPerQueue)
         if (!useMinimumReservation && count > reservationCycles)
-            throw std::invalid_argument(
-                "C2C weight-page reservation is shorter than its MEM write count");
-    auto remainingVectors = vectorsPerQueue;
+            throw std::invalid_argument("C2C reservation is shorter than its logical MEM instruction slots");
+    auto remainingLogical = logicalPerQueue;
 
     C2cWeightPageIcuProgram program;
     program.segments.reserve(page.segments.size());
@@ -960,16 +964,16 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
             hw::kMemEastBoundaryStreamRegisterColumn - (group + 1);
         const auto syncTag = firstSyncTag
             + static_cast<std::uint32_t>(segmentIndex);
-        // Every packet needs at least one cycle per emitted FU write. The
-        // final packet holds any page-level latency/guard slack so the whole
-        // physical queue remains reserved through the linked window end.
-        auto packetReservation =
-            static_cast<std::size_t>(segment.vector_count);
-        remainingVectors[queue] -= segment.vector_count;
+        // A dynamically synchronized packet has one logical instruction
+        // slot; its actual lifetime still includes all requested FU writes.
+        // Legacy standalone reservations retain the fixed write-count floor.
+        auto packetReservation = dynamicReservation ? std::size_t {1}
+            : static_cast<std::size_t>(segment.vector_count);
+        remainingLogical[queue] -= packetReservation;
         const auto queueReservation = useMinimumReservation
-            ? vectorsPerQueue[queue] : reservationCycles;
-        if (remainingVectors[queue] == 0)
-            packetReservation += queueReservation - vectorsPerQueue[queue];
+            ? logicalPerQueue[queue] : reservationCycles;
+        if (remainingLogical[queue] == 0)
+            packetReservation += queueReservation - logicalPerQueue[queue];
 
         const auto rx = C2cIcuPacketCodec::encode(
             C2cRxIcuInstruction::Receive(segment.hemisphere, lane,
@@ -1138,19 +1142,22 @@ C2cWeightPageFence C2cWeightPager::schedule(
             targetQueues.push_back(queue);
     }
 
-    auto vectorsPerQueue = std::array<std::size_t,
+    auto logicalSlotsPerQueue = std::array<std::size_t,
         InstructionControlUnit::kMemQueues> {};
     std::size_t minimumReservation = 0;
+    std::array<std::size_t, InstructionControlUnit::kMemQueues> physicalWritesPerQueue{};
+    std::size_t minimumPhysicalWrites = 0;
     for (const auto& segment : page.segments) {
         const auto queue = InstructionControlUnit::mem_queue(
             segment.hemisphere, segment.slice, segment.bank);
-        if (segment.vector_count > std::numeric_limits<std::size_t>::max()
-                - vectorsPerQueue[queue])
-            throw std::overflow_error(
-                "C2C weight-page MEM vector count overflows size_t");
-        vectorsPerQueue[queue] += segment.vector_count;
-        minimumReservation = std::max(
-            minimumReservation, vectorsPerQueue[queue]);
+        const auto slots = pageReadyEventTag != 0 ? std::size_t {1}
+            : static_cast<std::size_t>(segment.vector_count);
+        if (slots > std::numeric_limits<std::size_t>::max() - logicalSlotsPerQueue[queue])
+            throw std::overflow_error("C2C logical MEM reservation overflows size_t");
+        physicalWritesPerQueue[queue] += segment.vector_count;
+        minimumPhysicalWrites = std::max(minimumPhysicalWrites, physicalWritesPerQueue[queue]);
+        logicalSlotsPerQueue[queue] += slots;
+        minimumReservation = std::max(minimumReservation, logicalSlotsPerQueue[queue]);
     }
 
     const auto reservationEndAt = [&](std::size_t candidate) {
@@ -1227,7 +1234,11 @@ C2cWeightPageFence C2cWeightPager::schedule(
                         "no legal MEM ICU idle window can hold a C2C weight page: queue="
                         + std::to_string(queue) + " consumer="
                         + std::to_string(readyCycle) + " vectors="
-                        + std::to_string(minimumReservation));
+                        + std::to_string(minimumReservation)
+                        + " earliest_mem=" + std::to_string(earliestMemCycle)
+                        + " common_start=" + std::to_string(commonStart)
+                        + " transport_start=" + std::to_string(startCycle)
+                        + " transport_duration=" + std::to_string(transportDuration));
         }
         bool allFit = true;
         auto commonReservationEnd = reservationEndAt(commonStart);
@@ -1294,7 +1305,8 @@ C2cWeightPageFence C2cWeightPager::schedule(
     const auto reservationEnd = resolvedReservationEnd;
     const auto reservationDuration = reservationEnd - resolvedStart;
     const auto lowered = lower_c2c_weight_page_to_icu(
-        page, hardware, next_sync_tag_, reservationDuration);
+        page, hardware, next_sync_tag_, reservationDuration,
+        pageReadyEventTag != 0 && reservationDuration < minimumPhysicalWrites);
     if (pageReadyEventTag != 0) {
         // A late asynchronous page can outlive its predicted reservation.
         // Its MEM_WRITE_SYNC then remains at the head of every target MEM

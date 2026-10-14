@@ -197,24 +197,28 @@ try {
         table.rope_head_dim = 128;
         table.rope_rotary_dim = 96;
         table.rope_attention_factor = 1.19f;
+        for (int d = 0; d < 48; ++d)
+            table.rope_inverse_frequencies.push_back(0.01f * (d + 1));
         BinaryProgram program;
         program.bindings.push_back(table);
         std::stringstream encoded(std::ios::in | std::ios::out | std::ios::binary);
         write_binary_program(program, encoded);
         const auto decoded = read_binary_program(encoded);
         require(decoded.bindings[0].rope_rotary_dim == 96
-            && decoded.bindings[0].rope_attention_factor == 1.19f,
+            && decoded.bindings[0].rope_attention_factor == 1.19f
+            && decoded.bindings[0].rope_inverse_frequencies == table.rope_inverse_frequencies,
             "binary round-trip dropped partial RoPE parameters");
         const auto bytes = encoded.str();
         const auto metadata = read_binary_program_metadata(std::span<const std::uint8_t>(
             reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
-        require(metadata.bindings[0].rope_rotary_dim == 96,
+        require(metadata.bindings[0].rope_rotary_dim == 96
+            && metadata.bindings[0].rope_inverse_frequencies == table.rope_inverse_frequencies,
             "binary metadata reader dropped partial RoPE parameters");
         auto system = std::make_unique<ftlpu::TspSliceSystem>();
         CModelRuntime runtime(*system);
         runtime.load(decoded);
         for (std::size_t d = 0; d < 64; ++d) {
-            const float angle = d < 48 ? 7.0f / std::pow(10000.0f, float(2 * d) / 96) : 0.0f;
+            const float angle = d < 48 ? 7.0f * table.rope_inverse_frequencies[d] : 0.0f;
             const float factor = d < 48 ? 1.19f : 1.0f;
             const std::uint16_t expected[] = {
                 ftlpu::Bf16::from_float(std::cos(angle) * factor).bits(),

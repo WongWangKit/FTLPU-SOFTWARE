@@ -924,6 +924,9 @@ BinaryBinding translate_binding(command::BindingOp op)
     }
     if (const auto factor = ropeConfig.getAs<mlir::FloatAttr>("attention_factor"))
         binding.rope_attention_factor = static_cast<float>(factor.getValueAsDouble());
+    if (const auto frequencies = ropeConfig.getAs<mlir::DenseFPElementsAttr>("inverse_frequencies"))
+        for (const auto frequency : frequencies.getValues<llvm::APFloat>())
+            binding.rope_inverse_frequencies.push_back(frequency.convertToFloat());
     binding.initializer = initializer == "zero"
         ? software::runtime::BindingInitializer::Zero
         : initializer == "causal_mask"

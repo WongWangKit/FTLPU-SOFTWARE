@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 33;
+inline constexpr std::uint32_t kBinaryFormatVersion = 34;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -110,6 +110,9 @@ struct BinaryBinding {
     // bindings pack rotary pairs ahead of unchanged tail pairs.
     std::uint32_t rope_rotary_dim{0};
     float rope_attention_factor{1.0f};
+    // Explicit frequencies from the model graph (YaRN, LongRoPE, Llama3).
+    // Empty retains the legacy geometric theta-based table.
+    std::vector<float> rope_inverse_frequencies{};
     // Intra-executable paging metadata. A paged binding contains the logical
     // tensor; independently ready pages may share a bank when their exact
     // slice-group and row regions are disjoint.

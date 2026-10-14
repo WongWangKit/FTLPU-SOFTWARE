@@ -576,6 +576,11 @@ void write_binding(std::ostream& os, const BinaryBinding& binding)
     os.write(binding.name.data(),
         static_cast<std::streamsize>(binding.name.size()));
     if (!os) throw std::runtime_error("failed to write binding metadata");
+    if (binding.rope_inverse_frequencies.size() > 65536)
+        throw std::runtime_error("too many RoPE inverse frequencies");
+    write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(binding.rope_inverse_frequencies.size()));
+    for (const float frequency : binding.rope_inverse_frequencies)
+        write_scalar<float>(os, frequency);
 }
 
 BinaryBinding read_binding(std::istream& is, std::uint32_t version)
@@ -669,6 +674,12 @@ BinaryBinding read_binding(std::istream& is, std::uint32_t version)
         is.read(binding.name.data(),
             static_cast<std::streamsize>(binding.name.size()));
         if (!is) throw std::runtime_error("truncated binding metadata");
+        if (version >= 34) {
+            const auto count = read_scalar<std::uint32_t>(is);
+            if (count > 65536) throw std::runtime_error("too many RoPE inverse frequencies");
+            for (std::uint32_t i = 0; i < count; ++i)
+                binding.rope_inverse_frequencies.push_back(read_scalar<float>(is));
+        }
     }
     return binding;
 }
@@ -1082,6 +1093,12 @@ BinaryBinding read_binding(ByteReader& reader, std::uint32_t version)
         binding.name.resize(name_size);
         reader.read_bytes(binding.role.data(), binding.role.size());
         reader.read_bytes(binding.name.data(), binding.name.size());
+        if (version >= 34) {
+            const auto count = reader.read<std::uint32_t>();
+            if (count > 65536) throw std::runtime_error("too many RoPE inverse frequencies");
+            for (std::uint32_t i = 0; i < count; ++i)
+                binding.rope_inverse_frequencies.push_back(reader.read<float>());
+        }
     }
     return binding;
 }

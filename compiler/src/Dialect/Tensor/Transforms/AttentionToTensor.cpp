@@ -1394,6 +1394,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr(
             "output_weight_scale", graph.output.getRhsScaleAttr()),
     });
+    if (auto frequencies = graph.query_rope->getAttr("inverse_frequencies")) {
+        mlir::NamedAttrList attributes(config);
+        attributes.set("rope_inverse_frequencies", frequencies);
+        config = attributes.getDictionary(rewriter.getContext());
+    }
     if (has_qk_norm) {
         mlir::NamedAttrList config_attributes(config);
         config_attributes.set("qk_norm_epsilon",

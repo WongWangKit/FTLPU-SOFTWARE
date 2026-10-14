@@ -9,8 +9,9 @@ from resident_schedule import Value
 
 class ResidentGraph:
     type=staticmethod(CompiledStages.type)
-    def __init__(self, opt, directory):
+    def __init__(self, opt, directory, target_config=None):
         self.opt,self.directory=Path(opt),Path(directory)
+        self.target_config=Path(target_config).resolve() if target_config else None
         self.directory.mkdir(parents=True,exist_ok=True)
         self.nodes=[]
 
@@ -21,12 +22,17 @@ class ResidentGraph:
                 r'\1 attributes {ftlpu.vxm_queue_base = 8 : i64} {',source,count=1,flags=re.S)
         prefix=self.directory/f'{node:03d}_{name}'
         kernel=prefix.with_suffix('.kernel.mlir'); schedule=prefix.with_suffix('.schedule.mlir')
-        cached=kernel.exists() and schedule.exists() and kernel.read_text(encoding='utf-8')==source and schedule.stat().st_mtime_ns>=self.opt.stat().st_mtime_ns
+        config_stamp=prefix.with_suffix('.target-config.txt')
+        config_identity=self.target_config.read_text(encoding='utf-8') if self.target_config else 'compiler default'
+        cached=config_stamp.exists() and config_stamp.read_text(encoding='utf-8')==config_identity and kernel.exists() and schedule.exists() and kernel.read_text(encoding='utf-8')==source and schedule.stat().st_mtime_ns>=self.opt.stat().st_mtime_ns
         if not cached:
             kernel.write_text(source,encoding='utf-8')
-            result=subprocess.run([str(self.opt),'--input',str(kernel),'--output',str(schedule),
-                '--pipeline','ftlpu-stablehlo-to-schedule'],capture_output=True,text=True)
+            command=[str(self.opt),'--input',str(kernel),'--output',str(schedule),
+                '--pipeline','ftlpu-stablehlo-to-schedule']
+            if self.target_config:command.extend(['--target-config',str(self.target_config)])
+            result=subprocess.run(command,capture_output=True,text=True)
             if result.returncode: raise RuntimeError(f'{name}: {result.stderr}')
+            config_stamp.write_text(config_identity,encoding='utf-8')
         self.nodes.append(dict(name=name,inputs=inputs,outputs=outputs,schedule=schedule))
         return [Value(node,i,shape,dtype,np.arange(np.prod(shape),dtype=np.int64)) for i,(shape,dtype) in enumerate(outputs)]
 

@@ -70,6 +70,12 @@ try {
     const auto& expected = session.value("golden.output");
     if (actual.size() != expected.size())
         throw std::logic_error("decoder layer result size mismatch");
+    if (const char* output = std::getenv("FTLPU_DENSE_ACTUAL_BF16")) {
+        std::ofstream stream(output, std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(actual.data()),
+            static_cast<std::streamsize>(actual.size()));
+        if (!stream) throw std::runtime_error("cannot save actual decoder output");
+    }
     float maximumError = 0.0f;
     double meanError = 0.0;
     std::size_t maximumIndex = 0;

@@ -115,7 +115,11 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
     std::uint32_t first_sync_tag = 1,
     // Zero selects the minimum standalone reservation on each physical MEM
     // queue. The executable linker supplies an explicit scheduled window.
-    std::size_t reservation_cycles = 0);
+    std::size_t reservation_cycles = 0,
+    // With a consumer page-ready event, logical queue slots need not predict
+    // physical write duration: WRITE_SYNC owns the queue until every token
+    // has produced its write, and the event holds ordinary consumers.
+    bool dynamic_reservation = false);
 
 class C2cWeightPager {
 public:
