@@ -352,6 +352,20 @@ if(MSVC)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    # Keep the native compiler usable without the optional HF/XLA environment.
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import pytest, numpy"
+        RESULT_VARIABLE FTLPU_FRONTEND_TEST_DEPS
+        OUTPUT_QUIET ERROR_QUIET)
+    if(FTLPU_FRONTEND_TEST_DEPS EQUAL 0)
+        add_test(NAME hf_frontend_protocol_test
+            COMMAND ${Python3_EXECUTABLE} -B -m pytest -q -p no:cacheprovider
+                --basetemp ${CMAKE_CURRENT_BINARY_DIR}/hf_frontend_protocol_tmp
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/frontend_bundle_test.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/frontend_entry_test.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/frontend_weights_test.py
+                -k "not xla")
+    endif()
     add_test(NAME icu_short_lowering_test
         COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/icu_short_lowering_test.py

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "revision": null,
+  "load_dtype": "float32",
+  "load_options": {"attn_implementation": "eager", "local_files_only": false},
+  "entry": "causal_lm_logits",
+  "inputs": [
+    {"name": "input_ids", "shape": [1, 16], "dtype": "int64", "fill": 0},
+    {"name": "attention_mask", "shape": [1, 16], "dtype": "int64", "fill": 1}
+  ],
+  "quantization": "none",
+  "exporter": "torch_xla"
+}

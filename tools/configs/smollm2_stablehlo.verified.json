@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "model": "HuggingFaceTB/SmolLM2-135M",
+  "revision": "93efa2f097d58c2a74874c7e644dbc9b0cee75a2",
+  "load_dtype": "float32",
+  "load_options": {"attn_implementation": "eager", "local_files_only": true, "cache_dir": ".cache/hf-hub"},
+  "entry": "causal_lm_logits",
+  "inputs": [
+    {"name": "input_ids", "shape": [1, 16], "dtype": "int64", "fill": 0},
+    {"name": "attention_mask", "shape": [1, 16], "dtype": "int64", "fill": 1}
+  ],
+  "quantization": "none",
+  "exporter": "torch_xla"
+}

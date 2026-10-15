@@ -1,5 +1,11 @@
 # SmolLM2-135M to StableHLO
 
+The legacy CLI now delegates to the shared, JSON-configured frontend while
+preserving its arguments, defaults, and `export.json`. New model integrations
+can use `tools/export_hf_stablehlo.py --config ... --output ...`;
+see the [frontend guide](README.hf-stablehlo.zh-CN.md) and
+[Linux/WSL setup](README.xla-linux.zh-CN.md).
+
 This exporter captures one statically shaped, logits-only forward pass of
 `HuggingFaceTB/SmolLM2-135M`. It deliberately excludes tokenization, sampling,
 the autoregressive loop, and the KV cache. Those are runtime concerns and
