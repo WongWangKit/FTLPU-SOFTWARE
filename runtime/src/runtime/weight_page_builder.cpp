@@ -847,15 +847,22 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
     const std::size_t itemColumns =
         binding.layout == BindingLayout::W8A16MxmWeightStriped
         ? 64 : 128;
-    if (rows % 32 || columns % itemColumns)
+    const bool ffnWave =
+        binding.layout == BindingLayout::W8A16MxmWeightWaveStriped;
+    const bool projection = rows < columns;
+    // Q/K/V explicitly guard each output tile in the last wave. O and FFN
+    // down consume two 32-column tiles per active hemisphere. Gate/up use
+    // paired projection waves and still require complete 128-column waves.
+    const std::size_t outputAlignment =
+        binding.layout == BindingLayout::W8A16AttentionWeightStriped
+        ? 32 : 64;
+    if (rows % 32 || columns % outputAlignment
+        || (ffnWave && projection && columns % 128))
         throw std::invalid_argument(
             "paged Vector-MXM weight has an unsupported shape alignment");
     constexpr std::size_t loadSlices = 8;
     constexpr std::size_t logicalSlots = 2;
     constexpr std::size_t rowsPerLoad = 4;
-    const bool ffnWave =
-        binding.layout == BindingLayout::W8A16MxmWeightWaveStriped;
-    const bool projection = rows < columns;
     const BinaryWeightPagePlacement pagePlacement =
         resolve_weight_page_placement(binding, page_index);
     const std::uint64_t pageBegin = pagePlacement.base_row;
@@ -869,7 +876,6 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
         throw std::invalid_argument(
             "paged weight placement exceeds the executable SRAM bank");
     const std::size_t reductionBlocks = rows / 32;
-    const std::size_t outputWaves = columns / 128;
     const std::size_t pagesPerOutputWave = projection ? 0
         : (reductionBlocks + binding.page_granularity - 1)
             / binding.page_granularity;

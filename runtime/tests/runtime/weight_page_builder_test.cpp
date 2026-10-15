@@ -3,10 +3,14 @@
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include <cstdint>
+#include <algorithm>
+#include <array>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -106,11 +110,98 @@ void require(bool condition, const std::string& message)
     if (!condition) throw std::runtime_error(message);
 }
 
+using ImageRows = std::map<std::tuple<std::uint16_t, std::uint16_t,
+    std::uint32_t>, std::array<std::uint8_t, 32>>;
+
+ImageRows physical_rows(const PackedWeightImage& image)
+{
+    ImageRows rows;
+    for (const auto& segment : image.segments)
+        for (std::uint32_t row = 0; row < segment.vector_count; ++row) {
+            std::array<std::uint8_t, 32> data;
+            std::copy_n(image.data.begin() + segment.byte_offset + row * 32,
+                32, data.begin());
+            require(rows.emplace(std::make_tuple(segment.hemisphere,
+                        segment.slice, segment.base_row + row), data).second,
+                "page contains overlapping physical vectors");
+        }
+    return rows;
+}
+
+void test_paged_output_tail(BindingLayout layout, std::size_t rows,
+    std::size_t columns)
+{
+    const auto paddedColumns = ((columns + 127) / 128) * 128;
+    std::vector<std::uint8_t> logical(rows * columns);
+    std::vector<std::uint8_t> padded(rows * paddedColumns, 0);
+    for (std::size_t k = 0; k < rows; ++k)
+        for (std::size_t n = 0; n < columns; ++n)
+            padded[k * paddedColumns + n] = logical[k * columns + n] =
+                static_cast<std::uint8_t>(k * 29 + n * 17 + 3);
+    BinaryBinding binding = make_weight(1);
+    binding.layout = layout;
+    binding.shape = {rows, columns};
+    binding.byte_size = logical.size();
+    binding.base_row = 17;
+    binding.address_stride = 2;
+    binding.slices = {8, 9, 10, 11, 12, 13, 14, 15};
+    binding.page_storage_slices = binding.slices;
+    binding.paged_weight = true;
+    binding.page_bank_count = 2;
+    binding.page_rows = 8192;
+    const bool down = layout == BindingLayout::W8A16MxmWeightWaveStriped;
+    binding.page_count = down ? paddedColumns / 128 : 1;
+    binding.page_granularity = down ? rows / 32 : paddedColumns / 64;
+    binding.page_items_per_slice_group = binding.page_granularity;
+    binding.page_role_group_count = 1;
+    binding.instruction_count = down ? rows / 32 * 8
+        : rows / 32 * (layout == BindingLayout::W8A16AttentionWeightStriped
+              ? paddedColumns / 128 * 8 : paddedColumns / 64 * 4);
+    auto aligned = binding;
+    aligned.shape[1] = paddedColumns;
+    aligned.byte_size = padded.size();
+    std::size_t packedBytes = 0;
+    for (std::uint32_t page = 0; page < binding.page_count; ++page) {
+        const auto tail = pack_weight_binding_page(binding, page, logical, {});
+        const auto standard = physical_rows(
+            pack_weight_binding_page(aligned, page, padded, {}));
+        for (const auto& [address, data] : physical_rows(tail))
+            require(standard.at(address) == data,
+                "tail weight differs from aligned zero-padded physical image");
+        packedBytes += tail.data.size();
+    }
+    require(packedBytes == logical.size(),
+        "paged tail dropped or duplicated a logical weight byte");
+    binding.shape[1] = columns - 1;
+    binding.byte_size = rows * (columns - 1);
+    logical.resize(binding.byte_size);
+    bool rejected = false;
+    try { (void)pack_weight_binding_page(binding, 0, logical, {}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "unaligned output tail was accepted");
+    if (layout != BindingLayout::W8A16AttentionWeightStriped) {
+        binding.shape[1] = columns - 32;
+        binding.byte_size = rows * (columns - 32);
+        logical.resize(binding.byte_size);
+        rejected = false;
+        try { (void)pack_weight_binding_page(binding, 0, logical, {}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "unimplemented single-tile O/FFN-down tail was accepted");
+    }
+}
+
 } // namespace
 
 int main()
 try {
     test_kv_cache_roundtrip();
+    test_paged_output_tail(BindingLayout::W8A16AttentionWeightStriped,
+        576, 576);
+    test_paged_output_tail(BindingLayout::W8A16AttentionWeightStriped,
+        576, 192);
+    test_paged_output_tail(BindingLayout::W8A16MxmWeightStriped, 576, 576);
+    test_paged_output_tail(BindingLayout::W8A16MxmWeightWaveStriped,
+        1536, 576);
     const auto data = logical_weight();
     const BinaryBinding binding = make_weight(1);
     const PackedWeightImage packed = pack_weight_binding(
