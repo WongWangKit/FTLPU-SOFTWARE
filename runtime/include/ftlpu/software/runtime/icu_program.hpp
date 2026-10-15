@@ -744,6 +744,10 @@ decode_mem_synchronized_icu_packet(
 // Recover the scheduled MEM idle slots for a direct CModel golden run or a
 // transport-plan check. The executable keeps its compiler-authored packets.
 BinaryProgram without_compiled_mem_write_sync(const BinaryProgram& compiled);
+// Host-only coarse-domain timing, kept separately from hardware i-MEM words,
+// lets rebinding recover the pre-SYNC queue phases without expanding FU issues.
+void record_compiler_sync_origins(BinaryProgram& compiled,
+    const BinaryProgram& before_sync);
 // Recover compiler-authored KV-cache page-out packets. Runtime links C2C TX
 // and DMA around the extracted MEM_READ_SYNC program after main execution.
 BinaryProgram without_compiled_mem_read_sync(const BinaryProgram& compiled);
@@ -828,6 +832,7 @@ bool is_mem_write_read_2d_raw_packet_header(
 MemIcuWriteRead2DInstruction decode_mem_write_read_2d_raw_packet(
     const QueueProgram& queue, std::size_t command_index);
 std::size_t fu_3d_raw_packet_word_count(QueueKind kind);
+std::size_t fu_3d_raw_packet_word_count(QueueKind kind, const QueueCommand& header);
 IcuLoop3D decode_fu_3d_raw_packet_loop(
     const QueueProgram& queue, std::size_t command_index);
 

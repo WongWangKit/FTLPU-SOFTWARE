@@ -2,9 +2,6 @@
 
 #include "FfnEmitterUtils.hpp"
 
-#include "ftlpu/compiler/Dialect/Schedule/Analysis/paged_weight_residency.hpp"
-
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
@@ -13,124 +10,14 @@
 namespace ftlpu::compiler::schedule::ffn_detail {
 namespace {
 
-bool isPagedWeight(mlir::DictionaryAttr placement)
-{
-    const auto paged = placement.getAs<mlir::BoolAttr>("paged_weight");
-    return paged && paged.getValue();
-}
-
-struct OccupiedPage {
-    int64_t index;
-    int64_t bank;
-};
-
-llvm::SmallVector<OccupiedPage> occupiedPages(
-    mlir::DictionaryAttr placement)
-{
-    const auto integerOr = [&](llvm::StringRef name, int64_t fallback) {
-        const auto value = placement.getAs<mlir::IntegerAttr>(name);
-        return value ? value.getInt() : fallback;
-    };
-    const int64_t bankCount = std::max<int64_t>(
-        1, integerOr("page_bank_count", 1));
-    const int64_t pageCount = std::max<int64_t>(
-        1, integerOr("page_count", 1));
-    const int64_t baseBank = integerOr("bank", 0);
-    const auto exactBanks = placement.getAs<mlir::ArrayAttr>("page_banks");
-    llvm::SmallVector<OccupiedPage> pages;
-    for (int64_t page = 0; page < pageCount; ++page) {
-        const int64_t bank = exactBanks
-                && page < static_cast<int64_t>(exactBanks.size())
-            ? llvm::cast<mlir::IntegerAttr>(exactBanks[page]).getInt()
-            : (baseBank + page) % bankCount;
-        pages.push_back({page, bank});
-    }
-    return pages;
-}
-
-bool residencyOverlaps(mlir::DictionaryAttr lhs,
-    mlir::DictionaryAttr rhs)
-{
-    for (const OccupiedPage lhsPage : occupiedPages(lhs))
-        for (const OccupiedPage rhsPage : occupiedPages(rhs))
-            if (pagedWeightResidencyOverlaps(
-                    lhs, lhsPage.index, lhsPage.bank,
-                    rhs, rhsPage.index, rhsPage.bank))
-                return true;
-    return false;
-}
-
-void collectPagedWeightPlacements(mlir::Attribute attribute,
-    llvm::SmallVectorImpl<mlir::DictionaryAttr>& placements)
-{
-    if (const auto dictionary =
-            llvm::dyn_cast<mlir::DictionaryAttr>(attribute)) {
-        if (isPagedWeight(dictionary)) placements.push_back(dictionary);
-        for (mlir::NamedAttribute entry : dictionary)
-            collectPagedWeightPlacements(entry.getValue(), placements);
-        return;
-    }
-    if (const auto array = llvm::dyn_cast<mlir::ArrayAttr>(attribute)) {
-        for (mlir::Attribute element : array)
-            collectPagedWeightPlacements(element, placements);
-    }
-}
-
-void collectProducerPagedWeightPlacements(mlir::Value value,
-    llvm::SmallPtrSetImpl<mlir::Operation*>& visited,
-    llvm::SmallVectorImpl<mlir::DictionaryAttr>& placements)
-{
-    mlir::Operation* operation = value.getDefiningOp();
-    if (!operation || !visited.insert(operation).second) return;
-    for (mlir::NamedAttribute attribute : operation->getAttrs())
-        collectPagedWeightPlacements(attribute.getValue(), placements);
-    for (mlir::Value operand : operation->getOperands())
-        collectProducerPagedWeightPlacements(operand, visited, placements);
-}
-
-bool overlapsPriorPagedWeight(mlir::DictionaryAttr candidate,
-    llvm::ArrayRef<mlir::DictionaryAttr> priorPlacements)
-{
-    for (mlir::DictionaryAttr prior : priorPlacements) {
-        if (residencyOverlaps(candidate, prior)) return true;
-    }
-    return false;
-}
-
-FfnProjectionOrder chooseProjectionOrder(PrimitiveFfnSchedulePlan& ffn,
-    stream::RouteOp gateRaw, stream::RouteOp upRaw,
-    const target::LPUTargetModel& target, bool localWeightDequant)
+FfnProjectionOrder chooseProjectionOrder(const target::LPUTargetModel& target)
 {
     if (target.throughput().mxms_per_hemisphere != 1)
         return FfnProjectionOrder::Interleaved;
-    // Gate and Up are different command bodies. A single physical MXM cannot
-    // keep both bodies resident and alternate them inside one loop domain, so
-    // serialize them even when all weights are already resident.
-    if (!localWeightDequant
-        || !isPagedWeight(gateRaw.getPlacement())
-        || !isPagedWeight(upRaw.getPlacement()))
-        return FfnProjectionOrder::GateThenUp;
-    const auto gatePageCount = gateRaw.getPlacement()
-        .getAs<mlir::IntegerAttr>("page_count");
-    const auto upPageCount = upRaw.getPlacement()
-        .getAs<mlir::IntegerAttr>("page_count");
-    // Single-page projections need no refill-dependent ordering, but still
-    // require a stable body for the one physical instruction queue.
-    if (gatePageCount && upPageCount
-        && gatePageCount.getInt() == 1 && upPageCount.getInt() == 1)
-        return FfnProjectionOrder::GateThenUp;
-    llvm::SmallPtrSet<mlir::Operation*, 32> visited;
-    llvm::SmallVector<mlir::DictionaryAttr, 8> priorPlacements;
-    collectProducerPagedWeightPlacements(
-        ffn.activation_route.getInput(), visited, priorPlacements);
-    const bool gateRefill = overlapsPriorPagedWeight(
-        gateRaw.getPlacement(), priorPlacements);
-    const bool upRefill = overlapsPriorPagedWeight(
-        upRaw.getPlacement(), priorPlacements);
-    if (gateRefill == upRefill)
-        return FfnProjectionOrder::GateThenUp;
-    return gateRefill ? FfnProjectionOrder::UpThenGate
-                      : FfnProjectionOrder::GateThenUp;
+    // One physical MXM executes the complete Gate domain, then the complete
+    // Up domain. Weight refill availability must not reverse this order;
+    // page-ready events absorb ingress delays and protect SRAM reuse.
+    return FfnProjectionOrder::GateThenUp;
 }
 
 mlir::DictionaryAttr orderDownPagesByProjectionRelease(
@@ -404,8 +291,7 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         target::StreamEndpoint::Mem,
         target::StreamEndpoint::MxmActivation,
         target::StreamDirection::East, activationSlices.front());
-    const FfnProjectionOrder projectionOrder = chooseProjectionOrder(
-        ffn, gateRaw, upRaw, target, execution->uses_local_dequant());
+    const FfnProjectionOrder projectionOrder = chooseProjectionOrder(target);
     auto projectionTimeline = planFfnProjectionTimeline(
         {static_cast<int64_t>(ffn.getM()),
             static_cast<int64_t>(ffn.getK()),

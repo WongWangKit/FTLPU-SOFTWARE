@@ -168,9 +168,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         : hidden * query_width
             / (target.memory().hemispheres
                 * target.memory().w8a16_weight_slice_count * tile);
+    const auto module = op->getParentOfType<mlir::ModuleOp>();
+    const bool graph_weight_pages = module && module->hasAttr("ftlpu.runtime_weight_pages");
     const bool requires_weight_tiling = paged_weights
         && target.throughput().mxms_per_hemisphere == 1
-        && (std::max({q_weight_rows, k_weight_rows, v_weight_rows,
+        && (graph_weight_pages || std::max({q_weight_rows, k_weight_rows, v_weight_rows,
                 o_weight_rows}) > target.memory().sram_depth_rows
             || q_weight_rows + k_weight_rows + v_weight_rows
                     + o_weight_rows
@@ -317,7 +319,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         : transient_value_base;
     const int64_t qk_norm_scratch_base = std::max(
         kv_cache_enabled ? transient_value_base : value_base + value_rows,
-        rope_product_base + rope_product_rows);
+        rope_mirror_base + rope_rows);
     const int64_t qk_norm_input_base = qk_norm_scratch_base;
     const int64_t qk_norm_output_base = qk_norm_scratch_base;
     const int64_t causal_mask_base = target.uses_dedicated_slice_roles()
@@ -888,14 +890,16 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 > static_cast<int64_t>(rope_table_slices.size()))
             return mlir::failure();
         const llvm::SmallVector<int64_t, 2> candidates {
-            isolate_probability_from_runtime_weight_plane
+            graph_weight_pages ? activation_storage[12+offset]
+                : isolate_probability_from_runtime_weight_plane
                 ? weightStorage[weightStorage.size() - 4 + offset]
                 : rope_table_slices[static_cast<std::size_t>(offset)],
-            isolate_probability_from_runtime_weight_plane
+            graph_weight_pages ? activation_storage[13+offset]
+                : isolate_probability_from_runtime_weight_plane
                 ? weightStorage[weightStorage.size() - 3 + offset]
                 : rope_table_slices[static_cast<std::size_t>(offset + 1)]};
         return physical_allocator.allocate({name.str(), 2,
-            causal_mask_base, tile - 1, 2, 3, candidates, true,
+            graph_weight_pages ? qk_norm_scratch_base+qk_norm_matrix_rows+1 : causal_mask_base, tile - 1, 2, 3, candidates, true,
             mask_banks});
     };
     auto mask0 = allocate_mask("causal_mask_mxm0", 0);
@@ -1021,6 +1025,25 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     if (mlir::failed(require_allocation(
             mlir::succeeded(context), "context")))
         return mlir::failure();
+    mlir::FailureOr<tensor::PhysicalAllocation> gate_input = mlir::failure();
+    mlir::FailureOr<tensor::PhysicalAllocation> gated_context = mlir::failure();
+    if (graph.output_gate) {
+        const llvm::SmallVector<int64_t, 2> gate_banks {0, 1};
+        const int64_t gate_base = std::max({
+            qk_norm_scratch_base + qk_norm_matrix_rows + 1,
+            rope_staging_base + rope_staging_rows, rope_mirror_base + rope_rows});
+        gate_input = physical_allocator.allocate({"output_gate", 2, gate_base,
+            seq_len * query_width / tile, 0, 7, scratch_candidates, false, gate_banks});
+        gated_context = physical_allocator.allocate({"gated_context",
+            static_cast<int64_t>(context->slices.size()), 0, context_rows,
+            4, 7, scratch_candidates, true, gate_banks,
+            mlir::succeeded(gate_input) ? llvm::ArrayRef<int64_t>(gate_input->slices)
+                                       : llvm::ArrayRef<int64_t>{}});
+        if (mlir::failed(gate_input) || mlir::failed(gated_context)) {
+            op.emitError("cannot allocate independent attention output gate buffers");
+            return mlir::failure();
+        }
+    }
     const llvm::SmallVector<int64_t, 1> result_banks {
         secondary_scratch_bank};
     auto vector_result = physical_allocator.allocate({"result",
@@ -1090,12 +1113,23 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     };
     auto inheritedInputPlacement =
         get_value_placement(graph.query.getLhs());
-    const auto inputPlacement = mlir::succeeded(inheritedInputPlacement)
+    auto inputPlacement = mlir::succeeded(inheritedInputPlacement)
         ? *inheritedInputPlacement
         : make_attention_placement(rewriter,
             "fp16_mxm_activation_planar",
             activation_slices, 0, seq_len * hidden / tile,
             "both");
+    if (graph_weight_pages && mlir::failed(inheritedInputPlacement)) {
+        // Keep the complete activation tensor out of query-IW storage.
+        // Q normalization/RoPE precedes K/V projection in the serial path;
+        // its query-IW writes may reuse the short-lived planar staging pair.
+        // The shared RMSNorm distributed layout remains live throughout QKV.
+        const auto distributed = target.mxm_distributed_activation_slices();
+        inputPlacement = make_attention_placement(rewriter,
+            "fp16_mxm_distributed_16", distributed, 0,
+            (seq_len / tile) * (hidden / tile) * target.throughput().tile_rows,
+            "both", scratch_bank);
+    }
     const int64_t blocks_per_rotary_half =
         std::max<int64_t>(1, head_blocks / 2);
     const auto make_segment = [&](int64_t reduction_begin,
@@ -1223,11 +1257,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             exp1->bank)),
         rewriter.getNamedAttr("causal_mask", make_attention_placement(rewriter,
             "fp16_causal_mask_tile", mask0->slices,
-            causal_mask_base, tile - 1, "both",
+            mask0->base_row, tile - 1, "both",
             mask0->bank)),
         rewriter.getNamedAttr("causal_mask_mxm1", make_attention_placement(rewriter,
             "fp16_causal_mask_tile", mask1->slices,
-            causal_mask_base, tile - 1, "both",
+            mask1->base_row, tile - 1, "both",
             mask1->bank)),
         rewriter.getNamedAttr("fused_score", make_attention_placement(rewriter,
             "fp32_score_block", fused_score0,
@@ -1371,6 +1405,18 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             "value_bias", value_bias, value_bias_base, value_bias_rows);
         plan = plan_attributes.getDictionary(rewriter.getContext());
     }
+    if (graph.output_gate) {
+        mlir::NamedAttrList entries(plan);
+        entries.set("output_gate", make_attention_placement(rewriter,
+            "fp16_pair_planar", gate_input->slices, gate_input->base_row,
+            seq_len * query_width / tile, "both", gate_input->bank));
+        mlir::NamedAttrList gated(contextPlacement);
+        gated.set("slices", rewriter.getI64ArrayAttr(gated_context->slices));
+        gated.set("base_row", rewriter.getI64IntegerAttr(gated_context->base_row));
+        gated.set("bank", rewriter.getI64IntegerAttr(gated_context->bank));
+        entries.set("gated_context", gated.getDictionary(rewriter.getContext()));
+        plan = entries.getDictionary(rewriter.getContext());
+    }
     auto config = rewriter.getDictionaryAttr({
         rewriter.getNamedAttr(
             "seq_len", rewriter.getI64IntegerAttr(seq_len)),
@@ -1406,6 +1452,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr(
             "output_weight_scale", graph.output.getRhsScaleAttr()),
     });
+    if (auto frequencies = graph.query_rope->getAttr("inverse_frequencies")) {
+        mlir::NamedAttrList attributes(config);
+        attributes.set("rope_inverse_frequencies", frequencies);
+        config = attributes.getDictionary(rewriter.getContext());
+    }
     if (has_qk_norm) {
         mlir::NamedAttrList config_attributes(config);
         config_attributes.set("qk_norm_epsilon",
@@ -1560,7 +1611,16 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         transposedProbability, transposedValue, "pv",
         matrixType(seq_len, query_width),
         subplan({"context"}));
-    auto output = createProjection(pv.getResult(),
+    mlir::Value gatedContext = pv.getResult();
+    if (graph.output_gate) {
+        mlir::OperationState state(op.getLoc(), tensor::SigmoidMultiplyTaskOp::getOperationName());
+        state.addOperands({gatedContext, graph.output_gate.getGate()});
+        state.addTypes(gatedContext.getType());
+        state.addAttribute("config", config);
+        state.addAttribute("memory_plan", subplan({"output_gate", "gated_context"}));
+        gatedContext = rewriter.create(state)->getResult(0);
+    }
+    auto output = createProjection(gatedContext,
         graph.output.getRhs(), {}, "output",
         graph.output.getResult().getType(),
         subplan({"output_activation", "output_weight", "result"}));

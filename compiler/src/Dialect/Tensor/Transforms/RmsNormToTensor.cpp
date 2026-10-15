@@ -177,17 +177,20 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             "RMSNorm normalized scratch does not fit after the live input");
         return mlir::failure();
     }
+    // The feedback pass reads its input throughout normalization. Keep its
+    // result in the opposite bank even for targets without dedicated roles:
+    // disjoint addresses do not allow two domains to share one MEM ICU.
     scratch.push_back(fixed_allocation(PlacementKind::VxmResult,
         feedbackInputSlices, firstScratchBase,
         distributedRows + tokenBlocks,
         physicalRows * hidden * 2 + physicalRows * 2,
         "fp16_vxm_distributed_16", "both",
-        target.uses_dedicated_slice_roles() ? resultBank : workingBank));
+        resultBank));
     scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
         normalizedSlices, normalizedScratchBase,
         distributedRows, physicalRows * hidden * 2,
         "fp16_vxm_distributed_16", "both",
-        target.uses_dedicated_slice_roles() ? inputBank : workingBank));
+        inputBank));
     const auto distributedResultSlices =
         target.mxm_distributed_activation_slices();
     const Allocation result = fixed_allocation(PlacementKind::FinalResult,
@@ -195,7 +198,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         target.uses_dedicated_slice_roles() ? 0 : 5632,
         physicalRows * hidden / 256, matrixBytes,
         "fp16_mxm_distributed_16", "both",
-        target.uses_dedicated_slice_roles() ? resultBank : workingBank);
+        resultBank);
     if (mlir::failed(planner.bind(op.getInput(), input))
         || mlir::failed(planner.bind(op.getWeight(), weight))
         || mlir::failed(planner.bind(op.getResult(), result))) {

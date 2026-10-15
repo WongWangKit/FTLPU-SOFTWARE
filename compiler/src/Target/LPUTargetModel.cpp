@@ -124,7 +124,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
         const auto* topology = require_object("topology");
         const auto* mem = require_object("mem");
         const auto* sr = require_object("sr");
-        require_object("stream_topology");
+        const auto* streamTopology = require_object("stream_topology");
         const auto* mxm = require_object("mxm");
         const auto* vxm = require_object("vxm");
         if (!error.empty()) return mlir::failure();
@@ -200,7 +200,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
             return mlir::failure();
         }
         if (model.throughput_.mxm_accumulator_blocks > 256) {
-            error = "mxm.accum_contexts exceeds the 13-bit accumulator address capacity";
+            error = "mxm.accum_contexts exceeds the supported 256 contexts";
             return mlir::failure();
         }
         const auto rows_per_bank = model.memory_.sram_depth_rows;
@@ -220,9 +220,32 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
         model.streams_.c2c_streams_per_direction =
             model.throughput_.lanes_per_tile;
         model.streams_.c2c_bytes_per_stream_per_cycle =
-            model.memory_.bytes_per_word;
-        model.streams_.mem_slices_per_register_group =
-            model.throughput_.tile_rows;
+            std::min<int64_t>(32, model.memory_.bytes_per_word);
+        if (const auto* c2c = root->getObject("c2c")) {
+            if (!read_required(c2c, "c2c", "beat_bytes",
+                    model.streams_.c2c_bytes_per_stream_per_cycle))
+                return mlir::failure();
+        } else if (root->get("c2c")) {
+            error = "c2c must be a JSON object";
+            return mlir::failure();
+        }
+        model.icu_memory_.macro_encoding_version =
+            model.memory_.bytes_per_word > 32
+                || model.throughput_.mxm_accumulator_blocks * model.memory_.bytes_per_word > 8192 ? 2 : 1;
+        const auto* streamBindings = streamTopology->getObject("bindings");
+        const auto* memBinding = streamBindings ? streamBindings->getObject("mem") : nullptr;
+        if (!memBinding || !read_required(memBinding,
+                "stream_topology.bindings.mem", "slices_per_group",
+                model.streams_.mem_slices_per_register_group)) {
+            if (error.empty()) error = "missing stream_topology.bindings.mem";
+            return mlir::failure();
+        }
+        if (model.streams_.mem_slices_per_register_group <= 0
+            || model.memory_.slices_per_hemisphere
+                % model.streams_.mem_slices_per_register_group != 0) {
+            error = "MEM slices must divide evenly into positive stream MEM groups";
+            return mlir::failure();
+        }
         model.streams_.mem_boundary_register_columns =
             model.memory_.slices_per_hemisphere
                 / model.streams_.mem_slices_per_register_group
@@ -764,13 +787,13 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         return fail("target feature switches must be zero or one");
     if (throughput_.mxm_accumulator_blocks > 256)
         return fail(
-            "mxm_accumulator_blocks exceeds the 13-bit address encoding");
+            "mxm_accumulator_blocks exceeds the supported 256 contexts");
     if (streams_.encoded_streams
         < 2 * streams_.streams_per_direction)
         return fail("encoded_streams must cover east and west stream ranges");
-    if (streams_.c2c_bytes_per_stream_per_cycle != memory_.bytes_per_word)
+    if (streams_.c2c_bytes_per_stream_per_cycle > memory_.bytes_per_word)
         return fail(
-            "a C2C lane must carry one complete SRAM row per cycle");
+            "a C2C beat must fit within one SRAM row");
     if (streams_.system_register_columns
         < streams_.mem_boundary_register_columns)
         return fail("system register columns must cover MEM boundary columns");

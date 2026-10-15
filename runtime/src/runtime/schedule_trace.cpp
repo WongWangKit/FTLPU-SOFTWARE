@@ -284,11 +284,11 @@ Packet read_raw_trace_packet(
     const QueueProgram& queue, std::size_t commandIndex)
 {
     if (commandIndex > queue.commands.size()
-        || Packet::kWordCount > queue.commands.size() - commandIndex)
+        || fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(commandIndex)) > queue.commands.size() - commandIndex)
         throw std::logic_error("truncated raw FU packet in schedule trace");
     const auto expectedKind = raw_instruction_kind(queue.kind);
     Packet packet{};
-    for (std::size_t word = 0; word < Packet::kWordCount; ++word) {
+    for (std::size_t word = 0; word < fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(commandIndex)); ++word) {
         const auto& command = queue.commands[commandIndex + word];
         const auto wordIndexMask = expectedKind == InstructionKind::Sxm
             ? std::uint32_t{0x7} : std::uint32_t{0x3};
@@ -1008,7 +1008,7 @@ void write_schedule_trace_csv(const BinaryProgram& program,
                 cursor = write_raw_fu_packet(
                     output, queue, commandIndex, cursor,
                     program.hardware.mxms_per_hemisphere);
-                commandIndex += fu_3d_raw_packet_word_count(queue.kind) - 1;
+                commandIndex += fu_3d_raw_packet_word_count(queue.kind, command) - 1;
                 previous = nullptr;
                 history.clear();
                 continue;

@@ -3,6 +3,7 @@
 #include "ftlpu/software/runtime/imem_capacity.hpp"
 #include "ftlpu/software/runtime/model_session.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -17,6 +18,13 @@ int main(int argc, char** argv)
 try {
     using namespace ftlpu::software::runtime;
     if (argc != 4 && argc != 5) throw std::runtime_error("usage: compiled_stage_file_runner program.ftlpu inputs.txt output-prefix [runtime-pipeline.csv]");
+#ifdef FTLPU_FILE_RUNNER_LINK_CHECK
+#ifdef _WIN32
+    _putenv_s("FTLPU_SESSION_LINK_ONLY", "1");
+#else
+    setenv("FTLPU_SESSION_LINK_ONLY", "1", 1);
+#endif
+#endif
     const auto program = read_binary_program(argv[1]);
     const auto capacity = analyze_physical_imem(program);
     for (const auto& queue : capacity.queues)
@@ -24,9 +32,11 @@ try {
             std::cerr << "iMEM overflow kind=" << static_cast<int>(queue.kind)
                       << " queue=" << queue.index << " slots=" << queue.physical_slots
                       << " depth=" << queue.depth << '\n';
-    if (!program.weight_page_uses.empty()) {
-        // Use the same generic executable paging path as other models. The
-        // compiler binary already contains MEM_WRITE_SYNC and ICU SYNC.
+    if (!program.weight_page_uses.empty()
+        || std::getenv("FTLPU_FILE_RUNNER_MODEL_SESSION") != nullptr) {
+        // Use the generic executable session for paging, or explicitly for
+        // C2C I/O of a resident program. Paged compiler images already carry
+        // their MEM_WRITE_SYNC and page SYNC contracts.
         ModelPackage package;
         package.model_name = "compiled_program";
         package.architecture = "native_icu";
@@ -73,16 +83,41 @@ try {
         for (const auto& [name,bytes] : initialInputs) session.set_input(name,bytes);
         try { session.run(128); }
         catch (...) {
+            if (std::getenv("FTLPU_FILE_RUNNER_DEBUG_ICU") != nullptr) {
+                for (std::size_t queue = 0; queue < ftlpu::InstructionControlUnit::kMemQueues; ++queue) {
+                    const auto& state = dma->chip().icu().mem_iq(queue);
+                    const auto& trace = state.last_trace();
+                    if (trace.issue_pc)
+                        std::cerr << "debug mem queue=" << queue << " local_cycle=" << trace.cycle
+                                  << " pc=" << *trace.issue_pc << '\n';
+                }
+            }
             try {
                 session.write_last_linked_program(std::string(argv[3]) + ".runtime.ftlpu");
                 session.write_pre_execution_icu_programs(std::string(argv[3]) + ".pre_execution");
                 if (argc == 5) session.write_execution_trace_csv(argv[4]);
+                if (std::getenv("FTLPU_FILE_RUNNER_FAILURE_SNAPSHOT") != nullptr) {
+                    // Debug only: preserve raw final SRAM values if external
+                    // transport fails. These are never validation outputs.
+                    CModelRuntime snapshot(dma->chip());
+                    snapshot.load(read_binary_program(std::string(argv[3]) + ".runtime.ftlpu"), false);
+                    for (const auto& b : program.bindings) {
+                        if (b.access != BindingAccess::Output) continue;
+                        const auto bytes = snapshot.download_output(b.index);
+                        std::ofstream file(std::string(argv[3]) + ".diagnostic." + std::to_string(b.index) + ".bin", std::ios::binary);
+                        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                    }
+                }
             } catch (...) {}
             throw;
         }
         session.write_last_linked_program(std::string(argv[3]) + ".runtime.ftlpu");
         session.write_pre_execution_icu_programs(std::string(argv[3]) + ".pre_execution");
         if (argc == 5) session.write_execution_trace_csv(argv[4]);
+        if (std::getenv("FTLPU_SESSION_LINK_ONLY") != nullptr) {
+            std::cout << "linked_only=1 arithmetic_executed=0\n";
+            return 0;
+        }
         for (const auto& b : program.bindings) {
             if (b.access != BindingAccess::Output) continue;
             const auto& bytes = session.value("output" + std::to_string(b.index));
@@ -104,6 +139,11 @@ try {
     CModelRuntime runtime(*system);
     if (argc == 5) runtime.enable_execution_trace();
     runtime.load(program);
+    if (std::getenv("FTLPU_SESSION_LINK_ONLY") != nullptr) {
+        write_binary_program(program, std::string(argv[3]) + ".runtime.ftlpu");
+        std::cout << "linked_only=1 arithmetic_executed=0\n";
+        return 0;
+    }
     std::ifstream inputList(argv[2]);
     if (!inputList) throw std::runtime_error("cannot read input list");
     std::string path;

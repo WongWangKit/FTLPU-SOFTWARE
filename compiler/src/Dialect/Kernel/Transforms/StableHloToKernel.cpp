@@ -76,6 +76,7 @@ struct AttentionMatch {
     float rope_theta;
     int64_t rotary_dim;
     float rope_attention_factor;
+    mlir::DenseFPElementsAttr rope_inverse_frequencies;
     bool causal;
     llvm::SmallPtrSet<mlir::Operation*, 32> operations;
 };
@@ -460,6 +461,7 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
         100000.0f,
         head_dim,
         1.0f,
+        {},
         causal,
         {},
     };
@@ -470,6 +472,17 @@ std::optional<AttentionMatch> match_standard_attention(mlir::Operation* output_d
         auto type = llvm::dyn_cast<mlir::RankedTensorType>(cosine->getResult(0).getType());
         if (type && type.getRank() == 2)
             match.rotary_dim = 2 * type.getDimSize(1);
+        if (auto* angle = cosine->getOperand(0).getDefiningOp();
+            named(angle, "stablehlo.multiply")) {
+            for (auto operand : angle->getOperands()) {
+                auto* constant = find_backward(operand, "stablehlo.constant");
+                auto frequencies = constant ? constant->getAttrOfType<mlir::DenseFPElementsAttr>("value")
+                                            : mlir::DenseFPElementsAttr {};
+                if (frequencies && frequencies.getType().getRank() == 1
+                    && frequencies.getNumElements() == match.rotary_dim / 2)
+                    match.rope_inverse_frequencies = frequencies;
+            }
+        }
         for (auto* user : cosine->getResult(0).getUsers()) {
             if (!named(user, "stablehlo.multiply")) continue;
             for (auto operand : user->getOperands()) {
@@ -644,6 +657,8 @@ public:
                     rewriter.getF32FloatAttr(match->rope_theta));
                 state.addAttribute("rotary_dim", rewriter.getI64IntegerAttr(match->rotary_dim));
                 state.addAttribute("attention_factor", rewriter.getF32FloatAttr(match->rope_attention_factor));
+                if (match->rope_inverse_frequencies)
+                    state.addAttribute("inverse_frequencies", match->rope_inverse_frequencies);
                 return llvm::cast<kernel::RopeOp>(rewriter.create(state));
             };
             const auto create_head_norm = [&](mlir::Value input,

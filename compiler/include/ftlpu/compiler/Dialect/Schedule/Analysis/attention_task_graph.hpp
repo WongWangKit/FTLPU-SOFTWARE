@@ -14,7 +14,7 @@ namespace ftlpu::compiler::schedule {
 struct AttentionTaskGraph
     : analysis::AttentionTaskGraphView<stream::ProjectionTaskOp,
           stream::RopeTaskOp, stream::BatchMatmulTaskOp,
-          stream::SoftmaxTaskOp, stream::TransposeTaskOp> {
+          stream::SoftmaxTaskOp, stream::TransposeTaskOp, stream::SigmoidMultiplyTaskOp> {
     mlir::DictionaryAttr getMemoryPlan() const {
         auto op = output;
         return *op.getMemoryPlan();

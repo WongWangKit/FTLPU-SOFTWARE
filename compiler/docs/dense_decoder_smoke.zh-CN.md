@@ -36,12 +36,24 @@ Attention 的 Q/K/V/O 全部能驻留一个 bank 时仍使用分离 slice group�
 这条路径不在 projection 时间轴里预留预测的 DDR 传输时长，实际缺页由各参与
 ICU 的 page-ready 同步吸收。K 不会覆盖仍在读取的 Q，O 不会覆盖仍在读取的 V；
 后续 Gate/Up 也通过同一物理驻留区间检查等待 Attention 权重释放。
-C2C 每次完整执行一页，不交错执行两条 ICU 指令。预取调度优先考虑首次
-消费时间；较晚消费的大页若会挡住即将释放、且更早消费的页，就等待后者
-先传。能在释放前传完的短页仍可利用空窗。同一 binding 的多页保持原有
-物理释放顺序，避免逆转链接后跨页同步的先后关系。
+当前每半球一个 MXM 的 FFN 固定执行完整 Gate → 完整 Up。Gate 需要补页
+时由 page-ready 同步等待，不再根据 Attention 驻留重叠自动改成 Up 优先。
+Down 页按 Gate、Up 的实际释放顺序复用权重区域。
+编译器插入页 SYNC 时，在 host 元数据中记录粗域相位变化边界
+（`icu.sync_origin.*`）。运行时重绑定页事件前按这些边界还原原始
+`wait_cycle` 和地址重定位位置，避免重复插入同步后改变 MEM/MXM 的相对相位。
+这部分不增加硬件 i-MEM 指令，也不展开 FU 指令；KV `MEM_READ_SYNC` 保留。
+权重页预取严格按编译器 `ready_cycle` 的首次消费顺序执行，同周期保留
+稳定顺序。单 MXM 的 FFN 因而是 Gate page0..N → Up page0..N →
+Down page0..N。bank 或 SR 较早空闲不能让后消费的页插队；运行前预装
+也只允许该消费序列的连续前缀。后页的 MEM_WRITE_SYNC 不会越过前页
+的片内传输下界去占用更早的空窗，避免同步事件产生反向依赖。每次完整
+执行一页，不交错执行两条 ICU 指令；实际外部完成仍由动态事件保护。
 `dense_attention_ping_pong_test` 覆盖 bank 交替和 direct MEM_3D 到最终
-`weight_page` 的预取标记传递；数值与实际重叠仍需 CModel 流水验证。
+`weight_page` 的预取标记传递。Llama3.2-1B 与 Phi-4-mini 已通过 seq32
+整层合成非零 Q/K 数值复测，实际 CSV 确认 V/Q、K/V、O/K 的预取在
+前序 projection 结束前启动，部分页已在计算开始前就完成。结果保存在 `results/dense_transformers_nonzero_qk` 对应模型目录的
+`attention_ping_pong.json`、`pipeline.run.json` 和 `pipeline.html`。
 
 每次更新对应结果目录，保存阶段日志、`result.json`、fixture manifest、参考元数据、编译产物和 `linked.ftlpu`。后者是本次真实执行的链接后 ICU 程序，包含 C2C 和运行时同步。设置 `FTLPU_DENSE_PIPELINE_CSV` 可导出完整运行时功能单元流水 CSV，设置 `FTLPU_SESSION_PROGRESS=1` 可打印仿真进度。
 
@@ -54,3 +66,15 @@ C2C 每次完整执行一页，不交错执行两条 ICU 指令。预取调度�
 在零等待的 ICU 指令边界插入 SYNC 时，该队列会多占一个 issue 周期；如果其他队列在 wait_cycle 中吸收该 SYNC，只使用链接后指令位置计算相位就会使计算与写回错开。释放相位因此扣除同步占用造成的累计漂移，保持编译时的 producer/consumer 间隔。回归测试同时覆盖有等待和零等待的跨域边界。
 
 V projection 合并 WRITE_3D 的地址域按照每组四个 output block 推进，不能固定按一个 head 推进。head_dim=64 时，每个半球下一组相隔两个 KV head；head_dim=128 时相隔一个。Llama3.2-1B（8 个 KV head、head_dim=64）的完整数值测试覆盖该情况，MiniCPM 的两个 KV head 仅有一组，不能单独验证这个跨组步长。
+
+所有 Attention projection 路径均不把 `page_transfer_cycles` 加入计算开始时间，
+包括旧的非乒乓标记路径。该属性仅为传输分析元数据。FFN 的
+`weightStartupDelay` 是 MXM 有限 weight buffer 的片内结果窗口约束，
+不含 DDR 延迟；`FfnWeightTileTaskPlan` 的外部带宽估算只供分析测试，
+不参与执行指令生成。
+预取链接计划的 transport duration 也只计确定的片内 C2C 下界，不再
+使用 DDR 预计周期占用 MEM 空窗或推迟下一页。运行时等待前一页真实
+DDR/RX/MEM 写入完成才放行下一条页指令，消费者由各 ICU 的 page-ready
+事件同步放行。DDR 频率、带宽、延迟和 jitter 的变化不改变编译的计算
+周期及逻辑预取等待，实际物理停顿由 CModel 的完成事件决定。
+回归测试覆盖旧非乒乓路径、串行多页 C2C 和不同 DDR 参数下逻辑计划一致。

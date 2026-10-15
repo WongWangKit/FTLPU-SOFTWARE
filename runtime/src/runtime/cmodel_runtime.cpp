@@ -518,6 +518,13 @@ void CModelRuntime::initialize_internal_data(const BinaryProgram& program)
                 || !std::isfinite(binding.rope_theta)
                 || binding.rope_theta <= 1.0f)
                 throw std::logic_error("invalid internal RoPE-table binding");
+            const auto rotaryWidth = binding.rope_rotary_dim
+                ? binding.rope_rotary_dim : binding.rope_head_dim;
+            if (!binding.rope_inverse_frequencies.empty()
+                && (binding.rope_inverse_frequencies.size() != rotaryWidth / 2
+                    || !std::ranges::all_of(binding.rope_inverse_frequencies,
+                        [](float frequency) { return std::isfinite(frequency) && frequency > 0.0f; })))
+                throw std::logic_error("invalid explicit RoPE inverse frequencies");
             const std::size_t sequence =
                 static_cast<std::size_t>(binding.shape[0]);
             const std::size_t dimensions =
@@ -542,7 +549,9 @@ void CModelRuntime::initialize_internal_data(const BinaryProgram& program)
                     const auto rotary = binding.rope_rotary_dim
                         ? binding.rope_rotary_dim : binding.rope_head_dim;
                     const bool rotated = dimension < rotary / 2;
-                    const float inverse = rotated ? 1.0f / std::pow(
+                    const float inverse = rotated && !binding.rope_inverse_frequencies.empty()
+                        ? binding.rope_inverse_frequencies[dimension]
+                        : rotated ? 1.0f / std::pow(
                         binding.rope_theta,
                         static_cast<float>(2 * dimension)
                             / rotary) : 0.0f;

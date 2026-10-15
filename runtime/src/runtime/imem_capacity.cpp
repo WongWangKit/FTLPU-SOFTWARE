@@ -213,7 +213,7 @@ std::size_t peak_macro_contexts(const QueueProgram& queue)
                 static_cast<void>(decode_mem_write_read_2d(queue, index));
             else
                 static_cast<void>(decode_fu_3d_raw_packet_loop(queue, index));
-            index += fu_3d_raw_packet_word_count(queue.kind) - 1;
+            index += fu_3d_raw_packet_word_count(queue.kind, queue.commands[index]) - 1;
             continue;
         }
         if (is_fu_3d_raw_word_command(command))
@@ -286,7 +286,7 @@ std::size_t peak_fu_3d_contexts(const QueueProgram& queue)
             previousIssueCycle = interval.second;
             hasPreviousIssue = true;
             cursor = interval.second + 1;
-            index += fu_3d_raw_packet_word_count(queue.kind) - 1;
+            index += fu_3d_raw_packet_word_count(queue.kind, queue.commands[index]) - 1;
             continue;
         }
         if (is_fu_3d_raw_word_command(command))
@@ -515,7 +515,7 @@ CmodelAbstractImemReport analyze_cmodel_abstract_imem(
                         loop_3d_points(
                             decode_fu_3d_raw_packet_loop(queue, index)));
                 }
-                index += fu_3d_raw_packet_word_count(queue.kind) - 1;
+                index += fu_3d_raw_packet_word_count(queue.kind, queue.commands[index]) - 1;
                 continue;
             }
             if (is_fu_3d_raw_word_command(command))

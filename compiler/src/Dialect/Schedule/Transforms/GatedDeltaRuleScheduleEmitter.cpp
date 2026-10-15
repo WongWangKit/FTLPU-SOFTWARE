@@ -397,6 +397,8 @@ private:
         mlir::DictionaryAttr destination, int64_t destinationAddress,
         int64_t rows, int64_t cursor)
     {
+        if (source == destination && sourceAddress == destinationAddress)
+            return cursor;
         const int64_t tileCycles = 32
             / target_.throughput().mem_read_bytes_per_cycle;
         const int64_t count = rows;

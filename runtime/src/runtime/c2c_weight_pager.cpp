@@ -196,13 +196,13 @@ MemIcuInstruction decode_mem_3d_instruction(
     const QueueProgram& queue, std::size_t commandIndex)
 {
     if (queue.kind != QueueKind::Mem
-        || commandIndex + isa::EncodedMemIcu3DPacket::kWordCount
+        || commandIndex + fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(commandIndex))
             > queue.commands.size()
         || !is_fu_3d_raw_packet_header(queue.commands[commandIndex]))
         throw std::logic_error("expected MEM READ/WRITE_3D packet");
     isa::EncodedMemIcu3DPacket packet{};
     for (std::size_t word = 0;
-         word < isa::EncodedMemIcu3DPacket::kWordCount; ++word) {
+         word < fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(commandIndex)); ++word) {
         const auto& source = queue.commands[commandIndex + word];
         if (source.instruction_kind != InstructionKind::Mem
             || source.word_count
@@ -246,7 +246,7 @@ std::vector<Native4ActivationStarts> find_native4_activation_starts(
                     ++pc;
                 } else if (is_fu_3d_raw_packet_header(command)) {
                     isa::EncodedMxmComputeIcu3DPacket packet {};
-                    for (std::size_t word = 0; word < packet.kWordCount; ++word)
+                    for (std::size_t word = 0; word < fu_3d_raw_packet_word_count(queue.kind, command); ++word)
                         for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
                             packet.words[word].lanes[lane] = queue.commands[pc + word].words[lane];
                     const auto instruction = isa::decode_mxm_compute_icu_3d_instruction(packet);
@@ -261,7 +261,7 @@ std::vector<Native4ActivationStarts> find_native4_activation_starts(
                                 starts[index][hemisphere] = Native4ActivationStart {
                                     issue, instruction.activation_stream_base};
                     cursor += loop_cycles(instruction.loop);
-                    pc += packet.kWordCount;
+                    pc += fu_3d_raw_packet_word_count(queue.kind, command);
                 } else {
                     ++pc;
                 }
@@ -335,11 +335,11 @@ std::vector<std::pair<std::size_t, std::size_t>> native4_launch_producers(
                             producers.emplace_back(barriers[i].second, queue.index);
                     }
                 cursor += loop_cycles(instruction.loop);
-                pc += fu_3d_raw_packet_word_count(queue.kind);
+                pc += fu_3d_raw_packet_word_count(queue.kind, command);
             } else if (is_mem_write_read_2d_raw_packet_header(command)) {
                 cursor += detail::mem_icu_write_read_2d_last_issue_cycle(
                     decode_mem_write_read_2d_raw_packet(queue, pc)) + 1;
-                pc += fu_3d_raw_packet_word_count(queue.kind);
+                pc += fu_3d_raw_packet_word_count(queue.kind, command);
             } else {
                 ++cursor;
                 ++pc;
@@ -385,7 +385,7 @@ void retreat_native4_activation_producer_barriers(
                           decode_mem_write_read_2d_raw_packet(
                               queue, commandIndex))
                 + 1;
-            commandIndex += fu_3d_raw_packet_word_count(queue.kind);
+            commandIndex += fu_3d_raw_packet_word_count(queue.kind, command);
             continue;
         }
         if (is_fu_3d_raw_packet_header(command)) {
@@ -425,7 +425,7 @@ void retreat_native4_activation_producer_barriers(
                 }
             }
             cursor = commandEnd;
-            commandIndex += fu_3d_raw_packet_word_count(queue.kind);
+            commandIndex += fu_3d_raw_packet_word_count(queue.kind, command);
             continue;
         }
         if (is_mem_stream_nd_command(command)) {
@@ -618,7 +618,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     activeWindows.emplace_back(position + loop.wait_cycle,
                         position + loop_cycles(loop));
                     position += loop_cycles(loop);
-                    pc += fu_3d_raw_packet_word_count(queue.kind);
+                    pc += fu_3d_raw_packet_word_count(queue.kind, command);
                 } else {
                     // Conservatively retain fences around other commands.
                     activeWindows.emplace_back(position, position + 1);
@@ -770,7 +770,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
             }
             if (is_mem_write_read_2d_raw_packet_header(command)
                 || is_fu_3d_raw_packet_header(command)) {
-                const auto words = fu_3d_raw_packet_word_count(queue.kind);
+                const auto words = fu_3d_raw_packet_word_count(queue.kind, command);
                 const bool writeRead =
                     is_mem_write_read_2d_raw_packet_header(command);
                 const auto loop = writeRead
@@ -911,7 +911,7 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
     const C2cWeightPage& page,
     const SystemHardwareConfiguration& hardware,
     std::uint32_t firstSyncTag,
-    std::size_t reservationCycles)
+    std::size_t reservationCycles, bool dynamicReservation)
 {
     validate_weight_page(page, hardware);
     const bool useMinimumReservation = reservationCycles == 0;
@@ -930,6 +930,7 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
 
     std::array<std::size_t, InstructionControlUnit::kMemQueues>
         vectorsPerQueue{};
+    std::array<std::size_t, InstructionControlUnit::kMemQueues> packetsPerQueue{};
     for (const auto& segment : page.segments) {
         const auto queue = InstructionControlUnit::mem_queue(
             segment.hemisphere, segment.slice, segment.bank);
@@ -940,11 +941,14 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
                 "C2C weight-page MEM vector count overflows size_t");
         vectorsPerQueue[queue] += segment.vector_count;
     }
-    for (const auto count : vectorsPerQueue)
+    for (const auto& segment : page.segments)
+        ++packetsPerQueue[InstructionControlUnit::mem_queue(
+            segment.hemisphere, segment.slice, segment.bank)];
+    const auto& logicalPerQueue = dynamicReservation ? packetsPerQueue : vectorsPerQueue;
+    for (const auto count : logicalPerQueue)
         if (!useMinimumReservation && count > reservationCycles)
-            throw std::invalid_argument(
-                "C2C weight-page reservation is shorter than its MEM write count");
-    auto remainingVectors = vectorsPerQueue;
+            throw std::invalid_argument("C2C reservation is shorter than its logical MEM instruction slots");
+    auto remainingLogical = logicalPerQueue;
 
     C2cWeightPageIcuProgram program;
     program.segments.reserve(page.segments.size());
@@ -960,16 +964,16 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
             hw::kMemEastBoundaryStreamRegisterColumn - (group + 1);
         const auto syncTag = firstSyncTag
             + static_cast<std::uint32_t>(segmentIndex);
-        // Every packet needs at least one cycle per emitted FU write. The
-        // final packet holds any page-level latency/guard slack so the whole
-        // physical queue remains reserved through the linked window end.
-        auto packetReservation =
-            static_cast<std::size_t>(segment.vector_count);
-        remainingVectors[queue] -= segment.vector_count;
+        // A dynamically synchronized packet has one logical instruction
+        // slot; its actual lifetime still includes all requested FU writes.
+        // Legacy standalone reservations retain the fixed write-count floor.
+        auto packetReservation = dynamicReservation ? std::size_t {1}
+            : static_cast<std::size_t>(segment.vector_count);
+        remainingLogical[queue] -= packetReservation;
         const auto queueReservation = useMinimumReservation
-            ? vectorsPerQueue[queue] : reservationCycles;
-        if (remainingVectors[queue] == 0)
-            packetReservation += queueReservation - vectorsPerQueue[queue];
+            ? logicalPerQueue[queue] : reservationCycles;
+        if (remainingLogical[queue] == 0)
+            packetReservation += queueReservation - logicalPerQueue[queue];
 
         const auto rx = C2cIcuPacketCodec::encode(
             C2cRxIcuInstruction::Receive(segment.hemisphere, lane,
@@ -1063,7 +1067,7 @@ void C2cWeightPager::begin_schedule(const BinaryProgram& program)
             }
             if (is_mem_write_read_2d_raw_packet_header(command)
                 || is_fu_3d_raw_packet_header(command)) {
-                const auto words = fu_3d_raw_packet_word_count(queue.kind);
+                const auto words = fu_3d_raw_packet_word_count(queue.kind, command);
                 const auto wait =
                     is_mem_write_read_2d_raw_packet_header(command)
                     ? std::size_t {0}
@@ -1138,19 +1142,22 @@ C2cWeightPageFence C2cWeightPager::schedule(
             targetQueues.push_back(queue);
     }
 
-    auto vectorsPerQueue = std::array<std::size_t,
+    auto logicalSlotsPerQueue = std::array<std::size_t,
         InstructionControlUnit::kMemQueues> {};
     std::size_t minimumReservation = 0;
+    std::array<std::size_t, InstructionControlUnit::kMemQueues> physicalWritesPerQueue{};
+    std::size_t minimumPhysicalWrites = 0;
     for (const auto& segment : page.segments) {
         const auto queue = InstructionControlUnit::mem_queue(
             segment.hemisphere, segment.slice, segment.bank);
-        if (segment.vector_count > std::numeric_limits<std::size_t>::max()
-                - vectorsPerQueue[queue])
-            throw std::overflow_error(
-                "C2C weight-page MEM vector count overflows size_t");
-        vectorsPerQueue[queue] += segment.vector_count;
-        minimumReservation = std::max(
-            minimumReservation, vectorsPerQueue[queue]);
+        const auto slots = pageReadyEventTag != 0 ? std::size_t {1}
+            : static_cast<std::size_t>(segment.vector_count);
+        if (slots > std::numeric_limits<std::size_t>::max() - logicalSlotsPerQueue[queue])
+            throw std::overflow_error("C2C logical MEM reservation overflows size_t");
+        physicalWritesPerQueue[queue] += segment.vector_count;
+        minimumPhysicalWrites = std::max(minimumPhysicalWrites, physicalWritesPerQueue[queue]);
+        logicalSlotsPerQueue[queue] += slots;
+        minimumReservation = std::max(minimumReservation, logicalSlotsPerQueue[queue]);
     }
 
     const auto reservationEndAt = [&](std::size_t candidate) {
@@ -1227,7 +1234,11 @@ C2cWeightPageFence C2cWeightPager::schedule(
                         "no legal MEM ICU idle window can hold a C2C weight page: queue="
                         + std::to_string(queue) + " consumer="
                         + std::to_string(readyCycle) + " vectors="
-                        + std::to_string(minimumReservation));
+                        + std::to_string(minimumReservation)
+                        + " earliest_mem=" + std::to_string(earliestMemCycle)
+                        + " common_start=" + std::to_string(commonStart)
+                        + " transport_start=" + std::to_string(startCycle)
+                        + " transport_duration=" + std::to_string(transportDuration));
         }
         bool allFit = true;
         auto commonReservationEnd = reservationEndAt(commonStart);
@@ -1287,14 +1298,15 @@ C2cWeightPageFence C2cWeightPager::schedule(
         c2cLogicalEnd = std::max({c2cLogicalEnd,
             rxLogicalEnds[side], dmaLogicalEnds[side]});
     }
-    // Transport end is an estimate derived from the external-memory model.
-    // When it is late, the synchronized MEM packet remains at the queue head
+    // The planned end describes a deterministic on-chip transport window.
+    // When actual DDR completion is later, MEM_WRITE_SYNC stays at the head
     // while the page-ready barrier holds every ordinary consumer. C2C DMA/RX
     // and MEM transport-only issue keep advancing until all writes retire.
     const auto reservationEnd = resolvedReservationEnd;
     const auto reservationDuration = reservationEnd - resolvedStart;
     const auto lowered = lower_c2c_weight_page_to_icu(
-        page, hardware, next_sync_tag_, reservationDuration);
+        page, hardware, next_sync_tag_, reservationDuration,
+        pageReadyEventTag != 0 && reservationDuration < minimumPhysicalWrites);
     if (pageReadyEventTag != 0) {
         // A late asynchronous page can outlive its predicted reservation.
         // Its MEM_WRITE_SYNC then remains at the head of every target MEM
@@ -1634,7 +1646,7 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
                 && windows[windowIndex].begin < cursor)
                 throw std::logic_error(
                     "linked MEM_WRITE_SYNC overlaps an ordinary MEM domain");
-            const auto words = fu_3d_raw_packet_word_count(queue.kind);
+            const auto words = fu_3d_raw_packet_word_count(queue.kind, command);
             const auto loop =
                 is_mem_write_read_2d_raw_packet_header(command)
                 ? IcuLoop3D {}

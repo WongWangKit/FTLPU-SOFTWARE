@@ -19,6 +19,7 @@ mlir::ArrayAttr AttentionTaskGraph::getRoutes() const
     append(probability_transpose);
     append(value_transpose);
     append(pv);
+    if (output_gate) append(output_gate);
     append(output);
     auto operation = output;
     return mlir::ArrayAttr::get(

@@ -172,10 +172,6 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& rewriter,
             target::StreamDirection::East, slice).value();
     };
     constexpr int64_t westIngressDelay = 0;
-    // A chain whose head consumes an external SR bundle loads that bundle
-    // into the VXM input register before the first ALU stage.  Immediate-only
-    // chains do not pay this cycle.
-    constexpr int64_t externalInputDelay = 1;
     const auto eastDrainDelay = [&](int64_t queue) {
         return target.throughput().vxm_alus - queue;
     };
@@ -256,24 +252,34 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& rewriter,
         plane(paddedInput, tap, cycle + 1 + eastDrainDelay(1), outStream,
             tap == 3 ? "write" : "write_tap", 0, 3, tokens + 3);
     cycle += 3 * groups + transportGuard;
-    read(input, cycle, inStream, 0, tokens);
-    auto copyHead = create_vxm(rewriter, op.getLoc(), op.getInput(),
-        op.getInput(), type, cycle - 1, 0, "cast",
-        streamKind, inStream, 0.0f, "immediate", 0, 0.0f,
-        "fp32", -1, elementsPerTile, 1,
-        vxmInputHemisphere(input), vxmOutputHemisphere(paddedInput), -1,
-        false, false, true, false, 2);
-    auto copied = create_vxm(rewriter, op.getLoc(), copyHead.getResult(),
-        op.getInput(), type, cycle, 1, "cast",
-        "previous", 0, 0.0f, "immediate", 0, 0.0f,
-        dataFormat, outStream, elementsPerTile, 1,
-        vxmInputHemisphere(input), vxmOutputHemisphere(paddedInput), -1,
-        false, false, true, false, 2);
-    for (int64_t tap = 0; tap < 4; ++tap)
-        plane(paddedInput, tap,
-            cycle + 1 + eastDrainDelay(1) + externalInputDelay, outStream,
-            tap == 3 ? "write" : "write_tap", 3, tokens, tokens + 3);
-    current = copied.getResult();
+    // Preserve the input bytes while replicating them to the four causal
+    // windows. The two fabrics are connected by the passive VXM SR chain;
+    // no ALU decode/re-encode is needed for a same-format copy. Read and
+    // write use a separate stream pair from the preceding zero-fill chain.
+    constexpr int64_t copyStream = 20;
+    const int64_t memGroup = target.streams().mem_slices_per_register_group;
+    for (int64_t byte = 0; byte < 2; ++byte) {
+        const int64_t sourceSlice = sliceAt(input, byte);
+        const int64_t sourceGroup = sourceSlice / memGroup;
+        const int64_t issue = cycle - readLatency(input, sourceSlice);
+        direct_domain_detail::emitMem3D(rewriter, op.getLoc(), target,
+            issue, physicalQueue(input, sourceSlice), "read", baseRow(input),
+            target.streams().streams_per_direction + copyStream + byte,
+            tokens, tileCycles, 1, featureBlocks, tokens * tileCycles,
+            tokens, 1, 1, 0, -1, bank(input));
+        for (int64_t tap = 0; tap < 4; ++tap) {
+            const int64_t destinationSlice = sliceAt(paddedInput, 2 * tap + byte);
+            const int64_t destinationGroup = destinationSlice / memGroup;
+            const int64_t latency = sourceGroup + target.throughput().vxm_alus
+                + destinationGroup + 3;
+            direct_domain_detail::emitMem3D(rewriter, op.getLoc(), target,
+                issue + latency, physicalQueue(paddedInput, destinationSlice),
+                tap == 3 ? "write" : "write_tap", baseRow(paddedInput) + 3,
+                copyStream + byte, tokens, tileCycles, 1,
+                featureBlocks, tokens * tileCycles, tokens + 3,
+                1, 1, 0, -1, bank(paddedInput));
+        }
+    }
     cycle += elements + transportGuard;
 
     // All four taps stream concurrently from independent padded slice pairs.
@@ -308,8 +314,12 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& rewriter,
     column(4, "multiply", streamKind, activationStreams[3], streamKind, weightStreams[3]);
     column(5, "add", "alu", 3, "alu", 4);
     column(6, "add", "alu", 2, "alu", 5);
+    // Opposite-chain raw operands cross this terminal column in SR0..15.
+    // SR16's earlier FP32 carriers have been consumed before column 7, so
+    // the terminal BF16 result can reuse it while draining to MEM.
+    constexpr int64_t convolutionOutputStream = 16;
     auto convolution = column(7, "cast", "previous", 0,
-        "immediate", 0, dataFormat, outStream);
+        "immediate", 0, dataFormat, convolutionOutputStream);
     current = convolution.getResult();
     // West ingress to q0 (16), q0-to-q7 arithmetic (8), and the
     // q7-to-East-boundary drain (9) precede the destination MEM latency.
@@ -318,11 +328,11 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& rewriter,
     // Tap the same result into the primary buffer, then consume it into the
     // preserved-operand buffer. This eliminates a separate MEM/VXM copy pass.
     plane(op.getActivation() == "silu" ? scratch0 : result, 0,
-        convolutionResultCycle, outStream,
+            convolutionResultCycle, convolutionOutputStream,
         op.getActivation() == "silu" ? "write_tap" : "write", 0,
         tokens, tokens);
     if (op.getActivation() == "silu")
-        write(scratch1, convolutionResultCycle, outStream);
+        write(scratch1, convolutionResultCycle, convolutionOutputStream);
     cycle += elements + transportGuard;
 
     if (op.getActivation() == "silu") {
@@ -399,6 +409,54 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& rewriter,
     cycle += elements + 16;
     emitTimeline(rewriter, op, start, cycle);
     auto binding = outputBinding(rewriter, op, outputIndex, result);
+    const auto function = op->getParentOfType<mlir::func::FuncOp>();
+    const auto mirror = function->getAttrOfType<mlir::BoolAttr>(
+        "ftlpu.depthwise_conv_mirror");
+    if (mirror && mirror.getValue()) {
+        // Reflect the closed-form hardware domains, including the operand
+        // references. No FU trace expansion or model-specific operation.
+        const auto flip = [&](llvm::StringRef value) {
+            return rewriter.getStringAttr(value == "east" ? "west" : "east");
+        };
+        auto* generated = precedingOperation ? precedingOperation->getNextNode()
+                                             : &op->getBlock()->front();
+        for (; generated != op.getOperation(); generated = generated->getNextNode()) {
+            if (auto mem = llvm::dyn_cast<MemTransferOp>(generated)) {
+                mem->setAttr("hemisphere", rewriter.getI64IntegerAttr(1 - mem.getHemisphere()));
+            } else if (auto vxm = llvm::dyn_cast<VxmOp>(generated)) {
+                const int64_t queue = vxm.getQueue();
+                for (const auto prefix : {llvm::StringRef("lhs"), llvm::StringRef("rhs")}) {
+                    const auto kindName = (prefix + "_kind").str();
+                    const auto indexName = (prefix + "_index").str();
+                    const auto kind = vxm->getAttrOfType<mlir::StringAttr>(kindName).getValue();
+                    const auto sourceName = (prefix + "_stream_source").str();
+                    if (const auto source = vxm->getAttrOfType<mlir::StringAttr>(sourceName))
+                        vxm->setAttr(sourceName, flip(source.getValue()));
+                    if (kind == "previous" || kind == "alu") {
+                        const auto producer = kind == "previous" ? queue - 1
+                            : vxm->getAttrOfType<mlir::IntegerAttr>(indexName).getInt();
+                        const auto reflected = target.throughput().vxm_alus - 1 - producer;
+                        vxm->setAttr(kindName, rewriter.getStringAttr("stream_f32"));
+                        vxm->setAttr(indexName, rewriter.getI64IntegerAttr(
+                            16 + 4 * (reflected % 4)));
+                        vxm->setAttr(sourceName, rewriter.getStringAttr("west"));
+                    }
+                }
+                if (vxm.getOutputStreamAttr().getInt() < 0) {
+                    vxm->setAttr("output_stream", rewriter.getI64IntegerAttr(
+                        16 + 4 * ((target.throughput().vxm_alus - 1 - queue) % 4)));
+                }
+                vxm->setAttr("queue", rewriter.getI64IntegerAttr(target.throughput().vxm_alus - 1 - queue));
+                vxm->setAttr("input_hemisphere", flip(vxm.getInputHemisphere()));
+                vxm->setAttr("output_hemisphere", flip(vxm.getOutputHemisphere()));
+            } else if (auto bind = llvm::dyn_cast<BindingOp>(generated)) {
+                mlir::NamedAttrList attributes(bind.getPlacement());
+                attributes.set("hemisphere", flip(bind.getPlacement()
+                    .getAs<mlir::StringAttr>("hemisphere").getValue()));
+                bind->setAttr("placement", attributes.getDictionary(rewriter.getContext()));
+            }
+        }
+    }
     rewriter.replaceOp(op, binding.getValue());
     return mlir::success();
 }

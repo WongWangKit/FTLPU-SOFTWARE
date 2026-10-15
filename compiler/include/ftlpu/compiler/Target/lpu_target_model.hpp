@@ -69,7 +69,7 @@ struct StreamTopology {
     int64_t streams_per_direction = hw::kStreamsPerDirection;
     int64_t encoded_streams = hw::kStreams;
     int64_t c2c_streams_per_direction = 8;
-    int64_t c2c_bytes_per_stream_per_cycle = 32;
+    int64_t c2c_bytes_per_stream_per_cycle = hw::kC2cBytesPerStreamPerCycle;
     int64_t mem_boundary_register_columns = hw::kMemBoundaryStreamRegisterColumns;
     int64_t system_register_columns = hw::kSystemStreamRegisterColumns;
     int64_t mem_slices_per_register_group = hw::kMemSlicesPerGroup;
@@ -88,7 +88,7 @@ struct ThroughputModel {
     int64_t mxm_load_bytes_per_cycle = hw::kMxmLoadBytesPerCycle;
     int64_t mxm_activation_streams = 4;
     int64_t mxm_result_streams = 4;
-    int64_t mxm_pipeline_rows = 4;
+    int64_t mxm_pipeline_rows = hw::kTileRows;
     int64_t mxm_block_rows = 8;
     int64_t mxm_local_dequant_enabled = 1;
     int64_t mxm_block_compute_enabled = 0;
@@ -136,7 +136,7 @@ struct IcuMemoryGeometry {
     int64_t vxm_imem_depth = hw::kIcuVxmImemDepth;
     int64_t sxm_instruction_bits = hw::kIcuSxmInstructionBits;
     int64_t sxm_imem_depth = hw::kIcuSxmImemDepth;
-    int64_t macro_encoding_version = 1;
+    int64_t macro_encoding_version = hw::kIcuIsaLayoutVersion;
     // One queue-local loop state is shared by compatibility macro and raw
     // packet decoding; neither representation may require interleaving.
     int64_t mem_macro_contexts = hw::kIcuMemMacroContextDepth;

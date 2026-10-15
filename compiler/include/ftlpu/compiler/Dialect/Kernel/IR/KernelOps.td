@@ -100,6 +100,13 @@ def RmsNormOp : FTLPU_Kernel_Op<"rms_norm", [Pure]> {
   let hasVerifier = 1;
 }
 
+def SigmoidMultiplyOp : FTLPU_Kernel_Op<"sigmoid_multiply", [Pure]> {
+  let summary = "Elementwise input times sigmoid(gate)";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$gate);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $gate attr-dict `:` functional-type(operands, results)";
+}
+
 def SwishOp : FTLPU_Kernel_Op<"swish", [Pure]> {
   let summary = "Elementwise x times sigmoid(x) activation";
   let arguments = (ins AnyRankedTensor:$input);

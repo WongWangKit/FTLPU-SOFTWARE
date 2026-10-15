@@ -2,7 +2,6 @@
 
 #include "AttentionEmitterUtils.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
-#include "ftlpu/compiler/Dialect/Schedule/Analysis/paged_weight_residency.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
@@ -14,8 +13,6 @@ namespace ftlpu::compiler::schedule {
 using namespace attention_detail;
 namespace {
 
-constexpr int64_t kC2cTransportGuardCycles = 64;
-
 int64_t functionArgumentIndex(mlir::Value value) {
   if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(value))
     return argument.getArgNumber();
@@ -25,10 +22,10 @@ int64_t functionArgumentIndex(mlir::Value value) {
 } // namespace
 
 int64_t AttentionScheduleEmitter::emitOutputProjection(
-    int64_t pvEnd, int64_t qkvEnd) {
-  const AttentionMemoryLayout layout(op_, target_);
+    int64_t pvEnd) {
+  const AttentionMemoryLayout layout(op_, target_, static_cast<bool>(op_.output_gate));
   const auto contextPlacement =
-      op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("context");
+      op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(op_.output_gate ? "gated_context" : "context");
   const int64_t contextBank =
       contextPlacement.getAs<mlir::IntegerAttr>("bank").getInt();
   const auto outputResultPlacement =
@@ -114,8 +111,11 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
                                         target::StreamEndpoint::MxmActivation,
                                         target::StreamDirection::East, slice)
                      .value_or(0));
-  // MXM accumulator SRAM is a separate fixed-depth resource from MEM.
-  const int64_t accumulatorCapacity = 32 * target_.throughput().mxm_rows;
+  // Reserve the output token window inside the configured ACC SRAM.
+  // Its depth is independent from MEM and must not assume 32 contexts.
+  const int64_t accumulatorCapacity =
+      target_.throughput().mxm_accumulator_blocks
+      * target_.throughput().mxm_rows;
   const int64_t outputAccumulatorBase = accumulatorCapacity - op_.getSeqLen();
   const auto outputWeightScaleAttr =
       op_.output.getConfig().getAs<mlir::FloatAttr>("output_weight_scale");
@@ -128,30 +128,8 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
   };
 
   int64_t phaseStart = pvEnd;
-  const auto outputWeightPlacement =
-      op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("output_weight");
-  if (outputWeightPlacement) {
-    const auto pingPong = outputWeightPlacement.getAs<mlir::BoolAttr>(
-        "page_bank_ping_pong");
-    if (const auto transferCycles =
-            outputWeightPlacement.getAs<mlir::IntegerAttr>(
-                "page_transfer_cycles");
-        transferCycles && !(pingPong && pingPong.getValue())) {
-      const auto memoryPlan = op_.getMemoryPlan();
-      const char *priorWeights[] = {
-          "query_weight", "key_weight", "value_weight"};
-      const bool reusesPriorResidency = std::ranges::any_of(
-          priorWeights, [&](const char *name) {
-            return pagedWeightResidencyOverlaps(
-                memoryPlan.getAs<mlir::DictionaryAttr>(name),
-                outputWeightPlacement);
-          });
-      if (reusesPriorResidency)
-        phaseStart = std::max(
-            phaseStart,
-            qkvEnd + transferCycles.getInt() + kC2cTransportGuardCycles);
-    }
-  }
+  // PV supplies the on-chip dependency. Actual external weight completion
+  // is handled by page-ready SYNC, independent of DDR bandwidth or jitter.
   const auto plannedOutputGroupEnd = [&](int64_t finalFirstCompute) {
     const int64_t resultCycle =
         finalFirstCompute + target_.mxm_first_result_latency();
@@ -835,6 +813,76 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
     }
   }
   return phaseStart;
+}
+
+// Apply the generic sigmoid gate directly to packed PV tiles. Input and result
+// storage are distinct, so each MEM bank ICU owns a non-preemptible read or
+// write domain. No host transfer or model-level CModel operation is involved.
+int64_t AttentionScheduleEmitter::emitOutputGate(int64_t start) {
+  const AttentionMemoryLayout source(op_, target_), dest(op_, target_, true);
+  const auto plan = op_.getMemoryPlan();
+  const auto gate = plan.getAs<mlir::DictionaryAttr>("output_gate");
+  const auto context = plan.getAs<mlir::DictionaryAttr>("context");
+  const auto result = plan.getAs<mlir::DictionaryAttr>("gated_context");
+  const auto get = [](mlir::DictionaryAttr p, const char* n) {
+    return p.getAs<mlir::IntegerAttr>(n).getInt();
+  };
+  const auto gateSlices = gate.getAs<mlir::ArrayAttr>("slices");
+  const int64_t rows = op_.getSeqLen(), blocks = op_.getHeadDim() / 32;
+  int64_t cursor = start + 64;
+  for (int64_t head = 0; head < op_.getQueryHeads(); ++head)
+    for (int64_t block = 0; block < blocks; ++block) {
+      const int64_t beat = cursor;
+      int64_t end = cursor;
+      for (int64_t h = 0; h < 2; ++h) {
+        const auto hemi = h == 0 ? "east" : "west";
+        const int64_t streamBase = h * 8;
+        const auto column = [h](int64_t c) { return h == 0 ? c : 15-c; };
+        for (int64_t byte = 0; byte < 2; ++byte) {
+          const int64_t gs = llvm::cast<mlir::IntegerAttr>(gateSlices[byte]).getInt();
+          const int64_t cs = source.contextSlice(head, block, byte);
+          const int64_t ds = dest.contextSlice(head, block, byte);
+          const auto read = [&](int64_t slice, int64_t address, int64_t bank, int64_t stream, int64_t delay = 0) {
+            const int64_t latency = *target_.transport_latency(target::StreamEndpoint::Mem,
+                target::StreamEndpoint::VxmInput, target::StreamDirection::West, slice);
+            emitMem3D(rewriter_, op_.getLoc(), beat+delay-latency,
+                h*target_.memory().slices_per_hemisphere+slice, "read", address,
+                32+stream, rows, 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0, bank);
+          };
+          read(gs, get(gate,"base_row")+(head*blocks+block)*rows,
+              get(gate,"bank"), streamBase+byte);
+          read(cs, source.contextAddress(head,block,0), get(context,"bank"), (h == 0 ? 2 : 18)+byte, 8);
+          const int64_t latency = *target_.transport_latency(target::StreamEndpoint::VxmResult,
+              target::StreamEndpoint::Mem, target::StreamDirection::East, ds);
+          // Include the ordinary SR ingress/egress commit boundary as well
+          // as the arithmetic and eight passive VALU-column hops.
+          const int64_t write = beat + 26 + latency;
+          emitMem3D(rewriter_, op_.getLoc(), write,
+              (1-h)*target_.memory().slices_per_hemisphere+ds, "write",
+              dest.contextAddress(head,block,0), streamBase+byte,
+              rows,1,1,"sram",-1,1,1,0,1,1,0,get(result,"bank"));
+          end = std::max(end, write+rows);
+        }
+        const auto alu = [&](int64_t c, const char* code, const char* lhs, int64_t li,
+                             const char* rhs, int64_t ri, float immediate = 0) {
+          emitVxmConfigured(rewriter_,op_.getLoc(),op_.getOutputGate(),beat-1,column(c),
+              code,lhs,li,0,rhs,ri,immediate,c==7 ? "bf16" : "fp32",
+              c==7 ? streamBase : -1,hemi,hemi,-1,8,rows,1,
+              llvm::StringRef(lhs).starts_with("stream") ? hemi : "",
+              llvm::StringRef(rhs).starts_with("stream") ? hemi : "");
+        };
+        alu(0,"negate","stream_bf16",32+streamBase,"immediate",0);
+        alu(1,"exp","alu",column(0),"immediate",0);
+        alu(2,"add","alu",column(1),"immediate",0,1);
+        alu(3,"reciprocal","alu",column(2),"immediate",0);
+        alu(4,"multiply","alu",column(3),"stream_bf16",32+(h == 0 ? 2 : 18));
+        alu(5,"bypass","alu",column(4),"immediate",0);
+        alu(6,"bypass","alu",column(5),"immediate",0);
+        alu(7,"bypass","alu",column(6),"immediate",0);
+      }
+      cursor = end + 32;
+    }
+  return cursor;
 }
 
 } // namespace ftlpu::compiler::schedule

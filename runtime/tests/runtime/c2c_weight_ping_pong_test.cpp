@@ -234,6 +234,59 @@ LinkedTimingResult run_real_linked_timing_case(std::size_t readyCycle)
     return result;
 }
 
+void test_short_dynamic_page_window()
+{
+    auto system = std::make_unique<C2cDmaSystem>();
+    BinaryProgram program;
+    program.max_cycle = 16;
+    const auto memQueue = timing_mem_queue();
+    program.queues.push_back({QueueKind::Mem, memQueue,
+        {encode_icu_control_raw_word(IcuControlInstruction::Nop(5))}});
+    const auto reads = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D {0, {1, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(kTimingTrailingRow, {0, 0, 0}), StreamId::East(0))));
+    program.queues.front().commands.insert(program.queues.front().commands.end(), reads.begin(), reads.end());
+    C2cWeightPager pager(*system);
+    pager.begin_schedule(program);
+    auto page = timing_page();
+    page.segments[0].vector_count = 8;
+    // Eight physical writes cannot fit the one-cycle gap before the consumer.
+    // The compiler must arm WRITE_SYNC there and let real completion stall
+    // the page event, without padding the calculation timeline.
+    static_cast<void>(pager.schedule(program, page, 3, 80, 5,
+        kTimingLaunchEvent, 0x7f00, 3));
+    pager.finalize_schedule(program);
+    const auto queue = std::ranges::find_if(program.queues, [&](const auto& q) {
+        return q.kind == QueueKind::Mem && q.index == memQueue;
+    });
+    require(queue != program.queues.end(), "short page window lost MEM queue");
+    const auto sync = std::ranges::find_if(queue->commands,
+        [](const auto& c) { return is_mem_synchronized_raw_packet_header(c); });
+    require(sync != queue->commands.end(), "short page window omitted WRITE_SYNC");
+    require((sync->words[2] & 0xffffffU) + 1 < 8,
+        "short page window inserted a fixed write-count delay");
+    // Decode only this packet: each delivered token must still issue a write,
+    // even though its encoded logical reservation is shorter than the count.
+    const auto pc = static_cast<std::size_t>(sync - queue->commands.begin());
+    QueueProgram isolated {QueueKind::Mem, memQueue,
+        {queue->commands[pc], queue->commands[pc + 1]}};
+    isolated.commands.insert(isolated.commands.end(), reads.begin(), reads.end());
+    auto icu = std::make_unique<InstructionControlUnit>();
+    load_queue_programs_into_icu({isolated}, *icu);
+    auto& mem = icu->mem_iq(memQueue);
+    std::optional<std::size_t> lastWrite, ordinaryRead;
+    for (std::size_t cycle = 0; cycle < 96; ++cycle) {
+        if (cycle >= 10 && cycle <= 66 && (cycle - 10) % 8 == 0) mem.notify(kTimingSyncTag);
+        if (const auto issue = mem.tick()) {
+            if (issue->opcode == MemOpcode::Write) lastWrite = cycle;
+            if (issue->opcode == MemOpcode::Read) { ordinaryRead = cycle; break; }
+        }
+    }
+    require(mem.synchronized_issued_count() == 8 && lastWrite && ordinaryRead
+        && *lastWrite >= 66 && *ordinaryRead > *lastWrite,
+        "short logical reservation retired before all actual writes");
+}
+
 void test_linked_mem_window_releases_after_ingress()
 {
     constexpr std::size_t readyCycle = 11;
@@ -264,6 +317,19 @@ void test_linked_mem_window_releases_after_ingress()
             && *boundary.trailing_mem_issue_cycle
                 > *boundary.last_sync_issue_cycle,
         boundaryTimingFailure.c_str());
+
+    // Use the identical linked program but deliver page data after the
+    // consumer's nominal cycle. Completion, rather than the predicted
+    // reservation end, must keep the following ordinary read blocked.
+    const auto late = run_controlled_linked_timing_case(readyCycle,
+        {readyCycle + 8, readyCycle + 9});
+    require(late.synchronized_issue_count == kTimingVectorCount
+            && late.last_sync_issue_cycle.has_value()
+            && *late.last_sync_issue_cycle > readyCycle
+            && late.trailing_mem_issue_cycle.has_value()
+            && *late.trailing_mem_issue_cycle > *late.last_sync_issue_cycle
+            && *late.trailing_mem_issue_cycle > *early.trailing_mem_issue_cycle,
+        "late completion did not dynamically delay the following MEM read");
 
     // First observe the deterministic end-to-end completion with ample slack,
     // then move the consumer boundary next to that completion. The MEM port is
@@ -654,6 +720,7 @@ void run_test()
     test_same_boundary_pages_share_one_execution_epoch();
     test_early_page_event_is_latched_until_consumer();
     test_c2c_dma_frontend_tail();
+    test_short_dynamic_page_window();
     test_linked_mem_window_releases_after_ingress();
 
     constexpr auto hemisphere = Hemisphere::West;

@@ -51,4 +51,9 @@ mlir::LogicalResult lowerVectorAluSchedules(
     mlir::IRRewriter& rewriter, mlir::func::FuncOp function,
     const target::LPUTargetModel& target);
 
+// Assign native VXM graph storage before emitting any hardware domains. A
+// containing graph may replace returned-value placements after this step.
+mlir::LogicalResult planVectorAluMemory(
+    mlir::func::FuncOp function, const target::LPUTargetModel& target);
+
 } // namespace ftlpu::compiler::schedule

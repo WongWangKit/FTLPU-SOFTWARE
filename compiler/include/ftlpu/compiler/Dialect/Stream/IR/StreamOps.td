@@ -190,6 +190,14 @@ def ProjectionTaskOp : FTLPU_Stream_Op<"projection_task", [Pure]> {
   let hasVerifier = 1;
 }
 
+def SigmoidMultiplyTaskOp : FTLPU_Stream_Op<"sigmoid_multiply_task", [Pure]> {
+  let summary = "Sigmoid output gate with assigned stream routes";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$gate,
+      DictionaryAttr:$config, ArrayAttr:$routes);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $gate attr-dict `:` functional-type(operands, results)";
+}
+
 def RopeTaskOp : FTLPU_Stream_Op<"rope_task", [Pure]> {
   let summary = "Optional head RMS normalization followed by rotary-position embedding";
   let arguments = (ins AnyRankedTensor:$input,

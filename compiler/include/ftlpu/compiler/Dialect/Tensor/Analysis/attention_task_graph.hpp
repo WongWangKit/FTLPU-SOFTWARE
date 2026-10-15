@@ -12,7 +12,7 @@ namespace ftlpu::compiler::tensor {
 // A validated view over one primitive Tensor IR grouped-query attention DAG.
 struct AttentionTaskGraph
     : analysis::AttentionTaskGraphView<ProjectionTaskOp, RopeTaskOp,
-          BatchMatmulTaskOp, SoftmaxTaskOp, TransposeTaskOp> {
+          BatchMatmulTaskOp, SoftmaxTaskOp, TransposeTaskOp, SigmoidMultiplyTaskOp> {
     mlir::DictionaryAttr getMemoryPlan() const;
 };
 

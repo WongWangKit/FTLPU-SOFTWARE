@@ -4,8 +4,10 @@
 #include "ftlpu/software/runtime/macro_bitstream.hpp"
 
 #include <algorithm>
+#include <map>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 
 namespace ftlpu::software::runtime {
 
@@ -250,8 +252,9 @@ std::size_t raw_3d_packet_word_count(QueueKind kind)
     switch (kind) {
     case QueueKind::Mem:
         return isa::EncodedMemIcu3DPacket::kWordCount;
-    case QueueKind::MxmLoad:
     case QueueKind::MxmCompute:
+        return isa::EncodedMxmComputeIcu3DPacket::kWordCount;
+    case QueueKind::MxmLoad:
     case QueueKind::MxmDequant:
         return isa::EncodedMxmLoadIcu3DPacket::kWordCount;
     case QueueKind::Vxm:
@@ -323,7 +326,7 @@ template <typename Packet>
 Packet read_raw_3d_packet(const QueueProgram& queue,
     std::size_t commandIndex)
 {
-    constexpr auto physicalWordCount = Packet::kWordCount;
+    const auto physicalWordCount = fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(commandIndex));
     constexpr auto lanesPerWord = Packet::kLanesPerWord;
     if (commandIndex > queue.commands.size()
         || physicalWordCount > queue.commands.size() - commandIndex)
@@ -569,9 +572,255 @@ BinaryProgram without_compiled_mem_sync(
 
 } // namespace
 
+namespace {
+constexpr std::string_view kSyncOriginPrefix = "icu.sync_origin.";
+
+std::optional<std::size_t> sync_origin_nop(const QueueCommand& command)
+{
+    if (isa::decode_icu_command_opcode(command.command) != isa::IcuCommandOpcode::Nop)
+        return std::nullopt;
+    return is_icu_control_raw_word_command(command)
+        ? decode_icu_control_raw_word(command).count
+        : isa::decode_icu_nop_cycles(command.command);
+}
+
+bool compiler_page_wait(const QueueCommand& command)
+{
+    if (!is_icu_control_raw_word_command(command)) return false;
+    const auto control = decode_icu_control_raw_word(command);
+    return control.opcode == IcuControlOpcode::WaitEvent
+        && control.event_tag >= 0x30000u && control.event_tag < 0x40000u;
+}
+
+std::string sync_origin_name(const QueueProgram& queue, std::string ordinal)
+{
+    return std::string(kSyncOriginPrefix)
+        + std::to_string(static_cast<unsigned>(queue.kind)) + "."
+        + std::to_string(queue.index) + "." + ordinal;
+}
+
+struct SyncOriginCommandTiming {
+    std::size_t first;
+    std::size_t end;
+    std::size_t words;
+};
+
+SyncOriginCommandTiming sync_origin_timing(
+    const QueueProgram& queue, std::size_t pc, std::size_t cursor)
+{
+    const auto& command = queue.commands[pc];
+    if (is_fu_3d_raw_packet_header(command)) {
+        const auto loop = decode_fu_3d_raw_packet_loop(queue, pc);
+        const auto first = cursor + loop.start_cycle + loop.wait_cycle;
+        auto end = first + 1;
+        for (std::size_t axis = 0; axis < IcuLoop3D::kDimensions; ++axis)
+            end += (loop.counts[axis] - 1) * loop.cycle_strides[axis];
+        return {first, end, fu_3d_raw_packet_word_count(queue.kind, command)};
+    }
+    if (is_mem_synchronized_raw_packet_header(command))
+        return {cursor, cursor + (command.words[2] & 0xffffffU) + 1,
+            InstructionControlUnit::MemIcu::synchronized_packet_word_count};
+    return {cursor, cursor + 1, 1};
+}
+
+std::optional<BinaryProgram> restore_compiler_sync_origins(const BinaryProgram& compiled)
+{
+    using Key = std::tuple<QueueKind, std::size_t, std::size_t>;
+    std::map<Key, BinaryTimeline> origins;
+    std::map<std::pair<QueueKind, std::size_t>, std::uint64_t> ends;
+    for (const auto& timeline : compiled.timelines) {
+        if (!timeline.name.starts_with(kSyncOriginPrefix)) continue;
+        auto fields = timeline.name.substr(kSyncOriginPrefix.size());
+        std::replace(fields.begin(), fields.end(), '.', ' ');
+        std::istringstream input(fields);
+        unsigned kind;
+        std::size_t index;
+        std::string ordinal;
+        if (!(input >> kind >> index >> ordinal))
+            throw std::logic_error("malformed compiler SYNC origin");
+        const auto queueKind = static_cast<QueueKind>(kind);
+        if (ordinal == "end") ends[{queueKind, index}] = timeline.start_cycle;
+        else origins[{queueKind, index, std::stoull(ordinal)}] = timeline;
+    }
+    if (ends.empty()) return std::nullopt;
+    BinaryProgram base = compiled;
+    for (auto& queue : base.queues) {
+        if (queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cRx
+            || queue.kind == QueueKind::C2cTx) continue;
+        const auto original = queue.commands;
+        std::vector<QueueCommand> restored;
+        std::vector<std::size_t> oldToNew(original.size(), std::numeric_limits<std::size_t>::max());
+        std::size_t ordinal = 0, cursor = 0, compiledCursor = 0;
+        std::int64_t shift = 0;
+        for (std::size_t pc = 0; pc < original.size();) {
+            if (const auto cycles = sync_origin_nop(original[pc])) {
+                compiledCursor += *cycles;
+                ++pc;
+                continue;
+            }
+            if (compiler_page_wait(original[pc])) {
+                ++compiledCursor;
+                ++pc;
+                continue;
+            }
+            std::size_t words = 1;
+            if (is_mem_synchronized_raw_packet_header(original[pc])) {
+                const auto packet = decode_mem_synchronized_icu_packet(queue, pc);
+                words = InstructionControlUnit::MemIcu::synchronized_packet_word_count;
+                if (synchronized_mem_opcode(packet) == MemOpcode::Write) {
+                    compiledCursor += (original[pc].words[2] & 0xffffffU) + 1;
+                    pc += words;
+                    continue;
+                }
+            } else if (is_fu_3d_raw_packet_header(original[pc]))
+                words = fu_3d_raw_packet_word_count(queue.kind, original[pc]);
+            const auto found = origins.find({queue.kind, queue.index, ordinal++});
+            const auto timing = sync_origin_timing(queue, pc, compiledCursor);
+            if (found != origins.end())
+                shift = static_cast<std::int64_t>(timing.first)
+                    - static_cast<std::int64_t>(found->second.start_cycle);
+            const auto first = static_cast<std::int64_t>(timing.first) - shift;
+            if (first < 0 || static_cast<std::uint64_t>(first) < cursor)
+                throw std::logic_error("compiler SYNC origins overlap");
+            const auto wait = static_cast<std::size_t>(first) - cursor;
+            const bool loop = is_fu_3d_raw_packet_header(original[pc]);
+            if (!loop && wait != 0)
+                restored.push_back(encode_icu_control_raw_word(IcuControlInstruction::Nop(wait)));
+            // A queue can remain idle through a long recurrent-attention
+            // phase. Keep the representable tail in the following domain's
+            // wait field and encode the remaining delay as a hardware NOP.
+            constexpr auto maxDomainWait = (std::size_t{1} << 24) - 1;
+            const auto domainWait = std::min(wait, maxDomainWait);
+            if (loop && wait > domainWait)
+                restored.push_back(encode_icu_control_raw_word(
+                    IcuControlInstruction::Nop(wait - domainWait)));
+            const auto header = restored.size();
+            for (std::size_t word = 0; word < words; ++word) {
+                oldToNew[pc + word] = restored.size();
+                restored.push_back(original[pc + word]);
+            }
+            if (loop) {
+                restored[header].words[0] = (restored[header].words[0] & 0xffU)
+                    | (static_cast<std::uint32_t>(domainWait) << 8);
+                restored[header].command = restored[header].words[0];
+            }
+            cursor = static_cast<std::size_t>(first) + timing.end - timing.first;
+            compiledCursor = timing.end;
+            pc += words;
+        }
+        const auto end = ends.find({queue.kind, queue.index});
+        if (end != ends.end() && end->second > cursor)
+            restored.push_back(encode_icu_control_raw_word(IcuControlInstruction::Nop(end->second - cursor)));
+        const auto relocate = [&](auto& relocations) {
+            for (auto& relocation : relocations) {
+                if (relocation.queue_kind != queue.kind || relocation.queue_index != queue.index) continue;
+                if (relocation.command_index >= oldToNew.size()
+                    || oldToNew[relocation.command_index] == std::numeric_limits<std::size_t>::max())
+                    throw std::logic_error("compiler SYNC origin lost a relocation target");
+                relocation.command_index = static_cast<std::uint32_t>(oldToNew[relocation.command_index]);
+            }
+        };
+        relocate(base.address_relocations);
+        relocate(base.scale_relocations);
+        queue.commands = std::move(restored);
+    }
+    std::erase_if(base.queues, [](const auto& queue) { return queue.commands.empty(); });
+    std::erase_if(base.timelines, [](const auto& timeline) { return timeline.name.starts_with(kSyncOriginPrefix); });
+    return base;
+}
+} // namespace
+
+void record_compiler_sync_origins(BinaryProgram& compiled, const BinaryProgram& beforeSync)
+{
+    std::vector<BinaryTimeline> records;
+    for (const auto& queue : beforeSync.queues) {
+        if (queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cRx
+            || queue.kind == QueueKind::C2cTx) continue;
+        std::size_t cursor = 0, ordinal = 0;
+        std::vector<BinaryTimeline> originalTimings;
+        for (std::size_t pc = 0; pc < queue.commands.size();) {
+            const auto& command = queue.commands[pc];
+            if (const auto cycles = sync_origin_nop(command)) {
+                cursor += *cycles;
+                ++pc;
+                continue;
+            }
+            std::size_t first = cursor, end = cursor + 1, words = 1;
+            if (is_fu_3d_raw_packet_header(command)) {
+                if (is_mem_write_read_2d_raw_packet_header(command)) return;
+                const auto loop = decode_fu_3d_raw_packet_loop(queue, pc);
+                first += loop.start_cycle + loop.wait_cycle;
+                end = first + 1;
+                for (std::size_t axis = 0; axis < IcuLoop3D::kDimensions; ++axis)
+                    end += (loop.counts[axis] - 1) * loop.cycle_strides[axis];
+                words = fu_3d_raw_packet_word_count(queue.kind, command);
+            } else if (is_mem_synchronized_raw_packet_header(command)) {
+                const auto packet = decode_mem_synchronized_icu_packet(queue, pc);
+                if (synchronized_mem_opcode(packet) == MemOpcode::Write) return;
+                end = cursor + (command.words[2] & 0xffffffU) + 1;
+                words = InstructionControlUnit::MemIcu::synchronized_packet_word_count;
+            } else if (!is_icu_control_raw_word_command(command)
+                && (command.instruction_kind == InstructionKind::None || !command.extension_words.empty()))
+                return; // Legacy encodings retain their existing rebinding path.
+            originalTimings.push_back({sync_origin_name(queue, std::to_string(ordinal++)), first, end});
+            cursor = end;
+            pc += words;
+        }
+        const auto linkedQueue = std::ranges::find_if(compiled.queues, [&](const auto& candidate) {
+            return candidate.kind == queue.kind && candidate.index == queue.index;
+        });
+        if (linkedQueue == compiled.queues.end()) return;
+        std::size_t linkedCursor = 0, linkedOrdinal = 0;
+        std::int64_t previousShift = 0;
+        for (std::size_t pc = 0; pc < linkedQueue->commands.size();) {
+            const auto& command = linkedQueue->commands[pc];
+            if (const auto cycles = sync_origin_nop(command)) {
+                linkedCursor += *cycles;
+                ++pc;
+                continue;
+            }
+            if (compiler_page_wait(command)) {
+                ++linkedCursor;
+                ++pc;
+                continue;
+            }
+            const auto timing = sync_origin_timing(*linkedQueue, pc, linkedCursor);
+            if (!is_mem_synchronized_raw_packet_header(command)
+                || synchronized_mem_opcode(decode_mem_synchronized_icu_packet(*linkedQueue, pc))
+                    != MemOpcode::Write) {
+                if (linkedOrdinal >= originalTimings.size()) return;
+                const auto& origin = originalTimings[linkedOrdinal++];
+                const auto shift = static_cast<std::int64_t>(timing.first)
+                    - static_cast<std::int64_t>(origin.start_cycle);
+                // Record only changes of phase, not one timestamp per domain.
+                if (shift != previousShift) records.push_back(origin);
+                previousShift = shift;
+            }
+            linkedCursor = timing.end;
+            pc += timing.words;
+        }
+        if (linkedOrdinal != originalTimings.size()) return;
+        records.push_back({sync_origin_name(queue, "end"), cursor, cursor + 1});
+    }
+    compiled.timelines.insert(compiled.timelines.end(), records.begin(), records.end());
+}
+
 BinaryProgram without_compiled_mem_write_sync(const BinaryProgram& compiled)
 {
-    return without_compiled_mem_sync(compiled, MemOpcode::Write);
+    if (const auto restored = restore_compiler_sync_origins(compiled)) return *restored;
+    auto base = without_compiled_mem_sync(compiled, MemOpcode::Write);
+    // Preserve the static cycle slots while rebinding compiler page events.
+    // One control word replaces one control word, so relocations stay valid.
+    for (auto& queue : base.queues)
+        for (auto& command : queue.commands)
+            if (is_icu_control_raw_word_command(command)) {
+                const auto control = decode_icu_control_raw_word(command);
+                if (control.opcode == IcuControlOpcode::WaitEvent
+                    && control.event_tag >= 0x30000u
+                    && control.event_tag < 0x40000u)
+                    command = encode_icu_control_raw_word(IcuControlInstruction::Nop(1));
+            }
+    return base;
 }
 
 BinaryProgram without_compiled_mem_read_sync(const BinaryProgram& compiled)
@@ -607,6 +856,10 @@ bool is_fu_3d_raw_word_command(const QueueCommand& command) noexcept
     // Extended subtype lives at physical [91:88] of packet word zero.
     const auto subtype = (command.words[2] >> 24) & 0xfU;
     return wordIndex != 0 || subtype == 2
+        || ((command.instruction_kind == InstructionKind::Mem
+                || command.instruction_kind == InstructionKind::Mxm
+                || command.instruction_kind == InstructionKind::MxmDequant)
+            && subtype >= 8 && subtype <= 10)
         || (command.instruction_kind == InstructionKind::Mem
             && subtype == 7 && ((command.words[0] >> 4) & 0x3U) == 3);
 }
@@ -646,6 +899,37 @@ bool is_fu_3d_raw_packet_header(
 std::size_t fu_3d_raw_packet_word_count(QueueKind kind)
 {
     return raw_3d_packet_word_count(kind);
+}
+
+std::size_t fu_3d_raw_packet_word_count(QueueKind kind, const QueueCommand& header)
+{
+    switch (kind) {
+    case QueueKind::Mem: {
+        isa::EncodedMemIcu3DPacket packet{};
+        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+            packet.words[0].lanes[lane] = header.words[lane];
+        return isa::fu_loop_packet_word_count(packet);
+    }
+    case QueueKind::MxmLoad: {
+        isa::EncodedMxmLoadIcu3DPacket packet{};
+        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+            packet.words[0].lanes[lane] = header.words[lane];
+        return isa::fu_loop_packet_word_count(packet);
+    }
+    case QueueKind::MxmCompute: {
+        isa::EncodedMxmComputeIcu3DPacket packet{};
+        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+            packet.words[0].lanes[lane] = header.words[lane];
+        return isa::fu_loop_packet_word_count(packet);
+    }
+    case QueueKind::MxmDequant: {
+        isa::EncodedMxmDequantIcu3DPacket packet{};
+        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+            packet.words[0].lanes[lane] = header.words[lane];
+        return isa::fu_loop_packet_word_count(packet);
+    }
+    default: return raw_3d_packet_word_count(kind);
+    }
 }
 
 IcuLoop3D decode_fu_3d_raw_packet_loop(
@@ -1066,7 +1350,7 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                     throw std::logic_error(
                         "C2C queues do not carry FU 3-D packets");
                 }
-                command_index += raw_3d_packet_word_count(queue.kind) - 1;
+                command_index += fu_3d_raw_packet_word_count(queue.kind, command) - 1;
                 continue;
             }
             if (is_vxm_stream_nd_command(command)) {

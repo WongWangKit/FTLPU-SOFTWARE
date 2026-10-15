@@ -23,6 +23,7 @@ bool has_complete_disjoint_memory_plan(const AttentionTaskGraph& graph)
     append(graph.probability_transpose);
     append(graph.value_transpose);
     append(graph.pv);
+    if (graph.output_gate) append(graph.output_gate);
     append(graph.output);
     if (!disjoint) return false;
     for (llvm::StringRef required :
@@ -57,6 +58,7 @@ mlir::DictionaryAttr AttentionTaskGraph::getMemoryPlan() const
     append(probability_transpose);
     append(value_transpose);
     append(pv);
+    if (output_gate) append(output_gate);
     append(output);
     auto operation = output;
     return mlir::DictionaryAttr::get(

@@ -19,7 +19,7 @@ enum class AttentionProjectionKind : std::uint8_t {
 class AttentionMemoryLayout {
 public:
     AttentionMemoryLayout(const AttentionTaskGraph& graph,
-        const target::LPUTargetModel& target);
+        const target::LPUTargetModel& target, bool gatedContext = false);
 
     int64_t weightAddress(AttentionProjectionKind projection,
         int64_t outputBlock,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import struct
@@ -114,6 +115,12 @@ class SafeTensorStore:
 
     def contains(self, name: str) -> bool:
         return name in self.weight_map
+
+
+def canonicalize_glm_qk(weight: np.ndarray, head_dim: int) -> np.ndarray:
+    """Maps official interleaved rotary pairs to the LPU split-half layout."""
+    permutation = np.concatenate((np.arange(0, head_dim, 2), np.arange(1, head_dim, 2)))
+    return weight.reshape(-1, head_dim, weight.shape[1])[:, permutation, :].reshape(weight.shape)
 
 
 def quantize_linear(weight: np.ndarray) -> tuple[np.ndarray, float]:
@@ -553,7 +560,10 @@ def biased_rope_linear(
 
 
 def vxm_lut(value: np.ndarray, operation: str) -> np.ndarray:
-    value = fp16_ftz(value)
+    # The explicit-SR VXM passes Float32 operands directly to LUT range
+    # reduction. Only LUT coefficients and the restored result use FP16 FTZ.
+    # Truncating the input here incorrectly turns small RMS variances into 0.
+    value = np.asarray(value, dtype=np.float32)
     finite = np.isfinite(value)
     safe_value = np.where(finite, value, np.float32(0.0))
     entries = np.float32(256.0)
@@ -1120,6 +1130,25 @@ def main() -> None:
     store = SafeTensorStore(args.model_dir)
     prefix, embedding_name = checkpoint_prefixes(root_config, args.layer)
     source_weights, names = load_decoder_weights(store, prefix, config)
+    # Official GLM pairs neighboring Q/K features. Convert its projection
+    # columns to the split-half layout used by the generic hardware RoPE.
+    # Applying the same permutation to Q and K preserves their dot product.
+    qk_permutation = None
+    if config.get("model_type") == "glm":
+        head = attention_head_dim(config)
+        qk_permutation = np.concatenate((np.arange(0, head, 2), np.arange(1, head, 2)))
+        for role in ("query", "key"):
+            value = source_weights[role]
+            source_weights[role] = canonicalize_glm_qk(value, head)
+    provenance = None
+    provenance_path = args.model_dir / "provenance.json"
+    if provenance_path.exists():
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        digest = hashlib.sha256((args.model_dir / "model.safetensors").read_bytes()).hexdigest()
+        if digest != provenance["subset_sha256"]:
+            raise ValueError("official checkpoint subset hash mismatch")
+        if hashlib.sha256((args.model_dir / "config.json").read_bytes()).hexdigest() != provenance["config_sha256"]:
+            raise ValueError("official checkpoint config hash mismatch")
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, object] = {}
     for role, value in source_weights.items():
@@ -1318,6 +1347,12 @@ def main() -> None:
             str(args.input_bf16) if args.input_bf16 else "embedding"
         ),
     }
+    if provenance is not None:
+        metadata["checkpoint_provenance"] = provenance
+        metadata["checkpoint_kind"] = "official_layer_subset"
+    if qk_permutation is not None:
+        metadata["qk_column_permutation"] = qk_permutation.tolist()
+        metadata["source_rope_layout"] = "interleaved_pairs"
     if config.get("model_type") == "qwen3_moe":
         metadata["moe"] = {
             "num_experts": int(config["num_experts"]),

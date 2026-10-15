@@ -56,8 +56,10 @@ def main() -> None:
             raise AssertionError("increasing Conv1D VALU chain must propagate east")
     vxm_ops = [line for line in schedule.splitlines()
                if "ftlpu.schedule.vxm" in line]
-    if len(vxm_ops) != 18 or any('opcode = "pass"' in line for line in vxm_ops):
-        raise AssertionError("Conv1D must use one reduction tree and six-stage SiLU")
+    if len(vxm_ops) != 16 or any('opcode = "pass"' in line for line in vxm_ops):
+        raise AssertionError("Conv1D must use zero fill, one reduction tree and six-stage SiLU without an ALU input copy")
+    if sum('opcode = "cast"' in line for line in vxm_ops) != 3:
+        raise AssertionError("only zero fill, convolution and SiLU result casts should remain")
     mem_ops = [line for line in schedule.splitlines()
                if "ftlpu.schedule.mem_transfer" in line]
     if len(mem_ops) != 44:

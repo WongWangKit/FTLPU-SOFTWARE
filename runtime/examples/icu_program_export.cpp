@@ -115,11 +115,11 @@ template <typename Packet>
 Packet packet_at(const QueueProgram& queue, std::size_t pc)
 {
     if (pc > queue.commands.size()
-        || Packet::kWordCount > queue.commands.size() - pc)
+        || fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(pc)) > queue.commands.size() - pc)
         throw std::logic_error("truncated ICU packet at pc="
             + std::to_string(pc));
     Packet packet{};
-    for (std::size_t word = 0; word < Packet::kWordCount; ++word) {
+    for (std::size_t word = 0; word < fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(pc)); ++word) {
         const auto& command = queue.commands[pc + word];
         if (command.word_count != Packet::kLanesPerWord)
             throw std::logic_error("ICU packet has the wrong physical width");
@@ -164,7 +164,7 @@ InstructionRow decode_3d(
     row.ordinal = ordinal;
     row.pc = pc;
     row.words = ftlpu::software::runtime::
-        fu_3d_raw_packet_word_count(queue.kind);
+        fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(pc));
     row.raw = raw_words(queue, pc, row.words);
     std::ostringstream details;
     switch (queue.kind) {
@@ -233,7 +233,8 @@ InstructionRow decode_3d(
             ftlpu::isa::decode_mxm_load_icu_3d_instruction(
                 packet_at<ftlpu::isa::EncodedMxmLoadIcu3DPacket>(queue, pc));
         row.loop = instruction.loop;
-        row.opcode = "LOAD_3D";
+        row.opcode = instruction.opcode == ftlpu::MxmLoadIcuOpcode::DecodeLoadActivation3D
+            ? "DECODE_LOAD_ACTIVATION_3D" : "LOAD_3D";
         details << "weight_buffer_base=" << instruction.weight_buffer_base
                 << " weight_buffer_mode="
                 << static_cast<unsigned>(instruction.weight_buffer_mode)
@@ -265,7 +266,8 @@ InstructionRow decode_3d(
         row.loop = instruction.loop;
         row.opcode = instruction.opcode
                     == ftlpu::MxmComputeIcuOpcode::Compute3D
-            ? "COMPUTE_3D" : "ACCUMULATOR_READ_3D";
+            ? "COMPUTE_3D" : instruction.opcode == ftlpu::MxmComputeIcuOpcode::DecodeStreamCompute3D
+                ? "DECODE_STREAM_COMPUTE_3D" : "ACCUMULATOR_READ_3D";
         details << "weight_buffer_base=" << instruction.weight_buffer_base
                 << " weight_buffer_mode="
                 << static_cast<unsigned>(instruction.weight_buffer_mode)
@@ -366,6 +368,11 @@ InstructionRow decode_3d(
         throw std::logic_error("C2C is not an FU 3-D packet");
     }
     row.expanded = expanded_issues(row.loop);
+    const auto subtype = (queue.commands.at(pc).words[2] >> 24) & 15U;
+    if (subtype >= 8 && subtype <= 10 && row.opcode.ends_with("_3D")) {
+        row.opcode.resize(row.opcode.size() - 3);
+        if (subtype != 8) row.opcode += "_" + std::to_string(subtype - 8) + "D";
+    }
     row.details = details.str();
     return row;
 }
@@ -419,6 +426,11 @@ InstructionRow decode_mem_sync(
             << " address_base=" << instruction.address
             << " address_stride=" << addressStride << ' '
             << stream_description(instruction.stream_id().packed());
+    const auto subtype = (queue.commands.at(pc).words[2] >> 24) & 15U;
+    if (subtype >= 8 && subtype <= 10 && row.opcode.ends_with("_3D")) {
+        row.opcode.resize(row.opcode.size() - 3);
+        if (subtype != 8) row.opcode += "_" + std::to_string(subtype - 8) + "D";
+    }
     row.details = details.str();
     return row;
 }

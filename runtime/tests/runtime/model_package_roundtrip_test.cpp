@@ -51,6 +51,7 @@ try {
     rope.initializer = BindingInitializer::RopeTable;
     rope.rope_theta = 100000.0f;
     rope.rope_head_dim = 64;
+    rope.rope_inverse_frequencies.assign(32, 0.125f);
     program.bindings.push_back(rope);
     BinaryBinding key_cache;
     key_cache.index = 10;
@@ -189,7 +190,8 @@ try {
             && decoded_rope.layout == BindingLayout::Fp16RopeTable
             && decoded_rope.name == "rope.cos_sin"
             && decoded_rope.rope_theta == 100000.0f
-            && decoded_rope.rope_head_dim == 64,
+            && decoded_rope.rope_head_dim == 64
+            && decoded_rope.rope_inverse_frequencies == rope.rope_inverse_frequencies,
         "internal RoPE initializer metadata was not preserved");
     require(decoded.invocations.size() == 1
             && decoded.invocations[0].inputs[0].value == "hidden.0"
