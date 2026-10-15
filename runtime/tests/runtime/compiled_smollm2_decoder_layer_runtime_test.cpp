@@ -1028,7 +1028,7 @@ try {
                     for (std::size_t dimension = 0;
                          dimension < kHeadDim; ++dimension) {
                         const std::size_t reduction = dimension / 32;
-                        const std::size_t address = 576
+                        const std::size_t address = kHidden
                             + (head * 2 + reduction % 2) * 4
                             + tokenWave;
                         const float actual = physicalBf16(

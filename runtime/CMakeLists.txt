@@ -115,6 +115,10 @@ target_link_libraries(ftlpu_software
 add_executable(ftlpu_binary_inspect examples/binary_inspect.cpp)
 target_link_libraries(ftlpu_binary_inspect PRIVATE ftlpu_software)
 
+add_executable(macro_frontend_fetch_sweep
+    examples/macro_frontend_fetch_sweep.cpp)
+target_link_libraries(macro_frontend_fetch_sweep PRIVATE ftlpu_software)
+
 add_executable(ftlpu_binary_repack examples/binary_repack.cpp)
 target_link_libraries(ftlpu_binary_repack PRIVATE ftlpu_software)
 
