@@ -4,7 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -51,6 +53,55 @@ std::vector<std::uint8_t> make_input()
     return result;
 }
 
+void test_planar_output(BindingElementType type, BindingLayout layout,
+                       std::vector<std::uint64_t> shape,
+                       std::vector<std::uint16_t> slices,
+                       std::uint16_t hemisphereMask, std::int64_t baseRow)
+{
+    auto inputBinding = make_binding(BindingAccess::Input);
+    inputBinding.element_type = type;
+    inputBinding.layout = layout;
+    inputBinding.shape = shape;
+    inputBinding.slices = slices;
+    inputBinding.hemisphere_mask = hemisphereMask;
+    inputBinding.bank = 1;
+    inputBinding.base_row = baseRow;
+    inputBinding.instruction_count = shape[0] * (shape[1] / 32);
+    const auto bytesPerElement = type == BindingElementType::F32 ? 4u : 2u;
+    inputBinding.byte_size = shape[0] * shape[1] * bytesPerElement;
+    auto outputBinding = inputBinding;
+    outputBinding.access = BindingAccess::Output;
+    outputBinding.name = "output";
+    outputBinding.role = "result";
+    BinaryProgram program;
+    program.hardware.ddr_peak_bandwidth_mbytes_per_second = 51200;
+    program.bindings = {inputBinding, outputBinding};
+    ModelPackage package;
+    package.model_name = "planar-output-roundtrip";
+    package.architecture = "test";
+    package.values = {{"input", type, shape, true, false},
+                      {"output", type, shape, false, true}};
+    package.executables.push_back({"identity", std::move(program), {}});
+    package.invocations.push_back({"identity", 0, {{0,"input"}}, {{0,"output"}}, {}});
+    std::vector<std::uint8_t> input(inputBinding.byte_size);
+    for (std::size_t element = 0; element < input.size() / bytesPerElement; ++element) {
+        const float value = static_cast<float>(static_cast<int>(element % 37) - 18) / 8.0f;
+        if (type == BindingElementType::F32)
+            std::memcpy(input.data() + element * 4, &value, 4);
+        else {
+            const auto bits = Bf16::from_float(value).bits();
+            std::memcpy(input.data() + element * 2, &bits, 2);
+        }
+    }
+    auto system = std::make_unique<C2cDmaSystem>();
+    ModelSession session(*system);
+    session.load(std::move(package));
+    session.set_input("input", input);
+    session.run();
+    if (session.value("output") != input)
+        throw std::runtime_error("multi-lane planar C2C output changed bytes");
+}
+
 } // namespace
 
 int main()
@@ -95,6 +146,10 @@ try {
         throw std::runtime_error(
             "ModelSession did not account for physical C2C I/O");
 
+    test_planar_output(BindingElementType::BF16, BindingLayout::Fp16PairPlanar,
+                       {32,1024}, {32,33}, 2, 6432);
+    test_planar_output(BindingElementType::F32, BindingLayout::Fp32QuadPlanar,
+                       {2048,128}, {8,9,10,11}, 1, 0);
     std::cout << "model_session_c2c_io_test passed"
               << " ingress_bytes=" << stats.c2c_ingress_bytes
               << " ingress_cycles=" << stats.c2c_ingress_cycles

@@ -832,6 +832,7 @@ bool is_mem_write_read_2d_raw_packet_header(
 MemIcuWriteRead2DInstruction decode_mem_write_read_2d_raw_packet(
     const QueueProgram& queue, std::size_t command_index);
 std::size_t fu_3d_raw_packet_word_count(QueueKind kind);
+std::size_t fu_3d_raw_packet_word_count(QueueKind kind, const QueueCommand& header);
 IcuLoop3D decode_fu_3d_raw_packet_loop(
     const QueueProgram& queue, std::size_t command_index);
 

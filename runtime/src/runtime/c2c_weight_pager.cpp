@@ -196,13 +196,13 @@ MemIcuInstruction decode_mem_3d_instruction(
     const QueueProgram& queue, std::size_t commandIndex)
 {
     if (queue.kind != QueueKind::Mem
-        || commandIndex + isa::EncodedMemIcu3DPacket::kWordCount
+        || commandIndex + fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(commandIndex))
             > queue.commands.size()
         || !is_fu_3d_raw_packet_header(queue.commands[commandIndex]))
         throw std::logic_error("expected MEM READ/WRITE_3D packet");
     isa::EncodedMemIcu3DPacket packet{};
     for (std::size_t word = 0;
-         word < isa::EncodedMemIcu3DPacket::kWordCount; ++word) {
+         word < fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(commandIndex)); ++word) {
         const auto& source = queue.commands[commandIndex + word];
         if (source.instruction_kind != InstructionKind::Mem
             || source.word_count
@@ -246,7 +246,7 @@ std::vector<Native4ActivationStarts> find_native4_activation_starts(
                     ++pc;
                 } else if (is_fu_3d_raw_packet_header(command)) {
                     isa::EncodedMxmComputeIcu3DPacket packet {};
-                    for (std::size_t word = 0; word < packet.kWordCount; ++word)
+                    for (std::size_t word = 0; word < fu_3d_raw_packet_word_count(queue.kind, command); ++word)
                         for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
                             packet.words[word].lanes[lane] = queue.commands[pc + word].words[lane];
                     const auto instruction = isa::decode_mxm_compute_icu_3d_instruction(packet);
@@ -261,7 +261,7 @@ std::vector<Native4ActivationStarts> find_native4_activation_starts(
                                 starts[index][hemisphere] = Native4ActivationStart {
                                     issue, instruction.activation_stream_base};
                     cursor += loop_cycles(instruction.loop);
-                    pc += packet.kWordCount;
+                    pc += fu_3d_raw_packet_word_count(queue.kind, command);
                 } else {
                     ++pc;
                 }
@@ -335,11 +335,11 @@ std::vector<std::pair<std::size_t, std::size_t>> native4_launch_producers(
                             producers.emplace_back(barriers[i].second, queue.index);
                     }
                 cursor += loop_cycles(instruction.loop);
-                pc += fu_3d_raw_packet_word_count(queue.kind);
+                pc += fu_3d_raw_packet_word_count(queue.kind, command);
             } else if (is_mem_write_read_2d_raw_packet_header(command)) {
                 cursor += detail::mem_icu_write_read_2d_last_issue_cycle(
                     decode_mem_write_read_2d_raw_packet(queue, pc)) + 1;
-                pc += fu_3d_raw_packet_word_count(queue.kind);
+                pc += fu_3d_raw_packet_word_count(queue.kind, command);
             } else {
                 ++cursor;
                 ++pc;
@@ -385,7 +385,7 @@ void retreat_native4_activation_producer_barriers(
                           decode_mem_write_read_2d_raw_packet(
                               queue, commandIndex))
                 + 1;
-            commandIndex += fu_3d_raw_packet_word_count(queue.kind);
+            commandIndex += fu_3d_raw_packet_word_count(queue.kind, command);
             continue;
         }
         if (is_fu_3d_raw_packet_header(command)) {
@@ -425,7 +425,7 @@ void retreat_native4_activation_producer_barriers(
                 }
             }
             cursor = commandEnd;
-            commandIndex += fu_3d_raw_packet_word_count(queue.kind);
+            commandIndex += fu_3d_raw_packet_word_count(queue.kind, command);
             continue;
         }
         if (is_mem_stream_nd_command(command)) {
@@ -618,7 +618,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     activeWindows.emplace_back(position + loop.wait_cycle,
                         position + loop_cycles(loop));
                     position += loop_cycles(loop);
-                    pc += fu_3d_raw_packet_word_count(queue.kind);
+                    pc += fu_3d_raw_packet_word_count(queue.kind, command);
                 } else {
                     // Conservatively retain fences around other commands.
                     activeWindows.emplace_back(position, position + 1);
@@ -770,7 +770,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
             }
             if (is_mem_write_read_2d_raw_packet_header(command)
                 || is_fu_3d_raw_packet_header(command)) {
-                const auto words = fu_3d_raw_packet_word_count(queue.kind);
+                const auto words = fu_3d_raw_packet_word_count(queue.kind, command);
                 const bool writeRead =
                     is_mem_write_read_2d_raw_packet_header(command);
                 const auto loop = writeRead
@@ -1067,7 +1067,7 @@ void C2cWeightPager::begin_schedule(const BinaryProgram& program)
             }
             if (is_mem_write_read_2d_raw_packet_header(command)
                 || is_fu_3d_raw_packet_header(command)) {
-                const auto words = fu_3d_raw_packet_word_count(queue.kind);
+                const auto words = fu_3d_raw_packet_word_count(queue.kind, command);
                 const auto wait =
                     is_mem_write_read_2d_raw_packet_header(command)
                     ? std::size_t {0}
@@ -1646,7 +1646,7 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
                 && windows[windowIndex].begin < cursor)
                 throw std::logic_error(
                     "linked MEM_WRITE_SYNC overlaps an ordinary MEM domain");
-            const auto words = fu_3d_raw_packet_word_count(queue.kind);
+            const auto words = fu_3d_raw_packet_word_count(queue.kind, command);
             const auto loop =
                 is_mem_write_read_2d_raw_packet_header(command)
                 ? IcuLoop3D {}

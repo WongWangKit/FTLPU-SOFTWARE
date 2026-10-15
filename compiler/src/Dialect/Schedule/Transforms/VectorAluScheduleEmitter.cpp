@@ -32,7 +32,16 @@ struct Storage {
     int64_t slice = 0;
     int64_t bank = 0;
     bool west = false;
+    int64_t base = 0;
 };
+
+Storage storageOf(mlir::DictionaryAttr p)
+{
+    return {llvm::cast<mlir::IntegerAttr>(p.getAs<mlir::ArrayAttr>("slices")[0]).getInt(),
+        p.getAs<mlir::IntegerAttr>("bank").getInt(),
+        p.getAs<mlir::StringAttr>("hemisphere").getValue() == "west",
+        p.getAs<mlir::IntegerAttr>("base_row").getInt()};
+}
 
 mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
     const target::LPUTargetModel& target, Storage lhsStorage,
@@ -57,7 +66,11 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
             r.getNamedAttr("name", r.getStringAttr("vector_alu")),
             r.getNamedAttr("bytes", r.getI64IntegerAttr(type.getNumElements()
                 * (type.getElementType().isF32() ? 4 : 2))),
-            r.getNamedAttr("placement", placement(r, type, storage.slice, storage.west ? "west" : "east", storage.bank, packed)),
+            r.getNamedAttr("placement", [&] {
+                mlir::NamedAttrList a(placement(r, type, storage.slice, storage.west ? "west" : "east", storage.bank, packed));
+                a.set("base_row", r.getI64IntegerAttr(storage.base));
+                return a.getDictionary(r.getContext());
+            }()),
         });
         return llvm::cast<BindingOp>(r.create(state));
     };
@@ -85,6 +98,9 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
     const int64_t extraLatency = special ? 4 : op.getKind() == "multiply" ? 1 : 0;
     int64_t cursor = 96;
     const int64_t passes = 1;
+    // Returning to the East fabric may share the West-going SR path with an
+    // incoming West operand. Use disjoint streams instead of colliding W0.
+    const int64_t outputStream = outStorage.west ? 0 : 24;
     const int64_t reductionRows = op.getReduce() ? lhsType.getDimSize(0) : 1;
     const int64_t reductionRowInterval = lhsType.getDimSize(1) * tileCycles + 96;
     for (int64_t pass = 0; pass < passes; ++pass) {
@@ -104,7 +120,7 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
                     target::StreamEndpoint::VxmInput, target::StreamDirection::West, slice).value();
                 direct_domain_detail::emitMem3D(r, op.getLoc(), target,
                     cursor - latency, slice + (storage.west ? target.memory().slices_per_hemisphere : 0),
-                    "read", firstAddress,
+                    "read", storage.base + firstAddress,
                     target.streams().streams_per_direction + stream + byte,
                     inner, tileCycles, broadcastColumns ? 0 : 1,
                     waves, op.getReduce() ? reductionRowInterval : inner * tileCycles,
@@ -127,7 +143,7 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
                 current, op.getRhs(), outType, cursor - 1, queueBase + col, opcode,
                 lhsKind, 0, 0.0f, rhsKind, rhsKind.starts_with("stream_") && op.getRhs() != op.getLhs() ? 8 : 0, op.getImmediate().convertToFloat(),
                 col == lastColumn ? format : llvm::StringRef("fp32"),
-                col == lastColumn ? 0 : -1, count, 1, "east", outStorage.west ? "east" : "west", -1,
+                col == lastColumn ? outputStream : -1, count, 1, "east", outStorage.west ? "east" : "west", -1,
                 reduction, reduction, true, false, 8, reduction, reduction);
             if (col == 0) vxm->setAttr("lhs_stream_source", r.getStringAttr(lhsStorage.west ? "west" : "east"));
             if (arithmetic && !op.getUseImmediate())
@@ -138,7 +154,11 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
             }
             current = vxm.getResult();
         }
-        const int64_t resultCycle = cursor + (lhsStorage.west ? 32 - 2 * queueBase : 17) + extraLatency
+        // A result returning left traverses the final ALU columns twice.
+        // West-boundary drains keep the existing passive-chain timing.
+        const int64_t resultCycle = cursor + (outStorage.west
+            ? (lhsStorage.west ? 32 - 2 * queueBase : 17)
+            : (lhsStorage.west ? 19 : 4 + 2 * queueBase) + 2 * (lastColumn - 1)) + extraLatency
             + (op.getReduce() ? (count - 1) * tileCycles : 0);
         for (int64_t byte = 0; byte < planes(outType); ++byte) {
             const int64_t slice = outStorage.slice + byte;
@@ -146,7 +166,7 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
                 target::StreamEndpoint::Mem, target::StreamDirection::East, slice).value();
             direct_domain_detail::emitMem3D(r, op.getLoc(), target,
                 resultCycle + latency, slice + (outStorage.west ? target.memory().slices_per_hemisphere : 0),
-                "write", op.getReduce() ? pass : 0, byte,
+                "write", outStorage.base + (op.getReduce() ? pass : 0), outputStream + byte,
                 op.getReduce() ? 1 : count, tileCycles, 1,
                 reductionRows, op.getReduce() ? reductionRowInterval : 1,
                 op.getReduce() ? 1 : 0, 1, 1, 0, -1, outStorage.bank);
@@ -159,30 +179,48 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
 }
 } // namespace
 
-mlir::LogicalResult lowerVectorAluSchedules(mlir::IRRewriter& r,
-    mlir::func::FuncOp function, const target::LPUTargetModel& target)
+mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
+    const target::LPUTargetModel& target)
 {
     llvm::SmallVector<kernel::VectorAluOp> ops;
     function.walk([&](kernel::VectorAluOp op) { ops.push_back(op); });
     if (ops.empty()) return mlir::success();
-    const auto queuePolicy=function->getAttrOfType<mlir::IntegerAttr>("ftlpu.vxm_queue_base");
-    const int64_t queueBase=queuePolicy ? queuePolicy.getInt() : 0;
-    if (queueBase != 0 && queueBase != 8) return function.emitError("VXM queue base must select one physical eight-ALU group");
-    // Elementwise graphs can keep all 32 lanes of every physical word.
-    // Reductions and broadcasts retain their explicit scalar-row layout.
+    // A graph-level plan is authoritative; repeated lowering must not reset it.
+    if (llvm::any_of(ops, [](auto op) { return op->hasAttr("ftlpu.vector_result_placement"); })) {
+        for (auto op : ops) {
+            const auto packed = op->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_packed");
+            if (!packed) return op.emitError("incomplete vector memory plan: missing packing policy");
+            for (const auto name : {"ftlpu.vector_lhs_placement", "ftlpu.vector_rhs_placement", "ftlpu.vector_result_placement"}) {
+                const auto p = op->getAttrOfType<mlir::DictionaryAttr>(name);
+                if (!p) return op.emitError("incomplete vector memory plan");
+                const auto ids = p.getAs<mlir::ArrayAttr>("slices");
+                const auto bank = p.getAs<mlir::IntegerAttr>("bank");
+                const auto base = p.getAs<mlir::IntegerAttr>("base_row");
+                const auto count = p.getAs<mlir::IntegerAttr>("instruction_count");
+                const auto hemi = p.getAs<mlir::StringAttr>("hemisphere");
+                if (!ids || ids.empty() || !bank || !base || !count || !hemi ||
+                    (hemi.getValue() != "east" && hemi.getValue() != "west") ||
+                    bank.getInt() < 0 || bank.getInt() >= target.memory().banks_per_slice ||
+                    base.getInt() < 0 || count.getInt() <= 0 ||
+                    base.getInt() + count.getInt() > target.memory().sram_depth_rows)
+                    return op.emitError("invalid vector memory plan bounds");
+                int64_t prior = -1;
+                for (auto id : ids) {
+                    const auto slice = llvm::dyn_cast<mlir::IntegerAttr>(id);
+                    if (!slice || slice.getInt() < 0 || slice.getInt() >= target.memory().slices_per_hemisphere ||
+                        (prior >= 0 && slice.getInt() != prior + 1))
+                        return op.emitError("vector memory plan requires consecutive byte-plane slices");
+                    prior = slice.getInt();
+                }
+            }
+        }
+        return mlir::success();
+    }
+    mlir::IRRewriter r(function.getContext());
     const bool packed = llvm::all_of(ops, [](auto op) {
         return !op.getReduce() && op.getLhs().getType().getDimSize(1) % 32 == 0
             && (op.getUseImmediate() || op.getLhs().getType().getShape() == op.getRhs().getType().getShape());
     });
-    const bool graph = ops.size() > 1;
-    if (!graph) {
-        auto op = ops.front();
-        if (!llvm::isa<mlir::BlockArgument>(op.getLhs())
-            || !llvm::isa<mlir::BlockArgument>(op.getRhs()))
-            return op.emitError("vector input has no scalar-broadcast producer placement");
-        return lowerOne(r, op, target, {0, 0, false},
-            op.getRhs() == op.getLhs() ? Storage{0, 0, false} : Storage{8, 0, false}, {48, 0, true}, packed, queueBase);
-    }
     llvm::DenseMap<mlir::Value, Storage> storage;
     llvm::DenseMap<mlir::Value, int64_t> lastUse;
     for (auto [index, op] : llvm::enumerate(ops)) {
@@ -197,13 +235,20 @@ mlir::LogicalResult lowerVectorAluSchedules(mlir::IRRewriter& r,
         for (auto value : {op.getLhs(), op.getRhs()}) {
             if (!llvm::isa<mlir::BlockArgument>(value) || storage.contains(value)) continue;
             if (inputSlot >= 4) return op.emitError("vector graph currently supports at most four external inputs");
-            storage[value] = {4 * inputSlot++, 0, true};
+            storage[value] = ops.size() == 1
+                ? Storage{inputSlot == 0 ? 0 : 8, 0, false}
+                : Storage{4 * inputSlot, 0, true};
+            ++inputSlot;
         }
-    struct Live { mlir::Value value; int64_t slot; int64_t end; };
+    struct Live { int64_t slot; int64_t end; };
     llvm::SmallVector<Live> live;
     const int64_t slotsPerBank = (target.memory().slices_per_hemisphere - 16) / 4;
     const int64_t capacity = slotsPerBank * target.memory().banks_per_slice;
     if (slotsPerBank <= 0) return function.emitError("no vector graph scratch slice groups");
+    const auto plan = [&](mlir::Value value, Storage st) {
+        return placement(r, llvm::cast<mlir::RankedTensorType>(value.getType()),
+            st.slice, st.west ? "west" : "east", st.bank, packed);
+    };
     for (auto [index, op] : llvm::enumerate(ops)) {
         llvm::erase_if(live, [&](const Live& item) { return item.end < static_cast<int64_t>(index); });
         int64_t slot = 0;
@@ -211,28 +256,41 @@ mlir::LogicalResult lowerVectorAluSchedules(mlir::IRRewriter& r,
             if (llvm::none_of(live, [&](const Live& item) { return item.slot == slot; })) break;
         if (slot == capacity) return op.emitError("vector graph live values exceed MEM capacity");
         if (!storage.contains(op.getLhs()) || !storage.contains(op.getRhs()))
-            return op.emitError("vector graph operand is not a scalar-broadcast input or producer");
-        const Storage output{16 + (slot % slotsPerBank) * 4, slot / slotsPerBank, true};
-        const auto oldResult = op.getResult();
-        const int64_t end = lastUse.lookup(oldResult);
-        const auto lhs = storage.lookup(op.getLhs());
-        const auto rhs = storage.lookup(op.getRhs());
-        auto* before = op->getPrevNode();
-        if (mlir::failed(lowerOne(r, op, target, lhs, rhs, output, packed, queueBase))) return mlir::failure();
-        // lowerOne replaces the Kernel result with a physical binding. The
-        // subsequent users now refer to that binding, not the erased result.
-        auto* inserted = before ? before->getNextNode() : &function.getBody().front().front();
-        BindingOp result;
+            return op.emitError("vector graph operand has no storage plan");
+        const Storage output = ops.size() == 1 ? Storage{48, 0, true}
+            : Storage{16 + (slot % slotsPerBank) * 4, slot / slotsPerBank, true};
+        op->setAttr("ftlpu.vector_lhs_placement", plan(op.getLhs(), storage.lookup(op.getLhs())));
+        op->setAttr("ftlpu.vector_rhs_placement", plan(op.getRhs(), storage.lookup(op.getRhs())));
+        op->setAttr("ftlpu.vector_result_placement", plan(op.getResult(), output));
+        op->setAttr("ftlpu.vector_packed", r.getBoolAttr(packed));
+        storage[op.getResult()] = output;
+        live.push_back({slot, lastUse.lookup(op.getResult())});
+    }
+    return mlir::success();
+}
+
+mlir::LogicalResult lowerVectorAluSchedules(mlir::IRRewriter& r,
+    mlir::func::FuncOp function, const target::LPUTargetModel& target)
+{
+    if (mlir::failed(planVectorAluMemory(function, target))) return mlir::failure();
+    llvm::SmallVector<kernel::VectorAluOp> ops;
+    function.walk([&](kernel::VectorAluOp op) { ops.push_back(op); });
+    const auto queuePolicy = function->getAttrOfType<mlir::IntegerAttr>("ftlpu.vxm_queue_base");
+    const int64_t queueBase = queuePolicy ? queuePolicy.getInt() : 0;
+    if (queueBase != 0 && queueBase != 8) return function.emitError("VXM queue base must select one physical eight-ALU group");
+    for (auto [index, op] : llvm::enumerate(ops)) {
+        auto *before = op->getPrevNode();
+        if (mlir::failed(lowerOne(r, op, target,
+            storageOf(op->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_lhs_placement")),
+            storageOf(op->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_rhs_placement")),
+            storageOf(op->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_result_placement")),
+            op->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_packed").getValue(), queueBase))) return mlir::failure();
+        auto *inserted = before ? before->getNextNode() : &function.front().front();
         for (; inserted; inserted = inserted->getNextNode()) {
-            // Stage identity comes from SSA operation order, independently
-            // of source/debug locations (which can all be unknown).
             inserted->setAttr("ftlpu.schedule_stage", r.getI64IntegerAttr(index));
-            auto binding = llvm::dyn_cast<BindingOp>(inserted);
-            if (binding && binding.getAccess() == "output") { result = binding; break; }
+            if (auto binding = llvm::dyn_cast<BindingOp>(inserted))
+                if (binding.getAccess() == "output") break;
         }
-        if (!result) return function.emitError("vector graph result placement was not emitted");
-        storage[result.getValue()] = output;
-        live.push_back({result.getValue(), slot, end});
     }
     return mlir::success();
 }

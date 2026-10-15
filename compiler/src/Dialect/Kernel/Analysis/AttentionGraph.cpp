@@ -37,7 +37,9 @@ ProjectionRoot match_normalized_projection_root(ReshapeOp heads_reshape)
 
 std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
 {
-    auto context_reshape = output.getLhs().getDefiningOp<ReshapeOp>();
+    auto output_gate = output.getLhs().getDefiningOp<SigmoidMultiplyOp>();
+    auto context_reshape = (output_gate ? output_gate.getInput() : output.getLhs())
+        .getDefiningOp<ReshapeOp>();
     if (!context_reshape) return std::nullopt;
     auto context_transpose =
         context_reshape.getInput().getDefiningOp<TransposeOp>();
@@ -135,6 +137,7 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
         qk,
         softmax,
         pv,
+        output_gate,
         {query.getOperation(), key.getOperation(), value.getOperation(),
             query_reshape.getOperation(), key_reshape.getOperation(),
             value_reshape.getOperation(), query_rope.getOperation(),
@@ -145,6 +148,11 @@ std::optional<AttentionGraph> match_attention_graph(MatmulOp output)
             context_transpose.getOperation(), context_reshape.getOperation(),
             output.getOperation()}
     };
+    if (output_gate) {
+        if (output_gate.getGate().getType() != context_reshape.getResult().getType())
+            return std::nullopt;
+        graph.operations.push_back(output_gate.getOperation());
+    }
     std::size_t bias_index = 3;
     if (query_root.bias)
         graph.operations.insert(graph.operations.begin() + bias_index++,

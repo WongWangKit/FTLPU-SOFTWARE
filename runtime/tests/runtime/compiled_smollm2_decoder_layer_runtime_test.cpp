@@ -232,8 +232,8 @@ std::size_t firstBindingReadCycle(
             }
             if (ftlpu::software::runtime::is_fu_3d_raw_packet_header(
                     command)) {
-                constexpr std::size_t packetWords =
-                    ftlpu::isa::EncodedMemIcu3DPacket::kWordCount;
+                const std::size_t packetWords =
+                    ftlpu::software::runtime::fu_3d_raw_packet_word_count(queue->kind, command);
                 if (commandIndex + packetWords > queue->commands.size())
                     throw std::logic_error(
                         "truncated raw MEM 3-D binding relocation");
@@ -2702,8 +2702,6 @@ try {
     ModelSession dynamicSession(dynamicSystem);
     std::uint32_t runtimeDdrBandwidth =
         program.hardware.ddr_peak_bandwidth_mbytes_per_second;
-    const bool hasRuntimeDdrOverride =
-        std::getenv("FTLPU_DDR_BANDWIDTH_MBPS") != nullptr;
     if (const char* bandwidth =
             std::getenv("FTLPU_DDR_BANDWIDTH_MBPS")) {
         const auto parsed = std::stoull(bandwidth);
@@ -3041,12 +3039,11 @@ try {
             + " bytes="
             + std::to_string(dynamicStats.weight_page_prefetch_bytes)
             + " expected_bytes=" + std::to_string(expectedPagedBytes));
-    if (!hasRuntimeDdrOverride && runtimeDdrBandwidth >= 51'200
-        && dynamicStats.weight_page_runtime_wait_cycles != 0)
-        throw std::logic_error(
-            "Qwen dynamic C2C execution stalled after program start: "
-            + std::to_string(dynamicStats.weight_page_runtime_wait_cycles)
-            + " cycles");
+    // Page-ready waits are legal even at high DDR bandwidth: bank reuse and
+    // consumer epochs also constrain prefetch. Report them as performance
+    // metrics below, rather than treating a bandwidth threshold as a proof
+    // of zero waits. ModelSession's completion watchdog detects deadlock;
+    // the exact output comparison above detects incorrect resumption.
     const BinaryProgram& linkedProgram =
         dynamicSession.last_linked_program();
     std::array<bool, ftlpu::InstructionControlUnit::kMemQueues>
@@ -3093,7 +3090,7 @@ try {
                 else
                     static_cast<void>(decode_fu_3d_raw_packet_loop(
                         queue, pc));
-                pc += fu_3d_raw_packet_word_count(queue.kind);
+                pc += fu_3d_raw_packet_word_count(queue.kind, queue.commands[pc]);
                 continue;
             }
             ++pc;

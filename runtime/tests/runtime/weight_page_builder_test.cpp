@@ -250,6 +250,27 @@ try {
         require(packedPartial.data == pack_weight_binding(partial, canonical, ExecutableHardwareConfig{}).data,
             "partial Q/K offline image did not apply the compiler-selected permutation");
     }
+    {
+        BinaryBinding gamma;
+        gamma.shape = {256};
+        gamma.element_type = BindingElementType::BF16;
+        gamma.byte_size = 512;
+        gamma.rope_head_dim = 256;
+        gamma.rope_rotary_dim = 64;
+        std::vector<std::uint8_t> source(512);
+        for (std::size_t i = 0; i < 256; ++i) {
+            source[2*i] = static_cast<std::uint8_t>(i);
+            source[2*i+1] = 0x3f;
+        }
+        const auto physical = pack_rope_projection_data(gamma, source);
+        for (std::size_t lane = 0; lane < 256; ++lane) {
+            const auto expected = lane < 32 ? lane : lane < 128 ? lane+32
+                : lane < 160 ? lane-96 : lane;
+            require(physical[2*lane] == source[2*expected]
+                    && physical[2*lane+1] == source[2*expected+1],
+                "partial RoPE must apply the Q/K feature permutation to BF16 norm gamma");
+        }
+    }
     test_kv_cache_roundtrip();
     test_planar_transport();
     const auto data = logical_weight();

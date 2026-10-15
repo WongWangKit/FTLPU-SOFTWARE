@@ -180,7 +180,7 @@ std::uint64_t native_mem_release_before(
                     duration += (loop.counts[axis] - 1) * loop.cycle_strides[axis];
                 cursor += duration;
                 if (cursor < plan.ready_cycle) queueRelease = cursor;
-                pc += fu_3d_raw_packet_word_count(queue.kind);
+                pc += fu_3d_raw_packet_word_count(queue.kind, command);
             } else if (is_icu_control_raw_word_command(command)) {
                 ++cursor; ++pc;
             } else {
@@ -526,10 +526,43 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         // available to absorb DDR latency and jitter. Launch at the earliest
         // physically safe cycle; page-ready synchronization still protects
         // the consumer when runtime bandwidth is lower than planned.
-        const std::uint64_t earliest = std::max(
+        std::uint64_t earliest = std::max(
             reusableCycles[index], nextTransportCursor);
+        // A graph compiler may reserve an exclusive SR ingress window
+        // between complete operators. The page-ready rendezvous fences all
+        // later consumers, including when physical DDR service is late.
+        // Such a reservation is stronger than an executable-wide last-use
+        // floor, which otherwise prevents an early page from preceding a
+        // future operator that reuses the same SR lanes.
+        bool hasIngressWindow = !plan.use_indices.empty();
+        std::uint64_t ingressBegin = 0;
+        std::uint64_t ingressEnd = plan.ready_cycle;
+        for (const auto useIndex : plan.use_indices) {
+            const auto& use = program.weight_page_uses.at(useIndex);
+            const auto name = "c2c.window.binding:"
+                + std::to_string(use.binding_index) + ".page:"
+                + std::to_string(use.page_index);
+            const auto window = std::ranges::find_if(program.timelines,
+                [&](const BinaryTimeline& timeline) {
+                    return timeline.name == name;
+                });
+            if (window == program.timelines.end()) {
+                hasIngressWindow = false;
+                break;
+            }
+            ingressBegin = std::max(ingressBegin, window->start_cycle);
+            ingressEnd = std::min(ingressEnd, window->end_cycle);
+        }
+        if (hasIngressWindow) {
+            if (ingressBegin >= ingressEnd
+                || ingressEnd > plan.ready_cycle)
+                throw std::logic_error("invalid compiler C2C ingress window");
+            earliest = std::max(earliest, ingressBegin);
+            plan.earliest_mem_cycle = std::max(
+                plan.earliest_mem_cycle, ingressBegin);
+        }
         plan.fabric_streams.clear();
-        if (hasStreamReleases) {
+        if (hasStreamReleases && !hasIngressWindow) {
             struct StreamSelection {
                 std::uint64_t start{0};
                 std::uint64_t end{std::numeric_limits<std::uint64_t>::max()};

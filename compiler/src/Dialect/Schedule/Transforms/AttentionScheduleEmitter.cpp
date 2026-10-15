@@ -155,7 +155,6 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         : rewriter_.getF32FloatAttr(1.0f);
     if (rotaryDimAttr.getInt() < op_.getHeadDim()
         && (op_.getQueryBias() || op_.getKeyBias()
-            || op_.config().getAs<mlir::FloatAttr>("qk_norm_epsilon")
             || op_.config().getAs<mlir::IntegerAttr>("kv_cache_capacity"))) {
         op_.emitError("partial RoPE currently requires bias-free prefill without persistent KV export");
         return mlir::failure();
@@ -220,7 +219,19 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         createBinding(rewriter_, op_.getLoc(), normWeights[index],
             argument.getArgNumber(), "input", "weight",
             llvm::cast<mlir::RankedTensorType>(argument.getType()),
-            placement, normPlacements[index]);
+            placement, normPlacements[index], "none", rewriter_.getDictionaryAttr({
+                rewriter_.getNamedAttr("head_dim", rewriter_.getI64IntegerAttr(op_.getHeadDim())),
+                rewriter_.getNamedAttr("rotary_dim", rotaryDimAttr)}));
+    }
+    if (op_.output_gate) {
+        auto argument = llvm::dyn_cast<mlir::BlockArgument>(op_.getOutputGate());
+        if (!argument) {
+            op_.emitError("output gate must have a planned tensor input");
+            return mlir::failure();
+        }
+        createBinding(rewriter_, op_.getLoc(), argument, argument.getArgNumber(),
+            "input", "activation", llvm::cast<mlir::RankedTensorType>(argument.getType()),
+            memoryPlan.getAs<mlir::DictionaryAttr>("output_gate"));
     }
     if (op_.getCausal()) {
         const auto maskType = mlir::RankedTensorType::get(
@@ -394,8 +405,11 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     const int64_t pvEnd = emitPv(probabilityTransposeEnd);
     contextBinding->setAttr("ready_cycle",
         rewriter_.getI64IntegerAttr(pvEnd));
-    const int64_t outputProjectionEnd =
-        emitOutputProjection(pvEnd);
+    const int64_t gateEnd = op_.output_gate ? emitOutputGate(pvEnd) : pvEnd;
+    if (gateEnd < 0) return mlir::failure();
+    const int64_t outputProjectionEnd = emitOutputProjection(gateEnd);
+    if (op_.output_gate)
+        createTimeline(rewriter_, op_.getLoc(), "attention_output_gate", pvEnd, gateEnd);
     if (keyBinding) {
         const auto function = op_.output->getParentOfType<mlir::func::FuncOp>();
         if (annotateStateTransfers(function, keyBinding, rewriter_) == 0
@@ -417,7 +431,7 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     createTimeline(rewriter_, op_.getLoc(), "pv",
         probabilityTransposeEnd, pvEnd);
     createTimeline(rewriter_, op_.getLoc(), "o_proj",
-        pvEnd, outputProjectionEnd);
+        gateEnd, outputProjectionEnd);
     auto outputBinding = createBinding(rewriter_, op_.getLoc(), {},
         outputIndex, "output", "result",
         llvm::cast<mlir::RankedTensorType>(op_.getResult().getType()),
@@ -452,6 +466,7 @@ mlir::LogicalResult lowerAttentionSchedules(mlir::IRRewriter& rewriter,
         auto lowered = emitter.emit(outputIndex++);
         if (mlir::failed(lowered)) return mlir::failure();
         rewriter.replaceOp(operation.output, *lowered);
+        if (operation.output_gate) rewriter.eraseOp(operation.output_gate);
         rewriter.eraseOp(operation.pv);
         rewriter.eraseOp(operation.probability_transpose);
         rewriter.eraseOp(operation.value_transpose);

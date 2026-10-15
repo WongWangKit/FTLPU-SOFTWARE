@@ -18,8 +18,8 @@ mlir::ArrayAttr packetWords(mlir::OpBuilder& builder,
 {
     llvm::SmallVector<mlir::Attribute> words;
     words.reserve(Packet::kWordCount * Packet::kLanesPerWord);
-    for (const auto& physicalWord : packet.words)
-        for (const auto lane : physicalWord.lanes)
+    for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(packet); ++w)
+        for (const auto lane : packet.words[w].lanes)
             words.push_back(builder.getI64IntegerAttr(lane));
     return builder.getArrayAttr(words);
 }
@@ -58,7 +58,7 @@ mlir::LogicalResult materializeMem3DCommand(mlir::OpBuilder& builder,
         hardwareInstruction.loop.start_cycle = 0;
         mlir::Operation* operation = createRawPacketOp<Mem3DOp>(builder,
             location, cycle, queue,
-            isa::encode_mem_icu_3d_instruction(hardwareInstruction));
+            isa::encode_mem_icu_shortest_instruction(hardwareInstruction));
         if (addressBinding >= 0) {
             operation->setAttr("address_binding",
                 builder.getI64IntegerAttr(addressBinding));
@@ -99,7 +99,7 @@ mlir::LogicalResult materializeMxmLoad3DCommand(mlir::OpBuilder& builder,
         const auto cycle = hardwareInstruction.loop.start_cycle;
         hardwareInstruction.loop.start_cycle = 0;
         createRawPacketOp<MxmLoad3DOp>(builder, location, cycle, queue,
-            isa::encode_mxm_load_icu_3d_instruction(hardwareInstruction));
+            isa::encode_mxm_load_icu_shortest_instruction(hardwareInstruction));
         return mlir::success();
     } catch (const std::exception& exception) {
         if (error) *error = exception.what();
@@ -119,7 +119,7 @@ mlir::LogicalResult materializeMxmDequant3DCommand(mlir::OpBuilder& builder,
         hardwareInstruction.loop.start_cycle = 0;
         mlir::Operation* operation = createRawPacketOp<MxmDequant3DOp>(builder,
             location, cycle, queue,
-            isa::encode_mxm_dequant_icu_3d_instruction(hardwareInstruction));
+            isa::encode_mxm_dequant_icu_shortest_instruction(hardwareInstruction));
         if (scaleBinding >= 0)
             operation->setAttr("scale_binding",
                 builder.getI64IntegerAttr(scaleBinding));
@@ -140,7 +140,7 @@ mlir::LogicalResult materializeMxmCompute3DCommand(mlir::OpBuilder& builder,
         const auto cycle = hardwareInstruction.loop.start_cycle;
         hardwareInstruction.loop.start_cycle = 0;
         createRawPacketOp<MxmCompute3DOp>(builder, location, cycle, queue,
-            isa::encode_mxm_compute_icu_3d_instruction(hardwareInstruction));
+            isa::encode_mxm_compute_icu_shortest_instruction(hardwareInstruction));
         return mlir::success();
     } catch (const std::exception& exception) {
         if (error) *error = exception.what();
@@ -161,14 +161,14 @@ mlir::LogicalResult materializeFfnUp3DCommands(mlir::OpBuilder& builder,
                     "FFN Up MEM hardware instruction has a nonzero origin");
             createRawPacketOp<Mem3DOp>(builder, location, command.cycle,
                 command.queue,
-                isa::encode_mem_icu_3d_instruction(command.instruction));
+                isa::encode_mem_icu_shortest_instruction(command.instruction));
         }
         for (const auto& command : lowering.mxm_load_commands) {
             if (command.instruction.loop.start_cycle != 0)
                 throw std::invalid_argument(
                     "FFN Up MXM load hardware instruction has a nonzero origin");
             createRawPacketOp<MxmLoad3DOp>(builder, location, command.cycle,
-                command.queue, isa::encode_mxm_load_icu_3d_instruction(
+                command.queue, isa::encode_mxm_load_icu_shortest_instruction(
                     command.instruction));
         }
         for (const auto& command : lowering.mxm_dequant_commands) {
@@ -177,7 +177,7 @@ mlir::LogicalResult materializeFfnUp3DCommands(mlir::OpBuilder& builder,
                     "FFN Up MXM dequant hardware instruction has a nonzero origin");
             createRawPacketOp<MxmDequant3DOp>(builder, location,
                 command.cycle,
-                command.queue, isa::encode_mxm_dequant_icu_3d_instruction(
+                command.queue, isa::encode_mxm_dequant_icu_shortest_instruction(
                     command.instruction));
         }
         for (const auto& command : lowering.mxm_compute_commands) {
@@ -186,7 +186,7 @@ mlir::LogicalResult materializeFfnUp3DCommands(mlir::OpBuilder& builder,
                     "FFN Up MXM compute hardware instruction has a nonzero origin");
             createRawPacketOp<MxmCompute3DOp>(builder, location,
                 command.cycle,
-                command.queue, isa::encode_mxm_compute_icu_3d_instruction(
+                command.queue, isa::encode_mxm_compute_icu_shortest_instruction(
                     command.instruction));
         }
         return mlir::success();

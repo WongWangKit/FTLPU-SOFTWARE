@@ -76,6 +76,8 @@ add_library(ftlpu_compiler
     src/Dialect/Kernel/Analysis/AttentionGraph.cpp
     src/Dialect/Kernel/Analysis/FfnGraph.cpp
     src/Dialect/Kernel/Transforms/StableHloToKernel.cpp
+    src/Dialect/Kernel/Transforms/ConnectedKernelGraphToSchedule.cpp
+    src/Dialect/Kernel/Transforms/LogicalKernelGraphToSchedule.cpp
     src/Dialect/Tensor/IR/TensorDialect.cpp
     src/Dialect/Tensor/Analysis/AttentionTaskGraph.cpp
     src/Dialect/Tensor/Analysis/AttentionWeightTilePlan.cpp
@@ -254,6 +256,12 @@ target_link_libraries(ftlpu_translate PRIVATE ftlpu_compiler)
 add_executable(ftlpu_compile tools/ftlpu_compile.cpp)
 set_target_properties(ftlpu_compile PROPERTIES OUTPUT_NAME "ftlpu-compile")
 target_link_libraries(ftlpu_compile PRIVATE ftlpu_compiler)
+add_executable(ftlpu_graph_compile tools/ftlpu_graph_compile.cpp)
+set_target_properties(ftlpu_graph_compile PROPERTIES OUTPUT_NAME "ftlpu-graph-compile")
+target_link_libraries(ftlpu_graph_compile PRIVATE ftlpu_compiler)
+if(MSVC)
+    target_compile_options(ftlpu_graph_compile PRIVATE /EHsc)
+endif()
 if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     # Large command streams such as Qwen seq128 exceed the default 2 GiB
     # user-mode address-space ceiling of a 32-bit Windows executable.
@@ -341,6 +349,13 @@ if(MSVC)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    add_test(NAME icu_short_lowering_test
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/icu_short_lowering_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --export $<TARGET_FILE:ftlpu_icu_program_export>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/icu_short)
     add_test(
         NAME model_test_entrypoint_test
         COMMAND ${Python3_EXECUTABLE} -B
@@ -583,6 +598,15 @@ if(Python3_Interpreter_FOUND)
             --target-config ${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/exploration_40_streams.json
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/lpu_target_configuration)
     add_test(
+        NAME mem_group_configuration_lowering_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/mem_group_configuration_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64_bf16.stablehlo.mlir
+            --hardware-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/mem_group_configuration)
+    add_test(
         NAME w8a16_ffn_mtile_weight_reuse_test
         COMMAND
             ${Python3_EXECUTABLE}
@@ -794,13 +818,70 @@ if(Python3_Interpreter_FOUND)
             --compile $<TARGET_FILE:ftlpu_compile>
             --runner $<TARGET_FILE:compiled_stage_file_runner>
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/resident_layout_bridge)
+        add_test(NAME resident_sr_copy_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/resident_sr_copy_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/resident_sr_copy)
+        add_test(NAME depthwise_conv_mirrored_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/depthwise_conv_mirrored_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/depthwise_conv_mirrored)
+        add_test(NAME shared_rmsnorm_resident_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/shared_rmsnorm_resident_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/shared_rmsnorm_resident)
+        add_test(NAME shared_rmsnorm_partitioned_resident_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/shared_rmsnorm_resident_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${CMAKE_SOURCE_DIR}/../FTLPU-CMODEL/config/ftlpu-lpu32.json
+            --direct-initial-input
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/shared_rmsnorm_partitioned_resident)
         add_test(NAME qwen3_5_resident_decoder_layer_test
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_5_resident_decoder_layer_test.py
             --opt $<TARGET_FILE:ftlpu_opt>
             --compile $<TARGET_FILE:ftlpu_compile>
             --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen3_5_resident_decoder_layer)
+        add_test(NAME gated_attention_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gated_attention_runtime_test.py
+            --hidden-size 256
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gated_attention_runtime)
+        add_test(NAME gated_attention_decoder_layer_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gated_attention_runtime_test.py
+            --hidden-size 256 --full-layer
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gated_attention_decoder_layer_runtime)
+        foreach(native_vector_test packed_vector_graph_runtime_test vxm_queue_group_runtime_test vector_memory_plan_runtime_test)
+          add_test(NAME ${native_vector_test}
+            COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/${native_vector_test}.py
+              --compile $<TARGET_FILE:ftlpu_compile>
+              --runner $<TARGET_FILE:compiled_stage_file_runner>
+              --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/${native_vector_test})
+        endforeach()
         add_test(NAME vector_alu_binary_runtime_test
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/vector_alu_binary_runtime_test.py

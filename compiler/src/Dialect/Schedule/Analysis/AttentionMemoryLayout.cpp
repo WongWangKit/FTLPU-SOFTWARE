@@ -6,7 +6,7 @@
 namespace ftlpu::compiler::schedule {
 
 AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
-    const target::LPUTargetModel& target)
+    const target::LPUTargetModel& target, bool gatedContext)
     : target_(target), seqLen_(op.getSeqLen()), kvSeqLen_(op.getKvSeqLen()),
       hidden_(op.getHidden()),
       queryHeads_(op.getQueryHeads()), kvHeads_(op.getKvHeads()),
@@ -207,7 +207,7 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
                             + stream]).getInt();
     }
     if (const auto context =
-            plan.getAs<mlir::DictionaryAttr>("context")) {
+            plan.getAs<mlir::DictionaryAttr>(gatedContext ? "gated_context" : "context")) {
         contextBase_ =
             context.getAs<mlir::IntegerAttr>("base_row").getInt();
         const auto values = context.getAs<mlir::ArrayAttr>("slices");

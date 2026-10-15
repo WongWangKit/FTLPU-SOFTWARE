@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 
 from qwen3_5_reference import Qwen35DeltaConfig, Qwen35DeltaWeights
+from common_kernel_graph import rms_norm_source
 
 
 def bf16(x):
@@ -162,6 +163,10 @@ class CompiledStages:
         return self.alu(name, x, self.sigmoid(name, x), dtype=dtype)
 
     def norm(self, name, x, gamma, epsilon, mean=True, scale=1):
+        if mean and scale == 1:
+            gamma = bf16(np.asarray(gamma).reshape(-1))
+            return self.run(name, rms_norm_source(x.shape, epsilon),
+                            [(x, 'bf16'), (gamma, 'bf16')], [(x.shape, 'bf16')])[0]
         if x.size <= 4096:
             graph = VectorGraph(self, name, [(x, "bf16"), (np.asarray(gamma).reshape(1, -1), "f32")])
             return graph.finish(graph.norm(0, 1, epsilon, mean, scale))

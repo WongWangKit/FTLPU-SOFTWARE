@@ -112,6 +112,7 @@ class Schedule:
         self.group = target['streams']['mem_slices_per_register_group']
         self.period = 32 // target['throughput']['mem_read_bytes_per_cycle']
         self.bridge_domains=0
+        self.raw_sr_copies=False
 
     def bridge_queue(self):
         base=(4,6,12,14)[self.bridge_domains%4]
@@ -209,6 +210,8 @@ class Schedule:
             pos=end
 
     def scalar_domain(self,source,dest,src_offset,dst_offset,counts,src_strides,dst_strides):
+        if self.raw_sr_copies and self.raw_mem_domain(source,dest,src_offset,dst_offset,counts,src_strides,dst_strides):
+            return
         beat=self.cursor+32
         queue=self.bridge_queue()
         intervals=(self.period,counts[0]*self.period,counts[0]*counts[1]*self.period)
@@ -224,6 +227,35 @@ class Schedule:
             self.mem(result+dest['slices'][plane]//self.group+1,dest,plane,'write',dest['base_row']+dst_offset,24+plane,
                 counts,dst_strides,intervals)
         self.cursor=result+count*self.period+96
+
+    def raw_mem_domain(self,source,dest,src_offset,dst_offset,counts,src_strides,dst_strides):
+        """Copy bytes through directed SR links; no VALU configuration/cast.
+
+        Same-fabric copies require a reachable downstream MEM boundary.
+        Cross-fabric copies use the existing passive sixteen-column SR chain.
+        Streams 20..23 avoid the active RMSNorm/Conv operand channels, including
+        the mirrored RMSNorm channels 16..19. Paging sees the MEM SR usage.
+        """
+        if len(source['slices'])!=len(dest['slices']):return False
+        paths=[]
+        for plane,(src,dst) in enumerate(zip(source['slices'],dest['slices'])):
+            sg,dg=src//self.group,dst//self.group
+            if source['hemisphere']!=dest['hemisphere']:
+                read_stream=52+plane;write_stream=20+plane
+                latency=sg+self.target['throughput']['vxm_alus']+dg+3
+            elif sg<dg:
+                read_stream=write_stream=20+plane;latency=dg-sg
+            elif sg>dg:
+                read_stream=write_stream=52+plane;latency=sg-dg
+            else:return False # no same-column U-turn link
+            paths.append((read_stream,write_stream,latency))
+        start=self.cursor+32
+        intervals=(self.period,counts[0]*self.period,counts[0]*counts[1]*self.period)
+        for plane,(read_stream,write_stream,latency) in enumerate(paths):
+            self.mem(start,source,plane,'read',source['base_row']+src_offset,read_stream,counts,src_strides,intervals)
+            self.mem(start+latency,dest,plane,'write',dest['base_row']+dst_offset,write_stream,counts,dst_strides,intervals)
+        self.cursor=start+int(np.prod(counts))*self.period+max(p[2] for p in paths)+96
+        return True
 
     def unpack(self, source, dest, shape, needed=None):
         """Packed [rows, columns] to row-major scalar broadcast."""
@@ -317,12 +349,12 @@ class Schedule:
             permute=transpose+5
             # Only row 0 is emitted. Reserve W24..31 for C2C instead of
             # assigning unused crossbar rows to those transport streams.
-            self.sxm(permute,'east','permute',list(range(16,32)),[48,49]*8,[i%8 for i in range(32)],words,interval,row=9)
+            self.sxm(permute,'east','permute',list(range(16,32)),list(range(32,48)),[i%8 for i in range(32)],words,interval,row=9)
             beat=permute+15
             for plane in range(4):
                 self.mem(beat-(masks['slices'][plane]//self.group+1),masks,plane,'read',tile,40+plane,
                     (words,1,1),(0,0,0),(interval,1,1))
-            self.vxm(beat-1,kind='multiply',lhs='stream_bf16',rhs='stream_f32',lhs_index=16,rhs_index=8,source='east',rhs_source='east',count=words,interval=interval)
+            self.vxm(beat-1,kind='multiply',lhs='stream_bf16',rhs='stream_f32',lhs_index=0,rhs_index=8,source='east',rhs_source='east',count=words,interval=interval)
             last=1
             if tile:
                 previous=ping[(tile-1)%2]
@@ -375,12 +407,12 @@ class Schedule:
                 self.sxm(transpose,src['hemisphere'],'transpose',[16,17],list(range(16,32)),list(range(32)),counts[0],32,waves=counts[1]*counts[2],wave_interval=counts[0]*32)
                 permute=transpose+5;direct=src['hemisphere']==dest['hemisphere']
                 if len(dest['slices'])==4 and not direct:raise ValueError('FP32 unpack requires the same hemisphere')
-                base=32 if direct else 48
-                destinations=list(range(base,base+16)) if direct else [48,49]*8
+                base=32
+                destinations=list(range(base,base+16))
                 self.sxm(permute,src['hemisphere'],'permute',list(range(16,32)),destinations,[tile*8+i%8 for i in range(32)],counts[0],32,row=9+lane if lane<7 else 7,waves=counts[1]*counts[2],wave_interval=counts[0]*32,map_stride=8 if full_words else 0)
                 if not direct:
                     beat=permute+15
-                    self.vxm(beat-1,queue=4,lhs='stream_bf16',lhs_index=16,source=src['hemisphere'],output=dest['hemisphere'],count=n,interval=32)
+                    self.vxm(beat-1,queue=4,lhs='stream_bf16',lhs_index=2*lane,source=src['hemisphere'],output=dest['hemisphere'],count=n,interval=32)
                     self.vxm(beat-1,queue=5,lhs='previous',output=dest['hemisphere'],format_='bf16',out=0,count=n,interval=32)
                     result=beat+((19 if src['hemisphere']=='west' else 12) if dest['hemisphere']=='east' else (24 if src['hemisphere']=='west' else 17))
                 for plane in range(2):
@@ -412,16 +444,26 @@ class Schedule:
 class ResidentLinker:
     """Link operator-owned schedules before binary encoding.
 
-    Intermediate tensors are archived in bank-1 SRAM above all operator
-    scratch ranges. Static inputs are resident in the lower half of bank 1.
+    Intermediate tensors and static inputs occupy bank-1 ranges disjoint from
+    all native mutable workspaces. Slice roles come from the target schedules.
     Lifetime allocation follows graph edges. This intentionally serial first
     implementation does not claim C2C overlap or optimized layout traffic.
     """
-    def __init__(self, graph, finals):
+    def __init__(self, graph, finals, direct_initial_inputs=(), direct_edges=(), raw_sr_copies=False):
         self.graph,self.finals=graph,list(finals)
         first=graph.nodes[0]['schedule'].read_text().splitlines()[0]
         target=parse_attr(first[first.index('ftlpu.target = ')+15:-3])
         self.schedule=Schedule(target)
+        self.schedule.raw_sr_copies=raw_sr_copies
+        self.direct_outputs={}
+        for producer,consumer in direct_edges:
+            ni,idx=consumer
+            value,dtype=graph.nodes[ni]['inputs'][idx]
+            if not isinstance(value,Value) or ni<=producer[0] or dtype!=value.dtype or (value.node,value.output)!=tuple(producer) or value.owners is not None or not np.array_equal(value.indices,np.arange(value.size)):
+                raise ValueError('direct edge requires a complete producer tensor')
+            bindings=[p[1] for line in graph.nodes[ni]['schedule'].read_text(encoding='utf-8').splitlines()
+                      if (p:=operation(line)) and p[0]=='binding' and p[1]['access']=='input' and p[1]['index']==idx]
+            self.direct_outputs[tuple(producer)]=copy.deepcopy(bindings[0]['placement'])
         self.bindings,self.arguments,self.inputs=[],[],[]
         self.cache,self.live,self.static_ranges={},{},{}
         self.internal_index=1000
@@ -429,24 +471,102 @@ class ResidentLinker:
         self.static_values={}
         self.weight_inputs={}
         self.last_projection_input=None
-        self.needed={};self.last={}
+        self.direct_initial_inputs=set()
+        for ni,idx in direct_initial_inputs:
+            if ni!=0:
+                raise ValueError('direct initial input must belong to the first operator')
+            value,dtype=graph.nodes[ni]['inputs'][idx]
+            if isinstance(value,Value) or dtype=='i8':
+                raise ValueError('direct initial input must be a resident external activation')
+            if any(v is value for node in graph.nodes[1:] for v,_ in node['inputs']):
+                raise ValueError('direct initial input cannot have later external consumers')
+            bindings=[p[1] for line in graph.nodes[ni]['schedule'].read_text(encoding='utf-8').splitlines()
+                      if (p:=operation(line)) and p[0]=='binding' and p[1]['access']=='input' and p[1]['index']==idx]
+            placement=bindings[0]['placement']
+            # All paged weights can be prefetched before this consumer.
+            # Do not alias any of their physical storage with its input.
+            for node in graph.nodes:
+                if not node.get('schedule'):continue
+                for line in node['schedule'].read_text(encoding='utf-8').splitlines():
+                    p=operation(line)
+                    if not p or p[0]!='binding' or p[1]['access']!='input':continue
+                    w=p[1]['placement']
+                    if w['kind']!='w8a16_mxm_weight_striped' or placement.get('bank',0)!=0:continue
+                    same_side=placement['hemisphere']=='both' or w['hemisphere']=='both' or placement['hemisphere']==w['hemisphere']
+                    if same_side and set(placement['slices'])&set(w['slices']) and placement['base_row']<w['instruction_count'] and placement['base_row']+placement['instruction_count']>0:
+                        raise ValueError('direct initial input overlaps paged weight storage')
+            self.direct_initial_inputs.add((id(value),dtype,attr(placement)))
+        # Immutable inputs and archived outputs must survive every native
+        # operator's mutable workspace, whose slice roles depend on target.
+        # Derive touched row ranges from Schedule domains, not fixed slice IDs.
+        self.native_ranges={}
+        for node in graph.nodes:
+            if not node.get('schedule'):continue
+            for line in node['schedule'].read_text(encoding='utf-8').splitlines():
+                parsed=operation(line)
+                if not parsed or parsed[0]!='mem_transfer':continue
+                v=parsed[1]
+                if v.get('bank',0)!=1 or v['opcode'] not in ('write','write_tap'):continue
+                low=high=v['address']
+                for count,stride in (('repeat_count','address_stride'),('wave_count','wave_address_stride'),('group_count','group_address_stride')):
+                    delta=(v.get(count,1)-1)*v.get(stride,0)
+                    low+=min(0,delta);high+=max(0,delta)
+                key=('west' if v['hemisphere'] else 'east',v['slice'])
+                self.native_ranges.setdefault(key,[]).append((low,high+1))
+        self.needed={};self.last={};self.consumer_copy_groups={}
         for i,node in enumerate(graph.nodes):
             for value,_ in node['inputs']:
                 if isinstance(value,Value):
                     for key,indices,_ in value.segments():
                         self.last[key]=i
                         self.needed.setdefault(key,set()).update(map(int,indices))
+            if raw_sr_copies and node.get('schedule'):
+                for line in node['schedule'].read_text(encoding='utf-8').splitlines():
+                    p=operation(line)
+                    if not p or p[0]!='binding' or p[1]['access']!='input':continue
+                    value,_=node['inputs'][p[1]['index']]
+                    if isinstance(value,Value):
+                        for key,_,_ in value.segments():
+                            self.consumer_copy_groups.setdefault(key,set()).update(
+                                self.copy_groups([p[1]['placement']]))
         for value in finals:
             for key,indices,_ in value.segments():
                 self.last[key]=len(graph.nodes)
                 self.needed.setdefault(key,set()).update(map(int,indices))
+        for key,dest in self.direct_outputs.items():
+            for node in graph.nodes[key[0]+1:min(self.last[key]+1,len(graph.nodes))]:
+                if not node.get('schedule'):continue
+                for line in node['schedule'].read_text(encoding='utf-8').splitlines():
+                    p=operation(line)
+                    if not p or p[0]!='mem_transfer':continue
+                    v=p[1];side='west' if v['hemisphere'] else 'east'
+                    if v['opcode'] not in ('write','write_tap') or v.get('bank',0)!=dest.get('bank',0) or v['slice'] not in dest['slices'] or dest['hemisphere'] not in (side,'both'):continue
+                    low=high=v['address']
+                    for count,stride in (('repeat_count','address_stride'),('wave_count','wave_address_stride'),('group_count','group_address_stride')):
+                        delta=(v.get(count,1)-1)*v.get(stride,0);low+=min(0,delta);high+=max(0,delta)
+                    if low<dest['base_row']+dest['instruction_count'] and dest['base_row']<high+1:
+                        raise ValueError('direct consumer allocation is overwritten during the producer lifetime')
 
-    def allocate(self,key,shape,dtype,hemisphere="west",packed=None):
+    def copy_groups(self,placements):
+        """MEM groups with no direct same-fabric SR U-turn route."""
+        return {(h,s//self.schedule.group) for p in placements
+                for h in ('east','west') if p['hemisphere'] in (h,'both')
+                for s in p['slices']}
+
+    def value_copy_groups(self,value):
+        return self.copy_groups([self.cache[key] for key,_,_ in value.segments()]) \
+            if self.schedule.raw_sr_copies else set()
+
+    def allocate(self,key,shape,dtype,hemisphere="west",packed=None,avoid_groups=()):
         if packed is None: packed=shape[-1]%32==0
         rows=int(np.prod(shape))//(32 if packed else 1); planes=4 if dtype=='f32' else 2
         depth=self.schedule.target['memory']['sram_depth_rows']
         start=depth//2
         pairs=(list(range(32,self.schedule.slices-planes+1,2))+list(range(8,32-planes+1,2))+list(range(0,8-planes+1,2))) if hemisphere=='west' else (list(range(32,self.schedule.slices-planes+1,2))+list(range(8,32-planes+1,2)))
+        # Prefer a directed SR route without making available SRAM unusable.
+        # If only a same-group placement fits, retain the existing bridge.
+        pairs.sort(key=lambda first:any((hemisphere,s//self.schedule.group) in avoid_groups
+                                       for s in range(first,first+planes)))
         for first in pairs:
             # Native projection results occupy bank 1 on slices 28/29.
             # Keep their workspace disjoint from archives on both sides.
@@ -454,10 +574,13 @@ class ResidentLinker:
             lower=(4096 if first>=48 else 2048 if first<8 or projection_workspace or (first<=25 and first+planes>24) else 0) if hemisphere=='west' else (start if first>=32 else 2048 if projection_workspace else 0)
             candidates={lower}
             for p in self.live.values(): candidates.add(p['base_row']+p['instruction_count'])
+            native=[r for slice_ in range(first,first+planes) for r in self.native_ranges.get((hemisphere,slice_),[])]
+            candidates.update(end for _,end in native)
             for row in sorted(candidates):
                 if row<lower:continue
                 if row+rows>depth: continue
-                if any(p['hemisphere']==hemisphere and set(range(first,first+planes)) & set(p['slices']) and
+                if any(row<end and begin<row+rows for begin,end in native):continue
+                if any(p['hemisphere'] in (hemisphere,'both') and set(range(first,first+planes)) & set(p['slices']) and
                     row<p['base_row']+p['instruction_count'] and p['base_row']<row+rows for p in self.live.values()): continue
                 p=dict(kind=('fp32_quad_planar' if planes==4 else 'fp16_pair_planar') if packed else ('fp32_scalar_broadcast_planar' if planes==4 else 'fp16_scalar_broadcast_planar'),
                     slices=list(range(first,first+planes)),base_row=row,bank=1,hemisphere=hemisphere,
@@ -483,8 +606,19 @@ class ResidentLinker:
     def static_input(self,value,dtype,placement,name):
         p=copy.deepcopy(placement)
         identity=self.static_identity(value,dtype,p)
+        direct=(id(value),dtype,attr(p)) in self.direct_initial_inputs
+        if direct:identity=('direct_initial',id(value),identity)
         if identity in self.static_cache:
             result=self.static_cache[identity];self.static_values[(id(value),dtype)]=result
+            return result
+        if direct:
+            # C2C writes straight into the first consumer's native allocation.
+            # Its internal scratch retains the original banks and addresses.
+            index=len(self.inputs)
+            self.inputs.append((value,dtype));self.arguments.append(f'%input{index}: {CompiledType(value.shape,dtype)}')
+            self.binding(name,value.shape,dtype,p,'input',f'%input{index}',index)
+            result=(p,index,f'%resident_bind{len(self.bindings)-1}')
+            self.static_cache[identity]=result;self.static_values[(id(value),dtype)]=result
             return result
         if dtype=='i8' and p['kind']=='w8a16_mxm_weight_striped':
             index=len(self.inputs)
@@ -500,7 +634,8 @@ class ResidentLinker:
             self.static_cache[identity]=result;self.weight_inputs[index]=p
             return result
         if 'scalar_broadcast' in p['kind'] or p['kind'] in ('fp16_pair_planar','fp32_quad_planar'):
-            p=self.allocate(('static',len(self.inputs)),value.shape,dtype,p['hemisphere'],packed='scalar_broadcast' not in p['kind'])
+            p=self.allocate(('static',len(self.inputs)),value.shape,dtype,p['hemisphere'],packed='scalar_broadcast' not in p['kind'],
+                            avoid_groups=self.copy_groups([p]) if self.schedule.raw_sr_copies else ())
             self.last[('static',len(self.inputs))]=len(self.graph.nodes)+1
             index=len(self.inputs);self.inputs.append((value,dtype))
             self.arguments.append(f'%input{index}: {CompiledType(value.shape,dtype)}')
@@ -510,13 +645,19 @@ class ResidentLinker:
             self.static_values[(id(value),dtype)]=result
             return result
         keys=[(h,s) for h in ('east','west') if p['hemisphere'] in (h,'both') for s in p['slices']]
-        row=max([512]+[self.static_ranges.get(key,512) for key in keys])
+        row=max([512]+[self.static_ranges.get(key,512) for key in keys]
+                +[end for key in keys for _,end in self.native_ranges.get(key,[])])
         count=p['instruction_count']
-        if row+count>self.schedule.target['memory']['sram_depth_rows']//2:
+        if row+count>self.schedule.target['memory']['sram_depth_rows']:
             raise ValueError(f'static resident input exceeds reserved area: {name}')
         for key in keys:self.static_ranges[key]=row+count
         p['bank']=1;p['base_row']=row
         index=len(self.inputs)
+        # Distributed immutable inputs are uploaded before execution too.
+        # Reserve their ranges against bank-1 archives on either fabric.
+        key=('static',index)
+        self.live[key]=p
+        self.last[key]=len(self.graph.nodes)+1
         self.inputs.append((value,dtype))
         self.arguments.append(f'%input{index}: {CompiledType(value.shape,dtype)}')
         self.binding(name,value.shape,dtype,p,'input',f'%input{index}',index)
@@ -540,6 +681,44 @@ class ResidentLinker:
 
     def move(self,source,dest,source_shape,dest_shape,indices,positions):
         s=self.schedule
+        same=lambda p:{k:v for k,v in p.items() if not k.startswith('_')}
+        if same(source)==same(dest) and source_shape==dest_shape and np.array_equal(indices,positions):return
+        distributed='fp16_mxm_distributed_16'
+        if source['kind']==distributed or dest['kind']==distributed:
+            if 'scalar_broadcast' in source['kind'] or 'scalar_broadcast' in dest['kind']:
+                raise ValueError('distributed RMSNorm bridge requires a packed tensor view')
+            indices=np.asarray(indices);positions=np.asarray(positions)
+            chosen=np.flatnonzero(indices%32==0)
+            if len(chosen)*32!=len(indices) or np.any(positions[chosen]%32):
+                raise ValueError('distributed RMSNorm bridge requires complete aligned feature words')
+            ix=indices[chosen];pos=positions[chosen]
+            src_rows=ix//source_shape[1];dst_rows=pos//dest_shape[1]
+            # Each token lane owns a MEM pair; each SRAM word contains all
+            # 32 feature lanes. Copy those words using geometry-derived 3-D
+            # domains, with no numerical evaluation or FU-trace compression.
+            for src_lane in range(8 if source['kind']==distributed else 1):
+                for dst_lane in range(8 if dest['kind']==distributed else 1):
+                    selected=np.ones(len(ix),dtype=bool)
+                    if source['kind']==distributed:selected &= src_rows%8==src_lane
+                    if dest['kind']==distributed:selected &= dst_rows%8==dst_lane
+                    if not np.any(selected):continue
+                    a,b=ix[selected],pos[selected]
+                    def word_geometry(p,shape,logical,lane):
+                        if p['kind']==distributed:
+                            row=logical//shape[1]
+                            words=(row//32*(shape[1]//32)+logical%shape[1]//32)*4+row%32//8
+                            return dict(p,slices=p['slices'][2*lane:2*lane+2]),words
+                        if p['kind']!='fp16_pair_planar':
+                            raise ValueError('unsupported packed layout for distributed RMSNorm bridge: '+p['kind'])
+                        return p,self.packed_words(shape,logical)
+                    src,words=word_geometry(source,source_shape,a,src_lane)
+                    dst,offsets=word_geometry(dest,dest_shape,b,dst_lane)
+                    for dst_hemi in ('east','west') if dst['hemisphere']=='both' else (dst['hemisphere'],):
+                        src_hemi=dst_hemi if src['hemisphere']=='both' else src['hemisphere']
+                        if s.raw_sr_copies and src['hemisphere']=='both' and any(a//s.group==b//s.group for a,b in zip(src['slices'],dst['slices'])):
+                            src_hemi='west' if dst_hemi=='east' else 'east'
+                        s.scalar_copy(dict(src,hemisphere=src_hemi),dict(dst,hemisphere=dst_hemi),words,offsets)
+            return
         scalar_source='scalar_broadcast' in source['kind']
         scalar_dest='scalar_broadcast' in dest['kind']
         if scalar_source and scalar_dest:
@@ -573,6 +752,22 @@ class ResidentLinker:
         for key,indices,positions in value.segments():
             self.move(self.cache[key],dest,self.graph.nodes[key[0]]['outputs'][key[1]][0],value.shape,indices,positions)
 
+    def archive_node_outputs(self,ni,native_outputs):
+        node=self.graph.nodes[ni]
+        for oi,(shape,dtype) in enumerate(node['outputs']):
+            key=(ni,oi)
+            if key not in self.last:continue
+            source=native_outputs[oi]
+            if key in self.direct_outputs:
+                dest=copy.deepcopy(self.direct_outputs[key]);dest['_shape']=tuple(shape)
+                self.cache[key]=dest;self.live[key]=dest
+                self.move(source,dest,shape,shape,np.arange(np.prod(shape)),np.arange(np.prod(shape)))
+                continue
+            archive_hemi='east' if dtype=='f32' or node['name'].startswith('key_l2') else 'west'
+            avoid=self.copy_groups([source])|self.consumer_copy_groups.get(key,set()) if self.schedule.raw_sr_copies else set()
+            dest=self.allocate(key,shape,dtype,archive_hemi,packed='scalar_broadcast' not in source['kind'],avoid_groups=avoid)
+            self.move(source,dest,shape,shape,np.arange(np.prod(shape)),np.arange(np.prod(shape)))
+
     def build(self):
         s=self.schedule
         masks=np.zeros((4,32),np.float32)
@@ -593,13 +788,36 @@ class ResidentLinker:
                 v=parsed[1];value,dtype=node['inputs'][v['index']]
                 if isinstance(value,Value) or (node['name'].startswith('delta_rule') and v['index']==5):continue
                 self.static_input(value,dtype,v['placement'],f'{node["name"]}.input{v["index"]}')
+        parallel_start=None;parallel_end=0;parallel_outputs=[];prepared=set()
         for ni,node in enumerate(self.graph.nodes):
             print(f'link {ni:02d} {node["name"]}',flush=True)
+            group=node.get('parallel_group')
+            if group and (ni==0 or self.graph.nodes[ni-1].get('parallel_group')!=group):
+                # Materialize every independent operand before either chain
+                # starts; a layout bridge must not borrow active VALU queues.
+                for pi in range(ni,len(self.graph.nodes)):
+                    member=self.graph.nodes[pi]
+                    if member.get('parallel_group')!=group:break
+                    for line in member['schedule'].read_text(encoding='utf-8').splitlines():
+                        p=operation(line)
+                        if not p or p[0]!='binding' or p[1]['access']!='input':continue
+                        idx=p[1]['index'];value,_=member['inputs'][idx]
+                        placement=p[1]['placement']
+                        if isinstance(value,Value):
+                            if any(key[0]>=ni for key,_,_ in value.segments()):
+                                raise ValueError('parallel operators cannot depend on one another')
+                            self.materialize(value,placement);prepared.add((pi,idx))
+                        elif 'scalar_broadcast' in placement['kind'] or placement['kind'] in ('fp16_pair_planar','fp32_quad_planar','fp16_mxm_distributed_16'):
+                            prior=self.static_values[(id(value),member['inputs'][idx][1])][0]
+                            self.move(prior,placement,value.shape,value.shape,np.arange(value.size),np.arange(value.size))
+                            prepared.add((pi,idx))
+                parallel_start=s.cursor+64;parallel_end=parallel_start;parallel_outputs=[]
             projection=node['name'].startswith(('in_proj_','out_proj','gate_proj','up_proj','down_proj'))
             if not projection:self.last_projection_input=None
             if node.get('layout_join'):
                 value=node['inputs'][0][0]
-                dest=self.allocate((ni,0),value.shape,value.dtype,node['hemisphere'],packed=True)
+                dest=self.allocate((ni,0),value.shape,value.dtype,node['hemisphere'],packed=True,
+                                   avoid_groups=self.value_copy_groups(value))
                 self.materialize(value,dest)
                 for key in list(self.live):
                     if self.last.get(key)==ni:self.live.pop(key)
@@ -618,12 +836,17 @@ class ResidentLinker:
                         idx=v['index'];value,dtype=node['inputs'][idx]
                         placement=v['placement']
                         prior_static=self.static_values.get((id(value),dtype)) if not isinstance(value,Value) else None
-                        if isinstance(value,Value) or (prior_static and ('scalar_broadcast' in placement['kind'] or placement['kind'] in ('fp16_pair_planar','fp32_quad_planar'))):
+                        # RMSNorm intentionally reuses activation slice IDs
+                        # for internal transpose scratch. Materialize its
+                        # external input at the original allocation; blindly
+                        # relocating all reads would also retarget scratch.
+                        if isinstance(value,Value) or (prior_static and ('scalar_broadcast' in placement['kind'] or placement['kind'] in ('fp16_pair_planar','fp32_quad_planar','fp16_mxm_distributed_16'))):
                             if isinstance(value,Value):
                                 identity=(value.shape,hashlib.sha256(value.indices.tobytes()+(value.owners.tobytes() if value.owners is not None else str((value.node,value.output)).encode())).digest(),attr(placement))
-                                if not (projection and idx==0 and self.last_projection_input==identity):self.materialize(value,placement)
+                                if (ni,idx) not in prepared and not (projection and idx==0 and self.last_projection_input==identity):self.materialize(value,placement)
                                 if projection and idx==0:self.last_projection_input=identity
-                            else:self.move(prior_static[0],placement,value.shape,value.shape,np.arange(value.size),np.arange(value.size))
+                            elif prior_static[0]!=placement and (ni,idx) not in prepared:
+                                self.move(prior_static[0],placement,value.shape,value.shape,np.arange(value.size),np.arange(value.size))
                             v['access']='internal'
                             if oldarg:argument_map[oldarg.group(1)]=f'%s{ni}_{old_result[1:]}'
                             pre=pre.replace(oldarg.group(1),'') if oldarg else pre
@@ -651,7 +874,14 @@ class ResidentLinker:
                         if v['access']=='output': native_outputs[v['index']]=copy.deepcopy(v['placement'])
                         v['access']='internal';v['index']=self.internal_index;self.internal_index+=1
                 operations.append((kind,v,pre,post))
-            start=s.cursor+64;end=start
+            # One MEM ICU owns the whole synchronized page write. Leave a
+            # geometry-derived admission window even for adjacent projection
+            # pages whose activation buffer is reused without another pack.
+            # Real DDR latency is absorbed by WRITE_SYNC/page-ready SYNC.
+            page_rows=max((p['page_rows'] for _,p in relocated.values()
+                if p.get('paged_weight')),default=0)
+            s.cursor+=page_rows+32 if page_rows else 0
+            start=parallel_start if group else s.cursor+64;end=start
             weight_ranges={}
             for kind,v,pre,post in operations:
                 # This linked image owns its final SRAM addresses and embeds
@@ -688,24 +918,26 @@ class ResidentLinker:
                 # Mapped names are already global; the replacement does not
                 # recursively apply to the replacement itself.
                 s.lines.append(line)
-            s.cursor=end+96
+            if group:
+                parallel_end=max(parallel_end,end)
+                parallel_outputs.append((ni,native_outputs))
+                s.cursor=parallel_end+96
+            else:s.cursor=end+96
             # ScheduleToCommand derives the page's complete consumption
             # interval from the tagged native MEM domains above.
             for key in list(self.live):
                 if self.last[key]==ni: self.live.pop(key)
-            for oi,(shape,dtype) in enumerate(node['outputs']):
-                key=(ni,oi)
-                if key not in self.last:continue
-                source=native_outputs[oi]
-                archive_hemi='east' if dtype=='f32' or node['name'].startswith('key_l2') else 'west'
-                dest=self.allocate(key,shape,dtype,archive_hemi,packed='scalar_broadcast' not in source['kind'])
-                self.move(source,dest,shape,shape,np.arange(np.prod(shape)),np.arange(np.prod(shape)))
+            if group:
+                if ni+1==len(self.graph.nodes) or self.graph.nodes[ni+1].get('parallel_group')!=group:
+                    for pi,outputs in parallel_outputs:self.archive_node_outputs(pi,outputs)
+                    parallel_start=None
+            else:self.archive_node_outputs(ni,native_outputs)
         for i,value in enumerate(self.finals):
             original=self.cache.get((value.node,value.output)) if value.owners is None else None
             if original and value.shape==original['_shape'] and np.array_equal(value.indices,np.arange(value.size)):
                 p=original
             else:
-                p=self.allocate(('final',i),value.shape,value.dtype)
+                p=self.allocate(('final',i),value.shape,value.dtype,avoid_groups=self.value_copy_groups(value))
                 self.materialize(value,p)
             self.binding(f'output{i}',value.shape,value.dtype,p,'output',index=i)
         return s.module(self.bindings,self.arguments)

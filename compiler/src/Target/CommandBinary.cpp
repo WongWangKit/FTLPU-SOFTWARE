@@ -111,7 +111,8 @@ bool can_encode_packet_wait(const Raw3DPacketSequence& packet,
         return false;
     // FU 3-D and VXM/SXM RUN_2D use bits 8..31 of word zero for the
     // queue-local wait_cycle. WRITE_READ_2D has a separate packet layout.
-    return ((packet.physical_words.front().words[2] >> 24) & 0xfU) == 2U;
+    const auto subtype = (packet.physical_words.front().words[2] >> 24) & 0xfU;
+    return subtype == 2U || (subtype >= 8U && subtype <= 10U);
 }
 
 void set_packet_wait(Raw3DPacketSequence& packet, std::size_t wait)
@@ -287,9 +288,9 @@ int64_t raw_loop_absolute_final_cycle(mlir::Operation* operation,
 template <typename Packet>
 Packet raw_3d_packet(mlir::Operation* operation, mlir::ArrayAttr words)
 {
-    constexpr std::size_t expected =
-        Packet::kWordCount * Packet::kLanesPerWord;
-    if (words.size() != expected)
+    const std::size_t expected = words.size();
+    if (expected < Packet::kLanesPerWord || expected > Packet::kWordCount * Packet::kLanesPerWord
+        || expected % Packet::kLanesPerWord != 0)
         throw std::runtime_error(
             "FU 3-D Command op has an invalid physical packet width");
     Packet packet {};
@@ -303,6 +304,8 @@ Packet raw_3d_packet(mlir::Operation* operation, mlir::ArrayAttr words)
             .lanes[index % Packet::kLanesPerWord] =
             static_cast<std::uint32_t>(word.getValue().getZExtValue());
     }
+    if (expected != isa::fu_loop_packet_word_count(packet) * Packet::kLanesPerWord)
+        throw std::runtime_error("FU packet length disagrees with subtype");
     (void)operation;
     return packet;
 }
@@ -313,7 +316,8 @@ std::vector<QueueCommand> raw_3d_queue_words(
 {
     std::vector<QueueCommand> result;
     result.reserve(Packet::kWordCount);
-    for (const auto& physicalWord : packet.words) {
+    for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(packet); ++w) {
+        const auto& physicalWord = packet.words[w];
         QueueCommand command;
         command.command = physicalWord.lanes[0];
         command.instruction_kind = instructionKind;
@@ -598,7 +602,8 @@ struct StreamReleaseSummary {
 };
 
 StreamReleaseSummary stream_release_cycles(
-    mlir::ModuleOp module, const LPUTargetModel& target)
+    mlir::ModuleOp module, const LPUTargetModel& target,
+    std::optional<std::uint64_t> lastPagedConsumer)
 {
     const int64_t streamCount = target.streams().streams_per_direction;
     const int64_t encodedStreamCount = target.streams().encoded_streams;
@@ -609,6 +614,18 @@ StreamReleaseSummary stream_release_cycles(
         static_cast<std::size_t>(encodedStreamCount), 0);
     const int64_t fabricDrain = std::max<int64_t>(
         1, target.streams().system_register_columns);
+
+    // Every dynamic page is complete at its compiler-authored consumer
+    // rendezvous. Operations starting after the last such rendezvous cannot
+    // overlap weight ingress: a late physical transfer stalls those queues
+    // at the rendezvous too. Do not turn their future SR use into a launch
+    // floor for earlier pages. Domains starting before it retain their full
+    // release time, including the SR drain.
+    const auto afterWeightIngress = [&](mlir::Operation* operation) {
+        return lastPagedConsumer
+            && static_cast<std::uint64_t>(command_cycle(operation))
+                >= *lastPagedConsumer;
+    };
 
     const auto sequenceEnd = [](mlir::Operation* operation,
                                  int64_t firstCycle) {
@@ -652,6 +669,7 @@ StreamReleaseSummary stream_release_cycles(
     };
 
     module.walk([&](command::MemOp op) {
+        if (afterWeightIngress(op)) return;
         markPacked(op.getPackedStream(),
             sequenceEnd(op, command_cycle(op)));
     });
@@ -659,12 +677,15 @@ StreamReleaseSummary stream_release_cycles(
         for (std::size_t index = 0; index < op.getCycles().size(); ++index) {
             const int64_t cycle = llvm::cast<mlir::IntegerAttr>(
                 op.getCycles()[index]).getInt();
+            if (lastPagedConsumer && static_cast<std::uint64_t>(cycle)
+                    >= *lastPagedConsumer) continue;
             const int64_t packed = llvm::cast<mlir::IntegerAttr>(
                 op.getPackedStreams()[index]).getInt();
             markPacked(packed, sequenceEnd(op, cycle));
         }
     });
     module.walk([&](command::MxmOp op) {
+        if (afterWeightIngress(op)) return;
         const int64_t end = sequenceEnd(op, command_cycle(op));
         if (op.getOpcode() == "iw") {
             const bool int8 = op.getWeightInputMode().value_or("direct16")
@@ -692,6 +713,7 @@ StreamReleaseSummary stream_release_cycles(
                 target.throughput().mxm_result_streams, end);
     });
     module.walk([&](command::VxmOp op) {
+        if (afterWeightIngress(op)) return;
         const int64_t end = sequenceEnd(op, command_cycle(op));
         const auto markOperand = [&](llvm::StringRef kind, int64_t index) {
             if (!kind.starts_with("stream_")) return;
@@ -710,6 +732,7 @@ StreamReleaseSummary stream_release_cycles(
         markRange(output % streamCount, width, end);
     });
     module.walk([&](command::SxmOp op) {
+        if (afterWeightIngress(op)) return;
         const int64_t end = sequenceEnd(op, command_cycle(op));
         for (mlir::Attribute stream : op.getSourceStreams())
             markPacked(llvm::cast<mlir::IntegerAttr>(stream).getInt(), end);
@@ -717,6 +740,7 @@ StreamReleaseSummary stream_release_cycles(
             markPacked(llvm::cast<mlir::IntegerAttr>(stream).getInt(), end);
     });
     module.walk([&](command::Mem3DOp op) {
+        if (afterWeightIngress(op)) return;
         const auto packet = raw_3d_packet<isa::EncodedMemIcu3DPacket>(
             op.getOperation(), op.getWords());
         const auto instruction =
@@ -726,6 +750,7 @@ StreamReleaseSummary stream_release_cycles(
                 op.getOperation(), instruction.loop));
     });
     module.walk([&](command::MemWriteRead2DOp op) {
+        if (afterWeightIngress(op)) return;
         const auto packet = raw_3d_packet<
             isa::EncodedMemIcuWriteRead2DPacket>(
             op.getOperation(), op.getWords());
@@ -741,6 +766,7 @@ StreamReleaseSummary stream_release_cycles(
                     * instruction.read_stream_outer_stride, end);
     });
     module.walk([&](command::MxmLoad3DOp op) {
+        if (afterWeightIngress(op)) return;
         const auto packet = raw_3d_packet<
             isa::EncodedMxmLoadIcu3DPacket>(
             op.getOperation(), op.getWords());
@@ -756,6 +782,7 @@ StreamReleaseSummary stream_release_cycles(
                 op.getOperation(), instruction.loop));
     });
     module.walk([&](command::MxmCompute3DOp op) {
+        if (afterWeightIngress(op)) return;
         const auto packet = raw_3d_packet<
             isa::EncodedMxmComputeIcu3DPacket>(
             op.getOperation(), op.getWords());
@@ -784,6 +811,7 @@ StreamReleaseSummary stream_release_cycles(
                 target.throughput().mxm_result_streams, end);
     });
     module.walk([&](command::VxmRun2DOp op) {
+        if (afterWeightIngress(op)) return;
         const auto packet = raw_3d_packet<
             isa::EncodedVxmIcuRun2DPacket>(
             op.getOperation(), op.getWords());
@@ -814,6 +842,7 @@ StreamReleaseSummary stream_release_cycles(
         markRange(static_cast<int64_t>(instruction.result_sr), width, end);
     });
     module.walk([&](command::SxmRun2DOp op) {
+        if (afterWeightIngress(op)) return;
         const auto run = op.getKind() == "transpose"
             ? isa::decode_sxm_transpose_icu_run_2d_instruction(
                 raw_3d_packet<isa::EncodedSxmTransposeIcuRun2DPacket>(
@@ -2831,7 +2860,6 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     if (const auto attr = module->getAttrOfType<mlir::BoolAttr>(
             "ftlpu.mem_slice_program"))
         memSliceProgramEnabled = attr.getValue();
-    auto streamReleaseSummary = stream_release_cycles(module, *target);
     QueueMap queues;
     Raw3DQueueMap raw3DQueues;
     std::vector<BinaryBinding> bindings;
@@ -2857,6 +2885,13 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             runtimePrefetch && runtimePrefetch.getValue(),
         });
     });
+    std::optional<std::uint64_t> lastPagedConsumer;
+    if (requiresDirectLowering)
+        for (const auto& use : weightPageUses)
+            lastPagedConsumer = std::max(
+                lastPagedConsumer.value_or(0), use.ready_cycle);
+    auto streamReleaseSummary = stream_release_cycles(
+        module, *target, lastPagedConsumer);
     module.walk([&](command::MemOp op) { collect_mem(op, queues); });
     module.walk([&](command::MemBundleOp op) {
         collect_mem_bundle(op, queues);

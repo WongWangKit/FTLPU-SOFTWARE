@@ -134,8 +134,8 @@ BinaryProgram parameterize_program(const ModelPackage &package,
     QueueCommand &command = queue->commands[relocation.command_index];
     if (is_fu_3d_raw_packet_header(command) &&
         relocation.queue_kind == QueueKind::MxmDequant) {
-      constexpr std::size_t packetWords =
-          isa::EncodedMxmDequantIcu3DPacket::kWordCount;
+      const std::size_t packetWords =
+          fu_3d_raw_packet_word_count(queue->kind, command);
       if (relocation.command_index + packetWords > queue->commands.size())
         throw std::logic_error(
             "raw MXM DEQUANT_3D scale relocation references a truncated packet");
@@ -155,7 +155,7 @@ BinaryProgram parameterize_program(const ModelPackage &package,
       auto instruction = isa::decode_mxm_dequant_icu_3d_instruction(packet);
       instruction.instruction =
           MxmDequantInstruction::Scale(tensor.scales[relocation.scale_index]);
-      packet = isa::encode_mxm_dequant_icu_3d_instruction(instruction);
+      packet = isa::patch_mxm_dequant_icu_scale(packet, instruction.instruction);
       for (std::size_t word = 0; word < packetWords; ++word) {
         QueueCommand &target =
             queue->commands[relocation.command_index + word];
@@ -372,8 +372,8 @@ BinaryProgram parameterize_program(const ModelPackage &package,
     }
     if (relocation.queue_kind == QueueKind::Mem &&
         is_fu_3d_raw_packet_header(command)) {
-      constexpr std::size_t packetWords =
-          isa::EncodedMemIcu3DPacket::kWordCount;
+      const std::size_t packetWords =
+          fu_3d_raw_packet_word_count(queue->kind, command);
       if (relocation.command_index + packetWords > queue->commands.size())
         throw std::logic_error(
             "raw MEM 3-D relocation references a truncated packet");
@@ -392,7 +392,7 @@ BinaryProgram parameterize_program(const ModelPackage &package,
       auto instruction = isa::decode_mem_icu_3d_instruction(packet);
       instruction.address.base_address =
           relocate_address(instruction.address.base_address);
-      packet = isa::encode_mem_icu_3d_instruction(instruction);
+      packet = isa::patch_mem_icu_base_address(packet, instruction.address.base_address);
       for (std::size_t word = 0; word < packetWords; ++word) {
         QueueCommand &target =
             queue->commands[relocation.command_index + word];
@@ -1185,15 +1185,18 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
                 C2cMemNotifyRoute::Mem(
                     hemisphere, segment.slice, binding.bank))));
       } else {
-        c2c_system_->chip().icu().enqueue_mem_nop(queue, laneCount);
-        c2c_system_->chip().icu().enqueue_mem(
-            queue, MemInstruction::Read(segment.base_row,
-                       StreamId::East(fabricStream)));
-        if (segment.vector_count > 1)
-          c2c_system_->chip().icu().enqueue_mem_repeat(
-              queue, segment.vector_count - 1, memReadInterval, 1);
-        c2c_system_->chip().icu().enqueue_c2c_send(
-            hemisphere, copy.lane, segment.vector_count, fabricStream);
+        // The DDR writer may serialize lanes even when aggregate bandwidth
+        // exceeds MEM demand. Unconditional reads can therefore outrun a TX
+        // lane and lose SR vectors. Use the native per-vector TX request, as
+        // compiler-authored cache page-out does, for generic external I/O too.
+        const auto tag = static_cast<std::uint32_t>(0x8000u + copy.lane);
+        c2c_system_->chip().icu().enqueue_mem_synchronized_read(queue,
+            MemInstruction::Read(segment.base_row, StreamId::East(fabricStream)),
+            segment.vector_count, tag, 0, 1, segment.vector_count);
+        c2c_system_->chip().icu().enqueue_c2c_tx_raw(hemisphere,
+            C2cIcuPacketCodec::encode(C2cTxIcuInstruction::Send(
+                hemisphere, copy.lane, fabricStream, segment.vector_count, tag,
+                C2cMemNotifyRoute::Mem(hemisphere, segment.slice, binding.bank))));
       }
       c2c_system_->chip().icu().enqueue_c2c_dma(
           hemisphere,
@@ -2541,8 +2544,17 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   // its loop, which a physical ICU cannot do.
   if (weight_pager_ && !executable_weight_transfers_.empty())
     runtimeProgram.weight_page_uses.clear();
+  if (const char *diagnosticPath =
+          std::getenv("FTLPU_SESSION_DIAGNOSTIC_PROGRAM"))
+    write_binary_program(runtimeProgram, std::string(diagnosticPath) + ".loaded.ftlpu");
   runtime_.load(runtimeProgram, weight_pager_ == nullptr);
   report("runtime program loaded");
+  // Diagnostic link check: materialize the complete hardware image without
+  // executing arithmetic or pretending that output values were produced.
+  if (std::getenv("FTLPU_SESSION_LINK_ONLY") != nullptr) {
+    report("linked only; computation was not executed");
+    return;
+  }
   std::size_t executionCycles = program.max_cycle + drain_cycles;
   if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
     executionCycles =

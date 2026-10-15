@@ -150,6 +150,14 @@ def ProjectionTaskOp : FTLPU_Tensor_Op<"projection_task", [Pure]> {
   let hasVerifier = 1;
 }
 
+def SigmoidMultiplyTaskOp : FTLPU_Tensor_Op<"sigmoid_multiply_task", [Pure]> {
+  let summary = "Sigmoid output gate with a physical buffer sub-plan";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$gate,
+      DictionaryAttr:$config, DictionaryAttr:$memory_plan);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $gate attr-dict `:` functional-type(operands, results)";
+}
+
 def RopeTaskOp : FTLPU_Tensor_Op<"rope_task", [Pure]> {
   let summary = "Optional head RMS normalization followed by rotary-position embedding";
   let arguments = (ins AnyRankedTensor:$input,

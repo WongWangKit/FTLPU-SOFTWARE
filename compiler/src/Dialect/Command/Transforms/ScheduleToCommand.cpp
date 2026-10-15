@@ -939,7 +939,9 @@ public:
                     * transfer.getRepeatInterval()
                 + 1;
             interval.ready = std::min<int64_t>(
-                interval.ready, transfer.getCycle());
+                interval.ready, transfer->getAttrOfType<mlir::IntegerAttr>("weight_ready_cycle")
+                    ? transfer->getAttrOfType<mlir::IntegerAttr>("weight_ready_cycle").getInt()
+                    : transfer.getCycle());
             interval.release = std::max<int64_t>(
                 interval.release, endCycle);
         }

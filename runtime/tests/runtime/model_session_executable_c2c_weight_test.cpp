@@ -111,10 +111,11 @@ try {
         InstructionControlUnit::mem_queue(Hemisphere::East, 28, 0), {}};
     scratchQueue.commands.push_back(encode_icu_control_raw_word(
         IcuControlInstruction::Nop(80)));
-    const auto scratchPacket = isa::encode_mem_icu_3d_instruction(
+    const auto scratchPacket = isa::encode_mem_icu_shortest_instruction(
         MemIcuInstruction::Write3D(IcuLoop3D{0, {4,1,1}, {5,1,1}},
             MemIcuAddress3D::Affine(0, {1,0,0}), StreamId::East(0)));
-    for (const auto& word : scratchPacket.words) {
+    for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(scratchPacket); ++w) {
+        const auto& word = scratchPacket.words[w];
         QueueCommand command;
         command.command = word.lanes[0];
         command.instruction_kind = InstructionKind::Mem;
@@ -438,10 +439,11 @@ try {
         InstructionControlUnit::mem_queue(Hemisphere::East, 20, 0), {}};
     nativeMem.commands.push_back(encode_icu_control_raw_word(
         IcuControlInstruction::Nop(40)));
-    const auto nativePacket = isa::encode_mem_icu_3d_instruction(
+    const auto nativePacket = isa::encode_mem_icu_shortest_instruction(
         MemIcuInstruction::Read3D(IcuLoop3D {0, {16, 1, 1}, {1, 1, 1}},
             MemIcuAddress3D::Affine(100, {1, 0, 0}), StreamId::East(0)));
-    for (const auto& word : nativePacket.words) {
+    for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(nativePacket); ++w) {
+        const auto& word = nativePacket.words[w];
         QueueCommand command;
         command.command = word.lanes[0];
         command.instruction_kind = InstructionKind::Mem;
@@ -474,11 +476,12 @@ try {
     // extra issue slot at a zero-wait boundary in another. Rebinding must
     // recover both original phases, rather than turn every old SYNC into NOP.
     auto beforeSync = nativeWeightProgram;
-    const auto secondPacket = isa::encode_mem_icu_3d_instruction(
+    const auto secondPacket = isa::encode_mem_icu_shortest_instruction(
         MemIcuInstruction::Read3D(IcuLoop3D{0, {4, 1, 1}, {1, 1, 1}},
             MemIcuAddress3D::Affine(200, {1, 0, 0}), StreamId::East(0)));
     const auto appendPacket = [](auto& commands, const auto& packet) {
-        for (const auto& word : packet.words) {
+        for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(packet); ++w) {
+        const auto& word = packet.words[w];
             QueueCommand command;
             command.command = word.lanes[0];
             command.instruction_kind = InstructionKind::Mem;
@@ -514,11 +517,32 @@ try {
     const auto& restoredQueue = restoredPhases.queues[0];
     if (decode_fu_3d_raw_packet_loop(restoredQueue, 0).wait_cycle != 40
         || decode_fu_3d_raw_packet_loop(restoredQueue,
-            fu_3d_raw_packet_word_count(QueueKind::Mem)).wait_cycle != 0
+            fu_3d_raw_packet_word_count(QueueKind::Mem, restoredQueue.commands[0])).wait_cycle != 0
         || !is_mem_synchronized_raw_packet_header(restoredQueue.commands[
-            2 * fu_3d_raw_packet_word_count(QueueKind::Mem)])
+            2 * fu_3d_raw_packet_word_count(QueueKind::Mem, restoredQueue.commands[0])])
         || restoredPhases.address_relocations[0].command_index != 0)
         throw std::runtime_error("compiler SYNC rebind changed domain timing or relocation");
+
+    // A long recurrent phase can leave an unrelated queue idle beyond the
+    // 24-bit domain wait field. Restoring compiler timing must preserve the
+    // complete gap and relocate the packet past the required leading NOP.
+    auto longSync = withSync;
+    constexpr std::uint64_t longGap = std::uint64_t{1} << 24;
+    std::erase_if(longSync.timelines, [](const auto& timeline) {
+        return timeline.name.starts_with("icu.sync_origin.");
+    });
+    const auto longOriginPrefix = "icu.sync_origin."
+        + std::to_string(static_cast<unsigned>(longSync.queues[0].kind)) + "."
+        + std::to_string(longSync.queues[0].index) + ".";
+    longSync.timelines.push_back({longOriginPrefix + "0", longGap + 40, longGap + 56});
+    longSync.timelines.push_back({longOriginPrefix + "1", longGap + 56, longGap + 60});
+    longSync.timelines.push_back({longOriginPrefix + "end", longGap + 60, longGap + 61});
+    const auto restoredLong = without_compiled_mem_write_sync(longSync);
+    const auto& longQueue = restoredLong.queues[0];
+    if (decode_icu_control_raw_word(longQueue.commands[0]).count != 41
+        || decode_fu_3d_raw_packet_loop(longQueue, 1).wait_cycle != longGap - 1
+        || restoredLong.address_relocations[0].command_index != 1)
+        throw std::runtime_error("long compiler SYNC wait lost timing or relocation");
 
     BinaryProgram wideningStreamProgram = overlappingProgram;
     wideningStreamProgram.stream_release_cycles.assign(
@@ -543,6 +567,27 @@ try {
                 {31, 30, 29, 28, 27, 26, 25, 24}))
         throw std::runtime_error(
             "C2C planner did not wait briefly for the faster wide stream set");
+
+    // Future SR use cannot delay a page past its consumer when the compiler
+    // explicitly reserved an exclusive ingress window before that consumer.
+    BinaryProgram windowProgram;
+    windowProgram.stream_release_cycles.assign(
+        windowProgram.hardware.encoded_streams, 1000000);
+    windowProgram.weight_page_uses.push_back({0, 0, 0, 1000, 1100, true});
+    windowProgram.timelines.push_back({"c2c.window.binding:0.page:0", 100, 900});
+    std::vector<WeightPrefetchPlan> windowPlans(1);
+    windowPlans[0].use_indices = {0};
+    windowPlans[0].runtime_prefetch = true;
+    windowPlans[0].ready_cycle = 1000;
+    windowPlans[0].release_cycle = 1100;
+    windowPlans[0].bytes[0] = 128;
+    windowPlans[0].regions = {{0, 1, 20, 0, 8, false}};
+    schedule_weight_prefetches(windowProgram, windowPlans);
+    if (windowPlans[0].start_cycle != 100
+        || windowPlans[0].earliest_mem_cycle != 100
+        || windowPlans[0].fabric_streams.size()
+            != windowProgram.hardware.c2c_streams_per_direction)
+        throw std::runtime_error("compiler C2C ingress reservation was ignored");
 
     BinaryProgram program;
     program.bindings.push_back(make_weight_binding());

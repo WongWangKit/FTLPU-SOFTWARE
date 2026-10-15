@@ -499,3 +499,6 @@ target_link_libraries(hf_decoder_stack_checkpoint_test
 
 add_executable(compiled_stage_file_runner tests/runtime/compiled_stage_file_runner.cpp)
 target_link_libraries(compiled_stage_file_runner PRIVATE ftlpu_software)
+add_executable(compiled_program_link_check tests/runtime/compiled_stage_file_runner.cpp)
+target_link_libraries(compiled_program_link_check PRIVATE ftlpu_software)
+target_compile_definitions(compiled_program_link_check PRIVATE FTLPU_FILE_RUNNER_LINK_CHECK=1)

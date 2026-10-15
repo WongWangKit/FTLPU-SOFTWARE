@@ -35,6 +35,7 @@ struct AttentionGraph {
     BatchMatmulOp qk;
     SoftmaxOp softmax;
     BatchMatmulOp pv;
+    SigmoidMultiplyOp output_gate;
     llvm::SmallVector<mlir::Operation*, 32> operations;
 };
 

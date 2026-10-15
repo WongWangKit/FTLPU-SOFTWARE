@@ -198,7 +198,8 @@ def commands(a, model, out, work):
         else:
             phases.append(('compile', [compiler, '--input',str(source),
                 '--output',str(out/'decoder_layer.ftlpu'),'--target-config',str(a.target_config),
-                '--weight-bank','1','--mxm-execution','vector','--ffn-schedule','fused','--attention-schedule','tail',
+                '--weight-bank','1','--kv-cache-capacity','256',
+                '--mxm-execution','vector','--ffn-schedule','fused','--attention-schedule','tail',
                 '--projection-rope-overlap','on']))
             if a.suite != 'compile':
                 phases.append(('cmodel', [str(executable(a.build_dir,a.config,'qwen2' if model.startswith('qwen2') else 'qwen3')),

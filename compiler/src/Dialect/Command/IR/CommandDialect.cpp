@@ -30,9 +30,9 @@ template <typename Packet, typename Decode>
 LogicalResult verifyFu3DPacket(Operation* operation, ArrayAttr attributes,
     Decode&& decode)
 {
-    constexpr std::size_t expected =
-        Packet::kWordCount * Packet::kLanesPerWord;
-    if (attributes.size() != expected)
+    const std::size_t expected = attributes.size();
+    if (expected < Packet::kLanesPerWord || expected > Packet::kWordCount * Packet::kLanesPerWord
+        || expected % Packet::kLanesPerWord != 0)
         return operation->emitOpError()
             << "requires exactly " << expected
             << " flattened 32-bit packet words";
@@ -50,6 +50,8 @@ LogicalResult verifyFu3DPacket(Operation* operation, ArrayAttr attributes,
             static_cast<std::uint32_t>(attribute.getValue().getZExtValue());
     }
     try {
+        if (expected != isa::fu_loop_packet_word_count(packet) * Packet::kLanesPerWord)
+            throw std::logic_error("FU packet length disagrees with subtype");
         static_cast<void>(decode(packet));
     } catch (const std::exception& error) {
         return operation->emitOpError()

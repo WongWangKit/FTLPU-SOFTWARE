@@ -158,13 +158,17 @@ std::vector<std::uint8_t> pack_rope_projection_data(
 {
     const std::size_t head = binding.rope_head_dim;
     const std::size_t rotary = binding.rope_rotary_dim;
+    const bool vector = binding.shape.size() == 1;
+    const std::size_t bytes = binding.element_type == BindingElementType::I8 ? 1 :
+        binding.element_type == BindingElementType::BF16 ? 2 : 0;
     if (head == 0 || head % 2 || rotary == 0 || rotary > head || rotary % 2
-        || binding.shape.size() != 2 || binding.element_type != BindingElementType::I8
-        || binding.shape[1] % head || data.size() != binding.byte_size)
-        throw std::invalid_argument("invalid partial RoPE projection packing");
-    const std::size_t columns = binding.shape[1];
+        || (!vector && binding.shape.size() != 2) || !bytes
+        || binding.shape.back() % head || data.size() != binding.byte_size)
+        throw std::invalid_argument("invalid partial RoPE projection/norm packing");
+    const std::size_t columns = binding.shape.back();
+    const std::size_t rows = vector ? 1 : binding.shape[0];
     std::vector<std::uint8_t> packed(data.size());
-    for (std::size_t row = 0; row < binding.shape[0]; ++row)
+    for (std::size_t row = 0; row < rows; ++row)
         for (std::size_t column = 0; column < columns; ++column) {
             const auto lane = column % head;
             const auto half = head / 2;
@@ -173,7 +177,8 @@ std::vector<std::uint8_t> pack_rope_projection_data(
             const auto source = part < rotatedHalf
                 ? (lane < half ? part : rotatedHalf + part)
                 : (lane < half ? rotary + part - rotatedHalf : lane);
-            packed[row * columns + column] = data[row * columns + column - lane + source];
+            std::copy_n(data.begin()+(row*columns+column-lane+source)*bytes, bytes,
+                packed.begin()+(row*columns+column)*bytes);
         }
     return packed;
 }

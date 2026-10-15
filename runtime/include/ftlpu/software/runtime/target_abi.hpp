@@ -25,7 +25,7 @@ struct ExecutableHardwareConfig {
     std::uint32_t streams_per_direction{hw::kStreamsPerDirection};
     std::uint32_t encoded_streams{hw::kStreams};
     std::uint32_t c2c_streams_per_direction{hw::kC2cStreamsPerDirection};
-    std::uint32_t c2c_bytes_per_stream_per_cycle{hw::kPhysicalVectorBytes};
+    std::uint32_t c2c_bytes_per_stream_per_cycle{hw::kC2cBytesPerStreamPerCycle};
     std::uint32_t mem_boundary_register_columns{hw::kMemBoundaryStreamRegisterColumns};
     std::uint32_t system_register_columns{hw::kSystemStreamRegisterColumns};
     std::uint32_t mem_slices_per_register_group{hw::kMemSlicesPerGroup};
@@ -40,7 +40,7 @@ struct ExecutableHardwareConfig {
     std::uint32_t mxm_load_bytes_per_cycle{hw::kMxmLoadBytesPerCycle};
     std::uint32_t mxm_activation_streams{4};
     std::uint32_t mxm_result_streams{4};
-    std::uint32_t mxm_pipeline_rows{4};
+    std::uint32_t mxm_pipeline_rows{hw::kTileRows};
     std::uint32_t mxm_block_rows{8};
     std::uint32_t mxm_local_dequant_enabled{1};
     std::uint32_t mxm_block_compute_enabled{0};
@@ -85,7 +85,7 @@ struct ExecutableHardwareConfig {
     std::uint32_t icu_vxm_imem_depth{hw::kIcuVxmImemDepth};
     std::uint32_t icu_sxm_instruction_bits{hw::kIcuSxmInstructionBits};
     std::uint32_t icu_sxm_imem_depth{hw::kIcuSxmImemDepth};
-    std::uint32_t icu_macro_encoding_version{1};
+    std::uint32_t icu_macro_encoding_version{hw::kIcuIsaLayoutVersion};
     std::uint32_t icu_mem_macro_contexts{hw::kIcuMemMacroContextDepth};
     std::uint32_t icu_mxm_macro_contexts{hw::kIcuMxmMacroContextDepth};
     std::uint32_t icu_mem_macro_context_bits{hw::kIcuMemMacroContextBits};

@@ -32,6 +32,7 @@ private:
         bool fusedSoftmax);
     int64_t emitProbabilityTranspose(int64_t packEnd);
     int64_t emitPv(int64_t transposeEnd);
+    int64_t emitOutputGate(int64_t start);
     int64_t emitOutputProjection(int64_t pvEnd);
 
     mlir::IRRewriter& rewriter_;

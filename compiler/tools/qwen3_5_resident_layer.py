@@ -5,6 +5,7 @@ import subprocess
 import numpy as np
 from qwen3_5_compiled_layer import VectorGraph, CompiledStages, bf16
 from resident_schedule import Value
+from common_kernel_graph import rms_norm_source
 
 
 class ResidentGraph:
@@ -15,7 +16,7 @@ class ResidentGraph:
         self.directory.mkdir(parents=True,exist_ok=True)
         self.nodes=[]
 
-    def run(self,name,source,inputs,outputs):
+    def run(self,name,source,inputs,outputs,parallel_group=None):
         node=len(self.nodes)
         if ('ftlpu.kernel.vector_alu' in source or 'ftlpu.kernel.gated_delta_rule' in source) and node%2:
             source=re.sub(r'(@stage\([^{}]+?\)\s*->\s*(?:\([^{}]+\)|tensor<[^>]+>))\s*\{',
@@ -33,7 +34,7 @@ class ResidentGraph:
             result=subprocess.run(command,capture_output=True,text=True)
             if result.returncode: raise RuntimeError(f'{name}: {result.stderr}')
             config_stamp.write_text(config_identity,encoding='utf-8')
-        self.nodes.append(dict(name=name,inputs=inputs,outputs=outputs,schedule=schedule))
+        self.nodes.append(dict(name=name,inputs=inputs,outputs=outputs,schedule=schedule,parallel_group=parallel_group))
         return [Value(node,i,shape,dtype,np.arange(np.prod(shape),dtype=np.int64)) for i,(shape,dtype) in enumerate(outputs)]
 
     def project(self,name,value,weight,scale):
@@ -55,6 +56,11 @@ class ResidentGraph:
         return self.run(name,source,[(value,'bf16'),(packed,'i8')],[((m,padded),'bf16')])[0][:,:n]
 
     def norm(self,name,x,gamma,epsilon,mean=True,scale=1):
+        if mean and scale == 1:
+            gamma=bf16(np.asarray(gamma).reshape(-1))
+            return self.run(name,rms_norm_source(x.shape,epsilon),
+                [(x,'bf16'),(gamma,'bf16')],[(x.shape,'bf16')])[0]
+        # L2 normalization has different reduction semantics from RMSNorm.
         if x.size > 4096:
             rows = max(1,4096 // x.shape[1])
             return Value.concatenate([self.norm(name+f'_tile{start}',x[start:start+rows],
@@ -68,22 +74,25 @@ class ResidentGraph:
             schedule=None,layout_join=True,hemisphere=hemisphere))
         return Value(node,0,value.shape,value.dtype,np.arange(value.size))
 
-    def conv(self,qkv,weight):
+    def conv(self,qkv,weight,mirror=False,parallel_group=None):
         if qkv.shape[1] > 1024:
             groups=[]
             for start in range(0,qkv.shape[1],2048):
-                parts=[self.conv(qkv[:,offset:offset+1024],weight[offset:offset+1024])
-                    for offset in range(start,min(start+2048,qkv.shape[1]),1024)]
+                group=f'conv_pair{len(self.nodes)}'
+                parts=[self.conv(qkv[:,offset:offset+1024],weight[offset:offset+1024],
+                    mirror=slot==1,parallel_group=group)
+                    for slot,offset in enumerate(range(start,min(start+2048,qkv.shape[1]),1024))]
                 groups.append(self.join(f'conv_layout_group{start}',Value.concatenate(parts,axis=1),
                     'east' if start==2048 else 'west'))
             return Value.concatenate(groups,axis=1)
         a,w=self.type(qkv.shape,'bf16'),self.type(weight.shape,'bf16')
-        source=f'''module {{ func.func @stage(%a: {a}, %w: {w}) -> {a} {{
+        policy=' attributes {ftlpu.depthwise_conv_mirror = true}' if mirror else ''
+        source=f'''module {{ func.func @stage(%a: {a}, %w: {w}) -> {a}{policy} {{
           %o = ftlpu.kernel.depthwise_conv1d %a, %w {{kernel_size = 4 : i64,
           causal = true, activation = "silu"}} : ({a}, {w}) -> {a}
           return %o : {a}
         }} }}'''
-        return self.run('conv1d_silu',source,[(qkv,'bf16'),(weight,'bf16')],[(qkv.shape,'bf16')])[0]
+        return self.run('conv1d_silu',source,[(qkv,'bf16'),(weight,'bf16')],[(qkv.shape,'bf16')],parallel_group=parallel_group)[0]
 
     def vector_tiles(self,name,inputs,build):
         shape=inputs[0][0].shape;rows=max(1,4096//shape[1])

@@ -85,7 +85,7 @@ std::size_t issued_commands(const QueueProgram& queue)
             for (const auto count : loop.counts) points *= count;
             issued += points;
             ++prior_instructions;
-            commandIndex += fu_3d_raw_packet_word_count(queue.kind) - 1;
+            commandIndex += fu_3d_raw_packet_word_count(queue.kind, command) - 1;
             continue;
         }
         if (is_fu_3d_raw_word_command(command))

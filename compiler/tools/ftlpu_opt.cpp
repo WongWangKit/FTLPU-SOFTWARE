@@ -304,6 +304,10 @@ try {
         && args.pipeline != "ftlpu-compress-schedule")
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stablehlo_to_kernel_pass());
+    if (args.pipeline == "ftlpu-stablehlo-to-schedule"
+        || args.pipeline == "ftlpu-stablehlo-to-commands")
+        pass_manager.addNestedPass<mlir::func::FuncOp>(
+            ftlpu::compiler::create_lower_connected_kernel_graph_pass());
     if (args.pipeline == "ftlpu-stablehlo-to-tensor" || args.pipeline == "ftlpu-stablehlo-to-stream"
         || args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stablehlo-to-commands")

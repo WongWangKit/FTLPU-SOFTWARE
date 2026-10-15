@@ -20,7 +20,8 @@ std::vector<QueueCommand> raw_mem_3d_commands(const Packet& packet)
 {
     std::vector<QueueCommand> commands;
     commands.reserve(packet.words.size());
-    for (const auto& word : packet.words) {
+    for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(packet); ++w) {
+        const auto& word = packet.words[w];
         QueueCommand command;
         command.command = word.lanes[0];
         command.instruction_kind = InstructionKind::Mem;
@@ -48,12 +49,12 @@ try {
             commands.begin(), commands.end());
     };
     append(raw_mem_3d_commands(
-        isa::encode_mem_icu_3d_instruction(
+        isa::encode_mem_icu_shortest_instruction(
             MemIcuInstruction::Read3D(onePoint,
                 MemIcuAddress3D::Affine(10, {0, 0, 0}),
                 StreamId::East(1)))));
     append(raw_mem_3d_commands(
-        isa::encode_mem_icu_3d_instruction(
+        isa::encode_mem_icu_shortest_instruction(
             MemIcuInstruction::Write3D(onePoint,
                 MemIcuAddress3D::Affine(20, {0, 0, 0}),
                 StreamId::East(2)))));
@@ -93,7 +94,7 @@ try {
     append(synchronizedReadCommands);
 
     const auto expectedWords =
-        2 * isa::EncodedMemIcu3DPacket::kWordCount + 1
+        2 + 1
         + 2 * InstructionControlUnit::MemIcu::
             synchronized_packet_word_count;
 

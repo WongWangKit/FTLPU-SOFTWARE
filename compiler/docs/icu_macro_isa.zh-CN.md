@@ -2,6 +2,9 @@
 
 ## 范围
 
+MEM/MXM 已增加单次、1D、2D 物理短格式，优先选择最短合法包；下文 3D
+位布局继续用于长格式。详见 [ICU 短格式](icu_short_formats.zh-CN.md)。
+
 本文区分当前硬件可见的 FU 专用循环指令，以及旧的 `Macro`、`STREAM_ND`
 序列化格式。projection 只是编译器意图，不是 ICU 指令，也不是硬件中的 program
 对象。每个物理 ICU 只接收其功能单元能够执行的指令。

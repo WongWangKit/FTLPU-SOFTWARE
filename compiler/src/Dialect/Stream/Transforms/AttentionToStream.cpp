@@ -227,10 +227,20 @@ mlir::LogicalResult lower_attention(
         matrixType(op.getSeqLen(),
             op.getQueryHeads() * op.getHeadDim()),
         routesForPhase("pv"));
-    auto output = createProjection(pv.getResult(),
+    mlir::Value gatedContext = pv.getResult();
+    if (op.output_gate) {
+        mlir::OperationState state(op.getLoc(), stream::SigmoidMultiplyTaskOp::getOperationName());
+        state.addOperands({gatedContext, op.getOutputGate()});
+        state.addTypes(gatedContext.getType());
+        state.addAttribute("config", config);
+        state.addAttribute("routes", rewriter.getArrayAttr({}));
+        gatedContext = rewriter.create(state)->getResult(0);
+    }
+    auto output = createProjection(gatedContext,
         op.getOutputWeight(), {}, "output", op.getResult().getType(),
         routesForPhase("o_proj"), true);
     rewriter.replaceOp(op.output, output.getResult());
+    if (op.output_gate) rewriter.eraseOp(op.output_gate);
     rewriter.eraseOp(op.pv);
     rewriter.eraseOp(op.value_transpose);
     rewriter.eraseOp(op.probability_transpose);

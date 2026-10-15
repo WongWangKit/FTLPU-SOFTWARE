@@ -197,6 +197,7 @@ public:
     void runOnOperation() final
     {
         mlir::func::FuncOp function = getOperation();
+        if (function->hasAttr("ftlpu.connected_graph_schedule")) return;
         if (!function.getBody().hasOneBlock()) {
             function.emitError("cycle scheduling currently requires a single-block function");
             signalPassFailure();

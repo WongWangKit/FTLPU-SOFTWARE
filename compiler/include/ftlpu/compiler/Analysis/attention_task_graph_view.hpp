@@ -8,18 +8,20 @@
 namespace ftlpu::compiler::analysis {
 
 template <typename ProjectionOp, typename RopeOp, typename BatchMatmulOp,
-    typename SoftmaxOp, typename TransposeOp>
+    typename SoftmaxOp, typename TransposeOp, typename GateOp>
 struct AttentionTaskGraphView {
     using ProjectionTask = ProjectionOp;
     using RopeTask = RopeOp;
     using BatchMatmulTask = BatchMatmulOp;
     using SoftmaxTask = SoftmaxOp;
     using TransposeTask = TransposeOp;
+    using GateTask = GateOp;
 
     ProjectionOp query;
     ProjectionOp key;
     ProjectionOp value;
     ProjectionOp output;
+    GateOp output_gate;
     RopeOp query_rope;
     RopeOp key_rope;
     BatchMatmulOp qk;
@@ -93,6 +95,11 @@ struct AttentionTaskGraphView {
         auto op = output;
         return op.getWeight();
     }
+    mlir::Value getOutputGate() const
+    {
+        auto op = output_gate;
+        return op ? op.getGate() : mlir::Value{};
+    }
     mlir::Value getQueryBias() const
     {
         auto op = query;
@@ -165,6 +172,7 @@ bool has_common_attention_config(const Graph& graph)
     auto probability_transpose = graph.probability_transpose;
     auto value_transpose = graph.value_transpose;
     auto pv = graph.pv;
+    auto output_gate = graph.output_gate;
     return query.getConfig() == config
         && key.getConfig() == config
         && value.getConfig() == config
@@ -174,7 +182,8 @@ bool has_common_attention_config(const Graph& graph)
         && softmax.getConfig() == config
         && probability_transpose.getConfig() == config
         && value_transpose.getConfig() == config
-        && pv.getConfig() == config;
+        && pv.getConfig() == config
+        && (!output_gate || output_gate.getConfig() == config);
 }
 
 template <typename Graph, typename Validator>
@@ -187,6 +196,7 @@ collect_attention_task_graphs(
     using BatchMatmulOp = typename Graph::BatchMatmulTask;
     using SoftmaxOp = typename Graph::SoftmaxTask;
     using TransposeOp = typename Graph::TransposeTask;
+    using GateOp = typename Graph::GateTask;
 
     llvm::SmallVector<Graph, 2> graphs;
     llvm::SmallVector<ProjectionOp> outputs;
@@ -197,8 +207,9 @@ collect_attention_task_graphs(
     for (ProjectionOp output : outputs) {
         Graph graph;
         graph.output = output;
+        graph.output_gate = output.getInput().template getDefiningOp<GateOp>();
         graph.pv = defining_attention_task<BatchMatmulOp>(
-            output.getInput(), "pv");
+            graph.output_gate ? graph.output_gate.getInput() : output.getInput(), "pv");
         if (graph.pv) {
             graph.probability_transpose =
                 defining_attention_task<TransposeOp>(

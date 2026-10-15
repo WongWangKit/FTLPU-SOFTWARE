@@ -314,6 +314,8 @@ try {
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stablehlo_to_kernel_pass());
         passes.addNestedPass<mlir::func::FuncOp>(
+            ftlpu::compiler::create_lower_connected_kernel_graph_pass());
+        passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_kernel_to_tensor_pass(
                 args.weight_bank));
         passes.addNestedPass<mlir::func::FuncOp>(

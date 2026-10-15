@@ -252,8 +252,9 @@ std::size_t raw_3d_packet_word_count(QueueKind kind)
     switch (kind) {
     case QueueKind::Mem:
         return isa::EncodedMemIcu3DPacket::kWordCount;
-    case QueueKind::MxmLoad:
     case QueueKind::MxmCompute:
+        return isa::EncodedMxmComputeIcu3DPacket::kWordCount;
+    case QueueKind::MxmLoad:
     case QueueKind::MxmDequant:
         return isa::EncodedMxmLoadIcu3DPacket::kWordCount;
     case QueueKind::Vxm:
@@ -325,7 +326,7 @@ template <typename Packet>
 Packet read_raw_3d_packet(const QueueProgram& queue,
     std::size_t commandIndex)
 {
-    constexpr auto physicalWordCount = Packet::kWordCount;
+    const auto physicalWordCount = fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(commandIndex));
     constexpr auto lanesPerWord = Packet::kLanesPerWord;
     if (commandIndex > queue.commands.size()
         || physicalWordCount > queue.commands.size() - commandIndex)
@@ -614,7 +615,7 @@ SyncOriginCommandTiming sync_origin_timing(
         auto end = first + 1;
         for (std::size_t axis = 0; axis < IcuLoop3D::kDimensions; ++axis)
             end += (loop.counts[axis] - 1) * loop.cycle_strides[axis];
-        return {first, end, fu_3d_raw_packet_word_count(queue.kind)};
+        return {first, end, fu_3d_raw_packet_word_count(queue.kind, command)};
     }
     if (is_mem_synchronized_raw_packet_header(command))
         return {cursor, cursor + (command.words[2] & 0xffffffU) + 1,
@@ -672,7 +673,7 @@ std::optional<BinaryProgram> restore_compiler_sync_origins(const BinaryProgram& 
                     continue;
                 }
             } else if (is_fu_3d_raw_packet_header(original[pc]))
-                words = fu_3d_raw_packet_word_count(queue.kind);
+                words = fu_3d_raw_packet_word_count(queue.kind, original[pc]);
             const auto found = origins.find({queue.kind, queue.index, ordinal++});
             const auto timing = sync_origin_timing(queue, pc, compiledCursor);
             if (found != origins.end())
@@ -685,16 +686,22 @@ std::optional<BinaryProgram> restore_compiler_sync_origins(const BinaryProgram& 
             const bool loop = is_fu_3d_raw_packet_header(original[pc]);
             if (!loop && wait != 0)
                 restored.push_back(encode_icu_control_raw_word(IcuControlInstruction::Nop(wait)));
+            // A queue can remain idle through a long recurrent-attention
+            // phase. Keep the representable tail in the following domain's
+            // wait field and encode the remaining delay as a hardware NOP.
+            constexpr auto maxDomainWait = (std::size_t{1} << 24) - 1;
+            const auto domainWait = std::min(wait, maxDomainWait);
+            if (loop && wait > domainWait)
+                restored.push_back(encode_icu_control_raw_word(
+                    IcuControlInstruction::Nop(wait - domainWait)));
             const auto header = restored.size();
             for (std::size_t word = 0; word < words; ++word) {
                 oldToNew[pc + word] = restored.size();
                 restored.push_back(original[pc + word]);
             }
             if (loop) {
-                if (wait >= (std::size_t{1} << 24))
-                    throw std::logic_error("compiler SYNC origin wait is not encodable");
                 restored[header].words[0] = (restored[header].words[0] & 0xffU)
-                    | (static_cast<std::uint32_t>(wait) << 8);
+                    | (static_cast<std::uint32_t>(domainWait) << 8);
                 restored[header].command = restored[header].words[0];
             }
             cursor = static_cast<std::size_t>(first) + timing.end - timing.first;
@@ -746,7 +753,7 @@ void record_compiler_sync_origins(BinaryProgram& compiled, const BinaryProgram& 
                 end = first + 1;
                 for (std::size_t axis = 0; axis < IcuLoop3D::kDimensions; ++axis)
                     end += (loop.counts[axis] - 1) * loop.cycle_strides[axis];
-                words = fu_3d_raw_packet_word_count(queue.kind);
+                words = fu_3d_raw_packet_word_count(queue.kind, command);
             } else if (is_mem_synchronized_raw_packet_header(command)) {
                 const auto packet = decode_mem_synchronized_icu_packet(queue, pc);
                 if (synchronized_mem_opcode(packet) == MemOpcode::Write) return;
@@ -849,6 +856,10 @@ bool is_fu_3d_raw_word_command(const QueueCommand& command) noexcept
     // Extended subtype lives at physical [91:88] of packet word zero.
     const auto subtype = (command.words[2] >> 24) & 0xfU;
     return wordIndex != 0 || subtype == 2
+        || ((command.instruction_kind == InstructionKind::Mem
+                || command.instruction_kind == InstructionKind::Mxm
+                || command.instruction_kind == InstructionKind::MxmDequant)
+            && subtype >= 8 && subtype <= 10)
         || (command.instruction_kind == InstructionKind::Mem
             && subtype == 7 && ((command.words[0] >> 4) & 0x3U) == 3);
 }
@@ -888,6 +899,37 @@ bool is_fu_3d_raw_packet_header(
 std::size_t fu_3d_raw_packet_word_count(QueueKind kind)
 {
     return raw_3d_packet_word_count(kind);
+}
+
+std::size_t fu_3d_raw_packet_word_count(QueueKind kind, const QueueCommand& header)
+{
+    switch (kind) {
+    case QueueKind::Mem: {
+        isa::EncodedMemIcu3DPacket packet{};
+        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+            packet.words[0].lanes[lane] = header.words[lane];
+        return isa::fu_loop_packet_word_count(packet);
+    }
+    case QueueKind::MxmLoad: {
+        isa::EncodedMxmLoadIcu3DPacket packet{};
+        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+            packet.words[0].lanes[lane] = header.words[lane];
+        return isa::fu_loop_packet_word_count(packet);
+    }
+    case QueueKind::MxmCompute: {
+        isa::EncodedMxmComputeIcu3DPacket packet{};
+        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+            packet.words[0].lanes[lane] = header.words[lane];
+        return isa::fu_loop_packet_word_count(packet);
+    }
+    case QueueKind::MxmDequant: {
+        isa::EncodedMxmDequantIcu3DPacket packet{};
+        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+            packet.words[0].lanes[lane] = header.words[lane];
+        return isa::fu_loop_packet_word_count(packet);
+    }
+    default: return raw_3d_packet_word_count(kind);
+    }
 }
 
 IcuLoop3D decode_fu_3d_raw_packet_loop(
@@ -1308,7 +1350,7 @@ void load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
                     throw std::logic_error(
                         "C2C queues do not carry FU 3-D packets");
                 }
-                command_index += raw_3d_packet_word_count(queue.kind) - 1;
+                command_index += fu_3d_raw_packet_word_count(queue.kind, command) - 1;
                 continue;
             }
             if (is_vxm_stream_nd_command(command)) {

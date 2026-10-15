@@ -63,6 +63,9 @@ class EntryPointTests(unittest.TestCase):
         self.assertEqual([phase for phase, _ in plan], ['compile', 'cmodel'])
         self.assertEqual(plan[0][1][0], str(entry.executable(self.args.build_dir,'Release','compile')))
         self.assertEqual(plan[0][1][-1], 'on')
+        # The numerical harness validates K/V state as well as the layer output.
+        command = plan[0][1]
+        self.assertEqual(command[command.index('--kv-cache-capacity') + 1], '256')
         self.assertFalse(any('pipeline_test.py' in arg for _, cmd in plan for arg in cmd))
 
     def test_local_pinned_checkpoint_is_not_redownloaded(self):
