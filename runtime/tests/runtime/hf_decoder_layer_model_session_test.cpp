@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -24,9 +25,9 @@ float readBf16(const std::vector<std::uint8_t>& data, std::size_t index)
 
 int main(int argc, char** argv)
 try {
-    if (argc != 2)
+    if (argc != 2 && argc != 3)
         throw std::runtime_error(
-            "usage: hf_decoder_layer_model_session_test model.ftlpum");
+            "usage: hf_decoder_layer_model_session_test model.ftlpum [output.bf16.bin]");
     using namespace ftlpu::software::runtime;
     auto system = std::make_unique<ftlpu::C2cDmaSystem>();
     ModelSession session(*system);
@@ -36,6 +37,12 @@ try {
 
     const auto& actual = session.value("hidden.1");
     const auto& expected = session.value("golden.output");
+    if (argc == 3) {
+        std::ofstream output(std::filesystem::path(argv[2]), std::ios::binary);
+        if (!output || !output.write(reinterpret_cast<const char*>(actual.data()),
+                static_cast<std::streamsize>(actual.size())))
+            throw std::runtime_error("cannot save CModel decoder output");
+    }
     if (actual.size() != expected.size())
         throw std::logic_error("decoder layer result size mismatch");
     float maximumError = 0.0f;

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "model": "HuggingFaceTB/SmolLM2-135M",
+  "revision": "93efa2f097d58c2a74874c7e644dbc9b0cee75a2",
+  "load_dtype": "float32",
+  "load_options": {"attn_implementation": "eager", "local_files_only": true, "cache_dir": ".cache/hf-hub"},
+  "entry": "ftlpu_frontend.hf:submodule_entry",
+  "entry_options": {"module_path": "model.layers.0.mlp"},
+  "inputs": [
+    {"name": "hidden_states", "shape": [16, 576], "dtype": "float32", "fill": 0.125}
+  ],
+  "quantization": "none",
+  "exporter": "torch_xla"
+}

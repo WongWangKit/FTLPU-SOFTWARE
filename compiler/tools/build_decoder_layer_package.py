@@ -67,6 +67,31 @@ def binding_refs(stream, refs: list[tuple[int, str]]) -> None:
         string(stream, name)
 
 
+def decoder_input_refs(metadata: dict, invocation_index: int) -> list[tuple[int, str]]:
+    """Bind captured executables explicitly; retain the legacy ABI by default."""
+    layer = int(metadata["layer"])
+    roles = ["activation", "input_layernorm", "query", "key", "value", "output"]
+    if metadata.get("attention_bias_operands", False):
+        roles.extend(["query_bias", "key_bias", "value_bias"])
+    roles.extend(["post_attention_layernorm", "gate", "up", "down"])
+    indices = metadata.get("executable_input_bindings", dict(zip(roles, range(len(roles)))))
+    if set(indices) != set(roles):
+        raise ValueError("executable input bindings must cover every decoder role exactly")
+    values = list(indices.values())
+    if any(type(index) is not int or index < 0 for index in values) or len(set(values)) != len(values):
+        raise ValueError("executable input binding indices must be unique non-negative integers")
+    names = {
+        "activation": f"hidden.{invocation_index}",
+        "input_layernorm": f"layers.{layer}.input_layernorm.weight",
+        "post_attention_layernorm": f"layers.{layer}.post_attention_layernorm.weight",
+    }
+    for role in ("query", "key", "value", "output", "gate", "up", "down"):
+        names[role] = f"layers.{layer}.{role}.weight"
+    for role in ("query", "key", "value"):
+        names[role + "_bias"] = f"layers.{layer}.{role}.bias"
+    return [(indices[role], names[role]) for role in roles]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -162,6 +187,9 @@ def main() -> None:
         bool(current.get("attention_bias_operands", False))
         for current in metadata_list
     ]
+    # Validate optional captured-graph bindings before opening the output file.
+    invocation_input_refs = [decoder_input_refs(current, index)
+                             for index, current in enumerate(metadata_list)]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("wb") as stream:
@@ -349,30 +377,7 @@ def main() -> None:
                 stream, "I",
                 executable_indices[invocation_index],
             )
-            input_refs = [
-                (0, f"hidden.{invocation_index}"),
-                (1, f"layers.{layer}.input_layernorm.weight"),
-                (2, f"layers.{layer}.query.weight"),
-                (3, f"layers.{layer}.key.weight"),
-                (4, f"layers.{layer}.value.weight"),
-                (5, f"layers.{layer}.output.weight"),
-            ]
-            next_binding = 6
-            if bias_operand_flags[invocation_index]:
-                input_refs.extend([
-                    (6, f"layers.{layer}.query.bias"),
-                    (7, f"layers.{layer}.key.bias"),
-                    (8, f"layers.{layer}.value.bias"),
-                ])
-                next_binding = 9
-            input_refs.extend([
-                (next_binding,
-                 f"layers.{layer}.post_attention_layernorm.weight"),
-                (next_binding + 1, f"layers.{layer}.gate.weight"),
-                (next_binding + 2, f"layers.{layer}.up.weight"),
-                (next_binding + 3, f"layers.{layer}.down.weight"),
-            ])
-            binding_refs(stream, input_refs)
+            binding_refs(stream, invocation_input_refs[invocation_index])
             binding_refs(
                 stream, [(0, f"hidden.{invocation_index + 1}")]
             )

@@ -5,68 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import struct
 from pathlib import Path
 
 import numpy as np
 
 
-class SafeTensorFile:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        with path.open("rb") as stream:
-            header_size = struct.unpack("<Q", stream.read(8))[0]
-            self.data_base = 8 + header_size
-            self.header = json.loads(stream.read(header_size))
-
-    def read(self, name: str) -> np.ndarray:
-        metadata = self.header[name]
-        begin, end = metadata["data_offsets"]
-        with self.path.open("rb") as stream:
-            stream.seek(self.data_base + begin)
-            data = stream.read(end - begin)
-        dtype = metadata["dtype"]
-        shape = tuple(metadata["shape"])
-        if dtype == "BF16":
-            words = np.frombuffer(data, dtype="<u2").astype(np.uint32)
-            return (words << 16).view(np.float32).reshape(shape)
-        numpy_dtype = {
-            "F16": "<f2",
-            "F32": "<f4",
-            "I8": "i1",
-        }.get(dtype)
-        if numpy_dtype is None:
-            raise ValueError(f"unsupported safetensors dtype {dtype}")
-        return np.frombuffer(data, dtype=numpy_dtype).reshape(shape).astype(np.float32)
-
-
-class SafeTensorStore:
-    def __init__(self, model_dir: Path) -> None:
-        index_path = model_dir / "model.safetensors.index.json"
-        if index_path.exists():
-            index = json.loads(index_path.read_text(encoding="utf-8"))
-            self.weight_map = index["weight_map"]
-            paths = {model_dir / name for name in self.weight_map.values()}
-        else:
-            path = model_dir / "model.safetensors"
-            if not path.exists():
-                raise FileNotFoundError(
-                    f"{model_dir} has no model.safetensors checkpoint"
-                )
-            reader = SafeTensorFile(path)
-            self.weight_map = {
-                name: path.name
-                for name in reader.header
-                if name != "__metadata__"
-            }
-            paths = {path}
-        self.readers = {path.name: SafeTensorFile(path) for path in paths}
-
-    def read(self, name: str) -> np.ndarray:
-        filename = self.weight_map.get(name)
-        if filename is None:
-            raise KeyError(f"checkpoint tensor is missing: {name}")
-        return self.readers[filename].read(name)
+from ftlpu_frontend.weights import SafeTensorFile, SafeTensorStore  # noqa: F401
 
 
 def quantize_linear(weight: np.ndarray) -> tuple[np.ndarray, float]:

@@ -76,6 +76,8 @@ add_library(ftlpu_compiler
     src/Dialect/Kernel/Analysis/AttentionGraph.cpp
     src/Dialect/Kernel/Analysis/FfnGraph.cpp
     src/Dialect/Kernel/Transforms/StableHloToKernel.cpp
+    src/Dialect/Kernel/Transforms/NormalizeStableHlo.cpp
+    src/Dialect/Kernel/Transforms/VerifyKernelCoverage.cpp
     src/Dialect/Tensor/IR/TensorDialect.cpp
     src/Dialect/Tensor/Analysis/AttentionTaskGraph.cpp
     src/Dialect/Tensor/Analysis/AttentionWeightTilePlan.cpp
@@ -224,11 +226,14 @@ target_link_libraries(ftlpu_compiler
         MLIRPass
         MLIRFuncDialect
         MLIRSupport
+        MLIRTransforms
         StablehloOps
+        StablehloReferenceOps
         ftlpu_software)
 
 add_executable(ftlpu_opt tools/ftlpu_opt.cpp)
 target_link_libraries(ftlpu_opt PRIVATE ftlpu_compiler)
+target_link_libraries(ftlpu_opt PRIVATE StablehloSerialization)
 add_executable(ftlpu_translate tools/ftlpu_translate.cpp)
 set_target_properties(ftlpu_translate PROPERTIES OUTPUT_NAME "ftlpu-translate")
 target_link_libraries(ftlpu_translate PRIVATE ftlpu_compiler)
@@ -590,6 +595,27 @@ if(Python3_Interpreter_FOUND)
             --tool $<TARGET_FILE:ftlpu_opt>
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/iree_frontend/simple_stablehlo.mlir
             --output ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/stablehlo_matmul_320_to_ftlpu_kernel/matmul_320.kernel.mlir)
+    add_test(
+        NAME stablehlo_batched_dot_to_ftlpu_kernel_mlir_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_batched_dot_mlir_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/stablehlo_batched_dot_to_ftlpu_kernel)
+    add_test(
+        NAME stablehlo_normalization_kernel_legality_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stablehlo_normalization_legality_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/stablehlo_normalization_kernel_legality)
+    add_test(
+        NAME hf_structure_lowering_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/hf_structure_lowering_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/hf_structure_lowering)
     add_test(
         NAME stablehlo_matmul_320_to_ftlpu_tensor_mlir_test
         COMMAND

@@ -138,8 +138,8 @@ LogicalResult BatchMatmulOp::verify()
         || lhs.getDimSize(1) != result.getDimSize(1)
         || rhs_n != result.getDimSize(2))
         return emitOpError("tensor shapes do not satisfy batched matmul");
-    if (getRole() != "qk" && getRole() != "pv")
-        return emitOpError("role must be qk or pv");
+    if (getRole() != "qk" && getRole() != "pv" && getRole() != "generic")
+        return emitOpError("role must be qk, pv, or generic");
     return success();
 }
 

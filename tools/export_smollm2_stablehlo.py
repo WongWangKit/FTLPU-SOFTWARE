@@ -13,32 +13,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-import torch
-from transformers import AutoModelForCausalLM
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "compiler" / "tools"))
+from ftlpu_frontend import export_model  # noqa: E402
+from ftlpu_frontend.config import DEFAULT_MODEL  # noqa: E402
+from ftlpu_frontend.pipeline import require_empty_output  # noqa: E402,F401
 
 
-DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M"
-
-
-class LogitsOnly(torch.nn.Module):
-    """Give torch.export a tensor-only, positional-input interface."""
-
-    def __init__(self, model: torch.nn.Module) -> None:
-        super().__init__()
-        self.model = model
-
-    def forward(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=False,
-        )
-        return outputs[0]
+def __getattr__(name):
+    if name == "LogitsOnly":
+        from ftlpu_frontend.hf import LogitsOnly
+        return LogitsOnly
+    raise AttributeError(name)
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,50 +49,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def require_empty_output(path: Path) -> None:
-    if path.exists() and any(path.iterdir()):
-        raise SystemExit(
-            f"Refusing to overwrite non-empty output directory: {path}\n"
-            "Choose another --output or remove the old artifact explicitly."
-        )
-    path.mkdir(parents=True, exist_ok=True)
-
-
 def main() -> None:
     args = parse_args()
     if args.batch_size < 1 or args.sequence_length < 1:
         raise SystemExit("--batch-size and --sequence-length must be positive")
 
-    require_empty_output(args.output)
-    dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
-
-    print(f"Loading {args.model} ({args.dtype})...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=dtype,
-        attn_implementation="eager",
-        local_files_only=args.local_files_only,
-    )
-    model.eval()
-    model.config.use_cache = False
-    wrapped = LogitsOnly(model).eval()
-
-    input_ids = torch.zeros(
-        (args.batch_size, args.sequence_length), dtype=torch.int64
-    )
-    attention_mask = torch.ones_like(input_ids)
-
-    print("Capturing the PyTorch graph...")
-    with torch.inference_mode():
-        exported = torch.export.export(
-            wrapped, (input_ids, attention_mask), strict=False
-        )
-
-    print("Lowering the captured graph to StableHLO...")
-    from torch_xla.stablehlo import exported_program_to_stablehlo
-
-    stablehlo_program = exported_program_to_stablehlo(exported)
-    stablehlo_program.save(str(args.output))
+    export_model({
+        "model": args.model,
+        "load_dtype": args.dtype,
+        "load_options": {"local_files_only": args.local_files_only},
+        "inputs": [
+            {"name": "input_ids", "shape": [args.batch_size, args.sequence_length], "dtype": "int64", "fill": 0},
+            {"name": "attention_mask", "shape": [args.batch_size, args.sequence_length], "dtype": "int64", "fill": 1},
+        ],
+    }, args.output)
 
     manifest = {
         "model": args.model,

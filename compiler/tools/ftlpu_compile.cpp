@@ -19,6 +19,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/Support/InitLLVM.h"
 
@@ -247,8 +248,16 @@ try {
     passes.enableVerifier(false);
     if (args.pass_timing) passes.enableTiming();
     if (args.input_stage == InputStage::StableHlo) {
+        // The legacy entry retains its mask structure; static mask evaluation
+        // is enabled explicitly by the new bundle bridge through ftlpu-opt.
+        passes.addNestedPass<mlir::func::FuncOp>(
+            ftlpu::compiler::create_normalize_stablehlo_pass());
+        passes.addNestedPass<mlir::func::FuncOp>(mlir::createCSEPass());
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stablehlo_to_kernel_pass());
+        passes.addNestedPass<mlir::func::FuncOp>(mlir::createCSEPass());
+        passes.addNestedPass<mlir::func::FuncOp>(
+            ftlpu::compiler::create_verify_kernel_coverage_pass());
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_kernel_to_tensor_pass(
                 args.weight_bank));

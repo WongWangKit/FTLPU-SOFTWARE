@@ -262,7 +262,25 @@ public:
             }
             if (fixed_w8a16_operand) continue;
             if (mlir::failed(allocate_value(argument, argument_kind(argument)))) {
-                function.emitError("cannot allocate function inputs in the east MEM hemisphere");
+                const auto tensor = llvm::dyn_cast<mlir::RankedTensorType>(argument.getType());
+                const auto kind = argument_kind(argument);
+                const bool weight = kind == PlacementKind::Weight;
+                const auto slices = weight ? target.weight_storage_slices()
+                                           : target.activation_storage_slices();
+                const auto& memory = target.memory();
+                const int64_t capacity = static_cast<int64_t>(slices.size())
+                    * memory.banks_per_slice * memory.words_per_bank * memory.bytes_per_word;
+                const int64_t bytes = tensor && tensor.hasStaticShape()
+                    ? tensor.getNumElements() * ((tensor.getElementTypeBitWidth() + 7) / 8) : -1;
+                function.emitError("cannot allocate function inputs in the east MEM hemisphere")
+                    << ": argument=" << argument.getArgNumber() << " type=" << argument.getType()
+                    << " required_bytes=" << bytes
+                    << " allocation_category=" << (weight ? "weight" : "activation")
+                    << " role_capacity_upper_bound_bytes=" << capacity
+                    << " candidate_slices=" << slices.size()
+                    << " banks_per_slice=" << memory.banks_per_slice
+                    << " words_per_bank=" << memory.words_per_bank
+                    << "; function inputs coexist with other live allocations";
                 signalPassFailure();
                 return;
             }

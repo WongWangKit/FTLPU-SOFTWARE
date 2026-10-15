@@ -1,0 +1,13 @@
+diff --git a/stablehlo/reference/Ops.cpp b/stablehlo/reference/Ops.cpp
+index 2f9d3b6e..a6a33244 100644
+--- a/stablehlo/reference/Ops.cpp
++++ b/stablehlo/reference/Ops.cpp
+@@ -1868,7 +1868,7 @@ Tensor fftOp(const Tensor& operand, const FftType fftType,
+     // compute IFFT as conjugation, FFT, conjugation and normalization
+     Tensor result(operand);
+     for (auto d = fftDims.begin(); d != fftDims.end(); ++d) {
+-      auto divisorValue = std::complex<APFloat>(
++      auto divisorValue = mlir::NonFloatComplex<APFloat>(
+           APFloat(static_cast<double>(resultType.getDimSize(*d))),
+           APFloat(0.0));
+       auto divisor =

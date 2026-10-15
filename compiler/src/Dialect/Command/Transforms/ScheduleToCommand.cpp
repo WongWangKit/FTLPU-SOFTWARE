@@ -104,8 +104,14 @@ std::optional<int64_t> source_binding_index(mlir::Value value)
             result = index;
             continue;
         }
-        for (mlir::Value operand : defining->getOperands())
-            pending.push_back(operand);
+        // Relocation follows storage aliases, not computational dependency.
+        // An FFN intermediate can depend on just one external weight after
+        // internal bindings cut the other paths; that does not put the
+        // intermediate in the weight's MEM allocation.
+        if (auto route = llvm::dyn_cast<stream::RouteOp>(defining))
+            pending.push_back(route.getInput());
+        else
+            return std::nullopt;
     }
     return result;
 }
@@ -882,9 +888,7 @@ public:
                 bindingPlacement = read.getPlacement();
             create_binding(builder, read.getLoc(),
                 argument.getArgNumber(), "input",
-                argument.getArgNumber() == 0
-                    ? "activation"
-                    : "weight",
+                read.getRole().starts_with("weight") ? "weight" : "activation",
                 "arg" + std::to_string(argument.getArgNumber()), 0,
                 type, bindingBytes, bindingPlacement);
         }

@@ -1,0 +1,7 @@
+# Install torch and torch-xla with matching versions on an XLA-supported host.
+torch
+torch-xla
+transformers
+safetensors>=0.8
+numpy
+ml_dtypes

@@ -1,5 +1,11 @@
 # SmolLM2-135M to StableHLO
 
+The original CLI now shares a lightweight configuration-driven frontend and
+also writes a validated `manifest.json`, stage diagnostics, and capture
+metadata. Defaults and the legacy `export.json` are preserved. See the
+[HF frontend guide](README.hf-stablehlo.zh-CN.md) for configuration, bundle ABI,
+weight reading, validation, and current limitations.
+
 This exporter captures one statically shaped, logits-only forward pass of
 `HuggingFaceTB/SmolLM2-135M`. It deliberately excludes tokenization, sampling,
 the autoregressive loop, and the KV cache. Those are runtime concerns and

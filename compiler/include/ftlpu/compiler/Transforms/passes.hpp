@@ -17,6 +17,13 @@ enum class AttentionScheduleStrategy {
 };
 
 std::unique_ptr<mlir::Pass> create_lower_stablehlo_to_kernel_pass();
+// Layout canonicalization and optional static mask evaluation. No floating
+// arithmetic reassociation or dtype changes.
+std::unique_ptr<mlir::Pass> create_normalize_stablehlo_pass(
+    bool fold_static_mask = false);
+// In complete mode every remaining computation must have a downstream consumer.
+std::unique_ptr<mlir::Pass> create_verify_kernel_coverage_pass(
+    bool allow_partial = false);
 std::unique_ptr<mlir::Pass> create_lower_kernel_to_tensor_pass(
     std::int64_t weight_bank = -1);
 std::unique_ptr<mlir::Pass> create_lower_tensor_to_stream_pass();
