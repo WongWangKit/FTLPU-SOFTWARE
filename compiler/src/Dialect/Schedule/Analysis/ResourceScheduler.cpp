@@ -1,6 +1,8 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/resource_scheduler.hpp"
 
 #include <algorithm>
+#include <iterator>
+#include <stdexcept>
 #include <vector>
 
 namespace ftlpu::compiler::schedule {
@@ -71,7 +73,7 @@ bool ResourceScheduler::try_reserve_at(int64_t cycle,
     llvm::ArrayRef<ResourceWindow> windows)
 {
     if (!is_free_at(cycle, windows)) return false;
-    reserve_at(cycle, windows);
+    commit_at(cycle, windows);
     return true;
 }
 
@@ -80,19 +82,57 @@ std::optional<int64_t> ResourceScheduler::try_reserve(
 {
     if (has_internal_conflict(windows)) return std::nullopt;
     const int64_t cycle = find_earliest(earliest_cycle, windows);
-    reserve_at(cycle, windows);
+    commit_at(cycle, windows);
     return cycle;
 }
 
 int64_t ResourceScheduler::reserve(int64_t earliest_cycle,
     llvm::ArrayRef<ResourceWindow> windows)
 {
-    const int64_t anchor = find_earliest(earliest_cycle, windows);
-    reserve_at(anchor, windows);
-    return anchor;
+    const auto cycle = try_reserve(earliest_cycle, windows);
+    if (!cycle)
+        throw std::invalid_argument(
+            "cannot reserve a resource bundle with internal conflicts");
+    return *cycle;
 }
 
 void ResourceScheduler::reserve_at(int64_t cycle,
+    llvm::ArrayRef<ResourceWindow> windows)
+{
+    if (!try_reserve_at(cycle, windows))
+        throw std::invalid_argument(
+            "cannot reserve a conflicting resource bundle at a fixed cycle");
+}
+
+void ResourceScheduler::block_at(int64_t cycle,
+    llvm::ArrayRef<ResourceWindow> windows)
+{
+    for (const ResourceWindow& window : windows) {
+        if (window.duration <= 0)
+            throw std::invalid_argument(
+                "cannot block a resource for a non-positive duration");
+        int64_t start = cycle + window.offset;
+        int64_t end = start + window.duration;
+        auto& intervals = reservations_[window.resource];
+        auto position = intervals.lower_bound(start);
+        if (position != intervals.begin()) {
+            auto previous = std::prev(position);
+            if (previous->second >= start) position = previous;
+        }
+        while (position != intervals.end() && position->first <= end) {
+            if (position->second < start) {
+                ++position;
+                continue;
+            }
+            start = std::min(start, position->first);
+            end = std::max(end, position->second);
+            position = intervals.erase(position);
+        }
+        intervals.emplace(start, end);
+    }
+}
+
+void ResourceScheduler::commit_at(int64_t cycle,
     llvm::ArrayRef<ResourceWindow> windows)
 {
     for (const auto& window : windows) {

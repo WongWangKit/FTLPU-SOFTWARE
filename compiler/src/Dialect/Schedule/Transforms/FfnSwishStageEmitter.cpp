@@ -633,6 +633,12 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
 
     FfnSwishScheduleRequest request;
     request.tile_rows = tile;
+    request.temp_bank = context.temp_bank;
+    request.mem_windows = std::move(emission.mem_busy_windows);
+    request.hidden_slices.assign(
+        context.hidden_slices.begin(), context.hidden_slices.end());
+    request.hidden_bank = ffn.getHidden0Placement()
+        .getAs<mlir::IntegerAttr>("bank").getInt();
     const int64_t dequantWindowCycles =
         memory.hemispheres * throughput.mxms_per_hemisphere
             * weightLoadCycles

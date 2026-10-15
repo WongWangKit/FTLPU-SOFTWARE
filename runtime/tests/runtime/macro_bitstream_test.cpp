@@ -92,6 +92,14 @@ try {
         "command count changed");
     for (std::size_t i = 0; i < queue.commands.size(); ++i)
         compare(queue.commands[i], decoded.commands[i]);
+    rt::QueueProgram topAddressQueue{rt::QueueKind::Mem, 0, {}};
+    topAddressQueue.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(ftlpu::hw::kSramDepthRows - 1, 0),
+        {0, 1, 1, 0, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}));
+    const auto topAddressImage = rt::encode_mem_macro_bitstream(topAddressQueue);
+    const auto topAddressDecoded = rt::decode_mem_macro_bitstream(
+        topAddressImage, topAddressQueue.index);
+    compare(topAddressQueue.commands.front(), topAddressDecoded.commands.front());
     expect(image.stats.compact_template_runs != 0,
         "compact template was not exercised");
     expect(image.stats.extended_template_runs != 0,

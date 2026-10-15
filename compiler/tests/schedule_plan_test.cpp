@@ -42,4 +42,15 @@ int main()
     invalid.addTask("duplicate", ScheduleTaskKind::Barrier,
         ScheduleStage::Generic, 0, 1);
     require(mlir::failed(invalid.validate()), "duplicate task names were accepted");
+
+    SchedulePlan conflicting;
+    const ResourceWindow selfConflict[] {
+        {"mem.h0.s0.b0.icu", 0, 2},
+        {"mem.h0.s0.b0.icu", 1, 2},
+    };
+    conflicting.addTask("self-conflicting", ScheduleTaskKind::MemRead,
+        ScheduleStage::Generic, 0, 3, selfConflict);
+    ResourceScheduler conflictingResources;
+    require(mlir::failed(conflicting.schedule(conflictingResources)),
+        "task-local resource conflict was silently committed");
 }

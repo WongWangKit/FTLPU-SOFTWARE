@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_stage_plan.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_pv_timeline.hpp"
 
 #include <cstdio>
 #include <stdexcept>
@@ -37,6 +38,23 @@ int main()
 
     require(plan.qk_wave_interval == 256,
         "single-MXM QK waves should overlap without a refill gap");
+
+    // A resident Value block can be reused, but each query tile must own a
+    // distinct complete MXM issue window, including seq128's four tiles.
+    for (int64_t tokens : {32, 64, 128, 256}) {
+        llvm::SmallVector<schedule::ResourceWindow> queryWindows;
+        int64_t lastEnd = 0;
+        for (int64_t block = 0; block < tokens / 32; ++block) {
+            const int64_t start = schedule::attention_pv_query_compute_cycle(
+                100, block, 32);
+            queryWindows.push_back({"pv.mxm", start, 32});
+            lastEnd = start + 32;
+        }
+        require(!resources.has_internal_conflict(queryWindows),
+            "PV query blocks overlap one physical MXM issue window");
+        require(queryWindows.front().offset == 100 && lastEnd == 100 + tokens,
+            "PV query windows do not cover the complete sequence");
+    }
 
     const auto shortKvPlan = schedule::planAttentionStages(
         {32, 2048, 32, 8, 64}, target);

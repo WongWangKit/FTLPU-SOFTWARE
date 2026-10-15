@@ -1,5 +1,7 @@
 #include "FfnEmitterUtils.hpp"
 
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_swish_planner.hpp"
+
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 namespace ftlpu::compiler::schedule::ffn_detail {
@@ -84,7 +86,7 @@ mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
     // model hid those passive hops; the physical 16-column fabric does not.
     const int64_t kVxmSwishLatency =
         pipelineLatency >= 0 ? pipelineLatency
-            : 18 + (target.throughput().vxm_alus - 8);
+            : ffn_swish_result_latency(target);
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t blockRows = target.throughput().mxm_block_rows;
     const int64_t destination = 1 - sourceHemisphere;

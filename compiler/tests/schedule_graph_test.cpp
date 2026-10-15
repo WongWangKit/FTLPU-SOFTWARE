@@ -63,4 +63,27 @@ int main()
         "legal transactional bundle was rejected");
     require(!transactional.try_reserve_at(100, legalBundle),
         "existing ICU reservation was ignored");
+    bool fixedCycleRejected = false;
+    try {
+        transactional.reserve_at(200, conflictingBundle);
+    } catch (const std::invalid_argument&) {
+        fixedCycleRejected = true;
+    }
+    require(fixedCycleRejected,
+        "fixed-cycle API silently committed an internal conflict");
+    require(transactional.try_reserve_at(200, legalBundle),
+        "rejected bundle left a partial reservation behind");
+
+    ResourceScheduler blocked;
+    blocked.block_at(10, {{"external.busy", 0, 4}});
+    blocked.block_at(12, {{"external.busy", 0, 4}});
+    blocked.block_at(13, {{"external.busy", 0, 1}});
+    require(blocked.find_earliest(10, {{"external.busy", 0, 1}}) == 16,
+        "overlapping external busy windows were not treated as a union");
+
+    ScheduleGraph selfConflicting;
+    selfConflicting.add_node("invalid", 0, 4, conflictingBundle);
+    ResourceScheduler graphResources;
+    require(mlir::failed(selfConflicting.schedule(graphResources)),
+        "graph scheduler accepted a task-local ICU conflict");
 }

@@ -268,6 +268,19 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
     };
 
     FfnProjectionEmission emission;
+    const auto recordActivationWindow = [&](int64_t hemisphere, int64_t slice,
+                                            int64_t cycle, int64_t count,
+                                            int64_t interval,
+                                            const FfnLoopDomain3D& domain) {
+        const int64_t bank = context.activation_route.getPlacement()
+            .getAs<mlir::IntegerAttr>("bank").getInt();
+        // One READ_3D owns its MEM ICU throughout the gaps between waves.
+        const int64_t end = cycle + (count - 1) * interval
+            + (domain.wave_count - 1) * domain.wave_interval
+            + (domain.group_count - 1) * domain.group_interval + 1;
+        emission.mem_busy_windows.push_back(
+            {hemisphere, slice, bank, cycle, end});
+    };
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, mlir::Value>
         tempDomainOutputs;
     rewriter.setInsertionPoint(ffn.getOperation());
@@ -603,10 +616,12 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                                 2 * tokenLane + byte];
                                         FfnLoopDomain3D domain =
                                             projectionDomain;
+                                        const int64_t issueCycle =
+                                            consumerCycle + firstOffset
+                                                - context.eastMxmLatency(slice);
                                         emitFfnMemTransfer3D(rewriter,
                                             ffn.getLoc(),
-                                            consumerCycle + firstOffset
-                                                - context.eastMxmLatency(slice),
+                                            issueCycle,
                                             hemisphere, slice, "read", row,
                                             segment.stream_base + byte,
                                             occurrenceCount, blockRows, 1,
@@ -616,16 +631,20 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                                     "bank")
                                                 .getInt(),
                                             domain);
+                                        recordActivationWindow(hemisphere, slice,
+                                            issueCycle, occurrenceCount,
+                                            blockRows, domain);
                                     }
                                 }
                             } else {
                                 for (int64_t byte = 0; byte < 2; ++byte) {
                                     const int64_t slice =
                                         context.activation_slices[byte];
+                                    const int64_t issueCycle = consumerCycle
+                                        - context.activation_latency;
                                     emitFfnMemTransfer3D(rewriter,
                                         ffn.getLoc(),
-                                        consumerCycle
-                                            - context.activation_latency,
+                                        issueCycle,
                                         hemisphere, slice, "read",
                                         activationBase + rowOffset,
                                         segment.stream_base + byte,
@@ -634,6 +653,9 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                             .getPlacement()
                                             .getAs<mlir::IntegerAttr>("bank")
                                             .getInt(),
+                                        projectionDomain);
+                                    recordActivationWindow(hemisphere, slice,
+                                        issueCycle, segment.rows, 1,
                                         projectionDomain);
                                 }
                             }

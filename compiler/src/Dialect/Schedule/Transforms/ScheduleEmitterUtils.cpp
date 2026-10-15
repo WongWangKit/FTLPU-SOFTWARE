@@ -90,7 +90,9 @@ int64_t reserve_resources_and_streams(ResourceScheduler& resources,
         if (!routeConflict) break;
         ++anchor;
     }
-    resources.reserve_at(anchor, resource_windows);
+    if (!resources.try_reserve_at(anchor, resource_windows))
+        throw std::logic_error(
+            "resource bundle changed between conflict check and commit");
     for (const auto& timed : stream_routes) {
         if (!streams.reserve_at(anchor + timed.offset, timed.route))
             throw std::logic_error(

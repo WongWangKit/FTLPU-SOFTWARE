@@ -48,8 +48,10 @@ mlir::FailureOr<std::vector<ScheduledNode>> ScheduleGraph::schedule(
                     result[dependency.predecessor].end_cycle + dependency.latency);
             }
             if (!ready || current.duration <= 0) continue;
-            const int64_t cycle = resources.reserve(earliest, current.resources);
-            result[id] = {cycle, cycle + current.duration};
+            const auto cycle = resources.try_reserve(
+                earliest, current.resources);
+            if (!cycle) return mlir::failure();
+            result[id] = {*cycle, *cycle + current.duration};
             scheduled[id] = true;
             --remaining;
             progress = true;

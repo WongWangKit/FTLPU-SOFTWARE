@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -13,7 +14,8 @@ namespace {
 
 constexpr unsigned kCompactStartDeltaBits = 22;
 constexpr unsigned kCompactAddressDeltaBits = 14;
-constexpr unsigned kMemAddressBits = 13;
+constexpr unsigned kMemAddressBits = static_cast<unsigned>(
+    std::bit_width(hw::kSramDepthRows - 1));
 
 class BitWriter {
 public:

@@ -31,9 +31,12 @@ public:
         llvm::ArrayRef<ResourceWindow> windows);
     int64_t reserve(int64_t earliest_cycle, llvm::ArrayRef<ResourceWindow> windows);
     void reserve_at(int64_t cycle, llvm::ArrayRef<ResourceWindow> windows);
+    // Imported busy intervals may overlap and form a union of blocked time.
+    void block_at(int64_t cycle, llvm::ArrayRef<ResourceWindow> windows);
     int64_t minimum_non_overlapping_shift(int64_t minimum_shift) const;
 
 private:
+    void commit_at(int64_t cycle, llvm::ArrayRef<ResourceWindow> windows);
     bool is_free(const ResourceWindow& window, int64_t anchor) const;
     std::unordered_map<std::string, std::map<int64_t, int64_t>> reservations_;
 };

@@ -83,8 +83,10 @@ mlir::FailureOr<ScheduleAssignment> SchedulePlan::schedule(
                         + dependency.latency);
             }
             if (!ready) continue;
-            const int64_t cycle = resources.reserve(earliest, current.resources);
-            assignment.tasks[id] = {cycle, cycle + current.duration};
+            const auto cycle = resources.try_reserve(
+                earliest, current.resources);
+            if (!cycle) return mlir::failure();
+            assignment.tasks[id] = {*cycle, *cycle + current.duration};
             scheduled[id] = true;
             --remaining;
             progress = true;
