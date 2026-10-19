@@ -1,27 +1,24 @@
 #include "ftlpu/software/runtime/imem_capacity.hpp"
 
-#include <limits>
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 namespace ftlpu::software::runtime {
 namespace {
 
-std::pair<std::uint32_t, std::uint32_t> geometry_for(
-    QueueKind kind, const ExecutableHardwareConfig& hardware)
+std::pair<std::uint32_t, std::uint32_t>
+geometry_for(QueueKind kind, const ExecutableHardwareConfig& hardware)
 {
     switch (kind) {
     case QueueKind::Mem:
-        return {hardware.icu_mem_instruction_bits,
-            hardware.icu_mem_imem_depth};
+        return {hardware.icu_mem_instruction_bits, hardware.icu_mem_imem_depth};
     case QueueKind::MxmLoad:
     case QueueKind::MxmCompute:
     case QueueKind::MxmDequant:
-        return {hardware.icu_mxm_instruction_bits,
-            hardware.icu_mxm_imem_depth};
+        return {hardware.icu_mxm_instruction_bits, hardware.icu_mxm_imem_depth};
     case QueueKind::Vxm:
-        return {hardware.icu_vxm_instruction_bits,
-            hardware.icu_vxm_imem_depth};
+        return {hardware.icu_vxm_instruction_bits, hardware.icu_vxm_imem_depth};
     case QueueKind::SxmTranspose:
     case QueueKind::SxmPermute:
         return {hardware.icu_sxm_instruction_bits,
@@ -101,10 +98,9 @@ void checked_add(std::uint64_t& destination, std::uint64_t value)
 std::uint64_t stream_points(const IcuStreamNdSchedule& schedule)
 {
     std::uint64_t points = 1;
-    for (std::size_t dimension = 0; dimension < schedule.rank;
-         ++dimension) {
-        if (schedule.counts[dimension]
-            > std::numeric_limits<std::uint64_t>::max() / points)
+    for (std::size_t dimension = 0; dimension < schedule.rank; ++dimension) {
+        if (schedule.counts[dimension] >
+            std::numeric_limits<std::uint64_t>::max() / points)
             throw std::overflow_error("STREAM_ND work statistic overflow");
         points *= schedule.counts[dimension];
     }
@@ -369,8 +365,36 @@ std::size_t peak_fu_3d_contexts(const QueueProgram& queue)
     return peak_contexts(std::move(intervals));
 }
 
+bool is_all_macro_mem(const QueueProgram& queue)
+{
+    return queue.kind == QueueKind::Mem && !queue.commands.empty() &&
+           std::all_of(queue.commands.begin(), queue.commands.end(),
+                       [](const QueueCommand& command) {
+                           return is_macro_schedule_command(command) &&
+                                  command.instruction_kind ==
+                                      InstructionKind::Mem;
+                       });
+}
+
+bool is_all_macro_mxm(const QueueProgram& queue)
+{
+    const bool mxmKind = queue.kind == QueueKind::MxmLoad ||
+                         queue.kind == QueueKind::MxmCompute ||
+                         queue.kind == QueueKind::MxmDequant;
+    return mxmKind && !queue.commands.empty() &&
+           std::all_of(queue.commands.begin(), queue.commands.end(),
+                       [&](const QueueCommand& command) {
+                           const auto expected =
+                               queue.kind == QueueKind::MxmDequant
+                                   ? InstructionKind::MxmDequant
+                                   : InstructionKind::Mxm;
+                           return is_macro_schedule_command(command) &&
+                                  command.instruction_kind == expected;
+                       });
+}
+
 std::size_t macro_context_capacity_for(QueueKind kind,
-    const ExecutableHardwareConfig& hardware)
+                                       const ExecutableHardwareConfig& hardware)
 {
     switch (kind) {
     case QueueKind::Mem:
@@ -391,7 +415,7 @@ std::size_t macro_context_capacity_for(QueueKind kind,
 }
 
 std::uint32_t macro_context_bits_for(QueueKind kind,
-    const ExecutableHardwareConfig& hardware)
+                                     const ExecutableHardwareConfig& hardware)
 {
     switch (kind) {
     case QueueKind::Mem:
@@ -461,8 +485,8 @@ std::uint32_t fu_3d_context_bits_for(QueueKind kind)
 
 } // namespace
 
-CmodelAbstractImemReport analyze_cmodel_abstract_imem(
-    const BinaryProgram& program)
+CmodelAbstractImemReport
+analyze_cmodel_abstract_imem(const BinaryProgram& program)
 {
     CmodelAbstractImemReport report;
     report.queues.reserve(program.queues.size());
@@ -470,8 +494,8 @@ CmodelAbstractImemReport analyze_cmodel_abstract_imem(
         CmodelAbstractImemQueue capacity;
         capacity.kind = queue.kind;
         capacity.index = queue.index;
-        const auto [slotBits, depth] = geometry_for(queue.kind,
-            program.hardware);
+        const auto [slotBits, depth] =
+            geometry_for(queue.kind, program.hardware);
         capacity.slot_bits = slotBits;
         capacity.depth = depth;
         capacity.used_slots = queue.commands.size();
@@ -523,46 +547,48 @@ CmodelAbstractImemReport analyze_cmodel_abstract_imem(
                     "orphan FU 3-D continuation word in binary queue");
             if (is_mem_slice_program_command(command)) {
                 ++capacity.coarse_program_entries;
-                const auto program =
-                    decode_mem_slice_program_command(command);
+                const auto program = decode_mem_slice_program_command(command);
                 const auto points = stream_points(program.schedule);
-                if (program.body.size()
-                    > std::numeric_limits<std::uint64_t>::max() / points)
+                if (program.body.size() >
+                    std::numeric_limits<std::uint64_t>::max() / points)
                     throw std::overflow_error(
                         "MEM_SLICE_PROGRAM work statistic overflow");
                 checked_add(capacity.expanded_work,
-                    points * program.body.size());
+                            points * program.body.size());
                 continue;
             }
             if (is_vxm_stream_nd_command(command)) {
                 ++capacity.coarse_program_entries;
-                checked_add(capacity.expanded_work,
+                checked_add(
+                    capacity.expanded_work,
                     stream_points(
                         decode_vxm_stream_nd_command(command).schedule));
                 continue;
             }
             if (is_sxm_tile_program_command(command)) {
                 ++capacity.coarse_program_entries;
-                checked_add(capacity.expanded_work,
+                checked_add(
+                    capacity.expanded_work,
                     stream_points(
                         decode_sxm_tile_program_command(command).schedule));
                 continue;
             }
-            if (is_mem_stream_nd_command(command)
-                || is_mxm_stream_nd_command(command)) {
+            if (is_mem_stream_nd_command(command) ||
+                is_mxm_stream_nd_command(command)) {
                 ++capacity.coarse_program_entries;
-                checked_add(capacity.expanded_work,
+                checked_add(
+                    capacity.expanded_work,
                     stream_points(is_mem_stream_nd_command(command)
-                            ? decode_mem_stream_nd_command(command)
-                            : decode_mxm_stream_nd_command(command)));
+                                      ? decode_mem_stream_nd_command(command)
+                                      : decode_mxm_stream_nd_command(command)));
                 continue;
             }
             if (is_macro_schedule_command(command)) {
                 ++capacity.macro_entries;
                 const auto macro = decode_macro_schedule_command(command);
                 checked_add(capacity.expanded_work,
-                    static_cast<std::uint64_t>(macro.inner_count)
-                        * macro.outer_count);
+                            static_cast<std::uint64_t>(macro.inner_count) *
+                                macro.outer_count);
                 continue;
             }
             if (is_icu_control_raw_word_command(command)) {
@@ -598,8 +624,8 @@ CmodelAbstractImemReport analyze_cmodel_abstract_imem(
                 ++capacity.repeat_2d_entries;
                 const auto repeat = decode_repeat_2d_command(command);
                 const auto repetitions =
-                    static_cast<std::uint64_t>(repeat.inner_count)
-                    * repeat.outer_count;
+                    static_cast<std::uint64_t>(repeat.inner_count) *
+                    repeat.outer_count;
                 // Repeat2D replays the preceding functional instruction; its
                 // first issue is counted by that instruction entry.
                 if (repetitions != 0)
@@ -625,18 +651,19 @@ CmodelAbstractImemReport analyze_cmodel_abstract_imem(
             }
         }
 
-        const auto encodedWork = capacity.instruction_entries
-            + capacity.repeat_entries + capacity.repeat_2d_entries
-            + capacity.macro_entries
-            + capacity.coarse_program_entries;
+        const auto encodedWork =
+            capacity.instruction_entries + capacity.repeat_entries +
+            capacity.repeat_2d_entries + capacity.macro_entries +
+            capacity.coarse_program_entries;
         report.used_slots += capacity.used_slots;
         report.encoded_work_entries += encodedWork;
         checked_add(report.expanded_work, capacity.expanded_work);
         checked_add(report.used_bits, capacity.used_bits());
         checked_add(report.active_queue_capacity_bits,
-            static_cast<std::uint64_t>(capacity.depth)
-                * capacity.slot_bits);
-        if (capacity.overflow()) ++report.overflow_queues;
+                    static_cast<std::uint64_t>(capacity.depth) *
+                        capacity.slot_bits);
+        if (capacity.overflow())
+            ++report.overflow_queues;
         report.queues.push_back(capacity);
     }
     return report;
@@ -652,41 +679,76 @@ PhysicalImemReport analyze_physical_imem(const BinaryProgram& program)
         PhysicalImemQueue physical;
         static_cast<CmodelAbstractImemQueue&>(physical) = abstract.queues[i];
         physical.peak_macro_contexts = peak_macro_contexts(queue);
+        const bool rawMem = is_all_macro_mem(queue)
+            && physical.slot_bits == kMemIcuImemWordBits
+            && program.hardware.icu_macro_encoding_version == kMemMacroBitstreamVersion;
+        const bool rawMxm = is_all_macro_mxm(queue)
+            && physical.slot_bits == kMxmIcuImemWordBits
+            && program.hardware.icu_macro_encoding_version == kMxmMacroBitstreamVersion;
+
         physical.macro_context_capacity = macro_context_capacity_for(
             queue.kind, program.hardware);
         physical.macro_context_bits = macro_context_bits_for(
             queue.kind, program.hardware);
-        physical.peak_fu_3d_contexts = peak_fu_3d_contexts(queue);
+        physical.peak_fu_3d_contexts = (rawMem || rawMxm)
+            ? 0 : peak_fu_3d_contexts(queue);
         physical.fu_3d_context_capacity =
             fu_3d_context_capacity_for(queue.kind);
         physical.fu_3d_context_bits = fu_3d_context_bits_for(queue.kind);
         if (physical.slot_bits == 0)
-            throw std::invalid_argument(
-                "target i-MEM slot width must be non-zero");
-        for (const auto& command : queue.commands) {
-            const auto streamNd = is_mem_stream_nd_command(command)
-                || is_mxm_stream_nd_command(command)
-                || is_vxm_stream_nd_command(command)
-                || is_sxm_tile_program_command(command);
-            const auto legacyFuMacro =
-                is_macro_schedule_command(command)
-                && (queue.kind == QueueKind::Mem
-                    || queue.kind == QueueKind::MxmLoad
-                    || queue.kind == QueueKind::MxmCompute
-                    || queue.kind == QueueKind::MxmDequant);
-            if (streamNd || legacyFuMacro) {
-                if (streamNd) ++physical.stream_nd_packets;
-                const auto packetWords =
-                    fu_3d_packet_words(queue.kind);
-                checked_add(physical.physical_bits,
-                    static_cast<std::uint64_t>(packetWords)
-                        * physical.slot_bits);
-                physical.physical_slots += packetWords;
-            } else {
-                physical.physical_bits += physical.slot_bits;
-                ++physical.physical_slots;
+            throw std::invalid_argument("target i-MEM slot width must be non-zero");
+        if (rawMem) {
+            if (program.hardware.icu_macro_encoding_version !=
+                kMemMacroBitstreamVersion)
+                throw std::invalid_argument(
+                    "target does not support MEM Macro bitstream v1");
+            const auto image = encode_mem_macro_bitstream(queue);
+            const auto packed = pack_mem_macro_imem(image);
+            physical.mem_delta_rle = true;
+            physical.macro_codec = image.stats;
+            physical.payload_bits = image.stats.physical_bits();
+            physical.physical_slots = packed.word_count();
+            ++report.mem_delta_rle_queues;
+        } else if (rawMxm) {
+            if (program.hardware.icu_macro_encoding_version !=
+                kMxmMacroBitstreamVersion)
+                throw std::invalid_argument(
+                    "target does not support MXM Macro bitstream v1");
+            const auto image = encode_mxm_macro_bitstream(queue);
+            const auto packed = pack_mxm_macro_imem(image);
+            physical.mxm_delta_rle = true;
+            physical.macro_codec = image.stats;
+            physical.payload_bits = image.stats.physical_bits();
+            physical.physical_slots = packed.word_count();
+            ++report.mxm_delta_rle_queues;
+        } else {
+            for (const auto& command : queue.commands) {
+                const auto streamNd = is_mem_stream_nd_command(command)
+                    || is_mxm_stream_nd_command(command)
+                    || is_vxm_stream_nd_command(command)
+                    || is_sxm_tile_program_command(command);
+                const auto legacyFuMacro =
+                    is_macro_schedule_command(command)
+                    && (queue.kind == QueueKind::Mem
+                        || queue.kind == QueueKind::MxmLoad
+                        || queue.kind == QueueKind::MxmCompute
+                        || queue.kind == QueueKind::MxmDequant);
+                if (streamNd || legacyFuMacro) {
+                    if (streamNd) ++physical.stream_nd_packets;
+                    const auto packetWords =
+                        fu_3d_packet_words(queue.kind);
+                    checked_add(physical.physical_bits,
+                        static_cast<std::uint64_t>(packetWords)
+                            * physical.slot_bits);
+                    physical.physical_slots += packetWords;
+                } else {
+                    physical.physical_bits += physical.slot_bits;
+                    ++physical.physical_slots;
+                }
             }
         }
+        if (physical.mem_delta_rle || physical.mxm_delta_rle)
+            physical.physical_bits = static_cast<std::uint64_t>(physical.physical_slots) * physical.slot_bits;
         report.stream_nd_packets += physical.stream_nd_packets;
         checked_add(report.used_bits, physical.physical_bits);
         report.used_slots += physical.physical_slots;
@@ -703,7 +765,8 @@ PhysicalImemReport analyze_physical_imem(const BinaryProgram& program)
             static_cast<std::uint64_t>(physical.fu_3d_context_capacity)
                 * physical.fu_3d_context_bits);
         checked_add(report.active_queue_capacity_bits,
-            static_cast<std::uint64_t>(physical.depth) * physical.slot_bits);
+                    static_cast<std::uint64_t>(physical.depth) *
+                        physical.slot_bits);
         if (physical.macro_context_overflow())
             ++report.macro_context_overflow_queues;
         if (physical.fu_3d_context_overflow())

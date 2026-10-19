@@ -53,7 +53,7 @@ try {
     if (input.empty() || output.empty())
         throw std::runtime_error(
             "usage: ftlpu-translate --input command.mlir --output program.ftlpu "
-            "[--icu-compression none|control|macro] "
+            "[--icu-compression none|control|macro|raw-macro] "
             "[--mem-slice-program on|off] [--verify-icu-issues]");
 
     mlir::DialectRegistry registry;

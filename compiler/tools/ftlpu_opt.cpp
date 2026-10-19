@@ -155,7 +155,7 @@ Args parse_args(int argc, char** argv)
                                  "[--attention-schedule tail|fused] "
                                  "[--projection-rope-overlap on|off] "
                                  "[--mxm-execution auto|vector|native4|legacy] "
-                                 "[--icu-compression none|control|macro] "
+                                 "[--icu-compression none|control|macro|raw-macro] "
                                  "[--mem-slice-program on|off] "
                                  "[--weight-bank 0|1] "
                                  "[--kv-cache-capacity tokens] "
@@ -272,8 +272,8 @@ try {
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,
             !producesCommands && !producesDirectSchedule
-                && args.icu_compression
-                == ftlpu::compiler::target::IcuCompressionMode::Macro));
+                && (args.icu_compression == ftlpu::compiler::target::IcuCompressionMode::Macro
+                || args.icu_compression == ftlpu::compiler::target::IcuCompressionMode::RawMacro)));
 
     mlir::PassManager pass_manager(&context);
     const bool deferVerificationUntilCompressed =

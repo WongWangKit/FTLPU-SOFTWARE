@@ -352,6 +352,13 @@ if(MSVC)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    add_test(NAME macro_rectangle_folding_test
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/macro_rectangle_folding_test.py
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --inspect $<TARGET_FILE:ftlpu_binary_inspect>
+            --runtime-test $<TARGET_FILE:macro_bitstream_test>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/macro_rectangle_folding)
     # Keep the native compiler usable without the optional HF/XLA environment.
     execute_process(
         COMMAND ${Python3_EXECUTABLE} -c "import pytest, numpy"
