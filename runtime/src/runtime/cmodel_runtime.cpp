@@ -21,6 +21,18 @@
 namespace ftlpu::software::runtime {
 namespace {
 
+const char* macro_queue_kind_name(IcuMacroQueueKind kind)
+{
+    switch (kind) {
+    case IcuMacroQueueKind::Mem: return "mem";
+    case IcuMacroQueueKind::MxmLoad: return "mxm_load";
+    case IcuMacroQueueKind::MxmCompute: return "mxm_compute";
+    case IcuMacroQueueKind::MxmDequant: return "mxm_dequant";
+    }
+    return "unknown";
+}
+
+
 template <typename System>
 std::size_t stage_and_prime_icu_programs_if_supported(
     System& system, std::uint64_t imageBase)
@@ -424,13 +436,12 @@ void CModelRuntime::load(
     for (std::size_t block = 0; block < 8; ++block)
         system_.configure_vxm_output_block_destination(block,
             block < 4 ? Hemisphere::West : Hemisphere::East);
-    load_queue_programs_into_icu(program.queues, system_.icu(),
+    instruction_prefill_cycles_ = load_queue_programs_into_icu(program.queues, system_.icu(),
         program.hardware.mxms_per_hemisphere);
-    instruction_prefill_cycles_ = 0;
     if (c2c_system_ != nullptr) {
         constexpr auto kInstructionImageBase =
             std::uint64_t {0x1'0000'0000};
-        instruction_prefill_cycles_ =
+        instruction_prefill_cycles_ +=
             stage_and_prime_icu_programs_if_supported(
                 *c2c_system_, kInstructionImageBase);
     }
@@ -1743,6 +1754,179 @@ void CModelRuntime::run_cycles(std::size_t cycles, std::ostream* log)
                 << " physical_cycle=" << physical_cycles_
                 << ": " << ex.what();
         throw std::logic_error(message.str());
+    }
+}
+
+IcuFrontendStatistics CModelRuntime::icu_frontend_statistics() const noexcept
+{
+    return system_.icu().frontend_statistics();
+}
+
+std::vector<IcuMacroQueueFrontendStatistics>
+CModelRuntime::icu_macro_queue_frontend_statistics() const
+{
+    return system_.icu().macro_queue_frontend_statistics();
+}
+
+void CModelRuntime::print_icu_frontend_performance(std::ostream& os) const
+{
+    const auto statistics = icu_frontend_statistics();
+    os << "runtime perf resource=ICU.frontend"
+       << " imem_entries=" << statistics.imem_entries
+       << " fetched_entries=" << statistics.fetched_entries
+       << " issued_instructions=" << statistics.issued_instructions
+       << " macro_queues=" << statistics.macro_queues
+       << " peak_macro_contexts_per_queue="
+       << statistics.peak_macro_contexts_per_queue
+       << " decoded_macro_contexts="
+       << statistics.decoded_macro_contexts
+       << " macro_decoder_bit_wait_cycles="
+       << statistics.macro_decoder_bit_wait_cycles
+       << " macro_decoder_context_stall_cycles="
+       << statistics.macro_decoder_context_stall_cycles
+       << " peak_macro_reservoir_bits="
+       << statistics.peak_macro_reservoir_bits
+       << " macro_frontend_cycles="
+       << statistics.macro_frontend_cycles
+       << " macro_fetched_words="
+       << statistics.macro_fetched_words
+       << " macro_payload_bits_consumed="
+       << statistics.macro_payload_bits_consumed
+       << " macro_reservoir_empty_cycles="
+       << statistics.macro_reservoir_empty_cycles
+       << " macro_reservoir_full_cycles="
+       << statistics.macro_reservoir_full_cycles
+       << " macro_reservoir_occupancy_bit_samples="
+       << statistics.macro_reservoir_occupancy_bit_samples
+       << " macro_descriptor_count="
+       << statistics.macro_descriptor_count
+       << " macro_mem_descriptor_count="
+       << statistics.macro_mem_descriptor_count
+       << " macro_mxm_descriptor_count="
+       << statistics.macro_mxm_descriptor_count
+       << " macro_descriptor_decode_cycles="
+       << statistics.macro_descriptor_decode_cycles
+       << " macro_max_descriptor_decode_cycles="
+       << statistics.macro_max_descriptor_decode_cycles
+       << " macro_decoder_active_cycles="
+       << statistics.macro_decoder_active_cycles
+       << " macro_decoder_starvation_cycles="
+       << statistics.macro_decoder_starvation_cycles
+       << " macro_decoder_ddb_stall_cycles="
+       << statistics.macro_decoder_ddb_stall_cycles
+       << " macro_ddb_entries=" << statistics.macro_ddb_entries
+       << " peak_macro_ddb_occupancy="
+       << statistics.peak_macro_ddb_occupancy
+       << " macro_ddb_full_cycles="
+       << statistics.macro_ddb_full_cycles
+       << " macro_ddb_residency_cycles="
+       << statistics.macro_ddb_residency_cycles
+       << " macro_ddb_occupancy_samples="
+       << statistics.macro_ddb_occupancy_samples
+       << " macro_max_ddb_residency_cycles="
+       << statistics.macro_max_ddb_residency_cycles
+       << " macro_contexts_generated="
+       << statistics.macro_contexts_generated
+       << " macro_timing_window_block_cycles="
+       << statistics.macro_timing_window_block_cycles
+       << " macro_active_ram_full_cycles="
+       << statistics.macro_active_ram_full_cycles
+       << " macro_capacity_feasible_wait_cycles="
+       << statistics.macro_capacity_feasible_wait_cycles
+       << " macro_admission_count="
+       << statistics.macro_admission_count
+       << " macro_admission_stall_cycles="
+       << statistics.macro_admission_stall_cycles
+       << " macro_admission_to_start_cycles="
+       << statistics.macro_admission_to_start_cycles
+       << " macro_max_admission_to_start_cycles="
+       << statistics.macro_max_admission_to_start_cycles
+       << " macro_active_occupancy_samples="
+       << statistics.macro_active_occupancy_samples
+       << " macro_context_active_lifetime_cycles="
+       << statistics.macro_context_active_lifetime_cycles
+       << " macro_max_context_active_lifetime_cycles="
+       << statistics.macro_max_context_active_lifetime_cycles
+       << " instruction_prefill_cycles="
+       << instruction_prefill_cycles_ << '\n';
+
+    for (const auto& queue : icu_macro_queue_frontend_statistics()) {
+        const auto& decoder = queue.decoder;
+        os << "runtime perf resource=ICU.macro_frontend.queue"
+           << " queue_kind=" << macro_queue_kind_name(queue.kind)
+           << " queue_index=" << queue.queue_index
+           << " imem_entries=" << queue.imem_entries
+           << " fetched_entries=" << queue.fetched_entries
+           << " issued_instructions=" << queue.issued_instructions
+           << " peak_active_contexts=" << queue.peak_active_contexts
+           << " active_context_capacity=" << queue.active_context_capacity
+           << " active_context_bits=" << queue.active_context_bits
+           << " instruction_bits=" << queue.instruction_bits
+           << " imem_read_latency=" << queue.imem_read_latency
+           << " imem_request_ii="
+           << queue.imem_request_initiation_interval
+           << " reservoir_words=" << queue.reservoir_words
+           << " decode_window_bits=" << queue.decode_window_bits
+           << " ddb_depth=" << queue.ddb_depth
+           << " ddb_run_capacity=" << queue.ddb_run_capacity
+           << " ddb_entry_bits=" << queue.ddb_entry_bits
+           << " admission_lookahead=" << queue.admission_lookahead
+           << " context_expand_width=" << queue.context_expand_width
+           << " frontend_cycles=" << decoder.cycles
+           << " fetched_words=" << decoder.fetched_words
+           << " decoded_contexts=" << decoder.decoded_contexts
+           << " bit_wait_cycles=" << decoder.bit_wait_cycles
+           << " context_stall_cycles=" << decoder.context_stall_cycles
+           << " payload_bits_consumed="
+           << decoder.payload_bits_consumed
+           << " reservoir_empty_cycles="
+           << decoder.reservoir_empty_cycles
+           << " reservoir_full_cycles="
+           << decoder.reservoir_full_cycles
+           << " reservoir_occupancy_bit_samples="
+           << decoder.reservoir_occupancy_bit_samples
+           << " peak_reservoir_bits=" << decoder.peak_reservoir_bits
+           << " decoder_active_cycles=" << decoder.decoder_active_cycles
+           << " decoder_starvation_cycles="
+           << decoder.decoder_starvation_cycles
+           << " descriptor_count=" << decoder.descriptor_count
+           << " descriptor_decode_cycles="
+           << decoder.descriptor_decode_cycles
+           << " max_descriptor_decode_cycles="
+           << decoder.max_descriptor_decode_cycles
+           << " decoder_ddb_stall_cycles="
+           << decoder.decoder_ddb_stall_cycles
+           << " ddb_entries=" << decoder.ddb_entries_committed
+           << " ddb_full_cycles=" << decoder.ddb_full_cycles
+           << " ddb_occupancy_samples="
+           << decoder.ddb_occupancy_samples
+           << " peak_ddb_occupancy=" << decoder.peak_ddb_occupancy
+           << " ddb_residency_cycles=" << decoder.ddb_residency_cycles
+           << " max_ddb_residency_cycles="
+           << decoder.max_ddb_residency_cycles
+           << " contexts_generated=" << decoder.contexts_generated
+           << " timing_window_block_cycles="
+           << decoder.timing_window_block_cycles
+           << " active_ram_full_cycles="
+           << decoder.active_ram_full_cycles
+           << " capacity_feasible_wait_cycles="
+           << decoder.capacity_feasible_wait_cycles
+           << " admission_count=" << decoder.admission_count
+           << " admission_stall_cycles="
+           << decoder.admission_stall_cycles
+           << " admission_to_start_cycles="
+           << decoder.admission_to_start_cycles
+           << " max_admission_to_start_cycles="
+           << decoder.max_admission_to_start_cycles
+           << " active_occupancy_samples="
+           << decoder.active_occupancy_samples
+           << " peak_active_occupancy="
+           << decoder.peak_active_occupancy
+           << " context_active_lifetime_cycles="
+           << decoder.context_active_lifetime_cycles
+           << " max_context_active_lifetime_cycles="
+           << decoder.max_context_active_lifetime_cycles
+           << '\n';
     }
 }
 

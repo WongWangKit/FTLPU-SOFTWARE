@@ -112,6 +112,9 @@ A/B cycle 测量游标。使用说明见
 
 ## 构建
 
+可选的 raw Macro 物理前端、参数扫描及其与现有 compact/FU3D 路径的关系见
+[Macro frontend 接入说明](docs/macro_frontend_physical_model.zh-CN.md)。
+
 CMake 默认假设 `FTLPU-CMODEL` 与本仓库位于同一父目录：
 
 ```powershell

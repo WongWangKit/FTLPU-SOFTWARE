@@ -50,17 +50,23 @@ struct CmodelAbstractImemReport {
     bool fits() const { return overflow_queues == 0; }
 };
 
-CmodelAbstractImemReport analyze_cmodel_abstract_imem(
-    const BinaryProgram& program);
+CmodelAbstractImemReport
+analyze_cmodel_abstract_imem(const BinaryProgram& program);
 
 // Target-facing storage estimate. MEM/MXM Macro and STREAM_ND commands are
 // lowered into FU-specific 3-D packets and occupy that packet's word count in
 // local physical i-MEM.
+// All-Macro MEM/MXM queues instead use fixed-width raw packed images.
 struct PhysicalImemQueue : CmodelAbstractImemQueue {
+    // Meaningful queue payload, excluding the word-0 control word and final
+    // physical-word padding.
+    std::uint64_t payload_bits{0};
+    // Allocated physical storage, including word 0 and word padding.
     std::uint64_t physical_bits{0};
     std::size_t physical_slots{0};
     bool mem_delta_rle{false};
     std::size_t stream_nd_packets{0};
+    bool mxm_delta_rle{false};
     MemMacroBitstreamStats macro_codec{};
     std::size_t peak_macro_contexts{0};
     std::size_t macro_context_capacity{0};
@@ -99,6 +105,7 @@ struct PhysicalImemReport {
     std::size_t fu_3d_context_overflow_queues{0};
     std::size_t mem_delta_rle_queues{0};
     std::size_t stream_nd_packets{0};
+    std::size_t mxm_delta_rle_queues{0};
     std::uint64_t peak_macro_context_bits{0};
     std::uint64_t provisioned_macro_context_bits{0};
     std::uint64_t peak_fu_3d_context_bits{0};

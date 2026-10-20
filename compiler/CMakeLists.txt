@@ -191,13 +191,14 @@ set(FTLPU_TARGET_MODEL_CONSUMER_SOURCES
     tools/ftlpu_opt.cpp
     tools/ftlpu_translate.cpp
     tools/ftlpu_compile.cpp
+    tools/ftlpu_graph_compile.cpp
     tests/attention_projection_planner_test.cpp
     tests/attention_target_layout_test.cpp
     tests/attention_work_planner_test.cpp
     tests/physical_memory_allocator_test.cpp)
 set_source_files_properties(${FTLPU_TARGET_MODEL_CONSUMER_SOURCES}
     PROPERTIES OBJECT_DEPENDS
-        "${FTLPU_GENERATED_HARDWARE_CONFIG};${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${CMAKE_SOURCE_DIR}/runtime/include/ftlpu/software/runtime/target_abi.hpp")
+        "${FTLPU_GENERATED_HARDWARE_CONFIG};${FTLPU_CMODEL_DIR}/include/ftlpu/core/hardware_params.hpp;${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${CMAKE_SOURCE_DIR}/runtime/include/ftlpu/software/runtime/target_abi.hpp")
 set(FTLPU_ATTENTION_EMITTER_CONSUMER_SOURCES
     src/Dialect/Schedule/Transforms/AttentionEmitterUtils.cpp
     src/Dialect/Schedule/Transforms/AttentionProjectionEmitter.cpp
@@ -357,6 +358,13 @@ if(MSVC)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    add_test(NAME macro_rectangle_folding_test
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/macro_rectangle_folding_test.py
+            --translate $<TARGET_FILE:ftlpu_translate>
+            --inspect $<TARGET_FILE:ftlpu_binary_inspect>
+            --runtime-test $<TARGET_FILE:macro_bitstream_test>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/macro_rectangle_folding)
     # Keep the native compiler usable without the optional HF/XLA environment.
     execute_process(
         COMMAND ${Python3_EXECUTABLE} -c "import pytest, numpy"

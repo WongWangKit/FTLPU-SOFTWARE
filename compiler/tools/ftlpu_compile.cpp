@@ -170,7 +170,7 @@ Args parse_args(int argc, char** argv)
             "[--target-config target.json] [--weight-bank 0|1] "
             "[--kv-cache-capacity tokens] "
             "[--mxm-execution auto|vector|native4|legacy] "
-            "[--icu-compression none|control|macro] "
+            "[--icu-compression none|control|macro|raw-macro] "
             "[--mem-slice-program on|off] "
             "[--verify-icu-issues] "
             "[--direct-ffn-up-3d (standalone, SRAM-preloaded)] "
@@ -293,8 +293,8 @@ try {
     // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,
-            effectiveCompression
-                == ftlpu::compiler::target::IcuCompressionMode::Macro));
+            effectiveCompression == ftlpu::compiler::target::IcuCompressionMode::Macro
+                || effectiveCompression == ftlpu::compiler::target::IcuCompressionMode::RawMacro));
     (*module)->setAttr("ftlpu.command_lowering",
         mlir::StringAttr::get(&context,
             directLowering ? "direct" : "legacy"));

@@ -1,140 +1,924 @@
-#include "ftlpu/software/runtime/macro_bitstream.hpp"
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/icu_program.hpp"
+#include "ftlpu/software/runtime/imem_capacity.hpp"
+#include "ftlpu/software/runtime/macro_bitstream.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <span>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace rt = ftlpu::software::runtime;
 
 namespace {
 
 rt::QueueCommand macro(ftlpu::MemInstruction instruction,
-    const ftlpu::IcuMacroSchedule& schedule)
+                       const ftlpu::IcuMacroSchedule& schedule)
 {
     const auto encoded = ftlpu::isa::encode_mem_instruction(instruction);
-    rt::QueueCommand command {
+    rt::QueueCommand command{
         static_cast<ftlpu::isa::EncodedIcuCommand>(
             ftlpu::isa::IcuCommandOpcode::Instruction),
         rt::InstructionKind::Mem,
         static_cast<std::uint16_t>((encoded >> 32) == 0 ? 1 : 2),
         {static_cast<std::uint32_t>(encoded),
-            static_cast<std::uint32_t>(encoded >> 32), 0, 0},
+         static_cast<std::uint32_t>(encoded >> 32), 0, 0},
+    };
+    return rt::encode_macro_schedule_command(std::move(command), schedule);
+}
+
+rt::QueueCommand macro(ftlpu::MxmControlInstruction instruction,
+                       const ftlpu::IcuMacroSchedule& schedule)
+{
+    const auto encoded = ftlpu::isa::encode_mxm_instruction(instruction);
+    rt::QueueCommand command{
+        static_cast<ftlpu::isa::EncodedIcuCommand>(
+            ftlpu::isa::IcuCommandOpcode::Instruction),
+        rt::InstructionKind::Mxm,
+        static_cast<std::uint16_t>((encoded >> 32) == 0 ? 1 : 2),
+        {static_cast<std::uint32_t>(encoded),
+         static_cast<std::uint32_t>(encoded >> 32), 0, 0},
+    };
+    return rt::encode_macro_schedule_command(std::move(command), schedule);
+}
+
+rt::QueueCommand macro(ftlpu::MxmDequantInstruction instruction,
+                       const ftlpu::IcuMacroSchedule& schedule)
+{
+    rt::QueueCommand command{
+        static_cast<ftlpu::isa::EncodedIcuCommand>(
+            ftlpu::isa::IcuCommandOpcode::Instruction),
+        rt::InstructionKind::MxmDequant,
+        1,
+        {ftlpu::isa::encode_mxm_dequant_instruction(instruction), 0, 0, 0},
     };
     return rt::encode_macro_schedule_command(std::move(command), schedule);
 }
 
 void expect(bool value, const char* message)
 {
-    if (!value) throw std::runtime_error(message);
+    if (!value)
+        throw std::runtime_error(message);
 }
 
-void compare(const rt::QueueCommand& expected, const rt::QueueCommand& actual)
+template <typename RawWord>
+std::vector<RawWord> raw_words(const rt::PackedMacroImemImage& image)
+{
+    expect(image.word_bits == RawWord::bit_count,
+           "packed image has the wrong raw i-MEM width");
+    const auto wordBytes = RawWord::bit_count / 8;
+    expect(image.bytes.size() % wordBytes == 0,
+           "packed image is not raw-word aligned");
+    std::vector<RawWord> result(image.bytes.size() / wordBytes);
+    for (std::size_t address = 0; address < result.size(); ++address) {
+        for (std::size_t lane = 0; lane < RawWord::lane_count; ++lane) {
+            const auto offset = address * wordBytes
+                + lane * sizeof(std::uint32_t);
+            result[address].lanes[lane] =
+                static_cast<std::uint32_t>(image.bytes[offset])
+                | (static_cast<std::uint32_t>(image.bytes[offset + 1]) << 8)
+                | (static_cast<std::uint32_t>(image.bytes[offset + 2]) << 16)
+                | (static_cast<std::uint32_t>(image.bytes[offset + 3]) << 24);
+        }
+    }
+    return result;
+}
+
+template <typename Fn>
+void expect_throw(Fn&& function, const char* message)
+{
+    try {
+        function();
+    } catch (const std::exception&) {
+        return;
+    }
+    throw std::runtime_error(message);
+}
+
+void compare_schedule(const rt::QueueCommand& expected,
+                      const rt::QueueCommand& actual)
 {
     const auto expectedSchedule = rt::decode_macro_schedule_command(expected);
     const auto actualSchedule = rt::decode_macro_schedule_command(actual);
     expect(expectedSchedule.start_cycle == actualSchedule.start_cycle,
-        "start cycle changed");
+           "start cycle changed");
     expect(expectedSchedule.inner_count == actualSchedule.inner_count,
-        "inner count changed");
+           "inner count changed");
     expect(expectedSchedule.outer_count == actualSchedule.outer_count,
-        "outer count changed");
+           "outer count changed");
     if (expectedSchedule.inner_count != 1) {
         expect(expectedSchedule.inner_interval == actualSchedule.inner_interval,
-            "inner interval changed");
+               "inner interval changed");
         expect(expectedSchedule.inner_stride == actualSchedule.inner_stride,
-            "inner stride changed");
+               "inner stride changed");
     }
     if (expectedSchedule.outer_count != 1) {
         expect(expectedSchedule.outer_interval == actualSchedule.outer_interval,
-            "outer interval changed");
+               "outer interval changed");
         expect(expectedSchedule.outer_stride == actualSchedule.outer_stride,
-            "outer stride changed");
+               "outer stride changed");
     }
     expect(expectedSchedule.induction_target == actualSchedule.induction_target,
-        "induction target changed");
+           "induction target changed");
+}
+
+void compare(const rt::QueueCommand& expected, const rt::QueueCommand& actual)
+{
+    compare_schedule(expected, actual);
     const auto expectedInstruction = ftlpu::isa::decode_mem_instruction(
-        expected.words[0] | (static_cast<std::uint64_t>(expected.words[1]) << 32));
+        expected.words[0] |
+        (static_cast<std::uint64_t>(expected.words[1]) << 32));
     const auto actualInstruction = ftlpu::isa::decode_mem_instruction(
         actual.words[0] | (static_cast<std::uint64_t>(actual.words[1]) << 32));
     expect(expectedInstruction.opcode == actualInstruction.opcode,
-        "MEM opcode changed");
+           "MEM opcode changed");
     expect(expectedInstruction.address == actualInstruction.address,
-        "MEM address changed");
+           "MEM address changed");
     expect(expectedInstruction.stream == actualInstruction.stream,
-        "MEM stream changed");
-    expect(expectedInstruction.preserve_stream == actualInstruction.preserve_stream,
-        "MEM preserve-stream changed");
+           "MEM stream changed");
+    expect(expectedInstruction.preserve_stream ==
+               actualInstruction.preserve_stream,
+           "MEM preserve-stream changed");
+}
+
+void compare_mxm(const rt::QueueCommand& expected,
+                  const rt::QueueCommand& actual)
+{
+    compare_schedule(expected, actual);
+    expect(expected.instruction_kind == actual.instruction_kind,
+           "MXM instruction kind changed");
+    expect(expected.word_count == actual.word_count,
+           "MXM instruction width changed");
+    expect(expected.words[0] == actual.words[0] &&
+               expected.words[1] == actual.words[1],
+           "MXM native instruction changed");
+}
+
+std::string serialize(const rt::BinaryProgram& program)
+{
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    rt::write_binary_program(program, stream);
+    return stream.str();
+}
+
+std::span<const std::uint8_t> bytes(const std::string& storage)
+{
+    return {reinterpret_cast<const std::uint8_t*>(storage.data()),
+            storage.size()};
+}
+
+std::uint32_t low_u32(const std::vector<std::uint8_t>& storage)
+{
+    expect(storage.size() >= 4, "physical i-MEM image has no control word");
+    return static_cast<std::uint32_t>(storage[0]) |
+           (static_cast<std::uint32_t>(storage[1]) << 8) |
+           (static_cast<std::uint32_t>(storage[2]) << 16) |
+           (static_cast<std::uint32_t>(storage[3]) << 24);
+}
+
+std::uint64_t packed_bits(const std::vector<std::uint8_t>& storage,
+                          std::uint64_t offset,
+                          unsigned width)
+{
+    std::uint64_t result = 0;
+    for (unsigned bit = 0; bit < width; ++bit) {
+        const auto position = offset + bit;
+        expect(position < storage.size() * 8,
+               "physical i-MEM bit read is out of range");
+        result |= static_cast<std::uint64_t>(
+                      (storage[position / 8] >> (position & 7u)) & 1u)
+                  << bit;
+    }
+    return result;
+}
+
+struct CmodelMemRun {
+    ftlpu::IcuFrontendStatistics frontend{};
+    std::vector<std::pair<std::size_t, ftlpu::isa::EncodedMemInstruction>>
+        issues;
+};
+
+CmodelMemRun run_compiled_mem_program(const rt::BinaryProgram& program)
+{
+    const rt::QueueProgram* memQueue = nullptr;
+    for (const auto& queue : program.queues) {
+        if (queue.commands.empty())
+            continue;
+        expect(queue.kind == rt::QueueKind::Mem && memQueue == nullptr,
+               "Macro CModel A/B fixture must contain one MEM queue");
+        memQueue = &queue;
+    }
+    expect(memQueue != nullptr, "Macro CModel A/B fixture has no MEM queue");
+
+    ftlpu::InstructionControlUnit icu;
+    rt::load_queue_programs_into_icu(program.queues, icu,
+                                     program.hardware.mxms_per_hemisphere);
+    CmodelMemRun result;
+    auto& queue = icu.mem_iq(memQueue->index);
+    for (std::size_t cycle = 0; cycle <= program.max_cycle + 64; ++cycle) {
+        if (const auto issued = queue.tick())
+            result.issues.emplace_back(
+                cycle, ftlpu::isa::encode_mem_instruction(*issued));
+        if (queue.done())
+            break;
+    }
+    expect(queue.done(), "Macro CModel A/B queue did not complete");
+    result.frontend = icu.frontend_statistics();
+    return result;
 }
 
 } // namespace
 
 int main(int argc, char** argv)
 try {
-    rt::QueueProgram queue {rt::QueueKind::Mem, 3, {}};
-    queue.commands.push_back(macro(ftlpu::MemInstruction::Read(100, 2),
-        {10, 1, 1, 0, 4, 7, 3, ftlpu::IcuInductionTarget::MemAddress}));
-    queue.commands.push_back(macro(ftlpu::MemInstruction::Read(112, 2),
-        {42, 1, 1, 0, 4, 7, 3, ftlpu::IcuInductionTarget::MemAddress}));
-    queue.commands.push_back(macro(ftlpu::MemInstruction::Read(124, 2),
-        {74, 1, 1, 0, 4, 7, 3, ftlpu::IcuInductionTarget::MemAddress}));
-    queue.commands.push_back(macro(ftlpu::MemInstruction::WriteTap(88, 5),
+    if (argc > 3)
+        throw std::runtime_error("usage: macro_bitstream_test [program.ftlpu | "
+                                 "none.ftlpu macro.ftlpu]");
+    rt::QueueProgram queue{rt::QueueKind::Mem, 3, {}};
+    queue.commands.push_back(
+        macro(ftlpu::MemInstruction::Read(100, 2),
+              {10, 1, 1, 0, 4, 7, 3, ftlpu::IcuInductionTarget::MemAddress}));
+    queue.commands.push_back(
+        macro(ftlpu::MemInstruction::Read(112, 2),
+              {42, 1, 1, 0, 4, 7, 3, ftlpu::IcuInductionTarget::MemAddress}));
+    queue.commands.push_back(
+        macro(ftlpu::MemInstruction::Read(124, 2),
+              {74, 1, 1, 0, 4, 7, 3, ftlpu::IcuInductionTarget::MemAddress}));
+    queue.commands.push_back(macro(
+        ftlpu::MemInstruction::WriteTap(88, 5),
         {106, 8, 2, -1, 3, 23, 4, ftlpu::IcuInductionTarget::MemAddress}));
     // Forces both the wide delta escape and the extended template path.
-    queue.commands.push_back(macro(ftlpu::MemInstruction::Write(90, 6),
-        {5000000, 4097, 3, 2, 1, 1, 0,
-            ftlpu::IcuInductionTarget::MemAddress}));
+    queue.commands.push_back(macro(
+        ftlpu::MemInstruction::Write(90, 6),
+        {5000000, 4097, 3, 0, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}));
 
     const auto image = rt::encode_mem_macro_bitstream(queue);
     const auto decoded = rt::decode_mem_macro_bitstream(image, queue.index);
     expect(decoded.commands.size() == queue.commands.size(),
-        "command count changed");
+           "command count changed");
     for (std::size_t i = 0; i < queue.commands.size(); ++i)
         compare(queue.commands[i], decoded.commands[i]);
+    expect(image.stats.compact_template_runs != 0,
+           "compact template was not exercised");
+    expect(image.stats.extended_template_runs != 0,
+           "extended template was not exercised");
+    expect(image.stats.wide_escaped_transitions != 0,
+           "wide delta escape was not exercised");
+
+    rt::QueueProgram oversizedContext{rt::QueueKind::Mem, 0, {}};
+    oversizedContext.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(0, 0),
+        {0, 65537, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    expect_throw(
+        [&]() { (void)rt::encode_mem_macro_bitstream(oversizedContext); },
+        "bitstream encoder accepted a count outside the Active Context");
+
+    rt::QueueProgram invalidOperandContext{rt::QueueKind::Mem, 0, {}};
+    invalidOperandContext.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(0, 0),
+        {0, 2, 1, -1, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    expect_throw(
+        [&]() { (void)rt::encode_mem_macro_bitstream(
+                    invalidOperandContext); },
+        "bitstream encoder accepted an out-of-range Active Context operand");
+
     rt::QueueProgram topAddressQueue{rt::QueueKind::Mem, 0, {}};
     topAddressQueue.commands.push_back(macro(
         ftlpu::MemInstruction::Read(ftlpu::hw::kSramDepthRows - 1, 0),
-        {0, 1, 1, 0, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}));
-    const auto topAddressImage = rt::encode_mem_macro_bitstream(topAddressQueue);
+        {0, 1, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    const auto topAddressImage =
+        rt::encode_mem_macro_bitstream(topAddressQueue);
     const auto topAddressDecoded = rt::decode_mem_macro_bitstream(
         topAddressImage, topAddressQueue.index);
-    compare(topAddressQueue.commands.front(), topAddressDecoded.commands.front());
-    expect(image.stats.compact_template_runs != 0,
-        "compact template was not exercised");
-    expect(image.stats.extended_template_runs != 0,
-        "extended template was not exercised");
-    expect(image.stats.wide_escaped_transitions != 0,
-        "wide delta escape was not exercised");
+    compare(topAddressQueue.commands.front(),
+            topAddressDecoded.commands.front());
+
+    const auto packedMem = rt::pack_mem_macro_imem(image);
+    const auto memControl =
+        rt::decode_icu_queue_control(low_u32(packedMem.bytes));
+    expect(memControl.valid && memControl.enable,
+           "MEM physical control word did not enable a valid queue");
+    expect(memControl.mode == rt::IcuQueueMode::Macro,
+           "MEM physical control word did not select Macro mode");
+    expect(memControl.command_count == queue.commands.size(),
+           "MEM physical control word has the wrong command count");
+    expect(packedMem.word_bits == rt::kMemIcuImemWordBits,
+           "MEM physical image has the wrong word width");
+    expect(packedMem.software_valid_bit_length ==
+               rt::kMemIcuImemWordBits + image.stats.physical_bits(),
+           "MEM software valid bit length changed");
+    expect(packedMem.word_count() ==
+               1 + (image.stats.physical_bits() +
+                    rt::kMemIcuImemWordBits - 1) /
+                       rt::kMemIcuImemWordBits,
+           "MEM physical image did not reserve word 0");
+    expect(packed_bits(packedMem.bytes, rt::kMemIcuImemWordBits, 3) ==
+               image.delta_count,
+           "MEM dictionary count is not the first payload field");
+    const auto decodedPackedMem =
+        rt::decode_mem_macro_imem(packedMem, queue.index);
+    expect(decodedPackedMem.commands.size() == queue.commands.size(),
+           "MEM physical i-MEM command count changed");
+    for (std::size_t i = 0; i < queue.commands.size(); ++i)
+        compare(queue.commands[i], decodedPackedMem.commands[i]);
+
+    expect_throw(
+        []() {
+            (void)rt::encode_icu_queue_control(
+                {true,
+                 true,
+                 rt::IcuQueueMode::Macro,
+                 rt::kIcuQueueControlMaxCommandCount + 1});
+        },
+        "oversized physical command count was accepted");
+    auto invalidPackedMem = rt::pack_mem_macro_imem(image, true, false);
+    expect_throw(
+        [&]() { (void)rt::decode_mem_macro_imem(invalidPackedMem, queue.index); },
+        "invalid MEM physical queue was decoded");
+
+    std::vector<rt::QueueProgram> mxmQueues;
+    mxmQueues.push_back(
+        {rt::QueueKind::MxmLoad,
+         0,
+         {
+             macro(ftlpu::MxmControlInstruction::IW(0, 0),
+                   {10, 4, 2, 1, 2, 11, 0,
+                    ftlpu::IcuInductionTarget::MxmWeightColumn}),
+             macro(ftlpu::MxmControlInstruction::IW(0, 0),
+                   {42, 4, 2, 1, 2, 11, 0,
+                    ftlpu::IcuInductionTarget::MxmWeightColumn}),
+         }});
+    mxmQueues.push_back(
+        {rt::QueueKind::MxmCompute,
+         0,
+         {
+             macro(ftlpu::MxmControlInstruction::Compute(0, 0, 0, 16),
+                   {20, 8, 3, 1, 4, 29, 16,
+                    ftlpu::IcuInductionTarget::MxmAccumulatorAddress}),
+             macro(ftlpu::MxmControlInstruction::Compute(0, 0, 0, 32),
+                   {200, 8, 3, 1, 4, 29, 16,
+                    ftlpu::IcuInductionTarget::MxmAccumulatorAddress}),
+             macro(ftlpu::MxmControlInstruction::AccumulatorRead(24, 4),
+                   {5000000, 4097, 3, 0, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::MxmAccumulatorAddress}),
+         }});
+    mxmQueues.push_back(
+        {rt::QueueKind::MxmDequant,
+         0,
+         {
+             macro(ftlpu::MxmDequantInstruction::ScaleBits(0x3f80),
+                   {5, 16, 2, 0, 1, 1, 0, ftlpu::IcuInductionTarget::None}),
+              macro(ftlpu::MxmDequantInstruction::ScaleBits(0x3f80),
+                    {69, 16, 2, 0, 1, 1, 0, ftlpu::IcuInductionTarget::None}),
+          }});
+    mxmQueues.push_back(
+        {rt::QueueKind::MxmLoad,
+         1,
+         {
+             macro(ftlpu::MxmControlInstruction::DecodeLoadActivation(
+                       0, 0, ftlpu::MxmDataFormat::BFloat16,
+                       ftlpu::MxmDecodeLayout::Native4x4),
+                   {12, 3, 5, 0, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::None}),
+             macro(ftlpu::MxmControlInstruction::DecodeLoadActivation(
+                       1, 8, ftlpu::MxmDataFormat::BFloat16,
+                       ftlpu::MxmDecodeLayout::Linear1x16),
+                   {64, 1, 1, 0, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::None}),
+         }});
+    mxmQueues.push_back(
+        {rt::QueueKind::MxmCompute,
+         1,
+         {
+             macro(ftlpu::MxmControlInstruction::DecodeStreamCompute(
+                       0, 0, ftlpu::MxmDataFormat::BFloat16, 16, 0,
+                       ftlpu::MxmAccumulatorDestination::Sram, false,
+                       ftlpu::MxmDecodeLayout::Native4x4),
+                   {24, 4, 7, 1, 2, 31, 16,
+                    ftlpu::IcuInductionTarget::MxmAccumulatorAddress}),
+             macro(ftlpu::MxmControlInstruction::DecodeStreamCompute(
+                       1, 4, ftlpu::MxmDataFormat::BFloat16, 48, 1,
+                       ftlpu::MxmAccumulatorDestination::Stream, true,
+                       ftlpu::MxmDecodeLayout::Linear1x16),
+                   {96, 1, 1, 0, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::None}),
+         }});
+    bool sawMxmCompact = false;
+    bool sawMxmExtended = false;
+    bool sawMxmWideDelta = false;
+    for (const auto& mxmQueue : mxmQueues) {
+        const auto encoded = rt::encode_mxm_macro_bitstream(mxmQueue);
+        sawMxmCompact |= encoded.stats.compact_template_runs != 0;
+        sawMxmExtended |= encoded.stats.extended_template_runs != 0;
+        sawMxmWideDelta |= encoded.stats.wide_escaped_transitions != 0;
+        const auto restored =
+            rt::decode_mxm_macro_bitstream(encoded, mxmQueue.index);
+        expect(restored.kind == mxmQueue.kind, "MXM queue kind changed");
+        expect(restored.commands.size() == mxmQueue.commands.size(),
+               "MXM command count changed");
+        for (std::size_t i = 0; i < mxmQueue.commands.size(); ++i)
+            compare_mxm(mxmQueue.commands[i], restored.commands[i]);
+
+        const auto packed = rt::pack_mxm_macro_imem(encoded);
+        const auto control =
+            rt::decode_icu_queue_control(low_u32(packed.bytes));
+        expect(control.valid && control.enable &&
+                   control.mode == rt::IcuQueueMode::Macro,
+               "MXM physical control word is invalid");
+        expect(control.command_count == mxmQueue.commands.size(),
+               "MXM physical control word has the wrong command count");
+        expect(packed.word_bits == rt::kMxmIcuImemWordBits,
+               "MXM physical image has the wrong word width");
+        expect(packed.software_valid_bit_length ==
+                   rt::kMxmIcuImemWordBits + encoded.stats.physical_bits(),
+               "MXM software valid bit length changed");
+        expect(packed_bits(packed.bytes, rt::kMxmIcuImemWordBits, 3) ==
+                   encoded.delta_count,
+               "MXM dictionary count is not the first payload field");
+        const auto restoredPacked =
+            rt::decode_mxm_macro_imem(packed, mxmQueue.kind, mxmQueue.index);
+        expect(restoredPacked.commands.size() == mxmQueue.commands.size(),
+               "MXM physical i-MEM command count changed");
+        for (std::size_t i = 0; i < mxmQueue.commands.size(); ++i)
+            compare_mxm(mxmQueue.commands[i], restoredPacked.commands[i]);
+    }
+    expect(sawMxmCompact, "compact MXM template was not exercised");
+    expect(sawMxmExtended, "extended MXM template was not exercised");
+    expect(sawMxmWideDelta, "wide MXM delta escape was not exercised");
+
+    // Prove that all three MXM queue kinds use the packed container path, not
+    // only the in-memory reference codec or the legacy per-record envelope.
+    rt::BinaryProgram emptyProgram;
+    rt::BinaryProgram packedMxmProgram;
+    packedMxmProgram.queues = mxmQueues;
+    const auto emptyBinary = serialize(emptyProgram);
+    const auto packedMxmBinary = serialize(packedMxmProgram);
+    std::size_t expectedPackedQueueBytes = 0;
+    for (const auto& mxmQueue : mxmQueues) {
+        const auto encoded = rt::encode_mxm_macro_bitstream(mxmQueue);
+        expectedPackedQueueBytes += 9 + 10 + encoded.delta_count * 8 +
+                                    encoded.bytes.size();
+    }
+    expect(packedMxmBinary.size() - emptyBinary.size() ==
+               expectedPackedQueueBytes,
+           "MXM Macro queues were not serialized as packed images");
+    constexpr std::size_t kQueueModeOffset = 4;
+    expect(static_cast<std::uint8_t>(
+               packedMxmBinary[emptyBinary.size() + kQueueModeOffset]) == 3,
+           "MXM Macro queue did not select the packed container mode");
+
+    std::stringstream packedMxmStream(
+        packedMxmBinary, std::ios::in | std::ios::binary);
+    const auto restoredMxmStream = rt::read_binary_program(packedMxmStream);
+    const auto restoredMxmSpan = rt::read_binary_program(bytes(packedMxmBinary));
+    for (const auto* restored : {&restoredMxmStream, &restoredMxmSpan}) {
+        expect(restored->queues.size() == mxmQueues.size(),
+               "packed MXM binary queue count changed");
+        for (std::size_t queueIndex = 0; queueIndex < mxmQueues.size();
+             ++queueIndex) {
+            const auto& expectedQueue = mxmQueues[queueIndex];
+            const auto& actualQueue = restored->queues[queueIndex];
+            expect(actualQueue.kind == expectedQueue.kind,
+                   "packed MXM binary queue kind changed");
+            expect(actualQueue.commands.size() == expectedQueue.commands.size(),
+                   "packed MXM binary command count changed");
+            for (std::size_t commandIndex = 0;
+                 commandIndex < expectedQueue.commands.size(); ++commandIndex)
+                compare_mxm(expectedQueue.commands[commandIndex],
+                            actualQueue.commands[commandIndex]);
+        }
+    }
+    std::stringstream packedMxmMetadataStream(
+        packedMxmBinary, std::ios::in | std::ios::binary);
+    (void)rt::read_binary_program_metadata(packedMxmMetadataStream);
+    (void)rt::read_binary_program_metadata(bytes(packedMxmBinary));
+
+    auto unsupportedCodecBinary = packedMxmBinary;
+    constexpr std::size_t kPackedCodecVersionOffset = 9;
+    unsupportedCodecBinary[emptyBinary.size() + kPackedCodecVersionOffset] = 2;
+    expect_throw(
+        [&]() { (void)rt::read_binary_program(bytes(unsupportedCodecBinary)); },
+        "unsupported MXM Macro codec version was accepted");
+    auto truncatedMxmBinary = packedMxmBinary;
+    truncatedMxmBinary.pop_back();
+    expect_throw(
+        [&]() { (void)rt::read_binary_program(bytes(truncatedMxmBinary)); },
+        "truncated MXM Macro packed image was accepted");
+
+    // Exercise the complete binary -> runtime loader -> finite CModel Macro
+    // context path for both supported Macro v1 functional-unit families.
+    rt::BinaryProgram executionProgram;
+    executionProgram.max_cycle = 13;
+    executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::Mem,
+        0,
+        {
+            macro(ftlpu::MemInstruction::Read(100, 0),
+                  {2, 3, 4, 1, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}),
+            macro(ftlpu::MemInstruction::Read(200, 1),
+                  {3, 3, 4, 1, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}),
+        }});
+    executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::MxmLoad,
+        0,
+        {macro(ftlpu::MxmControlInstruction::IW(0, 1),
+               {4, 2, 3, 1, 1, 1, 0,
+                ftlpu::IcuInductionTarget::MxmWeightColumn})}});
+    executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::MxmCompute,
+        0,
+        {macro(ftlpu::MxmControlInstruction::Compute(0, 0, 0, 10),
+               {2, 2, 3, 1, 2, 8, 10,
+                ftlpu::IcuInductionTarget::MxmAccumulatorAddress})}});
+    executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::MxmDequant,
+        0,
+        {macro(ftlpu::MxmDequantInstruction::ScaleBits(0x3f80),
+               {1, 1, 1, 0, 1, 1, 0,
+                ftlpu::IcuInductionTarget::None})}});
+    executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::MxmLoad,
+        1,
+        {macro(ftlpu::MxmControlInstruction::DecodeLoadActivation(
+                   1, 4, ftlpu::MxmDataFormat::BFloat16,
+                   ftlpu::MxmDecodeLayout::Native4x4),
+               {3, 1, 1, 0, 1, 1, 0,
+                ftlpu::IcuInductionTarget::None})}});
+    executionProgram.queues.push_back(rt::QueueProgram{
+        rt::QueueKind::MxmCompute,
+        1,
+        {macro(ftlpu::MxmControlInstruction::DecodeStreamCompute(
+                   1, 2, ftlpu::MxmDataFormat::BFloat16, 40, 2,
+                   ftlpu::MxmAccumulatorDestination::Sram, false,
+                   ftlpu::MxmDecodeLayout::Native4x4),
+               {5, 2, 3, 4, 1, 1, 0,
+                ftlpu::IcuInductionTarget::MxmAccumulatorAddress})}});
+
+    std::stringstream binary(std::ios::in | std::ios::out | std::ios::binary);
+    rt::write_binary_program(executionProgram, binary);
+    binary.seekg(0);
+    const auto restoredProgram = rt::read_binary_program(binary);
+    for (const auto& restoredQueue : restoredProgram.queues) {
+        expect(restoredQueue.packed_macro_imem.has_value(),
+               "binary reader did not retain the packed Macro i-MEM image");
+        expect(restoredQueue.packed_macro_imem->word_bits ==
+                   (restoredQueue.kind == rt::QueueKind::Mem
+                        ? rt::kMemIcuImemWordBits
+                        : rt::kMxmIcuImemWordBits),
+               "retained Macro image has the wrong physical word width");
+        for (const auto& command : restoredQueue.commands) {
+            expect(rt::is_macro_schedule_command(command),
+                   "2-D Macro changed representation during binary round-trip");
+            expect(!rt::is_mem_stream_nd_command(command) &&
+                       !rt::is_mxm_stream_nd_command(command),
+                   "2-D Macro unexpectedly became STREAM_ND");
+        }
+    }
+
+    ftlpu::InstructionControlUnit icu;
+    const auto prefillCycles =
+        rt::load_queue_programs_into_icu(restoredProgram.queues, icu);
+    expect(prefillCycles != 0,
+           "runtime did not schedule the finite-bandwidth Macro decoder");
+    expect(icu.mem_iq(0).raw_macro_mode()
+               && icu.mxm_load_iq(0).raw_macro_mode()
+               && icu.mxm_compute_iq(0).raw_macro_mode()
+               && icu.mxm_dequant_iq(0).raw_macro_mode()
+               && icu.mxm_load_iq(1).raw_macro_mode()
+               && icu.mxm_compute_iq(1).raw_macro_mode(),
+           "runtime bypassed the CModel raw Macro frontend");
+    std::vector<std::pair<std::size_t, std::size_t>> memIssues;
+    std::vector<std::pair<std::size_t, std::size_t>> mxmLoadIssues;
+    std::vector<std::pair<std::size_t, std::size_t>> mxmIssues;
+    std::vector<std::pair<std::size_t, std::uint16_t>> dequantIssues;
+    std::vector<std::pair<std::size_t, ftlpu::MxmControlInstruction>>
+        decodeLoadIssues;
+    std::vector<std::pair<std::size_t, ftlpu::MxmControlInstruction>>
+        decodeComputeIssues;
+    for (std::size_t cycle = 0; cycle <= executionProgram.max_cycle; ++cycle) {
+        if (const auto issued = icu.mem_iq(0).tick())
+            memIssues.emplace_back(cycle, issued->address);
+        if (const auto issued = icu.mxm_load_iq(0).tick())
+            mxmLoadIssues.emplace_back(cycle, issued->weight_column);
+        if (const auto issued = icu.mxm_compute_iq(0).tick())
+            mxmIssues.emplace_back(cycle, issued->accumulator_address);
+        if (const auto issued = icu.mxm_dequant_iq(0).tick())
+            dequantIssues.emplace_back(cycle, issued->scale_bf16);
+        if (const auto issued = icu.mxm_load_iq(1).tick())
+            decodeLoadIssues.emplace_back(cycle, *issued);
+        if (const auto issued = icu.mxm_compute_iq(1).tick())
+            decodeComputeIssues.emplace_back(cycle, *issued);
+    }
+    expect(
+        memIssues ==
+            std::vector<std::pair<std::size_t, std::size_t>>{
+                {2, 100}, {3, 200}, {6, 101}, {7, 201}, {10, 102}, {11, 202}},
+        "runtime/CModel MEM Macro emitted incorrect cycles or addresses");
+    expect(mxmLoadIssues ==
+               std::vector<std::pair<std::size_t, std::size_t>>{
+                   {4, 1}, {7, 2}},
+           "runtime/CModel MXM-load Macro emitted incorrect cycles or columns");
+    expect(mxmIssues ==
+               std::vector<std::pair<std::size_t, std::size_t>>{
+                   {2, 10}, {5, 11}, {10, 20}, {13, 21}},
+           "runtime/CModel MXM Macro emitted incorrect cycles or accumulators");
+    expect(dequantIssues ==
+               std::vector<std::pair<std::size_t, std::uint16_t>>{
+                   {1, 0x3f80}},
+           "runtime/CModel dequant Macro emitted an incorrect scale");
+    expect(decodeLoadIssues.size() == 1
+               && decodeLoadIssues[0].first == 3
+               && decodeLoadIssues[0].second.opcode
+                   == ftlpu::MxmControlOpcode::Decode
+               && decodeLoadIssues[0].second.decode_operation
+                   == ftlpu::MxmDecodeOperation::LoadActivation
+               && decodeLoadIssues[0].second.weight_buffer == 1
+               && decodeLoadIssues[0].second.activation_stream_base == 4,
+           "runtime/CModel Decode.LoadActivation Macro was not preserved");
+    expect(decodeComputeIssues.size() == 2
+               && decodeComputeIssues[0].first == 5
+               && decodeComputeIssues[1].first == 8
+               && decodeComputeIssues[0].second.opcode
+                   == ftlpu::MxmControlOpcode::Decode
+               && decodeComputeIssues[0].second.decode_operation
+                   == ftlpu::MxmDecodeOperation::StreamCompute
+               && decodeComputeIssues[0].second.accumulator_address == 40
+               && decodeComputeIssues[1].second.accumulator_address == 44,
+           "runtime/CModel Decode.StreamCompute Macro induction changed");
+    expect(icu.mem_iq(0).peak_active_macros() == 2,
+           "runtime/CModel did not model interleaved finite Macro contexts");
+    expect(icu.mem_iq(0).macro_decoder_statistics().decoded_contexts == 2 &&
+               icu.mxm_load_iq(0)
+                       .macro_decoder_statistics()
+                       .decoded_contexts == 1 &&
+               icu.mxm_compute_iq(0)
+                       .macro_decoder_statistics()
+                       .decoded_contexts == 1 &&
+               icu.mxm_dequant_iq(0)
+                       .macro_decoder_statistics()
+                       .decoded_contexts == 1,
+           "CModel Macro decoder did not enqueue every physical context");
+    expect(icu.mem_iq(0).done() && icu.mxm_load_iq(0).done()
+               && icu.mxm_compute_iq(0).done()
+               && icu.mxm_dequant_iq(0).done()
+               && icu.mxm_load_iq(1).done()
+               && icu.mxm_compute_iq(1).done(),
+           "runtime/CModel Macro queues did not complete");
+
+    // A 32-record physical run exercises decode-ahead, finite DDB pressure,
+    // lazy one-context expansion, late admission, and Active RAM credits. The
+    // first contexts are four cycles apart while lookahead is eight cycles,
+    // so a one-entry Active RAM must backpressure admission without stalling
+    // or corrupting the parser state. Later unequal gaps also force compact
+    // escape deltas, keeping enough payload behind a full reservoir.
+    rt::QueueProgram lazyRun{rt::QueueKind::Mem, 0, {}};
+    constexpr std::size_t lazyContextCount = 32;
+    constexpr std::size_t lazyFirstCycle = 100;
+    const auto lazyStartCycle = [](std::size_t index) {
+        return lazyFirstCycle + 4 * index
+            + index * (index - 1) / 2;
+    };
+    for (std::size_t index = 0; index < lazyContextCount; ++index) {
+        lazyRun.commands.push_back(macro(
+            ftlpu::MemInstruction::Read(300 + index, 2),
+            {lazyStartCycle(index),
+             1, 1, 0, 1, 1, 0,
+             ftlpu::IcuInductionTarget::MemAddress}));
+    }
+    const auto lazyPacked =
+        rt::pack_mem_macro_imem(rt::encode_mem_macro_bitstream(lazyRun));
+    using LazyQueue = ftlpu::DistributedIcuQueue<
+        ftlpu::MemInstruction, 96, 64, 4, 1,
+        1, ftlpu::IcuQueueRole::Legacy, 3, 32, 2, 8, 4>;
+    LazyQueue lazyQueue;
+    lazyQueue.load_raw_macro(
+        ftlpu::IcuMacroQueueKind::Mem,
+        raw_words<LazyQueue::RawImemWord>(lazyPacked));
+    std::size_t lazyPrimeCycles = 0;
+    while (!lazyQueue.raw_macro_ready()) {
+        lazyQueue.prefetch_raw_macro();
+        expect(++lazyPrimeCycles < 256,
+               "finite DDB frontend did not reach a decode-ahead boundary");
+    }
+    expect(lazyQueue.peak_active_macros() == 0,
+           "far-future contexts occupied Active RAM during decode ahead");
+    expect(lazyQueue.macro_decoder_statistics().peak_ddb_occupancy == 2,
+           "finite DDB did not fill to its configured depth");
+    expect(lazyQueue.macro_decoder_statistics().reservoir_full_cycles != 0
+               && lazyQueue.macro_decoder_statistics().fetched_words
+                   < lazyPacked.word_count(),
+           "DDB pressure did not propagate through reservoir to IMEM fetch");
+
+    std::vector<std::pair<std::size_t, std::size_t>> lazyIssues;
+    const auto lazyLastCycle = lazyStartCycle(lazyContextCount - 1);
+    for (std::size_t cycle = 0; cycle <= lazyLastCycle; ++cycle)
+        if (const auto issued = lazyQueue.tick())
+            lazyIssues.emplace_back(cycle, issued->address);
+    expect(lazyIssues.size() == lazyContextCount,
+           "lazy expander did not generate every run context");
+    for (std::size_t index = 0; index < lazyIssues.size(); ++index) {
+        expect(lazyIssues[index].first
+                       == lazyStartCycle(index)
+                   && lazyIssues[index].second == 300 + index,
+               "lazy run expansion changed issue timing or operand deltas");
+    }
+    const auto& lazyStats = lazyQueue.macro_decoder_statistics();
+    expect(lazyQueue.done() && lazyQueue.peak_active_macros() == 1,
+           "late admission exceeded the one-entry Active Context RAM");
+    expect(lazyStats.descriptor_count == 1
+               && lazyStats.ddb_entries_committed >= 8
+               && lazyStats.decoder_ddb_stall_cycles != 0
+               && lazyStats.ddb_full_cycles != 0,
+           "DDB capacity did not propagate parser backpressure");
+    expect(lazyStats.timing_window_block_cycles != 0
+               && lazyStats.active_ram_full_cycles != 0
+               && lazyStats.admission_count == lazyContextCount,
+           "late-admission timing/credit gates were not exercised");
+    expect(lazyStats.contexts_generated == lazyContextCount
+               && lazyStats.peak_reservoir_bits <= 3 * 96
+               && lazyStats.fetched_words == lazyPacked.word_count(),
+           "frontend violated expansion width or reservoir capacity");
+    expect(lazyStats.max_context_active_lifetime_cycles <= 9,
+           "late admission retained a context longer than lookahead permits");
+
+    // Packed-v1 is globally start-time monotonic. Rejecting this sequence is
+    // the compiler/codec contract that prevents FIFO DDB head-of-line blocking
+    // (A0=100, A1=10000 would otherwise hide B0=150 behind A1).
+    rt::QueueProgram holRun{rt::QueueKind::Mem, 0, {}};
+    holRun.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(1, 0),
+        {100, 1, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    holRun.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(2, 0),
+        {10000, 1, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    holRun.commands.push_back(macro(
+        ftlpu::MemInstruction::Read(3, 1),
+        {150, 1, 1, 0, 1, 1, 0,
+         ftlpu::IcuInductionTarget::MemAddress}));
+    expect_throw(
+        [&]() { (void)rt::encode_mem_macro_bitstream(holRun); },
+        "codec accepted a descriptor order that causes FIFO DDB HOL blocking");
+
+    // Invalid cached images must be rejected even when semantic relocation
+    // requires regeneration before the actual CModel hardware load.
+    auto corruptProgram = restoredProgram;
+    corruptProgram.queues.front().packed_macro_imem->bytes[3] |= 0x80u;
+    ftlpu::InstructionControlUnit corruptIcu;
+    expect_throw(
+        [&]() {
+            (void)rt::load_queue_programs_into_icu(
+                corruptProgram.queues, corruptIcu);
+        },
+        "runtime accepted an invalid retained raw Macro image");
+
     std::cout << "macro_bitstream_test passed: bits="
               << image.stats.physical_bits() << '\n';
     if (argc == 2) {
         const auto program = rt::read_binary_program(argv[1]);
-        std::size_t queues = 0;
-        std::size_t commands = 0;
-        std::uint64_t bits = 0;
+        std::size_t memQueues = 0;
+        std::size_t memCommands = 0;
+        std::uint64_t memBits = 0;
+        std::size_t mxmQueues = 0;
+        std::size_t mxmCommands = 0;
+        std::uint64_t mxmBits = 0;
+        std::size_t memWords = 0;
+        std::size_t mxmWords = 0;
         for (const auto& source : program.queues) {
-            if (source.kind != rt::QueueKind::Mem || source.commands.empty()
-                || !std::all_of(source.commands.begin(), source.commands.end(),
-                    [](const rt::QueueCommand& command) {
-                        return rt::is_macro_schedule_command(command)
-                            && command.instruction_kind == rt::InstructionKind::Mem;
-                    }))
+            if (source.commands.empty())
                 continue;
-            const auto encoded = rt::encode_mem_macro_bitstream(source);
-            const auto restored = rt::decode_mem_macro_bitstream(
-                encoded, source.index);
-            expect(restored.commands.size() == source.commands.size(),
-                "Qwen roundtrip command count changed");
-            for (std::size_t i = 0; i < source.commands.size(); ++i)
-                compare(source.commands[i], restored.commands[i]);
-            ++queues;
-            commands += source.commands.size();
-            bits += encoded.stats.physical_bits();
+            const bool allMacro =
+                std::all_of(source.commands.begin(), source.commands.end(),
+                            [](const rt::QueueCommand& command) {
+                                return rt::is_macro_schedule_command(command);
+                            });
+            if (!allMacro)
+                continue;
+            if (source.kind == rt::QueueKind::Mem) {
+                const auto encoded = rt::encode_mem_macro_bitstream(source);
+                const auto packed = rt::pack_mem_macro_imem(encoded);
+                const auto restored =
+                    rt::decode_mem_macro_imem(packed, source.index);
+                expect(restored.commands.size() == source.commands.size(),
+                       "Qwen MEM roundtrip command count changed");
+                for (std::size_t i = 0; i < source.commands.size(); ++i)
+                    compare(source.commands[i], restored.commands[i]);
+                ++memQueues;
+                memCommands += source.commands.size();
+                memBits += encoded.stats.physical_bits();
+                memWords += packed.word_count();
+                continue;
+            }
+            if (source.kind == rt::QueueKind::MxmLoad ||
+                source.kind == rt::QueueKind::MxmCompute ||
+                source.kind == rt::QueueKind::MxmDequant) {
+                const auto encoded = rt::encode_mxm_macro_bitstream(source);
+                const auto packed = rt::pack_mxm_macro_imem(encoded);
+                const auto restored = rt::decode_mxm_macro_imem(
+                    packed, source.kind, source.index);
+                expect(restored.commands.size() == source.commands.size(),
+                       "Qwen MXM roundtrip command count changed");
+                for (std::size_t i = 0; i < source.commands.size(); ++i)
+                    compare_mxm(source.commands[i], restored.commands[i]);
+                ++mxmQueues;
+                mxmCommands += source.commands.size();
+                mxmBits += encoded.stats.physical_bits();
+                mxmWords += packed.word_count();
+            }
         }
-        std::cout << "macro_bitstream_qwen_roundtrip passed: queues="
-                  << queues << " commands=" << commands
-                  << " bits=" << bits << '\n';
+        std::cout << "macro_bitstream_qwen_roundtrip passed: mem_queues="
+                  << memQueues << " mem_commands=" << memCommands
+                  << " mem_payload_bits=" << memBits
+                  << " mem_physical_words=" << memWords
+                  << " mxm_queues=" << mxmQueues
+                  << " mxm_commands=" << mxmCommands << " mxm_bits=" << mxmBits
+                  << " mxm_physical_words=" << mxmWords
+                  << '\n';
+    }
+    // Relocation may change semantic commands after the reader cached an
+    // encoded image. The actual hardware load must use the relocated address.
+    {
+        rt::BinaryProgram relocated;
+        relocated.max_cycle = 24;
+        const ftlpu::IcuMacroSchedule schedule {
+            20, 2, 2, 1, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress};
+        relocated.queues.push_back(rt::QueueProgram {rt::QueueKind::Mem, 0,
+            {macro(ftlpu::MemInstruction::Read(100, 2), schedule)}});
+        std::stringstream saved;
+        rt::write_binary_program(relocated, saved);
+        auto reloaded = rt::read_binary_program(saved);
+        expect(reloaded.queues.front().packed_macro_imem.has_value(),
+            "serialized Macro fixture has no cached image");
+        reloaded.queues.front().commands.front() =
+            macro(ftlpu::MemInstruction::Read(777, 2), schedule);
+        const auto actual = run_compiled_mem_program(reloaded);
+        expect(actual.issues.size() == 2
+                && actual.issues.front().second == ftlpu::isa::encode_mem_instruction(
+                    ftlpu::MemInstruction::Read(777, 2)),
+            "hardware loader used a stale Macro image after relocation");
+    }
+    if (argc == 3) {
+        const auto baseline = rt::read_binary_program(argv[1]);
+        const auto compressed = rt::read_binary_program(argv[2]);
+        expect(baseline.max_cycle == compressed.max_cycle,
+               "compiler-generated Macro changed the scheduled cycle count");
+        std::size_t macroCommands = 0;
+        for (const auto& compressedQueue : compressed.queues)
+            for (const auto& command : compressedQueue.commands) {
+                expect(
+                    !rt::is_mem_stream_nd_command(command) &&
+                        !rt::is_mxm_stream_nd_command(command),
+                    "compiler-generated Macro A/B binary contains STREAM_ND");
+                macroCommands += rt::is_macro_schedule_command(command) ? 1 : 0;
+            }
+        expect(macroCommands != 0,
+               "compiler-generated Macro A/B binary contains no 2-D Macro");
+
+        const auto baselineRun = run_compiled_mem_program(baseline);
+        const auto compressedRun = run_compiled_mem_program(compressed);
+        expect(baselineRun.issues == compressedRun.issues,
+               "compiler-generated Macro changed CModel issue semantics");
+        expect(baselineRun.frontend.issued_instructions ==
+                   compressedRun.frontend.issued_instructions,
+               "compiler-generated Macro changed dynamic issue count");
+        expect(compressedRun.frontend.imem_entries <
+                   baselineRun.frontend.imem_entries,
+               "compiler-generated Macro did not reduce CModel i-MEM entries");
+        expect(compressedRun.frontend.fetched_entries <
+                   baselineRun.frontend.fetched_entries,
+               "compiler-generated Macro did not reduce CModel fetch entries");
+        expect(compressedRun.frontend.macro_queues != 0 &&
+                   compressedRun.frontend.peak_macro_contexts_per_queue != 0,
+               "CModel did not execute compiler-generated Macro contexts");
+
+        const auto baselineImem = rt::analyze_physical_imem(baseline);
+        const auto compressedImem = rt::analyze_physical_imem(compressed);
+        expect(compressedImem.used_bits < baselineImem.used_bits,
+               "compiler-generated Macro did not reduce physical MEM bits");
+        std::cout << "macro_cmodel_ab_test passed"
+                  << " logical_issues=" << compressedRun.issues.size()
+                  << " scheduled_cycles=" << compressed.max_cycle + 1
+                  << " baseline_imem_entries="
+                  << baselineRun.frontend.imem_entries << " macro_imem_entries="
+                  << compressedRun.frontend.imem_entries
+                  << " baseline_fetched_entries="
+                  << baselineRun.frontend.fetched_entries
+                  << " macro_fetched_entries="
+                  << compressedRun.frontend.fetched_entries
+                  << " baseline_physical_bits=" << baselineImem.used_bits
+                  << " macro_physical_bits=" << compressedImem.used_bits
+                  << " peak_macro_contexts="
+                  << compressedRun.frontend.peak_macro_contexts_per_queue
+                  << '\n';
     }
     return 0;
 } catch (const std::exception& error) {

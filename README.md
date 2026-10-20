@@ -114,6 +114,9 @@ overview navigation, and A/B cycle measurement cursors. See
 
 ## Build
 
+For the optional raw Macro frontend, parameter sweeps, and coexistence with
+compact/FU3D execution, see the [Macro frontend guide](docs/macro_frontend_physical_model.zh-CN.md).
+
 By default CMake expects `FTLPU-CMODEL` to sit next to this repository:
 
 ```powershell

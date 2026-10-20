@@ -24,11 +24,14 @@ constexpr std::uint8_t kCompactWordCountShift = 3;
 constexpr std::uint8_t kCompactHasExtension = 0x40;
 constexpr std::uint8_t kCompactMacro = 0x80;
 
+// Internal .ftlpu container discriminant. This is not the two-bit hardware
+// QueueMode (00 Native, 01 Macro); values 1 and 2 remain readable for old
+// container formats.
 enum class QueueEncodingMode : std::uint8_t {
     Native = 0,
     MacroSchedule = 1,
     CompactTagged = 2,
-    MemMacroDeltaRle = 3,
+    MacroPacked = 3,
 };
 
 constexpr bool has_queue_encoding_mode(std::uint32_t version)
@@ -39,9 +42,29 @@ constexpr bool has_queue_encoding_mode(std::uint32_t version)
     return version == 27 || version == 28 || version >= 29;
 }
 
-constexpr bool has_mem_macro_delta_rle(std::uint32_t version)
+constexpr bool has_mem_macro_packed(std::uint32_t version)
 {
     return version == 28 || version >= 29;
+}
+
+constexpr bool has_mxm_macro_packed(std::uint32_t version)
+{
+    // v33-v35 on main used semantic MXM descriptors. The experimental v33
+    // format has conflicting binding layout IDs and is not this ABI.
+    return version >= 36;
+}
+
+constexpr bool is_mxm_macro_queue(QueueKind kind)
+{
+    return kind == QueueKind::MxmLoad || kind == QueueKind::MxmCompute ||
+           kind == QueueKind::MxmDequant;
+}
+
+constexpr bool has_macro_packed(std::uint32_t version, QueueKind kind)
+{
+    if (kind == QueueKind::Mem)
+        return has_mem_macro_packed(version);
+    return is_mxm_macro_queue(kind) && has_mxm_macro_packed(version);
 }
 
 constexpr std::uint32_t kNativeWordCountShift = 2;
@@ -334,7 +357,7 @@ void write_compact_queue_command(
     }
 }
 
-QueueEncodingMode queue_encoding_mode(const QueueProgram& queue)
+QueueEncodingMode queue_encoding_mode(const QueueProgram& queue, bool rawMacroSupported)
 {
     const auto macroCount = std::count_if(queue.commands.begin(),
         queue.commands.end(), [](const QueueCommand& command) {
@@ -352,8 +375,8 @@ QueueEncodingMode queue_encoding_mode(const QueueProgram& queue)
             : QueueEncodingMode::Native;
     }
     if (macroCount == static_cast<std::ptrdiff_t>(queue.commands.size())) {
-        if (queue.kind == QueueKind::Mem)
-            return QueueEncodingMode::MemMacroDeltaRle;
+        if (rawMacroSupported && (queue.kind == QueueKind::Mem || is_mxm_macro_queue(queue.kind)))
+            return QueueEncodingMode::MacroPacked;
         return QueueEncodingMode::MacroSchedule;
     }
     return QueueEncodingMode::CompactTagged;
@@ -464,6 +487,21 @@ void write_mem_macro_bitstream(std::ostream& os, const QueueProgram& queue)
     os.write(reinterpret_cast<const char*>(image.bytes.data()),
         static_cast<std::streamsize>(image.bytes.size()));
     if (!os) throw std::runtime_error("failed to write MEM Macro bitstream");
+}
+
+void write_mxm_macro_bitstream(std::ostream& os, const QueueProgram& queue)
+{
+    const auto image = encode_mxm_macro_bitstream(queue);
+    write_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(image.version));
+    write_scalar<std::uint8_t>(os, image.delta_count);
+    write_scalar<std::uint64_t>(os, image.bit_count);
+    for (std::size_t i = 0; i < image.delta_count; ++i) {
+        write_scalar<std::uint32_t>(os, image.deltas[i].start_cycle);
+        write_scalar<std::int32_t>(os, image.deltas[i].operand);
+    }
+    os.write(reinterpret_cast<const char*>(image.bytes.data()),
+        static_cast<std::streamsize>(image.bytes.size()));
+    if (!os) throw std::runtime_error("failed to write MXM Macro bitstream");
 }
 
 QueueCommand read_compact_queue_command(std::istream& is)
@@ -956,7 +994,7 @@ void skip_macro_queue_command(Reader& reader, bool wide)
 QueueEncodingMode decode_queue_encoding_mode(std::uint8_t value)
 {
     if (value > static_cast<std::uint8_t>(
-                    QueueEncodingMode::MemMacroDeltaRle))
+                    QueueEncodingMode::MacroPacked))
         throw std::runtime_error("invalid FTLPU queue encoding mode");
     return static_cast<QueueEncodingMode>(value);
 }
@@ -987,16 +1025,55 @@ QueueProgram read_mem_macro_bitstream(Reader& reader,
     } else {
         reader.read_bytes(image.bytes.data(), image.bytes.size());
     }
-    return decode_mem_macro_bitstream(image, queueIndex);
+    auto queue = decode_mem_macro_bitstream(image, queueIndex);
+    queue.packed_macro_imem = pack_mem_macro_imem(image);
+    return queue;
 }
 
 template <typename Reader>
-void skip_mem_macro_bitstream(Reader& reader)
+QueueProgram read_mxm_macro_bitstream(Reader& reader,
+    std::uint32_t commandCount, std::size_t queueIndex, QueueKind queueKind)
+{
+    if (!is_mxm_macro_queue(queueKind))
+        throw std::runtime_error("invalid MXM Macro packed queue kind");
+    MxmMacroBitstream image;
+    image.kind = queueKind;
+    image.version = read_value<std::uint8_t>(reader);
+    image.command_count = commandCount;
+    image.delta_count = read_value<std::uint8_t>(reader);
+    image.bit_count = read_value<std::uint64_t>(reader);
+    if (image.delta_count > image.deltas.size())
+        throw std::runtime_error("invalid MXM Macro delta dictionary size");
+    for (std::size_t i = 0; i < image.delta_count; ++i) {
+        image.deltas[i].start_cycle = read_value<std::uint32_t>(reader);
+        image.deltas[i].operand = read_value<std::int32_t>(reader);
+    }
+    const auto byteCount = (image.bit_count + 7) / 8;
+    if (byteCount > std::numeric_limits<std::size_t>::max())
+        throw std::runtime_error("MXM Macro bitstream is too large");
+    image.bytes.resize(static_cast<std::size_t>(byteCount));
+    if constexpr (std::is_same_v<Reader, std::istream>) {
+        reader.read(reinterpret_cast<char*>(image.bytes.data()),
+            static_cast<std::streamsize>(image.bytes.size()));
+        if (!reader) throw std::runtime_error("truncated MXM Macro bitstream");
+    } else {
+        reader.read_bytes(image.bytes.data(), image.bytes.size());
+    }
+    auto queue = decode_mxm_macro_bitstream(image, queueIndex);
+    queue.packed_macro_imem = pack_mxm_macro_imem(image);
+    return queue;
+}
+
+template <typename Reader>
+void skip_macro_bitstream(Reader& reader, QueueKind queueKind)
 {
     (void)read_value<std::uint8_t>(reader);
     const auto deltaCount = read_value<std::uint8_t>(reader);
-    if (deltaCount > kMemMacroDeltaDictionarySize)
-        throw std::runtime_error("invalid MEM Macro delta dictionary size");
+    const auto dictionaryCapacity = queueKind == QueueKind::Mem
+        ? kMemMacroDeltaDictionarySize
+        : kMxmMacroDeltaDictionarySize;
+    if (deltaCount > dictionaryCapacity)
+        throw std::runtime_error("invalid Macro delta dictionary size");
     const auto bitCount = read_value<std::uint64_t>(reader);
     skip_value(reader, static_cast<std::uint64_t>(deltaCount) * 8
         + (bitCount + 7) / 8);
@@ -1431,11 +1508,18 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
     for (const auto& queue : program.queues) {
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.kind));
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.index));
-        const auto mode = queue_encoding_mode(queue);
+        const auto wordBits = queue.kind == QueueKind::Mem
+            ? program.hardware.icu_mem_instruction_bits : program.hardware.icu_mxm_instruction_bits;
+        const bool rawSupported = program.hardware.icu_macro_encoding_version == 1
+            && wordBits == (queue.kind == QueueKind::Mem ? kMemIcuImemWordBits : kMxmIcuImemWordBits);
+        const auto mode = queue_encoding_mode(queue, rawSupported);
         write_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(mode));
         write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(queue.commands.size()));
-        if (mode == QueueEncodingMode::MemMacroDeltaRle) {
-            write_mem_macro_bitstream(os, queue);
+        if (mode == QueueEncodingMode::MacroPacked) {
+            if (queue.kind == QueueKind::Mem)
+                write_mem_macro_bitstream(os, queue);
+            else
+                write_mxm_macro_bitstream(os, queue);
         } else if (mode == QueueEncodingMode::MacroSchedule) {
             write_macro_queue_commands(os, queue);
         } else if (mode == QueueEncodingMode::CompactTagged) {
@@ -1572,10 +1656,16 @@ BinaryProgram read_binary_program(std::istream& is)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(is, command_count);
 
-        if (has_mem_macro_delta_rle(version)
-            && mode == QueueEncodingMode::MemMacroDeltaRle) {
-            program.queues.push_back(read_mem_macro_bitstream(
-                is, command_count, queue.index));
+        if (mode == QueueEncodingMode::MacroPacked) {
+            if (!has_macro_packed(version, queue.kind))
+                throw std::runtime_error(
+                    "unsupported FTLPU packed Macro queue kind or version");
+            if (queue.kind == QueueKind::Mem)
+                program.queues.push_back(read_mem_macro_bitstream(
+                    is, command_count, queue.index));
+            else
+                program.queues.push_back(read_mxm_macro_bitstream(
+                    is, command_count, queue.index, queue.kind));
             continue;
         }
 
@@ -1744,9 +1834,11 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         if (has_queue_encoding_mode(version)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(is, command_count);
-        if (has_mem_macro_delta_rle(version)
-            && mode == QueueEncodingMode::MemMacroDeltaRle) {
-            skip_mem_macro_bitstream(is);
+        if (mode == QueueEncodingMode::MacroPacked) {
+            if (!has_macro_packed(version, queueKind))
+                throw std::runtime_error(
+                    "unsupported FTLPU packed Macro queue kind or version");
+            skip_macro_bitstream(is, queueKind);
             continue;
         }
         for (std::uint32_t command = 0;
@@ -1813,10 +1905,16 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
         if (has_queue_encoding_mode(header.version)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(reader, command_count);
-        if (has_mem_macro_delta_rle(header.version)
-            && mode == QueueEncodingMode::MemMacroDeltaRle) {
-            program.queues.push_back(read_mem_macro_bitstream(
-                reader, command_count, queue.index));
+        if (mode == QueueEncodingMode::MacroPacked) {
+            if (!has_macro_packed(header.version, queue.kind))
+                throw std::runtime_error(
+                    "unsupported FTLPU packed Macro queue kind or version");
+            if (queue.kind == QueueKind::Mem)
+                program.queues.push_back(read_mem_macro_bitstream(
+                    reader, command_count, queue.index));
+            else
+                program.queues.push_back(read_mxm_macro_bitstream(
+                    reader, command_count, queue.index, queue.kind));
             continue;
         }
         for (std::uint32_t command_id = 0;
@@ -1918,9 +2016,11 @@ BinaryProgram read_binary_program_metadata(
         if (has_queue_encoding_mode(header.version)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(reader, command_count);
-        if (has_mem_macro_delta_rle(header.version)
-            && mode == QueueEncodingMode::MemMacroDeltaRle) {
-            skip_mem_macro_bitstream(reader);
+        if (mode == QueueEncodingMode::MacroPacked) {
+            if (!has_macro_packed(header.version, queueKind))
+                throw std::runtime_error(
+                    "unsupported FTLPU packed Macro queue kind or version");
+            skip_macro_bitstream(reader, queueKind);
             continue;
         }
         for (std::uint32_t command = 0;

@@ -5,12 +5,17 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <sstream>
+#include <utility>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -605,12 +610,111 @@ void require(bool condition, const std::string& message)
     if (!condition) throw std::runtime_error(message);
 }
 
+using ImageRows = std::map<std::tuple<std::uint16_t, std::uint16_t,
+    std::uint32_t>, std::vector<std::uint8_t>>;
+
+ImageRows physical_rows(const PackedWeightImage& image, std::size_t width)
+{
+    ImageRows rows;
+    for (const auto& segment : image.segments)
+        for (std::uint32_t row = 0; row < segment.vector_count; ++row) {
+            std::vector<std::uint8_t> data(width);
+            std::copy_n(image.data.begin() + segment.byte_offset + row * width,
+                width, data.begin());
+            require(rows.emplace(std::make_tuple(segment.hemisphere,
+                        segment.slice, segment.base_row + row), data).second,
+                "page contains overlapping physical vectors");
+        }
+    return rows;
+}
+
+void test_paged_output_tail(BindingLayout layout, std::size_t rows,
+    std::size_t columns, std::size_t width = 32)
+{
+    ExecutableHardwareConfig hardware;
+    hardware.bytes_per_word = hardware.mxm_rows = hardware.mxm_columns = width;
+    hardware.tile_rows = width / 8;
+    hardware.sram_depth_rows = hardware.words_per_bank = 8192;
+    const auto waveColumns = 4 * width;
+    const auto paddedColumns = ((columns + waveColumns - 1) / waveColumns) * waveColumns;
+    std::vector<std::uint8_t> logical(rows * columns);
+    std::vector<std::uint8_t> padded(rows * paddedColumns, 0);
+    for (std::size_t k = 0; k < rows; ++k)
+        for (std::size_t n = 0; n < columns; ++n)
+            padded[k * paddedColumns + n] = logical[k * columns + n] =
+                static_cast<std::uint8_t>(k * 29 + n * 17 + 3);
+    BinaryBinding binding = make_weight(1);
+    binding.layout = layout;
+    binding.shape = {rows, columns};
+    binding.byte_size = logical.size();
+    binding.base_row = 17;
+    binding.address_stride = 2;
+    binding.slices = {8, 9, 10, 11, 12, 13, 14, 15};
+    binding.page_storage_slices = binding.slices;
+    binding.paged_weight = true;
+    binding.page_bank_count = 2;
+    binding.page_rows = 8192;
+    const bool down = layout == BindingLayout::W8A16MxmWeightWaveStriped;
+    binding.page_count = down ? paddedColumns / waveColumns : 1;
+    binding.page_granularity = down ? rows / width : paddedColumns / (2 * width);
+    binding.page_items_per_slice_group = binding.page_granularity;
+    binding.page_role_group_count = 1;
+    binding.instruction_count = down ? rows / width * (2 * hardware.tile_rows)
+        : rows / width * (layout == BindingLayout::W8A16AttentionWeightStriped
+              ? paddedColumns / waveColumns * (2 * hardware.tile_rows)
+              : paddedColumns / (2 * width) * hardware.tile_rows);
+    auto aligned = binding;
+    aligned.shape[1] = paddedColumns;
+    aligned.byte_size = padded.size();
+    std::size_t packedBytes = 0;
+    for (std::uint32_t page = 0; page < binding.page_count; ++page) {
+        const auto tail = pack_weight_binding_page(binding, page, logical, hardware);
+        const auto standard = physical_rows(
+            pack_weight_binding_page(aligned, page, padded, hardware), width);
+        for (const auto& [address, data] : physical_rows(tail, width))
+            require(standard.at(address) == data,
+                "tail weight differs from aligned zero-padded physical image");
+        packedBytes += tail.data.size();
+    }
+    require(packedBytes == logical.size(),
+        "paged tail dropped or duplicated a logical weight byte");
+    binding.shape[1] = columns - 1;
+    binding.byte_size = rows * (columns - 1);
+    logical.resize(binding.byte_size);
+    bool rejected = false;
+    try { (void)pack_weight_binding_page(binding, 0, logical, hardware); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "unaligned output tail was accepted");
+    if (layout != BindingLayout::W8A16AttentionWeightStriped) {
+        binding.shape[1] = columns - width;
+        binding.byte_size = rows * (columns - width);
+        logical.resize(binding.byte_size);
+        rejected = false;
+        try { (void)pack_weight_binding_page(binding, 0, logical, hardware); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "unimplemented single-tile O/FFN-down tail was accepted");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 try {
     test_vxm_distributed_roundtrip();
     test_token_partition_planar();
+    if (argc == 2 && std::string(argv[1]) == "--paged-output-tail") {
+        for (const std::size_t width : {16, 32, 64}) {
+            test_paged_output_tail(BindingLayout::W8A16AttentionWeightStriped,
+                18 * width, 18 * width, width);
+            test_paged_output_tail(BindingLayout::W8A16AttentionWeightStriped,
+                18 * width, 6 * width, width);
+            test_paged_output_tail(BindingLayout::W8A16MxmWeightStriped,
+                18 * width, 18 * width, width);
+            test_paged_output_tail(BindingLayout::W8A16MxmWeightWaveStriped,
+                48 * width, 18 * width, width);
+        }
+        return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--generic-planar") {
         test_planar_transport(false);
         return 0;
@@ -749,6 +853,13 @@ try {
     if (ExecutableHardwareConfig {}.sram_depth_rows == 1024)
         test_segmented_gamma_broadcast();
     test_planar_transport();
+    test_paged_output_tail(BindingLayout::W8A16AttentionWeightStriped,
+        576, 576);
+    test_paged_output_tail(BindingLayout::W8A16AttentionWeightStriped,
+        576, 192);
+    test_paged_output_tail(BindingLayout::W8A16MxmWeightStriped, 576, 576);
+    test_paged_output_tail(BindingLayout::W8A16MxmWeightWaveStriped,
+        1536, 576);
     const auto data = logical_weight();
     const BinaryBinding binding = make_weight(1);
     const PackedWeightImage packed = pack_weight_binding(

@@ -1173,9 +1173,6 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
         binding.layout == BindingLayout::W8A16MxmWeightReplicated
             ? reductionWidth
             : twoWidthStriped ? 2 * reductionWidth : 4 * reductionWidth;
-    if (rows % reductionWidth || columns % itemColumns)
-        throw std::invalid_argument(
-            "paged Vector-MXM weight has an unsupported shape alignment");
     constexpr std::size_t loadSlices = 8;
     constexpr std::size_t logicalSlots = 2;
     const std::size_t rowsPerLoad = hardware.tile_rows;
@@ -1192,6 +1189,16 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
         / binding.page_granularity;
     const bool projection = ffnWave
         ? binding.page_count == projectionPages : rows < columns;
+    // Q/K/V guard individual output tiles; O and Down consume tile pairs.
+    // Keep those tail rules in target units, including replicated projections
+    // and the page-count-based Gate/Up versus channel-tiled Down distinction.
+    const std::size_t outputAlignment = attention
+        || binding.layout == BindingLayout::W8A16MxmWeightReplicated
+        ? reductionWidth : 2 * reductionWidth;
+    if (rows % reductionWidth || columns % outputAlignment
+        || (ffnWave && projection && columns % (4 * reductionWidth)))
+        throw std::invalid_argument(
+            "paged Vector-MXM weight has an unsupported shape alignment");
     const BinaryWeightPagePlacement pagePlacement =
         resolve_weight_page_placement(binding, page_index);
     const std::size_t storageGroups =
@@ -1212,7 +1219,7 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
         throw std::invalid_argument(
             "paged weight placement exceeds the executable SRAM bank");
     const std::size_t reductionBlocks = rows / reductionWidth;
-    const std::size_t outputWaves = columns / itemColumns;
+    const std::size_t outputWaves = (columns + itemColumns - 1) / itemColumns;
     const std::size_t pagesPerOutputWave = projection ? 0
         : (reductionBlocks + binding.page_granularity - 1)
             / binding.page_granularity;

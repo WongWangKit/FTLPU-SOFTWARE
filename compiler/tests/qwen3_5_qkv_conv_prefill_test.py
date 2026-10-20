@@ -41,7 +41,8 @@ def main():
     a.with_qk_norm |= a.with_gates
     out = a.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
-    (out / 'summary.json').unlink(missing_ok=True)
+    if not a.compile_only:
+        (out / 'summary.json').unlink(missing_ok=True)
 
     x, weights, packed, scales, config = load_imported_layer(a.package)
     metadata = json.loads((a.package / 'metadata.json').read_text(encoding='utf-8'))
