@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 from qwen3_5_compiled_layer import VectorGraph, bf16
 from tensor_geometry import Value
-from common_kernel_graph import rms_norm_source, tensor_type
+from common_kernel_graph import l2_norm_source, rms_norm_source, tensor_type
 
 
 class LogicalGraph:
@@ -33,6 +33,9 @@ class LogicalGraph:
         if mean and scale == 1:
             return self.run(name, rms_norm_source(x.shape,epsilon),
                 [(x,'bf16'),(bf16(np.asarray(gamma).reshape(-1)),'bf16')],[(x.shape,'bf16')])[0]
+        if not mean and np.all(np.asarray(gamma) == 1):
+            return self.run(name, l2_norm_source(x.shape, epsilon, scale),
+                [(x,'bf16')],[(x.shape,'bf16')])[0]
         graph = VectorGraph(self,name,[(x,'bf16'),(np.asarray(gamma).reshape(1,-1),'f32')])
         return graph.finish(graph.norm(0,1,epsilon,mean,scale))
 
@@ -45,9 +48,46 @@ class LogicalGraph:
         }} }}'''
         return self.run('conv1d_silu',source,[(qkv,'bf16'),(weight,'bf16')],[(qkv.shape,'bf16')])[0]
 
+    def ffn(self, value, packed, scales):
+        """Semantic FFN equations; the shared C++ matcher chooses its lowering."""
+        m,k = value.shape
+        n = packed['gate_proj'].shape[0]
+        a,h,w,d = (self.type(s,t) for s,t in (
+            ((m,k),'bf16'),((m,n),'bf16'),((k,n),'i8'),((n,k),'i8')))
+        source = f'''module {{ func.func @stage(%x: {a}, %g: {w}, %u: {w}, %d: {d}) -> {a} {{
+          %gate = "ftlpu.kernel.matmul"(%x, %g) {{m = {m} : i64, n = {n} : i64, k = {k} : i64,
+            unit = "MXM", rhs_scale = {scales['gate_proj']:.9e} : f32}} : ({a}, {w}) -> {h}
+          %up = "ftlpu.kernel.matmul"(%x, %u) {{m = {m} : i64, n = {n} : i64, k = {k} : i64,
+            unit = "MXM", rhs_scale = {scales['up_proj']:.9e} : f32}} : ({a}, {w}) -> {h}
+          %silu = "ftlpu.kernel.swish"(%gate) : ({h}) -> {h}
+          %hidden = "ftlpu.kernel.elementwise"(%silu, %up) {{kind = "multiply"}} : ({h}, {h}) -> {h}
+          %down = "ftlpu.kernel.matmul"(%hidden, %d) {{m = {m} : i64, n = {k} : i64, k = {n} : i64,
+            unit = "MXM", rhs_scale = {scales['down_proj']:.9e} : f32}} : ({h}, {d}) -> {a}
+          return %down : {a}
+        }} }}'''
+        return self.run('ffn',source,[(value,'bf16')]+[
+            (packed[name].T.copy(),'i8') for name in ('gate_proj','up_proj','down_proj')],
+            [(value.shape,'bf16')])[0]
+
     def vector_tiles(self, name, inputs, build):
         graph = VectorGraph(self,name,inputs)
         return graph.finish(build(graph))
+
+    def gates(self, value, packed, scales, dt_bias, a_log):
+        """Logical beta and log-decay; hardware expansion belongs to C++."""
+        b = self.project('in_proj_b', value, packed['in_proj_b'], scales['in_proj_b'])
+        a = self.project('in_proj_a', value, packed['in_proj_a'], scales['in_proj_a'])
+        # A_log is immutable checkpoint data. Fold its transform once; this
+        # never evaluates an activation or a runtime intermediate on the host.
+        negative_a = -np.exp(np.asarray(a_log, dtype=np.float32))
+        graph = VectorGraph(self, 'delta_gates', [(b, 'bf16'), (a, 'bf16'),
+            (np.asarray(dt_bias, dtype=np.float32).reshape(1, -1), 'f32'),
+            (negative_a.reshape(1, -1), 'f32')])
+        beta = graph.add(0, kind='sigmoid', immediate=0)
+        biased = graph.add(1, 2, kind='add')
+        softplus = graph.add(biased, kind='softplus', immediate=0)
+        g = graph.add(softplus, 3)
+        return graph.finish((beta, g))
 
     def delta(self, q, k, v, decay, beta, state, c):
         qt, vt, dt, st = self.type(q.shape,'bf16'), self.type(v.shape,'bf16'), self.type(decay.shape,'f32'), self.type(state.shape,'f32')
@@ -121,11 +161,6 @@ class LogicalGraph:
         attention=project('out_proj',gated)
         residual=self.vector_tiles('residual0',[(x,'bf16'),(attention,'bf16')],lambda g:g.add(0,1,kind='add',dtype='bf16'))
         ffn=self.norm('post_attention_norm',residual,bf16(1+weights.post_attention_norm),c.rms_norm_eps)
-        gate,up=project('gate_proj',ffn),project('up_proj',ffn)
-        def swiglu(graph):
-            activated=graph.add(0,graph.sigmoid(0),dtype='bf16')
-            return graph.add(activated,1,dtype='bf16')
-        hidden=self.vector_tiles('swiglu',[(gate,'bf16'),(up,'bf16')],swiglu)
-        down=project('down_proj',hidden)
+        down=self.ffn(ffn,packed,scales)
         output=self.vector_tiles('output',[(residual,'bf16'),(down,'bf16')],lambda g:g.add(0,1,kind='add',dtype='bf16'))
         return output,state,qkv[-c.conv_kernel_size:]

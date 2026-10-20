@@ -10,6 +10,18 @@ def tensor_type(shape, dtype):
     return 'tensor<' + 'x'.join(map(str, shape)) + 'x' + dtype + '>'
 
 
+def l2_norm_source(shape, epsilon, scale=1):
+    if len(shape) != 2:
+        raise ValueError('L2Norm expects a rows-by-features matrix')
+    activation = tensor_type(shape, 'bf16')
+    return f'''module {{ func.func @stage(%a: {activation}) -> {activation} {{
+      %o = ftlpu.kernel.l2_norm %a {{axis = 1 : i64,
+        epsilon = {float(epsilon):.9e} : f32, scale = {float(scale):.9e} : f32}}
+        : ({activation}) -> {activation}
+      return %o : {activation}
+    }} }}'''
+
+
 def rms_norm_source(shape, epsilon):
     if len(shape) != 2:
         raise ValueError('RMSNorm expects a rows-by-hidden matrix')

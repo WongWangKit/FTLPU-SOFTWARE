@@ -364,6 +364,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_THROUGHPUT(mxm_columns);
     READ_THROUGHPUT(mxm_load_streams_per_cycle);
     READ_THROUGHPUT(mxm_int8_load_streams_per_cycle);
+    READ_THROUGHPUT(mxm_prefill_weight_streams);
     READ_THROUGHPUT(mxm_load_bytes_per_cycle);
     READ_THROUGHPUT(mxm_activation_streams);
     READ_THROUGHPUT(mxm_result_streams);
@@ -423,6 +424,15 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_ICU_MEMORY(mxm_macro_context_bits);
 #undef READ_ICU_MEMORY
 
+    if (const auto* mxm = root->getObject("mxm")) {
+        if (auto physical = mxm->getInteger("instances_per_hemisphere")) {
+            if (*physical < 1 || *physical > 2
+                || model.throughput_.mxms_per_hemisphere > *physical) {
+                error = "enabled MXM count exceeds physical instances or physical count is not 1/2";
+                return mlir::failure();
+            }
+        }
+    }
     if (mlir::failed(model.validate(&error))) return mlir::failure();
     return model;
 }
@@ -511,6 +521,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_THROUGHPUT(mxm_columns);
     READ_THROUGHPUT(mxm_load_streams_per_cycle);
     READ_THROUGHPUT(mxm_int8_load_streams_per_cycle);
+    READ_THROUGHPUT(mxm_prefill_weight_streams);
     READ_THROUGHPUT(mxm_load_bytes_per_cycle);
     READ_THROUGHPUT(mxm_activation_streams);
     READ_THROUGHPUT(mxm_result_streams);
@@ -646,6 +657,7 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(throughput_, mxm_columns),
         I64(throughput_, mxm_load_streams_per_cycle),
         I64(throughput_, mxm_int8_load_streams_per_cycle),
+        I64(throughput_, mxm_prefill_weight_streams),
         I64(throughput_, mxm_load_bytes_per_cycle),
         I64(throughput_, mxm_activation_streams),
         I64(throughput_, mxm_result_streams),
@@ -815,6 +827,13 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         || throughput_.mxm_result_streams
             > streams_.streams_per_direction)
         return fail("functional-unit stream width exceeds directional streams");
+    if (throughput_.mxm_prefill_weight_streams != 1
+        && throughput_.mxm_prefill_weight_streams != 8)
+        return fail("MXM prefill weight ingress must use 1 or 8 streams");
+    if (throughput_.mxm_prefill_weight_streams == 1
+        && (!throughput_.mxm_local_dequant_enabled || throughput_.mxm_rows != 32
+            || throughput_.mxms_per_hemisphere != 1))
+        return fail("one-stream prefill currently requires LPU32, local dequant and one MXM per hemisphere");
     const auto valid_slice = [&](int64_t slice) {
         return slice >= 0 && slice < memory_.slices_per_hemisphere;
     };
@@ -904,6 +923,8 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
     HASH(mxm_columns);
     HASH(mxm_load_streams_per_cycle);
     HASH(mxm_int8_load_streams_per_cycle);
+    // The selected prefill ingress width is a lowering policy, like the
+    // weight-slice mapping. It does not change the executable hardware ABI.
     HASH(mxm_load_bytes_per_cycle);
     HASH(mxm_activation_streams);
     HASH(mxm_result_streams);
@@ -1348,8 +1369,10 @@ llvm::SmallVector<int64_t> LPUTargetModel::ffn_gate_temp_slices() const
 {
     if (uses_dedicated_slice_roles()) {
         const auto storage = activation_storage_slices();
+        const std::size_t groupSize = throughput_.mxms_per_hemisphere > 1
+            ? storage.size() / 2 : std::min<std::size_t>(8, storage.size());
         return llvm::SmallVector<int64_t>(storage.begin(),
-            storage.begin() + std::min<std::size_t>(8, storage.size()));
+            storage.begin() + groupSize);
     }
     return llvm::SmallVector<int64_t>(
         memory_.w8a16_fused_gate_temp_slices.begin(),
@@ -1360,8 +1383,10 @@ llvm::SmallVector<int64_t> LPUTargetModel::ffn_up_temp_slices() const
 {
     if (uses_dedicated_slice_roles()) {
         const auto storage = activation_storage_slices();
-        const std::size_t begin = std::min<std::size_t>(8, storage.size());
-        const std::size_t end = std::min<std::size_t>(16, storage.size());
+        const std::size_t begin = throughput_.mxms_per_hemisphere > 1
+            ? storage.size() / 2 : std::min<std::size_t>(8, storage.size());
+        const std::size_t end = throughput_.mxms_per_hemisphere > 1
+            ? storage.size() : std::min<std::size_t>(16, storage.size());
         return llvm::SmallVector<int64_t>(
             storage.begin() + begin, storage.begin() + end);
     }

@@ -457,7 +457,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         vxm(normalizeConfig, 2, "pass", "previous", 0, 0.0f,
             "immediate", 0, 0.0f, "fp32", -1, sequence, 4);
         vxm(normalizeConfig, 3, "multiply", "previous", 0, 0.0f,
-            "accumulator", 0, 0.0f, dataFormat, 2,
+            "accumulator", 0, 0.0f, dataFormat, 4,
             sequence, 4);
         constexpr int64_t normalizePipelineLatency = 8;
         const int64_t keysPerLane = sequence
@@ -481,7 +481,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                         + 5;
                     const int64_t queue = destination
                         * target_.memory().slices_per_hemisphere + slice;
-                    const int64_t stream = destination * 8 + 2 + byte;
+                    const int64_t stream = destination * 8 + 4 + byte;
                     probabilityPackComplete = std::max(
                         probabilityPackComplete,
                         cycle + (keysPerLane - 1)
@@ -621,7 +621,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
         groupedTranspose[static_cast<std::size_t>(hemisphere)] = true;
         emitSxm(rewriter_, op_.getLoc(), work[0].start + memToSxm,
             hemisphere, "transpose", inputStreams, transposeStreams,
-            identityMap(), "vector_columns", -1, -1, -1,
+            identityMap(target_), "vector_columns", -1, -1, -1,
             transposePipelineBeats, 1, static_cast<int64_t>(work.size()),
             interval);
     }
@@ -716,7 +716,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
             if (!groupedTranspose[static_cast<std::size_t>(hemisphere)])
                 emitSxm(rewriter_, op_.getLoc(), capture, hemisphere,
                     "transpose", inputStreams, transposeStreams,
-                    identityMap(), "vector_columns", -1, -1, -1,
+                    identityMap(target_), "vector_columns", -1, -1, -1,
                     transposePipelineBeats, 1);
             emitSxm(rewriter_, op_.getLoc(), capture + 1, hemisphere,
                 "permute", transposeStreams, outputStreams,

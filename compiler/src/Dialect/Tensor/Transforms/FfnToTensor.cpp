@@ -53,7 +53,8 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     llvm::SmallVector<int64_t, 32> up_weight_slices;
     llvm::SmallVector<int64_t, 32> down_weight_slices;
     if (native4) {
-        for (int64_t slice = 20; slice < 52; ++slice) {
+        for (int64_t slice = 20;
+             slice < 20 + throughput.mxm_columns; ++slice) {
             gate_weight_slices.push_back(slice);
             up_weight_slices.push_back(slice);
             down_weight_slices.push_back(slice);
@@ -81,13 +82,34 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         result_slices.push_back(
             memory.w8a16_result_slice_base + index);
     }
+    // Large prefill inputs use the same distributed token layout as RMSNorm.
+    // Standalone/connected FFNs must not require an oversized planar staging
+    // allocation merely because their producer is lowered in another region.
+    const bool distributedInput = w8a16 && !native4
+        && m * k / throughput.mxm_rows > memory.sram_depth_rows;
+    if (distributedInput)
+        activation_slices = target.mxm_distributed_activation_slices();
+    const int64_t inputRows = m * k / (throughput.mxm_rows
+        * (distributedInput ? throughput.mxm_block_rows : 1));
+    const llvm::StringRef inputKind = distributedInput
+        ? "fp16_mxm_distributed_16" : "fp16_mxm_activation_planar";
     const int64_t hidden_pass_bytes = w8a16
         ? m * hidden * 2
         : m * 320;
     const bool singleMxmVector = w8a16
         && throughput.mxms_per_hemisphere == 1;
+    const int64_t nativeWaveColumns = 2 * throughput.mxm_columns;
+    if (native4 && (nativeWaveColumns <= 0
+            || hidden % nativeWaveColumns != 0
+            || n % nativeWaveColumns != 0
+            || k % (2 * throughput.mxm_rows) != 0
+            || hidden % (2 * throughput.mxm_rows) != 0)) {
+        op.emitError(
+            "Native4 FFN shape is not aligned to the physical MXM waves");
+        return mlir::failure();
+    }
     const int64_t gate_rows = native4
-        ? (hidden / 64) * (k / 32)
+        ? (hidden / nativeWaveColumns) * (k / throughput.mxm_rows)
         : w8a16
         ? k * hidden
             / ((singleMxmVector ? memory.hemispheres : 1)
@@ -99,13 +121,29 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
                 ? 2 : throughput.mxms_per_hemisphere)
         * throughput.tile_rows * throughput.lanes_per_tile;
     const int64_t down_rows = native4
-        ? (n / 64) * (hidden / 32)
+        ? (n / nativeWaveColumns) * (hidden / throughput.mxm_rows)
         : w8a16
         ? ((n + down_wave_columns - 1) / down_wave_columns)
             * (hidden / throughput.mxm_rows)
             * memory.w8a16_weight_slice_count
         : 0;
-    const bool requiresWeightPaging = singleMxmVector
+    const int64_t nativeProjectionReductions =
+        k / throughput.mxm_rows;
+    const int64_t nativeDownReductions =
+        hidden / throughput.mxm_rows;
+    if (native4 && (nativeProjectionReductions <= 0
+            || nativeDownReductions <= 0
+            || nativeProjectionReductions > memory.sram_depth_rows
+            || nativeDownReductions > memory.sram_depth_rows)) {
+        op.emitError("one Native4 output wave exceeds one SRAM bank")
+            << ": Gate/Up=" << nativeProjectionReductions
+            << " rows, Down=" << nativeDownReductions
+            << " rows, bank=" << memory.sram_depth_rows << " rows";
+        return mlir::failure();
+    }
+    const bool nativePaged = native4
+        && std::max(gate_rows, down_rows) > memory.sram_depth_rows;
+    const bool requiresWeightPaging = w8a16 && !native4
         && std::max(gate_rows, down_rows) > memory.sram_depth_rows;
     const bool pagedWeights = weight_bank >= 0 || requiresWeightPaging;
     // The complete attention epoch occupies weight_bank. Start Gate in the
@@ -181,7 +219,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     int64_t liveInputEndRow = 0;
     if (hiddenBank == inputBank) {
         int64_t inputBaseRow = 0;
-        int64_t inputRowCount = m * k / throughput.mxm_rows;
+        int64_t inputRowCount = inputRows;
         bool hiddenOverlapsInputSlices = llvm::any_of(hidden_slices,
             [&](int64_t hiddenSlice) {
                 return llvm::is_contained(
@@ -234,20 +272,32 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     }
     if (hiddenBaseRow + hiddenRowCount > memory.sram_depth_rows) {
         op.emitError(
-            "FFN hidden allocation cannot remain disjoint from its live input");
+            "FFN hidden allocation cannot remain disjoint from its live input")
+            << ": bank_rows=" << memory.sram_depth_rows
+            << ", hidden_base=" << hiddenBaseRow
+            << ", hidden_rows=" << hiddenRowCount
+            << ", input_end=" << liveInputEndRow;
         return mlir::failure();
     }
     const bool resultOverlapsHidden = llvm::any_of(result_slices,
         [&](int64_t resultSlice) {
             return llvm::is_contained(hidden_slices, resultSlice);
         });
+    const bool reuseDualMxmTemps = throughput.mxms_per_hemisphere == 2
+        && llvm::any_of(result_slices, [&](int64_t slice) {
+            return llvm::is_contained(gateTempSlices, slice)
+                || llvm::is_contained(upTempSlices, slice);
+        });
     // Prefer the input bank so the following residual add can read its two
     // operands from independent bank ICU queues. Only switch banks when the
     // target places final-result and hidden tiles on the same physical slices,
     // where Down result streaming would otherwise collide with hidden reads.
+    // Dual-MXM temporaries also occupy the persistent-residual slice group.
+    // The residual is retained in the input bank, so Down must use the dead
+    // Gate/Up bank after SwiGLU has drained.
     const int64_t resultBank = target.uses_dedicated_slice_roles()
         && memory.banks_per_slice > 1
-        && resultOverlapsHidden
+        && (resultOverlapsHidden || reuseDualMxmTemps)
         ? workingBank : inputBank;
     const bool largeSramProfile =
         memory.banks_per_slice * memory.words_per_bank >= 17000;
@@ -255,28 +305,28 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         ? 0 : largeSramProfile ? 10000 : 0;
     auto input = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Activation,
-            activation_slices, 0, m * k / throughput.mxm_rows,
-            m * k * 2, "fp16_mxm_activation_planar",
+            activation_slices, 0, inputRows,
+            m * k * 2, inputKind,
             "both", inputBank))
         : allocate_value(input_value, PlacementKind::Activation);
     auto gate = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
             gate_weight_slices, ffnWeightBase,
-            tiledWeights ? memory.sram_depth_rows : gate_rows,
+            (tiledWeights || nativePaged) ? memory.sram_depth_rows : gate_rows,
             k * hidden, {}, native4 ? "both" : "east",
             initialWeightBank))
         : allocate_value(gate_weight, PlacementKind::Weight);
     auto up = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
             up_weight_slices, ffnWeightBase,
-            tiledWeights ? memory.sram_depth_rows : gate_rows,
+            (tiledWeights || nativePaged) ? memory.sram_depth_rows : gate_rows,
             k * hidden, {}, native4 ? "both" : "east",
             native4 ? alternateWeightBank : initialWeightBank))
         : allocate_value(up_weight, PlacementKind::Weight);
     auto down = w8a16
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::Weight,
             down_weight_slices, ffnWeightBase,
-            tiledWeights ? memory.sram_depth_rows : down_rows,
+            (tiledWeights || nativePaged) ? memory.sram_depth_rows : down_rows,
             hidden * n, {}, native4 ? "both" : "east",
             initialWeightBank))
         : allocate_value(down_weight, PlacementKind::Weight);
@@ -299,9 +349,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const auto result = w8a16 && mlir::succeeded(result_bytes)
         ? mlir::FailureOr<Allocation>(fixed_allocation(PlacementKind::FinalResult,
             result_slices, 0,
-            m * n
-                / (throughput.mxm_rows
-                    * throughput.mxms_per_hemisphere),
+            ((n + down_wave_columns - 1) / down_wave_columns) * m,
             *result_bytes, {},
             "both", target.uses_dedicated_slice_roles()
                 ? resultBank
@@ -318,7 +366,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     rewriter.setInsertionPoint(op);
     const auto input_placement = w8a16
         ? make_profile_placement(rewriter, *input,
-            "fp16_mxm_activation_planar",
+            inputKind,
             "both")
         : make_placement_attr(rewriter, *input);
     const int64_t projectionPageCount = tiledWeights
@@ -352,13 +400,39 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
                                       tensor::FfnWeightTileKind kind) {
         if (native4) {
             mlir::NamedAttrList attrs(placement);
-            const auto rows = placement.getAs<mlir::IntegerAttr>(
-                "instruction_count").getInt();
+            const int64_t reductions = kind == tensor::FfnWeightTileKind::Down
+                ? nativeDownReductions : nativeProjectionReductions;
+            const int64_t totalWaves = kind == tensor::FfnWeightTileKind::Down
+                ? n / nativeWaveColumns : hidden / nativeWaveColumns;
+            const int64_t wavesPerPage = std::max<int64_t>(1,
+                memory.sram_depth_rows / reductions);
+            const int64_t nativePageCount =
+                (totalWaves + wavesPerPage - 1) / wavesPerPage;
+            const auto pageBank = placement.getAs<mlir::IntegerAttr>("bank");
+            const int64_t firstBank = pageBank
+                ? pageBank.getInt() : initialWeightBank;
+            llvm::SmallVector<mlir::Attribute> pageBanks;
+            llvm::SmallVector<mlir::Attribute> pageGroupBases;
+            llvm::SmallVector<mlir::Attribute> pageGroupCounts;
+            llvm::SmallVector<mlir::Attribute> pageBaseRows;
+            llvm::SmallVector<mlir::Attribute> pageRowCounts;
+            for (int64_t page = 0; page < nativePageCount; ++page) {
+                const int64_t waves = std::min(
+                    wavesPerPage, totalWaves - page * wavesPerPage);
+                pageBanks.push_back(rewriter.getI64IntegerAttr(
+                    (firstBank + page) % memory.banks_per_slice));
+                pageGroupBases.push_back(rewriter.getI64IntegerAttr(0));
+                pageGroupCounts.push_back(rewriter.getI64IntegerAttr(1));
+                pageBaseRows.push_back(rewriter.getI64IntegerAttr(0));
+                pageRowCounts.push_back(
+                    rewriter.getI64IntegerAttr(waves * reductions));
+            }
             attrs.set("paged_weight", rewriter.getBoolAttr(true));
-            attrs.set("page_count", rewriter.getI64IntegerAttr(1));
+            attrs.set("page_count", rewriter.getI64IntegerAttr(nativePageCount));
             attrs.set("page_rows",
                 rewriter.getI64IntegerAttr(memory.sram_depth_rows));
-            attrs.set("page_granularity", rewriter.getI64IntegerAttr(1));
+            attrs.set("page_granularity",
+                rewriter.getI64IntegerAttr(wavesPerPage));
             attrs.set("page_role_group_base", rewriter.getI64IntegerAttr(0));
             attrs.set("page_role_group_count", rewriter.getI64IntegerAttr(1));
             attrs.set("page_items_per_slice_group",
@@ -367,13 +441,13 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
                 rewriter.getArrayAttr(weightStorageSliceAttrs));
             attrs.set("page_bank_count",
                 rewriter.getI64IntegerAttr(memory.banks_per_slice));
-            const auto pageBank = placement.getAs<mlir::IntegerAttr>("bank");
-            attrs.set("page_banks", rewriter.getI64ArrayAttr(
-                {pageBank ? pageBank.getInt() : initialWeightBank}));
-            attrs.set("page_slice_group_bases", rewriter.getI64ArrayAttr({0}));
-            attrs.set("page_slice_group_counts", rewriter.getI64ArrayAttr({1}));
-            attrs.set("page_base_rows", rewriter.getI64ArrayAttr({0}));
-            attrs.set("page_row_counts", rewriter.getI64ArrayAttr({rows}));
+            attrs.set("page_banks", rewriter.getArrayAttr(pageBanks));
+            attrs.set("page_slice_group_bases",
+                rewriter.getArrayAttr(pageGroupBases));
+            attrs.set("page_slice_group_counts",
+                rewriter.getArrayAttr(pageGroupCounts));
+            attrs.set("page_base_rows", rewriter.getArrayAttr(pageBaseRows));
+            attrs.set("page_row_counts", rewriter.getArrayAttr(pageRowCounts));
             return attrs.getDictionary(rewriter.getContext());
         }
         if (!tiledWeights) return placement;
@@ -588,6 +662,45 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         projection_type, m, hidden, k,
         input_allocations, up_allocations, transient,
         projectionConfig(up_scale));
+
+    // SR SwiGLU retains Gate (two copies) and Up in fixed SRAM while the
+    // projections drain their accumulators. These are graph workspaces, even
+    // though the matmul SSA results are transient ACC values. Publish them
+    // before graph allocation so a sum retained across FFN batches cannot be
+    // placed in a later batch's temporary storage.
+    if (w8a16 && !native4 && throughput.vxm_alus == 16) {
+        const int64_t tile = throughput.mxm_rows;
+        const int64_t pairs = hidden
+            / ((throughput.mxms_per_hemisphere == 1
+                    ? memory.hemispheres : 1) * tile);
+        const int64_t residentRows = pairs
+            * ((m + tile - 1) / tile) * std::min(m, tile);
+        if (residentRows > memory.sram_depth_rows
+            || gateTempSlices.size() < 4 || upTempSlices.size() < 2) {
+            op.emitError("SR SwiGLU temporary workspace exceeds SRAM; "
+                         "split the FFN output channels before lowering");
+            return mlir::failure();
+        }
+        const int64_t tempBank = memory.banks_per_slice > 1
+                && (tiledWeights || hiddenOverlapsTempSlices)
+            ? (hiddenBank + 1) % memory.banks_per_slice : hiddenBank;
+        const auto tempPlacement = [&](llvm::ArrayRef<int64_t> slices) {
+            mlir::NamedAttrList attrs(hidden0_placement);
+            attrs.set("kind", rewriter.getStringAttr("bf16_swiglu_temp_byte"));
+            llvm::SmallVector<mlir::Attribute> sliceAttrs;
+            for (int64_t slice : slices)
+                sliceAttrs.push_back(rewriter.getI64IntegerAttr(slice));
+            attrs.set("slices", rewriter.getArrayAttr(sliceAttrs));
+            attrs.set("bank", rewriter.getI64IntegerAttr(tempBank));
+            attrs.set("base_row", rewriter.getI64IntegerAttr(0));
+            attrs.set("instruction_count", rewriter.getI64IntegerAttr(residentRows));
+            return attrs.getDictionary(rewriter.getContext());
+        };
+        gate_task->setAttr("temporary_workspace", tempPlacement(
+            llvm::ArrayRef<int64_t>(gateTempSlices).take_front(4)));
+        up_task->setAttr("temporary_workspace", tempPlacement(
+            llvm::ArrayRef<int64_t>(upTempSlices).take_front(2)));
+    }
 
     mlir::OperationState swish_state(op.getLoc(),
         tensor::SwishTaskOp::getOperationName());

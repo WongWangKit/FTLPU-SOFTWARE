@@ -1,4 +1,5 @@
 #include "KernelToTensorLowering.hpp"
+#include "ftlpu/compiler/Dialect/Kernel/Analysis/decoder_graph.hpp"
 
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
@@ -15,12 +16,6 @@
 namespace ftlpu::compiler {
 namespace {
 using namespace tensor_lowering;
-
-struct FeedbackGammaPlacement {
-    int64_t base_row = 0;
-    int64_t slice_base = -1;
-    int64_t bank = 0;
-};
 
 class LowerKernelToTensorPass final
     : public mlir::PassWrapper<LowerKernelToTensorPass, mlir::OperationPass<mlir::func::FuncOp>> {
@@ -82,9 +77,9 @@ public:
                     llvm::dyn_cast<kernel::DepthwiseConv1DOp>(&operation))
                 depthwiseConvs.push_back(conv);
         }
-        for (kernel::MatmulOp root : llvm::reverse(matmuls)) {
-            auto graph = kernel::match_attention_graph(root);
-            if (!graph) continue;
+        auto decoderGraph = kernel::match_decoder_graph(function);
+        for (auto& matched : decoderGraph.attentions) {
+            auto* graph = &matched;
             attention_operations.insert(
                 graph->operations.begin(), graph->operations.end());
             attentions.push_back(std::move(*graph));
@@ -92,9 +87,8 @@ public:
         llvm::erase_if(matmuls, [&](kernel::MatmulOp op) {
             return attention_operations.contains(op.getOperation());
         });
-        for (kernel::MatmulOp root : llvm::reverse(matmuls)) {
-            auto graph = kernel::match_ffn_graph(root);
-            if (!graph) continue;
+        for (auto& matched : decoderGraph.ffns) {
+            auto* graph = &matched;
             ffn_operations.insert(
                 graph->operations.begin(), graph->operations.end());
             if (is_w8a16_ffn(*graph, target))
@@ -157,15 +151,97 @@ public:
             // bank. Put eagerly uploaded gamma constants in the opposite
             // activation bank so host initialization cannot overwrite either
             // constant before execution begins.
-            const int64_t constantBank = target.memory().banks_per_slice > 1
+            int64_t constantBank = target.memory().banks_per_slice > 1
                 ? (std::max<int64_t>(0, weight_bank_) + 1)
                     % target.memory().banks_per_slice
                 : 0;
+            if (auto plannedBank = function->getAttrOfType<mlir::IntegerAttr>("ftlpu.feedback_gamma_bank")) {
+                constantBank = plannedBank.getInt();
+                if (constantBank < 0 || constantBank >= target.memory().banks_per_slice) {
+                    function.emitError("feedback gamma bank is outside target memory");
+                    signalPassFailure(); return;
+                }
+            }
+            // Small-bank decode can keep a gamma across two disjoint slice
+            // pairs. Each row broadcasts one feature to every physical lane;
+            // the second pair holds the tail after the first bank-depth rows.
+            // Two eagerly initialized gamma vectors must also use different
+            // banks, since both are live before the first instruction runs.
+            const bool segmentedGamma = llvm::any_of(rmsNorms,
+                [&](kernel::RmsNormOp rmsNorm) {
+                    return rmsNorm.getWeight().getType().getNumElements()
+                        > target.memory().words_per_bank;
+                });
+            if (segmentedGamma && (pairCount < 2
+                    || target.memory().banks_per_slice < 2)) {
+                function.emitError(
+                    "segmented RMSNorm gamma needs two slice pairs and two banks");
+                signalPassFailure();
+                return;
+            }
+            int64_t segmentedCount = 0;
             for (kernel::RmsNormOp rmsNorm : llvm::reverse(rmsNorms)) {
                 if (feedbackRmsWeightPlacements.contains(rmsNorm.getWeight()))
                     continue;
                 const int64_t rows =
                     rmsNorm.getWeight().getType().getNumElements();
+                // A dual-MXM compact prefill stores context in both banks of
+                // slices 16..19. The post-attention gamma must survive that
+                // operator, so split it over four activation slices in the
+                // upper rows of the Query bank, below its cache tail. The first
+                // gamma retires before attention and retains its old layout.
+                const int64_t gammaRows = (rows + 1) / 2;
+                const int64_t cacheTailReserve =
+                    rmsNorm.getInput().getType().getDimSize(0) * 2;
+                const int64_t gammaBase = target.memory().words_per_bank
+                    - cacheTailReserve - gammaRows;
+                if (rmsNorms.size() == 2 && rmsNorm == rmsNorms.back()
+                    && target.throughput().mxms_per_hemisphere == 2
+                    && target.throughput().mxm_rows == 64
+                    && target.memory().banks_per_slice == 2
+                    && target.memory().words_per_bank <= 2048
+                    && rmsNorm.getInput().getType().getDimSize(0)
+                        == target.throughput().mxm_rows
+                    && gammaBase >= target.memory().words_per_bank / 2) {
+                    feedbackRmsWeightPlacements[rmsNorm.getWeight()] = {
+                        gammaBase, distributedSlices.front(),
+                        1 - constantBank, gammaRows};
+                    continue;
+                }
+                if (segmentedGamma) {
+                    if (rows > 2 * target.memory().words_per_bank
+                        || segmentedCount >= target.memory().banks_per_slice) {
+                        function.emitError(
+                            "RMSNorm gamma vectors exceed segmented slice-pair banks");
+                        signalPassFailure();
+                        return;
+                    }
+                    const bool compactDecodeGamma =
+                        target.uses_dedicated_slice_roles()
+                        && target.memory().words_per_bank <= 1024
+                        && target.throughput().mxms_per_hemisphere == 1
+                        && rmsNorms.size() == 2
+                        && llvm::all_of(rmsNorms, [](kernel::RmsNormOp norm) {
+                            return norm.getInput().getType().getDimSize(0) == 1;
+                        });
+                    // Reverse traversal visits the FFN gamma first. Keep it
+                    // on activation bank 0. The attention gamma is consumed
+                    // before page-1 Q weights or Gate prefetch touch bank-0
+                    // weight slices, so that bank can stage it without
+                    // overlapping the persistent bank-1 Key cache.
+                    const int64_t gammaSliceBase =
+                        compactDecodeGamma && segmentedCount == 1
+                        ? target.weight_storage_slices().front()
+                        : constantSlices[0];
+                    const int64_t gammaBank =
+                        compactDecodeGamma ? constantBank
+                        : (constantBank + segmentedCount)
+                            % target.memory().banks_per_slice;
+                    feedbackRmsWeightPlacements[rmsNorm.getWeight()] = {
+                        0, gammaSliceBase, gammaBank};
+                    ++segmentedCount;
+                    continue;
+                }
                 std::optional<std::size_t> selected;
                 for (std::size_t pair = 0; pair < pairCount; ++pair) {
                     // Spread gamma constants across slice pairs before
@@ -216,29 +292,41 @@ public:
                 }
                 if (feedsFeedbackRmsNorm) {
                     const int64_t bytes = type.getNumElements() * 2;
-                    // distributed16 stores every 32-feature block in four
-                    // consecutive SRAM rows.  A one-token decode tensor
-                    // still occupies the full 32-row physical MXM tile, so
-                    // its address span is hidden / 8 rows rather than the
-                    // logical byte count divided by the 16 slices.  Keep the
-                    // binding extent equal to the physical address span;
-                    // otherwise the memory planner may reuse rows 12..191
-                    // while the decode input remains live for the residual.
-                    const int64_t physicalRows = type.getDimSize(0) == 1
-                        ? target.throughput().mxm_rows
-                        : type.getDimSize(0);
-                    const int64_t physicalRowSpan = physicalRows
-                        * type.getDimSize(1) / 256;
+                    // A decode token still occupies one physical MXM row
+                    // group. Reserve every SRAM row addressed by that group
+                    // so later scratch cannot overwrite the live residual.
+                    const int64_t physicalRowSpan =
+                        ((type.getDimSize(0)
+                              + target.throughput().mxm_rows - 1)
+                             / target.throughput().mxm_rows)
+                        * (type.getDimSize(1)
+                           / target.memory().bytes_per_word)
+                        * target.throughput().tile_rows;
                     const int64_t inputBank =
                         target.uses_dedicated_slice_roles()
                             && weight_bank_ >= 0
                         ? (weight_bank_ + 1)
                             % target.memory().banks_per_slice
                         : 0;
+                    const int64_t inputBase =
+                        type.getDimSize(0) == 1
+                            && target.uses_dedicated_slice_roles()
+                            && target.memory().words_per_bank <= 1024
+                        ? target.memory().words_per_bank
+                            - type.getDimSize(1)
+                                / target.throughput().mxm_rows
+                            - physicalRowSpan
+                        : target.uses_dedicated_slice_roles() ? 0 : 4096;
+                    if (inputBase < 0) {
+                        function.emitError(
+                            "decode residual input does not fit below attention staging");
+                        signalPassFailure();
+                        return;
+                    }
                     const auto allocation = fixed_allocation(
                         PlacementKind::Activation,
                         target.mxm_distributed_activation_slices(),
-                        target.uses_dedicated_slice_roles() ? 0 : 4096,
+                        inputBase,
                         physicalRowSpan, bytes,
                         "fp16_mxm_distributed_16", "both", inputBank);
                     if (mlir::failed(planner.bind(argument, allocation))) {
@@ -307,14 +395,15 @@ public:
             ffn_roots[ffns[index].output.getOperation()] = index;
 
         mlir::IRRewriter rewriter(&getContext());
-        bool loweredPagedAttention = false;
+        const auto priorWeightPages = function->getAttrOfType<mlir::BoolAttr>("ftlpu.prior_weight_pages");
+        bool loweredPagedAttention = priorWeightPages && priorWeightPages.getValue();
         for (mlir::Operation* operation : operation_order) {
             planner.release_before(operation);
             if (auto found = attention_roots.find(operation);
                 found != attention_roots.end()) {
                 if (mlir::failed(lower_attention(
                         attentions[found->second], target,
-                        weight_bank_, rewriter))) {
+                        weight_bank_, feedbackRmsWeightPlacements, rewriter))) {
                     signalPassFailure();
                     return;
                 }
@@ -334,6 +423,13 @@ public:
             if (attention_operations.contains(operation)
                 || ffn_operations.contains(operation))
                 continue;
+            if (auto op = llvm::dyn_cast<kernel::L2NormOp>(operation)) {
+                if (mlir::failed(lower_l2_norm(op, target, planner, rewriter))) {
+                    signalPassFailure();
+                    return;
+                }
+                continue;
+            }
             if (auto op = llvm::dyn_cast<kernel::RmsNormOp>(operation)) {
                 int64_t feedbackWeightBaseRow = 0;
                 int64_t feedbackWeightSliceBase = -1;
@@ -353,7 +449,8 @@ public:
                 if (mlir::failed(lower_rms_norm(
                         op, target, feedbackWeightBaseRow,
                         feedbackWeightSliceBase,
-                        feedbackWeightBank, weight_bank_, planner,
+                        feedbackWeightBank, weight_bank_,
+                        found->second.segment_rows, planner,
                         rewriter))) {
                     signalPassFailure();
                     return;

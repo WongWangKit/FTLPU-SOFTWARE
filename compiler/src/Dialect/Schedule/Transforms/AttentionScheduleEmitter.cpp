@@ -225,11 +225,7 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
     }
     if (op_.output_gate) {
         auto argument = llvm::dyn_cast<mlir::BlockArgument>(op_.getOutputGate());
-        if (!argument) {
-            op_.emitError("output gate must have a planned tensor input");
-            return mlir::failure();
-        }
-        createBinding(rewriter_, op_.getLoc(), argument, argument.getArgNumber(),
+        if (argument) createBinding(rewriter_, op_.getLoc(), argument, argument.getArgNumber(),
             "input", "activation", llvm::cast<mlir::RankedTensorType>(argument.getType()),
             memoryPlan.getAs<mlir::DictionaryAttr>("output_gate"));
     }

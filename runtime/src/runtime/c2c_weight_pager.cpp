@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 
 namespace ftlpu::software::runtime {
 namespace {
@@ -418,10 +419,12 @@ void retreat_native4_activation_producer_barriers(
                     // first activation-load issue. If a page wait lands in
                     // that producer READ_3D startup window, waiting only the
                     // MXM queue lets the vector pass while MXM is stopped.
-                    // Put this MEM ICU's wait at the first issue instead; the
-                    // per-ICU release phase retains the original MEM-to-MXM
-                    // lead without splitting the 3-D instruction.
-                    barriers[index].first = issueStart;
+                    // WAIT_EVENT itself occupies one issue cycle. Use the
+                    // idle slot immediately before the producer's first
+                    // read so the read retains its compiler-scheduled lead
+                    // over MXM after a dynamically late page release.
+                    barriers[index].first = issueStart > cursor
+                        ? issueStart - 1 : issueStart;
                 }
             }
             cursor = commandEnd;
@@ -448,6 +451,551 @@ void retreat_native4_activation_producer_barriers(
         throw std::logic_error(
             "unsupported MEM command while locating native4 activation producer");
     }
+}
+
+struct MxmOutputTail {
+    std::size_t event_tag{0};
+    std::size_t hemisphere{0};
+    std::size_t stream_base{0};
+    std::size_t last_compute_issue{0};
+};
+using MxmOutputTailsByEvent =
+    std::unordered_map<std::size_t, std::vector<MxmOutputTail>>;
+
+std::vector<MxmOutputTail> find_mxm_output_tails(
+    const BinaryProgram& program,
+    const std::vector<std::pair<std::size_t, std::size_t>>& barriers)
+{
+    std::vector<MxmOutputTail> tails;
+    const auto mxmsPerHemisphere = program.hardware.mxms_per_hemisphere;
+    if (mxmsPerHemisphere == 0) return tails;
+    for (const auto& queue : program.queues) {
+        if (queue.kind != QueueKind::MxmCompute) continue;
+        const auto hemisphere = queue.index / mxmsPerHemisphere;
+        if (hemisphere >= hw::kHemispheres) continue;
+        std::size_t cursor = 0;
+        for (std::size_t pc = 0; pc < queue.commands.size();) {
+            const auto& command = queue.commands[pc];
+            if (const auto idle = nop_cycles(command)) {
+                cursor += *idle;
+                ++pc;
+            } else if (is_fu_3d_raw_packet_header(command)) {
+                isa::EncodedMxmComputeIcu3DPacket packet{};
+                const auto words = fu_3d_raw_packet_word_count(
+                    queue.kind, command);
+                for (std::size_t word = 0; word < words; ++word)
+                    for (std::size_t lane = 0; lane < packet.kLanesPerWord;
+                         ++lane)
+                        packet.words[word].lanes[lane] =
+                            queue.commands[pc + word].words[lane];
+                const auto instruction =
+                    isa::decode_mxm_compute_icu_3d_instruction(packet);
+                const auto issueStart = cursor + instruction.loop.start_cycle
+                    + instruction.loop.wait_cycle;
+                const auto commandEnd = cursor + loop_cycles(instruction.loop);
+                const bool streamsResult =
+                    instruction.regular_mode.accumulator_destination
+                            == MxmAccumulatorDestination::Stream
+                    || instruction.terminal_mode.accumulator_destination
+                            == MxmAccumulatorDestination::Stream;
+                if (streamsResult)
+                    for (const auto& [ready, eventTag] : barriers)
+                        if (issueStart < ready
+                            && ready < commandEnd
+                                + program.hardware.accumulator_to_vxm_latency
+                                + program.hardware.vxm_alus + 2)
+                            tails.push_back(MxmOutputTail {eventTag,
+                                hemisphere,
+                                instruction.result_stream_base,
+                                commandEnd - 1});
+                cursor = commandEnd;
+                pc += words;
+            } else {
+                ++cursor;
+                ++pc;
+            }
+        }
+    }
+    return tails;
+}
+
+void defer_mem_barriers_past_mxm_output_tails(
+    const QueueProgram& queue, const ExecutableHardwareConfig& hardware,
+    const MxmOutputTailsByEvent& tailsByEvent,
+    std::vector<std::pair<std::size_t, std::size_t>>& barriers)
+{
+    if (queue.kind != QueueKind::Mem || tailsByEvent.empty()
+        || hardware.mem_slices_per_register_group == 0)
+        return;
+    const auto slice = (queue.index
+        % InstructionControlUnit::kMemQueuesPerHemisphere)
+        / hw::kMemBanksPerSlice;
+    const auto group = slice / hardware.mem_slices_per_register_group;
+    const auto hemisphere = queue.index
+        / InstructionControlUnit::kMemQueuesPerHemisphere;
+    if (hardware.system_register_columns <= group + 1) return;
+    const auto localResultLatency = hardware.mxm_pipeline_rows - 1
+        + hardware.system_register_columns - 1 - group;
+    const auto remoteResultLatency = hardware.mxm_pipeline_rows - 1
+        + hardware.accumulator_to_vxm_latency + hardware.vxm_alus
+        + group;
+    std::size_t cursor = 0;
+    for (std::size_t pc = 0; pc < queue.commands.size();) {
+        const auto& command = queue.commands[pc];
+        if (const auto idle = nop_cycles(command)) {
+            cursor += *idle;
+            ++pc;
+        } else if (is_mem_synchronized_raw_packet_header(command)) {
+            cursor += (command.words[2] & 0x00ffffffU) + 1;
+            pc += InstructionControlUnit::MemIcu::synchronized_packet_word_count;
+        } else if (is_mem_write_read_2d_raw_packet_header(command)) {
+            cursor += detail::mem_icu_write_read_2d_last_issue_cycle(
+                decode_mem_write_read_2d_raw_packet(queue, pc)) + 1;
+            pc += fu_3d_raw_packet_word_count(queue.kind, command);
+        } else if (is_fu_3d_raw_packet_header(command)) {
+            const auto instruction = decode_mem_3d_instruction(queue, pc);
+            const auto issueStart = cursor + instruction.loop.start_cycle
+                + instruction.loop.wait_cycle;
+            const auto commandEnd = cursor + loop_cycles(instruction.loop);
+            if (instruction.opcode == MemIcuOpcode::Write3D) {
+                const auto stream = StreamId::from_packed(instruction.stream);
+                for (auto& [ready, eventTag] : barriers) {
+                    if (issueStart < ready || ready >= commandEnd) continue;
+                    const auto found = tailsByEvent.find(eventTag);
+                    if (found == tailsByEvent.end()) continue;
+                    for (const auto& tail : found->second) {
+                        const bool local = stream.direction()
+                                == StreamDirection::West
+                            && hemisphere == tail.hemisphere;
+                        const bool remote = stream.direction()
+                                == StreamDirection::East
+                            && hemisphere != tail.hemisphere;
+                        if (tail.event_tag != eventTag
+                            || (!local && !remote)
+                            || stream.index() < tail.stream_base
+                            || stream.index() >= tail.stream_base
+                                + hardware.mxm_result_streams
+                            || issueStart > tail.last_compute_issue
+                                + (local ? localResultLatency
+                                         : remoteResultLatency))
+                            continue;
+                        // The compute domain started before this page wait.
+                        // Its last result can still be in the local stream
+                        // route or the passive VXM bridge. Complete that
+                        // old-page MEM write before joining the next page.
+                        ready = commandEnd;
+                    }
+                }
+            }
+            cursor = commandEnd;
+            pc += fu_3d_raw_packet_word_count(queue.kind, command);
+        } else {
+            ++cursor;
+            ++pc;
+        }
+    }
+}
+
+struct MxmOutputTilePair {
+    std::size_t event_tag;
+    std::size_t queue_index;
+    std::size_t activation_stream_base;
+    std::size_t first_begin;
+    std::size_t second_begin;
+    std::size_t second_end;
+};
+
+std::optional<std::size_t> mem_result_write_delay_after_page_wait(
+    const QueueProgram& queue, std::size_t eventTag,
+    std::size_t resultStreamBase, std::size_t resultStreamCount,
+    std::size_t* contiguousWriteCount = nullptr)
+{
+    if (queue.kind != QueueKind::Mem) return std::nullopt;
+    bool afterWait = false;
+    std::size_t delay = 0;
+    for (std::size_t pc = 0; pc < queue.commands.size();) {
+        const auto& command = queue.commands[pc];
+        if (const auto idle = nop_cycles(command)) {
+            if (afterWait) delay += *idle;
+            ++pc;
+            continue;
+        }
+        if (is_icu_control_raw_word_command(command)) {
+            const auto control = decode_icu_control_raw_word(command);
+            if (control.opcode == IcuControlOpcode::WaitEvent
+                && control.event_tag == eventTag) {
+                afterWait = true;
+                delay = 1;
+            } else if (afterWait) {
+                return std::nullopt;
+            }
+            ++pc;
+            continue;
+        }
+        if (is_fu_3d_raw_packet_header(command)) {
+            const auto words = fu_3d_raw_packet_word_count(
+                queue.kind, command);
+            if (afterWait) {
+                const auto instruction = decode_mem_3d_instruction(queue, pc);
+                const auto stream = StreamId::from_packed(
+                    instruction.stream);
+                if ((instruction.opcode == MemIcuOpcode::Write3D
+                        || instruction.opcode == MemIcuOpcode::WriteTap3D)
+                    && stream.direction() == StreamDirection::West
+                    && stream.index() >= resultStreamBase
+                    && stream.index() < resultStreamBase
+                        + resultStreamCount)
+                {
+                    if (contiguousWriteCount
+                        && instruction.loop.counts[1] == 1
+                        && instruction.loop.counts[2] == 1
+                        && instruction.loop.cycle_strides[0] == 1)
+                        *contiguousWriteCount = instruction.loop.counts[0];
+                    return delay + instruction.loop.start_cycle
+                        + instruction.loop.wait_cycle;
+                }
+                return std::nullopt;
+            }
+            pc += words;
+            continue;
+        }
+        if (afterWait) return std::nullopt;
+        ++pc;
+    }
+    return std::nullopt;
+}
+
+struct MxmPageResultStream {
+    std::size_t event_tag{0};
+    std::size_t hemisphere{0};
+    std::size_t stream_base{0};
+    std::size_t first_result_delay{0};
+    std::size_t last_compute_delay{0};
+    std::size_t queue_index{0};
+    std::size_t activation_stream_base{0};
+    std::size_t first_compute_delay{1};
+    std::size_t contiguous_result_count{0};
+};
+
+std::vector<MxmPageResultStream> find_mxm_page_result_streams(
+    const BinaryProgram& program)
+{
+    std::vector<MxmPageResultStream> streams;
+    if (program.hardware.mxms_per_hemisphere == 0) return streams;
+    for (const auto& queue : program.queues) {
+        if (queue.kind != QueueKind::MxmCompute) continue;
+        std::optional<std::size_t> pageEvent;
+        std::size_t delay = 0;
+        for (std::size_t pc = 0; pc < queue.commands.size();) {
+            const auto& command = queue.commands[pc];
+            if (const auto idle = nop_cycles(command)) {
+                if (pageEvent) delay += *idle;
+                ++pc;
+                continue;
+            }
+            if (is_icu_control_raw_word_command(command)) {
+                const auto control = decode_icu_control_raw_word(command);
+                if (control.opcode == IcuControlOpcode::WaitEvent) {
+                    pageEvent = control.event_tag;
+                    delay = 1;
+                } else {
+                    pageEvent.reset();
+                }
+                ++pc;
+                continue;
+            }
+            if (is_fu_3d_raw_packet_header(command)) {
+                const auto words = fu_3d_raw_packet_word_count(
+                    queue.kind, command);
+                if (pageEvent) {
+                    isa::EncodedMxmComputeIcu3DPacket packet{};
+                    for (std::size_t word = 0; word < words; ++word)
+                        for (std::size_t lane = 0;
+                             lane < packet.kLanesPerWord; ++lane)
+                            packet.words[word].lanes[lane] =
+                                queue.commands[pc + word].words[lane];
+                    const auto instruction =
+                        isa::decode_mxm_compute_icu_3d_instruction(packet);
+                    const auto dimension = instruction.terminal_dimension;
+                    const bool hasTerminal = dimension < IcuLoop3D::kDimensions;
+                    const bool regularStream = instruction.regular_mode
+                        .accumulator_destination == MxmAccumulatorDestination::Stream;
+                    const bool terminalStream = hasTerminal && instruction.terminal_mode
+                        .accumulator_destination == MxmAccumulatorDestination::Stream;
+                    const bool firstIsTerminal = hasTerminal
+                        && instruction.loop.counts[dimension] == 1;
+                    std::optional<std::size_t> firstResult;
+                    if (firstIsTerminal ? terminalStream : regularStream)
+                        firstResult = 0;
+                    else if (terminalStream)
+                        firstResult = (instruction.loop.counts[dimension] - 1)
+                            * instruction.loop.cycle_strides[dimension];
+                    if (instruction.opcode == MxmComputeIcuOpcode::Compute3D
+                        && firstResult) {
+                        streams.push_back(MxmPageResultStream {
+                            *pageEvent,
+                            queue.index / program.hardware.mxms_per_hemisphere,
+                            instruction.result_stream_base,
+                            delay + instruction.loop.start_cycle
+                                + instruction.loop.wait_cycle + *firstResult,
+                            delay + loop_cycles(instruction.loop) - 1,
+                            queue.index, instruction.activation_stream_base,
+                            delay + instruction.loop.start_cycle + instruction.loop.wait_cycle,
+                            instruction.loop.cycle_strides[0] == 1
+                                ? instruction.loop.counts[0] : 0});
+                        pageEvent.reset();
+                    }
+                    delay += loop_cycles(instruction.loop);
+                }
+                pc += words;
+                continue;
+            }
+            if (!nop_cycles(command)) pageEvent.reset();
+            ++pc;
+        }
+    }
+    return streams;
+}
+
+std::size_t mem_activation_first_read_delay_after_page_wait(
+    const QueueProgram& queue, std::size_t eventTag,
+    std::size_t activationStreamBase)
+{
+    if (queue.kind != QueueKind::Mem) return 0;
+    bool afterWait = false;
+    std::size_t elapsed = 0;
+    for (std::size_t pc = 0; pc < queue.commands.size();) {
+        const auto& command = queue.commands[pc];
+        if (is_icu_control_raw_word_command(command)) {
+            const auto control = decode_icu_control_raw_word(command);
+            if (control.opcode == IcuControlOpcode::WaitEvent
+                && control.event_tag == eventTag) {
+                afterWait = true;
+                elapsed = 1;
+            } else if (afterWait && control.opcode == IcuControlOpcode::Nop) {
+                elapsed += control.count;
+            } else if (afterWait) {
+                return 0;
+            }
+            ++pc;
+            continue;
+        }
+        if (is_fu_3d_raw_packet_header(command)) {
+            const auto words = fu_3d_raw_packet_word_count(
+                queue.kind, command);
+            if (afterWait) {
+                const auto instruction = decode_mem_3d_instruction(queue, pc);
+                const auto stream = StreamId::from_packed(instruction.stream);
+                if (instruction.opcode == MemIcuOpcode::Read3D
+                    && stream.direction() == StreamDirection::East
+                    && stream.index() >= activationStreamBase
+                    && stream.index() < activationStreamBase + 2)
+                    return elapsed + instruction.loop.start_cycle
+                        + instruction.loop.wait_cycle;
+                return 0;
+            }
+            pc += words;
+            continue;
+        }
+        if (afterWait) return 0;
+        ++pc;
+    }
+    return 0;
+}
+
+void defer_mxm_barriers_past_output_tile_pairs(
+    const QueueProgram& queue,
+    std::vector<std::pair<std::size_t, std::size_t>>& barriers,
+    std::vector<MxmOutputTilePair>* outputPairs = nullptr)
+{
+    if (queue.kind != QueueKind::MxmCompute || barriers.empty()) return;
+    struct OutputTile {
+        std::size_t begin;
+        std::size_t end;
+        MxmComputeIcuInstruction instruction;
+    };
+    std::optional<OutputTile> previous;
+    std::size_t cursor = 0;
+    for (std::size_t pc = 0; pc < queue.commands.size();) {
+        const auto& command = queue.commands[pc];
+        if (const auto idle = nop_cycles(command)) {
+            cursor += *idle;
+            ++pc;
+            continue;
+        }
+        if (!is_fu_3d_raw_packet_header(command)) {
+            previous.reset();
+            ++cursor;
+            ++pc;
+            continue;
+        }
+        const auto words = fu_3d_raw_packet_word_count(queue.kind, command);
+        isa::EncodedMxmComputeIcu3DPacket packet{};
+        for (std::size_t word = 0; word < words; ++word)
+            for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+                packet.words[word].lanes[lane] =
+                    queue.commands[pc + word].words[lane];
+        const auto current = isa::decode_mxm_compute_icu_3d_instruction(packet);
+        const auto begin = cursor + current.loop.start_cycle
+            + current.loop.wait_cycle;
+        const auto end = cursor + loop_cycles(current.loop);
+        const auto streamsResult = [](const MxmComputeIcuInstruction& value) {
+            return value.opcode == MxmComputeIcuOpcode::Compute3D
+                && value.regular_mode.accumulator_destination
+                    == MxmAccumulatorDestination::Stream
+                && value.terminal_mode.accumulator_destination
+                    == MxmAccumulatorDestination::Stream
+                && value.loop.counts[0] > 1
+                && value.loop.counts[0] <= hw::kMxmRows
+                && value.loop.counts[1] == 1
+                && value.loop.counts[2] == 1;
+        };
+        if (previous && streamsResult(previous->instruction)
+            && streamsResult(current)
+            && begin == previous->end
+            && previous->instruction.weight_buffer_base
+                == current.weight_buffer_base
+            && previous->instruction.result_stream_base
+                == current.result_stream_base
+            && previous->instruction.loop.counts[0]
+                == current.loop.counts[0]
+            && previous->instruction.accumulator_address_base
+                % (2 * current.loop.counts[0]) == 0
+            && current.accumulator_address_base
+                == previous->instruction.accumulator_address_base
+                    + current.loop.counts[0]) {
+            for (auto& [ready, eventTag] : barriers) {
+                // WAIT_EVENT may be scheduled one cycle before a page's
+                // nominal boundary. If it lands inside the first output
+                // tile, the ICU cannot pause that domain and would otherwise
+                // insert the wait between the two tiles. Keep the complete
+                // output wave in one execution epoch.
+                if (ready > previous->begin && ready <= begin) {
+                    if (outputPairs != nullptr)
+                        outputPairs->push_back(MxmOutputTilePair {
+                            eventTag, queue.index,
+                            current.activation_stream_base,
+                            previous->begin, begin, end});
+                    ready = end;
+                }
+            }
+        }
+        previous = OutputTile {begin, end, current};
+        cursor = end;
+        pc += words;
+    }
+}
+
+void align_mem_barriers_at_mxm_activation_wave_boundary(
+    const QueueProgram& queue, const ExecutableHardwareConfig& hardware,
+    const std::vector<MxmOutputTilePair>& pairs,
+    std::vector<std::pair<std::size_t, std::size_t>>& barriers,
+    std::vector<std::pair<std::size_t, std::size_t>>* activationProducers = nullptr,
+    std::unordered_map<std::size_t, std::size_t>* barrierShifts = nullptr)
+{
+    if (queue.kind != QueueKind::Mem || pairs.empty()
+        || hardware.mxms_per_hemisphere == 0
+        || hardware.mem_slices_per_register_group == 0)
+        return;
+    const auto hemisphere = queue.index
+        / InstructionControlUnit::kMemQueuesPerHemisphere;
+    const auto slice = (queue.index
+        % InstructionControlUnit::kMemQueuesPerHemisphere)
+        / hw::kMemBanksPerSlice;
+    const auto registerGroup = slice
+        / hardware.mem_slices_per_register_group;
+    const auto tokenLane = slice / 2;
+    std::size_t cursor = 0;
+    std::unordered_map<std::size_t, std::size_t> firstReadEndByEvent;
+    for (std::size_t pc = 0; pc < queue.commands.size();) {
+        const auto& command = queue.commands[pc];
+        if (const auto idle = nop_cycles(command)) {
+            cursor += *idle;
+            ++pc;
+            continue;
+        }
+        if (is_mem_synchronized_raw_packet_header(command)) {
+            cursor += (command.words[2] & 0x00ffffffU) + 1;
+            pc += InstructionControlUnit::MemIcu::
+                synchronized_packet_word_count;
+            continue;
+        }
+        if (!is_fu_3d_raw_packet_header(command)) {
+            ++cursor;
+            ++pc;
+            continue;
+        }
+        const auto words = fu_3d_raw_packet_word_count(queue.kind, command);
+        if (is_mem_write_read_2d_raw_packet_header(command)) {
+            cursor += detail::mem_icu_write_read_2d_last_issue_cycle(
+                decode_mem_write_read_2d_raw_packet(queue, pc)) + 1;
+            pc += words;
+            continue;
+        }
+        const auto instruction = decode_mem_3d_instruction(queue, pc);
+        const auto issueStart = cursor + instruction.loop.start_cycle
+            + instruction.loop.wait_cycle;
+        const auto commandEnd = cursor + loop_cycles(instruction.loop);
+        if (instruction.opcode == MemIcuOpcode::Read3D) {
+            const auto stream = StreamId::from_packed(instruction.stream);
+            if (stream.direction() == StreamDirection::East)
+                for (const auto& pair : pairs) {
+                    // A slice may emit the next output wave's first vector
+                    // while the previous MXM tile still computes. Classify
+                    // the read by its arrival at MXM, not only its MEM issue
+                    // cycle, before placing the dynamic page wait.
+                    if (pair.queue_index / hardware.mxms_per_hemisphere
+                            != hemisphere
+                        || stream.index() < pair.activation_stream_base
+                        || stream.index()
+                            >= pair.activation_stream_base + 2
+                        || issueStart < pair.first_begin
+                        || issueStart >= pair.second_end)
+                        continue;
+                    if (activationProducers != nullptr)
+                        activationProducers->emplace_back(
+                            pair.event_tag, queue.index);
+                    for (auto& [ready, eventTag] : barriers)
+                        if (eventTag == pair.event_tag
+                            && ready <= pair.second_end) {
+                            // The final activation read for the following
+                            // page may issue while the prior output tile is
+                            // still computing: it needs SR flight time.
+                            // Such a vector cannot cross a dynamic page
+                            // wait, because it would leave the SR long
+                            // before the next MXM domain resumes. Move the
+                            // MEM wait before this read, not after it.
+                            const bool planarActivationSlice =
+                                slice < 2 * hardware.mxm_block_rows
+                                && hardware.system_register_columns + 1
+                                    >= registerGroup + tokenLane;
+                            const auto mxmArrival = planarActivationSlice
+                                ? issueStart
+                                    + hardware.system_register_columns + 1
+                                    - registerGroup - tokenLane
+                                : 0;
+                            if (planarActivationSlice
+                                && mxmArrival >= pair.second_end) {
+                                ready = std::min(ready, cursor);
+                            } else if (ready < commandEnd) {
+                                firstReadEndByEvent.try_emplace(eventTag,
+                                    commandEnd);
+                                ready = std::max(ready, commandEnd);
+                            }
+                        }
+                }
+        }
+        cursor = commandEnd;
+        pc += words;
+    }
+    if (barrierShifts != nullptr)
+        for (const auto& [ready, eventTag] : barriers) {
+            const auto first = firstReadEndByEvent.find(eventTag);
+            if (first != firstReadEndByEvent.end()
+                && ready > first->second)
+                (*barrierShifts)[eventTag] = std::max(
+                    (*barrierShifts)[eventTag], ready - first->second);
+        }
 }
 
 void set_raw_3d_wait(QueueCommand& header, std::size_t wait)
@@ -566,7 +1114,8 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
         std::size_t>>,
         InstructionControlUnit::kMemQueues>& memWriteWindows,
     std::vector<std::tuple<std::size_t, QueueKind, std::size_t,
-        std::size_t>>* insertedBarriers = nullptr)
+        std::size_t>>* insertedBarriers = nullptr,
+    bool preserveIssuePhases = false)
 {
     if (barriers.empty()) return;
     auto timedBarriers = barriers;
@@ -587,6 +1136,17 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
     }
     const auto native4ActivationStarts =
         find_native4_activation_starts(program, barriers);
+    const auto mxmOutputTails = find_mxm_output_tails(program, barriers);
+    MxmOutputTailsByEvent mxmOutputTailsByEvent;
+    for (const auto& tail : mxmOutputTails)
+        mxmOutputTailsByEvent[tail.event_tag].push_back(tail);
+    std::vector<MxmOutputTilePair> mxmOutputTilePairs;
+    for (const QueueProgram& queue : program.queues) {
+        if (queue.kind != QueueKind::MxmCompute) continue;
+        auto queueBarriers = timedBarriers;
+        defer_mxm_barriers_past_output_tile_pairs(
+            queue, queueBarriers, &mxmOutputTilePairs);
+    }
     for (QueueProgram& queue : program.queues) {
         if (queue.kind == QueueKind::C2cDma
             || queue.kind == QueueKind::C2cRx
@@ -595,6 +1155,14 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
 
         auto queueBarriers = timedBarriers;
         std::vector<std::size_t> earlyJoinTags;
+        if (queue.kind == QueueKind::MxmCompute) {
+            defer_mxm_barriers_past_output_tile_pairs(queue, queueBarriers);
+            std::ranges::sort(queueBarriers,
+                [](const auto& lhs, const auto& rhs) {
+                    return std::tie(lhs.first, lhs.second)
+                        < std::tie(rhs.first, rhs.second);
+                });
+        }
         if (queue.kind == QueueKind::Mem
             && queue.index < memWriteWindows.size()) {
             retreat_native4_activation_producer_barriers(
@@ -672,6 +1240,10 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     }
                 }
             }
+            defer_mem_barriers_past_mxm_output_tails(
+                queue, program.hardware, mxmOutputTailsByEvent, queueBarriers);
+            align_mem_barriers_at_mxm_activation_wave_boundary(
+                queue, program.hardware, mxmOutputTilePairs, queueBarriers);
             std::ranges::sort(queueBarriers,
                 [](const auto& lhs, const auto& rhs) {
                     return std::tie(lhs.first, lhs.second)
@@ -685,8 +1257,23 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
         std::vector<std::size_t> oldToNew(original.size(),
             std::numeric_limits<std::size_t>::max());
         std::size_t cursor = 0;
+        std::size_t originalCursor = 0;
         std::size_t barrierIndex = 0;
-        std::size_t barrierIssueDrift = 0;
+        std::vector<std::size_t> pendingPhaseIndices;
+        const auto preserveNextIssue = [&](std::size_t originalIssue,
+                                           std::size_t linkedIssue) {
+            if (!preserveIssuePhases || insertedBarriers == nullptr) return;
+            for (const auto index : pendingPhaseIndices) {
+                auto& phase = std::get<3>((*insertedBarriers)[index]);
+                const auto adjusted = static_cast<std::int64_t>(phase)
+                    + static_cast<std::int64_t>(originalIssue)
+                    - static_cast<std::int64_t>(linkedIssue);
+                if (adjusted < 0)
+                    throw std::logic_error("page wait has no nonnegative logical issue phase");
+                phase = static_cast<std::size_t>(adjusted);
+            }
+            pendingPhaseIndices.clear();
+        };
 
         // actualCycle is the logical consumer phase, even for an early join
         // whose queue reaches WAIT_EVENT before that logical cycle. Release
@@ -695,11 +1282,12 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                                        std::size_t actualCycle) {
             append_control(linked,
                 IcuControlInstruction::WaitEvent(barrier.second));
-            if (insertedBarriers != nullptr)
+            if (insertedBarriers != nullptr) {
                 insertedBarriers->emplace_back(
                     barrier.second, queue.kind, queue.index,
-                    actualCycle >= barrierIssueDrift
-                        ? actualCycle - barrierIssueDrift : 0);
+                    actualCycle);
+                pendingPhaseIndices.push_back(insertedBarriers->size() - 1);
+            }
         };
         auto appendDueBarriers = [&](std::size_t throughCycle) {
             while (barrierIndex < queueBarriers.size()
@@ -730,6 +1318,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     linked.push_back(original[commandIndex + word]);
                 }
                 cursor += reservation;
+                originalCursor += reservation;
                 commandIndex += words;
                 continue;
             }
@@ -740,7 +1329,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                 // retaining the mapping keeps the linked image structurally
                 // valid for inspection and re-serialization.
                 oldToNew[commandIndex] = linked.size();
-                const auto idleEnd = cursor + *cycles;
+                const auto idleEnd = originalCursor + *cycles;
                 while (barrierIndex < queueBarriers.size()
                     && queueBarriers[barrierIndex].first < idleEnd) {
                     const auto barrierCycle = std::max(
@@ -758,6 +1347,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     append_nop(linked, idleEnd - cursor);
                     cursor = idleEnd;
                 }
+                originalCursor = idleEnd;
                 ++commandIndex;
                 continue;
             }
@@ -765,6 +1355,8 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                 appendDueBarriers(cursor);
                 oldToNew[commandIndex] = linked.size();
                 linked.push_back(command);
+                ++cursor;
+                ++originalCursor;
                 ++commandIndex;
                 continue;
             }
@@ -778,7 +1370,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     : decode_fu_3d_raw_packet_loop(queue, commandIndex);
                 const auto wait = writeRead ? std::size_t {0}
                                             : loop.wait_cycle;
-                const auto commandBase = cursor;
+                const auto commandBase = originalCursor;
                 const auto idleEnd = commandBase + wait;
                 while (barrierIndex < queueBarriers.size()
                     && queueBarriers[barrierIndex].first <= idleEnd) {
@@ -788,13 +1380,10 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                             queueBarriers[barrierIndex].second) == earlyJoinTags.end())
                         append_nop(linked, barrierCycle - cursor);
                     cursor = barrierCycle;
-                    // A barrier at a zero-wait boundary adds an issue cycle
-                    // to this queue. Express its release phase in the original
-                    // schedule so other queues (which absorb SYNC in wait_cycle)
-                    // keep their producer/consumer distance.
-                    const auto extraIssue = cursor >= idleEnd ? std::size_t {1}
-                                                             : std::size_t {0};
-                    barrierIssueDrift += extraIssue;
+                    // Release phases describe the linked ICU image. Previous
+                    // zero-wait barriers may have added issue cycles; removing
+                    // them here would release a consumer ahead of its MEM
+                    // activation producers after a later dynamic page wait.
                     appendBarrier(queueBarriers[barrierIndex], barrierCycle);
                     ++cursor;
                     ++barrierIndex;
@@ -809,6 +1398,13 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                     ? idleEnd - cursor : std::size_t {0};
                 const auto commandEnd = cursor + remainingWait
                     + activeDuration;
+                // The injected control word can consume idle time or add a
+                // cycle to a zero-wait queue. Release relative to the first
+                // original FU issue, not that altered local cursor. This
+                // preserves the compiler's producer/consumer phase for the
+                // entire following interval, including MEM/VXM writeback.
+                preserveNextIssue(idleEnd + loop.start_cycle,
+                    cursor + remainingWait + loop.start_cycle);
                 // A hardware ICU cannot suspend a decoded 3-D domain halfway
                 // through its nested loop. Keep a barrier crossed by the
                 // active domain pending so appendDueBarriers places it at the
@@ -823,6 +1419,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                 if (!writeRead && remainingWait != wait)
                     set_raw_3d_wait(linked[newHeader], remainingWait);
                 cursor = commandEnd;
+                originalCursor = commandBase + duration;
                 commandIndex += words;
                 continue;
             }
@@ -837,6 +1434,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                 oldToNew[commandIndex] = linked.size();
                 linked.push_back(command);
                 cursor = final + 1;
+                originalCursor = final + 1;
                 ++commandIndex;
             };
             if (is_mem_stream_nd_command(command)) {
@@ -861,6 +1459,7 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                 oldToNew[commandIndex] = linked.size();
                 linked.push_back(command);
                 ++cursor;
+                ++originalCursor;
                 ++commandIndex;
                 continue;
             }
@@ -924,7 +1523,7 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
     constexpr auto maxSyncTag =
         static_cast<std::uint32_t>(std::numeric_limits<std::uint16_t>::max());
     if (firstSyncTag == 0 || firstSyncTag > maxSyncTag
-        || page.segments.size() - 1 > maxSyncTag - firstSyncTag)
+        || page.segments.size() > maxSyncTag)
         throw std::overflow_error(
             "C2C weight-page sync tags exceed the 16-bit ICU field");
 
@@ -962,8 +1561,13 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
         const auto group = segment.slice / hw::kMemSlicesPerGroup;
         const auto transportNops =
             hw::kMemEastBoundaryStreamRegisterColumn - (group + 1);
-        const auto syncTag = firstSyncTag
-            + static_cast<std::uint32_t>(segmentIndex);
+        // RX/DMA/MEM queues consume packets in order, with a DMA completion
+        // SYNC after every descriptor. Recycle the nonzero 16-bit tag space
+        // after a full rotation instead of imposing a 65k-segment limit on
+        // an entire decoder layer.
+        const auto syncTag = 1 + static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(firstSyncTag - 1) + segmentIndex)
+            % maxSyncTag);
         // A dynamically synchronized packet has one logical instruction
         // slot; its actual lifetime still includes all requested FU writes.
         // Legacy standalone reservations retain the fixed write-count floor.
@@ -1004,8 +1608,9 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
         program.dma_completion_sync[hemisphere_index(segment.hemisphere)] =
             true;
     }
-    program.next_sync_tag = firstSyncTag
-        + static_cast<std::uint32_t>(program.segments.size());
+    program.next_sync_tag = 1 + static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(firstSyncTag - 1)
+            + program.segments.size()) % maxSyncTag);
     return program;
 }
 
@@ -1032,6 +1637,14 @@ void C2cWeightPager::begin_schedule(const BinaryProgram& program)
     for (auto& windows : linked_mem_windows_) windows.clear();
     linked_page_barriers_.clear();
     linked_page_releases_.clear();
+    linked_preserves_issue_phases_ = false;
+    linked_activation_barrier_shifts_.clear();
+    linked_mxm_rows_ = program.hardware.mxm_rows;
+    linked_mxm_pipeline_rows_ = program.hardware.mxm_pipeline_rows;
+    linked_system_register_columns_ = program.hardware.system_register_columns;
+    linked_mem_slices_per_group_ =
+        program.hardware.mem_slices_per_register_group;
+    linked_mxms_per_hemisphere_ = program.hardware.mxms_per_hemisphere;
 
     std::array<bool, InstructionControlUnit::kMemQueues> seenMem{};
     for (const auto& queue : program.queues) {
@@ -1463,7 +2076,121 @@ C2cWeightPager::page_ready_releases(std::size_t eventTag) const
             releases.push_back(PageReadyRelease {
                 release.location,
                 release.barrier_cycle - referenceCycle,
-                release.activation_producer});
+                release.activation_producer,
+                release.result_writer});
+    if (linked_preserves_issue_phases_) {
+        std::ranges::stable_sort(releases, [](const auto& lhs, const auto& rhs) {
+            return lhs.phase_offset < rhs.phase_offset;
+        });
+        return releases;
+    }
+    std::optional<std::size_t> firstMxmCompute;
+    for (const PageReadyRelease& release : releases) {
+        if (release.location.kind == IcuLocationKind::MxmCompute)
+            firstMxmCompute = std::min(
+                firstMxmCompute.value_or(release.phase_offset),
+                release.phase_offset);
+    }
+    const auto shifted = linked_activation_barrier_shifts_.find(eventTag);
+    std::optional<std::size_t> firstGroupArrival;
+    for (const auto& release : linked_page_releases_)
+        if (release.event_tag == eventTag
+            && release.activation_first_read_delay != 0) {
+            const auto tokenLane = release.location.index / 2;
+            const auto arrival = release.barrier_cycle - referenceCycle
+                + release.activation_first_read_delay
+                + std::max<std::size_t>(2 + tokenLane,
+                    linked_system_register_columns_) - 2 - tokenLane;
+            firstGroupArrival = std::max(
+                firstGroupArrival.value_or(arrival), arrival);
+        }
+    if (firstMxmCompute && (firstGroupArrival
+            || shifted != linked_activation_barrier_shifts_.end())) {
+        std::optional<std::size_t> lastActivationProducer;
+        for (const auto& release : releases)
+            if (release.activation_producer)
+                lastActivationProducer = std::max(
+                    lastActivationProducer.value_or(release.phase_offset),
+                    release.phase_offset);
+        // Group-zero MEM reads inject the first activation row at the far
+        // end of the SR. Account for the wait-to-first-read interval and
+        // its physical trip to the MXM ingress. Later MEM groups produce
+        // later rows nearer the MXM, so their release time is not the
+        // first-row arrival time. This also removes a one-cycle page-to-page
+        // drift when the compiler places adjacent waits one cycle apart.
+        std::size_t desiredComputePhase = *firstMxmCompute;
+        if (firstGroupArrival) {
+            // WAIT_EVENT retires on the preceding issue cycle. The first
+            // activation reaches the MXM one cycle after the linked SR
+            // arrival boundary. Anchor each page to that arrival even when
+            // the compiler's nominal MXM wait is one cycle later.
+            std::size_t firstIssueDelay = 1;
+            for (const auto& linked : linked_page_releases_)
+                if (linked.event_tag == eventTag
+                    && linked.location.kind == IcuLocationKind::MxmCompute
+                    && linked.barrier_cycle - referenceCycle == *firstMxmCompute)
+                    firstIssueDelay = std::max(firstIssueDelay, linked.compute_first_issue_delay);
+            // Arrival anchors the first FU issue, not the ICU release. The
+            // domain may still carry wait_cycle after WAIT_EVENT retires.
+            desiredComputePhase = *firstGroupArrival + 1 >= firstIssueDelay - 1
+                ? *firstGroupArrival + 1 - (firstIssueDelay - 1) : 0;
+        } else if (lastActivationProducer) {
+            const auto producerBound = *lastActivationProducer
+                + linked_mxm_pipeline_rows_ + 1;
+            if (producerBound > desiredComputePhase)
+                desiredComputePhase += std::min(shifted->second,
+                    producerBound - desiredComputePhase);
+        }
+        // Anchor only the activation consumer. Unrelated MEM/VXM queues
+        // retain their compiler timing; shifting one side of a later VXM
+        // writeback would accumulate a one-cycle skew at each page join.
+        // MXM result writers are aligned separately below.
+        for (auto& release : releases)
+            if (release.location.kind == IcuLocationKind::MxmCompute) {
+                if (desiredComputePhase >= *firstMxmCompute)
+                    release.phase_offset += desiredComputePhase
+                        - *firstMxmCompute;
+                else
+                    release.phase_offset -= *firstMxmCompute
+                        - desiredComputePhase;
+            }
+        // The MEM WAIT_EVENT retires before its following Read3D can inject
+        // into the SR, while the resumed MXM domain observes the SR at the
+        // start of its cycle. Keep the relocated producer wave one physical
+        // cycle behind the linked issue-boundary phase so the last activation
+        // vector is still present for the final MXM row.
+        for (auto& release : releases)
+            if (release.activation_producer)
+                ++release.phase_offset;
+    }
+    // Resolve writers after the activation wave has anchored MXM's release.
+    // A writer can precede its producer's release when it carries a long
+    // local wait. Preserve that signed offset, then shift the common origin
+    // if necessary so no event needs to be signalled before the page join.
+    std::vector<std::pair<std::size_t, std::int64_t>> writerPhases;
+    std::int64_t minimumPhase = 0;
+    for (const auto& linked : linked_page_releases_) {
+        if (linked.event_tag != eventTag || !linked.result_release_offset)
+            continue;
+        const auto producer = std::ranges::find_if(releases,
+            [&](const auto& release) {
+                return release.location == IcuLocation::MxmCompute(
+                    linked.result_producer_index);
+            });
+        const auto writer = std::ranges::find_if(releases,
+            [&](const auto& release) {
+                return release.location == linked.location;
+            });
+        if (producer == releases.end() || writer == releases.end()) continue;
+        const auto phase = static_cast<std::int64_t>(producer->phase_offset)
+            + *linked.result_release_offset;
+        minimumPhase = std::min(minimumPhase, phase);
+        writerPhases.emplace_back(std::distance(releases.begin(), writer), phase);
+    }
+    for (auto& release : releases)
+        release.phase_offset += static_cast<std::size_t>(-minimumPhase);
+    for (const auto& [index, phase] : writerPhases)
+        releases[index].phase_offset = static_cast<std::size_t>(phase - minimumPhase);
     std::ranges::sort(releases,
         [](const PageReadyRelease& lhs, const PageReadyRelease& rhs) {
             return lhs.phase_offset < rhs.phase_offset;
@@ -1706,22 +2433,198 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
     // inserted into the remaining idle cycles and can be moved to the end of
     // a write reservation without accidentally being placed before the
     // MEM_WRITE_SYNC packet that owns that reservation.
-    const auto activationProducers = native4_launch_producers(program, pageBarriers);
+    auto activationProducers = native4_launch_producers(
+        program, pageBarriers);
+    std::vector<MxmOutputTilePair> outputPairs;
+    for (const QueueProgram& queue : program.queues) {
+        if (queue.kind != QueueKind::MxmCompute) continue;
+        auto shiftedBarriers = pageBarriers;
+        defer_mxm_barriers_past_output_tile_pairs(
+            queue, shiftedBarriers, &outputPairs);
+    }
+    for (const QueueProgram& queue : program.queues) {
+        if (queue.kind != QueueKind::Mem) continue;
+        auto shiftedBarriers = pageBarriers;
+        align_mem_barriers_at_mxm_activation_wave_boundary(queue, program.hardware,
+            outputPairs, shiftedBarriers, &activationProducers,
+            &linked_activation_barrier_shifts_);
+    }
+    // An SR number is local to its physical column. Weight ingress can use
+    // E0/E1 just like activation ingress, but must not receive the activation
+    // release adjustment. This epoch's C2C weight receivers are known here.
+    std::erase_if(activationProducers, [&](const auto& producer) {
+        return std::ranges::any_of(memWriteWindows[producer.second],
+            [&](const auto& window) {
+                return std::get<2>(window) == producer.first;
+            });
+    });
+    std::ranges::sort(activationProducers);
+    activationProducers.erase(
+        std::unique(activationProducers.begin(), activationProducers.end()),
+        activationProducers.end());
     std::vector<std::tuple<std::size_t, QueueKind, std::size_t,
         std::size_t>> insertedBarriers;
+    for (const auto& queue : program.queues) {
+        if (queue.kind != QueueKind::MxmCompute) continue;
+        for (std::size_t pc = 0; pc < queue.commands.size();) {
+            if (!is_fu_3d_raw_packet_header(queue.commands[pc])) {
+                ++pc;
+                continue;
+            }
+            const auto words = fu_3d_raw_packet_word_count(queue.kind, queue.commands[pc]);
+            isa::EncodedMxmComputeIcu3DPacket packet{};
+            for (std::size_t word = 0; word < words; ++word)
+                for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
+                    packet.words[word].lanes[lane] = queue.commands[pc + word].words[lane];
+            const auto instruction = isa::decode_mxm_compute_icu_3d_instruction(packet);
+            linked_preserves_issue_phases_ |=
+                instruction.opcode == MxmComputeIcuOpcode::Compute3D
+                && instruction.loop.counts[0] > 1
+                && instruction.loop.counts[1] > 1
+                && instruction.terminal_dimension == 2;
+            pc += words;
+        }
+    }
     inject_page_ready_barriers_impl(
-        program, pageBarriers, memWriteWindows, &insertedBarriers);
+        program, pageBarriers, memWriteWindows, &insertedBarriers,
+        linked_preserves_issue_phases_);
+    const auto pageResultStreams = find_mxm_page_result_streams(program);
     linked_page_releases_.clear();
     linked_page_releases_.reserve(insertedBarriers.size());
     for (const auto& [eventTag, kind, queueIndex, barrierCycle] :
          insertedBarriers)
+    {
+        std::optional<std::int64_t> resultReleaseOffset;
+        std::size_t resultProducerIndex = 0;
+        bool resultWriter = false;
+        if (kind == QueueKind::Mem) {
+            const auto queue = std::ranges::find_if(program.queues,
+                [&](const QueueProgram& candidate) {
+                    return candidate.kind == kind
+                        && candidate.index == queueIndex;
+                });
+            if (queue != program.queues.end())
+                for (const MxmPageResultStream& result : pageResultStreams)
+                    if (result.event_tag == eventTag
+                        && result.hemisphere == queueIndex
+                            / InstructionControlUnit::
+                                kMemQueuesPerHemisphere) {
+                        std::size_t contiguousWriteCount = 0;
+                        const auto writeDelay = mem_result_write_delay_after_page_wait(
+                            *queue, eventTag, result.stream_base,
+                            program.hardware.mxm_result_streams, &contiguousWriteCount);
+                        if (!writeDelay) continue;
+                        const auto slice = (queueIndex
+                            % InstructionControlUnit::kMemQueuesPerHemisphere)
+                            / hw::kMemBanksPerSlice;
+                        const auto group = slice
+                            / program.hardware.mem_slices_per_register_group;
+                        const auto latency = program.hardware.mxm_pipeline_rows - 1
+                            + program.hardware.system_register_columns - 1 - group;
+                        const auto producerBarrier = std::ranges::find_if(
+                            insertedBarriers, [&](const auto& barrier) {
+                                return std::get<0>(barrier) == eventTag
+                                    && std::get<1>(barrier) == QueueKind::MxmCompute
+                                    && std::get<2>(barrier) == result.queue_index;
+                            });
+                        // SR IDs are reused by later operators. A write after
+                        // this compute packet's final result has passed the
+                        // MEM column cannot be one of its result consumers.
+                        // Compare in the common nominal schedule, since page
+                        // waits may have moved to different queue boundaries.
+                        if (producerBarrier == insertedBarriers.end()
+                            || barrierCycle + *writeDelay
+                                > std::get<3>(*producerBarrier)
+                                    + result.last_compute_delay + latency)
+                            continue;
+                        // A consumer may intentionally write only a suffix of
+                        // this result tile. Preserve its token offset instead
+                        // of moving the write to the first streamed token.
+                        std::size_t resultOffset = 0;
+                        const auto nominalFirstResult = std::get<3>(*producerBarrier)
+                            + result.first_result_delay + latency;
+                        const auto nominalFirstWrite = barrierCycle + *writeDelay;
+                        if (contiguousWriteCount > 0
+                            && contiguousWriteCount < result.contiguous_result_count
+                            && nominalFirstWrite >= nominalFirstResult
+                            && nominalFirstWrite - nominalFirstResult
+                                <= result.contiguous_result_count - contiguousWriteCount)
+                            resultOffset = nominalFirstWrite - nominalFirstResult;
+                        // Both delays include retirement of the page wait.
+                        // Match the first MEM write to the first streamed
+                        // result at this physical MEM column. This remains
+                        // valid when an earlier page inserted an extra wait
+                        // into only one of the two queues.
+                        resultReleaseOffset = static_cast<std::int64_t>(
+                            result.first_result_delay + latency + resultOffset)
+                            - static_cast<std::int64_t>(*writeDelay);
+                        resultProducerIndex = result.queue_index;
+                        break;
+                    }
+            resultWriter = resultReleaseOffset.has_value();
+        }
+        const bool activationProducer = kind == QueueKind::Mem
+            && std::ranges::find(activationProducers,
+                std::pair {eventTag, queueIndex})
+                != activationProducers.end();
+        std::size_t activationFirstReadDelay = 0;
+        if (activationProducer) {
+            const auto slice = (queueIndex
+                % InstructionControlUnit::kMemQueuesPerHemisphere)
+                / hw::kMemBanksPerSlice;
+            if (slice < program.hardware.mem_slices_per_register_group) {
+                const auto hemisphere = queueIndex
+                    / InstructionControlUnit::kMemQueuesPerHemisphere;
+                const auto pair = std::ranges::find_if(outputPairs,
+                    [&](const MxmOutputTilePair& candidate) {
+                        return candidate.event_tag == eventTag
+                            && candidate.queue_index
+                                / program.hardware.mxms_per_hemisphere
+                                == hemisphere;
+                    });
+                const auto queue = std::ranges::find_if(program.queues,
+                    [&](const QueueProgram& candidate) {
+                        return candidate.kind == QueueKind::Mem
+                            && candidate.index == queueIndex;
+                    });
+                const auto result = std::ranges::find_if(pageResultStreams,
+                    [&](const MxmPageResultStream& candidate) {
+                        return candidate.event_tag == eventTag
+                            && candidate.hemisphere == hemisphere;
+                    });
+                if (queue != program.queues.end()
+                    && (pair != outputPairs.end()
+                        || (result != pageResultStreams.end()
+                            && result->first_compute_delay == 1)))
+                    // A non-relocated projection with an explicit startup
+                    // wait already has compiler-timed weight/activation
+                    // ingress. Only re-anchor an immediate consumer or a
+                    // wave whose barrier was moved past an output tile pair.
+                    activationFirstReadDelay =
+                        mem_activation_first_read_delay_after_page_wait(
+                            *queue, eventTag,
+                            pair != outputPairs.end()
+                                ? pair->activation_stream_base
+                                : result->activation_stream_base);
+            }
+        }
+        std::size_t computeFirstIssueDelay = 1;
+        if (kind == QueueKind::MxmCompute)
+            for (const auto& result : pageResultStreams)
+                if (result.event_tag == eventTag && result.queue_index == queueIndex)
+                    computeFirstIssueDelay = result.first_compute_delay;
         linked_page_releases_.push_back(LinkedPageRelease {
             eventTag,
             linked_queue_location(kind, queueIndex,
                 program.hardware.mxms_per_hemisphere),
             barrierCycle,
-            kind == QueueKind::Mem && std::ranges::find(activationProducers,
-                std::pair {eventTag, queueIndex}) != activationProducers.end()});
+            activationProducer,
+            resultWriter,
+            activationFirstReadDelay,
+            resultReleaseOffset,
+            resultProducerIndex,
+            computeFirstIssueDelay});
+    }
     std::ranges::sort(program.queues,
         [](const QueueProgram& lhs, const QueueProgram& rhs) {
             return std::tie(lhs.kind, lhs.index)

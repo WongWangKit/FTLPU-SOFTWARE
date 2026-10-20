@@ -4,6 +4,8 @@
 #include "ftlpu/software/runtime/model_session.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
+#include <optional>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -51,6 +53,16 @@ try {
         while (std::getline(listing, path)) {
             if (!path.empty() && path.back() == '\r') path.pop_back();
             if (path.empty()) continue;
+            // Optional per-tensor INT8 scale follows the path after a tab.
+            // ModelSession resolves compiler-authored scale relocations from
+            // this metadata, exactly as it does for an imported model package.
+            std::optional<float> scale;
+            if (const auto separator = path.find('\t'); separator != std::string::npos) {
+                scale = std::stof(path.substr(separator+1));
+                path.resize(separator);
+                if (!std::isfinite(*scale) || *scale <= 0)
+                    throw std::runtime_error("input quantization scale must be finite and positive");
+            }
             const auto binding = std::find_if(program.bindings.begin(), program.bindings.end(),
                 [&](const auto& b) { return b.access == BindingAccess::Input && b.index == index; });
             if (binding == program.bindings.end()) throw std::runtime_error("missing input binding");
@@ -58,8 +70,15 @@ try {
             if (!file) throw std::runtime_error("cannot read input: " + path);
             std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)), {});
             const auto name = "input" + std::to_string(index);
-            if (binding->paged_weight) {
+            if (binding->paged_weight || scale.has_value()) {
                 package.tensors.push_back({name, binding->element_type, binding->shape, std::move(bytes)});
+                if (scale) {
+                    if (binding->element_type != BindingElementType::I8)
+                        throw std::runtime_error("quantization scale requires INT8 input");
+                    auto& tensor = package.tensors.back();
+                    tensor.encoding = ModelTensorEncoding::SymmetricPerTensorI8;
+                    tensor.scales = {*scale};
+                }
             } else {
                 // The compiler has already allocated every immutable input
                 // and intermediate. Preserve those addresses; a second
@@ -114,9 +133,53 @@ try {
         session.write_last_linked_program(std::string(argv[3]) + ".runtime.ftlpu");
         session.write_pre_execution_icu_programs(std::string(argv[3]) + ".pre_execution");
         if (argc == 5) session.write_execution_trace_csv(argv[4]);
+        if (std::getenv("FTLPU_FILE_RUNNER_DEBUG_SRAM") != nullptr) {
+            std::ofstream dump(std::string(argv[3]) + ".sram.bin",
+                std::ios::binary);
+            for (std::uint16_t hemisphere = 0;
+                 hemisphere < program.hardware.hemispheres; ++hemisphere)
+                for (std::uint16_t slice = 0;
+                     slice < program.hardware.slices_per_hemisphere; ++slice)
+                    for (std::uint16_t bank = 0;
+                         bank < program.hardware.banks_per_slice; ++bank)
+                        for (std::uint32_t row = 0;
+                             row < program.hardware.sram_depth_rows; ++row)
+                            for (std::uint32_t byte = 0;
+                                 byte < program.hardware.bytes_per_word; ++byte) {
+                                const auto value = dma->chip()
+                                    .read_mem_sram_lane_byte(
+                                        static_cast<ftlpu::Hemisphere>(hemisphere),
+                                        slice, bank,
+                                        byte / program.hardware.lanes_per_tile,
+                                        row,
+                                        byte % program.hardware.lanes_per_tile);
+                                dump.put(static_cast<char>(value));
+                            }
+        }
         if (std::getenv("FTLPU_SESSION_LINK_ONLY") != nullptr) {
             std::cout << "linked_only=1 arithmetic_executed=0\n";
             return 0;
+        }
+        if (std::getenv("FTLPU_FILE_RUNNER_DEBUG_OUTPUT") != nullptr) {
+            CModelRuntime snapshot(dma->chip());
+            snapshot.load(read_binary_program(
+                std::string(argv[3]) + ".runtime.ftlpu"), false);
+            for (const auto& binding : program.bindings) {
+                if (binding.access != BindingAccess::Output) continue;
+                const auto direct = snapshot.download_output(binding.index);
+                const auto& transported = session.value(
+                    "output" + std::to_string(binding.index));
+                const auto mismatches = std::mismatch(direct.begin(),
+                    direct.end(), transported.begin(), transported.end());
+                std::cerr << "direct_output_match="
+                          << (mismatches.first == direct.end())
+                          << " binding=" << binding.index << '\n';
+                std::ofstream diagnostic(std::string(argv[3]) + ".direct."
+                    + std::to_string(binding.index) + ".bin",
+                    std::ios::binary);
+                diagnostic.write(reinterpret_cast<const char*>(direct.data()),
+                    direct.size());
+            }
         }
         for (const auto& b : program.bindings) {
             if (b.access != BindingAccess::Output) continue;

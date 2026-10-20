@@ -161,11 +161,16 @@ VxmOp emitVxmConfigured(mlir::IRRewriter &rewriter, mlir::Location location,
                         int64_t waveCount = 1,
                         int64_t waveInterval = 1);
 
+int64_t emitDistributedActivationStaging(mlir::IRRewriter &rewriter,
+    mlir::Location location, const target::LPUTargetModel &target,
+    mlir::DictionaryAttr source, mlir::DictionaryAttr destination,
+    int64_t rows, int64_t columns);
+
 AttentionProjectionKind projectionKind(int64_t index);
 
 void emitRopeOrCast(mlir::IRRewriter &rewriter, mlir::Location location,
                     const target::LPUTargetModel &target, int64_t cycle,
                     int64_t hemisphere, bool rope, mlir::Value value,
-                    mlir::Type elementType);
+                    mlir::Type elementType, int64_t repeatCount = 1);
 
 } // namespace ftlpu::compiler::schedule::attention_detail

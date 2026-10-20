@@ -47,7 +47,6 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
             : mlir::IntegerAttr {};
         return bank ? bank.getInt() : 0;
     };
-    const int64_t valueBank = placementBank("value");
     const int64_t contextBank = placementBank("context");
     const bool singleMxm =
         target_.throughput().mxms_per_hemisphere == 1;
@@ -65,16 +64,20 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     const int64_t mxmResultToVxmLatency =
         target_.throughput().accumulator_to_vxm_latency
         - target_.mxm_first_result_latency();
+    // The first streamed MXM result is two cycles ahead of the nominal
+    // accumulator-to-VXM latency. Use that phase for both the bridge write
+    // and its queue spacing, so the remote MEM consumes all result rows.
+    constexpr int64_t firstResultAdvance = 2;
     const auto vxmBridgeToMemLatency = [&](int64_t slice) {
         return target_.transport_latency(
             target::StreamEndpoint::VxmBridgeResult,
             target::StreamEndpoint::Mem,
             target::StreamDirection::East, slice);
     };
-    // E0/E1 carry the previous BF16 context block through the passive VXM
-    // bridge. Feed the next probability block on a disjoint pair so PV can
-    // keep issuing one MXM row per cycle while that result is replicated.
-    const int64_t activationStreamBase = sourceLocalContext ? 0 : 2;
+    // The passive VXM bridge returns MXM0 on E0/E1 and, on dual-MXM targets,
+    // MXM1 on E2/E3. Keep probability input clear of both result pairs.
+    const int64_t activationStreamBase = sourceLocalContext
+        ? 0 : (singleMxm ? 2 : 4);
     int64_t finalOutputHemisphereStagger = 0;
     if (!sourceLocalContext && !layout.contextHemispherePaired()) {
         for (const int64_t slice : layout.contextSlices()) {
@@ -86,7 +89,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
             const auto bridgeLatency = vxmBridgeToMemLatency(slice);
             if (!bridgeLatency) return -1;
             const int64_t remoteLatency =
-                mxmResultToVxmLatency + *bridgeLatency + 1;
+                mxmResultToVxmLatency + *bridgeLatency + 1
+                    - firstResultAdvance;
             finalOutputHemisphereStagger = std::max(
                 finalOutputHemisphereStagger,
                 tile + std::abs(*localLatency - remoteLatency));
@@ -125,7 +129,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                 }
                 emitSxm(rewriter_, op_.getLoc(), captures[begin],
                     hemisphere, "transpose", inputStreams,
-                    transposeStreams, identityMap(), "vector_columns",
+                    transposeStreams, identityMap(target_), "vector_columns",
                     -1, -1, -1, tileRows, 1,
                     static_cast<int64_t>(end - begin), interval);
                 begin = end;
@@ -175,7 +179,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                     "read", layout.valuePackAddress(
                         kvHead, localMxm, keyBlock, 0),
                     inputStreams[static_cast<std::size_t>(stream)],
-                    tileRows, 1, 1, 1, 1, 0, 1, 1, 0, -1, valueBank);
+                    tileRows, 1, 1, 1, 1, 0, 1, 1, 0, -1,
+                    layout.valuePackBank(localMxm));
             }
         }
         std::array<int64_t, 16> mxmStreams {};
@@ -201,7 +206,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
             0, 0, 0, 1, 1, 0, 1, "stream", true,
             "supercell", 0, dataFormat, {}, {}, tileRows, 1, 1,
             1, 1, 0,
-            singleMxm ? singleMxmWeightStreamBase : -1);
+            singleMxm ? singleMxmWeightStreamBase : localMxm * 16);
         return capture + 2 * tileRows + 1;
     };
 
@@ -224,12 +229,12 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                 });
         };
         bool groupPvMemory = pipelineHeadBlocks
-            && valueBank != probabilityBank
             && disjointFromContext(layout.probabilityDiagonalSlices());
         for (int64_t headBlock = 0;
              groupPvMemory && headBlock < headBlocks; ++headBlock)
-            groupPvMemory &= disjointFromContext(
-                layout.valuePackSlices(headBlock));
+            groupPvMemory &= layout.valuePackBank(headBlock)
+                    != probabilityBank
+                && disjointFromContext(layout.valuePackSlices(headBlock));
         const int64_t valueLoadLead = memToSxm + 2 * tileRows + 1
             + 8 + memToMxm;
         const int64_t firstIwOffset = memToSxm + 2;
@@ -433,14 +438,15 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                     if (groupPvMemory)
                                         contextWriteWindows.push_back({
                                             writeCycle, queue, address,
-                                            32 + byte, contextBank, false});
+                                            32 + byte,
+                                            layout.contextBank(headBlock), false});
                                     else
                                         direct_domain_detail::emitMem3D(
                                             rewriter_, op_.getLoc(), target_,
                                             writeCycle, queue, "write",
                                             address, 32 + byte, tile, 1, 1,
                                             1, 1, 0, 1, 1, 0, -1,
-                                            contextBank);
+                                            layout.contextBank(headBlock));
                                     blockEnd = std::max(
                                         blockEnd, writeCycle + tile);
                                     continue;
@@ -470,7 +476,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                         if (!bridgeLatency) return -1;
                                         writeCycle = resultStart
                                             + mxmResultToVxmLatency
-                                            + *bridgeLatency + 1;
+                                            + *bridgeLatency + 1
+                                            - firstResultAdvance;
                                         packedStream = byte;
                                     }
                                     const int64_t queue =
@@ -485,7 +492,8 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                     if (groupPvMemory)
                                         contextWriteWindows.push_back({
                                             writeCycle, queue, address,
-                                            packedStream, contextBank, local});
+                                            packedStream,
+                                            layout.contextBank(headBlock), local});
                                     else
                                         direct_domain_detail::emitMem3D(
                                             rewriter_, op_.getLoc(), target_,
@@ -493,7 +501,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                             local ? "write_tap" : "write",
                                             address, packedStream, tile, 1, 1,
                                             1, 1, 0, 1, 1, 0, -1,
-                                            contextBank);
+                                            layout.contextBank(headBlock));
                                     blockEnd = std::max(
                                         blockEnd, writeCycle + tile);
                                     lastContextWriteCycle = std::max(
@@ -571,7 +579,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                 layout.valuePackAddress(
                                     kvHead, headBlock, keyBlock, 0),
                                 inputStreams[static_cast<std::size_t>(stream)],
-                                valueBank, tileRows, 1, 1,
+                                layout.valuePackBank(headBlock), tileRows, 1, 1,
                                 wave, planIndex});
                         }
                         for (int64_t row = 0; row < lanes; ++row) {
@@ -852,6 +860,9 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
 
                     if (keyBlock + 1 == keyBlocks) {
                         for (int64_t half = 0; half < headBlocks; ++half) {
+                            // Local MEM sees the same first-result phase for
+                            // both MXMs. The per-unit accumulator skew applies
+                            // only to the route through the VXM bridge.
                             const int64_t resultStart = finalComputeStart
                                 + (singleMxm ? half * tile : 0)
                                 + target_.mxm_first_result_latency();
@@ -891,8 +902,21 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                                 vxmBridgeToMemLatency(slice);
                                             if (!bridgeLatency) return -1;
                                             writeCycle = resultStart
+                                                + (!singleMxm && half == 0
+                                                    ? target_.throughput().mxm0_accumulator_latency
+                                                        - target_.throughput().mxm1_accumulator_latency
+                                                    : 0)
                                                 + mxmResultToVxmLatency
-                                                + *bridgeLatency + 1;
+                                                + *bridgeLatency + 1
+                                                - firstResultAdvance
+                                                // Dual-MXM BF16 results traverse
+                                                // the eight-row bridge pipeline;
+                                                // the first remote row follows
+                                                // the local result window.
+                                                + (!singleMxm
+                                                    ? tileRows - 2
+                                                        - (half == 0 ? 1 : 0)
+                                                    : 0);
                                             packedStream = resultStream + byte
                                                 - target_.streams()
                                                       .streams_per_direction;
@@ -921,7 +945,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                                 queryBlock * tile),
                                             packedStream, tile, 1, 1,
                                             1, 1, 0, 1, 1, 0, -1,
-                                            contextBank);
+                                            layout.contextBank(contextBlock));
                                         lastContextWriteCycle = std::max(
                                             lastContextWriteCycle,
                                             writeCycle + tile - 1);

@@ -3,6 +3,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 
 #include <algorithm>
+#include <stdexcept>
 namespace ftlpu::compiler::schedule {
 
 AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
@@ -38,6 +39,19 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
         paging.itemsPerGroup = placement
             .getAs<mlir::IntegerAttr>(
                 "page_items_per_slice_group").getInt();
+        paging.itemsPerPage = placement
+            .getAs<mlir::IntegerAttr>("page_granularity").getInt();
+        const auto readPageArray = [&](llvm::StringRef name,
+                                       llvm::SmallVectorImpl<int64_t>& values) {
+            if (const auto attrs = placement.getAs<mlir::ArrayAttr>(name))
+                for (mlir::Attribute attr : attrs)
+                    values.push_back(
+                        llvm::cast<mlir::IntegerAttr>(attr).getInt());
+        };
+        readPageArray("page_banks", paging.pageBanks);
+        readPageArray("page_slice_group_bases", paging.pageGroupBases);
+        readPageArray("page_slice_group_counts", paging.pageGroupCounts);
+        readPageArray("page_base_rows", paging.pageBaseRows);
         for (mlir::Attribute slice :
              placement.getAs<mlir::ArrayAttr>("page_storage_slices"))
             paging.storageSlices.push_back(
@@ -199,6 +213,8 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     readSegments("key", false);
     if (const auto value = plan.getAs<mlir::DictionaryAttr>("value")) {
         valuePackBase_ = value.getAs<mlir::IntegerAttr>("base_row").getInt();
+        valuePackBanks_.fill(
+            value.getAs<mlir::IntegerAttr>("bank").getInt());
         const auto slices = value.getAs<mlir::ArrayAttr>("slices");
         for (std::size_t block = 0; block < valuePackSlices_.size(); ++block)
             for (std::size_t stream = 0;
@@ -207,6 +223,17 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
                     llvm::cast<mlir::IntegerAttr>(
                         slices[block * valuePackSlices_[block].size()
                             + stream]).getInt();
+        if (const auto segments = value.getAs<mlir::ArrayAttr>("segments"))
+            for (mlir::Attribute attribute : segments) {
+                const auto segment = mlir::dyn_cast<mlir::DictionaryAttr>(attribute);
+                if (!segment) continue;
+                const auto begin = segment.getAs<mlir::IntegerAttr>(
+                    "reduction_begin");
+                const auto bank = segment.getAs<mlir::IntegerAttr>("bank");
+                if (begin && bank && begin.getInt() >= 0
+                    && begin.getInt() < static_cast<int64_t>(valuePackBanks_.size()))
+                    valuePackBanks_[begin.getInt()] = bank.getInt();
+            }
     }
     if (const auto context =
             plan.getAs<mlir::DictionaryAttr>(gatedContext ? "gated_context" : "context")) {
@@ -222,9 +249,27 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
         if (const auto paired =
                 context.getAs<mlir::BoolAttr>("hemisphere_paired"))
             contextHemispherePaired_ = paired.getValue();
+        contextBanks_.fill(
+            context.getAs<mlir::IntegerAttr>("bank").getInt());
+        if (const auto segments = context.getAs<mlir::ArrayAttr>("segments")) {
+            contextSplitBanks_ = true;
+            for (mlir::Attribute attribute : segments) {
+                const auto segment = mlir::dyn_cast<mlir::DictionaryAttr>(attribute);
+                if (!segment) continue;
+                const auto begin = segment.getAs<mlir::IntegerAttr>(
+                    "reduction_begin");
+                const auto bank = segment.getAs<mlir::IntegerAttr>("bank");
+                if (begin && bank && begin.getInt() >= 0
+                    && begin.getInt() < static_cast<int64_t>(contextBanks_.size()))
+                    contextBanks_[begin.getInt()] = bank.getInt();
+            }
+        }
     }
-    if (const auto result = plan.getAs<mlir::DictionaryAttr>("result"))
+    if (const auto result = plan.getAs<mlir::DictionaryAttr>("result")) {
         resultBase_ = result.getAs<mlir::IntegerAttr>("base_row").getInt();
+        const auto hemisphere = result.getAs<mlir::StringAttr>("hemisphere");
+        resultPartitioned_ = hemisphere && hemisphere.getValue() == "both";
+    }
 }
 
 int64_t AttentionMemoryLayout::weightBase(AttentionProjectionKind projection) const
@@ -237,13 +282,15 @@ int64_t AttentionMemoryLayout::weightAddress(AttentionProjectionKind projection,
     int64_t column) const
 {
     const int64_t hiddenBlocks = hidden_ / target_.throughput().mxm_rows;
+    const int64_t slotRows = target_.throughput().mxm_rows / 8;
     const auto& paging = weightPaging_[static_cast<std::size_t>(projection)];
     const int64_t item = outputBlock / 4;
     const int64_t localItem = paging.enabled
-        ? item % paging.itemsPerGroup : item;
+        ? (item % paging.itemsPerPage) % paging.itemsPerGroup : item;
     return weightBase(projection)
-        + (localItem * hiddenBlocks + reductionBlock) * 8
-        + localMxm * 4 + column;
+        + pagingBase(paging, item)
+        + (localItem * hiddenBlocks + reductionBlock) * (2 * slotRows)
+        + localMxm * slotRows + column;
 }
 
 llvm::ArrayRef<int64_t> AttentionMemoryLayout::pagingSlices(
@@ -251,11 +298,16 @@ llvm::ArrayRef<int64_t> AttentionMemoryLayout::pagingSlices(
     llvm::ArrayRef<int64_t> fallback) const
 {
     if (!paging.enabled) return fallback;
-    const int64_t group = paging.groupBase
-        + item / paging.itemsPerGroup;
+    const int64_t page = pagingPage(paging, item);
+    const int64_t groupBase = paging.pageGroupBases.empty()
+        ? paging.groupBase : paging.pageGroupBases[page];
+    const int64_t groupCount = paging.pageGroupCounts.empty()
+        ? paging.groupCount : paging.pageGroupCounts[page];
+    const int64_t group = groupBase
+        + (item % paging.itemsPerPage) / paging.itemsPerGroup;
     const int64_t groupSize = static_cast<int64_t>(fallback.size());
-    if (group < paging.groupBase
-        || group >= paging.groupBase + paging.groupCount
+    if (group < groupBase
+        || group >= groupBase + groupCount
         || (group + 1) * groupSize
             > static_cast<int64_t>(paging.storageSlices.size()))
         return {};
@@ -271,16 +323,51 @@ llvm::ArrayRef<int64_t> AttentionMemoryLayout::weightSlices(
         outputBlock / 4, weightSlices_);
 }
 
-int64_t AttentionMemoryLayout::weightPage(
-    AttentionProjectionKind projection) const
+int64_t AttentionMemoryLayout::pagingPage(
+    const WeightPagingLayout& paging, int64_t item) const
 {
-    return weightPaging_[static_cast<std::size_t>(projection)].page;
+    if (!paging.enabled) return -1;
+    if (item < 0 || paging.itemsPerPage <= 0)
+        throw std::out_of_range("invalid attention weight page item");
+    const int64_t page = item / paging.itemsPerPage;
+    if ((!paging.pageBanks.empty()
+            && page >= static_cast<int64_t>(paging.pageBanks.size()))
+        || (!paging.pageGroupBases.empty()
+            && page >= static_cast<int64_t>(paging.pageGroupBases.size()))
+        || (!paging.pageGroupCounts.empty()
+            && page >= static_cast<int64_t>(paging.pageGroupCounts.size()))
+        || (!paging.pageBaseRows.empty()
+            && page >= static_cast<int64_t>(paging.pageBaseRows.size())))
+        throw std::out_of_range("attention weight item exceeds page count");
+    return page;
+}
+
+int64_t AttentionMemoryLayout::pagingBank(
+    const WeightPagingLayout& paging, int64_t item) const
+{
+    if (!paging.enabled || paging.pageBanks.empty()) return paging.bank;
+    return paging.pageBanks[pagingPage(paging, item)];
+}
+
+int64_t AttentionMemoryLayout::pagingBase(
+    const WeightPagingLayout& paging, int64_t item) const
+{
+    if (!paging.enabled || paging.pageBaseRows.empty()) return 0;
+    return paging.pageBaseRows[pagingPage(paging, item)];
+}
+
+int64_t AttentionMemoryLayout::weightPage(
+    AttentionProjectionKind projection, int64_t outputBlock) const
+{
+    return pagingPage(weightPaging_[static_cast<std::size_t>(projection)],
+        outputBlock / 4);
 }
 
 int64_t AttentionMemoryLayout::weightBank(
-    AttentionProjectionKind projection) const
+    AttentionProjectionKind projection, int64_t outputBlock) const
 {
-    return weightPaging_[static_cast<std::size_t>(projection)].bank;
+    return pagingBank(weightPaging_[static_cast<std::size_t>(projection)],
+        outputBlock / 4);
 }
 
 int64_t AttentionMemoryLayout::activationAddress(
@@ -429,9 +516,17 @@ llvm::ArrayRef<int64_t> AttentionMemoryLayout::valuePackSlices(
         static_cast<std::size_t>(reductionBlock % valuePackSlices_.size()));
 }
 
+int64_t AttentionMemoryLayout::valuePackBank(int64_t reductionBlock) const
+{
+    return valuePackBanks_.at(
+        static_cast<std::size_t>(reductionBlock % valuePackBanks_.size()));
+}
+
 int64_t AttentionMemoryLayout::contextAddress(
     int64_t queryHead, int64_t headBlock, int64_t token) const
 {
+    if (contextSplitBanks_)
+        return contextBase_ + queryHead * seqLen_ + token;
     if (contextHeadBlockPacked_)
         return contextBase_
             + (queryHead * headBlocks_ + headBlock) * seqLen_ + token;
@@ -455,14 +550,23 @@ int64_t AttentionMemoryLayout::contextSlice(
     return contextSlices_.at(static_cast<std::size_t>(index));
 }
 
+int64_t AttentionMemoryLayout::contextBank(int64_t headBlock) const
+{
+    return contextBanks_.at(
+        static_cast<std::size_t>(headBlock % contextBanks_.size()));
+}
+
 int64_t AttentionMemoryLayout::outputWeightAddress(int64_t outputGroup,
     int64_t reductionBlock, int64_t column) const
 {
     const int64_t reductionBlocks = queryHeads_ * headBlocks_;
     const int64_t localGroup = outputWeightPaging_.enabled
-        ? outputGroup % outputWeightPaging_.itemsPerGroup : outputGroup;
+        ? (outputGroup % outputWeightPaging_.itemsPerPage)
+            % outputWeightPaging_.itemsPerGroup : outputGroup;
     return outputWeightBase_
-        + (localGroup * reductionBlocks + reductionBlock) * 4 + column;
+        + pagingBase(outputWeightPaging_, outputGroup)
+        + (localGroup * reductionBlocks + reductionBlock)
+            * target_.throughput().tile_rows + column;
 }
 
 llvm::ArrayRef<int64_t> AttentionMemoryLayout::outputWeightSlices(
@@ -472,20 +576,22 @@ llvm::ArrayRef<int64_t> AttentionMemoryLayout::outputWeightSlices(
         outputWeightSlices_);
 }
 
-int64_t AttentionMemoryLayout::outputWeightPage() const
+int64_t AttentionMemoryLayout::outputWeightPage(
+    int64_t outputGroup) const
 {
-    return outputWeightPaging_.page;
+    return pagingPage(outputWeightPaging_, outputGroup);
 }
 
-int64_t AttentionMemoryLayout::outputWeightBank() const
+int64_t AttentionMemoryLayout::outputWeightBank(
+    int64_t outputGroup) const
 {
-    return outputWeightPaging_.bank;
+    return pagingBank(outputWeightPaging_, outputGroup);
 }
 
 int64_t AttentionMemoryLayout::resultAddress(
     int64_t outputGroup, int64_t token) const
 {
-    return resultBase_ + outputGroup * seqLen_ + token;
+    return resultBase_ + (outputGroup / (resultPartitioned_ ? 2 : 1)) * seqLen_ + token;
 }
 
 int64_t AttentionMemoryLayout::ropeAddress(int64_t token) const

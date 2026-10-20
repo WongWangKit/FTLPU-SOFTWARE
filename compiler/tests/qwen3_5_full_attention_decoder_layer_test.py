@@ -10,7 +10,7 @@ import subprocess
 import sys
 import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
-from qwen3_5_full_attention import load, quantize, graph_layer, reference
+from qwen3_5_full_attention import load, quantize, dense_layer_source, dense_layer_inputs, reference, bf16
 
 
 def metrics(actual, expected):
@@ -22,8 +22,10 @@ def metrics(actual, expected):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    for name in ('compile','graph-compile','runner','model-dir','output-dir','target-config'):
+    for name in ('compile','runner','model-dir','output-dir','target-config'):
         p.add_argument('--'+name,type=Path,required=True)
+    p.add_argument('--opt',type=Path)
+    p.add_argument('--graph-compile',type=Path,help=argparse.SUPPRESS)
     p.add_argument('--layer',type=int,default=3)
     p.add_argument('--seq-len',type=int,default=32)
     p.add_argument('--compile-only',action='store_true')
@@ -34,10 +36,39 @@ def main():
     binary=out/'decoder_layer.ftlpu';prefix=out/'resident'
     if not a.validate_only:
         (out/'summary.json').unlink(missing_ok=True)
-        graph,output=graph_layer(x,weights,packed,scales,config)
-        logical=graph.write(out/'logical_graph',[output])
-        subprocess.run([str(a.graph_compile.resolve()),'--input',str(logical),'--output',str(out/'decoder_layer.schedule.mlir'),
-            '--inputs-dir',str(out),'--target-config',str(a.target_config.resolve())],check=True)
+        (out/'graph_plan.json').unlink(missing_ok=True)
+        source=out/'decoder_layer.kernel.mlir'
+        source.write_text(dense_layer_source(len(x),config,scales))
+        inputs=[]
+        for i,(value,dtype) in enumerate(dense_layer_inputs(x,weights,packed)):
+            path=out/f'input{i}.bin'
+            if dtype=='bf16': (bf16(value).view(np.uint32)>>16).astype('<u2').tofile(path)
+            else: value.astype('i1').tofile(path)
+            roles={2:'query',3:'key',4:'value',5:'output',8:'attention_gate',10:'gate',11:'up',12:'down'}
+            inputs.append(str(path)+(f'\t{scales[roles[i]]:.9e}' if dtype=='i8' else ''))
+        (out/'inputs.txt').write_text('\n'.join(inputs)+'\n')
+        opt=a.opt or a.compile.resolve().with_name('ftlpu_opt.exe' if sys.platform=='win32' else 'ftlpu_opt')
+        common=['--target-config',str(a.target_config.resolve()),'--weight-bank','0',
+            '--mxm-execution','vector','--ffn-schedule','fused','--projection-rope-overlap','off']
+        subprocess.run([str(opt),'--input',str(source),'--output',str(out/'decoder_layer.stream.mlir'),
+            '--pipeline','ftlpu-kernel-to-stream',*common],check=True)
+        stream=(out/'decoder_layer.stream.mlir').read_text()
+        assert stream.count('ftlpu.stream.softmax_task')==1
+        assert 'ftlpu.stream.swish_task' in stream and 'ftlpu.stream.sigmoid_multiply_task' in stream
+        assert stream.count('kind = "linear"')==1, 'FFN must use the native dense FFN subgraph'
+        assert 'ftlpu.graph_lowering' not in stream and 'ftlpu.connected_graph_schedule' not in stream
+        for placement in re.findall(r'\b(?:query|key)_norm_weight = \{([^{}]+)\}',stream):
+            assert 'bank_locked = true' in placement
+        (out/'lowering_path.json').write_text(json.dumps(dict(
+            entry='whole_function_kernel_ir',logical_graph_json_used=False,
+            pipeline=['KernelToTensor (attention/FFN match + dense memory planning)',
+                'TensorToStream','StreamToSchedule (primitive FFN + attention)',
+                'VerifySchedule','ScheduleToCommand'],
+            native_attention_subgraphs=stream.count('ftlpu.stream.softmax_task'),native_ffn_subgraphs=stream.count('ftlpu.stream.swish_task'),
+            standalone_projections=stream.count('kind = "linear"'),
+            ffn_schedule='fused',attention_schedule='tail',projection_rope_overlap=False),indent=2)+'\n')
+        subprocess.run([str(opt),'--input',str(out/'decoder_layer.stream.mlir'),'--output',str(out/'decoder_layer.schedule.mlir'),
+            '--pipeline','ftlpu-stream-to-schedule',*common],check=True)
         subprocess.run([str(a.compile.resolve()),'--input',str(out/'decoder_layer.schedule.mlir'),'--input-stage','verified-schedule',
             '--output',str(binary),'--target-config',str(a.target_config.resolve())],check=True)
         if a.compile_only: return
@@ -74,7 +105,7 @@ def main():
         hidden_size=config['hidden_size'],intermediate_size=config['intermediate_size'],query_heads=config['num_attention_heads'],
         kv_heads=config['num_key_value_heads'],head_dim=config['head_dim'],rotary_dim=int(config['head_dim']*.25),
         includes_ffn=True,attention_output_gate=True,qk_norm=True,synthetic_weights=False,program_count=1,runtime_run_calls=1,
-        host_intermediate_transfers=0,arithmetic_backend='CModel ICU/FU',hardware_lowering='C++ native dense attention and logical graph planner',
+        host_intermediate_transfers=0,arithmetic_backend='CModel ICU/FU',hardware_lowering='shared dense KernelToTensor + primitive FFN + attention schedule',
         input_source='official embedding rows 0..seq_len-1, isolated layer stimulus',checkpoint_provenance=provenance,
         compiler_binary_bytes=binary.stat().st_size,runtime_binary_bytes=runtime_binary.stat().st_size,
         execution_stats=stats,numerical_comparisons=comparisons,

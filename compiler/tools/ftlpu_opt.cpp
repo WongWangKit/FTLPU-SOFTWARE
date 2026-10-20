@@ -145,6 +145,7 @@ Args parse_args(int argc, char** argv)
         throw std::runtime_error("usage: ftlpu-opt --input in.mlir --output out.mlir "
                                  "[--pipeline ftlpu-stablehlo-to-kernel|ftlpu-stablehlo-to-tensor|"
                                  "ftlpu-stablehlo-to-stream|ftlpu-stablehlo-to-schedule|"
+                                 "ftlpu-kernel-to-stream|ftlpu-kernel-to-schedule|"
                                  "ftlpu-stream-to-uncompressed-schedule|"
                                  "ftlpu-stream-to-compressed-schedule|"
                                  "ftlpu-stream-to-schedule|"
@@ -169,7 +170,10 @@ Args parse_args(int argc, char** argv)
 int main(int argc, char** argv)
 try {
     llvm::InitLLVM initLLVM(argc, argv);
-    const auto args = parse_args(argc, argv);
+    auto args = parse_args(argc, argv);
+    const bool kernelInput = args.pipeline.starts_with("ftlpu-kernel-to-");
+    if (kernelInput)
+        args.pipeline.replace(6, 6, "stablehlo");
     mlir::DialectRegistry registry;
     registry.insert<mlir::func::FuncDialect, mlir::stablehlo::StablehloDialect,
         ftlpu::compiler::kernel::KernelDialect, ftlpu::compiler::tensor::TensorDialect>();
@@ -248,6 +252,8 @@ try {
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::mxm_execution_policy_name(
                 args.mxm_execution_policy)));
+    (*module)->setAttr("ftlpu.ffn_schedule", mlir::StringAttr::get(&context,
+        args.ffn_schedule == ftlpu::compiler::FfnScheduleStrategy::Fused ? "fused" : "tail"));
     const bool producesCommands =
         args.pipeline == "ftlpu-stablehlo-to-commands"
         || args.pipeline == "ftlpu-schedule-to-commands"
@@ -295,7 +301,7 @@ try {
         && args.pipeline != "ftlpu-verify-schedule") {
         throw std::runtime_error("unknown MLIR pipeline: " + args.pipeline);
     }
-    if (args.pipeline != "ftlpu-verify-schedule"
+    if (!kernelInput && args.pipeline != "ftlpu-verify-schedule"
         && args.pipeline != "ftlpu-stream-to-uncompressed-schedule"
         && args.pipeline != "ftlpu-stream-to-compressed-schedule"
         && args.pipeline != "ftlpu-stream-to-schedule"

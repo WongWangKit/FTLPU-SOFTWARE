@@ -47,6 +47,14 @@ def ReshapeOp : FTLPU_Kernel_Op<"reshape", [Pure]> {
   let hasVerifier = 1;
 }
 
+def IndexedViewOp : FTLPU_Kernel_Op<"indexed_view", [Pure]> {
+  let summary = "Logical gather/concatenation view, with no physical storage";
+  let arguments = (ins Variadic<AnyRankedTensor>:$inputs,
+      DenseI64ArrayAttr:$sources, DenseI64ArrayAttr:$indices);
+  let results = (outs AnyRankedTensor:$result);
+  let hasVerifier = 1;
+}
+
 def TransposeOp : FTLPU_Kernel_Op<"transpose", [Pure]> {
   let summary = "Logical tensor permutation preserved for layout planning";
   let arguments = (ins AnyRankedTensor:$input, DenseI64ArrayAttr:$permutation);
@@ -86,6 +94,15 @@ def SoftmaxOp : FTLPU_Kernel_Op<"softmax", [Pure]> {
   let summary = "Row softmax with optional causal masking";
   let arguments = (ins AnyRankedTensor:$input, I64Attr:$axis,
       F32Attr:$scale, BoolAttr:$causal);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def L2NormOp : FTLPU_Kernel_Op<"l2_norm", [Pure]> {
+  let summary = "scale * input * rsqrt(sum(input squared) + epsilon)";
+  let arguments = (ins AnyRankedTensor:$input, I64Attr:$axis,
+      F32Attr:$epsilon, F32Attr:$scale);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;

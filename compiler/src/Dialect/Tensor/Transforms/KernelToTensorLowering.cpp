@@ -81,17 +81,22 @@ void FunctionMemoryPlanner::release_before(mlir::Operation* operation)
 void FunctionMemoryPlanner::replace_value(
     mlir::Value old_value, mlir::Value new_value)
 {
+    if (old_value == new_value) return;
     if (auto allocation = allocations_.find(old_value);
         allocation != allocations_.end()) {
-        allocations_.try_emplace(new_value, allocation->second);
+        // Inserting can rehash DenseMap and invalidate both this iterator
+        // and references into the old bucket. Move through a local copy.
+        auto value = allocation->second;
+        allocations_.erase(allocation);
+        allocations_.try_emplace(new_value, std::move(value));
         if (externally_managed_.erase(old_value))
             externally_managed_.insert(new_value);
-        allocations_.erase(allocation);
     }
     if (auto use = last_uses_.find(old_value);
         use != last_uses_.end()) {
-        last_uses_[new_value] = use->second;
+        const auto value = use->second;
         last_uses_.erase(use);
+        last_uses_[new_value] = value;
     }
 }
 
@@ -352,6 +357,8 @@ mlir::FailureOr<mlir::ArrayAttr> get_value_task_allocations(
     mlir::Value value)
 {
     if (auto op = value.getDefiningOp<tensor::MatmulTaskOp>())
+        return op.getResultAllocations();
+    if (auto op = value.getDefiningOp<tensor::L2NormTaskOp>())
         return op.getResultAllocations();
     if (auto op = value.getDefiningOp<tensor::RmsNormTaskOp>())
         return op.getResultAllocations();

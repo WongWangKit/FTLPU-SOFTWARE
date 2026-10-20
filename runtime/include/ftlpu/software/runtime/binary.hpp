@@ -73,6 +73,9 @@ enum class BindingLayout : std::uint16_t {
     Fp32ScalarBroadcastPlanar = 32,
     // Alternating 32-feature blocks on East/West, one byte-plane pair each.
     Fp16HemispherePairPlanar = 33,
+    // Packed byte planes; first ceil(rows/2) tokens on West, remainder East.
+    // Both halves share bank/slices/base, with ceil(rows/2) physical row stride.
+    TokenPartitionPlanar = 34,
 };
 
 enum class BindingInitializer : std::uint16_t {

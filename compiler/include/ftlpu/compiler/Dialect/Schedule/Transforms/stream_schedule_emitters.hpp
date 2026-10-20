@@ -23,6 +23,9 @@ mlir::LogicalResult lowerLinearProjectionSchedules(
     mlir::IRRewriter& rewriter, mlir::func::FuncOp function,
     const target::LPUTargetModel& target);
 
+mlir::LogicalResult lowerL2NormSchedules(mlir::IRRewriter& rewriter,
+    mlir::func::FuncOp function, const target::LPUTargetModel& target);
+
 mlir::LogicalResult lowerRmsNormSchedules(mlir::IRRewriter& rewriter,
     mlir::func::FuncOp function, const target::LPUTargetModel& target);
 

@@ -11,6 +11,8 @@ try {
     auto memory = defaults.memory();
     memory.slices_per_hemisphere = 52;
     memory.sram_depth_rows = 8192;
+    memory.words_per_bank = 8192;
+    memory.bytes_per_word = 32;
     memory.banks_per_slice = 2;
     memory.dedicated_slice_roles = 1;
     memory.w8a16_weight_slice_base = 20;
@@ -18,6 +20,8 @@ try {
     memory.w8a16_weight_slice_stride = 4;
     auto throughput = defaults.throughput();
     throughput.mxms_per_hemisphere = 1;
+    throughput.mxm_rows = 32;
+    throughput.mxm_columns = 32;
     target::LPUTargetModel target(
         memory, defaults.streams(), throughput);
 
@@ -86,6 +90,41 @@ try {
                 || v.bank != 1 - bank || o.bank != 1 - bank)
                 throw std::logic_error("Q/V/K/O did not alternate banks");
         }
+    }
+
+    // LPU16 has four 8-slice weight groups and 1024 rows per bank. A full
+    // Qwen2.5 decode projection no longer fits a single resident bank.
+    auto smallMemory = memory;
+    smallMemory.sram_depth_rows = 1024;
+    smallMemory.words_per_bank = 1024;
+    smallMemory.bytes_per_word = 16;
+    auto smallThroughput = throughput;
+    smallThroughput.mxm_rows = 16;
+    smallThroughput.mxm_columns = 16;
+    target::LPUTargetModel lpu16(
+        smallMemory, defaults.streams(), smallThroughput);
+    auto small = tensor::planAttentionWeightTiles(
+        1536, 12, 2, 128, 1, lpu16);
+    if (mlir::failed(small) || small->transfer_phase_count != 17)
+        throw std::logic_error("LPU16 attention page count is incorrect");
+    const std::array<int64_t, 4> expectedPages = {3, 1, 1, 12};
+    for (std::size_t index = 0; index < expectedPages.size(); ++index) {
+        const auto kind = static_cast<tensor::AttentionWeightTileKind>(index);
+        const auto pages = small->getPages(kind);
+        if (static_cast<int64_t>(pages.size()) != expectedPages[index])
+            throw std::logic_error("LPU16 projection page count is incorrect");
+        int64_t nextItem = 0;
+        for (const auto& page : pages) {
+            if (page.item_begin != nextItem || page.item_count <= 0
+                || page.rows > smallMemory.sram_depth_rows
+                || page.slice_group_count > small->slice_group_count)
+                throw std::logic_error("LPU16 page exceeds residency");
+            nextItem += page.item_count;
+        }
+        const int64_t expectedItems = index == 0 ? 24
+            : index == 3 ? 48 : 4;
+        if (nextItem != expectedItems)
+            throw std::logic_error("LPU16 projection items were lost");
     }
 
     std::cout << "attention_weight_tile_planner_test passed\n";

@@ -174,6 +174,8 @@ void validate_raw_3d_frontend(const QueueKey& key,
 
     std::size_t totalWords = 0;
     std::size_t scheduleCursor = 0;
+    std::size_t previousStart = 0;
+    const Raw3DPacketSequence* previousPacket = nullptr;
     for (const Raw3DPacketSequence& packet : packets) {
         if (packet.start_cycle < scheduleCursor)
             throw std::runtime_error(
@@ -182,6 +184,16 @@ void validate_raw_3d_frontend(const QueueKey& key,
                 + std::string(raw_loop_queue_name(key.first))
                 + ", queue=" + std::to_string(key.second)
                 + ", start_cycle=" + std::to_string(packet.start_cycle)
+                + ", previous_start=" + std::to_string(previousStart)
+                + ", previous_words=" + (previousPacket
+                    ? std::to_string(previousPacket->physical_words.front().words[0])
+                        + "/" + std::to_string(previousPacket->physical_words.front().words[1])
+                        + "/" + std::to_string(previousPacket->physical_words.front().words[2])
+                    : std::string("none"))
+                + ", current_words="
+                    + std::to_string(packet.physical_words.front().words[0])
+                    + "/" + std::to_string(packet.physical_words.front().words[1])
+                    + "/" + std::to_string(packet.physical_words.front().words[2])
                 + ", busy_through=" + std::to_string(scheduleCursor - 1));
         if (packet.start_cycle > scheduleCursor
             && !can_encode_packet_wait(
@@ -193,6 +205,8 @@ void validate_raw_3d_frontend(const QueueKey& key,
         if (packet.final_cycle == std::numeric_limits<std::size_t>::max())
             throw std::runtime_error("FU loop packet end cycle overflows");
         scheduleCursor = packet.final_cycle + 1;
+        previousStart = packet.start_cycle;
+        previousPacket = &packet;
     }
 
     const std::size_t iqDepth = raw_loop_iq_depth(key.first);
@@ -211,6 +225,13 @@ void validate_raw_3d_frontend(const QueueKey& key,
             ++nextReadyFetch;
         }
         if (iqWords < requiredWords) {
+            std::string nearby;
+            for (const Raw3DPacketSequence& candidate : packets)
+                if (candidate.start_cycle <= cycle
+                    && candidate.start_cycle + 64 >= cycle)
+                    nearby += std::to_string(candidate.start_cycle)
+                        + ":" + std::to_string(
+                            candidate.physical_words.size()) + ",";
             throw std::runtime_error(
                 "raw FU loop schedule exceeds ICU frontend bandwidth: "
                 "resource=" + std::string(raw_loop_queue_name(key.first))
@@ -219,6 +240,7 @@ void validate_raw_3d_frontend(const QueueKey& key,
                 + ", command=" + commandName
                 + ", required_words=" + std::to_string(requiredWords)
                 + ", available_words=" + std::to_string(iqWords)
+                + ", nearby_packets=" + nearby
                 + ", iq_depth=" + std::to_string(iqDepth)
                 + ", refill_words_per_cycle="
                 + std::to_string(refillWordsPerCycle)
@@ -878,6 +900,7 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::W8A16Native4Weight;
     if (value == "fp16_pair_planar") return BindingLayout::Fp16PairPlanar;
     if (value == "fp16_hemisphere_pair_planar") return BindingLayout::Fp16HemispherePairPlanar;
+    if (value == "token_partition_planar") return BindingLayout::TokenPartitionPlanar;
     if (value == "fp32_quad_planar") return BindingLayout::Fp32QuadPlanar;
     if (value == "fp16_scalar_broadcast_planar")
         return BindingLayout::Fp16ScalarBroadcastPlanar;
@@ -1345,6 +1368,8 @@ void collect_vxm(command::VxmOp op, QueueMap& queues)
         static_cast<float>(op.getRhsImmediateAttr().getValueAsDouble()), queue,
         chainDepth, rhsSource ? rhsSource.getValue() : llvm::StringRef{},
         op.getInputHemisphere());
+    instruction.lhs_stream_tap = op.getLhsStreamTap().value_or(false);
+    instruction.rhs_stream_tap = op.getRhsStreamTap().value_or(false);
     instruction.result_type = parse_vxm_cast_target(op.getCastTarget());
     instruction.precision = VxmAluPrecision::Float32;
     instruction.repeat_count = static_cast<std::size_t>(op.getRepeatCount());
@@ -2682,11 +2707,22 @@ void emit_compiled_mem_write_sync(software::runtime::BinaryProgram& program)
             // Packing geometry depends on the binding and page placement,
             // never on weight values. Use zeros to get the exact touched-row
             // runs; residency regions may conservatively include holes.
-            const auto image = pack_weight_binding_page(*binding,
-                use.page_index,
-                std::span<const std::uint8_t>(
-                    geometryBytes.data(), logicalBytes),
-                program.hardware);
+            PackedWeightImage image;
+            try {
+                image = pack_weight_binding_page(*binding, use.page_index,
+                    std::span<const std::uint8_t>(
+                        geometryBytes.data(), logicalBytes),
+                    program.hardware);
+            } catch (const std::exception& error) {
+                throw std::runtime_error(
+                    "weight binding " + std::to_string(binding->index)
+                    + " page " + std::to_string(use.page_index)
+                    + " layout " + std::to_string(
+                        static_cast<int>(binding->layout))
+                    + " target_rows " + std::to_string(program.hardware.mxm_rows)
+                    + " target_bytes " + std::to_string(program.hardware.bytes_per_word)
+                    + ": " + error.what());
+            }
             for (const auto& segment : image.segments) {
                 if (segment.vector_count
                     > std::numeric_limits<std::uint16_t>::max())
@@ -2702,7 +2738,12 @@ void emit_compiled_mem_write_sync(software::runtime::BinaryProgram& program)
             }
         }
         if (page.segments.empty())
-            throw std::runtime_error("paged MEM_WRITE_SYNC has no segments");
+            throw std::runtime_error(
+                "paged MEM_WRITE_SYNC has no segments: binding="
+                + std::to_string(program.weight_page_uses.at(
+                    plan.use_indices.front()).binding_index)
+                + " page=" + std::to_string(plan.page_index)
+                + " bank=" + std::to_string(plan.bank));
         pages.push_back(std::move(page));
     }
     schedule_weight_prefetches(program, plans);

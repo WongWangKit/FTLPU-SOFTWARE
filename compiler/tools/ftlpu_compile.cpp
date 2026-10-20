@@ -34,6 +34,7 @@ namespace {
 
 enum class InputStage {
     StableHlo,
+    Kernel,
     Stream,
     Schedule,
     VerifiedSchedule,
@@ -66,6 +67,7 @@ struct Args {
 InputStage parse_input_stage(const std::string& value)
 {
     if (value == "stablehlo") return InputStage::StableHlo;
+    if (value == "kernel") return InputStage::Kernel;
     if (value == "stream") return InputStage::Stream;
     if (value == "schedule") return InputStage::Schedule;
     if (value == "verified-schedule") return InputStage::VerifiedSchedule;
@@ -164,7 +166,7 @@ Args parse_args(int argc, char** argv)
     if (args.input.empty() || args.output.empty())
         throw std::runtime_error(
             "usage: ftlpu-compile --input in.mlir --output program.ftlpu "
-            "[--input-stage stablehlo|stream|schedule|verified-schedule|command] "
+            "[--input-stage stablehlo|kernel|stream|schedule|verified-schedule|command] "
             "[--target-config target.json] [--weight-bank 0|1] "
             "[--kv-cache-capacity tokens] "
             "[--mxm-execution auto|vector|native4|legacy] "
@@ -270,6 +272,8 @@ try {
         mlir::StringAttr::get(&context,
             ftlpu::compiler::target::mxm_execution_policy_name(
                 args.mxm_execution_policy)));
+    (*module)->setAttr("ftlpu.ffn_schedule", mlir::StringAttr::get(&context,
+        args.ffn_schedule == ftlpu::compiler::FfnScheduleStrategy::Fused ? "fused" : "tail"));
     const auto existingLowering =
         (*module)->getAttrOfType<mlir::StringAttr>("ftlpu.command_lowering");
     const bool directLowering = args.direct_ffn_up_3d
@@ -310,9 +314,10 @@ try {
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::
                 create_lower_standalone_ffn_up_to_3d_command_pass());
-    } else if (args.input_stage == InputStage::StableHlo) {
-        passes.addNestedPass<mlir::func::FuncOp>(
-            ftlpu::compiler::create_lower_stablehlo_to_kernel_pass());
+    } else if (args.input_stage == InputStage::StableHlo || args.input_stage == InputStage::Kernel) {
+        if (args.input_stage == InputStage::StableHlo)
+            passes.addNestedPass<mlir::func::FuncOp>(
+                ftlpu::compiler::create_lower_stablehlo_to_kernel_pass());
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_connected_kernel_graph_pass());
         passes.addNestedPass<mlir::func::FuncOp>(
@@ -322,7 +327,7 @@ try {
             ftlpu::compiler::create_lower_tensor_to_stream_pass());
     }
     if (!args.direct_ffn_up_3d
-        && (args.input_stage == InputStage::StableHlo
+        && (args.input_stage == InputStage::StableHlo || args.input_stage == InputStage::Kernel
             || args.input_stage == InputStage::Stream))
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_stream_to_schedule_pass(

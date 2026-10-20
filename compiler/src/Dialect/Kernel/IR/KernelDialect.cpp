@@ -71,6 +71,23 @@ LogicalResult ReshapeOp::verify()
     return success();
 }
 
+LogicalResult IndexedViewOp::verify()
+{
+    const auto output = getResult().getType();
+    if (!output.hasStaticShape() || getSources().size() != output.getNumElements()
+        || getIndices().size() != getSources().size())
+        return emitOpError("requires one logical source/index per output element");
+    for (auto [source, index] : llvm::zip(getSources(), getIndices())) {
+        if (source < 0 || source >= getInputs().size())
+            return emitOpError("source operand index is out of bounds");
+        auto input = llvm::cast<RankedTensorType>(getInputs()[source].getType());
+        if (!input.hasStaticShape() || input.getElementType() != output.getElementType()
+            || index < 0 || index >= input.getNumElements())
+            return emitOpError("view element is out of bounds or has a different type");
+    }
+    return success();
+}
+
 LogicalResult TransposeOp::verify()
 {
     const auto input = getInput().getType();
@@ -165,6 +182,21 @@ LogicalResult SoftmaxOp::verify()
     return success();
 }
 
+LogicalResult L2NormOp::verify()
+{
+    const auto input = getInput().getType();
+    const int64_t axis = getAxisAttr().getInt();
+    if (!input.hasStaticShape() || input.getRank() != 2
+        || input.getDimSize(0) <= 0 || input.getDimSize(1) <= 0
+        || (!input.getElementType().isBF16() && !input.getElementType().isF16())
+        || getResult().getType() != input || (axis != 1 && axis != -1))
+        return emitOpError("requires a static rank-2 16-bit floating input/result and final axis");
+    if (!std::isfinite(getEpsilon().convertToFloat()) || getEpsilon().convertToFloat() <= 0
+        || !std::isfinite(getScale().convertToFloat()))
+        return emitOpError("requires positive finite epsilon and finite scale");
+    return success();
+}
+
 LogicalResult RmsNormOp::verify()
 {
     const auto input = getInput().getType();
@@ -216,8 +248,12 @@ LogicalResult VectorAluOp::verify()
         && getKind() != "multiply" && getKind() != "max"
         && getKind() != "negate" && getKind() != "cast"
         && getKind() != "exp" && getKind() != "reciprocal"
-        && getKind() != "rsqrt")
+        && getKind() != "rsqrt" && getKind() != "sigmoid"
+        && getKind() != "softplus")
         return emitOpError("unsupported generic vector ALU operation");
+    if ((getKind() == "sigmoid" || getKind() == "softplus") &&
+        (!getUseImmediate() || getReduce() || !result.getElementType().isF32()))
+        return emitOpError("semantic sigmoid/softplus require unary non-reducing FP32 output");
     if (getReduce() && getKind() != "multiply")
         return emitOpError("row reduction currently sums products");
     return success();

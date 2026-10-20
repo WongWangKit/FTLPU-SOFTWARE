@@ -2,6 +2,49 @@
 
 namespace ftlpu::compiler::schedule::attention_detail {
 
+int64_t emitDistributedActivationStaging(mlir::IRRewriter &rewriter,
+    mlir::Location location, const target::LPUTargetModel &target,
+    mlir::DictionaryAttr source, mlir::DictionaryAttr destination,
+    int64_t rows, int64_t columns) {
+  const auto get = [](mlir::DictionaryAttr p, const char *key) {
+    return p.getAs<mlir::IntegerAttr>(key).getInt();
+  };
+  auto src = source.getAs<mlir::ArrayAttr>("slices");
+  auto dst = destination.getAs<mlir::ArrayAttr>("slices");
+  const auto tile = target.throughput().mxm_rows;
+  const auto blocks = columns/tile;
+  if (src.size() != 16 || dst.size() != 2 || rows%tile || columns%tile)
+    return -1;
+  const int64_t beat = 32;
+  for (int64_t h = 0; h < 2; ++h) {
+    for (int64_t lane = 0; lane < 8; ++lane)
+      for (int64_t byte = 0; byte < 2; ++byte) {
+        const auto slice = llvm::cast<mlir::IntegerAttr>(src[2*lane+byte]).getInt();
+        const auto latency = target.transport_latency(target::StreamEndpoint::Mem,
+            target::StreamEndpoint::VxmInput, target::StreamDirection::West, slice);
+        if (!latency) return -1;
+        emitMem3D(rewriter, location, beat+lane-*latency,
+            h*target.memory().slices_per_hemisphere+slice,"read",get(source,"base_row"),
+            32+h*16+byte,4,8,1,"sram",-1,rows/tile,tile,blocks*4,
+            blocks,rows,4,get(source,"bank"));
+      }
+  }
+  int64_t end = beat;
+  for (int64_t h = 0; h < 2; ++h)
+    for (int64_t byte = 0; byte < 2; ++byte) {
+      const auto slice = llvm::cast<mlir::IntegerAttr>(dst[byte]).getInt();
+      const auto latency = target.transport_latency(target::StreamEndpoint::VxmResult,
+          target::StreamEndpoint::Mem,target::StreamDirection::East,slice);
+      if (!latency) return -1;
+      const auto cycle = beat+target.throughput().vxm_alus+*latency+1;
+      emitMem3D(rewriter,location,cycle,h*target.memory().slices_per_hemisphere+slice,
+          "write",get(destination,"base_row"),(1-h)*16+byte,blocks*rows,1,1,
+          "sram",-1,1,1,0,1,1,0,get(destination,"bank"));
+      end = std::max(end,cycle+blocks*rows);
+    }
+  return end+32;
+}
+
 void emitMem(mlir::IRRewriter &rewriter, mlir::Location location, int64_t cycle,
              int64_t queue, llvm::StringRef opcode, int64_t address,
              int64_t packedStream, int64_t repeatCount, int64_t repeatInterval,

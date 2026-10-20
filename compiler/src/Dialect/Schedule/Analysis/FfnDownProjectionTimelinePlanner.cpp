@@ -95,6 +95,17 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
         ? (result.reduction_block_count + reductionsPerWeightPage - 1)
             / reductionsPerWeightPage
         : 0;
+    // Retire the previous activation wave before a descending supercell IW
+    // burst reuses its buffer. Keep this phase uniform across page/wave
+    // starts so the complete resident reduction domain remains affine.
+    const int64_t dualMxmLoadDelay =
+        throughput.mxms_per_hemisphere > 1
+            && target.supports_mxm_local_dequant()
+            && throughput.mxm_prefill_weight_streams != 1
+        ? std::max<int64_t>(0, tile + target.mxm_first_result_latency()
+              - (throughput.mxm_weight_buffers - 1)
+                  * result.reduction_interval)
+        : 0;
     int64_t previousPage = -1;
     int64_t previousPageDrainEnd = 0;
 
@@ -127,7 +138,7 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
             block.reduction_block = reduction;
             block.active_hemispheres = activeHemispheres;
             block.weight_compute_cycle = computeCycle;
-            block.dequant_start = computeCycle - tile;
+            block.dequant_start = computeCycle - tile + dualMxmLoadDelay;
             if (throughput.mxms_per_hemisphere == 1
                 && target.supports_mxm_local_dequant()
                 && !result.blocks.empty()) {

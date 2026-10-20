@@ -449,6 +449,30 @@ LogicalResult ElementwiseTaskOp::verify()
     return verify_task_allocations(getOperation(), getResultAllocations());
 }
 
+LogicalResult L2NormTaskOp::verify()
+{
+    const auto input = getInput().getType();
+    const int64_t axis = getAxisAttr().getInt();
+    if (!input.hasStaticShape() || input.getRank() != 2
+        || input.getDimSize(0) <= 0 || input.getDimSize(1) <= 0
+        || (!input.getElementType().isBF16() && !input.getElementType().isF16())
+        || getResult().getType() != input || (axis != 1 && axis != -1))
+        return emitOpError("requires a static rank-2 16-bit floating input/result and final axis");
+    if (!std::isfinite(getEpsilon().convertToFloat()) || getEpsilon().convertToFloat() <= 0
+        || !std::isfinite(getScale().convertToFloat()))
+        return emitOpError("requires positive finite epsilon and finite scale");
+    if (getRoutes().size() < 2)
+        return emitOpError("requires input and result routes");
+    if (failed(verify_task_allocations(getOperation(), getInputAllocations()))
+        || failed(verify_task_allocations(getOperation(), getResultAllocations())))
+        return failure();
+    if (getScratchAllocations().size() != 2)
+        return emitOpError("requires input and output feedback scratch");
+    if (failed(verify_task_allocations(getOperation(), getScratchAllocations())))
+        return failure();
+    return success();
+}
+
 LogicalResult RmsNormTaskOp::verify()
 {
     const auto input = getInput().getType();

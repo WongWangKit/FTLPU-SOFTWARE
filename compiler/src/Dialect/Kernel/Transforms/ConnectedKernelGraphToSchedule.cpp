@@ -2,6 +2,8 @@
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
+#include "ftlpu/compiler/Transforms/logical_kernel_graph.hpp"
+#include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -234,6 +236,25 @@ public:
   llvm::StringRef getDescription() const final {return "Plan connected RMSNorm/projection/causal-convolution layouts and native ICU domains";}
   void runOnOperation() final {
     auto function=getOperation();
+    if (function->hasAttr("ftlpu.logical_inputs")) {
+      try {
+        auto directory = function->getAttrOfType<mlir::StringAttr>("ftlpu.artifact_directory");
+        if (!directory) throw std::runtime_error("connected decoder needs an artifact directory for packed inputs");
+        auto parent = function->getParentOfType<mlir::ModuleOp>();
+        auto lowered = lower_connected_decoder_graph(parent, directory.getValue().str());
+        auto generated = *lowered->getOps<mlir::func::FuncOp>().begin();
+        function.getBody().takeBody(generated.getBody());
+        function.setType(generated.getFunctionType());
+        function->removeAttr("ftlpu.logical_inputs");
+        function->setAttr("ftlpu.connected_graph_schedule",mlir::UnitAttr::get(function.getContext()));
+        for (auto attr : (*lowered)->getAttrs()) parent->setAttr(attr.getName(),attr.getValue());
+        std::error_code ec;
+        llvm::raw_fd_ostream out((std::filesystem::path(directory.getValue().str())/"decoder_layer.schedule.mlir").string(),ec);
+        if (ec) throw std::runtime_error(ec.message());
+        parent.print(out);
+      } catch (const std::exception &e) {function.emitError(e.what());signalPassFailure();}
+      return;
+    }
     kernel::RmsNormOp norm;kernel::MatmulOp projection;kernel::DepthwiseConv1DOp conv;
     int64_t kernels=0;
     for (auto &op : function.front()) {

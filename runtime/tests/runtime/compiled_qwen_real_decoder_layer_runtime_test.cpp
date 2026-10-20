@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -945,13 +946,22 @@ int main(int argc, char **argv) try {
   try {
     session.run();
   } catch (...) {
+    const auto original_error = std::current_exception();
+    if (trace_path != nullptr)
+      session.write_execution_trace_csv(std::string(trace_path) + ".failed.csv");
+    if (mem_trace_path != nullptr)
+      session.write_mem_execution_trace_csv(std::string(mem_trace_path) + ".failed.csv");
     if (const char *linked_path =
-            std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
-      session.write_last_linked_program(linked_path);
+            std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY")) {
+      try { session.write_last_linked_program(linked_path); }
+      catch (const std::exception&) {}
+    }
     if (const char *pre_execution_directory =
-            std::getenv("FTLPU_QWEN_C2C_PRE_EXECUTION_DIR"))
-      session.write_pre_execution_icu_programs(pre_execution_directory);
-    throw;
+            std::getenv("FTLPU_QWEN_C2C_PRE_EXECUTION_DIR")) {
+      try { session.write_pre_execution_icu_programs(pre_execution_directory); }
+      catch (const std::exception&) {}
+    }
+    std::rethrow_exception(original_error);
   }
 
   if (const char *linked_path =
@@ -1029,6 +1039,7 @@ int main(int argc, char **argv) try {
       throw std::logic_error(
           "Qwen decoder has no distributed attention-stage binding");
     CModelRuntime observer(system.chip());
+    observer.load(loaded_program, false);
     constexpr std::size_t kPrefillKvBytes = 32 * 2 * 128 * 2;
     const auto state_prefix = [](const std::vector<std::uint8_t> &state) {
       if (state.size() < kPrefillKvBytes)
@@ -1211,6 +1222,19 @@ int main(int argc, char **argv) try {
                               : observer.download_binding(*distributed_binding);
     write_bytes(fixture / ("debug." + stage_name + ".actual.bf16.bin"),
                 observed);
+    if (decode && stage_name == "residual0") {
+      BinaryBinding down_binding = find_binding(
+          loaded_program, BindingAccess::Output, 0);
+      down_binding.layout = BindingLayout::Fp16PairPlanar;
+      down_binding.bank = 1;
+      down_binding.base_row = 0;
+      down_binding.slices = {16, 17, 18, 19};
+      down_binding.hemisphere_mask = 3;
+      const auto down = observer.download_binding(down_binding);
+      write_bytes(fixture / "debug.down.actual.bf16.bin", down);
+      print_stage_error("down", down,
+          read_bytes(fixture / "golden.down.bf16.bin"));
+    }
     if (stage_name == "gate" || stage_name == "up") {
       if (stage_name == "gate") {
         write_bytes(fixture / "debug.up.actual.bf16.bin",
@@ -1384,6 +1408,8 @@ int main(int argc, char **argv) try {
   }
 
   const auto &actual = session.value("hidden.1");
+  if (std::getenv("FTLPU_TRACE_QWEN_FINAL") != nullptr)
+    write_bytes(fixture / "debug.final.actual.bf16.bin", actual);
   const auto golden = read_bytes(fixture / "golden.bf16.bin");
   if (actual.size() != golden.size())
     throw std::logic_error("Qwen decoder output size differs from golden");

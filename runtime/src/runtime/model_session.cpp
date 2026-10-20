@@ -1964,7 +1964,8 @@ void ModelSession::observe_executable_weight_page_tick() {
             hw::kMxmBoundaryStreamRegisterColumn + 1;
         bool allParticipantsAtBarrier = true;
         for (const auto& release : epoch.releases) {
-          if (release.phase_offset > startupWindow && !release.activation_producer)
+          if (release.phase_offset > startupWindow && !release.activation_producer
+              && release.location.kind != IcuLocationKind::MxmCompute)
             continue;
           if (!c2c_system_->chip().icu().blocked_on_tagged_event(
                   release.location, epoch.event_tag)) {
@@ -2002,6 +2003,10 @@ void ModelSession::observe_executable_weight_page_tick() {
       if (!epoch.release_origin_cycle)
         epoch.release_origin_cycle = now
             - static_cast<std::int64_t>(phaseOffset);
+      if (std::getenv("FTLPU_SESSION_PROGRESS") != nullptr)
+        std::clog << "FTLPU epoch release: tag=" << epoch.event_tag
+                  << " cycle=" << now << " phase_offset=" << phaseOffset
+                  << " participants=" << phaseEnd - phaseBegin << std::endl;
       for (auto index = phaseBegin; index < phaseEnd; ++index)
         c2c_system_->chip().icu().notify_tagged(
             epoch.releases[index].location, epoch.event_tag);

@@ -642,13 +642,16 @@ LogicalResult SxmOp::verify()
     const int64_t physicalWidth =
         2 * target.throughput().lanes_per_tile;
     const int64_t sourceWidth = getInputRow() ? 2 : physicalWidth;
+    const int64_t mapWidth = target.throughput().tile_rows
+        * target.throughput().lanes_per_tile;
     if (getSourceStreams().size() != sourceWidth
         || getDestinationStreams().size() != physicalWidth
-        || getPermuteMap().size() != 32)
+        || getPermuteMap().size() != mapWidth)
         return emitOpError()
             << "requires " << sourceWidth << " source and "
             << physicalWidth
-            << " destination byte streams and a 32-lane map";
+            << " destination byte streams and a " << mapWidth
+            << "-lane map";
     const auto valid_stream = [&](Attribute attribute) {
         const auto value = llvm::dyn_cast<IntegerAttr>(attribute);
         return value && value.getInt() >= 0
@@ -660,8 +663,10 @@ LogicalResult SxmOp::verify()
         if (!valid_stream(stream)) return emitOpError("destination stream is outside the encoded range");
     for (Attribute lane : getPermuteMap()) {
         const auto value = llvm::dyn_cast<IntegerAttr>(lane);
-        if (!value || value.getInt() < -1 || value.getInt() >= 32)
-            return emitOpError("permute map lanes must be -1 or [0, 31]");
+        if (!value || value.getInt() < -1 || value.getInt() >= mapWidth)
+            return emitOpError()
+                << "permute map lanes must be -1 or [0, "
+                << (mapWidth - 1) << "]";
     }
     if (getWeightLayout() != "vector_columns" && getWeightLayout() != "matrix_columns")
         return emitOpError("weight_layout must be vector_columns or matrix_columns");

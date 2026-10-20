@@ -186,6 +186,16 @@ def SoftmaxTaskOp : FTLPU_Tensor_Op<"softmax_task", [Pure]> {
   let hasVerifier = 1;
 }
 
+def L2NormTaskOp : FTLPU_Tensor_Op<"l2_norm_task", [Pure]> {
+  let summary = "L2 normalization with distributed16 input and result storage";
+  let arguments = (ins AnyRankedTensor:$input, I64Attr:$axis,
+      F32Attr:$epsilon, F32Attr:$scale, ArrayAttr:$input_allocations,
+      ArrayAttr:$scratch_allocations, ArrayAttr:$result_allocations);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def RmsNormTaskOp : FTLPU_Tensor_Op<"rms_norm_task", [Pure]> {
   let summary = "RMS normalization with assigned input, scale, scratch, and result storage";
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,

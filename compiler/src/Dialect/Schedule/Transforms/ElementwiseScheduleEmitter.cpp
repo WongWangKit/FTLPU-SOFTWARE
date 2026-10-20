@@ -110,21 +110,24 @@ bool isDistributed16(mlir::DictionaryAttr placement)
 
 mlir::FailureOr<TileAddress> distributedAddress(
     mlir::DictionaryAttr placement, int64_t block, int64_t row,
-    int64_t columnBlocks, int64_t hemisphere)
+    int64_t columnBlocks, int64_t hemisphere,
+    const target::LPUTargetModel& target)
 {
     const auto slices = placementSlices(placement);
     if (!isDistributed16(placement) || slices.size() != 16)
         return mlir::failure();
-    const int64_t tile = 32;
+    const int64_t tile = target.throughput().mxm_rows;
     const int64_t tokenBlock = row / tile;
     const int64_t tokenWithinBlock = row % tile;
-    const int64_t tokenWave = tokenWithinBlock / 8;
-    const int64_t tokenLane = tokenWithinBlock % 8;
+    const int64_t lanes = target.throughput().lanes_per_tile;
+    const int64_t tokenWave = tokenWithinBlock / lanes;
+    const int64_t tokenLane = tokenWithinBlock % lanes;
     const int64_t base =
         placement.getAs<mlir::IntegerAttr>("base_row").getInt();
     return TileAddress {
         {slices[2 * tokenLane], slices[2 * tokenLane + 1]},
-        base + (tokenBlock * columnBlocks + block) * 4 + tokenWave,
+        base + (tokenBlock * columnBlocks + block)
+            * target.throughput().tile_rows + tokenWave,
         hemisphere, placementBank(placement)};
 }
 
@@ -156,7 +159,7 @@ mlir::FailureOr<TileAddress> tileAddress(
     }
     if (isDistributed16(placement)) {
         return distributedAddress(
-            placement, block, 0, 1, preferredHemisphere);
+            placement, block, 0, 1, preferredHemisphere, target);
     }
     return mlir::failure();
 }
@@ -287,7 +290,8 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
     int64_t cycle = 10;
     const int64_t start = cycle;
     mlir::Value finalValue = op.getLhs();
-    const int64_t columnBlocks = columns / tile;
+    const int64_t columnBlocks =
+        columns / target.memory().bytes_per_word;
     // Every supported layout repeats its physical command body after four
     // column blocks.  pair_planar uses block%2 for the slice pair and
     // (block/2)%2 for the hemisphere; distributed16 and activation_planar
@@ -377,7 +381,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     && outputHemisphere == validOutputHemisphere;
                 for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                     auto output = distributedAddress(resultPlacement,
-                        block, pair, columnBlocks, outputHemisphere);
+                        block, pair, columnBlocks, outputHemisphere, target);
                     if (mlir::failed(output)) return mlir::failure();
                     for (int64_t byte = 0; byte < 2; ++byte) {
                         const int64_t pairCycle = pairMajorMemOrder
@@ -417,7 +421,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
             int64_t bridgeEnd = bridgeCycle;
             for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                 auto mirror = distributedAddress(resultPlacement,
-                    block, pair, columnBlocks, mirrorOutputHemisphere);
+                    block, pair, columnBlocks, mirrorOutputHemisphere, target);
                 if (mlir::failed(mirror)) return mlir::failure();
                 for (int64_t byte = 0; byte < 2; ++byte) {
                     const int64_t mirrorWriteCycle = bridgeCycle + pair
@@ -500,13 +504,13 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 const int64_t physicalPairs = singleRowDecode ? 1 : lanes;
                 for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                     auto distributed = distributedAddress(placement,
-                        block, pair, columnBlocks, sourceHemisphere);
+                        block, pair, columnBlocks, sourceHemisphere, target);
                     if (mlir::failed(distributed)) return false;
                     int64_t columnAddressStride = 0;
                     if (columnDomainCount > 1) {
                         auto next = distributedAddress(placement,
                             block + kColumnBlockResidues, pair,
-                            columnBlocks, sourceHemisphere);
+                            columnBlocks, sourceHemisphere, target);
                         if (mlir::failed(next)) return false;
                         columnAddressStride =
                             next->row - distributed->row;
@@ -847,7 +851,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     && outputHemisphere == validOutputHemisphere;
                 for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                     auto output = distributedAddress(resultPlacement,
-                        block, pair, columnBlocks, outputHemisphere);
+                        block, pair, columnBlocks, outputHemisphere, target);
                     if (mlir::failed(output))
                         return op.emitError(
                             "invalid distributed elementwise result");
@@ -855,7 +859,7 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     if (columnDomainCount > 1) {
                         auto nextOutput = distributedAddress(resultPlacement,
                             block + kColumnBlockResidues, pair,
-                            columnBlocks, outputHemisphere);
+                            columnBlocks, outputHemisphere, target);
                         if (mlir::failed(nextOutput))
                             return op.emitError(
                                 "invalid distributed elementwise column domain");
@@ -957,10 +961,10 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                 for (int64_t pair = 0; pair < physicalPairs; ++pair) {
                     auto source = distributedAddress(resultPlacement,
                         block, pair, columnBlocks,
-                        validOutputHemisphere);
+                        validOutputHemisphere, target);
                     auto mirror = distributedAddress(resultPlacement,
                         block, pair, columnBlocks,
-                        mirrorOutputHemisphere);
+                        mirrorOutputHemisphere, target);
                     if (mlir::failed(source) || mlir::failed(mirror))
                         return op.emitError(
                             "invalid distributed elementwise mirror");
@@ -969,10 +973,10 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     if (columnDomainCount > 1) {
                         auto nextSource = distributedAddress(resultPlacement,
                             block + kColumnBlockResidues, pair,
-                            columnBlocks, validOutputHemisphere);
+                            columnBlocks, validOutputHemisphere, target);
                         auto nextMirror = distributedAddress(resultPlacement,
                             block + kColumnBlockResidues, pair,
-                            columnBlocks, mirrorOutputHemisphere);
+                            columnBlocks, mirrorOutputHemisphere, target);
                         if (mlir::failed(nextSource)
                             || mlir::failed(nextMirror))
                             return op.emitError(
@@ -1125,6 +1129,14 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
     createTimeline(rewriter, op, start, cycle);
     auto output =
         createOutputBinding(rewriter, op, outputIndex, resultPlacement);
+    if (persistentResultPlacement) {
+        auto persistent =
+            createOutputBinding(rewriter, op, outputIndex, persistentResultPlacement);
+        persistent->setAttr("access", rewriter.getStringAttr("internal"));
+        persistent->setAttr("name", rewriter.getStringAttr(
+            output->getAttrOfType<mlir::StringAttr>("name").getValue().str()
+                + ".persistent"));
+    }
     rewriter.replaceOp(op, output.getValue());
     return mlir::success();
 }

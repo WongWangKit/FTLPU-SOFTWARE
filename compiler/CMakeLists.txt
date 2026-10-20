@@ -75,6 +75,7 @@ add_library(ftlpu_compiler
     src/Dialect/Kernel/IR/KernelDialect.cpp
     src/Dialect/Kernel/Analysis/AttentionGraph.cpp
     src/Dialect/Kernel/Analysis/FfnGraph.cpp
+    src/Dialect/Kernel/Analysis/DecoderGraph.cpp
     src/Dialect/Kernel/Transforms/StableHloToKernel.cpp
     src/Dialect/Kernel/Transforms/ConnectedKernelGraphToSchedule.cpp
     src/Dialect/Kernel/Transforms/LogicalKernelGraphToSchedule.cpp
@@ -90,6 +91,7 @@ add_library(ftlpu_compiler
     src/Dialect/Tensor/Transforms/KernelToTensorLowering.cpp
     src/Dialect/Tensor/Transforms/KernelToTensor.cpp
     src/Dialect/Tensor/Transforms/MatmulToTensor.cpp
+    src/Dialect/Tensor/Transforms/L2NormToTensor.cpp
     src/Dialect/Tensor/Transforms/RmsNormToTensor.cpp
     src/Dialect/Tensor/Transforms/SwigluToTensor.cpp
     src/Dialect/Stream/IR/StreamDialect.cpp
@@ -101,6 +103,7 @@ add_library(ftlpu_compiler
     src/Dialect/Stream/Transforms/FfnToStream.cpp
     src/Dialect/Stream/Transforms/ElementwiseToStream.cpp
     src/Dialect/Stream/Transforms/MatmulToStream.cpp
+    src/Dialect/Stream/Transforms/L2NormToStream.cpp
     src/Dialect/Stream/Transforms/RmsNormToStream.cpp
     src/Dialect/Stream/Transforms/SwigluToStream.cpp
     src/Dialect/Stream/Transforms/TensorToStream.cpp
@@ -319,6 +322,8 @@ add_test(NAME stream_route_plan_test COMMAND $<TARGET_FILE:stream_route_plan_tes
 add_executable(ffn_schedule_builders_test tests/ffn_schedule_builders_test.cpp)
 target_link_libraries(ffn_schedule_builders_test PRIVATE ftlpu_compiler)
 add_test(NAME ffn_schedule_builders_test COMMAND $<TARGET_FILE:ffn_schedule_builders_test>)
+add_test(NAME ffn_projection_affine_test
+    COMMAND $<TARGET_FILE:ffn_schedule_builders_test> --affine-only)
 add_executable(elementwise_vxm_sr_direction_test tests/elementwise_vxm_sr_direction_test.cpp)
 target_link_libraries(elementwise_vxm_sr_direction_test PRIVATE ftlpu_compiler)
 add_test(NAME elementwise_vxm_sr_direction_test COMMAND $<TARGET_FILE:elementwise_vxm_sr_direction_test>)
@@ -856,6 +861,28 @@ if(Python3_Interpreter_FOUND)
             --compile $<TARGET_FILE:ftlpu_compile>
             --runner $<TARGET_FILE:compiled_stage_file_runner>
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/depthwise_conv_mirrored)
+        add_test(NAME l2norm_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/l2norm_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/l2norm)
+        add_test(NAME vector_nonlinear_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/vector_nonlinear_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/vector_nonlinear)
+        add_test(NAME vector_token_parallel_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/vector_token_parallel_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/vector_token_parallel)
         add_test(NAME shared_rmsnorm_resident_runtime_test
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/shared_rmsnorm_resident_runtime_test.py
@@ -880,6 +907,21 @@ if(Python3_Interpreter_FOUND)
             --runner $<TARGET_FILE:compiled_stage_file_runner>
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen3_5_resident_decoder_layer)
+        add_test(NAME decoder_graph_patterns_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/decoder_graph_patterns_test.py
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/decoder_graph_patterns)
+        add_test(NAME connected_ffn_memory_lifetime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/connected_ffn_memory_lifetime_test.py
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/connected_ffn_memory_lifetime)
         add_test(NAME gated_attention_runtime_test
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/gated_attention_runtime_test.py
@@ -889,6 +931,14 @@ if(Python3_Interpreter_FOUND)
             --runner $<TARGET_FILE:compiled_stage_file_runner>
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gated_attention_runtime)
+        add_test(NAME native_dense_gated_decoder_layer_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/native_dense_gated_decoder_layer_runtime_test.py
+            --opt $<TARGET_FILE:ftlpu_opt>
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/native_dense_gated_decoder_layer)
         add_test(NAME gated_attention_decoder_layer_runtime_test
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/gated_attention_runtime_test.py

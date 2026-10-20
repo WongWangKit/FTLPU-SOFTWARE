@@ -134,7 +134,12 @@ def check_environment(a, models, *, check_binaries=True):
     if not a.target_config.is_file(): issues.append(f'Missing target config: {a.target_config}')
     cached_target = cache.get('FTLPU_HARDWARE_CONFIG')
     if cached_target and Path(cached_target).is_file() and a.target_config.is_file():
-        if json.loads(Path(cached_target).read_text()) != json.loads(a.target_config.read_text()):
+        built = json.loads(Path(cached_target).read_text(encoding='utf-8'))
+        requested = json.loads(a.target_config.read_text(encoding='utf-8'))
+        # This selects existing IW/IWColumn hardware, not physical geometry.
+        for configuration in (built, requested):
+            configuration.get('throughput', {}).pop('mxm_prefill_weight_streams', None)
+        if built != requested:
             issues.append('Target differs from the build configuration; configure a separate build with FTLPU_HARDWARE_CONFIG')
     for dependency in ('numpy',):
         if importlib.util.find_spec(dependency) is None:

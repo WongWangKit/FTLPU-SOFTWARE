@@ -37,6 +37,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/weight_prefetch_plan.cpp
     examples/binary_inspect.cpp
     examples/binary_repack.cpp
+    examples/icu_program_export.cpp
     examples/pack_model_weights.cpp
     tests/runtime/command_mxm_column_binary_test.cpp
     tests/runtime/command_vxm_binary_runtime_test.cpp
@@ -46,6 +47,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/issue_inspector_test.cpp
     tests/runtime/compiled_sxm_command_runtime_test.cpp
     tests/runtime/compiled_queue_program_runtime_test.cpp
+    tests/runtime/compiled_stage_file_runner.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
     tests/runtime/compiled_qwen_real_ffn_runtime_test.cpp
     tests/runtime/compiled_qwen_real_decoder_layer_runtime_test.cpp
@@ -277,6 +279,10 @@ add_test(
 add_executable(c2c_weight_ping_pong_test
     tests/runtime/c2c_weight_ping_pong_test.cpp)
 target_link_libraries(c2c_weight_ping_pong_test PRIVATE ftlpu_software)
+if(MSVC)
+    # These tests instantiate complete C2C systems on the stack.
+    target_link_options(c2c_weight_ping_pong_test PRIVATE /STACK:67108864)
+endif()
 add_test(
     NAME c2c_weight_ping_pong_test
     COMMAND $<TARGET_FILE:c2c_weight_ping_pong_test>)
@@ -463,6 +469,29 @@ target_compile_definitions(
 target_link_libraries(
     compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test
     PRIVATE ftlpu_software)
+
+add_executable(compiled_qwen2_5_1_5b_decoder_layer_seq64_runtime_test
+    tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
+target_compile_definitions(
+    compiled_qwen2_5_1_5b_decoder_layer_seq64_runtime_test PRIVATE
+    FTLPU_TEST_SEQUENCE_LENGTH=64
+    FTLPU_TEST_HIDDEN_SIZE=1536
+    FTLPU_TEST_INTERMEDIATE_SIZE=8960
+    FTLPU_TEST_QUERY_HEADS=12
+    FTLPU_TEST_KV_HEADS=2
+    FTLPU_TEST_HEAD_DIM=128
+    FTLPU_TEST_RMS_EPSILON=1.0e-6f
+    FTLPU_TEST_ROPE_THETA=1000000.0f
+    FTLPU_TEST_MODEL_NAME="Qwen2.5-1.5B-seq64"
+    FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES=1)
+target_link_libraries(
+    compiled_qwen2_5_1_5b_decoder_layer_seq64_runtime_test
+    PRIVATE ftlpu_software)
+if(MSVC)
+    target_link_options(
+        compiled_qwen2_5_1_5b_decoder_layer_seq64_runtime_test
+        PRIVATE /STACK:67108864)
+endif()
 
 add_executable(compiled_qwen3_0_6b_decoder_layer_seq32_runtime_test
     tests/runtime/compiled_qwen3_0_6b_decoder_layer_runtime_test.cpp)
