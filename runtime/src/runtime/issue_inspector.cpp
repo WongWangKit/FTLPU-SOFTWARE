@@ -1,6 +1,7 @@
 #include "ftlpu/software/runtime/issue_inspector.hpp"
 
 #include "ftlpu/icu/distributed_queue.hpp"
+#include "ftlpu/icu/fu_3d_codec.hpp"
 
 #include <algorithm>
 #include <array>
@@ -147,6 +148,234 @@ void insert_issue(IssueMap& issues, const BinaryProgram& program,
             + std::to_string(index) + "] cycle=" + std::to_string(cycle));
 }
 
+std::size_t checked_cycle_add(std::size_t base, std::size_t delta)
+{
+    if (delta > std::numeric_limits<std::size_t>::max() - base)
+        throw std::overflow_error("logical inspector cycle overflows size_t");
+    return base + delta;
+}
+
+InstructionKind instruction_kind_for(QueueKind kind)
+{
+    switch (kind) {
+    case QueueKind::Mem: return InstructionKind::Mem;
+    case QueueKind::MxmLoad:
+    case QueueKind::MxmCompute: return InstructionKind::Mxm;
+    case QueueKind::MxmDequant: return InstructionKind::MxmDequant;
+    case QueueKind::Vxm: return InstructionKind::Vxm;
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute: return InstructionKind::Sxm;
+    default: throw std::runtime_error(
+        "logical inspector cannot map C2C transport to functional FU issues");
+    }
+}
+
+template <typename Packet>
+Packet read_fu_packet(const QueueProgram& queue, std::size_t pc)
+{
+    const auto count = fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(pc));
+    if (count == 0 || count > Packet::kWordCount
+        || count > queue.commands.size() - pc)
+        throw std::runtime_error("logical inspector found a truncated FU packet");
+    Packet packet{};
+    for (std::size_t word = 0; word < count; ++word) {
+        const auto& source = queue.commands[pc + word];
+        if (source.instruction_kind != instruction_kind_for(queue.kind)
+            || source.word_count != Packet::kLanesPerWord
+            || source.command != source.words[0]
+            || !source.extension_words.empty())
+            throw std::runtime_error("logical inspector found a malformed FU packet word");
+        for (std::size_t lane = 0; lane < Packet::kLanesPerWord; ++lane)
+            packet.words[word].lanes[lane] = source.words[lane];
+        for (std::size_t lane = Packet::kLanesPerWord; lane < source.words.size(); ++lane)
+            if (source.words[lane] != 0)
+                throw std::runtime_error("logical inspector found nonzero FU packet padding");
+    }
+    return packet;
+}
+
+QueueCommand native_instruction(const MemInstruction& instruction)
+{
+    const auto word = isa::encode_mem_instruction(instruction);
+    return {kInstructionCommand, InstructionKind::Mem, 2,
+        {static_cast<std::uint32_t>(word), static_cast<std::uint32_t>(word >> 32), 0, 0}};
+}
+
+QueueCommand native_instruction(const MxmControlInstruction& instruction)
+{
+    const auto word = isa::encode_mxm_instruction(instruction);
+    return {kInstructionCommand, InstructionKind::Mxm, 2,
+        {static_cast<std::uint32_t>(word), static_cast<std::uint32_t>(word >> 32), 0, 0}};
+}
+
+QueueCommand native_instruction(const MxmDequantInstruction& instruction)
+{
+    return {kInstructionCommand, InstructionKind::MxmDequant, 1,
+        {static_cast<std::uint32_t>(isa::encode_mxm_dequant_instruction(instruction)), 0, 0, 0}};
+}
+
+QueueCommand native_instruction(const VxmSrCompactInstruction& instruction)
+{
+    return {kInstructionCommand, InstructionKind::Vxm, 3,
+        {static_cast<std::uint32_t>(instruction.control),
+            static_cast<std::uint32_t>(instruction.control >> 32),
+            instruction.immediate_bits, 0}};
+}
+
+QueueCommand native_instruction(const SxmInstruction& instruction)
+{
+    QueueCommand command{kInstructionCommand, InstructionKind::Sxm, 4,
+        {static_cast<std::uint32_t>(instruction.opcode),
+            static_cast<std::uint32_t>(instruction.shift_source),
+            static_cast<std::uint32_t>(instruction.shift_distance),
+            (instruction.output_row == SxmInstruction::kAllOutputRows ? 0xffu
+                : static_cast<std::uint32_t>(instruction.output_row))
+                | ((instruction.input_row == SxmInstruction::kAllInputRows ? 0xffu
+                    : static_cast<std::uint32_t>(instruction.input_row)) << 8)
+                | ((instruction.output_tile == SxmInstruction::kAllOutputTiles ? 0xffu
+                    : static_cast<std::uint32_t>(instruction.output_tile)) << 16)}};
+    command.extension_words.push_back(static_cast<std::uint32_t>(instruction.src_streams.size()));
+    command.extension_words.push_back(static_cast<std::uint32_t>(instruction.dst_streams.size()));
+    for (const auto stream : instruction.src_streams)
+        command.extension_words.push_back(static_cast<std::uint32_t>(stream.stream));
+    for (const auto stream : instruction.dst_streams)
+        command.extension_words.push_back(static_cast<std::uint32_t>(stream.stream));
+    for (const auto lane : instruction.permute_map)
+        command.extension_words.push_back(lane == SxmInstruction::kZeroFill
+            ? UINT32_MAX : static_cast<std::uint32_t>(lane));
+    return command;
+}
+
+template <typename Emit>
+void for_each_fu_point(const IcuLoop3D& loop, std::size_t cursor, Emit emit)
+{
+    IcuCoordinate3D coordinate{};
+    do {
+        emit(checked_cycle_add(cursor,
+            detail::icu_loop_3d_issue_cycle(loop, coordinate)), coordinate);
+    } while (detail::advance_icu_coordinate_3d(loop, coordinate));
+}
+
+std::size_t expand_fu_packet(const BinaryProgram& program, const QueueProgram& queue,
+    std::size_t pc, std::size_t cursor, IssueMap& issues,
+    std::optional<QueueCommand>& previous, std::size_t& previousCycle)
+{
+    std::size_t finalCycle = cursor;
+    const auto emit = [&](std::size_t cycle, QueueCommand instruction) {
+        insert_issue(issues, program, queue.kind, queue.index, cycle, instruction);
+        if (!previous || cycle >= previousCycle) {
+            previous = std::move(instruction);
+            previousCycle = cycle;
+        }
+        finalCycle = std::max(finalCycle, cycle);
+    };
+    switch (queue.kind) {
+    case QueueKind::Mem:
+        if (is_mem_write_read_2d_raw_packet_header(queue.commands[pc])) {
+            const auto instruction = isa::decode_mem_icu_write_read_2d_instruction(
+                read_fu_packet<isa::EncodedMemIcuWriteRead2DPacket>(queue, pc));
+            for (std::size_t outer = 0; outer < instruction.counts[1]; ++outer)
+                for (std::size_t inner = 0; inner < instruction.counts[0]; ++inner)
+                    for (const bool read : {false, true}) {
+                        const auto& strides = read ? instruction.read_cycle_strides
+                            : instruction.write_cycle_strides;
+                        auto offset = instruction.start_wait;
+                        if (read) offset = checked_cycle_add(offset, instruction.read_start_offset);
+                        offset = checked_cycle_add(offset, inner * strides[0]);
+                        offset = checked_cycle_add(offset, outer * strides[1]);
+                        emit(checked_cycle_add(cursor, offset), native_instruction(
+                            detail::expand_mem_icu_write_read_2d_instruction(instruction, inner, outer, read)));
+                    }
+        } else {
+            const auto instruction = isa::decode_mem_icu_3d_instruction(
+                read_fu_packet<isa::EncodedMemIcu3DPacket>(queue, pc));
+            for_each_fu_point(instruction.loop, cursor, [&](auto cycle, const auto& coordinate) {
+                emit(cycle, native_instruction(detail::expand_mem_icu_instruction(instruction, coordinate)));
+            });
+        }
+        break;
+    case QueueKind::MxmLoad: {
+        const auto instruction = isa::decode_mxm_load_icu_3d_instruction(
+            read_fu_packet<isa::EncodedMxmLoadIcu3DPacket>(queue, pc));
+        for_each_fu_point(instruction.loop, cursor, [&](auto cycle, const auto& coordinate) {
+            emit(cycle, native_instruction(detail::expand_mxm_load_icu_instruction(instruction, coordinate)));
+        });
+        break;
+    }
+    case QueueKind::MxmCompute: {
+        const auto instruction = isa::decode_mxm_compute_icu_3d_instruction(
+            read_fu_packet<isa::EncodedMxmComputeIcu3DPacket>(queue, pc));
+        for_each_fu_point(instruction.loop, cursor, [&](auto cycle, const auto& coordinate) {
+            emit(cycle, native_instruction(detail::expand_mxm_compute_icu_instruction(instruction, coordinate)));
+        });
+        break;
+    }
+    case QueueKind::MxmDequant: {
+        const auto instruction = isa::decode_mxm_dequant_icu_3d_instruction(
+            read_fu_packet<isa::EncodedMxmDequantIcu3DPacket>(queue, pc));
+        for_each_fu_point(instruction.loop, cursor, [&](auto cycle, const auto&) {
+            emit(cycle, native_instruction(instruction.instruction));
+        });
+        break;
+    }
+    case QueueKind::Vxm: {
+        const auto instruction = isa::decode_vxm_icu_run_2d_instruction(
+            read_fu_packet<isa::EncodedVxmIcuRun2DPacket>(queue, pc));
+        for_each_fu_point(instruction.loop, cursor, [&](auto cycle, const auto&) {
+            emit(cycle, native_instruction(instruction.instruction));
+        });
+        break;
+    }
+    case QueueKind::SxmTranspose:
+    case QueueKind::SxmPermute: {
+        const auto instruction = queue.kind == QueueKind::SxmTranspose
+            ? isa::decode_sxm_transpose_icu_run_2d_instruction(
+                read_fu_packet<isa::EncodedSxmTransposeIcuRun2DPacket>(queue, pc))
+            : isa::decode_sxm_permute_icu_run_2d_instruction(
+                read_fu_packet<isa::EncodedSxmPermuteIcuRun2DPacket>(queue, pc));
+        for_each_fu_point(instruction.loop, cursor, [&](auto cycle, const auto& coordinate) {
+            auto expanded = instruction.instruction;
+            if (expanded.opcode == SxmOpcode::Permute && instruction.permute_map_stride != 0) {
+                const auto ordinal = coordinate.index[0]
+                    + instruction.loop.counts[0] * coordinate.index[1];
+                const auto delta = ordinal * instruction.permute_map_stride;
+                for (auto& lane : expanded.permute_map)
+                    if (lane != SxmInstruction::kZeroFill)
+                        lane = (lane + delta) % SxmInstruction::kTotalLanes;
+            }
+            emit(cycle, native_instruction(expanded));
+        });
+        break;
+    }
+    default:
+        throw std::runtime_error("logical inspector found a FU packet in a transport queue");
+    }
+    return checked_cycle_add(finalCycle, 1);
+}
+
+QueueCommand canonical_queue_instruction(const QueueProgram& queue, const QueueCommand& command)
+{
+    // Native MEM/MXM physical words carry a two-bit ICU envelope; semantic
+    // native words and VXM/SXM compact instructions do not carry that envelope.
+    const auto physicalWidth = queue.kind == QueueKind::Mem ? 3u : 4u;
+    if ((queue.kind == QueueKind::Mem || queue.kind == QueueKind::MxmLoad
+            || queue.kind == QueueKind::MxmCompute || queue.kind == QueueKind::MxmDequant)
+        && command.word_count == physicalWidth && command.extension_words.empty()) {
+        if (command.instruction_kind != instruction_kind_for(queue.kind)
+            || command.command != command.words[0] || (command.words[2] >> 2) != 0
+            || command.words[3] != 0)
+            throw std::runtime_error("logical inspector found an invalid native FU envelope");
+        const auto bits = (words64(command) >> 2)
+            | (static_cast<std::uint64_t>(command.words[2] & 3u) << 62);
+        if (queue.kind == QueueKind::MxmDequant && (bits >> 16) != 0)
+            throw std::runtime_error("logical inspector found reserved native dequant bits");
+        QueueCommand native{kInstructionCommand, command.instruction_kind, 2,
+            {static_cast<std::uint32_t>(bits), static_cast<std::uint32_t>(bits >> 32), 0, 0}};
+        return canonical_instruction(std::move(native));
+    }
+    return canonical_instruction(command);
+}
+
 template <typename Emit>
 void for_each_stream_point(const IcuStreamNdSchedule& schedule, Emit emit)
 {
@@ -179,7 +408,39 @@ void expand_queue(const BinaryProgram& program, const QueueProgram& queue,
     std::size_t cursor = 0;
     std::size_t previousCycle = 0;
     std::optional<QueueCommand> previous;
-    for (const auto& encodedCommand : queue.commands) {
+    if (!queue.commands.empty() && (queue.kind == QueueKind::C2cDma
+            || queue.kind == QueueKind::C2cRx || queue.kind == QueueKind::C2cTx))
+        throw std::runtime_error("logical inspector cannot map C2C transport to functional FU issues");
+    for (std::size_t commandIndex = 0; commandIndex < queue.commands.size(); ++commandIndex) {
+        const auto& encodedCommand = queue.commands[commandIndex];
+        if (is_mem_synchronized_raw_packet_header(encodedCommand))
+            throw std::runtime_error("logical inspector cannot map runtime-dependent MEM synchronization");
+        if (is_icu_control_raw_word_command(encodedCommand)) {
+            const auto control = decode_icu_control_raw_word(encodedCommand);
+            if (control.opcode == IcuControlOpcode::Nop) {
+                cursor = checked_cycle_add(cursor, control.count);
+                continue;
+            }
+            if (control.opcode != IcuControlOpcode::Repeat)
+                throw std::runtime_error("logical inspector cannot map runtime-dependent ICU control");
+            if (!previous)
+                throw std::runtime_error("logical inspector found Repeat without a preceding instruction");
+            for (std::size_t index = 1; index <= control.count; ++index)
+                insert_issue(issues, program, queue.kind, queue.index,
+                    checked_cycle_add(previousCycle, index * control.interval),
+                    repeat_instruction(*previous, control.address_stride, index));
+            if (control.count != 0)
+                cursor = checked_cycle_add(previousCycle, control.count * control.interval + 1);
+            continue;
+        }
+        if (is_fu_3d_raw_packet_header(encodedCommand)) {
+            cursor = expand_fu_packet(program, queue, commandIndex, cursor,
+                issues, previous, previousCycle);
+            commandIndex += fu_3d_raw_packet_word_count(queue.kind, encodedCommand) - 1;
+            continue;
+        }
+        if (is_fu_3d_raw_word_command(encodedCommand))
+            throw std::runtime_error("logical inspector found an orphan FU packet continuation");
         if (is_mem_slice_program_command(encodedCommand)) {
             const auto descriptor =
                 decode_mem_slice_program_command(encodedCommand);
@@ -286,7 +547,7 @@ void expand_queue(const BinaryProgram& program, const QueueProgram& queue,
         const auto opcode =
             isa::decode_icu_command_opcode(encodedCommand.command);
         if (opcode == isa::IcuCommandOpcode::Nop) {
-            cursor += isa::decode_icu_nop_cycles(encodedCommand.command);
+            cursor = checked_cycle_add(cursor, isa::decode_icu_nop_cycles(encodedCommand.command));
             continue;
         }
         if (opcode == isa::IcuCommandOpcode::Repeat) {
@@ -306,7 +567,7 @@ void expand_queue(const BinaryProgram& program, const QueueProgram& queue,
         if (opcode != isa::IcuCommandOpcode::Instruction)
             throw std::runtime_error(
                 "logical inspector found an unsupported ICU command");
-        previous = canonical_instruction(encodedCommand);
+        previous = canonical_queue_instruction(queue, encodedCommand);
         previousCycle = cursor;
         insert_issue(issues, program, queue.kind, queue.index,
             cursor, *previous);

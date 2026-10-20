@@ -567,6 +567,8 @@ try {
     binary.seekg(0);
     const auto restoredProgram = rt::read_binary_program(binary);
     for (const auto& restoredQueue : restoredProgram.queues) {
+        expect(restoredQueue.requires_raw_macro,
+               "packed binary lost its required physical Macro queue mode");
         expect(restoredQueue.packed_macro_imem.has_value(),
                "binary reader did not retain the packed Macro i-MEM image");
         expect(restoredQueue.packed_macro_imem->word_bits ==
@@ -780,6 +782,17 @@ try {
                 corruptProgram.queues, corruptIcu);
         },
         "runtime accepted an invalid retained raw Macro image");
+
+    // A later native linker must fail instead of silently bypassing raw mode.
+    auto mixedProgram = restoredProgram;
+    rt::QueueCommand linkedNop{};
+    linkedNop.command = ftlpu::isa::encode_icu_nop(1);
+    mixedProgram.queues.front().commands.push_back(linkedNop);
+    expect_throw([&]() { (void)serialize(mixedProgram); },
+        "writer silently downgraded a required Macro queue to native controls");
+    expect_throw([&]() {
+        (void)rt::load_queue_programs_into_icu(mixedProgram.queues, corruptIcu);
+    }, "runtime silently downgraded a required Macro queue to FU packets");
 
     std::cout << "macro_bitstream_test passed: bits="
               << image.stats.physical_bits() << '\n';

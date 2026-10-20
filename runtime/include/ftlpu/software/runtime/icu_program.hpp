@@ -734,6 +734,9 @@ struct QueueProgram {
     // Present when this QueueProgram came from a packed-Macro .ftlpu record.
     // Any operation that mutates a command must reset this cached image.
     std::optional<PackedMacroImemImage> packed_macro_imem{};
+    // A physical packed queue must not silently fall back to FU packets if a
+    // later linker inserts native controls. Persisted by MacroPacked encoding.
+    bool requires_raw_macro{false};
 };
 
 // Raw control records preserve one physical 96-bit local-iMEM word. They are

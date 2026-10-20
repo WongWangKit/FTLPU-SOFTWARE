@@ -22,6 +22,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/binary.cpp
     src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
+    src/runtime/fu_3d_macro_lowering.cpp
     src/runtime/icu_program.cpp
     src/runtime/issue_inspector.cpp
     src/runtime/imem_capacity.cpp
@@ -44,6 +45,8 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/vxm_stream_nd_binary_test.cpp
     tests/runtime/mem_slice_program_binary_test.cpp
     tests/runtime/issue_inspector_test.cpp
+    tests/runtime/fu_3d_macro_lowering_test.cpp
+    tests/runtime/raw_macro_cli_replay_test.cpp
     tests/runtime/compiled_sxm_command_runtime_test.cpp
     tests/runtime/compiled_queue_program_runtime_test.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
@@ -85,6 +88,7 @@ add_library(ftlpu_software
     src/runtime/binary.cpp
     src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
+    src/runtime/fu_3d_macro_lowering.cpp
     src/runtime/icu_program.cpp
     src/runtime/issue_inspector.cpp
     src/runtime/imem_capacity.cpp
@@ -131,6 +135,14 @@ add_executable(macro_bitstream_test
     tests/runtime/macro_bitstream_test.cpp)
 target_link_libraries(macro_bitstream_test PRIVATE ftlpu_software)
 add_test(NAME macro_bitstream_test COMMAND $<TARGET_FILE:macro_bitstream_test>)
+
+add_executable(fu_3d_macro_lowering_test
+    tests/runtime/fu_3d_macro_lowering_test.cpp)
+target_link_libraries(fu_3d_macro_lowering_test PRIVATE ftlpu_software)
+add_test(NAME fu_3d_macro_lowering_test COMMAND $<TARGET_FILE:fu_3d_macro_lowering_test>)
+
+add_executable(raw_macro_cli_replay_test tests/runtime/raw_macro_cli_replay_test.cpp)
+target_link_libraries(raw_macro_cli_replay_test PRIVATE ftlpu_software)
 
 add_executable(schedule_trace_weight_page_test
     tests/runtime/schedule_trace_weight_page_test.cpp)

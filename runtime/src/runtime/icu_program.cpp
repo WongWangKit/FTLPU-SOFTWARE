@@ -447,10 +447,20 @@ bool load_raw_macro_queue(const QueueProgram& queue,
                           InstructionControlUnit& icu,
                           std::size_t logical_mxms_per_hemisphere)
 {
-    if (!is_all_macro_queue(queue)) return false;
+    if (!is_all_macro_queue(queue)) {
+        if (queue.requires_raw_macro && !queue.commands.empty())
+            throw std::logic_error(
+                "raw-macro does not support paged weights or synchronization controls; "
+                "a required Macro queue was modified by the native linker");
+        return false;
+    }
     if ((queue.kind == QueueKind::Mem && hw::kIcuMemInstructionBits != kMemIcuImemWordBits)
         || (queue.kind != QueueKind::Mem && hw::kIcuMxmInstructionBits != kMxmIcuImemWordBits))
+    {
+        if (queue.requires_raw_macro)
+            throw std::logic_error("required raw-macro queue has an incompatible CModel i-MEM width");
         return false; // Wide native/FU packets keep main's existing loader.
+    }
 
 
     const auto queueIndex = physical_queue_index(

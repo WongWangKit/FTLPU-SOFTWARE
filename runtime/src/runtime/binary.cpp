@@ -363,6 +363,12 @@ QueueEncodingMode queue_encoding_mode(const QueueProgram& queue, bool rawMacroSu
         queue.commands.end(), [](const QueueCommand& command) {
             return is_macro_schedule_command(command);
         });
+    if (queue.requires_raw_macro && !queue.commands.empty()
+        && (macroCount != static_cast<std::ptrdiff_t>(queue.commands.size())
+            || !rawMacroSupported
+            || (queue.kind != QueueKind::Mem && !is_mxm_macro_queue(queue.kind))))
+        throw std::runtime_error(
+            "raw-macro queue cannot be serialized as native FU packets or mixed controls");
     if (macroCount == 0) {
         const bool hasExtendedDescriptor = std::any_of(
             queue.commands.begin(), queue.commands.end(),
@@ -1027,6 +1033,7 @@ QueueProgram read_mem_macro_bitstream(Reader& reader,
     }
     auto queue = decode_mem_macro_bitstream(image, queueIndex);
     queue.packed_macro_imem = pack_mem_macro_imem(image);
+    queue.requires_raw_macro = true;
     return queue;
 }
 
@@ -1061,6 +1068,7 @@ QueueProgram read_mxm_macro_bitstream(Reader& reader,
     }
     auto queue = decode_mxm_macro_bitstream(image, queueIndex);
     queue.packed_macro_imem = pack_mxm_macro_imem(image);
+    queue.requires_raw_macro = true;
     return queue;
 }
 

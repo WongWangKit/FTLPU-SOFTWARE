@@ -1016,6 +1016,11 @@ C2cWeightPager::C2cWeightPager(C2cDmaSystem& system)
 
 void C2cWeightPager::begin_schedule(const BinaryProgram& program)
 {
+    if (std::ranges::any_of(program.queues,
+            [](const auto& queue) { return queue.requires_raw_macro; }))
+        throw std::logic_error(
+            "raw-macro packed-v1 queues cannot be linked with C2C paging controls; "
+            "use the default FU3D mode for executable paging");
     if (active_ && !ready())
         throw std::logic_error(
             "cannot schedule executable pages while a page is in flight");

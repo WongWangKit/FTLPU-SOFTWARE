@@ -1,5 +1,6 @@
 #include "ftlpu/software/runtime/issue_inspector.hpp"
 #include "ftlpu/software/runtime/imem_capacity.hpp"
+#include "ftlpu/icu/fu_3d_codec.hpp"
 
 #include <array>
 #include <iostream>
@@ -49,12 +50,234 @@ std::vector<ftlpu::software::runtime::QueueCommand> raw_3d_commands(
     return commands;
 }
 
+template <typename Fn>
+void require_rejected(Fn fn, const char* message)
+{
+    bool rejected = false;
+    try { fn(); } catch (const std::exception&) { rejected = true; }
+    require(rejected, message);
+}
+
+ftlpu::software::runtime::QueueCommand mxm_command(const ftlpu::MxmControlInstruction& instruction)
+{
+    using namespace ftlpu::software::runtime;
+    const auto bits = ftlpu::isa::encode_mxm_instruction(instruction);
+    return {0, InstructionKind::Mxm, 2,
+        {static_cast<std::uint32_t>(bits), static_cast<std::uint32_t>(bits >> 32), 0, 0}};
+}
+
+void test_native_fu_issues()
+{
+    using namespace ftlpu;
+    using namespace ftlpu::software::runtime;
+    BinaryProgram coarse;
+    coarse.max_cycle = 84;
+    IcuLoop3D loop{0, {2, 2, 4}, {2, 7, 20}, 3};
+    auto packets = raw_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(loop,
+            MemIcuAddress3D::BlockedOuter(100, 1, 4, 2, 16, 64),
+            StreamId::East(2))), InstructionKind::Mem);
+    QueueProgram queue{QueueKind::Mem, 0,
+        {encode_icu_control_raw_word(IcuControlInstruction::Nop(2))}};
+    queue.commands.insert(queue.commands.end(), packets.begin(), packets.end());
+    IcuLoop3D nextLoop{0, {1, 1, 1}, {1, 1, 1}, 4};
+    const auto next = raw_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Write3D(nextLoop, MemIcuAddress3D::Affine(300, {0, 0, 0}),
+            StreamId::West(1))), InstructionKind::Mem);
+    queue.commands.insert(queue.commands.end(), next.begin(), next.end());
+    coarse.queues.push_back(queue);
+    BinaryProgram macros;
+    macros.max_cycle = coarse.max_cycle;
+    macros.queues.push_back({QueueKind::Mem, 0, {}});
+    for (std::size_t outer = 0; outer < 4; ++outer)
+        macros.queues[0].commands.push_back(encode_macro_schedule_command(
+            mem_command(MemInstruction::Read(100 + (outer / 2) * 64 + (outer % 2) * 16, 2)),
+            IcuMacroSchedule{5 + outer * 20, 2, 2, 1, 2, 7, 4,
+                IcuInductionTarget::MemAddress}));
+    macros.queues[0].commands.push_back(encode_macro_schedule_command(
+        mem_command(MemInstruction::Write(300, StreamId::West(1).packed())),
+        IcuMacroSchedule{79, 1, 1, 0, 1, 1, 0, IcuInductionTarget::MemAddress}));
+    require(compare_logical_issues(coarse, macros).equivalent,
+        "native MEM 3-D blocked addressing, relative waits, or packet cursor differs from Macro");
+    auto changed = macros;
+    changed.queues[0].commands[0].words = mem_command(MemInstruction::Read(101, 2)).words;
+    const auto mismatch = compare_logical_issues(coarse, changed);
+    require(!mismatch.equivalent && mismatch.first_mismatch
+            && mismatch.first_mismatch->cycle == 5,
+        "native FU versus Macro comparison missed an operand difference");
+    changed = macros;
+    auto schedule = decode_macro_schedule_command(changed.queues[0].commands[0]);
+    schedule.start_cycle = 6;
+    changed.queues[0].commands[0] = encode_macro_schedule_command(
+        mem_command(MemInstruction::Read(100, 2)), schedule);
+    require(!compare_logical_issues(coarse, changed).equivalent,
+        "native FU versus Macro comparison missed a cycle difference");
+
+    // A standalone physical native word has a two-bit ICU envelope.
+    const auto bits = isa::encode_mem_instruction(MemInstruction::Read(319, 7));
+    auto physical = queue;
+    physical.commands.push_back(QueueCommand{static_cast<std::uint32_t>(bits << 2),
+        InstructionKind::Mem, 3, {static_cast<std::uint32_t>(bits << 2),
+            static_cast<std::uint32_t>(bits >> 30), static_cast<std::uint32_t>(bits >> 62), 0}});
+    auto withNative = coarse;
+    withNative.queues = {physical};
+    macros.queues[0].commands.push_back(encode_macro_schedule_command(
+        mem_command(MemInstruction::Read(319, 7)),
+        IcuMacroSchedule{80, 1, 1, 0, 1, 1, 0, IcuInductionTarget::MemAddress}));
+    require(compare_logical_issues(withNative, macros).equivalent,
+        "physical native envelope was confused with semantic FU bits");
+    physical.commands.back().words[2] |= 4;
+    withNative.queues = {physical};
+    require_rejected([&] { (void)inspect_logical_issues(withNative); },
+        "inspector accepted reserved physical native bits");
+
+    IcuProgram expected;
+    BinaryProgram mxm;
+    mxm.max_cycle = 40;
+    const IcuLoop3D loadLoop{0, {2, 2, 1}, {3, 9, 1}, 1};
+    mxm.queues.push_back({QueueKind::MxmLoad, 0,
+        raw_3d_commands(isa::encode_mxm_load_icu_3d_instruction(
+            MxmLoadIcuInstruction::Load3D(loadLoop, 0,
+                MxmIcuBufferMode::ToggleDimension0, 0, {1, 2, 0}, 8)), InstructionKind::Mxm)});
+    for (std::size_t outer = 0; outer < 2; ++outer)
+        for (std::size_t inner = 0; inner < 2; ++inner)
+            expected.emit_mxm_load(1 + inner * 3 + outer * 9, 0,
+                MxmControlInstruction::IW(inner, inner + outer * 2,
+                    MxmWeightInputMode::Int8DequantBf16, 8));
+    const IcuLoop3D computeLoop{0, {3, 2, 1}, {2, 9, 1}, 4};
+    const MxmComputeIcuMode terminal{MxmAccumulatorDestination::Stream,
+        true, MxmAccumulatorOutputFormat::BFloat16};
+    mxm.queues.push_back({QueueKind::MxmCompute, 0,
+        raw_3d_commands(isa::encode_mxm_compute_icu_3d_instruction(
+            MxmComputeIcuInstruction::Compute3D(computeLoop, 0,
+                MxmIcuBufferMode::ToggleDimension1, 16, 12, 10, {0, 4, 0}, 1,
+                MxmDataFormat::BFloat16, MxmComputeIcuMode{}, 0, terminal)), InstructionKind::Mxm)});
+    for (std::size_t outer = 0; outer < 2; ++outer)
+        for (std::size_t inner = 0; inner < 3; ++inner) {
+            const bool last = inner == 2;
+            expected.emit_mxm_compute(4 + inner * 2 + outer * 9, 0,
+                MxmControlInstruction::Compute(outer, 16, 12, 10 + outer * 4, 1,
+                    last ? MxmAccumulatorDestination::Stream : MxmAccumulatorDestination::Sram,
+                    MxmDataFormat::BFloat16, last,
+                    last ? MxmAccumulatorOutputFormat::BFloat16 : MxmAccumulatorOutputFormat::Float32));
+        }
+    const auto scale = MxmDequantInstruction::ScaleBits(0x3f80);
+    const IcuLoop3D dequantLoop{0, {2, 2, 1}, {3, 10, 1}, 2};
+    mxm.queues.push_back({QueueKind::MxmDequant, 0,
+        raw_3d_commands(isa::encode_mxm_dequant_icu_3d_instruction(
+            MxmDequantIcuInstruction::Dequant3D(dequantLoop, scale)), InstructionKind::MxmDequant)});
+    for (std::size_t outer = 0; outer < 2; ++outer)
+        for (std::size_t inner = 0; inner < 2; ++inner)
+            expected.emit_mxm_dequant(2 + inner * 3 + outer * 10, 0, scale);
+    BinaryProgram expanded;
+    expanded.max_cycle = mxm.max_cycle;
+    expanded.queues = expected.encode_queues();
+    require(compare_logical_issues(mxm, expanded).equivalent,
+        "MXM parity, terminal compute mode, or dequant differs from native instructions");
+    const auto dequantMacro = encode_macro_schedule_command(
+        QueueCommand{0, InstructionKind::MxmDequant, 1,
+            {static_cast<std::uint32_t>(isa::encode_mxm_dequant_instruction(scale)), 0, 0, 0}},
+        IcuMacroSchedule{2, 2, 3, 0, 2, 10, 0, IcuInductionTarget::None});
+    auto dequantOnly = mxm;
+    dequantOnly.queues = {mxm.queues.back()};
+    auto dequantEquivalent = dequantOnly;
+    dequantEquivalent.queues[0].commands = {dequantMacro};
+    require(compare_logical_issues(dequantOnly, dequantEquivalent).equivalent,
+        "native DEQUANT_3D differs from equivalent zero-stride Macro");
+
+    BinaryProgram rejected = coarse;
+    rejected.max_cycle = 4;
+    require_rejected([&] { (void)inspect_logical_issues(rejected); },
+        "inspector accepted native issues beyond program max_cycle");
+    rejected = coarse;
+    rejected.queues[0].commands.resize(2);
+    require_rejected([&] { (void)inspect_logical_issues(rejected); },
+        "inspector accepted a truncated native FU packet");
+    rejected = coarse;
+    rejected.queues[0].commands.push_back(encode_macro_schedule_command(
+        mem_command(MemInstruction::Read(100, 2)),
+        IcuMacroSchedule{5, 1, 1, 0, 1, 1, 0, IcuInductionTarget::MemAddress}));
+    require_rejected([&] { (void)inspect_logical_issues(rejected); },
+        "inspector accepted duplicate functional issue cycles");
+    for (const auto control : {IcuControlInstruction::Sync(), IcuControlInstruction::WaitEvent(42),
+             IcuControlInstruction::Notify()}) {
+        rejected.queues = {{QueueKind::Mem, 0, {encode_icu_control_raw_word(control)}}};
+        require_rejected([&] { (void)inspect_logical_issues(rejected); },
+            "inspector silently ignored runtime-dependent native synchronization");
+    }
+}
+
+void test_native_vxm_sxm_issues()
+{
+    using namespace ftlpu;
+    using namespace ftlpu::software::runtime;
+    BinaryProgram packets;
+    packets.max_cycle = 40;
+    VxmSrInstruction vxm;
+    vxm.lhs = VxmSrOperand::Immediate(1.25f);
+    vxm.repeat_count = 4;
+    const auto compact = VxmSrCompactInstructionCodec::encode(vxm);
+    auto vxmRun = VxmIcuRun2DInstruction::Run2D(0, {2, 2}, {3, 11}, compact);
+    vxmRun.loop.wait_cycle = 2;
+    packets.queues.push_back({QueueKind::Vxm, 0,
+        raw_3d_commands(isa::encode_vxm_icu_run_2d_instruction(vxmRun), InstructionKind::Vxm)});
+    IcuProgram expected;
+
+    SxmInstruction::StreamList streams;
+    for (std::size_t i = 0; i < 2 * hw::kLanesPerTile; ++i) streams.push_back({i});
+    auto transpose = SxmInstruction::Transpose({SxmStreamId{2}, SxmStreamId{3}}, streams);
+    transpose.input_row = 1;
+    auto transposeRun = SxmIcuRun2DInstruction::Run2D(0, {2, 1}, {7, 1}, transpose);
+    transposeRun.loop.wait_cycle = 1;
+    packets.queues.push_back({QueueKind::SxmTranspose, 0,
+        raw_3d_commands(isa::encode_sxm_transpose_icu_run_2d_instruction(transposeRun), InstructionKind::Sxm)});
+    expected.emit_sxm_transpose(1, Hemisphere::East, transpose);
+    expected.emit_sxm_transpose(8, Hemisphere::East, transpose);
+    SxmInstruction::PermuteMap map;
+    for (std::size_t i = 0; i < map.size(); ++i) map[i] = i;
+    auto permute = SxmInstruction::Permute(streams, streams, map);
+    permute.output_row = 11;
+    permute.output_tile = 1;
+    auto permuteRun = SxmIcuRun2DInstruction::Run2D(0, {2, 2}, {3, 11}, permute, hw::kLanesPerTile);
+    permuteRun.loop.wait_cycle = 2;
+    packets.queues.push_back({QueueKind::SxmPermute, 0,
+        raw_3d_commands(isa::encode_sxm_permute_icu_run_2d_instruction(permuteRun), InstructionKind::Sxm)});
+    for (std::size_t outer = 0; outer < 2; ++outer)
+        for (std::size_t inner = 0; inner < 2; ++inner) {
+            auto instruction = permute;
+            const auto offset = (inner + 2 * outer) * hw::kLanesPerTile;
+            for (auto& lane : instruction.permute_map)
+                lane = (lane + offset) % SxmInstruction::kTotalLanes;
+            expected.emit_sxm_permute(2 + inner * 3 + outer * 11,
+                Hemisphere::East, std::move(instruction));
+        }
+    BinaryProgram native;
+    native.max_cycle = packets.max_cycle;
+    native.queues = expected.encode_queues();
+    for (auto& queue : native.queues)
+        if (queue.kind == QueueKind::Vxm && queue.index == 0)
+            queue.commands = {encode_vxm_stream_nd_command(
+                QueueCommand{0, InstructionKind::Vxm, 3,
+                    {static_cast<std::uint32_t>(compact.control),
+                        static_cast<std::uint32_t>(compact.control >> 32), compact.immediate_bits, 0}},
+                IcuVxmStreamNdSchedule{2, 2, {2, 2, 1}, {3, 11, 1},
+                    {0, 0, 0}, IcuInductionTarget::None})};
+    require(compare_logical_issues(packets, native).equivalent,
+        "native VXM/SXM RUN_2D differs from semantic native instruction encoding");
+    const auto inspected = inspect_logical_issues(packets);
+    require(inspected.functional_issues == 10,
+        "VXM FU repeat_count was confused with ICU launch count");
+}
+
 } // namespace
 
 int main()
 try {
     using namespace ftlpu;
     using namespace ftlpu::software::runtime;
+
+    test_native_fu_issues();
+    test_native_vxm_sxm_issues();
 
     BinaryProgram sliced;
     sliced.max_cycle = 7;
@@ -130,17 +353,38 @@ try {
     require(compare_logical_issues(control, macro).equivalent,
         "logical inspector disagrees between Repeat and Macro forms");
     const auto macroCapacity = analyze_physical_imem(macro);
-    require(macroCapacity.queues[0].physical_slots
-                == isa::EncodedMemIcu3DPacket::kWordCount
-            && macroCapacity.queues[0].physical_bits
-                == isa::EncodedMemIcu3DPacket::kWordCount
-                    * macro.hardware.icu_mem_instruction_bits
-            && macroCapacity.queues[0].peak_macro_contexts == 1
-            && macroCapacity.queues[0].peak_fu_3d_contexts == 1
-            && !macroCapacity.queues[0].fu_3d_context_overflow()
-            && !macroCapacity.queues[0].mem_delta_rle
-            && macroCapacity.mem_delta_rle_queues == 0,
-        "physical inspector did not count an all-Macro MEM queue as raw 3-D packets");
+    const bool packedMacroTarget = macro.hardware.icu_mem_instruction_bits
+            == kMemIcuImemWordBits
+        && macro.hardware.icu_macro_encoding_version == kMemMacroBitstreamVersion;
+    if (packedMacroTarget) {
+        // A singleton descriptor uses one 96-bit control word plus one packed
+        // payload word (dictionary count, absolute origin, and compact 1-D
+        // template). The three functional issues share one Macro context.
+        require(macroCapacity.queues[0].physical_slots == 2
+                && macroCapacity.queues[0].physical_bits == 192
+                && macroCapacity.used_bits == 192
+                && macroCapacity.queues[0].peak_macro_contexts == 1
+                && macroCapacity.queues[0].peak_fu_3d_contexts == 0
+                && macroCapacity.queues[0].mem_delta_rle
+                && macroCapacity.mem_delta_rle_queues == 1
+                && macroCapacity.queues[0].macro_codec.command_count == 1
+                && macroCapacity.queues[0].macro_codec.run_count == 1
+                && macroCapacity.queues[0].macro_codec.compact_template_runs == 1
+                && !macroCapacity.queues[0].deployment_overflow(),
+            "physical inspector did not account for the 24-byte packed MEM Macro image");
+    } else {
+        require(macroCapacity.queues[0].physical_slots
+                    == isa::EncodedMemIcu3DPacket::kWordCount
+                && macroCapacity.queues[0].physical_bits
+                    == isa::EncodedMemIcu3DPacket::kWordCount
+                        * macro.hardware.icu_mem_instruction_bits
+                && macroCapacity.queues[0].peak_macro_contexts == 1
+                && macroCapacity.queues[0].peak_fu_3d_contexts == 1
+                && !macroCapacity.queues[0].fu_3d_context_overflow()
+                && !macroCapacity.queues[0].mem_delta_rle
+                && macroCapacity.mem_delta_rle_queues == 0,
+            "unsupported packed-Macro target did not retain legacy FU packet accounting");
+    }
 
     const IcuLoop3D rawLoop {0, {1, 1, 1}, {1, 1, 1}};
     BinaryProgram rawTypes;

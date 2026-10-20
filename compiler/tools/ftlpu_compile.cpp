@@ -58,6 +58,7 @@ struct Args {
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
         ftlpu::compiler::target::IcuCompressionMode::Macro};
+    bool icu_compression_specified{false};
     bool mem_slice_program{false};
     bool verify_icu_issues{false};
     bool direct_ffn_up_3d{false};
@@ -98,9 +99,11 @@ Args parse_args(int argc, char** argv)
             args.verify_icu_issues = true;
         else if (argument == "--direct-ffn-up-3d")
             args.direct_ffn_up_3d = true;
-        else if (argument == "--icu-macro-schedule")
+        else if (argument == "--icu-macro-schedule") {
             args.icu_compression =
                 ftlpu::compiler::target::IcuCompressionMode::Macro;
+            args.icu_compression_specified = true;
+        }
         else if (argument == "--icu-compression") {
             const std::string value = next();
             const auto parsed = ftlpu::compiler::target::
@@ -109,6 +112,7 @@ Args parse_args(int argc, char** argv)
                 throw std::runtime_error(
                     "unknown ICU compression mode: " + value);
             args.icu_compression = *parsed;
+            args.icu_compression_specified = true;
         }
         else if (argument == "--mem-slice-program") {
             const std::string value = next();
@@ -275,9 +279,17 @@ try {
     const bool directLowering = args.direct_ffn_up_3d
         || args.input_stage != InputStage::Command
         || (existingLowering && existingLowering.getValue() == "direct");
+    auto requestedCompression = args.icu_compression;
+    if (!args.icu_compression_specified)
+        if (const auto attr = (*module)->getAttrOfType<mlir::StringAttr>("ftlpu.icu_compression")) {
+            const auto parsed = ftlpu::compiler::target::parse_icu_compression_mode(attr.getValue().str());
+            if (!parsed) throw std::runtime_error("invalid inherited ftlpu.icu_compression");
+            requestedCompression = *parsed;
+        }
     const auto effectiveCompression = directLowering
+            && requestedCompression != ftlpu::compiler::target::IcuCompressionMode::RawMacro
         ? ftlpu::compiler::target::IcuCompressionMode::None
-        : args.icu_compression;
+        : requestedCompression;
     const bool effectiveMemSliceProgram =
         directLowering ? false : args.mem_slice_program;
     (*module)->setAttr("ftlpu.icu_compression",

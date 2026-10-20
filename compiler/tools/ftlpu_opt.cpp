@@ -51,6 +51,7 @@ struct Args {
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
         ftlpu::compiler::target::IcuCompressionMode::Macro};
+    bool icu_compression_specified{false};
     bool mem_slice_program{false};
 };
 
@@ -120,9 +121,11 @@ Args parse_args(int argc, char** argv)
             args.decode_current_len = std::stoll(next());
         else if (arg == "--pass-timing")
             args.pass_timing = true;
-        else if (arg == "--icu-macro-schedule")
+        else if (arg == "--icu-macro-schedule") {
             args.icu_compression =
                 ftlpu::compiler::target::IcuCompressionMode::Macro;
+            args.icu_compression_specified = true;
+        }
         else if (arg == "--icu-compression") {
             const std::string value = next();
             const auto parsed = ftlpu::compiler::target::
@@ -131,6 +134,7 @@ Args parse_args(int argc, char** argv)
                 throw std::runtime_error(
                     "unknown ICU compression mode: " + value);
             args.icu_compression = *parsed;
+            args.icu_compression_specified = true;
         }
         else if (arg == "--mem-slice-program") {
             const std::string value = next();
@@ -256,11 +260,19 @@ try {
         args.pipeline == "ftlpu-stablehlo-to-schedule"
         || args.pipeline == "ftlpu-stream-to-uncompressed-schedule"
         || args.pipeline == "ftlpu-stream-to-schedule";
+    auto requestedCompression = args.icu_compression;
+    if (!args.icu_compression_specified)
+        if (const auto attr = (*module)->getAttrOfType<mlir::StringAttr>("ftlpu.icu_compression")) {
+            const auto parsed = ftlpu::compiler::target::parse_icu_compression_mode(attr.getValue().str());
+            if (!parsed) throw std::runtime_error("invalid inherited ftlpu.icu_compression");
+            requestedCompression = *parsed;
+        }
     (*module)->setAttr("ftlpu.icu_compression",
         mlir::StringAttr::get(&context,
-            producesCommands || producesDirectSchedule ? "none"
+            (producesCommands || producesDirectSchedule)
+                    && requestedCompression != ftlpu::compiler::target::IcuCompressionMode::RawMacro ? "none"
                 : ftlpu::compiler::target::icu_compression_mode_name(
-                    args.icu_compression)));
+                    requestedCompression)));
     (*module)->setAttr("ftlpu.mem_slice_program",
         mlir::BoolAttr::get(&context,
             producesCommands || producesDirectSchedule
@@ -271,9 +283,9 @@ try {
     // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,
-            !producesCommands && !producesDirectSchedule
-                && (args.icu_compression == ftlpu::compiler::target::IcuCompressionMode::Macro
-                || args.icu_compression == ftlpu::compiler::target::IcuCompressionMode::RawMacro)));
+            requestedCompression == ftlpu::compiler::target::IcuCompressionMode::RawMacro
+                || (!producesCommands && !producesDirectSchedule
+                    && requestedCompression == ftlpu::compiler::target::IcuCompressionMode::Macro)));
 
     mlir::PassManager pass_manager(&context);
     const bool deferVerificationUntilCompressed =

@@ -6,12 +6,34 @@
 compact/FU3D 路径；新增的物理前端通过显式 `raw-macro` 模式选择：
 
 ```text
+ftlpu-compile --input model.stablehlo.mlir --input-stage stablehlo \
+  --output program.ftlpu --target-config target.json \
+  --icu-compression raw-macro --verify-icu-issues
 ftlpu-translate --input command.mlir --output program.ftlpu \
   --icu-compression raw-macro --verify-icu-issues
 macro_frontend_fetch_sweep program.ftlpu
 macro_frontend_fetch_sweep --structure program.ftlpu
 macro_frontend_fetch_sweep --admission program.ftlpu
 ```
+
+生产入口已贯通 `ftlpu-compile`、`ftlpu-opt` 和 `ftlpu-translate`。
+`ftlpu-opt` 把模式保留在 IR 中，后续入口在没有显式覆盖时继承该模式。
+默认 direct lowering 仍使用 FU3D。Command IR 的 `*_3d` 继续表示共同的粗循环域；
+最终生成二进制时，`raw-macro` 才把 MEM/MXM 域按 parity、terminal mode、
+blocked address 和仿射轴拆成二维 Macro，VXM/SXM 等保持原生 FU 路径。
+生产转换不展开整条功能指令流；一个源 packet 拆成多个描述符时，地址和 scale
+重定位逐一复制到对应描述符，且不跨不同源 packet 合并。
+
+packed-v1 尚无同步控制记录。同一队列中的 `WAIT_EVENT`、SYNC、同步 MEM 传输，
+以及当前转换器尚未覆盖的 `WRITE_READ_2D`、native4 decode 会明确拒绝。
+因此带运行时分页或持久 KV 同步的完整 decoder 暂不能使用此模式，应保留默认 FU3D；
+编译器不会删除这些控制，也不会把请求静默降级。C2C 分页链接器同样拒绝必选 Macro
+队列。全驻留、无这些控制的程序可走真实 raw 前端，回归覆盖了 StableHLO FFN。
+
+`--verify-icu-issues` 现在可直接比较 FU3D 与 Macro 的功能指令及绝对发射周期。
+此开关不替代物理解码供给门禁；集成回归另用真实 ICU 逐周期回放，检查 cold prime、
+Active Context 和 admission deadline。二进制 `MacroPacked` 模式在读取后保留为
+必选 raw 队列，后续插入原生控制时，序列化和 loader 会报错，防止绕回旧 FU3D loader。
 
 raw 模式面向 96-bit MEM / 128-bit MXM、至多二维的仿射 Macro；其他 FU
 继续使用 main 原有路径。主机重定位后，loader 从更新后的语义指令重新生成镜像，

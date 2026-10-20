@@ -87,10 +87,9 @@ try {
         });
     std::optional<ftlpu::software::runtime::LogicalIssueProgram>
         logicalIssues;
-    if (hasRawFu3D) {
-        // A raw FU packet is already the hardware ICU program.  The legacy
-        // logical inspector expands only Schedule-derived encodings, so keep
-        // reporting physical packet/i-MEM data without reinterpreting it.
+    if (hasRawFu3D && !comparePath) {
+        // Physical inspection stays cheap for large coarse programs. Explicit
+        // comparison uses the logical inspector's native FU packet expansion.
         std::cout << "binary logical_issue_summary mode=raw_fu_3d"
                   << " status=not_expanded\n";
     } else {
@@ -933,9 +932,6 @@ try {
         ftlpu::software::runtime::write_schedule_trace_csv(
             program, *tracePath);
     if (comparePath) {
-        if (!logicalIssues)
-            throw std::runtime_error(
-                "--compare does not expand raw FU 3-D packet programs");
         const auto reference =
             ftlpu::software::runtime::read_binary_program(*comparePath);
         const auto referenceIssues =

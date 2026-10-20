@@ -10,6 +10,8 @@
 #include "ftlpu/icu/sxm_run_2d.hpp"
 #include "ftlpu/icu/vxm_run_2d.hpp"
 #include "ftlpu/software/runtime/c2c_weight_pager.hpp"
+#include "ftlpu/software/runtime/fu_3d_macro_lowering.hpp"
+#include "ftlpu/software/runtime/imem_capacity.hpp"
 #include "ftlpu/software/runtime/weight_prefetch_plan.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 
@@ -23,6 +25,7 @@
 #include <span>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 #include <unordered_set>
 
 namespace ftlpu::compiler::target {
@@ -3086,6 +3089,62 @@ void emit_compiled_mem_read_sync(software::runtime::BinaryProgram& program)
         });
 }
 
+void lower_direct_raw_macro(software::runtime::BinaryProgram& program)
+{
+    using namespace software::runtime;
+    using Key = std::pair<QueueKind, std::size_t>;
+    std::map<Key, std::vector<std::vector<std::size_t>>> indices;
+    for (auto& queue : program.queues) {
+        if (queue.kind != QueueKind::Mem && queue.kind != QueueKind::MxmLoad
+            && queue.kind != QueueKind::MxmCompute && queue.kind != QueueKind::MxmDequant)
+            continue;
+        if (queue.commands.empty()) continue;
+        const bool allMacro = std::ranges::all_of(queue.commands,
+            [](const auto& command) { return is_macro_schedule_command(command); });
+        if (!allMacro) {
+            try {
+                auto lowered = lower_fu_3d_queue_to_macro(queue);
+                indices.emplace(Key {queue.kind, queue.index}, std::move(lowered.command_indices));
+                queue = std::move(lowered.queue);
+            } catch (const std::exception& error) {
+                throw std::runtime_error(
+                    "raw-macro does not support paged weights or synchronization controls "
+                    "in the same queue, or an unrepresentable FU loop: "
+                    + std::string(queue_kind_name(queue.kind)) + "["
+                    + std::to_string(queue.index) + "]: " + error.what());
+            }
+        }
+        queue.requires_raw_macro = !queue.commands.empty();
+        queue.packed_macro_imem.reset();
+    }
+    // One coarse loop can become multiple descriptors. Every descriptor must
+    // retain its binding/scale owner, including after chronological sorting.
+    const auto remap = [&](auto& relocations) {
+        using Container = std::remove_reference_t<decltype(relocations)>;
+        Container mapped;
+        for (const auto& relocation : relocations) {
+            const auto queue = indices.find(Key {relocation.queue_kind, relocation.queue_index});
+            if (queue == indices.end()) { mapped.push_back(relocation); continue; }
+            if (relocation.command_index >= queue->second.size()
+                || queue->second[relocation.command_index].empty())
+                throw std::runtime_error("raw-macro relocation does not name a functional packet header");
+            for (const auto index : queue->second[relocation.command_index]) {
+                if (index > std::numeric_limits<std::uint32_t>::max())
+                    throw std::runtime_error("raw-macro relocation index exceeds the binary format");
+                auto copy = relocation;
+                copy.command_index = static_cast<std::uint32_t>(index);
+                mapped.push_back(copy);
+            }
+        }
+        relocations = std::move(mapped);
+    };
+    remap(program.address_relocations);
+    remap(program.scale_relocations);
+    const auto physical = analyze_physical_imem(program);
+    if (!physical.fits())
+        throw std::runtime_error("raw-macro exceeds physical i-MEM or Active Context capacity");
+}
+
 } // namespace
 
 software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
@@ -3511,6 +3570,8 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
         emit_compiled_mem_write_sync(program);
         emit_compiled_mem_read_sync(program);
     }
+    if (compressionMode == IcuCompressionMode::RawMacro)
+        lower_direct_raw_macro(program);
     return program;
 }
 
