@@ -1,5 +1,7 @@
 #include "AttentionEmitterUtils.hpp"
 
+#include <algorithm>
+
 namespace ftlpu::compiler::schedule::attention_detail {
 
 void emitMem(mlir::IRRewriter &rewriter, mlir::Location location, int64_t cycle,
@@ -81,6 +83,38 @@ void emitMem3D(mlir::IRRewriter &rewriter, mlir::Location location,
                        rewriter.getI64IntegerAttr(outerGroupStride));
   }
   rewriter.create(state);
+}
+
+void emitDistributedActivationStagingReads(
+    mlir::IRRewriter &rewriter, mlir::Location location,
+    const target::LPUTargetModel &target, llvm::ArrayRef<int64_t> inputSlices,
+    int64_t inputBase, int64_t inputBank, int64_t seqLen,
+    int64_t hiddenBlocks, int64_t stagingCycle) {
+  const int64_t tile = target.throughput().mxm_rows;
+  const int64_t tokenBlocks = (seqLen + tile - 1) / tile;
+  const int64_t projectionRows = std::min(tile, seqLen);
+  // Decode may occupy only one lane. For prefill, wave already visits each
+  // token block: repeat must cover only that lane's tokens within one tile.
+  // Counting seqLen here multiplies tokenBlocks twice, duplicating cycles
+  // and SRAM reads as soon as the sequence spans more than one tile.
+  const int64_t activeTokenLanes = std::min<int64_t>(8, seqLen);
+  for (int64_t tokenLane = 0; tokenLane < activeTokenLanes; ++tokenLane) {
+    const int64_t tokenWaves = (projectionRows - tokenLane + 7) / 8;
+    for (int64_t hemisphere = 0;
+         hemisphere < target.memory().hemispheres; ++hemisphere) {
+      for (int64_t byte = 0; byte < 2; ++byte) {
+        const int64_t sourceSlice = inputSlices[2 * tokenLane + byte];
+        const int64_t sourceLatency = *target.transport_latency(
+            target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
+            target::StreamDirection::West, sourceSlice);
+        emitMem3D(rewriter, location, stagingCycle + tokenLane - sourceLatency,
+                  hemisphere * target.memory().slices_per_hemisphere + sourceSlice,
+                  "read", inputBase, 32 + hemisphere * 16 + byte,
+                  tokenWaves, 8, 1, "sram", -1, tokenBlocks, tile,
+                  hiddenBlocks * 4, hiddenBlocks, seqLen, 4, inputBank);
+      }
+    }
+  }
 }
 
 void emitMemWave(mlir::IRRewriter &rewriter, mlir::Location location,

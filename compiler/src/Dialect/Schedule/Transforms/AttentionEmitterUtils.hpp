@@ -72,6 +72,14 @@ void emitMem3D(mlir::IRRewriter &rewriter, mlir::Location location,
                int64_t outerInnerStride = 0,
                int64_t outerGroupStride = 0);
 
+// Read a distributed16 activation into the attention staging stream, with
+// token waves within a tile separate from the outer token-block dimension.
+void emitDistributedActivationStagingReads(
+    mlir::IRRewriter &rewriter, mlir::Location location,
+    const target::LPUTargetModel &target, llvm::ArrayRef<int64_t> inputSlices,
+    int64_t inputBase, int64_t inputBank, int64_t seqLen,
+    int64_t hiddenBlocks, int64_t stagingCycle);
+
 void emitMxm(mlir::IRRewriter &rewriter, mlir::Location location, int64_t cycle,
              int64_t queue, llvm::StringRef opcode, int64_t weightBuffer,
              int64_t weightColumn, int64_t activationStream,

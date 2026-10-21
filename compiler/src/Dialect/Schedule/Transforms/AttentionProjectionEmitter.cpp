@@ -419,33 +419,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
     const int64_t stagingCycle = 16;
     const int64_t stagingBase =
         inputStagingPlacement.getAs<mlir::IntegerAttr>("base_row").getInt();
-    // A partial decode tile contains only the physical token lanes that are
-    // logically present.  Emitting the prefill-sized 4x8 lane domain for an
-    // m=1 decode would make the 48 hidden-block groups overlap on the same
-    // MEM ICU (the next hidden block starts one cycle later while the stale
-    // lane domain still spans 25 cycles).
-    const int64_t activeTokenLanes = std::min<int64_t>(8, op_.getSeqLen());
-    for (int64_t tokenLane = 0; tokenLane < activeTokenLanes; ++tokenLane) {
-      const int64_t tokenWaves =
-          (op_.getSeqLen() - tokenLane + 7) / 8;
-      for (int64_t hemisphere = 0;
-           hemisphere < target_.memory().hemispheres; ++hemisphere) {
-        for (int64_t byte = 0; byte < 2; ++byte) {
-          const int64_t sourceSlice = inputSlices[2 * tokenLane + byte];
-          const int64_t sourceLatency = *target_.transport_latency(
-              target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
-              target::StreamDirection::West, sourceSlice);
-          emitMem3D(
-              rewriter_, op_.getLoc(),
-              stagingCycle + tokenLane - sourceLatency,
-              hemisphere * target_.memory().slices_per_hemisphere +
-                  sourceSlice,
-              "read", inputBase, 32 + hemisphere * 16 + byte,
-              tokenWaves, 8, 1, "sram", -1, tokenBlocks, tile,
-              hiddenBlocks * 4, hiddenBlocks, op_.getSeqLen(), 4, inputBank);
-        }
-      }
-    }
+    emitDistributedActivationStagingReads(
+        rewriter_, op_.getLoc(), target_, inputSlices, inputBase, inputBank,
+        op_.getSeqLen(), hiddenBlocks, stagingCycle);
 
     // The VXM pass and staging writes advance over the flattened
     // reduction-by-token domain with unit cycle and address strides.
