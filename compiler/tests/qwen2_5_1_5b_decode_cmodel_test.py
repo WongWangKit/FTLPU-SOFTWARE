@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import subprocess
@@ -43,6 +44,10 @@ def main() -> None:
     parser.add_argument("--current-len", type=int, default=1)
     parser.add_argument("--kv-cache-capacity", type=int, default=256)
     parser.add_argument(
+        "--mxm-execution", choices=("auto", "native4", "vector"),
+        default="auto",
+    )
+    parser.add_argument(
         "--projection-rope-overlap", choices=("on", "off"), default="off"
     )
     parser.add_argument(
@@ -51,6 +56,12 @@ def main() -> None:
         help="stop after producing and structurally checking the ICU binary",
     )
     args = parser.parse_args()
+    hardware = json.loads(args.target_config.read_text(encoding="utf-8"))
+    if args.mxm_execution == "auto":
+        args.mxm_execution = (
+            "native4" if "native4x4" in hardware["mxm"]["supported_modes"]
+            else "vector"
+        )
     if args.past_len <= 0 or args.current_len <= 0:
         raise ValueError("decode lengths must be positive")
     if args.past_len % 32 != 0:
@@ -84,7 +95,7 @@ def main() -> None:
     stablehlo.write_text(source, encoding="utf-8")
 
     common = [
-        "--mxm-execution", "native4",
+        "--mxm-execution", args.mxm_execution,
         "--ffn-schedule", "fused",
         "--projection-rope-overlap", args.projection_rope_overlap,
         "--target-config", str(args.target_config),
@@ -109,12 +120,59 @@ def main() -> None:
         str(args.compile), "--input", str(command),
         "--output", str(binary), "--input-stage", "command",
         "--target-config", str(args.target_config),
-        "--mxm-execution", "native4",
+        "--mxm-execution", args.mxm_execution,
         "--weight-bank", str(args.weight_bank),
         "--kv-cache-capacity", str(args.kv_cache_capacity),
     ], "icu-commands-to-binary")
 
     stream_text = stream.read_text(encoding="utf-8")
+    if args.mxm_execution == "vector":
+        require(stream_text, 'ftlpu.mxm_execution_policy = "vector"', stream)
+        require(stream_text, "tensor<1x1536xbf16>", stream)
+        command_text = command.read_text(encoding="utf-8")
+        require(command_text, 'ftlpu.command_lowering = "direct"', command)
+        require(command_text, "ftlpu.command.mem_3d", command)
+        require(command_text, "ftlpu.command.weight_page", command)
+        require(command_text, "ftlpu.command.vxm_run_2d", command)
+        if args.compile_only:
+            print(f"Qwen2.5-1.5B vector decode compiled: {binary}", flush=True)
+            return
+        fixture_script = Path(__file__).with_name(
+            "qwen2_5_1_5b_decode_cmodel_fixture.py"
+        )
+        run([
+            sys.executable, str(fixture_script),
+            "--output-dir", str(fixture),
+            "--capacity", str(args.kv_cache_capacity),
+            "--past-len", str(args.past_len),
+        ], "generate-ddr-fixture")
+        runtime_environment = os.environ.copy()
+        runtime_environment["FTLPU_QWEN_C2C_LINKED_BINARY"] = str(
+            linked_binary.resolve()
+        )
+        runtime_environment["FTLPU_QWEN_C2C_PRE_EXECUTION_DIR"] = str(
+            pre_execution.resolve()
+        )
+        runtime_environment["FTLPU_QWEN_KV_DUMP_DIR"] = str(kv_dump.resolve())
+        runtime_environment["FTLPU_QWEN_PIPELINE_CSV"] = str(
+            runtime_pipeline.resolve()
+        )
+        run(
+            [str(args.runtime_test), str(binary), str(fixture)],
+            "icu-cmodel-decode",
+            environment=runtime_environment,
+        )
+        run([
+            str(args.icu_export), str(linked_binary), str(runtime_icu_programs),
+            "--pre-execution-dir", str(pre_execution),
+        ], "export-runtime-icu-programs")
+        print(
+            "Qwen2.5-1.5B vector ICU/CModel decode passed: "
+            f"past={args.past_len}, current={args.current_len}, "
+            f"capacity={args.kv_cache_capacity}, binary={binary}",
+            flush=True,
+        )
+        return
     require(stream_text, f"ftlpu.decode_past_len = {args.past_len} : i64", stream)
     require(stream_text,
             f"ftlpu.decode_current_len = {args.current_len} : i64", stream)
@@ -131,11 +189,15 @@ def main() -> None:
             f"one-token activation tile [0, {physical_input_rows})"
         )
     schedule_text = schedule.read_text(encoding="utf-8")
-    if not re.search(
-        r'ftlpu\.schedule\.binding %arg0 .*instruction_count = 192 : i64, '
-        r'kind = "fp16_mxm_distributed_16"',
+    input_binding = re.search(
+        r'ftlpu\.schedule\.binding %arg0 .*instruction_count = (\d+) : i64, '
+        r'kind = "fp16_mxm_distributed_16", slices = \[([^]]+)\]',
         schedule_text,
-    ):
+    )
+    if (input_binding is None
+        or int(input_binding.group(1)) <= 0
+        or [int(s.strip()) for s in input_binding.group(2).split(",")]
+            != list(range(16))):
         raise AssertionError(
             f"{schedule} does not reserve the full 16-slice physical input span"
         )
@@ -143,24 +205,30 @@ def main() -> None:
         line for line in schedule_text.splitlines()
         if "ftlpu.schedule.mxm_issue" in line and 'opcode = "compute"' in line
     ]
-    if not any(
-        "group_count = 24 : i64" in line
-        and "wave_count = 48 : i64" in line
-        and "wave_interval = 6 : i64" in line
-        for line in compute_domains
-    ):
-        raise AssertionError(
-            f"{schedule} does not use the compact 6-cycle Q projection cadence"
-        )
-    if not any(
-        "group_count = 24 : i64" in line
-        and "wave_count = 48 : i64" in line
-        and "wave_interval = 8 : i64" in line
-        for line in compute_domains
-    ):
-        raise AssertionError(
-            f"{schedule} does not use the legal 8-cycle O projection cadence"
-        )
+    wide_mxm = hardware["topology"]["tiles_per_slice"] == 4
+    if wide_mxm:
+        if not any(
+            "group_count = 24 : i64" in line
+            and "wave_count = 48 : i64" in line
+            and "wave_interval = 6 : i64" in line
+            for line in compute_domains
+        ):
+            raise AssertionError(
+                f"{schedule} does not use the compact 6-cycle Q projection cadence"
+            )
+        if not any(
+            "group_count = 24 : i64" in line
+            and "wave_count = 48 : i64" in line
+            and "wave_interval = 8 : i64" in line
+            for line in compute_domains
+        ):
+            raise AssertionError(
+                f"{schedule} does not use the legal 8-cycle O projection cadence"
+            )
+    elif not any("group_count = 96 : i64" in line
+                 and "group_interval = 6 : i64" in line
+                 for line in compute_domains):
+        raise AssertionError(f"{schedule} has no compact LPU16 Q projection")
     schedule_lines = schedule_text.splitlines()
     key_start = next(
         index for index, line in enumerate(schedule_lines)
@@ -180,7 +248,7 @@ def main() -> None:
         match = re.search(rf"\b{re.escape(name)} = (-?\d+) : i64", line)
         return int(match.group(1)) if match else default
 
-    native4_compute_cycles: dict[int, list[int]] = {}
+    native4_compute_domains: dict[int, list[str]] = {}
     for line in schedule_lines:
         if (
             "ftlpu.schedule.mxm_issue" not in line
@@ -190,22 +258,65 @@ def main() -> None:
         ):
             continue
         repeat_count = integer_attr(line, "repeat_count")
-        native4_compute_cycles.setdefault(repeat_count, []).append(
-            integer_attr(line, "cycle")
-        )
-    for local_waves in (140, 24):
-        cycles = native4_compute_cycles.get(local_waves, [])
-        adjacent_deltas = [
-            later - earlier for earlier, later in zip(cycles, cycles[1:])
-            if 0 < later - earlier < 1000
-        ]
-        expected_interval = local_waves + 4
-        if not adjacent_deltas or min(adjacent_deltas) != expected_interval:
+        native4_compute_domains.setdefault(repeat_count, []).append(line)
+    hardware = json.loads(args.target_config.read_text(encoding="utf-8"))
+    accumulator_rows = (hardware["mxm"]["accum_contexts"]
+                        * hardware["topology"]["tiles_per_slice"]
+                        * hardware["topology"]["lanes_per_tile"])
+    if not native4_compute_domains or any(
+        count > accumulator_rows for count in native4_compute_domains
+    ):
+        raise AssertionError("native4 decode output batch exceeds ACC capacity")
+    for local_waves, domains in native4_compute_domains.items():
+        expected_interval = (local_waves
+                             + hardware["topology"]["tiles_per_slice"])
+        if not domains or any(
+            integer_attr(line, "wave_count", 1) <= 1
+            or integer_attr(line, "wave_interval", 1) != expected_interval
+            or integer_attr(line, "group_count", 1) != 2
+            or integer_attr(line, "group_interval", 1)
+                != integer_attr(line, "wave_count", 1) * expected_interval
+            for line in domains
+        ):
             raise AssertionError(
-                "native4 MXM reductions retain an avoidable pipeline bubble: "
-                f"waves={local_waves}, deltas={sorted(set(adjacent_deltas))[:8]}, "
-                f"expected={expected_interval}"
+                "native4 MXM reductions are not covered by one 3-D K-loop "
+                f"descriptor per page: waves={local_waves}, "
+                f"expected_interval={expected_interval}"
             )
+    # Each hemisphere must drain Gate, Up and Down in full, clearing ACC
+    # before the next output batch. This also checks the non-full final batch.
+    expected_drains = sorted(
+        count for count, domains in native4_compute_domains.items()
+        for _ in domains
+    )
+    for unit in (0, 1):
+        computes = [line for line in schedule_lines
+                    if "ftlpu.schedule.mxm_issue" in line
+                    and 'opcode = "decode_stream_compute"' in line
+                    and integer_attr(line, "unit_id") == unit]
+        if sorted(integer_attr(line, "repeat_count") for line in computes) != expected_drains:
+            raise AssertionError(f"unit {unit} omitted an FFN K-loop batch")
+        dequants = [line for line in schedule_lines
+                    if "ftlpu.schedule.mxm_dequant" in line
+                    and integer_attr(line, "unit_id") == unit
+                    and integer_attr(line, "scale_binding") in (10, 11, 12)]
+        domain_shape = lambda line: tuple(
+            integer_attr(line, name, 1) for name in
+            ("cycle", "repeat_count", "wave_count", "wave_interval",
+             "group_count", "group_interval")
+        )
+        if sorted(map(domain_shape, dequants)) != sorted(map(domain_shape, computes)):
+            raise AssertionError(f"unit {unit} dequant does not cover each FFN 3-D K-loop")
+        drains = [line for line in schedule_lines
+                  if "ftlpu.schedule.mxm_issue" in line
+                  and 'opcode = "accumulator_read"' in line
+                  and 'accumulator_output_format = "bf16"' in line
+                  and integer_attr(line, "unit_id") == unit]
+        if sorted(integer_attr(line, "repeat_count") for line in drains) != expected_drains:
+            raise AssertionError(f"unit {unit} does not drain every FFN output batch")
+        if any(integer_attr(line, "accumulator_address") != 0
+               or "accumulator_clear = true" not in line for line in drains):
+            raise AssertionError("FFN batches must clear and reuse ACC from row zero")
 
     key_raw_queues = {
         (integer_attr(line, "hemisphere"), integer_attr(line, "slice"),
@@ -237,16 +348,23 @@ def main() -> None:
         (integer_attr(line, "hemisphere"), integer_attr(line, "slice"))
         for line in output_weight_reads
     }
-    if len(output_weight_reads) != 16 or len(output_weight_queues) != 16 or not all(
-        "group_count = 24 : i64" in line
-        and "wave_count = 48 : i64" in line
-        and "wave_interval = 8 : i64" in line
+    if wide_mxm:
+        if len(output_weight_reads) != 16 or len(output_weight_queues) != 16 or not all(
+            "group_count = 24 : i64" in line
+            and "wave_count = 48 : i64" in line
+            and "wave_interval = 8 : i64" in line
+            for line in output_weight_reads
+        ):
+            raise AssertionError(
+                f"{schedule} does not keep one closed-form O-weight READ_3D per "
+                "hemisphere/ICU"
+            )
+    elif not output_weight_reads or any(
+        integer_attr(line, "wave_count", 1) <= 1
+        or integer_attr(line, "weight_page", -1) < 0
         for line in output_weight_reads
     ):
-        raise AssertionError(
-            f"{schedule} does not keep one closed-form O-weight READ_3D per "
-            "hemisphere/ICU"
-        )
+        raise AssertionError(f"{schedule} has no paged LPU16 O-weight READ_3D")
     command_text = command.read_text(encoding="utf-8")
     require(command_text, 'ftlpu.command_lowering = "direct"', command)
     require(command_text, 'role = "state.kv.key"', command)
@@ -281,7 +399,14 @@ def main() -> None:
             for value in banks_match.group(1).split(",")
             if value.strip()
         ]
-        if banks != [expected_bank] or integer_attr(line, "bank") != expected_bank:
+        bank_pattern_valid = (
+            banks == [expected_bank] if wide_mxm
+            else bool(banks) and all(
+                bank == (expected_bank + page) % 2
+                for page, bank in enumerate(banks)
+            )
+        )
+        if not bank_pattern_valid or integer_attr(line, "bank") != expected_bank:
             raise AssertionError(
                 "decode FFN epochs do not ping-pong physical SRAM banks: "
                 f"binding={binding_index}, placement_bank="
@@ -328,14 +453,20 @@ def main() -> None:
         for value in probability_pack_slices_match.group(1).split(",")
         if value.strip()
     }
-    if (
-        integer_attr(probability_pack_line, "bank") != args.weight_bank
-        or not probability_pack_slices
-        or min(probability_pack_slices) < 20
+    gate_page_line = next(line for line in paged_weight_lines
+                          if "index = 10 : i64" in line)
+    gate_slices = {int(value.strip()) for value in re.search(
+        r"\bpage_storage_slices = \[([^]]*)\]", gate_page_line
+    ).group(1).split(",") if value.strip()}
+    # The pack may use activation slices, or the released Attention bank.
+    # What matters is disjointness from Gate's concurrently prefetched page.
+    if not probability_pack_slices or (
+        integer_attr(probability_pack_line, "bank")
+            == integer_attr(gate_page_line, "bank")
+        and not probability_pack_slices.isdisjoint(gate_slices)
     ):
         raise AssertionError(
-            "decode probability pack must borrow the released Attention "
-            "weight bank, not overwrite the prefetched Gate bank: "
+            "decode probability pack overlaps the prefetched Gate page: "
             f"bank={integer_attr(probability_pack_line, 'bank')}, "
             f"slices={sorted(probability_pack_slices)}"
         )
@@ -427,24 +558,33 @@ def main() -> None:
         for row in pipeline_rows
         if row["resource"] == "MXM.E0.Load"
     )
-    first_gate_wait = min(
-        int(row["start"])
-        for row in pipeline_rows
-        if row["resource"] == "ICU.PageReadyWait"
-    )
     gate_prefetch_start = int(gate_prefetch["start"])
     gate_prefetch_end = int(gate_prefetch["end"])
+    first_gate_compute = min(
+        int(row["start"])
+        for row in pipeline_rows
+        if row["resource"] == "MXM.E0.Compute"
+        and row["detail"].startswith("Decode ")
+    )
+    attention_compute_overlaps_gate = any(
+        row["resource"] == "MXM.E0.Compute"
+        and row["detail"].startswith("Compute ")
+        and int(row["start"]) < gate_prefetch_end
+        and int(row["end"]) > gate_prefetch_start
+        for row in pipeline_rows
+    )
     if not (
-        attention_prefetch_end <= first_mxm_issue < gate_prefetch_end
-        and gate_prefetch_start < first_gate_wait
+        attention_prefetch_end <= first_mxm_issue
+        and gate_prefetch_start < gate_prefetch_end <= first_gate_compute
+        and attention_compute_overlaps_gate
     ):
         raise AssertionError(
-            "Attention execution waited for the Gate page instead of "
-            "overlapping Gate prefetch: "
+            "Gate prefetch did not overlap Attention compute before Gate execution: "
             f"attention_ready={attention_prefetch_end}, "
             f"first_mxm={first_mxm_issue}, gate_prefetch="
             f"[{gate_prefetch_start}, {gate_prefetch_end}), "
-            f"gate_wait={first_gate_wait}"
+            f"first_gate_compute={first_gate_compute}, "
+            f"attention_overlap={attention_compute_overlaps_gate}"
         )
     run([
         str(args.icu_export), str(linked_binary), str(runtime_icu_programs),

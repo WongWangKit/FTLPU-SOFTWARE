@@ -15,6 +15,7 @@ namespace ftlpu::compiler::tensor_lowering {
 
 mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const target::LPUTargetModel& target, int64_t weight_bank,
+    const llvm::DenseMap<mlir::Value, FeedbackGammaPlacement>& gamma_placements,
     mlir::IRRewriter& rewriter)
 {
     kernel::MatmulOp op = graph.output;
@@ -126,7 +127,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         const int64_t waves = (columns + columns_per_wave - 1)
             / columns_per_wave;
         return waves * (hidden / tile)
-            * target.throughput().lanes_per_tile;
+            * 2 * (tile / target.throughput().lanes_per_tile);
     };
     const bool paged_weights = weight_bank >= 0;
     const int64_t scratch_bank = paged_weights
@@ -171,7 +172,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const auto module = op->getParentOfType<mlir::ModuleOp>();
     const bool graph_weight_pages = module && module->hasAttr("ftlpu.runtime_weight_pages");
     const bool requires_weight_tiling = paged_weights
-        && target.throughput().mxms_per_hemisphere == 1
         && (graph_weight_pages || std::max({q_weight_rows, k_weight_rows, v_weight_rows,
                 o_weight_rows}) > target.memory().sram_depth_rows
             || q_weight_rows + k_weight_rows + v_weight_rows
@@ -191,7 +191,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     const bool tiled_weights = weight_tile_plan.has_value();
     const bool serial_attention_weight_pages = tiled_weights
-        && weight_tile_plan->transfer_phase_count == 4;
+        && weight_tile_plan->transfer_phase_count >= 4;
     const bool compact_rope_products =
         target.uses_dedicated_slice_roles()
         && target.memory().banks_per_slice > 1
@@ -248,12 +248,35 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         ((seq_len + tile - 1) / tile) * (hidden / tile)
         * target.throughput().tile_rows;
     const int64_t output_activation_base = distributed_input_rows;
-    const int64_t input_staging_rows = seq_len * hidden / tile;
+    // Serial matrix prefill can read token lanes directly from distributed
+    // SRAM. Do not materialize a second full input in one planar MEM pair.
+    auto inheritedInputPlacement = get_value_placement(graph.query.getLhs());
+    const bool distributedInputAvailable = mlir::failed(inheritedInputPlacement)
+        || inheritedInputPlacement->getAs<mlir::StringAttr>("kind").getValue()
+            == "fp16_mxm_distributed_16";
+    // Compact targets need direct distributed input to avoid a full planar
+    // copy. Large-bank layouts retain the established staging domain: their
+    // raw Q/K writeback shares MEM queues with the distributed source, so
+    // direct READ_3D contexts would overlap those writes across token tiles.
+    const bool direct_projection_input = !decode && !projection_rope_overlap
+        && distributedInputAvailable && target.uses_dedicated_slice_roles()
+        && target.memory().words_per_bank <= 2048
+        && target.throughput().mxms_per_hemisphere == 1;
+    const int64_t input_staging_rows = direct_projection_input
+        ? 0 : seq_len * hidden / tile;
     const int64_t input_staging_base =
         target.memory().words_per_bank - input_staging_rows;
+    const int64_t output_staging_rows = seq_len * query_width / tile;
+    const int64_t output_staging_base =
+        target.memory().words_per_bank - output_staging_rows;
+    // Eight head blocks put the rotary halves four output blocks apart;
+    // four bias plane pairs keep those simultaneous reads on distinct ICUs.
+    const bool wide_projection_bias = tile == 16 && (decode || head_blocks == 8);
     const auto projection_bias_rows = [&](int64_t width) {
         const int64_t output_blocks = (width + tile - 1) / tile;
-        return 2 * ((output_blocks + 3) / 4);
+        const int64_t blocks_per_group = wide_projection_bias ? 8 : 4;
+        return 2 * ((output_blocks + blocks_per_group - 1)
+            / blocks_per_group);
     };
     const int64_t query_bias_rows = query_bias
         ? projection_bias_rows(query_width) : 0;
@@ -263,16 +286,47 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         ? projection_bias_rows(kv_width) : 0;
     const int64_t projection_bias_total_rows =
         query_bias_rows + key_bias_rows + value_bias_rows;
+    // The legacy attention constants assume an 8192-row bank.  Keep both
+    // decode and prefill scratch inside a smaller dedicated bank; the
+    // physical allocator still checks concurrent slice/bank live ranges.
+    const bool compact_decode_sram = decode
+        && target.uses_dedicated_slice_roles()
+        && target.memory().words_per_bank <= 1024;
+    const bool compact_prefill_sram = !decode
+        && target.uses_dedicated_slice_roles()
+        && target.memory().words_per_bank <= 2048;
+    const int64_t context_base = compact_decode_sram
+        ? target.memory().words_per_bank / 2
+        : compact_prefill_sram
+        ? std::max<int64_t>(64,
+            target.memory().words_per_bank - context_rows)
+        : target.attention_context_base_row();
+    const int64_t probability_pack_base = compact_decode_sram
+            || compact_prefill_sram
+        ? target.memory().words_per_bank / 4
+        : target.attention_probability_pack_base_row();
+    const int64_t probability_diagonal_base = compact_decode_sram
+            || compact_prefill_sram
+        ? target.memory().words_per_bank / 2
+        : target.attention_probability_diagonal_base_row();
     const int64_t projection_bias_base =
-        target.attention_context_base_row() - projection_bias_total_rows;
+        context_base - projection_bias_total_rows;
     const int64_t query_bias_base = projection_bias_base;
     const int64_t key_bias_base = query_bias_base + query_bias_rows;
     const int64_t value_bias_base = key_bias_base + key_bias_rows;
     const int64_t qk_norm_gamma_base =
         input_staging_base - 2 * head_dim;
-    const int64_t query_norm_gamma_base = qk_norm_gamma_base;
+    const auto query_gamma = gamma_placements.find(query_norm_weight);
+    const auto key_gamma = gamma_placements.find(key_norm_weight);
+    const int64_t query_norm_gamma_base = query_gamma != gamma_placements.end()
+        ? query_gamma->second.base_row : qk_norm_gamma_base;
     const int64_t key_norm_gamma_base =
-        query_norm_gamma_base + head_dim;
+        key_gamma != gamma_placements.end() ? key_gamma->second.base_row
+                                           : qk_norm_gamma_base + head_dim;
+    const int64_t query_norm_bank = query_gamma != gamma_placements.end()
+        ? query_gamma->second.bank : scratch_bank;
+    const int64_t key_norm_bank = key_gamma != gamma_placements.end()
+        ? key_gamma->second.bank : scratch_bank;
     // Attention intermediates live in the activation partition. Keep their
     // low row above the persistent residual input so later weight pages may
     // remain resident in the dedicated weight slices throughout RoPE and
@@ -285,7 +339,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // Its long-lived primary copy shares activation slices with the transient
     // score plane, so place it immediately after that plane. The persistent
     // Key cache continues to grow down from the high end of SRAM.
-    const int64_t rope_mirror_base = rope_product_base + rope_product_rows;
+    // Decode's mirrored constants use the low activation slices and are
+    // initialized before RMSNorm. Preserve both the live input plane and
+    // its adjacent RMSNorm transpose scratch until the constants are read.
+    const int64_t rope_mirror_base = decode
+        ? std::max(rope_product_base + rope_product_rows,
+            2 * distributed_input_rows)
+        : rope_product_base + rope_product_rows;
     const int64_t rope_staging_mirror_base = rope_mirror_base + rope_rows;
     // The function input remains live until the attention residual add. Keep
     // Q/V and score scratch above its distributed16 rows. The RoPE table and
@@ -293,21 +353,32 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // below the late input-staging window instead of relying on stage lifetime
     // reuse.
     const int64_t score_base = target.uses_dedicated_slice_roles()
-        ? std::max(distributed_input_rows, key_rows)
+        ? (compact_decode_sram ? 0
+            : std::max(distributed_input_rows, key_rows))
         : target.attention_score_base_row();
-    const int64_t query_base = score_base + score_rows;
-    // Compact low Key products use activation slices 4..7 on scratch_bank.
-    // Their Key-local head coordinates must preserve both the live residual
-    // input and Query IW rows until the attention consumer has finished.
-    const int64_t rope_product_key_base = compact_rope_products
+    // Compact Query IW occupies distributed activation slices; scores occupy
+    // the separate planar score slices. Their row ranges need not be stacked.
+    // Dual-MXM QK needs two score planes concurrently with both Query
+    // halves. Those allocations share activation slices, so preserve their
+    // disjoint row ranges even on a compact prefill target.
+    const int64_t query_base = compact_decode_sram
+            || (compact_prefill_sram
+                && target.throughput().mxms_per_hemisphere == 1)
+        ? distributed_input_rows : score_base + score_rows;
+    // Key low-half products share the distributed input/Query slice group.
+    // Place them above both live tensors so another head batch can replay
+    // the same normalized input without an external reload.
+    const int64_t key_product_base = compact_rope_products
         ? std::max(distributed_input_rows, query_base + query_rows)
         : rope_product_base;
-    const int64_t rope_product_key_rows = compact_rope_products
+    const int64_t key_product_rows = compact_rope_products
         ? (direct_rope_streaming ? 1 : kv_heads * (head_blocks / 2) * 2 * seq_len)
         : rope_product_rows;
     const int64_t rope_table_base = decode
         ? query_base
-        : target.attention_probability_diagonal_base_row();
+        : compact_prefill_sram
+        ? rope_product_base + rope_product_rows
+        : probability_diagonal_base;
     // Serial Q/K projection retains every raw head until RoPE starts. Its
     // larger staging allocation must stay clear of the Query IW rows, which
     // remain live for QK and can occupy either scratch bank by rotary half.
@@ -344,14 +415,20 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             > target.memory().words_per_bank
         || rope_product_base + rope_product_rows
             > target.memory().words_per_bank
-        || rope_product_key_base + rope_product_key_rows
+        || key_product_base + key_product_rows
             > target.memory().words_per_bank
         || (compact_rope_products
             && rope_mirror_base + rope_rows > target.memory().words_per_bank)
         || causal_mask_base + tile > input_staging_base) {
         op.emitError(
             "attention activation scratch does not fit around persistent "
-            "input and initialized constants");
+            "input and initialized constants")
+            << ": bank_rows=" << target.memory().words_per_bank
+            << ", input_staging_rows=" << input_staging_rows
+            << ", rope_product_rows=" << rope_product_rows
+            << ", context_rows=" << context_rows
+            << ", score_end=" << score_base + score_rows
+            << ", query_end=" << query_base + query_rows;
         return mlir::failure();
     }
     llvm::SmallVector<int64_t, 36> scratch_candidates;
@@ -359,16 +436,37 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const llvm::SmallVector<int64_t, 2> scratch_banks {
         scratch_bank, secondary_scratch_bank};
     tensor::PhysicalMemoryAllocator physical_allocator(target);
+    // These compact gamma images are function inputs and remain resident
+    // until the post-attention RMSNorm materializes its local read layout.
+    for (const auto& entry : gamma_placements) {
+        const auto& gamma = entry.second;
+        if (gamma.segment_rows <= 0) continue;
+        if (mlir::failed(physical_allocator.reserve({"resident_post_norm_gamma",
+                {gamma.slice_base, gamma.slice_base + 1,
+                    gamma.slice_base + 2, gamma.slice_base + 3},
+                gamma.base_row, gamma.segment_rows, 0, 7, false, gamma.bank}))) {
+            op.emitError("post-attention gamma conflicts with attention storage");
+            return mlir::failure();
+        }
+    }
     const int64_t value_bank = compact_rope_products
         ? secondary_scratch_bank : scratch_bank;
+    const bool split_value_banks = tiled_weights
+        && target.throughput().mxms_per_hemisphere == 2;
     if (kv_cache_enabled) {
         llvm::SmallVector<int64_t, 16> value_cache_slices;
         for (int64_t slice : target.attention_value_slices())
             if (!llvm::is_contained(value_cache_slices, slice))
                 value_cache_slices.push_back(slice);
-        if (mlir::failed(physical_allocator.reserve({"value_cache",
+        const bool valueReservationFailed =
+            mlir::failed(physical_allocator.reserve({"value_cache",
                 value_cache_slices, value_base, value_rows, 0, 7, false,
-                value_bank}))) {
+                value_bank}))
+            || (split_value_banks
+                && mlir::failed(physical_allocator.reserve({"value_cache_second_bank",
+                    value_cache_slices, value_base, value_rows, 0, 7,
+                    false, scratch_bank})));
+        if (valueReservationFailed) {
             op.emitError(
                 "persistent Value cache overlaps attention scratch memory");
             return mlir::failure();
@@ -414,8 +512,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             projection_bias_slices.assign(
                 weightStorage.begin() + 22, weightStorage.begin() + 26);
         } else {
+            const int64_t slice_begin = wide_projection_bias ? 8 : 12;
             projection_bias_slices.assign(
-                storage.begin() + 12, storage.begin() + 16);
+                storage.begin() + slice_begin,
+                storage.begin() + slice_begin
+                    + (wide_projection_bias ? 8 : 4));
         }
     }
     llvm::SmallVector<int64_t, 16> qk_norm_input_slices;
@@ -439,21 +540,26 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         qk_norm_weight_slices.assign(
             storage.end() - 2, storage.end());
     }
-    // The bias bank is opposite the raw RoPE staging bank. On the overlapping
-    // Q path its slices are disjoint from the mirrored staging bank as well.
     const int64_t projection_bias_bank = scratch_bank;
     const int64_t input_staging_bank = scratch_bank;
     const auto input_staging_values = target.uses_dedicated_slice_roles()
         ? target.activation_storage_slices() : planar_activation_slices;
     llvm::SmallVector<int64_t, 16> input_staging_slices;
-    const auto input_staging_begin = direct_rope_streaming
-        ? input_staging_values.end() - 2
-        : compact_rope_products
-            ? input_staging_values.begin() + 8
-            : input_staging_values.begin();
-    input_staging_slices.assign(
-        input_staging_begin, input_staging_begin + 2);
-    if (mlir::failed(physical_allocator.reserve({"input_staging",
+    if (tiled_weights && target.throughput().mxms_per_hemisphere == 2
+        && weightStorage.size() >= 2) {
+        // Keep the last staged input read off the Q result MEM ICUs.
+        input_staging_slices.assign(
+            weightStorage.end() - 2, weightStorage.end());
+    } else {
+        const auto input_staging_begin = direct_rope_streaming
+            ? input_staging_values.end() - 2
+            : compact_rope_products
+                ? input_staging_values.begin() + 8
+                : input_staging_values.begin();
+        input_staging_slices.assign(
+            input_staging_begin, input_staging_begin + 2);
+    }
+    if (!direct_projection_input && mlir::failed(physical_allocator.reserve({"input_staging",
             input_staging_slices, input_staging_base,
             input_staging_rows, 0, 2, true, input_staging_bank}))) {
         op.emitError("failed to reserve the attention input staging buffer");
@@ -461,6 +567,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     llvm::SmallVector<int64_t, 16> input_staging_pong_slices;
     if (projection_rope_overlap && tiled_weights
+        && target.throughput().mxms_per_hemisphere == 1
             && compact_rope_products && !direct_rope_streaming
             && input_staging_values.size() >= 10) {
         // Keep both copies inside the activation partition.  The primary
@@ -484,7 +591,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         ? q_weight_rows + k_weight_rows + v_weight_rows
         : std::max({q_weight_rows + k_weight_rows + v_weight_rows,
               score_base + score_rows,
-              target.attention_probability_pack_base_row()
+              probability_pack_base
                   + probability_pack_rows,
               causal_mask_base + tile});
     if (!paged_weights
@@ -683,15 +790,23 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             "failed to reserve the attention projection-bias constants");
         return mlir::failure();
     }
+    auto query_norm_weight_slices = qk_norm_weight_slices;
+    auto key_norm_weight_slices = qk_norm_weight_slices;
+    if (query_gamma != gamma_placements.end())
+        query_norm_weight_slices = {query_gamma->second.slice_base,
+                                   query_gamma->second.slice_base + 1};
+    if (key_gamma != gamma_placements.end())
+        key_norm_weight_slices = {key_gamma->second.slice_base,
+                                 key_gamma->second.slice_base + 1};
     if (has_qk_norm
         && (mlir::failed(physical_allocator.reserve({"query_norm_weight",
-                llvm::SmallVector<int64_t, 16>(qk_norm_weight_slices.begin(),
-                    qk_norm_weight_slices.end()), query_norm_gamma_base, head_dim,
-                0, 3, false, scratch_bank}))
+                llvm::SmallVector<int64_t, 16>(query_norm_weight_slices.begin(),
+                    query_norm_weight_slices.end()), query_norm_gamma_base, head_dim,
+                0, 3, false, query_norm_bank}))
             || mlir::failed(physical_allocator.reserve({"key_norm_weight",
-                llvm::SmallVector<int64_t, 16>(qk_norm_weight_slices.begin(),
-                    qk_norm_weight_slices.end()), key_norm_gamma_base, head_dim,
-                0, 3, false, scratch_bank})))) {
+                llvm::SmallVector<int64_t, 16>(key_norm_weight_slices.begin(),
+                    key_norm_weight_slices.end()), key_norm_gamma_base, head_dim,
+                0, 3, false, key_norm_bank})))) {
         op.emitError("failed to reserve Q/K head RMSNorm gamma constants");
         return mlir::failure();
     }
@@ -709,7 +824,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             llvm::SmallVector<int64_t, 16>(
                 rope_product_key_slices.begin(),
                 rope_product_key_slices.end()),
-            rope_product_key_base, rope_product_key_rows,
+            key_product_base, key_product_rows,
             0, 2, false, scratch_bank}))) {
         op.emitError("failed to reserve the key RoPE product FIFO");
         return mlir::failure();
@@ -725,7 +840,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     if (mlir::failed(physical_allocator.reserve({"probability_diagonal",
             probability_diagonal_slices,
-            target.attention_probability_diagonal_base_row(),
+            probability_diagonal_base,
             query_heads * blocks * blocks
                 * target.throughput().tile_rows,
             4, 5, true, probability_diagonal_bank}))) {
@@ -813,6 +928,19 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             : scratch_bank,
     };
     for (int64_t group = 0; group < 2; ++group) {
+        const auto querySlices = target.attention_query_iw_slices(group);
+        // Query is retained from projection completion through QK. Its
+        // production within stage 0..2 is ordered against transient staging
+        // by the projection scheduler; persistent constants span both phases.
+        if (mlir::failed(physical_allocator.reserve({
+                "query_iw_half_" + std::to_string(group),
+                llvm::SmallVector<int64_t, 16>(querySlices.begin(), querySlices.end()),
+                query_base, query_rows, 2, 3, false, query_segment_banks[group]}))) {
+            op.emitError("Query IW storage overlaps a live attention allocation");
+            return mlir::failure();
+        }
+    }
+    for (int64_t group = 0; group < 2; ++group) {
         if (query_segment_banks[group] != key_bank) continue;
         for (int64_t slice : target.attention_query_iw_slices(group))
             if (!llvm::is_contained(qk_excluded_slices, slice))
@@ -890,10 +1018,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     auto exp1 = target.throughput().mxms_per_hemisphere == 1 ? exp0 : allocate_scratch(
         "exp_mxm1", 4, score_base,
         score_rows, 2, 3);
-    // The external activation binding is not owned by this local allocator
-    // and occupies the activation plane at low rows. Keep persistent mask
-    // initializers on the target's parameter slices so initialization cannot
-    // overwrite input token blocks before RMSNorm consumes them.
+    // Mask initializers survive until softmax. A following paged FFN can
+    // prefetch into every weight slice before that point, so paged attention
+    // keeps masks in the activation region beyond its Q/K scratch instead.
+    // Low activation rows still belong to the input/residual tensors.
+    const bool mask_in_activation = paged_weights || tiled_weights;
     const llvm::SmallVector<int64_t, 1> mask_banks {scratch_bank};
     const auto allocate_mask = [&](llvm::StringRef name, int64_t offset)
         -> mlir::FailureOr<tensor::PhysicalAllocation> {
@@ -901,16 +1030,16 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 > static_cast<int64_t>(rope_table_slices.size()))
             return mlir::failure();
         const llvm::SmallVector<int64_t, 2> candidates {
-            graph_weight_pages ? activation_storage[12+offset]
+            mask_in_activation ? activation_storage[12+offset]
                 : isolate_probability_from_runtime_weight_plane
                 ? weightStorage[weightStorage.size() - 4 + offset]
                 : rope_table_slices[static_cast<std::size_t>(offset)],
-            graph_weight_pages ? activation_storage[13+offset]
+            mask_in_activation ? activation_storage[13+offset]
                 : isolate_probability_from_runtime_weight_plane
                 ? weightStorage[weightStorage.size() - 3 + offset]
                 : rope_table_slices[static_cast<std::size_t>(offset + 1)]};
         return physical_allocator.allocate({name.str(), 2,
-            graph_weight_pages ? qk_norm_scratch_base+qk_norm_matrix_rows+1 : causal_mask_base, tile - 1, 2, 3, candidates, true,
+            mask_in_activation ? qk_norm_scratch_base+qk_norm_matrix_rows+1 : causal_mask_base, tile - 1, 0, 3, candidates, true,
             mask_banks});
     };
     auto mask0 = allocate_mask("causal_mask_mxm0", 0);
@@ -989,8 +1118,6 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         for (int64_t slice : probability_diagonal_slices)
             if (!llvm::is_contained(probability_pack_excluded, slice))
                 probability_pack_excluded.push_back(slice);
-    const int64_t probability_pack_base =
-        target.attention_probability_pack_base_row();
     // Value survives Softmax until PV consumes it. Its transient placement
     // is not reserved by the allocator, so explicitly keep an overlapping
     // probability window off the same physical bank/slice/row cells.
@@ -1023,19 +1150,31 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 "context",
                 static_cast<int64_t>(
                     target.attention_context_slices().size()),
-                target.attention_context_base_row(), context_rows, 4, 6);
+                context_base, context_rows, 4, 6);
         const auto storage = target.activation_storage_slices();
         const llvm::SmallVector<int64_t, 4> context_candidates {
             storage[16], storage[17], storage[18], storage[19]};
+        // The long-lived RoPE table and the alternate product FIFO fill the
+        // other bank on these four slices. The primary product retires before
+        // context starts, so its bank can be reused without an ICU conflict.
         const llvm::SmallVector<int64_t, 1> context_banks {
-            secondary_scratch_bank};
+            compact_prefill_sram ? scratch_bank : secondary_scratch_bank};
         return physical_allocator.allocate({"context", 4,
-            target.attention_context_base_row(), context_rows, 4, 6,
+            context_base, context_rows, 4, 6,
             context_candidates, true, context_banks});
     }();
     if (mlir::failed(require_allocation(
             mlir::succeeded(context), "context")))
         return mlir::failure();
+    const bool split_context_banks = split_value_banks
+        && compact_rope_products && head_blocks == 2;
+    if (split_context_banks
+        && mlir::failed(physical_allocator.reserve({"context_second_bank",
+            context->slices, context_base, context_rows / 2,
+            4, 6, true, secondary_scratch_bank}))) {
+        op.emitError("cannot place the second attention context half");
+        return mlir::failure();
+    }
     mlir::FailureOr<tensor::PhysicalAllocation> gate_input = mlir::failure();
     mlir::FailureOr<tensor::PhysicalAllocation> gated_context = mlir::failure();
     if (graph.output_gate) {
@@ -1043,8 +1182,27 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         const int64_t gate_base = std::max({
             qk_norm_scratch_base + qk_norm_matrix_rows + 1,
             rope_staging_base + rope_staging_rows, rope_mirror_base + rope_rows});
-        gate_input = physical_allocator.allocate({"output_gate", 2, gate_base,
-            seq_len * query_width / tile, 0, 7, scratch_candidates, false, gate_banks});
+        if (!llvm::isa<mlir::BlockArgument>(graph.output_gate.getGate())) {
+            auto inherited = get_value_placement(graph.output_gate.getGate());
+            if (mlir::failed(inherited)) return mlir::failure();
+            tensor::PhysicalAllocation preserved;
+            preserved.name = "output_gate";
+            for (auto slice : inherited->getAs<mlir::ArrayAttr>("slices"))
+                preserved.slices.push_back(llvm::cast<mlir::IntegerAttr>(slice).getInt());
+            preserved.base_row = inherited->getAs<mlir::IntegerAttr>("base_row").getInt();
+            preserved.rows = inherited->getAs<mlir::IntegerAttr>("instruction_count").getInt();
+            preserved.bank = inherited->getAs<mlir::IntegerAttr>("bank").getInt();
+            preserved.live_start = 0; preserved.live_end = 7;
+            preserved.reserve_slice_port = false;
+            if (mlir::failed(physical_allocator.reserve(preserved))) {
+                op.emitError("attention scratch overlaps the live gate projection");
+                return mlir::failure();
+            }
+            gate_input = preserved;
+        } else {
+            gate_input = physical_allocator.allocate({"output_gate", 2, gate_base,
+                seq_len * query_width / tile, 0, 7, scratch_candidates, false, gate_banks});
+        }
         gated_context = physical_allocator.allocate({"gated_context",
             static_cast<int64_t>(context->slices.size()), 0, context_rows,
             4, 7, scratch_candidates, true, gate_banks,
@@ -1057,9 +1215,15 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     const llvm::SmallVector<int64_t, 1> result_banks {
         secondary_scratch_bank};
+    // Use both hemispheres when the canonical east-only result exceeds a
+    // bank. Four consecutive feature blocks map to E pair0/pair1, W pair0/pair1.
+    const bool partition_result = seq_len * hidden / (tile * 2)
+        > target.memory().words_per_bank;
+    const int64_t result_rows = seq_len * ((hidden + tile * (partition_result ? 4 : 2) - 1)
+        / (tile * (partition_result ? 4 : 2)));
     auto vector_result = physical_allocator.allocate({"result",
         target.throughput().mxm_result_streams,
-        0, seq_len * hidden / (tile * 2), 5, 7,
+        0, result_rows, 5, 7,
         scratch_candidates, true, result_banks});
     if (mlir::failed(vector_result)) {
         op.emitError(
@@ -1080,11 +1244,12 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         const auto& tile_plan = weight_tile_plan->get(kind);
         mlir::NamedAttrList attrs(placement);
         attrs.set("paged_weight", rewriter.getBoolAttr(true));
-        attrs.set("page_count", rewriter.getI64IntegerAttr(1));
+        const auto pages = weight_tile_plan->getPages(kind);
+        attrs.set("page_count", rewriter.getI64IntegerAttr(pages.size()));
         attrs.set("page_rows",
             rewriter.getI64IntegerAttr(weight_tile_plan->bank_rows));
         attrs.set("page_granularity",
-            rewriter.getI64IntegerAttr(tile_plan.item_count));
+            rewriter.getI64IntegerAttr(pages.front().item_count));
         attrs.set("page_role_group_base",
             rewriter.getI64IntegerAttr(tile_plan.slice_group_begin));
         attrs.set("page_role_group_count",
@@ -1098,6 +1263,26 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         attrs.set("page_phase", rewriter.getI64IntegerAttr(phase));
         attrs.set("page_transfer_cycles",
             rewriter.getI64IntegerAttr(tile_plan.transfer_cycles));
+        if (pages.size() > 1) {
+            llvm::SmallVector<int64_t> pageBanks, pageGroupBases,
+                pageGroupCounts, pageBaseRows, pageRowCounts;
+            for (const auto& page : pages) {
+                pageBanks.push_back(page.bank);
+                pageGroupBases.push_back(page.slice_group_begin);
+                pageGroupCounts.push_back(page.slice_group_count);
+                // Placement base_row is already stored in the binding. The
+                // per-page base is relative to that row.
+                pageBaseRows.push_back(page.base_row - tile_plan.base_row);
+                pageRowCounts.push_back(page.rows);
+            }
+            attrs.set("page_banks", rewriter.getI64ArrayAttr(pageBanks));
+            attrs.set("page_slice_group_bases",
+                rewriter.getI64ArrayAttr(pageGroupBases));
+            attrs.set("page_slice_group_counts",
+                rewriter.getI64ArrayAttr(pageGroupCounts));
+            attrs.set("page_base_rows", rewriter.getI64ArrayAttr(pageBaseRows));
+            attrs.set("page_row_counts", rewriter.getI64ArrayAttr(pageRowCounts));
+        }
         if (weight_tile_plan->bank_level_ping_pong) {
             attrs.set("page_bank_ping_pong", rewriter.getBoolAttr(true));
             // Only Q is required before execution. Subsequent projections
@@ -1122,15 +1307,14 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             layout, slices, tile_plan.base_row, tile_plan.rows, "both",
             tile_plan.bank), kind, phase);
     };
-    auto inheritedInputPlacement =
-        get_value_placement(graph.query.getLhs());
     auto inputPlacement = mlir::succeeded(inheritedInputPlacement)
         ? *inheritedInputPlacement
         : make_attention_placement(rewriter,
             "fp16_mxm_activation_planar",
             activation_slices, 0, seq_len * hidden / tile,
             "both");
-    if (graph_weight_pages && mlir::failed(inheritedInputPlacement)) {
+    if ((graph_weight_pages || direct_projection_input)
+        && mlir::failed(inheritedInputPlacement)) {
         // Keep the complete activation tensor out of query-IW storage.
         // Q normalization/RoPE precedes K/V projection in the serial path;
         // its query-IW writes may reuse the short-lived planar staging pair.
@@ -1138,7 +1322,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         const auto distributed = target.mxm_distributed_activation_slices();
         inputPlacement = make_attention_placement(rewriter,
             "fp16_mxm_distributed_16", distributed, 0,
-            (seq_len / tile) * (hidden / tile) * target.throughput().tile_rows,
+            blocks * (hidden / tile) * target.throughput().tile_rows,
             "both", scratch_bank);
     }
     const int64_t blocks_per_rotary_half =
@@ -1193,6 +1377,17 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             key_rows, "both",
             key_allocation->bank),
         key_segments);
+    const auto valueSlices = target.attention_value_slices();
+    auto valuePlacement = make_attention_placement(rewriter,
+        "fp16_value_x16", valueSlices, value_base, value_rows,
+        "both", value_bank);
+    if (split_value_banks)
+        valuePlacement = with_segments(valuePlacement, rewriter.getArrayAttr({
+            make_segment(0, 1, value_bank,
+                llvm::ArrayRef<int64_t>(valueSlices).take_front(16), value_base),
+            make_segment(1, 2, scratch_bank,
+                llvm::ArrayRef<int64_t>(valueSlices).take_back(16), value_base),
+        }));
     auto ropeProductPlacement = make_attention_placement(rewriter,
         compact_rope_products ? "fp16_rope_product_banked_x4"
                               : "fp16_rope_product_x16",
@@ -1207,18 +1402,25 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         compact_rope_products ? "fp16_head_block_packed"
                               : "fp16_head_planar",
         context->slices,
-        target.attention_context_base_row(), context_rows, "both",
+        context_base, context_rows, "both",
         context->bank);
     if (compact_rope_products) {
         mlir::NamedAttrList attrs(contextPlacement);
         attrs.set("head_block_packed", rewriter.getBoolAttr(true));
         attrs.set("hemisphere_paired", rewriter.getBoolAttr(true));
+        if (split_context_banks)
+            attrs.set("segments", rewriter.getArrayAttr({
+                make_segment(0, 1, context->bank, context->slices,
+                    context_base),
+                make_segment(1, 2, secondary_scratch_bank, context->slices,
+                    context_base),
+            }));
         contextPlacement = attrs.getDictionary(rewriter.getContext());
     }
     auto plan = rewriter.getDictionaryAttr({
         rewriter.getNamedAttr("input", inputPlacement),
         rewriter.getNamedAttr("input_staging",
-            make_attention_placement(rewriter,
+            direct_projection_input ? inputPlacement : make_attention_placement(rewriter,
                 "fp16_pair_planar", input_staging_slices,
                 input_staging_base, input_staging_rows, "both",
                 input_staging_bank)),
@@ -1247,9 +1449,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             serial_attention_weight_pages ? 3 : 1)),
         rewriter.getNamedAttr("query", query_placement),
         rewriter.getNamedAttr("key", key_placement),
-        rewriter.getNamedAttr("value", make_attention_placement(rewriter,
-            "fp16_value_x16", target.attention_value_slices(),
-            value_base, value_rows, "both", value_bank)),
+        rewriter.getNamedAttr("value", valuePlacement),
         rewriter.getNamedAttr("score", make_attention_placement(rewriter,
             "fp16_score_block", score0->slices,
             score_base, score_rows, "both",
@@ -1292,13 +1492,13 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             fused_scratch_bank)),
         rewriter.getNamedAttr("probability_pack", make_attention_placement(rewriter,
             "fp16_probability_x16", probability_pack_slices,
-            target.attention_probability_pack_base_row(),
+            probability_pack_base,
             probability_pack_rows, "both",
             probability_pack_bank)),
         rewriter.getNamedAttr("probability_diagonal", make_attention_placement(rewriter,
             "fp16_probability_diagonal",
             probability_diagonal_slices,
-            target.attention_probability_diagonal_base_row(),
+            probability_diagonal_base,
             probability_diagonal_rows, "both",
             probability_diagonal_bank)),
         rewriter.getNamedAttr("rope", make_attention_placement(rewriter,
@@ -1310,7 +1510,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             decode ? "fp16_rope_table_decode_compact" : "fp16_rope_table",
             rope_mirror_slices,
             compact_rope_products ? rope_mirror_base
-                                  : target.attention_probability_diagonal_base_row(),
+                                  : probability_diagonal_base,
             rope_rows, "both", rope_mirror_bank)),
         rewriter.getNamedAttr("rope_staging",
             make_attention_placement(rewriter,
@@ -1321,18 +1521,18 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr("rope_product_key",
             make_attention_placement(rewriter,
                 "fp16_rope_product_key_x4", rope_product_key_slices,
-                rope_product_key_base, rope_product_key_rows, "both",
+                key_product_base, key_product_rows, "both",
                 scratch_bank)),
         rewriter.getNamedAttr("context", contextPlacement),
         rewriter.getNamedAttr("output_activation",
             make_attention_placement(rewriter,
                 "fp16_pair_planar", input_staging_slices,
-                input_staging_base, input_staging_rows,
+                output_staging_base, output_staging_rows,
                 "both", scratch_bank)),
         rewriter.getNamedAttr("result", make_attention_placement(rewriter,
             "fp16_pair_planar",
             vector_result->slices, vector_result->base_row,
-            seq_len * hidden / (tile * 2), "east",
+            result_rows, partition_result ? "both" : "east",
             vector_result->bank)),
     });
     if (!input_staging_pong_slices.empty()) {
@@ -1365,16 +1565,19 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     if (has_qk_norm) {
         mlir::NamedAttrList plan_attributes(plan);
-        plan_attributes.set("query_norm_weight",
-            make_attention_placement(rewriter,
-                "fp16_vxm_gamma_broadcast", qk_norm_weight_slices,
-                query_norm_gamma_base, head_dim, "both",
-                scratch_bank));
-        plan_attributes.set("key_norm_weight",
-            make_attention_placement(rewriter,
-                "fp16_vxm_gamma_broadcast", qk_norm_weight_slices,
-                key_norm_gamma_base, head_dim, "both",
-                scratch_bank));
+        const auto gammaPlacement = [&](llvm::ArrayRef<int64_t> slices,
+                                       int64_t base, int64_t bank) {
+            mlir::NamedAttrList placement(make_attention_placement(rewriter,
+                "fp16_vxm_gamma_broadcast", slices, base, head_dim, "both", bank));
+            // Gamma is a persistent activation-region constant, not a matrix
+            // weight whose bank may be reassigned after physical planning.
+            placement.set("bank_locked", rewriter.getBoolAttr(true));
+            return placement.getDictionary(rewriter.getContext());
+        };
+        plan_attributes.set("query_norm_weight", gammaPlacement(
+            query_norm_weight_slices, query_norm_gamma_base, query_norm_bank));
+        plan_attributes.set("key_norm_weight", gammaPlacement(
+            key_norm_weight_slices, key_norm_gamma_base, key_norm_bank));
         plan_attributes.set("query_norm_input",
             make_attention_placement(rewriter,
                 "fp16_vxm_distributed_16", qk_norm_input_slices,
@@ -1418,9 +1621,18 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     }
     if (graph.output_gate) {
         mlir::NamedAttrList entries(plan);
-        entries.set("output_gate", make_attention_placement(rewriter,
+        auto gatePlacement = make_attention_placement(rewriter,
             "fp16_pair_planar", gate_input->slices, gate_input->base_row,
-            seq_len * query_width / tile, "both", gate_input->bank));
+            seq_len * query_width / tile, "both", gate_input->bank);
+        if (!llvm::isa<mlir::BlockArgument>(graph.output_gate.getGate())) {
+            auto inheritedGate = get_value_placement(graph.output_gate.getGate());
+            if (mlir::failed(inheritedGate)) {
+                op.emitError("attention gate producer has no physical placement");
+                return mlir::failure();
+            }
+            gatePlacement = *inheritedGate;
+        }
+        entries.set("output_gate", gatePlacement);
         mlir::NamedAttrList gated(contextPlacement);
         gated.set("slices", rewriter.getI64ArrayAttr(gated_context->slices));
         gated.set("base_row", rewriter.getI64IntegerAttr(gated_context->base_row));

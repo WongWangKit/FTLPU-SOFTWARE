@@ -127,7 +127,7 @@ int64_t emitRopeNormTranspose(
     }
     for (int64_t hemisphere = 0; hemisphere < target.memory().hemispheres; ++hemisphere) {
       emitSxm(rewriter,location,captureStart,hemisphere,"transpose",sourceStreams,
-          transposeStreams,identityMap(),"vector_columns",-1,-1,-1,beats,1);
+          transposeStreams,identityMap(target),"vector_columns",-1,-1,-1,beats,1);
       emitSxm(rewriter,location,captureStart+1,hemisphere,"permute",transposeStreams,
           outputStreams,blockDiagonalMap(0,target),"vector_columns",-1,-1,-1,
           beats+tileRows-1,1,1,1,target.throughput().lanes_per_tile);
@@ -148,6 +148,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   const llvm::StringRef streamKind = lpu_16bit_stream_kind(elementType);
   const llvm::StringRef dataFormat = lpu_16bit_data_format(elementType);
   const int64_t tile = target_.throughput().mxm_rows;
+  const int64_t projectionWeightSlotRows = tile / 8;
+  const int64_t projectionWeightReductionRows = 2 * projectionWeightSlotRows;
   const int64_t tokenBlocks = (op_.getSeqLen() + tile - 1) / tile;
   const int64_t projectionRows = std::min(tile, op_.getSeqLen());
   // A one-token decode only occupies one physical MXM row.  Reusing the same
@@ -191,6 +193,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   }
   const int64_t weightToIw = target_.throughput().vxm_weight_to_iw_latency;
   const bool localDequant = target_.supports_mxm_local_dequant();
+  const bool columnLoad = localDequant && target_.throughput().mxm_prefill_weight_streams == 1;
+  const int64_t weightLoadCycles = columnLoad ? tile
+      : target_.throughput().tile_rows;
   const int64_t loadToIw = localDequant ? 0 : weightToIw;
   const int64_t weightStreamBase =
       localDequant ? target_.streams().streams_per_direction -
@@ -209,6 +214,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       inputDistributed16
           ? op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("input_staging")
           : mlir::DictionaryAttr{};
+  const bool directProjectionInput = inputStagingPlacement
+      && inputStagingPlacement.getAs<mlir::StringAttr>("kind").getValue()
+          == "fp16_mxm_distributed_16";
   const auto inputStagingPongPlacement =
       inputDistributed16
           ? op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(
@@ -236,7 +244,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                        layout.activationSlices().end());
   const int64_t activationLatency = *target_.transport_latency(
       target::StreamEndpoint::Mem, target::StreamEndpoint::MxmActivation,
-      target::StreamDirection::East, projectionActivationSlices.front());
+      target::StreamDirection::East, directProjectionInput
+          ? inputSlices.back() : projectionActivationSlices.front());
   const int64_t projectionHeads[] = {op_.getQueryHeads(), op_.getKvHeads(),
                                      op_.getKvHeads()};
   const mlir::Value projectionValues[] = {
@@ -273,25 +282,29 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   };
   const auto emitDequant = [&](int64_t cycle, int64_t hemisphere,
                                int64_t localMxm, mlir::Value weight,
-                               float scale) {
+                               float scale, int64_t repeatCount) {
     const char *hemi = hemisphere == 0 ? "east" : "west";
     for (int64_t lane = 0; lane < target_.throughput().lanes_per_tile; ++lane) {
       const int64_t multiplyColumn = hemisphere == 0
           ? lane : target_.throughput().vxm_alus - 1 - lane;
       const int64_t castColumn = hemisphere == 0
           ? 8 + lane : target_.throughput().vxm_alus - 1 - (8 + lane);
-      emitVxm(rewriter_, op_.getLoc(), weight, cycle, multiplyColumn, "multiply",
-              "stream_i8", 32 + lane, 0.0f, "immediate", 0, scale, "fp32", -1,
-              hemi, hemi, functionArgumentIndex(weight));
-      emitVxm(rewriter_, op_.getLoc(), weight, cycle + 1, castColumn, "cast", "alu",
-              multiplyColumn, 0.0f, "immediate", 0, 0.0f, dataFormat,
-              localMxm * 16 + lane * 2, hemi, hemi);
+      emitVxmConfigured(rewriter_, op_.getLoc(), weight, cycle,
+              multiplyColumn, "multiply", "stream_i8", 32 + lane, 0.0f,
+              "immediate", 0, scale, "fp32", -1, hemi, hemi,
+              functionArgumentIndex(weight), 8, repeatCount, 1);
+      emitVxmConfigured(rewriter_, op_.getLoc(), weight, cycle + 1,
+              castColumn, "cast", "alu", multiplyColumn, 0.0f,
+              "immediate", 0, 0.0f, dataFormat,
+              localMxm * 16 + lane * 2, hemi, hemi, -1, 8,
+              repeatCount, 1);
     }
   };
   const auto emitRopeOrCast = [&](int64_t cycle, int64_t hemisphere, bool rope,
-                                  mlir::Value value) {
+                                  mlir::Value value, int64_t repeatCount) {
     attention_detail::emitRopeOrCast(rewriter_, op_.getLoc(), target_, cycle,
-                                     hemisphere, rope, value, elementType);
+                                     hemisphere, rope, value, elementType,
+                                     repeatCount);
   };
   const auto placementBank = [&](llvm::StringRef name) {
     return op_.getMemoryPlan()
@@ -340,7 +353,6 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                            .getInt()
                                      : ropeBank;
   const int64_t keyBank = placementBank("key");
-  const int64_t valueBank = placementBank("value");
   const int64_t productBank = placementBank("rope_product");
   const auto keyProductPlacement =
       op_.getMemoryPlan().getAs<mlir::DictionaryAttr>("rope_product_key");
@@ -409,7 +421,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       projectionRopeOverlap &&
       target_.streams().streams_per_direction >= 18;
 
-  if (inputDistributed16) {
+  if (inputDistributed16 && !directProjectionInput) {
     const auto &stagingSlices = inputStagingSlices;
     if (inputSlices.size() != 16 || stagingSlices.size() < 2) {
       op_.emitError("distributed attention input requires 16 source slices "
@@ -530,7 +542,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           ? op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(
                 biasPlacementNames[projection])
           : mlir::DictionaryAttr {};
-      llvm::SmallVector<int64_t, 4> biasSlices;
+      llvm::SmallVector<int64_t, 8> biasSlices;
       int64_t biasBase = 0;
       int64_t biasBank = 0;
       if (projectionBias) {
@@ -547,17 +559,19 @@ int64_t AttentionScheduleEmitter::emitProjections() {
              biasPlacement.getAs<mlir::ArrayAttr>("slices"))
           biasSlices.push_back(
               llvm::cast<mlir::IntegerAttr>(slice).getInt());
-        if (biasSlices.size() != 4) {
+        if (biasSlices.size() != 4 && biasSlices.size() != 8) {
           op_.emitError(
-              "attention projection bias requires four MEM slices");
+              "attention projection bias requires four or eight MEM slices");
           return -1;
         }
         biasBase =
             biasPlacement.getAs<mlir::IntegerAttr>("base_row").getInt();
         biasBank = biasPlacement.getAs<mlir::IntegerAttr>("bank").getInt();
       }
+      const int64_t biasPairs = biasSlices.size() / 2;
       const auto biasAddress = [&](int64_t outputBlock) {
-        return biasBase + (outputBlock / 4) * 2 + outputBlock % 2;
+        return biasBase + (outputBlock / (2 * biasPairs)) * 2
+            + outputBlock % 2;
       };
       // External page completion is asynchronous. Compiler-authored page
       // SYNCs gate these consumers; never predict DDR latency in phaseStart.
@@ -568,6 +582,16 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           projectionRopeOverlap &&
           (kind == AttentionProjectionKind::Query ||
            secondaryActivationOverlap);
+      if (!projection_rope_overlap_enabled_) {
+        // phaseStart is the MXM weight ingress time. MEM reads issue earlier;
+        // their page-ready SYNC must not split the preceding passive-SR copy.
+        int64_t readLead = 0;
+        for (int64_t hemisphere = 0;
+             hemisphere < target_.memory().hemispheres; ++hemisphere)
+          for (int64_t slice : layout.weightSlices(kind, hemisphere * 2))
+            readLead = std::max(readLead, weightReadLatency(slice));
+        phaseStart = std::max(phaseStart, postprocessReady + readLead);
+      }
       // With uninterrupted Q/K/V reductions, each output group occupies
       // exactly two 48-reduction halves.  Their weight queues have no
       // intervening work: flatten all halves into the third READ_3D counter
@@ -578,6 +602,17 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           target_.throughput().mxm_weight_buffers == 2 &&
           projectionOutputBlocks == projectionGroups * 4 &&
           projectionGroups > 1;
+      // On a compact decode target the Value bias and the next output
+      // group's activation use the same bank-0 MEM ICUs.  A merged weight /
+      // activation / MXM domain cannot pause for the bias read; keep each
+      // output group separate and place the next group after its predecessor
+      // has drained.
+      const bool serialValueBiasGroups =
+          kind == AttentionProjectionKind::Value && projectionBias &&
+          (tokenBlocks == 1 || directProjectionInput) &&
+          target_.memory().words_per_bank <= 1024;
+      if (serialValueBiasGroups)
+        mergeProjectionWeightReads = false;
       if (mergeProjectionWeightReads) {
         for (int64_t hemisphere = 0;
              hemisphere < target_.memory().hemispheres; ++hemisphere) {
@@ -597,6 +632,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     group * 4 + hemisphere * 2 + half;
                 const auto slices = layout.weightSlices(kind, outputBlock);
                 if (slices[stream] != firstSlices[stream] ||
+                    layout.weightPage(kind, outputBlock) !=
+                        layout.weightPage(kind, hemisphere * 2) ||
+                    layout.weightBank(kind, outputBlock) !=
+                        layout.weightBank(kind, hemisphere * 2) ||
                     layout.weightAddress(kind, outputBlock, 0, half, 0) !=
                         baseAddress + group * groupStride +
                             half * halfStride)
@@ -622,11 +661,12 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             const int64_t slice = slices[stream];
             emitMem3D(
                 rewriter_, op_.getLoc(),
-                phaseStart - weightReadLatency(slice),
+                phaseStart - weightReadLatency(slice) + (columnLoad ? stream : 0),
                 hemisphere * target_.memory().slices_per_hemisphere + slice,
-                "read", baseAddress, weightStreamBase + stream, 4, 1, 1,
+                "read", baseAddress + (columnLoad ? weightLoadCycles - 1 : 0), weightStreamBase + (columnLoad ? 0 : stream), weightLoadCycles, columnLoad ? 8 : 1, columnLoad ? -1 : 1,
                 "sram", functionArgumentIndex(projectionValues[projection]),
-                hiddenBlocks, projectionReductionInterval, 8,
+                hiddenBlocks, projectionReductionInterval,
+                projectionWeightReductionRows,
                 projectionGroups * 2,
                 hiddenBlocks * projectionReductionInterval, 0,
                 layout.weightBank(kind), layout.weightPage(kind), -1,
@@ -640,7 +680,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       // [output half] domain directly as one READ_3D per physical MEM ICU.
       const bool mergeProjectionActivationReads =
           !projection_rope_overlap_enabled_ && mergeProjectionWeightReads &&
-          inputDistributed16;
+          inputDistributed16 && !directProjectionInput;
       // A serial projection has one uninterrupted reduction stream per MXM.
       // Keep the output-half axis in the hardware loop instead of creating a
       // new LOAD/DEQUANT/COMPUTE descriptor for every half.
@@ -658,7 +698,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     target::StreamDirection::East, slice);
             emitMem3D(
                 rewriter_, op_.getLoc(),
-                phaseStart + 4 + loadToIw - readToActivation,
+                phaseStart + weightLoadCycles + loadToIw - readToActivation,
                 hemisphere * target_.memory().slices_per_hemisphere + slice,
                 "read", placementBase(inputStagingPlacement), byte,
                 projectionRows, 1,
@@ -881,9 +921,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 int64_t groupInterval, int64_t groupAddressStride) {
               emitMem3D(
                   rewriter_, op_.getLoc(), domain.cycle, domain.queue, "read",
-                  domain.address, domain.packedStream, 4, 1, 1, "sram",
+                  domain.address + (columnLoad ? weightLoadCycles - 1 : 0), domain.packedStream, weightLoadCycles, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram",
                   domain.addressBinding, hiddenBlocks,
-                  projectionReductionInterval, 8,
+                  projectionReductionInterval,
+                  projectionWeightReductionRows,
                   groupCount, groupInterval, groupAddressStride, domain.bank,
                   domain.weightPage);
             };
@@ -994,7 +1035,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 for (int64_t stream = 0; stream < 8; ++stream) {
                   const int64_t slice = selectedWeightSlices[stream];
                   const int64_t readCycle =
-                      dequantStart - weightReadLatency(slice);
+                      dequantStart - weightReadLatency(slice) + (columnLoad ? stream : 0);
                   const PendingWeightReadDomain current{
                       true,
                       readCycle,
@@ -1002,10 +1043,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           slice,
                       layout.weightAddress(kind, outputBlock, reductionBlock,
                                            half, 0),
-                      weightStreamBase + stream,
+                      weightStreamBase + (columnLoad ? 0 : stream),
                       functionArgumentIndex(projectionValues[projection]),
-                      layout.weightBank(kind),
-                      layout.weightPage(kind)};
+                      layout.weightBank(kind, outputBlock),
+                      layout.weightPage(kind, outputBlock)};
                   if (!mergeProjectionWeightReads) {
                     auto &pending = pendingWeightReads[static_cast<std::size_t>(
                         hemisphere * 8 + stream)];
@@ -1024,7 +1065,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       const int64_t groupAddressStride =
                           current.address - pending.address;
                       const int64_t innerDomainLastOffset =
-                          (hiddenBlocks - 1) * projectionReductionInterval + 3;
+                          (hiddenBlocks - 1) * projectionReductionInterval + (columnLoad ? (weightLoadCycles - 1) * 8 : weightLoadCycles - 1);
                       const bool pairCompleteHalves =
                           half == 1 && completeReductionDomain && pending.valid &&
                           current.queue == pending.queue &&
@@ -1032,7 +1073,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           current.addressBinding == pending.addressBinding &&
                           current.bank == pending.bank &&
                           current.weightPage == pending.weightPage &&
-                          groupAddressStride == 4 &&
+                          groupAddressStride == projectionWeightSlotRows &&
                           groupInterval > innerDomainLastOffset;
                       if (pairCompleteHalves) {
                         emitWeightReadDomain(pending, 2, groupInterval,
@@ -1042,10 +1083,11 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         flushPendingWeightRead(pending);
                         emitMem3D(
                             rewriter_, op_.getLoc(), current.cycle,
-                            current.queue, "read", current.address,
-                            current.packedStream, 4, 1, 1, "sram",
+                            current.queue, "read", current.address + (columnLoad ? weightLoadCycles - 1 : 0),
+                            current.packedStream, weightLoadCycles, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram",
                             current.addressBinding, weightDomainCount,
-                            projectionReductionInterval, 8, 1, 1, 0,
+                            projectionReductionInterval,
+                            projectionWeightReductionRows, 1, 1, 0,
                             current.bank,
                             current.weightPage);
                       }
@@ -1057,7 +1099,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                      (outputGroup == 0 && half == 0)))
                   emitMxmDequant3D(
                       rewriter_, op_.getLoc(), dequantStart, hemisphere,
-                      projectionScales[projection], 4, 1, weightDomainCount,
+                      projectionScales[projection], weightLoadCycles, 1, weightDomainCount,
                       projectionReductionInterval,
                       mergeProjectionMxm ? projectionGroups * 2 : 1,
                       mergeProjectionMxm
@@ -1065,12 +1107,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           : 1,
                       functionArgumentIndex(projectionValues[projection]));
               }
-              if (!localDequant) {
-                for (int64_t pulse = 0; pulse < 4; ++pulse)
-                  emitDequant(dequantStart + pulse, hemisphere, 0,
-                              projectionValues[projection],
-                              projectionScales[projection]);
-              }
+              if (!localDequant)
+                emitDequant(dequantStart, hemisphere, 0,
+                            projectionValues[projection],
+                            projectionScales[projection], weightLoadCycles);
               if ((weightDomainCount != 0 ||
                    target_.throughput().mxm_weight_buffers > 2) &&
                   (!mergeProjectionMxm ||
@@ -1080,18 +1120,18 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         ? 1
                         : weightDomainCount;
                 MxmDomain3D loadDomain;
-                loadDomain.wave_count = 4;
+                loadDomain.wave_count = weightLoadCycles;
                 loadDomain.wave_interval = 1;
-                loadDomain.wave_weight_column_stride = -1;
+                loadDomain.wave_weight_column_stride = columnLoad ? 1 : -1;
                 loadDomain.group_count = loadGroupCount;
                 loadDomain.group_interval = projectionReductionInterval;
                 if (loadGroupCount > 1 &&
                     target_.throughput().mxm_weight_buffers == 2)
                   loadDomain.weight_buffer_mode = "toggle_dim2";
                 if (mergeProjectionMxm) {
-                  loadDomain.repeat_count = 4;
+                  loadDomain.repeat_count = weightLoadCycles;
                   loadDomain.repeat_interval = 1;
-                  loadDomain.repeat_weight_column_stride = -1;
+                  loadDomain.repeat_weight_column_stride = columnLoad ? 1 : -1;
                   loadDomain.wave_count = hiddenBlocks;
                   loadDomain.wave_interval = projectionReductionInterval;
                   loadDomain.wave_weight_column_stride = 0;
@@ -1102,15 +1142,15 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 }
                 emitMxm3D(
                     rewriter_, op_.getLoc(), dequantStart + loadToIw,
-                    hemisphere, "iw", weightBuffer, 3, 0, 0, 0, 1, "stream",
-                    true, "supercell", 0, dataFormat,
+                    hemisphere, "iw", weightBuffer, columnLoad ? 0 : weightLoadCycles - 1, 0, 0, 0, 1, "stream",
+                    true, columnLoad ? "column" : "supercell", 0, dataFormat,
                     localDequant ? "int8_dequant_bf16" : llvm::StringRef{},
                     llvm::StringRef{}, loadDomain,
                     localDequant ? weightStreamBase : -1);
               }
             }
 
-            const int64_t firstCompute = dequantStart + 4 + loadToIw;
+            const int64_t firstCompute = dequantStart + weightLoadCycles + loadToIw;
             struct ActivationReadSegment {
               int64_t begin;
               int64_t count;
@@ -1190,7 +1230,33 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 const int64_t headBlock = outputBlock % projectionHeadBlocks;
                 if (tokenBlock == 0 && activationDomainCount != 0 &&
                     !mergeProjectionActivationReads) {
-                  if (overlapsRopeProducts) {
+                  if (directProjectionInput) {
+                    const int64_t lanes = target_.throughput().mxm_block_rows;
+                    // Value bias is consumed between token-tile activation
+                    // reads on these same bank-0 ICUs. End the final-K domain
+                    // at each token tile; an ICU cannot pause it for the bias.
+                    const bool splitForValueBias = projectionBias
+                        && kind == AttentionProjectionKind::Value && finalReduction;
+                    for (int64_t block = 0; block < (splitForValueBias ? tokenBlocks : 1); ++block)
+                    for (int64_t lane = 0; lane < std::min(lanes, projectionRows); ++lane)
+                      for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t slice = inputSlices[2 * lane + byte];
+                        const int64_t latency = *target_.transport_latency(
+                            target::StreamEndpoint::Mem,
+                            target::StreamEndpoint::MxmActivation,
+                            target::StreamDirection::East, slice);
+                        emitMem3D(rewriter_, op_.getLoc(),
+                            firstCompute + block * computeSpacing + lane - latency,
+                            hemisphere * target_.memory().slices_per_hemisphere + slice,
+                            "read", inputBase + (reductionBlock + block * hiddenBlocks) * target_.throughput().tile_rows,
+                            activationStreamBase + byte,
+                            (projectionRows - lane + lanes - 1) / lanes, lanes, 1,
+                            "sram", -1, splitForValueBias ? 1 : tokenBlocks, computeSpacing,
+                            hiddenBlocks * target_.throughput().tile_rows,
+                            activationDomainCount, projectionReductionInterval,
+                            target_.throughput().tile_rows, inputBank);
+                      }
+                  } else if (overlapsRopeProducts) {
                     for (const ActivationReadSegment &segment :
                          activationReadSegments) {
                       const auto &slices = segment.pong
@@ -1597,6 +1663,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           computeCycle +
                           target_.throughput().accumulator_to_vxm_latency +
                           offset;
+                      // The first MXM result reaches the VXM ingress two
+                      // cycles before the nominal input cycle for this
+                      // physical value-projection path.
+                      constexpr int64_t firstResultAdvance = 2;
                       if (offset == 0 && hemisphere == 0) {
                         for (int64_t source = 0;
                              source < target_.memory().hemispheres;
@@ -1642,7 +1712,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               projectionRows, 1);
                         }
                       }
-                      const int64_t pair = (outputBlock / 2) % 2;
+                      const int64_t pair = (outputBlock / 2) % biasPairs;
                       for (int64_t byte = 0; byte < 2; ++byte) {
                         const int64_t slice = biasSlices[2 * pair + byte];
                         const bool mergeValueBias =
@@ -1658,12 +1728,13 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                     biasAddress(outputGroup * 4 +
                                                 hemisphere * 2) ==
                                 2;
-                        if (offset == 0 && tokenBlock == 0 &&
+                        if (offset == 0 && (directProjectionInput || tokenBlock == 0) &&
                             (!mergeValueBias ||
                              (outputGroup == 0 && half == 0)))
                           emitMem3D(
                               rewriter_, op_.getLoc(),
-                              vxmInputCycle - vxmInputReadLatency(slice),
+                              vxmInputCycle - firstResultAdvance
+                                  - vxmInputReadLatency(slice),
                               hemisphere *
                                       target_.memory().slices_per_hemisphere +
                                   slice,
@@ -1671,7 +1742,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               40 + hemisphere * 16 + byte, projectionRows, 1,
                               0, "sram",
                               functionArgumentIndex(projectionBias),
-                              tokenBlocks, computeSpacing, 0,
+                              directProjectionInput ? 1 : tokenBlocks, computeSpacing, 0,
                               mergeValueBias ? projectionGroups * 2 : 1,
                               mergeValueBias
                                   ? hiddenBlocks * projectionReductionInterval
@@ -1685,7 +1756,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       // hops, and one launch/commit boundary.
                       const int64_t valueTurnaroundLatency = 4 + 2 + 5 + 1;
                       const int64_t outputCycle =
-                          vxmInputCycle + valueTurnaroundLatency;
+                          vxmInputCycle - firstResultAdvance
+                              + valueTurnaroundLatency;
                       const int64_t outputStream =
                           (1 - hemisphere) * 8 + 4 + hemisphere * 2;
                       for (int64_t byte = 0; byte < 2; ++byte) {
@@ -1811,9 +1883,11 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             const int64_t lastCompute = firstCompute
                 + (tokenBlocks - 1) * computeSpacing;
             phaseStart = lastCompute + projectionIssueInterval -
-                         (4 + loadToIw);
+                         (weightLoadCycles + loadToIw);
             ++projectionBlock;
           }
+          if (serialValueBiasGroups && half == 0)
+            phaseStart = std::max(phaseStart, rawWriteEnd + 1);
         }
         for (PendingWeightReadDomain &domain : pendingWeightReads)
           flushPendingWeightRead(domain);
@@ -1821,6 +1895,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
 
         if (deferPostprocess && emitProjectionPass) {
           deferredRawWriteEnds[outputGroup] = rawWriteEnd;
+          if (serialValueBiasGroups)
+            phaseStart = std::max(phaseStart, rawWriteEnd + 1);
           continue;
         }
 
@@ -1892,7 +1968,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               const int64_t readCycle = copyCycle - readLatency(slice);
               const int64_t readQueue =
                   sourceHemisphere * memory.slices_per_hemisphere + slice;
-              const int64_t valueBank = placementBank("value");
+              const int64_t valueBank = layout.valuePackBank(headBlock);
               if (mergeValueCopyPairs)
                 pendingValueCopies.push_back(
                     {readCycle, readQueue, address, 32 + stream,
@@ -2643,7 +2719,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             for (int64_t half = 0; half < 2; ++half) {
                               const int64_t outputBlock =
                                   head * projectionHeadBlocks + blocks[half];
-                              const int64_t pair = (outputBlock / 2) % 2;
+                                  const int64_t pair = (outputBlock / 2) % biasPairs;
                               for (int64_t hemisphere = 0;
                                    hemisphere < memory.hemispheres;
                                    ++hemisphere) {
@@ -2957,7 +3033,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     : blocks[half];
                 const int64_t outputBlock =
                     head * projectionHeadBlocks + domainReductionBlock;
-                const int64_t pair = (outputBlock / 2) % 2;
+                              const int64_t pair = (outputBlock / 2) % biasPairs;
                 for (int64_t hemisphere = 0;
                      hemisphere < memory.hemispheres; ++hemisphere) {
                   for (int64_t byte = 0; byte < 2; ++byte) {
@@ -3793,9 +3869,14 @@ int64_t AttentionScheduleEmitter::emitProjections() {
     return std::max(phaseStart, postprocessReady) + 16;
   }
 
+  const int64_t dualWeightLoadCycles = 2 * weightLoadCycles;
   const int64_t weightLoadLead =
-      (target_.memory().hemispheres - 1) * 8 + 7 + weightToIw + 1;
+      target_.memory().hemispheres * dualWeightLoadCycles + loadToIw;
   int64_t projectionBlock = 0;
+  const auto projectionHead = [&](int64_t, int64_t headBase,
+                                  int64_t hemisphere) {
+    return headBase + hemisphere;
+  };
   for (int64_t projection = 0; projection < 3; ++projection) {
     const auto kind = projectionKind(projection);
     for (int64_t headBase = 0; headBase < projectionHeads[projection];
@@ -3811,31 +3892,51 @@ int64_t AttentionScheduleEmitter::emitProjections() {
         const int64_t weightBuffer =
             projectionBlock % target_.throughput().mxm_weight_buffers;
         for (int64_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
-          const int64_t head = headBase + hemisphere;
+          const int64_t head = projectionHead(projection, headBase, hemisphere);
           if (head >= projectionHeads[projection])
             continue;
-          for (int64_t pulse = 0; pulse < 8; ++pulse) {
-            const int64_t localMxm = pulse / 4;
-            const int64_t column = 3 - pulse % 4;
-            const int64_t cycle = dequantStart + hemisphere * 8 + pulse;
+          for (int64_t pulse = 0; pulse < dualWeightLoadCycles; ++pulse) {
+            const int64_t localMxm = pulse / weightLoadCycles;
+            const int64_t column = weightLoadCycles - 1 - pulse % weightLoadCycles;
+            const int64_t cycle = dequantStart + hemisphere * dualWeightLoadCycles + pulse;
             const int64_t address = layout.weightAddress(
                 kind, head * projectionHeadBlocks + localMxm, reductionBlock,
-                localMxm, pulse % 4);
+                localMxm, pulse % weightLoadCycles);
+            const int64_t outputBlock =
+                head * projectionHeadBlocks + localMxm;
+            const auto weightSlices = layout.weightSlices(kind, outputBlock);
+            const int64_t weightBank = layout.weightBank(kind, outputBlock);
+            const int64_t weightPage = layout.weightPage(kind, outputBlock);
             for (int64_t stream = 0; stream < 8; ++stream) {
-              const int64_t slice = layout.weightSlices()[stream];
-              emitMem(rewriter_, op_.getLoc(), cycle - readLatency(slice),
+              const int64_t slice = weightSlices[stream];
+              emitMem(rewriter_, op_.getLoc(),
+                      cycle - (localDequant
+                                   ? weightReadLatency(slice)
+                                   : readLatency(slice)),
                       hemisphere * target_.memory().slices_per_hemisphere +
                           slice,
-                      "read", address, 32 + stream, 1, 1, 0, "sram",
+                      "read", address,
+                      (localDequant ? weightStreamBase : 32) + stream,
+                      1, 1, 0, "sram",
                       functionArgumentIndex(projectionValues[projection]),
-                      layout.weightBank(kind));
+                      weightBank, weightPage);
             }
-            emitDequant(cycle, hemisphere, localMxm,
-                        projectionValues[projection],
-                        projectionScales[projection]);
-            emitMxm(rewriter_, op_.getLoc(), cycle + weightToIw,
+            if (pulse % weightLoadCycles == 0) {
+              if (localDequant)
+                emitMxmDequant(rewriter_, op_.getLoc(), cycle,
+                    hemisphere * 2 + localMxm,
+                    projectionScales[projection], weightLoadCycles, 1,
+                    functionArgumentIndex(projectionValues[projection]));
+              else
+                emitDequant(cycle, hemisphere, localMxm,
+                            projectionValues[projection],
+                            projectionScales[projection], weightLoadCycles);
+            }
+            emitMxm(rewriter_, op_.getLoc(), cycle + loadToIw,
                     hemisphere * 2 + localMxm, "iw", weightBuffer, column, 0, 0,
-                    1, 1, 0, 1, "stream", true, "supercell", 0, dataFormat);
+                    1, 1, 0, 1, "stream", true, "supercell", 0, dataFormat,
+                    localDequant ? "int8_dequant_bf16" : llvm::StringRef{},
+                    {}, localDequant ? weightStreamBase : -1);
           }
         }
 
@@ -3868,7 +3969,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 : target_.mxm_block_issue_interval();
         for (int64_t tokenBlock = 0; tokenBlock < tokenBlocks; ++tokenBlock) {
           for (int64_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
-            const int64_t head = headBase + hemisphere;
+            const int64_t head = projectionHead(projection, headBase, hemisphere);
             if (head >= projectionHeads[projection])
               continue;
             const int64_t computeCycle =
@@ -3879,19 +3980,21 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                           .getAs<mlir::IntegerAttr>("base_row")
                                           .getInt()
                                     : 0);
-            const int64_t outputAddress =
-                layout.projectionAddress(kind, head, tokenBlock);
+            // The projection address is in MEM, while each MXM owns a much
+            // smaller accumulator SRAM. Final reductions drain and clear the
+            // token block before the next head reuses these rows.
+            const int64_t accumulatorAddress = tokenBlock * tile;
             llvm::SmallVector<int64_t> segmentRows;
             llvm::SmallVector<int64_t> segmentStreams;
             const bool prefetchNextWeight =
-                !finalReduction && tokenBlock + 1 == tokenBlocks;
+                !localDequant && !finalReduction && tokenBlock + 1 == tokenBlocks;
             if (prefetchNextWeight) {
               const int64_t nextFirstCompute =
                   firstCompute + tokenBlocks * computeBlockCycles;
               const int64_t nextDequantStart =
                   nextFirstCompute - weightLoadLead;
               const int64_t switchRow =
-                  nextDequantStart + hemisphere * 8 + weightToIw - computeCycle;
+                  nextDequantStart + hemisphere * dualWeightLoadCycles + loadToIw - computeCycle;
               if (switchRow > 0) {
                 segmentRows.push_back(switchRow);
                 segmentStreams.push_back(0);
@@ -3939,12 +4042,12 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               }
               emitMxm(rewriter_, op_.getLoc(), segmentCycle, hemisphere * 2,
                       "compute", weightBuffer, 0, streamBase, 0, rows, 1,
-                      outputAddress, 1, destination, true, "supercell", 0,
+                      accumulatorAddress, 1, destination, true, "supercell", 0,
                       dataFormat);
               emitMxm(rewriter_, op_.getLoc(), segmentCycle, hemisphere * 2 + 1,
                       "compute", weightBuffer, 0,
                       streamBase + (inputDistributed16 ? 0 : 2), 4, rows, 1,
-                      outputAddress, 1, destination, true, "supercell", 0,
+                      accumulatorAddress, 1, destination, true, "supercell", 0,
                       dataFormat);
               rowOffset += rows;
             }
@@ -3957,23 +4060,38 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   computeCycle +
                   target_.throughput().accumulator_to_vxm_latency + offset;
               if (kind != AttentionProjectionKind::Value) {
+                const bool mirrorTable = kind == AttentionProjectionKind::Key;
+                const auto tableSlices = mirrorTable
+                    ? layout.ropeMirrorSlices() : layout.ropeSlices();
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                  const int64_t slice = layout.ropeSlices()[byte];
+                  const int64_t slice = tableSlices[byte];
                   emitMem(
-                      rewriter_, op_.getLoc(), vxmCycle - readLatency(slice),
+                      rewriter_, op_.getLoc(),
+                      vxmCycle +
+                          target_.throughput().mxm1_accumulator_latency -
+                          readLatency(slice),
                       hemisphere * target_.memory().slices_per_hemisphere +
                           slice,
                       "read",
-                      layout.ropeAddress(op_.getPositionOffset() + token),
+                      mirrorTable
+                          ? layout.ropeMirrorAddress(op_.getPositionOffset() + token, 0)
+                          : layout.ropeAddress(op_.getPositionOffset() + token),
                       40 + byte, 1, 1, 0,
-                      "sram", -1, ropeBank);
+                      "sram", -1, mirrorTable ? layout.ropeMirrorBank() : ropeBank);
                 }
               }
-              emitRopeOrCast(vxmCycle, hemisphere,
-                             kind != AttentionProjectionKind::Value,
-                             projectionValues[projection]);
+              if (offset == 0)
+                emitRopeOrCast(vxmCycle, hemisphere,
+                               kind != AttentionProjectionKind::Value,
+                               projectionValues[projection], tile);
+              // Final casts turn onto the reverse SR direction and return
+              // to the projection's own MEM hemisphere. Physical SR tests
+              // place the two RoPE results at ingress+13/+15 (casts at
+              // ingress+0/+2); ingress/egress commits add two cycles.
               const int64_t writeCycle =
-                  vxmCycle + (kind == AttentionProjectionKind::Value ? 1 : 2);
+                  vxmCycle +
+                  target_.throughput().mxm1_accumulator_latency +
+                  (kind == AttentionProjectionKind::Value ? 2 : 15);
               if (kind == AttentionProjectionKind::Query) {
                 const int64_t phase = (token % tile) / 8;
                 const int64_t localColumn = token % 8;
@@ -3983,7 +4101,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   for (int64_t byte = 0; byte < 2; ++byte) {
                     const int64_t stream = reduction * 2 + byte;
                     const int64_t slice = slices[localColumn * 2 + byte];
-                    emitMem(rewriter_, op_.getLoc(), writeCycle + slice / 4,
+                    emitMem(rewriter_, op_.getLoc(), writeCycle + 2 * reduction + slice / 4,
                             hemisphere *
                                     target_.memory().slices_per_hemisphere +
                                 slice,
@@ -3993,17 +4111,22 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             stream, 1, 1, 0, "sram", -1,
                             layout.queryIwBank(reduction));
                     finalWriteEnd =
-                        std::max(finalWriteEnd, writeCycle + slice / 4 + 1);
+                        std::max(finalWriteEnd, writeCycle + 2 * reduction + slice / 4 + 1);
                   }
                 }
               } else if (kind == AttentionProjectionKind::Key) {
                 for (int64_t byte = 0; byte < 4; ++byte) {
-                  emitMem(rewriter_, op_.getLoc(), writeCycle,
+                  const int64_t reduction = byte / 2;
+                  const int64_t slice = layout.keySlices(reduction)[byte % 2];
+                  const int64_t cycle = writeCycle + 2 * reduction
+                      + slice / target_.streams().mem_slices_per_register_group;
+                  emitMem(rewriter_, op_.getLoc(), cycle,
                           hemisphere * target_.memory().slices_per_hemisphere +
-                              byte,
-                          "write", outputAddress + offset, byte, 1, 1, 0,
-                          "sram", -1, keyBank);
-                  finalWriteEnd = std::max(finalWriteEnd, writeCycle + 1);
+                              slice,
+                          "write", layout.keyAddress(head, reduction,
+                              cacheTokenBlock + tokenBlock) + offset, byte, 1, 1, 0,
+                          "sram", -1, layout.keyBank(reduction));
+                  finalWriteEnd = std::max(finalWriteEnd, cycle + 1);
                 }
               } else {
                 const int64_t packedStream = (token % 8) * 2;
@@ -4014,7 +4137,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     const int64_t slice = slices[packedStream + byte];
                     emitMem(
                         rewriter_, op_.getLoc(),
-                        writeCycle +
+                        writeCycle + 2 * reduction +
                             slice /
                                 target_.streams().mem_slices_per_register_group,
                         hemisphere * target_.memory().slices_per_hemisphere +
@@ -4024,10 +4147,10 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                                 cacheTokenBlock + tokenBlock,
                                                 row),
                         reduction * 2 + byte, 1, 1, 0, "sram", -1,
-                        valueBank);
+                        layout.valuePackBank(reduction));
                     finalWriteEnd = std::max(
                         finalWriteEnd,
-                        writeCycle +
+                        writeCycle + 2 * reduction +
                             slice / target_.streams()
                                         .mem_slices_per_register_group +
                             1);
@@ -4065,68 +4188,53 @@ int64_t AttentionScheduleEmitter::emitProjections() {
     for (int64_t queryBlock = 0; queryBlock < tokenBlocks; ++queryBlock) {
       for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
         const auto &slices = layout.queryIwSlices(reduction);
-        for (int64_t phase = 0; phase < target_.throughput().tile_rows;
-             ++phase, ++copyCycle) {
-          for (int64_t stream = 0; stream < static_cast<int64_t>(slices.size());
-               ++stream) {
+        const int64_t phases = target_.throughput().tile_rows;
+        int64_t copyStride = phases;
+        for (int64_t stream = 0; stream < static_cast<int64_t>(slices.size());
+             ++stream) {
             const int64_t slice = slices[stream];
+            // A cross-hemisphere copy keeps its stream direction and crosses
+            // the entire VXM. Mirror west-origin queues so every byte enters
+            // near its first VALU and has the same end-to-end path length.
+            const int64_t bridgeColumn = source == 0
+                ? stream : target_.throughput().vxm_alus - 1 - stream;
             emitMem(
-                rewriter_, op_.getLoc(), copyCycle - readLatency(slice),
+                rewriter_, op_.getLoc(),
+                copyCycle + 1 - readLatency(slice),
                 source * target_.memory().slices_per_hemisphere + slice, "read",
-                layout.queryIwAddress(queryHead, reduction, queryBlock, phase),
-                32 + stream, 1, 1, 0, "sram", -1,
+                layout.queryIwAddress(queryHead, reduction, queryBlock, 0),
+                32 + stream, phases, 1, 1, "sram", -1,
                 layout.queryIwBank(reduction));
-            emitVxm(rewriter_, op_.getLoc(), op_.getInput(), copyCycle, stream,
+            emitVxmConfigured(rewriter_, op_.getLoc(), op_.getInput(),
+                    copyCycle, bridgeColumn,
                     "pass", "stream_i8", 32 + stream, 0.0f, "immediate", 0,
                     0.0f, "i8", stream, hemisphereName(source),
-                    hemisphereName(destination));
+                    hemisphereName(source), -1, 8, phases, 1);
             emitMem(
-                rewriter_, op_.getLoc(), copyCycle + 1 + slice / groups,
+                rewriter_, op_.getLoc(),
+                copyCycle + target_.throughput().vxm_alus + 2
+                    + slice / groups,
                 destination * target_.memory().slices_per_hemisphere + slice,
                 "write",
-                layout.queryIwAddress(queryHead, reduction, queryBlock, phase),
-                stream, 1, 1, 0, "sram", -1,
+                layout.queryIwAddress(queryHead, reduction, queryBlock, 0),
+                stream, phases, 1, 1, "sram", -1,
                 layout.queryIwBank(reduction));
-          }
+            // The next block reuses this slice's sole MEM ICU. Its read may
+            // start only after the current block's write run has drained.
+            copyStride = std::max(copyStride,
+                target_.throughput().vxm_alus + 2
+                    + slice / groups + phases
+                    + readLatency(slice));
         }
+        copyCycle += copyStride;
       }
     }
     copyCycle += 20;
   }
 
-  // Each hemisphere has two MXMs. Duplicate K's two 16-bit pairs onto slices
-  // 4..7 so MXM0 and MXM1 can consume the same KV head concurrently.
-  int64_t keyCopyCycle = copyCycle + 16;
-  for (int64_t keyHead = 0; keyHead < op_.getKvHeads(); ++keyHead) {
-    const int64_t hemisphere = keyHead % target_.memory().hemispheres;
-    const char *hemi = hemisphereName(hemisphere);
-    for (int64_t token = 0; token < op_.getKvSeqLen(); ++token, ++keyCopyCycle) {
-      for (int64_t byte = 0; byte < 4; ++byte) {
-        emitMem(rewriter_, op_.getLoc(), keyCopyCycle - readLatency(byte),
-                hemisphere * target_.memory().slices_per_hemisphere + byte,
-                "read",
-                layout.keyAddress(keyHead, 0, token / tile) + token % tile,
-                32 + byte, 1, 1, 0, "sram", -1, keyBank);
-      }
-      emitVxm(rewriter_, op_.getLoc(), op_.getKeyWeight(), keyCopyCycle, 0,
-              "pass", streamKind, 32, 0.0f, "immediate", 0, 0.0f, dataFormat, 0,
-              hemi, hemi);
-      emitVxm(rewriter_, op_.getLoc(), op_.getKeyWeight(), keyCopyCycle, 1,
-              "pass", streamKind, 34, 0.0f, "immediate", 0, 0.0f, dataFormat, 2,
-              hemi, hemi);
-      for (int64_t byte = 0; byte < 4; ++byte) {
-        const int64_t reduction = byte < 2 ? 0 : headBlocks / 2;
-        const int64_t slice = layout.keySlices(reduction)[byte % 2];
-        emitMem(rewriter_, op_.getLoc(), keyCopyCycle + 1 + slice / groups,
-                hemisphere * target_.memory().slices_per_hemisphere + slice,
-                "write",
-                layout.keyAddress(keyHead, 0, token / tile) + token % tile,
-                byte, 1, 1, 0, "sram", -1, layout.keyBank(reduction));
-      }
-    }
-    keyCopyCycle += 12;
-  }
-  return keyCopyCycle + 16;
+  // K is already in its allocated cache slices. Both MXMs can observe the
+  // same activation SR, so QK does not need unplanned copies on slices 0..7.
+  return copyCycle + 16;
 }
 
 mlir::LogicalResult AttentionScheduleEmitter::emitQk(
@@ -4162,7 +4270,19 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
     return wavefront
                ? compute - qkIwToComputeCycles -
                      localMxm * target_.throughput().tile_rows
-               : firstIwCycle + localMxm * 8 + reduction * tile / 8;
+               : firstIwCycle
+                   + localMxm
+                       * (layout.queryIwBank(0) == layout.queryIwBank(1)
+                              ? headBlocks * (tile / 8) : 8)
+                   + reduction * tile / 8;
+  };
+  const auto keyReadOwner = [&](std::size_t waveIndex, const auto& work) {
+    int64_t owner = work.local_mxm;
+    for (const auto& peer : stage_plan_.qk_waves[waveIndex].slots)
+      if (peer && peer->hemisphere == work.hemisphere
+          && peer->kv_head == work.kv_head)
+        owner = std::min(owner, peer->local_mxm);
+    return owner;
   };
 
   // Plan the complete QK input bundle before emitting any IR. Query-IW and
@@ -4206,11 +4326,14 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
                        layout.queryIwBank(reduction));
           }
         }
+        if (keyReadOwner(waveIndex, *work) != work->local_mxm)
+          continue;
         for (int64_t keyBlock = 0; keyBlock < keyBlocks; ++keyBlock) {
           const int64_t compute =
               reductionComputeCycle(firstComputeCycle, reduction) +
               keyBlock * issue;
-          for (int64_t slice : layout.keySlices(reduction)) {
+          for (int64_t byte = 0; byte < 2; ++byte) {
+            const int64_t slice = layout.keySlices(reduction)[byte];
             const int64_t latency = *target_.transport_latency(
                 target::StreamEndpoint::Mem,
                 target::StreamEndpoint::MxmActivation,
@@ -4222,6 +4345,22 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
       }
     }
     if (!qkResources.try_reserve_at(0, windows)) {
+      for (std::size_t lhs = 0; lhs < windows.size(); ++lhs)
+        for (std::size_t rhs = lhs + 1; rhs < windows.size(); ++rhs)
+          if (windows[lhs].resource == windows[rhs].resource
+              && windows[lhs].offset
+                  < windows[rhs].offset + windows[rhs].duration
+              && windows[rhs].offset
+                  < windows[lhs].offset + windows[lhs].duration) {
+            op_.output.emitError()
+                << "QK conflicting resource " << windows[lhs].resource
+                << " at [" << windows[lhs].offset << ", "
+                << windows[lhs].offset + windows[lhs].duration
+                << ") and [" << windows[rhs].offset << ", "
+                << windows[rhs].offset + windows[rhs].duration
+                << "), wave=" << waveIndex;
+            return mlir::failure();
+          }
       op_.emitError(
           "QK input placement has an overlapping MEM ICU/read-port bundle");
       return mlir::failure();
@@ -4295,7 +4434,8 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
       // Direct16 Q weights occupy E0..E15. Keep K activations on the
       // upper east streams so the next Q block can be loaded while the
       // current block computes.
-      const int64_t activationStream = 16 + work->local_mxm * 2;
+      const int64_t keyOwner = keyReadOwner(waveIndex, *work);
+      const int64_t activationStream = 16 + keyOwner * 2;
       const int64_t outputStream = work->local_mxm * 4;
       const int64_t phases = tile / 8;
       const int64_t firstSourcePhase = phases - 1;
@@ -4392,7 +4532,8 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
           emitMxm3D(
               rewriter_, op_.getLoc(), firstReductionIw, mxm, "iw", 0,
               firstSourcePhase, 0, 0, 0, 1, "stream", true, "supercell", 0,
-              dataFormat, llvm::StringRef{}, llvm::StringRef{}, iwDomain);
+              dataFormat, llvm::StringRef{}, llvm::StringRef{}, iwDomain,
+              work->local_mxm * 16);
         }
       } else {
         for (int64_t reduction = 0; reduction < headBlocks; ++reduction) {
@@ -4405,7 +4546,8 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
               firstReductionIw + reduction * iwReductionInterval, mxm, "iw",
               reduction % target_.throughput().mxm_weight_buffers,
               firstSourcePhase, 0, 0, 0, 1, "stream", true, "supercell", 0,
-              dataFormat, llvm::StringRef{}, llvm::StringRef{}, iwDomain);
+              dataFormat, llvm::StringRef{}, llvm::StringRef{}, iwDomain,
+              work->local_mxm * 16);
         }
       }
       const int64_t computeReductionInterval = keyBlocks * issue;
@@ -4415,15 +4557,13 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
               : 1;
       for (int64_t reduction = 0; reduction < headBlocks;
            reduction += keyReductionGroup) {
+        if (keyOwner != work->local_mxm) continue;
         const int64_t reductionCount =
             std::min<int64_t>(keyReductionGroup, headBlocks - reduction);
         const int64_t computeCycle = firstComputeCycle +
                                      reduction * computeReductionInterval;
         for (int64_t byte = 0; byte < 2; ++byte) {
-          const int64_t slice =
-              target_.throughput().mxms_per_hemisphere == 1
-                  ? layout.keySlices(reduction)[byte]
-                  : work->local_mxm * 4 + (reduction % 2) * 2 + byte;
+          const int64_t slice = layout.keySlices(reduction)[byte];
           const int64_t latency = *target_.transport_latency(
               target::StreamEndpoint::Mem,
               target::StreamEndpoint::MxmActivation,
@@ -4543,6 +4683,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
       }
     }
   }
+  // Each physical Query-IW or K-activation queue sees one input domain per
   // Each physical Query-IW or K-activation queue sees one input domain per
   // QK wave. The wave plan has already reserved the exact FU issue windows;
   // emit a single outer 3D loop only when the whole per-queue sequence is

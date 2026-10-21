@@ -32,14 +32,18 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
         || storageSlices < 2 * weightSlices
         || storageSlices % weightSlices != 0
         || streams.c2c_streams_per_direction <= 0
-        || throughput.mxms_per_hemisphere != 1)
+        || throughput.mxms_per_hemisphere < 1
+        || throughput.mxms_per_hemisphere > 2)
         return mlir::failure();
 
     const int64_t reductionBlocks = shape.k / tile;
     const int64_t projectionRowsPerWave =
         reductionBlocks * rowsPerWeightTile;
-    const int64_t projectionWaves =
-        shape.hidden / (memory.hemispheres * tile);
+    // With two MXMs per hemisphere, each hemisphere currently owns a full
+    // Gate/Up output copy; its page sequence must cover every physical pair.
+    const int64_t projectionWaves = shape.hidden
+        / ((throughput.mxms_per_hemisphere == 1
+               ? memory.hemispheres : 1) * tile);
     const int64_t sliceGroupCount = storageSlices / weightSlices;
     if (sliceGroupCount % 2 != 0) return mlir::failure();
     const int64_t splitProjectionGroupsPerRole = sliceGroupCount / 2;

@@ -114,8 +114,10 @@ int main()
     bool sawWestRopeHead = false;
     bool sawWestRopeLowTail = false;
     bool sawWestRopeHighTail = false;
+    bool sawWestRopeLowOutput = false;
+    bool sawWestRopeHighOutput = false;
     function.walk([&](schedule::VxmOp op) {
-        if (op.getCycle() == 10 || op.getCycle() == 11)
+        if (op.getCycle() >= 10 && op.getCycle() <= 12)
             ++ropeInstructions;
         if (op.getCycle() == 20) ++castInstructions;
         if (op.getCycle() == 20 && op.getQueue() == 15)
@@ -125,23 +127,32 @@ int main()
         if (op.getCycle() == 30 && op.getQueue() == 15)
             sawWestRopeHead = true;
         if (op.getCycle() == 31 && op.getQueue() == 13
-            && op.getLhsKind() == "alu" && op.getLhsIndex() == 15
-            && op.getRhsKind() == "alu" && op.getRhsIndex() == 14)
+            && op.getLhsKind() == "stream_f32" && op.getLhsIndex() == 16
+            && op.getRhsKind() == "stream_f32" && op.getRhsIndex() == 20)
             sawWestRopeLowTail = true;
         if (op.getCycle() == 31 && op.getQueue() == 10
-            && op.getLhsKind() == "alu" && op.getLhsIndex() == 12
-            && op.getRhsKind() == "alu" && op.getRhsIndex() == 11)
+            && op.getLhsKind() == "stream_f32" && op.getLhsIndex() == 24
+            && op.getRhsKind() == "stream_f32" && op.getRhsIndex() == 28)
             sawWestRopeHighTail = true;
+        if (op.getCycle() == 32 && op.getQueue() == 9
+            && op.getOpcode() == "pass" && op.getLhsIndex() == 12
+            && op.getOutputStream() == 0 && op.getOutputHemisphere() == "east")
+            sawWestRopeLowOutput = true;
+        if (op.getCycle() == 32 && op.getQueue() == 8
+            && op.getOpcode() == "pass" && op.getLhsIndex() == 14
+            && op.getOutputStream() == 2 && op.getOutputHemisphere() == "east")
+            sawWestRopeHighOutput = true;
     });
-    if (ropeInstructions != 6 || castInstructions != 2
+    if (ropeInstructions != 8 || castInstructions != 2
         || !sawWestCast15 || !sawWestCast14) {
         std::cerr << "unexpected VXM instruction counts: rope="
                   << ropeInstructions << ", cast=" << castInstructions << '\n';
         return 1;
     }
     if (!sawWestRopeHead || !sawWestRopeLowTail
-        || !sawWestRopeHighTail) {
-        std::cerr << "west RoPE does not follow C15-to-C10 propagation\n";
+        || !sawWestRopeHighTail || !sawWestRopeLowOutput
+        || !sawWestRopeHighOutput) {
+        std::cerr << "west RoPE does not preserve products and return through C9/C8\n";
         return 1;
     }
     return 0;

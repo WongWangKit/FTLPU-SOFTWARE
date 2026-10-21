@@ -161,6 +161,27 @@ try {
         || initializedOverlapPlans[1].earliest_mem_cycle != 40)
         throw std::runtime_error(
             "weight page ignored initialized SRAM release timeline");
+    auto gammaOverlapProgram = preloadProgram;
+    BinaryBinding gamma;
+    gamma.index = 2;
+    gamma.access = BindingAccess::Input;
+    gamma.element_type = BindingElementType::F16;
+    gamma.layout = BindingLayout::Fp16VxmGammaBroadcast;
+    gamma.base_row = 0;
+    gamma.instruction_count = 8;
+    gamma.address_stride = 1;
+    gamma.slices = alternateBankPreload.slices;
+    gamma.hemisphere_mask = 3;
+    gamma.bank = 0;
+    gammaOverlapProgram.bindings.push_back(gamma);
+    gammaOverlapProgram.timelines.push_back({"rmsnorm.feedback", 20, 40});
+    const auto gammaOverlapPlans = plan_weight_prefetches(gammaOverlapProgram);
+    if (gammaOverlapPlans.size() != 2
+        || !gammaOverlapPlans[0].pre_execution
+        || gammaOverlapPlans[1].pre_execution
+        || gammaOverlapPlans[1].start_cycle != 40)
+        throw std::runtime_error(
+            "weight page overwrote an input RMSNorm gamma before consumption");
     auto lowBandwidthHardware = preloadProgram.hardware;
     lowBandwidthHardware.lpu_clock_mhz = 1000;
     lowBandwidthHardware.ddr_peak_bandwidth_mbytes_per_second = 6400;
@@ -493,6 +514,20 @@ try {
         }
     };
     appendPacket(beforeSync.queues[0].commands, secondPacket);
+    // Decode mixes native MXM ND commands with direct MEM domains. This
+    // must still record MEM origins, including zero-wait SYNC boundaries.
+    QueueCommand nativeMxm;
+    nativeMxm.command = static_cast<isa::EncodedIcuCommand>(
+        isa::IcuCommandOpcode::Instruction);
+    nativeMxm.instruction_kind = InstructionKind::Mxm;
+    nativeMxm.word_count = 2;
+    const auto nativeMxmWord = isa::encode_mxm_instruction(
+        MxmControlInstruction::IW(0, 3));
+    nativeMxm.words[0] = static_cast<std::uint32_t>(nativeMxmWord);
+    nativeMxm.words[1] = static_cast<std::uint32_t>(nativeMxmWord >> 32);
+    beforeSync.queues.push_back(QueueProgram {QueueKind::MxmLoad, 0,
+        {encode_mxm_stream_nd_command(nativeMxm,
+            IcuMxmStreamNdSchedule {45, 1, {2, 1, 1}, {4, 1, 1}, {0, 0, 0}})}});
     auto withSync = beforeSync;
     auto& syncCommands = withSync.queues[0].commands;
     syncCommands.clear();
@@ -516,6 +551,9 @@ try {
     std::istringstream phaseInput(phaseBinary.str(), std::ios::in | std::ios::binary);
     const auto restoredPhases = without_compiled_mem_write_sync(read_binary_program(phaseInput));
     const auto& restoredQueue = restoredPhases.queues[0];
+    const auto& restoredMxm = restoredPhases.queues[1];
+    if (decode_mxm_stream_nd_command(restoredMxm.commands.back()).start_cycle != 45)
+        throw std::runtime_error("compiler SYNC rebind changed native MXM timing");
     if (decode_fu_3d_raw_packet_loop(restoredQueue, 0).wait_cycle != 40
         || decode_fu_3d_raw_packet_loop(restoredQueue,
             fu_3d_raw_packet_word_count(QueueKind::Mem, restoredQueue.commands[0])).wait_cycle != 0

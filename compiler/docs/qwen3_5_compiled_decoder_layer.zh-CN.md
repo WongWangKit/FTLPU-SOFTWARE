@@ -1,15 +1,30 @@
 # Qwen3.5 dense DeltaNet decoder 层验证
 
-## 当前整层入口：C++ 图级 lowering
+## 当前整层入口：单函数 Kernel IR 与共享子图识别
 
 整层验收使用 `qwen3_5_resident_decoder_layer_test.py` 的真实 checkpoint
-路径。`qwen3_5_logical_graph.py` 只生成 19 个逻辑 Kernel 子图、张量
+路径。`qwen3_5_logical_graph.py` 只生成逻辑算子、张量
 reshape/slice/repeat 视图和参数文件；不生成 Schedule，不决定 SRAM
 slice/bank、分页、Conv 分块、ALU 分配或周期。
 
-`ftlpu-graph-compile` 调用编译器库中的
-`LogicalKernelGraphToSchedule.cpp`，负责图级规划、生命周期分配、布局
-衔接和硬件分块，再复用原生 Kernel→Tensor→Stream→Schedule lowering。
+`ftlpu-graph-compile --emit-kernel` 只做语义导入，输出一个完整的
+`decoder_layer.kernel.mlir` 函数。reshape/slice/repeat 等逻辑连接用
+`ftlpu.kernel.indexed_view` 表达，包含元素索引而不包含物理地址。
+正式编译使用 `ftlpu-compile --input-stage kernel`，走已有 connected
+Kernel pass 和原生 Kernel→Tensor→Stream→Schedule lowerer。
+
+`match_decoder_graph` 是 dense 和 DeltaNet 共用的识别入口，内部保留
+softmax attention、Gated DeltaNet 和 FFN 三种独立模式。识别依赖
+算子类型和 SSA 连接，不依赖 Qwen 名称或 Python 节点名称。
+FFN 的 Gate/Up/Swish/Multiply/Down 由原来的 `match_ffn_graph` 和
+`lower_ffn` 一次处理，使用原有 FFN 权重页规划、hidden 布局和调度器。
+FFN 之前存在动态权重页时，整层规划器传递权重生命周期约束，不能把
+FFN 权重当成从程序入口一直常驻的常量。
+
+DeltaNet 的 Conv、归约、逐 token 状态更新仍有自己的分块方式；
+整层 connected Tensor 规划器统一收集 native task 的输入、输出和
+工作区，再决定存储位置。它与 dense 复用 native 子图 lowering，
+不是把整个 DeltaNet 强行交给 softmax attention 的固定布局规则。
 projection 的 N 分页、Conv 的双半球分块、归约的行分块和 Delta rule
 的逐 token 状态传递都在 C++ 中完成。生成的都是闭式 MEM 3D、SXM/
 VXM 2D 和 MXM 3D 域，不先展开 FU 指令再压缩。
@@ -32,6 +47,25 @@ emitter 直接写到该位置。没有逐算子 `archive()` 或输出归档阶�
 state 指向同一区域，原生 recurrent emitter 不再生成自复制。
 有快照或分支时分配独立状态区，不能用原地更新覆盖仍存活的值。
 
+权重页工作区按 `page_banks`、`page_slice_group_bases/counts` 和
+`page_base_rows/row_counts` 展开参与存储检查，不能只检查 placement
+里的默认 bank。工作区同时携带所属计算节点；只与保留值生命周期
+相交的工作区限制它的分配。当前真实尺寸测试的 recurrent state
+占用 East slice16–19、bank1 的完整 8192 行，RMSNorm gamma 工作区
+放到另一 bank，避免后续 FFN Up 的 bank1 权重页覆盖状态。
+
+分页输入也必须保留 native 工作区约束，不能因为它来自函数参数就
+跳过；尤其要保护跨 FFN 存活的 residual 和 post-attention norm。
+布局转换的常量 mask 同样由统一分配器分配，不固定在可被权重页
+覆盖的 slice。`connected_ffn_memory_lifetime_test` 使用 seq32、
+hidden1024、FFN3584 的随机 W8 权重，检查两 bank 权重页与保留值
+没有重叠，并保留一份真实尺寸状态区，强制 Down 输出使用非零起始行。
+Down 的写地址及 binding placement 都使用规划给出的 `base_row`，
+不能沿用独立 FFN 的第 0 行假设。测试通过 CModel 验证保留状态、
+residual、norm、Down 和最终输出。
+`decoder_graph_patterns_test` 另外覆盖去除节点名称后的子图识别、
+跨 scan 保留状态快照以及非法逻辑 view 的拒绝。
+
 ```powershell
 cmake --build build-ftlpu-vs2026 --config Release --target ftlpu_graph_compile ftlpu_compile compiled_stage_file_runner
 D:/Apps/Anaconda3/python.exe compiler/tests/qwen3_5_resident_decoder_layer_test.py `
@@ -50,12 +84,44 @@ FP32 recurrent state 更新、head norm/gate、out projection，以及两次
 residual、post-attention RMSNorm 和完整 Gate/Up/SwiGLU/Down FFN。
 只有一个连续计算程序，中间激活和状态不经过主机。
 
+2026-10-15 共享整层识别与原生 FFN 版本已通过真实权重验证。相对
+同一组 W8A16 权重的 FP32 参考，output NRMSE 为 0.8507%，
+recurrent state 为 0.5577%，Conv state 为 0.3735%；三者 cosine
+均大于 0.9999。静态执行及 drain 为 21,308,856 周期，11 个 epoch、
+17 次动态权重分页，共装载 21,626,880 bytes；中间 host 操作为 0。
+运行时权重等待另计，实际周期和初始数据装载以 runtime CSV 为准。
+编译程序为 1,088,289 bytes，实际加载的 runtime 程序为 1,083,308
+bytes。七项相关回归通过，包括非零 Down 结果起始行的数值测试。
+主程序物理 iMEM payload 为 656,440 bytes，容量和单 context 检查
+通过。runtime CSV 共 120,211 个压缩记录，包含初始输入和最终输出
+传输，最后结束周期为 21,492,416。
+
+2026-10-16 的入口布局更新让 C2C 将首个 RMSNorm 的激活直接写入
+`fp16_mxm_distributed_16`，gamma 直接写入
+`fp16_vxm_gamma_broadcast`。整图连接器不再先建立 pair-planar 输入、
+再用 MEM/VXM/MEM 转换。新 runtime CSV 在首个 RMSNorm 开始前没有
+MEM Read3D、Write3D 或 VXM 发射；首个 RMSNorm 从周期 33,913
+提前至 13,271。真实权重 seq32 整层数值仍通过：output NRMSE
+0.8507%、recurrent state 0.5577%、Conv state 0.3735%；runtime
+最后结束周期为 21,472,096。`qwen3_5_resident_decoder_layer_test.py`
+检查入口 binding 与原生 placement 一致，且 RMSNorm 前没有 MEM/VXM
+布局转换。
+
 当前图级调度保守串行执行算子，在每个 projection 前预留独占的 C2C
 ingress 窗口。compiler 的 `MEM_WRITE_SYNC` 和 page `SYNC` 承担真实
 DDR 延迟等待；后续算子可以复用 SR，不会把其未来使用错误地作为先前
 权重页的启动下限。窗口以 `c2c.window.binding:<index>.page:<page>`
 timeline 元数据传给页规划器，不改变硬件指令字段。该路径目前不宣称
 跨算子预取重叠或最优 TTFT。
+
+`lowering_path.json` 记录入口和实际匹配数量；`graph_plan.json` 的
+`native_ffn` 标记实际使用 dense FFN lowering 的节点，`stateful_mixer`
+标记 recurrent domain。整层应有一个 FFN 子图、一个 DeltaNet 子图；
+seq32 的 recurrence 当前展开为 32 个 token domain，但共享一份
+有整层生命周期的 FP32 状态。
+
+这里的闭式 ICU 域、全图存储规划和 FFN 复用不代表 DeltaNet 核心已经
+采用 chunked 算法；当前仍是逐 token 的 recurrent 实现。
 
 下文的串行 host-stage 及 Python resident linker 数据保留为历史测试记录。
 它们不再作为当前整层 lowering 入口。新的通过结论以 `continuous/summary.json`
@@ -75,6 +141,9 @@ epoch、13 次动态权重分页，21,626,880 bytes 经 DDR/C2C 装载。
 `runtime.pipeline.csv`。`operator_cycles.csv` 通过物理队列和 PC 匹配
 同次真实轨迹，给出各原生算子的首尾发射区间；独立布局搬运不计入
 算子区间。C++ 输出的 `graph_plan.json` 保存节点来源和编译周期域。
+区间匹配先用程序中的权重页 ready cycle 恢复 `SYNC_PAGE` 的 epoch
+起点，再按实际队列/PC 查询 runtime 发射。ICU CSV 自己回放得到的
+`start_cycle` 是不含动态等待的队列局部时间，不能直接当作全局周期。
 
 同日的图级输出直写版本已完成真实权重整层验证，输出、recurrent
 state、Conv state 三个文件与上述基线逐字节一致。三项 NRMSE 仍为
@@ -548,3 +617,265 @@ tokens/channels/activation 回归均通过。实际 runtime program
 context 检查通过。当前静态调度加 drain 为 413,842 cycle；
 主要收益是释放 ALU 和缩小程序，MEM 数据复制本身仍需要执行。
 所有最新结果继续更新 `results/qwen3_5_0_8b_prefill_frontend`。
+
+
+### Q/K 使用独立 L2Norm lowering（2026-10-18）
+
+Q/K 归一化保留 `ftlpu.kernel.l2_norm` → `ftlpu.tensor.l2_norm_task`
+→ `ftlpu.stream.l2_norm_task`，直接生成 MEM/SXM/VXM ICU 指令。
+计算为 `scale * x * rsqrt(sum(x*x) + epsilon)`；Q 的 scale 是
+`1/sqrt(128)`，K 为 1，epsilon 均为 `1e-6`。不再转换成 RMSNorm，
+不除以 hidden width，不缩放 epsilon，不分配或读取 gamma。
+Python 适配器只描述这个数学算子，物理布局与调度由 C++ lowering 完成。
+
+L2Norm 参考 RMSNorm 的 distributed16 和 VXM feedback 实现：
+平方/累加用 C0/C1，标量处理与乘回输入使用 C0–C3；另一半球镜像为
+C15/C14 和 C15–C12。归约按 FP32 累加，反馈标量按现有 MEM 数据通路
+存为 BF16/F16；Q 的 scale 保留 FP32 立即数。去掉 gamma 乘法后，
+输入直通少一拍，MEM 写回时间相应提前一拍。
+
+需要区分两种 distributed16 布局。Conv 的输出原来标为
+`fp16_vxm_distributed_16`，但写入实际上按 token 分 slice、feature 在
+SR 向量内，对应 `fp16_mxm_distributed_16`，现已修正。L2Norm 通过
+与 RMSNorm 相同的 SXM 转置获得按 feature 分 slice 的 VXM 布局，
+归一化后再恢复输出布局，不能仅更改布局名称就跳过必要的转置。
+
+`l2norm_runtime_test.py` 检查宽度 32/128/256、全零、全 1、小幅值输入、
+不同 epsilon 和非二次幂 scale，并回归 RMSNorm。
+`qwen3_5_qkv_conv_prefill_test.py --with-qk-norm` 检查真实 seq32 权重，
+同时断言编译后的 Q/K kernel 与 schedule 保持 L2Norm，无 RMSNorm 替代。
+
+修正后的真实权重 seq32 QKV → Conv1D+SiLU → Q/K L2Norm 测试通过：
+Q NRMSE 0.38683%，K NRMSE 0.41230%，运行 580,647 cycle，
+4 个执行 epoch、3 个动态权重页、0 个 host operation。
+`results/qwen3_5_0_8b_qkv_conv_qk_norm_prefill` 保存最新 runtime pipeline、
+实际 ICU program、图和数值摘要。本轮没有运行完整 decoder 层。
+
+### L2Norm 直接消费 Conv 分组布局（2026-10-18）
+
+图内存规划现在识别 `[tokens, groups * width]` 的分组列视图。对于
+原生 MXM distributed16 producer，将各组的 placement、列偏移和物理
+行宽交给 L2Norm emitter；由它直接从 producer 读取每组数据，完成
+必要的 SXM 转置，不再先用通用 layout bridge 拼接完整 Q/K 输入。
+这是一条通用的分组 L2 lowering，不依赖 Qwen 模型名称。
+
+归一化结果直接写入 `[tokens, groups * width]` 的 distributed16
+存储，`storage_shape` 与逻辑 reshape 分开记录。后续消费者若要求
+不同物理布局，通用搬运必须依据这个实际存储形状计算地址；不能仅因
+逻辑 shape 和布局名称相同就直接 alias。测试输出使用原生布局的
+runtime unpack，避免为了读取结果而生成末尾的 MEM/VXM planar 整理。
+
+当前仍保留每个转置 tile 的被动 SR 跨半球复制：现有双侧反馈链要求
+两份相同输入，单侧 Conv producer 需补齐另一侧。这段只有 MEM
+read/write，不执行 ALU cast/bypass。它没有重新物化整块 Q/K 输入。
+SXM 转置、平方和反馈标量的存取、归一化输入重读和最终写回仍会出现在
+流水图中；不能把所有 MEM read/write 都当作纯搬运。
+
+真实权重 seq32 的 QKV → Conv1D+SiLU → Q/K L2Norm 测试通过：
+
+| 指标 | 修改前 | 修改后 |
+|---|---:|---:|
+| runner `cycles` | 580,647 | 340,779 |
+| Q NRMSE | 0.38683% | 0.38683% |
+| K NRMSE | 0.41230% | 0.41230% |
+| 编译产物文件大小（含元数据，非纯 iMEM） | 400,651 bytes | 337,920 bytes |
+
+运行计数减少 239,868 cycle（41.3%）。动态权重页仍为 3 个，运行期
+等待仍为 20,858 cycle，host operation 仍为 0。runtime pipeline 的
+`Session.Invocation` 区间为 `[4248,366013)`，随后是诊断输出 C2C
+读回 `[366013,373339)`；这些绝对时间与 runner 的计数口径不同。
+
+独立 L2Norm（32/128/256 维）和 RMSNorm 回归通过；新增两种真实
+Conv → 分组 L2 → 原生读回测试，分别覆盖 4×32 和 2×128，最大逐行
+NRMSE 为 0.4343% 和 0.3866%。真实模型测试还覆盖多个 producer、
+东西两侧分块及最终 token/head 顺序，并断言输出不再回到 planar。
+
+### β 和 g 门控分支（2026-10-19）
+
+在上述 seq32 子图测试上使用 `--with-gates`，加入真实 layer-0 的
+`in_proj_b`、`in_proj_a`、`dt_bias` 和 `A_log`：
+
+```
+b = x @ W_b.T
+a = x @ W_a.T
+beta = sigmoid(b)
+g = -exp(A_log) * softplus(a + dt_bias)
+```
+
+这里 x 是测试预先准备的 RMSNorm 输出；RMSNorm 没有编入本次程序。
+两路 projection 输入均为 `[32,1024]`，真实权重均为 `[16,1024]`，
+采用现有 W8A16 projection lowering。β、g 输出均为 `[32,16]` FP32，
+g 为非正的 log-decay，尚未计算 `exp(g)` 或执行 recurrent state 更新。
+本次也没有加入 z、输出投影、残差或 FFN。
+
+Python 只导入数学 `sigmoid` / `softplus` 节点和常量 checkpoint 数据；
+`-exp(A_log)` 可以在导入时常量折叠。C++ 在 vector memory planning
+之前展开非线性运算，随后通过现有 MEM/VXM ICU 路径执行：
+
+- sigmoid 使用 negate、exp、add、reciprocal。
+- softplus 使用稳定形式 `max(x,0) + 2*atanh(t)`，
+  `t=exp(-abs(x))/(2+exp(-abs(x)))`，用六项奇数多项式近似 atanh。
+  exp 输入不大于零，多项式截断误差小于 `1.1e-7`。
+
+后者是多项式理论截断误差，并非硬件总误差：现有 SFU LUT 结果按
+FP16 舍入并 flush-to-zero，外层 FP32 存储不会改变这一点。
+独立 `vector_nonlinear_runtime_test.py` 覆盖宽度 16/32、logit ±80、
+零和近零值；最大绝对误差为 sigmoid `4.115e-4`、softplus `1.833e-4`。
+当前 vector lowering 仍逐操作存取中间值，尚未将门控链融合为一条
+多 ALU 流水，因此流水图中会看到门控内部的中间 MEM read/write。
+
+真实权重连续 ICU 执行检查通过：
+
+| 输出 | NRMSE | cosine |
+|---|---:|---:|
+| Q L2Norm | 0.38683% | 0.99999252 |
+| K L2Norm | 0.41230% | 0.99999150 |
+| β | 0.06691% | 0.99999978 |
+| g | 0.12094% | 0.99999927 |
+
+runner `cycles=473741`，6 个执行 epoch、5 个动态权重页，权重传输
+6,422,528 bytes，运行期等待 20,888 cycle，host operation 为 0。
+这些计数与 pipeline 的绝对时间不同：初始输入加载包含在 runtime
+pipeline 内，`Session.Invocation` 为 `[4424,499181)`，其后另有诊断输出读回。
+最新结果仍更新 `results/qwen3_5_0_8b_qkv_conv_qk_norm_prefill`，包含
+四个输出、`summary.json`、`runtime.pipeline.csv` 和每队列的
+`runtime_icu_programs/*.icu.csv`（来自实际运行的 program）。
+
+新增 a/b 权重页同时暴露并修复了分页结果同步的 SR 复用误判：
+后续 L2Norm MEM write 与早先 MXM result 使用相同 SR 编号时，
+必须检查该 write 是否仍处于对应 compute packet 的结果到达时间范围。
+否则不能把它标成 MXM result writer 并据此调整整个 epoch 的释放相位。
+`c2c_weight_ping_pong_test` 覆盖此用例，并保留动态延迟页的实际 ICU
+结果到达与 MEM write 对拍验证。
+
+### β/g 保留 projection 打包布局（2026-10-19）
+
+门控不再将 `[32,16]` 的 a/b 拆成逐标量广播。通用 vector memory
+planning 支持最后一个物理向量只有部分有效 lane：每个 token 使用
+一个 32-lane word，其中前 16 lane 对应 16 个 head。物理行数按
+`tokens * ceil(columns / word_elements)` 分配，逻辑 shape 保持不变。
+逐元素计算不跨 lane 归约，padding lane 不影响有效输出。
+
+图规划器识别 projection 的 paired-planar 列块视图，直接将 a/b
+输入绑定到 producer 的东侧 byte-plane pair，不生成输入复制或
+SXM transpose/permute。`dt_bias` 和 `-exp(A_log)` 以同样的 head lane
+顺序由 C2C 写入 packed FP32 常量向量，MEM Read3D 对每个 token
+重复读取这个 word；对于多 word 的向量则按列块推进常量地址。
+
+β/g 最终输出为 packed `fp32_quad_planar`，各占 32 个物理 word，
+由现有 runtime unpack 读回逻辑 `[32,16]`。C2C planar 传输支持
+部分占用的尾部 word。Python 中的门控数学图保持不变，物理选择仍由
+C++ 完成。Q/K L2Norm 的 SXM 布局变换保留；门控内部逐操作中间值
+仍有 MEM 存取，本次没有实现跨算子的多 ALU 融合。
+
+回归覆盖 packed 宽度 16/32/48/65 的 sigmoid、softplus，以及带
+per-head bias 和 scale 的 softplus，包含多列块、非整 word 尾部、
+正负大值和近零输入。真实模型测试另外断言 β/g 输出布局及物理行数，
+并检查 Q/K L2Norm 之后没有新增 SXM 指令。
+
+真实权重 seq32 的 QKV → Conv1D+SiLU → Q/K L2Norm → β/g 连续测试已通过，
+仍为一个 ICU program、6 个 epoch、5 个权重页、0 个 host 运算。
+总运行周期由上一版 473,741 降为 384,882（减少 18.76%）；门控节点的
+静态调度区间为 `[379924,384755)`，不再包含 a/b 的 SXM 解包。
+Q/K/β/g 的 NRMSE 分别为 0.00386831、0.00412300、0.000669082、
+0.00120941，与修改前一致。结果覆盖原来的
+`results/qwen3_5_0_8b_qkv_conv_qk_norm_prefill`，包含实际执行后的
+`runtime.pipeline.csv` 和 `runtime_icu_programs/`，并非完整 decoder 测试。
+
+常量存储在生成执行指令前统一预留。消费者改换半球时复用原有不可变
+常量绑定，通过 MEM/SR 送到最终消费位置，避免晚分配的初始上传常量
+落入早期 Conv 输出会覆盖的地址。此次也修正了分页释放时对权重读和
+激活读的区分，以及带显式首发等待的 MXM 域的相位计算；分页回归和
+12 组 packed 非线性数值回归均通过。
+
+### β/g 的 VXM 链融合（2026-10-19）
+
+C++ vector lowering 在生成 ICU/FU 域之前识别连续的单消费者 FP32 边，
+将链头的流输入和后续 immediate 运算连到相邻 ALU，按照 exp 与
+reciprocal/rsqrt 的列位置插入必要的传递列。只有链末尾写回 MEM。
+多处使用的值、需要另一路流输入的后继、归约，以及会改变中间量精度的
+边保留为链边界。本版本未实现任意 DAG 的 SR 保留与多输入供数融合。
+内存规划采用同一份链划分，将链头输入的生命周期延长到链末尾，避免
+中间 scratch 复用引起同一个 MEM ICU 队列读写重叠。
+
+本测试 β 对应 C8 negate → C9 exp → C10 add(1) → C11 reciprocal，
+C12 负责最终输出；输入一次读取，结果一次写回。g 的 24 个独立计算阶段
+合并成 15 条链，包含 max→negate→exp、add→reciprocal，以及多项式的
+multiply→add。整个门控节点从 28 个计算阶段降为 16 条链。
+静态门控区间从 `[379924,384755)` 缩短到 `[379924,382697)`，
+即 4,831 → 2,773 周期（减少 42.60%）。
+
+真实权重 seq32 连续测试再次通过：CModel 报告的执行周期为 382,824
+（上一版 384,882），Q/K/β/g 误差与上一版一致，host 运算仍为 0。
+runtime pipeline 中 β 链配置位于 cycle 405257，C8～C12 同时配置，
+数据按实际 ALU 延迟沿 previous-result SR 依次流动；这些配置区间不表示
+同一数据在同一拍完成所有运算。该 CSV 时间轴包含初始数据传输，与
+仅统计执行的 runner cycles 不同。仍覆盖同一 results 目录。
+
+12 组非线性回归覆盖宽度 16/32/48/65；除数值比较外，sigmoid 的
+runtime trace 断言只有一组四字节平面输入读和输出写，且四个数学运算
+处于同一条物理 ALU 链。模型编译回归同时检查 β 链及 g 的乘加融合。
+
+### β/g 按 token 双侧并行（2026-10-19）
+
+图规划器将单 word 宽度、无归约的逐元素子图按 token 切成两个独立分区。
+seq32 对应 `delta_gates.tokens0`（token 0～15，C0→C7）和
+`delta_gates.tokens16`（token 16～31，C15→C8）。两侧同时执行相同
+的 β/g 链，常量保留 per-head 广播，scratch 和输出分别位于 West/East。
+布局、token 视图和镜像 ICU 域均由 C++ 生成，Python 数学图未增加
+硬件调度信息，CModel 未添加模型算子。
+
+后半 token 直接读取 projection 的 native packed 行视图；前半 token
+经 MEM/SR 分发到另一侧，使两侧具有独立 MEM ICU 队列。最终测试输出
+通过 packed MEM/SR 合并回 `[32,16]`，没有 SXM 转置或逐标量展开。
+这两处搬运目前仍存在。两侧输出使用 SR16，避免覆盖对侧正在传输的
+SR0/SR8 原始输入；链内 FP32 中间值沿各自方向传递。
+
+真实权重测试通过，Q/K/β/g 误差与上一版完全一致。两侧静态计算区间均为
+`[380622,382625)`，跨度 2,003 周期，相比单侧 2,773 周期缩短 27.77%。
+但是计入新增分发和结果合并后，runner 总执行周期为 383,623，
+比单侧版 382,824 增加 799 周期（约 0.21%）；此次实现了双侧并行，
+尚未获得整个测试的净加速。后续性能优化需将 token 分区前推到 producer
+的输出规划，并让后续 consumer 直接读取分区输出。
+
+更新后的 runtime pipeline 在 cycle 405955 同时出现两条 β 链：
+`C0 negate → C1 exp → C2 add → C3 reciprocal → C4 输出` 和
+`C15 negate → C14 exp → C13 add → C12 reciprocal → C11 输出`。
+回归包括真实 seq32，以及独立逐元素图的 seq1/5/32：验证单 token 回退、
+奇数 token 切分、数值和输出顺序、真实 ICU trace 双侧同时启动。
+
+### β/g producer 直接分区与原位读回（2026-10-20）
+
+C++ 图规划将仅供窄逐元素分区使用的 a/b projection 结果直接规划为
+`token_partition_planar`。第一个 feature word 的 token 0～15 沿 SR
+被动跨半球，到 West MEM slice 0/1 bank1；token 16～31 在 East 同一
+slice/bank 写入。b、a 的 base row 分别为 4480、4512。该过程直接消费
+MXM 结果流，不再先完整落 MEM，再用 MEM read/write 分发输入，也不发
+VXM bypass。两个半区的 MEM 写入仍是各自连续的 WRITE_3D 域。
+
+β/g 两个输出保留同地址、不同半球的 FP32 四字节平面布局，分别使用
+slice 20～23、24～27 的 bank1/base0。最终 output binding 描述 token
+分区，runtime 读回按逻辑 token 顺序恢复 `[32,16]`，不再执行芯片内结果
+合并。新布局属于通用 tensor 存储描述，支持 BF16/FP32、奇数行、跨 word
+列和非单位地址步长；CModel 未增加模型级算子。后续算子仍需按实际输入
+布局规划，不能据此假定所有 consumer 都已经无搬运。
+
+动态分页结果写入的对齐也保留部分 tile 的起始 token 偏移，避免将仅接收
+后 16 个 token 的 WRITE_3D 错移到第一个 token。回归实际 tick ICU 并延后
+page-ready，检查非零结果 SR、首写周期与连续写入次数。
+
+真实权重 seq32 的 QKV＋Conv1D/SiLU＋Q/K L2Norm＋β/g 测试通过：
+
+| 指标 | 上一双侧版 | 直接分区版 |
+|---|---:|---:|
+| runner 执行周期 | 383,623 | 382,361 |
+| 两侧门控静态起点 | 380,622 | 380,231 |
+| 门控计算跨度 | 2,003 | 2,003 |
+| epoch / 权重页 | 6 / 5 | 6 / 5 |
+| host 运算 | 0 | 0 |
+
+总周期减少 1,262（0.329%）；相比单侧版 382,824，减少 463 周期。
+Q、K、β、g 的 NRMSE 分别为 0.00386831、0.00412300、0.000669082、
+0.00120941，与上一版一致。runtime pipeline 的 C0/C15 β 链同时在
+cycle 405564 启动。原目录的 runtime pipeline、执行后二进制和每 ICU
+指令 CSV 已更新；测试范围仍不含 recurrent DeltaNet、输出门控和 FFN。

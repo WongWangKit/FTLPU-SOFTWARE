@@ -114,6 +114,56 @@ def graph_layer(x, weights, packed, scales, config):
     return graph, output
 
 
+def dense_layer_source(seq, config, scales):
+    """One logical decoder function for the ordinary dense graph matcher."""
+    import re
+    hidden, inner = config['hidden_size'], config['intermediate_size']
+    width = config['num_attention_heads']*config['head_dim']
+    kv = config['num_key_value_heads']*config['head_dim']
+    ty = LogicalGraph.type
+    matrix = ty((seq,hidden),'bf16')
+    gate = ty((seq,width),'bf16')
+    ffn = ty((seq,inner),'bf16')
+    args = [('x',matrix),('input_gamma',ty((hidden,),'bf16')),
+        ('qw',ty((hidden,width),'i8')),('kw',ty((hidden,kv),'i8')),
+        ('vw',ty((hidden,kv),'i8')),('ow',ty((width,hidden),'i8')),
+        ('qn',ty((config['head_dim'],),'bf16')),('kn',ty((config['head_dim'],),'bf16')),
+        ('attention_gate_weight',ty((hidden,width),'i8')),
+        ('post_gamma',ty((hidden,),'bf16')),('fw_gate',ty((hidden,inner),'i8')),
+        ('fw_up',ty((hidden,inner),'i8')),('fw_down',ty((inner,hidden),'i8'))]
+    lines=['module { func.func @decoder_layer('+', '.join('%'+n+': '+t for n,t in args)+') -> '+matrix+' {']
+    def op(name,kind,operands,types,result,attrs=''):
+        lines.append(f' %{name} = "ftlpu.kernel.{kind}"('+', '.join('%'+v for v in operands)+f') {{{attrs}}} : ('+', '.join(types)+f') -> {result}')
+    eps=config['rms_norm_eps']
+    op('normalized','rms_norm',['x','input_gamma'],[matrix,ty((hidden,),'bf16')],matrix,f'axis = -1 : i64, epsilon = {eps:.9e} : f32')
+    def project(name,value,weight,m,n,k,scale):
+        op(name,'matmul',[value,weight],[ty((m,k),'bf16'),ty((k,n),'i8')],ty((m,n),'bf16'),
+            f'm = {m} : i64, n = {n} : i64, k = {k} : i64, unit = "MXM", rhs_scale = {scale:.9e} : f32')
+    project('attention_gate','normalized','attention_gate_weight',seq,width,hidden,scales['attention_gate'])
+    body=attention_source(seq,config,scales).splitlines()[1:-2]
+    replacements={'a':'normalized','gate':'attention_gate','output':'attention'}
+    for line in body:
+        lines.append(re.sub(r'%([A-Za-z_][A-Za-z_0-9]*)',lambda m:'%'+replacements.get(m[1],m[1]),line))
+    op('residual','elementwise',['x','attention'],[matrix,matrix],matrix,'kind = "add"')
+    op('post_norm','rms_norm',['residual','post_gamma'],[matrix,ty((hidden,),'bf16')],matrix,f'axis = -1 : i64, epsilon = {eps:.9e} : f32')
+    project('ffn_gate','post_norm','fw_gate',seq,inner,hidden,scales['gate'])
+    project('ffn_up','post_norm','fw_up',seq,inner,hidden,scales['up'])
+    op('ffn_silu','swish',['ffn_gate'],[ffn],ffn)
+    op('ffn_inner','elementwise',['ffn_silu','ffn_up'],[ffn,ffn],ffn,'kind = "multiply"')
+    project('ffn_down','ffn_inner','fw_down',seq,hidden,inner,scales['down'])
+    op('result','elementwise',['residual','ffn_down'],[matrix,matrix],matrix,'kind = "add"')
+    return '\n'.join(lines+[f' return %result : {matrix}','} }'])
+
+
+def dense_layer_inputs(x, weights, packed):
+    return [(x,'bf16'),(bf16(1+weights['input_layernorm']),'bf16')]+[
+        (packed[n].T.copy(),'i8') for n in ('query','key','value','output')]+[
+        (bf16(1+weights['self_attn.'+n+'_norm']),'bf16') for n in ('q','k')]+[
+        (packed['attention_gate'].T.copy(),'i8'),
+        (bf16(1+weights['post_attention_layernorm']),'bf16')]+[
+        (packed[n].T.copy(),'i8') for n in ('gate','up','down')]
+
+
 def reference_attention(n, w, c):
     """FP32 attention in original checkpoint head/rotary order."""
     rms = lambda x, gamma: x/np.sqrt(np.mean(x*x,axis=-1,keepdims=True)+c['rms_norm_eps'])*(1+gamma)

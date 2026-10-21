@@ -236,10 +236,25 @@ std::vector<InitializedInternalRegion> initialized_internal_regions(
     const BinaryProgram& program)
 {
     std::vector<InitializedInternalRegion> regions;
+    std::vector<std::uint64_t> rmsnormReleases;
+    for (const BinaryTimeline& timeline : program.timelines)
+        if (timeline.name == "rmsnorm.feedback")
+            rmsnormReleases.push_back(timeline.end_cycle);
+    std::ranges::sort(rmsnormReleases);
+    std::size_t gammaOrdinal = 0;
     for (const BinaryBinding& binding : program.bindings) {
-        if (binding.access != BindingAccess::Internal
-            || binding.initializer == BindingInitializer::None
-            || binding.base_row < 0 || binding.instruction_count <= 0)
+        // A non-paged RMSNorm gamma is uploaded before execution just like an
+        // initialized internal constant.  Compact decode may stage the first
+        // gamma on weight slices, so the second Q page must not be preloaded
+        // into that bank before the first RMSNorm has consumed it.
+        const bool stagedGamma = binding.access == BindingAccess::Input
+            && binding.layout == BindingLayout::Fp16VxmGammaBroadcast
+            && !binding.paged_weight;
+        if (!stagedGamma
+            && (binding.access != BindingAccess::Internal
+                || binding.initializer == BindingInitializer::None))
+            continue;
+        if (binding.base_row < 0 || binding.instruction_count <= 0)
             continue;
         const auto stride = static_cast<std::uint64_t>(
             std::max<std::int64_t>(1, std::abs(binding.address_stride)));
@@ -249,7 +264,13 @@ std::vector<InitializedInternalRegion> initialized_internal_regions(
                 * stride;
         const auto end = std::min<std::uint64_t>(
             std::numeric_limits<std::uint32_t>::max(), last + 1);
-        const auto release = initialized_binding_release_cycle(program, binding);
+        auto release = initialized_binding_release_cycle(program, binding);
+        if (stagedGamma) {
+            release = gammaOrdinal < rmsnormReleases.size()
+                ? rmsnormReleases[gammaOrdinal]
+                : std::numeric_limits<std::uint64_t>::max();
+            ++gammaOrdinal;
+        }
         for (const std::uint16_t slice : binding.slices)
             regions.push_back({
                 {binding.bank, binding.hemisphere_mask, slice,
@@ -535,8 +556,13 @@ void schedule_weight_prefetches(const BinaryProgram& program,
         // Do not arm a later page in an earlier idle window: its blocked MEM
         // queue could otherwise fence consumers of preceding pages while its
         // ordered DMA descriptor has not yet reached the launch boundary.
-        plan.earliest_mem_cycle = std::max(
-            reusableCycles[index], nextTransportCursor);
+        // Usually keep MEM arming in transport order. When the ordered DMA
+        // launch is already later than this page's nominal consumer, the
+        // synchronized MEM packet must instead be armed after SRAM release
+        // but before that consumer; it can wait for the future DMA event.
+        plan.earliest_mem_cycle = nextTransportCursor > plan.ready_cycle
+            ? reusableCycles[index]
+            : std::max(reusableCycles[index], nextTransportCursor);
         // Once every overlapping SRAM region has been released, retaining
         // the transfer until just before its consumer only reduces the time
         // available to absorb DDR latency and jitter. Launch at the earliest

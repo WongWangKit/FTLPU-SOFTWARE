@@ -63,6 +63,9 @@ try {
               << " measured_cycles=" << cycles
               << " mxms_per_hemisphere="
               << program.hardware.mxms_per_hemisphere
+              << " tile_rows=" << program.hardware.tile_rows
+              << " mxm_rows=" << program.hardware.mxm_rows
+              << " bytes_per_word=" << program.hardware.bytes_per_word
               << " vxm_alus=" << program.hardware.vxm_alus << '\n';
     std::vector<const ftlpu::software::runtime::QueueProgram*> queues;
     queues.reserve(program.queues.size());

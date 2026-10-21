@@ -221,6 +221,8 @@ MxmLoadOp emitFfnWeightTile(
   mlir::Value readValue;
 
   if (localDequant) {
+    const bool columnLoad = throughput.mxm_prefill_weight_streams == 1;
+    const int64_t loadCycles = columnLoad ? throughput.mxm_rows : duration;
     const int64_t packedLoadsPerDirectLoad =
         (throughput.mxm_load_streams_per_cycle +
          throughput.mxm_int8_load_streams_per_cycle - 1) /
@@ -244,8 +246,8 @@ MxmLoadOp emitFfnWeightTile(
                                  slice)
               .value_or(slice / target.streams().mem_slices_per_register_group +
                         2);
-      auto placement = schedule_placement(rewriter, {slice}, baseRow, duration,
-                                          1, hemi, "schedule_slice", bank);
+      auto placement = schedule_placement(rewriter, {slice}, baseRow + (columnLoad ? duration - 1 : 0), duration,
+                                          columnLoad ? -1 : 1, hemi, "schedule_slice", bank);
       mlir::NamedAttrList attributes(placement);
       attributes.set("binding_placement",
                      bindingPlacement ? bindingPlacement
@@ -253,16 +255,17 @@ MxmLoadOp emitFfnWeightTile(
       if (pageIndex >= 0) {
         attributes.set("weight_page", rewriter.getI64IntegerAttr(pageIndex));
         attributes.set("logical_base_row",
-                       rewriter.getI64IntegerAttr(logicalBaseRow));
+                       rewriter.getI64IntegerAttr(logicalBaseRow + (columnLoad ? duration - 1 : 0)));
       }
       auto read = emitFfnMemRead3D(
-          rewriter, location, rawRoute.getInput(), startCycle - latency, duration,
-          streamBase + stream, 1,
+          rewriter, location, rawRoute.getInput(), startCycle - latency + (columnLoad ? stream : 0), duration,
+          streamBase + (columnLoad ? 0 : stream), 1,
           slice / target.streams().mem_slices_per_register_group + 1,
           rewriter.getStringAttr(directionName),
           rewriter.getStringAttr("weight_i8"), rawRoute.getAddress(),
           attributes.getDictionary(rewriter.getContext()),
           duration * throughput.lanes_per_tile, domain);
+      if (columnLoad) read->setAttr("repeat_interval", rewriter.getI64IntegerAttr(8));
       readValue = read.getOutput();
     }
 
@@ -276,7 +279,7 @@ MxmLoadOp emitFfnWeightTile(
         rewriter.getNamedAttr("unit_id", rewriter.getI64IntegerAttr(unit)),
         rewriter.getNamedAttr("scale", rewriter.getF32FloatAttr(scale)),
         rewriter.getNamedAttr("repeat_count",
-                              rewriter.getI64IntegerAttr(duration)),
+                              rewriter.getI64IntegerAttr(loadCycles)),
         rewriter.getNamedAttr("repeat_interval", rewriter.getI64IntegerAttr(1)),
     });
     const int64_t scaleBinding = functionArgumentIndex(rawRoute.getInput());
@@ -311,10 +314,10 @@ MxmLoadOp emitFfnWeightTile(
       auto load = rewriter.create<MxmLoadOp>(
           location, readValue,
           startCycle + (flatLoadDomain ? 0 : group * control.group_interval),
-          duration, streamBase,
-          throughput.mxm_int8_load_streams_per_cycle, unit, groupBuffer);
+          loadCycles, streamBase,
+          columnLoad ? 1 : throughput.mxm_int8_load_streams_per_cycle, unit, groupBuffer);
       load->setAttr("data_format", rewriter.getStringAttr(dataFormat));
-      load->setAttr("weight_load_mode", rewriter.getStringAttr("supercell"));
+      load->setAttr("weight_load_mode", rewriter.getStringAttr(columnLoad ? "column" : "supercell"));
       load->setAttr("weight_input_mode",
                     rewriter.getStringAttr("int8_dequant_bf16"));
       load->setAttr("group_count",

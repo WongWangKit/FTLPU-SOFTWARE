@@ -35,6 +35,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         get_base_row(ffn.getHidden0Placement());
     const int64_t resultBank = ffn.getResultPlacement()
         .getAs<mlir::IntegerAttr>("bank").getInt();
+    const int64_t resultBaseRow = get_base_row(ffn.getResultPlacement());
     const auto hiddenKind =
         ffn.getHidden0Placement().getAs<mlir::StringAttr>("kind");
     const bool hiddenDistributed16 = hiddenKind
@@ -205,7 +206,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         return std::pair {begin, end - begin};
     };
     bool directSingleMxm = singleMxm
-        && context.local_weight_dequant && mTileCount == 1
+        && context.local_weight_dequant
+        && (mTileCount == 1 || (hiddenDistributed16 && m == mTileCount * tile))
         && throughput.mxm_weight_buffers == 2
         && timeline->reduction_interval == 2 * projectionSlotInterval
         && projectionSlotInterval >= tile;
@@ -223,7 +225,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                 }
                 const auto& signature = timeline->blocks[
                     blockBase + begin];
-                if (signature.tiles.size() != 1
+                if (signature.tiles.size() != mTileCount
                     || signature.tiles.front().segments.size() != 1) {
                     directSingleMxm = false;
                     break;
@@ -235,7 +237,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         blockBase + begin + offset];
                     if (current.active_hemispheres
                             != signature.active_hemispheres
-                        || current.tiles.size() != 1
+                        || current.tiles.size() != mTileCount
                         || current.tiles.front().segments.size() != 1
                         || current.tiles.front().compute_cycle
                             != signature.tiles.front().compute_cycle
@@ -250,6 +252,22 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             != signatureSegment.stream_base) {
                         directSingleMxm = false;
                         break;
+                    }
+                    // All token tiles share one weight buffer and form the
+                    // middle dimension of a non-preemptible compute domain.
+                    for (int64_t tokenTile = 0; tokenTile < mTileCount;
+                         ++tokenTile) {
+                        const auto& tokenSchedule = current.tiles[tokenTile];
+                        if (tokenSchedule.segments.size() != 1
+                            || tokenSchedule.segments.front().rows != tile
+                            || tokenSchedule.segments.front().stream_base
+                                != signatureSegment.stream_base
+                            || tokenSchedule.compute_cycle
+                                != current.tiles.front().compute_cycle
+                                    + tokenTile * tile) {
+                            directSingleMxm = false;
+                            break;
+                        }
                     }
                 }
                 begin += runCount;
@@ -423,7 +441,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     : directSingleMxm
                     ? directSlotCycle(
                           outputWave, reduction, logicalSlot) - tile
-                        + target.mxm_first_result_latency()
+                        + (throughput.mxm_prefill_weight_streams == 1
+                            ? 0 : target.mxm_first_result_latency())
                     : singleMxm
                     ? block.dequant_start + logicalSlot * tile
                     : block.dequant_start
@@ -488,6 +507,14 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         .getAs<mlir::ArrayAttr>("page_storage_slices");
                     const int64_t loadSliceCount =
                         static_cast<int64_t>(selectedWeightSlices.size());
+                    const int64_t storageGroups =
+                        static_cast<int64_t>(storage.size()) / loadSliceCount;
+                    const bool splitDualMxmSlots = !singleMxm
+                        && target.uses_dedicated_slice_roles()
+                        && storageGroups >= 4
+                        && pagePlacement->slice_group_base
+                                + pagePlacement->slice_group_count
+                            <= storageGroups / 2;
                     if (sliceGroup
                             >= pagePlacement->slice_group_base
                                 + pagePlacement->slice_group_count) {
@@ -498,10 +525,13 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         return mlir::failure();
                     }
                     selectedWeightSlices.clear();
+                    const int64_t physicalSliceGroup = sliceGroup
+                        + (splitDualMxmSlots
+                              ? logicalSlot * (storageGroups / 2) : 0);
                     for (int64_t index = 0; index < loadSliceCount; ++index)
                         selectedWeightSlices.push_back(
                             llvm::cast<mlir::IntegerAttr>(
-                                storage[sliceGroup * loadSliceCount + index])
+                                storage[physicalSliceGroup * loadSliceCount + index])
                                 .getInt());
                     base = bindingBase + pagePlacement->base_row
                         + localReduction * logicalSlotsPerHemisphere
@@ -574,10 +604,10 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
             const int64_t mTile = tileSchedule.m_tile;
             const int64_t computeCycle = tileSchedule.compute_cycle;
             const int64_t down0ComputeCycle = directSingleMxm
-                ? directSlotCycle(outputWave, reduction, 0)
+                ? directSlotCycle(outputWave, reduction, 0) + mTile * tile
                 : computeCycle;
             const int64_t down1ComputeCycle = directSingleMxm
-                ? directSlotCycle(outputWave, reduction, 1)
+                ? directSlotCycle(outputWave, reduction, 1) + mTile * tile
                 : computeCycle
                     + (serializedSlots ? timeline->second_slot_offsets[outputWave]
                         : singleMxm ? projectionSlotInterval : 0);
@@ -601,6 +631,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     const auto emitHidden = [&](int64_t consumerCycle,
                                                 bool includeSecondSlot) {
                         mlir::Value hiddenValue = swish.hidden;
+                        if (directSingleMxm && mTileCount > 1 && mTile != 0)
+                            return hiddenValue;
                         const int64_t reductionStep =
                             hiddenDistributed16 ? 1 : 2;
                         const auto [hiddenRunCount, hiddenRunInterval] =
@@ -608,7 +640,20 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                                 mTile, reductionStep);
                         if (hiddenRunCount == 0) return hiddenValue;
                         FfnLoopDomain3D slotDomain;
-                        if (directSingleMxm) {
+                        if (directSingleMxm && mTileCount > 1) {
+                            // A separate domain per logical output slot:
+                            // slice rows, token tiles, reductions in this page.
+                            // No domain spans a dynamic page-ready barrier.
+                            slotDomain.wave_count = mTileCount;
+                            slotDomain.wave_interval = tile;
+                            slotDomain.wave_address_stride =
+                                (intermediate / target.memory().bytes_per_word)
+                                    * throughput.tile_rows;
+                            slotDomain.group_count = hiddenRunCount;
+                            slotDomain.group_interval = hiddenRunInterval;
+                            slotDomain.group_address_stride =
+                                reductionStep * throughput.tile_rows;
+                        } else if (directSingleMxm) {
                             // RUN_3D iterates dimension 1 before dimension 2.
                             // Put the dense reduction run in dimension 1 and
                             // the two serialized logical output slots in the
@@ -637,7 +682,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                                 ? reductionStep * throughput.tile_rows : m;
                         }
                         if (hiddenDistributed16) {
-                            const int64_t hiddenBlocks = intermediate / tile;
+                            const int64_t hiddenBlocks =
+                                intermediate / target.memory().bytes_per_word;
                             const int64_t blockRows =
                                 throughput.mxm_block_rows;
                             const int64_t segmentTokenBase =
@@ -702,20 +748,27 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         }
                         return hiddenValue;
                     };
+                    // Multi-token domains spend their middle axis on token
+                    // tiles. Keep the logical output slots separate, leaving
+                    // the outer axis for K within a weight page. The fallback
+                    // also keeps short reads in their actual queue order.
                     mlir::Value hidden0 = emitHidden(
-                        down0Cycle, singleMxm && !serializedSlots);
-                    mlir::Value hidden1 = serializedSlots
+                        down0Cycle, singleMxm && mTileCount == 1 && !serializedSlots);
+                    mlir::Value hidden1 = singleMxm && (mTileCount > 1 || serializedSlots)
                         ? emitHidden(down1Cycle, false) : hidden0;
                     const int64_t unitBase =
                         hemisphere * throughput.mxms_per_hemisphere;
                     if (directSingleMxm
-                        && reduction == directRunBegin) {
+                        && reduction == directRunBegin && mTile == 0) {
                         const bool finalRun =
                             directRunBegin + directRunCount
                             == reductionBlockCount;
                         FfnMxmDomain3D domain;
                         domain.repeat_count = segment.rows;
                         domain.repeat_accumulator_address_stride = 0;
+                        domain.wave_count = mTileCount;
+                        domain.wave_interval = tile;
+                        domain.wave_accumulator_address_stride = tile;
                         domain.group_count = directRunCount;
                         domain.group_interval = projectionSlotInterval;
                         if (directRunCount > 1)
@@ -831,7 +884,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         target::StreamDirection::West, slice);
                     if (!latency) return mlir::failure();
                     auto placement = schedule_placement(rewriter,
-                        {slice}, outputWave * m + mTile * tile,
+                        {slice}, resultBaseRow + outputWave * m + mTile * tile,
                         tile, 1, context.hemisphereName(hemisphere),
                         "fp16_pair_planar", resultBank);
                     mlir::NamedAttrList attributes(placement);
@@ -846,7 +899,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             ffn.getM() * timeline->wave_count));
                     attributes.set("binding_placement",
                         schedule_placement(rewriter,
-                            context.result_slices, 0,
+                            context.result_slices, resultBaseRow,
                             ffn.getM() * timeline->wave_count, 1,
                             "both", "fp16_pair_planar", resultBank));
                     const int64_t writeCycle =
@@ -858,7 +911,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             attributes.getDictionary(rewriter.getContext()),
                             writeCycle, outputWave, mTile, hemisphere,
                             slice, streamBase + byte % 2,
-                            outputWave * m + mTile * tile});
+                            resultBaseRow + outputWave * m + mTile * tile});
                 }
             }
         }

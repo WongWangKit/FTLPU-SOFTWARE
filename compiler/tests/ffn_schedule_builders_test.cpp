@@ -14,12 +14,69 @@ void require(bool condition, const std::string& message)
     if (!condition) throw std::logic_error(message);
 }
 
+void checkAffineProjection()
+{
+    using namespace ftlpu::compiler;
+    target::LPUTargetModel nativeTarget;
+    auto throughput = nativeTarget.throughput();
+    throughput.mxms_per_hemisphere = 2;
+    throughput.mxm_local_dequant_enabled = 1;
+    throughput.mxm_prefill_weight_streams = 8;
+    target::LPUTargetModel target(
+        nativeTarget.memory(), nativeTarget.streams(), throughput);
+    const auto tile = target.throughput().mxm_rows;
+    const auto slices = target.attention_weight_slices();
+    const auto buffers = static_cast<std::size_t>(
+        target.throughput().mxm_weight_buffers);
+    // Check every output-pair boundary, including the startup pair. The
+    // same closed 3-D load domain must remain legal for one or several
+    // activation tiles.
+    for (int64_t tokens : {tile, 2 * tile, 4 * tile}) {
+        auto projection = schedule::planFfnProjectionTimeline(
+            {tokens, 24 * tile, 140 * tile, 24 * tile},
+            slices, target, true);
+        require(mlir::succeeded(projection),
+            "dual-MXM affine projection timeline failed");
+        const auto& blocks = projection->blocks;
+        const int64_t lead = blocks.front().weight_compute_cycle
+            - blocks.front().dequant_start;
+        for (std::size_t index = 0; index < blocks.size(); ++index) {
+            require(blocks[index].weight_compute_cycle
+                        - blocks[index].dequant_start == lead,
+                "dual-MXM load phase changed within a direct 3-D domain");
+            if (index >= buffers)
+                require(blocks[index].dequant_start
+                        >= blocks[index - buffers].tiles.back().compute_cycle
+                            + target.mxm_result_window_cycles(tile),
+                    "dual-MXM affine load overwrote a live buffer");
+        }
+        const auto hiddenSlices = target.ffn_hidden_slices();
+        const auto resultSlices = target.attention_result_slices();
+        for (int64_t pageReductions : {0, 48}) {
+            auto down = schedule::planFfnDownProjectionTimeline(
+                {tokens, 24 * tile, 140 * tile, 24 * tile}, *projection,
+                projection->final_projection_cycle + 1000,
+                slices, hiddenSlices, resultSlices, target, pageReductions);
+            require(mlir::succeeded(down),
+                "dual-MXM affine down timeline failed");
+            for (std::size_t index = buffers; index < down->blocks.size(); ++index)
+                require(down->blocks[index].dequant_start
+                        >= down->blocks[index - buffers].tiles.back().compute_cycle
+                            + target.mxm_result_window_cycles(tile),
+                    "dual-MXM Down load overwrote a live buffer");
+        }
+    }
+    std::cout << "FFN affine projection PASS tile=" << tile << '\n';
+}
+
 } // namespace
 
-int main() try
+int main(int argc, char** argv) try
 {
     using namespace ftlpu::compiler;
     target::LPUTargetModel target;
+    checkAffineProjection();
+    if (argc == 2 && std::string(argv[1]) == "--affine-only") return 0;
 
     auto plan = schedule::buildFfnTaskPlan({128, 576, 1536, 576}, target);
     require(plan.tasks.size() == 4, "FFN plan must contain four stages");
@@ -216,6 +273,44 @@ int main() try
     require(residencyFirstProjection->final_projection_cycle
             > residencyFirstProjection->second_projection_offset,
         "residency-first FFN final cycle does not include both phases");
+    auto columnThroughput = singleMxmThroughput;
+    columnThroughput.mxm_prefill_weight_streams = 1;
+    auto columnMemory = target.memory();
+    columnMemory.w8a16_weight_slice_base = 20;
+    columnMemory.w8a16_weight_slice_stride = 1;
+    llvm::SmallVector<int64_t> columnWeightSlices;
+    for (int64_t slice = 20; slice < 28; ++slice)
+        columnWeightSlices.push_back(slice);
+    target::LPUTargetModel columnTarget(
+        columnMemory, target.streams(), columnThroughput);
+    auto columnProjection = schedule::planFfnProjectionTimeline(
+        {32, 1536, 8960, 1536}, columnWeightSlices, columnTarget, true,
+        false, schedule::FfnProjectionOrder::GateThenUp);
+    require(mlir::succeeded(columnProjection),
+        "single-stream Gate/Up timeline failed");
+    for (std::size_t index = 0; index < columnProjection->blocks.size(); ++index) {
+        const auto& block = columnProjection->blocks[index];
+        require(block.weight_compute_cycle - block.dequant_start == 32,
+            "single-stream column wave does not fully precede compute");
+        require(block.weight_buffer == index % 2,
+            "single-stream projection lost weight-buffer ping-pong");
+        if (index)
+            require(block.dequant_start
+                    - columnProjection->blocks[index - 1].dequant_start == 32,
+                "seq32 single-stream projection has a steady-state load bubble");
+    }
+    // Up starts on buffer 0. Check each column against that buffer's final
+    // Gate use; a column load need not wait for the other buffer to drain.
+    const auto& lastGateBuffer0 = columnProjection->blocks[
+        columnProjection->blocks.size() - 2];
+    for (int64_t column = 0; column < 32; ++column) {
+        const auto lastUse = lastGateBuffer0.tiles.back().compute_cycle
+            + 31 + column;
+        const auto firstUpLoad = columnProjection->blocks.front().dequant_start
+            + columnProjection->second_projection_offset + column;
+        require(firstUpLoad > lastUse,
+            "single-stream Up overwrites a column still used by Gate");
+    }
     for (const auto& block : projection->blocks) {
         for (const auto& tile : block.tiles) {
             for (const auto& hemisphere : tile.hemisphere_segments) {

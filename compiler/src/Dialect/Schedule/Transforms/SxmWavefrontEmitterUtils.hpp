@@ -5,7 +5,7 @@
 
 #include "mlir/IR/PatternMatch.h"
 
-#include <array>
+#include "llvm/ADT/SmallVector.h"
 
 namespace ftlpu::compiler::schedule::sxm_detail {
 
@@ -20,9 +20,11 @@ void emitSxm(mlir::IRRewriter& rewriter, mlir::Location location,
     int64_t repeatInterval = 1, int64_t waveCount = 1,
     int64_t waveInterval = 1, int64_t permuteMapStride = 0);
 
-std::array<int64_t, 32> identityMap();
+llvm::SmallVector<int64_t, 64> identityMap(int64_t width = 32);
+llvm::SmallVector<int64_t, 64> identityMap(
+    const target::LPUTargetModel& target);
 
-std::array<int64_t, 32> blockDiagonalMap(int64_t diagonal,
+llvm::SmallVector<int64_t, 64> blockDiagonalMap(int64_t diagonal,
     const target::LPUTargetModel& target);
 
 // Emits one valid full-width capture followed by its registered Permute.

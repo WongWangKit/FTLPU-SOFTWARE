@@ -282,7 +282,10 @@ LogicalResult MemReadOp::verify()
         || groupCount <= 0 || groupInterval <= 0)
         return emitOpError(
             "requires positive wave/group counts and intervals");
-    const int64_t repeatSpan = getDuration() - 1;
+    const int64_t repeatInterval = getRepeatInterval().value_or(1);
+    if (repeatInterval <= 0)
+        return emitOpError("requires a positive repeat interval");
+    const int64_t repeatSpan = (getDuration() - 1) * repeatInterval;
     const int64_t waveSpan = repeatSpan
         + (waveCount - 1) * waveInterval;
     if (waveCount > 1 && waveInterval <= repeatSpan)
@@ -333,9 +336,7 @@ LogicalResult MemReadOp::verify()
     const bool native4Weight = getRole() == "weight" && kind
         && kind.getValue() == "w8a16_native4_weight";
     const auto expected_count = native4Weight
-        ? std::optional<int64_t>(
-              targetModel->streams().streams_per_direction
-              / targetModel->throughput().tile_rows)
+        ? std::optional<int64_t>(targetModel->throughput().lanes_per_tile)
         : targetModel->route_stream_count(
               target::StreamEndpoint::Mem, endpoint,
               target::StreamDirection::East);
@@ -372,7 +373,7 @@ LogicalResult MxmLoadOp::verify()
         && bufferMode != "toggle_dim1" && bufferMode != "toggle_dim2")
         return emitOpError("contains an invalid MXM weight buffer mode");
     const int64_t expectedStreams = loadMode == "column"
-        ? 2
+        ? (inputMode == "int8_dequant_bf16" ? 1 : 2)
         : inputMode == "int8_dequant_bf16"
             ? target.throughput().mxm_int8_load_streams_per_cycle
             : target.throughput().mxm_load_streams_per_cycle;
@@ -818,7 +819,14 @@ LogicalResult MemTransferOp::verify()
     const int64_t memoryRows = target.memory().sram_depth_rows;
     if (getAddress() < 0 || getAddress() >= memoryRows)
         return emitOpError("address is outside the target SRAM: ")
-            << getAddress() << " not in [0, " << memoryRows << ")";
+            << getAddress() << " not in [0, " << memoryRows << ")"
+            << ", opcode=" << getOpcode()
+            << ", slice=" << getSlice()
+            << ", bank=" << bank
+            << ", cycle=" << getCycle()
+            << ", binding=" << getAddressBinding().value_or(-1)
+            << ", page=" << getWeightPage().value_or(-1)
+            << ", logical_base=" << getLogicalBaseRow().value_or(-1);
     if (getPackedStream() < 0
         || getPackedStream() >= target.streams().encoded_streams)
         return emitOpError("packed stream is outside the target: ")
@@ -1002,11 +1010,14 @@ LogicalResult MxmIssueOp::verify()
         return emitOpError("contains an invalid MXM issue 3-D domain");
     const std::array<int64_t, 3> counts {
         static_cast<int64_t>(getRepeatCount()), waveCount, groupCount};
+    const bool columnLoad = getWeightLoadMode().value_or("supercell") == "column";
     const auto weightColumnBounds = affine_3d_bounds(
-        getWeightColumn(), counts,
+        columnLoad ? getWeightColumn() * 8 + getWeightInnerColumn().value_or(0)
+                   : getWeightColumn(), counts,
         {repeatColumnStride, waveColumnStride, groupColumnStride});
     if (!weightColumnBounds || weightColumnBounds->first < 0
-        || weightColumnBounds->second >= target.throughput().tile_rows)
+        || weightColumnBounds->second >= (columnLoad
+            ? target.throughput().mxm_columns : target.throughput().tile_rows))
         return emitOpError("contains an invalid MXM issue 3-D domain");
     if ((getOpcode() == "iw" || decodeLoad)
         && (repeatAccumulatorStride != 0 || waveAccumulatorStride != 0
@@ -1077,10 +1088,23 @@ LogicalResult MxmIssueOp::verify()
         || (getOpcode() == "compute"
             && accumulatorMaximum >= accumulatorRows)
         || getAccumulatorRowStride() <= 0)
+    {
         return emitOpError(
             "contains an invalid MXM accumulator address or stride: address=")
             << getAccumulatorAddress()
-            << ", stride=" << getAccumulatorRowStride();
+            << ", stride=" << getAccumulatorRowStride()
+            << ", bounds=["
+            << (accumulatorBounds ? accumulatorBounds->first : -1) << ", "
+            << (accumulatorBounds ? accumulatorBounds->second : -1)
+            << "], row_span=" << accumulatorRowSpan
+            << ", capacity=" << accumulatorRows
+            << ", opcode=" << getOpcode()
+            << ", unit=" << getUnitId()
+            << ", cycle=" << getCycle()
+            << ", repeats=" << getRepeatCount()
+            << ", waves=" << waveCount
+            << ", groups=" << groupCount;
+    }
     const llvm::StringRef bufferMode =
         getWeightBufferMode().value_or("fixed");
     if (bufferMode != "fixed" && bufferMode != "toggle_dim0"
@@ -1192,13 +1216,16 @@ LogicalResult SxmOp::verify()
     const int64_t physicalWidth =
         2 * target.throughput().lanes_per_tile;
     const int64_t sourceWidth = getInputRow() ? 2 : physicalWidth;
+    const int64_t mapWidth = target.throughput().tile_rows
+        * target.throughput().lanes_per_tile;
     if (getSourceStreams().size() != sourceWidth
         || getDestinationStreams().size() != physicalWidth
-        || getPermuteMap().size() != 32)
+        || getPermuteMap().size() != mapWidth)
         return emitOpError()
             << "requires " << sourceWidth << " source and "
             << physicalWidth
-            << " destination byte streams and a 32-lane map";
+            << " destination byte streams and a " << mapWidth
+            << "-lane map";
     return success();
 }
 

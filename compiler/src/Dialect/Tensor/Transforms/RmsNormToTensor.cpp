@@ -6,11 +6,21 @@
 
 namespace ftlpu::compiler::tensor_lowering {
 
+static int64_t distributed_row_span(int64_t rows, int64_t columns,
+    const target::LPUTargetModel& target)
+{
+    return ((rows + target.throughput().mxm_rows - 1)
+               / target.throughput().mxm_rows)
+        * (columns / target.memory().bytes_per_word)
+        * target.throughput().tile_rows;
+}
+
 mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const target::LPUTargetModel& target,
     int64_t feedbackWeightBaseRow,
     int64_t feedbackWeightSliceBase,
     int64_t feedbackWeightBank, int64_t weightBank,
+    int64_t feedbackWeightSegmentRows,
     FunctionMemoryPlanner& planner,
     mlir::IRRewriter& rewriter)
 {
@@ -60,7 +70,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             : fixed_allocation(PlacementKind::Activation,
                   distributedInputSlices,
                   target.uses_dedicated_slice_roles() ? 0 : 4096,
-                  physicalRows * hidden / 256, matrixBytes,
+                  distributed_row_span(rows, hidden, target), matrixBytes,
                   "fp16_mxm_distributed_16", "both", workingBank);
     const int64_t inputBank = input.bank;
     const int64_t resultBank = memory.banks_per_slice > 1
@@ -99,18 +109,36 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         return mlir::failure();
     }
     llvm::SmallVector<int64_t, 16> distributedWeightBindingSlices;
+    const int64_t gammaSegmentRows = feedbackWeightSegmentRows > 0
+        ? feedbackWeightSegmentRows : memory.words_per_bank;
+    const bool segmentedGamma = target.uses_dedicated_slice_roles()
+        && hidden > gammaSegmentRows;
+    const auto validGammaSlice = [&](int64_t slice) {
+        return target.is_activation_storage_slice(slice)
+            || (singleTokenDecode && segmentedGamma
+                && memory.words_per_bank <= 1024
+                && target.is_weight_storage_slice(slice));
+    };
     if (target.uses_dedicated_slice_roles()) {
         if (feedbackWeightSliceBase < 0
-            || !target.is_activation_storage_slice(feedbackWeightSliceBase)
-            || !target.is_activation_storage_slice(
-                feedbackWeightSliceBase + 1)) {
+            || !validGammaSlice(feedbackWeightSliceBase)
+            || !validGammaSlice(feedbackWeightSliceBase + 1)) {
             op.emitError(
-                "feedback RMSNorm gamma is not assigned to an activation slice pair");
+                "feedback RMSNorm gamma is not assigned to a legal slice pair");
             return mlir::failure();
         }
         distributedWeightBindingSlices.push_back(feedbackWeightSliceBase);
         distributedWeightBindingSlices.push_back(
             feedbackWeightSliceBase + 1);
+        if (segmentedGamma) {
+            if (!validGammaSlice(feedbackWeightSliceBase + 2)
+                || !validGammaSlice(feedbackWeightSliceBase + 3)) {
+                op.emitError("segmented gamma needs a second legal slice pair");
+                return mlir::failure();
+            }
+            distributedWeightBindingSlices.push_back(feedbackWeightSliceBase + 2);
+            distributedWeightBindingSlices.push_back(feedbackWeightSliceBase + 3);
+        }
     } else {
         for (int64_t slice = 0;
              slice < memory.slices_per_hemisphere
@@ -122,7 +150,8 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         }
     }
     if (distributedWeightBindingSlices.size()
-            != (target.uses_dedicated_slice_roles() ? 2u : 16u)) {
+            != (target.uses_dedicated_slice_roles()
+                    ? segmentedGamma ? 4u : 2u : 16u)) {
         op.emitError(
             "target does not provide the required gamma slice layout");
         return mlir::failure();
@@ -130,7 +159,8 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const Allocation weight = fixed_allocation(PlacementKind::Activation,
         distributedWeightBindingSlices, feedbackWeightBaseRow,
         target.uses_dedicated_slice_roles()
-            ? hidden : hidden / throughput.lanes_per_tile,
+            ? std::min(hidden, gammaSegmentRows)
+            : hidden / throughput.lanes_per_tile,
         hidden * 2,
         target.uses_dedicated_slice_roles()
             ? "fp16_vxm_gamma_broadcast"
@@ -138,6 +168,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         "both", target.uses_dedicated_slice_roles()
             ? feedbackWeightBank
             : std::max<int64_t>(0, weightBank));
+    const bool materializeGamma = feedbackWeightSegmentRows > 0;
     llvm::SmallVector<Allocation, 4> scratch;
     const auto canonicalResultSlices =
         target.mxm_distributed_activation_slices();
@@ -169,7 +200,10 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         target.uses_dedicated_slice_roles() ? 0 : 4608;
     const int64_t normalizedScratchBase =
         target.uses_dedicated_slice_roles()
-            ? preservesInput ? input.base_row + input.row_span : 0
+            ? preservesInput
+                ? input.base_row >= distributedRows
+                    ? 0 : input.base_row + input.row_span
+                : 0
             : 5632;
     if (normalizedScratchBase + distributedRows
         > memory.words_per_bank) {
@@ -191,12 +225,20 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         distributedRows, physicalRows * hidden * 2,
         "fp16_vxm_distributed_16", "both",
         inputBank));
+    if (materializeGamma) {
+        const auto storage = target.activation_storage_slices();
+        if (storage.size() < 20 || hidden > memory.words_per_bank)
+            return op.emitError("compact gamma materialization does not fit");
+        scratch.push_back(fixed_allocation(PlacementKind::Weight,
+            {storage[16], storage[17]}, memory.words_per_bank - hidden,
+            hidden, hidden * 2, "fp16_vxm_gamma_broadcast", "both", inputBank));
+    }
     const auto distributedResultSlices =
         target.mxm_distributed_activation_slices();
     const Allocation result = fixed_allocation(PlacementKind::FinalResult,
         distributedResultSlices,
         target.uses_dedicated_slice_roles() ? 0 : 5632,
-        physicalRows * hidden / 256, matrixBytes,
+        distributed_row_span(rows, hidden, target), matrixBytes,
         "fp16_mxm_distributed_16", "both",
         resultBank);
     if (mlir::failed(planner.bind(op.getInput(), input))
@@ -446,14 +488,16 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
         const Allocation result = usesPersistentActivationAbi
             ? fixed_allocation(PlacementKind::FinalResult,
                 target.mxm_distributed_activation_slices(),
-                feedbackResultBase, rows * columns / 128,
+                feedbackResultBase,
+                std::max(rows * columns / 128,
+                    distributed_row_span(rows, columns, target)),
                 rows * columns * 2,
                 "fp16_mxm_distributed_16", "both",
                 target.uses_dedicated_slice_roles() ? resultBank : 0)
             : feedsFeedbackRmsNorm
             ? fixed_allocation(PlacementKind::FinalResult,
                 distributedSlices, feedbackResultBase,
-                rows * columns / 256,
+                distributed_row_span(rows, columns, target),
                 rows * columns * 2,
                 "fp16_mxm_distributed_16", "both", plannedResultBank)
             : feedsRmsNorm
@@ -479,10 +523,41 @@ mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,
                 return op.emitError(
                     "feedback RMSNorm residual requires four persistent "
                     "activation slices");
+            const int64_t persistentBase = 0;
+            int64_t persistentBank = plannedResultBank;
+            int64_t persistentRows = rows * columns / 64;
+            const auto gateTemps = target.ffn_gate_temp_slices();
+            const auto upTemps = target.ffn_up_temp_slices();
+            const bool aliasesFfnTemps = llvm::any_of(persistentSlices,
+                [&](int64_t slice) {
+                    return llvm::is_contained(gateTemps, slice)
+                        || llvm::is_contained(upTemps, slice);
+                });
+            if (target.uses_dedicated_slice_roles()
+                && target.throughput().mxms_per_hemisphere == 2
+                && target.memory().banks_per_slice > 1
+                && aliasesFfnTemps) {
+                // Gate/Up occupy these slices in the temporary bank until
+                // SwiGLU finishes. Retain the residual in the other bank;
+                // dual-MXM Down then reuses the dead temporary bank, giving
+                // the final add two independent input ICU queues.
+                persistentBank = (plannedResultBank + 1)
+                    % target.memory().banks_per_slice;
+                const int64_t pairWidth = 4 * target.throughput().mxm_rows;
+                persistentRows = ((columns + pairWidth - 1) / pairWidth) * rows;
+                int64_t cacheTail = 0;
+                if (auto module = op->getParentOfType<mlir::ModuleOp>())
+                    if (auto capacity = module->getAttrOfType<mlir::IntegerAttr>(
+                            "ftlpu.kv_cache_capacity"))
+                        cacheTail = capacity.getInt();
+                if (persistentRows > target.memory().words_per_bank - cacheTail)
+                    return op.emitError(
+                        "persistent residual does not fit below KV cache");
+            }
             const Allocation persistent = fixed_allocation(
-                PlacementKind::FinalResult, persistentSlices, 0,
-                rows * columns / 64, rows * columns * 2,
-                "fp16_pair_planar", "both", plannedResultBank);
+                PlacementKind::FinalResult, persistentSlices, persistentBase,
+                persistentRows, rows * columns * 2,
+                "fp16_pair_planar", "both", persistentBank);
             resultAllocations.push_back(make_task_allocation(
                 rewriter, persistent, make_placement_attr(rewriter,
                     persistent)));

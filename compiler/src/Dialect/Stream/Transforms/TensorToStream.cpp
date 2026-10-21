@@ -201,6 +201,7 @@ public:
 
         llvm::SmallVector<tensor::MatmulOp> matmuls;
         llvm::SmallVector<tensor::SwigluOp> swiglus;
+        llvm::SmallVector<tensor::L2NormTaskOp> l2Norms;
         llvm::SmallVector<tensor::RmsNormTaskOp> rmsNorms;
         llvm::SmallVector<tensor::DepthwiseConv1DTaskOp> depthwiseConvs;
         llvm::SmallVector<tensor::GatedDeltaRuleTaskOp> gatedDeltaRules;
@@ -209,6 +210,7 @@ public:
             [&](tensor::MatmulOp op) { matmuls.push_back(op); });
         function.walk(
             [&](tensor::SwigluOp op) { swiglus.push_back(op); });
+        function.walk([&](tensor::L2NormTaskOp op) { l2Norms.push_back(op); });
         function.walk(
             [&](tensor::RmsNormTaskOp op) { rmsNorms.push_back(op); });
         function.walk([&](tensor::DepthwiseConv1DTaskOp op) {
@@ -232,6 +234,12 @@ public:
         }
         for (FfnTaskGraph& graph : *ffns) {
             if (mlir::failed(lower_ffn(graph, context))) {
+                signalPassFailure();
+                return;
+            }
+        }
+        for (tensor::L2NormTaskOp op : l2Norms) {
+            if (mlir::failed(lower_l2_norm(op, context))) {
                 signalPassFailure();
                 return;
             }
@@ -295,6 +303,7 @@ public:
                     || llvm::isa<tensor::RopeTaskOp>(operation)
                     || llvm::isa<tensor::BatchMatmulTaskOp>(operation)
                     || llvm::isa<tensor::SoftmaxTaskOp>(operation)
+                    || llvm::isa<tensor::L2NormTaskOp>(operation)
                     || llvm::isa<tensor::RmsNormTaskOp>(operation)
                     || llvm::isa<tensor::TransposeTaskOp>(operation)))
                 unlowered_task = operation;

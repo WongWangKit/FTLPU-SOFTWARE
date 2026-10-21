@@ -77,10 +77,12 @@ public:
     llvm::ArrayRef<int64_t> weightSlices(
         AttentionProjectionKind projection, int64_t outputBlock) const;
     llvm::ArrayRef<int64_t> outputWeightSlices(int64_t outputGroup) const;
-    int64_t weightPage(AttentionProjectionKind projection) const;
-    int64_t weightBank(AttentionProjectionKind projection) const;
-    int64_t outputWeightPage() const;
-    int64_t outputWeightBank() const;
+    int64_t weightPage(AttentionProjectionKind projection,
+        int64_t outputBlock = 0) const;
+    int64_t weightBank(AttentionProjectionKind projection,
+        int64_t outputBlock = 0) const;
+    int64_t outputWeightPage(int64_t outputGroup = 0) const;
+    int64_t outputWeightBank(int64_t outputGroup = 0) const;
     llvm::ArrayRef<int64_t> activationSlices() const { return activationSlices_; }
     llvm::ArrayRef<int64_t> ropeSlices() const { return ropeSlices_; }
     int64_t ropeBank() const { return ropeBank_; }
@@ -121,7 +123,9 @@ public:
     llvm::ArrayRef<int64_t> probabilityPackSlices() const { return probabilityPackSlices_; }
     llvm::ArrayRef<int64_t> probabilityDiagonalSlices() const { return probabilityDiagonalSlices_; }
     llvm::ArrayRef<int64_t> valuePackSlices(int64_t reductionBlock) const;
+    int64_t valuePackBank(int64_t reductionBlock) const;
     llvm::ArrayRef<int64_t> contextSlices() const { return contextSlices_; }
+    int64_t contextBank(int64_t headBlock) const;
     bool contextHeadBlockPacked() const { return contextHeadBlockPacked_; }
     bool contextHemispherePaired() const { return contextHemispherePaired_; }
 
@@ -133,6 +137,11 @@ private:
         int64_t groupBase = 0;
         int64_t groupCount = 0;
         int64_t itemsPerGroup = 0;
+        int64_t itemsPerPage = 0;
+        llvm::SmallVector<int64_t, 16> pageBanks;
+        llvm::SmallVector<int64_t, 16> pageGroupBases;
+        llvm::SmallVector<int64_t, 16> pageGroupCounts;
+        llvm::SmallVector<int64_t, 16> pageBaseRows;
         llvm::SmallVector<int64_t, 32> storageSlices;
     };
 
@@ -140,6 +149,9 @@ private:
     llvm::ArrayRef<int64_t> pagingSlices(
         const WeightPagingLayout& paging, int64_t item,
         llvm::ArrayRef<int64_t> fallback) const;
+    int64_t pagingPage(const WeightPagingLayout& paging, int64_t item) const;
+    int64_t pagingBank(const WeightPagingLayout& paging, int64_t item) const;
+    int64_t pagingBase(const WeightPagingLayout& paging, int64_t item) const;
 
     const target::LPUTargetModel& target_;
     int64_t seqLen_ = 0;
@@ -183,9 +195,12 @@ private:
         {{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32, 33}},
         {{18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35}},
     }};
+    std::array<int64_t, 2> valuePackBanks_ {0, 0};
     std::array<int64_t, 8> contextSlices_ {44, 45, 46, 47, 48, 49, 50, 51};
     bool contextHeadBlockPacked_ = false;
     bool contextHemispherePaired_ = false;
+    bool contextSplitBanks_ = false;
+    std::array<int64_t, 2> contextBanks_ {0, 0};
     int64_t ropeBase_ = 7000;
     int64_t ropeMirrorBase_ = 7000;
     int64_t ropeStagingBase_ = 0;
@@ -201,6 +216,7 @@ private:
     int64_t valuePackBase_ = 7800;
     int64_t contextBase_ = 2000;
     int64_t resultBase_ = 0;
+    bool resultPartitioned_ = false;
 };
 
 } // namespace ftlpu::compiler::schedule

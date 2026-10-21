@@ -782,6 +782,13 @@ SyncOriginCommandTiming sync_origin_timing(
     const QueueProgram& queue, std::size_t pc, std::size_t cursor)
 {
     const auto& command = queue.commands[pc];
+    if (is_mxm_stream_nd_command(command)) {
+        const auto schedule = decode_mxm_stream_nd_command(command);
+        auto end = schedule.start_cycle + 1;
+        for (std::size_t axis = 0; axis < schedule.rank; ++axis)
+            end += (schedule.counts[axis] - 1) * schedule.cycle_strides[axis];
+        return {schedule.start_cycle, end, 1};
+    }
     if (is_fu_3d_raw_packet_header(command)) {
         const auto loop = decode_fu_3d_raw_packet_loop(queue, pc);
         const auto first = cursor + loop.start_cycle + loop.wait_cycle;
@@ -876,6 +883,14 @@ std::optional<BinaryProgram> restore_compiler_sync_origins(const BinaryProgram& 
                 restored[header].words[0] = (restored[header].words[0] & 0xffU)
                     | (static_cast<std::uint32_t>(domainWait) << 8);
                 restored[header].command = restored[header].words[0];
+            } else if (is_mxm_stream_nd_command(original[pc])) {
+                auto schedule = decode_mxm_stream_nd_command(original[pc]);
+                schedule.start_cycle = static_cast<std::size_t>(first);
+                auto native = original[pc];
+                native.extension_words.clear();
+                native.command = static_cast<isa::EncodedIcuCommand>(
+                    isa::IcuCommandOpcode::Instruction);
+                restored[header] = encode_mxm_stream_nd_command(native, schedule);
             }
             cursor = static_cast<std::size_t>(first) + timing.end - timing.first;
             compiledCursor = timing.end;
@@ -932,6 +947,14 @@ void record_compiler_sync_origins(BinaryProgram& compiled, const BinaryProgram& 
                 if (synchronized_mem_opcode(packet) == MemOpcode::Write) return;
                 end = cursor + (command.words[2] & 0xffffffU) + 1;
                 words = InstructionControlUnit::MemIcu::synchronized_packet_word_count;
+            } else if (is_mxm_stream_nd_command(command)) {
+                // Native4 decode shares a program with direct MEM domains.
+                // Its absolute ND timing must not disable origin recording
+                // for every queue, otherwise a compiler SYNC issue slot is
+                // retained and counted again during runtime rebinding.
+                const auto timing = sync_origin_timing(queue, pc, cursor);
+                first = timing.first;
+                end = timing.end;
             } else if (!is_icu_control_raw_word_command(command)
                 && (command.instruction_kind == InstructionKind::None || !command.extension_words.empty()))
                 return; // Legacy encodings retain their existing rebinding path.

@@ -26,6 +26,12 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
         context.projection_timeline.weight_load_cycles;
     const int64_t mTileCount =
         context.projection_timeline.m_tile_count;
+    // A decode tile contains only m live token rows.  The MXM still issues a
+    // full physical tile, but only those live rows need Gate/Up SRAM storage.
+    // Restrict this compact layout to a single partial tile so the 3D address
+    // generator retains a constant stride for every output pair.
+    const int64_t tempRowsPerTile = mTileCount == 1
+        ? std::min(tile, m) : tile;
     const int64_t projectionSlotInterval =
         context.projection_timeline.projection_slot_interval;
     const int64_t gateAccLatency =
@@ -235,8 +241,47 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
     // one stable stream segment per hemisphere and tile.  Its compute launch
     // domain is therefore closed form even when a weight-load hazard splits
     // the corresponding MEM domain.
-    const bool closedProjectionDomains = context.local_weight_dequant
+    // Consecutive token tiles belong to the same non-preemptible domain.
+    // MEM uses (rows within one token tile, token tile, reduction) for each
+    // output pair. MXM uses (row, token tile, reduction), with K as the
+    // terminal axis, so its inner row count stays within one physical wave.
+    bool combinedTokenTileDomains = context.local_weight_dequant
+        && (serializedProjections || !singleMxm)
+        && mTileCount > 1 && m == mTileCount * tile
         && reductionBlockCount > 0 && pairCount > 0;
+    if (combinedTokenTileDomains) {
+        const auto& blocks = context.projection_timeline.blocks;
+        const int64_t firstCompute = blocks.front().tiles.front().compute_cycle;
+        for (int64_t index = 0; index < static_cast<int64_t>(blocks.size()); ++index) {
+            const auto& block = blocks[index];
+            if (static_cast<int64_t>(block.tiles.size()) != mTileCount) {
+                combinedTokenTileDomains = false;
+                break;
+            }
+            for (int64_t tokenTile = 0; tokenTile < mTileCount; ++tokenTile) {
+                const auto& schedule = block.tiles[tokenTile];
+                combinedTokenTileDomains &= schedule.compute_cycle
+                    == firstCompute + index * context.projection_timeline
+                        .projection_block_interval + tokenTile * tile;
+                for (int64_t side = 0; side < memory.hemispheres; ++side) {
+                    const auto& segments = schedule.hemisphere_segments[side];
+                    const auto& firstSegments = blocks.front().tiles.front()
+                        .hemisphere_segments[side];
+                    combinedTokenTileDomains &= segments.size() == 1
+                        && firstSegments.size() == 1;
+                    if (segments.size() == 1 && firstSegments.size() == 1)
+                        combinedTokenTileDomains &= segments.front().rows == tile
+                            && segments.front().stream_base
+                                == firstSegments.front().stream_base;
+                }
+            }
+            if (!combinedTokenTileDomains) break;
+        }
+    }
+    const bool closedProjectionDomains = context.local_weight_dequant
+        && reductionBlockCount > 0 && pairCount > 0
+        && (mTileCount == 1 || combinedTokenTileDomains
+            || memory.sram_depth_rows > 1024);
     // Weight SRAM descriptors stop at page/slice-group boundaries.  MXM
     // dequant and load must stop at the same boundaries: a hardware ICU
     // cannot suspend an already decoded 3-D domain while the next dynamic
@@ -527,10 +572,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 const int64_t terminalStreamBase =
                     context.strategy == FfnScheduleStrategy::Fused
                     ? 8 + hemisphere * 8 : 0;
-                const bool combineTokenTiles = closedProjectionDomains
-                    && mTileCount > 1 && (serializedProjections || !singleMxm);
                 const bool computeCanCrossPairs =
-                    closedProjectionDomains && !combineTokenTiles
+                    closedProjectionDomains && !combinedTokenTileDomains
                     && (reductionBlockCount % 2 == 0
                         || reductionBlockCount == 1);
                 const std::array<int64_t, 2> computeDomainPairCounts = {
@@ -543,11 +586,11 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 };
                 const std::array<bool, 2> closedComputeLeaders = {
                     closedProjectionDomains && reduction == 0
-                        && (!combineTokenTiles || mTile == 0)
+                        && (!combinedTokenTileDomains || mTile == 0)
                         && (!computeCanCrossPairs
                             || computeDomainPairCounts[0] > 0),
                     closedProjectionDomains && reduction == 0
-                        && (!combineTokenTiles || mTile == 0)
+                        && (!combinedTokenTileDomains || mTile == 0)
                         && (!computeCanCrossPairs
                             || computeDomainPairCounts[1] > 0),
                 };
@@ -596,7 +639,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                     context.activation_route.getPlacement()
                                         .getAs<mlir::IntegerAttr>("base_row")
                                         .getInt();
-                                const int64_t reductionBlocks = k / tile;
+                                const int64_t reductionBlocks =
+                                    k / target.memory().bytes_per_word;
                                 const int64_t blockRows =
                                     throughput.mxm_block_rows;
                                 const int64_t segmentTokenBase =
@@ -678,8 +722,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     mlir::Value gateActivation =
                         context.activation_route.getInput();
                     mlir::Value upActivation = gateActivation;
-                    if (closedProjectionDomains && mTileCount > 1
-                        && (serializedProjections || !singleMxm)) {
+                    if (combinedTokenTileDomains) {
                         // Token tiles interleave on each activation MEM queue.
                         // Keep them inside one context, with reduction outside
                         // the token dimension; output pairs remain separate.
@@ -820,7 +863,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                 domain.terminal_accumulator_output_format =
                                     "bf16";
                             }
-                            if (combineTokenTiles) {
+                            if (combinedTokenTileDomains) {
                                 // One Native ICU cannot interleave contexts
                                 // for individual token tiles. Put tokens inside
                                 // reduction and keep one output pair per domain.
@@ -918,13 +961,20 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 const auto gateTempSlices = target.ffn_gate_temp_slices();
                 const auto upTempSlices = target.ffn_up_temp_slices();
                 const int64_t pairsPerTempGroup =
-                    memory.sram_depth_rows / (mTileCount * tile);
+                    memory.sram_depth_rows / (mTileCount * tempRowsPerTile);
                 const int64_t tempGroup = pair / pairsPerTempGroup;
                 if (2 * tempGroup + 1
                         >= static_cast<int64_t>(gateTempSlices.size())
                     || 2 * tempGroup + 1
                         >= static_cast<int64_t>(upTempSlices.size()))
+                {
+                    ffn.getOperation()->emitError(
+                        "FFN Gate/Up temporary storage cannot hold all output pairs; "
+                        "schedule must consume a batch and reuse the temporary slices")
+                        << ": pair=" << pair << ", temp_group=" << tempGroup
+                        << ", pairs_per_group=" << pairsPerTempGroup;
                     return mlir::failure();
+                }
                 mlir::Value gateTemp;
                 mlir::Value upTemp;
                 int64_t deferredReadyCycle = std::max(
@@ -937,7 +987,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 {
                     const int64_t tempBase =
                         ((pair % pairsPerTempGroup) * mTileCount + mTile)
-                        * tile;
+                        * tempRowsPerTile;
                         const auto emitTempWrite =
                             [&](mlir::Value source,
                             llvm::ArrayRef<int64_t> tempSlices,
@@ -994,10 +1044,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                     domain.wave_interval = context
                                         .projection_timeline
                                         .pipelined_block_interval;
-                                    domain.wave_address_stride = tile;
+                                    domain.wave_address_stride = tempRowsPerTile;
                                     domain.group_count = pairsInDomain;
                                     domain.group_address_stride =
-                                        mTileCount * tile;
+                                        mTileCount * tempRowsPerTile;
                                     if (pairsInDomain > 1) {
                                         const int64_t reductionBlocks =
                                             k / tile;
@@ -1013,26 +1063,26 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                     }
                                     auto placement = schedule_placement(
                                         rewriter, {targetSlice}, tempBase,
-                                        tile, 1,
+                                        tempRowsPerTile, 1,
                                         context.hemisphereName(hemisphere),
                                         "bf16_swiglu_temp_byte",
                                         context.temp_bank);
                                     auto write = rewriter.create<MemWriteOp>(
                                         ffn.getLoc(), source,
-                                        writeCycle, tile,
+                                        writeCycle, tempRowsPerTile,
                                         streamBase + byte, 1,
                                         targetBoundary,
                                         rewriter.getStringAttr("west"),
                                         ffn.getHidden1Address(), placement,
-                                        tile
+                                        tempRowsPerTile
                                             * throughput.lanes_per_tile);
                                     setFfnLoopDomain3D(
                                         write.getOperation(), rewriter,
                                         domain);
-                                    // The upstream copy keeps the West result
-                                    // alive for the ordinary downstream write.
-                                    // Each Gate copy has its own MEM read queue
-                                    // in the physical SR SwiGLU pipeline.
+                                    // The 16-column SR SwiGLU reads Gate
+                                    // twice: once at C0 and again at C4.
+                                    // Both Tail and Fused schedules need the
+                                    // second physical copy on separate slices.
                                     if (projection == 0
                                         && throughput.vxm_alus == 16
                                         && tempGroup == 0
@@ -1046,7 +1096,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                             sourceComputeCycle + target.mxm_first_result_latency()
                                                 + *copyLatency,
                                             hemisphere, copySlice, "write_tap", tempBase,
-                                            32 + streamBase + byte, tile, 1, 1,
+                                            32 + streamBase + byte,
+                                            tempRowsPerTile, 1, 1,
                                             context.temp_bank, domain);
                                     }
                                     tempDomainOutputs[key] =
@@ -1061,10 +1112,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                     .temp_mem_busy_windows[hemisphere]
                                     .push_back({
                                         writeCycle,
-                                        writeCycle + tile});
+                                        writeCycle + tempRowsPerTile});
                                 deferredReadyCycle =
                                     std::max(deferredReadyCycle,
-                                        writeCycle + tile
+                                        writeCycle + tempRowsPerTile
                                             + context.westLatency(
                                                 targetSlice));
                             }

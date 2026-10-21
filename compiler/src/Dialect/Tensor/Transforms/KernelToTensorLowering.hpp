@@ -26,6 +26,13 @@ enum class PlacementKind {
     FinalResult
 };
 
+struct FeedbackGammaPlacement {
+    int64_t base_row = 0;
+    int64_t slice_base = -1;
+    int64_t bank = 0;
+    int64_t segment_rows = 0;
+};
+
 struct Allocation {
     PlacementKind kind;
     llvm::SmallVector<int64_t, 16> slices;
@@ -139,6 +146,7 @@ mlir::DictionaryAttr make_attention_placement(
 
 mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const target::LPUTargetModel& target, int64_t weight_bank,
+    const llvm::DenseMap<mlir::Value, FeedbackGammaPlacement>& gamma_placements,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     const target::LPUTargetModel& target, EastMemoryAllocator& allocator,
@@ -148,11 +156,16 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
 mlir::LogicalResult lower_swiglu(kernel::SwigluOp op,
     EastMemoryAllocator& allocator, AllocateValueFn allocate_value,
     mlir::IRRewriter& rewriter);
+mlir::LogicalResult lower_l2_norm(kernel::L2NormOp op,
+    const target::LPUTargetModel& target, FunctionMemoryPlanner& planner,
+    mlir::IRRewriter& rewriter);
+
 mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const target::LPUTargetModel& target,
     int64_t feedback_weight_base_row,
     int64_t feedback_weight_slice_base,
     int64_t feedback_weight_bank, int64_t weight_bank,
+    int64_t feedback_weight_segment_rows,
     FunctionMemoryPlanner& planner,
     mlir::IRRewriter& rewriter);
 mlir::LogicalResult lower_elementwise(kernel::ElementwiseOp op,

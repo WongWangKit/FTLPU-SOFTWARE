@@ -206,6 +206,24 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& rewriter,
     };
     const auto write = [&](mlir::DictionaryAttr p, int64_t cycle,
                            int64_t stream) {
+        const auto kind = p.getAs<mlir::StringAttr>("kind");
+        if (kind && kind.getValue() == "fp16_mxm_distributed_16") {
+            // Conv emits feature-block-major words, with token as the inner
+            // axis. Route token lane r%8 straight to its distributed16 pair;
+            // the four token waves occupy consecutive rows of that pair.
+            for (int64_t pair = 0; pair < lanes; ++pair)
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice = sliceAt(p, 2 * pair + byte);
+                    direct_domain_detail::emitMem3D(rewriter, op.getLoc(), target,
+                        cycle + pair * tileCycles + writeLatency(p, slice),
+                        physicalQueue(p, slice), "write", baseRow(p),
+                        stream + byte, target.throughput().tile_rows,
+                        lanes * tileCycles, 1, featureBlocks,
+                        tokens * tileCycles, target.throughput().tile_rows,
+                        1, 1, 0, -1, bank(p));
+                }
+            return;
+        }
         plane(p, 0, cycle, stream, "write", 0, tokens, tokens);
     };
     const auto readWeight = [&](int64_t cycle, int64_t stream,

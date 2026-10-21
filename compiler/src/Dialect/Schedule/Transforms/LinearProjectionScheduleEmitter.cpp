@@ -70,6 +70,8 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     const target::LPUTargetModel& target, int64_t outputIndex)
 {
     const auto memoryPlan = *op.getMemoryPlan();
+    const auto replicatedAttr = op.getConfig().getAs<mlir::BoolAttr>("replicated_result");
+    const bool replicated = replicatedAttr && replicatedAttr.getValue();
     const auto inputPlacement =
         memoryPlan.getAs<mlir::DictionaryAttr>("input");
     const auto weightPlacement =
@@ -115,7 +117,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     }
     const bool localDequant = execution->uses_local_dequant();
     const std::size_t expectedActivationSlices = 2;
-    const std::size_t expectedResultSlices = 2;
+    const std::size_t expectedResultSlices = replicated ? 4 : 2;
     if (inputSlices.size() != expectedActivationSlices
         || weightSlices.size() != 8
         || resultSlices.size() != expectedResultSlices) {
@@ -126,6 +128,16 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     }
 
     const int64_t tile = target.throughput().mxm_rows;
+    const bool tokenPartition = resultPlacement.getAs<mlir::StringAttr>("kind").getValue()
+        == "token_partition_planar";
+    if (tokenPartition && (!localDequant || m != tile || n != 2 * tile || replicated)) {
+        op.emitError("token-partitioned projection requires one locally dequantized output tile");
+        return mlir::failure();
+    }
+    if (replicated && (!localDequant || m != tile)) {
+        op.emitError("replicated gated projection requires one token tile with local dequantization");
+        return mlir::failure();
+    }
     if (m % tile || n % (2 * tile) || k % tile) {
         op.emitError("linear projection dimensions are not MXM aligned");
         return mlir::failure();
@@ -139,14 +151,14 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     const int64_t resultBank = resultPlacement.getAs<mlir::IntegerAttr>("bank").getInt();
     const int64_t inputBinding = argumentIndex(op.getInput());
     const int64_t weightBinding = argumentIndex(op.getWeight());
-    if (inputBinding < 0 || weightBinding < 0) {
+    if (weightBinding < 0) {
         op.emitError(
-            "linear projection activation and weight must be function arguments");
+            "linear projection weight must be a function argument");
         return mlir::failure();
     }
 
     rewriter.setInsertionPoint(op);
-    createBinding(rewriter, op.getLoc(), op.getInput(), inputBinding,
+    if (inputBinding >= 0) createBinding(rewriter, op.getLoc(), op.getInput(), inputBinding,
         "input", "activation",
         llvm::cast<mlir::RankedTensorType>(op.getInput().getType()),
         inputPlacement);
@@ -187,6 +199,17 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     const int64_t tokenBlocks = (m + tile - 1) / tile;
     const int64_t reductionBlocks = k / tile;
     const int64_t outputGroups = n / (2 * tile);
+    const auto pagedAttr = weightPlacement.getAs<mlir::BoolAttr>("paged_weight");
+    const int64_t weightPage = pagedAttr && pagedAttr.getValue() ? 0 : -1;
+    int64_t stagingEnd = 0;
+    if (const auto source = memoryPlan.getAs<mlir::DictionaryAttr>("source_input")) {
+        stagingEnd = emitDistributedActivationStaging(rewriter, op.getLoc(), target,
+            source, inputPlacement, m, k);
+        if (stagingEnd < 0) {
+            op.emitError("cannot stage distributed projection input");
+            return mlir::failure();
+        }
+    }
     const int64_t localMxm = 0;
     const int64_t accumulatorAddress =
         target.throughput().mxm_accumulator_blocks
@@ -204,7 +227,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
         const int64_t period = std::max<int64_t>(64,
             maxWeightLatency + target.throughput().mxm_local_load_to_compute_latency + m);
         const int64_t groupPeriod = reductionBlocks * period;
-        const int64_t weightCycle = maxWeightLatency;
+        const int64_t weightCycle = stagingEnd + maxWeightLatency;
         const int64_t computeCycle = weightCycle
             + target.throughput().mxm_local_load_to_compute_latency;
         for (int64_t hemisphere = 0; hemisphere < target.memory().hemispheres; ++hemisphere) {
@@ -214,7 +237,8 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                 emitMem3D(rewriter, op.getLoc(), weightCycle - weightReadLatency(slice),
                     hemisphere * target.memory().slices_per_hemisphere + slice,
                     "read", weightBase, stream, 4, 1, 1, "sram", weightBinding,
-                    reductionBlocks, period, 4, outputGroups, groupPeriod, reductionBlocks * 4);
+                    reductionBlocks, period, 4, outputGroups, groupPeriod, reductionBlocks * 4,
+                    weightPlacement.getAs<mlir::IntegerAttr>("bank").getInt(), weightPage);
             }
             emitMxmDequant3D(rewriter, op.getLoc(), weightCycle, unit, scale,
                 4, 1, reductionBlocks, period, outputGroups, groupPeriod, weightBinding);
@@ -236,7 +260,8 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                     hemisphere * target.memory().slices_per_hemisphere + slice,
                     "read", inputBase, hemisphere * 2 + byte, m, 1, 1,
                     "sram", inputBinding, reductionBlocks, period, m,
-                    outputGroups, groupPeriod, 0);
+                    outputGroups, groupPeriod, 0,
+                    inputPlacement.getAs<mlir::IntegerAttr>("bank").getInt());
             }
             MxmDomain3D compute;
             compute.repeat_count = m;
@@ -250,17 +275,55 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
             emitMxm3D(rewriter, op.getLoc(), computeCycle, unit, "compute", 0, 0,
                 hemisphere * 2, 0, accumulatorAddress, 1, "sram", false,
                 "supercell", 0, dataFormat, {}, {}, compute);
+            if (tokenPartition) {
+                if (hemisphere != 0) continue; // only the first feature word is live
+                const int64_t half = (m + 1) / 2;
+                const int64_t resultCycle = computeCycle + (reductionBlocks - 1) * period
+                    + target.mxm_first_result_latency();
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const auto slice = resultSlices[byte];
+                    const auto local = target.transport_latency(target::StreamEndpoint::MxmResult,
+                        target::StreamEndpoint::Mem, target::StreamDirection::West, slice);
+                    const auto bridge = target.transport_latency(target::StreamEndpoint::VxmBridgeResult,
+                        target::StreamEndpoint::Mem, target::StreamDirection::East, slice);
+                    if (!local || !bridge) return mlir::failure();
+                    // Let the first half flow passively to the opposite MEM;
+                    // consume the second half at the local result destination.
+                    emitMem3D(rewriter, op.getLoc(), resultCycle + half + *local,
+                        slice, "write", resultBase, target.streams().streams_per_direction + byte,
+                        m - half, 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0, resultBank);
+                    const int64_t delay = target.throughput().accumulator_to_vxm_latency
+                        - target.mxm_first_result_latency() + *bridge + 1;
+                    emitMem3D(rewriter, op.getLoc(), resultCycle + delay,
+                        target.memory().slices_per_hemisphere + slice,
+                        "write", resultBase, byte, half, 1, 1, "sram", -1,
+                        1, 1, 0, 1, 1, 0, resultBank);
+                }
+                continue;
+            }
             for (int64_t byte = 0; byte < 2; ++byte) {
-                const auto slice = resultSlices[byte];
+                const auto slice = resultSlices[(replicated ? 2*hemisphere : 0)+byte];
                 const auto latency = target.transport_latency(target::StreamEndpoint::MxmResult,
                     target::StreamEndpoint::Mem, target::StreamDirection::West, slice);
                 if (!latency) return mlir::failure();
                 emitMem3D(rewriter, op.getLoc(), computeCycle + (reductionBlocks - 1) * period
                         + target.mxm_first_result_latency() + *latency,
                     hemisphere * target.memory().slices_per_hemisphere + slice,
-                    "write", resultBase, target.streams().streams_per_direction + byte,
+                    replicated ? "write_tap" : "write", resultBase, target.streams().streams_per_direction + byte,
                     m, 1, 1, "sram", -1, outputGroups, groupPeriod, m,
                     1, 1, 0, resultBank);
+                if (replicated) {
+                    const auto bridge = target.transport_latency(target::StreamEndpoint::VxmBridgeResult,
+                        target::StreamEndpoint::Mem,target::StreamDirection::East,slice);
+                    if (!bridge) return mlir::failure();
+                    const auto delay = target.throughput().accumulator_to_vxm_latency
+                        - target.mxm_first_result_latency() + *bridge + 1;
+                    emitMem3D(rewriter, op.getLoc(), computeCycle+(reductionBlocks-1)*period
+                        +target.mxm_first_result_latency()+delay,
+                        (1-hemisphere)*target.memory().slices_per_hemisphere+slice,
+                        "write",resultBase,byte,m,1,1,"sram",-1,
+                        outputGroups,groupPeriod,m,1,1,0,resultBank);
+                }
             }
         }
         mlir::OperationState timeline(op.getLoc(), TimelineOp::getOperationName());

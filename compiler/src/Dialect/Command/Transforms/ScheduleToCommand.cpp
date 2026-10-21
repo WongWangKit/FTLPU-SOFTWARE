@@ -299,7 +299,7 @@ std::uint8_t schedule_alu_result_sr(
     // columns. Keep inter-column FP32 temporaries in SR16..SR31 so a
     // downstream VALU cannot consume an in-flight raw operand as a result.
     const int64_t slot = producer % 4;
-    const int64_t base = producer < 8 ? 16 : 0;
+    const int64_t base = producer % 16 < 8 ? 16 : 0;
     return schedule_sr(direction, base + 4 * slot, 4,
         "VXM internal FP32 result SR");
 }
@@ -326,7 +326,7 @@ VxmSrOperand parse_schedule_vxm_sr_operand(llvm::StringRef kind,
     }
     if (kind == "original" || kind == "auxiliary") {
         const int64_t head = queue - queue % chainDepth;
-        const int64_t group = (head / 2) * 2
+        const int64_t group = head % 16
             + (kind == "auxiliary" ? 1 : 0);
         const auto direction = parse_schedule_stream_direction(
             "local", inputHemisphere);
@@ -389,6 +389,8 @@ void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op)
             queue, chainDepth,
             rhsSource ? rhsSource.getValue() : llvm::StringRef {},
             op.getInputHemisphere());
+        instruction.lhs_stream_tap = op.getLhsStreamTap().value_or(false);
+        instruction.rhs_stream_tap = op.getRhsStreamTap().value_or(false);
         instruction.result_type =
             parse_schedule_vxm_cast_target(op.getCastTarget());
         instruction.precision = VxmAluPrecision::Float32;
@@ -441,9 +443,16 @@ void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op)
         }
 }
 
-void create_sxm_command(mlir::OpBuilder& builder, schedule::SxmOp op)
+mlir::LogicalResult create_sxm_command(mlir::OpBuilder& builder,
+    schedule::SxmOp op)
 {
     SxmInstruction instruction {};
+    if (op.getPermuteMap().size() != instruction.permute_map.size()) {
+        op.emitError("SXM permute map has ") << op.getPermuteMap().size()
+            << " lanes, but this CModel/compiler binary was built for "
+            << instruction.permute_map.size() << " lanes";
+        return mlir::failure();
+    }
     instruction.opcode = op.getOpcode() == "transpose"
         ? SxmOpcode::Transpose : SxmOpcode::Permute;
     if (op.getOutputRow())
@@ -486,8 +495,11 @@ void create_sxm_command(mlir::OpBuilder& builder, schedule::SxmOp op)
     std::string error;
     if (mlir::failed(command::materializeSxmRun2DCommand(builder,
             op.getLoc(), op.getOpcode() == "transpose",
-            static_cast<std::size_t>(op.getHemisphere()), run, &error)))
-        throw std::runtime_error(error);
+            static_cast<std::size_t>(op.getHemisphere()), run, &error))) {
+        op.emitError("cannot lower SXM RUN_2D: ") << error;
+        return mlir::failure();
+    }
+    return mlir::success();
 }
 
 void create_mem_transfer_command(mlir::OpBuilder& builder,
@@ -610,10 +622,7 @@ void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
     const auto queue = as_size(op.getUnitId(), "MXM queue");
     std::string error;
     if (op.getOpcode() == "iw") {
-        if (op.getWeightLoadMode().value_or("supercell") == "column"
-            || op.getWeightInnerColumn().value_or(0) != 0)
-            throw std::runtime_error(
-                "direct MXM LOAD_3D does not encode legacy IWColumn mode");
+        const bool columnLoad = op.getWeightLoadMode().value_or("supercell") == "column";
         auto instruction = MxmLoadIcuInstruction::Load3D(loop,
             as_size(op.getWeightBuffer(), "weight buffer"),
             mxm_buffer_mode(op.getWeightBufferMode().value_or("fixed")),
@@ -628,6 +637,11 @@ void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
                 "weight stream base"),
             mxm_weight_input_mode(
                 op.getWeightInputMode().value_or("direct16")));
+        if (columnLoad) {
+            instruction.opcode = MxmLoadIcuOpcode::LoadColumn3D;
+            instruction.weight_column_base = instruction.weight_column_base * 8
+                + op.getWeightInnerColumn().value_or(0);
+        }
         require_materialized(command::materializeMxmLoad3DCommand(builder,
             op.getLoc(), queue, instruction, &error), "MXM load", error);
         return;
@@ -907,7 +921,7 @@ public:
                         * read.getGroupInterval().value_or(1)
                     + (read.getWaveCount().value_or(1) - 1)
                         * read.getWaveInterval().value_or(1)
-                    + read.getDuration());
+                    + (read.getDuration() - 1) * read.getRepeatInterval().value_or(1) + 1);
         }
         for (schedule::MemTransferOp transfer : mem_transfers) {
             const auto page = transfer.getWeightPage();
@@ -1055,6 +1069,8 @@ public:
                         .getDefiningOp<schedule::MemReadOp>())
                 repeatCount = placement_integer(
                     read.getPlacement(), "instruction_count");
+            if (load.getWeightLoadMode().value_or("supercell") == "column")
+                repeatCount = load.getDuration();
             loadRepeatCounts.push_back(repeatCount);
         }
         for (schedule::MemTransferOp transfer : mem_transfers) {
@@ -1083,7 +1099,10 @@ public:
         }
         for (schedule::SxmOp sxm : sxms) {
             builder.setInsertionPointAfter(sxm);
-            create_sxm_command(builder, sxm);
+            if (mlir::failed(create_sxm_command(builder, sxm))) {
+                signalPassFailure();
+                return;
+            }
         }
         for (schedule::MemReadOp read : reads) {
             const auto slices = placement_slices(read.getPlacement());
@@ -1126,6 +1145,7 @@ public:
                 max_latency = std::max(max_latency, *latency);
             }
             const int64_t command_base = stride < 0
+                && !(weightRead && target.throughput().mxm_prefill_weight_streams == 1)
                 ? base_row - (count - 1) * stride : base_row;
             const int64_t addressBinding =
                 source_binding_index(read.getInput()).value_or(-1);
@@ -1147,7 +1167,7 @@ public:
                 const int64_t packedStream = (west_stream ? 32 : 0)
                     + static_cast<int64_t>(read.getStreamBase())
                     + static_cast<int64_t>(index);
-                const auto loop = loop_3d(cycle, count, 1,
+                const auto loop = loop_3d(cycle, count, read.getRepeatInterval().value_or(1),
                     read.getWaveCount().value_or(1),
                     read.getWaveInterval().value_or(1),
                     read.getGroupCount().value_or(1),
@@ -1176,8 +1196,9 @@ public:
             builder.setInsertionPointAfter(load);
             const int64_t repeat_count =
                 loadRepeatCounts[loadIndex];
-            const int64_t columnsPerWave =
-                target.throughput().tile_rows;
+            const bool columnLoad = load.getWeightLoadMode().value_or("supercell") == "column";
+            const int64_t columnsPerWave = columnLoad
+                ? target.throughput().mxm_rows : target.throughput().tile_rows;
             const int64_t fullWaves = repeat_count / columnsPerWave;
             const int64_t tailColumns = repeat_count % columnsPerWave;
             const auto materializeLoadDomain = [&](int64_t startOffset,
@@ -1195,11 +1216,12 @@ public:
                     as_size(load.getWeightBuffer(), "weight buffer"),
                     mxm_buffer_mode(
                         load.getWeightBufferMode().value_or("fixed")),
-                    as_size(columnsPerWave - 1, "weight column"),
-                    {-1, 0, 0},
+                    as_size(columnLoad ? 0 : columnsPerWave - 1, "weight column"),
+                    {columnLoad ? 1 : -1, 0, 0},
                     as_size(load.getStreamBase(), "weight stream base"),
                     mxm_weight_input_mode(
                         load.getWeightInputMode().value_or("direct16")));
+                if (columnLoad) instruction.opcode = MxmLoadIcuOpcode::LoadColumn3D;
                 std::string error;
                 require_materialized(
                     command::materializeMxmLoad3DCommand(builder,

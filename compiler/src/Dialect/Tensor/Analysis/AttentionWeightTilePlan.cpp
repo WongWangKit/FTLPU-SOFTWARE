@@ -25,7 +25,8 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
         || headDim <= 0 || hidden % tile != 0
         || headDim % tile != 0 || memory.banks_per_slice < 2
         || initialBank < 0 || initialBank >= memory.banks_per_slice
-        || throughput.mxms_per_hemisphere != 1
+        || (throughput.mxms_per_hemisphere != 1
+            && throughput.mxms_per_hemisphere != 2)
         || loadSlices <= 0 || storage.size() < 2 * loadSlices
         || storage.size() % loadSlices != 0
         || streams.c2c_streams_per_direction <= 0)
@@ -34,8 +35,13 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
     const int64_t groups = storage.size() / loadSlices;
     const int64_t projectionReductionBlocks = hidden / tile;
     const int64_t outputReductionBlocks = queryHeads * headDim / tile;
-    const int64_t projectionRowsPerItem = projectionReductionBlocks * 8;
-    const int64_t outputRowsPerItem = outputReductionBlocks * 4;
+    // Each hemisphere stores two MXM output slots.  A 16-row MXM needs two
+    // weight pulses per slot, so all four rows can be packed without the
+    // four unused rows inherited from the 32-row layout.
+    const int64_t projectionRowsPerItem =
+        projectionReductionBlocks * 2 * (tile / 8);
+    const int64_t outputRowsPerItem = outputReductionBlocks
+        * throughput.tile_rows;
     const int64_t projectionItemsPerGroup =
         memory.sram_depth_rows / projectionRowsPerItem;
     // W8 output reads use a doubled physical reduction stride while adjacent
@@ -73,10 +79,9 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
         outputItems, outputItemsPerGroup);
     const bool disjointResidency =
         projectionGroupsUsed + outputGroups <= groups;
-    if (!disjointResidency
-        && std::max({queryGroups, keyGroups, valueGroups, outputGroups})
-            > groups)
-        return mlir::failure();
+    const bool multiPage =
+        std::max({queryGroups, keyGroups, valueGroups, outputGroups})
+            > groups;
 
     const auto transferCycles = [&](int64_t rows, int64_t columns) {
         return target.external_read_transfer_cycles(rows * columns);
@@ -137,6 +142,63 @@ mlir::FailureOr<AttentionWeightTilePlan> planAttentionWeightTiles(
             outputItemsPerGroup, outputItems,
             outputRowsPerItem, queryHeads * headDim, hidden),
     };
+    if (!multiPage) {
+        for (std::size_t kind = 0; kind < result.placements.size(); ++kind)
+            result.pages[kind].push_back(result.placements[kind]);
+        return result;
+    }
+
+    // An individual projection can exceed the entire bank on small SRAM
+    // targets. Page it by output item, never by an arbitrary row boundary:
+    // all reductions for an item remain resident while that item computes.
+    // Q -> V -> K -> O is the schedule's consumption order. Alternating
+    // banks across *pages* leaves the next transfer a different destination
+    // from the currently consumed page.
+    const std::array<AttentionWeightTileKind, 4> order = {
+        AttentionWeightTileKind::Query, AttentionWeightTileKind::Value,
+        AttentionWeightTileKind::Key, AttentionWeightTileKind::Output};
+    int64_t physicalPage = 0;
+    result.transfer_phase_count = 0;
+    result.bank_level_ping_pong = true;
+    for (AttentionWeightTileKind kind : order) {
+        const std::size_t index = static_cast<std::size_t>(kind);
+        const auto& whole = result.placements[index];
+        const int64_t itemsPerPage = groups * whole.items_per_slice_group;
+        if (itemsPerPage <= 0) return mlir::failure();
+        for (int64_t begin = 0; begin < whole.item_count;
+             begin += itemsPerPage) {
+            const int64_t count = std::min(
+                itemsPerPage, whole.item_count - begin);
+            AttentionWeightTilePlacement page = whole;
+            page.bank = (initialBank + physicalPage)
+                % memory.banks_per_slice;
+            page.page_index = static_cast<int64_t>(result.pages[index].size());
+            page.base_row = 0;
+            page.slice_group_begin = 0;
+            page.slice_group_count = divideCeil(
+                count, whole.items_per_slice_group);
+            page.item_begin = begin;
+            page.item_count = count;
+            page.rows = std::min(count, whole.items_per_slice_group)
+                * whole.rows_per_item;
+            // The byte count is proportional to the output items in this
+            // page; the final short page must not charge a full projection.
+            const int64_t totalColumns = kind == AttentionWeightTileKind::Output
+                ? hidden : kind == AttentionWeightTileKind::Query
+                    ? queryHeads * headDim : kvHeads * headDim;
+            const int64_t reductionRows = kind == AttentionWeightTileKind::Output
+                ? queryHeads * headDim : hidden;
+            page.transfer_cycles = transferCycles(reductionRows,
+                divideCeil(totalColumns * count, whole.item_count));
+            if (page.rows > memory.sram_depth_rows
+                || page.slice_group_count > groups)
+                return mlir::failure();
+            result.pages[index].push_back(page);
+            ++physicalPage;
+            ++result.transfer_phase_count;
+        }
+        result.placements[index] = result.pages[index].front();
+    }
     return result;
 }
 

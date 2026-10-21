@@ -7,6 +7,32 @@
 - 构建：`E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-common-barrier-ninja`。
 - 本文所述日志、二进制和统计：`E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-common-barrier-e2e`。
 
+## 推送前合并远端 main 后的复验
+
+本次合入 SOFTWARE 远端 `1dd422a` 与 CMODEL 远端 `20020fe`，没有合并实验分支。CMODEL 的协议提交为 `ae19ce6`，合并后 main 为 `bc84188`。SOFTWARE 同时保留本地 Raw CLI、staging、seq128 修复及远端的可配置硬件、直接 lowering 和原生执行更新。
+
+合并时修正了三处衔接：大 SRAM 配置继续使用已有平面 input staging，避免 distributed 直接读与 QKV 写回占用同一 MEM Context；MXM→VXM 的返回相位按实际 VXM 列数和 MXM 首结果延迟推导，避免固定提前两拍；驻留 QKV 保留已支持的 N 半波尾块打包。RoPE 测试同时检查新增输出返回阶段，驻留尾块按地址逐字节对照完整补零镜像，没有删除资源检查、同步或搬运控制。
+
+- SOFTWARE 最终相关回归 **14/14** 通过，55.55 秒，日志 `push-final-regressions.log`。包含真实 Raw CLI、seq128 完整双路径编译、容器/运行时/ModelSession/ping-pong 及相关编译器测试。
+- CMODEL 合并后相关回归 **9/9** 通过，2.02 秒，日志为 CMODEL main 的 `out/push-merge-tests.log`。
+- `weight_page_builder_test --paged-output-tail` 通过，保留分页 16/32/64 的覆盖，并增加已支持的 32 字节物理行驻留 attention 尾块验证。
+- seq128 默认产物 **1,640,659 字节**，Raw Macro **343,391 字节**，均经完整编译、二进制读取和 i-MEM 检查；MEM/MXM 没有静默回退。seq128 真实分页数值执行仍未验证。
+
+合并后重新编译并实际执行 seq32 完整 attention + FFN，再跑两档 DDR。18,432 个 BF16 输出与原生基线逐字节一致，相对 CPU 最大误差 0.03125；attention residual 误差 0，RMS2 最大误差 0.015625。FFN hidden 的硬件参考误差及东西副本误差均为 0。两次 linked 文件完全相同，SHA256 为 `D7695E25FE65DE8171EBEF2C57707BB0C3742246054B9F902CBD6E503ECF0B66`。
+
+| 合并后实测 | DDR 51,200 MB/s | DDR 25,600 MB/s |
+| --- | ---: | ---: |
+| 主执行逻辑周期（max_cycle + drain 64） | 79,972 | 79,972 |
+| HOLD 物理周期 | 29,193 | 55,528 |
+| 主执行物理周期（逻辑周期 + HOLD） | 109,165 | 135,500 |
+| 启动权重等待（另计） | 1,849 | 3,375 |
+| 屏障 / page-use 实例 | 2 / 7 | 2 / 7 |
+| MEM 同步写控制 / 实际 FU 写 | 104 / 82,944 | 104 / 82,944 |
+
+最终表为 `(29556,196608,members=0,1)`、`(62092,196610,members=2..6)`；两个有成本排空窗口仍各为 62 个逻辑周期。计算 i-MEM 为 92,992 字节，搬运控制为 9,144 字节，有效 Barrier RAM 为 16 字节，合计 102,152 字节；完整 linked 容器为 152,318 字节。目标实际配置的 Barrier RAM 容量仍为 8,192 字节，不等于本程序使用的 16 字节。
+
+日志 `push-decoder-51200.log`、`push-decoder-25600.log` 和 `push-decoder-linked.inspect.log` 保存本次执行及存储统计。以下首次验收表格和文件哈希保留为历史记录；当前 main 的合并后结果以本节为准。静态逻辑等价工具仍不能展开运行时事件控制；没有通过排除搬运队列绕过该限制。本次针对性回归不等同于全量模型/硬件配置验收。
+
 ## 已实现的协议
 
 每任务每芯片一张公共表，容量 1024 项，每项 `{uint32 stop_cycle, uint32 event_id}`。当前、下一项缓存；成员完成状态有 65535 的有限上限。空表有效，损坏、溢出、孤立事件、重复项、过期周期和未完成最终链接均明确报错。`generation` 是运行时状态；实例编号指向一次具体装入，重复装入相同页不能复用旧完成状态。

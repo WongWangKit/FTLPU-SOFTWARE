@@ -30,7 +30,7 @@ public:
 private:
     mlir::WalkResult reserveMemPlacement(mlir::Operation* operation,
         mlir::DictionaryAttr placement, int64_t cycle, int64_t duration,
-        llvm::StringRef port)
+        llvm::StringRef port, int64_t repeatInterval = 1)
     {
         const auto hemisphereAttr =
             placement.getAs<mlir::StringAttr>("hemisphere");
@@ -56,10 +56,10 @@ private:
                     + std::to_string(bank) + ".";
                 auto queueResult = reserve(operation,
                     base + "icu",
-                    cycle, duration, 1);
+                    cycle, duration, repeatInterval);
                 if (queueResult.wasInterrupted()) return queueResult;
                 auto portResult = reserve(operation, base + port.str(),
-                    cycle, duration, 1);
+                    cycle, duration, repeatInterval);
                 if (portResult.wasInterrupted()) return portResult;
             }
         }
@@ -106,7 +106,8 @@ private:
                     << start << ", " << end << ") with "
                     << interval.operation->getName() << " ["
                     << interval.start << ", " << interval.end << ")"
-                    << "; current attributes " << operation->getAttrDictionary()
+                    << "; current attributes "
+                    << operation->getAttrDictionary()
                     << "; existing attributes "
                     << interval.operation->getAttrDictionary();
                 return mlir::WalkResult::interrupt();
@@ -116,7 +117,11 @@ private:
             if (cycle >= start && cycle < end) {
                 operation->emitError()
                     << "resource '" << resource << "' overlaps at cycle "
-                    << cycle << " with " << owner->getName();
+                    << cycle << " with " << owner->getName()
+                    << "; current attributes "
+                    << operation->getAttrDictionary()
+                    << "; existing attributes "
+                    << owner->getAttrDictionary();
                 return mlir::WalkResult::interrupt();
             }
         }
@@ -135,7 +140,7 @@ private:
                         op.getPlacement(), op.getCycle()
                             + group * op.getGroupInterval().value_or(1)
                             + wave * op.getWaveInterval().value_or(1),
-                        op.getDuration(), "read");
+                        op.getDuration(), "read", op.getRepeatInterval().value_or(1));
                     if (result.wasInterrupted()) return result;
                 }
             }

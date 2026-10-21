@@ -29,6 +29,8 @@ struct AttentionWeightTilePlacement {
     int64_t item_count;
     int64_t rows_per_item;
     int64_t transfer_cycles;
+    // Index of the first output item covered by this resident page.
+    int64_t item_begin{0};
 };
 
 struct AttentionWeightTilePlan {
@@ -40,10 +42,17 @@ struct AttentionWeightTilePlan {
     bool bank_level_ping_pong{false};
     llvm::SmallVector<int64_t, 32> storage_slices;
     std::array<AttentionWeightTilePlacement, 4> placements;
+    // A projection can exceed one physical bank. In that case each entry
+    // describes one independently transferred and consumed resident page.
+    std::array<llvm::SmallVector<AttentionWeightTilePlacement, 16>, 4> pages;
 
     const AttentionWeightTilePlacement& get(
         AttentionWeightTileKind kind) const {
         return placements[static_cast<std::size_t>(kind)];
+    }
+    llvm::ArrayRef<AttentionWeightTilePlacement> getPages(
+        AttentionWeightTileKind kind) const {
+        return pages[static_cast<std::size_t>(kind)];
     }
 };
 

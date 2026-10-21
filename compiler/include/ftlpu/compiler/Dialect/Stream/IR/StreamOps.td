@@ -226,6 +226,16 @@ def SoftmaxTaskOp : FTLPU_Stream_Op<"softmax_task", [Pure]> {
   let hasVerifier = 1;
 }
 
+def L2NormTaskOp : FTLPU_Stream_Op<"l2_norm_task", [Pure]> {
+  let summary = "L2 square-sum feedback and scalar normalization through VXM";
+  let arguments = (ins AnyRankedTensor:$input, I64Attr:$axis,
+      F32Attr:$epsilon, F32Attr:$scale, ArrayAttr:$routes,
+      ArrayAttr:$input_allocations, ArrayAttr:$scratch_allocations, ArrayAttr:$result_allocations);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def RmsNormTaskOp : FTLPU_Stream_Op<"rms_norm_task", [Pure]> {
   let summary = "RMS normalization routed through VXM and MXM reduction resources";
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,

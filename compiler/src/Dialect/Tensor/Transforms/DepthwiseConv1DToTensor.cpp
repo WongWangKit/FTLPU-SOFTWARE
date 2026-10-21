@@ -36,8 +36,23 @@ mlir::LogicalResult lower_depthwise_conv1d(kernel::DepthwiseConv1DOp op,
     auto weight = customPlan(op.getWeight(), PlacementKind::Weight,
         {0, 1, 2, 3, 4, 5, 6, 7}, "fp16_depthwise_kernel4",
         op.getKernelSize() * featureBlocks, "west");
+    const auto function = op->getParentOfType<mlir::func::FuncOp>();
+    const auto distributed = function->getAttrOfType<mlir::BoolAttr>(
+        "ftlpu.depthwise_conv_distributed_output");
+    const bool distributedOutput = distributed && distributed.getValue();
+    llvm::SmallVector<int64_t> resultSlices;
+    if (distributedOutput) {
+        for (int64_t slice = 8; slice < 24; ++slice)
+            resultSlices.push_back(slice);
+    } else {
+        resultSlices = {48, 49};
+    }
     auto result = customPlan(op.getResult(), PlacementKind::FinalResult,
-        {48, 49}, "fp16_pair_planar", tokens * featureBlocks, "west");
+        resultSlices,
+        distributedOutput ? "fp16_mxm_distributed_16" : "fp16_pair_planar",
+        distributedOutput ? tokens * featureBlocks / 8
+                          : tokens * featureBlocks,
+        "west");
     auto bytes = get_static_tensor_bytes(op.getResult().getType());
     if (mlir::failed(input) || mlir::failed(weight)
         || mlir::failed(result) || mlir::failed(bytes))

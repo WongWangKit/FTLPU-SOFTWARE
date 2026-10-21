@@ -82,8 +82,8 @@ bool same_read_body(schedule::MemReadOp lhs, schedule::MemReadOp rhs,
 bool same_vxm_body(schedule::VxmOp lhs, schedule::VxmOp rhs)
 {
     for (llvm::StringRef name : {"queue", "opcode", "lhs_kind",
-             "lhs_index", "lhs_immediate", "lhs_stream_source",
-             "rhs_kind", "rhs_index", "rhs_stream_source",
+             "lhs_index", "lhs_immediate", "lhs_stream_source", "lhs_stream_tap",
+             "rhs_kind", "rhs_index", "rhs_stream_source", "rhs_stream_tap",
              "rhs_immediate", "cast_target", "output_stream",
                "input_hemisphere", "output_hemisphere", "scale_binding",
                "chain_depth",

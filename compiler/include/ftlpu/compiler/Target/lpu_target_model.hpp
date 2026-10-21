@@ -85,6 +85,8 @@ struct ThroughputModel {
     int64_t mxm_columns = hw::kMxmColumns;
     int64_t mxm_load_streams_per_cycle = hw::kMxmLoadStreamsPerCycle;
     int64_t mxm_int8_load_streams_per_cycle = hw::kMxmInt8LoadStreamsPerCycle;
+    // Software-selected W8 prefill ingress: full supercell or serial columns.
+    int64_t mxm_prefill_weight_streams = 8;
     int64_t mxm_load_bytes_per_cycle = hw::kMxmLoadBytesPerCycle;
     int64_t mxm_activation_streams = 4;
     int64_t mxm_result_streams = 4;

@@ -65,6 +65,17 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
     result.second_projection_offset = 0;
     const int64_t reductionBlocks = shape.k / tile;
     const int64_t totalBlocks = result.pair_count * reductionBlocks;
+    // Keep one affine load phase across every output pair. A pair-boundary
+    // compute gap can make its first two buffers safe earlier, but using
+    // that temporary slack changes the reduction-domain interval at every
+    // pair, not just at program startup. The direct 3-D emitter needs the
+    // steady-state phase for the whole resident domain.
+    const int64_t dualMxmLoadDelay = localWeightDequant && !singleMxm
+            && throughput.mxm_prefill_weight_streams != 1
+        ? std::max<int64_t>(0, tile + target.mxm_first_result_latency()
+              - (throughput.mxm_weight_buffers - 1)
+                  * result.projection_slot_interval)
+        : 0;
 
     for (int64_t pair = 0; pair < result.pair_count; ++pair) {
         for (int64_t reduction = 0; reduction < reductionBlocks;
@@ -76,10 +87,14 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
             block.weight_compute_cycle = result.initial_compute_cycle
                 + block.index * result.projection_block_interval
                 + (supportsDensePairHandoff ? 0 : pair * tile);
-            block.dequant_start = block.weight_compute_cycle - tile;
+            block.dequant_start =
+                block.weight_compute_cycle - tile + dualMxmLoadDelay;
             block.weight_buffer = block.index
                 % throughput.mxm_weight_buffers;
-            if (localWeightDequant
+            // Ascending IWColumn follows the previous wave's column skew:
+            // each column is overwritten only after its final old use. The
+            // short supercell burst instead needs whole-buffer drain.
+            if (localWeightDequant && throughput.mxm_prefill_weight_streams != 1
                 && ((singleMxm && !result.blocks.empty())
                     || (!singleMxm
                         && block.index
@@ -183,7 +198,13 @@ mlir::FailureOr<FfnProjectionTimeline> planFfnProjectionTimeline(
         result.second_projection_offset =
             lastFirstProjectionCycle - result.initial_compute_cycle
             + result.projection_slot_interval
-            + (localWeightDequant ? target.mxm_first_result_latency() : 0);
+            + (localWeightDequant ? target.mxm_first_result_latency() : 0)
+            // Single-stream ingress occupies the whole tile. Finish the
+            // preceding MEM-to-MXM wave before the next projection's page
+            // rendezvous, so SYNC never cuts across that live ingress wave.
+            // This is fixed on-chip transport drain, not a DDR prediction.
+            + (localWeightDequant && throughput.mxm_prefill_weight_streams == 1
+                ? target.streams().system_register_columns : 0);
         result.final_projection_cycle = lastFirstProjectionCycle
             + result.second_projection_offset;
     } else {

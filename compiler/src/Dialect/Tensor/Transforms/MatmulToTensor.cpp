@@ -60,20 +60,42 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
         const int64_t lhsBytes = lhsType.getNumElements() * 2;
         const int64_t rhsBytes = rhsType.getNumElements();
         const int64_t resultBytes = resultType.getNumElements() * 2;
-        const auto input = fixed_allocation(PlacementKind::Activation,
+        auto input = fixed_allocation(PlacementKind::Activation,
             llvm::ArrayRef<int64_t>(activationSlices).take_front(2),
             0, op.getM() * op.getK() / tile, lhsBytes,
             "fp16_pair_planar", "both");
-        const auto weight = fixed_allocation(PlacementKind::Weight,
+        auto weight = fixed_allocation(PlacementKind::Weight,
             weightSlices, 0,
             (op.getN() / (2 * tile)) * (op.getK() / tile) * 4,
             rhsBytes, "w8a16_mxm_weight_striped", "both");
-        const auto result = fixed_allocation(PlacementKind::FinalResult,
+        auto result = fixed_allocation(PlacementKind::FinalResult,
             llvm::ArrayRef<int64_t>(resultSlices).take_front(2), 0,
             op.getM() * op.getN() / (2 * tile),
             resultBytes, "fp16_hemisphere_pair_planar", "both",
             target.memory().banks_per_slice > 1 ? 1 : 0);
-        const auto memoryPlan = rewriter.getDictionaryAttr({
+        const bool replicated = llvm::any_of(op.getResult().getUsers(),
+            [](mlir::Operation* user) { return llvm::isa<kernel::SigmoidMultiplyOp>(user); });
+        mlir::DictionaryAttr sourceInput;
+        if (replicated) {
+            auto inherited = get_value_placement(op.getLhs());
+            if (mlir::failed(inherited)) {
+                op.emitError("gated projection requires a planned activation input");
+                return mlir::failure();
+            }
+            sourceInput = *inherited;
+            const auto storage = target.weight_storage_slices();
+            if (storage.size() < 8) {
+                op.emitError("gated projection requires eight weight storage slices");
+                return mlir::failure();
+            }
+            input.slices = {storage[storage.size()-8], storage[storage.size()-7]};
+            input.bank = target.memory().banks_per_slice > 1 ? 1 : 0;
+            result = fixed_allocation(PlacementKind::Result,
+                resultSlices,
+                target.memory().words_per_bank/2, op.getM()*op.getN()/(2*tile),
+                resultBytes, "fp16_pair_planar", "both", input.bank);
+        }
+        auto memoryPlan = rewriter.getDictionaryAttr({
             rewriter.getNamedAttr(
                 "input", make_placement_attr(rewriter, input)),
             rewriter.getNamedAttr(
@@ -81,7 +103,7 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             rewriter.getNamedAttr(
                 "result", make_placement_attr(rewriter, result)),
         });
-        const auto config = rewriter.getDictionaryAttr({
+        auto config = rewriter.getDictionaryAttr({
             rewriter.getNamedAttr(
                 "m", rewriter.getI64IntegerAttr(op.getM())),
             rewriter.getNamedAttr(
@@ -91,7 +113,35 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             rewriter.getNamedAttr(
                 "rhs_scale", op.getRhsScaleAttr()),
         });
+        if (replicated) {
+            mlir::NamedAttrList plan(memoryPlan);
+            plan.set("source_input", sourceInput);
+            mlir::NamedAttrList paged(make_placement_attr(rewriter, weight));
+            paged.set("paged_weight", rewriter.getBoolAttr(true));
+            paged.set("page_count", rewriter.getI64IntegerAttr(1));
+            paged.set("page_rows", rewriter.getI64IntegerAttr(weight.instruction_count));
+            paged.set("page_granularity", rewriter.getI64IntegerAttr(op.getN()/(2*tile)));
+            paged.set("page_items_per_slice_group", rewriter.getI64IntegerAttr(op.getN()/(2*tile)));
+            paged.set("page_role_group_base", rewriter.getI64IntegerAttr(0));
+            paged.set("page_role_group_count", rewriter.getI64IntegerAttr(1));
+            paged.set("page_bank_count", rewriter.getI64IntegerAttr(2));
+            paged.set("page_storage_slices", rewriter.getI64ArrayAttr(weight.slices));
+            plan.set("weight", paged.getDictionary(rewriter.getContext()));
+            for (auto key : {"input", "result"}) {
+                mlir::NamedAttrList locked(llvm::cast<mlir::DictionaryAttr>(plan.get(key)));
+                locked.set("bank_locked", rewriter.getBoolAttr(true));
+                plan.set(key, locked.getDictionary(rewriter.getContext()));
+            }
+            memoryPlan = plan.getDictionary(rewriter.getContext());
+            mlir::NamedAttrList flags(config);
+            flags.set("replicated_result", rewriter.getBoolAttr(true));
+            config = flags.getDictionary(rewriter.getContext());
+        }
         const mlir::Value oldResult = op.getResult();
+        if (replicated && mlir::failed(planner.bind(oldResult, result))) {
+            op.emitError("gated projection result conflicts with a live dense tensor");
+            return mlir::failure();
+        }
         rewriter.setInsertionPoint(op);
         mlir::OperationState state(
             op.getLoc(), tensor::ProjectionTaskOp::getOperationName());

@@ -40,6 +40,9 @@ std::pair<VxmOp, VxmOp> emitFfnSwishAlu(
     const auto source = rewriter.getStringAttr(hemi);
     head->setAttr("lhs_stream_source", source);
     head->setAttr("rhs_stream_source", source);
+    // C4 reads the original Gate operand again after C0 negates it.
+    // Keep the input stream alive through the intervening VXM columns.
+    head->setAttr("lhs_stream_tap", rewriter.getBoolAttr(true));
     mlir::Value value = head.getResult();
     value = create_vxm(rewriter, location, value, upValue,
         resultType, cycle, column(1), "exp", "alu", column(0), 0,
@@ -87,6 +90,11 @@ mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
     const int64_t kVxmSwishLatency =
         pipelineLatency >= 0 ? pipelineLatency
             : ffn_swish_result_latency(target);
+    // The extra passive half of a 32-column VXM commits its egress to the
+    // opposite MEM fabric on the following cycle.
+    // Explicit physical-SR latency already includes the egress commit.
+    const int64_t egressCommitPhase =
+        pipelineLatency < 0 && target.throughput().vxm_alus > 16 ? 1 : 0;
     const int64_t tile = target.throughput().mxm_rows;
     const int64_t blockRows = target.throughput().mxm_block_rows;
     const int64_t destination = 1 - sourceHemisphere;
@@ -120,7 +128,8 @@ mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
         auto placement = schedule_placement(rewriter, {slice}, address,
             innerCount, 1, hemisphere_name(hemisphere), kind, hiddenBank);
         auto write = rewriter.create<MemWriteOp>(plan.getLoc(), output,
-            inputCycle + firstRow + kVxmSwishLatency + *latency,
+            inputCycle + firstRow + kVxmSwishLatency + *latency
+                + egressCommitPhase,
             innerCount, stream + byte, 1, 0,
             rewriter.getStringAttr("east"), plan.getHidden0Address(),
             placement, innerCount * tile);
@@ -167,7 +176,8 @@ mlir::Value emitFfnSwishResultTile(mlir::IRRewriter& rewriter,
                     target::StreamDirection::East, slice);
                 if (!latency) continue;
                 emitFfnMemTransfer3D(rewriter, plan.getLoc(),
-                    inputCycle + tokenLane + kVxmSwishLatency + *latency,
+                    inputCycle + tokenLane + kVxmSwishLatency + *latency
+                        + egressCommitPhase,
                     destination, slice, "write", address,
                     destinationStream + byte, occurrenceCount, blockRows, 1,
                     hiddenBank, outerDomain);

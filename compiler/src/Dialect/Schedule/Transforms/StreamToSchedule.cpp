@@ -104,9 +104,11 @@ void sequentializeScheduleStages(mlir::func::FuncOp function,
                     integerAttribute(*operation, "repeat_count", 1);
                 const int64_t repeatInterval =
                     integerAttribute(*operation, "repeat_interval", 1);
-                const int64_t duration = std::max<int64_t>(1,
+                int64_t duration = std::max<int64_t>(1,
                     integerAttribute(*operation, "duration",
                         (repeatCount - 1) * repeatInterval + 1));
+                if (llvm::isa<schedule::MemReadOp>(operation))
+                    duration = (duration - 1) * repeatInterval + 1;
                 const int64_t waveSpan =
                     (integerAttribute(*operation, "wave_count", 1) - 1)
                     * integerAttribute(*operation, "wave_interval", 1);
@@ -292,6 +294,12 @@ public:
                     + std::to_string(ffnIndex));
             ++ffnIndex;
         }
+        if (mlir::failed(schedule::lowerLinearProjectionSchedules(
+                rewriter, function, target))) {
+            signalPassFailure();
+            return;
+        }
+        reportStage("linear-projection");
         if (mlir::failed(
                 schedule::lowerAttentionSchedules(
                     rewriter, function, target, attention_strategy_,
@@ -306,12 +314,11 @@ public:
             return;
         }
         reportStage("rmsnorm");
-        if (mlir::failed(schedule::lowerLinearProjectionSchedules(
-                rewriter, function, target))) {
+        if (mlir::failed(schedule::lowerL2NormSchedules(rewriter, function, target))) {
             signalPassFailure();
             return;
         }
-        reportStage("linear-projection");
+        reportStage("l2norm");
         if (mlir::failed(schedule::lowerDepthwiseConv1DSchedules(
                 rewriter, function, target))) {
             signalPassFailure();

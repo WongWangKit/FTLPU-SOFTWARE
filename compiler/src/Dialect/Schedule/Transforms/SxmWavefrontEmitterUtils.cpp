@@ -73,20 +73,28 @@ void emitSxm(mlir::IRRewriter& rewriter, mlir::Location location,
     rewriter.create(state);
 }
 
-std::array<int64_t, 32> identityMap()
+llvm::SmallVector<int64_t, 64> identityMap(int64_t width)
 {
-    std::array<int64_t, 32> map {};
+    llvm::SmallVector<int64_t, 64> map(
+        static_cast<std::size_t>(width));
     for (int64_t lane = 0; lane < static_cast<int64_t>(map.size()); ++lane)
         map[static_cast<std::size_t>(lane)] = lane;
     return map;
 }
 
-std::array<int64_t, 32> blockDiagonalMap(int64_t diagonal,
+llvm::SmallVector<int64_t, 64> identityMap(
     const target::LPUTargetModel& target)
 {
-    auto map = identityMap();
+    return identityMap(target.throughput().tile_rows
+        * target.throughput().lanes_per_tile);
+}
+
+llvm::SmallVector<int64_t, 64> blockDiagonalMap(int64_t diagonal,
+    const target::LPUTargetModel& target)
+{
     const int64_t rows = target.throughput().tile_rows;
     const int64_t lanes = target.throughput().lanes_per_tile;
+    auto map = identityMap(rows * lanes);
     for (int64_t destination = 0; destination < rows; ++destination) {
         const int64_t source = (diagonal + rows - destination) % rows;
         for (int64_t lane = 0; lane < lanes; ++lane)
@@ -107,7 +115,7 @@ void emitWavefrontBeat(mlir::IRRewriter& rewriter, mlir::Location location,
     requirePhysicalWidth(target, sourceStreams, transposeStreams);
     requirePhysicalWidth(target, transposeStreams, destinationStreams);
     emitSxm(rewriter, location, cycle, hemisphere, "transpose",
-        sourceStreams, transposeStreams, identityMap());
+        sourceStreams, transposeStreams, identityMap(target));
     emitSxm(rewriter, location, cycle + 1, hemisphere, "permute",
         transposeStreams, destinationStreams,
         blockDiagonalMap(diagonal, target), weightLayout);
