@@ -181,6 +181,22 @@ std::uint64_t native_mem_release_before(
                 cursor += duration;
                 if (cursor < plan.ready_cycle) queueRelease = cursor;
                 pc += fu_3d_raw_packet_word_count(queue.kind, command);
+            } else if (is_macro_schedule_command(command)) {
+                // Keep the Native scratch-release lower bound after a loop
+                // becomes Raw Macro. This can only delay page reuse; it does
+                // not authorize an additional pause point or transport slot.
+                const auto macro = decode_macro_schedule_command(command);
+                const auto innerSpan = static_cast<std::uint64_t>(macro.inner_count - 1) * macro.inner_interval;
+                const auto outerSpan = static_cast<std::uint64_t>(macro.outer_count - 1) * macro.outer_interval;
+                if (outerSpan > std::numeric_limits<std::uint64_t>::max() - innerSpan)
+                    throw std::overflow_error("Macro scratch-release span overflows");
+                const auto span = innerSpan + outerSpan;
+                if (span >= std::numeric_limits<std::uint64_t>::max() - macro.start_cycle)
+                    throw std::overflow_error("Macro scratch-release timeline overflows");
+                const auto end = static_cast<std::uint64_t>(macro.start_cycle) + span + 1;
+                if (end < plan.ready_cycle) queueRelease = std::max(queueRelease, end);
+                cursor = std::max(cursor, end);
+                ++pc;
             } else if (is_icu_control_raw_word_command(command)) {
                 ++cursor; ++pc;
             } else {
@@ -627,7 +643,13 @@ void schedule_weight_prefetches(const BinaryProgram& program,
             + hw::kTileRows + activeLanes;
         durations[index] = c2cCycles + transportGuard;
         plan.transfer_end_cycle = plan.start_cycle + durations[index];
-        nextTransportCursor = plan.transfer_end_cycle;
+        // Common barriers serialize these transfers on physical time while
+        // L is held at C. Carrying their durations into the next logical
+        // lower bound would incorrectly reject same-C all-of dependencies.
+        // SRAM reuse still constrains each individual page above; the final
+        // linker and runtime enforce the physical transport dependency DAG.
+        if (!program.common_barrier_protocol)
+            nextTransportCursor = plan.transfer_end_cycle;
     }
 }
 

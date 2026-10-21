@@ -81,7 +81,7 @@ void emitMemColumnDomain(mlir::IRRewriter& rewriter,
     int64_t columnCount, int64_t columnInterval,
     int64_t columnAddressStride, int64_t bank, bool splitColumns)
 {
-    if (!splitColumns || columnCount == 1) {
+    if (!splitColumns) {
         direct_domain_detail::emitMem3D(rewriter, location, target,
             cycle, queue, opcode, address, packedStream,
             repeatCount, repeatInterval, addressStride,
@@ -93,12 +93,16 @@ void emitMemColumnDomain(mlir::IRRewriter& rewriter,
     // alternate READ_3D and WRITE_3D.  Each emitted command is already a
     // closed hardware domain; no later pass splits or moves it.
     for (int64_t column = 0; column < columnCount; ++column) {
-        direct_domain_detail::emitMem3D(rewriter, location, target,
-            cycle + column * columnInterval, queue, opcode,
-            address + column * columnAddressStride, packedStream,
-            repeatCount, repeatInterval, addressStride,
-            waveCount, waveInterval, waveAddressStride,
-            1, 1, 0, -1, bank);
+        // Aliasing input/output queues also alternate inside each token
+        // tile. Retire one contiguous pair before another opcode uses it.
+        for (int64_t wave = 0; wave < waveCount; ++wave)
+            direct_domain_detail::emitMem3D(rewriter, location, target,
+                cycle + column * columnInterval + wave * waveInterval,
+                queue, opcode,
+                address + column * columnAddressStride
+                    + wave * waveAddressStride, packedStream,
+                repeatCount, repeatInterval, addressStride,
+                1, 1, 0, 1, 1, 0, -1, bank);
     }
 }
 
@@ -307,7 +311,6 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
     // VXM still consumes one element per cycle, and all operand/result
     // addresses use the same pair-major permutation.
     const bool pairMajorMemOrder = resultDistributed
-        && (rows == tile || singleRowDecode)
         && (sharesMemQueue(lhsPlacement, resultPlacement)
             || sharesMemQueue(rhsPlacement, resultPlacement));
     const bool closedColumnDomain = resultDistributed
@@ -554,14 +557,17 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                     && usesMemQueue(
                         resultPlacement, address.bank, slice);
                 if (pairMajorMemOrder) {
+                    for (int64_t tokenBlock = 0;
+                         tokenBlock < (singleRowDecode ? 1 : rows / tile);
+                         ++tokenBlock)
                     emitMemColumnDomain(
                         rewriter, op.getLoc(), target,
-                        inputCycle - westLatency(slice),
+                        inputCycle + tokenBlock * tile - westLatency(slice),
                         sourceHemisphere
                                 * target.memory().slices_per_hemisphere
                             + slice,
-                        "read", address.row, streamBase + byte,
-                        tileRows, 1,
+                        "read", address.row + tokenBlock * tile,
+                        streamBase + byte, tileRows, 1,
                         singleRowDecode ? 0 : lanes,
                         singleRowDecode ? 1 : lanes, tileRows, 1,
                         columnDomainCount, activeColumnInterval,
@@ -910,13 +916,16 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
                                     persistent->bank, slice)
                                 || usesMemQueue(rhsPlacement,
                                     persistent->bank, slice));
+                        for (int64_t tokenBlock = 0;
+                             tokenBlock < (pairMajorMemOrder ? tokenBlocks : 1);
+                             ++tokenBlock)
                         emitMemColumnDomain(
                             rewriter, op.getLoc(), target,
-                            persistentWriteCycle,
+                            persistentWriteCycle + tokenBlock * tile,
                             validOutputHemisphere
                                     * target.memory().slices_per_hemisphere
                                 + slice,
-                            "write", persistent->row,
+                            "write", persistent->row + tokenBlock * tile,
                             streamBase + byte,
                             pairMajorMemOrder ? tileRows : rows,
                             1, singleRowDecode ? 0

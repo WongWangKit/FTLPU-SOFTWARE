@@ -206,11 +206,14 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     };
 
     int64_t phaseStart = transposeEnd;
-    if (singleMxm
-        && headBlocks > target_.throughput().mxm_weight_buffers) {
-        // A head may contain more 32-column blocks than the physical MXM has
-        // weight buffers. Page one block at a time, retain each block's ACC
-        // rows across key blocks, and emit it before reusing the buffer. A
+    const int64_t accumulatorCapacity = target_.throughput().mxm_accumulator_blocks * tile;
+    const bool serializeHeadBlocks = singleMxm
+        && (headBlocks > target_.throughput().mxm_weight_buffers
+            || queryBlocks * tile * headBlocks > accumulatorCapacity);
+    if (serializeHeadBlocks) {
+        // Serialize head blocks when either weights or live partials exceed
+        // physical capacity. Retain one head block's query rows across key
+        // blocks, drain its final partials, then reuse that ACC window.
         // Forward the result through the passive VXM bridge so both
         // hemispheres own a complete planar context.
         const bool pipelineHeadBlocks = queryBlocks == 1;

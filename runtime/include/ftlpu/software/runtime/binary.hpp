@@ -13,7 +13,8 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 36;
+inline constexpr std::uint32_t kBinaryFormatVersion = 37;
+inline constexpr std::uint32_t kBinaryCommonBarrierMaxCompletionInstances = 65535;
 
 enum class BindingAccess : std::uint16_t {
     Input = 0,
@@ -156,6 +157,9 @@ struct BinaryWeightPageUse {
     // disjoint from every startup page. This is used for the next ping-pong
     // epoch so its C2C transfer overlaps current-epoch compute.
     bool runtime_prefetch{false};
+    // Zero in compiler candidates and pre-execution loads. A final runtime
+    // transport instance binds the DMA/RX launch WAIT to its common stop.
+    std::uint32_t transport_launch_event_id{0};
 };
 
 enum class VxmImmediateOperand : std::uint16_t {
@@ -180,6 +184,7 @@ struct BinaryAddressRelocation {
     std::uint32_t command_index{0};
     // ReadWrite has a second independently relocatable SRAM address.
     bool write_port{false};
+    bool transport_queue{false};
 };
 
 struct BinaryTimeline {
@@ -195,12 +200,33 @@ struct BinaryMemoryFloor {
     std::uint16_t bank{0};
 };
 
+// One table per task/chip, in common computation logical cycles. A stop at
+// C is checked before any Native or Macro computation can issue at C.
+struct BinaryBarrier {
+    std::uint32_t stop_cycle{0};
+    std::uint32_t event_id{0};
+};
+
+struct BinaryBarrierEvent {
+    std::uint32_t event_id{0};
+    // All-of completion dependencies. Each index identifies one concrete
+    // weight_page_uses record, including repeated loads of the same page.
+    // Completion means the entire instance is committed to visible SRAM.
+    std::vector<std::uint32_t> page_use_indices{};
+};
+
 struct BinaryProgram {
     std::string target_name{std::string(kLpu32StreamTargetName)};
     std::uint64_t target_abi{kLpu32StreamTargetAbi};
     ExecutableHardwareConfig hardware{};
     std::size_t max_cycle{0};
     std::vector<QueueProgram> queues{};
+    // Physically independent finite Native MEM control queues. They continue
+    // advancing on physical time while computation is held.
+    std::vector<QueueProgram> transport_queues{};
+    bool common_barrier_protocol{false};
+    std::vector<BinaryBarrier> barriers{};
+    std::vector<BinaryBarrierEvent> barrier_events{};
     std::vector<BinaryBinding> bindings{};
     std::vector<BinaryTimeline> timelines{};
     // Per-physical-slice upper bounds for statically addressed command
@@ -215,6 +241,10 @@ struct BinaryProgram {
     // range from the inbound West direction after its release point.
     std::vector<std::uint64_t> stream_release_cycles{};
 };
+
+// Checked conversion for linker arithmetic; never truncate a logical cycle.
+BinaryBarrier make_binary_barrier(std::uint64_t stop_cycle, std::uint32_t event_id);
+void validate_binary_barriers(const BinaryProgram& program);
 
 void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path);
 BinaryProgram read_binary_program(const std::filesystem::path& path);

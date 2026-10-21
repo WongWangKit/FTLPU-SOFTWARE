@@ -352,6 +352,14 @@ if(MSVC)
 endif()
 
 if(Python3_Interpreter_FOUND)
+    add_test(NAME smollm2_seq128_compile_test
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smollm2_seq128_compile_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --inspect $<TARGET_FILE:ftlpu_binary_inspect>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/smollm2_135m_decoder_layer/decoder_layer_seq128.stablehlo.mlir
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/seq128_compile)
     add_test(NAME direct_raw_macro_cli_test
         COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/direct_raw_macro_cli_test.py

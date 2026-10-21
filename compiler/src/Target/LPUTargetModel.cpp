@@ -421,6 +421,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_ICU_MEMORY(mxm_macro_contexts);
     READ_ICU_MEMORY(mem_macro_context_bits);
     READ_ICU_MEMORY(mxm_macro_context_bits);
+    READ_ICU_MEMORY(common_barrier_encoding_version);
+    READ_ICU_MEMORY(common_barrier_capacity);
 #undef READ_ICU_MEMORY
 
     if (mlir::failed(model.validate(&error))) return mlir::failure();
@@ -566,6 +568,8 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_ICU_MEMORY(mxm_macro_contexts);
     READ_ICU_MEMORY(mem_macro_context_bits);
     READ_ICU_MEMORY(mxm_macro_context_bits);
+    READ_ICU_MEMORY(common_barrier_encoding_version);
+    READ_ICU_MEMORY(common_barrier_capacity);
 #undef READ_ICU_MEMORY
     std::string error;
     if (mlir::failed(model.validate(&error))) {
@@ -697,6 +701,8 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(icu_memory_, mxm_macro_contexts),
         I64(icu_memory_, mem_macro_context_bits),
         I64(icu_memory_, mxm_macro_context_bits),
+        I64(icu_memory_, common_barrier_encoding_version),
+        I64(icu_memory_, common_barrier_capacity),
     });
 #undef I64
     return builder.getDictionaryAttr({
@@ -761,6 +767,12 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
             icu_memory_.mem_macro_context_bits,
             icu_memory_.mxm_macro_context_bits}))
         return fail("topology dimensions and throughput values must be positive");
+    const bool noCommonBarrier = icu_memory_.common_barrier_encoding_version == 0
+        && icu_memory_.common_barrier_capacity == 0;
+    if (!noCommonBarrier && (icu_memory_.common_barrier_encoding_version != hw::kCommonBarrierEncodingVersion
+        || icu_memory_.common_barrier_capacity <= 0
+        || icu_memory_.common_barrier_capacity > hw::kCommonBarrierCapacity))
+        return fail("common barrier capability must be absent (0/0) or use the supported encoding and finite RAM capacity");
     if (throughput_.vxm_alus < 16 || throughput_.vxm_alus % 8 != 0)
         return fail("vxm_alus must be at least 16 and a multiple of 8");
     if (icu_memory_.mem_instruction_bits % 32 != 0
@@ -942,6 +954,8 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
     HASH(ddr_request_queue_depth);
     HASH(ddr_latency_random_seed);
 #undef HASH
+    hash.add(icu_memory_.common_barrier_encoding_version);
+    hash.add(icu_memory_.common_barrier_capacity);
     return hash.value();
 }
 

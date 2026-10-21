@@ -105,7 +105,10 @@ private:
                     << "resource '" << resource << "' ICU contexts overlap ["
                     << start << ", " << end << ") with "
                     << interval.operation->getName() << " ["
-                    << interval.start << ", " << interval.end << ")";
+                    << interval.start << ", " << interval.end << ")"
+                    << "; current attributes " << operation->getAttrDictionary()
+                    << "; existing attributes "
+                    << interval.operation->getAttrDictionary();
                 return mlir::WalkResult::interrupt();
             }
         }

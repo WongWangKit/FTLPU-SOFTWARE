@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <streambuf>
 #include <type_traits>
+#include <unordered_set>
+#include <unordered_map>
 
 namespace ftlpu::software::runtime {
 
@@ -92,6 +94,14 @@ T read_scalar(std::istream& is)
         throw std::runtime_error("truncated FTLPU binary");
     }
     return value;
+}
+
+template <typename T>
+void write_le(std::ostream& os, T value)
+{
+    static_assert(std::is_unsigned_v<T>);
+    for (unsigned i = 0; i < sizeof(T); ++i)
+        write_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(value >> (8 * i)));
 }
 
 InstructionKind instruction_kind_for_queue(QueueKind kind)
@@ -373,8 +383,9 @@ QueueEncodingMode queue_encoding_mode(const QueueProgram& queue, bool rawMacroSu
         const bool hasExtendedDescriptor = std::any_of(
             queue.commands.begin(), queue.commands.end(),
             [](const QueueCommand& command) {
-                return isa::decode_icu_command_opcode(command.command)
-                    == isa::IcuCommandOpcode::Extended;
+                return is_icu_control_raw_word_command(command)
+                    || isa::decode_icu_command_opcode(command.command)
+                        == isa::IcuCommandOpcode::Extended;
             });
         return hasExtendedDescriptor
             ? QueueEncodingMode::CompactTagged
@@ -855,6 +866,81 @@ T read_value(ByteReader& reader)
     return reader.read<T>();
 }
 
+template <typename T, typename Reader>
+T read_le(Reader& reader)
+{
+    static_assert(std::is_unsigned_v<T>);
+    T result = 0;
+    for (unsigned i = 0; i < sizeof(T); ++i)
+        result |= static_cast<T>(read_value<std::uint8_t>(reader)) << (8 * i);
+    return result;
+}
+
+template <typename Reader>
+void read_barrier_sections(Reader& reader, BinaryProgram& program,
+                           std::uint32_t event_count)
+{
+    if (program.common_barrier_protocol
+        && (program.hardware.common_barrier_encoding_version != 1
+            || program.hardware.common_barrier_capacity == 0
+            || program.hardware.common_barrier_capacity > hw::kCommonBarrierCapacity))
+        throw std::runtime_error("unsupported FTLPU common barrier hardware capability");
+    if (event_count > program.hardware.common_barrier_capacity)
+        throw std::runtime_error("FTLPU barrier event capacity exceeded");
+    program.barrier_events.reserve(event_count);
+    std::uint32_t completion_count = 0;
+    for (std::uint32_t i = 0; i < event_count; ++i) {
+        BinaryBarrierEvent event;
+        event.event_id = read_le<std::uint32_t>(reader);
+        const auto count = read_le<std::uint32_t>(reader);
+        if (count == 0 || count > program.weight_page_uses.size()
+            || count > kBinaryCommonBarrierMaxCompletionInstances - completion_count)
+            throw std::runtime_error("invalid FTLPU barrier dependency count or completion capacity");
+        completion_count += count;
+        event.page_use_indices.reserve(count);
+        for (std::uint32_t j = 0; j < count; ++j)
+            event.page_use_indices.push_back(read_le<std::uint32_t>(reader));
+        program.barrier_events.push_back(std::move(event));
+    }
+    for (const auto expected : std::array<std::uint8_t, 4>{'B', 'A', 'R', 'R'})
+        if (read_le<std::uint8_t>(reader) != expected)
+            throw std::runtime_error("invalid FTLPU BarrierBlock magic");
+    const auto encoding = read_le<std::uint16_t>(reader);
+    const auto entry_bytes = read_le<std::uint16_t>(reader);
+    const auto count = read_le<std::uint32_t>(reader);
+    const auto reserved = read_le<std::uint32_t>(reader);
+    if (encoding != 1 || entry_bytes != 8 || reserved != 0)
+        throw std::runtime_error("invalid FTLPU BarrierBlock header");
+    if (count > program.hardware.common_barrier_capacity)
+        throw std::runtime_error("FTLPU barrier capacity exceeded");
+    program.barriers.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto cycle = read_le<std::uint32_t>(reader);
+        const auto event = read_le<std::uint32_t>(reader);
+        program.barriers.push_back({cycle, event});
+    }
+    validate_binary_barriers(program);
+}
+
+void write_barrier_sections(std::ostream& os, const BinaryProgram& program)
+{
+    for (const auto& event : program.barrier_events) {
+        write_le<std::uint32_t>(os, event.event_id);
+        write_le<std::uint32_t>(os, static_cast<std::uint32_t>(event.page_use_indices.size()));
+        for (const auto use : event.page_use_indices)
+            write_le<std::uint32_t>(os, use);
+    }
+    os.write("BARR", 4);
+    write_le<std::uint16_t>(os, 1);
+    write_le<std::uint16_t>(os, 8);
+    write_le<std::uint32_t>(os, static_cast<std::uint32_t>(program.barriers.size()));
+    write_le<std::uint32_t>(os, 0);
+    for (const auto& barrier : program.barriers) {
+        write_le<std::uint32_t>(os, barrier.stop_cycle);
+        write_le<std::uint32_t>(os, barrier.event_id);
+    }
+}
+
 void skip_value(std::istream& is, std::uint64_t bytes)
 {
     if (bytes > static_cast<std::uint64_t>(
@@ -1243,6 +1329,7 @@ struct BinaryHeader {
     std::uint32_t address_relocation_count;
     std::uint32_t weight_page_use_count;
     std::uint32_t stream_release_count;
+    std::uint32_t transport_queue_count;
 };
 
 template <typename ReadValue>
@@ -1251,8 +1338,10 @@ void read_hardware_config(BinaryProgram& program, std::uint32_t version,
 {
     auto read = [&](std::uint32_t& value) { value = read_value(); };
     bool upgradeTargetAbi = false;
-    if (version >= 29) {
+    if (version >= 37) {
         program.hardware.visit(read);
+    } else if (version >= 29) {
+        program.hardware.visit_pre_v37(read);
     } else if (version == 28) {
         // Local pre-merge format: i-MEM and Macro geometry, no VXM capability
         // fields. Preserve existing Qwen v28 artifacts.
@@ -1280,6 +1369,13 @@ void read_hardware_config(BinaryProgram& program, std::uint32_t version,
     } else {
         program.hardware.visit_pre_v19(read);
         upgradeTargetAbi = true;
+    }
+    if (version < 37) {
+        TargetAbiHasher legacy;
+        legacy.add(21);
+        program.hardware.visit_command_abi([&](std::uint32_t value) { legacy.add(value); });
+        if (program.target_abi == legacy.value())
+            upgradeTargetAbi = true;
     }
     if (upgradeTargetAbi)
         program.target_abi = executable_target_abi(program.hardware);
@@ -1334,6 +1430,13 @@ BinaryHeader read_header(ByteReader& reader)
         version >= 22 ? reader.read<std::uint32_t>() : 0;
     const auto stream_release_count =
         version >= 31 ? reader.read<std::uint32_t>() : 0;
+    const auto barrier_event_count = version >= 37 ? reader.read<std::uint32_t>() : 0;
+    const auto metadata_flags = version >= 37 ? reader.read<std::uint32_t>() : 0;
+    const auto transport_queue_count = version >= 37 ? reader.read<std::uint32_t>() : 0;
+    if ((metadata_flags & ~1u) != 0 || transport_queue_count > queue_count
+        || (transport_queue_count != 0 && (metadata_flags & 1u) == 0))
+        throw std::runtime_error("invalid FTLPU common barrier metadata flags or queue count");
+    program.common_barrier_protocol = (metadata_flags & 1u) != 0;
     program.bindings.reserve(binding_count);
     for (std::uint32_t index = 0; index < binding_count; ++index)
         program.bindings.push_back(read_binding(reader, version));
@@ -1362,14 +1465,18 @@ BinaryHeader read_header(ByteReader& reader)
         use.runtime_prefetch = reader.read<std::uint16_t>() != 0;
         use.ready_cycle = reader.read<std::uint64_t>();
         use.release_cycle = reader.read<std::uint64_t>();
+        if (version >= 37)
+            use.transport_launch_event_id = read_le<std::uint32_t>(reader);
         program.weight_page_uses.push_back(use);
     }
     program.stream_release_cycles.reserve(stream_release_count);
     for (std::uint32_t index = 0; index < stream_release_count; ++index)
         program.stream_release_cycles.push_back(reader.read<std::uint64_t>());
+    if (version >= 37)
+        read_barrier_sections(reader, program, barrier_event_count);
     return {std::move(program), version, queue_count, relocation_count,
         address_relocation_count, weight_page_use_count,
-        stream_release_count};
+        stream_release_count, transport_queue_count};
 }
 
 void skip_bytes(std::istream& is, std::uint64_t bytes)
@@ -1448,8 +1555,91 @@ BinaryWeightPagePlacement resolve_weight_page_placement(
     };
 }
 
+BinaryBarrier make_binary_barrier(std::uint64_t cycle, std::uint32_t event_id)
+{
+    if (cycle > std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("FTLPU barrier cycle exceeds uint32 logical time");
+    if (event_id == 0)
+        throw std::runtime_error("FTLPU barrier event ID zero is reserved");
+    return {static_cast<std::uint32_t>(cycle), event_id};
+}
+
+void validate_binary_barriers(const BinaryProgram& program)
+{
+    const auto& hardware = program.hardware;
+    if (program.common_barrier_protocol
+        && (hardware.common_barrier_encoding_version != 1 || hardware.common_barrier_capacity == 0
+            || hardware.common_barrier_capacity > hw::kCommonBarrierCapacity))
+        throw std::runtime_error("unsupported FTLPU common barrier hardware capability");
+    if ((!program.barriers.empty() || !program.barrier_events.empty() || !program.transport_queues.empty())
+        && !program.common_barrier_protocol)
+        throw std::runtime_error("FTLPU common barrier data requires the protocol flag");
+    if (program.barriers.size() > hardware.common_barrier_capacity
+        || program.barrier_events.size() > hardware.common_barrier_capacity)
+        throw std::runtime_error("FTLPU common barrier RAM capacity exceeded");
+    if (program.common_barrier_protocol && program.max_cycle > std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("FTLPU common barrier program exceeds uint32 logical time");
+    if (program.barrier_events.size() != program.barriers.size())
+        throw std::runtime_error("FTLPU common barrier events and entries must have a one-to-one association");
+    std::unordered_set<std::uint32_t> event_ids;
+    std::unordered_set<std::uint32_t> instances;
+    std::unordered_map<std::uint32_t, std::uint32_t> launch_events;
+    std::size_t completion_count = 0;
+    for (const auto& event : program.barrier_events) {
+        if (event.event_id == 0 || !event_ids.insert(event.event_id).second || event.page_use_indices.empty())
+            throw std::runtime_error("invalid or duplicate FTLPU common barrier event ID");
+        if (event.page_use_indices.size() > kBinaryCommonBarrierMaxCompletionInstances - completion_count)
+            throw std::runtime_error("FTLPU common barrier completion capacity exceeds 65535 instances");
+        completion_count += event.page_use_indices.size();
+        for (const auto instance : event.page_use_indices) {
+            if (instance >= program.weight_page_uses.size() || !instances.insert(instance).second)
+                throw std::runtime_error("invalid or repeated FTLPU barrier transport instance");
+            const auto& use = program.weight_page_uses[instance];
+            const auto binding = std::find_if(program.bindings.begin(), program.bindings.end(),
+                [&](const auto& value) { return value.access == BindingAccess::Input
+                    && value.index == use.binding_index; });
+            if (use.transport_launch_event_id == 0)
+                throw std::runtime_error("FTLPU barrier transport instance has no DMA/RX launch event");
+            const auto [launch, inserted] = launch_events.emplace(use.transport_launch_event_id, event.event_id);
+            if (!inserted && launch->second != event.event_id)
+                throw std::runtime_error("FTLPU transport launch event is reused across common barriers");
+            if (binding == program.bindings.end() || !binding->paged_weight
+                || use.page_index >= binding->page_count || use.bank >= hardware.banks_per_slice
+                || use.release_cycle < use.ready_cycle)
+                throw std::runtime_error("FTLPU barrier references an invalid page transport instance");
+            if (resolve_weight_page_placement(*binding, use.page_index).bank != use.bank)
+                throw std::runtime_error("FTLPU barrier transport bank differs from page placement");
+        }
+    }
+    std::unordered_set<std::uint32_t> consumed;
+    std::uint32_t previous = 0;
+    bool first = true;
+    for (const auto& barrier : program.barriers) {
+        if ((!first && barrier.stop_cycle <= previous) || barrier.stop_cycle > program.max_cycle)
+            throw std::runtime_error("FTLPU common barriers must have strictly increasing in-range cycles");
+        if (!event_ids.contains(barrier.event_id) || !consumed.insert(barrier.event_id).second)
+            throw std::runtime_error("FTLPU barrier references an unknown or repeated event");
+        const auto event = std::find_if(program.barrier_events.begin(), program.barrier_events.end(),
+            [&](const auto& value) { return value.event_id == barrier.event_id; });
+        for (const auto instance : event->page_use_indices)
+            if (barrier.stop_cycle > program.weight_page_uses[instance].ready_cycle)
+                throw std::runtime_error("FTLPU barrier is later than its page consumer");
+        previous = barrier.stop_cycle;
+        first = false;
+    }
+    for (const auto& queue : program.transport_queues) {
+        if (queue.kind != QueueKind::Mem || queue.packed_macro_imem.has_value()
+            || queue.requires_raw_macro)
+            throw std::runtime_error("FTLPU transport control queues must be Native MEM");
+        for (const auto& command : queue.commands)
+            if (is_macro_schedule_command(command))
+                throw std::runtime_error("FTLPU transport control queue contains a Macro descriptor");
+    }
+}
+
 void write_binary_program(const BinaryProgram& program, std::ostream& os)
 {
+    validate_binary_barriers(program);
     os.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
     write_scalar<std::uint32_t>(os, kBinaryFormatVersion);
     if (program.target_name.empty()
@@ -1478,7 +1668,7 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
         write_scalar<std::uint32_t>(os, value);
     });
     write_scalar<std::uint64_t>(os, static_cast<std::uint64_t>(program.max_cycle));
-    write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.queues.size()));
+    write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.queues.size() + program.transport_queues.size()));
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(program.bindings.size()));
     write_scalar<std::uint32_t>(
         os, static_cast<std::uint32_t>(program.scale_relocations.size()));
@@ -1492,6 +1682,9 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
         os, static_cast<std::uint32_t>(program.weight_page_uses.size()));
     write_scalar<std::uint32_t>(
         os, static_cast<std::uint32_t>(program.stream_release_cycles.size()));
+    write_le<std::uint32_t>(os, static_cast<std::uint32_t>(program.barrier_events.size()));
+    write_le<std::uint32_t>(os, program.common_barrier_protocol ? 1 : 0);
+    write_le<std::uint32_t>(os, static_cast<std::uint32_t>(program.transport_queues.size()));
 
     for (const auto& binding : program.bindings) write_binding(os, binding);
     for (const auto& timeline : program.timelines)
@@ -1509,11 +1702,16 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
         write_scalar<std::uint16_t>(os, use.runtime_prefetch ? 1 : 0);
         write_scalar<std::uint64_t>(os, use.ready_cycle);
         write_scalar<std::uint64_t>(os, use.release_cycle);
+        write_le<std::uint32_t>(os, use.transport_launch_event_id);
     }
     for (const std::uint64_t cycle : program.stream_release_cycles)
         write_scalar<std::uint64_t>(os, cycle);
 
-    for (const auto& queue : program.queues) {
+    write_barrier_sections(os, program);
+    for (std::size_t queue_id = 0;
+         queue_id < program.queues.size() + program.transport_queues.size(); ++queue_id) {
+        const auto& queue = queue_id < program.queues.size()
+            ? program.queues[queue_id] : program.transport_queues[queue_id - program.queues.size()];
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.kind));
         write_scalar<std::uint16_t>(os, static_cast<std::uint16_t>(queue.index));
         const auto wordBits = queue.kind == QueueKind::Mem
@@ -1558,6 +1756,7 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
         write_scalar<std::uint32_t>(os, relocation.command_index);
         write_scalar<std::uint16_t>(
             os, relocation.write_port ? 1 : 0);
+        write_le<std::uint16_t>(os, relocation.transport_queue ? 1 : 0);
     }
 }
 
@@ -1612,6 +1811,13 @@ BinaryProgram read_binary_program(std::istream& is)
         version >= 22 ? read_scalar<std::uint32_t>(is) : 0;
     const auto stream_release_count =
         version >= 31 ? read_scalar<std::uint32_t>(is) : 0;
+    const auto barrier_event_count = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
+    const auto metadata_flags = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
+    const auto transport_queue_count = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
+    if ((metadata_flags & ~1u) != 0 || transport_queue_count > queue_count
+        || (transport_queue_count != 0 && (metadata_flags & 1u) == 0))
+        throw std::runtime_error("invalid FTLPU common barrier metadata flags or queue count");
+    program.common_barrier_protocol = (metadata_flags & 1u) != 0;
     program.bindings.reserve(binding_count);
     for (std::uint32_t binding_id = 0; binding_id < binding_count; ++binding_id)
         program.bindings.push_back(read_binding(is, version));
@@ -1641,13 +1847,17 @@ BinaryProgram read_binary_program(std::istream& is)
         use.runtime_prefetch = read_scalar<std::uint16_t>(is) != 0;
         use.ready_cycle = read_scalar<std::uint64_t>(is);
         use.release_cycle = read_scalar<std::uint64_t>(is);
+        if (version >= 37)
+            use.transport_launch_event_id = read_le<std::uint32_t>(is);
         program.weight_page_uses.push_back(use);
     }
     program.stream_release_cycles.reserve(stream_release_count);
     for (std::uint32_t index = 0; index < stream_release_count; ++index)
         program.stream_release_cycles.push_back(
             read_scalar<std::uint64_t>(is));
-    program.queues.reserve(queue_count);
+    if (version >= 37)
+        read_barrier_sections(is, program, barrier_event_count);
+    program.queues.reserve(queue_count - transport_queue_count);
 
     for (std::uint32_t queue_id = 0; queue_id < queue_count; ++queue_id) {
         auto queue = QueueProgram {};
@@ -1664,6 +1874,10 @@ BinaryProgram read_binary_program(std::istream& is)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(is, command_count);
 
+        if (queue_id >= queue_count - transport_queue_count
+            && (queue.kind != QueueKind::Mem || mode == QueueEncodingMode::MacroPacked
+                || mode == QueueEncodingMode::MacroSchedule))
+            throw std::runtime_error("invalid FTLPU transport control queue encoding");
         if (mode == QueueEncodingMode::MacroPacked) {
             if (!has_macro_packed(version, queue.kind))
                 throw std::runtime_error(
@@ -1710,7 +1924,10 @@ BinaryProgram read_binary_program(std::istream& is)
             }
             queue.commands.push_back(std::move(command));
         }
-        program.queues.push_back(std::move(queue));
+        if (queue_id < queue_count - transport_queue_count)
+            program.queues.push_back(std::move(queue));
+        else
+            program.transport_queues.push_back(std::move(queue));
     }
     program.scale_relocations.reserve(relocation_count);
     for (std::uint32_t index = 0; index < relocation_count; ++index) {
@@ -1740,9 +1957,15 @@ BinaryProgram read_binary_program(std::istream& is)
         if (version >= 14)
             relocation.write_port =
                 read_scalar<std::uint16_t>(is) != 0;
+        if (version >= 37) {
+            const auto flags = read_le<std::uint16_t>(is);
+            if (flags > 1) throw std::runtime_error("invalid FTLPU address relocation flags");
+            relocation.transport_queue = flags != 0;
+        }
         program.address_relocations.push_back(relocation);
     }
 
+    validate_binary_barriers(program);
     return program;
 }
 
@@ -1797,6 +2020,13 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         version >= 22 ? read_scalar<std::uint32_t>(is) : 0;
     const auto stream_release_count =
         version >= 31 ? read_scalar<std::uint32_t>(is) : 0;
+    const auto barrier_event_count = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
+    const auto metadata_flags = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
+    const auto transport_queue_count = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
+    if ((metadata_flags & ~1u) != 0 || transport_queue_count > queue_count
+        || (transport_queue_count != 0 && (metadata_flags & 1u) == 0))
+        throw std::runtime_error("invalid FTLPU common barrier metadata flags or queue count");
+    program.common_barrier_protocol = (metadata_flags & 1u) != 0;
 
     program.bindings.reserve(binding_count);
     for (std::uint32_t index = 0; index < binding_count; ++index)
@@ -1816,19 +2046,25 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
             hemisphere, slice, firstFreeRow, bank,
         });
     }
-    for (std::uint32_t index = 0;
-         index < weight_page_use_count; ++index) {
-        (void)read_scalar<std::uint32_t>(is);
-        (void)read_scalar<std::uint32_t>(is);
-        (void)read_scalar<std::uint16_t>(is);
-        (void)read_scalar<std::uint16_t>(is);
-        (void)read_scalar<std::uint64_t>(is);
-        (void)read_scalar<std::uint64_t>(is);
+    program.weight_page_uses.reserve(weight_page_use_count);
+    for (std::uint32_t index = 0; index < weight_page_use_count; ++index) {
+        BinaryWeightPageUse use;
+        use.binding_index = read_scalar<std::uint32_t>(is);
+        use.page_index = read_scalar<std::uint32_t>(is);
+        use.bank = read_scalar<std::uint16_t>(is);
+        use.runtime_prefetch = read_scalar<std::uint16_t>(is) != 0;
+        use.ready_cycle = read_scalar<std::uint64_t>(is);
+        use.release_cycle = read_scalar<std::uint64_t>(is);
+        if (version >= 37)
+            use.transport_launch_event_id = read_le<std::uint32_t>(is);
+        program.weight_page_uses.push_back(use);
     }
     program.stream_release_cycles.reserve(stream_release_count);
     for (std::uint32_t index = 0; index < stream_release_count; ++index)
         program.stream_release_cycles.push_back(
             read_scalar<std::uint64_t>(is));
+    if (version >= 37)
+        read_barrier_sections(is, program, barrier_event_count);
 
     for (std::uint32_t queue = 0; queue < queue_count; ++queue) {
         const auto queueKind = static_cast<QueueKind>(
@@ -1842,6 +2078,10 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         if (has_queue_encoding_mode(version)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(is, command_count);
+        if (queue >= queue_count - transport_queue_count
+            && (queueKind != QueueKind::Mem || mode == QueueEncodingMode::MacroPacked
+                || mode == QueueEncodingMode::MacroSchedule))
+            throw std::runtime_error("invalid FTLPU transport control queue encoding");
         if (mode == QueueEncodingMode::MacroPacked) {
             if (!has_macro_packed(version, queueKind))
                 throw std::runtime_error(
@@ -1885,7 +2125,8 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
     const std::uint64_t address_relocation_size =
         sizeof(std::uint32_t) * 2 + sizeof(std::uint16_t) * 2
         + (version >= 10 ? sizeof(std::uint16_t) : 0)
-        + (version >= 14 ? sizeof(std::uint16_t) : 0);
+        + (version >= 14 ? sizeof(std::uint16_t) : 0)
+        + (version >= 37 ? sizeof(std::uint16_t) : 0);
     skip_bytes(is,
         static_cast<std::uint64_t>(address_relocation_count)
             * address_relocation_size);
@@ -1913,6 +2154,10 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
         if (has_queue_encoding_mode(header.version)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(reader, command_count);
+        if (queue_id >= header.queue_count - header.transport_queue_count
+            && (queue.kind != QueueKind::Mem || mode == QueueEncodingMode::MacroPacked
+                || mode == QueueEncodingMode::MacroSchedule))
+            throw std::runtime_error("invalid FTLPU transport control queue encoding");
         if (mode == QueueEncodingMode::MacroPacked) {
             if (!has_macro_packed(header.version, queue.kind))
                 throw std::runtime_error(
@@ -1967,7 +2212,10 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
             }
             queue.commands.push_back(std::move(command));
         }
-        program.queues.push_back(std::move(queue));
+        if (queue_id < header.queue_count - header.transport_queue_count)
+            program.queues.push_back(std::move(queue));
+        else
+            program.transport_queues.push_back(std::move(queue));
     }
     program.scale_relocations.reserve(header.relocation_count);
     for (std::uint32_t index = 0;
@@ -1999,10 +2247,16 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
         if (header.version >= 14)
             relocation.write_port =
                 reader.read<std::uint16_t>() != 0;
+        if (header.version >= 37) {
+            const auto flags = read_le<std::uint16_t>(reader);
+            if (flags > 1) throw std::runtime_error("invalid FTLPU address relocation flags");
+            relocation.transport_queue = flags != 0;
+        }
         program.address_relocations.push_back(relocation);
     }
     if (!reader.empty())
         throw std::runtime_error("FTLPU binary has trailing data");
+    validate_binary_barriers(program);
     return std::move(program);
 }
 
@@ -2024,6 +2278,10 @@ BinaryProgram read_binary_program_metadata(
         if (has_queue_encoding_mode(header.version)
             && mode == QueueEncodingMode::MacroSchedule)
             macroWidths = read_macro_width_bitmap(reader, command_count);
+        if (queue >= header.queue_count - header.transport_queue_count
+            && (queueKind != QueueKind::Mem || mode == QueueEncodingMode::MacroPacked
+                || mode == QueueEncodingMode::MacroSchedule))
+            throw std::runtime_error("invalid FTLPU transport control queue encoding");
         if (mode == QueueEncodingMode::MacroPacked) {
             if (!has_macro_packed(header.version, queueKind))
                 throw std::runtime_error(
@@ -2067,7 +2325,8 @@ BinaryProgram read_binary_program_metadata(
     const std::uint64_t address_relocation_size =
         sizeof(std::uint32_t) * 2 + sizeof(std::uint16_t) * 2
         + (header.version >= 10 ? sizeof(std::uint16_t) : 0)
-        + (header.version >= 14 ? sizeof(std::uint16_t) : 0);
+        + (header.version >= 14 ? sizeof(std::uint16_t) : 0)
+        + (header.version >= 37 ? sizeof(std::uint16_t) : 0);
     reader.skip(
         static_cast<std::uint64_t>(header.address_relocation_count)
         * address_relocation_size);

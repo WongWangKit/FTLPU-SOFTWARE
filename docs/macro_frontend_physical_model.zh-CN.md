@@ -24,11 +24,13 @@ blocked address 和仿射轴拆成二维 Macro，VXM/SXM 等保持原生 FU 路�
 生产转换不展开整条功能指令流；一个源 packet 拆成多个描述符时，地址和 scale
 重定位逐一复制到对应描述符，且不跨不同源 packet 合并。
 
-packed-v1 尚无同步控制记录。同一队列中的 `WAIT_EVENT`、SYNC、同步 MEM 传输，
-以及当前转换器尚未覆盖的 `WRITE_READ_2D`、native4 decode 会明确拒绝。
-因此带运行时分页或持久 KV 同步的完整 decoder 暂不能使用此模式，应保留默认 FU3D；
-编译器不会删除这些控制，也不会把请求静默降级。C2C 分页链接器同样拒绝必选 Macro
-队列。全驻留、无这些控制的程序可走真实 raw 前端，回归覆盖了 StableHLO FFN。
+packed-v1 仍不内嵌同步控制记录。同一 Raw 队列中的 `WAIT_EVENT`、SYNC 和同步 MEM
+传输不能直接编码；尚未覆盖的 `WRITE_READ_2D`、native4 decode 继续明确拒绝。
+分页程序改由 v37 公共屏障表统一冻结 Native/Macro 计算，通过独立 Native MEM transport
+保留实际 DMA/RX 启动、同步写入及 KV page-out 控制。最终链接必须证明候选边界的
+排空和 SRAM 生存期，并完整关联实际 MEM commit，之后才允许装载 Raw 分页程序。
+无法证明时明确拒绝，禁止静默退回 FU3D。全驻留 StableHLO FFN 已有真实前端数值回归；
+完整 decoder 的实际结果及剩余边界见 [公共屏障验证记录](common_barrier_validation.zh-CN.md)。
 
 `--verify-icu-issues` 现在可直接比较 FU3D 与 Macro 的功能指令及绝对发射周期。
 此开关不替代物理解码供给门禁；集成回归另用真实 ICU 逐周期回放，检查 cold prime、
@@ -37,7 +39,7 @@ Active Context 和 admission deadline。二进制 `MacroPacked` 模式在读取�
 
 raw 模式面向 96-bit MEM / 128-bit MXM、至多二维的仿射 Macro；其他 FU
 继续使用 main 原有路径。主机重定位后，loader 从更新后的语义指令重新生成镜像，
-防止使用失效的编码缓存。新写入容器版本为 v36，main 的 binding layout 编号保持不变；
+防止使用失效的编码缓存。新写入容器版本为 v37，main 的 binding layout 编号保持不变；
 实验分支的 v33 布局不作为兼容格式引入。软件与更新后的 CModel 需配套构建。
 本轮验证对应 CModel main 的 `a99f3bc`；使用工作树时应通过
 `-DFTLPU_CMODEL_DIR=/path/to/cmodel-main` 指向包含该能力的 CModel。

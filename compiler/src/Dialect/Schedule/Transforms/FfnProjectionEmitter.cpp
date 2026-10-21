@@ -37,6 +37,16 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
         context.projection_timeline.projection_order;
     const bool serializedProjections = singleMxm
         && projectionOrder != FfnProjectionOrder::Interleaved;
+    const int64_t accumulatorCapacity = throughput.mxm_accumulator_blocks * tile;
+    const bool reuseProjectionAccumulator = singleMxm && serializedProjections
+        && 2 * m > accumulatorCapacity;
+    if (m > accumulatorCapacity || (singleMxm && !serializedProjections && 2 * m > accumulatorCapacity)) {
+        ffn.getOperation()->emitError("FFN live projection rows exceed physical accumulator capacity");
+        return mlir::failure();
+    }
+    // Serialized Gate/Up completes and clears every partial before the next
+    // projection starts. Reuse that window when two token windows cannot fit.
+    const int64_t upAccumulatorOffset = singleMxm && !reuseProjectionAccumulator ? m : 0;
     const int64_t reductionBlockCount = k / tile;
     const auto activationType = llvm::cast<mlir::RankedTensorType>(
         ffn.getActivation().getType());
@@ -517,8 +527,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 const int64_t terminalStreamBase =
                     context.strategy == FfnScheduleStrategy::Fused
                     ? 8 + hemisphere * 8 : 0;
+                const bool combineTokenTiles = closedProjectionDomains
+                    && mTileCount > 1 && (serializedProjections || !singleMxm);
                 const bool computeCanCrossPairs =
-                    closedProjectionDomains
+                    closedProjectionDomains && !combineTokenTiles
                     && (reductionBlockCount % 2 == 0
                         || reductionBlockCount == 1);
                 const std::array<int64_t, 2> computeDomainPairCounts = {
@@ -531,9 +543,11 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 };
                 const std::array<bool, 2> closedComputeLeaders = {
                     closedProjectionDomains && reduction == 0
+                        && (!combineTokenTiles || mTile == 0)
                         && (!computeCanCrossPairs
                             || computeDomainPairCounts[0] > 0),
                     closedProjectionDomains && reduction == 0
+                        && (!combineTokenTiles || mTile == 0)
                         && (!computeCanCrossPairs
                             || computeDomainPairCounts[1] > 0),
                 };
@@ -664,7 +678,28 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     mlir::Value gateActivation =
                         context.activation_route.getInput();
                     mlir::Value upActivation = gateActivation;
-                    if (closedProjectionDomains) {
+                    if (closedProjectionDomains && mTileCount > 1
+                        && (serializedProjections || !singleMxm)) {
+                        // Token tiles interleave on each activation MEM queue.
+                        // Keep them inside one context, with reduction outside
+                        // the token dimension; output pairs remain separate.
+                        if (reduction == 0 && mTile == 0) {
+                            FfnLoopDomain3D activationDomain;
+                            activationDomain.wave_count = mTileCount;
+                            activationDomain.wave_interval = block.tiles[1].compute_cycle
+                                - block.tiles[0].compute_cycle;
+                            activationDomain.wave_address_stride =
+                                context.activation_distributed16
+                                ? reductionBlockCount * throughput.tile_rows : tile;
+                            activationDomain.group_count = reductionBlockCount;
+                            activationDomain.group_interval = reductionInterval;
+                            activationDomain.group_address_stride =
+                                context.activation_distributed16 ? throughput.tile_rows : m;
+                            gateActivation = emitActivation(gateCycle, activationDomain);
+                            if (singleMxm)
+                                upActivation = emitActivation(upCycle, activationDomain);
+                        }
+                    } else if (closedProjectionDomains && mTileCount == 1) {
                         if (splitSerializedActivationDomains
                             && reduction == 0) {
                             // The MEM activation producer must stop at every
@@ -785,6 +820,22 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                 domain.terminal_accumulator_output_format =
                                     "bf16";
                             }
+                            if (combineTokenTiles) {
+                                // One Native ICU cannot interleave contexts
+                                // for individual token tiles. Put tokens inside
+                                // reduction and keep one output pair per domain.
+                                domain.wave_count = mTileCount;
+                                domain.wave_interval = block.tiles[1].compute_cycle
+                                    - block.tiles[0].compute_cycle;
+                                domain.wave_accumulator_address_stride = tile;
+                                domain.group_count = reductionBlockCount;
+                                domain.group_interval = reductionInterval;
+                                domain.weight_buffer_mode = reductionBlockCount > 1
+                                    && throughput.mxm_weight_buffers == 2
+                                    ? "toggle_dim2" : "fixed";
+                                if (reductionBlockCount > 1)
+                                    domain.terminal_dimension = 2;
+                            }
                             return domain;
                         };
                     const bool finalOnly = reductionBlockCount == 1;
@@ -811,7 +862,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             terminalStreamBase
                                 + throughput.mxm_result_streams,
                             mTile * tile + rowOffset
-                                + (singleMxm ? m : 0), 1,
+                                + upAccumulatorOffset, 1,
                             finalOnly ? "stream" : "sram", true,
                             dataFormat, finalOnly ? "bf16" : "fp32",
                             domain);
@@ -839,7 +890,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             resultStreamBase
                                 + throughput.mxm_result_streams,
                             mTile * tile + rowOffset
-                                + (singleMxm ? m : 0), 1,
+                                + upAccumulatorOffset, 1,
                             finalReduction ? "stream" : "sram", true,
                             dataFormat,
                             finalReduction ? "bf16" : "fp32", domain);

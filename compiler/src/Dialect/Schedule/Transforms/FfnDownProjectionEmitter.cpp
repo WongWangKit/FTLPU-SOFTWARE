@@ -1,6 +1,7 @@
 #include "FfnStageEmitter.hpp"
 
 #include "FfnEmitterUtils.hpp"
+#include "CommonBarrierSchedule.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 
 #include <algorithm>
@@ -47,12 +48,65 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                 "page_granularity"))
             reductionsPerWeightPage = granularity.getInt();
     }
+    // Preserve the actual materialized hidden placement for checkpoints. The
+    // vector path uses four planar slices; it cannot be inferred from RMS2's
+    // distributed placement or from the result's layout.
+    int64_t hiddenBindingIndex = 65538;
+    for (auto binding : ffn.getOperation()->getBlock()->getOps<BindingOp>())
+        if (binding.getAccess() == "internal")
+            hiddenBindingIndex = std::max(hiddenBindingIndex,
+                static_cast<int64_t>(binding.getIndex()) + 1);
+    const auto hiddenType = llvm::cast<mlir::RankedTensorType>(
+        ffn.multiply.getResult().getType());
+    // Hidden allocation reserves an activation-planar envelope, but vector
+    // Swish/Down materialize alternating BF16 slice pairs at half that row
+    // stride. Export the actual pair-planar layout for runtime unpacking.
+    mlir::NamedAttrList hiddenPlacement(ffn.getHidden0Placement());
+    if (!hiddenDistributed16)
+        hiddenPlacement.set("kind", rewriter.getStringAttr("fp16_pair_planar"));
+    mlir::OperationState hiddenBinding(ffn.getLoc(), BindingOp::getOperationName());
+    hiddenBinding.addTypes(hiddenType);
+    hiddenBinding.addAttributes({
+        rewriter.getNamedAttr("index", rewriter.getI64IntegerAttr(hiddenBindingIndex)),
+        rewriter.getNamedAttr("access", rewriter.getStringAttr("internal")),
+        rewriter.getNamedAttr("role", rewriter.getStringAttr("workspace")),
+        rewriter.getNamedAttr("name", rewriter.getStringAttr("ffn.hidden")),
+        rewriter.getNamedAttr("bytes", rewriter.getI64IntegerAttr(
+            hiddenType.getNumElements() * 2)),
+        rewriter.getNamedAttr("placement", hiddenPlacement.getDictionary(rewriter.getContext())),
+    });
+    rewriter.create(hiddenBinding);
+    auto downLastSwishCycle = swish.last_cycle;
+    if (reductionsPerWeightPage > 0 && requestsRawMacroBarriers(ffn.getOperation())) {
+        // emitFfnSwish includes every owner-to-peer hidden SRAM mirror. Its
+        // final MEM issue is a stable functional boundary: Gate/Up temporaries
+        // are dead and Down consumes the materialized hidden value. Charge a
+        // full drain interval before Down; the final linker still checks exact
+        // SRAM reuse and rejects pages that cannot coexist at this stop.
+        const auto binding = commonBarrierInputBinding(context.down_raw.getInput());
+        const auto pageCount = downPlacement.getAs<mlir::IntegerAttr>("page_count");
+        if (!binding || !pageCount || pageCount.getInt() <= 0 || pageCount.getInt() > 65535) {
+            ffn.getOperation()->emitError("common Down paging requires a bounded input/page association");
+            return mlir::failure();
+        }
+        const auto begin = swish.last_cycle + 1;
+        const auto stop = begin + commonBarrierDrainCycles(target);
+        downLastSwishCycle = stop - 1;
+        mlir::OperationState cost(ffn.getLoc(), TimelineOp::getOperationName());
+        cost.addAttributes({rewriter.getNamedAttr("name", rewriter.getStringAttr("common_barrier.drain_cost")),
+            rewriter.getNamedAttr("start", rewriter.getI64IntegerAttr(begin)),
+            rewriter.getNamedAttr("end", rewriter.getI64IntegerAttr(stop))});
+        rewriter.create(cost);
+        for (int64_t page = 0; page < pageCount.getInt(); ++page)
+            emitCommonBarrierCandidate(rewriter, ffn.getLoc(), *binding, page, begin, stop);
+    }
     auto timeline = planFfnDownProjectionTimeline(
         {context.m(), context.k(), intermediate, context.n()},
-        context.projection_timeline, swish.last_cycle,
+        context.projection_timeline, downLastSwishCycle,
         context.down_weight_slices, context.hidden_slices,
         context.result_slices, target, reductionsPerWeightPage);
     if (mlir::failed(timeline)) return mlir::failure();
+    const bool serializedSlots = timeline->serialized_slots;
     int64_t downEnd = timeline->phase_start;
     struct PendingResultWrite {
         mlir::Value source;
@@ -340,9 +394,9 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
             reductionRun(outputWave, reduction);
         for (int64_t hemisphere = 0;
              hemisphere < activeHemispheres; ++hemisphere) {
-            const int64_t emittedLogicalSlots = directSingleMxm
-                ? 1
-                : (singleMxm ? 1 : logicalSlotsPerHemisphere);
+            const int64_t emittedLogicalSlots = serializedSlots
+                ? logicalSlotsPerHemisphere : directSingleMxm
+                ? 1 : (singleMxm ? 1 : logicalSlotsPerHemisphere);
             for (int64_t logicalSlot = 0;
                  logicalSlot < emittedLogicalSlots;
                  ++logicalSlot) {
@@ -364,7 +418,9 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                 const int64_t unit =
                     hemisphere * throughput.mxms_per_hemisphere
                     + localMxm;
-                const int64_t start = directSingleMxm
+                const int64_t start = serializedSlots
+                    ? block.dequant_start + logicalSlot * timeline->second_slot_offsets[outputWave]
+                    : directSingleMxm
                     ? directSlotCycle(
                           outputWave, reduction, logicalSlot) - tile
                         + target.mxm_first_result_latency()
@@ -462,7 +518,11 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     mlir::RankedTensorType::get(rawType.getShape(),
                         activationType.getElementType());
                 FfnLoopDomain3D weightDomain;
-                if (directSingleMxm) {
+                if (serializedSlots) {
+                    weightDomain.wave_count = weightRunCount;
+                    weightDomain.wave_interval = weightRunInterval;
+                    weightDomain.wave_address_stride = logicalSlotsPerHemisphere * weightLoadCycles;
+                } else if (directSingleMxm) {
                     // The two logical slots execute consecutively on the
                     // same physical MXM.  Reuse its INT8 stream window and
                     // express slot selection as the outer MEM dimension.
@@ -502,7 +562,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     context.local_weight_dequant, bank, page,
                     logicalBase, context.down_weight_placement,
                     weightDomain,
-                    directSingleMxm
+                    serializedSlots ? "fixed" : directSingleMxm
                         ? (weightRunCount * logicalSlotsPerHemisphere > 1
                                 ? "toggle_dim2" : "fixed")
                     : weightRunCount > 1 || singleMxm
@@ -519,7 +579,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
             const int64_t down1ComputeCycle = directSingleMxm
                 ? directSlotCycle(outputWave, reduction, 1)
                 : computeCycle
-                    + (singleMxm ? projectionSlotInterval : 0);
+                    + (serializedSlots ? timeline->second_slot_offsets[outputWave]
+                        : singleMxm ? projectionSlotInterval : 0);
             downEnd = std::max(downEnd,
                 down1ComputeCycle
                     + target.mxm_first_result_latency() + tile);
@@ -642,8 +703,9 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         return hiddenValue;
                     };
                     mlir::Value hidden0 = emitHidden(
-                        down0Cycle, singleMxm);
-                    mlir::Value hidden1 = hidden0;
+                        down0Cycle, singleMxm && !serializedSlots);
+                    mlir::Value hidden1 = serializedSlots
+                        ? emitHidden(down1Cycle, false) : hidden0;
                     const int64_t unitBase =
                         hemisphere * throughput.mxms_per_hemisphere;
                     if (directSingleMxm
@@ -745,7 +807,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             segment.stream_base,
                             throughput.mxm_result_streams,
                             context.down_accumulator_base + mTile * tile
-                                + rowOffset + (singleMxm ? m : 0),
+                                + rowOffset + (singleMxm && !serializedSlots ? m : 0),
                             1, block.final_reduction ? "stream" : "sram",
                             true, dataFormat,
                             block.final_reduction ? "bf16" : "fp32",

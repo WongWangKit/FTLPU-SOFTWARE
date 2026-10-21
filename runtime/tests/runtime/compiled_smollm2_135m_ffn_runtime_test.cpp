@@ -79,7 +79,11 @@ try {
         throw std::runtime_error("unknown FFN runtime test option");
     const auto program = ftlpu::software::runtime::read_binary_program(
         std::filesystem::path(argv[1]));
-    if (program.bindings.size() != 5)
+    using ftlpu::software::runtime::BindingAccess;
+    if (std::ranges::count(program.bindings, BindingAccess::Input,
+            &ftlpu::software::runtime::BinaryBinding::access) != 4
+        || std::ranges::count(program.bindings, BindingAccess::Output,
+            &ftlpu::software::runtime::BinaryBinding::access) != 1)
         throw std::logic_error("SmolLM2 FFN binary must contain four inputs and one output");
     if (program.max_cycle == 0)
         throw std::logic_error("SmolLM2 FFN binary has no scheduled ICU commands");

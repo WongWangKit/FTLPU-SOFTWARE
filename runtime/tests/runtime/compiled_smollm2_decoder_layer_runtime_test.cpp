@@ -466,9 +466,9 @@ std::int8_t upSign(std::size_t h) { return (h & 2) ? -1 : 1; }
 
 int main(int argc, char** argv)
 try {
-    if (argc != 2)
+    if (argc != 2 && !(FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES && argc == 3))
         throw std::runtime_error(
-            "usage: compiled_decoder_layer_runtime_test program.ftlpu");
+            "usage: compiled_decoder_layer_runtime_test baseline.ftlpu [raw-program.ftlpu]");
     const bool skipNumericChecks =
         std::getenv("FTLPU_SKIP_QWEN_NUMERIC_CHECK") != nullptr;
     std::size_t decoderLayerCount = 1;
@@ -760,27 +760,6 @@ try {
         const std::size_t featureLane = column % 8;
         const std::size_t address = baseRow
             + (tokenBlock * hiddenBlocks + hiddenBlock) * 4 + tokenWave;
-        return physicalBf16(hemisphere,
-            slices[2 * tokenLane], slices[2 * tokenLane + 1],
-            address, featureWave * 8 + featureLane, bank);
-    };
-    const auto readMxmDistributedWidth = [&physicalBf16](
-                                             const std::vector<std::uint16_t>& slices,
-                                             std::size_t baseRow,
-                                             std::size_t row,
-                                             std::size_t column,
-                                             std::size_t logicalColumns,
-                                             ftlpu::Hemisphere hemisphere,
-                                             std::size_t bank) {
-        const std::size_t columnBlocks = logicalColumns / 32;
-        const std::size_t tokenBlock = row / 32;
-        const std::size_t tokenWave = (row % 32) / 8;
-        const std::size_t tokenLane = row % 8;
-        const std::size_t columnBlock = column / 32;
-        const std::size_t featureWave = (column % 32) / 8;
-        const std::size_t featureLane = column % 8;
-        const std::size_t address = baseRow
-            + (tokenBlock * columnBlocks + columnBlock) * 4 + tokenWave;
         return physicalBf16(hemisphere,
             slices[2 * tokenLane], slices[2 * tokenLane + 1],
             address, featureWave * 8 + featureLane, bank);
@@ -1964,8 +1943,41 @@ try {
             exponential + 1.0f);
         return bf16(reciprocal * gate * up);
     };
-    const std::size_t hiddenBaseRow = rms2BaseRow
-        + static_cast<std::size_t>(rms2Binding->instruction_count);
+    const auto hiddenBinding = std::find_if(program.bindings.begin(), program.bindings.end(),
+        [](const auto& binding) {
+            return binding.access == ftlpu::software::runtime::BindingAccess::Internal
+                && binding.name == "ffn.hidden";
+        });
+    if (hiddenBinding == program.bindings.end()
+        || hiddenBinding->shape != std::vector<std::uint64_t>{kSeqLen, kIntermediate})
+        throw std::logic_error("cannot locate actual FFN hidden placement");
+    const auto hiddenLocation = [&](std::size_t row, std::size_t column) {
+        using ftlpu::software::runtime::BindingLayout;
+        const auto base = static_cast<std::size_t>(hiddenBinding->base_row);
+        std::size_t pair = 0;
+        std::size_t address = 0;
+        if (hiddenBinding->layout == BindingLayout::Fp16MxmDistributed16
+            && hiddenBinding->slices.size() == 16) {
+            pair = row % kMxmBlockRows;
+            address = base + ((row / 32) * (kIntermediate / 32) + column / 32)
+                * kTileRows + (row % 32) / kMxmBlockRows;
+        } else if (hiddenBinding->layout == BindingLayout::Fp16PairPlanar
+            && hiddenBinding->slices.size() == 4) {
+            pair = (column / 32) % 2;
+            address = base + (column / 64) * kSeqLen + row;
+        } else {
+            throw std::logic_error("unsupported FFN hidden checkpoint placement");
+        }
+        return std::array<std::size_t, 3>{
+            hiddenBinding->slices[2 * pair], hiddenBinding->slices[2 * pair + 1], address};
+    };
+    const auto readHidden = [&](const auto& readPhysical, ftlpu::Hemisphere hemisphere,
+                               std::size_t row, std::size_t column) {
+        const auto location = hiddenLocation(row, column);
+        return readPhysical(hemisphere, location[0], location[1], location[2],
+            column % 32, hiddenBinding->bank);
+    };
+    const auto unpackedHidden = runtime.download_binding(*hiddenBinding);
     std::vector<float> physicalHidden(kSeqLen * kIntermediate);
     std::size_t hiddenMismatchCount = 0;
     float hiddenMaxError = 0.0f;
@@ -1975,12 +1987,10 @@ try {
     for (std::size_t row = 0; row < kSeqLen; ++row) {
         for (std::size_t h = 0; h < kIntermediate; ++h) {
             const std::size_t index = row * kIntermediate + h;
-            const float east = readMxmDistributedWidth(
-                rms2Binding->slices, hiddenBaseRow, row, h, kIntermediate,
-                ftlpu::Hemisphere::East, rms2Binding->bank);
-            const float west = readMxmDistributedWidth(
-                rms2Binding->slices, hiddenBaseRow, row, h, kIntermediate,
-                ftlpu::Hemisphere::West, rms2Binding->bank);
+            const float east = readHidden(physicalBf16, ftlpu::Hemisphere::East, row, h);
+            const float west = readHidden(physicalBf16, ftlpu::Hemisphere::West, row, h);
+            if (east != readBf16(unpackedHidden, index))
+                throw std::logic_error("FFN hidden metadata unpacking differs from physical SRAM");
             const float expected = hiddenValue(row, h);
             const float hardwareExpected = hardwareHiddenValue(row, h);
             physicalHidden[index] = east;
@@ -2017,6 +2027,9 @@ try {
               << " hardware_mismatches=" << hardwareHiddenMismatchCount
               << " hardware_max_error=" << hardwareHiddenMaxError
               << " replica_max_error=" << hiddenReplicaMaxError << '\n';
+    if (!skipNumericChecks && (hiddenMismatchCount != 0
+            || hardwareHiddenMismatchCount != 0 || hiddenReplicaMaxError != 0.0f))
+        throw std::logic_error("FFN hidden checkpoint disagrees with its hardware reference or replica");
     std::vector<float> ffnOutput(kSeqLen * kHidden);
     float ffnCheckpointMaxError = 0.0f;
     std::size_t ffnCheckpointMismatchCount = 0;
@@ -2398,6 +2411,67 @@ try {
     }
 #if FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES
     using namespace ftlpu::software::runtime;
+    const auto dynamicProgram = argc == 3
+        ? read_binary_program(std::filesystem::path(argv[2])) : program;
+    if (argc == 3) {
+        // Raw compilation can charge explicit drain intervals before safe
+        // operator boundaries. Check the retiming exactly, rather than
+        // accepting arbitrary phase changes or requiring those costs to vanish.
+        auto costs = dynamicProgram.timelines;
+        std::erase_if(costs, [](const auto& value) { return value.name != "common_barrier.drain_cost"; });
+        std::ranges::sort(costs, {}, &BinaryTimeline::start_cycle);
+        const auto& h = dynamicProgram.hardware;
+        const std::uint64_t guard = h.system_register_columns + h.mem_boundary_register_columns
+            + h.mxm_pipeline_rows + h.tile_rows
+            + std::max({h.mem_to_sxm_latency, h.mem_to_mxm_latency, h.mxm0_accumulator_latency,
+                h.mxm1_accumulator_latency, h.accumulator_to_vxm_latency, h.accumulator_read_to_vxm_latency,
+                h.swiglu_write_latency, h.qk_iw_to_compute_latency, h.vxm_weight_to_iw_latency});
+        std::uint64_t previousEnd = 0;
+        for (const auto& cost : costs) {
+            if (cost.start_cycle < previousEnd || cost.end_cycle <= cost.start_cycle
+                || cost.end_cycle - cost.start_cycle != guard || cost.end_cycle > dynamicProgram.max_cycle)
+                throw std::logic_error("Raw decoder has an invalid charged drain interval");
+            previousEnd = cost.end_cycle;
+        }
+        const auto baselineCycle = [&](std::uint64_t cycle) {
+            auto result = cycle;
+            for (const auto& cost : costs) {
+                if (cost.start_cycle < cycle && cycle < cost.end_cycle)
+                    throw std::logic_error("Raw decoder places a consumer inside its charged drain interval");
+                if (cost.end_cycle <= cycle) result -= cost.end_cycle - cost.start_cycle;
+            }
+            return result;
+        };
+        if (!dynamicProgram.common_barrier_protocol
+            || baselineCycle(dynamicProgram.max_cycle) != program.max_cycle
+            || dynamicProgram.bindings.size() != program.bindings.size()
+            || dynamicProgram.weight_page_uses.size() != program.weight_page_uses.size())
+            throw std::logic_error("Raw decoder does not preserve the baseline paging contract");
+        for (std::size_t index = 0; index < program.bindings.size(); ++index) {
+            const auto& before = program.bindings[index];
+            const auto& after = dynamicProgram.bindings[index];
+            if (before.index != after.index || before.access != after.access
+                || before.element_type != after.element_type || before.layout != after.layout
+                || before.base_row != after.base_row || before.bank != after.bank
+                || before.shape != after.shape || before.slices != after.slices
+                || before.page_count != after.page_count || before.paged_weight != after.paged_weight)
+                throw std::logic_error("Raw decoder changed a baseline binding placement");
+        }
+        for (std::size_t index = 0; index < program.weight_page_uses.size(); ++index) {
+            const auto& before = program.weight_page_uses[index];
+            const auto& after = dynamicProgram.weight_page_uses[index];
+            if (before.binding_index != after.binding_index || before.page_index != after.page_index
+                || before.bank != after.bank || before.ready_cycle != baselineCycle(after.ready_cycle)
+                || before.release_cycle != baselineCycle(after.release_cycle))
+                throw std::logic_error("Raw decoder changed a baseline page transport instance");
+        }
+        for (const auto& queue : dynamicProgram.queues)
+            if (!queue.commands.empty() && (queue.kind == QueueKind::Mem
+                    || queue.kind == QueueKind::MxmLoad || queue.kind == QueueKind::MxmCompute
+                    || queue.kind == QueueKind::MxmDequant)
+                && !queue.requires_raw_macro)
+                throw std::logic_error("Raw decoder silently retained a non-Macro computation queue");
+    }
     const std::size_t declaredExecutableWeightPages =
         std::accumulate(program.bindings.begin(), program.bindings.end(),
             std::size_t {0}, [](std::size_t total,
@@ -2463,7 +2537,7 @@ try {
             synchronizedWritesPerUse[useIndex] += segment.vector_count;
         }
     }
-    const auto expectedPlans = plan_weight_prefetches(program);
+    const auto expectedPlans = plan_weight_prefetches(dynamicProgram);
     const std::size_t expectedExecutablePrefetches = expectedPlans.size();
     std::size_t expectedSyncInstructions = 0;
     std::size_t expectedSynchronizedWrites = 0;
@@ -2591,7 +2665,7 @@ try {
             layer == 0, layer == decoderLayerCount});
     }
 
-    dynamicPackage.executables.push_back({"decoder.layer", program, {}});
+    dynamicPackage.executables.push_back({"decoder.layer", dynamicProgram, {}});
     for (std::size_t layer = 0; layer < decoderLayerCount; ++layer) {
         std::vector<ModelStateBindingRef> stateRefs;
         for (const BinaryBinding& binding : program.bindings) {
@@ -2810,17 +2884,10 @@ try {
         for (std::size_t row = 0; row < kSeqLen; ++row) {
             for (std::size_t h = 0; h < kIntermediate; ++h) {
                 const std::size_t block = h / 32;
-                const std::size_t tokenLane = row % kMxmBlockRows;
-                const std::size_t tokenWave = (row % 32) / kMxmBlockRows;
-                const std::size_t address = hiddenBaseRow
-                    + ((row / 32) * (kIntermediate / 32) + block)
-                        * kTileRows
-                    + tokenWave;
-                const float actualValue = checkpointPhysicalBf16(
-                    ftlpu::Hemisphere::East,
-                    rms2Binding->slices[2 * tokenLane],
-                    rms2Binding->slices[2 * tokenLane + 1], address,
-                    h % 32, rms2Binding->bank);
+                const auto location = hiddenLocation(row, h);
+                const auto address = location[2];
+                const float actualValue = readHidden(checkpointPhysicalBf16,
+                    ftlpu::Hemisphere::East, row, h);
                 const float expectedValue =
                     physicalHidden[row * kIntermediate + h];
                 const float error = std::fabs(actualValue - expectedValue);
@@ -2880,18 +2947,8 @@ try {
                 static_cast<std::uint16_t>(low)
                 | (static_cast<std::uint16_t>(high) << 8)).to_float();
         };
-        const auto dynamicDistributed = [&](std::size_t row, std::size_t column,
-                                            std::size_t width) {
-            const std::size_t block = column / 32;
-            const std::size_t tokenLane = row % kMxmBlockRows;
-            const std::size_t tokenWave = (row % 32) / kMxmBlockRows;
-            const std::size_t address = hiddenBaseRow
-                + ((row / 32) * (width / 32) + block) * kTileRows
-                + tokenWave;
-            return dynamicPhysicalBf16(ftlpu::Hemisphere::East,
-                rms2Binding->slices[2 * tokenLane],
-                rms2Binding->slices[2 * tokenLane + 1], address,
-                column % 32, rms2Binding->bank);
+        const auto dynamicHidden = [&](std::size_t row, std::size_t column) {
+            return readHidden(dynamicPhysicalBf16, ftlpu::Hemisphere::East, row, column);
         };
         std::size_t dynamicHiddenMismatches = 0;
         float dynamicHiddenMaxError = 0.0f;
@@ -2899,7 +2956,7 @@ try {
             for (std::size_t h = 0; h < kIntermediate; ++h) {
                 const std::size_t index = row * kIntermediate + h;
                 const float error = std::fabs(
-                    dynamicDistributed(row, h, kIntermediate)
+                    dynamicHidden(row, h)
                     - physicalHidden[index]);
                 if (error != 0.0f) ++dynamicHiddenMismatches;
                 dynamicHiddenMaxError = std::max(dynamicHiddenMaxError, error);
@@ -2944,14 +3001,12 @@ try {
                                       << " error=" << error
                                       << " h0=" << h0
                                       << " h0.dynamic="
-                                      << dynamicDistributed(
-                                             row, h0, kIntermediate)
+                                      << dynamicHidden(row, h0)
                                       << " h0.direct=" << physicalHidden[
                                              row * kIntermediate + h0]
                                       << " h1=" << h1
                                       << " h1.dynamic="
-                                      << dynamicDistributed(
-                                             row, h1, kIntermediate)
+                                      << dynamicHidden(row, h1)
                                       << " h1.direct=" << physicalHidden[
                                              row * kIntermediate + h1]
                                       << '\n';
@@ -3046,11 +3101,11 @@ try {
     // the exact output comparison above detects incorrect resumption.
     const BinaryProgram& linkedProgram =
         dynamicSession.last_linked_program();
-    std::array<bool, ftlpu::InstructionControlUnit::kMemQueues>
-        seenLinkedMemQueue{};
     std::size_t linkedWriteSyncInstructions = 0;
     std::size_t linkedReadSyncInstructions = 0;
-    for (const QueueProgram& queue : linkedProgram.queues) {
+    const auto inspectLinkedQueues = [&](const std::vector<QueueProgram>& queues) {
+      std::array<bool, ftlpu::InstructionControlUnit::kMemQueues> seenLinkedMemQueue{};
+      for (const QueueProgram& queue : queues) {
         if (queue.kind != QueueKind::Mem)
             continue;
         if (queue.index >= seenLinkedMemQueue.size()
@@ -3096,6 +3151,12 @@ try {
             ++pc;
         }
     }
+    };
+    inspectLinkedQueues(linkedProgram.queues);
+    inspectLinkedQueues(linkedProgram.transport_queues);
+    if (argc == 3 && (linkedProgram.barriers.empty()
+            || linkedProgram.transport_queues.empty()))
+        throw std::logic_error("Raw decoder did not execute a linked common barrier and MEM transport image");
     if (linkedWriteSyncInstructions != expectedSyncInstructions)
         throw std::logic_error(
             "Qwen dynamic linker MEM_WRITE_SYNC count mismatch: linked="
@@ -3133,7 +3194,10 @@ try {
               << dynamicStats.weight_page_runtime_wait_cycles
               << ", compiled_ddr_mbytes="
               << program.hardware.ddr_peak_bandwidth_mbytes_per_second
-              << ", runtime_ddr_mbytes=" << runtimeDdrBandwidth << '\n';
+              << ", runtime_ddr_mbytes=" << runtimeDdrBandwidth
+              << ", common_barriers=" << linkedProgram.barriers.size()
+              << ", barrier_table_bytes=" << (16 + 8 * linkedProgram.barriers.size())
+              << '\n';
 #endif
     std::cout << "Complete " FTLPU_TEST_MODEL_NAME
                  " decoder layer passed: "

@@ -85,6 +85,17 @@ try {
                         is_fu_3d_raw_packet_header(command);
                 });
         });
+    // Logical issue comparison concerns only computation. DMA/RX and the
+    // independently loaded MEM transport have physical schedules of their own.
+    const auto computationOnly = [](auto image) {
+        using ftlpu::software::runtime::QueueKind;
+        std::erase_if(image.queues, [](const auto& queue) {
+            return queue.kind == QueueKind::C2cDma
+                || queue.kind == QueueKind::C2cTx || queue.kind == QueueKind::C2cRx;
+        });
+        image.transport_queues.clear();
+        return image;
+    };
     std::optional<ftlpu::software::runtime::LogicalIssueProgram>
         logicalIssues;
     if (hasRawFu3D && !comparePath) {
@@ -94,7 +105,7 @@ try {
                   << " status=not_expanded\n";
     } else {
         logicalIssues =
-            ftlpu::software::runtime::inspect_logical_issues(program);
+            ftlpu::software::runtime::inspect_logical_issues(computationOnly(program));
         std::cout << "binary logical_issue_summary queues="
                   << logicalIssues->queues.size()
                   << " functional_issues="
@@ -479,6 +490,56 @@ try {
                   << " macro=" << queue.macro_entries
                   << " coarse_program=" << queue.coarse_program_entries
                   << '\n';
+    }
+    // Report physical computation and live transport separately. Container
+    // metadata costs are explicit and are not counted as hardware i-MEM.
+    auto computeStorageProgram = program;
+    auto transportStorageProgram = program;
+    computeStorageProgram.queues.clear();
+    transportStorageProgram.queues = program.transport_queues;
+    computeStorageProgram.transport_queues.clear();
+    transportStorageProgram.transport_queues.clear();
+    for (const auto& queue : program.queues) {
+        using ftlpu::software::runtime::QueueKind;
+        if (queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cTx
+            || queue.kind == QueueKind::C2cRx)
+            transportStorageProgram.queues.push_back(queue);
+        else
+            computeStorageProgram.queues.push_back(queue);
+    }
+    const auto computeStorage = ftlpu::software::runtime::analyze_physical_imem(computeStorageProgram);
+    const auto transportStorage = ftlpu::software::runtime::analyze_physical_imem(transportStorageProgram);
+    const auto computeBytes = (computeStorage.used_bits + 7) / 8;
+    const auto transportBytes = (transportStorage.used_bits + 7) / 8;
+    const auto barrierRamBytes = program.barriers.size() * std::uint64_t{8};
+    const auto barrierBlockBytes = binaryVersion >= 37 ? std::uint64_t{16} + barrierRamBytes : 0;
+    std::uint64_t associationBytes = 0;
+    std::uint64_t completionInstances = 0;
+    for (const auto& event : program.barrier_events) {
+        associationBytes += 8 + event.page_use_indices.size() * std::uint64_t{4};
+        completionInstances += event.page_use_indices.size();
+    }
+    std::cout << "binary common_barrier_storage protocol=" << program.common_barrier_protocol
+              << " entries=" << program.barriers.size()
+              << " barrier_ram_bytes=" << barrierRamBytes
+              << " barrier_block_bytes=" << barrierBlockBytes
+              << " event_association_bytes=" << associationBytes
+              << " completion_instances=" << completionInstances
+              << " use_launch_metadata_bytes=" << (binaryVersion >= 37 ? program.weight_page_uses.size() * 4 : 0)
+              << " compute_imem_bytes=" << computeBytes
+              << " transport_native_words=" << transportStorage.used_slots
+              << " transport_native_bytes=" << transportBytes
+              << " total_imem_bytes=" << computeBytes + transportBytes
+              << " imem_and_barrier_ram_bytes=" << computeBytes + transportBytes + barrierRamBytes
+              << " total_file_bytes=" << std::filesystem::file_size(argv[1]) << '\n';
+    for (const auto& barrier : program.barriers) {
+        const auto event = std::ranges::find(program.barrier_events, barrier.event_id,
+            &ftlpu::software::runtime::BinaryBarrierEvent::event_id);
+        std::cout << "binary common_barrier stop_cycle=" << barrier.stop_cycle
+                  << " event_id=" << barrier.event_id << " page_use_instances=";
+        for (std::size_t i = 0; i < event->page_use_indices.size(); ++i)
+            std::cout << (i ? "," : "") << event->page_use_indices[i];
+        std::cout << '\n';
     }
     const auto physical =
         ftlpu::software::runtime::analyze_physical_imem(program);
@@ -935,7 +996,7 @@ try {
         const auto reference =
             ftlpu::software::runtime::read_binary_program(*comparePath);
         const auto referenceIssues =
-            ftlpu::software::runtime::inspect_logical_issues(reference);
+            ftlpu::software::runtime::inspect_logical_issues(computationOnly(reference));
         const auto comparison =
             ftlpu::software::runtime::compare_logical_issues(
                 program, reference);

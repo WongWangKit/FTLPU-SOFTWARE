@@ -91,16 +91,30 @@ struct ExecutableHardwareConfig {
     std::uint32_t icu_mem_macro_context_bits{hw::kIcuMemMacroContextBits};
     std::uint32_t icu_mxm_macro_context_bits{hw::kIcuMxmMacroContextBits};
 
+    // Finite shared controller RAM; packed-v1 instruction encoding is unchanged.
+    std::uint32_t common_barrier_encoding_version{hw::kCommonBarrierEncodingVersion};
+    std::uint32_t common_barrier_capacity{hw::kCommonBarrierCapacity};
+
+    template <typename Visitor>
+    constexpr void visit_pre_v37(Visitor&& visitor)
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor));
+    }
+
     template <typename Visitor>
     constexpr void visit(Visitor&& visitor)
     {
         visit_impl(*this, std::forward<Visitor>(visitor));
+        visitor(common_barrier_encoding_version);
+        visitor(common_barrier_capacity);
     }
 
     template <typename Visitor>
     constexpr void visit(Visitor&& visitor) const
     {
         visit_impl(*this, std::forward<Visitor>(visitor));
+        visitor(common_barrier_encoding_version);
+        visitor(common_barrier_capacity);
     }
 
     template <typename Visitor>
@@ -295,6 +309,8 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     // change. Keep legacy Schedule attributes valid and validate geometry
     // explicitly when loading an executable into a CModel.
     config.visit_command_abi([&](std::uint32_t value) { hash.add(value); });
+    hash.add(config.common_barrier_encoding_version);
+    hash.add(config.common_barrier_capacity);
     return hash.value();
 }
 
@@ -304,6 +320,8 @@ constexpr std::uint64_t executable_target_abi(
     TargetAbiHasher hash;
     hash.add(21); // VXM terminal accumulator controls in compact ICU packets.
     config.visit_command_abi([&](std::uint32_t value) { hash.add(value); });
+    hash.add(config.common_barrier_encoding_version);
+    hash.add(config.common_barrier_capacity);
     return hash.value();
 }
 

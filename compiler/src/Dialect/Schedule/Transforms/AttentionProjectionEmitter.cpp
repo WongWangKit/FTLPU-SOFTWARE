@@ -492,9 +492,16 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   }
 
   if (target_.throughput().mxms_per_hemisphere == 1) {
-    const int64_t accumulatorHalfStride =
-        target_.throughput().mxm_accumulator_blocks
-        * target_.throughput().mxm_rows / 2;
+    const int64_t accumulatorCapacity = target_.throughput().mxm_accumulator_blocks * tile;
+    if (tokenBlocks * tile > accumulatorCapacity) {
+      op_.emitError("attention projection token window exceeds physical accumulator capacity");
+      return -1;
+    }
+    // Halves execute all reductions and clear their final partials in order.
+    // A long token window can reuse the complete accumulator after that clear,
+    // rather than overlap two windows at a fixed half-capacity stride.
+    const bool reuseAccumulatorWindow = tokenBlocks * tile > accumulatorCapacity / 2;
+    const int64_t accumulatorHalfStride = reuseAccumulatorWindow ? 0 : accumulatorCapacity / 2;
     const int64_t conservativeComputeSpacing = projectionIssueInterval;
     int64_t projectionBlock = 0;
     int64_t postprocessReady = phaseStart;
@@ -917,6 +924,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               target_.memory().slices_per_hemisphere, -1);
         }
         for (int64_t half = 0; half < 2; ++half) {
+          if (reuseAccumulatorWindow && half != 0)
+            phaseStart = std::max(phaseStart, rawWriteEnd + target_.throughput().tile_rows);
           int64_t nextWeightDomain = 0;
           int64_t nextActivationDomain = 0;
           int64_t nextComputeDomain = 0;
@@ -1706,7 +1715,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                 "sram", -1,
                                 mergeProjectionMxm ? 1 : tokenBlocks,
                                 mergeProjectionMxm ? 1 : computeSpacing,
-                                mergeProjectionMxm ? 0 : tile,
+                                mergeProjectionMxm ? 0 : target_.throughput().tile_rows,
                                 mergeProjectionMxm ? projectionGroups * 2 : 1,
                                 mergeProjectionMxm
                                     ? hiddenBlocks * projectionReductionInterval
@@ -1761,7 +1770,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               "sram", -1,
                               mergeProjectionMxm ? 1 : tokenBlocks,
                               mergeProjectionMxm ? 1 : computeSpacing,
-                              mergeProjectionMxm ? 0 : tile,
+                              mergeProjectionMxm ? 0 : target_.throughput().tile_rows,
                               mergeProjectionMxm ? projectionGroups * 2 : 1,
                               mergeProjectionMxm
                                   ? hiddenBlocks * projectionReductionInterval
@@ -2835,11 +2844,17 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           {cycle, queue, address, packedStream, bank,
                            pairBlock, phase});
                     } else {
-                      emitMem3D(rewriter_, op_.getLoc(), cycle, queue,
-                                "read", address, packedStream,
-                                ropeRowsPerLane, 1, 1,
-                                "sram", -1, tokenBlocks, tile, tile,
-                                1, 1, 0, bank);
+                      // The two RoPE operands rotate through the same MEM
+                      // queues within each token tile. A context spanning
+                      // multiple tiles would retain the queue over the other
+                      // operand's reads, even when its issue cycles are idle.
+                      for (int64_t tokenBlock = 0; tokenBlock < tokenBlocks;
+                           ++tokenBlock)
+                        emitMem3D(rewriter_, op_.getLoc(),
+                                  cycle + tokenBlock * tile, queue,
+                                  "read", address + tokenBlock * tile,
+                                  packedStream, ropeRowsPerLane, 1, 1,
+                                  "sram", -1, 1, 1, 0, 1, 1, 0, bank);
                     }
                   }
                 }

@@ -131,6 +131,14 @@ target_link_libraries(ftlpu_icu_program_export PRIVATE ftlpu_software)
 add_executable(ftlpu_binary_repack examples/binary_repack.cpp)
 target_link_libraries(ftlpu_binary_repack PRIVATE ftlpu_software)
 
+add_executable(runtime_common_barrier_test tests/runtime/runtime_common_barrier_test.cpp)
+target_link_libraries(runtime_common_barrier_test PRIVATE ftlpu_software)
+add_test(NAME runtime_common_barrier_test COMMAND $<TARGET_FILE:runtime_common_barrier_test>)
+
+add_executable(binary_barrier_test tests/runtime/binary_barrier_test.cpp)
+target_link_libraries(binary_barrier_test PRIVATE ftlpu_software)
+add_test(NAME binary_barrier_test COMMAND $<TARGET_FILE:binary_barrier_test>)
+
 add_executable(macro_bitstream_test
     tests/runtime/macro_bitstream_test.cpp)
 target_link_libraries(macro_bitstream_test PRIVATE ftlpu_software)
@@ -460,6 +468,15 @@ add_executable(compiled_smollm2_decoder_layer_runtime_test
 
 target_link_libraries(compiled_smollm2_decoder_layer_runtime_test
     PRIVATE ftlpu_software)
+
+# Compare a real Macro paging run against the CPU-checked native decoder.
+# The optional second input selects Raw computation only for ModelSession.
+add_executable(compiled_smollm2_common_barrier_decoder_test
+    tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
+target_compile_definitions(compiled_smollm2_common_barrier_decoder_test PRIVATE
+    FTLPU_TEST_SEQUENCE_LENGTH=32
+    FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES=1)
+target_link_libraries(compiled_smollm2_common_barrier_decoder_test PRIVATE ftlpu_software)
 
 add_executable(compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test
     tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)

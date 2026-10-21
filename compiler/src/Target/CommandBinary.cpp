@@ -3108,8 +3108,7 @@ void lower_direct_raw_macro(software::runtime::BinaryProgram& program)
                 queue = std::move(lowered.queue);
             } catch (const std::exception& error) {
                 throw std::runtime_error(
-                    "raw-macro does not support paged weights or synchronization controls "
-                    "in the same queue, or an unrepresentable FU loop: "
+                    "raw-macro contains an unmapped synchronization control or an unrepresentable FU loop: "
                     + std::string(queue_kind_name(queue.kind)) + "["
                     + std::to_string(queue.index) + "]: " + error.what());
             }
@@ -3472,6 +3471,8 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     COPY_ICU_MEMORY(mxm_macro_contexts);
     COPY_ICU_MEMORY(mem_macro_context_bits);
     COPY_ICU_MEMORY(mxm_macro_context_bits);
+    hardware.common_barrier_encoding_version = static_cast<std::uint32_t>(icuMemory.common_barrier_encoding_version);
+    hardware.common_barrier_capacity = static_cast<std::uint32_t>(icuMemory.common_barrier_capacity);
 #undef COPY_ICU_MEMORY
     if (compressionMode == IcuCompressionMode::RawMacro
         && (hardware.icu_mem_instruction_bits != 96 || hardware.icu_mxm_instruction_bits != 128
@@ -3566,12 +3567,32 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             return std::tie(lhs.kind, lhs.index)
                 < std::tie(rhs.kind, rhs.index);
         });
-    if (requiresDirectLowering) {
+    if (compressionMode == IcuCompressionMode::RawMacro) {
+        // Runtime paging owns concrete transport instances and final common
+        // logical stops. Keep the computation image free of queue-local
+        // WAIT/SYNC; weight_page_uses and exclusive ingress timelines retain
+        // the information needed for the checked final link.
+        if (!program.weight_page_uses.empty()
+            && (program.hardware.common_barrier_encoding_version != 1
+                || program.hardware.common_barrier_capacity == 0))
+            throw std::runtime_error("Raw Macro paging requires the common barrier target capability");
+        program.common_barrier_protocol = program.hardware.common_barrier_encoding_version == 1;
+        lower_direct_raw_macro(program);
+        if (requiresDirectLowering) {
+            software::runtime::BinaryProgram readback;
+            readback.hardware = program.hardware;
+            readback.bindings = program.bindings;
+            emit_compiled_mem_read_sync(readback);
+            program.transport_queues = std::move(readback.queues);
+            for (auto& relocation : readback.address_relocations) {
+                relocation.transport_queue = true;
+                program.address_relocations.push_back(relocation);
+            }
+        }
+    } else if (requiresDirectLowering) {
         emit_compiled_mem_write_sync(program);
         emit_compiled_mem_read_sync(program);
     }
-    if (compressionMode == IcuCompressionMode::RawMacro)
-        lower_direct_raw_macro(program);
     return program;
 }
 

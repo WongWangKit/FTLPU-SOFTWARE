@@ -61,6 +61,12 @@ public:
     void stream_mem_execution_trace_csv(const std::filesystem::path& path);
     void write_mem_execution_trace_csv(
         const std::filesystem::path& path) const;
+    std::uint64_t execution_generation() const noexcept { return execution_generation_; }
+    void notify_common_page_commit(std::uint32_t instance);
+    void notify_common_page_commit(std::uint64_t generation, std::uint32_t instance);
+    bool common_transport_launched(std::uint32_t launch_event) const;
+    bool common_transport_committed(std::uint32_t launch_event) const;
+    bool common_barrier_protocol() const noexcept { return common_barrier_protocol_; }
     std::size_t physical_cycles() const noexcept { return physical_cycles_; }
     std::size_t logical_cycles() const noexcept { return executed_cycles_; }
     std::size_t instruction_prefill_cycles() const noexcept
@@ -77,11 +83,24 @@ public:
 private:
     const BinaryBinding& find_binding(BindingAccess access, std::size_t index) const;
     void load_ready_weight_pages();
+    void configure_common_transport(const BinaryProgram& program);
+    void advance_common_transport();
+    struct CommonTransportPage {
+        std::uint32_t launch_event{0}, stop_cycle{0};
+        std::uint16_t hemisphere_mask{0};
+        std::vector<std::uint32_t> instances{};
+        std::vector<std::pair<std::size_t, std::size_t>> mem_issue_targets{};
+        std::optional<std::size_t> writes_issued_cycle{};
+        bool launched{false}, committed{false};
+    };
+    std::vector<CommonTransportPage> common_transports_{};
     void run_logical_cycles(std::size_t cycles,
         TspSliceSystem::LogSinks sinks);
 
     TspSliceSystem& system_;
     C2cDmaSystem* c2c_system_{nullptr};
+    std::uint64_t execution_generation_{0};
+    bool common_barrier_protocol_{false};
     std::size_t loaded_max_cycle_{0};
     std::size_t loaded_mxms_per_hemisphere_{hw::kMxmsPerHemisphere};
     std::size_t loaded_vxm_alus_{hw::kVxmAluCount};

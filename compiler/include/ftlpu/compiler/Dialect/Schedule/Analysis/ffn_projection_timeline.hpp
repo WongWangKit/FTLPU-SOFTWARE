@@ -89,6 +89,8 @@ struct FfnDownProjectionTimeline {
     int64_t first_accumulator_stream;
     int64_t second_accumulator_stream;
     int64_t vxm_queues_per_hemisphere;
+    bool serialized_slots{false};
+    std::vector<int64_t> second_slot_offsets;
     std::vector<FfnDownBlockSchedule> blocks;
 };
 

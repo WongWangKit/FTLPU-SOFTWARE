@@ -296,6 +296,15 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         ? std::max(distributed_input_rows, key_rows)
         : target.attention_score_base_row();
     const int64_t query_base = score_base + score_rows;
+    // Compact low Key products use activation slices 4..7 on scratch_bank.
+    // Their Key-local head coordinates must preserve both the live residual
+    // input and Query IW rows until the attention consumer has finished.
+    const int64_t rope_product_key_base = compact_rope_products
+        ? std::max(distributed_input_rows, query_base + query_rows)
+        : rope_product_base;
+    const int64_t rope_product_key_rows = compact_rope_products
+        ? (direct_rope_streaming ? 1 : kv_heads * (head_blocks / 2) * 2 * seq_len)
+        : rope_product_rows;
     const int64_t rope_table_base = decode
         ? query_base
         : target.attention_probability_diagonal_base_row();
@@ -334,6 +343,8 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         || rope_staging_base + rope_staging_rows
             > target.memory().words_per_bank
         || rope_product_base + rope_product_rows
+            > target.memory().words_per_bank
+        || rope_product_key_base + rope_product_key_rows
             > target.memory().words_per_bank
         || (compact_rope_products
             && rope_mirror_base + rope_rows > target.memory().words_per_bank)
@@ -698,7 +709,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             llvm::SmallVector<int64_t, 16>(
                 rope_product_key_slices.begin(),
                 rope_product_key_slices.end()),
-            rope_product_base, rope_product_rows,
+            rope_product_key_base, rope_product_key_rows,
             0, 2, false, scratch_bank}))) {
         op.emitError("failed to reserve the key RoPE product FIFO");
         return mlir::failure();
@@ -1310,7 +1321,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         rewriter.getNamedAttr("rope_product_key",
             make_attention_placement(rewriter,
                 "fp16_rope_product_key_x4", rope_product_key_slices,
-                rope_product_base, rope_product_rows, "both",
+                rope_product_key_base, rope_product_key_rows, "both",
                 scratch_bank)),
         rewriter.getNamedAttr("context", contextPlacement),
         rewriter.getNamedAttr("output_activation",

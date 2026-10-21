@@ -140,6 +140,7 @@ private:
     void prepare_executable_weight_pages(
         const BinaryProgram& program, const ModelInvocation& invocation,
         std::size_t invocation_index);
+    void execute_executable_weight_preloads(const BinaryProgram& program);
     void prepare_executable_weight_lookahead(
         std::size_t invocation_index, const BinaryProgram& program);
     void schedule_executable_weight_pages(BinaryProgram& program);

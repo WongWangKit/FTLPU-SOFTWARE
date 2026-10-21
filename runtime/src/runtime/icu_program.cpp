@@ -4,6 +4,7 @@
 #include "ftlpu/software/runtime/macro_bitstream.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -997,7 +998,41 @@ BinaryProgram without_compiled_mem_write_sync(const BinaryProgram& compiled)
 
 BinaryProgram without_compiled_mem_read_sync(const BinaryProgram& compiled)
 {
-    return without_compiled_mem_sync(compiled, MemOpcode::Read);
+    if (!compiled.common_barrier_protocol)
+        return without_compiled_mem_sync(compiled, MemOpcode::Read);
+    BinaryProgram result = compiled;
+    for (auto& queue : result.transport_queues) {
+        std::vector<std::size_t> remap(queue.commands.size(),
+            std::numeric_limits<std::size_t>::max());
+        std::vector<QueueCommand> retained;
+        for (std::size_t pc = 0; pc < queue.commands.size();) {
+            const bool sync = is_mem_synchronized_raw_packet_header(queue.commands[pc]);
+            const auto words = sync
+                ? InstructionControlUnit::MemIcu::synchronized_packet_word_count : 1;
+            const bool read = sync && synchronized_mem_opcode(
+                decode_mem_synchronized_icu_packet(queue, pc)) == MemOpcode::Read;
+            if (!read) {
+                for (std::size_t word = 0; word < words; ++word) {
+                    remap[pc + word] = retained.size();
+                    retained.push_back(queue.commands[pc + word]);
+                }
+            }
+            pc += words;
+        }
+        std::erase_if(result.address_relocations, [&](auto& relocation) {
+            if (!relocation.transport_queue || relocation.queue_index != queue.index)
+                return false;
+            if (relocation.command_index >= remap.size())
+                throw std::invalid_argument("transport relocation exceeds iMEM image");
+            const auto target = remap[relocation.command_index];
+            if (target == std::numeric_limits<std::size_t>::max()) return true;
+            relocation.command_index = target;
+            return false;
+        });
+        queue.commands = std::move(retained);
+    }
+    std::erase_if(result.transport_queues, [](const auto& queue) { return queue.commands.empty(); });
+    return result;
 }
 
 bool is_fu_3d_raw_word_command(const QueueCommand& command) noexcept
@@ -1418,6 +1453,31 @@ bool IcuProgram::empty() const
         }
     }
     return true;
+}
+
+void load_transport_queue_programs_into_icu(
+    const std::vector<QueueProgram>& queues, InstructionControlUnit& icu)
+{
+    std::unordered_set<std::size_t> seen;
+    for (const auto& queue : queues) {
+        if (queue.kind != QueueKind::Mem || queue.requires_raw_macro
+            || queue.packed_macro_imem || queue.index >= InstructionControlUnit::kMemQueues
+            || !seen.insert(queue.index).second)
+            throw std::invalid_argument("invalid or duplicate common-barrier MEM transport queue");
+        auto& target = icu.mem_transport_iq(queue.index);
+        for (std::size_t pc = 0; pc < queue.commands.size(); ++pc) {
+            const auto& command = queue.commands[pc];
+            if (is_mem_synchronized_raw_packet_header(command)) {
+                target.push_encoded_synchronized_packet(
+                    decode_mem_synchronized_icu_packet(queue, pc));
+                pc += InstructionControlUnit::MemIcu::synchronized_packet_word_count - 1;
+            } else if (is_icu_control_raw_word_command(command)) {
+                target.append_control(decode_icu_control_raw_word(command));
+            } else {
+                throw std::invalid_argument("MEM transport accepts only explicit control and synchronized packets");
+            }
+        }
+    }
 }
 
 std::size_t load_queue_programs_into_icu(

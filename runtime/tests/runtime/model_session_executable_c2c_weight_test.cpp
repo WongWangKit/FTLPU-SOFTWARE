@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -589,6 +590,25 @@ try {
             != windowProgram.hardware.c2c_streams_per_direction)
         throw std::runtime_error("compiler C2C ingress reservation was ignored");
 
+    // Physical transfer time must not advance the common computation
+    // coordinate. Both disjoint pages enter at the same proven stop even
+    // when the first page takes longer than the entire logical program.
+    auto commonWindowProgram = windowProgram;
+    commonWindowProgram.common_barrier_protocol = true;
+    commonWindowProgram.weight_page_uses.push_back({1, 0, 0, 1000, 1100, true});
+    commonWindowProgram.timelines.push_back({"c2c.window.binding:1.page:0", 100, 900});
+    auto commonWindowPlans = windowPlans;
+    commonWindowPlans[0].bytes[0] = 1'000'000;
+    auto secondCommonPlan = commonWindowPlans[0];
+    secondCommonPlan.use_indices = {1};
+    secondCommonPlan.regions = {{0, 1, 21, 0, 8, false}};
+    commonWindowPlans.push_back(secondCommonPlan);
+    schedule_weight_prefetches(commonWindowProgram, commonWindowPlans);
+    if (commonWindowPlans[0].earliest_mem_cycle != 100
+        || commonWindowPlans[1].earliest_mem_cycle != 100
+        || commonWindowPlans[1].start_cycle != 100)
+        throw std::runtime_error("physical paging duration consumed common logical time");
+
     BinaryProgram program;
     program.bindings.push_back(make_weight_binding());
     program.weight_page_uses.push_back({0, 0, 0, 200, 220});
@@ -707,6 +727,48 @@ try {
                 throw std::runtime_error(
                     "lookahead model page became ready before SRAM commit");
         }
+
+    {
+        // Exercise common INIT ordering through the actual session: one
+        // preloaded bank plus a second bank filled while computation holds.
+        BinaryProgram commonProgram;
+        commonProgram.common_barrier_protocol = true;
+        commonProgram.max_cycle = 512;
+        auto startup = make_weight_binding(0);
+        auto refill = make_weight_binding(1);
+        refill.index = 1;
+        refill.name = "next.weight";
+        commonProgram.bindings = {startup, refill};
+        commonProgram.weight_page_uses = {{0, 0, 0, 128, 256, false}, {1, 0, 1, 256, 512, true}};
+        commonProgram.timelines = {{"c2c.window.binding:1.page:0", 128, 256}};
+        ModelPackage commonPackage;
+        commonPackage.model_name = "common-bootstrap-and-refill";
+        commonPackage.architecture = "test";
+        commonPackage.tensors = {{startup.name, BindingElementType::I8, {32, 128}, logical},
+            {refill.name, BindingElementType::I8, {32, 128}, nextLogical}};
+        commonPackage.executables.push_back({"main", commonProgram, {}});
+        commonPackage.invocations.push_back({"main", 0, {{0, startup.name}, {1, refill.name}}, {}, {}});
+        auto commonSystem = std::make_unique<C2cDmaSystem>();
+        ModelSession commonSession(*commonSystem);
+        commonSession.load(std::move(commonPackage));
+        commonSession.run(0);
+        const auto& commonStats = commonSession.stats();
+        const auto& linked = commonSession.last_linked_program();
+        if (commonStats.weight_page_prefetches != 2 || commonStats.weight_page_initial_wait_cycles == 0
+            || commonStats.weight_page_runtime_wait_cycles == 0 || linked.barriers.size() != 1
+            || linked.barriers.front().stop_cycle != 256 || linked.transport_queues.empty())
+            throw std::runtime_error("common session did not separate startup transport and logical refill waiting");
+        for (const auto& [weight, bytes] : std::array{std::pair{startup, logical}, std::pair{refill, nextLogical}}) {
+            const auto packed = pack_weight_binding_page(weight, 0, bytes, commonProgram.hardware);
+            for (const auto& segment : packed.segments)
+                for (std::size_t row = 0; row < segment.vector_count; ++row)
+                    for (std::size_t byte = 0; byte < hw::kPhysicalVectorBytes; ++byte)
+                        if (commonSystem->chip().read_mem_sram_lane_byte(static_cast<Hemisphere>(segment.hemisphere),
+                            segment.slice, weight.bank, byte / hw::kLanesPerTile, segment.base_row + row,
+                            byte % hw::kLanesPerTile) != packed.data[segment.byte_offset + row * hw::kPhysicalVectorBytes + byte])
+                            throw std::runtime_error("common session resumed before its initial/refill SRAM contents committed");
+        }
+    }
 
     std::cout << "model_session_executable_c2c_weight_test passed\n";
     return 0;

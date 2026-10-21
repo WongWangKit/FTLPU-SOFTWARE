@@ -317,22 +317,20 @@ def main() -> None:
     if args.runtime_test:
         run([args.runtime_test, ffn_baseline, ffn_macro])
 
-    # A real paged decoder must fail explicitly until Macro supports runtime
-    # C2C synchronization. It must never fall back to native FU3D silently.
+    # A real paged decoder retains Macro computation plus compiler paging
+    # candidates. The runtime final link owns the concrete common barriers
+    # and independently loaded MEM transport controls.
     decoder = (Path(__file__).resolve().parents[1] / "examples" /
                "qwen2_5_1_5b_decoder_layer" / "decoder_layer_seq32.stablehlo.mlir")
-    rejected = args.output_dir / "paged-decoder-raw-macro.ftlpu"
-    rejected.unlink(missing_ok=True)
+    paged = args.output_dir / "paged-decoder-raw-macro.ftlpu"
     run([args.compile, "--input", decoder, "--input-stage", "stablehlo",
-         "--output", rejected, *target, "--weight-bank", "1",
+         "--output", paged, *target, "--weight-bank", "1",
          "--kv-cache-capacity", "256", "--mxm-execution", "vector",
-         "--projection-rope-overlap", "off", "--icu-compression", "raw-macro"],
-        failure="raw-macro does not support paged weights or synchronization controls")
-    if rejected.exists():
-        raise AssertionError("failed raw-macro compilation emitted a binary")
+         "--projection-rope-overlap", "off", "--icu-compression", "raw-macro"])
+    check_binary(args, paged, paged, macro=True, require_all_resources=False)
     print("direct raw Macro CLI entries, inherited mode/override, relocation clones, "
-          "StableHLO FFN, native queue preservation, issue equivalence and explicit "
-          "paged-decoder rejection passed")
+          "StableHLO FFN, native queue preservation, issue equivalence and paged "
+          "decoder candidate emission passed")
 
 
 if __name__ == "__main__":

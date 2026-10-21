@@ -1,3 +1,4 @@
+#include "ftlpu/software/runtime/common_transport_validation.hpp"
 #include "ftlpu/software/runtime/c2c_weight_pager.hpp"
 
 #include "ftlpu/icu/instruction.hpp"
@@ -190,6 +191,157 @@ std::size_t loop_cycles(const IcuLoop3D& loop)
     if (final == std::numeric_limits<std::size_t>::max())
         throw std::overflow_error("MEM 3-D duration overflows size_t");
     return final + 1;
+}
+
+// Query a compact affine issue domain without expanding a decoder's complete
+// execution trace. This analysis never changes the finite hardware frontend.
+struct CommonIssueDomain {
+    std::size_t start{0};
+    std::array<std::size_t, 3> counts{1, 1, 1};
+    std::array<std::size_t, 3> strides{1, 1, 1};
+};
+
+bool common_domain_intersects(const CommonIssueDomain& domain,
+    std::size_t begin, std::size_t end)
+{
+    if (begin >= end) return false;
+    std::array<std::pair<std::size_t, std::size_t>, 3> axes;
+    for (std::size_t axis = 0; axis < axes.size(); ++axis) {
+        if (domain.counts[axis] == 0 || domain.strides[axis] == 0)
+            throw std::logic_error("invalid affine issue domain at common stop");
+        axes[axis] = {domain.strides[axis], domain.counts[axis]};
+    }
+    std::ranges::sort(axes);
+    std::array<std::size_t, 4> spans{};
+    for (std::size_t axis = 0; axis < axes.size(); ++axis) {
+        const auto [stride, count] = axes[axis];
+        if (count - 1 > (std::numeric_limits<std::size_t>::max()
+                - spans[axis]) / stride)
+            throw std::overflow_error("common-stop affine issue span overflows");
+        spans[axis + 1] = spans[axis] + (count - 1) * stride;
+    }
+    std::size_t probes = 0;
+    const auto search = [&](auto&& self, std::size_t rank,
+                            std::size_t start) -> bool {
+        if (++probes > 1000000)
+            throw std::logic_error("common-stop safety analysis exceeded its finite work bound");
+        if (start >= end) return false;
+        if (spans[rank] > std::numeric_limits<std::size_t>::max() - start)
+            throw std::overflow_error("common-stop final issue cycle overflows");
+        if (start + spans[rank] < begin) return false;
+        if (rank == 0) return start >= begin;
+        const auto [stride, count] = axes[rank - 1];
+        const auto lowerSpan = spans[rank - 1];
+        const auto first = begin > start + lowerSpan
+            ? (begin - start - lowerSpan - 1) / stride + 1 : 0;
+        const auto last = std::min(count - 1, (end - 1 - start) / stride);
+        for (auto point = first; point <= last && point < count; ++point)
+            if (self(self, rank - 1, start + point * stride)) return true;
+        return false;
+    };
+    return search(search, axes.size(), domain.start);
+}
+
+void validate_common_drain_window(const BinaryProgram& program,
+    std::size_t stop, std::size_t ingressBegin)
+{
+    // A full fabric traversal plus the longest configured FU path is a
+    // deliberately conservative drain cost. The compiler's ingress timeline
+    // promises that live cross-operator values have reached stable storage.
+    const auto& hwc = program.hardware;
+    const auto longestFu = std::max({hwc.mem_to_sxm_latency,
+        hwc.mem_to_mxm_latency, hwc.mxm0_accumulator_latency,
+        hwc.mxm1_accumulator_latency, hwc.accumulator_to_vxm_latency,
+        hwc.accumulator_read_to_vxm_latency, hwc.swiglu_write_latency,
+        hwc.qk_iw_to_compute_latency, hwc.vxm_weight_to_iw_latency});
+    const std::size_t guard = static_cast<std::size_t>(hwc.system_register_columns)
+        + hwc.mem_boundary_register_columns + hwc.mxm_pipeline_rows
+        + hwc.tile_rows + longestFu;
+    if (stop < ingressBegin || stop - ingressBegin < guard)
+        throw std::logic_error("unsafe common stop: exclusive compiler ingress window is shorter than the drain guard");
+    const auto begin = stop - guard;
+    const auto check = [&](const CommonIssueDomain& domain,
+                            const QueueProgram& queue) {
+        if (common_domain_intersects(domain, begin, stop))
+            throw std::logic_error("unsafe common stop: computation is still in the drain window: queue="
+                + std::string(queue_kind_name(queue.kind)) + "["
+                + std::to_string(queue.index) + "] stop=" + std::to_string(stop)
+                + " drain_begin=" + std::to_string(begin));
+    };
+    for (const auto& queue : program.queues) {
+        if (queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cRx
+            || queue.kind == QueueKind::C2cTx) continue;
+        std::size_t cursor = 0, previous = 0;
+        bool hasPrevious = false;
+        for (std::size_t pc = 0; pc < queue.commands.size();) {
+            const auto& command = queue.commands[pc];
+            if (const auto idle = nop_cycles(command)) {
+                if (*idle > std::numeric_limits<std::size_t>::max() - cursor)
+                    throw std::overflow_error("common-stop Native NOP overflows");
+                cursor += *idle; ++pc; continue;
+            }
+            if (is_macro_schedule_command(command)) {
+                const auto macro = decode_macro_schedule_command(command);
+                check({macro.start_cycle, {macro.inner_count, macro.outer_count, 1},
+                    {macro.inner_interval, macro.outer_interval, 1}}, queue);
+                ++pc; continue;
+            }
+            if (is_mem_write_read_2d_raw_packet_header(command))
+                throw std::logic_error("common-stop proof does not support unsplit MEM WRITE_READ_2D");
+            if (is_fu_3d_raw_packet_header(command)) {
+                const auto loop = decode_fu_3d_raw_packet_loop(queue, pc);
+                const auto duration = loop_cycles(loop);
+                if (duration > std::numeric_limits<std::size_t>::max() - cursor)
+                    throw std::overflow_error("common-stop Native loop overflows");
+                check({cursor + loop.start_cycle + loop.wait_cycle,
+                    loop.counts, loop.cycle_strides}, queue);
+                cursor += duration;
+                pc += fu_3d_raw_packet_word_count(queue.kind, command);
+                continue;
+            }
+            const auto checkSchedule = [&](const auto& schedule) {
+                check({schedule.start_cycle, schedule.counts,
+                    schedule.cycle_strides}, queue);
+            };
+            if (is_mem_stream_nd_command(command)) {
+                checkSchedule(decode_mem_stream_nd_command(command)); ++pc; continue;
+            }
+            if (is_mxm_stream_nd_command(command)) {
+                checkSchedule(decode_mxm_stream_nd_command(command)); ++pc; continue;
+            }
+            if (is_vxm_stream_nd_command(command)) {
+                checkSchedule(decode_vxm_stream_nd_command(command).schedule); ++pc; continue;
+            }
+            if (is_sxm_tile_program_command(command)) {
+                checkSchedule(decode_sxm_tile_program_command(command).schedule); ++pc; continue;
+            }
+            if (is_mem_slice_program_command(command)) {
+                const auto descriptor = decode_mem_slice_program_command(command);
+                for (const auto& body : descriptor.body) {
+                    auto schedule = descriptor.schedule;
+                    schedule.start_cycle += body.cycle_offset;
+                    checkSchedule(schedule);
+                }
+                ++pc; continue;
+            }
+            if (is_repeat_2d_command(command)) {
+                if (!hasPrevious) throw std::logic_error("common-stop Repeat2D has no instruction");
+                const auto repeat = decode_repeat_2d_command(command);
+                check({previous, {repeat.inner_count, repeat.outer_count, 1},
+                    {repeat.inner_interval, repeat.outer_interval, 1}}, queue);
+                cursor = previous + (repeat.inner_count - 1) * repeat.inner_interval
+                    + (repeat.outer_count - 1) * repeat.outer_interval + 1;
+                ++pc; continue;
+            }
+            const auto opcode = isa::decode_icu_command_opcode(command.command);
+            if (is_icu_control_raw_word_command(command)
+                || opcode != isa::IcuCommandOpcode::Instruction
+                || command.instruction_kind == InstructionKind::None)
+                throw std::logic_error("common-stop computation contains an unmapped Native synchronization/control instruction");
+            check({cursor}, queue);
+            previous = cursor++; hasPrevious = true; ++pc;
+        }
+    }
 }
 
 MemIcuInstruction decode_mem_3d_instruction(
@@ -1014,17 +1166,68 @@ C2cWeightPager::C2cWeightPager(C2cDmaSystem& system)
 {
 }
 
-void C2cWeightPager::begin_schedule(const BinaryProgram& program)
+void C2cWeightPager::begin_schedule(BinaryProgram& program)
 {
-    if (std::ranges::any_of(program.queues,
+    common_barrier_protocol_ = program.common_barrier_protocol;
+    if (!common_barrier_protocol_ && std::ranges::any_of(program.queues,
             [](const auto& queue) { return queue.requires_raw_macro; }))
-        throw std::logic_error(
-            "raw-macro packed-v1 queues cannot be linked with C2C paging controls; "
-            "use the default FU3D mode for executable paging");
+        throw std::logic_error("Raw Macro paging requires the common barrier protocol capability");
     if (active_ && !ready())
         throw std::logic_error(
             "cannot schedule executable pages while a page is in flight");
     if (active_) retire();
+    if (common_barrier_protocol_) {
+        const bool hadLinkedPlan = !program.barriers.empty();
+        program.barriers.clear();
+        program.barrier_events.clear();
+        for (auto& use : program.weight_page_uses)
+            use.transport_launch_event_id = 0;
+        if (hadLinkedPlan) {
+            std::erase_if(program.queues, [](const QueueProgram& queue) {
+                return queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cRx;
+            });
+            // Preserve compiler KV page-out controls and their independent
+            // relocations; remove only derived page-in writes before relink.
+            for (auto& queue : program.transport_queues) {
+                std::vector<QueueCommand> preserved;
+                std::vector<std::size_t> oldToNew(queue.commands.size(),
+                    std::numeric_limits<std::size_t>::max());
+                for (std::size_t pc = 0; pc < queue.commands.size();) {
+                    if (!is_mem_synchronized_raw_packet_header(queue.commands[pc]))
+                        throw std::logic_error("common relink encountered an unsupported transport control");
+                    const auto packet = decode_mem_synchronized_icu_packet(queue, pc);
+                    const auto encoded = ((static_cast<isa::EncodedMemInstruction>(packet[1].lanes[0])
+                        | (static_cast<isa::EncodedMemInstruction>(packet[1].lanes[1]) << 32)) >> 2)
+                        | (static_cast<isa::EncodedMemInstruction>(packet[1].lanes[2]) << 62);
+                    constexpr auto words = InstructionControlUnit::MemIcu::synchronized_packet_word_count;
+                    if (isa::decode_mem_instruction(encoded).opcode == MemOpcode::Read)
+                        for (std::size_t word = 0; word < words; ++word) {
+                            oldToNew[pc + word] = preserved.size();
+                            preserved.push_back(queue.commands[pc + word]);
+                        }
+                    pc += words;
+                }
+                for (auto& relocation : program.address_relocations) {
+                    if (!relocation.transport_queue || relocation.queue_kind != QueueKind::Mem
+                        || relocation.queue_index != queue.index) continue;
+                    if (relocation.command_index >= oldToNew.size())
+                        throw std::logic_error("common relink transport relocation is outside its image");
+                    const auto next = oldToNew[relocation.command_index];
+                    relocation.command_index = next == std::numeric_limits<std::size_t>::max()
+                        ? std::numeric_limits<std::uint32_t>::max() : static_cast<std::uint32_t>(next);
+                }
+                std::erase_if(program.address_relocations, [&](const BinaryAddressRelocation& relocation) {
+                    return relocation.transport_queue && relocation.queue_kind == QueueKind::Mem
+                        && relocation.queue_index == queue.index
+                        && relocation.command_index == std::numeric_limits<std::uint32_t>::max();
+                });
+                queue.commands = std::move(preserved);
+            }
+            std::erase_if(program.transport_queues, [](const QueueProgram& queue) {
+                return queue.commands.empty();
+            });
+        }
+    }
     schedule_dma_cursor_ = {};
     schedule_rx_cursor_ = {};
     scheduled_dma_issues_ = {};
@@ -1037,6 +1240,15 @@ void C2cWeightPager::begin_schedule(const BinaryProgram& program)
     for (auto& windows : linked_mem_windows_) windows.clear();
     linked_page_barriers_.clear();
     linked_page_releases_.clear();
+    common_events_.clear();
+    common_page_ranges_.clear();
+    if (common_barrier_protocol_) {
+        for (const auto& queue : program.queues)
+            if ((queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cRx)
+                && !queue.commands.empty())
+                throw std::logic_error("common paging linker requires ownership of the C2C transport queues");
+        return;
+    }
 
     std::array<bool, InstructionControlUnit::kMemQueues> seenMem{};
     for (const auto& queue : program.queues) {
@@ -1125,7 +1337,8 @@ C2cWeightPageFence C2cWeightPager::schedule(
     BinaryProgram& binary, const C2cWeightPage& page,
     std::size_t startCycle, std::size_t transferEndCycle,
     std::size_t readyCycle, std::size_t launchEventTag,
-    std::size_t pageReadyEventTag, std::size_t earliestMemCycle)
+    std::size_t pageReadyEventTag, std::size_t earliestMemCycle,
+    std::span<const std::size_t> pageUseIndices)
 {
     if (!schedule_open_)
         throw std::logic_error(
@@ -1133,6 +1346,9 @@ C2cWeightPageFence C2cWeightPager::schedule(
     if (transferEndCycle <= startCycle)
         throw std::invalid_argument(
             "executable C2C page has an empty transfer window");
+    if (common_barrier_protocol_)
+        return schedule_common(binary, page, readyCycle, launchEventTag,
+            pageReadyEventTag, std::max(startCycle, earliestMemCycle), pageUseIndices);
     const auto transportDuration = transferEndCycle - startCycle;
     auto& chip = system_.chip();
     const auto& hardware = chip.hardware_configuration();
@@ -1430,9 +1646,130 @@ C2cWeightPageFence C2cWeightPager::schedule(
     return fence;
 }
 
+C2cWeightPageFence C2cWeightPager::schedule_common(
+    BinaryProgram& binary, const C2cWeightPage& page,
+    std::size_t readyCycle, std::size_t launchEventTag,
+    std::size_t pageReadyEventTag, std::size_t earliestMemCycle,
+    std::span<const std::size_t> pageUseIndices)
+{
+    if (!binary.common_barrier_protocol || pageReadyEventTag == 0
+        || pageReadyEventTag > std::numeric_limits<std::uint32_t>::max()
+        || launchEventTag == 0 || launchEventTag > std::numeric_limits<std::uint32_t>::max()
+        || pageUseIndices.empty())
+        throw std::logic_error("common paging requires a concrete event and nonempty transport-instance association");
+    validate_weight_page(page, system_.chip().hardware_configuration());
+    std::size_t ingressBegin = 0;
+    std::size_t stop = readyCycle;
+    for (const auto index : pageUseIndices) {
+        if (index >= binary.weight_page_uses.size()
+            || index > std::numeric_limits<std::uint32_t>::max())
+            throw std::logic_error("common paging references an invalid weight-page use instance");
+        const auto& use = binary.weight_page_uses[index];
+        const auto name = "c2c.window.binding:" + std::to_string(use.binding_index)
+            + ".page:" + std::to_string(use.page_index);
+        auto window = binary.timelines.end();
+        for (auto candidate = binary.timelines.begin(); candidate != binary.timelines.end(); ++candidate)
+            if (candidate->name == name && candidate->end_cycle <= use.ready_cycle
+                && (window == binary.timelines.end() || candidate->end_cycle > window->end_cycle))
+                window = candidate;
+        if (window == binary.timelines.end() || window->start_cycle >= window->end_cycle
+            || window->end_cycle > std::numeric_limits<std::uint32_t>::max())
+            throw std::logic_error("unsafe common stop: missing or invalid exclusive compiler ingress candidate: " + name);
+        ingressBegin = std::max(ingressBegin, static_cast<std::size_t>(window->start_cycle));
+        stop = std::min(stop, static_cast<std::size_t>(window->end_cycle));
+    }
+    if (stop < earliestMemCycle)
+        throw std::logic_error("unsafe common stop: transport launch or SRAM reuse depends on computation after the stop");
+    validate_common_drain_window(binary, stop, ingressBegin);
+    for (const auto index : pageUseIndices) {
+        const auto& use = binary.weight_page_uses[index];
+        for (const auto& segment : page.segments) {
+            if (common_page_ranges_.size() == kBinaryCommonBarrierMaxCompletionInstances)
+                throw std::logic_error("common storage proof exceeds 65535 actual MEM segments");
+            common_page_ranges_.push_back({InstructionControlUnit::mem_queue(
+                segment.hemisphere, segment.slice, segment.bank), segment.base_row,
+                segment.vector_count, use.binding_index, static_cast<std::uint32_t>(index),
+                static_cast<std::uint32_t>(stop), use.ready_cycle, use.release_cycle});
+        }
+    }
+    // First implementation deliberately performs runtime page traffic while
+    // held at the drained stop. Thus an arbitrarily late DDR response cannot
+    // collide with computation or borrow an SR past its compiler reservation.
+    // Same-C pages are serialized physically and joined by one all-of event.
+    const auto producerStart = stop;
+    const auto lowered = lower_c2c_weight_page_to_icu(page,
+        system_.chip().hardware_configuration(), next_sync_tag_, 0, true);
+    C2cWeightPageFence fence;
+    fence.transport_queue = true;
+    fence.dma_issues_begin = scheduled_dma_issues_;
+    fence.dma_issues_end = scheduled_dma_issues_;
+    fence.completed_segments = scheduled_rx_segments_;
+    fence.scheduled_start_cycle = producerStart;
+    fence.scheduled_end_cycle = producerStart;
+    const auto getTransport = [&](std::size_t index) -> QueueProgram& {
+        const auto found = std::ranges::find_if(binary.transport_queues,
+            [&](const QueueProgram& queue) { return queue.kind == QueueKind::Mem && queue.index == index; });
+        if (found != binary.transport_queues.end()) return *found;
+        binary.transport_queues.push_back(QueueProgram {QueueKind::Mem, index, {}});
+        return binary.transport_queues.back();
+    };
+    std::array<std::size_t, hw::kHemispheres> segmentCounts{};
+    for (const auto& segment : lowered.segments)
+        ++segmentCounts[hemisphere_index(segment.hemisphere)];
+    for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
+        if (segmentCounts[side] == 0) continue;
+        auto& dmaQueue = find_or_create_queue(binary, QueueKind::C2cDma, side);
+        append_control(dmaQueue.commands, IcuControlInstruction::WaitEvent(launchEventTag));
+        auto& rxQueue = find_or_create_queue(binary, QueueKind::C2cRx, side);
+        append_control(rxQueue.commands, IcuControlInstruction::WaitEvent(launchEventTag));
+        // find_or_create_queue may reallocate binary.queues: reacquire refs.
+        for (const auto& segment : lowered.segments) {
+            if (hemisphere_index(segment.hemisphere) != side) continue;
+            append_c2c_endpoint(find_queue(binary, QueueKind::C2cRx, side)->commands, segment.rx);
+            append_c2c_dma(find_queue(binary, QueueKind::C2cDma, side)->commands, segment.dma);
+            const auto encoded = encode_mem_synchronized_icu_packet(segment.mem_write_sync);
+            auto& mem = getTransport(segment.mem_queue).commands;
+            // Existing KV readback packets remain intact for the runtime's
+            // post-execution extraction; the page-in loader filters them.
+            mem.insert(mem.end(), encoded.begin(), encoded.end());
+            ++scheduled_dma_issues_[side];
+            fence.dma_issues_end[side] = scheduled_dma_issues_[side];
+            ++scheduled_rx_segments_[side][segment.lane];
+            fence.completed_segments[side][segment.lane] = scheduled_rx_segments_[side][segment.lane];
+            scheduled_mem_writes_[segment.mem_queue] += segment.vector_count;
+            fence.completed_mem_writes[segment.mem_queue] = scheduled_mem_writes_[segment.mem_queue];
+            ++scheduled_mem_reservations_[segment.mem_queue];
+            fence.completed_mem_reservations[segment.mem_queue] = scheduled_mem_reservations_[segment.mem_queue];
+        }
+        for (std::size_t segment = 0; segment < segmentCounts[side]; ++segment)
+            append_control(find_queue(binary, QueueKind::C2cDma, side)->commands,
+                IcuControlInstruction::Sync());
+    }
+    next_sync_tag_ = lowered.next_sync_tag;
+    linked_page_barriers_.push_back({stop, pageReadyEventTag});
+    BinaryBarrierEvent association;
+    association.event_id = static_cast<std::uint32_t>(pageReadyEventTag);
+    for (const auto index : pageUseIndices) {
+        binary.weight_page_uses[index].transport_launch_event_id = static_cast<std::uint32_t>(launchEventTag);
+        association.page_use_indices.push_back(static_cast<std::uint32_t>(index));
+    }
+    common_events_.push_back(std::move(association));
+    return fence;
+}
+
 void C2cWeightPager::inject_page_ready_barriers(
     BinaryProgram& program) const
 {
+    if (common_barrier_protocol_) {
+        program.common_barrier_protocol = true;
+        program.barriers.clear();
+        for (const auto& barrier : linked_page_barriers_)
+            program.barriers.push_back(make_binary_barrier(barrier.ready_cycle,
+                static_cast<std::uint32_t>(barrier.event_tag)));
+        program.barrier_events = common_events_;
+        validate_binary_barriers(program);
+        return;
+    }
     std::vector<std::pair<std::size_t, std::size_t>> pageBarriers;
     pageBarriers.reserve(linked_page_barriers_.size());
     for (const LinkedPageBarrier& barrier : linked_page_barriers_)
@@ -1452,6 +1789,7 @@ void C2cWeightPager::inject_page_ready_barriers(
 std::vector<C2cWeightPager::PageReadyRelease>
 C2cWeightPager::page_ready_releases(std::size_t eventTag) const
 {
+    if (common_barrier_protocol_) return {};
     const auto barrier = std::ranges::find_if(linked_page_barriers_,
         [&](const LinkedPageBarrier& candidate) {
             return candidate.event_tag == eventTag;
@@ -1496,6 +1834,25 @@ C2cWeightPager::coalesce_page_ready_events()
         }
         begin = end;
     }
+    if (common_barrier_protocol_) {
+        std::vector<BinaryBarrierEvent> merged;
+        for (auto event : common_events_) {
+            for (const auto& [oldTag, newTag] : aliases)
+                if (event.event_id == oldTag) { event.event_id = static_cast<std::uint32_t>(newTag); break; }
+            auto target = std::ranges::find_if(merged, [&](const BinaryBarrierEvent& value) {
+                return value.event_id == event.event_id;
+            });
+            if (target == merged.end()) merged.push_back(std::move(event));
+            else target->page_use_indices.insert(target->page_use_indices.end(),
+                event.page_use_indices.begin(), event.page_use_indices.end());
+        }
+        for (auto& event : merged) {
+            std::ranges::sort(event.page_use_indices);
+            event.page_use_indices.erase(std::ranges::unique(event.page_use_indices).begin(),
+                event.page_use_indices.end());
+        }
+        common_events_ = std::move(merged);
+    }
     for (auto& windows : linked_mem_windows_)
         for (auto& window : windows)
             for (const auto& [oldTag, newTag] : aliases)
@@ -1512,6 +1869,8 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
         throw std::logic_error(
             "begin_schedule must precede executable C2C page finalization");
 
+    if (common_barrier_protocol_)
+        static_cast<void>(coalesce_page_ready_events());
     std::ranges::sort(linked_page_barriers_,
         [](const LinkedPageBarrier& lhs, const LinkedPageBarrier& rhs) {
             return std::tie(lhs.ready_cycle, lhs.event_tag)
@@ -1525,6 +1884,20 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
                     && lhs.event_tag == rhs.event_tag;
             }).begin(),
         linked_page_barriers_.end());
+    if (common_barrier_protocol_) {
+        inject_page_ready_barriers(program);
+        for (const auto& load : common_page_ranges_) {
+            const std::array<std::uint32_t, 1> ownerBinding {load.binding_index};
+            validate_common_page_storage(program, load.stop, load.queue, load.row_begin,
+                load.row_count, ownerBinding, load.release, common_page_ranges_);
+        }
+        for (const auto& queue : program.transport_queues)
+            if (queue.commands.size() > program.hardware.icu_mem_imem_depth)
+                throw std::logic_error("common paging MEM transport control RAM capacity exceeded");
+        linked_page_releases_.clear();
+        schedule_open_ = false;
+        return;
+    }
     std::vector<std::pair<std::size_t, std::size_t>> pageBarriers;
     pageBarriers.reserve(linked_page_barriers_.size());
     for (const LinkedPageBarrier& barrier : linked_page_barriers_)
@@ -1781,7 +2154,8 @@ bool C2cWeightPager::transport_ready(
             }
     for (std::size_t queue = 0;
          queue < fence.completed_mem_writes.size(); ++queue)
-        if (chip.icu().mem_iq(queue).synchronized_issued_count()
+        if ((fence.transport_queue ? chip.icu().mem_transport_iq(queue)
+                                 : chip.icu().mem_iq(queue)).synchronized_issued_count()
             < fence.completed_mem_writes[queue]) {
             fence.mem_writes_issued_cycle.reset();
             return false;
@@ -1804,7 +2178,8 @@ bool C2cWeightPager::ready(const C2cWeightPageFence& fence) const
 
     for (std::size_t queue = 0;
          queue < fence.completed_mem_reservations.size(); ++queue)
-        if (chip.icu().mem_iq(queue).synchronized_completed_count()
+        if ((fence.transport_queue ? chip.icu().mem_transport_iq(queue)
+                                 : chip.icu().mem_iq(queue)).synchronized_completed_count()
             < fence.completed_mem_reservations[queue])
             return false;
     return true;

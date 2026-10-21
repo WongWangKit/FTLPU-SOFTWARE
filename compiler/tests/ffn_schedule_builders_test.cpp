@@ -334,7 +334,15 @@ int main() try
         const auto down = schedule::planFfnDownProjectionTimeline(
             shape, *gateUp, 1000, weightSlices, hiddenSlices,
             resultSlices, singleMxmTarget, 0);
+        const int64_t accumulatorCapacity = singleMxmThroughput.mxm_accumulator_blocks
+            * singleMxmThroughput.mxm_rows;
+        if (tokens > accumulatorCapacity) {
+            require(mlir::failed(down), "FFN accepted a token window beyond physical ACC capacity");
+            continue;
+        }
         require(mlir::succeeded(down), "FFN token sweep down failed");
+        require(down->serialized_slots == (2 * tokens > accumulatorCapacity),
+            "FFN Down did not serialize slots at the physical ACC boundary");
         const int64_t retireOffset = gateUp->projection_slot_interval
             + singleMxmTarget.mxm_first_result_latency();
         for (std::size_t i = 1; i < gateUp->blocks.size(); ++i)
@@ -386,6 +394,36 @@ int main() try
             + std::to_string(
                 nextPageFirst.dequant_start - maxWeightLatency)
             + " drain=" + std::to_string(previousDrainEnd));
+
+    // Test the real finite ACC budget: two seq128 slots require 256 rows,
+    // while only 128 exist. Reuse must follow the preceding slot's drain,
+    // including the earliest MEM weight-read issue rather than just IW.
+    auto finiteThroughput = singleMxmThroughput;
+    finiteThroughput.mxm_accumulator_blocks = 4;
+    target::LPUTargetModel finiteTarget(target.memory(), target.streams(), finiteThroughput);
+    const schedule::FfnScheduleShape finiteShape {128, 576, 1536, 576};
+    const auto finiteProjection = schedule::planFfnProjectionTimeline(
+        finiteShape, weightSlices, finiteTarget, true);
+    require(mlir::succeeded(finiteProjection), "finite ACC projection planning failed");
+    const auto finiteDown = schedule::planFfnDownProjectionTimeline(
+        finiteShape, *finiteProjection, 1000, weightSlices, hiddenSlices,
+        resultSlices, finiteTarget, 48);
+    require(mlir::succeeded(finiteDown) && finiteDown->serialized_slots,
+        "seq128 Down needs serialized reuse of its 128-row ACC");
+    int64_t previousSlotEnd = 0;
+    for (int64_t wave = 0; wave < finiteDown->wave_count; ++wave) {
+        const auto& first = finiteDown->blocks[wave * finiteDown->reduction_block_count];
+        const auto& last = finiteDown->blocks[(wave + 1) * finiteDown->reduction_block_count - 1];
+        const int64_t offset = finiteDown->second_slot_offsets[wave];
+        const int64_t slot0Drain = last.tiles.back().compute_cycle
+            + finiteTarget.mxm_first_result_latency() + maxResultLatency
+            + finiteThroughput.mxm_rows + finiteTarget.streams().system_register_columns;
+        require(first.dequant_start - maxWeightLatency >= previousSlotEnd,
+            "next Down wave starts before both previous slots drain");
+        require(first.dequant_start + offset - maxWeightLatency >= slot0Drain,
+            "Down1 reuses ACC or SRs before Down0 drains");
+        previousSlotEnd = slot0Drain + offset;
+    }
 
     auto exploredStreams = target.streams();
     exploredStreams.streams_per_direction = 40;

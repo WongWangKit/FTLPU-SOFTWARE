@@ -218,6 +218,41 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
             }
         }
     }
+    const int64_t accumulatorCapacity = throughput.mxm_accumulator_blocks * tile;
+    if (shape.m > accumulatorCapacity) return mlir::failure();
+    result.serialized_slots = throughput.mxms_per_hemisphere == 1
+        && 2 * shape.m > accumulatorCapacity;
+    result.second_slot_offsets.assign(static_cast<std::size_t>(result.wave_count),
+        projection.projection_slot_interval);
+    if (result.serialized_slots) {
+        // Reindex complete slot domains, including their loads and final
+        // SRAM drains. Two live token windows cannot share finite ACC rows.
+        // This explicit gap permits the second slot to reuse the first's
+        // cleared rows; a following output wave starts after both slots.
+        int64_t previousEnd = 0;
+        for (int64_t wave = 0; wave < result.wave_count; ++wave) {
+            const int64_t begin = wave * result.reduction_block_count;
+            const int64_t end = begin + result.reduction_block_count;
+            const int64_t firstLoad = result.blocks[begin].dequant_start;
+            int64_t slotEnd = firstLoad;
+            for (int64_t index = begin; index < end; ++index)
+                slotEnd = std::max(slotEnd,
+                    result.blocks[index].tiles.back().compute_cycle
+                        + target.mxm_result_window_cycles(tile)
+                        + maxResultLatency + throughput.tile_rows
+                        + target.streams().system_register_columns);
+            const int64_t shift = std::max<int64_t>(0, previousEnd + maxWeightLatency - firstLoad);
+            const int64_t offset = slotEnd + maxWeightLatency - firstLoad;
+            result.second_slot_offsets[wave] = offset;
+            for (int64_t index = begin; index < end; ++index) {
+                auto& block = result.blocks[index];
+                block.weight_compute_cycle += shift;
+                block.dequant_start += shift;
+                for (auto& item : block.tiles) item.compute_cycle += shift;
+            }
+            previousEnd = slotEnd + shift + offset;
+        }
+    }
     return result;
 }
 

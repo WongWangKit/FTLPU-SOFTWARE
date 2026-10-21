@@ -2,6 +2,7 @@
 
 #include "ftlpu/c2c/icu_instruction.hpp"
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/common_page_range.hpp"
 #include "ftlpu/system/c2c_dma_system.hpp"
 
 #include <cstddef>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -49,6 +51,7 @@ struct C2cWeightPageStats {
 };
 
 struct C2cWeightPageFence {
+    bool transport_queue{false};
     std::array<std::size_t, hw::kHemispheres> dma_issues_begin{};
     std::array<std::size_t, hw::kHemispheres> dma_issues_end{};
     std::array<std::array<std::size_t, hw::kC2cStreamsPerDirection>,
@@ -132,14 +135,15 @@ public:
     explicit C2cWeightPager(C2cDmaSystem& system);
 
     void enqueue(const C2cWeightPage& page);
-    void begin_schedule(const BinaryProgram& program);
+    void begin_schedule(BinaryProgram& program);
     C2cWeightPageFence schedule(
         BinaryProgram& binary, const C2cWeightPage& page,
         std::size_t start_cycle, std::size_t transfer_end_cycle,
         std::size_t ready_cycle,
         std::size_t launch_event_tag,
         std::size_t page_ready_event_tag = 0,
-        std::size_t earliest_mem_cycle = 0);
+        std::size_t earliest_mem_cycle = 0,
+        std::span<const std::size_t> page_use_indices = {});
     void finalize_schedule(BinaryProgram& program);
     std::vector<std::pair<std::size_t, std::size_t>> coalesce_page_ready_events();
     // Apply the scheduled page-ready waits to a parallel compiler image that
@@ -220,6 +224,17 @@ private:
     std::vector<LinkedPageRelease> linked_page_releases_{};
     std::uint32_t next_sync_tag_{1};
     std::uint32_t drain_cycles_{0};
+    // Common mode keeps every paging write in independent physical-time
+    // MEM transport queues. The conservative first implementation launches
+    // runtime pages only at a verified, drained common stop.
+    bool common_barrier_protocol_{false};
+    std::vector<BinaryBarrierEvent> common_events_{};
+    std::vector<CommonPageLoadRange> common_page_ranges_{};
+    C2cWeightPageFence schedule_common(BinaryProgram& binary,
+        const C2cWeightPage& page, std::size_t ready_cycle,
+        std::size_t launch_event_tag, std::size_t page_ready_event_tag,
+        std::size_t earliest_mem_cycle,
+        std::span<const std::size_t> page_use_indices);
     bool schedule_open_{false};
     bool active_{false};
 };

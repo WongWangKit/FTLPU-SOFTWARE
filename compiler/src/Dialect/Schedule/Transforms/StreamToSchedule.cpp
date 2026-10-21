@@ -5,6 +5,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/ffn_schedule_emitter.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/stream_schedule_emitters.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
+#include "CommonBarrierSchedule.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <limits>
 #include <optional>
+#include <set>
 
 namespace ftlpu::compiler {
 namespace {
@@ -129,6 +131,25 @@ void sequentializeScheduleStages(mlir::func::FuncOp function,
                 end = std::max(end, timelineEnd.getInt());
         }
         if (first == std::numeric_limits<int64_t>::max()) continue;
+        std::set<std::pair<int64_t, int64_t>> pageInputs;
+        if (schedule::requestsRawMacroBarriers(function))
+            for (auto* operation : stage) {
+                if (auto transfer = llvm::dyn_cast<schedule::MemTransferOp>(operation)) {
+                    if (transfer.getWeightPage() && transfer.getAddressBinding())
+                        pageInputs.emplace(static_cast<int64_t>(*transfer.getAddressBinding()), static_cast<int64_t>(*transfer.getWeightPage()));
+                } else if (auto read = llvm::dyn_cast<schedule::MemReadOp>(operation)) {
+                    const auto page = read.getPlacement().getAs<mlir::IntegerAttr>("weight_page");
+                    const auto binding = schedule::commonBarrierInputBinding(read.getInput());
+                    if (page && binding) pageInputs.emplace(*binding, page.getInt());
+                }
+            }
+        // This is an existing complete SSA operator boundary: the preceding
+        // stage has materialized its result and its passive routes have
+        // drained. Reserve a real, charged interval before admitting the
+        // next paged stage. We do not infer safety from an incidental gap.
+        const auto stableBegin = cursor;
+        if (!pageInputs.empty()) cursor += schedule::commonBarrierDrainCycles(target);
+        const auto stageStart = cursor;
         const int64_t baseOffset = cursor - first;
         // Stage placement is a property of the executable data/resource
         // schedule.  External-memory bandwidth is a runtime property and may
@@ -149,6 +170,18 @@ void sequentializeScheduleStages(mlir::func::FuncOp function,
         // from injecting a different producer onto those links until the
         // longest possible on-chip route has drained.
         cursor += std::max<int64_t>(1, end - first) + streamDrainCycles;
+        if (!pageInputs.empty()) {
+            mlir::OpBuilder builder(stage.back());
+            builder.setInsertionPointAfter(stage.back());
+            mlir::OperationState cost(stage.back()->getLoc(), schedule::TimelineOp::getOperationName());
+            cost.addAttributes({builder.getNamedAttr("name", builder.getStringAttr("common_barrier.drain_cost")),
+                builder.getNamedAttr("start", builder.getI64IntegerAttr(stableBegin)),
+                builder.getNamedAttr("end", builder.getI64IntegerAttr(stageStart))});
+            builder.create(cost);
+            for (const auto& [binding, page] : pageInputs)
+                schedule::emitCommonBarrierCandidate(builder, stage.back()->getLoc(),
+                    binding, page, stableBegin, stageStart);
+        }
     }
 
     llvm::SmallDenseSet<mlir::Value> returnedValues;
