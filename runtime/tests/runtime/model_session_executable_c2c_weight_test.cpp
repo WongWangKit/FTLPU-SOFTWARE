@@ -47,7 +47,7 @@ BinaryBinding make_weight_binding(std::uint16_t bank = 0)
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 try {
     BinaryProgram preloadProgram;
     auto firstPreload = make_weight_binding();
@@ -182,6 +182,20 @@ try {
         || gammaOverlapPlans[1].start_cycle != 40)
         throw std::runtime_error(
             "weight page overwrote an input RMSNorm gamma before consumption");
+    // Linked graph operators carry their logical node prefix. Their SRAM
+    // release remains the operator end, not the next weight consumer.
+    initializedOverlapProgram.timelines[0].name="attention.heads0.rope";
+    gammaOverlapProgram.timelines[0].name="post_attention_norm.rmsnorm.feedback";
+    for (const auto* linked : {&initializedOverlapProgram,&gammaOverlapProgram}) {
+        const auto plans=plan_weight_prefetches(*linked);
+        if (plans.size()!=2 || plans[1].pre_execution ||
+            plans[1].start_cycle!=40 || plans[1].earliest_mem_cycle!=40)
+            throw std::runtime_error("prefixed initializer timeline lost its SRAM release");
+    }
+    if (argc==2 && std::string(argv[1])=="--initialized-lifetimes") {
+        std::cout << "initialized lifetime checks passed\n";
+        return 0;
+    }
     auto lowBandwidthHardware = preloadProgram.hardware;
     lowBandwidthHardware.lpu_clock_mhz = 1000;
     lowBandwidthHardware.ddr_peak_bandwidth_mbytes_per_second = 6400;

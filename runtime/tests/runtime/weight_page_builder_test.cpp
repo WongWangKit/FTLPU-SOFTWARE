@@ -416,7 +416,7 @@ void test_kv_cache_roundtrip()
 
 void test_segmented_gamma_broadcast()
 {
-    for (const std::size_t segmentRows : {std::size_t{1024}, std::size_t{768}}) {
+    for (const std::size_t segmentRows : {std::size_t{1024}, std::size_t{768}, std::size_t{384}, std::size_t{192}}) {
         BinaryBinding gamma;
         gamma.index = 7;
         gamma.access = BindingAccess::Input;
@@ -428,7 +428,8 @@ void test_segmented_gamma_broadcast()
             : ftlpu::hw::kSramDepthRows - segmentRows;
         gamma.instruction_count = segmentRows;
         gamma.address_stride = 1;
-        gamma.slices = {16, 17, 18, 19};
+        for (std::size_t i=0; i<2*((1536+segmentRows-1)/segmentRows); ++i)
+            gamma.slices.push_back(static_cast<std::uint16_t>(16+i));
         gamma.hemisphere_mask = 3;
         gamma.bank = 1;
         std::vector<std::uint8_t> logical(gamma.byte_size);
@@ -442,8 +443,8 @@ void test_segmented_gamma_broadcast()
         runtime.load(program);
         runtime.upload_input(gamma.index, logical);
         const auto packed = pack_binding_image(gamma, logical, program.hardware);
-        require(packed.segments.size() == 8,
-            "segmented gamma should use two slice pairs in both hemispheres");
+        require(packed.segments.size() == 2*gamma.slices.size(),
+            "segmented gamma should emit every pair in both hemispheres");
         for (const std::size_t feature : {std::size_t{0}, segmentRows - 1,
                  segmentRows, std::size_t{1535}}) {
             const std::size_t segment = feature / segmentRows;
@@ -529,20 +530,24 @@ void test_four_slice_pair_planar_roundtrip()
 
 void test_distributed_activation_target_width()
 {
+  for (auto layout : {BindingLayout::Fp16MxmDistributed16,
+                      BindingLayout::Fp16MxmActivationPlanar})
+  for (std::uint32_t tokens : {1u, 32u, 64u}) {
     BinaryProgram program;
     BinaryBinding activation;
     activation.index = 0;
     activation.access = BindingAccess::Input;
     activation.element_type = BindingElementType::BF16;
-    activation.layout = BindingLayout::Fp16MxmDistributed16;
-    activation.shape = {1, 64};
-    activation.byte_size = 128;
+    activation.layout = layout;
+    activation.shape = {tokens, 64};
+    activation.byte_size = tokens * 128;
     activation.base_row = 4;
-    activation.instruction_count = 64;
+    activation.instruction_count = tokens * 2;
     activation.address_stride = 1;
     activation.bank = 0;
     activation.hemisphere_mask = 3;
-    for (std::uint16_t slice = 0; slice < 16; ++slice)
+    for (std::uint16_t slice = 0;
+         slice < (layout == BindingLayout::Fp16MxmActivationPlanar ? 4 : 16); ++slice)
         activation.slices.push_back(slice);
     program.bindings.push_back(activation);
     std::vector<std::uint8_t> logical(activation.byte_size);
@@ -566,18 +571,20 @@ void test_distributed_activation_target_width()
                         static_cast<ftlpu::Hemisphere>(segment.hemisphere),
                         segment.slice, activation.bank, lane / 8,
                         segment.base_row + row, lane % 8),
-                    "distributed activation C2C image differs from direct upload");
+                    "native activation C2C image differs from direct upload");
+  }
 }
 
-void test_token_partition_planar()
+void test_token_partition_planar(bool columns = false)
 {
     for (const auto type : {BindingElementType::BF16, BindingElementType::F32}) {
         const std::size_t bytes = type == BindingElementType::F32 ? 4 : 2;
         BinaryProgram program;
         BinaryBinding b;
         b.index = 0; b.access = BindingAccess::Input; b.element_type = type;
-        b.layout = BindingLayout::TokenPartitionPlanar;
-        b.shape = {5,65}; b.byte_size = 5 * 65 * bytes;
+        b.layout = columns ? BindingLayout::ColumnPartitionPlanar : BindingLayout::TokenPartitionPlanar;
+        const std::size_t width = columns ? 128 : 65;
+        b.shape = {5,width}; b.byte_size = 5 * width * bytes;
         b.bank = 1; b.base_row = 7; b.address_stride = 2;
         b.hemisphere_mask = 3; b.instruction_count = 18;
         for (std::size_t i = 0; i < bytes; ++i) b.slices.push_back(8+i);
@@ -594,13 +601,17 @@ void test_token_partition_planar()
         runtime.load(program); runtime.upload_input(0, logical);
         require(runtime.download_output(0) == logical, "token partition direct runtime roundtrip failed");
         for (std::size_t row = 0; row < 5; ++row)
-            for (std::size_t col = 0; col < 65; ++col)
+            for (std::size_t col = 0; col < width; ++col)
                 for (std::size_t byte = 0; byte < bytes; ++byte) {
-                    const auto side = row < 3 ? ftlpu::Hemisphere::West : ftlpu::Hemisphere::East;
-                    const auto address = 7 + ((col / program.hardware.bytes_per_word) * 3 + row % 3) * 2;
+                    const auto side = columns
+                        ? (col < width/2 ? ftlpu::Hemisphere::East : ftlpu::Hemisphere::West)
+                        : (row < 3 ? ftlpu::Hemisphere::West : ftlpu::Hemisphere::East);
+                    const auto address = 7 + (columns
+                        ? ((col % (width/2)) / program.hardware.bytes_per_word) * 5 + row
+                        : (col / program.hardware.bytes_per_word) * 3 + row % 3) * 2;
                     const auto lane = col % program.hardware.bytes_per_word;
                     require(system->read_mem_sram_lane_byte(side, 8+byte, 1, lane/8, address, lane%8)
-                        == logical[(row*65+col)*bytes+byte], "token partition physical ownership mismatch");
+                        == logical[(row*width+col)*bytes+byte], "partition physical ownership mismatch");
                 }
     }
 }
@@ -709,12 +720,75 @@ void test_paged_output_tail(BindingLayout layout, std::size_t rows,
     }
 }
 
+// Compare the new dense rows with the preserved legacy striped image. Every
+// useful byte must survive, while each physical slice becomes one DMA burst.
+void test_dense_split_down_page()
+{
+    ExecutableHardwareConfig hardware;
+    hardware.bytes_per_word = hardware.mxm_rows = hardware.mxm_columns = 64;
+    hardware.tile_rows = 8;
+    hardware.mxms_per_hemisphere = 2;
+    hardware.sram_depth_rows = hardware.words_per_bank = 2048;
+    BinaryBinding binding;
+    binding.element_type = BindingElementType::I8;
+    binding.layout = BindingLayout::W8A16MxmWeightWaveStriped;
+    binding.shape = {8960, 512};
+    binding.role = "weight";
+    binding.byte_size = 8960 * 512;
+    binding.address_stride = 1;
+    binding.slices = {20, 21, 22, 23, 24, 25, 26, 27};
+    binding.paged_weight = true;
+    binding.page_count = 2;
+    binding.page_rows = 2048;
+    binding.page_granularity = 512;
+    binding.page_items_per_slice_group = 128;
+    binding.page_bank_count = 2;
+    for (std::uint16_t slice = 20; slice < 52; ++slice)
+        binding.page_storage_slices.push_back(slice);
+    binding.page_banks = {0, 1};
+    binding.page_slice_group_bases = {0, 0};
+    binding.page_slice_group_counts = {2, 2};
+    binding.page_base_rows = {0, 0};
+    binding.page_row_counts = {2048, 2048};
+    std::vector<std::uint8_t> data(binding.byte_size);
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] = static_cast<std::uint8_t>((i * 29 + i / 512 * 17 + 3) % 251);
+    auto dense = binding;
+    dense.layout = BindingLayout::W8A16MxmWeightWaveSplitDense;
+    for (std::uint32_t page = 0; page < 2; ++page) {
+        const auto legacyImage = pack_weight_binding_page(binding, page, data, hardware);
+        const auto denseImage = pack_weight_binding_page(dense, page, data, hardware);
+        require(legacyImage.segments.size() == 4480, "legacy split Down fixture changed");
+        require(denseImage.segments.size() == 64, "dense Down page must use 64 contiguous segments");
+        require(denseImage.data.size() == 8960 * 256,
+            "dense Down page changed the useful byte count");
+        const auto denseRows = physical_rows(denseImage, 64);
+        for (const auto& [address, bytes] : physical_rows(legacyImage, 64)) {
+            const auto [hemisphere, slice, row] = address;
+            const auto denseRow = (row / 16) * 8 + row % 8;
+            require(denseRows.at(std::make_tuple(hemisphere, slice, denseRow)) == bytes,
+                "dense Down layout dropped or permuted a weight vector");
+        }
+    }
+    hardware.mxms_per_hemisphere = 1;
+    bool rejected = false;
+    try { (void)pack_weight_binding_page(dense, 0, data, hardware); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "dense split Down accepted overlapping MXM slice groups");
+    std::cout << "Dense split Down pages passed: 4480 -> 64 segments, unchanged bytes\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 try {
+    if (argc == 2 && std::string(argv[1]) == "--dense-split-down") {
+        test_dense_split_down_page();
+        return 0;
+    }
     test_vxm_distributed_roundtrip();
     test_token_partition_planar();
+    test_token_partition_planar(true);
     if (argc == 2 && std::string(argv[1]) == "--paged-output-tail") {
         for (const std::size_t width : {16, 32, 64}) {
             test_paged_output_tail(BindingLayout::W8A16AttentionWeightStriped,

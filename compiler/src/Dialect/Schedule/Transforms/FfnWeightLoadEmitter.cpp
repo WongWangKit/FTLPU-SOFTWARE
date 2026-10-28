@@ -209,7 +209,7 @@ MxmLoadOp emitFfnWeightTile(
     mlir::DictionaryAttr bindingPlacement, FfnLoopDomain3D domain,
     llvm::StringRef weightBufferMode,
     std::optional<FfnLoopDomain3D> mxmControlDomain,
-    bool emitMxmControl) {
+    bool emitMxmControl, int64_t weightSyncGroup) {
   const auto &throughput = target.throughput();
   const int64_t duration = throughput.mxm_rows / throughput.lanes_per_tile;
   const int64_t encodedStreamBase = target.streams().streams_per_direction;
@@ -252,6 +252,8 @@ MxmLoadOp emitFfnWeightTile(
       attributes.set("binding_placement",
                      bindingPlacement ? bindingPlacement
                                       : rawRoute.getPlacement());
+      if (weightSyncGroup >= 0)
+        attributes.set("weight_sync_group", rewriter.getI64IntegerAttr(weightSyncGroup));
       if (pageIndex >= 0) {
         attributes.set("weight_page", rewriter.getI64IntegerAttr(pageIndex));
         attributes.set("logical_base_row",
@@ -347,6 +349,8 @@ MxmLoadOp emitFfnWeightTile(
     attributes.set("binding_placement",
                    bindingPlacement ? bindingPlacement
                                     : rawRoute.getPlacement());
+    if (weightSyncGroup >= 0)
+      attributes.set("weight_sync_group", rewriter.getI64IntegerAttr(weightSyncGroup));
     if (pageIndex >= 0) {
       attributes.set("weight_page", rewriter.getI64IntegerAttr(pageIndex));
       attributes.set("logical_base_row",

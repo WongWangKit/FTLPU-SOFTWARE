@@ -446,17 +446,6 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       stagingCycle - 1, 1, "pass", "previous", 0, 0.0f,
                       "immediate", 0, 0.0f, dataFormat, 0, "east", "east", -1,
                       2, stagingItems, 1);
-    // The two memory hemispheres feed opposite ends of the physical VXM SR
-    // fabric. Mirror the east C0->C1 chain as west C15->C14.
-    emitVxmConfigured(rewriter_, op_.getLoc(), op_.getInput(),
-                      stagingCycle - 1, 15, "pass", streamKind, 48, 0.0f,
-                      "immediate", 0, 0.0f, "fp32", -1, "west", "west", -1,
-                      2, stagingItems, 1);
-    emitVxmConfigured(rewriter_, op_.getLoc(), op_.getInput(),
-                      stagingCycle - 1, 14, "pass", "alu", 15, 0.0f,
-                      "immediate", 0, 0.0f, dataFormat, 8, "west", "west", -1,
-                      2, stagingItems, 1);
-
     int64_t lastWriteCycle = stagingCycle;
     for (int64_t hemisphere = 0;
          hemisphere < target_.memory().hemispheres; ++hemisphere) {
@@ -472,7 +461,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               target::StreamEndpoint::Mem,
               target::StreamDirection::East, destinationSlice);
           const int64_t source = 1 - hemisphere;
-          const int64_t vxmSrTraversal = target_.throughput().vxm_alus;
+          const int64_t vxmSrTraversal = 0;
           const int64_t writeCycle = stagingCycle + 1
               + destinationLatency + vxmSrTraversal;
           emitMem3D(
@@ -1663,54 +1652,19 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                           computeCycle +
                           target_.throughput().accumulator_to_vxm_latency +
                           offset;
-                      // The first MXM result reaches the VXM ingress two
-                      // cycles before the nominal input cycle for this
-                      // physical value-projection path.
-                      constexpr int64_t firstResultAdvance = 2;
                       if (offset == 0 && hemisphere == 0) {
-                        for (int64_t source = 0;
-                             source < target_.memory().hemispheres;
-                             ++source) {
-                          const int64_t sourceBlock =
-                              outputGroup * 4 + source * 2 + half;
-                          if (sourceBlock >= projectionOutputBlocks)
-                            continue;
-                          const char *sourceName =
-                              source == 0 ? "east" : "west";
-                          // The two value-bias chains enter from opposite
-                          // boundaries of the one 16-column VXM fabric.  Keep
-                          // the east chain at C4/C5 and mirror it physically
-                          // to C11/C10 for west input.
-                          const int64_t alu = source == 0
-                              ? 4
-                              : target_.throughput().vxm_alus - 1 - 4;
-                          const int64_t resultAlu = source == 0
-                              ? alu + 1
-                              : alu - 1;
-                          const int64_t streamOffset = source * 16;
-                          // Turn the terminal result back toward its local
-                          // MEM boundary: the east chain emits W12 and the
-                          // west chain emits E6.  This preserves the value
-                          // block's local layout without a C2C copy.
-                          const int64_t resultStream = source == 0 ? 12 : 6;
-                          const char *resultName =
-                              source == 0 ? "west" : "east";
-                          emitVxmConfigured(
-                              rewriter_, op_.getLoc(), projectionBias,
-                              vxmInputCycle - 1, alu, "add", streamKind,
-                              32 + streamOffset, 0.0f, streamKind,
-                              40 + streamOffset, 0.0f, "fp32", -1,
-                              sourceName, sourceName, -1, 2, projectionRows, 1,
-                              sourceName, sourceName);
-                          emitVxmConfigured(
-                              rewriter_, op_.getLoc(), projectionBias,
-                              vxmInputCycle - 1, resultAlu, "pass",
-                              source == 0 ? "previous" : "alu",
-                              source == 0 ? 0 : alu, 0.0f,
-                              "immediate", 0, 0.0f, dataFormat,
-                              resultStream, sourceName, resultName, -1, 2,
-                              projectionRows, 1);
-                        }
+                        emitVxmConfigured(rewriter_, op_.getLoc(), projectionBias,
+                            vxmInputCycle - 1, 0, "add", streamKind, 32, 0,
+                            streamKind, 34, 0, "fp32", -1, "east", "west", -1,
+                            8, projectionRows, 1);
+                        // The depth-8 tail uses E6/E14, clear of the E0/E2
+                        // activation streams that remain live during projection.
+                        for (int64_t stage = 1; stage < 8; ++stage)
+                          emitVxmConfigured(rewriter_, op_.getLoc(), projectionBias,
+                              vxmInputCycle - 1, stage, "pass", "previous", 0, 0,
+                              "immediate", 0, 0, stage == 7 ? dataFormat : "fp32",
+                              stage == 7 ? 6 : -1, "east", "west", -1,
+                              8, projectionRows, 1);
                       }
                       const int64_t pair = (outputBlock / 2) % biasPairs;
                       for (int64_t byte = 0; byte < 2; ++byte) {
@@ -1733,13 +1687,12 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                              (outputGroup == 0 && half == 0)))
                           emitMem3D(
                               rewriter_, op_.getLoc(),
-                              vxmInputCycle - firstResultAdvance
-                                  - vxmInputReadLatency(slice),
+                              vxmInputCycle - vxmInputReadLatency(slice),
                               hemisphere *
                                       target_.memory().slices_per_hemisphere +
                                   slice,
                               "read", biasAddress(outputBlock),
-                              40 + hemisphere * 16 + byte, projectionRows, 1,
+                              34 + hemisphere * 16 + byte, projectionRows, 1,
                               0, "sram",
                               functionArgumentIndex(projectionBias),
                               directProjectionInput ? 1 : tokenBlocks, computeSpacing, 0,
@@ -1750,16 +1703,16 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               mergeValueBias ? 1 : 0,
                               biasBank);
                       }
-                      // The two-stage value chain enters at C4/C11 and turns
-                      // back at C5/C10.  From either boundary this is four
-                      // ingress hops, two one-cycle VALU stages, five return
-                      // hops, and one launch/commit boundary.
-                      const int64_t valueTurnaroundLatency = 4 + 2 + 5 + 1;
+                      // Depth-8 emits on E6/E14, away from live activation
+                      // streams. Eight one-cycle stages give latency seven
+                      // relative to the input-issue cycle.
+                      const int64_t valueTurnaroundLatency = 7;
+                      // Bias and MXM data must enter on the same cycle. SR
+                      // forwarding does not retain an early bias vector.
                       const int64_t outputCycle =
-                          vxmInputCycle - firstResultAdvance
-                              + valueTurnaroundLatency;
+                          vxmInputCycle + valueTurnaroundLatency;
                       const int64_t outputStream =
-                          (1 - hemisphere) * 8 + 4 + hemisphere * 2;
+                          hemisphere * 8 + 6;
                       for (int64_t byte = 0; byte < 2; ++byte) {
                         const int64_t slice = slices[packedStream + byte];
                         const int64_t latency =
@@ -1775,7 +1728,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               (outputGroup == 0 && half == 0))
                             emitMem3D(
                                 rewriter_, op_.getLoc(), cycle,
-                                hemisphere *
+                                (1 - hemisphere) *
                                         target_.memory()
                                             .slices_per_hemisphere +
                                     slice,
@@ -1955,7 +1908,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                outputBlock < lastOutputBlock; ++outputBlock) {
             const int64_t head = outputBlock / projectionHeadBlocks;
             const int64_t headBlock = outputBlock % projectionHeadBlocks;
-            const int64_t sourceHemisphere = (outputBlock % 4) / 2;
+            const int64_t sourceHemisphere = projectionBias
+                ? 1 - (outputBlock % 4) / 2 : (outputBlock % 4) / 2;
             const int64_t destinationHemisphere = head % memory.hemispheres;
             if (sourceHemisphere == destinationHemisphere)
               continue;
@@ -1965,7 +1919,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               const int64_t address =
                   layout.valuePackAddress(
                       head, headBlock, cacheTokenBlock, 0);
-              const int64_t readCycle = copyCycle - readLatency(slice);
+              const int64_t readCycle = copyCycle - vxmInputReadLatency(slice);
               const int64_t readQueue =
                   sourceHemisphere * memory.slices_per_hemisphere + slice;
               const int64_t valueBank = layout.valuePackBank(headBlock);
@@ -2089,6 +2043,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
              ++outputBlock) {
           const int64_t head = outputBlock / projectionHeadBlocks;
           const int64_t headBlock = outputBlock % projectionHeadBlocks;
+          // Raw Q/K is written directly by MXM; bias is applied later in
+          // the RoPE chain, so its owner is still the projection hemisphere.
           const int64_t sourceHemisphere = (outputBlock % 4) / 2;
           const int64_t destinationHemisphere = 1 - sourceHemisphere;
           const int64_t sourceStagingBank =
@@ -2106,7 +2062,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 layout.ropeStagingAddress(
                     kind, head, headBlock, 0, 0));
             const int64_t copyReadCycle =
-                replicateCycle - readLatency(slice);
+                replicateCycle - vxmInputReadLatency(slice);
             if (qWriteRead2D) {
               auto &pending = pendingQWriteRead[sourceHemisphere][slice];
               const int64_t half = outputBlock % 2;
@@ -2196,12 +2152,11 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   sourceStagingBank);
             }
             // A replicated Q/K block is injected at its local MEM boundary,
-            // crosses all physical VXM columns through the passive bridge,
-            // then returns to the destination MEM group.  This is a full
-            // fabric traversal, not the local VXM-result-to-MEM route.
+            // crosses the passive bridge, then returns to the destination
+            // MEM group; it does not execute the eight ALU stages.
             const int64_t destinationSlice = mirroredStagingSlice(slice);
             const int64_t latency =
-                target_.throughput().vxm_alus + 1 +
+                1 +
                 destinationSlice /
                     target_.streams().mem_slices_per_register_group;
             emitMem3D(
@@ -2277,124 +2232,38 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           replicateEnd = restoreEnd;
         }
 
-        // Both physical chains take three cycles: MUL (2) -> PASS (1),
-        // or bias ADD (1) -> MUL (2). The latter casts in the multiply's
-        // result writer; it does not have an additional BF16 pass stage.
-        const int64_t productPipelineLatency = 3;
+        // Two depth-4 chains preserve the table operand in Auxiliary.
+        // Bias is loaded once into C1/C5 before the token stream arrives.
+        const int64_t productPipelineLatency = 4;
         const auto emitRopeProducts = [&](int64_t cycle,
                                           int64_t inputHemisphere,
                                           int64_t outputHemisphere,
                                           bool swapBiasHalves) {
-          (void)inputHemisphere;
-          (void)outputHemisphere;
-          // MEM.E enters the physical VXM fabric at E0 and MEM.W at W16.
-          // The lower and upper column groups therefore always consume and
-          // drain in the fixed E and W directions respectively.  Logical
-          // source/destination hemispheres only select the SRAM addresses.
-          constexpr const char *input = "east";
-          constexpr const char *output = "east";
-          constexpr const char *mirrorInput = "west";
-          constexpr const char *mirrorOutput = "west";
-          const auto emitColumn = [&](mlir::Value value, int64_t queue,
-                                      llvm::StringRef opcode,
-                                      llvm::StringRef lhsKind,
-                                      int64_t lhsIndex,
-                                      llvm::StringRef rhsKind,
-                                      int64_t rhsIndex,
-                                      llvm::StringRef castTarget,
-                                      int64_t outputStream,
-                                      int64_t chainDepth,
-                                      llvm::StringRef lhsSource = {},
-                                      llvm::StringRef rhsSource = {}) {
-            const auto sourceStreamIndex = [](llvm::StringRef kind,
-                                              int64_t index,
-                                              llvm::StringRef source) {
-              return kind.starts_with("stream_") && source == "west"
-                         ? index + 16
-                         : index;
-            };
-            const int64_t directLhsIndex = lhsSource.empty()
-                                               ? lhsIndex
-                                               : sourceStreamIndex(
-                                                     lhsKind, lhsIndex,
-                                                     lhsSource);
-            emitVxmConfigured(
-                rewriter_, op_.getLoc(), value, cycle, queue, opcode,
-                lhsKind, directLhsIndex, 0.0f, rhsKind, rhsIndex, 0.0f,
-                castTarget, outputStream, input, output, -1, chainDepth,
-                op_.getSeqLen(), 1,
-                lhsSource,
-                rhsSource.empty() ? llvm::StringRef{} : input);
-            const int64_t mirrorQueue =
-                target_.throughput().vxm_alus - 1 - queue;
-            const auto mirrorKind = [](llvm::StringRef kind) {
-              return kind == "previous" ? llvm::StringRef("alu") : kind;
-            };
-            const auto mirrorIndex = [&](llvm::StringRef kind,
-                                         int64_t index) {
-              if (kind == "previous") return mirrorQueue + 1;
-              if (kind == "alu")
-                return target_.throughput().vxm_alus - 1 - index;
-              if (kind.starts_with("stream_")) return index + 16;
-              return index;
-            };
-            emitVxmConfigured(
-                rewriter_, op_.getLoc(), value, cycle, mirrorQueue, opcode,
-                mirrorKind(lhsKind),
-                lhsSource.empty()
-                    ? mirrorIndex(lhsKind, lhsIndex)
-                    : directLhsIndex,
-                0.0f,
-                mirrorKind(rhsKind), mirrorIndex(rhsKind, rhsIndex), 0.0f,
-                castTarget, outputStream,
-                mirrorInput, mirrorOutput, -1, chainDepth,
-                op_.getSeqLen(), 1,
-                lhsSource,
-                rhsSource.empty() ? llvm::StringRef{} : mirrorInput);
-          };
-          // Product A takes the low half from E and high half from W; B swaps
-          // their stream positions. Absolute source selection broadcasts the
-          // same pair to both physical VXM chains without SRAM copies.
-          const char *firstSource = directSplitRope
-                                        ? (swapBiasHalves ? "west" : "east")
-                                        : "";
-          const char *secondSource = directSplitRope
-                                         ? (swapBiasHalves ? "east" : "west")
-                                         : "";
-          const int64_t firstIndex =
-              directSplitRope && swapBiasHalves ? 36 : 32;
-          const int64_t secondIndex =
-              directSplitRope && swapBiasHalves ? 32 : 36;
-          emitColumn(projectionValues[projection], 0,
-                     projectionBias ? "add" : "multiply",
-                     streamKind, firstIndex,
-                     streamKind, projectionBias
-                         ? (swapBiasHalves ? 42 : 40)
-                         : 34,
-                     "fp32", -1, 2, firstSource,
-                     projectionBias ? llvm::StringRef(input)
-                                    : llvm::StringRef{});
-          if (projectionBias) {
-            emitColumn(projectionBias, 1, "multiply", "previous", 0,
-                       streamKind, 34, dataFormat, 12, 2, {}, input);
-          } else
-            emitColumn(projectionValues[projection], 1, "pass", "previous",
-                       0, "immediate", 0, dataFormat, 12, 2);
-          emitColumn(projectionValues[projection], 2,
-                     projectionBias ? "add" : "multiply",
-                     streamKind, secondIndex,
-                     streamKind, projectionBias
-                         ? (swapBiasHalves ? 40 : 42)
-                         : 38,
-                     "fp32", -1, 2, secondSource,
-                     projectionBias ? llvm::StringRef(input)
-                                    : llvm::StringRef{});
-          if (projectionBias) {
-            emitColumn(projectionBias, 3, "multiply", "previous", 0,
-                       streamKind, 38, dataFormat, 14, 2, {}, input);
-          } else
-            emitColumn(projectionValues[projection], 3, "pass", "previous",
-                       0, "immediate", 0, dataFormat, 14, 2);
+          for (int64_t head : {int64_t{0}, int64_t{4}}) {
+            if (projectionBias) {
+              emitVxmConfigured(rewriter_, op_.getLoc(), projectionBias,
+                  cycle - 10, head, "pass", streamKind, 32 + head * 2, 0,
+                  "immediate", 0, 0, "fp32", -1, "east", "west", -1, 2, 1, 1);
+              auto capture = emitVxmConfigured(rewriter_, op_.getLoc(), projectionBias,
+                  cycle - 10, head + 1, "pass", "previous", 0, 0,
+                  "immediate", 0, 0, "fp32", -1, "east", "west", -1, 2, 1, 1);
+              capture->setAttr("local_scalar_write", rewriter_.getBoolAttr(true));
+            }
+            emitVxmConfigured(rewriter_, op_.getLoc(), projectionValues[projection],
+                cycle, head, "pass", streamKind, 32 + head * 2, 0,
+                streamKind, 34 + head * 2, 0, "fp32", -1,
+                "east", "west", -1, 4, op_.getSeqLen(), 1);
+            emitVxmConfigured(rewriter_, op_.getLoc(), projectionValues[projection],
+                cycle, head + 1, projectionBias ? "add" : "pass", "previous", 0, 0,
+                projectionBias ? "accumulator" : "immediate", 0, 0, "fp32", -1,
+                "east", "west", -1, 4, op_.getSeqLen(), 1);
+            emitVxmConfigured(rewriter_, op_.getLoc(), projectionValues[projection],
+                cycle, head + 2, "pass", "previous", 0, 0, "immediate", 0, 0,
+                "fp32", -1, "east", "west", -1, 4, op_.getSeqLen(), 1);
+            emitVxmConfigured(rewriter_, op_.getLoc(), projectionValues[projection],
+                cycle, head + 3, "multiply", "previous", 0, 0, "auxiliary", 0, 0,
+                dataFormat, head + 2, "east", "west", -1, 4, op_.getSeqLen(), 1);
+          }
         };
         const auto emitRopeCombine = [&](int64_t cycle, int64_t inputHemisphere,
                                          int64_t outputHemisphere,
@@ -2418,27 +2287,6 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 queue, opcode, lhsKind, lhsIndex, 0.0f, rhsKind, rhsIndex,
                 0.0f, castTarget, outputStream, input, output, -1, 2,
                 op_.getSeqLen(), 1, {}, {}, domainCount, domainInterval);
-            const int64_t mirrorQueue =
-                target_.throughput().vxm_alus - 1 - queue;
-            const auto mirrorKind = [](llvm::StringRef kind) {
-              return kind == "previous" ? llvm::StringRef("alu") : kind;
-            };
-            const auto mirrorIndex = [&](llvm::StringRef kind,
-                                         int64_t index) {
-              if (kind == "previous") return mirrorQueue + 1;
-              if (kind == "alu")
-                return target_.throughput().vxm_alus - 1 - index;
-              if (kind.starts_with("stream_")) return index + 16;
-              return index;
-            };
-            emitVxmConfigured(
-                rewriter_, op_.getLoc(), projectionValues[projection], cycle,
-                mirrorQueue, opcode, mirrorKind(lhsKind),
-                mirrorIndex(lhsKind, lhsIndex), 0.0f, mirrorKind(rhsKind),
-                mirrorIndex(rhsKind, rhsIndex), 0.0f, castTarget,
-                outputStream < 0 ? -1 : outputStream + 24,
-                mirrorInput, mirrorOutput, -1, 2, op_.getSeqLen(), 1,
-                {}, {}, domainCount, domainInterval);
           };
           emitColumn(0, "subtract", streamKind, 32, streamKind, 34,
                      "fp32", -1);
@@ -2954,7 +2802,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       ? layout.ropeMirrorSlices()[byte]
                       : layout.ropeSlices()[byte];
                   const int64_t stream =
-                      (byte < 2 ? 34 + byte : 36 + byte) + hemisphere * 16;
+                      (byte < 2 ? 34 + byte : 40 + byte) + hemisphere * 16;
                   const int64_t bank = mirror ? ropeMirrorBank : ropeBank;
                   const int64_t queue =
                       hemisphere * memory.slices_per_hemisphere + slice;
@@ -2996,74 +2844,23 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             };
             const auto emitProjectionBiasDomain = [&](int64_t inputCycle,
                                                        int64_t phaseInterval) {
-              if (!projectionBias)
-                return;
-              if (projectionBiasPairDomain && pairBlock == 0) {
-                firstPairBiasInput = inputCycle;
-                return;
-              }
-              const bool pairDomain =
-                  projectionBiasPairDomain && pairBlock != 0;
-              const int64_t domainInputCycle =
-                  pairDomain ? firstPairBiasInput : inputCycle;
-              bool mergeSerialBiasHeads =
-                  serialQueryProductsFirst && pairDomain &&
-                  tokenBlocks == 1 &&
-                  inputCycle - firstPairBiasInput ==
-                      serialQueryProductSlotCycles;
-              if (mergeSerialBiasHeads) {
-                for (int64_t biasHead = 0;
-                     biasHead < op_.getQueryHeads(); ++biasHead) {
-                  const int64_t firstBlock =
-                      biasHead * projectionHeadBlocks;
-                  if (biasAddress(firstBlock + 1) !=
-                          biasAddress(0) + 2 * biasHead + 1 ||
-                      biasAddress(firstBlock) !=
-                          biasAddress(0) + 2 * biasHead) {
-                    mergeSerialBiasHeads = false;
-                    break;
-                  }
+              if (!projectionBias) return;
+              for (int64_t phase = 0; phase < 2; ++phase)
+                for (int64_t half = 0; half < 2; ++half) {
+                  const auto sourceHalf = phase == 0 ? half : 1 - half;
+                  const auto block = head * projectionHeadBlocks + blocks[sourceHalf];
+                  const auto pair = (block / 2) % biasPairs;
+                  for (int64_t hemisphere = 0; hemisphere < memory.hemispheres; ++hemisphere)
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                      const auto slice = biasSlices[2 * pair + byte];
+                      emitMem3D(rewriter_, op_.getLoc(),
+                          inputCycle + phase * phaseInterval - 10 - vxmInputReadLatency(slice),
+                          hemisphere * memory.slices_per_hemisphere + slice,
+                          "read", biasAddress(block), 32 + hemisphere * 16 + half * 8 + byte,
+                          1, 1, 0, "sram", functionArgumentIndex(projectionBias),
+                          1, 1, 0, 1, 1, 0, biasBank);
+                    }
                 }
-              }
-              if (mergeSerialBiasHeads && head != 0)
-                return;
-              for (int64_t half = 0; half < 2; ++half) {
-                const int64_t domainReductionBlock = pairDomain
-                    ? half * (projectionHeadBlocks / 2)
-                    : blocks[half];
-                const int64_t outputBlock =
-                    head * projectionHeadBlocks + domainReductionBlock;
-                              const int64_t pair = (outputBlock / 2) % biasPairs;
-                for (int64_t hemisphere = 0;
-                     hemisphere < memory.hemispheres; ++hemisphere) {
-                  for (int64_t byte = 0; byte < 2; ++byte) {
-                    const int64_t slice = biasSlices[2 * pair + byte];
-                    emitMem3D(
-                        rewriter_, op_.getLoc(),
-                        domainInputCycle - vxmInputReadLatency(slice),
-                        hemisphere * memory.slices_per_hemisphere + slice,
-                        "read", biasAddress(outputBlock),
-                        40 + hemisphere * 16 + half * 2 + byte,
-                        op_.getSeqLen(), 1, 0, "sram",
-                        functionArgumentIndex(projectionBias), 2,
-                        phaseInterval, 0,
-                        mergeSerialBiasHeads
-                            ? op_.getQueryHeads() *
-                                  (projectionHeadBlocks / 2)
-                            : (pairDomain ? 2 : 1),
-                        mergeSerialBiasHeads
-                            ? serialQueryProductSlotCycles
-                            : (pairDomain
-                                   ? inputCycle - firstPairBiasInput
-                                   : 1),
-                        pairDomain
-                            ? biasAddress(outputBlock + 1) -
-                                  biasAddress(outputBlock)
-                            : 0,
-                        biasBank);
-                  }
-                }
-              }
             };
             const auto emitProductWriteDomain = [&](int64_t firstProduct,
                                                     int64_t outputCycle) {
@@ -3150,7 +2947,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       const int64_t boundaryLatency =
                           target_.throughput().vxm_alus + memoryGroup;
                       const int64_t vxmSrTraversal =
-                          std::max<int64_t>(0, boundaryLatency - latency);
+                          0;
                       const int64_t phase = firstProduct / 2;
                       const int64_t productSource =
                           phase == 0 ? slot : 1 - slot;
@@ -3165,7 +2962,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               vxmSrTraversal + crossTraversal,
                           destination * memory.slices_per_hemisphere + slice,
                           "write", baseAddress,
-                          12 + slot * 2 + byte,
+                          source * 8 + 2 + slot * 4 + byte,
                           ropeRowsPerLane, 1, rowAddressStride,
                           "sram", -1, laneCount,
                           laneStride * target_.throughput().tile_rows,
@@ -3202,7 +2999,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               }
               headEnd = scheduled;
             }
-            const int64_t productAConfig = headEnd;
+            const int64_t productAConfig = headEnd + 16;
             const int64_t productAInput = productAConfig + 1;
             const int64_t productBConfig =
                 productAInput + 2 * projectionCycleSpan +
@@ -3219,7 +3016,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               emitProductWriteDomain(
                   0, productAInput + productPipelineLatency);
               emitSourceDomain(0, 32, productAInput, 0);
-              emitSourceDomain(1, 36, productAInput, 0);
+              emitSourceDomain(1, 40, productAInput, 0);
 
               emitRopeProducts(productBConfig, inputHemisphere,
                                outputHemisphere, true);
@@ -3228,7 +3025,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                   2, productBInput + productPipelineLatency);
               emitSourceDomain(1, directSplitRope ? 36 : 32,
                                productBInput, 1);
-              emitSourceDomain(0, directSplitRope ? 32 : 36,
+              emitSourceDomain(0, directSplitRope ? 32 : 40,
                                productBInput, 1);
               if (kind == AttentionProjectionKind::Query &&
                   !serialQueryProductsFirst)
@@ -3397,13 +3194,13 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                             .value_or(readLatency(slice));
                     const int64_t currentCycle =
                         combineInput + tokenLane * tileRows +
-                        target_.throughput().vxm_alus + latency + 1;
+                        latency + 1;
                     if (!pairBlockDomain || pairBlock != 0) {
                       const int64_t domainCycle =
                           pairBlockDomain
                               ? firstPairCombineInput +
                                     tokenLane * tileRows +
-                                    target_.throughput().vxm_alus + latency + 1
+                                    latency + 1
                               : currentCycle;
                       const int64_t baseAddress = layout.queryIwAddress(
                           head, domainReductionBlock, 0, 0);
@@ -3438,13 +3235,13 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                                   projectionHeadBlocks / 2))) {
                           pendingQueryIwWrites.push_back(
                               {domainCycle, queue, baseAddress,
-                               source * 24 + half * 2 + byte, bank, head,
+                               source * 8 + half * 2 + byte, bank, head,
                                pairBlock});
                         } else {
                           emitMem3D(
                               rewriter_, op_.getLoc(), domainCycle, queue,
                               "write", baseAddress,
-                               source * 24 + half * 2 + byte,
+                               source * 8 + half * 2 + byte,
                               ropeRowsPerLane, 1, 1, "sram",
                               -1, tokenBlocks, tile,
                               target_.throughput().tile_rows, groupCount,
@@ -3473,11 +3270,11 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                               target::StreamDirection::East, slice)
                           .value_or(readLatency(slice));
                   const int64_t currentCycle =
-                      combineInput + target_.throughput().vxm_alus + latency + 1;
+                      combineInput + latency + 1;
                   if (!pairBlockDomain || pairBlock != 0) {
                     const int64_t domainCycle = pairBlockDomain
                         ? firstPairCombineInput +
-                              target_.throughput().vxm_alus + latency + 1
+                              latency + 1
                         : currentCycle;
                     const int64_t baseAddress = layout.keyAddress(
                         head, domainReductionBlock, cacheTokenBlock);
@@ -3493,7 +3290,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       const int64_t queue =
                           destination * memory.slices_per_hemisphere + slice;
                       const int64_t stream =
-                          source * 24 + half * 2 + byte;
+                          source * 8 + half * 2 + byte;
                       const int64_t bank =
                           layout.keyBank(domainReductionBlock);
                       if (currentTokens < tile &&

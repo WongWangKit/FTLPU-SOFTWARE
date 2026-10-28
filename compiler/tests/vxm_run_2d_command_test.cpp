@@ -3,6 +3,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Target/command_binary.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
+#include "ftlpu/compiler/Target/vxm_chain_lowering.hpp"
 #include "ftlpu/software/runtime/icu_program.hpp"
 #include "ftlpu/software/runtime/imem_capacity.hpp"
 
@@ -39,14 +40,30 @@ int main() try
     using namespace ftlpu::compiler;
     using namespace ftlpu::software::runtime;
 
-    VxmSrInstruction lane {};
+    require(ftlpu::compiler::target::lowerVxmChainOperand("stream_bf16", 32, 0, 0, false, "local").kind
+            == VxmLaneOperandKind::StreamBFloat16,
+        "chain head fixed lhs input did not lower");
+    for (const auto rhs : {false, true}) {
+        bool rejected = false;
+        try {
+            ftlpu::compiler::target::lowerVxmChainOperand("stream_bf16", rhs ? 32 : 34,
+                0, 0, rhs, "local");
+        } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "chain lowering silently discarded an incompatible stream index");
+    }
+    bool rejectedMirrorQueue = false;
+    try {
+        ftlpu::compiler::target::lowerVxmChainOperand("immediate", 0, 1, 15, false, "local");
+    } catch (const std::runtime_error&) { rejectedMirrorQueue = true; }
+    require(rejectedMirrorQueue, "chain lowering accepted an independent mirror queue");
+
+    VxmLaneAluInstruction lane {};
     lane.operation = VxmAluOpcode::Multiply;
-    lane.lhs = VxmSrOperand::StreamBFloat16(StreamId::East(0).packed());
-    lane.rhs = VxmSrOperand::Immediate(0.5f);
-    lane.result_sr = static_cast<std::uint8_t>(StreamId::East(0).packed());
-    lane.result_type = VxmCastTarget::BFloat16;
+    lane.lhs = VxmLaneOperand::StreamBFloat16();
+    lane.rhs = VxmLaneOperand::Imm(0.5f);
+    lane.output_type = VxmCastTarget::BFloat16;
     lane.repeat_count = 32;
-    const auto compact = VxmSrCompactInstructionCodec::encode(lane);
+    const auto compact = isa::encode_vxm_instruction(0, VxmChainDepth::Two, lane);
     const auto instruction = VxmIcuRun2DInstruction::Run2D(
         2, {2, 2}, {5, 17}, compact);
     auto hardwareInstruction = instruction;
@@ -118,7 +135,7 @@ int main() try
         if (const auto issued = icu.vxm_iq(0).tick()) {
             require(*issued == compact,
                 "runtime changed the VXM compact instruction");
-            require(VxmSrCompactInstructionCodec::decode(*issued)
+            require(isa::decode_vxm_instruction(0, *issued).instruction
                         .repeat_count == 32,
                 "runtime expanded the VXM contiguous datapath run");
             issueCycles.push_back(cycle);
@@ -126,6 +143,56 @@ int main() try
     }
     require(issueCycles == std::vector<std::size_t> {2, 7, 19, 24},
         "VXM RUN_2D ICU issued at incorrect absolute cycles");
+
+    // Compose equal singleton domains only while their cadence remains affine.
+    // Verify physical CModel iMEM occupancy, not just serialized statistics.
+    auto composedModule = mlir::ModuleOp::create(location);
+    composedModule->setAttr("ftlpu.target", targetModel.to_attribute(&context));
+    composedModule->setAttr("ftlpu.command_lowering",
+        mlir::StringAttr::get(&context, "direct"));
+    auto composedFunction = mlir::func::FuncOp::create(location, "composed",
+        mlir::FunctionType::get(&context, {}, {}));
+    auto* composedEntry = composedFunction.addEntryBlock();
+    composedModule.push_back(composedFunction);
+    mlir::OpBuilder composedBuilder(composedEntry, composedEntry->begin());
+    const std::vector<std::size_t> launches{7, 20, 33, 47, 61};
+    for (const auto launch : launches)
+        require(mlir::succeeded(command::materializeVxmRun2DCommand(
+            composedBuilder, location, 0,
+            VxmIcuRun2DInstruction::Run2D(launch, {1, 1}, {1, 1}, compact),
+            &error, 3)), "singleton domain materialization failed");
+    composedBuilder.create<mlir::func::ReturnOp>(location);
+    const auto composedBinary = ftlpu::compiler::target::translate_command_module(composedModule);
+    require(analyze_physical_imem(composedBinary).used_slots == 6,
+        "equal singleton domains were not composed into two affine domains");
+    require(composedBinary.scale_relocations.size() == 2
+        && composedBinary.scale_relocations[1].command_index == 3,
+        "composed domain scale relocations were not preserved");
+    InstructionControlUnit composedIcu;
+    load_queue_programs_into_icu(composedBinary.queues, composedIcu);
+    require(composedIcu.vxm_iq(0).imem_occupancy() == 6,
+        "physical CModel iMEM differs from encoded domain size");
+    std::vector<std::size_t> composedCycles;
+    for (std::size_t cycle = 0; cycle < 65; ++cycle)
+        if (const auto issued = composedIcu.vxm_iq(0).tick()) {
+            require(*issued == compact, "composed domain changed VXM payload");
+            composedCycles.push_back(cycle);
+        }
+    require(composedCycles == launches, "composed domain changed FU issue cycles");
+
+    // A consumer fence at cycle 20 must separate the first two launches.
+    // Exercise domain selection alone; this fixture has no real DMA binding.
+    composedModule->removeAttr("ftlpu.command_lowering");
+    composedBuilder.setInsertionPoint(composedEntry->getTerminator());
+    mlir::OperationState fence(location, command::WeightPageOp::getOperationName());
+    for (const auto& [name, value] : std::vector<std::pair<const char*, int64_t>>{
+            {"binding_index", 0}, {"page_index", 0}, {"bank", 0},
+            {"ready_cycle", 20}, {"release_cycle", 100}})
+        fence.addAttribute(name, composedBuilder.getI64IntegerAttr(value));
+    composedBuilder.create(fence);
+    const auto fencedBinary = ftlpu::compiler::target::translate_command_module(composedModule);
+    require(analyze_physical_imem(fencedBinary).used_slots == 9,
+        "VXM domain composition crossed a page consumer fence");
 
     auto sxmMap = SxmInstruction::PermuteMap {};
     for (std::size_t laneIndex = 0; laneIndex < sxmMap.size(); ++laneIndex)

@@ -3,6 +3,7 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/common_page_range.hpp"
 #include "ftlpu/software/runtime/icu_program.hpp"
+#include "ftlpu/software/runtime/fu_3d_macro_lowering.hpp"
 
 #include <algorithm>
 #include <span>
@@ -39,11 +40,37 @@ inline void validate_common_page_storage(const BinaryProgram& program,
     };
     for (const auto& queue : program.queues) {
         if (queue.kind != QueueKind::Mem || queue.index != memQueue) continue;
+        if (std::ranges::any_of(queue.commands, is_fu_3d_raw_packet_header)) {
+            // Normalize affine domains for the storage proof only. The actual
+            // executable remains Native 3D; no FU stream is expanded. Retain
+            // every cloned descriptor's binding provenance, just as codegen
+            // does, and let the existing checks reject aliasing/partial writes.
+            auto lowered = lower_fu_3d_queue_to_macro(queue);
+            BinaryProgram proof;
+            proof.hardware = program.hardware;
+            proof.queues.push_back(std::move(lowered.queue));
+            for (const auto& relocation : program.address_relocations) {
+                if (relocation.transport_queue || relocation.queue_kind != QueueKind::Mem
+                    || relocation.queue_index != queue.index) continue;
+                if (relocation.command_index >= lowered.command_indices.size()
+                    || lowered.command_indices[relocation.command_index].empty())
+                    throw std::invalid_argument("common storage proof has an invalid Native 3D relocation");
+                for (const auto index : lowered.command_indices[relocation.command_index]) {
+                    auto copy = relocation;
+                    copy.command_index = static_cast<std::uint32_t>(index);
+                    proof.address_relocations.push_back(copy);
+                }
+            }
+            validate_common_page_storage(proof, stop, memQueue, rowBegin,
+                rowCount, weightBindings, weightRelease, pageLoads);
+            continue;
+        }
         struct Access {
             std::int64_t low, high;
             std::uint64_t first, last;
             bool write, dense, weight;
             std::optional<std::uint32_t> input_binding;
+            std::vector<std::int64_t> written_rows;
         };
         std::vector<Access> accesses;
         std::uint64_t cursor = 0;
@@ -78,6 +105,7 @@ inline void validate_common_page_storage(const BinaryProgram& program,
             std::int64_t low = instruction.address, high = instruction.address;
             auto first = cursor, last = cursor;
             bool dense = true;
+            std::optional<IcuMacroSchedule> addressSchedule;
             if (macro) {
                 const auto schedule = decode_macro_schedule_command(command);
                 first = schedule.start_cycle;
@@ -95,6 +123,7 @@ inline void validate_common_page_storage(const BinaryProgram& program,
                     if (stride < 0) low -= delta; else high += delta;
                 };
                 if (schedule.induction_target == IcuInductionTarget::MemAddress) {
+                    addressSchedule = schedule;
                     addRows(schedule.inner_count, schedule.inner_stride);
                     addRows(schedule.outer_count, schedule.outer_stride);
                     // Exact coverage of the affine address envelope is proved
@@ -134,7 +163,21 @@ inline void validate_common_page_storage(const BinaryProgram& program,
                     inputBinding = relocation.binding_index;
                 }
             accesses.push_back({low, high, first, last, instruction.opcode == MemOpcode::Write,
-                dense, incomingWeightRead, inputBinding});
+                dense, incomingWeightRead, inputBinding, {}});
+            // Sparse writes can jointly replace a page (e.g. the two halves
+            // of a projection layout). Record exact SRAM rows, never their
+            // bounding envelope, so holes remain unproved.
+            if (instruction.opcode == MemOpcode::Write && !dense && addressSchedule) {
+                const auto& s = *addressSchedule;
+                auto& rows = accesses.back().written_rows;
+                for (std::size_t i=0;i<(s.inner_stride?s.inner_count:1);++i)
+                    for (std::size_t j=0;j<(s.outer_stride?s.outer_count:1);++j) {
+                        const auto row = static_cast<std::int64_t>(instruction.address)
+                            + static_cast<std::int64_t>(i)*s.inner_stride
+                            + static_cast<std::int64_t>(j)*s.outer_stride;
+                        if(row>=rowBegin && row<static_cast<std::int64_t>(rowEnd))rows.push_back(row);
+                    }
+            }
         }
         for (const auto& access : accesses) {
             if (access.write) {
@@ -173,7 +216,21 @@ inline void validate_common_page_storage(const BinaryProgram& program,
                 }
                 replacedByPage = next > static_cast<std::uint64_t>(high);
             }
-            if (replacement == accesses.end() && !replacedByPage)
+            bool replacedByWrites = false;
+            if (replacement == accesses.end() && !replacedByPage) {
+                std::vector<bool> covered(static_cast<std::size_t>(high-low+1),false);
+                for(const auto& write:accesses) {
+                    if(!write.write || write.first<weightRelease || write.last>=access.first
+                        || access.first-write.last<program.hardware.tile_rows)continue;
+                    if(write.dense) {
+                        for(auto row=std::max(low,write.low);row<=std::min(high,write.high);++row)
+                            covered[static_cast<std::size_t>(row-low)]=true;
+                    } else for(auto row:write.written_rows)
+                        if(row>=low && row<=high)covered[static_cast<std::size_t>(row-low)]=true;
+                }
+                replacedByWrites=std::ranges::all_of(covered,[](bool v){return v;});
+            }
+            if (replacement == accesses.end() && !replacedByPage && !replacedByWrites)
                 throw std::invalid_argument("unsafe common stop: page write may overwrite SRAM needed by a future computation read: queue="
                     + std::to_string(memQueue) + " stop=" + std::to_string(stop)
                     + " read=" + std::to_string(access.first) + " rows=" + std::to_string(low) + ".." + std::to_string(high));

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -69,10 +70,15 @@ private:
     mlir::WalkResult reserve(mlir::Operation* operation, std::string resource,
         int64_t start, int64_t repeatCount = 1, int64_t repeatInterval = 1)
     {
+        if (repeatCount > 0 && repeatInterval == 1)
+            return reserveInterval(operation, resource, start, start + repeatCount);
         auto& reservations = resources_[resource];
         for (int64_t repeat = 0; repeat < repeatCount; ++repeat) {
             const int64_t cycle = start + repeat * repeatInterval;
-            for (const auto& interval : intervals_[resource]) {
+            const auto& ranges=intervals_[resource];
+            auto candidate=ranges.upper_bound(cycle);
+            if(candidate!=ranges.begin()) {
+                const auto& interval=std::prev(candidate)->second;
                 if (cycle >= interval.start && cycle < interval.end) {
                     operation->emitError()
                         << "resource '" << resource << "' overlaps at cycle "
@@ -99,7 +105,11 @@ private:
     mlir::WalkResult reserveInterval(mlir::Operation* operation,
         const std::string& resource, int64_t start, int64_t end)
     {
-        for (const auto& interval : intervals_[resource]) {
+        auto& ranges=intervals_[resource];
+        auto first=ranges.lower_bound(start);
+        if(first!=ranges.begin())--first;
+        for(auto it=first;it!=ranges.end() && it->first<end;++it) {
+            const auto& interval=it->second;
             if (start < interval.end && interval.start < end) {
                 operation->emitError()
                     << "resource '" << resource << "' ICU contexts overlap ["
@@ -113,7 +123,9 @@ private:
                 return mlir::WalkResult::interrupt();
             }
         }
-        for (const auto& [cycle, owner] : resources_[resource]) {
+        const auto& points=resources_[resource];
+        for(auto it=points.lower_bound(start);it!=points.end() && it->first<end;++it) {
+            const auto& [cycle,owner]=*it;
             if (cycle >= start && cycle < end) {
                 operation->emitError()
                     << "resource '" << resource << "' overlaps at cycle "
@@ -125,7 +137,7 @@ private:
                 return mlir::WalkResult::interrupt();
             }
         }
-        intervals_[resource].push_back({start, end, operation});
+        ranges.emplace(start,Interval{start, end, operation});
         return mlir::WalkResult::advance();
     }
 
@@ -337,13 +349,13 @@ private:
 
     mlir::func::FuncOp function_;
     std::unordered_map<std::string,
-        std::unordered_map<int64_t, mlir::Operation*>> resources_;
+        std::map<int64_t, mlir::Operation*>> resources_;
     struct Interval {
         int64_t start;
         int64_t end;
         mlir::Operation* operation;
     };
-    std::unordered_map<std::string, std::vector<Interval>> intervals_;
+    std::unordered_map<std::string, std::map<int64_t,Interval>> intervals_;
 };
 
 class VerifySchedulePass final

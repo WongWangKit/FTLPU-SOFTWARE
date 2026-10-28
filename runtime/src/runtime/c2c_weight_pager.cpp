@@ -1373,6 +1373,23 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
                 retained.push_back(barrier);
             }
             queueBarriers = std::move(retained);
+            // Once this queue has committed a page, join its consumer event
+            // immediately when there is no intervening FU work. Replaying
+            // the nominal idle window after a dynamically stalled WRITE_SYNC
+            // would count transport latency twice. The event still waits for
+            // every compute/activation participant and preserves issue phase.
+            for (const auto& barrier : queueBarriers) {
+                std::optional<std::size_t> lastWriteEnd;
+                for (const auto& [begin, end, eventTag] : memWriteWindows[queue.index])
+                    if (eventTag == barrier.second && end <= barrier.first)
+                        lastWriteEnd = std::max(lastWriteEnd.value_or(0), end);
+                if (lastWriteEnd && !std::ranges::any_of(activeWindows,
+                        [&](const auto& window) {
+                            return window.second > *lastWriteEnd
+                                && window.first < barrier.first;
+                        }))
+                    earlyJoinTags.push_back(barrier.second);
+            }
             // Remaining barriers protect actual consumers. A WRITE_SYNC
             // cannot be interrupted, so place these joins after its reserved
             // interval while retaining the consumer's relative phase.

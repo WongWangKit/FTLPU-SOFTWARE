@@ -28,6 +28,23 @@ def compare(actual, expected):
                 max_abs=float(np.max(np.abs(a-e))))
 
 
+def scan(query, key, value, decay, beta, config, count):
+    """Independent FP32 reference; Q/K already include L2 and Q scaling."""
+    h, k, v = config.num_value_heads, config.key_head_dim, config.value_head_dim
+    q = np.asarray(query, np.float32).reshape(-1, h, k)
+    keys = np.asarray(key, np.float32).reshape(-1, h, k)
+    values = np.asarray(value, np.float32).reshape(-1, h, v)
+    state = np.zeros((h, k, v), np.float32)
+    outputs = []
+    for t in range(count):
+        state *= np.asarray(decay[t], np.float32)[:, None, None]
+        prediction = np.einsum('hkv,hk->hv', state, keys[t])
+        delta = (values[t] - prediction) * np.asarray(beta[t], np.float32)[:, None]
+        state += keys[t, :, :, None] * delta[:, None, :]
+        outputs.append(np.einsum('hkv,hk->hv', state, q[t]))
+    return np.asarray(outputs).reshape(count, h*v), state.reshape(h*k, v)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('compile', 'runner', 'package', 'output-dir', 'target-config'):
@@ -36,8 +53,11 @@ def main():
     p.add_argument('--with-qk-norm', action='store_true')
     p.add_argument('--with-gates', action='store_true',
                    help='include Q/K L2Norm and the real beta/log-decay branches')
+    p.add_argument('--recurrent-tokens', type=int, choices=(0, 2, 32), default=0,
+                   help='append the stateful DeltaNet core for two tokens or seq32')
     p.add_argument('--compile-only', action='store_true')
     a = p.parse_args()
+    a.with_gates |= bool(a.recurrent_tokens)
     a.with_qk_norm |= a.with_gates
     out = a.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -80,6 +100,18 @@ def main():
     if a.with_gates:
         beta, log_decay = graph.gates(normalized, packed, scales, weights.dt_bias, weights.a_log)
         finals += [beta, log_decay]
+    if a.recurrent_tokens:
+        value = conv[:, 2 * config.key_width:]
+        decay = graph.vector_tiles('delta_decay', [(log_decay, 'f32')],
+                                   lambda g: g.add(0, kind='exp', immediate=0))
+        initial_state = np.zeros((config.num_value_heads * config.key_head_dim,
+                                  config.value_head_dim), np.float32)
+        count = a.recurrent_tokens
+        core, state = graph.delta(query[:count], key[:count], value[:count],
+                                  decay[:count], beta[:count], initial_state, config)
+        # Expose native intermediates only for numerical diagnostics. They are
+        # read back after execution, never fed back by the host into the graph.
+        finals += [value, decay, core, state]
     logical = graph.write(out / 'logical_graph', finals)
     if a.with_qk_norm:
         norms = [n for n in graph.nodes if n['name'] in ('query_l2', 'key_l2')]
@@ -127,27 +159,29 @@ def main():
                 layout['kind'] != 'token_partition_planar' or layout['hemisphere'] != 'both'
                 for node in producers for layout in node['direct_output_layouts']):
             raise AssertionError('a/b projection must directly write the two token partitions')
-        if any('kind = "token_partition_planar"' not in line for line in outputs[2:]):
+        if any('kind = "token_partition_planar"' not in line for line in outputs[2:4]):
             raise AssertionError('beta/g readback must use the native token partitions without merging')
         if (len(gate_nodes) != 2 or gate_nodes[0]['nominal_start'] != gate_nodes[1]['nominal_start']
                 or {layout['hemisphere'] for node in gate_nodes
                     for layout in node['direct_output_layouts']} != {'east', 'west'}):
             raise AssertionError('gate token halves must run concurrently on opposite hemispheres')
         gate_start = min(node['nominal_start'] for node in gate_nodes)
+        gate_end = max(node['nominal_end'] for node in gate_nodes)
         if any(layout['kind'] != 'fp32_quad_planar' or layout['rows'] != 16
                for node in gate_nodes for layout in node['direct_output_layouts']):
             raise AssertionError('beta/g must keep packed words with 16 valid head lanes')
         norm_end = max(node['nominal_end'] for node in plan['nodes']
                        if node['name'] in ('query_l2', 'key_l2'))
         if any(int(re.search(r'cycle = (\d+)', line).group(1)) >= norm_end
-               for line in schedule.splitlines() if 'ftlpu.schedule.sxm ' in line):
+               for line in schedule.splitlines() if 'ftlpu.schedule.sxm ' in line and
+               int(re.search(r'cycle = (\d+)', line).group(1)) < gate_end):
             raise AssertionError('gate branches must not introduce SXM layout conversion')
         gate_chains = {}
         for line in schedule.splitlines():
             if 'ftlpu.schedule.vxm ' not in line:
                 continue
             cycle = int(re.search(r'cycle = (\d+)', line).group(1))
-            if cycle < gate_start:
+            if not gate_start <= cycle < gate_end:
                 continue
             queue = int(re.search(r'queue = (\d+)', line).group(1))
             opcode = re.search(r'opcode = "([^"]+)"', line).group(1)
@@ -166,6 +200,8 @@ def main():
         allowed += ('query_l2.', 'key_l2.')
     if a.with_gates:
         allowed += ('in_proj_b.', 'in_proj_a.', 'delta_gates')
+    if a.recurrent_tokens:
+        allowed += ('delta_decay', 'delta_rule.', 'recurrent_output_layout')
     has_node = lambda prefix: any(name == prefix or name.startswith(prefix + '.') for name in names)
     if (not any(name.startswith('in_proj_qkv.') for name in names) or
             not any(name.startswith('conv1d_silu.') for name in names) or
@@ -233,13 +269,21 @@ def main():
         expected['beta'] = 1 / (1 + np.exp(-b_ref))
         expected['g'] = -np.exp(weights.a_log.astype(np.float64)) * np.logaddexp(
             0, a_ref + weights.dt_bias.astype(np.float64))
+    if a.recurrent_tokens:
+        expected['value'] = expected_conv[:, 2 * config.key_width:]
+        expected['decay'] = np.exp(expected['g'])
+        expected['recurrent_output'], expected['recurrent_state'] = scan(
+            expected['query_l2'], expected['key_l2'], expected['value'],
+            expected['decay'], expected['beta'], config, a.recurrent_tokens)
     errors = {}
+    actual_outputs = {}
     for index, (name, reference) in enumerate(expected.items()):
-        if name in ('beta', 'g'):
+        if name in ('beta', 'g', 'decay', 'recurrent_state'):
             actual = np.fromfile(out / f'qkv_conv.{index}.bin', '<f4').reshape(reference.shape)
         else:
             actual = (np.fromfile(out / f'qkv_conv.{index}.bin', '<u2').astype(np.uint32) << 16)
             actual = actual.view(np.float32).reshape(reference.shape)
+        actual_outputs[name] = actual
         errors[name] = compare(actual, reference)
         if name == 'beta' and (np.any(actual < 0) or np.any(actual > 1)):
             raise AssertionError('beta must be in [0,1]')
@@ -247,6 +291,16 @@ def main():
             raise AssertionError('log-decay g must be nonpositive')
     passed = all(value['nrmse'] <= .03 and value['cosine'] >= .999
                  for value in errors.values())
+    core_errors = {}
+    if a.recurrent_tokens:
+        core_reference, state_reference = scan(
+            actual_outputs['query_l2'], actual_outputs['key_l2'], actual_outputs['value'],
+            actual_outputs['decay'], actual_outputs['beta'], config, a.recurrent_tokens)
+        core_errors = dict(output=compare(actual_outputs['recurrent_output'], bf16(core_reference)),
+                           state=compare(actual_outputs['recurrent_state'], state_reference))
+        passed &= all(e['nrmse'] < .003 and e['cosine'] > .99999 for e in core_errors.values())
+        for name, ref in (('output', core_reference), ('state', state_reference)):
+            ref.astype('<f4').tofile(out / f'golden.recurrent.{name}.f32.bin')
     stats = [line for line in execution_log.splitlines() if line.startswith('cycles=')]
     execution_stats = {key: int(value) for key, value in
                        re.findall(r'(\w+)=(\d+)', stats[-1])} if stats else {}
@@ -264,13 +318,14 @@ def main():
         if pre_execution.exists():
             export_command += ['--pre-execution-dir', str(pre_execution)]
         subprocess.run(export_command, check=True)
-    summary = dict(status='passed' if passed else 'failed',
+    summary = dict(recurrent_tokens=a.recurrent_tokens, recurrent_core_errors=core_errors, status='passed' if passed else 'failed',
                    model=provenance['repo'], revision=provenance['revision'],
                    seq_len=32, hidden_size=1024, qkv_width=6144,
                    operators=['qkv_projection', 'causal_depthwise_conv1d_silu'] +
                              (['query_l2', 'key_l2'] if a.with_qk_norm else []) +
                              (['b_projection', 'a_projection', 'beta_sigmoid', 'g_softplus_scale']
-                              if a.with_gates else []),
+                              if a.with_gates else []) +
+                             (['decay_exp', 'gated_delta_rule'] if a.recurrent_tokens else []),
                    gate_outputs=(dict(beta='sigmoid(x @ W_b.T)',
                                       g='-exp(A_log) * softplus(x @ W_a.T + dt_bias)',
                                       shape=[32, config.num_value_heads], dtype='f32',

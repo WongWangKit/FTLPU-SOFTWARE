@@ -107,6 +107,140 @@ void emitTimeline(mlir::IRRewriter& rewriter,
     rewriter.create(state);
 }
 
+mlir::LogicalResult lowerFixedChain(mlir::IRRewriter& rewriter,
+    stream::DepthwiseConv1DTaskOp op,const target::LPUTargetModel& target,int64_t outputIndex)
+{
+    const auto type=llvm::cast<mlir::RankedTensorType>(op.getResult().getType());
+    const auto tokens=type.getDimSize(0), blocks=type.getDimSize(1)/32;
+    const auto function=op->getParentOfType<mlir::func::FuncOp>();
+    const auto mirror=function->getAttrOfType<mlir::BoolAttr>("ftlpu.depthwise_conv_mirror");
+    const auto pairedAttr=function->getAttrOfType<mlir::BoolAttr>("ftlpu.depthwise_conv_paired");
+    const bool paired=pairedAttr && pairedAttr.getValue();
+    auto* preceding=op->getPrevNode();
+    const auto flip=[&](mlir::DictionaryAttr p){
+        mlir::NamedAttrList a(p);
+        a.set("hemisphere",rewriter.getStringAttr(isWest(p)?"east":"west"));
+        return a.getDictionary(rewriter.getContext());
+    };
+    const auto physical=[&](mlir::DictionaryAttr p){return mirror && mirror.getValue()?flip(p):p;};
+    const auto input=physical(placement(op.getInputAllocations()));
+    const auto weight=physical(placement(op.getWeightAllocations()));
+    const auto window=physical(placement(op.getScratchAllocations(),0));
+    // A chain drains to the opposite hemisphere. The next SiLU chain brings
+    // the result back; no explicit-SR FP32 carriers or ALU crossbars are used.
+    const auto partial=physical(placement(op.getScratchAllocations(),1));
+    const auto output=physical(placement(op.getResultAllocations()));
+    rewriter.setInsertionPoint(op);
+    inputBinding(rewriter,op,op.getInput(),"activation",input);
+    inputBinding(rewriter,op,op.getWeight(),"weight",weight);
+    const auto mem=[&](mlir::DictionaryAttr p,int64_t plane,int64_t time,bool write,
+                       int64_t address,int64_t stream,int64_t count=1,int64_t interval=1,int64_t stride=1){
+        const auto slice=sliceAt(p,plane);
+        direct_domain_detail::emitMem3D(rewriter,op.getLoc(),target,time,
+            int64_t(isWest(p))*target.memory().slices_per_hemisphere+slice,
+            write?"write":"read",baseRow(p)+address,stream,count,interval,stride,
+            1,1,0,1,1,0,-1,bank(p));
+        if(!paired && !write && stream>=32 && stream<52){
+            // The shared ICU configures both fixed chains. An unused half
+            // still needs a complete input Bundle; its result is discarded.
+            direct_domain_detail::emitMem3D(rewriter,op.getLoc(),target,time,
+                int64_t(!isWest(p))*target.memory().slices_per_hemisphere+slice,
+                "read",baseRow(p)+address,stream^16,count,interval,stride,
+                1,1,0,1,1,0,-1,bank(p));
+        }
+    };
+    int64_t cursor=64;
+    for(int64_t byte=0;byte<2;++byte){
+        const auto sg=sliceAt(input,byte)/4,dg=sliceAt(window,byte)/4;
+        const bool cross=isWest(input)!=isWest(window);
+        const auto latency=cross?sg+dg+2:std::abs(sg-dg);
+        if(!cross && sg==dg)return op.emitError("fixed-chain Conv ingress needs distinct SR columns");
+        const auto readStream=20+byte+((cross || sg>dg)?32:0);
+        const auto writeStream=20+byte+(!cross && sg>dg?32:0);
+        mem(input,byte,cursor,false,0,readStream,tokens*blocks);
+        mem(window,byte,cursor+latency,true,0,writeStream,tokens*blocks);
+    }
+    cursor+=tokens*blocks+96;
+    const auto vxm=[&](int64_t time,int64_t queue,llvm::StringRef opcode,
+        llvm::StringRef lhs,llvm::StringRef rhs,int64_t count,bool reset,bool acc,bool emit,
+        int64_t depth=2,float immediate=0.f){
+        return create_vxm(rewriter,op.getLoc(),op.getInput(),op.getWeight(),type,time,queue,opcode,
+            lhs,0,0.f,rhs,rhs=="stream_bf16"?2:0,immediate,
+            emit?"bf16":"fp32",emit?0:-1,count,1,"east","west",-1,
+            reset,acc,!acc || emit,false,depth);
+    };
+    const auto drain=[&](llvm::StringRef name,int64_t begin,int64_t end){
+        mlir::OperationState t(op.getLoc(),TimelineOp::getOperationName());
+        t.addAttribute("name",rewriter.getStringAttr(name));
+        t.addAttribute("start",rewriter.getI64IntegerAttr(begin));
+        t.addAttribute("end",rewriter.getI64IntegerAttr(end));rewriter.create(t);
+    };
+    for(int64_t block=0;block<blocks;++block){
+        const auto begin=cursor;
+        for(int64_t token=0;token<tokens;++token){
+            const auto first=std::max<int64_t>(0,3-token),count=4-first;
+            for(int64_t tap=first;tap<4;++tap)for(int64_t byte=0;byte<2;++byte){
+                const auto phase=cursor+tap-first-1;
+                mem(window,byte,phase-sliceAt(window,byte)/4,false,
+                    block*tokens+token+tap-3,32+int64_t(isWest(window))*16+byte);
+                mem(weight,2*tap+byte,phase-sliceAt(weight,2*tap+byte)/4,false,
+                    tap*blocks+block,32+int64_t(isWest(weight))*16+2+byte);
+            }
+            vxm(cursor-1,0,"multiply","stream_bf16","stream_bf16",count,false,false,false);
+            vxm(cursor-1,1,"add","previous","accumulator",1,true,true,count==1);
+            if(count>2)vxm(cursor,1,"add","previous","accumulator",count-2,false,true,false);
+            if(count>1)vxm(cursor+(count>2?1:0),1,"add","previous","accumulator",1,false,true,true);
+            for(int64_t byte=0;byte<2;++byte)
+                mem(partial,byte,cursor+count+2+sliceAt(partial,byte)/4,true,
+                    block*tokens+token,int64_t(isWest(weight))*8+byte);
+            cursor+=count+48;
+        }
+        cursor+=64;
+        drain("imem.drain.conv.chain.block"+std::to_string(block),begin,cursor);
+        // The next domain's MEM reads precede its VXM configuration. Keep
+        // them after the reload boundary, including the farthest MEM group.
+        cursor+=32;
+    }
+    const auto start=cursor;
+    const auto count=tokens*blocks;
+    for(int64_t byte=0;byte<2;++byte)
+        mem(partial,byte,start-1-sliceAt(partial,byte)/4,false,0,
+            32+int64_t(isWest(partial))*16+byte,count);
+    if(op.getActivation()!="silu" && op.getActivation()!="none")
+        return op.emitError("fixed-chain Conv supports SiLU or no activation");
+    const char* operations[]={"negate","exp","add","reciprocal","multiply","bypass","bypass","bypass"};
+    for(int64_t stage=0;stage<8;++stage){
+        const bool silu=op.getActivation()=="silu";
+        auto v=vxm(start-1,stage,silu?operations[stage]:"bypass",stage?"previous":"stream_bf16",
+            silu && stage==4?"original":"immediate",count,false,false,stage==7,8,silu && stage==2?1.f:0.f);
+        if(stage==7)v->setAttr("output_stream",rewriter.getI64IntegerAttr(6));
+    }
+    const auto outputStream=int64_t(isWest(partial))*8+6;
+    const int64_t outputLatency=op.getActivation()=="silu"?17:8;
+    if(output.getAs<mlir::StringAttr>("kind").getValue()=="fp16_mxm_distributed_16"){
+        if(tokens%32)return op.emitError("distributed Conv output requires token blocks of 32");
+        for(int64_t block=0;block<blocks;++block)for(int64_t tokenBase=0;tokenBase<tokens;tokenBase+=32)
+          for(int64_t pair=0;pair<8;++pair)
+            for(int64_t byte=0;byte<2;++byte)
+                mem(output,2*pair+byte,start+outputLatency+block*tokens+tokenBase+pair+sliceAt(output,2*pair+byte)/4,true,
+                    (tokenBase/32*blocks+block)*4,outputStream+byte,4,8,1);
+    } else for(int64_t byte=0;byte<2;++byte)
+        mem(output,byte,start+outputLatency+sliceAt(output,byte)/4,true,0,outputStream+byte,count);
+    cursor=start+count+96;
+    drain("imem.drain.conv.chain.silu",start,cursor);
+    emitTimeline(rewriter,op,64,cursor);
+    if(paired && mirror && mirror.getValue()) {
+        auto* current=preceding?preceding->getNextNode():&op->getBlock()->front();
+        while(current!=op.getOperation()) {
+            auto* next=current->getNextNode();
+            if(llvm::isa<VxmOp>(current))rewriter.eraseOp(current);
+            current=next;
+        }
+    }
+    auto binding=outputBinding(rewriter,op,outputIndex,output);
+    rewriter.replaceOp(op,binding.getValue());return mlir::success();
+}
+
 mlir::LogicalResult lowerOne(mlir::IRRewriter& rewriter,
     stream::DepthwiseConv1DTaskOp op,
     const target::LPUTargetModel& target, int64_t outputIndex)
@@ -127,6 +261,8 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& rewriter,
     if (tokens <= 0 || channels <= 0 || channels % channelsPerWord != 0)
         return op.emitError(
             "channels must be aligned to one MEM byte plane (32 channels)");
+
+    if(type.getElementType().isBF16())return lowerFixedChain(rewriter,op,target,outputIndex);
 
     const auto input = placement(op.getInputAllocations());
     const auto weight = placement(op.getWeightAllocations());

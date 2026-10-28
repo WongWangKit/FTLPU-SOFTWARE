@@ -158,6 +158,6 @@ MxmLoadOp emitFfnWeightTile(mlir::IRRewriter& rewriter,
     FfnLoopDomain3D domain = {},
     llvm::StringRef weightBufferMode = "fixed",
     std::optional<FfnLoopDomain3D> mxmControlDomain = std::nullopt,
-    bool emitMxmControl = true);
+    bool emitMxmControl = true, int64_t weightSyncGroup = -1);
 
 } // namespace ftlpu::compiler::schedule::ffn_detail

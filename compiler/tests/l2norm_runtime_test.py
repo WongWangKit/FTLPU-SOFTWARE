@@ -19,6 +19,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('compile', 'runner', 'target-config', 'output-dir'):
         p.add_argument('--' + name, type=Path, required=True)
+    p.add_argument("--native-only", action="store_true", help="Test normalization without the convolution producer")
     a = p.parse_args()
     results = []
     # Ones distinguish sum from mean; tiny inputs test the unscaled epsilon.
@@ -69,6 +70,10 @@ def main():
             raise AssertionError(f'{kind}/{width}: per-row NRMSE {row_error.tolist()}')
         results.append(dict(kind=kind, width=width, epsilon=eps, scale=scale,
                             max_row_nrmse=float(row_error.max())))
+    if a.native_only:
+        (a.output_dir / "summary.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(results, indent=2))
+        return
     # Exercise a reshaped native producer, not just an externally packed
     # L2 input. Distinct groups detect head/token address permutations.
     for width, groups, eps, scale in ((32, 4, .25, .37), (128, 2, 1e-6, 1.)):
@@ -87,6 +92,8 @@ def main():
             'ftlpu-graph-compile.exe' if sys.platform == 'win32' else 'ftlpu-graph-compile')
         subprocess.run([str(graph_compile), '--input', str(logical), '--output', str(kernel),
                         '--emit-kernel', '--target-config', str(a.target_config.resolve())], check=True)
+        kernel.write_text(kernel.read_text().replace('module {',
+            'module attributes {ftlpu.common_barrier_protocol = true} {', 1))
         subprocess.run([str(a.compile.resolve()), '--input', str(kernel), '--input-stage', 'kernel',
                         '--output', str(binary), '--target-config', str(a.target_config.resolve())], check=True)
         schedule = (out / 'decoder_layer.schedule.mlir').read_text(encoding='utf-8')

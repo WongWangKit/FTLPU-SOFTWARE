@@ -231,7 +231,7 @@ try {
     program.queues.push_back(QueueProgram {
         QueueKind::MxmLoad, 0,
         {encode_macro_schedule_command(
-            mxm_command(ftlpu::MxmControlInstruction::IW(0, 3)),
+            mxm_command(ftlpu::MxmControlInstruction::IW(0, 0)),
             ftlpu::IcuMacroSchedule {10, 3, 2, 1, 1, 1, 0,
                 ftlpu::IcuInductionTarget::MxmWeightColumn})}});
     program.queues.push_back(QueueProgram {
@@ -424,7 +424,7 @@ try {
         throw std::runtime_error(
             "non-overlapping reuse page was merged with Gate/Up");
     require_contains(trace,
-        "10,11,\"MXM.E0.Load\",\"IW buffer=0 column=3\",\"repeat\","
+        "10,11,\"MXM.E0.Load\",\"IW buffer=0 column=0\",\"repeat\","
         "3,2,1,1,1,0,0,\"mxm_weight_column\",0");
     if (trace.find("12,13,\"MXM.E0.Load\"") != std::string::npos)
         throw std::runtime_error("macro schedule was expanded in CSV v2");
@@ -441,7 +441,7 @@ try {
         "25,26,\"MEM.E.Read\",\"slice=0 bank=0 operation=read addr=301 stream=E3\","
         "\"repeat\",3,4,10,1,1,0,0,\"mem_address\",0");
     require_contains(trace,
-        "0,7,\"VXM.C0\",\"mul repeat=7 -> SR0\",\"single\","
+        "0,7,\"VXM.C0\",\"mul repeat=7 chain_depth=2\",\"single\","
         "1,0,0,1,0,0,0,\"none\",0");
 
     BinaryProgram rawProgram;
@@ -485,14 +485,13 @@ try {
                 {0, 0, 0}, 1, ftlpu::MxmDataFormat::BFloat16,
                 ftlpu::MxmComputeIcuMode{})), InstructionKind::Mxm, 70)});
 
-    auto rawVxm = ftlpu::VxmSrInstruction{};
+    auto rawVxm = ftlpu::VxmLaneAluInstruction{};
     rawVxm.operation = ftlpu::VxmAluOpcode::Multiply;
-    rawVxm.lhs = ftlpu::VxmSrOperand::StreamBFloat16(0);
-    rawVxm.rhs = ftlpu::VxmSrOperand::Immediate(0.5f);
-    rawVxm.result_sr = 8;
-    rawVxm.result_type = ftlpu::VxmCastTarget::BFloat16;
+    rawVxm.lhs = ftlpu::VxmLaneOperand::StreamBFloat16();
+    rawVxm.rhs = ftlpu::VxmLaneOperand::Imm(0.5f);
+    rawVxm.output_type = ftlpu::VxmCastTarget::BFloat16;
     rawVxm.repeat_count = 4;
-    const auto compact = ftlpu::VxmSrCompactInstructionCodec::encode(rawVxm);
+    const auto compact = ftlpu::isa::encode_vxm_instruction(0, ftlpu::VxmChainDepth::Two, rawVxm);
     rawProgram.queues.push_back(QueueProgram{QueueKind::Vxm, 0,
         raw_fu_commands(ftlpu::isa::encode_vxm_icu_run_2d_instruction(
             ftlpu::VxmIcuRun2DInstruction::Run2D(
@@ -539,7 +538,7 @@ try {
     require_contains(rawTrace, "\"MXM.E0.Dequant\",\"Dequant3D");
     require_contains(rawTrace, "\"MXM.W0.Compute\",\"Compute3D");
     require_contains(rawTrace,
-        "\"VXM.C0\",\"mul result_sr=8 repeat=4 Run2D\"");
+        "\"VXM.C0\",\"mul chain_depth=2 repeat=4 Run2D\"");
     require_contains(rawTrace, "\"SXM.E.Permute\",\"permute Run2D map_stride=8\"");
 
     std::ostringstream rawPerformance;
@@ -554,7 +553,7 @@ try {
         "runtime perf resource=MXM.load cycles=128 active_queues=1/2 issued=2");
     require_contains(rawPerformance.str(),
         "runtime perf resource=VXM cycles=128 active_queues=1/"
-            + std::to_string(rawProgram.hardware.vxm_alus)
+            + std::to_string(rawProgram.hardware.vxm_alus / 2)
             + " issued=4");
 
     // A MEM queue may mix ordinary READ3D with the three-word WRITE_READ_2D

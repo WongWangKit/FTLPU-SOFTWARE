@@ -26,8 +26,8 @@ def rms_norm_source(shape, epsilon):
     if len(shape) != 2:
         raise ValueError('RMSNorm expects a rows-by-hidden matrix')
     rows, hidden = shape
-    if (rows != 1 and rows % 32) or hidden % 32:
-        raise ValueError('shared RMSNorm lowering requires tile-aligned tensors')
+    if rows <= 0 or hidden <= 0:
+        raise ValueError('RMSNorm requires positive dimensions')
     activation = tensor_type(shape, 'bf16')
     gamma = tensor_type((hidden,), 'bf16')
     return f'''module {{ func.func @stage(%a: {activation}, %g: {gamma}) -> {activation} {{

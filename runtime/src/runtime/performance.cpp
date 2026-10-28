@@ -184,7 +184,7 @@ void print_runtime_performance(
         {"MXM.load", logical_mxm_queues},
         {"MXM.compute", logical_mxm_queues},
         {"MXM.dequant", logical_mxm_queues},
-        {"VXM", program.hardware.vxm_alus},
+        {"VXM", program.hardware.vxm_alus / 2},
         {"SXM.transpose", program.hardware.hemispheres},
         {"SXM.permute", program.hardware.hemispheres},
         {"C2C.DMA", program.hardware.hemispheres},
@@ -265,11 +265,12 @@ void DatapathPerformanceMonitor::sample(const TspSliceSystem& system,
     const auto& vxm = system.vxm_unit();
     std::size_t active_rows = 0;
     std::size_t useful_rows = 0;
-    for (std::size_t tile = 0; tile < VxmSrSlice::kTileCount; ++tile)
-        for (const bool executed : vxm.last_execution()[tile]) {
-            active_rows += executed ? 1U : 0U;
-            useful_rows += executed ? 1U : 0U;
-        }
+    for (std::size_t tile = 0; tile < VxmSlice::kTileCount; ++tile) {
+        const auto& timeline = vxm.superlane(tile).lane(0).statistics().timeline;
+        if (timeline.empty()) continue;
+        active_rows += timeline.back().active_slots();
+        useful_rows += timeline.back().useful_slots();
+    }
     const std::size_t vxm_active = active_rows * hw::kLanesPerTile;
     const std::size_t vxm_useful = useful_rows * hw::kLanesPerTile;
     const auto vxm_capacity =

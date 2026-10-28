@@ -214,7 +214,7 @@ QueueCommand native_instruction(const MxmDequantInstruction& instruction)
         {static_cast<std::uint32_t>(isa::encode_mxm_dequant_instruction(instruction)), 0, 0, 0}};
 }
 
-QueueCommand native_instruction(const VxmSrCompactInstruction& instruction)
+QueueCommand native_instruction(const VxmCompactInstruction& instruction)
 {
     return {kInstructionCommand, InstructionKind::Vxm, 3,
         {static_cast<std::uint32_t>(instruction.control),

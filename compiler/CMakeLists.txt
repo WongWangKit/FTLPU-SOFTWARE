@@ -680,6 +680,50 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64_bf16.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/vxm_sr_ffn
             --target-config ${FTLPU_HARDWARE_CONFIG})
+    add_test(NAME distributed_projection_staging_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/distributed_projection_staging_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/distributed_projection_staging)
+    add_test(NAME chain_vxm_gates_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/chain_vxm_gates_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/chain_gates)
+    foreach(conv_channels IN ITEMS 64 2048)
+        add_test(NAME chain_vxm_conv_${conv_channels}_runtime_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/chain_vxm_conv_runtime_test.py
+                --compile $<TARGET_FILE:ftlpu_compile>
+                --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+                --runner $<TARGET_FILE:compiled_stage_file_runner>
+                --target-config ${FTLPU_HARDWARE_CONFIG}
+                --channels ${conv_channels}
+                --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/chain_conv_${conv_channels})
+    endforeach()
+    add_test(NAME chain_vxm_conv_none_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/chain_vxm_conv_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --activation none
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/chain_conv_none)
+    add_test(
+        NAME chain_vxm_rmsnorm_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/chain_vxm_rmsnorm_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/chain_vxm_rmsnorm)
     add_test(
         NAME smollm2_135m_ffn_binary_cmodel_runtime_test
         COMMAND
@@ -861,6 +905,52 @@ if(Python3_Interpreter_FOUND)
               --tool $<TARGET_FILE:ftlpu_opt>
               --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/gated_delta_rule.kernel.mlir
               --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gated_delta_rule)
+        add_test(NAME gated_delta_rule_binary_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gated_delta_rule_binary_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --runtime-test $<TARGET_FILE:compiled_gated_delta_rule_runtime_test>
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/gated_delta_rule.kernel.mlir
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gated_delta_rule_runtime)
+        add_test(NAME gdn_native_chunkwise_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdn_native_chunkwise_test.py
+            --runner $<TARGET_FILE:gdn_native_chunkwise_test>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gdn_native_chunkwise)
+        set_tests_properties(gdn_native_chunkwise_test PROPERTIES TIMEOUT 600)
+        add_test(NAME gdn_native_chunkwise_seq32_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdn_native_chunkwise_test.py
+            --runner $<TARGET_FILE:gdn_native_chunkwise_test>
+            --tokens 32
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gdn_native_chunkwise_seq32)
+        set_tests_properties(gdn_native_chunkwise_seq32_test PROPERTIES TIMEOUT 600)
+        add_test(NAME gdn_connected_chunkwise_seq32_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gated_delta_chunkwise_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/../../FTLPU-CMODEL/config/ftlpu-lpu32.json
+            --tokens 32 --head-dim 128
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gdn_connected_chunkwise_seq32)
+        set_tests_properties(gdn_connected_chunkwise_seq32_test PROPERTIES TIMEOUT 600)
+        add_test(NAME gdn_chunkwise_native_solve_oracle_integration_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdn_chunkwise_native_solve_integration_test.py
+            --runner $<TARGET_FILE:gdn_vector32_solve_system_test>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gdn_native_solve_oracle_integration)
+        add_test(NAME gated_delta_chunkwise_reference_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gated_delta_chunkwise_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${CMAKE_CURRENT_SOURCE_DIR}/../../FTLPU-CMODEL/config/ftlpu-lpu32.json
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gated_delta_chunkwise_reference
+            --tokens 64 --head-dim 128 --reference-only)
         add_test(NAME qwen3_5_compiled_decoder_layer_test
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen3_5_compiled_decoder_layer_test.py
@@ -888,6 +978,14 @@ if(Python3_Interpreter_FOUND)
             --compile $<TARGET_FILE:ftlpu_compile>
             --runner $<TARGET_FILE:compiled_stage_file_runner>
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/depthwise_conv_mirrored)
+        add_test(NAME chain_vxm_native_norm_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/l2norm_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --native-only
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/chain_native_norm)
         add_test(NAME l2norm_runtime_test
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/l2norm_runtime_test.py
@@ -975,6 +1073,14 @@ if(Python3_Interpreter_FOUND)
             --runner $<TARGET_FILE:compiled_stage_file_runner>
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gated_attention_decoder_layer_runtime)
+        add_test(NAME gdn_decode_graph_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdn_decode_graph_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gdn_decode_graph_runtime)
         foreach(native_vector_test packed_vector_graph_runtime_test vxm_queue_group_runtime_test vector_memory_plan_runtime_test)
           add_test(NAME ${native_vector_test}
             COMMAND ${Python3_EXECUTABLE}

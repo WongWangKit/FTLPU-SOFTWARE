@@ -1665,7 +1665,7 @@ std::size_t load_queue_programs_into_icu(
                         "VXM_STREAM_ND must target a VXM queue");
                 const auto descriptor =
                     decode_vxm_stream_nd_command(command);
-                const VxmSrCompactInstruction instruction {
+                const VxmCompactInstruction instruction {
                     static_cast<std::uint64_t>(
                         descriptor.instruction.words[0]) |
                         (static_cast<std::uint64_t>(
@@ -2025,7 +2025,7 @@ std::size_t load_queue_programs_into_icu(
                     throw std::logic_error("VXM queue command must carry one "
                                            "96-bit compact packet");
                 }
-                icu.enqueue_vxm(queue_index, VxmSrCompactInstruction {
+                icu.enqueue_vxm(queue_index, VxmCompactInstruction {
                     static_cast<std::uint64_t>(command.words[0])
                         | (static_cast<std::uint64_t>(command.words[1]) << 32),
                     command.words[2]});

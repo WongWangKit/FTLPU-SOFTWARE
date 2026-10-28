@@ -1521,10 +1521,10 @@ void run_test()
                 && queue.index == lowered.segments[0].mem_queue;
         });
     require(fragmentedMem != fragmentedIdleProgram.queues.end()
-            && fragmentedMem->commands.size() == 7
-            && decode_icu_control_raw_word(fragmentedMem->commands[2]).count == 89
-            && decode_fu_3d_raw_packet_loop(*fragmentedMem, 4).wait_cycle == 0,
-        "fragmented NOP/wait idle span introduced a false early page barrier");
+            && fragmentedMem->commands.size() == 6
+            && decode_icu_control_raw_word(fragmentedMem->commands[2]).event_tag == 0x3201
+            && decode_fu_3d_raw_packet_loop(*fragmentedMem, 3).wait_cycle == 0,
+        "fragmented idle span was not replaced by the page rendezvous");
 
     BinaryProgram groupedPagesProgram;
     auto groupedRead = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
@@ -1551,10 +1551,10 @@ void run_test()
                 && queue.index == lowered.segments[0].mem_queue;
         });
     require(groupedMem != groupedPagesProgram.queues.end()
-            && groupedMem->commands.size() == 9
-            && decode_icu_control_raw_word(groupedMem->commands[2]).count == 87
-            && decode_fu_3d_raw_packet_loop(*groupedMem, 6).wait_cycle == 0,
-        "three page waits at one boundary moved the following MEM wavefront");
+            && groupedMem->commands.size() == 8
+            && decode_icu_control_raw_word(groupedMem->commands[2]).event_tag == 0x3500
+            && decode_fu_3d_raw_packet_loop(*groupedMem, 5).wait_cycle == 0,
+        "three page waits retained idle transport time before the rendezvous");
 
     BinaryProgram mergedBoundaryProgram;
     auto mergedRead = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
@@ -1668,6 +1668,34 @@ void run_test()
                 static_cast<std::size_t>(ownWait + 1
                     - earlyMem->commands.begin())).wait_cycle == 0,
         "late prefetch replayed static idle time before its consumer rendezvous");
+
+    // A single consumer epoch must also replace idle time after WRITE_SYNC;
+    // this must not depend on skipping an unrelated earlier epoch.
+    BinaryProgram ownJoinProgram;
+    auto ownRead = raw_mem_3d_commands(isa::encode_mem_icu_3d_instruction(
+        MemIcuInstruction::Read3D(IcuLoop3D {0, {1, 1, 1}, {1, 1, 1}},
+            MemIcuAddress3D::Affine(next_row, {1, 0, 0}), StreamId::East(0))));
+    ownRead.insert(ownRead.begin(), encode_icu_control_raw_word(
+        IcuControlInstruction::Nop(300)));
+    ownJoinProgram.queues.push_back(QueueProgram {QueueKind::Mem,
+        lowered.segments[0].mem_queue, std::move(ownRead)});
+    auto ownJoinSystem = std::make_unique<C2cDmaSystem>();
+    C2cWeightPager ownJoinPager(*ownJoinSystem);
+    ownJoinPager.begin_schedule(ownJoinProgram);
+    static_cast<void>(ownJoinPager.schedule(ownJoinProgram,
+        logicalPage, 0, 60, 300, 0x3450, 0x3451));
+    ownJoinPager.finalize_schedule(ownJoinProgram);
+    const auto ownMem = std::ranges::find_if(ownJoinProgram.queues,
+        [&](const QueueProgram& queue) {
+            return queue.kind == QueueKind::Mem
+                && queue.index == lowered.segments[0].mem_queue;
+        });
+    require(ownMem != ownJoinProgram.queues.end()
+            && ownMem->commands.size() == 6
+            && is_mem_synchronized_raw_packet_header(ownMem->commands[0])
+            && decode_icu_control_raw_word(ownMem->commands[2]).event_tag == 0x3451
+            && decode_fu_3d_raw_packet_loop(*ownMem, 3).wait_cycle == 0,
+        "single page consumer retained a static post-transport NOP");
 
     C2cWeightPage multiQueuePage;
     multiQueuePage.layer = 2;

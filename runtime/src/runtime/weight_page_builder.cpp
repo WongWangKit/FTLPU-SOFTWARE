@@ -255,7 +255,8 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
     const bool packedPlanar = binding.layout == BindingLayout::Fp16PairPlanar
         || binding.layout == BindingLayout::Fp32QuadPlanar;
     const bool tokenPartition = binding.layout == BindingLayout::TokenPartitionPlanar;
-    if (scalarPlanar || packedPlanar || tokenPartition) {
+    const bool columnPartition = binding.layout == BindingLayout::ColumnPartitionPlanar;
+    if (scalarPlanar || packedPlanar || tokenPartition || columnPartition) {
         const std::size_t width = hardware.bytes_per_word;
         const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
         if ((bytes == 4 && binding.element_type != BindingElementType::F32)
@@ -266,14 +267,18 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         if (tokenPartition && binding.hemisphere_mask != 3)
             throw std::invalid_argument("token-partitioned planar binding requires both hemispheres");
         const auto half = (rows + 1) / 2;
+        const auto halfColumns = (columns + 1) / 2;
+        if (columnPartition && (binding.hemisphere_mask != 3 || columns % (2 * width)))
+            throw std::invalid_argument("column partition requires two aligned column halves");
         for (std::size_t row = 0; row < rows; ++row)
             for (std::size_t column = 0; column < columns; ++column) {
-                const auto word = tokenPartition ? (column / width) * half + row % half : scalarPlanar ? row * columns + column
+                const auto word = columnPartition ? ((column % halfColumns) / width) * rows + row : tokenPartition ? (column / width) * half + row % half : scalarPlanar ? row * columns + column
                     : (column / width) * rows + row;
                 const auto address = base + static_cast<std::uint32_t>(word) * stride;
                 const auto offset = (row * columns + column) * bytes;
                 for_each_hemisphere(binding, [&](std::uint16_t hemisphere) {
                     if (tokenPartition && hemisphere != (row < half ? 1 : 0)) return;
+                    if (columnPartition && hemisphere != (column < halfColumns ? 0 : 1)) return;
                     for (std::size_t byte = 0; byte < bytes; ++byte)
                         for (std::size_t lane = scalarPlanar ? 0 : column % width;
                              lane < (scalarPlanar ? width : column % width + 1); ++lane)
@@ -473,6 +478,29 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         return image.finish();
     }
 
+    if (binding.layout == BindingLayout::Fp16MxmActivationPlanar
+        && (binding.element_type == BindingElementType::F16
+            || binding.element_type == BindingElementType::BF16)
+        && binding.slices.size() == 4) {
+        const auto width = hardware.bytes_per_word;
+        if (binding.shape.size() != 2 || width == 0 || columns % width)
+            throw std::invalid_argument("MXM planar activation requires aligned columns");
+        for (std::size_t row = 0; row < rows; ++row)
+            for (std::size_t column = 0; column < columns; ++column) {
+                const auto address = base + static_cast<std::uint32_t>(
+                    (column / width) * rows + row) * stride;
+                const auto offset = (row * columns + column) * 2;
+                for_each_hemisphere(binding, [&](std::uint16_t hemisphere) {
+                    for (std::size_t pair = 0; pair < 2; ++pair)
+                        for (std::size_t byte = 0; byte < 2; ++byte)
+                            image.write(hemisphere, binding.slices[2 * pair + byte],
+                                address, static_cast<std::uint32_t>(column % width),
+                                data[offset + byte]);
+                });
+            }
+        return image.finish();
+    }
+
     if (binding.layout == BindingLayout::Vector) {
         if (binding.slices.size() != 1 || columns > hardware.bytes_per_word)
             throw std::invalid_argument("unsupported vector weight binding");
@@ -554,7 +582,7 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
     if (binding.layout == BindingLayout::Fp16VxmGammaBroadcast
         && (binding.element_type == BindingElementType::F16
             || binding.element_type == BindingElementType::BF16)
-        && (binding.slices.size() == 2 || binding.slices.size() == 4)) {
+        && (!binding.slices.empty() && binding.slices.size() % 2 == 0)) {
         if (binding.shape.size() != 1)
             throw std::invalid_argument(
                 "VXM gamma broadcast weight must be a vector");
@@ -845,7 +873,8 @@ std::vector<std::uint8_t> unpack_binding_image(
     const bool packedPlanar = binding.layout == BindingLayout::Fp16PairPlanar
         || binding.layout == BindingLayout::Fp32QuadPlanar;
     const bool tokenPartition = binding.layout == BindingLayout::TokenPartitionPlanar;
-    if (scalarPlanar || packedPlanar || tokenPartition) {
+    const bool columnPartition = binding.layout == BindingLayout::ColumnPartitionPlanar;
+    if (scalarPlanar || packedPlanar || tokenPartition || columnPartition) {
         const std::size_t width = hardware.bytes_per_word;
         const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
         if (binding.slices.size() != bytes || binding.address_stride <= 0)
@@ -859,14 +888,17 @@ std::vector<std::uint8_t> unpack_binding_image(
         if (tokenPartition && binding.hemisphere_mask != 3)
             throw std::invalid_argument("token-partitioned planar binding requires both hemispheres");
         const auto half = (rows + 1) / 2;
+        const auto halfColumns = (columns + 1) / 2;
+        if (columnPartition && (binding.hemisphere_mask != 3 || columns % (2 * width)))
+            throw std::invalid_argument("column partition requires two aligned column halves");
         for (std::size_t row = 0; row < rows; ++row)
             for (std::size_t column = 0; column < columns; ++column) {
-                const auto word = tokenPartition ? (column / width) * half + row % half : scalarPlanar ? row * columns + column
+                const auto word = columnPartition ? ((column % halfColumns) / width) * rows + row : tokenPartition ? (column / width) * half + row % half : scalarPlanar ? row * columns + column
                     : (column / width) * rows + row;
                 const auto address = static_cast<std::uint32_t>(binding.base_row)
                     + static_cast<std::uint32_t>(word) * static_cast<std::uint32_t>(binding.address_stride);
                 for (std::size_t byte = 0; byte < bytes; ++byte)
-                    result[(row * columns + column) * bytes + byte] = read(tokenPartition ? (row < half ? 1 : 0) : hemisphere,
+                    result[(row * columns + column) * bytes + byte] = read(columnPartition ? (column < halfColumns ? 0 : 1) : tokenPartition ? (row < half ? 1 : 0) : hemisphere,
                         binding.slices[byte], address, scalarPlanar ? 0 : static_cast<std::uint32_t>(column % width));
             }
         return result;
@@ -1059,6 +1091,30 @@ std::vector<std::uint8_t> unpack_binding_image(
         return result;
     }
 
+    if (binding.layout == BindingLayout::Fp16MxmActivationPlanar
+        && (binding.element_type == BindingElementType::F16
+            || binding.element_type == BindingElementType::BF16)
+        && binding.slices.size() == 4) {
+        const auto width = hardware.bytes_per_word;
+        if (binding.shape.size() != 2 || width == 0 || columns % width
+            || binding.address_stride <= 0)
+            throw std::invalid_argument("MXM planar activation requires aligned columns");
+        std::uint16_t hemisphere = 0;
+        while (hemisphere < hardware.hemispheres
+            && !(binding.hemisphere_mask & (1u << hemisphere))) ++hemisphere;
+        if (hemisphere == hardware.hemispheres)
+            throw std::invalid_argument("MXM activation has no enabled hemisphere");
+        std::vector<std::uint8_t> result(static_cast<std::size_t>(binding.byte_size));
+        for (std::size_t row = 0; row < rows; ++row)
+            for (std::size_t column = 0; column < columns; ++column) {
+                const auto address = static_cast<std::uint32_t>(binding.base_row
+                    + ((column / width) * rows + row) * binding.address_stride);
+                for (std::size_t byte = 0; byte < 2; ++byte)
+                    result[(row * columns + column) * 2 + byte] = read(hemisphere,
+                        binding.slices[byte], address, static_cast<std::uint32_t>(column % width));
+            }
+        return result;
+    }
     throw std::invalid_argument(
         "offline C2C unpacking does not support this binding layout");
 }
@@ -1068,6 +1124,13 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
     std::span<const std::uint8_t> data,
     const ExecutableHardwareConfig& hardware)
 {
+    if (binding.role == "prefetch.input") {
+        if (!binding.paged_weight || binding.page_count != 1 || page_index != 0)
+            throw std::invalid_argument("prefetched input must describe one complete physical image");
+        auto physical = binding;
+        physical.paged_weight = false;
+        return pack_binding_image(physical, data, hardware);
+    }
     if (binding.rope_rotary_dim && binding.rope_rotary_dim < binding.rope_head_dim) {
         auto physical = binding;
         physical.rope_rotary_dim = 0;
@@ -1135,6 +1198,7 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
     if (!binding.paged_weight || binding.role != "weight"
         || binding.element_type != BindingElementType::I8
         || (binding.layout != BindingLayout::W8A16MxmWeightWaveStriped
+            && binding.layout != BindingLayout::W8A16MxmWeightWaveSplitDense
             && binding.layout != BindingLayout::W8A16MxmWeightStriped
             && binding.layout != BindingLayout::W8A16MxmWeightReplicated
             && binding.layout
@@ -1179,8 +1243,10 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
     constexpr std::size_t loadSlices = 8;
     constexpr std::size_t logicalSlots = 2;
     const std::size_t rowsPerLoad = hardware.tile_rows;
-    const bool ffnWave =
-        binding.layout == BindingLayout::W8A16MxmWeightWaveStriped;
+    const bool denseSplitDown =
+        binding.layout == BindingLayout::W8A16MxmWeightWaveSplitDense;
+    const bool ffnWave = denseSplitDown
+        || binding.layout == BindingLayout::W8A16MxmWeightWaveStriped;
     // A channel-tiled FFN can have a Down matrix with fewer reduction rows
     // than output columns.  Shape alone cannot distinguish it from Gate/Up:
     // projection pages cover pairs of output tiles, whereas Down pages cover
@@ -1190,8 +1256,8 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
     const std::size_t projectionPages =
         (projectionItems + binding.page_granularity - 1)
         / binding.page_granularity;
-    const bool projection = ffnWave
-        ? binding.page_count == projectionPages : rows < columns;
+    const bool projection = !denseSplitDown && (ffnWave
+        ? binding.page_count == projectionPages : rows < columns);
     // Q/K/V guard individual output tiles; O and Down consume tile pairs.
     // Keep those tail rules in target units, including replicated projections
     // and the page-count-based Gate/Up versus channel-tiled Down distinction.
@@ -1211,6 +1277,9 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
         && storageGroups >= 4
         && pagePlacement.slice_group_base + pagePlacement.slice_group_count
             <= storageGroups / 2;
+    if (denseSplitDown && !splitDualMxmDownSlots)
+        throw std::invalid_argument(
+            "dense split Down weights require disjoint MXM slice groups");
     const std::uint64_t pageBegin = pagePlacement.base_row;
     const std::uint64_t pageEnd = pageBegin + pagePlacement.row_count;
     const std::uint64_t bindingBase =
@@ -1385,8 +1454,8 @@ PackedWeightImage pack_weight_binding_page(const BinaryBinding& binding,
                       + reduction)
                         * logicalSlots * rowsPerLoad
                     + slot * rowsPerLoad + pulse
-                : localItem * logicalSlots * rowsPerLoad
-                    + slot * rowsPerLoad + pulse);
+                : localItem * (denseSplitDown ? 1 : logicalSlots) * rowsPerLoad
+                    + (denseSplitDown ? 0 : slot * rowsPerLoad) + pulse);
             image.write(hemisphere, slice,
                 physicalRow(address),
                 static_cast<std::uint32_t>(k % reductionWidth),

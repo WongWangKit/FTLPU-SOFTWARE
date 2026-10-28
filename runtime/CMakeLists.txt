@@ -1,8 +1,32 @@
+# Isolated native-FU mapping test: intentionally does not depend on the legacy
+# runtime codec while the compiler/runtime VXM ABI is being migrated.
+add_executable(gdn_vector32_solve_test tests/runtime/gdn_vector32_solve_test.cpp)
+target_include_directories(gdn_vector32_solve_test PRIVATE
+    "${CMAKE_SOURCE_DIR}/compiler/include"
+    "${FTLPU_GENERATED_INCLUDE_DIR}" "${FTLPU_CMODEL_DIR}/include")
+add_test(NAME gdn_vector32_solve_test COMMAND gdn_vector32_solve_test
+    "${CMAKE_CURRENT_BINARY_DIR}/gdn_vector32_solve_results")
+
 add_library(ftlpu_cmodel_static STATIC
     src/cmodel/cmodel_static.cpp
     "${FTLPU_CMODEL_DIR}/src/mem/sram.cpp"
     "${FTLPU_CMODEL_DIR}/src/mxm/accumulator.cpp"
     "${FTLPU_CMODEL_DIR}/src/system/stream_topology_builder.cpp")
+
+add_executable(gdn_vector32_solve_system_test tests/runtime/gdn_vector32_solve_system_test.cpp)
+add_executable(gdn_native_chunkwise_test tests/runtime/gdn_native_chunkwise_test.cpp)
+target_include_directories(gdn_native_chunkwise_test PRIVATE "${CMAKE_SOURCE_DIR}/compiler/include")
+target_link_libraries(gdn_native_chunkwise_test PRIVATE ftlpu_cmodel_static)
+set_source_files_properties(tests/runtime/gdn_native_chunkwise_test.cpp PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_SOURCE_DIR}/compiler/include/ftlpu/compiler/Target/gdn_native_schedule.hpp")
+set_source_files_properties(tests/runtime/gdn_vector32_solve_system_test.cpp PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_SOURCE_DIR}/compiler/include/ftlpu/compiler/Target/vector32_triangular_schedule.hpp;${CMAKE_SOURCE_DIR}/compiler/include/ftlpu/compiler/Target/vector32_triangular_solve.hpp")
+target_include_directories(gdn_vector32_solve_system_test PRIVATE "${CMAKE_SOURCE_DIR}/compiler/include")
+target_link_libraries(gdn_vector32_solve_system_test PRIVATE ftlpu_cmodel_static)
+add_test(NAME gdn_vector32_solve_system_test COMMAND gdn_vector32_solve_system_test
+    "${CMAKE_CURRENT_BINARY_DIR}/gdn_vector32_solve_system_results")
+add_test(NAME gdn_vector32_solve_packed_system_test COMMAND gdn_vector32_solve_system_test
+    "${CMAKE_CURRENT_BINARY_DIR}/gdn_vector32_solve_packed_results" --packed-coefficients)
 
 file(GLOB_RECURSE FTLPU_CMODEL_PUBLIC_HEADERS CONFIGURE_DEPENDS
     "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
@@ -123,6 +147,8 @@ target_link_libraries(ftlpu_software
 
 add_executable(ftlpu_binary_inspect examples/binary_inspect.cpp)
 target_link_libraries(ftlpu_binary_inspect PRIVATE ftlpu_software)
+add_executable(ftlpu_compare_compute_issues examples/compare_compute_issues.cpp)
+target_link_libraries(ftlpu_compare_compute_issues PRIVATE ftlpu_software)
 
 add_executable(macro_frontend_fetch_sweep examples/macro_frontend_fetch_sweep.cpp)
 target_link_libraries(macro_frontend_fetch_sweep PRIVATE ftlpu_software)
@@ -354,6 +380,9 @@ add_test(
     NAME weight_page_builder_target_tail_test
     COMMAND $<TARGET_FILE:weight_page_builder_test> --paged-output-tail)
 
+add_test(NAME dense_split_down_weight_page_test
+    COMMAND $<TARGET_FILE:weight_page_builder_test> --dense-split-down)
+
 add_executable(qwen_weight_page_builder_test
     tests/runtime/qwen_weight_page_builder_test.cpp)
 target_link_libraries(qwen_weight_page_builder_test PRIVATE ftlpu_software)
@@ -563,6 +592,8 @@ target_link_libraries(hf_decoder_stack_checkpoint_test
 
 add_executable(compiled_stage_file_runner tests/runtime/compiled_stage_file_runner.cpp)
 target_link_libraries(compiled_stage_file_runner PRIVATE ftlpu_software)
+add_executable(compiled_batch_file_runner tests/runtime/compiled_batch_file_runner.cpp)
+target_link_libraries(compiled_batch_file_runner PRIVATE ftlpu_software)
 add_executable(compiled_program_link_check tests/runtime/compiled_stage_file_runner.cpp)
 target_link_libraries(compiled_program_link_check PRIVATE ftlpu_software)
 target_compile_definitions(compiled_program_link_check PRIVATE FTLPU_FILE_RUNNER_LINK_CHECK=1)

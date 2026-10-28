@@ -128,7 +128,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                             * target_.memory().slices_per_hemisphere
                         + slice,
                     "write", address,
-                    destination * 8 + originalOutputStream + byte,
+                    (1 - destination) * 8 + originalOutputStream + byte,
                     count, repeatInterval, stride,
                     1, 1, 0, bank});
             }
@@ -196,32 +196,6 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
             "east", outputStream < 0 ? "east" : "west", -1,
             accumulatorReset, accumulatorWrite, accumulatorEmit,
             localScalarWrite, chainDepth);
-        const int64_t mirrorQueue =
-            target_.throughput().vxm_alus - 1 - queue;
-        const auto mirroredKind = [](llvm::StringRef kind) {
-            return kind == "previous" || kind == "feedback"
-                ? llvm::StringRef("alu") : kind;
-        };
-        const auto mirroredIndex = [&](llvm::StringRef kind, int64_t index) {
-            if (kind.starts_with("stream_")) return index + 16;
-            if (kind == "previous") return mirrorQueue + 1;
-            if (kind == "feedback")
-                return mirrorQueue - chainDepth + 1;
-            if (kind == "alu")
-                return target_.throughput().vxm_alus - 1 - index;
-            return index;
-        };
-        ffn_detail::create_vxm(rewriter_, op_.getLoc(),
-            op_.getInput(), op_.getInput(), op_.getInput().getType(),
-            cycle, mirrorQueue, opcode,
-            mirroredKind(lhsKind), mirroredIndex(lhsKind, lhsIndex),
-            lhsImmediate, mirroredKind(rhsKind),
-            mirroredIndex(rhsKind, rhsIndex), rhsImmediate,
-            castTarget, outputStream < 0 ? outputStream : outputStream + 8,
-            repeatCount, 1, "west",
-            outputStream < 0 ? "west" : "east", -1,
-            accumulatorReset, accumulatorWrite, accumulatorEmit,
-            localScalarWrite, chainDepth);
         return primary;
     };
 
@@ -277,7 +251,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                 maxBridgeWriteLatency = std::max(
                     maxBridgeWriteLatency, bridgeWriteLatency(slice));
             const int64_t mirrorWriteEnd = copyBridge
-                + maxBridgeWriteLatency + 1 + sequence - 1;
+                + maxBridgeWriteLatency + sequence - 1;
             for (int64_t byte = 0; byte < 2; ++byte) {
                 const int64_t slice = state.score_slices[byte];
                 mirrorTransfers.push_back({copyBridge - readLatency(slice),
@@ -287,7 +261,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                     "read", state.score_address, 32 + byte,
                     sequence, 1, 1, 1, 1, 0, scoreBank});
                 mirrorTransfers.push_back({
-                    copyBridge + bridgeWriteLatency(slice) + 1,
+                    copyBridge + bridgeWriteLatency(slice),
                     (1 - sourceHemisphere)
                             * target_.memory().slices_per_hemisphere
                         + slice,
@@ -348,12 +322,9 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         const int64_t generateOutput = generateInput + 2;
         planMirroredWrite(generateTransfers,
             state.x_slices, state.x_address, 0,
-            generateOutput, sequence, 1, expBank, 1,
-            // Queue 1 reverses a two-cycle Multiply result back through C1
-            // and the VXM/system boundary before local MEM can consume it.
-            3);
+            generateOutput, sequence, 1, expBank);
         cursor = generateOutput + maxWriteLatency(state.x_slices)
-            + 3 + sequence;
+            + sequence;
     }
     emitPlannedTransfers(generateTransfers);
 
@@ -382,12 +353,8 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
             maxInput, sequence, 1, expBank);
         planMirroredWrite(maxTransfers,
             state.score_slices, state.score_address, 0,
-            maxOutput, 1, 0, scoreBank, 1,
-            // The accumulator-emitting Queue 1 Max retires one cycle after a
-            // normal one-cycle Basic ALU result, then reverses through C1 and
-            // the VXM/system boundary.
-            3);
-        cursor = maxOutput + maxWriteLatency(state.score_slices) + 3 + 1;
+            maxOutput, 1, 0, scoreBank);
+        cursor = maxOutput + maxWriteLatency(state.score_slices) + 1;
     }
     emitPlannedTransfers(maxTransfers);
 
@@ -418,17 +385,19 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         vxm(sumConfig + 2, 3, "add", "previous", 0, 0.0f,
             "accumulator", 0, 0.0f, "fp32", -1, 1, 4,
             false, true, true);
-        // The physical SR fabric has no tail-to-head feedback path.  Queue 3
-        // owns the reduction accumulator, so reciprocal reads that scalar
-        // directly and writes the reciprocal back into the same local scalar
-        // register for the following normalize multiply.
-        // Queue 3 already holds the reset, body, and final accumulator
-        // configs.  Wait until its first config starts before enqueueing this
-        // fourth config into the three-entry Current/Next FIFO.
+        // Capture the final sum through the fixed C3->C0 feedback path.
+        // Queue this before the reduction tail finishes so feedback is armed.
+        vxm(sumConfig + 12, 0, "pass",
+            "feedback", 0, 0.0f, "immediate", 0, 0.0f,
+            "fp32", -1, 1, 4);
+        for (int64_t stage : {int64_t{1}, int64_t{2}})
+            vxm(sumConfig + 12, stage, "pass",
+                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+                "fp32", -1, 1, 4);
         vxm(sumConfig + 12, 3, "reciprocal",
-            "accumulator", 0, 0.0f, "immediate", 0, 0.0f,
+            "previous", 0, 0.0f, "immediate", 0, 0.0f,
             "fp32", -1, 1, 4, false, false, true, true);
-        const int64_t normalizeConfig = sumInput + sequence + 12;
+        const int64_t normalizeConfig = sumInput + sequence + 24;
         const int64_t normalizeInput = normalizeConfig + 1;
 
         planMirroredRead(normalizeTransfers,
@@ -457,7 +426,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         vxm(normalizeConfig, 2, "pass", "previous", 0, 0.0f,
             "immediate", 0, 0.0f, "fp32", -1, sequence, 4);
         vxm(normalizeConfig, 3, "multiply", "previous", 0, 0.0f,
-            "accumulator", 0, 0.0f, dataFormat, 4,
+            "accumulator", 0, 0.0f, dataFormat, 2,
             sequence, 4);
         constexpr int64_t normalizePipelineLatency = 8;
         const int64_t keysPerLane = sequence
@@ -475,13 +444,10 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                         static_cast<std::size_t>(packedStream + byte)];
                     const int64_t cycle = normalizeInput
                         + normalizePipelineLatency + lane
-                        + writeLatency(slice)
-                        // Queue 3 reverses a two-cycle Multiply result back
-                        // across three physical columns and the boundary.
-                        + 5;
+                        + writeLatency(slice);
                     const int64_t queue = destination
                         * target_.memory().slices_per_hemisphere + slice;
-                    const int64_t stream = destination * 8 + 4 + byte;
+                    const int64_t stream = (1 - destination) * 8 + 2 + byte;
                     probabilityPackComplete = std::max(
                         probabilityPackComplete,
                         cycle + (keysPerLane - 1)

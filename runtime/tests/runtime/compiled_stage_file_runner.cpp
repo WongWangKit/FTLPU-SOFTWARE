@@ -15,7 +15,7 @@
 #include <string>
 
 // Generic harness: no model arithmetic, shape transforms or reference outputs.
-// Each compiled stage executes its actual ICU program against uploaded bindings.
+// Each compiled stage executes its actual ICU program against C2C-uploaded bindings.
 int main(int argc, char** argv)
 try {
     using namespace ftlpu::software::runtime;
@@ -201,7 +201,8 @@ try {
     auto system = std::make_unique<ftlpu::TspSliceSystem>();
     CModelRuntime runtime(*system);
     if (argc == 5) runtime.enable_execution_trace();
-    runtime.load(program);
+    const auto segments=split_resident_program_at_drains(program);
+    runtime.load(segments.front());
     if (std::getenv("FTLPU_SESSION_LINK_ONLY") != nullptr) {
         write_binary_program(program, std::string(argv[3]) + ".runtime.ftlpu");
         std::cout << "linked_only=1 arithmetic_executed=0\n";
@@ -219,7 +220,20 @@ try {
         std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)), {});
         runtime.upload_input(index++, bytes);
     }
-    runtime.run_cycles(program.max_cycle + 128);
+    std::size_t cycleOffset=0;
+    for(std::size_t segment=0;segment<segments.size();++segment){
+        if(segment){
+            runtime.configure_execution_trace_segment(cycleOffset,true);
+            runtime.load(segments[segment],false);
+        }
+        const auto cycles=segments[segment].max_cycle+(segment+1==segments.size()?128:0);
+        try { runtime.run_cycles(cycles); }
+        catch (...) {
+            if (argc == 5) runtime.write_execution_trace_csv(argv[4]);
+            throw;
+        }
+        cycleOffset+=cycles;
+    }
     if (argc == 5) runtime.write_execution_trace_csv(argv[4]);
     std::size_t outputs = 0;
     for (const auto& binding : program.bindings) {
@@ -231,7 +245,7 @@ try {
         ++outputs;
     }
     if (!outputs) throw std::runtime_error("program has no output bindings");
-    std::cout << "cycles=" << program.max_cycle + 128 << " outputs=" << outputs << '\n';
+    std::cout << "cycles=" << cycleOffset << " outputs=" << outputs << " imem_segments=" << segments.size() << '\n';
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

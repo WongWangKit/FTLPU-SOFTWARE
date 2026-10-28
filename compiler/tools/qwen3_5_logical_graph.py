@@ -129,38 +129,52 @@ class LogicalGraph:
         path.write_text(json.dumps(result,separators=(',',':'))+'\n',encoding='utf-8')
         return path
 
-    def layer(self,x,weights,packed,scales,c):
+    def attention(self,x,weights,packed,scales,c,initial_state=None,conv_state=None):
         project=lambda name,value:self.project(name,value,packed[name],scales[name])
         n=self.norm('input_norm',x,bf16(1+weights.input_norm),c.rms_norm_eps)
         qkv=project('in_proj_qkv',n)
-        mixed=self.conv(qkv,weights.conv1d)
+        if conv_state is None:
+            mixed=self.conv(qkv,weights.conv1d)
+            next_conv=qkv[-c.conv_kernel_size:]
+        else:
+            history=np.asarray(conv_state,dtype=np.float32)
+            if history.shape != (c.conv_kernel_size,c.conv_width):
+                raise ValueError('Conv cache must be [kernel_size, channels]')
+            t=self.type(history.shape,'bf16')
+            source=f'''module {{ func.func @stage(%h: {t}) -> {t} {{
+              %o = ftlpu.kernel.reshape %h : ({t}) -> {t}
+              return %o : {t}
+            }} }}'''
+            cached=self.run('conv_cache_view',source,[(history,'bf16')],[(history.shape,'bf16')])[0]
+            window=Value.concatenate([cached[-(c.conv_kernel_size-1):],qkv])
+            mixed=self.conv(window,weights.conv1d)[-x.shape[0]:]
+            next_conv=window[-c.conv_kernel_size:]
         q=mixed[:,:c.key_width].reshape(-1,c.num_key_heads,c.key_head_dim).repeat(c.num_value_heads//c.num_key_heads,1).reshape(-1,c.key_head_dim)
         k=mixed[:,c.key_width:2*c.key_width].reshape(-1,c.num_key_heads,c.key_head_dim).repeat(c.num_value_heads//c.num_key_heads,1).reshape(-1,c.key_head_dim)
         v=mixed[:,2*c.key_width:]
         q=self.norm('query_l2',q,np.ones(c.key_head_dim,np.float32),1e-6,False,1/np.sqrt(c.key_head_dim)).reshape(x.shape[0],-1)
         k=self.norm('key_l2',k,np.ones(c.key_head_dim,np.float32),1e-6,False).reshape(x.shape[0],-1)
-        z=project('in_proj_z',n); b=project('in_proj_b',n); a=project('in_proj_a',n)
-        graph=VectorGraph(self,'delta_controls',[(b,'bf16'),(a,'bf16'),
-            (weights.dt_bias.reshape(1,-1),'f32'),(weights.a_log.reshape(1,-1),'f32')])
-        beta=graph.sigmoid(0)
-        biased=graph.add(1,2,kind='add')
-        softplus=graph.softplus(biased)
-        exponent=graph.add(3,kind='exp',immediate=0)
-        negative=graph.add(exponent,kind='negate',immediate=0)
-        logdecay=graph.add(softplus,negative)
-        decay=graph.add(logdecay,kind='exp',immediate=0)
-        beta,decay=graph.finish((beta,decay))
-        state=np.zeros((c.num_value_heads*c.key_head_dim,c.value_head_dim),np.float32)
+        z=project('in_proj_z',n)
+        beta,logdecay=self.gates(n,packed,scales,weights.dt_bias,weights.a_log)
+        decay=self.vector_tiles('delta_decay',[(logdecay,'f32')],
+            lambda g:g.add(0,kind='exp',immediate=0))
+        state=np.zeros((c.num_value_heads*c.key_head_dim,c.value_head_dim),np.float32) if initial_state is None else np.asarray(initial_state,dtype=np.float32).reshape(c.num_value_heads*c.key_head_dim,c.value_head_dim)
         core,state=self.delta(q,k,v,decay,beta,state,c)
-        def norm_gate(graph):
-            normalized=graph.norm(0,1,c.rms_norm_eps)
-            gate=graph.add(2,graph.sigmoid(2),dtype='bf16')
-            return graph.add(normalized,gate,dtype='bf16')
-        gated=self.vector_tiles('delta_norm_gate',[(core.reshape(-1,c.value_head_dim),'bf16'),
-            (weights.delta_norm.reshape(1,-1),'f32'),(z.reshape(-1,c.value_head_dim),'bf16')],norm_gate).reshape(core.shape)
+        normalized=self.norm('delta_output_norm',core.reshape(-1,c.value_head_dim),
+            weights.delta_norm,c.rms_norm_eps).reshape(core.shape)
+        def apply_gate(graph):
+            gate=graph.add(1,graph.sigmoid(1),dtype='bf16')
+            return graph.add(0,gate,dtype='bf16')
+        gated=self.vector_tiles('delta_output_gate',[(normalized,'bf16'),(z,'bf16')],apply_gate)
         attention=project('out_proj',gated)
+        self.attention_stages=dict(normalized_input=n,qkv=qkv,conv=mixed,q=q,k=k,v=v,
+            beta=beta,decay=decay,core=core,normalized_output=normalized,z=z,gated=gated)
+        return attention,state,next_conv
+
+    def layer(self,x,weights,packed,scales,c):
+        attention,state,conv_state=self.attention(x,weights,packed,scales,c)
         residual=self.vector_tiles('residual0',[(x,'bf16'),(attention,'bf16')],lambda g:g.add(0,1,kind='add',dtype='bf16'))
         ffn=self.norm('post_attention_norm',residual,bf16(1+weights.post_attention_norm),c.rms_norm_eps)
         down=self.ffn(ffn,packed,scales)
         output=self.vector_tiles('output',[(residual,'bf16'),(down,'bf16')],lambda g:g.add(0,1,kind='add',dtype='bf16'))
-        return output,state,qkv[-c.conv_kernel_size:]
+        return output,state,conv_state

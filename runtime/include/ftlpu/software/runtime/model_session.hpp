@@ -31,6 +31,7 @@ struct ModelSessionStats {
     std::size_t state_page_out_cycles{0};
     std::size_t host_uploads{0};
     std::size_t host_downloads{0};
+    std::size_t prefetched_input_hits{0};
     std::size_t c2c_ingress_bytes{0};
     std::size_t c2c_ingress_cycles{0};
     std::size_t c2c_egress_bytes{0};
@@ -192,6 +193,8 @@ private:
     std::unordered_map<std::string, std::vector<std::uint8_t>> values_{};
     std::unordered_set<std::string> host_input_overrides_{};
     std::unordered_map<std::string, DeviceValue> device_values_{};
+    std::unordered_map<std::string, DeviceValue> prefetched_inputs_{};
+    std::optional<std::size_t> prefetched_input_consumer_{};
     // Logical persistent states live in DDR-facing session storage. Each
     // invocation pages its executable-sized window through C2C into SRAM.
     std::unordered_map<std::string, std::vector<std::uint8_t>> state_backing_{};

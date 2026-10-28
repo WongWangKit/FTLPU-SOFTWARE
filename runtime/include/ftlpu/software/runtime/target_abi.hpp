@@ -55,7 +55,9 @@ struct ExecutableHardwareConfig {
     std::uint32_t vxm_cross_hemisphere_streams_enabled{1};
     // Reserved to preserve the command ABI field offsets used by v26+.
     // VXM has no fused multiply opcode; new executables always write zero.
-    std::uint32_t vxm_reserved_feature{0};
+    // ISA discriminator: 0 = retired explicit-SR VALU, 1 = mirrored chain.
+    // Packet width is identical, so old programs must not be reinterpreted.
+    std::uint32_t vxm_reserved_feature{1};
     std::uint32_t vxm_weight_to_iw_latency{16};
     std::uint32_t mem_to_sxm_latency{14};
     std::uint32_t mem_to_mxm_latency{16};

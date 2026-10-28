@@ -18,7 +18,7 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
         && rhsType.getElementType().isInteger(8)
         && is_lpu_16bit_float(resultType.getElementType());
     if (w8a16) {
-        if (op.getM() % tile || op.getN() % (2 * tile)
+        if ((op.getM() > tile && op.getM() % tile) || op.getN() % (2 * tile)
             || op.getK() % tile) {
             op.emitError(
                 "W8A16 linear projection requires M/K aligned to the "

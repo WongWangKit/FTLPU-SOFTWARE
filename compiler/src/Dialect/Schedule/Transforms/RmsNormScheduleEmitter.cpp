@@ -1037,38 +1037,6 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             "east", "east", -1, accumulatorReset,
             accumulatorWrite, accumulatorEmit, localScalarWrite,
             chainDepth);
-        // Both VXM hemispheres have independent physical ICU queues.  The
-        // west-side MEM reads use the corresponding stream indices in the
-        // second fabric, so issue the same operation to the second half of
-        // the configured physical columns instead of relying on implicit
-        // mirroring.
-        const int64_t mirrorQueue =
-            target.throughput().vxm_alus - 1 - queue;
-        const auto mirroredKind = [](llvm::StringRef kind) {
-            return kind == "previous" || kind == "feedback"
-                ? llvm::StringRef("alu") : kind;
-        };
-        const auto mirroredIndex = [&](llvm::StringRef kind, int64_t index) {
-            if (kind == "stream_bf16" || kind == "stream_fp16")
-                return index + 16;
-            if (kind == "previous") return mirrorQueue + 1;
-            if (kind == "feedback")
-                return mirrorQueue - chainDepth + 1;
-            if (kind == "alu")
-                return target.throughput().vxm_alus - 1 - index;
-            return index;
-        };
-        create_vxm(rewriter, location, input,
-            weight, inputType, cycle,
-            mirrorQueue, opcode,
-            mirroredKind(lhsKind), mirroredIndex(lhsKind, lhsIndex),
-            lhsImmediate, mirroredKind(rhsKind),
-            mirroredIndex(rhsKind, rhsIndex), rhsImmediate,
-            castTarget, outputStream < 0 ? outputStream : outputStream + 8,
-            repeatCount, 1,
-            "west", "west", -1, accumulatorReset,
-            accumulatorWrite, accumulatorEmit, localScalarWrite,
-            chainDepth);
         return primary;
     };
     const auto emitMirroredPairRead =
@@ -1109,15 +1077,10 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
         for (int64_t destination = 0;
              destination < target.memory().hemispheres; ++destination) {
             const int64_t source = 1 - destination;
-            // East chains occupy C0, C1, ... while their west mirrors occupy
-            // C15, C14, ... . Their final values therefore have identical
-            // distances to the corresponding VXM boundary.
-            const int64_t vxmSrTraversal =
-                target.throughput().vxm_alus - originalOutputStream;
             for (int64_t byte = 0; byte < byteCount; ++byte) {
                 const int64_t slice = memorySlices[byte];
                 const int64_t startCycle = outputCycle
-                    + writeLatency(slice) + vxmSrTraversal;
+                    + writeLatency(slice);
                 emitMem3D(rewriter, location, target,
                     startCycle,
                     destination * target.memory().slices_per_hemisphere
@@ -1137,28 +1100,37 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
         const int64_t reductionInput = cycle
             + maxReadLatency(inputSlices) + 1;
         const int64_t reductionConfig = reductionInput - 1;
-        vxm(reductionConfig, 0, "multiply",
-            streamKind, 32, 0.0f, streamKind, 32, 0.0f,
-            "fp32", -1, hidden, 2);
-        vxm(reductionConfig, 1, "add",
+        // Preserve x in the chain token; C1 squares Previous * Original.
+        // This avoids asking both fixed input ports to read the same stream.
+        vxm(reductionConfig, 0, "pass",
+            streamKind, 32, 0.0f, "immediate", 0, 0.0f,
+            "fp32", -1, hidden, 4);
+        vxm(reductionConfig, 1, "multiply",
+            "previous", 0, 0.0f, "original", 0, 0.0f,
+            "fp32", -1, hidden, 4);
+        vxm(reductionConfig, 2, "pass",
+            "previous", 0, 0.0f, "immediate", 0, 0.0f,
+            "fp32", -1, hidden, 4);
+        vxm(reductionConfig, 3, "add",
             "previous", 0, 0.0f, "accumulator", 0, 0.0f,
-            "fp32", -1, 1, 2, true, true, false);
-        vxm(reductionConfig + 1, 1, "add",
+            "fp32", -1, 1, 4, true, true, false);
+        if (hidden > 2)
+            vxm(reductionConfig + 1, 3, "add",
+                "previous", 0, 0.0f, "accumulator", 0, 0.0f,
+                "fp32", -1, hidden - 2, 4, false, true, false);
+        vxm(reductionConfig + 2, 3, "add",
             "previous", 0, 0.0f, "accumulator", 0, 0.0f,
-            "fp32", -1, hidden - 2, 2, false, true, false);
-        vxm(reductionConfig + 2, 1, "add",
-            "previous", 0, 0.0f, "accumulator", 0, 0.0f,
-            dataFormat, 0, 1, 2, false, true, true);
+            dataFormat, 2, 1, 4, false, true, true);
 
         const int64_t featuresPerPair = hidden / lanes;
         const int64_t scalarAddress = baseRow(inputPlacement)
             + distributedRows + tokenBlock;
-        const int64_t sumOutput = reductionInput + hidden + 1;
+        const int64_t sumOutput = reductionInput + hidden + 3;
         const auto scalarSlices =
             llvm::ArrayRef<int64_t>(inputSlices).take_front(2);
         const int64_t scalarWriteEnd = sumOutput
             + maxWriteLatency(scalarSlices)
-            + target.throughput().vxm_alus + 2;
+            + 2;
         const int64_t factorInput = scalarWriteEnd
             + maxReadLatency(scalarSlices) + 1;
         const int64_t normalizeInput = factorInput + 10;
@@ -1196,32 +1168,36 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
         }
 
         emitMirroredWrite(llvm::ArrayRef<int64_t>(inputSlices).take_front(2),
-            scalarAddress, 0, sumOutput, 2, bank(inputPlacement));
+            scalarAddress, 2, sumOutput, 2, bank(inputPlacement));
 
         const int64_t factorConfig = factorInput - 1;
+        // The LUT ingress is FP16 with flush-to-zero. Scale the positive
+        // sum+epsilon before RSQRT, then undo that scale in normalization.
+        const float lookupScale = epsilon > 0.0 && epsilon < 0x1p-14
+            ? std::exp2(std::ceil(std::log2(0x1p-14 / epsilon))) : 1.0f;
         if (l2Norm) {
-            // L2 uses the sum directly: no mean, no gamma tensor, no
-            // epsilon rescaling. Keep the scalar in C3/C12 as in the
-            // shared feedback data path; scale is an FP32 immediate.
+            // L2 uses sum+epsilon rather than mean+epsilon. Keep the
+            // lookup result in C3/C11; normalize compensates lookupScale
+            // and applies the requested output scale as an FP32 immediate.
             vxm(factorConfig, 0, "add",
                 streamKind, 32, 0.0f, "immediate", 0,
                 static_cast<float>(epsilon), "fp32", -1, 1, 4);
-            vxm(factorConfig, 1, "rsqrt",
-                "previous", 0, 0.0f, "immediate", 0, 0.0f,
+            vxm(factorConfig, 1, "multiply",
+                "previous", 0, 0.0f, "immediate", 0, lookupScale,
                 "fp32", -1, 1, 4);
             vxm(factorConfig, 2, "pass",
                 "previous", 0, 0.0f, "immediate", 0, 0.0f,
                 "fp32", -1, 1, 4);
-            vxm(factorConfig, 3, "multiply",
-                "previous", 0, 0.0f, "immediate", 0, outputScale,
+            vxm(factorConfig, 3, "rsqrt",
+                "previous", 0, 0.0f, "immediate", 0, 0.0f,
                 "fp32", -1, 1, 4, false, false, true, true);
         } else {
             vxm(factorConfig, 0, "multiply",
                 streamKind, 32, 0.0f, "immediate", 0,
-                1.0f / static_cast<float>(hidden), "fp32", -1, 1, 4);
+                lookupScale / static_cast<float>(hidden), "fp32", -1, 1, 4);
             vxm(factorConfig, 1, "add",
                 "previous", 0, 0.0f, "immediate", 0,
-                static_cast<float>(epsilon),
+                static_cast<float>(epsilon) * lookupScale,
                 "fp32", -1, 1, 4);
             vxm(factorConfig, 2, "pass",
                 "previous", 0, 0.0f, "immediate", 0, 0.0f,
@@ -1234,15 +1210,15 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             factorInput, bank(inputPlacement));
 
         const int64_t normalizeConfig = normalizeInput - 1;
-        vxm(normalizeConfig, 0, l2Norm ? "pass" : "multiply",
+        vxm(normalizeConfig, 0, "multiply",
             streamKind, 32, 0.0f, l2Norm ? "immediate" : streamKind,
-            l2Norm ? 0 : 34, 0.0f,
+            l2Norm ? 0 : 34, l2Norm ? outputScale * std::sqrt(lookupScale) : 0.0f,
             "fp32", -1, hidden, 4);
         vxm(normalizeConfig, 1, "pass",
             "previous", 0, 0.0f, "immediate", 0, 0.0f,
             "fp32", -1, hidden, 4);
-        vxm(normalizeConfig, 2, "pass",
-            "previous", 0, 0.0f, "immediate", 0, 0.0f,
+        vxm(normalizeConfig, 2, l2Norm ? "pass" : "multiply",
+            "previous", 0, 0.0f, "immediate", 0, std::sqrt(lookupScale),
             "fp32", -1, hidden, 4);
         vxm(normalizeConfig, 3, "multiply",
             "previous", 0, 0.0f, "accumulator", 0, 0.0f,
@@ -1267,9 +1243,9 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                     baseRow(weightPlacement), 2,
                     normalizeInput + pair, bank(weightPlacement),
                     inputBindingIndex(weight), featuresPerPair, lanes, 1);
-            // L2 forwards x at C0 instead of multiplying by gamma: bypass
-            // takes one cycle, whereas the hardware multiply takes two.
-            const int64_t outputCycle = normalizeInput + pair + (l2Norm ? 4 : 5);
+            // C0 multiplies by gamma for RMSNorm or the immediate output
+            // scale for L2Norm; both have the same two-cycle latency.
+            const int64_t outputCycle = normalizeInput + pair + (l2Norm ? 5 : 6);
             const auto outputPair =
                 llvm::ArrayRef<int64_t>(outputSlices).slice(2 * pair, 2);
             emitMirroredWrite(outputPair, outputAddress, 2,
@@ -1278,7 +1254,7 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             normalizeWriteEnd = std::max(normalizeWriteEnd,
                 outputCycle + (featuresPerPair - 1) * lanes
                     + maxWriteLatency(outputPair)
-                    + target.throughput().vxm_alus + 4);
+                    + 2);
         }
         if (broadcastWeight) {
             const int64_t segmentRows = weightPlacement
@@ -1813,7 +1789,7 @@ mlir::LogicalResult lowerL2NormSchedules(mlir::IRRewriter& rewriter,
                         for (int64_t p = 0; p < static_cast<int64_t>(ids.size()); ++p) {
                             const int64_t slice = ids[p];
                             const int64_t group = slice / target.streams().mem_slices_per_register_group;
-                            const int64_t latency = 2 * group + target.throughput().vxm_alus + 3;
+                            const int64_t latency = 2 * group + 2;
                             emitMem3D(rewriter, op.getLoc(), target, cycle,
                                 side * target.memory().slices_per_hemisphere + slice,
                                 "read", baseRow(feedbackInput), 48 + p,

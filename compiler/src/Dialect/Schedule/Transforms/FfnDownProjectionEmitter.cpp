@@ -42,6 +42,9 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         && hiddenKind.getValue() == "fp16_mxm_distributed_16";
 
     const auto downPlacement = context.down_weight_placement;
+    const auto downKind = downPlacement.getAs<mlir::StringAttr>("kind");
+    const bool denseSplitDown = downKind
+        && downKind.getValue() == "w8a16_mxm_weight_wave_split_dense";
     int64_t reductionsPerWeightPage = 0;
     if (const auto paged = downPlacement.getAs<mlir::BoolAttr>(
             "paged_weight"); paged && paged.getValue()) {
@@ -78,7 +81,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
     });
     rewriter.create(hiddenBinding);
     auto downLastSwishCycle = swish.last_cycle;
-    if (reductionsPerWeightPage > 0 && requestsRawMacroBarriers(ffn.getOperation())) {
+    if (reductionsPerWeightPage > 0 && requestsCommonBarriers(ffn.getOperation())) {
         // emitFfnSwish includes every owner-to-peer hidden SRAM mirror. Its
         // final MEM issue is a stable functional boundary: Gate/Up temporaries
         // are dead and Down consumes the materialized hidden value. Charge a
@@ -533,10 +536,15 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             llvm::cast<mlir::IntegerAttr>(
                                 storage[physicalSliceGroup * loadSliceCount + index])
                                 .getInt());
+                    if (denseSplitDown && !splitDualMxmSlots) {
+                        ffn.getOperation()->emitError(
+                            "dense split Down weights require disjoint MXM slice groups");
+                        return mlir::failure();
+                    }
                     base = bindingBase + pagePlacement->base_row
-                        + localReduction * logicalSlotsPerHemisphere
+                        + localReduction * (denseSplitDown ? 1 : logicalSlotsPerHemisphere)
                             * weightLoadCycles
-                        + logicalSlot * weightLoadCycles;
+                        + (denseSplitDown ? 0 : logicalSlot * weightLoadCycles);
                 }
                 const auto rawType =
                     llvm::cast<mlir::RankedTensorType>(
@@ -577,7 +585,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     weightDomain.wave_count = weightRunCount;
                     weightDomain.wave_interval = weightRunInterval;
                     weightDomain.wave_address_stride =
-                        logicalSlotsPerHemisphere * weightLoadCycles;
+                        (denseSplitDown ? 1 : logicalSlotsPerHemisphere) * weightLoadCycles;
                 }
                 // Down projection keeps its per-window MXM control domains.
                 emitFfnWeightTile(rewriter, ffn.getLoc(),
@@ -596,7 +604,8 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                         ? (weightRunCount * logicalSlotsPerHemisphere > 1
                                 ? "toggle_dim2" : "fixed")
                     : weightRunCount > 1 || singleMxm
-                        ? "toggle_dim2" : "fixed");
+                        ? "toggle_dim2" : "fixed",
+                    std::nullopt, true, -1);
             }
         }
 

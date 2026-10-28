@@ -213,10 +213,11 @@ void test_native_vxm_sxm_issues()
     using namespace ftlpu::software::runtime;
     BinaryProgram packets;
     packets.max_cycle = 40;
-    VxmSrInstruction vxm;
-    vxm.lhs = VxmSrOperand::Immediate(1.25f);
+    VxmLaneAluInstruction vxm;
+    vxm.lhs = VxmLaneOperand::Imm(1.25f);
+    vxm.rhs = VxmLaneOperand::Imm(1.25f);
     vxm.repeat_count = 4;
-    const auto compact = VxmSrCompactInstructionCodec::encode(vxm);
+    const auto compact = isa::encode_vxm_instruction(0, VxmChainDepth::Two, vxm);
     auto vxmRun = VxmIcuRun2DInstruction::Run2D(0, {2, 2}, {3, 11}, compact);
     vxmRun.loop.wait_cycle = 2;
     packets.queues.push_back({QueueKind::Vxm, 0,

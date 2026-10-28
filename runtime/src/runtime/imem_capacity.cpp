@@ -777,4 +777,66 @@ PhysicalImemReport analyze_physical_imem(const BinaryProgram& program)
     return report;
 }
 
+std::vector<BinaryProgram> split_resident_program_at_drains(const BinaryProgram& program)
+{
+    if(analyze_physical_imem(program).fits())return {program};
+    if(program.common_barrier_protocol || !program.transport_queues.empty() ||
+       !program.weight_page_uses.empty() || !program.barriers.empty() ||
+       !program.scale_relocations.empty())
+        throw std::invalid_argument("resident iMEM segmentation cannot bypass paging/barrier/scale contracts");
+    std::vector<std::size_t> ends;
+    for(const auto& timeline:program.timelines)
+        if(timeline.name.find("imem.drain.")!=std::string::npos && timeline.end_cycle>0 && timeline.end_cycle<program.max_cycle)
+            ends.push_back(timeline.end_cycle);
+    // max_cycle names the last issue cycle; intervals here are half-open.
+    ends.push_back(program.max_cycle+1);
+    std::sort(ends.begin(),ends.end());ends.erase(std::unique(ends.begin(),ends.end()),ends.end());
+    if(ends.size()==1)throw std::invalid_argument("iMEM overflow has no compiler-declared drain boundaries");
+    auto metadata=program;
+    metadata.queues.clear();metadata.timelines.clear();metadata.address_relocations.clear();
+    std::vector<BinaryProgram> result(ends.size(),metadata);
+    for(std::size_t n=0;n<ends.size();++n){
+        result[n].max_cycle=ends[n]-(n?ends[n-1]:0);
+        result[n].queues.clear();result[n].timelines.clear();result[n].address_relocations.clear();
+    }
+    for(const auto& queue:program.queues){
+        std::vector<QueueProgram> parts(ends.size());std::vector<std::size_t> local(ends.size());
+        for(auto& part:parts){part.kind=queue.kind;part.index=queue.index;}
+        std::size_t cursor=0;
+        for(std::size_t pc=0;pc<queue.commands.size();){
+            const auto& command=queue.commands[pc];
+            if(isa::decode_icu_command_opcode(command.command)==isa::IcuCommandOpcode::Nop){
+                cursor+=is_icu_control_raw_word_command(command)?decode_icu_control_raw_word(command).count:isa::decode_icu_nop_cycles(command.command);
+                ++pc;continue;
+            }
+            if(!is_fu_3d_raw_packet_header(command))
+                throw std::invalid_argument("resident iMEM segmentation requires native 3D packets and NOPs");
+            const auto loop=decode_fu_3d_raw_packet_loop(queue,pc);
+            const auto first=cursor+loop.start_cycle+loop.wait_cycle;
+            std::size_t end=first+1;
+            for(std::size_t d=0;d<3;++d)end+=(loop.counts[d]-1)*loop.cycle_strides[d];
+            const auto part=std::upper_bound(ends.begin(),ends.end(),first)-ends.begin();
+            if(part>=ends.size() || end>ends[part])
+                throw std::invalid_argument("ICU domain crosses compiler-declared iMEM drain: kind="+
+                    std::to_string(static_cast<int>(queue.kind))+" queue="+std::to_string(queue.index)+
+                    " pc="+std::to_string(pc)+" first="+std::to_string(first)+" end="+std::to_string(end)+
+                    " boundary="+std::to_string(part<ends.size()?ends[part]:program.max_cycle));
+            const auto begin=part?ends[part-1]:0;
+            if(first<begin+local[part])throw std::invalid_argument("overlapping ICU domains at iMEM drain");
+            const auto wait=first-begin-local[part];
+            if(wait>0xffffff)throw std::invalid_argument("segmented native wait exceeds 24 bits");
+            const auto words=fu_3d_raw_packet_word_count(queue.kind,command);
+            auto& target=parts[part].commands;const auto header=target.size();
+            target.insert(target.end(),queue.commands.begin()+pc,queue.commands.begin()+pc+words);
+            target[header].words[0]=(target[header].words[0]&0xffU)|(static_cast<std::uint32_t>(wait)<<8);
+            target[header].command=target[header].words[0];
+            local[part]=end-begin;cursor=end;pc+=words;
+        }
+        for(std::size_t n=0;n<parts.size();++n)if(!parts[n].commands.empty())result[n].queues.push_back(std::move(parts[n]));
+    }
+    for(const auto& part:result)if(!analyze_physical_imem(part).fits())
+        throw std::invalid_argument("compiler-declared iMEM segment still exceeds physical capacity");
+    return result;
+}
+
 } // namespace ftlpu::software::runtime

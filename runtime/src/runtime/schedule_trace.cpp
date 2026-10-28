@@ -227,11 +227,11 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
                 static_cast<std::uint64_t>(command.words[0])
                     | (static_cast<std::uint64_t>(command.words[1]) << 32),
                 command.words[2]});
-        const auto& instruction = decoded;
+        const auto& instruction = decoded.instruction;
         std::ostringstream detail;
         detail << VxmLane::operation_name(instruction.operation)
                << " repeat=" << instruction.repeat_count
-               << " -> SR" << static_cast<std::size_t>(instruction.result_sr);
+               << " chain_depth=" << static_cast<std::size_t>(decoded.chain_depth);
         return {"VXM.C" + std::to_string(queue.index), detail.str()};
     }
     case QueueKind::SxmTranspose:
@@ -349,7 +349,7 @@ std::size_t event_duration(
             static_cast<std::uint64_t>(command.words[0])
                 | (static_cast<std::uint64_t>(command.words[1]) << 32),
             command.words[2]});
-    return decoded.repeat_count;
+    return decoded.instruction.repeat_count;
 }
 
 IcuInductionTarget resolve_induction_target(const QueueProgram& queue,
@@ -637,19 +637,18 @@ std::size_t write_raw_fu_packet(std::ostream& output,
         const auto run = isa::decode_vxm_icu_run_2d_instruction(
             read_raw_trace_packet<isa::EncodedVxmIcuRun2DPacket>(
                 queue, commandIndex));
-        const auto decoded = VxmSrCompactInstructionCodec::decode(
-            run.instruction);
+        const auto decoded = isa::decode_vxm_instruction(queue.index, run.instruction);
         std::ostringstream detail;
-        detail << VxmLane::operation_name(decoded.operation)
-               << " result_sr=" << static_cast<std::size_t>(decoded.result_sr)
-               << " repeat=" << decoded.repeat_count
+        detail << VxmLane::operation_name(decoded.instruction.operation)
+               << " chain_depth=" << static_cast<std::size_t>(decoded.chain_depth)
+               << " repeat=" << decoded.instruction.repeat_count
                << " Run2D";
         write_event(output,
             static_cast<std::int64_t>(packetIssueCycle
                 + run.loop.start_cycle + run.loop.wait_cycle),
             static_cast<std::int64_t>(packetIssueCycle
                 + run.loop.start_cycle + run.loop.wait_cycle
-                + decoded.repeat_count),
+                + decoded.instruction.repeat_count),
             {"VXM.C" + std::to_string(queue.index), detail.str()},
             loop_pattern(run.loop));
         return packetIssueCycle + raw_loop_final_offset(run.loop) + 1;

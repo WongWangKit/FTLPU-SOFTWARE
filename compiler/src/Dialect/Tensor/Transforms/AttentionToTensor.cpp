@@ -397,9 +397,11 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     const int64_t value_base = kv_cache_enabled
         ? target.memory().words_per_bank - value_rows
         : transient_value_base;
-    const int64_t qk_norm_scratch_base = std::max(
+    const int64_t qk_norm_scratch_base = std::max({
         kv_cache_enabled ? transient_value_base : value_base + value_rows,
-        rope_mirror_base + rope_rows);
+        rope_mirror_base + rope_rows,
+        rope_staging_base + rope_staging_rows,
+        rope_staging_mirror_base + rope_staging_rows});
     const int64_t qk_norm_input_base = qk_norm_scratch_base;
     const int64_t qk_norm_output_base = qk_norm_scratch_base;
     const int64_t causal_mask_base = target.uses_dedicated_slice_roles()

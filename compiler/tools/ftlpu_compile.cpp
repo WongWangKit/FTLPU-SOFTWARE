@@ -363,11 +363,15 @@ try {
         && args.input_stage != InputStage::Command)
         passes.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_lower_schedule_to_command_pass());
+    if (args.pass_timing) llvm::errs() << "compile: running lowering and verification passes\n";
     if (mlir::failed(passes.run(*module))) return 1;
+    if (args.pass_timing) llvm::errs() << "compile: verifying Command IR\n";
     if (mlir::failed(mlir::verify(*module))) return 1;
 
     std::error_code error;
     std::filesystem::create_directories(args.output.parent_path(), error);
+    if (args.pass_timing) llvm::errs() << "compile: encoding ICU image\n";
+    if (args.pass_timing) (*module)->setAttr("ftlpu.report_encoding_progress", mlir::UnitAttr::get(&context));
     auto program =
         ftlpu::compiler::target::translate_command_module(*module);
     if (args.verify_icu_issues) {
@@ -396,6 +400,7 @@ try {
                          program).functional_issues
                   << " max_cycle=" << program.max_cycle << '\n';
     }
+    if (args.pass_timing) llvm::errs() << "compile: writing ICU image\n";
     ftlpu::software::runtime::write_binary_program(program, args.output);
     return 0;
 } catch (const std::exception& error) {

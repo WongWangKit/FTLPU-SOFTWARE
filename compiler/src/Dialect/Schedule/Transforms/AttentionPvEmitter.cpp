@@ -90,7 +90,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
             const auto bridgeLatency = vxmBridgeToMemLatency(slice);
             if (!bridgeLatency) return -1;
             const int64_t remoteLatency =
-                mxmResultToVxmLatency + *bridgeLatency + 1
+                mxmResultToVxmLatency + *bridgeLatency
                     - firstResultAdvance;
             finalOutputHemisphereStagger = std::max(
                 finalOutputHemisphereStagger,
@@ -480,7 +480,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                         if (!bridgeLatency) return -1;
                                         writeCycle = resultStart
                                             + mxmResultToVxmLatency
-                                            + *bridgeLatency + 1
+                                            + *bridgeLatency
                                             - firstResultAdvance;
                                         packedStream = byte;
                                     }
@@ -911,7 +911,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                                         - target_.throughput().mxm1_accumulator_latency
                                                     : 0)
                                                 + mxmResultToVxmLatency
-                                                + *bridgeLatency + 1
+                                                + *bridgeLatency
                                                 - firstResultAdvance
                                                 - (!singleMxm && half == 0 ? 1 : 0);
                                             packedStream = resultStream + byte

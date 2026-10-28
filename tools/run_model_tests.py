@@ -205,7 +205,7 @@ def commands(a, model, out, work):
                 '--output',str(out/'decoder_layer.ftlpu'),'--target-config',str(a.target_config),
                 '--weight-bank','1','--kv-cache-capacity','256',
                 '--mxm-execution','vector','--ffn-schedule','fused','--attention-schedule','tail',
-                '--projection-rope-overlap','on']))
+                '--projection-rope-overlap',a.projection_rope_overlap]))
             if a.suite != 'compile':
                 phases.append(('cmodel', [str(executable(a.build_dir,a.config,'qwen2' if model.startswith('qwen2') else 'qwen3')),
                                           str(out/'decoder_layer.ftlpu')]))
@@ -383,6 +383,8 @@ def main(argv=None):
     parser.add_argument('--build-dir',type=Path,default=default_build())
     parser.add_argument('--config',default='Release')
     parser.add_argument('--target-config',type=Path)
+    parser.add_argument('--projection-rope-overlap', choices=('off', 'on'), default='off',
+                        help='Qwen prefill/compile scheduling; fixed-port chain VXM baseline uses off')
     parser.add_argument('--output-root',type=Path,help='Override results as ROOT/model/suite')
     parser.add_argument('--checkpoint-root',type=Path,default=ROOT/'models/official_dense')
     parser.add_argument('--checkpoint',type=Path,help='Verified raw checkpoint directory for one model')

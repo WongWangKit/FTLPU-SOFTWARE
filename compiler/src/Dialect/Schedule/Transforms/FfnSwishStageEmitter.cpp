@@ -129,7 +129,7 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
                     ffn.getHidden0Placement());
                 auto read = emitFfnMemRead3D(context.rewriter,
                     ffn.getLoc(), bridgeSource,
-                    bridgeInputCycle + firstOffset - *readLatency - 1,
+                    bridgeInputCycle + firstOffset - *readLatency,
                     innerCount, byte, 1,
                     slice
                             / target.streams()
@@ -210,7 +210,7 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
                         if (!readLatency || !writeLatency)
                             return false;
                         emitFfnMemTransfer3D(context.rewriter, ffn.getLoc(),
-                            bridgeInputCycle + firstOffset - *readLatency - 1,
+                            bridgeInputCycle + firstOffset - *readLatency,
                             owner, slice, "read", address, 32 + byte,
                             occurrenceCount, blockRows, 1, hiddenBank,
                             outerDomain);
@@ -296,7 +296,9 @@ mlir::LogicalResult emitHiddenMirrorCopies(FfnEmissionContext& context,
     return mlir::success();
 }
 
-mlir::FailureOr<FfnSwishEmission> emitSrSwish(
+// Both physical chains share C0..C7. Launch matching projection tiles
+// together and retain Gate/Up as Original/Auxiliary through the LUT stages.
+mlir::FailureOr<FfnSwishEmission> emitChainSwish(
     FfnEmissionContext& context, const FfnProjectionEmission& projection)
 {
     auto& rewriter = context.rewriter;
@@ -305,137 +307,81 @@ mlir::FailureOr<FfnSwishEmission> emitSrSwish(
     const auto gateSlices = target.ffn_gate_temp_slices();
     const auto upSlices = target.ffn_up_temp_slices();
     const int64_t tile = context.tile();
-    const int64_t tempRowsPerTile =
-        context.projection_timeline.m_tile_count == 1
+    const int64_t rows = context.projection_timeline.m_tile_count == 1
         ? std::min(tile, context.m()) : tile;
-    const int64_t columns = target.throughput().vxm_alus;
-    const int64_t residentRows = context.projection_timeline.pair_count
-        * context.projection_timeline.m_tile_count * tempRowsPerTile;
-    if (residentRows > target.memory().sram_depth_rows || gateSlices.size() < 4
-        || upSlices.size() < 2 || gateSlices[2] <= gateSlices[0]
-        || gateSlices[3] <= gateSlices[1]) {
-        ffn.getOperation()->emitError(
-            "physical SR SwiGLU requires two disjoint Gate copies on the West route")
-            << ": resident_rows=" << residentRows
-            << ", bank_rows=" << target.memory().sram_depth_rows
-            << ", gate_slices=" << gateSlices.size()
-            << ", up_slices=" << upSlices.size();
-        return mlir::failure();
-    }
-    int64_t maxRead = 0;
-    int64_t maxOutput = 0;
-    for (int64_t slice : gateSlices)
-        maxRead = std::max(maxRead, context.westLatency(slice));
-    for (int64_t slice : upSlices)
-        maxRead = std::max(maxRead, context.westLatency(slice));
-    for (int64_t slice : context.hidden_slices)
-        maxOutput = std::max(maxOutput, target.transport_latency(
+    const int64_t pairsPerGroup = target.memory().sram_depth_rows
+        / (context.projection_timeline.m_tile_count * rows);
+    int64_t maxRead = 0, maxWrite = 0;
+    for (auto slice : gateSlices) maxRead = std::max(maxRead, context.westLatency(slice));
+    for (auto slice : upSlices) maxRead = std::max(maxRead, context.westLatency(slice));
+    for (auto slice : context.hidden_slices)
+        maxWrite = std::max(maxWrite, target.transport_latency(
             target::StreamEndpoint::VxmResult, target::StreamEndpoint::Mem,
             target::StreamDirection::East, slice).value());
     int64_t inputCycle = context.projection_timeline.final_projection_cycle
         + context.projection_timeline.accumulator_queue_release;
     for (const auto& completed : projection.completed_tiles)
         inputCycle = std::max(inputCycle, completed.deferred_ready_cycle);
-    inputCycle += maxRead + columns + 2;
-    const int64_t tileInterval = tile + columns + maxOutput + maxRead + 12;
-    // Each hemisphere owns an independent six-ALU chain. Derive its outer
-    // loop from the symbolic projection tile order before emitting VXM ops;
-    // MEM address changes do not require another identical ALU instruction.
-    std::array<int64_t, 2> waveCount {}, previousOrdinal {-1, -1}, ordinalStride {};
-    std::array<bool, 2> regular {true, true};
-    for (size_t ordinal = 0; ordinal < projection.completed_tiles.size(); ++ordinal) {
-        const auto hemi = projection.completed_tiles[ordinal].hemisphere;
-        if (waveCount[hemi] == 1)
-            ordinalStride[hemi] = int64_t(ordinal) - previousOrdinal[hemi];
-        else if (waveCount[hemi] > 1)
-            regular[hemi] = regular[hemi]
-                && int64_t(ordinal) - previousOrdinal[hemi] == ordinalStride[hemi];
-        previousOrdinal[hemi] = ordinal;
-        ++waveCount[hemi];
-    }
-    std::array<mlir::Value, 2> chainOutputs;
+    inputCycle += maxRead + 2;
+    constexpr int64_t latency = 17;
     FfnSwishEmission result {};
-    for (const auto& completed : projection.completed_tiles) {
-        const int64_t hemisphere = completed.hemisphere;
-        const auto hemi = context.hemisphereName(hemisphere);
-        const auto column = [&](int64_t stage) {
-            return hemisphere == 0 ? stage : columns - 1 - stage;
-        };
-        const int64_t gateStream = 8 + hemisphere * 8;
-        const int64_t tempRow = (completed.pair
-            * context.projection_timeline.m_tile_count + completed.m_tile)
-            * tempRowsPerTile;
+    for (const auto& east : projection.completed_tiles) {
+        if (east.hemisphere != 0) continue;
+        const auto west = llvm::find_if(projection.completed_tiles,
+            [&](const CompletedProjectionTile& item) {
+                return item.hemisphere == 1 && item.pair == east.pair
+                    && item.m_tile == east.m_tile;
+            });
+        if (west == projection.completed_tiles.end()) {
+            ffn.getOperation()->emitError("shared chain SwiGLU requires paired hemisphere tiles");
+            return mlir::failure();
+        }
+        const auto group = east.pair / pairsPerGroup;
+        if (2 * group + 1 >= gateSlices.size() || 2 * group + 1 >= upSlices.size())
+            return mlir::failure();
+        const auto address = ((east.pair % pairsPerGroup)
+            * context.projection_timeline.m_tile_count + east.m_tile) * rows;
         mlir::Value gateValue, upValue;
-        for (int64_t byte = 0; byte < 2; ++byte) {
-            gateValue = context.emitSliceRead(completed.gate_temp,
-                context.activation_route,
-                inputCycle - context.westLatency(gateSlices[byte]),
-                gateSlices[byte], tempRow, tempRowsPerTile, 1,
-                gateStream + byte,
-                "west", "vxm_bf16", hemi).getOutput();
-            // Two LUTs add eight cycles before C4. Feed the independent
-            // Gate copy eight cycles later so it meets sigmoid at C4.
-            context.emitSliceRead(completed.gate_temp, context.activation_route,
-                inputCycle + 8 - context.westLatency(gateSlices[2 + byte]),
-                gateSlices[2 + byte], tempRow, tempRowsPerTile, 1,
-                gateStream + 4 + byte,
-                "west", "vxm_bf16", hemi);
-            // C4 multiply adds one more cycle before Up is consumed at C5.
-            upValue = context.emitSliceRead(completed.up_temp,
-                context.activation_route,
-                inputCycle + 9 - context.westLatency(upSlices[byte]),
-                upSlices[byte], tempRow, tempRowsPerTile, 1,
-                gateStream + 2 + byte,
-                "west", "vxm_bf16", hemi).getOutput();
+        for (const auto* completed : {&east, &*west}) {
+            const auto hemi = context.hemisphereName(completed->hemisphere);
+            for (int64_t byte = 0; byte < 2; ++byte) {
+                const auto gateSlice = gateSlices[2 * group + byte];
+                const auto upSlice = upSlices[2 * group + byte];
+                gateValue = context.emitSliceRead(completed->gate_temp,
+                    context.activation_route, inputCycle - context.westLatency(gateSlice),
+                    gateSlice, address, rows, 1, completed->hemisphere * 16 + byte,
+                    "west", "vxm_bf16", hemi).getOutput();
+                upValue = context.emitSliceRead(completed->up_temp,
+                    context.activation_route, inputCycle - context.westLatency(upSlice),
+                    upSlice, address, rows, 1, completed->hemisphere * 16 + 2 + byte,
+                    "west", "vxm_bf16", hemi).getOutput();
+            }
         }
-        if (!regular[hemisphere] || !chainOutputs[hemisphere]) {
-            const auto loop = [&](VxmOp op) {
-                if (regular[hemisphere] && waveCount[hemisphere] > 1) {
-                    op->setAttr("wave_count", rewriter.getI64IntegerAttr(waveCount[hemisphere]));
-                    op->setAttr("wave_interval", rewriter.getI64IntegerAttr(
-                        ordinalStride[hemisphere] * tileInterval));
-                }
-                return op;
-            };
-            auto value = loop(create_vxm(rewriter, ffn.getLoc(), gateValue, gateValue,
-                ffn.getResult().getType(), inputCycle - 1, column(0),
-                "negate", "stream_bf16", 32 + gateStream, 0,
-                "immediate", 0, 0, "fp32", -1, tempRowsPerTile, 1,
-                hemi, hemi)).getResult();
-            const char* operations[] = {"exp", "add", "reciprocal"};
-            for (int64_t stage = 1; stage < 4; ++stage)
-                value = loop(create_vxm(rewriter, ffn.getLoc(), value, gateValue,
-                    ffn.getResult().getType(), inputCycle - 1, column(stage),
-                    operations[stage - 1], "alu", column(stage - 1), 0,
-                    "immediate", 0, stage == 2 ? 1 : 0, "fp32", -1,
-                    tempRowsPerTile, 1, hemi, hemi)).getResult();
-            auto multiply = loop(create_vxm(rewriter, ffn.getLoc(), value, gateValue,
-                ffn.getResult().getType(), inputCycle - 1, column(4),
-                "multiply", "alu", column(3), 0,
-                "stream_bf16", 32 + gateStream + 4, 0, "fp32", -1,
-                tempRowsPerTile, 1, hemi, hemi));
-            auto output = loop(create_vxm(rewriter, ffn.getLoc(), multiply.getResult(),
-                upValue, ffn.getResult().getType(), inputCycle - 1, column(5),
-                "multiply", "alu", column(4), 0,
-                "stream_bf16", 32 + gateStream + 2, 0,
-                lpu_16bit_data_format(llvm::cast<mlir::RankedTensorType>(
-                    ffn.getResult().getType()).getElementType()),
-                hemisphere * 8 + 6, tempRowsPerTile, 1, hemi, hemi));
-            chainOutputs[hemisphere] = output.getResult();
+        const auto type = ffn.getResult().getType();
+        mlir::Value value = gateValue;
+        const char* operations[] = {"negate", "exp", "add", "reciprocal",
+                                   "multiply", "multiply", "pass", "pass"};
+        for (int64_t stage = 0; stage < 8; ++stage) {
+            const auto rhs = stage == 0 ? "stream_bf16"
+                : stage == 4 ? "original" : stage == 5 ? "auxiliary" : "immediate";
+            value = create_vxm(rewriter, ffn.getLoc(), value, upValue, type,
+                inputCycle - 1, stage, operations[stage],
+                stage == 0 ? "stream_bf16" : "previous", stage == 0 ? 32 : 0, 0,
+                rhs, stage == 0 ? 34 : 0, stage == 2 ? 1 : 0,
+                stage == 7 ? lpu_16bit_data_format(llvm::cast<mlir::RankedTensorType>(type).getElementType()) : "fp32",
+                stage == 7 ? 6 : -1, rows, 1, "east", "west", -1,
+                false, false, true, false, 8).getResult();
         }
-        result.hidden = emitFfnSwishResultTile(rewriter, ffn, target,
-            context.hidden_slices, chainOutputs[hemisphere], inputCycle,
-            completed.m_tile, completed.pair, hemisphere,
-            tempRowsPerTile,
-            false, {}, false, columns + 11);
-        result.last_cycle = inputCycle + tempRowsPerTile - 1;
-        inputCycle += tileInterval;
+        for (const auto* completed : {&east, &*west})
+            result.hidden = emitFfnSwishResultTile(rewriter, ffn, target,
+                context.hidden_slices, value, inputCycle, completed->m_tile,
+                completed->pair, completed->hemisphere, rows, false, {}, false, latency);
+        result.last_cycle = inputCycle + rows - 1;
+        inputCycle += rows + latency + maxWrite + maxRead + 2;
     }
     llvm::SmallVector<const CompletedProjectionTile*> tiles;
-    for (const auto& completed : projection.completed_tiles)
-        tiles.push_back(&completed);
-    if (mlir::failed(emitHiddenMirrorCopies(context, tiles,
-            result.last_cycle, result)))
+    for (const auto& completed : projection.completed_tiles) tiles.push_back(&completed);
+    if (mlir::failed(emitHiddenMirrorCopies(context, tiles, result.last_cycle, result)))
         return mlir::failure();
     return result;
 }
@@ -627,7 +573,7 @@ mlir::FailureOr<FfnSwishEmission> emitFfnSwish(
     auto& ffn = context.ffn;
     const auto& target = context.target;
     if (target.throughput().vxm_alus == 16)
-        return emitSrSwish(context, emission);
+        return emitChainSwish(context, emission);
     if (target.throughput().vxm_alus > 16
         && target.throughput().mxms_per_hemisphere == 2
         && context.strategy == FfnScheduleStrategy::Tail)

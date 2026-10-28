@@ -236,6 +236,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
         && serializedProjections
         && (isPagedPlacement(context.gate_route.getPlacement())
             || isPagedPlacement(context.up_route.getPlacement()));
+    const bool splitPagedActivationDomains = splitSerializedActivationDomains
+        || (!singleMxm
+            && (isPagedPlacement(context.gate_route.getPlacement())
+                || isPagedPlacement(context.up_route.getPlacement())));
 
     // The active Qwen path uses local dequant, whose projection planner emits
     // one stable stream segment per hemisphere and tile.  Its compute launch
@@ -532,6 +536,23 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                     mxmControlDomain->group_count = mxmControlPairCount;
                     mxmControlDomain->group_interval = mxmPairInterval;
                 }
+                // Concurrent Gate/Up domains share activation and downstream
+                // control. Both operand pages must join one readiness epoch;
+                // separate waits can stop one queue inside another queue's
+                // already active coarse domain.
+                int64_t weightSyncGroup = -1;
+                if (!singleMxm && page >= 0) {
+                    const auto gateGranularity = context.gate_route.getPlacement()
+                        .getAs<mlir::IntegerAttr>("page_granularity");
+                    const auto upGranularity = context.up_route.getPlacement()
+                        .getAs<mlir::IntegerAttr>("page_granularity");
+                    if (gateGranularity && upGranularity
+                        && gateGranularity.getInt() == upGranularity.getInt()) {
+                        const auto firstPair = pair - pair % gateGranularity.getInt();
+                        weightSyncGroup = context.projection_timeline.blocks[
+                            firstPair * reductionBlockCount].dequant_start;
+                    }
+                }
                 emitFfnWeightTile(rewriter, ffn.getLoc(), raw,
                     dequantizedType,
                     selectedWeightSlices,
@@ -550,7 +571,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         ? "toggle_dim2" : "fixed",
                     mxmControlDomain,
                     !closedWeightMxmControl
-                        || (reduction == 0 && mxmControlPairCount > 0));
+                        || (reduction == 0 && mxmControlPairCount > 0),
+                    weightSyncGroup);
             }
         }
 
@@ -743,7 +765,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                 upActivation = emitActivation(upCycle, activationDomain);
                         }
                     } else if (closedProjectionDomains && mTileCount == 1) {
-                        if (splitSerializedActivationDomains
+                        if (splitPagedActivationDomains
                             && reduction == 0) {
                             // The MEM activation producer must stop at every
                             // dynamic weight-page boundary together with the
@@ -767,7 +789,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                 gateActivation = emitActivation(gateCycle,
                                     makeActivationDomain(
                                         computeDomainPairCounts[0]));
-                            if (closedComputeLeaders[1])
+                            if (singleMxm && closedComputeLeaders[1])
                                 upActivation = emitActivation(upCycle,
                                     makeActivationDomain(
                                         computeDomainPairCounts[1]));

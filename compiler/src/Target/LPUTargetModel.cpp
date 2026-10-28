@@ -785,8 +785,8 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         || icu_memory_.common_barrier_capacity <= 0
         || icu_memory_.common_barrier_capacity > hw::kCommonBarrierCapacity))
         return fail("common barrier capability must be absent (0/0) or use the supported encoding and finite RAM capacity");
-    if (throughput_.vxm_alus < 16 || throughput_.vxm_alus % 8 != 0)
-        return fail("vxm_alus must be at least 16 and a multiple of 8");
+    if (throughput_.vxm_alus != 16)
+        return fail("chain VXM requires exactly 16 physical ALUs and 8 shared ICU queues");
     if (icu_memory_.mem_instruction_bits % 32 != 0
         || icu_memory_.mxm_instruction_bits % 32 != 0
         || icu_memory_.vxm_instruction_bits % 32 != 0
@@ -953,7 +953,7 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
     HASH(mxm_weight_buffers);
     HASH(vxm_alus);
     HASH(vxm_cross_hemisphere_streams_enabled);
-    hash.add(0); // ExecutableHardwareConfig::vxm_reserved_feature.
+    hash.add(1); // Mirrored-chain VXM ISA; incompatible with explicit-SR VALU.
     HASH(vxm_weight_to_iw_latency);
     HASH(mem_to_sxm_latency);
     HASH(mem_to_mxm_latency);
@@ -1675,7 +1675,7 @@ std::optional<int64_t> LPUTargetModel::transport_latency(StreamEndpoint source,
         return 1;
     if (source == StreamEndpoint::VxmBridgeResult
         && destination == StreamEndpoint::Mem)
-        return throughput_.vxm_alus + 1 + group;
+        return 1 + group;
     if (source == StreamEndpoint::SxmResult
         && destination == StreamEndpoint::Mem)
         return streams_.system_register_columns - 2 - group;

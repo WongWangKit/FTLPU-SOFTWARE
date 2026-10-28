@@ -23,13 +23,18 @@ try {
     if (argc < 2)
         throw std::runtime_error(
             "usage: ftlpu_binary_inspect program.ftlpu "
-            "[--all-queues] [--trace schedule.csv] "
+            "[--all-queues] [--physical-only] [--trace schedule.csv] "
             "[--compare reference.ftlpu]");
     bool reportAllQueues = false;
+    bool physicalOnly = false;
     std::optional<std::filesystem::path> tracePath;
     std::optional<std::filesystem::path> comparePath;
     for (int index = 2; index < argc; ++index) {
         const std::string_view argument(argv[index]);
+        if (argument == "--physical-only") {
+            physicalOnly = true;
+            continue;
+        }
         if (argument == "--all-queues") {
             reportAllQueues = true;
             continue;
@@ -48,6 +53,8 @@ try {
             "unknown binary inspector option: " + std::string(argument));
     }
 
+    if (physicalOnly && (comparePath || tracePath))
+        throw std::runtime_error("--physical-only cannot be combined with logical comparison or trace");
     const auto program = ftlpu::software::runtime::read_binary_program(
         std::filesystem::path(argv[1]));
     std::ifstream binaryVersionStream(argv[1], std::ios::binary);
@@ -101,10 +108,11 @@ try {
     };
     std::optional<ftlpu::software::runtime::LogicalIssueProgram>
         logicalIssues;
-    if (hasRawFu3D && !comparePath) {
+    if (physicalOnly || (hasRawFu3D && !comparePath)) {
         // Physical inspection stays cheap for large coarse programs. Explicit
         // comparison uses the logical inspector's native FU packet expansion.
-        std::cout << "binary logical_issue_summary mode=raw_fu_3d"
+        std::cout << "binary logical_issue_summary mode="
+                  << (physicalOnly ? "physical_only" : "raw_fu_3d")
                   << " status=not_expanded\n";
     } else {
         logicalIssues =
@@ -990,8 +998,9 @@ try {
         }
         std::cout << '\n';
     }
-    ftlpu::software::runtime::print_runtime_performance(
-        program, cycles, std::cout);
+    if (!physicalOnly)
+        ftlpu::software::runtime::print_runtime_performance(
+            program, cycles, std::cout);
     if (tracePath)
         ftlpu::software::runtime::write_schedule_trace_csv(
             program, *tracePath);

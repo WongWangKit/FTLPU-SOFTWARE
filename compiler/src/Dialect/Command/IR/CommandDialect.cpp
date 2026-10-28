@@ -116,10 +116,10 @@ LogicalResult BindingOp::verify()
         && getRole() != "result" && getRole() != "constant"
         && getRole() != "workspace" && getRole() != "bias"
         && getRole() != "state.kv.key"
-        && getRole() != "state.kv.value")
+        && getRole() != "state.kv.value" && getRole() != "prefetch.input")
         return emitOpError(
             "role must be activation, weight, bias, result, constant, or "
-            "workspace, state.kv.key, or state.kv.value");
+            "workspace, state.kv.key, state.kv.value, or prefetch.input");
     if (getElementType() != "i8" && getElementType() != "i32"
         && getElementType() != "f16" && getElementType() != "bf16"
         && getElementType() != "f32")

@@ -221,7 +221,8 @@ std::uint64_t initialized_binding_release_cycle(
     if (!timelineName.empty()) {
         bool found = false;
         for (const BinaryTimeline& timeline : program.timelines)
-            if (timeline.name == timelineName) {
+            if (timeline.name == timelineName ||
+                timeline.name.ends_with("." + std::string(timelineName))) {
                 release = std::max(release, timeline.end_cycle);
                 found = true;
             }
@@ -238,7 +239,8 @@ std::vector<InitializedInternalRegion> initialized_internal_regions(
     std::vector<InitializedInternalRegion> regions;
     std::vector<std::uint64_t> rmsnormReleases;
     for (const BinaryTimeline& timeline : program.timelines)
-        if (timeline.name == "rmsnorm.feedback")
+        if (timeline.name == "rmsnorm.feedback" ||
+            timeline.name.ends_with(".rmsnorm.feedback"))
             rmsnormReleases.push_back(timeline.end_cycle);
     std::ranges::sort(rmsnormReleases);
     std::size_t gammaOrdinal = 0;

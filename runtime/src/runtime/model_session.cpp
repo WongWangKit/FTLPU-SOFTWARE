@@ -189,13 +189,13 @@ BinaryProgram parameterize_program(const ModelPackage &package,
       auto run = isa::decode_vxm_icu_run_2d_instruction(packet);
       auto decoded = isa::decode_vxm_instruction(queue->index,
                                                   run.instruction);
-      VxmSrOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
-          ? decoded.lhs : decoded.rhs;
-      if (operand.kind != VxmSrOperandKind::Immediate)
+      VxmLaneOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
+          ? decoded.instruction.lhs : decoded.instruction.rhs;
+      if (operand.kind != VxmLaneOperandKind::Immediate)
         throw std::logic_error(
             "raw VXM RUN_2D scale relocation target is not immediate");
-      operand = VxmSrOperand::Immediate(tensor.scales[relocation.scale_index]);
-      run.instruction = VxmSrCompactInstructionCodec::encode(decoded);
+      operand = VxmLaneOperand::Imm(tensor.scales[relocation.scale_index]);
+      run.instruction = isa::encode_vxm_instruction(queue->index, decoded.chain_depth, decoded.instruction);
       packet = isa::encode_vxm_icu_run_2d_instruction(run);
       for (std::size_t word = 0; word < packetWords; ++word) {
         QueueCommand &target =
@@ -223,14 +223,14 @@ BinaryProgram parameterize_program(const ModelPackage &package,
             (static_cast<std::uint64_t>(command.words[1]) << 32),
         command.words[2]};
     auto decoded = isa::decode_vxm_instruction(queue->index, encoded);
-    VxmSrOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
-                                  ? decoded.lhs
-                                  : decoded.rhs;
-    if (operand.kind != VxmSrOperandKind::Immediate)
+    VxmLaneOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
+                                  ? decoded.instruction.lhs
+                                  : decoded.instruction.rhs;
+    if (operand.kind != VxmLaneOperandKind::Immediate)
       throw std::logic_error(
           "scale relocation target is not an immediate operand");
-    operand = VxmSrOperand::Immediate(tensor.scales[relocation.scale_index]);
-    encoded = VxmSrCompactInstructionCodec::encode(decoded);
+    operand = VxmLaneOperand::Imm(tensor.scales[relocation.scale_index]);
+    encoded = isa::encode_vxm_instruction(queue->index, decoded.chain_depth, decoded.instruction);
     command.words = {static_cast<std::uint32_t>(encoded.control),
                      static_cast<std::uint32_t>(encoded.control >> 32),
                      encoded.immediate_bits, 0};
@@ -1717,8 +1717,13 @@ void ModelSession::schedule_executable_weight_pages(BinaryProgram &program) {
         transfer.pre_execution_cycles);
   }
   std::optional<std::size_t> debugStopCycle;
-  if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
-    debugStopCycle = static_cast<std::size_t>(std::stoull(stop));
+  // Compiler-owned common barriers must retain the complete page contract
+  // even for a diagnostic stop. Dropping future pages changes the lifetime
+  // validation of earlier pages and can make an otherwise valid image fail
+  // linking. The execution limit still stops before future consumers run.
+  if (!program.common_barrier_protocol)
+    if (const char *stop = std::getenv("FTLPU_SESSION_STOP_CYCLE"))
+      debugStopCycle = static_cast<std::size_t>(std::stoull(stop));
   const bool compilerMemSync = has_compiler_mem_sync(program);
   BinaryProgram relinked;
   if (compilerMemSync)
@@ -2314,6 +2319,8 @@ void ModelSession::load(ModelPackage package) {
   host_input_overrides_.clear();
   device_values_.clear();
   state_backing_.clear();
+  prefetched_inputs_.clear();
+  prefetched_input_consumer_.reset();
   stats_ = {};
   load_stats_ = {};
   last_linked_program_.reset();
@@ -2458,6 +2465,7 @@ void ModelSession::set_input(std::string name,
     throw std::invalid_argument(
         "FTLPU model input is not declared as external");
   host_input_overrides_.insert(name);
+  prefetched_inputs_.erase(name);
   values_[std::move(name)] =
       std::vector<std::uint8_t>(data.begin(), data.end());
 }
@@ -2477,6 +2485,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     throw std::logic_error("no FTLPU model package is loaded");
   if (index >= package_.invocations.size())
     throw std::out_of_range("FTLPU model invocation index is out of range");
+  if (prefetched_input_consumer_ != index) prefetched_inputs_.clear();
   last_linked_program_.reset();
   const bool reportProgress = std::getenv("FTLPU_SESSION_PROGRESS") != nullptr;
   const auto report = [&](const char *phase) {
@@ -2526,6 +2535,16 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   report("persistent state paged in");
 
   for (const SessionInputPlan &input : invocation_plan.inputs) {
+    const auto& destinationBinding = find_binding(program, BindingAccess::Input, input.binding_index);
+    if (destinationBinding.role == "prefetch.input") continue;
+    if (const auto ready = prefetched_inputs_.find(input.value); ready != prefetched_inputs_.end()) {
+      if (ready->second.target_abi != program.target_abi
+          || !bindings_physically_alias(ready->second.binding, destinationBinding))
+        throw std::logic_error("prefetched input does not match its consumer placement: " + input.value);
+      prefetched_inputs_.erase(ready);
+      ++stats_.prefetched_input_hits;
+      continue;
+    }
     if (input.transfer == SessionTransferKind::Resident ||
         input.transfer == SessionTransferKind::WeightPage)
       continue;
@@ -2560,6 +2579,8 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
       device_values_.erase(source);
   }
   report("inputs ready");
+  prefetched_inputs_.clear();
+  prefetched_input_consumer_.reset();
   // Internal constants may share physical SRAM with executable-local weight
   // pages whose lifetimes start later.  Initialize them before pre-execution
   // C2C page loads so the page data is the final writer for its residency
@@ -2719,6 +2740,18 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     }
   }
   report("runtime program completed");
+  for (const auto& input : invocation.inputs) {
+    const auto& binding = find_binding(program, BindingAccess::Input, input.binding_index);
+    if (binding.role != "prefetch.input") continue;
+    const auto transfer = std::ranges::find_if(executable_weight_transfers_, [&](const auto& item) {
+      return std::ranges::any_of(item.uses, [&](const auto& use) { return use.binding_index == input.binding_index; });
+    });
+    if (transfer == executable_weight_transfers_.end()
+        || (!transfer->ready_before_execution && !transfer->actual_ready_cycle.has_value()))
+      throw std::logic_error("prefetched input did not complete its synchronized transfer");
+    prefetched_inputs_[input.value] = DeviceValue{binding, program.target_abi};
+    prefetched_input_consumer_ = index + 1;
+  }
   if (c2c_system_ != nullptr
       && std::getenv("FTLPU_VERIFY_EXECUTABLE_WEIGHTS_AFTER_EXECUTION")
           != nullptr)
@@ -2728,6 +2761,25 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
           && transfer.actual_ready_cycle.has_value())
         verify_c2c_weight_page_residency(*c2c_system_, transfer.page);
   const std::size_t invocationPhysicalCycles = runtime_.physical_cycles();
+  if (std::getenv("FTLPU_SESSION_BENCHMARK") != nullptr) {
+    std::cout << "Session benchmark: invocation=" << index
+              << ", logical_cycles=" << runtime_.logical_cycles()
+              << ", physical_cycles=" << invocationPhysicalCycles
+              << ", instruction_prefill_cycles=" << runtime_.instruction_prefill_cycles()
+              << ", ingress_cycles=" << stats_.c2c_ingress_cycles
+              << ", initial_wait_cycles=" << stats_.weight_page_initial_wait_cycles
+              << '\n';
+    if (c2c_system_ != nullptr) {
+      const auto f = c2c_system_->chip().icu().frontend_statistics();
+      std::cout << "Session frontend: macro_queues=" << f.macro_queues
+                << ", peak_macro_contexts=" << f.peak_macro_contexts_per_queue
+                << ", descriptors=" << f.macro_descriptor_count
+                << ", decoder_starvation_queue_cycles=" << f.macro_decoder_starvation_cycles
+                << ", decoder_ddb_stall_queue_cycles=" << f.macro_decoder_ddb_stall_cycles
+                << ", admission_stall_queue_cycles=" << f.macro_admission_stall_cycles
+                << '\n';
+    }
+  }
   if (program.common_barrier_protocol)
     stats_.weight_page_runtime_wait_cycles +=
         runtime_.physical_cycles() - runtime_.logical_cycles();

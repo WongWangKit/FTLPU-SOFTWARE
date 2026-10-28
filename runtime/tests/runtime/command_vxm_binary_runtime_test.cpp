@@ -40,7 +40,7 @@ try {
                 static_cast<std::uint64_t>(command.words[0])
                     | (static_cast<std::uint64_t>(command.words[1]) << 32),
                 command.words[2]});
-        require(decoded.repeat_count == 2,
+        require(decoded.instruction.repeat_count == 2,
             "VXM packet repeat count was not encoded");
         hasCompactInstruction = true;
     }

@@ -63,6 +63,7 @@ void print_weight_page_residency_error(
   const bool paged_matrix_weight =
       binding.layout == BindingLayout::W8A16MxmWeightStriped ||
       binding.layout == BindingLayout::W8A16MxmWeightWaveStriped ||
+      binding.layout == BindingLayout::W8A16MxmWeightWaveSplitDense ||
       binding.layout == BindingLayout::W8A16AttentionWeightStriped ||
       binding.layout == BindingLayout::W8A16Block8WeightWaveStriped ||
       binding.layout == BindingLayout::W8A16MxmWeightReplicated;

@@ -115,5 +115,8 @@ struct PhysicalImemReport {
 };
 
 PhysicalImemReport analyze_physical_imem(const BinaryProgram& program);
+// Only compiler-declared, fully drained boundaries may reload local iMEM.
+// Resident-only: paging/barriers/relocations require the executable linker.
+std::vector<BinaryProgram> split_resident_program_at_drains(const BinaryProgram& program);
 
 } // namespace ftlpu::software::runtime

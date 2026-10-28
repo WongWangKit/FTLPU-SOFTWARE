@@ -134,7 +134,7 @@ void sequentializeScheduleStages(mlir::func::FuncOp function,
         }
         if (first == std::numeric_limits<int64_t>::max()) continue;
         std::set<std::pair<int64_t, int64_t>> pageInputs;
-        if (schedule::requestsRawMacroBarriers(function))
+        if (schedule::requestsCommonBarriers(function))
             for (auto* operation : stage) {
                 if (auto transfer = llvm::dyn_cast<schedule::MemTransferOp>(operation)) {
                     if (transfer.getWeightPage() && transfer.getAddressBinding())

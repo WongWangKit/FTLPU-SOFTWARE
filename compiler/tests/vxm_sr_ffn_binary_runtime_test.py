@@ -1,4 +1,7 @@
-"""Numerically verify physical SR SwiGLU and its Gate/Up/Down handoffs."""
+"""Numerically verify chain VXM SwiGLU and its Gate/Up/Down handoffs.
+
+The historical test name is retained for existing CTest invocations.
+"""
 
 import argparse
 import os

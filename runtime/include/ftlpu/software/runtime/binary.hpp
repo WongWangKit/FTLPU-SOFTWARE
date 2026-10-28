@@ -77,6 +77,12 @@ enum class BindingLayout : std::uint16_t {
     // Packed byte planes; first ceil(rows/2) tokens on West, remainder East.
     // Both halves share bank/slices/base, with ceil(rows/2) physical row stride.
     TokenPartitionPlanar = 34,
+    // Paged dual-MXM Down weights: output slots use disjoint slice groups,
+    // and reduction tiles occupy consecutive rows within each group.
+    W8A16MxmWeightWaveSplitDense = 35,
+    // Split columns into two contiguous halves: first half East, second West.
+    // Each half uses ordinary packed byte planes [column_block, row].
+    ColumnPartitionPlanar = 36,
 };
 
 enum class BindingInitializer : std::uint16_t {

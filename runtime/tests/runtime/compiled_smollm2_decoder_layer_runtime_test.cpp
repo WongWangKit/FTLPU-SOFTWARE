@@ -498,6 +498,9 @@ try {
     const auto expectedAbi =
         ftlpu::software::runtime::executable_target_abi(
             program.hardware);
+    if (const char* path = std::getenv("FTLPU_QWEN_DIRECT_BINARY"))
+        ftlpu::software::runtime::write_binary_program(directProgram,
+            std::filesystem::path(path));
     if (program.target_abi != expectedAbi
         || program.max_cycle == 0 || program.timelines.empty())
         throw std::logic_error(
@@ -695,11 +698,13 @@ try {
                 || before.release_cycle != baselineCycle(after.release_cycle))
                 throw std::logic_error("Raw decoder changed a baseline page transport instance");
         }
+        const bool rawMacro = std::ranges::any_of(dynamicProgram.queues,
+            [](const auto& queue) { return queue.requires_raw_macro; });
         for (const auto& queue : dynamicProgram.queues)
             if (!queue.commands.empty() && (queue.kind == QueueKind::Mem
                     || queue.kind == QueueKind::MxmLoad || queue.kind == QueueKind::MxmCompute
                     || queue.kind == QueueKind::MxmDequant)
-                && !queue.requires_raw_macro)
+                && rawMacro && !queue.requires_raw_macro)
                 throw std::logic_error("Raw decoder silently retained a non-Macro computation queue");
     }
     const auto inputBindingByIndex = [&](std::uint32_t index)
@@ -819,7 +824,8 @@ try {
             if (binding.bank != parameterPage.bank) {
                 // A ModelWeightPage has one destination bank. Parameters in
                 // another bank use ModelSession's ordinary C2C ingress.
-                appendTensor(bindingIndex, std::move(name), logical);
+                dynamicPackage.values.push_back(ModelValue{
+                    std::move(name), binding.element_type, binding.shape, true, false});
                 return;
             }
             PackedWeightImage image =
@@ -1149,6 +1155,10 @@ try {
         auto [dynamicPackage, expectedPrefetches, expectedPagedBytes,
             expectedSyncInstructions, expectedSynchronizedWrites] = prepareDynamic();
 #endif
+        const bool dynamicOnly = std::getenv("FTLPU_LPU64_DYNAMIC_ONLY") != nullptr;
+#if !FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES
+        if (dynamicOnly) throw std::invalid_argument("dynamic C2C is not enabled in this target");
+#endif
         std::ofstream scopedLog;
         std::size_t logStart = 0, logEnd = 0;
         if (const char* logPath = std::getenv("FTLPU_CMODEL_LOG")) {
@@ -1162,19 +1172,27 @@ try {
             scopedLog.open(logPath);
             if (!scopedLog) throw std::runtime_error("cannot open CModel log");
         }
+        const bool reportProgress = std::getenv("FTLPU_SESSION_PROGRESS") != nullptr;
         const auto advanceTo = [&](std::size_t end) {
+            if (dynamicOnly) return;
             while (runtime.logical_cycles() < end) {
                 const auto start = runtime.logical_cycles();
                 const bool logging = scopedLog.is_open()
                     && start >= logStart && start < logEnd;
-                const auto stop = logging ? std::min(end, logEnd)
+                auto stop = logging ? std::min(end, logEnd)
                     : start < logStart ? std::min(end, logStart) : end;
+                if (reportProgress)
+                    stop = std::min(stop, start + 25000);
                 runtime.run_cycles(stop - start, logging ? &scopedLog : nullptr);
+                if (reportProgress)
+                    std::clog << "LPU64 direct execution cycle=" << stop
+                              << "/" << program.max_cycle + 64 << std::endl;
             }
         };
         const auto checkStage = [&](const char* name,
                                     const std::vector<float>& expected,
                                     std::size_t readyCycle) {
+            if (dynamicOnly) return;
             advanceTo(readyCycle);
             const auto binding = std::find_if(program.bindings.begin(),
                 program.bindings.end(), [&](const auto& b) {
@@ -1442,7 +1460,7 @@ try {
             }
         checkStage("attention.result", projectedValues,
             timeline(program, "elementwise.add", 0).start_cycle);
-        if (std::any_of(program.timelines.begin(), program.timelines.end(),
+        if (!dynamicOnly && std::any_of(program.timelines.begin(), program.timelines.end(),
                 [](const auto& t) { return t.name == "rmsnorm.materialize_gamma"; })) {
             advanceTo(timeline(program, "rmsnorm.materialize_gamma").start_cycle);
             const auto gammaBinding = std::find_if(program.bindings.begin(),
@@ -1467,7 +1485,7 @@ try {
         }
         checkStage("elementwise.add.0", residual,
             timeline(program, "rmsnorm.transpose_input", 1).start_cycle);
-        if (std::any_of(program.timelines.begin(), program.timelines.end(),
+        if (!dynamicOnly && std::any_of(program.timelines.begin(), program.timelines.end(),
                 [](const auto& t) { return t.name == "rmsnorm.materialize_gamma"; })) {
             for (std::size_t hemisphere = 0; hemisphere < 2; ++hemisphere)
                 for (std::size_t column = 0; column < kHidden; ++column)
@@ -1499,7 +1517,7 @@ try {
         // tiles cover that drain while the tail SwiGLU scratch copies have
         // not yet reclaimed any original Gate rows.
         advanceTo(projectionReady + 2 * program.hardware.mxm_rows);
-        for (std::size_t projection = 0; projection < 2; ++projection)
+        for (std::size_t projection = 0; projection < (dynamicOnly ? 0u : 2u); ++projection)
             for (std::size_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
                 std::vector<float> observed(kSeqLen * kIntermediate);
                 std::vector<float> expected(observed.size());
@@ -1563,7 +1581,7 @@ try {
         // The fixture reserves the input's distributed rows first, followed
         // by the hidden tensor in the same bank.
         const auto hiddenBase = (kHidden / vectorWidth) * tokenGroups;
-        for (std::size_t hemisphere = 0; hemisphere < 2; ++hemisphere) {
+        for (std::size_t hemisphere = 0; hemisphere < (dynamicOnly ? 0u : 2u); ++hemisphere) {
             std::vector<float> observed(expectedHidden.size());
             float maximum = 0.0f;
             std::size_t worst = 0;
@@ -1615,6 +1633,12 @@ try {
         checkStage("ffn.result", expectedDown, finalAddStart);
         checkStage("elementwise.add.0.persistent", residual, finalAddStart);
         advanceTo(program.max_cycle + 64);
+        std::vector<std::uint8_t> referenceOutput;
+        for (std::size_t i = 0; i < residual.size(); ++i)
+            appendBf16(referenceOutput, bf16(residual[i] + expectedDown[i]));
+        std::cout << "LPU64 independent CPU reference prepared: BF16 values="
+                  << referenceOutput.size() / 2 << std::endl;
+        if (!dynamicOnly) {
         const auto actual = runtime.download_output(0);
         double squaredError = 0.0;
         float maxError = 0.0f;
@@ -1645,6 +1669,7 @@ try {
         if (!std::isfinite(maxError) || !std::isfinite(rmse)
             || maxError > 0.1f || rmse > 0.01)
             throw std::logic_error("LPU64 decoder output numeric mismatch");
+        }
 #if FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES
         runtimeOwner.reset();
         systemOwner.reset();
@@ -1665,6 +1690,9 @@ try {
             dynamicSession.stream_mem_execution_trace_csv(memPath);
         dynamicSession.load(std::move(dynamicPackage));
         dynamicSession.set_input("hidden.0", input);
+        if (inputBindingByIndex(static_cast<std::uint32_t>(postAttentionNormBinding)).bank
+            != inputBindingByIndex(1).bank)
+            dynamicSession.set_input("post_attention_layernorm.weight", gamma1);
         std::cout << "LPU64 dynamic C2C start: DDR_MBps=" << runtimeDdrBandwidth
                   << " pages=" << expectedPrefetches << std::endl;
         try {
@@ -1683,18 +1711,19 @@ try {
         if (const char* path = std::getenv("FTLPU_QWEN_C2C_LINKED_BINARY"))
             dynamicSession.write_last_linked_program(path);
         const auto& dynamicActual = dynamicSession.value("hidden.1");
-        if (dynamicActual != actual) {
+        if (dynamicActual != referenceOutput) {
             std::size_t first = 0;
-            while (first < std::min(actual.size(), dynamicActual.size())
-                && actual[first] == dynamicActual[first]) ++first;
-            throw std::logic_error("LPU64 dynamic C2C differs from validated direct output: byte="
-                + std::to_string(first) + " direct_bytes=" + std::to_string(actual.size())
+            while (first < std::min(referenceOutput.size(), dynamicActual.size())
+                && referenceOutput[first] == dynamicActual[first]) ++first;
+            throw std::logic_error("LPU64 dynamic C2C differs from independent CPU reference: byte="
+                + std::to_string(first) + " reference_bytes=" + std::to_string(referenceOutput.size())
                 + " dynamic_bytes=" + std::to_string(dynamicActual.size()));
         }
         verifyDynamic(dynamicSession, expectedPrefetches, expectedPagedBytes,
             expectedSyncInstructions, expectedSynchronizedWrites, runtimeDdrBandwidth);
         std::cout << "LPU64 dynamic C2C output: exact_match=" << dynamicActual.size() / 2
-                  << " BF16 values, total_cycles=" << dynamicSystem->cycle() << std::endl;
+                  << " BF16 values, final_transport_segment_cycles="
+                  << dynamicSystem->cycle() << std::endl;
 #endif
         return 0;
     }
@@ -2131,12 +2160,12 @@ try {
                 std::uint64_t {1} << (column % 64);
         }
     }
-    std::array<std::size_t, ftlpu::VxmSrSlice::kAluQueues> vxmRemaining {};
+    std::array<std::size_t, ftlpu::VxmSlice::kAluQueues> vxmRemaining {};
     for (std::size_t column = 0; column < vxmRemaining.size(); ++column) {
-        for (std::size_t tile = 0; tile < ftlpu::VxmSrSlice::kTileCount;
+        for (std::size_t tile = 0; tile < ftlpu::VxmSlice::kTileCount;
              ++tile) {
             vxmRemaining[column] +=
-                system->vxm_unit().config_entry_count(tile, column);
+                system->vxm_unit().superlane(tile).config_entry_count(column);
         }
     }
     const auto copiedBlockSlices = valueBinding->slices.begin();
@@ -3528,6 +3557,9 @@ try {
         dynamicSession.stream_mem_execution_trace_csv(dynamicMemTrace);
     dynamicSession.load(std::move(dynamicPackage));
     dynamicSession.set_input("hidden.0", input);
+    if (inputBindingByIndex(static_cast<std::uint32_t>(postAttentionNormBinding)).bank
+        != inputBindingByIndex(1).bank)
+        dynamicSession.set_input("post_attention_layernorm.weight", gamma1);
     try {
         dynamicSession.run(kCheckpointDrainCycles);
     } catch (...) {

@@ -38,7 +38,9 @@ int64_t emitDistributedActivationStaging(mlir::IRRewriter &rewriter,
       const auto latency = target.transport_latency(target::StreamEndpoint::VxmResult,
           target::StreamEndpoint::Mem,target::StreamDirection::East,slice);
       if (!latency) return -1;
-      const auto cycle = beat+target.throughput().vxm_alus+*latency+1;
+      // The passive bridge connects the two MEM fabrics at the VXM input
+      // boundary. No ALU traversal or arithmetic result latency is involved.
+      const auto cycle = beat+*latency;
       emitMem3D(rewriter,location,cycle,h*target.memory().slices_per_hemisphere+slice,
           "write",get(destination,"base_row"),(1-h)*16+byte,blocks*rows,1,1,
           "sram",-1,1,1,0,1,1,0,get(destination,"bank"));

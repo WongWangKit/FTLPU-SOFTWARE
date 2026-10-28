@@ -227,6 +227,7 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     REQUIRE_EXACT(icu_mxm_macro_context_bits);
     if (program.common_barrier_protocol)
         REQUIRE_EXACT(common_barrier_encoding_version);
+    REQUIRE_EXACT(vxm_reserved_feature);
 #undef REQUIRE_EXACT
 
     require_capacity("sram_depth_rows", requested.sram_depth_rows,
@@ -413,8 +414,41 @@ void CModelRuntime::load(
     const BinaryProgram& program, bool initializeInternalData)
 {
     validate_cmodel_hardware_config(program);
+    for (std::size_t tile=0;tile<VxmSlice::kTileCount;++tile)
+        for (std::size_t lane=0;lane<hw::kLanesPerTile;++lane)
+            system_.vxm_unit().superlane(tile).lane(lane)
+                .set_statistics_timeline_retention(false);
     const auto imem = analyze_physical_imem(program);
+    compute_imem_segments_.clear();compute_imem_queues_.clear();
+    compute_imem_segment_=0;compute_imem_boundary_=0;
+    auto initialQueues=program.queues;
     if (!imem.fits()) {
+        // Reload only overflowing compute queues. MEM, MXM and transport
+        // keep their original programs and global common-barrier timeline.
+        const bool supported=program.common_barrier_protocol &&
+            std::all_of(imem.queues.begin(),imem.queues.end(),[](const auto& q) {
+                return !q.deployment_overflow() ||
+                    (q.physical_overflow() && !q.fu_3d_context_overflow()
+                     && !q.macro_context_overflow() &&
+                     (q.kind==QueueKind::Vxm || q.kind==QueueKind::SxmTranspose || q.kind==QueueKind::SxmPermute));
+            });
+        if (supported) {
+            BinaryProgram subset;
+            subset.hardware=program.hardware;subset.max_cycle=program.max_cycle;
+            subset.timelines=program.timelines;
+            for(const auto& q:imem.queues)if(q.physical_overflow())
+                compute_imem_queues_.emplace_back(q.kind,q.index);
+            const auto selected=[&](const auto& q) {
+                return std::find(compute_imem_queues_.begin(),compute_imem_queues_.end(),
+                    std::make_pair(q.kind,static_cast<std::size_t>(q.index)))!=compute_imem_queues_.end();
+            };
+            for(const auto& q:program.queues)if(selected(q))subset.queues.push_back(q);
+            compute_imem_segments_=split_resident_program_at_drains(subset);
+            compute_imem_boundary_=compute_imem_segments_.front().max_cycle;
+            std::erase_if(initialQueues,selected);
+            const auto& first=compute_imem_segments_.front().queues;
+            initialQueues.insert(initialQueues.end(),first.begin(),first.end());
+        } else {
         std::ostringstream detail;
         detail << "linked ICU program exceeds local i-MEM capacity:";
         for (const auto& queue : imem.queues) {
@@ -424,6 +458,7 @@ void CModelRuntime::load(
         }
         detail << "; segmented i-MEM loading is required for this program";
         throw std::runtime_error(detail.str());
+        }
     }
     validate_binary_barriers(program);
     if (program.common_barrier_protocol) {
@@ -481,7 +516,7 @@ void CModelRuntime::load(
     for (std::size_t block = 0; block < 8; ++block)
         system_.configure_vxm_output_block_destination(block,
             block < 4 ? Hemisphere::West : Hemisphere::East);
-    instruction_prefill_cycles_ = load_queue_programs_into_icu(program.queues, system_.icu(),
+    instruction_prefill_cycles_ = load_queue_programs_into_icu(initialQueues, system_.icu(),
         program.hardware.mxms_per_hemisphere);
     if (c2c_system_ != nullptr) {
         constexpr auto kInstructionImageBase =
@@ -833,16 +868,24 @@ void CModelRuntime::upload_binding(
     if (binding.shape.size() == 3)
         columns *= static_cast<std::size_t>(binding.shape[2]);
     const std::size_t row_stride = static_cast<std::size_t>(std::abs(binding.address_stride));
-    if (binding.layout == BindingLayout::TokenPartitionPlanar) {
+    if (binding.layout == BindingLayout::TokenPartitionPlanar
+        || binding.layout == BindingLayout::ColumnPartitionPlanar) {
+        const bool columnPartition = binding.layout == BindingLayout::ColumnPartitionPlanar;
         const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
         if (binding.slices.size() != bytes || binding.hemisphere_mask != 3 || rows == 0)
             throw std::invalid_argument("invalid token-partitioned planar binding");
         const auto half = (rows + 1) / 2;
+        const auto halfColumns = (columns + 1) / 2;
+        if (columnPartition && columns % (2 * hardware_.bytes_per_word))
+            throw std::invalid_argument("column partition requires aligned column halves");
         for (std::size_t row = 0; row < rows; ++row)
             for (std::size_t column = 0; column < columns; ++column) {
-                const auto hemisphere = row < half ? Hemisphere::West : Hemisphere::East;
+                const auto hemisphere = columnPartition
+                    ? (column < halfColumns ? Hemisphere::East : Hemisphere::West)
+                    : (row < half ? Hemisphere::West : Hemisphere::East);
                 const auto address = static_cast<std::size_t>(binding.base_row)
-                    + ((column / hardware_.bytes_per_word) * half + row % half) * row_stride;
+                    + (columnPartition ? ((column % halfColumns) / hardware_.bytes_per_word) * rows + row
+                        : (column / hardware_.bytes_per_word) * half + row % half) * row_stride;
                 for (std::size_t byte = 0; byte < bytes; ++byte)
                     write_binding_sram_byte(system_, binding, hemisphere, binding.slices[byte],
                         address, column % hardware_.bytes_per_word, data[(row * columns + column) * bytes + byte]);
@@ -1112,7 +1155,7 @@ void CModelRuntime::upload_binding(
     }
     if (binding.layout == BindingLayout::Fp16VxmGammaBroadcast
         && is_16bit_float(binding.element_type)
-        && (binding.slices.size() == 2 || binding.slices.size() == 4)) {
+        && (!binding.slices.empty() && binding.slices.size() % 2 == 0)) {
         if (!vector)
             throw std::logic_error(
                 "VXM gamma broadcast input requires a rank-1 tensor");
@@ -1424,17 +1467,25 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
     const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
     const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
     const std::size_t row_stride = static_cast<std::size_t>(std::abs(binding.address_stride));
-    if (binding.layout == BindingLayout::TokenPartitionPlanar) {
+    if (binding.layout == BindingLayout::TokenPartitionPlanar
+        || binding.layout == BindingLayout::ColumnPartitionPlanar) {
+        const bool columnPartition = binding.layout == BindingLayout::ColumnPartitionPlanar;
         const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
         if (binding.slices.size() != bytes || binding.hemisphere_mask != 3 || rows == 0)
             throw std::invalid_argument("invalid token-partitioned planar binding");
         const auto half = (rows + 1) / 2;
+        const auto halfColumns = (columns + 1) / 2;
+        if (columnPartition && columns % (2 * hardware_.bytes_per_word))
+            throw std::invalid_argument("column partition requires aligned column halves");
         std::vector<std::uint8_t> result(binding.byte_size);
         for (std::size_t row = 0; row < rows; ++row)
             for (std::size_t column = 0; column < columns; ++column) {
-                const auto hemisphere = row < half ? Hemisphere::West : Hemisphere::East;
+                const auto hemisphere = columnPartition
+                    ? (column < halfColumns ? Hemisphere::East : Hemisphere::West)
+                    : (row < half ? Hemisphere::West : Hemisphere::East);
                 const auto address = static_cast<std::size_t>(binding.base_row)
-                    + ((column / hardware_.bytes_per_word) * half + row % half) * row_stride;
+                    + (columnPartition ? ((column % halfColumns) / hardware_.bytes_per_word) * rows + row
+                        : (column / hardware_.bytes_per_word) * half + row % half) * row_stride;
                 for (std::size_t byte = 0; byte < bytes; ++byte)
                     result[(row * columns + column) * bytes + byte] = read_binding_sram_byte(
                         system_, binding, hemisphere, binding.slices[byte], address, column % hardware_.bytes_per_word);
@@ -1979,6 +2030,28 @@ void CModelRuntime::notify_common_page_commit(std::uint64_t generation, std::uin
     system_.icu().notify_common_mem_commit(generation, instance);
 }
 
+void CModelRuntime::reload_drained_compute_imem()
+{
+    if(compute_imem_segments_.empty() || compute_imem_segment_+1>=compute_imem_segments_.size()
+        || executed_cycles_!=compute_imem_boundary_)return;
+    if(!system_.vxm_unit().idle())
+        throw std::runtime_error("compiler iMEM drain reached while VXM is active");
+    auto& icu=system_.icu();
+    const auto reset=[](auto& queue) {
+        if(!queue.done())throw std::runtime_error("compiler iMEM drain reached with unfinished ICU instructions");
+        queue.reset();
+    };
+    for(const auto& [kind,index]:compute_imem_queues_) {
+        if(kind==QueueKind::Vxm)reset(icu.vxm_iq(index));
+        else if(kind==QueueKind::SxmTranspose)reset(icu.sxm_transpose_iq(static_cast<Hemisphere>(index)));
+        else if(kind==QueueKind::SxmPermute)reset(icu.sxm_permute_iq(static_cast<Hemisphere>(index)));
+    }
+    ++compute_imem_segment_;
+    const auto& part=compute_imem_segments_[compute_imem_segment_];
+    instruction_prefill_cycles_+=load_queue_programs_into_icu(part.queues,icu,loaded_mxms_per_hemisphere_);
+    compute_imem_boundary_+=part.max_cycle;
+}
+
 void CModelRuntime::run_logical_cycles(
     std::size_t cycles, TspSliceSystem::LogSinks sinks)
 {
@@ -1988,6 +2061,7 @@ void CModelRuntime::run_logical_cycles(
     std::size_t heldCycles = 0;
     constexpr std::size_t kPhysicalWaitWatchdog = 10'000'000;
     for (std::size_t advanced = 0; advanced < count;) {
+        reload_drained_compute_imem();
         // P advances on every tick; L advances only on an enabled dispatch.
         load_ready_weight_pages();
         advance_common_transport();

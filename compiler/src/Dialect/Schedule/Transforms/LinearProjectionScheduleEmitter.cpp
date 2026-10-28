@@ -138,7 +138,8 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
         op.emitError("replicated gated projection requires one token tile with local dequantization");
         return mlir::failure();
     }
-    if (m % tile || n % (2 * tile) || k % tile) {
+    if ((m > tile && m % tile) || n % (2 * tile) || k % tile
+        || (m < tile && !localDequant)) {
         op.emitError("linear projection dimensions are not MXM aligned");
         return mlir::failure();
     }

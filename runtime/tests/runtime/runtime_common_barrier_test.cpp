@@ -1,6 +1,7 @@
 #include "ftlpu/software/runtime/c2c_weight_pager.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
+#include "ftlpu/icu/fu_3d_codec.hpp"
 
 #include <algorithm>
 #include <array>
@@ -284,6 +285,35 @@ Result run(std::size_t latency, bool cycleZero = false)
         rejects([&] { runtime.load(alias); }, "internal SRAM read was mistaken for the incoming weight page");
         alias.address_relocations.back().binding_access = BindingAccess::Input;
         runtime.load(alias); // The incoming page's own linked read is legal.
+        // Native 3D must pass the same SRAM proof, including provenance after
+        // one domain splits into several affine descriptors for analysis.
+        auto native3d = alias;
+        auto& nativeQueue = native3d.queues.back();
+        nativeQueue.requires_raw_macro = false;
+        nativeQueue.commands.clear();
+        IcuLoop3D loop;
+        loop.counts = {2, 2, 2};
+        loop.cycle_strides = {1, 8, 32};
+        loop.wait_cycle = 256;
+        const auto packet = isa::encode_mem_icu_3d_instruction(
+            MemIcuInstruction::Read3D(loop,
+                MemIcuAddress3D::Affine(segment.base_row, {1, 2, 4}), StreamId::East(2)));
+        for (const auto& word : packet.words) {
+            QueueCommand command;
+            command.command = word.lanes[0];
+            command.instruction_kind = InstructionKind::Mem;
+            command.word_count = packet.kLanesPerWord;
+            std::copy(word.lanes.begin(), word.lanes.end(), command.words.begin());
+            nativeQueue.commands.push_back(command);
+        }
+        runtime.load(native3d);
+        native3d.address_relocations.back().binding_access = BindingAccess::Internal;
+        rejects([&] { runtime.load(native3d); },
+            "Native 3D page write overwrote a future non-weight read");
+        native3d.address_relocations.back().binding_access = BindingAccess::Input;
+        native3d.address_relocations.back().command_index = 1;
+        rejects([&] { runtime.load(native3d); },
+            "Native 3D proof accepted provenance on a continuation word");
         // A mixed queue can take the Native compatibility loader. Its first
         // Macro runs at L256, so a following Native read really runs after the
         // page-in; the proof must not mistake it for cursor zero and skip it.
@@ -319,6 +349,18 @@ Result run(std::size_t latency, bool cycleZero = false)
             encode_macro_schedule_command(write, {530, 2, 1, 2, 1, 1, 0, IcuInductionTarget::MemAddress}),
             encode_macro_schedule_command(readHole, {600, 1, 1, 0, 1, 1, 0, IcuInductionTarget::MemAddress})};
         rejects([&] { runtime.load(holes); }, "a hole in the future write domain was mistaken for complete SRAM replacement");
+        auto unionWrites = holes;
+        auto oddWrite = write;
+        const auto oddBits = isa::encode_mem_instruction(MemInstruction::Write(segment.base_row+1, StreamId::West(2)));
+        oddWrite.words[0]=static_cast<std::uint32_t>(oddBits);
+        oddWrite.words[1]=static_cast<std::uint32_t>(oddBits>>32);
+        unionWrites.queues.back().commands = {
+            encode_macro_schedule_command(write,{530,2,1,2,1,1,0,IcuInductionTarget::MemAddress}),
+            encode_macro_schedule_command(oddWrite,{540,2,1,2,1,1,0,IcuInductionTarget::MemAddress}),
+            encode_macro_schedule_command(read,{600,4,1,1,1,1,0,IcuInductionTarget::MemAddress})};
+        runtime.load(unionWrites);
+        unionWrites.queues.back().commands.erase(unionWrites.queues.back().commands.begin()+1);
+        rejects([&]{runtime.load(unionWrites);},"incomplete sparse write union released the whole read range");
         auto overlap = program;
         auto secondBinding = overlap.bindings.front();
         secondBinding.index = 1;

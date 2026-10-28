@@ -57,11 +57,11 @@ try {
                                    command.words[1])
                                 << 32),
                         command.words[2]});
-                const auto& instruction = decoded;
+                const auto& instruction = decoded.instruction;
                 require(instruction.lhs.kind
-                        == VxmSrOperandKind::StreamBFloat16,
+                        == VxmLaneOperandKind::StreamBFloat16,
                     "VXM BF16 stream operand was lost");
-                require(instruction.result_type
+                require(instruction.output_type
                         == VxmCastTarget::BFloat16,
                     "VXM BF16 cast target was lost");
                 sawVxm = true;

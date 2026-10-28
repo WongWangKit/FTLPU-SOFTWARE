@@ -1,3 +1,4 @@
+#include "ftlpu/compiler/Target/vxm_chain_lowering.hpp"
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Command/Transforms/fu_3d_command_materializer.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
@@ -265,94 +266,6 @@ void require_materialized(mlir::LogicalResult result,
             " lowering: " + llvm::StringRef(error)).str());
 }
 
-StreamDirection parse_schedule_stream_direction(
-    llvm::StringRef value, llvm::StringRef localHemisphere)
-{
-    if (value.empty() || value == "local") value = localHemisphere;
-    if (value == "east") return StreamDirection::East;
-    if (value == "west") return StreamDirection::West;
-    throw std::runtime_error(
-        "Schedule IR VXM stream source must be local, east, or west");
-}
-
-std::uint8_t schedule_sr(StreamDirection direction, int64_t index,
-    std::size_t width, llvm::StringRef field)
-{
-    if (index < 0 || index >= static_cast<int64_t>(hw::kStreamsPerDirection)
-        || index + static_cast<int64_t>(width)
-            > static_cast<int64_t>(hw::kStreamsPerDirection)
-        || index % static_cast<int64_t>(width) != 0)
-        throw std::runtime_error((field + " is not an aligned SR span").str());
-    return static_cast<std::uint8_t>(
-        direction == StreamDirection::East
-            ? StreamId::East(static_cast<std::size_t>(index)).packed()
-            : StreamId::West(static_cast<std::size_t>(index)).packed());
-}
-
-std::uint8_t schedule_alu_result_sr(
-    int64_t producer, StreamDirection direction)
-{
-    if (producer < 0 || producer >= static_cast<int64_t>(hw::kVxmAluCount))
-        throw std::runtime_error(
-            "VXM alu(N) producer exceeds the configured physical column count");
-    // Raw BF16 operands occupy SR0..SR15 while they cross the physical VXM
-    // columns. Keep inter-column FP32 temporaries in SR16..SR31 so a
-    // downstream VALU cannot consume an in-flight raw operand as a result.
-    const int64_t slot = producer % 4;
-    const int64_t base = producer % 16 < 8 ? 16 : 0;
-    return schedule_sr(direction, base + 4 * slot, 4,
-        "VXM internal FP32 result SR");
-}
-
-VxmSrOperand parse_schedule_vxm_sr_operand(llvm::StringRef kind,
-    int64_t index, float immediate, int64_t queue, int64_t chainDepth,
-    llvm::StringRef streamSource, llvm::StringRef inputHemisphere)
-{
-    if (kind == "accumulator") return VxmSrOperand::Accumulator();
-    if (kind == "immediate") return VxmSrOperand::Immediate(immediate);
-    if (kind == "previous" || kind == "feedback") {
-        const int64_t producer = kind == "previous" ? queue - 1
-                                                     : queue + chainDepth - 1;
-        const auto direction = producer < queue
-            ? StreamDirection::East : StreamDirection::West;
-        return VxmSrOperand::StreamFloat32(
-            schedule_alu_result_sr(producer, direction));
-    }
-    if (kind == "alu") {
-        const auto direction = index < queue
-            ? StreamDirection::East : StreamDirection::West;
-        return VxmSrOperand::StreamFloat32(
-            schedule_alu_result_sr(index, direction));
-    }
-    if (kind == "original" || kind == "auxiliary") {
-        const int64_t head = queue - queue % chainDepth;
-        const int64_t group = head % 16
-            + (kind == "auxiliary" ? 1 : 0);
-        const auto direction = parse_schedule_stream_direction(
-            "local", inputHemisphere);
-        const auto sr = schedule_sr(direction, group * 2, 2,
-            "VXM preserved input SR");
-        return VxmSrOperand::StreamBFloat16(sr);
-    }
-    const auto direction = parse_schedule_stream_direction(
-        streamSource, inputHemisphere);
-    if (index >= static_cast<int64_t>(hw::kStreamsPerDirection)) index %= 32;
-    if (kind == "stream_f16")
-        return VxmSrOperand::StreamFloat16(
-            schedule_sr(direction, index, 2, "VXM FP16 operand SR"));
-    if (kind == "stream_bf16")
-        return VxmSrOperand::StreamBFloat16(
-            schedule_sr(direction, index, 2, "VXM BF16 operand SR"));
-    if (kind == "stream_f32")
-        return VxmSrOperand::StreamFloat32(
-            schedule_sr(direction, index, 4, "VXM FP32 operand SR"));
-    if (kind == "stream_i8")
-        return VxmSrOperand::StreamInt8(
-            schedule_sr(direction, index, 1, "VXM int8 operand SR"));
-    throw std::runtime_error(
-        "unsupported Schedule IR VXM SR operand kind");
-}
-
 VxmCastTarget parse_schedule_vxm_cast_target(llvm::StringRef value)
 {
     if (value == "fp32") return VxmCastTarget::Float32;
@@ -364,34 +277,26 @@ VxmCastTarget parse_schedule_vxm_cast_target(llvm::StringRef value)
 
 void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op)
 {
+    target::validateVxmChainControls(op);
     const int64_t effectiveRepeatCount = op.getRepeatCount();
     const int64_t effectiveRepeatInterval = op.getRepeatInterval();
         const int64_t queue = op.getQueue();
         try {
-        const int64_t chainDepth = op.getChainDepth().value_or(8);
-        if (chainDepth <= 0 || hw::kVxmAluCount % chainDepth != 0)
-            throw std::runtime_error("Schedule IR VXM chain depth is invalid");
-        auto instruction = VxmSrInstruction {};
+        auto instruction = VxmLaneAluInstruction {};
         instruction.operation = parse_schedule_vxm_operation(op.getOpcode());
         const auto lhsSource =
             op->getAttrOfType<mlir::StringAttr>("lhs_stream_source");
         const auto rhsSource =
             op->getAttrOfType<mlir::StringAttr>("rhs_stream_source");
-        instruction.lhs = parse_schedule_vxm_sr_operand(op.getLhsKind(),
+        instruction.lhs = target::lowerVxmChainOperand(op.getLhsKind(),
             op.getLhsIndex(),
             static_cast<float>(op.getLhsImmediateAttr().getValueAsDouble()),
-            queue, chainDepth,
-            lhsSource ? lhsSource.getValue() : llvm::StringRef {},
-            op.getInputHemisphere());
-        instruction.rhs = parse_schedule_vxm_sr_operand(op.getRhsKind(),
+            queue, false, lhsSource ? lhsSource.getValue() : llvm::StringRef {});
+        instruction.rhs = target::lowerVxmChainOperand(op.getRhsKind(),
             op.getRhsIndex(),
             static_cast<float>(op.getRhsImmediateAttr().getValueAsDouble()),
-            queue, chainDepth,
-            rhsSource ? rhsSource.getValue() : llvm::StringRef {},
-            op.getInputHemisphere());
-        instruction.lhs_stream_tap = op.getLhsStreamTap().value_or(false);
-        instruction.rhs_stream_tap = op.getRhsStreamTap().value_or(false);
-        instruction.result_type =
+            queue, true, rhsSource ? rhsSource.getValue() : llvm::StringRef {});
+        instruction.output_type =
             parse_schedule_vxm_cast_target(op.getCastTarget());
         instruction.precision = VxmAluPrecision::Float32;
         const bool contiguousRun = effectiveRepeatInterval == 1;
@@ -400,26 +305,19 @@ void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op)
         instruction.accumulator_reset =
             op.getAccumulatorReset().value_or(false);
         instruction.accumulator_write =
-            op.getAccumulatorWrite().value_or(false)
-            || op.getLocalScalarWrite().value_or(false);
+            op.getAccumulatorWrite().value_or(false);
         instruction.accumulator_emit =
             op.getAccumulatorEmit().value_or(true);
-        instruction.accumulator_reset_first =
-            op.getAccumulatorResetFirst().value_or(false);
-        instruction.accumulator_emit_last =
-            op.getAccumulatorEmitLast().value_or(false);
+        instruction.local_scalar_write =
+            op.getLocalScalarWrite().value_or(false);
         const int64_t outputStream = op.getOutputStreamAttr().getInt();
-        const auto resultDirection = outputStream >= 0
-            ? parse_schedule_stream_direction(
-                  op.getOutputHemisphere(), op.getOutputHemisphere())
-            : parse_schedule_stream_direction(
-                  "local", op.getInputHemisphere());
-        instruction.result_sr = outputStream >= 0
-            ? schedule_sr(resultDirection, outputStream % 32,
-                  instruction.result_type == VxmCastTarget::Float32 ? 4
-                      : instruction.result_type == VxmCastTarget::Int8 ? 1 : 2,
-                  "VXM output SR")
-            : schedule_alu_result_sr(queue, resultDirection);
+        if (outputStream >= 0)
+            instruction.output_stream =
+                static_cast<std::size_t>(outputStream);
+        const auto depth = static_cast<VxmChainDepth>(
+            op->getAttrOfType<mlir::IntegerAttr>("chain_depth")
+                ? op->getAttrOfType<mlir::IntegerAttr>("chain_depth").getInt()
+                : 8);
         const auto run = VxmIcuRun2DInstruction::Run2D(
             static_cast<std::size_t>(op.getCycle()),
             {static_cast<std::size_t>(
@@ -428,7 +326,7 @@ void create_vxm_command(mlir::OpBuilder& builder, schedule::VxmOp op)
             {static_cast<std::size_t>(
                  contiguousRun ? 1 : effectiveRepeatInterval),
                 static_cast<std::size_t>(op.getWaveInterval().value_or(1))},
-            VxmSrCompactInstructionCodec::encode(instruction));
+            isa::encode_vxm_instruction(queue, depth, instruction));
         std::string error;
         if (mlir::failed(command::materializeVxmRun2DCommand(builder,
                 op.getLoc(), static_cast<std::size_t>(queue), run, &error,
@@ -884,9 +782,21 @@ public:
             int64_t release{0};
             bool runtimePrefetch{false};
             mlir::Location location;
+            std::optional<int64_t> syncGroup;
         };
         std::map<std::tuple<int64_t, int64_t, int64_t>,
             WeightPageInterval> weightPages;
+        // A future invocation's input has no FU consumer in this function.
+        // Its compiler-declared deadline still authors MEM_WRITE_SYNC in the
+        // idle bank; runtime supplies only DDR addresses and completion events.
+        for (schedule::BindingOp binding : bindings) {
+            const auto ready = binding.getPlacement().getAs<mlir::IntegerAttr>("prefetch_ready_cycle");
+            if (!ready) continue;
+            const auto bank = placement_integer_or(binding.getPlacement(), "bank", 0);
+            weightPages.emplace(std::tuple{binding.getIndex(), int64_t{0}, bank},
+                WeightPageInterval{static_cast<int64_t>(binding.getIndex()), 0, bank, ready.getInt(),
+                    ready.getInt()+1, true, binding.getLoc()});
+        }
         for (schedule::MemReadOp read : reads) {
             const auto page = read.getPlacement()
                 .getAs<mlir::IntegerAttr>("weight_page");
@@ -906,6 +816,15 @@ public:
                     std::numeric_limits<int64_t>::max(), 0,
                     false, read.getLoc()});
             auto& interval = position->second;
+            if (const auto group = read.getPlacement()
+                    .getAs<mlir::IntegerAttr>("weight_sync_group")) {
+                if (interval.syncGroup && *interval.syncGroup != group.getInt()) {
+                    read.emitError("one weight page spans inconsistent readiness groups");
+                    signalPassFailure();
+                    return;
+                }
+                interval.syncGroup = group.getInt();
+            }
             if (const auto bindingPlacement = read.getPlacement()
                     .getAs<mlir::DictionaryAttr>("binding_placement"))
                 if (const auto runtimePrefetch = bindingPlacement
@@ -959,6 +878,17 @@ public:
             interval.release = std::max<int64_t>(
                 interval.release, endCycle);
         }
+        // Normalize a compiler-declared dependency group before authoring
+        // SYNC/MEM_WRITE_SYNC. Runtime only waits for all transfers in that
+        // epoch; it does not infer projection relationships or predict DDR.
+        std::map<int64_t, int64_t> groupReady;
+        for (const auto& [key, interval] : weightPages) {
+            if (!interval.syncGroup) continue;
+            auto [it, inserted] = groupReady.emplace(*interval.syncGroup, interval.ready);
+            if (!inserted) it->second = std::min(it->second, interval.ready);
+        }
+        for (auto& [key, interval] : weightPages)
+            if (interval.syncGroup) interval.ready = groupReady.at(*interval.syncGroup);
         builder.setInsertionPointToStart(&function.getBody().front());
         for (const auto& [key, interval] : weightPages) {
             (void)key;

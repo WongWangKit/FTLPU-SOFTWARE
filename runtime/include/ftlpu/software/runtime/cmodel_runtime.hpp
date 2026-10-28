@@ -85,6 +85,10 @@ private:
     void load_ready_weight_pages();
     void configure_common_transport(const BinaryProgram& program);
     void advance_common_transport();
+    void reload_drained_compute_imem();
+    std::vector<BinaryProgram> compute_imem_segments_{};
+    std::vector<std::pair<QueueKind, std::size_t>> compute_imem_queues_{};
+    std::size_t compute_imem_segment_{0}, compute_imem_boundary_{0};
     struct CommonTransportPage {
         std::uint32_t launch_event{0}, stop_cycle{0};
         std::uint16_t hemisphere_mask{0};

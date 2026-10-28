@@ -1,3 +1,4 @@
+#include "ftlpu/compiler/Target/vxm_chain_lowering.hpp"
 // Keep this translation unit rebuilt when BinaryProgram or binding ABI evolves.
 #include "ftlpu/compiler/Target/command_binary.hpp"
 
@@ -844,27 +845,32 @@ StreamReleaseSummary stream_release_cycles(
             isa::decode_vxm_icu_run_2d_instruction(packet);
         const auto decoded = isa::decode_vxm_instruction(
             static_cast<std::size_t>(op.getQueue()), run.instruction);
-        const auto& instruction = decoded;
+        const auto& instruction = decoded.instruction;
         const int64_t end = raw_loop_absolute_final_cycle(
             op.getOperation(), run.loop, instruction.repeat_count - 1);
-        const auto markOperand = [&](const VxmSrOperand& operand) {
-            const auto width =
-                operand.kind == VxmSrOperandKind::StreamFloat32 ? 4
-                : operand.kind == VxmSrOperandKind::StreamInt8 ? 1
-                : (operand.kind == VxmSrOperandKind::StreamFloat16
-                      || operand.kind == VxmSrOperandKind::StreamBFloat16)
-                ? 2 : 0;
-            if (width == 0)
-                return;
-            markRange(static_cast<int64_t>(operand.sr), width, end);
-        };
-        markOperand(instruction.lhs);
-        markOperand(instruction.rhs);
-        const int64_t width =
-            instruction.result_type == VxmCastTarget::Int8 ? 1
-            : instruction.result_type == VxmCastTarget::Float32 ? 4
-            : 2;
-        markRange(static_cast<int64_t>(instruction.result_sr), width, end);
+        // Both mirrored datapaths share this config. Reserve their fixed
+        // input/output groups on both hemispheres for transport scheduling.
+        for (const auto stage : {static_cast<std::size_t>(op.getQueue()),
+                 static_cast<std::size_t>(op.getQueue()) + 8}) {
+            const auto markOperand = [&](const VxmLaneOperand& operand,
+                                         bool rhs) {
+                if (operand.kind != VxmLaneOperandKind::StreamFloat16
+                    && operand.kind != VxmLaneOperandKind::StreamBFloat16)
+                    return;
+                const auto base = 2 * VxmLane::fixed_input_group_for_stage(stage, rhs);
+                markRange(base, 2, end);
+                markRange(streamCount + base, 2, end);
+            };
+            markOperand(instruction.lhs, false);
+            markOperand(instruction.rhs, true);
+            if (instruction.output_stream) {
+                const auto base = VxmLane::fixed_output_stream_for_block(stage / 2);
+                const auto width = instruction.output_type == VxmCastTarget::Int8 ? 1
+                    : instruction.output_type == VxmCastTarget::Float32 ? 4 : 2;
+                markRange(base, width, end);
+                markRange(streamCount + base, width, end);
+            }
+        }
     });
     module.walk([&](command::SxmRun2DOp op) {
         if (afterWeightIngress(op)) return;
@@ -895,6 +901,8 @@ BindingLayout parse_layout(llvm::StringRef value)
     if (value == "w8a16_mxm_weight_striped") return BindingLayout::W8A16MxmWeightStriped;
     if (value == "w8a16_mxm_weight_replicated")
         return BindingLayout::W8A16MxmWeightReplicated;
+    if (value == "w8a16_mxm_weight_wave_split_dense")
+        return BindingLayout::W8A16MxmWeightWaveSplitDense;
     if (value == "w8a16_mxm_weight_wave_striped")
         return BindingLayout::W8A16MxmWeightWaveStriped;
     if (value == "w8a16_attention_weight_striped")
@@ -904,6 +912,7 @@ BindingLayout parse_layout(llvm::StringRef value)
     if (value == "fp16_pair_planar") return BindingLayout::Fp16PairPlanar;
     if (value == "fp16_hemisphere_pair_planar") return BindingLayout::Fp16HemispherePairPlanar;
     if (value == "token_partition_planar") return BindingLayout::TokenPartitionPlanar;
+    if (value == "column_partition_planar") return BindingLayout::ColumnPartitionPlanar;
     if (value == "fp32_quad_planar") return BindingLayout::Fp32QuadPlanar;
     if (value == "fp16_scalar_broadcast_planar")
         return BindingLayout::Fp16ScalarBroadcastPlanar;
@@ -1248,96 +1257,6 @@ VxmLaneOperation parse_vxm_operation(llvm::StringRef value)
         "Command IR VXM operation is not implemented by the current CModel");
 }
 
-StreamDirection parse_vxm_stream_direction(
-    llvm::StringRef value, llvm::StringRef localHemisphere)
-{
-    if (value.empty() || value == "local") value = localHemisphere;
-    if (value == "east") return StreamDirection::East;
-    if (value == "west") return StreamDirection::West;
-    throw std::runtime_error(
-        "Command IR VXM stream source must be local, east, or west");
-}
-
-std::uint8_t command_sr(StreamDirection direction, int64_t index,
-    std::size_t width, llvm::StringRef field)
-{
-    if (index < 0 || index >= static_cast<int64_t>(hw::kStreamsPerDirection)
-        || index + static_cast<int64_t>(width)
-            > static_cast<int64_t>(hw::kStreamsPerDirection)
-        || index % static_cast<int64_t>(width) != 0)
-        throw std::runtime_error((field + " is not an aligned SR span").str());
-    return static_cast<std::uint8_t>(
-        direction == StreamDirection::East
-            ? StreamId::East(static_cast<std::size_t>(index)).packed()
-            : StreamId::West(static_cast<std::size_t>(index)).packed());
-}
-
-std::uint8_t command_alu_result_sr(
-    int64_t producer, StreamDirection direction)
-{
-    if (producer < 0 || producer >= static_cast<int64_t>(hw::kVxmAluCount))
-        throw std::runtime_error(
-            "VXM alu(N) producer exceeds the configured physical column count");
-    // Raw BF16 operands occupy SR0..SR15 while they cross the physical VXM
-    // columns.  Keep all inter-column FP32 temporaries in SR16..SR31 so a
-    // downstream VALU cannot mistake an in-flight raw operand for an ALU
-    // result. Four rotating slots suffice because a value is consumed before
-    // its producer slot is reused four columns later.
-    const int64_t slot = producer % 4;
-    const int64_t base = producer < 8 ? 16 : 0;
-    return command_sr(direction, base + 4 * slot, 4,
-        "VXM internal FP32 result SR");
-}
-
-VxmSrOperand parse_vxm_sr_operand(llvm::StringRef kind, int64_t index,
-    float immediate, int64_t queue, int64_t chainDepth,
-    llvm::StringRef streamSource, llvm::StringRef inputHemisphere)
-{
-    if (kind == "accumulator") return VxmSrOperand::Accumulator();
-    if (kind == "immediate") return VxmSrOperand::Immediate(immediate);
-    if (kind == "previous" || kind == "feedback") {
-        const int64_t producer = kind == "previous" ? queue - 1
-                                                     : queue + chainDepth - 1;
-        const auto direction = producer < queue
-            ? StreamDirection::East : StreamDirection::West;
-        return VxmSrOperand::StreamFloat32(
-            command_alu_result_sr(producer, direction));
-    }
-    if (kind == "alu") {
-        const auto direction = index < queue
-            ? StreamDirection::East : StreamDirection::West;
-        return VxmSrOperand::StreamFloat32(
-            command_alu_result_sr(index, direction));
-    }
-    if (kind == "original" || kind == "auxiliary") {
-        const int64_t head = queue - queue % chainDepth;
-        const int64_t group = (head / 2) * 2
-            + (kind == "auxiliary" ? 1 : 0);
-        const auto direction = parse_vxm_stream_direction(
-            "local", inputHemisphere);
-        const auto sr = command_sr(direction, group * 2, 2,
-            "VXM preserved input SR");
-        return VxmSrOperand::StreamBFloat16(sr);
-    }
-    const auto direction = parse_vxm_stream_direction(
-        streamSource, inputHemisphere);
-    if (index >= static_cast<int64_t>(hw::kStreamsPerDirection)) index %= 32;
-    if (kind == "stream_f16")
-        return VxmSrOperand::StreamFloat16(
-            command_sr(direction, index, 2, "VXM FP16 operand SR"));
-    if (kind == "stream_bf16")
-        return VxmSrOperand::StreamBFloat16(
-            command_sr(direction, index, 2, "VXM BF16 operand SR"));
-    if (kind == "stream_f32")
-        return VxmSrOperand::StreamFloat32(
-            command_sr(direction, index, 4, "VXM FP32 operand SR"));
-    if (kind == "stream_i8")
-        return VxmSrOperand::StreamInt8(
-            command_sr(direction, index, 1, "VXM int8 operand SR"));
-    throw std::runtime_error(
-        "unsupported Command IR VXM SR operand kind");
-}
-
 VxmCastTarget parse_vxm_cast_target(llvm::StringRef value)
 {
     if (value == "fp32") return VxmCastTarget::Float32;
@@ -1349,57 +1268,43 @@ VxmCastTarget parse_vxm_cast_target(llvm::StringRef value)
 
 void collect_vxm(command::VxmOp op, QueueMap& queues)
 {
+    target::validateVxmChainControls(op);
     const int64_t queue = op.getQueue();
     if (queue < 0 || queue >= InstructionControlUnit::kVxmQueues)
         throw std::runtime_error(
-            "Command IR VXM queue exceeds the configured physical VALU columns");
+            "Command IR VXM queue exceeds the 8 compact control queues");
     const int64_t output_stream = op.getOutputStreamAttr().getInt();
-    const int64_t chainDepth = op.getChainDepth().value_or(8);
-    if (chainDepth <= 0 || hw::kVxmAluCount % chainDepth != 0)
-        throw std::runtime_error("Command IR VXM chain depth is invalid");
-    auto instruction = VxmSrInstruction {};
+    auto instruction = VxmLaneAluInstruction {};
     instruction.operation = parse_vxm_operation(op.getOpcode());
     const auto lhsSource =
         op->getAttrOfType<mlir::StringAttr>("lhs_stream_source");
     const auto rhsSource =
         op->getAttrOfType<mlir::StringAttr>("rhs_stream_source");
-    instruction.lhs = parse_vxm_sr_operand(op.getLhsKind(), op.getLhsIndex(),
-        static_cast<float>(op.getLhsImmediateAttr().getValueAsDouble()), queue,
-        chainDepth, lhsSource ? lhsSource.getValue() : llvm::StringRef{},
-        op.getInputHemisphere());
-    instruction.rhs = parse_vxm_sr_operand(op.getRhsKind(), op.getRhsIndex(),
-        static_cast<float>(op.getRhsImmediateAttr().getValueAsDouble()), queue,
-        chainDepth, rhsSource ? rhsSource.getValue() : llvm::StringRef{},
-        op.getInputHemisphere());
-    instruction.lhs_stream_tap = op.getLhsStreamTap().value_or(false);
-    instruction.rhs_stream_tap = op.getRhsStreamTap().value_or(false);
-    instruction.result_type = parse_vxm_cast_target(op.getCastTarget());
+    instruction.lhs = target::lowerVxmChainOperand(op.getLhsKind(), op.getLhsIndex(),
+        static_cast<float>(op.getLhsImmediateAttr().getValueAsDouble()), queue, false,
+        lhsSource ? lhsSource.getValue() : llvm::StringRef{});
+    instruction.rhs = target::lowerVxmChainOperand(op.getRhsKind(), op.getRhsIndex(),
+        static_cast<float>(op.getRhsImmediateAttr().getValueAsDouble()), queue, true,
+        rhsSource ? rhsSource.getValue() : llvm::StringRef{});
+    instruction.output_type = parse_vxm_cast_target(op.getCastTarget());
     instruction.precision = VxmAluPrecision::Float32;
     instruction.repeat_count = static_cast<std::size_t>(op.getRepeatCount());
     instruction.accumulator_reset = op.getAccumulatorReset().value_or(false);
-    instruction.accumulator_write = op.getAccumulatorWrite().value_or(false)
-        || op.getLocalScalarWrite().value_or(false);
+    instruction.accumulator_write = op.getAccumulatorWrite().value_or(false);
     instruction.accumulator_emit = op.getAccumulatorEmit().value_or(true);
-    instruction.accumulator_reset_first =
-        op.getAccumulatorResetFirst().value_or(false);
-    instruction.accumulator_emit_last =
-        op.getAccumulatorEmitLast().value_or(false);
-    const auto resultDirection = output_stream >= 0
-        ? parse_vxm_stream_direction(
-              op.getOutputHemisphere(), op.getOutputHemisphere())
-        : parse_vxm_stream_direction("local", op.getInputHemisphere());
-    instruction.result_sr = output_stream >= 0
-        ? command_sr(resultDirection, output_stream % 32,
-              instruction.result_type == VxmCastTarget::Float32 ? 4
-                  : instruction.result_type == VxmCastTarget::Int8 ? 1 : 2,
-              "VXM output SR")
-        : command_alu_result_sr(queue, resultDirection);
+    instruction.local_scalar_write = op.getLocalScalarWrite().value_or(false);
+    if (output_stream >= 0)
+        instruction.output_stream = static_cast<std::size_t>(output_stream);
+    const auto depth = static_cast<VxmChainDepth>(
+        op->getAttrOfType<mlir::IntegerAttr>("chain_depth")
+            ? op->getAttrOfType<mlir::IntegerAttr>("chain_depth").getInt()
+            : 8);
     try {
         queues[{QueueKind::Vxm, queue}].push_back(CommandSequence {
             command_cycle(op),
             1, 1, 0,
             vxm_instruction_command(
-                VxmSrCompactInstructionCodec::encode(instruction)),
+                isa::encode_vxm_instruction(queue, depth, instruction)),
             op.getScaleBinding()
                 ? static_cast<int64_t>(*op.getScaleBinding()) : -1,
         });
@@ -1408,7 +1313,7 @@ void collect_vxm(command::VxmOp op, QueueMap& queues)
             "invalid Command IR VXM instruction at cycle "
             + std::to_string(command_cycle(op)) + ", queue "
             + std::to_string(queue) + ", chain_depth "
-            + std::to_string(chainDepth)
+            + std::to_string(static_cast<int64_t>(depth))
             + ", output_stream " + std::to_string(output_stream)
             + ": " + error.what());
     }
@@ -3189,6 +3094,7 @@ void lower_direct_raw_macro(software::runtime::BinaryProgram& program)
 
 software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
 {
+    const bool progress=module->hasAttr("ftlpu.report_encoding_progress");
     const auto target = LPUTargetModel::from_operation(module);
     if (mlir::failed(target))
         throw std::runtime_error("Command IR module has an invalid target");
@@ -3256,6 +3162,7 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
                 lastPagedConsumer.value_or(0), use.ready_cycle);
     auto streamReleaseSummary = stream_release_cycles(
         module, *target, lastPagedConsumer);
+    if(progress)llvm::errs()<<"encode: collecting queue domains\n";
     module.walk([&](command::MemOp op) { collect_mem(op, queues); });
     module.walk([&](command::MemBundleOp op) {
         collect_mem_bundle(op, queues);
@@ -3475,7 +3382,7 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     COPY_THROUGHPUT(mxm_accumulator_blocks);
     COPY_THROUGHPUT(vxm_alus);
     COPY_THROUGHPUT(vxm_cross_hemisphere_streams_enabled);
-    hardware.vxm_reserved_feature = 0;
+    hardware.vxm_reserved_feature = 1;
     COPY_THROUGHPUT(vxm_weight_to_iw_latency);
     COPY_THROUGHPUT(mem_to_sxm_latency);
     COPY_THROUGHPUT(mem_to_mxm_latency);
@@ -3520,6 +3427,7 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             || hardware.icu_macro_encoding_version != 1))
         throw std::runtime_error("raw-macro requires the 96-bit MEM / 128-bit MXM target; use macro for wide FU packets");
 
+    if(progress)llvm::errs()<<"encode: planning memory floors\n";
     program.memory_floors = static_memory_floors(module,
         target->memory().slices_per_hemisphere,
         target->memory().banks_per_slice,
@@ -3536,6 +3444,16 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     program.weight_page_uses = std::move(weightPageUses);
     program.stream_release_cycles =
         std::move(streamReleaseSummary.cycles);
+    std::vector<std::uint64_t> compositionStops;
+    for(const auto& timeline:program.timelines)
+        if(timeline.name.find("imem.drain.")!=std::string::npos)
+            compositionStops.push_back(timeline.end_cycle);
+    for(const auto& use:program.weight_page_uses)compositionStops.push_back(use.ready_cycle);
+    std::sort(compositionStops.begin(),compositionStops.end());
+    const auto crossesStop=[&](std::uint64_t previous,std::uint64_t next) {
+        const auto stop=std::upper_bound(compositionStops.begin(),compositionStops.end(),previous);
+        return stop!=compositionStops.end() && *stop<=next;
+    };
     for (auto& [key, sequences] : queues)
         program.queues.push_back(encode_queue(key, std::move(sequences),
             program.max_cycle, program.scale_relocations,
@@ -3543,11 +3461,56 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             target->throughput().icu_repeat_2d_enabled != 0,
             compressionMode, memSliceProgramEnabled));
     for (auto& [key, packets] : raw3DQueues) {
+        if(progress)llvm::errs()<<"encode: "<<raw_loop_queue_name(key.first)<<"["<<key.second<<"] domains="<<packets.size()<<"\n";
         std::stable_sort(packets.begin(), packets.end(),
             [](const Raw3DPacketSequence& lhs,
                 const Raw3DPacketSequence& rhs) {
                 return lhs.start_cycle < rhs.start_cycle;
             });
+        // Compose adjacent singleton VXM domains before serialization. Never
+        // enumerate FU issues or cross a compiler-authored page consumer: the
+        // resulting loop must remain one uninterrupted hardware domain.
+        if (key.first == QueueKind::Vxm) {
+            const auto decode = [](const Raw3DPacketSequence& source) {
+                isa::EncodedVxmIcuRun2DPacket encoded{};
+                for (std::size_t w = 0; w < encoded.words.size(); ++w)
+                    for (std::size_t lane = 0; lane < 3; ++lane)
+                        encoded.words[w].lanes[lane] = source.physical_words[w].words[lane];
+                return isa::decode_vxm_icu_run_2d_instruction(encoded);
+            };
+            const auto singleton = [](const VxmIcuRun2DInstruction& run) {
+                return std::ranges::all_of(run.loop.counts,
+                    [](std::size_t count) { return count == 1; });
+            };
+            std::vector<Raw3DPacketSequence> composed;
+            for (std::size_t first = 0; first < packets.size();) {
+                auto run = decode(packets[first]);
+                std::size_t end = first + 1, stride = 0;
+                if (singleton(run)) {
+                    while (end < packets.size() && end - first < 65536) {
+                        const auto next = decode(packets[end]);
+                        const auto gap = packets[end].start_cycle - packets[end - 1].start_cycle;
+                        if (!singleton(next) || next.instruction != run.instruction
+                            || packets[end].scale_binding != packets[first].scale_binding
+                            || gap == 0 || gap >= (std::size_t{1} << 24)
+                            || (end > first + 1 && gap != stride)
+                            || crossesStop(packets[end-1].start_cycle,packets[end].start_cycle)) break;
+                        stride = gap;
+                        ++end;
+                    }
+                }
+                if (end > first + 1) {
+                    run.loop.counts[0] = end - first;
+                    run.loop.cycle_strides[0] = stride;
+                    packets[first].physical_words = raw_3d_queue_words(
+                        isa::encode_vxm_icu_run_2d_instruction(run), InstructionKind::Vxm);
+                    packets[first].final_cycle = packets[end - 1].final_cycle;
+                }
+                composed.push_back(std::move(packets[first]));
+                first = end;
+            }
+            packets = std::move(composed);
+        }
         validate_raw_3d_frontend(key, packets);
         QueueProgram queue {key.first,
             static_cast<std::size_t>(key.second), {}};
@@ -3608,7 +3571,10 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
             return std::tie(lhs.kind, lhs.index)
                 < std::tie(rhs.kind, rhs.index);
         });
-    if (compressionMode == IcuCompressionMode::RawMacro) {
+    const auto commonBarrierAttr = module->getAttrOfType<mlir::BoolAttr>(
+        "ftlpu.common_barrier_protocol");
+    if (compressionMode == IcuCompressionMode::RawMacro
+        || (commonBarrierAttr && commonBarrierAttr.getValue())) {
         // Runtime paging owns concrete transport instances and final common
         // logical stops. Keep the computation image free of queue-local
         // WAIT/SYNC; weight_page_uses and exclusive ingress timelines retain
@@ -3618,7 +3584,8 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
                 || program.hardware.common_barrier_capacity == 0))
             throw std::runtime_error("Raw Macro paging requires the common barrier target capability");
         program.common_barrier_protocol = program.hardware.common_barrier_encoding_version == 1;
-        lower_direct_raw_macro(program);
+        if (compressionMode == IcuCompressionMode::RawMacro)
+            lower_direct_raw_macro(program);
         if (requiresDirectLowering) {
             software::runtime::BinaryProgram readback;
             readback.hardware = program.hardware;

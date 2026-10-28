@@ -262,6 +262,8 @@ struct Node {
   std::vector<bool> stagedInputs;
   std::vector<mlir::DictionaryAttr> workspaces;
   I parallel = -1;
+  I pointwiseGroup = -1, pointwiseRow = 0;
+  V pointwiseShape;
   bool recurrent = false;
   bool ffn = false;
 };
@@ -273,6 +275,7 @@ public:
   mlir::DictionaryAttr policies;
   bool persistentState = false;
   bool hasAttention = false;
+  bool retainedAcrossFfn = false;
   bool distributedConvOutput = false;
   std::vector<Node> nodes;
   Planner(mlir::MLIRContext &c, fc::target::LPUTargetModel t)
@@ -292,6 +295,7 @@ public:
                           I parallel = -1) {
     Node n;
     n.name = std::move(name);
+    if (std::getenv("FTLPU_GRAPH_PROGRESS")) llvm::errs()<<"graph: planning "<<n.name<<"\n";
     n.inputs = std::move(inputs);
     n.parallel = parallel;
     n.module = mlir::parseSourceString<mlir::ModuleOp>(source, &context);
@@ -311,6 +315,10 @@ public:
     auto patterns = fc::kernel::match_decoder_graph(n.function);
     n.ffn = !patterns.ffns.empty();
     n.recurrent = !patterns.delta_nets.empty();
+    // Native chunkwise keeps its state as an ordinary graph value; the
+    // legacy scan's persistent FP32 scratch reservation does not apply.
+    if (source.find("native_chunkwise_bf16") != std::string::npos)
+      n.recurrent = false;
     if (n.ffn) {
       (*n.module)->setAttr("ftlpu.runtime_weight_pages", mlir::BoolAttr::get(&context, true));
       n.function->setAttr("ftlpu.prior_weight_pages", mlir::BoolAttr::get(&context,!nodes.empty()));
@@ -325,11 +333,16 @@ public:
         m->setAttr("n", mlir::IntegerAttr::get(
                             mlir::IntegerType::get(&context, 64), columns));
         m.getResult().setType(type(&context, outputs[0]));
-      } else if (auto conv = llvm::dyn_cast<fc::kernel::DepthwiseConv1DOp>(op))
+      } else if (llvm::isa<fc::kernel::RmsNormOp,fc::kernel::L2NormOp>(op) && rows >= 0)
+        op->getResult(0).setType(type(&context,outputs[0]));
+      else if (auto conv = llvm::dyn_cast<fc::kernel::DepthwiseConv1DOp>(op))
         conv.getResult().setType(type(&context, outputs[0]));
-      else if (auto delta = llvm::dyn_cast<fc::kernel::GatedDeltaRuleOp>(op))
+      else if (auto delta = llvm::dyn_cast<fc::kernel::GatedDeltaRuleOp>(op)) {
+        if (op->hasAttr("native_chunkwise_bf16"))
+          op->setAttr("heads",mlir::IntegerAttr::get(mlir::IntegerType::get(&context,64),1));
         for (size_t i = 0; i < outputs.size(); ++i)
           delta.getResult(i).setType(type(&context, outputs[i]));
+      }
       else if (llvm::isa<fc::kernel::VectorAluOp>(op) && rows >= 0)
         for (auto result : op->getResults()) {
           auto t = llvm::cast<mlir::RankedTensorType>(result.getType());
@@ -371,6 +384,7 @@ public:
         fc::create_lower_kernel_to_tensor_pass(attention || n.ffn ? 1 : -1));
     if (mlir::failed(pm.run(*n.module)))
       throw std::runtime_error("native tensor lowering failed: " + n.name);
+    if (std::getenv("FTLPU_GRAPH_PROGRESS")) llvm::errs()<<"graph: tensor planned "<<n.name<<"\n";
     if (mlir::failed(fc::schedule::planVectorAluMemory(n.function, target)))
       throw std::runtime_error("native vector storage planning failed: " +
                                n.name);
@@ -552,12 +566,164 @@ public:
     nodes.push_back(std::move(n));
     return out;
   }
+// Chunkwise mathematical decomposition before any physical
+// layout or ICU schedule exists. This FP32 baseline uses generic vector
+// multiply/reduce domains for matrix products; it is not an MXM fast path.
+I deltaConstantId = 1000000;
+Tensor deltaConstant(V shape, const std::vector<float> &values) {
+  Tensor t;
+  t.shape = std::move(shape); t.dtype = "f32"; t.constant = deltaConstantId++;
+  t.data.resize(values.size() * sizeof(float));
+  std::memcpy(t.data.data(), values.data(), t.data.size());
+  return t;
+}
+Tensor deltaBroadcast(const Tensor &t, V shape) {
+  if (t.shape == shape) return t;
+  if ((t.shape[0] != 1 && t.shape[0] != shape[0]) ||
+      (t.shape[1] != 1 && t.shape[1] != shape[1]))
+    throw std::runtime_error("invalid chunkwise broadcast");
+  V indices;
+  for (I r=0; r<shape[0]; ++r)
+    for (I c=0; c<shape[1]; ++c)
+      indices.push_back((t.shape[0] == 1 ? 0 : r)*t.shape[1] +
+                        (t.shape[1] == 1 ? 0 : c));
+  return view(t, indices, shape);
+}
+Tensor deltaAlu(const std::string &name, Tensor a, Tensor b,
+                const std::string &kind, bool reduce=false,
+                const std::string &dtype="f32") {
+  b = deltaBroadcast(b, a.shape);
+  Tensor output; output.shape = reduce ? V{a.shape[0],1} : a.shape;
+  output.dtype = dtype;
+  const auto strType = [&](const Tensor &t) {
+    std::string s; llvm::raw_string_ostream os(s); type(&context,t).print(os); return s;
+  };
+  const auto at=strType(a), bt=strType(b), ot=strType(output);
+  auto source = "module { func.func @chunk(%a: " + at + ", %b: " + bt +
+      ") -> " + ot + " { %r = ftlpu.kernel.vector_alu %a, %b {kind = \"" + kind +
+      "\", use_immediate = false, immediate = 0.0 : f32, reduce = " +
+      (reduce ? "true" : "false") + "} : (" + at + ", " + bt + ") -> " + ot +
+      " return %r : " + ot + " } }";
+  return add(name, source, {a,b}, {output})[0];
+}
+Tensor deltaTranspose(const Tensor &a) {
+  V indices;
+  for (I c=0; c<a.shape[1]; ++c)
+    for (I r=0; r<a.shape[0]; ++r) indices.push_back(r*a.shape[1]+c);
+  return view(a,indices,{a.shape[1],a.shape[0]});
+}
+Tensor deltaProduct(const std::string &name, const Tensor &a, const Tensor &b) {
+  const I m=a.shape[0], k=a.shape[1], n=b.shape[1];
+  if (k != b.shape[0]) throw std::runtime_error("chunkwise matmul shape mismatch");
+  std::vector<Tensor> parts;
+  // Bound both the packed operands and the scalar reduction result homes.
+  const I rows = std::max<I>(1,std::min<I>(8,
+      target.memory().words_per_bank / (n*k)));
+  for (I first=0; first<m; first+=rows) {
+    const I count=std::min(rows,m-first);
+    V lhs,rhs;
+    for (I i=first; i<first+count; ++i)
+      for (I j=0; j<n; ++j)
+        for (I l=0; l<k; ++l) {
+          lhs.push_back(i*k+l); rhs.push_back(l*n+j);
+        }
+    auto result = deltaAlu(name+".rows"+std::to_string(first),
+        view(a,lhs,{count*n,k}),view(b,rhs,{count*n,k}),"multiply",true);
+    result.shape={count,n}; parts.push_back(std::move(result));
+  }
+  return concat(parts);
+}
+std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
+    const std::vector<Tensor> &originalInput, const std::vector<Tensor> &outputs,
+    I heads, I chunk) {
+  auto input = originalInput;
+  if (chunk != 32 || heads <= 0)
+    throw std::runtime_error("chunkwise baseline currently requires chunk32");
+  const I tokens=input[0].shape[0], kd=input[0].shape[1]/heads,
+          vd=input[2].shape[1]/heads;
+  if (tokens%chunk || kd%32 || vd%32)
+    throw std::runtime_error("chunkwise baseline requires complete chunks and 32-aligned heads");
+  const auto one=deltaConstant({1,1},{1.0f});
+  // Bind each external tensor once. Subsequent matrix views are SRAM
+  // operands, not duplicated immutable uploads of expanded broadcasts.
+  for (size_t i=0; i<input.size(); ++i)
+    input[i]=deltaAlu(name+".ingress"+std::to_string(i),input[i],one,
+                      "multiply",false,input[i].dtype);
+  std::vector<Tensor> headOutputs,headStates;
+  for (I h=0; h<heads; ++h) {
+    Tensor state=sliceRows(input[5],h*kd,kd);
+    std::vector<Tensor> chunks;
+    for (I start=0; start<tokens; start+=chunk) {
+      const auto prefix=name+".head"+std::to_string(h)+".chunk"+std::to_string(start);
+      const auto q=sliceColumns(sliceRows(input[0],start,chunk),h*kd,kd);
+      const auto k=sliceColumns(sliceRows(input[1],start,chunk),h*kd,kd);
+      const auto v=sliceColumns(sliceRows(input[2],start,chunk),h*vd,vd);
+      const auto decay=sliceColumns(sliceRows(input[3],start,chunk),h,1);
+      const auto beta=sliceColumns(sliceRows(input[4],start,chunk),h,1);
+      // R[i,j] = product(decay[j+1..i]); include incoming-state gamma
+      // in column 0. Products avoid inverse decay and 0/0 underflow.
+      const I width=64;
+      std::vector<float> seed(width,0); seed[0]=1;
+      Tensor row=deltaConstant({1,width},seed);
+      std::vector<Tensor> decayRows;
+      for (I i=0; i<chunk; ++i) {
+        row=deltaAlu(prefix+".decay.mul"+std::to_string(i),row,sliceRows(decay,i,1),"multiply");
+        std::vector<float> unit(width,0); unit[i+1]=1;
+        row=deltaAlu(prefix+".decay.diag"+std::to_string(i),row,deltaConstant({1,width},unit),"add");
+        decayRows.push_back(row);
+      }
+      const auto allDecay=concat(decayRows);
+      const auto gamma=sliceColumns(allDecay,0,1);
+      const auto r=sliceColumns(allDecay,1,chunk);
+      auto gram=deltaProduct(prefix+".KKt",k,deltaTranspose(k));
+      auto l=deltaAlu(prefix+".gram_decay",gram,r,"multiply");
+      l=deltaAlu(prefix+".gram_beta",l,beta,"multiply");
+      // Forward substitution reads only strictly lower entries of L.
+      auto history=deltaProduct(prefix+".KS",k,state);
+      history=deltaAlu(prefix+".history_decay",history,gamma,"multiply");
+      auto rhs=deltaAlu(prefix+".rhs_subtract",v,history,"subtract");
+      rhs=deltaAlu(prefix+".rhs_beta",rhs,beta,"multiply");
+      std::vector<Tensor> solved;
+      for (I i=0; i<chunk; ++i) {
+        auto di=sliceRows(rhs,0,1); solved.push_back(di);
+        const I remaining=chunk-i-1;
+        if (!remaining) break;
+        auto column=sliceColumns(sliceRows(l,i+1,remaining),i,1);
+        auto correction=deltaAlu(prefix+".solve.mul"+std::to_string(i),
+            deltaBroadcast(di,{remaining,vd}),column,"multiply");
+        rhs=deltaAlu(prefix+".solve.sub"+std::to_string(i),
+            sliceRows(rhs,1,remaining),correction,"subtract");
+      }
+      const auto d=concat(solved);
+      auto attention=deltaProduct(prefix+".QKt",q,deltaTranspose(k));
+      attention=deltaAlu(prefix+".causal_decay",attention,r,"multiply");
+      auto output=deltaProduct(prefix+".local_output",attention,d);
+      auto prior=deltaProduct(prefix+".QS",q,state);
+      prior=deltaAlu(prefix+".output_decay",prior,gamma,"multiply");
+      output=deltaAlu(prefix+".output_add",output,prior,"add");
+      chunks.push_back(deltaAlu(prefix+".output_cast",output,one,"multiply",false,outputs[0].dtype));
+      auto lastR=deltaTranspose(sliceRows(r,chunk-1,1));
+      auto scaledD=deltaAlu(prefix+".state_delta_decay",d,lastR,"multiply");
+      auto update=deltaProduct(prefix+".state_product",deltaTranspose(k),scaledD);
+      state=deltaAlu(prefix+".state_decay",state,sliceRows(gamma,chunk-1,1),"multiply");
+      state=deltaAlu(prefix+".state_add",state,update,"add");
+    }
+    headOutputs.push_back(concat(chunks)); headStates.push_back(state);
+  }
+  return {concat(headOutputs,1),concat(headStates)};
+}
+
+
   std::vector<Tensor> lower(const J &j, std::vector<Tensor> input,
                             std::vector<Tensor> outputs) {
     auto source = j.getString("kernel")->str(),
          name = j.getString("name")->str();
     auto parsed = mlir::parseSourceString<mlir::ModuleOp>(source, &context);
     if (!parsed) throw std::runtime_error("invalid kernel subgraph: " + name);
+    auto parsedFunction = *parsed->getOps<mlir::func::FuncOp>().begin();
+    if (input.size()==1 && outputs.size()==1 && llvm::all_of(parsedFunction.front(),[](mlir::Operation& op) {
+          return llvm::isa<fc::kernel::ReshapeOp,mlir::func::ReturnOp>(op);
+        })) return {view(input[0],range(input[0].size()),outputs[0].shape)};
     auto patterns = fc::kernel::match_decoder_graph(*parsed->getOps<mlir::func::FuncOp>().begin());
     if (!patterns.ffns.empty()) {
       auto &ffn = patterns.ffns.front();
@@ -569,8 +735,10 @@ public:
       // The SR SwiGLU retains two Gate copies and Up over this output batch.
       // Derive the batch from physical residency, before emitting any ICU/FU
       // instructions. Decode retains its independent native strategy.
+      const I workspaceRows = target.memory().sram_depth_rows /
+          (retainedAcrossFfn ? 2 : 1);
       const I batch = hw.vxm_alus == 16 && m >= tile
-          ? (target.memory().sram_depth_rows / tokenRows) * alignment
+          ? (workspaceRows / tokenRows) * alignment
           : hidden;
       if (batch <= 0)
         throw std::runtime_error("FFN token tile exceeds on-chip temporary capacity");
@@ -773,6 +941,19 @@ public:
         }
       }
     }
+    if ((source.find("ftlpu.kernel.rms_norm") != std::string::npos
+         || source.find("ftlpu.kernel.l2_norm") != std::string::npos)
+        && input[0].shape[0] > 1 && input[0].shape[0] < 32) {
+      // Independent normalization rows may occupy a partial hardware tile.
+      // Duplicate a logical row in unused lanes; retain only live results.
+      const I live = input[0].shape[0];
+      std::vector<Tensor> padded{input[0]};
+      for (I row=live;row<32;++row) padded.push_back(sliceRows(input[0],live-1,1));
+      input[0]=concat(padded);
+      auto out=outputs; out[0].shape[0]=32;
+      auto values=add(name,source,input,out,32);
+      return {sliceRows(values[0],0,live)};
+    }
     if (source.find("ftlpu.kernel.batch_matmul") != std::string::npos)
       return add(name, source, std::move(input), std::move(outputs));
     if (source.find("ftlpu.kernel.matmul") != std::string::npos) {
@@ -806,6 +987,8 @@ public:
           o.shape[1] = count;
           pieces.push_back(add(name + ".block" + std::to_string(col), source,
                                {a, w}, {o}, -1, count, col != first, group)[0]);
+          nodes.back().function->setAttr("ftlpu.depthwise_conv_paired",
+              mlir::BoolAttr::get(&context,width-first>=2*tile));
         }
         auto groupedResult = concat(pieces, 1);
         groups.push_back(distributedConvOutput
@@ -816,17 +999,51 @@ public:
       return {concat(groups, 1)};
     }
     if (!patterns.delta_nets.empty()) {
+      auto function = *parsed->getOps<mlir::func::FuncOp>().begin();
+      auto delta=patterns.delta_nets.front().recurrence;
+      const I heads=delta.getHeads();
+      const I requestedChunk=integer(delta,"chunk_size",integer(function,"ftlpu.gdn_chunk_size"));
+      if (input[0].dtype=="bf16" && delta.getKeyDim()==128 && delta.getValueDim()==128 &&
+          (!requestedChunk || requestedChunk==32) &&
+          input[0].shape[0]>=32 && input[0].shape[0]%32==0) {
+        delta->setAttr("native_chunkwise_bf16",mlir::BoolAttr::get(&context,true));
+        std::string nativeSource;llvm::raw_string_ostream nativeStream(nativeSource);parsed->print(nativeStream);
+        std::vector<Tensor> headOutputs,headStates;
+        for(I h=0;h<heads;++h){
+          std::vector<Tensor> args={sliceColumns(input[0],h*128,128),sliceColumns(input[1],h*128,128),
+              sliceColumns(input[2],h*128,128),sliceColumns(input[3],h,1),sliceColumns(input[4],h,1),sliceRows(input[5],h*128,128)};
+          auto out=outputs;out[0].shape={input[0].shape[0],128};out[1].shape={128,128};
+          auto values=add(name+".chunkwise.head"+std::to_string(h),nativeSource,args,out);
+          headOutputs.push_back(values[0]);headStates.push_back(values[1]);
+        }
+        return {concat(headOutputs,1),concat(headStates)};
+      }
+      if (const I chunk = integer(patterns.delta_nets.front().recurrence,
+              "chunk_size", integer(function, "ftlpu.gdn_chunk_size")))
+        return lowerChunkwiseDelta(name, input, outputs,
+            patterns.delta_nets.front().recurrence.getHeads(), chunk);
       std::vector<Tensor> pieces;
       Tensor state = input[5];
-      for (I row = 0; row < input[0].shape[0]; ++row) {
+      // Convert a bounded token block once, then retain its native operands
+      // throughout the serial state scan. Per-token graph nodes duplicate
+      // packed-to-broadcast SXM programs even though their views are affine.
+      // Q/K scalar homes have one row per feature and token.
+      I blockRows = std::max<I>(1, std::min<I>(4,
+          target.memory().words_per_bank / input[0].shape[1]));
+      // Packed gate producers partition tokens between hemispheres. A
+      // block must not span that boundary (FP32 unpack remains local).
+      const I halfRows = (input[0].shape[0] + 1) / 2;
+      while (blockRows > 1 && halfRows % blockRows) --blockRows;
+      for (I row = 0; row < input[0].shape[0]; row += blockRows) {
+        const I rows = std::min(blockRows, input[0].shape[0] - row);
         std::vector<Tensor> args;
         for (size_t i = 0; i < 5; ++i)
-          args.push_back(sliceRows(input[i], row, 1));
+          args.push_back(sliceRows(input[i], row, rows));
         args.push_back(state);
         auto o = outputs[0];
-        o.shape[0] = 1;
+        o.shape[0] = rows;
         auto values = add(name + ".token" + std::to_string(row), source, args,
-                          {o, outputs[1]}, 1);
+                          {o, outputs[1]}, rows);
         pieces.push_back(values[0]);
         state = values[1];
       }
@@ -840,7 +1057,32 @@ public:
       if (auto vector = llvm::dyn_cast<fc::kernel::VectorAluOp>(op)) return !vector.getReduce();
       return llvm::isa<mlir::func::ReturnOp>(op);
     });
-    if (pointwiseGraph && target.throughput().vxm_alus == 16
+    if (pointwiseGraph && tokenRows > 1 && input[0].shape[1] > target.memory().bytes_per_word &&
+        llvm::all_of(input,[&](const Tensor &v) {return v.shape.size()==2 &&
+            (v.shape[0]==1 || v.shape[0]==tokenRows);})) {
+      const I words=(input[0].shape[1]+target.memory().bytes_per_word-1)/target.memory().bytes_per_word;
+      const I capacity=std::max<I>(1,target.memory().sram_depth_rows/(2*words));
+      if (tokenRows>capacity) {
+        std::vector<std::vector<Tensor>> pieces(outputs.size());
+        const I group=nodes.size();
+        for (I first=0;first<tokenRows;first+=capacity) {
+          const I count=std::min(capacity,tokenRows-first);
+          auto args=input, outs=outputs;
+          for (auto &a : args) a=sliceRows(a,first,count);
+          for (auto &o : outs) o.shape[0]=count;
+          auto values=add(name+".rows"+std::to_string(first),source,args,outs,count);
+          nodes.back().pointwiseGroup=group;
+          nodes.back().pointwiseRow=first;
+          nodes.back().pointwiseShape=outputs[0].shape;
+          for (size_t i=0;i<values.size();++i) pieces[i].push_back(values[i]);
+        }
+        std::vector<Tensor> result;
+        for (auto &p : pieces) result.push_back(concat(p));
+        return result;
+      }
+    }
+    if (pointwiseGraph && source.find("ftlpu.vector_bf16_spill") == std::string::npos
+        && target.throughput().vxm_alus == 16
         && target.memory().hemispheres == 2
         && source.find("ftlpu.kernel.vector_alu") != std::string::npos
         && source.find("reduce = true") == std::string::npos && tokenRows >= 2
@@ -852,15 +1094,24 @@ public:
              return v.shape.size() == 2 && v.shape[0] == tokenRows;
            })) {
       std::vector<std::vector<Tensor>> pieces(outputs.size());
-      const I half = (tokenRows + 1) / 2, group = nodes.size();
-      for (I first : {I(0), half}) {
-        const I count = std::min(half, tokenRows - first);
-        auto args = input, outs = outputs;
-        for (auto &a : args) if (a.shape[0] != 1) a = sliceRows(a, first, count);
-        for (auto &o : outs) o.shape[0] = count;
-        auto values = add(name + ".tokens" + std::to_string(first), source,
-                          args, outs, count, -1, first != 0, group);
-        for (size_t i = 0; i < values.size(); ++i) pieces[i].push_back(values[i]);
+      // Each mirrored pair must fit the physical bank, including the
+      // retained outputs and conversion scratch reserved in its lower half.
+      const I perSide = std::min<I>((tokenRows+1)/2,
+                                   target.memory().sram_depth_rows/2);
+      for (I base=0; base<tokenRows; base+=2*perSide) {
+        const I pairRows=std::min<I>(2*perSide,tokenRows-base);
+        const I half=(pairRows+1)/2, group=nodes.size();
+        for (I side=0; side<2; ++side) {
+          const I first=base+side*half;
+          const I count=std::min<I>(half,base+pairRows-first);
+          if (!count) continue;
+          auto args = input, outs = outputs;
+          for (auto &a : args) if (a.shape[0] != 1) a = sliceRows(a, first, count);
+          for (auto &o : outs) o.shape[0] = count;
+          auto values = add(name + ".tokens" + std::to_string(first), source,
+                            args, outs, count, -1, side != 0, group);
+          for (size_t i = 0; i < values.size(); ++i) pieces[i].push_back(values[i]);
+        }
       }
       std::vector<Tensor> result;
       for (auto &p : pieces) result.push_back(concat(p));
@@ -1138,23 +1389,29 @@ public:
       return kind == "fp16_hemisphere_pair_planar" ||
              kind == "fp16_pair_planar" ||
              kind == "fp16_mxm_distributed_16" ||
-             kind == "fp16_vxm_distributed_16";
+             kind == "fp16_vxm_distributed_16" ||
+             kind == "fp16_scalar_broadcast_planar" ||
+             kind == "fp32_quad_planar" ||
+             kind == "fp32_scalar_broadcast_planar";
     };
+    const bool samePlanes = ss.size()==2 && ds.size()==2 ||
+        (ss.size()==4 && ds.size()==4 && text(src,"kind").find("fp32_")==0 && text(dst,"kind").find("fp32_")==0);
     const bool passivePair =
         bf16Pair(src) && bf16Pair(dst) &&
-        ss.size() == 2 && ds.size() == 2 &&
+        samePlanes &&
         (text(src, "hemisphere") != text(dst, "hemisphere") ||
          (ss[0] / group != ds[0] / group &&
           ss[1] / group != ds[1] / group));
     if (passivePair) {
       I maxLatency = 0;
-      for (I p = 0; p < 2; ++p) {
+      for (I p = 0; p < I(ss.size()); ++p) {
         I sourceGroup = ss[p] / group, destGroup = ds[p] / group;
         I readStream = 20 + p, writeStream = 20 + p, latency = 0;
         if (text(src, "hemisphere") != text(dst, "hemisphere")) {
           readStream += target.streams().streams_per_direction;
-          latency = sourceGroup + target.throughput().vxm_alus +
-                    destGroup + 3;
+          // Passive SR crosses at the VXM input boundary, without traversing
+          // the ALU chain. Include the two MEM/bridge boundary cycles only.
+          latency = sourceGroup + destGroup + 2;
         } else if (sourceGroup < destGroup) {
           latency = destGroup - sourceGroup;
         } else if (sourceGroup > destGroup) {
@@ -1170,6 +1427,19 @@ public:
         maxLatency = std::max(maxLatency, latency);
       }
       cursor = beat + n * period + maxLatency + 96;
+      return;
+    }
+    if(bf16Pair(src) && bf16Pair(dst) && samePlanes) {
+      // A local same-column copy cannot tap its own newly emitted SR.
+      // Route unchanged byte planes through the opposite hemisphere instead
+      // of using legacy arbitrary-SR/FP32 VXM casts.
+      const auto from=text(src,"hemisphere");
+      auto temp=placement(ss.size()==4?"fp32_quad_planar":"fp16_pair_planar",
+          range(ss.size(),48),from=="east"?"west":"east",0,0,n);
+      Domain first=d;first.dst={1,d.count[0],d.count[0]*d.count[1]};
+      scalarDomain(src,temp,a,0,first);
+      Domain second=d;second.src=first.dst;
+      scalarDomain(temp,dst,0,z,second);
       return;
     }
     for (I p = 0; p < I(ss.size()); ++p)
@@ -1225,19 +1495,45 @@ public:
     }
   }
   void unpack(mlir::DictionaryAttr source, mlir::DictionaryAttr dest,
-              const V &shape, const V &indices, const V &offsets) {
+              const V &shape, const V &indices, const V &offsets,
+              I onlyResidue = -1, I sourceGroups = 1, bool issueSxm = true) {
+    // SXM operates on one hemisphere. "both" is a storage contract, not a
+    // physical SXM endpoint: broadcast the completed scalar words explicitly.
+    if (text(dest,"hemisphere") == "both") {
+      auto local = change(dest,J{{"hemisphere","east"}});
+      unpack(source,local,shape,indices,offsets,onlyResidue,sourceGroups,issueSxm);
+      copy(local,change(dest,J{{"hemisphere","west"}}),offsets,offsets);
+      return;
+    }
+    if (text(source,"hemisphere")=="both" && text(dest,"hemisphere")!="both")
+      source=change(source,J{{"hemisphere",text(dest,"hemisphere")}});
+    if (text(source,"kind")!="fp16_hemisphere_pair_planar" &&
+        text(source,"hemisphere")!="both" &&
+        text(source,"hemisphere")!=text(dest,"hemisphere")) {
+      if (onlyResidue>=0 || offsets.empty() ||
+          *std::max_element(offsets.begin(),offsets.end())>=target.memory().sram_depth_rows)
+        throw std::runtime_error("cross-hemisphere unpack requires a bounded complete view");
+      auto temporary=change(dest,J{{"hemisphere",text(source,"hemisphere")},
+          {"slices",array(range(slices(dest).size(),48))},{"bank",0},{"base_row",0}});
+      unpack(source,temporary,shape,indices,offsets,onlyResidue,sourceGroups,issueSxm);
+      copy(temporary,dest,offsets,offsets);
+      return;
+    }
     I rows = shape[0], columns = shape[1];
     bool paired = text(source, "kind") == "fp16_hemisphere_pair_planar";
     I step = paired ? 64 : 32;
     std::map<I, std::set<I>> wordLanes;
     for (I ix : indices)
       wordLanes[ix / 32].insert(ix % 32);
-    bool full = !wordLanes.empty();
+    // Logical short rows occupy separate padded physical words. Combining
+    // two 16-column rows does not make a complete 32-lane source word.
+    bool full = columns % 32 == 0 && !wordLanes.empty();
     for (auto &p : wordLanes)
       full &= p.second.size() == 32;
     for (I half = 0; half < (paired && full ? 2 : 1); ++half)
       for (I residue = 0; residue < (full ? 8 : std::min(step, columns));
            ++residue) {
+        if (onlyResidue >= 0 && residue != onlyResidue) continue;
         V words, offs;
         for (size_t i = 0; i < indices.size(); ++i) {
           I ix = indices[i];
@@ -1269,9 +1565,9 @@ public:
             mem(transpose - (14 - ss[2 * pair + plane] / group), src,
                 2 * pair + plane, "read", field(src, "base_row") + words[0],
                 16 + plane, d.count, d.src, interval);
-          sxm(transpose, text(src, "hemisphere"), "transpose", {16, 17},
+          if (issueSxm) sxm(transpose, text(src, "hemisphere"), "transpose", {16, 17},
               range(16, 16), range(32), d.count[0], 32, -1,
-              d.count[1] * d.count[2], d.count[0] * 32);
+              d.count[1] * d.count[2] * sourceGroups, d.count[0] * 32);
           I permute = transpose + 5;
           bool direct = text(src, "hemisphere") == text(dest, "hemisphere");
           if (ds.size() == 4 && !direct)
@@ -1279,9 +1575,9 @@ public:
           V map;
           for (I i = 0; i < 32; ++i)
             map.push_back(tile * 8 + i % 8);
-          sxm(permute, text(src, "hemisphere"), "permute", range(16, 16),
+          if (issueSxm) sxm(permute, text(src, "hemisphere"), "permute", range(16, 16),
               range(16, 32), map, d.count[0], 32, lane < 7 ? 9 + lane : 7,
-              d.count[1] * d.count[2], d.count[0] * 32, full ? 8 : 0);
+              d.count[1] * d.count[2] * sourceGroups, d.count[0] * 32, full ? 8 : 0);
           I result = 0;
           if (!direct) {
             I beat = permute + 15;
@@ -1297,7 +1593,8 @@ public:
                        : result + ds[2 * pair + p] / group + 1,
                 dest, 2 * pair + p, "write", field(dest, "base_row") + offs[0],
                 direct ? 32 + 2 * lane + p : p, d.count, d.dst, interval);
-          cursor = permute + count * 32 + 32;
+          cursor = onlyResidue >= 0 ? cursor + count * 32
+                                   : permute + count * 32 + 32;
         }
       }
   }
@@ -1402,8 +1699,10 @@ public:
   std::vector<Tensor> inputs;
   llvm::json::Array nodeRanges;
   std::map<I,mlir::DictionaryAttr> recurrentStates;
+  std::map<I,mlir::Value> initialStateBindings;
   std::map<Key,mlir::DictionaryAttr> partitionOutputHomes;
   std::map<Key,mlir::DictionaryAttr> retainedOutputHomes;
+  std::map<Key,mlir::DictionaryAttr> pointwiseHomes;
   Linker(Planner &p, std::vector<Tensor> out, fs::path dir)
       : planner(p), s(p.context, p.target), finals(std::move(out)),
         directory(std::move(dir)) {
@@ -1595,6 +1894,7 @@ public:
                   t.data.begin()+(candidate.sourceOffset-t.sourceOffset)*t.bytes())) {
             ++consumers;
             activationLastUse = std::max(activationLastUse, ni);
+            if (ai >= I(planner.nodes[ni].in.size())) continue;
             auto placement = planner.nodes[ni].in[ai];
             if (candidate.shape == t.shape &&
                 text(placement,"kind") == "fp16_mxm_distributed_16")
@@ -1650,6 +1950,14 @@ public:
                         {"page_items_per_slice_group", t.shape[1] / 64},
                         {"page_bank_count", 2},
                         {"page_storage_slices", s.array(slices(p))}});
+    } else if (text(p,"kind") == "fp16_vxm_gamma_broadcast") {
+      last[{-2,index}] = directLastUse;
+      // Keep later normalization weights in more, shorter SRAM segments.
+      // At use time copy the broadcast rows to the native two-segment home.
+      auto prototype = s.change(p,J{{"slices",s.array(range(8))},
+          {"hemisphere","west"},{"bank",1},{"base_row",0},
+          {"instruction_count",(t.size()+3)/4}});
+      p = allocate({-2,index},t,"west",0,prototype);
     } else if (text(p,"kind") == "fp16_projection_bias_x4") {
       // All immutable biases are initialized up front, but retire after
       // their final attention batch. Later FFN temporaries may reuse them.
@@ -1682,6 +1990,21 @@ public:
             for (auto r : nativeTimed[key])
               row = std::max(row, r.end);
           }
+      // Generic planar inputs were allocated through live[], not staticEnd.
+      // Native-format constants uploaded later must also avoid those inputs.
+      for (const auto &entry : live) {
+        const auto occupied = entry.second;
+        if (field(occupied, "bank") != 1) continue;
+        const auto side = text(occupied, "hemisphere");
+        if (side != "both" && text(p, "hemisphere") != "both"
+            && side != text(p, "hemisphere")) continue;
+        const auto occupiedSlices = slices(occupied);
+        if (llvm::any_of(slices(p), [&](I slice) {
+              return llvm::is_contained(occupiedSlices, slice);
+            }))
+          row = std::max(row, field(occupied, "base_row")
+                             + field(occupied, "instruction_count"));
+      }
       if (row + field(p, "instruction_count") >
           s.target.memory().sram_depth_rows)
         throw std::runtime_error("immutable binding exceeds SRAM: " + name);
@@ -1728,6 +2051,38 @@ public:
     }
     if (src == dst && sourceShape == destShape && ix == pos)
       return;
+    if (auto shape = dst.getAs<mlir::ArrayAttr>("storage_shape")) {
+      V physical;
+      for (auto d : shape) physical.push_back(llvm::cast<mlir::IntegerAttr>(d).getInt());
+      mlir::NamedAttrList attrs(dst);
+      attrs.erase("storage_shape");
+      const I offset=field(dst,"storage_offset");
+      attrs.erase("storage_offset");
+      V physicalPositions=pos;
+      for (auto &index : physicalPositions) index+=offset;
+      move(src,attrs.getDictionary(&s.context),sourceShape,physical,ix,physicalPositions);
+      return;
+    }
+    if (text(src,"kind") == "fp16_vxm_gamma_broadcast" &&
+        text(dst,"kind") == "fp16_vxm_gamma_broadcast") {
+      const I sourceRows=field(src,"instruction_count"), destRows=field(dst,"instruction_count");
+      auto ss=slices(src), ds=slices(dst);
+      for (I first=0;first<I(ix.size());) {
+        const I sourceSegment=ix[first]/sourceRows, destSegment=pos[first]/destRows;
+        I end=first+1;
+        while (end<I(ix.size()) && ix[end]/sourceRows==sourceSegment &&
+               pos[end]/destRows==destSegment) ++end;
+        V reads,writes;
+        for (I i=first;i<end;++i) {reads.push_back(ix[i]%sourceRows);writes.push_back(pos[i]%destRows);}
+        auto a=s.change(src,J{{"kind","fp16_scalar_broadcast_planar"},
+            {"slices",s.array({ss.at(2*sourceSegment),ss.at(2*sourceSegment+1)})}});
+        auto z=s.change(dst,J{{"kind","fp16_scalar_broadcast_planar"},
+            {"slices",s.array({ds.at(2*destSegment),ds.at(2*destSegment+1)})}});
+        s.copy(a,z,reads,writes);
+        first=end;
+      }
+      return;
+    }
     if (text(dst,"kind") == "fp16_mxm_activation_planar") {
       // Both MXM activation ports consume the same K32 vector on every
       // reduction beat. Preserve the full address range in each byte pair;
@@ -1740,45 +2095,47 @@ public:
       }
       return;
     }
-    if (text(dst,"kind") == "fp16_pair_planar" && slices(dst).size() == 4) {
+    if (text(dst,"kind") == "fp16_pair_planar" && slices(dst).size() >= 4) {
       // Two packed BF16 pairs per hemisphere partition physical feature words.
       // Four planes here describe
       // two vectors, not the four bytes of an FP32 conversion.
       auto ids = slices(dst);
       const I hemispheres = text(dst,"hemisphere") == "both" ? 2 : 1;
+      const I pairs=ids.size()/2;
       for (I h = 0; h < hemispheres; ++h)
-      for (I pair = 0; pair < 2; ++pair) {
+      for (I pair = 0; pair < pairs; ++pair) {
         V selected, positions;
         for (size_t i = 0; i < pos.size(); ++i) {
           I col = pos[i] % destShape[1];
-          if ((col/word)%2 != pair
-              || (hemispheres == 2 && (col/(2*word))%2 != h)) continue;
+          if ((col/word)%pairs != pair
+              || (hemispheres == 2 && (col/(pairs*word))%2 != h)) continue;
           selected.push_back(ix[i]);
-          positions.push_back((pos[i]/destShape[1])*(destShape[1]/(2*hemispheres))+
-                              (col/(2*word*hemispheres))*word+col%word);
+          positions.push_back((pos[i]/destShape[1])*(destShape[1]/(pairs*hemispheres))+
+                              (col/(pairs*word*hemispheres))*word+col%word);
         }
         if (selected.empty()) continue;
         auto physical = s.change(dst,J{{"slices",s.array({ids[2*pair],ids[2*pair+1]})},
             {"hemisphere",hemispheres == 2 ? (h ? "west" : "east") : text(dst,"hemisphere")}});
-        move(src,physical,sourceShape,{destShape[0],destShape[1]/(2*hemispheres)},selected,positions);
+        move(src,physical,sourceShape,{destShape[0],destShape[1]/(pairs*hemispheres)},selected,positions);
       }
       return;
     }
-    if (text(src,"kind") == "fp16_pair_planar" && slices(src).size() == 4) {
+    if (text(src,"kind") == "fp16_pair_planar" && slices(src).size() >= 4) {
       // Dense attention's canonical O result has two independent BF16
       // plane pairs per hemisphere. Split tensor geometry before transport;
       // four BF16 planes must never be interpreted as one FP32/scalar pair.
       const I hemispheres = text(src,"hemisphere") == "both" ? 2 : 1;
-      const I columns = sourceShape[1], localColumns = columns/(2*hemispheres);
+      const I pairs=slices(src).size()/2;
+      const I columns = sourceShape[1], localColumns = columns/(pairs*hemispheres);
       auto ids = slices(src);
       for (I h = 0; h < hemispheres; ++h)
-        for (I pair = 0; pair < 2; ++pair) {
+        for (I pair = 0; pair < pairs; ++pair) {
           V selected, positions;
           for (size_t i = 0; i < ix.size(); ++i) {
             I col = ix[i]%columns;
-            if ((col/word)%2 != pair || (hemispheres == 2 && (col/(2*word))%2 != h)) continue;
+            if ((col/word)%pairs != pair || (hemispheres == 2 && (col/(pairs*word))%2 != h)) continue;
             selected.push_back((ix[i]/columns)*localColumns+
-                (col/(2*word*hemispheres))*word+col%word);
+                (col/(pairs*word*hemispheres))*word+col%word);
             positions.push_back(pos[i]);
           }
           if (selected.empty()) continue;
@@ -1808,6 +2165,72 @@ public:
       return text(p, "kind") == "fp16_mxm_distributed_16" ||
              text(p, "kind") == "fp16_vxm_distributed_16";
     };
+    if (distributed(src) && scalar(dst)) {
+      // A native distributed word contains 32 features. Recurrence consumes
+      // one feature broadcast across value lanes, so unpack every feature,
+      // rather than copying only the word-aligned element of each group.
+      const auto ids = slices(src);
+      struct BroadcastSource { mlir::DictionaryAttr placement; I columns; V indices, offsets; };
+      std::vector<BroadcastSource> sources;
+      for (I lane = 0; lane < 8; ++lane) {
+        V selected, positions;
+        for (size_t i = 0; i < ix.size(); ++i) {
+          const I row = ix[i] / sourceShape[1], col = ix[i] % sourceShape[1];
+          if (row % 8 != lane) continue;
+          const I physicalWord = (row / word * (sourceShape[1] / word) + col / word)
+              * s.target.throughput().tile_rows + row % word / 8;
+          selected.push_back(physicalWord * word + col % word);
+          positions.push_back(pos[i]);
+        }
+        if (selected.empty()) continue;
+        auto physical = s.change(src, J{{"kind", "fp16_pair_planar"},
+            {"slices", s.array({ids[2*lane], ids[2*lane+1]})},
+            {"hemisphere", text(src,"hemisphere") == "both"
+                ? text(dst,"hemisphere") : text(src,"hemisphere")}});
+        const I columns = (*std::max_element(selected.begin(),selected.end()) / word + 1) * word;
+        sources.push_back({physical, columns, std::move(selected), std::move(positions)});
+      }
+      // The source pairs feed the same SXM streams. Schedule them as one
+      // source-pair domain per residue instead of restarting all eight SXM
+      // programs for every distributed pair. MEM queues retain their own
+      // affine addresses; no FU instruction stream is generated/compressed.
+      bool grouped = sources.size() > 1 && slices(dst).size() == 2
+          && text(dst,"hemisphere") != "both";
+      for (I residue = 0; grouped && residue < 8; ++residue) {
+        std::array<I,3> counts{};
+        for (size_t n = 0; grouped && n < sources.size(); ++n) {
+          const auto &source = sources[n];
+          grouped &= text(source.placement,"hemisphere") == text(dst,"hemisphere");
+          std::map<I,std::set<I>> lanes;
+          V words, offsets;
+          for (size_t j = 0; j < source.indices.size(); ++j) {
+            I ix = source.indices[j];
+            lanes[ix/32].insert(ix%32);
+            if (ix%8 == residue) { words.push_back(ix/32); offsets.push_back(source.offsets[j]); }
+          }
+          for (auto &entry : lanes) grouped &= entry.second.size() == 32;
+          Domain domain;
+          grouped &= !words.empty() && affine(words, offsets, domain);
+          if (!grouped) break;
+          if (n == 0) counts = domain.count;
+          else grouped &= counts == domain.count;
+        }
+      }
+      if (grouped) {
+        for (I residue = 0; residue < 8; ++residue) {
+          for (size_t n = 0; n < sources.size(); ++n) {
+            const auto &source = sources[n];
+            s.unpack(source.placement, dst, {1,source.columns}, source.indices,
+                     source.offsets, residue, sources.size(), n == 0);
+          }
+          s.cursor += 69;
+        }
+      } else {
+        for (const auto &source : sources)
+          s.unpack(source.placement, dst, {1,source.columns}, source.indices, source.offsets);
+      }
+      return;
+    }
     if (distributed(src) || distributed(dst)) {
       for (I sl = 0; sl < (distributed(src) ? 8 : 1); ++sl)
         for (I dl = 0; dl < (distributed(dst) ? 8 : 1); ++dl) {
@@ -1941,7 +2364,7 @@ public:
         // Reserve carried FP32 state before scalar vectors fragment a bank.
         // Branches and externally retained snapshots need separate storage.
         recurrentStates[ni] =
-            allocate({-4, ni}, node.outputs[1], "east", 1, node.out[1]);
+            allocate({-4, ni}, node.outputs[1], text(node.in[5],"hemisphere"), 1, node.out[1]);
         last[{-4, ni}] = planner.nodes.size() + 1;
       }
     }
@@ -2054,6 +2477,91 @@ public:
     retainedOutputHomes[key]=home;
     return true;
   }
+  bool planInPlacePointwise(I ni, I oi) {
+    auto &node=planner.nodes[ni];
+    if (node.parallel>=0 || !llvm::isa<fc::kernel::VectorAluOp>(node.outputSlots[oi].op)) return false;
+    auto output=llvm::cast<fc::kernel::VectorAluOp>(node.outputSlots[oi].op);
+    if (output.getReduce()) return false;
+    const Key key{ni,oi};
+    for (const auto &input : node.inputs) {
+      if (input.external() || input.shape!=node.outputs[oi].shape || input.refs.empty()) continue;
+      const auto first=input.refs.front();
+      const Key parent{first.node,first.output};
+      auto home=cache.at(parent);
+      if (text(home,"kind")!="fp16_mxm_distributed_16" &&
+          !(text(home,"kind")=="fp16_pair_planar" && slices(home).size()>=4)) continue;
+      bool contiguous=true;
+      for (I i=0;i<input.size();++i)
+        contiguous &= input.refs[i].node==first.node && input.refs[i].output==first.output && input.refs[i].index==first.index+i;
+      if (!contiguous) continue;
+      // Only overwrite elements whose old version has no remaining reader.
+      const auto usesOldElements=[&](const Tensor &v) {
+        return llvm::any_of(v.refs,[&](const Ref &r) {return r.node==first.node && r.output==first.output &&
+            r.index>=first.index && r.index<first.index+input.size();});
+      };
+      bool safe=true;
+      for (I future=ni+1;safe && future<I(planner.nodes.size());++future)
+        for (const auto &value : planner.nodes[future].inputs) safe &= !usesOldElements(value);
+      for (const auto &value : finals) safe &= !usesOldElements(value);
+      for (auto h : {"east","west"})
+        if (text(home,"hemisphere")==h || text(home,"hemisphere")=="both")
+          for (I slice : slices(home))
+            for (auto r : nativeTimed[{h,slice}])
+              if (r.node>ni && r.node<=last[key] && field(home,"base_row")<r.end &&
+                  r.begin<field(home,"base_row")+field(home,"instruction_count")) safe=false;
+      if (!safe) continue;
+      V physical=planner.nodes[first.node].outputs[first.output].shape;
+      if (auto shape=home.getAs<mlir::ArrayAttr>("storage_shape")) {
+        physical.clear();
+        for (auto d : shape) physical.push_back(llvm::cast<mlir::IntegerAttr>(d).getInt());
+      }
+      home=s.change(home,J{{"storage_shape",s.array(physical)},
+          {"storage_offset",field(home,"storage_offset")+first.index}});
+      // Drain to a short-lived planar scratch, then commit this row view.
+      // The next chunk can reuse the scratch after this copy retires.
+      const Key scratch{ni,-100-oi};
+      last[scratch]=ni;
+      auto busy=node.in;
+      busy.insert(busy.end(),node.workspaces.begin(),node.workspaces.end());
+      auto drain=allocate(scratch,node.outputs[oi],text(node.out[oi],"hemisphere"),1,node.out[oi],busy);
+      node.out[oi]=drain;
+      node.outputSlots[oi].set(drain);
+      cache[key]=live[key]=home;
+      retainedOutputHomes[key]=home;
+      return true;
+    }
+    return false;
+  }
+  bool planGroupedPointwise(I ni, I oi) {
+    auto &node=planner.nodes[ni];
+    const I word=s.target.memory().bytes_per_word;
+    if (node.pointwiseGroup<0 || node.outputs.size()!=1 || node.outputs[oi].dtype!="bf16" ||
+        node.pointwiseShape.size()!=2 || node.pointwiseShape[1]%(8*word)) return false;
+    const Key key{ni,oi}, group{node.pointwiseGroup,oi};
+    mlir::DictionaryAttr home;
+    if (pointwiseHomes.count(group)) home=pointwiseHomes.at(group);
+    else {
+      auto tensor=node.outputs[oi]; tensor.shape=node.pointwiseShape;
+      I finalUse=last[key];
+      for (I i=ni;i<I(planner.nodes.size());++i)
+        if (planner.nodes[i].pointwiseGroup==node.pointwiseGroup)
+          finalUse=std::max(finalUse,last[{i,oi}]);
+      const Key reservation{-4,ni};
+      last[reservation]=finalUse;
+      auto prototype=s.placement("fp16_pair_planar",range(8),"both",1,0,tensor.size()/(8*word));
+      home=allocate(reservation,tensor,"both",1,prototype);
+      pointwiseHomes[group]=home;
+    }
+    home=s.change(home,J{{"storage_shape",s.array(node.pointwiseShape)},
+        {"storage_offset",node.pointwiseRow*node.pointwiseShape[1]}});
+    const Key scratch{ni,-100-oi}; last[scratch]=ni;
+    auto busy=node.in;
+    busy.insert(busy.end(),node.workspaces.begin(),node.workspaces.end());
+    auto drain=allocate(scratch,node.outputs[oi],text(node.out[oi],"hemisphere"),1,node.out[oi],busy);
+    node.out[oi]=drain; node.outputSlots[oi].set(drain);
+    cache[key]=live[key]=home; retainedOutputHomes[key]=home;
+    return true;
+  }
   void planMemory() {
     I joined = 0;
     for (I ni = 0; ni < I(planner.nodes.size()); ++ni) {
@@ -2068,7 +2576,8 @@ public:
         else
           ++it;
       if (!node.module) {
-        allocate({ni, 0}, node.outputs[0], joined++ % 2 ? "east" : "west");
+        if (node.inputs[0].external()) live[{ni,0}] = cache.at({ni,0});
+        else allocate({ni, 0}, node.outputs[0], joined++ % 2 ? "east" : "west");
         continue;
       }
       node.stagedInputs.assign(node.inputs.size(), false);
@@ -2086,6 +2595,21 @@ public:
         if (value.refs.empty())
           continue;
         auto firstRef = value.refs[0];
+        // Packed beta/decay rows live on their producer's token hemisphere.
+        // Broadcast locally through SXM; VXM can select that hemisphere for
+        // its RHS while the recurrent state remains in its retained home.
+        if (node.recurrent && text(node.in[idx],"hemisphere") != "both" && (idx == 3 || idx == 4)) {
+          auto source = cache.at({firstRef.node, firstRef.output});
+          const auto &shape = planner.nodes[firstRef.node].outputs[firstRef.output].shape;
+          std::string hemisphere = text(source,"hemisphere");
+          if (text(source,"kind") == "token_partition_planar")
+            hemisphere = firstRef.index / shape[1] < (shape[0]+1)/2 ? "west" : "east";
+          if (hemisphere != "both") {
+            node.in[idx] = s.change(node.in[idx], J{{"hemisphere",hemisphere}});
+            for (auto &slot : node.inputSlots[idx]) slot.set(node.in[idx]);
+          }
+        }
+
         // A grouped last-axis reduction may view columns from several native
         // distributed producers. Describe those columns before scheduling;
         // the L2 emitter transposes each group directly from its producer.
@@ -2158,7 +2682,8 @@ public:
           }
         }
         const I wordElements = s.target.memory().bytes_per_word;
-        if (text(firstPlacement, "kind") == "fp16_hemisphere_pair_planar"
+        if (!node.function->hasAttr("ftlpu.vector_bf16_spill")
+            && text(firstPlacement, "kind") == "fp16_hemisphere_pair_planar"
             && text(node.in[idx], "kind") == "fp16_pair_planar"
             && slices(firstPlacement).size() == 2 && !firstPlacement.get("storage_shape")
             && producerShape.size() == 2 && value.shape.size() == 2
@@ -2300,7 +2825,7 @@ public:
         Key key{ni, oi};
         if (!last.count(key))
           continue;
-        if (planRetainedRmsNorm(ni,oi) || planRetainedAttention(ni,oi))
+        if (planRetainedRmsNorm(ni,oi) || planRetainedAttention(ni,oi) || planInPlacePointwise(ni,oi) || planGroupedPointwise(ni,oi))
           continue;
         auto busy = node.in;
         busy.insert(busy.end(), node.workspaces.begin(), node.workspaces.end());
@@ -2408,7 +2933,7 @@ public:
           cache[key] = dest;
         } else
           try {
-            dest = allocate(key, node.outputs[oi], "west",
+            dest = allocate(key, node.outputs[oi], node.recurrent ? text(node.out[oi],"hemisphere") : "west",
                             !scalar(node.out[oi]), node.out[oi], busy);
           } catch (const std::runtime_error &) {
             if (!llvm::isa<fc::kernel::VectorAluOp>(node.outputSlots[oi].op))
@@ -2437,8 +2962,7 @@ public:
     // All assignments are now fixed. Only now may native emitters generate
     // MEM/MXM/VXM/SXM domains, deriving route timing from the chosen slices.
     for (auto &node : planner.nodes) {
-      if (!node.module)
-        continue;
+      if (!node.module) continue;
       mlir::PassManager pm(&s.context);
       pm.enableVerifier(false);
       pm.addNestedPass<mlir::func::FuncOp>(
@@ -2482,6 +3006,18 @@ public:
   void build() {
     fs::create_directories(directory);
     reserveRecurrentStates();
+    // The reserved state lifetime is already part of the whole-graph plan.
+    // Upload a nonzero initial image directly there, without an archive copy.
+    for (I ni=0;ni<I(planner.nodes.size());++ni) {
+      const auto& node=planner.nodes[ni];
+      if (!node.recurrent || !node.inputs[5].external()) continue;
+      const auto& state=node.inputs[5];
+      if (llvm::all_of(state.data,[](uint8_t x){return x==0;})) continue;
+      const I index=inputs.size(); inputs.push_back(state);
+      s.function.insertArgument(s.function.getNumArguments(),type(&s.context,state),mlir::DictionaryAttr{},s.loc);
+      initialStateBindings[ni]=s.binding(state,recurrentStates.at(ni),"input",index,
+          "initial_recurrent_state",s.function.getArgument(s.function.getNumArguments()-1));
+    }
     Tensor mask;
     mask.shape = {4, 32};
     mask.dtype = "f32";
@@ -2507,8 +3043,16 @@ public:
                      .p;
     for (I ni = 0; ni < I(planner.nodes.size()); ++ni) {
       auto &node = planner.nodes[ni];
-      if (!node.module)
+      if (!node.module) {
+        if (node.inputs[0].external()) {
+          const auto& value=node.inputs[0];
+          auto prototype=s.placement(value.dtype=="f32"?"fp32_quad_planar":"fp16_pair_planar",
+              value.dtype=="f32"?V{44,45,46,47}:V{44,45},"west",1,0,
+              value.shape[0]*((value.shape[1]+31)/32));
+          cache[{ni,0}]=input(value,prototype,node.name).p;
+        }
         continue;
+      }
       bool initialRmsNorm = false;
       if (ni == 0)
         node.function.walk([&](fc::tensor::RmsNormTaskOp) {
@@ -2522,7 +3066,9 @@ public:
                     (text(node.in[i], "kind") == "fp16_mxm_distributed_16" ||
                      text(node.in[i], "kind") == "fp16_vxm_gamma_broadcast"))
                     || (ni == 0
-                        && text(node.in[i], "kind") == "fp16_mxm_distributed_16"),
+                        && (text(node.in[i], "kind") == "fp16_mxm_distributed_16"
+                            || (node.ffn && i == 0 &&
+                                text(node.in[i], "kind") == "fp16_mxm_activation_planar"))),
                 node.ffn ? I(planner.nodes.size()) : ni);
     }
     planMemory();
@@ -2539,7 +3085,7 @@ public:
         // Balance packed materializations between the two SXM fabrics. A
         // fixed West home concentrates every later unpack on one iMEM.
         auto p = cache.at({ni, 0});
-        materialize(node.inputs[0], p);
+        if (!node.inputs[0].external()) materialize(node.inputs[0], p);
         for (auto it = live.begin(); it != live.end();)
           if (last[it->first] == ni)
             it = live.erase(it);
@@ -2567,15 +3113,11 @@ public:
                        text(p, "kind") == "fp32_quad_planar" ||
                        text(p, "kind") == "fp16_mxm_distributed_16";
         if (a.external() && node.recurrent && idx == 5) {
-          if (std::any_of(a.data.begin(), a.data.end(),
-                          [](uint8_t x) { return x != 0; }))
-            throw std::runtime_error(
-                "nonzero external recurrent state is not supported yet");
-          s.copy(zeroP, p, V(field(p, "instruction_count"), 0),
-                 range(field(p, "instruction_count")));
-          mapping.map(node.function.getArgument(idx),
-                      s.binding(a, p, "internal", s.internal++,
-                                "initial_recurrent_state"));
+          if (initialStateBindings.count(ni)) mapping.map(node.function.getArgument(idx),initialStateBindings.at(ni));
+          else {
+            s.copy(zeroP, p, V(field(p, "instruction_count"), 0),range(field(p, "instruction_count")));
+            mapping.map(node.function.getArgument(idx),s.binding(a, p, "internal", s.internal++,"initial_recurrent_state"));
+          }
         } else if (a.external() && text(p,"kind") == "fp16_projection_bias_x4") {
           // Preserve the native bias read bank/queues. Relocating those reads
           // after scheduling can collide with the raw-Q FIFO on the other
@@ -2635,7 +3177,9 @@ public:
       }
       pageRows = std::max(pageRows,physicalIngress);
       I ingressBegin = s.cursor;
-      if (pageRows) s.cursor += pageRows+32;
+      // FFN page readiness is a hardware event. Its ingress window describes
+      // resource availability, not a transfer-duration delay on every ICU.
+      if (pageRows && !node.ffn) s.cursor += pageRows+32;
       I start = node.parallel >= 0 ? parallelStart : s.cursor+64, end = start;
       I nativeFirst = std::numeric_limits<I>::max(), nativeLast = 0;
       // This conservative graph schedule finishes the preceding operator
@@ -3029,12 +3573,17 @@ mlir::OwningOpRef<mlir::ModuleOp> ftlpu::compiler::lower_connected_decoder_graph
   Planner planner(context, *target);
   planner.persistentState = !graph.delta_nets.empty();
   planner.hasAttention = !graph.attentions.empty();
+  for (auto &ffn : graph.ffns)
+    for (auto *user : ffn.output.getResult().getUsers())
+      if (auto pointwise=llvm::dyn_cast<fc::kernel::VectorAluOp>(user))
+        planner.retainedAcrossFfn |= !pointwise.getUseImmediate() && !pointwise.getReduce();
   // A head normalization that views the Conv result can consume distributed16
   // directly. Other Conv graphs keep their established planar result layout.
   const auto fromConvolution = [&](const auto &self, mlir::Value value) -> bool {
     auto *producer = value.getDefiningOp();
     if (!producer) return false;
-    if (llvm::isa<fc::kernel::DepthwiseConv1DOp>(producer)) return true;
+    if (auto conv=llvm::dyn_cast<fc::kernel::DepthwiseConv1DOp>(producer))
+      return conv.getInput().getType().getDimSize(0)%32==0;
     if (!llvm::isa<fc::kernel::IndexedViewOp>(producer)) return false;
     return llvm::any_of(producer->getOperands(), [&](mlir::Value operand) {
       return self(self, operand);
@@ -3048,7 +3597,7 @@ mlir::OwningOpRef<mlir::ModuleOp> ftlpu::compiler::lower_connected_decoder_graph
                                                         norm.getInput());
   }
   mlir::NamedAttrList policies;
-  for (auto name : {"ftlpu.mxm_execution_policy", "ftlpu.projection_rope_overlap"})
+  for (auto name : {"ftlpu.mxm_execution_policy", "ftlpu.projection_rope_overlap", "ftlpu.vector_bf16_spill"})
     if (auto attr = module->getAttr(name)) policies.set(name,attr);
   planner.policies = policies.getDictionary(&context);
   if (auto strategy = module->getAttrOfType<mlir::StringAttr>("ftlpu.ffn_schedule"))
@@ -3096,7 +3645,7 @@ mlir::OwningOpRef<mlir::ModuleOp> ftlpu::compiler::lower_connected_decoder_graph
     for (auto input : viewOp.getInputs()) materialize(input);
     for (I i=0; i<t.size(); ++i) {
       auto &src = values.find(viewOp.getInputs()[viewOp.getSources()[i]])->second;
-      if (src.external()) throw std::runtime_error("constant indexed views must be folded by importer");
+      if (src.external()) src=planner.join(src,"external_indexed_view");
       t.refs[i] = src.refs.at(viewOp.getIndices()[i]);
     }
     values[value] = std::move(t);
@@ -3126,6 +3675,17 @@ mlir::OwningOpRef<mlir::ModuleOp> ftlpu::compiler::lower_connected_decoder_graph
     for (auto value : inputs) {argTypes.push_back(value.getType()); args.push_back(values.find(value)->second);}
     for (auto value : outputs) {resultTypes.push_back(value.getType()); results.push_back(describe(value));}
     auto f = mlir::func::FuncOp::create(loc,"region",b.getFunctionType(argTypes,resultTypes)); part->push_back(f);
+    if (auto policy = function->getAttr("ftlpu.vector_bf16_spill"))
+      f->setAttr("ftlpu.vector_bf16_spill", policy);
+    else if (auto policy = module->getAttr("ftlpu.vector_bf16_spill"))
+      f->setAttr("ftlpu.vector_bf16_spill", policy);
+    // Region extraction must preserve the decoder's GDN lowering policy.
+    // Otherwise a whole-function chunkwise request silently becomes a scan
+    // when Planner::lower matches the extracted recurrence subgraph.
+    if (auto policy = function->getAttr("ftlpu.gdn_chunk_size"))
+      f->setAttr("ftlpu.gdn_chunk_size", policy);
+    else if (auto policy = module->getAttr("ftlpu.gdn_chunk_size"))
+      f->setAttr("ftlpu.gdn_chunk_size", policy);
     b.setInsertionPointToStart(f.addEntryBlock()); mlir::IRMapping mapping;
     for (auto [old,value] : llvm::zip(inputs,f.getArguments())) mapping.map(old,value);
     if (recurrentRoles) {

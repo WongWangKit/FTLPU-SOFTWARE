@@ -159,8 +159,13 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     // An earlier paged attention stage owns the same weight-storage slices.
     // Even when each FFN matrix fits by itself, it cannot stay resident across
     // those attention page loads, so give the FFN explicit C2C page lifetimes.
-    const bool requiresLifetimePaging =
-        follows_paged_attention && weight_bank >= 0;
+    // Logical graph execution explicitly requests runtime pages even when
+    // this FFN is its first region. Do not treat its weights as immutable
+    // resident bindings just because there are no earlier attention pages.
+    const auto module = op->getParentOfType<mlir::ModuleOp>();
+    const bool graphWeightPages = module && module->hasAttr("ftlpu.runtime_weight_pages");
+    const bool requiresLifetimePaging = weight_bank >= 0
+        && (follows_paged_attention || graphWeightPages);
     if (!native4 && (requiresWeightPaging || requiresLifetimePaging)) {
         auto planned = tensor::planFfnWeightTiles(
             {m, k, hidden, n}, target, initialWeightBank,
@@ -452,6 +457,23 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         }
         if (!tiledWeights) return placement;
         mlir::NamedAttrList attrs(placement);
+        // Independent MXMs already own disjoint slice groups. Do not retain
+        // the other MXM's row slots inside those groups: holes fragment every
+        // C2C page into tile-sized transfers.
+        const bool denseSplitDown = kind == tensor::FfnWeightTileKind::Down
+            && target.throughput().mxms_per_hemisphere == 2
+            && target.uses_dedicated_slice_roles()
+            && weightTilePlan->slice_group_count >= 4
+            && llvm::all_of(weightTilePlan->pages, [&](const auto& page) {
+                return llvm::all_of(page.spans, [&](const auto& span) {
+                    return span.kind != tensor::FfnWeightTileKind::Down
+                        || span.slice_group_begin + span.slice_group_count
+                            <= weightTilePlan->slice_group_count / 2;
+                });
+            });
+        if (denseSplitDown)
+            attrs.set("kind", rewriter.getStringAttr(
+                "w8a16_mxm_weight_wave_split_dense"));
         attrs.set("paged_weight", rewriter.getBoolAttr(true));
         attrs.set("page_count", rewriter.getI64IntegerAttr(pageCount));
         attrs.set("page_rows",
@@ -520,7 +542,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         attrs.set("runtime_prefetch", rewriter.getBoolAttr(true));
         gate_placement = attrs.getDictionary(rewriter.getContext());
     }
-    const auto up_placement = withWeightPaging(w8a16
+    auto up_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *up,
             native4 ? "w8a16_native4_weight" : singleMxmVector
                 ? "w8a16_mxm_weight_wave_striped"
@@ -532,6 +554,11 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         tiledWeights ? weightTilePlan->projection_slice_groups_per_role : 0,
         tiledWeights ? weightTilePlan->projection_waves_per_slice_group : 0,
         tensor::FfnWeightTileKind::Up);
+    if (graphWeightPages && (tiledWeights || native4)) {
+        mlir::NamedAttrList attrs(up_placement);
+        attrs.set("runtime_prefetch", rewriter.getBoolAttr(true));
+        up_placement = attrs.getDictionary(rewriter.getContext());
+    }
     const auto down_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *down,
             native4 ? "w8a16_native4_weight"

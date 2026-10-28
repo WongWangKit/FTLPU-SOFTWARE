@@ -72,7 +72,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
         target::StreamDirection::East, slice);
     return bridgeLatency
         ? std::optional<int64_t>(
-              mxmResultToVxmLatency + *bridgeLatency + 1
+              mxmResultToVxmLatency + *bridgeLatency
                   - firstResultAdvance)
         : std::nullopt;
   };

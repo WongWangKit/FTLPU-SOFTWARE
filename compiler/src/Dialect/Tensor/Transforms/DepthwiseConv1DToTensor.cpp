@@ -87,7 +87,10 @@ mlir::LogicalResult lower_depthwise_conv1d(kernel::DepthwiseConv1DOp op,
             allocation->layout = "fp16_pair_planar";
             allocation->instruction_count = tokens * featureBlocks;
             allocation->address_stride = 1;
-            allocation->hemisphere = "west";
+            // The fixed chain drains across hemispheres. Expose that scratch
+            // home to the shared planner instead of changing it in emission.
+            allocation->hemisphere = index == 1 && resultType.getElementType().isBF16()
+                ? "east" : "west";
         }
         scratch.push_back(make_task_allocation(rewriter, *allocation,
             make_placement_attr(rewriter, *allocation)));
