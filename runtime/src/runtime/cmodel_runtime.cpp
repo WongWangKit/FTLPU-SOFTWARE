@@ -410,14 +410,57 @@ CModelRuntime::CModelRuntime(C2cDmaSystem& system,
 {
 }
 
-void CModelRuntime::load(
-    const BinaryProgram& program, bool initializeInternalData)
+CModelRuntime::CModelRuntime(C2cDmaSystem& system)
+    : CModelRuntime(system, [&system](TspSliceSystem::LogSinks sinks) {
+        system.tick(sinks);
+    })
 {
+}
+
+void CModelRuntime::load(const BinaryProgram& program, bool initializeInternalData)
+{
+    load_impl(program, false, 0, initializeInternalData);
+}
+
+void CModelRuntime::load_timed(const BinaryProgram& program, std::uint64_t image_base)
+{
+    if (!c2c_system_)
+        throw std::logic_error("timed program load requires a C2cDmaSystem with shared DDR");
+    if (c2c_system_->program_loader().busy())
+        throw std::logic_error("program loader is busy");
+    load_impl(program, true, image_base, true);
+}
+
+bool CModelRuntime::all_images_committed() const
+{ return timed_program_load_ && c2c_system_->program_loader().all_images_committed(); }
+bool CModelRuntime::ready_to_start() const
+{ return timed_program_load_ && c2c_system_->program_loader().ready_to_start() && inputs_ready(); }
+const ProgramLoadStatistics& CModelRuntime::program_load_statistics() const
+{
+    if (!timed_program_load_) throw std::logic_error("no timed program load was submitted");
+    return c2c_system_->program_loader().statistics();
+}
+void CModelRuntime::print_program_load_performance(std::ostream& os) const
+{ program_load_statistics().print(os); }
+bool CModelRuntime::inputs_ready() const
+{
+    return std::all_of(bindings_.begin(), bindings_.end(), [&](const auto& binding) {
+        return binding.access != BindingAccess::Input || uploaded_inputs_.contains(binding.index);
+    });
+}
+
+void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uint64_t image_base,
+    bool initializeInternalData)
+{
+    if (c2c_system_ && c2c_system_->program_loader().busy())
+        throw std::logic_error("cannot replace a program while a timed load is active");
     validate_cmodel_hardware_config(program);
     for (std::size_t tile=0;tile<VxmSlice::kTileCount;++tile)
         for (std::size_t lane=0;lane<hw::kLanesPerTile;++lane)
             system_.vxm_unit().superlane(tile).lane(lane)
                 .set_statistics_timeline_retention(false);
+    const auto images = timed ? prepare_program_images(program.queues, image_base,
+        program.hardware.mxms_per_hemisphere) : std::vector<ProgramQueueImage>{};
     const auto imem = analyze_physical_imem(program);
     compute_imem_segments_.clear();compute_imem_queues_.clear();
     compute_imem_segment_=0;compute_imem_boundary_=0;
@@ -469,7 +512,7 @@ void CModelRuntime::load(
             || !std::equal(filtered.transport_queues.begin(), filtered.transport_queues.end(),
                 program.transport_queues.begin(), [](const auto& a, const auto& b) {
                     return a.commands.size() == b.commands.size(); })) {
-            load(filtered, initializeInternalData);
+            load_impl(filtered, timed, image_base, initializeInternalData);
             return;
         }
     }
@@ -489,7 +532,21 @@ void CModelRuntime::load(
     hardware.mxm_weight_activation_overlap_enabled =
         program.hardware.mxm_weight_activation_overlap_enabled != 0;
     system_.configure_hardware(hardware);
-    if (c2c_system_ != nullptr)
+    if (timed) {
+        // submit() clears only compute queues; outstanding weight/data traffic
+        // and all physical clocks continue across kernel switches.
+        std::vector<ProgramImage> descriptors;
+        for (const auto& image : images) {
+            for (std::size_t offset = 0; offset < image.bytes.size(); offset += hw::kPhysicalVectorBytes) {
+                C2cVector vector{};
+                for (std::size_t b = 0; b < hw::kPhysicalVectorBytes && offset + b < image.bytes.size(); ++b)
+                    vector.payload[b / hw::kLanesPerTile][b % hw::kLanesPerTile] = image.bytes[offset + b];
+                c2c_system_->ddr4().initialize_vector(image.descriptor.source_address + offset, vector);
+            }
+            descriptors.push_back(image.descriptor);
+        }
+        c2c_system_->program_loader().submit(std::move(descriptors), c2c_system_->cycle());
+    } else if (c2c_system_ != nullptr)
         c2c_system_->reset_execution_state();
     else
         system_.reset_execution_state();
@@ -516,9 +573,9 @@ void CModelRuntime::load(
     for (std::size_t block = 0; block < 8; ++block)
         system_.configure_vxm_output_block_destination(block,
             block < 4 ? Hemisphere::West : Hemisphere::East);
-    instruction_prefill_cycles_ = load_queue_programs_into_icu(initialQueues, system_.icu(),
+    instruction_prefill_cycles_ = timed ? 0 : load_queue_programs_into_icu(initialQueues, system_.icu(),
         program.hardware.mxms_per_hemisphere);
-    if (c2c_system_ != nullptr) {
+    if (!timed && c2c_system_ != nullptr) {
         constexpr auto kInstructionImageBase =
             std::uint64_t {0x1'0000'0000};
         instruction_prefill_cycles_ +=
@@ -557,8 +614,10 @@ void CModelRuntime::load(
     paged_weight_data_.clear();
     next_weight_page_use_ = 0;
     executed_cycles_ = 0;
-    physical_cycles_ = 0;
-    system_.icu().set_program_issue_enabled(true);
+    physical_cycles_ = timed ? system_.cycle() : 0;
+    timed_program_load_ = timed;
+    uploaded_inputs_.clear();
+    system_.icu().set_program_issue_enabled(!timed);
     if (execution_trace_enabled_)
         execution_trace_.begin_segment(program,
             execution_trace_cycle_offset_, execution_trace_append_on_load_);
@@ -722,6 +781,7 @@ void CModelRuntime::upload_input(std::size_t index, std::span<const std::uint8_t
                 "paged input byte size does not match binding");
         paged_weight_data_[binding.index] =
             std::vector<std::uint8_t>(data.begin(), data.end());
+        uploaded_inputs_.insert(binding.index);
         return;
     }
     upload_binding(binding, data);
@@ -844,6 +904,13 @@ void CModelRuntime::write_mem_execution_trace_csv(
 }
 
 void CModelRuntime::upload_binding(
+    const BinaryBinding& binding, std::span<const std::uint8_t> data)
+{
+    upload_binding_impl(binding, data);
+    if (binding.access == BindingAccess::Input) uploaded_inputs_.insert(binding.index);
+}
+
+void CModelRuntime::upload_binding_impl(
     const BinaryBinding& binding, std::span<const std::uint8_t> data)
 {
     if (binding.role == "weight" && binding.rope_rotary_dim
@@ -1794,8 +1861,11 @@ void CModelRuntime::copy_binding(
         && source.bank == destination.bank
         && source.base_row == destination.base_row
         && source.slices == destination.slices
-        && source.hemisphere_mask == destination.hemisphere_mask)
+        && source.hemisphere_mask == destination.hemisphere_mask) {
+        if (destination.access == BindingAccess::Input)
+            uploaded_inputs_.insert(destination.index);
         return;
+    }
 
     const std::size_t rows = static_cast<std::size_t>(source.shape[0]);
     const std::size_t columns = static_cast<std::size_t>(source.shape[1]);
@@ -1809,6 +1879,8 @@ void CModelRuntime::copy_binding(
         for (std::size_t column = 0; column < columns; ++column)
             write_16bit_element(system_, destination, row, column,
                 staging[row * columns + column], hardware_);
+    if (destination.access == BindingAccess::Input)
+        uploaded_inputs_.insert(destination.index);
 }
 
 void CModelRuntime::load_file(const std::filesystem::path& path)
@@ -2055,18 +2127,40 @@ void CModelRuntime::reload_drained_compute_imem()
 void CModelRuntime::run_logical_cycles(
     std::size_t cycles, TspSliceSystem::LogSinks sinks)
 {
+    if (timed_program_load_) physical_cycles_ = system_.cycle();
     sinks.capture_mem_trace = mem_execution_trace_enabled_;
     const auto count = cycles == 0 ? loaded_max_cycle_ + 1 : cycles;
-    system_.icu().set_program_issue_enabled(true);
+    if (!timed_program_load_) system_.icu().set_program_issue_enabled(true);
     std::size_t heldCycles = 0;
     constexpr std::size_t kPhysicalWaitWatchdog = 10'000'000;
     for (std::size_t advanced = 0; advanced < count;) {
         reload_drained_compute_imem();
         // P advances on every tick; L advances only on an enabled dispatch.
-        load_ready_weight_pages();
+        const bool inputReady = !timed_program_load_ || inputs_ready();
+        if (inputReady) load_ready_weight_pages();
         advance_common_transport();
+        if (timed_program_load_) {
+            auto& loader = c2c_system_->program_loader();
+            const bool initialPagesReady = std::all_of(common_transports_.begin(),
+                common_transports_.end(), [](const auto& page) {
+                    return page.stop_cycle != 0 || page.committed;
+                });
+            const bool dependenciesReady = inputReady && (loader.started()
+                || (initialPagesReady && (!program_start_dependency_checker_
+                    || program_start_dependency_checker_())));
+            loader.set_dependencies_ready(dependenciesReady);
+            loader.start();
+            system_.icu().set_program_issue_enabled(dependenciesReady
+                && (loader.started() || loader.ready_to_start()));
+        }
         tick_(sinks);
-        const bool enabled = !common_barrier_protocol_ || system_.icu().compute_enabled();
+        if (timed_program_load_) {
+            const auto& stats = program_load_statistics();
+            if (stats.frontend_ready)
+                instruction_prefill_cycles_ = *stats.frontend_ready - *stats.all_images_committed;
+        }
+        const bool enabled = timed_program_load_ || common_barrier_protocol_
+            ? system_.icu().compute_enabled() : true;
         if (execution_trace_enabled_)
             execution_trace_.sample(
                 system_, physical_cycles_, enabled, nullptr);

@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ftlpu {
@@ -25,6 +26,7 @@ namespace ftlpu::software::runtime {
 class CModelRuntime {
 public:
     explicit CModelRuntime(TspSliceSystem& system);
+    explicit CModelRuntime(C2cDmaSystem& system);
     CModelRuntime(TspSliceSystem& system,
         std::function<void(TspSliceSystem::LogSinks)> tick);
     CModelRuntime(C2cDmaSystem& system,
@@ -33,6 +35,18 @@ public:
     void load(const BinaryProgram& program,
         bool initialize_internal_data = true);
     void initialize_internal_data(const BinaryProgram& program);
+    // Legacy load() directly installs semantic/physical queues and primes IQ.
+    // load_timed() submits a real DDR image and returns before any i-MEM write.
+    void load_direct(const BinaryProgram& program) { load(program); }
+    void load_timed(const BinaryProgram& program,
+        std::uint64_t image_base = 0x1'0000'0000ULL);
+    // Startup-only dependency gate; common barriers still govern page transitions.
+    void set_program_start_dependency_checker(std::function<bool()> checker)
+    { program_start_dependency_checker_ = std::move(checker); }
+    bool all_images_committed() const;
+    bool ready_to_start() const;
+    const ProgramLoadStatistics& program_load_statistics() const;
+    void print_program_load_performance(std::ostream& os) const;
     void load_file(const std::filesystem::path& path);
     void upload_input(std::size_t index, std::span<const std::uint8_t> data);
     void upload_binding(
@@ -81,6 +95,10 @@ public:
     void print_datapath_performance(std::ostream& os) const;
 
 private:
+    void load_impl(const BinaryProgram& program, bool timed, std::uint64_t image_base,
+        bool initialize_internal_data);
+    void upload_binding_impl(const BinaryBinding& binding, std::span<const std::uint8_t> data);
+    bool inputs_ready() const;
     const BinaryBinding& find_binding(BindingAccess access, std::size_t index) const;
     void load_ready_weight_pages();
     void configure_common_transport(const BinaryProgram& program);
@@ -117,6 +135,9 @@ private:
     std::size_t executed_cycles_{0};
     std::size_t physical_cycles_{0};
     std::size_t instruction_prefill_cycles_{0};
+    bool timed_program_load_{false};
+    std::function<bool()> program_start_dependency_checker_{};
+    std::unordered_set<std::size_t> uploaded_inputs_{};
     DatapathPerformanceMonitor datapath_performance_{};
     RuntimeExecutionTrace execution_trace_{};
     MemExecutionTrace mem_execution_trace_{};

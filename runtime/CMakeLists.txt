@@ -75,6 +75,8 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/compiled_sxm_command_runtime_test.cpp
     tests/runtime/compiled_queue_program_runtime_test.cpp
     tests/runtime/compiled_stage_file_runner.cpp
+
+    tests/runtime/program_load_runtime_test.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
     tests/runtime/compiled_qwen_real_ffn_runtime_test.cpp
     tests/runtime/compiled_qwen_real_decoder_layer_runtime_test.cpp
@@ -216,6 +218,10 @@ add_test(
     NAME mem_execution_trace_test
     COMMAND $<TARGET_FILE:mem_execution_trace_test>
         ${CMAKE_CURRENT_BINARY_DIR}/test-output/mem-execution-trace.csv)
+
+add_executable(program_load_runtime_test tests/runtime/program_load_runtime_test.cpp)
+target_link_libraries(program_load_runtime_test PRIVATE ftlpu_software)
+add_test(NAME program_load_runtime_test COMMAND $<TARGET_FILE:program_load_runtime_test>)
 
 add_executable(ftlpu_pack_model_weights
     examples/pack_model_weights.cpp)
