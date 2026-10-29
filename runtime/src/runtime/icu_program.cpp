@@ -640,6 +640,42 @@ bool IcuProgram::empty() const
     return true;
 }
 
+std::vector<ProgramQueueImage> prepare_program_images(
+    const std::vector<QueueProgram>& queues, std::uint64_t source_base,
+    std::size_t logical_mxms_per_hemisphere)
+{
+    std::vector<ProgramQueueImage> result;
+    for (const auto& queue : queues) {
+        if (queue.commands.empty() && !queue.packed_macro_imem) continue;
+        if (!is_all_macro_queue(queue))
+            throw std::invalid_argument(std::string("timed program load has no physical codec for ")
+                + queue_kind_name(queue.kind) + " queue " + std::to_string(queue.index));
+        const auto index = physical_queue_index(queue.kind, queue.index,
+            logical_mxms_per_hemisphere);
+        validate_queue_index(queue.kind, index);
+        auto packed = queue.packed_macro_imem ? *queue.packed_macro_imem
+            : queue.kind == QueueKind::Mem
+                ? pack_mem_macro_imem(encode_mem_macro_bitstream(queue))
+                : pack_mxm_macro_imem(encode_mxm_macro_bitstream(queue));
+        const auto bits = queue.kind == QueueKind::Mem ? 96u : 128u;
+        if (packed.word_bits != bits || packed.bytes.empty()
+            || packed.bytes.size() % (bits / 8) != 0)
+            throw std::invalid_argument("invalid packed program image width or length");
+        ProgramImage descriptor{source_base,
+            static_cast<IcuMacroQueueKind>(queue.kind), index, packed.bytes.size()};
+        const auto dmaBytes = descriptor.vector_count() * hw::kPhysicalVectorBytes;
+        if (source_base > UINT64_MAX - dmaBytes)
+            throw std::overflow_error("program image DDR address overflow");
+        for (const auto& previous : result)
+            if (previous.descriptor.kind == descriptor.kind
+                && previous.descriptor.queue_index == descriptor.queue_index)
+                throw std::invalid_argument("duplicate program queue destination");
+        result.push_back({descriptor, std::move(packed.bytes)});
+        source_base += dmaBytes;
+    }
+    return result;
+}
+
 std::size_t load_queue_programs_into_icu(
     const std::vector<QueueProgram>& queues,
     InstructionControlUnit& icu,

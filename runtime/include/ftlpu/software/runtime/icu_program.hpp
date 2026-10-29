@@ -2,6 +2,7 @@
 
 #include "ftlpu/core/instruction_codec.hpp"
 #include "ftlpu/system/icu.hpp"
+#include "ftlpu/system/program_loader.hpp"
 
 #include <algorithm>
 #include <array>
@@ -791,6 +792,17 @@ private:
 };
 
 const char* queue_kind_name(QueueKind kind);
+
+struct ProgramQueueImage {
+    ProgramImage descriptor{};
+    std::vector<std::uint8_t> bytes{};
+};
+
+// No semantic entries are installed here. Unsupported physical codecs fail
+// before DDR or any target queue is modified.
+std::vector<ProgramQueueImage> prepare_program_images(
+    const std::vector<QueueProgram>& queues, std::uint64_t source_base,
+    std::size_t logical_mxms_per_hemisphere = hw::kMxmsPerHemisphere);
 std::size_t load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
     InstructionControlUnit& icu,
     std::size_t logical_mxms_per_hemisphere = hw::kMxmsPerHemisphere);

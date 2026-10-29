@@ -47,6 +47,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/issue_inspector_test.cpp
     tests/runtime/compiled_sxm_command_runtime_test.cpp
     tests/runtime/compiled_queue_program_runtime_test.cpp
+    tests/runtime/program_load_runtime_test.cpp
     tests/runtime/compiled_smollm2_135m_ffn_runtime_test.cpp
     tests/runtime/compiled_qwen_real_ffn_runtime_test.cpp
     tests/runtime/compiled_qwen_real_decoder_layer_runtime_test.cpp
@@ -148,6 +149,10 @@ target_link_libraries(runtime_page_ready_sync_test PRIVATE ftlpu_software)
 add_test(
     NAME runtime_page_ready_sync_test
     COMMAND $<TARGET_FILE:runtime_page_ready_sync_test>)
+
+add_executable(program_load_runtime_test tests/runtime/program_load_runtime_test.cpp)
+target_link_libraries(program_load_runtime_test PRIVATE ftlpu_software)
+add_test(NAME program_load_runtime_test COMMAND $<TARGET_FILE:program_load_runtime_test>)
 
 add_executable(ftlpu_pack_model_weights
     examples/pack_model_weights.cpp)
