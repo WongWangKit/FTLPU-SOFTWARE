@@ -17,7 +17,10 @@ namespace ftlpu::software::runtime {
 namespace {
 
 using QueueId = std::pair<QueueKind, std::size_t>;
-using IssueMap = std::map<std::size_t, QueueCommand>;
+struct IssueMap {
+    std::map<std::size_t, QueueCommand> entries;
+    std::size_t* remaining{nullptr};
+};
 
 constexpr isa::EncodedIcuCommand kInstructionCommand =
     static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction);
@@ -140,8 +143,11 @@ void insert_issue(IssueMap& issues, const BinaryProgram& program,
     QueueCommand instruction)
 {
     check_cycle(program, cycle, kind, index);
-    const auto [position, inserted] = issues.emplace(
+    if (!issues.remaining || *issues.remaining == 0)
+        throw std::invalid_argument("logical issue analysis exceeds its finite work bound");
+    const auto [position, inserted] = issues.entries.emplace(
         cycle, std::move(instruction));
+    if (inserted) --*issues.remaining;
     if (!inserted)
         throw std::runtime_error("multiple functional issues on one ICU queue cycle: queue="
             + std::string(queue_kind_name(kind)) + "["
@@ -591,7 +597,7 @@ const LogicalQueueTimeline* find_queue(
 
 } // namespace
 
-LogicalIssueProgram inspect_logical_issues(const BinaryProgram& program)
+LogicalIssueProgram inspect_logical_issues(const BinaryProgram& program, std::size_t max_issues)
 {
     std::map<QueueId, IssueMap> expanded;
     for (const auto& queue : program.queues) {
@@ -600,6 +606,7 @@ LogicalIssueProgram inspect_logical_issues(const BinaryProgram& program)
             throw std::runtime_error("binary contains a duplicate ICU queue: "
                 + std::string(queue_kind_name(queue.kind)) + "["
                 + std::to_string(queue.index) + "]");
+        expanded[id].remaining = &max_issues;
         expand_queue(program, queue, expanded[id]);
     }
 
@@ -610,8 +617,8 @@ LogicalIssueProgram inspect_logical_issues(const BinaryProgram& program)
         LogicalQueueTimeline timeline;
         timeline.kind = id.first;
         timeline.index = id.second;
-        timeline.issues.reserve(issues.size());
-        for (auto& [cycle, instruction] : issues)
+        timeline.issues.reserve(issues.entries.size());
+        for (auto& [cycle, instruction] : issues.entries)
             timeline.issues.push_back(
                 LogicalIssue {cycle, std::move(instruction)});
         const auto horizon = program.max_cycle

@@ -1,0 +1,3 @@
+final image equivalence passed: computation, transport, operands, relocations, events and release phases
+final image load passed: queue boundaries, transport dependency graph, SRAM targets and finite PRIME
+final image load passed: queue boundaries, transport dependency graph, SRAM targets and finite PRIME

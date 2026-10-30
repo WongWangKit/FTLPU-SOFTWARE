@@ -941,6 +941,86 @@ void write_barrier_sections(std::ostream& os, const BinaryProgram& program)
     }
 }
 
+template <typename Reader>
+void read_queue_controls(Reader& reader, BinaryProgram& program)
+{
+    for (const auto byte : std::array<std::uint8_t,4>{'Q','C','T','L'})
+        if (read_le<std::uint8_t>(reader) != byte)
+            throw std::runtime_error("invalid QCTL magic");
+    const auto version = read_le<std::uint16_t>(reader);
+    const auto bytes = read_le<std::uint16_t>(reader);
+    const auto directories = read_le<std::uint32_t>(reader);
+    const auto events = read_le<std::uint32_t>(reader);
+    if (version != 1 || bytes != 24 || directories > 4096 || events > 65535)
+        throw std::runtime_error("invalid QCTL encoding or count");
+    for (std::uint32_t q=0; q<directories; ++q) {
+        BinaryQueueControlPartition partition;
+        partition.kind = static_cast<QueueKind>(read_le<std::uint16_t>(reader));
+        partition.index = read_le<std::uint16_t>(reader);
+        const auto count = read_le<std::uint32_t>(reader);
+        partition.end_cycle = read_le<std::uint32_t>(reader);
+        if (count > program.hardware.queue_control_capacity || count > 256)
+            throw std::runtime_error("QCTL partition exceeds physical capacity");
+        for (std::uint32_t i=0; i<count; ++i) {
+            BinaryQueueControl control;
+            control.local_cycle = read_le<std::uint32_t>(reader);
+            control.opcode = static_cast<IcuControlOpcode>(read_le<std::uint16_t>(reader));
+            const auto flags = read_le<std::uint16_t>(reader);
+            if (flags > 3) throw std::runtime_error("invalid QCTL binding flags");
+            control.native_binding = (flags & 1) != 0;
+            control.activation_producer = (flags & 2) != 0;
+            control.operand = read_le<std::uint32_t>(reader);
+            control.source_command = read_le<std::uint32_t>(reader);
+            control.release_group = read_le<std::uint32_t>(reader);
+            control.phase_offset = read_le<std::uint32_t>(reader);
+            partition.entries.push_back(control);
+        }
+        program.queue_sync_plan.partitions.push_back(std::move(partition));
+    }
+    std::uint32_t instances=0;
+    for (std::uint32_t i=0; i<events; ++i) {
+        BinaryQueueControlEvent event;
+        event.event_id = read_le<std::uint32_t>(reader);
+        event.source = static_cast<QueueEventSource>(read_le<std::uint16_t>(reader));
+        if (read_le<std::uint16_t>(reader)) throw std::runtime_error("nonzero QCTL reserved field");
+        const auto count = read_le<std::uint32_t>(reader);
+        if (count > 65535-instances) throw std::runtime_error("QCTL completion capacity exceeded");
+        instances += count;
+        for (std::uint32_t n=0; n<count; ++n) event.page_use_indices.push_back(read_le<std::uint32_t>(reader));
+        program.queue_sync_plan.events.push_back(std::move(event));
+    }
+}
+
+void write_queue_controls(std::ostream& os, const BinaryProgram& program)
+{
+    os.write("QCTL",4);
+    write_le<std::uint16_t>(os,1); write_le<std::uint16_t>(os,24);
+    write_le<std::uint32_t>(os,static_cast<std::uint32_t>(program.queue_sync_plan.partitions.size()));
+    write_le<std::uint32_t>(os,static_cast<std::uint32_t>(program.queue_sync_plan.events.size()));
+    for (const auto& partition : program.queue_sync_plan.partitions) {
+        write_le<std::uint16_t>(os,static_cast<std::uint16_t>(partition.kind));
+        write_le<std::uint16_t>(os,partition.index);
+        write_le<std::uint32_t>(os,static_cast<std::uint32_t>(partition.entries.size()));
+        write_le<std::uint32_t>(os,partition.end_cycle);
+        for (const auto& c:partition.entries) {
+            write_le<std::uint32_t>(os,c.local_cycle);
+            write_le<std::uint16_t>(os,static_cast<std::uint16_t>(c.opcode));
+            write_le<std::uint16_t>(os,(c.native_binding ? 1 : 0) | (c.activation_producer ? 2 : 0));
+            write_le<std::uint32_t>(os,c.operand);
+            write_le<std::uint32_t>(os,c.source_command);
+            write_le<std::uint32_t>(os,c.release_group);
+            write_le<std::uint32_t>(os,c.phase_offset);
+        }
+    }
+    for (const auto& event:program.queue_sync_plan.events) {
+        write_le<std::uint32_t>(os,event.event_id);
+        write_le<std::uint16_t>(os,static_cast<std::uint16_t>(event.source));
+        write_le<std::uint16_t>(os,0);
+        write_le<std::uint32_t>(os,static_cast<std::uint32_t>(event.page_use_indices.size()));
+        for (const auto instance:event.page_use_indices) write_le<std::uint32_t>(os,instance);
+    }
+}
+
 void skip_value(std::istream& is, std::uint64_t bytes)
 {
     if (bytes > static_cast<std::uint64_t>(
@@ -1321,6 +1401,80 @@ BinaryTimeline read_timeline(ByteReader& reader)
     return timeline;
 }
 
+template <typename Reader>
+void read_queue_link_source(Reader& reader,BinaryProgram& program)
+{
+    for(const auto byte:std::array<std::uint8_t,4>{'Q','L','N','K'})
+        if(read_le<std::uint8_t>(reader)!=byte) throw std::runtime_error("invalid QLNK magic");
+    const auto version=read_le<std::uint16_t>(reader);
+    const auto flags=read_le<std::uint16_t>(reader);
+    const auto queues=read_le<std::uint32_t>(reader);
+    const auto addresses=read_le<std::uint32_t>(reader);
+    const auto scales=read_le<std::uint32_t>(reader);
+    const auto reserved=read_le<std::uint32_t>(reader);
+    if(version!=1 || flags>1 || reserved || queues>4096 || addresses>1000000 || scales>1000000
+        || (flags && !queues)) throw std::runtime_error("invalid QLNK header or capacity");
+    auto& source=program.queue_link_source;source.required=flags!=0;
+    std::size_t total=0;
+    for(std::uint32_t i=0;i<queues;++i) {
+        QueueProgram queue;
+        queue.kind=static_cast<QueueKind>(read_le<std::uint16_t>(reader));
+        queue.index=read_le<std::uint16_t>(reader);
+        const auto count=read_le<std::uint32_t>(reader);
+        if(count>1000000-total) throw std::runtime_error("QLNK exceeds compact source budget");
+        total+=count;
+        for(std::uint32_t pc=0;pc<count;++pc) queue.commands.push_back(read_compact_queue_command(reader));
+        source.queues.push_back(std::move(queue));
+    }
+    for(std::uint32_t i=0;i<addresses;++i) {
+        BinaryAddressRelocation a;
+        a.binding_index=read_le<std::uint32_t>(reader);
+        a.binding_access=static_cast<BindingAccess>(read_le<std::uint16_t>(reader));
+        a.queue_kind=static_cast<QueueKind>(read_le<std::uint16_t>(reader));
+        a.queue_index=read_le<std::uint16_t>(reader);
+        const auto bits=read_le<std::uint16_t>(reader);
+        if(bits>1) throw std::runtime_error("invalid QLNK relocation flags");
+        a.write_port=bits!=0;a.command_index=read_le<std::uint32_t>(reader);
+        source.address_relocations.push_back(a);
+    }
+    for(std::uint32_t i=0;i<scales;++i) {
+        BinaryScaleRelocation a;
+        a.binding_index=read_le<std::uint32_t>(reader);
+        a.scale_index=read_le<std::uint32_t>(reader);
+        a.queue_kind=static_cast<QueueKind>(read_le<std::uint16_t>(reader));
+        a.queue_index=read_le<std::uint16_t>(reader);
+        a.command_index=read_le<std::uint32_t>(reader);
+        a.operand=static_cast<VxmImmediateOperand>(read_le<std::uint16_t>(reader));
+        if(static_cast<unsigned>(a.operand)>1) throw std::runtime_error("invalid QLNK scale operand");
+        source.scale_relocations.push_back(a);
+    }
+}
+void write_queue_link_source(std::ostream& os,const BinaryProgram& program)
+{
+    const auto& source=program.queue_link_source;
+    os.write("QLNK",4);write_le<std::uint16_t>(os,1);write_le<std::uint16_t>(os,source.required?1:0);
+    write_le<std::uint32_t>(os,static_cast<std::uint32_t>(source.queues.size()));
+    write_le<std::uint32_t>(os,static_cast<std::uint32_t>(source.address_relocations.size()));
+    write_le<std::uint32_t>(os,static_cast<std::uint32_t>(source.scale_relocations.size()));
+    write_le<std::uint32_t>(os,0);
+    for(const auto& q:source.queues) {
+        write_le<std::uint16_t>(os,static_cast<std::uint16_t>(q.kind));
+        write_le<std::uint16_t>(os,static_cast<std::uint16_t>(q.index));
+        write_le<std::uint32_t>(os,static_cast<std::uint32_t>(q.commands.size()));
+        for(const auto& c:q.commands) write_compact_queue_command(os,c);
+    }
+    for(const auto& a:source.address_relocations) {
+        write_le<std::uint32_t>(os,a.binding_index);write_le<std::uint16_t>(os,static_cast<std::uint16_t>(a.binding_access));
+        write_le<std::uint16_t>(os,static_cast<std::uint16_t>(a.queue_kind));write_le<std::uint16_t>(os,a.queue_index);
+        write_le<std::uint16_t>(os,a.write_port?1:0);write_le<std::uint32_t>(os,a.command_index);
+    }
+    for(const auto& a:source.scale_relocations) {
+        write_le<std::uint32_t>(os,a.binding_index);write_le<std::uint32_t>(os,a.scale_index);
+        write_le<std::uint16_t>(os,static_cast<std::uint16_t>(a.queue_kind));write_le<std::uint16_t>(os,a.queue_index);
+        write_le<std::uint32_t>(os,a.command_index);write_le<std::uint16_t>(os,static_cast<std::uint16_t>(a.operand));
+    }
+}
+
 struct BinaryHeader {
     BinaryProgram program;
     std::uint32_t version;
@@ -1338,8 +1492,12 @@ void read_hardware_config(BinaryProgram& program, std::uint32_t version,
 {
     auto read = [&](std::uint32_t& value) { value = read_value(); };
     bool upgradeTargetAbi = false;
-    if (version >= 37) {
+    if (version >= 39) {
         program.hardware.visit(read);
+    } else if (version == 38) {
+        program.hardware.visit_pre_v39(read);
+    } else if (version == 37) {
+        program.hardware.visit_pre_v38(read);
     } else if (version >= 29) {
         program.hardware.visit_pre_v37(read);
     } else if (version == 28) {
@@ -1370,10 +1528,21 @@ void read_hardware_config(BinaryProgram& program, std::uint32_t version,
         program.hardware.visit_pre_v19(read);
         upgradeTargetAbi = true;
     }
-    if (version < 37) {
+    if (version < 39) {
+        program.hardware.queue_control_version = 0;
+        program.hardware.queue_control_capacity = 0;
+        program.hardware.queue_control_cache_depth = 0;
+        program.hardware.queue_control_read_latency = 0;
+        program.hardware.queue_control_read_ports = 0;
+        if (version < 38) program.hardware.common_transport_overlap_version = 0;
         TargetAbiHasher legacy;
         legacy.add(21);
         program.hardware.visit_command_abi([&](std::uint32_t value) { legacy.add(value); });
+        if (version >= 37) {
+            legacy.add(program.hardware.common_barrier_encoding_version);
+            legacy.add(program.hardware.common_barrier_capacity);
+        }
+        if (version >= 38) legacy.add(program.hardware.common_transport_overlap_version);
         if (program.target_abi == legacy.value())
             upgradeTargetAbi = true;
     }
@@ -1433,10 +1602,12 @@ BinaryHeader read_header(ByteReader& reader)
     const auto barrier_event_count = version >= 37 ? reader.read<std::uint32_t>() : 0;
     const auto metadata_flags = version >= 37 ? reader.read<std::uint32_t>() : 0;
     const auto transport_queue_count = version >= 37 ? reader.read<std::uint32_t>() : 0;
-    if ((metadata_flags & ~1u) != 0 || transport_queue_count > queue_count
-        || (transport_queue_count != 0 && (metadata_flags & 1u) == 0))
+    if ((metadata_flags & ~(version >= 39 ? 7u : version >= 38 ? 3u : 1u)) != 0 || transport_queue_count > queue_count
+        || (transport_queue_count != 0 && (metadata_flags & 5u) == 0))
         throw std::runtime_error("invalid FTLPU common barrier metadata flags or queue count");
     program.common_barrier_protocol = (metadata_flags & 1u) != 0;
+    program.transport_overlap_protocol = (metadata_flags & 2u) != 0;
+    program.queue_control_protocol = (metadata_flags & 4u) != 0;
     program.bindings.reserve(binding_count);
     for (std::uint32_t index = 0; index < binding_count; ++index)
         program.bindings.push_back(read_binding(reader, version));
@@ -1467,6 +1638,8 @@ BinaryHeader read_header(ByteReader& reader)
         use.release_cycle = reader.read<std::uint64_t>();
         if (version >= 37)
             use.transport_launch_event_id = read_le<std::uint32_t>(reader);
+        if (version >= 38)
+            use.transport_launch_cycle = read_le<std::uint32_t>(reader);
         program.weight_page_uses.push_back(use);
     }
     program.stream_release_cycles.reserve(stream_release_count);
@@ -1474,6 +1647,7 @@ BinaryHeader read_header(ByteReader& reader)
         program.stream_release_cycles.push_back(reader.read<std::uint64_t>());
     if (version >= 37)
         read_barrier_sections(reader, program, barrier_event_count);
+    if (version >= 39) { read_queue_controls(reader, program);read_queue_link_source(reader,program); validate_queue_sync_plan(program, false); }
     return {std::move(program), version, queue_count, relocation_count,
         address_relocation_count, weight_page_use_count,
         stream_release_count, transport_queue_count};
@@ -1567,11 +1741,27 @@ BinaryBarrier make_binary_barrier(std::uint64_t cycle, std::uint32_t event_id)
 void validate_binary_barriers(const BinaryProgram& program)
 {
     const auto& hardware = program.hardware;
+    if (program.transport_overlap_protocol && (!program.common_barrier_protocol
+        || hardware.common_transport_overlap_version != 1))
+        throw std::runtime_error("unsupported FTLPU transport overlap protocol");
+    std::unordered_map<std::uint32_t, std::uint32_t> launch_cycles;
+    for (const auto& use : program.weight_page_uses) {
+        if (!program.transport_overlap_protocol && use.transport_launch_cycle)
+            throw std::runtime_error("transport launch cycle requires the overlap protocol flag");
+        if (!use.transport_launch_event_id) {
+            if (use.transport_launch_cycle) throw std::runtime_error("orphan transport launch cycle");
+            continue;
+        }
+        const auto [entry, inserted] = launch_cycles.emplace(use.transport_launch_event_id, use.transport_launch_cycle);
+        if (!inserted && entry->second != use.transport_launch_cycle)
+            throw std::runtime_error("inconsistent transport launch cycle");
+    }
     if (program.common_barrier_protocol
         && (hardware.common_barrier_encoding_version != 1 || hardware.common_barrier_capacity == 0
             || hardware.common_barrier_capacity > hw::kCommonBarrierCapacity))
         throw std::runtime_error("unsupported FTLPU common barrier hardware capability");
-    if ((!program.barriers.empty() || !program.barrier_events.empty() || !program.transport_queues.empty())
+    if ((!program.barriers.empty() || !program.barrier_events.empty()
+            || (!program.queue_control_protocol && !program.transport_queues.empty()))
         && !program.common_barrier_protocol)
         throw std::runtime_error("FTLPU common barrier data requires the protocol flag");
     if (program.barriers.size() > hardware.common_barrier_capacity
@@ -1621,9 +1811,13 @@ void validate_binary_barriers(const BinaryProgram& program)
             throw std::runtime_error("FTLPU barrier references an unknown or repeated event");
         const auto event = std::find_if(program.barrier_events.begin(), program.barrier_events.end(),
             [&](const auto& value) { return value.event_id == barrier.event_id; });
-        for (const auto instance : event->page_use_indices)
-            if (barrier.stop_cycle > program.weight_page_uses[instance].ready_cycle)
+        for (const auto instance : event->page_use_indices) {
+            const auto& use = program.weight_page_uses[instance];
+            if (barrier.stop_cycle > use.ready_cycle)
                 throw std::runtime_error("FTLPU barrier is later than its page consumer");
+            if (program.transport_overlap_protocol && use.transport_launch_cycle > barrier.stop_cycle)
+                throw std::runtime_error("FTLPU transport launch is later than its barrier");
+        }
         previous = barrier.stop_cycle;
         first = false;
     }
@@ -1637,9 +1831,145 @@ void validate_binary_barriers(const BinaryProgram& program)
     }
 }
 
+void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
+{
+    const auto& plan=program.queue_sync_plan;
+    const auto& hw=program.hardware;
+    if (!program.queue_control_protocol) {
+        if (!plan.partitions.empty() || !plan.events.empty() || !program.queue_link_source.queues.empty() || program.queue_link_source.required)
+            throw std::runtime_error("QCTL data lacks protocol capability");
+        return;
+    }
+    if (program.common_barrier_protocol || program.transport_overlap_protocol
+        || hw.queue_control_version != 1 || !hw.queue_control_capacity
+        || hw.queue_control_capacity > ftlpu::hw::kQueueControlCapacity
+        || !hw.queue_control_cache_depth || hw.queue_control_cache_depth > hw.queue_control_capacity
+        || !hw.queue_control_read_latency || hw.queue_control_read_ports != 1
+        || program.max_cycle > std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("unsupported QCTL protocol, geometry or timeline");
+    const auto& source=program.queue_link_source;
+    if(source.queues.size()>4096 || source.address_relocations.size()>1000000 || source.scale_relocations.size()>1000000
+        || (source.required && source.queues.empty())) throw std::runtime_error("invalid QLNK source capacity");
+    std::unordered_set<std::uint32_t> source_queues;
+    std::size_t source_words=0;
+    for(const auto& q:source.queues) {
+        if(q.requires_raw_macro || q.packed_macro_imem || q.index>65535 || static_cast<unsigned>(q.kind)>9
+            || !source_queues.insert((static_cast<std::uint32_t>(q.kind)<<16)|q.index).second
+            || q.commands.size()>1000000-source_words)
+            throw std::runtime_error("QLNK source is not a bounded Native domain plan");
+        source_words+=q.commands.size();
+        for(const auto& c:q.commands)
+            if(is_macro_schedule_command(c)) throw std::runtime_error("QLNK cannot contain already folded Macro records");
+    }
+    const auto check_source_relocation=[&](const auto& a) {
+        const auto q=std::ranges::find_if(source.queues,[&](const auto& q){return q.kind==a.queue_kind && q.index==a.queue_index;});
+        if(q==source.queues.end() || a.command_index>=q->commands.size()) throw std::runtime_error("QLNK relocation has no source boundary");
+    };
+    for(const auto& a:source.address_relocations) {
+        if(a.transport_queue || static_cast<unsigned>(a.binding_access)>2) throw std::runtime_error("invalid QLNK address binding");
+        check_source_relocation(a);
+    }
+    for(const auto& a:source.scale_relocations) check_source_relocation(a);
+    if (plan.events.size()>65535) throw std::runtime_error("QCTL event capacity exceeded");
+    std::unordered_set<std::uint32_t> events,used,instances,partitions;
+    for (const auto& e:plan.events) {
+        if ((e.source==QueueEventSource::PageCommit && !e.event_id) || !events.insert(e.event_id).second
+            || (e.source != QueueEventSource::External && e.source != QueueEventSource::PageCommit)
+            || ((e.source == QueueEventSource::External) != e.page_use_indices.empty()))
+            throw std::runtime_error("invalid QCTL event association");
+        for (const auto i:e.page_use_indices) {
+            if (i>=program.weight_page_uses.size() || !instances.insert(i).second || instances.size()>65535)
+                throw std::runtime_error("invalid QCTL transport instance");
+            const auto& use=program.weight_page_uses[i];
+            const auto binding=std::ranges::find_if(program.bindings,[&](const auto& b) {
+                return b.access==BindingAccess::Input && b.index==use.binding_index;
+            });
+            if (binding==program.bindings.end() || !binding->paged_weight || use.page_index>=binding->page_count
+                || use.release_cycle<use.ready_cycle || !use.transport_launch_event_id
+                || resolve_weight_page_placement(*binding,use.page_index).bank!=use.bank)
+                throw std::runtime_error("QCTL event references invalid page placement or launch");
+        }
+    }
+    if(!source.required)
+        for(std::uint32_t i=0;i<program.weight_page_uses.size();++i)
+            if(program.weight_page_uses[i].runtime_prefetch && !instances.contains(i))
+                throw std::runtime_error("QCTL runtime page has no SRAM completion event");
+    std::unordered_set<std::uint32_t> transport_partitions;
+    for (const auto& p:plan.partitions) {
+        std::size_t limit=0;
+        switch(p.kind) {
+        case QueueKind::Mem: limit=hw.hemispheres*hw.slices_per_hemisphere*hw.banks_per_slice;break;
+        case QueueKind::MxmLoad: case QueueKind::MxmCompute: case QueueKind::MxmDequant: limit=hw.hemispheres*hw.mxms_per_hemisphere;break;
+        case QueueKind::Vxm: limit=hw.vxm_alus;break;
+        case QueueKind::SxmTranspose: case QueueKind::SxmPermute:
+        case QueueKind::C2cDma: case QueueKind::C2cTx: case QueueKind::C2cRx: limit=hw.hemispheres;break;
+        default: throw std::runtime_error("unknown QCTL queue kind");
+        }
+        if (p.index>=limit || !partitions.insert((static_cast<std::uint32_t>(p.kind)<<16)|p.index).second
+            || p.entries.size()>hw.queue_control_capacity || static_cast<std::uint64_t>(p.end_cycle)>static_cast<std::uint64_t>(program.max_cycle)+1)
+            throw std::runtime_error("invalid QCTL partition or capacity: kind="+std::to_string(static_cast<unsigned>(p.kind))+" queue="+std::to_string(p.index)+" end="+std::to_string(p.end_cycle)+" nominal_last="+std::to_string(program.max_cycle));
+        const auto q=std::ranges::find_if(program.queues,[&](const auto& queue) {return queue.kind==p.kind && queue.index==p.index;});
+        if (bindings && q==program.queues.end()) throw std::runtime_error("QCTL targets a missing queue");
+        if (bindings && p.entries.empty() && !q->requires_raw_macro && !q->packed_macro_imem)
+            throw std::runtime_error("empty QCTL extent must name a Raw computation queue");
+        std::unordered_set<std::uint32_t> sources;
+        std::uint32_t previous=0,transport_ordinal=0;
+        std::optional<std::uint32_t> previous_source;
+        for (const auto& c:p.entries) {
+            if ((previous_source && c.source_command<=*previous_source) || c.local_cycle<previous || c.local_cycle>p.end_cycle || !sources.insert(c.source_command).second
+                || (c.opcode!=IcuControlOpcode::Sync && c.opcode!=IcuControlOpcode::WaitEvent && c.opcode!=IcuControlOpcode::Notify && c.opcode!=kQueueControlMemPacket)
+                || (c.opcode!=IcuControlOpcode::WaitEvent && c.opcode!=kQueueControlMemPacket && (c.operand || c.release_group || c.phase_offset))
+                || (c.opcode==kQueueControlMemPacket && (p.kind!=QueueKind::Mem || !c.operand || c.release_group || c.phase_offset))
+                || (c.release_group && c.release_group!=c.operand) || (!c.release_group && (c.phase_offset || c.activation_producer)))
+                throw std::runtime_error("invalid QCTL operation, position, order or binding");
+            previous=c.local_cycle;
+            previous_source=c.source_command;
+            if (c.opcode==kQueueControlMemPacket && c.operand!=++transport_ordinal)
+                throw std::runtime_error("QCTL transport packet ordinal is not contiguous");
+            if(c.opcode==IcuControlOpcode::WaitEvent) {
+                if(!events.contains(c.operand)) throw std::runtime_error("QCTL wait has an orphan event");
+                const auto event=std::ranges::find_if(plan.events,[&](const auto& e){return e.event_id==c.operand;});
+                if ((event->source==QueueEventSource::PageCommit) != (c.release_group!=0))
+                    throw std::runtime_error("QCTL page wait lacks a release plan or external event has one");
+                used.insert(c.operand);
+            }
+            if (!bindings) continue;
+            const bool raw=q->requires_raw_macro || q->packed_macro_imem.has_value();
+            if (raw==c.native_binding) throw std::runtime_error("QCTL binding would duplicate or omit a control");
+            if(c.native_binding && c.opcode==kQueueControlMemPacket) {
+                if(c.source_command>=q->commands.size() || !is_mem_synchronized_raw_packet_header(q->commands[c.source_command]))
+                    throw std::runtime_error("QCTL MEM packet binding is invalid");
+            } else if(c.native_binding) {
+                if(c.source_command>=q->commands.size() || !is_icu_control_raw_word_command(q->commands[c.source_command]))
+                    throw std::runtime_error("QCTL Native binding does not name a control");
+                const auto native=decode_icu_control_raw_word(q->commands[c.source_command]);
+                if(native.opcode!=c.opcode || native.event_tag!=c.operand)
+                    throw std::runtime_error("QCTL Native control differs from binding");
+            }
+        }
+        if(bindings && transport_ordinal && !p.entries.front().native_binding) {
+            const auto transport=std::ranges::find_if(program.transport_queues,[&](const auto& t){return t.kind==p.kind && t.index==p.index;});
+            if(transport==program.transport_queues.end() || !transport_partitions.insert(p.index).second)
+                throw std::runtime_error("QCTL transport has no independent Native store");
+            std::size_t packets=0;
+            for(std::size_t pc=0;pc<transport->commands.size();) {
+                if(!is_mem_synchronized_raw_packet_header(transport->commands[pc]))
+                    throw std::runtime_error("QCTL transport store contains an unowned operation");
+                (void)decode_mem_synchronized_icu_packet(*transport,pc);
+                ++packets;pc+=InstructionControlUnit::MemIcu::synchronized_packet_word_count;
+            }
+            if(packets!=transport_ordinal) throw std::runtime_error("QCTL transport binding count differs from packet store");
+        }
+    }
+    if(bindings && transport_partitions.size()!=program.transport_queues.size())
+        throw std::runtime_error("QCTL contains an orphan transport partition");
+    if(used.size()!=events.size()) throw std::runtime_error("QCTL event is unreferenced");
+}
+
 void write_binary_program(const BinaryProgram& program, std::ostream& os)
 {
     validate_binary_barriers(program);
+    validate_queue_sync_plan(program);
     os.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
     write_scalar<std::uint32_t>(os, kBinaryFormatVersion);
     if (program.target_name.empty()
@@ -1683,7 +2013,9 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
     write_scalar<std::uint32_t>(
         os, static_cast<std::uint32_t>(program.stream_release_cycles.size()));
     write_le<std::uint32_t>(os, static_cast<std::uint32_t>(program.barrier_events.size()));
-    write_le<std::uint32_t>(os, program.common_barrier_protocol ? 1 : 0);
+    write_le<std::uint32_t>(os, (program.common_barrier_protocol ? 1u : 0u)
+        | (program.transport_overlap_protocol ? 2u : 0u)
+        | (program.queue_control_protocol ? 4u : 0u));
     write_le<std::uint32_t>(os, static_cast<std::uint32_t>(program.transport_queues.size()));
 
     for (const auto& binding : program.bindings) write_binding(os, binding);
@@ -1703,11 +2035,14 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
         write_scalar<std::uint64_t>(os, use.ready_cycle);
         write_scalar<std::uint64_t>(os, use.release_cycle);
         write_le<std::uint32_t>(os, use.transport_launch_event_id);
+        write_le<std::uint32_t>(os, use.transport_launch_cycle);
     }
     for (const std::uint64_t cycle : program.stream_release_cycles)
         write_scalar<std::uint64_t>(os, cycle);
 
     write_barrier_sections(os, program);
+    write_queue_controls(os, program);
+    write_queue_link_source(os,program);
     for (std::size_t queue_id = 0;
          queue_id < program.queues.size() + program.transport_queues.size(); ++queue_id) {
         const auto& queue = queue_id < program.queues.size()
@@ -1814,10 +2149,12 @@ BinaryProgram read_binary_program(std::istream& is)
     const auto barrier_event_count = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
     const auto metadata_flags = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
     const auto transport_queue_count = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
-    if ((metadata_flags & ~1u) != 0 || transport_queue_count > queue_count
-        || (transport_queue_count != 0 && (metadata_flags & 1u) == 0))
+    if ((metadata_flags & ~(version >= 39 ? 7u : version >= 38 ? 3u : 1u)) != 0 || transport_queue_count > queue_count
+        || (transport_queue_count != 0 && (metadata_flags & 5u) == 0))
         throw std::runtime_error("invalid FTLPU common barrier metadata flags or queue count");
     program.common_barrier_protocol = (metadata_flags & 1u) != 0;
+    program.transport_overlap_protocol = (metadata_flags & 2u) != 0;
+    program.queue_control_protocol = (metadata_flags & 4u) != 0;
     program.bindings.reserve(binding_count);
     for (std::uint32_t binding_id = 0; binding_id < binding_count; ++binding_id)
         program.bindings.push_back(read_binding(is, version));
@@ -1849,6 +2186,8 @@ BinaryProgram read_binary_program(std::istream& is)
         use.release_cycle = read_scalar<std::uint64_t>(is);
         if (version >= 37)
             use.transport_launch_event_id = read_le<std::uint32_t>(is);
+        if (version >= 38)
+            use.transport_launch_cycle = read_le<std::uint32_t>(is);
         program.weight_page_uses.push_back(use);
     }
     program.stream_release_cycles.reserve(stream_release_count);
@@ -1857,6 +2196,7 @@ BinaryProgram read_binary_program(std::istream& is)
             read_scalar<std::uint64_t>(is));
     if (version >= 37)
         read_barrier_sections(is, program, barrier_event_count);
+    if (version >= 39) { read_queue_controls(is, program);read_queue_link_source(is,program); validate_queue_sync_plan(program, false); }
     program.queues.reserve(queue_count - transport_queue_count);
 
     for (std::uint32_t queue_id = 0; queue_id < queue_count; ++queue_id) {
@@ -1966,17 +2306,26 @@ BinaryProgram read_binary_program(std::istream& is)
     }
 
     validate_binary_barriers(program);
+    validate_queue_sync_plan(program);
     return program;
 }
 
 BinaryProgram read_binary_program_metadata(std::istream& is)
 {
+    const auto start = is.tellg();
     std::array<char, 8> magic {};
     is.read(magic.data(), static_cast<std::streamsize>(magic.size()));
     if (!is || magic != kMagic)
         throw std::runtime_error("invalid FTLPU binary magic");
 
     const auto version = read_scalar<std::uint32_t>(is);
+    if (version >= 39 && version <= kBinaryFormatVersion) {
+        is.seekg(start);
+        auto metadata=read_binary_program(is);
+        metadata.queues.clear(); metadata.transport_queues.clear();
+        metadata.address_relocations.clear(); metadata.scale_relocations.clear();
+        return metadata;
+    }
     if (version < 1 || version > kBinaryFormatVersion)
         throw std::runtime_error("unsupported FTLPU binary version");
 
@@ -2023,10 +2372,12 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
     const auto barrier_event_count = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
     const auto metadata_flags = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
     const auto transport_queue_count = version >= 37 ? read_scalar<std::uint32_t>(is) : 0;
-    if ((metadata_flags & ~1u) != 0 || transport_queue_count > queue_count
-        || (transport_queue_count != 0 && (metadata_flags & 1u) == 0))
+    if ((metadata_flags & ~(version >= 39 ? 7u : version >= 38 ? 3u : 1u)) != 0 || transport_queue_count > queue_count
+        || (transport_queue_count != 0 && (metadata_flags & 5u) == 0))
         throw std::runtime_error("invalid FTLPU common barrier metadata flags or queue count");
     program.common_barrier_protocol = (metadata_flags & 1u) != 0;
+    program.transport_overlap_protocol = (metadata_flags & 2u) != 0;
+    program.queue_control_protocol = (metadata_flags & 4u) != 0;
 
     program.bindings.reserve(binding_count);
     for (std::uint32_t index = 0; index < binding_count; ++index)
@@ -2057,6 +2408,8 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
         use.release_cycle = read_scalar<std::uint64_t>(is);
         if (version >= 37)
             use.transport_launch_event_id = read_le<std::uint32_t>(is);
+        if (version >= 38)
+            use.transport_launch_cycle = read_le<std::uint32_t>(is);
         program.weight_page_uses.push_back(use);
     }
     program.stream_release_cycles.reserve(stream_release_count);
@@ -2065,6 +2418,7 @@ BinaryProgram read_binary_program_metadata(std::istream& is)
             read_scalar<std::uint64_t>(is));
     if (version >= 37)
         read_barrier_sections(is, program, barrier_event_count);
+    if (version >= 39) { read_queue_controls(is, program);read_queue_link_source(is,program); validate_queue_sync_plan(program, false); }
 
     for (std::uint32_t queue = 0; queue < queue_count; ++queue) {
         const auto queueKind = static_cast<QueueKind>(
@@ -2257,12 +2611,19 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
     if (!reader.empty())
         throw std::runtime_error("FTLPU binary has trailing data");
     validate_binary_barriers(program);
+    validate_queue_sync_plan(program);
     return std::move(program);
 }
 
 BinaryProgram read_binary_program_metadata(
     std::span<const std::uint8_t> data)
 {
+    if (data.size() >= 12 && data[8] == 39 && data[9] == 0 && data[10] == 0 && data[11] == 0) {
+        auto metadata=read_binary_program(data);
+        metadata.queues.clear(); metadata.transport_queues.clear();
+        metadata.address_relocations.clear(); metadata.scale_relocations.clear();
+        return metadata;
+    }
     ByteReader reader(data);
     BinaryHeader header = read_header(reader);
     for (std::uint32_t queue = 0;

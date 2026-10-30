@@ -1,3 +1,5 @@
+#include "ftlpu/software/runtime/queue_phase_release.hpp"
+#include "ftlpu/software/runtime/c2c_weight_pager.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 #include "ftlpu/software/runtime/imem_capacity.hpp"
 
@@ -5,6 +7,7 @@
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 #include "ftlpu/software/runtime/weight_prefetch_plan.hpp"
 #include "ftlpu/software/runtime/common_page_storage.hpp"
+#include "ftlpu/software/runtime/common_overlap.hpp"
 
 #include "ftlpu/core/bf16.hpp"
 #include "ftlpu/core/fp16.hpp"
@@ -225,9 +228,16 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     REQUIRE_EXACT(icu_macro_encoding_version);
     REQUIRE_EXACT(icu_mem_macro_context_bits);
     REQUIRE_EXACT(icu_mxm_macro_context_bits);
+    if (program.queue_control_protocol) {
+        REQUIRE_EXACT(queue_control_version);
+        REQUIRE_EXACT(queue_control_read_latency);
+        REQUIRE_EXACT(queue_control_read_ports);
+    }
     if (program.common_barrier_protocol)
         REQUIRE_EXACT(common_barrier_encoding_version);
     REQUIRE_EXACT(vxm_reserved_feature);
+    if (program.transport_overlap_protocol)
+        REQUIRE_EXACT(common_transport_overlap_version);
 #undef REQUIRE_EXACT
 
     require_capacity("sram_depth_rows", requested.sram_depth_rows,
@@ -255,6 +265,10 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     require_capacity("icu_mxm_macro_contexts",
         requested.icu_mxm_macro_contexts,
         physical.icu_mxm_macro_contexts);
+    if (program.queue_control_protocol) {
+        require_capacity("queue_control_capacity",requested.queue_control_capacity,physical.queue_control_capacity);
+        require_capacity("queue_control_cache_depth",requested.queue_control_cache_depth,physical.queue_control_cache_depth);
+    }
     if (program.common_barrier_protocol)
         require_capacity("common_barrier_capacity", requested.common_barrier_capacity,
             physical.common_barrier_capacity);
@@ -452,6 +466,10 @@ bool CModelRuntime::inputs_ready() const
 void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uint64_t image_base,
     bool initializeInternalData)
 {
+    // The timed image loader currently transports only packed MEM/MXM words.
+    // It has no control-RAM image/commit interface; never silently omit QCTL.
+    if (timed && program.queue_control_protocol)
+        throw std::invalid_argument("timed program load does not yet support QCTL control RAM; use load_direct");
     if (c2c_system_ && c2c_system_->program_loader().busy())
         throw std::logic_error("cannot replace a program while a timed load is active");
     validate_cmodel_hardware_config(program);
@@ -504,6 +522,8 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
         }
     }
     validate_binary_barriers(program);
+    validate_queue_sync_plan(program);
+    if(program.queue_link_source.required) throw std::invalid_argument("QCTL candidate requires final paging link before loading hardware");
     if (program.common_barrier_protocol) {
         // KV page-out control remains in the saved image and executes later.
         // It must never block the independent page-in transport port.
@@ -516,7 +536,7 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
             return;
         }
     }
-    if (program.common_barrier_protocol && !program.weight_page_uses.empty()
+    if ((program.common_barrier_protocol || program.queue_control_protocol) && !program.weight_page_uses.empty()
         && c2c_system_ == nullptr)
         throw std::invalid_argument("common-barrier paging requires the real C2C transport runtime");
     configure_common_transport(program);
@@ -554,7 +574,13 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
     execution_generation_ = nextGeneration.fetch_add(1);
     if (execution_generation_ == 0)
         throw std::overflow_error("execution generation exhausted");
+    queue_control_protocol_ = program.queue_control_protocol;
+    queue_progress_.clear();
+    if(queue_control_protocol_)
+        for(const auto& queue:program.queues) queue_progress_.push_back({queue.kind,queue.index});
     common_barrier_protocol_ = program.common_barrier_protocol;
+    transport_overlap_protocol_ = program.transport_overlap_protocol;
+    system_.icu().set_transport_overlap_enabled(transport_overlap_protocol_);
     if (common_barrier_protocol_) {
         std::vector<IcuCommonBarrierEntry> entries;
         std::vector<IcuCommonEventBinding> events;
@@ -565,7 +591,24 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
         system_.icu().configure_common_barriers(
             execution_generation_, std::move(entries), std::move(events));
     }
+    if(queue_control_protocol_) {
+        std::vector<IcuCommonEventBinding> events;
+        for(const auto& event:program.queue_sync_plan.events)
+            if(event.source==QueueEventSource::PageCommit) events.push_back({event.event_id,event.page_use_indices});
+        system_.icu().configure_queue_completion_events(execution_generation_,events);
+    }
     load_transport_queue_programs_into_icu(program.transport_queues, system_.icu());
+    for (const auto& page : common_transports_) {
+        for (const auto& [queue, pc] : page.mem_descriptors)
+            system_.icu().configure_mem_transport_owner(queue, pc, execution_generation_, page.launch_event,
+                std::ranges::any_of(program.transport_queues,[&](const auto& q){return q.index==queue;}));
+        for (const auto& [queue, count] : page.mem_commit_targets) {
+            const auto h = static_cast<Hemisphere>(queue / InstructionControlUnit::kMemQueuesPerHemisphere);
+            const auto local = queue % InstructionControlUnit::kMemQueuesPerHemisphere;
+            system_.mem_array(h).configure_transport_commit(execution_generation_, page.launch_event,
+                local / hw::kMemBanksPerSlice, local % hw::kMemBanksPerSlice, count);
+        }
+    }
     initialize_vxm_luts(system_);
     for (std::size_t group = 0; group < 16; ++group)
         system_.configure_vxm_input_group_source(group,
@@ -574,7 +617,7 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
         system_.configure_vxm_output_block_destination(block,
             block < 4 ? Hemisphere::West : Hemisphere::East);
     instruction_prefill_cycles_ = timed ? 0 : load_queue_programs_into_icu(initialQueues, system_.icu(),
-        program.hardware.mxms_per_hemisphere);
+        program.hardware.mxms_per_hemisphere, &program);
     if (!timed && c2c_system_ != nullptr) {
         constexpr auto kInstructionImageBase =
             std::uint64_t {0x1'0000'0000};
@@ -601,7 +644,7 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
     bindings_ = program.bindings;
     hardware_ = program.hardware;
     // Common-protocol pages become visible only through actual MEM commits.
-    weight_page_uses_ = common_barrier_protocol_
+    weight_page_uses_ = (common_barrier_protocol_ || program.queue_control_protocol)
         ? std::vector<BinaryWeightPageUse>{} : program.weight_page_uses;
     std::sort(weight_page_uses_.begin(), weight_page_uses_.end(),
         [](const auto& lhs, const auto& rhs) {
@@ -618,6 +661,7 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
     timed_program_load_ = timed;
     uploaded_inputs_.clear();
     system_.icu().set_program_issue_enabled(!timed);
+    paging_overlap_ = {};
     if (execution_trace_enabled_)
         execution_trace_.begin_segment(program,
             execution_trace_cycle_offset_, execution_trace_append_on_load_);
@@ -1888,9 +1932,77 @@ void CModelRuntime::load_file(const std::filesystem::path& path)
     load(read_binary_program(path));
 }
 
+void CModelRuntime::configure_queue_transport(const BinaryProgram& program)
+{
+    for (const auto& event : program.queue_sync_plan.events) {
+        if (event.source!=QueueEventSource::PageCommit) continue;
+        QueueReleaseEpoch epoch{event.event_id};
+        for (const auto& partition:program.queue_sync_plan.partitions)
+            for (const auto& control:partition.entries)
+                if (control.release_group==event.event_id)
+                    epoch.releases.push_back({queue_sync_location(partition.kind,partition.index,program.hardware.mxms_per_hemisphere),
+                        control.phase_offset,control.activation_producer});
+        std::ranges::stable_sort(epoch.releases,{},&QueueRelease::phase_offset);
+        queue_releases_.push_back(std::move(epoch));
+    }
+
+    if(queue_releases_.empty()) return; // ordinary Native synchronization has no page commits to link
+    const auto links=validate_common_transport_packet_links(program);
+    std::map<std::uint32_t,std::size_t> owners;
+    for(const auto& event:program.queue_sync_plan.events)
+        for(const auto instance:event.page_use_indices) {
+            const auto launch=program.weight_page_uses.at(instance).transport_launch_event_id;
+            const auto [owner,inserted]=owners.emplace(launch,common_transports_.size());
+            if(inserted) common_transports_.push_back(CommonTransportPage{launch,0});
+            common_transports_[owner->second].instances.push_back(instance);
+        }
+    struct Segment {std::size_t queue,pc,address,count;std::uint32_t launch;bool assigned{false};};
+    std::vector<Segment> segments;
+    for(const auto& [location,launch]:links) {
+        const auto [index,pc]=location;
+        const auto transport=std::ranges::find_if(program.transport_queues,[&](const auto& q){return q.index==index;});
+        const auto native=std::ranges::find_if(program.queues,[&](const auto& q){return q.kind==QueueKind::Mem && q.index==index;});
+        const auto& queue=transport!=program.transport_queues.end() ? *transport:*native;
+        const auto packet=decode_mem_synchronized_icu_packet(queue,pc);
+        const auto& word=packet[1].lanes;
+        const auto bits=((static_cast<isa::EncodedMemInstruction>(word[0])
+            | (static_cast<isa::EncodedMemInstruction>(word[1])<<32))>>2)
+            | (static_cast<isa::EncodedMemInstruction>(word[2])<<62);
+        const auto instruction=isa::decode_mem_instruction(bits);
+        segments.push_back({index,pc,instruction.address,((packet[0].lanes[0]>>2)&0xffffu)+1,launch});
+    }
+    std::unordered_map<std::uint32_t,std::vector<std::uint8_t>> layout_data;
+    for(auto& page:common_transports_) {
+        std::map<std::size_t,std::size_t> commits;
+        for(const auto instance:page.instances) {
+            const auto& use=program.weight_page_uses.at(instance);
+            const auto binding=std::ranges::find_if(program.bindings,[&](const auto& b){return b.access==BindingAccess::Input && b.index==use.binding_index;});
+            if(binding==program.bindings.end()) throw std::invalid_argument("QCTL page has no weight binding");
+            auto [data,inserted]=layout_data.try_emplace(use.binding_index);
+            if(inserted) data->second.resize(static_cast<std::size_t>(binding->byte_size),0);
+            const auto image=pack_weight_binding_page(*binding,use.page_index,data->second,program.hardware);
+            for(const auto& expected:image.segments) {
+                const auto index=InstructionControlUnit::mem_queue(static_cast<Hemisphere>(expected.hemisphere),expected.slice,use.bank);
+                auto segment=std::ranges::find_if(segments,[&](const auto& s){return !s.assigned
+                    && s.launch==page.launch_event && s.queue==index && s.address==expected.base_row && s.count==expected.vector_count;});
+                if(segment==segments.end()) throw std::invalid_argument("QCTL page is not backed by its actual SRAM commit packet");
+                segment->assigned=true;
+                commits[index]+=segment->count;
+                page.mem_descriptors.emplace_back(index,segment->pc);
+            }
+        }
+        if(commits.empty()) throw std::invalid_argument("QCTL completion instance has no SRAM writes");
+        page.mem_commit_targets.assign(commits.begin(),commits.end());
+    }
+    if(std::ranges::any_of(segments,[](const auto& s){return !s.assigned;}))
+        throw std::invalid_argument("QCTL SRAM write packet has no completion instance");
+}
+
 void CModelRuntime::configure_common_transport(const BinaryProgram& program)
 {
     common_transports_.clear();
+    queue_releases_.clear();
+    if(program.queue_control_protocol) { configure_queue_transport(program);return; }
     if (!program.common_barrier_protocol) return;
     std::map<std::uint32_t, std::size_t> owners;
     for (const auto& barrier : program.barriers) {
@@ -1902,6 +2014,11 @@ void CModelRuntime::configure_common_transport(const BinaryProgram& program)
             auto [it, inserted] = owners.emplace(launch, common_transports_.size());
             if (inserted) common_transports_.push_back(CommonTransportPage{launch, barrier.stop_cycle});
             auto& page = common_transports_[it->second];
+            const auto launchCycle = program.transport_overlap_protocol
+                ? program.weight_page_uses.at(instance).transport_launch_cycle : barrier.stop_cycle;
+            if (inserted) page.launch_cycle = launchCycle;
+            else if (page.launch_cycle != launchCycle)
+                throw std::invalid_argument("inconsistent common transport launch cycle");
             if (page.stop_cycle != barrier.stop_cycle)
                 throw std::invalid_argument("one common transport launch belongs to different barriers");
             page.instances.push_back(instance);
@@ -1924,14 +2041,15 @@ void CModelRuntime::configure_common_transport(const BinaryProgram& program)
                     common_transports_[owners.at(launch)].instances.end(), instance)
                     == common_transports_[owners.at(launch)].instances.end())
                 throw std::invalid_argument("common paging control table is not fully linked before launch");
-            if (common_transports_[owners.at(launch)].stop_cycle < reuseCycle)
+            if (common_transports_[owners.at(launch)].launch_cycle < reuseCycle)
                 throw std::invalid_argument("common page load precedes physical SRAM reuse or the preceding page's release");
         }
     }
     const auto packetLaunches = validate_common_transport_packet_links(program);
     const auto pageLoads = build_common_page_load_ranges(program);
     struct Segment {
-        std::size_t queue, address, count, target;
+        std::size_t queue, address, count, target, pc;
+        std::uint16_t stream;
         std::uint32_t launch;
         bool assigned{false};
     };
@@ -1951,14 +2069,18 @@ void CModelRuntime::configure_common_transport(const BinaryProgram& program)
                 throw std::invalid_argument("common page-in contains a non-write transport packet");
             const auto count = ((header[0] >> 2) & 0xffffU) + 1;
             target += count;
-            segments.push_back({queue.index, instruction.address, count, target,
+            segments.push_back({queue.index, instruction.address, count, target, pc, static_cast<std::uint16_t>(instruction.stream),
                 packetLaunches.at({queue.index, pc})});
             pc += InstructionControlUnit::MemIcu::synchronized_packet_word_count;
         }
     }
+    std::optional<CommonOverlapCalendar> calendar;
+    if (program.transport_overlap_protocol) calendar.emplace(program);
     std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> layoutData;
     for (auto& page : common_transports_) {
-        std::map<std::size_t, std::size_t> targets;
+        std::map<std::size_t, std::size_t> targets, commits;
+        std::vector<std::size_t> leaseQueues;
+        std::vector<std::uint16_t> leaseStreams;
         for (const auto instance : page.instances) {
             const auto& use = program.weight_page_uses.at(instance);
             const auto binding = std::find_if(program.bindings.begin(), program.bindings.end(),
@@ -1972,7 +2094,7 @@ void CModelRuntime::configure_common_transport(const BinaryProgram& program)
                 const auto queue = InstructionControlUnit::mem_queue(
                     static_cast<Hemisphere>(expected.hemisphere), expected.slice, use.bank);
                 const std::array<std::uint32_t, 1> ownerBinding {use.binding_index};
-                validate_common_page_storage(program, page.stop_cycle, queue,
+                validate_common_page_storage(program, page.launch_cycle, queue,
                     expected.base_row, expected.vector_count, ownerBinding, use.release_cycle, pageLoads);
                 auto found = std::find_if(segments.begin(), segments.end(), [&](const auto& actual) {
                     return !actual.assigned && actual.launch == page.launch_event
@@ -1981,12 +2103,20 @@ void CModelRuntime::configure_common_transport(const BinaryProgram& program)
                 if (found == segments.end())
                     throw std::invalid_argument("common page dependency has no matching physical MEM commit packet");
                 found->assigned = true;
+                leaseQueues.push_back(queue);
+                leaseStreams.push_back(StreamId::from_packed(found->stream).index());
                 targets[queue] = std::max(targets[queue], found->target);
+                commits[queue] += found->count;
+                page.mem_descriptors.emplace_back(queue, found->pc);
                 page.hemisphere_mask |= static_cast<std::uint16_t>(1U << expected.hemisphere);
             }
         }
         if (targets.empty()) throw std::invalid_argument("common transport page has no SRAM writes");
+        std::ranges::sort(leaseStreams);
+        leaseStreams.erase(std::ranges::unique(leaseStreams).begin(),leaseStreams.end());
+        if (calendar) calendar->validate(page.launch_cycle, page.stop_cycle, leaseQueues, leaseStreams);
         page.mem_issue_targets.assign(targets.begin(), targets.end());
+        page.mem_commit_targets.assign(commits.begin(), commits.end());
     }
     if (std::any_of(segments.begin(), segments.end(), [](const auto& s) { return !s.assigned; }))
         throw std::invalid_argument("common page-in MEM packet has no linked completion instance");
@@ -2061,13 +2191,77 @@ bool CModelRuntime::common_transport_committed(std::uint32_t launch) const
     return page != common_transports_.end() && page->committed;
 }
 
+void CModelRuntime::sample_queue_progress()
+{
+    for(auto& progress:queue_progress_) {
+        if(progress.done) continue;
+        const auto sample=[&](const auto& queue) {
+            progress.local_cycle=queue.raw_macro_mode();
+            progress.queue_cycle=queue.cycle();
+            progress.physical_cycles=physical_cycles_+1;
+            progress.issued=queue.issued_count();
+            progress.done=queue.done();
+            const auto action=queue.last_trace().action;
+            progress.wait_cycles+=action==IcuQueueAction::EventWait || action==IcuQueueAction::SyncWait;
+        };
+        const bool mxm=progress.kind==QueueKind::MxmLoad || progress.kind==QueueKind::MxmCompute
+            || progress.kind==QueueKind::MxmDequant;
+        const auto i=mxm ? (progress.index/loaded_mxms_per_hemisphere_)*hw::kMxmsPerHemisphere
+            + progress.index%loaded_mxms_per_hemisphere_ : progress.index;
+        auto& icu=system_.icu();
+        switch(progress.kind) {
+        case QueueKind::Mem: sample(icu.mem_iq(i));break;
+        case QueueKind::MxmLoad: sample(icu.mxm_load_iq(i));break;
+        case QueueKind::MxmCompute: sample(icu.mxm_compute_iq(i));break;
+        case QueueKind::MxmDequant: sample(icu.mxm_dequant_iq(i));break;
+        case QueueKind::Vxm: sample(icu.vxm_iq(i));break;
+        case QueueKind::SxmTranspose: sample(icu.sxm_transpose_iq(static_cast<Hemisphere>(i)));break;
+        case QueueKind::SxmPermute: sample(icu.sxm_permute_iq(static_cast<Hemisphere>(i)));break;
+        case QueueKind::C2cDma: sample(icu.c2c_dma_iq(static_cast<Hemisphere>(i)));break;
+        case QueueKind::C2cTx: sample(icu.c2c_tx_iq(static_cast<Hemisphere>(i)));break;
+        case QueueKind::C2cRx: sample(icu.c2c_rx_iq(static_cast<Hemisphere>(i)));break;
+        }
+    }
+}
+
+bool CModelRuntime::queue_release_complete(std::uint32_t event) const
+{
+    const auto epoch=std::ranges::find_if(queue_releases_,[&](const auto& e){return e.event_tag==event;});
+    return epoch!=queue_releases_.end() && epoch->released;
+}
+
+void CModelRuntime::advance_queue_releases()
+{
+    for (auto& epoch:queue_releases_) {
+        if (!system_.icu().queue_completion_ready(epoch.event_tag)) continue;
+        if (!epoch.actual_ready_cycle) epoch.actual_ready_cycle=static_cast<std::int64_t>(physical_cycles_);
+        release_queue_phase(epoch,system_.icu(),static_cast<std::int64_t>(physical_cycles_));
+    }
+}
+
 void CModelRuntime::advance_common_transport()
 {
+    if(queue_control_protocol_) {
+        for(auto& page:common_transports_) {
+            if(page.committed) continue;
+            bool complete=true;
+            for(const auto& [queue,vectors]:page.mem_commit_targets) {
+                const auto h=static_cast<Hemisphere>(queue/InstructionControlUnit::kMemQueuesPerHemisphere);
+                const auto local=queue%InstructionControlUnit::kMemQueuesPerHemisphere;
+                complete &= system_.mem_array(h).transport_committed_segments(execution_generation_,page.launch_event,
+                    local/hw::kMemBanksPerSlice,local%hw::kMemBanksPerSlice)==static_cast<std::uint64_t>(vectors)*hw::kTileRows;
+            }
+            if(!complete) continue;
+            for(const auto instance:page.instances) system_.icu().notify_queue_mem_commit(execution_generation_,instance);
+            page.committed=true;
+        }
+        return;
+    }
     if (!common_barrier_protocol_) return;
     for (auto& page : common_transports_) {
         if (page.committed) continue;
         if (!page.launched) {
-            if (executed_cycles_ < page.stop_cycle) return;
+            if (executed_cycles_ < page.launch_cycle) return;
             for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
                 if (!(page.hemisphere_mask & (1U << side))) continue;
                 const auto hemisphere = static_cast<Hemisphere>(side);
@@ -2077,11 +2271,15 @@ void CModelRuntime::advance_common_transport()
             page.launched = true;
             return;
         }
-        for (const auto& [queue, target] : page.mem_issue_targets)
-            if (system_.icu().mem_transport_iq(queue).synchronized_issued_count() < target) return;
-        if (!page.writes_issued_cycle) page.writes_issued_cycle = physical_cycles_;
-        if (physical_cycles_ - *page.writes_issued_cycle + 1 < hw::kTileRows
-            || !system_.common_barrier_resources_drained()) return;
+        for (const auto& [queue, vectors] : page.mem_commit_targets) {
+            const auto h = static_cast<Hemisphere>(queue / InstructionControlUnit::kMemQueuesPerHemisphere);
+            const auto local = queue % InstructionControlUnit::kMemQueuesPerHemisphere;
+            if (system_.mem_array(h).transport_committed_segments(execution_generation_, page.launch_event,
+                local / hw::kMemBanksPerSlice, local % hw::kMemBanksPerSlice)
+                < static_cast<std::uint64_t>(vectors) * hw::kTileRows) return;
+        }
+        if (transport_overlap_protocol_ ? !system_.common_transport_resources_drained()
+            : !system_.common_barrier_resources_drained()) return;
         // All requested vectors have reached the final tile and transient
         // transport data has drained before the next compute-enabled edge.
         for (const auto instance : page.instances)
@@ -2092,14 +2290,15 @@ void CModelRuntime::advance_common_transport()
 
 void CModelRuntime::notify_common_page_commit(std::uint32_t instance)
 {
-    if (!common_barrier_protocol_)
-        throw std::logic_error("common commit notification without a common-barrier task");
+    if (!common_barrier_protocol_ && !queue_control_protocol_)
+        throw std::logic_error("page commit notification without an event-enabled task");
     notify_common_page_commit(execution_generation_, instance);
 }
 
 void CModelRuntime::notify_common_page_commit(std::uint64_t generation, std::uint32_t instance)
 {
-    system_.icu().notify_common_mem_commit(generation, instance);
+    if(queue_control_protocol_) system_.icu().notify_queue_mem_commit(generation,instance);
+    else system_.icu().notify_common_mem_commit(generation, instance);
 }
 
 void CModelRuntime::reload_drained_compute_imem()
@@ -2161,6 +2360,28 @@ void CModelRuntime::run_logical_cycles(
         }
         const bool enabled = timed_program_load_ || common_barrier_protocol_
             ? system_.icu().compute_enabled() : true;
+        if(queue_control_protocol_) sample_queue_progress();
+        if (common_barrier_protocol_ || queue_control_protocol_) {
+            const bool compute = !system_.common_compute_resources_drained();
+            bool dma = false, rx = false;
+            std::size_t commits = 0;
+            for (std::size_t h=0;h<hw::kHemispheres;++h) {
+                const auto side=static_cast<Hemisphere>(h);
+                commits += system_.mem_array(side).last_transport_commit_segments();
+                rx |= system_.stream_fabric(side).last_cycle_activity().c2c_staged_writes != 0;
+                if (c2c_system_) dma |= c2c_system_->dma(side).last_beat().has_value();
+            }
+            paging_overlap_.compute_active += compute;
+            paging_overlap_.compute_dma += compute && dma;
+            paging_overlap_.compute_rx += compute && rx;
+            paging_overlap_.compute_commit += compute && commits != 0;
+            paging_overlap_.commit_segments += commits;
+            if (execution_trace_enabled_ && (dma || rx || commits))
+                execution_trace_.record_interval(physical_cycles_,physical_cycles_+1,
+                    "Paging.Activity", "compute="+std::to_string(compute)
+                        +" dma="+std::to_string(dma)+" rx="+std::to_string(rx)
+                        +" mem_commit="+std::to_string(commits));
+        }
         if (execution_trace_enabled_)
             execution_trace_.sample(
                 system_, physical_cycles_, enabled, nullptr);
@@ -2170,6 +2391,7 @@ void CModelRuntime::run_logical_cycles(
             system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
         ++physical_cycles_;
         advance_common_transport();
+        if(queue_control_protocol_) advance_queue_releases();
         if (enabled) {
             ++executed_cycles_;
             ++advanced;

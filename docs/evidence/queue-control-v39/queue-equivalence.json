@@ -1,0 +1,50 @@
+[
+  {
+    "seq": 32,
+    "case": "25600",
+    "queues": 154,
+    "fields": [
+      "wait_cycles",
+      "issued",
+      "physical_cycles",
+      "done"
+    ],
+    "differences": 0
+  },
+  {
+    "seq": 32,
+    "case": "51200-jitter",
+    "queues": 154,
+    "fields": [
+      "wait_cycles",
+      "issued",
+      "physical_cycles",
+      "done"
+    ],
+    "differences": 0
+  },
+  {
+    "seq": 128,
+    "case": "25600",
+    "queues": 154,
+    "fields": [
+      "wait_cycles",
+      "issued",
+      "physical_cycles",
+      "done"
+    ],
+    "differences": 0
+  },
+  {
+    "seq": 128,
+    "case": "51200-jitter",
+    "queues": 154,
+    "fields": [
+      "wait_cycles",
+      "issued",
+      "physical_cycles",
+      "done"
+    ],
+    "differences": 0
+  }
+]

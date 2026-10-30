@@ -694,6 +694,7 @@ BinaryProgram without_compiled_mem_sync(
         if (queue.kind != QueueKind::Mem) continue;
         const auto original = queue.commands;
         std::vector<QueueCommand> unlinked;
+        std::vector<bool> removed(original.size(),false);
         std::vector<std::size_t> oldToNew(original.size(),
             std::numeric_limits<std::size_t>::max());
         for (std::size_t index = 0; index < original.size();) {
@@ -704,6 +705,7 @@ BinaryProgram without_compiled_mem_sync(
                 constexpr auto words = InstructionControlUnit::MemIcu::
                     synchronized_packet_word_count;
                 if (synchronized_mem_opcode(packet) == removedOpcode) {
+                    for (std::size_t word=0;word<words;++word) removed[index+word]=true;
                     const auto reservation =
                         (original[index].words[2] & 0x00ffffffU) + 1;
                     oldToNew[index] = unlinked.size();
@@ -723,6 +725,12 @@ BinaryProgram without_compiled_mem_sync(
             }
         }
         const auto relocate = [&](auto& relocations) {
+            // A reservation NOP has no address operand. Keep relocation only
+            // for the functional instructions that survive this projection.
+            std::erase_if(relocations,[&](const auto& relocation) {
+                return relocation.queue_kind==QueueKind::Mem && relocation.queue_index==queue.index
+                    && relocation.command_index<removed.size() && removed[relocation.command_index];
+            });
             for (auto& relocation : relocations) {
                 if (relocation.queue_kind != QueueKind::Mem
                     || relocation.queue_index != queue.index)
@@ -1551,7 +1559,7 @@ std::vector<ProgramQueueImage> prepare_program_images(
 std::size_t load_queue_programs_into_icu(
     const std::vector<QueueProgram>& queues,
     InstructionControlUnit& icu,
-    std::size_t logical_mxms_per_hemisphere)
+    std::size_t logical_mxms_per_hemisphere, const BinaryProgram* control_program)
 {
     validate_fu_3d_context_capacity(queues);
     for (const auto& source_queue : queues) {
@@ -2100,6 +2108,52 @@ std::size_t load_queue_programs_into_icu(
                     "C2C functional commands must use fixed raw packets");
             }
         }
+    }
+    if (control_program && control_program->queue_control_protocol) {
+        validate_queue_sync_plan(*control_program);
+        const auto& hardware=control_program->hardware;
+        for (const auto& partition:control_program->queue_sync_plan.partitions) {
+            if (!partition.entries.empty() && partition.entries.front().native_binding) continue;
+            std::vector<ftlpu::IcuQueueControl> controls;
+            for (const auto& c:partition.entries) controls.push_back({c.local_cycle,c.opcode,c.operand});
+            const auto index=physical_queue_index(partition.kind,partition.index,logical_mxms_per_hemisphere);
+            const auto configure=[&](auto& queue) {
+                queue.configure_queue_controls(std::move(controls),hardware.queue_control_capacity,
+                    hardware.queue_control_cache_depth,hardware.queue_control_read_latency,partition.end_cycle);
+            };
+            switch(partition.kind) {
+            case QueueKind::Mem:
+                configure(icu.mem_iq(index));
+                if (std::ranges::any_of(partition.entries,[](const auto& c) {return c.opcode==kQueueControlMemPacket;}))
+                    icu.enable_queue_control_transport(index);
+                break;
+            case QueueKind::MxmLoad: configure(icu.mxm_load_iq(index)); break;
+            case QueueKind::MxmCompute: configure(icu.mxm_compute_iq(index)); break;
+            case QueueKind::MxmDequant: configure(icu.mxm_dequant_iq(index)); break;
+            default: throw std::logic_error("pseudo controls require a Raw Macro queue");
+            }
+        }
+    }
+    if(control_program && control_program->queue_control_protocol) {
+        // Finish lazy Native configuration before the host can deliver a
+        // cycle-zero token. launch() consumes no physical issue cycle.
+        for(const auto& q:queues) {
+            const auto i=physical_queue_index(q.kind,q.index,logical_mxms_per_hemisphere);
+            const auto side=static_cast<Hemisphere>(i);
+            switch(q.kind) {
+            case QueueKind::Mem: icu.mem_iq(i).launch();break;
+            case QueueKind::MxmLoad: icu.mxm_load_iq(i).launch();break;
+            case QueueKind::MxmCompute: icu.mxm_compute_iq(i).launch();break;
+            case QueueKind::MxmDequant: icu.mxm_dequant_iq(i).launch();break;
+            case QueueKind::Vxm: icu.vxm_iq(i).launch();break;
+            case QueueKind::SxmTranspose: icu.sxm_transpose_iq(side).launch();break;
+            case QueueKind::SxmPermute: icu.sxm_permute_iq(side).launch();break;
+            case QueueKind::C2cDma: icu.c2c_dma_iq(side).launch();break;
+            case QueueKind::C2cTx: icu.c2c_tx_iq(side).launch();break;
+            case QueueKind::C2cRx: icu.c2c_rx_iq(side).launch();break;
+            }
+        }
+        for(const auto& q:control_program->transport_queues)icu.mem_transport_iq(q.index).launch();
     }
     return icu.prime_raw_macro_frontends();
 }

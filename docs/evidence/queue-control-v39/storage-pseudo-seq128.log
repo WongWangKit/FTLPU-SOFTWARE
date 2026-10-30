@@ -1,0 +1,1 @@
+storage file_bytes=1987881 main_imem_bytes=257264 transport_imem_bytes=2496 qctl_bytes=14252 qctl_records=512 pseudo_records=354 peak_records_per_queue=63 qctl_capacity=256 qctl_cache=8 qctl_latency=2 qctl_ports=1 qlnk_bytes=1621786 final_link_required=0

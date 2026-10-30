@@ -3421,6 +3421,12 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     COPY_ICU_MEMORY(mxm_macro_context_bits);
     hardware.common_barrier_encoding_version = static_cast<std::uint32_t>(icuMemory.common_barrier_encoding_version);
     hardware.common_barrier_capacity = static_cast<std::uint32_t>(icuMemory.common_barrier_capacity);
+    hardware.common_transport_overlap_version = static_cast<std::uint32_t>(icuMemory.common_transport_overlap_version);
+    hardware.queue_control_version = static_cast<std::uint32_t>(icuMemory.queue_control_version);
+    hardware.queue_control_capacity = static_cast<std::uint32_t>(icuMemory.queue_control_capacity);
+    hardware.queue_control_cache_depth = static_cast<std::uint32_t>(icuMemory.queue_control_cache_depth);
+    hardware.queue_control_read_latency = static_cast<std::uint32_t>(icuMemory.queue_control_read_latency);
+    hardware.queue_control_read_ports = static_cast<std::uint32_t>(icuMemory.queue_control_read_ports);
 #undef COPY_ICU_MEMORY
     if (compressionMode == IcuCompressionMode::RawMacro
         && (hardware.icu_mem_instruction_bits != 96 || hardware.icu_mxm_instruction_bits != 128
@@ -3573,7 +3579,28 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
         });
     const auto commonBarrierAttr = module->getAttrOfType<mlir::BoolAttr>(
         "ftlpu.common_barrier_protocol");
-    if (compressionMode == IcuCompressionMode::RawMacro
+    if (compressionMode == IcuCompressionMode::RawMacro && requiresDirectLowering
+        && program.hardware.queue_control_version == 1
+        && !(commonBarrierAttr && commonBarrierAttr.getValue())) {
+        // The same compact Native plan supplies both encodings. Keep its
+        // coarse domains for a checked final paging link after relocation.
+        emit_compiled_mem_write_sync(program);
+        emit_compiled_mem_read_sync(program);
+        software::runtime::BinaryQueueLinkSource source;
+        source.required = !program.weight_page_uses.empty()
+            || std::ranges::any_of(program.queues, [](const auto& queue) {
+                return queue.kind == software::runtime::QueueKind::Mem
+                    && std::ranges::any_of(queue.commands, [](const auto& command) {
+                        return software::runtime::is_mem_synchronized_raw_packet_header(command);
+                    });
+            });
+        source.queues = program.queues;
+        source.address_relocations = program.address_relocations;
+        source.scale_relocations = program.scale_relocations;
+        program.queue_link_source = std::move(source);
+        software::runtime::externalize_native_queue_controls(program);
+        software::runtime::validate_queue_sync_plan(program);
+    } else if (compressionMode == IcuCompressionMode::RawMacro
         || (commonBarrierAttr && commonBarrierAttr.getValue())) {
         // Runtime paging owns concrete transport instances and final common
         // logical stops. Keep the computation image free of queue-local
@@ -3584,6 +3611,8 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
                 || program.hardware.common_barrier_capacity == 0))
             throw std::runtime_error("Raw Macro paging requires the common barrier target capability");
         program.common_barrier_protocol = program.hardware.common_barrier_encoding_version == 1;
+        program.transport_overlap_protocol = program.common_barrier_protocol
+            && !program.weight_page_uses.empty() && program.hardware.common_transport_overlap_version == 1;
         if (compressionMode == IcuCompressionMode::RawMacro)
             lower_direct_raw_macro(program);
         if (requiresDirectLowering) {

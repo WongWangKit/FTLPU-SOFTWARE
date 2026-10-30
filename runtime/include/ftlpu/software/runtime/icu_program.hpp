@@ -940,6 +940,7 @@ std::vector<ProgramQueueImage> prepare_program_images(
     std::size_t logical_mxms_per_hemisphere = hw::kMxmsPerHemisphere);
 std::size_t load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
     InstructionControlUnit& icu,
-    std::size_t logical_mxms_per_hemisphere = hw::kMxmsPerHemisphere);
+    std::size_t logical_mxms_per_hemisphere = hw::kMxmsPerHemisphere,
+    const BinaryProgram* control_program = nullptr);
 
 } // namespace ftlpu::software::runtime

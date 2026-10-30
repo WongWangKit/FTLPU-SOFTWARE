@@ -1,0 +1,19 @@
+{
+  "left": {
+    "file": "out/main-common-barrier-e2e/overlap-seq32-51200.csv",
+    "P": 97990,
+    "HOLD": 17646,
+    "L": 80344,
+    "actual_compute_trace_cycles": 663525,
+    "logical_trace_sha256": "7aff733df47a6bf2684d35eb5cecccc05b88f51b3e56c5da9b933851121baed4"
+  },
+  "right": {
+    "file": "out/main-common-barrier-e2e/overlap-seq32-25600.csv",
+    "P": 122016,
+    "HOLD": 41672,
+    "L": 80344,
+    "actual_compute_trace_cycles": 663525,
+    "logical_trace_sha256": "7aff733df47a6bf2684d35eb5cecccc05b88f51b3e56c5da9b933851121baed4"
+  },
+  "actual_logical_trace_equal": true
+}

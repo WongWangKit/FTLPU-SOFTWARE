@@ -55,6 +55,10 @@ struct ModelSessionStats {
     // Actual FU writes issued by executable MEM_WRITE_SYNC packets. The
     // value is captured before output/state C2C transfers reset ICU state.
     std::size_t weight_page_synchronized_writes{0};
+    std::size_t main_logical_cycles{0}, main_physical_cycles{0}, instruction_prime_cycles{0};
+    std::size_t compute_dma_overlap_cycles{0}, compute_rx_overlap_cycles{0}, compute_commit_overlap_cycles{0};
+    std::size_t transport_commit_segments{0};
+    std::vector<QueueExecutionProgress> queue_progress{};
 };
 
 class ModelSession {
@@ -76,6 +80,8 @@ public:
     void set_ddr_peak_bandwidth_mbytes_per_second(
         std::uint32_t bandwidth);
 
+    // Changes only the external DDR response timing, before load().
+    void set_ddr_latency_perturbation(std::uint32_t extra_read_cycles, std::uint32_t seed);
     const ModelPackage& package() const;
     const std::vector<std::uint8_t>& value(const std::string& name) const;
     void set_state(std::string name, std::span<const std::uint8_t> data);
@@ -186,6 +192,7 @@ private:
     SessionMemoryPlan memory_plan_{};
     ModelSessionStats stats_{};
     ModelSessionStats load_stats_{};
+    std::optional<std::pair<std::uint32_t,std::uint32_t>> ddr_latency_perturbation_{};
     std::optional<BinaryProgram> last_linked_program_{};
     std::vector<BinaryProgram> pre_execution_icu_programs_{};
     bool loaded_{false};

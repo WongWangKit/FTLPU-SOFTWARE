@@ -165,6 +165,9 @@ add_executable(runtime_common_barrier_test tests/runtime/runtime_common_barrier_
 target_link_libraries(runtime_common_barrier_test PRIVATE ftlpu_software)
 add_test(NAME runtime_common_barrier_test COMMAND $<TARGET_FILE:runtime_common_barrier_test>)
 
+add_executable(common_overlap_link_test tests/runtime/common_overlap_link_test.cpp)
+target_link_libraries(common_overlap_link_test PRIVATE ftlpu_software)
+
 add_executable(binary_barrier_test tests/runtime/binary_barrier_test.cpp)
 target_link_libraries(binary_barrier_test PRIVATE ftlpu_software)
 add_test(NAME binary_barrier_test COMMAND $<TARGET_FILE:binary_barrier_test>)
@@ -522,6 +525,12 @@ target_compile_definitions(compiled_smollm2_common_barrier_decoder_test PRIVATE
     FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES=1)
 target_link_libraries(compiled_smollm2_common_barrier_decoder_test PRIVATE ftlpu_software)
 
+add_executable(compiled_smollm2_common_barrier_seq128_decoder_test
+    tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
+target_compile_definitions(compiled_smollm2_common_barrier_seq128_decoder_test PRIVATE
+    FTLPU_TEST_SEQUENCE_LENGTH=128 FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES=1)
+target_link_libraries(compiled_smollm2_common_barrier_seq128_decoder_test PRIVATE ftlpu_software)
+
 add_executable(compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test
     tests/runtime/compiled_smollm2_decoder_layer_runtime_test.cpp)
 target_compile_definitions(
@@ -603,3 +612,7 @@ target_link_libraries(compiled_batch_file_runner PRIVATE ftlpu_software)
 add_executable(compiled_program_link_check tests/runtime/compiled_stage_file_runner.cpp)
 target_link_libraries(compiled_program_link_check PRIVATE ftlpu_software)
 target_compile_definitions(compiled_program_link_check PRIVATE FTLPU_FILE_RUNNER_LINK_CHECK=1)
+
+add_executable(binary_queue_control_test tests/runtime/binary_queue_control_test.cpp)
+target_link_libraries(binary_queue_control_test PRIVATE ftlpu_software)
+add_test(NAME binary_queue_control_test COMMAND $<TARGET_FILE:binary_queue_control_test>)

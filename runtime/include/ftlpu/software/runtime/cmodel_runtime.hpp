@@ -23,6 +23,12 @@ class C2cDmaSystem;
 
 namespace ftlpu::software::runtime {
 
+struct QueueExecutionProgress {
+    QueueKind kind{};
+    std::size_t index{}, invocation_index{}, queue_cycle{}, physical_cycles{}, wait_cycles{}, issued{};
+    bool local_cycle{false}, done{false};
+};
+
 class CModelRuntime {
 public:
     explicit CModelRuntime(TspSliceSystem& system);
@@ -80,7 +86,15 @@ public:
     void notify_common_page_commit(std::uint64_t generation, std::uint32_t instance);
     bool common_transport_launched(std::uint32_t launch_event) const;
     bool common_transport_committed(std::uint32_t launch_event) const;
+    const std::vector<QueueExecutionProgress>& queue_execution_progress() const noexcept { return queue_progress_; }
+    bool queue_release_complete(std::uint32_t event) const;
+    bool queue_control_protocol() const noexcept { return queue_control_protocol_; }
+    bool queue_completion_ready(std::uint32_t event) const { return system_.icu().queue_completion_ready(event); }
     bool common_barrier_protocol() const noexcept { return common_barrier_protocol_; }
+    struct PagingOverlapStatistics {
+        std::size_t compute_active{}, compute_dma{}, compute_rx{}, compute_commit{}, commit_segments{};
+    };
+    const PagingOverlapStatistics& paging_overlap_statistics() const noexcept { return paging_overlap_; }
     std::size_t physical_cycles() const noexcept { return physical_cycles_; }
     std::size_t logical_cycles() const noexcept { return executed_cycles_; }
     std::size_t instruction_prefill_cycles() const noexcept
@@ -102,13 +116,32 @@ private:
     const BinaryBinding& find_binding(BindingAccess access, std::size_t index) const;
     void load_ready_weight_pages();
     void configure_common_transport(const BinaryProgram& program);
+    void configure_queue_transport(const BinaryProgram& program);
     void advance_common_transport();
     void reload_drained_compute_imem();
     std::vector<BinaryProgram> compute_imem_segments_{};
     std::vector<std::pair<QueueKind, std::size_t>> compute_imem_queues_{};
     std::size_t compute_imem_segment_{0}, compute_imem_boundary_{0};
+    void advance_queue_releases();
+    void sample_queue_progress();
+    std::vector<QueueExecutionProgress> queue_progress_{};
+    struct QueueRelease {
+        IcuLocation location;
+        std::size_t phase_offset{0};
+        bool activation_producer{false};
+    };
+    struct QueueReleaseEpoch {
+        std::uint32_t event_tag{0};
+        std::vector<QueueRelease> releases{};
+        std::size_t next_release{0};
+        std::optional<std::int64_t> actual_ready_cycle{}, release_origin_cycle{};
+        bool released{false};
+    };
+    std::vector<QueueReleaseEpoch> queue_releases_{};
     struct CommonTransportPage {
         std::uint32_t launch_event{0}, stop_cycle{0};
+        std::uint32_t launch_cycle{0};
+        std::vector<std::pair<std::size_t, std::size_t>> mem_commit_targets{}, mem_descriptors{};
         std::uint16_t hemisphere_mask{0};
         std::vector<std::uint32_t> instances{};
         std::vector<std::pair<std::size_t, std::size_t>> mem_issue_targets{};
@@ -122,7 +155,9 @@ private:
     TspSliceSystem& system_;
     C2cDmaSystem* c2c_system_{nullptr};
     std::uint64_t execution_generation_{0};
+    bool queue_control_protocol_{false};
     bool common_barrier_protocol_{false};
+    bool transport_overlap_protocol_{false};
     std::size_t loaded_max_cycle_{0};
     std::size_t loaded_mxms_per_hemisphere_{hw::kMxmsPerHemisphere};
     std::size_t loaded_vxm_alus_{hw::kVxmAluCount};
@@ -134,6 +169,7 @@ private:
     std::size_t next_weight_page_use_{0};
     std::size_t executed_cycles_{0};
     std::size_t physical_cycles_{0};
+    PagingOverlapStatistics paging_overlap_{};
     std::size_t instruction_prefill_cycles_{0};
     bool timed_program_load_{false};
     std::function<bool()> program_start_dependency_checker_{};

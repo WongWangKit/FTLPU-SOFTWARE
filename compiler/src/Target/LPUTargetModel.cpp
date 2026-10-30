@@ -103,7 +103,7 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     const auto* streams = root->getObject("streams");
     const auto* throughput = root->getObject("throughput");
     const auto* externalMemory = root->getObject("external_memory");
-    const auto* icuMemory = root->getObject("icu_memory");
+    const auto* icuMemory = root->getObject(root->getInteger("schema_version") ? "icu" : "icu_memory");
     LPUTargetModel model;
 
     // Schema v2 is the shared physical-target format consumed by both the
@@ -424,6 +424,18 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_ICU_MEMORY(mxm_macro_context_bits);
     READ_ICU_MEMORY(common_barrier_encoding_version);
     READ_ICU_MEMORY(common_barrier_capacity);
+    model.icu_memory_.common_transport_overlap_version = 0;
+    READ_ICU_MEMORY(common_transport_overlap_version);
+    model.icu_memory_.queue_control_version = 0;
+    READ_ICU_MEMORY(queue_control_version);
+    model.icu_memory_.queue_control_capacity = 0;
+    READ_ICU_MEMORY(queue_control_capacity);
+    model.icu_memory_.queue_control_cache_depth = 0;
+    READ_ICU_MEMORY(queue_control_cache_depth);
+    model.icu_memory_.queue_control_read_latency = 0;
+    READ_ICU_MEMORY(queue_control_read_latency);
+    model.icu_memory_.queue_control_read_ports = 0;
+    READ_ICU_MEMORY(queue_control_read_ports);
 #undef READ_ICU_MEMORY
 
     if (const auto* mxm = root->getObject("mxm")) {
@@ -581,6 +593,18 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_ICU_MEMORY(mxm_macro_context_bits);
     READ_ICU_MEMORY(common_barrier_encoding_version);
     READ_ICU_MEMORY(common_barrier_capacity);
+    model.icu_memory_.common_transport_overlap_version = 0;
+    READ_ICU_MEMORY(common_transport_overlap_version);
+    model.icu_memory_.queue_control_version = 0;
+    READ_ICU_MEMORY(queue_control_version);
+    model.icu_memory_.queue_control_capacity = 0;
+    READ_ICU_MEMORY(queue_control_capacity);
+    model.icu_memory_.queue_control_cache_depth = 0;
+    READ_ICU_MEMORY(queue_control_cache_depth);
+    model.icu_memory_.queue_control_read_latency = 0;
+    READ_ICU_MEMORY(queue_control_read_latency);
+    model.icu_memory_.queue_control_read_ports = 0;
+    READ_ICU_MEMORY(queue_control_read_ports);
 #undef READ_ICU_MEMORY
     std::string error;
     if (mlir::failed(model.validate(&error))) {
@@ -715,6 +739,12 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(icu_memory_, mxm_macro_context_bits),
         I64(icu_memory_, common_barrier_encoding_version),
         I64(icu_memory_, common_barrier_capacity),
+        I64(icu_memory_, common_transport_overlap_version),
+        I64(icu_memory_, queue_control_version),
+        I64(icu_memory_, queue_control_capacity),
+        I64(icu_memory_, queue_control_cache_depth),
+        I64(icu_memory_, queue_control_read_latency),
+        I64(icu_memory_, queue_control_read_ports),
     });
 #undef I64
     return builder.getDictionaryAttr({
@@ -785,6 +815,16 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         || icu_memory_.common_barrier_capacity <= 0
         || icu_memory_.common_barrier_capacity > hw::kCommonBarrierCapacity))
         return fail("common barrier capability must be absent (0/0) or use the supported encoding and finite RAM capacity");
+    if (icu_memory_.common_transport_overlap_version < 0
+        || icu_memory_.common_transport_overlap_version > 1
+        || (icu_memory_.common_transport_overlap_version && noCommonBarrier))
+        return fail("transport overlap capability must be 0/1 and requires common barriers");
+    const auto& control=icu_memory_;
+    if (control.queue_control_version != 0 && (control.queue_control_version != 1
+        || control.queue_control_capacity < 1 || control.queue_control_capacity > hw::kQueueControlCapacity
+        || control.queue_control_cache_depth < 1 || control.queue_control_cache_depth > control.queue_control_capacity
+        || control.queue_control_read_latency < 1 || control.queue_control_read_ports != 1))
+        return fail("queue control requires version 1 and a finite single-port RAM/cache");
     if (throughput_.vxm_alus != 16)
         return fail("chain VXM requires exactly 16 physical ALUs and 8 shared ICU queues");
     if (icu_memory_.mem_instruction_bits % 32 != 0
@@ -977,6 +1017,12 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
 #undef HASH
     hash.add(icu_memory_.common_barrier_encoding_version);
     hash.add(icu_memory_.common_barrier_capacity);
+    hash.add(icu_memory_.common_transport_overlap_version);
+    hash.add(icu_memory_.queue_control_version);
+    hash.add(icu_memory_.queue_control_capacity);
+    hash.add(icu_memory_.queue_control_cache_depth);
+    hash.add(icu_memory_.queue_control_read_latency);
+    hash.add(icu_memory_.queue_control_read_ports);
     return hash.value();
 }
 

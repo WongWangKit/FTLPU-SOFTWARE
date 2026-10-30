@@ -14,6 +14,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -23,10 +24,11 @@ try {
     if (argc < 2)
         throw std::runtime_error(
             "usage: ftlpu_binary_inspect program.ftlpu "
-            "[--all-queues] [--physical-only] [--trace schedule.csv] "
+            "[--all-queues] [--physical-only] [--storage-only] [--trace schedule.csv] "
             "[--compare reference.ftlpu]");
     bool reportAllQueues = false;
     bool physicalOnly = false;
+    bool storageOnly = false;
     std::optional<std::filesystem::path> tracePath;
     std::optional<std::filesystem::path> comparePath;
     for (int index = 2; index < argc; ++index) {
@@ -35,6 +37,7 @@ try {
             physicalOnly = true;
             continue;
         }
+        if (argument == "--storage-only") { storageOnly=true; continue; }
         if (argument == "--all-queues") {
             reportAllQueues = true;
             continue;
@@ -57,6 +60,32 @@ try {
         throw std::runtime_error("--physical-only cannot be combined with logical comparison or trace");
     const auto program = ftlpu::software::runtime::read_binary_program(
         std::filesystem::path(argv[1]));
+    if(storageOnly) {
+        using namespace ftlpu::software::runtime;
+        const auto main=analyze_physical_imem(program);
+        auto transport=program;transport.queues=program.transport_queues;transport.transport_queues.clear();
+        const auto tx=analyze_physical_imem(transport);
+        std::size_t records=0,pseudo=0,peak=0,qctlBytes=16;
+        for(const auto& partition:program.queue_sync_plan.partitions) {
+            records+=partition.entries.size();peak=std::max(peak,partition.entries.size());
+            qctlBytes+=12+24*partition.entries.size();
+            for(const auto& c:partition.entries)pseudo+=!c.native_binding;
+        }
+        for(const auto& e:program.queue_sync_plan.events)qctlBytes+=12+4*e.page_use_indices.size();
+        auto noSource=program;noSource.queue_link_source={};
+        std::ostringstream with(std::ios::binary),without(std::ios::binary);
+        write_binary_program(program,with);write_binary_program(noSource,without);
+        std::cout<<"storage file_bytes="<<std::filesystem::file_size(argv[1])
+            <<" main_imem_bytes="<<(main.used_bits+7)/8<<" transport_imem_bytes="<<(tx.used_bits+7)/8
+            <<" qctl_bytes="<<qctlBytes<<" qctl_records="<<records<<" pseudo_records="<<pseudo
+            <<" peak_records_per_queue="<<peak<<" qctl_capacity="<<program.hardware.queue_control_capacity
+            <<" qctl_cache="<<program.hardware.queue_control_cache_depth
+            <<" qctl_latency="<<program.hardware.queue_control_read_latency
+            <<" qctl_ports="<<program.hardware.queue_control_read_ports
+            <<" qlnk_bytes="<<24+with.str().size()-without.str().size()
+            <<" final_link_required="<<program.queue_link_source.required<<'\n';
+        return 0;
+    }
     std::ifstream binaryVersionStream(argv[1], std::ios::binary);
     binaryVersionStream.seekg(8);
     std::uint32_t binaryVersion = 0;
@@ -531,12 +560,14 @@ try {
         completionInstances += event.page_use_indices.size();
     }
     std::cout << "binary common_barrier_storage protocol=" << program.common_barrier_protocol
+              << " overlap_protocol=" << program.transport_overlap_protocol
+              << " overlap_version=" << program.hardware.common_transport_overlap_version
               << " entries=" << program.barriers.size()
               << " barrier_ram_bytes=" << barrierRamBytes
               << " barrier_block_bytes=" << barrierBlockBytes
               << " event_association_bytes=" << associationBytes
               << " completion_instances=" << completionInstances
-              << " use_launch_metadata_bytes=" << (binaryVersion >= 37 ? program.weight_page_uses.size() * 4 : 0)
+              << " use_launch_metadata_bytes=" << (binaryVersion >= 37 ? program.weight_page_uses.size() * (binaryVersion >= 38 ? 8 : 4) : 0)
               << " compute_imem_bytes=" << computeBytes
               << " transport_native_words=" << transportStorage.used_slots
               << " transport_native_bytes=" << transportBytes
@@ -551,6 +582,11 @@ try {
         for (std::size_t i = 0; i < event->page_use_indices.size(); ++i)
             std::cout << (i ? "," : "") << event->page_use_indices[i];
         std::cout << '\n';
+    }
+    for (std::size_t i=0;i<program.weight_page_uses.size();++i) {
+        const auto& use=program.weight_page_uses[i];
+        std::cout << "binary transport_instance=" << i << " launch_event=" << use.transport_launch_event_id
+                  << " launch_cycle=" << use.transport_launch_cycle << '\n';
     }
     const auto physical =
         ftlpu::software::runtime::analyze_physical_imem(program);

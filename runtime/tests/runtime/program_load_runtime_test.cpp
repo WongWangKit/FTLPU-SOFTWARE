@@ -209,6 +209,9 @@ int main() try
     invalid.queues.push_back({rt::QueueKind::Vxm,0,{rt::QueueCommand{}}});
     const auto before = system->cycle();
     rejects([&] { runtime.load_timed(invalid); });
+    auto queueControlled = program;
+    queueControlled.queue_control_protocol = true;
+    rejects([&] { runtime.load_timed(queueControlled); });
     require(system->cycle() == before && system->program_loader().started(),
         "unsupported queue mutated active program");
     auto shortProgram = program;

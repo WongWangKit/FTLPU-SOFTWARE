@@ -1,5 +1,6 @@
 #include "ftlpu/software/runtime/c2c_weight_pager.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
+#include "ftlpu/software/runtime/common_overlap.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
 #include "ftlpu/icu/fu_3d_codec.hpp"
 
@@ -67,10 +68,11 @@ PackedWeightImage image()
         values[index] = static_cast<std::uint8_t>(index * 13 + 19);
     return pack_weight_binding_page(binding(), 0, values, ExecutableHardwareConfig{});
 }
-BinaryProgram linked_program(C2cDmaSystem& system, const PackedWeightImage& packed)
+BinaryProgram linked_program(C2cDmaSystem& system, const PackedWeightImage& packed, bool overlap = false)
 {
     BinaryProgram program;
     program.common_barrier_protocol = true;
+    program.transport_overlap_protocol = overlap;
     program.max_cycle = kBudget;
     program.bindings = {binding()};
     program.weight_page_uses = {{0, 0, 1, kStop, kBudget, true}};
@@ -119,14 +121,14 @@ BinaryProgram linked_program(C2cDmaSystem& system, const PackedWeightImage& pack
     stream.seekg(0);
     return read_binary_program(stream);
 }
-void initialize_ddr(C2cDmaSystem& system, const PackedWeightImage& packed)
+void initialize_ddr(C2cDmaSystem& system, const PackedWeightImage& packed, std::uint64_t base = kDdrBase)
 {
     for (std::size_t offset = 0; offset < packed.data.size(); offset += hw::kPhysicalVectorBytes) {
         C2cVector vector;
         for (std::size_t tile = 0; tile < hw::kTileRows; ++tile)
             for (std::size_t lane = 0; lane < hw::kLanesPerTile; ++lane)
                 vector.payload[tile][lane] = packed.data[offset + tile * hw::kLanesPerTile + lane];
-        system.ddr4().initialize_vector(kDdrBase + offset, vector);
+        system.ddr4().initialize_vector(base + offset, vector);
     }
 }
 void verify_commit(C2cDmaSystem& system, const PackedWeightImage& packed)
@@ -203,25 +205,50 @@ struct Result {
     std::size_t logical{}, physical{};
     std::vector<std::pair<std::size_t, std::size_t>> issues{}, native_issues{};
 };
-Result run(std::size_t latency, bool cycleZero = false)
+Result run(std::size_t latency, bool cycleZero = false, bool overlap = false, bool backpressure = false)
 {
     Ddr4Config config;
     config.read_latency_cycles = latency;
     config.read_latency_jitter_cycles = 0;
     config.write_latency_jitter_cycles = 0;
-    auto system = std::make_unique<C2cDmaSystem>(config);
+    auto system = std::make_unique<C2cDmaSystem>(config, backpressure ? 2 : 16);
     const auto packed = image();
-    auto program = linked_program(*system, packed);
+    auto program = linked_program(*system, packed, overlap);
+    if (backpressure)
+        for (auto& queue : program.transport_queues)
+            queue.commands.insert(queue.commands.begin(),encode_icu_control_raw_word(IcuControlInstruction::Nop(256)));
     if (cycleZero) program.barriers.front().stop_cycle = 0;
+    if (overlap && latency == 3) {
+        CModelRuntime preflight(*system,[&](auto sinks){system->tick(sinks);});
+        const auto makeRead = [](std::size_t stream) {
+            QueueCommand command;
+            command.command=static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction);
+            command.instruction_kind=InstructionKind::Mem; command.word_count=2;
+            const auto bits=isa::encode_mem_instruction(MemInstruction::Read(600,StreamId::from_packed(stream)));
+            command.words[0]=static_cast<std::uint32_t>(bits);command.words[1]=static_cast<std::uint32_t>(bits>>32);
+            return encode_macro_schedule_command(command,{64,1,1,0,1,1,0,IcuInductionTarget::MemAddress});
+        };
+        auto srConflict=program;
+        srConflict.queues.push_back({QueueKind::Mem,InstructionControlUnit::mem_queue(Hemisphere::East,2,0),{makeRead(StreamId::West(31).packed())}});
+        srConflict.queues.back().requires_raw_macro=true;
+        rejects([&]{preflight.load(srConflict);},"loader accepted an SR propagation lease conflict");
+        auto portConflict=program;
+        portConflict.queues.push_back({QueueKind::Mem,InstructionControlUnit::mem_queue(Hemisphere::East,20,1),{makeRead(StreamId::East(2).packed())}});
+        portConflict.queues.back().requires_raw_macro=true;
+        rejects([&]{preflight.load(portConflict);},"loader accepted a computation/transport MEM port conflict");
+        auto unsafe=program;unsafe.barriers[0].stop_cycle=64;
+        rejects([&]{preflight.load(unsafe);},"loader accepted a non-drained overlap stop");
+    }
     if (latency == 3 && !cycleZero)
         if (const char* output = std::getenv("FTLPU_COMMON_TEST_LINKED_PROGRAM"))
             write_binary_program(program, std::filesystem::path(output));
     Result result;
     CModelRuntime* current = nullptr;
-    bool checked_resumption = false;
+    bool checked_resumption = false, sawFullFifo = false;
     CModelRuntime runtime(*system, [&](TspSliceSystem::LogSinks sinks) {
         system->tick(sinks);
         auto& icu = system->chip().icu();
+        sawFullFifo |= system->dma(Hemisphere::East).receive_queue_size(0) == 2;
         if (icu.compute_enabled() && current->logical_cycles() >= (cycleZero ? 0 : kStop) && !checked_resumption) {
             verify_commit(*system, packed);
             checked_resumption = true;
@@ -247,10 +274,14 @@ Result run(std::size_t latency, bool cycleZero = false)
     runtime.notify_common_page_commit(old_generation, 0);
     initialize_ddr(*system, packed);
     runtime.run_cycles(kBudget);
+    if (backpressure) require(sawFullFifo,"delayed MEM admission never exercised the finite two-vector RX FIFO");
     require(checked_resumption, "test never resumed computation after its common stop");
     require(runtime.logical_cycles() == kBudget, "physical waiting consumed the requested logical budget");
-    require(runtime.physical_cycles() > runtime.logical_cycles(), "stale completion released the new task or real transport never waited");
+    if (!overlap || latency >= 128) require(runtime.physical_cycles() > runtime.logical_cycles(), "stale completion released the new task or real transport never waited");
     require(system->chip().icu().mem_iq(macro_queue()).done(), "Macro context did not finish across the stop");
+    if (overlap && latency == 3 && !backpressure)
+        require(runtime.paging_overlap_statistics().compute_commit > 0,
+            "RUN idle or DDR-only prefetch was counted as complete-path overlap");
     result.logical = runtime.logical_cycles();
     result.physical = runtime.physical_cycles();
     verify_commit(*system, packed);
@@ -261,7 +292,7 @@ Result run(std::size_t latency, bool cycleZero = false)
     auto no_transport = program;
     no_transport.transport_queues.clear();
     rejects([&] { runtime.load(no_transport); }, "loader accepted barrier events without their actual MEM commits");
-    if (latency == 3 && !cycleZero) {
+    if (latency == 3 && !cycleZero && !overlap) {
         reject_corrupt_transport(runtime, program);
         // All transient resources can drain while a stable SRAM operand is
         // still live. A page may not overwrite it merely because C is idle.
@@ -412,9 +443,76 @@ Result run(std::size_t latency, bool cycleZero = false)
     }
     return result;
 }
+
+void repeated_load_and_all_of()
+{
+    Ddr4Config config;config.read_latency_cycles=53;config.read_latency_jitter_cycles=0;
+    auto system=std::make_unique<C2cDmaSystem>(config);
+    const auto first=image();
+    auto program=linked_program(*system,first,true);
+    program.weight_page_uses[0].release_cycle=300;
+    auto secondBinding=binding();secondBinding.index=1;
+    auto thirdBinding=binding();thirdBinding.index=2;thirdBinding.base_row=128;
+    program.bindings.push_back(secondBinding);program.bindings.push_back(thirdBinding);
+    std::vector<std::uint8_t> values(first.data.size(),0x5a),other(first.data.size(),0xa7);
+    const auto second=pack_weight_binding_page(secondBinding,0,values,program.hardware);
+    const auto third=pack_weight_binding_page(thirdBinding,0,other,program.hardware);
+    program.weight_page_uses.push_back({1,0,1,384,kBudget,true});
+    program.weight_page_uses.push_back({2,0,1,384,kBudget,true});
+    program.timelines.push_back({"c2c.window.binding:1.page:0",320,384});
+    program.timelines.push_back({"c2c.window.binding:2.page:0",320,384});
+    C2cWeightPager pager(*system);pager.begin_schedule(program);
+    const auto link=[&](const auto& packed,std::uint64_t base,std::size_t instance,std::size_t stop,std::size_t earliest) {
+        C2cWeightPage page;page.bank=1;
+        for(const auto& s:packed.segments)page.segments.push_back({static_cast<Hemisphere>(s.hemisphere),s.slice,1,s.base_row,0,base+s.byte_offset,s.vector_count});
+        const std::array<std::size_t,1> use{instance};
+        (void)pager.schedule(program,page,earliest,earliest+16,stop,0x10000+instance,
+            instance?0x30001:0x30000,earliest,use);
+    };
+    link(first,kDdrBase,0,kStop,32);
+    link(second,kDdrBase+0x100000,1,384,300);
+    link(third,kDdrBase+0x200000,2,384,300);
+    pager.finalize_schedule(program);
+    require(program.barriers.size()==2 && program.barrier_events[1].page_use_indices.size()==2,
+        "same-C dependencies were not aggregated");
+    CModelRuntime* current=nullptr;bool sawFirst=false,sawSecond=false,duplicated=false;
+    CModelRuntime runtime(*system,[&](auto sinks){
+        system->tick(sinks);
+        if(current->common_transport_committed(0x10001) && !duplicated){
+            current->notify_common_page_commit(current->execution_generation(),1);
+            duplicated=true;
+        }
+        if(system->chip().icu().compute_enabled()){
+            if(current->logical_cycles()>=128 && !sawFirst){verify_commit(*system,first);sawFirst=true;}
+            if(current->logical_cycles()>=384 && !sawSecond){
+                verify_commit(*system,second);verify_commit(*system,third);sawSecond=true;
+            }
+        }
+    });current=&runtime;
+    runtime.load(program);
+    initialize_ddr(*system,first);initialize_ddr(*system,second,kDdrBase+0x100000);
+    initialize_ddr(*system,third,kDdrBase+0x200000);
+    runtime.run_cycles(kBudget);
+    require(sawFirst && sawSecond && duplicated,"repeated page/all-of run did not observe all completions");
+    require(runtime.logical_cycles()==kBudget,"repeated load consumed logical waiting budget");
+}
 }
 int main()
 try {
+    BinaryProgram chainProgram;
+    VxmLaneAluInstruction chain;
+    chain.lhs = VxmLaneOperand::StreamBFloat16();
+    const auto packet = VxmCompactInstructionCodec::encode(0, VxmChainDepth::Eight, chain);
+    chainProgram.queues.push_back({QueueKind::Vxm, 0, {{
+        static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
+        InstructionKind::Vxm, 3, {static_cast<std::uint32_t>(packet.control),
+            static_cast<std::uint32_t>(packet.control >> 32), packet.immediate_bits, 0}}}});
+    rejects([&] { CommonOverlapCalendar calendar(chainProgram); },
+        "legacy overlap proof accepted unproved chain VXM resource lifetimes");
+    repeated_load_and_all_of();
+    const auto overlapped = run(3,false,true);
+    const auto overlappedLate = run(200,false,true);
+    const auto pressured = run(3,false,true,true);
     const auto early = run(3);
     const auto late = run(53);
     const auto atZero = run(3, true);
@@ -428,9 +526,19 @@ try {
         "Macro had repeated or omitted computation across the common stop");
     require(early.native_issues == std::vector<std::pair<std::size_t, std::size_t>>({{32, 700}, {256, 701}, {513, 702}}),
         "Native phase shifted or an instruction repeated/disappeared across the common stop");
+    require(pressured.issues == early.issues && pressured.native_issues == early.native_issues
+        && pressured.physical > overlapped.physical,"finite FIFO backpressure changed computation or failed to wait");
+    require(overlapped.issues == early.issues && overlappedLate.issues == early.issues
+        && overlapped.native_issues == early.native_issues && overlappedLate.native_issues == early.native_issues,
+        "overlap changed mixed Native/Macro logical phases");
+    require(overlapped.physical < early.physical && overlappedLate.physical > overlapped.physical,
+        "overlap did not hide transport or late transport did not HOLD");
     require(late.physical > early.physical, "the second transport latency did not add physical waiting");
     std::cout << "runtime_common_barrier_test passed logical=" << early.logical
               << " early_physical=" << early.physical << " late_physical=" << late.physical
+              << " overlap_physical=" << overlapped.physical << " overlap_late_physical=" << overlappedLate.physical
+              << " finite_fifo_physical=" << pressured.physical
+              << " all_of=verified repeated_load=verified resource_conflicts=rejected"
               << " issues=" << early.issues.size() << " native_issues=" << early.native_issues.size() << " generation=isolated real_mem_commit=verified corrupt_transport_cases=10 cycle_zero=verified stable_sram=protected\n";
     return 0;
 } catch (const std::exception& error) {

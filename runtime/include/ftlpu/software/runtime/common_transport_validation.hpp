@@ -4,6 +4,7 @@
 #include "ftlpu/software/runtime/common_page_range.hpp"
 #include "ftlpu/software/runtime/icu_program.hpp"
 #include "ftlpu/software/runtime/fu_3d_macro_lowering.hpp"
+#include "ftlpu/software/runtime/queue_transport_order.hpp"
 
 #include <algorithm>
 #include <span>
@@ -204,7 +205,7 @@ inline void validate_common_page_storage(const BinaryProgram& program,
                 std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
                 for (const auto& load : pageLoads)
                     if (load.queue == memQueue && load.binding_index == *access.input_binding
-                        && load.stop >= weightRelease && load.stop <= access.first
+                        && load.launch >= weightRelease && load.stop <= access.first
                         && load.ready <= access.first && load.release > access.last)
                         covered.emplace_back(load.row_begin,
                             static_cast<std::uint64_t>(load.row_begin) + load.row_count);
@@ -246,7 +247,7 @@ validate_common_transport_packet_links(const BinaryProgram& program)
 {
     using Location = std::pair<std::size_t, std::size_t>;
     std::map<Location, std::uint32_t> result;
-    if (!program.common_barrier_protocol) return result;
+    if (!program.common_barrier_protocol && !program.queue_control_protocol) return result;
     validate_binary_barriers(program);
 
     const auto fail = [](const char* reason) {
@@ -256,6 +257,11 @@ validate_common_transport_packet_links(const BinaryProgram& program)
     for (const auto& event : program.barrier_events)
         for (const auto instance : event.page_use_indices)
             launches.insert(program.weight_page_uses.at(instance).transport_launch_event_id);
+
+    if(program.queue_control_protocol)
+        for(const auto& event:program.queue_sync_plan.events)
+            for(const auto instance:event.page_use_indices)
+                launches.insert(program.weight_page_uses.at(instance).transport_launch_event_id);
 
     struct MemSegment {
         Location location{};
@@ -283,7 +289,13 @@ validate_common_transport_packet_links(const BinaryProgram& program)
         return value;
     };
 
-    for (const auto& queue : program.transport_queues) {
+    std::vector<const QueueProgram*> mem_stores;
+    for(const auto& q:program.transport_queues) mem_stores.push_back(&q);
+    if(program.queue_control_protocol)
+        for(const auto& q:program.queues)
+            if(q.kind==QueueKind::Mem && !q.requires_raw_macro && !q.packed_macro_imem) mem_stores.push_back(&q);
+    for (const auto* store : mem_stores) {
+        const auto& queue=*store;
         if (queue.kind != QueueKind::Mem || queue.packed_macro_imem
             || queue.requires_raw_macro || queue.index >= InstructionControlUnit::kMemQueues
             || !mem_queues.insert(queue.index).second)
@@ -291,10 +303,25 @@ validate_common_transport_packet_links(const BinaryProgram& program)
         for (std::size_t pc = 0; pc < queue.commands.size();) {
             if (is_icu_control_raw_word_command(queue.commands[pc])) {
                 const auto control = decode_icu_control_raw_word(queue.commands[pc]);
-                if (control.opcode != IcuControlOpcode::Nop)
+                if (control.opcode != IcuControlOpcode::Nop && !program.queue_control_protocol)
                     fail("common page-in MEM control may only contain NOPs and WRITE_SYNC packets");
                 ++pc;
                 continue;
+            }
+            if(program.queue_control_protocol && is_fu_3d_raw_packet_header(queue.commands[pc])) {
+                pc+=fu_3d_raw_packet_word_count(queue.kind,queue.commands[pc]);continue;
+            }
+            if(program.queue_control_protocol && std::ranges::any_of(program.queues,[&](const auto& q){return &q==store;})) {
+                const auto& command=queue.commands[pc];
+                const auto opcode=isa::decode_icu_command_opcode(command.command);
+                if(opcode==isa::IcuCommandOpcode::Nop && command.instruction_kind==InstructionKind::None
+                    && !command.word_count && command.extension_words.empty()) {++pc;continue;}
+                if(opcode==isa::IcuCommandOpcode::Instruction && command.instruction_kind==InstructionKind::Mem
+                    && command.word_count==2 && command.extension_words.empty()) {
+                    (void)isa::decode_mem_instruction(static_cast<isa::EncodedMemInstruction>(command.words[0])
+                        | (static_cast<isa::EncodedMemInstruction>(command.words[1])<<32));
+                    ++pc;continue;
+                }
             }
             if (!is_mem_synchronized_raw_packet_header(queue.commands[pc]))
                 fail("common transport contains an orphan or unsupported MEM packet word");
@@ -398,6 +425,7 @@ validate_common_transport_packet_links(const BinaryProgram& program)
     }
     if (linked_launches != launches)
         fail("common launch event has no fully linked physical transport segment");
+    validate_queue_transport_order(program,result);
     return result;
 }
 

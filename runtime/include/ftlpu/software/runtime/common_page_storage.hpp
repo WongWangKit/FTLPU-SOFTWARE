@@ -90,7 +90,8 @@ build_common_page_load_ranges(const BinaryProgram& program)
                 spans[queue].emplace_back(segment.base_row, rowEnd);
                 ranges.push_back({queue, segment.base_row, segment.vector_count,
                     use.binding_index, instance, barrier.stop_cycle,
-                    use.ready_cycle, use.release_cycle});
+                    use.ready_cycle, use.release_cycle, program.transport_overlap_protocol
+                        ? use.transport_launch_cycle : barrier.stop_cycle});
             }
         }
     }

@@ -1,0 +1,12 @@
+seq32 51200
+final image equivalence passed: computation, transport, operands, relocations, events and release phases
+seq32 25600
+final image equivalence passed: computation, transport, operands, relocations, events and release phases
+seq32 51200-jitter
+final image equivalence passed: computation, transport, operands, relocations, events and release phases
+seq128 51200
+final image equivalence passed: computation, transport, operands, relocations, events and release phases
+seq128 25600
+final image equivalence passed: computation, transport, operands, relocations, events and release phases
+seq128 51200-jitter
+final image equivalence passed: computation, transport, operands, relocations, events and release phases

@@ -108,6 +108,6 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
     llvm::ArrayRef<int64_t> hiddenSlices,
     llvm::ArrayRef<int64_t> resultSlices,
     const target::LPUTargetModel& target,
-    int64_t reductionsPerWeightPage = 0);
+    int64_t reductionsPerWeightPage = 0, int64_t commonDrainCycles = 0);
 
 } // namespace ftlpu::compiler::schedule

@@ -96,6 +96,29 @@ struct ExecutableHardwareConfig {
     // Finite shared controller RAM; packed-v1 instruction encoding is unchanged.
     std::uint32_t common_barrier_encoding_version{hw::kCommonBarrierEncodingVersion};
     std::uint32_t common_barrier_capacity{hw::kCommonBarrierCapacity};
+    std::uint32_t common_transport_overlap_version{hw::kCommonTransportOverlapVersion};
+
+    std::uint32_t queue_control_version{hw::kQueueControlVersion};
+    std::uint32_t queue_control_capacity{hw::kQueueControlCapacity};
+    std::uint32_t queue_control_cache_depth{hw::kQueueControlCacheDepth};
+    std::uint32_t queue_control_read_latency{hw::kQueueControlReadLatency};
+    std::uint32_t queue_control_read_ports{hw::kQueueControlReadPorts};
+
+    template <typename Visitor>
+    constexpr void visit_pre_v38(Visitor&& visitor)
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor));
+        visitor(common_barrier_encoding_version);
+        visitor(common_barrier_capacity);
+    }
+
+    template <typename Visitor>
+    constexpr void visit_pre_v38(Visitor&& visitor) const
+    {
+        visit_impl(*this, std::forward<Visitor>(visitor));
+        visitor(common_barrier_encoding_version);
+        visitor(common_barrier_capacity);
+    }
 
     template <typename Visitor>
     constexpr void visit_pre_v37(Visitor&& visitor)
@@ -104,19 +127,42 @@ struct ExecutableHardwareConfig {
     }
 
     template <typename Visitor>
-    constexpr void visit(Visitor&& visitor)
+    constexpr void visit_pre_v39(Visitor&& visitor)
     {
         visit_impl(*this, std::forward<Visitor>(visitor));
         visitor(common_barrier_encoding_version);
         visitor(common_barrier_capacity);
+        visitor(common_transport_overlap_version);
     }
 
     template <typename Visitor>
-    constexpr void visit(Visitor&& visitor) const
+    constexpr void visit_pre_v39(Visitor&& visitor) const
     {
         visit_impl(*this, std::forward<Visitor>(visitor));
         visitor(common_barrier_encoding_version);
         visitor(common_barrier_capacity);
+        visitor(common_transport_overlap_version);
+    }
+
+    template <typename Visitor>
+    constexpr void visit(Visitor&& visitor)
+    {
+        visit_pre_v39(visitor);
+        visitor(queue_control_version);
+        visitor(queue_control_capacity);
+        visitor(queue_control_cache_depth);
+        visitor(queue_control_read_latency);
+        visitor(queue_control_read_ports);
+    }
+    template <typename Visitor>
+    constexpr void visit(Visitor&& visitor) const
+    {
+        visit_pre_v39(visitor);
+        visitor(queue_control_version);
+        visitor(queue_control_capacity);
+        visitor(queue_control_cache_depth);
+        visitor(queue_control_read_latency);
+        visitor(queue_control_read_ports);
     }
 
     template <typename Visitor>
@@ -313,6 +359,12 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     config.visit_command_abi([&](std::uint32_t value) { hash.add(value); });
     hash.add(config.common_barrier_encoding_version);
     hash.add(config.common_barrier_capacity);
+    hash.add(config.common_transport_overlap_version);
+    hash.add(config.queue_control_version);
+    hash.add(config.queue_control_capacity);
+    hash.add(config.queue_control_cache_depth);
+    hash.add(config.queue_control_read_latency);
+    hash.add(config.queue_control_read_ports);
     return hash.value();
 }
 
@@ -324,6 +376,12 @@ constexpr std::uint64_t executable_target_abi(
     config.visit_command_abi([&](std::uint32_t value) { hash.add(value); });
     hash.add(config.common_barrier_encoding_version);
     hash.add(config.common_barrier_capacity);
+    hash.add(config.common_transport_overlap_version);
+    hash.add(config.queue_control_version);
+    hash.add(config.queue_control_capacity);
+    hash.add(config.queue_control_cache_depth);
+    hash.add(config.queue_control_read_latency);
+    hash.add(config.queue_control_read_ports);
     return hash.value();
 }
 

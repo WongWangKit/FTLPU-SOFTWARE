@@ -1,0 +1,4 @@
+SmolLM2 decoder checkpoint passed: attention + RMS2; starting paged FFN
+FFN hidden checkpoint summary: mismatches=0 max_error=0.03125 hardware_mismatches=0 hardware_max_error=0 replica_max_error=0
+Qwen dynamic C2C pages passed: uses=7, prefetches=8, bytes=2801664, linked_mem_write_sync=104, linked_mem_read_sync=56, synchronized_fu_writes=82944, initial_wait_cycles=3375, completion_tail_cycles=34825, compiled_ddr_mbytes=51200, runtime_ddr_mbytes=25600, queue_execution_ticks=110978, P=110978, PRIME=0, compute_dma_overlap=17733, compute_rx_overlap=26905, compute_commit_overlap=26872, commit_segments=331776, queue_control=1, qctl_partitions=110, common_barriers=0, barrier_table_bytes=16
+Complete SmolLM2 decoder layer passed: 18432 BF16 values, nonzero=18419, max_error=0.03125, max_ulp_distance=128, ffn_checkpoint_max_error=0.03125, host_attention_context_max_error=0.0117188, attention_residual_max_error=0.03125, rms2_max_error=0.015625, max_cycle=76025

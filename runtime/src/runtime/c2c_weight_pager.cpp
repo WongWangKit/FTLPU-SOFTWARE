@@ -1,4 +1,5 @@
 #include "ftlpu/software/runtime/common_transport_validation.hpp"
+#include "ftlpu/software/runtime/common_overlap.hpp"
 #include "ftlpu/software/runtime/c2c_weight_pager.hpp"
 
 #include "ftlpu/icu/instruction.hpp"
@@ -571,10 +572,11 @@ void retreat_native4_activation_producer_barriers(
                     // first activation-load issue. If a page wait lands in
                     // that producer READ_3D startup window, waiting only the
                     // MXM queue lets the vector pass while MXM is stopped.
-                    // WAIT_EVENT itself occupies one issue cycle. Use the
-                    // idle slot immediately before the producer's first
-                    // read so the read retains its compiler-scheduled lead
-                    // over MXM after a dynamically late page release.
+                    // The Native linker's boundary coordinate reserves a slot
+                    // before the producer read. Its release-phase plan keeps
+                    // the read's lead over MXM after a late page release.
+                    // This is not a forced WAIT execution bubble: a ready
+                    // WAIT may consume its token and dispatch in the same tick.
                     barriers[index].first = issueStart > cursor
                         ? issueStart - 1 : issueStart;
                 }
@@ -1462,10 +1464,11 @@ void inject_page_ready_barriers_impl(BinaryProgram& program,
             while (barrierIndex < queueBarriers.size()
                 && queueBarriers[barrierIndex].first <= throughCycle) {
                 appendBarrier(queueBarriers[barrierIndex], cursor);
-                // WAIT_EVENT occupies one ICU issue cycle even when the
-                // event has already been latched.  Account for that cycle so
-                // the following command can consume one fewer idle cycle
-                // instead of drifting later once per injected barrier.
+                // Keep the existing Native linker boundary coordinate,
+                // which charges one slot when inserting a wait and reduces
+                // the following NOP budget. Actual WAIT execution may continue
+                // in the same tick. Native and QCTL share this cursor/phase
+                // convention; changing it requires rescheduling both paths.
                 ++cursor;
                 ++barrierIndex;
             }
@@ -1783,6 +1786,9 @@ C2cWeightPageIcuProgram lower_c2c_weight_page_to_icu(
     return program;
 }
 
+IcuLocation queue_sync_location(QueueKind kind,std::size_t index,std::size_t logical_mxms)
+{ return linked_queue_location(kind,index,logical_mxms); }
+
 C2cWeightPager::C2cWeightPager(C2cDmaSystem& system)
     : system_(system)
 {
@@ -1800,10 +1806,15 @@ void C2cWeightPager::begin_schedule(BinaryProgram& program)
     if (active_) retire();
     if (common_barrier_protocol_) {
         const bool hadLinkedPlan = !program.barriers.empty();
+        std::erase_if(program.timelines, [](const auto& value) {
+            return value.name.starts_with("c2c.serial_fallback.");
+        });
         program.barriers.clear();
         program.barrier_events.clear();
-        for (auto& use : program.weight_page_uses)
+        for (auto& use : program.weight_page_uses) {
             use.transport_launch_event_id = 0;
+            use.transport_launch_cycle = 0;
+        }
         if (hadLinkedPlan) {
             std::erase_if(program.queues, [](const QueueProgram& queue) {
                 return queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cRx;
@@ -1872,6 +1883,9 @@ void C2cWeightPager::begin_schedule(BinaryProgram& program)
     linked_mxms_per_hemisphere_ = program.hardware.mxms_per_hemisphere;
     common_events_.clear();
     common_page_ranges_.clear();
+    overlap_calendar_.reset();
+    if (program.transport_overlap_protocol)
+        overlap_calendar_ = std::make_shared<CommonOverlapCalendar>(program);
     if (common_barrier_protocol_) {
         for (const auto& queue : program.queues)
             if ((queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cRx)
@@ -2023,8 +2037,9 @@ C2cWeightPageFence C2cWeightPager::schedule(
         // waits for the real transfer and the page barrier stalls consumers.
         // Moving the packet after the consumer would create a dependency
         // cycle: the consumer waits for a page whose writes are behind it.
-        // WAIT_EVENT itself consumes one ICU cycle. Leave that cycle before
-        // the first ordinary issue so its transport wavefront is preserved.
+        // Preserve the Native linker's one-slot boundary convention before
+        // the first ordinary issue. The shared release plan uses this anchor;
+        // it does not require a ready WAIT to occupy a physical issue tick.
         auto fenceCycle = readyCycle == 0 ? 0 : readyCycle - 1;
         if (pageReadyEventTag != 0) {
             const auto coveredWaits = std::ranges::count_if(
@@ -2138,8 +2153,10 @@ C2cWeightPageFence C2cWeightPager::schedule(
     for (std::size_t side = 0; side < hw::kHemispheres; ++side) {
         const auto segmentCount = segmentCounts[side];
         if (segmentCount == 0) continue;
-        // WAIT_EVENT consumes one logical queue cycle. RX then sustains one
-        // one-word packet per cycle. DMA packets occupy two physical words;
+        // The Native link coordinate reserves one slot for WAIT_EVENT (the
+        // executor can consume a ready WAIT and continue in the same tick).
+        // RX then sustains one one-word packet per cycle. DMA packets occupy
+        // two physical words;
         // after the initially primed IQ burst, its one-word/cycle frontend
         // inserts one decode wait before every remaining packet.
         rxLogicalEnds[side] = c2c_queue_end(
@@ -2311,6 +2328,24 @@ C2cWeightPageFence C2cWeightPager::schedule_common(
     if (stop < earliestMemCycle)
         throw std::logic_error("unsafe common stop: transport launch or SRAM reuse depends on computation after the stop");
     validate_common_drain_window(binary, stop, ingressBegin);
+    auto linkedPage = page;
+    std::size_t producerStart = stop;
+    if (overlap_calendar_) {
+        std::vector<std::size_t> queues;
+        for (const auto& segment : page.segments)
+            queues.push_back(InstructionControlUnit::mem_queue(
+                segment.hemisphere, segment.slice, segment.bank));
+        const auto lease = overlap_calendar_->select(static_cast<std::uint32_t>(stop),
+            earliestMemCycle, queues);
+        producerStart = lease.launch;
+        if (producerStart == stop)
+            binary.timelines.push_back({"c2c.serial_fallback."
+                + std::string(earliestMemCycle == stop ? "sram_release" : "mem_sr_lease")
+                + ".launch:" + std::to_string(launchEventTag), stop, stop});
+        linkedPage.fabric_streams = lease.streams;
+        overlap_calendar_->validate(lease.launch, static_cast<std::uint32_t>(stop),
+            queues, lease.streams);
+    }
     for (const auto index : pageUseIndices) {
         const auto& use = binary.weight_page_uses[index];
         for (const auto& segment : page.segments) {
@@ -2319,15 +2354,13 @@ C2cWeightPageFence C2cWeightPager::schedule_common(
             common_page_ranges_.push_back({InstructionControlUnit::mem_queue(
                 segment.hemisphere, segment.slice, segment.bank), segment.base_row,
                 segment.vector_count, use.binding_index, static_cast<std::uint32_t>(index),
-                static_cast<std::uint32_t>(stop), use.ready_cycle, use.release_cycle});
+                static_cast<std::uint32_t>(stop), use.ready_cycle, use.release_cycle,
+                static_cast<std::uint32_t>(producerStart)});
         }
     }
-    // First implementation deliberately performs runtime page traffic while
-    // held at the drained stop. Thus an arbitrarily late DDR response cannot
-    // collide with computation or borrow an SR past its compiler reservation.
-    // Same-C pages are serialized physically and joined by one all-of event.
-    const auto producerStart = stop;
-    const auto lowered = lower_c2c_weight_page_to_icu(page,
+    // E is independent of physical DDR latency. Same-C pages remain ordered
+    // on the finite transport path and are joined by one all-of completion.
+    const auto lowered = lower_c2c_weight_page_to_icu(linkedPage,
         system_.chip().hardware_configuration(), next_sync_tag_, 0, true);
     C2cWeightPageFence fence;
     fence.transport_queue = true;
@@ -2381,6 +2414,8 @@ C2cWeightPageFence C2cWeightPager::schedule_common(
     association.event_id = static_cast<std::uint32_t>(pageReadyEventTag);
     for (const auto index : pageUseIndices) {
         binary.weight_page_uses[index].transport_launch_event_id = static_cast<std::uint32_t>(launchEventTag);
+        binary.weight_page_uses[index].transport_launch_cycle = binary.transport_overlap_protocol
+            ? static_cast<std::uint32_t>(producerStart) : 0;
         association.page_use_indices.push_back(static_cast<std::uint32_t>(index));
     }
     common_events_.push_back(std::move(association));
@@ -2480,8 +2515,9 @@ C2cWeightPager::page_ready_releases(std::size_t eventTag) const
         // drift when the compiler places adjacent waits one cycle apart.
         std::size_t desiredComputePhase = *firstMxmCompute;
         if (firstGroupArrival) {
-            // WAIT_EVENT retires on the preceding issue cycle. The first
-            // activation reaches the MXM one cycle after the linked SR
+            // The release plan's WAIT boundary is anchored one slot earlier;
+            // this is not a mandatory physical WAIT retirement bubble. The
+            // first activation reaches MXM one cycle after the linked SR
             // arrival boundary. Anchor each page to that arrival even when
             // the compiler's nominal MXM wait is one cycle later.
             std::size_t firstIssueDelay = 1;
@@ -2632,7 +2668,7 @@ void C2cWeightPager::finalize_schedule(BinaryProgram& program)
         inject_page_ready_barriers(program);
         for (const auto& load : common_page_ranges_) {
             const std::array<std::uint32_t, 1> ownerBinding {load.binding_index};
-            validate_common_page_storage(program, load.stop, load.queue, load.row_begin,
+            validate_common_page_storage(program, load.launch, load.queue, load.row_begin,
                 load.row_count, ownerBinding, load.release, common_page_ranges_);
         }
         for (const auto& queue : program.transport_queues)
@@ -3074,13 +3110,24 @@ bool C2cWeightPager::transport_ready(
             }
     for (std::size_t queue = 0;
          queue < fence.completed_mem_writes.size(); ++queue)
-        if ((fence.transport_queue ? chip.icu().mem_transport_iq(queue)
+        if (((fence.transport_queue || chip.icu().queue_control_transport_enabled(queue)) ? chip.icu().mem_transport_iq(queue)
                                  : chip.icu().mem_iq(queue)).synchronized_issued_count()
             < fence.completed_mem_writes[queue]) {
             fence.mem_writes_issued_cycle.reset();
             return false;
         }
 
+    if(fence.commit_generation) {
+        for(std::size_t queue=0;queue<fence.commit_vectors.size();++queue) {
+            if(!fence.commit_vectors[queue]) continue;
+            const auto h=static_cast<Hemisphere>(queue/InstructionControlUnit::kMemQueuesPerHemisphere);
+            const auto local=queue%InstructionControlUnit::kMemQueuesPerHemisphere;
+            if(chip.mem_array(h).transport_committed_segments(fence.commit_generation,fence.commit_launch,
+                local/hw::kMemBanksPerSlice,local%hw::kMemBanksPerSlice)
+                < static_cast<std::uint64_t>(fence.commit_vectors[queue])*hw::kTileRows) return false;
+        }
+        return true;
+    }
     if (!fence.mem_writes_issued_cycle)
         fence.mem_writes_issued_cycle = system_.cycle();
     const std::size_t elapsed =
@@ -3098,7 +3145,7 @@ bool C2cWeightPager::ready(const C2cWeightPageFence& fence) const
 
     for (std::size_t queue = 0;
          queue < fence.completed_mem_reservations.size(); ++queue)
-        if ((fence.transport_queue ? chip.icu().mem_transport_iq(queue)
+        if (((fence.transport_queue || chip.icu().queue_control_transport_enabled(queue)) ? chip.icu().mem_transport_iq(queue)
                                  : chip.icu().mem_iq(queue)).synchronized_completed_count()
             < fence.completed_mem_reservations[queue])
             return false;

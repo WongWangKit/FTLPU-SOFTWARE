@@ -81,7 +81,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
     });
     rewriter.create(hiddenBinding);
     auto downLastSwishCycle = swish.last_cycle;
-    if (reductionsPerWeightPage > 0 && requestsCommonBarriers(ffn.getOperation())) {
+    if (reductionsPerWeightPage > 0 && requestsRawMacroBarriers(ffn.getOperation(), target)) {
         // emitFfnSwish includes every owner-to-peer hidden SRAM mirror. Its
         // final MEM issue is a stable functional boundary: Gate/Up temporaries
         // are dead and Down consumes the materialized hidden value. Charge a
@@ -108,7 +108,10 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         {context.m(), context.k(), intermediate, context.n()},
         context.projection_timeline, downLastSwishCycle,
         context.down_weight_slices, context.hidden_slices,
-        context.result_slices, target, reductionsPerWeightPage);
+        context.result_slices, target, reductionsPerWeightPage,
+        requestsRawMacroBarriers(ffn.getOperation(), target)
+            && target.icu_memory().common_transport_overlap_version == 1
+            ? commonBarrierDrainCycles(target) : 0);
     if (mlir::failed(timeline)) return mlir::failure();
     const bool serializedSlots = timeline->serialized_slots;
     int64_t downEnd = timeline->phase_start;
@@ -586,6 +589,24 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                     weightDomain.wave_interval = weightRunInterval;
                     weightDomain.wave_address_stride =
                         (denseSplitDown ? 1 : logicalSlotsPerHemisphere) * weightLoadCycles;
+                }
+                if (requestsRawMacroBarriers(ffn.getOperation(), target)
+                    && target.icu_memory().common_transport_overlap_version == 1
+                    && hemisphere == 0 && logicalSlot == 0 && page > 0
+                    && reduction % reductionsPerWeightPage == 0) {
+                    const auto binding = commonBarrierInputBinding(context.down_raw.getInput());
+                    if (!binding) return mlir::failure();
+                    int64_t firstRead = start;
+                    for (std::size_t i=0;i<selectedWeightSlices.size();++i)
+                        firstRead = std::min(firstRead, start - context.eastMxmLatency(selectedWeightSlices[i])
+                            + (throughput.mxm_prefill_weight_streams == 1 ? static_cast<int64_t>(i) : 0));
+                    const auto begin = firstRead - commonBarrierDrainCycles(target);
+                    emitCommonBarrierCandidate(rewriter,ffn.getLoc(),*binding,page,begin,firstRead);
+                    mlir::OperationState cost(ffn.getLoc(),TimelineOp::getOperationName());
+                    cost.addAttributes({rewriter.getNamedAttr("name",rewriter.getStringAttr("common_barrier.drain_cost")),
+                        rewriter.getNamedAttr("start",rewriter.getI64IntegerAttr(begin)),
+                        rewriter.getNamedAttr("end",rewriter.getI64IntegerAttr(firstRead))});
+                    rewriter.create(cost);
                 }
                 // Down projection keeps its per-window MXM control domains.
                 emitFfnWeightTile(rewriter, ffn.getLoc(),

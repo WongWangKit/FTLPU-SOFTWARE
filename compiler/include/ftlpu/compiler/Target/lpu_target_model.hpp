@@ -147,6 +147,12 @@ struct IcuMemoryGeometry {
     int64_t mxm_macro_context_bits = hw::kIcuMxmMacroContextBits;
     int64_t common_barrier_encoding_version = hw::kCommonBarrierEncodingVersion;
     int64_t common_barrier_capacity = hw::kCommonBarrierCapacity;
+    int64_t common_transport_overlap_version = hw::kCommonTransportOverlapVersion;
+    int64_t queue_control_version = hw::kQueueControlVersion;
+    int64_t queue_control_capacity = hw::kQueueControlCapacity;
+    int64_t queue_control_cache_depth = hw::kQueueControlCacheDepth;
+    int64_t queue_control_read_latency = hw::kQueueControlReadLatency;
+    int64_t queue_control_read_ports = hw::kQueueControlReadPorts;
 };
 
 class LPUTargetModel {

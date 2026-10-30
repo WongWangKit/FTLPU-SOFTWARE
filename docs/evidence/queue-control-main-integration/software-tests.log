@@ -1,0 +1,24 @@
+Internal ctest changing into directory: E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-qctl-integration/build
+Test project E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-qctl-integration/build
+    Start  4: runtime_common_barrier_test
+1/9 Test  #4: runtime_common_barrier_test ................   Passed    1.07 sec
+    Start  5: binary_barrier_test
+2/9 Test  #5: binary_barrier_test ........................   Passed    0.18 sec
+    Start  6: macro_bitstream_test
+3/9 Test  #6: macro_bitstream_test .......................   Passed    0.33 sec
+    Start  7: fu_3d_macro_lowering_test
+4/9 Test  #7: fu_3d_macro_lowering_test ..................   Passed    0.55 sec
+    Start  9: model_session_executable_c2c_weight_test
+5/9 Test  #9: model_session_executable_c2c_weight_test ...   Passed    0.57 sec
+    Start 13: program_load_runtime_test
+6/9 Test #13: program_load_runtime_test ..................   Passed    0.24 sec
+    Start 17: issue_inspector_test
+7/9 Test #17: issue_inspector_test .......................   Passed    0.21 sec
+    Start 25: c2c_weight_ping_pong_test
+8/9 Test #25: c2c_weight_ping_pong_test ..................   Passed    0.24 sec
+    Start 36: binary_queue_control_test
+9/9 Test #36: binary_queue_control_test ..................   Passed    0.30 sec
+
+100% tests passed, 0 tests failed out of 9
+
+Total Test time (real) =   3.75 sec

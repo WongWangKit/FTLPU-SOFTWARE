@@ -597,7 +597,7 @@ void schedule_weight_prefetches(const BinaryProgram& program,
             ingressBegin = std::max(ingressBegin, window->start_cycle);
             ingressEnd = std::min(ingressEnd, window->end_cycle);
         }
-        if (hasIngressWindow) {
+        if (hasIngressWindow && !program.transport_overlap_protocol) {
             if (ingressBegin >= ingressEnd
                 || ingressEnd > plan.ready_cycle)
                 throw std::logic_error("invalid compiler C2C ingress window");
@@ -606,7 +606,7 @@ void schedule_weight_prefetches(const BinaryProgram& program,
                 plan.earliest_mem_cycle, ingressBegin);
         }
         plan.fabric_streams.clear();
-        if (hasStreamReleases && !hasIngressWindow) {
+        if (hasStreamReleases && !hasIngressWindow && !program.transport_overlap_protocol) {
             struct StreamSelection {
                 std::uint64_t start{0};
                 std::uint64_t end{std::numeric_limits<std::uint64_t>::max()};

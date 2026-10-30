@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -215,7 +216,8 @@ CmodelMemRun run_compiled_mem_program(const rt::BinaryProgram& program)
     }
     expect(memQueue != nullptr, "Macro CModel A/B fixture has no MEM queue");
 
-    ftlpu::InstructionControlUnit icu;
+    auto icuStorage = std::make_unique<ftlpu::InstructionControlUnit>();
+    auto& icu = *icuStorage;
     rt::load_queue_programs_into_icu(program.queues, icu,
                                      program.hardware.mxms_per_hemisphere);
     CmodelMemRun result;
@@ -585,7 +587,8 @@ try {
         }
     }
 
-    ftlpu::InstructionControlUnit icu;
+    auto icuStorage = std::make_unique<ftlpu::InstructionControlUnit>();
+    auto& icu = *icuStorage;
     const auto prefillCycles =
         rt::load_queue_programs_into_icu(restoredProgram.queues, icu);
     expect(prefillCycles != 0,
@@ -775,7 +778,8 @@ try {
     // requires regeneration before the actual CModel hardware load.
     auto corruptProgram = restoredProgram;
     corruptProgram.queues.front().packed_macro_imem->bytes[3] |= 0x80u;
-    ftlpu::InstructionControlUnit corruptIcu;
+    auto corruptIcuStorage = std::make_unique<ftlpu::InstructionControlUnit>();
+    auto& corruptIcu = *corruptIcuStorage;
     expect_throw(
         [&]() {
             (void)rt::load_queue_programs_into_icu(

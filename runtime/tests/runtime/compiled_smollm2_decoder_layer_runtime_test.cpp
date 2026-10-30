@@ -644,14 +644,14 @@ try {
 
 #if FTLPU_TEST_DYNAMIC_C2C_WEIGHT_PAGES
     using namespace ftlpu::software::runtime;
-    const auto dynamicProgram = argc == 3
+    auto dynamicProgram = argc == 3
         ? read_binary_program(std::filesystem::path(argv[2])) : program;
     if (argc == 3) {
         // Raw compilation can charge explicit drain intervals before safe
         // operator boundaries. Check the retiming exactly, rather than
         // accepting arbitrary phase changes or requiring those costs to vanish.
         auto costs = dynamicProgram.timelines;
-        std::erase_if(costs, [](const auto& value) { return value.name != "common_barrier.drain_cost"; });
+        std::erase_if(costs, [](const auto& value) { return value.name != "common_barrier.drain_cost" && value.name != "common_barrier.schedule_cost"; });
         std::ranges::sort(costs, {}, &BinaryTimeline::start_cycle);
         const auto& h = dynamicProgram.hardware;
         const std::uint64_t guard = h.system_register_columns + h.mem_boundary_register_columns
@@ -662,7 +662,7 @@ try {
         std::uint64_t previousEnd = 0;
         for (const auto& cost : costs) {
             if (cost.start_cycle < previousEnd || cost.end_cycle <= cost.start_cycle
-                || cost.end_cycle - cost.start_cycle != guard || cost.end_cycle > dynamicProgram.max_cycle)
+                || cost.end_cycle - cost.start_cycle != (cost.name == "common_barrier.schedule_cost" ? 2 * guard : guard) || cost.end_cycle > dynamicProgram.max_cycle)
                 throw std::logic_error("Raw decoder has an invalid charged drain interval");
             previousEnd = cost.end_cycle;
         }
@@ -675,7 +675,9 @@ try {
             }
             return result;
         };
-        if (!dynamicProgram.common_barrier_protocol
+        if (dynamicProgram.queue_control_protocol && !costs.empty())
+            throw std::logic_error("QCTL changed Native scheduling with global barrier padding");
+        if ((!dynamicProgram.common_barrier_protocol && !dynamicProgram.queue_control_protocol)
             || baselineCycle(dynamicProgram.max_cycle) != program.max_cycle
             || dynamicProgram.bindings.size() != program.bindings.size()
             || dynamicProgram.weight_page_uses.size() != program.weight_page_uses.size())
@@ -707,6 +709,9 @@ try {
                 && rawMacro && !queue.requires_raw_macro)
                 throw std::logic_error("Raw decoder silently retained a non-Macro computation queue");
     }
+    // Identical computation/safe-stop schedule; only disable early launch for
+    // the measured serial control. The production linker never reads this knob.
+    if (std::getenv("FTLPU_TEST_SERIAL_PAGING")) dynamicProgram.transport_overlap_protocol = false;
     const auto inputBindingByIndex = [&](std::uint32_t index)
         -> const BinaryBinding& {
         const auto binding = std::ranges::find_if(
@@ -1004,6 +1009,14 @@ try {
         // the exact output comparison above detects incorrect resumption.
         const BinaryProgram& linkedProgram =
             dynamicSession.last_linked_program();
+        if(const auto path=std::getenv("FTLPU_QUEUE_PROGRESS_CSV")) {
+            std::ofstream stream(path);
+            if(!stream)throw std::runtime_error("cannot write queue progress report");
+            stream<<"invocation,kind,index,local_cycle,queue_cycle,physical_cycles,wait_cycles,issued,done\n";
+            for(const auto& q:dynamicStats.queue_progress)
+                stream<<q.invocation_index<<','<<static_cast<unsigned>(q.kind)<<','<<q.index<<','
+                      <<q.local_cycle<<','<<q.queue_cycle<<','<<q.physical_cycles<<','<<q.wait_cycles<<','<<q.issued<<','<<q.done<<'\n';
+        }
         std::size_t linkedWriteSyncInstructions = 0;
         std::size_t linkedReadSyncInstructions = 0;
         const auto inspectLinkedQueues = [&](const std::vector<QueueProgram>& queues) {
@@ -1057,9 +1070,22 @@ try {
         };
         inspectLinkedQueues(linkedProgram.queues);
         inspectLinkedQueues(linkedProgram.transport_queues);
-        if (argc == 3 && (linkedProgram.barriers.empty()
+        if (argc == 3 && !linkedProgram.queue_control_protocol && (linkedProgram.barriers.empty()
                 || linkedProgram.transport_queues.empty()))
             throw std::logic_error("Raw decoder did not execute a linked common barrier and MEM transport image");
+        if (linkedProgram.queue_control_protocol) {
+            validate_queue_sync_plan(linkedProgram);
+            if (linkedProgram.common_barrier_protocol || linkedProgram.queue_sync_plan.partitions.empty()
+                || linkedProgram.queue_sync_plan.events.empty() || linkedProgram.queue_link_source.required)
+                throw std::logic_error("decoder did not load a completed queue-control image");
+            if (argc==3 && linkedProgram.transport_queues.empty())
+                throw std::logic_error("Raw decoder did not execute the Native MEM transport store");
+            // KV page-out is a distinct executable. Its compiler controls
+            // remain in the compact relink recipe, never in the main image.
+            const auto mainWrites=linkedWriteSyncInstructions;
+            inspectLinkedQueues(linkedProgram.queue_link_source.queues);
+            linkedWriteSyncInstructions=mainWrites;
+        }
         if (linkedWriteSyncInstructions != expectedSyncInstructions)
             throw std::logic_error(
                 "Qwen dynamic linker MEM_WRITE_SYNC count mismatch: linked="
@@ -1093,11 +1119,20 @@ try {
                   << dynamicStats.weight_page_synchronized_writes
                   << ", initial_wait_cycles="
                   << dynamicStats.weight_page_initial_wait_cycles
-                  << ", runtime_wait_cycles="
+                  << (linkedProgram.queue_control_protocol ? ", completion_tail_cycles=" : ", runtime_wait_cycles=")
                   << dynamicStats.weight_page_runtime_wait_cycles
                   << ", compiled_ddr_mbytes="
                   << program.hardware.ddr_peak_bandwidth_mbytes_per_second
                   << ", runtime_ddr_mbytes=" << runtimeDdrBandwidth
+                  << (linkedProgram.queue_control_protocol ? ", queue_execution_ticks=" : ", L=") << dynamicStats.main_logical_cycles
+                  << ", P=" << dynamicStats.main_physical_cycles
+                  << ", PRIME=" << dynamicStats.instruction_prime_cycles
+                  << ", compute_dma_overlap=" << dynamicStats.compute_dma_overlap_cycles
+                  << ", compute_rx_overlap=" << dynamicStats.compute_rx_overlap_cycles
+                  << ", compute_commit_overlap=" << dynamicStats.compute_commit_overlap_cycles
+                  << ", commit_segments=" << dynamicStats.transport_commit_segments
+                  << ", queue_control=" << linkedProgram.queue_control_protocol
+                  << ", qctl_partitions=" << linkedProgram.queue_sync_plan.partitions.size()
                   << ", common_barriers=" << linkedProgram.barriers.size()
                   << ", barrier_table_bytes=" << (16 + 8 * linkedProgram.barriers.size())
                   << '\n';
@@ -2039,6 +2074,7 @@ try {
         });
     const std::size_t valueSliceGroups =
         valueBinding->slices.size() / 16;
+    const std::size_t valueTokenBlocks = static_cast<std::size_t>(valueBinding->shape.at(0)) / 32;
     const auto readPackedValue = [&](std::size_t head,
                                      std::size_t token,
                                      std::size_t dimension,
@@ -2049,8 +2085,8 @@ try {
         const std::size_t packedStream = (token % 8) * 2;
         const std::size_t address =
             static_cast<std::size_t>(valueBinding->base_row)
-            + (head * kHeadBlocks + headBlock)
-                * kTokenBlocks * kTileRows
+            + ((head * kHeadBlocks + headBlock) * valueTokenBlocks
+                + token / 32) * kTileRows
             + (token % 32) / 8;
         return physicalBf16(hemisphere,
             valueBinding->slices[sliceGroup + packedStream],
@@ -3535,6 +3571,11 @@ try {
     system = nullptr;
     ftlpu::C2cDmaSystem dynamicSystem;
     ModelSession dynamicSession(dynamicSystem);
+    if(const auto latency=std::getenv("FTLPU_DDR_EXTRA_READ_LATENCY")) {
+        const auto extra=std::stoull(latency);
+        if(extra>UINT32_MAX)throw std::invalid_argument("DDR latency overflow");
+        dynamicSession.set_ddr_latency_perturbation(static_cast<std::uint32_t>(extra),20261029);
+    }
     std::uint32_t runtimeDdrBandwidth =
         program.hardware.ddr_peak_bandwidth_mbytes_per_second;
     if (const char* bandwidth =

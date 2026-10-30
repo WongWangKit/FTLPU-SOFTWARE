@@ -1,0 +1,16 @@
+Internal ctest changing into directory: E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/build
+Test project E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/build
+    Start 57: subsystem.program.loader
+1/2 Test #57: subsystem.program.loader ..........   Passed    0.30 sec
+    Start 58: subsystem.program.configuration
+2/2 Test #58: subsystem.program.configuration ...   Passed    5.29 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Label Time Summary:
+dma          =   0.30 sec*proc (1 test)
+fast         =   0.30 sec*proc (1 test)
+program      =   0.30 sec*proc (1 test)
+subsystem    =   0.30 sec*proc (1 test)
+
+Total Test time (real) =   5.60 sec

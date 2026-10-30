@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 37;
+inline constexpr std::uint32_t kBinaryFormatVersion = 39;
 inline constexpr std::uint32_t kBinaryCommonBarrierMaxCompletionInstances = 65535;
 
 enum class BindingAccess : std::uint16_t {
@@ -169,6 +169,7 @@ struct BinaryWeightPageUse {
     // Zero in compiler candidates and pre-execution loads. A final runtime
     // transport instance binds the DMA/RX launch WAIT to its common stop.
     std::uint32_t transport_launch_event_id{0};
+    std::uint32_t transport_launch_cycle{0}; // v38: logical earliest launch, independent of C.
 };
 
 enum class VxmImmediateOperand : std::uint16_t {
@@ -224,6 +225,43 @@ struct BinaryBarrierEvent {
     std::vector<std::uint32_t> page_use_indices{};
 };
 
+// The order in a partition is semantic, including equal local coordinates.
+struct BinaryQueueControl {
+    std::uint32_t local_cycle{0};
+    IcuControlOpcode opcode{IcuControlOpcode::WaitEvent};
+    bool native_binding{false};
+    std::uint32_t operand{0};
+    std::uint32_t source_command{0};
+    std::uint32_t release_group{0};
+    std::uint32_t phase_offset{0};
+    bool activation_producer{false};
+};
+struct BinaryQueueControlPartition {
+    QueueKind kind{QueueKind::Mem};
+    std::uint16_t index{0};
+    std::vector<BinaryQueueControl> entries{};
+    std::uint32_t end_cycle{0}; // Includes original trailing NOPs, excludes control slots.
+};
+enum class QueueEventSource : std::uint16_t { External = 1, PageCommit = 2 };
+struct BinaryQueueControlEvent {
+    std::uint32_t event_id{0};
+    QueueEventSource source{QueueEventSource::External};
+    std::vector<std::uint32_t> page_use_indices{};
+};
+struct QueueSyncPlan {
+    std::vector<BinaryQueueControlPartition> partitions{};
+    std::vector<BinaryQueueControlEvent> events{};
+};
+
+// Compact pre-link FU domains and Native controls. This is a linker recipe,
+// not expanded per-cycle computation and never an executable fallback image.
+struct BinaryQueueLinkSource {
+    bool required{false};
+    std::vector<QueueProgram> queues{};
+    std::vector<BinaryAddressRelocation> address_relocations{};
+    std::vector<BinaryScaleRelocation> scale_relocations{};
+};
+
 struct BinaryProgram {
     std::string target_name{std::string(kLpu32StreamTargetName)};
     std::uint64_t target_abi{kLpu32StreamTargetAbi};
@@ -233,7 +271,11 @@ struct BinaryProgram {
     // Physically independent finite Native MEM control queues. They continue
     // advancing on physical time while computation is held.
     std::vector<QueueProgram> transport_queues{};
+    bool queue_control_protocol{false};
+    QueueSyncPlan queue_sync_plan{};
+    BinaryQueueLinkSource queue_link_source{};
     bool common_barrier_protocol{false};
+    bool transport_overlap_protocol{false};
     std::vector<BinaryBarrier> barriers{};
     std::vector<BinaryBarrierEvent> barrier_events{};
     std::vector<BinaryBinding> bindings{};
@@ -254,6 +296,7 @@ struct BinaryProgram {
 // Checked conversion for linker arithmetic; never truncate a logical cycle.
 BinaryBarrier make_binary_barrier(std::uint64_t stop_cycle, std::uint32_t event_id);
 void validate_binary_barriers(const BinaryProgram& program);
+void validate_queue_sync_plan(const BinaryProgram& program, bool validate_bindings = true);
 
 void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path);
 BinaryProgram read_binary_program(const std::filesystem::path& path);

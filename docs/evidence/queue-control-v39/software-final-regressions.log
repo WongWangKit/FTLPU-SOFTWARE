@@ -1,0 +1,22 @@
+Internal ctest changing into directory: E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-common-barrier-ninja
+Test project E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-common-barrier-ninja
+    Start  1: runtime_common_barrier_test
+1/8 Test  #1: runtime_common_barrier_test ................   Passed    1.24 sec
+    Start  2: binary_barrier_test
+2/8 Test  #2: binary_barrier_test ........................   Passed    0.05 sec
+    Start  3: macro_bitstream_test
+3/8 Test  #3: macro_bitstream_test .......................   Passed    0.05 sec
+    Start  4: fu_3d_macro_lowering_test
+4/8 Test  #4: fu_3d_macro_lowering_test ..................   Passed    0.08 sec
+    Start  6: model_session_executable_c2c_weight_test
+5/8 Test  #6: model_session_executable_c2c_weight_test ...   Passed    0.36 sec
+    Start 13: issue_inspector_test
+6/8 Test #13: issue_inspector_test .......................   Passed    0.09 sec
+    Start 21: c2c_weight_ping_pong_test
+7/8 Test #21: c2c_weight_ping_pong_test ..................   Passed    0.18 sec
+    Start 31: binary_queue_control_test
+8/8 Test #31: binary_queue_control_test ..................   Passed    0.03 sec
+
+100% tests passed, 0 tests failed out of 8
+
+Total Test time (real) =   2.12 sec

@@ -11,7 +11,7 @@
 
 namespace ftlpu::compiler::schedule {
 
-inline bool requestsCommonBarriers(mlir::Operation* operation)
+inline bool requestsRawMacroBarriers(mlir::Operation* operation, const target::LPUTargetModel& target)
 {
     const auto module = operation->getParentOfType<mlir::ModuleOp>();
     // Keep the transport protocol independent of computation encoding so
@@ -19,7 +19,8 @@ inline bool requestsCommonBarriers(mlir::Operation* operation)
     const auto common = module ? module->getAttrOfType<mlir::BoolAttr>("ftlpu.common_barrier_protocol") : mlir::BoolAttr{};
     if (common && common.getValue()) return true;
     const auto mode = module ? module->getAttrOfType<mlir::StringAttr>("ftlpu.icu_compression") : mlir::StringAttr{};
-    return mode && mode.getValue() == "raw-macro";
+    return mode && mode.getValue() == "raw-macro"
+        && target.icu_memory().queue_control_version == 0;
 }
 
 inline int64_t commonBarrierDrainCycles(const target::LPUTargetModel& target)
