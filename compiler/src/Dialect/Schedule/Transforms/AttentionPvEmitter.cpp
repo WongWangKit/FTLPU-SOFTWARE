@@ -205,7 +205,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                 ? localMxm % target_.throughput().mxm_weight_buffers
                 : 0,
             0, 0, 0, 1, 1, 0, 1, "stream", true,
-            "supercell", 0, dataFormat, {}, {}, tileRows, 1, 1,
+            "block", 0, dataFormat, {}, {}, tileRows, 1, 1,
             1, 1, 0,
             singleMxm ? singleMxmWeightStreamBase : localMxm * 16);
         return capture + 2 * tileRows + 1;
@@ -405,7 +405,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                 accumulatorAddress(queryBlock, 0),
                                 1,
                                 finalReduction ? "stream" : "sram",
-                                finalReduction, "supercell", 0,
+                                finalReduction, "block", 0,
                                 dataFormat, {},
                                 finalReduction ? "bf16" : "");
                             weightBufferRelease[
@@ -858,7 +858,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                             0, activationStreamBase, outputStream, tile, 1,
                             accumulatorAddress(queryBlock, localMxm),
                             1, finalReduction ? "stream" : "sram",
-                            finalReduction, "supercell", 0, dataFormat,
+                            finalReduction, "block", 0, dataFormat,
                             {}, finalReduction ? "bf16" : "");
                     }
 

@@ -74,6 +74,38 @@ def main():
         (a.output_dir / "summary.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(results, indent=2))
         return
+    # External short tiles must retain their ingress bytes through graph
+    # padding, just like short views of an internal producer. Different row
+    # magnitudes catch a missing input or accidentally replicated live row.
+    for kind in ('rms', 'l2'):
+        out = a.output_dir.resolve() / f'external_partial_{kind}'
+        out.mkdir(parents=True, exist_ok=True)
+        rng = np.random.default_rng(16128)
+        x = bf16(rng.normal(0, .3, (16, 128)).astype('f4'))
+        x[0] = 0
+        gamma = bf16(rng.uniform(.7, 1.3, 128).astype('f4')) if kind == 'rms' else np.ones(128, 'f4')
+        graph = LogicalGraph()
+        value = graph.norm('partial_norm', x, gamma, 1e-6, mean=kind == 'rms')
+        logical = graph.write(out / 'logical_graph', [value])
+        graph_compile = a.compile.resolve().with_name(
+            'ftlpu-graph-compile.exe' if sys.platform == 'win32' else 'ftlpu-graph-compile')
+        kernel, binary = out / 'norm.kernel.mlir', out / 'norm.ftlpu'
+        subprocess.run([str(graph_compile), '--input', str(logical), '--output', str(kernel),
+                        '--emit-kernel', '--target-config', str(a.target_config.resolve())], check=True)
+        subprocess.run([str(a.compile.resolve()), '--input', str(kernel), '--input-stage', 'kernel',
+                        '--output', str(binary), '--target-config', str(a.target_config.resolve()),
+                        '--icu-compression', 'raw-macro'], check=True)
+        with (out / 'execution.log').open('w') as log:
+            subprocess.run([str(a.runner.resolve()), str(binary), str(out / 'inputs.txt'), str(out / 'norm')],
+                           env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+        actual = (np.fromfile(out / 'norm.0.bin', '<u2').astype('u4') << 16).view('f4').reshape(x.shape)
+        sq = x.astype('f8') ** 2
+        expected = x / np.sqrt((sq.mean(axis=1, keepdims=True) if kind == 'rms'
+                               else sq.sum(axis=1, keepdims=True)) + 1e-6) * gamma
+        row_error = np.linalg.norm(actual - expected, axis=1) / np.maximum(np.linalg.norm(expected, axis=1), 1e-30)
+        assert np.isfinite(actual).all() and row_error.max() < .012, (kind, row_error)
+        results.append(dict(kind=kind, rows=16, external_partial_tile=True,
+                            max_row_nrmse=float(row_error.max())))
     # Exercise a reshaped native producer, not just an externally packed
     # L2 input. Distinct groups detect head/token address permutations.
     for width, groups, eps, scale in ((32, 4, .25, .37), (128, 2, 1e-6, 1.)):

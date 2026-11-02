@@ -233,7 +233,7 @@ InstructionRow decode_3d(
             ftlpu::isa::decode_mxm_load_icu_3d_instruction(
                 packet_at<ftlpu::isa::EncodedMxmLoadIcu3DPacket>(queue, pc));
         row.loop = instruction.loop;
-        row.opcode = instruction.opcode == ftlpu::MxmLoadIcuOpcode::DecodeLoadActivation3D
+        row.opcode = instruction.opcode == ftlpu::MxmLoadIcuOpcode::IsLoadActivation3D
             ? "DECODE_LOAD_ACTIVATION_3D" : instruction.opcode == ftlpu::MxmLoadIcuOpcode::LoadColumn3D
             ? "LOAD_COLUMN_3D" : "LOAD_3D";
         details << "weight_buffer_base=" << instruction.weight_buffer_base
@@ -267,7 +267,7 @@ InstructionRow decode_3d(
         row.loop = instruction.loop;
         row.opcode = instruction.opcode
                     == ftlpu::MxmComputeIcuOpcode::Compute3D
-            ? "COMPUTE_3D" : instruction.opcode == ftlpu::MxmComputeIcuOpcode::DecodeStreamCompute3D
+            ? "COMPUTE_3D" : instruction.opcode == ftlpu::MxmComputeIcuOpcode::IsStreamCompute3D
                 ? "DECODE_STREAM_COMPUTE_3D" : "ACCUMULATOR_READ_3D";
         details << "weight_buffer_base=" << instruction.weight_buffer_base
                 << " weight_buffer_mode="

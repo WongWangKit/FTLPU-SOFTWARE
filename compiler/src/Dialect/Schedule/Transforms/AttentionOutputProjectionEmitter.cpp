@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 
 #include "AttentionEmitterUtils.hpp"
+#include "ProjectionGemmSchedule.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 
@@ -335,41 +336,17 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
           mxmReductionInterval, outputGroups, outerGroupInterval,
           functionArgumentIndex(op_.getOutputWeight()));
 
-      MxmDomain3D loadDomain;
-      loadDomain.repeat_count = weightLoadCycles;
-      loadDomain.repeat_interval = 1;
-      loadDomain.repeat_weight_column_stride = columnLoad ? 1 : -1;
-      loadDomain.wave_count = reductionBlocks;
-      loadDomain.wave_interval = mxmReductionInterval;
-      loadDomain.group_count = outputGroups;
-      loadDomain.group_interval = outerGroupInterval;
-      loadDomain.weight_buffer_mode = "toggle_dim1";
-      emitMxm3D(
-          rewriter_, op_.getLoc(), loadCycle + loadToIw,
+      const projection_detail::ProjectionGemmSchedule gemm{
+          projectionRows, reductionBlocks, outputGroups,
+          mxmReductionInterval, outerGroupInterval};
+      const projection_detail::ProjectionGemmSchedule::Binding gemmBinding{
           hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
-          "iw", 0, columnLoad ? 0 : weightLoadCycles - 1, 0, 0, 0, 1, "stream", true,
-          columnLoad ? "column" : "supercell", 0, dataFormat, "int8_dequant_bf16",
-          llvm::StringRef{}, loadDomain, weightStreamBase);
-
-      MxmDomain3D computeDomain;
-      computeDomain.repeat_count = projectionRows;
-      computeDomain.repeat_interval = 1;
-      computeDomain.wave_count = reductionBlocks;
-      computeDomain.wave_interval = mxmReductionInterval;
-      computeDomain.group_count = outputGroups;
-      computeDomain.group_interval = outerGroupInterval;
-      computeDomain.weight_buffer_mode = "toggle_dim1";
-      computeDomain.terminal_dimension = 1;
-      computeDomain.terminal_accumulator_destination = "stream";
-      computeDomain.terminal_accumulator_clear = true;
-      computeDomain.terminal_accumulator_output_format = dataFormat;
-      emitMxm3D(
-          rewriter_, op_.getLoc(), base.firstComputeCycles[0],
-          hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
-          "compute", 0, 0, hemisphere * 2, 0,
-          accumulatorAddress(0), 1, "sram", false,
-          "supercell", 0, dataFormat, llvm::StringRef{}, "fp32",
-          computeDomain);
+          0, hemisphere * 2, 0, accumulatorAddress(0), dataFormat};
+      gemm.emitLoad(rewriter_, op_.getLoc(), loadCycle + loadToIw,
+          gemmBinding, weightLoadCycles, columnLoad, "int8_dequant_bf16",
+          weightStreamBase);
+      gemm.emitCompute(rewriter_, op_.getLoc(), base.firstComputeCycles[0],
+          gemmBinding);
     }
   }
 
@@ -739,7 +716,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
               rewriter_, op_.getLoc(), loadCycle + loadToIw,
               hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
               "iw", weightBuffer, columnLoad ? 0 : weightLoadCycles - 1, 0, 0, 0, 1, "stream", true,
-              columnLoad ? "column" : "supercell", 0, dataFormat,
+              columnLoad ? "vector" : "block", 0, dataFormat,
               localDequant ? "int8_dequant_bf16" : llvm::StringRef{},
               llvm::StringRef{}, loadDomain,
               localDequant ? weightStreamBase : -1);
@@ -782,7 +759,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
               hemisphere * target_.throughput().mxms_per_hemisphere + localMxm,
               "compute", weightBuffer, 0, hemisphere * 2, 0,
               accumulatorAddress(0), 1, finalOnly ? "stream" : "sram",
-              finalOnly, "supercell", 0, dataFormat, llvm::StringRef{},
+              finalOnly, "block", 0, dataFormat, llvm::StringRef{},
               finalOnly ? dataFormat : "fp32", computeDomain);
         }
 

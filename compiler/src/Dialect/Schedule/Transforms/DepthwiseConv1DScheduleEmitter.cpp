@@ -125,7 +125,13 @@ mlir::LogicalResult lowerFixedChain(mlir::IRRewriter& rewriter,
     const auto physical=[&](mlir::DictionaryAttr p){return mirror && mirror.getValue()?flip(p):p;};
     const auto input=physical(placement(op.getInputAllocations()));
     const auto weight=physical(placement(op.getWeightAllocations()));
-    const auto window=physical(placement(op.getScratchAllocations(),0));
+    const auto nativeWords=op->getAttrOfType<mlir::ArrayAttr>("native_window_words");
+    // Graph ingress can place the causal window directly on the chain's
+    // input hemisphere. Do not copy it again to an identical planar layout.
+    const bool directInput = nativeWords || function->hasAttr("ftlpu.depthwise_conv_direct_input")
+        || (isWest(input) == isWest(weight)
+            && input.getAs<mlir::StringAttr>("kind").getValue() == "fp16_pair_planar");
+    const auto window=directInput ? input : physical(placement(op.getScratchAllocations(),0));
     // A chain drains to the opposite hemisphere. The next SiLU chain brings
     // the result back; no explicit-SR FP32 carriers or ALU crossbars are used.
     const auto partial=physical(placement(op.getScratchAllocations(),1));
@@ -150,6 +156,27 @@ mlir::LogicalResult lowerFixedChain(mlir::IRRewriter& rewriter,
         }
     };
     int64_t cursor=64;
+    if(nativeWords) {
+        if(nativeWords.size()!=tokens*blocks) return op.emitError("invalid native Conv window");
+        int64_t copied=0;
+        for(int64_t i=0;i<tokens*blocks;++i) {
+            auto word=llvm::cast<mlir::DictionaryAttr>(nativeWords[i]);
+            auto source=word.getAs<mlir::DictionaryAttr>("placement");
+            if(isWest(source)==isWest(window) ||
+                source.getAs<mlir::StringAttr>("hemisphere").getValue()=="both") continue;
+            for(int64_t byte=0;byte<2;++byte) {
+                const int64_t latency=sliceAt(source,byte)/4+sliceAt(window,byte)/4+2;
+                mem(source,byte,cursor+copied,false,word.getAs<mlir::IntegerAttr>("row").getInt(),52+byte);
+                mem(window,byte,cursor+copied+latency,true,i,20+byte);
+            }
+            ++copied;
+        }
+        // Paired chains share one VXM ICU configuration. Reserve the same
+        // local SR ingress phase on both sides; one side's history transfer
+        // must finish before the other side reads that MEM queue for MACs.
+        cursor+=tokens*blocks+2*((target.memory().slices_per_hemisphere-1)/4)+2+32;
+    }
+    if (!directInput) {
     for(int64_t byte=0;byte<2;++byte){
         const auto sg=sliceAt(input,byte)/4,dg=sliceAt(window,byte)/4;
         const bool cross=isWest(input)!=isWest(window);
@@ -161,6 +188,9 @@ mlir::LogicalResult lowerFixedChain(mlir::IRRewriter& rewriter,
         mem(window,byte,cursor+latency,true,0,writeStream,tokens*blocks);
     }
     cursor+=tokens*blocks+96;
+    }
+    if (isWest(window) != isWest(weight))
+        return op.emitError("fixed-chain Conv input and weights must share a hemisphere");
     const auto vxm=[&](int64_t time,int64_t queue,llvm::StringRef opcode,
         llvm::StringRef lhs,llvm::StringRef rhs,int64_t count,bool reset,bool acc,bool emit,
         int64_t depth=2,float immediate=0.f){
@@ -181,8 +211,23 @@ mlir::LogicalResult lowerFixedChain(mlir::IRRewriter& rewriter,
             const auto first=std::max<int64_t>(0,3-token),count=4-first;
             for(int64_t tap=first;tap<4;++tap)for(int64_t byte=0;byte<2;++byte){
                 const auto phase=cursor+tap-first-1;
-                mem(window,byte,phase-sliceAt(window,byte)/4,false,
-                    block*tokens+token+tap-3,32+int64_t(isWest(window))*16+byte);
+                auto source=window;
+                int64_t address=block*tokens+token+tap-3;
+                if(nativeWords) {
+                    auto word=llvm::cast<mlir::DictionaryAttr>(nativeWords[address]);
+                    auto candidate=word.getAs<mlir::DictionaryAttr>("placement");
+                    if(candidate.getAs<mlir::StringAttr>("hemisphere").getValue()=="both") {
+                        mlir::NamedAttrList local(candidate);
+                        local.set("hemisphere",rewriter.getStringAttr(isWest(window)?"west":"east"));
+                        candidate=local.getDictionary(rewriter.getContext());
+                    }
+                    if(isWest(candidate)==isWest(window)) {
+                        source=candidate;
+                        address=word.getAs<mlir::IntegerAttr>("row").getInt();
+                    }
+                }
+                mem(source,byte,phase-sliceAt(source,byte)/4,false,
+                    address,32+int64_t(isWest(window))*16+byte);
                 mem(weight,2*tap+byte,phase-sliceAt(weight,2*tap+byte)/4,false,
                     tap*blocks+block,32+int64_t(isWest(weight))*16+2+byte);
             }
@@ -193,13 +238,26 @@ mlir::LogicalResult lowerFixedChain(mlir::IRRewriter& rewriter,
             for(int64_t byte=0;byte<2;++byte)
                 mem(partial,byte,cursor+count+2+sliceAt(partial,byte)/4,true,
                     block*tokens+token,int64_t(isWest(weight))*8+byte);
-            cursor+=count+48;
+            // The next token resets the accumulator after the previous token's
+            // final tap. Independent window/weight reads and partial writes
+            // do not require a full MEM round trip between outputs.
+            // Three accumulator configurations consume nine iMEM words.
+            // Reserve nine cycles for a full four-tap output, rather than
+            // draining the entire MEM/VXM path between independent tokens.
+            cursor+=count+5;
         }
-        cursor+=64;
-        drain("imem.drain.conv.chain.block"+std::to_string(block),begin,cursor);
-        // The next domain's MEM reads precede its VXM configuration. Keep
-        // them after the reload boundary, including the farthest MEM group.
-        cursor+=32;
+        // C1 needs at most three 3-word configurations per output. 128
+        // outputs fit in its 2048-word iMEM with room for queue setup;
+        // grouping blocks avoids a reload after every 32-token feature word.
+        const int64_t blocksPerEpoch=std::max<int64_t>(1,128/tokens);
+        if ((block+1)%blocksPerEpoch==0 || block+1==blocks) {
+            // Drain the last MAC and the furthest MEM write, then prelaunch
+            // the next block's reads by their slice-to-VXM flight distance.
+            cursor+=24;
+            drain("imem.drain.conv.chain.block"+std::to_string(block),begin,cursor);
+            // Earliest MEM read must remain after the reload boundary.
+            cursor+=16;
+        }
     }
     const auto start=cursor;
     const auto count=tokens*blocks;

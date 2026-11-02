@@ -4,7 +4,9 @@
 #include "ftlpu/compiler/Support/float_format.hpp"
 #include "DirectDomainEmitterUtils.hpp"
 #include "FfnEmitterUtils.hpp"
+#include "AttentionEmitterUtils.hpp"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/APFloat.h"
 #include <algorithm>
 
 namespace ftlpu::compiler::schedule {
@@ -37,6 +39,9 @@ struct Storage {
     bool west = false;
     int64_t base = 0;
     bool both = false;
+    bool tokenPartition = false;
+    int64_t broadcastRowRepeat = 0;
+    int64_t broadcastHeadBase = 0;
 };
 
 Storage storageOf(mlir::DictionaryAttr p)
@@ -45,8 +50,15 @@ Storage storageOf(mlir::DictionaryAttr p)
         p.getAs<mlir::IntegerAttr>("bank").getInt(),
         p.getAs<mlir::StringAttr>("hemisphere").getValue() == "west",
         p.getAs<mlir::IntegerAttr>("base_row").getInt(),
-        p.getAs<mlir::StringAttr>("hemisphere").getValue() == "both"};
+        p.getAs<mlir::StringAttr>("hemisphere").getValue() == "both",
+        p.getAs<mlir::StringAttr>("kind").getValue() == "token_partition_planar",
+        p.getAs<mlir::IntegerAttr>("broadcast_row_repeat") ? p.getAs<mlir::IntegerAttr>("broadcast_row_repeat").getInt() : 0,
+        p.getAs<mlir::IntegerAttr>("broadcast_head_base") ? p.getAs<mlir::IntegerAttr>("broadcast_head_base").getInt() : 0};
 }
+
+#include "ScaledMatvecEmitter.hpp"
+#include "SiluMultiplyEmitter.hpp"
+#include "WeightedGramEmitter.hpp"
 
 // One streamed head followed by immediate operations. Keep multi-use values
 // and quantizing edges as boundaries. This plan also determines SRAM lifetimes:
@@ -57,19 +69,23 @@ llvm::SmallVector<int64_t> chainColumns(llvm::ArrayRef<kernel::VectorAluOp> ops,
     const auto columnFor = [](kernel::VectorAluOp op, int64_t first) {
         const auto kind = op.getKind();
         const int64_t residue = kind == "exp" ? 1
-            : kind == "reciprocal" || kind == "rsqrt" ? 3 : -1;
+            : kind == "reciprocal" || kind == "rsqrt" || kind == "log" ? 3 : -1;
         while (residue >= 0 && first % 4 != residue) ++first;
         return first;
     };
     auto head = ops.front();
     const bool fixed = head->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill");
+    const auto tokenPolicy=head->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_bf16_token_halves");
+    const bool originalChain=fixed && tokenPolicy && tokenPolicy.getValue();
     llvm::SmallVector<int64_t> columns{columnFor(head,
         fixed && !head.getUseImmediate() && head.getLhs()==head.getRhs()?1:0)};
+    if (head.getKind()=="cumsum_rows" || head.getKind()=="causal_exp_difference" || head.getKind()=="weighted_gram") return columns;
     while (packed && !head.getReduce() && columns.size() < ops.size()) {
         auto prior = ops[columns.size() - 1];
         auto next = ops[columns.size()];
         const int64_t column = columnFor(next, columns.back() + 1);
-        if (column >= 7 || next.getReduce() || !next.getUseImmediate()
+        if (column >= 7 || next.getReduce() || next.getKind()=="cumsum_rows" || next.getKind()=="causal_exp_difference" || next.getKind()=="weighted_gram"
+            || (!next.getUseImmediate() && !(originalChain && next.getRhs()==head.getLhs()))
             || next.getLhs() != prior.getResult()
             || !prior.getResult().getType().getElementType().isF32()
             || !llvm::all_of(prior.getResult().getUsers(), [&](auto *user) {
@@ -85,6 +101,7 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
     Storage rhsStorage, Storage outStorage, bool packed, int64_t queueBase,
     llvm::ArrayRef<kernel::VectorAluOp> chain, llvm::ArrayRef<int64_t> columns)
 {
+    if(op.getKind()=="weighted_gram") return emitWeightedGram(r,op,target);
     const auto lhsType = op.getLhs().getType();
     const auto rhsType = op.getRhs().getType();
     auto tail = chain.back();
@@ -111,6 +128,9 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
             r.getNamedAttr("placement", [&] {
                 mlir::NamedAttrList a(placement(r, type, storage.slice, storage.both ? "both" : storage.west ? "west" : "east", storage.bank, packed, wordElements));
                 a.set("base_row", r.getI64IntegerAttr(storage.base));
+                if(storage.broadcastRowRepeat)
+                    a.set("instruction_count",r.getI64IntegerAttr(storage.broadcastHeadBase+type.getDimSize(0)/storage.broadcastRowRepeat));
+                if(storage.tokenPartition) a.set("kind",r.getStringAttr("token_partition_planar"));
                 return a.getDictionary(r.getContext());
             }()),
         });
@@ -127,6 +147,180 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
     bindInput(op.getLhs(), lhsType, lhsStorage);
     if (op.getRhs() != op.getLhs())
         bindInput(op.getRhs(), rhsType, rhsStorage);
+    const auto fp32Attr=op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_fp32_ingress");
+    const bool fp32Ingress=fp32Attr && fp32Attr.getValue();
+    if (op.getKind()=="causal_exp_difference") {
+        const auto transpose=op->getAttrOfType<mlir::BoolAttr>("transpose_result");
+        const bool directTranspose=transpose && transpose.getValue();
+        const auto scaleAttr=op->getAttrOfType<mlir::BoolAttr>("row_scale");
+        const bool rowScale=scaleAttr && scaleAttr.getValue();
+        const auto strictAttr=op->getAttrOfType<mlir::BoolAttr>("strict_lower");
+        const bool strict=strictAttr && strictAttr.getValue();
+        if(rowScale && (!rhsStorage.both || rhsStorage.tokenPartition))
+            return op.emitError("scaled causal difference requires native mirrored row coefficients");
+        const auto wide=op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
+        if(directTranspose && (!wide || !wide.getValue()))
+            return op.emitError("transposed causal difference requires wide SXM");
+        if (!packed || packedColumns!=1 || !lhsStorage.both || !outStorage.both ||
+            lhsStorage.tokenPartition || outStorage.tokenPartition ||
+            !op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill"))
+            return op.emitError("causal_exp_difference requires mirrored packed BF16 ingress and full row domains");
+        const bool fullInput=fp32Ingress && lhsType.getElementType().isF32();
+        const int64_t tokens=lhsType.getDimSize(0), first=lhsType.getElementType().isF32() && !fullInput?2:0;
+        const int64_t begin=96, pitch=tokens+24;
+        int64_t transposeEnd=begin;
+        const auto read=[&](int64_t issue,int64_t row,int64_t port,int64_t count) {
+            for(int64_t side=0;side<2;++side) for(int64_t byte=0;byte<(fullInput?4:2);++byte) {
+                const auto slice=lhsStorage.slice+first+byte;
+                direct_domain_detail::emitMem3D(r,op.getLoc(),target,issue-slice/4,
+                    side*target.memory().slices_per_hemisphere+slice,"read",lhsStorage.base+row,
+                    32+side*16+port+byte,count,1,1,1,1,0,1,1,0,-1,lhsStorage.bank);
+            }
+        };
+        const auto write=[&](int64_t issue,int64_t row,int64_t count) {
+            for(int64_t side=0;side<2;++side) for(int64_t byte=0;byte<4;++byte) {
+                const auto slice=outStorage.slice+byte;
+                direct_domain_detail::emitMem3D(r,op.getLoc(),target,issue+slice/4,
+                    side*target.memory().slices_per_hemisphere+slice,"write",outStorage.base+row,
+                    (1-side)*8+6+byte,count,1,1,1,1,0,1,1,0,-1,outStorage.bank);
+            }
+        };
+        for(int64_t i=0;i<tokens;++i) {
+            const int64_t latch=begin+i*pitch, compute=latch+2, lower=i+(strict?0:1);
+            if(rowScale) {
+                // One head-vector per row enters C0 and is latched in C7.
+                // It is reused for all j without an expanded broadcast table.
+                const bool fullScale=fp32Ingress && rhsType.getElementType().isF32();
+                const int64_t loadAt=latch-10, plane=rhsType.getElementType().isF32() && !fullScale?2:0;
+                for(int64_t side=0;side<2;++side) for(int64_t byte=0;byte<(fullScale?4:2);++byte) {
+                    const auto slice=rhsStorage.slice+plane+byte;
+                    direct_domain_detail::emitMem3D(r,op.getLoc(),target,loadAt-slice/4,
+                        side*target.memory().slices_per_hemisphere+slice,"read",rhsStorage.base+i,
+                        32+side*16+byte,1,1,0,1,1,0,1,1,0,-1,rhsStorage.bank);
+                }
+                for(int64_t column=0;column<8;++column) {
+                    auto loadScale=ffn_detail::create_vxm(r,op.getLoc(),op.getRhs(),op.getRhs(),outType,
+                        loadAt,column,column==7?"add":"bypass",column?"previous":fullScale?"stream_f32":"stream_bf16",0,0.f,
+                        column==7?"accumulator":"immediate",0,0.f,"fp32",-1,
+                        1,1,"east","east",-1,column==7,column==7,column!=7,false,8);
+                    if(column==0) loadScale->setAttr("lhs_stream_source",r.getStringAttr("local"));
+                }
+            }
+            // The same MEM queue loads Gi once, then streams Gj. C1's FP32
+            // accumulator holds Gi; no expanded broadcast or difference spill.
+            read(latch,i,0,1);
+            auto load=ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getLhs(),outType,
+                latch,0,"bypass",fullInput?"stream_f32":"stream_bf16",0,0.f,"immediate",0,0.f,"fp32",-1,
+                1,1,"east","east",-1,false,false,true,false,8);
+            load->setAttr("lhs_stream_source",r.getStringAttr("local"));
+            ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getLhs(),outType,
+                latch,1,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",-1,
+                1,1,"east","east",-1,true,true,false,false,8);
+            if(lower>0) {
+            read(compute,0,0,lower);
+            auto negative=ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getLhs(),outType,
+                compute,0,"negate",fullInput?"stream_f32":"stream_bf16",0,0.f,"immediate",0,0.f,"fp32",-1,
+                lower,1,"east","east",-1,false,false,true,false,8);
+            negative->setAttr("lhs_stream_source",r.getStringAttr("local"));
+            for(int64_t column=1;column<8;++column)
+                ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getLhs(),outType,
+                    compute,column,column==1?"add":column==5?"exp":column==7 && rowScale?"multiply":"bypass","previous",0,0.f,
+                    (column==1 || (column==7 && rowScale))?"accumulator":"immediate",0,0.f,"fp32",column==7?6:-1,
+                    lower,1,"east","east",-1,false,false,true,false,8);
+            if(!directTranspose) write(compute+13+rowScale,i*tokens,lower);
+            }
+            if(lower<tokens) {
+                // Drain the special-ALU pipeline before the fast zero path.
+                // Avoid exp(positive upper-triangle differences) and inf*0.
+                // Exp and the fast zero path must produce adjacent vectors
+                // when the downstream wide SXM captures an entire row tile.
+                const int64_t zero=compute+lower+(directTranspose?4:5)+rowScale;
+                for(int64_t column=0;column<8;++column)
+                    ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getLhs(),outType,
+                        zero,column,"bypass",column?"previous":"immediate",0,0.f,"immediate",0,0.f,
+                        "fp32",column==7?6:-1,tokens-lower,1,"east","east",-1,false,false,true,false,8);
+                if(!directTranspose) write(zero+9,i*tokens+lower,tokens-lower);
+            }
+            if(directTranspose && i==0) {
+                const int64_t heads=lhsType.getDimSize(1);
+                const int64_t capture=compute+12+rowScale+*target.transport_latency(
+                    target::StreamEndpoint::VxmResult,target::StreamEndpoint::SxmInput,
+                    target::StreamDirection::East,0);
+                llvm::SmallVector<int64_t> map;
+                for(int64_t j=0;j<32;++j)map.push_back(j);
+                for(int64_t side=0;side<2;++side) {
+                    // Upper FP32 byte planes preserve the exact truncation
+                    // formerly performed on the consumer's BF16 MEM read.
+                    const int64_t stream=(1-side)*8+8;
+                    // G continues to arrive on reverse port 0 while SXM
+                    // drains. Reserve reverse ports 4/5 for transposed R.
+                    attention_detail::emitSxm(r,op.getLoc(),capture,side,"transpose",
+                        {stream,stream+1},{36,37},map,"wide_matrix",-1,-1,-1,tokens,pitch);
+                    for(int64_t byte=0;byte<2;++byte) {
+                        const auto slice=outStorage.slice+byte;
+                        const int64_t at=capture+35+*target.transport_latency(
+                            target::StreamEndpoint::SxmResult,target::StreamEndpoint::Mem,
+                            target::StreamDirection::West,slice);
+                        direct_domain_detail::emitMem3D(r,op.getLoc(),target,at,
+                            side*target.memory().slices_per_hemisphere+slice,"write",
+                            outStorage.base,36+byte,heads,1,1,tokens,pitch,heads,1,1,0,-1,outStorage.bank);
+                        transposeEnd=std::max(transposeEnd,at+(tokens-1)*pitch+32+4);
+                    }
+                }
+            }
+        }
+        mlir::OperationState timeline(op.getLoc(),TimelineOp::getOperationName());
+        timeline.addAttribute("name",r.getStringAttr(rowScale?"causal_exp_difference.scaled_strict_vxm_sxm":directTranspose?"causal_exp_difference.vxm_sxm_direct":"causal_exp_difference.accumulator_exp"));
+        timeline.addAttribute("start",r.getI64IntegerAttr(begin));
+        timeline.addAttribute("end",r.getI64IntegerAttr(std::max(transposeEnd,begin+tokens*pitch+(outStorage.slice+3)/4)));
+        r.create(timeline);
+        auto result=bind({},outType,0,"output",outStorage);
+        r.replaceOp(op,result.getValue());
+        return mlir::success();
+    }
+    if (op.getKind()=="cumsum_rows") {
+        // Scan tokens in time, independently per lane. The accumulator stays
+        // FP32 for the complete scan; only MEM ingress consumes BF16 planes.
+        // Never split the token sequence into independent hemisphere halves.
+        if (!packed || packedColumns!=1 || !lhsStorage.both || !outStorage.both ||
+            !op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill"))
+            return op.emitError("cumsum_rows lowering requires mirrored packed fixed-port BF16 ingress");
+        const int64_t count=lhsType.getDimSize(0), start=96;
+        const bool fullInput=fp32Ingress && lhsType.getElementType().isF32();
+        const int64_t first=lhsType.getElementType().isF32() && !fullInput?2:0;
+        for(int64_t side=0;side<2;++side) {
+            for(int64_t byte=0;byte<(fullInput?4:2);++byte) {
+                const auto slice=lhsStorage.slice+first+byte;
+                direct_domain_detail::emitMem3D(r,op.getLoc(),target,start-1-slice/4,
+                    side*target.memory().slices_per_hemisphere+slice,"read",lhsStorage.base,
+                    32+side*16+byte,count,1,1,1,1,0,1,1,0,-1,lhsStorage.bank);
+            }
+            for(int64_t byte=0;byte<4;++byte) {
+                const auto slice=outStorage.slice+byte;
+                direct_domain_detail::emitMem3D(r,op.getLoc(),target,start+2+slice/4,
+                    side*target.memory().slices_per_hemisphere+slice,"write",outStorage.base,
+                    (1-side)*8+byte,count,1,1,1,1,0,1,1,0,-1,outStorage.bank);
+            }
+        }
+        auto input=ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
+            start-1,0,"bypass",fullInput?"stream_f32":"stream_bf16",0,0.f,"immediate",0,0.f,"fp32",-1,
+            count,1,"east","east",-1,false,false,true,false,2);
+        input->setAttr("lhs_stream_source",r.getStringAttr("local"));
+        ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
+            start-1,1,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",0,
+            1,1,"east","east",-1,true,true,true,false,2);
+        if(count>1) ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
+            start,1,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",0,
+            count-1,1,"east","east",-1,false,true,true,false,2);
+        mlir::OperationState timeline(op.getLoc(),TimelineOp::getOperationName());
+        timeline.addAttribute("name",r.getStringAttr("cumsum_rows.fp32_accumulator"));
+        timeline.addAttribute("start",r.getI64IntegerAttr(start-1));
+        timeline.addAttribute("end",r.getI64IntegerAttr(start+2+outStorage.slice/4+count));
+        r.create(timeline);
+        auto result=bind({},outType,0,"output",outStorage);
+        r.replaceOp(op,result.getValue());
+        return mlir::success();
+    }
     if (op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill")) {
         if (!packed || op.getReduce() || !lhsStorage.both || !outStorage.both
             || (!op.getUseImmediate() && !rhsStorage.both))
@@ -137,21 +331,80 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
         // FP32 interface buffers retain their four-plane ABI. Only the upper
         // two planes are consumed at a chain head, explicitly truncating to
         // BF16; all arithmetic inside a chain remains FP32.
-        const int64_t start=96, count=storageWords;
+        const auto partitionPolicy = op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_bf16_token_halves");
+        const bool partition = partitionPolicy && partitionPolicy.getValue()
+            && lhsType.getDimSize(0) == 32 && packedColumns == 1;
+        const int64_t half = lhsType.getDimSize(0) / 2;
+        const auto phaseOf = [](mlir::Value value) -> int64_t {
+            auto *owner = value.getDefiningOp();
+            if (!owner || owner->hasAttr("token_mirrored")) return -1;
+            auto phase = owner->getAttrOfType<mlir::IntegerAttr>("token_phase");
+            return phase ? phase.getInt() : -1;
+        };
+        const int64_t lhsPhase = lhsStorage.tokenPartition ? 1 : phaseOf(op.getLhs());
+        const int64_t phase = lhsPhase < 0 ? 0 : lhsPhase;
+        int64_t start = 96;
+        // Fill only an operand's missing token half when two DAG branches
+        // arrive with opposite native VXM output orientations. This is passive
+        // SR traffic, not repeated arithmetic, and is reused by later consumers.
+        const auto mirrorValue = [&](Storage st, mlir::RankedTensorType type,
+                                     int64_t valuePhase, int64_t begin) {
+            int64_t cursor = begin;
+            for (int64_t side=0; side<2; ++side) {
+                int64_t drain=cursor;
+                const int64_t row=st.base+(side==valuePhase?0:half);
+                for(int64_t byte=0; byte<(type.getElementType().isF32()?4:2); ++byte) {
+                    const int64_t slice=st.slice+byte, latency=2*(slice/4)+2;
+                    direct_domain_detail::emitMem3D(r,op.getLoc(),target,cursor,
+                        side*target.memory().slices_per_hemisphere+slice,"read",row,48+byte,
+                        half,1,1,1,1,0,1,1,0,-1,st.bank);
+                    direct_domain_detail::emitMem3D(r,op.getLoc(),target,cursor+latency,
+                        (1-side)*target.memory().slices_per_hemisphere+slice,"write",row,16+byte,
+                        half,1,1,1,1,0,1,1,0,-1,st.bank);
+                    drain=std::max(drain,cursor+latency+half+1);
+                }
+                cursor=drain;
+            }
+            return cursor;
+        };
+        if (partition && !op.getUseImmediate() && op.getRhs()!=op.getLhs()
+            && rhsType.getDimSize(0)>1) {
+            const int64_t rhsPhase=rhsStorage.tokenPartition ? 1 : phaseOf(op.getRhs());
+            if(rhsPhase>=0 && rhsPhase!=phase) {
+                if(rhsStorage.tokenPartition) return op.emitError("compact partition operand requires matching token orientation");
+                start=mirrorValue(rhsStorage,rhsType,rhsPhase,start)+32;
+                op.getRhs().getDefiningOp()->setAttr("token_mirrored",r.getUnitAttr());
+            }
+        }
+        const int64_t count=partition?half:storageWords;
+        const bool fullLhs=fp32Ingress && lhsType.getElementType().isF32();
+        const bool fullRhs=fp32Ingress && rhsType.getElementType().isF32();
+        if(fullLhs && !op.getUseImmediate() && op.getLhs()!=op.getRhs() && !fullRhs)
+            return op.emitError("mixed FP32 lhs and narrow rhs share fixed input bytes; legalize operands to the same input format");
+        const int64_t rhsPort=fullRhs?4:2;
         const auto readFixed=[&](mlir::RankedTensorType type,Storage st,int64_t port,bool broadcast) {
-            const int64_t offset=type.getElementType().isF32()?2:0;
-            for(int64_t side=0;side<2;++side)for(int64_t byte=0;byte<2;++byte) {
+            const bool full=fp32Ingress && type.getElementType().isF32();
+            const int64_t offset=type.getElementType().isF32() && !full?2:0;
+            for(int64_t side=0;side<2;++side)for(int64_t byte=0;byte<(full?4:2);++byte) {
                 const auto slice=st.slice+offset+byte;
+                if(st.broadcastRowRepeat) {
+                    const int64_t heads=lhsType.getDimSize(0)/st.broadcastRowRepeat;
+                    direct_domain_detail::emitMem3D(r,op.getLoc(),target,start-1-slice/4,
+                        side*target.memory().slices_per_hemisphere+slice,"read",st.base+st.broadcastHeadBase,
+                        32+side*16+port+byte,st.broadcastRowRepeat,1,0,
+                        heads,st.broadcastRowRepeat,1,packedColumns,lhsType.getDimSize(0),0,-1,st.bank);
+                    continue;
+                }
                 direct_domain_detail::emitMem3D(r,op.getLoc(),target,start-1-slice/4,
-                    side*target.memory().slices_per_hemisphere+slice,"read",st.base,
-                    32+side*16+port+byte,lhsType.getDimSize(0),1,broadcast?0:1,
+                    side*target.memory().slices_per_hemisphere+slice,"read",st.base+(partition && !st.tokenPartition && !broadcast && side!=phase?half:0),
+                    32+side*16+port+byte,partition?half:lhsType.getDimSize(0),1,broadcast?0:1,
                     packedColumns,lhsType.getDimSize(0),type.getDimSize(0),1,1,0,-1,st.bank);
             }
         };
         readFixed(lhsType,lhsStorage,0,false);
         const bool same=op.getLhs()==op.getRhs();
         if(!op.getUseImmediate() && !same)
-            readFixed(rhsType,rhsStorage,2,rhsType.getDimSize(0)==1);
+            readFixed(rhsType,rhsStorage,rhsPort,rhsType.getDimSize(0)==1);
         int64_t latency=8;
         mlir::Value current=op.getLhs();
         for(int64_t col=0;col<8;++col) {
@@ -159,26 +412,44 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
             const bool arithmetic=at!=columns.end();
             auto member=arithmetic?chain[at-columns.begin()]:op;
             auto opcode=arithmetic?member.getKind():llvm::StringRef("bypass");
-            auto lhs=col?llvm::StringRef("previous"):llvm::StringRef("stream_bf16");
+            auto lhs=col?llvm::StringRef("previous"):llvm::StringRef(fullLhs?"stream_f32":"stream_bf16");
             auto rhs=arithmetic && !member.getUseImmediate()
-                ? (same?llvm::StringRef("original"):llvm::StringRef("stream_bf16"))
+                ? (member!=op || same?llvm::StringRef("original"):llvm::StringRef(fullRhs?"stream_f32":"stream_bf16"))
                 : llvm::StringRef("immediate");
-            latency+=opcode=="exp" || opcode=="reciprocal" || opcode=="rsqrt"?4:opcode=="multiply"?1:0;
+            latency+=opcode=="exp" || opcode=="reciprocal" || opcode=="rsqrt" || opcode=="log"?4:opcode=="multiply"?1:0;
             auto v=ffn_detail::create_vxm(r,op.getLoc(),current,current,outType,
-                start-1,col,opcode,lhs,0,0.f,rhs,rhs=="stream_bf16"?2:0,
+                start-1,col,opcode,lhs,0,0.f,rhs,(rhs=="stream_bf16" || rhs=="stream_f32")?rhsPort:0,
                 arithmetic?member.getImmediate().convertToFloat():0.f,
                 col==7?(outType.getElementType().isF32()?"fp32":"bf16"):"fp32",
                 col==7?6:-1,count,1,"east","west",-1,false,false,true,false,8);
+            if(fp32Ingress) {
+                if(lhs=="stream_f32" || lhs=="stream_bf16") v->setAttr("lhs_stream_source",r.getStringAttr("local"));
+                if(rhs=="stream_f32" || rhs=="stream_bf16") v->setAttr("rhs_stream_source",r.getStringAttr("local"));
+            }
             current=v.getResult();
         }
+        const bool returned = partition && llvm::all_of(tail.getResult().getUsers(),
+            [](mlir::Operation *user) { return llvm::isa<mlir::func::ReturnOp>(user); });
+        const bool exported = returned && op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_native_partition_outputs");
         for(int64_t side=0;side<2;++side)
             for(int64_t byte=0;byte<(outType.getElementType().isF32()?4:2);++byte) {
                 const auto slice=outStorage.slice+byte;
                 direct_domain_detail::emitMem3D(r,op.getLoc(),target,start+latency+slice/4,
-                    side*target.memory().slices_per_hemisphere+slice,"write",outStorage.base,
+                    side*target.memory().slices_per_hemisphere+slice,"write",outStorage.base+(partition && !exported && side==phase?half:0),
                     (1-side)*8+6+byte,count,1,1,1,1,0,1,1,0,-1,outStorage.bank);
             }
+        if(returned && !exported)
+            mirrorValue(outStorage,outType,1-phase,start+latency+(outStorage.slice+3)/4+count+2);
         auto result=bind({},outType,0,"output",outStorage);
+        if(returned && !exported) result->setAttr("token_mirrored",r.getUnitAttr());
+        if(partition) {
+            result->setAttr("token_phase",r.getI64IntegerAttr(1-phase));
+            if(exported) {
+                mlir::NamedAttrList layout(result.getPlacement());
+                layout.set("kind",r.getStringAttr(phase==0?"token_partition_planar":"token_partition_east_first_planar"));
+                result->setAttr("placement",layout.getDictionary(r.getContext()));
+            }
+        }
         r.replaceOp(tail,result.getValue());
         for(int64_t i=chain.size()-2;i>=0;--i)r.eraseOp(chain[i]);
         return mlir::success();
@@ -194,7 +465,7 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
     int64_t extraLatency = 0;
     for (auto member : chain) {
         const auto kind = member.getKind();
-        extraLatency += kind == "exp" || kind == "reciprocal" || kind == "rsqrt"
+        extraLatency += kind == "exp" || kind == "reciprocal" || kind == "rsqrt" || kind == "log"
             ? 4 : kind == "multiply" ? 1 : 0;
     }
     int64_t cursor = 96;
@@ -295,6 +566,7 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
 mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
     const target::LPUTargetModel& target)
 {
+    if (mlir::failed(planScaledMatvecMemory(function,target))) return mlir::failure();
     // Expand mathematical unary operators before storage planning. Importers
     // supply sigmoid/softplus semantics, never a hardware approximation or
     // instruction sequence. Every generated value is executed by VXM.
@@ -327,6 +599,30 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
             auto neg = alu("negate", x);
             auto exponential = alu("exp", neg);
             result = alu("reciprocal", alu("add", exponential, {}, 1.0f));
+        } else if (auto policy = function->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_log_softplus");
+                   policy && policy.getValue()) {
+            // Split t=exp(-abs(x)) at an exactly representable boundary.
+            // Log sees >=1+1/16, avoiding FP16 cancellation around 1.
+            // Its baseline is subtracted inside the chain before BF16 spill.
+            // Below the boundary use u-u^2/2+u^3/3 (absolute error <4e-6).
+            constexpr float boundary = 0.0625f;
+            // Commutative max keeps negate -> max(previous, Original) in
+            // one chain. No opposite-side spill/mirror is needed for abs(x).
+            auto absolute = alu("max", alu("negate", x), x);
+            auto exponential = alu("exp", alu("negate", absolute));
+            auto upper = alu("max", exponential, {}, boundary);
+            auto logarithm = alu("log", alu("add", upper, {}, 1.0f));
+            // The standard runtime LUT stores its baseline in FP16. Match
+            // that coefficient exactly so the clamped branch produces zero.
+            llvm::APFloat baseline(std::log1p(boundary));
+            bool losesInfo = false;
+            baseline.convert(llvm::APFloat::IEEEhalf(), llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+            auto large = alu("subtract", logarithm, {}, baseline.convertToFloat());
+            auto small = alu("negate", alu("max", alu("negate", exponential), {}, -boundary));
+            auto polynomial = alu("add", alu("multiply", small, {}, 1.0f/3), {}, -0.5f);
+            polynomial = alu("add", alu("multiply", polynomial, small), {}, 1.0f);
+            auto correction = alu("add", large, alu("multiply", polynomial, small));
+            result = alu("add", alu("max", x), correction);
         } else {
             // softplus(x) = max(x,0) + 2*atanh(t),
             // t = exp(-abs(x))/(2+exp(-abs(x))) in [0,1/3].
@@ -348,6 +644,8 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
     llvm::SmallVector<kernel::VectorAluOp> ops;
     function.walk([&](kernel::VectorAluOp op) { ops.push_back(op); });
     if (ops.empty()) return mlir::success();
+    if (function->hasAttr("ftlpu.vector_bf16_spill") && matchSiluMultiply(function))
+        function->setAttr("ftlpu.native_silu_multiply",mlir::UnitAttr::get(function.getContext()));
     // A graph-level plan is authoritative; repeated lowering must not reset it.
     if (llvm::any_of(ops, [](auto op) { return op->hasAttr("ftlpu.vector_result_placement"); })) {
         for (auto op : ops) {
@@ -382,10 +680,29 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
     mlir::IRRewriter r(function.getContext());
     const bool packed = llvm::all_of(ops, [&](auto op) {
         const auto lhs = op.getLhs().getType(), rhs = op.getRhs().getType();
+        if(op.getKind()=="weighted_gram") return true;
         return !op.getReduce() && (op.getUseImmediate()
             || (lhs.getDimSize(1) == rhs.getDimSize(1)
                 && (lhs.getDimSize(0) == rhs.getDimSize(0) || rhs.getDimSize(0) == 1)));
     });
+    // Quantize only existing spill boundaries, not values kept inside an ALU
+    // chain. A fixed BF16 input port must consume an actual RNE output rather
+    // than silently dropping the low planes of a stored FP32 intermediate.
+    const auto rneSpills = function->getParentOfType<mlir::ModuleOp>()
+        ->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_bf16_rne_spill");
+    if (function->hasAttr("ftlpu.vector_bf16_spill") && rneSpills && rneSpills.getValue()) {
+        for (std::size_t first=0; first<ops.size();) {
+            const auto columns=chainColumns(llvm::ArrayRef(ops).drop_front(first),packed);
+            auto value=ops[first+columns.size()-1].getResult();
+            const bool returned=llvm::any_of(value.getUsers(),[](auto *user) {
+                return llvm::isa<mlir::func::ReturnOp>(user);
+            });
+            auto type=llvm::cast<mlir::RankedTensorType>(value.getType());
+            if (!returned && type.getElementType().isF32())
+                value.setType(mlir::RankedTensorType::get(type.getShape(),r.getBF16Type()));
+            first+=columns.size();
+        }
+    }
     llvm::DenseMap<mlir::Value, Storage> storage;
     llvm::DenseMap<mlir::Value, int64_t> lastUse;
     for (auto [index, op] : llvm::enumerate(ops)) {
@@ -434,6 +751,18 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
         op->setAttr("ftlpu.vector_lhs_placement", plan(op.getLhs(), storage.lookup(op.getLhs())));
         op->setAttr("ftlpu.vector_rhs_placement", plan(op.getRhs(), storage.lookup(op.getRhs())));
         op->setAttr("ftlpu.vector_result_placement", plan(op.getResult(), output));
+        if(op.getKind()=="weighted_gram") {
+            mlir::NamedAttrList result(op->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_result_placement"));
+            // Return native head groups [even heads, odd heads]. Logical
+            // consumers can express the interleave as a tensor view rather
+            // than requiring a physical output archive.
+            result.set("kind",r.getStringAttr("token_partition_east_first_planar"));
+            op->setAttr("ftlpu.vector_result_placement",result.getDictionary(r.getContext()));
+            if(!op.getRhs().getType().getElementType().isBF16()) {
+                auto table=mlir::RankedTensorType::get({1024,32},r.getBF16Type());
+                op->setAttr("weighted_gram.r_table",placement(r,table,48,"both",0,true,32));
+            }
+        }
         op->setAttr("ftlpu.vector_packed", r.getBoolAttr(packed));
         storage[op.getResult()] = output;
         live.push_back({slot, lastUse.lookup(op.getResult())});
@@ -445,6 +774,10 @@ mlir::LogicalResult lowerVectorAluSchedules(mlir::IRRewriter& r,
     mlir::func::FuncOp function, const target::LPUTargetModel& target)
 {
     if (mlir::failed(planVectorAluMemory(function, target))) return mlir::failure();
+    if (mlir::failed(lowerScaledMatvecSchedules(r,function,target))) return mlir::failure();
+    if(function->hasAttr("native_pointwise_words_0"))
+        if(auto match=matchSiluMultiply(function))
+            return emitNativeSiluMultiply(r,function,target,*match);
     llvm::SmallVector<kernel::VectorAluOp> ops;
     function.walk([&](kernel::VectorAluOp op) { ops.push_back(op); });
     const auto queuePolicy = function->getAttrOfType<mlir::IntegerAttr>("ftlpu.vxm_queue_base");

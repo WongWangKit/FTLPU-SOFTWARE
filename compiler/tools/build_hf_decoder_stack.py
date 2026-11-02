@@ -123,7 +123,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--mxm-execution",
-        choices=("auto", "vector", "legacy"),
+        choices=("auto", "ws", "is"),
         default="auto",
         help="MXM projection execution policy for every decoder variant",
     )

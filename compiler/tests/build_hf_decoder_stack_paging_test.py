@@ -84,7 +84,7 @@ def main() -> None:
                 "--target-config", str(root / "target.json"),
                 "--pack-model-weights", str(root / "pack_weights"),
                 "--c2c-weight-paging",
-                "--mxm-execution", "vector",
+                "--mxm-execution", "ws",
                 "--layer-count", "2",
                 "--seq-len", "128",
                 "--kv-cache-capacity", "256",

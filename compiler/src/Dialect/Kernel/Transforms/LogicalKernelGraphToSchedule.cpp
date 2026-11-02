@@ -86,7 +86,7 @@ bool overlap(mlir::DictionaryAttr a, mlir::DictionaryAttr b) {
   if (text(a, "hemisphere") != text(b, "hemisphere") &&
       text(a, "hemisphere") != "both" && text(b, "hemisphere") != "both")
     return false;
-  if (field(a, "bank") != field(b, "bank"))
+  if (!field(a,"bank_tile_rows") && !field(b,"bank_tile_rows") && field(a, "bank") != field(b, "bank"))
     return false;
   for (I s : slices(a))
     if (contains(slices(b), s))
@@ -277,6 +277,7 @@ public:
   bool hasAttention = false;
   bool retainedAcrossFfn = false;
   bool distributedConvOutput = false;
+  I decodeHeadWidth = 0, decodeConvWidth = 0;
   std::vector<Node> nodes;
   Planner(mlir::MLIRContext &c, fc::target::LPUTargetModel t)
       : context(c), target(t) {}
@@ -307,6 +308,12 @@ public:
     if (attention)
       (*n.module)->setAttr("ftlpu.runtime_weight_pages", mlir::BoolAttr::get(&context, true));
     n.function = *n.module->getOps<mlir::func::FuncOp>().begin();
+    if(source.find("ftlpu.kernel.rms_norm")!=std::string::npos && !n.inputs.empty()
+        && !n.inputs[0].refs.empty()
+        && llvm::all_of(n.inputs[0].refs,[&](const Ref& ref) {
+            return nodes[ref.node].outputs[ref.output].dtype=="f32";
+        }))
+      n.function->setAttr("ftlpu.norm_retained_matrix_input",mlir::UnitAttr::get(&context));
     // RoPE tables are initialized eagerly in bank1, before the first RMSNorm
     // executes. Its gamma must be on the other bank even though attention's
     // ordinary scratch does not become live until later.
@@ -343,6 +350,9 @@ public:
         for (size_t i = 0; i < outputs.size(); ++i)
           delta.getResult(i).setType(type(&context, outputs[i]));
       }
+      else if (llvm::isa<fc::kernel::ScaledMatvecOp>(op)) {
+        for (size_t i=0;i<outputs.size();++i) op->getResult(i).setType(type(&context,outputs[i]));
+      }
       else if (llvm::isa<fc::kernel::VectorAluOp>(op) && rows >= 0)
         for (auto result : op->getResults()) {
           auto t = llvm::cast<mlir::RankedTensorType>(result.getType());
@@ -363,6 +373,12 @@ public:
       n.function->setAttr(source.find("ftlpu.kernel.vector_alu") != std::string::npos
                               ? "ftlpu.vector_mirror" : "ftlpu.depthwise_conv_mirror",
                           mlir::BoolAttr::get(&context, true));
+    if (auto policy = policies.getAs<mlir::BoolAttr>("ftlpu.l2_head_partition");
+        policy && policy.getValue() && distributedConvOutput)
+      n.function->setAttr("ftlpu.l2_head_partition", policy);
+    if (auto policy = policies.getAs<mlir::BoolAttr>("ftlpu.vector_bf16_token_halves");
+        policy && policy.getValue() && source.find("ftlpu.kernel.vector_alu")!=std::string::npos)
+      n.function->setAttr("ftlpu.vector_bf16_token_halves",policy);
     if (distributedConvOutput &&
         source.find("ftlpu.kernel.depthwise_conv1d") != std::string::npos)
       n.function->setAttr("ftlpu.depthwise_conv_distributed_output",
@@ -436,6 +452,15 @@ public:
                                "beta_allocations",  "state_allocations"};
         for (I i = 0; i < 6; ++i)
           inputSlot(op->getOperand(i), slot(op, names[i]));
+      } else if (auto p = llvm::dyn_cast<fc::kernel::ScaledMatvecOp>(op)) {
+        inputSlot(p.getMatrix(),slot(op,"matrix_placement"));
+        inputSlot(p.getScale(),slot(op,"scale_placement"));
+        inputSlot(p.getVector(),slot(op,"vector_placement"));
+        if(!p.getEpilogue().empty()) {
+          inputSlot(p.getEpilogue()[0],slot(op,"value_placement"));
+          inputSlot(p.getEpilogue()[1],slot(op,"coefficient_placement"));
+          if(p.getEpilogue().size()==3)inputSlot(p.getEpilogue()[2],slot(op,"query_placement"));
+        }
       } else if (auto p = llvm::dyn_cast<fc::kernel::VectorAluOp>(op)) {
         inputSlot(p.getLhs(), slot(op, "ftlpu.vector_lhs_placement"));
         inputSlot(p.getRhs(), slot(op, "ftlpu.vector_rhs_placement"));
@@ -449,6 +474,8 @@ public:
       else if (llvm::isa<fc::tensor::GatedDeltaRuleTaskOp>(op))
         n.outputSlots[i] =
             slot(op, i ? "final_state_allocations" : "output_allocations");
+      else if (llvm::isa<fc::kernel::ScaledMatvecOp>(op))
+        n.outputSlots[i] = slot(op,i==4 ? "readout_placement" : i==3 ? "updated_placement" : i==2 ? "correction_placement" : i ? "product_placement" : "scaled_placement");
       else if (llvm::isa<fc::kernel::VectorAluOp>(op))
         n.outputSlots[i] = slot(op, "ftlpu.vector_result_placement");
       else
@@ -591,7 +618,7 @@ Tensor deltaBroadcast(const Tensor &t, V shape) {
 }
 Tensor deltaAlu(const std::string &name, Tensor a, Tensor b,
                 const std::string &kind, bool reduce=false,
-                const std::string &dtype="f32") {
+                const std::string &dtype="f32", bool fixed=false) {
   b = deltaBroadcast(b, a.shape);
   Tensor output; output.shape = reduce ? V{a.shape[0],1} : a.shape;
   output.dtype = dtype;
@@ -600,7 +627,8 @@ Tensor deltaAlu(const std::string &name, Tensor a, Tensor b,
   };
   const auto at=strType(a), bt=strType(b), ot=strType(output);
   auto source = "module { func.func @chunk(%a: " + at + ", %b: " + bt +
-      ") -> " + ot + " { %r = ftlpu.kernel.vector_alu %a, %b {kind = \"" + kind +
+      ") -> " + ot + (fixed ? " attributes {ftlpu.vector_bf16_spill = true}" : "") +
+      " { %r = ftlpu.kernel.vector_alu %a, %b {kind = \"" + kind +
       "\", use_immediate = false, immediate = 0.0 : f32, reduce = " +
       (reduce ? "true" : "false") + "} : (" + at + ", " + bt + ") -> " + ot +
       " return %r : " + ot + " } }";
@@ -632,6 +660,49 @@ Tensor deltaProduct(const std::string &name, const Tensor &a, const Tensor &b) {
     result.shape={count,n}; parts.push_back(std::move(result));
   }
   return concat(parts);
+}
+std::vector<Tensor> lowerTokenwiseDelta(const std::string &name,
+    const std::vector<Tensor> &input, const std::vector<Tensor> &outputs,
+    I heads, I kd, I vd) {
+  if(input[0].dtype!="bf16" || kd%32 || vd%32)
+    throw std::runtime_error("tokenwise streamed GDN requires BF16 and 32-aligned heads");
+  const auto strType=[&](const Tensor &t) {
+    std::string text;llvm::raw_string_ostream os(text);type(&context,t).print(os);return text;
+  };
+  // The semantic State ABI is [head*key,value]. Internally retain
+  // [head*value,key] throughout the scan, matching the shared decode kernel.
+  V order;
+  for(I h=0;h<heads;++h)for(I v=0;v<vd;++v)for(I k=0;k<kd;++k)
+    order.push_back((h*kd+k)*vd+v);
+  Tensor state=view(input[5],order,{heads*vd,kd});
+  std::vector<Tensor> tokens;
+  for(I t=0;t<input[0].shape[0];++t) {
+    auto q=sliceRows(input[0],t,1),k=sliceRows(input[1],t,1),v=sliceRows(input[2],t,1);
+    q.shape=k.shape={heads,kd};v.shape={heads,vd};
+    auto d=sliceRows(input[3],t,1),b=sliceRows(input[4],t,1);
+    Tensor y; y.shape={heads,vd};y.dtype=state.dtype;
+    const auto mt=strType(state),dt=strType(d),kt=strType(k),vt=strType(v),pt=strType(y);
+    const auto results="("+mt+", "+pt+", "+pt+", "+mt+", "+pt+")";
+    const auto source="module { func.func @step(%s: "+mt+", %d: "+dt+", %k: "+kt+
+        ", %v: "+vt+", %b: "+dt+", %q: "+kt+") -> "+results+" { "
+        "%scaled, %p, %delta, %updated, %y = ftlpu.kernel.scaled_matvec %s, %d, %k epilogue(%v, %b, %q) : ("+
+        mt+", "+dt+", "+kt+", "+vt+", "+dt+", "+kt+") -> "+results+
+        " return %scaled, %p, %delta, %updated, %y : "+mt+", "+pt+", "+pt+", "+mt+", "+pt+" } }";
+    // Re-enter the generic grouped contraction planner to retain its capacity
+    // tiling and the same emitter as batch-1 decode. No FU trace compression.
+    auto r=lower(J{{"name",name+".token"+std::to_string(t)},{"kernel",source}},
+        {state,d,k,v,b,q},{state,y,y,state,y});
+    state=r[3];
+    auto token=state.dtype=="bf16" ? r[4] :
+        deltaAlu(name+".readout"+std::to_string(t),r[4],deltaConstant({1,1},{1.f}),
+                 "multiply",false,"bf16",true);
+    nodes.back().function->setAttr("ftlpu.imem_drain_after",mlir::UnitAttr::get(&context));
+    token.shape={1,heads*vd};tokens.push_back(std::move(token));
+  }
+  order.clear();
+  for(I h=0;h<heads;++h)for(I k=0;k<kd;++k)for(I v=0;v<vd;++v)
+    order.push_back((h*vd+v)*kd+k);
+  return {concat(tokens),view(state,order,outputs[1].shape)};
 }
 std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
     const std::vector<Tensor> &originalInput, const std::vector<Tensor> &outputs,
@@ -721,6 +792,47 @@ std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
     auto parsed = mlir::parseSourceString<mlir::ModuleOp>(source, &context);
     if (!parsed) throw std::runtime_error("invalid kernel subgraph: " + name);
     auto parsedFunction = *parsed->getOps<mlir::func::FuncOp>().begin();
+    if (!parsedFunction.getOps<fc::kernel::ScaledMatvecOp>().empty()) {
+      const I groupOffset=(*parsedFunction.getOps<fc::kernel::ScaledMatvecOp>().begin()).getGroupOffset();
+      const I heads=input[2].shape[0], columns=input[0].shape[0]/heads;
+      // Input state and retained output occupy different slice groups.
+      // They do not need to split one bank's depth between ping/pong halves.
+      // The lifetime-aware allocator below still checks full-depth residency.
+      const I perTile=std::min<I>(32,std::max<I>(1,target.memory().sram_depth_rows/
+          (columns*((input[0].shape[1]+31)/32))));
+      std::vector<Tensor> matrices,products,corrections,updates,readouts;
+      for(I h=0;h<heads;h+=perTile) {
+        const I count=std::min(perTile,heads-h);
+        auto a=sliceRows(input[0],h*columns,count*columns);
+        // Keep the packed scale vector intact: a sub-word head slice is not
+        // a base-address adjustment. The emitter selects rows after SXM.
+        auto d=input[1];
+        auto k=sliceRows(input[2],h,count);
+        auto outs=outputs;outs[0].shape=a.shape;outs[1].shape={count,columns};
+        std::vector<Tensor> args={a,d,k};
+        if(input.size()>=5) {
+          args.push_back(sliceRows(input[3],h,count));args.push_back(input[4]);
+          outs[2].shape={count,columns};
+          if(outs.size()>=4)outs[3].shape=a.shape;
+          if(input.size()==6) {
+            args.push_back(sliceRows(input[5],h,count));outs[4].shape={count,columns};
+          }
+        }
+        auto result=add(name+".heads"+std::to_string(h),source,args,outs);
+        nodes.back().function.walk([&](fc::kernel::ScaledMatvecOp op) {
+          mlir::Builder b(&context);
+          op->setAttr("group_offset",b.getI64IntegerAttr(groupOffset+h));
+        });
+        matrices.push_back(result[0]);products.push_back(result[1]);
+        if(result.size()>=3)corrections.push_back(result[2]);
+        if(result.size()>=4)updates.push_back(result[3]);
+        if(result.size()==5)readouts.push_back(result[4]);
+      }
+      if(!readouts.empty())return {concat(matrices),concat(products),concat(corrections),concat(updates),concat(readouts)};
+      if(!updates.empty())return {concat(matrices),concat(products),concat(corrections),concat(updates)};
+      if(!corrections.empty())return {concat(matrices),concat(products),concat(corrections)};
+      return {concat(matrices),concat(products)};
+    }
     if (input.size()==1 && outputs.size()==1 && llvm::all_of(parsedFunction.front(),[](mlir::Operation& op) {
           return llvm::isa<fc::kernel::ReshapeOp,mlir::func::ReturnOp>(op);
         })) return {view(input[0],range(input[0].size()),outputs[0].shape)};
@@ -947,9 +1059,23 @@ std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
       // Independent normalization rows may occupy a partial hardware tile.
       // Duplicate a logical row in unused lanes; retain only live results.
       const I live = input[0].shape[0];
-      std::vector<Tensor> padded{input[0]};
-      for (I row=live;row<32;++row) padded.push_back(sliceRows(input[0],live-1,1));
-      input[0]=concat(padded);
+      if (input[0].external()) {
+        // concat joins producer references, which external inputs do not
+        // have. Preserve the actual ingress bytes when padding a partial
+        // normalization tile instead of silently creating an empty view.
+        const I width = input[0].size() / live;
+        V indices = range(input[0].size());
+        for (I row=live;row<32;++row) {
+          const auto lastRow = range(width,(live-1)*width);
+          indices.insert(indices.end(),lastRow.begin(),lastRow.end());
+        }
+        V shape = input[0].shape; shape[0] = 32;
+        input[0]=view(input[0],indices,std::move(shape));
+      } else {
+        std::vector<Tensor> padded{input[0]};
+        for (I row=live;row<32;++row) padded.push_back(sliceRows(input[0],live-1,1));
+        input[0]=concat(padded);
+      }
       auto out=outputs; out[0].shape[0]=32;
       auto values=add(name,source,input,out,32);
       return {sliceRows(values[0],0,live)};
@@ -964,18 +1090,135 @@ std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
       for (I first = 0; first < width; first += page) {
         I count = std::min(page, ((width - first + 63) / 64) * 64);
         auto w = sliceColumns(input[1], first, count, true);
+        const auto headPolicy = policies.getAs<mlir::BoolAttr>("ftlpu.l2_head_partition");
+        const bool partitionHeads = distributedConvOutput && headPolicy && headPolicy.getValue()
+            && width % 256 == 0 && count % 256 == 0;
+        const bool decodeHeads = headPolicy && headPolicy.getValue() && decodeHeadWidth > 0
+            && input[0].shape[0] == 1 && width % (2*decodeHeadWidth) == 0
+            && count % (2*decodeHeadWidth) == 0;
+        if (decodeHeads) {
+          V order;
+          for (I row=0;row<k;++row) for(I c=0;c<count;++c)
+            order.push_back(row*count+(c/32%2)*(count/2)+(c/64)*32+c%32);
+          w=view(w,order,w.shape);
+        }
+        if (partitionHeads) {
+          V order;
+          for (I row = 0; row < k; ++row)
+            for (I c = 0; c < count; ++c) {
+              const I word = c / 32, localWord = word / 2;
+              const I logical = ((localWord / 4) * 2 + word % 2) * 128
+                  + (localWord % 4) * 32 + c % 32;
+              order.push_back(row * count + logical);
+            }
+          w = view(w, order, w.shape);
+        }
         auto o = outputs[0];
         o.shape[1] = count;
         auto values = add(name + ".page" + std::to_string(first / page), source,
                           {input[0], w}, {o}, -1, count);
-        pieces.push_back(
-            sliceColumns(values[0], 0, std::min(count, width - first)));
+        auto value = values[0];
+        if (decodeHeads) {
+          V order;
+          for(I row=0;row<value.shape[0];++row) for(I c=0;c<count;++c)
+            order.push_back(row*count+(c%(count/2)/32)*64+(c/(count/2))*32+c%32);
+          value=view(value,order,value.shape);
+        }
+        if (partitionHeads) {
+          V order;
+          for (I row = 0; row < value.shape[0]; ++row)
+            for (I c = 0; c < count; ++c) {
+              const I head = c / 128, within = c % 128;
+              order.push_back(row * count + (((head / 2) * 4 + within / 32) * 2
+                  + head % 2) * 32 + within % 32);
+            }
+          value = view(value, order, value.shape);
+        }
+        pieces.push_back(sliceColumns(value, 0, std::min(count, width - first)));
       }
       return {concat(pieces, 1)};
     }
     if (source.find("ftlpu.kernel.depthwise_conv1d") != std::string::npos) {
       I width = input[0].shape[1], tile = std::min<I>(1024, width);
+      // Short decode windows fit all channel heads in one bilateral domain.
+      // The 1024-channel prefill split otherwise restages activation and
+      // coefficients between heads even though SRAM capacity is available.
+      if (input[0].shape[0] <= 4 && width % 64 == 0) {
+        const I words = target.memory().sram_depth_rows / 2;
+        const I capacity = 32 * std::min(words / (input[0].shape[0]+3), words / 4);
+        if (width/2 <= capacity) tile=width/2;
+      }
+      const auto headPolicy = policies.getAs<mlir::BoolAttr>("ftlpu.l2_head_partition");
+      if (headPolicy && headPolicy.getValue() && decodeHeadWidth>0
+          && width==decodeConvWidth && input[0].shape[0]<=4 && !input[0].external()) {
+        // The current token's projection references determine channel ownership;
+        // apply the identical permutation to Conv history and coefficients.
+        V channels[2];
+        bool eligible=true;
+        for(I c=0;c<width;++c) {
+          const auto ref=input[0].refs[(input[0].shape[0]-1)*width+c];
+          auto projection=llvm::dyn_cast_or_null<fc::tensor::ProjectionTaskOp>(nodes[ref.node].outputSlots[ref.output].op);
+          if(!projection || projection.getKind()!="linear") { eligible=false;break; }
+          channels[(ref.index/32)%2].push_back(c);
+        }
+        if(eligible && I(channels[0].size())==tile && I(channels[1].size())==tile) {
+          const I group=nodes.size();std::vector<Tensor> halves;V inverse(width);
+          for(I part=0;part<2;++part) {
+            const I side=1-part;V ai,wi;
+            for(I r=0;r<input[0].shape[0];++r) for(I c:channels[side]) ai.push_back(r*width+c);
+            for(I c:channels[side]) for(I tap=0;tap<input[1].shape[1];++tap) wi.push_back(c*input[1].shape[1]+tap);
+            auto o=outputs[0];o.shape[1]=tile;
+            halves.push_back(add(name+".block"+std::to_string(part*tile),source,
+                {view(input[0],ai,{input[0].shape[0],tile}),view(input[1],wi,{tile,input[1].shape[1]})},
+                {o},-1,tile,part!=0,group)[0]);
+            nodes.back().function->setAttr("ftlpu.depthwise_conv_paired",mlir::BoolAttr::get(&context,true));
+            for(I c=0;c<tile;++c) inverse[channels[side][c]]=part*tile+c;
+          }
+          auto joined=concat(halves,1);V order;
+          for(I r=0;r<joined.shape[0];++r) for(I c:inverse) order.push_back(r*width+c);
+          return {view(joined,order,joined.shape)};
+        }
+      }
+      const I channelBlock = distributedConvOutput && headPolicy && headPolicy.getValue()
+          && width % 256 == 0 ? 128 : 32;
       std::vector<Tensor> groups;
+      // Keep each hemisphere's native projection words together. These are
+      // logical views only: neither splitting nor restoring channel order
+      // emits a MEM copy.
+      if ((distributedConvOutput || input[0].shape[0] >= 32)
+          && !input[0].external() && width % (2 * tile) == 0
+          && llvm::all_of(input[0].refs, [&](const auto &ref) {
+            auto *owner = nodes[ref.node].outputSlots[ref.output].op;
+            auto projection = llvm::dyn_cast_or_null<fc::tensor::ProjectionTaskOp>(owner);
+            return projection && projection.getKind() == "linear";
+          })) {
+        for (I first = 0; first < width; first += 2 * tile) {
+          std::vector<Tensor> halves;
+          const I group = nodes.size();
+          for (I side = 0; side < 2; ++side) {
+            V ai, wi;
+            const I parity = 1 - side; // primary chain reads West, mirror East
+            for (I r = 0; r < input[0].shape[0]; ++r)
+              for (I c = 0; c < tile; ++c)
+                ai.push_back(r * width + first + (2 * (c / channelBlock) + parity) * channelBlock + c % channelBlock);
+            for (I c = 0; c < tile; ++c)
+              for (I tap = 0; tap < input[1].shape[1]; ++tap)
+                wi.push_back((first + (2 * (c / channelBlock) + parity) * channelBlock + c % channelBlock) * input[1].shape[1] + tap);
+            auto o = outputs[0]; o.shape[1] = tile;
+            halves.push_back(add(name + ".block" + std::to_string(first + side * tile), source,
+                {view(input[0], ai, {input[0].shape[0], tile}),
+                 view(input[1], wi, {tile, input[1].shape[1]})}, {o}, -1, tile, side != 0, group)[0]);
+            nodes.back().function->setAttr("ftlpu.depthwise_conv_paired", mlir::BoolAttr::get(&context,true));
+          }
+          auto joined = concat(halves, 1);
+          V order;
+          for (I r = 0; r < joined.shape[0]; ++r)
+            for (I c = 0; c < 2 * tile; ++c)
+              order.push_back(r * 2 * tile + (1 - (c / channelBlock) % 2) * tile + (c / (2 * channelBlock)) * channelBlock + c % channelBlock);
+          groups.push_back(view(joined, order, joined.shape));
+        }
+        return {concat(groups, 1)};
+      }
       for (I first = 0; first < width; first += tile * 2) {
         std::vector<Tensor> pieces;
         I group = nodes.size();
@@ -991,7 +1234,10 @@ std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
               mlir::BoolAttr::get(&context,width-first>=2*tile));
         }
         auto groupedResult = concat(pieces, 1);
-        groups.push_back(distributedConvOutput
+        // Keep short decode outputs as producer views. Eagerly joining each
+        // channel group copies a completed head before the next can execute.
+        // Consumers and final export materialize only the words they need.
+        groups.push_back((distributedConvOutput || input[0].shape[0] <= 4)
                              ? std::move(groupedResult)
                              : join(std::move(groupedResult),
                                     "conv_layout_group" + std::to_string(first)));
@@ -1002,6 +1248,14 @@ std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
       auto function = *parsed->getOps<mlir::func::FuncOp>().begin();
       auto delta=patterns.delta_nets.front().recurrence;
       const I heads=delta.getHeads();
+      auto strategy=function->getAttrOfType<mlir::StringAttr>("ftlpu.gdn_prefill_strategy");
+      if(!strategy)strategy=policies.getAs<mlir::StringAttr>("ftlpu.gdn_prefill_strategy");
+      if(strategy && strategy.getValue()!="tokenwise" && strategy.getValue()!="chunkwise")
+        throw std::runtime_error("gdn_prefill_strategy must be tokenwise or chunkwise");
+      if(strategy && strategy.getValue()=="tokenwise")
+        return lowerTokenwiseDelta(name,input,outputs,heads,delta.getKeyDim(),delta.getValueDim());
+      if(input[5].dtype=="bf16")
+        throw std::runtime_error("BF16 recurrent State storage currently requires explicit tokenwise strategy");
       const I requestedChunk=integer(delta,"chunk_size",integer(function,"ftlpu.gdn_chunk_size"));
       if (input[0].dtype=="bf16" && delta.getKeyDim()==128 && delta.getValueDim()==128 &&
           (!requestedChunk || requestedChunk==32) &&
@@ -1019,7 +1273,7 @@ std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
         return {concat(headOutputs,1),concat(headStates)};
       }
       if (const I chunk = integer(patterns.delta_nets.front().recurrence,
-              "chunk_size", integer(function, "ftlpu.gdn_chunk_size")))
+              "chunk_size", integer(function, "ftlpu.gdn_chunk_size",strategy?32:0)))
         return lowerChunkwiseDelta(name, input, outputs,
             patterns.delta_nets.front().recurrence.getHeads(), chunk);
       std::vector<Tensor> pieces;
@@ -1054,10 +1308,12 @@ std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
     const I tokenRows = input.empty() || input[0].shape.size() != 2 ? 0 : input[0].shape[0];
     auto vectorFunction = *parsed->getOps<mlir::func::FuncOp>().begin();
     const bool pointwiseGraph = llvm::all_of(vectorFunction.front(), [](mlir::Operation &op) {
-      if (auto vector = llvm::dyn_cast<fc::kernel::VectorAluOp>(op)) return !vector.getReduce();
+      if (auto vector = llvm::dyn_cast<fc::kernel::VectorAluOp>(op))
+        return !vector.getReduce() && vector.getKind()!="cumsum_rows"
+            && vector.getKind()!="causal_exp_difference" && vector.getKind()!="weighted_gram";
       return llvm::isa<mlir::func::ReturnOp>(op);
     });
-    if (pointwiseGraph && tokenRows > 1 && input[0].shape[1] > target.memory().bytes_per_word &&
+    if (pointwiseGraph && tokenRows > 1 &&
         llvm::all_of(input,[&](const Tensor &v) {return v.shape.size()==2 &&
             (v.shape[0]==1 || v.shape[0]==tokenRows);})) {
       const I words=(input[0].shape[1]+target.memory().bytes_per_word-1)/target.memory().bytes_per_word;
@@ -1068,7 +1324,7 @@ std::vector<Tensor> lowerChunkwiseDelta(const std::string &name,
         for (I first=0;first<tokenRows;first+=capacity) {
           const I count=std::min(capacity,tokenRows-first);
           auto args=input, outs=outputs;
-          for (auto &a : args) a=sliceRows(a,first,count);
+          for (auto &a : args) if (a.shape[0] != 1) a=sliceRows(a,first,count);
           for (auto &o : outs) o.shape[0]=count;
           auto values=add(name+".rows"+std::to_string(first),source,args,outs,count);
           nodes.back().pointwiseGroup=group;
@@ -1190,6 +1446,8 @@ public:
   mlir::Location loc;
   mlir::DictionaryAttr maskPlacement;
   I cursor = 64, internal = 1000, bridges = 0, period, group;
+  llvm::json::Array transportDomains;
+  std::string transportPhase = "initialization";
   Scheduler(mlir::MLIRContext &c, const fc::target::LPUTargetModel &t)
       : context(c), target(t), b(&c), loc(b.getUnknownLoc()) {
     period = target.memory().bytes_per_word /
@@ -1389,6 +1647,7 @@ public:
       return kind == "fp16_hemisphere_pair_planar" ||
              kind == "fp16_pair_planar" ||
              kind == "fp16_mxm_distributed_16" ||
+            kind == "fp16_mxm_block4_partition_distributed_16" ||
              kind == "fp16_vxm_distributed_16" ||
              kind == "fp16_scalar_broadcast_planar" ||
              kind == "fp32_quad_planar" ||
@@ -1403,6 +1662,10 @@ public:
          (ss[0] / group != ds[0] / group &&
           ss[1] / group != ds[1] / group));
     if (passivePair) {
+      // MEM pipelines consecutive vectors with one-cycle issue spacing;
+      // superlane skew is a drain latency, not a four-cycle initiation
+      // interval. Native Conv/projection domains use the same contract.
+      const std::array<I,3> copyIntervals={1,d.count[0],d.count[0]*d.count[1]};
       I maxLatency = 0;
       for (I p = 0; p < I(ss.size()); ++p) {
         I sourceGroup = ss[p] / group, destGroup = ds[p] / group;
@@ -1420,13 +1683,23 @@ public:
           latency = sourceGroup - destGroup;
         }
         mem(beat, src, p, "read", field(src, "base_row") + a,
-            readStream, d.count, d.src, intervals);
+            readStream, d.count, d.src, copyIntervals);
         mem(beat + latency, dst, p, "write",
             field(dst, "base_row") + z, writeStream, d.count, d.dst,
-            intervals);
+            copyIntervals);
         maxLatency = std::max(maxLatency, latency);
       }
-      cursor = beat + n * period + maxLatency + 96;
+      // A passive copy has no ALU pipeline to drain. Its final word is
+      // visible after the route latency and the last superlane's skew.
+      // The next domain already reserves its own 32-cycle issue lead-in.
+      cursor = beat + (n-1) + maxLatency
+          + target.throughput().tile_rows;
+      transportDomains.push_back(J{{"phase",transportPhase},{"route","passive_sr"},
+          {"start",beat},{"end",cursor},{"vectors",n},{"byte_planes",I(ss.size())},
+          {"source_side",text(src,"hemisphere")},{"source_slice",ss[0]},
+          {"source_bank",field(src,"bank")},{"source_row",field(src,"base_row")+a},
+          {"destination_side",text(dst,"hemisphere")},{"destination_slice",ds[0]},
+          {"destination_bank",field(dst,"bank")},{"destination_row",field(dst,"base_row")+z}});
       return;
     }
     if(bf16Pair(src) && bf16Pair(dst) && samePlanes) {
@@ -1455,6 +1728,10 @@ public:
       mem(result + ds[p] / group + 1, dst, p, "write",
           field(dst, "base_row") + z, 24 + p, d.count, d.dst, intervals);
     cursor = result + n * period + 96;
+    transportDomains.push_back(J{{"phase",transportPhase},{"route","vxm_cast"},
+        {"start",beat},{"end",cursor},{"vectors",n},{"byte_planes",I(ss.size())},
+        {"source_side",text(src,"hemisphere")},{"source_slice",ss[0]},
+        {"destination_side",text(dst,"hemisphere")},{"destination_slice",ds[0]}});
   }
   void copy(mlir::DictionaryAttr src, mlir::DictionaryAttr dst,
             const V &indices, const V &offsets) {
@@ -1465,6 +1742,7 @@ public:
     }
     if (text(src,"hemisphere") == "both")
       src = change(src,J{{"hemisphere",text(dst,"hemisphere")}});
+    if (src==dst && indices==offsets) return;
     if (overlap(src, dst)) {
       auto temp = change(
           src,
@@ -1688,7 +1966,7 @@ public:
   std::map<Key, I> last;
   std::map<std::pair<std::string, I>, std::vector<Key>> native;
   struct TimedWorkspace { I node, begin, end; };
-  std::map<std::pair<std::string,I>,std::vector<TimedWorkspace>> nativeTimed;
+  std::map<std::pair<std::string,I>,std::vector<TimedWorkspace>> nativeTimed, nativeBank0;
   std::map<std::pair<std::string, I>, I> staticEnd;
   struct Static {
     mlir::DictionaryAttr p;
@@ -1703,6 +1981,10 @@ public:
   std::map<Key,mlir::DictionaryAttr> partitionOutputHomes;
   std::map<Key,mlir::DictionaryAttr> retainedOutputHomes;
   std::map<Key,mlir::DictionaryAttr> pointwiseHomes;
+  std::map<Key,mlir::DictionaryAttr> externalVectorHomes;
+  std::map<Key,mlir::DictionaryAttr> wideBroadcastHomes;
+  std::map<Key,Key> wideBroadcastOperands;
+  std::set<Key> emittedWideBroadcasts;
   Linker(Planner &p, std::vector<Tensor> out, fs::path dir)
       : planner(p), s(p.context, p.target), finals(std::move(out)),
         directory(std::move(dir)) {
@@ -1712,9 +1994,20 @@ public:
           last[{ref.node, ref.output}] = i;
       if (!p.nodes[i].module)
         continue;
+      // Scaled/KS/delta results are physical scratch even if not exposed by
+      // the graph. Give them real homes until the composite step retires.
+      if(!p.nodes[i].function.getOps<fc::kernel::ScaledMatvecOp>().empty())
+        for(I oi=0;oi<I(p.nodes[i].outputs.size());++oi)
+          last.try_emplace({i,oi},i);
       for (auto workspace : p.nodes[i].workspaces) {
-        if (field(workspace, "bank") != 1)
+        if (field(workspace,"bank")==0) {
+          for(auto h:{"east","west"})
+            if(text(workspace,"hemisphere")==h || text(workspace,"hemisphere")=="both")
+              for(I slice:slices(workspace)) nativeBank0[{h,slice}].push_back(
+                {i,field(workspace,"base_row"),field(workspace,"base_row")+field(workspace,"instruction_count")});
           continue;
+        }
+        if (field(workspace, "bank") != 1) continue;
         for (auto h : {"east", "west"})
           if (text(workspace, "hemisphere") == h ||
               text(workspace, "hemisphere") == "both")
@@ -1756,8 +2049,15 @@ public:
       depth = s.target.memory().sram_depth_rows;
     // Final view materialization starts after all native kernels. Earlier
     // kernel scratch reservations must not prevent reusing their SRAM here.
+    // Nonzero external state is uploaded before the first node, even when
+    // its recurrence consumer appears much later. Earlier native scratch
+    // must not overwrite that ingress image while projections/norms run.
+    const bool initialState = key.first == -4
+        && planner.nodes[key.second].inputs[5].external()
+        && llvm::any_of(planner.nodes[key.second].inputs[5].data,
+                        [](uint8_t byte) { return byte != 0; });
     const I born = key.first >= 0 ? key.first
-                   : key.first == -4 ? key.second
+                   : key.first == -4 ? (initialState ? 0 : key.second)
                    : key.first == -3 ? I(planner.nodes.size()) : 0;
     const I dead = last.count(key) ? last.at(key) : planner.nodes.size();
     V pairs;
@@ -1800,6 +2100,10 @@ public:
               ranges.push_back(r);
               candidates.insert(r.second);
             }
+            if(prototype && field(prototype,"bank_tile_rows"))
+              for(auto r:nativeBank0[{h,slice}]) if(r.node>=born && r.node<=dead) {
+                ranges.push_back({r.begin,r.end}); candidates.insert(r.end);
+              }
             for (auto r : nativeTimed[{h,slice}])
               if (r.node >= born && r.node <= dead) {
                 ranges.push_back({r.begin,r.end}); candidates.insert(r.end);
@@ -1820,9 +2124,19 @@ public:
         if (prototype)
           p = s.change(p, J{{"kind", text(prototype, "kind")},
                             {"instruction_count", rows}});
+        if (prototype && prototype.get("partition_row_sides")) {
+          mlir::NamedAttrList mapped(p);
+          for(auto name:{"partition_row_sides","partition_row_indices","partition_storage_rows"})
+            mapped.set(name,prototype.get(name));
+          p=mapped.getDictionary(&s.context);
+        }
         for (auto busy : forbiddenQueues)
           if (overlap(p, busy))
             conflict = true;
+        // A striped producer finishes its reads before writing either bank.
+        // Reserve the row range in both banks for its entire graph lifetime.
+        if(prototype && field(prototype,"bank_tile_rows"))
+          p=s.change(p,J{{"bank_tile_rows",field(prototype,"bank_tile_rows")}});
         for (auto &kv : live)
           if (overlap(p, kv.second) &&
               row < field(kv.second, "base_row") +
@@ -1848,7 +2162,8 @@ public:
   }
   Static input(const Tensor &t, mlir::DictionaryAttr original,
                std::string name, bool directNativeIngress = false,
-               I directLastUse = 0) {
+               I directLastUse = 0,
+               const std::vector<mlir::DictionaryAttr> &forbiddenQueues = {}) {
     // Views of a retained activation use the original upload and carry
     // their logical offset into the on-chip layout conversion.
     if (t.external() && t.sourceContiguous)
@@ -1875,6 +2190,7 @@ public:
     identity += t.dtype;
     for (I d : t.shape)
       identity += "," + std::to_string(d);
+    if(!forbiddenQueues.empty()) identity += ":isolated:" + name;
     // A reused external activation has one physical lifetime, even when its
     // consumers request different layouts. Keep a distributed on-chip home
     // and materialize each consumer layout from that shared binding.
@@ -1973,7 +2289,8 @@ public:
                text(p, "kind") == "fp16_mxm_activation_planar" ||
                text(p, "kind") == "fp16_mxm_distributed_16" ||
                text(p, "kind") == "fp32_quad_planar") {
-      p = allocate({-2, index}, t, text(p, "hemisphere"), !scalar(p));
+      p = allocate({-2, index}, t, text(p, "hemisphere"), !scalar(p),
+                   forbiddenQueues.empty()?mlir::DictionaryAttr{}:p,forbiddenQueues);
       last[{-2, index}] = planner.nodes.size() + 1;
     } else {
       I row = 512;
@@ -2145,7 +2462,24 @@ public:
         }
       return;
     }
-    if (text(src, "kind") == "token_partition_planar") {
+    if (text(src, "kind") == "token_partition_planar" || text(src,"kind")=="token_partition_east_first_planar") {
+      if(auto rowSides=src.getAs<mlir::ArrayAttr>("partition_row_sides")) {
+        const auto rowIndices=src.getAs<mlir::ArrayAttr>("partition_row_indices");
+        const I columns=sourceShape[1],rows=field(src,"partition_storage_rows");
+        for(I side=0;side<2;++side) {
+          V selected,positions;
+          for(size_t i=0;i<ix.size();++i) {
+            const I row=ix[i]/columns;
+            if(llvm::cast<mlir::IntegerAttr>(rowSides[row]).getInt()!=side) continue;
+            selected.push_back(llvm::cast<mlir::IntegerAttr>(rowIndices[row]).getInt()*columns+ix[i]%columns);
+            positions.push_back(pos[i]);
+          }
+          if(selected.empty()) continue;
+          auto physical=s.change(src,J{{"kind","fp16_pair_planar"},{"hemisphere",side?"west":"east"}});
+          move(physical,dst,{rows,columns},destShape,selected,positions);
+        }
+        return;
+      }
       const I half = (sourceShape[0] + 1) / 2, columns = sourceShape[1];
       for (I side = 0; side < 2; ++side) {
         V selected, positions;
@@ -2156,7 +2490,7 @@ public:
           }
         if (selected.empty()) continue;
         auto physical = s.change(src, J{{"kind", slices(src).size() == 4 ? "fp32_quad_planar" : "fp16_pair_planar"},
-            {"hemisphere", side ? "east" : "west"}});
+            {"hemisphere", (bool(side) != (text(src,"kind")=="token_partition_east_first_planar")) ? "east" : "west"}});
         move(physical, dst, {half, columns}, destShape, selected, positions);
       }
       return;
@@ -2339,10 +2673,14 @@ public:
       p.first.push_back(ref.index);
       p.second.push_back(i);
     }
-    for (auto &kv : segments)
+    for (auto &kv : segments) {
+      const I begin=s.cursor;
       move(cache.at(kv.first), dest,
            planner.nodes[kv.first.first].outputs[kv.first.second].shape,
            value.shape, kv.second.first, kv.second.second);
+      if(s.cursor>begin) s.emit("timeline",J{{"name", "mem_materialize."+planner.nodes[kv.first.first].name},
+          {"start",begin},{"end",s.cursor}});
+    }
   }
   // Whole-subgraph placement, analogous to the dense attention memory plan:
   // native operator tasks receive final storage before their ICU domains exist.
@@ -2581,6 +2919,13 @@ public:
         continue;
       }
       node.stagedInputs.assign(node.inputs.size(), false);
+      for (I idx=0;idx<I(node.inputs.size());++idx) {
+        auto home=externalVectorHomes.find({ni,idx});
+        if(home==externalVectorHomes.end()) continue;
+        node.in[idx]=home->second;
+        for(auto &slot:node.inputSlots[idx]) slot.set(home->second);
+        node.stagedInputs[idx]=true;
+      }
       if (node.recurrent) {
         node.in[5] = recurrentStates.at(ni);
         for (auto &slot : node.inputSlots[5])
@@ -2595,6 +2940,174 @@ public:
         if (value.refs.empty())
           continue;
         auto firstRef = value.refs[0];
+        if(idx==0 && !node.inputSlots[idx].empty() &&
+            llvm::all_of(node.inputSlots[idx],[](const auto &slot) {
+                auto op=llvm::dyn_cast<fc::kernel::VectorAluOp>(slot.op);
+                return op && op.getKind()=="weighted_gram";
+            })) {
+          auto source=cache.at({firstRef.node,firstRef.output});
+          const auto &shape=planner.nodes[firstRef.node].outputs[firstRef.output].shape;
+          bool identity=value.size()==product(shape) && firstRef.index==0;
+          for(I j=0;identity && j<value.size();++j)
+            identity=value.refs[j].node==firstRef.node && value.refs[j].output==firstRef.output && value.refs[j].index==j;
+          if(identity && text(source,"kind")=="fp16_mxm_distributed_16" && slices(source).size()==16 &&
+              llvm::isa<fc::tensor::L2NormTaskOp>(planner.nodes[firstRef.node].outputSlots[firstRef.output].op)) {
+            node.in[idx]=source;
+            for(auto &slot:node.inputSlots[idx]) slot.set(source);
+            node.stagedInputs[idx]=true;
+            // This consumer reads alternating native L2 heads on their home
+            // hemisphere. Do not mirror the producer merely for this edge.
+            bool partitionConsumers=true;
+            for(auto &consumer:planner.nodes) for(I operand=0;operand<I(consumer.inputs.size());++operand) {
+              const bool uses=llvm::any_of(consumer.inputs[operand].refs,[&](const Ref &ref) {
+                return ref.node==firstRef.node && ref.output==firstRef.output;
+              });
+              if(!uses)continue;
+              partitionConsumers &= operand==0 && I(consumer.inputSlots.size())>operand && !consumer.inputSlots[operand].empty() &&
+                  llvm::all_of(consumer.inputSlots[operand],[](const auto &slot) {
+                    auto op=llvm::dyn_cast<fc::kernel::VectorAluOp>(slot.op);
+                    return op && op.getKind()=="weighted_gram";
+                  });
+            }
+            if(partitionConsumers)
+              planner.nodes[firstRef.node].function->setAttr("ftlpu.l2_native_partition_output",s.b.getUnitAttr());
+            continue;
+          }
+        }
+        if(node.function->hasAttr("ftlpu.native_silu_multiply") && value.dtype=="bf16"
+            && value.shape.size()==2 && value.shape[0]%2==0 && value.shape[1]%32==0) {
+          llvm::SmallVector<mlir::Attribute> words;
+          V rowSides,rowIndices;I localRows[2]={0,0};
+          bool valid=true;const I rows=value.shape[0],blocks=value.shape[1]/32;
+          for(I block=0;valid && block<blocks;++block) for(I row=0;valid && row<rows;++row) {
+            const I at=row*value.shape[1]+block*32;
+            const auto ref=value.refs[at];auto p=cache.at({ref.node,ref.output});
+            const auto &shape=planner.nodes[ref.node].outputs[ref.output].shape;
+            valid=shape.size()==2 && shape[1]%32==0 && ref.index%32==0 && slices(p).size()==2 && !p.get("storage_shape");
+            for(I lane=0;valid && lane<32;++lane) {
+              const auto r=value.refs[at+lane];
+              valid=r.node==ref.node && r.output==ref.output && r.index==ref.index+lane;
+            }
+            if(!valid)break;
+            I side=0,address=0;
+            if(text(p,"kind")=="fp16_hemisphere_pair_planar") {
+              const I col=ref.index%shape[1];side=col/32%2;
+              address=field(p,"base_row")+(col/64)*shape[0]+ref.index/shape[1];
+            } else if(text(p,"kind")=="token_partition_planar" && p.get("partition_row_sides")) {
+              const I logicalRow=ref.index/shape[1];
+              side=llvm::cast<mlir::IntegerAttr>(p.getAs<mlir::ArrayAttr>("partition_row_sides")[logicalRow]).getInt();
+              const I local=llvm::cast<mlir::IntegerAttr>(p.getAs<mlir::ArrayAttr>("partition_row_indices")[logicalRow]).getInt();
+              address=field(p,"base_row")+(ref.index%shape[1]/32)*field(p,"partition_storage_rows")+local;
+            } else {valid=false;break;}
+            p=s.change(p,J{{"kind","fp16_pair_planar"},{"hemisphere",side?"west":"east"}});
+            words.push_back(s.b.getDictionaryAttr({s.b.getNamedAttr("placement",p),s.b.getNamedAttr("address",s.b.getI64IntegerAttr(address))}));
+            if(block==0) {rowSides.push_back(1-side);rowIndices.push_back(localRows[side]++);}
+          }
+          if(valid && localRows[0]==rows/2 && localRows[1]==rows/2) {
+            node.function->setAttr("native_pointwise_words_"+std::to_string(idx),s.b.getArrayAttr(words));
+            node.out[0]=s.change(node.out[0],J{{"kind","token_partition_planar"},{"hemisphere","both"},
+                {"partition_row_sides",s.array(rowSides)},{"partition_row_indices",s.array(rowIndices)},
+                {"partition_storage_rows",rows/2}});
+            node.stagedInputs[idx]=true;continue;
+          }
+        }
+        // A row-wise scalar broadcast can retain a compact table of vectors:
+        // repeat a packed coefficient word 32 times through the wide SXM.
+        // The consumer repeats table addresses instead of expanding to state size.
+        if(value.shape.size()==2 && value.shape[1]%32==0 && !node.inputSlots[idx].empty() &&
+            node.function->hasAttr("ftlpu.vector_bf16_spill") &&
+            llvm::all_of(node.inputSlots[idx],[](const auto &slot){return llvm::isa<fc::kernel::VectorAluOp>(slot.op);}) &&
+            (*node.module)->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide")) {
+          const Key sourceKey{firstRef.node,firstRef.output};
+          const auto &sourceTensor=planner.nodes[firstRef.node].outputs[firstRef.output];
+          auto source=cache.at(sourceKey);
+          const I heads=sourceTensor.size(), width=value.shape[1];
+          I repeat=0;
+          while(repeat<value.shape[0] && value.refs[repeat*width].index==firstRef.index) ++repeat;
+          bool valid=heads<=32 && sourceTensor.shape==V{1,heads} &&
+              text(source,"kind")=="fp32_quad_planar" && text(source,"hemisphere")=="both" &&
+              value.dtype=="f32" && repeat>0 && value.shape[0]%repeat==0;
+          for(I j=0;valid && j<value.size();++j) {
+            const auto r=value.refs[j];
+            valid=r.node==firstRef.node && r.output==firstRef.output &&
+                r.index==firstRef.index+(j/width)/repeat;
+          }
+          if(valid) {
+            if(!wideBroadcastHomes.count(sourceKey)) {
+              Tensor table=sourceTensor;table.shape={heads,32};
+              const Key reservation{-5,firstRef.node};last[reservation]=last[sourceKey];
+              wideBroadcastHomes[sourceKey]=allocate(reservation,table,"both",1);
+            }
+            auto home=s.change(wideBroadcastHomes.at(sourceKey),J{{"broadcast_row_repeat",repeat},
+                {"broadcast_head_base",firstRef.index}});
+            node.in[idx]=home;
+            for(auto &slot:node.inputSlots[idx]) slot.set(home);
+            node.stagedInputs[idx]=true;
+            wideBroadcastOperands[{ni,idx}]=sourceKey;
+            continue;
+          }
+        }
+        // A single packed row of a mirrored pointwise producer is already a
+        // complete vector operand. Preserve its address instead of copying a
+        // token view into the consumer's provisional activation allocation.
+        if (value.shape.size()==2 && value.shape[0]==1 && value.shape[1]<=32 &&
+            !node.inputSlots[idx].empty() && node.function->hasAttr("ftlpu.vector_bf16_spill") &&
+            llvm::all_of(node.inputSlots[idx],[](const auto &slot){return llvm::isa<fc::kernel::VectorAluOp>(slot.op);})) {
+          auto source=cache.at({firstRef.node,firstRef.output});
+          const auto &shape=planner.nodes[firstRef.node].outputs[firstRef.output].shape;
+          const auto kind=text(source,"kind");
+          bool valid=shape.size()==2 && shape[1]==value.shape[1] &&
+              firstRef.index%shape[1]==0 && text(source,"hemisphere")=="both" &&
+              !source.get("storage_shape") && !source.get("storage_offset") &&
+              ((value.dtype=="f32" && kind=="fp32_quad_planar" && slices(source).size()==4) ||
+               (value.dtype=="bf16" && kind=="fp16_pair_planar" && slices(source).size()==2));
+          for(I j=0;valid && j<value.size();++j) {
+            const auto r=value.refs[j];
+            valid=r.node==firstRef.node && r.output==firstRef.output && r.index==firstRef.index+j;
+          }
+          if(valid) {
+            auto home=s.change(source,J{{"base_row",field(source,"base_row")+firstRef.index/shape[1]},
+                {"instruction_count",1}});
+            node.in[idx]=home;
+            for(auto &slot:node.inputSlots[idx]) slot.set(home);
+            node.stagedInputs[idx]=true;
+            continue;
+          }
+        }
+        // Decode causal windows are logical views of history and projection
+        // words. Describe those homes directly instead of joining a window.
+        if (idx==0 && node.function->hasAttr("ftlpu.depthwise_conv_paired") &&
+            value.shape.size()==2 && value.shape[0]<=4 &&
+            value.shape[1]%32==0 && node.inputSlots[idx].size()==1 &&
+            llvm::isa<fc::tensor::DepthwiseConv1DTaskOp>(node.inputSlots[idx][0].op)) {
+          llvm::SmallVector<mlir::Attribute> words;
+          bool valid=true;
+          for(I block=0;valid && block<value.shape[1]/32;++block)
+            for(I row=0;valid && row<value.shape[0];++row) {
+              I at=row*value.shape[1]+block*32;
+              const auto ref=value.refs[at];
+              auto p=cache.at({ref.node,ref.output});
+              const auto shape=planner.nodes[ref.node].outputs[ref.output].shape;
+              const bool paired=text(p,"kind")=="fp16_hemisphere_pair_planar";
+              valid=shape.size()==2 && !p.get("storage_shape") &&
+                  (paired || text(p,"kind")=="fp16_pair_planar") &&
+                  ref.index%shape[1]%32==0;
+              for(I lane=0;valid && lane<32;++lane) {
+                const auto r=value.refs[at+lane];
+                valid=r.node==ref.node && r.output==ref.output && r.index==ref.index+lane;
+              }
+              if(!valid) break;
+              if(paired) p=s.change(p,J{{"hemisphere",ref.index%shape[1]/32%2?"west":"east"}});
+              const I address=ref.index%shape[1]/(paired?64:32)*shape[0]+ref.index/shape[1];
+              words.push_back(s.b.getDictionaryAttr({s.b.getNamedAttr("placement",p),
+                  s.b.getNamedAttr("row",s.b.getI64IntegerAttr(address))}));
+            }
+          if(valid) {
+            node.inputSlots[idx][0].op->setAttr("native_window_words",s.b.getArrayAttr(words));
+            node.stagedInputs[idx]=true;
+            continue;
+          }
+        }
         // Packed beta/decay rows live on their producer's token hemisphere.
         // Broadcast locally through SXM; VXM can select that hemisphere for
         // its RHS while the recurrent state remains in its retained home.
@@ -2614,7 +3127,81 @@ public:
         // distributed producers. Describe those columns before scheduling;
         // the L2 emitter transposes each group directly from its producer.
         if (idx == 0 && node.inputSlots[idx].size() == 1 &&
-            llvm::isa<fc::tensor::L2NormTaskOp>(node.inputSlots[idx][0].op)) {
+            llvm::isa<fc::tensor::L2NormTaskOp,fc::tensor::RmsNormTaskOp>(node.inputSlots[idx][0].op)) {
+          // Wide SXM accepts row vectors directly from a planar producer.
+          // Describe the logical view rather than materializing distributed16
+          // (including duplicated padding heads) before the transpose.
+          const auto widePolicy=(*node.module)->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
+          bool planar=widePolicy && widePolicy.getValue() && value.shape[0]==32
+              && value.shape[1]%32==0;
+          llvm::SmallVector<mlir::Attribute> words;
+          for(I i=0;planar && i<value.size();i+=32) {
+            const auto ref=value.refs[i];auto p=cache.at({ref.node,ref.output});
+            const auto &shape=planner.nodes[ref.node].outputs[ref.output].shape;
+            // A semantic FP32 -> BF16 truncating view aliases the upper
+            // two byte planes. Readout is already mirrored on both fabrics;
+            // assign complete heads to each side without moving the data.
+            if(value.dtype=="bf16" && planner.nodes[ref.node].outputs[ref.output].dtype=="f32"
+                && text(p,"kind")=="fp32_quad_planar" && slices(p).size()==4) {
+              const auto ids=slices(p);
+              const auto side=text(p,"hemisphere")=="both"
+                  ? (ref.index/shape[1]<shape[0]/2?"west":"east") : text(p,"hemisphere");
+              p=s.change(p,J{{"kind","fp16_pair_planar"},{"slices",s.array({ids[2],ids[3]})},
+                  {"hemisphere",side}});
+            }
+            planar=shape.size()==2 && shape[1]%32==0 && ref.index%32==0
+                && text(p,"kind")=="fp16_pair_planar" && !p.get("storage_shape")
+                && slices(p).size()==2;
+            for(I j=0;planar && j<32;++j) {
+              auto r=value.refs[i+j];planar=r.node==ref.node && r.output==ref.output && r.index==ref.index+j;
+            }
+            if(planar) {
+              mlir::NamedAttrList d;d.set("placement",p);
+              d.set("address",s.b.getI64IntegerAttr(field(p,"base_row")+
+                  (ref.index%shape[1]/32)*shape[0]+ref.index/shape[1]));
+              words.push_back(d.getDictionary(&s.context));
+            }
+          }
+          if(planar) {
+            node.inputSlots[idx][0].op->setAttr("native_planar_words",s.b.getArrayAttr(words));
+            node.out[0]=s.change(node.out[0],J{{"kind","fp16_pair_planar"},
+                {"slices",s.array({48,49})},{"hemisphere","west"},
+                {"instruction_count",value.size()/32}});
+            const auto partition=(*node.module)->getAttrOfType<mlir::BoolAttr>("ftlpu.l2_head_partition");
+            if(partition && partition.getValue() && planner.decodeHeadWidth>0) {
+              const I blocks=value.shape[1]/32;
+              V heads[2],rowSides,rowIndices;
+              for(I row=0;row<32;++row) {
+                const auto p=llvm::cast<mlir::DictionaryAttr>(words[row*blocks]).getAs<mlir::DictionaryAttr>("placement");
+                const I side=text(p,"hemisphere")=="west"?1:0;
+                for(I b=1;b<blocks;++b)
+                  if(text(llvm::cast<mlir::DictionaryAttr>(words[row*blocks+b]).getAs<mlir::DictionaryAttr>("placement"),"hemisphere")!=text(p,"hemisphere"))
+                    throw std::runtime_error("decode L2 head spans hemispheres after producer partition");
+                I local=0;
+                for(;local<I(heads[side].size());++local) {
+                  bool same=true;
+                  for(I b=0;b<blocks;++b) same &= words[row*blocks+b]==words[heads[side][local]*blocks+b];
+                  if(same) break;
+                }
+                if(local==I(heads[side].size())) heads[side].push_back(row);
+                // Fixed VXM outputs leave on the opposite fabric. Retain that
+                // native home rather than copying normalized heads back.
+                rowSides.push_back(1-side);rowIndices.push_back(local);
+              }
+              llvm::SmallVector<mlir::Attribute> paired;
+              for(I side=0;side<2;++side) {
+                if(heads[side].empty()) throw std::runtime_error("decode head partition needs heads on both fabrics");
+                for(I row=0;row<32;++row) for(I b=0;b<blocks;++b)
+                  paired.push_back(words[heads[side][std::min<I>(row,heads[side].size()-1)]*blocks+b]);
+              }
+              node.inputSlots[idx][0].op->setAttr("native_partitioned_planar_words",s.b.getArrayAttr(paired));
+              node.out[0]=s.change(node.out[0],J{{"kind","token_partition_planar"},{"hemisphere","both"},
+                  {"partition_row_sides",s.array(rowSides)},{"partition_row_indices",s.array(rowIndices)},
+                  {"partition_storage_rows",32}});
+            }
+            node.stagedInputs[idx]=true;continue;
+          }
+          if(llvm::isa<fc::tensor::RmsNormTaskOp>(node.inputSlots[idx][0].op)) continue;
           const auto &firstShape = planner.nodes[firstRef.node].outputs[firstRef.output].shape;
           const I tokens = firstShape[0], width = value.shape[1];
           const I groups = tokens ? value.shape[0] / tokens : 0;
@@ -2644,6 +3231,36 @@ public:
               sources.push_back(descriptor.getDictionary(&s.context));
             }
           }
+          if (!compatible && tokens > 0 && tokens % 32 == 0 && width % 32 == 0
+              && groups > 1 && value.shape[0] == tokens * groups) {
+            // A head may span native words on both hemispheres. Describe each
+            // word to the transpose itself instead of copying the full head.
+            compatible = true; sources.clear();
+            for (I g = 0; compatible && g < groups; ++g) {
+              llvm::SmallVector<mlir::Attribute> chunks;
+              for (I c = 0; compatible && c < width; c += 32) {
+                const auto ref = value.refs[g * width + c];
+                auto src = cache.at({ref.node, ref.output});
+                const auto &shape = planner.nodes[ref.node].outputs[ref.output].shape;
+                const I column = ref.index;
+                compatible = shape.size() == 2 && shape[0] == tokens && column % 32 == 0
+                    && column + 32 <= shape[1] && text(src,"kind") == "fp16_mxm_distributed_16"
+                    && !src.get("storage_shape") && slices(src).size() == 16;
+                for (I t = 0; compatible && t < tokens; ++t)
+                  for (I f = 0; compatible && f < 32; ++f) {
+                    const auto r = value.refs[(t * groups + g) * width + c + f];
+                    compatible = r.node == ref.node && r.output == ref.output
+                        && r.index == t * shape[1] + column + f;
+                  }
+                mlir::NamedAttrList d;
+                d.set("placement",src); d.set("column",s.b.getI64IntegerAttr(column));
+                d.set("columns",s.b.getI64IntegerAttr(shape[1]));
+                chunks.push_back(d.getDictionary(&s.context));
+              }
+              mlir::NamedAttrList d; d.set("chunks",s.b.getArrayAttr(chunks));
+              sources.push_back(d.getDictionary(&s.context));
+            }
+          }
           if (compatible) {
             auto *owner = node.inputSlots[idx][0].op;
             owner->setAttr("native_input_groups", s.b.getArrayAttr(sources));
@@ -2657,6 +3274,77 @@ public:
         // Keep logical head count unchanged; padding lanes are independent.
         const auto firstPlacement = cache.at({firstRef.node, firstRef.output});
         const auto &producerShape = planner.nodes[firstRef.node].outputs[firstRef.output].shape;
+        // A channel block of a planar causal window occupies consecutive
+        // vector words. Rebind its base address instead of staging a second
+        // window before every Conv group. Preserve the selected hemisphere.
+        if (idx == 0 && node.inputSlots[idx].size() == 1
+            && llvm::isa<fc::tensor::DepthwiseConv1DTaskOp>(node.inputSlots[idx][0].op)
+            && text(firstPlacement,"kind") == "fp16_pair_planar"
+            && text(firstPlacement,"hemisphere") == text(node.in[idx],"hemisphere")
+            && !firstPlacement.get("storage_shape")
+            && producerShape.size() == 2 && value.shape.size() == 2
+            && value.shape[0] == producerShape[0]
+            && firstRef.index % 32 == 0 && firstRef.index < producerShape[1]
+            && value.shape[1] % 32 == 0) {
+          bool contiguous = true;
+          for (I j=0; contiguous && j<value.size(); ++j) {
+            const auto ref=value.refs[j];
+            contiguous = ref.node==firstRef.node && ref.output==firstRef.output
+                && ref.index==firstRef.index+(j/value.shape[1])*producerShape[1]+j%value.shape[1];
+          }
+          if (contiguous) {
+            auto p=s.change(firstPlacement,J{
+                {"base_row",field(firstPlacement,"base_row")+(firstRef.index/32)*producerShape[0]},
+                {"instruction_count",value.size()/32}});
+            node.in[idx]=p;node.inputSlots[idx][0].set(p);
+            node.function->setAttr("ftlpu.depthwise_conv_direct_input",s.b.getBoolAttr(true));
+            node.stagedInputs[idx]=true;
+            continue;
+          }
+        }
+        if (idx == 0 && node.inputSlots[idx].size() == 1
+            && llvm::isa<fc::tensor::DepthwiseConv1DTaskOp>(node.inputSlots[idx][0].op)
+            && text(firstPlacement, "kind") == "fp16_hemisphere_pair_planar"
+            && !firstPlacement.get("storage_shape") && slices(firstPlacement).size() == 2
+            && producerShape.size() == 2 && value.shape.size() == 2
+            && firstRef.index % 32 == 0 && value.shape[1] % 32 == 0) {
+          const I col = firstRef.index % producerShape[1];
+          bool affine = firstRef.index / producerShape[1] == 0 && value.shape[0] == producerShape[0];
+          for (I j = 0; affine && j < value.size(); ++j) {
+            const auto ref = value.refs[j]; const I c = j % value.shape[1];
+            affine = ref.node == firstRef.node && ref.output == firstRef.output
+                && ref.index == (j / value.shape[1]) * producerShape[1] + col + (c / 32) * 64 + c % 32;
+          }
+          if (affine) {
+            auto p = s.change(firstPlacement, J{{"kind", "fp16_pair_planar"},
+                {"hemisphere", (col / 32) % 2 ? "west" : "east"},
+                {"base_row", field(firstPlacement,"base_row") + (col / 64) * producerShape[0]},
+                {"instruction_count", value.size() / 32}});
+            node.in[idx] = p;
+            node.inputSlots[idx][0].set(p);
+            node.function->setAttr("ftlpu.depthwise_conv_direct_input", s.b.getBoolAttr(true));
+            node.stagedInputs[idx] = true;
+            continue;
+          }
+        }
+        if (text(firstPlacement,"kind")=="token_partition_planar"
+            && node.function->hasAttr("ftlpu.vector_bf16_token_halves")
+            && value.shape.size()==2 && value.shape[0]==32 && value.shape[1]<=32
+            && producerShape.size()==2 && producerShape[0]==32 && firstRef.index==0
+            && !firstPlacement.get("partition_row_sides")) {
+          bool direct=true;
+          for(I j=0;j<value.size();++j) {
+            const auto ref=value.refs[j];
+            direct &= ref.node==firstRef.node && ref.output==firstRef.output
+                && ref.index==(j/value.shape[1])*producerShape[1]+j%value.shape[1];
+          }
+          if(direct) {
+            node.in[idx]=firstPlacement;
+            for(auto &slot:node.inputSlots[idx]) slot.set(firstPlacement);
+            node.stagedInputs[idx]=true;
+            continue;
+          }
+        }
         if (text(firstPlacement, "kind") == "token_partition_planar"
             && value.shape.size() == 2 && producerShape.size() == 2
             && value.shape[1] <= s.target.memory().bytes_per_word) {
@@ -2827,8 +3515,108 @@ public:
           continue;
         if (planRetainedRmsNorm(ni,oi) || planRetainedAttention(ni,oi) || planInPlacePointwise(ni,oi) || planGroupedPointwise(ni,oi))
           continue;
+        if (oi==3 && llvm::isa<fc::kernel::ScaledMatvecOp>(node.outputSlots[oi].op)) {
+          // The rank-one phase starts only after scaling/contraction drains.
+          // Reuse a dead external matrix home, preserving the separately
+          // retained scaled matrix. Never overwrite a shared/live snapshot.
+          const auto &matrix=node.inputs[0];
+          auto home=node.in[0];
+          Key matrixKey{-1,-1};
+          bool reusable=false;
+          if(matrix.external()) reusable=externalVectorHomes.count({ni,0});
+          else if(!matrix.refs.empty()) {
+            const auto ref=matrix.refs[0];matrixKey={ref.node,ref.output};
+            reusable=last.at(matrixKey)==ni && cache.at(matrixKey)==home &&
+                planner.nodes[ref.node].outputs[ref.output].shape==matrix.shape;
+            for(I j=0;reusable && j<matrix.size();++j)
+              reusable=matrix.refs[j].node==ref.node && matrix.refs[j].output==ref.output && matrix.refs[j].index==j;
+          }
+          // Non-overlapping rows still share one MEM ICU queue. The update
+          // writes must not interleave with K or broadcast-table reads.
+          for(I operand=1;operand<I(node.in.size());++operand)
+            if(overlap(home,node.in[operand]))reusable=false;
+          for(auto workspace:node.workspaces)
+            if(overlap(home,workspace))reusable=false;
+          const auto sameSource=[&](const Tensor &t) {
+            return t.external() && (t.constant==matrix.constant ||
+                (t.dtype==matrix.dtype && t.data==matrix.data));
+          };
+          for(I future=ni+1;future<I(planner.nodes.size());++future)
+            for(const auto &t:planner.nodes[future].inputs)
+              if(sameSource(t))reusable=false;
+          for(const auto &t:finals)if(sameSource(t))reusable=false;
+          const auto intersects=[&](mlir::DictionaryAttr other) {
+            return overlap(home,other)
+                && field(home,"base_row")<field(other,"base_row")+field(other,"instruction_count")
+                && field(other,"base_row")<field(home,"base_row")+field(home,"instruction_count");
+          };
+          for(const auto &entry:externalVectorHomes)
+            if(entry.first.first>=ni && entry.first!=Key{ni,0} && intersects(entry.second))reusable=false;
+          for(const auto &entry:live)
+            if(intersects(entry.second) && entry.first!=matrixKey &&
+                !(entry.first.first==-2 && entry.second==home))reusable=false;
+          if(reusable) {
+            node.outputSlots[oi].set(home);node.out[oi]=home;
+            cache[key]=live[key]=home;
+            continue;
+          }
+        }
+        // Choose the consumer layout at the L2 producer. Four physical rows
+        // hold one D32 tile; alternate their bank without duplicating K.
+        if(auto norm=llvm::dyn_cast<fc::tensor::L2NormTaskOp>(node.outputSlots[oi].op);
+            norm && norm.getInput().getType().getDimSize(1)==128 && norm->hasAttr("native_input_groups")) {
+          bool used=false, onlyGram=true;
+          for(auto &consumer:planner.nodes) for(I operand=0;operand<I(consumer.inputs.size());++operand) {
+            if(!llvm::any_of(consumer.inputs[operand].refs,[&](const Ref &ref){return ref.node==ni && ref.output==oi;})) continue;
+            used=true;
+            const auto &view=consumer.inputs[operand];
+            onlyGram &= view.size()==node.outputs[oi].size();
+            for(I j=0;onlyGram && j<view.size();++j)
+              onlyGram &= view.refs[j].node==ni && view.refs[j].output==oi && view.refs[j].index==j;
+            onlyGram &= operand==0 && !consumer.inputSlots[operand].empty() && llvm::all_of(consumer.inputSlots[operand],[](const auto &slot){
+              auto op=llvm::dyn_cast<fc::kernel::VectorAluOp>(slot.op); return op && op.getKind()=="weighted_gram";
+            });
+          }
+          auto groups=norm->getAttrOfType<mlir::ArrayAttr>("native_input_groups");
+          bool paired=groups && !groups.empty() && groups.size()%2==0 && integer(norm,"native_input_rows")==32;
+          for(I g=0;paired && g<I(groups.size());++g) {
+            auto descriptor=llvm::cast<mlir::DictionaryAttr>(groups[g]);
+            auto source=descriptor.getAs<mlir::DictionaryAttr>("placement");
+            paired=source && !descriptor.getAs<mlir::ArrayAttr>("chunks") &&
+                (text(source,"hemisphere")=="east")== (g%2==0);
+          }
+          auto wide=(*node.module)->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
+          auto split=(*node.module)->getAttrOfType<mlir::BoolAttr>("ftlpu.l2_head_partition");
+          if(used && onlyGram && paired && wide && wide.getValue() && split && split.getValue()
+              && s.target.throughput().mxm_weight_activation_overlap_enabled)
+            node.out[oi]=s.change(node.out[oi],J{{"bank_tile_rows",4}});
+        }
         auto busy = node.in;
         busy.insert(busy.end(), node.workspaces.begin(), node.workspaces.end());
+        // A streamed Gram epilogue reads its coefficient while the final K
+        // activation domain is still live. Plan the producer's final home
+        // on independent ICU queues; different SRAM rows are insufficient.
+        // This keeps the fused SXM output native instead of copying it at A.
+        for (auto &consumer : planner.nodes) {
+          if (consumer.inputs.size()!=2 || consumer.inputSlots.size()!=2 ||
+              consumer.inputSlots[1].empty()) continue;
+          if (!llvm::all_of(consumer.inputSlots[1],[](const auto &slot) {
+                auto op=llvm::dyn_cast<fc::kernel::VectorAluOp>(slot.op);
+                return op && op.getKind()=="weighted_gram" && op.getRhs().getType().getElementType().isBF16();
+              })) continue;
+          if (!llvm::any_of(consumer.inputs[1].refs,[&](const Ref &ref) {
+                return ref.node==ni && ref.output==oi;
+              })) continue;
+          for (const auto &ref : consumer.inputs[0].refs) {
+            auto home=cache.find({ref.node,ref.output});
+            if (home!=cache.end() && std::find(busy.begin(),busy.end(),home->second)==busy.end())
+              busy.push_back(home->second);
+          }
+        }
+        if(oi==4 && llvm::isa<fc::kernel::ScaledMatvecOp>(node.outputSlots[oi].op))
+          // Readout returns while the next updated-state tile still drains.
+          // Different rows cannot make two commands share this MEM ICU.
+          busy.push_back(node.out[3]);
         if (node.ffn) {
           // The FFN result is written by Down after Gate/Up have retired.
           // Protect Down's live operand queues, rather than every queue that
@@ -2875,7 +3663,8 @@ public:
             for (auto &input : consumer.inputs)
               for (auto ref : input.refs) if (ref.node == ni && ref.output == oi) {
                 used = true;
-                eligible &= consumer.function && consumer.function->hasAttr("ftlpu.vector_token_partition")
+                eligible &= consumer.function && (consumer.function->hasAttr("ftlpu.vector_token_partition")
+                    || consumer.function->hasAttr("ftlpu.vector_bf16_token_halves"))
                     && ref.index % (2 * word) < word;
               }
           for (auto &output : finals)
@@ -2963,6 +3752,15 @@ public:
     // MEM/MXM/VXM/SXM domains, deriving route timing from the chosen slices.
     for (auto &node : planner.nodes) {
       if (!node.module) continue;
+      const I nodeIndex=&node-planner.nodes.data();
+      bool terminal=true;
+      for(const auto &consumer:planner.nodes)
+        for(const auto &input:consumer.inputs)
+          for(const auto &ref:input.refs) terminal &= ref.node!=nodeIndex;
+      if(terminal) {
+        node.function->setAttr("ftlpu.vector_native_partition_outputs",s.b.getUnitAttr());
+        node.function->setAttr("ftlpu.l2_native_partition_output",s.b.getUnitAttr());
+      }
       mlir::PassManager pm(&s.context);
       pm.enableVerifier(false);
       pm.addNestedPass<mlir::func::FuncOp>(
@@ -2977,6 +3775,22 @@ public:
       for (I oi = 0; oi < I(node.out.size()); ++oi) {
         auto binding =
             ret.getOperand(oi).getDefiningOp<fc::schedule::BindingOp>();
+        if (binding && text(binding.getPlacement(),"kind")=="fp16_mxm_block4_partition_distributed_16") {
+          auto layout=binding.getPlacement();
+          if(s.change(layout,J{{"kind",text(node.out[oi],"kind")}})!=node.out[oi])
+            throw std::runtime_error("native L2 output changed allocated storage");
+          node.out[oi]=layout; cache[{nodeIndex,oi}]=layout;
+        }
+        if (binding && binding->hasAttr("token_phase")
+            && (text(binding.getPlacement(),"kind")=="token_partition_planar"
+                || text(binding.getPlacement(),"kind")=="token_partition_east_first_planar")) {
+          auto layout=binding.getPlacement();
+          if(s.change(layout,J{{"kind",text(node.out[oi],"kind")}})!=node.out[oi])
+            throw std::runtime_error("token partition changed allocated storage");
+          node.out[oi]=layout;
+          const I index=&node-planner.nodes.data();
+          cache[{index,oi}]=layout;
+        }
         if (!binding || binding.getPlacement() != node.out[oi])
           throw std::runtime_error(
               "native emitter did not honor graph output placement: " +
@@ -2993,6 +3807,8 @@ public:
           if (!node.stagedInputs[idx])
             materialize(a, p);
         prepared.insert({ni, idx});
+      } else if (node.stagedInputs[idx]) {
+        prepared.insert({ni,idx});
       } else if (scalar(p) || text(p, "kind") == "fp16_pair_planar" ||
                  text(p, "kind") == "fp32_quad_planar" ||
                  text(p, "kind") == "fp16_mxm_distributed_16") {
@@ -3059,8 +3875,23 @@ public:
           initialRmsNorm = true;
         });
       for (I i = 0; i < I(node.inputs.size()); ++i)
-        if (node.inputs[i].external() && !(node.recurrent && i == 5))
-          input(node.inputs[i], node.in[i],
+        if (node.inputs[i].external() && !(node.recurrent && i == 5)) {
+          std::vector<mlir::DictionaryAttr> concurrentInputs;
+          const auto fp32InputPolicy=(*node.module)->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_fp32_ingress");
+          bool binaryFp32=false;
+          if(fp32InputPolicy && fp32InputPolicy.getValue())
+            node.function.walk([&](fc::kernel::VectorAluOp op) {
+              binaryFp32 |= !op.getUseImmediate() && op.getLhs()!=op.getRhs()
+                  && (op.getKind()=="add" || op.getKind()=="subtract"
+                      || op.getKind()=="multiply" || op.getKind()=="max");
+            });
+          // Concurrent fixed-port operands need independent MEM ICU queues,
+          // even when the C2C allocator could place them in disjoint rows.
+          if(binaryFp32 || !node.function.getOps<fc::kernel::ScaledMatvecOp>().empty())
+            for(I earlier=0;earlier<i;++earlier)
+              concurrentInputs.push_back(externalVectorHomes.count({ni,earlier})
+                  ? externalVectorHomes.at({ni,earlier}) : node.in[earlier]);
+          auto prior=input(node.inputs[i], node.in[i],
                 node.name + ".input" + std::to_string(i),
                 (initialRmsNorm &&
                     (text(node.in[i], "kind") == "fp16_mxm_distributed_16" ||
@@ -3069,7 +3900,32 @@ public:
                         && (text(node.in[i], "kind") == "fp16_mxm_distributed_16"
                             || (node.ffn && i == 0 &&
                                 text(node.in[i], "kind") == "fp16_mxm_activation_planar"))),
-                node.ffn ? I(planner.nodes.size()) : ni);
+                node.ffn ? I(planner.nodes.size()) : ni,
+                concurrentInputs);
+          // Packed VXM inputs have configurable slice/base addresses. Read
+          // the lifetime-safe C2C home directly instead of copying the whole
+          // tensor back into the emitter's provisional input slots.
+          if (!node.inputSlots[i].empty() &&
+              llvm::all_of(node.inputSlots[i],[&](const auto &slot) {
+                if(llvm::isa<fc::kernel::VectorAluOp,fc::kernel::ScaledMatvecOp>(slot.op)) return true;
+                auto projection=llvm::dyn_cast<fc::tensor::ProjectionTaskOp>(slot.op);
+                return i==0 && projection && projection.getKind()=="linear";
+              }) && text(prior.p,"kind")==text(node.in[i],"kind") &&
+              text(prior.p,"hemisphere")==text(node.in[i],"hemisphere") &&
+              (text(prior.p,"kind")=="fp32_quad_planar" ||
+               text(prior.p,"kind")=="fp16_pair_planar"))
+            externalVectorHomes[{ni,i}]=prior.p;
+          // Linear projection's activation read domains accept arbitrary
+          // slices/base/bank. All pages can use the immutable C2C home; a
+          // provisional bank-0 address is not an execution requirement.
+          if(i==0 && !node.inputSlots[i].empty() &&
+              llvm::all_of(node.inputSlots[i],[](const auto &slot) {
+                auto projection=llvm::dyn_cast<fc::tensor::ProjectionTaskOp>(slot.op);
+                return projection && projection.getKind()=="linear";
+              }) && text(prior.p,"kind")=="fp16_pair_planar" && slices(prior.p).size()==2
+              && text(prior.p,"hemisphere")=="both" && !prior.p.get("storage_shape"))
+            externalVectorHomes[{ni,i}]=prior.p;
+        }
     }
     planMemory();
     std::set<Key> prepared;
@@ -3078,6 +3934,42 @@ public:
     for (I ni = 0; ni < I(planner.nodes.size()); ++ni) {
       auto &node = planner.nodes[ni];
       llvm::outs() << "plan " << ni << " " << node.name << "\n";
+      s.transportPhase=node.name;
+      for(I operand=0;operand<I(node.inputs.size());++operand) {
+        auto found=wideBroadcastOperands.find({ni,operand});
+        if(found==wideBroadcastOperands.end() || emittedWideBroadcasts.count(found->second)) continue;
+        const auto key=found->second;
+        const auto src=cache.at(key),dst=wideBroadcastHomes.at(key);
+        const I heads=planner.nodes[key.first].outputs[key.second].size();
+        const auto ss=slices(src),ds=slices(dst);
+        const I begin=s.cursor;
+        for(I pair=0;pair<2;++pair) {
+          const I capture=s.cursor+32;
+          I end=capture;
+          for(I side=0;side<2;++side) {
+            auto from=s.change(src,J{{"hemisphere",side?"west":"east"}});
+            auto to=s.change(dst,J{{"hemisphere",side?"west":"east"}});
+            s.emit("sxm",J{{"cycle",capture},{"hemisphere",side},{"opcode","transpose"},
+                {"source_streams",s.array({16,17})},{"destination_streams",s.array({32+side*16,33+side*16})},
+                {"permute_map",s.array(range(32))},{"weight_layout","wide_matrix"},
+                {"repeat_count",1},{"repeat_interval",32},{"wave_count",1},{"wave_interval",32}});
+            for(I byte=0;byte<2;++byte) {
+              I plane=pair*2+byte;
+              const I readLatency=*s.target.transport_latency(fc::target::StreamEndpoint::Mem,
+                  fc::target::StreamEndpoint::SxmInput,fc::target::StreamDirection::East,ss[plane]);
+              const I writeLatency=*s.target.transport_latency(fc::target::StreamEndpoint::SxmResult,
+                  fc::target::StreamEndpoint::Mem,fc::target::StreamDirection::West,ds[plane]);
+              s.mem(capture-readLatency,from,plane,"read",field(src,"base_row"),16+byte,{32,1,1},{0,0,0},{1,32,32});
+              s.mem(capture+35+writeLatency,to,plane,"write",field(dst,"base_row"),32+side*16+byte,
+                  {heads,1,1},{1,0,0},{1,heads,heads});
+              end=std::max(end,capture+35+writeLatency+32);
+            }
+          }
+          s.cursor=end+32;
+        }
+        s.emit("timeline",J{{"name","wide_scalar_broadcast"},{"start",begin},{"end",s.cursor}});
+        emittedWideBroadcasts.insert(key);
+      }
       llvm::outs().flush();
       if (!node.module) {
         nodeRanges.push_back(
@@ -3141,7 +4033,7 @@ public:
               if (!node.stagedInputs[idx])
                 materialize(a, p);
             }
-            else {
+            else if (!node.stagedInputs[idx]) {
               auto prior =
                   input(a, p, node.name + ".input" + std::to_string(idx));
               if (prior.p != p)
@@ -3283,16 +4175,32 @@ public:
           s.set(copy, "start", integer(copy, "start") + start);
           s.set(copy, "end", integer(copy, "end") + start);
           end = std::max(end, integer(copy, "end"));
-          if (auto n = copy->getAttrOfType<mlir::StringAttr>("name"))
-            copy->setAttr("name",
-                          s.b.getStringAttr(node.name + "." + n.getValue()));
+          if (auto n = copy->getAttrOfType<mlir::StringAttr>("name")) {
+            auto name = n.getValue();
+            constexpr llvm::StringLiteral prefix("c2c.window.binding:");
+            if (name.starts_with(prefix)) {
+              auto suffix = name.drop_front(prefix.size());
+              auto parts = suffix.split(".page:");
+              int64_t localBinding = -1;
+              if (parts.first.getAsInteger(10, localBinding)
+                  || parts.second.empty() || !relocated.count(localBinding))
+                throw std::runtime_error("cannot relocate native C2C window binding");
+              copy->setAttr("name", s.b.getStringAttr(prefix.str()
+                  + std::to_string(relocated.at(localBinding).second.index)
+                  + ".page:" + parts.second.str()));
+            } else if (name == "common_barrier.drain_cost") {
+              // Protocol timelines retain their reserved names after linking.
+            } else {
+              copy->setAttr("name", s.b.getStringAttr(node.name + "." + name));
+            }
+          }
         }
         if (copy->hasAttr("ready_cycle"))
           s.set(copy, "ready_cycle", integer(copy, "ready_cycle") + start);
       }
       llvm::json::Array layouts;
       for (auto p : node.out)
-        layouts.push_back(J{{"kind", text(p, "kind")},
+        layouts.push_back(J{{"kind", text(p, "kind")},{"bank_tile_rows",field(p,"bank_tile_rows")},
                             {"hemisphere", text(p, "hemisphere")},
                             {"slices", s.array(slices(p))},
                             {"bank", field(p, "bank")},
@@ -3343,6 +4251,12 @@ public:
           s.emit("timeline", J{{"name", node.name + ".retain_on_chip"},
                                {"start", begin}, {"end", s.cursor}});
         }
+      if(node.function->hasAttr("ftlpu.imem_drain_after")) {
+        if(node.parallel>=0)throw std::runtime_error("iMEM drain cannot split parallel nodes");
+        s.emit("timeline",J{{"name","imem.drain."+node.name},
+            {"start",s.cursor-1},{"end",s.cursor}});
+        s.cursor+=96;
+      }
       for (auto it = live.begin(); it != live.end();)
         if (last[it->first] == ni)
           it = live.erase(it);
@@ -3350,6 +4264,7 @@ public:
           ++it;
     }
     for (I i = 0; i < I(finals.size()); ++i) {
+      s.transportPhase="validation_export."+std::to_string(i);
       auto &value = finals[i];
       bool identity = !value.refs.empty();
       auto first = value.refs[0];
@@ -3357,6 +4272,33 @@ public:
         identity &= value.refs[j].node == first.node &&
                     value.refs[j].output == first.output &&
                     value.refs[j].index == j;
+      // Interleaved complete four-word groups already occupy matching native
+      // distributed allocations. Export their physical halves, not a gathered
+      // planar archive. Validate every logical element before selecting this ABI.
+      if(!identity && value.dtype=="bf16" && value.shape.size()==2 && value.shape[1]%256==0) {
+        const I columns=value.shape[1], local=columns/2;
+        auto even=value.refs[0], odd=value.refs[128];
+        auto ep=cache.at({even.node,even.output}), wp=cache.at({odd.node,odd.output});
+        bool direct=text(ep,"kind")=="fp16_mxm_distributed_16" && text(wp,"kind")==text(ep,"kind")
+            && text(ep,"hemisphere")=="east" && text(wp,"hemisphere")=="west"
+            && s.change(ep,J{{"hemisphere","west"}})==wp
+            && planner.nodes[even.node].outputs[even.output].shape==V({value.shape[0],local})
+            && planner.nodes[odd.node].outputs[odd.output].shape==V({value.shape[0],local});
+        for(I j=0;direct && j<value.size();++j) {
+          const I c=j%columns; const auto owner=(c/128)%2 ? odd : even;
+          const auto ref=value.refs[j];
+          direct=ref.node==owner.node && ref.output==owner.output
+              && ref.index==(j/columns)*local+(c/256)*128+c%128;
+        }
+        if(direct) {
+          auto p=s.change(ep,J{{"kind","fp16_mxm_compact_block4_partition_distributed_16"},{"hemisphere","both"}});
+          s.binding(value,p,"output",i,"output"+std::to_string(i));continue;
+        }
+      }
+      // A prefix of a padded native tile is not the complete storage tensor.
+      // Export only the requested live rows, not its unused physical lanes.
+      if (identity)
+        identity = value.size() == planner.nodes[first.node].outputs[first.output].size();
       // A concatenation of matching physical token partitions is only a
       // logical view. Export the native row-partition layout without FU copies.
       if (!identity && value.shape.size() == 2 && value.shape[0] >= 2
@@ -3390,10 +4332,12 @@ public:
       if (identity) {
         auto native = cache.at({first.node, first.output});
         const auto kind = text(native, "kind");
-        const bool externalPlanar = scalar(native) ||
+        const bool externalPlanar = scalar(native) || kind == "token_partition_planar"
+            || kind == "token_partition_east_first_planar" ||
             (kind == "fp16_pair_planar" && slices(native).size() == 2) ||
             kind == "fp32_quad_planar" ||
             kind == "fp16_mxm_distributed_16" ||
+            kind == "fp16_mxm_block4_partition_distributed_16" ||
             kind == "fp16_vxm_distributed_16";
         if (!externalPlanar)
           identity = false;
@@ -3429,6 +4373,7 @@ public:
     llvm::raw_string_ostream planStream(plan);
     planStream << llvm::json::Value(
         J{{"planning", "tensor_subgraph_before_schedule"},
+          {"linker_mem_transports",std::move(s.transportDomains)},
           {"native_output_archive_copies", I(retainedOutputHomes.size())},
           {"nodes", std::move(nodeRanges)}});
     std::ofstream(directory / "graph_plan.json") << plan << '\n';
@@ -3596,8 +4541,21 @@ mlir::OwningOpRef<mlir::ModuleOp> ftlpu::compiler::lower_connected_decoder_graph
       planner.distributedConvOutput |= fromConvolution(fromConvolution,
                                                         norm.getInput());
   }
+  // Decode head geometry comes from the semantic reduction and Conv graph,
+  // not from checkpoint names or test-side physical permutations.
+  for(auto &op:function.front()) {
+    if(auto norm=llvm::dyn_cast<fc::kernel::L2NormOp>(op)) {
+      const auto ty=norm.getInput().getType();
+      if(ty.getRank()==2 && ty.getDimSize(0)>1 && ty.getDimSize(0)<32)
+        planner.decodeHeadWidth=ty.getDimSize(1);
+    }
+    if(auto conv=llvm::dyn_cast<fc::kernel::DepthwiseConv1DOp>(op)) {
+      const auto ty=conv.getInput().getType();
+      if(ty.getDimSize(0)<=4) planner.decodeConvWidth=ty.getDimSize(1);
+    }
+  }
   mlir::NamedAttrList policies;
-  for (auto name : {"ftlpu.mxm_execution_policy", "ftlpu.projection_rope_overlap", "ftlpu.vector_bf16_spill"})
+  for (auto name : {"ftlpu.vector_fp32_ingress", "ftlpu.mxm_execution_policy", "ftlpu.projection_rope_overlap", "ftlpu.vector_bf16_spill", "ftlpu.vector_bf16_rne_spill", "ftlpu.gdn_decode_retrieval_mxm", "ftlpu.gdn_prefill_strategy", "ftlpu.common_barrier_protocol", "ftlpu.icu_compression", "ftlpu.ffn_schedule", "ftlpu.sxm_wide", "ftlpu.l2_head_partition", "ftlpu.vector_log_softplus", "ftlpu.vector_bf16_token_halves"})
     if (auto attr = module->getAttr(name)) policies.set(name,attr);
   planner.policies = policies.getDictionary(&context);
   if (auto strategy = module->getAttrOfType<mlir::StringAttr>("ftlpu.ffn_schedule"))
@@ -3682,6 +4640,10 @@ mlir::OwningOpRef<mlir::ModuleOp> ftlpu::compiler::lower_connected_decoder_graph
     // Region extraction must preserve the decoder's GDN lowering policy.
     // Otherwise a whole-function chunkwise request silently becomes a scan
     // when Planner::lower matches the extracted recurrence subgraph.
+    if (auto policy = function->getAttr("ftlpu.gdn_prefill_strategy"))
+      f->setAttr("ftlpu.gdn_prefill_strategy", policy);
+    else if (auto policy = module->getAttr("ftlpu.gdn_prefill_strategy"))
+      f->setAttr("ftlpu.gdn_prefill_strategy", policy);
     if (auto policy = function->getAttr("ftlpu.gdn_chunk_size"))
       f->setAttr("ftlpu.gdn_chunk_size", policy);
     else if (auto policy = module->getAttr("ftlpu.gdn_chunk_size"))

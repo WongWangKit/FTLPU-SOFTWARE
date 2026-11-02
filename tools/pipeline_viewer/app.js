@@ -618,6 +618,12 @@ function patternVisibleSegments(pattern, viewStart, viewEnd) {
   let total = 0;
   for (let outer = 0; outer < pattern.outerCount; outer += 1) {
     const outerStart = pattern.start + outer * pattern.outerInterval;
+    // A singleton inner axis still needs viewport clipping. Counting every
+    // outer instance can trigger LOD sampling even when zoomed in, dropping
+    // real compute blocks and making a continuous stream look idle.
+    const outerEnd = outerStart
+      + (pattern.innerCount - 1) * pattern.innerInterval + duration;
+    if (outerEnd < viewStart || outerStart > viewEnd) continue;
     let first = pattern.innerCount === 1 ? 0
       : Math.ceil((viewStart - duration - outerStart) / pattern.innerInterval);
     let last = pattern.innerCount === 1 ? 0
@@ -1209,17 +1215,35 @@ window.addEventListener("resize", () => {
 
 setTrace(parseCsv(SAMPLE_CSV), "sample_trace.csv");
 
-const csvUrl = new URLSearchParams(window.location.search).get("csv");
+const pageParams = new URLSearchParams(window.location.search);
+const csvUrl = pageParams.get("csv");
 if (csvUrl) {
   const name = csvUrl.split("/").filter(Boolean).pop() || "runtime.csv";
   dom.interactionState.textContent = "Fetching runtime CSV";
-  fetch(csvUrl)
+  fetch(csvUrl, {cache: "no-store"})
     .then((response) => {
       if (!response.ok)
         throw new Error(`CSV fetch failed: ${response.status}`);
       return response.blob();
     })
     .then((blob) => loadFile(new File([blob], name, {type: "text/csv"})))
+    .then(() => {
+      const family = pageParams.get("family");
+      if ([...dom.familyFilter.options].some((option) => option.value === family)) {
+        state.family = family;
+        dom.familyFilter.value = family;
+        state.scrollY = 0;
+        applyFilters();
+      }
+      const start = Number(pageParams.get("start"));
+      const end = Number(pageParams.get("end"));
+      if (pageParams.has("start") && pageParams.has("end")
+          && Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        state.viewStart = start;
+        state.viewEnd = end;
+        drawAll();
+      }
+    })
     .catch((error) => {
       dom.interactionState.textContent = error.message;
     });

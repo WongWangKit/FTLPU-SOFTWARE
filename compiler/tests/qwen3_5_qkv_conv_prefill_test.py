@@ -130,7 +130,7 @@ def main():
                     str(a.target_config.resolve())], check=True)
     subprocess.run([str(a.compile.resolve()), '--input', str(kernel),
                     '--input-stage', 'kernel', '--output', str(binary),
-                    '--mxm-execution', 'vector', '--target-config',
+                    '--mxm-execution', 'ws', '--target-config',
                     str(a.target_config.resolve())], check=True)
     if a.with_qk_norm:
         compiled_kernel = kernel.read_text(encoding='utf-8')

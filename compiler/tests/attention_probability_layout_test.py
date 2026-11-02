@@ -37,7 +37,7 @@ def main() -> None:
     output_path = args.output_dir / "decoder.tensor.mlir"
     result = subprocess.run([
         str(args.tool), "--input", str(input_path), "--output", str(output_path),
-        "--pipeline", "ftlpu-stablehlo-to-tensor", "--mxm-execution", "vector",
+        "--pipeline", "ftlpu-stablehlo-to-tensor", "--mxm-execution", "ws",
         "--weight-bank", "0", "--target-config", str(target_path),
     ], capture_output=True, text=True)
     if result.returncode:

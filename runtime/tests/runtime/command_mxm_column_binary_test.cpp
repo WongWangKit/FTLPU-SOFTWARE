@@ -38,7 +38,7 @@ try {
     const auto instruction = isa::decode_mxm_instruction(encoded);
     require(instruction.opcode == MxmControlOpcode::IW,
         "decoded instruction is not IW");
-    require(instruction.weight_load_mode == MxmWeightLoadMode::Column,
+    require(instruction.weight_load_mode == MxmWeightLoadMode::Vector,
         "MXM column load mode was lost during binary translation");
     require(instruction.weight_buffer == 1, "wrong MXM weight buffer");
     require(instruction.weight_column == 2, "wrong MXM outer weight column");

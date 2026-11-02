@@ -500,6 +500,39 @@ void test_vxm_distributed_roundtrip()
         }
 }
 
+void test_block4_partition_distributed_roundtrip()
+{
+    for (auto layout : {BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16, BindingLayout::Fp16MxmBlock4PartitionDistributed16,
+                        BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16}) {
+        BinaryProgram program;
+        BinaryBinding b;
+        b.index=0; b.access=BindingAccess::Input;
+        b.layout=layout; b.element_type=BindingElementType::BF16;
+        b.shape={64,512}; b.byte_size=64*512*2;
+        b.base_row=7; b.address_stride=1; b.bank=1; b.hemisphere_mask=3;
+        for(std::uint16_t slice=0;slice<16;++slice) b.slices.push_back(slice);
+        std::vector<std::uint8_t> data(b.byte_size);
+        for(std::size_t i=0;i<data.size();++i) data[i]=static_cast<std::uint8_t>(i*37+i/113);
+        const auto image=pack_binding_image(b,data,program.hardware);
+        require(unpack_binding_image(b,image,program.hardware)==data,"partitioned distributed C2C roundtrip");
+        program.bindings.push_back(b);
+        auto system=std::make_unique<ftlpu::TspSliceSystem>();
+        CModelRuntime runtime(*system); runtime.load(program); runtime.upload_input(0,data);
+        for(const auto &segment:image.segments)
+          for(std::size_t row=0;row<segment.vector_count;++row)
+            for(std::size_t lane=0;lane<32;++lane)
+              require(image.data[segment.byte_offset+row*32+lane]==system->read_mem_sram_lane_byte(
+                static_cast<ftlpu::Hemisphere>(segment.hemisphere),segment.slice,
+                  1 ^ (layout==BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16 ? ((segment.base_row+row-b.base_row)/4)%2 : 0),
+                  lane/8,segment.base_row+row,lane%8),
+                "partitioned distributed physical ownership mismatch");
+        // Download from the same physical homes, without a mirror copy.
+        b.access=BindingAccess::Output; b.index=1;
+        program.bindings.push_back(b); runtime.load(program); runtime.upload_input(0,data);
+        require(runtime.download_output(1)==data,"partitioned distributed download");
+    }
+}
+
 void test_four_slice_pair_planar_roundtrip()
 {
     BinaryProgram program;
@@ -575,14 +608,14 @@ void test_distributed_activation_target_width()
   }
 }
 
-void test_token_partition_planar(bool columns = false)
+void test_token_partition_planar(bool columns = false, bool eastFirst = false)
 {
     for (const auto type : {BindingElementType::BF16, BindingElementType::F32}) {
         const std::size_t bytes = type == BindingElementType::F32 ? 4 : 2;
         BinaryProgram program;
         BinaryBinding b;
         b.index = 0; b.access = BindingAccess::Input; b.element_type = type;
-        b.layout = columns ? BindingLayout::ColumnPartitionPlanar : BindingLayout::TokenPartitionPlanar;
+        b.layout = columns ? BindingLayout::ColumnPartitionPlanar : eastFirst ? BindingLayout::TokenPartitionEastFirstPlanar : BindingLayout::TokenPartitionPlanar;
         const std::size_t width = columns ? 128 : 65;
         b.shape = {5,width}; b.byte_size = 5 * width * bytes;
         b.bank = 1; b.base_row = 7; b.address_stride = 2;
@@ -605,7 +638,7 @@ void test_token_partition_planar(bool columns = false)
                 for (std::size_t byte = 0; byte < bytes; ++byte) {
                     const auto side = columns
                         ? (col < width/2 ? ftlpu::Hemisphere::East : ftlpu::Hemisphere::West)
-                        : (row < 3 ? ftlpu::Hemisphere::West : ftlpu::Hemisphere::East);
+                        : ((row < 3) != eastFirst ? ftlpu::Hemisphere::West : ftlpu::Hemisphere::East);
                     const auto address = 7 + (columns
                         ? ((col % (width/2)) / program.hardware.bytes_per_word) * 5 + row
                         : (col / program.hardware.bytes_per_word) * 3 + row % 3) * 2;
@@ -787,8 +820,10 @@ try {
         return 0;
     }
     test_vxm_distributed_roundtrip();
+    test_block4_partition_distributed_roundtrip();
     test_token_partition_planar();
     test_token_partition_planar(true);
+    test_token_partition_planar(false, true);
     if (argc == 2 && std::string(argv[1]) == "--paged-output-tail") {
         for (const std::size_t width : {16, 32, 64}) {
             test_paged_output_tail(BindingLayout::W8A16AttentionWeightStriped,

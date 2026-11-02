@@ -58,7 +58,8 @@ void write_binding_sram_byte(TspSliceSystem& system,
     const BinaryBinding& binding, Hemisphere hemisphere, std::size_t slice,
     std::size_t address, std::size_t column, std::uint8_t value)
 {
-    system.initialize_mem_sram_lane_byte(hemisphere, slice, binding.bank,
+    system.initialize_mem_sram_lane_byte(hemisphere, slice, binding.bank ^
+        (binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16 ? ((address-binding.base_row)/4)%2 : 0),
         column / hw::kLanesPerTile, address,
         column % hw::kLanesPerTile, value);
 }
@@ -67,7 +68,8 @@ std::uint8_t read_binding_sram_byte(const TspSliceSystem& system,
     const BinaryBinding& binding, Hemisphere hemisphere, std::size_t slice,
     std::size_t address, std::size_t column)
 {
-    return system.read_mem_sram_lane_byte(hemisphere, slice, binding.bank,
+    return system.read_mem_sram_lane_byte(hemisphere, slice, binding.bank ^
+        (binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16 ? ((address-binding.base_row)/4)%2 : 0),
         column / hw::kLanesPerTile, address,
         column % hw::kLanesPerTile);
 }
@@ -130,6 +132,11 @@ void initialize_vxm_luts(TspSliceSystem& system)
         {1.0f, reciprocalWidth},
         make_vxm_lut(1.0f, reciprocalWidth, entries,
             [](float x) { return 1.0f / x; }));
+
+    system.initialize_vxm_lut(VxmSpecialAluOpcode::Log,
+        {1.0f, reciprocalWidth},
+        make_vxm_lut(1.0f, reciprocalWidth, entries,
+            [](float x) { return std::log(x); }));
 
     const float rsqrtWidth = 3.0f / static_cast<float>(entries);
     system.initialize_vxm_lut(VxmSpecialAluOpcode::Rsqrt,
@@ -321,7 +328,9 @@ std::uint16_t read_16bit_element(const TspSliceSystem& system,
                    hemisphere, binding.slices[1], address, column % width))
                 << 8);
     }
-    if ((binding.layout == BindingLayout::Fp16MxmDistributed16
+    if ((binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+            || (binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16 || binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16)
+            || binding.layout == BindingLayout::Fp16MxmDistributed16
             || binding.layout
                 == BindingLayout::Fp16MxmBlock8Distributed16)
         && binding.slices.size() == 16) {
@@ -332,9 +341,13 @@ std::uint16_t read_16bit_element(const TspSliceSystem& system,
         const std::size_t hidden_block = column / hardware.bytes_per_word;
         const std::size_t feature_lane = column % hardware.bytes_per_word;
         const std::size_t address = static_cast<std::size_t>(binding.base_row)
-            + (token_block * hidden_blocks + hidden_block) * hardware.tile_rows
+            + (binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+                        ? token_block * (hidden_blocks / 2) + (hidden_block / 8) * 4 + hidden_block % 4
+                        : token_block * hidden_blocks + hidden_block) * hardware.tile_rows
             + token_wave;
-        const auto hemisphere = binding.layout
+        const auto hemisphere = binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+            ? static_cast<Hemisphere>((hidden_block / 4) % 2) : (binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16 || binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16)
+            ? static_cast<Hemisphere>(1 - (hidden_block / 4) % 2) : binding.layout
                 == BindingLayout::Fp16MxmBlock8Distributed16
             ? static_cast<Hemisphere>(
                 (hidden_block
@@ -433,17 +446,13 @@ void CModelRuntime::load(
                      (q.kind==QueueKind::Vxm || q.kind==QueueKind::SxmTranspose || q.kind==QueueKind::SxmPermute));
             });
         if (supported) {
-            BinaryProgram subset;
-            subset.hardware=program.hardware;subset.max_cycle=program.max_cycle;
-            subset.timelines=program.timelines;
             for(const auto& q:imem.queues)if(q.physical_overflow())
                 compute_imem_queues_.emplace_back(q.kind,q.index);
             const auto selected=[&](const auto& q) {
                 return std::find(compute_imem_queues_.begin(),compute_imem_queues_.end(),
                     std::make_pair(q.kind,static_cast<std::size_t>(q.index)))!=compute_imem_queues_.end();
             };
-            for(const auto& q:program.queues)if(selected(q))subset.queues.push_back(q);
-            compute_imem_segments_=split_resident_program_at_drains(subset);
+            compute_imem_segments_=plan_compute_imem_segments(program);
             compute_imem_boundary_=compute_imem_segments_.front().max_cycle;
             std::erase_if(initialQueues,selected);
             const auto& first=compute_imem_segments_.front().queues;
@@ -869,6 +878,7 @@ void CModelRuntime::upload_binding(
         columns *= static_cast<std::size_t>(binding.shape[2]);
     const std::size_t row_stride = static_cast<std::size_t>(std::abs(binding.address_stride));
     if (binding.layout == BindingLayout::TokenPartitionPlanar
+        || binding.layout == BindingLayout::TokenPartitionEastFirstPlanar
         || binding.layout == BindingLayout::ColumnPartitionPlanar) {
         const bool columnPartition = binding.layout == BindingLayout::ColumnPartitionPlanar;
         const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
@@ -882,7 +892,7 @@ void CModelRuntime::upload_binding(
             for (std::size_t column = 0; column < columns; ++column) {
                 const auto hemisphere = columnPartition
                     ? (column < halfColumns ? Hemisphere::East : Hemisphere::West)
-                    : (row < half ? Hemisphere::West : Hemisphere::East);
+                    : ((row < half) != (binding.layout == BindingLayout::TokenPartitionEastFirstPlanar) ? Hemisphere::West : Hemisphere::East);
                 const auto address = static_cast<std::size_t>(binding.base_row)
                     + (columnPartition ? ((column % halfColumns) / hardware_.bytes_per_word) * rows + row
                         : (column / hardware_.bytes_per_word) * half + row % half) * row_stride;
@@ -1183,7 +1193,9 @@ void CModelRuntime::upload_binding(
         }
         return;
     }
-    if ((binding.layout == BindingLayout::Fp16MxmDistributed16
+    if ((binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+            || (binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16 || binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16)
+            || binding.layout == BindingLayout::Fp16MxmDistributed16
             || binding.layout
                 == BindingLayout::Fp16MxmBlock8Distributed16)
         && is_16bit_float(binding.element_type)
@@ -1202,7 +1214,9 @@ void CModelRuntime::upload_binding(
                 const std::size_t feature_lane = column % hardware_.bytes_per_word;
                 const std::size_t address =
                     static_cast<std::size_t>(binding.base_row)
-                    + (token_block * hidden_blocks + hidden_block) * hardware_.tile_rows
+                    + (binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+                        ? token_block * (hidden_blocks / 2) + (hidden_block / 8) * 4 + hidden_block % 4
+                        : token_block * hidden_blocks + hidden_block) * hardware_.tile_rows
                     + token_wave;
                 const std::size_t offset = (row * columns + column) * 2;
                 const auto writeHemisphere = [&](Hemisphere hemisphere) {
@@ -1213,7 +1227,11 @@ void CModelRuntime::upload_binding(
                             binding.slices[2 * token_lane + 1], address,
                             feature_lane, data[offset + 1]);
                     };
-                if (binding.layout
+                if (binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16) {
+                    writeHemisphere(static_cast<Hemisphere>((hidden_block / 4) % 2));
+                } else if ((binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16 || binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16)) {
+                    writeHemisphere(static_cast<Hemisphere>(1 - (hidden_block / 4) % 2));
+                } else if (binding.layout
                     == BindingLayout::Fp16MxmBlock8Distributed16) {
                     const auto hemisphere = static_cast<Hemisphere>(
                         (hidden_block % (hw::kHemispheres
@@ -1468,6 +1486,7 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
     const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);
     const std::size_t row_stride = static_cast<std::size_t>(std::abs(binding.address_stride));
     if (binding.layout == BindingLayout::TokenPartitionPlanar
+        || binding.layout == BindingLayout::TokenPartitionEastFirstPlanar
         || binding.layout == BindingLayout::ColumnPartitionPlanar) {
         const bool columnPartition = binding.layout == BindingLayout::ColumnPartitionPlanar;
         const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
@@ -1482,7 +1501,7 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
             for (std::size_t column = 0; column < columns; ++column) {
                 const auto hemisphere = columnPartition
                     ? (column < halfColumns ? Hemisphere::East : Hemisphere::West)
-                    : (row < half ? Hemisphere::West : Hemisphere::East);
+                    : ((row < half) != (binding.layout == BindingLayout::TokenPartitionEastFirstPlanar) ? Hemisphere::West : Hemisphere::East);
                 const auto address = static_cast<std::size_t>(binding.base_row)
                     + (columnPartition ? ((column % halfColumns) / hardware_.bytes_per_word) * rows + row
                         : (column / hardware_.bytes_per_word) * half + row % half) * row_stride;
@@ -1721,7 +1740,9 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
         }
         return result;
     }
-    if ((binding.layout == BindingLayout::Fp16MxmDistributed16
+    if ((binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+            || (binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16 || binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16)
+            || binding.layout == BindingLayout::Fp16MxmDistributed16
             || binding.layout
                 == BindingLayout::Fp16MxmBlock8Distributed16)
         && is_16bit_float(binding.element_type)
@@ -1742,10 +1763,14 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
                 const std::size_t feature_lane = column % hardware_.bytes_per_word;
                 const std::size_t address =
                     static_cast<std::size_t>(binding.base_row)
-                    + (token_block * hidden_blocks + hidden_block) * hardware_.tile_rows
+                    + (binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+                        ? token_block * (hidden_blocks / 2) + (hidden_block / 8) * 4 + hidden_block % 4
+                        : token_block * hidden_blocks + hidden_block) * hardware_.tile_rows
                     + token_wave;
                 const std::size_t offset = (row * columns + column) * 2;
-                const auto hemisphere = binding.layout
+                const auto hemisphere = binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+            ? static_cast<Hemisphere>((hidden_block / 4) % 2) : (binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16 || binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16)
+            ? static_cast<Hemisphere>(1 - (hidden_block / 4) % 2) : binding.layout
                         == BindingLayout::Fp16MxmBlock8Distributed16
                     ? static_cast<Hemisphere>(
                         (hidden_block

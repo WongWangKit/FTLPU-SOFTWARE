@@ -318,10 +318,14 @@ mlir::FailureOr<FfnSwishEmission> emitChainSwish(
         maxWrite = std::max(maxWrite, target.transport_latency(
             target::StreamEndpoint::VxmResult, target::StreamEndpoint::Mem,
             target::StreamDirection::East, slice).value());
-    int64_t inputCycle = context.projection_timeline.final_projection_cycle
+    // Multi-token-tile WRITE3D domains must retire completely before reuse.
+    const bool streaming = context.strategy == FfnScheduleStrategy::Fused
+        && context.projection_timeline.m_tile_count == 1;
+    int64_t inputCycle = streaming ? 0 : context.projection_timeline.final_projection_cycle
         + context.projection_timeline.accumulator_queue_release;
-    for (const auto& completed : projection.completed_tiles)
-        inputCycle = std::max(inputCycle, completed.deferred_ready_cycle);
+    if (!streaming)
+        for (const auto& completed : projection.completed_tiles)
+            inputCycle = std::max(inputCycle, completed.deferred_ready_cycle);
     inputCycle += maxRead + 2;
     constexpr int64_t latency = 17;
     FfnSwishEmission result {};
@@ -336,6 +340,9 @@ mlir::FailureOr<FfnSwishEmission> emitChainSwish(
             ffn.getOperation()->emitError("shared chain SwiGLU requires paired hemisphere tiles");
             return mlir::failure();
         }
+        if (streaming)
+            inputCycle = std::max(inputCycle,
+                std::max(east.deferred_ready_cycle, west->deferred_ready_cycle) + maxRead + 2);
         const auto group = east.pair / pairsPerGroup;
         if (2 * group + 1 >= gateSlices.size() || 2 * group + 1 >= upSlices.size())
             return mlir::failure();
@@ -377,8 +384,20 @@ mlir::FailureOr<FfnSwishEmission> emitChainSwish(
                 context.hidden_slices, value, inputCycle, completed->m_tile,
                 completed->pair, completed->hemisphere, rows, false, {}, false, latency);
         result.last_cycle = inputCycle + rows - 1;
-        inputCycle += rows + latency + maxWrite + maxRead + 2;
+        if (streaming) {
+            // Finish each mirrored tile while MXM computes the next Up tile.
+            // These complete READ/WRITE domains retire in queue order; no
+            // long hidden-copy phase is left after the final Up result.
+            const CompletedProjectionTile* tiles[] = {&east, &*west};
+            if (mlir::failed(emitHiddenMirrorCopies(context, tiles,
+                    result.last_cycle, result)))
+                return mlir::failure();
+            inputCycle = result.last_cycle + maxRead + 2;
+        } else {
+            inputCycle += rows + latency + maxWrite + maxRead + 2;
+        }
     }
+    if (streaming) return result;
     llvm::SmallVector<const CompletedProjectionTile*> tiles;
     for (const auto& completed : projection.completed_tiles) tiles.push_back(&completed);
     if (mlir::failed(emitHiddenMirrorCopies(context, tiles, result.last_cycle, result)))

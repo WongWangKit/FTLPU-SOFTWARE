@@ -295,16 +295,17 @@ LogicalResult MxmOp::verify()
         || getWeightColumn() < 0 || getWeightColumn() >= target.throughput().tile_rows
         || getRepeatCount() <= 0 || getRepeatInterval() <= 0)
         return emitOpError("contains an invalid ICU MXM queue command field");
-    const bool decodeLoad = getOpcode() == "decode_load_activation";
-    const bool decodeCompute = getOpcode() == "decode_stream_compute";
+    const bool decodeLoad = getOpcode() == "is_load_activation";
+    const bool decodeCompute = getOpcode() == "is_stream_compute";
     if (getOpcode() != "iw" && getOpcode() != "compute"
         && getOpcode() != "accumulator_read" && !decodeLoad
         && !decodeCompute)
         return emitOpError("opcode must be iw, compute, accumulator_read, "
-                           "decode_load_activation, or decode_stream_compute");
+                           "is_load_activation, or is_stream_compute");
     if ((decodeLoad || decodeCompute)
-        && getDecodeLayout().value_or("") != "native4")
-        return emitOpError("decode MXM command requires decode_layout=native4");
+        && getIsMode().value_or("") != "is-block"
+        && getIsMode().value_or("") != "is-vector")
+        return emitOpError("IS MXM command requires is_mode=is-block or is-vector");
     const int64_t waveCount = getWaveCount().value_or(1);
     const int64_t waveInterval = getWaveInterval().value_or(1);
     const int64_t waveColumnStride =
@@ -341,16 +342,16 @@ LogicalResult MxmOp::verify()
         return emitOpError(
             "accumulator_output_format must be fp32 or bf16");
     const llvm::StringRef loadMode =
-        getWeightLoadMode().value_or("supercell");
+        getWeightLoadMode().value_or("block");
     const int64_t innerColumn = getWeightInnerColumn().value_or(0);
-    if (loadMode != "supercell" && loadMode != "column")
+    if (loadMode != "block" && loadMode != "vector")
         return emitOpError(
             "weight_load_mode must be supercell or column");
-    if (getOpcode() != "iw" && loadMode != "supercell")
+    if (getOpcode() != "iw" && loadMode != "block")
         return emitOpError(
             "only iw may use column weight loading");
-    if ((loadMode == "supercell" && innerColumn != 0)
-        || (loadMode == "column"
+    if ((loadMode == "block" && innerColumn != 0)
+        || (loadMode == "vector"
             && (innerColumn < 0
                 || innerColumn >= target.throughput().lanes_per_tile)))
         return emitOpError("contains an invalid MXM inner weight column");
@@ -386,7 +387,7 @@ LogicalResult MxmOp::verify()
     if ((decodeLoad || decodeCompute)
         && getDataFormat().value_or("bf16") != "bf16")
         return emitOpError("native4 decode currently requires BF16 data");
-    const int64_t weightStreams = loadMode == "column"
+    const int64_t weightStreams = loadMode == "vector"
         ? inputMode == "int8_dequant_bf16" ? 1 : 2
         : inputMode == "int8_dequant_bf16"
         ? target.throughput().mxm_int8_load_streams_per_cycle
@@ -561,7 +562,7 @@ LogicalResult VxmOp::verify()
         && opcode != "multiply"
         && opcode != "negate"
         && opcode != "max" && opcode != "exp"
-        && opcode != "reciprocal" && opcode != "rsqrt")
+        && opcode != "reciprocal" && opcode != "rsqrt" && opcode != "log")
         return emitOpError("contains an unsupported VXM opcode");
 
     const auto verify_operand = [&](StringRef kind, int64_t index) {
@@ -641,11 +642,15 @@ LogicalResult SxmOp::verify()
           return emitOpError("output_tile must be in the physical tile range");
     const int64_t physicalWidth =
         2 * target.throughput().lanes_per_tile;
-    const int64_t sourceWidth = getInputRow() ? 2 : physicalWidth;
+    const bool wideTranspose = getOpcode() == "transpose"
+        && !getInputRow() && !getOutputRow() && !getOutputTile()
+        && getSourceStreams().size() == 2 && getDestinationStreams().size() == 2;
+    const int64_t destinationWidth = wideTranspose ? 2 : physicalWidth;
+    const int64_t sourceWidth = (wideTranspose || getInputRow()) ? 2 : physicalWidth;
     const int64_t mapWidth = target.throughput().tile_rows
         * target.throughput().lanes_per_tile;
     if (getSourceStreams().size() != sourceWidth
-        || getDestinationStreams().size() != physicalWidth
+        || getDestinationStreams().size() != destinationWidth
         || getPermuteMap().size() != mapWidth)
         return emitOpError()
             << "requires " << sourceWidth << " source and "

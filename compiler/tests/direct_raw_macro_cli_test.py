@@ -303,7 +303,7 @@ def main() -> None:
                          (ffn_macro, ["--icu-compression", "raw-macro"])):
         require_verification(run([args.compile, "--input", ffn,
                                   "--input-stage", "stablehlo", *target,
-                                  "--mxm-execution", "vector", "--ffn-schedule", "fused",
+                                  "--mxm-execution", "ws", "--ffn-schedule", "fused",
                                   "--output", binary, *mode, "--verify-icu-issues"]))
         if args.numeric_test:
             execution = run([args.numeric_test, binary])
@@ -325,7 +325,7 @@ def main() -> None:
     paged = args.output_dir / "paged-decoder-raw-macro.ftlpu"
     run([args.compile, "--input", decoder, "--input-stage", "stablehlo",
          "--output", paged, *target, "--weight-bank", "1",
-         "--kv-cache-capacity", "256", "--mxm-execution", "vector",
+         "--kv-cache-capacity", "256", "--mxm-execution", "ws",
          "--projection-rope-overlap", "off", "--icu-compression", "raw-macro"])
     check_binary(args, paged, paged, macro=True, require_all_resources=False)
     print("direct raw Macro CLI entries, inherited mode/override, relocation clones, "

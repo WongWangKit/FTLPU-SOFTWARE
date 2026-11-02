@@ -461,6 +461,28 @@ int64_t emitDistributedMatrixTranspose(mlir::IRRewriter& rewriter,
     const int64_t blockCount = (rows / tile) * hiddenBlocks;
     const int64_t inputBeats = blockCount * tileRows;
     const int64_t captureStart = start + maxReadLatency;
+    const auto module = rewriter.getInsertionBlock()->getParentOp()->getParentOfType<mlir::ModuleOp>();
+    const auto wide = module ? module->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide") : mlir::BoolAttr{};
+    if (wide && wide.getValue()) {
+        // Serialize distributed row pairs onto one BF16 vector stream.
+        // Scatter transposed columns back with MEM addresses, no permute.
+        for (int64_t h=0;h<target.memory().hemispheres;++h) {
+            if(selectedHemisphere>=0 && h!=selectedHemisphere) continue;
+            for(int64_t pair=0;pair<lanes;++pair) for(int64_t byte=0;byte<2;++byte) {
+                const auto src=inputSlices[2*pair+byte], dst=outputSlices[2*pair+byte];
+                emitMem3D(rewriter,location,target,captureStart+pair-readLatency(src),
+                    h*target.memory().slices_per_hemisphere+src,"read",baseRow(inputPlacement),
+                    sourceBase+byte,tileRows,lanes,1,blockCount,tile,tileRows,1,1,0,-1,bank(inputPlacement));
+                emitMem3D(rewriter,location,target,captureStart+tile+tileRows-1+pair+writeLatency(dst),
+                    h*target.memory().slices_per_hemisphere+dst,"write",baseRow(outputPlacement),
+                    outputBase+byte,tileRows,lanes,1,blockCount,tile,tileRows,1,1,0,-1,bank(outputPlacement));
+            }
+            emitSxm(rewriter,location,captureStart,h,"transpose",
+                {sourceBase,sourceBase+1},{outputBase,outputBase+1},
+                attention_detail::identityMap(target),"wide_matrix",-1,-1,-1,blockCount,tile);
+        }
+        return captureStart+blockCount*tile+tile+tileRows-1+maxWriteLatency+tileRows;
+    }
     for (int64_t hemisphere = 0;
          hemisphere < target.memory().hemispheres; ++hemisphere) {
         if (selectedHemisphere >= 0 && hemisphere != selectedHemisphere)
@@ -970,7 +992,9 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
     mlir::DictionaryAttr inputPlacement,
     mlir::DictionaryAttr weightPlacement,
     mlir::DictionaryAttr outputPlacement, int64_t start,
-    bool l2Norm = false, float outputScale = 1.0f)
+    bool l2Norm = false, float outputScale = 1.0f,
+    llvm::ArrayRef<int64_t> streamedReduction = {}, bool independentHeads = false,
+    int64_t* normalizedStreamStart = nullptr)
 {
     const auto inputSlices = slices(inputPlacement);
     const auto weightSlices = weightPlacement ? slices(weightPlacement)
@@ -1097,9 +1121,10 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
     int64_t cycle = start;
     for (int64_t tokenBlock = 0;
          tokenBlock < tokenBlocks; ++tokenBlock) {
-        const int64_t reductionInput = cycle
-            + maxReadLatency(inputSlices) + 1;
+        const int64_t reductionInput = streamedReduction.empty() ? cycle
+            + maxReadLatency(inputSlices) + 1 : streamedReduction.front();
         const int64_t reductionConfig = reductionInput - 1;
+        if(streamedReduction.empty()) {
         // Preserve x in the chain token; C1 squares Previous * Original.
         // This avoids asking both fixed input ports to read the same stream.
         vxm(reductionConfig, 0, "pass",
@@ -1122,23 +1147,56 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             "previous", 0, 0.0f, "accumulator", 0, 0.0f,
             dataFormat, 2, 1, 4, false, true, true);
 
+        } else {
+            // Each SXM tile supplies 32 consecutive feature vectors directly.
+            // Keep the same accumulator across gaps between tiles.
+            for(size_t segment=0;segment<streamedReduction.size();++segment) {
+                const auto config=streamedReduction[segment]-1;
+                vxm(config,0,"pass",streamKind,32,0.f,"immediate",0,0.f,"fp32",-1,32,4);
+                vxm(config,1,"multiply","previous",0,0.f,"original",0,0.f,"fp32",-1,32,4);
+                vxm(config,2,"pass","previous",0,0.f,"immediate",0,0.f,"fp32",-1,32,4);
+                const bool first=segment==0,last=segment+1==streamedReduction.size();
+                if(first) vxm(config,3,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",-1,1,4,true,true,false);
+                vxm(config+(first?1:0),3,"add","previous",0,0.f,"accumulator",0,0.f,
+                    "fp32",-1,32-(first?1:0)-(last?1:0),4,false,true,false);
+                if(last) vxm(config+1,3,"add","previous",0,0.f,"accumulator",0,0.f,dataFormat,2,1,4,false,true,true);
+            }
+        }
         const int64_t featuresPerPair = hidden / lanes;
         const int64_t scalarAddress = baseRow(inputPlacement)
             + distributedRows + tokenBlock;
-        const int64_t sumOutput = reductionInput + hidden + 3;
+        const int64_t sumOutput = (streamedReduction.empty() ? reductionInput+hidden : streamedReduction.back()+32) + 3;
         const auto scalarSlices =
             llvm::ArrayRef<int64_t>(inputSlices).take_front(2);
         const int64_t scalarWriteEnd = sumOutput
             + maxWriteLatency(scalarSlices)
             + 2;
-        const int64_t factorInput = scalarWriteEnd
+        int64_t scalarReady = scalarWriteEnd;
+        if (independentHeads) {
+            // Fixed VXM outputs cross to the opposite MEM hemisphere. Return
+            // only the two-byte reduction scalar to its owning head; the
+            // retained feature tile never moves between hemispheres.
+            for (int64_t side = 0; side < 2; ++side)
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const auto slice = scalarSlices[byte];
+                    const auto latency = 2*(slice/target.streams().mem_slices_per_register_group)+2;
+                    emitMem3D(rewriter,location,target,scalarWriteEnd,
+                        side*target.memory().slices_per_hemisphere+slice,"read",scalarAddress,48+byte,
+                        1,1,0,1,1,0,1,1,0,-1,bank(inputPlacement));
+                    emitMem3D(rewriter,location,target,scalarWriteEnd+latency,
+                        (1-side)*target.memory().slices_per_hemisphere+slice,"write",scalarAddress,16+byte,
+                        1,1,0,1,1,0,1,1,0,-1,bank(inputPlacement));
+                    scalarReady=std::max(scalarReady,scalarWriteEnd+latency+2);
+                }
+        }
+        const int64_t factorInput = scalarReady
             + maxReadLatency(scalarSlices) + 1;
         const int64_t normalizeInput = factorInput + 10;
         // The first input pair also holds the reduction scalar. A later pair
         // may span both passes only when no other memory role can insert a
         // command into its physical (hemisphere, slice, bank) ICU queue.
         const auto canGroupInputPair = [&](int64_t pair) {
-            if (pair == 0 || normalizeInput - reductionInput
+            if (!streamedReduction.empty() || pair == 0 || normalizeInput - reductionInput
                     <= (featuresPerPair - 1) * lanes)
                 return false;
             for (int64_t byte = 0; byte < 2; ++byte) {
@@ -1157,7 +1215,7 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             }
             return true;
         };
-        for (int64_t pair = 0; pair < lanes; ++pair) {
+        if(streamedReduction.empty()) for (int64_t pair = 0; pair < lanes; ++pair) {
             emitMirroredPairRead(inputSlices, pair,
                 packedAddress(inputPlacement, tokenBlock,
                     0, 0, hiddenBlocks, target.throughput().tile_rows),
@@ -1210,6 +1268,7 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             factorInput, bank(inputPlacement));
 
         const int64_t normalizeConfig = normalizeInput - 1;
+        if (normalizedStreamStart) *normalizedStreamStart = normalizeInput + (l2Norm ? 5 : 6);
         vxm(normalizeConfig, 0, "multiply",
             streamKind, 32, 0.0f, l2Norm ? "immediate" : streamKind,
             l2Norm ? 0 : 34, l2Norm ? outputScale * std::sqrt(lookupScale) : 0.0f,
@@ -1248,12 +1307,13 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             const int64_t outputCycle = normalizeInput + pair + (l2Norm ? 5 : 6);
             const auto outputPair =
                 llvm::ArrayRef<int64_t>(outputSlices).slice(2 * pair, 2);
-            emitMirroredWrite(outputPair, outputAddress, 2,
-                outputCycle, 2, bank(outputPlacement),
-                featuresPerPair, lanes, 1, 1, 1, 0);
+            if (!normalizedStreamStart)
+                emitMirroredWrite(outputPair, outputAddress, 2,
+                    outputCycle, 2, bank(outputPlacement),
+                    featuresPerPair, lanes, 1, 1, 1, 0);
             normalizeWriteEnd = std::max(normalizeWriteEnd,
                 outputCycle + (featuresPerPair - 1) * lanes
-                    + maxWriteLatency(outputPair)
+                    + (normalizedStreamStart ? 0 : maxWriteLatency(outputPair))
                     + 2);
         }
         if (broadcastWeight) {
@@ -1571,6 +1631,137 @@ int64_t emitRowParallelVxmFeedback(mlir::IRRewriter& rewriter,
     return cycle;
 }
 
+// Shared planar ingress/egress for RMSNorm and L2Norm. The arithmetic remains
+// distinct in emitVxmFeedbackImpl (mean+epsilon+gamma versus sum+epsilon).
+mlir::FailureOr<mlir::Value> emitDirectPlanarNorm(mlir::IRRewriter& rewriter,
+    mlir::Operation* op, mlir::Value inputValue, mlir::Value weight,
+    mlir::RankedTensorType inputType, const target::LPUTargetModel& target,
+    mlir::DictionaryAttr feedbackInput, mlir::DictionaryAttr feedbackOutput,
+    mlir::DictionaryAttr result, mlir::DictionaryAttr weightPlacement,
+    double epsilon, bool l2Norm, float outputScale, int64_t outputIndex)
+{
+    const std::string prefix=l2Norm?"l2norm":"rmsnorm";
+    const auto words=op->getAttrOfType<mlir::ArrayAttr>("native_planar_words");
+    const auto partitionedWords=op->getAttrOfType<mlir::ArrayAttr>("native_partitioned_planar_words");
+    const int64_t blocks=inputType.getDimSize(1)/32;
+    const auto stageSlices=slices(feedbackOutput), feedbackSlices=slices(feedbackInput);
+    struct Word { mlir::DictionaryAttr p; int64_t address; };
+    llvm::SmallVector<llvm::SmallVector<Word>> tileSources[2];
+    int64_t gatherIssue[2]={32,32}, gatherEnd=32;
+    // Shared VXM controls execute on both fixed chains. Prepare only
+    // missing source words on each fabric, before either SXM starts.
+    // Padding rows alias their real head; do not copy them twice.
+    for(int64_t side=0;side<2;++side) for(int64_t block=0;block<blocks;++block) {
+        llvm::SmallVector<Word> sources;
+        for(int64_t row=0;row<32;++row) {
+            const auto d=llvm::cast<mlir::DictionaryAttr>(partitionedWords
+                ? partitionedWords[(side*32+row)*blocks+block] : words[row*blocks+block]);
+            auto p=d.getAs<mlir::DictionaryAttr>("placement");
+            const int64_t address=d.getAs<mlir::IntegerAttr>("address").getInt();
+            const int64_t sourceSide=p.getAs<mlir::StringAttr>("hemisphere").getValue()=="west"?1:0;
+            if(partitionedWords && sourceSide!=side)
+                { op->emitError("partitioned norm head must remain on its producer hemisphere"); return mlir::failure(); }
+            if(sourceSide==side) { sources.push_back({p,address}); continue; }
+            int64_t previous=0;
+            for(;previous<row;++previous)
+                if(words[previous*blocks+block]==words[row*blocks+block]) break;
+            if(previous<row) { sources.push_back(sources[previous]); continue; }
+            const auto ids=slices(p);
+            const int64_t pair=row%8, issue=gatherIssue[side]++;
+            for(int64_t byte=0;byte<2;++byte) {
+                const int64_t dst=stageSlices[2*pair+byte],latency=ids[byte]/4+dst/4+2;
+                emitMem3D(rewriter,op->getLoc(),target,issue,
+                    sourceSide*target.memory().slices_per_hemisphere+ids[byte],"read",address,52+byte,
+                    1,1,0,1,1,0,1,1,0,-1,bank(p));
+                emitMem3D(rewriter,op->getLoc(),target,issue+latency,
+                    side*target.memory().slices_per_hemisphere+dst,"write",baseRow(feedbackOutput)+block*4+row/8,20+byte,
+                    1,1,0,1,1,0,1,1,0,-1,bank(feedbackOutput));
+                gatherEnd=std::max(gatherEnd,issue+latency+4);
+            }
+            mlir::NamedAttrList staged(feedbackOutput);
+            staged.set("slices",rewriter.getArrayAttr({rewriter.getI64IntegerAttr(stageSlices[2*pair]),rewriter.getI64IntegerAttr(stageSlices[2*pair+1])}));
+            staged.set("hemisphere",rewriter.getStringAttr(side?"west":"east"));
+            sources.push_back({staged.getDictionary(rewriter.getContext()),baseRow(feedbackOutput)+block*4+row/8});
+        }
+        tileSources[side].push_back(std::move(sources));
+    }
+    if(!partitionedWords)
+        createTimeline(rewriter,op->getLoc(),"l2norm.prepare_sxm_pair",32,gatherEnd);
+    // Both wide SXMs feed the fixed VXM groups (East 0/1, West 16/17).
+    // Tap the transposed x along the SR route for normalization replay;
+    // never consume it before it reaches VXM.
+    const int64_t firstCapture=gatherEnd+32;
+    int64_t transposeEnd=firstCapture;
+    for(int64_t side=0;side<2;++side) {
+        emitSxm(rewriter,op->getLoc(),firstCapture,side,"transpose",{16,17},{32+side*16,33+side*16},
+            attention_detail::identityMap(target),"wide_matrix",-1,-1,-1,blocks,32);
+        for(int64_t block=0;block<blocks;++block) {
+            const auto &sources=tileSources[side][block];
+            const int64_t capture=firstCapture+block*32;
+            for(int64_t row=0;row<32;) {
+                const auto w=sources[row];int64_t count=1,stride=0;
+                if(row+1<32 && sources[row+1].p==w.p) stride=sources[row+1].address-w.address;
+                while(row+count<32 && sources[row+count].p==w.p && sources[row+count].address==w.address+count*stride) ++count;
+                const auto ids=slices(w.p);
+                for(int64_t byte=0;byte<2;++byte) {
+                    const int64_t latency=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::SxmInput,target::StreamDirection::East,ids[byte]);
+                    emitMem3D(rewriter,op->getLoc(),target,capture+row-latency,
+                        side*target.memory().slices_per_hemisphere+ids[byte],"read",w.address,16+byte,
+                        count,1,stride,1,1,0,1,1,0,-1,bank(w.p));
+                }
+                row+=count;
+            }
+            for(int64_t pair=0;pair<8;++pair) for(int64_t byte=0;byte<2;++byte) {
+                const int64_t dst=feedbackSlices[2*pair+byte];
+                const int64_t latency=*target.transport_latency(target::StreamEndpoint::SxmResult,target::StreamEndpoint::Mem,target::StreamDirection::West,dst);
+                emitMem3D(rewriter,op->getLoc(),target,capture+35+pair+latency,
+                    side*target.memory().slices_per_hemisphere+dst,"write_tap",baseRow(feedbackInput)+block*4,32+side*16+byte,
+                    4,8,1,1,1,0,1,1,0,-1,bank(feedbackInput));
+                transposeEnd=std::max(transposeEnd,capture+35+pair+latency+28);
+            }
+        }
+    }
+    llvm::SmallVector<int64_t> arrivals;
+    const int64_t routeLatency=*target.transport_latency(target::StreamEndpoint::SxmResult,
+        target::StreamEndpoint::VxmInput,target::StreamDirection::West,0);
+    for(int64_t block=0;block<blocks;++block)
+        arrivals.push_back(firstCapture+block*32+35+routeLatency);
+    createTimeline(rewriter,op->getLoc(),prefix+".direct_planar_ingress",0,transposeEnd);
+    int64_t normalizedStreamStart=0;
+    int64_t cycle=emitVxmFeedbackImpl(rewriter,op->getLoc(),inputValue,weight,inputType,
+        epsilon,target,feedbackInput,weightPlacement,feedbackOutput,transposeEnd,l2Norm,
+        outputScale,arrivals,bool(partitionedWords),&normalizedStreamStart);
+    createTimeline(rewriter,op->getLoc(),prefix+".sxm_vxm_streaming",arrivals.front(),cycle);
+    // Capture normalized vectors directly on the forward SR fabric. VXM
+    // emits 32 consecutive feature vectors per wide-transpose tile, with
+    // the existing superlane skew; no normalized-output MEM spill is needed.
+    // The input tap/replay above is still needed for the reduction dependency.
+    const int64_t firstSide=partitionedWords?0:(result.getAs<mlir::StringAttr>("hemisphere").getValue()=="west"?1:0);
+    const int64_t capture=normalizedStreamStart+*target.transport_latency(
+        target::StreamEndpoint::VxmResult,target::StreamEndpoint::SxmInput,
+        target::StreamDirection::East,0);
+    int64_t restored=cycle;
+    for(int64_t side=firstSide;side<(partitionedWords?2:firstSide+1);++side) {
+    const int64_t stream=(1-side)*8+2;
+    emitSxm(rewriter,op->getLoc(),capture,side,"transpose",{stream,stream+1},{32,33},
+        attention_detail::identityMap(target),"wide_matrix",-1,-1,-1,blocks,32);
+    const auto outputSlices=slices(result);
+    for(int64_t byte=0;byte<2;++byte) {
+        const auto dst=outputSlices[byte];
+        const int64_t latency=*target.transport_latency(target::StreamEndpoint::SxmResult,target::StreamEndpoint::Mem,target::StreamDirection::West,dst);
+        emitMem3D(rewriter,op->getLoc(),target,capture+35+latency,
+            side*target.memory().slices_per_hemisphere+dst,"write",baseRow(result),32+byte,
+            blocks*32,1,1,1,1,0,1,1,0,-1,bank(result));
+        restored=std::max(restored,capture+35+latency+blocks*32+4);
+    }
+    }
+    createTimeline(rewriter,op->getLoc(),prefix+".vxm_sxm_direct",normalizedStreamStart,restored);
+    createTimeline(rewriter,op->getLoc(),prefix+".direct_planar_output",capture,restored);
+    auto output=createBinding(rewriter,op->getLoc(),{},outputIndex,"output","result",inputType,result);
+    output->setAttr("name",rewriter.getStringAttr(prefix+".result."+std::to_string(outputIndex)));
+    return output.getValue();
+}
+
 mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
     stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
     int64_t outputIndex)
@@ -1607,6 +1798,13 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
             llvm::cast<mlir::RankedTensorType>(op.getWeight().getType()),
             weightPlacement);
 
+    if(op->hasAttr("native_planar_words")) {
+        auto value=emitDirectPlanarNorm(rewriter,op,op.getInput(),op.getWeight(),executionInputType,
+            target,feedbackInputPlacement,feedbackOutputPlacement,resultPlacement,weightPlacement,
+            op.getEpsilon().convertToDouble(),false,1.0f,outputIndex);
+        if(mlir::failed(value)) return mlir::failure();
+        rewriter.replaceOp(op,*value);return mlir::success();
+    }
     const auto inputKind =
         inputPlacement.getAs<mlir::StringAttr>("kind");
     const bool vxmInput = inputKind
@@ -1744,12 +1942,22 @@ mlir::LogicalResult lowerL2NormSchedules(mlir::IRRewriter& rewriter,
         const auto feedbackInput = allocationPlacement(op.getScratchAllocations(), 0);
         const auto feedbackOutput = allocationPlacement(op.getScratchAllocations(), 1);
         if (input.getAs<mlir::StringAttr>("kind").getValue() != "fp16_mxm_distributed_16"
-            || result.getAs<mlir::StringAttr>("kind").getValue() != "fp16_mxm_distributed_16")
+            || (result.getAs<mlir::StringAttr>("kind").getValue() != "fp16_mxm_distributed_16"
+                && !(op->hasAttr("native_planar_words") &&
+                    (result.getAs<mlir::StringAttr>("kind").getValue()=="fp16_pair_planar"
+                     || result.getAs<mlir::StringAttr>("kind").getValue()=="token_partition_planar"))))
             return op.emitError("L2Norm requires MXM distributed16 input and result");
         rewriter.setInsertionPoint(op);
         if (auto arg = llvm::dyn_cast<mlir::BlockArgument>(op.getInput()))
             createBinding(rewriter, op.getLoc(), op.getInput(), arg.getArgNumber(),
                 "input", "activation", inputType, input);
+        if (op->hasAttr("native_planar_words")) {
+            auto value=emitDirectPlanarNorm(rewriter,op,op.getInput(),op.getInput(),inputType,
+                target,feedbackInput,feedbackOutput,result,{},op.getEpsilon().convertToDouble(),
+                true,op.getScale().convertToFloat(),outputIndex++);
+            if(mlir::failed(value)) return mlir::failure();
+            rewriter.replaceOp(op,*value);continue;
+        }
         if (auto groups = op->getAttrOfType<mlir::ArrayAttr>("native_input_groups")) {
             const int64_t rows = op->getAttrOfType<mlir::IntegerAttr>("native_input_rows").getInt();
             const int64_t hidden = inputType.getDimSize(1);
@@ -1762,47 +1970,269 @@ mlir::LogicalResult lowerL2NormSchedules(mlir::IRRewriter& rewriter,
                 attrs.set("base_row", rewriter.getI64IntegerAttr(baseRow(p) + n));
                 return attrs.getDictionary(rewriter.getContext());
             };
+            bool nativePartition = op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.l2_native_partition_output") && hidden==128;
+            const auto wideOutput=op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
+            const auto headsOutput=op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.l2_head_partition");
+            nativePartition &= wideOutput && wideOutput.getValue() && headsOutput && headsOutput.getValue();
+            for(int64_t g=0; nativePartition && g<static_cast<int64_t>(groups.size()); ++g) {
+                auto d=llvm::cast<mlir::DictionaryAttr>(groups[g]);
+                auto p=d.getAs<mlir::DictionaryAttr>("placement");
+                nativePartition = p && !d.getAs<mlir::ArrayAttr>("chunks") &&
+                    (p.getAs<mlir::StringAttr>("hemisphere").getValue()=="east") == (g%2==0);
+            }
             int64_t cycle = 0;
             // The physical output remains [tokens, groups * hidden]. Logical
             // [tokens * groups, hidden] is a reshape of the same flat tensor.
             for (int64_t block = 0; block < rows / tile; ++block)
                 for (int64_t g = 0; g < static_cast<int64_t>(groups.size()); ++g) {
                     auto descriptor = llvm::cast<mlir::DictionaryAttr>(groups[g]);
-                    auto source = descriptor.getAs<mlir::DictionaryAttr>("placement");
-                    const int64_t columns = descriptor.getAs<mlir::IntegerAttr>("columns").getInt();
-                    const int64_t column = descriptor.getAs<mlir::IntegerAttr>("column").getInt();
+                    struct FeedbackCopy { int64_t side, destination, words; };
+                    llvm::SmallVector<FeedbackCopy> copies;
+                    const auto widePolicy = op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
+                    const bool pipeline = widePolicy && widePolicy.getValue();
+                    const auto headPolicy = op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.l2_head_partition");
+                    if (pipeline && headPolicy && headPolicy.getValue()
+                        && !descriptor.getAs<mlir::ArrayAttr>("chunks") && g + 1 < static_cast<int64_t>(groups.size())) {
+                        auto next = llvm::cast<mlir::DictionaryAttr>(groups[g + 1]);
+                        auto left = descriptor.getAs<mlir::DictionaryAttr>("placement");
+                        auto right = next.getAs<mlir::DictionaryAttr>("placement");
+                        if (next.getAs<mlir::ArrayAttr>("chunks") || !left || !right
+                            || left.getAs<mlir::StringAttr>("hemisphere") == right.getAs<mlir::StringAttr>("hemisphere"))
+                            return op.emitError("head-partitioned L2 requires paired independent hemispheres");
+                        const int64_t firstCapture = cycle + target.throughput().mem_to_sxm_latency;
+                        const auto saved = slices(feedbackInput);
+                        int64_t allWrites = cycle;
+                        for (int64_t member = 0; member < 2; ++member) {
+                            auto d = member ? next : descriptor;
+                            auto source = d.getAs<mlir::DictionaryAttr>("placement");
+                            const int64_t side = source.getAs<mlir::StringAttr>("hemisphere").getValue() == "west" ? 1 : 0;
+                            source = offset(source, (block * d.getAs<mlir::IntegerAttr>("columns").getInt()
+                                + d.getAs<mlir::IntegerAttr>("column").getInt()) / 8);
+                            if (bank(source) == bank(feedbackInput))
+                                return op.emitError("streaming L2 source and retention require different banks");
+                            const auto src = slices(source);
+                            for (int64_t pair = 0; pair < 8; ++pair) for (int64_t byte = 0; byte < 2; ++byte) {
+                                const auto rlat = *target.transport_latency(target::StreamEndpoint::Mem,
+                                    target::StreamEndpoint::SxmInput,target::StreamDirection::East,src[2*pair+byte]);
+                                emitMem3D(rewriter,op.getLoc(),target,firstCapture+pair-rlat,
+                                    side*target.memory().slices_per_hemisphere+src[2*pair+byte],"read",baseRow(source),16+byte,
+                                    4,8,1,hidden/32,32,4,1,1,0,-1,bank(source));
+                                const auto dst = saved[2*pair+byte];
+                                const auto wlat = *target.transport_latency(target::StreamEndpoint::SxmResult,
+                                    target::StreamEndpoint::Mem,target::StreamDirection::West,dst);
+                                emitMem3D(rewriter,op.getLoc(),target,firstCapture+35+pair+wlat,
+                                    side*target.memory().slices_per_hemisphere+dst,"write_tap",baseRow(feedbackInput),32+side*16+byte,
+                                    4,8,1,hidden/32,32,4,1,1,0,-1,bank(feedbackInput));
+                                allWrites = std::max(allWrites, firstCapture+35+pair+wlat+hidden-4);
+                            }
+                            emitSxm(rewriter,op.getLoc(),firstCapture,side,"transpose",{16,17},{32+side*16,33+side*16},
+                                attention_detail::identityMap(target),"wide_matrix",-1,-1,-1,hidden/32,32);
+                        }
+                        llvm::SmallVector<int64_t> arrivals;
+                        for (int64_t c = 0; c < hidden / 32; ++c)
+                            arrivals.push_back(firstCapture+c*32+35+target.streams().system_register_columns-1);
+                        const auto begin = cycle;
+                        int64_t normalizedStreamStart = 0;
+                        cycle = emitVxmFeedbackImpl(rewriter,op.getLoc(),op.getInput(),op.getInput(),tileType,
+                            op.getEpsilon().convertToDouble(),target,feedbackInput,{},feedbackOutput,allWrites,
+                            true,op.getScale().convertToFloat(),arrivals,true,&normalizedStreamStart);
+                        createTimeline(rewriter,op.getLoc(),"l2norm.sxm_vxm_streaming",begin,cycle);
+                        // The normalized vectors already travel forward from
+                        // VXM to SXM. Capture them in-place on the SR fabric,
+                        // without writing/reading the feedbackOutput scratch.
+                        const auto restoreBegin = normalizedStreamStart;
+                        const auto capture = normalizedStreamStart + *target.transport_latency(
+                            target::StreamEndpoint::VxmResult,target::StreamEndpoint::SxmInput,
+                            target::StreamDirection::East,0);
+                        int64_t restoreEnd = cycle;
+                        for (int64_t member = 0; member < 2; ++member) {
+                            auto d = member ? next : descriptor;
+                            const int64_t side = d.getAs<mlir::DictionaryAttr>("placement").getAs<mlir::StringAttr>("hemisphere").getValue() == "west" ? 0 : 1;
+                            const int64_t stream=(1-side)*8+2;
+                            auto destination=offset(result,(block*groups.size()+g+member)*words);
+                            const auto dst=slices(destination);
+                            emitSxm(rewriter,op.getLoc(),capture,side,"transpose",
+                                {stream,stream+1},{32,33},attention_detail::identityMap(target),
+                                "wide_matrix",-1,-1,-1,hidden/32,32);
+                            for(int64_t pair=0;pair<8;++pair)for(int64_t byte=0;byte<2;++byte) {
+                                const auto slice=dst[2*pair+byte];
+                                const auto latency=*target.transport_latency(target::StreamEndpoint::SxmResult,
+                                    target::StreamEndpoint::Mem,target::StreamDirection::West,slice);
+                                if(auto stripe=destination.getAs<mlir::IntegerAttr>("bank_tile_rows")) {
+                                    if(!nativePartition || stripe.getInt()!=4 || hidden!=128)
+                                        return op.emitError("bank-striped L2 requires native paired D128 heads");
+                                    for(int64_t parity=0;parity<2;++parity)
+                                        emitMem3D(rewriter,op.getLoc(),target,capture+35+pair+latency+parity*32,
+                                            side*target.memory().slices_per_hemisphere+slice,"write",baseRow(destination)+parity*4,32+byte,
+                                            4,8,1,hidden/64,64,8,1,1,0,-1,bank(destination)^parity);
+                                } else {
+                                emitMem3D(rewriter,op.getLoc(),target,capture+35+pair+latency,
+                                    side*target.memory().slices_per_hemisphere+slice,"write",baseRow(destination),32+byte,
+                                    4,8,1,hidden/32,32,4,1,1,0,-1,bank(destination));
+                                }
+                                restoreEnd=std::max(restoreEnd,capture+35+pair+latency+hidden-8+1);
+                            }
+                        }
+                        cycle = restoreEnd;
+                        createTimeline(rewriter,op.getLoc(),"l2norm.vxm_sxm_direct",restoreBegin,cycle);
+                        // The public distributed16 binding currently promises both
+                        // hemispheres. Materialize that contract only at the output,
+                        // never before or during the independent head reductions.
+                        if (!nativePartition) {
+                        const auto exportBegin = cycle;
+                        const auto ids = slices(result);
+                        for (int64_t member = 0; member < 2; ++member) {
+                            auto d = member ? next : descriptor;
+                            const int64_t side = d.getAs<mlir::DictionaryAttr>("placement").getAs<mlir::StringAttr>("hemisphere").getValue() == "west" ? 0 : 1;
+                            int64_t drain = cycle;
+                            for (int64_t plane = 0; plane < static_cast<int64_t>(ids.size()); ++plane) {
+                                const int64_t latency = 2*(ids[plane]/target.streams().mem_slices_per_register_group)+2;
+                                const int64_t row = baseRow(result)+(block*groups.size()+g+member)*words;
+                                emitMem3D(rewriter,op.getLoc(),target,cycle,side*target.memory().slices_per_hemisphere+ids[plane],
+                                    "read",row,48+plane,words,1,1,1,1,0,1,1,0,-1,bank(result));
+                                emitMem3D(rewriter,op.getLoc(),target,cycle+latency,(1-side)*target.memory().slices_per_hemisphere+ids[plane],
+                                    "write",row,16+plane,words,1,1,1,1,0,1,1,0,-1,bank(result));
+                                drain = std::max(drain,cycle+latency+words+1);
+                            }
+                            cycle = drain;
+                        }
+                        createTimeline(rewriter,op.getLoc(),"l2norm.output_binding_mirror",exportBegin,cycle);
+                        }
+                        ++g;
+                        continue;
+                    }
+                    if(pipeline && descriptor.getAs<mlir::ArrayAttr>("chunks")) {
+                        const auto chunks=descriptor.getAs<mlir::ArrayAttr>("chunks");
+                        struct Source { mlir::DictionaryAttr p; int64_t side; };
+                        llvm::SmallVector<Source> sources;
+                        for(auto attr:chunks) {
+                            auto d=llvm::cast<mlir::DictionaryAttr>(attr);
+                            auto p=d.getAs<mlir::DictionaryAttr>("placement");
+                            p=offset(p,(block*d.getAs<mlir::IntegerAttr>("columns").getInt()+d.getAs<mlir::IntegerAttr>("column").getInt())/8);
+                            sources.push_back({p,p.getAs<mlir::StringAttr>("hemisphere").getValue()=="west"?1:0});
+                        }
+                        const auto staged=slices(feedbackOutput), saved=slices(feedbackInput);
+                        const int64_t gatherBegin=cycle;
+                        // Move only the missing source half before transpose.
+                        // The original half remains at its producer address.
+                        for(int64_t side=0;side<2;++side) {
+                            int64_t issue=cycle,drain=cycle;
+                            for(size_t c=0;c<sources.size();++c) if(sources[c].side==side) {
+                                const auto src=slices(sources[c].p);
+                                for(int64_t plane=0;plane<16;++plane) {
+                                    const auto latency=src[plane]/4+staged[plane]/4+2;
+                                    emitMem3D(rewriter,op.getLoc(),target,issue,
+                                        side*target.memory().slices_per_hemisphere+src[plane],"read",baseRow(sources[c].p),48+plane,
+                                        4,1,1,1,1,0,1,1,0,-1,bank(sources[c].p));
+                                    emitMem3D(rewriter,op.getLoc(),target,issue+latency,
+                                        (1-side)*target.memory().slices_per_hemisphere+staged[plane],"write",baseRow(feedbackOutput)+c*4,16+plane,
+                                        4,1,1,1,1,0,1,1,0,-1,bank(feedbackOutput));
+                                    drain=std::max(drain,issue+latency+5);
+                                }
+                                issue+=4;
+                            }
+                            cycle=drain;
+                        }
+                        createTimeline(rewriter,op.getLoc(),"l2norm.prepare_sxm_pair",gatherBegin,cycle);
+                        llvm::SmallVector<int64_t> arrivals;
+                        int64_t launch=cycle,allWrites=cycle;
+                        for(size_t c=0;c<sources.size();++c) {
+                            // A full tile finishes writing before a reused MEM
+                            // bank queue reads the following source tile.
+                            const int64_t capture=launch+target.throughput().mem_to_sxm_latency;
+                            int64_t drain=capture+67;
+                            for(int64_t side=0;side<2;++side) {
+                                const auto source=side==sources[c].side?sources[c].p:offset(feedbackOutput,c*4);
+                                const auto src=slices(source);
+                                for(int64_t pair=0;pair<8;++pair) for(int64_t byte=0;byte<2;++byte) {
+                                    const auto rlat=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::SxmInput,target::StreamDirection::East,src[2*pair+byte]);
+                                    emitMem3D(rewriter,op.getLoc(),target,capture+pair-rlat,
+                                        side*target.memory().slices_per_hemisphere+src[2*pair+byte],"read",baseRow(source),16+byte,
+                                        4,8,1,1,1,0,1,1,0,-1,bank(source));
+                                    const auto dst=saved[2*pair+byte];
+                                    const auto wlat=*target.transport_latency(target::StreamEndpoint::SxmResult,target::StreamEndpoint::Mem,target::StreamDirection::West,dst);
+                                    emitMem3D(rewriter,op.getLoc(),target,capture+35+pair+wlat,
+                                        side*target.memory().slices_per_hemisphere+dst,"write_tap",baseRow(feedbackInput)+c*4,32+side*16+byte,
+                                        4,8,1,1,1,0,1,1,0,-1,bank(feedbackInput));
+                                    drain=std::max(drain,capture+35+pair+wlat+28);
+                                }
+                                emitSxm(rewriter,op.getLoc(),capture,side,"transpose",{16,17},{32+side*16,33+side*16},
+                                    attention_detail::identityMap(target),"wide_matrix");
+                            }
+                            arrivals.push_back(capture+35+target.streams().system_register_columns-1);
+                            allWrites=std::max(allWrites,drain);launch=drain;
+                        }
+                        const auto begin=arrivals.front();
+                        cycle=emitVxmFeedbackImpl(rewriter,op.getLoc(),op.getInput(),op.getInput(),tileType,
+                            op.getEpsilon().convertToDouble(),target,feedbackInput,{},feedbackOutput,allWrites,
+                            true,op.getScale().convertToFloat(),arrivals);
+                        createTimeline(rewriter,op.getLoc(),"l2norm.sxm_vxm_streaming",begin,cycle);
+                        const auto restore=cycle;
+                        cycle=emitDistributedMatrixTranspose(rewriter,op.getLoc(),target,feedbackOutput,
+                            offset(result,(block*groups.size()+g)*words),tile,hidden,cycle);
+                        createTimeline(rewriter,op.getLoc(),"l2norm.restore_layout",restore,cycle);
+                        continue;
+                    }
+                    int64_t transposeLaunch=cycle, transposeEnd=cycle;
+                    int64_t sideDrain[2]={cycle,cycle};
+                    const auto transposePart = [&](mlir::DictionaryAttr part, int64_t destination, int64_t partWidth) {
+                    const int64_t partWords = partWidth / target.throughput().lanes_per_tile;
+                    auto source = part.getAs<mlir::DictionaryAttr>("placement");
+                    const int64_t columns = part.getAs<mlir::IntegerAttr>("columns").getInt();
+                    const int64_t column = part.getAs<mlir::IntegerAttr>("column").getInt();
                     source = offset(source, (block * columns + column) /
                         target.throughput().lanes_per_tile);
                     const auto hemisphere = source.getAs<mlir::StringAttr>("hemisphere").getValue();
                     const int64_t side = hemisphere == "both" ? -1 : hemisphere == "west" ? 1 : 0;
-                    const int64_t begin = cycle;
-                    cycle = emitDistributedMatrixTranspose(rewriter, op.getLoc(),
-                        target, source, feedbackInput, tile, hidden, cycle, side);
-                    createTimeline(rewriter, op.getLoc(), "l2norm.transpose_native_group", begin, cycle);
-                    if (side >= 0) {
-                        // Feedback chains consume mirrored vectors. Replicate
-                        // just this transposed tile through passive SR, with
-                        // distinct streams for every byte plane; no VXM copy.
-                        const int64_t beginCopy = cycle;
-                        const auto ids = slices(feedbackInput);
-                        int64_t drain = cycle;
-                        for (int64_t p = 0; p < static_cast<int64_t>(ids.size()); ++p) {
-                            const int64_t slice = ids[p];
-                            const int64_t group = slice / target.streams().mem_slices_per_register_group;
-                            const int64_t latency = 2 * group + 2;
-                            emitMem3D(rewriter, op.getLoc(), target, cycle,
-                                side * target.memory().slices_per_hemisphere + slice,
-                                "read", baseRow(feedbackInput), 48 + p,
-                                words, 1, 1, 1, 1, 0, 1, 1, 0, -1, bank(feedbackInput));
-                            emitMem3D(rewriter, op.getLoc(), target, cycle + latency,
-                                (1 - side) * target.memory().slices_per_hemisphere + slice,
-                                "write", baseRow(feedbackInput), 16 + p,
-                                words, 1, 1, 1, 1, 0, 1, 1, 0, -1, bank(feedbackInput));
-                            drain = std::max(drain, cycle + latency + words + 1);
-                        }
-                        cycle = drain;
-                        createTimeline(rewriter, op.getLoc(), "l2norm.replicate_feedback_tile", beginCopy, cycle);
+                    int64_t begin = pipeline ? transposeLaunch : cycle;
+                    // A MEM bank ICU cannot interleave the next input read
+                    // with the previous output domain on the same hemisphere.
+                    if(side>=0 && bank(source)==bank(feedbackInput)) {
+                        const auto srcSlices=slices(source), dstSlices=slices(feedbackInput);
+                        bool shared=false;
+                        for(auto src:srcSlices) shared |= llvm::is_contained(dstSlices,src);
+                        if(shared) begin=std::max(begin,sideDrain[side]);
                     }
+                    const int64_t end = emitDistributedMatrixTranspose(rewriter, op.getLoc(),
+                        target, source, offset(feedbackInput, destination), tile, partWidth, begin, side);
+                    transposeEnd=std::max(transposeEnd,end);
+                    if(side>=0) sideDrain[side]=end;
+                    else sideDrain[0]=sideDrain[1]=end;
+                    transposeLaunch=begin+partWidth;
+                    cycle=end;
+                    createTimeline(rewriter, op.getLoc(), "l2norm.transpose_native_group", begin, end);
+                    if(side>=0) copies.push_back({side,destination,partWords});
+                    };
+                    if (auto chunks = descriptor.getAs<mlir::ArrayAttr>("chunks")) {
+                        for (int64_t c = 0; c < static_cast<int64_t>(chunks.size()); ++c)
+                            transposePart(llvm::cast<mlir::DictionaryAttr>(chunks[c]), c * 4, 32);
+                    } else transposePart(descriptor, 0, hidden);
+                    cycle=transposeEnd;
+                    // Copy the missing hemisphere words as one streaming phase,
+                    // after all transposes drain. Do not drain the SR fabric
+                    // separately after every 32-feature chunk.
+                    const int64_t copyBegin=cycle;
+                    int64_t copyCursor=cycle,copyEnd=cycle;
+                    const auto ids=slices(feedbackInput);
+                    std::stable_sort(copies.begin(),copies.end(),[](const auto &a,const auto &b){return a.side<b.side;});
+                    int64_t previousSide=-1;
+                    for(const auto &copy:copies) {
+                        if(previousSide>=0 && previousSide!=copy.side) copyCursor=copyEnd;
+                        previousSide=copy.side;
+                        for(int64_t p=0;p<static_cast<int64_t>(ids.size());++p) {
+                            const int64_t slice=ids[p], latency=2*(slice/target.streams().mem_slices_per_register_group)+2;
+                            emitMem3D(rewriter,op.getLoc(),target,copyCursor,
+                                copy.side*target.memory().slices_per_hemisphere+slice,"read",
+                                baseRow(feedbackInput)+copy.destination,48+p,copy.words,1,1,1,1,0,1,1,0,-1,bank(feedbackInput));
+                            emitMem3D(rewriter,op.getLoc(),target,copyCursor+latency,
+                                (1-copy.side)*target.memory().slices_per_hemisphere+slice,"write",
+                                baseRow(feedbackInput)+copy.destination,16+p,copy.words,1,1,1,1,0,1,1,0,-1,bank(feedbackInput));
+                            copyEnd=std::max(copyEnd,copyCursor+latency+copy.words+1);
+                        }
+                        copyCursor+=copy.words;
+                    }
+                    cycle=copyEnd;
+                    if(!copies.empty()) createTimeline(rewriter,op.getLoc(),"l2norm.replicate_feedback_tile",copyBegin,cycle);
                     const int64_t feedbackBegin = cycle;
                     cycle = emitVxmFeedbackImpl(rewriter, op.getLoc(), op.getInput(),
                         op.getInput(), tileType, op.getEpsilon().convertToDouble(),
@@ -1815,8 +2245,14 @@ mlir::LogicalResult lowerL2NormSchedules(mlir::IRRewriter& rewriter,
                         tile, hidden, cycle);
                     createTimeline(rewriter, op.getLoc(), "l2norm.restore_layout", restoreBegin, cycle);
                 }
+            auto resultLayout=result;
+            if(nativePartition) {
+                mlir::NamedAttrList attrs(result);
+                attrs.set("kind",rewriter.getStringAttr("fp16_mxm_block4_partition_distributed_16"));
+                resultLayout=attrs.getDictionary(rewriter.getContext());
+            }
             auto output = createBinding(rewriter, op.getLoc(), {}, outputIndex,
-                "output", "result", inputType, result);
+                "output", "result", inputType, resultLayout);
             output->setAttr("name", rewriter.getStringAttr("l2norm.result." + std::to_string(outputIndex++)));
             rewriter.replaceOp(op, output.getValue());
             continue;

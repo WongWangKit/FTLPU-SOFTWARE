@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/stream_schedule_emitters.hpp"
 
 #include "AttentionEmitterUtils.hpp"
+#include "ProjectionGemmSchedule.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
@@ -225,33 +226,40 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
         // Emit the projection's loop nest directly. Final-K compute exports
         // BF16 and clears its accumulator, so no accumulator-read command
         // has to interrupt the COMPUTE_3D instruction between output groups.
-        const int64_t period = std::max<int64_t>(64,
-            maxWeightLatency + target.throughput().mxm_local_load_to_compute_latency + m);
+        // MEM transport is a startup lead, not a per-K bubble. With two
+        // weight buffers the next K tile loads while the current tile computes.
+        // Keep the short-row/decode policy unchanged until validated separately.
+        const bool columnLoad = target.throughput().mxm_prefill_weight_streams == 1;
+        const int64_t loadLead = columnLoad ? 32 : target.throughput().mxm_local_load_to_compute_latency;
+        const int64_t period = m == tile && reductionBlocks % 2 == 0
+            && target.throughput().mxm_weight_buffers == 2
+            ? std::max({m, accumulatorLatency, int64_t{4}, (loadLead + m + 1) / 2})
+            : std::max<int64_t>(64, maxWeightLatency + loadLead + m);
+        // toggle_dim1 restarts at buffer 0 in each group. Odd K counts retain
+        // the conservative cadence to finish consuming that buffer first.
         const int64_t groupPeriod = reductionBlocks * period;
+        const int64_t weightStreamBase = target.streams().streams_per_direction
+            - target.throughput().mxm_int8_load_streams_per_cycle;
         const int64_t weightCycle = stagingEnd + maxWeightLatency;
-        const int64_t computeCycle = weightCycle
-            + target.throughput().mxm_local_load_to_compute_latency;
+        const int64_t computeCycle = weightCycle + loadLead;
         for (int64_t hemisphere = 0; hemisphere < target.memory().hemispheres; ++hemisphere) {
             const int64_t unit = hemisphere * target.throughput().mxms_per_hemisphere;
             for (int64_t stream = 0; stream < 8; ++stream) {
                 const int64_t slice = weightSlices[stream];
-                emitMem3D(rewriter, op.getLoc(), weightCycle - weightReadLatency(slice),
+                emitMem3D(rewriter, op.getLoc(), weightCycle - weightReadLatency(slice) + (columnLoad ? stream : 0),
                     hemisphere * target.memory().slices_per_hemisphere + slice,
-                    "read", weightBase, stream, 4, 1, 1, "sram", weightBinding,
+                    "read", weightBase + (columnLoad ? 3 : 0), weightStreamBase + (columnLoad ? 0 : stream), 4, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram", weightBinding,
                     reductionBlocks, period, 4, outputGroups, groupPeriod, reductionBlocks * 4,
                     weightPlacement.getAs<mlir::IntegerAttr>("bank").getInt(), weightPage);
             }
             emitMxmDequant3D(rewriter, op.getLoc(), weightCycle, unit, scale,
-                4, 1, reductionBlocks, period, outputGroups, groupPeriod, weightBinding);
-            MxmDomain3D load;
-            load.repeat_count = 4;
-            load.repeat_weight_column_stride = -1;
-            load.wave_count = reductionBlocks; load.wave_interval = period;
-            load.group_count = outputGroups; load.group_interval = groupPeriod;
-            load.weight_buffer_mode = "toggle_dim1";
-            emitMxm3D(rewriter, op.getLoc(), weightCycle, unit, "iw", 0, 3, 0, 0,
-                0, 1, "sram", true, "supercell", 0, dataFormat,
-                execution->weight_input_mode(), {}, load);
+                columnLoad ? 32 : 4, 1, reductionBlocks, period, outputGroups, groupPeriod, weightBinding);
+            const projection_detail::ProjectionGemmSchedule gemm{
+                m, reductionBlocks, outputGroups, period, groupPeriod};
+            const projection_detail::ProjectionGemmSchedule::Binding gemmBinding{
+                unit, 0, hemisphere * 2, 0, accumulatorAddress, dataFormat};
+            gemm.emitLoad(rewriter, op.getLoc(), weightCycle, gemmBinding,
+                columnLoad ? 32 : 4, columnLoad, execution->weight_input_mode(), weightStreamBase, "sram");
             for (int64_t byte = 0; byte < 2; ++byte) {
                 const auto slice = inputSlices[byte];
                 const auto latency = target.transport_latency(target::StreamEndpoint::Mem,
@@ -264,18 +272,8 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                     outputGroups, groupPeriod, 0,
                     inputPlacement.getAs<mlir::IntegerAttr>("bank").getInt());
             }
-            MxmDomain3D compute;
-            compute.repeat_count = m;
-            compute.wave_count = reductionBlocks; compute.wave_interval = period;
-            compute.group_count = outputGroups; compute.group_interval = groupPeriod;
-            compute.weight_buffer_mode = "toggle_dim1";
-            compute.terminal_dimension = 1;
-            compute.terminal_accumulator_destination = "stream";
-            compute.terminal_accumulator_clear = true;
-            compute.terminal_accumulator_output_format = dataFormat;
-            emitMxm3D(rewriter, op.getLoc(), computeCycle, unit, "compute", 0, 0,
-                hemisphere * 2, 0, accumulatorAddress, 1, "sram", false,
-                "supercell", 0, dataFormat, {}, {}, compute);
+            gemm.emitCompute(rewriter, op.getLoc(), computeCycle,
+                gemmBinding, false, {});
             if (tokenPartition) {
                 if (hemisphere != 0) continue; // only the first feature word is live
                 const int64_t half = (m + 1) / 2;
@@ -294,7 +292,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                         slice, "write", resultBase, target.streams().streams_per_direction + byte,
                         m - half, 1, 1, "sram", -1, 1, 1, 0, 1, 1, 0, resultBank);
                     const int64_t delay = target.throughput().accumulator_to_vxm_latency
-                        - target.mxm_first_result_latency() + *bridge + 1;
+                        - target.mxm_first_result_latency() + *bridge;
                     emitMem3D(rewriter, op.getLoc(), resultCycle + delay,
                         target.memory().slices_per_hemisphere + slice,
                         "write", resultBase, byte, half, 1, 1, "sram", -1,
@@ -318,7 +316,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                         target::StreamEndpoint::Mem,target::StreamDirection::East,slice);
                     if (!bridge) return mlir::failure();
                     const auto delay = target.throughput().accumulator_to_vxm_latency
-                        - target.mxm_first_result_latency() + *bridge + 1;
+                        - target.mxm_first_result_latency() + *bridge;
                     emitMem3D(rewriter, op.getLoc(), computeCycle+(reductionBlocks-1)*period
                         +target.mxm_first_result_latency()+delay,
                         (1-hemisphere)*target.memory().slices_per_hemisphere+slice,
@@ -394,7 +392,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                 loadDomain.repeat_weight_column_stride = -1;
                 emitMxm3D(rewriter, op.getLoc(), cycle + (localDequant ? 0 : weightToIw),
                     unit, "iw", weightBuffer, 3, 0, 0, 0, 1,
-                    localDequant ? "sram" : "stream", true, "supercell", 0,
+                    localDequant ? "sram" : "stream", true, "block", 0,
                     dataFormat, execution->weight_input_mode(), {}, loadDomain);
             }
 
@@ -434,7 +432,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                         "compute", weightBuffer, 0,
                         hemisphere * 2, 0, tile, 1,
                         accumulatorAddress + tokenBlock * tile,
-                        1, "sram", false, "supercell", 0,
+                        1, "sram", false, "block", 0,
                         dataFormat);
                 }
             }
@@ -455,7 +453,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                 emitMxm3D(rewriter, op.getLoc(), readCycle,
                     hemisphere * target.throughput().mxms_per_hemisphere + localMxm,
                     "accumulator_read", 0, 0, 0, outputStream, accumulatorAddress, 1,
-                    "stream", true, "supercell", 0, dataFormat, {}, dataFormat, readDomain);
+                    "stream", true, "block", 0, dataFormat, {}, dataFormat, readDomain);
                 for (int64_t byte = 0; byte < 2; ++byte) {
                     const int64_t slice = resultSlices[byte];
                     const auto latency = target.transport_latency(target::StreamEndpoint::MxmResult,

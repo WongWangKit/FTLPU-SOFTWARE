@@ -959,13 +959,18 @@ void ModelSession::upload_binding_through_c2c(
   if (image.segments.empty())
     throw std::logic_error("packed C2C input has no physical SRAM segments");
 
+  const bool striped=binding.layout==BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16;
+  for(std::uint16_t parity=0;parity<(striped?2:1);++parity) {
+  const auto transferBank=static_cast<std::uint16_t>(binding.bank^parity);
   C2cWeightPage page;
-  page.bank = binding.bank;
+  page.bank = transferBank;
   std::array<std::array<std::uint64_t, hw::kC2cStreamsPerDirection>,
              hw::kHemispheres>
       laneLoads{};
   const std::size_t laneCount = hardware.c2c_streams_per_direction;
   for (const PackedWeightSegment &source : image.segments) {
+    const auto sourceBank=binding.bank ^ (striped?((source.base_row-binding.base_row)/4)%2:0);
+    if(sourceBank!=transferBank)continue;
     const auto side = static_cast<std::size_t>(source.hemisphere);
     if (side >= hardware.hemispheres || laneCount == 0)
       throw std::logic_error("packed C2C input has an invalid hemisphere");
@@ -990,7 +995,7 @@ void ModelSession::upload_binding_through_c2c(
     }
     page.segments.push_back(C2cWeightSegment{
         static_cast<Hemisphere>(source.hemisphere), source.slice,
-        binding.bank, source.base_row, static_cast<std::uint16_t>(lane),
+        transferBank, source.base_row, static_cast<std::uint16_t>(lane),
         ddrAddress, source.vector_count});
     laneLoads[side][lane] += source.vector_count;
     executable_ddr4_address_ += bytes;
@@ -1007,18 +1012,20 @@ void ModelSession::upload_binding_through_c2c(
   const std::size_t transferCycles = wait_for_standalone_weight_page(
       std::max<std::size_t>(4096, vectors * 64));
   if (execution_trace_enabled_ && transferCycles != 0) {
-    if (!traceDetail.empty())
-      traceDetail += ' ';
-    traceDetail += "binding=" + std::to_string(binding.index) +
+    auto transferDetail=traceDetail;
+    if (!transferDetail.empty())
+      transferDetail += ' ';
+    transferDetail += "binding=" + std::to_string(binding.index) +
                    " role=" + binding.role +
                    " bytes=" + std::to_string(data.size());
     runtime_.record_execution_trace_interval(
         0, static_cast<std::int64_t>(transferCycles),
-        std::move(traceResource), std::move(traceDetail));
+        traceResource, std::move(transferDetail));
   }
   stats_.c2c_ingress_cycles += c2c_system_->cycle() - beginCycle;
   stats_.c2c_ingress_bytes += vectors * hw::kPhysicalVectorBytes;
   weight_pager_->retire();
+  }
 }
 
 std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
@@ -1031,6 +1038,9 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
   const std::vector<std::uint8_t> zero(
       static_cast<std::size_t>(binding.byte_size), 0);
   PackedWeightImage image = pack_binding_image(binding, zero, hardware);
+  const auto segmentBank=[&](const PackedWeightSegment& segment) {
+    return binding.bank ^ (binding.layout==BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16 ? ((segment.base_row-binding.base_row)/4)%2 : 0);
+  };
   if (image.segments.empty())
     throw std::logic_error("packed C2C output has no physical SRAM segments");
 
@@ -1142,7 +1152,7 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
         std::size_t transportLane = lane;
         if (!compiledReads.empty()) {
           const auto queue = InstructionControlUnit::mem_queue(
-              hemisphere, segment.slice, binding.bank);
+              hemisphere, segment.slice, segmentBank(segment));
           for (std::size_t read = 0; read < compiledReads.size(); ++read) {
             auto &candidate = compiledReads[read];
             if (candidate.used || candidate.queue != queue ||
@@ -1179,7 +1189,7 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
           static_cast<Hemisphere>(segment.hemisphere);
       const std::size_t fabricStream = copy.lane;
       const auto queue = InstructionControlUnit::mem_queue(
-          hemisphere, segment.slice, binding.bank);
+          hemisphere, segment.slice, segmentBank(segment));
       if (copy.compiled_read.has_value()) {
         const auto &read = compiledReads[*copy.compiled_read];
         c2c_system_->chip().icu().push_mem_synchronized_raw(
@@ -1191,7 +1201,7 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
                 hemisphere, copy.lane, fabricStream,
                 segment.vector_count, static_cast<std::uint32_t>(read.tag),
                 C2cMemNotifyRoute::Mem(
-                    hemisphere, segment.slice, binding.bank))));
+                    hemisphere, segment.slice, segmentBank(segment)))));
       } else {
         // The DDR writer may serialize lanes even when aggregate bandwidth
         // exceeds MEM demand. Unconditional reads can therefore outrun a TX
@@ -1204,7 +1214,7 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
         c2c_system_->chip().icu().enqueue_c2c_tx_raw(hemisphere,
             C2cIcuPacketCodec::encode(C2cTxIcuInstruction::Send(
                 hemisphere, copy.lane, fabricStream, segment.vector_count, tag,
-                C2cMemNotifyRoute::Mem(hemisphere, segment.slice, binding.bank))));
+                C2cMemNotifyRoute::Mem(hemisphere, segment.slice, segmentBank(segment)))));
       }
       c2c_system_->chip().icu().enqueue_c2c_dma(
           hemisphere,

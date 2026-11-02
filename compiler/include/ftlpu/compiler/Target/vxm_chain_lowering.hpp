@@ -21,19 +21,20 @@ inline VxmLaneOperand lowerVxmChainOperand(llvm::StringRef kind,
     if (kind == "feedback") return VxmLaneOperand::Feedback();
     if (kind == "immediate") return VxmLaneOperand::Imm(immediate);
     if (kind == "alu" && index == queue - 1) return VxmLaneOperand::Previous();
-    if (kind == "stream_f16" || kind == "stream_bf16") {
-        const auto expected = 2 * VxmLane::fixed_input_group_for_stage(queue, rhs);
+    if (kind == "stream_f16" || kind == "stream_bf16" || kind == "stream_f32") {
+        const auto operand = kind == "stream_f32" ? VxmLaneOperand::StreamFloat32()
+            : kind == "stream_f16" ? VxmLaneOperand::StreamFloat16() : VxmLaneOperand::StreamBFloat16();
+        const auto expected = VxmLane::fixed_input_base_for_stage(queue, rhs, operand.kind);
         if (index < 0 || index >= 64 || index % 32 != expected)
             throw std::runtime_error("chain VXM fixed input port requires stream "
                 + std::to_string(expected) + "; requested " + std::to_string(index)
                 + ". Re-layout MEM inputs instead of discarding the stream index");
         if (!source.empty() && source != "local" && source != "east")
             throw std::runtime_error("chain VXM absolute input hemisphere requires a configured group mux; current runtime uses mirrored local inputs");
-        return kind == "stream_f16" ? VxmLaneOperand::StreamFloat16()
-                                    : VxmLaneOperand::StreamBFloat16();
+        return operand;
     }
     throw std::runtime_error("operand " + kind.str()
-        + " requires chain legalization; chain VXM cannot consume arbitrary SR/FP32 stream operands");
+        + " requires chain legalization; chain VXM cannot consume arbitrary SR stream operands");
 }
 
 template <typename Op>

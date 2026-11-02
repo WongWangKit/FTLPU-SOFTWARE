@@ -19,6 +19,13 @@
 int main(int argc, char** argv)
 try {
     using namespace ftlpu::software::runtime;
+    const char* sxmChoice = std::getenv("FTLPU_FILE_RUNNER_SXM_ARCHITECTURE");
+    if (sxmChoice && std::string(sxmChoice) != "wide" && std::string(sxmChoice) != "local")
+        throw std::runtime_error("SXM architecture must be wide or local");
+    const auto sxmArchitecture = sxmChoice && std::string(sxmChoice) == "wide"
+        ? ftlpu::SxmTransposeArchitecture::WideStreaming
+        : ftlpu::SxmTransposeArchitecture::LocalBlocks;
+    std::cout << "sxm_architecture=" << (sxmArchitecture == ftlpu::SxmTransposeArchitecture::WideStreaming ? "wide" : "local") << '\n';
     if (argc != 4 && argc != 5) throw std::runtime_error("usage: compiled_stage_file_runner program.ftlpu inputs.txt output-prefix [runtime-pipeline.csv]");
 #ifdef FTLPU_FILE_RUNNER_LINK_CHECK
 #ifdef _WIN32
@@ -95,7 +102,8 @@ try {
             invocation.outputs.push_back({b.index, name});
         }
         package.invocations.push_back(invocation);
-        auto dma = std::make_unique<ftlpu::C2cDmaSystem>();
+        auto dma = std::make_unique<ftlpu::C2cDmaSystem>(ftlpu::Ddr4Config{}, 16,
+            ftlpu::SystemHardwareConfiguration{}, sxmArchitecture);
         ModelSession session(*dma);
         if (argc == 5) session.enable_execution_trace();
         session.load(std::move(package));
@@ -198,7 +206,8 @@ try {
                   << " host_operations=" << stats.host_operations << '\n';
         return 0;
     }
-    auto system = std::make_unique<ftlpu::TspSliceSystem>();
+    auto system = std::make_unique<ftlpu::TspSliceSystem>(
+        ftlpu::SystemHardwareConfiguration{}, sxmArchitecture);
     CModelRuntime runtime(*system);
     if (argc == 5) runtime.enable_execution_trace();
     const auto segments=split_resident_program_at_drains(program);

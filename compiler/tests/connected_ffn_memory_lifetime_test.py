@@ -52,7 +52,7 @@ def main():
         '--output', str(out / 'layer.kernel.mlir'), '--emit-kernel'], check=True)
     subprocess.run([str(args.compile.resolve()), '--input', str(out / 'layer.kernel.mlir'),
         '--input-stage', 'kernel', '--output', str(out / 'layer.ftlpu'),
-        '--mxm-execution', 'vector', '--ffn-schedule', 'fused',
+        '--mxm-execution', 'ws', '--ffn-schedule', 'fused',
         '--target-config', str(args.target_config.resolve())], check=True)
     plan = json.loads((out / 'graph_plan.json').read_text())
     ffns = [node for node in plan['nodes'] if node.get('native_ffn')]

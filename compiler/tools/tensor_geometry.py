@@ -28,8 +28,11 @@ class Value:
         return Value(self.node, self.output, geometry.shape, self.dtype, geometry.reshape(-1), owners)
     @property
     def T(self):
-        geometry = self.indices.reshape(self.shape).T
-        owners = None if self.owners is None else self.owners.reshape(self.shape).T.reshape(-1)
+        return self.transpose()
+
+    def transpose(self, *axes):
+        geometry = self.indices.reshape(self.shape).transpose(*axes)
+        owners = None if self.owners is None else self.owners.reshape(self.shape).transpose(*axes).reshape(-1)
         return Value(self.node, self.output, geometry.shape, self.dtype, geometry.reshape(-1), owners)
 
     def segments(self):

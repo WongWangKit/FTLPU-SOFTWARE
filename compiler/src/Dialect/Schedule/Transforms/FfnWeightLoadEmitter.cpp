@@ -174,7 +174,7 @@ MxmIssueOp emitFfnMxmIssue3D(mlir::IRRewriter& rewriter,
                             rewriter.getBoolAttr(accumulatorClear)),
       rewriter.getNamedAttr("data_format", rewriter.getStringAttr(dataFormat)),
       rewriter.getNamedAttr("weight_load_mode",
-                            rewriter.getStringAttr("supercell")),
+                            rewriter.getStringAttr("block")),
       rewriter.getNamedAttr("weight_inner_column",
                             rewriter.getI64IntegerAttr(0)),
       rewriter.getNamedAttr("weight_buffer_mode",
@@ -319,7 +319,7 @@ MxmLoadOp emitFfnWeightTile(
           loadCycles, streamBase,
           columnLoad ? 1 : throughput.mxm_int8_load_streams_per_cycle, unit, groupBuffer);
       load->setAttr("data_format", rewriter.getStringAttr(dataFormat));
-      load->setAttr("weight_load_mode", rewriter.getStringAttr(columnLoad ? "column" : "supercell"));
+      load->setAttr("weight_load_mode", rewriter.getStringAttr(columnLoad ? "vector" : "block"));
       load->setAttr("weight_input_mode",
                     rewriter.getStringAttr("int8_dequant_bf16"));
       load->setAttr("group_count",

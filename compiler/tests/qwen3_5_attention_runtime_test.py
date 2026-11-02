@@ -26,7 +26,13 @@ def main():
     p.add_argument('--decode-token',type=int,help='Decode one fixture token with a nonzero recurrent and convolution history')
     p.add_argument('--previous-step',type=Path,help='Use actual state and Conv cache outputs from this prior CModel step')
     p.add_argument('--debug-intermediates',action='store_true')
+    p.add_argument('--decode-retrieval', choices=('vxm','mxm'), default='vxm',
+        help='Use MXM for k times decayed State in the single-token decode core')
+    p.add_argument('--icu-compression', choices=('raw-macro', 'none'), default='raw-macro',
+        help='Production MEM/MXM encoding; VXM/SXM retain native instructions')
     a=p.parse_args();out=a.output_dir.resolve();out.mkdir(parents=True,exist_ok=True)
+    if a.decode_retrieval == 'mxm' and a.decode_token is None:
+        p.error('--decode-retrieval mxm requires --decode-token')
     x,w,packed,scales,c=load_imported_layer(a.package)
     initial=None
     if a.decode_token is not None:
@@ -52,21 +58,26 @@ def main():
         decode=a.decode_token is not None, state_source=str(a.previous_step) if a.previous_step else 'synthetic nonzero history' if initial is not None else 'zero prefill state',
         state_precision='BF16 storage, FP32 accumulation; FP32 ingress upper16 truncation',
         gate_precision='BF16 upper-plane reload at spill boundaries, FP32 chain arithmetic; FP32 buffer ABI retained',
-        runtime_trace_requested=a.trace,
+        runtime_trace_requested=a.trace, icu_compression=a.icu_compression,
+        decode_retrieval=a.decode_retrieval,
         checkpoint_provenance=json.loads((a.package/'metadata.json').read_text()).get('checkpoint_provenance',{}))
     (out/'summary.json').write_text(json.dumps(summary,indent=2))
     try:
         if not a.validate_only and not a.run_only:
             logical=graph.write(out/'logical_graph',finals)
             for command in ([str(a.graph_compile.resolve()),'--input',str(logical),'--output',str(kernel),'--emit-kernel'],
-                [str(a.compile.resolve()),'--input',str(kernel),'--input-stage','kernel','--output',str(binary),'--mxm-execution','vector','--pass-timing']):
+                [str(a.compile.resolve()),'--input',str(kernel),'--input-stage','kernel','--output',str(binary),'--mxm-execution','vector','--pass-timing','--icu-compression',a.icu_compression]):
                 with (out/('import.log' if '--emit-kernel' in command else 'compile.log')).open('w') as log:
                     subprocess.run(command+['--target-config',str(a.target_config.resolve())],stdout=log,stderr=subprocess.STDOUT,check=True)
                 if '--emit-kernel' in command:
                     kernel.write_text(kernel.read_text().replace('module {',
-                        'module attributes {ftlpu.vector_bf16_spill = true, ftlpu.common_barrier_protocol = true} {', 1))
+                        'module attributes {ftlpu.vector_bf16_spill = true, ftlpu.common_barrier_protocol = true, '
+                        f'ftlpu.gdn_decode_retrieval_mxm = {str(a.decode_retrieval == "mxm").lower()}'+'} {', 1))
             if a.compile_only:
                 summary['status']='compiled';return
+        if a.decode_retrieval == 'mxm':
+            assert a.decode_token is not None, 'MXM decode retrieval needs a decode fixture'
+            assert 'imem.drain.gdn.decode_mxm.' in (out/'decoder_layer.schedule.mlir').read_text(), 'MXM retrieval policy was lost in lowering'
         if not a.validate_only:
             with (out/'execution.log').open('w') as log:
                 subprocess.run([str(a.runner.resolve()),str(binary),str(out/'inputs.txt'),str(out/'actual')]

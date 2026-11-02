@@ -21,7 +21,7 @@ mlir::DictionaryAttr withNative4ReadShape(mlir::IRRewriter& rewriter,
         sliceAttrs.push_back(rewriter.getI64IntegerAttr(slice));
     mlir::NamedAttrList attrs;
     attrs.set("kind", rewriter.getStringAttr(
-        weight ? "w8a16_native4_weight" : "fp16_native4_activation"));
+        weight ? "w8a16_is_weight" : "fp16_is_activation"));
     attrs.set("hemisphere", rewriter.getStringAttr(hemisphere));
     attrs.set("slices", rewriter.getArrayAttr(sliceAttrs));
     attrs.set("base_row", rewriter.getI64IntegerAttr(baseRow));
@@ -64,7 +64,7 @@ schedule::MxmIssueOp emitNative4Mxm(mlir::IRRewriter& rewriter,
         rewriter.getNamedAttr("accumulator_destination", rewriter.getStringAttr("sram")),
         rewriter.getNamedAttr("accumulator_clear", rewriter.getBoolAttr(false)),
         rewriter.getNamedAttr("data_format", rewriter.getStringAttr("bf16")),
-        rewriter.getNamedAttr("decode_layout", rewriter.getStringAttr("native4")),
+        rewriter.getNamedAttr("is_mode", rewriter.getStringAttr("is-block")),
         rewriter.getNamedAttr("group_count", rewriter.getI64IntegerAttr(groupCount)),
         rewriter.getNamedAttr("group_interval", rewriter.getI64IntegerAttr(groupInterval)),
     });
@@ -307,12 +307,12 @@ mlir::FailureOr<Native4ProjectionResult> emitNative4ProjectionBatch(
         // This removes the per-parity ICU packet without changing FU cycles.
         const int64_t loadCycle = startCycle + activationLoadOffset;
         emitNative4Mxm(rewriter, plan.getLoc(), loadCycle, hemisphere,
-            "decode_load_activation", 0, 0, 0,
+            "is_load_activation", 0, 0, 0,
             1, 1, 0, parityCount, reductionInterval,
             2, parityPhaseSpan, activationStreamBase);
         emitNative4Mxm(rewriter, plan.getLoc(),
             loadCycle + target.throughput().tile_rows,
-            hemisphere, "decode_stream_compute", 0, 0, 0,
+            hemisphere, "is_stream_compute", 0, 0, 0,
             localWaves, 1, 1, parityCount, reductionInterval,
             2, parityPhaseSpan, activationStreamBase);
     }
@@ -352,7 +352,7 @@ mlir::FailureOr<Native4ProjectionResult> emitNative4ProjectionBatch(
             auto placement = schedule::ffn_detail::schedule_placement(
                 rewriter, {slice}, outputBaseRow, localWaves, 1,
                 schedule::ffn_detail::hemisphere_name(hemisphere),
-                "fp16_native4_stage", outputBank);
+                "fp16_is_stage", outputBank);
             auto write = rewriter.create<schedule::MemWriteOp>(plan.getLoc(),
                 activationValue, drainCycle + *latency, localWaves,
                 byte, 1, 0, rewriter.getStringAttr("west"),
@@ -743,7 +743,7 @@ mlir::FailureOr<mlir::Value> schedule::lowerFfnSchedule(
     auto executionPolicy = target::mxm_execution_policy_from_operation(
         plan.getOperation());
     if (mlir::succeeded(executionPolicy)
-        && *executionPolicy == target::MxmExecutionPolicy::Native4)
+        && *executionPolicy == target::MxmExecutionPolicy::Is)
         return lowerNative4Ffn(rewriter, plan, target);
     auto context = schedule::ffn_detail::createFfnEmissionContext(
         rewriter, plan, strategy, target);

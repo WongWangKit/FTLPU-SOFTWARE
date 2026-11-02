@@ -34,7 +34,7 @@ def main() -> None:
     shutil.copyfile(args.input, stablehlo)
 
     common = [
-        "--mxm-execution", "vector",
+        "--mxm-execution", "ws",
         "--ffn-schedule", "fused",
         "--projection-rope-overlap", "on",
         "--target-config", str(args.target_config),
@@ -143,7 +143,7 @@ def main() -> None:
         str(args.compile), "--input", str(command),
         "--output", str(binary), "--input-stage", "command",
         "--target-config", str(args.target_config),
-        "--mxm-execution", "vector",
+        "--mxm-execution", "ws",
         "--weight-bank", str(args.weight_bank),
     ], "hardware-commands-to-binary")
     if binary.stat().st_size < 64:

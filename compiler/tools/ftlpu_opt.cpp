@@ -159,7 +159,7 @@ Args parse_args(int argc, char** argv)
                                  "[--ffn-schedule tail|fused] "
                                  "[--attention-schedule tail|fused] "
                                  "[--projection-rope-overlap on|off] "
-                                 "[--mxm-execution auto|vector|native4|legacy] "
+                                 "[--mxm-execution auto|ws|is] "
                                  "[--icu-compression none|control|macro|raw-macro] "
                                  "[--mem-slice-program on|off] "
                                  "[--weight-bank 0|1] "

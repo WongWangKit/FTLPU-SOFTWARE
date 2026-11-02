@@ -40,7 +40,7 @@ def main():
     commands = [
         [a.graph_compile, '--input', logical, '--output', kernel, '--emit-kernel'],
         [a.compile, '--input', kernel, '--input-stage', 'kernel', '--output', binary,
-         '--mxm-execution', 'vector'],
+         '--mxm-execution', 'ws'],
     ]
     for i, command in enumerate(commands):
         with (out / f'compile{i}.log').open('w') as log:

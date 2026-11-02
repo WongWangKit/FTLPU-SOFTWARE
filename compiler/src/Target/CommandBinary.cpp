@@ -855,11 +855,13 @@ StreamReleaseSummary stream_release_cycles(
             const auto markOperand = [&](const VxmLaneOperand& operand,
                                          bool rhs) {
                 if (operand.kind != VxmLaneOperandKind::StreamFloat16
-                    && operand.kind != VxmLaneOperandKind::StreamBFloat16)
+                    && operand.kind != VxmLaneOperandKind::StreamBFloat16
+                    && operand.kind != VxmLaneOperandKind::StreamFloat32)
                     return;
-                const auto base = 2 * VxmLane::fixed_input_group_for_stage(stage, rhs);
-                markRange(base, 2, end);
-                markRange(streamCount + base, 2, end);
+                const auto base = VxmLane::fixed_input_base_for_stage(stage, rhs, operand.kind);
+                const auto width = VxmLane::stream_operand_bytes(operand.kind);
+                markRange(base, width, end);
+                markRange(streamCount + base, width, end);
             };
             markOperand(instruction.lhs, false);
             markOperand(instruction.rhs, true);
@@ -907,10 +909,11 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::W8A16MxmWeightWaveStriped;
     if (value == "w8a16_attention_weight_striped")
         return BindingLayout::W8A16AttentionWeightStriped;
-    if (value == "w8a16_native4_weight")
+    if (value == "w8a16_is_weight")
         return BindingLayout::W8A16Native4Weight;
     if (value == "fp16_pair_planar") return BindingLayout::Fp16PairPlanar;
     if (value == "fp16_hemisphere_pair_planar") return BindingLayout::Fp16HemispherePairPlanar;
+    if (value == "token_partition_east_first_planar") return BindingLayout::TokenPartitionEastFirstPlanar;
     if (value == "token_partition_planar") return BindingLayout::TokenPartitionPlanar;
     if (value == "column_partition_planar") return BindingLayout::ColumnPartitionPlanar;
     if (value == "fp32_quad_planar") return BindingLayout::Fp32QuadPlanar;
@@ -932,6 +935,10 @@ BindingLayout parse_layout(llvm::StringRef value)
         return BindingLayout::Fp16DepthwiseKernel4;
     if (value == "fp16_vxm_gamma_broadcast")
         return BindingLayout::Fp16VxmGammaBroadcast;
+    if (value == "fp16_mxm_compact_block4_partition_distributed_16")
+        return BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16;
+    if (value == "fp16_mxm_block4_partition_distributed_16")
+        return BindingLayout::Fp16MxmBlock4PartitionDistributed16;
     if (value == "fp16_mxm_distributed_16")
         return BindingLayout::Fp16MxmDistributed16;
     if (value == "fp16_rope_table")
@@ -972,6 +979,11 @@ BinaryBinding translate_binding(command::BindingOp op)
         : BindingElementType::I32;
     binding.byte_size = static_cast<std::uint64_t>(op.getBytes());
     binding.layout = parse_layout(op.getPlacement().getAs<mlir::StringAttr>("kind").getValue());
+    if(auto stripe=op.getPlacement().getAs<mlir::IntegerAttr>("bank_tile_rows")) {
+        if(stripe.getInt()!=4 || (binding.layout!=BindingLayout::Fp16MxmBlock4PartitionDistributed16 && binding.layout!=BindingLayout::Fp16MxmDistributed16))
+            throw std::runtime_error("unsupported bank-striped binding geometry");
+        binding.layout=BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16;
+    }
     auto hemisphere = op.getPlacement().getAs<mlir::StringAttr>("hemisphere");
     binding.hemisphere_mask = !hemisphere || hemisphere.getValue() == "east" ? 1
         : hemisphere.getValue() == "west" ? 2 : 3;
@@ -1178,7 +1190,7 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
     }
     const int64_t weightColumn = op.getWeightColumn();
         const auto instruction = is_load
-            ? op.getWeightLoadMode().value_or("supercell") == "column"
+            ? op.getWeightLoadMode().value_or("block") == "vector"
                 ? MxmControlInstruction::IWColumn(
                     op.getWeightBuffer(), weightColumn,
                     op.getWeightInnerColumn().value_or(0), inputMode,
@@ -1253,6 +1265,7 @@ VxmLaneOperation parse_vxm_operation(llvm::StringRef value)
     if (value == "reciprocal" || value == "divide")
         return VxmSpecialAluOpcode::Reciprocal;
     if (value == "rsqrt") return VxmSpecialAluOpcode::Rsqrt;
+    if (value == "log") return VxmSpecialAluOpcode::Log;
     throw std::runtime_error(
         "Command IR VXM operation is not implemented by the current CModel");
 }
@@ -2085,31 +2098,34 @@ void compress_stream_nd_depth(
 
 bool is_native4_decode(command::MxmOp op)
 {
-    return (op.getOpcode() == "decode_load_activation"
-            || op.getOpcode() == "decode_stream_compute")
-        && op.getDecodeLayout().value_or("") == "native4";
+    return (op.getOpcode() == "is_load_activation"
+            || op.getOpcode() == "is_stream_compute")
+        && (op.getIsMode().value_or("") == "is-block"
+            || op.getIsMode().value_or("") == "is-vector");
 }
 
 void collect_native4_decode(
     command::MxmOp op, Raw3DQueueMap& queues)
 {
-    const bool load = op.getOpcode() == "decode_load_activation";
+    const bool load = op.getOpcode() == "is_load_activation";
     const auto format = op.getDataFormat().value_or("bf16") == "bf16"
         ? MxmDataFormat::BFloat16 : MxmDataFormat::Float16;
     const auto destination = op.getAccumulatorDestination() == "stream"
         ? MxmAccumulatorDestination::Stream
         : MxmAccumulatorDestination::Sram;
+    const auto mode = op.getIsMode().value_or("") == "is-vector"
+        ? MxmIsMode::Vector : MxmIsMode::Block;
     const auto instruction = load
-        ? MxmControlInstruction::DecodeLoadActivation(
+        ? MxmControlInstruction::IsLoadActivation(
             static_cast<std::size_t>(op.getWeightBuffer()),
             static_cast<std::size_t>(op.getActivationStreamBase()), format,
-            MxmDecodeLayout::Native4x4)
-        : MxmControlInstruction::DecodeStreamCompute(
+            mode)
+        : MxmControlInstruction::IsStreamCompute(
             static_cast<std::size_t>(op.getWeightBuffer()),
             static_cast<std::size_t>(op.getOutputStreamBase()), format,
             static_cast<std::size_t>(op.getAccumulatorAddress()),
             static_cast<std::size_t>(op.getWeightColumn()), destination,
-            op.getAccumulatorClear(), MxmDecodeLayout::Native4x4);
+            op.getAccumulatorClear(), mode);
     const std::size_t repeatCount =
         static_cast<std::size_t>(op.getRepeatCount());
     const std::size_t waveCount = static_cast<std::size_t>(
@@ -3086,8 +3102,14 @@ void lower_direct_raw_macro(software::runtime::BinaryProgram& program)
     remap(program.address_relocations);
     remap(program.scale_relocations);
     const auto physical = analyze_physical_imem(program);
-    if (!physical.fits())
-        throw std::runtime_error("raw-macro exceeds physical i-MEM or Active Context capacity");
+    if (!physical.fits()) {
+        try {
+            static_cast<void>(plan_compute_imem_segments(program));
+        } catch (const std::exception& error) {
+            throw std::runtime_error("raw-macro exceeds physical i-MEM or Active Context capacity: "
+                + std::string(error.what()));
+        }
+    }
 }
 
 } // namespace

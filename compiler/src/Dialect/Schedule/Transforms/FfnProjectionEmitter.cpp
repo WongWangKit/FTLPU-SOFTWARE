@@ -1048,12 +1048,21 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                         pagePairBase)];
                                 const int64_t tempGroupPairBase =
                                     tempGroup * pairsPerTempGroup;
-                                const int64_t domainPairBase = std::max(
+                                int64_t domainPairBase = std::max(
                                     pagePairBase, tempGroupPairBase);
-                                const int64_t domainPairEnd = std::min({
+                                int64_t domainPairEnd = std::min({
                                     pagePairBase + pagePairCount,
                                     tempGroupPairBase + pairsPerTempGroup,
                                     context.projection_timeline.pair_count});
+                                // Each Up tile must finish its WRITE3D before
+                                // the same queue can READ3D it for SwiGLU.
+                                // Keep Gate as one domain; it is fully resident.
+                                if (projection == 1 && throughput.vxm_alus == 16
+                                    && mTileCount == 1
+                                    && context.strategy == FfnScheduleStrategy::Fused) {
+                                    domainPairBase = pair;
+                                    domainPairEnd = pair + 1;
+                                }
                                 const int64_t pairsInDomain =
                                     domainPairEnd - domainPairBase;
                                 const auto key = std::tuple {hemisphere,
@@ -1101,27 +1110,8 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                     setFfnLoopDomain3D(
                                         write.getOperation(), rewriter,
                                         domain);
-                                    // The 16-column SR SwiGLU reads Gate
-                                    // twice: once at C0 and again at C4.
-                                    // Both Tail and Fused schedules need the
-                                    // second physical copy on separate slices.
-                                    if (projection == 0
-                                        && throughput.vxm_alus == 16
-                                        && tempGroup == 0
-                                        && gateTempSlices.size() >= 4) {
-                                        const int64_t copySlice = gateTempSlices[2 + byte];
-                                        const auto copyLatency = target.transport_latency(
-                                            target::StreamEndpoint::MxmResult,
-                                            target::StreamEndpoint::Mem,
-                                            target::StreamDirection::West, copySlice);
-                                        emitFfnMemTransfer3D(rewriter, ffn.getLoc(),
-                                            sourceComputeCycle + target.mxm_first_result_latency()
-                                                + *copyLatency,
-                                            hemisphere, copySlice, "write_tap", tempBase,
-                                            32 + streamBase + byte,
-                                            tempRowsPerTile, 1, 1,
-                                            context.temp_bank, domain);
-                                    }
+                                    // The 16-ALU chain retains Original Gate
+                                    // for C4. It needs no second SRAM copy.
                                     tempDomainOutputs[key] =
                                         write.getOutput();
                                 }

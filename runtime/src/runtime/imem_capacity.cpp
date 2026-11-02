@@ -839,4 +839,30 @@ std::vector<BinaryProgram> split_resident_program_at_drains(const BinaryProgram&
     return result;
 }
 
+std::vector<BinaryProgram> plan_compute_imem_segments(const BinaryProgram& program)
+{
+    const auto report = analyze_physical_imem(program);
+    if (report.fits()) return {};
+    if (!program.common_barrier_protocol)
+        throw std::invalid_argument("compute iMEM reload requires the common barrier protocol");
+    BinaryProgram subset;
+    subset.target_name = program.target_name;
+    subset.target_abi = program.target_abi;
+    subset.hardware = program.hardware;
+    subset.max_cycle = program.max_cycle;
+    subset.timelines = program.timelines;
+    for (const auto& queue : report.queues) {
+        if (!queue.deployment_overflow()) continue;
+        if (!queue.physical_overflow() || queue.fu_3d_context_overflow()
+            || queue.macro_context_overflow()
+            || (queue.kind != QueueKind::Vxm && queue.kind != QueueKind::SxmTranspose
+                && queue.kind != QueueKind::SxmPermute))
+            throw std::invalid_argument("iMEM reload cannot split MEM/MXM or bypass Active Context capacity");
+        for (const auto& source : program.queues)
+            if (source.kind == queue.kind && source.index == queue.index)
+                subset.queues.push_back(source);
+    }
+    return split_resident_program_at_drains(subset);
+}
+
 } // namespace ftlpu::software::runtime

@@ -132,6 +132,29 @@ def SwishOp : FTLPU_Kernel_Op<"swish", [Pure]> {
   let hasVerifier = 1;
 }
 
+def ScaledMatvecOp : FTLPU_Kernel_Op<"scaled_matvec", [Pure]> {
+  let summary = "Grouped matrix scaling with retained matrix and vector contraction";
+  let description = [{
+    Matrix is [groups * columns, reduction], vector is [groups, reduction],
+    and scale is [1, scale_groups]. Returns scale[group_offset + group] * matrix and its
+    contraction with vector over reduction. Both results are observable.
+    This storage orientation permits streaming scaled columns into MXM IW.
+    Optional epilogue operands (value, coefficient) return
+    coefficient[group_offset + group] * (value - product).
+    A second optional epilogue result retains the rank-one update:
+    updated[group, column, reduction] = scaled + correction * vector.
+    With a third epilogue operand (readout vector), return a third epilogue
+    result contracting the updated matrix with that vector over reduction.
+  }];
+  let arguments = (ins AnyRankedTensor:$matrix, AnyRankedTensor:$scale,
+                       AnyRankedTensor:$vector, Variadic<AnyRankedTensor>:$epilogue,
+                       DefaultValuedAttr<I64Attr, "0">:$group_offset);
+  let results = (outs AnyRankedTensor:$scaled, AnyRankedTensor:$product,
+                      Variadic<AnyRankedTensor>:$correction);
+  let assemblyFormat = "$matrix `,` $scale `,` $vector (`epilogue` `(` $epilogue^ `)`)? attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def VectorAluOp : FTLPU_Kernel_Op<"vector_alu", [Pure]> {
   let summary = "Generic scalar-broadcast vector arithmetic and row reduction";
   let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,

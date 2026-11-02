@@ -160,7 +160,10 @@ mlir::LogicalResult lower_gated_delta_rule(kernel::GatedDeltaRuleOp op,
         // The native node owns bank 0 while running. Live graph edges are
         // allocated in bank 1 and copied at this explicit operator boundary.
         for(int64_t pair=0;pair<52;pair+=2){
-            auto p=scratchPlan({pair,pair+1},"fp16_pair_planar","both",4096*64,4096,PlacementKind::Result);
+            // Pair 50 retains transposed State at rows 5000..5511 while
+            // other native stages use the lower coefficient/copy workspace.
+            const int64_t rows=pair==50?6144:4096;
+            auto p=scratchPlan({pair,pair+1},"fp16_pair_planar","both",rows*64,rows,PlacementKind::Result);
             if(mlir::failed(p))return op.emitError("cannot reserve native GDN arena");
             scratch.push_back(*p);
         }

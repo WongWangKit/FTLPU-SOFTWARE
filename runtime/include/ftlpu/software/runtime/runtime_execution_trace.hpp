@@ -29,7 +29,7 @@ public:
         const BinaryWeightPageUse* waiting_page = nullptr);
     void record_interval(std::int64_t start_cycle, std::int64_t end_cycle,
         std::string resource, std::string detail,
-        std::size_t issue_count = 1);
+        std::size_t issue_count = 1, bool merge_overlaps = true);
     void write_csv(const std::filesystem::path& path) const;
     bool empty() const noexcept { return events_.empty(); }
 

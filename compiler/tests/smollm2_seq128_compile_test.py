@@ -26,7 +26,7 @@ def main():
         binary = args.output_dir / f"seq128-{mode}.ftlpu"
         run([args.compile, "--input", args.input, "--input-stage", "stablehlo",
              "--target-config", args.target_config, "--weight-bank", "1",
-             "--kv-cache-capacity", "256", "--mxm-execution", "vector",
+             "--kv-cache-capacity", "256", "--mxm-execution", "ws",
              "--projection-rope-overlap", "off", "--ffn-schedule", "tail",
              "--icu-compression", mode, "--output", binary])
         report = run([args.inspect, binary, "--all-queues"])

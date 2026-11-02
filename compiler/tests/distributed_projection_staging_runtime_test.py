@@ -10,16 +10,17 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('compile','graph-compile','runner','target-config','output-dir'):
         p.add_argument('--'+name,type=Path,required=True)
+    p.add_argument('--hidden-size',type=int,default=128)
     a=p.parse_args();out=a.output_dir.resolve();out.mkdir(parents=True,exist_ok=True)
     (out/'summary.json').write_text(json.dumps(dict(status='pending')))
     rng=np.random.default_rng(842)
-    x=bf16(rng.normal(0,.4,(32,128)));gamma=bf16(rng.normal(1,.1,128))
-    weight=rng.integers(-32,33,(128,128),dtype=np.int8);scale=.01
+    x=bf16(rng.normal(0,.4,(32,a.hidden_size)));gamma=bf16(rng.normal(1,.1,a.hidden_size))
+    weight=rng.integers(-32,33,(128,a.hidden_size),dtype=np.int8);scale=.01
     g=LogicalGraph();norm=g.norm('norm',x,gamma,1e-6)
     result=g.project('projection',norm,weight,scale)
     logical=g.write(out/'graph',[result]);kernel=out/'kernel.mlir';binary=out/'program.ftlpu'
     commands=([str(a.graph_compile.resolve()),'--input',str(logical),'--output',str(kernel),'--emit-kernel'],
-        [str(a.compile.resolve()),'--input',str(kernel),'--input-stage','kernel','--output',str(binary),'--mxm-execution','vector'])
+        [str(a.compile.resolve()),'--input',str(kernel),'--input-stage','kernel','--output',str(binary),'--mxm-execution','vector','--icu-compression','raw-macro'])
     for i,cmd in enumerate(commands):
         with (out/f'compile{i}.log').open('w') as log:
             subprocess.run(cmd+['--target-config',str(a.target_config.resolve())],stdout=log,stderr=subprocess.STDOUT,check=True)

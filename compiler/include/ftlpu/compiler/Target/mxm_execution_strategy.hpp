@@ -12,9 +12,8 @@ namespace ftlpu::compiler::target {
 
 enum class MxmExecutionPolicy {
     Auto,
-    Vector,
-    Native4,
-    Legacy,
+    Ws,
+    Is,
 };
 
 enum class MxmWeightPreparation {

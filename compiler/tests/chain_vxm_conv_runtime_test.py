@@ -32,7 +32,7 @@ def main():
     kernel, binary = out / 'kernel.mlir', out / 'program.ftlpu'
     commands = [
         [str(args.graph_compile.resolve()), '--input', str(logical), '--output', str(kernel), '--emit-kernel'],
-        [str(args.compile.resolve()), '--input', str(kernel), '--input-stage', 'kernel', '--output', str(binary)],
+        [str(args.compile.resolve()), '--input', str(kernel), '--input-stage', 'kernel', '--output', str(binary), '--icu-compression', 'raw-macro'],
     ]
     for index, command in enumerate(commands):
         with (out / f'compile{index}.log').open('w') as log:

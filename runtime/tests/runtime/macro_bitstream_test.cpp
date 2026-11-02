@@ -383,14 +383,14 @@ try {
         {rt::QueueKind::MxmLoad,
          1,
          {
-             macro(ftlpu::MxmControlInstruction::DecodeLoadActivation(
+             macro(ftlpu::MxmControlInstruction::IsLoadActivation(
                        0, 0, ftlpu::MxmDataFormat::BFloat16,
-                       ftlpu::MxmDecodeLayout::Native4x4),
+                       ftlpu::MxmIsMode::Block),
                    {12, 3, 5, 0, 1, 1, 0,
                     ftlpu::IcuInductionTarget::None}),
-             macro(ftlpu::MxmControlInstruction::DecodeLoadActivation(
+             macro(ftlpu::MxmControlInstruction::IsLoadActivation(
                        1, 8, ftlpu::MxmDataFormat::BFloat16,
-                       ftlpu::MxmDecodeLayout::Linear1x16),
+                       ftlpu::MxmIsMode::Vector),
                    {64, 1, 1, 0, 1, 1, 0,
                     ftlpu::IcuInductionTarget::None}),
          }});
@@ -398,16 +398,16 @@ try {
         {rt::QueueKind::MxmCompute,
          1,
          {
-             macro(ftlpu::MxmControlInstruction::DecodeStreamCompute(
+             macro(ftlpu::MxmControlInstruction::IsStreamCompute(
                        0, 0, ftlpu::MxmDataFormat::BFloat16, 16, 0,
                        ftlpu::MxmAccumulatorDestination::Sram, false,
-                       ftlpu::MxmDecodeLayout::Native4x4),
+                       ftlpu::MxmIsMode::Block),
                    {24, 4, 7, 1, 2, 31, 16,
                     ftlpu::IcuInductionTarget::MxmAccumulatorAddress}),
-             macro(ftlpu::MxmControlInstruction::DecodeStreamCompute(
+             macro(ftlpu::MxmControlInstruction::IsStreamCompute(
                        1, 4, ftlpu::MxmDataFormat::BFloat16, 48, 1,
                        ftlpu::MxmAccumulatorDestination::Stream, true,
-                       ftlpu::MxmDecodeLayout::Linear1x16),
+                       ftlpu::MxmIsMode::Vector),
                    {96, 1, 1, 0, 1, 1, 0,
                     ftlpu::IcuInductionTarget::None}),
          }});
@@ -547,18 +547,18 @@ try {
     executionProgram.queues.push_back(rt::QueueProgram{
         rt::QueueKind::MxmLoad,
         1,
-        {macro(ftlpu::MxmControlInstruction::DecodeLoadActivation(
+        {macro(ftlpu::MxmControlInstruction::IsLoadActivation(
                    1, 4, ftlpu::MxmDataFormat::BFloat16,
-                   ftlpu::MxmDecodeLayout::Native4x4),
+                   ftlpu::MxmIsMode::Block),
                {3, 1, 1, 0, 1, 1, 0,
                 ftlpu::IcuInductionTarget::None})}});
     executionProgram.queues.push_back(rt::QueueProgram{
         rt::QueueKind::MxmCompute,
         1,
-        {macro(ftlpu::MxmControlInstruction::DecodeStreamCompute(
+        {macro(ftlpu::MxmControlInstruction::IsStreamCompute(
                    1, 2, ftlpu::MxmDataFormat::BFloat16, 40, 2,
                    ftlpu::MxmAccumulatorDestination::Sram, false,
-                   ftlpu::MxmDecodeLayout::Native4x4),
+                   ftlpu::MxmIsMode::Block),
                {5, 2, 3, 4, 1, 1, 0,
                 ftlpu::IcuInductionTarget::MxmAccumulatorAddress})}});
 
@@ -639,9 +639,9 @@ try {
     expect(decodeLoadIssues.size() == 1
                && decodeLoadIssues[0].first == 3
                && decodeLoadIssues[0].second.opcode
-                   == ftlpu::MxmControlOpcode::Decode
+                   == ftlpu::MxmControlOpcode::IS
                && decodeLoadIssues[0].second.decode_operation
-                   == ftlpu::MxmDecodeOperation::LoadActivation
+                   == ftlpu::MxmIsOperation::LoadActivation
                && decodeLoadIssues[0].second.weight_buffer == 1
                && decodeLoadIssues[0].second.activation_stream_base == 4,
            "runtime/CModel Decode.LoadActivation Macro was not preserved");
@@ -649,9 +649,9 @@ try {
                && decodeComputeIssues[0].first == 5
                && decodeComputeIssues[1].first == 8
                && decodeComputeIssues[0].second.opcode
-                   == ftlpu::MxmControlOpcode::Decode
+                   == ftlpu::MxmControlOpcode::IS
                && decodeComputeIssues[0].second.decode_operation
-                   == ftlpu::MxmDecodeOperation::StreamCompute
+                   == ftlpu::MxmIsOperation::StreamCompute
                && decodeComputeIssues[0].second.accumulator_address == 40
                && decodeComputeIssues[1].second.accumulator_address == 44,
            "runtime/CModel Decode.StreamCompute Macro induction changed");

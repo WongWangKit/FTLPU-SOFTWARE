@@ -125,7 +125,7 @@ def main() -> None:
         schedule = args.output_dir / f"qwen2_5_seq32_{setting}.schedule.mlir"
         common = [
             "--target-config", str(args.target_config),
-            "--weight-bank", "0", "--mxm-execution", "vector",
+            "--weight-bank", "0", "--mxm-execution", "ws",
         ]
         subprocess.run([
             str(args.opt), "--input", str(args.input), "--output",
@@ -173,7 +173,7 @@ def main() -> None:
     split_schedule = args.output_dir / "qwen2_5_seq32_split.schedule.mlir"
     split_common = [
         "--target-config", str(args.target_config),
-        "--weight-bank", "1", "--mxm-execution", "vector",
+        "--weight-bank", "1", "--mxm-execution", "ws",
         "--projection-rope-overlap", "off",
     ]
     subprocess.run([

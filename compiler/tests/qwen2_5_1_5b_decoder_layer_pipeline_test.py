@@ -111,7 +111,7 @@ def main() -> None:
     shutil.copyfile(args.input, stablehlo)
 
     common = [
-        "--mxm-execution", "vector", "--ffn-schedule", args.ffn_schedule,
+        "--mxm-execution", "ws", "--ffn-schedule", args.ffn_schedule,
         "--projection-rope-overlap", "on",
         "--target-config", str(args.target_config),
         "--weight-bank", str(args.weight_bank),
@@ -1367,7 +1367,7 @@ def main() -> None:
         str(args.compile), "--input", str(command),
         "--output", str(binary), "--input-stage", "command",
         "--target-config", str(args.target_config),
-        "--mxm-execution", "vector",
+        "--mxm-execution", "ws",
         "--weight-bank", str(args.weight_bank),
         *(["--kv-cache-capacity", str(args.kv_cache_capacity)]
           if args.kv_cache_capacity else []),

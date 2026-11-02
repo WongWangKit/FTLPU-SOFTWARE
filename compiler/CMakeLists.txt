@@ -215,6 +215,9 @@ set_property(SOURCE ${FTLPU_ATTENTION_EMITTER_CONSUMER_SOURCES}
 set_property(SOURCE src/Dialect/Schedule/IR/ScheduleDialect.cpp
     APPEND PROPERTY OBJECT_DEPENDS
         "${CMAKE_CURRENT_BINARY_DIR}/ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.cpp.inc")
+set_property(SOURCE src/Dialect/Schedule/Transforms/VectorAluScheduleEmitter.cpp
+    APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/SiluMultiplyEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/ScaledMatvecEmitter.hpp")
 file(GLOB_RECURSE FTLPU_CMODEL_COMPILER_HEADERS CONFIGURE_DEPENDS
     "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
 set(FTLPU_CMODEL_COMPILER_CONSUMER_SOURCES
@@ -1073,6 +1076,17 @@ if(Python3_Interpreter_FOUND)
             --runner $<TARGET_FILE:compiled_stage_file_runner>
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gated_attention_decoder_layer_runtime)
+        foreach(gdn_tokens 32 64)
+          add_test(NAME gdn_mxm_chunk${gdn_tokens}_runtime_test
+            COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdn_mxm_chunkwise_runtime_test.py
+              --compile $<TARGET_FILE:ftlpu_compile>
+              --runner $<TARGET_FILE:compiled_stage_file_runner>
+              --target-config ${FTLPU_HARDWARE_CONFIG}
+              --tokens ${gdn_tokens}
+              --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gdn_mxm_chunk${gdn_tokens})
+          set_tests_properties(gdn_mxm_chunk${gdn_tokens}_runtime_test PROPERTIES TIMEOUT 900)
+        endforeach()
         add_test(NAME gdn_decode_graph_runtime_test
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdn_decode_graph_runtime_test.py

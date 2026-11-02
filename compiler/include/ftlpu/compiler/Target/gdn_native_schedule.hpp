@@ -2,25 +2,31 @@
 #include "ftlpu/compiler/Target/vector32_triangular_schedule.hpp"
 #include <string>
 #include <tuple>
+#include <optional>
 
 namespace ftlpu::compiler {
 // Experimental complete chunkwise lowering. Resident tensors use BF16 words
 // of 32 lanes; the two hemispheres carry identical copies in this correctness
-// baseline. Matrix products use FP32 VXM accumulation, not MXM. Epochs only
+// baseline. Production products emit MXM tasks; the standalone VXM reference
+// scheduler remains available for regression comparisons. Epochs only
 // bound iMEM occupancy: they never transfer intermediate tensors to the host.
 struct GdnTensor {
     std::size_t pair, base, rows, cols;
     std::size_t words() const { return cols/32; }
     GdnTensor row(std::size_t r) const { return {pair,base+r*words(),1,cols}; }
 };
-struct GdnEpoch { std::string name; Vector32SolveSchedule program; };
+struct GdnMxmProduct { GdnTensor a, transposed_b, out; std::size_t reduction_block; bool final; };
+struct GdnMxmTranspose { GdnTensor source, output; };
+struct GdnEpoch { std::string name; Vector32SolveSchedule program; std::optional<GdnMxmProduct> mxm; std::optional<GdnMxmTranspose> transpose; };
 class GdnNativeLowering {
+    bool use_mxm_ = false;
+    bool state_transposed_ = false;
     std::vector<GdnEpoch> epochs_;
     Vector32SolveSchedule p_;
     std::size_t t_=64;
-    void begin() { p_={}; t_=64; }
+    void begin() { p_={}; t_=use_mxm_?32:64; }
     void finish(const std::string& name) {
-        p_.end_cycle=t_+64; epochs_.push_back({name,std::move(p_)});
+        p_.end_cycle=t_+(use_mxm_?24:64); epochs_.push_back({name,std::move(p_)});
     }
     void mem(std::size_t pair, std::size_t time, std::size_t address,
              std::size_t count, std::int64_t stride, bool rhs, bool write=false) {
@@ -49,7 +55,11 @@ class GdnNativeLowering {
         tail.output_type=VxmCastTarget::BFloat16; tail.output_stream=0;
         vxm(0,t_-1,head); vxm(1,t_-1,tail);
         mem(out.pair,t_+(op==VxmAluOpcode::Multiply?3:2),out.base,count,1,false,true);
-        t_+=count+48;
+        // Serialize aliasing MEM queues through their round-trip transport,
+        // rather than imposing a fixed 48-cycle gap on every vector row.
+        const auto guard = 2*((std::max({a.pair,b.pair,out.pair})+1)
+            /hw::kMemSlicesPerGroup)+8;
+        t_+=count+(use_mxm_?guard:48);
     }
     void mac_packets(std::size_t count) {
         VxmLaneAluInstruction head{VxmAluOpcode::Multiply,VxmLaneOperand::StreamBFloat16(),VxmLaneOperand::StreamBFloat16()};
@@ -66,6 +76,7 @@ class GdnNativeLowering {
         else {add(1,true,false);if(count>2)add(count-2,false,false);add(1,false,true);}
     }
 public:
+    explicit GdnNativeLowering(bool use_mxm=false) : use_mxm_(use_mxm) {}
     void initialize_constants() {
         begin();
         for(auto [pair,address,value]:std::vector<std::tuple<std::size_t,std::size_t,float>>{
@@ -77,7 +88,7 @@ public:
             tail.precision=VxmAluPrecision::Float32;
             tail.output_type=VxmCastTarget::BFloat16;tail.output_stream=0;
             vxm(0,t_-1,head);vxm(1,t_-1,tail);
-            mem(pair,t_+2,address,1,0,false,true);t_+=64;
+            mem(pair,t_+2,address,1,0,false,true);t_+=use_mxm_?32:64;
         }
         finish("constants.ones_zero");
         begin();
@@ -107,7 +118,7 @@ public:
                         MemIcuInstruction::Write3D(loop,MemIcuAddress3D::Affine(1+lane,{0,0,0}),StreamId::West(byte))});
                 }
             }
-            t_+=64;
+            t_+=use_mxm_?2*edge+8:64;
         }
         finish("constants.diagonal");
     }
@@ -115,7 +126,34 @@ public:
                 VxmAluOpcode op,bool scale_rows=false,bool fixed_scale=false,
                 bool immediate=false,float value=0) {
         begin();
-        for(std::size_t r=0;r<out.rows;++r)
+        if(use_mxm_ && out.pair!=a.pair && (immediate || out.pair!=b.pair)) {
+            // Independent rows form one continuous vector domain. Broadcast
+            // a gate within each row via address strides, not idle cycles.
+            const auto words=out.words(), count=out.rows*words;
+            const auto matrixMem=[&](GdnTensor tensor,bool rhs,bool write,
+                                     std::int64_t inner,std::int64_t outer){
+                const auto latency=op==VxmAluOpcode::Multiply?3:2;
+                for(std::size_t side=0;side<2;++side)for(std::size_t byte=0;byte<2;++byte){
+                    const auto hop=(tensor.pair+byte)/hw::kMemSlicesPerGroup;
+                    IcuLoop3D loop{0,{words,out.rows,1},{1,words,1}};
+                    auto address=MemIcuAddress3D::Affine(tensor.base,{inner,outer,0});
+                    p_.mem.push_back({side,tensor.pair+byte,write?t_+latency+hop:t_-1-hop,write
+                        ?MemIcuInstruction::Write3D(loop,address,StreamId::East(side*8+byte))
+                        :MemIcuInstruction::Read3D(loop,address,StreamId::West(side*16+(rhs?2:0)+byte))});
+                }
+            };
+            matrixMem(a,false,false,1,a.words());
+            if(!immediate)matrixMem(b,true,false,scale_rows?0:1,fixed_scale?0:b.words());
+            VxmLaneAluInstruction head{op,VxmLaneOperand::StreamBFloat16(),
+                immediate?VxmLaneOperand::Imm(value):VxmLaneOperand::StreamBFloat16()};
+            head.precision=VxmAluPrecision::Float32;head.repeat_count=count;
+            VxmLaneAluInstruction tail{VxmAluOpcode::Bypass,VxmLaneOperand::Previous()};
+            tail.precision=VxmAluPrecision::Float32;tail.repeat_count=count;
+            tail.output_type=VxmCastTarget::BFloat16;tail.output_stream=0;
+            vxm(0,t_-1,head);vxm(1,t_-1,tail);
+            matrixMem(out,false,true,1,words);
+            t_+=count+16;
+        } else for(std::size_t r=0;r<out.rows;++r)
             binary_words(a.row(r),b.row(fixed_scale?0:r),out.row(r),op,scale_rows,immediate,value);
         finish(name);
     }
@@ -144,13 +182,44 @@ public:
                             MemIcuInstruction::Write3D(loop,MemIcuAddress3D::Affine(c,{static_cast<std::int64_t>(a.cols),0,0}),StreamId::West(c%8*2+byte))});
                     }
                 }
-                t_+=a.rows*8+64;
+                t_+=a.rows*8+(use_mxm_?2*edge+8:64);
             }
             finish(name+".cols"+std::to_string(first));
         }
     }
     void product(const std::string& name,GdnTensor a,GdnTensor b,GdnTensor out) {
         if(a.cols!=b.rows||out.rows!=a.rows||out.cols!=b.cols)throw std::logic_error("GDN product dimensions");
+        if(use_mxm_) {
+            // Column tiles occupy at most 512 packed words. Pair 4
+            // is dead outside the triangular solve; keep every product output
+            // in its existing row-packed placement for the VXM consumers.
+            std::vector<GdnMxmProduct> products;
+            for(std::size_t kb=0;kb<a.cols/32;++kb) {
+                GdnTensor bt{4,kb*b.cols,b.cols,32};
+                if(b.pair==18) {
+                    // K^T is already available as K: load its row-packed
+                    // columns directly, without a second transpose.
+                    bt={12,b.base+kb,32,128};
+                } else if(b.pair==16) {
+                    // KS and QS share the unchanged incoming State. Retain
+                    // its four transposed K tiles above coefficient scratch.
+                    bt={50,5000+kb*b.cols,b.cols,32};
+                    if(!state_transposed_)
+                        transpose_chunk_key(name+".rhs_tile"+std::to_string(kb),
+                            {b.pair,b.base+kb*32*b.words(),32,b.cols},bt);
+                } else {
+                    transpose_chunk_key(name+".rhs_tile"+std::to_string(kb),
+                        {b.pair,b.base+kb*32*b.words(),32,b.cols},bt);
+                }
+                products.push_back({a,bt,out,kb,kb+1==a.cols/32});
+            }
+            // Prepare all columns before beginning cross-K accumulation;
+            // identity-transpose and products share the physical MXM ACC.
+            for(const auto& task:products)
+                epochs_.push_back({name+".mxm"+std::to_string(task.reduction_block),{},task});
+            if(b.pair==16)state_transposed_=true;
+            return;
+        }
         expand(name+".coefficients",a,50);
         for(std::size_t first=0;first<a.rows;first+=16){
             begin();
@@ -171,7 +240,7 @@ public:
         for(std::size_t r=0;r<32;++r)for(std::size_t block=0;block<4;++block){
             if(r){mem(0,t_-1,block,r,4,false);mem(4,t_-1,r*32,r,1,true);}
             mem(2,t_+r-1,r*4+block,1,0,false);mem(6,t_+r-1,0,1,0,true);
-            mac_packets(r+1);mem(0,t_+r+3,r*4+block,1,0,false,true);t_+=r+48;
+            mac_packets(r+1);mem(0,t_+r+3,r*4+block,1,0,false,true);t_+=r+(use_mxm_?16:48);
         }
         finish(name);
     }
@@ -181,6 +250,10 @@ public:
         // with one-hot vectors. No second host-prepared K ingress is needed.
         if(k.rows!=32 || kt.cols!=32 || kt.rows!=k.cols)
             throw std::invalid_argument("GDN key transpose requires a full chunk32");
+        if(use_mxm_) {
+            epochs_.push_back({name+".mxm_transpose",{},{},GdnMxmTranspose{k,kt}});
+            return;
+        }
         expand(name+".coefficients",k,50);
         for(std::size_t first=0;first<k.cols;first+=16){
             begin();
@@ -200,6 +273,7 @@ public:
         epochs_.clear();
         initialize_constants();
         for(std::size_t chunk=0;chunk<tokens/32;++chunk){
+            state_transposed_=false;
             const auto prefix="chunk"+std::to_string(chunk)+".";
             GdnTensor q{10,chunk*128,32,128},k{12,chunk*128,32,128},v{14,chunk*128,32,128},
                 s{16,0,128,128},kt{18,chunk*128,128,32},gamma{24,0,32,32},rmat{26,0,32,32},

@@ -39,6 +39,17 @@ class LogicalGraph:
         graph = VectorGraph(self,name,[(x,'bf16'),(np.asarray(gamma).reshape(1,-1),'f32')])
         return graph.finish(graph.norm(0,1,epsilon,mean,scale))
 
+    def truncate_bf16(self, name, value):
+        """Explicit truncating FP32 high-plane view, without arithmetic."""
+        src, dst = self.type(value.shape, 'f32'), self.type(value.shape, 'bf16')
+        indices = ','.join(map(str, range(int(np.prod(value.shape)))))
+        source = f'''module {{ func.func @stage(%x: {src}) -> {dst} {{
+          %o = "ftlpu.kernel.indexed_view"(%x) {{sources = array<i64: {','.join(['0']*int(np.prod(value.shape)))}>,
+            indices = array<i64: {indices}>, truncate_bf16}} : ({src}) -> {dst}
+          return %o : {dst}
+        }} }}'''
+        return self.run(name, source, [(value,'f32')], [(value.shape,'bf16')])[0]
+
     def conv(self, qkv, weight, **kwargs):
         a, w = self.type(qkv.shape,'bf16'), self.type(weight.shape,'bf16')
         source = f'''module {{ func.func @stage(%a: {a}, %w: {w}) -> {a} {{
@@ -73,24 +84,27 @@ class LogicalGraph:
         graph = VectorGraph(self,name,inputs)
         return graph.finish(build(graph))
 
-    def gates(self, value, packed, scales, dt_bias, a_log):
+    def gates(self, value, packed, scales, dt_bias, a_log, *, bf16_outputs=False):
         """Logical beta and log-decay; hardware expansion belongs to C++."""
         b = self.project('in_proj_b', value, packed['in_proj_b'], scales['in_proj_b'])
         a = self.project('in_proj_a', value, packed['in_proj_a'], scales['in_proj_a'])
         # A_log is immutable checkpoint data. Fold its transform once; this
         # never evaluates an activation or a runtime intermediate on the host.
         negative_a = -np.exp(np.asarray(a_log, dtype=np.float32))
+        constant_type = 'bf16' if bf16_outputs else 'f32'
         graph = VectorGraph(self, 'delta_gates', [(b, 'bf16'), (a, 'bf16'),
-            (np.asarray(dt_bias, dtype=np.float32).reshape(1, -1), 'f32'),
-            (negative_a.reshape(1, -1), 'f32')])
+            (np.asarray(dt_bias, dtype=np.float32).reshape(1, -1), constant_type),
+            (negative_a.reshape(1, -1), constant_type)])
         beta = graph.add(0, kind='sigmoid', immediate=0)
         biased = graph.add(1, 2, kind='add')
         softplus = graph.add(biased, kind='softplus', immediate=0)
-        g = graph.add(softplus, 3)
+        g = graph.add(softplus, 3, dtype='bf16' if bf16_outputs else 'f32')
+        if bf16_outputs:
+            beta = graph.add(beta, kind='cast', immediate=0, dtype='bf16')
         return graph.finish((beta, g))
 
-    def delta(self, q, k, v, decay, beta, state, c):
-        qt, vt, dt, st = self.type(q.shape,'bf16'), self.type(v.shape,'bf16'), self.type(decay.shape,'f32'), self.type(state.shape,'f32')
+    def delta(self, q, k, v, decay, beta, state, c, *, state_dtype='f32'):
+        qt, vt, dt, st = self.type(q.shape,'bf16'), self.type(v.shape,'bf16'), self.type(decay.shape,state_dtype), self.type(state.shape,state_dtype)
         source = f'''module {{ func.func @stage(%q: {qt}, %k: {qt}, %v: {vt},
           %d: {dt}, %b: {dt}, %s: {st}) -> ({vt}, {st}) {{
           %o, %s1 = ftlpu.kernel.gated_delta_rule %q, %k, %v, %d, %b, %s {{heads = {c.num_value_heads} : i64,
@@ -98,7 +112,7 @@ class LogicalGraph:
           return %o, %s1 : {vt}, {st}
         }} }}'''
         return self.run('delta_rule',source,[(q,'bf16'),(k,'bf16'),(v,'bf16'),
-            (decay,'f32'),(beta,'f32'),(state,'f32')],[(v.shape,'bf16'),(state.shape,'f32')])
+            (decay,state_dtype),(beta,state_dtype),(state,state_dtype)],[(v.shape,'bf16'),(state.shape,state_dtype)])
 
     def write(self, directory, finals):
         directory = Path(directory)
@@ -128,6 +142,50 @@ class LogicalGraph:
         path = directory/'decoder_layer.graph.json'
         path.write_text(json.dumps(result,separators=(',',':'))+'\n',encoding='utf-8')
         return path
+
+    def decode_projections(self, x, weights, packed, scales, c):
+        """One row per independent request; all projections share the batch GEMM."""
+        n = self.norm('input_norm', x, bf16(1+weights.input_norm), c.rms_norm_eps)
+        qkv = self.project('in_proj_qkv', n, packed['in_proj_qkv'], scales['in_proj_qkv'])
+        z = self.project('in_proj_z', n, packed['in_proj_z'], scales['in_proj_z'])
+        beta, logdecay = self.gates(n, packed, scales, weights.dt_bias, weights.a_log)
+        decay = self.vector_tiles('delta_decay', [(logdecay, 'f32')],
+            lambda g: g.add(0, kind='exp', immediate=0))
+        return qkv, z, beta, decay
+
+    def decode_output(self, core, z, weights, packed, scales, c):
+        """Normalize each request/head, then one batch-wide output projection."""
+        normalized = self.norm('delta_output_norm', core.reshape(-1,c.value_head_dim),
+            weights.delta_norm,c.rms_norm_eps).reshape(core.shape)
+        def apply_gate(graph):
+            gate=graph.add(1,graph.sigmoid(1),dtype='bf16')
+            return graph.add(0,gate,dtype='bf16')
+        gated=self.vector_tiles('delta_output_gate',[(normalized,'bf16'),(z,'bf16')],apply_gate)
+        return self.project('out_proj',gated,packed['out_proj'],scales['out_proj'])
+
+    def decode_mixer(self, qkv, beta, decay, history, state, weights, c):
+        """Single independent state update, with no projections or host math."""
+        def argument(name, value, dtype):
+            t = self.type(value.shape, dtype)
+            source = f'''module {{ func.func @stage(%x: {t}) -> {t} {{
+              %y = ftlpu.kernel.reshape %x : ({t}) -> {t}
+              return %y : {t}
+            }} }}'''
+            return self.run(name,source,[(value,dtype)],[(value.shape,dtype)])[0]
+        projected = argument('decode_qkv',qkv,'bf16')
+        cached = argument('decode_history',history,'bf16')
+        window = Value.concatenate([cached[-(c.conv_kernel_size-1):],projected])
+        mixed = self.conv(window,weights.conv1d)[-1:]
+        q = mixed[:,:c.key_width].reshape(-1,c.num_key_heads,c.key_head_dim).repeat(
+            c.num_value_heads//c.num_key_heads,1).reshape(-1,c.key_head_dim)
+        k = mixed[:,c.key_width:2*c.key_width].reshape(-1,c.num_key_heads,c.key_head_dim).repeat(
+            c.num_value_heads//c.num_key_heads,1).reshape(-1,c.key_head_dim)
+        q = self.norm('query_l2',q,np.ones(c.key_head_dim,np.float32),1e-6,False,
+            1/np.sqrt(c.key_head_dim)).reshape(1,-1)
+        k = self.norm('key_l2',k,np.ones(c.key_head_dim,np.float32),1e-6,False).reshape(1,-1)
+        core, updated = self.delta(q,k,mixed[:,2*c.key_width:],decay,beta,
+            state.reshape(c.num_value_heads*c.key_head_dim,c.value_head_dim),c)
+        return core, updated, window
 
     def attention(self,x,weights,packed,scales,c,initial_state=None,conv_state=None):
         project=lambda name,value:self.project(name,value,packed[name],scales[name])

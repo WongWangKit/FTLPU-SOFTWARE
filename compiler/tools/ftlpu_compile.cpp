@@ -173,7 +173,7 @@ Args parse_args(int argc, char** argv)
             "[--input-stage stablehlo|kernel|stream|schedule|verified-schedule|command] "
             "[--target-config target.json] [--weight-bank 0|1] "
             "[--kv-cache-capacity tokens] "
-            "[--mxm-execution auto|vector|native4|legacy] "
+            "[--mxm-execution auto|ws|is] "
             "[--icu-compression none|control|macro|raw-macro] "
             "[--mem-slice-program on|off] "
             "[--verify-icu-issues] "

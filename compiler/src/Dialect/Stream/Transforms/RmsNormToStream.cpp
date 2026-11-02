@@ -119,6 +119,8 @@ mlir::LogicalResult lower_rms_norm(
     auto lowered =
         llvm::cast<stream::RmsNormTaskOp>(
             context.rewriter.create(state));
+    for (const auto name : {"native_planar_words", "native_partitioned_planar_words"})
+        if (auto attr=op->getAttr(name)) lowered->setAttr(name,attr);
     context.rewriter.replaceOp(op, lowered.getResult());
     context.stage += 12;
     return mlir::success();

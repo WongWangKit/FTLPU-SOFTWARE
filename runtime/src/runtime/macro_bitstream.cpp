@@ -393,14 +393,14 @@ bool is_mxm_macro_kind(QueueKind kind)
 
 bool is_decode_load(const MxmControlInstruction& instruction)
 {
-    return instruction.opcode == MxmControlOpcode::Decode
-        && instruction.decode_operation == MxmDecodeOperation::LoadActivation;
+    return instruction.opcode == MxmControlOpcode::IS
+        && instruction.decode_operation == MxmIsOperation::LoadActivation;
 }
 
 bool is_decode_compute(const MxmControlInstruction& instruction)
 {
-    return instruction.opcode == MxmControlOpcode::Decode
-        && instruction.decode_operation == MxmDecodeOperation::StreamCompute;
+    return instruction.opcode == MxmControlOpcode::IS
+        && instruction.decode_operation == MxmIsOperation::StreamCompute;
 }
 
 unsigned mxm_instruction_bits(QueueKind kind, std::uint64_t native)
@@ -408,7 +408,7 @@ unsigned mxm_instruction_bits(QueueKind kind, std::uint64_t native)
     switch (kind) {
     case QueueKind::MxmLoad: {
         const auto opcode = static_cast<MxmControlOpcode>(native & 0x3u);
-        return opcode == MxmControlOpcode::Decode ? 29 : 16;
+        return opcode == MxmControlOpcode::IS ? 29 : 16;
     }
     case QueueKind::MxmDequant:
         return 16;

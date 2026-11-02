@@ -192,6 +192,26 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
     std::span<const std::uint8_t> data,
     const ExecutableHardwareConfig& hardware)
 {
+    if(binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16) {
+        auto physical=binding;
+        physical.layout=BindingLayout::Fp16MxmBlock4PartitionDistributed16;
+        auto image=pack_binding_image(physical,data,hardware);
+        std::vector<PackedWeightSegment> segments;
+        for(const auto &segment:image.segments) {
+            for(std::uint32_t offset=0;offset<segment.vector_count;) {
+                const auto count=std::min<std::uint32_t>(4-(segment.base_row+offset-binding.base_row)%4,segment.vector_count-offset);
+                segments.push_back({segment.byte_offset+offset*hardware.bytes_per_word,
+                    segment.hemisphere,segment.slice,segment.base_row+offset,count});
+                offset+=count;
+            }
+        }
+        // Spread each batch across slices, rather than repeatedly queueing one slice.
+        std::sort(segments.begin(),segments.end(),[](const auto&a,const auto&b){
+            return std::tie(a.hemisphere,a.base_row,a.slice)<std::tie(b.hemisphere,b.base_row,b.slice);
+        });
+        image.segments=std::move(segments);return image;
+    }
+
     if (binding.role == "weight" && binding.rope_rotary_dim
         && binding.rope_rotary_dim < binding.rope_head_dim) {
         auto physical = binding;
@@ -254,7 +274,9 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         || binding.layout == BindingLayout::Fp32ScalarBroadcastPlanar;
     const bool packedPlanar = binding.layout == BindingLayout::Fp16PairPlanar
         || binding.layout == BindingLayout::Fp32QuadPlanar;
-    const bool tokenPartition = binding.layout == BindingLayout::TokenPartitionPlanar;
+    const bool tokenPartition = binding.layout == BindingLayout::TokenPartitionPlanar
+        || binding.layout == BindingLayout::TokenPartitionEastFirstPlanar;
+    const bool eastFirst = binding.layout == BindingLayout::TokenPartitionEastFirstPlanar;
     const bool columnPartition = binding.layout == BindingLayout::ColumnPartitionPlanar;
     if (scalarPlanar || packedPlanar || tokenPartition || columnPartition) {
         const std::size_t width = hardware.bytes_per_word;
@@ -277,7 +299,7 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
                 const auto address = base + static_cast<std::uint32_t>(word) * stride;
                 const auto offset = (row * columns + column) * bytes;
                 for_each_hemisphere(binding, [&](std::uint16_t hemisphere) {
-                    if (tokenPartition && hemisphere != (row < half ? 1 : 0)) return;
+                    if (tokenPartition && hemisphere != ((row < half) != eastFirst ? 1 : 0)) return;
                     if (columnPartition && hemisphere != (column < halfColumns ? 0 : 1)) return;
                     for (std::size_t byte = 0; byte < bytes; ++byte)
                         for (std::size_t lane = scalarPlanar ? 0 : column % width;
@@ -424,7 +446,9 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         return image.finish();
     }
 
-    if ((binding.layout == BindingLayout::Fp16MxmDistributed16
+    if ((binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+            || binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16
+            || binding.layout == BindingLayout::Fp16MxmDistributed16
             || binding.layout
                 == BindingLayout::Fp16MxmBlock8Distributed16)
         && (binding.element_type == BindingElementType::F16
@@ -449,7 +473,9 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
                 const std::size_t hidden_block = column / blockColumns;
                 const std::uint32_t address = base
                     + static_cast<std::uint32_t>(
-                        (token_block * hidden_blocks + hidden_block) * tokenWaves
+                        (binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+                        ? token_block * (hidden_blocks / 2) + (hidden_block / 8) * 4 + hidden_block % 4
+                        : token_block * hidden_blocks + hidden_block) * tokenWaves
                         + token_wave) * stride;
                 const std::size_t offset = (row * columns + column) * 2;
                 const auto write_hemisphere = [&](std::uint16_t hemisphere) {
@@ -462,7 +488,11 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
                         static_cast<std::uint32_t>(column % blockColumns),
                         data[offset + 1]);
                 };
-                if (binding.layout
+                if (binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16) {
+                    write_hemisphere(static_cast<std::uint16_t>((hidden_block / 4) % 2));
+                } else if (binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16) {
+                    write_hemisphere(static_cast<std::uint16_t>(1 - (hidden_block / 4) % 2));
+                } else if (binding.layout
                     == BindingLayout::Fp16MxmBlock8Distributed16) {
                     const auto hemisphere = static_cast<std::uint16_t>(
                         (hidden_block
@@ -798,6 +828,11 @@ std::vector<std::uint8_t> unpack_binding_image(
     const BinaryBinding& binding, const PackedWeightImage& image,
     const ExecutableHardwareConfig& hardware)
 {
+    if(binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16) {
+        auto physical=binding;physical.layout=BindingLayout::Fp16MxmBlock4PartitionDistributed16;
+        return unpack_binding_image(physical,image,hardware);
+    }
+
     if (binding.base_row < 0
         || (binding.shape.size() != 2 && binding.shape.size() != 3)
         || binding.slices.empty()
@@ -872,7 +907,9 @@ std::vector<std::uint8_t> unpack_binding_image(
         || binding.layout == BindingLayout::Fp32ScalarBroadcastPlanar;
     const bool packedPlanar = binding.layout == BindingLayout::Fp16PairPlanar
         || binding.layout == BindingLayout::Fp32QuadPlanar;
-    const bool tokenPartition = binding.layout == BindingLayout::TokenPartitionPlanar;
+    const bool tokenPartition = binding.layout == BindingLayout::TokenPartitionPlanar
+        || binding.layout == BindingLayout::TokenPartitionEastFirstPlanar;
+    const bool eastFirst = binding.layout == BindingLayout::TokenPartitionEastFirstPlanar;
     const bool columnPartition = binding.layout == BindingLayout::ColumnPartitionPlanar;
     if (scalarPlanar || packedPlanar || tokenPartition || columnPartition) {
         const std::size_t width = hardware.bytes_per_word;
@@ -898,7 +935,7 @@ std::vector<std::uint8_t> unpack_binding_image(
                 const auto address = static_cast<std::uint32_t>(binding.base_row)
                     + static_cast<std::uint32_t>(word) * static_cast<std::uint32_t>(binding.address_stride);
                 for (std::size_t byte = 0; byte < bytes; ++byte)
-                    result[(row * columns + column) * bytes + byte] = read(columnPartition ? (column < halfColumns ? 0 : 1) : tokenPartition ? (row < half ? 1 : 0) : hemisphere,
+                    result[(row * columns + column) * bytes + byte] = read(columnPartition ? (column < halfColumns ? 0 : 1) : tokenPartition ? ((row < half) != eastFirst ? 1 : 0) : hemisphere,
                         binding.slices[byte], address, scalarPlanar ? 0 : static_cast<std::uint32_t>(column % width));
             }
         return result;
@@ -1037,7 +1074,9 @@ std::vector<std::uint8_t> unpack_binding_image(
             }
         return result;
     }
-    if ((binding.layout == BindingLayout::Fp16MxmDistributed16
+    if ((binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+            || binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16
+            || binding.layout == BindingLayout::Fp16MxmDistributed16
             || binding.layout
                 == BindingLayout::Fp16MxmBlock8Distributed16)
         && (binding.element_type == BindingElementType::F16
@@ -1065,12 +1104,18 @@ std::vector<std::uint8_t> unpack_binding_image(
                 const std::uint32_t address =
                     static_cast<std::uint32_t>(binding.base_row)
                     + static_cast<std::uint32_t>(
-                        (token_block * hidden_blocks + hidden_block) * tokenWaves
+                        (binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16
+                        ? token_block * (hidden_blocks / 2) + (hidden_block / 8) * 4 + hidden_block % 4
+                        : token_block * hidden_blocks + hidden_block) * tokenWaves
                         + token_wave)
                         * static_cast<std::uint32_t>(
                             binding.address_stride);
                 std::uint16_t hemisphere = 0;
-                if (binding.layout
+                if (binding.layout == BindingLayout::Fp16MxmCompactBlock4PartitionDistributed16) {
+                    hemisphere = static_cast<std::uint16_t>((hidden_block / 4) % 2);
+                } else if (binding.layout == BindingLayout::Fp16MxmBlock4PartitionDistributed16) {
+                    hemisphere = static_cast<std::uint16_t>(1 - (hidden_block / 4) % 2);
+                } else if (binding.layout
                     == BindingLayout::Fp16MxmBlock8Distributed16) {
                     hemisphere = static_cast<std::uint16_t>(
                         (hidden_block

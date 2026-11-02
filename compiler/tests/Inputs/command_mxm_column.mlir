@@ -14,7 +14,7 @@ module {
       accumulator_row_stride = 1 : i64,
       accumulator_destination = "sram",
       accumulator_clear = false,
-      weight_load_mode = "column",
+      weight_load_mode = "vector",
       weight_inner_column = 6 : i64
     }
     return

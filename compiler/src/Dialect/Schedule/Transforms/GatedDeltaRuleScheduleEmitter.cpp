@@ -2,6 +2,7 @@
 
 #include "DirectDomainEmitterUtils.hpp"
 #include "FfnEmitterUtils.hpp"
+#include "AttentionEmitterUtils.hpp"
 
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
@@ -247,6 +248,11 @@ private:
             ->getAttrOfType<mlir::BoolAttr>("ftlpu.gdn_partition_heads");
         const bool partitioned = partition && partition.getValue() && heads % 2 == 0;
         const auto localHeads = partitioned ? heads / 2 : heads;
+        const auto retrievalPolicy = op_->getParentOfType<mlir::ModuleOp>()
+            ->getAttrOfType<mlir::BoolAttr>("ftlpu.gdn_decode_retrieval_mxm");
+        const bool mxmRetrieval = retrievalPolicy && retrievalPolicy.getValue();
+        if (mxmRetrieval && (partitioned || dim != 128))
+            return op_.emitError("MXM decode retrieval currently requires mirrored 128-wide heads");
         bool flipped = false;
         auto mem=[&](mlir::DictionaryAttr p,int64_t address,int64_t count,int64_t stride,
                      int64_t cycle,bool write,bool fp32,int64_t port) {
@@ -292,12 +298,129 @@ private:
             mem(dst,da,reduce?1:count,ds,t+(opcode=="multiply"?3:2)+(reduce?count-1:0),true,!bf16Output,0);
             cursor+=count+64;
         };
+        // Reuse the dead product scratch during retrieval. Low planes hold
+        // an identity tile and four packed K vectors; upper planes hold the
+        // four transposed State tiles. Prepare every tile before cross-K ACC
+        // accumulation, since layout preparation also uses MXM's ACC.
+        auto retrieveMxm=[&](int64_t stateAddress,int64_t keyAddress,int64_t vector) {
+            const auto loc=op_.getLoc();
+            auto transfer=[&](mlir::DictionaryAttr p,int64_t plane,int64_t address,
+                              int64_t cycle,bool write,int64_t stream,int64_t count=1,
+                              int64_t stride=1,target::StreamEndpoint endpoint=target::StreamEndpoint::MxmWeight) {
+                for(int64_t side=0;side<2;++side)for(int64_t byte=0;byte<2;++byte){
+                    const auto slice=sliceAt(p,plane+byte);
+                    const auto latency=write
+                        ?target_.transport_latency(endpoint,target::StreamEndpoint::Mem,target::StreamDirection::West,slice).value()
+                        :target_.transport_latency(target::StreamEndpoint::Mem,endpoint,target::StreamDirection::East,slice).value();
+                    direct_domain_detail::emitMem3D(rewriter_,loc,target_,cycle+(write?latency:-latency),
+                        side*target_.memory().slices_per_hemisphere+slice,write?"write":"read",
+                        baseRow(p)+address,stream+byte,count,1,stride,1,1,0,1,1,0,-1,bank(p));
+                }
+            };
+            auto constant=[&](float value,mlir::DictionaryAttr p,int64_t plane,int64_t address){
+                const auto t=cursor;
+                create_vxm(rewriter_,loc,op_.getQuery(),op_.getKey(),op_.getOutput().getType(),
+                    t-1,0,"bypass","immediate",0,value,"immediate",0,value,"fp32",-1,1,1,
+                    "east","east",-1,false,false,true,false,2);
+                alu(t-1,1,"bypass","previous","immediate",1,true,false,false,true);
+                for(int64_t side=0;side<2;++side)for(int64_t byte=0;byte<2;++byte){
+                    const auto slice=sliceAt(p,plane+byte);
+                    direct_domain_detail::emitMem3D(rewriter_,loc,target_,t+2+slice/4,
+                        side*target_.memory().slices_per_hemisphere+slice,"write",baseRow(p)+address,
+                        (1-side)*8+byte,1,1,0,1,1,0,1,1,0,-1,bank(p));
+                }
+                cursor+=64;
+            };
+            struct Pair {mlir::DictionaryAttr p; int64_t plane,address;};
+            const Pair constants[]={{product_,0,127},{product_,2,127},
+                {remembered_,0,vector},{remembered_,2,vector},
+                {delta_,0,vector},{delta_,2,vector},{output_,0,vector},
+                {decayed_,0,stateAddress}};
+            for(int i=0;i<8;++i)constant(i?0.f:1.f,constants[i].p,constants[i].plane,constants[i].address);
+            // Construct identity rows with the existing SXM transpose/permute
+            // hardware. All source words are real initialized SRAM vectors.
+            const int64_t edge=target_.memory().slices_per_hemisphere/4+1;
+            for(int64_t lane=0;lane<32;++lane){
+                const auto t=cursor;
+                for(int64_t side=0;side<2;++side){
+                    for(int64_t row=0;row<8;++row)for(int64_t byte=0;byte<2;++byte){
+                        const auto& p=constants[row]; const auto slice=sliceAt(p.p,p.plane+byte);
+                        direct_domain_detail::emitMem3D(rewriter_,loc,target_,t-edge+slice/4,
+                            side*target_.memory().slices_per_hemisphere+slice,"read",baseRow(p.p)+p.address,
+                            16+2*row+byte,1,1,0,1,1,0,1,1,0,-1,bank(p.p));
+                    }
+                    for(int stage=0;stage<2;++stage){
+                        mlir::OperationState sxm(loc,SxmOp::getOperationName());
+                        sxm.addAttribute("cycle",rewriter_.getI64IntegerAttr(t+stage*5));
+                        sxm.addAttribute("hemisphere",rewriter_.getI64IntegerAttr(side));
+                        sxm.addAttribute("opcode",rewriter_.getStringAttr(stage?"permute":"transpose"));
+                        llvm::SmallVector<mlir::Attribute> src,dst,map;
+                        for(int i=0;i<16;++i){src.push_back(rewriter_.getI64IntegerAttr(16+i));dst.push_back(rewriter_.getI64IntegerAttr((stage?32:16)+i));}
+                        for(int i=0;i<32;++i)map.push_back(rewriter_.getI64IntegerAttr(i==lane?0:1));
+                        sxm.addAttribute("source_streams",rewriter_.getArrayAttr(src));
+                        sxm.addAttribute("destination_streams",rewriter_.getArrayAttr(dst));
+                        sxm.addAttribute("permute_map",rewriter_.getArrayAttr(map));
+                        if(stage)sxm.addAttribute("output_row",rewriter_.getI64IntegerAttr(9));
+                        sxm.addAttribute("repeat_count",rewriter_.getI64IntegerAttr(1));
+                        sxm.addAttribute("repeat_interval",rewriter_.getI64IntegerAttr(1));
+                        sxm.addAttribute("weight_layout",rewriter_.getStringAttr("decode_identity"));
+                        rewriter_.create(sxm);
+                    }
+                    for(int64_t byte=0;byte<2;++byte){
+                        const auto slice=sliceAt(product_,byte);
+                        direct_domain_detail::emitMem3D(rewriter_,loc,target_,t+5+edge-slice/4,
+                            side*target_.memory().slices_per_hemisphere+slice,"write",baseRow(product_)+lane,
+                            32+byte,1,1,0,1,1,0,1,1,0,-1,bank(product_));
+                    }
+                }
+                cursor+=64;
+            }
+            auto loadColumns=[&](mlir::DictionaryAttr p,int64_t plane,int64_t address,int64_t stride){
+                const auto load=cursor+32;
+                for(int64_t col=0;col<32;++col){
+                    transfer(p,plane,address+col*stride,load+col*4,false,16);
+                    for(int64_t side=0;side<2;++side)
+                        attention_detail::emitMxm(rewriter_,loc,load+col*4,side*target_.throughput().mxms_per_hemisphere,
+                            "iw",0,col/8,0,0,1,1,0,1,"stream",true,"vector",col%8,"bf16","direct16","",16);
+                }
+                cursor=load+144;
+            };
+            auto compute=[&](int64_t activation,int64_t count,int64_t outPlane,int64_t outAddress,
+                             bool final,bool clear,mlir::DictionaryAttr destination,bool fp32){
+                const auto t=cursor;
+                transfer(product_,0,activation,t,false,0,count,1,target::StreamEndpoint::MxmActivation);
+                for(int64_t side=0;side<2;++side)
+                    attention_detail::emitMxm(rewriter_,loc,t,side*target_.throughput().mxms_per_hemisphere,
+                        "compute",0,0,0,0,count,1,0,1,final?"stream":"sram",clear,
+                        "block",0,"bf16","direct16",final?(fp32?"fp32":"bf16"):"");
+                if(final){
+                    transfer(destination,outPlane,outAddress,t+target_.mxm_first_result_latency(),true,32,count,1,target::StreamEndpoint::MxmResult);
+                    if(fp32)transfer(destination,outPlane+2,outAddress,t+target_.mxm_first_result_latency(),true,34,count,1,target::StreamEndpoint::MxmResult);
+                }
+                cursor=t+count+64;
+            };
+            for(int64_t kb=0;kb<4;++kb){
+                // Scalar-broadcast K columns plus e0 produce a packed K tile.
+                loadColumns(key_,0,keyAddress+kb*32,1);
+                compute(0,1,0,32+kb,true,true,product_,false);
+                // State rows loaded as columns, then I * State^T.
+                loadColumns(decayed_,2,stateAddress+kb*32,1);
+                compute(0,32,2,kb*32,true,true,product_,false);
+            }
+            for(int64_t kb=0;kb<4;++kb){
+                loadColumns(product_,2,kb*32,1);
+                // MXM clear retires the ACC after this issue; keep partials
+                // through all four K tiles and clear only on the final drain.
+                compute(32+kb,1,0,vector,kb==3,kb==3,remembered_,true);
+            }
+        };
         for(int64_t head=0;head<localHeads;++head)for(int64_t block=0;block<blocks;++block){
             const auto s=block*localHeads*dim+head*dim, vector=head*blocks+block;
             flipped=false;
             pass(state_,s,true,1,decay_,head,true,0,decayed_,s,1,dim,"multiply",false,false);
             flipped=true;
-            pass(decayed_,s,true,1,key_,head*dim,false,1,remembered_,vector,1,dim,"multiply",true,false);
+            if(mxmRetrieval) retrieveMxm(s,head*dim,vector);
+            else pass(decayed_,s,true,1,key_,head*dim,false,1,remembered_,vector,1,dim,"multiply",true,false);
             flipped=false;
             pass(value_,vector,false,1,remembered_,vector,true,1,delta_,vector,1,1,"subtract",false,false);
             flipped=true;
@@ -308,6 +431,13 @@ private:
             pass(decayed_,s,true,1,product_,s,true,1,finalState_,s,1,dim,"add",false,false);
             flipped=false;
             pass(finalState_,s,true,1,query_,head*dim,false,1,output_,vector,1,dim,"multiply",true,true);
+            if(mxmRetrieval){
+                mlir::OperationState drain(op_.getLoc(),TimelineOp::getOperationName());
+                drain.addAttribute("name",rewriter_.getStringAttr("imem.drain.gdn.decode_mxm.h"+std::to_string(head)+".b"+std::to_string(block)));
+                drain.addAttribute("start",rewriter_.getI64IntegerAttr(cursor-1));
+                drain.addAttribute("end",rewriter_.getI64IntegerAttr(cursor));rewriter_.create(drain);
+                cursor+=96; // Following FU arrivals must not precede the drain.
+            }
         }
         mlir::OperationState timeline(op_.getLoc(),TimelineOp::getOperationName());
         timeline.addAttribute("name",rewriter_.getStringAttr("gated_delta_rule.fixed_decode_bf16_reload"));
@@ -338,6 +468,67 @@ private:
         return mlir::success();
     }
 
+    int64_t emitMxmProduct(const GdnMxmProduct& product, int64_t cursor,
+                          bool pipelineNext = false, int64_t bufferOffset = 0) {
+        const auto& a=product.a; const auto& bt=product.transposed_b; const auto& out=product.out;
+        const auto loc=op_.getLoc();
+        const auto read=[&](int64_t side,int64_t slice,int64_t cycle,int64_t address,
+                            int64_t count,int64_t stride,int64_t stream,target::StreamEndpoint endpoint){
+            const auto latency=target_.transport_latency(target::StreamEndpoint::Mem,endpoint,
+                target::StreamDirection::East,slice).value();
+            direct_domain_detail::emitMem3D(rewriter_,loc,target_,cycle-latency,
+                side*target_.memory().slices_per_hemisphere+slice,"read",address,stream,
+                count,1,stride,1,1,0,1,1,0,-1,0);
+        };
+        // Both halves retain identical tensors, matching the existing native
+        // consumer contract. Each MXM reads BF16 operands directly from SRAM.
+        // Pipeline output tiles through alternate weight buffers. Never overlap
+        // a weight read with another use of the same MEM ICU queue.
+        const bool overlap = target_.throughput().mxm_weight_buffers >= 2
+            && bt.pair != a.pair
+            && (!product.final || (bt.pair != out.pair && a.pair != out.pair));
+        const int64_t firstLoad = cursor + 32;
+        // 32 column instructions require 128 cycles at the raw-macro issue
+        // cadence. Leave time for ACC/result drain before reusing a buffer.
+        const int64_t tileInterval = overlap
+            ? std::max<int64_t>(128, a.rows + 32)
+            : 144 + a.rows + 64;
+        for(std::size_t nb=0;nb<out.words();++nb) {
+            const int64_t load=firstLoad+nb*tileInterval;
+            const int64_t buffer=overlap ? (nb+bufferOffset)%2 : 0;
+            for(int64_t side=0;side<2;++side) {
+                const auto queue=side*target_.throughput().mxms_per_hemisphere;
+                for(int64_t col=0;col<32;++col) {
+                    for(int64_t byte=0;byte<2;++byte)
+                        read(side,bt.pair+byte,load+4*col,bt.base+(nb*32+col)*bt.words(),1,0,16+byte,target::StreamEndpoint::MxmWeight);
+                    attention_detail::emitMxm(rewriter_,loc,load+4*col,queue,"iw",buffer,col/8,
+                        0,0,1,1,0,1,"stream",true,"vector",col%8,"bf16","direct16","",16);
+                }
+                for(std::size_t mb=0;mb<a.rows/32;++mb) {
+                    const int64_t compute=load+144+mb*32;
+                    for(int64_t byte=0;byte<2;++byte)
+                        read(side,a.pair+byte,compute,a.base+mb*32*a.words()+product.reduction_block,32,a.words(),
+                            byte,target::StreamEndpoint::MxmActivation);
+                    attention_detail::emitMxm(rewriter_,loc,compute,queue,"compute",buffer,0,0,0,32,1,
+                        (a.cols==32?0:nb*a.rows)+mb*32,1,product.final?"stream":"sram",product.final,
+                        "block",0,"bf16","direct16",product.final?"bf16":"");
+                    if(product.final) for(int64_t byte=0;byte<2;++byte) {
+                        const auto slice=out.pair+byte;
+                        const auto latency=target_.transport_latency(target::StreamEndpoint::MxmResult,
+                            target::StreamEndpoint::Mem,target::StreamDirection::West,slice).value();
+                        direct_domain_detail::emitMem3D(rewriter_,loc,target_,compute+target_.mxm_first_result_latency()+latency,
+                            side*target_.memory().slices_per_hemisphere+slice,"write",out.base+mb*32*out.words()+nb,32+byte,
+                            32,1,out.words(),1,1,0,1,1,0,-1,0);
+                    }
+            }
+            }
+            cursor=load+144+a.rows+32;
+        }
+        // A chained independent transpose tile may start loading before this
+        // result drains. The caller alternates buffers and drains the last tile.
+        return pipelineNext && overlap
+            ? firstLoad + out.words()*tileInterval - 32 : cursor;
+    }
     mlir::LogicalResult emitNative() {
         const auto tokens=llvm::cast<mlir::RankedTensorType>(op_.getQuery().getType()).getDimSize(0);
         if(op_.getHeads()!=1 || op_.getKeyDim()!=128 || op_.getValueDim()!=128 || tokens%32)
@@ -368,7 +559,7 @@ private:
             else {read+=32;write+=32;latency=sg-dg;}
             emitMem(cursor,sh,ss,sb,false,sa,count,stride,read);
             emitMem(cursor+latency,dh,ds,db,true,da,count,destinationStride,write);
-            cursor+=count+latency+64;
+            cursor+=count+latency+16;
         };
         const auto planeCopy=[&](mlir::DictionaryAttr p,int64_t plane,int64_t pair,int64_t count,bool output,int64_t sourceAddress=0,int64_t stride=1){
             const auto h=p.getAs<mlir::StringAttr>("hemisphere").getValue();
@@ -399,8 +590,22 @@ private:
             createInputBinding(rewriter_,op_,op_->getOperand(i),names[i],in[i]);
             planeCopy(in[i],i>=3?2:0,pairs[i],words[i],false);
         }
-        for(const auto& epoch:GdnNativeLowering{}.lower(tokens,true)){
+        for(const auto& epoch:GdnNativeLowering{true}.lower(tokens,true)){
             const auto start=cursor;
+            if(epoch.mxm) cursor=emitMxmProduct(*epoch.mxm,cursor);
+            if(epoch.transpose) {
+                const auto& source=epoch.transpose->source;
+                const auto& destination=epoch.transpose->output;
+                // Loading original rows as columns forms B^T in MXM.
+                // Identity activations emit packed rows. The planner prepares
+                // all tiles before cross-K accumulation begins, so this
+                // transpose cannot overwrite live product partials.
+                for(std::size_t block=0;block<source.cols/32;++block)
+                    cursor=emitMxmProduct({{6,1,32,32},
+                        {source.pair,source.base+block,32,source.cols},
+                        {destination.pair,destination.base+block*32,32,32},0,true},cursor,
+                        block+1<source.cols/32,block);
+            }
             for(const auto& issue:epoch.program.mem){
                 const auto& m=issue.instruction;
                 if(m.address.outer_group_size!=1)throw std::runtime_error("native GDN non-affine domain");

@@ -306,7 +306,8 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     config.mxms_per_hemisphere =
         static_cast<std::uint32_t>(mxms_per_hemisphere);
     TargetAbiHasher hash;
-    hash.add(21); // VXM terminal accumulator controls in compact ICU packets.
+    hash.add(22); // WS/IS: retired Linear1x16 bit now selects IS-vector.
+    hash.add(hw::kMxmIsColumns);
     // i-MEM capacity is a deployment constraint rather than a command-bit ABI
     // change. Keep legacy Schedule attributes valid and validate geometry
     // explicitly when loading an executable into a CModel.
@@ -320,7 +321,8 @@ constexpr std::uint64_t executable_target_abi(
     const ExecutableHardwareConfig& config)
 {
     TargetAbiHasher hash;
-    hash.add(21); // VXM terminal accumulator controls in compact ICU packets.
+    hash.add(22); // WS/IS instruction semantics and configured IS columns.
+    hash.add(hw::kMxmIsColumns);
     config.visit_command_abi([&](std::uint32_t value) { hash.add(value); });
     hash.add(config.common_barrier_encoding_version);
     hash.add(config.common_barrier_capacity);

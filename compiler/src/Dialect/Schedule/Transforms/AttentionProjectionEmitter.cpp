@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 
 #include "AttentionEmitterUtils.hpp"
+#include "ProjectionGemmSchedule.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_projection_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_work_planner.hpp"
@@ -1118,24 +1119,24 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     target_.throughput().mxm_weight_buffers == 2)
                   loadDomain.weight_buffer_mode = "toggle_dim2";
                 if (mergeProjectionMxm) {
-                  loadDomain.repeat_count = weightLoadCycles;
-                  loadDomain.repeat_interval = 1;
-                  loadDomain.repeat_weight_column_stride = columnLoad ? 1 : -1;
-                  loadDomain.wave_count = hiddenBlocks;
-                  loadDomain.wave_interval = projectionReductionInterval;
-                  loadDomain.wave_weight_column_stride = 0;
-                  loadDomain.group_count = projectionGroups * 2;
-                  loadDomain.group_interval =
-                      hiddenBlocks * projectionReductionInterval;
-                  loadDomain.weight_buffer_mode = "toggle_dim1";
+                  const projection_detail::ProjectionGemmSchedule gemm{
+                      projectionRows, hiddenBlocks, projectionGroups * 2,
+                      projectionReductionInterval,
+                      hiddenBlocks * projectionReductionInterval};
+                  gemm.emitLoad(rewriter_, op_.getLoc(), dequantStart + loadToIw,
+                      {hemisphere, weightBuffer, 0, 0, 0, dataFormat},
+                      weightLoadCycles, columnLoad,
+                      localDequant ? "int8_dequant_bf16" : llvm::StringRef{},
+                      localDequant ? weightStreamBase : -1);
+                } else {
+                  emitMxm3D(
+                      rewriter_, op_.getLoc(), dequantStart + loadToIw,
+                      hemisphere, "iw", weightBuffer, columnLoad ? 0 : weightLoadCycles - 1, 0, 0, 0, 1, "stream",
+                      true, columnLoad ? "vector" : "block", 0, dataFormat,
+                      localDequant ? "int8_dequant_bf16" : llvm::StringRef{},
+                      llvm::StringRef{}, loadDomain,
+                      localDequant ? weightStreamBase : -1);
                 }
-                emitMxm3D(
-                    rewriter_, op_.getLoc(), dequantStart + loadToIw,
-                    hemisphere, "iw", weightBuffer, columnLoad ? 0 : weightLoadCycles - 1, 0, 0, 0, 1, "stream",
-                    true, columnLoad ? "column" : "supercell", 0, dataFormat,
-                    localDequant ? "int8_dequant_bf16" : llvm::StringRef{},
-                    llvm::StringRef{}, loadDomain,
-                    localDequant ? weightStreamBase : -1);
               }
             }
 
@@ -1342,31 +1343,26 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                     computeDomain.terminal_accumulator_output_format =
                         dataFormat;
                   }
-                  if (mergeProjectionMxm) {
-                    computeDomain.repeat_count = projectionRows;
-                    computeDomain.repeat_interval = 1;
-                    computeDomain.wave_count = hiddenBlocks;
-                    computeDomain.wave_interval = projectionReductionInterval;
-                    computeDomain.wave_accumulator_address_stride = 0;
-                    computeDomain.group_count = projectionGroups * 2;
-                    computeDomain.group_interval =
-                        hiddenBlocks * projectionReductionInterval;
-                    computeDomain.weight_buffer_mode = "toggle_dim1";
-                    computeDomain.terminal_dimension = 1;
-                    computeDomain.terminal_accumulator_destination = "stream";
-                    computeDomain.terminal_accumulator_clear = true;
-                    computeDomain.terminal_accumulator_output_format =
-                        dataFormat;
-                  }
                   const bool finalOnly =
                       computeDomainIncludesFinal && computeDomainCount == 1;
-                  emitMxm3D(
-                      rewriter_, op_.getLoc(), firstCompute, hemisphere,
-                      "compute", weightBuffer, 0, activationStreamBase,
-                      resultStreamBase, half * accumulatorHalfStride, 1,
-                      finalOnly ? "stream" : "sram", finalOnly, "supercell",
-                      0, dataFormat, llvm::StringRef{},
-                      finalOnly ? dataFormat : "fp32", computeDomain);
+                  if (mergeProjectionMxm) {
+                    const projection_detail::ProjectionGemmSchedule gemm{
+                        projectionRows, hiddenBlocks, projectionGroups * 2,
+                        projectionReductionInterval,
+                        hiddenBlocks * projectionReductionInterval};
+                    gemm.emitCompute(rewriter_, op_.getLoc(), firstCompute,
+                        {hemisphere, weightBuffer, activationStreamBase,
+                         resultStreamBase, half * accumulatorHalfStride, dataFormat},
+                        finalOnly);
+                  } else {
+                    emitMxm3D(
+                        rewriter_, op_.getLoc(), firstCompute, hemisphere,
+                        "compute", weightBuffer, 0, activationStreamBase,
+                        resultStreamBase, half * accumulatorHalfStride, 1,
+                        finalOnly ? "stream" : "sram", finalOnly, "block",
+                        0, dataFormat, llvm::StringRef{},
+                        finalOnly ? dataFormat : "fp32", computeDomain);
+                  }
                 }
                 if (!finalReduction)
                   continue;
@@ -3731,7 +3727,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
             }
             emitMxm(rewriter_, op_.getLoc(), cycle + loadToIw,
                     hemisphere * 2 + localMxm, "iw", weightBuffer, column, 0, 0,
-                    1, 1, 0, 1, "stream", true, "supercell", 0, dataFormat,
+                    1, 1, 0, 1, "stream", true, "block", 0, dataFormat,
                     localDequant ? "int8_dequant_bf16" : llvm::StringRef{},
                     {}, localDequant ? weightStreamBase : -1);
           }
@@ -3839,12 +3835,12 @@ int64_t AttentionScheduleEmitter::emitProjections() {
               }
               emitMxm(rewriter_, op_.getLoc(), segmentCycle, hemisphere * 2,
                       "compute", weightBuffer, 0, streamBase, 0, rows, 1,
-                      accumulatorAddress, 1, destination, true, "supercell", 0,
+                      accumulatorAddress, 1, destination, true, "block", 0,
                       dataFormat);
               emitMxm(rewriter_, op_.getLoc(), segmentCycle, hemisphere * 2 + 1,
                       "compute", weightBuffer, 0,
                       streamBase + (inputDistributed16 ? 0 : 2), 4, rows, 1,
-                      accumulatorAddress, 1, destination, true, "supercell", 0,
+                      accumulatorAddress, 1, destination, true, "block", 0,
                       dataFormat);
               rowOffset += rows;
             }
@@ -4328,7 +4324,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
           }
           emitMxm3D(
               rewriter_, op_.getLoc(), firstReductionIw, mxm, "iw", 0,
-              firstSourcePhase, 0, 0, 0, 1, "stream", true, "supercell", 0,
+              firstSourcePhase, 0, 0, 0, 1, "stream", true, "block", 0,
               dataFormat, llvm::StringRef{}, llvm::StringRef{}, iwDomain,
               work->local_mxm * 16);
         }
@@ -4342,7 +4338,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
               rewriter_, op_.getLoc(),
               firstReductionIw + reduction * iwReductionInterval, mxm, "iw",
               reduction % target_.throughput().mxm_weight_buffers,
-              firstSourcePhase, 0, 0, 0, 1, "stream", true, "supercell", 0,
+              firstSourcePhase, 0, 0, 0, 1, "stream", true, "block", 0,
               dataFormat, llvm::StringRef{}, llvm::StringRef{}, iwDomain,
               work->local_mxm * 16);
         }
@@ -4428,7 +4424,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
               layout.scoreAccumulatorAddress(work->query_head,
                                              work->query_block, 0),
               1, headBlocks == 1 ? "stream" : "sram", headBlocks == 1,
-              "supercell", 0, dataFormat, llvm::StringRef{},
+              "block", 0, dataFormat, llvm::StringRef{},
               headBlocks == 1 ? dataFormat : "fp32", computeDomain);
         }
       } else {
@@ -4448,7 +4444,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
               layout.scoreAccumulatorAddress(work->query_head,
                                              work->query_block, 0),
               1, finalReduction ? "stream" : "sram", finalReduction,
-              "supercell", 0, dataFormat, llvm::StringRef{},
+              "block", 0, dataFormat, llvm::StringRef{},
               finalReduction ? dataFormat : "fp32", computeDomain);
         }
       }

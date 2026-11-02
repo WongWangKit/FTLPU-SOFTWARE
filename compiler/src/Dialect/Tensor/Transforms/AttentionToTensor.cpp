@@ -1427,24 +1427,24 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 input_staging_base, input_staging_rows, "both",
                 input_staging_bank)),
         rewriter.getNamedAttr("query_weight", weight_placement(
-            native4 ? "w8a16_native4_weight"
+            native4 ? "w8a16_is_weight"
                     : "w8a16_attention_weight_striped",
             tensor::AttentionWeightTileKind::Query, 0, q_weight_rows,
             weight_slices, 0)),
         rewriter.getNamedAttr("key_weight", weight_placement(
-            native4 ? "w8a16_native4_weight"
+            native4 ? "w8a16_is_weight"
                     : "w8a16_attention_weight_striped",
             tensor::AttentionWeightTileKind::Key, q_weight_rows,
             k_weight_rows, weight_slices,
             serial_attention_weight_pages ? 2 : 0)),
         rewriter.getNamedAttr("value_weight", weight_placement(
-            native4 ? "w8a16_native4_weight"
+            native4 ? "w8a16_is_weight"
                     : "w8a16_attention_weight_striped",
             tensor::AttentionWeightTileKind::Value,
             q_weight_rows + k_weight_rows, v_weight_rows,
             weight_slices, serial_attention_weight_pages ? 1 : 0)),
         rewriter.getNamedAttr("output_weight", weight_placement(
-            native4 ? "w8a16_native4_weight"
+            native4 ? "w8a16_is_weight"
                     : "w8a16_mxm_weight_striped",
             tensor::AttentionWeightTileKind::Output, output_weight_base,
             o_weight_rows, output_weight_slices,

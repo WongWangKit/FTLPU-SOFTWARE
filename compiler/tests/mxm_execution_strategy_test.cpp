@@ -41,16 +41,14 @@ try {
             && streamResult->uses_local_dequant(),
         "stream-result request must retain local-dequant Vector compute");
 
-    auto forcedLegacy = plan_mxm_execution_strategy(
-        {32, 64, 64, true, true, true, true}, target,
-        MxmExecutionPolicy::Legacy);
-    require(mlir::succeeded(forcedLegacy)
-            && forcedLegacy->uses_local_dequant(),
-        "legacy policy must select local-dequant Vector compute");
+    require(mlir::failed(parse_mxm_execution_policy("legacy"))
+            && mlir::failed(parse_mxm_execution_policy("native4"))
+            && mlir::failed(parse_mxm_execution_policy("linear1x16")),
+        "obsolete execution policies must be rejected");
 
     auto forcedVector = plan_mxm_execution_strategy(
         {32, 64, 64, true, true, true, true}, target,
-        MxmExecutionPolicy::Vector);
+        MxmExecutionPolicy::Ws);
     require(mlir::succeeded(forcedVector)
             && forcedVector->uses_local_dequant(),
         "vector policy must select local-dequant Vector compute");

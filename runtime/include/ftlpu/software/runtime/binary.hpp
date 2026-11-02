@@ -83,6 +83,14 @@ enum class BindingLayout : std::uint16_t {
     // Split columns into two contiguous halves: first half East, second West.
     // Each half uses ordinary packed byte planes [column_block, row].
     ColumnPartitionPlanar = 36,
+    // Native opposite orientation: first token half East, second West.
+    TokenPartitionEastFirstPlanar = 37,
+    // Four consecutive 32-column blocks alternate West/East; global row addresses.
+    Fp16MxmBlock4PartitionDistributed16 = 38,
+    // Four-word groups alternate East/West, with compact local column addresses.
+    Fp16MxmCompactBlock4PartitionDistributed16 = 39,
+    // As Block4Partition, with alternating D32 tiles in bank XOR (tile % 2).
+    Fp16MxmBankStripedBlock4PartitionDistributed16 = 40,
 };
 
 enum class BindingInitializer : std::uint16_t {

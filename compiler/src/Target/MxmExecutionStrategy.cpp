@@ -8,9 +8,8 @@ llvm::StringRef mxm_execution_policy_name(MxmExecutionPolicy policy)
 {
     switch (policy) {
     case MxmExecutionPolicy::Auto: return "auto";
-    case MxmExecutionPolicy::Vector: return "vector";
-    case MxmExecutionPolicy::Native4: return "native4";
-    case MxmExecutionPolicy::Legacy: return "legacy";
+    case MxmExecutionPolicy::Ws: return "ws";
+    case MxmExecutionPolicy::Is: return "is";
     }
     return "auto";
 }
@@ -19,10 +18,9 @@ mlir::FailureOr<MxmExecutionPolicy> parse_mxm_execution_policy(
     llvm::StringRef value)
 {
     if (value == "auto") return MxmExecutionPolicy::Auto;
-    if (value == "vector") return MxmExecutionPolicy::Vector;
-    if (value == "native4" || value == "native4x4")
-        return MxmExecutionPolicy::Native4;
-    if (value == "legacy") return MxmExecutionPolicy::Legacy;
+    if (value == "ws") return MxmExecutionPolicy::Ws;
+    if (value == "is")
+        return MxmExecutionPolicy::Is;
     return mlir::failure();
 }
 
@@ -73,7 +71,7 @@ mlir::FailureOr<MxmExecutionStrategy> plan_mxm_execution_strategy(
     strategy.activation_stream_count =
         throughput.mxm_activation_streams;
 
-    if (policy == MxmExecutionPolicy::Native4) {
+    if (policy == MxmExecutionPolicy::Is) {
         const bool native4Legal = request.m == 1
             && request.activation_is_bf16
             && request.weight_is_i8

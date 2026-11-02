@@ -81,7 +81,9 @@ LogicalResult IndexedViewOp::verify()
         if (source < 0 || source >= getInputs().size())
             return emitOpError("source operand index is out of bounds");
         auto input = llvm::cast<RankedTensorType>(getInputs()[source].getType());
-        if (!input.hasStaticShape() || input.getElementType() != output.getElementType()
+        const bool highPlanes = (*this)->hasAttr("truncate_bf16")
+            && input.getElementType().isF32() && output.getElementType().isBF16();
+        if (!input.hasStaticShape() || (!highPlanes && input.getElementType() != output.getElementType())
             || index < 0 || index >= input.getNumElements())
             return emitOpError("view element is out of bounds or has a different type");
     }
@@ -226,6 +228,44 @@ LogicalResult SwishOp::verify()
     return success();
 }
 
+LogicalResult ScaledMatvecOp::verify()
+{
+    const auto m=llvm::cast<RankedTensorType>(getMatrix().getType());
+    const auto d=llvm::cast<RankedTensorType>(getScale().getType());
+    const auto k=llvm::cast<RankedTensorType>(getVector().getType());
+    const auto p=llvm::cast<RankedTensorType>(getProduct().getType());
+    const auto offset=static_cast<int64_t>(getGroupOffset());
+    if(m.getRank()!=2 || d.getRank()!=2 || k.getRank()!=2 || p.getRank()!=2)
+        return emitOpError("requires rank-two matrix, scale, vector and product");
+    if(!m.hasStaticShape() || !d.hasStaticShape() || !k.hasStaticShape() || !p.hasStaticShape()
+        || k.getDimSize(0)<=0 || m.getDimSize(0)<=0 || m.getDimSize(1)<=0
+        || m.getDimSize(0)%k.getDimSize(0)
+        || d.getDimSize(0)!=1 || offset<0 || offset>d.getDimSize(1)
+        || d.getDimSize(1)-offset<k.getDimSize(0)
+        || m.getDimSize(1)!=k.getDimSize(1) || getScaled().getType()!=m
+        || p.getDimSize(0)!=k.getDimSize(0)
+        || p.getDimSize(1)!=m.getDimSize(0)/k.getDimSize(0))
+        return emitOpError("inconsistent grouped scaled matvec shapes");
+    if(getEpilogue().size()!=0 && getEpilogue().size()!=2 && getEpilogue().size()!=3)
+        return emitOpError("epilogue requires value, coefficient and optional readout vector operands");
+    if(getEpilogue().empty() ? !getCorrection().empty() :
+        getEpilogue().size()==3 ? getCorrection().size()!=3 :
+        (getCorrection().size()!=1 && getCorrection().size()!=2))
+        return emitOpError("epilogue requires correction, optional updated matrix, and readout when its vector is provided");
+    if(!getEpilogue().empty()) {
+        auto v=llvm::cast<RankedTensorType>(getEpilogue()[0].getType());
+        auto b=llvm::cast<RankedTensorType>(getEpilogue()[1].getType());
+        if(v.getShape()!=p.getShape() || !v.getElementType().isBF16()
+            || b!=d || getCorrection()[0].getType()!=p)
+            return emitOpError("epilogue needs BF16 value shaped like product, coefficient shaped like scale, and FP32 correction");
+        if(getCorrection().size()>=2 && getCorrection()[1].getType()!=m)
+            return emitOpError("rank-one updated matrix must match matrix type");
+        if(getEpilogue().size()==3 && (getEpilogue()[2].getType()!=k || getCorrection()[2].getType()!=p))
+            return emitOpError("readout vector must match vector type and readout result must match product type");
+    }
+    return success();
+}
+
 LogicalResult VectorAluOp::verify()
 {
     const auto lhs = getLhs().getType();
@@ -234,6 +274,43 @@ LogicalResult VectorAluOp::verify()
     const auto floating = [](Type t) {
         return t.isBF16() || t.isF16() || t.isF32();
     };
+    if (getKind()=="weighted_gram") {
+        const bool transposed=rhs.getElementType().isBF16();
+        const int64_t heads=rhs.getRank()==2 ? (transposed?rhs.getDimSize(0)/32:rhs.getDimSize(1)) : 0;
+        // Output rows group even heads before odd heads. This matches the
+        // native bilateral stream drain and avoids an output interleave copy.
+        if (!lhs.hasStaticShape() || !rhs.hasStaticShape() || !result.hasStaticShape() ||
+            lhs.getRank()!=2 || rhs.getRank()!=2 || result.getRank()!=2 ||
+            lhs.getDimSize(0)!=32 || heads<=0 || heads>32 || heads%2 ||
+            (transposed ? (rhs.getDimSize(0)!=32*heads || rhs.getDimSize(1)!=32) : rhs.getDimSize(0)!=1024) ||
+            lhs.getDimSize(1)<=0 || lhs.getDimSize(1)%(32*heads) ||
+            !lhs.getElementType().isBF16() || !(transposed || rhs.getElementType().isF32()) ||
+            !result.getElementType().isF32() || getUseImmediate() || getReduce() ||
+            result.getDimSize(0)!=32*heads || result.getDimSize(1)!=32)
+            return emitOpError("weighted_gram requires BF16 K[32,H*D], FP32 weights[1024,H] or native BF16 weights[32*H,32] in [i,h,j] order, FP32 result[H*32,32], even H<=32 and D multiple of 32");
+        return success();
+    }
+    if (getKind() == "causal_exp_difference") {
+        const auto transpose=(*this)->getAttrOfType<BoolAttr>("transpose_result");
+        const bool transposed=transpose && transpose.getValue();
+        const auto scaling=(*this)->getAttrOfType<BoolAttr>("row_scale");
+        const bool rowScale=scaling && scaling.getValue();
+        // Optional RHS scales each output row; strict_lower excludes its diagonal.
+        // A generic pairwise map: y[i*T+j,h] = exp(x[i,h]-x[j,h])
+        // below the diagonal, one on the diagonal, and zero above it.
+        // transpose_result fuses the lane/time transpose and upper-plane
+        // BF16 truncation: y[i*H+h,j], with T=32 for wide SXM capture.
+        if (!lhs.hasStaticShape() || !result.hasStaticShape() || lhs.getRank()!=2 ||
+            result.getRank()!=2 || lhs.getDimSize(0)<=0 || lhs.getDimSize(0)>32 ||
+            lhs.getDimSize(1)<=0 || lhs.getDimSize(1)>32 || rhs!=lhs ||
+            !(lhs.getElementType().isF32() || lhs.getElementType().isBF16()) ||
+            !(transposed?result.getElementType().isBF16():result.getElementType().isF32()) || getUseImmediate()==rowScale || getReduce() ||
+            (transposed && lhs.getDimSize(0)!=32) ||
+            result.getDimSize(0)!=lhs.getDimSize(0)*(transposed?lhs.getDimSize(1):lhs.getDimSize(0)) ||
+            result.getDimSize(1)!=(transposed?lhs.getDimSize(0):lhs.getDimSize(1)))
+            return emitOpError("causal_exp_difference requires [T,H] BF16/FP32 input (same-shaped RHS when row_scale=true) and [T*T,H] FP32 output; transpose_result requires T=32 and BF16 [T*H,T] output, 1<=T,H<=32");
+        return success();
+    }
     if (!lhs.hasStaticShape() || !rhs.hasStaticShape() || !result.hasStaticShape()
         || lhs.getRank() != 2 || lhs.getDimSize(0) <= 0 || lhs.getDimSize(1) <= 0
         || rhs.getRank() != 2 || result.getRank() != 2
@@ -248,9 +325,13 @@ LogicalResult VectorAluOp::verify()
         && getKind() != "multiply" && getKind() != "max"
         && getKind() != "negate" && getKind() != "cast"
         && getKind() != "exp" && getKind() != "reciprocal"
-        && getKind() != "rsqrt" && getKind() != "sigmoid"
-        && getKind() != "softplus")
+        && getKind() != "rsqrt" && getKind() != "log" && getKind() != "sigmoid"
+        && getKind() != "softplus" && getKind() != "cumsum_rows")
         return emitOpError("unsupported generic vector ALU operation");
+    if (getKind() == "cumsum_rows" &&
+        (!getUseImmediate() || getReduce() || !result.getElementType().isF32()
+         || lhs.getDimSize(1)>32 || !(lhs.getElementType().isF32() || lhs.getElementType().isBF16())))
+        return emitOpError("cumsum_rows requires unary BF16/FP32 input, FP32 output, and at most 32 columns; inclusive scan along rows");
     if ((getKind() == "sigmoid" || getKind() == "softplus") &&
         (!getUseImmediate() || getReduce() || !result.getElementType().isF32()))
         return emitOpError("semantic sigmoid/softplus require unary non-reducing FP32 output");
@@ -322,10 +403,10 @@ LogicalResult GatedDeltaRuleOp::verify()
         || (!query.getElementType().isF16()
             && !query.getElementType().isBF16()))
         return emitOpError("Q/K/V/output must use one 16-bit float type");
-    if (!decay.getElementType().isF32()
-        || !beta.getElementType().isF32()
-        || !state.getElementType().isF32())
-        return emitOpError("decay, beta, and recurrent state must be FP32");
+    if ((!state.getElementType().isF32() && !state.getElementType().isBF16())
+        || decay.getElementType()!=state.getElementType()
+        || beta.getElementType()!=state.getElementType())
+        return emitOpError("decay, beta, and recurrent state must share FP32 or BF16 storage");
     return success();
 }
 

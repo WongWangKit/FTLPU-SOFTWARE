@@ -252,8 +252,8 @@ def main() -> None:
     for line in schedule_lines:
         if (
             "ftlpu.schedule.mxm_issue" not in line
-            or 'decode_layout = "native4"' not in line
-            or 'opcode = "decode_stream_compute"' not in line
+            or 'is_mode = "is-block"' not in line
+            or 'opcode = "is_stream_compute"' not in line
             or integer_attr(line, "unit_id") != 0
         ):
             continue
@@ -292,7 +292,7 @@ def main() -> None:
     for unit in (0, 1):
         computes = [line for line in schedule_lines
                     if "ftlpu.schedule.mxm_issue" in line
-                    and 'opcode = "decode_stream_compute"' in line
+                    and 'opcode = "is_stream_compute"' in line
                     and integer_attr(line, "unit_id") == unit]
         if sorted(integer_attr(line, "repeat_count") for line in computes) != expected_drains:
             raise AssertionError(f"unit {unit} omitted an FFN K-loop batch")
@@ -370,9 +370,9 @@ def main() -> None:
     require(command_text, 'role = "state.kv.key"', command)
     require(command_text, 'role = "state.kv.value"', command)
     require(command_text, "ftlpu.command.mem_3d", command)
-    require(command_text, 'opcode = "decode_load_activation"', command)
-    require(command_text, 'opcode = "decode_stream_compute"', command)
-    require(command_text, 'decode_layout = "native4"', command)
+    require(command_text, 'opcode = "is_load_activation"', command)
+    require(command_text, 'opcode = "is_stream_compute"', command)
+    require(command_text, 'is_mode = "is-block"', command)
     require(command_text, "ftlpu.command.vxm_run_2d", command)
     require(command_text, "ftlpu.command.weight_page", command)
 

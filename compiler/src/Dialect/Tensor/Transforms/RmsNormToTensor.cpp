@@ -46,6 +46,12 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
 
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
+    const auto module=op->getParentOfType<mlir::ModuleOp>();
+    const auto wide=module->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
+    const auto headPolicy=module->getAttrOfType<mlir::BoolAttr>("ftlpu.l2_head_partition");
+    const bool headScratch = rows==tile && wide && wide.getValue()
+        && headPolicy && headPolicy.getValue() && target.uses_dedicated_slice_roles()
+        && op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.norm_retained_matrix_input");
     const int64_t workingBank = weightBank >= 0
         ? (weightBank + 1) % memory.banks_per_slice : 0;
     const bool preservesInput = llvm::any_of(
@@ -166,7 +172,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             ? "fp16_vxm_gamma_broadcast"
             : "fp16_vxm_distributed_16",
         "both", target.uses_dedicated_slice_roles()
-            ? feedbackWeightBank
+            ? (headScratch ? 0 : feedbackWeightBank)
             : std::max<int64_t>(0, weightBank));
     const bool materializeGamma = feedbackWeightSegmentRows > 0;
     llvm::SmallVector<Allocation, 4> scratch;
@@ -192,6 +198,14 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
             "target does not provide 16 normalized scratch slices "
             "disjoint from canonical MXM output");
         return mlir::failure();
+    }
+    // Independent head normalization runs after its projection/matvec.
+    // Use disjoint bank-0 queues for replay and normalized output, leaving
+    // bank-1 retained recurrent matrices intact throughout the graph.
+    if(headScratch) {
+        normalizedSlices.clear();
+        for(int64_t i=0;i<16;++i)
+            normalizedSlices.push_back(memory.w8a16_weight_slice_base+i);
     }
     const int64_t distributedRows =
         physicalRows * hidden / (tile * throughput.lanes_per_tile);
@@ -219,7 +233,7 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         distributedRows + tokenBlocks,
         physicalRows * hidden * 2 + physicalRows * 2,
         "fp16_vxm_distributed_16", "both",
-        resultBank));
+        headScratch ? 0 : resultBank));
     scratch.push_back(fixed_allocation(PlacementKind::VxmResult1,
         normalizedSlices, normalizedScratchBase,
         distributedRows, physicalRows * hidden * 2,

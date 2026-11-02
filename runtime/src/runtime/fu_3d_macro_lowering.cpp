@@ -359,7 +359,7 @@ QueueCommand decode_native(const QueueCommand& command, QueueKind kind)
         return native_command(isa::decode_mxm_dequant_instruction(bits));
     }
     auto instruction = isa::decode_mxm_instruction(bits);
-    if (instruction.opcode == MxmControlOpcode::Decode)
+    if (instruction.opcode == MxmControlOpcode::IS)
         throw std::invalid_argument("native4 decode is not supported by coarse Macro lowering");
     if ((kind == QueueKind::MxmLoad && instruction.opcode != MxmControlOpcode::IW)
         || (kind == QueueKind::MxmCompute
@@ -448,8 +448,11 @@ Fu3dMacroLoweringResult lower_fu_3d_queue_to_macro(
             } else if (queue.kind == QueueKind::MxmLoad) {
                 const auto instruction = isa::decode_mxm_load_icu_3d_instruction(
                     read_packet<isa::EncodedMxmLoadIcu3DPacket>(queue, pc));
-                if (instruction.opcode != MxmLoadIcuOpcode::Load3D)
+                if (instruction.opcode == MxmLoadIcuOpcode::IsLoadActivation3D)
                     throw std::invalid_argument("native4 decode is not supported by coarse Macro lowering");
+                if (instruction.opcode != MxmLoadIcuOpcode::Load3D
+                    && instruction.opcode != MxmLoadIcuOpcode::LoadColumn3D)
+                    throw std::invalid_argument("unsupported MXM load Macro opcode");
                 loop = instruction.loop;
                 for (const auto& box : split_boxes(loop, instruction.weight_buffer_mode))
                     emit(box_domain(instruction, box, cursor, instruction.weight_column_strides,
@@ -457,7 +460,7 @@ Fu3dMacroLoweringResult lower_fu_3d_queue_to_macro(
             } else if (queue.kind == QueueKind::MxmCompute) {
                 const auto instruction = isa::decode_mxm_compute_icu_3d_instruction(
                     read_packet<isa::EncodedMxmComputeIcu3DPacket>(queue, pc));
-                if (instruction.opcode == MxmComputeIcuOpcode::DecodeStreamCompute3D)
+                if (instruction.opcode == MxmComputeIcuOpcode::IsStreamCompute3D)
                     throw std::invalid_argument("native4 decode is not supported by coarse Macro lowering");
                 loop = instruction.loop;
                 const auto terminal = instruction.opcode == MxmComputeIcuOpcode::Compute3D

@@ -433,11 +433,11 @@ std::vector<Native4ActivationStarts> find_native4_activation_starts(
                        command.words[1])
                     << 32);
             const auto instruction = isa::decode_mxm_instruction(encoded);
-            if (instruction.opcode != MxmControlOpcode::Decode
+            if (instruction.opcode != MxmControlOpcode::IS
                 || instruction.decode_operation
-                    != MxmDecodeOperation::LoadActivation
-                || instruction.decode_layout
-                    != MxmDecodeLayout::Native4x4)
+                    != MxmIsOperation::LoadActivation
+                || instruction.is_mode
+                    != MxmIsMode::Block)
                 continue;
             for (std::size_t index = 0; index < barriers.size(); ++index) {
                 const auto ready = barriers[index].first;
@@ -2309,7 +2309,9 @@ C2cWeightPageFence C2cWeightPager::schedule_common(
         stop = std::min(stop, static_cast<std::size_t>(window->end_cycle));
     }
     if (stop < earliestMemCycle)
-        throw std::logic_error("unsafe common stop: transport launch or SRAM reuse depends on computation after the stop");
+        throw std::logic_error("unsafe common stop: transport launch or SRAM reuse depends on computation after the stop: stop="
+            + std::to_string(stop) + " earliest_mem=" + std::to_string(earliestMemCycle)
+            + " binding=" + std::to_string(binary.weight_page_uses[pageUseIndices.front()].binding_index));
     validate_common_drain_window(binary, stop, ingressBegin);
     for (const auto index : pageUseIndices) {
         const auto& use = binary.weight_page_uses[index];

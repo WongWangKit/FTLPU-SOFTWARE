@@ -32,9 +32,15 @@ mlir::LogicalResult lower_depthwise_conv1d(kernel::DepthwiseConv1DOp op,
     const int64_t channels = resultType.getDimSize(1);
     const int64_t featureBlocks = (channels + 31) / 32;
     auto input = customPlan(op.getInput(), PlacementKind::Activation,
-        {32, 33}, "fp16_pair_planar", tokens * featureBlocks, "east");
+        {32, 33}, "fp16_pair_planar", tokens * featureBlocks,
+        resultType.getElementType().isBF16() ? "west" : "east");
+    // Keep fixed-chain coefficients off the projection result pair so the
+    // two operands can be read concurrently without an ingress copy.
+    const llvm::SmallVector<int64_t> weightSlices = resultType.getElementType().isBF16()
+        ? llvm::SmallVector<int64_t>{24, 25, 26, 27, 28, 29, 30, 31}
+        : llvm::SmallVector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7};
     auto weight = customPlan(op.getWeight(), PlacementKind::Weight,
-        {0, 1, 2, 3, 4, 5, 6, 7}, "fp16_depthwise_kernel4",
+        weightSlices, "fp16_depthwise_kernel4",
         op.getKernelSize() * featureBlocks, "west");
     const auto function = op->getParentOfType<mlir::func::FuncOp>();
     const auto distributed = function->getAttrOfType<mlir::BoolAttr>(

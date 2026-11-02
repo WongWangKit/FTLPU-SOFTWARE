@@ -1,4 +1,4 @@
-"""Real-weight FFN decode: B independent requests, one token per request.
+"""Real-weight FFN decode or isolated prefill (token-independent FFN).
 
 Only semantic graph/fixtures and NumPy validation live here. Shared C++ FFN
 lowering owns tiling, layout, paging and instruction generation.
@@ -33,6 +33,9 @@ def main():
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--batches', nargs='+', type=int, default=[1, 32, 64])
     p.add_argument('--check-only', action='store_true')
+    p.add_argument('--ffn-schedule', choices=('tail', 'fused'), default='tail')
+    p.add_argument('--prefill', action='store_true',
+                   help='Treat rows as tokens of one prompt; FFN is token independent')
     args = p.parse_args()
     if any(b < 1 for b in args.batches):
         p.error('batch sizes must be positive')
@@ -71,18 +74,20 @@ def main():
     env['FTLPU_SESSION_PROGRESS'] = '1'
     records = []
     for batch in args.batches:
-        directory = out / f'batch{batch}'
+        directory = out / (f'seq{batch}' if args.prefill else f'batch{batch}')
         directory.mkdir(exist_ok=True)
         summary_path = directory / 'summary.json'
         summary_path.unlink(missing_ok=True)
-        record = dict(batch=batch, sequence_length_per_request=1,
+        record = dict(batch=1 if args.prefill else batch,
+            sequence_length_per_request=batch if args.prefill else 1,
+            ffn_schedule=args.ffn_schedule, icu_compression='raw-macro',
             model=provenance['repo'], revision=provenance['revision'],
             layer=meta['layer'], hidden_size=h, intermediate_size=n,
-            scope='isolated_decode_ffn', activation_source='deterministic_synthetic_rms_normalized',
+            scope='isolated_prefill_ffn' if args.prefill else 'isolated_decode_ffn', activation_source='deterministic_synthetic_rms_normalized',
             weights='official_checkpoint_per_tensor_W8A16', mxm_execution='vector',
             clock_mhz=clock, ddr_bandwidth_GB_s=memory['ddr_peak_bandwidth_mbytes_per_second']/1000,
             pass_limits=dict(nrmse=.03, worst_request_nrmse=.04), status='failed')
-        print(f'Running decode FFN batch={batch}', flush=True)
+        print(f'Running {"prefill" if args.prefill else "decode"} FFN rows={batch} schedule={args.ffn_schedule}', flush=True)
         try:
             x = x_all[:batch]
             if not args.check_only:
@@ -95,7 +100,8 @@ def main():
                 command([graph_compiler, '--input', logical, '--output', kernel,
                     '--emit-kernel', '--target-config', args.target_config.resolve()], directory / 'graph.log', env)
                 command([compiler, '--input', kernel, '--input-stage', 'kernel',
-                    '--output', binary, '--mxm-execution', 'vector', '--ffn-schedule', 'tail',
+                    '--output', binary, '--mxm-execution', 'ws', '--ffn-schedule', args.ffn_schedule,
+                    '--icu-compression', 'raw-macro',
                     '--target-config', args.target_config.resolve()], directory / 'compile.log', env)
                 command([runner, binary, directory / 'inputs.txt', directory / 'actual',
                     directory / 'runtime.pipeline.csv'], directory / 'execution.log', env)
@@ -119,6 +125,38 @@ def main():
             record.update(nrmse=nrmse, worst_request_nrmse=float(request_errors.max()),
                 per_request_nrmse=request_errors.tolist(), max_abs_error=float(np.abs(delta).max()),
                 execution_stats=stats, native_ffn_regions=sum(bool(node.get('native_ffn')) for node in plan['nodes']))
+            if args.prefill:
+                schedule = (directory / 'decoder_layer.schedule.mlir').read_text()
+                lines = schedule.splitlines()
+                def integer(line, name, default=0):
+                    match = re.search(r'\b' + name + r' = (\d+)', line)
+                    return int(match[1]) if match else default
+                swish_first = min(integer(line, 'cycle') for line in lines
+                    if 'ftlpu.schedule.vxm ' in line and 'opcode = "negate"' in line)
+                down_start = next(integer(line, 'start') for line in lines
+                    if 'name = "ffn.ffn.down.vector"' in line)
+                up_last = max(integer(line, 'cycle') + sum(
+                    (integer(line, count, 1)-1)*integer(line, interval, 1)
+                    for count, interval in [('repeat_count', 'repeat_interval'),
+                        ('wave_count', 'wave_interval'), ('group_count', 'group_interval')])
+                    for line in lines if 'ftlpu.schedule.mxm_issue ' in line
+                    and 'opcode = "compute"' in line
+                    and integer(line, 'cycle') < down_start)
+                overlap = swish_first < up_last
+                record.update(swiglu_first_logical_cycle=swish_first,
+                    up_last_compute_logical_cycle=up_last,
+                    down_first_logical_cycle=down_start,
+                    up_to_down_logical_gap=down_start-up_last,
+                    swiglu_overlaps_up=overlap,
+                    fusion_scope='up_projection_swiglu_overlap; down_after_hidden_ready')
+                assert overlap == (args.ffn_schedule == 'fused'), 'FFN schedule silently lost requested overlap policy'
+                if (args.ffn_schedule == 'fused' and batch == 32
+                        and target['target']['name'] == 'ftlpu-lpu32'):
+                    # A final tile may drain, but a whole hidden-tensor copy
+                    # must not remain between Up and Down. One Up output tile
+                    # spans h reduction cycles on this vector target.
+                    assert 0 < down_start-up_last < h, 'whole-hidden mirror tail returned'
+                    assert 'opcode = "write_tap"' not in schedule, 'unused Gate replay copy returned'
             # CSV end is one occurrence's exclusive end, not the entire repeat
             # domain. Include both repeat dimensions and initial C2C ingress.
             with (directory / 'runtime.pipeline.csv').open(newline='') as f:
@@ -166,8 +204,9 @@ def main():
         raise SystemExit(1)
     consistency = []
     for small, large in zip(sorted(set(args.batches)), sorted(set(args.batches))[1:]):
-        left = np.fromfile(out / f'batch{small}/actual.0.bin', '<u2').reshape(small, h)
-        right = np.fromfile(out / f'batch{large}/actual.0.bin', '<u2').reshape(large, h)[:small]
+        prefix = 'seq' if args.prefill else 'batch'
+        left = np.fromfile(out / f'{prefix}{small}/actual.0.bin', '<u2').reshape(small, h)
+        right = np.fromfile(out / f'{prefix}{large}/actual.0.bin', '<u2').reshape(large, h)[:small]
         mismatches = int(np.count_nonzero(left != right))
         consistency.append(dict(smaller_batch=small, larger_batch=large,
                                 mismatched_bf16_values=mismatches))

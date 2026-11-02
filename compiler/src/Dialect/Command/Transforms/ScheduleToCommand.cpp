@@ -161,6 +161,7 @@ VxmLaneOperation parse_schedule_vxm_operation(llvm::StringRef value)
     if (value == "reciprocal" || value == "divide")
         return VxmSpecialAluOpcode::Reciprocal;
     if (value == "rsqrt") return VxmSpecialAluOpcode::Rsqrt;
+    if (value == "log") return VxmSpecialAluOpcode::Log;
     throw std::runtime_error(
         "Schedule IR VXM operation is not implemented by the current CModel");
 }
@@ -464,8 +465,8 @@ void create_mem_write_read_2d_command(mlir::OpBuilder& builder,
 
 void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
 {
-    if (op.getOpcode() == "decode_load_activation"
-        || op.getOpcode() == "decode_stream_compute") {
+    if (op.getOpcode() == "is_load_activation"
+        || op.getOpcode() == "is_stream_compute") {
         // Decode is a native MXM control instruction wrapped by the hardware
         // STREAM_ND ICU descriptor.  Keep it explicit in Command IR; the
         // binary lowering encodes this op directly and never reconstructs it
@@ -503,7 +504,7 @@ void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
         copy("weight_inner_column");
         copy("weight_input_mode");
         copy("weight_stream_base");
-        copy("decode_layout");
+        copy("is_mode");
         copy("wave_count");
         copy("wave_interval");
         copy("wave_weight_column_stride");
@@ -520,7 +521,7 @@ void create_mxm_issue_command(mlir::OpBuilder& builder, schedule::MxmIssueOp op)
     const auto queue = as_size(op.getUnitId(), "MXM queue");
     std::string error;
     if (op.getOpcode() == "iw") {
-        const bool columnLoad = op.getWeightLoadMode().value_or("supercell") == "column";
+        const bool columnLoad = op.getWeightLoadMode().value_or("block") == "vector";
         auto instruction = MxmLoadIcuInstruction::Load3D(loop,
             as_size(op.getWeightBuffer(), "weight buffer"),
             mxm_buffer_mode(op.getWeightBufferMode().value_or("fixed")),
@@ -999,7 +1000,7 @@ public:
                         .getDefiningOp<schedule::MemReadOp>())
                 repeatCount = placement_integer(
                     read.getPlacement(), "instruction_count");
-            if (load.getWeightLoadMode().value_or("supercell") == "column")
+            if (load.getWeightLoadMode().value_or("block") == "vector")
                 repeatCount = load.getDuration();
             loadRepeatCounts.push_back(repeatCount);
         }
@@ -1126,7 +1127,7 @@ public:
             builder.setInsertionPointAfter(load);
             const int64_t repeat_count =
                 loadRepeatCounts[loadIndex];
-            const bool columnLoad = load.getWeightLoadMode().value_or("supercell") == "column";
+            const bool columnLoad = load.getWeightLoadMode().value_or("block") == "vector";
             const int64_t columnsPerWave = columnLoad
                 ? target.throughput().mxm_rows : target.throughput().tile_rows;
             const int64_t fullWaves = repeat_count / columnsPerWave;

@@ -61,6 +61,8 @@ mlir::LogicalResult lower_depthwise_conv1d(
     });
     auto lowered = llvm::cast<stream::DepthwiseConv1DTaskOp>(
         context.rewriter.create(state));
+    if(auto words=op->getAttr("native_window_words"))
+        lowered->setAttr("native_window_words",words);
     context.rewriter.replaceOp(op, lowered.getResult());
     context.stage += 4;
     return mlir::success();

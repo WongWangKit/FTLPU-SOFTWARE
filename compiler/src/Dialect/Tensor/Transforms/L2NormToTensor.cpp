@@ -27,12 +27,14 @@ mlir::LogicalResult lower_l2_norm(kernel::L2NormOp op,
     const auto input = fixed_allocation(PlacementKind::Activation, slices,
         0, dataRows, rows * width * 2,
         "fp16_mxm_distributed_16", "both", 0);
+    const auto headPolicy = op->getParentOfType<mlir::func::FuncOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.l2_head_partition");
+    const bool partitionHeads = headPolicy && headPolicy.getValue();
     const auto feedbackInput = fixed_allocation(PlacementKind::VxmResult, slices,
         0, feedbackRows, (rows * width + rows) * 2,
-        "fp16_vxm_distributed_16", "both", 1);
+        "fp16_vxm_distributed_16", "both", partitionHeads ? 0 : 1);
     const auto feedbackOutput = fixed_allocation(PlacementKind::VxmResult1, slices,
         dataRows, dataRows, rows * width * 2,
-        "fp16_vxm_distributed_16", "both", 0);
+        "fp16_vxm_distributed_16", "both", partitionHeads ? 1 : 0);
     const auto result = fixed_allocation(PlacementKind::FinalResult, slices,
         2 * dataRows, dataRows, rows * width * 2,
         "fp16_mxm_distributed_16", "both", 1);

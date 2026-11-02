@@ -46,6 +46,11 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
             return mlir::failure();
         }
         native4 = strategy->decode_native4;
+        if (native4 && hw::kMxmIsColumns != hw::kMxmSupercellsPerPlane) {
+            op.emitError("IS FFN output layout currently requires all physical columns; "
+                         "reduced IS columns are supported by primitive MXM instructions");
+            return mlir::failure();
+        }
     }
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
@@ -186,6 +191,17 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
         > memory.sram_depth_rows;
     if (planarHiddenExceedsSram)
         hidden_slices = target.mxm_distributed_activation_slices();
+    const auto ffnSchedule = module
+        ? module->getAttrOfType<mlir::StringAttr>("ftlpu.ffn_schedule") : mlir::StringAttr{};
+    // Streaming SwiGLU writes must not occupy the activation read queues.
+    // The output slices are unused until Down, whose result bank is chosen
+    // below to remain independent of this live hidden tensor.
+    if (ffnSchedule && ffnSchedule.getValue() == "fused"
+        && throughput.vxm_alus == 16 && singleMxmVector
+        && m <= throughput.mxm_rows
+        && !planarHiddenExceedsSram && hidden_slices.size() == 4
+        && target.uses_dedicated_slice_roles())
+        hidden_slices = result_slices;
     bool hiddenDistributed16 = tiledWeights
         && hidden_slices.size() == 16;
     const int64_t distributedElementsPerRow =
@@ -527,7 +543,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     };
     auto gate_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *gate,
-            native4 ? "w8a16_native4_weight" : singleMxmVector
+            native4 ? "w8a16_is_weight" : singleMxmVector
                 ? "w8a16_mxm_weight_wave_striped"
                 : "w8a16_mxm_weight_replicated",
             "both")
@@ -544,7 +560,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     }
     auto up_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *up,
-            native4 ? "w8a16_native4_weight" : singleMxmVector
+            native4 ? "w8a16_is_weight" : singleMxmVector
                 ? "w8a16_mxm_weight_wave_striped"
                 : "w8a16_mxm_weight_replicated",
             "both")
@@ -561,7 +577,7 @@ mlir::LogicalResult lower_ffn(kernel::FfnGraph& graph,
     }
     const auto down_placement = withWeightPaging(w8a16
         ? make_profile_placement(rewriter, *down,
-            native4 ? "w8a16_native4_weight"
+            native4 ? "w8a16_is_weight"
                     : "w8a16_mxm_weight_wave_striped",
             "both")
         : make_placement_attr(rewriter, *down), downPageCount,

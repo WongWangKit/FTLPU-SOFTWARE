@@ -79,6 +79,26 @@ int main()
         "east and west register banks were incorrectly aliased");
 
     target::LPUTargetModel target;
+    require(target.supports_route(target::StreamEndpoint::SxmResult,
+                target::StreamEndpoint::VxmInput, target::StreamDirection::West)
+            && !target.supports_route(target::StreamEndpoint::SxmResult,
+                target::StreamEndpoint::VxmInput, target::StreamDirection::East)
+            && target.transport_latency(target::StreamEndpoint::SxmResult,
+                target::StreamEndpoint::VxmInput, target::StreamDirection::West, 0)
+                == target.streams().system_register_columns - 1,
+        "SXM-to-VXM must follow the westbound SR hops and consume cycle");
+    require(target.supports_route(target::StreamEndpoint::VxmResult,
+                target::StreamEndpoint::SxmInput, target::StreamDirection::East)
+            && !target.supports_route(target::StreamEndpoint::VxmResult,
+                target::StreamEndpoint::SxmInput, target::StreamDirection::West)
+            && target.transport_latency(target::StreamEndpoint::VxmResult,
+                target::StreamEndpoint::SxmInput, target::StreamDirection::East, 0)
+                == target.streams().system_register_columns - 1
+            && target.stream_source_column(target::StreamEndpoint::VxmResult,
+                target::StreamDirection::East, 0) == 0
+            && target.stream_destination_column(target::StreamEndpoint::SxmInput,
+                target::StreamDirection::East, 0) == target.streams().system_register_columns - 2,
+        "VXM-to-SXM must follow forward SR from the VXM edge to SXM ingress");
     require(target.stream_source_column(target::StreamEndpoint::Mem,
                 target::StreamDirection::East, 0) == 1
             && target.stream_destination_column(

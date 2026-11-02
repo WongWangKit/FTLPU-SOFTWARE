@@ -161,6 +161,29 @@ try {
     common.queues.push_back({QueueKind::Mem,0,{
         encode_icu_control_raw_word(IcuControlInstruction::Nop(100)),read,
         encode_icu_control_raw_word(IcuControlInstruction::Nop(1999)),read}});
+    auto identified = common;
+    identified.target_name = "compute_reload_identity_fixture";
+    identified.target_abi ^= 1;
+    const auto planned = plan_compute_imem_segments(identified);
+    require(planned.size() == 2, "common compute reload must validate both segments");
+    for (const auto& part : planned) {
+        require(part.target_name == identified.target_name && part.target_abi == identified.target_abi,
+            "compute segment export must preserve target identity");
+        for (const auto& q : part.queues)
+            require(q.kind == QueueKind::Vxm, "compute reload must not select MEM");
+    }
+    auto missingDrain = common;
+    missingDrain.timelines.clear();
+    rejected = false;
+    try { static_cast<void>(plan_compute_imem_segments(missingDrain)); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "compute reload must reject overflow without a compiler drain");
+    auto badMem = common;
+    badMem.hardware.icu_mem_imem_depth = 1;
+    rejected = false;
+    try { static_cast<void>(plan_compute_imem_segments(badMem)); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "compute reload must not hide MEM iMEM overflow");
     auto system=std::make_unique<TspSliceSystem>();
     CModelRuntime runtime(*system);
     runtime.load(common);runtime.run_cycles(1100);

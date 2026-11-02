@@ -280,35 +280,32 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
             error = "mxm.supported_modes must be a non-empty array";
             return mlir::failure();
         }
-        bool native4x4 = false;
-        bool linear1x16 = false;
+        const llvm::StringRef names[] = {"ws-vector", "ws-block", "is-vector", "is-block"};
+        const bool expected[] = {hw::kMxmSupportsWsVector, hw::kMxmSupportsWsBlock,
+            hw::kMxmSupportsIsVector, hw::kMxmSupportsIsBlock};
+        bool seen[4] = {};
         for (const auto& value : *supported_modes) {
             const auto mode = value.getAsString();
-            if (!mode) {
-                error = "mxm.supported_modes entries must be strings";
+            int index = -1;
+            for (int i = 0; i < 4; ++i) if (mode && *mode == names[i]) index = i;
+            if (index < 0 || seen[index]) {
+                error = "unsupported or duplicate MXM mode; expected ws-vector/ws-block/is-vector/is-block";
                 return mlir::failure();
             }
-            if (*mode == "native4x4") {
-                if (native4x4) {
-                    error = "mxm.supported_modes contains native4x4 twice";
-                    return mlir::failure();
-                }
-                native4x4 = true;
-            } else if (*mode == "linear1x16") {
-                if (linear1x16) {
-                    error = "mxm.supported_modes contains linear1x16 twice";
-                    return mlir::failure();
-                }
-                linear1x16 = true;
-            }
-            else {
-                error = ("unsupported MXM mode: " + *mode).str();
-                return mlir::failure();
-            }
+            seen[index] = true;
         }
-        if (native4x4 != hw::kMxmSupportsNative4x4
-            || linear1x16 != hw::kMxmSupportsLinear1x16) {
+        for (int i = 0; i < 4; ++i) if (seen[i] != expected[i]) {
             error = "mxm.supported_modes differs from the software build configuration";
+            return mlir::failure();
+        }
+        const auto isColumns = mxm->getInteger("is_columns").value_or(0);
+        if (isColumns <= 0 || isColumns > model.throughput_.tile_rows
+            || model.throughput_.tile_rows % isColumns != 0) {
+            error = "mxm.is_columns must be a positive divisor of the supercell row count (topology.tiles_per_slice)";
+            return mlir::failure();
+        }
+        if (isColumns != hw::kMxmIsColumns) {
+            error = "mxm.is_columns differs from the software build configuration";
             return mlir::failure();
         }
     }
@@ -906,7 +903,8 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
 std::uint64_t LPUTargetModel::abi_fingerprint() const
 {
     software::runtime::TargetAbiHasher hash;
-    hash.add(21); // VXM terminal accumulator controls in compact ICU packets.
+    hash.add(22); // WS/IS instruction semantics and configured IS columns.
+    hash.add(hw::kMxmIsColumns);
 #define HASH(field) hash.add(memory_.field)
     HASH(hemispheres);
     HASH(slices_per_hemisphere);
@@ -1014,6 +1012,8 @@ bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destin
         return direction == StreamDirection::West;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::MxmWeight)
         return direction == StreamDirection::East;
+    if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::SxmInput)
+        return direction == StreamDirection::East;
     if (source == StreamEndpoint::MxmResult && destination == StreamEndpoint::Mem)
         return direction == StreamDirection::West;
     if ((source == StreamEndpoint::VxmResult
@@ -1022,6 +1022,8 @@ bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destin
         return direction == StreamDirection::East;
     if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::Mem)
         return direction == StreamDirection::West;
+    if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::VxmInput)
+        return direction == StreamDirection::West;
     return false;
 }
 
@@ -1029,7 +1031,8 @@ std::optional<int64_t> LPUTargetModel::route_stream_count(StreamEndpoint source,
     StreamEndpoint destination, StreamDirection direction) const
 {
     if (!supports_route(source, destination, direction)) return std::nullopt;
-    if (source == StreamEndpoint::Mem && destination == StreamEndpoint::VxmInput)
+    if ((source == StreamEndpoint::Mem || source == StreamEndpoint::SxmResult)
+        && destination == StreamEndpoint::VxmInput)
         return throughput_.lanes_per_tile;
     if ((source == StreamEndpoint::Mem
             && destination == StreamEndpoint::SxmInput)
@@ -1043,6 +1046,8 @@ std::optional<int64_t> LPUTargetModel::route_stream_count(StreamEndpoint source,
         return throughput_.mxm_load_streams_per_cycle;
     if (destination == StreamEndpoint::MxmActivation)
         return throughput_.mxm_activation_streams;
+    if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::SxmInput)
+        return throughput_.mxm_result_streams;
     return throughput_.mxm_result_streams;
 }
 
@@ -1118,7 +1123,8 @@ std::optional<int64_t> LPUTargetModel::route_issue_cycles(StreamEndpoint source,
 {
     if (bytes <= 0) return std::nullopt;
     const int64_t vector_bytes = throughput_.tile_rows * throughput_.lanes_per_tile;
-    if (source == StreamEndpoint::Mem && destination == StreamEndpoint::VxmInput)
+    if ((source == StreamEndpoint::Mem || source == StreamEndpoint::SxmResult)
+        && destination == StreamEndpoint::VxmInput)
         return divide_ceil(bytes, throughput_.mxm_rows * throughput_.lanes_per_tile);
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::MxmWeight)
         return divide_ceil(bytes, vector_bytes * throughput_.mxm_load_streams_per_cycle);
@@ -1127,6 +1133,8 @@ std::optional<int64_t> LPUTargetModel::route_issue_cycles(StreamEndpoint source,
     if (source == StreamEndpoint::Mem && destination == StreamEndpoint::SxmInput)
         return divide_ceil(bytes,
             2 * throughput_.lanes_per_tile * vector_bytes);
+    if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::SxmInput)
+        return divide_ceil(bytes, vector_bytes);
     if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::Mem)
         return divide_ceil(bytes,
             2 * throughput_.lanes_per_tile * vector_bytes);
@@ -1668,6 +1676,12 @@ std::optional<int64_t> LPUTargetModel::transport_latency(StreamEndpoint source,
     if (source == StreamEndpoint::MxmResult
         && destination == StreamEndpoint::VxmInput)
         return throughput_.accumulator_to_vxm_latency;
+    if (source == StreamEndpoint::SxmResult
+        && destination == StreamEndpoint::VxmInput)
+        return streams_.system_register_columns - 1;
+    if (source == StreamEndpoint::VxmResult
+        && destination == StreamEndpoint::SxmInput)
+        return streams_.system_register_columns - 1;
     if (source == StreamEndpoint::Mem
         && destination == StreamEndpoint::SxmInput)
         return throughput_.mem_to_sxm_latency - group;

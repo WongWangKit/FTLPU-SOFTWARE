@@ -24,7 +24,7 @@ def main():
         subprocess.run([
             str(args.compile), "--input", str(args.input), "--output", str(binary),
             "--input-stage", "stablehlo", "--target-config", str(args.target_config),
-            "--weight-bank", "1", "--mxm-execution", "vector",
+            "--weight-bank", "1", "--mxm-execution", "ws",
             "--ffn-schedule", strategy,
         ], check=True, env=env)
         subprocess.run([str(args.runtime_test), str(binary)], check=True, env=env)

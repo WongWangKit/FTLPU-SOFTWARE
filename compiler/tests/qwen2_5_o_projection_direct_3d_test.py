@@ -41,7 +41,7 @@ def main() -> None:
     schedule = args.output_dir / "decoder_layer.schedule.mlir"
     common = ["--target-config", str(args.target_config),
               "--weight-bank", "1", "--kv-cache-capacity", "256",
-              "--mxm-execution", "vector", "--projection-rope-overlap", "off"]
+              "--mxm-execution", "ws", "--projection-rope-overlap", "off"]
     for source, destination, pipeline in (
         (args.input, stream, "ftlpu-stablehlo-to-stream"),
         (stream, schedule, "ftlpu-stream-to-schedule"),

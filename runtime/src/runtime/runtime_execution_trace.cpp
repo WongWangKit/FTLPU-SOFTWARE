@@ -160,13 +160,15 @@ std::pair<std::string, std::string> describe_mxm(std::size_t queue,
     const bool east = queue < per_hemisphere;
     std::ostringstream detail;
     if (instruction.opcode == MxmControlOpcode::IW) {
-        detail << "IW buffer=" << instruction.weight_buffer
+        detail << "IW dataflow=ws transfer="
+               << (instruction.weight_load_mode == MxmWeightLoadMode::Vector ? "vector" : "block")
+               << " buffer=" << instruction.weight_buffer
                << " mode="
                << (instruction.weight_input_mode
                            == MxmWeightInputMode::Int8DequantBf16
                        ? "int8_dequant_bf16" : "direct16");
     } else if (instruction.opcode == MxmControlOpcode::Compute) {
-        detail << "Compute buffer=" << instruction.weight_buffer
+        detail << "Compute dataflow=ws buffer=" << instruction.weight_buffer
                << " format=" << mxm_data_format_name(instruction.data_format)
                << " destination="
                << (instruction.accumulator_destination
@@ -174,10 +176,22 @@ std::pair<std::string, std::string> describe_mxm(std::size_t queue,
                        ? "stream" : "sram")
                << " clear=" << (instruction.accumulator_clear ? 1 : 0);
     } else if (instruction.opcode == MxmControlOpcode::AccumulatorRead) {
-        detail << "AccumulatorRead clear="
+        detail << "AccumulatorRead address=" << instruction.accumulator_address
+               << " clear="
                << (instruction.accumulator_clear ? 1 : 0);
     } else {
-        detail << "Decode";
+        detail << (instruction.decode_operation == MxmIsOperation::LoadActivation
+                       ? "IS.LoadActivation" : "IS.StreamCompute")
+               << " dataflow=is transfer="
+               << (instruction.is_mode == MxmIsMode::Vector ? "vector" : "block")
+               << " columns=" << hw::kMxmIsColumns;
+        if (instruction.decode_operation == MxmIsOperation::StreamCompute)
+            detail << " acc_address=" << instruction.accumulator_address
+                   << " acc_segment=" << instruction.weight_column
+                   << " destination="
+                   << (instruction.accumulator_destination == MxmAccumulatorDestination::Stream
+                           ? "stream" : "sram")
+                   << " clear=" << (instruction.accumulator_clear ? 1 : 0);
     }
     return {std::string("MXM.") + (east ? "E" : "W")
             + std::to_string(queue % per_hemisphere)
@@ -227,7 +241,7 @@ void RuntimeExecutionTrace::begin_segment(const BinaryProgram& program,
 
 void RuntimeExecutionTrace::record_interval(std::int64_t startCycle,
     std::int64_t endCycle, std::string resource, std::string detail,
-    std::size_t issueCount)
+    std::size_t issueCount, bool mergeOverlaps)
 {
     startCycle += cycle_offset_;
     endCycle += cycle_offset_;
@@ -239,7 +253,7 @@ void RuntimeExecutionTrace::record_interval(std::int64_t startCycle,
     const auto previous = last_event_by_resource_.find(mergeKey);
     if (previous != last_event_by_resource_.end()) {
         Event& event = events_[previous->second];
-        if (event.repeat_count == 1 && startCycle <= event.end_cycle) {
+        if (mergeOverlaps && event.repeat_count == 1 && startCycle <= event.end_cycle) {
             event.end_cycle = std::max(event.end_cycle, endCycle);
             event.issue_count += issueCount;
             return;
@@ -398,6 +412,28 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
                                 + " index=" + std::to_string(ref.index)))
                         return;
                     if (last_issued(queue) == nullptr) return;
+                    if (ref.kind == QueueKind::SxmTranspose
+                        && system.sxm_unit(side).transpose_architecture()
+                            == SxmTransposeArchitecture::WideStreaming) {
+                        // Wide transpose has fixed timing (missing input is an
+                        // error, not a stall). Anchor its full FU span to this
+                        // actual runtime issue, including both SL-skew tails.
+                        // Preserve overlapping jobs and their 32-cycle II.
+                        std::ostringstream detail;
+                        detail << queueName << " architecture=wide"
+                               << " timing=fixed_fu_span issue=start"
+                               << " input=[+0,+" << SxmWideTranspose::input_cycles
+                               << ") output=[+" << SxmWideTranspose::output_offset
+                               << ",+" << SxmWideTranspose::execution_cycles
+                               << ") initiation_interval=" << SxmWideTranspose::N;
+                        record_interval(physicalCycle,
+                            physicalCycle + SxmWideTranspose::execution_cycles,
+                            std::string("SXM.")
+                                + (side == Hemisphere::East ? "E." : "W.")
+                                + unitName,
+                            with_issue_pc(detail.str(), queue), 1, false);
+                        return;
+                    }
                     record(std::string("SXM.")
                             + (side == Hemisphere::East ? "E." : "W.")
                             + unitName,

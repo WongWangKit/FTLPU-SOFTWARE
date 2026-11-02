@@ -380,6 +380,13 @@ public:
                     attention_operations.contains(use.getOwner());
             }
             if (fixed_w8a16_operand) continue;
+            // VectorAlu operands are assigned by planVectorAluMemory. The
+            // generic activation allocator would reserve their scalar-sized
+            // storage before the packed vector layout is even selected.
+            if (!argument.use_empty() && llvm::all_of(argument.getUses(),
+                    [](mlir::OpOperand &use) {
+                        return llvm::isa<kernel::VectorAluOp,kernel::ScaledMatvecOp>(use.getOwner());
+                    })) continue;
             if (mlir::failed(allocate_value(argument, argument_kind(argument)))) {
                 function.emitError("cannot allocate function inputs in the east MEM hemisphere");
                 signalPassFailure();

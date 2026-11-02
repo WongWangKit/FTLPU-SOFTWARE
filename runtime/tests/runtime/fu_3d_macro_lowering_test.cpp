@@ -211,6 +211,60 @@ void load_parity_and_dequant()
         expected(dequant, 0, [](const auto& x, const auto&) { return x.instruction; }));
 }
 
+void fixed_bf16_columns()
+{
+    IcuLoop3D loop;
+    loop.counts = {3, 1, 1};
+    loop.cycle_strides = {8, 1, 1};
+    for (std::size_t column = 0; column < 32; ++column) {
+        auto load = MxmLoadIcuInstruction::Load3D(loop, 0,
+            MxmIcuBufferMode::Fixed, column, {0, 0, 0}, 16,
+            MxmWeightInputMode::Direct16);
+        load.opcode = MxmLoadIcuOpcode::LoadColumn3D;
+        QueueProgram source {QueueKind::MxmLoad, 0, {}};
+        append(source, isa::encode_mxm_load_icu_3d_instruction(load));
+        equivalent(lower_fu_3d_queue_to_macro(source).queue,
+            expected(load, 0, detail::expand_mxm_load_icu_instruction));
+        load.weight_column_strides[0] = 1;
+        if (column < 30) {
+            source.commands.clear();
+            append(source, isa::encode_mxm_load_icu_3d_instruction(load));
+            equivalent(lower_fu_3d_queue_to_macro(source).queue,
+                expected(load, 0, detail::expand_mxm_load_icu_instruction));
+        }
+    }
+}
+
+void continuous_columns()
+{
+    IcuLoop3D loop;
+    loop.counts = {32, 4, 2};
+    loop.cycle_strides = {1, 32, 128};
+    auto load = MxmLoadIcuInstruction::Load3D(loop, 0,
+        MxmIcuBufferMode::ToggleDimension1, 0, {1, 0, 0}, 24);
+    load.opcode = MxmLoadIcuOpcode::LoadColumn3D;
+    QueueProgram source {QueueKind::MxmLoad, 0, {}};
+    append(source, isa::encode_mxm_load_icu_3d_instruction(load));
+    equivalent(lower_fu_3d_queue_to_macro(source).queue,
+        expected(load, 0, detail::expand_mxm_load_icu_instruction));
+}
+
+void grouped_columns()
+{
+    for (std::size_t inner = 0; inner < 8; ++inner) {
+        IcuLoop3D loop;
+        loop.counts = {4, 4, 2};
+        loop.cycle_strides = {1, 32, 128};
+        auto load = MxmLoadIcuInstruction::Load3D(loop, 0,
+            MxmIcuBufferMode::ToggleDimension1, inner, {8, 0, 0}, 24);
+        load.opcode = MxmLoadIcuOpcode::LoadColumn3D;
+        QueueProgram source {QueueKind::MxmLoad, 0, {}};
+        append(source, isa::encode_mxm_load_icu_3d_instruction(load));
+        equivalent(lower_fu_3d_queue_to_macro(source).queue,
+            expected(load, 0, detail::expand_mxm_load_icu_instruction));
+    }
+}
+
 void large_closed_form_and_limits()
 {
     // 262144 work points become one two-axis descriptor without constructing
@@ -262,11 +316,11 @@ void unsupported_and_malformed()
     append(source, isa::encode_mem_icu_write_read_2d_instruction(wr));
     rejects([&] { lower_fu_3d_queue_to_macro(source); }, "WRITE_READ_2D");
     source = {QueueKind::MxmLoad, 0, {}};
-    const auto decode = MxmLoadIcuInstruction::DecodeLoadActivation3D({}, 0,
+    const auto decode = MxmLoadIcuInstruction::IsLoadActivation3D({}, 0,
         MxmIcuBufferMode::Fixed, StreamId::East(0).packed(),
-        MxmDataFormat::BFloat16, MxmDecodeLayout::Native4x4);
+        MxmDataFormat::BFloat16, MxmIsMode::Block);
     append(source, isa::encode_mxm_load_icu_3d_instruction(decode));
-    rejects([&] { lower_fu_3d_queue_to_macro(source); }, "native4");
+    rejects([&] { lower_fu_3d_queue_to_macro(source); }, "is-block");
     source = {QueueKind::Mem, 0, {}};
     append(source, isa::encode_mem_icu_3d_instruction(MemIcuInstruction {}));
     source.commands.pop_back();
@@ -281,6 +335,9 @@ try {
     blocked_outer_tail();
     mxm_buffer_and_terminal();
     load_parity_and_dequant();
+    fixed_bf16_columns();
+    grouped_columns();
+    continuous_columns();
     large_closed_form_and_limits();
     unsupported_and_malformed();
     std::cout << "fu_3d_macro_lowering_test passed\n";
