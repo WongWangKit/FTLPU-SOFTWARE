@@ -2598,6 +2598,10 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     runtimeProgram.hardware.queue_control_cache_depth=hw::kQueueControlCacheDepth;
     runtimeProgram.hardware.queue_control_read_latency=hw::kQueueControlReadLatency;
     runtimeProgram.hardware.queue_control_read_ports=hw::kQueueControlReadPorts;
+    runtimeProgram.hardware.queue_control_storage_version=hw::kQueueControlStorageVersion;
+    runtimeProgram.hardware.queue_control_pool_capacity=hw::kQueueControlPoolCapacity;
+    runtimeProgram.hardware.queue_control_pool_read_ii=hw::kQueueControlPoolReadIi;
+
     runtimeProgram.target_abi=executable_target_abi(runtimeProgram.hardware);
     for(const auto& epoch:execution_epochs_) {
       BinaryQueueControlEvent event{static_cast<std::uint32_t>(epoch.event_tag),QueueEventSource::PageCommit,{}};
@@ -2804,6 +2808,11 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   stats_.main_logical_cycles += runtime_.logical_cycles();
   stats_.main_physical_cycles += invocationPhysicalCycles;
   stats_.instruction_prime_cycles += runtime_.instruction_prefill_cycles();
+  const auto& poolStats=runtime_.queue_control_pool_statistics();
+  stats_.qctl_prime_reads+=poolStats.prime_reads;stats_.qctl_run_reads+=poolStats.run_reads;
+  stats_.qctl_max_arbitration_wait=std::max(stats_.qctl_max_arbitration_wait,poolStats.max_arbitration_wait);
+  stats_.qctl_peak_pending=std::max(stats_.qctl_peak_pending,poolStats.peak_pending);
+  stats_.qctl_peak_cached=std::max(stats_.qctl_peak_cached,poolStats.peak_cached);
   for(auto progress:runtime_.queue_execution_progress()) {
     progress.invocation_index=index;
     stats_.queue_progress.push_back(progress);

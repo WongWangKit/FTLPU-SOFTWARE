@@ -232,6 +232,10 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
         REQUIRE_EXACT(queue_control_version);
         REQUIRE_EXACT(queue_control_read_latency);
         REQUIRE_EXACT(queue_control_read_ports);
+        REQUIRE_EXACT(queue_control_storage_version);
+        if(requested.queue_control_storage_version) {
+            REQUIRE_EXACT(queue_control_pool_read_ii);
+        }
     }
     if (program.common_barrier_protocol)
         REQUIRE_EXACT(common_barrier_encoding_version);
@@ -268,6 +272,8 @@ void validate_cmodel_hardware_config(const BinaryProgram& program)
     if (program.queue_control_protocol) {
         require_capacity("queue_control_capacity",requested.queue_control_capacity,physical.queue_control_capacity);
         require_capacity("queue_control_cache_depth",requested.queue_control_cache_depth,physical.queue_control_cache_depth);
+        if(requested.queue_control_storage_version)
+            require_capacity("queue_control_pool_capacity",requested.queue_control_pool_capacity,physical.queue_control_pool_capacity);
     }
     if (program.common_barrier_protocol)
         require_capacity("common_barrier_capacity", requested.common_barrier_capacity,

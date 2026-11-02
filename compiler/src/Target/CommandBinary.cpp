@@ -3427,6 +3427,10 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
     hardware.queue_control_cache_depth = static_cast<std::uint32_t>(icuMemory.queue_control_cache_depth);
     hardware.queue_control_read_latency = static_cast<std::uint32_t>(icuMemory.queue_control_read_latency);
     hardware.queue_control_read_ports = static_cast<std::uint32_t>(icuMemory.queue_control_read_ports);
+    hardware.queue_control_storage_version = static_cast<std::uint32_t>(icuMemory.queue_control_storage_version);
+    hardware.queue_control_pool_capacity = static_cast<std::uint32_t>(icuMemory.queue_control_pool_capacity);
+    hardware.queue_control_pool_read_ii = static_cast<std::uint32_t>(icuMemory.queue_control_pool_read_ii);
+
 #undef COPY_ICU_MEMORY
     if (compressionMode == IcuCompressionMode::RawMacro
         && (hardware.icu_mem_instruction_bits != 96 || hardware.icu_mxm_instruction_bits != 128

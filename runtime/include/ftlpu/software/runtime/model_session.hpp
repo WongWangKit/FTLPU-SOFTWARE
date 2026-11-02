@@ -56,6 +56,7 @@ struct ModelSessionStats {
     // value is captured before output/state C2C transfers reset ICU state.
     std::size_t weight_page_synchronized_writes{0};
     std::size_t main_logical_cycles{0}, main_physical_cycles{0}, instruction_prime_cycles{0};
+    std::size_t qctl_prime_reads{0},qctl_run_reads{0},qctl_max_arbitration_wait{0},qctl_peak_pending{0},qctl_peak_cached{0};
     std::size_t compute_dma_overlap_cycles{0}, compute_rx_overlap_cycles{0}, compute_commit_overlap_cycles{0};
     std::size_t transport_commit_segments{0};
     std::vector<QueueExecutionProgress> queue_progress{};

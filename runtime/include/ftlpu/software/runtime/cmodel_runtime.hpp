@@ -31,6 +31,9 @@ struct QueueExecutionProgress {
 
 class CModelRuntime {
 public:
+    const IcuQueueControlPool::Statistics& queue_control_pool_statistics() const noexcept
+    {return system_.icu().queue_control_pool().statistics();}
+
     explicit CModelRuntime(TspSliceSystem& system);
     explicit CModelRuntime(C2cDmaSystem& system);
     CModelRuntime(TspSliceSystem& system,

@@ -1,0 +1,34 @@
+{
+  "compiled-seq32-none.ftlpu": {
+    "bytes": 358482,
+    "sha256": "ffe9deec2d747bfa38fb4719a13f24c4cd3b74c05d345964b69f363ab4cddad6"
+  },
+  "compiled-seq32-raw-macro.ftlpu": {
+    "bytes": 487546,
+    "sha256": "5eedcdf38db18cf8c6514fd367e11c7ac0241dd64e70e4a2e2f31a95224bbcc3"
+  },
+  "native-seq32-25600-linked.ftlpu": {
+    "bytes": 710681,
+    "sha256": "58852a3f32db7c6474849813d228e83920ea11b02450ea13904d5586efc38ed7"
+  },
+  "native-seq32-25600.csv": {
+    "bytes": 4833467,
+    "sha256": "6e09cf85b07a145cc1bf33dd2abac8549ce23768d737996e0d26e311bbf7d190"
+  },
+  "native-seq32-25600-queues.csv": {
+    "bytes": 5325,
+    "sha256": "947587603a9e2791059d0c9be17b8c771565107fd92c5fc1fe6ced996379d677"
+  },
+  "pseudo-seq32-25600-linked.ftlpu": {
+    "bytes": 485258,
+    "sha256": "d48ce1f91290ae25dd933f8f3615498dc8f85a7d55f55ce8b64905d5ce3f2230"
+  },
+  "pseudo-seq32-25600.csv": {
+    "bytes": 4855381,
+    "sha256": "7669aa976a2e18d8d5d0b7bf128c6a8115123b8b482d880c98ff8a7d9cb2c079"
+  },
+  "pseudo-seq32-25600-queues.csv": {
+    "bytes": 5255,
+    "sha256": "3c9d2fb9b164adee1777b5b676774fe1e288f4d2715db5ed14bacf984575fb47"
+  }
+}

@@ -1127,6 +1127,11 @@ try {
                   << (linkedProgram.queue_control_protocol ? ", queue_execution_ticks=" : ", L=") << dynamicStats.main_logical_cycles
                   << ", P=" << dynamicStats.main_physical_cycles
                   << ", PRIME=" << dynamicStats.instruction_prime_cycles
+                  << ", qctl_prime_reads=" << dynamicStats.qctl_prime_reads
+                  << ", qctl_run_reads=" << dynamicStats.qctl_run_reads
+                  << ", qctl_max_arbitration_wait=" << dynamicStats.qctl_max_arbitration_wait
+                  << ", qctl_peak_pending=" << dynamicStats.qctl_peak_pending
+                  << ", qctl_peak_cached=" << dynamicStats.qctl_peak_cached
                   << ", compute_dma_overlap=" << dynamicStats.compute_dma_overlap_cycles
                   << ", compute_rx_overlap=" << dynamicStats.compute_rx_overlap_cycles
                   << ", compute_commit_overlap=" << dynamicStats.compute_commit_overlap_cycles

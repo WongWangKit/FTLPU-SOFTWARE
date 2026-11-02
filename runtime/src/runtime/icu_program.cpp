@@ -2154,13 +2154,19 @@ std::size_t load_queue_programs_into_icu(
     if (control_program && control_program->queue_control_protocol) {
         validate_queue_sync_plan(*control_program);
         const auto& hardware=control_program->hardware;
+        if(hardware.queue_control_storage_version)
+            icu.configure_queue_control_pool(hardware.queue_control_pool_capacity,hardware.queue_control_cache_depth,
+                hardware.queue_control_read_latency,hardware.queue_control_pool_read_ii);
         for (const auto& partition:control_program->queue_sync_plan.partitions) {
             if (!partition.entries.empty() && partition.entries.front().native_binding) continue;
             std::vector<ftlpu::IcuQueueControl> controls;
             for (const auto& c:partition.entries) controls.push_back({c.local_cycle,c.opcode,c.operand});
             const auto index=physical_queue_index(partition.kind,partition.index,logical_mxms_per_hemisphere);
             const auto configure=[&](auto& queue) {
-                queue.configure_queue_controls(std::move(controls),hardware.queue_control_capacity,
+                if(hardware.queue_control_storage_version)
+                    queue.configure_shared_queue_controls(icu.queue_control_pool(),std::move(controls),
+                        hardware.queue_control_capacity,partition.end_cycle);
+                else queue.configure_queue_controls(std::move(controls),hardware.queue_control_capacity,
                     hardware.queue_control_cache_depth,hardware.queue_control_read_latency,partition.end_cycle);
             };
             switch(partition.kind) {

@@ -1,0 +1,22 @@
+{
+  "default_binary_comparisons": [
+    {
+      "mode": "none",
+      "bytes": 358482,
+      "identical": true,
+      "sha256": "ffe9deec2d747bfa38fb4719a13f24c4cd3b74c05d345964b69f363ab4cddad6"
+    },
+    {
+      "mode": "raw-macro",
+      "bytes": 487546,
+      "identical": true,
+      "sha256": "5eedcdf38db18cf8c6514fd367e11c7ac0241dd64e70e4a2e2f31a95224bbcc3"
+    }
+  ],
+  "incompatible_overlays_rejected": [
+    "mem_iq_depth",
+    "c2c_imem_depth",
+    "fetch_latency_cycles",
+    "macro_reservoir_words"
+  ]
+}

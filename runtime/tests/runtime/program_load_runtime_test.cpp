@@ -298,6 +298,10 @@ void qctl_and_empty_controls() {
         for(const auto& q:program.queues) require(system->chip().icu().mem_iq(q.index).issued_count()==0,"QCTL gate leaked execution");
     }
     auto images=rt::prepare_program_images(program,0x1'0000'0000ULL);
+    require(system->chip().icu().queue_control_pool().used()==program.queue_sync_plan.partitions.size(),
+        "timed QCTL did not commit into the shared pool");
+    require(system->chip().icu().queue_control_pool().statistics().prime_reads==program.queue_sync_plan.partitions.size(),
+        "timed QCTL PRIME bypassed shared RAM reads");
     for(const auto& image:images) {
         require(system->chip().icu().read_program_image(image.descriptor)==image.bytes,"QCTL/event RAM bytes differ");
         if(image.descriptor.storage==ProgramStorage::Qctl) require(image.bytes.size()==12,"QCTL host metadata was transferred");

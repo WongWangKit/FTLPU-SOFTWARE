@@ -52,6 +52,56 @@ BinaryProgram fixture() {
     p.queue_sync_plan.partitions.push_back(binding);
     return p;
 }
+void shared_pool_container() {
+    auto legacy=fixture();
+    legacy.hardware.queue_control_storage_version=0;
+    legacy.hardware.queue_control_pool_capacity=0;
+    legacy.hardware.queue_control_pool_read_ii=0;
+    legacy.target_abi=executable_target_abi(legacy.hardware);
+    auto old=encode(legacy);
+    std::size_t fields=0;legacy.hardware.visit([&](auto){++fields;});
+    old.erase(22+legacy.target_name.size()+(fields-3)*4,12);
+    put(old,8,39);all_readers(old,true); // v39 layout and ABI stay unchanged.
+
+    BinaryProgram native;native.queue_control_protocol=true;native.max_cycle=64;
+    QueueProgram q{QueueKind::C2cDma,0,{}};
+    BinaryQueueControlPartition binding{QueueKind::C2cDma,0,{},64};
+    for(unsigned i=0;i<64;++i) {
+        q.commands.push_back(encode_icu_control_raw_word(IcuControlInstruction::WaitEvent(7)));
+        binding.entries.push_back({i,IcuControlOpcode::WaitEvent,true,7,i});
+    }
+    native.queues.push_back(q);native.queue_sync_plan.partitions.push_back(binding);
+    native.queue_sync_plan.events={{7,QueueEventSource::External,{}}};
+    all_readers(encode(native),true);
+    auto bad=native;bad.queue_sync_plan.partitions[0].entries[1].source_command=0;
+    rejects([&]{encode(bad);});
+    bad=native;bad.queues[0].commands[1]=encode_icu_control_raw_word(IcuControlInstruction::WaitEvent(8));
+    rejects([&]{encode(bad);});
+    auto mixed=encode(native);mixed[mixed.find("QCTL")+28+24+6]=0;all_readers(mixed,false);
+
+    auto full=fixture();const auto raw=full.queues[0];const auto controls=full.queue_sync_plan.partitions[0];
+    for(unsigned i=2;i<=128;++i) {
+        auto q=raw;q.index=i;full.queues.push_back(q);
+        auto p=controls;p.index=i;full.queue_sync_plan.partitions.push_back(p);
+    }
+    all_readers(encode(full),true); // 128 * 4 pseudo records, Native binding excluded.
+    auto extra=raw;extra.index=129;full.queues.push_back(extra);
+    auto partition=controls;partition.index=129;partition.entries.resize(1);
+    full.queue_sync_plan.partitions.push_back(partition);
+    rejects([&]{encode(full);}); // 513th record cannot fit shared RAM.
+
+    auto stream=fixture();stream.max_cycle=80;
+    auto& p=stream.queue_sync_plan.partitions[0];p.end_cycle=80;p.entries.clear();
+    for(unsigned i=0;i<16;++i)p.entries.push_back({i*4,IcuControlOpcode::WaitEvent,false,7,i});
+    const auto exact=encode(stream);all_readers(exact,true);
+    p.entries.push_back({64,IcuControlOpcode::WaitEvent,false,7,16});
+    rejects([&]{encode(stream);});
+    p.entries.pop_back();for(auto& c:p.entries)c.local_cycle=0;
+    rejects([&]{encode(stream);}); // capacity fits, but single-port supply cannot.
+    auto overflow=exact;const auto at=overflow.find("QCTL");
+    std::string record(24,'\0');put(record,0,64);record[4]=7;put(record,8,7);put(record,12,16);
+    overflow.insert(at+28+16*24,record);put(overflow,at+20,17);all_readers(overflow,false);
+}
 void sync_projection_relocations() {
     BinaryProgram p;p.max_cycle=40;
     const auto packet=InstructionControlUnit::MemIcu::encode_synchronized_raw_packet(
@@ -182,6 +232,9 @@ int main(int argc,char** argv) try {
         p.hardware.queue_control_cache_depth=hw::kQueueControlCacheDepth;
         p.hardware.queue_control_read_latency=hw::kQueueControlReadLatency;
         p.hardware.queue_control_read_ports=hw::kQueueControlReadPorts;
+        p.hardware.queue_control_storage_version=hw::kQueueControlStorageVersion;
+        p.hardware.queue_control_pool_capacity=hw::kQueueControlPoolCapacity;
+        p.hardware.queue_control_pool_read_ii=hw::kQueueControlPoolReadIi;
         p.target_abi=executable_target_abi(p.hardware);
         externalize_native_queue_controls(p);write_binary_program(p,argv[2]);
         auto icu=std::make_unique<InstructionControlUnit>();
@@ -189,6 +242,7 @@ int main(int argc,char** argv) try {
         const auto prime=load_queue_programs_into_icu(p.queues,*icu,p.hardware.mxms_per_hemisphere,&p);
         std::cout<<"final encoding/physical frontend priming passed: "<<prime<<" cycles\n";return 0;
     }
+    shared_pool_container();
     sync_projection_relocations();link_source_roundtrip();early_event_after_load();transport_dependency_order();
     BinaryProgram empty;empty.queue_control_protocol=true;all_readers(encode(empty),true);
     auto p=fixture();auto data=encode(p);all_readers(data,true);
@@ -230,5 +284,5 @@ int main(int argc,char** argv) try {
         if(mutation==7) bad.resize(qctl+30);
         all_readers(bad,false);
     }
-    std::cout<<"QCTL passed: four readers, empty/mixed partitions, control stripping, malformed data and bindings\n";
+    std::cout<<"QCTL passed: four readers, empty/mixed partitions, control stripping, malformed data and bindings, shared pool limits, supply proof, v39 compatibility\n";
 } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}

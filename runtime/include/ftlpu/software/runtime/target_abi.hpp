@@ -104,6 +104,10 @@ struct ExecutableHardwareConfig {
     std::uint32_t queue_control_read_latency{hw::kQueueControlReadLatency};
     std::uint32_t queue_control_read_ports{hw::kQueueControlReadPorts};
 
+    std::uint32_t queue_control_storage_version{hw::kQueueControlStorageVersion};
+    std::uint32_t queue_control_pool_capacity{hw::kQueueControlPoolCapacity};
+    std::uint32_t queue_control_pool_read_ii{hw::kQueueControlPoolReadIi};
+
     template <typename Visitor>
     constexpr void visit_pre_v38(Visitor&& visitor)
     {
@@ -145,7 +149,7 @@ struct ExecutableHardwareConfig {
     }
 
     template <typename Visitor>
-    constexpr void visit(Visitor&& visitor)
+    constexpr void visit_pre_v40(Visitor&& visitor)
     {
         visit_pre_v39(visitor);
         visitor(queue_control_version);
@@ -155,7 +159,7 @@ struct ExecutableHardwareConfig {
         visitor(queue_control_read_ports);
     }
     template <typename Visitor>
-    constexpr void visit(Visitor&& visitor) const
+    constexpr void visit_pre_v40(Visitor&& visitor) const
     {
         visit_pre_v39(visitor);
         visitor(queue_control_version);
@@ -163,6 +167,19 @@ struct ExecutableHardwareConfig {
         visitor(queue_control_cache_depth);
         visitor(queue_control_read_latency);
         visitor(queue_control_read_ports);
+    }
+
+    template <typename Visitor> constexpr void visit(Visitor&& visitor) {
+        visit_pre_v40(visitor);
+        visitor(queue_control_storage_version);
+        visitor(queue_control_pool_capacity);
+        visitor(queue_control_pool_read_ii);
+    }
+    template <typename Visitor> constexpr void visit(Visitor&& visitor) const {
+        visit_pre_v40(visitor);
+        visitor(queue_control_storage_version);
+        visitor(queue_control_pool_capacity);
+        visitor(queue_control_pool_read_ii);
     }
 
     template <typename Visitor>
@@ -365,6 +382,11 @@ constexpr std::uint64_t lpu_32stream_target_abi(
     hash.add(config.queue_control_cache_depth);
     hash.add(config.queue_control_read_latency);
     hash.add(config.queue_control_read_ports);
+    if(config.queue_control_storage_version) {
+        hash.add(config.queue_control_storage_version);
+        hash.add(config.queue_control_pool_capacity);
+        hash.add(config.queue_control_pool_read_ii);
+    }
     return hash.value();
 }
 
@@ -382,6 +404,11 @@ constexpr std::uint64_t executable_target_abi(
     hash.add(config.queue_control_cache_depth);
     hash.add(config.queue_control_read_latency);
     hash.add(config.queue_control_read_ports);
+    if(config.queue_control_storage_version) {
+        hash.add(config.queue_control_storage_version);
+        hash.add(config.queue_control_pool_capacity);
+        hash.add(config.queue_control_pool_read_ii);
+    }
     return hash.value();
 }
 

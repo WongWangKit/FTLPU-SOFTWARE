@@ -25,6 +25,9 @@ constexpr std::uint8_t kCompactWordCountMask = 0x38;
 constexpr std::uint8_t kCompactWordCountShift = 3;
 constexpr std::uint8_t kCompactHasExtension = 0x40;
 constexpr std::uint8_t kCompactMacro = 0x80;
+// Container bound, independent of per-queue pseudo-control RAM. Native
+// bindings describe existing i-MEM controls and do not occupy that RAM.
+constexpr std::size_t kMaxQueueControlRecordsPerPartition = 256;
 
 // Internal .ftlpu container discriminant. This is not the two-bit hardware
 // QueueMode (00 Native, 01 Macro); values 1 and 2 remain readable for old
@@ -959,8 +962,8 @@ void read_queue_controls(Reader& reader, BinaryProgram& program)
         partition.index = read_le<std::uint16_t>(reader);
         const auto count = read_le<std::uint32_t>(reader);
         partition.end_cycle = read_le<std::uint32_t>(reader);
-        if (count > program.hardware.queue_control_capacity || count > 256)
-            throw std::runtime_error("QCTL partition exceeds physical capacity");
+        if (count > kMaxQueueControlRecordsPerPartition)
+            throw std::runtime_error("QCTL partition exceeds container record limit");
         for (std::uint32_t i=0; i<count; ++i) {
             BinaryQueueControl control;
             control.local_cycle = read_le<std::uint32_t>(reader);
@@ -969,6 +972,10 @@ void read_queue_controls(Reader& reader, BinaryProgram& program)
             if (flags > 3) throw std::runtime_error("invalid QCTL binding flags");
             control.native_binding = (flags & 1) != 0;
             control.activation_producer = (flags & 2) != 0;
+            if (i && control.native_binding != partition.entries.front().native_binding)
+                throw std::runtime_error("QCTL partition mixes Native bindings and pseudo controls");
+            if (!control.native_binding && count > program.hardware.queue_control_capacity)
+                throw std::runtime_error("QCTL pseudo partition exceeds physical RAM capacity");
             control.operand = read_le<std::uint32_t>(reader);
             control.source_command = read_le<std::uint32_t>(reader);
             control.release_group = read_le<std::uint32_t>(reader);
@@ -1492,8 +1499,10 @@ void read_hardware_config(BinaryProgram& program, std::uint32_t version,
 {
     auto read = [&](std::uint32_t& value) { value = read_value(); };
     bool upgradeTargetAbi = false;
-    if (version >= 39) {
+    if (version >= 40) {
         program.hardware.visit(read);
+    } else if (version == 39) {
+        program.hardware.visit_pre_v40(read);
     } else if (version == 38) {
         program.hardware.visit_pre_v39(read);
     } else if (version == 37) {
@@ -1527,6 +1536,11 @@ void read_hardware_config(BinaryProgram& program, std::uint32_t version,
     } else {
         program.hardware.visit_pre_v19(read);
         upgradeTargetAbi = true;
+    }
+    if (version < 40) {
+        program.hardware.queue_control_storage_version=0;
+        program.hardware.queue_control_pool_capacity=0;
+        program.hardware.queue_control_pool_read_ii=0;
     }
     if (version < 39) {
         program.hardware.queue_control_version = 0;
@@ -1842,11 +1856,24 @@ void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
     }
     if (program.common_barrier_protocol || program.transport_overlap_protocol
         || hw.queue_control_version != 1 || !hw.queue_control_capacity
-        || hw.queue_control_capacity > ftlpu::hw::kQueueControlCapacity
+        || hw.queue_control_capacity > 256
         || !hw.queue_control_cache_depth || hw.queue_control_cache_depth > hw.queue_control_capacity
         || !hw.queue_control_read_latency || hw.queue_control_read_ports != 1
         || program.max_cycle > std::numeric_limits<std::uint32_t>::max())
         throw std::runtime_error("unsupported QCTL protocol, geometry or timeline");
+    if(hw.queue_control_storage_version) {
+        if(hw.queue_control_storage_version!=1 || !hw.queue_control_pool_capacity || hw.queue_control_pool_capacity>65535
+            || !hw.queue_control_pool_read_ii || hw.queue_control_pool_read_ii>65535 || hw.queue_control_read_latency>65535)
+            throw std::runtime_error("unsupported shared QCTL pool geometry");
+    } else if(hw.queue_control_pool_capacity || hw.queue_control_pool_read_ii)
+        throw std::runtime_error("shared QCTL geometry lacks storage capability");
+    std::size_t poolRecords=0,refillQueues=0;
+    for(const auto& p:plan.partitions) {
+        const bool native=!p.entries.empty() && p.entries.front().native_binding;
+        if(!native) {poolRecords+=p.entries.size();refillQueues+=p.entries.size()>hw.queue_control_cache_depth;}
+    }
+    if(hw.queue_control_storage_version && poolRecords>hw.queue_control_pool_capacity)
+        throw std::runtime_error("shared QCTL total record capacity exceeded");
     const auto& source=program.queue_link_source;
     if(source.queues.size()>4096 || source.address_relocations.size()>1000000 || source.scale_relocations.size()>1000000
         || (source.required && source.queues.empty())) throw std::runtime_error("invalid QLNK source capacity");
@@ -1905,8 +1932,13 @@ void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
         case QueueKind::C2cDma: case QueueKind::C2cTx: case QueueKind::C2cRx: limit=hw.hemispheres;break;
         default: throw std::runtime_error("unknown QCTL queue kind");
         }
+        const bool nativeBinding = !p.entries.empty() && p.entries.front().native_binding;
+        if (p.entries.size() > kMaxQueueControlRecordsPerPartition)
+            throw std::runtime_error("QCTL partition exceeds container record limit");
+        if (!nativeBinding && p.entries.size() > hw.queue_control_capacity)
+            throw std::runtime_error("QCTL pseudo partition exceeds physical RAM capacity");
         if (p.index>=limit || !partitions.insert((static_cast<std::uint32_t>(p.kind)<<16)|p.index).second
-            || p.entries.size()>hw.queue_control_capacity || static_cast<std::uint64_t>(p.end_cycle)>static_cast<std::uint64_t>(program.max_cycle)+1)
+            || static_cast<std::uint64_t>(p.end_cycle)>static_cast<std::uint64_t>(program.max_cycle)+1)
             throw std::runtime_error("invalid QCTL partition or capacity: kind="+std::to_string(static_cast<unsigned>(p.kind))+" queue="+std::to_string(p.index)+" end="+std::to_string(p.end_cycle)+" nominal_last="+std::to_string(program.max_cycle));
         const auto q=std::ranges::find_if(program.queues,[&](const auto& queue) {return queue.kind==p.kind && queue.index==p.index;});
         if (bindings && q==program.queues.end()) throw std::runtime_error("QCTL targets a missing queue");
@@ -1916,6 +1948,8 @@ void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
         std::uint32_t previous=0,transport_ordinal=0;
         std::optional<std::uint32_t> previous_source;
         for (const auto& c:p.entries) {
+            if (c.native_binding != nativeBinding)
+                throw std::runtime_error("QCTL partition mixes Native bindings and pseudo controls");
             if ((previous_source && c.source_command<=*previous_source) || c.local_cycle<previous || c.local_cycle>p.end_cycle || !sources.insert(c.source_command).second
                 || (c.opcode!=IcuControlOpcode::Sync && c.opcode!=IcuControlOpcode::WaitEvent && c.opcode!=IcuControlOpcode::Notify && c.opcode!=kQueueControlMemPacket)
                 || (c.opcode!=IcuControlOpcode::WaitEvent && c.opcode!=kQueueControlMemPacket && (c.operand || c.release_group || c.phase_offset))
@@ -1959,6 +1993,36 @@ void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
                 ++packets;pc+=InstructionControlUnit::MemIcu::synchronized_packet_word_count;
             }
             if(packets!=transport_ordinal) throw std::runtime_error("QCTL transport binding count differs from packet store");
+        }
+    }
+    if(bindings && hw.queue_control_storage_version && !source.required) {
+        // Event delays may align competing queues arbitrarily. Use a service
+        // bound independent of those delays: at most cache_depth requests can
+        // be ahead of a new refill in one queue, each served within N RR grants.
+        const std::uint64_t bound=std::uint64_t(hw.queue_control_cache_depth)*refillQueues*hw.queue_control_pool_read_ii
+            +hw.queue_control_read_latency+1;
+        for(const auto& p:plan.partitions) {
+            const auto depth=hw.queue_control_cache_depth;
+            if(p.entries.size()<=depth || p.entries.front().native_binding) continue;
+            std::vector<std::uint64_t> duration(p.entries.size(),0);
+            for(std::size_t i=0;i<p.entries.size();++i) {
+                const auto& c=p.entries[i];
+                // Ignore control-slot costs for a conservative lower bound.
+                if(c.opcode==kQueueControlMemPacket) {
+                    const auto tx=std::ranges::find_if(program.transport_queues,[&](const auto& q){return q.kind==p.kind && q.index==p.index;});
+                    if(tx==program.transport_queues.end()) throw std::runtime_error("shared QCTL refill proof lacks MEM packet");
+                    const auto packet=decode_mem_synchronized_icu_packet(*tx,(c.operand-1)*InstructionControlUnit::MemIcu::synchronized_packet_word_count);
+                    // At least count-1 cycles between first and last issue. Ignore
+                    // receive delays/reservations: they can only extend it.
+                    duration[i]=ftlpu::detail::read_raw_icu_bits(packet[0],2,16);
+                }
+            }
+            for(std::size_t j=depth;j<p.entries.size();++j) {
+                std::uint64_t window=p.entries[j-1].local_cycle-p.entries[j-depth].local_cycle;
+                for(std::size_t k=j-depth+1;k<j;++k)window+=duration[k];
+                if(window<bound)throw std::runtime_error("shared QCTL prefetch supply not proven: queue="+std::to_string(p.index)
+                    +" record="+std::to_string(j)+" window="+std::to_string(window)+" bound="+std::to_string(bound));
+            }
         }
     }
     if(bindings && transport_partitions.size()!=program.transport_queues.size())

@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 39;
+inline constexpr std::uint32_t kBinaryFormatVersion = 40;
 inline constexpr std::uint32_t kBinaryCommonBarrierMaxCompletionInstances = 65535;
 
 enum class BindingAccess : std::uint16_t {

@@ -153,6 +153,10 @@ struct IcuMemoryGeometry {
     int64_t queue_control_cache_depth = hw::kQueueControlCacheDepth;
     int64_t queue_control_read_latency = hw::kQueueControlReadLatency;
     int64_t queue_control_read_ports = hw::kQueueControlReadPorts;
+    int64_t queue_control_storage_version = hw::kQueueControlStorageVersion;
+    int64_t queue_control_pool_capacity = hw::kQueueControlPoolCapacity;
+    int64_t queue_control_pool_read_ii = hw::kQueueControlPoolReadIi;
+
 };
 
 class LPUTargetModel {

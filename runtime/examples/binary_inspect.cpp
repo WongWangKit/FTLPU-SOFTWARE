@@ -65,9 +65,11 @@ try {
         const auto main=analyze_physical_imem(program);
         auto transport=program;transport.queues=program.transport_queues;transport.transport_queues.clear();
         const auto tx=analyze_physical_imem(transport);
-        std::size_t records=0,pseudo=0,peak=0,qctlBytes=16;
+        std::size_t records=0,pseudo=0,peak=0,pseudoPeak=0,nativePeak=0,qctlBytes=16;
         for(const auto& partition:program.queue_sync_plan.partitions) {
             records+=partition.entries.size();peak=std::max(peak,partition.entries.size());
+            auto& kindPeak=!partition.entries.empty() && partition.entries.front().native_binding ? nativePeak : pseudoPeak;
+            kindPeak=std::max(kindPeak,partition.entries.size());
             qctlBytes+=12+24*partition.entries.size();
             for(const auto& c:partition.entries)pseudo+=!c.native_binding;
         }
@@ -78,7 +80,11 @@ try {
         std::cout<<"storage file_bytes="<<std::filesystem::file_size(argv[1])
             <<" main_imem_bytes="<<(main.used_bits+7)/8<<" transport_imem_bytes="<<(tx.used_bits+7)/8
             <<" qctl_bytes="<<qctlBytes<<" qctl_records="<<records<<" pseudo_records="<<pseudo
-            <<" peak_records_per_queue="<<peak<<" qctl_capacity="<<program.hardware.queue_control_capacity
+            <<" peak_records_per_queue="<<peak
+            <<" peak_pseudo_records_per_queue="<<pseudoPeak<<" peak_native_bindings_per_queue="<<nativePeak
+            <<" qctl_storage_version="<<program.hardware.queue_control_storage_version
+            <<" qctl_pool_capacity="<<program.hardware.queue_control_pool_capacity
+            <<" qctl_pool_read_ii="<<program.hardware.queue_control_pool_read_ii<<" qctl_capacity="<<program.hardware.queue_control_capacity
             <<" qctl_cache="<<program.hardware.queue_control_cache_depth
             <<" qctl_latency="<<program.hardware.queue_control_read_latency
             <<" qctl_ports="<<program.hardware.queue_control_read_ports

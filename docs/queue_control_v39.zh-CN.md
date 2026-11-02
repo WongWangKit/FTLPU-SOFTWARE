@@ -1,6 +1,12 @@
 # v39：按队列执行的公共伪控制表
 
+当前 main 的默认存储已切换为 v40 共享 QCTL 池（512 条、每队列 4 条缓存），并接入定时 DMA 装载。本文保留 v39 控制语义与历史验收；当前集成范围以 SOFTWARE 的 `docs/queue_control_shared_pool_main.zh-CN.md` 为准。
+
+本 worktree 的新默认目标使用 v40 共享控制池＋4条缓存，见 [共享池实现与验证](queue_control_shared_pool.zh-CN.md)。本文的独立 RAM 配置描述旧 v39 目标。
+
 当前 main 的链式 VXM、定时装载支持范围及集成复验见 [main 集成记录](queue_control_main_integration.zh-CN.md)。
+
+2026-11-02 的独立 RAM 复验使用每队列 16 条伪控制 RAM＋8 条缓存；容量分离及 seq32 数值、逐拍对照见 [16＋8 复验记录](queue_control_16x8_validation.zh-CN.md)。
 
 本文描述 `queue_control_version=1`。v37/v38 的 BARR 仍是全局计算逻辑周期屏障，读取时不转换、不重新解释。新路径使用 QCTL；MEM/MXM 的 packed-v1 编码不变。验证结果和复现命令见 [queue_control_v39_validation.zh-CN.md](queue_control_v39_validation.zh-CN.md)。
 
@@ -40,7 +46,9 @@ stateDiagram-v2
 
 装载返回前先完成 Native 队列初始化，再允许外部事件投递，避免第一物理拍前已到达的令牌被 lazy launch 清除。
 
-当前 lpu32 配置：每队列控制 RAM 深度 256，预取缓存 8，读延迟 2 个物理周期，每拍一个读请求。PRIME 使用真实 Macro 解码和控制 RAM 访问，不使用无限缓存或零延迟解码。读取控制表不会占用其他队列的控制端口。
+历史 v39 独立 RAM 配置：每队列伪控制 RAM 深度 16，预取缓存 8，读延迟 2 个物理周期，每拍一个读请求。16 条是整个队列分区的装载上限，8 条是其中已取回的执行缓存，不是额外 8 条程序容量；目前没有运行中换页补充控制 RAM。PRIME 使用真实 Macro 解码和控制 RAM 访问，不使用无限缓存或零延迟解码。读取控制表不会占用其他队列的控制端口。
+
+Native 绑定只用于检查真实 i-MEM 控制字及释放关联，不装入伪控制 RAM。容器仍将每分区记录数限制在 256 条；在此基础上，只有伪控制分区受目标的 16 条 RAM 容量限制。同一分区禁止混合 Native 绑定与伪控制，Native 的源位置唯一性、指令匹配、事件关联检查保持。硬件容量属于目标 ABI：此前声明 256 条容量的文件需要针对新目标重新编译/链接，不能直接截断或绕过目标检查。
 
 完成状态由 `generation + page_use_index` 标识，一次页面重新装入对应另一个实例。每任务最多 65,535 个完成事件/实例；重复提交幂等，旧 generation 无效，未来 generation 和未知实例报错。页事件是所列实例的 all-of。原生通知令牌与分页实例完成状态分开，合法的多次 NOTIFY 不会被合并。
 
