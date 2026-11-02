@@ -1,0 +1,208 @@
+binary target=ftlpu-lpu32 max_cycle=80280 measured_cycles=80344 mxms_per_hemisphere=1 tile_rows=4 mxm_rows=32 bytes_per_word=32 vxm_alus=16
+binary queues=154 commands=12135 file_bytes=152893
+binary logical_issue_summary mode=raw_fu_3d status=not_expanded
+binary aggregate instruction=312 nop=0 repeat=0 repeat2d=0 macro=9343 mem_stream_nd=0 mem_slice_program=0 mem_slice_body=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0 mem_write_read_2d=0 repeat_replayed=0 repeat2d_replayed=0 macro_expanded=613616 mem_stream_nd_expanded=0 mem_slice_program_expanded=0 mxm_stream_nd_expanded=0 vxm_stream_nd_expanded=0 sxm_tile_program_expanded=0 mem_write_read_2d_expanded=0 expanded_instruction=613928 encoded_work_entries=9655 saved_work_entries=604273 trace_queue_pattern_rows=9655 serialized_queue_bytes=126205
+imem model=cmodel-abstract deployable=yes queues=154 overflow_queues=0 used_slots=12135 used_bits=1179264 used_bytes_ceil=147408 active_queue_capacity_bits=1676673024 expanded_work=616483 encoded_work_entries=10329 saved_work_entries=606154 work_compression_percent=98.3245
+imem resource=mem slot_bits=96 depth_per_queue=131072 queues=128 used_slots=8896 max_used_slots=186 max_utilization_percent=0.141907 used_bits=854016 expanded_work=474016 encoded_work_entries=8896 saved_work_entries=465120 overflow_queues=0
+imem resource=mxm_load slot_bits=128 depth_per_queue=65536 queues=2 used_slots=138 max_used_slots=82 max_utilization_percent=0.125122 used_bits=17664 expanded_work=13968 encoded_work_entries=138 saved_work_entries=13830 overflow_queues=0
+imem resource=mxm_compute slot_bits=128 depth_per_queue=65536 queues=2 used_slots=258 max_used_slots=147 max_utilization_percent=0.224304 used_bits=33024 expanded_work=111808 encoded_work_entries=258 saved_work_entries=111550 overflow_queues=0
+imem resource=mxm_dequant slot_bits=128 depth_per_queue=65536 queues=2 used_slots=51 max_used_slots=29 max_utilization_percent=0.0442505 used_bits=6528 expanded_work=13824 encoded_work_entries=51 saved_work_entries=13773 overflow_queues=0
+imem resource=vxm slot_bits=96 depth_per_queue=2048 queues=12 used_slots=2172 max_used_slots=330 max_utilization_percent=16.1133 used_bits=208512 expanded_work=1168 encoded_work_entries=724 saved_work_entries=444 overflow_queues=0
+imem resource=sxm_transpose slot_bits=96 depth_per_queue=2048 queues=2 used_slots=38 max_used_slots=22 max_utilization_percent=1.07422 used_bits=3648 expanded_work=693 encoded_work_entries=19 saved_work_entries=674 overflow_queues=0
+imem resource=sxm_permute slot_bits=96 depth_per_queue=2048 queues=2 used_slots=140 max_used_slots=88 max_utilization_percent=4.29688 used_bits=13440 expanded_work=798 encoded_work_entries=35 saved_work_entries=763 overflow_queues=0
+imem resource=c2c_dma slot_bits=96 depth_per_queue=32768 queues=2 used_slots=325 max_used_slots=175 max_utilization_percent=0.534058 used_bits=31200 expanded_work=104 encoded_work_entries=104 saved_work_entries=0 overflow_queues=0
+imem resource=c2c_rx slot_bits=96 depth_per_queue=32768 queues=2 used_slots=117 max_used_slots=63 max_utilization_percent=0.192261 used_bits=11232 expanded_work=104 encoded_work_entries=104 saved_work_entries=0 overflow_queues=0
+binary common_barrier_storage protocol=1 overlap_protocol=1 overlap_version=1 entries=7 barrier_ram_bytes=56 barrier_block_bytes=72 event_association_bytes=84 completion_instances=7 use_launch_metadata_bytes=56 compute_imem_bytes=92992 transport_native_words=762 transport_native_bytes=9144 total_imem_bytes=102136 imem_and_barrier_ram_bytes=102192 total_file_bytes=152893
+binary common_barrier stop_cycle=29556 event_id=196608 page_use_instances=0
+binary common_barrier stop_cycle=43560 event_id=196609 page_use_instances=1
+binary common_barrier stop_cycle=62216 event_id=196610 page_use_instances=2
+binary common_barrier stop_cycle=65508 event_id=196611 page_use_instances=3
+binary common_barrier stop_cycle=68712 event_id=196612 page_use_instances=4
+binary common_barrier stop_cycle=71916 event_id=196613 page_use_instances=5
+binary common_barrier stop_cycle=75120 event_id=196614 page_use_instances=6
+binary transport_instance=0 launch_event=65536 launch_cycle=28823
+binary transport_instance=1 launch_event=65537 launch_cycle=28823
+binary transport_instance=2 launch_event=65538 launch_cycle=60515
+binary transport_instance=3 launch_event=65539 launch_cycle=65352
+binary transport_instance=4 launch_event=65540 launch_cycle=68556
+binary transport_instance=5 launch_event=65541 launch_cycle=71760
+binary transport_instance=6 launch_event=65542 launch_cycle=74964
+imem model=target-physical-v1 deployable=yes queues=154 mem_delta_rle_queues=128 stream_nd_packets=0 overflow_queues=0 macro_context_overflow_queues=0 fu_3d_context_overflow_queues=0 used_slots=8091 used_bits=786368 used_bytes_ceil=98296 active_queue_capacity_bits=1676673024 peak_macro_context_bits=119808 provisioned_macro_context_bits=1110016 peak_fu_3d_context_bits=4352 provisioned_fu_3d_context_bits=55168
+imem physical_resource=mem queues=128 used_slots=4998 max_used_slots=104 used_bits=479808 stream_nd_packets=0 peak_macro_contexts=8 macro_context_capacity=32 peak_macro_context_bits=108544 provisioned_macro_context_bits=1048576 peak_fu_3d_contexts=0 fu_3d_context_capacity=1 peak_fu_3d_context_bits=0 provisioned_fu_3d_context_bits=49152 template_runs=4782 compact_template_runs=4782 extended_template_runs=0 escaped_deltas=3774
+imem physical_resource=mxm_load queues=2 used_slots=91 max_used_slots=53 used_bits=11648 stream_nd_packets=0 peak_macro_contexts=8 macro_context_capacity=40 peak_macro_context_bits=4096 provisioned_macro_context_bits=20480 peak_fu_3d_contexts=0 fu_3d_context_capacity=1 peak_fu_3d_context_bits=0 provisioned_fu_3d_context_bits=576 template_runs=126 compact_template_runs=126 extended_template_runs=0 escaped_deltas=18
+imem physical_resource=mxm_compute queues=2 used_slots=194 max_used_slots=113 used_bits=24832 stream_nd_packets=0 peak_macro_contexts=10 macro_context_capacity=40 peak_macro_context_bits=5120 provisioned_macro_context_bits=20480 peak_fu_3d_contexts=0 fu_3d_context_capacity=1 peak_fu_3d_context_bits=0 provisioned_fu_3d_context_bits=640 template_runs=202 compact_template_runs=202 extended_template_runs=0 escaped_deltas=50
+imem physical_resource=mxm_dequant queues=2 used_slots=16 max_used_slots=8 used_bits=2048 stream_nd_packets=0 peak_macro_contexts=4 macro_context_capacity=40 peak_macro_context_bits=2048 provisioned_macro_context_bits=20480 peak_fu_3d_contexts=0 fu_3d_context_capacity=1 peak_fu_3d_context_bits=0 provisioned_fu_3d_context_bits=448 template_runs=8 compact_template_runs=8 extended_template_runs=0 escaped_deltas=4
+imem physical_resource=vxm queues=12 used_slots=2172 max_used_slots=330 used_bits=208512 stream_nd_packets=0 peak_macro_contexts=0 macro_context_capacity=0 peak_macro_context_bits=0 provisioned_macro_context_bits=0 peak_fu_3d_contexts=1 fu_3d_context_capacity=1 peak_fu_3d_context_bits=3072 provisioned_fu_3d_context_bits=3072 template_runs=0 compact_template_runs=0 extended_template_runs=0 escaped_deltas=0
+imem physical_resource=sxm_transpose queues=2 used_slots=38 max_used_slots=22 used_bits=3648 stream_nd_packets=0 peak_macro_contexts=0 macro_context_capacity=0 peak_macro_context_bits=0 provisioned_macro_context_bits=0 peak_fu_3d_contexts=1 fu_3d_context_capacity=1 peak_fu_3d_context_bits=512 provisioned_fu_3d_context_bits=512 template_runs=0 compact_template_runs=0 extended_template_runs=0 escaped_deltas=0
+imem physical_resource=sxm_permute queues=2 used_slots=140 max_used_slots=88 used_bits=13440 stream_nd_packets=0 peak_macro_contexts=0 macro_context_capacity=0 peak_macro_context_bits=0 provisioned_macro_context_bits=0 peak_fu_3d_contexts=1 fu_3d_context_capacity=1 peak_fu_3d_context_bits=768 provisioned_fu_3d_context_bits=768 template_runs=0 compact_template_runs=0 extended_template_runs=0 escaped_deltas=0
+imem physical_resource=c2c_dma queues=2 used_slots=325 max_used_slots=175 used_bits=31200 stream_nd_packets=0 peak_macro_contexts=0 macro_context_capacity=0 peak_macro_context_bits=0 provisioned_macro_context_bits=0 peak_fu_3d_contexts=0 fu_3d_context_capacity=0 peak_fu_3d_context_bits=0 provisioned_fu_3d_context_bits=0 template_runs=0 compact_template_runs=0 extended_template_runs=0 escaped_deltas=0
+imem physical_resource=c2c_rx queues=2 used_slots=117 max_used_slots=63 used_bits=11232 stream_nd_packets=0 peak_macro_contexts=0 macro_context_capacity=0 peak_macro_context_bits=0 provisioned_macro_context_bits=0 peak_fu_3d_contexts=0 fu_3d_context_capacity=0 peak_fu_3d_context_bits=0 provisioned_fu_3d_context_bits=0 template_runs=0 compact_template_runs=0 extended_template_runs=0 escaped_deltas=0
+binary scale_relocations=51
+binary scale_relocation binding=2 resource=mxm_dequant count=18
+binary scale_relocation binding=3 resource=mxm_dequant count=6
+binary scale_relocation binding=4 resource=mxm_dequant count=6
+binary scale_relocation binding=5 resource=mxm_dequant count=8
+binary scale_relocation binding=7 resource=mxm_dequant count=2
+binary scale_relocation binding=8 resource=mxm_dequant count=2
+binary scale_relocation binding=9 resource=mxm_dequant count=9
+binary timeline name=rmsnorm.transpose_input start_cycle=0 end_cycle=101
+binary timeline name=rmsnorm.feedback start_cycle=101 end_cycle=1319
+binary timeline name=rmsnorm.restore_layout start_cycle=1319 end_cycle=1420
+binary timeline name=qkv start_cycle=1436 end_cycle=16017
+binary timeline name=rope start_cycle=16017 end_cycle=16018
+binary timeline name=qk start_cycle=16018 end_cycle=16819
+binary timeline name=softmax start_cycle=16819 end_cycle=19266
+binary timeline name=probability_transpose start_cycle=19266 end_cycle=19348
+binary timeline name=pv start_cycle=19348 end_cycle=20321
+binary timeline name=o_proj start_cycle=20321 end_cycle=25991
+binary timeline name=elementwise.add start_cycle=26008 end_cycle=28042
+binary timeline name=rmsnorm.transpose_input start_cycle=28058 end_cycle=28159
+binary timeline name=rmsnorm.feedback start_cycle=28159 end_cycle=29377
+binary timeline name=rmsnorm.restore_layout start_cycle=29377 end_cycle=29478
+binary timeline name=c2c.window.binding:8.page:0 start_cycle=43498 end_cycle=43560
+binary timeline name=common_barrier.schedule_cost start_cycle=43436 end_cycle=43560
+binary timeline name=common_barrier.drain_cost start_cycle=62154 end_cycle=62216
+binary timeline name=c2c.window.binding:9.page:0 start_cycle=62154 end_cycle=62216
+binary timeline name=c2c.window.binding:9.page:1 start_cycle=62154 end_cycle=62216
+binary timeline name=c2c.window.binding:9.page:2 start_cycle=62154 end_cycle=62216
+binary timeline name=c2c.window.binding:9.page:3 start_cycle=62154 end_cycle=62216
+binary timeline name=c2c.window.binding:9.page:4 start_cycle=62154 end_cycle=62216
+binary timeline name=c2c.window.binding:9.page:1 start_cycle=65446 end_cycle=65508
+binary timeline name=common_barrier.drain_cost start_cycle=65446 end_cycle=65508
+binary timeline name=c2c.window.binding:9.page:2 start_cycle=68650 end_cycle=68712
+binary timeline name=common_barrier.drain_cost start_cycle=68650 end_cycle=68712
+binary timeline name=c2c.window.binding:9.page:3 start_cycle=71854 end_cycle=71916
+binary timeline name=common_barrier.drain_cost start_cycle=71854 end_cycle=71916
+binary timeline name=c2c.window.binding:9.page:4 start_cycle=75058 end_cycle=75120
+binary timeline name=common_barrier.drain_cost start_cycle=75058 end_cycle=75120
+binary timeline name=ffn.down.vector start_cycle=62251 end_cycle=78234
+binary timeline name=common_barrier.drain_cost start_cycle=29494 end_cycle=29556
+binary timeline name=c2c.window.binding:7.page:0 start_cycle=29494 end_cycle=29556
+binary timeline name=c2c.window.binding:8.page:0 start_cycle=29494 end_cycle=29556
+binary timeline name=c2c.window.binding:9.page:0 start_cycle=29494 end_cycle=29556
+binary timeline name=c2c.window.binding:9.page:1 start_cycle=29494 end_cycle=29556
+binary timeline name=c2c.window.binding:9.page:2 start_cycle=29494 end_cycle=29556
+binary timeline name=c2c.window.binding:9.page:3 start_cycle=29494 end_cycle=29556
+binary timeline name=c2c.window.binding:9.page:4 start_cycle=29494 end_cycle=29556
+binary timeline name=elementwise.add start_cycle=78266 end_cycle=80282
+binary address_relocation access=0 binding=1 count=4
+binary address_relocation access=0 binding=2 count=144
+binary address_relocation access=0 binding=3 count=48
+binary address_relocation access=0 binding=4 count=48
+binary address_relocation access=0 binding=5 count=64
+binary address_relocation access=0 binding=6 count=4
+binary address_relocation access=0 binding=7 count=128
+binary address_relocation access=0 binding=8 count=128
+binary address_relocation access=0 binding=9 count=144
+binary address_relocation access=2 binding=65536 count=68
+binary address_relocation access=2 binding=65537 count=432
+binary weight_page_uses=7
+binary weight_page_use binding=7 page=0 bank=0 runtime_prefetch=1 ready_cycle=29609 release_cycle=43406
+binary weight_page_use binding=8 page=0 bank=1 runtime_prefetch=0 ready_cycle=43560 release_cycle=57357
+binary weight_page_use binding=9 page=0 bank=0 runtime_prefetch=0 ready_cycle=62304 release_cycle=65349
+binary weight_page_use binding=9 page=1 bank=0 runtime_prefetch=0 ready_cycle=65508 release_cycle=68553
+binary weight_page_use binding=9 page=2 bank=0 runtime_prefetch=0 ready_cycle=68712 release_cycle=71757
+binary weight_page_use binding=9 page=3 bank=0 runtime_prefetch=0 ready_cycle=71916 release_cycle=74961
+binary weight_page_use binding=9 page=4 bank=0 runtime_prefetch=0 ready_cycle=75120 release_cycle=78165
+binary weight_residency_pages=3 transfer_fragments=7
+binary weight_residency_page bank=0 page=0 fragments=1 used_bytes=3538944 capacity_bytes=16777216 utilization_percent=21.0938
+binary weight_residency_page bank=0 page=1 fragments=5 used_bytes=983040 capacity_bytes=16777216 utilization_percent=5.85938
+binary weight_residency_page bank=1 page=0 fragments=1 used_bytes=3538944 capacity_bytes=16777216 utilization_percent=21.0938
+binary weight_prefetch_plan page=0 residency_page=0 bank=0 pre_execution=0 start_cycle=0 transfer_end_cycle=1753 ready_cycle=29609 release_cycle=43406 uses=1
+binary weight_prefetch_plan page=0 residency_page=0 bank=1 pre_execution=0 start_cycle=0 transfer_end_cycle=1753 ready_cycle=43560 release_cycle=57357 uses=1
+binary weight_prefetch_plan page=0 residency_page=1 bank=0 pre_execution=0 start_cycle=43406 transfer_end_cycle=43777 ready_cycle=62304 release_cycle=65349 uses=1
+binary weight_prefetch_plan page=1 residency_page=1 bank=0 pre_execution=0 start_cycle=43406 transfer_end_cycle=43777 ready_cycle=65508 release_cycle=68553 uses=1
+binary weight_prefetch_plan page=2 residency_page=1 bank=0 pre_execution=0 start_cycle=43406 transfer_end_cycle=43777 ready_cycle=68712 release_cycle=71757 uses=1
+binary weight_prefetch_plan page=3 residency_page=1 bank=0 pre_execution=0 start_cycle=43406 transfer_end_cycle=43777 ready_cycle=71916 release_cycle=74961 uses=1
+binary weight_prefetch_plan page=4 residency_page=1 bank=0 pre_execution=0 start_cycle=43406 transfer_end_cycle=43777 ready_cycle=75120 release_cycle=78165 uses=1
+binary stream_release_cycles=64
+binary stream_release direction=east streams=0..1 release_cycle=62170
+binary stream_release direction=east streams=2..5 release_cycle=29483
+binary stream_release direction=east streams=6..7 release_cycle=60530
+binary stream_release direction=east streams=8..15 release_cycle=74986
+binary stream_release direction=east streams=16..19 release_cycle=75043
+binary stream_release direction=east streams=20..31 release_cycle=60501
+binary stream_release direction=west streams=0..1 release_cycle=73521
+binary stream_release direction=west streams=2..3 release_cycle=73507
+binary stream_release direction=west streams=4..5 release_cycle=75057
+binary stream_release direction=west streams=6..7 release_cycle=75043
+binary stream_release direction=west streams=8..17 release_cycle=60566
+binary stream_release direction=west streams=18..19 release_cycle=60573
+binary stream_release direction=west streams=20..21 release_cycle=60574
+binary stream_release direction=west streams=22..27 release_cycle=15973
+binary stream_release direction=west streams=28..31 release_cycle=0
+binary queue_occupancy rank=0 resource=vxm queue=1 commands=330 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=1 resource=vxm queue=14 commands=330 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=2 resource=vxm queue=0 commands=291 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=3 resource=vxm queue=15 commands=291 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=4 resource=vxm queue=12 commands=270 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=5 resource=vxm queue=3 commands=270 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=6 resource=vxm queue=2 commands=189 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=7 resource=vxm queue=13 commands=189 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=8 resource=mem queue=1 commands=186 instruction=0 nop=0 repeat=0 repeat2d=0 macro=186 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=9 resource=mem queue=3 commands=186 instruction=0 nop=0 repeat=0 repeat2d=0 macro=186 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=10 resource=mem queue=5 commands=180 instruction=0 nop=0 repeat=0 repeat2d=0 macro=180 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=11 resource=mem queue=7 commands=180 instruction=0 nop=0 repeat=0 repeat2d=0 macro=180 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=12 resource=c2c_dma queue=0 commands=175 instruction=112 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=13 resource=mem queue=105 commands=163 instruction=0 nop=0 repeat=0 repeat2d=0 macro=163 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=14 resource=mem queue=107 commands=163 instruction=0 nop=0 repeat=0 repeat2d=0 macro=163 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=15 resource=mem queue=111 commands=158 instruction=0 nop=0 repeat=0 repeat2d=0 macro=158 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=16 resource=mem queue=109 commands=158 instruction=0 nop=0 repeat=0 repeat2d=0 macro=158 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=17 resource=c2c_dma queue=1 commands=150 instruction=96 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=18 resource=mem queue=9 commands=147 instruction=0 nop=0 repeat=0 repeat2d=0 macro=147 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary queue_occupancy rank=19 resource=mem queue=11 commands=147 instruction=0 nop=0 repeat=0 repeat2d=0 macro=147 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary resource_summary resource=mem queues=128 commands=8896 min=8 max=186 average=69.5
+binary resource_max resource=mem queue=1 commands=186 instruction=0 nop=0 repeat=0 repeat2d=0 macro=186 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary resource_summary resource=mxm_load queues=2 commands=138 min=56 max=82 average=69
+binary resource_max resource=mxm_load queue=0 commands=82 instruction=0 nop=0 repeat=0 repeat2d=0 macro=82 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary resource_summary resource=mxm_compute queues=2 commands=258 min=111 max=147 average=129
+binary resource_max resource=mxm_compute queue=0 commands=147 instruction=0 nop=0 repeat=0 repeat2d=0 macro=147 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary resource_summary resource=mxm_dequant queues=2 commands=51 min=22 max=29 average=25.5
+binary resource_max resource=mxm_dequant queue=0 commands=29 instruction=0 nop=0 repeat=0 repeat2d=0 macro=29 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary resource_summary resource=vxm queues=12 commands=2172 min=3 max=330 average=181
+binary resource_max resource=vxm queue=1 commands=330 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary resource_summary resource=sxm_transpose queues=2 commands=38 min=16 max=22 average=19
+binary resource_max resource=sxm_transpose queue=0 commands=22 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary resource_summary resource=sxm_permute queues=2 commands=140 min=52 max=88 average=70
+binary resource_max resource=sxm_permute queue=0 commands=88 instruction=0 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary resource_summary resource=c2c_dma queues=2 commands=325 min=150 max=175 average=162.5
+binary resource_max resource=c2c_dma queue=0 commands=175 instruction=112 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary resource_summary resource=c2c_rx queues=2 commands=117 min=54 max=63 average=58.5
+binary resource_max resource=c2c_rx queue=0 commands=63 instruction=56 nop=0 repeat=0 repeat2d=0 macro=0 mem_stream_nd=0 mem_slice_program=0 mxm_stream_nd=0 vxm_stream_nd=0 sxm_tile_program=0
+binary binding index=0 access=0 role=activation name=activation layout=13 bytes=36864 page_count=0 base_row=0 rows=72 bank=0 hemisphere_mask=3 slices=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+binary binding index=1 access=0 role=weight name=weight layout=22 bytes=1152 page_count=0 base_row=7616 rows=576 bank=0 hemisphere_mask=3 slices=18,19
+binary binding index=2 access=0 role=weight name=weight layout=8 bytes=331776 page_count=0 base_row=7472 rows=720 bank=1 hemisphere_mask=3 slices=42,43,45,46,47,49,50,51
+binary binding index=3 access=0 role=weight name=weight layout=8 bytes=110592 page_count=0 base_row=6536 rows=288 bank=1 hemisphere_mask=3 slices=42,43,45,46,47,49,50,51
+binary binding index=4 access=0 role=weight name=weight layout=8 bytes=110592 page_count=0 base_row=6248 rows=288 bank=1 hemisphere_mask=3 slices=42,43,45,46,47,49,50,51
+binary binding index=5 access=0 role=weight name=weight layout=6 bytes=331776 page_count=0 base_row=6824 rows=648 bank=1 hemisphere_mask=3 slices=42,43,45,46,47,49,50,51
+binary binding index=6 access=0 role=weight name=weight layout=22 bytes=1152 page_count=0 base_row=7616 rows=576 bank=0 hemisphere_mask=3 slices=16,17
+binary binding index=7 access=0 role=weight name=arg7 layout=9 bytes=884736 page_count=1 base_row=0 rows=8192 bank=0 hemisphere_mask=3 slices=20,24,28,32,36,40,44,48 page_granularity=448 page_items_per_slice_group=112 page_storage_slices=20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51 page_placements=bank0:groups0+4:rows0+1728
+binary binding index=8 access=0 role=weight name=arg8 layout=9 bytes=884736 page_count=1 base_row=0 rows=8192 bank=0 hemisphere_mask=3 slices=21,22,23,25,26,27,29,30 page_granularity=448 page_items_per_slice_group=112 page_storage_slices=20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51 page_placements=bank1:groups0+4:rows0+1728
+binary binding index=9 access=0 role=weight name=arg9 layout=9 bytes=884736 page_count=5 base_row=0 rows=8192 bank=0 hemisphere_mask=3 slices=31,33,34,35,37,38,39,41 page_granularity=4096 page_items_per_slice_group=1024 page_storage_slices=20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51 page_placements=bank0:groups0+1:rows0+384;bank0:groups0+1:rows384+384;bank0:groups0+1:rows768+384;bank0:groups0+1:rows1152+384;bank0:groups0+1:rows1536+384
+binary binding index=0 access=1 role=result name=elementwise.add.1 layout=13 bytes=36864 page_count=0 base_row=0 rows=144 bank=1 hemisphere_mask=3 slices=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+binary binding index=0 access=2 role=result name=rmsnorm.result.0 layout=13 bytes=36864 page_count=0 base_row=0 rows=72 bank=1 hemisphere_mask=3 slices=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+binary binding index=0 access=2 role=constant name=causal_mask.0 layout=19 bytes=1984 page_count=0 base_row=809 rows=31 bank=0 hemisphere_mask=3 slices=12,13
+binary binding index=0 access=2 role=result name=attention.result layout=7 bytes=36864 page_count=0 base_row=0 rows=288 bank=1 hemisphere_mask=1 slices=0,1,2,3
+binary binding index=0 access=2 role=result name=elementwise.add.0 layout=13 bytes=36864 page_count=0 base_row=0 rows=72 bank=0 hemisphere_mask=3 slices=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+binary binding index=0 access=2 role=result name=elementwise.add.0.persistent layout=7 bytes=36864 page_count=0 base_row=0 rows=288 bank=0 hemisphere_mask=3 slices=16,17,18,19
+binary binding index=0 access=2 role=result name=ffn.result layout=7 bytes=36864 page_count=0 base_row=0 rows=160 bank=1 hemisphere_mask=3 slices=16,17,18,19
+binary binding index=1 access=2 role=constant name=causal_mask.1 layout=19 bytes=1984 page_count=0 base_row=809 rows=31 bank=0 hemisphere_mask=3 slices=14,15
+binary binding index=1 access=2 role=result name=rmsnorm.result.1 layout=13 bytes=36864 page_count=0 base_row=0 rows=72 bank=1 hemisphere_mask=3 slices=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+binary binding index=2 access=2 role=constant name=rope.cos_sin layout=14 bytes=4096 page_count=0 base_row=7000 rows=32 bank=1 hemisphere_mask=3 slices=16,17,18,19
+binary binding index=3 access=2 role=constant name=rope.cos_sin.mirror layout=14 bytes=4096 page_count=0 base_row=768 rows=32 bank=0 hemisphere_mask=3 slices=0,1,2,3
+binary binding index=4 access=2 role=workspace name=attention.probability_pack layout=20 bytes=18432 page_count=0 base_row=6000 rows=36 bank=1 hemisphere_mask=3 slices=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+binary binding index=5 access=2 role=workspace name=attention.probability_diagonal layout=21 bytes=18432 page_count=0 base_row=7000 rows=36 bank=0 hemisphere_mask=3 slices=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+binary binding index=7 access=2 role=workspace name=attention.context layout=25 bytes=36864 page_count=0 base_row=2000 rows=576 bank=1 hemisphere_mask=3 slices=16,17,18,19
+binary binding index=65536 access=2 role=state.kv.key name=attention.key_cache layout=24 bytes=12288 page_count=0 base_row=8096 rows=96 bank=1 hemisphere_mask=3 slices=16,17,18,19
+binary binding index=65537 access=2 role=state.kv.value name=attention.value_cache layout=23 bytes=12288 page_count=0 base_row=8168 rows=24 bank=1 hemisphere_mask=3 slices=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+binary binding index=65538 access=2 role=workspace name=ffn.hidden layout=7 bytes=98304 page_count=0 base_row=72 rows=1536 bank=1 hemisphere_mask=2 slices=0,1,2,3
+runtime perf resource=MEM cycles=80344 active_queues=128/208 issued=474016 issue_util=2.84%
+runtime perf resource=MXM.load cycles=80344 active_queues=2/2 issued=13968 issue_util=8.69%
+runtime perf resource=MXM.compute cycles=80344 active_queues=2/2 issued=111808 issue_util=69.58%
+runtime perf resource=MXM.dequant cycles=80344 active_queues=2/2 issued=13824 issue_util=8.60%
+runtime perf resource=VXM cycles=80344 active_queues=12/16 issued=1168 issue_util=0.09%
+runtime perf resource=SXM.transpose cycles=80344 active_queues=2/2 issued=693 issue_util=0.43%
+runtime perf resource=SXM.permute cycles=80344 active_queues=2/2 issued=798 issue_util=0.50%
+runtime perf resource=C2C.DMA cycles=80344 active_queues=2/2 issued=104 issue_util=0.06%
+runtime perf resource=C2C.TX cycles=80344 active_queues=0/2 issued=0 issue_util=0.00%
+runtime perf resource=C2C.RX cycles=80344 active_queues=2/2 issued=104 issue_util=0.06%

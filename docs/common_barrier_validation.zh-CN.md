@@ -1,5 +1,7 @@
 # Macro 公共屏障：实现、验证与边界
 
+> 2026-10-27 更新：本文保留 v37 串行阶段的历史记录。计算/分页重叠和 seq128 真实执行已完成当前范围验收，最新结果见 [重叠验收记录](common_transport_overlap_validation.zh-CN.md)，新格式见 [v38 协议](common_barrier_binary_v38.zh-CN.md)。
+
 验证日期：2026-10-21。实现位于两个工程的 main worktree，包含公共屏障协议及后续 seq128 编译修复；没有整体合并实验分支。本文区分已验证结果和仍未完成的执行验证。
 
 - SOFTWARE：`C:/Users/Jiang_Hua/.codex/worktrees/port-seq128-correctness/FTLPU-SOFTWARE`，基础提交 `2410f11`。

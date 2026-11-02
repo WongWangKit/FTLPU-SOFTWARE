@@ -1,0 +1,57 @@
+[1/20] Building CXX object CMakeFiles\mem_array_separated_test.dir\tests\unit\mem\mem_array_test.cpp.obj
+[2/20] Building CXX object CMakeFiles\ftlpu_cmodel.dir\src\system\stream_topology_builder.cpp.obj
+[3/20] Linking CXX static library ftlpu_cmodel.lib
+[4/20] Building CXX object CMakeFiles\icu_macro_schedule_test.dir\tests\unit\icu\macro_schedule_test.cpp.obj
+[5/20] Building CXX object CMakeFiles\icu_barrier_test.dir\tests\unit\icu\barrier_test.cpp.obj
+[6/20] Building CXX object CMakeFiles\icu_common_barrier_test.dir\tests\unit\icu\common_barrier_test.cpp.obj
+[7/20] Building CXX object CMakeFiles\icu_mem_single_icu_3d_test.dir\tests\unit\icu\mem_single_icu_3d_test.cpp.obj
+[8/20] Building CXX object CMakeFiles\icu_raw_macro_decoder_test.dir\tests\unit\icu\raw_macro_decoder_test.cpp.obj
+[9/20] Linking CXX executable mem_array_separated_test.exe
+[10/20] Linking CXX executable icu_barrier_test.exe
+[11/20] Linking CXX executable icu_common_barrier_test.exe
+[12/20] Linking CXX executable icu_macro_schedule_test.exe
+[13/20] Building CXX object CMakeFiles\c2c_test.dir\tests\subsystem\c2c\dual_chip_test.cpp.obj
+[14/20] Linking CXX executable icu_raw_macro_decoder_test.exe
+[15/20] Linking CXX executable icu_mem_single_icu_3d_test.exe
+[16/20] Linking CXX executable icu_vxm_run_2d_instruction_test.exe
+[17/20] Linking CXX executable icu_sxm_run_2d_instruction_test.exe
+[18/20] Linking CXX executable c2c_test.exe
+[19/20] Building CXX object CMakeFiles\c2c_dma_ddr4_test.dir\tests\subsystem\c2c\dma_ddr4_test.cpp.obj
+[20/20] Linking CXX executable c2c_dma_ddr4_test.exe
+Internal ctest changing into directory: E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/out/main-mature-macro/build
+Test project E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/out/main-mature-macro/build
+      Start  9: unit.mem.array
+ 1/10 Test  #9: unit.mem.array ...................   Passed    0.56 sec
+      Start 34: unit.icu.barrier
+ 2/10 Test #34: unit.icu.barrier .................   Passed    0.24 sec
+      Start 35: unit.icu.common_barrier
+ 3/10 Test #35: unit.icu.common_barrier ..........   Passed    0.27 sec
+      Start 40: unit.icu.macro_schedule
+ 4/10 Test #40: unit.icu.macro_schedule ..........   Passed    0.22 sec
+      Start 41: unit.icu.raw_macro_decoder
+ 5/10 Test #41: unit.icu.raw_macro_decoder .......   Passed    0.29 sec
+      Start 46: unit.icu.mem_single_icu_3d
+ 6/10 Test #46: unit.icu.mem_single_icu_3d .......   Passed    0.26 sec
+      Start 48: unit.icu.vxm_run_2d
+ 7/10 Test #48: unit.icu.vxm_run_2d ..............   Passed    0.23 sec
+      Start 51: unit.icu.sxm_run_2d
+ 8/10 Test #51: unit.icu.sxm_run_2d ..............   Passed    0.29 sec
+      Start 53: subsystem.c2c.dual_chip
+ 9/10 Test #53: subsystem.c2c.dual_chip ..........   Passed    0.27 sec
+      Start 54: subsystem.c2c.dma_ddr4
+10/10 Test #54: subsystem.c2c.dma_ddr4 ...........   Passed    1.96 sec
+
+100% tests passed, 0 tests failed out of 10
+
+Label Time Summary:
+c2c          =   2.23 sec*proc (2 tests)
+ddr4         =   1.96 sec*proc (1 test)
+dma          =   1.96 sec*proc (1 test)
+fast         =   4.59 sec*proc (10 tests)
+icu          =   1.80 sec*proc (7 tests)
+mem          =   0.82 sec*proc (2 tests)
+subsystem    =   2.23 sec*proc (2 tests)
+sxm          =   0.29 sec*proc (1 test)
+unit         =   2.35 sec*proc (8 tests)
+
+Total Test time (real) =   4.61 sec

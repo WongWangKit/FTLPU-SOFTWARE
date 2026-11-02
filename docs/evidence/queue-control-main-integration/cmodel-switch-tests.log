@@ -1,0 +1,18 @@
+Internal ctest changing into directory: E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/build
+Test project E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/build
+    Start 31: unit.icu.queue_control
+1/2 Test #31: unit.icu.queue_control ...........   Passed    0.17 sec
+    Start 57: subsystem.program.loader
+2/2 Test #57: subsystem.program.loader .........   Passed    0.30 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Label Time Summary:
+dma          =   0.30 sec*proc (1 test)
+fast         =   0.48 sec*proc (2 tests)
+icu          =   0.17 sec*proc (1 test)
+program      =   0.30 sec*proc (1 test)
+subsystem    =   0.30 sec*proc (1 test)
+unit         =   0.17 sec*proc (1 test)
+
+Total Test time (real) =   0.49 sec

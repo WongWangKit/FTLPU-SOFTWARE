@@ -1,6 +1,7 @@
 #include "FfnStageEmitter.hpp"
 
 #include "FfnEmitterUtils.hpp"
+#include "CommonBarrierSchedule.hpp"
 
 #include <algorithm>
 #include <array>
@@ -552,6 +553,26 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                         weightSyncGroup = context.projection_timeline.blocks[
                             firstPair * reductionBlockCount].dequant_start;
                     }
+                }
+                if (requestsRawMacroBarriers(ffn.getOperation(), target)
+                    && target.icu_memory().common_transport_overlap_version == 1
+                    && serializedProjections && computeProjectionOffset(projection) > 0
+                    && hemisphere == 0 && pair == 0 && reduction == 0 && page >= 0) {
+                    const auto binding = commonBarrierInputBinding(raw.getInput());
+                    if (!binding) return mlir::failure();
+                    int64_t firstRead = weightStart;
+                    for (std::size_t i=0; i<selectedWeightSlices.size(); ++i) {
+                        const auto latency = context.eastMxmLatency(selectedWeightSlices[i]);
+                        firstRead = std::min(firstRead, weightStart - latency
+                            + (throughput.mxm_prefill_weight_streams == 1 ? static_cast<int64_t>(i) : 0));
+                    }
+                    const auto begin = firstRead - commonBarrierDrainCycles(target);
+                    emitCommonBarrierCandidate(rewriter, ffn.getLoc(), *binding, page, begin, firstRead);
+                    mlir::OperationState cost(ffn.getLoc(), TimelineOp::getOperationName());
+                    cost.addAttributes({rewriter.getNamedAttr("name", rewriter.getStringAttr("common_barrier.schedule_cost")),
+                        rewriter.getNamedAttr("start", rewriter.getI64IntegerAttr(firstRead - 2 * commonBarrierDrainCycles(target))),
+                        rewriter.getNamedAttr("end", rewriter.getI64IntegerAttr(firstRead))});
+                    rewriter.create(cost);
                 }
                 emitFfnWeightTile(rewriter, ffn.getLoc(), raw,
                     dequantizedType,

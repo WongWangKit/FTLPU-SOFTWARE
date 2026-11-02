@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -31,7 +32,8 @@ struct LogicalIssueProgram {
 // Expands native, control-compressed, macro, and coarse descriptor queues into
 // the same sparse per-cycle functional issue representation. Every cycle not
 // present in a queue timeline through max_cycle is a logical NOP/idle cycle.
-LogicalIssueProgram inspect_logical_issues(const BinaryProgram& program);
+LogicalIssueProgram inspect_logical_issues(const BinaryProgram& program,
+    std::size_t max_issues = std::numeric_limits<std::size_t>::max());
 
 struct LogicalIssueMismatch {
     QueueKind kind{QueueKind::Mem};

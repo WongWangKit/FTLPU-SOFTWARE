@@ -39,4 +39,7 @@ ftlpu_generate_hardware_config(
 enable_testing()
 
 add_subdirectory(runtime)
-add_subdirectory(compiler)
+option(FTLPU_BUILD_COMPILER "Build the LLVM/MLIR compiler" ON)
+if(FTLPU_BUILD_COMPILER)
+    add_subdirectory(compiler)
+endif()

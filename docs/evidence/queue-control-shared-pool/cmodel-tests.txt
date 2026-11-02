@@ -1,0 +1,4 @@
+Commands: build/Release/icu_queue_control_test.exe; build/Release/icu_barrier_test.exe
+Both returned exit code 0.
+
+queue controls passed: native physical issue equivalence, same-cycle WAIT chain, SYNC/NOTIFY slots, active Macro, independent queue, finite RAM, shared 4-entry caches and runtime refill

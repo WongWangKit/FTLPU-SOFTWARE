@@ -10,12 +10,15 @@
 #include <algorithm>
 #include <array>
 #include <optional>
+#include <memory>
 #include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace ftlpu::software::runtime {
+
+class CommonOverlapCalendar;
 
 struct C2cWeightSegment {
     Hemisphere hemisphere{Hemisphere::East};
@@ -51,7 +54,12 @@ struct C2cWeightPageStats {
     std::size_t bytes{0};
 };
 
+IcuLocation queue_sync_location(QueueKind kind, std::size_t index, std::size_t logical_mxms);
+
 struct C2cWeightPageFence {
+    std::uint64_t commit_generation{0};
+    std::uint32_t commit_launch{0};
+    std::array<std::size_t,InstructionControlUnit::kMemQueues> commit_vectors{};
     bool transport_queue{false};
     std::array<std::size_t, hw::kHemispheres> dma_issues_begin{};
     std::array<std::size_t, hw::kHemispheres> dma_issues_end{};
@@ -239,10 +247,11 @@ private:
     std::size_t linked_mxms_per_hemisphere_{hw::kMxmsPerHemisphere};
     std::uint32_t next_sync_tag_{1};
     std::uint32_t drain_cycles_{0};
-    // Common mode keeps every paging write in independent physical-time
-    // MEM transport queues. The conservative first implementation launches
-    // runtime pages only at a verified, drained common stop.
+    // Common mode uses independent physical-time MEM control, arbitrated on
+    // the existing bank issue port. Overlap leases keep that port and the
+    // selected SR routes disjoint from computation from E through C/HOLD.
     bool common_barrier_protocol_{false};
+    std::shared_ptr<CommonOverlapCalendar> overlap_calendar_{};
     std::vector<BinaryBarrierEvent> common_events_{};
     std::vector<CommonPageLoadRange> common_page_ranges_{};
     C2cWeightPageFence schedule_common(BinaryProgram& binary,

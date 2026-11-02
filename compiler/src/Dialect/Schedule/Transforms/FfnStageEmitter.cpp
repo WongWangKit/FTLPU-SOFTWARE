@@ -1,4 +1,5 @@
 #include "FfnStageEmitter.hpp"
+#include "CommonBarrierSchedule.hpp"
 
 #include "FfnEmitterUtils.hpp"
 
@@ -305,6 +306,20 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         return mlir::failure();
     }
 
+    const auto gatePaged = gateRaw.getPlacement().getAs<mlir::BoolAttr>("paged_weight");
+    const auto upPaged = upRaw.getPlacement().getAs<mlir::BoolAttr>("paged_weight");
+    if (requestsRawMacroBarriers(ffn.getOperation(), target)
+        && target.icu_memory().common_transport_overlap_version == 1
+        && projectionTimeline->projection_order != FfnProjectionOrder::Interleaved
+        && ((gatePaged && gatePaged.getValue()) || (upPaged && upPaged.getValue()))) {
+        // Charge a real gap before the second projection. Its SRAM operands
+        // are materialized and the old ACC domain has retired before C.
+        // Serialized issue domains still overlap their result-write tail.
+        // Budget one guard to finish that tail and one full idle guard.
+        const auto drain = 2 * commonBarrierDrainCycles(target);
+        projectionTimeline->second_projection_offset += drain;
+        projectionTimeline->final_projection_cycle += drain;
+    }
     const int64_t tile = throughput.mxm_rows;
     // Projection final partials are drained to MEM and clear their rows.
     // Down projection starts afterwards and can reuse the same token window.

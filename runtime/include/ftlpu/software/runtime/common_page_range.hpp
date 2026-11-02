@@ -17,6 +17,7 @@ struct CommonPageLoadRange {
     std::uint32_t stop{0};
     std::uint64_t ready{0};
     std::uint64_t release{0};
+    std::uint32_t launch{0};
 };
 
 } // namespace ftlpu::software::runtime

@@ -1,0 +1,8 @@
+@echo off
+call "D:\Visual Studio\Visual Studio 2022\VC\Auxiliary\Build\vcvars64.bat" >nul
+if errorlevel 1 exit /b 1
+set "QCTL_CMAKE=D:\Visual Studio\Visual Studio 2022\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+"%QCTL_CMAKE%" -S "E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/qctl-shared-pool" -B "E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/qctl-pool-build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DFTLPU_CMODEL_DIR="E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/out/qctl-shared-pool" -DFTLPU_HARDWARE_CONFIG="E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/out/qctl-shared-pool/config/ftlpu-lpu32.json" -DFTLPU_LLVM_SOURCE_DIR="E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/third_party/llvm-project" -DFTLPU_STABLEHLO_SOURCE_DIR="E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/third_party/stablehlo" -DFTLPU_MLIR_DIR="E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-common-barrier-toolchain/lib/cmake/mlir" -DMLIR_DIR="E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-common-barrier-toolchain/lib/cmake/mlir" -DLLVM_DIR="E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-common-barrier-toolchain/lib/cmake/llvm"
+if errorlevel 1 exit /b 1
+"%QCTL_CMAKE%" --build "E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/qctl-pool-build" --target binary_barrier_test ftlpu_compile ftlpu_binary_inspect binary_queue_control_test compiled_smollm2_common_barrier_decoder_test compiled_smollm2_common_barrier_seq128_decoder_test --parallel 3
+exit /b %errorlevel%

@@ -1,0 +1,19 @@
+[1/2] Building CXX object CMakeFiles\icu_queue_control_test.dir\tests\unit\icu\queue_control_test.cpp.obj
+[2/2] Linking CXX executable icu_queue_control_test.exe
+Internal ctest changing into directory: E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/out/main-mature-macro/build
+Test project E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/out/main-mature-macro/build
+    Start 34: unit.icu.barrier
+1/3 Test #34: unit.icu.barrier .................   Passed    0.02 sec
+    Start 35: unit.icu.common_barrier
+2/3 Test #35: unit.icu.common_barrier ..........   Passed    0.03 sec
+    Start 36: unit.icu.queue_control
+3/3 Test #36: unit.icu.queue_control ...........   Passed    0.05 sec
+
+100% tests passed, 0 tests failed out of 3
+
+Label Time Summary:
+fast    =   0.11 sec*proc (3 tests)
+icu     =   0.11 sec*proc (3 tests)
+unit    =   0.11 sec*proc (3 tests)
+
+Total Test time (real) =   0.11 sec

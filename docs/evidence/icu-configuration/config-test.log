@@ -1,0 +1,4 @@
+-- FTLPU hardware target 'ftlpu-lpu32' from E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/config/ftlpu-lpu32.json
+-- FTLPU hardware target 'ftlpu-lpu32' from E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/build/icu-config-test/legacy.json
+-- FTLPU hardware target 'ftlpu-lpu32' from E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-CMODEL/build/icu-config-test/changed.json
+-- ICU configuration passed: legacy defaults, custom profile and invalid geometry

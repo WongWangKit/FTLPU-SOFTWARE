@@ -1,5 +1,7 @@
+#include "ftlpu/software/runtime/queue_phase_release.hpp"
 #include "ftlpu/software/runtime/common_page_storage.hpp"
 #include "ftlpu/software/runtime/model_session.hpp"
+#include "ftlpu/software/runtime/fu_3d_macro_lowering.hpp"
 
 #include "ftlpu/core/bf16.hpp"
 #include "ftlpu/core/fp16.hpp"
@@ -843,6 +845,11 @@ ModelSession::ModelSession(C2cDmaSystem &system)
       c2c_system_(&system),
       weight_pager_(std::make_unique<C2cWeightPager>(system)) {}
 
+void ModelSession::set_ddr_latency_perturbation(std::uint32_t extra, std::uint32_t seed) {
+  if(loaded_) throw std::logic_error("DDR latency must be configured before loading a model package");
+  ddr_latency_perturbation_=std::pair{extra,seed};
+}
+
 void ModelSession::set_ddr_peak_bandwidth_mbytes_per_second(
     std::uint32_t bandwidth) {
   if (loaded_)
@@ -934,6 +941,10 @@ void ModelSession::configure_external_transport(
           hardware.ddr_peak_bandwidth_mbytes_per_second) *
       1'000'000;
   ddr.latency_random_seed = hardware.ddr_latency_random_seed;
+  if(ddr_latency_perturbation_) {
+    ddr.read_latency_cycles+=ddr_latency_perturbation_->first;
+    ddr.latency_random_seed=ddr_latency_perturbation_->second;
+  }
   c2c_system_->ddr4().configure(ddr);
   configure_instruction_data_arbiter_if_supported(
       *c2c_system_, ddr.transfer_channels);
@@ -1001,7 +1012,7 @@ void ModelSession::upload_binding_through_c2c(
     executable_ddr4_address_ += bytes;
   }
 
-  c2c_system_->reset_execution_state();
+  c2c_system_->clear_completed_program();
   weight_pager_->enqueue(page);
   pre_execution_icu_programs_.push_back(
       weight_pager_->last_enqueued_program());
@@ -1126,7 +1137,7 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
   std::size_t transferredVectors = 0;
   while (cursor[0] < byHemisphere[0].size() ||
          cursor[1] < byHemisphere[1].size()) {
-    c2c_system_->reset_execution_state();
+    c2c_system_->clear_completed_program();
     struct BatchSegment {
       std::size_t image_index{0};
       std::uint64_t ddr_address{0};
@@ -1602,7 +1613,7 @@ void ModelSession::execute_executable_weight_preloads(const BinaryProgram& progr
             InstructionControlUnit::mem_queue(segment.hemisphere, segment.slice, segment.bank),
             segment.base_row, segment.vector_count, ownerBindings, pageRelease, pageLoads);
     }
-    c2c_system_->reset_execution_state();
+    c2c_system_->clear_completed_program();
     weight_pager_->enqueue(transfer.page);
     pre_execution_icu_programs_.push_back(
         weight_pager_->last_enqueued_program());
@@ -1987,6 +1998,14 @@ void ModelSession::observe_executable_weight_page_tick() {
     return;
   }
 
+  // QCTL loads this same phase plan from the executable. Runtime owns its
+  // post-commit edge; ModelSession only records transport diagnostics.
+  if (runtime_.queue_control_protocol()) {
+    for (auto& epoch : execution_epochs_)
+      epoch.released=runtime_.queue_release_complete(static_cast<std::uint32_t>(epoch.event_tag));
+    return;
+  }
+
   // An epoch event represents a set of SRAM resources, not one transfer.
   // Release it only after every page required by that epoch has committed.
   // A release phase is a real multi-ICU rendezvous: all queues in that phase
@@ -2011,71 +2030,7 @@ void ModelSession::observe_executable_weight_page_tick() {
       continue;
     if (!epoch.actual_ready_cycle)
       epoch.actual_ready_cycle = readyCycle;
-    if (epoch.releases.empty()) {
-      c2c_system_->chip().icu().broadcast_tagged_notification(
-          epoch.event_tag);
-      epoch.released = true;
-    } else {
-      // Join the startup phases before launching a new activation wave.
-      // Their skew is bounded by the MEM-to-MXM SR flight window. A later
-      // downstream phase can require results produced by this epoch, so it
-      // must rendezvous separately rather than blocking the launch itself.
-      // Without the startup join, an early MEM queue can emit a new wave
-      // while another producer is still draining the preceding Read3D.
-      if (!epoch.release_origin_cycle) {
-        constexpr auto startupWindow =
-            hw::kMxmBoundaryStreamRegisterColumn + 1;
-        bool allParticipantsAtBarrier = true;
-        for (const auto& release : epoch.releases) {
-          if (release.phase_offset > startupWindow && !release.activation_producer
-              && release.location.kind != IcuLocationKind::MxmCompute)
-            continue;
-          if (!c2c_system_->chip().icu().blocked_on_tagged_event(
-                  release.location, epoch.event_tag)) {
-            allParticipantsAtBarrier = false;
-            break;
-          }
-        }
-        if (!allParticipantsAtBarrier)
-          continue;
-      }
-      const auto phaseBegin = epoch.next_release;
-      const auto phaseOffset = epoch.releases[phaseBegin].phase_offset;
-      auto phaseEnd = phaseBegin;
-      while (phaseEnd < epoch.releases.size()
-             && epoch.releases[phaseEnd].phase_offset == phaseOffset)
-        ++phaseEnd;
-
-      const auto now = physicalCycle + 1;
-      const auto expected = epoch.release_origin_cycle
-          ? *epoch.release_origin_cycle
-              + static_cast<std::int64_t>(phaseOffset)
-          : *epoch.actual_ready_cycle;
-      if (now < expected)
-        continue;
-      bool allAtBarrier = true;
-      for (auto index = phaseBegin; index < phaseEnd; ++index)
-        if (!c2c_system_->chip().icu().blocked_on_tagged_event(
-                epoch.releases[index].location, epoch.event_tag)) {
-          allAtBarrier = false;
-          break;
-        }
-      if (!allAtBarrier)
-        continue;
-
-      if (!epoch.release_origin_cycle)
-        epoch.release_origin_cycle = now
-            - static_cast<std::int64_t>(phaseOffset);
-      if (std::getenv("FTLPU_SESSION_PROGRESS") != nullptr)
-        std::clog << "FTLPU epoch release: tag=" << epoch.event_tag
-                  << " cycle=" << now << " phase_offset=" << phaseOffset
-                  << " participants=" << phaseEnd - phaseBegin << std::endl;
-      for (auto index = phaseBegin; index < phaseEnd; ++index)
-        c2c_system_->chip().icu().notify_tagged(
-            epoch.releases[index].location, epoch.event_tag);
-      epoch.next_release = phaseEnd;
-      epoch.released = epoch.next_release == epoch.releases.size();
-    }
+    release_queue_phase(epoch,c2c_system_->chip().icu(),physicalCycle+1);
   }
 }
 
@@ -2300,7 +2255,7 @@ void ModelSession::ensure_weight_page(std::uint32_t page_index) {
     // Standalone C2C transactions, including resident uploads during session
     // load, leave their ICU programs launched. Start each unscheduled model
     // page from a fresh execution context; SRAM and DDR contents survive.
-    c2c_system_->reset_execution_state();
+    c2c_system_->clear_completed_program();
     start_weight_page(page_index);
   }
   const std::size_t waitCycles = wait_for_standalone_weight_page(
@@ -2510,9 +2465,13 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   if (invocation.weight_page != 0xffffffffu)
     ensure_weight_page(invocation.weight_page);
   report("model weight page ready");
+  auto compiledInput=materialize_model_executable(executable);
+  const bool queueControlRequested=compiledInput.queue_control_protocol;
+  if(queueControlRequested) compiledInput=native_queue_link_input(compiledInput);
   BinaryProgram program =
-      parameterize_program(package_, invocation, invocation_plan,
-                           materialize_model_executable(executable));
+      parameterize_program(package_, invocation, invocation_plan,std::move(compiledInput));
+  const BinaryQueueLinkSource relinkRecipe{false,program.queues,program.address_relocations,program.scale_relocations};
+  const bool finalQueueEncoding=queueControlRequested || std::getenv("FTLPU_QUEUE_CONTROL_FINAL_ENCODING")!=nullptr;
   report("program parameterized");
 
   const std::size_t stateIngressCyclesBefore = stats_.c2c_ingress_cycles;
@@ -2638,12 +2597,78 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   // at one logical cycle and can suspend a decoded 3-D domain halfway through
   // its loop, which a physical ICU cannot do.
   if (weight_pager_ && !program.common_barrier_protocol
+      && !finalQueueEncoding
       && !executable_weight_transfers_.empty())
     runtimeProgram.weight_page_uses.clear();
+  // Validation entry: encode precisely the Native link result after its
+  // phase plan has been established, without changing scheduling or releases.
+  if (finalQueueEncoding) {
+    runtimeProgram.hardware.queue_control_version=hw::kQueueControlVersion;
+    runtimeProgram.hardware.queue_control_capacity=hw::kQueueControlCapacity;
+    runtimeProgram.hardware.queue_control_cache_depth=hw::kQueueControlCacheDepth;
+    runtimeProgram.hardware.queue_control_read_latency=hw::kQueueControlReadLatency;
+    runtimeProgram.hardware.queue_control_read_ports=hw::kQueueControlReadPorts;
+    runtimeProgram.hardware.queue_control_storage_version=hw::kQueueControlStorageVersion;
+    runtimeProgram.hardware.queue_control_pool_capacity=hw::kQueueControlPoolCapacity;
+    runtimeProgram.hardware.queue_control_pool_read_ii=hw::kQueueControlPoolReadIi;
+
+    runtimeProgram.target_abi=executable_target_abi(runtimeProgram.hardware);
+    for(const auto& epoch:execution_epochs_) {
+      BinaryQueueControlEvent event{static_cast<std::uint32_t>(epoch.event_tag),QueueEventSource::PageCommit,{}};
+      for(const auto transferIndex:epoch.transfer_indices) {
+        const auto& transfer=executable_weight_transfers_.at(transferIndex);
+        for(const auto instance:transfer.plan.use_indices) {
+          runtimeProgram.weight_page_uses.at(instance).transport_launch_event_id=static_cast<std::uint32_t>(transfer.launch_event_tag);
+          event.page_use_indices.push_back(static_cast<std::uint32_t>(instance));
+        }
+      }
+      runtimeProgram.queue_sync_plan.events.push_back(std::move(event));
+    }
+    const auto encodingOverride=std::getenv("FTLPU_QUEUE_CONTROL_FINAL_ENCODING");
+    const bool nativeControl=encodingOverride && std::string_view(encodingOverride)=="native";
+    externalize_native_queue_controls(runtimeProgram,!nativeControl,[&](QueueSyncPlan& syncPlan) {
+    for(auto& partition:syncPlan.partitions)
+      for(auto& control:partition.entries) {
+        if(control.opcode!=IcuControlOpcode::WaitEvent) continue;
+        const auto epoch=std::ranges::find_if(execution_epochs_,[&](const auto& e){return e.event_tag==control.operand;});
+        if(epoch==execution_epochs_.end()) continue;
+        const auto location=queue_sync_location(partition.kind,partition.index,runtimeProgram.hardware.mxms_per_hemisphere);
+        const auto release=std::ranges::find_if(epoch->releases,[&](const auto& r){return r.location==location;});
+        if(release==epoch->releases.end() && !epoch->releases.empty()) throw std::logic_error("QCTL page wait has no Native release phase");
+        if(release!=epoch->releases.end() && release->phase_offset>UINT32_MAX) throw std::overflow_error("QCTL release phase exceeds uint32");
+        control.release_group=control.operand;
+        control.activation_producer=release!=epoch->releases.end() && release->activation_producer;
+        control.phase_offset=release==epoch->releases.end() ? 0 : static_cast<std::uint32_t>(release->phase_offset);
+      }
+    });
+    runtimeProgram.queue_link_source=relinkRecipe;
+    validate_queue_sync_plan(runtimeProgram);
+  }
   if (const char *diagnosticPath =
           std::getenv("FTLPU_SESSION_DIAGNOSTIC_PROGRAM"))
     write_binary_program(runtimeProgram, std::string(diagnosticPath) + ".loaded.ftlpu");
+  if(const auto finalImage=std::getenv("FTLPU_SESSION_EXECUTE_LINKED_IMAGE")) {
+    auto loadedImage=read_binary_program(std::filesystem::path(finalImage));
+    std::ostringstream expected(std::ios::binary),actual(std::ios::binary);
+    write_binary_program(runtimeProgram,expected);write_binary_program(loadedImage,actual);
+    if(expected.str()!=actual.str())
+      throw std::logic_error("saved final image differs from the checked current Native paging plan");
+    runtimeProgram=std::move(loadedImage);
+  }
   runtime_.load(runtimeProgram, weight_pager_ == nullptr);
+  const auto invocationPhysicalBegin=runtime_.physical_cycles();
+  if(runtimeProgram.queue_control_protocol) last_linked_program_=runtimeProgram;
+  if(runtime_.queue_control_protocol()) {
+    for(auto& transfer:executable_weight_transfers_) {
+      if(!transfer.launch_event_tag) continue;
+      transfer.fence.commit_generation=runtime_.execution_generation();
+      transfer.fence.commit_launch=static_cast<std::uint32_t>(transfer.launch_event_tag);
+      for(const auto& segment:transfer.page.segments) {
+        const auto queue=InstructionControlUnit::mem_queue(segment.hemisphere,segment.slice,segment.bank);
+        transfer.fence.commit_vectors[queue]+=segment.vector_count;
+      }
+    }
+  }
   if (program.common_barrier_protocol && weight_pager_)
     executable_clock_active_ = true;
   report("runtime program loaded");
@@ -2770,7 +2795,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
       if (transfer.launch_event_tag != 0
           && transfer.actual_ready_cycle.has_value())
         verify_c2c_weight_page_residency(*c2c_system_, transfer.page);
-  const std::size_t invocationPhysicalCycles = runtime_.physical_cycles();
+  const std::size_t invocationPhysicalCycles = runtime_.physical_cycles()-invocationPhysicalBegin;
   if (std::getenv("FTLPU_SESSION_BENCHMARK") != nullptr) {
     std::cout << "Session benchmark: invocation=" << index
               << ", logical_cycles=" << runtime_.logical_cycles()
@@ -2790,11 +2815,30 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
                 << '\n';
     }
   }
+  stats_.main_logical_cycles += runtime_.logical_cycles();
+  stats_.main_physical_cycles += invocationPhysicalCycles;
+  stats_.instruction_prime_cycles += runtime_.instruction_prefill_cycles();
+  const auto& poolStats=runtime_.queue_control_pool_statistics();
+  stats_.qctl_prime_reads+=poolStats.prime_reads;stats_.qctl_run_reads+=poolStats.run_reads;
+  stats_.qctl_max_arbitration_wait=std::max(stats_.qctl_max_arbitration_wait,poolStats.max_arbitration_wait);
+  stats_.qctl_peak_pending=std::max(stats_.qctl_peak_pending,poolStats.peak_pending);
+  stats_.qctl_peak_cached=std::max(stats_.qctl_peak_cached,poolStats.peak_cached);
+  for(auto progress:runtime_.queue_execution_progress()) {
+    progress.invocation_index=index;
+    stats_.queue_progress.push_back(progress);
+  }
+  const auto& overlap = runtime_.paging_overlap_statistics();
+  stats_.compute_dma_overlap_cycles += overlap.compute_dma;
+  stats_.compute_rx_overlap_cycles += overlap.compute_rx;
+  stats_.compute_commit_overlap_cycles += overlap.compute_commit;
+  stats_.transport_commit_segments += overlap.commit_segments;
   if (program.common_barrier_protocol)
     stats_.weight_page_runtime_wait_cycles +=
-        runtime_.physical_cycles() - runtime_.logical_cycles();
+        invocationPhysicalCycles - runtime_.logical_cycles();
   const std::size_t lookaheadBoundaryCycles =
       settle_executable_weight_lookahead();
+  if(std::getenv("FTLPU_SESSION_STOP_CYCLE")==nullptr && !runtime_.run_until_complete(10'000'000))
+    throw std::runtime_error("kernel did not safely drain after invocation and lookahead transport");
   if (c2c_system_ != nullptr)
     for (std::size_t queue = 0;
          queue < InstructionControlUnit::kMemQueues; ++queue)
@@ -2938,7 +2982,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
       static_cast<std::int64_t>(outputTransferCycles);
   execution_trace_has_segment_ = true;
   report("complete");
-  last_linked_program_ = std::move(program);
+  if(!runtimeProgram.queue_control_protocol) last_linked_program_ = std::move(program);
 }
 
 void ModelSession::run_embedding_lookups() {

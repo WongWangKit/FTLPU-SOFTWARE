@@ -10,7 +10,7 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
     llvm::ArrayRef<int64_t> hiddenSlices,
     llvm::ArrayRef<int64_t> resultSlices,
     const target::LPUTargetModel& target,
-    int64_t reductionsPerWeightPage)
+    int64_t reductionsPerWeightPage, int64_t commonDrainCycles)
 {
     const auto& memory = target.memory();
     const auto& throughput = target.throughput();
@@ -262,6 +262,23 @@ mlir::FailureOr<FfnDownProjectionTimeline> planFfnDownProjectionTimeline(
                 for (auto& item : block.tiles) item.compute_cycle += shift;
             }
             previousEnd = slotEnd + shift + offset;
+        }
+    }
+    // Add page-cut costs only after finite-ACC slot serialization. Retiming
+    // before that pass lets its wave reindexing absorb the gap and cuts across
+    // the preceding page's second-slot activation/result tail at seq128.
+    // Shift all loads and token tiles of each later page together; preserve
+    // within-page phases and the second-slot offset exactly.
+    if (commonDrainCycles > 0 && pagesPerWave > 0) {
+        int64_t cumulative = 0, lastPage = -1;
+        for (auto& block : result.blocks) {
+            const auto page = block.output_wave * pagesPerWave
+                + block.reduction_block / reductionsPerWeightPage;
+            if (lastPage >= 0 && page != lastPage) cumulative += commonDrainCycles;
+            lastPage = page;
+            block.weight_compute_cycle += cumulative;
+            block.dequant_start += cumulative;
+            for (auto& item : block.tiles) item.compute_cycle += cumulative;
         }
     }
     return result;

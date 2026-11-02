@@ -1,0 +1,12 @@
+Internal ctest changing into directory: E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-qctl-integration/build
+Test project E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-qctl-integration/build
+    Start  5: binary_barrier_test
+1/3 Test  #5: binary_barrier_test ..............   Passed    0.13 sec
+    Start 13: program_load_runtime_test
+2/3 Test #13: program_load_runtime_test ........   Passed    0.40 sec
+    Start 36: binary_queue_control_test
+3/3 Test #36: binary_queue_control_test ........   Passed    0.18 sec
+
+100% tests passed, 0 tests failed out of 3
+
+Total Test time (real) =   0.75 sec

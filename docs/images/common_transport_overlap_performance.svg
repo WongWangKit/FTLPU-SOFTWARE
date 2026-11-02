@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE svg
+  PUBLIC '-//W3C//DTD SVG 1.0//EN'
+  'http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd'>
+<svg width="1040" height="400" preserveAspectRatio="xMinYMin meet" viewBox="0 0 1040 400" xmlns="http://www.w3.org/2000/svg" version="1.0" fill-rule="evenodd" xmlns:xlink="http://www.w3.org/1999/xlink">
+	<title>...</title>
+	<desc>...</desc>
+	<clipPath id="clip">
+		<rect x="0" y="0" width="1040" height="400"/>
+	</clipPath>
+	<g id="group" transform="scale(1,-1) translate(0,-400)" style="clip-path: url(#clip)">
+		<g transform="">
+			<rect x="0" y="0" width="1040" height="400" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(96%,97%,98%); fill-rule: evenodd;"/>
+			<text x="28" y="367" style="font-family: Helvetica; font-size: 19px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,734) scale(1,-1)">Measured main execution: same computation schedule, real paging</text>
+			<text x="28" y="344" style="font-family: Helvetica; font-size: 11px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,688) scale(1,-1)">Logical drain/retiming costs included. CPU-checked Native vs Raw outputs are byte-identical.</text>
+			<text x="60" y="315" style="font-family: Helvetica; font-size: 15px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,630) scale(1,-1)">seq32</text>
+			<path d="M 60,95 L 490,95 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="27" y="92" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,184) scale(1,-1)">0</text>
+			<path d="M 60,146.25 L 490,146.25 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="27" y="143.25" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,286) scale(1,-1)">38</text>
+			<path d="M 60,197.5 L 490,197.5 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="27" y="194.5" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,389) scale(1,-1)">75</text>
+			<path d="M 60,248.75 L 490,248.75 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="27" y="245.75" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,491) scale(1,-1)">112</text>
+			<path d="M 60,300 L 490,300 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="27" y="297" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,594) scale(1,-1)">150</text>
+			<text x="27" y="305" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,610) scale(1,-1)">k P</text>
+			<rect x="104" y="95" width="56" height="149.65683333333334" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(27%,42%,60%); fill-rule: evenodd;"/>
+			<text x="102" y="252.65683333333334" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,505) scale(1,-1)">109,505</text>
+			<rect x="172" y="95" width="56" height="133.91966666666667" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(8%,54%,50%); fill-rule: evenodd;"/>
+			<text x="170" y="236.91966666666667" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,473) scale(1,-1)">97,990</text>
+			<text x="117" y="74" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,148) scale(1,-1)">51,200 MB/s</text>
+			<text x="125" y="55" style="font-family: Helvetica; font-size: 10px;fill: rgb(8%,54%,50%); stroke:none;" transform="translate(0,110) scale(1,-1)">P reduced 10.52%</text>
+			<rect x="319" y="95" width="56" height="185.50176666666664" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(27%,42%,60%); fill-rule: evenodd;"/>
+			<text x="317" y="288.50176666666664" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,577) scale(1,-1)">135,733</text>
+			<rect x="387" y="95" width="56" height="166.7552" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(8%,54%,50%); fill-rule: evenodd;"/>
+			<text x="385" y="269.7552" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,539) scale(1,-1)">122,016</text>
+			<text x="332" y="74" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,148) scale(1,-1)">25,600 MB/s</text>
+			<text x="340" y="55" style="font-family: Helvetica; font-size: 10px;fill: rgb(8%,54%,50%); stroke:none;" transform="translate(0,110) scale(1,-1)">P reduced 10.11%</text>
+			<rect x="60" y="25" width="12" height="9" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(27%,42%,60%); fill-rule: evenodd;"/>
+			<text x="78" y="24" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,48) scale(1,-1)">Serial, E=C</text>
+			<rect x="210" y="25" width="12" height="9" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(8%,54%,50%); fill-rule: evenodd;"/>
+			<text x="228" y="24" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,48) scale(1,-1)">Overlap, E&lt;C</text>
+			<text x="570" y="315" style="font-family: Helvetica; font-size: 15px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,630) scale(1,-1)">seq128</text>
+			<path d="M 570,95 L 1000,95 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="537" y="92" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,184) scale(1,-1)">0</text>
+			<path d="M 570,146.25 L 1000,146.25 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="537" y="143.25" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,286) scale(1,-1)">120</text>
+			<path d="M 570,197.5 L 1000,197.5 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="537" y="194.5" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,389) scale(1,-1)">240</text>
+			<path d="M 570,248.75 L 1000,248.75 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="537" y="245.75" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,491) scale(1,-1)">360</text>
+			<path d="M 570,300 L 1000,300 Z" style="stroke: rgb(86%,89%,92%); stroke-linecap: butt; stroke-width: 0.5;"/>
+			<text x="537" y="297" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,594) scale(1,-1)">480</text>
+			<text x="537" y="305" style="font-family: Helvetica; font-size: 8px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,610) scale(1,-1)">k P</text>
+			<rect x="614" y="95" width="56" height="180.99151041666664" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(27%,42%,60%); fill-rule: evenodd;"/>
+			<text x="612" y="283.99151041666664" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,567) scale(1,-1)">423,785</text>
+			<rect x="682" y="95" width="56" height="175.562" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(8%,54%,50%); fill-rule: evenodd;"/>
+			<text x="680" y="278.562" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,557) scale(1,-1)">411,072</text>
+			<text x="627" y="74" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,148) scale(1,-1)">51,200 MB/s</text>
+			<text x="635" y="55" style="font-family: Helvetica; font-size: 10px;fill: rgb(8%,54%,50%); stroke:none;" transform="translate(0,110) scale(1,-1)">P reduced 3.00%</text>
+			<rect x="829" y="95" width="56" height="192.18621874999997" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(27%,42%,60%); fill-rule: evenodd;"/>
+			<text x="827" y="295.18621874999997" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,590) scale(1,-1)">449,997</text>
+			<rect x="897" y="95" width="56" height="182.40771875000002" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(8%,54%,50%); fill-rule: evenodd;"/>
+			<text x="895" y="285.40771875" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,570) scale(1,-1)">427,101</text>
+			<text x="842" y="74" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,148) scale(1,-1)">25,600 MB/s</text>
+			<text x="850" y="55" style="font-family: Helvetica; font-size: 10px;fill: rgb(8%,54%,50%); stroke:none;" transform="translate(0,110) scale(1,-1)">P reduced 5.09%</text>
+			<rect x="570" y="25" width="12" height="9" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(27%,42%,60%); fill-rule: evenodd;"/>
+			<text x="588" y="24" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,48) scale(1,-1)">Serial, E=C</text>
+			<rect x="720" y="25" width="12" height="9" style="stroke: none; stroke-linecap: butt; stroke-width: 1; fill: rgb(8%,54%,50%); fill-rule: evenodd;"/>
+			<text x="738" y="24" style="font-family: Helvetica; font-size: 10px;fill: rgb(12%,20%,29%); stroke:none;" transform="translate(0,48) scale(1,-1)">Overlap, E&lt;C</text>
+		</g>
+	</g>
+</svg>

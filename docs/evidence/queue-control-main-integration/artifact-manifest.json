@@ -1,0 +1,50 @@
+{
+  "native-seq32-25600.csv": {
+    "bytes": 4833467,
+    "sha256": "6e09cf85b07a145cc1bf33dd2abac8549ce23768d737996e0d26e311bbf7d190"
+  },
+  "native-seq32-25600-linked.ftlpu": {
+    "bytes": 710681,
+    "sha256": "610fbe32c56b6ec4182f408c04246825aeded17f414664a503ee9adc0e4374b8"
+  },
+  "pseudo-seq32-25600.csv": {
+    "bytes": 4855381,
+    "sha256": "7669aa976a2e18d8d5d0b7bf128c6a8115123b8b482d880c98ff8a7d9cb2c079"
+  },
+  "pseudo-seq32-25600-linked.ftlpu": {
+    "bytes": 485258,
+    "sha256": "311bc9b6f9266db4fe871d99bca5c748bb10676610141c9d6e31501b3514ccff"
+  },
+  "native-seq128-25600.csv": {
+    "bytes": 9548686,
+    "sha256": "c1add587ef842cd9c03e1f7ae0fdf17dacc5d233631cce29e73e726d28b76966"
+  },
+  "native-seq128-25600-linked.ftlpu": {
+    "bytes": 3126371,
+    "sha256": "5a79c2f72f5ab70dc9b6d4842cacad775ed92cb60f859dc971550d3bbddd577a"
+  },
+  "pseudo-seq128-25600.csv": {
+    "bytes": 10524013,
+    "sha256": "7c0dfe164b2b3ca2b7e732552e7e9e19c9fbee0a749de6550608768752ac220d"
+  },
+  "pseudo-seq128-25600-linked.ftlpu": {
+    "bytes": 1852425,
+    "sha256": "3001fcd19c810afd115008d828e214f22330dc1b6c9cb9026888a16258940563"
+  },
+  "compiled-seq128-none.ftlpu": {
+    "bytes": 1567539,
+    "sha256": "9d7c0f8e3eb066d31c78869dac1a8b8b9310e327aaab603fdbf9b660dbf64a63"
+  },
+  "compiled-seq128-raw-macro.ftlpu": {
+    "bytes": 1854713,
+    "sha256": "4de1a9161dfb71602e0ff64aeab5698488288c63bd11207c2746301f0d7ba72e"
+  },
+  "compiled-seq32-none.ftlpu": {
+    "bytes": 358482,
+    "sha256": "df4c1f89aa9346cf1c1780d447599137003e9f60c2cdfe86412ed6125b161a67"
+  },
+  "compiled-seq32-raw-macro.ftlpu": {
+    "bytes": 487546,
+    "sha256": "15fd017d9351b5adf689ceb0d065906b9d9a785a108217babb0c2e525e80d2a4"
+  }
+}

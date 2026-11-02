@@ -1,0 +1,1 @@
+runtime_common_barrier_test passed logical=516 early_physical=579 late_physical=630 overlap_physical=516 overlap_late_physical=677 finite_fifo_physical=692 all_of=verified repeated_load=verified resource_conflicts=rejected issues=3 native_issues=3 generation=isolated real_mem_commit=verified corrupt_transport_cases=10 cycle_zero=verified stable_sram=protected

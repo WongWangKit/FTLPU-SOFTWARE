@@ -1,5 +1,7 @@
 # `.ftlpu` v37 公共屏障容器
 
+> 2026-10-27 更新：本文保留 v37 串行阶段的历史记录。计算/分页重叠和 seq128 真实执行已完成当前范围验收，最新结果见 [重叠验收记录](common_transport_overlap_validation.zh-CN.md)，新格式见 [v38 协议](common_barrier_binary_v38.zh-CN.md)。
+
 v37 沿用 `FTLPUB01` magic，Macro packed-v1 编码保持 1。旧加载器由于容器版本未知而拒绝 v37；新 reader 继续读取 v1–v36。v29–v36 的硬件字段不含屏障几何，reader 只有在旧 command ABI hash 匹配时才升级为含公共屏障能力的新 ABI。读取成功仍不替代装载器的目标、资源与安全点校验。
 
 `ExecutableHardwareConfig` 在 v36 硬件字段后追加两个 uint32：`common_barrier_encoding_version = 1`、`common_barrier_capacity = 1024`。两项按此顺序追加到现有 command ABI hash；容量不可大于目标物理容量。每任务每芯片有一张最多 1024 项的有限表，事件完成成员总数不得超过 65535，硬件 RAM 占 8192 字节。描述符 Context、packed Macro 和 Native 队列共享此表。

@@ -1,0 +1,1 @@
+binary_barrier_test passed: v38 four-reader roundtrip, v36/v37 compatibility, corruptions, instances, capacity and cycle bounds

@@ -505,6 +505,8 @@ try {
                     * mixedMacro.hardware.icu_mem_instruction_bits
             && mixedMacroCapacity.queues[0].stream_nd_packets == 0,
         "physical inspector did not count a mixed legacy MEM Macro as one raw 3-D packet");
+    require_rejected([&]{(void)inspect_logical_issues(control,2);},
+        "bounded analysis expanded a queue beyond its issue capacity");
     const auto controlInspection = inspect_logical_issues(control);
     require(controlInspection.functional_issues == 3
             && controlInspection.logical_nop_cycles == 2,

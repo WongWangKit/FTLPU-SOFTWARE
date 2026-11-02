@@ -103,8 +103,25 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     const auto* streams = root->getObject("streams");
     const auto* throughput = root->getObject("throughput");
     const auto* externalMemory = root->getObject("external_memory");
-    const auto* icuMemory = root->getObject("icu_memory");
+    const auto* icuMemory = root->getObject(root->getInteger("schema_version") ? "icu" : "icu_memory");
     LPUTargetModel model;
+
+    // IQ/decoder timing and C2C geometry are compile-time CModel parameters;
+    // v39 does not serialize them. Do not silently accept an overlay that
+    // differs from the frontend actually used for scheduling and validation.
+    if (icuMemory) {
+        for (const auto& parameter : hw::config::kIcuBuildParameters) {
+            const llvm::StringRef name(parameter.name.data(), parameter.name.size());
+            if (!icuMemory->get(name)) continue; // Older profiles inherit the build.
+            const auto value = icuMemory->getInteger(name);
+            if (!value || *value != static_cast<int64_t>(parameter.value)) {
+                error = "ICU build parameter '" + name.str()
+                    + "' differs from this compiler; rebuild SOFTWARE and CModel"
+                      " with the same FTLPU_HARDWARE_CONFIG";
+                return mlir::failure();
+            }
+        }
+    }
 
     // Schema v2 is the shared physical-target format consumed by both the
     // CModel CMake build and FTLPU-SOFTWARE. Legacy compiler exploration
@@ -421,6 +438,25 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
     READ_ICU_MEMORY(mxm_macro_context_bits);
     READ_ICU_MEMORY(common_barrier_encoding_version);
     READ_ICU_MEMORY(common_barrier_capacity);
+    model.icu_memory_.common_transport_overlap_version = 0;
+    READ_ICU_MEMORY(common_transport_overlap_version);
+    model.icu_memory_.queue_control_version = 0;
+    READ_ICU_MEMORY(queue_control_version);
+    model.icu_memory_.queue_control_capacity = 0;
+    READ_ICU_MEMORY(queue_control_capacity);
+    model.icu_memory_.queue_control_cache_depth = 0;
+    READ_ICU_MEMORY(queue_control_cache_depth);
+    model.icu_memory_.queue_control_read_latency = 0;
+    READ_ICU_MEMORY(queue_control_read_latency);
+    model.icu_memory_.queue_control_read_ports = 0;
+    READ_ICU_MEMORY(queue_control_read_ports);
+    model.icu_memory_.queue_control_storage_version = 0;
+    READ_ICU_MEMORY(queue_control_storage_version);
+    model.icu_memory_.queue_control_pool_capacity = 0;
+    READ_ICU_MEMORY(queue_control_pool_capacity);
+    model.icu_memory_.queue_control_pool_read_ii = 0;
+    READ_ICU_MEMORY(queue_control_pool_read_ii);
+
 #undef READ_ICU_MEMORY
 
     if (const auto* mxm = root->getObject("mxm")) {
@@ -578,6 +614,25 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
     READ_ICU_MEMORY(mxm_macro_context_bits);
     READ_ICU_MEMORY(common_barrier_encoding_version);
     READ_ICU_MEMORY(common_barrier_capacity);
+    model.icu_memory_.common_transport_overlap_version = 0;
+    READ_ICU_MEMORY(common_transport_overlap_version);
+    model.icu_memory_.queue_control_version = 0;
+    READ_ICU_MEMORY(queue_control_version);
+    model.icu_memory_.queue_control_capacity = 0;
+    READ_ICU_MEMORY(queue_control_capacity);
+    model.icu_memory_.queue_control_cache_depth = 0;
+    READ_ICU_MEMORY(queue_control_cache_depth);
+    model.icu_memory_.queue_control_read_latency = 0;
+    READ_ICU_MEMORY(queue_control_read_latency);
+    model.icu_memory_.queue_control_read_ports = 0;
+    READ_ICU_MEMORY(queue_control_read_ports);
+    model.icu_memory_.queue_control_storage_version = 0;
+    READ_ICU_MEMORY(queue_control_storage_version);
+    model.icu_memory_.queue_control_pool_capacity = 0;
+    READ_ICU_MEMORY(queue_control_pool_capacity);
+    model.icu_memory_.queue_control_pool_read_ii = 0;
+    READ_ICU_MEMORY(queue_control_pool_read_ii);
+
 #undef READ_ICU_MEMORY
     std::string error;
     if (mlir::failed(model.validate(&error))) {
@@ -712,6 +767,16 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(icu_memory_, mxm_macro_context_bits),
         I64(icu_memory_, common_barrier_encoding_version),
         I64(icu_memory_, common_barrier_capacity),
+        I64(icu_memory_, common_transport_overlap_version),
+        I64(icu_memory_, queue_control_version),
+        I64(icu_memory_, queue_control_capacity),
+        I64(icu_memory_, queue_control_cache_depth),
+        I64(icu_memory_, queue_control_read_latency),
+        I64(icu_memory_, queue_control_read_ports),
+        I64(icu_memory_, queue_control_storage_version),
+        I64(icu_memory_, queue_control_pool_capacity),
+        I64(icu_memory_, queue_control_pool_read_ii),
+
     });
 #undef I64
     return builder.getDictionaryAttr({
@@ -782,6 +847,23 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         || icu_memory_.common_barrier_capacity <= 0
         || icu_memory_.common_barrier_capacity > hw::kCommonBarrierCapacity))
         return fail("common barrier capability must be absent (0/0) or use the supported encoding and finite RAM capacity");
+    if (icu_memory_.common_transport_overlap_version < 0
+        || icu_memory_.common_transport_overlap_version > 1
+        || (icu_memory_.common_transport_overlap_version && noCommonBarrier))
+        return fail("transport overlap capability must be 0/1 and requires common barriers");
+    const auto& control=icu_memory_;
+    if (control.queue_control_version != 0 && (control.queue_control_version != 1
+        || control.queue_control_capacity < 1 || control.queue_control_capacity > hw::kQueueControlCapacity
+        || control.queue_control_cache_depth < 1 || control.queue_control_cache_depth > control.queue_control_capacity
+        || control.queue_control_read_latency < 1 || control.queue_control_read_ports != 1))
+        return fail("queue control requires version 1 and a finite single-port RAM/cache");
+    if(control.queue_control_storage_version) {
+        if(control.queue_control_storage_version!=1 || control.queue_control_version!=1
+            || control.queue_control_pool_capacity<1 || control.queue_control_pool_capacity>hw::kQueueControlPoolCapacity
+            || control.queue_control_pool_read_ii<1)
+            return fail("unsupported shared QCTL pool geometry");
+    } else if(control.queue_control_pool_capacity || control.queue_control_pool_read_ii)
+        return fail("shared QCTL geometry without storage capability");
     if (throughput_.vxm_alus != 16)
         return fail("chain VXM requires exactly 16 physical ALUs and 8 shared ICU queues");
     if (icu_memory_.mem_instruction_bits % 32 != 0
@@ -975,6 +1057,17 @@ std::uint64_t LPUTargetModel::abi_fingerprint() const
 #undef HASH
     hash.add(icu_memory_.common_barrier_encoding_version);
     hash.add(icu_memory_.common_barrier_capacity);
+    hash.add(icu_memory_.common_transport_overlap_version);
+    hash.add(icu_memory_.queue_control_version);
+    hash.add(icu_memory_.queue_control_capacity);
+    hash.add(icu_memory_.queue_control_cache_depth);
+    hash.add(icu_memory_.queue_control_read_latency);
+    hash.add(icu_memory_.queue_control_read_ports);
+    if(icu_memory_.queue_control_storage_version) {
+        hash.add(icu_memory_.queue_control_storage_version);
+        hash.add(icu_memory_.queue_control_pool_capacity);
+        hash.add(icu_memory_.queue_control_pool_read_ii);
+    }
     return hash.value();
 }
 

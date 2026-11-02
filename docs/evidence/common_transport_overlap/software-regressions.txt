@@ -1,0 +1,70 @@
+[0/2] Re-checking globbed directories...
+[1/29] Building CXX object runtime\CMakeFiles\fu_3d_macro_lowering_test.dir\tests\runtime\fu_3d_macro_lowering_test.cpp.obj
+[2/29] Building CXX object runtime\CMakeFiles\raw_macro_cli_replay_test.dir\tests\runtime\raw_macro_cli_replay_test.cpp.obj
+[3/29] Building CXX object runtime\CMakeFiles\macro_bitstream_test.dir\tests\runtime\macro_bitstream_test.cpp.obj
+[4/29] Building CXX object runtime\CMakeFiles\model_session_executable_c2c_weight_test.dir\tests\runtime\model_session_executable_c2c_weight_test.cpp.obj
+[5/29] Building CXX object runtime\CMakeFiles\mem_execution_trace_test.dir\tests\runtime\mem_execution_trace_test.cpp.obj
+[6/29] Building CXX object runtime\CMakeFiles\runtime_page_ready_sync_test.dir\tests\runtime\runtime_page_ready_sync_test.cpp.obj
+[7/29] Building CXX object runtime\CMakeFiles\issue_inspector_test.dir\tests\runtime\issue_inspector_test.cpp.obj
+[8/29] Building CXX object runtime\CMakeFiles\model_package_roundtrip_test.dir\tests\runtime\model_package_roundtrip_test.cpp.obj
+[9/29] Building CXX object runtime\CMakeFiles\weight_page_planner_test.dir\tests\runtime\weight_page_planner_test.cpp.obj
+[10/29] Building CXX object runtime\CMakeFiles\compiled_vxm_sr_ffn_runtime_test.dir\tests\runtime\compiled_smollm2_135m_ffn_runtime_test.cpp.obj
+[11/29] Linking CXX executable runtime\macro_bitstream_test.exe
+[12/29] Linking CXX executable runtime\fu_3d_macro_lowering_test.exe
+[13/29] Linking CXX executable runtime\raw_macro_cli_replay_test.exe
+[14/29] Linking CXX executable runtime\model_session_executable_c2c_weight_test.exe
+[15/29] Building CXX object runtime\CMakeFiles\c2c_weight_ping_pong_test.dir\tests\runtime\c2c_weight_ping_pong_test.cpp.obj
+[16/29] Linking CXX executable runtime\runtime_page_ready_sync_test.exe
+[17/29] Linking CXX executable runtime\issue_inspector_test.exe
+[18/29] Linking CXX executable runtime\mem_execution_trace_test.exe
+[19/29] Linking CXX executable runtime\model_package_roundtrip_test.exe
+[20/29] Linking CXX executable runtime\c2c_weight_ping_pong_test.exe
+[21/29] Linking CXX executable runtime\weight_page_planner_test.exe
+[22/29] Linking CXX executable runtime\compiled_vxm_sr_ffn_runtime_test.exe
+[23/29] Linking CXX executable compiler\attention_rope_emitter_test.exe
+[24/29] Linking CXX executable compiler\ftlpu_opt.exe
+[25/29] Linking CXX executable compiler\ffn_schedule_builders_test.exe
+[26/29] Linking CXX executable compiler\elementwise_vxm_sr_direction_test.exe
+[27/29] Building CXX object compiler\CMakeFiles\ftlpu_translate.dir\tools\ftlpu_translate.cpp.obj
+E:\Fudan_University\internship\timesintelli\LPU\work\FTLPU-SOFTWARE\third_party\llvm-project\mlir\include\mlir/IR/DialectRegistry.h(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+E:\Fudan_University\internship\timesintelli\LPU\work\FTLPU-SOFTWARE\build-mlir-vs2026-x64\tools\mlir\include\mlir/IR/BuiltinTypes.h.inc(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+E:\Fudan_University\internship\timesintelli\LPU\work\FTLPU-SOFTWARE\build-mlir-vs2026-x64\tools\mlir\include\mlir/Dialect/Func/IR/FuncOps.h.inc(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+[28/29] Linking CXX executable compiler\ftlpu-translate.exe
+Internal ctest changing into directory: E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-common-barrier-ninja
+Test project E:/Fudan_University/internship/timesintelli/LPU/work/FTLPU-SOFTWARE/out/main-common-barrier-ninja
+      Start  1: runtime_common_barrier_test
+ 1/16 Test  #1: runtime_common_barrier_test ................   Passed    1.13 sec
+      Start  2: binary_barrier_test
+ 2/16 Test  #2: binary_barrier_test ........................   Passed    0.02 sec
+      Start  3: macro_bitstream_test
+ 3/16 Test  #3: macro_bitstream_test .......................   Passed    0.18 sec
+      Start  4: fu_3d_macro_lowering_test
+ 4/16 Test  #4: fu_3d_macro_lowering_test ..................   Passed    0.19 sec
+      Start  6: model_session_executable_c2c_weight_test
+ 5/16 Test  #6: model_session_executable_c2c_weight_test ...   Passed    0.45 sec
+      Start  7: runtime_page_ready_sync_test
+ 6/16 Test  #7: runtime_page_ready_sync_test ...............   Passed    0.23 sec
+      Start  9: mem_execution_trace_test
+ 7/16 Test  #9: mem_execution_trace_test ...................   Passed    0.17 sec
+      Start 13: issue_inspector_test
+ 8/16 Test #13: issue_inspector_test .......................   Passed    0.20 sec
+      Start 16: model_package_roundtrip_test
+ 9/16 Test #16: model_package_roundtrip_test ...............   Passed    0.15 sec
+      Start 21: c2c_weight_ping_pong_test
+10/16 Test #21: c2c_weight_ping_pong_test ..................   Passed    0.25 sec
+      Start 22: weight_page_planner_test
+11/16 Test #22: weight_page_planner_test ...................   Passed    0.19 sec
+      Start 34: attention_rope_emitter_test
+12/16 Test #34: attention_rope_emitter_test ................   Passed    0.17 sec
+      Start 42: ffn_schedule_builders_test
+13/16 Test #42: ffn_schedule_builders_test .................   Passed    0.17 sec
+      Start 44: elementwise_vxm_sr_direction_test
+14/16 Test #44: elementwise_vxm_sr_direction_test ..........   Passed    0.14 sec
+      Start 51: smollm2_seq128_compile_test
+15/16 Test #51: smollm2_seq128_compile_test ................   Passed   23.44 sec
+      Start 52: direct_raw_macro_cli_test
+16/16 Test #52: direct_raw_macro_cli_test ..................   Passed   35.07 sec
+
+100% tests passed, 0 tests failed out of 16
+
+Total Test time (real) =  62.17 sec
