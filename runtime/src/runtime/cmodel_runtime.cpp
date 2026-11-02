@@ -466,27 +466,22 @@ bool CModelRuntime::inputs_ready() const
 void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uint64_t image_base,
     bool initializeInternalData)
 {
-    // The timed image loader currently transports only packed MEM/MXM words.
-    // It has no control-RAM image/commit interface; never silently omit QCTL.
-    if (timed && program.queue_control_protocol)
-        throw std::invalid_argument("timed program load does not yet support QCTL control RAM; use load_direct");
-    if (c2c_system_ && c2c_system_->program_loader().busy())
-        throw std::logic_error("cannot replace a program while a timed load is active");
+    if (!can_load_program())
+        throw std::logic_error("cannot replace a program before all execution and transport resources drain");
     validate_cmodel_hardware_config(program);
-    for (std::size_t tile=0;tile<VxmSlice::kTileCount;++tile)
-        for (std::size_t lane=0;lane<hw::kLanesPerTile;++lane)
-            system_.vxm_unit().superlane(tile).lane(lane)
-                .set_statistics_timeline_retention(false);
-    const auto images = timed ? prepare_program_images(program.queues, image_base,
-        program.hardware.mxms_per_hemisphere) : std::vector<ProgramQueueImage>{};
+    validate_binary_barriers(program);
+    validate_queue_sync_plan(program);
+    if(program.queue_link_source.required) throw std::invalid_argument("QCTL candidate requires final paging link before loading hardware");
+    auto images = prepare_program_images(program,image_base,timed);
     const auto imem = analyze_physical_imem(program);
-    compute_imem_segments_.clear();compute_imem_queues_.clear();
-    compute_imem_segment_=0;compute_imem_boundary_=0;
+    std::vector<BinaryProgram> preparedSegments;
+    std::vector<std::pair<QueueKind,std::size_t>> preparedQueues;
+    std::size_t preparedBoundary=0;
     auto initialQueues=program.queues;
     if (!imem.fits()) {
         // Reload only overflowing compute queues. MEM, MXM and transport
         // keep their original programs and global common-barrier timeline.
-        const bool supported=program.common_barrier_protocol &&
+        const bool supported=!timed && program.common_barrier_protocol &&
             std::all_of(imem.queues.begin(),imem.queues.end(),[](const auto& q) {
                 return !q.deployment_overflow() ||
                     (q.physical_overflow() && !q.fu_3d_context_overflow()
@@ -498,16 +493,16 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
             subset.hardware=program.hardware;subset.max_cycle=program.max_cycle;
             subset.timelines=program.timelines;
             for(const auto& q:imem.queues)if(q.physical_overflow())
-                compute_imem_queues_.emplace_back(q.kind,q.index);
+                preparedQueues.emplace_back(q.kind,q.index);
             const auto selected=[&](const auto& q) {
-                return std::find(compute_imem_queues_.begin(),compute_imem_queues_.end(),
-                    std::make_pair(q.kind,static_cast<std::size_t>(q.index)))!=compute_imem_queues_.end();
+                return std::find(preparedQueues.begin(),preparedQueues.end(),
+                    std::make_pair(q.kind,static_cast<std::size_t>(q.index)))!=preparedQueues.end();
             };
             for(const auto& q:program.queues)if(selected(q))subset.queues.push_back(q);
-            compute_imem_segments_=split_resident_program_at_drains(subset);
-            compute_imem_boundary_=compute_imem_segments_.front().max_cycle;
+            preparedSegments=split_resident_program_at_drains(subset);
+            preparedBoundary=preparedSegments.front().max_cycle;
             std::erase_if(initialQueues,selected);
-            const auto& first=compute_imem_segments_.front().queues;
+            const auto& first=preparedSegments.front().queues;
             initialQueues.insert(initialQueues.end(),first.begin(),first.end());
         } else {
         std::ostringstream detail;
@@ -521,9 +516,6 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
         throw std::runtime_error(detail.str());
         }
     }
-    validate_binary_barriers(program);
-    validate_queue_sync_plan(program);
-    if(program.queue_link_source.required) throw std::invalid_argument("QCTL candidate requires final paging link before loading hardware");
     if (program.common_barrier_protocol) {
         // KV page-out control remains in the saved image and executes later.
         // It must never block the independent page-in transport port.
@@ -539,7 +531,9 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
     if ((program.common_barrier_protocol || program.queue_control_protocol) && !program.weight_page_uses.empty()
         && c2c_system_ == nullptr)
         throw std::invalid_argument("common-barrier paging requires the real C2C transport runtime");
-    configure_common_transport(program);
+    CModelRuntime prepared(system_);
+    prepared.configure_common_transport(program);
+
     SystemHardwareConfiguration hardware;
     hardware.sram_depth_rows = program.hardware.sram_depth_rows;
     hardware.mxms_per_hemisphere = program.hardware.mxms_per_hemisphere;
@@ -551,10 +545,16 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
         program.hardware.mxm_local_dequant_enabled != 0;
     hardware.mxm_weight_activation_overlap_enabled =
         program.hardware.mxm_weight_activation_overlap_enabled != 0;
+    static std::atomic<std::uint64_t> nextGeneration{1};
+    const auto previousGeneration=c2c_system_?c2c_system_->program_loader().last_generation():system_.icu().program_generation();
+    const auto reservedGeneration=nextGeneration.fetch_add(1);
+    if (!reservedGeneration || previousGeneration==UINT64_MAX) throw std::overflow_error("execution generation exhausted");
+    const auto newGeneration=std::max(reservedGeneration,previousGeneration+1);
     system_.configure_hardware(hardware);
+    for(auto& image:images) image.descriptor.generation=newGeneration;
     if (timed) {
-        // submit() clears only compute queues; outstanding weight/data traffic
-        // and all physical clocks continue across kernel switches.
+        // Guard and physicalization completed before staging any new DDR bytes.
+        // The accepted switch preserves all device and DDR/DMA clocks.
         std::vector<ProgramImage> descriptors;
         for (const auto& image : images) {
             for (std::size_t offset = 0; offset < image.bytes.size(); offset += hw::kPhysicalVectorBytes) {
@@ -566,14 +566,17 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
             descriptors.push_back(image.descriptor);
         }
         c2c_system_->program_loader().submit(std::move(descriptors), c2c_system_->cycle());
-    } else if (c2c_system_ != nullptr)
-        c2c_system_->reset_execution_state();
-    else
-        system_.reset_execution_state();
-    static std::atomic<std::uint64_t> nextGeneration{1};
-    execution_generation_ = nextGeneration.fetch_add(1);
-    if (execution_generation_ == 0)
-        throw std::overflow_error("execution generation exhausted");
+    } else system_.reset_program();
+    execution_generation_ = newGeneration;
+    system_.icu().set_program_generation(newGeneration);
+    common_transports_=std::move(prepared.common_transports_);
+    queue_releases_=std::move(prepared.queue_releases_);
+    compute_imem_segments_=std::move(preparedSegments);compute_imem_queues_=std::move(preparedQueues);
+    compute_imem_segment_=0;compute_imem_boundary_=preparedBoundary;
+    for (std::size_t tile=0;tile<VxmSlice::kTileCount;++tile)
+        for (std::size_t lane=0;lane<hw::kLanesPerTile;++lane)
+            system_.vxm_unit().superlane(tile).lane(lane).set_statistics_timeline_retention(false);
+
     queue_control_protocol_ = program.queue_control_protocol;
     queue_progress_.clear();
     if(queue_control_protocol_)
@@ -581,23 +584,7 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
     common_barrier_protocol_ = program.common_barrier_protocol;
     transport_overlap_protocol_ = program.transport_overlap_protocol;
     system_.icu().set_transport_overlap_enabled(transport_overlap_protocol_);
-    if (common_barrier_protocol_) {
-        std::vector<IcuCommonBarrierEntry> entries;
-        std::vector<IcuCommonEventBinding> events;
-        for (const auto& barrier : program.barriers)
-            entries.push_back({barrier.stop_cycle, barrier.event_id});
-        for (const auto& event : program.barrier_events)
-            events.push_back({event.event_id, event.page_use_indices});
-        system_.icu().configure_common_barriers(
-            execution_generation_, std::move(entries), std::move(events));
-    }
-    if(queue_control_protocol_) {
-        std::vector<IcuCommonEventBinding> events;
-        for(const auto& event:program.queue_sync_plan.events)
-            if(event.source==QueueEventSource::PageCommit) events.push_back({event.event_id,event.page_use_indices});
-        system_.icu().configure_queue_completion_events(execution_generation_,events);
-    }
-    load_transport_queue_programs_into_icu(program.transport_queues, system_.icu());
+    if(!timed) load_transport_queue_programs_into_icu(program.transport_queues, system_.icu());
     for (const auto& page : common_transports_) {
         for (const auto& [queue, pc] : page.mem_descriptors)
             system_.icu().configure_mem_transport_owner(queue, pc, execution_generation_, page.launch_event,
@@ -616,8 +603,17 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
     for (std::size_t block = 0; block < 8; ++block)
         system_.configure_vxm_output_block_destination(block,
             block < 4 ? Hemisphere::West : Hemisphere::East);
-    instruction_prefill_cycles_ = timed ? 0 : load_queue_programs_into_icu(initialQueues, system_.icu(),
-        program.hardware.mxms_per_hemisphere, &program);
+    instruction_prefill_cycles_=0;
+    if(!timed) {
+        load_queue_programs_into_icu(initialQueues,system_.icu(),program.hardware.mxms_per_hemisphere,nullptr,false);
+        for(const auto& image:images) {
+            for(std::size_t word=0;word<image.descriptor.word_count();++word)
+                system_.icu().write_program_word(image.descriptor,word,image.bytes.data()+word*image.descriptor.word_bytes());
+            system_.icu().seal_program_image(image.descriptor);
+        }
+        system_.icu().for_each_program_queue([](auto& q){q.launch();});
+        instruction_prefill_cycles_=system_.icu().prime_raw_macro_frontends();
+    }
     if (!timed && c2c_system_ != nullptr) {
         constexpr auto kInstructionImageBase =
             std::uint64_t {0x1'0000'0000};
@@ -625,7 +621,7 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
             stage_and_prime_icu_programs_if_supported(
                 *c2c_system_, kInstructionImageBase);
     }
-    if (common_barrier_protocol_) {
+    if (!timed && common_barrier_protocol_) {
         // Configure/launch before any cycle-zero event can be delivered.
         // Lazy launch clears notification latches as part of reset_execution.
         for (const auto& queue : program.queues) {
@@ -657,8 +653,14 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
     paged_weight_data_.clear();
     next_weight_page_use_ = 0;
     executed_cycles_ = 0;
-    physical_cycles_ = timed ? system_.cycle() : 0;
+    physical_cycles_ = system_.cycle();
+    loaded_physical_cycle_=physical_cycles_;
     timed_program_load_ = timed;
+    task_loaded_=true;direct_done_cycle_.reset();
+    if(!timed) {
+        system_.icu().set_program_loading(false);
+        if(c2c_system_) c2c_system_->program_loader().begin_direct_program(system_.cycle(),newGeneration);
+    }
     uploaded_inputs_.clear();
     system_.icu().set_program_issue_enabled(!timed);
     paging_overlap_ = {};
@@ -2198,7 +2200,7 @@ void CModelRuntime::sample_queue_progress()
         const auto sample=[&](const auto& queue) {
             progress.local_cycle=queue.raw_macro_mode();
             progress.queue_cycle=queue.cycle();
-            progress.physical_cycles=physical_cycles_+1;
+            progress.physical_cycles=physical_cycles_-loaded_physical_cycle_+1;
             progress.issued=queue.issued_count();
             progress.done=queue.done();
             const auto action=queue.last_trace().action;
@@ -2241,6 +2243,7 @@ void CModelRuntime::advance_queue_releases()
 
 void CModelRuntime::advance_common_transport()
 {
+    if(timed_program_load_ && !c2c_system_->program_loader().all_images_committed()) return;
     if(queue_control_protocol_) {
         for(auto& page:common_transports_) {
             if(page.committed) continue;
@@ -2323,83 +2326,98 @@ void CModelRuntime::reload_drained_compute_imem()
     compute_imem_boundary_+=part.max_cycle;
 }
 
-void CModelRuntime::run_logical_cycles(
-    std::size_t cycles, TspSliceSystem::LogSinks sinks)
+bool CModelRuntime::step_physical(TspSliceSystem::LogSinks sinks)
 {
-    if (timed_program_load_) physical_cycles_ = system_.cycle();
-    sinks.capture_mem_trace = mem_execution_trace_enabled_;
-    const auto count = cycles == 0 ? loaded_max_cycle_ + 1 : cycles;
-    if (!timed_program_load_) system_.icu().set_program_issue_enabled(true);
-    std::size_t heldCycles = 0;
-    constexpr std::size_t kPhysicalWaitWatchdog = 10'000'000;
-    for (std::size_t advanced = 0; advanced < count;) {
-        reload_drained_compute_imem();
-        // P advances on every tick; L advances only on an enabled dispatch.
-        const bool inputReady = !timed_program_load_ || inputs_ready();
-        if (inputReady) load_ready_weight_pages();
-        advance_common_transport();
-        if (timed_program_load_) {
-            auto& loader = c2c_system_->program_loader();
-            const bool initialPagesReady = std::all_of(common_transports_.begin(),
-                common_transports_.end(), [](const auto& page) {
-                    return page.stop_cycle != 0 || page.committed;
-                });
-            const bool dependenciesReady = inputReady && (loader.started()
-                || (initialPagesReady && (!program_start_dependency_checker_
-                    || program_start_dependency_checker_())));
-            loader.set_dependencies_ready(dependenciesReady);
-            loader.start();
-            system_.icu().set_program_issue_enabled(dependenciesReady
-                && (loader.started() || loader.ready_to_start()));
-        }
-        tick_(sinks);
-        if (timed_program_load_) {
-            const auto& stats = program_load_statistics();
-            if (stats.frontend_ready)
-                instruction_prefill_cycles_ = *stats.frontend_ready - *stats.all_images_committed;
-        }
-        const bool enabled = timed_program_load_ || common_barrier_protocol_
-            ? system_.icu().compute_enabled() : true;
-        if(queue_control_protocol_) sample_queue_progress();
-        if (common_barrier_protocol_ || queue_control_protocol_) {
-            const bool compute = !system_.common_compute_resources_drained();
-            bool dma = false, rx = false;
-            std::size_t commits = 0;
-            for (std::size_t h=0;h<hw::kHemispheres;++h) {
-                const auto side=static_cast<Hemisphere>(h);
-                commits += system_.mem_array(side).last_transport_commit_segments();
-                rx |= system_.stream_fabric(side).last_cycle_activity().c2c_staged_writes != 0;
-                if (c2c_system_) dma |= c2c_system_->dma(side).last_beat().has_value();
-            }
-            paging_overlap_.compute_active += compute;
-            paging_overlap_.compute_dma += compute && dma;
-            paging_overlap_.compute_rx += compute && rx;
-            paging_overlap_.compute_commit += compute && commits != 0;
-            paging_overlap_.commit_segments += commits;
-            if (execution_trace_enabled_ && (dma || rx || commits))
-                execution_trace_.record_interval(physical_cycles_,physical_cycles_+1,
-                    "Paging.Activity", "compute="+std::to_string(compute)
-                        +" dma="+std::to_string(dma)+" rx="+std::to_string(rx)
-                        +" mem_commit="+std::to_string(commits));
-        }
-        if (execution_trace_enabled_)
-            execution_trace_.sample(
-                system_, physical_cycles_, enabled, nullptr);
-        if (mem_execution_trace_enabled_)
-            mem_execution_trace_.sample(system_, physical_cycles_, enabled);
-        datapath_performance_.sample(
-            system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
-        ++physical_cycles_;
-        advance_common_transport();
-        if(queue_control_protocol_) advance_queue_releases();
-        if (enabled) {
-            ++executed_cycles_;
-            ++advanced;
-            heldCycles = 0;
-        } else if (++heldCycles > kPhysicalWaitWatchdog) {
-            throw std::runtime_error("common barrier physical wait timed out before SRAM commit");
-        }
+    physical_cycles_=system_.cycle();
+    sinks.capture_mem_trace=mem_execution_trace_enabled_;
+    reload_drained_compute_imem();
+    // P advances on every tick; L advances only on an enabled dispatch.
+    const bool inputReady = !timed_program_load_ || inputs_ready();
+    if (inputReady) load_ready_weight_pages();
+    advance_common_transport();
+    if (timed_program_load_) {
+        auto& loader = c2c_system_->program_loader();
+        const bool initialPagesReady = std::all_of(common_transports_.begin(),
+            common_transports_.end(), [](const auto& page) {
+                return page.stop_cycle != 0 || page.committed;
+            });
+        const bool dependenciesReady = inputReady && (loader.started()
+            || (initialPagesReady && (!program_start_dependency_checker_
+                || program_start_dependency_checker_())));
+        loader.set_dependencies_ready(dependenciesReady);
+        loader.start();
+        system_.icu().set_program_issue_enabled(dependenciesReady
+            && (loader.started() || loader.ready_to_start()));
     }
+    tick_(sinks);
+    if (timed_program_load_) {
+        const auto& stats = program_load_statistics();
+        if (stats.frontend_ready)
+            instruction_prefill_cycles_ = *stats.frontend_ready - *stats.all_images_committed;
+    }
+    const bool enabled = timed_program_load_ || common_barrier_protocol_
+        ? system_.icu().compute_enabled() : true;
+    if(queue_control_protocol_ && (!timed_program_load_ || c2c_system_->program_loader().started())) sample_queue_progress();
+    if (common_barrier_protocol_ || queue_control_protocol_) {
+        const bool compute = !system_.common_compute_resources_drained();
+        bool dma = false, rx = false;
+        std::size_t commits = 0;
+        for (std::size_t h=0;h<hw::kHemispheres;++h) {
+            const auto side=static_cast<Hemisphere>(h);
+            commits += system_.mem_array(side).last_transport_commit_segments();
+            rx |= system_.stream_fabric(side).last_cycle_activity().c2c_staged_writes != 0;
+            if (c2c_system_) dma |= c2c_system_->dma(side).last_beat().has_value();
+        }
+        paging_overlap_.compute_active += compute;
+        paging_overlap_.compute_dma += compute && dma;
+        paging_overlap_.compute_rx += compute && rx;
+        paging_overlap_.compute_commit += compute && commits != 0;
+        paging_overlap_.commit_segments += commits;
+        if (execution_trace_enabled_ && (dma || rx || commits))
+            execution_trace_.record_interval(physical_cycles_-loaded_physical_cycle_,physical_cycles_-loaded_physical_cycle_+1,
+                "Paging.Activity", "compute="+std::to_string(compute)
+                    +" dma="+std::to_string(dma)+" rx="+std::to_string(rx)
+                    +" mem_commit="+std::to_string(commits));
+    }
+    if (execution_trace_enabled_)
+        execution_trace_.sample(
+            system_, physical_cycles_-loaded_physical_cycle_, enabled, nullptr);
+    if (mem_execution_trace_enabled_)
+        mem_execution_trace_.sample(system_, physical_cycles_-loaded_physical_cycle_, enabled);
+    datapath_performance_.sample(
+        system_, loaded_mxms_per_hemisphere_, loaded_vxm_alus_);
+    ++physical_cycles_;
+    advance_common_transport();
+    if(queue_control_protocol_ && (!timed_program_load_ || c2c_system_->program_loader().started())) advance_queue_releases();
+    if(enabled) ++executed_cycles_;
+    if(task_loaded_ && !direct_done_cycle_ && system_.can_load_program()
+        && (!c2c_system_ || c2c_system_->kernel_done())) direct_done_cycle_=system_.cycle();
+    return enabled;
+}
+void CModelRuntime::run_logical_cycles(std::size_t cycles,TspSliceSystem::LogSinks sinks)
+{
+    const auto count=cycles==0?loaded_max_cycle_+1:cycles;
+    if(!timed_program_load_) system_.icu().set_program_issue_enabled(true);
+    std::size_t held=0;
+    for(std::size_t advanced=0;advanced<count;) {
+        if(step_physical(sinks)) {++advanced;held=0;}
+        else if(++held>10'000'000) throw std::runtime_error("physical wait timed out");
+    }
+}
+bool CModelRuntime::kernel_done() const {
+    return task_loaded_ && (c2c_system_?c2c_system_->kernel_done():direct_done_cycle_.has_value());
+}
+std::optional<std::size_t> CModelRuntime::kernel_done_cycle() const {
+    return c2c_system_?c2c_system_->program_loader().statistics().kernel_done_cycle:direct_done_cycle_;
+}
+bool CModelRuntime::can_load_program() const {
+    return (!task_loaded_ || kernel_done()) && system_.can_load_program()
+        && (!c2c_system_ || c2c_system_->can_load_program());
+}
+bool CModelRuntime::run_until_complete(std::size_t max_physical_cycles) {
+    if(!task_loaded_) throw std::logic_error("no program loaded");
+    for(std::size_t n=0;n<max_physical_cycles && !kernel_done();++n) step_physical({});
+    return kernel_done();
 }
 
 void CModelRuntime::dispatch_icu_cycles(std::size_t cycles, std::ostream* log)

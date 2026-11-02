@@ -392,7 +392,7 @@ std::size_t physical_queue_index(QueueKind kind, std::size_t logical_index,
 
 bool is_all_macro_queue(const QueueProgram& queue)
 {
-    if (queue.commands.empty()) return false;
+    if (queue.commands.empty()) return queue.requires_raw_macro || queue.packed_macro_imem.has_value();
     InstructionKind expected;
     switch (queue.kind) {
     case QueueKind::Mem:
@@ -408,6 +408,7 @@ bool is_all_macro_queue(const QueueProgram& queue)
     case QueueKind::Vxm:
     case QueueKind::SxmTranspose:
     case QueueKind::SxmPermute:
+    default:
         return false;
     }
     return std::all_of(queue.commands.begin(), queue.commands.end(),
@@ -1511,55 +1512,96 @@ void load_transport_queue_programs_into_icu(
     }
 }
 
+namespace {
+void append_program_image(std::vector<ProgramQueueImage>& result, ProgramImage descriptor,
+    std::vector<std::uint8_t> bytes, std::uint64_t& source) {
+    descriptor.source_address=source;descriptor.byte_count=bytes.size();
+    const auto dmaBytes=descriptor.vector_count()*hw::kPhysicalVectorBytes;
+    if(source>UINT64_MAX-dmaBytes) throw std::overflow_error("program image DDR address overflow");
+    for(const auto& previous:result) if(previous.descriptor.key()==descriptor.key())
+        throw std::invalid_argument("duplicate program storage destination");
+    result.push_back({descriptor,std::move(bytes)});source+=dmaBytes;
+}
+void append_u32(std::vector<std::uint8_t>& bytes,std::uint32_t value) {
+    for(unsigned b=0;b<4;++b) bytes.push_back(static_cast<std::uint8_t>(value>>(8*b)));
+}
+}
 std::vector<ProgramQueueImage> prepare_program_images(
     const std::vector<QueueProgram>& queues, std::uint64_t source_base,
     std::size_t logical_mxms_per_hemisphere)
 {
+    // The direct writer is also the physicalizer. This off-device ICU holds
+    // only encoded words; it never ticks hardware or contributes simulated time.
+    auto encoded=std::make_unique<InstructionControlUnit>();
+    load_queue_programs_into_icu(queues,*encoded,logical_mxms_per_hemisphere,nullptr,false);
     std::vector<ProgramQueueImage> result;
-    for (const auto& queue : queues) {
-        if (queue.commands.empty() && !queue.packed_macro_imem) continue;
-        if ((queue.kind != QueueKind::Mem && queue.kind != QueueKind::MxmLoad
-                && queue.kind != QueueKind::MxmCompute && queue.kind != QueueKind::MxmDequant)
-            || !is_all_macro_queue(queue))
-            throw std::invalid_argument(std::string("timed program load has no physical codec for ")
-                + queue_kind_name(queue.kind) + " queue " + std::to_string(queue.index));
-        const auto index = physical_queue_index(queue.kind, queue.index,
-            logical_mxms_per_hemisphere);
-        validate_queue_index(queue.kind, index);
-        // Preserve main's relocation rule: validate the cached image, then
-        // re-encode the current commands so relocated operands cannot go stale.
-        if (queue.packed_macro_imem) {
-            if (queue.kind == QueueKind::Mem)
-                (void)decode_mem_macro_imem(*queue.packed_macro_imem, queue.index);
-            else
-                (void)decode_mxm_macro_imem(*queue.packed_macro_imem, queue.kind, queue.index);
-        }
-        auto packed = queue.kind == QueueKind::Mem
-            ? pack_mem_macro_imem(encode_mem_macro_bitstream(queue))
-            : pack_mxm_macro_imem(encode_mxm_macro_bitstream(queue));
-        const auto bits = queue.kind == QueueKind::Mem ? 96u : 128u;
-        if (packed.word_bits != bits || packed.bytes.empty()
-            || packed.bytes.size() % (bits / 8) != 0)
-            throw std::invalid_argument("invalid packed program image width or length");
-        ProgramImage descriptor{source_base,
-            static_cast<IcuMacroQueueKind>(queue.kind), index, packed.bytes.size()};
-        const auto dmaBytes = descriptor.vector_count() * hw::kPhysicalVectorBytes;
-        if (source_base > UINT64_MAX - dmaBytes)
-            throw std::overflow_error("program image DDR address overflow");
-        for (const auto& previous : result)
-            if (previous.descriptor.kind == descriptor.kind
-                && previous.descriptor.queue_index == descriptor.queue_index)
-                throw std::invalid_argument("duplicate program queue destination");
-        result.push_back({descriptor, std::move(packed.bytes)});
-        source_base += dmaBytes;
+    for(const auto& queue:queues) {
+        if(queue.commands.empty() && !queue.packed_macro_imem && !queue.requires_raw_macro) continue;
+        ProgramImage image;
+        image.kind=static_cast<IcuMacroQueueKind>(queue.kind);
+        image.queue_index=physical_queue_index(queue.kind,queue.index,logical_mxms_per_hemisphere);
+        encoded->visit_program_queue(image.kind,image.queue_index,false,[&](auto& target) {
+            using Q=std::decay_t<decltype(target)>;
+            image.mode=target.raw_macro_mode()?ftlpu::IcuQueueMode::Macro:ftlpu::IcuQueueMode::Native;
+            image.physical_word_bytes=Q::instruction_bits/8;
+            image.byte_count=target.imem_occupancy()*image.word_bytes();
+        });
+        encoded->validate_program_image(image);
+        append_program_image(result,image,encoded->read_program_image(image),source_base);
     }
+    return result;
+}
+std::vector<ProgramQueueImage> prepare_program_images(const BinaryProgram& program,std::uint64_t source_base,bool include_imem) {
+    auto result=include_imem?prepare_program_images(program.queues,source_base,program.hardware.mxms_per_hemisphere):std::vector<ProgramQueueImage>{};
+    if(!result.empty()) {const auto& last=result.back().descriptor;source_base=last.source_address+last.vector_count()*hw::kPhysicalVectorBytes;}
+    auto encoded=std::make_unique<InstructionControlUnit>();
+    if(include_imem) load_transport_queue_programs_into_icu(program.transport_queues,*encoded);
+    if(include_imem) for(const auto& queue:program.transport_queues) {
+        ProgramImage image{0,IcuMacroQueueKind::Mem,queue.index,0,ftlpu::IcuQueueMode::Native};
+        image.storage=ProgramStorage::TransportImem;
+        image.physical_word_bytes=InstructionControlUnit::MemIcu::instruction_bits/8;
+        image.byte_count=encoded->mem_transport_iq(queue.index).imem_occupancy()*image.word_bytes();
+        append_program_image(result,image,encoded->read_program_image(image),source_base);
+    }
+    if(program.queue_control_protocol) {
+        for(const auto& partition:program.queue_sync_plan.partitions) {
+            if(!partition.entries.empty() && partition.entries.front().native_binding) continue;
+            // Empty Native binding partitions are metadata, not a QCTL RAM.
+            if(partition.entries.empty() && !std::ranges::any_of(program.queues,[&](const auto& q){
+                return q.kind==partition.kind && q.index==partition.index && is_all_macro_queue(q);})) continue;
+            ProgramImage image{0,static_cast<IcuMacroQueueKind>(partition.kind),
+                physical_queue_index(partition.kind,partition.index,program.hardware.mxms_per_hemisphere)};
+            image.storage=ProgramStorage::Qctl;image.end_cycle=partition.end_cycle;image.generation=1;
+            std::vector<std::uint8_t> bytes;
+            for(const auto& c:partition.entries) {append_u32(bytes,c.local_cycle);append_u32(bytes,static_cast<std::uint32_t>(c.opcode));append_u32(bytes,c.operand);}
+            append_program_image(result,image,std::move(bytes),source_base);
+        }
+    } else if(program.common_barrier_protocol) {
+        ProgramImage image;image.storage=ProgramStorage::Barr;image.generation=1;
+        std::vector<std::uint8_t> bytes;
+        for(const auto& b:program.barriers) {append_u32(bytes,b.stop_cycle);append_u32(bytes,b.event_id);}
+        append_program_image(result,image,std::move(bytes),source_base);
+    }
+    if(program.queue_control_protocol || program.common_barrier_protocol) {
+        ProgramImage image;image.generation=1;image.storage=program.queue_control_protocol?ProgramStorage::QueueEvents:ProgramStorage::BarrierEvents;
+        std::vector<std::uint8_t> bytes;
+        if(program.queue_control_protocol) for(const auto& e:program.queue_sync_plan.events) {
+            append_u32(bytes,e.event_id);append_u32(bytes,static_cast<std::uint32_t>(e.source));
+            append_u32(bytes,static_cast<std::uint32_t>(e.page_use_indices.size()));for(auto instance:e.page_use_indices)append_u32(bytes,instance);
+        } else for(const auto& e:program.barrier_events) {
+            append_u32(bytes,e.event_id);append_u32(bytes,static_cast<std::uint32_t>(e.page_use_indices.size()));
+            for(auto instance:e.page_use_indices)append_u32(bytes,instance);
+        }
+        append_program_image(result,image,std::move(bytes),source_base);
+    }
+    for(const auto& image:result) encoded->validate_program_image(image.descriptor);
     return result;
 }
 
 std::size_t load_queue_programs_into_icu(
     const std::vector<QueueProgram>& queues,
     InstructionControlUnit& icu,
-    std::size_t logical_mxms_per_hemisphere, const BinaryProgram* control_program)
+    std::size_t logical_mxms_per_hemisphere, const BinaryProgram* control_program, bool prime_frontends)
 {
     validate_fu_3d_context_capacity(queues);
     for (const auto& source_queue : queues) {
@@ -2155,7 +2197,7 @@ std::size_t load_queue_programs_into_icu(
         }
         for(const auto& q:control_program->transport_queues)icu.mem_transport_iq(q.index).launch();
     }
-    return icu.prime_raw_macro_frontends();
+    return prime_frontends ? icu.prime_raw_macro_frontends() : 0;
 }
 
 void IcuProgram::check_mem_column(std::size_t column) const

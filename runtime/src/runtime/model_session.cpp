@@ -1007,7 +1007,7 @@ void ModelSession::upload_binding_through_c2c(
     executable_ddr4_address_ += bytes;
   }
 
-  c2c_system_->reset_execution_state();
+  c2c_system_->clear_completed_program();
   weight_pager_->enqueue(page);
   pre_execution_icu_programs_.push_back(
       weight_pager_->last_enqueued_program());
@@ -1127,7 +1127,7 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
   std::size_t transferredVectors = 0;
   while (cursor[0] < byHemisphere[0].size() ||
          cursor[1] < byHemisphere[1].size()) {
-    c2c_system_->reset_execution_state();
+    c2c_system_->clear_completed_program();
     struct BatchSegment {
       std::size_t image_index{0};
       std::uint64_t ddr_address{0};
@@ -1603,7 +1603,7 @@ void ModelSession::execute_executable_weight_preloads(const BinaryProgram& progr
             InstructionControlUnit::mem_queue(segment.hemisphere, segment.slice, segment.bank),
             segment.base_row, segment.vector_count, ownerBindings, pageRelease, pageLoads);
     }
-    c2c_system_->reset_execution_state();
+    c2c_system_->clear_completed_program();
     weight_pager_->enqueue(transfer.page);
     pre_execution_icu_programs_.push_back(
         weight_pager_->last_enqueued_program());
@@ -2245,7 +2245,7 @@ void ModelSession::ensure_weight_page(std::uint32_t page_index) {
     // Standalone C2C transactions, including resident uploads during session
     // load, leave their ICU programs launched. Start each unscheduled model
     // page from a fresh execution context; SRAM and DDR contents survive.
-    c2c_system_->reset_execution_state();
+    c2c_system_->clear_completed_program();
     start_weight_page(page_index);
   }
   const std::size_t waitCycles = wait_for_standalone_weight_page(
@@ -2642,6 +2642,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     runtimeProgram=std::move(loadedImage);
   }
   runtime_.load(runtimeProgram, weight_pager_ == nullptr);
+  const auto invocationPhysicalBegin=runtime_.physical_cycles();
   if(runtimeProgram.queue_control_protocol) last_linked_program_=runtimeProgram;
   if(runtime_.queue_control_protocol()) {
     for(auto& transfer:executable_weight_transfers_) {
@@ -2780,7 +2781,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
       if (transfer.launch_event_tag != 0
           && transfer.actual_ready_cycle.has_value())
         verify_c2c_weight_page_residency(*c2c_system_, transfer.page);
-  const std::size_t invocationPhysicalCycles = runtime_.physical_cycles();
+  const std::size_t invocationPhysicalCycles = runtime_.physical_cycles()-invocationPhysicalBegin;
   if (std::getenv("FTLPU_SESSION_BENCHMARK") != nullptr) {
     std::cout << "Session benchmark: invocation=" << index
               << ", logical_cycles=" << runtime_.logical_cycles()
@@ -2814,9 +2815,11 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   stats_.transport_commit_segments += overlap.commit_segments;
   if (program.common_barrier_protocol)
     stats_.weight_page_runtime_wait_cycles +=
-        runtime_.physical_cycles() - runtime_.logical_cycles();
+        invocationPhysicalCycles - runtime_.logical_cycles();
   const std::size_t lookaheadBoundaryCycles =
       settle_executable_weight_lookahead();
+  if(std::getenv("FTLPU_SESSION_STOP_CYCLE")==nullptr && !runtime_.run_until_complete(10'000'000))
+    throw std::runtime_error("kernel did not safely drain after invocation and lookahead transport");
   if (c2c_system_ != nullptr)
     for (std::size_t queue = 0;
          queue < InstructionControlUnit::kMemQueues; ++queue)

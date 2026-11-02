@@ -49,6 +49,11 @@ public:
     // Startup-only dependency gate; common barriers still govern page transitions.
     void set_program_start_dependency_checker(std::function<bool()> checker)
     { program_start_dependency_checker_ = std::move(checker); }
+    bool kernel_done() const;
+    bool can_load_program() const;
+    // False means the physical budget expired. The task remains resumable.
+    bool run_until_complete(std::size_t max_physical_cycles);
+    std::optional<std::size_t> kernel_done_cycle() const;
     bool all_images_committed() const;
     bool ready_to_start() const;
     const ProgramLoadStatistics& program_load_statistics() const;
@@ -149,6 +154,7 @@ private:
         bool launched{false}, committed{false};
     };
     std::vector<CommonTransportPage> common_transports_{};
+    bool step_physical(TspSliceSystem::LogSinks sinks);
     void run_logical_cycles(std::size_t cycles,
         TspSliceSystem::LogSinks sinks);
 
@@ -169,8 +175,11 @@ private:
     std::size_t next_weight_page_use_{0};
     std::size_t executed_cycles_{0};
     std::size_t physical_cycles_{0};
+    std::size_t loaded_physical_cycle_{0};
     PagingOverlapStatistics paging_overlap_{};
     std::size_t instruction_prefill_cycles_{0};
+    bool task_loaded_{false};
+    std::optional<std::size_t> direct_done_cycle_{};
     bool timed_program_load_{false};
     std::function<bool()> program_start_dependency_checker_{};
     std::unordered_set<std::size_t> uploaded_inputs_{};

@@ -938,9 +938,11 @@ struct ProgramQueueImage {
 std::vector<ProgramQueueImage> prepare_program_images(
     const std::vector<QueueProgram>& queues, std::uint64_t source_base,
     std::size_t logical_mxms_per_hemisphere = hw::kMxmsPerHemisphere);
+std::vector<ProgramQueueImage> prepare_program_images(
+    const BinaryProgram& program, std::uint64_t source_base, bool include_imem = true);
 std::size_t load_queue_programs_into_icu(const std::vector<QueueProgram>& queues,
     InstructionControlUnit& icu,
     std::size_t logical_mxms_per_hemisphere = hw::kMxmsPerHemisphere,
-    const BinaryProgram* control_program = nullptr);
+    const BinaryProgram* control_program = nullptr, bool prime_frontends = true);
 
 } // namespace ftlpu::software::runtime
