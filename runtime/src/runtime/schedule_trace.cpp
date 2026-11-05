@@ -91,6 +91,10 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
 {
     const auto east = queue.index < InstructionControlUnit::kMemQueuesPerHemisphere;
     switch (queue.kind) {
+    case QueueKind::Routing: {
+        const auto instruction=decode_routing_instruction({{command.words[0],command.words[1],command.words[2]}});
+        return {"RCU.Command",std::string(routing_opcode_name(instruction.opcode))+" descriptor="+std::to_string(instruction.descriptor)+" instance="+std::to_string(instruction.completion)};
+    }
     case QueueKind::Mem: {
         if (induction_target != IcuInductionTarget::None
             && induction_target != IcuInductionTarget::MemAddress)

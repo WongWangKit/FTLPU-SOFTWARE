@@ -411,6 +411,17 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
                         "sxm_permute", "Permute");
                 break;
             }
+            case QueueKind::Routing: {
+                const auto& queue=icu.routing_iq();
+                if(recordEventWait(queue,"queue=routing index=0"))break;
+                if(const auto* instruction=last_issued(queue))
+                    record("RCU.Command",with_issue_pc(std::string(routing_opcode_name(instruction->opcode))+" descriptor="+std::to_string(instruction->descriptor)+" instance="+std::to_string(instruction->completion),queue));
+                if(system.routing().busy() && !system.routing().trace().empty()) {
+                    const auto& execution=system.routing().trace().back();
+                    record("RCU.Execute",std::string(routing_opcode_name(execution.opcode))+" instance="+std::to_string(execution.instance));
+                }
+                break;
+            }
             case QueueKind::C2cDma:
             case QueueKind::C2cTx:
             case QueueKind::C2cRx:

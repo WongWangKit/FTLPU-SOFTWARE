@@ -616,3 +616,10 @@ target_compile_definitions(compiled_program_link_check PRIVATE FTLPU_FILE_RUNNER
 add_executable(binary_queue_control_test tests/runtime/binary_queue_control_test.cpp)
 target_link_libraries(binary_queue_control_test PRIVATE ftlpu_software)
 add_test(NAME binary_queue_control_test COMMAND $<TARGET_FILE:binary_queue_control_test>)
+
+add_executable(routing_runtime_test tests/runtime/routing_runtime_test.cpp)
+target_link_libraries(routing_runtime_test PRIVATE ftlpu_software)
+add_test(NAME routing_runtime_test COMMAND routing_runtime_test)
+add_executable(moe_ffn_demo examples/moe_ffn_demo.cpp)
+target_link_libraries(moe_ffn_demo PRIVATE ftlpu_software)
+add_test(NAME moe_ffn_demo COMMAND moe_ffn_demo "${CMAKE_CURRENT_BINARY_DIR}/moe_ffn_demo_output")

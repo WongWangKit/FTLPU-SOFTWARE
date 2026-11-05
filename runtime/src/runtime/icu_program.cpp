@@ -211,6 +211,7 @@ std::string queue_name(QueueKind kind, std::size_t index)
 
 void validate_queue_index(QueueKind kind, std::size_t index)
 {
+    if(kind==QueueKind::Routing && index)throw std::out_of_range("one physical Routing queue");
     if (kind == QueueKind::Mem && index >= InstructionControlUnit::kMemQueues) {
         throw std::out_of_range(
             "binary MEM queue index is outside the CModel ICU range");
@@ -304,6 +305,7 @@ bool begins_raw_3d_packet(
 IcuLocation queue_location(QueueKind kind, std::size_t queueIndex)
 {
     switch (kind) {
+    case QueueKind::Routing:return IcuLocation::Routing();
     case QueueKind::Mem: {
         const auto hemisphere = static_cast<Hemisphere>(queueIndex
             / InstructionControlUnit::kMemQueuesPerHemisphere);
@@ -1214,6 +1216,7 @@ IcuLoop3D decode_fu_3d_raw_packet_loop(
 const char* queue_kind_name(QueueKind kind)
 {
     switch (kind) {
+    case QueueKind::Routing:return "routing";
     case QueueKind::Mem:
         return "mem";
     case QueueKind::MxmLoad:
@@ -1563,6 +1566,11 @@ std::vector<ProgramQueueImage> prepare_program_images(const BinaryProgram& progr
         image.byte_count=encoded->mem_transport_iq(queue.index).imem_occupancy()*image.word_bytes();
         append_program_image(result,image,encoded->read_program_image(image),source_base);
     }
+    if(!program.routing_descriptors.empty()) {
+        ProgramImage image;image.storage=ProgramStorage::RoutingDescriptors;image.physical_word_bytes=4;
+        std::vector<std::uint8_t> bytes;for(auto w:encode_routing_descriptors(program.routing_descriptors))append_u32(bytes,w);
+        append_program_image(result,image,std::move(bytes),source_base);
+    }
     if(program.queue_control_protocol) {
         for(const auto& partition:program.queue_sync_plan.partitions) {
             if(!partition.entries.empty() && partition.entries.front().native_binding) continue;
@@ -1622,6 +1630,11 @@ std::size_t load_queue_programs_into_icu(
         for (std::size_t command_index = 0;
              command_index < queue.commands.size(); ++command_index) {
             const auto& command = queue.commands[command_index];
+            if(command.instruction_kind==InstructionKind::Routing) {
+                if(queue.kind!=QueueKind::Routing || command.word_count!=3 || !command.extension_words.empty())throw std::invalid_argument("invalid Routing queue command");
+                icu.routing_iq().push_instruction(decode_routing_instruction({{command.words[0],command.words[1],command.words[2]}}));
+                continue;
+            }
             if (command.instruction_kind
                     == InstructionKind::C2cEndpoint) {
                 if (queue.kind != QueueKind::C2cTx
@@ -1958,6 +1971,7 @@ std::size_t load_queue_programs_into_icu(
             if (opcode == isa::IcuCommandOpcode::Nop) {
                 const auto cycles = isa::decode_icu_nop_cycles(command.command);
                 switch (queue.kind) {
+                case QueueKind::Routing:icu.routing_iq().push_nop(cycles);break;
                 case QueueKind::Mem:
                     icu.enqueue_mem_nop(queue_index, cycles);
                     break;
@@ -2199,6 +2213,7 @@ std::size_t load_queue_programs_into_icu(
             case QueueKind::C2cDma: icu.c2c_dma_iq(side).launch();break;
             case QueueKind::C2cTx: icu.c2c_tx_iq(side).launch();break;
             case QueueKind::C2cRx: icu.c2c_rx_iq(side).launch();break;
+            case QueueKind::Routing:icu.routing_iq().launch();break;
             }
         }
         for(const auto& q:control_program->transport_queues)icu.mem_transport_iq(q.index).launch();

@@ -29,6 +29,7 @@ enum class QueueKind : std::uint16_t {
     C2cDma = 7,
     C2cTx = 8,
     C2cRx = 9,
+    Routing = 10,
 };
 
 enum class InstructionKind : std::uint16_t {
@@ -40,6 +41,7 @@ enum class InstructionKind : std::uint16_t {
     MxmDequant = 5,
     C2cEndpoint = 6,
     C2cDma = 7,
+    Routing = 8,
 };
 
 struct QueueCommand {

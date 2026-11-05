@@ -61,6 +61,8 @@ void shared_pool_container() {
     auto old=encode(legacy);
     std::size_t fields=0;legacy.hardware.visit([&](auto){++fields;});
     old.erase(22+legacy.target_name.size()+(fields-3)*4,12);
+    const auto routing=old.find("RCU1");require(routing!=std::string::npos,"missing v41 Routing section");
+    old.erase(routing-8,16); // Remove the v41-only empty capability section.
     put(old,8,39);all_readers(old,true); // v39 layout and ABI stay unchanged.
 
     BinaryProgram native;native.queue_control_protocol=true;native.max_cycle=64;

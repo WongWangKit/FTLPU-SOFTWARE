@@ -10,6 +10,14 @@ Pipeline Viewer 是一个无外部依赖的 Canvas 波形工作台，可以查�
 浏览器直接打开 `index.html` 后载入任意一种 CSV。性能分析和流水验证应优先使用
 第一种实际运行 trace。
 
+## MoE 逐周期与指令级视图
+
+`cycles.html` 支持打开 MoE 示例输出的 `instructions.cycles.csv` / JSON，
+逐周期查看 RCU、MXM、VXM、DMA、MEM、ICU 的发射、内部执行、等待及数据提交。
+路由面板按实际发生顺序回放分数、Top-K、计数和分段索引。
+运行 `tools/render_moe_cycles.py <示例输出目录>` 可生成内嵌数据的独立页面。
+记录范围、精度边界及复现方法见 [MoE 周期视图说明](../../docs/moe_cycle_viewer.zh-CN.md)。
+
 ## MEM 每周期 Viewer
 
 `mem.html` 是 MEM 专用的动态查看器。它按 `hemisphere / slice / bank /

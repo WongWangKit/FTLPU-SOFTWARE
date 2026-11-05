@@ -1,6 +1,7 @@
 #include "ftlpu/software/runtime/queue_phase_release.hpp"
 #include "ftlpu/software/runtime/c2c_weight_pager.hpp"
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
+#include "ftlpu/software/runtime/expert_template_validation.hpp"
 #include "ftlpu/software/runtime/imem_capacity.hpp"
 
 #include "ftlpu/system/c2c_dma_system.hpp"
@@ -540,7 +541,16 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
     CModelRuntime prepared(system_);
     prepared.configure_common_transport(program);
 
+    if(program.hardware.routing_isa_version>5 || ((!program.routing_descriptors.empty() || std::ranges::any_of(program.queues,[](const auto& q){return q.kind==QueueKind::Routing;})) && !program.hardware.routing_isa_version))throw std::invalid_argument("Routing program capability mismatch");
+    validate_routing_descriptor_references(program.routing_descriptors,program.hardware.routing_isa_version);
+    validate_expert_template_program(program);
+    if(std::ranges::any_of(program.routing_descriptors,[](const auto& d){return d.opcode==RoutingOpcode::WeightTable;}))
+        for(const auto& q:program.queues)if(q.kind==QueueKind::C2cDma || q.kind==QueueKind::C2cRx || q.kind==QueueKind::C2cTx)
+            throw std::invalid_argument("indirect expert loading reserves ordinary C2C queues");
+    if(program.hardware.routing_isa_version && !system_.hardware_configuration().routing.enabled)throw std::invalid_argument("Routing is disabled in this device configuration");
+    for(const auto& d:program.routing_descriptors)RoutingControlUnit::validate_descriptor(d,program.hardware.sram_depth_rows);
     SystemHardwareConfiguration hardware;
+    hardware.routing=system_.hardware_configuration().routing;
     hardware.sram_depth_rows = program.hardware.sram_depth_rows;
     hardware.mxms_per_hemisphere = program.hardware.mxms_per_hemisphere;
     hardware.mxm_weight_buffers = program.hardware.mxm_weight_buffers;
@@ -1958,7 +1968,7 @@ void CModelRuntime::configure_queue_transport(const BinaryProgram& program)
     const auto links=validate_common_transport_packet_links(program);
     std::map<std::uint32_t,std::size_t> owners;
     for(const auto& event:program.queue_sync_plan.events)
-        for(const auto instance:event.page_use_indices) {
+        if(event.source==QueueEventSource::PageCommit)for(const auto instance:event.page_use_indices) {
             const auto launch=program.weight_page_uses.at(instance).transport_launch_event_id;
             const auto [owner,inserted]=owners.emplace(launch,common_transports_.size());
             if(inserted) common_transports_.push_back(CommonTransportPage{launch,0});
@@ -2228,6 +2238,7 @@ void CModelRuntime::sample_queue_progress()
         case QueueKind::C2cDma: sample(icu.c2c_dma_iq(static_cast<Hemisphere>(i)));break;
         case QueueKind::C2cTx: sample(icu.c2c_tx_iq(static_cast<Hemisphere>(i)));break;
         case QueueKind::C2cRx: sample(icu.c2c_rx_iq(static_cast<Hemisphere>(i)));break;
+        case QueueKind::Routing:sample(icu.routing_iq());break;
         }
     }
 }

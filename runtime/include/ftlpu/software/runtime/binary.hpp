@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 40;
+inline constexpr std::uint32_t kBinaryFormatVersion = 41;
 inline constexpr std::uint32_t kBinaryCommonBarrierMaxCompletionInstances = 65535;
 
 enum class BindingAccess : std::uint16_t {
@@ -242,7 +242,7 @@ struct BinaryQueueControlPartition {
     std::vector<BinaryQueueControl> entries{};
     std::uint32_t end_cycle{0}; // Includes original trailing NOPs, excludes control slots.
 };
-enum class QueueEventSource : std::uint16_t { External = 1, PageCommit = 2 };
+enum class QueueEventSource : std::uint16_t { External = 1, PageCommit = 2, Routing = 3 };
 struct BinaryQueueControlEvent {
     std::uint32_t event_id{0};
     QueueEventSource source{QueueEventSource::External};
@@ -263,6 +263,7 @@ struct BinaryQueueLinkSource {
 };
 
 struct BinaryProgram {
+    std::vector<RoutingDescriptor> routing_descriptors{};
     std::string target_name{std::string(kLpu32StreamTargetName)};
     std::uint64_t target_abi{kLpu32StreamTargetAbi};
     ExecutableHardwareConfig hardware{};
@@ -296,6 +297,7 @@ struct BinaryProgram {
 // Checked conversion for linker arithmetic; never truncate a logical cycle.
 BinaryBarrier make_binary_barrier(std::uint64_t stop_cycle, std::uint32_t event_id);
 void validate_binary_barriers(const BinaryProgram& program);
+void validate_routing_program(const BinaryProgram& program, bool validate_commands = true);
 void validate_queue_sync_plan(const BinaryProgram& program, bool validate_bindings = true);
 
 void write_binary_program(const BinaryProgram& program, const std::filesystem::path& path);

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoE · 逐周期指令视图</title><link rel="stylesheet" href="cycle_style.css"></head>
+<body><main>
+<script>window.addEventListener('error',function(e){var status=document.getElementById('loadStatus');if(status)status.textContent='交互视图加载失败：'+e.message;});</script>
+<header><div><div class="eyebrow">LPU CMODEL · ACTUAL EXECUTION</div><h1>逐周期 · 指令与路由</h1><p id="summary">打开 instructions.cycles.csv，或使用已封装的数据页面</p></div>
+<nav><label class="button">打开周期 CSV / JSON<input id="file" type="file" accept=".csv,.json" hidden></label><a href="index.html">全程 Pipeline</a><a href="mem.html">MEM 明细</a></nav></header>
+<p id="loadStatus" role="status">交互视图尚未启动；可打开周期 CSV / JSON。若封装页面一直停在此处，请在 Edge / Chrome 中打开此 HTML 文件。</p><noscript><p>此预览未执行 JavaScript；下方静态图可查看全流程，逐周期交互需在浏览器中打开。</p></noscript>
+<!--STATIC_OVERVIEW-->
+<section class="wave"><div class="section-title"><h2>MoE 全流程总览</h2><span>点击总览定位周期；下方展开该周期的实际指令与活动</span></div><canvas id="overview" height="350"></canvas><p class="note">程序与描述符装载 → Router 打分 → Top-K / PLAN → 专家输入 Gather 与权重搬运 → 专家 Gate / Up / SwiGLU / Down → 加权回并。阶段区间包含内部等待，具体工作状态以下方逐周期记录为准。</p></section>
+<section class="controls"><button id="first">⏮</button><button id="prev">上一周期</button><button id="play">播放</button><button id="next">下一周期</button>
+<label>物理 cycle <input id="cycle" type="number" value="0" min="0"></label><span id="max"></span><input id="slider" type="range" min="0" value="0">
+<label>窗口 <select id="span"><option>64</option><option selected>128</option><option>256</option><option>512</option></select> cycles</label></section>
+<section class="jumps"><span>跳转实际事件：</span><button data-jump="load">程序装载</button><button data-jump="router">Router 打分</button><button data-jump="select">Top-K 比较</button><button data-jump="plan">计数 / PLAN</button><button data-jump="input">专家输入 Gather</button><button data-jump="weights">专家权重 DMA</button><button data-jump="expert">专家 FFN</button><button data-jump="combine">加权回并</button></section>
+<section id="badges" class="badges"></section>
+<section class="wave"><div class="section-title"><h2>功能单元活动</h2><span>实色：发射／执行／提交　浅色：等待／在途／控制装载　空白：无已记录活动</span></div><canvas id="wave" height="240"></canvas></section>
+<div class="columns"><section class="events"><div class="section-title"><h2 id="cycleTitle">本周期</h2><div><select id="unit"><option value="ALL">全部功能单元</option><option>RCU</option><option>MXM</option><option>VXM</option><option>DMA</option><option>MEM</option><option>ICU</option></select> <label><input id="issues" type="checkbox">只看指令发射</label></div></div>
+<div class="table-wrap"><table><thead><tr><th>单元／资源</th><th>阶段</th><th>指令／操作</th><th>PC</th><th>关键字段</th></tr></thead><tbody id="events"></tbody></table></div>
+<p class="note">ISA 指令发射与内部步骤分列。执行流水不伪造源 PC；VXM 数据行为记录各 tile 的 lane 0，指令广播到向量 lane。</p><pre id="detail">点击记录查看完整编码、地址、比较输入或操作数。</pre></section>
+<section class="routing"><h2>路由结果随周期产生</h2><p class="note">分数仅在 RCU 实际读到后显示；未产生的数据保持空白。</p><div class="table-wrap"><table><thead id="scoresHead"></thead><tbody id="scores"></tbody></table></div>
+<div id="comparison" class="comparison">尚未执行比较</div><h3>专家 token 计数与分段</h3><table><thead><tr><th>专家</th><th>count</th><th>offset</th></tr></thead><tbody id="counts"></tbody></table>
+<h3>反向索引：token / slot → assignment 行</h3><div id="inverse" class="inverse"></div></section></div>
+<footer>所有时间均为物理周期。包含当前 CModel 的命令、控制步骤及数据提交；不代表未建模的 RTL 门级行为。ICU 行记录程序存储写入，各队列指令发射归属目标单元。SXM 在此样例中未使用。</footer>
+</main><script src="cycle_model.js"></script><script src="cycle_app.js"></script></body></html>

@@ -11,6 +11,7 @@ std::pair<std::uint32_t, std::uint32_t>
 geometry_for(QueueKind kind, const ExecutableHardwareConfig& hardware)
 {
     switch (kind) {
+    case QueueKind::Routing:return {96,256};
     case QueueKind::Mem:
         return {hardware.icu_mem_instruction_bits, hardware.icu_mem_imem_depth};
     case QueueKind::MxmLoad:
@@ -51,6 +52,7 @@ std::size_t fu_3d_packet_words(QueueKind kind)
         return isa::EncodedSxmPermuteIcuRun2DPacket::kWordCount;
     case QueueKind::C2cDma:
     case QueueKind::C2cTx:
+    case QueueKind::Routing:
     case QueueKind::C2cRx:
         break;
     }
@@ -408,6 +410,7 @@ std::size_t macro_context_capacity_for(QueueKind kind,
     case QueueKind::SxmPermute:
     case QueueKind::C2cDma:
     case QueueKind::C2cTx:
+    case QueueKind::Routing:
     case QueueKind::C2cRx:
         return 0;
     }
@@ -429,6 +432,7 @@ std::uint32_t macro_context_bits_for(QueueKind kind,
     case QueueKind::SxmPermute:
     case QueueKind::C2cDma:
     case QueueKind::C2cTx:
+    case QueueKind::Routing:
     case QueueKind::C2cRx:
         return 0;
     }
@@ -450,6 +454,7 @@ std::size_t fu_3d_context_capacity_for(QueueKind kind)
         return hw::kIcuSxmRun2DContextDepth;
     case QueueKind::C2cDma:
     case QueueKind::C2cTx:
+    case QueueKind::Routing:
     case QueueKind::C2cRx:
         return 0;
     }
@@ -477,6 +482,7 @@ std::uint32_t fu_3d_context_bits_for(QueueKind kind)
             hw::kIcuSxmPermuteRun2DContextBits);
     case QueueKind::C2cDma:
     case QueueKind::C2cTx:
+    case QueueKind::Routing:
     case QueueKind::C2cRx:
         return 0;
     }

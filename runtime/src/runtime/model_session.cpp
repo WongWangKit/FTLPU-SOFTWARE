@@ -815,6 +815,8 @@ bool linked_queue_done(InstructionControlUnit &icu,
   case QueueKind::C2cRx:
     return icu.c2c_rx_iq(
         static_cast<Hemisphere>(queue.index)).done();
+  case QueueKind::Routing:
+    return icu.routing_iq().done();
   }
   throw std::logic_error("unknown linked ICU queue kind");
 }

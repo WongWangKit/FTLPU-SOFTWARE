@@ -14,6 +14,8 @@ inline constexpr std::string_view kLpu32StreamTargetName = hw::kTargetName;
 // fields describe the instruction and transport geometry; capacity fields may
 // select a logical subset of a larger CModel instance.
 struct ExecutableHardwareConfig {
+    // v41 optional RCU capability, serialized in the routing section.
+    std::uint32_t routing_isa_version{0};
     std::uint32_t hemispheres{hw::kHemispheres};
     std::uint32_t slices_per_hemisphere{hw::kMemSliceColumns};
     std::uint32_t banks_per_slice{hw::kMemBanksPerSlice};
@@ -409,6 +411,7 @@ constexpr std::uint64_t executable_target_abi(
         hash.add(config.queue_control_pool_capacity);
         hash.add(config.queue_control_pool_read_ii);
     }
+    if(config.routing_isa_version){hash.add(0x31554352u);hash.add(config.routing_isa_version);}
     return hash.value();
 }
 

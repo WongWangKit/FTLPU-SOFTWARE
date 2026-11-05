@@ -1,6 +1,8 @@
 // Keep serialization rebuilt when BinaryProgram or BinaryBinding ABI evolves.
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/routing/control_unit.hpp"
 #include "ftlpu/software/runtime/macro_bitstream.hpp"
+#include "ftlpu/software/runtime/expert_template_validation.hpp"
 
 #include <algorithm>
 #include <array>
@@ -110,6 +112,7 @@ void write_le(std::ostream& os, T value)
 InstructionKind instruction_kind_for_queue(QueueKind kind)
 {
     switch (kind) {
+    case QueueKind::Routing:return InstructionKind::Routing;
     case QueueKind::Mem:
         return InstructionKind::Mem;
     case QueueKind::MxmLoad:
@@ -372,6 +375,7 @@ void write_compact_queue_command(
 
 QueueEncodingMode queue_encoding_mode(const QueueProgram& queue, bool rawMacroSupported)
 {
+    if(queue.kind==QueueKind::Routing){if(queue.requires_raw_macro || queue.packed_macro_imem)throw std::invalid_argument("Routing queue is Native only");return QueueEncodingMode::Native;}
     const auto macroCount = std::count_if(queue.commands.begin(),
         queue.commands.end(), [](const QueueCommand& command) {
             return is_macro_schedule_command(command);
@@ -405,6 +409,18 @@ QueueEncodingMode queue_encoding_mode(const QueueProgram& queue, bool rawMacroSu
 void write_native_queue_command(std::ostream& os, QueueKind queueKind,
     const QueueCommand& command)
 {
+    if(queueKind==QueueKind::Routing) {
+        if(command.instruction_kind==InstructionKind::Routing){
+            if(command.word_count!=3 || !command.extension_words.empty() || command.command!=0)throw std::runtime_error("invalid Routing instruction record");
+            (void)decode_routing_instruction({{command.words[0],command.words[1],command.words[2]}});
+            for(std::size_t j=0;j<3;++j)write_le<std::uint32_t>(os,command.words[j]);return;
+        }
+        auto c=command;
+        if(c.instruction_kind==InstructionKind::None && c.word_count==0 && isa::decode_icu_command_opcode(c.command)==isa::IcuCommandOpcode::Nop)
+            c=encode_icu_control_raw_word(IcuControlInstruction::Nop(isa::decode_icu_nop_cycles(c.command)));
+        (void)decode_icu_control_raw_word(c);
+        for(std::size_t j=0;j<3;++j)write_le<std::uint32_t>(os,c.words[j]);return;
+    }
     if (is_macro_schedule_command(command))
         throw std::runtime_error(
             "native FTLPU queue cannot contain a macro record");
@@ -1060,6 +1076,11 @@ IcuMacroSchedule read_macro_schedule_payload(Reader& reader)
 template <typename Reader>
 QueueCommand read_native_queue_command(Reader& reader, QueueKind queueKind)
 {
+    if(queueKind==QueueKind::Routing) {
+        std::array<std::uint32_t,4> words{};for(std::size_t j=0;j<3;++j)words[j]=read_value<std::uint32_t>(reader);
+        if((words[0]&3u)==0){(void)decode_routing_instruction({{words[0],words[1],words[2]}});return {0,InstructionKind::Routing,3,words};}
+        QueueCommand c{words[0],InstructionKind::None,3,words};(void)decode_icu_control_raw_word(c);return c;
+    }
     const auto prefix = read_value<std::uint32_t>(reader);
     const auto opcode = isa::decode_icu_command_opcode(prefix);
     if (opcode == isa::IcuCommandOpcode::Instruction) {
@@ -1129,6 +1150,7 @@ std::vector<std::uint8_t> read_macro_width_bitmap(
 template <typename Reader>
 void skip_native_queue_command(Reader& reader, QueueKind queueKind)
 {
+    if(queueKind==QueueKind::Routing){skip_value(reader,12);return;}
     const auto prefix = read_value<std::uint32_t>(reader);
     const auto opcode = isa::decode_icu_command_opcode(prefix);
     if (opcode == isa::IcuCommandOpcode::Instruction) {
@@ -1482,6 +1504,17 @@ void write_queue_link_source(std::ostream& os,const BinaryProgram& program)
     }
 }
 
+template<class Reader> void read_routing_section(Reader& reader,BinaryProgram& program) {
+    program.hardware.routing_isa_version=read_value<std::uint32_t>(reader);
+    const auto n=read_value<std::uint32_t>(reader);
+    if(program.hardware.routing_isa_version>5 || n>4096)throw std::runtime_error("unsupported Routing section");
+    std::vector<std::uint32_t> words;for(std::uint32_t j=0;j<n;++j)words.push_back(read_value<std::uint32_t>(reader));
+    program.routing_descriptors=decode_routing_descriptors(words);
+    validate_routing_descriptor_references(program.routing_descriptors,program.hardware.routing_isa_version);
+    if(!program.routing_descriptors.empty() && !program.hardware.routing_isa_version)throw std::runtime_error("Routing descriptors lack capability");
+    for(const auto& d:program.routing_descriptors)RoutingControlUnit::validate_descriptor(d,program.hardware.sram_depth_rows);
+}
+
 struct BinaryHeader {
     BinaryProgram program;
     std::uint32_t version;
@@ -1661,7 +1694,7 @@ BinaryHeader read_header(ByteReader& reader)
         program.stream_release_cycles.push_back(reader.read<std::uint64_t>());
     if (version >= 37)
         read_barrier_sections(reader, program, barrier_event_count);
-    if (version >= 39) { read_queue_controls(reader, program);read_queue_link_source(reader,program); validate_queue_sync_plan(program, false); }
+    if (version >= 39) { read_queue_controls(reader, program);read_queue_link_source(reader,program); if(version>=41)read_routing_section(reader,program); validate_queue_sync_plan(program, false); }
     return {std::move(program), version, queue_count, relocation_count,
         address_relocation_count, weight_page_use_count,
         stream_release_count, transport_queue_count};
@@ -1845,8 +1878,48 @@ void validate_binary_barriers(const BinaryProgram& program)
     }
 }
 
+void validate_routing_program(const BinaryProgram& program, bool commands)
+{
+    validate_routing_descriptor_references(program.routing_descriptors,program.hardware.routing_isa_version);
+    if(std::ranges::any_of(program.routing_descriptors,[](const auto& d){return d.opcode==RoutingOpcode::WeightTable;}))
+        for(const auto& q:program.queues)if(q.kind==QueueKind::C2cDma || q.kind==QueueKind::C2cRx || q.kind==QueueKind::C2cTx)
+            throw std::runtime_error("indirect expert loading reserves ordinary C2C queues");
+    if(program.hardware.routing_isa_version>5 || (!program.routing_descriptors.empty() && !program.hardware.routing_isa_version))
+        throw std::runtime_error("unsupported Routing capability");
+    (void)encode_routing_descriptors(program.routing_descriptors);
+    for(const auto& d:program.routing_descriptors)RoutingControlUnit::validate_descriptor(d,program.hardware.sram_depth_rows);
+    if(!commands)return;
+    validate_expert_template_program(program);
+    std::unordered_set<std::uint32_t> completions;
+    bool seen=false;
+    for(const auto& q:program.queues) {
+        if(q.kind!=QueueKind::Routing) {
+            for(const auto& c:q.commands)if(c.instruction_kind==InstructionKind::Routing)throw std::runtime_error("Routing instruction in another queue");
+            continue;
+        }
+        if(seen || q.index || !program.hardware.routing_isa_version || q.requires_raw_macro || q.packed_macro_imem || q.commands.size()>RoutingConfig::imem_depth)
+            throw std::runtime_error("invalid Native Routing queue/capability");
+        seen=true;
+        for(const auto& c:q.commands) {
+            if(c.instruction_kind==InstructionKind::None) {
+                if(c.word_count==0 && c.extension_words.empty() && isa::decode_icu_command_opcode(c.command)==isa::IcuCommandOpcode::Nop) {
+                    (void)encode_icu_control_raw_word(IcuControlInstruction::Nop(isa::decode_icu_nop_cycles(c.command)));continue;
+                }
+                (void)decode_icu_control_raw_word(c);continue;
+            }
+            if(c.instruction_kind!=InstructionKind::Routing || c.command || c.word_count!=3 || !c.extension_words.empty())throw std::runtime_error("invalid Routing command record");
+            const auto i=decode_routing_instruction({{c.words[0],c.words[1],c.words[2]}});
+            if(i.descriptor>=program.routing_descriptors.size() || program.routing_descriptors[i.descriptor].opcode!=i.opcode || !completions.insert(i.completion).second)
+                throw std::runtime_error("invalid Routing descriptor/completion reference");
+        }
+    }
+    for(const auto& e:program.queue_sync_plan.events)if(e.source==QueueEventSource::Routing)
+        for(auto instance:e.page_use_indices)if(!completions.contains(instance))throw std::runtime_error("Routing event has no device command");
+}
+
 void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
 {
+    validate_routing_program(program,bindings);
     const auto& plan=program.queue_sync_plan;
     const auto& hw=program.hardware;
     if (!program.queue_control_protocol) {
@@ -1901,10 +1974,11 @@ void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
     std::unordered_set<std::uint32_t> events,used,instances,partitions;
     for (const auto& e:plan.events) {
         if ((e.source==QueueEventSource::PageCommit && !e.event_id) || !events.insert(e.event_id).second
-            || (e.source != QueueEventSource::External && e.source != QueueEventSource::PageCommit)
+            || (e.source != QueueEventSource::External && e.source != QueueEventSource::PageCommit && e.source != QueueEventSource::Routing)
             || ((e.source == QueueEventSource::External) != e.page_use_indices.empty()))
-            throw std::runtime_error("invalid QCTL event association");
+            throw std::runtime_error("invalid QCTL event association: source="+std::to_string(static_cast<unsigned>(e.source))+" event="+std::to_string(e.event_id)+" instances="+std::to_string(e.page_use_indices.size()));
         for (const auto i:e.page_use_indices) {
+            if(e.source==QueueEventSource::Routing){if(!i || i>=0x80000000u || !instances.insert(i|0x80000000u).second)throw std::runtime_error("invalid Routing completion association");continue;}
             if (i>=program.weight_page_uses.size() || !instances.insert(i).second || instances.size()>65535)
                 throw std::runtime_error("invalid QCTL transport instance");
             const auto& use=program.weight_page_uses[i];
@@ -1930,6 +2004,7 @@ void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
         case QueueKind::Vxm: limit=hw.vxm_alus;break;
         case QueueKind::SxmTranspose: case QueueKind::SxmPermute:
         case QueueKind::C2cDma: case QueueKind::C2cTx: case QueueKind::C2cRx: limit=hw.hemispheres;break;
+        case QueueKind::Routing:limit=1;break;
         default: throw std::runtime_error("unknown QCTL queue kind");
         }
         const bool nativeBinding = !p.entries.empty() && p.entries.front().native_binding;
@@ -2107,6 +2182,10 @@ void write_binary_program(const BinaryProgram& program, std::ostream& os)
     write_barrier_sections(os, program);
     write_queue_controls(os, program);
     write_queue_link_source(os,program);
+    write_le<std::uint32_t>(os,program.hardware.routing_isa_version);
+    const auto routingWords=encode_routing_descriptors(program.routing_descriptors);
+    write_le<std::uint32_t>(os,static_cast<std::uint32_t>(routingWords.size()));
+    for(auto w:routingWords)write_le<std::uint32_t>(os,w);
     for (std::size_t queue_id = 0;
          queue_id < program.queues.size() + program.transport_queues.size(); ++queue_id) {
         const auto& queue = queue_id < program.queues.size()
@@ -2260,7 +2339,7 @@ BinaryProgram read_binary_program(std::istream& is)
             read_scalar<std::uint64_t>(is));
     if (version >= 37)
         read_barrier_sections(is, program, barrier_event_count);
-    if (version >= 39) { read_queue_controls(is, program);read_queue_link_source(is,program); validate_queue_sync_plan(program, false); }
+    if (version >= 39) { read_queue_controls(is, program);read_queue_link_source(is,program); if(version>=41)read_routing_section(is,program); validate_queue_sync_plan(program, false); }
     program.queues.reserve(queue_count - transport_queue_count);
 
     for (std::uint32_t queue_id = 0; queue_id < queue_count; ++queue_id) {
@@ -2682,7 +2761,7 @@ BinaryProgram read_binary_program(std::span<const std::uint8_t> data)
 BinaryProgram read_binary_program_metadata(
     std::span<const std::uint8_t> data)
 {
-    if (data.size() >= 12 && data[8] == 39 && data[9] == 0 && data[10] == 0 && data[11] == 0) {
+    if (data.size() >= 12 && data[8] >= 39 && data[8] <= kBinaryFormatVersion && data[9] == 0 && data[10] == 0 && data[11] == 0) {
         auto metadata=read_binary_program(data);
         metadata.queues.clear(); metadata.transport_queues.clear();
         metadata.address_relocations.clear(); metadata.scale_relocations.clear();

@@ -8,6 +8,7 @@
 #include <array>
 #include <iomanip>
 #include <stdexcept>
+#include <string_view>
 
 namespace ftlpu::software::runtime {
 namespace {
@@ -32,6 +33,7 @@ std::size_t group_index(QueueKind kind)
     case QueueKind::C2cDma: return 7;
     case QueueKind::C2cTx: return 8;
     case QueueKind::C2cRx: return 9;
+    case QueueKind::Routing: return 10;
     }
     throw std::logic_error("unknown ICU queue kind in runtime performance report");
 }
@@ -177,7 +179,7 @@ void print_runtime_performance(
     const std::size_t logical_mxm_queues =
         program.hardware.hemispheres
         * program.hardware.mxms_per_hemisphere;
-    std::array<QueueGroupStats, 10> groups {{
+    std::array<QueueGroupStats, 11> groups {{
         {"MEM", program.hardware.hemispheres
                 * program.hardware.slices_per_hemisphere
                 * program.hardware.banks_per_slice},
@@ -190,6 +192,7 @@ void print_runtime_performance(
         {"C2C.DMA", program.hardware.hemispheres},
         {"C2C.TX", program.hardware.hemispheres},
         {"C2C.RX", program.hardware.hemispheres},
+        {"RCU", program.hardware.routing_isa_version ? 1u : 0u},
     }};
 
     for (const auto& queue : program.queues) {
@@ -203,6 +206,7 @@ void print_runtime_performance(
     const auto old_precision = os.precision();
     os << std::fixed << std::setprecision(2);
     for (const auto& group : groups) {
+        if (!group.capacity && std::string_view(group.name)=="RCU") continue;
         const auto slots = cycles * group.capacity;
         const double utilization = slots == 0 ? 0.0
             : static_cast<double>(group.issued) / static_cast<double>(slots);
