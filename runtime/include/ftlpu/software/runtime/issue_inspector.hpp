@@ -5,10 +5,20 @@
 #include <cstddef>
 #include <optional>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace ftlpu::software::runtime {
+
+// Exhausting a caller's analysis budget is different from an invalid image.
+// Optional optimizations may decline their proof on this exception; malformed
+// instructions and unsafe schedules must remain hard errors.
+class LogicalIssueAnalysisLimit : public std::invalid_argument {
+public:
+    LogicalIssueAnalysisLimit()
+        : std::invalid_argument("logical issue analysis exceeds its finite work bound") {}
+};
 
 struct LogicalIssue {
     std::size_t cycle{0};

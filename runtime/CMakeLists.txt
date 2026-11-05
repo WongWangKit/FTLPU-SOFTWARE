@@ -382,6 +382,8 @@ add_test(
 add_executable(weight_page_builder_test
     tests/runtime/weight_page_builder_test.cpp)
 target_link_libraries(weight_page_builder_test PRIVATE ftlpu_software)
+add_test(NAME partial_rope_bias_test
+    COMMAND $<TARGET_FILE:weight_page_builder_test> --partial-rope-bias)
 add_test(
     NAME weight_page_builder_test
     COMMAND $<TARGET_FILE:weight_page_builder_test>)

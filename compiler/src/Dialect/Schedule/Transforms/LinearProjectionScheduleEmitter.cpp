@@ -140,7 +140,8 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
         return mlir::failure();
     }
     if ((m > tile && m % tile) || n % (2 * tile) || k % tile
-        || (m < tile && !localDequant)) {
+        || (m < tile && !localDequant)
+        || m > target.throughput().mxm_accumulator_blocks * tile) {
         op.emitError("linear projection dimensions are not MXM aligned");
         return mlir::failure();
     }
@@ -221,6 +222,10 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
         target.throughput().mxm0_accumulator_latency;
     const float scale =
         static_cast<float>(scaleAttr.getValueAsDouble());
+    const auto westScale=op.getConfig().getAs<mlir::FloatAttr>("rhs_scale_west");
+    const auto scaleFor=[&](int64_t hemisphere) {
+        return hemisphere && westScale?static_cast<float>(westScale.getValueAsDouble()):scale;
+    };
 
     if (localDequant && tokenBlocks == 1) {
         // Emit the projection's loop nest directly. Final-K compute exports
@@ -252,7 +257,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                     reductionBlocks, period, 4, outputGroups, groupPeriod, reductionBlocks * 4,
                     weightPlacement.getAs<mlir::IntegerAttr>("bank").getInt(), weightPage);
             }
-            emitMxmDequant3D(rewriter, op.getLoc(), weightCycle, unit, scale,
+            emitMxmDequant3D(rewriter, op.getLoc(), weightCycle, unit, scaleFor(hemisphere),
                 columnLoad ? 32 : 4, 1, reductionBlocks, period, outputGroups, groupPeriod, weightBinding);
             const projection_detail::ProjectionGemmSchedule gemm{
                 m, reductionBlocks, outputGroups, period, groupPeriod};
@@ -333,7 +338,11 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
         return createBinding(rewriter, op.getLoc(), {}, outputIndex, "output", "result", resultType, resultPlacement).getValue();
     }
 
-    int64_t phaseStart = 0;
+    const bool columnLoad = localDequant
+        && target.throughput().mxm_prefill_weight_streams == 1;
+    const int64_t columnWeightStream = target.streams().streams_per_direction
+        - target.throughput().mxm_int8_load_streams_per_cycle;
+    int64_t phaseStart = stagingEnd;
     for (int64_t outputGroup = 0;
          outputGroup < outputGroups; ++outputGroup) {
         for (int64_t reduction = 0;
@@ -341,9 +350,7 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
             const int64_t dequantStart =
                 phaseStart + maxWeightLatency;
             const int64_t firstCompute = localDequant
-                ? dequantStart
-                    + target.throughput()
-                          .mxm_local_load_to_compute_latency
+                ? dequantStart + (columnLoad ? 32 : target.throughput().mxm_local_load_to_compute_latency)
                 : dequantStart + vectorWeightLoadLead;
             const int64_t weightBuffer =
                 (outputGroup * reductionBlocks + reduction)
@@ -359,16 +366,17 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                     + (outputGroup * reductionBlocks + reduction) * 4;
                 for (int64_t stream = 0; stream < 8; ++stream) {
                     const int64_t slice = weightSlices[stream];
-                    emitMem3D(rewriter, op.getLoc(), cycle - weightReadLatency(slice),
+                    emitMem3D(rewriter, op.getLoc(), cycle - weightReadLatency(slice) + (columnLoad ? stream : 0),
                         hemisphere * target.memory().slices_per_hemisphere + slice,
-                        "read", address,
-                        localDequant ? localMxm * target.throughput().mxm_int8_load_streams_per_cycle + stream
+                        "read", address + (columnLoad ? 3 : 0),
+                        columnLoad ? columnWeightStream : localDequant ? localMxm * target.throughput().mxm_int8_load_streams_per_cycle + stream
                             : target.streams().streams_per_direction + stream,
-                        4, 1, 1, "sram", weightBinding, 1, 1, 0, 1, 1, 0);
+                        4, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram", weightBinding, 1, 1, 0, 1, 1, 0,
+                        weightPlacement.getAs<mlir::IntegerAttr>("bank").getInt(), weightPage);
                 }
                 const int64_t unit = hemisphere * target.throughput().mxms_per_hemisphere + localMxm;
                 if (localDequant) {
-                    emitMxmDequant(rewriter, op.getLoc(), cycle, unit, scale, 4, 1, weightBinding);
+                    emitMxmDequant(rewriter, op.getLoc(), cycle, unit, scaleFor(hemisphere), columnLoad ? 32 : 4, 1, weightBinding);
                 } else {
                     for (int64_t lane = 0; lane < target.throughput().lanes_per_tile; ++lane) {
                         const int64_t multiplyColumn = hemisphere == 0 ? lane
@@ -388,12 +396,13 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                     }
                 }
                 MxmDomain3D loadDomain;
-                loadDomain.repeat_count = 4;
-                loadDomain.repeat_weight_column_stride = -1;
+                loadDomain.repeat_count = columnLoad ? 32 : 4;
+                loadDomain.repeat_weight_column_stride = columnLoad ? 1 : -1;
                 emitMxm3D(rewriter, op.getLoc(), cycle + (localDequant ? 0 : weightToIw),
-                    unit, "iw", weightBuffer, 3, 0, 0, 0, 1,
-                    localDequant ? "sram" : "stream", true, "block", 0,
-                    dataFormat, execution->weight_input_mode(), {}, loadDomain);
+                    unit, "iw", weightBuffer, columnLoad ? 0 : 3, 0, 0, 0, 1,
+                    localDequant ? "sram" : "stream", true, columnLoad ? "vector" : "block", 0,
+                    dataFormat, execution->weight_input_mode(), {}, loadDomain,
+                    columnLoad ? columnWeightStream : -1);
             }
 
             const bool finalReduction =
@@ -422,7 +431,8 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                             inputBase + reduction * m
                                 + tokenBlock * tile,
                             hemisphere * 2 + byte, tile, 1, 1,
-                            "sram", inputBinding);
+                            "sram", inputBinding,
+                            inputPlacement.getAs<mlir::IntegerAttr>("bank").getInt());
                     }
                     emitMxm(rewriter, op.getLoc(), computeCycle,
                         hemisphere

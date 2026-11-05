@@ -43,6 +43,8 @@ CATALOG = {
     **{name: dict(label=label, suites=('prefill', 'official', 'compile'),
                   scope='full-size nonzero-Q/K synthetic / official layer0 seq32')
        for name, label in DENSE.items()},
+    'glm4_9b': dict(label='GLM-4-9B', suites=('prefill', 'official'),
+                   scope='official full-size layer0 seq32; partial RoPE, QKV bias, attention and FFN; W8A16'),
     'deepseek_native': dict(label='Native DeepSeek', suites=(), scope='not integrated into ICU/FU model tests'),
     'glm5_native': dict(label='Native GLM-5', suites=(), scope='not integrated; GLM-Edge coverage does not cover GLM-5'),
 }
@@ -103,6 +105,8 @@ def result_directory(a, model):
         return ROOT / 'results' / ('qwen2_5_decoder_layer_' + a.suite)
     if model == 'qwen3_5_0_8b' and a.suite in ('official', 'prefill'):
         return ROOT / 'results/qwen3_5_0_8b_decoder_layer_prefill/continuous'
+    if model == 'glm4_9b':
+        return ROOT / 'results/glm4_9b_decoder_layer_prefill'
     return ROOT / 'results/model_tests' / model / a.suite
 
 
@@ -125,7 +129,7 @@ def selected_models(a):
 
 
 def needs_checkpoint(model, suite):
-    return suite == 'official' or (model == 'qwen3_5_0_8b' and suite == 'prefill')
+    return suite == 'official' or (model in ('qwen3_5_0_8b', 'glm4_9b') and suite == 'prefill')
 
 
 def check_environment(a, models, *, check_binaries=True):
@@ -209,7 +213,7 @@ def commands(a, model, out, work):
             if a.suite != 'compile':
                 phases.append(('cmodel', [str(executable(a.build_dir,a.config,'qwen2' if model.startswith('qwen2') else 'qwen3')),
                                           str(out/'decoder_layer.ftlpu')]))
-    elif a.suite == 'official':
+    elif a.suite == 'official' or model == 'glm4_9b':
         # Pass exact paths so checkpoint directory names need not match model IDs.
         checkpoint = checkpoint_directory(a,model)
         phases.append(('official', python + [str(ROOT/'compiler/tools/run_official_dense_acceptance.py'),

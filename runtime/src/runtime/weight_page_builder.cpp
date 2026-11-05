@@ -212,7 +212,7 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         image.segments=std::move(segments);return image;
     }
 
-    if (binding.role == "weight" && binding.rope_rotary_dim
+    if ((binding.role == "weight" || binding.role == "bias") && binding.rope_rotary_dim
         && binding.rope_rotary_dim < binding.rope_head_dim) {
         auto physical = binding;
         physical.rope_rotary_dim = 0;

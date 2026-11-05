@@ -1105,6 +1105,8 @@ bool LPUTargetModel::supports_route(StreamEndpoint source, StreamEndpoint destin
         return direction == StreamDirection::West;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::MxmWeight)
         return direction == StreamDirection::East;
+    if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::MxmWeight)
+        return direction == StreamDirection::East;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::SxmInput)
         return direction == StreamDirection::East;
     if (source == StreamEndpoint::MxmResult && destination == StreamEndpoint::Mem)
@@ -1779,6 +1781,8 @@ std::optional<int64_t> LPUTargetModel::transport_latency(StreamEndpoint source,
         && destination == StreamEndpoint::SxmInput)
         return throughput_.mem_to_sxm_latency - group;
     if (source == StreamEndpoint::VxmResult && destination == StreamEndpoint::MxmWeight)
+        return 1;
+    if (source == StreamEndpoint::SxmResult && destination == StreamEndpoint::MxmWeight)
         return 1;
     if (source == StreamEndpoint::VxmBridgeResult
         && destination == StreamEndpoint::Mem)

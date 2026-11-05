@@ -24,6 +24,35 @@ def weighted_gram_source(heads,dim,transposed=False):
     }} }}'''
 
 
+
+
+def scaled_weighted_gram_source(heads,dim):
+    k=LogicalGraph.type((32,heads*dim),'bf16')
+    r=LogicalGraph.type((heads*32,32),'bf16')
+    b=LogicalGraph.type((32,heads),'f32')
+    m=LogicalGraph.type((32,32),'bf16')
+    o=LogicalGraph.type((heads*32,32),'f32')
+    return f'''module {{ func.func @stage(%k: {k}, %r: {r}, %b: {b}, %m: {m}) -> {o} {{
+      %a = ftlpu.kernel.vector_alu %k, %r {{kind = "weighted_gram", use_immediate = false, immediate = 0.0 : f32, reduce = false}} : ({k}, {r}) -> {o}
+      %s = ftlpu.kernel.vector_alu %a, %b {{kind = "gram_row_scale", use_immediate = false, immediate = 0.0 : f32, reduce = false}} : ({o}, {b}) -> {o}
+      %l = ftlpu.kernel.vector_alu %s, %m {{kind = "head_mask", use_immediate = false, immediate = 0.0 : f32, reduce = false}} : ({o}, {m}) -> {o}
+      return %l : {o}
+    }} }}'''
+
+
+def weighted_cross_gram_source(heads, dim):
+    q = LogicalGraph.type((32, heads*dim), 'bf16')
+    w = LogicalGraph.type((heads*32,32), 'bf16')
+    a = LogicalGraph.type((heads*32,32), 'f32')
+    return f'''module {{ func.func @stage(%q: {q}, %k: {q}, %w: {w}) -> {a} {{
+      %p = ftlpu.kernel.vector_alu %q, %k {{kind = "cross_gram", use_immediate = false,
+        immediate = 0.0 : f32, reduce = false}} : ({q}, {q}) -> {a}
+      %h = ftlpu.kernel.vector_alu %p, %w {{kind = "multiply", use_immediate = false,
+        immediate = 0.0 : f32, reduce = false}} : ({a}, {w}) -> {a}
+      return %h : {a}
+    }} }}'''
+
+
 def reference(k,weights):
     heads=weights.shape[-1]
     keys=k.reshape(32,heads,-1).transpose(1,0,2)

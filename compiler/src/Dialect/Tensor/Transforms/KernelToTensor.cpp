@@ -195,6 +195,28 @@ public:
                     rmsNorm.getInput().getType().getDimSize(0) * 2;
                 const int64_t gammaBase = target.memory().words_per_bank
                     - cacheTailReserve - gammaRows;
+                // A wide prefill decoder's transient RoPE products can consume
+                // more than half of the constant-slice bank. Keep both
+                // RMSNorm gammas compact in opposite banks of four upper
+                // activation planes; materialize each broadcast at its norm.
+                // Slices 0/1 and 8/9 belong to projection input staging.
+                if (rmsNorms.size() == 2
+                    && target.throughput().mxms_per_hemisphere == 1
+                    && target.memory().banks_per_slice == 2
+                    && target.memory().words_per_bank > 2048
+                    && rows >= target.memory().words_per_bank / 2
+                    && rows <= target.memory().words_per_bank
+                    && rmsNorm.getInput().getType().getDimSize(0)
+                        == target.throughput().mxm_rows
+                    && distributedSlices.size() >= 8 && pairCount >= 2) {
+                    feedbackRmsWeightPlacements[rmsNorm.getWeight()] = {
+                        target.memory().words_per_bank - gammaRows,
+                        distributedSlices[4],
+                        (constantBank + (rmsNorm == rmsNorms.back() ? 0 : 1))
+                            % target.memory().banks_per_slice,
+                        gammaRows};
+                    continue;
+                }
                 if (rmsNorms.size() == 2 && rmsNorm == rmsNorms.back()
                     && target.throughput().mxms_per_hemisphere == 2
                     && target.throughput().mxm_rows == 64

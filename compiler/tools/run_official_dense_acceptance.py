@@ -32,7 +32,7 @@ import numpy as np
 from download_official_dense_layer import OFFICIAL_REPOS, sha256
 from generate_dense_decoder_layer import generate
 from import_hf_decoder_layer import (SafeTensorStore, bf16, decoder_config,
-    checkpoint_prefixes, load_decoder_weights, attention_head_dim,
+    checkpoint_prefixes, load_decoder_weights, load_decoder_biases, attention_head_dim,
     rope_parameters, rope_theta_value, residual_scale, layer_uses_rope,
     rope_at_positions, read_bf16, write_bf16)
 
@@ -94,25 +94,30 @@ def native_bf16_reference(checkpoint, seq_len=32):
     prefix, embedding_name = checkpoint_prefixes(root_config, 0)
     store = SafeTensorStore(checkpoint)
     weights, _ = load_decoder_weights(store, prefix, config)
+    biases = load_decoder_biases(store, prefix, config)
     hidden, heads, kv_heads = int(config['hidden_size']), int(config['num_attention_heads']), int(config['num_key_value_heads'])
     dim = attention_head_dim(config)
     x = bf16(store.read(embedding_name)[:seq_len] * float(config.get('scale_emb', 1)))
     def norm(value, gamma):
         variance = np.mean(value * value, axis=-1, keepdims=True, dtype=np.float32)
+        if config['model_type'] == 'chatglm':
+            # Original ChatGLM keeps normalized values in FP32 through gamma.
+            return bf16(value / np.sqrt(variance + np.float32(config['rms_norm_eps'])) * gamma)
         return bf16(bf16(value / np.sqrt(variance + np.float32(config['rms_norm_eps']))) * gamma)
     def linear(value, role):
-        return bf16(value @ weights[role].T)
+        return bf16(value @ weights[role].T + biases.get(role, 0))
     normalized = norm(x, store.read(prefix + '.input_layernorm.weight'))
     q = linear(normalized, 'query').reshape(seq_len, heads, dim)
     k = linear(normalized, 'key').reshape(seq_len, kv_heads, dim)
     v = linear(normalized, 'value').reshape(seq_len, kv_heads, dim)
     inv, amplitude, rotary = rope_parameters(config, seq_len)
-    if config['model_type'] == 'glm':
+    if config['model_type'] in ('glm', 'chatglm'):
         def rotate(value):
             angle = np.arange(seq_len, dtype=np.float32)[:, None] * inv[None, :]
             c, s = bf16(np.cos(angle) * amplitude)[:, None, :], bf16(np.sin(angle) * amplitude)[:, None, :]
-            low, high = value[..., 0::2], value[..., 1::2]
-            return bf16(np.stack((low*c-high*s, high*c+low*s), axis=-1).reshape(value.shape))
+            low, high = value[..., :rotary:2], value[..., 1:rotary:2]
+            rotated = bf16(np.stack((low*c-high*s, high*c+low*s), axis=-1).reshape(*value.shape[:-1], rotary))
+            return np.concatenate((rotated, value[..., rotary:]), axis=-1)
         q, k = rotate(q), rotate(k)
     else:
         def rotate(value):
@@ -124,7 +129,9 @@ def native_bf16_reference(checkpoint, seq_len=32):
     q = q.transpose(1, 0, 2)
     k = np.repeat(k, heads // kv_heads, axis=1).transpose(1, 0, 2)
     v = np.repeat(v, heads // kv_heads, axis=1).transpose(1, 0, 2)
-    scores = bf16(bf16(q @ k.transpose(0, 2, 1)) * np.float32(1 / np.sqrt(dim)))
+    dot = q @ k.transpose(0, 2, 1)
+    # ChatGLM's baddbmm applies alpha before casting the BF16 score output.
+    scores = bf16((dot if config['model_type'] == 'chatglm' else bf16(dot)) * np.float32(1 / np.sqrt(dim)))
     scores = np.where(np.triu(np.ones((seq_len, seq_len), dtype=bool), 1), -np.inf, scores)
     exp = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
     probability = bf16(exp / np.sum(exp, axis=-1, keepdims=True))
@@ -144,7 +151,8 @@ def source_ir(config, name):
         name=name, hidden=int(config['hidden_size']), intermediate=int(config['intermediate_size']),
         query_heads=int(config['num_attention_heads']), kv_heads=int(config['num_key_value_heads']),
         head_dim=head, rope_theta=rope_theta_value(config), rms_norm_eps=float(config['rms_norm_eps']),
-        rotary_dim=rotary, rope_attention_factor=amplitude, residual_scale=residual_scale(config))
+        rotary_dim=rotary, rope_attention_factor=amplitude, residual_scale=residual_scale(config),
+        attention_bias=bool(config.get('attention_bias', config.get('model_type') == 'qwen2')))
     # Emit the exact configured frequency vector in the mathematical graph.
     # The compiler extracts it into native constant-table binding metadata.
     values = ', '.join(f'{float(v):.9e}' for v in inv)
@@ -161,7 +169,8 @@ def run_model(a, model):
     report = dict(model=model, source_repo=OFFICIAL_REPOS[model], checkpoint_kind='official_layer_subset',
         sequence_length=32, layers=1, layer=0, quantization='symmetric_per_tensor_w8a16',
         started_at=datetime.now(timezone.utc).isoformat(), status='running',
-        limits=dict(max_error=0.35, mean_error=0.035, relative_l2=0.05, cosine_min=0.99))
+        limits=dict(max_error=0.35, mean_error=0.035, relative_l2=0.05, cosine_min=0.99),
+        icu_encoding='raw-macro', synchronization='common_barrier' if model == 'glm4_9b' else 'queue_local')
     def save():
         temporary = d / 'result.json.part'
         temporary.write_text(json.dumps(report, indent=2), encoding='utf-8')
@@ -198,7 +207,9 @@ def run_model(a, model):
                 '--model-dir', str(checkpoint), '--output-dir', str(golden), '--seq-len', '32']),
             ('compile', [str(a.compiler), '--input', str(source), '--output', str(program),
                 '--target-config', str(a.target), '--weight-bank', '1', '--ffn-schedule', 'fused',
-                '--attention-schedule', 'fused', '--projection-rope-overlap', 'off']),
+                '--attention-schedule', 'fused', '--projection-rope-overlap', 'off',
+                '--icu-compression', 'raw-macro', '--mxm-execution', 'ws']
+                + (['--common-barrier'] if model == 'glm4_9b' else [])),
             ('package', [sys.executable, '-B', str(ROOT/'compiler/tools/build_decoder_layer_package.py'),
                 '--golden-dir', str(golden), '--executable', str(program), '--output', str(package)]),
             ('cmodel', [str(a.runtime), str(package)]),

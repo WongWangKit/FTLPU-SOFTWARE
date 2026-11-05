@@ -68,7 +68,8 @@ PackedWeightImage image()
         values[index] = static_cast<std::uint8_t>(index * 13 + 19);
     return pack_weight_binding_page(binding(), 0, values, ExecutableHardwareConfig{});
 }
-BinaryProgram linked_program(C2cDmaSystem& system, const PackedWeightImage& packed, bool overlap = false)
+BinaryProgram linked_program(C2cDmaSystem& system, const PackedWeightImage& packed,
+                             bool overlap = false, std::size_t proofBudget = 8'000'000)
 {
     BinaryProgram program;
     program.common_barrier_protocol = true;
@@ -109,7 +110,7 @@ BinaryProgram linked_program(C2cDmaSystem& system, const PackedWeightImage& pack
             segment.slice, 1, segment.base_row, 0,
             kDdrBase + segment.byte_offset, segment.vector_count});
     C2cWeightPager pager(system);
-    pager.begin_schedule(program);
+    pager.begin_schedule(program, proofBudget);
     const std::array<std::size_t, 1> instances {0};
     static_cast<void>(pager.schedule(program, page, 32, 48, kStop,
         0x10000, 0x30000, 32, instances));
@@ -205,7 +206,8 @@ struct Result {
     std::size_t logical{}, physical{};
     std::vector<std::pair<std::size_t, std::size_t>> issues{}, native_issues{};
 };
-Result run(std::size_t latency, bool cycleZero = false, bool overlap = false, bool backpressure = false)
+Result run(std::size_t latency, bool cycleZero = false, bool overlap = false,
+           bool backpressure = false, bool proofBudgetFallback = false)
 {
     Ddr4Config config;
     config.read_latency_cycles = latency;
@@ -213,7 +215,19 @@ Result run(std::size_t latency, bool cycleZero = false, bool overlap = false, bo
     config.write_latency_jitter_cycles = 0;
     auto system = std::make_unique<C2cDmaSystem>(config, backpressure ? 2 : 16);
     const auto packed = image();
-    auto program = linked_program(*system, packed, overlap);
+    auto program = linked_program(*system, packed, overlap,
+        proofBudgetFallback ? 0 : 8'000'000);
+    if (proofBudgetFallback) {
+        require(!program.transport_overlap_protocol,
+            "analysis-bound fallback retained an overlap protocol in the linked binary");
+        require(std::ranges::any_of(program.timelines, [](const auto& timeline) {
+            return timeline.name == "c2c.serial_fallback.proof_work_bound";
+        }), "analysis-bound fallback lost its reason through binary serialization");
+        for (const auto& use : program.weight_page_uses)
+            require(use.transport_launch_cycle == 0,
+                "serial fallback retained an early-launch cycle");
+        overlap = false;
+    }
     if (backpressure)
         for (auto& queue : program.transport_queues)
             queue.commands.insert(queue.commands.begin(),encode_icu_control_raw_word(IcuControlInstruction::Nop(256)));
@@ -511,20 +525,85 @@ try {
     BinaryProgram chainProgram;
     VxmLaneAluInstruction chain;
     chain.lhs = VxmLaneOperand::StreamBFloat16();
+    chain.repeat_count = 64;
     const auto packet = VxmCompactInstructionCodec::encode(0, VxmChainDepth::Eight, chain);
     chainProgram.queues.push_back({QueueKind::Vxm, 0, {{
         static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
         InstructionKind::Vxm, 3, {static_cast<std::uint32_t>(packet.control),
             static_cast<std::uint32_t>(packet.control >> 32), packet.immediate_bits, 0}}}});
-    rejects([&] { CommonOverlapCalendar calendar(chainProgram); },
-        "legacy overlap proof accepted unproved chain VXM resource lifetimes");
+    CommonOverlapCalendar chainCalendar(chainProgram);
+    const std::vector<std::size_t> noMem;
+    const std::vector<std::uint16_t> captured{0}, freeRoute{31};
+    chainCalendar.validate(0,512,noMem,freeRoute);
+    rejects([&] { chainCalendar.validate(0,512,noMem,captured); },
+        "overlap proof leased a chain head's captured SR bundle");
+    rejects([&] { chainCalendar.validate(32,512,noMem,captured); },
+        "overlap proof ignored the VXM configuration vector train");
+    const std::vector<std::uint16_t> mirroredCaptured{17};
+    rejects([&] { chainCalendar.validate(32,512,noMem,mirroredCaptured); },
+        "overlap proof ignored the mirrored BF16 input vector train");
+    bool boundedAnalysis = false;
+    try {
+        inspect_logical_issues(chainProgram, 0);
+    } catch (const LogicalIssueAnalysisLimit&) {
+        boundedAnalysis = true;
+    }
+    require(boundedAnalysis,"finite issue budget did not report the typed analysis limit");
+    // FP32 consumes four ordinary byte streams, including bytes 2 and 3.
+    chain.lhs=VxmLaneOperand::StreamFloat32();
+    const auto fp32=VxmCompactInstructionCodec::encode(0,VxmChainDepth::Eight,chain);
+    chainProgram.queues.front().commands.front().words={
+        static_cast<std::uint32_t>(fp32.control),
+        static_cast<std::uint32_t>(fp32.control>>32),fp32.immediate_bits,0};
+    CommonOverlapCalendar fp32Calendar(chainProgram);
+    const std::vector<std::uint16_t> highByte{3};
+    rejects([&] { fp32Calendar.validate(0,512,noMem,highByte); },
+        "overlap proof ignored FP32 high byte streams");
+    const std::vector<std::uint16_t> mirroredHighByte{19};
+    rejects([&] { fp32Calendar.validate(0,512,noMem,mirroredHighByte); },
+        "overlap proof ignored the mirrored physical ALU's FP32 input");
+    rejects([&] { fp32Calendar.validate(32,512,noMem,mirroredHighByte); },
+        "overlap proof ignored the mirrored input's repeated vector train");
+    VxmLaneAluInstruction tail;
+    tail.output_stream=6; tail.output_type=VxmCastTarget::Float32;
+    tail.repeat_count=64;
+    const auto result=VxmCompactInstructionCodec::encode(7,VxmChainDepth::Eight,tail);
+    chainProgram.queues.push_back({QueueKind::Vxm,7,{{
+        static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
+        InstructionKind::Vxm,3,{static_cast<std::uint32_t>(result.control),
+            static_cast<std::uint32_t>(result.control>>32),result.immediate_bits,0}}}});
+    CommonOverlapCalendar resultCalendar(chainProgram);
+    const std::vector<std::uint16_t> outputHighByte{9};
+    rejects([&] { resultCalendar.validate(0,512,noMem,outputHighByte); },
+        "overlap proof ignored FP32 chain output streams");
+    // Isolate the output so an earlier FP32 input on streams 16..19 cannot
+    // accidentally satisfy this regression's rejection condition.
+    BinaryProgram outputOnlyProgram;
+    outputOnlyProgram.queues.push_back(chainProgram.queues.back());
+    CommonOverlapCalendar outputOnlyCalendar(outputOnlyProgram);
+    const std::vector<std::uint16_t> mirroredOutputHighByte{17};
+    rejects([&] { outputOnlyCalendar.validate(0,512,noMem,mirroredOutputHighByte); },
+        "overlap proof ignored the mirrored physical ALU's FP32 output");
+    outputOnlyCalendar.validate(256,512,noMem,mirroredOutputHighByte);
+    chain.repeat_count=1024;
+    const auto longTrain=VxmCompactInstructionCodec::encode(0,VxmChainDepth::Eight,chain);
+    chainProgram.queues.front().commands.front().words={
+        static_cast<std::uint32_t>(longTrain.control),
+        static_cast<std::uint32_t>(longTrain.control>>32),longTrain.immediate_bits,0};
+    CommonOverlapCalendar crossingCalendar(chainProgram);
+    rejects([&] { crossingCalendar.validate(0,512,noMem,freeRoute); },
+        "overlap proof accepted a consumer stop inside an active vector train");
     repeated_load_and_all_of();
     const auto overlapped = run(3,false,true);
     const auto overlappedLate = run(200,false,true);
     const auto pressured = run(3,false,true,true);
     const auto early = run(3);
+    const auto bounded = run(3,false,true,false,true);
     const auto late = run(53);
     const auto atZero = run(3, true);
+    require(bounded.issues == early.issues && bounded.native_issues == early.native_issues
+            && bounded.logical == early.logical && bounded.physical == early.physical,
+        "bounded proof fallback did not preserve real serialized execution");
     require(atZero.issues == early.issues && atZero.native_issues == early.native_issues
             && atZero.logical == early.logical,
         "cycle-zero launch lost its event or changed computation");
@@ -547,6 +626,7 @@ try {
               << " early_physical=" << early.physical << " late_physical=" << late.physical
               << " overlap_physical=" << overlapped.physical << " overlap_late_physical=" << overlappedLate.physical
               << " finite_fifo_physical=" << pressured.physical
+              << " bounded_fallback_physical=" << bounded.physical
               << " all_of=verified repeated_load=verified resource_conflicts=rejected"
               << " issues=" << early.issues.size() << " native_issues=" << early.native_issues.size() << " generation=isolated real_mem_commit=verified corrupt_transport_cases=10 cycle_zero=verified stable_sram=protected\n";
     return 0;

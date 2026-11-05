@@ -97,9 +97,13 @@ void test_planar_output(BindingElementType type, BindingLayout layout,
     ModelSession session(*system);
     session.load(std::move(package));
     session.set_input("input", input);
+    const auto beginCycle = system->cycle();
     session.run();
     if (session.value("output") != input)
         throw std::runtime_error("multi-lane planar C2C output changed bytes");
+    const auto elapsed = system->cycle() - beginCycle;
+    if (session.stats().c2c_ingress_cycles + session.stats().c2c_egress_cycles > elapsed)
+        throw std::runtime_error("C2C I/O accounting added absolute clocks instead of elapsed cycles");
 }
 
 } // namespace

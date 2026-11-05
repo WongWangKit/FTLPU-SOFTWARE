@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 
 #include "AttentionEmitterUtils.hpp"
+#include "CommonBarrierSchedule.hpp"
 #include "ProjectionGemmSchedule.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_projection_planner.hpp"
@@ -197,6 +198,9 @@ int64_t AttentionScheduleEmitter::emitProjections() {
   const bool columnLoad = localDequant && target_.throughput().mxm_prefill_weight_streams == 1;
   const int64_t weightLoadCycles = columnLoad ? tile
       : target_.throughput().tile_rows;
+  // One-vector IW takes tile cycles, but each of the eight striped MEM
+  // slices contributes only tile/8 rows, interleaved at an eight-cycle II.
+  const int64_t weightReadRows = target_.throughput().tile_rows;
   const int64_t loadToIw = localDequant ? 0 : weightToIw;
   const int64_t weightStreamBase =
       localDequant ? target_.streams().streams_per_direction -
@@ -581,6 +585,22 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           for (int64_t slice : layout.weightSlices(kind, hemisphere * 2))
             readLead = std::max(readLead, weightReadLatency(slice));
         phaseStart = std::max(phaseStart, postprocessReady + readLead);
+        if (requestsRawMacroBarriers(op_.output.getOperation(), target_)
+            && layout.weightPage(kind, 0) >= 0) {
+          // Q, V and K can reuse SRAM. The whole-attention entry barrier
+          // cannot guard a later projection whose page replaces Q weights.
+          // Serial projection postprocessing has drained at this boundary.
+          const int64_t page = layout.weightPage(kind, 0);
+          if (layout.weightPage(kind, projectionOutputBlocks - 1) != page) {
+            op_.emitError("common-barrier Q/K/V projection requires an intra-projection page boundary");
+            return -1;
+          }
+          const int64_t begin = phaseStart;
+          const int64_t stop = begin + commonBarrierDrainCycles(target_);
+          emitCommonBarrierCandidate(rewriter_, op_.getLoc(),
+              functionArgumentIndex(projectionValues[projection]), page, begin, stop);
+          phaseStart = stop + readLead;
+        }
       }
       // With uninterrupted Q/K/V reductions, each output group occupies
       // exactly two 48-reduction halves.  Their weight queues have no
@@ -653,7 +673,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 rewriter_, op_.getLoc(),
                 phaseStart - weightReadLatency(slice) + (columnLoad ? stream : 0),
                 hemisphere * target_.memory().slices_per_hemisphere + slice,
-                "read", baseAddress + (columnLoad ? weightLoadCycles - 1 : 0), weightStreamBase + (columnLoad ? 0 : stream), weightLoadCycles, columnLoad ? 8 : 1, columnLoad ? -1 : 1,
+                "read", baseAddress + (columnLoad ? weightReadRows - 1 : 0), weightStreamBase + (columnLoad ? 0 : stream), weightReadRows, columnLoad ? 8 : 1, columnLoad ? -1 : 1,
                 "sram", functionArgumentIndex(projectionValues[projection]),
                 hiddenBlocks, projectionReductionInterval,
                 projectionWeightReductionRows,
@@ -911,7 +931,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                 int64_t groupInterval, int64_t groupAddressStride) {
               emitMem3D(
                   rewriter_, op_.getLoc(), domain.cycle, domain.queue, "read",
-                  domain.address + (columnLoad ? weightLoadCycles - 1 : 0), domain.packedStream, weightLoadCycles, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram",
+                  domain.address + (columnLoad ? weightReadRows - 1 : 0), domain.packedStream, weightReadRows, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram",
                   domain.addressBinding, hiddenBlocks,
                   projectionReductionInterval,
                   projectionWeightReductionRows,
@@ -1055,7 +1075,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       const int64_t groupAddressStride =
                           current.address - pending.address;
                       const int64_t innerDomainLastOffset =
-                          (hiddenBlocks - 1) * projectionReductionInterval + (columnLoad ? (weightLoadCycles - 1) * 8 : weightLoadCycles - 1);
+                          (hiddenBlocks - 1) * projectionReductionInterval + (columnLoad ? (weightReadRows - 1) * 8 : weightReadRows - 1);
                       const bool pairCompleteHalves =
                           half == 1 && completeReductionDomain && pending.valid &&
                           current.queue == pending.queue &&
@@ -1073,8 +1093,8 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         flushPendingWeightRead(pending);
                         emitMem3D(
                             rewriter_, op_.getLoc(), current.cycle,
-                            current.queue, "read", current.address + (columnLoad ? weightLoadCycles - 1 : 0),
-                            current.packedStream, weightLoadCycles, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram",
+                            current.queue, "read", current.address + (columnLoad ? weightReadRows - 1 : 0),
+                            current.packedStream, weightReadRows, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram",
                             current.addressBinding, weightDomainCount,
                             projectionReductionInterval,
                             projectionWeightReductionRows, 1, 1, 0,

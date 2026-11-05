@@ -974,7 +974,7 @@ void CModelRuntime::upload_binding(
 void CModelRuntime::upload_binding_impl(
     const BinaryBinding& binding, std::span<const std::uint8_t> data)
 {
-    if (binding.role == "weight" && binding.rope_rotary_dim
+    if ((binding.role == "weight" || binding.role == "bias") && binding.rope_rotary_dim
         && binding.rope_rotary_dim < binding.rope_head_dim) {
         auto physical = binding;
         physical.rope_rotary_dim = 0;
@@ -2388,6 +2388,12 @@ bool CModelRuntime::step_physical(TspSliceSystem::LogSinks sinks)
     }
     const bool enabled = timed_program_load_ || common_barrier_protocol_
         ? system_.icu().compute_enabled() : true;
+    if (execution_trace_enabled_ && enabled && common_barrier_protocol_)
+        for (const auto& page:common_transports_)
+            if (executed_cycles_==page.stop_cycle)
+                execution_trace_.record_interval(physical_cycles_-loaded_physical_cycle_,
+                    physical_cycles_-loaded_physical_cycle_+1,"Paging.Consumer",
+                    "logical_cycle="+std::to_string(page.stop_cycle));
     if(queue_control_protocol_ && (!timed_program_load_ || c2c_system_->program_loader().started())) sample_queue_progress();
     if (common_barrier_protocol_ || queue_control_protocol_) {
         const bool compute = !system_.common_compute_resources_drained();

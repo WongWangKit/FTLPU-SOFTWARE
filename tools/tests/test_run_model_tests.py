@@ -28,7 +28,8 @@ class EntryPointTests(unittest.TestCase):
             build_dir=self.root/'build with spaces', config='Release',
             target_config=self.target, output_root=self.root/'results',
             checkpoint_root=self.root/'checkpoints', checkpoint=None,
-            download=False, allow_gated_skip=False, no_pipeline=True, dry_run=False)
+            download=False, allow_gated_skip=False, no_pipeline=True, dry_run=False,
+            projection_rope_overlap='on')
         self.root_patch = patch.object(entry, 'ROOT', self.root)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
@@ -76,6 +77,18 @@ class EntryPointTests(unittest.TestCase):
         for name in ('config.json','model.safetensors','provenance.json'):
             (checkpoint/name).write_text('{}')
         self.assertEqual(entry.commands(self.args,'phi4_mini',self.root/'out',self.root/'work')[0][0], 'official')
+
+    def test_glm4_prefill_uses_official_checkpoint_whole_layer_path(self):
+        self.args.model = ['glm4_9b']
+        self.args.output_root = None
+        self.assertEqual(entry.selected_models(self.args), ['glm4_9b'])
+        self.assertTrue(entry.needs_checkpoint('glm4_9b', 'prefill'))
+        out = entry.result_directory(self.args, 'glm4_9b')
+        self.assertEqual(out, self.root/'results/glm4_9b_decoder_layer_prefill')
+        plan = entry.commands(self.args, 'glm4_9b', out, self.root/'work')
+        self.assertEqual([phase for phase, _ in plan], ['official'])
+        self.assertIn('run_official_dense_acceptance.py', ' '.join(plan[0][1]))
+        self.assertIn('--model-dir', plan[0][1])
 
     def test_bypass_and_hardware_override_flags_are_removed(self):
         with patch.dict(os.environ, {'FTLPU_SKIP_QWEN_NUMERIC_CHECK':'1',

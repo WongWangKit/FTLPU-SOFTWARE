@@ -144,7 +144,7 @@ void insert_issue(IssueMap& issues, const BinaryProgram& program,
 {
     check_cycle(program, cycle, kind, index);
     if (!issues.remaining || *issues.remaining == 0)
-        throw std::invalid_argument("logical issue analysis exceeds its finite work bound");
+        throw LogicalIssueAnalysisLimit();
     const auto [position, inserted] = issues.entries.emplace(
         cycle, std::move(instruction));
     if (inserted) --*issues.remaining;

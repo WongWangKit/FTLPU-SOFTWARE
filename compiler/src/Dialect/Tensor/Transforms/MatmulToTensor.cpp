@@ -75,6 +75,13 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             target.memory().banks_per_slice > 1 ? 1 : 0);
         const bool replicated = llvm::any_of(op.getResult().getUsers(),
             [](mlir::Operation* user) { return llvm::isa<kernel::SigmoidMultiplyOp>(user); });
+        const bool narrowPair=op->hasAttr("ftlpu.replicated_narrow_pair");
+        if(narrowPair) {
+            if(op.getM()!=tile || op.getN()!=2*tile || !strategy->uses_local_dequant())
+                return op.emitError("paired narrow projections require one local-dequant output tile");
+            result=fixed_allocation(PlacementKind::Result,resultSlices,0,op.getM(),
+                resultBytes,"fp16_pair_planar","both",target.memory().banks_per_slice>1?1:0);
+        }
         mlir::DictionaryAttr sourceInput;
         if (replicated) {
             auto inherited = get_value_placement(op.getLhs());
@@ -138,6 +145,12 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             config = flags.getDictionary(rewriter.getContext());
         }
         const mlir::Value oldResult = op.getResult();
+        if(narrowPair) {
+            mlir::NamedAttrList flags(config);
+            flags.set("replicated_result",rewriter.getBoolAttr(true));
+            flags.set("rhs_scale_west",op->getAttr("rhs_scale_west"));
+            config=flags.getDictionary(rewriter.getContext());
+        }
         if (replicated && mlir::failed(planner.bind(oldResult, result))) {
             op.emitError("gated projection result conflicts with a live dense tensor");
             return mlir::failure();

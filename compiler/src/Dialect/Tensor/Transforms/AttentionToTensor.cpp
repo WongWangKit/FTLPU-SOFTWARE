@@ -305,10 +305,22 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
             || compact_prefill_sram
         ? target.memory().words_per_bank / 4
         : target.attention_probability_pack_base_row();
-    const int64_t probability_diagonal_base = compact_decode_sram
+    int64_t probability_diagonal_base = compact_decode_sram
             || compact_prefill_sram
         ? target.memory().words_per_bank / 2
         : target.attention_probability_diagonal_base_row();
+    // Segmented post-attention gamma is resident through PV. Keep the
+    // probability diagonal below its high-row activation-plane reservation.
+    const auto diagonalSlices = target.activation_storage_slices();
+    for (const auto& entry : gamma_placements) {
+        const auto& gamma = entry.second;
+        if (gamma.segment_rows > 0 && gamma.bank == scratch_bank
+            && diagonalSlices.size() >= 16
+            && llvm::is_contained(llvm::ArrayRef<int64_t>(diagonalSlices).take_front(16),
+                gamma.slice_base)
+            && probability_diagonal_base + probability_diagonal_rows > gamma.base_row)
+            probability_diagonal_base = gamma.base_row - probability_diagonal_rows;
+    }
     const int64_t projection_bias_base =
         context_base - projection_bias_total_rows;
     const int64_t query_bias_base = projection_bias_base;
@@ -378,7 +390,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
         ? query_base
         : compact_prefill_sram
         ? rope_product_base + rope_product_rows
-        : probability_diagonal_base;
+        : target.attention_probability_diagonal_base_row();
     // Serial Q/K projection retains every raw head until RoPE starts. Its
     // larger staging allocation must stay clear of the Query IW rows, which
     // remain live for QK and can occupy either scratch bank by rotary half.
@@ -1040,9 +1052,23 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
                 : isolate_probability_from_runtime_weight_plane
                 ? weightStorage[weightStorage.size() - 3 + offset]
                 : rope_table_slices[static_cast<std::size_t>(offset + 1)]};
-        return physical_allocator.allocate({name.str(), 2,
-            mask_in_activation ? qk_norm_scratch_base+qk_norm_matrix_rows+1 : causal_mask_base, tile - 1, 0, 3, candidates, true,
-            mask_banks});
+        const int64_t base = mask_in_activation
+            ? qk_norm_scratch_base + qk_norm_matrix_rows + 1 : causal_mask_base;
+        auto allocation = physical_allocator.allocate({name.str(), 2,
+            base, tile - 1, 0, 3, candidates, true, mask_banks});
+        // Constants are initialized before the input RMSNorm. The maximum
+        // scratch end may belong to unrelated slices (or an unused QK-norm
+        // workspace) and can exceed SRAM on a wide decoder. Find a free
+        // interval on the actual mask slices, above input + RMSNorm scratch.
+        if (mask_in_activation && mlir::failed(allocation)) {
+            for (int64_t row = 2 * distributed_input_rows;
+                 row + tile - 1 <= input_staging_base; ++row) {
+                allocation = physical_allocator.allocate({name.str(), 2,
+                    row, tile - 1, 0, 3, candidates, true, mask_banks});
+                if (mlir::succeeded(allocation)) break;
+            }
+        }
+        return allocation;
     };
     auto mask0 = allocate_mask("causal_mask_mxm0", 0);
     auto mask1 = allocate_mask("causal_mask_mxm1", 2);

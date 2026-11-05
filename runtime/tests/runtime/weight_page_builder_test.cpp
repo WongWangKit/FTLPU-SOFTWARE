@@ -811,12 +811,60 @@ void test_dense_split_down_page()
     std::cout << "Dense split Down pages passed: 4480 -> 64 segments, unchanged bytes\n";
 }
 
+void test_partial_rope_bias()
+{
+        BinaryBinding bias;
+        bias.role = "bias";
+        bias.shape = {256}; // Two heads, each with a 64-feature rotary prefix.
+        bias.element_type = BindingElementType::BF16;
+        bias.layout = BindingLayout::Fp16ProjectionBiasX4;
+        bias.byte_size = 512;
+        bias.address_stride = 1;
+        bias.slices = {12, 13, 14, 15};
+        bias.hemisphere_mask = 3;
+        bias.rope_head_dim = 128;
+        bias.rope_rotary_dim = 64;
+        std::vector<std::uint8_t> source(512), expected(512);
+        for (std::size_t i = 0; i < 256; ++i) {
+            source[2*i] = static_cast<std::uint8_t>(i);
+            source[2*i+1] = 0x3f;
+        }
+        for (std::size_t i = 0; i < 256; ++i) {
+            const auto lane = i % 128;
+            const auto from = i - lane + (lane < 32 ? lane : lane < 64
+                ? lane + 32 : lane < 96 ? lane - 32 : lane);
+            expected[2*i] = source[2*from];
+            expected[2*i+1] = source[2*from+1];
+        }
+        const auto image = pack_binding_image(bias, source, ExecutableHardwareConfig{});
+        auto physical = bias;
+        physical.rope_rotary_dim = 0;
+        require(image.data == pack_binding_image(physical, expected, ExecutableHardwareConfig{}).data,
+            "partial RoPE bias must use the same feature permutation as Q/K weights");
+        auto system = std::make_unique<ftlpu::TspSliceSystem>();
+        CModelRuntime runtime(*system);
+        runtime.upload_binding(bias, source);
+        for (const auto& segment : image.segments)
+            for (std::uint32_t row = 0; row < segment.vector_count; ++row)
+                for (std::uint32_t lane = 0; lane < 32; ++lane)
+                    require(system->read_mem_sram_lane_byte(
+                        static_cast<ftlpu::Hemisphere>(segment.hemisphere), segment.slice,
+                        bias.bank, lane / 8, segment.base_row + row, lane % 8)
+                            == image.data[segment.byte_offset + row * 32 + lane],
+                        "runtime and C2C packing disagree for partial RoPE bias");
+    }
+
 } // namespace
 
 int main(int argc, char** argv)
 try {
     if (argc == 2 && std::string(argv[1]) == "--dense-split-down") {
         test_dense_split_down_page();
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--partial-rope-bias") {
+        test_partial_rope_bias();
+        std::cout << "Partial RoPE bias packing and runtime upload passed\n";
         return 0;
     }
     test_vxm_distributed_roundtrip();
@@ -970,6 +1018,7 @@ try {
                 "partial RoPE must apply the Q/K feature permutation to BF16 norm gamma");
         }
     }
+    test_partial_rope_bias();
     test_kv_cache_roundtrip();
     test_distributed_activation_target_width();
     if (ExecutableHardwareConfig {}.sram_depth_rows == 1024)

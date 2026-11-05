@@ -145,7 +145,10 @@ public:
     explicit C2cWeightPager(C2cDmaSystem& system);
 
     void enqueue(const C2cWeightPage& page);
-    void begin_schedule(BinaryProgram& program);
+    // Overlap proof is optional and bounded independently of executable
+    // length. Exhausting this budget retains serial common-SYNC paging.
+    void begin_schedule(BinaryProgram& program,
+                        std::size_t overlap_analysis_budget = 8'000'000);
     C2cWeightPageFence schedule(
         BinaryProgram& binary, const C2cWeightPage& page,
         std::size_t start_cycle, std::size_t transfer_end_cycle,

@@ -3637,8 +3637,10 @@ software::runtime::BinaryProgram translate_command_module(mlir::ModuleOp module)
                 || program.hardware.common_barrier_capacity == 0))
             throw std::runtime_error("Raw Macro paging requires the common barrier target capability");
         program.common_barrier_protocol = program.hardware.common_barrier_encoding_version == 1;
+        const auto overlapPolicy=module->getAttrOfType<mlir::BoolAttr>("ftlpu.common_transport_overlap");
         program.transport_overlap_protocol = program.common_barrier_protocol
-            && !program.weight_page_uses.empty() && program.hardware.common_transport_overlap_version == 1;
+            && !program.weight_page_uses.empty() && program.hardware.common_transport_overlap_version == 1
+            && (!overlapPolicy || overlapPolicy.getValue());
         if (compressionMode == IcuCompressionMode::RawMacro)
             lower_direct_raw_macro(program);
         if (requiresDirectLowering) {

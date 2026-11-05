@@ -857,3 +857,70 @@ Runtime execution is 385402 cycles, with eight epochs and seven weight-page
 prefetches. The complete diagnostic trace is 748195 cycles / 1.496390 ms
 at 500 MHz and 51.2 GB/s nominal DDR bandwidth, including initialization and
 18 output exports; this is not an end-to-end decoder-layer latency.
+
+### Batch32 wide-SXM staged decode
+
+The batched harness supports `--sxm-architecture wide --raw-input`. It runs
+one decode step for each independent request, using the same real INT8
+checkpoint projections, wide-only SXM, WS MXM and raw macro encoding:
+
+1. Batched QKV, Z and beta/g projections, including `exp(g)`.
+2. Independent bounded Conv/SiLU, Q/K L2Norm, state decay/KS, correction,
+   rank-one update, Q readout and gated RMSNorm invocations.
+3. A single batched `[B,2048] x [2048,1024]` output projection.
+
+State uses the native `[head,value,key]` DDR ABI and is swapped in and out
+for every request, together with its Conv cache. Projection weights are
+not re-executed separately for every request. The staged harness only
+serializes DDR tensor rows between executable phases; C++ performs all
+physical layout planning, lowering and activation computation.
+
+This is a staged baseline, not one continuous batch-wide ICU program.
+The current 512-record QCTL pool cannot hold the projection graph's full
+control plan. The harness explicitly selects ordinary common SYNC with
+serialized C2C transfers; it does not insert a static transfer-time budget.
+Do not compare its latency to an overlapping-prefetch implementation as
+though the synchronization policy were identical. The combined pipeline
+concatenates the three measured traces sequentially and labels their
+phase; host orchestration wall time is excluded.
+
+External gate inputs require additional persistent SRAM bindings, so the
+state planner uses eight heads per tile. Conv ingress retains whole-head
+ownership across hemispheres. External Z currently uses generic gated
+output staging; the continuous batch1 graph's producer-to-producer SiLU
+fusion remains available when both inputs have native word descriptors.
+Input RMSNorm, residual add and FFN are outside this test.
+
+The projection/gate phase enables FP32 vector ingress. Truncating the
+FP32 gate edges to BF16 before `exp(g)` amplified error in strongly decaying
+heads (about 6% decay error in the first trial), which the per-head state
+checks caught despite a small aggregate error. FP32 ingress preserves
+these edges; the numerical limits are unchanged.
+
+```powershell
+python -X utf8 compiler/tests/qwen3_5_decode_gdn_batched_test.py --batches 32 --sxm-architecture wide --raw-input --package results/qwen3_5_0_8b_decoder_layer_prefill/package --build-dir build-ftlpu-vs2026-direct --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json --output-dir results/qwen3_5_0_8b_decode_qkv_conv_qk_norm_wide_sxm
+```
+
+Results are written to `batch32/step0/` below that directory. `summary.json`
+checks every request's attention output, updated state, Conv cache and
+individual state heads. `runtime.pipeline.csv` is the complete staged
+runtime trace; each phase also retains its actual executed program images.
+
+The batch32 numerical run passes all 32 output, state and Conv-cache checks,
+including 512 individual state-head checks. Worst output NRMSE is 0.0128171
+(minimum cosine 0.99996597); worst individual state-head NRMSE is 0.0142080.
+The original aggregate trace time was invalidated: output DMA accounting
+added absolute C2C clocks after `clear_completed_program()` began preserving
+the global clock. Accounting now uses elapsed cycles for each download
+batch, with a planar-I/O regression checking that reported I/O time does
+not exceed elapsed system time. Timing replay records binary output hashes
+in `timing_replay.json` so the timing correction is checked independently
+of numerical tolerances.
+
+The corrected replay passes with all 101 output binaries bit-identical.
+At 500 MHz and nominal 51.2 GB/s DDR, the concatenated measured trace spans
+5,112,085 cycles (10.224170 ms): projections `[0,327836)`, the 32 state/mixer
+requests `[327836,5035768)`, and output projection `[5035768,5112085)`.
+These intervals include C2C initialization and tensor exports. They describe
+the serialized staged baseline above, not a complete decoder layer or a
+fully overlapped batch32 implementation.

@@ -1,6 +1,7 @@
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 
 #include "AttentionEmitterUtils.hpp"
+#include "CommonBarrierSchedule.hpp"
 #include "ProjectionGemmSchedule.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
@@ -81,6 +82,9 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
   const bool columnLoad = localDequant && target_.throughput().mxm_prefill_weight_streams == 1;
   const int64_t weightLoadCycles = columnLoad ? tile
       : target_.throughput().tile_rows;
+  // One-vector IW takes tile cycles, but each of the eight striped MEM
+  // slices contributes only tile/8 rows, interleaved at an eight-cycle II.
+  const int64_t weightReadRows = target_.throughput().tile_rows;
   const int64_t loadToIw = localDequant ? 0 : weightToIw;
   const int64_t weightStreamBase =
       localDequant ? target_.streams().streams_per_direction -
@@ -177,6 +181,15 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
   groupPlans.reserve(static_cast<std::size_t>(outputGroups));
   int64_t plannedPhaseStart = phaseStart;
   for (int64_t outputGroup = 0; outputGroup < outputGroups; ++outputGroup) {
+    const int64_t page = layout.outputWeightPage(outputGroup);
+    if (requestsRawMacroBarriers(op_.output.getOperation(), target_)
+        && page >= 0
+        && (outputGroup == 0 || page != layout.outputWeightPage(outputGroup - 1))) {
+      const int64_t begin = plannedPhaseStart;
+      plannedPhaseStart += commonBarrierDrainCycles(target_);
+      emitCommonBarrierCandidate(rewriter_, op_.getLoc(),
+          functionArgumentIndex(op_.getOutputWeight()), page, begin, plannedPhaseStart);
+    }
     const auto selectedWeightSlices = layout.outputWeightSlices(outputGroup);
     int64_t maxWeightReadLatency = 0;
     for (int64_t slice : selectedWeightSlices)
@@ -652,13 +665,13 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
                 rewriter_, op_.getLoc(), loadCycle - weightReadLatency(slice) + (columnLoad ? stream : 0),
                 hemisphere * target_.memory().slices_per_hemisphere + slice,
                 "read",
-                layout.outputWeightAddress(outputGroup, reductionBlock, 0) + (columnLoad ? weightLoadCycles - 1 : 0),
-                weightStreamBase + (columnLoad ? 0 : stream), weightLoadCycles, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram",
+                layout.outputWeightAddress(outputGroup, reductionBlock, 0) + (columnLoad ? weightReadRows - 1 : 0),
+                weightStreamBase + (columnLoad ? 0 : stream), weightReadRows, columnLoad ? 8 : 1, columnLoad ? -1 : 1, "sram",
                 functionArgumentIndex(op_.getOutputWeight()),
                 reductionDomainCount, reductionDomainInterval,
-                weightLoadCycles,
+                weightReadRows,
                 weightOutputGroupCount, outputGroupInterval,
-                reductionBlocks * weightLoadCycles,
+                reductionBlocks * weightReadRows,
                 layout.outputWeightBank(outputGroup),
                 layout.outputWeightPage(outputGroup));
           }

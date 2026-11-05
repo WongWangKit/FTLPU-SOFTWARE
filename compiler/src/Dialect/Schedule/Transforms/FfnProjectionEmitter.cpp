@@ -556,8 +556,10 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                 }
                 if (requestsRawMacroBarriers(ffn.getOperation(), target)
                     && target.icu_memory().common_transport_overlap_version == 1
-                    && serializedProjections && computeProjectionOffset(projection) > 0
-                    && hemisphere == 0 && pair == 0 && reduction == 0 && page >= 0) {
+                    && serializedProjections
+                    && hemisphere == 0 && reduction == 0 && page >= 0
+                    && pair % placement.getAs<mlir::IntegerAttr>("page_granularity").getInt() == 0
+                    && (pair > 0 || computeProjectionOffset(projection) > 0)) {
                     const auto binding = commonBarrierInputBinding(raw.getInput());
                     if (!binding) return mlir::failure();
                     int64_t firstRead = weightStart;

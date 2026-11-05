@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <map>
 #include <cmath>
+#include <cstdlib>
 
 // Execute independent requests with one shared executable. No tensor arithmetic
 // or instruction synthesis: ModelSession owns C2C ingress, execution, egress,
@@ -88,7 +89,15 @@ int main(int argc, char** argv) try {
         }
         package.invocations.push_back(std::move(invocation));
     }
-    auto dma = std::make_unique<ftlpu::C2cDmaSystem>();
+    const char* sxmChoice = std::getenv("FTLPU_FILE_RUNNER_SXM_ARCHITECTURE");
+    if (sxmChoice && std::string(sxmChoice) != "wide" && std::string(sxmChoice) != "local")
+        throw std::runtime_error("SXM architecture must be wide or local");
+    const auto sxmArchitecture = sxmChoice && std::string(sxmChoice) == "wide"
+        ? ftlpu::SxmTransposeArchitecture::WideStreaming
+        : ftlpu::SxmTransposeArchitecture::LocalBlocks;
+    std::cout << "sxm_architecture=" << (sxmArchitecture == ftlpu::SxmTransposeArchitecture::WideStreaming ? "wide" : "local") << '\n';
+    auto dma = std::make_unique<ftlpu::C2cDmaSystem>(ftlpu::Ddr4Config{},
+        ftlpu::hw::config::kDmaFifoDepthVectors, ftlpu::SystemHardwareConfiguration{}, sxmArchitecture);
     ModelSession session(*dma);
     session.enable_execution_trace();
     session.load(std::move(package));

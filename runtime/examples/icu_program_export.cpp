@@ -851,6 +851,19 @@ try {
         expanded += queueExpanded;
     }
 
+    const bool overlapBudgetFallback = std::any_of(program.timelines.begin(),
+        program.timelines.end(), [](const auto& timeline) {
+            return timeline.name == "c2c.serial_fallback.proof_work_bound";
+        });
+    // These are properties of the executed/linked image, not the source
+    // compiler's requested policy. Preserve safe-fallback provenance in CSV
+    // exports so a requested auto policy is not reported as actual overlap.
+    std::ofstream metadata(outputDirectory / "program.json", std::ios::trunc);
+    metadata << std::boolalpha
+        << "{\n  \"common_barrier_protocol\": " << program.common_barrier_protocol
+        << ",\n  \"transport_overlap_protocol\": " << program.transport_overlap_protocol
+        << ",\n  \"overlap_analysis_fallback\": " << overlapBudgetFallback
+        << ",\n  \"weight_page_uses\": " << program.weight_page_uses.size() << "\n}\n";
     std::ofstream readme(outputDirectory / "README.txt", std::ios::trunc);
     readme << "Source: " << input.string() << '\n'
            << "Target: " << program.target_name << '\n'

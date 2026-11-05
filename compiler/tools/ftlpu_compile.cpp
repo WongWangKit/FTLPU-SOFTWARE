@@ -63,6 +63,7 @@ struct Args {
     bool mem_slice_program{false};
     bool verify_icu_issues{false};
     bool direct_ffn_up_3d{false};
+    bool common_barrier{false};
 };
 
 InputStage parse_input_stage(const std::string& value)
@@ -97,6 +98,8 @@ Args parse_args(int argc, char** argv)
             args.kv_cache_capacity = std::stoll(next());
         else if (argument == "--pass-timing")
             args.pass_timing = true;
+        else if (argument == "--common-barrier")
+            args.common_barrier = true;
         else if (argument == "--verify-icu-issues")
             args.verify_icu_issues = true;
         else if (argument == "--direct-ffn-up-3d")
@@ -175,6 +178,7 @@ Args parse_args(int argc, char** argv)
             "[--kv-cache-capacity tokens] "
             "[--mxm-execution auto|ws|is] "
             "[--icu-compression none|control|macro|raw-macro] "
+            "[--common-barrier (raw-macro synchronization)] "
             "[--mem-slice-program on|off] "
             "[--verify-icu-issues] "
             "[--direct-ffn-up-3d (standalone, SRAM-preloaded)] "
@@ -302,6 +306,12 @@ try {
                 effectiveCompression)));
     (*module)->setAttr("ftlpu.mem_slice_program",
         mlir::BoolAttr::get(&context, effectiveMemSliceProgram));
+    if (args.common_barrier) {
+        if (effectiveCompression != ftlpu::compiler::target::IcuCompressionMode::RawMacro)
+            throw std::runtime_error("--common-barrier requires --icu-compression raw-macro");
+        (*module)->setAttr("ftlpu.common_barrier_protocol",
+            mlir::BoolAttr::get(&context, true));
+    }
     // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,

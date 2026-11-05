@@ -84,6 +84,9 @@ public:
     void record_execution_trace_interval(std::int64_t start_cycle,
         std::int64_t end_cycle, std::string resource, std::string detail,
         std::size_t issue_count = 1);
+    std::int64_t execution_trace_local_cycle(std::int64_t physical_cycle) const noexcept {
+        return physical_cycle - static_cast<std::int64_t>(loaded_physical_cycle_);
+    }
     void write_execution_trace_csv(const std::filesystem::path& path) const;
     void enable_mem_execution_trace(bool enabled = true) noexcept;
     void stream_mem_execution_trace_csv(const std::filesystem::path& path);

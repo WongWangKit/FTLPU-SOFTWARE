@@ -305,6 +305,8 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
         rewriter.getNamedAttr("config", rewriter.getDictionaryAttr({
             rewriter.getNamedAttr("strategy",
                 rewriter.getStringAttr("vxm_feedback")),
+            rewriter.getNamedAttr("materialize_gamma",
+                rewriter.getBoolAttr(materializeGamma)),
             rewriter.getNamedAttr("reduction_width",
                 rewriter.getI64IntegerAttr(tile)),
         })),

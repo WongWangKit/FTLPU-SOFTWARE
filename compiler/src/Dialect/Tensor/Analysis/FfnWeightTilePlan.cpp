@@ -1,4 +1,5 @@
 #include "ftlpu/compiler/Dialect/Tensor/Analysis/ffn_weight_tile_plan.hpp"
+#include "ftlpu/compiler/Target/weight_page_plan.hpp"
 
 #include <algorithm>
 
@@ -46,15 +47,17 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
                ? memory.hemispheres : 1) * tile);
     const int64_t sliceGroupCount = storageSlices / weightSlices;
     if (sliceGroupCount % 2 != 0) return mlir::failure();
+    const target::weight_pages::Geometry pageGeometry{
+        memory.sram_depth_rows, memory.banks_per_slice, sliceGroupCount};
     const int64_t splitProjectionGroupsPerRole = sliceGroupCount / 2;
     // Two adjacent 64-column projection waves share one doubled physical
     // reduction-row stripe. Keep the per-group capacity even and leave one
     // complete pair below the raw SRAM limit; an odd tail still occupies the
     // full doubled stripe and therefore does not save rows.
-    const int64_t rawProjectionWavesPerGroup =
-        memory.sram_depth_rows / projectionRowsPerWave;
+    const target::weight_pages::ItemLayout projectionLayout{
+        projectionRowsPerWave, 2, projectionRowsPerWave};
     const int64_t projectionWavesPerGroup =
-        2 * ((rawProjectionWavesPerGroup - 1) / 2);
+        target::weight_pages::itemsPerGroup(pageGeometry, projectionLayout);
     if (projectionWavesPerGroup <= 0) return mlir::failure();
     const bool bankLevelPingPong = projectionWaves
         <= sliceGroupCount * projectionWavesPerGroup;
@@ -91,14 +94,13 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
         result.pages.push_back(std::move(page));
     };
 
-    for (int64_t wave = 0; wave < projectionWaves;
-         wave += projectionWavesPerPage) {
-        const int64_t count = std::min(
-            projectionWavesPerPage, projectionWaves - wave);
-        const int64_t itemsInLargestGroup =
-            std::min(count, projectionWavesPerGroup);
-        const int64_t rows = divideCeil(itemsInLargestGroup, 2)
-            * 2 * projectionRowsPerWave;
+    const auto projectionPages = target::weight_pages::splitItems(
+        projectionWaves, projectionGroupsPerRole, pageGeometry, projectionLayout);
+    if (projectionPages.empty()) return mlir::failure();
+    for (const auto& itemPage : projectionPages) {
+        const int64_t wave = itemPage.item_begin;
+        const int64_t count = itemPage.item_count;
+        const int64_t rows = itemPage.rows_per_group;
         FfnWeightTilePage page {-1, -1, 0, rows,
             memory.hemispheres * weightSlices * count
                 * projectionRowsPerWave * 2,
@@ -122,8 +124,10 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
         * downOutputBlocksPerHemisphere * tile;
     const int64_t downWaves = divideCeil(shape.n, downColumnsPerWave);
     const int64_t downReductionBlocks = shape.hidden / tile;
-    const int64_t downReductionsPerGroup = memory.sram_depth_rows
-        / (downOutputBlocksPerHemisphere * rowsPerWeightTile);
+    const target::weight_pages::ItemLayout downReductionLayout{
+        downOutputBlocksPerHemisphere * rowsPerWeightTile};
+    const int64_t downReductionsPerGroup =
+        target::weight_pages::itemsPerGroup(pageGeometry, downReductionLayout);
     const int64_t downReductionsPerPage =
         sliceGroupCount * downReductionsPerGroup;
     if (downReductionsPerPage <= 0) return mlir::failure();
@@ -142,12 +146,8 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
     // fit in one bank without overwriting each other.
     const int64_t downRowsPerWave = downReductionBlocks
         * downOutputBlocksPerHemisphere * rowsPerWeightTile;
-    const bool compactDownWaves = downRowsPerWave > 0
-        && downRowsPerWave <= memory.sram_depth_rows;
-    const int64_t downWavesPerGroup = compactDownWaves
-        ? memory.sram_depth_rows / downRowsPerWave : 0;
-    const int64_t downWavesPerBank =
-        downWavesPerGroup * sliceGroupCount;
+    const bool compactDownWaves = target::weight_pages::itemsPerGroup(
+        pageGeometry, {downRowsPerWave}) > 0;
     // Keep one logical Down output wave per runtime page. Several waves may
     // remain resident simultaneously in disjoint slice-group/row slots, but
     // the page identity must stay aligned with the compute timeline and the
@@ -155,51 +155,34 @@ mlir::FailureOr<FfnWeightTilePlan> planFfnWeightTiles(
     // logical page loses that boundary and can release the tail waves before
     // their result writes drain.
     int64_t downPageIndex = 0;
+    const auto reductionPages = target::weight_pages::splitItems(
+        downReductionBlocks, sliceGroupCount, pageGeometry, downReductionLayout);
+    if (reductionPages.empty()) return mlir::failure();
     for (int64_t wave = 0; wave < downWaves; ++wave) {
-        for (int64_t reduction = 0; reduction < downReductionBlocks;
-             reduction += downReductionsPerPage) {
-            const int64_t count = std::min(
-                downReductionsPerPage, downReductionBlocks - reduction);
-            const int64_t usedGroups = divideCeil(
-                count, downReductionsPerGroup);
+        for (const auto& itemPage : reductionPages) {
+            const int64_t reduction = itemPage.item_begin;
+            const int64_t count = itemPage.item_count;
+            const int64_t usedGroups = itemPage.group_count;
             int64_t bank = -1;
             int64_t group = 0;
             int64_t baseRow = 0;
             if (compactDownWaves && reduction == 0
                 && count == downReductionBlocks) {
-                if (streamingDownDoubleBuffer && !bankLevelPingPong) {
-                    // Alternate banks for consecutive consumer tiles, but do
-                    // not throw away the remaining SRAM in either bank. Fill
-                    // every disjoint (slice-group,row-slot) before wrapping
-                    // and reusing a physical region. This preserves ping-pong
-                    // overlap while making page boundaries reflect actual
-                    // SRAM capacity instead of one logical output wave.
-                    const int64_t bankSlot = downPageIndex
-                        % memory.banks_per_slice;
-                    const int64_t slotInBank =
-                        (downPageIndex / memory.banks_per_slice)
-                        % downWavesPerBank;
-                    bank = (initialBank + bankSlot)
-                        % memory.banks_per_slice;
-                    group = slotInBank / downWavesPerGroup;
-                    baseRow = (slotInBank % downWavesPerGroup)
-                        * downRowsPerWave;
-                } else {
-                    const int64_t residentSlot = wave
-                        % (downWavesPerBank * memory.banks_per_slice);
-                    const int64_t bankSlot = residentSlot / downWavesPerBank;
-                    const int64_t slotInBank = residentSlot % downWavesPerBank;
-                    bank = (initialBank + bankSlot) % memory.banks_per_slice;
-                    group = slotInBank / downWavesPerGroup;
-                    baseRow = (slotInBank % downWavesPerGroup)
-                        * downRowsPerWave;
-                }
+                // Distinct consumer pages can share a bank while retaining
+                // distinct rows. Only the streaming schedule requests bank
+                // alternation; both policies fill every slot before reuse.
+                const auto slot = target::weight_pages::residentSlot(
+                    downPageIndex, downRowsPerWave, pageGeometry, initialBank,
+                    streamingDownDoubleBuffer && !bankLevelPingPong);
+                if (!slot) return mlir::failure();
+                bank = slot->bank;
+                group = slot->slice_group_begin;
+                baseRow = slot->base_row;
             }
             const int64_t rows = compactDownWaves
                     && reduction == 0 && count == downReductionBlocks
                 ? downRowsPerWave
-                : std::min(count, downReductionsPerGroup)
-                    * downOutputBlocksPerHemisphere * rowsPerWeightTile;
+                : itemPage.rows_per_group;
             FfnWeightTilePage page {-1, bank, baseRow, rows,
                 memory.hemispheres * weightSlices * rows, 0, {}};
             page.spans.push_back({FfnWeightTileKind::Down,

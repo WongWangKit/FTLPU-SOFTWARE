@@ -154,9 +154,8 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         ? op_.config().getAs<mlir::FloatAttr>("rope_attention_factor")
         : rewriter_.getF32FloatAttr(1.0f);
     if (rotaryDimAttr.getInt() < op_.getHeadDim()
-        && (op_.getQueryBias() || op_.getKeyBias()
-            || op_.config().getAs<mlir::IntegerAttr>("kv_cache_capacity"))) {
-        op_.emitError("partial RoPE currently requires bias-free prefill without persistent KV export");
+        && op_.config().getAs<mlir::IntegerAttr>("kv_cache_capacity")) {
+        op_.emitError("partial RoPE currently requires prefill without persistent KV export");
         return mlir::failure();
     }
     const mlir::Value inputs[] = {op_.getInput(), op_.getQueryWeight(),
@@ -199,7 +198,11 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         createBinding(rewriter_, op_.getLoc(), biases[index],
             argument.getArgNumber(), "input", "bias",
             llvm::cast<mlir::RankedTensorType>(argument.getType()),
-            placement, biasPlacements[index]);
+            placement, biasPlacements[index], "none",
+            index < 2 ? rewriter_.getDictionaryAttr({
+                rewriter_.getNamedAttr("head_dim", rewriter_.getI64IntegerAttr(op_.getHeadDim())),
+                rewriter_.getNamedAttr("rotary_dim", rotaryDimAttr)
+            }) : rewriter_.getDictionaryAttr({}));
     }
     const mlir::Value normWeights[] = {
         op_.getQueryNormWeight(), op_.getKeyNormWeight()};

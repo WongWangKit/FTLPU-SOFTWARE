@@ -217,7 +217,7 @@ set_property(SOURCE src/Dialect/Schedule/IR/ScheduleDialect.cpp
         "${CMAKE_CURRENT_BINARY_DIR}/ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.cpp.inc")
 set_property(SOURCE src/Dialect/Schedule/Transforms/VectorAluScheduleEmitter.cpp
     APPEND PROPERTY OBJECT_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/SiluMultiplyEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/ScaledMatvecEmitter.hpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/SiluMultiplyEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/ScaledMatvecEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/UnitLowerSolveEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/UnitLowerMxmEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/WeightedGramEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/HeadWeightedProductEmitter.hpp")
 file(GLOB_RECURSE FTLPU_CMODEL_COMPILER_HEADERS CONFIGURE_DEPENDS
     "${FTLPU_CMODEL_DIR}/include/ftlpu/*.hpp")
 set(FTLPU_CMODEL_COMPILER_CONSUMER_SOURCES
@@ -309,6 +309,9 @@ add_executable(attention_weight_tile_planner_test
 target_link_libraries(attention_weight_tile_planner_test PRIVATE ftlpu_compiler)
 add_test(NAME attention_weight_tile_planner_test
     COMMAND $<TARGET_FILE:attention_weight_tile_planner_test>)
+add_executable(weight_page_plan_test tests/weight_page_plan_test.cpp)
+target_link_libraries(weight_page_plan_test PRIVATE ftlpu_compiler)
+add_test(NAME weight_page_plan_test COMMAND $<TARGET_FILE:weight_page_plan_test>)
 add_executable(schedule_graph_test tests/schedule_graph_test.cpp)
 target_link_libraries(schedule_graph_test PRIVATE ftlpu_compiler)
 add_test(NAME schedule_graph_test COMMAND $<TARGET_FILE:schedule_graph_test>)
@@ -470,6 +473,18 @@ if(Python3_Interpreter_FOUND)
         COMMAND
             ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/dense_decoder_family_importer_test.py)
+    add_test(
+        NAME glm4_decoder_importer_test
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/glm4_decoder_importer_test.py)
+    add_test(
+        NAME glm4_decoder_layout_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/glm4_decoder_layout_test.py
+            --tool $<TARGET_FILE:ftlpu_opt>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/glm4_layout)
     add_test(
         NAME dense_attention_ping_pong_test
         COMMAND
@@ -683,6 +698,13 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/w8a16_ffn/ffn_32x64x128x64_bf16.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/vxm_sr_ffn
             --target-config ${FTLPU_HARDWARE_CONFIG})
+    add_test(NAME logical_weight_paging_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/logical_weight_paging_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/logical_weight_paging)
     add_test(NAME distributed_projection_staging_runtime_test
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/distributed_projection_staging_runtime_test.py
@@ -699,6 +721,48 @@ if(Python3_Interpreter_FOUND)
             --runner $<TARGET_FILE:compiled_stage_file_runner>
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/chain_gates)
+    add_test(NAME chain_vxm_gates_fp32_softplus_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/chain_vxm_gates_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --log-softplus --token-halves --fp32-ingress
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/chain_gates_fp32_softplus)
+    add_test(NAME chain_vxm_gates_paired_recurrence_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/chain_vxm_gates_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --log-softplus --token-halves --fp32-ingress --decay-factor
+            --paired-projections --with-recurrence
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/chain_gates_paired_recurrence)
+    add_test(NAME chain_vxm_gates_chunkwise_prefix_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/chain_vxm_gates_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --log-softplus --token-halves --fp32-ingress
+            --paired-projections --with-prefix
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/chain_gates_chunkwise_prefix)
+    set_tests_properties(chain_vxm_gates_fp32_softplus_runtime_test
+        chain_vxm_gates_chunkwise_prefix_runtime_test
+        chain_vxm_gates_paired_recurrence_runtime_test PROPERTIES
+        ENVIRONMENT "FTLPU_FILE_RUNNER_SXM_ARCHITECTURE=wide;FTLPU_FILE_RUNNER_MODEL_SESSION=1")
+    add_test(NAME projection_conv_chunk_views_seq64_runtime_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/projection_conv_direct_view_runtime_test.py
+            --compile $<TARGET_FILE:ftlpu_compile>
+            --graph-compile $<TARGET_FILE:ftlpu_graph_compile>
+            --runner $<TARGET_FILE:compiled_stage_file_runner>
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --channels 2048 --seq-len 64 --wide-sxm
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/projection_conv_chunk_views_seq64)
     foreach(conv_channels IN ITEMS 64 2048)
         add_test(NAME chain_vxm_conv_${conv_channels}_runtime_test
             COMMAND ${Python3_EXECUTABLE}
@@ -1095,6 +1159,30 @@ if(Python3_Interpreter_FOUND)
             --runner $<TARGET_FILE:compiled_stage_file_runner>
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/gdn_decode_graph_runtime)
+        add_test(NAME unit_lower_solve_produced_rhs_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit_lower_solve_runtime_test.py
+            --build-dir ${CMAKE_BINARY_DIR}
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --heads 4 --dim 128 --produced-rhs
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/unit_lower_solve_produced_rhs)
+        set_tests_properties(unit_lower_solve_produced_rhs_runtime_test PROPERTIES TIMEOUT 300)
+        add_test(NAME packed_scalar_broadcast_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/packed_scalar_broadcast_runtime_test.py
+            --build-dir ${CMAKE_BINARY_DIR}
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/packed_scalar_broadcast)
+        set_tests_properties(packed_scalar_broadcast_runtime_test PROPERTIES TIMEOUT 300)
+        foreach(decode_test activation_batch_matmul_test glm4_decode_core_test)
+          add_test(NAME ${decode_test}
+            COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/${decode_test}.py
+              --build-dir ${CMAKE_BINARY_DIR}
+              --target-config ${FTLPU_HARDWARE_CONFIG}
+              --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/${decode_test})
+          set_tests_properties(${decode_test} PROPERTIES TIMEOUT 1200)
+        endforeach()
         foreach(native_vector_test packed_vector_graph_runtime_test vxm_queue_group_runtime_test vector_memory_plan_runtime_test)
           add_test(NAME ${native_vector_test}
             COMMAND ${Python3_EXECUTABLE}

@@ -25,11 +25,12 @@ public:
         std::uint32_t launch{};
         std::vector<std::uint16_t> streams{};
     };
-    explicit CommonOverlapCalendar(const BinaryProgram& program)
+    explicit CommonOverlapCalendar(const BinaryProgram& program,
+                                   std::size_t max_issues = 8'000'000)
         : streams_(program.hardware.streams_per_direction),
           lanes_(program.hardware.c2c_streams_per_direction),
           tile_rows_(program.hardware.tile_rows),
-          stream_issues_(streams_)
+          stream_issues_(streams_), stream_spans_(streams_)
     {
         const auto& h = program.hardware;
         guard_ = static_cast<std::uint64_t>(h.system_register_columns)
@@ -46,11 +47,10 @@ public:
             return q.kind == QueueKind::C2cDma || q.kind == QueueKind::C2cRx
                 || q.kind == QueueKind::C2cTx;
         });
-        const auto timeline = inspect_logical_issues(computation,8'000'000);
-        std::size_t count = 0;
+        const auto timeline = inspect_logical_issues(computation,max_issues);
         for (const auto& q : timeline.queues) for (const auto& issue : q.issues) {
-            if (++count > 8'000'000 || issue.cycle > std::numeric_limits<std::uint32_t>::max())
-                throw std::invalid_argument("overlap proof exceeds finite issue/cycle bound");
+            if (issue.cycle > std::numeric_limits<std::uint32_t>::max())
+                throw std::invalid_argument("overlap proof exceeds finite cycle bound");
             all_issues_.push_back(issue.cycle);
             const auto& c = issue.instruction;
             const auto bits = static_cast<std::uint64_t>(c.words[0])
@@ -87,13 +87,50 @@ public:
                 break;
             }
             case InstructionKind::MxmDequant: break; // local weight registers
-            case InstructionKind::Vxm:
-                // The chain VXM target replaced explicit SR operands with
-                // captured input groups and internal feedback. The legacy
-                // v38 lease proof cannot infer their lifetime from issue time.
-                // QCTL uses the Native phase plan and does not use this proof.
-                throw std::invalid_argument(
-                    "legacy transport overlap proof does not support chain VXM; use queue control");
+            case InstructionKind::Vxm: {
+                const auto decoded = isa::decode_vxm_instruction(q.index,
+                    {bits, c.words[2]});
+                const auto& instruction = decoded.instruction;
+                // A configuration can consume a vector train after its ICU
+                // issue. Reserve through its final vector, plus the common
+                // drain guard. Internal Original/Aux/Feedback operands are
+                // local registers, not new SR reads.
+                const auto end = issue.cycle + instruction.repeat_count - 1;
+                if (end > std::numeric_limits<std::uint32_t>::max())
+                    throw std::invalid_argument("overlap VXM train exceeds finite cycle bound");
+                all_issues_.push_back(end);
+                if (end>issue.cycle) all_spans_.push_back({issue.cycle,end});
+                const auto reserve = [&](std::size_t base, std::size_t width) {
+                    mark(base,width);
+                    for (std::size_t i=0;i<width;++i) {
+                        stream_issues_[base+i].push_back(end);
+                        if(end>issue.cycle) stream_spans_[base+i].push_back({issue.cycle,end});
+                    }
+                };
+                // One compact C0..C7 queue drives both physical halves. The
+                // mirrored C8..C15 operands use different fixed SR bundles;
+                // they remain occupied even when their producer is passive
+                // forwarding rather than another MEM issue at this cycle.
+                constexpr auto mirroredOffset = VxmLane::kAluCount / 2;
+                if (q.index >= mirroredOffset)
+                    throw std::invalid_argument("overlap proof VXM control stage is invalid");
+                for (const auto stage : {q.index, q.index + mirroredOffset}) {
+                    for (const bool rhs : {false,true}) {
+                        const auto kind = (rhs ? instruction.rhs : instruction.lhs).kind;
+                        if (kind == VxmLaneOperandKind::StreamFloat16
+                            || kind == VxmLaneOperandKind::StreamBFloat16
+                            || kind == VxmLaneOperandKind::StreamFloat32)
+                            reserve(VxmLane::fixed_input_base_for_stage(stage,rhs,kind),
+                                VxmLane::stream_operand_bytes(kind));
+                    }
+                    if (instruction.output_stream)
+                        reserve(stage == q.index ? *instruction.output_stream :
+                            VxmLane::fixed_output_stream_for_block(VxmLane::block_for_stage(stage)),
+                            instruction.output_type == VxmCastTarget::Float32 ? 4 :
+                            instruction.output_type == VxmCastTarget::Int8 ? 1 : 2);
+                }
+                break;
+            }
             case InstructionKind::Sxm: {
                 if (c.extension_words.size() < 2)
                     throw std::invalid_argument("overlap proof SXM stream list missing");
@@ -118,7 +155,8 @@ public:
             earliest=std::max(earliest,release(it->second,stop,tile_rows_));
         std::vector<std::uint64_t> available(streams_);
         for (std::size_t s=0;s<streams_;++s)
-            available[s]=std::max(earliest,release(stream_issues_[s],stop,guard_));
+            available[s]=std::max({earliest,release(stream_issues_[s],stop,guard_),
+                crossing_release(stream_spans_[s],stop,guard_)});
         const auto e=*std::min_element(available.begin(),available.end());
         if (e>stop) throw std::invalid_argument("no proved MEM/SR overlap lease before safe stop");
         Selection selected{static_cast<std::uint32_t>(e),{}};
@@ -131,7 +169,7 @@ public:
                   std::span<const std::size_t> queues,
                   std::span<const std::uint16_t> streams) const
     {
-        if (release(all_issues_,stop,guard_)>stop)
+        if (std::max(release(all_issues_,stop,guard_),crossing_release(all_spans_,stop,guard_))>stop)
             throw std::invalid_argument("unsafe overlap stop: computation has no full drain window");
         if (launch>stop || streams.empty() || streams.size()>lanes_)
             throw std::invalid_argument("invalid overlap lease domain");
@@ -139,10 +177,19 @@ public:
             if (release(it->second,stop,tile_rows_)>launch)
                 throw std::invalid_argument("overlap lease conflicts with computation MEM port");
         for (const auto s:streams)
-            if (s>=streams_ || release(stream_issues_[s],stop,guard_)>launch)
+            if (s>=streams_ || std::max(release(stream_issues_[s],stop,guard_),
+                    crossing_release(stream_spans_[s],stop,guard_))>launch)
                 throw std::invalid_argument("overlap lease conflicts with computation SR propagation");
     }
 private:
+    using Span=std::pair<std::uint64_t,std::uint64_t>;
+    static std::uint64_t crossing_release(const std::vector<Span>& spans,
+                                         std::uint32_t stop,std::uint64_t guard) {
+        std::uint64_t result=0;
+        for(const auto& [begin,end]:spans)
+            if(begin<stop && end>=stop) result=std::max(result,end+guard);
+        return result;
+    }
     static void normalize(std::vector<std::uint64_t>& v) {
         std::ranges::sort(v); v.erase(std::ranges::unique(v).begin(),v.end());
     }
@@ -155,6 +202,8 @@ private:
     std::uint64_t tile_rows_,guard_{};
     std::vector<std::uint64_t> all_issues_;
     std::vector<std::vector<std::uint64_t>> stream_issues_;
+    std::vector<Span> all_spans_;
+    std::vector<std::vector<Span>> stream_spans_;
     std::map<std::size_t,std::vector<std::uint64_t>> mem_issues_;
 };
 } // namespace ftlpu::software::runtime

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a seq32 bias-free dense decoder StableHLO fixture."""
+"""Generate a seq32 dense decoder StableHLO graph, optionally with QKV bias."""
 
 from __future__ import annotations
 
@@ -81,6 +81,7 @@ def generate(
     residual_scale: float = 1.0,
     rotary_dim: int | None = None,
     rope_attention_factor: float = 1.0,
+    attention_bias: bool = False,
 ) -> str:
     if query_heads % kv_heads:
         raise ValueError("query heads must be divisible by KV heads")
@@ -89,18 +90,19 @@ def generate(
     text = source.read_text(encoding="utf-8")
     text = text.replace("qwen2_5_1_5b_decoder_layer_seq32", name)
 
-    for line in (
-        "      %query_bias: tensor<1536xbf16>,\n",
-        "      %key_bias: tensor<256xbf16>,\n",
-        "      %value_bias: tensor<256xbf16>,\n",
-    ):
-        text = text.replace(line, "")
-    bias_begin = text.index("    %attention_query_bias_2d")
-    heads_begin = text.index("    %attention_query_heads", bias_begin)
-    text = text[:bias_begin] + text[heads_begin:]
-    text = text.replace("%attention_query_biased", "%attention_query_2d")
-    text = text.replace("%attention_key_biased", "%attention_key_2d")
-    text = text.replace("%attention_value_biased", "%attention_value_2d")
+    if not attention_bias:
+        for line in (
+            "      %query_bias: tensor<1536xbf16>,\n",
+            "      %key_bias: tensor<256xbf16>,\n",
+            "      %value_bias: tensor<256xbf16>,\n",
+        ):
+            text = text.replace(line, "")
+        bias_begin = text.index("    %attention_query_bias_2d")
+        heads_begin = text.index("    %attention_query_heads", bias_begin)
+        text = text[:bias_begin] + text[heads_begin:]
+        text = text.replace("%attention_query_biased", "%attention_query_2d")
+        text = text.replace("%attention_key_biased", "%attention_key_2d")
+        text = text.replace("%attention_value_biased", "%attention_value_2d")
 
     text = transform_tensor_types(
         text,

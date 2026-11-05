@@ -1794,7 +1794,8 @@ C2cWeightPager::C2cWeightPager(C2cDmaSystem& system)
 {
 }
 
-void C2cWeightPager::begin_schedule(BinaryProgram& program)
+void C2cWeightPager::begin_schedule(BinaryProgram& program,
+                                  std::size_t overlap_analysis_budget)
 {
     common_barrier_protocol_ = program.common_barrier_protocol;
     if (!common_barrier_protocol_ && std::ranges::any_of(program.queues,
@@ -1884,8 +1885,22 @@ void C2cWeightPager::begin_schedule(BinaryProgram& program)
     common_events_.clear();
     common_page_ranges_.clear();
     overlap_calendar_.reset();
-    if (program.transport_overlap_protocol)
-        overlap_calendar_ = std::make_shared<CommonOverlapCalendar>(program);
+    if (program.transport_overlap_protocol) {
+        try {
+            overlap_calendar_ = std::make_shared<CommonOverlapCalendar>(program, overlap_analysis_budget);
+        } catch (const LogicalIssueAnalysisLimit&) {
+            // Overlap is an optional optimization. A finite proof budget can
+            // be exhausted by a valid long scan; retain its compiler-declared
+            // drained common stops and synchronize real MEM commits there.
+            // Do not catch malformed images, invalid resources or unsafe
+            // drain windows. They are not a reason to relax the contract.
+            // Persist the resolved protocol in the linked binary too. The
+            // loader independently validates it, and must not retry the
+            // exhausted overlap proof or interpret serial launches as early.
+            program.transport_overlap_protocol = false;
+            program.timelines.push_back({"c2c.serial_fallback.proof_work_bound", 0, 0});
+        }
+    }
     if (common_barrier_protocol_) {
         for (const auto& queue : program.queues)
             if ((queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cRx)

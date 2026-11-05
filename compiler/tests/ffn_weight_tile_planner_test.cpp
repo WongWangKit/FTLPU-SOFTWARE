@@ -33,7 +33,19 @@ try {
         || plan->down_reduction_blocks_per_page != 1024
         || plan->minimum_hidden_slices != 9
         || plan->pages.size() != 21)
-        throw std::logic_error("unexpected Qwen FFN tile geometry");
+        throw std::logic_error("unexpected Qwen FFN tile geometry: bank_bytes="
+            + std::to_string(plan->bank_bytes) + " waves="
+            + std::to_string(plan->projection_wave_count) + " storage_slices="
+            + std::to_string(plan->weight_storage_slice_count) + " groups="
+            + std::to_string(plan->slice_group_count) + " waves/page="
+            + std::to_string(plan->projection_waves_per_page) + " waves/group="
+            + std::to_string(plan->projection_waves_per_slice_group) + " down_waves="
+            + std::to_string(plan->down_wave_count) + " reductions/page="
+            + std::to_string(plan->down_reduction_blocks_per_page) + " hidden_slices="
+            + std::to_string(plan->minimum_hidden_slices) + " pages="
+            + std::to_string(plan->pages.size()) + " mxm_rows="
+            + std::to_string(throughput.mxm_rows) + " tile_rows="
+            + std::to_string(throughput.tile_rows));
 
     const auto projectionPages = std::count_if(
         plan->pages.begin(), plan->pages.end(), [](const auto& page) {

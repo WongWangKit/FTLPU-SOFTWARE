@@ -317,6 +317,25 @@ createFfnEmissionContext(mlir::IRRewriter& rewriter,
         // Serialized issue domains still overlap their result-write tail.
         // Budget one guard to finish that tail and one full idle guard.
         const auto drain = 2 * commonBarrierDrainCycles(target);
+        const auto gateGranularity = gateRaw.getPlacement().getAs<mlir::IntegerAttr>("page_granularity");
+        const auto upGranularity = upRaw.getPlacement().getAs<mlir::IntegerAttr>("page_granularity");
+        if (gateGranularity && upGranularity
+            && gateGranularity.getInt() == upGranularity.getInt()) {
+            const int64_t pairsPerPage = gateGranularity.getInt();
+            // Keep every page boundary as a real drained interval in the
+            // operator timeline. The same per-page affine regions feed MEM,
+            // MXM and result domains; no already-issued ICU loop is paused.
+            for (auto& block : projectionTimeline->blocks) {
+                const int64_t offset = (block.pair / pairsPerPage) * drain;
+                block.dequant_start += offset;
+                block.weight_compute_cycle += offset;
+                for (auto& tileSchedule : block.tiles)
+                    tileSchedule.compute_cycle += offset;
+            }
+            const int64_t added = ((projectionTimeline->pair_count - 1) / pairsPerPage) * drain;
+            projectionTimeline->second_projection_offset += added;
+            projectionTimeline->final_projection_cycle += 2 * added;
+        }
         projectionTimeline->second_projection_offset += drain;
         projectionTimeline->final_projection_cycle += drain;
     }

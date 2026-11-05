@@ -1138,6 +1138,7 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
   while (cursor[0] < byHemisphere[0].size() ||
          cursor[1] < byHemisphere[1].size()) {
     c2c_system_->clear_completed_program();
+    const std::size_t batchBeginCycle = c2c_system_->cycle();
     struct BatchSegment {
       std::size_t image_index{0};
       std::uint64_t ddr_address{0};
@@ -1309,7 +1310,7 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
           detail += std::to_string(queue) + ",";
       throw std::runtime_error(detail);
     }
-    stats_.c2c_egress_cycles += c2c_system_->cycle();
+    stats_.c2c_egress_cycles += c2c_system_->cycle() - batchBeginCycle;
 
     for (const BatchSegment &copy : batch) {
       const PackedWeightSegment &segment = image.segments[copy.image_index];
@@ -1761,6 +1762,11 @@ void ModelSession::schedule_executable_weight_pages(BinaryProgram &program) {
   std::ranges::sort(launchOrder, [&](std::size_t lhs, std::size_t rhs) {
     const auto &left = executable_weight_transfers_[lhs].plan;
     const auto &right = executable_weight_transfers_[rhs].plan;
+    // A later consumer must not precede an earlier consumer in the physical
+    // DMA/RX FIFOs: the earlier common stop would freeze the later launch.
+    // Launch eligibility can still precede its consumer and overlap compute.
+    if (program.common_barrier_protocol && left.ready_cycle!=right.ready_cycle)
+      return left.ready_cycle<right.ready_cycle;
     return left.start_cycle != right.start_cycle
                ? left.start_cycle < right.start_cycle
                : left.ready_cycle < right.ready_cycle;
@@ -2220,22 +2226,30 @@ void ModelSession::record_weight_page_trace(
     else if (transfer.plan.pre_execution)
       detail << "pre_execution";
     else
-      detail << "overlap";
+      detail << (transfer.fence.scheduled_start_cycle < transfer.plan.ready_cycle
+                     ? "overlap" : "serialized");
     if (transfer.model_page_index)
       detail << " scope=model invocation_page="
              << *transfer.model_page_index;
-    runtime_.record_execution_trace_interval(*transfer.actual_start_cycle,
-        transportReady,
+    // Tick observations use the runtime's absolute physical clock. The trace
+    // segment adds its own origin; standalone pre-execution transfers already
+    // carry local timestamps.
+    const bool absolute = !transfer.plan.pre_execution || transfer.inter_invocation_lookahead;
+    const auto traceStart = absolute ? runtime_.execution_trace_local_cycle(*transfer.actual_start_cycle)
+                                    : *transfer.actual_start_cycle;
+    const auto traceEnd = absolute ? runtime_.execution_trace_local_cycle(transportReady) : transportReady;
+    runtime_.record_execution_trace_interval(traceStart,
+        traceEnd,
         std::string("C2C.") + sideName + ".Prefetch", detail.str());
-    runtime_.record_execution_trace_interval(*transfer.actual_start_cycle,
-        transportReady,
+    runtime_.record_execution_trace_interval(traceStart,
+        traceEnd,
         std::string("SR.") + sideName + ".C2C.Shared",
         "page=" + std::to_string(transfer.plan.page_index) +
             " bank=" + std::to_string(transfer.plan.bank) +
             " streams=" + std::to_string(fabricStreamBase) + ".." +
             std::to_string(fabricStreamBase + c2cStreamCount - 1));
-    runtime_.record_execution_trace_interval(*transfer.actual_start_cycle,
-        transportReady,
+    runtime_.record_execution_trace_interval(traceStart,
+        traceEnd,
         std::string("MEM.") + sideName + ".C2CWrite",
         "page=" + std::to_string(transfer.plan.page_index) +
             " bank=" + std::to_string(transfer.plan.bank));

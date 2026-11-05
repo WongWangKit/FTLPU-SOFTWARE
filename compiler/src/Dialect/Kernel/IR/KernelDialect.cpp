@@ -255,9 +255,9 @@ LogicalResult ScaledMatvecOp::verify()
     if(!getEpilogue().empty()) {
         auto v=llvm::cast<RankedTensorType>(getEpilogue()[0].getType());
         auto b=llvm::cast<RankedTensorType>(getEpilogue()[1].getType());
-        if(v.getShape()!=p.getShape() || !v.getElementType().isBF16()
+        if(v.getShape()!=p.getShape() || (!v.getElementType().isBF16() && !v.getElementType().isF32())
             || b!=d || getCorrection()[0].getType()!=p)
-            return emitOpError("epilogue needs BF16 value shaped like product, coefficient shaped like scale, and FP32 correction");
+            return emitOpError("epilogue needs BF16/FP32 value shaped like product, coefficient shaped like scale, and matching correction");
         if(getCorrection().size()>=2 && getCorrection()[1].getType()!=m)
             return emitOpError("rank-one updated matrix must match matrix type");
         if(getEpilogue().size()==3 && (getEpilogue()[2].getType()!=k || getCorrection()[2].getType()!=p))
@@ -268,12 +268,78 @@ LogicalResult ScaledMatvecOp::verify()
 
 LogicalResult VectorAluOp::verify()
 {
+    if(auto reduction=(*this)->getAttrOfType<StringAttr>("reduction_kind")) {
+        if(!getReduce() || (reduction.getValue()!="add" && reduction.getValue()!="max"))
+            return emitOpError("reduction_kind requires reduce=true and add or max");
+        if(reduction.getValue()=="max" && (!getUseImmediate() || getKind()!="max"
+            || getImmediate().convertToFloat()!=0.f))
+            return emitOpError("max reduction requires explicit zero clamp");
+    }
     const auto lhs = getLhs().getType();
     const auto rhs = getRhs().getType();
     const auto result = getResult().getType();
     const auto floating = [](Type t) {
         return t.isBF16() || t.isF16() || t.isF32();
     };
+    if(getKind()=="head_last_row_scale_transpose" || getKind()=="head_cross_product") {
+        if(!lhs.hasStaticShape() || !rhs.hasStaticShape() || !result.hasStaticShape() ||
+           lhs.getRank()!=2 || rhs.getRank()!=2 || result.getRank()!=2 || getUseImmediate() || getReduce())
+            return emitOpError("weighted head product requires static rank-two operands");
+        const int64_t h=rhs.getDimSize(0)/32;
+        if(h<=0 || h>32 || h%2 || rhs.getDimSize(0)!=h*32 || !lhs.getElementType().isBF16())
+            return emitOpError("weighted head product requires even H<=32 and BF16 keys");
+        if(getKind()=="head_last_row_scale_transpose") {
+            if(lhs.getDimSize(0)!=32 || lhs.getDimSize(1)%(h*32) || !rhs.getElementType().isBF16() ||
+               rhs.getDimSize(1)!=32 || !result.getElementType().isBF16() || result.getDimSize(0)!=lhs.getDimSize(1) || result.getDimSize(1)!=32)
+                return emitOpError("scale-transpose needs K[32,H*K], R[H*32,32] and BF16 result[H*K,32]");
+        } else if(lhs.getDimSize(0)%(h*32) || lhs.getDimSize(1)!=32 || !rhs.getElementType().isF32() ||
+                  rhs.getDimSize(1)<=0 || rhs.getDimSize(1)%32 || !result.getElementType().isF32() ||
+                  result.getDimSize(0)!=lhs.getDimSize(0) || result.getDimSize(1)!=rhs.getDimSize(1))
+            return emitOpError("cross-product needs BF16 A[H*K,32], FP32 D[H*32,V] and FP32 result[H*K,V]");
+        return success();
+    }
+    if (getKind()=="head_scale" || (getKind()=="unit_lower_solve" || getKind()=="unit_lower_solve_blocked") || getKind()=="unit_lower_inverse" || getKind()=="head_matmul") {
+        const bool solve=getKind()!="head_scale";
+        if(!lhs.hasStaticShape() || !rhs.hasStaticShape() || !result.hasStaticShape() ||
+           lhs.getRank()!=2 || rhs.getRank()!=2 || result.getRank()!=2 ||
+           getUseImmediate() || getReduce() || !result.getElementType().isF32())
+            return emitOpError("head_scale/solve require static rank-two tensors and FP32 output");
+        const int64_t heads=solve?lhs.getDimSize(0)/32:rhs.getDimSize(1);
+        const int64_t dim=solve?rhs.getDimSize(1):lhs.getDimSize(1)/std::max<int64_t>(1,heads);
+        if(heads<=0 || heads>32 || heads%2 || dim<=0 || dim%32 ||
+           result.getDimSize(0)!=heads*32 || result.getDimSize(1)!=dim ||
+           !rhs.getElementType().isF32() ||
+           (solve ? (!lhs.getElementType().isF32() || lhs.getDimSize(0)!=heads*32 || lhs.getDimSize(1)!=32 || rhs!=result)
+                  : (!lhs.getElementType().isBF16() || lhs.getDimSize(0)!=32 || rhs.getDimSize(0)!=32 || lhs.getDimSize(1)!=heads*dim)))
+            return emitOpError("head_scale needs BF16 V[32,H*D], FP32 beta[32,H]; solve needs FP32 L[H*32,32], B[H*32,D]; even H<=32, D multiple of 32");
+        if(getKind()=="unit_lower_inverse" && dim!=32) return emitOpError("inverse requires 32x32 identity RHS per head");
+        if(auto precision=(*this)->getAttrOfType<StringAttr>("mxm_precision"))
+            if(getKind()!="head_matmul" || (precision.getValue()!="bf16" && precision.getValue()!="fp32-components"))
+                return emitOpError("mxm_precision requires head_matmul and bf16 or fp32-components");
+        return success();
+    }
+    if(getKind()=="gram_row_scale" || getKind()=="head_mask") {
+        const int64_t heads=lhs.getRank()==2?lhs.getDimSize(0)/32:0;
+        const bool scale=getKind()=="gram_row_scale";
+        if(!lhs.hasStaticShape() || !rhs.hasStaticShape() || lhs.getRank()!=2 || rhs.getRank()!=2 ||
+           heads<=0 || heads>32 || heads%2 || lhs.getDimSize(0)!=heads*32 || lhs.getDimSize(1)!=32 ||
+           result!=lhs || !lhs.getElementType().isF32() || getUseImmediate() || getReduce() ||
+           rhs.getDimSize(0)!=32 || rhs.getDimSize(1)!=(scale?heads:32) ||
+           (scale?!rhs.getElementType().isF32():!rhs.getElementType().isBF16()))
+            return emitOpError("gram_row_scale/head_mask require FP32 [H*32,32], FP32 scale[32,H] or BF16 mask[32,32]");
+        return success();
+    }
+    if (getKind()=="cross_gram") {
+        const int64_t heads=result.getRank()==2?result.getDimSize(0)/32:0;
+        if (!lhs.hasStaticShape() || !rhs.hasStaticShape() || !result.hasStaticShape() ||
+            lhs.getRank()!=2 || rhs!=lhs || result.getRank()!=2 ||
+            lhs.getDimSize(0)!=32 || heads<=0 || heads>32 || heads%2 ||
+            result.getDimSize(0)!=heads*32 || result.getDimSize(1)!=32 ||
+            lhs.getDimSize(1)<=0 || lhs.getDimSize(1)%(32*heads) ||
+            !lhs.getElementType().isBF16() || !result.getElementType().isF32() || getUseImmediate() || getReduce())
+            return emitOpError("cross_gram needs BF16 Q/K[32,H*D], FP32 result[H*32,32], even H<=32 and D multiple of 32");
+        return success();
+    }
     if (getKind()=="weighted_gram") {
         const bool transposed=rhs.getElementType().isBF16();
         const int64_t heads=rhs.getRank()==2 ? (transposed?rhs.getDimSize(0)/32:rhs.getDimSize(1)) : 0;
@@ -335,8 +401,9 @@ LogicalResult VectorAluOp::verify()
     if ((getKind() == "sigmoid" || getKind() == "softplus") &&
         (!getUseImmediate() || getReduce() || !result.getElementType().isF32()))
         return emitOpError("semantic sigmoid/softplus require unary non-reducing FP32 output");
-    if (getReduce() && getKind() != "multiply")
-        return emitOpError("row reduction currently sums products");
+    const auto reduction=(*this)->getAttrOfType<StringAttr>("reduction_kind");
+    if (getReduce() && getKind() != "multiply" && !(reduction && reduction.getValue()=="max"))
+        return emitOpError("row reduction requires a product sum or explicit clamped maximum");
     return success();
 }
 

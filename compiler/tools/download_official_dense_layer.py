@@ -15,6 +15,7 @@ OFFICIAL_REPOS = {
     'phi4_mini': 'microsoft/Phi-4-mini-instruct',
     'smollm3_3b': 'HuggingFaceTB/SmolLM3-3B',
     'glm_edge_1_5b': 'zai-org/glm-edge-1.5b-chat',
+    'glm4_9b': 'zai-org/glm-4-9b',
     'minicpm4_0_5b': 'openbmb/MiniCPM4-0.5B',
 }
 # Kept separate so the dense acceptance suite does not accidentally include
@@ -60,6 +61,9 @@ def download(model, output, revision='main', layer=0, embedding_rows=32, headers
     if model == 'qwen3_5_0_8b':
         prefix = f'model.language_model.layers.{layer}'
         embedding = 'model.language_model.embed_tokens.weight'
+    if config.get('model_type') == 'chatglm':
+        prefix = f'transformer.encoder.layers.{layer}'
+        embedding = 'transformer.embedding.word_embeddings.weight'
     files = {f['rfilename'] for f in info['siblings']}
     output.mkdir(parents=True, exist_ok=True)
     (output / 'config.json').write_bytes(config_bytes)

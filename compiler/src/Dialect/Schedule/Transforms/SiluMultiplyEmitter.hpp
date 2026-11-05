@@ -69,11 +69,12 @@ mlir::LogicalResult emitNativeSiluMultiply(mlir::IRRewriter& r,
         const int64_t base=field(words[0],"address");
         const int64_t rowStride=half>1?field(words[1],"address")-base:0;
         const int64_t blockStride=blocks>1?field(words[half],"address")-base:0;
+        bool affine=true;
         for(int64_t b=0;b<blocks;++b) for(int64_t h=0;h<half;++h)
             if(words[b*half+h].getAs<mlir::DictionaryAttr>("placement")!=p
                 || field(words[b*half+h],"address")!=base+h*rowStride+b*blockStride)
-                return function.emitError("native SiLU word domain must be affine");
-        for(int byte=0;byte<2;++byte) {
+                affine=false;
+        if(affine)for(int byte=0;byte<2;++byte) {
             const auto slice=llvm::cast<mlir::IntegerAttr>(ids[byte]).getInt();
             const auto latency=*target.transport_latency(target::StreamEndpoint::Mem,
                 target::StreamEndpoint::VxmInput,target::StreamDirection::West,slice);
@@ -81,6 +82,28 @@ mlir::LogicalResult emitNativeSiluMultiply(mlir::IRRewriter& r,
                 side*target.memory().slices_per_hemisphere+slice,"read",base,
                 32+side*16+operand*2+byte,half,1,rowStride,blocks,half,blockStride,
                 1,1,0,-1,field(p,"bank"));
+        }
+        else for(int64_t first=0;first<count;) {
+            // Different retained producer tiles form piecewise affine homes.
+            // Emit their read domains directly into one uninterrupted chain,
+            // rather than joining them through an intermediate MEM buffer.
+            const auto home=words[first].getAs<mlir::DictionaryAttr>("placement");
+            const auto address=field(words[first],"address");
+            int64_t stride=0,n=1;
+            if(first+1<count && words[first+1].getAs<mlir::DictionaryAttr>("placement")==home)
+                stride=field(words[first+1],"address")-address;
+            while(first+n<count && words[first+n].getAs<mlir::DictionaryAttr>("placement")==home &&
+                  field(words[first+n],"address")==address+n*stride)++n;
+            const auto slices=home.getAs<mlir::ArrayAttr>("slices");
+            for(int byte=0;byte<2;++byte) {
+                const auto slice=llvm::cast<mlir::IntegerAttr>(slices[byte]).getInt();
+                const auto latency=*target.transport_latency(target::StreamEndpoint::Mem,
+                    target::StreamEndpoint::VxmInput,target::StreamDirection::West,slice);
+                direct_domain_detail::emitMem3D(r,loc,target,start+first-latency,
+                    side*target.memory().slices_per_hemisphere+slice,"read",address,
+                    32+side*16+operand*2+byte,n,1,stride,1,1,0,1,1,0,-1,field(home,"bank"));
+            }
+            first+=n;
         }
     }
     // C0 captures z as original and normalized x as auxiliary; both travel

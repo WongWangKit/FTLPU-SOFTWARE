@@ -23,11 +23,31 @@ SUPPORTED_MODEL_TYPES = {
     "smollm3",
     "minicpm",
     "glm",
+    "chatglm",
 }
 
 
 def decoder_config(root_config: dict[str, object]) -> dict[str, object]:
     """Returns the text decoder config from a text or multimodal wrapper."""
+    if root_config.get("model_type") == "chatglm":
+        # Original GLM-4-9B checkpoint ABI, normalized to the shared dense IR.
+        # Reject architectural variants rather than silently treating them as
+        # the supported pre-norm, MQA, bias-free SwiGLU decoder.
+        if (not root_config.get("rmsnorm", True)
+                or root_config.get("add_bias_linear", False)
+                or root_config.get("apply_residual_connection_post_layernorm", False)
+                or root_config.get("fp32_residual_connection", False)
+                or not root_config.get("multi_query_attention", False)):
+            raise ValueError("ChatGLM import requires pre-RMSNorm, MQA, BF16 residuals and no general linear bias")
+        config = dict(root_config)
+        config.update(intermediate_size=int(config["ffn_hidden_size"]),
+            num_key_value_heads=int(config["multi_query_group_num"]),
+            num_hidden_layers=int(config["num_layers"]), head_dim=int(config["kv_channels"]),
+            rms_norm_eps=float(config["layernorm_epsilon"]), hidden_act="silu",
+            attention_bias=bool(config.get("add_qkv_bias", False)),
+            rope_theta=10000.0 * float(config.get("rope_ratio", 1.0)),
+            partial_rotary_factor=0.5)
+        return config
     if root_config.get("model_type") is None:
         architectures = root_config.get("architectures", [])
         if any(str(name).startswith("MiniCPM") for name in architectures):
@@ -48,6 +68,8 @@ def checkpoint_prefixes(
     root_config: dict[str, object], layer: int
 ) -> tuple[str, str]:
     """Returns decoder-layer and embedding prefixes used by HF checkpoints."""
+    if root_config.get("model_type") == "chatglm":
+        return f"transformer.encoder.layers.{layer}", "transformer.embedding.word_embeddings.weight"
     if root_config.get("model_type") == "mistral3":
         return (
             f"language_model.model.layers.{layer}",
@@ -117,9 +139,18 @@ class SafeTensorStore:
         return name in self.weight_map
 
 
-def canonicalize_glm_qk(weight: np.ndarray, head_dim: int) -> np.ndarray:
+def glm_qk_permutation(head_dim: int, rotary_dim: int | None = None) -> np.ndarray:
+    rotary = head_dim if rotary_dim is None else rotary_dim
+    if rotary <= 0 or rotary > head_dim or rotary % 2:
+        raise ValueError("GLM rotary dimension must be positive, even and within a head")
+    return np.concatenate((np.arange(0, rotary, 2), np.arange(1, rotary, 2),
+                           np.arange(rotary, head_dim)))
+
+
+def canonicalize_glm_qk(weight: np.ndarray, head_dim: int,
+                        rotary_dim: int | None = None) -> np.ndarray:
     """Maps official interleaved rotary pairs to the LPU split-half layout."""
-    permutation = np.concatenate((np.arange(0, head_dim, 2), np.arange(1, head_dim, 2)))
+    permutation = glm_qk_permutation(head_dim, rotary_dim)
     return weight.reshape(-1, head_dim, weight.shape[1])[:, permutation, :].reshape(weight.shape)
 
 
@@ -1005,8 +1036,9 @@ def load_decoder_weights(
     source_names: dict[str, str] = {}
     weights: dict[str, np.ndarray] = {}
 
-    if model_type == "phi3":
-        qkv_name = f"{prefix}.self_attn.qkv_proj.weight"
+    if model_type in ("phi3", "chatglm"):
+        qkv_name = (f"{prefix}.self_attention.query_key_value.weight" if model_type == "chatglm"
+                    else f"{prefix}.self_attn.qkv_proj.weight")
         qkv = store.read(qkv_name)
         expected = (query_width + 2 * kv_width, hidden)
         if qkv.shape != expected:
@@ -1024,7 +1056,8 @@ def load_decoder_weights(
             weights[role] = store.read(name)
             source_names[role] = name
 
-    output_name = f"{prefix}.self_attn.o_proj.weight"
+    output_name = (f"{prefix}.self_attention.dense.weight" if model_type == "chatglm"
+                   else f"{prefix}.self_attn.o_proj.weight")
     weights["output"] = store.read(output_name)
     source_names["output"] = output_name
 
@@ -1069,8 +1102,9 @@ def load_decoder_weights(
             "expert_up": gate_up_name,
             "expert_down": expert_down_name,
         })
-    elif model_type in ("phi3", "glm"):
-        gate_up_name = f"{prefix}.mlp.gate_up_proj.weight"
+    elif model_type in ("phi3", "glm", "chatglm"):
+        gate_up_name = (f"{prefix}.mlp.dense_h_to_4h.weight" if model_type == "chatglm"
+                       else f"{prefix}.mlp.gate_up_proj.weight")
         gate_up = store.read(gate_up_name)
         expected = (2 * intermediate, hidden)
         if gate_up.shape != expected:
@@ -1086,10 +1120,27 @@ def load_decoder_weights(
             weights[role] = store.read(name)
             source_names[role] = name
     if model_type != "qwen3_moe":
-        down_name = f"{prefix}.mlp.down_proj.weight"
+        down_name = (f"{prefix}.mlp.dense_4h_to_h.weight" if model_type == "chatglm"
+                     else f"{prefix}.mlp.down_proj.weight")
         weights["down"] = store.read(down_name)
         source_names["down"] = down_name
     return weights, source_names
+
+
+def load_decoder_biases(store: SafeTensorStore, prefix: str,
+                        config: dict[str, object]) -> dict[str, np.ndarray]:
+    if not config.get("attention_bias", config.get("model_type") == "qwen2"):
+        return {}
+    if config.get("model_type") == "chatglm":
+        head = attention_head_dim(config)
+        query = int(config["num_attention_heads"]) * head
+        kv = int(config["num_key_value_heads"]) * head
+        value = store.read(f"{prefix}.self_attention.query_key_value.bias")
+        if value.shape != (query + 2 * kv,):
+            raise ValueError("ChatGLM fused QKV bias has an invalid shape")
+        return dict(query=value[:query], key=value[query:query+kv], value=value[query+kv:])
+    return {role: store.read(f"{prefix}.self_attn.{stem}.bias")
+            for role, stem in (("query", "q_proj"), ("key", "k_proj"), ("value", "v_proj"))}
 
 
 def main() -> None:
@@ -1134,12 +1185,13 @@ def main() -> None:
     # columns to the split-half layout used by the generic hardware RoPE.
     # Applying the same permutation to Q and K preserves their dot product.
     qk_permutation = None
-    if config.get("model_type") == "glm":
+    if config.get("model_type") in ("glm", "chatglm"):
         head = attention_head_dim(config)
-        qk_permutation = np.concatenate((np.arange(0, head, 2), np.arange(1, head, 2)))
+        rotary = rope_parameters(config, args.seq_len)[2]
+        qk_permutation = glm_qk_permutation(head, rotary)
         for role in ("query", "key"):
             value = source_weights[role]
-            source_weights[role] = canonicalize_glm_qk(value, head)
+            source_weights[role] = canonicalize_glm_qk(value, head, rotary)
     provenance = None
     provenance_path = args.model_dir / "provenance.json"
     if provenance_path.exists():
@@ -1162,9 +1214,10 @@ def main() -> None:
     )
     biases: dict[str, np.ndarray] = {}
     if source_has_attention_bias and not args.ignore_attention_bias:
-        for role, stem in (("query", "q_proj"), ("key", "k_proj"),
-                           ("value", "v_proj")):
-            biases[role] = store.read(f"{prefix}.self_attn.{stem}.bias")
+        biases = load_decoder_biases(store, prefix, config)
+        if qk_permutation is not None:
+            for role in ("query", "key"):
+                biases[role] = biases[role].reshape(-1, head)[:, qk_permutation].reshape(-1)
 
     hidden = int(config["hidden_size"])
     query_heads = int(config["num_attention_heads"])
@@ -1337,7 +1390,8 @@ def main() -> None:
             "key": f"{prefix}.self_attn.k_norm.weight",
         } if qk_norms else {},
         "bias_tensors": {
-            role: f"{prefix}.self_attn.{stem}.bias"
+            role: (f"{prefix}.self_attention.query_key_value.bias" if config["model_type"] == "chatglm"
+                   else f"{prefix}.self_attn.{stem}.bias")
             for role, stem in (("query", "q_proj"), ("key", "k_proj"),
                                ("value", "v_proj"))
             if role in biases

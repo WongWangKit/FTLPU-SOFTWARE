@@ -32,6 +32,15 @@ def reference(q, k, v, eg, beta, state, reload=False, rounding='truncate'):
     state = state.copy()
     result = []
     for t in range(len(q)):
+        if rounding=='fp32' and reload is True:
+            # Only MXM's matrix input is narrowed. Never truncate the State
+            # saved for the next token, gates, prediction or delta.
+            decayed=state*eg[t,:,None,None]
+            prediction=np.einsum('hkv,hk->hv',trunc(decayed),k[t])
+            delta=(v[t]-prediction)*beta[t,:,None]
+            state=decayed+k[t,:,:,None]*delta[:,None,:]
+            result.append(bf16(np.einsum('hkv,hk->hv',trunc(state),q[t])))
+            continue
         decayed = cast_state(state) * cast_gate(eg[t])[:, None, None]
         prediction = np.einsum('hkv,hk->hv', cast_state(decayed), k[t])
         delta = (v[t] - cast(prediction)) * cast_gate(beta[t])[:, None]
@@ -49,11 +58,16 @@ def main():
     p.add_argument('--package', type=Path)
     p.add_argument('--tokens', type=int, default=32, choices=(2, 32))
     p.add_argument('--core-only', action='store_true', help='Small nonzero-State handoff regression')
-    p.add_argument('--rounding', choices=('rne','truncate'), default='rne')
+    p.add_argument('--rounding', choices=('fp32','rne','truncate'), default='fp32',
+                   help='FP32 State/ingress (default), BF16 RNE, or legacy high-plane truncation')
+    p.add_argument('--recurrence-only', action='store_true', help='Stop before Z/gated RMSNorm/output projection')
     p.add_argument('--validate-only', action='store_true')
     p.add_argument('--compile-only', action='store_true')
     a = p.parse_args()
     rne=a.rounding=='rne'
+    full=a.rounding=='fp32'
+    with_tail=not a.core_only and not a.recurrence_only
+    if with_tail and a.tokens!=32: p.error('full attention currently requires --tokens 32')
     out = a.output_dir.resolve(); out.mkdir(parents=True, exist_ok=True)
     build = a.build_dir.resolve(); suffix = '.exe' if sys.platform == 'win32' else ''
     exe = lambda area, name: build / area / (name+suffix)
@@ -64,8 +78,9 @@ def main():
         q = bf16(rng.normal(0, .02, shape).astype('f4'))
         k = bf16(rng.normal(0, .08, shape).astype('f4'))
         v = bf16(rng.normal(0, .1, shape).astype('f4'))
-        eg = bf16(rng.uniform(.7, .99, (a.tokens, 2)).astype('f4'))
-        beta = bf16(rng.uniform(.1, .8, (a.tokens, 2)).astype('f4'))
+        eg = rng.uniform(.7, .99, (a.tokens, 2)).astype('f4')
+        beta = rng.uniform(.1, .8, (a.tokens, 2)).astype('f4')
+        if not full: eg,beta=bf16(eg),bf16(beta)
         operands = [q.reshape(a.tokens, -1), k.reshape(a.tokens, -1), v.reshape(a.tokens, -1), eg, beta]
     else:
         if not a.package: p.error('--package is required for the real-weight frontend')
@@ -102,6 +117,18 @@ def main():
     if not a.core_only:
         native_v = conv[:, 2*width:].reshape(32,c.num_value_heads,c.value_head_dim)
         outputs += [query,key,native_v[:,::2,:].reshape(32,-1),native_v[:,1::2,:].reshape(32,-1),b,factor]
+    if with_tail:
+        # Tensor equations only. Shared C++ planning owns the native layouts,
+        # retained head-normalization tiles, VXM gate chain and MXM paging.
+        z=g.project('in_proj_z',x,packed['in_proj_z'],scales['in_proj_z'])
+        normalized=g.norm('delta_output_norm',outputs[0].reshape(-1,c.value_head_dim),
+                          w.delta_norm,c.rms_norm_eps)
+        def output_gate(graph):
+            return graph.add(0,graph.add(1,graph.sigmoid(1)),dtype='bf16')
+        gated=g.vector_tiles('delta_output_gate',
+            [(normalized,'bf16'),(z.reshape(normalized.shape),'bf16')],output_gate)
+        attention=g.project('out_proj',gated.reshape(32,c.value_width),packed['out_proj'],scales['out_proj'])
+        outputs += [z,normalized,gated,attention]
     binary, kernel = out/'program.ftlpu', out/'kernel.mlir'
     if not a.validate_only:
         (out/'summary.json').write_text(json.dumps(dict(status='pending')))
@@ -110,6 +137,7 @@ def main():
              '--emit-kernel', '--target-config', a.target_config.resolve()], out/'import.log')
         kernel.write_text(kernel.read_text().replace('module {',
             'module attributes {'+('ftlpu.vector_bf16_rne_spill = true, ' if rne else '')+
+            ('ftlpu.vector_fp32_ingress = true, ' if full else '')+
             'ftlpu.gdn_prefill_strategy = "tokenwise", ftlpu.vector_bf16_spill = true, '
             'ftlpu.common_barrier_protocol = true, ftlpu.sxm_wide = true, ftlpu.l2_head_partition = true, '
             'ftlpu.vector_log_softplus = true, ftlpu.vector_bf16_token_halves = true} {', 1))
@@ -147,13 +175,64 @@ def main():
     actual_inputs=(q,k,v,eg,beta,state) if a.core_only else (aq,ak,av[:a.tokens],ae,ab,state)
     fy,fs=reference(*actual_inputs)
     precision=dict(actual_frontend_fp32=dict(output=compare(actual_y,fy),state=compare(actual_s,fs)))
-    for mode in ('state','gates','intermediates'):
+    if full:
+        precision['mxm_bf16_high_planes_and_output_rne']=dict(output=compare(ry,fy),state=compare(rs,fs))
+    for mode in (() if full else ('state','gates','intermediates')):
         py,ps=reference(*actual_inputs,reload=mode,rounding=a.rounding)
         precision[mode+'_'+a.rounding+'_only']=dict(output=compare(py,fy),state=compare(ps,fs))
     head_errors=[dict(output=compare(actual_y[:,h],ry[:,h]),state=compare(actual_s[h],rs[h]))
                  for h in range(c.num_value_heads)]
     (out/'numerics.json').write_text(json.dumps(dict(errors=errors,reload_by_head=head_errors),indent=2))
     plan=json.loads((out/'graph_plan.json').read_text())
+    gate_mapping={}
+    if full and not a.core_only:
+        paired=[n for n in plan['nodes'] if n['name'].startswith(('in_proj_a.','in_proj_b.'))]
+        assert len(paired)==1 and paired[0]['name'].endswith('.paired'),paired
+        factor=next(n for n in plan['nodes'] if n['name']=='state_decay_factor')
+        assert not any(n['name']=='delta_gates' for n in plan['nodes'])
+        homes=factor['direct_output_layouts']
+        assert len(homes)==2 and all(h['kind']=='fp32_quad_planar' for h in homes)
+        copies=[t for t in plan['linker_mem_transports']
+                if t['phase'].startswith('delta_rule.token') and t['vectors']==1
+                and any(t['source_bank']==h['bank'] and t['source_slice']==h['slices'][0]
+                    and h['base_row']<=t['source_row']<h['base_row']+h['rows'] for h in homes)]
+        assert not copies,copies
+        gate_mapping=dict(paired_projection=paired[0]['name'],fused_eg=True,
+            recurrence_gate_copy_domains=0,projection_cycles=paired[0]['nominal_end']-paired[0]['nominal_start'],
+            elementwise_cycles=factor['nominal_end']-factor['nominal_start'],
+            span_cycles=factor['nominal_end']-paired[0]['nominal_start'])
+    tail_errors={}
+    if with_tail:
+        az=bf(8,(32,c.num_value_heads,c.value_head_dim))
+        an=bf(9,az.shape)
+        ag=bf(10,az.shape)
+        gate_node=next(n for n in plan['nodes'] if n['name']=='delta_output_gate')
+        gate_layout=gate_node['direct_output_layouts'][0]['kind']
+        if gate_layout.startswith('token_partition_'):
+            ag=ag.reshape(2,32,c.num_value_heads//2,c.value_head_dim).transpose(1,2,0,3).reshape(az.shape)
+        aa=bf(11,(32,c.hidden_size))
+        normalize=lambda y:y/np.sqrt(np.mean(y*y,axis=-1,keepdims=True)+c.rms_norm_eps)*bf16(w.delta_norm)
+        silu=lambda z:z/(1+np.exp(-z))
+        z_ref=(x.astype('f4')@w.in_proj_z.T).reshape(az.shape)
+        model_gated=normalize(expected_y)*silu(z_ref)
+        tail_errors=dict(z_projection=compare(az,z_ref),
+            rmsnorm_given_actual_input=compare(an,normalize(actual_y)),
+            gate_given_actual_inputs=compare(ag,an*silu(az)),
+            gated_norm_end_to_end=compare(ag,model_gated),
+            output_projection_given_actual_input=compare(aa,ag.reshape(32,-1)@w.out_proj.T),
+            attention_end_to_end=compare(aa,model_gated.reshape(32,-1)@w.out_proj.T))
+        (out/'tail_numerics.json').write_text(json.dumps(tail_errors,indent=2))
+        tail_heads=[dict(norm=compare(an[:,h],normalize(actual_y)[:,h]),
+            gate=compare(ag[:,h],(an*silu(az))[:,h])) for h in range(c.num_value_heads)]
+        tail_local=all(e['nrmse']<.03 and e['cosine']>.999 for h in tail_heads for e in h.values())
+        assert tail_local,tail_heads
+        assert any(n['name'].startswith('out_proj.page') for n in plan['nodes'])
+        norm_nodes=[n for n in plan['nodes'] if n['name'].startswith('delta_output_norm.rows')]
+        norm_transports=[t for t in plan.get('linker_mem_transports',[]) if t['phase'].startswith('delta_output_norm')]
+        assert len(norm_nodes)==16 and not norm_nodes[0]['norm_weight_reused']
+        assert all(n['norm_weight_reused'] and n['norm_tight_start'] for n in norm_nodes[1:])
+        assert len(norm_transports)==8 and all(t['phase']==norm_nodes[0]['name'] for t in norm_transports)
+        assert not any(t['phase'].startswith('delta_output_gate') for t in plan.get('linker_mem_transports',[]))
     steps=[n for n in plan['nodes'] if n['name'].startswith('delta_rule.token')]
     assert len(steps)==a.tokens and all('chunkwise' not in n['name'] for n in plan['nodes'])
     # The exact updated-State home is consumed by the next token; materializing
@@ -171,26 +250,53 @@ def main():
     assert not state_copies, state_copies
     stats={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)',(out/'execution.log').read_text().splitlines()[-1])}
     assert stats.get('host_operations')==0
+    cycles=0; epoch_offsets=[]
     with (out/'runtime.pipeline.csv').open() as f:
-        cycles=max(int(r['end'])+(int(r['inner_count'])-1)*int(r['inner_interval'])+
-                   (int(r['outer_count'])-1)*int(r['outer_interval']) for r in csv.DictReader(f))
+        for row in csv.DictReader(f):
+            cycles=max(cycles,int(row['end'])+(int(row['inner_count'])-1)*int(row['inner_interval'])+
+                       (int(row['outer_count'])-1)*int(row['outer_interval']))
+            if row['resource']=='Paging.Consumer':
+                logical_cycle=int(re.search(r'logical_cycle=(\d+)',row['detail'])[1])
+                epoch_offsets.append((logical_cycle,int(row['start'])-logical_cycle))
+    epoch_offsets.sort()
+    def stage_range(node):
+        start,end=node['nominal_start'],node['nominal_end']
+        offset=next((delta for logical,delta in reversed(epoch_offsets) if logical<=start),0)
+        return dict(name=node['name'],nominal_start=start,nominal_end=end,
+                    runtime_start=start+offset,runtime_end=end+offset)
     run([exe('runtime','ftlpu_icu_program_export'),out/'actual.runtime.ftlpu',out/'runtime_icu_programs',
          '--pre-execution-dir',out/'actual.pre_execution'],out/'export.log')
+    paging_image=json.loads((out/'runtime_icu_programs'/'program.json').read_text())
     passed=all(errors[n]['nrmse']<.002 and errors[n]['cosine']>.99999 for n in ('reload_output','reload_state'))
     passed &= all(e['nrmse']<.002 and e['cosine']>.99999 for h in head_errors for e in h.values())
     accuracy=all(errors[n]['nrmse']<.03 and errors[n]['cosine']>.999 for n in ('output','state'))
+    if with_tail:
+        passed &= all(tail_errors[n]['nrmse']<.03 and tail_errors[n]['cosine']>.999 for n in
+            ('z_projection','rmsnorm_given_actual_input','gate_given_actual_inputs','output_projection_given_actual_input'))
+        accuracy &= all(e['nrmse']<.03 and e['cosine']>.999 for e in tail_errors.values())
     result=dict(status=('passed' if accuracy else 'correctness_passed_accuracy_failed') if passed else 'failed',
         correctness_passed=passed,accuracy_passed=accuracy,strategy='tokenwise',tokens=a.tokens,
-        real_weights=not a.core_only,nonzero_initial_state=True,scope='GDN recurrence through Q readout; no output gate/projection or FFN',
-        rounding=a.rounding,
-        precision=('BF16 RNE State/gate/intermediate storage; FP32 arithmetic and accumulation' if rne else
+        real_weights=not a.core_only,nonzero_initial_state=True,scope='Full GDN attention: QKV/Conv/QK norm/gates/tokenwise recurrence/Z/gated RMSNorm/output projection; no input RMSNorm, residual or FFN' if with_tail else 'GDN recurrence through Q readout; no output gate/projection or FFN',
+        rounding=a.rounding,transport_overlap=paging_image['transport_overlap_protocol'],
+        weight_paging_policy=plan.get('weight_paging_policy'),paging_image=paging_image,paging_protocol='common_sync',
+        precision=('FP32 State/gate/intermediate storage and full VXM ingress; BF16 high-plane MXM input; BF16 RNE output' if full else
+                   'BF16 RNE State/gate/intermediate storage; FP32 arithmetic and accumulation' if rne else
                    'BF16-truncated MEM/SR ingress; FP32 State ABI and accumulation; BF16 output'),
         errors=errors,reload_by_head=head_errors,runtime=stats,runtime_trace_cycles=cycles,host_state_handoffs=0,
         fp32_reference_within_3_percent=accuracy,precision_diagnostics=precision,
         frontend_errors={} if a.core_only else frontend_errors,
+        gate_mapping=gate_mapping,
         output_state_layout='[head,value,key] native checkpoint view',
         native_state_homes=[n['direct_output_layouts'][3] for n in steps],
         streaming=audit_streaming(out))
+    if with_tail:
+        result['attention_tail']=dict(status='passed' if passed and accuracy else 'failed',errors=tail_errors,
+            norm_weight='delta_norm, no 1+weight offset',gated_output_layout=gate_layout,
+            norm_weight_materializations=1,norm_weight_reuses=15,core_to_norm_layout_copies=0,norm_to_gate_layout_copies=0,
+            stages=[stage_range(n) for n in plan['nodes']
+                    if n['name'].startswith(('in_proj_z','delta_output_','out_proj'))],
+            output_bindings=dict(z=8,normalized=9,gated=10,attention=11),
+            body_mem_transports=[t for t in transports if t['phase'].startswith(('in_proj_z','delta_output_','out_proj'))])
     (out/'summary.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
     assert passed,errors
 

@@ -31,6 +31,7 @@ def audit_streaming(out):
     result=[]
     for node in plan['nodes']:
         lines=node_lines.get(node['name'],[])
+        full_fp32=any('lhs_kind = "stream_f32"' in line and 'queue = 0 : i64' in line for line in lines)
         marker='name = "'+node['name']+'.scaled_matvec.vxm_to_mxm_and_mem"'
         if not any(marker in line for line in lines):continue
         saved=node['direct_output_layouts'][0]
@@ -96,11 +97,12 @@ def audit_streaming(out):
         if update:
             assert updated_reads==0
             # Schedule slice IDs are local; both hemispheres are counted.
-            # Each saved high byte is read once, each FP32 byte written once.
+            # Each selected State byte is read once, each output byte written once.
             sides=2 if saved['hemisphere']=='both' else 1
-            assert update_read_vectors==saved['rows']*2*sides,(node['name'],update_read_vectors,saved)
+            assert update_read_vectors==saved['rows']*(4 if full_fp32 else 2)*sides,(node['name'],update_read_vectors,saved)
             assert update_write_vectors==update_home['rows']*len(update_home['slices'])*sides,(node['name'],update_write_vectors,update_home)
-            result[-1]['rank_one_update']=dict(saved_high_plane_vector_reads=update_read_vectors,
+            result[-1]['rank_one_update']=dict(saved_state_byte_vector_reads=update_read_vectors,
+                saved_input_bytes=4 if full_fp32 else 2,
                 updated_byte_vector_writes=update_write_vectors,updated_state_mem_reads=updated_reads,
                 updated_state_write_opcode='write_tap' if readout else 'write',outer_product_spills=0)
     assert result,'No fused dataflow found in native schedule'
@@ -172,12 +174,13 @@ def audit_streaming(out):
                 heads,vd=meta['head_count'],meta['value_width']
                 blocks=(meta['key_width']//32)*(vd//32 if node['readout_enabled'] else 1)
                 segment=32 if node['readout_enabled'] else vd
-                broadcast_cost=(vd//32)*80+64
+                pair_count=node['rank_one_update']['saved_input_bytes']//2
+                broadcast_cost=(vd//32)*80*pair_count+64
                 queues={}
                 for line in lines:
                     if 'ftlpu.schedule.mem_transfer' not in line:continue
                     fields={k:int(v) for k,v in re.findall(r'(\w+) = (-?\d+) : i64',line)}
-                    if not start<=fields.get('cycle',-1)<native['nominal_end'] or fields.get('slice') not in (50,51):continue
+                    if not start<=fields.get('cycle',-1)<native['nominal_end'] or fields.get('slice') not in ((48,49,50,51) if node['rank_one_update']['saved_input_bytes']==4 else (50,51)):continue
                     table_count=fields.get('repeat_count',1); address=fields['address']
                     assert 0<=address and address+(table_count-1)*fields.get('address_stride',1)<vd
                     queue=(fields['hemisphere'],fields['slice'],fields['bank'])
@@ -192,12 +195,12 @@ def audit_streaming(out):
                     assert gap==expected,(i,gap,expected)
                 transposes=[row for row in runtime if row['resource']=='SXM.E.Transpose'
                     and start+shift<=int(row['start'])<native['nominal_end']+shift]
-                assert len(transposes)==heads*(vd//32)
+                assert len(transposes)==heads*(vd//32)*pair_count
                 if heads>1:
                     # SXM decode aligns with the current head's first multiply
                     # issue; K capture was issued one cycle earlier.
                     for h in range(1,heads):
-                        assert int(transposes[h*(vd//32)]['start'])==int(active[(h-1)*blocks]['start'])
+                        assert int(transposes[h*(vd//32)*pair_count]['start'])==int(active[(h-1)*blocks]['start'])
                 node['rank_one_update'].update(runtime_multiply_issue_range=[int(active[0]['start']),int(active[-1]['end'])],
                     runtime_vector_updates=sum(int(r['end'])-int(r['start']) for r in active),
                     runtime_segments=len(active),segment_boundary_cycles=2,
@@ -270,7 +273,7 @@ def main():
     graph=g.write(out/'logical',values);kernel=out/'kernel.mlir';binary=out/'program.ftlpu'
     run([exe('compiler','ftlpu-graph-compile'),'--input',graph,'--output',kernel,'--emit-kernel','--target-config',a.target_config.resolve()],out/'import.log')
     kernel.write_text(kernel.read_text().replace('module {','module attributes {ftlpu.sxm_wide = true, ftlpu.vector_bf16_spill = true, ftlpu.common_barrier_protocol = true} {',1))
-    run([exe('compiler','ftlpu-compile'),'--input',kernel,'--input-stage','kernel','--output',binary,'--target-config',a.target_config.resolve(),'--icu-compression','raw-macro','--mxm-execution','vector'],out/'compile.log')
+    run([exe('compiler','ftlpu-compile'),'--input',kernel,'--input-stage','kernel','--output',binary,'--target-config',a.target_config.resolve(),'--icu-compression','raw-macro','--mxm-execution','ws'],out/'compile.log')
     os.environ['FTLPU_FILE_RUNNER_MODEL_SESSION']='1'
     os.environ['FTLPU_FILE_RUNNER_SXM_ARCHITECTURE']='wide'
     run([exe('runtime','compiled_stage_file_runner'),binary,out/'inputs.txt',out/'actual',out/'runtime.pipeline.csv'],out/'execution.log')

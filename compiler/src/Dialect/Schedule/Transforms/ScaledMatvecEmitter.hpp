@@ -25,6 +25,8 @@ mlir::LogicalResult planScaledMatvecMemory(mlir::func::FuncOp function,
             || p.getDimSize(0)!=k.getDimSize(0)
             || p.getDimSize(1)!=m.getDimSize(0)/k.getDimSize(0) || p.getDimSize(1)%32)
             return op.emitError("scaled_matvec needs matching FP32 or BF16 matrix/scale/product, BF16 vector, K/V multiples of 32");
+        const auto fp32Policy=function->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_fp32_ingress");
+        const bool full=fp32Policy && fp32Policy.getValue() && m.getElementType().isF32();
         if(op->hasAttr("matrix_placement")) continue;
         op->setAttr("matrix_placement",placement(r,m,0,"both",1,true,32));
         op->setAttr("scale_placement",placement(r,d,4,"both",1,true,32));
@@ -35,17 +37,17 @@ mlir::LogicalResult planScaledMatvecMemory(mlir::func::FuncOp function,
         op->setAttr("scale_table",placement(r,broadcast,20,"both",1,true,32));
         if(!op.getEpilogue().empty()) {
             op->setAttr("value_placement",placement(r,llvm::cast<mlir::RankedTensorType>(op.getEpilogue()[0].getType()),24,"both",1,true,32));
-            op->setAttr("coefficient_placement",placement(r,d,26,"both",1,true,32));
+            op->setAttr("coefficient_placement",placement(r,d,full?28:26,"both",1,true,32));
             op->setAttr("correction_placement",placement(r,p,36,"both",1,true,32));
             op->setAttr("coefficient_table",placement(r,broadcast,40,"both",1,true,32));
             if(op.getCorrection().size()>=2) {
                 op->setAttr("updated_placement",placement(r,m,44,"both",1,true,32));
-                // Two head-sized BF16 buffers, on independent MEM ICU banks.
-                auto rows=mlir::RankedTensorType::get({p.getDimSize(1),32},r.getBF16Type());
-                op->setAttr("correction_table",placement(r,rows,50,"both",1,true,32));
-                op->setAttr("correction_table_alt",placement(r,rows,50,"both",0,true,32));
+                // Two head-sized buffers, on independent MEM ICU banks.
+                auto rows=mlir::RankedTensorType::get({p.getDimSize(1),32},full?r.getF32Type():r.getBF16Type());
+                op->setAttr("correction_table",placement(r,rows,full?48:50,"both",1,true,32));
+                op->setAttr("correction_table_alt",placement(r,rows,full?48:50,"both",0,true,32));
                 if(op.getEpilogue().size()==3) {
-                    op->setAttr("query_placement",placement(r,k,30,"both",1,true,32));
+                    op->setAttr("query_placement",placement(r,k,full?32:30,"both",1,true,32));
                     op->setAttr("readout_placement",placement(r,p,44,"both",1,true,32));
                 }
             }
@@ -64,10 +66,15 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
         const auto loc=op.getLoc();
         auto m=llvm::cast<mlir::RankedTensorType>(op.getMatrix().getType());
         auto k=llvm::cast<mlir::RankedTensorType>(op.getVector().getType());
-        // BF16 storage uses the FU's RNE output conversion. The legacy FP32
-        // storage path keeps its high-plane reload behavior for compatibility.
+        // BF16 storage uses the FU's RNE output conversion. Opt-in full FP32
+        // ingress preserves all State/gate/delta bytes. MXM alone consumes
+        // the high BF16 pair; the retained FP32 State is never narrowed.
         const bool rne=m.getElementType().isBF16();
         const int64_t high=rne?0:2, bytes=rne?2:4;
+        const auto fp32Policy=function->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_fp32_ingress");
+        const bool full=fp32Policy && fp32Policy.getValue() && !rne;
+        const int64_t inputBytes=full?4:2, inputHigh=full?0:high;
+        const llvm::StringRef inputKind=full?"stream_f32":"stream_bf16";
         const llvm::StringRef outputFormat=rne?"bf16":"fp32";
         const int64_t heads=k.getDimSize(0),kd=k.getDimSize(1),vd=m.getDimSize(0)/heads;
         const int64_t scaleHeads=llvm::cast<mlir::RankedTensorType>(op.getScale().getType()).getDimSize(1);
@@ -76,6 +83,10 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
         auto saved=get("scaled_placement"),product=get("product_placement"),table=get("scale_table");
         const bool epilogue=!op.getEpilogue().empty();
         const bool readout=op.getEpilogue().size()==3;
+        if(epilogue && full && !llvm::cast<mlir::RankedTensorType>(op.getEpilogue()[0].getType()).getElementType().isF32())
+            return op.emitError("full FP32 scaled_matvec requires FP32 value on the independent C4 RHS port");
+        if(epilogue && !full && !llvm::cast<mlir::RankedTensorType>(op.getEpilogue()[0].getType()).getElementType().isBF16())
+            return op.emitError("FP32 epilogue value requires vector_fp32_ingress");
         const int64_t depth=epilogue?4:8, tailStream=epilogue?2:6;
         auto value=get("value_placement"),coefficient=get("coefficient_placement");
         auto correction=get("correction_placement"),coefficientTable=get("coefficient_table");
@@ -106,15 +117,18 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
         // A packed head vector is repeated 32 times into wide SXM, producing
         // one all-lanes coefficient vector per head. BF16 storage is already
         // RNE-converted; legacy FP32 storage supplies only its high planes.
+        // Wide SXM transposes two byte planes at a time, so full FP32
+        // broadcasts use separate low/high-pair passes.
         const auto wide=function->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
         if(!wide || !wide.getValue())return op.emitError("scaled_matvec streaming requires wide SXM");
         for(int factor=0;factor<(epilogue?2:1);++factor) {
           auto factorInput=factor?coefficient:scale;
           auto factorTable=factor?coefficientTable:table;
-          const int64_t factorCycle=cursor+80*factor;
+          for(int pair=0;pair<inputBytes/2;++pair) {
+          const int64_t factorCycle=cursor+80*(factor*(inputBytes/2)+pair);
           for(int64_t side=0;side<2;++side) {
             llvm::SmallVector<mlir::Attribute> src,dst,map;
-            for(int b=0;b<2;++b){src.push_back(r.getI64IntegerAttr(16+2*factor+b));dst.push_back(r.getI64IntegerAttr(32+side*16+b));}
+            for(int b=pair*2;b<pair*2+2;++b){src.push_back(r.getI64IntegerAttr(16+inputBytes*factor+b));dst.push_back(r.getI64IntegerAttr(32+side*16+b));}
             for(int i=0;i<32;++i)map.push_back(r.getI64IntegerAttr(i));
             mlir::OperationState sx(loc,SxmOp::getOperationName());
             sx.addAttributes({r.getNamedAttr("cycle",r.getI64IntegerAttr(factorCycle)),
@@ -127,15 +141,16 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                 r.getNamedAttr("repeat_count",r.getI64IntegerAttr(1)),
                 r.getNamedAttr("repeat_interval",r.getI64IntegerAttr(32))});
             r.create(sx);
-            for(int b=0;b<2;++b) {
-                const auto rd=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::SxmInput,target::StreamDirection::East,id(factorInput,b+high));
-                const auto wr=*target.transport_latency(target::StreamEndpoint::SxmResult,target::StreamEndpoint::Mem,target::StreamDirection::West,id(factorTable,b+high));
-                mem(factorInput,b+high,side,factorCycle-rd,"read",0,16+2*factor+b,32,0);
-                mem(factorTable,b+high,side,factorCycle+35+wr,"write",0,32+side*16+b,scaleHeads);
+            for(int b=pair*2;b<pair*2+2;++b) {
+                const auto rd=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::SxmInput,target::StreamDirection::East,id(factorInput,b+inputHigh));
+                const auto wr=*target.transport_latency(target::StreamEndpoint::SxmResult,target::StreamEndpoint::Mem,target::StreamDirection::West,id(factorTable,b+inputHigh));
+                mem(factorInput,b+inputHigh,side,factorCycle-rd,"read",0,16+inputBytes*factor+b,32,0);
+                mem(factorTable,b+inputHigh,side,factorCycle+35+wr,"write",0,32+side*16+b,scaleHeads);
             }
         }
         }
-        cursor+=epilogue?240:160;
+        }
+        cursor+=(epilogue?160:80)*(inputBytes/2)+80;
         const int64_t begin=cursor;
         // Each 32x32 matrix block is generated once. Its output is saved
         // while the BF16 pair directly feeds the MXM weight port.
@@ -146,15 +161,15 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                 const int64_t start=cursor+32;
                 const int64_t weightBuffer=((h*(vd/32)+vb)*(kd/32)+kb)%2;
                 const int64_t address=kb*heads*vd+h*vd+vb*32;
-                for(int64_t side=0;side<2;++side)for(int b=0;b<2;++b) {
-                    mem(matrix,b+high,side,start-1-id(matrix,b+high)/4,"read",address,32+side*16+b,32);
-                    mem(table,b+high,side,start-1-id(table,b+high)/4,"read",h+op.getGroupOffset(),32+side*16+2+b,32,0);
+                for(int64_t side=0;side<2;++side)for(int b=0;b<inputBytes;++b) {
+                    mem(matrix,b+inputHigh,side,start-1-id(matrix,b+inputHigh)/4,"read",address,32+side*16+b,32);
+                    mem(table,b+inputHigh,side,start-1-id(table,b+inputHigh)/4,"read",h+op.getGroupOffset(),32+side*16+inputBytes+b,32,0);
                 }
                 mlir::Value current=op.getMatrix();
                 for(int col=0;col<depth;++col) {
                     auto alu=ffn_detail::create_vxm(r,loc,current,current,m,start-1,col,
-                        col?"bypass":"multiply",col?"previous":"stream_bf16",0,0.f,
-                        col?"immediate":"stream_bf16",col?0:2,0.f,col==depth-1?outputFormat:"fp32",
+                        col?"bypass":"multiply",col?"previous":inputKind,0,0.f,
+                        col?"immediate":inputKind,col?0:inputBytes,0.f,col==depth-1?outputFormat:"fp32",
                         col==depth-1?tailStream:-1,32,1,"east","west",-1,false,false,true,false,depth);
                     current=alu.getResult();
                 }
@@ -180,17 +195,18 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                         mem(key,b,side,compute-latency,"read",kb*heads+h,b);
                     }
                     const bool last=kb==kd/32-1;
-                    // W0-W3 carry continuous state/coefficient inputs.
+                    // W0-W3 (BF16) or W0-W7 (FP32) carry continuous
+                    // state/coefficient inputs.
                     // Without an epilogue, KS uses W24-W27. With one, place
-                    // its high pair on each hemisphere's fixed C4 LHS port.
+                    // the operand on each hemisphere's fixed C4 LHS port.
                     attention_detail::emitMxm(r,loc,compute,
-                        side*target.throughput().mxms_per_hemisphere,"compute",weightBuffer,0,0,epilogue?8-high+side*16:24,1,1,
+                        side*target.throughput().mxms_per_hemisphere,"compute",weightBuffer,0,0,epilogue?8-inputHigh+side*16:24,1,1,
                         0,1,last?"stream":"sram",last,"block",0,"bf16","direct16",last?outputFormat:"");
                     if(last)for(int b=0;b<bytes;++b) {
                         const auto latency=*target.transport_latency(target::StreamEndpoint::MxmResult,
                             target::StreamEndpoint::Mem,target::StreamDirection::West,id(product,b));
                         mem(product,b,side,compute+target.mxm_first_result_latency()+latency,
-                            epilogue?"write_tap":"write",vb*heads+h,32+(epilogue?8-high+side*16:24)+b);
+                            epilogue?"write_tap":"write",vb*heads+h,32+(epilogue?8-inputHigh+side*16:24)+b);
                     }
                 }
                 if(epilogue) {
@@ -202,9 +218,9 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                         for(int col=4;col<8;++col) {
                             auto alu=ffn_detail::create_vxm(r,loc,current,current,m,cycle,col,
                                 capture?"bypass":col==4?"subtract":col==5?"multiply":col==6?"negate":"bypass",
-                                col==4?"stream_bf16":"previous",col==4?8:0,0.f,
-                                !capture && col==4?"stream_bf16":!capture && col==5?"accumulator":"immediate",
-                                !capture && col==4?10:0,0.f,col==7?outputFormat:"fp32",!capture && col==7?6:-1,
+                                col==4?inputKind:"previous",col==4?8:0,0.f,
+                                !capture && col==4?inputKind:!capture && col==5?"accumulator":"immediate",
+                                !capture && col==4?8+inputBytes:0,0.f,col==7?outputFormat:"fp32",!capture && col==7?6:-1,
                                 1,1,"east","west",-1,false,false,true,capture && col==5,4);
                             current=alu.getResult();
                         }
@@ -213,8 +229,8 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                         // Leave the preceding head's final multiply time to
                         // consume its beta before replacing the local scalar.
                         const bool preview=start+63<begin+31+heads*(vd/32)*(kd/32)*32;
-                        for(int64_t side=0;side<2;++side)for(int b=0;b<2;++b)
-                            mem(coefficientTable,b+high,side,start+63-preview-id(coefficientTable,b+high)/4,
+                        for(int64_t side=0;side<2;++side)for(int b=0;b<inputBytes;++b)
+                            mem(coefficientTable,b+inputHigh,side,start+63-preview-id(coefficientTable,b+inputHigh)/4,
                                 "read",h+op.getGroupOffset(),32+side*16+8+b,1+preview,0);
                         chain(start+63,true);
                     }
@@ -234,9 +250,9 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                         // active, so supply that preview beat as well. It is
                         // discarded by C0; only the following real MXM result
                         // is consumed by C4. This avoids an entire KS spill.
-                        for(int64_t side=0;side<2;++side)for(int b=0;b<2;++b) {
-                            mem(value,b,side,arrival-1-preview-id(value,b)/4,"read",vb*heads+h,32+side*16+10+b,1+preview,0);
-                            if(preview)mem(coefficientTable,b+high,side,arrival-2-id(coefficientTable,b+high)/4,
+                        for(int64_t side=0;side<2;++side)for(int b=0;b<inputBytes;++b) {
+                            mem(value,b,side,arrival-1-preview-id(value,b)/4,"read",vb*heads+h,32+side*16+8+inputBytes+b,1+preview,0);
+                            if(preview)mem(coefficientTable,b+inputHigh,side,arrival-2-id(coefficientTable,b+inputHigh)/4,
                                 "read",h+op.getGroupOffset(),32+side*16+8+b);
                         }
                         chain(arrival-1,false);
@@ -264,14 +280,15 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
             auto broadcastHead=[&](int64_t h,int64_t launch) {
               auto expanded=buffer(h);
               for(int64_t vb=0;vb<vd/32;++vb) {
-                const int64_t t=launch+vb*80;
+                for(int pair=0;pair<inputBytes/2;++pair) {
+                const int64_t t=launch+(vb*(inputBytes/2)+pair)*80;
                 for(int64_t side=0;side<2;++side) {
                     llvm::SmallVector<mlir::Attribute> src,dst,map;
-                    for(int b=0;b<2;++b) {
+                    for(int b=pair*2;b<pair*2+2;++b) {
                         src.push_back(r.getI64IntegerAttr(16+b));
-                        // W0/W2 feed the concurrently active VXM chain.
-                        // Give SXM-to-MEM broadcasts their own W4 byte pair.
-                        dst.push_back(r.getI64IntegerAttr(32+side*16+4+b));
+                        // Reserve separate SR bytes from the active binary
+                        // VXM chain: W0..W7 are occupied in FP32 mode.
+                        dst.push_back(r.getI64IntegerAttr(32+side*16+(full?8:4)+b));
                     }
                     for(int i=0;i<32;++i)map.push_back(r.getI64IntegerAttr(i));
                     mlir::OperationState sx(loc,SxmOp::getOperationName());
@@ -285,17 +302,18 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                         r.getNamedAttr("repeat_count",r.getI64IntegerAttr(1)),
                         r.getNamedAttr("repeat_interval",r.getI64IntegerAttr(32))});
                     r.create(sx);
-                    for(int b=0;b<2;++b) {
-                        auto rd=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::SxmInput,target::StreamDirection::East,id(correction,b+high));
+                    for(int b=pair*2;b<pair*2+2;++b) {
+                        auto rd=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::SxmInput,target::StreamDirection::East,id(correction,b+inputHigh));
                         auto wr=*target.transport_latency(target::StreamEndpoint::SxmResult,target::StreamEndpoint::Mem,target::StreamDirection::West,id(expanded,b));
-                        mem(correction,b+high,side,t-rd,"read",vb*heads+h,16+b,32,0);
-                        mem(expanded,b,side,t+35+wr,"write",vb*32,32+side*16+4+b,32);
+                        mem(correction,b+inputHigh,side,t-rd,"read",vb*heads+h,16+b,32,0);
+                        mem(expanded,b,side,t+35+wr,"write",vb*32,32+side*16+(full?8:4)+b,32);
                     }
+                }
                 }
               }
               // Include the final transpose output, MEM commit, and route
               // to VXM before allowing a read from this head's buffer.
-              return launch+(vd/32)*80+64;
+              return launch+(vd/32)*80*(inputBytes/2)+64;
             };
             cursor=broadcastHead(0,cursor);
             auto updateChain=[&](int64_t issue,bool capture,int64_t count) {
@@ -303,9 +321,9 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                 for(int col=0;col<4;++col) {
                     auto alu=ffn_detail::create_vxm(r,loc,current,current,m,issue,col,
                         capture?"bypass":col==1?"multiply":col==2?"add":"bypass",
-                        col?"previous":"stream_bf16",0,0.f,
-                        capture?"immediate":col==0?"stream_bf16":col==1?"accumulator":col==2?"auxiliary":"immediate",
-                        !capture && col==0?2:0,0.f,col==3?outputFormat:"fp32",!capture && col==3?2:-1,
+                        col?"previous":capture?"stream_bf16":inputKind,0,0.f,
+                        capture?"immediate":col==0?inputKind:col==1?"accumulator":col==2?"auxiliary":"immediate",
+                        !capture && col==0?inputBytes:0,0.f,col==3?outputFormat:"fp32",!capture && col==3?2:-1,
                         count,1,"east","west",-1,false,false,true,capture && col==1,4);
                     current=alu.getResult();
                 }
@@ -331,8 +349,10 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                 for(int64_t side=0;side<2;++side) {
                     for(int b=0;b<2;++b) {
                         mem(key,b,side,capture-1-id(key,b)/4,"read",kb*heads+h,32+side*16+b);
+                    }
+                    for(int b=0;b<inputBytes;++b) {
                         mem(expanded,b,side,start-1-id(expanded,b)/4,"read",valueOffset,32+side*16+b,vectors);
-                        mem(saved,b+high,side,start-1-id(saved,b+high)/4,"read",address,32+side*16+2+b,vectors);
+                        mem(saved,b+inputHigh,side,start-1-id(saved,b+inputHigh)/4,"read",address,32+side*16+inputBytes+b,vectors);
                     }
                     for(int b=0;b<bytes;++b)
                         mem(updated,b,side,start+5+id(updated,b)/4,readout?"write_tap":"write",address,(1-side)*8+2+b,vectors);
@@ -351,11 +371,13 @@ mlir::LogicalResult lowerScaledMatvecSchedules(mlir::IRRewriter& r,
                             mem(query,b,side,compute-latency,"read",kb*heads+h,b);
                         }
                         const bool last=kb==kd/32-1;
+                        // Full-width SXM broadcasts use W24..W27 on the
+                        // mirrored side; keep readout on its own W28..W31.
                         attention_detail::emitMxm(r,loc,compute,side*target.throughput().mxms_per_hemisphere,
-                            "compute",weightBuffer,0,0,24,1,1,0,1,last?"stream":"sram",last,"block",0,"bf16","direct16",last?outputFormat:"");
+                            "compute",weightBuffer,0,0,full?28:24,1,1,0,1,last?"stream":"sram",last,"block",0,"bf16","direct16",last?outputFormat:"");
                         if(last)for(int b=0;b<bytes;++b) {
                             const auto latency=*target.transport_latency(target::StreamEndpoint::MxmResult,target::StreamEndpoint::Mem,target::StreamDirection::West,id(result,b));
-                            mem(result,b,side,compute+target.mxm_first_result_latency()+latency,"write",vb*heads+h,32+24+b);
+                            mem(result,b,side,compute+target.mxm_first_result_latency()+latency,"write",vb*heads+h,32+(full?28:24)+b);
                         }
                     }
                 }

@@ -143,9 +143,9 @@ class LogicalGraph:
         path.write_text(json.dumps(result,separators=(',',':'))+'\n',encoding='utf-8')
         return path
 
-    def decode_projections(self, x, weights, packed, scales, c):
+    def decode_projections(self, x, weights, packed, scales, c, *, normalize_input=True):
         """One row per independent request; all projections share the batch GEMM."""
-        n = self.norm('input_norm', x, bf16(1+weights.input_norm), c.rms_norm_eps)
+        n = self.norm('input_norm', x, bf16(1+weights.input_norm), c.rms_norm_eps) if normalize_input else x
         qkv = self.project('in_proj_qkv', n, packed['in_proj_qkv'], scales['in_proj_qkv'])
         z = self.project('in_proj_z', n, packed['in_proj_z'], scales['in_proj_z'])
         beta, logdecay = self.gates(n, packed, scales, weights.dt_bias, weights.a_log)
@@ -186,6 +186,52 @@ class LogicalGraph:
         core, updated = self.delta(q,k,mixed[:,2*c.key_width:],decay,beta,
             state.reshape(c.num_value_heads*c.key_head_dim,c.value_head_dim),c)
         return core, updated, window
+
+    def decode_mixer_wide(self, qkv, beta, decay, history, state, z, weights, c):
+        """Independent decode equations using the shared streaming state primitive.
+
+        State ABI is [head,value,key], retaining the native matrix layout in DDR.
+        No projection, physical layout conversion, or host activation math here.
+        """
+        def argument(name, value, dtype):
+            t = self.type(value.shape, dtype)
+            source = f'''module {{ func.func @stage(%x: {t}) -> {t} {{
+              %y = ftlpu.kernel.reshape %x : ({t}) -> {t}
+              return %y : {t}
+            }} }}'''
+            return self.run(name,source,[(value,dtype)],[(value.shape,dtype)])[0]
+        projected = argument('decode_qkv',qkv,'bf16')
+        cached = argument('conv_cache_view',history,'bf16')
+        window = Value.concatenate([cached[-(c.conv_kernel_size-1):], projected])
+        mixed = self.conv(window,weights.conv1d)[-1:]
+        q = self.norm('query_l2',mixed[:,:c.key_width].reshape(-1,c.key_head_dim),
+            np.ones(c.key_head_dim),1e-6,False,1/np.sqrt(c.key_head_dim))
+        k = self.norm('key_l2',mixed[:,c.key_width:2*c.key_width].reshape(-1,c.key_head_dim),
+            np.ones(c.key_head_dim),1e-6,False)
+        q = q.repeat(c.num_value_heads//c.num_key_heads,axis=0)
+        k = k.repeat(c.num_value_heads//c.num_key_heads,axis=0)
+        v = mixed[:,2*c.key_width:].reshape(c.num_value_heads,c.value_head_dim)
+        mt,dt,kt,vt,pt = (self.type(shape,dtype) for shape,dtype in (
+            (state.shape,'f32'),(decay.shape,'f32'),(k.shape,'bf16'),
+            (v.shape,'bf16'),((c.num_value_heads,c.value_head_dim),'f32')))
+        source = f'''module {{ func.func @stage(%s: {mt}, %d: {dt}, %k: {kt},
+            %v: {vt}, %b: {dt}, %q: {kt}) -> ({mt}, {pt}, {pt}, {mt}, {pt}) {{
+          %scaled, %p, %delta, %updated, %y = ftlpu.kernel.scaled_matvec %s, %d, %k
+              epilogue(%v, %b, %q) : ({mt}, {dt}, {kt}, {vt}, {dt}, {kt}) -> ({mt}, {pt}, {pt}, {mt}, {pt})
+          return %scaled, %p, %delta, %updated, %y : {mt}, {pt}, {pt}, {mt}, {pt}
+        }} }}'''
+        results = self.run('state_decay_ks',source,
+            [(state,'f32'),(decay,'f32'),(k,'bf16'),(v,'bf16'),(beta,'f32'),(q,'bf16')],
+            [(state.shape,'f32'),((c.num_value_heads,c.value_head_dim),'f32'),
+             ((c.num_value_heads,c.value_head_dim),'f32'),(state.shape,'f32'),
+             ((c.num_value_heads,c.value_head_dim),'f32')])
+        readout = self.truncate_bf16('readout_bf16_view',results[4])
+        normalized = self.norm('delta_output_norm',readout,weights.delta_norm,c.rms_norm_eps)
+        def gate(g):
+            return g.add(0,g.add(1,g.sigmoid(1)),dtype='bf16')
+        gated = self.vector_tiles('delta_output_gate',
+            [(normalized,'bf16'),(z.reshape(normalized.shape),'bf16')],gate)
+        return gated.reshape(1,c.value_width), results[3], window
 
     def attention(self,x,weights,packed,scales,c,initial_state=None,conv_state=None):
         project=lambda name,value:self.project(name,value,packed[name],scales[name])

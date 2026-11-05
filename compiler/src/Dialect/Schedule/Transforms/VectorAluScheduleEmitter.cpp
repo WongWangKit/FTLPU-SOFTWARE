@@ -2,6 +2,7 @@
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
+#include "ftlpu/compiler/Target/graph_weight_paging.hpp"
 #include "DirectDomainEmitterUtils.hpp"
 #include "FfnEmitterUtils.hpp"
 #include "AttentionEmitterUtils.hpp"
@@ -42,6 +43,7 @@ struct Storage {
     bool tokenPartition = false;
     int64_t broadcastRowRepeat = 0;
     int64_t broadcastHeadBase = 0;
+    int64_t broadcastHeadStride = 1;
 };
 
 Storage storageOf(mlir::DictionaryAttr p)
@@ -53,12 +55,16 @@ Storage storageOf(mlir::DictionaryAttr p)
         p.getAs<mlir::StringAttr>("hemisphere").getValue() == "both",
         p.getAs<mlir::StringAttr>("kind").getValue() == "token_partition_planar",
         p.getAs<mlir::IntegerAttr>("broadcast_row_repeat") ? p.getAs<mlir::IntegerAttr>("broadcast_row_repeat").getInt() : 0,
-        p.getAs<mlir::IntegerAttr>("broadcast_head_base") ? p.getAs<mlir::IntegerAttr>("broadcast_head_base").getInt() : 0};
+        p.getAs<mlir::IntegerAttr>("broadcast_head_base") ? p.getAs<mlir::IntegerAttr>("broadcast_head_base").getInt() : 0,
+        p.getAs<mlir::IntegerAttr>("broadcast_head_stride") ? p.getAs<mlir::IntegerAttr>("broadcast_head_stride").getInt() : 1};
 }
 
 #include "ScaledMatvecEmitter.hpp"
 #include "SiluMultiplyEmitter.hpp"
 #include "WeightedGramEmitter.hpp"
+#include "UnitLowerSolveEmitter.hpp"
+#include "UnitLowerMxmEmitter.hpp"
+#include "HeadWeightedProductEmitter.hpp"
 
 // One streamed head followed by immediate operations. Keep multi-use values
 // and quantizing edges as boundaries. This plan also determines SRAM lifetimes:
@@ -74,17 +80,44 @@ llvm::SmallVector<int64_t> chainColumns(llvm::ArrayRef<kernel::VectorAluOp> ops,
         return first;
     };
     auto head = ops.front();
+    // Fuse a matrix contraction and its pointwise epilogue before emitting
+    // hardware domains. The intermediate matrix never acquires a MEM stream.
+    if(head.getKind()=="weighted_gram" && ops.size()>=3) {
+        auto scale=ops[1],mask=ops[2];
+        if(scale.getKind()=="gram_row_scale" && mask.getKind()=="head_mask" &&
+           scale.getLhs()==head.getResult() && mask.getLhs()==scale.getResult() &&
+           head.getResult().hasOneUse() && scale.getResult().hasOneUse()) return {0,1,2};
+    }
+    if(head.getKind()=="cross_gram") {
+        auto next=ops.size()>1?ops[1]:kernel::VectorAluOp{};
+        if(next && next.getKind()=="multiply" && !next.getUseImmediate() &&
+           !next.getReduce() && next.getLhs()==head.getResult() && head.getResult().hasOneUse() &&
+           next.getRhs().getType().getElementType().isBF16()) return {0,1};
+        return {0};
+    }
+    if(head.getKind()=="head_last_row_scale_transpose") {
+        auto next=ops.size()>1?ops[1]:kernel::VectorAluOp{};
+        if(next && next.getKind()=="head_cross_product" && next.getLhs()==head.getResult() && head.getResult().hasOneUse()) {
+            auto output=ops.size()>2?ops[2]:kernel::VectorAluOp{};
+            if(output && output.getKind()=="head_matmul" && output.getRhs()==next.getRhs()) {
+                auto precision=output->getAttrOfType<mlir::StringAttr>("mxm_precision");
+                if(precision && precision.getValue()=="bf16") return {0,1,2};
+            }
+            return {0,1};
+        }
+        return {0};
+    }
     const bool fixed = head->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill");
     const auto tokenPolicy=head->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_bf16_token_halves");
     const bool originalChain=fixed && tokenPolicy && tokenPolicy.getValue();
     llvm::SmallVector<int64_t> columns{columnFor(head,
         fixed && !head.getUseImmediate() && head.getLhs()==head.getRhs()?1:0)};
-    if (head.getKind()=="cumsum_rows" || head.getKind()=="causal_exp_difference" || head.getKind()=="weighted_gram") return columns;
+    if (head.getKind()=="cumsum_rows" || head.getKind()=="causal_exp_difference" || head.getKind()=="weighted_gram" || (head.getKind()=="unit_lower_solve" || head.getKind()=="unit_lower_solve_blocked") || head.getKind()=="head_scale" || head.getKind()=="unit_lower_inverse" || head.getKind()=="head_matmul") return columns;
     while (packed && !head.getReduce() && columns.size() < ops.size()) {
         auto prior = ops[columns.size() - 1];
         auto next = ops[columns.size()];
         const int64_t column = columnFor(next, columns.back() + 1);
-        if (column >= 7 || next.getReduce() || next.getKind()=="cumsum_rows" || next.getKind()=="causal_exp_difference" || next.getKind()=="weighted_gram"
+        if (column >= (fixed ? 8 : 7) || next.getReduce() || next.getKind()=="cumsum_rows" || next.getKind()=="causal_exp_difference" || (next.getKind()=="weighted_gram" || next.getKind()=="cross_gram") || (next.getKind()=="unit_lower_solve" || next.getKind()=="unit_lower_solve_blocked") || next.getKind()=="head_scale" || next.getKind()=="unit_lower_inverse" || next.getKind()=="head_matmul"
             || (!next.getUseImmediate() && !(originalChain && next.getRhs()==head.getLhs()))
             || next.getLhs() != prior.getResult()
             || !prior.getResult().getType().getElementType().isF32()
@@ -101,7 +134,19 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
     Storage rhsStorage, Storage outStorage, bool packed, int64_t queueBase,
     llvm::ArrayRef<kernel::VectorAluOp> chain, llvm::ArrayRef<int64_t> columns)
 {
-    if(op.getKind()=="weighted_gram") return emitWeightedGram(r,op,target);
+    if(op.getKind()=="head_last_row_scale_transpose") {
+        if(chain.size()!=2 && chain.size()!=3)return op.emitError("requires fused head_cross_product consumer");
+        return emitHeadWeightedProduct(r,op,chain[1],target,chain.size()==3?chain[2]:kernel::VectorAluOp{});
+    }
+    if(op.getKind()=="head_cross_product")return op.emitError("requires fused scale-transpose producer");
+    if(op.getKind()=="unit_lower_inverse" || op.getKind()=="head_matmul") return emitUnitLowerMxm(r,op,target);
+    if((op.getKind()=="unit_lower_solve" || op.getKind()=="unit_lower_solve_blocked") || op.getKind()=="head_scale") return emitUnitLowerSolve(r,op,target);
+    if(op.getKind()=="cross_gram") {
+        if(chain.size()!=2) return op.emitError("cross_gram currently requires a single native BF16 multiply epilogue");
+        return emitWeightedGram(r,op,target,chain.back());
+    }
+    if(op.getKind()=="weighted_gram") return emitWeightedGram(r,op,target,{},chain.size()==3?chain[1]:kernel::VectorAluOp{},chain.size()==3?chain[2]:kernel::VectorAluOp{});
+    if(op.getKind()=="gram_row_scale" || op.getKind()=="head_mask") return op.emitError("requires fused weighted Gram row-scale/mask chain");
     const auto lhsType = op.getLhs().getType();
     const auto rhsType = op.getRhs().getType();
     auto tail = chain.back();
@@ -129,7 +174,8 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
                 mlir::NamedAttrList a(placement(r, type, storage.slice, storage.both ? "both" : storage.west ? "west" : "east", storage.bank, packed, wordElements));
                 a.set("base_row", r.getI64IntegerAttr(storage.base));
                 if(storage.broadcastRowRepeat)
-                    a.set("instruction_count",r.getI64IntegerAttr(storage.broadcastHeadBase+type.getDimSize(0)/storage.broadcastRowRepeat));
+                    a.set("instruction_count",r.getI64IntegerAttr(storage.broadcastHeadBase+
+                        (type.getDimSize(0)/storage.broadcastRowRepeat-1)*storage.broadcastHeadStride+1));
                 if(storage.tokenPartition) a.set("kind",r.getStringAttr("token_partition_planar"));
                 return a.getDictionary(r.getContext());
             }()),
@@ -321,6 +367,82 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
         r.replaceOp(op,result.getValue());
         return mlir::success();
     }
+    if (!packed && fp32Ingress) {
+        // Scalar-planar rows replicate each scalar across the 32 lanes. Use
+        // the same fixed local ports as packed chains; reduce across cycles,
+        // with a fresh accumulator for every row. No legacy group mux exists.
+        if (!lhsStorage.both || !outStorage.both || (!op.getUseImmediate() && !rhsStorage.both))
+            return op.emitError("fixed scalar chains require mirrored placements");
+        const int64_t start=96, cols=lhsType.getDimSize(1), rows=lhsType.getDimSize(0);
+        const int64_t count=op.getReduce()?cols:rows*cols;
+        const int64_t interval=cols+96;
+        const bool fullLhs=lhsType.getElementType().isF32(), fullRhs=rhsType.getElementType().isF32();
+        const int64_t rhsPort=fullLhs || fullRhs?4:2;
+        const auto read=[&](mlir::RankedTensorType ty,Storage st,int64_t port,bool rhs) {
+            const bool bc=rhs && ty.getDimSize(1)==1, br=rhs && ty.getDimSize(0)==1;
+            for(int64_t side=0;side<2;++side)for(int64_t byte=0;byte<(ty.getElementType().isF32()?4:2);++byte) {
+                const auto slice=st.slice+byte;
+                direct_domain_detail::emitMem3D(r,op.getLoc(),target,start-1-slice/4,
+                    side*target.memory().slices_per_hemisphere+slice,"read",st.base,
+                    32+side*16+port+byte,cols,1,bc?0:1,
+                    rows,op.getReduce()?interval:cols,br?0:ty.getDimSize(1),1,1,0,-1,st.bank);
+            }
+        };
+        read(lhsType,lhsStorage,0,false);
+        const bool same=op.getLhs()==op.getRhs();
+        if(!op.getUseImmediate() && !same) read(rhsType,rhsStorage,rhsPort,true);
+        int64_t latency=8;
+        mlir::Value current=op.getLhs();
+        for(int64_t col=0;col<8;++col) {
+            auto at=llvm::find(columns,col);
+            const bool arithmetic=at!=columns.end(), reduction=op.getReduce() && col==1;
+            auto member=arithmetic?chain[at-columns.begin()]:op;
+            auto reductionKind=op->getAttrOfType<mlir::StringAttr>("reduction_kind");
+            auto opcode=reduction?(reductionKind?reductionKind.getValue():llvm::StringRef("add")):
+                arithmetic?member.getKind():llvm::StringRef("bypass");
+            auto lhs=col?llvm::StringRef("previous"):llvm::StringRef(fullLhs?"stream_f32":"stream_bf16");
+            auto rhs=reduction?llvm::StringRef("accumulator"):
+                arithmetic && !member.getUseImmediate()?(member!=op || same?llvm::StringRef("original"):
+                llvm::StringRef(fullRhs?"stream_f32":"stream_bf16")):llvm::StringRef("immediate");
+            latency+=opcode=="exp" || opcode=="reciprocal" || opcode=="rsqrt" || opcode=="log"?4:opcode=="multiply"?1:0;
+            if(reduction) {
+                for(int64_t row=0;row<rows;++row) {
+                    auto first=ffn_detail::create_vxm(r,op.getLoc(),current,current,outType,
+                        start-1+row*interval,col,opcode,
+                        "previous",0,0.f,"accumulator",0,0.f,
+                        "fp32",-1,1,1,"east","west",-1,true,true,true,false,8);
+                    if(count>1)first=ffn_detail::create_vxm(r,op.getLoc(),current,current,outType,
+                        start+row*interval,col,opcode,"previous",0,0.f,"accumulator",0,0.f,
+                        "fp32",-1,count-1,1,"east","west",-1,false,true,true,false,8);
+                    current=first.getResult();
+                }
+                continue;
+            }
+            auto v=ffn_detail::create_vxm(r,op.getLoc(),current,current,outType,
+                start-1,col,opcode,lhs,0,0.f,rhs,(rhs=="stream_f32" || rhs=="stream_bf16")?rhsPort:0,
+                arithmetic?member.getImmediate().convertToFloat():0.f,
+                col==7?(outType.getElementType().isF32()?"fp32":"bf16"):"fp32",col==7?6:-1,
+                count,1,"east","west",-1,false,false,true,false,8);
+            if(lhs.starts_with("stream_"))v->setAttr("lhs_stream_source",r.getStringAttr("local"));
+            if(rhs.starts_with("stream_"))v->setAttr("rhs_stream_source",r.getStringAttr("local"));
+            if(op.getReduce()) {
+                v->setAttr("wave_count",r.getI64IntegerAttr(rows));
+                v->setAttr("wave_interval",r.getI64IntegerAttr(interval));
+            }
+            current=v.getResult();
+        }
+        for(int64_t side=0;side<2;++side)for(int64_t byte=0;byte<(outType.getElementType().isF32()?4:2);++byte) {
+            const auto slice=outStorage.slice+byte;
+            direct_domain_detail::emitMem3D(r,op.getLoc(),target,start+latency+slice/4+(op.getReduce()?cols-1:0),
+                side*target.memory().slices_per_hemisphere+slice,"write",outStorage.base,(1-side)*8+6+byte,
+                op.getReduce()?1:count,1,1,op.getReduce()?rows:1,op.getReduce()?interval:1,
+                op.getReduce()?1:0,1,1,0,-1,outStorage.bank);
+        }
+        auto result=bind({},outType,0,"output",outStorage);
+        r.replaceOp(tail,result.getValue());
+        for(int64_t i=chain.size()-2;i>=0;--i)r.eraseOp(chain[i]);
+        return mlir::success();
+    }
     if (op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill")) {
         if (!packed || op.getReduce() || !lhsStorage.both || !outStorage.both
             || (!op.getUseImmediate() && !rhsStorage.both))
@@ -392,7 +514,7 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
                     direct_domain_detail::emitMem3D(r,op.getLoc(),target,start-1-slice/4,
                         side*target.memory().slices_per_hemisphere+slice,"read",st.base+st.broadcastHeadBase,
                         32+side*16+port+byte,st.broadcastRowRepeat,1,0,
-                        heads,st.broadcastRowRepeat,1,packedColumns,lhsType.getDimSize(0),0,-1,st.bank);
+                        heads,st.broadcastRowRepeat,st.broadcastHeadStride,packedColumns,lhsType.getDimSize(0),0,-1,st.bank);
                     continue;
                 }
                 direct_domain_detail::emitMem3D(r,op.getLoc(),target,start-1-slice/4,
@@ -516,7 +638,8 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
             const bool arithmetic = at != columns.end();
             auto member = arithmetic ? chain[at - columns.begin()] : op;
             const bool reduction = op.getReduce() && col == lastColumn;
-            const auto opcode = reduction ? llvm::StringRef("add")
+            const auto reductionKind = op->getAttrOfType<mlir::StringAttr>("reduction_kind");
+            const auto opcode = reduction ? (reductionKind ? reductionKind.getValue() : llvm::StringRef("add"))
                 : arithmetic ? member.getKind() : llvm::StringRef("cast");
             const auto lhsKind = col == 0 ? kind(lhsType) : llvm::StringRef("previous");
             const auto rhsKind = reduction ? llvm::StringRef("accumulator")
@@ -618,10 +741,19 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
             bool losesInfo = false;
             baseline.convert(llvm::APFloat::IEEEhalf(), llvm::APFloat::rmNearestTiesToEven, &losesInfo);
             auto large = alu("subtract", logarithm, {}, baseline.convertToFloat());
-            auto small = alu("negate", alu("max", alu("negate", exponential), {}, -boundary));
-            auto polynomial = alu("add", alu("multiply", small, {}, 1.0f/3), {}, -0.5f);
-            polynomial = alu("add", alu("multiply", polynomial, small), {}, 1.0f);
-            auto correction = alu("add", large, alu("multiply", polynomial, small));
+            // p(t)=t-t^2/2+t^3/3 is monotone on [0,1], hence
+            // p(min(t,a))=min(p(t),p(a)). Clamp after the polynomial:
+            // every multiply can reuse the chain's Original=t, eliminating
+            // the clamped-t spill and keeping both branch outputs on the
+            // same token hemisphere. C7 performs the final negate/output.
+            float limit=boundary*(1.0f/3.0f);
+            limit=(limit-0.5f)*boundary;
+            limit=(limit+1.0f)*boundary;
+            auto polynomial = alu("add", alu("multiply", exponential, {}, 1.0f/3), {}, -0.5f);
+            polynomial = alu("add", alu("multiply", polynomial, exponential), {}, 1.0f);
+            polynomial = alu("multiply", polynomial, exponential);
+            auto small = alu("negate", alu("max", alu("negate", polynomial), {}, -limit));
+            auto correction = alu("add", large, small);
             result = alu("add", alu("max", x), correction);
         } else {
             // softplus(x) = max(x,0) + 2*atanh(t),
@@ -678,9 +810,10 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
         return mlir::success();
     }
     mlir::IRRewriter r(function.getContext());
-    const bool packed = llvm::all_of(ops, [&](auto op) {
+    const auto scalarPolicy=function->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_scalar_layout");
+    const bool packed = !(scalarPolicy && scalarPolicy.getValue()) && llvm::all_of(ops, [&](auto op) {
         const auto lhs = op.getLhs().getType(), rhs = op.getRhs().getType();
-        if(op.getKind()=="weighted_gram") return true;
+        if(op.getKind()=="head_last_row_scale_transpose" || op.getKind()=="head_cross_product" || op.getKind()=="gram_row_scale" || op.getKind()=="head_mask" || op.getKind()=="cross_gram" || op.getKind()=="weighted_gram" || (op.getKind()=="unit_lower_solve" || op.getKind()=="unit_lower_solve_blocked") || op.getKind()=="head_scale" || op.getKind()=="unit_lower_inverse" || op.getKind()=="head_matmul") return true;
         return !op.getReduce() && (op.getUseImmediate()
             || (lhs.getDimSize(1) == rhs.getDimSize(1)
                 && (lhs.getDimSize(0) == rhs.getDimSize(0) || rhs.getDimSize(0) == 1)));
@@ -735,8 +868,10 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
     const int64_t capacity = slotsPerBank * target.memory().banks_per_slice;
     if (slotsPerBank <= 0) return function.emitError("no vector graph scratch slice groups");
     const auto plan = [&](mlir::Value value, Storage st) {
+        const auto ingress=function->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_fp32_ingress");
+        const bool fixedScalar=!packed && ingress && ingress.getValue();
         return placement(r, llvm::cast<mlir::RankedTensorType>(value.getType()),
-            st.slice, function->hasAttr("ftlpu.vector_bf16_spill") ? "both" : st.west ? "west" : "east", st.bank, packed, target.memory().bytes_per_word);
+            st.slice, (fixedScalar || function->hasAttr("ftlpu.vector_bf16_spill")) ? "both" : st.west ? "west" : "east", st.bank, packed, target.memory().bytes_per_word);
     };
     for (auto [index, op] : llvm::enumerate(ops)) {
         llvm::erase_if(live, [&](const Live& item) { return item.end < static_cast<int64_t>(index); });
@@ -751,16 +886,100 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
         op->setAttr("ftlpu.vector_lhs_placement", plan(op.getLhs(), storage.lookup(op.getLhs())));
         op->setAttr("ftlpu.vector_rhs_placement", plan(op.getRhs(), storage.lookup(op.getRhs())));
         op->setAttr("ftlpu.vector_result_placement", plan(op.getResult(), output));
-        if(op.getKind()=="weighted_gram") {
+        if(op.getKind()=="head_last_row_scale_transpose" || op.getKind()=="head_cross_product") {
+            for(auto name:{"ftlpu.vector_lhs_placement","ftlpu.vector_rhs_placement","ftlpu.vector_result_placement"}) {
+                mlir::NamedAttrList p(op->getAttrOfType<mlir::DictionaryAttr>(name));
+                p.set("hemisphere",r.getStringAttr("both"));
+                if(op.getKind()=="head_cross_product")
+                    p.set("kind",r.getStringAttr(llvm::StringRef(name)=="ftlpu.vector_rhs_placement"?"token_partition_east_first_planar":"token_partition_planar"));
+                if(op.getKind()=="head_cross_product" && llvm::StringRef(name)=="ftlpu.vector_result_placement")
+                    p.set("instruction_count",r.getI64IntegerAttr(op.getResult().getType().getNumElements()/64));
+                op->setAttr(name,p.getDictionary(r.getContext()));
+            }
+        }
+        if(op.getKind()=="gram_row_scale" || op.getKind()=="head_mask" || op.getKind()=="weighted_gram" || op.getKind()=="cross_gram" ||
+           (op.getKind()=="multiply" && op.getLhs().getDefiningOp<kernel::VectorAluOp>() &&
+            op.getLhs().getDefiningOp<kernel::VectorAluOp>().getKind()=="cross_gram")) {
             mlir::NamedAttrList result(op->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_result_placement"));
             // Return native head groups [even heads, odd heads]. Logical
             // consumers can express the interleave as a tensor view rather
             // than requiring a physical output archive.
             result.set("kind",r.getStringAttr("token_partition_east_first_planar"));
             op->setAttr("ftlpu.vector_result_placement",result.getDictionary(r.getContext()));
-            if(!op.getRhs().getType().getElementType().isBF16()) {
+            if(op.getKind()=="weighted_gram" && !op.getRhs().getType().getElementType().isBF16()) {
                 auto table=mlir::RankedTensorType::get({1024,32},r.getBF16Type());
                 op->setAttr("weighted_gram.r_table",placement(r,table,48,"both",0,true,32));
+            }
+        }
+        if(op.getKind()=="gram_row_scale") {
+            op->setAttr("gram_scale.heads",placement(r,mlir::RankedTensorType::get({op.getLhs().getType().getDimSize(0),32},r.getF32Type()),28,"both",0,true,32));
+            op->setAttr("gram_scale.masked",placement(r,mlir::RankedTensorType::get({op.getLhs().getType().getDimSize(0),32},r.getF32Type()),24,"both",1,true,32));
+            op->setAttr("gram_scale.broadcast",placement(r,mlir::RankedTensorType::get({op.getLhs().getType().getDimSize(0),32},r.getF32Type()),24,"both",0,true,32));
+        }
+        if((op.getKind()=="unit_lower_solve" || op.getKind()=="unit_lower_solve_blocked") || op.getKind()=="head_scale") {
+            const bool solve=(op.getKind()=="unit_lower_solve" || op.getKind()=="unit_lower_solve_blocked");
+            auto table=mlir::RankedTensorType::get({32,32},r.getF32Type());
+            // Head scaling uses bank ping-pong near the SR midpoint, keeping
+            // local and bridged byte planes close enough for a 32-cycle II.
+            int64_t coefficientSlice=24;
+            const auto module=function->getParentOfType<mlir::ModuleOp>();
+            // The operator requests four independent coefficient byte planes.
+            // Graph policy supplies reserved page queues; no model/test branch
+            // is responsible for moving this scratch when overlap is enabled.
+            if(solve && module->hasAttr("ftlpu.weight_paging_policy"))
+                coefficientSlice=target::GraphWeightPaging::resolve(target,module->getAttrDictionary())
+                    .scratchSlice(coefficientSlice,4,target.memory().slices_per_hemisphere);
+            op->setAttr("solve.coefficients",placement(r,table,coefficientSlice,"both",0,true,32));
+            op->setAttr("solve.coefficients_alternate",placement(r,table,coefficientSlice,"both",1,true,32));
+            if(solve) {
+                for(auto name:{"ftlpu.vector_lhs_placement","ftlpu.vector_rhs_placement"}) {
+                    mlir::NamedAttrList input(op->getAttrOfType<mlir::DictionaryAttr>(name));
+                    input.set("kind",r.getStringAttr(llvm::StringRef(name)=="ftlpu.vector_lhs_placement"?"token_partition_east_first_planar":"token_partition_planar"));
+                    op->setAttr(name,input.getDictionary(r.getContext()));
+                }
+                auto feedback=mlir::RankedTensorType::get({32,op.getRhs().getType().getDimSize(1)},r.getF32Type());
+                op->setAttr("solve.feedback",placement(r,feedback,36,"both",0,true,32));
+                if(op.getKind()=="unit_lower_solve_blocked") {
+                    auto tile=mlir::RankedTensorType::get({32,32},r.getBF16Type());
+                    auto product=mlir::RankedTensorType::get({16,op.getRhs().getType().getDimSize(1)},r.getF32Type());
+                    op->setAttr("solve_block.weight_tile",placement(r,tile,40,"both",0,true,32));
+                    op->setAttr("solve_block.product",placement(r,product,44,"both",0,true,32));
+                }
+            }
+            mlir::NamedAttrList out(op->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_result_placement"));
+            out.set("kind",r.getStringAttr(solve?"token_partition_east_first_planar":"token_partition_planar"));
+            op->setAttr("ftlpu.vector_result_placement",out.getDictionary(r.getContext()));
+        }
+        if(op.getKind()=="unit_lower_inverse" || op.getKind()=="head_matmul") {
+            const bool inverse=op.getKind()=="unit_lower_inverse";
+            const bool sharedWeight=!inverse && llvm::any_of(op.getRhs().getUsers(),[](mlir::Operation *user) {
+                auto other=llvm::dyn_cast<kernel::VectorAluOp>(user);
+                return other && other.getKind()=="head_cross_product";
+            });
+            for(auto name:{"ftlpu.vector_lhs_placement","ftlpu.vector_rhs_placement","ftlpu.vector_result_placement"}) {
+                mlir::NamedAttrList p(op->getAttrOfType<mlir::DictionaryAttr>(name));
+                const bool result=llvm::StringRef(name)=="ftlpu.vector_result_placement";
+                p.set("kind",r.getStringAttr((sharedWeight?!result:(inverse!=result))?"token_partition_east_first_planar":"token_partition_planar"));
+                p.set("hemisphere",r.getStringAttr("both"));
+                op->setAttr(name,p.getDictionary(r.getContext()));
+            }
+            const auto precision=op->getAttrOfType<mlir::StringAttr>("mxm_precision");
+            if(inverse || !precision || precision.getValue()!="bf16") {
+            auto tile=mlir::RankedTensorType::get({32,32},r.getBF16Type());
+            op->setAttr("solve_mxm.weight_tile",placement(r,tile,40,"both",0,true,32));
+            auto residualType=mlir::RankedTensorType::get({32,32},r.getF32Type());
+            op->setAttr("solve_mxm.a1",placement(r,residualType,24,"both",0,true,32));
+            op->setAttr("solve_mxm.a2",placement(r,residualType,24,"both",1,true,32));
+            op->setAttr("solve_mxm.b1",placement(r,residualType,28,"both",0,true,32));
+            op->setAttr("solve_mxm.b2",placement(r,residualType,28,"both",1,true,32));
+            op->setAttr("solve_mxm.residual_bridge",placement(r,residualType,36,"both",1,true,32));
+            }
+            if(inverse) {
+                auto matrix=mlir::RankedTensorType::get({32,32},r.getF32Type());
+                op->setAttr("solve_mxm.t0",placement(r,matrix,16,"both",0,true,32));
+                op->setAttr("solve_mxm.t1",placement(r,matrix,16,"both",1,true,32));
+                op->setAttr("solve_mxm.p0",placement(r,matrix,20,"both",0,true,32));
+                op->setAttr("solve_mxm.p1",placement(r,matrix,20,"both",1,true,32));
             }
         }
         op->setAttr("ftlpu.vector_packed", r.getBoolAttr(packed));
