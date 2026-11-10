@@ -37,12 +37,14 @@ struct ProjectionGemmSchedule {
   void emitCompute(mlir::IRRewriter &rewriter, mlir::Location loc,
                    int64_t cycle, const Binding &binding,
                    bool finalOnly = false,
-                   llvm::StringRef partialFormat = "fp32") const {
+                   llvm::StringRef partialFormat = "fp32",
+                   llvm::StringRef outputFormat = {}) const {
+    const auto terminalFormat = outputFormat.empty() ? binding.format : outputFormat;
     attention_detail::emitMxm3D(rewriter, loc, cycle, binding.queue, "compute",
         binding.weightBuffer, 0, binding.activationStream, binding.outputStream,
         binding.accumulatorAddress, 1, finalOnly ? "stream" : "sram",
         finalOnly, "block", 0, binding.format, {},
-        finalOnly ? binding.format : partialFormat, compute(binding.format));
+        finalOnly ? terminalFormat : partialFormat, compute(terminalFormat));
   }
 
   attention_detail::MxmDomain3D load(int64_t columns,

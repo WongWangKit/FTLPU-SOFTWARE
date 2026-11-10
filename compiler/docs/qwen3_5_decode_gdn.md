@@ -924,3 +924,203 @@ requests `[327836,5035768)`, and output projection `[5035768,5112085)`.
 These intervals include C2C initialization and tensor exports. They describe
 the serialized staged baseline above, not a complete decoder layer or a
 fully overlapped batch32 implementation.
+
+### Measuring decode projection/Conv overlap
+
+The independent unit of work is one request at one decoding position. Retain
+all 32 rows of the projection GEMM; each Conv window consists of three
+history rows belonging to that request and its own newly projected row.
+Convolving across the 32 GEMM rows would mix different sessions. Use
+`compiler/tests/qwen3_5_decode_projection_conv_overlap_test.py` to compare
+the compiler switch on/off with real projection weights and nonzero
+request-local histories. A channel slice of this frontier does not cover
+the state update, cache export, or output projection of the complete GDN.
+
+For an existing raw-macro runtime CSV use
+`python tools/measure_compute_overlap.py <runtime.pipeline.csv>`. The result
+counts the union of MXM Compute intervals, non-bypass VXM ALU intervals,
+and their intersection; a cycle counts once irrespective of the number of
+active hemispheres or ALUs. This measures time coverage, not MAC occupancy.
+Host input/output windows are reported separately. In the full staged
+baseline, host output includes mandatory state and Conv cache writeback;
+it cannot all be subtracted as diagnostic time.
+
+Example (repository root; use the same build for both arms):
+
+```powershell
+python -X utf8 compiler/tests/qwen3_5_decode_projection_conv_overlap_test.py --package results/qwen3_5_0_8b_decoder_layer_prefill/package --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json --build-dir build-ftlpu-vs2026-direct --channels 512 --page-rows 512 --consumers 32 --mode both --output-dir results/qwen3_5_0_8b_decode_qkv_conv_qk_norm_wide_sxm/batch32/projection_conv_overlap
+```
+
+On the 512-channel slice, the off/on traces span 70,966/66,622 cycles;
+useful MXM/VXM intersections are 0/454 cycles with identical individual
+activity (8,192 MXM and 3,584 VXM cycles). Both arms load two 256-KiB
+weight pages. All 33 exports match byte for byte, including the projection
+and 32 separate Conv/SiLU results. Host output costs 7,904 cycles in both.
+The 4,344-cycle saving exceeds the compute intersection because the
+scheduling change also overlaps MEM/SR movement and pipeline startup/drain.
+
+For the full QKV width, use `--channels 6144 --page-rows 0 --consumers 32`
+and the `batch32/projection_conv_full_width` result directory; zero selects
+the compiler's default page sizing. The matched raw-macro runs take
+449,294 cycles off and 383,226 cycles on at 500 MHz (14.7% shorter).
+Of 43,008 non-bypass VXM cycles, 18,816 overlap MXM Compute
+with scheduling enabled, versus none with it disabled. Both traces contain
+98,304 MXM Compute cycles, 80,131 ingress cycles, 22,504 weight-wait
+cycles and 74,982 diagnostic export cycles; both load three 2-MiB pages.
+All 33 outputs are bit-identical between arms. The first simultaneous FU
+cycle in the on trace is 135,982. See `summary.json`, each arm's
+`runtime.pipeline.csv`, `actual.runtime.ftlpu` and `runtime_icu_programs/`.
+
+### Integrated batch32 decode, one token per request
+
+In `qwen3_5_decode_gdn_batched_test.py`, explicitly pass
+`--batches 32 --sxm-architecture wide --raw-input --projection-conv-overlap on`
+or `off` to select the same graph with the overlap policy enabled or
+disabled. Omitting this option retains the original staged graph. Both new
+arms run QKV and its independent Conv consumers together, and export the
+new Conv caches from that stage. The mixer imports the mixed channels by
+head, updates and exports FP32 state, then feeds one batched output GEMM.
+Input RMSNorm, residual and FFN are outside this test.
+
+At 500 MHz / 51.2 GB/s nominal, the matched integrated traces span
+4,491,926 cycles off and 4,426,041 on, including external memory and
+export costs. Overlap saves 65,885 cycles (0.131770 ms, 1.47%); the
+useful MXM/VXM intersection grows from 16,256 to 35,072 cycles with the
+same 10,551,296 bytes of paged weights. The on trace contains the front
+`[0,615628)`, mixer `[615628,4353935)` and output `[4353935,4426041)`.
+All 132 exports match, with all request and state-head numerical checks
+passing. When identical mixer/tail traces were reused, the harness verified
+the complete executable, each ordered input binding and runner identity.
+This is still a staged run with measured interstage I/O.
+
+The result manifest
+`results/qwen3_5_0_8b_decode_gdn_batch32_conv_ab/verified/ab_summary.json`
+includes the commands for fresh runs and those actually used, tool hashes
+and trace provenance. Each arm retains the combined runtime CSV and executed
+programs under `batch32/step0`.
+
+### State export after the overlapped batch32 front
+
+The follow-up `--native-state-export` compiler policy exports ordered
+complete native tensor pieces from their existing addresses. It accepts
+FP32 quad-planar and BF16 pair-planar pieces in one bank, checks their
+logical coverage and physical disjointness, and falls back to gathering
+when the view cannot be represented. It is opt-in through
+`ftlpu.native_output_pieces`. No FU copy is emitted for an accepted view.
+
+Executable metadata version 41 records each output piece's shape and
+placement. The reader continues to accept older executable versions.
+ModelSession uses the existing C2C path to read all pieces, and the output
+unpacker reconstructs the logical byte order. This policy exports after
+the invocation completes. Cross-request prefetch and concurrent state
+writeback still require a separate lifetime and queue schedule.
+
+The dedicated packing regression is
+`weight_page_builder_test --native-output-pieces`. It covers unequal
+piece lengths, distinct slices/hemispheres, both binary readers,
+diagnostic SRAM readback, and rejection of aliases or incomplete output.
+
+The matched batch32 experiment uses the same compiler and batch runner in
+both arms. From the repository root, build and run:
+
+```powershell
+tools/build_vs2026.cmd -S . -B build-native-state-export -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_TRY_COMPILE_CONFIGURATION=Release `
+  -DFTLPU_MLIR_DIR=E:/timesintelli/workspace2/FTLPU-SOFTWARE/build-mlir-vs2026/lib/cmake/mlir
+tools/build_vs2026.cmd --build build-native-state-export `
+  --target ftlpu_compile compiled_batch_file_runner weight_page_builder_test --parallel 3
+build-native-state-export/runtime/weight_page_builder_test.exe --native-output-pieces
+$experiment = 'results/qwen3_5_0_8b_decode_gdn_batch32_conv_ab/native_state_export'
+foreach ($mode in @('off', 'on')) {
+  $policy = @()
+  if ($mode -eq 'on') { $policy += '--native-state-export' }
+  python compiler/tests/qwen3_5_decode_gdn_batched_test.py `
+    --batches 32 --sxm-architecture wide --raw-input --projection-conv-overlap on `
+    --package results/qwen3_5_0_8b_decoder_layer_prefill/package `
+    --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
+    --build-dir tmp/decode_conv_ab_full_tools `
+    --mixer-compiler build-native-state-export/compiler/ftlpu-compile.exe `
+    --mixer-runner build-native-state-export/runtime/compiled_batch_file_runner.exe `
+    --output-dir "$experiment/$mode" @policy
+}
+python compiler/tools/compare_native_state_export.py "$experiment/off" "$experiment/on"
+```
+
+The measured runs also supplied `--reuse-measured-front` and
+`--reuse-measured-stages`, both pointing to the prior `state_export`
+result directory. A stage is reused only when its raw executable,
+ordered input bytes, relevant runner and execution configuration match.
+Both mixers execute all 32 independent requests again.
+
+The measured native export run at 500 MHz / 51.2 GB/s completed in
+3,891,456 cycles (7.782912 ms), versus 4,160,090 cycles (8.320180 ms)
+for the matched control, a 6.4574% reduction including external transfers.
+Per-request state gather fell from 1 MiB to zero. The mixer program span
+fell from 31,817 to 23,424 cycles. Actual MXM/VXM simultaneous compute
+remained 35,072 cycles across the complete staged run.
+
+Both arms passed all 32 output/cache/state checks and 512 state-head
+checks. All 132 exported tensors are byte-identical, with worst attention
+NRMSE 1.2817% and worst state-head NRMSE 1.4208%. The new runner also
+executed the previous version-40 mixer program with identical output and
+state for one request. The comparison JSON is
+`native_state_export/native_export_comparison.json`.
+The on arm records 856,099 mixer ingress cycles and 1,598,055 egress
+cycles. Stage-boundary diagnostic and intermediate readback remains
+included in the complete runtime trace.
+
+The dedicated native-output regression passed. The broader
+`weight_page_builder_test` still fails with
+`cannot replace a program before all execution and transport resources drain`;
+the pre-existing build's test executable reproduces the same failure.
+The two logs are `tmp/native_state_weight_regression.log` and
+`tmp/native_state_existing_weight_regression.log`.
+
+The mixer produces a new FP32 recurrent state in two eight-head tiles. In
+the packed export path a mirrored source used to send both its east and
+west words to the same destination, in that order. For disjoint source
+and destination MEM queues the compiler now emits just the final west
+copy. Lane-partitioned inputs and potentially aliasing queues retain their
+original transfer order. The DDR binding still receives all 16 heads.
+
+With the same W8A16 projections, 500 MHz clock and 51.2 GB/s DDR peak,
+the complete single-step batch32 GDN trace decreased from 4,426,041 to
+4,160,090 cycles (8.852082 to 8.320180 ms). The state gather decreased
+from 2 MiB to 1 MiB per request. MXM compute and non-bypass VXM activity
+still intersect for 35,072 cycles. Mixer DDR ingress took 856,289 cycles
+and egress took 1,597,923. The trace includes intermediate readback at
+both stage boundaries. All 132 exported tensors matched the control
+byte-for-byte and all 512 per-head state comparisons passed against the
+reference. See `state_export/state_export_comparison.json` in the
+experiment directory for both runs' counters.
+
+To reproduce the batch32 single-token decode with the same staged runner,
+run from `FTLPU-SOFTWARE`. The pinned front and tail tools below are those
+used by the preceding projection/Conv experiment. The mixer compiler is
+the pinned version-40 executable from that measurement. Add `--keep-overwritten-mixer-copies` and
+use a separate output directory to run the unoptimized control.
+
+```powershell
+python compiler/tests/qwen3_5_decode_gdn_batched_test.py `
+  --batches 32 --sxm-architecture wide --raw-input --projection-conv-overlap on `
+  --package results/qwen3_5_0_8b_decoder_layer_prefill/package `
+  --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
+  --build-dir tmp/decode_conv_ab_full_tools `
+  --mixer-compiler tmp/state_export_compiler/ftlpu-compile-ab.exe `
+  --output-dir results/qwen3_5_0_8b_decode_gdn_batch32_conv_ab/state_export
+```
+
+The measured run reused the previous verified front and output projection
+traces after checking their program, ordered inputs and runner. The 32
+mixer invocations ran again. To verify that both measured mixer programs
+can be reproduced from a single kernel and the same compiler:
+
+```powershell
+$experiment = 'results/qwen3_5_0_8b_decode_gdn_batch32_conv_ab'
+python compiler/tests/check_packed_export_ab.py `
+  --compiler tmp/state_export_compiler/ftlpu-compile-ab.exe `
+  --target-config ../FTLPU-CMODEL/config/ftlpu-lpu32.json `
+  --baseline "$experiment/verified/on/batch32/step0/mixer" `
+  --optimized "$experiment/state_export/batch32/step0/mixer" `
+  --output-dir "$experiment/state_export/ab_compile_control"
+```

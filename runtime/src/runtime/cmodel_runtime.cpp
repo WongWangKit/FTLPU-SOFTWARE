@@ -1600,6 +1600,17 @@ std::vector<std::uint8_t> CModelRuntime::download_output(std::size_t index) cons
 std::vector<std::uint8_t> CModelRuntime::download_binding(
     const BinaryBinding& binding) const
 {
+    if (!binding.pieces.empty()) {
+        // Share the transport packer's coverage and physical-alias validation.
+        pack_binding_image(binding, std::vector<std::uint8_t>(binding.byte_size), hardware_);
+        std::vector<std::uint8_t> result;
+        result.reserve(binding.byte_size);
+        for (const auto& piece : binding.pieces) {
+            auto bytes = download_binding(piece);
+            result.insert(result.end(), bytes.begin(), bytes.end());
+        }
+        return result;
+    }
     require_matrix_binding(binding);
     const std::size_t rows = static_cast<std::size_t>(binding.shape[0]);
     const std::size_t columns = static_cast<std::size_t>(binding.shape[1]);

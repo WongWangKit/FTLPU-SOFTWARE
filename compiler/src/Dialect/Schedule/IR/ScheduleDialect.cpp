@@ -373,8 +373,8 @@ LogicalResult MxmLoadOp::verify()
         && bufferMode != "toggle_dim1" && bufferMode != "toggle_dim2")
         return emitOpError("contains an invalid MXM weight buffer mode");
     const int64_t expectedStreams = loadMode == "vector"
-        ? (inputMode == "int8_dequant_bf16" ? 1 : 2)
-        : inputMode == "int8_dequant_bf16"
+        ? (inputMode != "direct16" ? 1 : 2)
+        : inputMode != "direct16"
             ? target.throughput().mxm_int8_load_streams_per_cycle
             : target.throughput().mxm_load_streams_per_cycle;
     if ((loadMode != "block" && loadMode != "vector")
@@ -391,9 +391,9 @@ LogicalResult MxmLoadOp::verify()
     if (!target.is_valid_weight_buffer(getWeightBuffer()))
         return emitOpError("weight_buffer must select buffer 0 or 1");
     if (inputMode != "direct16"
-        && inputMode != "int8_dequant_bf16")
+        && inputMode != "int8_dequant_bf16" && inputMode != "fp8_dequant_bf16")
         return emitOpError(
-            "weight_input_mode must be direct16 or int8_dequant_bf16");
+            "weight_input_mode must be direct16, int8_dequant_bf16 or fp8_dequant_bf16");
     return success();
 }
 
@@ -1117,12 +1117,12 @@ LogicalResult MxmIssueOp::verify()
     const llvm::StringRef inputMode =
         getWeightInputMode().value_or("direct16");
     if (inputMode != "direct16"
-        && inputMode != "int8_dequant_bf16")
+        && inputMode != "int8_dequant_bf16" && inputMode != "fp8_dequant_bf16")
         return emitOpError(
-            "weight_input_mode must be direct16 or int8_dequant_bf16");
+            "weight_input_mode must be direct16, int8_dequant_bf16 or fp8_dequant_bf16");
     const int64_t weightStreams = loadMode == "vector"
-        ? inputMode == "int8_dequant_bf16" ? 1 : 2
-        : inputMode == "int8_dequant_bf16"
+        ? inputMode != "direct16" ? 1 : 2
+        : inputMode != "direct16"
         ? target.throughput().mxm_int8_load_streams_per_cycle
         : target.throughput().mxm_load_streams_per_cycle;
     const int64_t weightStreamBase = getWeightStreamBase().value_or(0);

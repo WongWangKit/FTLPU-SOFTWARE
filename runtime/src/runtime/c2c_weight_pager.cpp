@@ -244,8 +244,8 @@ bool common_domain_intersects(const CommonIssueDomain& domain,
     return search(search, axes.size(), domain.start);
 }
 
-void validate_common_drain_window(const BinaryProgram& program,
-    std::size_t stop, std::size_t ingressBegin)
+std::function<void(std::size_t, std::size_t)>
+make_common_drain_validator(const BinaryProgram& program)
 {
     // A full fabric traversal plus the longest configured FU path is a
     // deliberately conservative drain cost. The compiler's ingress timeline
@@ -259,16 +259,24 @@ void validate_common_drain_window(const BinaryProgram& program,
     const std::size_t guard = static_cast<std::size_t>(hwc.system_register_columns)
         + hwc.mem_boundary_register_columns + hwc.mxm_pipeline_rows
         + hwc.tile_rows + longestFu;
-    if (stop < ingressBegin || stop - ingressBegin < guard)
-        throw std::logic_error("unsafe common stop: exclusive compiler ingress window is shorter than the drain guard");
-    const auto begin = stop - guard;
+    struct Entry {
+        CommonIssueDomain domain;
+        QueueKind kind;
+        std::size_t index, last;
+    };
+    std::vector<Entry> entries;
     const auto check = [&](const CommonIssueDomain& domain,
                             const QueueProgram& queue) {
-        if (common_domain_intersects(domain, begin, stop))
-            throw std::logic_error("unsafe common stop: computation is still in the drain window: queue="
-                + std::string(queue_kind_name(queue.kind)) + "["
-                + std::to_string(queue.index) + "] stop=" + std::to_string(stop)
-                + " drain_begin=" + std::to_string(begin));
+        auto last = domain.start;
+        for (std::size_t axis = 0; axis < domain.counts.size(); ++axis) {
+            const auto count = domain.counts[axis], stride = domain.strides[axis];
+            if (count == 0 || stride == 0)
+                throw std::logic_error("invalid affine issue domain at common stop");
+            if (count - 1 > (std::numeric_limits<std::size_t>::max() - last) / stride)
+                throw std::overflow_error("common-stop final issue cycle overflows");
+            last += (count - 1) * stride;
+        }
+        entries.push_back({domain, queue.kind, queue.index, last});
     };
     for (const auto& queue : program.queues) {
         if (queue.kind == QueueKind::C2cDma || queue.kind == QueueKind::C2cRx
@@ -344,6 +352,21 @@ void validate_common_drain_window(const BinaryProgram& program,
             previous = cursor++; hasPrevious = true; ++pc;
         }
     }
+    // Compute queues stay immutable while schedule_common appends transport
+    // controls. Decode once; retain the exact affine intersection test for
+    // every candidate domain rather than weakening the drained-stop proof.
+    return [guard, entries = std::move(entries)](std::size_t stop, std::size_t ingressBegin) {
+        if (stop < ingressBegin || stop - ingressBegin < guard)
+            throw std::logic_error("unsafe common stop: exclusive compiler ingress window is shorter than the drain guard");
+        const auto begin = stop - guard;
+        for (const auto& entry : entries)
+            if (entry.domain.start < stop && entry.last >= begin
+                && common_domain_intersects(entry.domain, begin, stop))
+                throw std::logic_error("unsafe common stop: computation is still in the drain window: queue="
+                    + std::string(queue_kind_name(entry.kind)) + "["
+                    + std::to_string(entry.index) + "] stop=" + std::to_string(stop)
+                    + " drain_begin=" + std::to_string(begin));
+    };
 }
 
 MemIcuInstruction decode_mem_3d_instruction(
@@ -1883,6 +1906,7 @@ void C2cWeightPager::begin_schedule(BinaryProgram& program,
         program.hardware.mem_slices_per_register_group;
     linked_mxms_per_hemisphere_ = program.hardware.mxms_per_hemisphere;
     common_events_.clear();
+    common_drain_validator_ = {};
     common_page_ranges_.clear();
     overlap_calendar_.reset();
     if (program.transport_overlap_protocol) {
@@ -2344,7 +2368,9 @@ C2cWeightPageFence C2cWeightPager::schedule_common(
         throw std::logic_error("unsafe common stop: transport launch or SRAM reuse depends on computation after the stop: stop="
             + std::to_string(stop) + " earliest_mem=" + std::to_string(earliestMemCycle)
             + " binding=" + std::to_string(binary.weight_page_uses[pageUseIndices.front()].binding_index));
-    validate_common_drain_window(binary, stop, ingressBegin);
+    if (!common_drain_validator_)
+        common_drain_validator_ = make_common_drain_validator(binary);
+    common_drain_validator_(stop, ingressBegin);
     auto linkedPage = page;
     std::size_t producerStart = stop;
     if (overlap_calendar_) {

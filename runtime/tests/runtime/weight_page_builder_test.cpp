@@ -25,6 +25,68 @@ using namespace ftlpu::software::runtime;
 
 void require(bool condition, const std::string& message);
 
+void test_native_output_pieces()
+{
+    BinaryBinding first;
+    first.access = BindingAccess::Output;
+    first.element_type = BindingElementType::F32;
+    first.layout = BindingLayout::Fp32QuadPlanar;
+    first.shape = {3, 64};
+    first.byte_size = 3 * 64 * 4;
+    first.slices = {16,17,18,19};
+    first.base_row = 13;
+    first.instruction_count = 6;
+    first.address_stride = 1;
+    first.hemisphere_mask = 2;
+    first.bank = 1;
+    auto second = first;
+    second.shape = {5,64};
+    second.byte_size = 5 * 64 * 4;
+    second.slices = {44,45,46,47};
+    second.base_row = 97;
+    second.instruction_count = 10;
+    second.hemisphere_mask = 1;
+    auto output = first;
+    output.shape = {8,64};
+    output.byte_size = first.byte_size + second.byte_size;
+    output.pieces = {first,second};
+    std::vector<std::uint8_t> values(output.byte_size);
+    for (std::size_t i=0; i<values.size(); ++i) values[i] = (i*13+i/73)%251;
+    const ExecutableHardwareConfig hw;
+    auto image = pack_binding_image(output,values,hw);
+    require(image.segments.size()==8, "native output must preserve both physical homes");
+    require(unpack_binding_image(output,image,hw)==values, "native output order or byte planes changed");
+    BinaryProgram program;
+    program.bindings = {output};
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    write_binary_program(program,stream);
+    auto decoded = read_binary_program(stream);
+    require(unpack_binding_image(decoded.bindings.at(0),image,hw)==values, "native output binary roundtrip");
+    const auto bytes = stream.str();
+    auto metadata = read_binary_program_metadata(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size()));
+    require(unpack_binding_image(metadata.bindings.at(0),image,hw)==values, "native output metadata roundtrip");
+    auto system = std::make_unique<ftlpu::TspSliceSystem>();
+    CModelRuntime runtime(*system);
+    runtime.load(decoded);
+    runtime.upload_binding(first, std::vector<std::uint8_t>(values.begin(),values.begin()+first.byte_size));
+    runtime.upload_binding(second, std::vector<std::uint8_t>(values.begin()+first.byte_size,values.end()));
+    require(runtime.download_binding(decoded.bindings.at(0))==values, "native output diagnostic readback");
+    for (int invalid=0; invalid<3; ++invalid) {
+        auto bad = output;
+        if (invalid==0) bad.pieces[1].bank = 0;
+        if (invalid==1) {
+            bad.pieces[1] = first;
+            bad.byte_size = 2*first.byte_size;
+        }
+        if (invalid==2) bad.byte_size++;
+        bool rejected=false;
+        try { pack_binding_image(bad,std::vector<std::uint8_t>(bad.byte_size),hw); }
+        catch (const std::invalid_argument&) { rejected=true; }
+        require(rejected,"invalid native output accepted");
+    }
+}
+
 void test_attention16_paged_weight()
 {
     ExecutableHardwareConfig hardware;
@@ -858,6 +920,11 @@ void test_partial_rope_bias()
 
 int main(int argc, char** argv)
 try {
+    test_native_output_pieces();
+    if (argc == 2 && std::string(argv[1]) == "--native-output-pieces") {
+        std::cout << "Native output pieces passed\n";
+        return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--dense-split-down") {
         test_dense_split_down_page();
         return 0;

@@ -639,9 +639,17 @@ void write_binding(std::ostream& os, const BinaryBinding& binding)
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(binding.rope_inverse_frequencies.size()));
     for (const float frequency : binding.rope_inverse_frequencies)
         write_scalar<float>(os, frequency);
+    if (binding.pieces.size() > 4096)
+        throw std::runtime_error("too many binding pieces");
+    write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(binding.pieces.size()));
+    for (const auto& piece : binding.pieces) {
+        if (!piece.pieces.empty())
+            throw std::runtime_error("nested binding pieces are unsupported");
+        write_binding(os, piece);
+    }
 }
 
-BinaryBinding read_binding(std::istream& is, std::uint32_t version)
+BinaryBinding read_binding(std::istream& is, std::uint32_t version, bool child = false)
 {
     BinaryBinding binding;
     binding.index = read_scalar<std::uint32_t>(is);
@@ -738,6 +746,13 @@ BinaryBinding read_binding(std::istream& is, std::uint32_t version)
             for (std::uint32_t i = 0; i < count; ++i)
                 binding.rope_inverse_frequencies.push_back(read_scalar<float>(is));
         }
+    }
+    if (version >= 41) {
+        const auto count = read_scalar<std::uint32_t>(is);
+        if (count > 4096 || (child && count))
+            throw std::runtime_error("invalid binding piece count");
+        for (std::uint32_t i = 0; i < count; ++i)
+            binding.pieces.push_back(read_binding(is, version, true));
     }
     return binding;
 }
@@ -1260,7 +1275,7 @@ void skip_macro_bitstream(Reader& reader, QueueKind queueKind)
         + (bitCount + 7) / 8);
 }
 
-BinaryBinding read_binding(ByteReader& reader, std::uint32_t version)
+BinaryBinding read_binding(ByteReader& reader, std::uint32_t version, bool child = false)
 {
     BinaryBinding binding;
     binding.index = reader.read<std::uint32_t>();
@@ -1357,6 +1372,13 @@ BinaryBinding read_binding(ByteReader& reader, std::uint32_t version)
             for (std::uint32_t i = 0; i < count; ++i)
                 binding.rope_inverse_frequencies.push_back(reader.read<float>());
         }
+    }
+    if (version >= 41) {
+        const auto count = reader.read<std::uint32_t>();
+        if (count > 4096 || (child && count))
+            throw std::runtime_error("invalid binding piece count");
+        for (std::uint32_t i = 0; i < count; ++i)
+            binding.pieces.push_back(read_binding(reader, version, true));
     }
     return binding;
 }

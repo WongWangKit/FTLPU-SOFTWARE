@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -43,9 +44,24 @@ public:
         if (!streams_ || streams_ != hw::kWestStreams || !lanes_ || lanes_ > streams_)
             throw std::invalid_argument("unsupported overlap SR geometry");
         auto computation = program;
-        std::erase_if(computation.queues, [](const auto& q) {
-            return q.kind == QueueKind::C2cDma || q.kind == QueueKind::C2cRx
-                || q.kind == QueueKind::C2cTx;
+        std::set<std::size_t> mem_queues;
+        std::erase_if(computation.queues, [&](const auto& q) {
+            if (q.kind == QueueKind::C2cDma || q.kind == QueueKind::C2cRx
+                || q.kind == QueueKind::C2cTx) return true;
+            if (q.kind != QueueKind::Mem) return false;
+            if (!mem_queues.insert(q.index).second)
+                throw std::runtime_error("binary contains a duplicate MEM ICU queue");
+            const auto runs = inspect_mem_macro_runs(program, q, max_issues);
+            if (!runs) return false;
+            for (const auto& run : *runs) {
+                all_issues_.add(run.first, run.last);
+                mem_issues_[q.index].add(run.first, run.last);
+                if (run.stream >= 2 * streams_)
+                    throw std::invalid_argument("overlap proof packed SR is invalid");
+                if (run.stream >= streams_)
+                    stream_issues_[run.stream - streams_].add(run.first, run.last);
+            }
+            return true;
         });
         const auto timeline = inspect_logical_issues(computation,max_issues);
         for (const auto& q : timeline.queues) for (const auto& issue : q.issues) {
@@ -143,9 +159,9 @@ public:
             default: throw std::invalid_argument("unproved computation resource in overlap image");
             }
         }
-        normalize(all_issues_);
-        for (auto& v:stream_issues_) normalize(v);
-        for (auto& [q,v]:mem_issues_) normalize(v);
+        all_issues_.normalize();
+        for (auto& v:stream_issues_) v.normalize();
+        for (auto& [q,v]:mem_issues_) v.normalize();
     }
 
     Selection select(std::uint32_t stop,std::uint64_t earliest,
@@ -190,20 +206,41 @@ private:
             if(begin<stop && end>=stop) result=std::max(result,end+guard);
         return result;
     }
-    static void normalize(std::vector<std::uint64_t>& v) {
-        std::ranges::sort(v); v.erase(std::ranges::unique(v).begin(),v.end());
-    }
-    static std::uint64_t release(const std::vector<std::uint64_t>& v,
+    // A span covers consecutive issue cycles only. Repeated VXM configuration
+    // tails keep their separate crossing-stop check.
+    struct IssueCycles {
+        std::vector<Span> runs;
+        void add(std::uint64_t first, std::uint64_t last) {
+            if (!runs.empty() && first >= runs.back().first && first <= runs.back().second + 1)
+                runs.back().second = std::max(runs.back().second, last);
+            else
+                runs.emplace_back(first, last);
+        }
+        void push_back(std::uint64_t cycle) { add(cycle, cycle); }
+        void normalize() {
+            std::ranges::sort(runs);
+            std::size_t size = 0;
+            for (const auto run : runs) {
+                if (size && run.first <= runs[size - 1].second + 1)
+                    runs[size - 1].second = std::max(runs[size - 1].second, run.second);
+                else
+                    runs[size++] = run;
+            }
+            runs.resize(size);
+        }
+    };
+    static std::uint64_t release(const IssueCycles& issues,
                                  std::uint32_t stop,std::uint64_t guard) {
-        const auto next=std::lower_bound(v.begin(),v.end(),stop);
-        return next==v.begin()?0:*(next-1)+guard;
+        const auto next = std::ranges::lower_bound(issues.runs, stop, {}, &Span::first);
+        if (next == issues.runs.begin()) return 0;
+        return std::min<std::uint64_t>((next - 1)->second, stop - 1) + guard;
     }
     std::size_t streams_,lanes_;
     std::uint64_t tile_rows_,guard_{};
-    std::vector<std::uint64_t> all_issues_;
-    std::vector<std::vector<std::uint64_t>> stream_issues_;
+    IssueCycles all_issues_;
+    std::vector<IssueCycles> stream_issues_;
     std::vector<Span> all_spans_;
     std::vector<std::vector<Span>> stream_spans_;
-    std::map<std::size_t,std::vector<std::uint64_t>> mem_issues_;
+    std::map<std::size_t,IssueCycles> mem_issues_;
 };
 } // namespace ftlpu::software::runtime

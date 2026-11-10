@@ -143,15 +143,30 @@ class LogicalGraph:
         path.write_text(json.dumps(result,separators=(',',':'))+'\n',encoding='utf-8')
         return path
 
-    def decode_projections(self, x, weights, packed, scales, c, *, normalize_input=True):
+    def decode_projections(self, x, weights, packed, scales, c, *, normalize_input=True, histories=None):
         """One row per independent request; all projections share the batch GEMM."""
         n = self.norm('input_norm', x, bf16(1+weights.input_norm), c.rms_norm_eps) if normalize_input else x
         qkv = self.project('in_proj_qkv', n, packed['in_proj_qkv'], scales['in_proj_qkv'])
+        mixed, windows = [], []
+        if histories is not None:
+            if len(histories) != x.shape[0]:
+                raise ValueError('Expected one independent Conv cache per request')
+            for request, history in enumerate(histories):
+                ty = self.type(history.shape, 'bf16')
+                source = f'''module {{ func.func @stage(%x: {ty}) -> {ty} {{
+                  %y = ftlpu.kernel.reshape %x : ({ty}) -> {ty}
+                  return %y : {ty}
+                }} }}'''
+                cached = self.run('conv_cache_view', source, [(history,'bf16')],
+                                  [(history.shape,'bf16')])[0]
+                window = Value.concatenate([cached[-(c.conv_kernel_size-1):], qkv[request:request+1]])
+                mixed.append(self.conv(window, weights.conv1d)[-1:])
+                windows.append(window)
         z = self.project('in_proj_z', n, packed['in_proj_z'], scales['in_proj_z'])
         beta, logdecay = self.gates(n, packed, scales, weights.dt_bias, weights.a_log)
         decay = self.vector_tiles('delta_decay', [(logdecay, 'f32')],
             lambda g: g.add(0, kind='exp', immediate=0))
-        return qkv, z, beta, decay
+        return (*mixed, *windows, z, beta, decay) if histories is not None else (qkv, z, beta, decay)
 
     def decode_output(self, core, z, weights, packed, scales, c):
         """Normalize each request/head, then one batch-wide output projection."""
@@ -187,7 +202,7 @@ class LogicalGraph:
             state.reshape(c.num_value_heads*c.key_head_dim,c.value_head_dim),c)
         return core, updated, window
 
-    def decode_mixer_wide(self, qkv, beta, decay, history, state, z, weights, c):
+    def decode_mixer_wide(self, qkv, beta, decay, history, state, z, weights, c, *, mixed_input=False):
         """Independent decode equations using the shared streaming state primitive.
 
         State ABI is [head,value,key], retaining the native matrix layout in DDR.
@@ -200,10 +215,13 @@ class LogicalGraph:
               return %y : {t}
             }} }}'''
             return self.run(name,source,[(value,dtype)],[(value.shape,dtype)])[0]
-        projected = argument('decode_qkv',qkv,'bf16')
-        cached = argument('conv_cache_view',history,'bf16')
-        window = Value.concatenate([cached[-(c.conv_kernel_size-1):], projected])
-        mixed = self.conv(window,weights.conv1d)[-1:]
+        if mixed_input:
+            mixed = argument('decode_mixed', qkv, 'bf16')
+        else:
+            projected = argument('decode_qkv',qkv,'bf16')
+            cached = argument('conv_cache_view',history,'bf16')
+            window = Value.concatenate([cached[-(c.conv_kernel_size-1):], projected])
+            mixed = self.conv(window,weights.conv1d)[-1:]
         q = self.norm('query_l2',mixed[:,:c.key_width].reshape(-1,c.key_head_dim),
             np.ones(c.key_head_dim),1e-6,False,1/np.sqrt(c.key_head_dim))
         k = self.norm('key_l2',mixed[:,c.key_width:2*c.key_width].reshape(-1,c.key_head_dim),
@@ -231,7 +249,8 @@ class LogicalGraph:
             return g.add(0,g.add(1,g.sigmoid(1)),dtype='bf16')
         gated = self.vector_tiles('delta_output_gate',
             [(normalized,'bf16'),(z.reshape(normalized.shape),'bf16')],gate)
-        return gated.reshape(1,c.value_width), results[3], window
+        finals = gated.reshape(1,c.value_width), results[3]
+        return finals if mixed_input else (*finals, window)
 
     def attention(self,x,weights,packed,scales,c,initial_state=None,conv_state=None):
         project=lambda name,value:self.project(name,value,packed[name],scales[name])

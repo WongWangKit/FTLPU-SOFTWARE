@@ -597,6 +597,72 @@ const LogicalQueueTimeline* find_queue(
 
 } // namespace
 
+std::optional<std::vector<MemIssueRun>> inspect_mem_macro_runs(
+    const BinaryProgram& program, const QueueProgram& queue, std::size_t& work_left)
+{
+    if (queue.kind != QueueKind::Mem ||
+        !std::ranges::all_of(queue.commands, [](const QueueCommand& command) {
+            return command.instruction_kind == InstructionKind::Mem &&
+                is_macro_schedule_command(command);
+        }))
+        return std::nullopt;
+
+    std::vector<MemIssueRun> runs;
+    for (const auto& command : queue.commands) {
+        const auto m = decode_macro_schedule_command(command);
+        const auto mem = isa::decode_mem_instruction(words64(command));
+        if (mem.opcode != MemOpcode::Read && mem.opcode != MemOpcode::Write)
+            throw std::invalid_argument("overlap proof requires direct MEM addresses");
+        if (!m.inner_count || !m.outer_count || !m.inner_interval || !m.outer_interval)
+            throw std::invalid_argument("invalid MEM macro iteration space");
+
+        // Check the cycle bound first. The 32-bit cycle horizon and positive
+        // intervals also bound (outer + inner), so signed address deltas fit
+        // int64_t even for opposite-signed 32-bit induction strides.
+        const auto last_outer = m.outer_count - 1;
+        const auto last_inner = m.inner_count - 1;
+        const auto last = checked_cycle_add(checked_cycle_add(m.start_cycle,
+            last_outer * m.outer_interval), last_inner * m.inner_interval);
+        check_cycle(program, last, queue.kind, queue.index);
+        if (last > std::numeric_limits<std::uint32_t>::max())
+            throw std::invalid_argument("overlap proof exceeds finite cycle bound");
+        const auto outer_delta = static_cast<std::int64_t>(last_outer) * m.outer_stride;
+        const auto inner_delta = static_cast<std::int64_t>(last_inner) * m.inner_stride;
+        // Every address lies between these two affine corner extrema. Use
+        // the exact same induction and native encoder as pointwise inspection.
+        for (const auto delta : {
+                std::min<std::int64_t>(0, outer_delta) + std::min<std::int64_t>(0, inner_delta),
+                std::max<std::int64_t>(0, outer_delta) + std::max<std::int64_t>(0, inner_delta)})
+            (void)canonical_instruction(command, m.induction_target, delta);
+
+        const auto append = [&](std::size_t first, std::size_t end) {
+            if (work_left == 0) throw LogicalIssueAnalysisLimit();
+            --work_left;
+            runs.push_back({static_cast<std::uint32_t>(first),
+                static_cast<std::uint32_t>(end), mem.stream});
+        };
+        for (std::size_t row = 0; row < m.outer_count; ++row) {
+            const auto begin = m.start_cycle + row * m.outer_interval;
+            if (m.inner_interval == 1) {
+                append(begin, begin + last_inner);
+            } else {
+                for (std::size_t col = 0; col < m.inner_count; ++col) {
+                    const auto cycle = begin + col * m.inner_interval;
+                    append(cycle, cycle);
+                }
+            }
+        }
+    }
+    // Rows or packets may be emitted out of time order. A queue has one issue
+    // port even when colliding packets select different SRs or addresses.
+    std::ranges::sort(runs, {}, &MemIssueRun::first);
+    for (std::size_t i = 1; i < runs.size(); ++i)
+        if (runs[i].first <= runs[i - 1].last)
+            throw std::runtime_error("multiple functional issues on one MEM queue cycle: queue="
+                + std::to_string(queue.index) + " cycle=" + std::to_string(runs[i].first));
+    return runs;
+}
+
 LogicalIssueProgram inspect_logical_issues(const BinaryProgram& program, std::size_t max_issues)
 {
     std::map<QueueId, IssueMap> expanded;

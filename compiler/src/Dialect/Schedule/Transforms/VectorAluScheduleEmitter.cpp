@@ -46,6 +46,20 @@ struct Storage {
     int64_t broadcastHeadStride = 1;
 };
 
+// A matrix word carries 32 independent value components. Only the row
+// coefficient is replicated across its lanes, in one physical word per row.
+bool packedUpdate(mlir::func::FuncOp function)
+{
+    auto policy=function->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_packed_update");
+    return policy && policy.getValue();
+}
+
+bool reduceAlongRows(kernel::VectorAluOp op)
+{
+    auto axis=op->getAttrOfType<mlir::IntegerAttr>("reduction_axis");
+    return op.getReduce() && axis && axis.getInt()==0;
+}
+
 Storage storageOf(mlir::DictionaryAttr p)
 {
     return {llvm::cast<mlir::IntegerAttr>(p.getAs<mlir::ArrayAttr>("slices")[0]).getInt(),
@@ -69,6 +83,25 @@ Storage storageOf(mlir::DictionaryAttr p)
 // One streamed head followed by immediate operations. Keep multi-use values
 // and quantizing edges as boundaries. This plan also determines SRAM lifetimes:
 // a head operand remains live until the entire chain has drained.
+bool isHeadMatmulAdd(kernel::VectorAluOp product, kernel::VectorAluOp sum)
+{
+    if(!product || !sum || product.getKind()!="head_matmul" || sum.getKind()!="add") return false;
+    const auto precision=product->getAttrOfType<mlir::StringAttr>("mxm_precision");
+    return precision && precision.getValue()=="bf16" && product.getResult().hasOneUse() &&
+        !sum.getUseImmediate() && !sum.getReduce() && sum.getLhs()==product.getResult() &&
+        sum.getRhs().getType()==product.getResult().getType() && sum.getResult().getType()==product.getResult().getType() &&
+        sum.getResult().getType().getElementType().isF32();
+}
+
+bool isHeadMatmulCast(kernel::VectorAluOp sum, kernel::VectorAluOp cast)
+{
+    return cast && cast.getKind()=="multiply" && cast.getUseImmediate() && !cast.getReduce() &&
+        cast.getImmediate().convertToFloat()==1.f && cast.getLhs()==sum.getResult() &&
+        cast.getResult().getType().getElementType().isBF16() &&
+        cast.getResult().getType().getShape()==sum.getResult().getType().getShape() &&
+        llvm::all_of(sum.getResult().getUsers(),[&](mlir::Operation *user){return user==cast.getOperation();});
+}
+
 llvm::SmallVector<int64_t> chainColumns(llvm::ArrayRef<kernel::VectorAluOp> ops,
                                       bool packed)
 {
@@ -80,6 +113,9 @@ llvm::SmallVector<int64_t> chainColumns(llvm::ArrayRef<kernel::VectorAluOp> ops,
         return first;
     };
     auto head = ops.front();
+    if(ops.size()>=2 && isHeadMatmulAdd(head,ops[1]))
+        return ops.size()>=3 && isHeadMatmulCast(ops[1],ops[2])?
+            llvm::SmallVector<int64_t>{0,1,2}:llvm::SmallVector<int64_t>{0,1};
     // Fuse a matrix contraction and its pointwise epilogue before emitting
     // hardware domains. The intermediate matrix never acquires a MEM stream.
     if(head.getKind()=="weighted_gram" && ops.size()>=3) {
@@ -139,7 +175,9 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
         return emitHeadWeightedProduct(r,op,chain[1],target,chain.size()==3?chain[2]:kernel::VectorAluOp{});
     }
     if(op.getKind()=="head_cross_product")return op.emitError("requires fused scale-transpose producer");
-    if(op.getKind()=="unit_lower_inverse" || op.getKind()=="head_matmul") return emitUnitLowerMxm(r,op,target);
+    if(op.getKind()=="unit_lower_inverse" || op.getKind()=="head_matmul")
+        return emitUnitLowerMxm(r,op,target,chain.size()>=2?chain[1]:kernel::VectorAluOp{},
+            chain.size()==3?chain[2]:kernel::VectorAluOp{});
     if((op.getKind()=="unit_lower_solve" || op.getKind()=="unit_lower_solve_blocked") || op.getKind()=="head_scale") return emitUnitLowerSolve(r,op,target);
     if(op.getKind()=="cross_gram") {
         if(chain.size()!=2) return op.emitError("cross_gram currently requires a single native BF16 multiply epilogue");
@@ -153,6 +191,8 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
     const auto outType = tail.getResult().getType();
     const int64_t wordElements = target.memory().bytes_per_word;
     const int64_t packedColumns = (lhsType.getDimSize(1) + wordElements - 1) / wordElements;
+    const bool update=packedUpdate(op->getParentOfType<mlir::func::FuncOp>());
+    const bool rowCoefficient=update && rhsType.getDimSize(1)==1;
     const int64_t storageWords = packed ? lhsType.getDimSize(0) * packedColumns : lhsType.getNumElements();
     if (storageWords > target.memory().sram_depth_rows)
         return op.emitError("vector scalar-broadcast storage exceeds SRAM; tile the vector before lowering");
@@ -171,7 +211,8 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
             r.getNamedAttr("bytes", r.getI64IntegerAttr(type.getNumElements()
                 * (type.getElementType().isF32() ? 4 : 2))),
             r.getNamedAttr("placement", [&] {
-                mlir::NamedAttrList a(placement(r, type, storage.slice, storage.both ? "both" : storage.west ? "west" : "east", storage.bank, packed, wordElements));
+                const bool wordPacked=packed && !(rowCoefficient && value==op.getRhs());
+                mlir::NamedAttrList a(placement(r, type, storage.slice, storage.both ? "both" : storage.west ? "west" : "east", storage.bank, wordPacked, wordElements));
                 a.set("base_row", r.getI64IntegerAttr(storage.base));
                 if(storage.broadcastRowRepeat)
                     a.set("instruction_count",r.getI64IntegerAttr(storage.broadcastHeadBase+
@@ -194,7 +235,25 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
     if (op.getRhs() != op.getLhs())
         bindInput(op.getRhs(), rhsType, rhsStorage);
     const auto fp32Attr=op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_fp32_ingress");
-    const bool fp32Ingress=fp32Attr && fp32Attr.getValue();
+    const bool fp32Ingress = (fp32Attr && fp32Attr.getValue()) ||
+        llvm::any_of(chain, [](auto alu) { return alu->hasAttr("ftlpu.vector_require_fp32"); });
+    // A one-key PV tile is a BF16 matrix scaled by one BF16 coefficient
+    // per query row. Each coefficient word is already lane-broadcast and
+    // is reused for every value block. Existing fixed ports 0/2 consume
+    // the two BF16 byte pairs and the product is written with four planes.
+    const bool bf16RowProduct = rowCoefficient && op.getKind()=="multiply" &&
+        lhsType.getElementType().isBF16() && rhsType.getElementType().isBF16() &&
+        outType.getElementType().isF32();
+    const bool fp32Update = lhsType.getElementType().isF32() && rhsType.getElementType().isF32();
+    if (update && (!fp32Ingress || !packed
+        || op.getReduce() || op.getUseImmediate() || chain.size()!=1 ||
+        (op.getKind()!="multiply" && op.getKind()!="add") ||
+        !(fp32Update || bf16RowProduct) ||
+        lhsType.getDimSize(1)%wordElements!=0 || rhsType.getDimSize(0)!=lhsType.getDimSize(0) ||
+        (!rowCoefficient && rhsType.getDimSize(1)!=lhsType.getDimSize(1)) ||
+        lhsType.getShape()!=outType.getShape() ||
+        !(outType.getElementType().isF32() || outType.getElementType().isBF16())))
+        return op.emitError("packed update requires fixed ingress and word-aligned FP32 operands, or a BF16 matrix times per-row BF16 coefficients yielding FP32");
     if (op.getKind()=="causal_exp_difference") {
         const auto transpose=op->getAttrOfType<mlir::BoolAttr>("transpose_result");
         const bool directTranspose=transpose && transpose.getValue();
@@ -324,44 +383,62 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
         r.replaceOp(op,result.getValue());
         return mlir::success();
     }
-    if (op.getKind()=="cumsum_rows") {
-        // Scan tokens in time, independently per lane. The accumulator stays
-        // FP32 for the complete scan; only MEM ingress consumes BF16 planes.
-        // Never split the token sequence into independent hemisphere halves.
-        if (!packed || packedColumns!=1 || !lhsStorage.both || !outStorage.both ||
-            !op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill"))
-            return op.emitError("cumsum_rows lowering requires mirrored packed fixed-port BF16 ingress");
+    if (op.getKind()=="cumsum_rows" || reduceAlongRows(op)) {
+        // Each lane owns a column; streaming rows in order gives a separate
+        // FP32 accumulator for every query without a cross-lane shuffle.
+        // Scan exports every prefix, whereas reduction exports only the end.
+        const bool scan=!reduceAlongRows(op);
+        if (!packed || (scan && packedColumns!=1) || !lhsStorage.both || !outStorage.both ||
+            (scan && !op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill")))
+            return op.emitError("axis-zero scan/reduction requires mirrored packed fixed ports");
+        const auto kind=op->getAttrOfType<mlir::StringAttr>("reduction_kind");
+        const bool maximum=!scan && kind && kind.getValue()=="max";
+        if (!scan && (!fp32Ingress || !op.getUseImmediate() || !kind ||
+            (kind.getValue()!="add" && !maximum) || op.getKind()!="multiply" ||
+            op.getImmediate().convertToFloat()!=1.f || !outType.getElementType().isF32() ||
+            outType.getDimSize(0)!=1 || outType.getDimSize(1)!=lhsType.getDimSize(1)))
+            return op.emitError("axis-zero reduction requires unary FP32-accumulating sum/true maximum and [1,columns] output");
+        if(maximum) {
+            auto seed=op->getAttrOfType<mlir::BoolAttr>("reduction_seed_first");
+            if(!seed || !seed.getValue())
+                return op.emitError("axis-zero maximum requires a first-value seed");
+        }
         const int64_t count=lhsType.getDimSize(0), start=96;
         const bool fullInput=fp32Ingress && lhsType.getElementType().isF32();
         const int64_t first=lhsType.getElementType().isF32() && !fullInput?2:0;
+        for(int64_t word=0;word<packedColumns;++word) {
+        const int64_t begin=start+word*count;
         for(int64_t side=0;side<2;++side) {
             for(int64_t byte=0;byte<(fullInput?4:2);++byte) {
                 const auto slice=lhsStorage.slice+first+byte;
-                direct_domain_detail::emitMem3D(r,op.getLoc(),target,start-1-slice/4,
-                    side*target.memory().slices_per_hemisphere+slice,"read",lhsStorage.base,
+                direct_domain_detail::emitMem3D(r,op.getLoc(),target,begin-1-slice/4,
+                    side*target.memory().slices_per_hemisphere+slice,"read",lhsStorage.base+word*count,
                     32+side*16+byte,count,1,1,1,1,0,1,1,0,-1,lhsStorage.bank);
             }
             for(int64_t byte=0;byte<4;++byte) {
                 const auto slice=outStorage.slice+byte;
-                direct_domain_detail::emitMem3D(r,op.getLoc(),target,start+2+slice/4,
-                    side*target.memory().slices_per_hemisphere+slice,"write",outStorage.base,
-                    (1-side)*8+byte,count,1,1,1,1,0,1,1,0,-1,outStorage.bank);
+                direct_domain_detail::emitMem3D(r,op.getLoc(),target,begin+2+slice/4+(scan?0:count-1),
+                    side*target.memory().slices_per_hemisphere+slice,"write",outStorage.base+word*(scan?count:1),
+                    (1-side)*8+byte,scan?count:1,1,1,1,1,0,1,1,0,-1,outStorage.bank);
             }
         }
         auto input=ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
-            start-1,0,"bypass",fullInput?"stream_f32":"stream_bf16",0,0.f,"immediate",0,0.f,"fp32",-1,
+            begin-1,0,"bypass",fullInput?"stream_f32":"stream_bf16",0,0.f,"immediate",0,0.f,"fp32",-1,
             count,1,"east","east",-1,false,false,true,false,2);
         input->setAttr("lhs_stream_source",r.getStringAttr("local"));
+        // reset + add(x, accumulator=0) seeds even entirely negative blocks.
         ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
-            start-1,1,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",0,
+            begin-1,1,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",0,
             1,1,"east","east",-1,true,true,true,false,2);
         if(count>1) ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
-            start,1,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",0,
+            begin,1,maximum?"max":"add","previous",0,0.f,"accumulator",0,0.f,"fp32",0,
             count-1,1,"east","east",-1,false,true,true,false,2);
+        }
         mlir::OperationState timeline(op.getLoc(),TimelineOp::getOperationName());
-        timeline.addAttribute("name",r.getStringAttr("cumsum_rows.fp32_accumulator"));
+        timeline.addAttribute("name",r.getStringAttr(scan?"cumsum_rows.fp32_accumulator":
+            maximum?"row_max.fp32_accumulator":"row_sum.fp32_accumulator"));
         timeline.addAttribute("start",r.getI64IntegerAttr(start-1));
-        timeline.addAttribute("end",r.getI64IntegerAttr(start+2+outStorage.slice/4+count));
+        timeline.addAttribute("end",r.getI64IntegerAttr(start+2+(outStorage.slice+3)/4+packedColumns*count));
         r.create(timeline);
         auto result=bind({},outType,0,"output",outStorage);
         r.replaceOp(op,result.getValue());
@@ -406,9 +483,11 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
                 llvm::StringRef(fullRhs?"stream_f32":"stream_bf16")):llvm::StringRef("immediate");
             latency+=opcode=="exp" || opcode=="reciprocal" || opcode=="rsqrt" || opcode=="log"?4:opcode=="multiply"?1:0;
             if(reduction) {
+                const auto seed=op->getAttrOfType<mlir::BoolAttr>("reduction_seed_first");
+                const bool seedFirst=seed && seed.getValue();
                 for(int64_t row=0;row<rows;++row) {
                     auto first=ffn_detail::create_vxm(r,op.getLoc(),current,current,outType,
-                        start-1+row*interval,col,opcode,
+                        start-1+row*interval,col,seedFirst?llvm::StringRef("add"):opcode,
                         "previous",0,0.f,"accumulator",0,0.f,
                         "fp32",-1,1,1,"east","west",-1,true,true,true,false,8);
                     if(count>1)first=ffn_detail::create_vxm(r,op.getLoc(),current,current,outType,
@@ -443,18 +522,19 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
         for(int64_t i=chain.size()-2;i>=0;--i)r.eraseOp(chain[i]);
         return mlir::success();
     }
-    if (op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill")) {
+    if (auto seed=op->getAttrOfType<mlir::BoolAttr>("reduction_seed_first"); seed && seed.getValue())
+        return op.emitError("first-element reduction currently requires fixed scalar FP32 ingress");
+    if (update || op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_bf16_spill")) {
         if (!packed || op.getReduce() || !lhsStorage.both || !outStorage.both
             || (!op.getUseImmediate() && !rhsStorage.both))
             return op.emitError("fixed-chain BF16 spill requires packed mirrored storage and no reduction")
                 << "; lhs=" << op->getAttr("ftlpu.vector_lhs_placement")
                 << "; rhs=" << op->getAttr("ftlpu.vector_rhs_placement")
                 << "; output=" << tail->getAttr("ftlpu.vector_result_placement");
-        // FP32 interface buffers retain their four-plane ABI. Only the upper
-        // two planes are consumed at a chain head, explicitly truncating to
-        // BF16; all arithmetic inside a chain remains FP32.
+        // Full FP32 ingress consumes all four byte planes at fixed ports 0/4.
+        // Only legacy narrow ingress truncates a four-plane input to BF16.
         const auto partitionPolicy = op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_bf16_token_halves");
-        const bool partition = partitionPolicy && partitionPolicy.getValue()
+        const bool partition = !update && partitionPolicy && partitionPolicy.getValue()
             && lhsType.getDimSize(0) == 32 && packedColumns == 1;
         const int64_t half = lhsType.getDimSize(0) / 2;
         const auto phaseOf = [](mlir::Value value) -> int64_t {
@@ -520,7 +600,7 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
                 direct_domain_detail::emitMem3D(r,op.getLoc(),target,start-1-slice/4,
                     side*target.memory().slices_per_hemisphere+slice,"read",st.base+(partition && !st.tokenPartition && !broadcast && side!=phase?half:0),
                     32+side*16+port+byte,partition?half:lhsType.getDimSize(0),1,broadcast?0:1,
-                    packedColumns,lhsType.getDimSize(0),type.getDimSize(0),1,1,0,-1,st.bank);
+                    packedColumns,lhsType.getDimSize(0),rowCoefficient && port==rhsPort?0:type.getDimSize(0),1,1,0,-1,st.bank);
             }
         };
         readFixed(lhsType,lhsStorage,0,false);
@@ -811,13 +891,16 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
     }
     mlir::IRRewriter r(function.getContext());
     const auto scalarPolicy=function->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_scalar_layout");
-    const bool packed = !(scalarPolicy && scalarPolicy.getValue()) && llvm::all_of(ops, [&](auto op) {
+    const bool update=packedUpdate(function);
+    const bool timeReduction=llvm::any_of(ops, [](auto op){return reduceAlongRows(op);});
+    const bool packed = !(scalarPolicy && scalarPolicy.getValue()) && (update || llvm::all_of(ops, [&](auto op) {
         const auto lhs = op.getLhs().getType(), rhs = op.getRhs().getType();
+        if(reduceAlongRows(op)) return true;
         if(op.getKind()=="head_last_row_scale_transpose" || op.getKind()=="head_cross_product" || op.getKind()=="gram_row_scale" || op.getKind()=="head_mask" || op.getKind()=="cross_gram" || op.getKind()=="weighted_gram" || (op.getKind()=="unit_lower_solve" || op.getKind()=="unit_lower_solve_blocked") || op.getKind()=="head_scale" || op.getKind()=="unit_lower_inverse" || op.getKind()=="head_matmul") return true;
         return !op.getReduce() && (op.getUseImmediate()
             || (lhs.getDimSize(1) == rhs.getDimSize(1)
                 && (lhs.getDimSize(0) == rhs.getDimSize(0) || rhs.getDimSize(0) == 1)));
-    });
+    }));
     // Quantize only existing spill boundaries, not values kept inside an ALU
     // chain. A fixed BF16 input port must consume an actual RNE output rather
     // than silently dropping the low planes of a stored FP32 intermediate.
@@ -831,7 +914,8 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
                 return llvm::isa<mlir::func::ReturnOp>(user);
             });
             auto type=llvm::cast<mlir::RankedTensorType>(value.getType());
-            if (!returned && type.getElementType().isF32())
+            if (!returned && type.getElementType().isF32() &&
+                !value.getDefiningOp()->hasAttr("ftlpu.vector_require_fp32"))
                 value.setType(mlir::RankedTensorType::get(type.getShape(),r.getBF16Type()));
             first+=columns.size();
         }
@@ -867,11 +951,16 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
     const int64_t slotsPerBank = (target.memory().slices_per_hemisphere - 16) / 4;
     const int64_t capacity = slotsPerBank * target.memory().banks_per_slice;
     if (slotsPerBank <= 0) return function.emitError("no vector graph scratch slice groups");
+    const bool requireFp32 = llvm::any_of(ops, [](auto alu) {
+        return alu->hasAttr("ftlpu.vector_require_fp32");
+    });
     const auto plan = [&](mlir::Value value, Storage st) {
         const auto ingress=function->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.vector_fp32_ingress");
-        const bool fixedScalar=!packed && ingress && ingress.getValue();
-        return placement(r, llvm::cast<mlir::RankedTensorType>(value.getType()),
-            st.slice, (fixedScalar || function->hasAttr("ftlpu.vector_bf16_spill")) ? "both" : st.west ? "west" : "east", st.bank, packed, target.memory().bytes_per_word);
+        const bool fixedScalar = !packed && (requireFp32 || (ingress && ingress.getValue()));
+        const auto type=llvm::cast<mlir::RankedTensorType>(value.getType());
+        const bool wordPacked=packed && !(update && type.getDimSize(1)==1);
+        return placement(r, type,
+            st.slice, (fixedScalar || update || timeReduction || function->hasAttr("ftlpu.vector_bf16_spill")) ? "both" : st.west ? "west" : "east", st.bank, wordPacked, target.memory().bytes_per_word);
     };
     for (auto [index, op] : llvm::enumerate(ops)) {
         llvm::erase_if(live, [&](const Live& item) { return item.end < static_cast<int64_t>(index); });
@@ -981,6 +1070,25 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
                 op->setAttr("solve_mxm.p0",placement(r,matrix,20,"both",0,true,32));
                 op->setAttr("solve_mxm.p1",placement(r,matrix,20,"both",1,true,32));
             }
+        }
+        if(auto product=op.getLhs().getDefiningOp<kernel::VectorAluOp>(); isHeadMatmulAdd(product,op)) {
+            // The previous FP32 partial sum remains a real input. The new
+            // MXM product feeds C0 directly and therefore needs no MEM home.
+            mlir::NamedAttrList prior(op->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_rhs_placement"));
+            prior.set("kind",r.getStringAttr("fp32_quad_planar"));
+            prior.set("hemisphere",r.getStringAttr("both"));
+            op->setAttr("ftlpu.vector_rhs_placement",prior.getDictionary(r.getContext()));
+            mlir::NamedAttrList result(op->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_result_placement"));
+            result.set("kind",product->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_result_placement").get("kind"));
+            result.set("hemisphere",r.getStringAttr("both"));
+            op->setAttr("ftlpu.vector_result_placement",result.getDictionary(r.getContext()));
+        }
+        if(auto sum=op.getLhs().getDefiningOp<kernel::VectorAluOp>(); sum &&
+            isHeadMatmulAdd(sum.getLhs().getDefiningOp<kernel::VectorAluOp>(),sum) && isHeadMatmulCast(sum,op)) {
+            mlir::NamedAttrList result(op->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_result_placement"));
+            result.set("kind",sum->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_result_placement").get("kind"));
+            result.set("hemisphere",r.getStringAttr("both"));
+            op->setAttr("ftlpu.vector_result_placement",result.getDictionary(r.getContext()));
         }
         op->setAttr("ftlpu.vector_packed", r.getBoolAttr(packed));
         storage[op.getResult()] = output;

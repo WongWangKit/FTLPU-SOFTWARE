@@ -31,7 +31,7 @@ def run(command, log, env):
         raise RuntimeError(log.read_text(errors='replace')[-8000:])
 
 
-def compile_graph(graph, outputs, folder, build, target, *, fp32_spills=False):
+def compile_graph(graph, outputs, folder, build, target, *, fp32_spills=False, module_attrs=()):
     folder.mkdir(parents=True, exist_ok=True)
     ext = '.exe' if sys.platform == 'win32' else ''
     exe = lambda area, name: build / area / (name + ext)
@@ -48,7 +48,7 @@ def compile_graph(graph, outputs, folder, build, target, *, fp32_spills=False):
     kernel.write_text(kernel.read_text().replace('module {', 'module attributes {'
         'ftlpu.sxm_wide = true, ftlpu.vector_fp32_ingress = true, '
         'ftlpu.vector_bf16_spill = true, ftlpu.vector_bf16_rne_spill = '+str(not fp32_spills).lower()+', '
-        'ftlpu.common_barrier_protocol = true} {', 1))
+        'ftlpu.common_barrier_protocol = true' + ''.join(', ' + attr for attr in module_attrs) + '} {', 1))
     run([exe('compiler', 'ftlpu-compile'), '--input', kernel, '--input-stage', 'kernel',
          '--output', binary, '--target-config', target, '--icu-compression', 'raw-macro',
          '--mxm-execution', 'ws'], folder / 'compile.log', env)

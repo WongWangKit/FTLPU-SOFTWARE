@@ -715,7 +715,7 @@ StreamReleaseSummary stream_release_cycles(
         const int64_t end = sequenceEnd(op, command_cycle(op));
         if (op.getOpcode() == "iw") {
             const bool int8 = op.getWeightInputMode().value_or("direct16")
-                == "int8_dequant_bf16";
+                != "direct16";
             // CModel MXM weight ingress always consumes the East SR file.
             markRange(op.getWeightStreamBase().value_or(0),
                 int8
@@ -799,7 +799,7 @@ StreamReleaseSummary stream_release_cycles(
         const auto instruction =
             isa::decode_mxm_load_icu_3d_instruction(packet);
         const int64_t streamWidth = instruction.weight_input_mode
-                == MxmWeightInputMode::Int8DequantBf16
+                != MxmWeightInputMode::Direct16
             ? target.throughput().mxm_int8_load_streams_per_cycle
             : target.throughput().mxm_load_streams_per_cycle;
         markRange(static_cast<int64_t>(instruction.weight_stream_base),
@@ -1062,6 +1062,30 @@ BinaryBinding translate_binding(command::BindingOp op)
         binding.page_slice_group_counts);
     copyPageArray("page_base_rows", binding.page_base_rows);
     copyPageArray("page_row_counts", binding.page_row_counts);
+    if (auto pieces = placement.getAs<mlir::ArrayAttr>("output_pieces")) {
+        for (auto attribute : pieces) {
+            auto p = llvm::cast<mlir::DictionaryAttr>(attribute);
+            BinaryBinding piece = binding;
+            piece.pieces.clear();
+            piece.layout = parse_layout(p.getAs<mlir::StringAttr>("kind").getValue());
+            piece.hemisphere_mask = p.getAs<mlir::StringAttr>("hemisphere").getValue() == "west" ? 2 : 1;
+            piece.base_row = p.getAs<mlir::IntegerAttr>("base_row").getInt();
+            piece.bank = p.getAs<mlir::IntegerAttr>("bank").getInt();
+            piece.instruction_count = p.getAs<mlir::IntegerAttr>("instruction_count").getInt();
+            piece.address_stride = p.getAs<mlir::IntegerAttr>("address_stride").getInt();
+            piece.shape.clear();
+            piece.slices.clear();
+            piece.byte_size = binding.element_type == BindingElementType::F32 ? 4 : 2;
+            for (auto dim : p.getAs<mlir::ArrayAttr>("storage_shape")) {
+                auto size = llvm::cast<mlir::IntegerAttr>(dim).getInt();
+                piece.shape.push_back(size);
+                piece.byte_size *= size;
+            }
+            for (auto slice : p.getAs<mlir::ArrayAttr>("slices"))
+                piece.slices.push_back(llvm::cast<mlir::IntegerAttr>(slice).getInt());
+            binding.pieces.push_back(std::move(piece));
+        }
+    }
     return binding;
 }
 
@@ -1141,8 +1165,9 @@ void collect_mxm(command::MxmOp op, QueueMap& queues)
     const bool is_accumulator_read = op.getOpcode() == "accumulator_read";
     const auto destination = op.getAccumulatorDestination() == "stream"
         ? MxmAccumulatorDestination::Stream : MxmAccumulatorDestination::Sram;
-    const auto inputMode =
-        op.getWeightInputMode().value_or("direct16")
+    const auto inputMode = op.getWeightInputMode().value_or("direct16") == "fp8_dequant_bf16"
+        ? MxmWeightInputMode::Fp8DequantBf16
+        : op.getWeightInputMode().value_or("direct16")
             == "int8_dequant_bf16"
         ? MxmWeightInputMode::Int8DequantBf16
         : MxmWeightInputMode::Direct16;

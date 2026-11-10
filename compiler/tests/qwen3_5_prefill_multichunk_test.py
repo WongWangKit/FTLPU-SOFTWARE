@@ -106,11 +106,19 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     for arg in ('package','build-dir','target-config','output-dir'):p.add_argument('--'+arg,type=Path,required=True)
     p.add_argument('--seq-len',type=int,default=64)
+    p.add_argument('--projection-solve-overlap',choices=('on','off'),default='off',
+                   help='Allow C++ to overlap independent projection and FP32 forward solve')
+    p.add_argument('--projection-conv-overlap',choices=('on','off'),default='off',
+                   help='Allow C++ to pipeline projection pages with independent depthwise convolution blocks')
+    p.add_argument('--projection-vector-overlap',choices=('on','off'),default='off',
+                   help='Allow C++ to overlap an independent projection with FP32 vector outputs')
     modes=p.add_mutually_exclusive_group()
     modes.add_argument('--validate-only',action='store_true')
     modes.add_argument('--compile-only',action='store_true')
     modes.add_argument('--run-only',action='store_true')
     p.add_argument('--compiler-executable',type=Path)
+    p.add_argument('--passive-sr-multicast',choices=('off','on'),default='off',
+                   help='Allow mirrored MEM destinations to tap the same inward SR transfer')
     a=p.parse_args()
     assert a.seq_len in (32,64)
     out=a.output_dir.resolve();out.mkdir(parents=True,exist_ok=True)
@@ -124,13 +132,20 @@ def main():
     x=bf16(x[:a.seq_len]);h,k,d=c.num_value_heads,c.key_head_dim,c.value_head_dim
     exe=lambda area,n:a.build_dir.resolve()/area/(n+('.exe' if sys.platform=='win32' else ''))
     if not a.validate_only:
-        (out/'summary.json').write_text(json.dumps(dict(status='pending',seq_len=a.seq_len)))
+        (out/'summary.json').write_text(json.dumps(dict(status='pending',seq_len=a.seq_len,
+            projection_solve_overlap=a.projection_solve_overlap,projection_conv_overlap=a.projection_conv_overlap,
+            projection_vector_overlap=a.projection_vector_overlap)))
     if not a.validate_only and not a.run_only:
         graph=LogicalGraph();finals,manifest=build(graph,x,w,packed,scales,c)
         (out/'outputs.json').write_text(json.dumps(manifest,indent=2));x.astype('<f4').tofile(out/'fixture.f32.bin')
         logical=graph.write(out/'logical_graph',finals);kernel=out/'frontend.kernel.mlir';binary=out/'frontend.ftlpu'
         run([exe('compiler','ftlpu-graph-compile'),'--input',logical,'--output',kernel,'--emit-kernel','--target-config',a.target_config.resolve()],out/'import.log')
-        kernel.write_text(kernel.read_text().replace('module {','module attributes {ftlpu.vector_bf16_spill = true, ftlpu.common_barrier_protocol = true, ftlpu.vector_fp32_ingress = true, ftlpu.vector_bf16_token_halves = true, ftlpu.vector_log_softplus = true, ftlpu.l2_head_partition = true, ftlpu.sxm_wide = true} {',1))
+        kernel.write_text(kernel.read_text().replace('module {','module attributes {'
+            + f'ftlpu.projection_solve_overlap = {str(a.projection_solve_overlap == "on").lower()}, '
+            + f'ftlpu.projection_conv_overlap = {str(a.projection_conv_overlap == "on").lower()}, '
+            + f'ftlpu.projection_vector_overlap = {str(a.projection_vector_overlap == "on").lower()}, '
+            + f'ftlpu.passive_sr_multicast = {str(a.passive_sr_multicast == "on").lower()}, '
+            + 'ftlpu.vector_bf16_spill = true, ftlpu.common_barrier_protocol = true, ftlpu.vector_fp32_ingress = true, ftlpu.vector_bf16_token_halves = true, ftlpu.vector_log_softplus = true, ftlpu.l2_head_partition = true, ftlpu.sxm_wide = true} {',1))
         run([a.compiler_executable.resolve() if a.compiler_executable else exe('compiler','ftlpu-compile'),'--input',kernel,'--input-stage','kernel','--output',binary,'--target-config',a.target_config.resolve(),'--icu-compression','raw-macro','--mxm-execution','ws'],out/'compile.log')
         if a.compile_only:return
     if not a.validate_only:
@@ -187,6 +202,9 @@ def main():
     end=max(int(r['end'])+(int(r['inner_count'])-1)*int(r['inner_interval'])+(int(r['outer_count'])-1)*int(r['outer_interval']) for r in rows)
     host=sum(int(r['end'])-int(r['start']) for r in rows if r['resource']=='C2C.HostOutput')
     summary=dict(status='passed' if passed else 'failed',seq_len=a.seq_len,chunk_size=32,chunks=a.seq_len//32,real_weights=True,
+        passive_sr_multicast=a.passive_sr_multicast,
+        projection_solve_overlap=a.projection_solve_overlap, projection_conv_overlap=a.projection_conv_overlap,
+        projection_vector_overlap=a.projection_vector_overlap,
         input='BF16 fixture; chunk0 package input, chunk1 independent seeded fixture',initial_state='zero',
         state_carried_on_device=True,conv_history_across_chunks=True,icu_compression='raw-macro',
         precision='FP32 State storage/add/decay; BF16 high planes for MXM State products; FP32 accumulations/solve',

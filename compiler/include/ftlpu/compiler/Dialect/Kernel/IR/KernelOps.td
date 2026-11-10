@@ -31,6 +31,77 @@ def MatmulOp : FTLPU_Kernel_Op<"matmul", [Pure]> {
   let hasVerifier = 1;
 }
 
+def BlockFp8QuantizeOp : FTLPU_Kernel_Op<"block_fp8_quantize", [Pure]> {
+  let summary = "Dynamic BF16 to E4M3FN quantization per row and group of 32";
+  let description = [{
+    For each contiguous group of 32, take amax = max(max(abs(x)), 1e-4).
+    The UE8M0 scale is the smallest power of two >= amax * float32(1/448).
+    Divide by that scale, round to nearest even and saturate to finite E4M3FN.
+    Both the quantized values and the runtime scales are observable.
+  }];
+  let arguments = (ins AnyRankedTensor:$input);
+  let results = (outs AnyRankedTensor:$values, AnyRankedTensor:$scales);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def BlockFp8MatmulOp : FTLPU_Kernel_Op<"block_fp8_matmul", [Pure]> {
+  let summary = "E4M3FN projection with per-row K32 and per-weight-tile E8M0 scales";
+  let description = [{
+    Values are stored as X[M,K] and W[N,K]. Each output is a sum in increasing
+    K32 group order. Accumulate a 32-term dot in FP32 and apply the two
+    corresponding power-of-two scales. Accumulate the groups in FP32 and
+    round once to BF16. Exact BF16 expansion can precede each dot when
+    equivalent under the target's floating-point and reduction rules.
+  }];
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$lhs_scales,
+                       AnyRankedTensor:$weights, AnyRankedTensor:$weight_scales);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$lhs `,` $lhs_scales `,` $weights `,` $weight_scales attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def BlockFp8ProjectionOp : FTLPU_Kernel_Op<"block_fp8_projection", [Pure]> {
+  let summary = "Dynamic group32 activation QDQ and block-scaled FP8 weight projection";
+  let description = [{
+    BF16 X[M,K], checkpoint E4M3FN W[N,K], and constant UE8M0 S[N/32,K/32].
+    Quantize X dynamically per row and K32 group with the block_fp8_qdq
+    semantics. Dequantize weights at IW, compute each K32 partial in FP32,
+    sum partials in K order in FP32, and round the final result to BF16.
+  }];
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weights,
+                       AnyRankedTensor:$weight_scales);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input `,` $weights `,` $weight_scales attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def BlockFp8ScaleOp : FTLPU_Kernel_Op<"block_fp8_scale", [Pure]> {
+  let summary = "Compute the decoded E8M0 scale for each group of 32 finite BF16 values";
+  let description = [{
+    For each row return 2^ceil(log2(max(1e-4, max(abs(x))) / 448)).
+    The result is the scale represented in FP32, used for E4M3FN activation
+    quantization. Input and result shapes are [groups,32] and [groups,1].
+  }];
+  let arguments = (ins AnyRankedTensor:$input);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def BlockFp8QdqOp : FTLPU_Kernel_Op<"block_fp8_qdq", [Pure]> {
+  let summary = "Apply group-of-32 E4M3FN dynamic quantize/dequantize to BF16";
+  let description = [{
+    Scale each group of 32 finite BF16 inputs with the block_fp8_scale rule,
+    quantize each normalized value to E4M3FN with round-to-nearest-even,
+    then multiply by the group scale and round to BF16.
+  }];
+  let arguments = (ins AnyRankedTensor:$input);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def BiasAddOp : FTLPU_Kernel_Op<"bias_add", [Pure]> {
   let summary = "Broadcast a rank-1 projection bias over matrix rows";
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$bias);
@@ -87,6 +158,16 @@ def BatchMatmulOp : FTLPU_Kernel_Op<"batch_matmul", [Pure]> {
       BoolAttr:$transpose_rhs, StrAttr:$role);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def FlashAttentionOp : FTLPU_Kernel_Op<"flash_attention", [Pure]> {
+  let summary = "Grouped scaled dot-product attention, tiled with online softmax";
+  let arguments = (ins AnyRankedTensor:$query, AnyRankedTensor:$key,
+      AnyRankedTensor:$value, F32Attr:$scale, BoolAttr:$causal,
+      I64Attr:$query_position);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$query `,` $key `,` $value attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 

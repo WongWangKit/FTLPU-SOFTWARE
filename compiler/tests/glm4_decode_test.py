@@ -20,6 +20,7 @@ from import_hf_decoder_layer import (bf16, decoder_config, decoder_layer_decode_
 from qwen3_5_logical_graph import LogicalGraph
 from tensor_geometry import Value
 from activation_batch_matmul_test import batch_matmul, compile_graph, run
+from attention_graph import flash_attention
 from qwen3_5_decode_gdn_batched_test import concatenate_traces
 
 
@@ -87,21 +88,36 @@ def rope(graph, name, value, heads, config, position):
     return Value.concatenate([low, high, x[:, rotary:]], axis=1).reshape(value.shape)
 
 
-def projections(x, packed, scales, biases, norm0, config, position):
-    graph = LogicalGraph()
+def _project_qkv(graph, x, packed, scales, biases, norm0, config, position):
     normalized = graph.norm('input_rmsnorm', x, norm0, config['rms_norm_eps'])
     outputs = []
-    for role, heads in [('query', 32), ('key', 2), ('value', 2)]:
+    heads_by_role = (('query', config['num_attention_heads']),
+                     ('key', config['num_key_value_heads']),
+                     ('value', config['num_key_value_heads']))
+    for role, heads in heads_by_role:
         projected = graph.project(role + '_projection', normalized, packed[role].T, scales[role])
         projected = graph.vector_tiles(role + '_bias', [(projected, 'bf16'),
             (biases[role].reshape(1, -1), 'bf16')], lambda g: g.add(0, 1, kind='add', dtype='bf16'))
         if role != 'value':
             projected = rope(graph, role + '_rope', projected, heads, config, position)
         outputs.append(projected)
-    return graph, outputs
+    return outputs
 
 
-def attention(q, k, v, past_key, past_value, config, *, diagnostics=False):
+def projections(x, packed, scales, biases, norm0, config, position):
+    graph = LogicalGraph()
+    return graph, _project_qkv(graph, x, packed, scales, biases, norm0, config, position)
+
+
+def _decode_flash(graph, query, key, value, past):
+    batch, _, heads, dim = query.shape
+    cache_shape = (batch * (past + 1), key.shape[2] * dim)
+    context = flash_attention(graph, 'decode_flash_attention', query, key, value,
+                              causal=True, query_position=past)
+    return [context.reshape(batch, heads * dim), key.reshape(cache_shape), value.reshape(cache_shape)]
+
+
+def attention(q, k, v, past_key, past_value, config, *, diagnostics=False, strategy='baseline'):
     graph = LogicalGraph()
     batch, past, kv, dim = past_key.shape
     heads = int(config['num_attention_heads'])
@@ -114,6 +130,9 @@ def attention(q, k, v, past_key, past_value, config, *, diagnostics=False):
         zero = identity(graph, 'padding_' + name, np.zeros((batch * (padded-past-1), kv*dim), 'f4')).reshape(batch, padded-past-1, kv, dim)
         output.append(Value.concatenate([old, new, zero], axis=1))
     key, value = keys[0], values[0]
+    if strategy=='flash':
+        return graph, _decode_flash(graph, query.reshape(batch, 1, heads, dim),
+                                    key[:, :past+1], value[:, :past+1], past)
     scores = batch_matmul(graph, 'decode_qk', query, key.transpose(0, 2, 1, 3).reshape(batch*kv, padded, dim), True)
     scores = graph.vector_tiles('score_scale', [(scores.reshape(batch*heads, padded), 'bf16')],
         lambda g: g.add(0, immediate=1 / np.sqrt(dim), dtype='bf16'))
@@ -152,9 +171,43 @@ def attention(q, k, v, past_key, past_value, config, *, diagnostics=False):
     return graph, outputs
 
 
+def _project_output(graph, context, packed, scales):
+    return graph.project('o_projection', context, packed['output'].T, scales['output'])
+
+
+def output_projection(context, packed, scales):
+    graph = LogicalGraph()
+    return graph, [_project_output(graph, context, packed, scales)]
+
+
+def full_attention(x, packed, scales, biases, past_key, past_value, config, *, norm0):
+    """One device graph from raw hidden state to O projection and updated caches."""
+    if past_key.shape != past_value.shape or past_key.ndim != 4:
+        raise ValueError('expected matching [batch, past, kv_heads, head_dim] cache inputs')
+    batch, past, kv_heads, dim = past_key.shape
+    heads = int(config['num_attention_heads'])
+    if (x.shape != (batch, heads * dim) or kv_heads != int(config['num_key_value_heads'])
+            or dim != int(config['head_dim'])):
+        raise ValueError('hidden state and cache inputs disagree with the GLM attention geometry')
+    graph = LogicalGraph()
+    q, k, v = _project_qkv(graph, x, packed, scales, biases, norm0, config, past)
+
+    def append(name, history, current):
+        current = current.reshape(batch, 1, kv_heads, dim)
+        if past == 0:
+            return current
+        history = identity(graph, name, history.reshape(batch * past, kv_heads * dim))
+        return Value.concatenate([history.reshape(batch, past, kv_heads, dim), current], axis=1)
+
+    key = append('past_key', past_key, k)
+    value = append('past_value', past_value, v)
+    context, key, value = _decode_flash(graph, q.reshape(batch, 1, heads, dim), key, value, past)
+    return graph, [_project_output(graph, context, packed, scales), key, value]
+
+
 def tail(x, context, norm1, packed, scales, config):
     graph = LogicalGraph()
-    output = graph.project('o_projection', context, packed['output'].T, scales['output'])
+    output = _project_output(graph, context, packed, scales)
     residual = graph.vector_tiles('attention_residual', [(x, 'bf16'), (output, 'bf16')],
         lambda g: g.add(0, 1, kind='add', dtype='bf16'))
     normalized = graph.norm('post_attention_rmsnorm', residual, norm1, config['rms_norm_eps'])
@@ -172,6 +225,7 @@ def main():
     p.add_argument('--batches', type=int, nargs='+', default=[1, 32, 64])
     p.add_argument('--past-len', type=int, default=32)
     p.add_argument('--resume', action='store_true')
+    p.add_argument('--attention-strategy',choices=('baseline','flash'),default='baseline')
     p.add_argument('--reuse-completed-phase', nargs='*', default=[], choices=('projections', 'attention', 'tail'),
         help='With --resume, keep these completed device binaries across compiler rebuilds; input/program hashes and numerical checks still apply')
     a = p.parse_args()
@@ -213,6 +267,7 @@ def main():
             icu_encoding='raw-macro', sxm='wide', scope='full decoder layer; three device phases',
             cache_source='independent quantized prefill reference; different token histories',
             host_activation_operations=0, checkpoint_provenance=meta.get('checkpoint_provenance'))
+        record['attention_strategy']=a.attention_strategy
         (folder/'result.json').write_text(json.dumps(record, indent=2))
         print(f'batch={batch}: prepare independent histories and reference', flush=True)
         rng = np.random.default_rng(4096032)
@@ -255,25 +310,33 @@ def main():
             compiler_hash = hashlib.sha256((build/'compiler'/
                 ('ftlpu-compile.exe' if sys.platform == 'win32' else 'ftlpu-compile')).read_bytes()).hexdigest()
             helper_hash = hashlib.sha256(Path(__file__).with_name('activation_batch_matmul_test.py').read_bytes()).hexdigest()
-            def graph_hash():
+            def graph_hash(semantic=False):
                 path = phase/'logical/decoder_layer.graph.json'
                 if not path.exists():
                     return None
-                data = path.read_bytes(); digest = hashlib.sha256(data)
-                for constant in json.loads(data)['constants']:
-                    digest.update(Path(constant['file']).read_bytes())
+                data = path.read_bytes(); document=json.loads(data)
+                constants=[Path(c['file']).read_bytes() for c in document['constants']]
+                if semantic:
+                    for constant, content in zip(document['constants'],constants):
+                        constant['file']='sha256:'+hashlib.sha256(content).hexdigest()
+                    data=json.dumps(document,sort_keys=True).encode()
+                digest = hashlib.sha256(data)
+                for content in constants: digest.update(content)
                 return digest.hexdigest()
             old_graph = graph_hash() if stamp.exists() else None
+            old_semantic = graph_hash(True) if stamp.exists() else None
+            saved = json.loads(stamp.read_text()) if stamp.exists() else {}
             graph.write(phase/'logical', finals)
             current_graph = graph_hash()
-            reusable = a.resume and stamp.exists() and old_graph == current_graph
-            saved = json.loads(stamp.read_text()) if reusable else {}
-            reusable = reusable and saved.get('graph_sha256') == current_graph
+            reusable = (a.resume and stamp.exists() and old_semantic == graph_hash(True)
+                and saved.get('graph_sha256') == old_graph)
             valid = reusable and (name in a.reuse_completed_phase or
                 (saved.get('compiler_sha256') == compiler_hash and saved.get('helper_sha256') == helper_hash))
             if valid:
                 valid = saved['binary_sha256'] == hashlib.sha256((phase/'program.ftlpu').read_bytes()).hexdigest()
                 if valid:
+                    saved.update(graph_sha256=current_graph)
+                    stamp.write_text(json.dumps(saved))
                     print(f'batch={batch}: {name} reused completed device execution', flush=True)
             if not valid:
                 print(f'batch={batch}: {name} compile', flush=True)
@@ -301,7 +364,7 @@ def main():
                 value=errors(v.reshape(batch, 2, 128), expected_value[:, 32]))
             assert np.isfinite(q).all() and all(e['relative_l2'] < .03
                 for e in record['projection_cache_metrics'].values()), record['projection_cache_metrics']
-            graph, finals = attention(q, k, v, past_key, past_value, config)
+            graph, finals = attention(q, k, v, past_key, past_value, config,strategy=a.attention_strategy)
             context, actual_key, actual_value = execute('attention', graph, finals,
                 [(batch, hidden), (batch, 33, 2, 128), (batch, 33, 2, 128)])
             # Validate attention before launching the expensive FFN. This CPU

@@ -426,7 +426,7 @@ std::uint64_t read_mxm_native(BitReader& reader, QueueKind kind)
         return reader.bits(mxm_instruction_bits(kind, 0));
     const auto opcode = reader.bits(2);
     const auto width = mxm_instruction_bits(kind, opcode);
-    return opcode | (reader.bits(width - 2) << 2);
+    return isa::unpack_mxm_load_template(opcode | (reader.bits(width - 2) << 2));
 }
 
 unsigned mxm_operand_bits(QueueKind kind)
@@ -586,7 +586,9 @@ bool compact_mxm_template(const MxmMacroRecord& record)
 void write_mxm_template(BitWriter& writer, const MxmMacroRecord& record,
                         QueueKind kind, MxmMacroBitstreamStats& stats)
 {
-    const auto native = normalized_mxm_instruction(record, kind);
+    const auto normalized = normalized_mxm_instruction(record, kind);
+    const auto native = kind == QueueKind::MxmLoad
+        ? isa::pack_mxm_load_template(normalized) : normalized;
     if (!compact_mxm_template(record)) {
         writer.bit(true);
         writer.bits(native, mxm_instruction_bits(kind, native));

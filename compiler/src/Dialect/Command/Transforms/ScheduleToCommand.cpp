@@ -67,6 +67,8 @@ mlir::StringAttr placement_hemisphere(mlir::DictionaryAttr placement,
 llvm::StringRef element_type_name(mlir::Type type)
 {
     auto integer = llvm::dyn_cast<mlir::IntegerType>(type);
+    // The binding transports opaque weight bytes. IW selects their interpretation.
+    if (llvm::isa<mlir::Float8E4M3FNType>(type)) return "i8";
     if (integer && integer.getWidth() == 8) return "i8";
     if (integer && integer.getWidth() == 32) return "i32";
     if (type.isF16()) return "f16";
@@ -77,6 +79,7 @@ llvm::StringRef element_type_name(mlir::Type type)
 
 int64_t element_type_bytes(mlir::Type type)
 {
+    if (llvm::isa<mlir::Float8E4M3FNType>(type)) return 1;
     if (auto integer = llvm::dyn_cast<mlir::IntegerType>(type))
         return (integer.getWidth() + 7) / 8;
     if (is_lpu_16bit_float(type)) return 2;
@@ -244,6 +247,7 @@ MxmAccumulatorDestination mxm_destination(llvm::StringRef value)
 
 MxmWeightInputMode mxm_weight_input_mode(llvm::StringRef value)
 {
+    if (value == "fp8_dequant_bf16") return MxmWeightInputMode::Fp8DequantBf16;
     return value == "int8_dequant_bf16"
         ? MxmWeightInputMode::Int8DequantBf16
         : MxmWeightInputMode::Direct16;

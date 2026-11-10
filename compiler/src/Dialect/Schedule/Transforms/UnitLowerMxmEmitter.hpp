@@ -1,7 +1,9 @@
 // Chunk32 polynomial inverse and head-wise matmul. All dynamic arithmetic is
 // emitted as real MXM/VXM instructions; the second inverse operand is immutable I.
 mlir::LogicalResult emitUnitLowerMxm(mlir::IRRewriter& r,kernel::VectorAluOp op,
-                                   const target::LPUTargetModel& target) {
+                                   const target::LPUTargetModel& target,
+                                   kernel::VectorAluOp epilogue = {},
+                                   kernel::VectorAluOp cast = {}) {
     r.setInsertionPoint(op);const auto loc=op.getLoc();
     const bool inverse=op.getKind()=="unit_lower_inverse";
     const auto precision=op->getAttrOfType<mlir::StringAttr>("mxm_precision");
@@ -9,7 +11,19 @@ mlir::LogicalResult emitUnitLowerMxm(mlir::IRRewriter& r,kernel::VectorAluOp op,
     const int64_t heads=op.getLhs().getType().getDimSize(0)/32,half=heads/2,rows=half*32;
     const int64_t blocks=op.getResult().getType().getDimSize(1)/32;
     auto get=[&](llvm::StringRef n){return op->getAttrOfType<mlir::DictionaryAttr>(n);};
-    auto lhs=get("ftlpu.vector_lhs_placement"),rhs=get("ftlpu.vector_rhs_placement"),out=get("ftlpu.vector_result_placement");
+    auto tail=cast?cast:epilogue?epilogue:op;
+    auto lhs=get("ftlpu.vector_lhs_placement"),rhs=get("ftlpu.vector_rhs_placement");
+    auto out=tail->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_result_placement");
+    auto prior=epilogue?epilogue->getAttrOfType<mlir::DictionaryAttr>("ftlpu.vector_rhs_placement"):mlir::DictionaryAttr{};
+    if(epilogue && (!singleBf16 || epilogue.getKind()!="add" || epilogue.getUseImmediate() || epilogue.getReduce() ||
+        epilogue.getLhs()!=op.getResult() || !op.getResult().hasOneUse() ||
+        epilogue.getRhs().getType()!=op.getResult().getType() || epilogue.getResult().getType()!=op.getResult().getType()))
+        return op.emitError("head_matmul epilogue requires one FP32 matrix add after a BF16 product");
+    if(cast && (!epilogue || cast.getKind()!="multiply" || !cast.getUseImmediate() || cast.getReduce() ||
+        cast.getImmediate().convertToFloat()!=1.f || cast.getLhs()!=epilogue.getResult() ||
+        !cast.getResult().getType().getElementType().isBF16() || cast.getResult().getType().getShape()!=op.getResult().getType().getShape() ||
+        !llvm::all_of(epilogue.getResult().getUsers(),[&](mlir::Operation *user){return user==cast.getOperation();})))
+        return op.emitError("head_matmul cast requires a sole immediate-one BF16 consumer of the FP32 add");
     auto tile=get("solve_mxm.weight_tile");
     const auto wide=op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
     if(!wide || !wide.getValue() || target.memory().bytes_per_word!=32 ||
@@ -132,6 +146,29 @@ mlir::LogicalResult emitUnitLowerMxm(mlir::IRRewriter& r,kernel::VectorAluOp op,
         timeline("solve_mxm.compensated_product",begin,cursor-32);
     };
     if(singleBf16) {
+        // Native BF16 operands already occupy two byte planes. FP32 operands
+        // retain the existing upper-plane BF16 interpretation. This changes
+        // only the MEM source addresses, not MXM arithmetic or accumulation.
+        const int lhsPlane=op.getLhs().getType().getElementType().isBF16()?0:2;
+        const int rhsPlane=op.getRhs().getType().getElementType().isBF16()?0:2;
+        const auto eastFirst=[](mlir::DictionaryAttr p) {
+            return p.getAs<mlir::StringAttr>("kind").getValue()!="token_partition_planar";
+        };
+        const auto mirrored=[](mlir::DictionaryAttr p) {
+            const auto kind=p.getAs<mlir::StringAttr>("kind").getValue();
+            return p.getAs<mlir::StringAttr>("hemisphere").getValue()=="both" &&
+                (p.get("mxm_lhs_head_rows") || kind=="fp16_pair_planar" || kind=="fp32_quad_planar");
+        };
+        // Replicated A/B contain both logical head halves on either side.
+        // Select the local half already held by a partitioned prior sum;
+        // this avoids mirroring that sum between successive K reductions.
+        const bool selectPriorHalf=epilogue && prior && partition(prior) && mirrored(lhs) && mirrored(rhs);
+        const bool inputEastFirst=selectPriorHalf?eastFirst(prior):eastFirst(lhs);
+        if(epilogue && (!prior || prior.getAs<mlir::ArrayAttr>("slices").size()!=4 ||
+            prior.getAs<mlir::StringAttr>("hemisphere").getValue()!="both" ||
+            eastFirst(lhs)!=eastFirst(rhs) || (partition(prior) && eastFirst(prior)!=inputEastFirst) ||
+            (!partition(prior) && prior.getAs<mlir::StringAttr>("kind").getValue()!="fp32_quad_planar")))
+            return op.emitError("MXM add needs a mirrored FP32 prior or a partition matching the MXM input head order");
         if(target.throughput().mxm_weight_buffers<2 || !target.supports_mxm_weight_activation_overlap())
             return op.emitError("streaming head_matmul requires two overlapping MXM weight buffers");
         const auto sxmToWeight=target.transport_latency(target::StreamEndpoint::SxmResult,
@@ -139,10 +176,10 @@ mlir::LogicalResult emitUnitLowerMxm(mlir::IRRewriter& r,kernel::VectorAluOp op,
         if(!sxmToWeight)return op.emitError("head_matmul requires SXM-to-MXM weight routing");
         const int64_t capture=96,load=capture+35+*sxmToWeight,compute=load+32,jobs=half*blocks;
         const auto domainMem=[&](mlir::DictionaryAttr p,int byte,int side,int64_t at,
-                                llvm::StringRef opcode,int stream,int64_t blockStride) {
+                                llvm::StringRef opcode,int stream,int64_t blockStride,int logicalSide=-1) {
             direct_domain_detail::emitMem3D(r,loc,target,at,
                 side*target.memory().slices_per_hemisphere+id(p,byte),opcode,
-                field(p,"base_row")+(partition(p)?0:side*rows),stream,
+                field(p,"base_row")+(partition(p)?0:(logicalSide<0?side:logicalSide)*rows),stream,
                 32,1,1,blocks,32,blockStride,half,blocks*32,32,-1,field(p,"bank"));
         };
         const auto returning=*target.transport_latency(target::StreamEndpoint::MxmResult,target::StreamEndpoint::Mem,target::StreamDirection::West,0)
@@ -153,22 +190,57 @@ mlir::LogicalResult emitUnitLowerMxm(mlir::IRRewriter& r,kernel::VectorAluOp op,
             // Use different East output ports 18/19 to avoid fabric collisions.
             attention_detail::emitSxm(r,loc,capture,side,"transpose",{16,17},{18,19},map,"wide_matrix",-1,-1,-1,jobs,32);
             for(int byte=0;byte<2;++byte) {
-                const auto rd=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::SxmInput,target::StreamDirection::East,id(rhs,byte+2));
-                const auto ar=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::MxmActivation,target::StreamDirection::East,id(lhs,byte+2));
-                domainMem(rhs,byte+2,side,capture-rd,"read",16+byte,partition(rhs)?rows:heads*32);
-                domainMem(lhs,byte+2,side,compute-ar,"read",4+byte,0);
+                const auto rd=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::SxmInput,target::StreamDirection::East,id(rhs,byte+rhsPlane));
+                const int logicalSide=inputEastFirst?side:1-side;
+                domainMem(rhs,byte+rhsPlane,side,capture-rd,"read",16+byte,partition(rhs)?rows:heads*32,
+                    selectPriorHalf?logicalSide:side);
+                const int lhsHead=selectPriorHalf?logicalSide:side;
+                if(auto headRows=lhs.getAs<mlir::ArrayAttr>("mxm_lhs_head_rows")) {
+                    const int64_t base=llvm::cast<mlir::IntegerAttr>(headRows[lhsHead]).getInt();
+                    // Residue j supplies tokens j, j+8, j+16, j+24. Each
+                    // subsequent output-column tile consumes that same input.
+                    for(int residue=0;residue<8;++residue) {
+                        const auto slice=id(lhs,2*residue+byte);
+                        const auto delay=target.transport_latency(target::StreamEndpoint::Mem,
+                            target::StreamEndpoint::MxmActivation,target::StreamDirection::East,slice);
+                        if(!delay)return op.emitError("missing distributed MEM-to-MXM route");
+                        direct_domain_detail::emitMem3D(r,loc,target,compute+residue-*delay,
+                            side*target.memory().slices_per_hemisphere+slice,"read",base,
+                            4+byte,4,8,1,blocks,32,0,1,1,0,-1,field(lhs,"bank"));
+                    }
+                } else {
+                    const auto ar=*target.transport_latency(target::StreamEndpoint::Mem,
+                        target::StreamEndpoint::MxmActivation,target::StreamDirection::East,id(lhs,byte+lhsPlane));
+                    domainMem(lhs,byte+lhsPlane,side,compute-ar,"read",4+byte,0,lhsHead);
+                }
             }
             attention_detail::MxmDomain3D iw;
             iw.repeat_count=32;iw.repeat_weight_column_stride=1;
             iw.wave_count=jobs;iw.wave_interval=32;iw.weight_buffer_mode="toggle_dim1";
             attention_detail::emitMxm3D(r,loc,load,side,"iw",0,0,0,0,0,1,"stream",true,"vector",0,"bf16","direct16","",iw,18);
             auto cm=iw;cm.repeat_weight_column_stride=0;
-            attention_detail::emitMxm3D(r,loc,compute,side,"compute",0,0,4,24,0,1,"stream",true,"block",0,"bf16","direct16","fp32",cm);
+            attention_detail::emitMxm3D(r,loc,compute,side,"compute",0,0,4,epilogue?side*16:24,0,1,"stream",true,"block",0,"bf16","direct16","fp32",cm);
             for(int byte=0;byte<4;++byte) {
-                const auto wr=*target.transport_latency(target::StreamEndpoint::VxmBridgeResult,target::StreamEndpoint::Mem,target::StreamDirection::East,id(out,byte));
-                domainMem(out,byte,1-side,arrival+wr,"write",24+byte,rows);
+                if(epilogue) {
+                    const int logicalSide=inputEastFirst?side:1-side;
+                    direct_domain_detail::emitMem3D(r,loc,target,arrival-1-id(prior,byte)/4,
+                        side*target.memory().slices_per_hemisphere+id(prior,byte),"read",
+                        field(prior,"base_row")+(partition(prior)?0:logicalSide*rows),32+side*16+4+byte,
+                        32,1,1,blocks,32,partition(prior)?rows:heads*32,half,blocks*32,32,-1,field(prior,"bank"));
+                }
+                if(cast && byte>=2)continue;
+                const auto wr=epilogue?2+int(bool(cast))+id(out,byte)/4:
+                    *target.transport_latency(target::StreamEndpoint::VxmBridgeResult,target::StreamEndpoint::Mem,target::StreamDirection::East,id(out,byte));
+                domainMem(out,byte,1-side,arrival+wr,"write",epilogue?side*8+byte:24+byte,rows);
                 cursor=std::max(cursor,arrival+wr+jobs*32+32);
             }
+        }
+        if(epilogue) {
+            auto add=ffn_detail::create_vxm(r,loc,op.getLhs(),epilogue.getRhs(),epilogue.getResult().getType(),arrival-1,0,"add",
+                "stream_f32",0,0.f,"stream_f32",4,0.f,"fp32",-1,jobs*32,1,"east","west",-1,false,false,true,false,2);
+            add->setAttr("lhs_stream_source",r.getStringAttr("local"));add->setAttr("rhs_stream_source",r.getStringAttr("local"));
+            ffn_detail::create_vxm(r,loc,op.getLhs(),epilogue.getRhs(),tail.getResult().getType(),arrival-1,1,cast?"multiply":"bypass",
+                "previous",0,0.f,"immediate",0,cast?1.f:0.f,cast?"bf16":"fp32",0,jobs*32,1,"east","west",-1,false,false,true,false,2);
         }
         timeline("head_matmul.sxm_to_mxm",capture,cursor);
     } else for(int64_t pair=0;pair<half;++pair) {
@@ -194,8 +266,11 @@ mlir::LogicalResult emitUnitLowerMxm(mlir::IRRewriter& r,kernel::VectorAluOp op,
         }
     }
     timeline(inverse?"unit_lower_inverse.mxm":"head_matmul.mxm",32,cursor);
-    mlir::OperationState binding(loc,BindingOp::getOperationName());binding.addTypes(op.getResult().getType());
+    mlir::OperationState binding(loc,BindingOp::getOperationName());binding.addTypes(tail.getResult().getType());
     binding.addAttributes({r.getNamedAttr("index",r.getI64IntegerAttr(0)),r.getNamedAttr("access",r.getStringAttr("output")),
-        r.getNamedAttr("role",r.getStringAttr("result")),r.getNamedAttr("bytes",r.getI64IntegerAttr(op.getResult().getType().getNumElements()*4)),r.getNamedAttr("placement",out)});
-    r.replaceOp(op,llvm::cast<BindingOp>(r.create(binding)).getValue());return mlir::success();
+        r.getNamedAttr("role",r.getStringAttr("result")),r.getNamedAttr("bytes",r.getI64IntegerAttr(tail.getResult().getType().getNumElements()*(cast?2:4))),r.getNamedAttr("placement",out)});
+    r.replaceOp(tail,llvm::cast<BindingOp>(r.create(binding)).getValue());
+    if(cast)r.eraseOp(epilogue);
+    if(epilogue)r.eraseOp(op);
+    return mlir::success();
 }

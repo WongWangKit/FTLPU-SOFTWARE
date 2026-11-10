@@ -26,11 +26,39 @@ from unit_lower_mxm_runtime_test import source as matrix_source, polynomial
 from weighted_gram_runtime_test import scaled_weighted_gram_source, weighted_cross_gram_source, weighted_gram_source, reference as weighted_gram_reference, read_head_groups
 
 
+def paging_epoch_offsets(rows, log):
+    """Map logical issue cycles to physical time using consumer release events."""
+    consumers = [row for row in rows if row['resource'] == 'Paging.Consumer']
+    if consumers:
+        return sorted((int(re.search(r'logical_cycle=(\d+)', row['detail'])[1]),
+            int(row['start']) - int(re.search(r'logical_cycle=(\d+)', row['detail'])[1]))
+            for row in consumers)
+    # Legacy traces did not expose consumer release. Retain their original
+    # completion-event fallback; current traces always prefer actual consumers.
+    return sorted((int(consumer), int(ready) - 1 - int(consumer)) for consumer, ready in
+        re.findall(r'FTLPU executable page complete:.*?consumer=(\d+).*?actual_ready=(\d+)', log))
+
+
+def physical_node_range(node, offsets, fallback=0):
+    """Map both ends, including a barrier inside the node's logical interval."""
+    def physical(cycle):
+        delay = next((offset for consumer, offset in reversed(offsets) if consumer <= cycle), fallback)
+        return cycle + delay
+    begin, end = node['nominal_start'], node['nominal_end']
+    # The half-open end belongs to the previous epoch if the next consumer
+    # begins exactly there; that next page's wait is not part of this node.
+    return [physical(begin), physical(end - 1) + 1 if end > begin else physical(end)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('package', 'build-dir', 'target-config', 'output-dir'):
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--sxm-architecture', choices=('wide', 'local'), default='wide')
+    parser.add_argument('--projection-solve-overlap', choices=('on', 'off'), default='off',
+                        help='Allow C++ to overlap independent projection and FP32 forward solve')
+    parser.add_argument('--projection-conv-overlap', choices=('on', 'off'), default='off',
+                        help='Allow C++ to pipeline projection pages with independent depthwise convolution blocks')
     parser.add_argument('--with-qk-norm', action='store_true')
     parser.add_argument('--export-qkv', action='store_true', help='Diagnostic intermediate export; adds QKV output traffic')
     parser.add_argument('--validate-only', action='store_true', help='Validate existing CModel outputs and export runtime instructions')
@@ -86,7 +114,9 @@ def main():
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     summary = dict(status='pending', scope='QKV projection + causal Conv1D/SiLU only',
-                   sxm_architecture=args.sxm_architecture, icu_compression='raw-macro')
+                   sxm_architecture=args.sxm_architecture, icu_compression='raw-macro',
+                   projection_solve_overlap=args.projection_solve_overlap,
+                   projection_conv_overlap=args.projection_conv_overlap)
     (out / 'summary.json').write_text(json.dumps(summary, indent=2))
     build = args.build_dir.resolve()
     suffix = '.exe' if sys.platform == 'win32' else ''
@@ -228,6 +258,8 @@ def main():
              '--emit-kernel', '--target-config', args.target_config.resolve()], out / 'import.log')
         kernel.write_text(kernel.read_text().replace('module {',
             'module attributes {ftlpu.vector_bf16_spill = true, ftlpu.common_barrier_protocol = true, '
+            + f'ftlpu.projection_solve_overlap = {str(args.projection_solve_overlap == "on").lower()}, '
+            + f'ftlpu.projection_conv_overlap = {str(args.projection_conv_overlap == "on").lower()}, '
             + f'ftlpu.vector_fp32_ingress = {str(args.fp32_ingress).lower()}, '
             + f'ftlpu.vector_bf16_token_halves = {str(args.with_gates).lower()}, ftlpu.vector_log_softplus = {str(args.with_gates).lower()}, ftlpu.l2_head_partition = {str(args.with_qk_norm and args.sxm_architecture == "wide").lower()}, ftlpu.sxm_wide = {str(args.sxm_architecture == "wide").lower()}' + '} {', 1))
         run([exe('compiler', 'ftlpu-compile'), '--input', kernel, '--input-stage', 'kernel',
@@ -616,6 +648,7 @@ def main():
             dict(name=n['name'], start=n['nominal_start'], end=n['nominal_end'])
             for n in plan['nodes'] if n['name'].startswith('state_decay')]
     log = (out / 'execution.log').read_text()
+    epoch_offsets = paging_epoch_offsets(rows, log)
     assert f'sxm_architecture={args.sxm_architecture}' in log
     stats = {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', log.splitlines()[-1])}
     assert stats.get('host_operations') == 0
@@ -676,13 +709,14 @@ def main():
         invocation=next(r for r in rows if r['resource']=='Session.Invocation')
         scan_code=schedule.split('name = "g_prefix_sum.operand"',1)[1].split('name = "chunk_gamma.operand"',1)[0]
         scan_line=next(line for line in scan_code.splitlines() if 'accumulator_reset = true' in line and 'queue = 1 : i64' in line)
-        offset=scan_start-int(re.search(r'cycle = (\d+)',scan_line)[1])
+        scan_offset=scan_start-int(re.search(r'cycle = (\d+)',scan_line)[1])
+        physical_range=lambda node:physical_node_range(node,epoch_offsets,scan_offset)
         summary['chunkwise_solve']['nominal_and_runtime_ranges']={}
         for name in (('chunk_rhs_beta_v','chunk_unit_lower_inverse','chunk_solve_matmul') if args.solve_strategy=='mxm' else ('chunk_rhs_beta_v','chunk_unit_lower_solve')):
             node=next(n for n in plan['nodes'] if n['name']==name)
             summary['chunkwise_solve']['nominal_and_runtime_ranges'][name]=dict(
                 nominal=[node['nominal_start'],node['nominal_end']],
-                runtime=[node['nominal_start']+offset,node['nominal_end']+offset],
+                runtime=physical_range(node),
                 cycles=node['nominal_end']-node['nominal_start'])
         from head_scale_streaming_runtime_test import audit_runtime as audit_head_scale
         beta_range=summary['chunkwise_solve']['nominal_and_runtime_ranges']['chunk_rhs_beta_v']['runtime']
@@ -702,7 +736,8 @@ def main():
             summary['chunkwise_solve']['scheduling']=audit_blocked_solve(out,h,d,solve_range)
         if args.solve_strategy=='mxm':
             solve_start=summary['chunkwise_solve']['nominal_and_runtime_ranges']['chunk_unit_lower_inverse']['runtime'][0]
-            events=[r for r in rows if r['resource'].startswith('MXM.') and r['resource'].endswith('.Compute') and int(r['start'])>=solve_start and (not args.with_h or int(r['start'])<next(n for n in plan['nodes'] if n['name']=='chunk_output_cross_gram')['nominal_start']+offset)]
+            solve_end=physical_range(next(n for n in plan['nodes'] if n['name']=='chunk_output_cross_gram'))[0] if args.with_h else None
+            events=[r for r in rows if r['resource'].startswith('MXM.') and r['resource'].endswith('.Compute') and int(r['start'])>=solve_start and (solve_end is None or int(r['start'])<solve_end)]
             active={}
             for unit in sorted({r['resource'] for r in events}):
                 cycles=sum((int(r['end'])-int(r['start']))*int(r['inner_count'])*int(r['outer_count']) for r in events if r['resource']==unit)
@@ -741,7 +776,7 @@ def main():
         np.testing.assert_allclose(np.diagonal(h_actual,axis1=1,axis2=2),
             np.diagonal(local,axis1=1,axis2=2),rtol=.009,atol=2e-5)
         node=next(n for n in plan['nodes'] if n['name']=='chunk_output_cross_gram')
-        runtime_range=[node['nominal_start']+offset,node['nominal_end']+offset]
+        runtime_range=physical_range(node)
         util={}
         for unit in ('MXM.E0.Compute','MXM.W0.Compute'):
             spans=[]
@@ -798,7 +833,7 @@ def main():
         algebra_error=float(np.linalg.norm(model_o-recurrent)/np.linalg.norm(recurrent))
         assert algebra_error<2e-5,algebra_error
         node=next(n for n in plan['nodes'] if n['name']==('chunk_output_state' if fused_output_state else 'chunk_output_matmul'))
-        interval=[node['nominal_start']+offset,node['nominal_end']+offset]
+        interval=physical_range(node)
         events=[r for r in rows if r['resource'].startswith('MXM.') and r['resource'].endswith('.Compute')
                 and interval[0]<=int(r['start'])<interval[1]]
         active={unit:sum((int(r['end'])-int(r['start']))*int(r['inner_count'])*int(r['outer_count'])
@@ -853,7 +888,7 @@ def main():
         assert all(e['nrmse']<.01 for e in errors_local),errors_local
         assert all(e['nrmse']<.03 and e['cosine']>.999 for e in errors_model),errors_model
         node=next(n for n in plan['nodes'] if n['name']==('chunk_output_state' if fused_output_state else 'chunk_outgoing_state'))
-        interval=[node['nominal_start']+offset,node['nominal_end']+offset]
+        interval=physical_range(node)
         assert not core_transports
         summary['chunkwise_outgoing_state']=dict(status='passed',shape=[h,dim,d],output_index=h_index+2,
             formula='S_out=K^T diag(R[31,:]) D',initial_state='zero',storage='FP32',
@@ -899,17 +934,6 @@ def main():
             tail_errors['attention_end_to_end']=compare(attention_actual,model_gated.reshape(32,-1)@weights.out_proj.T)
             assert any(n['name'].startswith('out_proj.page') for n in plan['nodes'])
         assert all(e['nrmse']<.03 and e['cosine']>.999 for e in tail_errors.values()),tail_errors
-        # Each weight-page barrier changes the runtime offset. A single
-        # end-of-session offset would incorrectly shift the earlier core.
-        epoch_offsets=sorted((int(consumer),int(ready)-1-int(consumer)) for consumer,ready in
-            re.findall(r'FTLPU executable page complete:.*?consumer=(\d+).*?actual_ready=(\d+)',log))
-        consumer_events=[r for r in rows if r['resource']=='Paging.Consumer']
-        if consumer_events:
-            # A prefetched page can commit long before its consumer. Only
-            # actual consumer release gives the logical-to-physical offset.
-            epoch_offsets=sorted((int(re.search(r'logical_cycle=(\d+)',r['detail'])[1]),
-                int(r['start'])-int(re.search(r'logical_cycle=(\d+)',r['detail'])[1]))
-                for r in consumer_events)
         if args.with_output_projection and plan.get('weight_page_ping_pong'):
             placements={p['binding']:p for p in plan['weight_page_placements']}
             transfers=[]
@@ -940,9 +964,9 @@ def main():
         tail_stages=[]
         for n in plan['nodes']:
             if not n['name'].startswith(('in_proj_z','delta_output_','out_proj')):continue
-            runtime_offset=next(delay for consumer,delay in reversed(epoch_offsets) if consumer<=n['nominal_start'])
+            runtime_start,runtime_end=physical_range(n)
             tail_stages.append(dict(name=n['name'],nominal_start=n['nominal_start'],nominal_end=n['nominal_end'],
-                runtime_start=n['nominal_start']+runtime_offset,runtime_end=n['nominal_end']+runtime_offset))
+                runtime_start=runtime_start,runtime_end=runtime_end))
         gate_stage=next(n for n in tail_stages if n['name']=='delta_output_gate')
         gate_events=[r for r in rows if r['resource'].startswith('VXM.') and
             gate_stage['runtime_start']<=int(r['start'])<gate_stage['runtime_end']]

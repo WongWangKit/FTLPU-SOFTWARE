@@ -3,6 +3,7 @@
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 #include "ftlpu/compiler/Transforms/logical_kernel_graph.hpp"
+#include "BlockFp8ActivationLowering.hpp"
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -236,6 +237,11 @@ public:
   llvm::StringRef getDescription() const final {return "Plan connected RMSNorm/projection/causal-convolution layouts and native ICU domains";}
   void runOnOperation() final {
     auto function=getOperation();
+    mlir::IRRewriter rewriter(function.getContext());
+    for (auto scale : llvm::make_early_inc_range(function.getOps<kernel::BlockFp8ScaleOp>()))
+      kernel::expandBlockFp8Arithmetic(scale.getOperation(), scale.getInput(), false, rewriter);
+    for (auto qdq : llvm::make_early_inc_range(function.getOps<kernel::BlockFp8QdqOp>()))
+      kernel::expandBlockFp8Arithmetic(qdq.getOperation(), qdq.getInput(), true, rewriter);
     if (function->hasAttr("ftlpu.logical_inputs")) {
       try {
         auto directory = function->getAttrOfType<mlir::StringAttr>("ftlpu.artifact_directory");

@@ -14,9 +14,17 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
     const auto rhsType = op.getRhs().getType();
     const auto resultType = op.getResult().getType();
     const int64_t tile = target.throughput().mxm_rows;
+    const bool fp8 = llvm::isa<mlir::Float8E4M3FNType>(rhsType.getElementType());
+    const bool fp32Partial = fp8 && resultType.getElementType().isF32();
+    if (fp8 && (!lhsType.getElementType().isBF16() || tile != 32
+        || (!resultType.getElementType().isBF16() && !fp32Partial)
+        || op.getK() != 32 || op.getM() != 32 || op.getN() != 64))
+        return op.emitOpError("FP8 IW primitive requires BF16 X[32,32] and E4M3FN W[32,64]");
+    if (fp8 && !llvm::isa<mlir::BlockArgument>(op.getLhs()))
+        return op.emitOpError("use connected graph layout planning for an intermediate FP8 projection activation");
     const bool w8a16 = is_lpu_16bit_float(lhsType.getElementType())
-        && rhsType.getElementType().isInteger(8)
-        && is_lpu_16bit_float(resultType.getElementType());
+        && (fp8 || rhsType.getElementType().isInteger(8))
+        && (is_lpu_16bit_float(resultType.getElementType()) || fp32Partial);
     if (w8a16) {
         if ((op.getM() > tile && op.getM() % tile) || op.getN() % (2 * tile)
             || op.getK() % tile) {
@@ -36,13 +44,15 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
                 static_cast<int64_t>(op.getN()),
                 static_cast<int64_t>(op.getK()),
                 lhsType.getElementType().isBF16(),
-                rhsType.getElementType().isInteger(8),
-                is_lpu_16bit_float(resultType.getElementType()), true},
+                (fp8 || rhsType.getElementType().isInteger(8)),
+                is_lpu_16bit_float(resultType.getElementType()) || fp32Partial, true},
             target, *executionPolicy);
         if (mlir::failed(strategy)) {
             op.emitError("cannot select an MXM execution strategy");
             return mlir::failure();
         }
+        if (fp8 && !strategy->uses_local_dequant())
+            return op.emitOpError("FP8 IW requires weight-stationary local dequantization");
         const auto activationSlices = target.attention_activation_slices();
         const auto weightSlices =
             target.attention_output_weight_slices();
@@ -59,7 +69,7 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
         }
         const int64_t lhsBytes = lhsType.getNumElements() * 2;
         const int64_t rhsBytes = rhsType.getNumElements();
-        const int64_t resultBytes = resultType.getNumElements() * 2;
+        const int64_t resultBytes = resultType.getNumElements() * (fp32Partial ? 4 : 2);
         auto input = fixed_allocation(PlacementKind::Activation,
             llvm::ArrayRef<int64_t>(activationSlices).take_front(2),
             0, op.getM() * op.getK() / tile, lhsBytes,
@@ -69,9 +79,9 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             (op.getN() / (2 * tile)) * (op.getK() / tile) * 4,
             rhsBytes, "w8a16_mxm_weight_striped", "both");
         auto result = fixed_allocation(PlacementKind::FinalResult,
-            llvm::ArrayRef<int64_t>(resultSlices).take_front(2), 0,
+            llvm::ArrayRef<int64_t>(resultSlices).take_front(fp32Partial ? 4 : 2), 0,
             op.getM() * op.getN() / (2 * tile),
-            resultBytes, "fp16_hemisphere_pair_planar", "both",
+            resultBytes, fp32Partial ? "column_partition_planar" : "fp16_hemisphere_pair_planar", "both",
             target.memory().banks_per_slice > 1 ? 1 : 0);
         const bool replicated = llvm::any_of(op.getResult().getUsers(),
             [](mlir::Operation* user) { return llvm::isa<kernel::SigmoidMultiplyOp>(user); });
@@ -142,6 +152,12 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             memoryPlan = plan.getDictionary(rewriter.getContext());
             mlir::NamedAttrList flags(config);
             flags.set("replicated_result", rewriter.getBoolAttr(true));
+            config = flags.getDictionary(rewriter.getContext());
+        }
+        if (fp8) {
+            mlir::NamedAttrList flags(config);
+            if (auto west = op->getAttrOfType<mlir::FloatAttr>("rhs_scale_west"))
+                flags.set("rhs_scale_west", west);
             config = flags.getDictionary(rewriter.getContext());
         }
         const mlir::Value oldResult = op.getResult();

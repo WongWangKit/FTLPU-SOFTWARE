@@ -357,6 +357,10 @@ try {
              macro(ftlpu::MxmControlInstruction::IW(0, 0),
                    {42, 4, 2, 1, 2, 11, 0,
                     ftlpu::IcuInductionTarget::MxmWeightColumn}),
+             macro(ftlpu::MxmControlInstruction::IWColumn(0, 0, 3,
+                       ftlpu::MxmWeightInputMode::Fp8DequantBf16, 4),
+                   {80, 1, 1, 0, 1, 1, 0,
+                    ftlpu::IcuInductionTarget::MxmWeightColumn}),
          }});
     mxmQueues.push_back(
         {rt::QueueKind::MxmCompute,

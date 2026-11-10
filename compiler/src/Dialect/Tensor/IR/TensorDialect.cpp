@@ -492,8 +492,10 @@ LogicalResult ProjectionTaskOp::verify()
             || result.getShape()
                 != llvm::ArrayRef<int64_t>({m.getInt(), n.getInt()})
             || !is_lpu_16bit_float(input.getElementType())
-            || !weight.getElementType().isInteger(8)
-            || result.getElementType() != input.getElementType())
+            || !(weight.getElementType().isInteger(8) || llvm::isa<mlir::Float8E4M3FNType>(weight.getElementType()))
+            || (result.getElementType() != input.getElementType()
+                && !(llvm::isa<mlir::Float8E4M3FNType>(weight.getElementType())
+                    && result.getElementType().isF32())))
             return emitOpError(
                 "requires a valid rank-2 W8A16 linear projection config");
         return verify_attention_memory_subplan(

@@ -519,9 +519,84 @@ void repeated_load_and_all_of()
     require(sawFirst && sawSecond && duplicated,"repeated page/all-of run did not observe all completions");
     require(runtime.logical_cycles()==kBudget,"repeated load consumed logical waiting budget");
 }
+
+void mem_macro_calendar_matches_pointwise()
+{
+    BinaryProgram image;
+    image.max_cycle = 512;
+    const auto mem = [](const MemInstruction& op) {
+        const auto bits = isa::encode_mem_instruction(op);
+        return QueueCommand{
+            static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
+            InstructionKind::Mem, 2,
+            {static_cast<std::uint32_t>(bits), static_cast<std::uint32_t>(bits >> 32), 0, 0}};
+    };
+    const auto read = mem(MemInstruction::Read(64, StreamId::West(31)));
+    const auto write = mem(MemInstruction::Write(48, StreamId::East(2)));
+    const IcuMacroSchedule rows {12, 8, 1, -1, 3, 80, 3, IcuInductionTarget::MemAddress};
+    const IcuMacroSchedule sparse {216, 4, 3, 1, 1, 1, 0, IcuInductionTarget::MemAddress};
+    image.queues.push_back({QueueKind::Mem, macro_queue(), {
+        encode_macro_schedule_command(write, sparse), encode_macro_schedule_command(read, rows)}});
+
+    // Build the independent pointwise calendar from the ordinary inspector,
+    // using Native instructions/NOPs so it cannot take the interval path.
+    const auto expanded = inspect_logical_issues(image);
+    require(expanded.functional_issues == 28, "unexpected pointwise MEM count");
+    auto native = image;
+    auto& commands = native.queues.front().commands;
+    commands.clear();
+    std::size_t next = 0;
+    for (const auto& issue : expanded.queues.front().issues) {
+        if (next < issue.cycle)
+            commands.push_back(encode_icu_control_raw_word(IcuControlInstruction::Nop(issue.cycle - next)));
+        commands.push_back(issue.instruction);
+        next = issue.cycle + 1;
+    }
+    const CommonOverlapCalendar pointwise(native), compact(image, 7);
+    const std::array<std::size_t, 1> queues {macro_queue()};
+    const auto selection = [&](const CommonOverlapCalendar& calendar, std::uint32_t stop,
+                               std::span<const std::size_t> ports) -> std::optional<CommonOverlapCalendar::Selection> {
+        try { return calendar.select(stop, 0, ports); }
+        catch (const std::invalid_argument&) { return {}; }
+    };
+    const auto accepts = [&](const CommonOverlapCalendar& calendar, std::uint32_t launch,
+                             std::uint32_t stop, std::uint16_t stream) {
+        try { calendar.validate(launch, stop, queues, {&stream, 1}); return true; }
+        catch (const std::invalid_argument&) { return false; }
+    };
+    for (std::uint32_t stop = 0; stop <= image.max_cycle; ++stop) {
+        for (const auto ports : {std::span<const std::size_t>{}, std::span<const std::size_t>{queues}}) {
+            const auto a = selection(pointwise, stop, ports), b = selection(compact, stop, ports);
+            require(a.has_value() == b.has_value()
+                    && (!a || (a->launch == b->launch && a->streams == b->streams)),
+                "MEM row compression altered a safe launch or SR selection");
+        }
+        for (const std::uint16_t stream : {2, 31})
+            for (const auto launch : {0U, stop / 2, stop})
+                require(accepts(pointwise, launch, stop, stream) == accepts(compact, launch, stop, stream),
+                    "MEM row compression altered lease validation");
+    }
+
+    bool bounded = false;
+    try { CommonOverlapCalendar over_budget(image, 6); }
+    catch (const LogicalIssueAnalysisLimit&) { bounded = true; }
+    require(bounded, "MEM row proof ignored its work budget");
+    auto collision = image;
+    collision.queues[0].commands.push_back(encode_macro_schedule_command(write,
+        IcuMacroSchedule {14, 1, 1, 0, 1, 1, 0, IcuInductionTarget::None}));
+    rejects([&] { CommonOverlapCalendar invalid(collision); }, "overlapping MEM rows were accepted");
+    auto out_of_range = image;
+    auto underflow = rows;
+    underflow.inner_stride = -12;
+    out_of_range.queues[0].commands = {encode_macro_schedule_command(read, underflow)};
+    rejects([&] { CommonOverlapCalendar invalid(out_of_range); }, "MEM address underflow was accepted");
+    image.max_cycle = 200;
+    rejects([&] { CommonOverlapCalendar invalid(image); }, "MEM row beyond the horizon was accepted");
+}
 }
 int main()
 try {
+    mem_macro_calendar_matches_pointwise();
     BinaryProgram chainProgram;
     VxmLaneAluInstruction chain;
     chain.lhs = VxmLaneOperand::StreamBFloat16();

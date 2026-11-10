@@ -45,6 +45,16 @@ struct LogicalIssueProgram {
 LogicalIssueProgram inspect_logical_issues(const BinaryProgram& program,
     std::size_t max_issues = std::numeric_limits<std::size_t>::max());
 
+struct MemIssueRun {
+    std::uint32_t first, last; // Inclusive; every cycle issues exactly once.
+    std::size_t stream;
+};
+
+// Exact occupancy for queues made solely of absolute-cycle direct MEM macros.
+// Other queue encodings require the ordinary logical inspector.
+std::optional<std::vector<MemIssueRun>> inspect_mem_macro_runs(
+    const BinaryProgram& program, const QueueProgram& queue, std::size_t& work_left);
+
 struct LogicalIssueMismatch {
     QueueKind kind{QueueKind::Mem};
     std::size_t index{0};

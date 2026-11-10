@@ -11,6 +11,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <string>
 
 namespace ftlpu::compiler::schedule {
@@ -1014,6 +1016,25 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
     const int64_t tokenBlocks = rows / tile;
     const int64_t distributedRows =
         rows * hidden / (tile * lanes);
+    // If epsilon and unit variance cannot share even the full FP16 normal
+    // range, a single scaled RSQRT can overflow on ordinary activations.
+    // Retain the sum in the FP32 feedback chain for the multi-range lookup.
+    const bool rangeSafeFactor = !l2Norm && inputType.getElementType().isBF16()
+        && epsilon > 0.0 && epsilon <= 0x1p-30;
+    llvm::SmallVector<int> lookupExponents;
+    if (rangeSafeFactor) {
+        // FP16 normal exponents span [-14,15]. A stride of 28 gives
+        // overlapping bands; even exponents make the correction exact.
+        int exponent = -114;
+        const double minimumScale = 0x1p-14 / epsilon;
+        // The smallest positive binary32 epsilon is 2^-149, requiring
+        // a final even scale exponent of at most 136.
+        while (std::ldexp(1.0, exponent) < minimumScale && exponent < 136) {
+            lookupExponents.push_back(exponent);
+            exponent = std::min(exponent + 28, 136);
+        }
+        lookupExponents.push_back(exponent);
+    }
     if (inputSlices.size() != 16 || outputSlices.size() != 16
         || (!l2Norm && weightSlices.size() != 2 && weightSlices.size() != 4
             && weightSlices.size() != 16))
@@ -1145,7 +1166,8 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                 "fp32", -1, hidden - 2, 4, false, true, false);
         vxm(reductionConfig + 2, 3, "add",
             "previous", 0, 0.0f, "accumulator", 0, 0.0f,
-            dataFormat, 2, 1, 4, false, true, true);
+            rangeSafeFactor ? "fp32" : dataFormat, rangeSafeFactor ? -1 : 2,
+            1, 4, false, true, true);
 
         } else {
             // Each SXM tile supplies 32 consecutive feature vectors directly.
@@ -1159,7 +1181,8 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                 if(first) vxm(config,3,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",-1,1,4,true,true,false);
                 vxm(config+(first?1:0),3,"add","previous",0,0.f,"accumulator",0,0.f,
                     "fp32",-1,32-(first?1:0)-(last?1:0),4,false,true,false);
-                if(last) vxm(config+1,3,"add","previous",0,0.f,"accumulator",0,0.f,dataFormat,2,1,4,false,true,true);
+                if(last) vxm(config+1,3,"add","previous",0,0.f,"accumulator",0,0.f,
+                    rangeSafeFactor ? "fp32" : dataFormat,rangeSafeFactor ? -1 : 2,1,4,false,true,true);
             }
         }
         const int64_t featuresPerPair = hidden / lanes;
@@ -1172,7 +1195,7 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
             + maxWriteLatency(scalarSlices)
             + 2;
         int64_t scalarReady = scalarWriteEnd;
-        if (independentHeads) {
+        if (independentHeads && !rangeSafeFactor) {
             // Fixed VXM outputs cross to the opposite MEM hemisphere. Return
             // only the two-byte reduction scalar to its owning head; the
             // retained feature tile never moves between hemispheres.
@@ -1189,9 +1212,23 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                     scalarReady=std::max(scalarReady,scalarWriteEnd+latency+2);
                 }
         }
-        const int64_t factorInput = scalarReady
-            + maxReadLatency(scalarSlices) + 1;
-        const int64_t normalizeInput = factorInput + 10;
+        // Basic ALU, multiply and LUT latencies are 1, 2 and 5 clocks
+        // (VxmAlu and VxmSpecialAlu). Four cells are traversed per pass.
+        // Feedback clocks the result back into the head input register.
+        constexpr int64_t basic = 1, mul = 2, lut = 5, feedbackEdge = 1;
+        constexpr int64_t lookupLatency = basic + basic + mul + lut;
+        constexpr int64_t correctionLatency = mul + basic + basic + basic;
+        constexpr int64_t bandInterval = lookupLatency + feedbackEdge
+            + correctionLatency + feedbackEdge;
+        constexpr int64_t extraScalePass = basic + basic + mul + mul + feedbackEdge;
+        const bool splitFinalScale = rangeSafeFactor && lookupExponents.back() > 126;
+        const int64_t factorInput = rangeSafeFactor
+            ? sumOutput + feedbackEdge + correctionLatency + feedbackEdge
+            : scalarReady + maxReadLatency(scalarSlices) + 1;
+        const int64_t normalizeInput = rangeSafeFactor
+            ? factorInput + bandInterval * lookupExponents.size()
+                + (splitFinalScale ? extraScalePass : 0) + 1
+            : factorInput + 10;
         // The first input pair also holds the reduction scalar. A later pair
         // may span both passes only when no other memory role can insert a
         // command into its physical (hemisphere, slice, bank) ICU queue.
@@ -1225,15 +1262,66 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                 normalizeInput - reductionInput);
         }
 
-        emitMirroredWrite(llvm::ArrayRef<int64_t>(inputSlices).take_front(2),
-            scalarAddress, 2, sumOutput, 2, bank(inputPlacement));
+        if (!rangeSafeFactor)
+            emitMirroredWrite(llvm::ArrayRef<int64_t>(inputSlices).take_front(2),
+                scalarAddress, 2, sumOutput, 2, bank(inputPlacement));
 
         const int64_t factorConfig = factorInput - 1;
         // The LUT ingress is FP16 with flush-to-zero. Scale the positive
         // sum+epsilon before RSQRT, then undo that scale in normalization.
-        const float lookupScale = epsilon > 0.0 && epsilon < 0x1p-14
+        const float lookupScale = !rangeSafeFactor && epsilon > 0.0 && epsilon < 0x1p-14
             ? std::exp2(std::ceil(std::log2(0x1p-14 / epsilon))) : 1.0f;
-        if (l2Norm) {
+        if (rangeSafeFactor) {
+            // Arm the successor after the reduction's reset, repeat and
+            // emit descriptors are queued. The head waits for the tail's
+            // actual data-valid, independently of the number of features.
+            const int64_t lastReductionConfig = streamedReduction.empty()
+                ? reductionConfig : streamedReduction.back() - 1;
+            const int64_t sumFeedback = lastReductionConfig + 3;
+            const auto pass = [&](int64_t time, int64_t column) {
+                vxm(time,column,"pass","previous",0,0.f,"immediate",0,0.f,"fp32",-1,1,4);
+            };
+            vxm(sumFeedback,0,"multiply","feedback",0,0.f,"immediate",0,
+                1.f / static_cast<float>(hidden),"fp32",-1,1,4);
+            vxm(sumFeedback,1,"add","previous",0,0.f,"immediate",0,
+                static_cast<float>(epsilon),"fp32",-1,1,4,false,false,true,true);
+            pass(sumFeedback,2);
+            pass(sumFeedback,3);
+            for (auto [index, exponent] : llvm::enumerate(lookupExponents)) {
+                const int64_t issue = factorInput + index * bandInterval;
+                const int firstExponent = std::min(exponent, 126);
+                const float scale = std::ldexp(1.f, firstExponent);
+                const float minimum = std::max(std::ldexp(1.f, -14 - exponent),
+                                               std::numeric_limits<float>::denorm_min());
+                // f_s(y) = sqrt(s) * rsqrt(s * max(y, 2^-14/s)).
+                // Below its band f_s is a lower bound, above it the FP16
+                // ingress returns +inf and RSQRT returns zero.
+                vxm(issue,0,"pass","immediate",0,minimum,"immediate",0,minimum,"fp32",-1,1,4);
+                vxm(issue,1,"max","previous",0,0.f,"accumulator",0,0.f,"fp32",-1,1,4);
+                vxm(issue,2,"multiply","previous",0,0.f,"immediate",0,scale,"fp32",-1,1,4);
+                int64_t lookup = issue;
+                if (exponent > firstExponent) {
+                    // Represent the final scale as two finite FP32 powers
+                    // when epsilon itself is in the binary32 subnormal range.
+                    vxm(issue,3,"multiply","previous",0,0.f,"immediate",0,
+                        std::ldexp(1.f, exponent - firstExponent),"fp32",-1,1,4);
+                    lookup = issue + 1;
+                    vxm(lookup,0,"pass","feedback",0,0.f,"immediate",0,0.f,"fp32",-1,1,4);
+                    pass(lookup,1);
+                    pass(lookup,2);
+                }
+                vxm(lookup,3,"rsqrt","previous",0,0.f,"immediate",0,0.f,"fp32",-1,1,4);
+                // One control word per queue per clock. Enqueue the next
+                // selector immediately; it waits for the five-cycle LUT.
+                const int64_t feedback = lookup + 1;
+                vxm(feedback,0,"multiply","feedback",0,0.f,"immediate",0,
+                    std::ldexp(1.f, exponent / 2),"fp32",-1,1,4);
+                pass(feedback,1);
+                pass(feedback,2);
+                vxm(feedback,3,"max","previous",0,0.f,"accumulator",0,0.f,
+                    "fp32",-1,1,4,index == 0,true,false);
+            }
+        } else if (l2Norm) {
             // L2 uses sum+epsilon rather than mean+epsilon. Keep the
             // lookup result in C3/C11; normalize compensates lookupScale
             // and applies the requested output scale as an FP32 immediate.
@@ -1264,8 +1352,9 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                 "previous", 0, 0.0f, "immediate", 0, 0.0f,
                 "fp32", -1, 1, 4, false, false, true, true);
         }
-        emitMirroredPairRead(scalarSlices, 0, scalarAddress, 0,
-            factorInput, bank(inputPlacement));
+        if (!rangeSafeFactor)
+            emitMirroredPairRead(scalarSlices, 0, scalarAddress, 0,
+                factorInput, bank(inputPlacement));
 
         const int64_t normalizeConfig = normalizeInput - 1;
         if (normalizedStreamStart) *normalizedStreamStart = normalizeInput + (l2Norm ? 5 : 6);

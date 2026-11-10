@@ -5,6 +5,8 @@ mlir::LogicalResult emitUnitLowerSolve(mlir::IRRewriter& r,kernel::VectorAluOp o
     r.setInsertionPoint(op);const auto loc=op.getLoc();
     const bool blocked=op.getKind()=="unit_lower_solve_blocked";
     const bool solve=op.getKind()!="head_scale";
+    const auto overlapFeedback=op->getAttrOfType<mlir::BoolAttr>("solve.projection_overlap");
+    const int64_t feedbackStream=overlapFeedback && overlapFeedback.getValue()?12:28;
     const int64_t heads=solve?op.getLhs().getType().getDimSize(0)/32:op.getRhs().getType().getDimSize(1);
     const int64_t dim=op.getResult().getType().getDimSize(1),blocks=dim/32,half=heads/2,rows=half*32;
     auto get=[&](llvm::StringRef n){return op->getAttrOfType<mlir::DictionaryAttr>(n);};
@@ -302,8 +304,8 @@ mlir::LogicalResult emitUnitLowerSolve(mlir::IRRewriter& r,kernel::VectorAluOp o
                     for(int side=0;side<2;++side)for(int b=0;b<4;++b) {
                         const auto delay=id(out,b)/4+id(feedback,b)/4+2;
                         // Keep this return off SXM's concurrent W24/E24 pair.
-                        mem(out,b,1-side,copy,"read",pair*32+i,60+b,blocks,rows);
-                        mem(feedback,b,side,copy+delay,"write",n,28+b,blocks,32);
+                        mem(out,b,1-side,copy,"read",pair*32+i,32+feedbackStream+b,blocks,rows);
+                        mem(feedback,b,side,copy+delay,"write",n,feedbackStream+b,blocks,32);
                         end=std::max(end,copy+delay+blocks);
                         cursor=std::max(cursor,copy+delay+blocks+id(feedback,b)/4+target.throughput().tile_rows-1);
                     }

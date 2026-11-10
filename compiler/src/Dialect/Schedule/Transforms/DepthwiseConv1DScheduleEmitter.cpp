@@ -165,9 +165,13 @@ mlir::LogicalResult lowerFixedChain(mlir::IRRewriter& rewriter,
             if(isWest(source)==isWest(window) ||
                 source.getAs<mlir::StringAttr>("hemisphere").getValue()=="both") continue;
             for(int64_t byte=0;byte<2;++byte) {
-                const int64_t latency=sliceAt(source,byte)/4+sliceAt(window,byte)/4+2;
-                mem(source,byte,cursor+copied,false,word.getAs<mlir::IntegerAttr>("row").getInt(),52+byte);
-                mem(window,byte,cursor+copied+latency,true,i,20+byte);
+                // History and projected words may originate at different
+                // distances. Align at the hemisphere crossing, otherwise
+                // consecutive launches can collide on the same SR/sink.
+                const auto crossing=cursor+(target.memory().slices_per_hemisphere-1)/4+copied;
+                mem(source,byte,crossing-sliceAt(source,byte)/4,false,
+                    word.getAs<mlir::IntegerAttr>("row").getInt(),52+byte);
+                mem(window,byte,crossing+sliceAt(window,byte)/4+2,true,i,20+byte);
             }
             ++copied;
         }

@@ -20,6 +20,38 @@ namespace {
 
 using PhysicalRow = std::tuple<std::uint16_t, std::uint16_t, std::uint32_t>;
 
+void validate_binding_pieces(const BinaryBinding& binding)
+{
+    std::uint64_t bytes = 0;
+    for (const auto& piece : binding.pieces) {
+        if (!piece.pieces.empty() || piece.bank != binding.bank ||
+            piece.element_type != binding.element_type || piece.paged_weight ||
+            piece.byte_size == 0 || piece.byte_size > binding.byte_size - bytes)
+            throw std::invalid_argument("invalid native output binding pieces");
+        bytes += piece.byte_size;
+    }
+    if (binding.access != BindingAccess::Output || bytes != binding.byte_size)
+        throw std::invalid_argument("binding pieces must cover the complete output");
+}
+
+template<class Visit>
+void visit_hemisphere_pair_bytes(const BinaryBinding& binding, std::size_t rows,
+    std::size_t columns, std::size_t width, Visit visit)
+{
+    if (binding.slices.size() != 2 || binding.hemisphere_mask != 3
+        || (binding.element_type != BindingElementType::BF16
+            && binding.element_type != BindingElementType::F16))
+        throw std::invalid_argument("invalid hemisphere-pair planar binding");
+    for (std::size_t r = 0; r < rows; ++r)
+        for (std::size_t c = 0; c < columns; ++c) {
+            const auto block = c / width;
+            const auto address = binding.base_row + (block / 2 * rows + r) * binding.address_stride;
+            for (std::size_t byte = 0; byte < 2; ++byte)
+                visit((r * columns + c) * 2 + byte, block % 2,
+                    binding.slices[byte], address, c % width);
+        }
+}
+
 class ImageWriter {
 public:
     explicit ImageWriter(const ExecutableHardwareConfig& hardware)
@@ -192,6 +224,29 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
     std::span<const std::uint8_t> data,
     const ExecutableHardwareConfig& hardware)
 {
+    if (!binding.pieces.empty()) {
+        validate_binding_pieces(binding);
+        if (data.size() != binding.byte_size)
+            throw std::invalid_argument("output piece data size mismatch");
+        PackedWeightImage result;
+        std::size_t offset = 0;
+        for (const auto& piece : binding.pieces) {
+            auto part = pack_binding_image(piece, data.subspan(offset, piece.byte_size), hardware);
+            for (auto segment : part.segments) {
+                // Ambiguous physical aliases cannot describe independent pieces.
+                for (const auto& prior : result.segments)
+                    if (prior.hemisphere == segment.hemisphere && prior.slice == segment.slice &&
+                        std::uint64_t(prior.base_row) < std::uint64_t(segment.base_row) + segment.vector_count &&
+                        std::uint64_t(segment.base_row) < std::uint64_t(prior.base_row) + prior.vector_count)
+                        throw std::invalid_argument("overlapping native output pieces");
+                segment.byte_offset += result.data.size();
+                result.segments.push_back(segment);
+            }
+            result.data.insert(result.data.end(), part.data.begin(), part.data.end());
+            offset += piece.byte_size;
+        }
+        return result;
+    }
     if(binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16) {
         auto physical=binding;
         physical.layout=BindingLayout::Fp16MxmBlock4PartitionDistributed16;
@@ -233,6 +288,13 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
     const std::size_t columns = binding.shape.size() == 1
         ? checked_dimension(binding, 0) : checked_dimension(binding, 1);
     const std::uint32_t base = static_cast<std::uint32_t>(binding.base_row);
+    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar) {
+        visit_hemisphere_pair_bytes(binding, rows, columns, hardware.bytes_per_word,
+            [&](auto offset, auto hemi, auto slice, auto row, auto lane) {
+                image.write(hemi, slice, row, lane, data[offset]);
+            });
+        return image.finish();
+    }
     const std::uint32_t stride =
         static_cast<std::uint32_t>(binding.address_stride);
 
@@ -828,6 +890,16 @@ std::vector<std::uint8_t> unpack_binding_image(
     const BinaryBinding& binding, const PackedWeightImage& image,
     const ExecutableHardwareConfig& hardware)
 {
+    if (!binding.pieces.empty()) {
+        validate_binding_pieces(binding);
+        std::vector<std::uint8_t> result;
+        result.reserve(binding.byte_size);
+        for (const auto& piece : binding.pieces) {
+            auto data = unpack_binding_image(piece, image, hardware);
+            result.insert(result.end(), data.begin(), data.end());
+        }
+        return result;
+    }
     if(binding.layout == BindingLayout::Fp16MxmBankStripedBlock4PartitionDistributed16) {
         auto physical=binding;physical.layout=BindingLayout::Fp16MxmBlock4PartitionDistributed16;
         return unpack_binding_image(physical,image,hardware);
@@ -865,6 +937,14 @@ std::vector<std::uint8_t> unpack_binding_image(
 
     const std::size_t rows = checked_dimension(binding, 0);
     const std::size_t columns = checked_dimension(binding, 1);
+    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar) {
+        std::vector<std::uint8_t> result(binding.byte_size);
+        visit_hemisphere_pair_bytes(binding, rows, columns, hardware.bytes_per_word,
+            [&](auto offset, auto hemi, auto slice, auto row, auto lane) {
+                result[offset] = read(hemi, slice, row, lane);
+            });
+        return result;
+    }
     if (binding.layout == BindingLayout::Fp16PairPlanar
         && (binding.element_type == BindingElementType::F16
             || binding.element_type == BindingElementType::BF16)

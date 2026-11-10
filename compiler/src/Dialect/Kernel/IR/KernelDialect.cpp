@@ -43,6 +43,90 @@ LogicalResult MatmulOp::verify()
     return success();
 }
 
+LogicalResult BlockFp8QuantizeOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto values = getValues().getType();
+    const auto scales = getScales().getType();
+    if (!input.hasStaticShape() || input.getRank() != 2 || input.getDimSize(0) <= 0
+        || input.getDimSize(1) <= 0 || input.getDimSize(1) % 32 != 0
+        || !input.getElementType().isBF16())
+        return emitOpError("requires a positive static BF16 input [M,K] with K divisible by 32");
+    if (values.getShape() != input.getShape()
+        || !llvm::isa<Float8E4M3FNType>(values.getElementType()))
+        return emitOpError("requires E4M3FN values matching the input shape");
+    if (scales.getRank() != 2 || scales.getDimSize(0) != input.getDimSize(0)
+        || scales.getDimSize(1) != input.getDimSize(1) / 32
+        || !llvm::isa<Float8E8M0FNUType>(scales.getElementType()))
+        return emitOpError("requires UE8M0 activation scales [M,K/32]");
+    return success();
+}
+
+LogicalResult BlockFp8MatmulOp::verify()
+{
+    const auto lhs = getLhs().getType();
+    const auto weights = getWeights().getType();
+    if (!lhs.hasStaticShape() || lhs.getRank() != 2 || !weights.hasStaticShape()
+        || weights.getRank() != 2 || !llvm::isa<Float8E4M3FNType>(lhs.getElementType())
+        || !llvm::isa<Float8E4M3FNType>(weights.getElementType()))
+        return emitOpError("requires static E4M3FN operands X[M,K] and W[N,K]");
+    const auto m = lhs.getDimSize(0), n = weights.getDimSize(0), k = lhs.getDimSize(1);
+    if (m <= 0 || n <= 0 || k <= 0 || k % 32 || n % 32 || weights.getDimSize(1) != k)
+        return emitOpError("requires matching K, positive dimensions and N/K divisible by 32");
+    const auto validScales = [&](RankedTensorType type, int64_t rows) {
+        return type.getRank() == 2 && type.getDimSize(0) == rows && type.getDimSize(1) == k / 32
+            && llvm::isa<Float8E8M0FNUType>(type.getElementType());
+    };
+    if (!validScales(getLhsScales().getType(), m) || !validScales(getWeightScales().getType(), n / 32))
+        return emitOpError("requires UE8M0 scales [M,K/32] and [N/32,K/32]");
+    const auto result = getResult().getType();
+    if (result.getRank() != 2 || result.getDimSize(0) != m || result.getDimSize(1) != n
+        || !result.getElementType().isBF16())
+        return emitOpError("requires a BF16 result [M,N]");
+    return success();
+}
+
+LogicalResult BlockFp8ProjectionOp::verify()
+{
+    const auto x = getInput().getType(), w = getWeights().getType();
+    const auto s = getWeightScales().getType(), y = getResult().getType();
+    if (!x.hasStaticShape() || !w.hasStaticShape() || !s.hasStaticShape() || !y.hasStaticShape()
+        || x.getRank() != 2 || w.getRank() != 2 || s.getRank() != 2 || y.getRank() != 2)
+        return emitOpError("requires four static rank-2 tensors");
+    if (!x.getElementType().isBF16() || !y.getElementType().isBF16()
+        || !isa<Float8E4M3FNType>(w.getElementType()) || !isa<Float8E8M0FNUType>(s.getElementType()))
+        return emitOpError("requires BF16 activation/output, E4M3FN weights and UE8M0 scales");
+    const auto m = x.getDimSize(0), k = x.getDimSize(1), n = w.getDimSize(0);
+    if (m <= 0 || m % 32 || k <= 0 || k % 32 || n <= 0 || n % 64
+        || w.getDimSize(1) != k || s.getDimSize(0) != n / 32 || s.getDimSize(1) != k / 32
+        || y.getDimSize(0) != m || y.getDimSize(1) != n)
+        return emitOpError("requires M/K aligned to 32, N aligned to 64 and matching scale/output shapes");
+    return success();
+}
+
+LogicalResult BlockFp8ScaleOp::verify()
+{
+    const auto input = getInput().getType();
+    const auto result = getResult().getType();
+    if (!input.hasStaticShape() || input.getRank() != 2 || input.getDimSize(0) <= 0 ||
+        input.getDimSize(1) != 32 || !input.getElementType().isBF16())
+        return emitOpError("requires a static BF16 input [groups,32] with groups > 0");
+    if (result.getRank() != 2 || result.getDimSize(0) != input.getDimSize(0) ||
+        result.getDimSize(1) != 1 || !result.getElementType().isF32())
+        return emitOpError("requires an FP32 scale result [groups,1]");
+    return success();
+}
+
+LogicalResult BlockFp8QdqOp::verify()
+{
+    const auto input = getInput().getType();
+    if (!input.hasStaticShape() || input.getRank() != 2 || input.getDimSize(0) <= 0 ||
+        input.getDimSize(1) != 32 || !input.getElementType().isBF16() ||
+        input != getResult().getType())
+        return emitOpError("requires matching static BF16 tensors [groups,32] with groups > 0");
+    return success();
+}
+
 LogicalResult BiasAddOp::verify()
 {
     const auto input = getInput().getType();
@@ -168,6 +252,27 @@ LogicalResult BatchMatmulOp::verify()
     return success();
 }
 
+LogicalResult FlashAttentionOp::verify()
+{
+    const auto q=getQuery().getType(), k=getKey().getType(), v=getValue().getType();
+    const auto o=getResult().getType();
+    for(auto t : {q,k,v,o})
+        if(!t.hasStaticShape() || t.getRank()!=4 || !t.getElementType().isBF16()
+            || llvm::any_of(t.getShape(), [](int64_t d){return d<=0;}))
+            return emitOpError("requires positive static BF16 [batch,tokens,heads,width] tensors");
+    if(q.getDimSize(0)!=k.getDimSize(0) || k.getDimSize(0)!=v.getDimSize(0)
+        || k.getDimSize(1)!=v.getDimSize(1) || k.getDimSize(2)!=v.getDimSize(2)
+        || q.getDimSize(2)%k.getDimSize(2) || q.getDimSize(3)!=k.getDimSize(3)
+        || q.getDimSize(3)%32 || v.getDimSize(3)%32
+        || o.getDimSize(0)!=q.getDimSize(0) || o.getDimSize(1)!=q.getDimSize(1)
+        || o.getDimSize(2)!=q.getDimSize(2) || o.getDimSize(3)!=v.getDimSize(3))
+        return emitOpError("requires compatible GQA shapes and 32-aligned QK/value widths");
+    if(getQueryPosition()<0 || !std::isfinite(getScale().convertToFloat())
+        || getScale().convertToFloat()<=0.f)
+        return emitOpError("requires nonnegative query position and finite positive scale");
+    return success();
+}
+
 LogicalResult SoftmaxOp::verify()
 {
     const auto input = getInput().getType();
@@ -271,9 +376,12 @@ LogicalResult VectorAluOp::verify()
     if(auto reduction=(*this)->getAttrOfType<StringAttr>("reduction_kind")) {
         if(!getReduce() || (reduction.getValue()!="add" && reduction.getValue()!="max"))
             return emitOpError("reduction_kind requires reduce=true and add or max");
-        if(reduction.getValue()=="max" && (!getUseImmediate() || getKind()!="max"
-            || getImmediate().convertToFloat()!=0.f))
-            return emitOpError("max reduction requires explicit zero clamp");
+        const auto seed=(*this)->getAttrOfType<BoolAttr>("reduction_seed_first");
+        const bool first=seed && seed.getValue();
+        if(reduction.getValue()=="max" && (!getUseImmediate() ||
+            (first ? (getKind()!="multiply" || getImmediate().convertToFloat()!=1.f)
+                   : (getKind()!="max" || getImmediate().convertToFloat()!=0.f))))
+            return emitOpError("max reduction requires explicit zero clamp or multiply-by-one with reduction_seed_first");
     }
     const auto lhs = getLhs().getType();
     const auto rhs = getRhs().getType();
@@ -300,6 +408,11 @@ LogicalResult VectorAluOp::verify()
     }
     if (getKind()=="head_scale" || (getKind()=="unit_lower_solve" || getKind()=="unit_lower_solve_blocked") || getKind()=="unit_lower_inverse" || getKind()=="head_matmul") {
         const bool solve=getKind()!="head_scale";
+        const auto precision=(*this)->getAttrOfType<StringAttr>("mxm_precision");
+        const bool singleBf16=getKind()=="head_matmul" && precision && precision.getValue()=="bf16";
+        const auto matrixInput=[&](Type t) {
+            return t.isF32() || (singleBf16 && t.isBF16());
+        };
         if(!lhs.hasStaticShape() || !rhs.hasStaticShape() || !result.hasStaticShape() ||
            lhs.getRank()!=2 || rhs.getRank()!=2 || result.getRank()!=2 ||
            getUseImmediate() || getReduce() || !result.getElementType().isF32())
@@ -308,12 +421,12 @@ LogicalResult VectorAluOp::verify()
         const int64_t dim=solve?rhs.getDimSize(1):lhs.getDimSize(1)/std::max<int64_t>(1,heads);
         if(heads<=0 || heads>32 || heads%2 || dim<=0 || dim%32 ||
            result.getDimSize(0)!=heads*32 || result.getDimSize(1)!=dim ||
-           !rhs.getElementType().isF32() ||
-           (solve ? (!lhs.getElementType().isF32() || lhs.getDimSize(0)!=heads*32 || lhs.getDimSize(1)!=32 || rhs!=result)
+           !matrixInput(rhs.getElementType()) ||
+           (solve ? (!matrixInput(lhs.getElementType()) || lhs.getDimSize(0)!=heads*32 || lhs.getDimSize(1)!=32 || rhs.getShape()!=result.getShape())
                   : (!lhs.getElementType().isBF16() || lhs.getDimSize(0)!=32 || rhs.getDimSize(0)!=32 || lhs.getDimSize(1)!=heads*dim)))
-            return emitOpError("head_scale needs BF16 V[32,H*D], FP32 beta[32,H]; solve needs FP32 L[H*32,32], B[H*32,D]; even H<=32, D multiple of 32");
+            return emitOpError("head_scale needs BF16 V[32,H*D], FP32 beta[32,H]; solve needs FP32 L[H*32,32], B[H*32,D]; head_matmul with mxm_precision=bf16 also accepts BF16 inputs; even H<=32, D multiple of 32");
         if(getKind()=="unit_lower_inverse" && dim!=32) return emitOpError("inverse requires 32x32 identity RHS per head");
-        if(auto precision=(*this)->getAttrOfType<StringAttr>("mxm_precision"))
+        if(precision)
             if(getKind()!="head_matmul" || (precision.getValue()!="bf16" && precision.getValue()!="fp32-components"))
                 return emitOpError("mxm_precision requires head_matmul and bf16 or fp32-components");
         return success();
@@ -377,6 +490,17 @@ LogicalResult VectorAluOp::verify()
             return emitOpError("causal_exp_difference requires [T,H] BF16/FP32 input (same-shaped RHS when row_scale=true) and [T*T,H] FP32 output; transpose_result requires T=32 and BF16 [T*H,T] output, 1<=T,H<=32");
         return success();
     }
+    const auto axis=(*this)->getAttrOfType<IntegerAttr>("reduction_axis");
+    if ((*this)->hasAttr("reduction_axis") && (!axis || !getReduce() || (axis.getInt()!=0 && axis.getInt()!=1)))
+        return emitOpError("reduction_axis must be 0 or 1 on a reduction");
+    const bool temporal=axis && axis.getInt()==0;
+    if (temporal) {
+        const auto kind=(*this)->getAttrOfType<StringAttr>("reduction_kind");
+        const auto seed=(*this)->getAttrOfType<BoolAttr>("reduction_seed_first");
+        if (!kind || !getUseImmediate() || getKind()!="multiply" || getImmediate().convertToFloat()!=1.f ||
+            (kind.getValue()=="max" && !(seed && seed.getValue())) || !result.getElementType().isF32())
+            return emitOpError("axis 0 requires a unary FP32 sum or first-seeded maximum");
+    }
     if (!lhs.hasStaticShape() || !rhs.hasStaticShape() || !result.hasStaticShape()
         || lhs.getRank() != 2 || lhs.getDimSize(0) <= 0 || lhs.getDimSize(1) <= 0
         || rhs.getRank() != 2 || result.getRank() != 2
@@ -384,9 +508,9 @@ LogicalResult VectorAluOp::verify()
         || (rhs.getDimSize(1) != 1 && rhs.getDimSize(1) != lhs.getDimSize(1))
         || !floating(lhs.getElementType()) || !floating(rhs.getElementType())
         || !floating(result.getElementType())
-        || result.getDimSize(0) != lhs.getDimSize(0)
-        || result.getDimSize(1) != (getReduce() ? 1 : lhs.getDimSize(1)))
-        return emitOpError("requires static rank-2 floating operands, broadcast-compatible RHS and a map or row-reduction result");
+        || result.getDimSize(0) != (temporal ? 1 : lhs.getDimSize(0))
+        || result.getDimSize(1) != (getReduce() && !temporal ? 1 : lhs.getDimSize(1)))
+        return emitOpError("requires static rank-2 floating operands, broadcast-compatible RHS and a map or reduction result");
     if (getKind() != "add" && getKind() != "subtract"
         && getKind() != "multiply" && getKind() != "max"
         && getKind() != "negate" && getKind() != "cast"

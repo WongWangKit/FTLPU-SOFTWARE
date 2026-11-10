@@ -166,7 +166,8 @@ std::pair<std::string, std::string> describe_mxm(std::size_t queue,
                << " mode="
                << (instruction.weight_input_mode
                            == MxmWeightInputMode::Int8DequantBf16
-                       ? "int8_dequant_bf16" : "direct16");
+                       ? "int8_dequant_bf16" : instruction.weight_input_mode == MxmWeightInputMode::Fp8DequantBf16
+                       ? "fp8_dequant_bf16" : "direct16");
     } else if (instruction.opcode == MxmControlOpcode::Compute) {
         detail << "Compute dataflow=ws buffer=" << instruction.weight_buffer
                << " format=" << mxm_data_format_name(instruction.data_format)

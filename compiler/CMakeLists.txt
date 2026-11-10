@@ -215,6 +215,12 @@ set_property(SOURCE ${FTLPU_ATTENTION_EMITTER_CONSUMER_SOURCES}
 set_property(SOURCE src/Dialect/Schedule/IR/ScheduleDialect.cpp
     APPEND PROPERTY OBJECT_DEPENDS
         "${CMAKE_CURRENT_BINARY_DIR}/ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.cpp.inc")
+set_property(SOURCE src/Dialect/Kernel/Transforms/LogicalKernelGraphToSchedule.cpp
+    APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/BlockFp8ProjectionLowering.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/BlockFp8ActivationLowering.hpp")
+set_property(SOURCE src/Dialect/Kernel/Transforms/LogicalKernelGraphToSchedule.cpp
+    APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/FlashAttentionLowering.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/ProjectionSolveOverlap.inc")
 set_property(SOURCE src/Dialect/Schedule/Transforms/VectorAluScheduleEmitter.cpp
     APPEND PROPERTY OBJECT_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/SiluMultiplyEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/ScaledMatvecEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/UnitLowerSolveEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/UnitLowerMxmEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/WeightedGramEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/HeadWeightedProductEmitter.hpp")
@@ -1167,6 +1173,13 @@ if(Python3_Interpreter_FOUND)
             --heads 4 --dim 128 --produced-rhs
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/unit_lower_solve_produced_rhs)
         set_tests_properties(unit_lower_solve_produced_rhs_runtime_test PROPERTIES TIMEOUT 300)
+        add_test(NAME projection_solve_overlap_runtime_test
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/projection_solve_overlap_test.py
+            --build-dir ${CMAKE_BINARY_DIR}
+            --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/projection_solve_overlap)
+        set_tests_properties(projection_solve_overlap_runtime_test PROPERTIES TIMEOUT 300)
         add_test(NAME packed_scalar_broadcast_runtime_test
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/packed_scalar_broadcast_runtime_test.py
@@ -1174,7 +1187,15 @@ if(Python3_Interpreter_FOUND)
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/packed_scalar_broadcast)
         set_tests_properties(packed_scalar_broadcast_runtime_test PROPERTIES TIMEOUT 300)
-        foreach(decode_test activation_batch_matmul_test glm4_decode_core_test)
+        foreach(decode_test
+            activation_batch_matmul_test
+            activation_state_matmul_test
+            distributed_state_matmul_test
+            linear_projection_multitile_runtime_test
+            projection_page_activation_reuse_test
+            projection_conv_overlap_test
+            projection_vector_overlap_test
+            glm4_decode_core_test)
           add_test(NAME ${decode_test}
             COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/${decode_test}.py
@@ -1182,6 +1203,14 @@ if(Python3_Interpreter_FOUND)
               --target-config ${FTLPU_HARDWARE_CONFIG}
               --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/${decode_test})
           set_tests_properties(${decode_test} PROPERTIES TIMEOUT 1200)
+        endforeach()
+        foreach(flash_case negative gqa causal query_tiles causal_offset single_tile)
+          add_test(NAME flash_attention_${flash_case}_test
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/flash_attention_test.py
+              --build-dir ${CMAKE_BINARY_DIR} --target-config ${FTLPU_HARDWARE_CONFIG}
+              --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/flash_attention_${flash_case}
+              --case ${flash_case})
+          set_tests_properties(flash_attention_${flash_case}_test PROPERTIES TIMEOUT 1200)
         endforeach()
         foreach(native_vector_test packed_vector_graph_runtime_test vxm_queue_group_runtime_test vector_memory_plan_runtime_test)
           add_test(NAME ${native_vector_test}

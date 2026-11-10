@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <optional>
 #include <memory>
 #include <span>
@@ -254,6 +255,7 @@ private:
     // the existing bank issue port. Overlap leases keep that port and the
     // selected SR routes disjoint from computation from E through C/HOLD.
     bool common_barrier_protocol_{false};
+    std::function<void(std::size_t, std::size_t)> common_drain_validator_{};
     std::shared_ptr<CommonOverlapCalendar> overlap_calendar_{};
     std::vector<BinaryBarrierEvent> common_events_{};
     std::vector<CommonPageLoadRange> common_page_ranges_{};

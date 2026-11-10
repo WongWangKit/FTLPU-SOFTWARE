@@ -13,7 +13,7 @@
 
 namespace ftlpu::software::runtime {
 
-inline constexpr std::uint32_t kBinaryFormatVersion = 40;
+inline constexpr std::uint32_t kBinaryFormatVersion = 41;
 inline constexpr std::uint32_t kBinaryCommonBarrierMaxCompletionInstances = 65535;
 
 enum class BindingAccess : std::uint16_t {
@@ -151,6 +151,9 @@ struct BinaryBinding {
     // Row offsets are relative to the binding-level base_row.
     std::vector<std::uint32_t> page_base_rows{};
     std::vector<std::uint32_t> page_row_counts{};
+    // Ordered, complete logical pieces of a native output. Pieces use the
+    // parent's bank and element type and cannot themselves have pieces.
+    std::vector<BinaryBinding> pieces{};
 };
 
 struct BinaryWeightPagePlacement {
