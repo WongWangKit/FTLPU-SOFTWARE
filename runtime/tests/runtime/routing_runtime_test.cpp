@@ -3,6 +3,7 @@
 #include "ftlpu/software/runtime/performance.hpp"
 #include "ftlpu/software/runtime/routing_program.hpp"
 #include "ftlpu/software/runtime/schedule_trace.hpp"
+#include "ftlpu/software/runtime/vxm_topk_program.hpp"
 #include "ftlpu/system/c2c_dma_system.hpp"
 #include <fstream>
 #include <iostream>
@@ -841,12 +842,311 @@ static void weight_group(int group) {
             << " loads=4 vectors=6 hits=1 cycles=" << system->cycle() << '\n';
 }
 
+static void vxm_topk_submission(bool timed, bool pack_on_device = false) {
+  constexpr std::size_t E = 17, K = 5;
+  const std::size_t T = pack_on_device ? 9 : 35;
+  constexpr std::size_t pitch = RouteVxmSelectSchedule::workspace_blocks(E);
+  RouteSelectDescriptor select;
+  select.tokens = T;
+  select.experts = E;
+  select.k = K;
+  select.choice_scores = view(RoutingElement::F32, T, E, 0, 400, 1);
+  select.raw_scores = view(RoutingElement::F32, T, E, 4, 400, 1);
+  select.eligibility = view(RoutingElement::U32, T, E, 8, 400, 1);
+  select.selected_ids = view(RoutingElement::U32, T, K, 12, 400, 1);
+  select.selected_scores = view(RoutingElement::F32, T, K, 16, 400, 1);
+  RouteVxmSelectSchedule schedule;
+  schedule.first_bundle_cycle = 600;
+  schedule.bundle_interval = 4;
+  schedule.raw_offset = 2 * pitch;
+  schedule.eligibility_offset = 4 * pitch;
+  for (std::size_t stream = 0; stream < schedule.streams; ++stream)
+    schedule.score_planes[stream] = {pack_on_device ? 1u : 0u,
+                                     static_cast<std::uint32_t>(stream), 0, 900};
+
+  RouteAddressDescriptor block;
+  block.max_rows = 4;
+  block.source = view(RoutingElement::BF16, T, 32, 40, 300, 0);
+  block.destination = view(RoutingElement::BF16, 4, 32, 42, 400, 0);
+  rt::BinaryProgram program;
+  rt::RoutingProgramBuilder builder(program);
+  if (pack_on_device) schedule = builder.pack_vxm_scores(select, schedule, 10);
+  builder.select_vxm(select, schedule, 1);
+  builder.completion_event(77, {1});
+  builder.wait_for(rt::QueueKind::Routing, 0, 77);
+  builder.plan({}, 2);
+  builder.address(block, 3);
+  if (pack_on_device) {
+    for (const auto& queue : program.queues) {
+      std::set<std::size_t> issues;
+      for (const auto& command : queue.commands) {
+        if (!rt::is_macro_schedule_command(command)) continue;
+        const auto op = rt::decode_macro_schedule_command(command);
+        for (std::size_t j = 0; j < op.inner_count; ++j)
+          if (!issues.insert(op.start_cycle + j * op.inner_interval).second)
+            throw std::logic_error("packing MEM overlap queue=" + std::to_string(queue.index)
+                                   + " cycle=" + std::to_string(op.start_cycle + j * op.inner_interval));
+      }
+    }
+  }
+  std::stringstream image(std::ios::in | std::ios::out | std::ios::binary);
+  rt::write_binary_program(program, image);
+  image.seekg(0);
+  const auto loaded = rt::read_binary_program(image);
+  check(loaded.hardware.routing_isa_version == 6, "VXM SELECT capability roundtrip");
+
+  SystemHardwareConfiguration hardware;
+  hardware.routing.enabled = true;
+  auto system = std::make_unique<C2cDmaSystem>(
+      Ddr4Config{}, hw::config::kDmaFifoDepthVectors, hardware);
+  rt::CModelRuntime runtime(*system);
+  auto& chip = system->chip();
+  std::vector<std::uint32_t> ids, raw, active, counts(E);
+  const auto write_workspace = [&](std::size_t t, std::size_t e,
+                                   std::size_t offset, std::uint32_t bits) {
+    for (std::size_t byte = 0; byte < 4; ++byte) {
+      const auto& p = schedule.score_planes[4 * (e % 8) + byte];
+      chip.mem_array(static_cast<Hemisphere>(p.hemisphere)).set_sram_byte(
+          p.slice, p.bank, p.base_row + (t / 32) * pitch + e / 8 + offset,
+          t % 32, static_cast<std::uint8_t>(bits >> (8 * byte)));
+    }
+  };
+  for (std::size_t t = 0; t < T; ++t) {
+    std::vector<std::pair<float, std::uint32_t>> candidates;
+    for (std::size_t e = 0; e < E; ++e) {
+      const bool eligible = (e + t) % 5 != 1;
+      const float score = e == 16 ? std::numeric_limits<float>::infinity()
+          : float(int((e * 3 + t * 7) % 9) - 4);
+      const float original = float(t * E + e + 1) / 1024;
+      const auto bits = std::bit_cast<std::uint32_t>(original);
+      put(chip, select.raw_scores, t, e, bits);
+      if (pack_on_device) {
+        put(chip, select.choice_scores, t, e, std::bit_cast<std::uint32_t>(score));
+        put(chip, select.eligibility, t, e, eligible ? 0x80000000u : 0u);
+      } else {
+        write_workspace(t, e, 0, std::bit_cast<std::uint32_t>(score));
+        write_workspace(t, e, schedule.raw_offset, bits);
+        write_workspace(t, e, schedule.eligibility_offset, eligible ? 0x80000000u : 0u);
+      }
+      if (eligible) candidates.emplace_back(score, static_cast<std::uint32_t>(e));
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+      return a.first > b.first || (a.first == b.first && a.second < b.second);
+    });
+    for (std::size_t r = 0; r < K; ++r) {
+      const auto e = candidates[r].second;
+      ids.push_back(e);
+      raw.push_back(std::bit_cast<std::uint32_t>(float(t * E + e + 1) / 1024));
+      if (!counts[e]++) active.push_back(e);
+    }
+    for (std::size_t c = 0; c < 32; ++c)
+      put(chip, block.source, t, c, static_cast<std::uint32_t>(t * 32 + c + 1));
+  }
+
+  if (timed) {
+    runtime.load_timed(loaded);
+  } else {
+    runtime.load(loaded);
+  }
+  try {
+    check(runtime.run_until_complete(40000), "VXM Top-K program did not drain");
+  } catch (...) {
+    if (pack_on_device) std::cerr << "pack cycle=" << chip.cycle() << '\n';
+    throw;
+  }
+  const auto& rcu = chip.routing();
+  check(rcu.selected_experts() == ids && rcu.selected_score_bits() == raw,
+        "VXM selected IDs or raw score bits differ");
+  check(rcu.counts() == counts && rcu.active_experts() == active,
+        "VXM selection changed the RCU plan order");
+  for (std::size_t t = 0; t < T; ++t)
+    for (std::size_t r = 0; r < K; ++r) {
+      check(get(chip, select.selected_ids, t, r) == ids[t * K + r], "VXM selected ID export");
+      check(get(chip, select.selected_scores, t, r) == raw[t * K + r], "VXM selected score export");
+    }
+  const auto expert = active.front();
+  const auto rows = std::min<std::uint32_t>(4, counts[expert]);
+  std::vector<std::size_t> expected_tokens;
+  for (std::size_t i = 0; i < ids.size(); ++i)
+    if (ids[i] == expert) expected_tokens.push_back(i / K);
+  check(rcu.block_info().valid_rows == rows, "VXM route block shape");
+  for (std::size_t r = 0; r < rows; ++r)
+    for (std::size_t c = 0; c < 32; ++c)
+      check(get(chip, block.destination, r, c) == expected_tokens[r] * 32 + c + 1,
+            "VXM Top-K Gather payload");
+  const auto& stats = chip.vxm_unit().topk().statistics();
+  check(stats.batches == (T + 31) / 32 && stats.submitted_words == 2 * T * K &&
+        chip.icu().queue_completion_ready(77), "VXM selection commit accounting");
+  std::cout << "VXM Top-K timed=" << timed << " device_pack=" << pack_on_device
+            << " cycles=" << chip.cycle()
+            << " score_bundles=" << stats.score_bundles
+            << " submit_words=" << stats.submitted_words << '\n';
+}
+
+static void standalone_vxm_topk(bool timed, bool import = false) {
+  constexpr std::uint32_t columns = 17, k = 5;
+  const std::uint32_t rows = import ? 9 : 35;
+  const VxmTopKInstruction instruction{
+      rows, columns, k, static_cast<std::uint16_t>(import ? 0xffff : 0xff00), timed};
+  constexpr auto blocks = (columns + VxmRouteTopK::chains - 1) / VxmRouteTopK::chains;
+  rt::VxmTopKWorkspace workspace;
+  for (std::size_t i = 0; i < workspace.input.size(); ++i)
+    workspace.input[i] = {import || i >= 16 ? 1u : 0u, static_cast<std::uint32_t>(i), 0, 90};
+  workspace.input_batch_stride = import ? RouteVxmSelectSchedule::workspace_blocks(columns) : blocks;
+  workspace.mask_offset = instruction.has_mask ? (import ? workspace.input_batch_stride : 2 * blocks) : 0;
+  const auto indices = view(RoutingElement::U32, k, rows, 32, 200, 1);
+  const auto values = view(RoutingElement::F32, k, rows, 36, 200, 1);
+  workspace.indices = indices.planes;
+  workspace.values = values.planes;
+
+  rt::BinaryProgram program;
+  const auto choice = view(RoutingElement::F32, rows, columns, 0, 400, 1);
+  const auto mask = view(RoutingElement::U32, rows, columns, 4, 400, 1);
+  std::optional<rt::RoutingProgramBuilder> routing;
+  auto first_bundle = std::uint32_t{64};
+  if (import) {
+    routing.emplace(program);
+    RouteSelectDescriptor scores;
+    scores.tokens = rows;
+    scores.experts = columns;
+    scores.k = k;
+    scores.choice_scores = choice;
+    scores.eligibility = mask;
+    RouteVxmSelectSchedule schedule;
+    schedule.score_planes = workspace.input;
+    schedule.eligibility_offset = workspace.mask_offset;
+    first_bundle = routing->pack_vxm_scores(scores, schedule, 10).first_bundle_cycle;
+  }
+  const auto outputs_ready = rt::append_vxm_topk(program, instruction, workspace, first_bundle, 2);
+  rejects([&] { rt::append_vxm_topk(program, instruction, workspace, first_bundle, 2); });
+  const auto raw = view(RoutingElement::F32, rows, columns, 36, 300);
+  const auto activations = view(RoutingElement::BF16, rows, 32, 40, 300);
+  const auto gathered = view(RoutingElement::BF16, 4, 32, 42, 300);
+  if (import) {
+    RouteSelectDescriptor input;
+    input.tokens = rows;
+    input.experts = columns;
+    input.k = k;
+    input.selected_ids = indices;
+    input.selected_scores = values;
+    input.raw_scores = raw;
+    routing->import_topk(input, outputs_ready, 1);
+    routing->plan({}, 2);
+    routing->address({1, 0, 0, 4, activations, gathered}, 3);
+  }
+  auto corrupt = rt::encode_vxm_topk_command(instruction);
+  corrupt.words[2] = 1;
+  rejects([&] { (void)rt::decode_vxm_topk_command(corrupt); });
+  std::stringstream image(std::ios::in | std::ios::out | std::ios::binary);
+  rt::write_binary_program(program, image);
+  image.seekg(0);
+  const auto loaded = rt::read_binary_program(image);
+  check(loaded.hardware.routing_isa_version == (import ? 7u : 0u) &&
+        loaded.routing_descriptors.size() == (import ? 3u : 0u),
+        "VXM TOPK and Routing import capability");
+  const auto vxm_queue = std::ranges::find_if(loaded.queues, [](const auto& queue) {
+    return queue.kind == rt::QueueKind::Vxm;
+  });
+  check(vxm_queue != loaded.queues.end() &&
+        rt::decode_vxm_topk_command(vxm_queue->commands.back()) == instruction,
+        "standalone VXM TOPK codec roundtrip");
+  const auto images = rt::prepare_program_images(loaded, 0);
+  const auto vxm_image = std::ranges::find_if(images, [](const auto& entry) {
+    return entry.descriptor.kind == IcuMacroQueueKind::Vxm;
+  });
+  check(vxm_image != images.end() && vxm_image->descriptor.word_count() == 2,
+        "VXM TOPK must occupy one physical i-MEM word");
+
+  SystemHardwareConfiguration hardware;
+  hardware.routing.enabled = import;
+  auto system = std::make_unique<C2cDmaSystem>(
+      Ddr4Config{}, hw::config::kDmaFifoDepthVectors, hardware);
+  rt::CModelRuntime runtime(*system);
+  auto& chip = system->chip();
+  using Candidate = std::pair<float, std::uint32_t>;
+  std::vector<std::vector<Candidate>> expected(rows);
+  const auto write = [&](std::size_t row, std::size_t col, std::size_t offset, std::uint32_t bits) {
+    for (std::size_t byte = 0; byte < 4; ++byte) {
+      const auto& plane = workspace.input[4 * (col % VxmRouteTopK::chains) + byte];
+      chip.mem_array(static_cast<Hemisphere>(plane.hemisphere)).set_sram_byte(
+          plane.slice, plane.bank, plane.base_row + offset + row / VxmRouteTopK::lanes * blocks
+            + col / VxmRouteTopK::chains, row % VxmRouteTopK::lanes,
+          static_cast<std::uint8_t>(bits >> (8 * byte)));
+    }
+  };
+  for (std::size_t row = 0; row < rows; ++row) {
+    for (std::uint32_t col = 0; col < columns; ++col) {
+      const auto eligible = !instruction.has_mask || (row + col) % 4 != 1;
+      const auto value = col == 16 ? std::numeric_limits<float>::infinity()
+          : float(int((row + 3 * col) % 7) - 3);
+      if (import) {
+        put(chip, choice, row, col, std::bit_cast<std::uint32_t>(value));
+        put(chip, mask, row, col, eligible ? 1 : 0);
+        put(chip, raw, row, col, std::bit_cast<std::uint32_t>(float(row * columns + col) / 1024));
+      } else {
+        write(row, col, 0, std::bit_cast<std::uint32_t>(value));
+        if (instruction.has_mask) write(row, col, workspace.mask_offset, eligible ? 1 : 0);
+      }
+      if (eligible) expected[row].emplace_back(value, col);
+    }
+    std::ranges::sort(expected[row], [](const Candidate& a, const Candidate& b) {
+      return a.first > b.first || (a.first == b.first && a.second < b.second);
+    });
+    if (import)
+      for (std::size_t feature = 0; feature < 32; ++feature)
+        put(chip, activations, row, feature, static_cast<std::uint32_t>(1 + row * 32 + feature));
+  }
+  if (timed) runtime.load_timed(loaded);
+  else runtime.load(loaded);
+  check(runtime.run_until_complete(40000), "standalone VXM TOPK did not drain");
+  for (std::size_t row = 0; row < rows; ++row)
+    for (std::size_t rank = 0; rank < k; ++rank) {
+      const auto& [value, col] = expected[row][rank];
+      check(get(chip, indices, rank, row) == col, "standalone VXM TOPK index output");
+      check(get(chip, values, rank, row) == std::bit_cast<std::uint32_t>(value),
+            "standalone VXM TOPK value output");
+    }
+  const auto& stats = chip.vxm_unit().topk().statistics();
+  const auto batches = (rows + VxmRouteTopK::lanes - 1) / VxmRouteTopK::lanes;
+  check(stats.batches == batches && stats.output_tiles == batches * k * hw::kTileRows &&
+        stats.submitted_words == 0, "standalone VXM TOPK output accounting");
+  if (import) {
+    const auto& rcu = chip.routing();
+    const auto first = expected.front().front().second;
+    std::vector<std::size_t> expert_rows;
+    for (std::size_t row = 0; row < rows; ++row)
+      for (std::size_t rank = 0; rank < k; ++rank) {
+        const auto col = expected[row][rank].second;
+        check(rcu.selected_experts()[row * k + rank] == col, "RCU imported index");
+        check(rcu.selected_score_bits()[row * k + rank] ==
+            std::bit_cast<std::uint32_t>(float(row * columns + col) / 1024),
+            "RCU imported original score");
+        if (col == first) expert_rows.push_back(row);
+      }
+    const auto gathered_rows = std::min<std::size_t>(4, expert_rows.size());
+    check(rcu.block_info().expert_id == first && rcu.block_info().valid_rows == gathered_rows,
+          "imported TOPK expert block");
+    for (std::size_t row = 0; row < gathered_rows; ++row)
+      for (std::size_t feature = 0; feature < 32; ++feature)
+        check(get(chip, gathered, row, feature) == 1 + expert_rows[row] * 32 + feature,
+              "imported TOPK Gather payload");
+  }
+  std::cout << "standalone VXM TOPK timed=" << timed << " import=" << import
+            << " cycles=" << chip.cycle() << '\n';
+}
+
 #include "expert_macro_cases.hpp"
 int main() {
   try {
     scenario(false);
     scenario(true);
     vxm_producer();
+    vxm_topk_submission(false);
+    vxm_topk_submission(true);
+    vxm_topk_submission(false, true);
+    standalone_vxm_topk(false);
+    standalone_vxm_topk(true);
+    standalone_vxm_topk(true, true);
     reference_and_invalid();
     native_sync();
     dispatch_group(0); // traversal, stable handshake, delayed consumer

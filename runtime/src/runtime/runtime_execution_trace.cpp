@@ -375,6 +375,14 @@ void RuntimeExecutionTrace::sample(TspSliceSystem& system,
                     break;
                 const auto* packet = last_issued(queue);
                 if (packet == nullptr) break;
+                if (is_vxm_topk(*packet)) {
+                    const auto instruction = decode_vxm_topk(*packet);
+                    std::ostringstream detail;
+                    detail << "rows=" << instruction.rows << " columns=" << instruction.columns
+                           << " k=" << instruction.k << " mask=" << instruction.has_mask;
+                    record("VXM.TOPK", with_issue_pc(detail.str(), queue));
+                    break;
+                }
                 const auto decoded =
                     isa::decode_vxm_instruction(ref.index, *packet);
                 std::ostringstream detail;

@@ -226,6 +226,13 @@ EventDescription describe(const QueueProgram& queue, const QueueCommand& command
             || address_delta != 0)
             throw std::logic_error(
                 "runtime trace cannot induct a VXM instruction");
+        if (is_vxm_topk_command(command)) {
+            const auto instruction = decode_vxm_topk_command(command);
+            std::ostringstream detail;
+            detail << "rows=" << instruction.rows << " columns=" << instruction.columns
+                   << " k=" << instruction.k << " mask=" << instruction.has_mask;
+            return {"VXM.TOPK", detail.str()};
+        }
         const auto decoded = isa::decode_vxm_instruction(queue.index,
             isa::EncodedVxmInstruction {
                 static_cast<std::uint64_t>(command.words[0])

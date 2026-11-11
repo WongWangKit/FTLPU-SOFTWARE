@@ -54,6 +54,29 @@ struct QueueCommand {
     std::vector<std::uint32_t> extension_words{};
 };
 
+inline QueueCommand encode_vxm_topk_command(const VxmTopKInstruction& instruction)
+{
+    const auto packet = encode_vxm_topk(instruction);
+    return {0, InstructionKind::Vxm, 3,
+        {std::uint32_t(packet.control), std::uint32_t(packet.control >> 32), packet.immediate_bits}};
+}
+
+inline bool is_vxm_topk_command(const QueueCommand& command)
+{
+    return command.command == 0 && command.instruction_kind == InstructionKind::Vxm
+        && is_vxm_topk({command.words[0], 0});
+}
+
+inline VxmTopKInstruction decode_vxm_topk_command(const QueueCommand& command)
+{
+    if (!is_vxm_topk_command(command) || command.word_count != 3 ||
+        !command.extension_words.empty() || command.words[3])
+        throw std::invalid_argument("invalid VXM TOPK binary command");
+    return decode_vxm_topk({
+        std::uint64_t(command.words[0]) | (std::uint64_t(command.words[1]) << 32),
+        command.words[2]});
+}
+
 // Word-aligned physical i-MEM bytes retained by the binary reader for an
 // all-Macro queue. software_valid_bit_length is file/container metadata: it
 // includes word 0 and the meaningful payload bits, but excludes final word

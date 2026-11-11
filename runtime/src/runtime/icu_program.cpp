@@ -2129,6 +2129,10 @@ std::size_t load_queue_programs_into_icu(
                             command.words[0])));
                 break;
             case QueueKind::Vxm:
+                if (is_vxm_topk_command(command)) {
+                    icu.enqueue_vxm(queue_index, encode_vxm_topk(decode_vxm_topk_command(command)));
+                    break;
+                }
                 if (command.instruction_kind != InstructionKind::Vxm ||
                     command.word_count != 3) {
                     throw std::logic_error("VXM queue command must carry one "

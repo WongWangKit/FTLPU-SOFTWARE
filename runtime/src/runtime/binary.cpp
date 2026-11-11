@@ -1507,7 +1507,7 @@ void write_queue_link_source(std::ostream& os,const BinaryProgram& program)
 template<class Reader> void read_routing_section(Reader& reader,BinaryProgram& program) {
     program.hardware.routing_isa_version=read_value<std::uint32_t>(reader);
     const auto n=read_value<std::uint32_t>(reader);
-    if(program.hardware.routing_isa_version>5 || n>4096)throw std::runtime_error("unsupported Routing section");
+    if(program.hardware.routing_isa_version>RoutingConfig::isa_version || n>4096)throw std::runtime_error("unsupported Routing section");
     std::vector<std::uint32_t> words;for(std::uint32_t j=0;j<n;++j)words.push_back(read_value<std::uint32_t>(reader));
     program.routing_descriptors=decode_routing_descriptors(words);
     validate_routing_descriptor_references(program.routing_descriptors,program.hardware.routing_isa_version);
@@ -1884,7 +1884,7 @@ void validate_routing_program(const BinaryProgram& program, bool commands)
     if(std::ranges::any_of(program.routing_descriptors,[](const auto& d){return d.opcode==RoutingOpcode::WeightTable;}))
         for(const auto& q:program.queues)if(q.kind==QueueKind::C2cDma || q.kind==QueueKind::C2cRx || q.kind==QueueKind::C2cTx)
             throw std::runtime_error("indirect expert loading reserves ordinary C2C queues");
-    if(program.hardware.routing_isa_version>5 || (!program.routing_descriptors.empty() && !program.hardware.routing_isa_version))
+    if(program.hardware.routing_isa_version>RoutingConfig::isa_version || (!program.routing_descriptors.empty() && !program.hardware.routing_isa_version))
         throw std::runtime_error("unsupported Routing capability");
     (void)encode_routing_descriptors(program.routing_descriptors);
     for(const auto& d:program.routing_descriptors)RoutingControlUnit::validate_descriptor(d,program.hardware.sram_depth_rows);
@@ -1920,6 +1920,14 @@ void validate_routing_program(const BinaryProgram& program, bool commands)
 void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
 {
     validate_routing_program(program,bindings);
+    for (const auto& queue : program.queues)
+        for (const auto& command : queue.commands) {
+            if (!is_vxm_topk_command(command)) continue;
+            if (queue.kind != QueueKind::Vxm || queue.index != VxmTopKInstruction::queue ||
+                program.hardware.vxm_alus != ftlpu::hw::kVxmAluCount)
+                throw std::invalid_argument("VXM TOPK requires queue 0 and the full VXM lane");
+            (void)decode_vxm_topk_command(command);
+        }
     const auto& plan=program.queue_sync_plan;
     const auto& hw=program.hardware;
     if (!program.queue_control_protocol) {

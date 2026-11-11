@@ -103,7 +103,12 @@ struct Fixture {
   Matrix router{};
   std::array<std::array<Matrix, 3>, E> weights{};
   std::vector<ExpertWeightSegment> segments;
-  Fixture() {
+  explicit Fixture(const std::filesystem::path &checkpoint_tiles = {}) {
+    if (!checkpoint_tiles.empty()) {
+      load_checkpoint_tiles(checkpoint_tiles);
+      build(true);
+      return;
+    }
     for (unsigned t = 0; t < T; ++t)
       for (unsigned c = 0; c < H; ++c)
         x[t * H + c] = bf(float(int((t * 11 + c * 5) % 23) - 11) / 32);
@@ -127,16 +132,49 @@ struct Fixture {
                 (r == c ? diagonal : 0.f) +
                 float(int((r * 3 + c * 5 + e + projection) % 7) - 3) / 128.f);
           }
-    build();
+    build(false);
   }
-  void build() {
+  void load_checkpoint_tiles(const std::filesystem::path &path) {
+    std::ifstream source(path, std::ios::binary);
+    if (!source)
+      throw std::runtime_error("cannot open checkpoint tiles");
+    const auto read = [&] {
+      std::array<unsigned char, 2> bytes{};
+      source.read(reinterpret_cast<char *>(bytes.data()), bytes.size());
+      if (!source)
+        throw std::runtime_error("truncated checkpoint tile payload");
+      return Bf16::from_bits(std::uint16_t(bytes[0] | (std::uint16_t(bytes[1]) << 8))).to_float();
+    };
+    for (auto &value : x) value = read();
+    for (unsigned expert = 0; expert < E; ++expert)
+      for (unsigned hidden = 0; hidden < H; ++hidden)
+        router[hidden * H + expert] = read();
+    for (auto &expert : weights)
+      for (auto &projection : expert)
+        for (unsigned output = 0; output < H; ++output)
+          for (unsigned input = 0; input < H; ++input)
+            projection[input * H + output] = read();
+    if (source.peek() != std::char_traits<char>::eof())
+      throw std::runtime_error("extra data in checkpoint tile payload");
+  }
+  void build(bool use_vxm_topk) {
+    if (use_vxm_topk) build_router();
     rt::RoutingProgramBuilder builder(program);
     RouteSelectDescriptor select;
     select.tokens = T;
     select.experts = E;
     select.k = K;
     select.choice_scores = scores;
-    builder.select(select, 1);
+    if (use_vxm_topk) {
+      RouteVxmSelectSchedule schedule;
+      schedule.bundle_interval = 4;
+      for (unsigned stream = 0; stream < schedule.streams; ++stream)
+        schedule.score_planes[stream] = {1, 16 + stream, 1, 800};
+      schedule = builder.pack_vxm_scores(select, schedule, 200);
+      builder.select_vxm(select, schedule, 1);
+    } else {
+      builder.select(select, 1);
+    }
     builder.plan({}, 2);
     RouteAddressDescriptor address;
     address.max_rows = BLOCK;
@@ -378,8 +416,21 @@ struct Fixture {
     builder.completion_event(77, {4});
     builder.wait_for(rt::QueueKind::Mem,
                      static_cast<std::uint16_t>(memq(1, 30, 0)), 77);
+    if (!use_vxm_topk) {
+      build_router();
+      for (auto &q : program.queues)
+        if (q.kind == rt::QueueKind::Routing)
+          q.commands.insert(q.commands.begin(), {isa::encode_icu_nop(200)});
+    }
+    program.max_cycle = std::max<std::size_t>(program.max_cycle, 600);
+  }
+  void build_router() {
     // A separate physical West MXM computes router logits once, before SELECT.
     // Its queues are not owned by the dynamically restarted expert template.
+    const auto layout = make_configured_stream_layout();
+    const auto latency = [&](unsigned slice, std::size_t endpoint) {
+      return unsigned(endpoint - layout.mem_ports.output_column(slice, StreamDirection::East) + 1);
+    };
     const auto global = [&](rt::QueueKind kind, unsigned index,
                             auto instruction, IcuMacroSchedule schedule) {
       auto q = std::find_if(
@@ -394,7 +445,7 @@ struct Fixture {
     };
     for (unsigned s = 0; s < 16; ++s) {
       IcuMacroSchedule schedule;
-      schedule.start_cycle = 30 - weight_latency(s);
+      schedule.start_cycle = 30 - latency(s, layout.mxm_weight_input.column);
       schedule.inner_count = 4;
       schedule.inner_stride = 1;
       schedule.induction_target = IcuInductionTarget::MemAddress;
@@ -412,7 +463,7 @@ struct Fixture {
     for (unsigned p = 0; p < 2; ++p)
       global(rt::QueueKind::Mem, memq(1, 50 + p, 0),
              MemInstruction::Read(300, StreamId::East(p)),
-             rows(50 - input_latency(50 + p), T, 1,
+             rows(50 - latency(50 + p, layout.mxm_activation_input.column), T, 1,
                   IcuInductionTarget::MemAddress));
     global(rt::QueueKind::MxmCompute, west_mxm,
            MxmControlInstruction::Compute(0, 0, 0, 0, 1,
@@ -433,12 +484,6 @@ struct Fixture {
              MemInstruction::Write(500, StreamId::West(p)),
              rows(arrival, T, 1, IcuInductionTarget::MemAddress));
     }
-    for (auto &q : program.queues)
-      if (q.kind == rt::QueueKind::Routing)
-        q.commands.insert(
-            q.commands.begin(),
-            {isa::encode_icu_nop(200), rt::InstructionKind::None, 0, {}});
-    program.max_cycle = 600;
   }
   void initialize(C2cDmaSystem &system) {
     auto &chip = system.chip();
@@ -588,8 +633,14 @@ void observed_trace(rt::CModelRuntime &runtime, TspSliceSystem &chip,
 } // namespace
 int main(int argc, char **argv) try {
   const std::filesystem::path out = argc > 1 ? argv[1] : "moe_ffn_demo_output";
+  const std::filesystem::path checkpoint_tiles = argc > 2 ? argv[2] : "";
+  const std::string_view mode = argc > 3 ? argv[3] : "serial";
+  const bool double_buffered = mode == "double-buffered";
+  const bool overlap = mode == "overlap" || double_buffered;
+  if (argc > 4 || (!overlap && mode != "serial"))
+    throw std::invalid_argument("usage: moe_ffn_demo [output [checkpoint_tiles [serial|overlap|double-buffered]]]");
   std::filesystem::create_directories(out);
-  Fixture fixture;
+  Fixture fixture(checkpoint_tiles);
   const auto golden = reference(fixture);
   rt::write_binary_program(fixture.program, out / "program.ftlpu");
   auto program = rt::read_binary_program(out / "program.ftlpu");
@@ -604,6 +655,8 @@ int main(int argc, char **argv) try {
   runtime.enable_mem_execution_trace();
   runtime.stream_mem_execution_trace_csv(out / "runtime.mem.csv");
   runtime.load_timed(program);
+  chip.expert_tasks().set_input_weight_overlap(overlap);
+  chip.expert_weights().set_double_buffered(double_buffered);
   // Initial, fixed mux configuration: the 8-stage SwiGLU tail feeds the
   // East hidden buffer; the 2-stage final projection still writes West.
   chip.configure_vxm_output_block_destination(3, Hemisphere::East);
@@ -633,7 +686,7 @@ int main(int argc, char **argv) try {
         "MoE device pipeline timeout");
   std::ofstream tasks(out / "expert_tasks.csv"),
       operations(out / "rcu_operations.csv");
-  tasks << "task,expert,rows,row_offset,assignment_base,start,end\n";
+  tasks << "task,expert,rows,row_offset,assignment_base,start,end,weight_buffer\n";
   operations << "opcode,start,end\n";
   const auto &load_stats = runtime.program_load_statistics();
   if (load_stats.request_accepted && load_stats.program_start)
@@ -659,7 +712,7 @@ int main(int argc, char **argv) try {
     tasks << task.task.identity.task_id << ',' << task.task.expert_id << ','
           << task.task.valid_rows << ',' << task.task.row_offset << ','
           << task.task.assignment_base << ',' << task.start_cycle << ','
-          << task.finish_cycle + 1 << '\n';
+          << task.finish_cycle + 1 << ',' << task.weight_buffer << '\n';
   for (const auto &task : chip.expert_macros().trace())
     runtime.record_execution_trace_interval(
         task.start_cycle, task.finish_cycle + 1,
@@ -717,9 +770,20 @@ int main(int argc, char **argv) try {
     }
   }
   const auto rel = std::sqrt(square / std::max(scale, 1e-30));
-  summary << "{\n  \"case\": \"constructed linear-router Top2 SwiGLU MoE\",\n  "
+  const auto weight_stats = chip.expert_weights().statistics();
+  summary << "{\n  \"case\": \""
+          << (checkpoint_tiles.empty() ? "constructed linear-router Top2 SwiGLU MoE"
+                                       : "Qwen3-30B-A3B layer 0 BF16 weight tiles")
+          << "\",\n  \"input_weight_overlap\": " << (overlap ? "true" : "false")
+          << ",\n  \"weight_buffers\": " << (double_buffered ? 2 : 1)
+          << ",\n  \"prefetches\": " << weight_stats.prefetches
+          << ",\n  \"prefetch_hits\": " << weight_stats.prefetch_hits
+          << ",\n  \"dma_segments\": " << weight_stats.dma_segments
+          << ",\n  \"committed_weight_vectors\": " << weight_stats.committed_vectors
+          << ",\n  \"topk_unit\": \"" << (checkpoint_tiles.empty() ? "RCU" : "VXM")
+          << "\",\n  "
              "\"tokens\": 5, \"experts\": 4, \"top_k\": 2, \"hidden\": 32, "
-             "\"intermediate\": 32,\n  \"router_weights\": \"selected positive "
+             "\"intermediate\": 32,\n  \"router_weights\": \"selected "
              "FP32 logits; no softmax or renormalization\",\n  "
              "\"expert_dtype\": \"BF16 storage; existing VXM FP32 basic ALUs "
              "and FP16 LUT special functions\",\n  \"physical_cycles\": "

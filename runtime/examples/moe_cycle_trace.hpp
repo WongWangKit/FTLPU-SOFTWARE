@@ -35,6 +35,10 @@ public:
     auto &chip = system.chip();
     auto &icu = chip.icu();
     context_.clear();
+    const auto &task = chip.expert_tasks().task();
+    if (!chip.expert_tasks().idle() && task.identity.task_id)
+      context_ = {{"task", s(task.identity.task_id)}, {"expert", s(task.expert_id)},
+                  {"valid_rows", s(task.valid_rows)}};
     if (const auto &pending = chip.routing_descriptor_pending(); pending)
       write("RCU", "RCU.Descriptor", "fetch",
             routing_opcode_name(pending->opcode), "",
@@ -84,6 +88,18 @@ public:
              {"feature", s(combine.feature)},
              {"assignment", s(combine.assignment)},
              {"weight_bits", s(combine.weight_bits)}});
+    const auto &topk = chip.vxm_unit().topk().statistics();
+    const auto record_topk = [&](const char *stage, std::size_t count, std::size_t previous) {
+      const auto delta = count >= previous ? count - previous : count;
+      if (delta)
+        write("VXM", "VXM.TOPK", stage, "TOPK", "",
+              "observed change in VXM Top-K work counter", {{"count", s(delta)}});
+    };
+    record_topk("scan", topk.score_bundles, previous_topk_.score_bundles);
+    record_topk("merge", topk.merge_steps, previous_topk_.merge_steps);
+    record_topk("submit", topk.submitted_words, previous_topk_.submitted_words);
+    record_topk("output", topk.output_tiles, previous_topk_.output_tiles);
+    previous_topk_ = topk;
     // Slice control rows advance after execution. Row 1 is the actual compact
     // command accepted at tile 0 in this cycle, including commands from the
     // RCU command-port mux that never pass through a native ICU iMEM queue.
@@ -115,7 +131,8 @@ public:
                 : q.index;
         switch (q.kind) {
         case rt::QueueKind::Mem:
-          issue_mem(icu.mem_iq(index), index);
+          issue_mem(icu.mem_iq(index),
+                    index ^ static_cast<std::size_t>(icu.mem_iq(index).task_uses_alternate_weight_bank()));
           break;
         case rt::QueueKind::MxmLoad:
           issue_mxm(icu.mxm_load_iq(index), index, "Load");
@@ -127,6 +144,13 @@ public:
           const auto &queue = icu.vxm_iq(index);
           if (issued(queue)) {
             const auto &packet = *queue.last_dispatched();
+            if (is_vxm_topk(packet)) {
+              const auto topk = decode_vxm_topk(packet);
+              write("VXM", "VXM.TOPK", "issue", "TOPK", pc(queue),
+                    "standalone VXM iMEM command",
+                    {{"rows", s(topk.rows)}, {"columns", s(topk.columns)}, {"k", s(topk.k)}});
+              break;
+            }
             const auto d = VxmCompactInstructionCodec::decode(index, packet);
             write("VXM", "VXM.C" + s(index), "issue",
                   VxmLane::operation_name(d.instruction.operation), pc(queue),
@@ -173,16 +197,20 @@ public:
       for (const auto &tr : mem.executed_transfers()) {
         const bool write_sram =
             tr.kind == MemArrayModel::MemTransfer::Kind::StoreStreamToSram;
+        Payload payload{{"tile", s(tr.tile)},
+                        {"row", s(tr.address)},
+                        {"stream", stream(tr.stream)},
+                        {"sr_column", s(tr.sr_column)},
+                        {"vector_tag", hex(tr.vector_tag)},
+                        {"bytes", bytes(tr.bytes)}};
+        if (write_sram && tr.stream == StreamId::West(30) &&
+            chip.expert_weights().matches(side, ExpertWeightLoader::sync_tag))
+          add_weight_context(payload, chip.expert_weights());
         write("MEM",
               "MEM." + prefix + ".S" + s(tr.mem_slice) + ".B" + s(tr.bank),
               write_sram ? "write_commit" : "read_commit",
               write_sram ? "WRITE" : "READ", "", "actual SRAM transfer",
-              {{"tile", s(tr.tile)},
-               {"row", s(tr.address)},
-               {"stream", stream(tr.stream)},
-               {"sr_column", s(tr.sr_column)},
-               {"vector_tag", hex(tr.vector_tag)},
-               {"bytes", bytes(tr.bytes)}});
+              std::move(payload));
       }
       if (const auto &tr = mem.last_control_transfer(); tr)
         write("MEM", "MEM." + prefix + ".S" + s(tr->slice) + ".B" + s(tr->bank),
@@ -192,7 +220,7 @@ public:
               {{"tile", s(tr->tile)},
                {"row", s(tr->row)},
                {"bytes", bytes(tr->bytes)}});
-      dma(system.dma(static_cast<Hemisphere>(side)), "DMA." + prefix, side);
+      dma(system.dma(static_cast<Hemisphere>(side)), "DMA." + prefix, side, &chip.expert_weights());
     }
     dma(system.program_loader().dma_trace_source(), "DMA.ProgramLoader", 2);
     for (unsigned index = 0; index < hw::kMxmCount; ++index) {
@@ -384,18 +412,20 @@ private:
               s(index % hw::kMxmsPerHemisphere) + "." + type,
           stage, opcode, pc, "actual decoded MXM instruction", std::move(p));
   }
+  static void add_weight_context(Payload &payload, const ftlpu::ExpertWeightLoader &weights) {
+    payload["task"] = s(weights.loading_task().identity.task_id);
+    payload["expert"] = s(weights.loading_task().expert_id);
+    payload["weight_buffer"] = s(weights.loading_slot());
+    payload["prefetch"] = weights.loading_is_prefetch() ? "true" : "false";
+    payload["valid_rows"] = weights.loading_is_prefetch() ? "" : s(weights.loading_task().valid_rows);
+  }
   void dma(const ftlpu::C2cDmaEngine &engine, const std::string &resource,
-           unsigned index) {
+           unsigned index, const ftlpu::ExpertWeightLoader *weights = nullptr) {
     if (dma_sequence_[index] == engine.cycle())
       return;
     dma_sequence_[index] = engine.cycle();
-    for (const auto &tr : engine.last_cycle_trace())
-      write("DMA", resource, tr.stage,
-            tr.instruction.direction == ftlpu::C2cDmaDirection::Ddr4ToC2c
-                ? "DDR_TO_C2C"
-                : "C2C_TO_DDR",
-            "", "actual DMA instruction / request / completion",
-            {{"ddr_address", hex(tr.address)},
+    for (const auto &tr : engine.last_cycle_trace()) {
+      Payload payload{{"ddr_address", hex(tr.address)},
              {"base", hex(tr.instruction.ddr4_address)},
              {"vector_count", s(tr.instruction.vector_count)},
              {"vector_index", s(tr.vector_index)},
@@ -405,7 +435,14 @@ private:
              {"fifo", s(tr.fifo)},
              {"stream", s(tr.instruction.stream_index)},
              {"tag", hex(tr.tag)},
-             {"sync_tag", s(tr.instruction.sync_tag)}});
+             {"sync_tag", s(tr.instruction.sync_tag)}};
+      if (weights && tr.instruction.sync_tag == ftlpu::ExpertWeightLoader::sync_tag)
+        add_weight_context(payload, *weights);
+      write("DMA", resource, tr.stage,
+            tr.instruction.direction == ftlpu::C2cDmaDirection::Ddr4ToC2c
+                ? "DDR_TO_C2C" : "C2C_TO_DDR",
+            "", "actual DMA instruction / request / completion", std::move(payload));
+    }
     for (unsigned stream = 0; stream < ftlpu::hw::kC2cStreamsPerDirection;
          ++stream) {
       const auto inbound = engine.receive_queue_size(stream),
@@ -440,5 +477,6 @@ private:
   Payload context_;
   std::uint64_t cycle_{}, rcu_sequence_{};
   std::array<std::uint64_t, 3> dma_sequence_{};
+  ftlpu::VxmRouteTopK::Statistics previous_topk_{};
   std::size_t imem_words_{};
 };

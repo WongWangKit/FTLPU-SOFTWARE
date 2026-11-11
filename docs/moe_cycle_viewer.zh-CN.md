@@ -80,3 +80,28 @@ python tools/render_moe_cycles.py <输出目录>
 当前案例为 29481 周期、79698 条记录；40 次 Top-K 比较、10 项选中结果、
 80 条专家权重 DMA、784 个权重返回向量。开启采样前后周期不变，160 个 BF16
 输出与 BF16/LUT 参考逐位一致。`cycle_trace_checks.json` 保存该次运行的检查数据。
+
+## Qwen 权重切片的双缓冲对照
+
+用同一份 Qwen3-30B-A3B 第 0 层官方 BF16 权重切片运行三种调度。测试为 5 个 token、4 个专家、Top-2，隐藏维度和中间维度均为 32。回并使用选中的 logits。三次运行均执行 MXM 打分、VXM Top-K、RCU PLAN、Gather、权重 DMA、专家 FFN 和回并。
+
+```powershell
+$run = 'out/qwen-moe-overlap'
+python tools/extract_qwen_moe_tiles.py $run
+cmake --build build-program-load --config Release --target moe_ffn_demo
+foreach ($mode in 'serial', 'overlap', 'double-buffered') {
+    & build-program-load/runtime/Release/moe_ffn_demo.exe "$run/$mode" "$run/qwen_tiles.bf16" $mode
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+}
+python tools/render_qwen_moe_overlap.py $run
+```
+
+`pipeline_compare.html` 展示三组实测流水，各模式目录内的 `pipeline.html` 支持缩放。`comparison.json` 记录实际 DMA 命令在途区间与另一专家 FFN 的交集，以及逐周期 DDR、SRAM 和 FFN 活动。权重提取记录仓库固定 revision、字节范围和切片 SHA-256。
+
+| 调度 | 程序启动后周期 | 总周期 | 跨专家 DMA 和 FFN 重叠周期 |
+| --- | ---: | ---: | ---: |
+| 串行 | 24,324 | 31,374 | 0 |
+| 同块 Gather 和 DMA | 24,140 | 31,190 | 0 |
+| 双缓冲 | 20,868 | 27,918 | 427 |
+
+双缓冲把下一专家写入备用 bank，并按任务选择 FFN 的读取 bank。三次运行的程序镜像、路由结果和 160 个 BF16 输出逐位一致，各搬运 784 个权重向量。

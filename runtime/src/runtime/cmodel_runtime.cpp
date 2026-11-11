@@ -541,13 +541,18 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
     CModelRuntime prepared(system_);
     prepared.configure_common_transport(program);
 
-    if(program.hardware.routing_isa_version>5 || ((!program.routing_descriptors.empty() || std::ranges::any_of(program.queues,[](const auto& q){return q.kind==QueueKind::Routing;})) && !program.hardware.routing_isa_version))throw std::invalid_argument("Routing program capability mismatch");
+    if(program.hardware.routing_isa_version>RoutingConfig::isa_version || ((!program.routing_descriptors.empty() || std::ranges::any_of(program.queues,[](const auto& q){return q.kind==QueueKind::Routing;})) && !program.hardware.routing_isa_version))throw std::invalid_argument("Routing program capability mismatch");
     validate_routing_descriptor_references(program.routing_descriptors,program.hardware.routing_isa_version);
     validate_expert_template_program(program);
     if(std::ranges::any_of(program.routing_descriptors,[](const auto& d){return d.opcode==RoutingOpcode::WeightTable;}))
         for(const auto& q:program.queues)if(q.kind==QueueKind::C2cDma || q.kind==QueueKind::C2cRx || q.kind==QueueKind::C2cTx)
             throw std::invalid_argument("indirect expert loading reserves ordinary C2C queues");
     if(program.hardware.routing_isa_version && !system_.hardware_configuration().routing.enabled)throw std::invalid_argument("Routing is disabled in this device configuration");
+    if (!system_.hardware_configuration().routing.vxm_topk_enabled &&
+        std::ranges::any_of(program.routing_descriptors, [](const auto& descriptor) {
+            return descriptor.opcode == RoutingOpcode::SelectVxm;
+        }))
+        throw std::invalid_argument("VXM Top-K is disabled in this device configuration");
     for(const auto& d:program.routing_descriptors)RoutingControlUnit::validate_descriptor(d,program.hardware.sram_depth_rows);
     SystemHardwareConfiguration hardware;
     hardware.routing=system_.hardware_configuration().routing;
