@@ -20,7 +20,7 @@ from import_hf_decoder_layer import (bf16, decoder_config, decoder_layer_decode_
 from qwen3_5_logical_graph import LogicalGraph
 from tensor_geometry import Value
 from activation_batch_matmul_test import batch_matmul, compile_graph, run
-from attention_graph import flash_attention
+from attention_graph import dense_attention, flash_attention
 from qwen3_5_decode_gdn_batched_test import concatenate_traces
 
 
@@ -117,7 +117,11 @@ def _decode_flash(graph, query, key, value, past):
     return [context.reshape(batch, heads * dim), key.reshape(cache_shape), value.reshape(cache_shape)]
 
 
-def attention(q, k, v, past_key, past_value, config, *, diagnostics=False, strategy='baseline'):
+def attention(q, k, v, past_key, past_value, config, *, diagnostics=False, strategy='dense'):
+    if strategy not in ('dense', 'baseline', 'generic', 'flash'):
+        raise ValueError(f'unknown attention strategy {strategy}')
+    if diagnostics and strategy != 'generic':
+        raise ValueError('intermediate softmax diagnostics require strategy=generic')
     graph = LogicalGraph()
     batch, past, kv, dim = past_key.shape
     heads = int(config['num_attention_heads'])
@@ -133,6 +137,12 @@ def attention(q, k, v, past_key, past_value, config, *, diagnostics=False, strat
     if strategy=='flash':
         return graph, _decode_flash(graph, query.reshape(batch, 1, heads, dim),
                                     key[:, :past+1], value[:, :past+1], past)
+    if strategy in ('dense', 'baseline'):
+        context = dense_attention(graph, 'decode_dense_attention', query.reshape(batch, 1, heads, dim),
+                                  key[:, :past+1], value[:, :past+1], causal=True, query_position=past)
+        return graph, [context.reshape(batch, heads*dim),
+                       key[:, :past+1].reshape(batch*(past+1), kv*dim),
+                       value[:, :past+1].reshape(batch*(past+1), kv*dim)]
     scores = batch_matmul(graph, 'decode_qk', query, key.transpose(0, 2, 1, 3).reshape(batch*kv, padded, dim), True)
     scores = graph.vector_tiles('score_scale', [(scores.reshape(batch*heads, padded), 'bf16')],
         lambda g: g.add(0, immediate=1 / np.sqrt(dim), dtype='bf16'))
@@ -225,7 +235,7 @@ def main():
     p.add_argument('--batches', type=int, nargs='+', default=[1, 32, 64])
     p.add_argument('--past-len', type=int, default=32)
     p.add_argument('--resume', action='store_true')
-    p.add_argument('--attention-strategy',choices=('baseline','flash'),default='baseline')
+    p.add_argument('--attention-strategy',choices=('dense','baseline','generic','flash'),default='dense')
     p.add_argument('--reuse-completed-phase', nargs='*', default=[], choices=('projections', 'attention', 'tail'),
         help='With --resume, keep these completed device binaries across compiler rebuilds; input/program hashes and numerical checks still apply')
     a = p.parse_args()
@@ -303,8 +313,14 @@ def main():
                      golden=golden, expected_key=expected_key, expected_value=expected_value)
         (folder/'token_ids.json').write_text(json.dumps(dict(past=token_ids.tolist(), current=current_ids.tolist())))
         write_bf16(folder/'golden.bf16.bin', golden)
-        def execute(name, graph, finals, shapes):
+        def execute(name, graph, finals, shapes, contract):
+            from model_test_outputs import OutputContract
+            assert isinstance(contract, OutputContract)
             phase = folder/name; stamp = phase/'completed.json'
+            phase.mkdir(parents=True, exist_ok=True)
+            contract_record = contract.describe(finals)
+            assert contract.indices() == list(range(len(finals))), 'inter-invocation handoffs must be exported'
+            (phase/'output_contract.json').write_text(json.dumps(contract_record, indent=2)+'\n')
             # A long run may outlive a compiler rebuild between phases.
             # Attribute each phase to the compiler actually used for it.
             compiler_hash = hashlib.sha256((build/'compiler'/
@@ -340,7 +356,8 @@ def main():
                     print(f'batch={batch}: {name} reused completed device execution', flush=True)
             if not valid:
                 print(f'batch={batch}: {name} compile', flush=True)
-                exe, env, binary = compile_graph(graph, finals, phase, build, target, fp32_spills=name == 'attention')
+                exe, env, binary = compile_graph(graph, finals, phase, build, target, fp32_spills=name == 'attention',
+                    module_attrs=(contract.attribute(),))
                 # A compiler rebuild may leave an unaffected phase byte-identical.
                 # Reuse only when both semantic inputs and encoded program match.
                 if reusable and saved['binary_sha256'] == hashlib.sha256(binary.read_bytes()).hexdigest():
@@ -357,8 +374,10 @@ def main():
                     graph_sha256=current_graph, compiler_sha256=compiler_hash, helper_sha256=helper_hash)))
             return [read(phase/f'actual.{i}.bin', shape) for i, shape in enumerate(shapes)]
         try:
+            from model_test_outputs import OutputContract, TestOutput
             graph, finals = projections(x, packed, scales, biases, norm0, config, 32)
-            q, k, v = execute('projections', graph, finals, [(batch, hidden), (batch, width), (batch, width)])
+            q, k, v = execute('projections', graph, finals, [(batch, hidden), (batch, width), (batch, width)],
+                OutputContract(*(TestOutput(n, 'handoff') for n in ('query', 'key', 'value'))))
             record['projection_cache_metrics'] = dict(
                 key=errors(k.reshape(batch, 2, 128), expected_key[:, 32]),
                 value=errors(v.reshape(batch, 2, 128), expected_value[:, 32]))
@@ -366,7 +385,9 @@ def main():
                 for e in record['projection_cache_metrics'].values()), record['projection_cache_metrics']
             graph, finals = attention(q, k, v, past_key, past_value, config,strategy=a.attention_strategy)
             context, actual_key, actual_value = execute('attention', graph, finals,
-                [(batch, hidden), (batch, 33, 2, 128), (batch, 33, 2, 128)])
+                [(batch, hidden), (batch, 33, 2, 128), (batch, 33, 2, 128)],
+                OutputContract(TestOutput('context', 'handoff'), TestOutput('key_cache', 'persistent_state'),
+                               TestOutput('value_cache', 'persistent_state')))
             # Validate attention before launching the expensive FFN. This CPU
             # calculation is an oracle only; execution consumes CModel context.
             scores = np.einsum('bhqd,bthd->bhqt', q.reshape(batch, 2, 16, 128), actual_key) / np.sqrt(128)
@@ -377,7 +398,8 @@ def main():
             assert np.isfinite(context).all() and record['attention_metrics']['relative_l2'] < .03, record['attention_metrics']
             (folder/'result.json').write_text(json.dumps(record, indent=2))
             graph, finals = tail(x, context, norm1, packed, scales, config)
-            actual, = execute('tail', graph, finals, [(batch, hidden)])
+            actual, = execute('tail', graph, finals, [(batch, hidden)],
+                OutputContract(TestOutput('hidden', 'result')))
             metrics = errors(actual, golden)
             per_request = [errors(actual[i], golden[i]) for i in range(batch)]
             cache_errors = dict(key=errors(actual_key, expected_key), value=errors(actual_value, expected_value))

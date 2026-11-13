@@ -7,6 +7,10 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include "AttentionEmitterUtils.hpp"
+#include "DirectDomainEmitterUtils.hpp"
+#include "FfnEmitterUtils.hpp"
+
 #include <algorithm>
 #include <utility>
 #include <vector>
@@ -122,6 +126,8 @@ int64_t annotateStateTransfers(mlir::func::FuncOp function,
 
 } // namespace
 
+#include "FlashTileScheduleEmitter.hpp"
+
 AttentionScheduleEmitter::AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
     AttentionTaskGraph op, const target::LPUTargetModel& target,
     AttentionStagePlan stagePlan, AttentionScheduleStrategy strategy,
@@ -133,6 +139,111 @@ AttentionScheduleEmitter::AttentionScheduleEmitter(mlir::IRRewriter& rewriter,
     , strategy_(strategy)
     , projection_rope_overlap_enabled_(projectionRopeOverlapEnabled)
 {
+}
+
+mlir::FailureOr<mlir::Value>
+AttentionScheduleEmitter::emitCore(int64_t outputIndex)
+{
+    if (!op_.core || (op_.core->getNumOperands() != 3 && op_.core->getNumOperands() != 4)
+        || op_.core->getNumResults() != 1) {
+        op_.emitError("dense attention core requires Q/K/V and one context result");
+        return mlir::failure();
+    }
+    if(auto strategy=op_.config().getAs<mlir::StringAttr>("attention_strategy"); strategy && strategy.getValue()=="flash_tile")
+        return emitFlashTileCore(rewriter_,op_,target_,outputIndex);
+    if (mlir::failed(stage_plan_.tasks.validate())) {
+        op_.emitError("failed to construct the dense attention core task DAG");
+        return mlir::failure();
+    }
+    const auto memoryPlan = op_.getMemoryPlan();
+    const int64_t tile = target_.throughput().mxm_rows;
+    const auto elementType = llvm::cast<mlir::RankedTensorType>(
+        op_.getInput().getType()).getElementType();
+    rewriter_.setInsertionPoint(op_.core);
+    const char* inputNames[] = {"query", "key", "value"};
+    for (int64_t index = 0; index < 3; ++index) {
+        auto input = op_.core->getOperand(index);
+        auto argument = llvm::dyn_cast<mlir::BlockArgument>(input);
+        const auto placement = memoryPlan.getAs<mlir::DictionaryAttr>(inputNames[index]);
+        if (!argument || !placement) {
+            op_.emitError("dense attention core input has no native binding or placement");
+            return mlir::failure();
+        }
+        createBinding(rewriter_, op_.getLoc(), input,
+            argument.getArgNumber(), "input", "activation",
+            llvm::cast<mlir::RankedTensorType>(input.getType()), placement,
+            inputNames[index]);
+    }
+    if (op_.getCausal()) {
+        const auto maskType = mlir::RankedTensorType::get({tile - 1, tile}, elementType);
+        for (int64_t index = 0; index < 2; ++index) {
+            const char* name = index ? "causal_mask_mxm1" : "causal_mask";
+            createBinding(rewriter_, op_.getLoc(), {}, index,
+                "internal", "constant", maskType,
+                memoryPlan.getAs<mlir::DictionaryAttr>(name), name,
+                "causal_mask", rewriter_.getDictionaryAttr({}));
+        }
+    }
+    const auto probabilityType = mlir::RankedTensorType::get(
+        {op_.getQueryHeads(), op_.getSeqLen(), op_.getKvSeqLen()}, elementType);
+    BindingOp probabilityPack;
+    if (!usesStreamingProbabilityTranspose())
+        probabilityPack = createBinding(rewriter_, op_.getLoc(), {}, 2,
+            "internal", "workspace", probabilityType,
+            memoryPlan.getAs<mlir::DictionaryAttr>("probability_pack"),
+            "attention.probability_pack");
+    auto probabilityDiagonal = createBinding(rewriter_, op_.getLoc(), {}, 3,
+        "internal", "workspace", probabilityType,
+        memoryPlan.getAs<mlir::DictionaryAttr>("probability_diagonal"),
+        "attention.probability_diagonal");
+
+    // Standalone attention has no preceding projection to provide a read
+    // lead-in. Derive it from the same target routes used by emitQk.
+    const int64_t firstIwOffset = target_.throughput().mxm_earliest_iw_cycle
+        + *target_.transport_latency(target::StreamEndpoint::Mem,
+            target::StreamEndpoint::MxmWeight, target::StreamDirection::East, 0);
+    int64_t qkStart = 0;
+    for (int64_t slice = 0; slice < target_.memory().slices_per_hemisphere; ++slice) {
+        if (auto latency = target_.transport_latency(target::StreamEndpoint::Mem,
+                target::StreamEndpoint::MxmWeight, target::StreamDirection::East, slice))
+            qkStart = std::max(qkStart, *latency - firstIwOffset);
+        if (auto latency = target_.transport_latency(target::StreamEndpoint::Mem,
+                target::StreamEndpoint::MxmActivation, target::StreamDirection::East, slice))
+            qkStart = std::max(qkStart,
+                *latency - firstIwOffset - stage_plan_.qk_iw_to_compute_cycles);
+    }
+    const auto bank = [&](llvm::StringRef name) {
+        auto placement = memoryPlan.getAs<mlir::DictionaryAttr>(name);
+        auto value = placement.getAs<mlir::IntegerAttr>("bank");
+        return value ? value.getInt() : int64_t{0};
+    };
+    const int64_t qkWaveInterval = stage_plan_.qk_wave_interval
+        + (bank("score") == bank("query") ? tile : 0);
+    const int64_t qkEnd = stage_plan_.qk_waves.empty() ? qkStart
+        : qkStart + static_cast<int64_t>(stage_plan_.qk_waves.size() - 1)
+            * qkWaveInterval + stage_plan_.qk_wave_duration;
+    if (mlir::failed(emitQk(qkStart, qkWaveInterval,
+            stage_plan_.qk_iw_to_compute_cycles, false)))
+        return mlir::failure();
+    const int64_t softmaxEnd = emitSoftmax(qkStart, qkEnd, false);
+    const int64_t transposeStart = std::max(softmaxEnd, qkEnd);
+    const int64_t transposeEnd = emitProbabilityTranspose(transposeStart);
+    const int64_t pvEnd = emitPv(transposeEnd);
+    if (probabilityPack)
+        probabilityPack->setAttr("ready_cycle", rewriter_.getI64IntegerAttr(transposeStart));
+    probabilityDiagonal->setAttr("ready_cycle", rewriter_.getI64IntegerAttr(transposeEnd));
+    createTimeline(rewriter_, op_.getLoc(), "qk", qkStart, qkEnd);
+    createTimeline(rewriter_, op_.getLoc(), "softmax", qkEnd, softmaxEnd);
+    if (!usesStreamingProbabilityTranspose())
+        createTimeline(rewriter_, op_.getLoc(), "probability_transpose", transposeStart, transposeEnd);
+    createTimeline(rewriter_, op_.getLoc(), "pv", transposeEnd, pvEnd);
+    auto output = createBinding(rewriter_, op_.getLoc(), {}, outputIndex,
+        "output", "result", llvm::cast<mlir::RankedTensorType>(op_.getResult().getType()),
+        memoryPlan.getAs<mlir::DictionaryAttr>("context"), "attention.context");
+    output->setAttr("ready_cycle", rewriter_.getI64IntegerAttr(pvEnd));
+    op_.core->getParentOfType<mlir::func::FuncOp>()->setAttr(
+        "ftlpu.attention_core_schedule", rewriter_.getStringAttr("dense_specialized"));
+    return output.getValue();
 }
 
 mlir::FailureOr<mlir::Value>
@@ -356,8 +467,8 @@ AttentionScheduleEmitter::emit(int64_t outputIndex)
         return bank ? bank.getInt() : 0;
     };
     // When tail-QK score output shares the first Query-IW bank, its 32-row
-    // WRITE_3D must drain before the next wave starts the corresponding
-    // READ_3D.  The historical layout placed scores on the second bank and
+    // write domain must drain before the next wave starts the corresponding
+    // read domain.  The historical layout placed scores on the second bank and
     // only needed the ordinary wave interval.  Runtime-paged FFN keeps that
     // second activation bank for the probability pack, so serialize this
     // same-queue boundary explicitly.

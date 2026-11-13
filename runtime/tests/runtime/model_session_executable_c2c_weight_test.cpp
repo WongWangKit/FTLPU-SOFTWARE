@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -16,6 +17,11 @@ namespace {
 using namespace ftlpu;
 using namespace ftlpu::software::runtime;
 
+QueueCommand mem_macro(std::size_t row,std::size_t cycle,std::size_t count,std::size_t interval,bool write=false){
+    const auto word=isa::encode_mem_instruction(write?MemInstruction::Write(row,StreamId::East(0)):MemInstruction::Read(row,StreamId::East(0)));
+    return encode_macro_schedule_command({0,InstructionKind::Mem,2,{std::uint32_t(word),std::uint32_t(word>>32),0,0}},
+        {cycle,count,interval,1,1,1,0,IcuInductionTarget::MemAddress});
+}
 BinaryBinding make_weight_binding(std::uint16_t bank = 0)
 {
     BinaryBinding binding;
@@ -49,6 +55,24 @@ BinaryBinding make_weight_binding(std::uint16_t bank = 0)
 
 int main(int argc, char** argv)
 try {
+    // Lookahead may only append transport to a queue with no computation.
+    // It must never split a Macro to make room for MEM_WRITE_SYNC.
+    {
+        auto system = std::make_unique<C2cDmaSystem>();
+        C2cWeightPager pager(*system);
+        BinaryProgram occupied;
+        occupied.queues.push_back({QueueKind::Mem, 0, {mem_macro(0, 0, 8, 1)}});
+        pager.begin_schedule(occupied);
+        C2cWeightPage page;
+        page.segments.push_back({Hemisphere::East, 0, 0, 0, 0, 0, 1});
+        bool rejected = false;
+        try { (void)pager.schedule(occupied, page, 20, 80,
+            std::numeric_limits<std::size_t>::max(), 1); }
+        catch (const std::logic_error& error) {
+            rejected = std::string(error.what()).find("transport-only") != std::string::npos;
+        }
+        if (!rejected) throw std::runtime_error("lookahead attempted to split a computation Macro");
+    }
     BinaryProgram preloadProgram;
     auto firstPreload = make_weight_binding();
     firstPreload.bank = 1;
@@ -110,21 +134,7 @@ try {
     auto scratchReuseProgram = runtimePrefetchProgram;
     QueueProgram scratchQueue{QueueKind::Mem,
         InstructionControlUnit::mem_queue(Hemisphere::East, 28, 0), {}};
-    scratchQueue.commands.push_back(encode_icu_control_raw_word(
-        IcuControlInstruction::Nop(80)));
-    const auto scratchPacket = isa::encode_mem_icu_shortest_instruction(
-        MemIcuInstruction::Write3D(IcuLoop3D{0, {4,1,1}, {5,1,1}},
-            MemIcuAddress3D::Affine(0, {1,0,0}), StreamId::East(0)));
-    for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(scratchPacket); ++w) {
-        const auto& word = scratchPacket.words[w];
-        QueueCommand command;
-        command.command = word.lanes[0];
-        command.instruction_kind = InstructionKind::Mem;
-        command.word_count = isa::EncodedMemIcu3DPacket::kLanesPerWord;
-        for (std::size_t lane = 0; lane < command.word_count; ++lane)
-            command.words[lane] = word.lanes[lane];
-        scratchQueue.commands.push_back(command);
-    }
+    scratchQueue.commands.push_back(mem_macro(0,80,4,5,true));
     scratchReuseProgram.queues.push_back(scratchQueue);
     BinaryBinding sharedScratch;
     sharedScratch.access = BindingAccess::Internal;
@@ -473,21 +483,8 @@ try {
     BinaryProgram nativeWeightProgram;
     QueueProgram nativeMem {QueueKind::Mem,
         InstructionControlUnit::mem_queue(Hemisphere::East, 20, 0), {}};
-    nativeMem.commands.push_back(encode_icu_control_raw_word(
-        IcuControlInstruction::Nop(40)));
-    const auto nativePacket = isa::encode_mem_icu_shortest_instruction(
-        MemIcuInstruction::Read3D(IcuLoop3D {0, {16, 1, 1}, {1, 1, 1}},
-            MemIcuAddress3D::Affine(100, {1, 0, 0}), StreamId::East(0)));
-    for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(nativePacket); ++w) {
-        const auto& word = nativePacket.words[w];
-        QueueCommand command;
-        command.command = word.lanes[0];
-        command.instruction_kind = InstructionKind::Mem;
-        command.word_count = isa::EncodedMemIcu3DPacket::kLanesPerWord;
-        for (std::size_t lane = 0; lane < command.word_count; ++lane)
-            command.words[lane] = word.lanes[lane];
-        nativeMem.commands.push_back(command);
-    }
+    const auto nativePacket=mem_macro(100,40,16,1);
+    nativeMem.commands.push_back(nativePacket);
     nativeWeightProgram.queues.push_back(std::move(nativeMem));
     std::vector<WeightPrefetchPlan> nativePlans(1);
     nativePlans[0].runtime_prefetch = true;
@@ -512,21 +509,8 @@ try {
     // extra issue slot at a zero-wait boundary in another. Rebinding must
     // recover both original phases, rather than turn every old SYNC into NOP.
     auto beforeSync = nativeWeightProgram;
-    const auto secondPacket = isa::encode_mem_icu_shortest_instruction(
-        MemIcuInstruction::Read3D(IcuLoop3D{0, {4, 1, 1}, {1, 1, 1}},
-            MemIcuAddress3D::Affine(200, {1, 0, 0}), StreamId::East(0)));
-    const auto appendPacket = [](auto& commands, const auto& packet) {
-        for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(packet); ++w) {
-        const auto& word = packet.words[w];
-            QueueCommand command;
-            command.command = word.lanes[0];
-            command.instruction_kind = InstructionKind::Mem;
-            command.word_count = isa::EncodedMemIcu3DPacket::kLanesPerWord;
-            for (std::size_t lane = 0; lane < command.word_count; ++lane)
-                command.words[lane] = word.lanes[lane];
-            commands.push_back(command);
-        }
-    };
+    const auto secondPacket=mem_macro(200,56,4,1);
+    const auto appendPacket=[](auto& commands,const auto& command){commands.push_back(command);};
     appendPacket(beforeSync.queues[0].commands, secondPacket);
     // Decode mixes native MXM ND commands with direct MEM domains. This
     // must still record MEM origins, including zero-wait SYNC boundaries.
@@ -540,8 +524,7 @@ try {
     nativeMxm.words[0] = static_cast<std::uint32_t>(nativeMxmWord);
     nativeMxm.words[1] = static_cast<std::uint32_t>(nativeMxmWord >> 32);
     beforeSync.queues.push_back(QueueProgram {QueueKind::MxmLoad, 0,
-        {encode_mxm_stream_nd_command(nativeMxm,
-            IcuMxmStreamNdSchedule {45, 1, {2, 1, 1}, {4, 1, 1}, {0, 0, 0}})}});
+        {encode_macro_schedule_command(nativeMxm,{45,2,4,0,1,1,0,IcuInductionTarget::None})}});
     auto withSync = beforeSync;
     auto& syncCommands = withSync.queues[0].commands;
     syncCommands.clear();
@@ -566,15 +549,13 @@ try {
     const auto restoredPhases = without_compiled_mem_write_sync(read_binary_program(phaseInput));
     const auto& restoredQueue = restoredPhases.queues[0];
     const auto& restoredMxm = restoredPhases.queues[1];
-    if (decode_mxm_stream_nd_command(restoredMxm.commands.back()).start_cycle != 45)
+    if (decode_macro_schedule_command(restoredMxm.commands.back()).start_cycle != 45)
         throw std::runtime_error("compiler SYNC rebind changed native MXM timing");
-    if (decode_fu_3d_raw_packet_loop(restoredQueue, 0).wait_cycle != 40
-        || decode_fu_3d_raw_packet_loop(restoredQueue,
-            fu_3d_raw_packet_word_count(QueueKind::Mem, restoredQueue.commands[0])).wait_cycle != 0
-        || !is_mem_synchronized_raw_packet_header(restoredQueue.commands[
-            2 * fu_3d_raw_packet_word_count(QueueKind::Mem, restoredQueue.commands[0])])
+    if (decode_macro_schedule_command(restoredQueue.commands[0]).start_cycle != 40
+        || decode_macro_schedule_command(restoredQueue.commands[1]).start_cycle != 56
+        || !is_mem_synchronized_raw_packet_header(restoredQueue.commands[2])
         || restoredPhases.address_relocations[0].command_index != 0)
-        throw std::runtime_error("compiler SYNC rebind changed domain timing or relocation");
+        throw std::runtime_error("compiler SYNC rebind changed Macro timing or relocation");
 
     // A long recurrent phase can leave an unrelated queue idle beyond the
     // 24-bit domain wait field. Restoring compiler timing must preserve the
@@ -592,10 +573,9 @@ try {
     longSync.timelines.push_back({longOriginPrefix + "end", longGap + 60, longGap + 61});
     const auto restoredLong = without_compiled_mem_write_sync(longSync);
     const auto& longQueue = restoredLong.queues[0];
-    if (decode_icu_control_raw_word(longQueue.commands[0]).count != 41
-        || decode_fu_3d_raw_packet_loop(longQueue, 1).wait_cycle != longGap - 1
-        || restoredLong.address_relocations[0].command_index != 1)
-        throw std::runtime_error("long compiler SYNC wait lost timing or relocation");
+    if (decode_macro_schedule_command(longQueue.commands[0]).start_cycle != longGap+40
+        || restoredLong.address_relocations[0].command_index != 0)
+        throw std::runtime_error("long compiler SYNC rebind lost Macro timing or relocation");
 
     BinaryProgram wideningStreamProgram = overlappingProgram;
     wideningStreamProgram.stream_release_cycles.assign(

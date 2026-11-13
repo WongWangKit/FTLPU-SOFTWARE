@@ -76,7 +76,6 @@ struct StreamTopology {
 };
 
 struct ThroughputModel {
-    int64_t icu_repeat_2d_enabled = 1;
     int64_t tile_rows = hw::kTileRows;
     int64_t lanes_per_tile = hw::kLanesPerTile;
     int64_t mem_read_bytes_per_cycle = hw::kMemReadBytesPerCycle;

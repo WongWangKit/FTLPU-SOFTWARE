@@ -71,7 +71,7 @@ def main() -> None:
             "--input", str(source), "--output", str(args.executable),
             "--target-config", str(args.target_config), "--weight-bank", "1",
             "--ffn-schedule", "fused", "--attention-schedule", "fused",
-            "--projection-rope-overlap", "off"]))
+            "--projection-rope-overlap", "off", "--icu-compression", "raw-macro"]))
     elif not args.executable:
         parser.error("provide --compiler or --executable")
     checkpoint = model_work / "checkpoint"

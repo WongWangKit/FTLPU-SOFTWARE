@@ -28,6 +28,11 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     const int64_t tileRows = target_.throughput().tile_rows;
     const int64_t lanes = target_.throughput().lanes_per_tile;
     const int64_t queryBlocks = (op_.getSeqLen() + tile - 1) / tile;
+    const auto contextCount = [&](int64_t queryBlock) {
+        return op_.core
+            ? std::min<int64_t>(tile, op_.getSeqLen() - queryBlock * tile)
+            : tile;
+    };
     const int64_t keyBlocks = op_.getKvSeqLen() / tile;
     const int64_t headBlocks = op_.getHeadDim() / tile;
     const int64_t queryHeadsPerKv = op_.getQueryHeads() / op_.getKvHeads();
@@ -50,6 +55,14 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     const int64_t contextBank = placementBank("context");
     const bool singleMxm =
         target_.throughput().mxms_per_hemisphere == 1;
+    const auto module = op_.getInput().getParentRegion()->getParentOfType<mlir::ModuleOp>();
+    const auto wide = module ? module->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide")
+                             : mlir::BoolAttr{};
+    const bool wideSxm = wide && wide.getValue();
+    if (wideSxm && !singleMxm) {
+        op_.emitError("wide SXM dense PV currently requires one MXM per hemisphere");
+        return -1;
+    }
     const bool sourceLocalContext = false;
     // Accumulator addresses are local to each physical MXM and are not MEM
     // context addresses. A single-MXM target keeps one query-tile window per
@@ -108,6 +121,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
     }
     std::array<std::vector<int64_t>, 2> transposeCaptures;
     const auto emitPlannedTransposes = [&] {
+        if (wideSxm) return;
         for (int64_t hemisphere = 0;
              hemisphere < target_.memory().hemispheres; ++hemisphere) {
             auto& captures = transposeCaptures[static_cast<std::size_t>(
@@ -166,6 +180,41 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
         const int64_t kvHead = head / queryHeadsPerKv;
         const int64_t capture = routeStart + memToSxm;
         const auto slices = layout.valuePackSlices(localMxm);
+        if (wideSxm) {
+            // V is distributed by key-token residue, with one complete
+            // feature vector per word. Serialize the existing addresses
+            // into a full tile transpose and feed its columns directly to
+            // the native one-vector IW port; no temporary MEM tensor.
+            for (int64_t pair = 0; pair < lanes; ++pair) {
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice = slices[2 * pair + byte];
+                    const auto rd = target_.transport_latency(target::StreamEndpoint::Mem,
+                        target::StreamEndpoint::SxmInput, target::StreamDirection::East, slice);
+                    if (!rd) return int64_t{-1};
+                    direct_domain_detail::emitMem3D(rewriter_, op_.getLoc(), target_,
+                        capture + pair - *rd,
+                        hemisphere * target_.memory().slices_per_hemisphere + slice,
+                        "read", layout.valuePackAddress(kvHead, localMxm, keyBlock, 0),
+                        16 + byte, tileRows, lanes, 1, 1, 1, 0, 1, 1, 0,
+                        -1, layout.valuePackBank(localMxm));
+                }
+            }
+            emitSxm(rewriter_, op_.getLoc(), capture, hemisphere, "transpose",
+                {16, 17}, {18, 19}, identityMap(target_), "wide_matrix",
+                -1, -1, -1, 1, tile);
+            const auto route = target_.transport_latency(target::StreamEndpoint::SxmResult,
+                target::StreamEndpoint::MxmWeight, target::StreamDirection::East, 0);
+            if (!route) return int64_t{-1};
+            const int64_t load = capture + tile + tileRows - 1 + *route;
+            MxmDomain3D domain;
+            domain.repeat_count = tile;
+            domain.repeat_weight_column_stride = 1;
+            emitMxm3D(rewriter_, op_.getLoc(), load, hemisphere, "iw",
+                localMxm % target_.throughput().mxm_weight_buffers,
+                0, 0, 0, 0, 1, "stream", true, "vector", 0,
+                dataFormat, "direct16", "", domain, 18);
+            return load + tile;
+        }
         if (emitMemoryRead) {
             for (int64_t stream = 0; stream < 16; ++stream) {
                 const int64_t slice =
@@ -213,16 +262,15 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
 
     int64_t phaseStart = transposeEnd;
     const int64_t accumulatorCapacity = target_.throughput().mxm_accumulator_blocks * tile;
-    const bool serializeHeadBlocks = singleMxm
+    const bool serializeHeadBlocks = wideSxm || (singleMxm
         && (headBlocks > target_.throughput().mxm_weight_buffers
-            || queryBlocks * tile * headBlocks > accumulatorCapacity);
+            || queryBlocks * tile * headBlocks > accumulatorCapacity));
     if (serializeHeadBlocks) {
         // Serialize head blocks when either weights or live partials exceed
         // physical capacity. Retain one head block's query rows across key
         // blocks, drain its final partials, then reuse that ACC window.
         // Forward the result through the passive VXM bridge so both
         // hemispheres own a complete planar context.
-        const bool pipelineHeadBlocks = queryBlocks == 1;
         const auto contextSlices = layout.contextSlices();
         const auto disjointFromContext = [&](llvm::ArrayRef<int64_t> slices) {
             return std::none_of(slices.begin(), slices.end(),
@@ -232,16 +280,27 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                         != contextSlices.end();
                 });
         };
-        bool groupPvMemory = pipelineHeadBlocks
+        bool widePipelineSafe = op_.core && keyBlocks == 1
+            && (probabilityBank != contextBank || disjointFromContext(layout.probabilityDiagonalSlices()));
+        for (int64_t block = 0; widePipelineSafe && block < headBlocks; ++block)
+            widePipelineSafe = layout.valuePackBank(block) != contextBank
+                || disjointFromContext(layout.valuePackSlices(block));
+        const bool pipelineHeadBlocks = queryBlocks == 1 && (!wideSxm || widePipelineSafe);
+        bool groupPvMemory = !wideSxm && pipelineHeadBlocks
+            && (!op_.core || op_.getSeqLen() % tile == 0)
             && disjointFromContext(layout.probabilityDiagonalSlices());
         for (int64_t headBlock = 0;
              groupPvMemory && headBlock < headBlocks; ++headBlock)
             groupPvMemory &= layout.valuePackBank(headBlock)
                     != probabilityBank
                 && disjointFromContext(layout.valuePackSlices(headBlock));
-        const int64_t valueLoadLead = memToSxm + 2 * tileRows + 1
-            + 8 + memToMxm;
-        const int64_t firstIwOffset = memToSxm + 2;
+        const int64_t firstIwOffset = wideSxm
+            ? memToSxm + tile + tileRows - 1
+                + *target_.transport_latency(target::StreamEndpoint::SxmResult,
+                    target::StreamEndpoint::MxmWeight, target::StreamDirection::East, 0)
+            : memToSxm + 2;
+        const int64_t valueLoadLead = wideSxm ? firstIwOffset + tile + 1
+            : memToSxm + 2 * tileRows + 1 + 8 + memToMxm;
         int64_t nextPipelinedCompute = phaseStart + valueLoadLead;
         int64_t pipelinedEnd = phaseStart;
         std::vector<std::vector<int64_t>> weightBufferRelease(
@@ -448,7 +507,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                         direct_domain_detail::emitMem3D(
                                             rewriter_, op_.getLoc(), target_,
                                             writeCycle, queue, "write",
-                                            address, 32 + byte, tile, 1, 1,
+                                            address, 32 + byte, contextCount(queryBlock), 1, 1,
                                             1, 1, 0, 1, 1, 0, -1,
                                             layout.contextBank(headBlock));
                                     blockEnd = std::max(
@@ -503,7 +562,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                             rewriter_, op_.getLoc(), target_,
                                             writeCycle, queue,
                                             local ? "write_tap" : "write",
-                                            address, packedStream, tile, 1, 1,
+                                            address, packedStream, contextCount(queryBlock), 1, 1,
                                             1, 1, 0, 1, 1, 0, -1,
                                             layout.contextBank(headBlock));
                                     blockEnd = std::max(
@@ -515,7 +574,11 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                             }
                         }
                         if (pipelineHeadBlocks) {
-                            nextPipelinedCompute = queryCompute + tile;
+                            // Both fabrics mirror their result into the same
+                            // context queues. Retain room for both complete
+                            // write domains while preparing the next V tile.
+                            nextPipelinedCompute = queryCompute + (wideSxm
+                                ? std::max(tile, 2 * finalOutputHemisphereStagger) : tile);
                             pipelinedEnd = std::max(pipelinedEnd, blockEnd + 1);
                         } else {
                             phaseStart = blockEnd + 1;
@@ -940,7 +1003,7 @@ int64_t AttentionScheduleEmitter::emitPv(int64_t transposeEnd)
                                             layout.contextAddress(*head,
                                                 contextBlock,
                                                 queryBlock * tile),
-                                            packedStream, tile, 1, 1,
+                                            packedStream, contextCount(queryBlock), 1, 1,
                                             1, 1, 0, 1, 1, 0, -1,
                                             layout.contextBank(contextBlock));
                                         lastContextWriteCycle = std::max(

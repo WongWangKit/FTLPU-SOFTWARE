@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ftlpu/icu/fu_3d_instruction.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/affine_domains.hpp"
 
 #include "mlir/Support/LogicalResult.h"
 
@@ -97,13 +97,13 @@ struct PhysicalIcu3DCommand {
     Instruction instruction{};
 };
 
-using PhysicalMemIcu3DCommand = PhysicalIcu3DCommand<MemIcuInstruction>;
+using PhysicalMemIcu3DCommand = PhysicalIcu3DCommand<MemAddressDomain>;
 using PhysicalMxmLoadIcu3DCommand =
-    PhysicalIcu3DCommand<MxmLoadIcuInstruction>;
+    PhysicalIcu3DCommand<MxmLoadDomain>;
 using PhysicalMxmDequantIcu3DCommand =
-    PhysicalIcu3DCommand<MxmDequantIcuInstruction>;
+    PhysicalIcu3DCommand<MxmDequantDomain>;
 using PhysicalMxmComputeIcu3DCommand =
-    PhysicalIcu3DCommand<MxmComputeIcuInstruction>;
+    PhysicalIcu3DCommand<MxmComputeDomain>;
 
 // A compiler lowering result grouped by the independently addressed physical
 // ICU families. Every element is already a hardware FU-specific 3-D command.
@@ -123,7 +123,7 @@ struct FfnUp3DLoweringResult {
 // Lowers directly from shape, physical placement, and a closed-form timeline.
 // This API deliberately cannot consume Schedule dialect fine events, so it
 // cannot implement the result by discovering/compressing an event pattern.
-mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
+mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToMacroDomains(
     FfnUp3DShape shape, const FfnUp3DPlacement& placement,
     const FfnUp3DTimeline& timeline,
     const FfnUp3DRouteLatencies& routeLatencies,

@@ -16,13 +16,13 @@ add_library(ftlpu_cmodel_static STATIC
 add_executable(gdn_vector32_solve_system_test tests/runtime/gdn_vector32_solve_system_test.cpp)
 add_executable(gdn_native_chunkwise_test tests/runtime/gdn_native_chunkwise_test.cpp)
 target_include_directories(gdn_native_chunkwise_test PRIVATE "${CMAKE_SOURCE_DIR}/compiler/include")
-target_link_libraries(gdn_native_chunkwise_test PRIVATE ftlpu_cmodel_static)
+target_link_libraries(gdn_native_chunkwise_test PRIVATE ftlpu_software)
 set_source_files_properties(tests/runtime/gdn_native_chunkwise_test.cpp PROPERTIES OBJECT_DEPENDS
     "${CMAKE_SOURCE_DIR}/compiler/include/ftlpu/compiler/Target/gdn_native_schedule.hpp")
 set_source_files_properties(tests/runtime/gdn_vector32_solve_system_test.cpp PROPERTIES OBJECT_DEPENDS
     "${CMAKE_SOURCE_DIR}/compiler/include/ftlpu/compiler/Target/vector32_triangular_schedule.hpp;${CMAKE_SOURCE_DIR}/compiler/include/ftlpu/compiler/Target/vector32_triangular_solve.hpp")
 target_include_directories(gdn_vector32_solve_system_test PRIVATE "${CMAKE_SOURCE_DIR}/compiler/include")
-target_link_libraries(gdn_vector32_solve_system_test PRIVATE ftlpu_cmodel_static)
+target_link_libraries(gdn_vector32_solve_system_test PRIVATE ftlpu_software)
 add_test(NAME gdn_vector32_solve_system_test COMMAND gdn_vector32_solve_system_test
     "${CMAKE_CURRENT_BINARY_DIR}/gdn_vector32_solve_system_results")
 add_test(NAME gdn_vector32_solve_packed_system_test COMMAND gdn_vector32_solve_system_test
@@ -46,7 +46,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     src/runtime/binary.cpp
     src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
-    src/runtime/fu_3d_macro_lowering.cpp
+    src/runtime/macro_queue_link.cpp
     src/runtime/icu_program.cpp
     src/runtime/issue_inspector.cpp
     src/runtime/imem_capacity.cpp
@@ -67,10 +67,9 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/command_mxm_column_binary_test.cpp
     tests/runtime/command_vxm_binary_runtime_test.cpp
     tests/runtime/sxm_binary_roundtrip_test.cpp
-    tests/runtime/vxm_stream_nd_binary_test.cpp
-    tests/runtime/mem_slice_program_binary_test.cpp
+    tests/runtime/vxm_sequential_binary_test.cpp
     tests/runtime/issue_inspector_test.cpp
-    tests/runtime/fu_3d_macro_lowering_test.cpp
+    tests/runtime/macro_queue_link_test.cpp
     tests/runtime/raw_macro_cli_replay_test.cpp
     tests/runtime/compiled_sxm_command_runtime_test.cpp
     tests/runtime/compiled_queue_program_runtime_test.cpp
@@ -94,6 +93,7 @@ set(FTLPU_CMODEL_CONSUMER_SOURCES
     tests/runtime/model_session_embedding_test.cpp
     tests/runtime/resident_weight_planner_test.cpp
     tests/runtime/c2c_weight_ping_pong_test.cpp
+    tests/runtime/runtime_common_barrier_test.cpp
     tests/runtime/weight_page_planner_test.cpp
     tests/runtime/model_session_c2c_weight_pages_test.cpp
     tests/runtime/model_session_c2c_io_test.cpp
@@ -116,7 +116,7 @@ add_library(ftlpu_software
     src/runtime/binary.cpp
     src/runtime/c2c_weight_pager.cpp
     src/runtime/cmodel_runtime.cpp
-    src/runtime/fu_3d_macro_lowering.cpp
+    src/runtime/macro_queue_link.cpp
     src/runtime/icu_program.cpp
     src/runtime/issue_inspector.cpp
     src/runtime/imem_capacity.cpp
@@ -177,10 +177,10 @@ add_executable(macro_bitstream_test
 target_link_libraries(macro_bitstream_test PRIVATE ftlpu_software)
 add_test(NAME macro_bitstream_test COMMAND $<TARGET_FILE:macro_bitstream_test>)
 
-add_executable(fu_3d_macro_lowering_test
-    tests/runtime/fu_3d_macro_lowering_test.cpp)
-target_link_libraries(fu_3d_macro_lowering_test PRIVATE ftlpu_software)
-add_test(NAME fu_3d_macro_lowering_test COMMAND $<TARGET_FILE:fu_3d_macro_lowering_test>)
+add_executable(macro_queue_link_test
+    tests/runtime/macro_queue_link_test.cpp)
+target_link_libraries(macro_queue_link_test PRIVATE ftlpu_software)
+add_test(NAME macro_queue_link_test COMMAND $<TARGET_FILE:macro_queue_link_test>)
 
 add_executable(raw_macro_cli_replay_test tests/runtime/raw_macro_cli_replay_test.cpp)
 target_link_libraries(raw_macro_cli_replay_test PRIVATE ftlpu_software)
@@ -260,21 +260,14 @@ add_test(
     COMMAND $<TARGET_FILE:sxm_binary_roundtrip_test>
         ${CMAKE_CURRENT_BINARY_DIR}/test-output/sxm-v16.ftlpu)
 
-add_executable(vxm_stream_nd_binary_test
-    tests/runtime/vxm_stream_nd_binary_test.cpp)
-target_link_libraries(vxm_stream_nd_binary_test PRIVATE ftlpu_software)
+add_executable(vxm_sequential_binary_test
+    tests/runtime/vxm_sequential_binary_test.cpp)
+target_link_libraries(vxm_sequential_binary_test PRIVATE ftlpu_software)
 add_test(
-    NAME vxm_stream_nd_binary_test
-    COMMAND $<TARGET_FILE:vxm_stream_nd_binary_test>
+    NAME vxm_sequential_binary_test
+    COMMAND $<TARGET_FILE:vxm_sequential_binary_test>
         ${CMAKE_CURRENT_BINARY_DIR}/test-output/vxm-stream-nd.ftlpu)
 
-add_executable(mem_slice_program_binary_test
-    tests/runtime/mem_slice_program_binary_test.cpp)
-target_link_libraries(mem_slice_program_binary_test PRIVATE ftlpu_software)
-add_test(
-    NAME mem_slice_program_binary_test
-    COMMAND $<TARGET_FILE:mem_slice_program_binary_test>
-        ${CMAKE_CURRENT_BINARY_DIR}/test-output/mem-slice-program.ftlpu)
 
 add_executable(issue_inspector_test
     tests/runtime/issue_inspector_test.cpp)

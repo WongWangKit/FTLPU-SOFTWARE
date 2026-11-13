@@ -3,6 +3,8 @@
 #include "ftlpu/compiler/Support/float_format.hpp"
 #include "ftlpu/compiler/Target/mxm_execution_strategy.hpp"
 
+#include <cmath>
+
 namespace ftlpu::compiler::tensor_lowering {
 
 mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
@@ -16,10 +18,17 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
     const int64_t tile = target.throughput().mxm_rows;
     const bool fp8 = llvm::isa<mlir::Float8E4M3FNType>(rhsType.getElementType());
     const bool fp32Partial = fp8 && resultType.getElementType().isF32();
+    const auto blockScales = op->getAttrOfType<mlir::DenseF32ArrayAttr>("rhs_block_scales");
     if (fp8 && (!lhsType.getElementType().isBF16() || tile != 32
         || (!resultType.getElementType().isBF16() && !fp32Partial)
-        || op.getK() != 32 || op.getM() != 32 || op.getN() != 64))
-        return op.emitOpError("FP8 IW primitive requires BF16 X[32,32] and E4M3FN W[32,64]");
+        || op.getK() % tile || op.getM() != tile || op.getN() % (2 * tile)))
+        return op.emitOpError("FP8 IW projection requires BF16 X[32,K], K32-aligned, and E4M3FN W[K,N], N64-aligned");
+    if (op->hasAttr("rhs_block_scales") && (!fp8 || !blockScales
+        || blockScales.size() != (op.getN() / tile) * (op.getK() / tile)
+        || llvm::any_of(blockScales.asArrayRef(), [](float scale) {
+            return !std::isfinite(scale) || scale <= 0.f;
+        })))
+        return op.emitOpError("rhs_block_scales requires positive finite FP8 scales in [N/32,K/32] order");
     if (fp8 && !llvm::isa<mlir::BlockArgument>(op.getLhs()))
         return op.emitOpError("use connected graph layout planning for an intermediate FP8 projection activation");
     const bool w8a16 = is_lpu_16bit_float(lhsType.getElementType())
@@ -81,7 +90,7 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
         auto result = fixed_allocation(PlacementKind::FinalResult,
             llvm::ArrayRef<int64_t>(resultSlices).take_front(fp32Partial ? 4 : 2), 0,
             op.getM() * op.getN() / (2 * tile),
-            resultBytes, fp32Partial ? "column_partition_planar" : "fp16_hemisphere_pair_planar", "both",
+            resultBytes, fp32Partial ? "fp32_hemisphere_pair_planar" : "fp16_hemisphere_pair_planar", "both",
             target.memory().banks_per_slice > 1 ? 1 : 0);
         const bool replicated = llvm::any_of(op.getResult().getUsers(),
             [](mlir::Operation* user) { return llvm::isa<kernel::SigmoidMultiplyOp>(user); });
@@ -158,6 +167,7 @@ mlir::LogicalResult lower_matmul(kernel::MatmulOp op,
             mlir::NamedAttrList flags(config);
             if (auto west = op->getAttrOfType<mlir::FloatAttr>("rhs_scale_west"))
                 flags.set("rhs_scale_west", west);
+            if (blockScales) flags.set("rhs_block_scales", blockScales);
             config = flags.getDictionary(rewriter.getContext());
         }
         const mlir::Value oldResult = op.getResult();

@@ -503,7 +503,7 @@ void CModelRuntime::load_impl(const BinaryProgram& program, bool timed, std::uin
         const bool supported=!timed && program.common_barrier_protocol &&
             std::all_of(imem.queues.begin(),imem.queues.end(),[](const auto& q) {
                 return !q.deployment_overflow() ||
-                    (q.physical_overflow() && !q.fu_3d_context_overflow()
+                    (q.physical_overflow()
                      && !q.macro_context_overflow() &&
                      (q.kind==QueueKind::Vxm || q.kind==QueueKind::SxmTranspose || q.kind==QueueKind::SxmPermute));
             });
@@ -1102,16 +1102,19 @@ void CModelRuntime::upload_binding_impl(
         }
         return;
     }
-    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar
-        && is_16bit_float(binding.element_type) && binding.slices.size() == 2
+    if (((binding.layout == BindingLayout::Fp16HemispherePairPlanar
+          && is_16bit_float(binding.element_type) && binding.slices.size() == 2)
+        || (binding.layout == BindingLayout::Fp32HemispherePairPlanar
+            && binding.element_type == BindingElementType::F32 && binding.slices.size() == 4))
         && (binding.hemisphere_mask & 3) == 3) {
+        const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
         for (std::size_t r = 0; r < rows; ++r)
             for (std::size_t c = 0; c < columns; ++c) {
                 const auto hemisphere = static_cast<Hemisphere>((c / 32) % 2);
                 const std::size_t address = binding.base_row + (c / 64) * rows + r;
-                for (std::size_t byte = 0; byte < 2; ++byte)
+                for (std::size_t byte = 0; byte < bytes; ++byte)
                     write_binding_sram_byte(system_, binding, hemisphere,
-                        binding.slices[byte], address, c % 32, data[(r * columns + c) * 2 + byte]);
+                        binding.slices[byte], address, c % 32, data[(r * columns + c) * bytes + byte]);
             }
         return;
     }
@@ -1602,7 +1605,7 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
 {
     if (!binding.pieces.empty()) {
         // Share the transport packer's coverage and physical-alias validation.
-        pack_binding_image(binding, std::vector<std::uint8_t>(binding.byte_size), hardware_);
+        validate_native_output_pieces(binding, hardware_);
         std::vector<std::uint8_t> result;
         result.reserve(binding.byte_size);
         for (const auto& piece : binding.pieces) {
@@ -1672,16 +1675,19 @@ std::vector<std::uint8_t> CModelRuntime::download_binding(
         }
         return result;
     }
-    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar
-        && is_16bit_float(binding.element_type) && binding.slices.size() == 2
+    if (((binding.layout == BindingLayout::Fp16HemispherePairPlanar
+          && is_16bit_float(binding.element_type) && binding.slices.size() == 2)
+        || (binding.layout == BindingLayout::Fp32HemispherePairPlanar
+            && binding.element_type == BindingElementType::F32 && binding.slices.size() == 4))
         && (binding.hemisphere_mask & 3) == 3) {
+        const std::size_t bytes = binding.element_type == BindingElementType::F32 ? 4 : 2;
         std::vector<std::uint8_t> result(static_cast<std::size_t>(binding.byte_size));
         for (std::size_t r = 0; r < rows; ++r)
             for (std::size_t c = 0; c < columns; ++c) {
                 const auto hemisphere = static_cast<Hemisphere>((c / 32) % 2);
                 const std::size_t address = binding.base_row + (c / 64) * rows + r;
-                for (std::size_t byte = 0; byte < 2; ++byte)
-                    result[(r * columns + c) * 2 + byte] = read_binding_sram_byte(
+                for (std::size_t byte = 0; byte < bytes; ++byte)
+                    result[(r * columns + c) * bytes + byte] = read_binding_sram_byte(
                         system_, binding, hemisphere, binding.slices[byte], address, c % 32);
             }
         return result;
@@ -2121,6 +2127,7 @@ void CModelRuntime::configure_common_transport(const BinaryProgram& program)
     std::optional<CommonOverlapCalendar> calendar;
     if (program.transport_overlap_protocol) calendar.emplace(program);
     std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> layoutData;
+    CommonPageStorageValidator storageProof(program);
     for (auto& page : common_transports_) {
         std::map<std::size_t, std::size_t> targets, commits;
         std::vector<std::size_t> leaseQueues;
@@ -2138,7 +2145,7 @@ void CModelRuntime::configure_common_transport(const BinaryProgram& program)
                 const auto queue = InstructionControlUnit::mem_queue(
                     static_cast<Hemisphere>(expected.hemisphere), expected.slice, use.bank);
                 const std::array<std::uint32_t, 1> ownerBinding {use.binding_index};
-                validate_common_page_storage(program, page.launch_cycle, queue,
+                storageProof.validate(page.launch_cycle, queue,
                     expected.base_row, expected.vector_count, ownerBinding, use.release_cycle, pageLoads);
                 auto found = std::find_if(segments.begin(), segments.end(), [&](const auto& actual) {
                     return !actual.assigned && actual.launch == page.launch_event

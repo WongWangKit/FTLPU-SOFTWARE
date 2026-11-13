@@ -240,8 +240,6 @@ public:
     mlir::IRRewriter rewriter(function.getContext());
     for (auto scale : llvm::make_early_inc_range(function.getOps<kernel::BlockFp8ScaleOp>()))
       kernel::expandBlockFp8Arithmetic(scale.getOperation(), scale.getInput(), false, rewriter);
-    for (auto qdq : llvm::make_early_inc_range(function.getOps<kernel::BlockFp8QdqOp>()))
-      kernel::expandBlockFp8Arithmetic(qdq.getOperation(), qdq.getInput(), true, rewriter);
     if (function->hasAttr("ftlpu.logical_inputs")) {
       try {
         auto directory = function->getAttrOfType<mlir::StringAttr>("ftlpu.artifact_directory");
@@ -260,6 +258,17 @@ public:
         parent.print(out);
       } catch (const std::exception &e) {function.emitError(e.what());signalPassFailure();}
       return;
+    }
+    // Logical graphs retain this operation so the common planner partitions
+    // the last axis into independent K32 quantization groups. The primitive
+    // expansion below is only valid for one such group.
+    for (auto qdq : llvm::make_early_inc_range(function.getOps<kernel::BlockFp8QdqOp>())) {
+      auto shape=llvm::cast<mlir::RankedTensorType>(qdq.getInput().getType()).getShape();
+      if (shape[1]!=32) {
+        qdq.emitError("wide block FP8 QDQ requires the logical graph planner");
+        signalPassFailure();return;
+      }
+      kernel::expandBlockFp8Arithmetic(qdq.getOperation(), qdq.getInput(), true, rewriter);
     }
     kernel::RmsNormOp norm;kernel::MatmulOp projection;kernel::DepthwiseConv1DOp conv;
     int64_t kernels=0;

@@ -1,5 +1,6 @@
 @echo off
 setlocal
+chcp 65001 >nul
 
 set "VS_ROOT=D:\Apps\Microsoft Visual Studio\2026\community"
 call "%VS_ROOT%\VC\Auxiliary\Build\vcvars64.bat"

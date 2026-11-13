@@ -122,7 +122,7 @@ void validateUniqueSlices(const std::array<std::int64_t, N>& slices,
 
 } // namespace
 
-mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
+mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToMacroDomains(
     FfnUp3DShape shape, const FfnUp3DPlacement& placement,
     const FfnUp3DTimeline& timeline,
     const FfnUp3DRouteLatencies& routeLatencies,
@@ -266,7 +266,7 @@ mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
         for (std::size_t h = 0; h < placement.hemispheres.size(); ++h) {
             const auto& hemisphere = placement.hemispheres[h];
             for (const auto& region : hemisphere.weight_regions) {
-                const auto address = MemIcuAddress3D::BlockedOuter(
+                const auto address = MemAddressPattern::BlockedOuter(
                     asSize(region.base_address, "weight base address"),
                     1,
                     weightMiddleStride,
@@ -285,17 +285,17 @@ mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
                             routeLatencies.mem_to_mxm_weight_cycles,
                             slice, "MEM-to-MXM weight latency"),
                         "MXM weight consumer anchor");
-                    const IcuLoop3D loop {
+                    const AffineLoopDomain loop {
                         0,
                         {pulseRows, loopReductionCount,
                             asSize(region.pair_count, "weight pair count")},
                         {1, reductionStride, pairStride},
                     };
-                    auto instruction = MemIcuInstruction::Read3D(loop,
+                    auto instruction = MemAddressDomain::Read(loop,
                         address, StreamId::East(
                             asSize(placement.weight_stream_base,
                                 "weight stream base") + lane));
-                    detail::validate_mem_icu_instruction(instruction);
+                    detail::validate_mem_domain(instruction);
                     result.mem_commands.push_back({
                         memQueue(placement, h, slice, region.bank),
                         cycle,
@@ -309,7 +309,7 @@ mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
         for (std::size_t h = 0; h < placement.hemispheres.size(); ++h) {
             const auto& hemisphere = placement.hemispheres[h];
             for (std::size_t lane = 0; lane < hw::kLanesPerTile; ++lane) {
-                const auto address = MemIcuAddress3D::Affine(
+                const auto address = MemAddressPattern::Affine(
                     asSize(placement.activation_base_address,
                         "activation base address"),
                     {1, static_cast<std::int64_t>(pulseRows), 0});
@@ -330,16 +330,16 @@ mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
                             routeLatencies.mem_to_mxm_activation_cycles,
                             slice, "MEM-to-MXM activation latency"),
                         "MXM activation consumer anchor");
-                    const IcuLoop3D loop {
+                    const AffineLoopDomain loop {
                         0,
                         {pulseRows, loopReductionCount, loopPairCount},
                         {hw::kLanesPerTile, reductionStride, pairStride},
                     };
-                    auto instruction = MemIcuInstruction::Read3D(loop,
+                    auto instruction = MemAddressDomain::Read(loop,
                         address, StreamId::East(
                             asSize(placement.activation_stream_base,
                                 "activation stream base") + byte));
-                    detail::validate_mem_icu_instruction(instruction);
+                    detail::validate_mem_domain(instruction);
                     result.mem_commands.push_back({
                         memQueue(placement, h, slice,
                             placement.activation_bank),
@@ -352,7 +352,7 @@ mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
         // Final BF16 result drains into two byte slices in each hemisphere.
         for (std::size_t h = 0; h < placement.hemispheres.size(); ++h) {
             const auto& hemisphere = placement.hemispheres[h];
-            const auto address = MemIcuAddress3D::Affine(
+            const auto address = MemAddressPattern::Affine(
                 asSize(placement.result_base_address,
                     "result base address"),
                 {1, shape.m, 0});
@@ -366,16 +366,16 @@ mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
                         routeLatencies.mxm_result_to_mem_cycles,
                         slice, "MXM-to-MEM result latency"),
                     "MEM result consumer cycle");
-                const IcuLoop3D loop {
+                const AffineLoopDomain loop {
                     0,
                     {asSize(shape.m, "M"), loopPairCount, 1},
                     {1, pairStride, 1},
                 };
-                auto instruction = MemIcuInstruction::Write3D(loop,
+                auto instruction = MemAddressDomain::Write(loop,
                     address, StreamId::West(
                         asSize(hemisphere.result_stream_base,
                             "result stream base") + byte));
-                detail::validate_mem_icu_instruction(instruction);
+                detail::validate_mem_domain(instruction);
                 result.mem_commands.push_back({
                     memQueue(placement, h, slice,
                         placement.result_bank),
@@ -384,26 +384,26 @@ mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
             }
         }
 
-        const IcuLoop3D loadLoop {
+        const AffineLoopDomain loadLoop {
             0,
             {pulseRows, loopReductionCount, loopPairCount},
             {1, reductionStride, pairStride},
         };
-        const IcuLoop3D dequantLoop {
+        const AffineLoopDomain dequantLoop {
             0,
             loadLoop.counts, loadLoop.cycle_strides,
         };
-        const IcuLoop3D computeLoop {
+        const AffineLoopDomain computeLoop {
             0,
             {asSize(shape.m, "M"), loopReductionCount, loopPairCount},
             {1, reductionStride, pairStride},
         };
-        const MxmComputeIcuMode regularMode {
+        const MxmComputeMode regularMode {
             MxmAccumulatorDestination::Sram,
             false,
             MxmAccumulatorOutputFormat::Float32,
         };
-        const MxmComputeIcuMode terminalMode {
+        const MxmComputeMode terminalMode {
             MxmAccumulatorDestination::Stream,
             true,
             MxmAccumulatorOutputFormat::BFloat16,
@@ -411,16 +411,16 @@ mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
         for (const auto& hemisphere : placement.hemispheres) {
             const auto queue = asSize(hemisphere.mxm_queue,
                 "executable-local MXM queue");
-            auto load = MxmLoadIcuInstruction::Load3D(loadLoop, 0,
-                MxmIcuBufferMode::ToggleDimension1, 0, {1, 0, 0},
+            auto load = MxmLoadDomain::Load(loadLoop, 0,
+                MxmBufferSelection::ToggleDimension1, 0, {1, 0, 0},
                 asSize(placement.weight_stream_base,
                     "weight stream base"),
                 MxmWeightInputMode::Int8DequantBf16);
-            auto dequant = MxmDequantIcuInstruction::Dequant3D(
+            auto dequant = MxmDequantDomain::Dequant(
                 dequantLoop,
                 MxmDequantInstruction::ScaleBits(dequantScaleBf16));
-            auto compute = MxmComputeIcuInstruction::Compute3D(
-                computeLoop, 0, MxmIcuBufferMode::ToggleDimension1,
+            auto compute = MxmComputeDomain::Compute(
+                computeLoop, 0, MxmBufferSelection::ToggleDimension1,
                 asSize(placement.activation_stream_base,
                     "activation stream base"),
                 asSize(hemisphere.result_stream_base,
@@ -429,9 +429,9 @@ mlir::FailureOr<FfnUp3DLoweringResult> lowerFfnUpToFu3D(
                     "accumulator address base"),
                 {0, 0, 0}, 1, MxmDataFormat::BFloat16,
                 regularMode, 1, terminalMode);
-            detail::validate_mxm_load_icu_instruction(load);
-            detail::validate_mxm_dequant_icu_instruction(dequant);
-            detail::validate_mxm_compute_icu_instruction(compute);
+            detail::validate_mxm_load_domain(load);
+            detail::validate_mxm_dequant_domain(dequant);
+            detail::validate_mxm_compute_domain(compute);
             result.mxm_load_commands.push_back({queue,
                 asSize(timeline.mxm_load_start_cycle,
                     "MXM load start cycle"),

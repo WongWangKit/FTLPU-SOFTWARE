@@ -1,5 +1,7 @@
 // Keep this translation unit rebuilt with target topology ABI changes.
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/resource_scheduler.hpp"
+#include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_schedule_planner.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/ffn_schedule_emitter.hpp"
@@ -308,6 +310,37 @@ public:
             return;
         }
         reportStage("attention");
+        llvm::SmallVector<kernel::AttentionCoreOp> attentionCores;
+        function.walk([&](kernel::AttentionCoreOp core) {
+            attentionCores.push_back(core);
+        });
+        int64_t attentionCoreIndex = 0;
+        for (auto core : attentionCores) {
+            schedule::AttentionTaskGraph graph;
+            graph.core = core;
+            if (!graph.getMemoryPlan()) {
+                auto memoryPlan = schedule::planAttentionCoreMemory(
+                    rewriter, graph.config(), target);
+                if (mlir::failed(memoryPlan)) {
+                    core.emitError("cannot allocate native dense attention core storage");
+                    signalPassFailure();
+                    return;
+                }
+                core->setAttr("memory_plan", *memoryPlan);
+            }
+            auto stages = schedule::planAttentionStages(
+                {graph.getSeqLen(), graph.getHidden(), graph.getQueryHeads(),
+                    graph.getKvHeads(), graph.getHeadDim(), graph.getKvSeqLen()}, target);
+            schedule::AttentionScheduleEmitter emitter(rewriter, graph, target,
+                std::move(stages), AttentionScheduleStrategy::Tail, false);
+            auto result = emitter.emitCore(attentionCoreIndex++);
+            if (mlir::failed(result)) {
+                signalPassFailure();
+                return;
+            }
+            rewriter.replaceOp(core, *result);
+        }
+        if (!attentionCores.empty()) reportStage("dense-attention-core");
         if (mlir::failed(
                 schedule::lowerRmsNormSchedules(rewriter, function, target))) {
             signalPassFailure();

@@ -30,13 +30,20 @@ struct AttentionTaskGraphView {
     TransposeOp value_transpose;
     BatchMatmulOp pv;
 
+    // A core-only attention graph has real Q/K/V operands and a context
+    // result, without projection or RoPE tasks. The dense schedule consumes
+    // the same shape/configuration view in either case.
+    mlir::Operation* core = nullptr;
+
     mlir::DictionaryAttr config() const
     {
+        if (core) return core->getAttrOfType<mlir::DictionaryAttr>("config");
         auto op = output;
         return op.getConfig();
     }
     mlir::Location getLoc() const
     {
+        if (core) return core->getLoc();
         auto op = output;
         return op.getLoc();
     }
@@ -72,6 +79,7 @@ struct AttentionTaskGraphView {
     }
     mlir::Value getInput() const
     {
+        if (core) return core->getOperand(0);
         auto op = query;
         return op.getInput();
     }
@@ -132,11 +140,13 @@ struct AttentionTaskGraphView {
     }
     mlir::Value getResult() const
     {
+        if (core) return core->getResult(0);
         auto op = output;
         return op.getResult();
     }
     mlir::InFlightDiagnostic emitError(llvm::Twine message) const
     {
+        if (core) return core->emitError(message);
         auto op = output;
         return op.emitError(message);
     }

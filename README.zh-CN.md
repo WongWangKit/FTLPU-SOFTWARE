@@ -112,7 +112,7 @@ A/B cycle 测量游标。使用说明见
 
 ## 构建
 
-可选的 raw Macro 物理前端、参数扫描及其与现有 compact/FU3D 路径的关系见
+MEM/MXM/SXM 统一使用 raw Macro 物理前端，VXM 使用顺序 CONFIG；旧 2D/3D 执行路径已移除。当前规范见 [ICU Macro ISA](compiler/docs/icu_macro_isa.zh-CN.md)，前端参数与历史扫描见
 [Macro frontend 接入说明](docs/macro_frontend_physical_model.zh-CN.md)。
 
 CMake 默认假设 `FTLPU-CMODEL` 与本仓库位于同一父目录：

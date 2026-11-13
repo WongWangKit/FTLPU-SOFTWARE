@@ -1,48 +1,23 @@
 # Macro Frontend 首版物理模型
 
-## main 中的接入方式
+## 当前正式入口（2026-11-13）
 
-本功能按独立能力从实验分支迁移。现有 `macro` 模式继续使用 main 的
-compact/FU3D 路径；新增的物理前端通过显式 `raw-macro` 模式选择：
+MEM/MXM/SXM 统一使用 packed Macro，VXM 使用 96-bit 单字顺序 CONFIG。
+Transpose 与 Permute 保持独立队列。独立 2D/3D、STREAM_ND、slice/tile program
+及 compact/FU3D 执行器已移除；详见 [当前 ICU ISA](../compiler/docs/icu_macro_isa.zh-CN.md)。
+
+默认编译模式为 raw-macro，macro 是同义参数；none/control 不再支持。
+Schedule 仿射域直接生成 MacroOp，不先生成 FU 流再压缩。
+重定位在最终物理打包前完成。verify-icu-issues 检查二进制往返的逻辑 FU issue 等价，
+物理回放另检查取指/解析带宽和准时发射。相邻 Macro 的执行区间不允许交错。
+SXM 使用现有固定 frontend 参数；LPU32 context 上限分别为 Transpose 256 bit、Permute 384 bit。
 
 ```text
-ftlpu-compile --input model.stablehlo.mlir --input-stage stablehlo \
-  --output program.ftlpu --target-config target.json \
-  --icu-compression raw-macro --verify-icu-issues
-ftlpu-translate --input command.mlir --output program.ftlpu \
-  --icu-compression raw-macro --verify-icu-issues
+ftlpu-compile --input model.stablehlo.mlir --input-stage stablehlo --output program.ftlpu --target-config target.json --icu-compression raw-macro --verify-icu-issues
 macro_frontend_fetch_sweep program.ftlpu
-macro_frontend_fetch_sweep --structure program.ftlpu
-macro_frontend_fetch_sweep --admission program.ftlpu
 ```
 
-生产入口已贯通 `ftlpu-compile`、`ftlpu-opt` 和 `ftlpu-translate`。
-`ftlpu-opt` 把模式保留在 IR 中，后续入口在没有显式覆盖时继承该模式。
-默认 direct lowering 仍使用 FU3D。Command IR 的 `*_3d` 继续表示共同的粗循环域；
-最终生成二进制时，`raw-macro` 才把 MEM/MXM 域按 parity、terminal mode、
-blocked address 和仿射轴拆成二维 Macro，VXM/SXM 等保持原生 FU 路径。
-生产转换不展开整条功能指令流；一个源 packet 拆成多个描述符时，地址和 scale
-重定位逐一复制到对应描述符，且不跨不同源 packet 合并。
-
-packed-v1 仍不内嵌同步控制记录。同一 Raw 队列中的 `WAIT_EVENT`、SYNC 和同步 MEM
-传输不能直接编码；尚未覆盖的 `WRITE_READ_2D`、native4 decode 继续明确拒绝。
-分页程序改由 v37 公共屏障表统一冻结 Native/Macro 计算，通过独立 Native MEM transport
-保留实际 DMA/RX 启动、同步写入及 KV page-out 控制。最终链接必须证明候选边界的
-排空和 SRAM 生存期，并完整关联实际 MEM commit，之后才允许装载 Raw 分页程序。
-无法证明时明确拒绝，禁止静默退回 FU3D。全驻留 StableHLO FFN 已有真实前端数值回归；
-完整 decoder 的实际结果及剩余边界见 [公共屏障验证记录](common_barrier_validation.zh-CN.md)。
-
-`--verify-icu-issues` 现在可直接比较 FU3D 与 Macro 的功能指令及绝对发射周期。
-此开关不替代物理解码供给门禁；集成回归另用真实 ICU 逐周期回放，检查 cold prime、
-Active Context 和 admission deadline。二进制 `MacroPacked` 模式在读取后保留为
-必选 raw 队列，后续插入原生控制时，序列化和 loader 会报错，防止绕回旧 FU3D loader。
-
-raw 模式面向 96-bit MEM / 128-bit MXM、至多二维的仿射 Macro；其他 FU
-继续使用 main 原有路径。主机重定位后，loader 从更新后的语义指令重新生成镜像，
-防止使用失效的编码缓存。新写入容器版本为 v37，main 的 binding layout 编号保持不变；
-实验分支的 v33 布局不作为兼容格式引入。软件与更新后的 CModel 需配套构建。
-本轮验证对应 CModel main 的 `a99f3bc`；使用工作树时应通过
-`-DFTLPU_CMODEL_DIR=/path/to/cmodel-main` 指向包含该能力的 CModel。
+分页仍使用 common barrier 与真实 MEM/C2C 同步传输，不允许退回已移除的旧计算编码。
 
 冷启动时，issue clock 保持停止，在 parser/DDB 已 prime 后还需完成 cycle-zero
 context 的 admission，使 start_cycle=0 的指令在首个执行周期可见；远期 context
@@ -106,7 +81,7 @@ IMEM -> bit deque / combinational parser -> full context -> Active RAM
 | Lazy expander | FIFO head 每周期最多生成一个 context | 多 context/cycle 批量展开 |
 | Admission | 检查 timing window 和 Active RAM credit | issue match 与 context update |
 | Active Context RAM | 固定深度、allocation/free、valid lifecycle，以及显式 `next_issue_cycle` | descriptor decode 与 DDB storage |
-| Issue scheduler | 每个 queue 平坦比较全部 valid context；唯一 due context 发射并更新 | 动态优先级、冲突后的延迟发射 |
+| Issue scheduler | 预取 context 可以驻留；每个 queue 仅执行当前 Macro，末次 issue 后才能切换 | 动态优先级、冲突后的延迟发射 |
 
 各 stage 在同一 tick 并行推进。一个 cycle 内最多发生一次 fetch commit、一次
 parser state、一次 DDB commit 和一次 context admission；本周期 admit 的 context

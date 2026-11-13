@@ -4,11 +4,19 @@
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/Support/LogicalResult.h"
 
 #include <array>
 #include <cstdint>
 
 namespace ftlpu::compiler::schedule {
+
+// Native QK/Softmax/PV storage for a standalone, projection-free attention
+// core. KV length is physically padded to an MXM tile by the caller.
+mlir::FailureOr<mlir::DictionaryAttr> planAttentionCoreMemory(
+    mlir::OpBuilder& builder, mlir::DictionaryAttr config,
+    const target::LPUTargetModel& target);
 
 enum class AttentionProjectionKind : std::uint8_t {
     Query,
@@ -42,8 +50,8 @@ public:
     int64_t scoreAddress(int64_t queryHead, int64_t queryBlock,
         int64_t key) const;
     int64_t expScoreAddress(int64_t key) const { return expScoreBase_ + key; }
-    int64_t causalMaskAddress(int64_t localKey) const {
-        return causalMaskBase_ + localKey - 1;
+    int64_t causalMaskAddress(int64_t localKey, int64_t localMxm = 0) const {
+        return causalMaskBase_.at(static_cast<std::size_t>(localMxm)) + localKey - 1;
     }
     int64_t probabilityPackAddress(int64_t queryHead, int64_t queryBlock,
         int64_t keyBlock) const;
@@ -210,11 +218,12 @@ private:
     int64_t queryIwBase_ = 7600;
     int64_t scaledScoreBase_ = 0;
     int64_t expScoreBase_ = 0;
-    int64_t causalMaskBase_ = 8128;
+    std::array<int64_t, 2> causalMaskBase_ {{8128, 8128}};
     int64_t probabilityPackBase_ = 6000;
     int64_t probabilityDiagonalBase_ = 7000;
     int64_t valuePackBase_ = 7800;
     int64_t contextBase_ = 2000;
+    int64_t contextTokenStride_ = 0;
     int64_t resultBase_ = 0;
     bool resultPartitioned_ = false;
 };

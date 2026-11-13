@@ -63,44 +63,14 @@ try {
     binding.bank = 1;
     program.bindings.push_back(binding);
     program.timelines.push_back({"rmsnorm.transpose", 7, 13});
-    program.max_cycle = icu_program.last_cycle();
-    program.queues = icu_program.encode_queues();
-    const auto nativePermuteQueue = std::find_if(program.queues.begin(),
-        program.queues.end(), [](const QueueProgram& queue) {
-            return queue.kind == QueueKind::SxmPermute
-                && queue.index == 0;
-        });
-    require(nativePermuteQueue != program.queues.end(),
-        "native SXM permute queue is missing");
-    const auto nativePermute = std::find_if(
-        nativePermuteQueue->commands.begin(),
-        nativePermuteQueue->commands.end(),
-        [](const QueueCommand& command) {
-            return command.instruction_kind == InstructionKind::Sxm;
-        });
-    require(nativePermute != nativePermuteQueue->commands.end(),
-        "native SXM permute instruction is missing");
-    const auto westPermuteQueue = std::find_if(program.queues.begin(),
-        program.queues.end(), [](const QueueProgram& queue) {
-            return queue.kind == QueueKind::SxmPermute
-                && queue.index == 1;
-        });
-    require(westPermuteQueue != program.queues.end(),
-        "west SXM permute queue is missing");
-    westPermuteQueue->commands.push_back(
-        encode_sxm_tile_program_command(*nativePermute,
-            IcuSxmTileProgramSchedule {
-                20, 2, {4, 2, 1}, {1, 8, 1}, {0, 0, 0},
-                IcuInductionTarget::None}));
-    for (auto& queue : program.queues) {
-        if (queue.kind != QueueKind::SxmPermute || queue.index != 0)
-            continue;
-        QueueCommand repeat;
-        repeat.command = isa::encode_icu_repeat(
-            InstructionControlUnit::Repeat {3, 2, 0});
-        queue.commands.push_back(repeat);
-        program.max_cycle += 6;
-    }
+    program.max_cycle=32;
+    program.queues={
+        {QueueKind::SxmTranspose,0,{encode_macro_schedule_command(encode_sxm_command(transpose),
+            {7,1,1,0,1,1,0,IcuInductionTarget::None})}},
+        {QueueKind::SxmPermute,0,{encode_macro_schedule_command(encode_sxm_command(permute),
+            {12,4,2,0,1,1,0,IcuInductionTarget::None})}},
+        {QueueKind::SxmPermute,1,{encode_macro_schedule_command(encode_sxm_command(permute),
+            {20,4,1,0,2,8,0,IcuInductionTarget::None})}}};
     const auto path = std::filesystem::path(argv[1]);
     std::filesystem::create_directories(path.parent_path());
     write_binary_program(program, path);
@@ -147,16 +117,10 @@ try {
                 && ((command.words[3] >> 8) & 0xffu) == 0xffu
                 && ((command.words[3] >> 16) & 0xffu) == 2,
             "SXM row/tile selectors were not preserved");
-        require(std::any_of(queue.commands.begin(),
-                    queue.commands.end(),
-                    [](const QueueCommand& candidate) {
-                        return isa::decode_icu_command_opcode(
-                                   candidate.command)
-                            == isa::IcuCommandOpcode::Repeat;
-                    }),
-            "SXM repeat command was not preserved");
-        require(command.extension_words.size() == 2 + 16 + 16 + SxmInstruction::kTotalLanes,
-            "SXM variable payload size was not preserved");
+        const auto schedule=decode_macro_schedule_command(command);
+        require(schedule.inner_count==4 && schedule.inner_interval==2,"SXM Macro repeat lost");
+        require(command.extension_words.size()==9+2+16+16+SxmInstruction::kTotalLanes,
+            "SXM native map payload lost");
         found = true;
     }
     require(found, "serialized SXM permute queue is missing");
@@ -167,15 +131,14 @@ try {
         });
     require(tileQueue != decoded.queues.end()
             && tileQueue->commands.size() == 1
-            && is_sxm_tile_program_command(tileQueue->commands.front()),
-        "SXM_TILE_PROGRAM did not survive binary round-trip");
-    const auto tile = decode_sxm_tile_program_command(
+            && is_macro_schedule_command(tileQueue->commands.front()),
+        "SXM Macro did not survive binary round-trip");
+    const auto tile = decode_macro_schedule_command(
         tileQueue->commands.front());
-    require(tile.schedule.start_cycle == 20
-            && tile.schedule.rank == 2
-            && tile.schedule.counts[0] == 4
-            && tile.schedule.counts[1] == 2,
-        "SXM_TILE_PROGRAM schedule was not preserved");
+    require(tile.start_cycle == 20
+            && tile.inner_count == 4
+            && tile.outer_count == 2,
+        "SXM Macro schedule was not preserved");
 
     auto incompatible = decoded;
     incompatible.target_name = "incompatible-test-target";
@@ -195,6 +158,7 @@ try {
     runtime.load(decoded);
     require(system->hardware_configuration().mxms_per_hemisphere == 1,
         "CModel instance did not select the executable MXM topology");
+    runtime.run_cycles(program.max_cycle+128);
 
     auto legacy = decoded;
     legacy.target_name = "test-owned-legacy-hardware";
@@ -205,6 +169,7 @@ try {
     runtime.load(legacy);
     require(system->hardware_configuration().mxms_per_hemisphere == 2,
         "CModel instance did not select the legacy test configuration");
+    runtime.run_cycles(program.max_cycle+128);
 
     auto oversized = decoded;
     oversized.hardware.mxms_per_hemisphere =

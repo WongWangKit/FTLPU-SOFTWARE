@@ -8,7 +8,9 @@ mlir::LogicalResult lower_rms_norm(
     auto input = get_task_allocation(op.getInputAllocations(), 0);
     auto weight = get_task_allocation(op.getWeightAllocations(), 0);
     auto square = get_task_allocation(op.getScratchAllocations(), 0);
-    auto secondary = get_task_allocation(op.getScratchAllocations(), 1);
+    const auto planarAttr = op.getConfig().getAs<mlir::BoolAttr>("planar_streaming");
+    const bool planar = planarAttr && planarAttr.getValue();
+    auto secondary = get_task_allocation(op.getScratchAllocations(), planar ? 0 : 1);
     auto result = get_task_allocation(op.getResultAllocations(), 0);
     if (mlir::failed(input) || mlir::failed(weight)
         || mlir::failed(square) || mlir::failed(secondary)
@@ -79,6 +81,14 @@ mlir::LogicalResult lower_rms_norm(
     valid &= addRoute("feedback", "weight",
         target::StreamEndpoint::Mem, target::StreamEndpoint::VxmInput,
         target::StreamDirection::West, *weight, stage + 4, stage + 6);
+    if (planar) {
+        valid &= addRoute("reduction", "transposed_input",
+            target::StreamEndpoint::SxmResult, target::StreamEndpoint::VxmInput,
+            target::StreamDirection::West, *square, stage + 2, stage + 4);
+        valid &= addRoute("normalize", "normalized",
+            target::StreamEndpoint::VxmResult, target::StreamEndpoint::SxmInput,
+            target::StreamDirection::East, *result, stage + 6, stage + 10);
+    } else {
     valid &= addRoute("feedback", "normalized",
         target::StreamEndpoint::VxmResult, target::StreamEndpoint::Mem,
         target::StreamDirection::East, *secondary,
@@ -87,6 +97,7 @@ mlir::LogicalResult lower_rms_norm(
         target::StreamEndpoint::Mem, target::StreamEndpoint::SxmInput,
         target::StreamDirection::East, *secondary,
         stage + 8, stage + 10);
+    }
     valid &= addRoute("restore_layout", "result",
         target::StreamEndpoint::SxmResult, target::StreamEndpoint::Mem,
         target::StreamDirection::West, *result, stage + 10, stage + 12);

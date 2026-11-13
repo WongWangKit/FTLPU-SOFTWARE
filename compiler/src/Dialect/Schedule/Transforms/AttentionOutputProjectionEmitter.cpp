@@ -454,7 +454,7 @@ int64_t AttentionScheduleEmitter::emitOutputProjection(
           const int64_t headBlock = firstReduction % headBlocks;
           const int64_t slice =
               layout.contextSlice(queryHead, headBlock, byte);
-          // A long-lived READ_3D context cannot cross an output-weight read on
+          // A long-lived read domain context cannot cross an output-weight read on
           // the same physical MEM ICU.  Keep that topology as an explicit
           // piecewise-domain boundary.
           if (std::ranges::find(selectedWeightSlices, slice) !=

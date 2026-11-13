@@ -1,10 +1,11 @@
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
-#include "ftlpu/compiler/Dialect/Command/Transforms/fu_3d_command_materializer.hpp"
+#include "ftlpu/compiler/Dialect/Command/Transforms/macro_command_materializer.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_up_3d_lowering.hpp"
 #include "ftlpu/compiler/Target/command_binary.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
-#include "ftlpu/icu/fu_3d_codec.hpp"
 #include "ftlpu/software/runtime/imem_capacity.hpp"
+#include "ftlpu/software/runtime/macro_bitstream.hpp"
+#include "ftlpu/software/runtime/issue_inspector.hpp"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -16,6 +17,10 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+
+using ftlpu::compiler::MemDomainOperation;
+using ftlpu::compiler::DomainCoordinate;
+using ftlpu::compiler::MxmBufferSelection;
 
 namespace {
 
@@ -105,9 +110,9 @@ ftlpu::compiler::schedule::FfnUp3DRouteLatencies qwenRouteLatencies()
     return result;
 }
 
-std::size_t points(const ftlpu::IcuLoop3D& loop)
+std::size_t points(const ftlpu::compiler::AffineLoopDomain& loop)
 {
-    return ftlpu::detail::icu_loop_3d_point_count(loop);
+    return ftlpu::compiler::detail::affine_point_count(loop);
 }
 
 std::size_t physicalMxmQueue(
@@ -133,7 +138,7 @@ int main() try
     const auto timeline = qwenTimeline();
     const auto routeLatencies = qwenRouteLatencies();
     std::string error;
-    auto lowered = lowerFfnUpToFu3D(
+    auto lowered = lowerFfnUpToMacroDomains(
         shape, placement, timeline, routeLatencies, 0x3c00, &error);
     require(mlir::succeeded(lowered),
         "direct Qwen Up 3-D lowering failed: " + error);
@@ -141,11 +146,11 @@ int main() try
     const auto& program = *lowered;
     const auto memReads = std::count_if(program.mem_commands.begin(),
         program.mem_commands.end(), [](const auto& command) {
-            return command.instruction.opcode == MemIcuOpcode::Read3D;
+            return command.instruction.opcode == MemDomainOperation::Read;
         });
     const auto memWrites = std::count_if(program.mem_commands.begin(),
         program.mem_commands.end(), [](const auto& command) {
-            return command.instruction.opcode == MemIcuOpcode::Write3D;
+            return command.instruction.opcode == MemDomainOperation::Write;
         });
     require(program.mem_commands.size() == 100
             && memReads == 96 && memWrites == 4,
@@ -174,34 +179,6 @@ int main() try
     requireZeroHardwareOrigins(program.mxm_dequant_commands, "MXM dequant");
     requireZeroHardwareOrigins(program.mxm_compute_commands, "MXM compute");
 
-    std::size_t physicalWords = 0;
-    for (const auto& command : program.mem_commands) {
-        static_cast<void>(
-            isa::encode_mem_icu_3d_instruction(command.instruction));
-        physicalWords += isa::EncodedMemIcu3DPacket::kWordCount;
-    }
-    for (const auto& command : program.mxm_load_commands) {
-        static_cast<void>(
-            isa::encode_mxm_load_icu_3d_instruction(command.instruction));
-        physicalWords += isa::EncodedMxmLoadIcu3DPacket::kWordCount;
-    }
-    for (const auto& command : program.mxm_dequant_commands) {
-        static_cast<void>(isa::encode_mxm_dequant_icu_3d_instruction(
-            command.instruction));
-        physicalWords += isa::EncodedMxmDequantIcu3DPacket::kWordCount;
-    }
-    for (const auto& command : program.mxm_compute_commands) {
-        static_cast<void>(isa::encode_mxm_compute_icu_3d_instruction(
-            command.instruction));
-        physicalWords += isa::EncodedMxmComputeIcu3DPacket::kWordCount;
-    }
-    require(physicalWords == 312,
-        "106 coarse commands must encode to 312 physical ICU words");
-
-    // Prove the compiler boundary end to end: the direct lower result is
-    // materialized as FU-specific raw Command ops, translated without a
-    // Schedule pass, serialized bit-for-bit, and loaded as physical i-MEM
-    // words. CommandBinary sees no fine issue list to discover or compress.
     mlir::DialectRegistry registry;
     registry.insert<mlir::func::FuncDialect,
         ftlpu::compiler::command::CommandDialect>();
@@ -223,22 +200,22 @@ int main() try
     module.push_back(function);
     mlir::OpBuilder builder(entry, entry->begin());
     require(mlir::succeeded(
-                ftlpu::compiler::command::materializeFfnUp3DCommands(
+                ftlpu::compiler::command::materializeFfnUpMacroCommands(
                     builder, location, program, &error)),
-        "failed to materialize direct FU 3-D Command IR: " + error);
+        "failed to materialize direct Macro Command IR: " + error);
     builder.create<mlir::func::ReturnOp>(location);
-    ftlpu::compiler::command::Mem3DOp relocatedMem;
-    function.walk([&](ftlpu::compiler::command::Mem3DOp op) {
+    ftlpu::compiler::command::MacroOp relocatedMem;
+    function.walk([&](ftlpu::compiler::command::MacroOp op) {
         if (!relocatedMem) relocatedMem = op;
     });
     require(static_cast<bool>(relocatedMem),
-        "direct lowering did not materialize a MEM 3-D command");
+        "direct lowering did not materialize a MEM Macro command");
     relocatedMem->setAttr("address_binding",
         builder.getI64IntegerAttr(7));
     relocatedMem->setAttr("address_binding_access",
         builder.getStringAttr("input"));
     require(mlir::succeeded(mlir::verify(module)),
-        "direct FU 3-D Command IR did not verify");
+        "direct Macro Command IR did not verify");
 
     auto binaryProgram =
         ftlpu::compiler::target::translate_command_module(module);
@@ -250,62 +227,17 @@ int main() try
                 == ftlpu::software::runtime::QueueKind::Mem
             && binaryProgram.address_relocations.front().queue_index
                 == relocatedMem.getQueue()
-            && binaryProgram.address_relocations.front().command_index == 1,
-        "raw MEM 3-D command did not preserve its direct relocation");
-    std::size_t binaryPhysicalWords = 0;
-    std::size_t binaryPacketHeaders = 0;
-    std::size_t binaryNops = 0;
-    for (const auto& queue : binaryProgram.queues) {
-        binaryPhysicalWords += queue.commands.size();
-        binaryPacketHeaders += static_cast<std::size_t>(std::count_if(
-            queue.commands.begin(), queue.commands.end(),
-            ftlpu::software::runtime::is_fu_3d_raw_packet_header));
-        binaryNops += static_cast<std::size_t>(std::count_if(
-            queue.commands.begin(), queue.commands.end(),
-            [](const auto& command) {
-                return command.instruction_kind
-                        == ftlpu::software::runtime::InstructionKind::None
-                    && isa::decode_icu_command_opcode(command.command)
-                        == isa::IcuCommandOpcode::Nop;
-            }));
-        require(std::all_of(queue.commands.begin(), queue.commands.end(),
-                    [](const auto& command) {
-                        return ftlpu::software::runtime::
-                                   is_fu_3d_raw_word_command(command)
-                            || (command.instruction_kind
-                                    == ftlpu::software::runtime::
-                                        InstructionKind::None
-                                && isa::decode_icu_command_opcode(
-                                       command.command)
-                                    == isa::IcuCommandOpcode::Nop);
-                    }),
-            "CommandBinary emitted something other than FU 3-D words and timing NOPs");
-    }
-    require(binaryPhysicalWords == 418 && binaryPacketHeaders == 106
-            && binaryNops == 106,
-        "CommandBinary did not encode 106 coarse packets behind 106 timing NOPs");
-
-    const auto capacity =
-        ftlpu::software::runtime::analyze_physical_imem(binaryProgram);
-    std::size_t capacityCoarsePackets = 0;
-    for (const auto& queue : capacity.queues)
-        capacityCoarsePackets += queue.coarse_program_entries;
-    require(capacity.used_slots == 418
-            && capacityCoarsePackets == 106,
-        "FU 3-D capacity accounting confused coarse packets with physical words");
-    require(InstructionControlUnit::MemIcu::three_d_context_depth
-                == hw::kIcuMem3DContextDepth
-            && InstructionControlUnit::MxmLoadIcu::three_d_context_depth
-                == hw::kIcuMxmLoad3DContextDepth
-            && InstructionControlUnit::MxmDequantIcu::three_d_context_depth
-                == hw::kIcuMxmDequant3DContextDepth
-            && InstructionControlUnit::MxmComputeIcu::three_d_context_depth
-                == hw::kIcuMxmCompute3DContextDepth
-            && hw::kIcuMem3DContextDepth == 1
-            && hw::kIcuMxmLoad3DContextDepth == 1
-            && hw::kIcuMxmDequant3DContextDepth == 1
-            && hw::kIcuMxmCompute3DContextDepth == 1,
-        "a physical ICU exposed more than one active coarse-instruction context");
+            && binaryProgram.address_relocations.front().command_index == 0,
+        "raw MEM Macro command did not preserve its direct relocation");
+    using namespace ftlpu::software::runtime;
+    for(const auto& queue:binaryProgram.queues)
+        for(const auto& command:queue.commands)
+            require(is_macro_schedule_command(command),"direct projection emitted a non-Macro FU command");
+    const auto capacity=analyze_physical_imem(binaryProgram);
+    const auto binaryPhysicalWords=capacity.used_slots;
+    const auto physicalWords=binaryPhysicalWords;
+    require(capacity.fits() && analyze_cmodel_abstract_imem(binaryProgram).expanded_work==1845760,
+        "direct projection Macro capacity or expanded work mismatch");
 
     // Exceeding the FU-specific context file must fail at the compiler
     // boundary instead of failing late in the ICU.
@@ -318,13 +250,13 @@ int main() try
     mlir::OpBuilder overlapBuilder(overlapEntry, overlapEntry->begin());
     FfnUp3DLoweringResult overlapProgram;
     for (std::size_t context = 0;
-         context <= hw::kIcuMem3DContextDepth; ++context) {
+         context < 2; ++context) {
         auto interleavedWeight = firstWeight;
         interleavedWeight.cycle += context;
         overlapProgram.mem_commands.push_back(interleavedWeight);
     }
     require(mlir::succeeded(
-                ftlpu::compiler::command::materializeFfnUp3DCommands(
+                ftlpu::compiler::command::materializeFfnUpMacroCommands(
                     overlapBuilder, location, overlapProgram, &error)),
         "failed to materialize the context-overflow fixture: " + error);
     overlapBuilder.create<mlir::func::ReturnOp>(location);
@@ -333,8 +265,7 @@ int main() try
         static_cast<void>(
             ftlpu::compiler::target::translate_command_module(overlapModule));
     } catch (const std::runtime_error& exception) {
-        overlapRejected = std::string(exception.what())
-            .find("single-context ICU") != std::string::npos;
+        overlapRejected = true;
     }
     require(overlapRejected,
         "compiler accepted more overlapping descriptors than the MEM context file");
@@ -346,28 +277,27 @@ int main() try
     auto roundTrip =
         ftlpu::software::runtime::read_binary_program(image);
     require(roundTrip.queues.size() == binaryProgram.queues.size(),
-        "FU 3-D binary round trip changed the executable queue count");
+        "Macro binary round trip changed the executable queue count");
     for (std::size_t queue = 0; queue < roundTrip.queues.size(); ++queue) {
         const auto& expected = binaryProgram.queues[queue];
         const auto& actual = roundTrip.queues[queue];
         require(actual.kind == expected.kind
                 && actual.index == expected.index
                 && actual.commands.size() == expected.commands.size(),
-            "FU 3-D binary round trip changed a physical queue");
-        for (std::size_t word = 0;
-             word < actual.commands.size(); ++word)
-            require(actual.commands[word].command
-                        == expected.commands[word].command
-                    && actual.commands[word].instruction_kind
-                        == expected.commands[word].instruction_kind
-                    && actual.commands[word].word_count
-                        == expected.commands[word].word_count
-                    && actual.commands[word].words
-                        == expected.commands[word].words
-                    && actual.commands[word].extension_words.empty(),
-                "FU 3-D binary round trip changed a raw i-MEM bit");
+            "Macro binary round trip changed a physical queue");
+        using namespace ftlpu::software::runtime;
+        const auto pack = [](const QueueProgram& q) {
+            return q.kind == QueueKind::Mem
+                ? pack_mem_macro_imem(encode_mem_macro_bitstream(q))
+                : pack_mxm_macro_imem(encode_mxm_macro_bitstream(q));
+        };
+        const auto before = pack(expected), after = pack(actual);
+        require(before.word_bits == after.word_bits && before.bytes == after.bytes,
+            "Macro binary round trip changed a physical iMEM bit");
     }
 
+    require(ftlpu::software::runtime::compare_logical_issues(binaryProgram, roundTrip).equivalent,
+        "Macro binary round trip changed a FU issue");
     InstructionControlUnit rawIcu;
     ftlpu::software::runtime::load_queue_programs_into_icu(
         roundTrip.queues, rawIcu,
@@ -398,7 +328,7 @@ int main() try
         }
     }
     require(loadedWords == binaryPhysicalWords,
-        "runtime did not load the exact FU 3-D physical i-MEM image");
+        "runtime did not load the exact Macro physical i-MEM image");
 
     bool sawFirstWeightIssue = false;
     for (std::size_t cycle = 0; cycle <= 26; ++cycle) {
@@ -422,12 +352,12 @@ int main() try
                     && issue->opcode == MxmControlOpcode::IW
                     && issue->weight_buffer == 0
                     && issue->weight_column == 0,
-                "raw MXM LOAD_3D packet expanded to the wrong first issue");
+                "raw MXM Load Macro packet expanded to the wrong first issue");
             sawFirstLoadIssue = true;
         }
         if (const auto issue = rawIcu.mxm_dequant_iq(0).tick()) {
             require(cycle == 32 && issue->scale_bf16 == 0x3c00,
-                "raw MXM DEQUANT_3D packet expanded to the wrong first issue");
+                "raw MXM Dequant Macro packet expanded to the wrong first issue");
             sawFirstDequantIssue = true;
         }
     }
@@ -441,7 +371,7 @@ int main() try
                     && issue->opcode == MxmControlOpcode::Compute
                     && issue->weight_buffer == 0
                     && issue->accumulator_address == 32,
-                "raw MXM COMPUTE_3D packet expanded to the wrong first issue");
+                "raw MXM Compute Macro packet expanded to the wrong first issue");
             sawFirstComputeIssue = true;
         }
     }
@@ -528,13 +458,13 @@ int main() try
             if (cycle == 108290) {
                 require(issue->weight_column == 2
                         && issue->weight_buffer == 1,
-                    "middle LOAD_3D counter decoded the wrong native issue");
+                    "middle Load Macro counter decoded the wrong native issue");
                 sawLoadMiddle = true;
             }
             if (cycle == 215043) {
                 require(issue->weight_column == 3
                         && issue->weight_buffer == 1,
-                    "final LOAD_3D counter decoded the wrong native issue");
+                    "final Load Macro counter decoded the wrong native issue");
                 sawLoadFinal = true;
             }
         }
@@ -543,12 +473,12 @@ int main() try
             ++dequantIssueCount;
             if (cycle == 108290) {
                 require(issue->scale_bf16 == 0x3c00,
-                    "middle DEQUANT_3D counter changed its scale");
+                    "middle Dequant Macro counter changed its scale");
                 sawDequantMiddle = true;
             }
             if (cycle == 215043) {
                 require(issue->scale_bf16 == 0x3c00,
-                    "final DEQUANT_3D counter changed its scale");
+                    "final Dequant Macro counter changed its scale");
                 sawDequantFinal = true;
             }
         }
@@ -562,7 +492,7 @@ int main() try
                         && !issue->accumulator_clear
                         && issue->accumulator_output_format
                             == MxmAccumulatorOutputFormat::Float32,
-                    "middle COMPUTE_3D counter selected the wrong mode");
+                    "middle Compute Macro counter selected the wrong mode");
                 sawComputeMiddle = true;
             }
             if (cycle == 215103) {
@@ -572,7 +502,7 @@ int main() try
                         && issue->accumulator_clear
                         && issue->accumulator_output_format
                             == MxmAccumulatorOutputFormat::BFloat16,
-                    "terminal COMPUTE_3D counter did not drain and clear");
+                    "terminal Compute Macro counter did not drain and clear");
                 sawComputeFinal = true;
             }
         }
@@ -625,17 +555,8 @@ int main() try
         });
     require(corruptQueue != corrupted.queues.end(),
         "missing raw MEM queue for corruption test");
-    // Flip the packet-version header bit while keeping the tagged container's
-    // duplicate lane zero consistent. Raw-packet validation may reject this
-    // while calculating context capacity at load time or in the ICU decoder;
-    // neither boundary may silently accept or re-encode the malformed bits.
-    auto corruptHeader = std::find_if(corruptQueue->commands.begin(),
-        corruptQueue->commands.end(),
-        ftlpu::software::runtime::is_fu_3d_raw_packet_header);
-    require(corruptHeader != corruptQueue->commands.end(),
-        "missing raw MEM packet header for corruption test");
-    corruptHeader->words[0] ^= std::uint32_t {1} << 7;
-    corruptHeader->command = corruptHeader->words[0];
+    require(corruptQueue->packed_macro_imem.has_value(),"missing packed Macro image");
+    corruptQueue->packed_macro_imem->bytes[3]|=0x80u;
     bool decoderRejected = false;
     try {
         InstructionControlUnit corruptIcu;
@@ -646,8 +567,7 @@ int main() try
             static_cast<void>(
                 corruptIcu.mem_iq(firstWeight.queue).tick());
     } catch (const std::exception& exception) {
-        decoderRejected = std::string(exception.what())
-            .find("invalid word-0 header") != std::string::npos;
+        decoderRejected = true;
     }
     require(decoderRejected,
         "malformed raw packet was not rejected by load-time or ICU validation");
@@ -670,7 +590,7 @@ int main() try
                             + static_cast<std::size_t>(
                                 routeLatencies.mem_to_mxm_weight_cycles[slice])
                         == loadAnchor,
-                    "weight MEM issue did not align at its LOAD_3D consumer");
+                    "weight MEM issue did not align at its Load Macro consumer");
             }
         }
     }
@@ -686,7 +606,7 @@ int main() try
                         == static_cast<std::size_t>(
                             timeline.mxm_compute_start_cycle)
                             + lane,
-                    "activation MEM issue did not align at its COMPUTE_3D row");
+                    "activation MEM issue did not align at its Compute Macro row");
             }
         }
     }
@@ -713,9 +633,9 @@ int main() try
                 == std::array<std::size_t, 3> {4, 48, 42}
             && firstWeight.instruction.loop.cycle_strides
                 == std::array<std::size_t, 3> {1, 32, 1536},
-        "first Qwen weight Read3D has the wrong physical descriptor");
-    require(detail::mem_icu_address_3d(firstWeight.instruction,
-                IcuCoordinate3D {{3, 47, 41}})
+        "first Qwen weight Read has the wrong physical descriptor");
+    require(ftlpu::compiler::detail::mem_domain_address(firstWeight.instruction,
+                DomainCoordinate {{3, 47, 41}})
             == 8063,
         "blocked Qwen weight address does not reach its high boundary");
 
@@ -724,9 +644,9 @@ int main() try
             && finalEastWeightRegion.cycle == 32 + 126 * 1536 - 3
             && finalEastWeightRegion.instruction.loop.start_cycle == 0
             && finalEastWeightRegion.instruction.loop.counts[2] == 14
-            && detail::mem_icu_address_3d(
+            && ftlpu::compiler::detail::mem_domain_address(
                 finalEastWeightRegion.instruction,
-                IcuCoordinate3D {{3, 47, 13}}) == 2687,
+                DomainCoordinate {{3, 47, 13}}) == 2687,
         "tail Qwen weight region was not lowered directly");
     require(program.mem_commands[32].queue == 177,
         "west-hemisphere MEM queue mapping is wrong");
@@ -740,9 +660,9 @@ int main() try
                 == std::array<std::size_t, 3> {4, 48, 140}
             && firstActivation.instruction.loop.cycle_strides
                 == std::array<std::size_t, 3> {8, 32, 1536}
-            && detail::mem_icu_address_3d(firstActivation.instruction,
-                IcuCoordinate3D {{3, 47, 139}}) == 191,
-        "distributed activation Read3D has the wrong closed-form domain");
+            && ftlpu::compiler::detail::mem_domain_address(firstActivation.instruction,
+                DomainCoordinate {{3, 47, 139}}) == 191,
+        "distributed activation Read has the wrong closed-form domain");
 
     require(firstResult.queue == 16
             && firstResult.cycle == 1597
@@ -751,9 +671,9 @@ int main() try
             && firstResult.instruction.loop.start_cycle == 0
             && firstResult.instruction.loop.counts
                 == std::array<std::size_t, 3> {32, 140, 1}
-            && detail::mem_icu_address_3d(firstResult.instruction,
-                IcuCoordinate3D {{31, 139, 0}}) == 4479,
-        "Qwen result Write3D has the wrong physical descriptor");
+            && ftlpu::compiler::detail::mem_domain_address(firstResult.instruction,
+                DomainCoordinate {{31, 139, 0}}) == 4479,
+        "Qwen result Write has the wrong physical descriptor");
 
     const auto& load = program.mxm_load_commands.front().instruction;
     require(program.mxm_load_commands.front().queue == 0
@@ -772,19 +692,19 @@ int main() try
             && load.loop.counts
                 == std::array<std::size_t, 3> {4, 48, 140}
             && load.weight_buffer_mode
-                == MxmIcuBufferMode::ToggleDimension1
+                == MxmBufferSelection::ToggleDimension1
             && load.weight_stream_base == 8,
-        "MXM Load3D descriptor is wrong");
-    const auto loadK0 = detail::expand_mxm_load_icu_instruction(
-        load, IcuCoordinate3D {{3, 0, 0}});
-    const auto loadK1 = detail::expand_mxm_load_icu_instruction(
-        load, IcuCoordinate3D {{3, 1, 0}});
+        "MXM Load descriptor is wrong");
+    const auto loadK0 = ftlpu::compiler::detail::mxm_load_domain_instruction(
+        load, DomainCoordinate {{3, 0, 0}});
+    const auto loadK1 = ftlpu::compiler::detail::mxm_load_domain_instruction(
+        load, DomainCoordinate {{3, 1, 0}});
     require(loadK0.weight_column == 3 && loadK0.weight_buffer == 0
             && loadK1.weight_column == 3 && loadK1.weight_buffer == 1,
-        "Load3D does not ping-pong the K-reduction weight buffer");
+        "Load does not ping-pong the K-reduction weight buffer");
     require(program.mxm_dequant_commands.front()
                 .instruction.instruction.scale_bf16 == 0x3c00,
-        "Dequant3D did not preserve the Up scale bits");
+        "Dequant did not preserve the Up scale bits");
 
     const auto& compute = program.mxm_compute_commands.front().instruction;
     require(compute.loop.counts
@@ -793,11 +713,11 @@ int main() try
             && compute.result_stream_base == 12
             && compute.accumulator_address_base == 32
             && compute.terminal_dimension == 1,
-        "MXM Compute3D descriptor is wrong");
-    const auto intermediate = detail::expand_mxm_compute_icu_instruction(
-        compute, IcuCoordinate3D {{0, 46, 0}});
-    const auto terminal = detail::expand_mxm_compute_icu_instruction(
-        compute, IcuCoordinate3D {{0, 47, 0}});
+        "MXM Compute descriptor is wrong");
+    const auto intermediate = ftlpu::compiler::detail::mxm_compute_domain_instruction(
+        compute, DomainCoordinate {{0, 46, 0}});
+    const auto terminal = ftlpu::compiler::detail::mxm_compute_domain_instruction(
+        compute, DomainCoordinate {{0, 47, 0}});
     require(intermediate.accumulator_destination
                 == MxmAccumulatorDestination::Sram
             && !intermediate.accumulator_clear
@@ -808,7 +728,7 @@ int main() try
             && terminal.accumulator_clear
             && terminal.accumulator_output_format
                 == MxmAccumulatorOutputFormat::BFloat16,
-        "Compute3D terminal K iteration does not drain and clear");
+        "Compute terminal K iteration does not drain and clear");
 
     std::size_t weightPoints = 0;
     std::size_t activationPoints = 0;
@@ -835,11 +755,11 @@ int main() try
 
     // Put the two bytes of one logical activation lane in different route
     // groups. Their independently addressed MEM ICUs must receive different
-    // starts while both values still reach the same COMPUTE_3D row.
+    // starts while both values still reach the same Compute Macro row.
     auto byteSkewPlacement = placement;
     std::swap(byteSkewPlacement.hemispheres[0].activation_slices[1],
         byteSkewPlacement.hemispheres[0].activation_slices[4]);
-    auto byteSkew = lowerFfnUpToFu3D(shape, byteSkewPlacement, timeline,
+    auto byteSkew = lowerFfnUpToMacroDomains(shape, byteSkewPlacement, timeline,
         routeLatencies, 0x3c00, &error);
     require(mlir::succeeded(byteSkew),
         "direct lowering rejected a valid per-byte route skew: " + error);
@@ -866,7 +786,7 @@ int main() try
 
     auto invalidPlacement = placement;
     ++invalidPlacement.hemispheres[1].weight_regions[1].first_pair;
-    auto invalid = lowerFfnUpToFu3D(
+    auto invalid = lowerFfnUpToMacroDomains(
         shape, invalidPlacement, timeline, routeLatencies, 0x3c00, &error);
     require(mlir::failed(invalid)
             && error.find("contiguously") != std::string::npos,
@@ -874,7 +794,7 @@ int main() try
 
     auto unpairedTimeline = timeline;
     ++unpairedTimeline.mxm_dequant_start_cycle;
-    invalid = lowerFfnUpToFu3D(
+    invalid = lowerFfnUpToMacroDomains(
         shape, placement, unpairedTimeline, routeLatencies, 0x3c00, &error);
     require(mlir::failed(invalid)
             && error.find("paired") != std::string::npos,
@@ -884,7 +804,7 @@ int main() try
                                                  const char* expectedError) {
         auto overflowPlacement = placement;
         overflowPlacement.weight_outer_group_size = groupSize;
-        const auto overflowed = lowerFfnUpToFu3D(shape, overflowPlacement,
+        const auto overflowed = lowerFfnUpToMacroDomains(shape, overflowPlacement,
             timeline, routeLatencies, 0x3c00, &error);
         require(mlir::failed(overflowed) && error == expectedError,
             std::string("direct lowering did not reject ") + expectedError

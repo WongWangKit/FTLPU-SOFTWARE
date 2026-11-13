@@ -1,12 +1,11 @@
 #include "ftlpu/software/runtime/queue_phase_release.hpp"
 #include "ftlpu/software/runtime/common_page_storage.hpp"
 #include "ftlpu/software/runtime/model_session.hpp"
-#include "ftlpu/software/runtime/fu_3d_macro_lowering.hpp"
+#include "ftlpu/software/runtime/macro_queue_link.hpp"
 
 #include "ftlpu/core/bf16.hpp"
 #include "ftlpu/core/fp16.hpp"
 #include "ftlpu/c2c/dma_instruction.hpp"
-#include "ftlpu/icu/fu_3d_codec.hpp"
 #include "ftlpu/icu/instruction.hpp"
 #include "ftlpu/icu/location.hpp"
 #include "ftlpu/mem/slice.hpp"
@@ -135,80 +134,8 @@ BinaryProgram parameterize_program(const ModelPackage &package,
       throw std::logic_error(
           "executable scale relocation references a missing command");
     QueueCommand &command = queue->commands[relocation.command_index];
-    if (is_fu_3d_raw_packet_header(command) &&
-        relocation.queue_kind == QueueKind::MxmDequant) {
-      const std::size_t packetWords =
-          fu_3d_raw_packet_word_count(queue->kind, command);
-      if (relocation.command_index + packetWords > queue->commands.size())
-        throw std::logic_error(
-            "raw MXM DEQUANT_3D scale relocation references a truncated packet");
-      isa::EncodedMxmDequantIcu3DPacket packet{};
-      for (std::size_t word = 0; word < packetWords; ++word) {
-        const QueueCommand &source =
-            queue->commands[relocation.command_index + word];
-        if (source.instruction_kind != InstructionKind::MxmDequant ||
-            source.word_count !=
-                isa::EncodedMxmDequantIcu3DPacket::kLanesPerWord)
-          throw std::logic_error(
-              "raw MXM DEQUANT_3D scale relocation has an invalid word");
-        for (std::size_t lane = 0;
-             lane < isa::EncodedMxmDequantIcu3DPacket::kLanesPerWord; ++lane)
-          packet.words[word].lanes[lane] = source.words[lane];
-      }
-      auto instruction = isa::decode_mxm_dequant_icu_3d_instruction(packet);
-      instruction.instruction =
-          MxmDequantInstruction::Scale(tensor.scales[relocation.scale_index]);
-      packet = isa::patch_mxm_dequant_icu_scale(packet, instruction.instruction);
-      for (std::size_t word = 0; word < packetWords; ++word) {
-        QueueCommand &target =
-            queue->commands[relocation.command_index + word];
-        target.command = packet.words[word].lanes[0];
-        for (std::size_t lane = 0;
-             lane < isa::EncodedMxmDequantIcu3DPacket::kLanesPerWord; ++lane)
-          target.words[lane] = packet.words[word].lanes[lane];
-      }
-      continue;
-    }
-    if (is_fu_3d_raw_packet_header(command) &&
-        relocation.queue_kind == QueueKind::Vxm) {
-      constexpr std::size_t packetWords =
-          isa::EncodedVxmIcuRun2DPacket::kWordCount;
-      if (relocation.command_index + packetWords > queue->commands.size())
-        throw std::logic_error(
-            "raw VXM RUN_2D scale relocation references a truncated packet");
-      isa::EncodedVxmIcuRun2DPacket packet{};
-      for (std::size_t word = 0; word < packetWords; ++word) {
-        const QueueCommand &source =
-            queue->commands[relocation.command_index + word];
-        if (source.instruction_kind != InstructionKind::Vxm ||
-            source.word_count != isa::EncodedVxmIcuRun2DPacket::kLanesPerWord)
-          throw std::logic_error(
-              "raw VXM RUN_2D scale relocation has an invalid word");
-        for (std::size_t lane = 0;
-             lane < isa::EncodedVxmIcuRun2DPacket::kLanesPerWord; ++lane)
-          packet.words[word].lanes[lane] = source.words[lane];
-      }
-      auto run = isa::decode_vxm_icu_run_2d_instruction(packet);
-      auto decoded = isa::decode_vxm_instruction(queue->index,
-                                                  run.instruction);
-      VxmLaneOperand &operand = relocation.operand == VxmImmediateOperand::Lhs
-          ? decoded.instruction.lhs : decoded.instruction.rhs;
-      if (operand.kind != VxmLaneOperandKind::Immediate)
-        throw std::logic_error(
-            "raw VXM RUN_2D scale relocation target is not immediate");
-      operand = VxmLaneOperand::Imm(tensor.scales[relocation.scale_index]);
-      run.instruction = isa::encode_vxm_instruction(queue->index, decoded.chain_depth, decoded.instruction);
-      packet = isa::encode_vxm_icu_run_2d_instruction(run);
-      for (std::size_t word = 0; word < packetWords; ++word) {
-        QueueCommand &target =
-            queue->commands[relocation.command_index + word];
-        target.command = packet.words[word].lanes[0];
-        for (std::size_t lane = 0;
-             lane < isa::EncodedVxmIcuRun2DPacket::kLanesPerWord; ++lane)
-          target.words[lane] = packet.words[word].lanes[lane];
-      }
-      continue;
-    }
+
+
     if (command.instruction_kind == InstructionKind::MxmDequant &&
         command.word_count == 1) {
       command.words[0] = static_cast<std::uint32_t>(
@@ -311,14 +238,7 @@ BinaryProgram parameterize_program(const ModelPackage &package,
             " relocated=" + std::to_string(relocated));
       return static_cast<std::size_t>(relocated);
     };
-    if (is_mem_slice_program_command(command)) {
-      auto sliceProgram = decode_mem_slice_program_command(command);
-      for (auto &entry : sliceProgram.body)
-        entry.instruction.address =
-            relocate_address(entry.instruction.address);
-      command = encode_mem_slice_program_command(sliceProgram);
-      continue;
-    }
+
     if (relocation.queue_kind == QueueKind::Mem &&
         is_mem_synchronized_raw_packet_header(command)) {
       auto packet = decode_mem_synchronized_icu_packet(
@@ -350,66 +270,8 @@ BinaryProgram parameterize_program(const ModelPackage &package,
         queue->commands[relocation.command_index + word] = commands[word];
       continue;
     }
-    if (relocation.queue_kind == QueueKind::Mem &&
-        is_mem_write_read_2d_raw_packet_header(command)) {
-      constexpr std::size_t packetWords =
-          isa::EncodedMemIcuWriteRead2DPacket::kWordCount;
-      if (relocation.command_index + packetWords > queue->commands.size())
-        throw std::logic_error(
-            "WRITE_READ_2D relocation references a truncated packet");
-      auto instruction = decode_mem_write_read_2d_raw_packet(
-          *queue, relocation.command_index);
-      instruction.base_address = relocate_address(instruction.base_address);
-      const auto packet =
-          isa::encode_mem_icu_write_read_2d_instruction(instruction);
-      for (std::size_t word = 0; word < packetWords; ++word) {
-        QueueCommand &target =
-            queue->commands[relocation.command_index + word];
-        target.command = packet.words[word].lanes[0];
-        target.word_count = static_cast<std::uint16_t>(
-            isa::EncodedMemIcuWriteRead2DPacket::kLanesPerWord);
-        for (std::size_t lane = 0;
-             lane < isa::EncodedMemIcuWriteRead2DPacket::kLanesPerWord;
-             ++lane)
-          target.words[lane] = packet.words[word].lanes[lane];
-      }
-      continue;
-    }
-    if (relocation.queue_kind == QueueKind::Mem &&
-        is_fu_3d_raw_packet_header(command)) {
-      const std::size_t packetWords =
-          fu_3d_raw_packet_word_count(queue->kind, command);
-      if (relocation.command_index + packetWords > queue->commands.size())
-        throw std::logic_error(
-            "raw MEM 3-D relocation references a truncated packet");
-      isa::EncodedMemIcu3DPacket packet{};
-      for (std::size_t word = 0; word < packetWords; ++word) {
-        const QueueCommand &source =
-            queue->commands[relocation.command_index + word];
-        if (source.instruction_kind != InstructionKind::Mem ||
-            source.word_count != isa::EncodedMemIcu3DPacket::kLanesPerWord)
-          throw std::logic_error(
-              "raw MEM 3-D relocation target has an invalid physical word");
-        for (std::size_t lane = 0;
-             lane < isa::EncodedMemIcu3DPacket::kLanesPerWord; ++lane)
-          packet.words[word].lanes[lane] = source.words[lane];
-      }
-      auto instruction = isa::decode_mem_icu_3d_instruction(packet);
-      instruction.address.base_address =
-          relocate_address(instruction.address.base_address);
-      packet = isa::patch_mem_icu_base_address(packet, instruction.address.base_address);
-      for (std::size_t word = 0; word < packetWords; ++word) {
-        QueueCommand &target =
-            queue->commands[relocation.command_index + word];
-        target.command = packet.words[word].lanes[0];
-        target.word_count = static_cast<std::uint16_t>(
-            isa::EncodedMemIcu3DPacket::kLanesPerWord);
-        for (std::size_t lane = 0;
-             lane < isa::EncodedMemIcu3DPacket::kLanesPerWord; ++lane)
-          target.words[lane] = packet.words[word].lanes[lane];
-      }
-      continue;
-    }
+
+
     if (command.instruction_kind != InstructionKind::Mem ||
         command.word_count == 0 || command.word_count > 2)
       throw std::logic_error(
@@ -1046,6 +908,22 @@ std::vector<std::uint8_t> ModelSession::download_binding_through_c2c(
   if (c2c_system_ == nullptr)
     throw std::logic_error(
         "LPU output cannot bypass C2C in this ModelSession");
+  if (std::any_of(binding.pieces.begin(), binding.pieces.end(),
+          [&](const auto& piece) { return piece.bank != binding.bank; })) {
+    // Each child already has its compiler-selected physical bank/address.
+    // Read those homes through ordinary C2C transfers, then concatenate bytes
+    // on the host; no on-chip archive copy or model arithmetic is involved.
+    if (compilerProgram != nullptr)
+      throw std::logic_error("mixed-bank pieces are diagnostic outputs, not persistent state");
+    validate_native_output_pieces(binding, hardware);
+    std::vector<std::uint8_t> result;
+    result.reserve(binding.byte_size);
+    for (const auto& piece : binding.pieces) {
+      auto data = download_binding_through_c2c(piece, hardware);
+      result.insert(result.end(), data.begin(), data.end());
+    }
+    return result;
+  }
   const std::vector<std::uint8_t> zero(
       static_cast<std::size_t>(binding.byte_size), 0);
   PackedWeightImage image = pack_binding_image(binding, zero, hardware);
@@ -1599,6 +1477,7 @@ void ModelSession::prepare_executable_weight_pages(
 
 void ModelSession::execute_executable_weight_preloads(const BinaryProgram& program) {
   const auto pageLoads = build_common_page_load_ranges(program);
+  CommonPageStorageValidator storageProof(program);
   for (ExecutableWeightTransfer &transfer : executable_weight_transfers_) {
     if (!transfer.plan.pre_execution || transfer.ready_before_execution)
       continue;
@@ -1610,7 +1489,7 @@ void ModelSession::execute_executable_weight_preloads(const BinaryProgram& progr
         pageRelease = std::max(pageRelease, program.weight_page_uses.at(use).release_cycle);
       }
       for (const auto& segment : transfer.page.segments)
-        validate_common_page_storage(program, 0,
+        storageProof.validate(0,
             InstructionControlUnit::mem_queue(segment.hemisphere, segment.slice, segment.bank),
             segment.base_row, segment.vector_count, ownerBindings, pageRelease, pageLoads);
     }
@@ -2481,7 +2360,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
   report("model weight page ready");
   auto compiledInput=materialize_model_executable(executable);
   const bool queueControlRequested=compiledInput.queue_control_protocol;
-  if(queueControlRequested) compiledInput=native_queue_link_input(compiledInput);
+  if(queueControlRequested) compiledInput=macro_queue_link_input(compiledInput);
   BinaryProgram program =
       parameterize_program(package_, invocation, invocation_plan,std::move(compiledInput));
   const BinaryQueueLinkSource relinkRecipe{false,program.queues,program.address_relocations,program.scale_relocations};
@@ -2640,7 +2519,7 @@ void ModelSession::run_invocation(std::size_t index, std::size_t drain_cycles) {
     }
     const auto encodingOverride=std::getenv("FTLPU_QUEUE_CONTROL_FINAL_ENCODING");
     const bool nativeControl=encodingOverride && std::string_view(encodingOverride)=="native";
-    externalize_native_queue_controls(runtimeProgram,!nativeControl,[&](QueueSyncPlan& syncPlan) {
+    link_queue_controls(runtimeProgram,!nativeControl,[&](QueueSyncPlan& syncPlan) {
     for(auto& partition:syncPlan.partitions)
       for(auto& control:partition.entries) {
         if(control.opcode!=IcuControlOpcode::WaitEvent) continue;

@@ -2,7 +2,6 @@
 #include "ftlpu/software/runtime/cmodel_runtime.hpp"
 #include "ftlpu/software/runtime/common_overlap.hpp"
 #include "ftlpu/software/runtime/weight_page_builder.hpp"
-#include "ftlpu/icu/fu_3d_codec.hpp"
 
 #include <algorithm>
 #include <array>
@@ -339,35 +338,6 @@ Result run(std::size_t latency, bool cycleZero = false, bool overlap = false,
         rejects([&] { preflightLoad(alias); }, "internal SRAM read was mistaken for the incoming weight page");
         alias.address_relocations.back().binding_access = BindingAccess::Input;
         preflightLoad(alias); // The incoming page's own linked read is legal.
-        // Native 3D must pass the same SRAM proof, including provenance after
-        // one domain splits into several affine descriptors for analysis.
-        auto native3d = alias;
-        auto& nativeQueue = native3d.queues.back();
-        nativeQueue.requires_raw_macro = false;
-        nativeQueue.commands.clear();
-        IcuLoop3D loop;
-        loop.counts = {2, 2, 2};
-        loop.cycle_strides = {1, 8, 32};
-        loop.wait_cycle = 256;
-        const auto packet = isa::encode_mem_icu_3d_instruction(
-            MemIcuInstruction::Read3D(loop,
-                MemIcuAddress3D::Affine(segment.base_row, {1, 2, 4}), StreamId::East(2)));
-        for (const auto& word : packet.words) {
-            QueueCommand command;
-            command.command = word.lanes[0];
-            command.instruction_kind = InstructionKind::Mem;
-            command.word_count = packet.kLanesPerWord;
-            std::copy(word.lanes.begin(), word.lanes.end(), command.words.begin());
-            nativeQueue.commands.push_back(command);
-        }
-        preflightLoad(native3d);
-        native3d.address_relocations.back().binding_access = BindingAccess::Internal;
-        rejects([&] { preflightLoad(native3d); },
-            "Native 3D page write overwrote a future non-weight read");
-        native3d.address_relocations.back().binding_access = BindingAccess::Input;
-        native3d.address_relocations.back().command_index = 1;
-        rejects([&] { preflightLoad(native3d); },
-            "Native 3D proof accepted provenance on a continuation word");
         // A mixed queue can take the Native compatibility loader. Its first
         // Macro runs at L256, so a following Native read really runs after the
         // page-in; the proof must not mistake it for cursor zero and skip it.

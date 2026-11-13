@@ -1,4 +1,4 @@
-module attributes {ftlpu.icu_compression = "control"} {
+module attributes {ftlpu.icu_compression = "raw-macro"} {
   func.func @main() {
     ftlpu.command.mem {
       cycle = 0 : i64, queue = 0 : i64, opcode = "read",
@@ -54,8 +54,7 @@ module attributes {ftlpu.icu_compression = "control"} {
       wave_count = 3 : i64, wave_interval = 8 : i64,
       wave_address_stride = 16 : i64
     }
-    // The event at cycle 4 interleaves the outer wave. The binary emitter
-    // must expand the outer dimension because Repeat2D is blocking.
+    // The next command follows the complete Macro; one queue cannot interleave.
     ftlpu.command.mem {
       cycle = 0 : i64, queue = 6 : i64, opcode = "read",
       address = 300 : i64, packed_stream = 4 : i64,
@@ -65,12 +64,12 @@ module attributes {ftlpu.icu_compression = "control"} {
       wave_address_stride = 16 : i64
     }
     ftlpu.command.mem {
-      cycle = 4 : i64, queue = 6 : i64, opcode = "read",
+      cycle = 20 : i64, queue = 6 : i64, opcode = "read",
       address = 999 : i64, packed_stream = 5 : i64,
       repeat_count = 1 : i64, repeat_interval = 1 : i64,
       address_stride = 0 : i64
     }
-    // Preserve this affine sequence as one native instruction plus Repeat.
+    // Preserve two explicit non-overlapping Macro domains.
     ftlpu.command.mem {
       cycle = 0 : i64, queue = 8 : i64, opcode = "read",
       address = 400 : i64, packed_stream = 6 : i64,

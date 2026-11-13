@@ -75,6 +75,20 @@ Tensor flashExpDifference(const std::string &name, const Tensor &x, const Tensor
   return flashBinaryThenUnary(name,x,y,"subtract","exp");
 }
 
+Tensor flashSumInverse(const std::string &name, const Tensor &x) {
+  Tensor out;out.shape={1,x.shape[1]};out.dtype="f32";
+  const auto ty=[&](const Tensor &t){std::string s;llvm::raw_string_ostream os(s);type(&context,t).print(os);return s;};
+  const auto xt=ty(x),ot=ty(out);
+  const auto source="module { func.func @stage(%x: "+xt+") -> "+ot+
+      " attributes {ftlpu.vector_bf16_spill = false} { "
+      "%sum = ftlpu.kernel.vector_alu %x, %x {kind = \"multiply\", use_immediate = true, "
+      "immediate = 1.0 : f32, reduce = true, reduction_axis = 0 : i64, reduction_kind = \"add\"} : ("+xt+", "+xt+") -> "+ot+
+      " %inverse = ftlpu.kernel.vector_alu %sum, %sum {kind = \"reciprocal\", use_immediate = true, "
+      "immediate = 0.0 : f32, reduce = false} : ("+ot+", "+ot+") -> "+ot+
+      " return %inverse : "+ot+" } }";
+  return add(name,source,{x},{out})[0];
+}
+
 // A value-channel word shares one query's coefficient across all its lanes.
 Tensor flashRowCoefficients(const std::string &name, Tensor x, I live, I tile,
                             const std::string &dtype="f32") {
@@ -87,6 +101,9 @@ Tensor flashRowCoefficients(const std::string &name, Tensor x, I live, I tile,
 Tensor lowerFlashAttention(const std::string &name, const Tensor &q,
     const Tensor &k, const Tensor &v, const Tensor &out,
     float scale, bool causal, I position) {
+  if(nativeFlashTileEligible(q,k,v,position))
+    return lowerNativeFlashTile(name,q,k,v,out,scale,causal,position);
+  const I firstNode=nodes.size();
   const I batch=q.shape[0], qt=q.shape[1], qh=q.shape[2], kd=q.shape[3];
   const I kt=k.shape[1], kh=k.shape[2], vd=v.shape[3], group=qh/kh;
   const I tile=target.throughput().mxm_rows;
@@ -94,6 +111,12 @@ Tensor lowerFlashAttention(const std::string &name, const Tensor &q,
   const I groups=batch*kh, queryRows=qt*group;
   std::vector<std::vector<Tensor>> grouped(groups);
   for(I pair=0;pair<groups;pair+=2) {
+    // Query blocks revisit the same K/V tile. Retain its prepared planar
+    // words, bounded by one mirrored slice-pair's capacity; tensor references
+    // extend the real SRAM lifetime instead of reloading/repacking each time.
+    const bool retainKv=2*((kt+tile-1)/tile)*tile*(kd+vd)/tile <= target.memory().sram_depth_rows;
+    std::map<I,ActivationLhsTiles> sharedKeys;
+    std::map<I,ActivationRhsTiles> sharedValues;
     for(I qr=0;qr<queryRows;qr+=tile) {
       const I live=std::min<I>(tile,queryRows-qr);
       V qi;
@@ -127,7 +150,7 @@ Tensor lowerFlashAttention(const std::string &name, const Tensor &q,
         // Each packed word is already one key across 32 query rows.
         Tensor scoreType;scoreType.shape={2,tile,tile};scoreType.dtype="bf16";
         auto dots=lowerActivationBatchMatmul(prefix+".kqt",view(k,ki,{2,tile,kd}),
-            query,scoreType,true,nullptr,&sharedQuery,true);
+            query,scoreType,true,retainKv?&sharedKeys[first]:nullptr,&sharedQuery,true);
         V timeOrder;
         for(I t=0;t<keys;++t)for(I side=0;side<2;++side)for(I r=0;r<tile;++r) {
           timeOrder.push_back((side*tile+t)*tile+r);
@@ -143,20 +166,28 @@ Tensor lowerFlashAttention(const std::string &name, const Tensor &q,
         auto nextMax=first?flashTimeOp(prefix+".max_update",maximum,"max","f32",&blockMax):blockMax;
         auto probability=flashExpDifference(prefix+".shift_exp",score,nextMax);
         // A one-key tile already is its FP32 column sum; reuse the producer.
-        auto blockSum=keys==1?probability:
+        const bool singleBlock=first==0 && (first+tile>=kt ||
+            (causal && first+tile>position+(qr+live-1)/group));
+        Tensor blockSum;
+        if(singleBlock && keys>1)
+          inverse=flashSumInverse(prefix+".row_sum_inverse",probability);
+        else blockSum=keys==1?probability:
             flashTimeOp(prefix+".row_sum",probability,"multiply","f32",nullptr,1.f,"add");
         Tensor product;
         if (keys == 1) {
           // A single key contributes the outer product P[:,0] * V[0,:].
           // Round P once here, at the same BF16 boundary used by the MXM.
           auto coefficients=flashRowCoefficients(prefix+".pv.probability_rows",probability,live,tile,"bf16");
+          // Materialize each key's V row once per hemisphere. READ3D
+          // repeats that address for the query rows; no expanded V matrix.
+          V uniqueRows;
+          for(I side=0;side<2;++side)
+            uniqueRows.insert(uniqueRows.end(),vi.begin()+side*tile*vd,vi.begin()+side*tile*vd+vd);
+          auto values=join(view(v,uniqueRows,{2,vd}),prefix+".pv.values",true);
           V valueRows;
-          for (I side=0; side<2; ++side) {
-            const auto row=vi.begin()+side*tile*vd;
-            for (I r=0; r<live; ++r)
-              valueRows.insert(valueRows.end(),row,row+vd);
-          }
-          product=flashBinary(prefix+".pv.outer",view(v,valueRows,{2*live,vd}),coefficients,
+          for(I side=0;side<2;++side)for(I r=0;r<live;++r)
+            for(I d=0;d<vd;++d)valueRows.push_back(side*vd+d);
+          product=flashBinary(prefix+".pv.outer",view(values,valueRows,{2*live,vd}),coefficients,
                               "multiply","f32",true);
         } else {
           auto packed=flashTimeOp(prefix+".probability_bf16",probability,"multiply","bf16",nullptr,1.f);
@@ -170,7 +201,7 @@ Tensor lowerFlashAttention(const std::string &name, const Tensor &q,
             pt.push_back(key*2*tile+s*tile+row);
           Tensor productType;productType.shape={2,live,vd};productType.dtype="f32";
           product=lowerTimeMajorProbabilityValue(prefix+".pv",view(packed,pt,{2,tile,tile}),
-              view(v,vi,{2,tile,vd}),live,productType);
+              view(v,vi,{2,tile,vd}),live,productType,retainKv?&sharedValues[first]:nullptr);
           product.shape={2*live,vd};
         }
         if(first) {
@@ -204,5 +235,8 @@ Tensor lowerFlashAttention(const std::string &name, const Tensor &q,
   auto groupedOutput=concat(matrices); V order;
   for(I b=0;b<batch;++b)for(I t=0;t<qt;++t)for(I h=0;h<qh;++h)for(I d=0;d<vd;++d)
     order.push_back(((b*kh+h/group)*queryRows+t*group+h%group)*vd+d);
+  for(I ni=firstNode;ni<I(nodes.size());++ni)
+    if(nodes[ni].module)
+      nodes[ni].function->setAttr("ftlpu.tight_serial_schedule",mlir::UnitAttr::get(&context));
   return view(groupedOutput,order,out.shape);
 }

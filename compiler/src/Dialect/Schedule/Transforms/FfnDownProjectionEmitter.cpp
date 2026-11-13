@@ -684,7 +684,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
                             slotDomain.group_address_stride =
                                 reductionStep * throughput.tile_rows;
                         } else if (directSingleMxm) {
-                            // RUN_3D iterates dimension 1 before dimension 2.
+                            // affine domain iterates dimension 1 before dimension 2.
                             // Put the dense reduction run in dimension 1 and
                             // the two serialized logical output slots in the
                             // outer dimension so the ICU never has to jump
@@ -949,7 +949,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
     // Plan the whole Down output before emitting MEM instructions.  A result
     // queue that is independent of Down weights/hidden reads and has one
     // equally spaced tile per output wave needs only one non-preemptible ICU
-    // WRITE_3D.  Keep the original per-tile path for other layouts/timelines.
+    // write domain.  Keep the original per-tile path for other layouts/timelines.
     const auto resultSliceIsIndependent = [&](int64_t slice) {
         const auto contains = [&](llvm::ArrayRef<int64_t> slices) {
             return std::find(slices.begin(), slices.end(), slice)
@@ -979,7 +979,7 @@ mlir::FailureOr<mlir::Value> emitFfnDownProjection(
         const int64_t addressStride = writes.size() > 1
             ? writes[1].address - first.address : 0;
         // Every paged Down output wave is produced after a distinct weight
-        // residency barrier.  One WRITE_3D cannot remain decoded across that
+        // residency barrier.  One write domain cannot remain decoded across that
         // runtime-dependent pause, so keep each wave as its own hardware ICU
         // instruction.  Resident weights retain the larger closed domain.
         bool closedDomain = reductionsPerWeightPage <= 0

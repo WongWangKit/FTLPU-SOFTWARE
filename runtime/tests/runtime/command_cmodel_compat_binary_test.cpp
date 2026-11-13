@@ -30,19 +30,19 @@ try {
     bool sawDequant = false;
     bool sawInt8Load = false;
     bool sawCompute = false;
-    bool sawRepeat2D = false;
-    bool sawMxmAccumulatorRepeat2D = false;
-    bool sawInterleavedRepeat2D = false;
-    bool sawInterleavedInnerStride = false;
+    bool sawMacro = false;
+    bool sawMxmAccumulatorMacro = false;
+    bool sawSequentialMacro = false;
+    bool sawSequentialInnerStride = false;
     bool sawRepeatedCandidate = false;
-    std::size_t repeat2DQueueCommands = 0;
+    std::size_t macroQueueCommands = 0;
     for (const QueueProgram& queue : program.queues) {
         if (queue.kind == QueueKind::Mem && queue.index == 4)
-            repeat2DQueueCommands = queue.commands.size();
+            macroQueueCommands = queue.commands.size();
         for (const QueueCommand& command : queue.commands) {
-            if (is_repeat_2d_command(command)) {
-                const auto repeat = decode_repeat_2d_command(command);
-                sawMxmAccumulatorRepeat2D |=
+            if (is_macro_schedule_command(command)) {
+                const auto repeat = decode_macro_schedule_command(command);
+                sawMxmAccumulatorMacro |=
                     queue.kind == QueueKind::MxmCompute
                     && queue.index == 1
                     && repeat.inner_count == 4
@@ -53,9 +53,9 @@ try {
                     && repeat.outer_stride == 4
                     && repeat.induction_target
                         == IcuInductionTarget::MxmAccumulatorAddress;
-                sawInterleavedRepeat2D |= queue.kind == QueueKind::Mem
+                sawSequentialMacro |= queue.kind == QueueKind::Mem
                     && queue.index == 6;
-                sawRepeat2D |= queue.kind == QueueKind::Mem
+                sawMacro |= queue.kind == QueueKind::Mem
                     && queue.index == 4
                     && repeat.inner_count == 4
                     && repeat.inner_interval == 1
@@ -65,28 +65,10 @@ try {
                     && repeat.outer_stride == 16
                     && repeat.induction_target
                         == IcuInductionTarget::MemAddress;
-                continue;
-            }
-            if (isa::decode_icu_command_opcode(command.command)
-                == isa::IcuCommandOpcode::Repeat) {
-                const auto repeat = isa::decode_icu_repeat(command.command);
-                sawInterleavedInnerStride |=
-                    queue.kind == QueueKind::Mem && queue.index == 6
-                    && repeat.count == 3 && repeat.interval == 1
-                    && repeat.address_stride == 1;
-                sawRepeatedCandidate |= queue.kind == QueueKind::Mem
-                    && queue.index == 8 && repeat.count == 1
-                    && repeat.interval == 1
-                    && repeat.address_stride == 1;
-                sawReadRepeat |= queue.kind == QueueKind::Mem
-                    && queue.index == 0 && repeat.count == 2
-                    && repeat.interval == 1
-                    && repeat.address_stride == 1;
-                sawWriteRepeat |= queue.kind == QueueKind::Mem
-                    && queue.index == 1 && repeat.count == 2
-                    && repeat.interval == 1
-                    && repeat.address_stride == 2;
-                continue;
+                sawReadRepeat |= queue.kind==QueueKind::Mem && queue.index==0 && repeat.inner_count==3 && repeat.inner_stride==1;
+                sawWriteRepeat |= queue.kind==QueueKind::Mem && queue.index==1 && repeat.inner_count==3 && repeat.inner_stride==2;
+                sawSequentialInnerStride |= queue.kind==QueueKind::Mem && queue.index==6 && repeat.inner_stride==1;
+                sawRepeatedCandidate |= queue.kind==QueueKind::Mem && queue.index==8 && repeat.inner_count==2;
             }
             if (command.instruction_kind == InstructionKind::Mem) {
                 const auto word =
@@ -141,17 +123,17 @@ try {
         "MXM dequant scale relocation was not preserved");
     require(sawInt8Load, "MXM INT8 dequant load mode was not preserved");
     require(sawCompute, "MXM compute command was not preserved");
-    require(sawRepeat2D, "ICU Repeat2D descriptor was not preserved");
-    require(sawMxmAccumulatorRepeat2D,
-        "MXM accumulator-address Repeat2D descriptor was not preserved");
-    require(repeat2DQueueCommands == 2,
-        "ICU Repeat2D was expanded instead of encoded as one descriptor");
-    require(!sawInterleavedRepeat2D,
-        "interleaved outer waves cannot use blocking ICU Repeat2D");
-    require(sawInterleavedInnerStride,
-        "expanding interleaved outer waves lost the inner MEM address stride");
+    require(sawMacro, "ICU Macro descriptor was not preserved");
+    require(sawMxmAccumulatorMacro,
+        "MXM accumulator-address Macro descriptor was not preserved");
+    require(macroQueueCommands == 1,
+        "ICU Macro was expanded instead of encoded as one descriptor");
+    require(sawSequentialMacro,
+        "sequential command queue did not use Macro");
+    require(sawSequentialInnerStride,
+        "Macro lost the inner MEM address stride");
     require(sawRepeatedCandidate,
-        "Repeat encoding lost a command's inner repeat space");
+        "Macro encoding lost a command's inner repeat space");
 
     InstructionControlUnit icu;
     load_queue_programs_into_icu(program.queues, icu,

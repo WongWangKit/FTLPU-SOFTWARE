@@ -187,35 +187,16 @@ public:
     }
 
 private:
-    struct MemIdleWindow {
-        std::size_t begin{0};
-        std::size_t end{0};
-    };
 
-    struct LinkedMemWindow {
-        std::size_t begin{0};
-        std::size_t end{0};
-        std::size_t page_ready_event_tag{0};
-        std::vector<InstructionControlUnit::MemIcu::
-            EncodedSynchronizedPacket> packets{};
-    };
+
+
 
     struct LinkedPageBarrier {
         std::size_t ready_cycle{0};
         std::size_t event_tag{0};
     };
 
-    struct LinkedPageRelease {
-        std::size_t event_tag{0};
-        IcuLocation location{};
-        std::size_t barrier_cycle{0};
-        bool activation_producer{false};
-        bool result_writer{false};
-        std::size_t activation_first_read_delay{0};
-        std::optional<std::int64_t> result_release_offset{};
-        std::size_t result_producer_index{0};
-        std::size_t compute_first_issue_delay{1};
-    };
+
 
     C2cDmaSystem& system_;
     BinaryProgram last_enqueued_program_{};
@@ -235,20 +216,7 @@ private:
         active_mem_writes_target_{};
     std::array<std::size_t, InstructionControlUnit::kMemQueues>
         active_mem_reservations_target_{};
-    std::array<std::vector<MemIdleWindow>,
-        InstructionControlUnit::kMemQueues> mem_idle_windows_{};
-    std::array<std::vector<LinkedMemWindow>,
-        InstructionControlUnit::kMemQueues> linked_mem_windows_{};
     std::vector<LinkedPageBarrier> linked_page_barriers_{};
-    std::vector<LinkedPageRelease> linked_page_releases_{};
-    bool linked_preserves_issue_phases_{false};
-    std::unordered_map<std::size_t, std::size_t>
-        linked_activation_barrier_shifts_{};
-    std::size_t linked_mxm_rows_{hw::kMxmRows};
-    std::size_t linked_mxm_pipeline_rows_{1};
-    std::size_t linked_system_register_columns_{hw::kSystemStreamRegisterColumns};
-    std::size_t linked_mem_slices_per_group_{hw::kMemSlicesPerGroup};
-    std::size_t linked_mxms_per_hemisphere_{hw::kMxmsPerHemisphere};
     std::uint32_t next_sync_tag_{1};
     std::uint32_t drain_cycles_{0};
     // Common mode uses independent physical-time MEM control, arbitrated on

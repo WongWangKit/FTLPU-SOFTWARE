@@ -84,19 +84,8 @@ try {
     runtime.load(program);
     runtime.upload_input(0, encodeBf16(input));
     runtime.upload_input(1, encodeBf16(weight));
-    if (std::getenv("FTLPU_DEPTHWISE_COLUMN_TRACE")) {
-        for (std::size_t cycle = 0; cycle < program.max_cycle + 64; ++cycle) {
-            runtime.run_cycles(1);
-            const auto& executed = system->vxm_unit().last_execution();
-            std::cout << "cycle=" << cycle << " columns=";
-            for (std::size_t column = 0; column < 16; ++column)
-                if (executed[0][column]) std::cout << column << ',';
-            std::cout << '\n';
-        }
-    } else {
-        runtime.run_cycles(program.max_cycle + 64,
-            std::getenv("FTLPU_CMODEL_LOG") != nullptr ? &std::cout : nullptr);
-    }
+    runtime.run_cycles(program.max_cycle + 64,
+        std::getenv("FTLPU_CMODEL_LOG") != nullptr ? &std::cout : nullptr);
     const auto actual = runtime.download_output(0);
     if (tracePrefix) {
         runtime.write_execution_trace_csv(std::string(tracePrefix) + ".pipeline.csv");

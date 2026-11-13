@@ -334,7 +334,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                                             const FfnLoopDomain3D& domain) {
         const int64_t bank = context.activation_route.getPlacement()
             .getAs<mlir::IntegerAttr>("bank").getInt();
-        // One READ_3D owns its MEM ICU throughout the gaps between waves.
+        // One read domain owns its MEM ICU throughout the gaps between waves.
         const int64_t end = cycle + (count - 1) * interval
             + (domain.wave_count - 1) * domain.wave_interval
             + (domain.group_count - 1) * domain.group_interval + 1;
@@ -793,7 +793,7 @@ mlir::FailureOr<FfnProjectionEmission> emitFfnProjection(
                             // The MEM activation producer must stop at every
                             // dynamic weight-page boundary together with the
                             // MXM consumer. A hardware ICU cannot suspend one
-                            // decoded READ_3D while COMPUTE_3D waits on the
+                            // decoded read domain while compute domain waits on the
                             // next page, so lower one matching affine domain
                             // per projection page directly.
                             const auto makeActivationDomain =

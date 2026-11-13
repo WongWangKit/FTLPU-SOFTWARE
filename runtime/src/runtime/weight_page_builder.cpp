@@ -38,16 +38,19 @@ template<class Visit>
 void visit_hemisphere_pair_bytes(const BinaryBinding& binding, std::size_t rows,
     std::size_t columns, std::size_t width, Visit visit)
 {
-    if (binding.slices.size() != 2 || binding.hemisphere_mask != 3
-        || (binding.element_type != BindingElementType::BF16
-            && binding.element_type != BindingElementType::F16))
+    const bool fp32 = binding.layout == BindingLayout::Fp32HemispherePairPlanar;
+    const std::size_t bytes = fp32 ? 4 : 2;
+    if (binding.slices.size() != bytes || binding.hemisphere_mask != 3
+        || (fp32 ? binding.element_type != BindingElementType::F32
+                 : (binding.element_type != BindingElementType::BF16
+                    && binding.element_type != BindingElementType::F16)))
         throw std::invalid_argument("invalid hemisphere-pair planar binding");
     for (std::size_t r = 0; r < rows; ++r)
         for (std::size_t c = 0; c < columns; ++c) {
             const auto block = c / width;
             const auto address = binding.base_row + (block / 2 * rows + r) * binding.address_stride;
-            for (std::size_t byte = 0; byte < 2; ++byte)
-                visit((r * columns + c) * 2 + byte, block % 2,
+            for (std::size_t byte = 0; byte < bytes; ++byte)
+                visit((r * columns + c) * bytes + byte, block % 2,
                     binding.slices[byte], address, c % width);
         }
 }
@@ -288,7 +291,8 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
     const std::size_t columns = binding.shape.size() == 1
         ? checked_dimension(binding, 0) : checked_dimension(binding, 1);
     const std::uint32_t base = static_cast<std::uint32_t>(binding.base_row);
-    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar) {
+    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar
+        || binding.layout == BindingLayout::Fp32HemispherePairPlanar) {
         visit_hemisphere_pair_bytes(binding, rows, columns, hardware.bytes_per_word,
             [&](auto offset, auto hemi, auto slice, auto row, auto lane) {
                 image.write(hemi, slice, row, lane, data[offset]);
@@ -876,6 +880,36 @@ PackedWeightImage pack_binding_image(const BinaryBinding& binding,
         "offline C2C packing does not support this binding layout");
 }
 
+void validate_native_output_pieces(const BinaryBinding& binding,
+    const ExecutableHardwareConfig& hardware)
+{
+    if (binding.access != BindingAccess::Output || binding.pieces.empty())
+        throw std::invalid_argument("native pieces require an output binding");
+    std::uint64_t bytes = 0;
+    std::map<std::uint16_t, BinaryBinding> banks;
+    for (const auto& piece : binding.pieces) {
+        if (!piece.pieces.empty() || piece.element_type != binding.element_type ||
+            piece.paged_weight || piece.byte_size == 0 ||
+            piece.byte_size > binding.byte_size - bytes ||
+            piece.bank >= hardware.banks_per_slice)
+            throw std::invalid_argument("invalid native output binding piece");
+        bytes += piece.byte_size;
+        auto [it, inserted] = banks.try_emplace(piece.bank, binding);
+        auto& group = it->second;
+        if (inserted) {
+            group.bank = piece.bank;
+            group.byte_size = 0;
+            group.pieces.clear();
+        }
+        group.pieces.push_back(piece);
+        group.byte_size += piece.byte_size;
+    }
+    if (bytes != binding.byte_size)
+        throw std::invalid_argument("native pieces must cover the complete output");
+    for (const auto& [bank, group] : banks)
+        pack_binding_image(group, std::vector<std::uint8_t>(group.byte_size), hardware);
+}
+
 PackedWeightImage pack_weight_binding(const BinaryBinding& binding,
     std::span<const std::uint8_t> data,
     const ExecutableHardwareConfig& hardware)
@@ -937,7 +971,8 @@ std::vector<std::uint8_t> unpack_binding_image(
 
     const std::size_t rows = checked_dimension(binding, 0);
     const std::size_t columns = checked_dimension(binding, 1);
-    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar) {
+    if (binding.layout == BindingLayout::Fp16HemispherePairPlanar
+        || binding.layout == BindingLayout::Fp32HemispherePairPlanar) {
         std::vector<std::uint8_t> result(binding.byte_size);
         visit_hemisphere_pair_bytes(binding, rows, columns, hardware.bytes_per_word,
             [&](auto offset, auto hemi, auto slice, auto row, auto lane) {

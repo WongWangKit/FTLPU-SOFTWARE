@@ -90,6 +90,9 @@ LogicalResult BlockFp8ProjectionOp::verify()
 {
     const auto x = getInput().getType(), w = getWeights().getType();
     const auto s = getWeightScales().getType(), y = getResult().getType();
+    const auto groupsAttr=(*this)->getAttrOfType<IntegerAttr>("groups");
+    const int64_t groups=groupsAttr?groupsAttr.getInt():1;
+    if(groups<=0)return emitOpError("groups must be positive");
     if (!x.hasStaticShape() || !w.hasStaticShape() || !s.hasStaticShape() || !y.hasStaticShape()
         || x.getRank() != 2 || w.getRank() != 2 || s.getRank() != 2 || y.getRank() != 2)
         return emitOpError("requires four static rank-2 tensors");
@@ -97,8 +100,8 @@ LogicalResult BlockFp8ProjectionOp::verify()
         || !isa<Float8E4M3FNType>(w.getElementType()) || !isa<Float8E8M0FNUType>(s.getElementType()))
         return emitOpError("requires BF16 activation/output, E4M3FN weights and UE8M0 scales");
     const auto m = x.getDimSize(0), k = x.getDimSize(1), n = w.getDimSize(0);
-    if (m <= 0 || m % 32 || k <= 0 || k % 32 || n <= 0 || n % 64
-        || w.getDimSize(1) != k || s.getDimSize(0) != n / 32 || s.getDimSize(1) != k / 32
+    if (m <= 0 || m % 32 || k <= 0 || k % (32*groups) || n <= 0 || n % (64*groups)
+        || w.getDimSize(1) != k/groups || s.getDimSize(0) != n / 32 || s.getDimSize(1) != k/groups / 32
         || y.getDimSize(0) != m || y.getDimSize(1) != n)
         return emitOpError("requires M/K aligned to 32, N aligned to 64 and matching scale/output shapes");
     return success();
@@ -117,13 +120,54 @@ LogicalResult BlockFp8ScaleOp::verify()
     return success();
 }
 
+static bool hcStreamType(RankedTensorType type) {
+    return type.hasStaticShape() && type.getRank()==3 && type.getElementType().isBF16()
+        && type.getDimSize(0)>0 && type.getDimSize(0)%32==0
+        && type.getDimSize(1)>=2 && type.getDimSize(1)<=8
+        && type.getDimSize(2)>0 && type.getDimSize(2)%32==0;
+}
+static bool hcTensorType(RankedTensorType type, ArrayRef<int64_t> shape) {
+    return type.hasStaticShape() && type.getElementType().isBF16() && type.getShape()==shape;
+}
+LogicalResult HcMixesOp::verify() {
+    auto x=getInput().getType();
+    if(!hcStreamType(x)) return emitOpError("requires BF16 X[T,H,D], T/D aligned to 32, 2 <= H <= 8");
+    const int64_t t=x.getDimSize(0),h=x.getDimSize(1),d=x.getDimSize(2),fields=h*(h+2);
+    if(!hcTensorType(getWeight().getType(),{fields,h*d}) || !hcTensorType(getScale().getType(),{3})
+       || !hcTensorType(getBase().getType(),{fields}) || !hcTensorType(getPre().getType(),{t,h})
+       || !hcTensorType(getPost().getType(),{t,h}) || !hcTensorType(getComb().getType(),{t,h,h})
+       || !hcTensorType(getProjection().getType(),{t,fields}))
+        return emitOpError("mismatched BF16 parameter/coefficient shapes");
+    if(getIterations()<1 || getIterations()>64 || !std::isfinite(getEpsilon().convertToFloat())
+       || getEpsilon().convertToFloat()<=0 || !std::isfinite(getNormEpsilon().convertToFloat())
+       || getNormEpsilon().convertToFloat()<=0)
+        return emitOpError("requires 1..64 Sinkhorn iterations and finite positive epsilons");
+    return success();
+}
+LogicalResult HcPreOp::verify() {
+    auto x=getInput().getType();
+    if(!hcStreamType(x) || !hcTensorType(getPre().getType(),{x.getDimSize(0),x.getDimSize(1)})
+       || !hcTensorType(getResult().getType(),{x.getDimSize(0),x.getDimSize(2)}))
+        return emitOpError("requires BF16 X[T,H,D], pre[T,H] and result[T,D], T/D aligned to 32");
+    return success();
+}
+LogicalResult HcPostOp::verify() {
+    auto x=getResidual().getType();
+    if(!hcStreamType(x))return emitOpError("requires BF16 residual[T,H,D], T/D aligned to 32");
+    const int64_t t=x.getDimSize(0),h=x.getDimSize(1),d=x.getDimSize(2);
+    if(!hcTensorType(getInput().getType(),{t,d}) || !hcTensorType(getPost().getType(),{t,h})
+       || !hcTensorType(getComb().getType(),{t,h,h}) || getResult().getType()!=x)
+        return emitOpError("mismatched BF16 post-mix inputs/output");
+    return success();
+}
+
 LogicalResult BlockFp8QdqOp::verify()
 {
     const auto input = getInput().getType();
     if (!input.hasStaticShape() || input.getRank() != 2 || input.getDimSize(0) <= 0 ||
-        input.getDimSize(1) != 32 || !input.getElementType().isBF16() ||
+        input.getDimSize(1) <= 0 || input.getDimSize(1)%32 || !input.getElementType().isBF16() ||
         input != getResult().getType())
-        return emitOpError("requires matching static BF16 tensors [groups,32] with groups > 0");
+        return emitOpError("requires matching positive static BF16 matrices with columns aligned to 32");
     return success();
 }
 
@@ -273,6 +317,63 @@ LogicalResult FlashAttentionOp::verify()
     return success();
 }
 
+LogicalResult DenseAttentionOp::verify()
+{
+    const auto q=getQuery().getType(), k=getKey().getType(), v=getValue().getType();
+    const auto o=getResult().getType();
+    if (auto sinks=(*this)->getAttrOfType<DenseF32ArrayAttr>("attention_sinks"))
+        if(q.getRank()!=4 || sinks.size()!=q.getDimSize(2)
+            || llvm::any_of(sinks.asArrayRef(),[](float x){return !std::isfinite(x);}))
+            return emitOpError("attention_sinks requires one finite FP32 value per query head");
+    if (auto window=(*this)->getAttrOfType<IntegerAttr>("sliding_window"))
+        if(window.getInt()<=0 || !getCausal())
+            return emitOpError("sliding_window requires a positive causal window");
+    for(auto t : {q,k,v,o})
+        if(!t.hasStaticShape() || t.getRank()!=4 || !t.getElementType().isBF16()
+            || llvm::any_of(t.getShape(), [](int64_t d){return d<=0;}))
+            return emitOpError("requires positive static BF16 [batch,tokens,heads,width] tensors");
+    if(q.getDimSize(0)!=k.getDimSize(0) || k!=v
+        || q.getDimSize(2)%k.getDimSize(2) || q.getDimSize(3)!=k.getDimSize(3)
+        || q.getDimSize(3)%32 || o!=q)
+        return emitOpError("requires compatible GQA shapes, equal QK/value width, and 32-aligned head width");
+    if(getQueryPosition()<0 || getQueryPosition()+q.getDimSize(1)>k.getDimSize(1)
+        || !std::isfinite(getScale().convertToFloat()) || getScale().convertToFloat()<=0.f)
+        return emitOpError("requires a finite positive scale and K/V covering all query positions");
+    return success();
+}
+
+LogicalResult AttentionCoreOp::verify()
+{
+    const auto q=getQuery().getType(), k=getKey().getType(), v=getValue().getType();
+    for(auto t : {q,k,v,getResult().getType()})
+        if(!t.hasStaticShape() || t.getRank()!=2 || !t.getElementType().isBF16()
+            || llvm::any_of(t.getShape(), [](int64_t d){return d<=0;}))
+            return emitOpError("requires positive static rank-2 BF16 tensors");
+    auto cfg=getConfig();
+    const auto integer=[&](StringRef key) -> int64_t {
+        auto value=cfg.getAs<IntegerAttr>(key); return value?value.getInt():-1;
+    };
+    const auto hq=integer("query_heads"), hkv=integer("kv_heads"), d=integer("head_dim");
+    if (auto sinks=cfg.getAs<DenseF32ArrayAttr>("attention_sinks"))
+        if(sinks.size()!=hq || llvm::any_of(sinks.asArrayRef(),[](float x){return !std::isfinite(x);}))
+            return emitOpError("attention_sinks requires one finite FP32 value per query head");
+    const auto n=integer("seq_len"), kv=integer("kv_seq_len"), pos=integer("position_offset");
+    if (auto sink=getSinkValues()) {
+        auto t=llvm::cast<RankedTensorType>(sink.getType());
+        auto strategy=cfg.getAs<StringAttr>("attention_strategy");
+        if(!strategy || strategy.getValue()!="flash_tile" || hkv<=0 || hkv%2 || hq%hkv
+            || !t.hasStaticShape() || t.getRank()!=2 || !t.getElementType().isF32()
+            || t.getDimSize(0)!=n*hq/32 || t.getDimSize(1)!=32)
+            return emitOpError("sink_values requires planar flash tile FP32 [query_tiles,32]");
+    }
+    if(hq<=0 || hkv<=0 || hq%hkv || d<=0 || d%32 || n<=0 || kv<=0 || kv%32
+        || pos<0 || pos%32 || pos+n>integer("actual_kv_len") || kv!=k.getDimSize(0) || integer("actual_kv_len")>kv
+        || q.getDimSize(0)!=n || q.getDimSize(1)!=hq*d || k.getDimSize(1)!=hkv*d
+        || k!=v || q!=getResult().getType())
+        return emitOpError("config and tensor shapes do not describe compatible padded GQA attention");
+    return success();
+}
+
 LogicalResult SoftmaxOp::verify()
 {
     const auto input = getInput().getType();
@@ -419,10 +520,15 @@ LogicalResult VectorAluOp::verify()
             return emitOpError("head_scale/solve require static rank-two tensors and FP32 output");
         const int64_t heads=solve?lhs.getDimSize(0)/32:rhs.getDimSize(1);
         const int64_t dim=solve?rhs.getDimSize(1):lhs.getDimSize(1)/std::max<int64_t>(1,heads);
+          const int64_t contraction=singleBf16?lhs.getDimSize(1):32;
+          const bool nativeContraction=singleBf16 && contraction>32 && heads==2 && dim==32 &&
+              contraction%32==0 && lhs.getElementType().isBF16() && rhs.getElementType().isBF16() &&
+              rhs.getDimSize(0)==heads*contraction;
         if(heads<=0 || heads>32 || heads%2 || dim<=0 || dim%32 ||
            result.getDimSize(0)!=heads*32 || result.getDimSize(1)!=dim ||
            !matrixInput(rhs.getElementType()) ||
-           (solve ? (!matrixInput(lhs.getElementType()) || lhs.getDimSize(0)!=heads*32 || lhs.getDimSize(1)!=32 || rhs.getShape()!=result.getShape())
+             (solve ? (!matrixInput(lhs.getElementType()) || lhs.getDimSize(0)!=heads*32 ||
+                       (!nativeContraction && (lhs.getDimSize(1)!=32 || rhs.getShape()!=result.getShape())))
                   : (!lhs.getElementType().isBF16() || lhs.getDimSize(0)!=32 || rhs.getDimSize(0)!=32 || lhs.getDimSize(1)!=heads*dim)))
             return emitOpError("head_scale needs BF16 V[32,H*D], FP32 beta[32,H]; solve needs FP32 L[H*32,32], B[H*32,D]; head_matmul with mxm_precision=bf16 also accepts BF16 inputs; even H<=32, D multiple of 32");
         if(getKind()=="unit_lower_inverse" && dim!=32) return emitOpError("inverse requires 32x32 identity RHS per head");

@@ -257,7 +257,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     // Compact targets need direct distributed input to avoid a full planar
     // copy. Large-bank layouts retain the established staging domain: their
     // raw Q/K writeback shares MEM queues with the distributed source, so
-    // direct READ_3D contexts would overlap those writes across token tiles.
+    // direct read domain contexts would overlap those writes across token tiles.
     const bool direct_projection_input = !decode && !projection_rope_overlap
         && distributedInputAvailable && target.uses_dedicated_slice_roles()
         && target.memory().words_per_bank <= 2048
@@ -625,7 +625,7 @@ mlir::LogicalResult lower_attention(kernel::AttentionGraph& graph,
     llvm::SmallVector<int64_t, 16> alternate_rope_staging_slices(
         rope_staging_slices.begin(), rope_staging_slices.end());
     if (split_serial_q_rope_staging) {
-        // The long Q activation READ_3D owns staging slices 8/9 until the
+        // The long Q activation read domain owns staging slices 8/9 until the
         // projection ends. Keep the alternate raw output off those ICUs.
         alternate_rope_staging_slices[8] = weightStorage[8];
         alternate_rope_staging_slices[9] = weightStorage[9];

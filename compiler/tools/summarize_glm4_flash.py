@@ -12,7 +12,7 @@ def phase_timing(folder, clock_mhz):
     final = re.search(r'^cycles=(\d+) .*weight_page_runtime_wait_cycles=(\d+).*$', log, re.M)
     if not final:
         raise ValueError(f'incomplete execution: {folder}')
-    total, input_end, output_start, output_end = 0, 0, None, 0
+    total, input_end, output_start, output_end, invocation_end = 0, 0, None, 0, None
     with (folder/'runtime.pipeline.csv').open(newline='') as stream:
         for row in csv.DictReader(stream):
             start, end = int(row['start']), int(row['end'])
@@ -24,8 +24,14 @@ def phase_timing(folder, clock_mhz):
             if row['resource'] == 'C2C.HostOutput':
                 output_start = start if output_start is None else min(output_start, start)
                 output_end = max(output_end, end)
+            if row['resource'] == 'Session.Invocation':
+                invocation_end = end if invocation_end is None else max(invocation_end, end)
     if output_start is None:
-        raise ValueError(f'missing actual output transfer: {folder}')
+        if invocation_end is None:
+            raise ValueError(f'missing completed invocation: {folder}')
+        # A resident-only graph legitimately has no external result transfer.
+        # Count its actual completed device window, not a fabricated readback.
+        output_start = output_end = invocation_end
     result = dict(runtime_cycles=total, runtime_ms=total/(clock_mhz*1000),
                   initial_ingress_window_cycles=input_end,
                   device_execution_window_cycles=output_start-input_end,

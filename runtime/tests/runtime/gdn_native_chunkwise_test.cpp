@@ -1,3 +1,4 @@
+#include "direct_macro_fixture.hpp"
 #include "ftlpu/compiler/Target/gdn_native_schedule.hpp"
 #include "ftlpu/system/tsp_slice_system.hpp"
 #include <filesystem>
@@ -57,26 +58,20 @@ int main(int argc,char** argv) try {
     for(const auto& epoch:epochs){
         if(!system->vxm_unit().idle())throw std::runtime_error("VXM not drained at epoch boundary");
         system->icu().reset();
-        std::array<std::size_t,InstructionControlUnit::kMemQueues> mc{};
+        test::DirectMacroFixture fixture;
         std::array<std::size_t,8> vc{};std::size_t sc[2][2]{};
         for(const auto& i:epoch.program.mem){
             const auto q=InstructionControlUnit::mem_queue(static_cast<Hemisphere>(i.side),i.slice);
-            if(i.cycle<mc[q])throw std::runtime_error(epoch.name+": overlapping MEM domains");
-            auto ins=i.instruction;ins.loop.wait_cycle=i.cycle-mc[q];system->icu().enqueue_mem_3d(q,ins);
-            mc[q]=i.cycle+(ins.loop.counts[0]-1)*ins.loop.cycle_strides[0]+1;
+            fixture.mem(q,i.cycle,i.instruction);
         }
         for(const auto& i:epoch.program.vxm){
-            auto run=VxmIcuRun2DInstruction::Run2D(0,{1,1},{1,1},i.instruction);
-            run.loop.wait_cycle=i.cycle-vc[i.queue];system->icu().enqueue_vxm_run_2d(i.queue,run);vc[i.queue]=i.cycle+1;
+            if(i.cycle>vc[i.queue])system->icu().enqueue_vxm_nop(i.queue,i.cycle-vc[i.queue]);
+            system->icu().enqueue_vxm(i.queue,i.instruction);vc[i.queue]=i.cycle+1;
         }
         for(const auto& i:epoch.program.sxm){
-            const bool perm=i.instruction.opcode==SxmOpcode::Permute;
-            auto run=SxmIcuRun2DInstruction::Run2D(0,{i.count,1},{i.interval,1},i.instruction);
-            run.loop.wait_cycle=i.cycle-sc[i.side][perm];
-            if(perm)system->icu().sxm_permute_iq(static_cast<Hemisphere>(i.side)).push_sxm_run_2d(run);
-            else system->icu().sxm_transpose_iq(static_cast<Hemisphere>(i.side)).push_sxm_run_2d(run);
-            sc[i.side][perm]=i.cycle+(i.count-1)*i.interval+1;
+            fixture.sxm(i.side,i.cycle,i.count,i.interval,i.instruction);
         }
+        fixture.load(system->icu());
         spans<<number<<','<<global<<','<<global+epoch.program.end_cycle<<','<<epoch.name<<'\n';
         std::size_t sxm_issued[2][2]{};
         for(std::size_t cycle=0;cycle<epoch.program.end_cycle;++cycle){

@@ -102,75 +102,8 @@ def MxmDequantOp : FTLPU_Command_Op<"mxm_dequant",
   let hasVerifier = 1;
 }
 
-// Hardware-facing FU loop instructions. `words` is the flattened sequence of
-// physical 32-bit lanes: three 96-bit MEM/VXM i-MEM words or two 128-bit MXM
-// i-MEM words. MEM/MXM use three launch counters; VXM keeps its contiguous
-// run length in the compact config and uses two outer launch counters. These
-// operations are produced directly by closed-form lowering and must never be
-// reconstructed from per-cycle Schedule events. `cycle` is compiler-only
-// schedule metadata: CommandBinary emits queue-local NOPs for gaps, while the
-// encoded hardware packet keeps its former start-cycle field reserved at zero.
-def Mem3DOp : FTLPU_Command_Op<"mem_3d", [MemoryEffects<[MemWrite]>]> {
-  let summary = "Raw three-word MEM ICU 3-D instruction";
-  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words,
-      OptionalAttr<I64Attr>:$address_binding,
-      OptionalAttr<StrAttr>:$address_binding_access);
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
-def MemWriteRead2DOp : FTLPU_Command_Op<"mem_write_read_2d", [MemoryEffects<[MemWrite]>]> {
-  let summary = "Raw three-word MEM ICU write/read 2-D instruction";
-  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words);
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
-def MxmLoad3DOp : FTLPU_Command_Op<"mxm_load_3d",
-    [MemoryEffects<[MemWrite]>]> {
-  let summary = "Raw two-word MXM-load ICU 3-D instruction";
-  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words);
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
-def MxmDequant3DOp : FTLPU_Command_Op<"mxm_dequant_3d",
-    [MemoryEffects<[MemWrite]>]> {
-  let summary = "Raw two-word MXM-dequant ICU 3-D instruction";
-  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words,
-      OptionalAttr<I64Attr>:$scale_binding);
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
-def MxmCompute3DOp : FTLPU_Command_Op<"mxm_compute_3d",
-    [MemoryEffects<[MemWrite]>]> {
-  let summary = "Raw two-word MXM-compute ICU 3-D instruction";
-  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words);
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
-def VxmRun2DOp : FTLPU_Command_Op<"vxm_run_2d",
-    [MemoryEffects<[MemWrite]>]> {
-  let summary = "Raw three-word VXM ICU RUN_2D instruction";
-  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, ArrayAttr:$words,
-      OptionalAttr<I64Attr>:$scale_binding);
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
-def SxmRun2DOp : FTLPU_Command_Op<"sxm_run_2d",
-    [MemoryEffects<[MemWrite]>]> {
-  let summary = "Queue-specific compact SXM ICU RUN_2D instruction";
-  let arguments = (ins StrAttr:$kind, I64Attr:$cycle, I64Attr:$queue,
-      ArrayAttr:$words);
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
 def VxmOp : FTLPU_Command_Op<"vxm", [MemoryEffects<[MemWrite]>]> {
-    let summary = "Compressed command for one ICU VXM ALU queue";
+    let summary = "Sequential VXM configuration with a contiguous FU repeat count";
     let arguments = (ins I64Attr:$cycle, I64Attr:$queue, StrAttr:$opcode,
         OptionalAttr<I64Attr>:$chain_depth,
         StrAttr:$lhs_kind, I64Attr:$lhs_index, F32Attr:$lhs_immediate,
@@ -203,6 +136,17 @@ def SxmOp : FTLPU_Command_Op<"sxm", [MemoryEffects<[MemWrite]>]> {
       OptionalAttr<I64Attr>:$output_tile,
       OptionalAttr<I64Attr>:$repeat_count,
       OptionalAttr<I64Attr>:$repeat_interval);
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+// Direct compiler domain lowering produces semantic Macro templates. Physical
+// packed framing is linked after address relocation; no intermediate loop ISA.
+def MacroOp : FTLPU_Command_Op<"macro", [MemoryEffects<[MemWrite]>]> {
+  let arguments = (ins I64Attr:$cycle, I64Attr:$queue, I64Attr:$kind,
+      I64Attr:$instruction_kind, ArrayAttr:$words, ArrayAttr:$payload,
+      OptionalAttr<I64Attr>:$address_binding, OptionalAttr<StrAttr>:$address_binding_access,
+      OptionalAttr<I64Attr>:$scale_binding);
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
 }

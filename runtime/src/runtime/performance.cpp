@@ -67,82 +67,12 @@ std::size_t issued_commands(const QueueProgram& queue)
             commandIndex += C2cDmaIcuPacket::kWordCount - 1;
             continue;
         }
-        if (is_fu_3d_raw_packet_header(command)) {
-            if (queue.kind == QueueKind::Mem
-                && is_mem_write_read_2d_raw_packet_header(command)) {
-                const auto instruction =
-                    decode_mem_write_read_2d_raw_packet(queue, commandIndex);
-                issued += 2 * instruction.counts[0]
-                    * instruction.counts[1];
-                ++prior_instructions;
-                commandIndex +=
-                    isa::EncodedMemIcuWriteRead2DPacket::kWordCount - 1;
-                continue;
-            }
-            const auto loop =
-                decode_fu_3d_raw_packet_loop(queue, commandIndex);
-            std::size_t points = 1;
-            for (const auto count : loop.counts) points *= count;
-            issued += points;
-            ++prior_instructions;
-            commandIndex += fu_3d_raw_packet_word_count(queue.kind, command) - 1;
-            continue;
-        }
-        if (is_fu_3d_raw_word_command(command))
-            throw std::logic_error(
-                "runtime performance found an orphan raw FU packet word");
-        if (is_mem_slice_program_command(command)) {
-            const auto program = decode_mem_slice_program_command(command);
-            std::size_t points = program.body.size();
-            for (std::size_t dimension = 0;
-                 dimension < program.schedule.rank; ++dimension)
-                points *= program.schedule.counts[dimension];
-            issued += points;
-            continue;
-        }
-        if (is_vxm_stream_nd_command(command)) {
-            const auto stream = decode_vxm_stream_nd_command(command);
-            std::size_t points = 1;
-            for (std::size_t dimension = 0;
-                 dimension < stream.schedule.rank; ++dimension)
-                points *= stream.schedule.counts[dimension];
-            issued += points;
-            continue;
-        }
-        if (is_sxm_tile_program_command(command)) {
-            const auto tile = decode_sxm_tile_program_command(command);
-            std::size_t points = 1;
-            for (std::size_t dimension = 0;
-                 dimension < tile.schedule.rank; ++dimension)
-                points *= tile.schedule.counts[dimension];
-            issued += points;
-            continue;
-        }
-        if (is_mem_stream_nd_command(command)
-            || is_mxm_stream_nd_command(command)) {
-            const auto stream = is_mem_stream_nd_command(command)
-                ? decode_mem_stream_nd_command(command)
-                : decode_mxm_stream_nd_command(command);
-            std::size_t points = 1;
-            for (std::size_t dimension = 0;
-                 dimension < stream.rank; ++dimension)
-                points *= stream.counts[dimension];
-            issued += points;
-            continue;
-        }
         if (is_macro_schedule_command(command)) {
             const auto macro = decode_macro_schedule_command(command);
             issued += macro.inner_count * macro.outer_count;
             continue;
         }
-        if (is_repeat_2d_command(command)) {
-            if (prior_instructions == 0)
-                throw std::logic_error(
-                    "runtime performance found Repeat2D without instruction");
-            const auto repeat = decode_repeat_2d_command(command);
-            issued += repeat.inner_count * repeat.outer_count - 1;
-            continue;
-        }
+
         if (is_icu_control_raw_word_command(command)) {
             const auto control = decode_icu_control_raw_word(command);
             if (control.opcode == IcuControlOpcode::Sync

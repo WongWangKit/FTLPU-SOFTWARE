@@ -1,6 +1,7 @@
-"""Direct affine-domain lowering selects short physical ICU packets."""
+"""Direct affine-domain lowering emits packed Macro images and preserves exact issues."""
 import argparse
 import csv
+import re
 from pathlib import Path
 import subprocess
 
@@ -15,13 +16,14 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     operations = []
     # Time/address domains are deliberately not foldable except the last one.
-    for index, (counts, times, addresses) in enumerate([
+    domains = [
         ((1, 1, 1), (1, 1, 1), (0, 0, 0)),
         ((4, 1, 1), (2, 1, 1), (-1, 0, 0)),
         ((1, 3, 2), (1, 2, 11), (0, 1, 8)),
         ((2, 3, 2), (1, 5, 17), (1, 8, 32)),
         ((4, 2, 3), (1, 4, 8), (1, 4, 8)),
-    ]):
+    ]
+    for index, (counts, times, addresses) in enumerate(domains):
         operations.append(f'''ftlpu.schedule.mem_transfer {{
           address = 128 : i64, address_stride = {addresses[0]} : i64,
           cycle = 100 : i64, hemisphere = 0 : i64, slice = {index} : i64,
@@ -39,16 +41,28 @@ def main():
                     '--output', str(binary), '--target-config', args.target_config], check=True)
     csv_dir = args.output_dir / 'icu_programs'
     subprocess.run([args.export, str(binary), str(csv_dir)], check=True)
-    expected = [('READ', 1, 1), ('READ_1D', 2, 4), ('READ_2D', 2, 6),
-                ('READ_3D', 3, 12), ('READ_1D', 2, 24)]
-    for i, (opcode, words, issues) in enumerate(expected):
-        with (csv_dir / f'mem_E_slice{i:02d}_bank0.icu.csv').open(encoding='utf-8-sig') as f:
-            rows = list(csv.DictReader(line for line in f if not line.startswith('#')))
-        assert len(rows) == 1, rows  # wait belongs in the packet, no timing NOP
-        row = rows[0]
-        assert (row['opcode'], int(row['imem_words']), int(row['expanded_fu_issues'])) == (opcode, words, issues), row
-        assert int(row['start_cycle']) == 100 and int(row['wait_cycle']) == 100, row
-    print('direct short ICU lowering/physical CSV/wait encoding passed')
+    for i, (counts, times, addresses) in enumerate(domains):
+        path=csv_dir / f'mem_E_slice{i:02d}_bank0.icu.csv'
+        text=path.read_text(encoding='utf-8-sig')
+        rows=list(csv.DictReader(line for line in text.splitlines() if not line.startswith('#')))
+        expected=sorted((100+x*times[0]+y*times[1]+z*times[2],
+                         128+x*addresses[0]+y*addresses[1]+z*addresses[2])
+                        for z in range(counts[2]) for y in range(counts[1]) for x in range(counts[0]))
+        actual=[]
+        for row in rows:
+            assert row['opcode']=='MEM_READ_MACRO',row
+            assert row['raw_words'].startswith('file:'),row
+            image=csv_dir/row['raw_words'][5:]
+            assert image.is_file() and image.stat().st_size % 12 == 0,image
+            details=dict(re.findall(r'(\w+)=([^ ]+)',row['details']))
+            for y in range(int(row['count1'])):
+                for x in range(int(row['count0'])):
+                    actual.append((int(row['start_cycle'])+x*int(row['cycle_stride0'])+y*int(row['cycle_stride1']),
+                                   int(details['address_base'])+x*int(details['induction_stride0'])+y*int(details['induction_stride1'])))
+        assert sorted(actual)==expected,(i,actual,expected)
+        assert len(rows)==([1,1,1,2,1][i]),(i,len(rows))
+        assert int(rows[0]['wait_cycle'])==100,rows[0]
+    print('direct Macro domains, physical images, exact cycles and addresses passed')
 
 
 if __name__ == '__main__':

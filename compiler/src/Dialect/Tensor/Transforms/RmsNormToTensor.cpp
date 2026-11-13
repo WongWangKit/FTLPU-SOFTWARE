@@ -48,6 +48,57 @@ mlir::LogicalResult lower_rms_norm(kernel::RmsNormOp op,
     const auto& throughput = target.throughput();
     const auto module=op->getParentOfType<mlir::ModuleOp>();
     const auto wide=module->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
+    const auto legacy=module->getAttrOfType<mlir::BoolAttr>("ftlpu.norm_distributed16");
+    if (wide && wide.getValue() && !(legacy && legacy.getValue())
+        && tile == 32 && rows == tile && memory.banks_per_slice >= 2
+        && hidden + 1 <= memory.words_per_bank) {
+        // A 32-token tile is ordinary feature-block-major planar storage.
+        // SXM supplies token lanes to VXM; only its replay is retained.
+        const auto storage=target.activation_storage_slices();
+        if(storage.size()<8)return op.emitError("planar RMSNorm needs four legal MEM slice pairs");
+        const int64_t words=rows*hidden/tile;
+        const auto alloc=[&](PlacementKind kind,int pair,int64_t count,int64_t bytes,int bank,
+                             llvm::StringRef layout="fp16_pair_planar") {
+            return fixed_allocation(kind,{storage[pair*2],storage[pair*2+1]},0,count,bytes,
+                layout,"both",bank);
+        };
+        const auto input=alloc(PlacementKind::Activation,0,words,rows*hidden*2,0);
+        const auto replay=alloc(PlacementKind::VxmResult,1,hidden+1,(hidden+1)*tile*2,0);
+        const auto result=alloc(PlacementKind::FinalResult,2,words,rows*hidden*2,1);
+        const auto weight=feedbackWeightSliceBase>=0 && feedbackWeightSegmentRows<=0
+            ? fixed_allocation(PlacementKind::Weight,
+                {feedbackWeightSliceBase,feedbackWeightSliceBase+1},feedbackWeightBaseRow,
+                hidden,hidden*2,"fp16_vxm_gamma_broadcast","both",feedbackWeightBank)
+            : alloc(PlacementKind::Weight,3,hidden,hidden*2,1,"fp16_vxm_gamma_broadcast");
+        if(mlir::failed(planner.bind(op.getInput(),input))
+            || mlir::failed(planner.bind(op.getWeight(),weight))
+            || mlir::failed(planner.bind(op.getResult(),result)))
+            return op.emitError("planar RMSNorm conflicts with the global memory plan");
+        const auto allocations=[&](const Allocation& a) {
+            return make_task_allocations(rewriter,{make_task_allocation(rewriter,a,
+                make_profile_placement(rewriter,a,a.layout,a.hemisphere))});
+        };
+        rewriter.setInsertionPoint(op);
+        mlir::OperationState state(op.getLoc(),tensor::RmsNormTaskOp::getOperationName());
+        state.addOperands({op.getInput(),op.getWeight()});
+        state.addTypes(op.getResult().getType());
+        state.addAttributes({
+            rewriter.getNamedAttr("axis",op.getAxisAttr()),
+            rewriter.getNamedAttr("epsilon",op.getEpsilonAttr()),
+            rewriter.getNamedAttr("input_allocations",allocations(input)),
+            rewriter.getNamedAttr("weight_allocations",allocations(weight)),
+            rewriter.getNamedAttr("scratch_allocations",allocations(replay)),
+            rewriter.getNamedAttr("result_allocations",allocations(result)),
+            rewriter.getNamedAttr("config",rewriter.getDictionaryAttr({
+                rewriter.getNamedAttr("strategy",rewriter.getStringAttr("vxm_feedback")),
+                rewriter.getNamedAttr("planar_streaming",rewriter.getBoolAttr(true)),
+                rewriter.getNamedAttr("materialize_gamma",rewriter.getBoolAttr(false)),
+                rewriter.getNamedAttr("reduction_width",rewriter.getI64IntegerAttr(tile))}))});
+        auto lowered=llvm::cast<tensor::RmsNormTaskOp>(rewriter.create(state));
+        planner.replace_value(op.getResult(),lowered.getResult());
+        rewriter.replaceOp(op,lowered.getResult());
+        return mlir::success();
+    }
     const auto headPolicy=module->getAttrOfType<mlir::BoolAttr>("ftlpu.l2_head_partition");
     const bool headScratch = rows==tile && wide && wide.getValue()
         && headPolicy && headPolicy.getValue() && target.uses_dedicated_slice_roles()

@@ -35,18 +35,13 @@ def main() -> None:
     if result.returncode != 0:
         raise RuntimeError(result.stderr or result.stdout)
     text = command.read_text(encoding="utf-8")
-    expected = [
-        67, 131075, 33619972, 8388679, 163840,
-        8491008, 32843, 33554496, 65536,
-    ]
-    packets = [
-        [int(value.strip()) for value in match.split(",")]
-        for match in re.findall(
-            r"ftlpu\.command\.mem_3d.*?words = \[([^]]+)\]", text)
-    ]
-    if packets != [expected, expected]:
-        raise RuntimeError(f"unexpected blocked-outer MEM packets: {packets}")
-
+    # The blocked address domain is resolved by the compiler into ordered
+    # affine Macro templates, with no hardware blocked/3-D packet encoding.
+    macros = [line for line in text.splitlines() if "ftlpu.command.macro" in line]
+    if not macros or any(not re.search(r"\bkind = 0 : i64", line) for line in macros):
+        raise RuntimeError("blocked MEM domain did not lower directly to MEM Macro")
+    if "ftlpu.command.mem_3d" in text:
+        raise RuntimeError("retired hardware packet emitted")
     invalid = args.output_dir / "partial.schedule.mlir"
     invalid.write_text(
         args.input.read_text(encoding="utf-8").replace(

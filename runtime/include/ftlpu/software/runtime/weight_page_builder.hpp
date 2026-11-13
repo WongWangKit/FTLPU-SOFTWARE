@@ -38,6 +38,11 @@ std::vector<std::uint8_t> unpack_binding_image(
     const BinaryBinding& binding, const PackedWeightImage& image,
     const ExecutableHardwareConfig& hardware);
 
+// Validate coverage and physical aliases of native output pieces in each
+// bank. A bank-local PackedWeightImage cannot combine different banks.
+void validate_native_output_pieces(const BinaryBinding& binding,
+    const ExecutableHardwareConfig& hardware);
+
 // Converts one logical runtime tensor into the target's exact SRAM rows
 // consumed by its executable binding. This is the offline counterpart of a
 // host upload and is the only representation accepted by C2C weight pages.

@@ -11,7 +11,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('build-dir','target-config','output-dir'):
         p.add_argument('--'+name,type=Path,required=True)
-    p.add_argument('--case',choices=('negative','gqa','causal','query_tiles','causal_offset','single_tile','wide_reduction','flattened_q','odd_reduction','single_key','masked_singleton_tail'),default='negative')
+    p.add_argument('--case',choices=('negative','gqa','causal','query_tiles','causal_offset','single_tile','wide_reduction','flattened_q','odd_reduction','single_key','masked_singleton_tail','prefill_streaming'),default='negative')
     a=p.parse_args(); rng=np.random.default_rng(5731)
     batch,qt,kt,qh,kh,dim,dv,causal,position = {
         'negative':(1,1,33,2,1,32,32,False,0),
@@ -35,6 +35,10 @@ def main():
         'odd_reduction':(1,2,37,6,2,96,96,False,0),
         'single_key':(1,2,1,6,3,64,96,False,0),
         'masked_singleton_tail':(1,2,33,4,2,64,96,True,31),
+        # Two full P tiles use VXM->SXM fusion, then a singleton tail keeps
+        # its existing outer-product path. Multiple queries, batches and GQA
+        # groups expose wrong transpose order or shared online m/l/U state.
+        'prefill_streaming':(2,33,65,4,2,64,96,True,32),
     }[a.case]
     random=lambda shape:bf16(rng.normal(0,.4,shape).astype('f4'))
     q=random((batch,qt,qh,dim)); k=random((batch,kt,kh,dim)); v=random((batch,kt,kh,dv))
@@ -83,6 +87,17 @@ def main():
         assert np.array_equal(actual,np.broadcast_to(values,actual.shape))
     record=dict(status='passed',case=a.case,relative_l2=relative,shape=dict(batch=batch,q=qt,kv=kt,qh=qh,kh=kh,d=dim,dv=dv),
         precision='BF16 Q/K/V, QK score, scaled score and P; FP32 matmul accumulation and online m/l/U',icu_encoding='raw-macro')
+    if a.case=='prefill_streaming':
+        plan=json.loads((folder/'graph_plan.json').read_text())
+        def count_fused(value):
+            if isinstance(value,dict):
+                return int(value.get('vxm_sxm_direct_transpose') is True)+sum(map(count_fused,value.values()))
+            return sum(map(count_fused,value)) if isinstance(value,list) else 0
+        record['streamed_probability_tiles']=count_fused(plan)
+        assert record['streamed_probability_tiles']>0, 'P transpose did not fuse with its BF16 producer'
+        schedule=(folder/'decoder_layer.schedule.mlir').read_text()
+        record['native_row_scale_count']=schedule.count('vector.native_row_scale')
+        assert record['native_row_scale_count']>0, 'planar PV normalization was repacked'
     (folder/'summary.json').write_text(json.dumps(record,indent=2));print(record)
 
 

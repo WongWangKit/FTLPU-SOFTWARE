@@ -28,19 +28,7 @@ bool issued(IcuQueueAction action)
     switch (action) {
     case IcuQueueAction::FunctionalIssue:
     case IcuQueueAction::RepeatIssue:
-    case IcuQueueAction::Repeat2DIssue:
     case IcuQueueAction::MacroIssue:
-    case IcuQueueAction::MemStreamNdIssue:
-    case IcuQueueAction::MemSliceProgramIssue:
-    case IcuQueueAction::MxmStreamNdIssue:
-    case IcuQueueAction::VxmStreamNdIssue:
-    case IcuQueueAction::SxmTileProgramIssue:
-    case IcuQueueAction::VxmRun2DIssue:
-    case IcuQueueAction::SxmRun2DIssue:
-    case IcuQueueAction::Mem3DIssue:
-    case IcuQueueAction::MxmLoad3DIssue:
-    case IcuQueueAction::MxmDequant3DIssue:
-    case IcuQueueAction::MxmCompute3DIssue:
     case IcuQueueAction::SynchronizedIssue:
         return true;
     default:
@@ -77,34 +65,9 @@ const char* icu_action_name(IcuQueueAction action)
     case IcuQueueAction::NopWait: return "nop_wait";
     case IcuQueueAction::RepeatIssue: return "repeat_issue";
     case IcuQueueAction::RepeatWait: return "repeat_wait";
-    case IcuQueueAction::Repeat2DIssue: return "repeat2d_issue";
-    case IcuQueueAction::Repeat2DWait: return "repeat2d_wait";
     case IcuQueueAction::MacroIssue: return "macro_issue";
     case IcuQueueAction::MacroWait: return "macro_wait";
-    case IcuQueueAction::MemStreamNdIssue: return "stream_nd_issue";
-    case IcuQueueAction::MemStreamNdWait: return "stream_nd_wait";
-    case IcuQueueAction::MemSliceProgramIssue: return "slice_program_issue";
-    case IcuQueueAction::MemSliceProgramWait: return "slice_program_wait";
-    case IcuQueueAction::MxmStreamNdIssue: return "mxm_stream_nd_issue";
-    case IcuQueueAction::MxmStreamNdWait: return "mxm_stream_nd_wait";
-    case IcuQueueAction::VxmStreamNdIssue: return "vxm_stream_nd_issue";
-    case IcuQueueAction::VxmStreamNdWait: return "vxm_stream_nd_wait";
-    case IcuQueueAction::VxmRun2DIssue: return "vxm_run2d_issue";
-    case IcuQueueAction::VxmRun2DWait: return "vxm_run2d_wait";
-    case IcuQueueAction::SxmRun2DIssue: return "sxm_run2d_issue";
-    case IcuQueueAction::SxmRun2DWait: return "sxm_run2d_wait";
-    case IcuQueueAction::SxmTileProgramIssue: return "sxm_tile_issue";
-    case IcuQueueAction::SxmTileProgramWait: return "sxm_tile_wait";
-    case IcuQueueAction::Mem3DIssue: return "mem3d_issue";
-    case IcuQueueAction::Mem3DWait: return "mem3d_wait";
-    case IcuQueueAction::MxmLoad3DIssue: return "mxm_load3d_issue";
-    case IcuQueueAction::MxmLoad3DWait: return "mxm_load3d_wait";
-    case IcuQueueAction::MxmDequant3DIssue: return "mxm_dequant3d_issue";
-    case IcuQueueAction::MxmDequant3DWait: return "mxm_dequant3d_wait";
-    case IcuQueueAction::MxmCompute3DIssue: return "mxm_compute3d_issue";
-    case IcuQueueAction::MxmCompute3DWait: return "mxm_compute3d_wait";
-    case IcuQueueAction::ThreeDDecodeWait: return "decode3d_wait";
-    case IcuQueueAction::ThreeDContextFullWait: return "context_full_wait";
+    case IcuQueueAction::NativeDecodeWait: return "decode3d_wait";
     case IcuQueueAction::SynchronizedWait: return "sync_data_wait";
     case IcuQueueAction::SynchronizedDelay: return "sync_transport_delay";
     case IcuQueueAction::SynchronizedIssue: return "sync_issue";
@@ -145,9 +108,7 @@ std::pair<std::string, std::string> describe_mem(
            << " operation=" << (write ? "write" : "read")
            << " stream=" << stream_name(instruction.stream_id());
     std::string opcode = mem_opcode_name(instruction);
-    if (action == IcuQueueAction::Mem3DIssue)
-        opcode += "3D";
-    else if (action == IcuQueueAction::SynchronizedIssue)
+    if (action == IcuQueueAction::SynchronizedIssue)
         opcode += "Sync";
     return {std::string("MEM.") + (east ? "E." : "W.")
             + opcode, detail.str()};

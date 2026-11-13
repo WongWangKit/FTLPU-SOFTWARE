@@ -27,6 +27,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -58,9 +59,8 @@ struct Args {
     std::int64_t kv_cache_capacity{0};
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
-        ftlpu::compiler::target::IcuCompressionMode::Macro};
+        ftlpu::compiler::target::IcuCompressionMode::RawMacro};
     bool icu_compression_specified{false};
-    bool mem_slice_program{false};
     bool verify_icu_issues{false};
     bool direct_ffn_up_3d{false};
     bool common_barrier{false};
@@ -106,7 +106,7 @@ Args parse_args(int argc, char** argv)
             args.direct_ffn_up_3d = true;
         else if (argument == "--icu-macro-schedule") {
             args.icu_compression =
-                ftlpu::compiler::target::IcuCompressionMode::Macro;
+                ftlpu::compiler::target::IcuCompressionMode::RawMacro;
             args.icu_compression_specified = true;
         }
         else if (argument == "--icu-compression") {
@@ -119,13 +119,7 @@ Args parse_args(int argc, char** argv)
             args.icu_compression = *parsed;
             args.icu_compression_specified = true;
         }
-        else if (argument == "--mem-slice-program") {
-            const std::string value = next();
-            if (value == "on") args.mem_slice_program = true;
-            else if (value == "off") args.mem_slice_program = false;
-            else throw std::runtime_error(
-                "expected on or off for --mem-slice-program");
-        }
+
         else if (argument == "--ffn-schedule") {
             const std::string value = next();
             if (value == "tail")
@@ -177,9 +171,9 @@ Args parse_args(int argc, char** argv)
             "[--target-config target.json] [--weight-bank 0|1] "
             "[--kv-cache-capacity tokens] "
             "[--mxm-execution auto|ws|is] "
-            "[--icu-compression none|control|macro|raw-macro] "
+            "[--icu-compression raw-macro] "
             "[--common-barrier (raw-macro synchronization)] "
-            "[--mem-slice-program on|off] "
+
             "[--verify-icu-issues] "
             "[--direct-ffn-up-3d (standalone, SRAM-preloaded)] "
             "[--ffn-schedule tail|fused] "
@@ -246,9 +240,6 @@ try {
     if (args.direct_ffn_up_3d && args.weight_bank >= 0)
         throw std::runtime_error(
             "--direct-ffn-up-3d takes banks from explicit route placement; do not pass --weight-bank");
-    if (args.direct_ffn_up_3d && args.verify_icu_issues)
-        throw std::runtime_error(
-            "--direct-ffn-up-3d already emits raw FU 3-D commands and cannot use --verify-icu-issues");
     if (args.direct_ffn_up_3d) {
         std::size_t functionCount = 0;
         bool declaration = false;
@@ -294,18 +285,8 @@ try {
             if (!parsed) throw std::runtime_error("invalid inherited ftlpu.icu_compression");
             requestedCompression = *parsed;
         }
-    const auto effectiveCompression = directLowering
-            && requestedCompression != ftlpu::compiler::target::IcuCompressionMode::RawMacro
-        ? ftlpu::compiler::target::IcuCompressionMode::None
-        : requestedCompression;
-    const bool effectiveMemSliceProgram =
-        directLowering ? false : args.mem_slice_program;
-    (*module)->setAttr("ftlpu.icu_compression",
-        mlir::StringAttr::get(&context,
-            ftlpu::compiler::target::icu_compression_mode_name(
-                effectiveCompression)));
-    (*module)->setAttr("ftlpu.mem_slice_program",
-        mlir::BoolAttr::get(&context, effectiveMemSliceProgram));
+    const auto effectiveCompression = requestedCompression;
+    (*module)->setAttr("ftlpu.icu_compression", mlir::StringAttr::get(&context,"raw-macro"));
     if (args.common_barrier) {
         if (effectiveCompression != ftlpu::compiler::target::IcuCompressionMode::RawMacro)
             throw std::runtime_error("--common-barrier requires --icu-compression raw-macro");
@@ -315,7 +296,7 @@ try {
     // Keep the old attribute during the command-IR compatibility window.
     (*module)->setAttr("ftlpu.icu_macro_schedule",
         mlir::BoolAttr::get(&context,
-            effectiveCompression == ftlpu::compiler::target::IcuCompressionMode::Macro
+            effectiveCompression == ftlpu::compiler::target::IcuCompressionMode::RawMacro
                 || effectiveCompression == ftlpu::compiler::target::IcuCompressionMode::RawMacro));
     (*module)->setAttr("ftlpu.command_lowering",
         mlir::StringAttr::get(&context,
@@ -385,12 +366,10 @@ try {
     auto program =
         ftlpu::compiler::target::translate_command_module(*module);
     if (args.verify_icu_issues) {
-        (*module)->setAttr("ftlpu.icu_compression",
-            mlir::StringAttr::get(&context, "none"));
-        (*module)->setAttr("ftlpu.mem_slice_program",
-            mlir::BoolAttr::get(&context, false));
-        const auto baseline =
-            ftlpu::compiler::target::translate_command_module(*module);
+        std::stringstream encoded(std::ios::in | std::ios::out | std::ios::binary);
+        ftlpu::software::runtime::write_binary_program(program,encoded);
+        encoded.seekg(0);
+        const auto baseline = ftlpu::software::runtime::read_binary_program(encoded);
         const auto comparison =
             ftlpu::software::runtime::compare_logical_issues(
                 program, baseline);

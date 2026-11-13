@@ -1,3 +1,4 @@
+#include "ftlpu/compiler/Analysis/planar_access_attrs.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Transforms/stream_schedule_emitters.hpp"
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/IR/schedule_dialect.hpp"
@@ -44,6 +45,7 @@ struct Storage {
     int64_t broadcastRowRepeat = 0;
     int64_t broadcastHeadBase = 0;
     int64_t broadcastHeadStride = 1;
+    std::optional<analysis::PlanarReadPlan> access;
 };
 
 // A matrix word carries 32 independent value components. Only the row
@@ -70,11 +72,15 @@ Storage storageOf(mlir::DictionaryAttr p)
         p.getAs<mlir::StringAttr>("kind").getValue() == "token_partition_planar",
         p.getAs<mlir::IntegerAttr>("broadcast_row_repeat") ? p.getAs<mlir::IntegerAttr>("broadcast_row_repeat").getInt() : 0,
         p.getAs<mlir::IntegerAttr>("broadcast_head_base") ? p.getAs<mlir::IntegerAttr>("broadcast_head_base").getInt() : 0,
-        p.getAs<mlir::IntegerAttr>("broadcast_head_stride") ? p.getAs<mlir::IntegerAttr>("broadcast_head_stride").getInt() : 1};
+        p.getAs<mlir::IntegerAttr>("broadcast_head_stride") ? p.getAs<mlir::IntegerAttr>("broadcast_head_stride").getInt() : 1,
+        analysis::decodePlanarRead(p)};
 }
 
+#include "PlanarAccessEmitter.hpp"
+#include "VectorFusionEmitter.hpp"
 #include "ScaledMatvecEmitter.hpp"
 #include "SiluMultiplyEmitter.hpp"
+#include "PackedRowScaleEmitter.hpp"
 #include "WeightedGramEmitter.hpp"
 #include "UnitLowerSolveEmitter.hpp"
 #include "UnitLowerMxmEmitter.hpp"
@@ -113,6 +119,21 @@ llvm::SmallVector<int64_t> chainColumns(llvm::ArrayRef<kernel::VectorAluOp> ops,
         return first;
     };
     auto head = ops.front();
+    if(packed && ops.size()>=2 && (matchScaleAdd(head,ops[1]) || matchAddScale(head,ops[1]) || matchSquareSum(head,ops[1])))
+        return {0,1};
+    if(packed)if(auto fold=matchPointwiseFold(ops);!fold.columns.empty())return fold.columns;
+    if (packed && ops.size() >= 2 && reduceAlongRows(head)) {
+        auto next = ops[1];
+        auto reduction = head->getAttrOfType<mlir::StringAttr>("reduction_kind");
+        if (reduction && reduction.getValue() == "add" && head.getKind() == "multiply"
+            && head.getUseImmediate() && head.getImmediate().convertToFloat() == 1.f
+            && next.getKind() == "reciprocal" && next.getUseImmediate() && !next.getReduce()
+            && next.getLhs() == head.getResult()
+            && head.getResult().getType().getElementType().isF32()
+            && next.getResult().getType() == head.getResult().getType()
+            && llvm::all_of(head.getResult().getUsers(), [&](auto *user) { return user == next.getOperation(); }))
+            return {1, 3};
+    }
     if(ops.size()>=2 && isHeadMatmulAdd(head,ops[1]))
         return ops.size()>=3 && isHeadMatmulCast(ops[1],ops[2])?
             llvm::SmallVector<int64_t>{0,1,2}:llvm::SmallVector<int64_t>{0,1};
@@ -170,6 +191,9 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
     Storage rhsStorage, Storage outStorage, bool packed, int64_t queueBase,
     llvm::ArrayRef<kernel::VectorAluOp> chain, llvm::ArrayRef<int64_t> columns)
 {
+    if(chain.size()==2 && (matchScaleAdd(op,chain[1]) || matchAddScale(op,chain[1]) || matchSquareSum(op,chain[1])))
+        return emitPlanarArithmeticFusion(r,chain,target,matchSquareSum(op,chain[1]));
+    if(!matchPointwiseFold(chain).columns.empty())return emitPointwiseFold(r,chain,target);
     if(op.getKind()=="head_last_row_scale_transpose") {
         if(chain.size()!=2 && chain.size()!=3)return op.emitError("requires fused head_cross_product consumer");
         return emitHeadWeightedProduct(r,op,chain[1],target,chain.size()==3?chain[2]:kernel::VectorAluOp{});
@@ -383,6 +407,58 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
         r.replaceOp(op,result.getValue());
         return mlir::success();
     }
+    if (reduceAlongRows(op) && chain.size() == 2 && tail.getKind() == "reciprocal") {
+        // Keep the FP32 sum in C1, emit only its final token, and feed C3's
+        // reciprocal directly. No sum spill/reload or BF16 boundary is added.
+        if (!packed || !fp32Ingress || !lhsStorage.both || !outStorage.both)
+            return op.emitError("sum-reciprocal chain requires mirrored packed FP32-capable ports");
+        const int64_t count=lhsType.getDimSize(0), start=96, latency=8;
+        const bool fullInput=lhsType.getElementType().isF32();
+        for(int64_t word=0;word<packedColumns;++word) {
+            const int64_t begin=start+word*count;
+            for(int64_t side=0;side<2;++side) {
+                for(int64_t byte=0;byte<(fullInput?4:2);++byte) {
+                    const auto slice=lhsStorage.slice+byte;
+                    direct_domain_detail::emitMem3D(r,op.getLoc(),target,begin-1-slice/4,
+                        side*target.memory().slices_per_hemisphere+slice,"read",lhsStorage.base+word*count,
+                        32+side*16+byte,count,1,1,1,1,0,1,1,0,-1,lhsStorage.bank);
+                }
+                for(int64_t byte=0;byte<4;++byte) {
+                    const auto slice=outStorage.slice+byte;
+                    direct_domain_detail::emitMem3D(r,op.getLoc(),target,begin+latency+count-1+slice/4,
+                        side*target.memory().slices_per_hemisphere+slice,"write",outStorage.base+word,
+                        (1-side)*8+2+byte,1,1,0,1,1,0,1,1,0,-1,outStorage.bank);
+                }
+            }
+            auto input=ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
+                begin-1,0,"bypass",fullInput?"stream_f32":"stream_bf16",0,0.f,"immediate",0,0.f,"fp32",-1,
+                count,1,"east","east",-1,false,false,true,false,4);
+            input->setAttr("lhs_stream_source",r.getStringAttr("local"));
+            ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
+                begin-1,1,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",-1,
+                1,1,"east","east",-1,true,true,count==1,false,4);
+            if(count>2)ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
+                begin,1,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",-1,
+                count-2,1,"east","east",-1,false,true,false,false,4);
+            if(count>1)ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
+                begin+count-2,1,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",-1,
+                1,1,"east","east",-1,false,true,true,false,4);
+            ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
+                begin-1,2,"bypass","previous",0,0.f,"immediate",0,0.f,"fp32",-1,
+                1,1,"east","east",-1,false,false,true,false,4);
+            ffn_detail::create_vxm(r,op.getLoc(),op.getLhs(),op.getRhs(),outType,
+                begin-1,3,"reciprocal","previous",0,0.f,"immediate",0,0.f,"fp32",2,
+                1,1,"east","east",-1,false,false,true,false,4);
+        }
+        mlir::OperationState timeline(op.getLoc(),TimelineOp::getOperationName());
+        timeline.addAttribute("name",r.getStringAttr("row_sum_reciprocal.fp32_chain"));
+        timeline.addAttribute("start",r.getI64IntegerAttr(start-1));
+        timeline.addAttribute("end",r.getI64IntegerAttr(start+latency+(outStorage.slice+3)/4+packedColumns*count));
+        r.create(timeline);
+        auto result=bind({},outType,0,"output",outStorage);
+        r.replaceOp(tail,result.getValue());r.eraseOp(op);
+        return mlir::success();
+    }
     if (op.getKind()=="cumsum_rows" || reduceAlongRows(op)) {
         // Each lane owns a column; streaming rows in order gives a separate
         // FP32 accumulator for every query without a cross-lane shuffle.
@@ -589,6 +665,19 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
             const int64_t offset=type.getElementType().isF32() && !full?2:0;
             for(int64_t side=0;side<2;++side)for(int64_t byte=0;byte<(full?4:2);++byte) {
                 const auto slice=st.slice+offset+byte;
+                if(st.access) {
+                    if(partition)llvm::report_fatal_error("planar read ownership requires mirrored packed update");
+                    auto access=*st.access;
+                    if(broadcast) {
+                        access.rows=lhsType.getDimSize(0);access.rowChunk=access.rows;
+                        access.rowStride=0;access.groupStride=0;
+                    }
+                    if(rowCoefficient && port==rhsPort)access.columnStride=0;
+                    emitPlanarReadDomain(r,op.getLoc(),target,start-1-slice/4,
+                        side*target.memory().slices_per_hemisphere+slice,st.base,
+                        32+side*16+port+byte,st.bank,access,packedColumns);
+                    continue;
+                }
                 if(st.broadcastRowRepeat) {
                     const int64_t heads=lhsType.getDimSize(0)/st.broadcastRowRepeat;
                     direct_domain_detail::emitMem3D(r,op.getLoc(),target,start-1-slice/4,
@@ -633,6 +722,46 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
         const bool returned = partition && llvm::all_of(tail.getResult().getUsers(),
             [](mlir::Operation *user) { return llvm::isa<mlir::func::ReturnOp>(user); });
         const bool exported = returned && op->getParentOfType<mlir::func::FuncOp>()->hasAttr("ftlpu.vector_native_partition_outputs");
+        const bool directTranspose=tail->hasAttr("ftlpu.vector_result_tile_transpose");
+        if(directTranspose) {
+            const auto wide=op->getParentOfType<mlir::ModuleOp>()->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
+            const int64_t tile=target.throughput().mxm_rows;
+            if(!wide || !wide.getValue() || partition || update || tile!=32 ||
+               lhsType.getDimSize(0)!=tile || packedColumns!=2 || !outType.getElementType().isBF16())
+                return op.emitError("streamed result transpose requires two full mirrored BF16 tiles and wide SXM");
+            // The fixed chain's final BF16 output appears before its usual
+            // MEM write by VXM->MEM transport latency. Capture that exact
+            // stream, preserving the cast and the key reduction order.
+            const int64_t capture=start+latency-1+*target.transport_latency(
+                target::StreamEndpoint::VxmResult,target::StreamEndpoint::SxmInput,
+                target::StreamDirection::East,0);
+            llvm::SmallVector<int64_t> identity;
+            for(int64_t lane=0;lane<tile;++lane)identity.push_back(lane);
+            int64_t end=capture;
+            for(int64_t side=0;side<2;++side) {
+                const int64_t inputStream=(1-side)*8+6;
+                // Fixed FP32 input occupies reverse ports 0..3. Keep SXM
+                // output on 4/5 while the next tile still enters VXM.
+                attention_detail::emitSxm(r,op.getLoc(),capture,side,"transpose",
+                    {inputStream,inputStream+1},{36,37},identity,"wide_matrix",
+                    -1,-1,-1,packedColumns,tile);
+                for(int64_t byte=0;byte<2;++byte) {
+                    const int64_t slice=outStorage.slice+byte;
+                    const int64_t at=capture+tile+target.throughput().tile_rows-1+
+                        *target.transport_latency(target::StreamEndpoint::SxmResult,
+                            target::StreamEndpoint::Mem,target::StreamDirection::West,slice);
+                    direct_domain_detail::emitMem3D(r,op.getLoc(),target,at,
+                        side*target.memory().slices_per_hemisphere+slice,"write",outStorage.base,
+                        36+byte,tile,1,1,packedColumns,tile,tile,1,1,0,-1,outStorage.bank);
+                    end=std::max(end,at+packedColumns*tile);
+                }
+            }
+            mlir::OperationState timeline(op.getLoc(),TimelineOp::getOperationName());
+            timeline.addAttribute("name",r.getStringAttr("vector.vxm_sxm_direct_transpose"));
+            timeline.addAttribute("start",r.getI64IntegerAttr(capture));
+            timeline.addAttribute("end",r.getI64IntegerAttr(end));
+            r.create(timeline);
+        } else {
         for(int64_t side=0;side<2;++side)
             for(int64_t byte=0;byte<(outType.getElementType().isF32()?4:2);++byte) {
                 const auto slice=outStorage.slice+byte;
@@ -642,6 +771,7 @@ mlir::LogicalResult lowerOne(mlir::IRRewriter& r, kernel::VectorAluOp op,
             }
         if(returned && !exported)
             mirrorValue(outStorage,outType,1-phase,start+latency+(outStorage.slice+3)/4+count+2);
+        }
         auto result=bind({},outType,0,"output",outStorage);
         if(returned && !exported) result->setAttr("token_mirrored",r.getUnitAttr());
         if(partition) {
@@ -856,6 +986,21 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
     llvm::SmallVector<kernel::VectorAluOp> ops;
     function.walk([&](kernel::VectorAluOp op) { ops.push_back(op); });
     if (ops.empty()) return mlir::success();
+    // Capture phases finish before the binary stream starts. Their sources
+    // may share MEM queues with ordinary data reads without simultaneous use.
+    llvm::SmallVector<mlir::Attribute> captured;
+    const auto captureArgument=[&](mlir::Value value) {
+        if(auto arg=llvm::dyn_cast<mlir::BlockArgument>(value))
+            captured.push_back(mlir::IntegerAttr::get(mlir::IntegerType::get(function.getContext(),64),arg.getArgNumber()));
+    };
+    if(ops.size()==2 && matchScaleAdd(ops[0],ops[1]) && ops[0].getRhs()!=ops[0].getLhs() && ops[0].getRhs()!=ops[1].getRhs())
+        captureArgument(ops[0].getRhs());
+    if(ops.size()==2 && matchAddScale(ops[0],ops[1]) && ops[1].getRhs()!=ops[0].getLhs() && ops[1].getRhs()!=ops[0].getRhs())
+        captureArgument(ops[1].getRhs());
+    if(auto fold=matchPointwiseFold(ops);fold.columns.size()==ops.size())
+        for(size_t i=2;i<fold.inputs.size();++i)
+            if(fold.inputs[i]!=fold.inputs[0] && fold.inputs[i]!=fold.inputs[1])captureArgument(fold.inputs[i]);
+    if(!captured.empty())function->setAttr("ftlpu.vector_capture_arguments",mlir::ArrayAttr::get(function.getContext(),captured));
     if (function->hasAttr("ftlpu.vector_bf16_spill") && matchSiluMultiply(function))
         function->setAttr("ftlpu.native_silu_multiply",mlir::UnitAttr::get(function.getContext()));
     // A graph-level plan is authoritative; repeated lowering must not reset it.
@@ -1049,6 +1194,11 @@ mlir::LogicalResult planVectorAluMemory(mlir::func::FuncOp function,
                 mlir::NamedAttrList p(op->getAttrOfType<mlir::DictionaryAttr>(name));
                 const bool result=llvm::StringRef(name)=="ftlpu.vector_result_placement";
                 p.set("kind",r.getStringAttr((sharedWeight?!result:(inverse!=result))?"token_partition_east_first_planar":"token_partition_planar"));
+                // Long native K contractions keep two ordinary mirrored
+                // operand matrices; the result alone is partitioned. This
+                // also gives C2C the normal finite planar allocation path.
+                if(!inverse && !result && op.getLhs().getType().getDimSize(1)>32)
+                    p.set("kind",r.getStringAttr("fp16_pair_planar"));
                 p.set("hemisphere",r.getStringAttr("both"));
                 op->setAttr(name,p.getDictionary(r.getContext()));
             }
@@ -1102,6 +1252,8 @@ mlir::LogicalResult lowerVectorAluSchedules(mlir::IRRewriter& r,
 {
     if (mlir::failed(planVectorAluMemory(function, target))) return mlir::failure();
     if (mlir::failed(lowerScaledMatvecSchedules(r,function,target))) return mlir::failure();
+    if(function->hasAttr("native_row_scale_words"))
+        return emitNativePackedRowScale(r,function,target);
     if(function->hasAttr("native_pointwise_words_0"))
         if(auto match=matchSiluMultiply(function))
             return emitNativeSiluMultiply(r,function,target,*match);

@@ -1,3 +1,5 @@
+> 历史设计记录：本文中的独立 2D/3D、STREAM_ND、slice/tile program 已移除，不是当前 ISA。当前实现见 [Macro ISA](icu_macro_isa.zh-CN.md)。旧测试产物需重新编译。
+
 # ICU Repeat2D 编译器设计
 
 `Repeat2D` 压缩一条功能指令的二维规则迭代。Command IR 继续使用已有的

@@ -4,6 +4,11 @@ namespace ftlpu::compiler::schedule {
 
 mlir::ArrayAttr AttentionTaskGraph::getRoutes() const
 {
+    if (core) {
+        if (auto routes = core->getAttrOfType<mlir::ArrayAttr>("routes"))
+            return routes;
+        return mlir::ArrayAttr::get(core->getContext(), {});
+    }
     llvm::SmallVector<mlir::Attribute> routes;
     const auto append = [&](auto task) {
         for (mlir::Attribute route : task.getRoutes())

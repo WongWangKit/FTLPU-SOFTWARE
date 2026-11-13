@@ -50,9 +50,8 @@ struct Args {
     std::int64_t decode_current_len{0};
     bool pass_timing{false};
     ftlpu::compiler::target::IcuCompressionMode icu_compression{
-        ftlpu::compiler::target::IcuCompressionMode::Macro};
+        ftlpu::compiler::target::IcuCompressionMode::RawMacro};
     bool icu_compression_specified{false};
-    bool mem_slice_program{false};
 };
 
 Args parse_args(int argc, char** argv)
@@ -123,7 +122,7 @@ Args parse_args(int argc, char** argv)
             args.pass_timing = true;
         else if (arg == "--icu-macro-schedule") {
             args.icu_compression =
-                ftlpu::compiler::target::IcuCompressionMode::Macro;
+                ftlpu::compiler::target::IcuCompressionMode::RawMacro;
             args.icu_compression_specified = true;
         }
         else if (arg == "--icu-compression") {
@@ -136,13 +135,7 @@ Args parse_args(int argc, char** argv)
             args.icu_compression = *parsed;
             args.icu_compression_specified = true;
         }
-        else if (arg == "--mem-slice-program") {
-            const std::string value = next();
-            if (value == "on") args.mem_slice_program = true;
-            else if (value == "off") args.mem_slice_program = false;
-            else throw std::runtime_error(
-                "expected on or off for --mem-slice-program");
-        }
+
         else throw std::runtime_error("unknown argument: " + arg);
     }
     if (args.input.empty() || args.output.empty()) {
@@ -160,8 +153,8 @@ Args parse_args(int argc, char** argv)
                                  "[--attention-schedule tail|fused] "
                                  "[--projection-rope-overlap on|off] "
                                  "[--mxm-execution auto|ws|is] "
-                                 "[--icu-compression none|control|macro|raw-macro] "
-                                 "[--mem-slice-program on|off] "
+                                 "[--icu-compression raw-macro] "
+
                                  "[--weight-bank 0|1] "
                                  "[--kv-cache-capacity tokens] "
                                  "[--target-config target.json]");
@@ -273,16 +266,7 @@ try {
             if (!parsed) throw std::runtime_error("invalid inherited ftlpu.icu_compression");
             requestedCompression = *parsed;
         }
-    (*module)->setAttr("ftlpu.icu_compression",
-        mlir::StringAttr::get(&context,
-            (producesCommands || producesDirectSchedule)
-                    && requestedCompression != ftlpu::compiler::target::IcuCompressionMode::RawMacro ? "none"
-                : ftlpu::compiler::target::icu_compression_mode_name(
-                    requestedCompression)));
-    (*module)->setAttr("ftlpu.mem_slice_program",
-        mlir::BoolAttr::get(&context,
-            producesCommands || producesDirectSchedule
-                ? false : args.mem_slice_program));
+    (*module)->setAttr("ftlpu.icu_compression",mlir::StringAttr::get(&context,"raw-macro"));
     if (producesCommands || producesDirectSchedule)
         (*module)->setAttr("ftlpu.command_lowering",
             mlir::StringAttr::get(&context, "direct"));
@@ -291,7 +275,7 @@ try {
         mlir::BoolAttr::get(&context,
             requestedCompression == ftlpu::compiler::target::IcuCompressionMode::RawMacro
                 || (!producesCommands && !producesDirectSchedule
-                    && requestedCompression == ftlpu::compiler::target::IcuCompressionMode::Macro)));
+                    && requestedCompression == ftlpu::compiler::target::IcuCompressionMode::RawMacro)));
 
     mlir::PassManager pass_manager(&context);
     const bool deferVerificationUntilCompressed =
@@ -356,8 +340,7 @@ try {
         pass_manager.addNestedPass<mlir::func::FuncOp>(
             ftlpu::compiler::create_assign_weight_bank_pass(
                 args.weight_bank));
-    if (!producesCommands && !producesDirectSchedule && args.icu_compression
-            != ftlpu::compiler::target::IcuCompressionMode::None
+    if (!producesCommands && !producesDirectSchedule
         && (args.pipeline == "ftlpu-stream-to-compressed-schedule"
             || args.pipeline == "ftlpu-compress-schedule"))
         pass_manager.addNestedPass<mlir::func::FuncOp>(

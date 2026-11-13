@@ -91,6 +91,10 @@ enum class BindingLayout : std::uint16_t {
     Fp16MxmCompactBlock4PartitionDistributed16 = 39,
     // As Block4Partition, with alternating D32 tiles in bank XOR (tile % 2).
     Fp16MxmBankStripedBlock4PartitionDistributed16 = 40,
+    // FP32 counterpart of Fp16HemispherePairPlanar: alternating N32 blocks
+    // on East/West, four byte planes per hemisphere. This is binding metadata
+    // only; existing binary layout values and hardware instructions are unchanged.
+    Fp32HemispherePairPlanar = 41,
 };
 
 enum class BindingInitializer : std::uint16_t {
@@ -118,8 +122,9 @@ struct BinaryBinding {
     std::uint64_t ready_cycle{0};
     // Bit 0 selects east and bit 1 selects west. Inputs may be replicated to both.
     std::uint16_t hemisphere_mask{1};
-    // Physical SRAM bank shared by every (hemisphere, slice) placement in
-    // this binding. Bank-local addresses remain in base_row.
+    // Physical SRAM bank shared by every (hemisphere, slice) placement in a
+    // leaf binding. Native output pieces carry their own banks. Bank-local
+    // addresses remain in base_row.
     std::uint16_t bank{0};
     BindingInitializer initializer{BindingInitializer::None};
     float rope_theta{0.0f};
@@ -151,8 +156,8 @@ struct BinaryBinding {
     // Row offsets are relative to the binding-level base_row.
     std::vector<std::uint32_t> page_base_rows{};
     std::vector<std::uint32_t> page_row_counts{};
-    // Ordered, complete logical pieces of a native output. Pieces use the
-    // parent's bank and element type and cannot themselves have pieces.
+    // Ordered, complete logical pieces of a native output. Pieces share the
+    // parent's element type, can reside in different banks, and cannot nest.
     std::vector<BinaryBinding> pieces{};
 };
 

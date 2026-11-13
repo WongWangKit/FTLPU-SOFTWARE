@@ -482,9 +482,9 @@ LogicalResult VxmOp::verify()
     if (llvm::MulOverflow(
             static_cast<int64_t>(getRepeatCount()) - 1,
             static_cast<int64_t>(getRepeatInterval()), launchSpan))
-        return emitOpError("VXM RUN_2D inner domain overflows int64");
+        return emitOpError("VXM configuration sequence overflows int64");
     if (waveCount > 1 && waveInterval <= launchSpan)
-        return emitOpError("VXM waves overlap their RUN_2D inner domain");
+        return emitOpError("VXM waves overlap their configuration runs");
     if (getAccumulatorReset().value_or(false)
         && !getAccumulatorWrite().value_or(false))
         return emitOpError(
@@ -1199,7 +1199,7 @@ LogicalResult SxmOp::verify()
         * getRepeatInterval().value_or(1);
     if (getWaveCount().value_or(1) > 1
         && getWaveInterval().value_or(1) <= repeatSpan)
-        return emitOpError("SXM waves overlap their RUN_2D inner domain");
+        return emitOpError("SXM waves overlap their launch domain inner domain");
     if (getOpcode() != "transpose" && getOpcode() != "permute")
         return emitOpError("opcode must be transpose or permute");
     if (getOutputRow()

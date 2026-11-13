@@ -265,24 +265,16 @@ private:
                 op.getCycle() + std::max(writeLast, readLast) + 1);
         }
         if (auto op = llvm::dyn_cast<schedule::VxmOp>(operation)) {
-            // A contiguous VXM repeat is carried by the compact functional
-            // instruction itself.  The macro ICU launches that body once and
-            // immediately frees its sole RUN_2D context; the VXM-local config
-            // FIFO then executes the body repeat.  Sparse repeats remain ICU
-            // loop launches, so their context stays live through every hole.
-            const int64_t repeatCount = op.getRepeatCount();
-            const int64_t repeatInterval = op.getRepeatInterval();
-            const int64_t waveCount = op.getWaveCount().value_or(1);
-            const int64_t waveInterval = op.getWaveInterval().value_or(1);
-            const int64_t outerRepeatCount =
-                repeatInterval == 1 ? 1 : repeatCount;
-            const int64_t finalCycle = op.getCycle()
-                + (outerRepeatCount - 1) * repeatInterval
-                + (waveCount - 1) * waveInterval;
-            auto result = reserve(operation,
-                "vxm." + std::to_string(op.getQueue()), op.getCycle(),
-                finalCycle - op.getCycle() + 1, 1);
-            if (result.wasInterrupted()) return result;
+            // Reserve ICU configuration launches, not FU execution cycles.
+            // A following configuration may be prefetched into Next/FIFO while
+            // Current repeats; the Superlane never interleaves their execution.
+            for (int64_t wave=0; wave<op.getWaveCount().value_or(1); ++wave) {
+                auto result=reserve(operation,"vxm."+std::to_string(op.getQueue()),
+                    op.getCycle()+wave*op.getWaveInterval().value_or(1),
+                    op.getRepeatInterval()==1 ? 1 : op.getRepeatCount(),
+                    op.getRepeatInterval());
+                if(result.wasInterrupted())return result;
+            }
             return mlir::WalkResult::advance();
         }
         if (auto op = llvm::dyn_cast<schedule::SxmOp>(operation)) {

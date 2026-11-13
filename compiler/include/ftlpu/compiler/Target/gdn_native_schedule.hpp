@@ -32,11 +32,11 @@ class GdnNativeLowering {
              std::size_t count, std::int64_t stride, bool rhs, bool write=false) {
         for(std::size_t side=0;side<2;++side) for(std::size_t byte=0;byte<2;++byte) {
             const auto hop=(pair+byte)/hw::kMemSlicesPerGroup;
-            IcuLoop3D loop{0,{count,1,1},{1,1,1}};
-            auto a=MemIcuAddress3D::Affine(address,{stride,0,0});
+            AffineLoopDomain loop{0,{count,1,1},{1,1,1}};
+            auto a=MemAddressPattern::Affine(address,{stride,0,0});
             p_.mem.push_back({side,pair+byte,write?time+hop:time-hop,write
-                ?MemIcuInstruction::Write3D(loop,a,StreamId::East(side*8+byte))
-                :MemIcuInstruction::Read3D(loop,a,StreamId::West(side*16+(rhs?2:0)+byte))});
+                ?MemAddressDomain::Write(loop,a,StreamId::East(side*8+byte))
+                :MemAddressDomain::Read(loop,a,StreamId::West(side*16+(rhs?2:0)+byte))});
         }
     }
     void vxm(std::size_t queue,std::size_t time,VxmLaneAluInstruction i) {
@@ -107,15 +107,15 @@ public:
                 perm.output_row=SxmInstruction::kConsumeOutputRowBase;
                 p_.sxm.push_back({side,t_,1,1,trans});p_.sxm.push_back({side,t_+5,1,1,perm});
                 for(std::size_t byte=0;byte<2;++byte){
-                    IcuLoop3D loop{0,{1,1,1},{1,1,1}};
+                    AffineLoopDomain loop{0,{1,1,1},{1,1,1}};
                     const auto group=(6+byte)/hw::kMemSlicesPerGroup;
                     for(std::size_t row=0;row<8;++row){
                         const auto pair=row?26+2*row:6;
                         p_.mem.push_back({side,pair+byte,t_-edge+(pair+byte)/hw::kMemSlicesPerGroup,
-                            MemIcuInstruction::Read3D(loop,MemIcuAddress3D::Affine(0,{0,0,0}),StreamId::East(16+2*row+byte))});
+                            MemAddressDomain::Read(loop,MemAddressPattern::Affine(0,{0,0,0}),StreamId::East(16+2*row+byte))});
                     }
                     p_.mem.push_back({side,6+byte,t_+5+edge-group,
-                        MemIcuInstruction::Write3D(loop,MemIcuAddress3D::Affine(1+lane,{0,0,0}),StreamId::West(byte))});
+                        MemAddressDomain::Write(loop,MemAddressPattern::Affine(1+lane,{0,0,0}),StreamId::West(byte))});
                 }
             }
             t_+=use_mxm_?2*edge+8:64;
@@ -135,11 +135,11 @@ public:
                 const auto latency=op==VxmAluOpcode::Multiply?3:2;
                 for(std::size_t side=0;side<2;++side)for(std::size_t byte=0;byte<2;++byte){
                     const auto hop=(tensor.pair+byte)/hw::kMemSlicesPerGroup;
-                    IcuLoop3D loop{0,{words,out.rows,1},{1,words,1}};
-                    auto address=MemIcuAddress3D::Affine(tensor.base,{inner,outer,0});
+                    AffineLoopDomain loop{0,{words,out.rows,1},{1,words,1}};
+                    auto address=MemAddressPattern::Affine(tensor.base,{inner,outer,0});
                     p_.mem.push_back({side,tensor.pair+byte,write?t_+latency+hop:t_-1-hop,write
-                        ?MemIcuInstruction::Write3D(loop,address,StreamId::East(side*8+byte))
-                        :MemIcuInstruction::Read3D(loop,address,StreamId::West(side*16+(rhs?2:0)+byte))});
+                        ?MemAddressDomain::Write(loop,address,StreamId::East(side*8+byte))
+                        :MemAddressDomain::Read(loop,address,StreamId::West(side*16+(rhs?2:0)+byte))});
                 }
             };
             matrixMem(a,false,false,1,a.words());
@@ -175,11 +175,11 @@ public:
                     perm.output_row=c%8<7?9+c%8:7;
                     p_.sxm.push_back({side,t_,a.rows,8,trans});p_.sxm.push_back({side,t_+5,a.rows,8,perm});
                     for(std::size_t byte=0;byte<2;++byte){
-                        IcuLoop3D loop{0,{a.rows,1,1},{8,1,1}};
+                        AffineLoopDomain loop{0,{a.rows,1,1},{8,1,1}};
                         p_.mem.push_back({side,a.pair+byte,t_-edge+(a.pair+byte)/hw::kMemSlicesPerGroup,
-                            MemIcuInstruction::Read3D(loop,MemIcuAddress3D::Affine(a.base+c/32,{static_cast<std::int64_t>(a.words()),0,0}),StreamId::East(16+byte))});
+                            MemAddressDomain::Read(loop,MemAddressPattern::Affine(a.base+c/32,{static_cast<std::int64_t>(a.words()),0,0}),StreamId::East(16+byte))});
                         p_.mem.push_back({side,dest+byte,t_+5+edge-(dest+byte)/hw::kMemSlicesPerGroup,
-                            MemIcuInstruction::Write3D(loop,MemIcuAddress3D::Affine(c,{static_cast<std::int64_t>(a.cols),0,0}),StreamId::West(c%8*2+byte))});
+                            MemAddressDomain::Write(loop,MemAddressPattern::Affine(c,{static_cast<std::int64_t>(a.cols),0,0}),StreamId::West(c%8*2+byte))});
                     }
                 }
                 t_+=a.rows*8+(use_mxm_?2*edge+8:64);

@@ -218,134 +218,10 @@ std::size_t firstBindingReadCycle(
         for (std::size_t commandIndex = 0;
              commandIndex <= relocation.command_index; ++commandIndex) {
             const auto& command = queue->commands[commandIndex];
-            if (ftlpu::software::runtime::
-                    is_mem_write_read_2d_raw_packet_header(command)) {
-                constexpr std::size_t packetWords =
-                    ftlpu::isa::EncodedMemIcuWriteRead2DPacket::kWordCount;
-                if (commandIndex + packetWords > queue->commands.size())
-                    throw std::logic_error(
-                        "truncated WRITE_READ_2D packet before binding relocation");
-                if (relocation.command_index >= commandIndex
-                    && relocation.command_index < commandIndex + packetWords)
-                    throw std::logic_error(
-                        "binding relocation references a WRITE_READ_2D packet");
-                const auto instruction = ftlpu::software::runtime::
-                    decode_mem_write_read_2d_raw_packet(*queue, commandIndex);
-                cycle += ftlpu::detail::
-                    mem_icu_write_read_2d_last_issue_cycle(instruction) + 1;
-                commandIndex += packetWords - 1;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_fu_3d_raw_packet_header(
-                    command)) {
-                const std::size_t packetWords =
-                    ftlpu::software::runtime::fu_3d_raw_packet_word_count(queue->kind, command);
-                if (commandIndex + packetWords > queue->commands.size())
-                    throw std::logic_error(
-                        "truncated raw MEM 3-D binding relocation");
-                if (relocation.command_index > commandIndex
-                    && relocation.command_index < commandIndex + packetWords)
-                    throw std::logic_error(
-                        "binding relocation references the middle of a raw MEM 3-D packet");
 
-                ftlpu::isa::EncodedMemIcu3DPacket packet{};
-                for (std::size_t word = 0; word < packetWords; ++word) {
-                    const auto& source = queue->commands[commandIndex + word];
-                    if (source.instruction_kind
-                            != ftlpu::software::runtime::InstructionKind::Mem
-                        || source.word_count
-                            != ftlpu::isa::EncodedMemIcu3DPacket::kLanesPerWord)
-                        throw std::logic_error(
-                            "raw MEM 3-D binding relocation has an invalid physical word");
-                    for (std::size_t lane = 0;
-                         lane < ftlpu::isa::EncodedMemIcu3DPacket::kLanesPerWord;
-                         ++lane)
-                        packet.words[word].lanes[lane] = source.words[lane];
-                }
-                const auto instruction =
-                    ftlpu::isa::decode_mem_icu_3d_instruction(packet);
-                if (commandIndex == relocation.command_index) {
-                    if (instruction.opcode != ftlpu::MemIcuOpcode::Read3D)
-                        throw std::logic_error(
-                            "binding relocation does not reference a MEM read");
-                    // Account for queue-local wait_cycle when locating the
-                    // first binding read after NOP removal.
-                    firstCycle = std::min(firstCycle,
-                        cycle + instruction.loop.start_cycle
-                            + instruction.loop.wait_cycle);
-                    break;
-                }
-                std::size_t finalCycle = cycle
-                    + instruction.loop.start_cycle
-                    + instruction.loop.wait_cycle;
-                for (std::size_t dimension = 0;
-                     dimension < ftlpu::IcuLoop3D::kDimensions; ++dimension)
-                    finalCycle += (instruction.loop.counts[dimension] - 1)
-                        * instruction.loop.cycle_strides[dimension];
-                cycle = finalCycle + 1;
-                commandIndex += packetWords - 1;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mem_slice_program_command(
-                    command)) {
-                const auto sliceProgram = ftlpu::software::runtime::
-                    decode_mem_slice_program_command(command);
-                if (commandIndex == relocation.command_index) {
-                    bool foundRead = false;
-                    for (const auto& body : sliceProgram.body) {
-                        if (body.instruction.opcode != ftlpu::MemOpcode::Read)
-                            continue;
-                        firstCycle = std::min(firstCycle,
-                            sliceProgram.schedule.start_cycle
-                                + body.cycle_offset);
-                        foundRead = true;
-                    }
-                    if (!foundRead)
-                        throw std::logic_error(
-                            "binding relocation does not reference a MEM read");
-                    break;
-                }
-                std::size_t finalCycle = sliceProgram.schedule.start_cycle;
-                for (const auto& body : sliceProgram.body) {
-                    std::size_t bodyFinalCycle =
-                        sliceProgram.schedule.start_cycle + body.cycle_offset;
-                    for (std::size_t dimension = 0;
-                         dimension < sliceProgram.schedule.rank; ++dimension)
-                        bodyFinalCycle +=
-                            (sliceProgram.schedule.counts[dimension] - 1)
-                            * sliceProgram.schedule.cycle_strides[dimension];
-                    finalCycle = std::max(finalCycle, bodyFinalCycle);
-                }
-                cycle = std::max(cycle, finalCycle + 1);
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mem_stream_nd_command(
-                    command)) {
-                const auto schedule = ftlpu::software::runtime::
-                    decode_mem_stream_nd_command(command);
-                if (commandIndex == relocation.command_index) {
-                    const auto encoded =
-                        static_cast<ftlpu::isa::EncodedMemInstruction>(
-                            command.words[0])
-                        | (static_cast<ftlpu::isa::EncodedMemInstruction>(
-                               command.words[1])
-                            << 32);
-                    if (ftlpu::isa::decode_mem_instruction(encoded).opcode
-                        != ftlpu::MemOpcode::Read)
-                        throw std::logic_error(
-                            "binding relocation does not reference a MEM read");
-                    firstCycle = std::min(
-                        firstCycle, schedule.start_cycle);
-                    break;
-                }
-                std::size_t finalCycle = schedule.start_cycle;
-                for (std::size_t dimension = 0;
-                     dimension < schedule.rank; ++dimension)
-                    finalCycle += (schedule.counts[dimension] - 1)
-                        * schedule.cycle_strides[dimension];
-                cycle = std::max(cycle, finalCycle + 1);
-                continue;
-            }
+
+
+
             if (ftlpu::software::runtime::is_macro_schedule_command(
                     command)) {
                 const auto schedule =
@@ -379,16 +255,7 @@ std::size_t firstBindingReadCycle(
                         + 1);
                 continue;
             }
-            if (ftlpu::software::runtime::is_repeat_2d_command(command)) {
-                const auto repeat =
-                    ftlpu::software::runtime::decode_repeat_2d_command(
-                        command);
-                cycle += (repeat.outer_count - 1)
-                        * repeat.outer_interval
-                    + (repeat.inner_count - 1)
-                        * repeat.inner_interval;
-                continue;
-            }
+
             const auto opcode =
                 ftlpu::isa::decode_icu_command_opcode(command.command);
             if (opcode == ftlpu::isa::IcuCommandOpcode::Nop) {
@@ -1053,17 +920,7 @@ try {
                               synchronized_packet_word_count;
                     continue;
                 }
-                if (is_fu_3d_raw_packet_header(queue.commands[pc])) {
-                    if (is_mem_write_read_2d_raw_packet_header(
-                            queue.commands[pc]))
-                        static_cast<void>(
-                            decode_mem_write_read_2d_raw_packet(queue, pc));
-                    else
-                        static_cast<void>(decode_fu_3d_raw_packet_loop(
-                            queue, pc));
-                    pc += fu_3d_raw_packet_word_count(queue.kind, queue.commands[pc]);
-                    continue;
-                }
+
                 ++pc;
             }
         }

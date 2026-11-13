@@ -110,6 +110,37 @@ def project(encoded, act_scale, weight, weight_scale):
     return result
 
 
+def project_bf16_activation(x, weight, weight_scale):
+    """Unquantized BF16 activations; BF16 dequant weights, ordered FP32 K32 sums.
+
+    This deployment reference deliberately does not reproduce official FP8
+    activation QDQ. Serial products match the specified MXM reduction order;
+    all data here is used only for the independent CPU reference.
+    """
+    x = bf16(np.asarray(x, dtype=np.float32))
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
+        raise ValueError("Expected X[M,K] and W[N,K]")
+    if x.shape[1] % BLOCK or weight.shape[0] % BLOCK:
+        raise ValueError("Expected complete K32/N32 weight blocks")
+    if weight_scale.shape != (weight.shape[0] // BLOCK, weight.shape[1] // BLOCK):
+        raise ValueError("FP8 weight scale shape mismatch")
+    decoded = E4M3FN[weight]
+    block_scales = scales(weight_scale)
+    result = np.empty((len(x), len(weight)), dtype=np.float32)
+    for start in range(0, len(weight), 256):
+        stop = min(start + 256, len(weight))
+        total = np.zeros((len(x), stop - start), dtype=np.float32)
+        for group in range(x.shape[1] // BLOCK):
+            partial = np.zeros_like(total)
+            scale = block_scales[np.arange(start, stop) // BLOCK, group]
+            for column in range(group * BLOCK, (group + 1) * BLOCK):
+                rhs = bf16(decoded[start:stop, column] * scale)
+                partial += x[:, column, None] * rhs[None, :]
+            total += partial
+        result[:, start:stop] = bf16(total)
+    return result
+
+
 def norm(x, gamma, eps):
     inv_rms = np.float32(1) / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + np.float32(eps))
     return bf16((x * inv_rms) * gamma)

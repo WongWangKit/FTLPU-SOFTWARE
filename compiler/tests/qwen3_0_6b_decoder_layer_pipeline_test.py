@@ -120,17 +120,12 @@ def main() -> None:
         "--pipeline", "ftlpu-schedule-to-commands", *common,
     ], "closed-form-schedule-to-hardware-commands")
     command_text = command.read_text(encoding="utf-8")
-    vxm_run_2d = command_text.count("ftlpu.command.vxm_run_2d")
-    sxm_run_2d = command_text.count("ftlpu.command.sxm_run_2d")
-    if vxm_run_2d == 0 or sxm_run_2d == 0:
-        raise AssertionError(
-            "Qwen3 command lowering did not emit VXM/SXM RUN_2D packets"
-        )
-    if sxm_run_2d >= 1000:
-        raise AssertionError(
-            "interleaved Qwen3 SXM maps were not grouped into RUN_2D loops: "
-            f"{sxm_run_2d} packets"
-        )
+    vxm = command_text.count("ftlpu.command.vxm")
+    sxm_macros = sum(1 for line in command_text.splitlines()
+                     if "ftlpu.command.macro" in line
+                     and re.search(r"\bkind = [56] : i64", line))
+    if vxm == 0 or sxm_macros == 0:
+        raise AssertionError("missing sequential VXM configs or SXM Macro templates")
     for legacy in ("mem ", "mem_bundle ", "mxm ", "mxm_dequant ",
                    "vxm ", "sxm "):
         if f"ftlpu.command.{legacy}" in command_text:
@@ -150,8 +145,8 @@ def main() -> None:
         raise AssertionError("Qwen3 decoder-layer binary is unexpectedly small")
     print(
         f"Qwen3-0.6B seq32 prefill executable: {binary} "
-        f"({binary.stat().st_size} bytes, VXM RUN_2D={vxm_run_2d}, "
-        f"SXM RUN_2D={sxm_run_2d})",
+        f"({binary.stat().st_size} bytes, VXM config={vxm}, "
+        f"SXM Macro={sxm_macros})",
         flush=True,
     )
 

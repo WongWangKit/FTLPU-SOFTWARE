@@ -14,25 +14,6 @@ namespace ftlpu::software::runtime {
 
 namespace {
 
-void validate_fu_3d_context_capacity(
-    const std::vector<QueueProgram>& queues)
-{
-    BinaryProgram probe;
-    probe.queues = queues;
-    const auto report = analyze_physical_imem(probe);
-    for (const auto& queue : report.queues) {
-        if (!queue.fu_3d_context_overflow()) continue;
-        std::ostringstream message;
-        message << "binary FU 3-D context capacity exceeded: resource="
-                << queue_kind_name(queue.kind)
-                << " queue=" << queue.index
-                << " peak=" << queue.peak_fu_3d_contexts
-                << " capacity=" << queue.fu_3d_context_capacity
-                << "; lower overlapping work into one FU-specific 3-D instruction";
-        throw StaticScheduleError(message.str());
-    }
-}
-
 constexpr isa::EncodedIcuCommand kInstructionCommand =
     static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction);
 
@@ -102,6 +83,8 @@ QueueCommand encode_vxm_command(std::size_t queue, VxmChainDepth depth,
     };
 }
 
+} // namespace
+
 QueueCommand encode_sxm_command(const SxmInstruction& instruction)
 {
     QueueCommand command{kInstructionCommand, InstructionKind::Sxm, 4, {}};
@@ -138,8 +121,11 @@ QueueCommand encode_sxm_command(const SxmInstruction& instruction)
     return command;
 }
 
-SxmInstruction decode_sxm_command(const QueueCommand& command)
+SxmInstruction decode_sxm_command(const QueueCommand& input)
 {
+    auto command = input;
+    if (is_macro_schedule_command(command)) command.extension_words.erase(
+        command.extension_words.begin(),command.extension_words.begin()+9);
     if (command.instruction_kind != InstructionKind::Sxm ||
         command.word_count != 4 ||
         command.extension_words.size() < 2 + SxmInstruction::kTotalLanes)
@@ -177,6 +163,8 @@ SxmInstruction decode_sxm_command(const QueueCommand& command)
     }
     return instruction;
 }
+
+namespace {
 
 void validate_mxm_queue_opcode(QueueKind kind, std::size_t mxm,
                                const MxmControlInstruction& instruction)
@@ -241,66 +229,6 @@ bool is_mxm_queue(QueueKind kind)
            kind == QueueKind::MxmDequant;
 }
 
-InstructionKind instruction_kind_for_raw_queue(QueueKind kind)
-{
-    switch (kind) {
-    case QueueKind::Mem:
-        return InstructionKind::Mem;
-    case QueueKind::MxmLoad:
-    case QueueKind::MxmCompute:
-        return InstructionKind::Mxm;
-    case QueueKind::MxmDequant:
-        return InstructionKind::MxmDequant;
-    case QueueKind::Vxm:
-        return InstructionKind::Vxm;
-    case QueueKind::SxmTranspose:
-    case QueueKind::SxmPermute:
-        return InstructionKind::Sxm;
-    case QueueKind::C2cDma:
-    case QueueKind::C2cTx:
-    case QueueKind::C2cRx:
-        break;
-    }
-    throw std::logic_error(
-        "raw FU loop words are unsupported on this ICU queue");
-}
-
-std::size_t raw_3d_packet_word_count(QueueKind kind)
-{
-    switch (kind) {
-    case QueueKind::Mem:
-        return isa::EncodedMemIcu3DPacket::kWordCount;
-    case QueueKind::MxmCompute:
-        return isa::EncodedMxmComputeIcu3DPacket::kWordCount;
-    case QueueKind::MxmLoad:
-    case QueueKind::MxmDequant:
-        return isa::EncodedMxmLoadIcu3DPacket::kWordCount;
-    case QueueKind::Vxm:
-        return isa::EncodedVxmIcuRun2DPacket::kWordCount;
-    case QueueKind::SxmTranspose:
-        return isa::EncodedSxmTransposeIcuRun2DPacket::kWordCount;
-    case QueueKind::SxmPermute:
-        return isa::EncodedSxmPermuteIcuRun2DPacket::kWordCount;
-    case QueueKind::C2cDma:
-    case QueueKind::C2cTx:
-    case QueueKind::C2cRx:
-        break;
-    }
-    throw std::logic_error(
-        "raw FU loop packets are unsupported on this ICU queue");
-}
-
-bool begins_raw_3d_packet(
-    QueueKind kind, const QueueCommand& command)
-{
-    if (kind != QueueKind::Mem && !is_mxm_queue(kind)
-        && kind != QueueKind::Vxm
-        && kind != QueueKind::SxmTranspose
-        && kind != QueueKind::SxmPermute)
-        return false;
-    return is_fu_3d_raw_packet_header(command);
-}
-
 IcuLocation queue_location(QueueKind kind, std::size_t queueIndex)
 {
     switch (kind) {
@@ -340,37 +268,6 @@ IcuLocation queue_location(QueueKind kind, std::size_t queueIndex)
     throw std::logic_error("unknown ICU queue kind");
 }
 
-template <typename Packet>
-Packet read_raw_3d_packet(const QueueProgram& queue,
-    std::size_t commandIndex)
-{
-    const auto physicalWordCount = fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(commandIndex));
-    constexpr auto lanesPerWord = Packet::kLanesPerWord;
-    if (commandIndex > queue.commands.size()
-        || physicalWordCount > queue.commands.size() - commandIndex)
-        throw std::logic_error("truncated FU 3-D raw packet in binary queue");
-    const auto expectedKind = instruction_kind_for_raw_queue(queue.kind);
-    Packet packet {};
-    for (std::size_t wordIndex = 0;
-         wordIndex < physicalWordCount; ++wordIndex) {
-        const auto& command = queue.commands[commandIndex + wordIndex];
-        if (command.instruction_kind != expectedKind
-            || command.word_count != lanesPerWord
-            || !command.extension_words.empty()
-            || command.command != command.words[0]
-            || isa::decode_icu_command_opcode(command.command)
-                != isa::IcuCommandOpcode::Extended
-            || ((command.words[0] >> 2)
-                    & (expectedKind == InstructionKind::Sxm
-                            ? 0x7U : 0x3U)) != wordIndex)
-            throw std::logic_error(
-                "malformed FU 3-D raw packet word in binary queue");
-        for (std::size_t lane = 0; lane < lanesPerWord; ++lane)
-            packet.words[wordIndex].lanes[lane] = command.words[lane];
-    }
-    return packet;
-}
-
 std::size_t physical_queue_index(QueueKind kind, std::size_t logical_index,
                                  std::size_t logical_mxms_per_hemisphere)
 {
@@ -405,9 +302,11 @@ bool is_all_macro_queue(const QueueProgram& queue)
     case QueueKind::MxmDequant:
         expected = InstructionKind::MxmDequant;
         break;
-    case QueueKind::Vxm:
     case QueueKind::SxmTranspose:
     case QueueKind::SxmPermute:
+        expected = InstructionKind::Sxm;
+        break;
+    case QueueKind::Vxm:
     default:
         return false;
     }
@@ -457,7 +356,8 @@ bool load_raw_macro_queue(const QueueProgram& queue,
         return false;
     }
     if ((queue.kind == QueueKind::Mem && hw::kIcuMemInstructionBits != kMemIcuImemWordBits)
-        || (queue.kind != QueueKind::Mem && hw::kIcuMxmInstructionBits != kMxmIcuImemWordBits))
+        || ((queue.kind == QueueKind::MxmLoad || queue.kind == QueueKind::MxmCompute || queue.kind == QueueKind::MxmDequant)
+            && hw::kIcuMxmInstructionBits != kMxmIcuImemWordBits))
     {
         if (queue.requires_raw_macro)
             throw std::logic_error("required raw-macro queue has an incompatible CModel i-MEM width");
@@ -502,6 +402,14 @@ bool load_raw_macro_queue(const QueueProgram& queue,
         return true;
     }
 
+    if (queue.kind == QueueKind::SxmTranspose || queue.kind == QueueKind::SxmPermute) {
+        icu.visit_program_queue(static_cast<IcuMacroQueueKind>(queue.kind),queueIndex,false,[&](auto& q) {
+            for (std::size_t address=0;address<image->word_count();++address)
+                q.write_raw_imem(address,raw_imem_word<typename std::decay_t<decltype(q)>::RawImemWord>(*image,address));
+            q.configure_raw_macro(static_cast<IcuMacroQueueKind>(queue.kind),image->word_count());
+        });
+        return true;
+    }
     for (std::size_t address = 0; address < image->word_count(); ++address) {
         const auto word =
             raw_imem_word<InstructionControlUnit::MxmRawImemWord>(
@@ -590,7 +498,7 @@ IcuControlInstruction decode_icu_control_raw_word(
     if (!is_icu_control_raw_word_command(command))
         throw std::logic_error(
             "queue command is not a physical ICU control word");
-    isa::EncodedMemIcu3DWord word {{
+    isa::EncodedMemIcuWord word {{
         command.words[0], command.words[1], command.words[2]}};
     return InstructionControlUnit::MemIcu::decode_control_raw_word(word);
 }
@@ -791,20 +699,10 @@ SyncOriginCommandTiming sync_origin_timing(
     const QueueProgram& queue, std::size_t pc, std::size_t cursor)
 {
     const auto& command = queue.commands[pc];
-    if (is_mxm_stream_nd_command(command)) {
-        const auto schedule = decode_mxm_stream_nd_command(command);
-        auto end = schedule.start_cycle + 1;
-        for (std::size_t axis = 0; axis < schedule.rank; ++axis)
-            end += (schedule.counts[axis] - 1) * schedule.cycle_strides[axis];
-        return {schedule.start_cycle, end, 1};
-    }
-    if (is_fu_3d_raw_packet_header(command)) {
-        const auto loop = decode_fu_3d_raw_packet_loop(queue, pc);
-        const auto first = cursor + loop.start_cycle + loop.wait_cycle;
-        auto end = first + 1;
-        for (std::size_t axis = 0; axis < IcuLoop3D::kDimensions; ++axis)
-            end += (loop.counts[axis] - 1) * loop.cycle_strides[axis];
-        return {first, end, fu_3d_raw_packet_word_count(queue.kind, command)};
+    if (is_macro_schedule_command(command)) {
+        const auto m = decode_macro_schedule_command(command);
+        return {m.start_cycle, m.start_cycle + (m.inner_count - 1) * m.inner_interval
+            + (m.outer_count - 1) * m.outer_interval + 1, 1};
     }
     if (is_mem_synchronized_raw_packet_header(command))
         return {cursor, cursor + (command.words[2] & 0xffffffU) + 1,
@@ -861,8 +759,7 @@ std::optional<BinaryProgram> restore_compiler_sync_origins(const BinaryProgram& 
                     pc += words;
                     continue;
                 }
-            } else if (is_fu_3d_raw_packet_header(original[pc]))
-                words = fu_3d_raw_packet_word_count(queue.kind, original[pc]);
+            }
             const auto found = origins.find({queue.kind, queue.index, ordinal++});
             const auto timing = sync_origin_timing(queue, pc, compiledCursor);
             if (found != origins.end())
@@ -872,35 +769,16 @@ std::optional<BinaryProgram> restore_compiler_sync_origins(const BinaryProgram& 
             if (first < 0 || static_cast<std::uint64_t>(first) < cursor)
                 throw std::logic_error("compiler SYNC origins overlap");
             const auto wait = static_cast<std::size_t>(first) - cursor;
-            const bool loop = is_fu_3d_raw_packet_header(original[pc]);
-            if (!loop && wait != 0)
+            const bool macro = is_macro_schedule_command(original[pc]);
+            if (!macro && wait != 0)
                 restored.push_back(encode_icu_control_raw_word(IcuControlInstruction::Nop(wait)));
-            // A queue can remain idle through a long recurrent-attention
-            // phase. Keep the representable tail in the following domain's
-            // wait field and encode the remaining delay as a hardware NOP.
-            constexpr auto maxDomainWait = (std::size_t{1} << 24) - 1;
-            const auto domainWait = std::min(wait, maxDomainWait);
-            if (loop && wait > domainWait)
-                restored.push_back(encode_icu_control_raw_word(
-                    IcuControlInstruction::Nop(wait - domainWait)));
             const auto header = restored.size();
             for (std::size_t word = 0; word < words; ++word) {
                 oldToNew[pc + word] = restored.size();
                 restored.push_back(original[pc + word]);
             }
-            if (loop) {
-                restored[header].words[0] = (restored[header].words[0] & 0xffU)
-                    | (static_cast<std::uint32_t>(domainWait) << 8);
-                restored[header].command = restored[header].words[0];
-            } else if (is_mxm_stream_nd_command(original[pc])) {
-                auto schedule = decode_mxm_stream_nd_command(original[pc]);
-                schedule.start_cycle = static_cast<std::size_t>(first);
-                auto native = original[pc];
-                native.extension_words.clear();
-                native.command = static_cast<isa::EncodedIcuCommand>(
-                    isa::IcuCommandOpcode::Instruction);
-                restored[header] = encode_mxm_stream_nd_command(native, schedule);
-            }
+            if (macro)
+                restored[header].extension_words[1] = static_cast<std::uint32_t>(first);
             cursor = static_cast<std::size_t>(first) + timing.end - timing.first;
             compiledCursor = timing.end;
             pc += words;
@@ -920,6 +798,7 @@ std::optional<BinaryProgram> restore_compiler_sync_origins(const BinaryProgram& 
         relocate(base.address_relocations);
         relocate(base.scale_relocations);
         queue.commands = std::move(restored);
+        queue.packed_macro_imem.reset();
     }
     std::erase_if(base.queues, [](const auto& queue) { return queue.commands.empty(); });
     std::erase_if(base.timelines, [](const auto& timeline) { return timeline.name.starts_with(kSyncOriginPrefix); });
@@ -943,30 +822,13 @@ void record_compiler_sync_origins(BinaryProgram& compiled, const BinaryProgram& 
                 continue;
             }
             std::size_t first = cursor, end = cursor + 1, words = 1;
-            if (is_fu_3d_raw_packet_header(command)) {
-                if (is_mem_write_read_2d_raw_packet_header(command)) return;
-                const auto loop = decode_fu_3d_raw_packet_loop(queue, pc);
-                first += loop.start_cycle + loop.wait_cycle;
-                end = first + 1;
-                for (std::size_t axis = 0; axis < IcuLoop3D::kDimensions; ++axis)
-                    end += (loop.counts[axis] - 1) * loop.cycle_strides[axis];
-                words = fu_3d_raw_packet_word_count(queue.kind, command);
-            } else if (is_mem_synchronized_raw_packet_header(command)) {
-                const auto packet = decode_mem_synchronized_icu_packet(queue, pc);
-                if (synchronized_mem_opcode(packet) == MemOpcode::Write) return;
-                end = cursor + (command.words[2] & 0xffffffU) + 1;
-                words = InstructionControlUnit::MemIcu::synchronized_packet_word_count;
-            } else if (is_mxm_stream_nd_command(command)) {
-                // Native4 decode shares a program with direct MEM domains.
-                // Its absolute ND timing must not disable origin recording
-                // for every queue, otherwise a compiler SYNC issue slot is
-                // retained and counted again during runtime rebinding.
+            if (is_macro_schedule_command(command)
+                || is_mem_synchronized_raw_packet_header(command)) {
                 const auto timing = sync_origin_timing(queue, pc, cursor);
-                first = timing.first;
-                end = timing.end;
+                first = timing.first; end = timing.end; words = timing.words;
             } else if (!is_icu_control_raw_word_command(command)
                 && (command.instruction_kind == InstructionKind::None || !command.extension_words.empty()))
-                return; // Legacy encodings retain their existing rebinding path.
+                return;
             originalTimings.push_back({sync_origin_name(queue, std::to_string(ordinal++)), first, end});
             cursor = end;
             pc += words;
@@ -1065,150 +927,6 @@ BinaryProgram without_compiled_mem_read_sync(const BinaryProgram& compiled)
     }
     std::erase_if(result.transport_queues, [](const auto& queue) { return queue.commands.empty(); });
     return result;
-}
-
-bool is_fu_3d_raw_word_command(const QueueCommand& command) noexcept
-{
-    const bool supportedPair =
-        (command.instruction_kind == InstructionKind::Mem
-            && command.word_count
-                == isa::EncodedMemIcu3DPacket::kLanesPerWord)
-        || ((command.instruction_kind == InstructionKind::Mxm
-                || command.instruction_kind
-                    == InstructionKind::MxmDequant)
-            && command.word_count
-                == isa::EncodedMxmLoadIcu3DPacket::kLanesPerWord)
-        || (command.instruction_kind == InstructionKind::Vxm
-            && command.word_count
-                == isa::EncodedVxmIcuRun2DPacket::kLanesPerWord)
-        || (command.instruction_kind == InstructionKind::Sxm
-            && command.word_count
-                == isa::EncodedSxmIcuRun2DWord{}.lanes.size());
-    if (!supportedPair) return false;
-    if (!command.extension_words.empty()
-        || command.command != command.words[0]
-        || isa::decode_icu_command_opcode(command.command)
-            != isa::IcuCommandOpcode::Extended)
-        return false;
-    const auto wordIndex = (command.words[0] >> 2)
-        & (command.instruction_kind == InstructionKind::Sxm ? 0x7U : 0x3U);
-    // Extended subtype lives at physical [91:88] of packet word zero.
-    const auto subtype = (command.words[2] >> 24) & 0xfU;
-    return wordIndex != 0 || subtype == 2
-        || ((command.instruction_kind == InstructionKind::Mem
-                || command.instruction_kind == InstructionKind::Mxm
-                || command.instruction_kind == InstructionKind::MxmDequant)
-            && subtype >= 8 && subtype <= 10)
-        || (command.instruction_kind == InstructionKind::Mem
-            && subtype == 7 && ((command.words[0] >> 4) & 0x3U) == 3);
-}
-
-bool is_mem_write_read_2d_raw_packet_header(
-    const QueueCommand& command) noexcept
-{
-    return command.instruction_kind == InstructionKind::Mem
-        && is_fu_3d_raw_packet_header(command)
-        && ((command.words[2] >> 24) & 0xfU) == 7
-        && ((command.words[0] >> 4) & 0x3U) == 3;
-}
-
-MemIcuWriteRead2DInstruction decode_mem_write_read_2d_raw_packet(
-    const QueueProgram& queue, std::size_t commandIndex)
-{
-    if (queue.kind != QueueKind::Mem
-        || commandIndex >= queue.commands.size()
-        || !is_mem_write_read_2d_raw_packet_header(
-            queue.commands[commandIndex]))
-        throw std::logic_error(
-            "expected WRITE_READ_2D raw packet header in MEM queue");
-    return isa::decode_mem_icu_write_read_2d_instruction(
-        read_raw_3d_packet<isa::EncodedMemIcuWriteRead2DPacket>(
-            queue, commandIndex));
-}
-
-bool is_fu_3d_raw_packet_header(
-    const QueueCommand& command) noexcept
-{
-    return is_fu_3d_raw_word_command(command)
-        && ((command.words[0] >> 2)
-            & (command.instruction_kind == InstructionKind::Sxm
-                    ? 0x7U : 0x3U)) == 0;
-}
-
-std::size_t fu_3d_raw_packet_word_count(QueueKind kind)
-{
-    return raw_3d_packet_word_count(kind);
-}
-
-std::size_t fu_3d_raw_packet_word_count(QueueKind kind, const QueueCommand& header)
-{
-    switch (kind) {
-    case QueueKind::Mem: {
-        isa::EncodedMemIcu3DPacket packet{};
-        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
-            packet.words[0].lanes[lane] = header.words[lane];
-        return isa::fu_loop_packet_word_count(packet);
-    }
-    case QueueKind::MxmLoad: {
-        isa::EncodedMxmLoadIcu3DPacket packet{};
-        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
-            packet.words[0].lanes[lane] = header.words[lane];
-        return isa::fu_loop_packet_word_count(packet);
-    }
-    case QueueKind::MxmCompute: {
-        isa::EncodedMxmComputeIcu3DPacket packet{};
-        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
-            packet.words[0].lanes[lane] = header.words[lane];
-        return isa::fu_loop_packet_word_count(packet);
-    }
-    case QueueKind::MxmDequant: {
-        isa::EncodedMxmDequantIcu3DPacket packet{};
-        for (std::size_t lane = 0; lane < packet.kLanesPerWord; ++lane)
-            packet.words[0].lanes[lane] = header.words[lane];
-        return isa::fu_loop_packet_word_count(packet);
-    }
-    default: return raw_3d_packet_word_count(kind);
-    }
-}
-
-IcuLoop3D decode_fu_3d_raw_packet_loop(
-    const QueueProgram& queue, std::size_t commandIndex)
-{
-    switch (queue.kind) {
-    case QueueKind::Mem:
-        return isa::decode_mem_icu_3d_instruction(
-            read_raw_3d_packet<isa::EncodedMemIcu3DPacket>(
-                queue, commandIndex)).loop;
-    case QueueKind::MxmLoad:
-        return isa::decode_mxm_load_icu_3d_instruction(
-            read_raw_3d_packet<isa::EncodedMxmLoadIcu3DPacket>(
-                queue, commandIndex)).loop;
-    case QueueKind::MxmDequant:
-        return isa::decode_mxm_dequant_icu_3d_instruction(
-            read_raw_3d_packet<isa::EncodedMxmDequantIcu3DPacket>(
-                queue, commandIndex)).loop;
-    case QueueKind::MxmCompute:
-        return isa::decode_mxm_compute_icu_3d_instruction(
-            read_raw_3d_packet<isa::EncodedMxmComputeIcu3DPacket>(
-                queue, commandIndex)).loop;
-    case QueueKind::Vxm:
-        return isa::decode_vxm_icu_run_2d_instruction(
-            read_raw_3d_packet<isa::EncodedVxmIcuRun2DPacket>(
-                queue, commandIndex)).loop;
-    case QueueKind::SxmTranspose:
-        return isa::decode_sxm_transpose_icu_run_2d_instruction(
-            read_raw_3d_packet<isa::EncodedSxmTransposeIcuRun2DPacket>(
-                queue, commandIndex)).loop;
-    case QueueKind::SxmPermute:
-        return isa::decode_sxm_permute_icu_run_2d_instruction(
-            read_raw_3d_packet<isa::EncodedSxmPermuteIcuRun2DPacket>(
-                queue, commandIndex)).loop;
-    case QueueKind::C2cDma:
-    case QueueKind::C2cTx:
-    case QueueKind::C2cRx:
-        break;
-    }
-    throw std::logic_error("unknown ICU queue kind");
 }
 
 const char* queue_kind_name(QueueKind kind)
@@ -1603,7 +1321,6 @@ std::size_t load_queue_programs_into_icu(
     InstructionControlUnit& icu,
     std::size_t logical_mxms_per_hemisphere, const BinaryProgram* control_program, bool prime_frontends)
 {
-    validate_fu_3d_context_capacity(queues);
     for (const auto& source_queue : queues) {
         // Independent Macro QueueMode: runtime writes the physical 96/128-bit
         // image and CModel alone decodes it into active contexts/calendar.
@@ -1684,274 +1401,6 @@ std::size_t load_queue_programs_into_icu(
             if (is_icu_control_raw_word_command(command)) {
                 icu.enqueue_control(queue_location(queue.kind, queue_index),
                     decode_icu_control_raw_word(command));
-                continue;
-            }
-            if (begins_raw_3d_packet(queue.kind, command)) {
-                switch (queue.kind) {
-                case QueueKind::Mem: {
-                    if (is_mem_write_read_2d_raw_packet_header(command)) {
-                        icu.mem_iq(queue_index)
-                            .push_encoded_mem_write_read_2d_packet(
-                                read_raw_3d_packet<
-                                    isa::EncodedMemIcuWriteRead2DPacket>(
-                                    queue, command_index));
-                    } else {
-                        const auto packet = read_raw_3d_packet<
-                            isa::EncodedMemIcu3DPacket>(
-                            queue, command_index);
-                        icu.mem_iq(queue_index).push_encoded_3d_packet(packet);
-                    }
-                    break;
-                }
-                case QueueKind::MxmLoad:
-                    icu.mxm_load_iq(queue_index).push_encoded_3d_packet(
-                        read_raw_3d_packet<
-                            isa::EncodedMxmLoadIcu3DPacket>(
-                            queue, command_index));
-                    break;
-                case QueueKind::MxmDequant:
-                    icu.mxm_dequant_iq(queue_index)
-                        .push_encoded_3d_packet(
-                            read_raw_3d_packet<
-                                isa::EncodedMxmDequantIcu3DPacket>(
-                                queue, command_index));
-                    break;
-                case QueueKind::MxmCompute:
-                    icu.mxm_compute_iq(queue_index)
-                        .push_encoded_3d_packet(
-                            read_raw_3d_packet<
-                                isa::EncodedMxmComputeIcu3DPacket>(
-                                queue, command_index));
-                    break;
-                case QueueKind::Vxm:
-                    icu.vxm_iq(queue_index).push_encoded_3d_packet(
-                        read_raw_3d_packet<
-                            isa::EncodedVxmIcuRun2DPacket>(
-                            queue, command_index));
-                    break;
-                case QueueKind::SxmTranspose:
-                    icu.sxm_transpose_iq(
-                        static_cast<Hemisphere>(queue_index))
-                        .push_encoded_3d_packet(
-                            read_raw_3d_packet<
-                                isa::EncodedSxmTransposeIcuRun2DPacket>(
-                                queue, command_index));
-                    break;
-                case QueueKind::SxmPermute:
-                    icu.sxm_permute_iq(
-                        static_cast<Hemisphere>(queue_index))
-                        .push_encoded_3d_packet(
-                            read_raw_3d_packet<
-                                isa::EncodedSxmPermuteIcuRun2DPacket>(
-                                queue, command_index));
-                    break;
-                case QueueKind::C2cDma:
-                case QueueKind::C2cTx:
-                case QueueKind::C2cRx:
-                    throw std::logic_error(
-                        "C2C queues do not carry FU 3-D packets");
-                }
-                command_index += fu_3d_raw_packet_word_count(queue.kind, command) - 1;
-                continue;
-            }
-            if (is_vxm_stream_nd_command(command)) {
-                if (queue.kind != QueueKind::Vxm)
-                    throw std::logic_error(
-                        "VXM_STREAM_ND must target a VXM queue");
-                const auto descriptor =
-                    decode_vxm_stream_nd_command(command);
-                const VxmCompactInstruction instruction {
-                    static_cast<std::uint64_t>(
-                        descriptor.instruction.words[0]) |
-                        (static_cast<std::uint64_t>(
-                             descriptor.instruction.words[1])
-                         << 32),
-                    descriptor.instruction.words[2]};
-                icu.enqueue_vxm_stream_nd(queue_index, descriptor.schedule,
-                                          instruction);
-                continue;
-            }
-            if (is_sxm_tile_program_command(command)) {
-                if (queue.kind != QueueKind::SxmTranspose &&
-                    queue.kind != QueueKind::SxmPermute)
-                    throw std::logic_error(
-                        "SXM_TILE_PROGRAM must target an SXM queue");
-                const auto descriptor =
-                    decode_sxm_tile_program_command(command);
-                auto instruction = decode_sxm_command(descriptor.instruction);
-                const auto side = static_cast<Hemisphere>(queue_index);
-                if (queue.kind == QueueKind::SxmTranspose) {
-                    if (instruction.opcode != SxmOpcode::Transpose)
-                        throw std::logic_error(
-                            "SXM transpose tile program carries a "
-                            "non-transpose instruction");
-                    icu.enqueue_sxm_transpose_tile_program(
-                        side, descriptor.schedule, std::move(instruction));
-                } else {
-                    if (instruction.opcode != SxmOpcode::Permute)
-                        throw std::logic_error(
-                            "SXM permute tile program carries a non-permute "
-                            "instruction");
-                    icu.enqueue_sxm_permute_tile_program(
-                        side, descriptor.schedule, std::move(instruction));
-                }
-                continue;
-            }
-            if (is_mem_slice_program_command(command)) {
-                if (queue.kind != QueueKind::Mem)
-                    throw std::logic_error(
-                        "MEM_SLICE_PROGRAM must target a MEM queue");
-                icu.enqueue_mem_slice_program(
-                    queue_index, decode_mem_slice_program_command(command));
-                continue;
-            }
-            if (is_mem_stream_nd_command(command)) {
-                if (queue.kind != QueueKind::Mem || command.word_count < 1 ||
-                    command.word_count > 2)
-                    throw std::logic_error(
-                        "MEM_STREAM_ND must target a MEM queue and "
-                        "carry one or two MEM words");
-                const auto encoded =
-                    static_cast<isa::EncodedMemInstruction>(command.words[0]) |
-                    (static_cast<isa::EncodedMemInstruction>(command.words[1])
-                     << 32);
-                icu.enqueue_mem_stream_nd(queue_index,
-                                          decode_mem_stream_nd_command(command),
-                                          isa::decode_mem_instruction(encoded));
-                continue;
-            }
-            if (is_mxm_stream_nd_command(command)) {
-                const auto schedule = decode_mxm_stream_nd_command(command);
-                try {
-                    if (queue.kind == QueueKind::MxmDequant) {
-                        if (command.instruction_kind !=
-                                InstructionKind::MxmDequant ||
-                            command.word_count != 1)
-                            throw std::logic_error("MXM dequant STREAM_ND must "
-                                                   "carry one scale word");
-                        icu.enqueue_mxm_dequant_stream_nd(
-                            queue_index, schedule,
-                            isa::decode_mxm_dequant_instruction(
-                                static_cast<isa::EncodedMxmDequantInstruction>(
-                                    command.words[0])));
-                    } else {
-                        if ((queue.kind != QueueKind::MxmLoad &&
-                             queue.kind != QueueKind::MxmCompute) ||
-                            command.instruction_kind != InstructionKind::Mxm ||
-                            command.word_count < 1 || command.word_count > 2)
-                            throw std::logic_error(
-                                "MXM_STREAM_ND must target an MXM queue "
-                                "and carry one or two MXM words");
-                        const auto encoded =
-                            static_cast<isa::EncodedMxmInstruction>(
-                                command.words[0]) |
-                            (static_cast<isa::EncodedMxmInstruction>(
-                                 command.words[1])
-                             << 32);
-                        const auto instruction =
-                            isa::decode_mxm_instruction(encoded);
-                        validate_mxm_queue_opcode(queue.kind, queue_index,
-                                                  instruction);
-                        if (queue.kind == QueueKind::MxmLoad)
-                            icu.enqueue_mxm_load_stream_nd(queue_index,
-                                schedule, instruction);
-                        else
-                            icu.enqueue_mxm_compute_stream_nd(queue_index,
-                                schedule, instruction);
-                    }
-                } catch (const std::exception& error) {
-                    std::ostringstream message;
-                    message << error.what()
-                            << "; queue_kind=" << static_cast<int>(queue.kind)
-                            << ", queue_index=" << queue.index
-                            << ", command_index=" << command_index
-                            << ", rank=" << schedule.rank << ", counts=";
-                    for (std::size_t dimension = 0; dimension < schedule.rank;
-                         ++dimension) {
-                        if (dimension != 0)
-                            message << 'x';
-                        message << schedule.counts[dimension];
-                    }
-                    message << ", cycle_strides=";
-                    for (std::size_t dimension = 0; dimension < schedule.rank;
-                         ++dimension) {
-                        if (dimension != 0)
-                            message << ',';
-                        message << schedule.cycle_strides[dimension];
-                    }
-                    throw std::logic_error(message.str());
-                }
-                continue;
-            }
-            if (is_macro_schedule_command(command)) {
-                const auto schedule = decode_macro_schedule_command(command);
-                switch (queue.kind) {
-                case QueueKind::Mem: {
-                    if (command.instruction_kind != InstructionKind::Mem ||
-                        command.word_count < 1 || command.word_count > 2)
-                        throw std::logic_error("MEM macro must carry one or "
-                                               "two MEM instruction words");
-                    const auto encoded =
-                        static_cast<isa::EncodedMemInstruction>(
-                            command.words[0]) |
-                        (static_cast<isa::EncodedMemInstruction>(
-                             command.words[1])
-                         << 32);
-                    icu.enqueue_mem_macro(queue_index, schedule,
-                                          isa::decode_mem_instruction(encoded));
-                    break;
-                }
-                case QueueKind::MxmLoad:
-                case QueueKind::MxmCompute: {
-                    if (command.instruction_kind != InstructionKind::Mxm ||
-                        command.word_count < 1 || command.word_count > 2)
-                        throw std::logic_error("MXM macro must carry one or "
-                                               "two MXM instruction words");
-                    const auto encoded =
-                        static_cast<isa::EncodedMxmInstruction>(
-                            command.words[0]) |
-                        (static_cast<isa::EncodedMxmInstruction>(
-                             command.words[1])
-                         << 32);
-                    const auto instruction =
-                        isa::decode_mxm_instruction(encoded);
-                    validate_mxm_queue_opcode(queue.kind, queue_index,
-                                              instruction);
-                    if (queue.kind == QueueKind::MxmLoad)
-                        icu.enqueue_mxm_load_macro(queue_index, schedule,
-                                                   instruction);
-                    else
-                        icu.enqueue_mxm_compute_macro(queue_index, schedule,
-                                                      instruction);
-                    break;
-                }
-                case QueueKind::MxmDequant:
-                    if (command.instruction_kind !=
-                            InstructionKind::MxmDequant ||
-                        command.word_count != 1)
-                        throw std::logic_error(
-                            "MXM dequant macro must carry one scale word");
-                    icu.enqueue_mxm_dequant_macro(
-                        queue_index, schedule,
-                        isa::decode_mxm_dequant_instruction(
-                            static_cast<isa::EncodedMxmDequantInstruction>(
-                                command.words[0])));
-                    break;
-                case QueueKind::Vxm:
-                case QueueKind::SxmTranspose:
-                case QueueKind::SxmPermute:
-                case QueueKind::C2cDma:
-                case QueueKind::C2cTx:
-                case QueueKind::C2cRx:
-                    throw std::logic_error(
-                        "ICU macro v1 supports MEM and MXM queues only");
-                }
-                continue;
-            }
-            if (is_repeat_2d_command(command)) {
-                icu.enqueue_control(queue_location(queue.kind, queue_index),
-                    IcuControlInstruction::Repeat2D(
-                        decode_repeat_2d_command(command)));
                 continue;
             }
             const auto opcode = isa::decode_icu_command_opcode(command.command);
@@ -2178,6 +1627,8 @@ std::size_t load_queue_programs_into_icu(
             case QueueKind::MxmLoad: configure(icu.mxm_load_iq(index)); break;
             case QueueKind::MxmCompute: configure(icu.mxm_compute_iq(index)); break;
             case QueueKind::MxmDequant: configure(icu.mxm_dequant_iq(index)); break;
+            case QueueKind::SxmTranspose: configure(icu.sxm_transpose_iq(static_cast<Hemisphere>(index))); break;
+            case QueueKind::SxmPermute: configure(icu.sxm_permute_iq(static_cast<Hemisphere>(index))); break;
             default: throw std::logic_error("pseudo controls require a Raw Macro queue");
             }
         }

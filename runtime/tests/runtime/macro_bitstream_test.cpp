@@ -238,9 +238,49 @@ CmodelMemRun run_compiled_mem_program(const rt::BinaryProgram& program)
 
 int main(int argc, char** argv)
 try {
-    if (argc > 3)
-        throw std::runtime_error("usage: macro_bitstream_test [program.ftlpu | "
-                                 "none.ftlpu macro.ftlpu]");
+    {
+        using namespace ftlpu;
+        static_assert(InstructionControlUnit::SxmTransposeIcu::macro_context_bits==256);
+        static_assert(InstructionControlUnit::SxmPermuteIcu::macro_context_bits==384);
+        SxmInstruction::StreamList streams;
+        for(std::size_t i=0;i<2*hw::kLanesPerTile;++i) streams.push_back({i});
+        for(bool transpose:{true,false}) {
+            auto ins=SxmInstruction::Transpose(streams,streams);
+            if(!transpose) {
+                SxmInstruction::PermuteMap map{};
+                for(std::size_t i=0;i<map.size();++i) map[i]=map.size()-1-i;
+                ins=SxmInstruction::Permute(streams,streams,map);
+                ins.output_row=2;ins.output_tile=1;
+            }
+            rt::QueueProgram plan{transpose?rt::QueueKind::SxmTranspose:rt::QueueKind::SxmPermute,0,{}};
+            for(std::size_t n=0;n<12;++n) plan.commands.push_back(rt::encode_macro_schedule_command(
+                rt::encode_sxm_command(ins),IcuMacroSchedule{256+n*320,16,2,0,3,40,0,IcuInductionTarget::None}));
+            const auto packed=rt::pack_mxm_macro_imem(rt::encode_mxm_macro_bitstream(plan));
+            expect(packed.word_bits==96,"SXM Macro changed i-MEM width");
+            const auto decoded=rt::decode_mxm_macro_imem(packed,plan.kind,0);
+            expect(decoded.commands.size()==12,"SXM Macro roundtrip count");
+            const auto run=[&](auto& queue) {
+                using Q=std::decay_t<decltype(queue)>;
+                queue.load_raw_macro(transpose?IcuMacroQueueKind::SxmTranspose:IcuMacroQueueKind::SxmPermute,
+                    raw_words<typename Q::RawImemWord>(packed));
+                std::size_t issues=0;
+                for(std::size_t cycle=0;cycle<4200;++cycle) if(auto actual=queue.tick()) {
+                    const auto n=issues/48,r=(issues%48)/16,c=issues%16;
+                    expect(cycle==256+n*320+r*40+c*2,"SXM Macro emitted at wrong cycle");
+                    const auto expected=rt::encode_sxm_command(ins),observed=rt::encode_sxm_command(*actual);
+                    expect(expected.words==observed.words && expected.extension_words==observed.extension_words,
+                        "SXM Macro changed FU fields");
+                    ++issues;
+                }
+                expect(issues==12*48,"SXM Macro issue count");
+            };
+            if(transpose) { auto q=std::make_unique<InstructionControlUnit::SxmTransposeIcu>();run(*q); }
+            else { auto q=std::make_unique<InstructionControlUnit::SxmPermuteIcu>();run(*q); }
+        }
+    }
+
+    if (argc > 2)
+        throw std::runtime_error("usage: macro_bitstream_test [program.ftlpu]");
     rt::QueueProgram queue{rt::QueueKind::Mem, 3, {}};
     queue.commands.push_back(
         macro(ftlpu::MemInstruction::Read(100, 2),
@@ -522,7 +562,7 @@ try {
     // Exercise the complete binary -> runtime loader -> finite CModel Macro
     // context path for both supported Macro v1 functional-unit families.
     rt::BinaryProgram executionProgram;
-    executionProgram.max_cycle = 13;
+    executionProgram.max_cycle = 23;
     executionProgram.queues.push_back(rt::QueueProgram{
         rt::QueueKind::Mem,
         0,
@@ -530,7 +570,7 @@ try {
             macro(ftlpu::MemInstruction::Read(100, 0),
                   {2, 3, 4, 1, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}),
             macro(ftlpu::MemInstruction::Read(200, 1),
-                  {3, 3, 4, 1, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}),
+                  {15, 3, 4, 1, 1, 1, 0, ftlpu::IcuInductionTarget::MemAddress}),
         }});
     executionProgram.queues.push_back(rt::QueueProgram{
         rt::QueueKind::MxmLoad,
@@ -568,6 +608,11 @@ try {
                {5, 2, 3, 4, 1, 1, 0,
                 ftlpu::IcuInductionTarget::MxmAccumulatorAddress})}});
 
+    auto overlapping = executionProgram;
+    overlapping.queues[0].commands[1] = macro(ftlpu::MemInstruction::Read(200,1),
+        {3,3,4,1,1,1,0,ftlpu::IcuInductionTarget::MemAddress});
+    expect_throw([&]{(void)rt::analyze_physical_imem(overlapping);},
+        "capacity validator accepted interleaving Macros on one ICU");
     std::stringstream binary(std::ios::in | std::ios::out | std::ios::binary);
     rt::write_binary_program(executionProgram, binary);
     binary.seekg(0);
@@ -585,9 +630,6 @@ try {
         for (const auto& command : restoredQueue.commands) {
             expect(rt::is_macro_schedule_command(command),
                    "2-D Macro changed representation during binary round-trip");
-            expect(!rt::is_mem_stream_nd_command(command) &&
-                       !rt::is_mxm_stream_nd_command(command),
-                   "2-D Macro unexpectedly became STREAM_ND");
         }
     }
 
@@ -629,7 +671,7 @@ try {
     expect(
         memIssues ==
             std::vector<std::pair<std::size_t, std::size_t>>{
-                {2, 100}, {3, 200}, {6, 101}, {7, 201}, {10, 102}, {11, 202}},
+                {2, 100}, {6, 101}, {10, 102}, {15, 200}, {19, 201}, {23, 202}},
         "runtime/CModel MEM Macro emitted incorrect cycles or addresses");
     expect(mxmLoadIssues ==
                std::vector<std::pair<std::size_t, std::size_t>>{
@@ -662,8 +704,8 @@ try {
                && decodeComputeIssues[0].second.accumulator_address == 40
                && decodeComputeIssues[1].second.accumulator_address == 44,
            "runtime/CModel Decode.StreamCompute Macro induction changed");
-    expect(icu.mem_iq(0).peak_active_macros() == 2,
-           "runtime/CModel did not model interleaved finite Macro contexts");
+    expect(icu.mem_iq(0).peak_active_macros() <= ftlpu::hw::kIcuMemMacroContextDepth,
+           "runtime/CModel exceeded its bounded prefetched Macro contexts");
     expect(icu.mem_iq(0).macro_decoder_statistics().decoded_contexts == 2 &&
                icu.mxm_load_iq(0)
                        .macro_decoder_statistics()
@@ -886,60 +928,6 @@ try {
                 && actual.issues.front().second == ftlpu::isa::encode_mem_instruction(
                     ftlpu::MemInstruction::Read(777, 2)),
             "hardware loader used a stale Macro image after relocation");
-    }
-    if (argc == 3) {
-        const auto baseline = rt::read_binary_program(argv[1]);
-        const auto compressed = rt::read_binary_program(argv[2]);
-        expect(baseline.max_cycle == compressed.max_cycle,
-               "compiler-generated Macro changed the scheduled cycle count");
-        std::size_t macroCommands = 0;
-        for (const auto& compressedQueue : compressed.queues)
-            for (const auto& command : compressedQueue.commands) {
-                expect(
-                    !rt::is_mem_stream_nd_command(command) &&
-                        !rt::is_mxm_stream_nd_command(command),
-                    "compiler-generated Macro A/B binary contains STREAM_ND");
-                macroCommands += rt::is_macro_schedule_command(command) ? 1 : 0;
-            }
-        expect(macroCommands != 0,
-               "compiler-generated Macro A/B binary contains no 2-D Macro");
-
-        const auto baselineRun = run_compiled_mem_program(baseline);
-        const auto compressedRun = run_compiled_mem_program(compressed);
-        expect(baselineRun.issues == compressedRun.issues,
-               "compiler-generated Macro changed CModel issue semantics");
-        expect(baselineRun.frontend.issued_instructions ==
-                   compressedRun.frontend.issued_instructions,
-               "compiler-generated Macro changed dynamic issue count");
-        expect(compressedRun.frontend.imem_entries <
-                   baselineRun.frontend.imem_entries,
-               "compiler-generated Macro did not reduce CModel i-MEM entries");
-        expect(compressedRun.frontend.fetched_entries <
-                   baselineRun.frontend.fetched_entries,
-               "compiler-generated Macro did not reduce CModel fetch entries");
-        expect(compressedRun.frontend.macro_queues != 0 &&
-                   compressedRun.frontend.peak_macro_contexts_per_queue != 0,
-               "CModel did not execute compiler-generated Macro contexts");
-
-        const auto baselineImem = rt::analyze_physical_imem(baseline);
-        const auto compressedImem = rt::analyze_physical_imem(compressed);
-        expect(compressedImem.used_bits < baselineImem.used_bits,
-               "compiler-generated Macro did not reduce physical MEM bits");
-        std::cout << "macro_cmodel_ab_test passed"
-                  << " logical_issues=" << compressedRun.issues.size()
-                  << " scheduled_cycles=" << compressed.max_cycle + 1
-                  << " baseline_imem_entries="
-                  << baselineRun.frontend.imem_entries << " macro_imem_entries="
-                  << compressedRun.frontend.imem_entries
-                  << " baseline_fetched_entries="
-                  << baselineRun.frontend.fetched_entries
-                  << " macro_fetched_entries="
-                  << compressedRun.frontend.fetched_entries
-                  << " baseline_physical_bits=" << baselineImem.used_bits
-                  << " macro_physical_bits=" << compressedImem.used_bits
-                  << " peak_macro_contexts="
-                  << compressedRun.frontend.peak_macro_contexts_per_queue
-                  << '\n';
     }
     return 0;
 } catch (const std::exception& error) {

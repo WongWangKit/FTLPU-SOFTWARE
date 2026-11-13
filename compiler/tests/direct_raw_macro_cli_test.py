@@ -3,8 +3,8 @@
 
 The fixture deliberately keeps three independent affine launch dimensions,
 weight-buffer toggling, terminal accumulator behavior and a blocked MEM outer
-address domain.  Native VXM/SXM queues must survive unchanged alongside the
-MEM/MXM Macro queues.  No offline conversion or experimental artifacts are used.
+address domain.  Native VXM queues must survive unchanged alongside the
+MEM/MXM/SXM Macro queues.  No offline conversion or experimental artifacts are used.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ import re
 import subprocess
 
 
-MACRO_RESOURCES = {"mem", "mxm_load", "mxm_compute", "mxm_dequant"}
-NATIVE_RESOURCES = {"vxm", "sxm_permute"}
+MACRO_RESOURCES = {"mem", "mxm_load", "mxm_compute", "mxm_dequant", "sxm_permute"}
+NATIVE_RESOURCES = {"vxm"}
 
 
 def run(command: list[str | Path], *, failure: str | None = None) -> str:
@@ -107,7 +107,7 @@ def write_schedule(path: Path) -> None:
       opcode = "multiply", lhs_kind = "stream_bf16", lhs_index = 0 : i64,
       lhs_immediate = 0.0 : f32, rhs_kind = "immediate", rhs_index = 0 : i64,
       rhs_immediate = 0.5 : f32, cast_target = "bf16",
-      output_stream = 0 : i64, repeat_count = 2 : i64,
+      output_stream = -1 : i64, repeat_count = 2 : i64,
       repeat_interval = 4 : i64, wave_count = 2 : i64,
       wave_interval = 20 : i64,
       input_hemisphere = "east", output_hemisphere = "east"
@@ -148,8 +148,8 @@ def check_binary(args: argparse.Namespace, binary: Path, baseline: Path,
         macros, coarse = int(fields["macro"]), int(fields["coarse_program"])
         if macro and resource in MACRO_RESOURCES:
             if macros == 0 or coarse != 0:
-                raise AssertionError(f"MEM/MXM silently retained FU3D: {line}")
-        elif macros != 0 or coarse == 0:
+                raise AssertionError(f"compute queue did not use Macro: {line}")
+        elif resource in NATIVE_RESOURCES and (macros != 0 or int(fields["instruction"]) == 0):
             raise AssertionError(f"native FU queue changed encoding: {line}")
     if require_all_resources and not (MACRO_RESOURCES | NATIVE_RESOURCES) <= resources:
         raise AssertionError(f"fixture did not cover every queue kind: {resources}")
@@ -185,23 +185,25 @@ def check_relocation_clones(args: argparse.Namespace, default_command: Path) -> 
                           default_command.read_text(encoding="utf-8"), count=1)
     if count != 1:
         raise AssertionError("cannot locate the direct Command function")
-    for operation, attribute in (
-        ("mem_3d", 'address_binding = 0 : i64, address_binding_access = "input", '),
-        ("mxm_dequant_3d", "scale_binding = 1 : i64, "),
-    ):
-        text, count = re.subn(rf"(ftlpu\.command\.{operation} \{{)",
-                              lambda match: match[0] + attribute, text, count=1)
-        if count != 1:
-            raise AssertionError(f"cannot locate relocation owner {operation}")
+    # Bind every already materialized template of these affine source domains.
+    def bind(match: re.Match[str]) -> str:
+        line = match[0]
+        kind = int(re.search(r"\bkind = (\d+) : i64", line)[1])
+        queue = int(re.search(r"\bqueue = (\d+) : i64", line)[1])
+        attr = ('address_binding = 0 : i64, address_binding_access = "input", '
+                if kind == 0 and queue == 0 else
+                'scale_binding = 1 : i64, ' if kind == 3 else '')
+        return line.replace('ftlpu.command.macro {', 'ftlpu.command.macro {' + attr)
+    text = re.sub(r"ftlpu\.command\.macro \{[^\n]+", bind, text)
     command = args.output_dir / "relocations.command.mlir"
     command.write_text(text, encoding="utf-8")
     baseline = args.output_dir / "relocations-default.ftlpu"
     macro = args.output_dir / "relocations-raw-macro.ftlpu"
-    for binary, mode in ((baseline, "none"), (macro, "raw-macro")):
+    for binary, mode in ((baseline, "macro"), (macro, "raw-macro")):
         require_verification(run([args.translate, "--input", command,
                                   "--output", binary, "--icu-compression", mode,
                                   "--verify-icu-issues"]))
-    baseline_output = check_binary(args, baseline, baseline, macro=False)
+    baseline_output = check_binary(args, baseline, baseline, macro=True)
     macro_output = check_binary(args, macro, baseline, macro=True)
     for pattern, kind in (
         (r"binary address_relocation access=0 binding=0 count=(\d+)", "mem"),
@@ -212,7 +214,7 @@ def check_relocation_clones(args: argparse.Namespace, default_command: Path) -> 
         converted = re.search(pattern, macro_output)
         queue = re.search(rf"^imem queue resource={kind} queue=0 .*\bmacro=(\d+)\b",
                           macro_output, re.MULTILINE)
-        if (not source or int(source[1]) != 1 or not converted or not queue
+        if (not source or int(source[1]) != int(converted[1]) or not converted or not queue
                 or int(converted[1]) <= 1 or int(converted[1]) != int(queue[1])):
             raise AssertionError(f"{kind} relocation did not clone to every descriptor")
     if args.runtime_test:
@@ -237,13 +239,13 @@ def main() -> None:
     common = [args.compile, "--input", schedule, "--input-stage", "schedule",
               *target, "--verify-icu-issues"]
     require_verification(run(common + ["--output", baseline]))
-    check_binary(args, baseline, baseline, macro=False)
+    check_binary(args, baseline, baseline, macro=True)
 
     macro_binary = args.output_dir / "compile-raw-macro.ftlpu"
     require_verification(run(common + ["--output", macro_binary,
                                       "--icu-compression", "raw-macro"]))
-    if baseline.read_bytes() == macro_binary.read_bytes():
-        raise AssertionError("raw-macro CLI is still producing the default FU3D binary")
+    if baseline.read_bytes() != macro_binary.read_bytes():
+        raise AssertionError("default and explicit raw-macro encodings differ")
     check_binary(args, macro_binary, baseline, macro=True)
     if args.runtime_test:
         run([args.runtime_test, baseline, macro_binary])
@@ -260,8 +262,7 @@ def main() -> None:
             opt.extend(["--icu-compression", mode])
         run(opt)
         text = command.read_text(encoding="utf-8")
-        for operation in ("mem_3d", "mxm_load_3d", "mxm_compute_3d",
-                          "mxm_dequant_3d", "vxm_run_2d", "sxm_run_2d"):
+        for operation in ("macro", "vxm"):
             if f"ftlpu.command.{operation}" not in text:
                 raise AssertionError(f"direct lowering lost {operation}")
         if mode and 'ftlpu.icu_compression = "raw-macro"' not in text:
@@ -269,7 +270,7 @@ def main() -> None:
         binary = args.output_dir / f"opt-{name}.ftlpu"
         require_verification(run([args.translate, "--input", command,
                                   "--output", binary, "--verify-icu-issues"]))
-        check_binary(args, binary, baseline, macro=bool(mode))
+        check_binary(args, binary, baseline, macro=True)
 
     for tool, stage in ((args.translate, []),
                         (args.compile, ["--input-stage", "command", *target])):
@@ -282,19 +283,15 @@ def main() -> None:
         check_binary(args, binary, baseline, macro=True)
 
     raw_command = args.output_dir / "raw-macro.command.mlir"
-    for name, override, macro in (("inherited", [], True),
-                                  ("explicit-none", ["--icu-compression", "none"], False)):
-        binary = args.output_dir / f"compile-command-{name}.ftlpu"
-        require_verification(run([args.compile, "--input", raw_command,
-                                  "--input-stage", "command", *target,
-                                  "--output", binary, *override,
-                                  "--verify-icu-issues"]))
-        check_binary(args, binary, baseline, macro=macro)
+    for obsolete in ("none", "control"):
+        run([args.compile, "--input", raw_command, "--input-stage", "command",
+             *target, "--output", args.output_dir / "obsolete.ftlpu",
+             "--icu-compression", obsolete], failure="unknown ICU compression mode")
 
     check_relocation_clones(args, default_command)
 
     # A production StableHLO entry covers all compiler stages using the
-    # existing small fused SwiGLU FFN and its real CModel arithmetic harness.
+    # existing small SwiGLU FFN and its real CModel arithmetic harness.
     ffn = (Path(__file__).resolve().parents[1] / "examples" / "w8a16_ffn" /
            "ffn_32x64x128x64_bf16.stablehlo.mlir")
     ffn_baseline = args.output_dir / "stablehlo-ffn-default.ftlpu"
@@ -303,14 +300,14 @@ def main() -> None:
                          (ffn_macro, ["--icu-compression", "raw-macro"])):
         require_verification(run([args.compile, "--input", ffn,
                                   "--input-stage", "stablehlo", *target,
-                                  "--mxm-execution", "ws", "--ffn-schedule", "fused",
+                                  "--mxm-execution", "ws", "--ffn-schedule", "tail",
                                   "--output", binary, *mode, "--verify-icu-issues"]))
         if args.numeric_test:
             execution = run([args.numeric_test, binary])
             binary.with_suffix(".numeric.txt").write_text(execution, encoding="utf-8")
-    if ffn_baseline.read_bytes() == ffn_macro.read_bytes():
-        raise AssertionError("StableHLO raw-macro entry still produced the default binary")
-    check_binary(args, ffn_baseline, ffn_baseline, macro=False,
+    if ffn_baseline.read_bytes() != ffn_macro.read_bytes():
+        raise AssertionError("StableHLO default and raw-macro encodings differ")
+    check_binary(args, ffn_baseline, ffn_baseline, macro=True,
                  require_all_resources=False)
     check_binary(args, ffn_macro, ffn_baseline, macro=True,
                  require_all_resources=False)

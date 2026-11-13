@@ -4,7 +4,6 @@
 #include "ftlpu/software/runtime/performance.hpp"
 #include "ftlpu/software/runtime/schedule_trace.hpp"
 #include "ftlpu/software/runtime/weight_prefetch_plan.hpp"
-#include "ftlpu/icu/fu_3d_codec.hpp"
 
 #include <filesystem>
 #include <algorithm>
@@ -122,14 +121,6 @@ try {
               << " commands=" << total_commands
               << " file_bytes=" << std::filesystem::file_size(argv[1])
               << '\n';
-    const bool hasRawFu3D = std::ranges::any_of(program.queues,
-        [](const auto& queue) {
-            return std::ranges::any_of(queue.commands,
-                [](const auto& command) {
-                    return ftlpu::software::runtime::
-                        is_fu_3d_raw_packet_header(command);
-                });
-        });
     // Logical issue comparison concerns only computation. DMA/RX and the
     // independently loaded MEM transport have physical schedules of their own.
     const auto computationOnly = [](auto image) {
@@ -143,11 +134,11 @@ try {
     };
     std::optional<ftlpu::software::runtime::LogicalIssueProgram>
         logicalIssues;
-    if (physicalOnly || (hasRawFu3D && !comparePath)) {
+    if (physicalOnly || !comparePath) {
         // Physical inspection stays cheap for large coarse programs. Explicit
         // comparison uses the logical inspector's native FU packet expansion.
         std::cout << "binary logical_issue_summary mode="
-                  << (physicalOnly ? "physical_only" : "raw_fu_3d")
+                  << (physicalOnly ? "physical_only" : "packed_macro")
                   << " status=not_expanded\n";
     } else {
         logicalIssues =
@@ -158,289 +149,6 @@ try {
                   << logicalIssues->functional_issues
                   << " logical_nop_cycles="
                   << logicalIssues->logical_nop_cycles << '\n';
-    }
-    std::size_t totalInstructions = 0;
-    std::size_t totalNops = 0;
-    std::size_t totalRepeats = 0;
-    std::size_t totalRepeat2D = 0;
-    std::size_t totalMacros = 0;
-    std::size_t totalMemStreamNd = 0;
-    std::size_t totalMemSlicePrograms = 0;
-    std::size_t totalMemSliceBodyEntries = 0;
-    std::size_t maxMemSliceBodyEntries = 0;
-    std::size_t memSlicePayloadWords = 0;
-    std::size_t equivalentMemStreamPayloadWords = 0;
-    std::size_t totalMxmStreamNd = 0;
-    std::size_t totalVxmStreamNd = 0;
-    std::size_t totalSxmTilePrograms = 0;
-    std::size_t totalWriteRead2D = 0;
-    std::size_t writeRead2DExpanded = 0;
-    std::size_t expandedInstructions = 0;
-    std::size_t repeatReplayed = 0;
-    std::size_t repeat2DReplayed = 0;
-    std::size_t macroExpanded = 0;
-    std::size_t memStreamNdExpanded = 0;
-    std::size_t memSliceProgramExpanded = 0;
-    std::size_t mxmStreamNdExpanded = 0;
-    std::size_t vxmStreamNdExpanded = 0;
-    std::size_t sxmTileProgramExpanded = 0;
-    std::size_t tracePatternRows = 0;
-    std::size_t serializedQueueBytes =
-        program.queues.size() * (binaryVersion >= 26 ? 9 : 8);
-    for (const auto& queue : program.queues) {
-        const auto macroCount = std::ranges::count_if(queue.commands,
-            [](const auto& command) {
-                return ftlpu::software::runtime::is_macro_schedule_command(
-                    command);
-            });
-        const bool macroQueue = binaryVersion >= 26
-            && macroCount == queue.commands.size()
-            && !queue.commands.empty();
-        const bool memDeltaQueue = binaryVersion >= 28 && macroQueue
-            && queue.kind == ftlpu::software::runtime::QueueKind::Mem;
-        const bool hasExtendedDescriptor = std::ranges::any_of(
-            queue.commands, [](const auto& command) {
-                return ftlpu::isa::decode_icu_command_opcode(
-                           command.command)
-                    == ftlpu::isa::IcuCommandOpcode::Extended;
-            });
-        const bool nativeQueue = binaryVersion >= 26
-            && macroCount == 0 && !hasExtendedDescriptor;
-        if (memDeltaQueue) {
-            const auto image =
-                ftlpu::software::runtime::encode_mem_macro_bitstream(queue);
-            serializedQueueBytes += 10
-                + image.delta_count * 8 + image.bytes.size();
-        } else if (macroQueue) {
-            serializedQueueBytes += (queue.commands.size() + 7) / 8;
-        }
-        for (std::size_t commandIndex = 0;
-             commandIndex < queue.commands.size(); ++commandIndex) {
-            const auto& command = queue.commands[commandIndex];
-            const bool macro =
-                ftlpu::software::runtime::is_macro_schedule_command(command);
-            if (memDeltaQueue) {
-                // Accounted once as a packed queue-level bitstream above.
-            } else if (macroQueue) {
-                serializedQueueBytes +=
-                    command.word_count * sizeof(std::uint32_t) + 29;
-            } else if (nativeQueue) {
-                if (ftlpu::software::runtime::is_repeat_2d_command(command))
-                    serializedQueueBytes += 3 * sizeof(std::uint32_t);
-                else if (command.instruction_kind
-                            == ftlpu::software::runtime::InstructionKind::Sxm)
-                    serializedQueueBytes += 14 * sizeof(std::uint32_t);
-                else
-                    serializedQueueBytes += sizeof(std::uint32_t)
-                        + command.word_count * sizeof(std::uint32_t);
-            } else {
-                serializedQueueBytes += 1
-                    + command.word_count * sizeof(std::uint32_t)
-                    + (macro ? 29 : sizeof(std::uint32_t))
-                    + (!macro && !command.extension_words.empty()
-                            ? sizeof(std::uint16_t)
-                                + command.extension_words.size()
-                                    * sizeof(std::uint32_t)
-                            : 0);
-            }
-            if (ftlpu::software::runtime::
-                    is_mem_write_read_2d_raw_packet_header(command)) {
-                const auto instruction =
-                    ftlpu::software::runtime::
-                        decode_mem_write_read_2d_raw_packet(
-                            queue, commandIndex);
-                ++totalWriteRead2D;
-                const auto points = 2 * instruction.counts[0]
-                    * instruction.counts[1];
-                writeRead2DExpanded += points;
-                expandedInstructions += points;
-                tracePatternRows += 2;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_vxm_stream_nd_command(command)) {
-                ++totalVxmStreamNd;
-                const auto stream = ftlpu::software::runtime::
-                    decode_vxm_stream_nd_command(command);
-                std::size_t points = 1;
-                for (std::size_t dimension = 0;
-                     dimension < stream.schedule.rank; ++dimension)
-                    points *= stream.schedule.counts[dimension];
-                vxmStreamNdExpanded += points;
-                expandedInstructions += points;
-                tracePatternRows += stream.schedule.rank > 2
-                    ? stream.schedule.counts[2] : 1;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_sxm_tile_program_command(
-                    command)) {
-                ++totalSxmTilePrograms;
-                const auto tile = ftlpu::software::runtime::
-                    decode_sxm_tile_program_command(command);
-                std::size_t points = 1;
-                for (std::size_t dimension = 0;
-                     dimension < tile.schedule.rank; ++dimension)
-                    points *= tile.schedule.counts[dimension];
-                sxmTileProgramExpanded += points;
-                expandedInstructions += points;
-                tracePatternRows += tile.schedule.rank > 2
-                    ? tile.schedule.counts[2] : 1;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mem_slice_program_command(
-                    command)) {
-                ++totalMemSlicePrograms;
-                const auto sliceProgram = ftlpu::software::runtime::
-                    decode_mem_slice_program_command(command);
-                totalMemSliceBodyEntries += sliceProgram.body.size();
-                maxMemSliceBodyEntries = std::max(
-                    maxMemSliceBodyEntries, sliceProgram.body.size());
-                memSlicePayloadWords += command.extension_words.size();
-                for (const auto& body : sliceProgram.body) {
-                    const auto encoded = ftlpu::isa::encode_mem_instruction(
-                        body.instruction);
-                    equivalentMemStreamPayloadWords += 12
-                        + ((encoded >> 32) == 0 ? 1 : 2);
-                }
-                std::size_t points = sliceProgram.body.size();
-                for (std::size_t dimension = 0;
-                     dimension < sliceProgram.schedule.rank; ++dimension)
-                    points *= sliceProgram.schedule.counts[dimension];
-                memSliceProgramExpanded += points;
-                expandedInstructions += points;
-                tracePatternRows += sliceProgram.body.size()
-                    * (sliceProgram.schedule.rank > 2
-                            ? sliceProgram.schedule.counts[2] : 1);
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mem_stream_nd_command(
-                    command)) {
-                ++totalMemStreamNd;
-                const auto stream =
-                    ftlpu::software::runtime::decode_mem_stream_nd_command(
-                        command);
-                std::size_t points = 1;
-                for (std::size_t dimension = 0;
-                     dimension < stream.rank; ++dimension)
-                    points *= stream.counts[dimension];
-                memStreamNdExpanded += points;
-                expandedInstructions += points;
-                tracePatternRows += stream.rank > 2
-                    ? stream.counts[2] : 1;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mxm_stream_nd_command(
-                    command)) {
-                ++totalMxmStreamNd;
-                const auto stream =
-                    ftlpu::software::runtime::decode_mxm_stream_nd_command(
-                        command);
-                std::size_t points = 1;
-                for (std::size_t dimension = 0;
-                     dimension < stream.rank; ++dimension)
-                    points *= stream.counts[dimension];
-                mxmStreamNdExpanded += points;
-                expandedInstructions += points;
-                tracePatternRows += stream.rank > 2
-                    ? stream.counts[2] : 1;
-                continue;
-            }
-            if (macro) {
-                ++totalMacros;
-                const auto macro =
-                    ftlpu::software::runtime::decode_macro_schedule_command(
-                        command);
-                macroExpanded += macro.inner_count * macro.outer_count;
-                expandedInstructions += macro.inner_count * macro.outer_count;
-                ++tracePatternRows;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_repeat_2d_command(command)) {
-                ++totalRepeat2D;
-                const auto repeat =
-                    ftlpu::software::runtime::decode_repeat_2d_command(
-                        command);
-                repeat2DReplayed +=
-                    repeat.inner_count * repeat.outer_count - 1;
-                expandedInstructions +=
-                    repeat.inner_count * repeat.outer_count - 1;
-                if (repeat.inner_count * repeat.outer_count > 1)
-                    ++tracePatternRows;
-                continue;
-            }
-            switch (ftlpu::isa::decode_icu_command_opcode(command.command)) {
-            case ftlpu::isa::IcuCommandOpcode::Instruction:
-                ++totalInstructions;
-                ++expandedInstructions;
-                ++tracePatternRows;
-                break;
-            case ftlpu::isa::IcuCommandOpcode::Nop:
-                ++totalNops;
-                break;
-            case ftlpu::isa::IcuCommandOpcode::Repeat:
-                ++totalRepeats;
-                {
-                    const auto repeat =
-                        ftlpu::isa::decode_icu_repeat(command.command);
-                    repeatReplayed += repeat.count;
-                    expandedInstructions += repeat.count;
-                    if (repeat.count != 0) ++tracePatternRows;
-                }
-                break;
-            default:
-                break;
-            }
-        }
-    }
-    const std::size_t encodedWorkEntries = totalInstructions + totalRepeats
-        + totalRepeat2D + totalMacros + totalMemStreamNd
-        + totalMemSlicePrograms + totalMxmStreamNd + totalVxmStreamNd
-        + totalSxmTilePrograms + totalWriteRead2D;
-    const std::size_t savedWorkEntries = expandedInstructions
-        > encodedWorkEntries ? expandedInstructions - encodedWorkEntries : 0;
-    std::cout << "binary aggregate instruction=" << totalInstructions
-              << " nop=" << totalNops
-              << " repeat=" << totalRepeats
-              << " repeat2d=" << totalRepeat2D
-              << " macro=" << totalMacros
-              << " mem_stream_nd=" << totalMemStreamNd
-              << " mem_slice_program=" << totalMemSlicePrograms
-              << " mem_slice_body=" << totalMemSliceBodyEntries
-              << " mxm_stream_nd=" << totalMxmStreamNd
-              << " vxm_stream_nd=" << totalVxmStreamNd
-              << " sxm_tile_program=" << totalSxmTilePrograms
-              << " mem_write_read_2d=" << totalWriteRead2D
-              << " repeat_replayed=" << repeatReplayed
-              << " repeat2d_replayed=" << repeat2DReplayed
-              << " macro_expanded=" << macroExpanded
-              << " mem_stream_nd_expanded=" << memStreamNdExpanded
-              << " mem_slice_program_expanded="
-              << memSliceProgramExpanded
-              << " mxm_stream_nd_expanded=" << mxmStreamNdExpanded
-              << " vxm_stream_nd_expanded=" << vxmStreamNdExpanded
-              << " sxm_tile_program_expanded=" << sxmTileProgramExpanded
-              << " mem_write_read_2d_expanded=" << writeRead2DExpanded
-              << " expanded_instruction=" << expandedInstructions
-              << " encoded_work_entries=" << encodedWorkEntries
-              << " saved_work_entries=" << savedWorkEntries
-              << " trace_queue_pattern_rows=" << tracePatternRows
-              << " serialized_queue_bytes=" << serializedQueueBytes
-              << '\n';
-    if (totalMemSlicePrograms != 0) {
-        const auto savedPayloadWords =
-            static_cast<std::int64_t>(equivalentMemStreamPayloadWords)
-            - static_cast<std::int64_t>(memSlicePayloadWords);
-        std::cout << "binary mem_slice_cost programs="
-                  << totalMemSlicePrograms
-                  << " body_entries=" << totalMemSliceBodyEntries
-                  << " max_body_entries=" << maxMemSliceBodyEntries
-                  << " average_body_entries="
-                  << static_cast<double>(totalMemSliceBodyEntries)
-                        / totalMemSlicePrograms
-                  << " slice_payload_words=" << memSlicePayloadWords
-                  << " equivalent_mem_stream_payload_words="
-                  << equivalentMemStreamPayloadWords
-                  << " saved_payload_words=" << savedPayloadWords
-                  << '\n';
     }
     const auto imem =
         ftlpu::software::runtime::analyze_cmodel_abstract_imem(program);
@@ -490,7 +198,7 @@ try {
             usedBits += queue.used_bits();
             expandedWork += queue.expanded_work;
             encodedWork += queue.instruction_entries
-                + queue.repeat_entries + queue.repeat_2d_entries
+                + queue.repeat_entries
                 + queue.macro_entries
                 + queue.coarse_program_entries;
             maxUsed = std::max(maxUsed, queue.used_slots);
@@ -532,7 +240,6 @@ try {
                   << " instruction=" << queue.instruction_entries
                   << " nop=" << queue.nop_entries
                   << " repeat=" << queue.repeat_entries
-                  << " repeat2d=" << queue.repeat_2d_entries
                   << " macro=" << queue.macro_entries
                   << " coarse_program=" << queue.coarse_program_entries
                   << '\n';
@@ -600,12 +307,9 @@ try {
               << " deployable=" << (physical.fits() ? "yes" : "no")
               << " queues=" << physical.queues.size()
               << " mem_delta_rle_queues=" << physical.mem_delta_rle_queues
-              << " stream_nd_packets=" << physical.stream_nd_packets
               << " overflow_queues=" << physical.overflow_queues
               << " macro_context_overflow_queues="
               << physical.macro_context_overflow_queues
-              << " fu_3d_context_overflow_queues="
-              << physical.fu_3d_context_overflow_queues
               << " used_slots=" << physical.used_slots
               << " used_bits=" << physical.used_bits
               << " used_bytes_ceil=" << (physical.used_bits + 7) / 8
@@ -615,10 +319,7 @@ try {
               << physical.peak_macro_context_bits
               << " provisioned_macro_context_bits="
               << physical.provisioned_macro_context_bits
-              << " peak_fu_3d_context_bits="
-              << physical.peak_fu_3d_context_bits
-              << " provisioned_fu_3d_context_bits="
-              << physical.provisioned_fu_3d_context_bits << '\n';
+              << '\n';
     for (const auto kind : {
              ftlpu::software::runtime::QueueKind::Mem,
              ftlpu::software::runtime::QueueKind::MxmLoad,
@@ -637,15 +338,10 @@ try {
         std::size_t contextCapacity = 0;
         std::uint64_t peakContextBits = 0;
         std::uint64_t provisionedContextBits = 0;
-        std::size_t peakFu3DContexts = 0;
-        std::size_t fu3DContextCapacity = 0;
-        std::uint64_t peakFu3DContextBits = 0;
-        std::uint64_t provisionedFu3DContextBits = 0;
         std::size_t runs = 0;
         std::size_t escapes = 0;
         std::size_t compactTemplateRuns = 0;
         std::size_t extendedTemplateRuns = 0;
-        std::size_t streamNdPackets = 0;
         std::uint64_t bits = 0;
         for (const auto& queue : physical.queues) {
             if (queue.kind != kind) continue;
@@ -659,19 +355,10 @@ try {
                 queue.peak_macro_contexts) * queue.macro_context_bits;
             provisionedContextBits += static_cast<std::uint64_t>(
                 queue.macro_context_capacity) * queue.macro_context_bits;
-            peakFu3DContexts = std::max(
-                peakFu3DContexts, queue.peak_fu_3d_contexts);
-            fu3DContextCapacity = std::max(
-                fu3DContextCapacity, queue.fu_3d_context_capacity);
-            peakFu3DContextBits += static_cast<std::uint64_t>(
-                queue.peak_fu_3d_contexts) * queue.fu_3d_context_bits;
-            provisionedFu3DContextBits += static_cast<std::uint64_t>(
-                queue.fu_3d_context_capacity) * queue.fu_3d_context_bits;
             runs += queue.macro_codec.run_count;
             escapes += queue.macro_codec.escaped_transitions;
             compactTemplateRuns += queue.macro_codec.compact_template_runs;
             extendedTemplateRuns += queue.macro_codec.extended_template_runs;
-            streamNdPackets += queue.stream_nd_packets;
             bits += queue.physical_bits;
         }
         if (queues == 0) continue;
@@ -681,17 +368,11 @@ try {
                   << " used_slots=" << slots
                   << " max_used_slots=" << maxSlots
                   << " used_bits=" << bits
-                  << " stream_nd_packets=" << streamNdPackets
                   << " peak_macro_contexts=" << peakContexts
                   << " macro_context_capacity=" << contextCapacity
                   << " peak_macro_context_bits=" << peakContextBits
                   << " provisioned_macro_context_bits="
                   << provisionedContextBits
-                  << " peak_fu_3d_contexts=" << peakFu3DContexts
-                  << " fu_3d_context_capacity=" << fu3DContextCapacity
-                  << " peak_fu_3d_context_bits=" << peakFu3DContextBits
-                  << " provisioned_fu_3d_context_bits="
-                  << provisionedFu3DContextBits
                   << " template_runs=" << runs
                   << " compact_template_runs=" << compactTemplateRuns
                   << " extended_template_runs=" << extendedTemplateRuns
@@ -825,44 +506,14 @@ try {
         std::size_t instructions = 0;
         std::size_t nops = 0;
         std::size_t repeats = 0;
-        std::size_t repeats2d = 0;
         std::size_t macros = 0;
-        std::size_t memStreamNd = 0;
-        std::size_t memSlicePrograms = 0;
-        std::size_t mxmStreamNd = 0;
-        std::size_t vxmStreamNd = 0;
-        std::size_t sxmTilePrograms = 0;
         for (const auto& command : queue.commands) {
-            if (ftlpu::software::runtime::is_vxm_stream_nd_command(command)) {
-                ++vxmStreamNd;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_sxm_tile_program_command(
-                    command)) {
-                ++sxmTilePrograms;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mem_slice_program_command(
-                    command)) {
-                ++memSlicePrograms;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mem_stream_nd_command(command)) {
-                ++memStreamNd;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mxm_stream_nd_command(command)) {
-                ++mxmStreamNd;
-                continue;
-            }
+
             if (ftlpu::software::runtime::is_macro_schedule_command(command)) {
                 ++macros;
                 continue;
             }
-            if (ftlpu::software::runtime::is_repeat_2d_command(command)) {
-                ++repeats2d;
-                continue;
-            }
+
             switch (ftlpu::isa::decode_icu_command_opcode(command.command)) {
             case ftlpu::isa::IcuCommandOpcode::Instruction:
                 ++instructions;
@@ -885,13 +536,8 @@ try {
                   << " instruction=" << instructions
                   << " nop=" << nops
                   << " repeat=" << repeats
-                  << " repeat2d=" << repeats2d
                   << " macro=" << macros
-                  << " mem_stream_nd=" << memStreamNd
-                  << " mem_slice_program=" << memSlicePrograms
-                  << " mxm_stream_nd=" << mxmStreamNd
-                  << " vxm_stream_nd=" << vxmStreamNd
-                  << " sxm_tile_program=" << sxmTilePrograms << '\n';
+                  << '\n';
     }
     for (const auto kind : {
              ftlpu::software::runtime::QueueKind::Mem,
@@ -931,44 +577,14 @@ try {
         std::size_t instructionCount = 0;
         std::size_t nopCount = 0;
         std::size_t repeatCount = 0;
-        std::size_t repeat2DCount = 0;
         std::size_t macroCount = 0;
-        std::size_t memStreamNdCount = 0;
-        std::size_t memSliceProgramCount = 0;
-        std::size_t mxmStreamNdCount = 0;
-        std::size_t vxmStreamNdCount = 0;
-        std::size_t sxmTileProgramCount = 0;
         for (const auto& command : (*found)->commands) {
-            if (ftlpu::software::runtime::is_vxm_stream_nd_command(command)) {
-                ++vxmStreamNdCount;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_sxm_tile_program_command(
-                    command)) {
-                ++sxmTileProgramCount;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mem_slice_program_command(
-                    command)) {
-                ++memSliceProgramCount;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mem_stream_nd_command(command)) {
-                ++memStreamNdCount;
-                continue;
-            }
-            if (ftlpu::software::runtime::is_mxm_stream_nd_command(command)) {
-                ++mxmStreamNdCount;
-                continue;
-            }
+
             if (ftlpu::software::runtime::is_macro_schedule_command(command)) {
                 ++macroCount;
                 continue;
             }
-            if (ftlpu::software::runtime::is_repeat_2d_command(command)) {
-                ++repeat2DCount;
-                continue;
-            }
+
             switch (ftlpu::isa::decode_icu_command_opcode(command.command)) {
             case ftlpu::isa::IcuCommandOpcode::Instruction:
                 ++instructionCount;
@@ -990,13 +606,8 @@ try {
                   << " instruction=" << instructionCount
                   << " nop=" << nopCount
                   << " repeat=" << repeatCount
-                  << " repeat2d=" << repeat2DCount
                   << " macro=" << macroCount
-                  << " mem_stream_nd=" << memStreamNdCount
-                  << " mem_slice_program=" << memSliceProgramCount
-                  << " mxm_stream_nd=" << mxmStreamNdCount
-                  << " vxm_stream_nd=" << vxmStreamNdCount
-                  << " sxm_tile_program=" << sxmTileProgramCount << '\n';
+                  << '\n';
     }
     for (const auto& binding : program.bindings) {
         std::cout << "binary binding index=" << binding.index

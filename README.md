@@ -28,6 +28,12 @@ its linear-attention layer only. These are decoder-layer tests, not complete
 multi-layer text generation. See the [Chinese quickstart and coverage table](docs/model_test_quickstart.zh-CN.md)
 for commands, checkpoint access, artifacts, exit codes, and troubleshooting.
 
+GLM dense/Flash attention comparisons now use the same entry with
+`--suite attention-prefill` or `--suite attention-decode --batches 1 32`.
+The primary run exports required results, persistent states and invocation
+handoffs only; intermediate validation outputs are in a separate `diagnostic/`
+execution. See [output contracts](docs/model_test_output_contract.zh-CN.md).
+
 ## Current Focus
 
 The first target is the CModel ICU boundary in `FTLPU-CMODEL`:
@@ -114,8 +120,9 @@ overview navigation, and A/B cycle measurement cursors. See
 
 ## Build
 
-For the optional raw Macro frontend, parameter sweeps, and coexistence with
-compact/FU3D execution, see the [Macro frontend guide](docs/macro_frontend_physical_model.zh-CN.md).
+MEM/MXM/SXM execute packed Macro streams; VXM uses single-word sequential
+configurations. See the [current ICU ISA](compiler/docs/icu_macro_isa.md) and
+[Macro frontend guide](docs/macro_frontend_physical_model.zh-CN.md).
 
 By default CMake expects `FTLPU-CMODEL` to sit next to this repository:
 

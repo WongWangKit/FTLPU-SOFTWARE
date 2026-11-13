@@ -1,4 +1,5 @@
 #include "ftlpu/software/runtime/model_session.hpp"
+#include "ftlpu/software/runtime/weight_page_builder.hpp"
 
 #include "ftlpu/core/bf16.hpp"
 
@@ -106,6 +107,57 @@ void test_planar_output(BindingElementType type, BindingLayout layout,
         throw std::runtime_error("C2C I/O accounting added absolute clocks instead of elapsed cycles");
 }
 
+void test_mixed_bank_output_pieces()
+{
+    auto left = make_binding(BindingAccess::Input);
+    left.layout = BindingLayout::Fp16PairPlanar;
+    left.shape = {2,32};
+    left.byte_size = 128;
+    left.instruction_count = 2;
+    left.slices = {32,33};
+    left.hemisphere_mask = 2;
+    auto right = left;
+    right.index = 1;
+    right.bank = 1; // Same slice/address, distinct physical bank and payload.
+    right.name = "right";
+    auto output = left;
+    output.access = BindingAccess::Output;
+    output.shape = {4,32};
+    output.byte_size = 256;
+    output.name = "output";
+    output.role = "result";
+    output.pieces = {left,right};
+    for (auto& piece : output.pieces) piece.access = BindingAccess::Output;
+    BinaryProgram program;
+    program.hardware.ddr_peak_bandwidth_mbytes_per_second = 51200;
+    program.bindings = {left,right,output};
+    validate_native_output_pieces(output,program.hardware);
+    auto alias = output;
+    alias.pieces[1].bank = 0;
+    bool rejected = false;
+    try { validate_native_output_pieces(alias,program.hardware); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("same-bank output alias was accepted");
+    ModelPackage package;
+    package.model_name = "mixed-bank-output-roundtrip";
+    package.architecture = "test";
+    package.values = {{"left",BindingElementType::BF16,{2,32},true,false},
+                      {"right",BindingElementType::BF16,{2,32},true,false},
+                      {"output",BindingElementType::BF16,{4,32},false,true}};
+    package.executables.push_back({"identity",program,{}});
+    package.invocations.push_back({"identity",0,{{0,"left"},{1,"right"}},{{0,"output"}},{}});
+    std::vector<std::uint8_t> a(128,0x3f),b(128,0x40),expected=a;
+    expected.insert(expected.end(),b.begin(),b.end());
+    auto system = std::make_unique<C2cDmaSystem>();
+    ModelSession session(*system);
+    session.load(std::move(package));
+    session.set_input("left",a);
+    session.set_input("right",b);
+    session.run();
+    if (session.value("output") != expected || session.stats().c2c_egress_cycles == 0)
+        throw std::runtime_error("mixed-bank output did not read both physical banks through C2C");
+}
+
 } // namespace
 
 int main()
@@ -154,6 +206,7 @@ try {
                        {32,1024}, {32,33}, 2, 6432);
     test_planar_output(BindingElementType::F32, BindingLayout::Fp32QuadPlanar,
                        {2048,128}, {8,9,10,11}, 1, 0);
+    test_mixed_bank_output_pieces();
     std::cout << "model_session_c2c_io_test passed"
               << " ingress_bytes=" << stats.c2c_ingress_bytes
               << " ingress_cycles=" << stats.c2c_ingress_cycles

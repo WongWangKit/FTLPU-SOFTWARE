@@ -1016,6 +1016,9 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
     const int64_t tokenBlocks = rows / tile;
     const int64_t distributedRows =
         rows * hidden / (tile * lanes);
+    const bool planarReplay = inputSlices.size() == 2 && outputSlices.size() == 2
+        && inputPlacement.getAs<mlir::StringAttr>("kind").getValue() == "fp16_pair_planar"
+        && normalizedStreamStart && !streamedReduction.empty() && tokenBlocks == 1;
     // If epsilon and unit variance cannot share even the full FP16 normal
     // range, a single scaled RSQRT can overflow on ordinary activations.
     // Retain the sum in the FP32 feedback chain for the multi-range lookup.
@@ -1035,7 +1038,7 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
         }
         lookupExponents.push_back(exponent);
     }
-    if (inputSlices.size() != 16 || outputSlices.size() != 16
+    if ((!planarReplay && (inputSlices.size() != 16 || outputSlices.size() != 16))
         || (!l2Norm && weightSlices.size() != 2 && weightSlices.size() != 4
             && weightSlices.size() != 16))
         return start;
@@ -1181,13 +1184,13 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
                 if(first) vxm(config,3,"add","previous",0,0.f,"accumulator",0,0.f,"fp32",-1,1,4,true,true,false);
                 vxm(config+(first?1:0),3,"add","previous",0,0.f,"accumulator",0,0.f,
                     "fp32",-1,32-(first?1:0)-(last?1:0),4,false,true,false);
-                if(last) vxm(config+1,3,"add","previous",0,0.f,"accumulator",0,0.f,
+                if(last) vxm(config+(first?2:1),3,"add","previous",0,0.f,"accumulator",0,0.f,
                     rangeSafeFactor ? "fp32" : dataFormat,rangeSafeFactor ? -1 : 2,1,4,false,true,true);
             }
         }
         const int64_t featuresPerPair = hidden / lanes;
         const int64_t scalarAddress = baseRow(inputPlacement)
-            + distributedRows + tokenBlock;
+            + (planarReplay ? hidden : distributedRows) + tokenBlock;
         const int64_t sumOutput = (streamedReduction.empty() ? reductionInput+hidden : streamedReduction.back()+32) + 3;
         const auto scalarSlices =
             llvm::ArrayRef<int64_t>(inputSlices).take_front(2);
@@ -1375,7 +1378,12 @@ int64_t emitVxmFeedbackImpl(mlir::IRRewriter& rewriter,
         int64_t normalizeWriteEnd = normalizeInput;
         const bool broadcastWeight = weightSlices.size() == 2
             || weightSlices.size() == 4;
-        for (int64_t pair = 0; pair < lanes; ++pair) {
+        if (planarReplay) {
+            emitMirroredPairRead(inputSlices, 0, baseRow(inputPlacement), 0,
+                normalizeInput, bank(inputPlacement), -1, hidden, 1, 1);
+            normalizeWriteEnd = normalizeInput + hidden + (l2Norm ? 5 : 6) + 1;
+        }
+        for (int64_t pair = 0; !planarReplay && pair < lanes; ++pair) {
             const int64_t inputAddress = packedAddress(
                 inputPlacement, tokenBlock, 0, 0, hiddenBlocks,
                 target.throughput().tile_rows);
@@ -1851,6 +1859,74 @@ mlir::FailureOr<mlir::Value> emitDirectPlanarNorm(mlir::IRRewriter& rewriter,
     return output.getValue();
 }
 
+// A planar 32-token tile feeds both passes without distributed16 scratch.
+// SXM -> VXM is tapped only to retain x across the full-width reduction;
+// the normalized stream goes straight back through SXM into its final home.
+mlir::Value emitStreamingPlanarRmsNorm(mlir::IRRewriter& rewriter,
+    stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
+    mlir::DictionaryAttr input, mlir::DictionaryAttr weight,
+    mlir::DictionaryAttr replay, mlir::DictionaryAttr result, int64_t outputIndex)
+{
+    const auto type=llvm::cast<mlir::RankedTensorType>(op.getInput().getType());
+    const int64_t hidden=type.getDimSize(1), blocks=hidden/32;
+    const auto inputIds=slices(input), replayIds=slices(replay), resultIds=slices(result);
+    const auto latency=[&](target::StreamEndpoint src, target::StreamEndpoint dst,
+                           target::StreamDirection direction,int64_t slice=0) {
+        return *target.transport_latency(src,dst,direction,slice);
+    };
+    using E=target::StreamEndpoint;
+    using D=target::StreamDirection;
+    int64_t firstCapture=32;
+    for(auto id:inputIds) firstCapture=std::max(firstCapture,latency(E::Mem,E::SxmInput,D::East,id)+32);
+    int64_t replayEnd=0;
+    for(int64_t side=0;side<2;++side) {
+        emitSxm(rewriter,op.getLoc(),firstCapture,side,"transpose",{16,17},
+            {32+side*16,33+side*16},attention_detail::identityMap(target),
+            "wide_matrix",-1,-1,-1,blocks,32);
+        for(int64_t byte=0;byte<2;++byte) {
+            emitMem3D(rewriter,op.getLoc(),target,
+                firstCapture-latency(E::Mem,E::SxmInput,D::East,inputIds[byte]),
+                side*target.memory().slices_per_hemisphere+inputIds[byte],
+                "read",baseRow(input),16+byte,hidden,1,1,1,1,0,1,1,0,
+                inputBindingIndex(op.getInput()),bank(input));
+            const int64_t tap=firstCapture+35+latency(E::SxmResult,E::Mem,D::West,replayIds[byte]);
+            emitMem3D(rewriter,op.getLoc(),target,tap,
+                side*target.memory().slices_per_hemisphere+replayIds[byte],
+                "write_tap",baseRow(replay),32+side*16+byte,
+                hidden,1,1,1,1,0,1,1,0,-1,bank(replay));
+            replayEnd=std::max(replayEnd,tap+hidden+4);
+        }
+    }
+    llvm::SmallVector<int64_t> arrivals;
+    for(int64_t block=0;block<blocks;++block)
+        arrivals.push_back(firstCapture+block*32+35+latency(E::SxmResult,E::VxmInput,D::West));
+    int64_t normalized=0;
+    const auto feedbackEnd=emitVxmFeedbackImpl(rewriter,op.getLoc(),op.getInput(),op.getWeight(),
+        type,op.getEpsilon().convertToDouble(),target,replay,weight,result,replayEnd,
+        false,1.0f,arrivals,false,&normalized);
+    const int64_t capture=normalized+latency(E::VxmResult,E::SxmInput,D::East);
+    int64_t end=feedbackEnd;
+    for(int64_t side=0;side<2;++side) {
+        const int64_t source=(1-side)*8+2;
+        emitSxm(rewriter,op.getLoc(),capture,side,"transpose",{source,source+1},{32,33},
+            attention_detail::identityMap(target),"wide_matrix",-1,-1,-1,blocks,32);
+        for(int64_t byte=0;byte<2;++byte) {
+            const auto write=capture+35+latency(E::SxmResult,E::Mem,D::West,resultIds[byte]);
+            emitMem3D(rewriter,op.getLoc(),target,write,
+                side*target.memory().slices_per_hemisphere+resultIds[byte],
+                "write",baseRow(result),32+byte,hidden,1,1,1,1,0,1,1,0,-1,bank(result));
+            end=std::max(end,write+hidden+4);
+        }
+    }
+    createTimeline(rewriter,op.getLoc(),"rmsnorm.direct_planar_ingress",0,replayEnd);
+    createTimeline(rewriter,op.getLoc(),"rmsnorm.sxm_vxm_streaming",arrivals.front(),arrivals.back()+32+4);
+    createTimeline(rewriter,op.getLoc(),"rmsnorm.vxm_sxm_direct",normalized,end);
+    createTimeline(rewriter,op.getLoc(),"rmsnorm.direct_planar_output",capture,end);
+    auto output=createBinding(rewriter,op.getLoc(),{},outputIndex,"output","result",type,result);
+    output->setAttr("name",rewriter.getStringAttr("rmsnorm.result."+std::to_string(outputIndex)));
+    return output.getValue();
+}
+
 mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
     stream::RmsNormTaskOp op, const target::LPUTargetModel& target,
     int64_t outputIndex)
@@ -1871,10 +1947,12 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
         allocationPlacement(op.getWeightAllocations(), 0);
     const auto feedbackInputPlacement =
         allocationPlacement(op.getScratchAllocations(), 0);
-    const auto feedbackOutputPlacement =
-        allocationPlacement(op.getScratchAllocations(), 1);
     const auto resultPlacement =
         allocationPlacement(op.getResultAllocations(), 0);
+    const auto planarAttr=op.getConfig().getAs<mlir::BoolAttr>("planar_streaming");
+    const bool planar=planarAttr && planarAttr.getValue();
+    const auto feedbackOutputPlacement = planar ? resultPlacement
+        : allocationPlacement(op.getScratchAllocations(), 1);
 
     rewriter.setInsertionPoint(op);
     if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(op.getInput()))
@@ -1887,6 +1965,11 @@ mlir::LogicalResult lowerRmsNormFeedback(mlir::IRRewriter& rewriter,
             llvm::cast<mlir::RankedTensorType>(op.getWeight().getType()),
             weightPlacement);
 
+    if(planar) {
+        rewriter.replaceOp(op,emitStreamingPlanarRmsNorm(rewriter,op,target,
+            inputPlacement,weightPlacement,feedbackInputPlacement,resultPlacement,outputIndex));
+        return mlir::success();
+    }
     if(op->hasAttr("native_planar_words")) {
         auto value=emitDirectPlanarNorm(rewriter,op,op.getInput(),op.getWeight(),executionInputType,
             target,feedbackInputPlacement,feedbackOutputPlacement,resultPlacement,weightPlacement,

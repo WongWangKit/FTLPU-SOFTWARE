@@ -258,7 +258,8 @@ python compiler/tests/qwen3_5_resident_decoder_layer_test.py `
 还未在此单程序路径验证。
 
 通用驻留链接器直接用张量形状/索引视图生成 MEM 3D、SXM RUN_2D 和
-VXM RUN_2D 域，不先展开 FU 轨迹。静态参数在 bank1 下半区，中间张量
+VXM 顺序配置；VXM 的连续重复由 FU repeat_count 完成，不再支持 ICU
+RUN_2D/RUN_3D。上述历史测试产物需要重新编译。静态参数在 bank1 下半区，中间张量
 在 bank1 上半区按生命周期分配；算子本身保留原生 scratch 布局。同侧
 packed→scalar 转换由 SXM 直接写 MEM，跨侧搬运使用 VXM。FP32 同侧
 转换逐 byte-plane 保留原始比特；独立布局回归测试逐比特检查此转换。

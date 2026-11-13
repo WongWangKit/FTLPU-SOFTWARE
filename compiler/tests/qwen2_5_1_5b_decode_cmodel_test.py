@@ -119,6 +119,7 @@ def main() -> None:
     run([
         str(args.compile), "--input", str(command),
         "--output", str(binary), "--input-stage", "command",
+        "--icu-compression", "raw-macro",
         "--target-config", str(args.target_config),
         "--mxm-execution", args.mxm_execution,
         "--weight-bank", str(args.weight_bank),
@@ -131,9 +132,9 @@ def main() -> None:
         require(stream_text, "tensor<1x1536xbf16>", stream)
         command_text = command.read_text(encoding="utf-8")
         require(command_text, 'ftlpu.command_lowering = "direct"', command)
-        require(command_text, "ftlpu.command.mem_3d", command)
+        require(command_text, "ftlpu.command.macro", command)
         require(command_text, "ftlpu.command.weight_page", command)
-        require(command_text, "ftlpu.command.vxm_run_2d", command)
+        require(command_text, "ftlpu.command.vxm", command)
         if args.compile_only:
             print(f"Qwen2.5-1.5B vector decode compiled: {binary}", flush=True)
             return
@@ -369,11 +370,11 @@ def main() -> None:
     require(command_text, 'ftlpu.command_lowering = "direct"', command)
     require(command_text, 'role = "state.kv.key"', command)
     require(command_text, 'role = "state.kv.value"', command)
-    require(command_text, "ftlpu.command.mem_3d", command)
+    require(command_text, "ftlpu.command.macro", command)
     require(command_text, 'opcode = "is_load_activation"', command)
     require(command_text, 'opcode = "is_stream_compute"', command)
     require(command_text, 'is_mode = "is-block"', command)
-    require(command_text, "ftlpu.command.vxm_run_2d", command)
+    require(command_text, "ftlpu.command.vxm", command)
     require(command_text, "ftlpu.command.weight_page", command)
 
     ffn_bank_b = (args.weight_bank + 1) % 2

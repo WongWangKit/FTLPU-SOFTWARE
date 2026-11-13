@@ -26,7 +26,7 @@ def main():
     subprocess.run([str(a.compiler), '--input',str(source),'--output',str(a.output),
         '--target-config',str(a.target_config),'--weight-bank','1',
         '--ffn-schedule','fused','--attention-schedule','fused',
-        '--projection-rope-overlap','off'],check=True)
+        '--projection-rope-overlap','off','--icu-compression','raw-macro'],check=True)
 
 
 if __name__=='__main__': main()

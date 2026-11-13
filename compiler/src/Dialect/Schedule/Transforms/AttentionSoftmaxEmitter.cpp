@@ -16,6 +16,38 @@
 namespace ftlpu::compiler::schedule {
 using namespace attention_detail;
 
+bool AttentionScheduleEmitter::usesStreamingProbabilityTranspose() const
+{
+    // The standalone dense core owns its complete QK/softmax/PV scratch
+    // lifetime. Legacy whole-layer layouts keep the materialized path.
+    if (!op_.core || target_.throughput().mxms_per_hemisphere != 1)
+        return false;
+    const auto module = op_.core->getParentOfType<mlir::ModuleOp>();
+    const auto wide = module ? module->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide")
+                             : mlir::BoolAttr{};
+    if (!wide || !wide.getValue()
+        || !target_.supports_route(target::StreamEndpoint::VxmResult,
+            target::StreamEndpoint::SxmInput, target::StreamDirection::East))
+        return false;
+    const auto bank = [&](llvm::StringRef name) {
+        return op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(name)
+            .getAs<mlir::IntegerAttr>("bank").getInt();
+    };
+    // SXM writes may overlap the next head's reduction reads. Keep their
+    // physical MEM ICUs distinct; no instruction is preempted/interleaved.
+    const AttentionMemoryLayout layout(op_, target_);
+    const auto writes = layout.probabilityDiagonalSlices();
+    const auto disjoint = [&](llvm::StringRef name, llvm::ArrayRef<int64_t> reads) {
+        if (bank("probability_diagonal") != bank(name)) return true;
+        return llvm::none_of(reads, [&](int64_t slice) {
+            return llvm::is_contained(writes, slice);
+        });
+    };
+    return disjoint("score", layout.scaledScoreSlices(0))
+        && disjoint("exp", layout.expScoreSlices(0))
+        && (!op_.getCausal() || disjoint("causal_mask", layout.causalMaskSlices(0)));
+}
+
 int64_t AttentionScheduleEmitter::emitSoftmax(
     int64_t qkStart, int64_t qkEnd, bool fusedSoftmax)
 {
@@ -29,12 +61,21 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         lpu_16bit_data_format(elementType);
     const llvm::StringRef streamKind =
         dataFormat == "bf16" ? "stream_bf16" : "stream_f16";
-    const float scale = 1.0f / std::sqrt(static_cast<float>(op_.getHeadDim()));
+    const auto explicitScale = op_.core
+        ? op_.config().getAs<mlir::FloatAttr>("scale") : mlir::FloatAttr{};
+    const float scale = explicitScale ? explicitScale.getValueAsDouble()
+        : 1.0f / std::sqrt(static_cast<float>(op_.getHeadDim()));
     constexpr float causalMaskValue = -1.0e9f;
     // Softmax spans the resident KV window. Decode keeps one padded query
     // tile, while scores and probabilities cover all past tokens plus the
     // current token in the padded KV window.
     const int64_t sequence = op_.getKvSeqLen();
+    const auto actualKv = op_.core
+        ? op_.config().getAs<mlir::IntegerAttr>("actual_kv_len") : mlir::IntegerAttr{};
+    const int64_t validSequence = actualKv ? actualKv.getInt() : sequence;
+    const auto sinks = op_.core
+        ? op_.config().getAs<mlir::DenseF32ArrayAttr>("attention_sinks") : mlir::DenseF32ArrayAttr{};
+    if (std::getenv("FTLPU_GRAPH_PROGRESS")) llvm::errs()<<"native softmax sinks="<<(sinks?sinks.size():0)<<"\n";
     const int64_t tile = target_.throughput().mxm_rows;
     const auto placementBank = [&](llvm::StringRef name) {
         return op_.getMemoryPlan().getAs<mlir::DictionaryAttr>(name)
@@ -44,6 +85,8 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
     const int64_t expBank = placementBank("exp");
     const int64_t maskBank = placementBank("causal_mask");
     const int64_t probabilityPackBank = placementBank("probability_pack");
+    const bool streamProbabilityTranspose = usesStreamingProbabilityTranspose();
+    const bool tightCore = op_.core && streamProbabilityTranspose;
     const auto readLatency = [&](int64_t slice) {
         return *target_.transport_latency(target::StreamEndpoint::Mem,
             target::StreamEndpoint::VxmInput,
@@ -242,6 +285,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
     for (int64_t sourceHemisphere = 0;
          sourceHemisphere < target_.memory().hemispheres;
          ++sourceHemisphere) {
+        int64_t phaseWriteEnd = cursor;
         for (const SoftmaxWorkState& state : workStates) {
             if (state.hemisphere != sourceHemisphere) continue;
             const int64_t copyBridge = cursor
@@ -268,8 +312,14 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                     "write", state.score_address, byte,
                     sequence, 1, 1, 1, 1, 0, scoreBank});
             }
-            cursor = mirrorWriteEnd + 1;
+            phaseWriteEnd = std::max(phaseWriteEnd, mirrorWriteEnd + 1);
+            // All heads of this hemisphere use the same source/destination
+            // queues in the same direction. Launch consecutive read domains;
+            // their writes follow at the fixed route latency. Drain once
+            // before reversing direction for the other hemisphere.
+            cursor += sequence;
         }
+        cursor = phaseWriteEnd;
     }
     emitPlannedTransfers(mirrorTransfers);
 
@@ -277,6 +327,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
     // The exp allocation already reserves the complete work axis; use its
     // per-work address instead of repeatedly overwriting row zero.
     std::vector<PlannedMemTransfer> generateTransfers;
+    int64_t generateDrain = cursor;
     for (const SoftmaxWorkState& state : workStates) {
         const AttentionWorkItem& work = *state.work;
         const int64_t passReadLead = std::max(
@@ -287,7 +338,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         vxm(generateConfig, 1, "multiply",
             "previous", 0, 0.0f, "immediate", 0, scale,
             dataFormat, 0, sequence, 2);
-        const auto emitGenerateRun = [&](int64_t firstKey,
+        const auto emitGenerateRawRun = [&](int64_t firstKey,
                                           int64_t count,
                                           bool vectorMask,
                                           float immediateMask) {
@@ -300,9 +351,14 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
             if (vectorMask) {
                 const int64_t localKey = firstKey % tile;
                 planMirroredRead(generateTransfers, state.mask_slices,
-                    layout.causalMaskAddress(localKey), 2,
+                    layout.causalMaskAddress(localKey, work.local_mxm), 2,
                     generateInput + firstKey, count, 1, maskBank);
             }
+        };
+        const auto emitGenerateRun = [&](int64_t firstKey, int64_t count,
+                                         bool vectorMask, float immediateMask) {
+            emitGenerateRawRun(firstKey,
+                std::min(count, validSequence - firstKey), vectorMask, immediateMask);
         };
         if (!op_.getCausal()) {
             emitGenerateRun(0, sequence, false, 0.0f);
@@ -316,6 +372,10 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                 sequence - (absoluteQueryBlock + 1) * tile,
                 false, causalMaskValue);
         }
+        // Physical KV tile padding is never a valid softmax candidate, even
+        // for non-causal attention or inactive query lanes in a decode tile.
+        emitGenerateRawRun(validSequence, sequence - validSequence,
+            false, causalMaskValue);
         planMirroredRead(generateTransfers,
             state.score_slices, state.score_address, 0,
             generateInput, sequence, 1, scoreBank);
@@ -323,22 +383,27 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         planMirroredWrite(generateTransfers,
             state.x_slices, state.x_address, 0,
             generateOutput, sequence, 1, expBank);
-        cursor = generateOutput + maxWriteLatency(state.x_slices)
-            + sequence;
+        generateDrain = std::max(generateDrain, generateOutput + maxWriteLatency(state.x_slices) + sequence);
+        // Consecutive heads keep the same depth-2 pipeline. Its disjoint
+        // output queue can drain while the following head enters C0.
+        cursor = tightCore ? generateInput + sequence - passReadLead - 1 : generateDrain;
     }
+    cursor = std::max(cursor, generateDrain);
     emitPlannedTransfers(generateTransfers);
 
     // Phase 2: read every x row and write every max scalar.  No x write is
     // left in this phase, so each x queue has one write-to-read boundary for
     // the complete Softmax operator.
     std::vector<PlannedMemTransfer> maxTransfers;
+    int64_t maxDrain = cursor;
     for (const SoftmaxWorkState& state : workStates) {
         const int64_t maxInput = cursor
             + maxReadLatency(state.x_slices) + 1;
         const int64_t maxConfig = maxInput - 1;
         const int64_t maxOutput = maxInput + sequence;
-        vxm(maxConfig, 0, "pass", streamKind, 32, 0.0f,
-            "immediate", 0, 0.0f, "fp32", -1, sequence, 2);
+        vxm(maxConfig, 0, sinks ? "max" : "pass", streamKind, 32, 0.0f,
+            "immediate", 0, sinks ? sinks.asArrayRef()[state.work->query_head] : 0.0f,
+            "fp32", -1, sequence, 2);
         vxm(maxConfig, 1, "max", "previous", 0, 0.0f,
             "accumulator", 0, 0.0f, "fp32", -1, 1, 2,
             true, true, false);
@@ -354,8 +419,10 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         planMirroredWrite(maxTransfers,
             state.score_slices, state.score_address, 0,
             maxOutput, 1, 0, scoreBank);
-        cursor = maxOutput + maxWriteLatency(state.score_slices) + 1;
+        maxDrain = std::max(maxDrain, maxOutput + maxWriteLatency(state.score_slices) + 1);
+        cursor = tightCore ? maxInput + sequence - maxReadLatency(state.x_slices) - 1 : maxDrain;
     }
+    cursor = std::max(cursor, maxDrain);
     emitPlannedTransfers(maxTransfers);
 
     // Phases 3 and 4 remain adjacent per work item so reciprocal(sum) stays in
@@ -369,19 +436,24 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                   maxReadLatency(state.score_slices))
             + 1;
         const int64_t sumConfig = sumInput - 1;
+        const int64_t sumCount = sequence + (sinks ? 1 : 0);
         vxm(sumConfig, 0, "subtract", streamKind, 32, 0.0f,
             streamKind, 34, 0.0f, "fp32", -1, sequence, 4);
+        if (sinks)
+            vxm(sumConfig + 1, 0, "subtract", "immediate", 0,
+                sinks.asArrayRef()[work.query_head], streamKind, 34, 0.0f,
+                "fp32", -1, 1, 4);
         vxm(sumConfig, 1, "exp", "previous", 0, 0.0f,
-            "immediate", 0, 0.0f, "fp32", -1, sequence, 4);
+            "immediate", 0, 0.0f, "fp32", -1, sumCount, 4);
         vxm(sumConfig, 2, "pass", "previous", 0, 0.0f,
-            "immediate", 0, 0.0f, "fp32", -1, sequence, 4);
+            "immediate", 0, 0.0f, "fp32", -1, sumCount, 4);
         vxm(sumConfig, 3, "add", "previous", 0, 0.0f,
             "accumulator", 0, 0.0f, "fp32", -1, 1, 4,
             true, true, false);
-        if (sequence > 2)
+        if (sumCount > 2)
             vxm(sumConfig + 1, 3, "add", "previous", 0, 0.0f,
                 "accumulator", 0, 0.0f, "fp32", -1,
-                sequence - 2, 4, false, true, false);
+                sumCount - 2, 4, false, true, false);
         vxm(sumConfig + 2, 3, "add", "previous", 0, 0.0f,
             "accumulator", 0, 0.0f, "fp32", -1, 1, 4,
             false, true, true);
@@ -397,7 +469,7 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
         vxm(sumConfig + 12, 3, "reciprocal",
             "previous", 0, 0.0f, "immediate", 0, 0.0f,
             "fp32", -1, 1, 4, false, false, true, true);
-        const int64_t normalizeConfig = sumInput + sequence + 24;
+        const int64_t normalizeConfig = sumInput + sumCount + 24;
         const int64_t normalizeInput = normalizeConfig + 1;
 
         planMirroredRead(normalizeTransfers,
@@ -414,8 +486,12 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                 normalizeTransfers.push_back({
                     sumInput - readLatency(slice), queue,
                     "read", state.score_address, stream,
-                    sequence, 1, 0, 2,
+                    sumCount, 1, 0, sinks ? 1 : 2,
                     normalizeInput - sumInput, 0, scoreBank});
+                if (sinks)
+                    normalizeTransfers.push_back({normalizeInput - readLatency(slice), queue,
+                        "read", state.score_address, stream, sequence, 1, 0,
+                        1, 1, 0, scoreBank});
             }
         }
 
@@ -429,6 +505,47 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
             "accumulator", 0, 0.0f, dataFormat, 2,
             sequence, 4);
         constexpr int64_t normalizePipelineLatency = 8;
+        if (streamProbabilityTranspose) {
+            // Normalization already emits P(key, query-lane) in consecutive
+            // vectors. Capture every 32 vectors directly from SR, preserving
+            // the existing BF16/FP16 cast, then write the PV activation layout.
+            const int64_t capture = normalizeInput + normalizePipelineLatency
+                + *target_.transport_latency(target::StreamEndpoint::VxmResult,
+                    target::StreamEndpoint::SxmInput, target::StreamDirection::East, 0);
+            const int64_t h = work.hemisphere;
+            const int64_t inputStream = (1 - h) * 8 + 2;
+            // Ports 0/1 and 2/3 carry the next head's x/max reads toward VXM.
+            // Reserve reverse ports 4/5 for the SXM drain so those can overlap.
+            constexpr int64_t outputStream = 36;
+            const int64_t lanes = target_.throughput().lanes_per_tile;
+            const int64_t tileRows = target_.throughput().tile_rows;
+            const int64_t tokenBlocks = sequence / tile;
+            emitSxm(rewriter_, op_.getLoc(), capture, h, "transpose",
+                {inputStream, inputStream + 1}, {outputStream, outputStream + 1},
+                identityMap(target_), "wide_matrix", -1, -1, -1, tokenBlocks, tile);
+            const auto diagonalSlices = layout.probabilityDiagonalSlices();
+            for (int64_t pair = 0; pair < lanes; ++pair) {
+                for (int64_t byte = 0; byte < 2; ++byte) {
+                    const int64_t slice = diagonalSlices[2 * pair + byte];
+                    const int64_t at = capture + tile + tileRows - 1 + pair
+                        + *target_.transport_latency(target::StreamEndpoint::SxmResult,
+                            target::StreamEndpoint::Mem, target::StreamDirection::West, slice);
+                    normalizeTransfers.push_back({at,
+                        h * target_.memory().slices_per_hemisphere + slice,
+                        "write", layout.probabilityDiagonalAddress(
+                            work.query_head, work.query_block, 0, 0),
+                        outputStream + byte, tileRows, lanes, 1,
+                        tokenBlocks, tile, tileRows, placementBank("probability_diagonal")});
+                    probabilityPackComplete = std::max(probabilityPackComplete,
+                        at + (tokenBlocks - 1) * tile + (tileRows - 1) * lanes + 1);
+                }
+            }
+            mlir::OperationState timeline(op_.getLoc(), TimelineOp::getOperationName());
+            timeline.addAttribute("name", rewriter_.getStringAttr("softmax.vxm_sxm_direct"));
+            timeline.addAttribute("start", rewriter_.getI64IntegerAttr(capture));
+            timeline.addAttribute("end", rewriter_.getI64IntegerAttr(probabilityPackComplete));
+            rewriter_.create(timeline);
+        } else {
         const int64_t keysPerLane = sequence
             / target_.throughput().lanes_per_tile;
         for (int64_t lane = 0;
@@ -458,7 +575,12 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
                 }
             }
         }
-        cursor = normalizeInput + normalizePipelineLatency + 5
+        }
+        // C3 changes from a two-cycle multiply to a one-cycle add. Leave
+        // one input cycle so their completions cannot collide at its output.
+        cursor = tightCore ? normalizeInput + sequence + 1
+            - std::max(maxReadLatency(state.x_slices), maxReadLatency(state.score_slices)) - 1
+            : normalizeInput + normalizePipelineLatency + 5
             + sequence + 8
             + target_.throughput().tile_rows
             + target_.streams().system_register_columns;
@@ -508,8 +630,8 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
             transfer.wave_address_stride, 1, 1, 0, -1,
             transfer.bank);
     }
-    // A physical MEM ICU cannot preempt a coarse Write3D in order to start
-    // the following probability-pack Read3D.  Some compact attention layouts
+    // A physical MEM ICU cannot preempt a coarse Write in order to start
+    // the following probability-pack Read.  Some compact attention layouts
     // place both domains on the same bank, so the transpose phase must begin
     // after the last packed-probability write has retired on every queue.
     return std::max(cursor, probabilityPackComplete);
@@ -517,6 +639,9 @@ int64_t AttentionScheduleEmitter::emitSoftmax(
 
 int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
 {
+    // The SXM capture and diagonal writes were scheduled from the final VXM
+    // result timing inside emitSoftmax; there is no probability MEM replay.
+    if (usesStreamingProbabilityTranspose()) return packEnd;
     const AttentionMemoryLayout layout(op_, target_);
     const auto diagonalPlacement = op_.getMemoryPlan()
         .getAs<mlir::DictionaryAttr>("probability_diagonal");
@@ -530,6 +655,64 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
     const int64_t memToSxm = target_.throughput().mem_to_sxm_latency;
     const int64_t tokenBlocks =
         op_.getKvSeqLen() / target_.throughput().mxm_rows;
+    const auto module = op_.getInput().getParentRegion()->getParentOfType<mlir::ModuleOp>();
+    const auto wide = module ? module->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide")
+                             : mlir::BoolAttr{};
+    if (wide && wide.getValue()) {
+        // Packed rows hold P(key, query-lane). A wide tile transpose turns
+        // them into P(query, key-lane), exactly the diagonal PV activation
+        // layout used by the local transpose + permute path below.
+        const int64_t tile = target_.throughput().mxm_rows;
+        const int64_t lanes = target_.throughput().lanes_per_tile;
+        const int64_t tileRows = target_.throughput().tile_rows;
+        const auto packSlices = layout.probabilityPackSlices();
+        const auto diagonalSlices = layout.probabilityDiagonalSlices();
+        int64_t readLead = 0;
+        for (int64_t slice : packSlices) {
+            const auto latency = target_.transport_latency(target::StreamEndpoint::Mem,
+                target::StreamEndpoint::SxmInput, target::StreamDirection::East, slice);
+            if (!latency) return -1;
+            readLead = std::max(readLead, *latency);
+        }
+        std::array<int64_t, 2> capture {packEnd + readLead, packEnd + readLead};
+        int64_t end = packEnd;
+        for (const auto& wave : stage_plan_.qk_waves) {
+            for (const auto& work : wave.slots) {
+                if (!work) continue;
+                const int64_t h = work->hemisphere;
+                const int64_t start = capture[h];
+                emitSxm(rewriter_, op_.getLoc(), start, h, "transpose",
+                    {16, 17}, {32, 33}, identityMap(target_), "wide_matrix",
+                    -1, -1, -1, tokenBlocks, tile);
+                for (int64_t pair = 0; pair < lanes; ++pair) {
+                    for (int64_t byte = 0; byte < 2; ++byte) {
+                        const int64_t source = packSlices[2 * pair + byte];
+                        const int64_t destination = diagonalSlices[2 * pair + byte];
+                        const auto rd = target_.transport_latency(target::StreamEndpoint::Mem,
+                            target::StreamEndpoint::SxmInput, target::StreamDirection::East, source);
+                        const auto wr = target_.transport_latency(target::StreamEndpoint::SxmResult,
+                            target::StreamEndpoint::Mem, target::StreamDirection::West, destination);
+                        if (!rd || !wr) return -1;
+                        direct_domain_detail::emitMem3D(rewriter_, op_.getLoc(), target_,
+                            start + pair - *rd, h * target_.memory().slices_per_hemisphere + source,
+                            "read", layout.probabilityPackAddress(work->query_head, work->query_block, 0),
+                            16 + byte, tileRows, lanes, 1, tokenBlocks, tile, tileRows,
+                            1, 1, 0, -1, packBank);
+                        const int64_t writeStart = start + tile + tileRows - 1 + pair + *wr;
+                        direct_domain_detail::emitMem3D(rewriter_, op_.getLoc(), target_,
+                            writeStart, h * target_.memory().slices_per_hemisphere + destination,
+                            "write", layout.probabilityDiagonalAddress(work->query_head, work->query_block, 0, 0),
+                            32 + byte, tileRows, lanes, 1, tokenBlocks, tile, tileRows,
+                            1, 1, 0, -1, diagonalBank);
+                        end = std::max(end, writeStart + (tokenBlocks - 1) * tile
+                            + (tileRows - 1) * lanes + 1);
+                    }
+                }
+                capture[h] += tokenBlocks * tile;
+            }
+        }
+        return end;
+    }
     std::array<int64_t, 2> ready {packEnd, packEnd};
     std::array<int64_t, 16> inputStreams {};
     std::array<int64_t, 16> transposeStreams {};
@@ -717,7 +900,7 @@ int64_t AttentionScheduleEmitter::emitProbabilityTranspose(int64_t packEnd)
             }
 
             // The steady-state and drain beats have the same affine body and
-            // map stride.  Keep them in one RUN_2D domain so the physical ICU
+            // map stride.  Keep them in one launch domain domain so the physical ICU
             // does not need to switch packets while a transpose wavefront is
             // still live in the SXM tile pipeline.
             ready[static_cast<std::size_t>(hemisphere)] =

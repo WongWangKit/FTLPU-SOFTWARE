@@ -8,7 +8,7 @@
 
 namespace ftlpu::software::runtime {
 
-// Serializes ICU queue timelines as pipeline-viewer CSV. Repeat, Repeat2D,
+// Serializes ICU queue timelines as pipeline-viewer CSV. Macro timing fields,
 // macro-schedule, and raw FU 3-D/2-D packets remain compact patterns that the
 // viewer expands only for its visible cycle window. A raw 3-D packet emits one
 // row per third-counter coordinate so the CSV schema can retain the first two

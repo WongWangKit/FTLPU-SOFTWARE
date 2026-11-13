@@ -10,6 +10,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace ftlpu::compiler::schedule {
 using namespace attention_detail;
@@ -111,6 +112,17 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     const int64_t m = mAttr.getInt();
     const int64_t n = nAttr.getInt();
     const int64_t k = kAttr.getInt();
+    const auto blockScales = op.getConfig().getAs<mlir::DenseF32ArrayAttr>("rhs_block_scales");
+    if (op.getConfig().get("rhs_block_scales") && (!blockScales
+        || !llvm::isa<mlir::Float8E4M3FNType>(weightType.getElementType())
+        || m != 32 || k % 32 || n % 64
+        || blockScales.size() != (n / 32) * (k / 32)
+        || llvm::any_of(blockScales.asArrayRef(), [](float scale) {
+            return !std::isfinite(scale) || scale <= 0.f;
+        }))) {
+        op.emitError("FP8 block scales require positive finite [N/32,K/32] entries");
+        return mlir::failure();
+    }
     const bool fp32Partial = llvm::isa<mlir::Float8E4M3FNType>(weightType.getElementType())
         && resultType.getElementType().isF32();
     auto executionPolicy =
@@ -267,11 +279,17 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
     const auto scaleFor=[&](int64_t hemisphere) {
         return hemisphere && westScale?static_cast<float>(westScale.getValueAsDouble()):scale;
     };
+    const auto blockScaleFor = [&](int64_t hemisphere, int64_t outputGroup,
+                                   int64_t reduction) {
+        return blockScales
+            ? blockScales.asArrayRef()[(outputGroup * 2 + hemisphere) * reductionBlocks + reduction]
+            : scaleFor(hemisphere);
+    };
 
     if (localDequant && tokenBlocks == 1) {
         // Emit the projection's loop nest directly. Final-K compute exports
         // BF16 and clears its accumulator, so no accumulator-read command
-        // has to interrupt the COMPUTE_3D instruction between output groups.
+        // has to interrupt the compute domain instruction between output groups.
         // MEM transport is a startup lead, not a per-K bubble. With two
         // weight buffers the next K tile loads while the current tile computes.
         // Keep the short-row/decode policy unchanged until validated separately.
@@ -300,8 +318,22 @@ mlir::FailureOr<mlir::Value> emitLinearProjection(
                     reductionBlocks, period, 4, outputGroups, groupPeriod, reductionBlocks * 4,
                     weightPlacement.getAs<mlir::IntegerAttr>("bank").getInt(), weightPage);
             }
-            emitMxmDequant3D(rewriter, op.getLoc(), weightCycle, unit, scaleFor(hemisphere),
-                columnLoad ? 32 : 4, 1, reductionBlocks, period, outputGroups, groupPeriod, scaleBinding);
+            if (blockScales) {
+                // The existing dequant instruction has one immediate scale.
+                // Emit each constant block in queue order while retaining the
+                // shared closed-form MEM, IW and compute K/N domains. The
+                // MXM array forms one FP32 K32 partial and the ACC adds those
+                // partials in K order; only terminal K converts the output.
+                for (int64_t group = 0; group < outputGroups; ++group)
+                    for (int64_t reduction = 0; reduction < reductionBlocks; ++reduction)
+                        emitMxmDequant3D(rewriter, op.getLoc(),
+                            weightCycle + group * groupPeriod + reduction * period,
+                            unit, blockScaleFor(hemisphere, group, reduction),
+                            columnLoad ? 32 : 4, 1, 1, 1, 1, 1, -1);
+            } else {
+                emitMxmDequant3D(rewriter, op.getLoc(), weightCycle, unit, scaleFor(hemisphere),
+                    columnLoad ? 32 : 4, 1, reductionBlocks, period, outputGroups, groupPeriod, scaleBinding);
+            }
             const projection_detail::ProjectionGemmSchedule gemm{
                 m, reductionBlocks, outputGroups, period, groupPeriod};
             const projection_detail::ProjectionGemmSchedule::Binding gemmBinding{

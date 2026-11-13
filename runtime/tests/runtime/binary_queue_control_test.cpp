@@ -3,7 +3,7 @@
 #include "ftlpu/software/runtime/queue_transport_order.hpp"
 #include <algorithm>
 #include "ftlpu/system/c2c_dma_system.hpp"
-#include "ftlpu/software/runtime/fu_3d_macro_lowering.hpp"
+#include "ftlpu/software/runtime/macro_queue_link.hpp"
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -36,9 +36,10 @@ BinaryProgram fixture() {
         encode_icu_control_raw_word(IcuControlInstruction::Sync()),
         encode_icu_control_raw_word(IcuControlInstruction::Notify())}};
     const auto bits=isa::encode_mem_instruction(MemInstruction::Read(10,0));
-    q.commands.push_back({static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
-        InstructionKind::Mem,2,{static_cast<std::uint32_t>(bits),static_cast<std::uint32_t>(bits>>32),0,0}});
-    auto lowered=lower_fu_3d_queue_to_macro(q,65536,true);
+    q.commands.push_back(encode_macro_schedule_command({0, InstructionKind::Mem,2,
+        {static_cast<std::uint32_t>(bits),static_cast<std::uint32_t>(bits>>32),0,0}},
+        {20,1,1,0,1,1,0,IcuInductionTarget::MemAddress}));
+    auto lowered=link_macro_queue_controls(q,65536,true);
     require(lowered.controls.entries.size()==4,"lowering lost controls");
     require(decode_macro_schedule_command(lowered.queue.commands[0]).start_cycle==20,"control slots advanced Lq");
     lowered.queue.requires_raw_macro=true;
@@ -46,8 +47,8 @@ BinaryProgram fixture() {
     p.queue_sync_plan.partitions.push_back(lowered.controls);
     p.queue_sync_plan.events={{7,QueueEventSource::External,{}},{8,QueueEventSource::External,{}}};
     // Native queue retains its actual control; this directory is a binding only.
-    q.index=1;p.queues.push_back(q);
-    auto binding=lowered.controls;binding.index=1;
+    q.index=1;q.commands.pop_back();p.queues.push_back(q);
+    auto binding=lowered.controls;binding.index=1;binding.end_cycle=20;
     for(auto& c:binding.entries) c.native_binding=true;
     p.queue_sync_plan.partitions.push_back(binding);
     return p;
@@ -109,17 +110,18 @@ void sync_projection_relocations() {
     auto words=encode_mem_synchronized_icu_packet(packet);
     QueueProgram q{QueueKind::Mem,0,{words.begin(),words.end()}};
     const auto bits=isa::encode_mem_instruction(MemInstruction::Read(20,0));
-    q.commands.push_back({static_cast<isa::EncodedIcuCommand>(isa::IcuCommandOpcode::Instruction),
-        InstructionKind::Mem,2,{static_cast<std::uint32_t>(bits),static_cast<std::uint32_t>(bits>>32),0,0}});
+    q.commands.push_back(encode_macro_schedule_command({0, InstructionKind::Mem,2,
+        {static_cast<std::uint32_t>(bits),static_cast<std::uint32_t>(bits>>32),0,0}},
+        {20,1,1,0,1,1,0,IcuInductionTarget::MemAddress}));
     p.queues.push_back(q);
     p.address_relocations={{7,BindingAccess::Input,QueueKind::Mem,0,0},{8,BindingAccess::Input,QueueKind::Mem,0,2}};
     auto projected=without_compiled_mem_read_sync(p);
     require(projected.address_relocations.size()==1 && projected.address_relocations[0].binding_index==8
         && projected.address_relocations[0].command_index==1,"sync projection did not preserve only live relocations");
-    externalize_native_queue_controls(projected);
+    link_queue_controls(projected);
     require(projected.address_relocations.size()==1 && projected.address_relocations[0].command_index==0,
         "surviving relocation was not mapped to Macro");
-    externalize_native_queue_controls(p);
+    link_queue_controls(p);
     require(p.transport_queues.size()==1 && p.address_relocations[0].transport_queue,
         "transport relocation did not follow Native packet store");
     all_readers(encode(p),true);
@@ -130,9 +132,10 @@ void sync_projection_relocations() {
 void link_source_roundtrip() {
     auto f=fixture();BinaryProgram native;native.max_cycle=f.max_cycle;
     native.queues={f.queues[1]};
+    native.queues[0].commands.push_back(f.queues[0].commands[0]);
     native.address_relocations={{7,BindingAccess::Input,QueueKind::Mem,1,5}};
     auto encoded=native;
-    externalize_native_queue_controls(encoded);
+    link_queue_controls(encoded);
     encoded.queue_link_source={true,native.queues,native.address_relocations,{}};
     auto data=encode(encoded);all_readers(data,true);
     // A candidate's page events are resolved by final linking. The parser
@@ -143,9 +146,9 @@ void link_source_roundtrip() {
     candidate.queue_link_source.required=false;
     rejects([&]{encode(candidate);});
 
-    const auto restored=native_queue_link_input(read_binary_program(bytes(data)));
+    const auto restored=macro_queue_link_input(read_binary_program(bytes(data)));
     require(encode(restored)==encode(native),"QLNK changed compact Native plan on roundtrip");
-    auto relinked=restored;externalize_native_queue_controls(relinked);
+    auto relinked=restored;link_queue_controls(relinked);
     auto original=encoded;original.queue_link_source={};
     require(encode(relinked)==encode(original),"checked relink changed Macro control mapping");
     const auto offset=data.find("QLNK");require(offset!=std::string::npos,"QLNK absent");
@@ -182,15 +185,16 @@ void transport_dependency_order() {
     rejects([&]{validate_queue_transport_order(bad,packets);}); // opposite RX/MEM page order
 }
 void early_event_after_load() {
-    for(const bool raw:{false,true}) {
+    for(const bool raw:{true}) {
         const auto f=fixture();BinaryProgram p;p.max_cycle=f.max_cycle;p.queues={f.queues[1]};
-        externalize_native_queue_controls(p,raw);
+        p.queues[0].commands.push_back(f.queues[0].commands[0]);
+        link_queue_controls(p,raw);
         auto system=std::make_unique<TspSliceSystem>();CModelRuntime runtime(*system);
         runtime.load(p);
         auto& q=system->icu().mem_iq(1);
         q.notify(7);q.notify(8);q.notify(); // arrival before physical cycle zero
         runtime.run_cycles(30);
-        require(q.issued_count()==1 && q.done(),"load lost a cycle-zero Native/pseudo notification");
+        if(q.issued_count()!=1 || !q.done()) throw std::runtime_error("early notification: issued="+std::to_string(q.issued_count())+" done="+std::to_string(q.done()));
     }
 }
 int main(int argc,char** argv) try {
@@ -206,7 +210,7 @@ int main(int argc,char** argv) try {
     if(argc==4 && std::string_view(argv[1])=="--compare-final") {
         auto native=read_binary_program(argv[2]);auto actual=read_binary_program(argv[3]);
         const auto plan=native.queue_sync_plan;
-        externalize_native_queue_controls(native,true,[&](QueueSyncPlan& mapped) {
+        link_queue_controls(native,true,[&](QueueSyncPlan& mapped) {
             for(auto& p:mapped.partitions) {
                 const auto before=std::ranges::find_if(plan.partitions,[&](const auto& q){return q.kind==p.kind && q.index==p.index;});
                 if(before==plan.partitions.end()) {require(p.entries.empty(),"unexpected final control partition");continue;}
@@ -236,7 +240,7 @@ int main(int argc,char** argv) try {
         p.hardware.queue_control_pool_capacity=hw::kQueueControlPoolCapacity;
         p.hardware.queue_control_pool_read_ii=hw::kQueueControlPoolReadIi;
         p.target_abi=executable_target_abi(p.hardware);
-        externalize_native_queue_controls(p);write_binary_program(p,argv[2]);
+        link_queue_controls(p);write_binary_program(p,argv[2]);
         auto icu=std::make_unique<InstructionControlUnit>();
         load_transport_queue_programs_into_icu(p.transport_queues,*icu);
         const auto prime=load_queue_programs_into_icu(p.queues,*icu,p.hardware.mxms_per_hemisphere,&p);

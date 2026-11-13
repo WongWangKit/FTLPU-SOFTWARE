@@ -611,10 +611,10 @@ private:
                 if(m.address.outer_group_size!=1)throw std::runtime_error("native GDN non-affine domain");
                 direct_domain_detail::emitMem3D(rewriter_,loc,target_,start+issue.cycle,
                     issue.side*target_.memory().slices_per_hemisphere+issue.slice,
-                    m.opcode==MemIcuOpcode::Read3D?"read":"write",m.address.base_address,
+                    m.opcode==MemDomainOperation::Read?"read":"write",m.address.base_address,
                     // The public runtime uses the fixed cross-hemisphere VXM
                     // outputs. Both native halves compute identical values.
-                    m.opcode==MemIcuOpcode::Write3D && m.stream<16 ? (m.stream^8) : m.stream,
+                    m.opcode==MemDomainOperation::Write && m.stream<16 ? (m.stream^8) : m.stream,
                     m.loop.counts[0],m.loop.cycle_strides[0],m.address.inner_stride,
                     m.loop.counts[1],m.loop.cycle_strides[1],m.address.middle_stride,
                     m.loop.counts[2],m.loop.cycle_strides[2],m.address.outer_group_stride,-1,0);
@@ -698,7 +698,7 @@ private:
         int64_t inputCycle, llvm::StringRef opcode) const
     {
         static_cast<void>(destination);
-        // RUN_2D publishes the q1 result at the VXM-result source column.
+        // launch domain publishes the q1 result at the VXM-result source column.
         // MEM transport_latency below accounts for the remaining fabric
         // distance to each slice.  ADD/SUB+CAST needs five cycles from the
         // first external input; MUL+CAST needs one additional ALU cycle.
@@ -801,7 +801,7 @@ private:
             false, false, true, false, 2);
         head->setAttr("rhs_stream_source", rewriter_.getStringAttr(inputHemisphere(rhs)));
         gridVxm(head);
-        // RUN_2D schedules the entire chain at one launch cycle. Hardware
+        // launch domain schedules the entire chain at one launch cycle. Hardware
         // accounts for each ALU's latency; delaying the tail here applies
         // that latency twice and misaligns the MEM drain's tile phase.
         auto tail = create_vxm(rewriter_, op_.getLoc(), head.getResult(), op_.getKey(),

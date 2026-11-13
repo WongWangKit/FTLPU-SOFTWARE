@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import argparse
 import subprocess
 from pathlib import Path
@@ -49,24 +50,26 @@ def main() -> None:
                        'opcode = "multiply"',
                        'opcode = "add"',
                        'opcode = "reciprocal"',
-                       'lhs_stream_source = "west"',
                        'name = "depthwise_conv1d"'], "Schedule IR")
     for line in schedule.splitlines():
         if "ftlpu.schedule.vxm" in line and 'input_hemisphere = "east"' not in line:
             raise AssertionError("increasing Conv1D VALU chain must propagate east")
     vxm_ops = [line for line in schedule.splitlines()
                if "ftlpu.schedule.vxm" in line]
-    if len(vxm_ops) != 16 or any('opcode = "pass"' in line for line in vxm_ops):
-        raise AssertionError("Conv1D must use zero fill, one reduction tree and six-stage SiLU without an ALU input copy")
-    if sum('opcode = "cast"' in line for line in vxm_ops) != 3:
-        raise AssertionError("only zero fill, convolution and SiLU result casts should remain")
-    mem_ops = [line for line in schedule.splitlines()
-               if "ftlpu.schedule.mem_transfer" in line]
-    if len(mem_ops) != 44:
-        raise AssertionError("Conv1D introduced extra intermediate MEM transfers")
-    require(schedule, ['opcode = "write_tap"'], "non-consuming replication")
-    require(tensor, ['slices = [34, 35, 36, 37, 38, 39, 40, 41]'],
-            "replicated causal input")
+    # Kernel=4, causal seq32: the first three tokens have 1, 2 and 3
+    # valid taps, followed by 29 complete four-tap reductions.
+    def repeat_count(line):
+        return int(re.search(r"repeat_count = (\d+)", line).group(1))
+    products = [line for line in vxm_ops if 'chain_depth = 2' in line
+                and 'opcode = "multiply"' in line]
+    reductions = [line for line in vxm_ops if 'chain_depth = 2' in line
+                  and 'opcode = "add"' in line]
+    if sum(map(repeat_count, products)) != 122 or sum(map(repeat_count, reductions)) != 122:
+        raise AssertionError("Conv1D lost a valid causal tap")
+    if sum('accumulator_reset = true' in line for line in reductions) != 32:
+        raise AssertionError("Conv1D must reset its accumulator once per token")
+    require(schedule, ['rhs_kind = "original"', 'chain_depth = 8'],
+            "SiLU must retain the input within the VXM chain")
     if 'opcode = "fma"' in schedule or 'opcode = "fms"' in schedule:
         raise AssertionError("depthwise schedule still contains fused VXM opcodes")
     if "depthwise_conv1d_task" in schedule:
@@ -76,8 +79,8 @@ def main() -> None:
 
     command = run(args.tool, args.input, args.output_dir / "conv.command.mlir",
                   "ftlpu-stablehlo-to-commands")
-    require(command, ["ftlpu.command.mem_3d",
-                      "ftlpu.command.vxm_run_2d",
+    require(command, ["ftlpu.command.macro",
+                      "ftlpu.command.vxm",
                       'name = "depthwise_conv1d"'], "Command IR")
     if "depthwise_conv1d_task" in command:
         raise AssertionError("depthwise task survived command lowering")

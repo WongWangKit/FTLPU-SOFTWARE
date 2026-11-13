@@ -175,7 +175,7 @@ def validate_paged_weights(tensor: str, target_config: Path,
     for weight in weights:
         if int(weight["count"]) <= 0:
             raise AssertionError(f"weight placement is empty: {weight}")
-        if (mxm_execution != "vector"
+        if (mxm_execution != "ws"
                 and weight["bank"] != weight_bank):
             raise AssertionError(
                 f"weight is in bank {weight['bank']}, expected {weight_bank}")
@@ -183,7 +183,7 @@ def validate_paged_weights(tensor: str, target_config: Path,
             raise AssertionError(
                 f"weight placement exceeds {bank_rows} rows: {weight}")
 
-    if mxm_execution != "vector":
+    if mxm_execution != "ws":
         for index, lhs in enumerate(weights):
             lhs_slices = set(lhs["slices"])
             lhs_end = int(lhs["base"]) + int(lhs["count"])
@@ -214,7 +214,7 @@ def validate_paged_weights(tensor: str, target_config: Path,
         "rope_staging", "rope_product", "context",
         "output_activation", "result",
     )
-    if mxm_execution != "vector":
+    if mxm_execution != "ws":
         for name in attention_workspaces:
             matches = re.findall(rf"\b{name} = \{{([^{{}}]+)\}}", tensor)
             for body in matches:
@@ -266,7 +266,7 @@ def validate_paged_weights(tensor: str, target_config: Path,
             section = section.split(f"], {end_marker}", 1)[0]
             for body in re.findall(r"placement = \{([^{}]+)\}", section):
                 placement = parse_placement(body)
-                if (mxm_execution != "vector"
+                if (mxm_execution != "ws"
                         and placement["bank"] != working_bank):
                     raise AssertionError(
                         f"RMSNorm {section_name} is in weight bank: "
@@ -281,8 +281,8 @@ def main() -> None:
     parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--weight-bank", type=int)
-    parser.add_argument("--mxm-execution", choices=("vector",),
-                        default="vector")
+    parser.add_argument("--mxm-execution", choices=("ws",),
+                        default="ws")
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--kv-cache-capacity", type=int, default=0)
     args = parser.parse_args()
@@ -340,7 +340,7 @@ def main() -> None:
             raise AssertionError(
                 f"RMSNorm scratch and gamma are not distributed16: {line}"
             )
-    if args.mxm_execution == "vector":
+    if args.mxm_execution == "ws":
         validate_attention_output_allocation(tensor)
     if args.weight_bank is not None:
         validate_paged_weights(tensor, args.target_config, args.weight_bank,

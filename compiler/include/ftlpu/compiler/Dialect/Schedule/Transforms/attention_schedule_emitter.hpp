@@ -23,6 +23,9 @@ public:
         bool projectionRopeOverlapEnabled);
 
     mlir::FailureOr<mlir::Value> emit(int64_t outputIndex);
+    // Q, K and V already occupy the native dense input placements. Emit
+    // only QK, softmax, probability transpose and PV, returning context.
+    mlir::FailureOr<mlir::Value> emitCore(int64_t outputIndex);
 
 private:
     int64_t emitProjections();
@@ -30,6 +33,7 @@ private:
         int64_t qkIwToComputeCycles, bool fusedSoftmax);
     int64_t emitSoftmax(int64_t qkStart, int64_t qkEnd,
         bool fusedSoftmax);
+    bool usesStreamingProbabilityTranspose() const;
     int64_t emitProbabilityTranspose(int64_t packEnd);
     int64_t emitPv(int64_t transposeEnd);
     int64_t emitOutputGate(int64_t start);

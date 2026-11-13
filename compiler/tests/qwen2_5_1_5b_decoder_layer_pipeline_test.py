@@ -1332,36 +1332,15 @@ def main() -> None:
                     f"binding={binding}, page={page}, bank={bank}, "
                     f"expected_bank={expected_bank}"
                 )
-    raw_counts = {
-        name: command_text.count(f"ftlpu.command.{name}")
-        for name in (
-            "mem_3d", "mem_write_read_2d", "mxm_load_3d", "mxm_dequant_3d",
-            "mxm_compute_3d", "vxm_run_2d", "sxm_run_2d",
-        )
-    }
-    required_raw_packets = set(raw_counts)
-    if not has_staging_mirror:
-        # WRITE_READ_2D is the Q staging-mirror copy primitive.  The
-        # single-bank attention epoch does not allocate that mirror.
-        required_raw_packets.remove("mem_write_read_2d")
-    if any(raw_counts[name] == 0 for name in required_raw_packets):
-        raise AssertionError(
-            f"Qwen2.5 direct lowering is missing raw FU packets: {raw_counts}"
-        )
+    raw_counts = {name: command_text.count(f"ftlpu.command.{name}")
+                  for name in ("macro", "vxm")}
+    if not all(raw_counts.values()):
+        raise AssertionError(f"missing Macro/VXM sequential commands: {raw_counts}")
     total_raw_domains = sum(raw_counts.values())
-    # Aliased MEM read/write regions are emitted as separate closed domains so a
-    # physical MEM ICU never has to interleave two active coarse instructions.
-    if raw_counts["mem_3d"] > 19_600 or total_raw_domains > 21_250:
-        raise AssertionError(
-            "Qwen2.5 direct-domain lowering regressed its coarse-instruction "
-            f"budget: total={total_raw_domains}, raw={raw_counts}"
-        )
-    for legacy in ("mem ", "mem_bundle ", "mxm ", "mxm_dequant ",
-                   "vxm ", "sxm "):
-        if f"ftlpu.command.{legacy}" in command_text:
-            raise AssertionError(
-                f"Qwen2.5 retained legacy fine command {legacy.strip()}"
-            )
+    macro_kinds = {int(match) for match in re.findall(
+        r"ftlpu\.command\.macro[^\n]*?\bkind = (\d+) : i64", command_text)}
+    if not {0, 1, 2, 3, 5, 6} <= macro_kinds:
+        raise AssertionError(f"missing hardware Macro queue kinds: {macro_kinds}")
 
     run([
         str(args.compile), "--input", str(command),

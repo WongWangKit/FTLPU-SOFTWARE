@@ -16,6 +16,8 @@ struct AttentionTaskGraph
           stream::RopeTaskOp, stream::BatchMatmulTaskOp,
           stream::SoftmaxTaskOp, stream::TransposeTaskOp, stream::SigmoidMultiplyTaskOp> {
     mlir::DictionaryAttr getMemoryPlan() const {
+        if (core)
+            return core->getAttrOfType<mlir::DictionaryAttr>("memory_plan");
         auto op = output;
         return *op.getMemoryPlan();
     }

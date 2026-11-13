@@ -27,6 +27,9 @@ from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'compiler/tools'))
+from model_test_outputs import OutputContract, TestOutput
+
+ATTENTION_SUITES = ('attention-prefill', 'attention-decode')
 
 DENSE = {
     'llama3_2_1b': 'Llama-3.2-1B', 'ministral3_3b': 'Ministral-3-3B',
@@ -43,12 +46,13 @@ CATALOG = {
     **{name: dict(label=label, suites=('prefill', 'official', 'compile'),
                   scope='full-size nonzero-Q/K synthetic / official layer0 seq32')
        for name, label in DENSE.items()},
-    'glm4_9b': dict(label='GLM-4-9B', suites=('prefill', 'official'),
+    'glm4_9b': dict(label='GLM-4-9B', suites=('prefill', 'official', 'decode', *ATTENTION_SUITES),
                    scope='official full-size layer0 seq32; partial RoPE, QKV bias, attention and FFN; W8A16'),
     'deepseek_native': dict(label='Native DeepSeek', suites=(), scope='not integrated into ICU/FU model tests'),
     'glm5_native': dict(label='Native GLM-5', suites=(), scope='not integrated; GLM-Edge coverage does not cover GLM-5'),
 }
 TOOL_NAMES = {'opt': ('compiler', 'ftlpu_opt'), 'compile': ('compiler', 'ftlpu-compile'),
+              'graph': ('compiler', 'ftlpu-graph-compile'),
               'export': ('runtime', 'ftlpu_icu_program_export'),
               'dense': ('runtime', 'hf_decoder_layer_model_session_test'),
               'qwen2': ('runtime', 'compiled_qwen2_5_1_5b_decoder_layer_seq32_runtime_test'),
@@ -57,6 +61,7 @@ TOOL_NAMES = {'opt': ('compiler', 'ftlpu_opt'), 'compile': ('compiler', 'ftlpu-c
               'stage': ('runtime', 'compiled_stage_file_runner')}
 BUILD_TARGETS = {key: name.replace('ftlpu-compile', 'ftlpu_compile')
                  for key, (_, name) in TOOL_NAMES.items()}
+BUILD_TARGETS['graph'] = 'ftlpu_graph_compile'
 
 
 def read_cache(build):
@@ -86,8 +91,11 @@ def executable(build, config, key):
 
 def tool_keys(model, suite, pipeline=True):
     keys = {'compile'}
+    if model == 'glm4_9b' and (suite in ATTENTION_SUITES or suite == 'decode'):
+        return keys | {'graph', 'stage', 'export'}
     if model == 'qwen3_5_0_8b':
         keys.add('opt')
+        keys.add('graph')
         if suite != 'compile': keys.add('stage')
     elif model.startswith('qwen'):
         if suite == 'decode': keys.update(('opt', 'decode', 'export'))
@@ -106,6 +114,10 @@ def result_directory(a, model):
     if model == 'qwen3_5_0_8b' and a.suite in ('official', 'prefill'):
         return ROOT / 'results/qwen3_5_0_8b_decoder_layer_prefill/continuous'
     if model == 'glm4_9b':
+        if a.suite in ATTENTION_SUITES:
+            return ROOT / 'results' / ('glm4_9b_' + a.suite.replace('attention-', '') + '_attention_comparison')
+        if a.suite == 'decode':
+            return ROOT/'results/glm4_9b_decoder_layer_decode'
         return ROOT / 'results/glm4_9b_decoder_layer_prefill'
     return ROOT / 'results/model_tests' / model / a.suite
 
@@ -129,7 +141,34 @@ def selected_models(a):
 
 
 def needs_checkpoint(model, suite):
-    return suite == 'official' or (model in ('qwen3_5_0_8b', 'glm4_9b') and suite == 'prefill')
+    return (suite == 'official' or (model in ('qwen3_5_0_8b', 'glm4_9b') and suite == 'prefill')
+            or (model == 'glm4_9b' and suite in ('decode', 'attention-decode')))
+
+
+def output_contract(model, suite):
+    if suite in ATTENTION_SUITES:
+        outputs = [TestOutput('context', 'diagnostic')]
+        if suite == 'attention-decode':
+            outputs += [TestOutput('key_cache', 'persistent_state'), TestOutput('value_cache', 'persistent_state')]
+        return OutputContract(*outputs).describe()
+    states = ['recurrent_state', 'conv_state'] if model == 'qwen3_5_0_8b' else ['key_cache', 'value_cache']
+    return dict(version=1, policy='required', result=['hidden'], persistent_state=states,
+                diagnostic_intermediates=[],
+                boundary='decoder layer; final hidden and persistent states are required',
+                handoffs=['Q/K/V', 'context'] if model == 'glm4_9b' and suite == 'decode' else [],
+                implementation='ModelPackage external_output/state bindings' if model != 'qwen3_5_0_8b'
+                               else 'logical graph results: hidden, recurrent_state, conv_state')
+
+
+def case_scope(model, suite):
+    if suite in ATTENTION_SUITES:
+        return ('GLM-4-9B attention core QK/softmax/PV; existing device-produced QKV fixture; '
+                + ('seq32 causal prefill, no new KV' if suite == 'attention-prefill'
+                   else 'past32 decode1, independent batch histories and KV append')
+                + '; excludes projection, residual and FFN execution')
+    if model == 'glm4_9b' and suite == 'decode':
+        return 'GLM-4-9B W8A16 decoder layer0; past32 decode1; projections, attention and tail in three invocations'
+    return CATALOG[model]['scope']
 
 
 def check_environment(a, models, *, check_binaries=True):
@@ -151,6 +190,10 @@ def check_environment(a, models, *, check_binaries=True):
     if a.download and importlib.util.find_spec('requests') is None:
         issues.append('Missing Python dependency: requests; python -m pip install requests')
     for model in models:
+        if a.suite in ATTENTION_SUITES:
+            fixture = getattr(a, 'fixture', None) or ROOT/('results/glm4_9b_prefill_attention_comparison/projections/fixture.npz'
+                if a.suite == 'attention-prefill' else 'results/glm4_9b_decoder_layer_decode_flash')
+            if not fixture.exists(): issues.append(f'Missing verified attention fixture: {fixture}')
         if check_binaries:
             for key in sorted(tool_keys(model, a.suite, not a.no_pipeline)):
                 path = executable(a.build_dir, a.config, key)
@@ -167,7 +210,7 @@ def clean_environment(temp):
     # Prevent diagnostic flags from turning a numerical run into link-only,
     # partial execution, direct uploads, or disabled validation.
     for key in list(environment):
-        if key.startswith(('FTLPU_SESSION_', 'FTLPU_QWEN_', 'FTLPU_DENSE_', 'FTLPU_SKIP_QWEN_', 'FTLPU_DDR_')):
+        if key.startswith(('FTLPU_SESSION_', 'FTLPU_QWEN_', 'FTLPU_DENSE_', 'FTLPU_SKIP_QWEN_', 'FTLPU_DDR_', 'FTLPU_FILE_RUNNER_')):
             environment.pop(key)
     environment.update(TEMP=str(temp), TMP=str(temp), PYTHONDONTWRITEBYTECODE='1', FTLPU_SESSION_PROGRESS='1')
     return environment
@@ -185,7 +228,28 @@ def commands(a, model, out, work):
         if not all((checkpoint / f).is_file() for f in ('config.json', 'model.safetensors', 'provenance.json')):
             phases.append(('download', python + [str(ROOT/'compiler/tools/download_official_dense_layer.py'),
                 '--model', model, '--output-dir', str(checkpoint)]))
-    if model == 'qwen3_5_0_8b':
+    if model == 'glm4_9b' and a.suite in ATTENTION_SUITES:
+        common = ['--build-dir', str(a.build_dir), '--target-config', str(a.target_config)]
+        if a.suite == 'attention-prefill':
+            fixture = getattr(a, 'fixture', None) or ROOT/'results/glm4_9b_prefill_attention_comparison/projections/fixture.npz'
+            phases.append(('attention', python + [str(ROOT/'compiler/tests/glm4_prefill_attention_test.py'),
+                *common, '--output-dir', str(out), '--fixture', str(fixture)]))
+        else:
+            fixture = getattr(a, 'fixture', None) or ROOT/'results/glm4_9b_decoder_layer_decode_flash'
+            phases.append(('attention', python + [str(ROOT/'compiler/tests/glm4_attention_comparison_test.py'),
+                *common, '--checkpoint', str(checkpoint_directory(a, model)), '--flash-results', str(fixture),
+                '--output-dir', str(out/'dense'), '--executed-flash-results', str(out/'flash'),
+                '--batches', *map(str, getattr(a, 'batches', [1, 32]))]))
+    elif model == 'glm4_9b' and a.suite == 'decode':
+        package = work/'golden'
+        phases.append(('import', python + [str(ROOT/'compiler/tools/import_hf_decoder_layer.py'),
+            '--model-dir', str(checkpoint_directory(a, model)), '--output-dir', str(package), '--seq-len', '32']))
+        phases.append(('decode', python + [str(ROOT/'compiler/tests/glm4_decode_test.py'),
+            '--checkpoint', str(checkpoint_directory(a, model)), '--imported', str(package),
+            '--build-dir', str(a.build_dir), '--target-config', str(a.target_config), '--output-dir', str(out),
+            '--batches', *map(str, getattr(a, 'batches', [1, 32])), '--past-len', '32',
+            '--attention-strategy', getattr(a, 'attention_strategy', 'dense')]))
+    elif model == 'qwen3_5_0_8b':
         package = work / 'golden'
         if needs_checkpoint(model, a.suite):
             phases.append(('import', python + [str(ROOT/'compiler/tools/import_hf_qwen3_5_layer.py'),
@@ -208,6 +272,7 @@ def commands(a, model, out, work):
             phases.append(('compile', [compiler, '--input',str(source),
                 '--output',str(out/'decoder_layer.ftlpu'),'--target-config',str(a.target_config),
                 '--weight-bank','1','--kv-cache-capacity','256',
+                '--icu-compression','raw-macro',
                 '--mxm-execution','vector','--ffn-schedule','fused','--attention-schedule','tail',
                 '--projection-rope-overlap',a.projection_rope_overlap]))
             if a.suite != 'compile':
@@ -275,23 +340,65 @@ def write_json(path, value):
             time.sleep(0.1)
 
 
+def collect_graph_cases(a, out):
+    """Only accept the requested fresh cases, including runtime artifacts."""
+    if a.suite == 'attention-prefill':
+        paths = [out/strategy for strategy in ('dense', 'flash')]
+    elif a.suite == 'attention-decode':
+        paths = [out/strategy/f'batch{b}' for strategy in ('dense', 'flash') for b in a.batches]
+    else:
+        paths = [out/f'batch{b}' for b in a.batches]
+    cases = []
+    for directory in paths:
+        record = json.loads((directory/'result.json').read_text())
+        if record.get('status') != 'passed':
+            raise RuntimeError(f'numerical case failed: {directory}')
+        if a.suite in ATTENTION_SUITES:
+            runtime = directory if a.suite == 'attention-prefill' else directory/'attention'
+            policy = json.loads((runtime/'output_contract.json').read_text())
+            if policy['status'] != 'executed' or policy['external_output_indices'] != (
+                    [] if a.suite == 'attention-prefill' else [1, 2]):
+                raise RuntimeError(f'required output contract was not executed: {runtime}')
+            required = [runtime, runtime/'diagnostic']
+            phase = record['phase']
+            metrics = record['context_metrics']
+        else:
+            required = [directory/name for name in ('projections', 'attention', 'tail')]
+            phase, metrics = None, record['metrics']
+        for runtime in required:
+            for name in ('runtime.pipeline.csv', 'actual.runtime.ftlpu', 'icu_programs/index.csv'):
+                if not (runtime/name).is_file():
+                    raise RuntimeError(f'missing actual execution artifact: {runtime/name}')
+        cases.append(dict(directory=str(directory.relative_to(out)), metrics=metrics, phase=phase,
+            runtime_cycles=record.get('runtime_cycles'),
+            pipeline_csv=[str((r/'runtime.pipeline.csv').relative_to(out)) for r in required],
+            icu_programs=[str((r/'icu_programs').relative_to(out)) for r in required]))
+    return cases
+
+
 def run_case(a, model):
     out = result_directory(a, model).resolve()
     work = (ROOT/'tmp/model_tests'/model).resolve()
     plan = commands(a, model, out, work)
     if a.dry_run:
-        print(f'[{model}/{a.suite}] {CATALOG[model]["scope"]}\n  results: {out}')
+        print(f'[{model}/{a.suite}] {case_scope(model,a.suite)}\n  results: {out}')
+        print('  output contract: '+json.dumps(output_contract(model, a.suite), ensure_ascii=False))
         for phase, command in plan: print(f'  [{phase}] '+subprocess.list2cmdline(command))
         return dict(model=model,suite=a.suite,status='planned',results=str(out))
     out.mkdir(parents=True,exist_ok=True); work.mkdir(parents=True,exist_ok=True)
     temp = ROOT/'tmp/model_tests/_temp'; temp.mkdir(parents=True,exist_ok=True)
     env = clean_environment(temp)
     official = needs_checkpoint(model,a.suite)
-    report = dict(model=model,suite=a.suite,status='running',scope=CATALOG[model]['scope'],
-        weights='official_w8a16' if official else ('synthetic_mini' if model=='qwen3_5_0_8b' else 'synthetic_full_shape'),
+    report = dict(model=model,suite=a.suite,status='running',scope=case_scope(model,a.suite),
+        weights='device_projection_fixture_w8a16' if a.suite in ATTENTION_SUITES else
+                ('official_w8a16' if official else ('synthetic_mini' if model=='qwen3_5_0_8b' else 'synthetic_full_shape')),
         runtime_attempted=False,runtime_executed=False,numeric_passed=False,started_at=datetime.now(timezone.utc).isoformat(),
-        target_config=str(a.target_config),target_sha256=digest(a.target_config),phases=[],artifacts={},results=str(out))
+        target_config=str(a.target_config),target_sha256=digest(a.target_config),phases=[],artifacts={},results=str(out),
+        output_contract=output_contract(model, a.suite),
+        entry_sha256=digest(Path(__file__)),
+        output_contract_helper_sha256=digest(Path(__file__).resolve().parents[1]/'compiler/tools/model_test_outputs.py'))
     path = out/'runner.json'; write_json(path,report)
+    write_json(out/'output_contract.json', report['output_contract'])
     for filename in ('runtime.pipeline.csv','pipeline.csv','pipeline.html','linked.ftlpu',
                      'decoder.linked.ftlpu','resident.runtime.ftlpu','summary.json','result.json','run.json',
                      'decoder_layer.stream.mlir','decoder_layer.schedule.mlir','decoder_layer.command.mlir'):
@@ -313,9 +420,9 @@ def run_case(a, model):
     try:
         for phase, command in plan:
             print(f'[{model}/{a.suite}: {phase}]',flush=True)
-            if official and phase in ('import','official'):
+            if official and phase in ('import','official','attention'):
                 report['checkpoint_provenance'] = validate_checkpoint(a,model)
-            if phase in ('cmodel','decode','synthetic','official','resident') and a.suite != 'compile':
+            if phase in ('cmodel','decode','synthetic','official','resident','attention') and a.suite != 'compile':
                 report['runtime_attempted'] = True
             start = time.monotonic(); code = execute(command,out/(phase+'.runner.log'),env)
             report['phases'].append(dict(phase=phase,command=command,returncode=code,wall_seconds=time.monotonic()-start))
@@ -349,9 +456,12 @@ def run_case(a, model):
                     report['native_report']=native_name
                     report['metrics']=value.get('hardware_vs_quantized_reference',value.get('max_abs_errors',{}))
                     if value.get('status')!='passed': raise RuntimeError(f'{native_name} did not report numerical success')
+            if model == 'glm4_9b' and (a.suite in ATTENTION_SUITES or a.suite == 'decode'):
+                report['cases'] = collect_graph_cases(a, out)
+                report['artifacts']['case_directories'] = [c['directory'] for c in report['cases']]
             report['numeric_passed'] = report['runtime_executed']
             report['status'] = 'passed' if report['numeric_passed'] else 'compiled'
-            if not a.no_pipeline and a.suite!='compile':
+            if not (model == 'glm4_9b' and (a.suite in ATTENTION_SUITES or a.suite == 'decode')) and not a.no_pipeline and a.suite!='compile':
                 trace=out/('pipeline.csv' if a.suite=='decode' else 'runtime.pipeline.csv')
                 if not trace.is_file(): raise RuntimeError('Runtime succeeded but requested pipeline CSV is missing')
                 from run_dense_pipelines import embedded_viewer
@@ -383,7 +493,10 @@ def main(argv=None):
     selection=parser.add_mutually_exclusive_group()
     selection.add_argument('--model',nargs='+',help='Model IDs from list; default qwen2_5_1_5b')
     selection.add_argument('--all',action='store_true',help='Select all models supporting this suite')
-    parser.add_argument('--suite',choices=('prefill','decode','official','smoke','compile'),default='prefill')
+    parser.add_argument('--suite',choices=('prefill','decode','official','smoke','compile',*ATTENTION_SUITES),default='prefill')
+    parser.add_argument('--batches',type=int,nargs='+',choices=(1,32),default=[1,32],help='GLM decode; past_len=32, one new token per request')
+    parser.add_argument('--attention-strategy',choices=('dense','flash'),default='dense',help='GLM full decoder decode strategy; attention comparison always runs both')
+    parser.add_argument('--fixture',type=Path,help='Attention-only: verified prefill fixture.npz or decode fixture root')
     parser.add_argument('--build-dir',type=Path,default=default_build())
     parser.add_argument('--config',default='Release')
     parser.add_argument('--target-config',type=Path)
@@ -405,7 +518,7 @@ def main(argv=None):
     a.build_dir=a.build_dir.resolve()
     cache=read_cache(a.build_dir)
     a.target_config=(a.target_config or Path(cache.get('FTLPU_HARDWARE_CONFIG',str(ROOT.parent/'FTLPU-CMODEL/config/ftlpu-lpu32.json')))).resolve()
-    for name in ('output_root','checkpoint_root','checkpoint'):
+    for name in ('output_root','checkpoint_root','checkpoint','fixture'):
         if getattr(a,name): setattr(a,name,getattr(a,name).resolve())
     try:
         models=selected_models(a)

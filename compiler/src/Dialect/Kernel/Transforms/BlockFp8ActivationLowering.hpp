@@ -11,12 +11,15 @@ namespace ftlpu::compiler::kernel {
 // Both operators share a group scale. The QDQ result carries its dequantized
 // BF16 values; byte-valued E4M3FN/E8M0 results require separate lowering.
 inline void expandBlockFp8Arithmetic(mlir::Operation* op, mlir::Value x,
-                                    bool qdq, mlir::IRRewriter& rewriter)
+                                    bool qdq, mlir::IRRewriter& rewriter,
+                                    bool groupsInColumns = false)
 {
     rewriter.setInsertionPoint(op);
     const auto inputType = llvm::cast<mlir::RankedTensorType>(x.getType());
-    const auto rowType = mlir::RankedTensorType::get({inputType.getDimSize(0), 1},
-                                                     rewriter.getF32Type());
+    const auto rowType = mlir::RankedTensorType::get(
+        groupsInColumns ? llvm::SmallVector<int64_t>{1,inputType.getDimSize(1)}
+                        : llvm::SmallVector<int64_t>{inputType.getDimSize(0),1},
+        rewriter.getF32Type());
     const auto alu = [&](llvm::StringRef kind, mlir::Value lhs, mlir::Value rhs,
                          float immediate, mlir::Type type, bool reduce = false) {
         mlir::OperationState state(op->getLoc(), VectorAluOp::getOperationName());
@@ -27,8 +30,13 @@ inline void expandBlockFp8Arithmetic(mlir::Operation* op, mlir::Value x,
         state.addAttribute("immediate", rewriter.getF32FloatAttr(immediate));
         state.addAttribute("reduce", rewriter.getBoolAttr(reduce));
         state.addAttribute("ftlpu.vector_require_fp32", rewriter.getUnitAttr());
-        if (reduce)
+        if (reduce) {
             state.addAttribute("reduction_kind", rewriter.getStringAttr("max"));
+            if (groupsInColumns) {
+                state.addAttribute("reduction_axis", rewriter.getI64IntegerAttr(0));
+                state.addAttribute("reduction_seed_first", rewriter.getBoolAttr(true));
+            }
+        }
         if (const auto region = op->getAttr("ftlpu.logical_region"))
             state.addAttribute("ftlpu.logical_region", region);
         return rewriter.create(state)->getResult(0);
@@ -59,7 +67,8 @@ inline void expandBlockFp8Arithmetic(mlir::Operation* op, mlir::Value x,
 
     const auto negated = alu("negate", x, {}, 0.f, x.getType());
     const auto absolute = alu("max", x, negated, 0.f, x.getType());
-    auto maximum = alu("max", absolute, {}, 0.f, rowType, true);
+    auto maximum = alu(groupsInColumns?"multiply":"max", absolute, {},
+                       groupsInColumns?1.f:0.f, rowType, true);
 
     // The 1e-4 floor gives a minimum scale of 2^-22. Finite BF16 values
     // need at most 2^120. At each candidate exponent, a strict comparison

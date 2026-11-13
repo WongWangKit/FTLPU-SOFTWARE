@@ -385,10 +385,15 @@ struct MxmMacroRecord {
     IcuMacroSchedule schedule{};
 };
 
+bool is_sxm_macro_kind(QueueKind kind)
+{
+    return kind == QueueKind::SxmTranspose || kind == QueueKind::SxmPermute;
+}
+
 bool is_mxm_macro_kind(QueueKind kind)
 {
     return kind == QueueKind::MxmLoad || kind == QueueKind::MxmCompute ||
-           kind == QueueKind::MxmDequant;
+           kind == QueueKind::MxmDequant || is_sxm_macro_kind(kind);
 }
 
 bool is_decode_load(const MxmControlInstruction& instruction)
@@ -733,6 +738,130 @@ QueueCommand make_mxm_command(const MxmMacroRecord& record, QueueKind kind)
     return encode_macro_schedule_command(std::move(command), record.schedule);
 }
 
+MxmMacroBitstream encode_sxm_macro_bitstream(const QueueProgram& queue)
+{
+    MxmMacroBitstream image;
+    image.kind=queue.kind;
+    image.command_count=static_cast<std::uint32_t>(queue.commands.size());
+    image.stats.command_count=image.command_count;
+    if (queue.commands.empty()) return image;
+    const bool transpose=queue.kind==QueueKind::SxmTranspose;
+    std::vector<std::pair<SxmInstruction,IcuMacroSchedule>> records;
+    std::map<std::uint32_t,std::size_t> frequencies;
+    std::uint64_t previous=0, previousEnd=0;
+    for (const auto& command:queue.commands) {
+        auto schedule=decode_macro_schedule_command(command);
+        auto instruction=decode_sxm_command(command);
+        if (transpose) (void)IcuSxmActiveMacroContextCodec<true>::pack_initial(schedule,instruction);
+        else (void)IcuSxmActiveMacroContextCodec<false>::pack_initial(schedule,instruction);
+        if (!records.empty()) {
+            if (schedule.start_cycle<=previousEnd) throw std::invalid_argument("SXM Macro executions overlap");
+            ++frequencies[static_cast<std::uint32_t>(schedule.start_cycle-previous)];
+        }
+        previous=schedule.start_cycle;
+        previousEnd=previous+(schedule.inner_count-1)*schedule.inner_interval+(schedule.outer_count-1)*schedule.outer_interval;
+        records.emplace_back(std::move(instruction),schedule);
+    }
+    std::vector<std::pair<std::uint32_t,std::size_t>> common(frequencies.begin(),frequencies.end());
+    std::stable_sort(common.begin(),common.end(),[](auto a,auto b){return a.second>b.second;});
+    for (const auto& [delta,count]:common) {
+        if (image.delta_count==image.deltas.size()) break;
+        if (fits_unsigned(delta,kCompactStartDeltaBits)) image.deltas[image.delta_count++]={delta,0};
+    }
+    BitWriter writer;
+    writer.bits(records.front().second.start_cycle,32);
+    const auto same=[](const auto& a,const auto& b) {
+        const auto& x=a.second; const auto& y=b.second;
+        return encode_sxm_command(a.first).words==encode_sxm_command(b.first).words
+            && encode_sxm_command(a.first).extension_words==encode_sxm_command(b.first).extension_words
+            && x.inner_count==y.inner_count && x.inner_interval==y.inner_interval
+            && x.outer_count==y.outer_count && x.outer_interval==y.outer_interval;
+    };
+    for (std::size_t i=0;i<records.size();) {
+        std::size_t end=i+1;
+        while(end<records.size() && end-i<65536 && same(records[i],records[end])) ++end;
+        writer.bit(end-i>1); if(end-i>1) writer.bits(end-i-1,16);
+        const auto& [instruction,schedule]=records[i];
+        MacroRecord shapeRecord{MemInstruction::Read(0,0),schedule};
+        shapeRecord.schedule.induction_target=IcuInductionTarget::MemAddress;
+        const bool compact=compact_template(shapeRecord);
+        writer.bit(!compact);
+        const auto shape=shape_of(schedule);
+        if(compact) writer.bits(static_cast<unsigned>(shape),2);
+        isa::write_sxm_macro_native(instruction,transpose,[&](auto value,unsigned width){writer.bits(value,width);});
+        if(!compact) {
+            writer.bits(schedule.inner_count,32);writer.bits(schedule.inner_interval,32);writer.bits(0,32);
+            writer.bits(schedule.outer_count,32);writer.bits(schedule.outer_interval,32);writer.bits(0,32);writer.bits(0,2);
+            ++image.stats.extended_template_runs;
+        } else {
+            if(shape==Shape::Inner1D || shape==Shape::Full2D) {
+                writer.bits(schedule.inner_count-1,11);writer.bits(schedule.inner_interval-1,8);writer.bits(0,10);
+            }
+            if(shape==Shape::Outer1D || shape==Shape::Full2D) {
+                writer.bits(schedule.outer_count-1,9);
+                writer.bits(schedule.outer_interval-(schedule.inner_count-1)*schedule.inner_interval-1,15);writer.bits(0,12);
+            }
+            ++image.stats.compact_template_runs;
+        }
+        for(std::size_t j=i;j<end;++j) if(j) write_mxm_delta(writer,
+            {static_cast<std::uint32_t>(records[j].second.start_cycle-records[j-1].second.start_cycle),0},image,image.stats);
+        ++image.stats.run_count;i=end;
+    }
+    image.bit_count=writer.size();image.bytes=writer.take();image.stats.stream_bits=image.bit_count;
+    image.stats.dictionary_bits=image.delta_count*36;
+    return image;
+}
+
+QueueProgram decode_sxm_macro_bitstream(const MxmMacroBitstream& image,std::size_t index)
+{
+    if(image.version!=1 || image.delta_count>image.deltas.size()) throw std::invalid_argument("invalid SXM Macro image");
+    QueueProgram queue{image.kind,index,{}};
+    if(!image.command_count) {
+        if(image.bit_count || image.delta_count) throw std::invalid_argument("empty SXM Macro has payload");
+        return queue;
+    }
+    BitReader reader(image.bytes,image.bit_count);
+    std::uint64_t cycle=reader.bits(32);
+    const bool transpose=image.kind==QueueKind::SxmTranspose;
+    while(queue.commands.size()<image.command_count) {
+        const auto count=reader.bit()?reader.bits(16)+1:1;
+        if(count>image.command_count-queue.commands.size()) throw std::runtime_error("SXM Macro run exceeds image");
+        const bool extended=reader.bit();
+        const auto shape=extended?Shape::Single:static_cast<Shape>(reader.bits(2));
+        auto instruction=isa::read_sxm_macro_native(transpose,[&](unsigned width){return reader.bits(width);});
+        IcuMacroSchedule schedule{};
+        if(extended) {
+            schedule.inner_count=reader.bits(32);schedule.inner_interval=reader.bits(32);
+            schedule.inner_stride=static_cast<std::int32_t>(reader.bits(32));
+            schedule.outer_count=reader.bits(32);schedule.outer_interval=reader.bits(32);
+            schedule.outer_stride=static_cast<std::int32_t>(reader.bits(32));
+            schedule.induction_target=static_cast<IcuInductionTarget>(reader.bits(2));
+        } else {
+            if(shape==Shape::Inner1D || shape==Shape::Full2D) {
+                schedule.inner_count=reader.bits(11)+1;schedule.inner_interval=reader.bits(8)+1;
+                schedule.inner_stride=read_signed(reader,10);
+            }
+            if(shape==Shape::Outer1D || shape==Shape::Full2D) {
+                schedule.outer_count=reader.bits(9)+1;schedule.outer_interval=reader.bits(15)+1
+                    +(schedule.inner_count-1)*schedule.inner_interval;schedule.outer_stride=read_signed(reader,12);
+            }
+        }
+        for(std::size_t i=0;i<count;++i) {
+            if(!queue.commands.empty()) {
+                auto delta=read_mxm_delta(reader,image);
+                if(delta.operand) throw std::runtime_error("SXM Macro operand delta must be zero");
+                cycle+=delta.start_cycle;
+            }
+            schedule.start_cycle=cycle;
+            if(transpose) (void)IcuSxmActiveMacroContextCodec<true>::pack_initial(schedule,instruction);
+            else (void)IcuSxmActiveMacroContextCodec<false>::pack_initial(schedule,instruction);
+            queue.commands.push_back(encode_macro_schedule_command(encode_sxm_command(instruction),schedule));
+        }
+    }
+    if(reader.remaining()) throw std::runtime_error("SXM Macro image has trailing bits");
+    return queue;
+}
+
 } // namespace
 
 std::uint32_t encode_icu_queue_control(const IcuQueueControl& control)
@@ -793,10 +922,13 @@ MemMacroBitstream encode_mem_macro_bitstream(const QueueProgram& queue)
 
     std::map<std::pair<std::uint32_t, std::int32_t>, std::size_t> frequencies;
     for (std::size_t i = 1; i < records.size(); ++i) {
-        if (records[i].schedule.start_cycle <
-            records[i - 1].schedule.start_cycle)
+        const auto& previous = records[i - 1].schedule;
+        const auto previousEnd = previous.start_cycle
+            + (previous.inner_count - 1) * previous.inner_interval
+            + (previous.outer_count - 1) * previous.outer_interval;
+        if (records[i].schedule.start_cycle <= previousEnd)
             throw std::invalid_argument(
-                "MEM Macro start cycles are not monotonic");
+                "MEM Macro executions overlap on one ICU queue");
         const auto startDelta = records[i].schedule.start_cycle -
                                 records[i - 1].schedule.start_cycle;
         const auto addressDelta =
@@ -917,6 +1049,7 @@ QueueProgram decode_mem_macro_bitstream(const MemMacroBitstream& image,
 
 MxmMacroBitstream encode_mxm_macro_bitstream(const QueueProgram& queue)
 {
+    if(is_sxm_macro_kind(queue.kind)) return encode_sxm_macro_bitstream(queue);
     if (!is_mxm_macro_kind(queue.kind))
         throw std::invalid_argument(
             "MXM Macro bitstream requires an MXM queue");
@@ -952,10 +1085,13 @@ MxmMacroBitstream encode_mxm_macro_bitstream(const QueueProgram& queue)
 
     std::map<std::pair<std::uint32_t, std::int32_t>, std::size_t> frequencies;
     for (std::size_t i = 1; i < records.size(); ++i) {
-        if (records[i].schedule.start_cycle <
-            records[i - 1].schedule.start_cycle)
+        const auto& previous = records[i - 1].schedule;
+        const auto previousEnd = previous.start_cycle
+            + (previous.inner_count - 1) * previous.inner_interval
+            + (previous.outer_count - 1) * previous.outer_interval;
+        if (records[i].schedule.start_cycle <= previousEnd)
             throw std::invalid_argument(
-                "MXM Macro start cycles are not monotonic");
+                "MXM Macro executions overlap on one ICU queue");
         const auto startDelta = records[i].schedule.start_cycle -
                                 records[i - 1].schedule.start_cycle;
         const auto operandDelta =
@@ -1033,6 +1169,7 @@ MxmMacroBitstream encode_mxm_macro_bitstream(const QueueProgram& queue)
 QueueProgram decode_mxm_macro_bitstream(const MxmMacroBitstream& image,
                                         std::size_t queue_index)
 {
+    if(is_sxm_macro_kind(image.kind)) return decode_sxm_macro_bitstream(image,queue_index);
     if (image.version != kMxmMacroBitstreamVersion)
         throw std::invalid_argument("unsupported MXM Macro bitstream version");
     if (!is_mxm_macro_kind(image.kind))
@@ -1223,6 +1360,7 @@ PackedMacroImemImage pack_mxm_macro_imem(const MxmMacroBitstream& image,
                                          bool enable,
                                          bool valid)
 {
+    const auto wordBits=is_sxm_macro_kind(image.kind)?96u:kMxmIcuImemWordBits;
     if (image.command_count > kIcuQueueControlMaxCommandCount)
         throw std::invalid_argument(
             "MXM Macro command count does not fit the physical control word");
@@ -1238,7 +1376,7 @@ PackedMacroImemImage pack_mxm_macro_imem(const MxmMacroBitstream& image,
     writer.bits(encode_icu_queue_control(
                     {valid, enable, IcuQueueMode::Macro, image.command_count}),
                 32);
-    writer.bits(0, kMxmIcuImemWordBits - 32);
+    writer.bits(0, wordBits - 32);
     if (image.command_count != 0) {
         writer.bits(image.delta_count, 3);
         for (std::size_t i = 0; i < image.delta_count; ++i) {
@@ -1251,7 +1389,7 @@ PackedMacroImemImage pack_mxm_macro_imem(const MxmMacroBitstream& image,
     }
 
     PackedMacroImemImage result;
-    finish_packed_image(writer, kMxmIcuImemWordBits, result);
+    finish_packed_image(writer, wordBits, result);
     return result;
 }
 
@@ -1261,9 +1399,10 @@ QueueProgram decode_mxm_macro_imem(const PackedMacroImemImage& packed,
 {
     if (!is_mxm_macro_kind(kind))
         throw std::invalid_argument("invalid MXM Macro queue kind");
-    validate_packed_image(packed, kMxmIcuImemWordBits);
+    const auto wordBits=is_sxm_macro_kind(kind)?96u:kMxmIcuImemWordBits;
+    validate_packed_image(packed, wordBits);
     BitReader reader(packed.bytes, packed.software_valid_bit_length);
-    const auto control = read_control_word(reader, kMxmIcuImemWordBits);
+    const auto control = read_control_word(reader, wordBits);
 
     MxmMacroBitstream image;
     image.kind = kind;

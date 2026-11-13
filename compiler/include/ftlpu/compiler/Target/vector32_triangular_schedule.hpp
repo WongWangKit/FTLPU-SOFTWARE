@@ -1,12 +1,12 @@
 #pragma once
 #include "ftlpu/compiler/Target/vector32_triangular_solve.hpp"
-#include "ftlpu/icu/fu_3d_instruction.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/affine_domains.hpp"
 #include "ftlpu/sxm/instruction.hpp"
 
 namespace ftlpu::compiler {
 struct Vector32SolveMemIssue {
     std::size_t side, slice, cycle;
-    MemIcuInstruction instruction;
+    MemAddressDomain instruction;
 };
 struct Vector32SolveVxmIssue {
     std::size_t queue, cycle;
@@ -56,11 +56,11 @@ inline Vector32SolveSchedule schedule_vector32_triangular_solve(
                 result.sxm.push_back({side,transpose,count,expansion_interval,trans});
                 result.sxm.push_back({side,permute,count,expansion_interval,perm});
                 for (std::size_t byte=0; byte<2; ++byte) {
-                    IcuLoop3D loop{0,{count,1,1},{expansion_interval,1,1}};
+                    AffineLoopDomain loop{0,{count,1,1},{expansion_interval,1,1}};
                     result.mem.push_back({side,8+byte,transpose-edge+(8+byte)/hw::kMemSlicesPerGroup,
-                        MemIcuInstruction::Read3D(loop,MemIcuAddress3D::Affine(j+1,{1,0,0}),StreamId::East(16+byte))});
+                        MemAddressDomain::Read(loop,MemAddressPattern::Affine(j+1,{1,0,0}),StreamId::East(16+byte))});
                     result.mem.push_back({side,4+byte,permute+edge-(4+byte)/hw::kMemSlicesPerGroup,
-                        MemIcuInstruction::Write3D(loop,MemIcuAddress3D::Affine((j+1)*32+j,{32,0,0}),StreamId::West((j%8)*2+byte))});
+                        MemAddressDomain::Write(loop,MemAddressPattern::Affine((j+1)*32+j,{32,0,0}),StreamId::West((j%8)*2+byte))});
                 }
             }
             start+=count*expansion_interval+64;
@@ -75,14 +75,14 @@ inline Vector32SolveSchedule schedule_vector32_triangular_solve(
                 auto memory = [&](std::size_t slice, std::size_t cycle,
                                   std::size_t count, std::size_t address,
                                   std::int64_t stride, std::size_t stream, bool write=false) {
-                    IcuLoop3D loop{0,{count,1,1},{1,1,1}};
-                    const auto addr=MemIcuAddress3D::Affine(address,{stride,0,0});
+                    AffineLoopDomain loop{0,{count,1,1},{1,1,1}};
+                    const auto addr=MemAddressPattern::Affine(address,{stride,0,0});
                     // Callers express the group-0 issue time. Other groups
                     // need earlier reads so both operand bundles coincide.
                     const auto hop = slice / hw::kMemSlicesPerGroup;
                     result.mem.push_back({side,slice,write ? cycle+hop : cycle-hop,write
-                        ? MemIcuInstruction::Write3D(loop,addr,StreamId::East(stream))
-                        : MemIcuInstruction::Read3D(loop,addr,StreamId::West(stream))});
+                        ? MemAddressDomain::Write(loop,addr,StreamId::East(stream))
+                        : MemAddressDomain::Read(loop,addr,StreamId::West(stream))});
                 };
                 const auto block=task.block/2;
                 if (task.row) {

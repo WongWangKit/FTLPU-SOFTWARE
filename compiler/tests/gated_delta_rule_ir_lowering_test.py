@@ -72,8 +72,8 @@ def main() -> None:
                     args.output_dir / "delta.command.mlir",
                     "ftlpu-stablehlo-to-commands")
     for required in (
-        "ftlpu.command.mem_3d",
-        "ftlpu.command.vxm_run_2d",
+        "ftlpu.command.macro",
+        "ftlpu.command.vxm",
         'name = "gated_delta_rule"',
     ):
         if required not in command:

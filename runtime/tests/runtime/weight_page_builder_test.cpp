@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <sstream>
+#include <set>
 #include <utility>
 #include <iostream>
 #include <map>
@@ -85,6 +86,54 @@ void test_native_output_pieces()
         catch (const std::invalid_argument&) { rejected=true; }
         require(rejected,"invalid native output accepted");
     }
+}
+
+void test_strided_output_pieces()
+{
+    BinaryBinding prefix;
+    prefix.access=BindingAccess::Output;
+    prefix.element_type=BindingElementType::BF16;
+    prefix.layout=BindingLayout::Fp16HemispherePairPlanar;
+    prefix.shape={1,128};prefix.byte_size=256;
+    prefix.slices={32,33};prefix.base_row=17;
+    prefix.address_stride=32;prefix.instruction_count=2;
+    prefix.hemisphere_mask=3;prefix.bank=1;
+    auto tail=prefix;
+    tail.layout=BindingLayout::Fp16PairPlanar;
+    tail.shape={1,64};tail.byte_size=128;
+    tail.slices={40,41};tail.base_row=91;tail.hemisphere_mask=2;
+    auto result=prefix;
+    result.shape={1,192};result.byte_size=384;result.pieces={prefix,tail};
+    std::vector<std::uint8_t> values(result.byte_size);
+    for(std::size_t i=0;i<values.size();++i)values[i]=(i*17+i/64)%251;
+    ExecutableHardwareConfig hw;
+    auto image=pack_binding_image(result,values,hw);
+    require(unpack_binding_image(result,image,hw)==values,"strided hemisphere-pair output order changed");
+    std::set<std::tuple<unsigned,unsigned,unsigned>> rows;
+    for(const auto& s:image.segments)for(unsigned r=0;r<s.vector_count;++r)
+        rows.emplace(s.hemisphere,s.slice,s.base_row+r);
+    require(rows.size()==12 && rows.count({0,32,17}) && rows.count({1,33,49})
+        && rows.count({1,40,91}) && rows.count({1,41,123}),"strided output physical addresses changed");
+
+    // Large concats exercise both stream and span readers, including metadata
+    // readers used by offline tooling. Piece count is a software bound only.
+    BinaryProgram program;
+    result.pieces.assign(5000,tail);result.shape={5000,64};result.byte_size=5000*128;
+    program.bindings={result};
+    std::stringstream stream(std::ios::in|std::ios::out|std::ios::binary);
+    write_binary_program(program,stream);
+    const auto storage=stream.str();
+    const auto data=std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(storage.data()),storage.size());
+    require(read_binary_program(stream).bindings[0].pieces.size()==5000,"stream lost output pieces");
+    stream.clear();stream.seekg(0);
+    require(read_binary_program_metadata(stream).bindings[0].pieces.size()==5000,"stream metadata lost pieces");
+    require(read_binary_program(data).bindings[0].pieces.size()==5000,"span lost output pieces");
+    require(read_binary_program_metadata(data).bindings[0].pieces.size()==5000,"span metadata lost pieces");
+    program.bindings[0].pieces.resize(65537);
+    bool rejected=false;
+    try { std::ostringstream invalid;write_binary_program(program,invalid); }
+    catch(const std::runtime_error&) {rejected=true;}
+    require(rejected,"unbounded output-piece metadata accepted");
 }
 
 void test_attention16_paged_weight()
@@ -578,6 +627,9 @@ void test_block4_partition_distributed_roundtrip()
         const auto image=pack_binding_image(b,data,program.hardware);
         require(unpack_binding_image(b,image,program.hardware)==data,"partitioned distributed C2C roundtrip");
         program.bindings.push_back(b);
+        auto output=b;
+        output.access=BindingAccess::Output; output.index=1;
+        program.bindings.push_back(output);
         auto system=std::make_unique<ftlpu::TspSliceSystem>();
         CModelRuntime runtime(*system); runtime.load(program); runtime.upload_input(0,data);
         for(const auto &segment:image.segments)
@@ -589,8 +641,6 @@ void test_block4_partition_distributed_roundtrip()
                   lane/8,segment.base_row+row,lane%8),
                 "partitioned distributed physical ownership mismatch");
         // Download from the same physical homes, without a mirror copy.
-        b.access=BindingAccess::Output; b.index=1;
-        program.bindings.push_back(b); runtime.load(program); runtime.upload_input(0,data);
         require(runtime.download_output(1)==data,"partitioned distributed download");
     }
 }
@@ -921,6 +971,7 @@ void test_partial_rope_bias()
 int main(int argc, char** argv)
 try {
     test_native_output_pieces();
+    test_strided_output_pieces();
     if (argc == 2 && std::string(argv[1]) == "--native-output-pieces") {
         std::cout << "Native output pieces passed\n";
         return 0;

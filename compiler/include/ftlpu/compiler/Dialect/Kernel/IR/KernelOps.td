@@ -62,15 +62,17 @@ def BlockFp8MatmulOp : FTLPU_Kernel_Op<"block_fp8_matmul", [Pure]> {
 }
 
 def BlockFp8ProjectionOp : FTLPU_Kernel_Op<"block_fp8_projection", [Pure]> {
-  let summary = "Dynamic group32 activation QDQ and block-scaled FP8 weight projection";
+  let summary = "Block-scaled FP8 weight projection with optional activation QDQ";
   let description = [{
     BF16 X[M,K], checkpoint E4M3FN W[N,K], and constant UE8M0 S[N/32,K/32].
-    Quantize X dynamically per row and K32 group with the block_fp8_qdq
-    semantics. Dequantize weights at IW, compute each K32 partial in FP32,
+    By default quantize X dynamically per row and K32 group with the
+    block_fp8_qdq semantics. With quantize_activation=false, consume the
+    original BF16 X directly. Dequantize weights at IW, compute each K32 partial in FP32,
     sum partials in K order in FP32, and round the final result to BF16.
   }];
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weights,
-                       AnyRankedTensor:$weight_scales);
+                       AnyRankedTensor:$weight_scales,
+                       OptionalAttr<BoolAttr>:$quantize_activation);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$input `,` $weights `,` $weight_scales attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
@@ -107,6 +109,45 @@ def BiasAddOp : FTLPU_Kernel_Op<"bias_add", [Pure]> {
   let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$bias);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$input `,` $bias attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def HcMixesOp : FTLPU_Kernel_Op<"hc_mixes", [Pure]> {
+  let summary = "Hyper-connection coefficients from a BF16 residual stream";
+  let description = [{
+    X[T,H,D], W[H*(H+2),H*D], scale[3], base[H*(H+2)] are BF16.
+    Normalize the FP32 projection by the flattened input RMS. Round this
+    normalized projection to BF16, then compute sigmoid gates and the
+    specified full Sinkhorn iteration in FP32. Return BF16 pre[T,H],
+    post[T,H], comb[T,H,H] and normalized projection[T,H*(H+2)].
+    pre belongs to the next sublayer; the current hc_pre receives its own
+    incoming coefficient tensor. No model computation runs on the host.
+  }];
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$weight,
+      AnyRankedTensor:$scale, AnyRankedTensor:$base,
+      I64Attr:$iterations, F32Attr:$epsilon, F32Attr:$norm_epsilon);
+  let results = (outs AnyRankedTensor:$pre, AnyRankedTensor:$post,
+      AnyRankedTensor:$comb, AnyRankedTensor:$projection);
+  let hasVerifier = 1;
+}
+
+def HcPreOp : FTLPU_Kernel_Op<"hc_pre", [Pure]> {
+  let summary = "BF16 residual stream weighted collapse with FP32 accumulation";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$pre);
+  let results = (outs AnyRankedTensor:$result);
+  let hasVerifier = 1;
+}
+
+def HcPostOp : FTLPU_Kernel_Op<"hc_post", [Pure]> {
+  let summary = "BF16 sublayer output expansion and residual mixing";
+  let description = [{
+    Y[T,D], residual[T,H,D], post[T,H], comb[T,H,H] -> output[T,H,D].
+    output[t,j,d] = post[t,j]*Y[t,d] + sum_i comb[t,i,j]*residual[t,i,d].
+    Products and sums are FP32; the final result is BF16 RNE.
+  }];
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$residual,
+      AnyRankedTensor:$post, AnyRankedTensor:$comb);
+  let results = (outs AnyRankedTensor:$result);
   let hasVerifier = 1;
 }
 
@@ -168,6 +209,26 @@ def FlashAttentionOp : FTLPU_Kernel_Op<"flash_attention", [Pure]> {
       I64Attr:$query_position);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat = "$query `,` $key `,` $value attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def DenseAttentionOp : FTLPU_Kernel_Op<"dense_attention", [Pure]> {
+  let summary = "Grouped scaled dot-product attention through the native dense schedule";
+  let arguments = (ins AnyRankedTensor:$query, AnyRankedTensor:$key,
+      AnyRankedTensor:$value, F32Attr:$scale, BoolAttr:$causal,
+      I64Attr:$query_position);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$query `,` $key `,` $value attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def AttentionCoreOp : FTLPU_Kernel_Op<"attention_core", [Pure]> {
+  let summary = "Single-request native dense attention with flattened head dimensions";
+  let arguments = (ins AnyRankedTensor:$query, AnyRankedTensor:$key,
+      AnyRankedTensor:$value, Optional<AnyRankedTensor>:$sink_values, DictionaryAttr:$config,
+      OptionalAttr<DictionaryAttr>:$memory_plan);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$query `,` $key `,` $value (`sink` $sink_values^)? attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 

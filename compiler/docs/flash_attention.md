@@ -5,6 +5,118 @@ implements the tiled online-softmax algorithm used by FlashAttention with
 existing MXM, VXM, SXM and MEM instructions. It does not add a FlashAttention
 hardware instruction or a model-level operation to CModel.
 
+## Native short-prefill tile scheduler (2026-11-11)
+
+BF16 seq32/KV32 with equal D32/D64/D128, even KV-head count, position zero,
+wide SXM and two MXM weight buffers can now retain Flash as one native
+`attention_core` scheduling unit with `attention_strategy="flash_tile"`.
+`FlashTileLowering.inc` owns graph selection/request indexing,
+`FlashTileMemory.inc` owns bounded planar allocations, and
+`FlashTileScheduleEmitter.hpp` emits closed ICU domains directly. The public
+Flash operator and its general multi-KV-tile online-softmax fallback remain.
+
+Q loads directly as MXM columns for continuous KQ^T; score tiles ping-pong
+across separate MEM ICU pairs. VXM keeps max in its accumulator, chains the
+exponent and reciprocal passes, and sends BF16 P directly through SXM to
+MXM. The transposed PV contraction feeds FP32 denominator multiplication
+and a direct VXM-to-SXM context transpose. The next tile's scale/max occupies
+the current P capture/load interval. All scratch uses ordinary planar words.
+No full score/P matrix or pure MEM-to-MEM layout-copy kernel is needed for
+the accepted standalone GLM core. Ordinary functional score/exponent stores
+remain for reduction dependencies; they are not layout copies.
+
+The 2026-11-12 update shares one FP32 exponent read between two depth-2
+chains: C0/C1 casts unnormalized P to BF16 and streams it through SXM to
+MXM, while C2/C3 sums the original FP32 values in key order. The terminal
+sum uses the existing C3-to-C2 feedback for reciprocal, without a partial
+sum spill. The FP32 sum and BF16 rounding points remain unchanged.
+
+See [GLM prefill](glm4_9b_prefill.md#shared-exponent-read-for-sum-and-p-2026-11-12-latest-core-result)
+for scope, precision, runtime/ICU artifacts and reproduction. The shared
+read reduces the accepted native GLM core from 20,795 to 20,361 total cycles
+including ingress (the pre-native baseline was 76,939), with bit-identical
+output. Exponent reads drop from 256 to 128 KiB. The same-build dense core
+takes 27,165 cycles.
+
+## Common planar operand access planning (2026-11-11)
+
+The compiler now separates a logical operand view from its physical
+materialization. `Analysis/planar_access.hpp` defines `PlanarReadPlan` in MEM
+word units: base offset, logical rows/word-columns, row chunk, inner row
+stride, group stride and column stride. A layout proof runs before ICU/FU
+emission. It preserves byte planes and lane order; it never reconstructs a
+domain from issued FU commands. Signed/zero strides and nested row views
+use the same contract. New layouts use ordinary planar storage.
+
+`PlanarAccessPlanning.inc` handles the shared graph policy:
+
+1. An operand view is resolved against the producer allocation and, where
+   present, its own access plan. Shape identity is no longer required.
+2. The consumer must declare support, match storage/precision/ownership,
+   and have independent MEM ICU queues for concurrent operands. Unaligned
+   words, lane permutations, multiple allocations, conflicting queues and
+   non-affine views retain an explicit conversion.
+3. Mirrored matrix joins first try an address-only view. Retained aliases
+   reserve the original footprint through their final consumer, including
+   checks against fixed native workspaces.
+4. A matrix join with repeated logical rows can store each distinct row
+   reference once, then represent repetition in READ3D. This deduplicates
+   `(producer, output, element index)` references, never numerical values.
+5. The materialization fallback can read a planned view as well, so an
+   unsupported downstream consumer does not accidentally interpret compact
+   storage as a fully expanded matrix.
+
+`PlanarAccessEmitter.hpp` is the common READ3D emitter used by packed VXM
+updates and native BF16 `head_matmul` operands. It consumes the plan and
+final placement without choosing new temporary layouts. The former
+`vector_matrix_row_repeat` and `vector_coefficient_row_*` cases are removed.
+Native operator arithmetic, rounding points, output ownership and raw-macro
+execution remain unchanged.
+
+The first supported contract covers mirrored BF16/FP32 planar matrices,
+scalar-broadcast planar coefficients, and access maps fitting one 3D domain.
+The MXM adapter currently covers the existing 32-row tile per hemisphere.
+Per-lane transposes still require SXM. Segmented multi-producer U views and
+producer output-layout negotiation are not yet migrated to this contract;
+their existing conversions remain. This refactor is not a claim that all
+Flash MEM-to-MEM traffic has been eliminated.
+
+`graph_plan.json` reports `access_plans` for migrated operands, join
+`access_decision`, logical/stored row counts and a `reason` on each linker
+transport. Tests include `planar_access_test` (affine, broadcast, reversed
+and nested views plus invalid maps), the Flash numerical shape suite,
+native dense core regression and real GLM batch1/32 raw-macro execution.
+The raw-macro program and formal iMEM capacity audit remain part of acceptance.
+
+Reproduce the GLM comparison using the isolated build and unchanged fixture:
+
+```powershell
+python -B compiler/tests/glm4_attention_comparison_test.py --build-dir tmp/glm4_access_plan_1111 --batches 1 32 --strategies flash
+python -B compiler/tools/summarize_planar_access.py
+```
+
+The fixed decode result directories are updated in place. The root
+`results/glm4_9b_decoder_layer_decode_flash_streamed/planar_access.json`
+records numerical identity, transport bytes and timing; each batch keeps
+`before_access_plan.json`. `tmp/glm4_access_plan_1111/build_manifest.json`
+records frozen source/tool/link inputs, excluding unrelated concurrent work.
+
+The [2026-11-11 Flash prefill P streaming result](glm4_9b_prefill.md#flash-p-producer-to-sxm-streaming-2026-11-11)
+connects the BF16 VXM probability producer directly to wide SXM. The FP32
+denominator path is preserved. GLM seq32 output is bit-identical and total
+runtime falls from 163,312 to 159,391 cycles; full and padded KV tile regressions
+and physical iMEM/queue audits pass.
+
+The current GLM comparison uses the shared dense attention core as the
+ordinary baseline. See [the 2026-11-10 paired run](glm4_9b_decode.md#ordinary-attention-uses-the-dense-core-2026-11-10)
+for fresh same-build batch-1/32 measurements and reproduction commands.
+Older generic-baseline measurements below are historical results.
+
+GLM-4-9B causal seq32 prefill is also validated with real device-produced
+QKV; [the prefill comparison](glm4_9b_prefill.md#dense-versus-flash-seq32-attention-2026-11-11)
+records both strategies and their actual runtime programs. For this short
+sequence the present Flash mapping is slower than the native dense core.
+
 ## Scope and interface
 
 `ftlpu.kernel.flash_attention` accepts static BF16 tensors:

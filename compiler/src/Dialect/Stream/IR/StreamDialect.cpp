@@ -494,7 +494,9 @@ LogicalResult RmsNormTaskOp::verify()
     if (!strategy || strategy.getValue() != "vxm_feedback")
         return emitOpError("requires the VXM feedback RMSNorm lowering");
     const auto materializeGamma = getConfig().getAs<BoolAttr>("materialize_gamma");
-    const std::size_t expectedScratch = materializeGamma && materializeGamma.getValue() ? 3 : 2;
+    const auto planar = getConfig().getAs<BoolAttr>("planar_streaming");
+    const std::size_t expectedScratch = planar && planar.getValue() ? 1
+        : materializeGamma && materializeGamma.getValue() ? 3 : 2;
     if (getScratchAllocations().size() != expectedScratch)
         return emitOpError("scratch allocation count does not match strategy");
     if (getRoutes().size() < 2)

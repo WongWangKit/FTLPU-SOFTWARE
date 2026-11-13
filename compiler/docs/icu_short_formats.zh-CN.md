@@ -1,3 +1,5 @@
+> 历史设计记录：本文中的独立 2D/3D、STREAM_ND、slice/tile program 已移除，不是当前 ISA。当前实现见 [Macro ISA](icu_macro_isa.zh-CN.md)。旧测试产物需重新编译。
+
 # ICU 单次、1D、2D 短格式
 
 `.ftlpu` v35 增加 MEM/MXM 短格式；旧 3D 包仍可读取。物理 iMEM 仍是

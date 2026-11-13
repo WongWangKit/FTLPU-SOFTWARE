@@ -33,6 +33,9 @@ BinaryProgram make_program(std::uint16_t bank)
     weight.bank = bank;
     program.bindings.push_back(std::move(weight));
     program.max_cycle = 96;
+    // This transport-only fixture has no compute SR users. Supply the same
+    // explicit idle-stream proof that the compiler records for real programs.
+    program.stream_release_cycles.assign(program.hardware.encoded_streams, 0);
     return program;
 }
 
@@ -96,13 +99,15 @@ void run_overlap_hazard_test()
     session.load(std::move(package));
     session.run_invocation(0, 0);
     session.run_invocation(1, 0);
+    // The scratch binding remains live through this invocation. Prefetch
+    // must incur a boundary wait after that lifetime; it cannot be hidden.
     const ModelSessionStats& stats = session.stats();
     if (stats.weight_page_prefetches != 2
         || stats.weight_page_deferred_prefetches != 1
         || stats.weight_page_hidden_prefetches != 1
-        || stats.weight_page_boundary_wait_cycles != 0)
+        || stats.weight_page_boundary_wait_cycles == 0)
         throw std::runtime_error(
-            "session did not defer and then hide an overlapping next-bank weight page: "
+            "session did not wait for the live next-bank scratch before prefetch: "
             "prefetches=" + std::to_string(stats.weight_page_prefetches)
             + " deferred="
             + std::to_string(stats.weight_page_deferred_prefetches)
@@ -287,7 +292,13 @@ try {
         || session.stats().weight_page_wait_cycles
             != session.stats().weight_page_initial_wait_cycles)
         throw std::runtime_error(
-            "session did not fully hide layer-to-layer C2C prefetch");
+            "session did not fully hide layer-to-layer C2C prefetch: prefetches="
+            + std::to_string(session.stats().weight_page_prefetches)
+            + " bytes=" + std::to_string(session.stats().weight_page_prefetch_bytes)
+            + " initial=" + std::to_string(session.stats().weight_page_initial_wait_cycles)
+            + " boundary=" + std::to_string(session.stats().weight_page_boundary_wait_cycles)
+            + " hidden=" + std::to_string(session.stats().weight_page_hidden_prefetches)
+            + " wait=" + std::to_string(session.stats().weight_page_wait_cycles));
     if (!session.memory_plan().resident_tensors.empty())
         throw std::runtime_error(
             "C2C pages were also allocated as resident weights");

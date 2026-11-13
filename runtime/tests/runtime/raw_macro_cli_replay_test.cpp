@@ -5,6 +5,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
 
 using namespace ftlpu;
 namespace rt = ftlpu::software::runtime;
@@ -31,7 +32,7 @@ static void replay(Queue& queue, const rt::LogicalQueueTimeline& reference,
     std::size_t maxCycle)
 {
     if (!queue.raw_macro_mode())
-        throw std::runtime_error("requested Macro queue silently loaded as FU3D");
+        throw std::runtime_error("requested Macro queue did not load the packed frontend");
     std::size_t position = 0;
     for (std::size_t cycle = 0; cycle <= maxCycle + 64; ++cycle) {
         const auto issued = queue.tick();
@@ -40,7 +41,12 @@ static void replay(Queue& queue, const rt::LogicalQueueTimeline& reference,
         if (static_cast<bool>(issued) != due)
             throw std::runtime_error("physical Macro issue timing differs at cycle " + std::to_string(cycle));
         if (issued) {
-            if (bits(*issued) != reference.issues[position].instruction.words)
+            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(*issued)>,SxmInstruction>) {
+                const auto encoded=rt::encode_sxm_command(*issued);
+                const auto& expected=reference.issues[position].instruction;
+                if(encoded.words!=expected.words || encoded.extension_words!=expected.extension_words)
+                    throw std::runtime_error("physical SXM Macro payload differs");
+            } else if (bits(*issued) != reference.issues[position].instruction.words)
                 throw std::runtime_error("physical Macro native instruction differs");
             ++position;
         }
@@ -81,7 +87,8 @@ try {
     for (const auto& queue : macro.queues) {
         if (queue.commands.empty()) continue;
         if (queue.kind != rt::QueueKind::Mem && queue.kind != rt::QueueKind::MxmLoad
-            && queue.kind != rt::QueueKind::MxmCompute && queue.kind != rt::QueueKind::MxmDequant)
+            && queue.kind != rt::QueueKind::MxmCompute && queue.kind != rt::QueueKind::MxmDequant
+            && queue.kind != rt::QueueKind::SxmTranspose && queue.kind != rt::QueueKind::SxmPermute)
             continue;
         if (!queue.requires_raw_macro)
             throw std::runtime_error("packed binary did not retain its required Macro mode");
@@ -96,6 +103,8 @@ try {
         case rt::QueueKind::MxmLoad: replay(icu->mxm_load_iq(physical), *reference, macro.max_cycle); break;
         case rt::QueueKind::MxmCompute: replay(icu->mxm_compute_iq(physical), *reference, macro.max_cycle); break;
         case rt::QueueKind::MxmDequant: replay(icu->mxm_dequant_iq(physical), *reference, macro.max_cycle); break;
+        case rt::QueueKind::SxmTranspose: replay(icu->sxm_transpose_iq(static_cast<Hemisphere>(queue.index)), *reference, macro.max_cycle); break;
+        case rt::QueueKind::SxmPermute: replay(icu->sxm_permute_iq(static_cast<Hemisphere>(queue.index)), *reference, macro.max_cycle); break;
         default: break;
         }
         ++tested;

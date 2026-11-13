@@ -166,7 +166,7 @@ add_library(ftlpu_compiler
     src/Dialect/Schedule/Transforms/SwigluScheduleEmitter.cpp
     src/Dialect/Schedule/Transforms/VerifySchedule.cpp
     src/Dialect/Command/IR/CommandDialect.cpp
-    src/Dialect/Command/Transforms/Fu3DCommandMaterializer.cpp
+    src/Dialect/Command/Transforms/MacroCommandMaterializer.cpp
     src/Dialect/Command/Transforms/StandaloneFfnUp3DToCommand.cpp
     src/Dialect/Command/Transforms/ScheduleToCommand.cpp
     src/Target/LPUTargetModel.cpp
@@ -198,7 +198,7 @@ set(FTLPU_TARGET_MODEL_CONSUMER_SOURCES
     tests/physical_memory_allocator_test.cpp)
 set_source_files_properties(${FTLPU_TARGET_MODEL_CONSUMER_SOURCES}
     PROPERTIES OBJECT_DEPENDS
-        "${FTLPU_GENERATED_HARDWARE_CONFIG};${FTLPU_CMODEL_DIR}/include/ftlpu/core/hardware_params.hpp;${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${CMAKE_SOURCE_DIR}/runtime/include/ftlpu/software/runtime/target_abi.hpp")
+        "${FTLPU_GENERATED_HARDWARE_CONFIG};${FTLPU_CMODEL_DIR}/include/ftlpu/core/hardware_params.hpp;${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${CMAKE_SOURCE_DIR}/runtime/include/ftlpu/software/runtime/target_abi.hpp;${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Analysis/attention_task_graph_view.hpp;${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp;${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Dialect/Schedule/Transforms/attention_schedule_emitter.hpp")
 set(FTLPU_ATTENTION_EMITTER_CONSUMER_SOURCES
     src/Dialect/Schedule/Transforms/AttentionEmitterUtils.cpp
     src/Dialect/Schedule/Transforms/AttentionProjectionEmitter.cpp
@@ -215,12 +215,22 @@ set_property(SOURCE ${FTLPU_ATTENTION_EMITTER_CONSUMER_SOURCES}
 set_property(SOURCE src/Dialect/Schedule/IR/ScheduleDialect.cpp
     APPEND PROPERTY OBJECT_DEPENDS
         "${CMAKE_CURRENT_BINARY_DIR}/ftlpu/compiler/Dialect/Schedule/IR/ScheduleOps.cpp.inc")
+set_property(SOURCE src/Dialect/Kernel/IR/KernelDialect.cpp
+    APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_BINARY_DIR}/ftlpu/compiler/Dialect/Kernel/IR/KernelOps.cpp.inc;${CMAKE_CURRENT_BINARY_DIR}/ftlpu/compiler/Dialect/Kernel/IR/KernelOps.h.inc")
 set_property(SOURCE src/Dialect/Kernel/Transforms/LogicalKernelGraphToSchedule.cpp
     APPEND PROPERTY OBJECT_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/BlockFp8ProjectionLowering.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/BlockFp8ActivationLowering.hpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/ProjectionGraphLowering.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/BlockFp8ActivationLowering.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/RotaryGraphLowering.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/MhcGraphLowering.inc")
 set_property(SOURCE src/Dialect/Kernel/Transforms/LogicalKernelGraphToSchedule.cpp
     APPEND PROPERTY OBJECT_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/FlashAttentionLowering.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/ProjectionSolveOverlap.inc")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/FlashTileLowering.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/RotaryPlanarSchedule.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/RotaryTilePipeline.inc")
+set_property(SOURCE src/Dialect/Schedule/Analysis/AttentionMemoryLayout.cpp
+    APPEND PROPERTY OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Analysis/FlashTileMemory.inc")
+set_property(SOURCE src/Dialect/Schedule/Transforms/AttentionScheduleEmitter.cpp
+    APPEND PROPERTY OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/FlashTileScheduleEmitter.hpp")
+set_property(SOURCE src/Dialect/Kernel/Transforms/LogicalKernelGraphToSchedule.cpp
+    APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/FlashAttentionLowering.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/ProjectionSolveOverlap.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/DenseAttentionLowering.inc;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Kernel/Transforms/DenseAttentionTransport.inc")
 set_property(SOURCE src/Dialect/Schedule/Transforms/VectorAluScheduleEmitter.cpp
     APPEND PROPERTY OBJECT_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/SiluMultiplyEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/ScaledMatvecEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/UnitLowerSolveEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/UnitLowerMxmEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/WeightedGramEmitter.hpp;${CMAKE_CURRENT_SOURCE_DIR}/src/Dialect/Schedule/Transforms/HeadWeightedProductEmitter.hpp")
@@ -229,14 +239,14 @@ file(GLOB_RECURSE FTLPU_CMODEL_COMPILER_HEADERS CONFIGURE_DEPENDS
 set(FTLPU_CMODEL_COMPILER_CONSUMER_SOURCES
     src/Dialect/Schedule/Analysis/FfnUp3DLowering.cpp
     src/Dialect/Command/IR/CommandDialect.cpp
-    src/Dialect/Command/Transforms/Fu3DCommandMaterializer.cpp
+    src/Dialect/Command/Transforms/MacroCommandMaterializer.cpp
     src/Dialect/Command/Transforms/StandaloneFfnUp3DToCommand.cpp
     src/Target/CommandBinary.cpp
     tools/ftlpu_translate.cpp
     tools/ftlpu_compile.cpp
     tests/ffn_up_3d_lowering_test.cpp)
 list(APPEND FTLPU_CMODEL_COMPILER_CONSUMER_SOURCES
-    tests/vxm_run_2d_command_test.cpp)
+    tests/vxm_sequential_command_test.cpp)
 set_property(SOURCE ${FTLPU_CMODEL_COMPILER_CONSUMER_SOURCES}
     APPEND PROPERTY OBJECT_DEPENDS
         "${FTLPU_GENERATED_HARDWARE_CONFIG};${FTLPU_CMODEL_COMPILER_HEADERS};${CMAKE_CURRENT_SOURCE_DIR}/include/ftlpu/compiler/Target/lpu_target_model.hpp;${FTLPU_RUNTIME_ABI_HEADERS}")
@@ -343,9 +353,9 @@ add_test(NAME elementwise_vxm_sr_direction_test COMMAND $<TARGET_FILE:elementwis
 add_executable(ffn_up_3d_lowering_test tests/ffn_up_3d_lowering_test.cpp)
 target_link_libraries(ffn_up_3d_lowering_test PRIVATE ftlpu_compiler)
 add_test(NAME ffn_up_3d_lowering_test COMMAND $<TARGET_FILE:ffn_up_3d_lowering_test>)
-add_executable(vxm_run_2d_command_test tests/vxm_run_2d_command_test.cpp)
-target_link_libraries(vxm_run_2d_command_test PRIVATE ftlpu_compiler)
-add_test(NAME vxm_run_2d_command_test COMMAND $<TARGET_FILE:vxm_run_2d_command_test>)
+add_executable(vxm_sequential_command_test tests/vxm_sequential_command_test.cpp)
+target_link_libraries(vxm_sequential_command_test PRIVATE ftlpu_compiler)
+add_test(NAME vxm_sequential_command_test COMMAND $<TARGET_FILE:vxm_sequential_command_test>)
 add_executable(ffn_weight_tile_planner_test
     tests/ffn_weight_tile_planner_test.cpp)
 target_link_libraries(ffn_weight_tile_planner_test PRIVATE ftlpu_compiler)
@@ -362,6 +372,9 @@ target_include_directories(ffn_swish_emitter_test PRIVATE
 target_link_libraries(ffn_swish_emitter_test PRIVATE ftlpu_compiler)
 add_test(NAME ffn_swish_emitter_test COMMAND $<TARGET_FILE:ffn_swish_emitter_test>)
 add_executable(physical_memory_allocator_test tests/physical_memory_allocator_test.cpp)
+add_executable(planar_access_test tests/planar_access_test.cpp)
+target_include_directories(planar_access_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_test(NAME planar_access_test COMMAND $<TARGET_FILE:planar_access_test>)
 target_link_libraries(physical_memory_allocator_test PRIVATE ftlpu_compiler)
 add_test(NAME physical_memory_allocator_test COMMAND $<TARGET_FILE:physical_memory_allocator_test>)
 if(MSVC)
@@ -389,13 +402,6 @@ if(Python3_Interpreter_FOUND)
             --numeric-test $<TARGET_FILE:compiled_vxm_sr_ffn_runtime_test>
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/direct_raw_macro_cli)
-    add_test(NAME macro_rectangle_folding_test
-        COMMAND ${Python3_EXECUTABLE} -B
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/macro_rectangle_folding_test.py
-            --translate $<TARGET_FILE:ftlpu_translate>
-            --inspect $<TARGET_FILE:ftlpu_binary_inspect>
-            --runtime-test $<TARGET_FILE:macro_bitstream_test>
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/macro_rectangle_folding)
     # Keep the native compiler usable without the optional HF/XLA environment.
     execute_process(
         COMMAND ${Python3_EXECUTABLE} -c "import pytest, numpy"
@@ -410,13 +416,13 @@ if(Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/frontend_weights_test.py
                 -k "not xla")
     endif()
-    add_test(NAME icu_short_lowering_test
+    add_test(NAME macro_domain_lowering_test
         COMMAND ${Python3_EXECUTABLE} -B
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/icu_short_lowering_test.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/macro_domain_lowering_test.py
             --compile $<TARGET_FILE:ftlpu_compile>
             --export $<TARGET_FILE:ftlpu_icu_program_export>
             --target-config ${FTLPU_HARDWARE_CONFIG}
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/icu_short)
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/macro_domains)
     add_test(
         NAME model_test_entrypoint_test
         COMMAND ${Python3_EXECUTABLE} -B
@@ -519,7 +525,7 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --weight-bank 0
-            --mxm-execution vector
+            --mxm-execution ws
             --seq-len 32
             --kv-cache-capacity 256
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_decoder_layer)
@@ -532,7 +538,7 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen2_5_1_5b_decoder_layer/decoder_layer_seq32.stablehlo.mlir
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --weight-bank 1
-            --mxm-execution vector
+            --mxm-execution ws
             --seq-len 32
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen2_5_1_5b_paged)
     add_test(
@@ -819,7 +825,7 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/examples/qwen3_moe_30b_a3b/expert_ffn_seq32.stablehlo.mlir
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/qwen3_moe_expert_ffn_seq32
             --target-config ${FTLPU_HARDWARE_CONFIG}
-            --mxm-execution vector)
+            --mxm-execution ws)
     set_tests_properties(qwen3_moe_expert_ffn_seq32_cmodel_test
         PROPERTIES TIMEOUT 900)
     add_test(
@@ -937,15 +943,6 @@ if(Python3_Interpreter_FOUND)
             --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/mem_3d_blocked_outer.schedule.mlir
             --target-config ${FTLPU_HARDWARE_CONFIG}
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/mem_3d_blocked_outer)
-    add_test(
-        NAME mem_slice_program_ab_test
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/mem_slice_program_ab_test.py
-            --translate $<TARGET_FILE:ftlpu_translate>
-            --inspect $<TARGET_FILE:ftlpu_binary_inspect>
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/Inputs/command_mem_slice_ab.mlir
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/mem_slice_program_ab)
     add_test(
         NAME stablehlo_matmul_320_to_ftlpu_kernel_mlir_test
         COMMAND
@@ -1204,7 +1201,12 @@ if(Python3_Interpreter_FOUND)
               --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/${decode_test})
           set_tests_properties(${decode_test} PROPERTIES TIMEOUT 1200)
         endforeach()
-        foreach(flash_case negative gqa causal query_tiles causal_offset single_tile)
+        add_test(NAME external_output_policy_test
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/external_output_policy_test.py
+            --build-dir ${CMAKE_BINARY_DIR} --target-config ${FTLPU_HARDWARE_CONFIG}
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/ftlpu_lower/external_output_policy)
+        set_tests_properties(external_output_policy_test PROPERTIES TIMEOUT 1200)
+        foreach(flash_case negative gqa causal query_tiles causal_offset single_tile prefill_streaming)
           add_test(NAME flash_attention_${flash_case}_test
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/flash_attention_test.py
               --build-dir ${CMAKE_BINARY_DIR} --target-config ${FTLPU_HARDWARE_CONFIG}

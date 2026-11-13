@@ -57,7 +57,7 @@ void emitMemWave(mlir::IRRewriter &rewriter, mlir::Location location,
                  int64_t waveAddressStride, int64_t bank);
 
 // Emit one hardware MEM loop descriptor.  The three domains map directly to
-// the three counters in READ_3D/WRITE_3D/WRITE_TAP_3D; callers do not need to
+// the three counters in read domain/write domain/tap-write domain; callers do not need to
 // enumerate their logical rows before Schedule IR is formed.
 void emitMem3D(mlir::IRRewriter &rewriter, mlir::Location location,
                int64_t cycle, int64_t queue, llvm::StringRef opcode,
@@ -93,7 +93,7 @@ void emitMxm(mlir::IRRewriter &rewriter, mlir::Location location, int64_t cycle,
              llvm::StringRef accumulatorOutputFormat = {},
              int64_t weightStreamBase = -1);
 
-// Emit one physical MXM LOAD_3D, COMPUTE_3D, or ACCUMULATOR_READ_3D
+// Emit one physical MXM load domain, compute domain, or accumulator-read domain
 // descriptor. Every loop axis and operand induction is supplied by the
 // operator lowering; this helper never reconstructs a domain from prior ops.
 void emitMxm3D(mlir::IRRewriter &rewriter, mlir::Location location,

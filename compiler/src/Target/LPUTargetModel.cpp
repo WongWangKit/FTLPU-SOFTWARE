@@ -369,7 +369,6 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_json(
 
 #define READ_THROUGHPUT(field) \
     read_json_integer(throughput, #field, &ThroughputModel::field, model.throughput_)
-    READ_THROUGHPUT(icu_repeat_2d_enabled);
     READ_THROUGHPUT(tile_rows);
     READ_THROUGHPUT(lanes_per_tile);
     READ_THROUGHPUT(mem_read_bytes_per_cycle);
@@ -547,7 +546,6 @@ mlir::FailureOr<LPUTargetModel> LPUTargetModel::from_operation(
 #undef READ_STREAM
 #define READ_THROUGHPUT(field) \
     read_attr_integer(throughput, #field, &ThroughputModel::field, model.throughput_)
-    READ_THROUGHPUT(icu_repeat_2d_enabled);
     READ_THROUGHPUT(tile_rows);
     READ_THROUGHPUT(lanes_per_tile);
     READ_THROUGHPUT(mem_read_bytes_per_cycle);
@@ -704,7 +702,6 @@ mlir::DictionaryAttr LPUTargetModel::to_attribute(
         I64(streams_, mem_slices_per_register_group),
     });
     const auto throughput = builder.getDictionaryAttr({
-        I64(throughput_, icu_repeat_2d_enabled),
         I64(throughput_, tile_rows),
         I64(throughput_, lanes_per_tile),
         I64(throughput_, mem_read_bytes_per_cycle),
@@ -884,9 +881,7 @@ mlir::LogicalResult LPUTargetModel::validate(std::string* error) const
         || (throughput_.mxm_weight_activation_overlap_enabled != 0
             && throughput_.mxm_weight_activation_overlap_enabled != 1)
         || (throughput_.vxm_cross_hemisphere_streams_enabled != 0
-            && throughput_.vxm_cross_hemisphere_streams_enabled != 1)
-        || (throughput_.icu_repeat_2d_enabled != 0
-            && throughput_.icu_repeat_2d_enabled != 1))
+            && throughput_.vxm_cross_hemisphere_streams_enabled != 1))
         return fail("target feature switches must be zero or one");
     if (throughput_.mxm_accumulator_blocks > 256)
         return fail(

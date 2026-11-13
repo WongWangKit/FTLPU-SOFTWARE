@@ -3,7 +3,7 @@
 #include "ftlpu/software/runtime/binary.hpp"
 #include "ftlpu/software/runtime/common_page_range.hpp"
 #include "ftlpu/software/runtime/icu_program.hpp"
-#include "ftlpu/software/runtime/fu_3d_macro_lowering.hpp"
+#include "ftlpu/software/runtime/macro_queue_link.hpp"
 #include "ftlpu/software/runtime/queue_transport_order.hpp"
 
 #include <algorithm>
@@ -41,31 +41,7 @@ inline void validate_common_page_storage(const BinaryProgram& program,
     };
     for (const auto& queue : program.queues) {
         if (queue.kind != QueueKind::Mem || queue.index != memQueue) continue;
-        if (std::ranges::any_of(queue.commands, is_fu_3d_raw_packet_header)) {
-            // Normalize affine domains for the storage proof only. The actual
-            // executable remains Native 3D; no FU stream is expanded. Retain
-            // every cloned descriptor's binding provenance, just as codegen
-            // does, and let the existing checks reject aliasing/partial writes.
-            auto lowered = lower_fu_3d_queue_to_macro(queue);
-            BinaryProgram proof;
-            proof.hardware = program.hardware;
-            proof.queues.push_back(std::move(lowered.queue));
-            for (const auto& relocation : program.address_relocations) {
-                if (relocation.transport_queue || relocation.queue_kind != QueueKind::Mem
-                    || relocation.queue_index != queue.index) continue;
-                if (relocation.command_index >= lowered.command_indices.size()
-                    || lowered.command_indices[relocation.command_index].empty())
-                    throw std::invalid_argument("common storage proof has an invalid Native 3D relocation");
-                for (const auto index : lowered.command_indices[relocation.command_index]) {
-                    auto copy = relocation;
-                    copy.command_index = static_cast<std::uint32_t>(index);
-                    proof.address_relocations.push_back(copy);
-                }
-            }
-            validate_common_page_storage(proof, stop, memQueue, rowBegin,
-                rowCount, weightBindings, weightRelease, pageLoads);
-            continue;
-        }
+
         struct Access {
             std::int64_t low, high;
             std::uint64_t first, last;
@@ -239,6 +215,36 @@ inline void validate_common_page_storage(const BinaryProgram& program,
     }
 }
 
+// Scoped to one immutable executable. Only proof descriptors are cached;
+// every load retains its own ownership, release and future-replacement checks.
+class CommonPageStorageValidator {
+public:
+    explicit CommonPageStorageValidator(const BinaryProgram& program) : program_(program) {}
+    void validate(std::uint32_t stop, std::size_t queue, std::uint32_t row,
+        std::uint32_t count, std::span<const std::uint32_t> owners,
+        std::uint64_t release, std::span<const CommonPageLoadRange> loads = {})
+    {
+        auto found = proofs_.find(queue);
+        if (found == proofs_.end()) {
+            BinaryProgram proof;
+            proof.hardware = program_.hardware;
+            for (const auto& source : program_.queues)
+                if (source.kind == QueueKind::Mem && source.index == queue) {
+                    proof.queues.push_back(source);
+                    for (const auto& relocation : program_.address_relocations)
+                        if (!relocation.transport_queue && relocation.queue_kind == source.kind
+                            && relocation.queue_index == source.index)
+                            proof.address_relocations.push_back(relocation);
+                }
+            found = proofs_.emplace(queue, std::move(proof)).first;
+        }
+        validate_common_page_storage(found->second, stop, queue, row, count, owners, release, loads);
+    }
+private:
+    const BinaryProgram& program_;
+    std::map<std::size_t, BinaryProgram> proofs_;
+};
+
 // Validate one concrete MEM/RX/DMA triple for every page-in segment. A match
 // by SRAM row/count alone is insufficient for repeated loads into ping-pong
 // storage: the tag and launch domain identify the actual transport instance.
@@ -308,9 +314,7 @@ validate_common_transport_packet_links(const BinaryProgram& program)
                 ++pc;
                 continue;
             }
-            if(program.queue_control_protocol && is_fu_3d_raw_packet_header(queue.commands[pc])) {
-                pc+=fu_3d_raw_packet_word_count(queue.kind,queue.commands[pc]);continue;
-            }
+
             if(program.queue_control_protocol && std::ranges::any_of(program.queues,[&](const auto& q){return &q==store;})) {
                 const auto& command=queue.commands[pc];
                 const auto opcode=isa::decode_icu_command_opcode(command.command);

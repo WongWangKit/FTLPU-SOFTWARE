@@ -28,7 +28,7 @@ def main():
     p.add_argument('--debug-intermediates',action='store_true')
     p.add_argument('--decode-retrieval', choices=('vxm','mxm'), default='vxm',
         help='Use MXM for k times decayed State in the single-token decode core')
-    p.add_argument('--icu-compression', choices=('raw-macro', 'none'), default='raw-macro',
+    p.add_argument('--icu-compression', choices=('raw-macro', 'macro'), default='raw-macro',
         help='Production MEM/MXM encoding; VXM/SXM retain native instructions')
     a=p.parse_args();out=a.output_dir.resolve();out.mkdir(parents=True,exist_ok=True)
     if a.decode_retrieval == 'mxm' and a.decode_token is None:

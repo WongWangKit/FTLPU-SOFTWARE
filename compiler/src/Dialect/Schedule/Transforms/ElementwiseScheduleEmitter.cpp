@@ -90,7 +90,7 @@ void emitMemColumnDomain(mlir::IRRewriter& rewriter,
         return;
     }
     // This loop is the operator's direct lowering for queues that must
-    // alternate READ_3D and WRITE_3D.  Each emitted command is already a
+    // alternate read domain and write domain.  Each emitted command is already a
     // closed hardware domain; no later pass splits or moves it.
     for (int64_t column = 0; column < columnCount; ++column) {
         // Aliasing input/output queues also alternate inside each token
@@ -306,8 +306,8 @@ mlir::LogicalResult lowerElementwise(mlir::IRRewriter& rewriter,
     // group of one coarse command before the next residue starts.
     constexpr int64_t kColumnBlockResidues = 4;
     // A distributed result can reuse an operand's physical bank/slice queue.
-    // In that case a token-major READ_3D stays live across the interleaved
-    // result WRITE_3D launches, and a column domain would keep both contexts
+    // In that case a token-major read domain stays live across the interleaved
+    // result write domain launches, and a column domain would keep both contexts
     // live across every block as well.  Visit the four rows owned by each
     // slice pair consecutively and retire both MEM descriptors inside one
     // column block.  Only those aliasing queue domains are emitted once per

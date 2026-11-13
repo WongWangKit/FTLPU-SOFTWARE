@@ -173,14 +173,6 @@ std::uint64_t native_mem_release_before(
             } else if (is_mem_synchronized_raw_packet_header(command)) {
                 cursor += (command.words[2] & 0xffffffU) + 1;
                 pc += InstructionControlUnit::MemIcu::synchronized_packet_word_count;
-            } else if (is_fu_3d_raw_packet_header(command)) {
-                const auto loop = decode_fu_3d_raw_packet_loop(queue, pc);
-                auto duration = loop.start_cycle + loop.wait_cycle + 1;
-                for (std::size_t axis = 0; axis < IcuLoop3D::kDimensions; ++axis)
-                    duration += (loop.counts[axis] - 1) * loop.cycle_strides[axis];
-                cursor += duration;
-                if (cursor < plan.ready_cycle) queueRelease = cursor;
-                pc += fu_3d_raw_packet_word_count(queue.kind, command);
             } else if (is_macro_schedule_command(command)) {
                 // Keep the Native scratch-release lower bound after a loop
                 // becomes Raw Macro. This can only delay page reuse; it does

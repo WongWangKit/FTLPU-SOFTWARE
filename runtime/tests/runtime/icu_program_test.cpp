@@ -15,25 +15,6 @@ void require(bool condition, const char* message)
     if (!condition) throw std::runtime_error(message);
 }
 
-template <typename Packet>
-std::vector<QueueCommand> raw_mem_3d_commands(const Packet& packet)
-{
-    std::vector<QueueCommand> commands;
-    commands.reserve(packet.words.size());
-    for (std::size_t w = 0; w < isa::fu_loop_packet_word_count(packet); ++w) {
-        const auto& word = packet.words[w];
-        QueueCommand command;
-        command.command = word.lanes[0];
-        command.instruction_kind = InstructionKind::Mem;
-        command.word_count =
-            Packet::kLanesPerWord;
-        for (std::size_t lane = 0; lane < command.word_count; ++lane)
-            command.words[lane] = word.lanes[lane];
-        commands.push_back(std::move(command));
-    }
-    return commands;
-}
-
 } // namespace
 
 int main()
@@ -41,29 +22,20 @@ try {
     constexpr std::size_t kWaitTag = 0x1234;
     constexpr std::size_t kWriteTag = 0x2345;
     constexpr std::size_t kReadTag = 0x3456;
-    const IcuLoop3D onePoint {0, {1, 1, 1}, {1, 1, 1}, 0};
 
     QueueProgram queue {QueueKind::Mem, 0, {}};
     const auto append = [&](const auto& commands) {
         queue.commands.insert(queue.commands.end(),
             commands.begin(), commands.end());
     };
-    append(raw_mem_3d_commands(
-        isa::encode_mem_icu_shortest_instruction(
-            MemIcuInstruction::Read3D(onePoint,
-                MemIcuAddress3D::Affine(10, {0, 0, 0}),
-                StreamId::East(1)))));
-    append(raw_mem_3d_commands(
-        isa::encode_mem_icu_shortest_instruction(
-            MemIcuInstruction::Write3D(onePoint,
-                MemIcuAddress3D::Affine(20, {0, 0, 0}),
-                StreamId::East(2)))));
-
+    for(const auto ins:{MemInstruction::Read(10,StreamId::East(1)),MemInstruction::Write(20,StreamId::East(2))}) {
+        const auto bits=isa::encode_mem_instruction(ins);
+        queue.commands.push_back({0,InstructionKind::Mem,2,{std::uint32_t(bits),std::uint32_t(bits>>32),0,0}});
+    }
     const auto wait = encode_icu_control_raw_word(
         IcuControlInstruction::WaitEvent(kWaitTag));
-    require(is_icu_control_raw_word_command(wait)
-            && !is_repeat_2d_command(wait),
-        "raw WAIT_EVENT was mistaken for Repeat2D");
+    require(is_icu_control_raw_word_command(wait),
+        "raw WAIT_EVENT was mistaken for a FU command");
     queue.commands.push_back(wait);
 
     const auto synchronized =
@@ -76,7 +48,7 @@ try {
                 synchronizedCommands[0])
             && is_mem_synchronized_raw_word_command(
                 synchronizedCommands[1])
-            && !is_repeat_2d_command(synchronizedCommands[0]),
+,
         "MEM_WRITE_SYNC raw packet was not recognized structurally");
     append(synchronizedCommands);
 
@@ -143,59 +115,9 @@ try {
             && issued[4].address == 40
             && issued[5].opcode == MemOpcode::Read
             && issued[5].address == 41,
-        "Read3D, Write3D, MEM_WRITE_SYNC, and MEM_READ_SYNC did not execute in iMEM order");
+        "Read, Write, MEM_WRITE_SYNC, and MEM_READ_SYNC did not execute in iMEM order");
     require(mem.synchronized_issued_count() == 4,
         "MEM synchronized issue accounting is incorrect");
-
-    MemIcuWriteRead2DInstruction writeRead{};
-    writeRead.start_wait = 5;
-    writeRead.counts = {2, 2};
-    writeRead.write_cycle_strides = {8, 20};
-    writeRead.read_cycle_strides = {8, 20};
-    writeRead.read_start_offset = 2;
-    writeRead.base_address = 30;
-    writeRead.address_strides = {1, 4};
-    writeRead.write_stream = StreamId::East(3).packed();
-    writeRead.read_stream_base = StreamId::East(4).packed();
-    writeRead.read_stream_outer_stride = 1;
-    QueueCommand nop{};
-    nop.command = isa::encode_icu_nop(3);
-    QueueProgram writeReadQueue {QueueKind::Mem, 0, {nop}};
-    const auto rawWriteRead = raw_mem_3d_commands(
-        isa::encode_mem_icu_write_read_2d_instruction(writeRead));
-    writeReadQueue.commands.insert(writeReadQueue.commands.end(),
-        rawWriteRead.begin(), rawWriteRead.end());
-    InstructionControlUnit writeReadIcu;
-    load_queue_programs_into_icu({writeReadQueue}, writeReadIcu);
-    auto& writeReadMem = writeReadIcu.mem_iq(0);
-    require(writeReadMem.imem_occupancy() == 4,
-        "WRITE_READ_2D must occupy three MEM iMEM words plus NOP");
-    writeReadMem.configure_all();
-    for (std::size_t cycle = 0; cycle < 5; ++cycle)
-        writeReadMem.prefetch_only();
-    std::vector<std::size_t> issueCycles;
-    std::vector<MemInstruction> writeReadIssued;
-    for (std::size_t cycle = 0; cycle < 64 && !writeReadMem.done();
-         ++cycle) {
-        if (const auto instruction = writeReadMem.tick()) {
-            issueCycles.push_back(cycle);
-            writeReadIssued.push_back(*instruction);
-        }
-    }
-    require(writeReadMem.done() && writeReadIssued.size() == 8,
-        "WRITE_READ_2D did not retire eight FU issues");
-    require(issueCycles == std::vector<std::size_t>({8, 10, 16, 18,
-                28, 30, 36, 38}),
-        "WRITE_READ_2D start_wait shifted FU issue cycles");
-    for (std::size_t event = 0; event < writeReadIssued.size(); ++event) {
-        const auto& instruction = writeReadIssued[event];
-        const std::size_t address = std::array<std::size_t, 4>{
-            30, 31, 34, 35}[event / 2];
-        require(instruction.address == address
-                && instruction.opcode ==
-                    (event % 2 == 0 ? MemOpcode::Write : MemOpcode::Read),
-            "WRITE_READ_2D FU operation or address mismatch");
-    }
 
     std::cout << "icu_program_test passed\n";
     return 0;

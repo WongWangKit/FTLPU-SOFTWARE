@@ -145,7 +145,97 @@ mlir::LogicalResult emitUnitLowerMxm(mlir::IRRewriter& r,kernel::VectorAluOp op,
         }
         timeline("solve_mxm.compensated_product",begin,cursor-32);
     };
-    if(singleBf16) {
+    if(singleBf16 && op.getLhs().getType().getDimSize(1)>32) {
+        // Two native BF16 contractions, one per hemisphere. The K32 tiles
+        // share an FP32 ACC block; only the terminal tile drains it. No
+        // partial matrix is stored between K tiles, and each ICU completes
+        // one closed-form domain before proceeding to its next instruction.
+        const int64_t k=op.getLhs().getType().getDimSize(1),tiles=k/32;
+        if(heads!=2 || blocks!=1 || k%32 ||
+           !op.getLhs().getType().getElementType().isBF16() ||
+           !op.getRhs().getType().getElementType().isBF16() ||
+           target.throughput().mxm_weight_buffers<2 || !target.supports_mxm_weight_activation_overlap())
+            return op.emitError("native K contraction requires two BF16 matrices, N32, K32 and overlapping weight buffers");
+        const auto mirrored=[&](mlir::DictionaryAttr p) {
+            return !partition(p) && p.getAs<mlir::StringAttr>("hemisphere").getValue()=="both";
+        };
+        const bool selectPrior=epilogue && prior && partition(prior) && mirrored(lhs) && mirrored(rhs);
+        const bool inputEastFirst=(selectPrior?prior:lhs).getAs<mlir::StringAttr>("kind").getValue()!="token_partition_planar";
+        const auto sxmToWeight=target.transport_latency(target::StreamEndpoint::SxmResult,
+            target::StreamEndpoint::MxmWeight,target::StreamDirection::East,0);
+        if(!sxmToWeight)return op.emitError("native K contraction requires SXM-to-MXM routing");
+        const int64_t period=std::max<int64_t>(32,target.throughput().mxm0_accumulator_latency);
+        const int64_t capture=96,load=capture+35+*sxmToWeight,compute=load+32;
+        const auto returning=*target.transport_latency(target::StreamEndpoint::MxmResult,target::StreamEndpoint::Mem,target::StreamDirection::West,0)
+            +*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::VxmInput,target::StreamDirection::West,0);
+        const int64_t arrival=compute+(tiles-1)*period+target.mxm_first_result_latency()+returning;
+        for(int side=0;side<2;++side) {
+            const int logicalSide=selectPrior?(inputEastFirst?side:1-side):side;
+            attention_detail::emitSxm(r,loc,capture,side,"transpose",{16,17},{18,19},map,"wide_matrix",-1,-1,-1,tiles,period);
+            for(int byte=0;byte<2;++byte) {
+                const auto rd=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::SxmInput,target::StreamDirection::East,id(rhs,byte));
+                const auto ar=*target.transport_latency(target::StreamEndpoint::Mem,target::StreamEndpoint::MxmActivation,target::StreamDirection::East,id(lhs,byte));
+                // RHS is [head,K,N32]; LHS is [head*M32,K] in planar words.
+                  if(auto segments=rhs.getAs<mlir::ArrayAttr>("mxm_rhs_segments")) {
+                      for(auto attribute:segments) {
+                          const auto source=llvm::cast<mlir::DictionaryAttr>(attribute);
+                          const int64_t begin=field(source,"logical_begin"),count=field(source,"word_count");
+                          if(begin/k!=logicalSide)continue;
+                          const auto delay=target.transport_latency(target::StreamEndpoint::Mem,
+                              target::StreamEndpoint::SxmInput,target::StreamDirection::East,id(source,byte));
+                          if(!delay)return op.emitError("segmented RHS requires a MEM-to-SXM route");
+                          direct_domain_detail::emitMem3D(r,loc,target,capture+(begin%k/32)*period-*delay,
+                              side*target.memory().slices_per_hemisphere+id(source,byte),"read",
+                              field(source,"base_row"),16+byte,32,1,1,count/32,period,32,1,1,0,-1,field(source,"bank"));
+                      }
+                  } else {
+                      direct_domain_detail::emitMem3D(r,loc,target,capture-rd,
+                          side*target.memory().slices_per_hemisphere+id(rhs,byte),"read",
+                          field(rhs,"base_row")+(partition(rhs)?0:logicalSide*k),16+byte,
+                          32,1,1,tiles,period,32,1,1,0,-1,field(rhs,"bank"));
+                  }
+                int64_t base=field(lhs,"base_row")+(partition(lhs)?0:logicalSide*32);
+                int64_t rowStride=1,kStride=partition(lhs)?32:64;
+                if(auto access=analysis::decodePlanarRead(lhs)) {
+                    base=field(lhs,"base_row")+access->address(logicalSide*32,0);
+                    rowStride=access->address(logicalSide*32+1,0)-access->address(logicalSide*32,0);
+                    kStride=access->address(logicalSide*32,1)-access->address(logicalSide*32,0);
+                    for(int64_t c=0;c<tiles;++c)for(int64_t row=0;row<32;++row)
+                        if(field(lhs,"base_row")+access->address(logicalSide*32+row,c)!=base+row*rowStride+c*kStride)
+                            return op.emitError("native K contraction requires affine planar LHS access");
+                }
+                direct_domain_detail::emitMem3D(r,loc,target,compute-ar,
+                    side*target.memory().slices_per_hemisphere+id(lhs,byte),"read",base,4+byte,
+                    32,1,rowStride,tiles,period,kStride,1,1,0,-1,field(lhs,"bank"));
+            }
+            attention_detail::MxmDomain3D iw;
+            iw.repeat_count=32;iw.repeat_weight_column_stride=1;
+            iw.wave_count=tiles;iw.wave_interval=period;iw.weight_buffer_mode="toggle_dim1";
+            attention_detail::emitMxm3D(r,loc,load,side,"iw",0,0,0,0,0,1,"stream",true,"vector",0,"bf16","direct16","",iw,18);
+            auto cm=iw;cm.repeat_weight_column_stride=0;
+            cm.terminal_dimension=1;cm.terminal_accumulator_destination="stream";
+            cm.terminal_accumulator_clear=true;cm.terminal_accumulator_output_format="fp32";
+            attention_detail::emitMxm3D(r,loc,compute,side,"compute",0,0,4,epilogue?side*16:24,0,1,
+                "sram",false,"block",0,"bf16","direct16","",cm);
+            for(int byte=0;byte<4;++byte) {
+                if(epilogue)mem(prior,byte,side,arrival-1-id(prior,byte)/4,"read",
+                    partition(prior)?0:(inputEastFirst?side:1-side)*32,32+side*16+4+byte);
+                if(cast && byte>=2)continue;
+                const auto wr=epilogue?2+int(bool(cast))+id(out,byte)/4:
+                    *target.transport_latency(target::StreamEndpoint::VxmBridgeResult,target::StreamEndpoint::Mem,target::StreamDirection::East,id(out,byte));
+                mem(out,byte,1-side,arrival+wr,"write",partition(out)?0:(1-side)*32,epilogue?side*8+byte:24+byte);
+                cursor=std::max(cursor,arrival+wr+64);
+            }
+        }
+        if(epilogue) {
+            auto add=ffn_detail::create_vxm(r,loc,op.getLhs(),epilogue.getRhs(),epilogue.getResult().getType(),arrival-1,0,"add",
+                "stream_f32",0,0.f,"stream_f32",4,0.f,"fp32",-1,32,1,"east","west",-1,false,false,true,false,2);
+            add->setAttr("lhs_stream_source",r.getStringAttr("local"));add->setAttr("rhs_stream_source",r.getStringAttr("local"));
+            ffn_detail::create_vxm(r,loc,op.getLhs(),epilogue.getRhs(),tail.getResult().getType(),arrival-1,1,cast?"multiply":"bypass",
+                "previous",0,0.f,"immediate",0,cast?1.f:0.f,cast?"bf16":"fp32",0,32,1,"east","west",-1,false,false,true,false,2);
+        }
+        timeline("head_matmul.continuous_k",capture,cursor);
+    } else if(singleBf16) {
         // Native BF16 operands already occupy two byte planes. FP32 operands
         // retain the existing upper-plane BF16 interpretation. This changes
         // only the MEM source addresses, not MXM arithmetic or accumulation.
@@ -177,6 +267,16 @@ mlir::LogicalResult emitUnitLowerMxm(mlir::IRRewriter& r,kernel::VectorAluOp op,
         const int64_t capture=96,load=capture+35+*sxmToWeight,compute=load+32,jobs=half*blocks;
         const auto domainMem=[&](mlir::DictionaryAttr p,int byte,int side,int64_t at,
                                 llvm::StringRef opcode,int stream,int64_t blockStride,int logicalSide=-1) {
+            if(opcode=="read")if(auto source=analysis::decodePlanarRead(p)) {
+                if(half!=1)llvm::report_fatal_error("planar matrix access requires one head per hemisphere");
+                auto access=analysis::slicePlanarRows(*source,(logicalSide<0?side:logicalSide)*rows,rows);
+                if(!access)llvm::report_fatal_error("matrix row view cannot form READ3D");
+                if(!blockStride)access->columnStride=0;
+                emitPlanarReadDomain(r,loc,target,at,
+                    side*target.memory().slices_per_hemisphere+id(p,byte),field(p,"base_row"),
+                    stream,field(p,"bank"),*access,blocks);
+                return;
+            }
             direct_domain_detail::emitMem3D(r,loc,target,at,
                 side*target.memory().slices_per_hemisphere+id(p,byte),opcode,
                 field(p,"base_row")+(partition(p)?0:(logicalSide<0?side:logicalSide)*rows),stream,

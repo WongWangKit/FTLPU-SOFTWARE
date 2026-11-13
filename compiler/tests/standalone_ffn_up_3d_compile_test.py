@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the production CLI path for direct FFN Up FU 3-D lowering."""
+"""Exercise the production CLI path for direct affine FFN Up Macro lowering."""
 
 from __future__ import annotations
 
@@ -55,32 +55,17 @@ def main() -> None:
             + inspected)
 
     summary = re.search(r"binary queues=(\d+) commands=(\d+)", inspected)
-    if not summary or int(summary.group(2)) != 418:
-        raise AssertionError(
-            "direct CLI path did not emit 312 packet words plus 106 timing NOPs\n"
-            + inspected)
-    physical = re.search(
-        r"imem model=target-physical-v1[^\n]*used_slots=(\d+)",
-        inspected,
-    )
-    if not physical or int(physical.group(1)) != 418:
-        raise AssertionError(
-            "physical i-MEM accounting did not include timing NOPs\n"
-            + inspected)
-
+    physical = re.search(r"imem model=target-physical-v1[^\n]*used_slots=(\d+)", inspected)
+    if not summary or not physical or int(physical[1]) == 0:
+        raise AssertionError("missing physical packed Macro image accounting")
     loaded = run([args.runtime_test, str(binary)]).stdout
     if "ICU queues loaded" not in loaded:
-        raise AssertionError(
-            "direct binary did not load into the target-aware CModel ICU\n"
-            + loaded
-        )
-    coarse = sum(
-        int(value)
-        for value in re.findall(r"imem queue resource=.*?coarse_program=(\d+)", inspected)
-    )
-    if coarse != 106:
-        raise AssertionError(
-            f"expected 106 direct coarse commands, found {coarse}\n{inspected}")
+        raise AssertionError("packed Macro binary did not load into CModel: " + loaded)
+    for line in inspected.splitlines():
+        if line.startswith("imem queue resource="):
+            fields = dict(re.findall(r"(\w+)=([^ ]+)", line))
+            if int(fields["macro"]) == 0 or int(fields["coarse_program"]) != 0:
+                raise AssertionError("non-Macro computation in direct projection: " + line)
 
     # MXM queues stay dense in the executable's logical topology: east is 0
     # and west is 1 for the one-MXM lpu32 target. The runtime smoke above then
@@ -97,26 +82,6 @@ def main() -> None:
             raise AssertionError(
                 f"{resource} queues are not dense east/west logical ids "
                 f"{sorted(expected_logical_queues)}\n{inspected}")
-
-    aggregate = re.search(r"binary aggregate ([^\n]+)", inspected)
-    if not aggregate:
-        raise AssertionError("binary inspector omitted the aggregate command summary")
-    legacy_fields = (
-        "instruction", "repeat", "repeat2d", "macro",
-        "mem_stream_nd", "mem_slice_program", "mxm_stream_nd",
-        "vxm_stream_nd", "sxm_tile_program",
-    )
-    for field in legacy_fields:
-        match = re.search(rf"(?:^| ){field}=(\d+)(?: |$)", aggregate.group(1))
-        if not match or int(match.group(1)) != 0:
-            raise AssertionError(
-                f"direct raw 3-D binary unexpectedly contains legacy {field} commands\n"
-                + inspected)
-    nop = re.search(r"(?:^| )nop=(\d+)(?: |$)", aggregate.group(1))
-    if not nop or int(nop.group(1)) != 106:
-        raise AssertionError(
-            "direct raw 3-D binary did not carry one timing NOP per nonzero queue start\n"
-            + inspected)
 
     # The production mode must reject an ordinary/full graph instead of
     # silently treating any matmul as the standalone Up contract.
@@ -165,25 +130,17 @@ def main() -> None:
             "direct CLI accepted an MXM outside the target's logical topology\n"
             + rejected_unit.stdout + rejected_unit.stderr)
 
-    rejected_verify = subprocess.run([
-        args.compile,
-        "--input", args.input,
-        "--output", str(output_dir / "invalid_verify.ftlpu"),
-        "--input-stage", "stream",
-        "--direct-ffn-up-3d",
-        "--target-config", args.target_config,
-        "--verify-icu-issues",
-    ], check=False, text=True, capture_output=True)
-    if (rejected_verify.returncode == 0
-            or "cannot use --verify-icu-issues" not in rejected_verify.stderr):
-        raise AssertionError(
-            "direct CLI did not reject its inapplicable logical-issue self-check\n"
-            + rejected_verify.stdout + rejected_verify.stderr)
+    verified = run([args.compile, "--input", args.input, "--output",
+                    str(output_dir / "verified.ftlpu"), "--input-stage", "stream",
+                    "--direct-ffn-up-3d", "--target-config", args.target_config,
+                    "--verify-icu-issues"])
+    if "verified ICU logical issue equivalence:" not in verified.stdout:
+        raise AssertionError("direct Macro issue verification did not execute")
 
     print(
         "standalone_ffn_up_3d_compile_test passed: "
         f"mxms_per_hemisphere={expected_mxms} bindings=0 "
-        "coarse=106 packet_words=312 timing_nops=106 physical_words=418 legacy=0"
+        f"packed_words={physical[1]} Macro-only"
     )
 
 

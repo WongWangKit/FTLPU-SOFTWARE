@@ -604,7 +604,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       }
       // With uninterrupted Q/K/V reductions, each output group occupies
       // exactly two 48-reduction halves.  Their weight queues have no
-      // intervening work: flatten all halves into the third READ_3D counter
+      // intervening work: flatten all halves into the third read domain counter
       // and use blocked-outer addressing for [group][half] physical layout.
       bool mergeProjectionWeightReads =
           (projectionCanOverlap || !projection_rope_overlap_enabled_) &&
@@ -687,7 +687,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
       // In the serial policy all projection halves run before postprocessing.
       // Their activation reads revisit the same staging rows every
       // hiddenBlocks * seqLen cycles, so emit the whole [token][reduction]
-      // [output half] domain directly as one READ_3D per physical MEM ICU.
+      // [output half] domain directly as one read domain per physical MEM ICU.
       const bool mergeProjectionActivationReads =
           !projection_rope_overlap_enabled_ && mergeProjectionWeightReads &&
           inputDistributed16 && !directProjectionInput;
@@ -802,7 +802,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
         // The Q staging write and its first cross-hemisphere copy read visit
         // the same four SRAM rows with different issue rates. Keep their
         // common address domain until both times are known, then emit one
-        // hardware WRITE_READ_2D descriptor for each physical bank queue.
+        // hardware read/write domain pair descriptor for each physical bank queue.
         const bool qWriteRead2D = projectionCanOverlap &&
             kind == AttentionProjectionKind::Query && !deferPostprocess &&
             !op_.hasQkNorm() && tokenBlocks == 1 &&
@@ -1067,7 +1067,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                       // Keep the first complete half as an operator-domain
                       // coordinate.  If the second half has the same physical
                       // queue/stream/page/bank placement, both halves become
-                      // the group dimension of one READ_3D instruction.
+                      // the group dimension of one read domain instruction.
                       pending = current;
                     } else {
                       const int64_t groupInterval =
@@ -3240,7 +3240,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
                         // After all serial Q products have completed, every
                         // Query-IW queue stays idle between pair/head writes.
                         // Defer those writes to form one three-counter
-                        // WRITE_3D per physical bank queue. The older serial
+                        // write domain per physical bank queue. The older serial
                         // path can only join east low-half queues.
                         if (directSplitRope &&
                             kind == AttentionProjectionKind::Query &&
@@ -3630,7 +3630,7 @@ int64_t AttentionScheduleEmitter::emitProjections() {
           }
           // Query combine uses one fixed VXM body for each output
           // hemisphere. The head/pair plan is already timed, so lower each
-          // affine hemisphere run directly as one RUN_2D command.
+          // affine hemisphere run directly as one launch domain command.
           std::sort(pendingQueryCombines.begin(),
                     pendingQueryCombines.end(),
                     [](const auto &lhs, const auto &rhs) {
@@ -4165,7 +4165,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
                   < windows[rhs].offset + windows[rhs].duration
               && windows[rhs].offset
                   < windows[lhs].offset + windows[lhs].duration) {
-            op_.output.emitError()
+            op_.emitError("")
                 << "QK conflicting resource " << windows[lhs].resource
                 << " at [" << windows[lhs].offset << ", "
                 << windows[lhs].offset + windows[lhs].duration
@@ -4293,7 +4293,7 @@ mlir::LogicalResult AttentionScheduleEmitter::emitQk(
           const int64_t cycle = reductionIw - latency;
           const int64_t bank = layout.queryIwBank(reductionBase);
           // Score results can write the same physical Query-IW queue between
-          // waves. Such a queue cannot execute one non-preemptible READ_3D.
+          // waves. Such a queue cannot execute one non-preemptible read domain.
           // Only the first two scaled-score slices receive the MXM result;
           // the other layout slices are unused by this QK score writer.
           const auto scoreWriteSlices =

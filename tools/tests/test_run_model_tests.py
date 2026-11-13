@@ -200,6 +200,44 @@ class EntryPointTests(unittest.TestCase):
         self.assertTrue(report['numeric_passed'])  # Preserve backend success, but fail the requested artifact.
         self.assertIn('pipeline CSV is missing',report['error'])
 
+    def test_glm_attention_entry_keeps_primary_and_diagnostic_separate(self):
+        self.args.suite = 'attention-prefill'
+        plan = entry.commands(self.args, 'glm4_9b', self.root/'out', self.root/'work')
+        self.assertEqual([p for p, _ in plan], ['attention'])
+        self.assertNotIn('--export-context', plan[0][1])
+        self.assertEqual(entry.output_contract('glm4_9b', self.args.suite)['external_output_indices'], [])
+        self.assertIn('excludes projection', entry.case_scope('glm4_9b', self.args.suite))
+
+    def test_decode_entry_does_not_schedule_batch64_or_drop_cache(self):
+        self.args.suite = 'attention-decode'
+        self.args.batches = [1,32]
+        command = entry.commands(self.args, 'glm4_9b', self.root/'out', self.root/'work')[-1][1]
+        self.assertEqual(command[command.index('--batches')+1:], ['1','32'])
+        self.assertEqual(entry.output_contract('glm4_9b', self.args.suite)['external_output_indices'], [1,2])
+        self.args.suite = 'decode'
+        plan = entry.commands(self.args, 'glm4_9b', self.root/'out', self.root/'work')
+        self.assertEqual([p for p,_ in plan], ['import','decode'])
+        self.assertEqual(entry.output_contract('glm4_9b', 'decode')['handoffs'], ['Q/K/V','context'])
+
+    def test_registered_layers_preserve_states_and_final_hidden(self):
+        for model, spec in entry.CATALOG.items():
+            if not spec['suites']: continue
+            contract = entry.output_contract(model, 'prefill')
+            self.assertEqual(contract['result'], ['hidden'])
+            self.assertEqual(len(contract['persistent_state']), 2)
+            self.assertEqual(contract['diagnostic_intermediates'], [])
+
+    def test_graph_case_success_requires_current_output_contract_and_icu(self):
+        self.args.suite = 'attention-prefill'
+        out = self.root/'out'
+        for strategy in ('dense','flash'):
+            directory = out/strategy
+            directory.mkdir(parents=True)
+            (directory/'result.json').write_text(json.dumps(dict(status='passed',phase={},context_metrics={})))
+            (directory/'output_contract.json').write_text(json.dumps(dict(status='executed',external_output_indices=[])))
+        with self.assertRaisesRegex(RuntimeError, 'missing actual execution artifact'):
+            entry.collect_graph_cases(self.args, out)
+
 
 if __name__ == '__main__':
     unittest.main()

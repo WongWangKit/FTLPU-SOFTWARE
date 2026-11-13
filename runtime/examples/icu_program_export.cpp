@@ -1,9 +1,8 @@
 #include "ftlpu/software/runtime/binary.hpp"
+#include "ftlpu/software/runtime/imem_capacity.hpp"
+#include "ftlpu/software/runtime/macro_bitstream.hpp"
 
 #include "ftlpu/c2c/icu_instruction.hpp"
-#include "ftlpu/icu/fu_3d_codec.hpp" // Includes the shared wait_cycle field.
-#include "ftlpu/icu/sxm_run_2d.hpp"
-#include "ftlpu/icu/vxm_run_2d.hpp"
 #include "ftlpu/system/icu.hpp"
 
 #include <algorithm>
@@ -15,6 +14,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -35,6 +35,13 @@ struct IcuSpec {
     std::string location{};
 };
 
+// Export-only repetition coordinates; these are not a hardware instruction.
+struct IssuePattern {
+    std::size_t start_cycle{0};
+    std::array<std::size_t,3> counts{1,1,1};
+    std::array<std::size_t,3> cycle_strides{1,1,1};
+};
+
 struct InstructionRow {
     std::size_t ordinal{0};
     std::string phase{"execution"};
@@ -42,12 +49,13 @@ struct InstructionRow {
     std::size_t pc{0};
     std::size_t words{0};
     std::string opcode{};
-    ftlpu::IcuLoop3D loop{};
+    IssuePattern loop{};
     std::size_t wait_cycle{0};
     std::size_t expanded{0};
     std::optional<std::size_t> end_cycle{};
     std::string raw{};
     std::string details{};
+    bool packed_macro{false};
 };
 
 struct ExportSummary {
@@ -101,6 +109,16 @@ std::string raw_words(
         if (word != 0) output << ';';
         const auto& command = queue.commands.at(pc + word);
         output << "0x";
+        if (queue.kind == QueueKind::Vxm
+            && command.command == 0 && command.word_count == 3
+            && command.extension_words.empty()) {
+            const auto physical = ftlpu::isa::encode_vxm_icu_instruction({
+                std::uint64_t(command.words[0]) | (std::uint64_t(command.words[1]) << 32),
+                command.words[2]});
+            for (std::size_t lane = 3; lane != 0; --lane)
+                output << hex32(physical.lanes[lane - 1]);
+            continue;
+        }
         const auto lanes = command.word_count == 0
             ? physical_word_lanes(queue.kind) : command.word_count;
         for (std::size_t lane = lanes; lane != 0; --lane) {
@@ -111,34 +129,16 @@ std::string raw_words(
     return output.str();
 }
 
-template <typename Packet>
-Packet packet_at(const QueueProgram& queue, std::size_t pc)
-{
-    if (pc > queue.commands.size()
-        || fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(pc)) > queue.commands.size() - pc)
-        throw std::logic_error("truncated ICU packet at pc="
-            + std::to_string(pc));
-    Packet packet{};
-    for (std::size_t word = 0; word < fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(pc)); ++word) {
-        const auto& command = queue.commands[pc + word];
-        if (command.word_count != Packet::kLanesPerWord)
-            throw std::logic_error("ICU packet has the wrong physical width");
-        for (std::size_t lane = 0; lane < Packet::kLanesPerWord; ++lane)
-            packet.words[word].lanes[lane] = command.words[lane];
-    }
-    return packet;
-}
-
-std::size_t expanded_issues(const ftlpu::IcuLoop3D& loop)
+std::size_t expanded_issues(const IssuePattern& loop)
 {
     return loop.counts[0] * loop.counts[1] * loop.counts[2];
 }
 
-std::size_t final_cycle(const ftlpu::IcuLoop3D& loop)
+std::size_t final_cycle(const IssuePattern& loop)
 {
     std::size_t cycle = loop.start_cycle;
     for (std::size_t dimension = 0;
-         dimension < ftlpu::IcuLoop3D::kDimensions; ++dimension)
+         dimension < 3; ++dimension)
         cycle += (loop.counts[dimension] - 1)
             * loop.cycle_strides[dimension];
     return cycle;
@@ -155,227 +155,6 @@ std::string stream_description(std::size_t packed)
     return std::string("stream=")
         + (stream.direction() == ftlpu::StreamDirection::East ? "E" : "W")
         + std::to_string(stream.index());
-}
-
-InstructionRow decode_3d(
-    const QueueProgram& queue, std::size_t pc, std::size_t ordinal)
-{
-    InstructionRow row;
-    row.ordinal = ordinal;
-    row.pc = pc;
-    row.words = ftlpu::software::runtime::
-        fu_3d_raw_packet_word_count(queue.kind, queue.commands.at(pc));
-    row.raw = raw_words(queue, pc, row.words);
-    std::ostringstream details;
-    switch (queue.kind) {
-    case QueueKind::Mem: {
-        const auto& header = queue.commands.at(pc);
-        if (((header.words[2] >> 24) & 0xfU) == 7
-            && ((header.words[0] >> 4) & 0x3U) == 3) {
-            const auto instruction =
-                ftlpu::isa::decode_mem_icu_write_read_2d_instruction(
-                    packet_at<ftlpu::isa::EncodedMemIcuWriteRead2DPacket>(
-                        queue, pc));
-            row.opcode = "WRITE_READ_2D";
-            row.loop.counts = {instruction.counts[0],
-                instruction.counts[1], 1};
-            row.loop.cycle_strides = {instruction.write_cycle_strides[0],
-                instruction.write_cycle_strides[1], 1};
-            row.end_cycle = ftlpu::detail::
-                mem_icu_write_read_2d_last_issue_cycle(instruction);
-            row.expanded = 2 * instruction.counts[0]
-                * instruction.counts[1];
-            details << "start_wait=" << instruction.start_wait
-                    << " write_cycle_strides="
-                    << instruction.write_cycle_strides[0] << ':'
-                    << instruction.write_cycle_strides[1]
-                    << " read_start_offset="
-                    << instruction.read_start_offset
-                    << " read_cycle_strides="
-                    << instruction.read_cycle_strides[0] << ':'
-                    << instruction.read_cycle_strides[1]
-                    << " address_base=" << instruction.base_address
-                    << " address_strides="
-                    << instruction.address_strides[0] << ':'
-                    << instruction.address_strides[1]
-                    << " write_" << stream_description(
-                           instruction.write_stream)
-                    << " read_stream_base="
-                    << instruction.read_stream_base
-                    << " read_stream_outer_stride="
-                    << instruction.read_stream_outer_stride;
-            row.details = details.str();
-            return row;
-        }
-        const auto instruction = ftlpu::isa::decode_mem_icu_3d_instruction(
-            packet_at<ftlpu::isa::EncodedMemIcu3DPacket>(queue, pc));
-        row.loop = instruction.loop;
-        switch (instruction.opcode) {
-        case ftlpu::MemIcuOpcode::Read3D: row.opcode = "READ_3D"; break;
-        case ftlpu::MemIcuOpcode::Write3D: row.opcode = "WRITE_3D"; break;
-        case ftlpu::MemIcuOpcode::WriteTap3D:
-            row.opcode = "WRITE_TAP_3D";
-            break;
-        }
-        details << "address_base=" << instruction.address.base_address
-                << " address_strides=" << instruction.address.inner_stride
-                << ':' << instruction.address.middle_stride << ':'
-                << instruction.address.outer_inner_stride
-                << " outer_group_size="
-                << instruction.address.outer_group_size
-                << " outer_group_stride="
-                << instruction.address.outer_group_stride << ' '
-                << stream_description(instruction.stream);
-        break;
-    }
-    case QueueKind::MxmLoad: {
-        const auto instruction =
-            ftlpu::isa::decode_mxm_load_icu_3d_instruction(
-                packet_at<ftlpu::isa::EncodedMxmLoadIcu3DPacket>(queue, pc));
-        row.loop = instruction.loop;
-        row.opcode = instruction.opcode == ftlpu::MxmLoadIcuOpcode::IsLoadActivation3D
-            ? "DECODE_LOAD_ACTIVATION_3D" : instruction.opcode == ftlpu::MxmLoadIcuOpcode::LoadColumn3D
-            ? "LOAD_COLUMN_3D" : "LOAD_3D";
-        details << "weight_buffer_base=" << instruction.weight_buffer_base
-                << " weight_buffer_mode="
-                << static_cast<unsigned>(instruction.weight_buffer_mode)
-                << " weight_column_base=" << instruction.weight_column_base
-                << " weight_column_strides="
-                << instruction.weight_column_strides[0] << ':'
-                << instruction.weight_column_strides[1] << ':'
-                << instruction.weight_column_strides[2]
-                << " weight_stream_base=" << instruction.weight_stream_base
-                << " weight_input_mode="
-                << static_cast<unsigned>(instruction.weight_input_mode);
-        break;
-    }
-    case QueueKind::MxmDequant: {
-        const auto instruction =
-            ftlpu::isa::decode_mxm_dequant_icu_3d_instruction(
-                packet_at<ftlpu::isa::EncodedMxmDequantIcu3DPacket>(queue, pc));
-        row.loop = instruction.loop;
-        row.opcode = "DEQUANT_3D";
-        details << "dequant_word=0x"
-                << hex32(ftlpu::isa::encode_mxm_dequant_instruction(
-                       instruction.instruction));
-        break;
-    }
-    case QueueKind::MxmCompute: {
-        const auto instruction =
-            ftlpu::isa::decode_mxm_compute_icu_3d_instruction(
-                packet_at<ftlpu::isa::EncodedMxmComputeIcu3DPacket>(queue, pc));
-        row.loop = instruction.loop;
-        row.opcode = instruction.opcode
-                    == ftlpu::MxmComputeIcuOpcode::Compute3D
-            ? "COMPUTE_3D" : instruction.opcode == ftlpu::MxmComputeIcuOpcode::IsStreamCompute3D
-                ? "DECODE_STREAM_COMPUTE_3D" : "ACCUMULATOR_READ_3D";
-        details << "weight_buffer_base=" << instruction.weight_buffer_base
-                << " weight_buffer_mode="
-                << static_cast<unsigned>(instruction.weight_buffer_mode)
-                << " activation_stream_base="
-                << instruction.activation_stream_base
-                << " result_stream_base=" << instruction.result_stream_base
-                << " accumulator_address_base="
-                << instruction.accumulator_address_base
-                << " accumulator_address_strides="
-                << instruction.accumulator_address_strides[0] << ':'
-                << instruction.accumulator_address_strides[1] << ':'
-                << instruction.accumulator_address_strides[2]
-                << " accumulator_row_stride="
-                << instruction.accumulator_row_stride
-                << " data_format="
-                << static_cast<unsigned>(instruction.data_format)
-                << " regular_destination="
-                << static_cast<unsigned>(
-                       instruction.regular_mode.accumulator_destination)
-                << " regular_clear="
-                << instruction.regular_mode.accumulator_clear
-                << " regular_output_format="
-                << static_cast<unsigned>(
-                       instruction.regular_mode.accumulator_output_format)
-                << " terminal_dimension=" << instruction.terminal_dimension
-                << " terminal_destination="
-                << static_cast<unsigned>(
-                       instruction.terminal_mode.accumulator_destination)
-                << " terminal_clear="
-                << instruction.terminal_mode.accumulator_clear
-                << " terminal_output_format="
-                << static_cast<unsigned>(
-                       instruction.terminal_mode.accumulator_output_format);
-        break;
-    }
-    case QueueKind::Vxm: {
-        const auto instruction =
-            ftlpu::isa::decode_vxm_icu_run_2d_instruction(
-                packet_at<ftlpu::isa::EncodedVxmIcuRun2DPacket>(queue, pc));
-        row.loop = instruction.loop;
-        row.opcode = "RUN_2D";
-        details << "compact_control=0x" << std::hex << std::setfill('0')
-                << std::setw(16) << instruction.instruction.control
-                << " immediate_bits=0x" << std::setw(8)
-                << instruction.instruction.immediate_bits;
-        break;
-    }
-    case QueueKind::SxmTranspose:
-    case QueueKind::SxmPermute: {
-        const auto instruction = queue.kind == QueueKind::SxmTranspose
-            ? ftlpu::isa::decode_sxm_transpose_icu_run_2d_instruction(
-                packet_at<
-                    ftlpu::isa::EncodedSxmTransposeIcuRun2DPacket>(
-                    queue, pc))
-            : ftlpu::isa::decode_sxm_permute_icu_run_2d_instruction(
-                packet_at<
-                    ftlpu::isa::EncodedSxmPermuteIcuRun2DPacket>(
-                    queue, pc));
-        row.loop = instruction.loop;
-        row.opcode = "RUN_2D";
-        details << "src_base="
-                << instruction.instruction.src_streams.front().stream
-                << " dst_base="
-                << instruction.instruction.dst_streams.front().stream;
-        if (queue.kind == QueueKind::SxmTranspose) {
-            details << " input_row=";
-            if (instruction.instruction.input_row
-                == ftlpu::SxmInstruction::kAllInputRows)
-                details << "all";
-            else
-                details << instruction.instruction.input_row;
-        } else {
-            details << " output_row=";
-            if (instruction.instruction.output_row
-                == ftlpu::SxmInstruction::kAllOutputRows)
-                details << "all";
-            else
-                details << instruction.instruction.output_row;
-            details << " output_tile=";
-            if (instruction.instruction.output_tile
-                == ftlpu::SxmInstruction::kAllOutputTiles)
-                details << "all";
-            else
-                details << instruction.instruction.output_tile;
-            details << " permute_map_stride="
-                    << instruction.permute_map_stride << " permute_map=";
-            for (std::size_t lane = 0;
-                 lane < instruction.instruction.permute_map.size(); ++lane) {
-                if (lane != 0) details << ':';
-                details << instruction.instruction.permute_map[lane];
-            }
-        }
-        break;
-    }
-    case QueueKind::C2cDma:
-    case QueueKind::C2cTx:
-    case QueueKind::C2cRx:
-        throw std::logic_error("C2C is not an FU 3-D packet");
-    }
-    row.expanded = expanded_issues(row.loop);
-    const auto subtype = (queue.commands.at(pc).words[2] >> 24) & 15U;
-    if (subtype >= 8 && subtype <= 10 && row.opcode.ends_with("_3D")) {
-        row.opcode.resize(row.opcode.size() - 3);
-        if (subtype != 8) row.opcode += "_" + std::to_string(subtype - 8) + "D";
-    }
-    row.details = details.str();
-    return row;
 }
 
 InstructionRow decode_mem_sync(
@@ -427,11 +206,6 @@ InstructionRow decode_mem_sync(
             << " address_base=" << instruction.address
             << " address_stride=" << addressStride << ' '
             << stream_description(instruction.stream_id().packed());
-    const auto subtype = (queue.commands.at(pc).words[2] >> 24) & 15U;
-    if (subtype >= 8 && subtype <= 10 && row.opcode.ends_with("_3D")) {
-        row.opcode.resize(row.opcode.size() - 3);
-        if (subtype != 8) row.opcode += "_" + std::to_string(subtype - 8) + "D";
-    }
     row.details = details.str();
     return row;
 }
@@ -453,6 +227,70 @@ std::vector<InstructionRow> decode_queue(const QueueProgram& queue)
     std::size_t cursor = 0;
     for (std::size_t pc = 0; pc < queue.commands.size();) {
         const auto& command = queue.commands[pc];
+        if ((queue.kind == QueueKind::Mem || queue.kind == QueueKind::MxmLoad ||
+             queue.kind == QueueKind::MxmCompute || queue.kind == QueueKind::MxmDequant ||
+             queue.kind == QueueKind::SxmTranspose || queue.kind == QueueKind::SxmPermute) &&
+            ftlpu::software::runtime::is_macro_schedule_command(command)) {
+            // Packed instructions cross fetch-word boundaries. The
+            // container reconstructs semantic runs, not per-command iMEM PCs.
+            // Export their real domains and retain the complete physical image.
+            const auto schedule=ftlpu::software::runtime::decode_macro_schedule_command(command);
+            const auto native=static_cast<std::uint64_t>(command.words[0])
+                | (static_cast<std::uint64_t>(command.words[1]) << 32);
+            InstructionRow row;
+            row.ordinal=rows.size();row.packed_macro=true;
+            row.loop.start_cycle=schedule.start_cycle;
+            row.loop.counts={schedule.inner_count,schedule.outer_count,1};
+            row.loop.cycle_strides={schedule.inner_interval,schedule.outer_interval,1};
+            row.wait_cycle=schedule.start_cycle>=cursor?schedule.start_cycle-cursor:0;
+            row.expanded=schedule.inner_count*schedule.outer_count;
+            row.details="encoding=packed_macro command_ordinal="+std::to_string(pc)
+                +" induction_target="+std::to_string(static_cast<unsigned>(schedule.induction_target))
+                +" induction_stride0="+std::to_string(schedule.inner_stride)
+                +" induction_stride1="+std::to_string(schedule.outer_stride)
+                +" wait_cycle=derived_idle_gap";
+            if(queue.kind==QueueKind::Mem) {
+                const auto instruction=ftlpu::isa::decode_mem_instruction(native);
+                row.opcode=instruction.opcode==ftlpu::MemOpcode::Read?"MEM_READ_MACRO"
+                    : instruction.preserve_stream?"MEM_WRITE_TAP_MACRO":"MEM_WRITE_MACRO";
+                row.details+=" address_base="+std::to_string(instruction.address)
+                    +" "+stream_description(instruction.stream_id().packed());
+            } else if(queue.kind==QueueKind::SxmTranspose || queue.kind==QueueKind::SxmPermute) {
+                const auto instruction=ftlpu::software::runtime::decode_sxm_command(command);
+                row.opcode=queue.kind==QueueKind::SxmTranspose?"SXM_TRANSPOSE_MACRO":"SXM_PERMUTE_MACRO";
+                row.details+=" source_stream_base="+std::to_string(instruction.src_streams[0].stream)
+                    +" destination_stream_base="+std::to_string(instruction.dst_streams[0].stream);
+            } else if(queue.kind==QueueKind::MxmDequant) {
+                row.opcode="MXM_DEQUANT_MACRO";
+                row.details+=" scale_bf16="+std::to_string(command.words[0]&0xffffU);
+            } else {
+                const auto instruction=ftlpu::isa::decode_mxm_instruction(native);
+                switch(instruction.opcode) {
+                case ftlpu::MxmControlOpcode::IW: row.opcode="MXM_LOAD_MACRO";break;
+                case ftlpu::MxmControlOpcode::Compute: row.opcode="MXM_COMPUTE_MACRO";break;
+                case ftlpu::MxmControlOpcode::AccumulatorRead: row.opcode="MXM_ACC_READ_MACRO";break;
+                case ftlpu::MxmControlOpcode::IS: row.opcode="MXM_IS_MACRO";break;
+                }
+                row.details+=" native_control="+std::to_string(native);
+                if(instruction.opcode==ftlpu::MxmControlOpcode::IW) {
+                    row.details+=" weight_buffer="+std::to_string(instruction.weight_buffer)
+                        +" weight_column="+std::to_string(instruction.weight_column)
+                        +" weight_inner_column="+std::to_string(instruction.weight_inner_column)
+                        +" weight_stream_base="+std::to_string(instruction.weight_stream_base)
+                        +" weight_load_mode="+std::to_string(static_cast<unsigned>(instruction.weight_load_mode))
+                        +" weight_input_mode="+std::to_string(static_cast<unsigned>(instruction.weight_input_mode));
+                } else {
+                    row.details+=" weight_buffer="+std::to_string(instruction.weight_buffer)
+                        +" accumulator_address="+std::to_string(instruction.accumulator_address)
+                        +" accumulator_clear="+std::to_string(instruction.accumulator_clear)
+                        +" accumulator_destination="+std::to_string(static_cast<unsigned>(instruction.accumulator_destination))
+                        +" output_format="+std::to_string(static_cast<unsigned>(instruction.accumulator_output_format))
+                        +" activation_format="+std::to_string(static_cast<unsigned>(instruction.data_format));
+                }
+            }
+            cursor=final_cycle(row)+1;
+            rows.push_back(std::move(row));++pc;continue;
+        }
         if (ftlpu::software::runtime::
                 is_mem_synchronized_raw_packet_header(command)) {
             auto row = decode_mem_sync(
@@ -462,18 +300,7 @@ std::vector<InstructionRow> decode_queue(const QueueProgram& queue)
             rows.push_back(std::move(row));
             continue;
         }
-        if (ftlpu::software::runtime::
-                is_fu_3d_raw_packet_header(command)) {
-            auto row = decode_3d(queue, pc, rows.size());
-            row.wait_cycle = row.loop.wait_cycle;
-            row.loop.start_cycle += cursor + row.wait_cycle;
-            if (row.end_cycle)
-                *row.end_cycle += cursor;
-            cursor = final_cycle(row) + 1;
-            pc += row.words;
-            rows.push_back(std::move(row));
-            continue;
-        }
+
         InstructionRow row;
         row.ordinal = rows.size();
         row.pc = pc;
@@ -550,6 +377,25 @@ std::vector<InstructionRow> decode_queue(const QueueProgram& queue)
             row.details = c2c.str();
         }
         row.raw = raw_words(queue, pc, 1);
+        if (queue.kind == QueueKind::Vxm
+            && opcode == ftlpu::isa::IcuCommandOpcode::Instruction) {
+            if (command.word_count != 3 || !command.extension_words.empty())
+                throw std::invalid_argument("invalid sequential VXM configuration");
+            const auto decoded = ftlpu::isa::decode_vxm_instruction(queue.index, {
+                std::uint64_t(command.words[0]) | (std::uint64_t(command.words[1]) << 32),
+                command.words[2]});
+            const auto& config = decoded.instruction;
+            row.opcode = "CONFIG";
+            row.end_cycle = row.loop.start_cycle + config.repeat_count - 1;
+            row.details = std::string("operation=") + ftlpu::VxmLane::operation_name(config.operation)
+                + " repeat_count=" + std::to_string(config.repeat_count)
+                + " chain_depth=" + std::to_string(static_cast<unsigned>(decoded.chain_depth))
+                + " accumulator_reset=" + std::to_string(config.accumulator_reset)
+                + " accumulator_write=" + std::to_string(config.accumulator_write)
+                + " accumulator_emit=" + std::to_string(config.accumulator_emit)
+                + " precision=" + std::to_string(static_cast<unsigned>(config.precision))
+                + " output_type=" + std::to_string(static_cast<unsigned>(config.output_type));
+        }
         if (!row.details.empty()) row.details += ' ';
         row.details += "instruction_kind="
             + std::to_string(static_cast<unsigned>(command.instruction_kind));
@@ -678,8 +524,11 @@ void write_icu_file(const std::filesystem::path& path,
     for (const auto& row : rows) {
         output << row.ordinal << ',' << row.phase << ',';
         if (row.load_id) output << *row.load_id;
-        output << ',' << row.pc << ',' << row.words << ','
-               << row.opcode << ',' << row.loop.start_cycle << ','
+        output << ',';
+        if(!row.packed_macro)output << row.pc;
+        output << ',';
+        if(!row.packed_macro)output << row.words;
+        output << ',' << row.opcode << ',' << row.loop.start_cycle << ','
                << row.wait_cycle << ','
                << final_cycle(row) << ',' << row.loop.counts[0] << ','
                << row.loop.counts[1] << ',' << row.loop.counts[2] << ','
@@ -694,22 +543,31 @@ void write_icu_file(const std::filesystem::path& path,
 
 int main(int argc, char** argv)
 try {
-    if (argc != 3 && argc != 5)
+    if (argc < 3)
         throw std::runtime_error(
             "usage: ftlpu_icu_program_export program.ftlpu output_directory "
-            "[--pre-execution-dir directory]");
-    if (argc == 5 && std::string_view(argv[3]) != "--pre-execution-dir")
-        throw std::runtime_error("expected --pre-execution-dir");
+            "[--pre-execution-dir directory] [--compute-imem-segments]");
+    std::optional<std::filesystem::path> preExecutionDirectory;
+    bool exportComputeSegments = false;
+    for (int argument = 3; argument < argc; ++argument) {
+        const std::string_view option = argv[argument];
+        if (option == "--pre-execution-dir" && argument + 1 < argc)
+            preExecutionDirectory = argv[++argument];
+        else if (option == "--compute-imem-segments")
+            exportComputeSegments = true;
+        else
+            throw std::runtime_error("unknown or incomplete export option: " + std::string(option));
+    }
     const auto input = std::filesystem::absolute(argv[1]).lexically_normal();
     const auto outputDirectory =
         std::filesystem::absolute(argv[2]).lexically_normal();
     const auto program =
         ftlpu::software::runtime::read_binary_program(input);
     std::vector<ftlpu::software::runtime::BinaryProgram> preExecution;
-    if (argc == 5) {
+    if (preExecutionDirectory) {
         std::vector<std::pair<std::size_t, std::filesystem::path>> files;
         for (const auto& entry :
-             std::filesystem::directory_iterator(argv[4])) {
+             std::filesystem::directory_iterator(*preExecutionDirectory)) {
             if (!entry.is_regular_file()) continue;
             const auto name = entry.path().filename().string();
             if (!name.starts_with("pre_execution_")
@@ -732,6 +590,31 @@ try {
         }
     }
     std::filesystem::create_directories(outputDirectory);
+
+    // Reproduce the exact segmentation/relative waits used by CModelRuntime.
+    // This is an export of the linked image, not a new lowering or schedule.
+    // MEM/MXM queues remain resident; only the runtime's overflowed compute
+    // queues are reloaded at compiler-declared drain boundaries.
+    std::vector<ftlpu::software::runtime::BinaryProgram> computeSegments;
+    std::set<std::pair<QueueKind, std::size_t>> reloadedQueues;
+    if (exportComputeSegments) {
+        computeSegments = ftlpu::software::runtime::plan_compute_imem_segments(program);
+        std::ofstream segments(outputDirectory / "compute_imem_segments.csv", std::ios::trunc);
+        if (!segments) throw std::runtime_error("cannot create compute iMEM segment index");
+        segments << "load_id,logical_start,logical_end_exclusive,queue_count,used_slots,capacity_checked\n";
+        std::size_t begin = 0;
+        for (std::size_t load = 0; load < computeSegments.size(); ++load) {
+            const auto& segment = computeSegments[load];
+            const auto report = ftlpu::software::runtime::analyze_physical_imem(segment);
+            if (!report.fits()) throw std::logic_error("exported iMEM segment exceeds physical capacity");
+            segments << load << ',' << begin << ',' << begin + segment.max_cycle
+                     << ',' << segment.queues.size() << ',' << report.used_slots << ",1\n";
+            begin += segment.max_cycle;
+            for (const auto& queue : segment.queues)
+                reloadedQueues.emplace(queue.kind, queue.index);
+        }
+    } else
+        std::filesystem::remove(outputDirectory / "compute_imem_segments.csv");
 
     std::map<std::pair<QueueKind, std::size_t>, const QueueProgram*> queues;
     for (const auto& queue : program.queues) {
@@ -765,7 +648,7 @@ try {
          std::filesystem::directory_iterator(outputDirectory)) {
         if (!entry.is_regular_file()) continue;
         const auto filename = entry.path().filename().string();
-        if (!filename.ends_with(".icu.csv")) continue;
+        if (!filename.ends_with(".icu.csv") && !filename.ends_with(".imem.bin")) continue;
         if (std::filesystem::remove(entry.path())) ++staleFilesRemoved;
     }
 
@@ -789,27 +672,84 @@ try {
         const auto found = queues.find({spec.kind, spec.index});
         std::vector<InstructionRow> rows;
         std::size_t queueWords = 0;
+        const auto exportImage = [&](const QueueProgram& queue,
+                                     std::vector<InstructionRow>& decodedRows,
+                                     const std::string& suffix) -> std::size_t {
+            using namespace ftlpu::software::runtime;
+            if (queue.commands.empty()) return 0;
+            const auto images = prepare_program_images({queue}, 0, program.hardware.mxms_per_hemisphere);
+            if (images.size() != 1) throw std::logic_error("one ICU queue must produce one physical image");
+            const auto& bytes = images.front().bytes;
+            const auto name=spec.filename+suffix+".imem.bin";
+            std::ofstream image(outputDirectory/name,std::ios::binary|std::ios::trunc);
+            if(!image)throw std::runtime_error("cannot write physical iMEM image");
+            image.write(reinterpret_cast<const char*>(bytes.data()),bytes.size());
+            if(!image)throw std::runtime_error("cannot finish physical iMEM image");
+            for(auto& row:decodedRows) {
+                if(row.packed_macro) row.raw="file:"+name;
+                else row.details += " imem_file="+name;
+            }
+            const bool mxm=queue.kind==QueueKind::MxmLoad || queue.kind==QueueKind::MxmCompute || queue.kind==QueueKind::MxmDequant;
+            const auto wordBits=mxm ? program.hardware.icu_mxm_instruction_bits : program.hardware.icu_mem_instruction_bits;
+            if (!wordBits || bytes.size()*8%wordBits) throw std::logic_error("physical image has a partial word");
+            return bytes.size()*8/wordBits;
+        };
+
         for (std::size_t load = 0; load < preExecution.size(); ++load) {
             for (const auto& queue : preExecution[load].queues) {
                 if (queue.kind != spec.kind || queue.index != spec.index)
                     continue;
                 auto pageRows = decode_queue(queue);
+                queueWords += exportImage(queue,pageRows,".pre_execution_"+std::to_string(load));
                 for (auto& row : pageRows) {
                     row.ordinal = rows.size();
                     row.phase = "pre_execution";
                     row.load_id = load;
                     rows.push_back(std::move(row));
                 }
-                queueWords += queue.commands.size();
             }
         }
-        if (found != queues.end()) {
+        if (reloadedQueues.contains({spec.kind, spec.index})) {
+            std::size_t begin = 0;
+            for (std::size_t load = 0; load < computeSegments.size(); ++load) {
+                for (const auto& queue : computeSegments[load].queues) {
+                    if (queue.kind != spec.kind || queue.index != spec.index) continue;
+                    auto segmentRows = decode_queue(queue);
+                    queueWords += exportImage(queue,segmentRows,".execution_segment_"+std::to_string(load));
+                    for (auto& row : segmentRows) {
+                        row.ordinal = rows.size();
+                        row.phase = "execution_segment";
+                        row.load_id = load;
+                        // Cycle columns stay on the common logical timeline;
+                        // raw words, wait_cycle and pc_word stay segment-local.
+                        row.loop.start_cycle += begin;
+                        if (row.end_cycle) *row.end_cycle += begin;
+                        row.details += " imem_segment_start=" + std::to_string(begin);
+                        rows.push_back(std::move(row));
+                    }
+                }
+                begin += computeSegments[load].max_cycle;
+            }
+        } else if (found != queues.end()) {
             auto executionRows = decode_queue(*found->second);
+            queueWords += exportImage(*found->second,executionRows,"");
             for (auto& row : executionRows) {
                 row.ordinal = rows.size();
                 rows.push_back(std::move(row));
             }
-            queueWords += found->second->commands.size();
+        }
+        // Common-barrier MEM transport storage belongs to the same physical
+        // ICU. Export it beside its compute Macro image, without hiding SYNC.
+        for (const auto& transport : program.transport_queues) {
+            if (transport.kind != spec.kind || transport.index != spec.index) continue;
+            auto transportRows = decode_queue(transport);
+            queueWords += exportImage(transport, transportRows, ".transport");
+            for (auto& row : transportRows) {
+                row.ordinal = rows.size();
+                row.phase = "execution_transport";
+                row.details += " cycle_domain=transport_local common_barrier_controlled=1";
+                rows.push_back(std::move(row));
+            }
         }
         write_icu_file(outputDirectory / spec.filename,
             program, spec, rows, queueWords);
@@ -863,12 +803,15 @@ try {
         << "{\n  \"common_barrier_protocol\": " << program.common_barrier_protocol
         << ",\n  \"transport_overlap_protocol\": " << program.transport_overlap_protocol
         << ",\n  \"overlap_analysis_fallback\": " << overlapBudgetFallback
+        << ",\n  \"compute_imem_segment_export\": " << exportComputeSegments
+        << ",\n  \"compute_imem_segment_count\": " << computeSegments.size()
         << ",\n  \"weight_page_uses\": " << program.weight_page_uses.size() << "\n}\n";
     std::ofstream readme(outputDirectory / "README.txt", std::ios::trunc);
     readme << "Source: " << input.string() << '\n'
            << "Target: " << program.target_name << '\n'
            << "Executable prefill horizon: 0.." << program.max_cycle << '\n'
            << "Pre-execution ICU loads: " << preExecution.size() << '\n'
+           << "Compute iMEM segments (runtime planner): " << computeSegments.size() << '\n'
            << "Physical ICU files: " << specs.size() << '\n'
            << "Active ICU files: " << active << '\n'
            << "ICU coarse instructions: " << coarse << '\n'
@@ -894,6 +837,21 @@ try {
               "SYNC and SYNC_PAGE mark their fetch cycles; their actual wait "
               "is dynamic. SYNC_LAUNCH is the corresponding tagged wait in "
               "a C2C producer queue.\n\n"
+           << "Packed MEM/MXM macro rows retain the decoded domain and command ordinal. "
+              "Their pc_word/imem_words cells are empty because runs can cross "
+              "physical word boundaries; index.csv counts the actual packed words. "
+              "raw_words links the complete relocated *.imem.bin image used by the "
+              "raw loader. wait_cycle is the derived idle gap for these absolute-start "
+              "domains, not an extra encoded wait field.\n\n"
+           << "With --compute-imem-segments, execution_segment rows reproduce "
+              "the runtime planner's per-drain compute images. load_id and "
+              "pc_word identify the segment and its local iMEM PC; raw_words "
+              "and wait_cycle preserve the segment-local encoding. Cycle "
+              "columns include the segment's logical start offset, not dynamic "
+              "C2C waits; use runtime.pipeline.csv for actual FU cycles. "
+              "compute_imem_segments.csv lists checked segment capacities. "
+              "Segmentation is reconstructed from the linked image, not a "
+              "separate hardware instruction-fetch trace.\n\n"
            << "Compiler-authored KV-cache MEM_READ_SYNC and executable "
               "weight-page MEM_WRITE_SYNC packets appear in the MEM ICU "
               "files. Ordinary SYNC appears "

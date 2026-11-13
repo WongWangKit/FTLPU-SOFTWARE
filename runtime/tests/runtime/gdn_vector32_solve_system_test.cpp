@@ -1,3 +1,4 @@
+#include "direct_macro_fixture.hpp"
 #include "ftlpu/compiler/Target/vector32_triangular_schedule.hpp"
 #include "ftlpu/system/tsp_slice_system.hpp"
 #include <array>
@@ -78,38 +79,32 @@ int main(int argc, char** argv) try {
         for (std::size_t c=0; c<32; ++c) store(*system,side,6,0,c,1);
 
     const auto plan=compiler::schedule_vector32_triangular_solve(width,packed);
-    std::array<std::size_t,InstructionControlUnit::kMemQueues> mem_cursor{};
+    test::DirectMacroFixture macroFixture;
     std::array<std::size_t,8> vxm_cursor{};
     for (const auto& issue : plan.mem) {
         const auto q=InstructionControlUnit::mem_queue(static_cast<Hemisphere>(issue.side),issue.slice);
-        if (issue.cycle<mem_cursor[q]) throw std::logic_error("overlapping MEM domains");
-        auto instruction=issue.instruction;
-        instruction.loop.wait_cycle=issue.cycle-mem_cursor[q];
-        system->icu().enqueue_mem_3d(q,instruction);
-        mem_cursor[q]=issue.cycle+(instruction.loop.counts[0]-1)*instruction.loop.cycle_strides[0]+1;
+        const auto& instruction=issue.instruction;
+        macroFixture.mem(q,issue.cycle,instruction);
         program << "MEM." << issue.side << '.' << issue.slice << ',' << issue.cycle << ','
-            << (instruction.opcode==MemIcuOpcode::Read3D?"READ3D":"WRITE3D") << ','
+            << (instruction.opcode==compiler::MemDomainOperation::Read?"READ_MACRO":"WRITE_MACRO") << ','
             << instruction.loop.counts[0] << ',' << instruction.address.base_address << ','
             << instruction.address.inner_stride << '\n';
     }
     std::size_t sxm_cursor[2][2]{};
     for (const auto& issue : plan.sxm) {
         const bool permute=issue.instruction.opcode==SxmOpcode::Permute;
-        auto run=SxmIcuRun2DInstruction::Run2D(0,{issue.count,1},{issue.interval,1},issue.instruction);
-        run.loop.wait_cycle=issue.cycle-sxm_cursor[issue.side][permute];
-        if (permute) system->icu().sxm_permute_iq(static_cast<Hemisphere>(issue.side)).push_sxm_run_2d(run);
-        else system->icu().sxm_transpose_iq(static_cast<Hemisphere>(issue.side)).push_sxm_run_2d(run);
-        sxm_cursor[issue.side][permute]=issue.cycle+(issue.count-1)*issue.interval+1;
+        macroFixture.sxm(issue.side,issue.cycle,issue.count,issue.interval,issue.instruction);
         program << "SXM." << issue.side << '.' << (permute?"Permute":"Transpose")
-            << ',' << issue.cycle << ",RUN2D," << issue.count << ",0,0\n";
+            << ',' << issue.cycle << ",MACRO," << issue.count << ",0,0\n";
     }
     for (const auto& issue : plan.vxm) {
-        auto run=VxmIcuRun2DInstruction::Run2D(0,{1,1},{1,1},issue.instruction);
-        run.loop.wait_cycle=issue.cycle-vxm_cursor[issue.queue];
-        system->icu().enqueue_vxm_run_2d(issue.queue,run);
+        auto instruction=issue.instruction;
+        if(issue.cycle-vxm_cursor[issue.queue])system->icu().enqueue_vxm_nop(issue.queue,issue.cycle-vxm_cursor[issue.queue]);
+        system->icu().enqueue_vxm(issue.queue,instruction);
         vxm_cursor[issue.queue]=issue.cycle+1;
-        program << "VXM." << issue.queue << ',' << issue.cycle << ",RUN2D,1,0,0\n";
+        program << "VXM." << issue.queue << ',' << issue.cycle << ",CONFIG,1,0,0\n";
     }
+    macroFixture.load(system->icu());
     std::ofstream debug(out/"execution.log");
     std::array<std::size_t,InstructionControlUnit::kMemQueues> observed_mem{};
     std::array<std::size_t,2> observed_vxm{};

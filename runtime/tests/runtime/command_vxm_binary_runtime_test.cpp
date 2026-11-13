@@ -24,8 +24,8 @@ try {
 
     const auto path = std::filesystem::path(argv[1]);
     const auto program = read_binary_program(path);
-    require(program.max_cycle == 0,
-        "VXM packet repeat must not become an ICU Repeat command");
+    require(program.max_cycle == 1,
+        "VXM max_cycle must cover the two FU repetitions");
     require(program.queues.size() == 1, "expected exactly one serialized VXM queue");
     require(program.queues[0].kind == QueueKind::Vxm && program.queues[0].index == 1,
         "serialized VXM queue identity is incorrect");

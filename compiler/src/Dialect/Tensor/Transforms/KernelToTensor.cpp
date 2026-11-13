@@ -2,6 +2,7 @@
 #include "ftlpu/compiler/Dialect/Kernel/Analysis/decoder_graph.hpp"
 
 #include "ftlpu/compiler/Dialect/Kernel/IR/kernel_dialect.hpp"
+#include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
 #include "ftlpu/compiler/Support/float_format.hpp"
 #include "ftlpu/compiler/Transforms/passes.hpp"
 
@@ -51,6 +52,36 @@ public:
             return;
         }
         const target::LPUTargetModel& target = *target_model;
+        llvm::SmallVector<kernel::AttentionCoreOp> cores;
+        function.walk([&](kernel::AttentionCoreOp core) { cores.push_back(core); });
+        if (!cores.empty()) {
+            // A graph-scheduler node owns this complete physical workspace;
+            // unrelated operators must remain separate nodes so their live
+            // intervals cannot silently overlap the native attention plan.
+            if (cores.size() != 1 || function.getNumArguments() != cores.front()->getNumOperands()
+                || llvm::any_of(function.getBody().front(), [&](mlir::Operation& op) {
+                    return &op != cores.front().getOperation()
+                        && !llvm::isa<mlir::func::ReturnOp>(op);
+                })) {
+                function.emitError("attention_core memory planning requires an isolated Q/K/V core with optional sink tensor");
+                signalPassFailure();
+                return;
+            }
+            mlir::OpBuilder builder(function.getContext());
+            auto core = cores.front();
+            mlir::NamedAttrList config(core.getConfig());
+            config.set("kv_cache_resident_tokens", config.get("kv_seq_len"));
+            auto configuration = config.getDictionary(builder.getContext());
+            auto memory = schedule::planAttentionCoreMemory(builder, configuration, target);
+            if (mlir::failed(memory)) {
+                core.emitError("cannot allocate native attention QK/softmax/PV memory within the supported shape and target capacity");
+                signalPassFailure();
+                return;
+            }
+            core->setAttr("config", configuration);
+            core->setAttr("memory_plan", *memory);
+            return;
+        }
         EastMemoryAllocator allocator(target);
         llvm::SmallVector<kernel::MatmulOp> matmuls;
         llvm::SmallVector<kernel::SwigluOp> swiglus;
@@ -313,6 +344,16 @@ public:
                         && use.getOperandNumber() == 0;
                 }
                 if (feedsFeedbackRmsNorm) {
+                    const auto module=function->getParentOfType<mlir::ModuleOp>();
+                    const auto wide=module->getAttrOfType<mlir::BoolAttr>("ftlpu.sxm_wide");
+                    const auto legacy=module->getAttrOfType<mlir::BoolAttr>("ftlpu.norm_distributed16");
+                    // The streaming norm owns its planar ingress. Do not
+                    // pre-bind that argument to the legacy striped layout.
+                    if(wide && wide.getValue() && !(legacy && legacy.getValue())
+                        && target.throughput().mxm_rows==32 && type.getDimSize(0)==32
+                        && target.memory().banks_per_slice>=2
+                        && type.getDimSize(1)+1<=target.memory().words_per_bank)
+                        continue;
                     const int64_t bytes = type.getNumElements() * 2;
                     // A decode token still occupies one physical MXM row
                     // group. Reserve every SRAM row addressed by that group

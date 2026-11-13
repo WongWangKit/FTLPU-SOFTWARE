@@ -14,6 +14,7 @@ from qwen3_5_compiled_layer import bf16,load_imported_layer
 from qwen3_5_logical_graph import LogicalGraph
 from qwen3_5_reference import Qwen35DeltaConfig,linear_decoder_layer
 from qwen3_5_gated_deltanet_reference_test import random_weights
+from model_test_outputs import OutputContract, TestOutput
 
 
 def validate_compiler_plan(directory):
@@ -114,6 +115,9 @@ def main():
     if not a.validate_only:
         graph=LogicalGraph()
         finals=graph.layer(x,weights,packed,scales,c)
+        contract=OutputContract(TestOutput('hidden','result'),
+            TestOutput('recurrent_state','persistent_state'), TestOutput('conv_state','persistent_state'))
+        (a.output_dir/'output_contract.json').write_text(json.dumps(contract.describe(finals),indent=2)+'\n')
         logical=graph.write(a.output_dir/'logical_graph',finals)
         kernel=a.output_dir/'decoder_layer.kernel.mlir'
         graph_compiler=a.graph_compile or a.compile.resolve().with_name('ftlpu-graph-compile.exe' if sys.platform=='win32' else 'ftlpu-graph-compile')
@@ -122,7 +126,7 @@ def main():
         if a.target_config:graph_command.extend(['--target-config',str(a.target_config)])
         subprocess.run(graph_command,check=True)
         compile_command=[str(a.compile.resolve()),'--input',str(kernel),'--input-stage','kernel','--output',str(binary),
-            '--mxm-execution','vector','--ffn-schedule','fused']
+            '--mxm-execution','vector','--ffn-schedule','fused','--icu-compression','raw-macro']
         if a.target_config:compile_command.extend(['--target-config',str(a.target_config)])
         subprocess.run(compile_command,check=True)
         validate_compiler_plan(a.output_dir)

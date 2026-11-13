@@ -1,5 +1,5 @@
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
-#include "ftlpu/compiler/Dialect/Command/Transforms/fu_3d_command_materializer.hpp"
+#include "ftlpu/compiler/Dialect/Command/Transforms/macro_command_materializer.hpp"
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/ffn_up_3d_lowering.hpp"
 #include "ftlpu/compiler/Dialect/Stream/IR/stream_dialect.hpp"
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
@@ -539,7 +539,7 @@ public:
         }
 
         std::string error;
-        auto lowered = schedule::lowerFfnUpToFu3D(shape, placement,
+        auto lowered = schedule::lowerFfnUpToMacroDomains(shape, placement,
             timeline, routeLatencies, scaleBits, &error);
         if (mlir::failed(lowered)) {
             op.emitError("direct FU 3-D Up lowering failed: ") << error;
@@ -549,7 +549,7 @@ public:
 
         mlir::OpBuilder builder(&getContext());
         builder.setInsertionPoint(op);
-        if (mlir::failed(command::materializeFfnUp3DCommands(
+        if (mlir::failed(command::materializeFfnUpMacroCommands(
                 builder, op.getLoc(), *lowered, &error))) {
             op.emitError("cannot materialize direct FU 3-D commands: ")
                 << error;

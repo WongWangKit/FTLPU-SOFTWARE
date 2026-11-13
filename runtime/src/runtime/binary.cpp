@@ -62,7 +62,7 @@ constexpr bool has_mxm_macro_packed(std::uint32_t version)
 constexpr bool is_mxm_macro_queue(QueueKind kind)
 {
     return kind == QueueKind::MxmLoad || kind == QueueKind::MxmCompute ||
-           kind == QueueKind::MxmDequant;
+           kind == QueueKind::MxmDequant || kind == QueueKind::SxmTranspose || kind == QueueKind::SxmPermute;
 }
 
 constexpr bool has_macro_packed(std::uint32_t version, QueueKind kind)
@@ -77,7 +77,6 @@ constexpr std::uint32_t kNativeWordCountMask = 0x1cu;
 constexpr std::uint32_t kNativeSxmFixedWordCount = 7;
 constexpr std::uint32_t kIcuExtendedReservedMask = 0x3fu;
 constexpr std::uint32_t kIcuExtendedSubtypeShift = 8;
-constexpr std::uint32_t kIcuExtendedRepeat2D = 0;
 
 template <typename T>
 void write_scalar(std::ostream& os, T value)
@@ -221,76 +220,6 @@ SxmInstruction decode_sxm_queue_command(const QueueCommand& command)
     return instruction;
 }
 
-std::array<std::uint32_t, 3> encode_binary_repeat_2d(
-    const IcuRepeat2D& repeat)
-{
-    // Validate the public iteration-space contract with the hardware codec,
-    // then repack it so word zero is a self-describing extended-control record.
-    (void)isa::encode_icu_repeat_2d(repeat);
-    std::array<std::uint32_t, 3> words {};
-    const auto write = [&](std::size_t offset, std::size_t width,
-                           std::uint64_t value) {
-        for (std::size_t bit = 0; bit < width; ++bit)
-            if ((value & (std::uint64_t {1} << bit)) != 0)
-                words[(offset + bit) / 32]
-                    |= std::uint32_t {1} << ((offset + bit) % 32);
-    };
-    write(0, 2, static_cast<std::uint8_t>(
-        isa::IcuCommandOpcode::Extended));
-    // Bits 2..7 remain zero to identify the fixed-width extended escape.
-    write(kIcuExtendedSubtypeShift, 2, kIcuExtendedRepeat2D);
-    write(10, 10, repeat.inner_count);
-    write(20, 10, repeat.outer_count);
-    write(30, 16, repeat.inner_interval);
-    write(46, 16, repeat.outer_interval);
-    write(62, 16, static_cast<std::uint16_t>(repeat.inner_stride));
-    write(78, 16, static_cast<std::uint16_t>(repeat.outer_stride));
-    write(94, 2, static_cast<std::uint8_t>(repeat.induction_target));
-    return words;
-}
-
-IcuRepeat2D decode_binary_repeat_2d(
-    const std::array<std::uint32_t, 3>& words)
-{
-    const auto read = [&](std::size_t offset, std::size_t width) {
-        std::uint64_t value = 0;
-        for (std::size_t bit = 0; bit < width; ++bit)
-            if ((words[(offset + bit) / 32]
-                    & (std::uint32_t {1} << ((offset + bit) % 32))) != 0)
-                value |= std::uint64_t {1} << bit;
-        return value;
-    };
-    const auto signExtend16 = [](std::uint64_t value) {
-        return static_cast<std::int64_t>(
-            static_cast<std::int16_t>(value));
-    };
-    if (isa::decode_icu_command_opcode(words[0])
-            != isa::IcuCommandOpcode::Extended
-        || ((words[0] >> 2) & kIcuExtendedReservedMask) != 0
-        || read(kIcuExtendedSubtypeShift, 2) != kIcuExtendedRepeat2D)
-        throw std::runtime_error("invalid compact Repeat2D record");
-    IcuRepeat2D repeat {
-        static_cast<std::size_t>(read(10, 10)),
-        static_cast<std::size_t>(read(30, 16)),
-        signExtend16(read(62, 16)),
-        static_cast<std::size_t>(read(20, 10)),
-        static_cast<std::size_t>(read(46, 16)),
-        signExtend16(read(78, 16)),
-        static_cast<IcuInductionTarget>(read(94, 2)),
-    };
-    (void)isa::encode_icu_repeat_2d(repeat);
-    return repeat;
-}
-
-QueueCommand repeat_2d_queue_command(const IcuRepeat2D& repeat)
-{
-    const auto encoded = isa::encode_icu_repeat_2d(repeat);
-    return QueueCommand {
-        encoded.words[0], InstructionKind::None, 3,
-        {encoded.words[0], encoded.words[1], encoded.words[2], 0},
-    };
-}
-
 struct CompactQueueRecordHeader {
     InstructionKind instruction_kind;
     std::uint16_t word_count;
@@ -408,12 +337,7 @@ void write_native_queue_command(std::ostream& os, QueueKind queueKind,
     if (is_macro_schedule_command(command))
         throw std::runtime_error(
             "native FTLPU queue cannot contain a macro record");
-    if (is_repeat_2d_command(command)) {
-        const auto words = encode_binary_repeat_2d(
-            decode_repeat_2d_command(command));
-        for (const auto word : words) write_scalar(os, word);
-        return;
-    }
+
     if (command.instruction_kind == InstructionKind::None) {
         if (command.word_count != 0 || !command.extension_words.empty()
             || isa::decode_icu_command_opcode(command.command)
@@ -639,7 +563,10 @@ void write_binding(std::ostream& os, const BinaryBinding& binding)
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(binding.rope_inverse_frequencies.size()));
     for (const float frequency : binding.rope_inverse_frequencies)
         write_scalar<float>(os, frequency);
-    if (binding.pieces.size() > 4096)
+    // Host output descriptors may enumerate row runs of a large planar
+    // concat. This bound protects the software container parser; it is not
+    // a hardware queue or iMEM capacity (C2C submits bounded batches).
+    if (binding.pieces.size() > 65536)
         throw std::runtime_error("too many binding pieces");
     write_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(binding.pieces.size()));
     for (const auto& piece : binding.pieces) {
@@ -749,7 +676,7 @@ BinaryBinding read_binding(std::istream& is, std::uint32_t version, bool child =
     }
     if (version >= 41) {
         const auto count = read_scalar<std::uint32_t>(is);
-        if (count > 4096 || (child && count))
+        if (count > 65536 || (child && count))
             throw std::runtime_error("invalid binding piece count");
         for (std::uint32_t i = 0; i < count; ++i)
             binding.pieces.push_back(read_binding(is, version, true));
@@ -1104,15 +1031,8 @@ QueueCommand read_native_queue_command(Reader& reader, QueueKind queueKind)
             command.words[word] = read_value<std::uint32_t>(reader);
         return command;
     }
-    if (opcode == isa::IcuCommandOpcode::Extended
-        && ((prefix >> 2) & kIcuExtendedReservedMask) == 0) {
-        std::array<std::uint32_t, 3> words {
-            prefix,
-            read_value<std::uint32_t>(reader),
-            read_value<std::uint32_t>(reader),
-        };
-        return repeat_2d_queue_command(decode_binary_repeat_2d(words));
-    }
+    if (opcode == isa::IcuCommandOpcode::Extended)
+        throw std::runtime_error("retired extended control record; recompile as packed Macro");
     return QueueCommand {prefix};
 }
 
@@ -1166,14 +1086,8 @@ void skip_native_queue_command(Reader& reader, QueueKind queueKind)
                 * sizeof(std::uint32_t));
         return;
     }
-    if (opcode == isa::IcuCommandOpcode::Extended
-        && ((prefix >> 2) & kIcuExtendedReservedMask) == 0) {
-        if (((prefix >> kIcuExtendedSubtypeShift) & 0x3u)
-            != kIcuExtendedRepeat2D)
-            throw std::runtime_error(
-                "unsupported extended FTLPU control record");
-        skip_value(reader, 2 * sizeof(std::uint32_t));
-    }
+    if (opcode == isa::IcuCommandOpcode::Extended)
+        throw std::runtime_error("retired extended control record; recompile as packed Macro");
 }
 
 template <typename Reader>
@@ -1375,7 +1289,7 @@ BinaryBinding read_binding(ByteReader& reader, std::uint32_t version, bool child
     }
     if (version >= 41) {
         const auto count = reader.read<std::uint32_t>();
-        if (count > 4096 || (child && count))
+        if (count > 65536 || (child && count))
             throw std::runtime_error("invalid binding piece count");
         for (std::uint32_t i = 0; i < count; ++i)
             binding.pieces.push_back(read_binding(reader, version, true));
@@ -1905,10 +1819,11 @@ void validate_queue_sync_plan(const BinaryProgram& program, bool bindings)
         if(q.requires_raw_macro || q.packed_macro_imem || q.index>65535 || static_cast<unsigned>(q.kind)>9
             || !source_queues.insert((static_cast<std::uint32_t>(q.kind)<<16)|q.index).second
             || q.commands.size()>1000000-source_words)
-            throw std::runtime_error("QLNK source is not a bounded Native domain plan");
+            throw std::runtime_error("QLNK source is not a bounded unpacked domain plan");
         source_words+=q.commands.size();
         for(const auto& c:q.commands)
-            if(is_macro_schedule_command(c)) throw std::runtime_error("QLNK cannot contain already folded Macro records");
+            if (is_macro_schedule_command(c))
+                (void)decode_macro_schedule_command(c); // Direct lowering keeps semantic Macros until final linking.
     }
     const auto check_source_relocation=[&](const auto& a) {
         const auto q=std::ranges::find_if(source.queues,[&](const auto& q){return q.kind==a.queue_kind && q.index==a.queue_index;});

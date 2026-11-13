@@ -2,9 +2,7 @@
 #include "ftlpu/compiler/Dialect/Command/IR/command_dialect.hpp"
 
 #include "ftlpu/compiler/Target/lpu_target_model.hpp"
-#include "ftlpu/icu/fu_3d_codec.hpp"
-#include "ftlpu/icu/sxm_run_2d.hpp"
-#include "ftlpu/icu/vxm_run_2d.hpp"
+#include "ftlpu/compiler/Dialect/Command/Transforms/macro_command_materializer.hpp"
 
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/Builders.h"
@@ -25,83 +23,6 @@ using namespace mlir;
 namespace ftlpu::compiler::command {
 
 namespace {
-
-template <typename Packet, typename Decode>
-LogicalResult verifyFu3DPacket(Operation* operation, ArrayAttr attributes,
-    Decode&& decode)
-{
-    const std::size_t expected = attributes.size();
-    if (expected < Packet::kLanesPerWord || expected > Packet::kWordCount * Packet::kLanesPerWord
-        || expected % Packet::kLanesPerWord != 0)
-        return operation->emitOpError()
-            << "requires exactly " << expected
-            << " flattened 32-bit packet words";
-
-    Packet packet {};
-    for (std::size_t index = 0; index < expected; ++index) {
-        const auto attribute = dyn_cast<IntegerAttr>(attributes[index]);
-        if (!attribute || attribute.getValue().isNegative()
-            || attribute.getValue().getActiveBits() > 32)
-            return operation->emitOpError()
-                << "packet word " << index
-                << " is not an unsigned 32-bit integer";
-        packet.words[index / Packet::kLanesPerWord]
-            .lanes[index % Packet::kLanesPerWord] =
-            static_cast<std::uint32_t>(attribute.getValue().getZExtValue());
-    }
-    try {
-        if (expected != isa::fu_loop_packet_word_count(packet) * Packet::kLanesPerWord)
-            throw std::logic_error("FU packet length disagrees with subtype");
-        static_cast<void>(decode(packet));
-    } catch (const std::exception& error) {
-        return operation->emitOpError()
-            << "contains an invalid FU 3-D packet: " << error.what();
-    }
-    return success();
-}
-
-LogicalResult verifyMem3DQueue(Operation* operation, int64_t queue)
-{
-    auto target = target::LPUTargetModel::from_operation(operation);
-    if (failed(target)) return failure();
-    const int64_t queueCount = target->memory().hemispheres
-        * target->memory().slices_per_hemisphere
-        * target->memory().banks_per_slice;
-    if (queue < 0 || queue >= queueCount)
-        return operation->emitOpError(
-            "targets a MEM ICU queue outside the physical target");
-    return success();
-}
-
-LogicalResult verifyMxm3DQueue(Operation* operation, int64_t queue)
-{
-    auto target = target::LPUTargetModel::from_operation(operation);
-    if (failed(target)) return failure();
-    if (!target->is_valid_mxm_unit(queue))
-        return operation->emitOpError(
-            "targets an MXM ICU queue outside the physical target");
-    return success();
-}
-
-LogicalResult verifyVxmRun2DQueue(Operation* operation, int64_t queue)
-{
-    auto target = target::LPUTargetModel::from_operation(operation);
-    if (failed(target)) return failure();
-    if (!target->is_valid_vxm_alu(queue))
-        return operation->emitOpError(
-            "targets a VXM ICU queue outside the physical target");
-    return success();
-}
-
-LogicalResult verifySxmRun2DQueue(Operation* operation, int64_t queue)
-{
-    auto target = target::LPUTargetModel::from_operation(operation);
-    if (failed(target)) return failure();
-    if (queue < 0 || queue >= target->memory().hemispheres)
-        return operation->emitOpError(
-            "targets an SXM ICU queue outside the physical target");
-    return success();
-}
 
 } // namespace
 
@@ -416,100 +337,9 @@ LogicalResult MxmDequantOp::verify()
     return success();
 }
 
-LogicalResult Mem3DOp::verify()
-{
-    if (getCycle() < 0)
-        return emitOpError("cycle must be non-negative");
-    if (failed(verifyMem3DQueue(getOperation(), getQueue())))
-        return failure();
-    if (getAddressBindingAccess() && !getAddressBinding())
-        return emitOpError(
-            "address_binding_access requires address_binding");
-    if (getAddressBindingAccess()
-        && *getAddressBindingAccess() != "input"
-        && *getAddressBindingAccess() != "internal")
-        return emitOpError(
-            "address_binding_access must be input or internal");
-    if (failed(verifyFu3DPacket<isa::EncodedMemIcu3DPacket>(getOperation(),
-            getWords(), isa::decode_mem_icu_3d_instruction)))
-        return failure();
-
-    return success();
-}
-
-LogicalResult MemWriteRead2DOp::verify()
-{
-    if (getCycle() < 0)
-        return emitOpError("cycle must be non-negative");
-    if (failed(verifyMem3DQueue(getOperation(), getQueue())))
-        return failure();
-    return verifyFu3DPacket<isa::EncodedMemIcuWriteRead2DPacket>(
-        getOperation(), getWords(),
-        isa::decode_mem_icu_write_read_2d_instruction);
-}
-
-LogicalResult MxmLoad3DOp::verify()
-{
-    if (getCycle() < 0)
-        return emitOpError("cycle must be non-negative");
-    if (failed(verifyMxm3DQueue(getOperation(), getQueue())))
-        return failure();
-    return verifyFu3DPacket<isa::EncodedMxmLoadIcu3DPacket>(getOperation(),
-        getWords(), isa::decode_mxm_load_icu_3d_instruction);
-}
-
-LogicalResult MxmDequant3DOp::verify()
-{
-    if (getCycle() < 0)
-        return emitOpError("cycle must be non-negative");
-    if (getScaleBindingAttr() && getScaleBindingAttr().getInt() < 0)
-        return emitOpError("scale_binding must be non-negative");
-    if (failed(verifyMxm3DQueue(getOperation(), getQueue())))
-        return failure();
-    return verifyFu3DPacket<isa::EncodedMxmDequantIcu3DPacket>(
-        getOperation(), getWords(),
-        isa::decode_mxm_dequant_icu_3d_instruction);
-}
-
-LogicalResult MxmCompute3DOp::verify()
-{
-    if (getCycle() < 0)
-        return emitOpError("cycle must be non-negative");
-    if (failed(verifyMxm3DQueue(getOperation(), getQueue())))
-        return failure();
-    return verifyFu3DPacket<isa::EncodedMxmComputeIcu3DPacket>(
-        getOperation(), getWords(),
-        isa::decode_mxm_compute_icu_3d_instruction);
-}
-
-LogicalResult VxmRun2DOp::verify()
-{
-    if (getCycle() < 0)
-        return emitOpError("cycle must be non-negative");
-    if (getScaleBindingAttr() && getScaleBindingAttr().getInt() < 0)
-        return emitOpError("scale_binding must be non-negative");
-    if (failed(verifyVxmRun2DQueue(getOperation(), getQueue())))
-        return failure();
-    return verifyFu3DPacket<isa::EncodedVxmIcuRun2DPacket>(
-        getOperation(), getWords(),
-        isa::decode_vxm_icu_run_2d_instruction);
-}
-
-LogicalResult SxmRun2DOp::verify()
-{
-    if (getCycle() < 0)
-        return emitOpError("cycle must be non-negative");
-    if (getKind() != "transpose" && getKind() != "permute")
-        return emitOpError("kind must be transpose or permute");
-    if (failed(verifySxmRun2DQueue(getOperation(), getQueue())))
-        return failure();
-    if (getKind() == "transpose")
-        return verifyFu3DPacket<isa::EncodedSxmTransposeIcuRun2DPacket>(
-            getOperation(), getWords(),
-            isa::decode_sxm_transpose_icu_run_2d_instruction);
-    return verifyFu3DPacket<isa::EncodedSxmPermuteIcuRun2DPacket>(
-        getOperation(), getWords(),
-        isa::decode_sxm_permute_icu_run_2d_instruction);
+LogicalResult MacroOp::verify() {
+    try { (void)readMacroCommand(getOperation()); return success(); }
+    catch(const std::exception& e) {return emitOpError(e.what());}
 }
 
 LogicalResult VxmOp::verify()
@@ -528,7 +358,7 @@ LogicalResult VxmOp::verify()
     if (cycle < 0 || !target.is_valid_vxm_alu(queue)
         || (chainDepth != 2 && chainDepth != 4 && chainDepth != 8
             && chainDepth != 16)
-        || repeat_count <= 0 || repeat_interval <= 0)
+        || repeat_count <= 0 || repeat_interval != 1)
         return emitOpError("contains an invalid ICU VXM queue command field: cycle=")
             << cycle << ", queue=" << queue
             << ", chain_depth=" << chainDepth

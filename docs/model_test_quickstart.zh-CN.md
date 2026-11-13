@@ -6,6 +6,11 @@ CModel 数值验收，统一环境检查、命令参数、日志、退出码和�
 **当前验收范围是 decoder 单层，不是完整多层模型的文本生成。**
 测试报告会区分合成权重和官方权重，编译成功、权限跳过均不算数值通过。
 
+GLM 的 attention 核比较也已接入：`--suite attention-prefill`、
+`--suite attention-decode --batches 1 32`；完整 decoder decode 用 `--suite decode`。
+默认仅向 DDR 写必需结果和持久状态，中间数值诊断单独执行，详见
+[输出契约与计时](model_test_output_contract.zh-CN.md)。attention-only 不包含 projection/FFN。
+
 ## 第一次使用
 
 1. 将 `FTLPU-SOFTWARE` 和 `FTLPU-CMODEL` 放在同一父目录。

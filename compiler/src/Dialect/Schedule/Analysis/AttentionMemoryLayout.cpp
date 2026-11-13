@@ -1,10 +1,187 @@
 #include "ftlpu/compiler/Dialect/Schedule/Analysis/attention_memory_layout.hpp"
+#include "ftlpu/compiler/Dialect/Tensor/Analysis/physical_memory_allocator.hpp"
 
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
 #include <stdexcept>
 namespace ftlpu::compiler::schedule {
+
+#include "FlashTileMemory.inc"
+
+mlir::FailureOr<mlir::DictionaryAttr> planAttentionCoreMemory(
+    mlir::OpBuilder& builder, mlir::DictionaryAttr config,
+    const target::LPUTargetModel& target)
+{
+    if(auto strategy=config.getAs<mlir::StringAttr>("attention_strategy"); strategy && strategy.getValue()=="flash_tile")
+        return planFlashTileMemory(builder,config,target);
+    const auto integer = [&](llvm::StringRef name) -> int64_t {
+        const auto value = config.getAs<mlir::IntegerAttr>(name);
+        return value ? value.getInt() : 0;
+    };
+    const int64_t seq = integer("seq_len"), kvSeq = integer("kv_seq_len");
+    const int64_t queryHeads = integer("query_heads"), kvHeads = integer("kv_heads");
+    const int64_t headDim = integer("head_dim");
+    const int64_t tile = target.throughput().mxm_rows;
+    const int64_t lanes = target.throughput().lanes_per_tile;
+    const int64_t tileRows = target.throughput().tile_rows;
+    // The existing dense core has two rotary-half Query/Key groups and up
+    // to four context plane pairs. Keep that established supported domain.
+    if (tile != 32 || lanes != 8 || tileRows != 4
+        || target.memory().hemispheres != 2 || target.memory().banks_per_slice < 2
+        || seq <= 0 || (seq != 1 && seq % tile != 0)
+        || kvSeq <= 0 || kvSeq % tile != 0
+        || queryHeads <= 0 || kvHeads <= 0 || queryHeads % kvHeads != 0
+        || (headDim != 32 && headDim != 64 && headDim != 128 && headDim != 512))
+        return mlir::failure();
+    const int64_t headBlocks = headDim / tile;
+    const int64_t halfBlocks = std::max<int64_t>(1, headBlocks / 2);
+    const int64_t queryBlocks = (seq + tile - 1) / tile;
+    const int64_t tokenStride = queryBlocks * tile;
+    const int64_t queryRows = queryHeads * halfBlocks * queryBlocks * tileRows;
+    const int64_t keyRows = kvHeads * halfBlocks * kvSeq;
+    const int64_t valueRows = kvHeads * headBlocks * (kvSeq / tile) * tileRows;
+    const int64_t scoreRows = queryHeads * queryBlocks * kvSeq;
+    const int64_t packRows = queryHeads * queryBlocks * (kvSeq / lanes);
+    const int64_t diagonalRows = queryHeads * queryBlocks * (kvSeq / tile) * tileRows;
+    tensor::PhysicalMemoryAllocator allocator(target);
+    llvm::SmallVector<int64_t> candidates;
+    for (int64_t slice = 0; slice < target.memory().slices_per_hemisphere; ++slice)
+        candidates.push_back(slice);
+    const auto reserve = [&](llvm::StringRef name, llvm::ArrayRef<int64_t> slices,
+                             int64_t base, int64_t rows, int64_t begin,
+                             int64_t end, int64_t bank) {
+        return allocator.reserve({name.str(), llvm::SmallVector<int64_t, 16>(slices),
+            base, rows, begin, end, false, bank});
+    };
+    const auto allocate = [&](llvm::StringRef name, int64_t count, int64_t base,
+                              int64_t rows, int64_t begin, int64_t end,
+                              int64_t bank, llvm::ArrayRef<int64_t> excluded = {}) {
+        return allocator.allocate({name.str(), count, base, rows, begin, end,
+            candidates, true, llvm::ArrayRef<int64_t>(bank), excluded});
+    };
+    // Lifetimes: ingress=0, QK=1, softmax=2, probability transpose=3,
+    // PV=4, result export=5. Value and initialized masks survive ingress.
+    const auto& query0 = target.attention_query_iw_slices(0);
+    const auto& query1 = target.attention_query_iw_slices(1);
+    if (mlir::failed(reserve("query_half0", query0, 0, queryRows, 0, 2, 0))
+        || mlir::failed(reserve("query_half1", query1, 0, queryRows, 0, 2, 1)))
+        return mlir::failure();
+    auto key = allocate("key", 4, 0, keyRows, 0, 2, 1, query1);
+    if (mlir::failed(key)) return mlir::failure();
+    const auto valueSlices = target.attention_value_slices();
+    llvm::SmallVector<int64_t> uniqueValueSlices;
+    for (int64_t slice : valueSlices)
+        if (!llvm::is_contained(uniqueValueSlices, slice)) uniqueValueSlices.push_back(slice);
+    const int64_t valueBase = queryRows;
+    if (mlir::failed(reserve("value", uniqueValueSlices, valueBase,
+            valueRows, 0, 5, 0))) return mlir::failure();
+    // QK can drain a score wave while loading the next Query. Never place
+    // those writes on the Query half's own bank/ICU queues.
+    auto score0 = allocate("score", 4, 0, scoreRows, 1, 3, 1, query1);
+    auto score1 = target.throughput().mxms_per_hemisphere == 1 ? score0
+        : allocate("score_mxm1", 4, 0, scoreRows, 1, 3, 1, query1);
+    auto exp0 = allocate("exp", 4, 0, scoreRows, 2, 3, 0);
+    auto exp1 = target.throughput().mxms_per_hemisphere == 1 ? exp0
+        : allocate("exp_mxm1", 4, 0, scoreRows, 2, 3, 0);
+    auto mask0 = allocate("mask", 2, 0, tile - 1, 0, 3, 0);
+    auto mask1 = allocate("mask_mxm1", 2, 0, tile - 1, 0, 3, 0);
+    if (mlir::failed(score0) || mlir::failed(score1)
+        || mlir::failed(exp0) || mlir::failed(exp1)
+        || mlir::failed(mask0) || mlir::failed(mask1)) return mlir::failure();
+    auto pack = allocate("probability_pack", 16, valueBase + valueRows,
+        packRows, 2, 4, 0);
+    // P may stream from the final softmax ALU directly through wide SXM.
+    // Its destination is already live during softmax, and must not share a
+    // physical MEM ICU with score reads even when the address ranges differ.
+    llvm::SmallVector<int64_t> diagonalExcluded(score0->slices.begin(), score0->slices.end());
+    for (int64_t slice : score1->slices)
+        if (!llvm::is_contained(diagonalExcluded, slice)) diagonalExcluded.push_back(slice);
+    auto diagonal = allocate("probability_diagonal", 16, 0,
+        diagonalRows, 2, 5, 1, diagonalExcluded);
+    // Native head/block/token words can use ordinary planar output order.
+    // Drain directly to one byte pair, avoiding a later multi-slice gather.
+    const bool planarDecode = queryHeads * seq * headBlocks <= target.memory().sram_depth_rows / 2;
+    // Separate planar output pairs let both source hemispheres drain at
+    // once, without serializing their mirrored writes on one MEM ICU.
+    auto context = allocate("context", planarDecode ? 4 : 2 * headBlocks, 0,
+        queryHeads * seq * (planarDecode ? headBlocks : 1), 4, 6, 1);
+    if (mlir::failed(pack) || mlir::failed(diagonal) || mlir::failed(context))
+        return mlir::failure();
+
+    const auto placement = [&](llvm::StringRef kind, llvm::ArrayRef<int64_t> slices,
+                               int64_t base, int64_t rows, int64_t bank,
+                               int64_t heads, int64_t stride) {
+        return builder.getDictionaryAttr({
+            builder.getNamedAttr("kind", builder.getStringAttr(kind)),
+            builder.getNamedAttr("dtype", builder.getStringAttr("bf16")),
+            builder.getNamedAttr("hemisphere", builder.getStringAttr("both")),
+            builder.getNamedAttr("slices", builder.getI64ArrayAttr(slices)),
+            builder.getNamedAttr("base_row", builder.getI64IntegerAttr(base)),
+            builder.getNamedAttr("instruction_count", builder.getI64IntegerAttr(rows)),
+            builder.getNamedAttr("address_stride", builder.getI64IntegerAttr(1)),
+            builder.getNamedAttr("bank", builder.getI64IntegerAttr(bank)),
+            builder.getNamedAttr("head_dim", builder.getI64IntegerAttr(headDim)),
+            builder.getNamedAttr("heads", builder.getI64IntegerAttr(heads)),
+            builder.getNamedAttr("token_stride", builder.getI64IntegerAttr(stride)),
+            builder.getNamedAttr("query_heads_per_kv", builder.getI64IntegerAttr(queryHeads / kvHeads)),
+        });
+    };
+    const auto fromAllocation = [&](llvm::StringRef kind, const tensor::PhysicalAllocation& value) {
+        return placement(kind, value.slices, value.base_row, value.rows,
+            value.bank, queryHeads, tokenStride);
+    };
+    const auto segment = [&](int64_t begin, int64_t end, int64_t bank,
+                             llvm::ArrayRef<int64_t> slices) {
+        return builder.getDictionaryAttr({
+            builder.getNamedAttr("reduction_begin", builder.getI64IntegerAttr(begin)),
+            builder.getNamedAttr("reduction_end", builder.getI64IntegerAttr(end)),
+            builder.getNamedAttr("bank", builder.getI64IntegerAttr(bank)),
+            builder.getNamedAttr("base_row", builder.getI64IntegerAttr(0)),
+            builder.getNamedAttr("slices", builder.getI64ArrayAttr(slices)),
+        });
+    };
+    mlir::NamedAttrList query(placement("fp16_query_iw", query0, 0,
+        queryRows, 0, queryHeads, tokenStride));
+    query.set("dense_attention_role", builder.getStringAttr("query"));
+    query.set("segments", builder.getArrayAttr({
+        segment(0, halfBlocks, 0, query0),
+        segment(halfBlocks, std::max(halfBlocks, headBlocks), 1, query1)}));
+    mlir::NamedAttrList keyPlacement(placement("fp16_head_planar", key->slices,
+        key->base_row, keyRows, key->bank, kvHeads, kvSeq));
+    keyPlacement.set("dense_attention_role", builder.getStringAttr("key"));
+    keyPlacement.set("segments", builder.getArrayAttr({
+        segment(0, halfBlocks, key->bank, llvm::ArrayRef<int64_t>(key->slices).take_front(2)),
+        segment(halfBlocks, std::max(halfBlocks, headBlocks), key->bank,
+            llvm::ArrayRef<int64_t>(key->slices).take_back(2))}));
+    mlir::NamedAttrList contextPlacement(fromAllocation(
+        planarDecode ? "fp16_pair_planar" : "fp16_head_planar", *context));
+    contextPlacement.set("head_block_packed", builder.getBoolAttr(planarDecode));
+    contextPlacement.set("hemisphere_paired", builder.getBoolAttr(planarDecode));
+    // MXM computes full query tiles, but its MEM sink only retains the
+    // logical queries. Decode context therefore occupies one row per head.
+    contextPlacement.set("token_stride", builder.getI64IntegerAttr(seq));
+    contextPlacement.set("mirrored", builder.getBoolAttr(true));
+    contextPlacement.set("dense_attention_role", builder.getStringAttr("context"));
+    mlir::NamedAttrList valuePlacement(placement("fp16_value_x16", valueSlices,
+        valueBase, valueRows, 0, kvHeads, kvSeq));
+    valuePlacement.set("dense_attention_role", builder.getStringAttr("value"));
+    return builder.getDictionaryAttr({
+        builder.getNamedAttr("query", query.getDictionary(builder.getContext())),
+        builder.getNamedAttr("key", keyPlacement.getDictionary(builder.getContext())),
+        builder.getNamedAttr("value", valuePlacement.getDictionary(builder.getContext())),
+        builder.getNamedAttr("score", fromAllocation("fp16_score_block", *score0)),
+        builder.getNamedAttr("score_mxm1", fromAllocation("fp16_score_block", *score1)),
+        builder.getNamedAttr("exp", fromAllocation("fp16_score_block", *exp0)),
+        builder.getNamedAttr("exp_mxm1", fromAllocation("fp16_score_block", *exp1)),
+        builder.getNamedAttr("causal_mask", fromAllocation("fp16_causal_mask_tile", *mask0)),
+        builder.getNamedAttr("causal_mask_mxm1", fromAllocation("fp16_causal_mask_tile", *mask1)),
+        builder.getNamedAttr("probability_pack", fromAllocation("fp16_probability_x16", *pack)),
+        builder.getNamedAttr("probability_diagonal", fromAllocation("fp16_probability_diagonal", *diagonal)),
+        builder.getNamedAttr("context", contextPlacement.getDictionary(builder.getContext())),
+    });
+}
 
 AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     const target::LPUTargetModel& target, bool gatedContext)
@@ -60,6 +237,7 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     const char* names[] = {"query_weight", "key_weight", "value_weight"};
     for (std::size_t i = 0; i < weightBases_.size(); ++i) {
         const auto placement = plan.getAs<mlir::DictionaryAttr>(names[i]);
+        if (!placement) continue; // A core has external Q/K/V, no projections.
         weightBases_[i] = placement.getAs<mlir::IntegerAttr>("base_row").getInt();
         readPaging(placement, weightPaging_[i]);
         if (i == 0) {
@@ -160,8 +338,8 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     readPlacement("score_mxm1", scaledScoreSlices_[1], ignoredBase);
     readPlacement("exp", expScoreSlices_[0], expScoreBase_);
     readPlacement("exp_mxm1", expScoreSlices_[1], ignoredBase);
-    readPlacement("causal_mask", causalMaskSlices_[0], causalMaskBase_);
-    readPlacement("causal_mask_mxm1", causalMaskSlices_[1], ignoredBase);
+    readPlacement("causal_mask", causalMaskSlices_[0], causalMaskBase_[0]);
+    readPlacement("causal_mask_mxm1", causalMaskSlices_[1], causalMaskBase_[1]);
     readPlacement("probability_pack", probabilityPackSlices_, probabilityPackBase_);
     readPlacement("probability_diagonal", probabilityDiagonalSlices_, probabilityDiagonalBase_);
     if (const auto query = plan.getAs<mlir::DictionaryAttr>("query")) {
@@ -237,6 +415,8 @@ AttentionMemoryLayout::AttentionMemoryLayout(const AttentionTaskGraph& op,
     }
     if (const auto context =
             plan.getAs<mlir::DictionaryAttr>(gatedContext ? "gated_context" : "context")) {
+        if (const auto stride = context.getAs<mlir::IntegerAttr>("token_stride"))
+            contextTokenStride_ = stride.getInt();
         contextBase_ =
             context.getAs<mlir::IntegerAttr>("base_row").getInt();
         const auto values = context.getAs<mlir::ArrayAttr>("slices");
@@ -390,7 +570,7 @@ int64_t AttentionMemoryLayout::queryIwAddress(
     int64_t phase) const
 {
     const int64_t tile = target_.throughput().mxm_rows;
-    const int64_t tokenBlocks = seqLen_ / tile;
+    const int64_t tokenBlocks = (seqLen_ + tile - 1) / tile;
     const int64_t blocksPerRotaryHalf = std::max<int64_t>(1, headBlocks_ / 2);
     return queryIwBase_
         + ((head * blocksPerRotaryHalf
@@ -468,7 +648,8 @@ int64_t AttentionMemoryLayout::scoreAddress(int64_t queryHead,
     int64_t queryBlock, int64_t key) const
 {
     const int64_t tokenBlocks =
-        seqLen_ / target_.throughput().mxm_rows;
+        (seqLen_ + target_.throughput().mxm_rows - 1)
+            / target_.throughput().mxm_rows;
     return scaledScoreBase_
         + (queryHead * tokenBlocks + queryBlock) * kvSeqLen_ + key;
 }
@@ -476,7 +657,8 @@ int64_t AttentionMemoryLayout::scoreAddress(int64_t queryHead,
 int64_t AttentionMemoryLayout::probabilityPackAddress(int64_t queryHead,
     int64_t queryBlock, int64_t keyBlock) const
 {
-    const int64_t tokenBlocks = seqLen_ / target_.throughput().mxm_rows;
+    const int64_t tokenBlocks = (seqLen_ + target_.throughput().mxm_rows - 1)
+        / target_.throughput().mxm_rows;
     return probabilityPackBase_
         + (queryHead * tokenBlocks + queryBlock)
             * (kvSeqLen_ / target_.throughput().lanes_per_tile)
@@ -486,7 +668,8 @@ int64_t AttentionMemoryLayout::probabilityPackAddress(int64_t queryHead,
 int64_t AttentionMemoryLayout::probabilityDiagonalAddress(int64_t queryHead,
     int64_t queryBlock, int64_t keyBlock, int64_t diagonal) const
 {
-    const int64_t queryBlocks = seqLen_ / target_.throughput().mxm_rows;
+    const int64_t queryBlocks = (seqLen_ + target_.throughput().mxm_rows - 1)
+        / target_.throughput().mxm_rows;
     const int64_t keyBlocks = kvSeqLen_ / target_.throughput().mxm_rows;
     return probabilityDiagonalBase_
         + ((queryHead * queryBlocks + queryBlock) * keyBlocks + keyBlock)
@@ -525,12 +708,14 @@ int64_t AttentionMemoryLayout::valuePackBank(int64_t reductionBlock) const
 int64_t AttentionMemoryLayout::contextAddress(
     int64_t queryHead, int64_t headBlock, int64_t token) const
 {
+    const int64_t tokenStride = contextTokenStride_ > 0
+        ? contextTokenStride_ : seqLen_;
     if (contextSplitBanks_)
-        return contextBase_ + queryHead * seqLen_ + token;
+        return contextBase_ + queryHead * tokenStride + token;
     if (contextHeadBlockPacked_)
         return contextBase_
-            + (queryHead * headBlocks_ + headBlock) * seqLen_ + token;
-    return contextBase_ + queryHead * seqLen_ + token;
+            + (queryHead * headBlocks_ + headBlock) * tokenStride + token;
+    return contextBase_ + queryHead * tokenStride + token;
 }
 
 int64_t AttentionMemoryLayout::contextSlice(
